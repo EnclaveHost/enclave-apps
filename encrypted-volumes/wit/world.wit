@@ -1,0 +1,13 @@
+// encrypted-volumes: the first-party sample for encrypted volumes (rclone
+// crypt over S3). Serves the decryption UI and browses the volumes the
+// platform preopens at /enc/<name> with plain WASI file I/O (std::fs).
+// outgoing-handler drives the manager's loopback /encvol plane
+// (ENCLAVE_ENC_API + ENCLAVE_ENC_TOKEN) for unlock/sync/lock - the token
+// stays server-side; the browser only ever talks to this app.
+// WIT deps vendored verbatim from wasmtime v45.
+package enclave:encrypted-volumes;
+
+world encrypted-volumes {
+  import wasi:http/outgoing-handler@0.2.6;
+  export wasi:http/incoming-handler@0.2.6;
+}

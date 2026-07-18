@@ -1,0 +1,29 @@
+{
+  "name": "sd-turbo",
+  "warmup": "/warmup",
+  "model_volume": "sd-turbo",
+  "text_encoder_file": "text_encoder/model.onnx",
+  "unet_file": "unet/model.onnx",
+  "vae_decoder_file": "vae_decoder/model.onnx",
+  "vocab_file": "tokenizer/vocab.json",
+  "merges_file": "tokenizer/merges.txt",
+  "hidden_size": 1024,
+  "latent_channels": 4,
+  "vae_scaling": 0.18215,
+  "timestep_dtype": "fp16",
+  "io_dtype": "fp16",
+  "beta_start": 0.00085,
+  "beta_end": 0.012,
+  "num_train_timesteps": 1000,
+  "default_steps": 4,
+  "max_steps": 8,
+  "default_size": 512,
+  "min_size": 256,
+  "max_size": 1024,
+  "default_target": "gpu",
+  "max_images": 4,
+  "models": [
+    {},
+    { "name": "z-image-turbo", "model_volume": "z-image-turbo", "backend": "sdcpp", "default_size": 1024, "max_size": 2048 }
+  ]
+}

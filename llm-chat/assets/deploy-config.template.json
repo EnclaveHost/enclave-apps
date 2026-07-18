@@ -1,0 +1,56 @@
+{
+  "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). The 'models' catalog is stated in FULL for all three volumes; the qwen2.5 entries duplicate the catalog embedded in the wasm (assets/app-config.json) so this config also works standalone. 122b geometry from the volume's GGUF header (qwen35moe) + tokenizer.json; needs >=~50% GPU share. Largest attached model serves as the default.",
+  "volumes": ["qwen2.5-0.5b", "qwen2.5-0.5b-gguf", "qwen3.5-122b-gguf"],
+  "models": {
+    "qwen3.5-122b-gguf": {
+      "name": "qwen3.5-122b-a10b",
+      "backend": "ggml",
+      "n_layers": 48,
+      "n_kv_heads": 2,
+      "head_dim": 256,
+      "vocab": 248320,
+      "eos": [248046, 248044],
+      "template": "chatml",
+      "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
+      "max_prompt_tokens": 65536,
+      "default_max_new": 1024,
+      "max_new_cap": 16384,
+      "rep_penalty": 1.1,
+      "rep_window": 64
+    },
+    "qwen2.5-0.5b": {
+      "name": "qwen2.5-0.5b-instruct",
+      "backend": "onnx",
+      "n_layers": 24,
+      "n_kv_heads": 2,
+      "head_dim": 64,
+      "vocab": 151936,
+      "eos": [151645, 151643],
+      "template": "chatml",
+      "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
+      "max_prompt_tokens": 3072,
+      "default_max_new": 512,
+      "max_new_cap": 2048,
+      "rep_penalty": 1.1,
+      "rep_window": 64
+    },
+    "qwen2.5-0.5b-gguf": {
+      "name": "qwen2.5-0.5b-instruct-gguf",
+      "backend": "ggml",
+      "model_file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "tokenizer_file": "/models/qwen2.5-0.5b/tokenizer.json",
+      "n_layers": 24,
+      "n_kv_heads": 2,
+      "head_dim": 64,
+      "vocab": 151936,
+      "eos": [151645, 151643],
+      "template": "chatml",
+      "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
+      "max_prompt_tokens": 3072,
+      "default_max_new": 512,
+      "max_new_cap": 2048,
+      "rep_penalty": 1.1,
+      "rep_window": 64
+    }
+  }
+}

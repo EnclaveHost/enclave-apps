@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>image generator</title>
+<script>
+// Apply the theme before first paint to avoid a flash. Stored preference
+// wins; otherwise follow the OS.
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("imagegen-theme"); } catch (_) {}
+  if (t !== "light" && t !== "dark")
+    t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+<style>
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --bg-menu: #ffffff;
+    --text: #0d0d0d; --text-2: #5d5d5d; --text-3: #8f8f8f;
+    --border: rgba(0,0,0,.10); --border-soft: rgba(0,0,0,.06);
+    --hover: rgba(0,0,0,.05); --active: rgba(0,0,0,.08);
+    --composer: #f1f1f1;
+    --btn: #0d0d0d; --btn-fg: #ffffff;
+    --ic-bg: rgba(0,0,0,.06); --code-bg: #f7f7f8; --code-head: #ececec;
+    --ok: #0a8a55; --warn: #b45309; --err: #b91c1c;
+    --shadow: 0 4px 24px rgba(0,0,0,.10);
+    --accent: #10a37f;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #212121; --bg-menu: #2f2f2f;
+    --text: #ececec; --text-2: #b4b4b4; --text-3: #8b8b8b;
+    --border: rgba(255,255,255,.12); --border-soft: rgba(255,255,255,.07);
+    --hover: rgba(255,255,255,.06); --active: rgba(255,255,255,.10);
+    --composer: #2f2f2f;
+    --btn: #ffffff; --btn-fg: #0d0d0d;
+    --ic-bg: rgba(255,255,255,.10); --code-bg: #171717; --code-head: #2f2f2f;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    --shadow: 0 8px 32px rgba(0,0,0,.45);
+    --accent: #10a37f;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+      "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+    min-height: 100dvh;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+  button:disabled { cursor: default; }
+  svg { display: block; flex: none; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--active); }
+  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+  /* -------------------------------------------------------------- header -- */
+  header {
+    position: sticky; top: 0; z-index: 20; background: var(--bg);
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; padding: 4px 6px; }
+  .brand svg { color: var(--accent); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 12px; border-radius: 999px; font-size: 12.5px;
+    background: var(--hover); color: var(--text-2);
+    max-width: 42vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pill.ok { color: var(--ok); }
+  .pill.err { color: var(--err); }
+  .spin {
+    width: 12px; height: 12px; border-radius: 50%; flex: none;
+    border: 2px solid var(--border); border-top-color: var(--text-2);
+    animation: rot .8s linear infinite;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .spacer { flex: 1; }
+  .icon-btn { padding: 8px; border-radius: 10px; color: var(--text-2); display: flex; }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+
+  /* ---------------------------------------------------------------- main -- */
+  .wrap { width: 100%; max-width: 768px; margin: 0 auto; padding: 12px 20px 40px; }
+
+  #composer {
+    display: flex; align-items: flex-end; gap: 8px;
+    padding: 10px 10px 10px 20px;
+    background: var(--composer); border-radius: 28px;
+    border: 1px solid var(--border-soft);
+    transition: box-shadow .15s;
+  }
+  #composer:focus-within { box-shadow: 0 2px 12px rgba(0,0,0,.08); border-color: var(--active); }
+  #prompt {
+    flex: 1; resize: none; border: 0; outline: none; background: transparent;
+    color: var(--text); font: inherit; font-size: 15.5px; line-height: 1.5;
+    max-height: 200px; min-height: 48px; padding: 6px 0; caret-color: var(--text);
+  }
+  #prompt::placeholder { color: var(--text-3); }
+  #sendBtn {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--btn); color: var(--btn-fg); transition: opacity .12s, transform .08s;
+  }
+  #sendBtn:not(:disabled):active { transform: scale(.92); }
+  #sendBtn:disabled { opacity: .25; }
+
+  /* ------------------------------------------------------------ controls -- */
+  .controls {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    margin-top: 12px; padding: 0 6px;
+  }
+  .ctl { display: flex; align-items: center; gap: 8px; }
+  .ctl > span { font-size: 12px; color: var(--text-3); font-weight: 500; }
+  .seg { display: flex; background: var(--hover); border-radius: 9px; padding: 3px; }
+  .seg button { padding: 4px 12px; border-radius: 7px; font-size: 12.5px; color: var(--text-2); }
+  .seg button.on {
+    background: var(--bg-menu); color: var(--text);
+    box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 500;
+  }
+  .seg button:disabled { opacity: .35; }
+  select, input[type=text] {
+    background: transparent; color: var(--text); border: 1px solid var(--border);
+    border-radius: 9px; padding: 5px 10px; font: inherit; font-size: 13px; outline: none;
+  }
+  select:hover, input[type=text]:hover { background: var(--hover); }
+  select:focus, input[type=text]:focus { border-color: var(--accent); }
+  select option { background: var(--bg-menu); color: var(--text); }
+  input[type=text] { width: 110px; }
+
+  .status { margin-top: 12px; padding: 0 6px; font-size: 13px; color: var(--text-2); min-height: 20px; display: flex; align-items: center; gap: 8px; }
+  .status.err { color: var(--err); }
+
+  /* -------------------------------------------------------------- viewer -- */
+  .out { margin-top: 18px; display: none; }
+  .out img {
+    width: 100%; height: auto; border-radius: 14px;
+    border: 1px solid var(--border-soft); background: var(--composer);
+  }
+  .meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-3); margin-top: 8px; padding: 0 4px; }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+  .meta a.danger { color: var(--err); }
+
+  /* ------------------------------------------------------------- gallery -- */
+  .gal-head {
+    display: none; align-items: baseline; gap: 10px;
+    margin-top: 26px; padding: 0 4px;
+  }
+  .gal-head.show { display: flex; }
+  .gal-head h2 { font-size: 12px; color: var(--text-3); font-weight: 500; text-transform: uppercase; letter-spacing: .04em; }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; margin-top: 10px; }
+  .shot { position: relative; }
+  .shot img {
+    width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px;
+    border: 1px solid var(--border-soft); cursor: pointer; display: block;
+  }
+  .shot img:hover { border-color: var(--accent); }
+  .shot .del {
+    display: none; position: absolute; top: 6px; right: 6px; padding: 5px;
+    border-radius: 8px; background: var(--bg-menu); color: var(--text-2);
+    box-shadow: var(--shadow);
+  }
+  .shot:hover .del, .shot .del:focus-visible { display: flex; }
+  .shot .del:hover { color: var(--err); }
+
+  /* -------------------------------------------------------- API dialog -- */
+  #apiOverlay {
+    display: none; position: fixed; inset: 0; z-index: 60;
+    background: rgba(0,0,0,.5); align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  #apiOverlay.open { display: flex; }
+  .api-card {
+    background: var(--bg-menu); border: 1px solid var(--border-soft);
+    border-radius: 16px; box-shadow: var(--shadow); padding: 20px 22px;
+    max-width: 620px; width: 100%; max-height: 90dvh; overflow-y: auto;
+    font-size: 13.5px; line-height: 1.6;
+  }
+  .api-card > p { color: var(--text-2); }
+  .api-head { display: flex; align-items: center; margin-bottom: 10px; }
+  .api-head h2 { font-size: 16px; font-weight: 600; flex: 1; }
+  .api-url {
+    display: flex; align-items: center; gap: 8px; margin: 10px 0 14px;
+    background: var(--code-bg); border: 1px solid var(--border-soft);
+    border-radius: 10px; padding: 8px 8px 8px 12px;
+  }
+  .api-url code {
+    flex: 1; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+  }
+  .api-card .code {
+    border: 1px solid var(--border-soft); border-radius: 12px; overflow: hidden;
+    background: var(--code-bg); margin: 0 0 14px;
+  }
+  .code-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 8px 6px 14px; background: var(--code-head);
+    font-size: 12px; color: var(--text-2);
+  }
+  .cbtn {
+    display: flex; align-items: center; gap: 5px; padding: 4px 8px;
+    border-radius: 7px; font-size: 12px; color: var(--text-2);
+  }
+  .cbtn:hover { background: var(--hover); color: var(--text); }
+  .cbtn.done { color: var(--ok); }
+  .api-card pre {
+    padding: 12px 14px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .api-fine { color: var(--text-3); font-size: 12.5px; }
+  .api-fine .ic {
+    background: var(--ic-bg); padding: .1em .35em; border-radius: 5px;
+    font: .95em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  .footnote {
+    text-align: center; color: var(--text-3); font-size: 11.5px;
+    padding: 26px 16px 10px; max-width: 768px; margin: 0 auto;
+  }
+  .footnote code {
+    background: var(--ic-bg); padding: .15em .4em; border-radius: 6px;
+    font: .95em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .01s !important; transition-duration: .01s !important; }
+  }
+  @media (max-width: 768px) {
+    .wrap { padding: 8px 12px 32px; }
+    #prompt { font-size: 16px; } /* prevent iOS zoom-on-focus */
+    .controls { gap: 12px; }
+    .shot .del { display: flex; } /* no hover on touch */
+    .gallery { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="9.5" r="1.6"/><path d="M3.5 17.5l5-5 4 4 3-3 5 4.5"/></svg>
+    image generator
+  </span>
+  <span class="pill" id="model">&hellip;</span>
+  <span class="pill" id="warm">connecting</span>
+  <span class="spacer"></span>
+  <button class="icon-btn" id="apiBtn" aria-label="API access" title="API access">
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 5.5L21 12l-5.5 6.5M8.5 5.5L3 12l5.5 6.5"/></svg>
+  </button>
+  <button class="icon-btn" id="themeBtn" aria-label="Toggle theme" title="Toggle theme">
+    <svg id="iconSun" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.4"/><path d="M12 2.5v2.4M12 19.1v2.4M4.3 4.3L6 6M18 18l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.3 19.7L6 18M18 6l1.7-1.7"/></svg>
+    <svg id="iconMoon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+  </button>
+</header>
+
+<div class="wrap">
+  <div id="composer">
+    <textarea id="prompt" rows="2" placeholder="a cinematic photo of a lighthouse on a cliff at dawn, dramatic sky, 35mm film" autofocus></textarea>
+    <button id="sendBtn" aria-label="Generate" title="Generate" disabled>
+      <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+      <svg id="iconStop" width="18" height="18" viewBox="0 0 24 24" style="display:none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+    </button>
+  </div>
+
+  <div class="controls">
+    <span class="ctl" id="modelctl" style="display:none"><span>model</span>
+      <select id="modelsel"></select>
+    </span>
+    <span class="ctl"><span>steps</span>
+      <span class="seg" id="steps">
+        <button data-v="1">1</button><button data-v="2">2</button><button data-v="4" class="on">4</button><button data-v="8">8</button>
+      </span>
+    </span>
+    <span class="ctl"><span>size</span>
+      <select id="size"></select>
+    </span>
+    <span class="ctl"><span>seed</span>
+      <input type="text" id="seed" placeholder="random">
+      <button class="icon-btn" id="dice" title="New random seed" aria-label="New random seed">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><circle cx="8.6" cy="8.6" r=".6" fill="currentColor"/><circle cx="15.4" cy="8.6" r=".6" fill="currentColor"/><circle cx="12" cy="12" r=".6" fill="currentColor"/><circle cx="8.6" cy="15.4" r=".6" fill="currentColor"/><circle cx="15.4" cy="15.4" r=".6" fill="currentColor"/></svg>
+      </button>
+    </span>
+  </div>
+
+  <div class="status" id="status" role="status"></div>
+
+  <div class="out" id="out">
+    <img id="img" alt="generated image">
+    <div class="meta" id="meta"></div>
+  </div>
+
+  <div class="gal-head" id="galhead"><h2>This session</h2></div>
+  <div class="gallery" id="gallery"></div>
+</div>
+
+<div id="apiOverlay">
+  <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="apiTitle">
+    <div class="api-head">
+      <h2 id="apiTitle">Image API</h2>
+      <button class="icon-btn" id="apiClose" aria-label="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+      </button>
+    </div>
+    <p>This deployment serves the same models over HTTP &mdash; the base URL:</p>
+    <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
+    <div class="code"><div class="code-head"><span>curl &mdash; PNG straight to a file</span><button type="button" class="cbtn" id="apiCopyGet">Copy</button></div><pre><code id="apiGet"></code></pre></div>
+    <div class="code"><div class="code-head"><span>curl &mdash; OpenAI-compatible</span><button type="button" class="cbtn" id="apiCopyPost">Copy</button></div><pre><code id="apiPost"></code></pre></div>
+    <p class="api-fine">Model names match the picker; omit <code class="ic">model</code> for the largest attached one.
+    Also <code class="ic">GET /info</code>, <code class="ic">GET /warmup?model=&hellip;</code>. If the deployment config sets
+    <code class="ic">api_key</code>, send <code class="ic">Authorization: Bearer &lt;key&gt;</code> on <code class="ic">/v1/&hellip;</code>.
+    Requests run in the same enclave as this page.</p>
+  </div>
+</div>
+
+<footer class="footnote">
+  Confidential image generation &middot; stable-diffusion.cpp on an H200 GPU share &middot;
+  images stay in this tab's memory and are discarded on close
+</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let steps = 1, running = false, target = "gpu";
+let models = [], cur = null; // catalog from /info; cur = selected model
+
+const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11.5v6M14 11.5v6M6 7l1 12.4A2 2 0 0 0 9 21.2h6a2 2 0 0 0 2-1.8L18 7M9.5 7V4.8A1.8 1.8 0 0 1 11.3 3h1.4a1.8 1.8 0 0 1 1.8 1.8V7"/></svg>';
+
+// ------------------------------------------------------------------ theme --
+function applyThemeIcon() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  $("iconSun").style.display = dark ? "" : "none";
+  $("iconMoon").style.display = dark ? "none" : "";
+}
+$("themeBtn").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem("imagegen-theme", next); } catch (_) {}
+  applyThemeIcon();
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e => {
+  let stored = null;
+  try { stored = localStorage.getItem("imagegen-theme"); } catch (_) {}
+  if (stored !== "light" && stored !== "dark") {
+    document.documentElement.dataset.theme = e.matches ? "dark" : "light";
+    applyThemeIcon();
+  }
+});
+applyThemeIcon();
+
+// -------------------------------------------------------------- API dialog --
+// The base URL is derived from the page's own location (relative, like every
+// fetch here), so it stays correct behind any proxy prefix.
+const ICON_CHECK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L20 6.5"/></svg>';
+
+function copyText(text, btn) {
+  const done = () => {
+    if (!btn) return;
+    const prev = btn.innerHTML;
+    btn.classList.add("done");
+    btn.innerHTML = ICON_CHECK + "<span>Copied</span>";
+    setTimeout(() => { btn.classList.remove("done"); btn.innerHTML = prev; }, 1400);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, done);
+  } else {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (_) {}
+    ta.remove(); done();
+  }
+}
+
+function openApi() {
+  const base = new URL(".", location.href).href.replace(/\/$/, "");
+  const model = cur ? cur.name : "";
+  const size = +$("size").value || 1024;
+  $("apiBase").textContent = base;
+  $("apiGet").textContent =
+    'curl "' + base + "/image?prompt=a+red+fox+in+snow&steps=" + steps +
+    "&w=" + size + "&h=" + size + (model ? "&model=" + encodeURIComponent(model) : "") +
+    '" -o out.png';
+  $("apiPost").textContent =
+    "curl " + base + "/v1/images/generations \\\n" +
+    '  -H "content-type: application/json" \\\n' +
+    "  -d '" + JSON.stringify({
+      model: model || "default",
+      prompt: "a red fox in snow",
+      size: size + "x" + size,
+    }, null, 0).replace(/,"/g, ', "') + "'";
+  $("apiOverlay").classList.add("open");
+  $("apiClose").focus();
+}
+function closeApi() { $("apiOverlay").classList.remove("open"); }
+$("apiBtn").onclick = openApi;
+$("apiClose").onclick = closeApi;
+$("apiOverlay").addEventListener("click", e => { if (e.target === $("apiOverlay")) closeApi(); });
+window.addEventListener("keydown", e => { if (e.key === "Escape") closeApi(); });
+$("apiCopyBase").onclick = e => copyText($("apiBase").textContent, e.currentTarget);
+$("apiCopyGet").onclick = e => copyText($("apiGet").textContent, e.currentTarget);
+$("apiCopyPost").onclick = e => copyText($("apiPost").textContent, e.currentTarget);
+
+// ---------------------------------------------------------------- controls --
+$("steps").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  steps = +b.dataset.v;
+  for (const x of $("steps").children) x.classList.toggle("on", x === b);
+});
+$("dice").onclick = () => { $("seed").value = String(Math.floor(Math.random() * 2 ** 32)); };
+
+function setStatus(msg, cls) {
+  $("status").className = "status" + (cls ? " " + cls : "");
+  $("status").innerHTML = msg ? (cls === "err" ? "" : '<span class="spin"></span>') + "<span>" + msg + "</span>" : "";
+}
+
+function updateSend() {
+  $("sendBtn").disabled = !running && !$("prompt").value.trim();
+  $("iconSend").style.display = running ? "none" : "";
+  $("iconStop").style.display = running ? "" : "none";
+  const label = running ? "Stop" : "Generate";
+  $("sendBtn").setAttribute("aria-label", label);
+  $("sendBtn").title = label;
+}
+
+// Adapt the controls to the selected model: badge, default steps, and the
+// size list (sd.cpp sizes must be multiples of 64; latents want /8).
+const SIZES = [512, 1024, 2048];
+function pick(name) {
+  cur = models.find(m => m.name === name) || models[0];
+  $("modelsel").value = cur.name;
+  $("model").textContent = cur.name + " · " + cur.backend;
+  // snap the default step count to the nearest available button, and grey
+  // out buttons past the model's max
+  const maxs = cur.max_steps || 8;
+  const want = Math.min(cur.default_steps || 1, maxs);
+  const vals = [...$("steps").children].map(b => +b.dataset.v).filter(v => v <= maxs);
+  steps = vals.reduce((a, v) => Math.abs(v - want) < Math.abs(a - want) ? v : a, vals[0] || 1);
+  for (const x of $("steps").children) {
+    x.classList.toggle("on", +x.dataset.v === steps);
+    x.disabled = +x.dataset.v > maxs;
+  }
+  const prev = +$("size").value || 0;
+  const step = cur.size_step || 8;
+  const opts = SIZES.filter(v => v >= cur.min_size && v <= cur.max_size && v % step === 0);
+  $("size").innerHTML = "";
+  for (const v of opts) {
+    const o = document.createElement("option");
+    o.value = o.textContent = v;
+    o.selected = v === (opts.includes(prev) ? prev : cur.default_size);
+    $("size").appendChild(o);
+  }
+  if (!cur.attached) {
+    setStatus(`model volume '${cur.volume}' is not attached - deploy with it ticked in the volume picker`, "err");
+  } else if ($("status").classList.contains("err")) setStatus("");
+}
+$("modelsel").onchange = () => pick($("modelsel").value);
+
+async function info() {
+  try {
+    const r = await (await fetch("info")).json();
+    target = r.default_target;
+    models = (r.models && r.models.length) ? r.models : [{
+      name: r.name, volume: r.volume, backend: r.backend, attached: r.volume_attached,
+      default_steps: r.default_steps, max_steps: r.max_steps,
+      default_size: r.default_size, min_size: r.min_size, max_size: r.max_size, size_step: 8,
+    }];
+    $("modelsel").innerHTML = "";
+    for (const m of models) {
+      const o = document.createElement("option");
+      o.value = m.name;
+      o.textContent = m.name + (m.attached ? "" : " (volume missing)");
+      $("modelsel").appendChild(o);
+    }
+    if (models.length > 1) $("modelctl").style.display = "";
+    // auto-select the LARGEST attached model (max_size as the capability
+    // proxy; later catalog entries win ties) - the flagship is the default
+    // experience, the fast model stays one dropdown click away
+    const pool = models.filter(m => m.attached);
+    const best = (pool.length ? pool : models)
+      .reduce((a, b) => (b.max_size || 0) >= (a.max_size || 0) ? b : a);
+    pick(best.name);
+    if (!cur.attached) {
+      $("warm").textContent = "volume missing"; $("warm").className = "pill err";
+      return;
+    }
+    $("warm").innerHTML = '<span class="spin"></span>warming ' + target;
+    const t0 = performance.now();
+    const w = await fetch("warmup?target=" + target + "&model=" + encodeURIComponent(cur.name));
+    if (w.ok) {
+      $("warm").textContent = `${target} warm (${((performance.now() - t0) / 1000).toFixed(1)}s)`;
+      $("warm").className = "pill ok";
+    } else {
+      const e = await w.json().catch(() => ({}));
+      $("warm").textContent = "warmup failed"; $("warm").className = "pill err";
+      setStatus(e.error?.message || "warmup failed", "err");
+    }
+  } catch (e) { $("warm").textContent = "offline"; $("warm").className = "pill err"; }
+}
+info();
+
+// --------------------------------------------------------------- history --
+// The gallery lives ONLY in this tab's memory (object URLs over in-memory
+// blobs). Nothing is written to disk - no IndexedDB, no localStorage -
+// closing the page discards every image. Deliberate: confidential outputs
+// should not persist in a browser profile.
+const MAX_SHOTS = 48;
+const shots = []; // newest first: {id, url, meta}
+
+function b64ToBlob(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: "image/png" });
+}
+
+function addShot(blob, meta) {
+  const id = "i" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  shots.unshift({ id, url: URL.createObjectURL(blob), meta });
+  while (shots.length > MAX_SHOTS) {
+    URL.revokeObjectURL(shots.pop().url);
+  }
+  renderGallery();
+  return shots[0];
+}
+
+function deleteShot(id) {
+  const i = shots.findIndex(s => s.id === id);
+  if (i < 0) return;
+  const [s] = shots.splice(i, 1);
+  if ($("img").src === s.url) {
+    $("out").style.display = "none";
+    $("img").removeAttribute("src");
+  }
+  URL.revokeObjectURL(s.url);
+  renderGallery();
+}
+
+function renderGallery() {
+  $("galhead").classList.toggle("show", shots.length > 0);
+  $("gallery").innerHTML = "";
+  for (const s of shots) {
+    const cell = document.createElement("div");
+    cell.className = "shot";
+    const im = new Image();
+    im.src = s.url;
+    im.title = s.meta.prompt || "";
+    im.alt = s.meta.prompt || "generated image";
+    im.onclick = () => show(s.url, s.meta, s.id);
+    const del = document.createElement("button");
+    del.className = "del";
+    del.title = "Delete image";
+    del.setAttribute("aria-label", "Delete image");
+    del.innerHTML = ICON_TRASH;
+    del.onclick = e => { e.stopPropagation(); deleteShot(s.id); };
+    cell.append(im, del);
+    $("gallery").appendChild(cell);
+  }
+}
+
+// -------------------------------------------------------------- viewer -- --
+function show(src, m, id) {
+  $("img").src = src;
+  $("out").style.display = "block";
+  const t = m.timings || {};
+  $("meta").innerHTML =
+    (m.model ? `<span>${m.model}</span>` : "") +
+    `<span>${m.width}&times;${m.height}</span><span>${m.steps} step${m.steps > 1 ? "s" : ""}</span>` +
+    `<span>seed ${m.seed}</span>` +
+    (t.gen_ms != null ? `<span>gen ${(t.gen_ms / 1000).toFixed(1)} s &middot; load ${t.load_ms} ms</span>` : "") +
+    `<a href="${src}" download="enclave-${m.seed}.png">download</a>` +
+    `<a href="#" id="reuse">reuse seed</a>` +
+    (id ? `<a href="#" id="delcur" class="danger">delete</a>` : "");
+  document.getElementById("reuse").onclick = e => { e.preventDefault(); $("seed").value = String(m.seed); };
+  const del = document.getElementById("delcur");
+  if (del) del.onclick = e => { e.preventDefault(); deleteShot(id); };
+}
+
+// ------------------------------------------------------------- generate -- --
+let curCtrl = null, userCancelled = false;
+
+async function go() {
+  if (running) {
+    // the send button doubles as Stop while a request is in flight
+    userCancelled = true;
+    if (curCtrl) curCtrl.abort();
+    return;
+  }
+  const prompt = $("prompt").value.trim();
+  if (!prompt) { $("prompt").focus(); return; }
+  running = true;
+  updateSend();
+  const t0 = performance.now();
+  const tick = setInterval(() => {
+    const el = document.querySelector("#status u");
+    if (el) el.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+  }, 100);
+  setStatus("starting&hellip; <u>0.0s</u>");
+  // stall watchdog: 60s with NO response bytes aborts (dead share, buffering
+  // black hole); once the stream is live, allow 300s between events (the
+  // sdcpp path blocks through one long compute at big sizes)
+  const ctrl = new AbortController();
+  curCtrl = ctrl; userCancelled = false;
+  let lastActivity = performance.now(), streaming = false;
+  const watchdog = setInterval(() => {
+    if (performance.now() - lastActivity > (streaming ? 300000 : 60000)) ctrl.abort();
+  }, 1000);
+  try {
+    const body = { prompt, steps, target,
+      width: +$("size").value, height: +$("size").value };
+    if (cur && models.length > 1) body.model = cur.name;
+    if ($("seed").value.trim()) body.seed = +$("seed").value.trim();
+    const r = await fetch("generate", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(body), signal: ctrl.signal,
+    });
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      lastActivity = performance.now(); streaming = true;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2);
+        if (!line.startsWith("data:")) continue;
+        const ev = JSON.parse(line.slice(5));
+        if (ev.status) setStatus(ev.status + " &middot; <u>" + ((performance.now() - t0) / 1000).toFixed(1) + "s</u>");
+        else if (ev.error) setStatus(ev.error, "err");
+        else if (ev.done) {
+          const meta = { prompt, model: ev.model, seed: ev.seed, steps: ev.steps, width: ev.width, height: ev.height, timings: ev.timings };
+          const s = addShot(b64ToBlob(ev.image), meta);
+          show(s.url, meta, s.id);
+          $("status").className = "status";
+          $("status").innerHTML = `done in ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+        }
+      }
+    }
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      const s = ((performance.now() - t0) / 1000).toFixed(0);
+      if (userCancelled) {
+        $("status").className = "status";
+        $("status").innerHTML = `cancelled after ${s}s`;
+      } else {
+        setStatus(`timed out after ${s}s without a response - the deployment's gpu share may be too small for this size; try a smaller size, fewer steps, or redeploy with more share`, "err");
+      }
+    } else {
+      setStatus("request failed: " + e, "err");
+    }
+  } finally {
+    clearInterval(watchdog); clearInterval(tick);
+    running = false; curCtrl = null;
+    updateSend();
+  }
+}
+$("sendBtn").onclick = go;
+$("prompt").addEventListener("input", () => {
+  const p = $("prompt");
+  p.style.height = "auto";
+  p.style.height = Math.min(p.scrollHeight, 200) + "px";
+  updateSend();
+});
+$("prompt").addEventListener("keydown", e => {
+  // Enter submits but never cancels - cancel is an explicit click
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!running) go(); }
+});
+updateSend();
+</script>
+</body>
+</html>

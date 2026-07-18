@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>encrypted-volumes - rclone-crypt volumes on Enclave</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131722; --border: #232a3a;
+    --text: #e6e9f0; --dim: #8a93a6; --accent: #5eead4; --err: #f2b8c0; --warn: #f5d58a;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 820px; margin: 0 auto; padding: 0 16px 40px;
+  }
+  header { padding: 16px 0 10px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 17px; font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 12.5px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .card h2 { font-size: 13.5px; font-weight: 600; color: var(--accent); margin-bottom: 2px; }
+  .meta { color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace; word-break: break-all; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 9px; margin-left: 8px; vertical-align: 1px; }
+  .badge.locked   { background: #2a2f3e; color: var(--dim); }
+  .badge.syncing, .badge.pushing { background: #3a3320; color: var(--warn); }
+  .badge.unlocked { background: #16322c; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  td { padding: 4px 6px; border-top: 1px solid var(--border); font-family: ui-monospace, monospace; font-size: 12.5px; }
+  td.size { color: var(--dim); text-align: right; white-space: nowrap; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .empty { color: var(--dim); font-size: 13px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
+  form.unlock { margin-top: 10px; display: grid; gap: 8px; }
+  input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+    font: 13px ui-monospace, monospace;
+  }
+  input::placeholder { color: #59627a; }
+  button {
+    background: var(--accent); color: #06231e; border: 0; border-radius: 7px;
+    padding: 7px 14px; font: 600 13px system-ui, sans-serif; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.wallet { background: #7ba7f7; color: #0a1430; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  details.creds { font-size: 12.5px; color: var(--dim); }
+  details.creds > summary { cursor: pointer; user-select: none; }
+  details.creds > div { display: grid; gap: 8px; margin-top: 8px; }
+  .reveal { border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; }
+  .reveal .k { color: var(--dim); }
+  .reveal code { display: block; font: 11.5px ui-monospace, monospace; word-break: break-all; margin: 2px 0 8px; color: var(--text); user-select: all; }
+  pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; margin-top: 8px; overflow-x: auto;
+    font: 12px ui-monospace, monospace; white-space: pre-wrap; word-break: break-all;
+    max-height: 300px; overflow-y: auto;
+  }
+  footer { color: var(--dim); font-size: 12px; margin-top: 16px; line-height: 1.6; }
+  footer b { color: var(--text); }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--warn); border-top-color: transparent; border-radius: 50%; animation: r .8s linear infinite; vertical-align: -1px; margin-right: 5px; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>encrypted-volumes</h1>
+  <span class="sub">rclone-crypt volumes over S3 - the bucket and the host only ever see ciphertext; keys enter here, over this deployment's in-enclave TLS</span>
+</header>
+
+<div id="vols"><div class="card"><span class="empty">loading volumes…</span></div></div>
+
+<div class="card" id="viewer" style="display:none">
+  <h2 id="viewerTitle"></h2>
+  <pre id="viewerBody"></pre>
+</div>
+
+<footer>
+  <b>How this works.</b> The App Config names where each volume's ciphertext lives (S3 endpoint, bucket, path) - never a key.
+  <b>Unlock with wallet</b> asks your wallet to sign a fixed message naming the volume; the volume key is derived from that
+  signature, so only the wallet holder can produce it - nothing is verified or stored on any server, and no transaction is made.
+  Either way the key goes to <b>this app only</b>, which relays it over loopback to the in-enclave manager; the manager pulls the
+  ciphertext and decrypts onto the CVM's encrypted ramdisk at <span style="font-family:ui-monospace,monospace">/enc/&lt;name&gt;</span>.
+  Keys and plaintext never touch the operator's host or the bucket. <b>Lock</b> wipes the plaintext and drops the credentials;
+  <b>Push to cloud</b> re-encrypts local edits back to the bucket (needs write-capable S3 credentials at unlock, and the volume
+  not marked readOnly).
+</footer>
+
+<script>
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(1) + " KiB" : n + " B";
+let timer = null;
+
+// ---- wallet key derivation ------------------------------------------------
+// BYTE-EXACT contract with scripts/enclave-encvol.sh (`message` / `derive`):
+// the canonical message the wallet personal_signs, and password/salt as
+// sha256 of the lowercase 0x-signature + "\n" + a domain label. Deterministic
+// ECDSA (RFC 6979) makes the same wallet always derive the same key.
+const volMessage = (keyId) =>
+  `Enclave encrypted volume key v1\nvolume: ${keyId}\n\nSigning derives this volume's encryption key. Only sign in apps you trust with its contents.`;
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function walletDerive(keyId) {
+  const eth = window.ethereum;
+  if (!eth) throw new Error("no wallet detected (window.ethereum) - use a browser wallet, or unlock with a password");
+  const [account] = await eth.request({ method: "eth_requestAccounts" });
+  const msg = volMessage(keyId);
+  const hex = "0x" + Array.from(new TextEncoder().encode(msg), (b) => b.toString(16).padStart(2, "0")).join("");
+  let sig = await eth.request({ method: "personal_sign", params: [hex, account] });
+  sig = String(sig).trim().toLowerCase();
+  if (!/^0x[0-9a-f]{130}$/.test(sig)) throw new Error("unexpected signature format (need a 65-byte ECDSA personal_sign; smart-contract wallets are not supported)");
+  return { account, sig,
+           password: await sha256hex(sig + "\nenclave-encvol-v1:password"),
+           salt: await sha256hex(sig + "\nenclave-encvol-v1:salt") };
+}
+
+// ---- api ------------------------------------------------------------------
+async function api(path, body) {
+  const r = await fetch("./api/" + path, body
+    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+    : undefined);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+async function view(vol, path) {
+  const r = await fetch(`./f/${encodeURIComponent(vol)}/${path.split("/").map(encodeURIComponent).join("/")}`);
+  const card = document.getElementById("viewer");
+  document.getElementById("viewerTitle").textContent = `${vol}/${path}`;
+  const body = document.getElementById("viewerBody");
+  card.style.display = "";
+  if (!r.ok) { body.textContent = `HTTP ${r.status}`; body.className = "err"; return; }
+  const ct = r.headers.get("content-type") || "";
+  if (/^(text\/|application\/json)/.test(ct)) {
+    const t = await r.text();
+    body.textContent = t.length > 100000 ? t.slice(0, 100000) + "\n… (truncated in viewer; fetch ./f/ directly for the full file)" : t;
+  } else {
+    const b = await r.arrayBuffer();
+    const head = Array.from(new Uint8Array(b.slice(0, 256)), (x) => x.toString(16).padStart(2, "0")).join(" ");
+    body.textContent = `${fmt(b.byteLength)} of binary data. First bytes:\n${head}`;
+  }
+  body.className = "";
+  card.scrollIntoView({ behavior: "smooth" });
+}
+
+// ---- volume cards -----------------------------------------------------------
+function s3CredsBlock() {
+  return `<details class="creds"><summary>private bucket? S3 credentials (optional)</summary><div>
+      <input name="accessKeyId" placeholder="access key id" autocomplete="off">
+      <input type="password" name="secretAccessKey" placeholder="secret access key" autocomplete="off">
+      <input type="password" name="sessionToken" placeholder="session token (optional)" autocomplete="off">
+    </div></details>`;
+}
+
+function volCard(v, files) {
+  const busy = v.status === "syncing" || v.status === "pushing";
+  const badge = `<span class="badge ${esc(v.status)}">${busy ? '<span class="spin"></span>' : ""}${esc(v.status)}</span>`;
+  const where = `s3 ${esc(v.endpoint)} &rarr; ${esc(v.bucket)}${v.path ? "/" + esc(v.path) : ""}`;
+  let body = "";
+  if (v.status === "locked" && !busy) {
+    const walletBtn = `<button type="button" class="wallet" data-wallet="1">Unlock with wallet</button>
+        <span class="empty">signs "volume: ${esc(v.keyId || v.name)}", derives the key locally</span>`;
+    const passInputs = `
+        <input type="password" name="password" placeholder="rclone crypt password" autocomplete="off">
+        <input type="password" name="salt" placeholder="salt / password2 (leave empty if none)" autocomplete="off">
+        <div class="row"><button type="submit">Unlock with password</button></div>`;
+    const parts = (v.unlock === "password")
+      ? passInputs + `<div class="row">${walletBtn}</div>`
+      : `<div class="row">${walletBtn}</div>
+         <details class="creds"><summary>use a password instead</summary><div>${passInputs}</div></details>`;
+    body = `
+      <form class="unlock" data-vol="${esc(v.name)}" data-keyid="${esc(v.keyId || v.name)}">
+        ${parts}
+        ${s3CredsBlock()}
+      </form>
+      <div class="row"><a href="#" data-reveal="${esc(v.name)}">derive push credentials (wallet)</a></div>
+      <div class="reveal" id="reveal-${esc(v.name)}" style="display:none"></div>`;
+  } else if (v.status === "unlocked" || v.status === "pushing") {
+    const rows = (files?.files || []).map((f) =>
+      `<tr><td><a href="#" data-vol="${esc(v.name)}" data-path="${esc(f.path)}">${esc(f.path)}</a></td><td class="size">${fmt(f.size)}</td></tr>`).join("");
+    body = (rows ? `<table><tbody>${rows}</tbody></table>` : '<div class="empty" style="margin-top:8px">empty volume</div>')
+      + (files?.truncated ? '<div class="empty">listing truncated</div>' : "")
+      + `<div class="row">
+           <button class="ghost" data-act="lock" data-vol="${esc(v.name)}">Lock (wipe plaintext)</button>
+           ${v.readOnly ? "" : `<button class="ghost" data-act="sync" data-vol="${esc(v.name)}" ${v.status === "pushing" ? "disabled" : ""}>Push to cloud</button>`}
+           <span class="empty">${fmt(v.bytes || 0)} of ${esc(v.maxMb)} MiB</span>
+         </div>`;
+  } else if (busy) {
+    body = `<div class="empty" style="margin-top:8px">${v.status === "syncing" ? "pulling + decrypting from the bucket…" : "encrypting + pushing to the bucket…"}</div>`;
+  }
+  return `<div class="card"><h2>/enc/${esc(v.name)}${badge}</h2><div class="meta">${where}</div>` +
+    body + (v.error ? `<div class="err">${esc(v.error)}</div>` : "") + "</div>";
+}
+
+let lastVols = [];
+async function refresh() {
+  const box = document.getElementById("vols");
+  let status;
+  try {
+    status = await api("status");
+  } catch (e) {
+    box.innerHTML = `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(String(e.message || e))}</div></div>`;
+    return;
+  }
+  const vols = lastVols = status.volumes || [];
+  if (!vols.length) {
+    box.innerHTML = '<div class="card"><span class="empty">No encrypted volumes configured. Add an <b>encVolumes</b> entry to the App Config.</span></div>';
+    return;
+  }
+  let ls = { volumes: {} };
+  if (vols.some((v) => v.status === "unlocked" || v.status === "pushing")) {
+    ls = await fetch("./ls").then((r) => r.json()).catch(() => ({ volumes: {} }));
+  }
+  box.innerHTML = vols.map((v) => volCard(v, ls.volumes[v.name])).join("");
+  if (vols.some((v) => v.status === "syncing" || v.status === "pushing")) {
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 1500);
+  }
+}
+
+function s3CredsFrom(form) {
+  const body = {};
+  for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+    const el = form?.querySelector(`[name=${k}]`);
+    if (el && el.value) body[k] = el.value;
+  }
+  return body;
+}
+
+document.getElementById("vols").addEventListener("submit", async (e) => {
+  const f = e.target.closest("form.unlock");
+  if (!f) return;
+  e.preventDefault();
+  const pw = f.querySelector("[name=password]")?.value;
+  if (!pw) return alert("enter the crypt password (or use the wallet button)");
+  const body = { name: f.dataset.vol, password: pw, ...s3CredsFrom(f) };
+  const salt = f.querySelector("[name=salt]")?.value;
+  if (salt) body.salt = salt;
+  const btn = f.querySelector("button[type=submit]");
+  if (btn) btn.disabled = true;
+  try { await api("unlock", body); } catch (err) { alert(`unlock failed: ${err.message || err}`); }
+  refresh();
+});
+
+document.getElementById("vols").addEventListener("click", async (e) => {
+  const a = e.target.closest("a[data-vol]");
+  if (a) {
+    e.preventDefault();
+    return view(a.dataset.vol, a.dataset.path);
+  }
+  const w = e.target.closest("button[data-wallet]");
+  if (w) {
+    const f = w.closest("form.unlock");
+    w.disabled = true;
+    try {
+      const d = await walletDerive(f.dataset.keyid);
+      await api("unlock", { name: f.dataset.vol, password: d.password, salt: d.salt, ...s3CredsFrom(f) });
+    } catch (err) {
+      alert(`wallet unlock failed: ${err.message || err}`);
+    }
+    return refresh();
+  }
+  const r = e.target.closest("a[data-reveal]");
+  if (r) {
+    e.preventDefault();
+    const name = r.dataset.reveal;
+    const v = lastVols.find((x) => x.name === name);
+    const panel = document.getElementById(`reveal-${name}`);
+    try {
+      const d = await walletDerive(v.keyId || v.name);
+      const pushCmd = `ENCVOL_WALLET_SIG=${d.sig} scripts/enclave-encvol.sh push ./your-dir \\\n  --endpoint ${v.endpoint} --bucket ${v.bucket}${v.path ? ` --path ${v.path}` : ""} --name ${v.name}`;
+      panel.style.display = "";
+      panel.innerHTML =
+        `<span class="k">These credentials decrypt this volume - treat them like the data itself. Derived locally for ${esc(d.account)}; nothing was sent anywhere.</span>` +
+        `<div style="margin-top:8px"><span class="k">signature (feeds enclave-encvol.sh --sig / ENCVOL_WALLET_SIG)</span><code>${esc(d.sig)}</code>` +
+        `<span class="k">derived password (ENCVOL_PASSWORD)</span><code>${esc(d.password)}</code>` +
+        `<span class="k">derived salt (ENCVOL_SALT)</span><code>${esc(d.salt)}</code>` +
+        `<span class="k">push data with</span><code>${esc(pushCmd)}</code></div>`;
+    } catch (err) {
+      alert(`derive failed: ${err.message || err}`);
+    }
+    return;
+  }
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  if (b.dataset.act === "lock" && !confirm(`Lock ${b.dataset.vol}? The decrypted files are wiped from the enclave (the ciphertext in the bucket is untouched).`)) return;
+  if (b.dataset.act === "sync" && !confirm(`Push ${b.dataset.vol} back to the bucket? Remote content is replaced by the current local state (encrypted with the same key).`)) return;
+  b.disabled = true;
+  try { await api(b.dataset.act, { name: b.dataset.vol }); } catch (err) { alert(`${b.dataset.act} failed: ${err.message || err}`); }
+  refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>

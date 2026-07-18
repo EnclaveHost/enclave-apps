@@ -1,0 +1,1661 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>llm-chat on Enclave</title>
+<script>
+// Apply the theme before first paint to avoid a flash. Stored preference
+// wins (only present when "Remember on this device" is on); otherwise
+// follow the OS.
+(function () {
+  var t = null;
+  try {
+    if (localStorage.getItem("llmchat-store") === "1")
+      t = localStorage.getItem("llmchat-theme");
+  } catch (_) {}
+  if (t !== "light" && t !== "dark")
+    t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+<style>
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --bg-side: #f9f9f9; --bg-menu: #ffffff;
+    --text: #0d0d0d; --text-2: #5d5d5d; --text-3: #8f8f8f;
+    --border: rgba(0,0,0,.10); --border-soft: rgba(0,0,0,.06);
+    --hover: rgba(0,0,0,.05); --active: rgba(0,0,0,.08);
+    --composer: #f1f1f1; --bubble: #f1f1f1;
+    --btn: #0d0d0d; --btn-fg: #ffffff;
+    --code-bg: #f7f7f8; --code-head: #ececec; --ic-bg: rgba(0,0,0,.06);
+    --ok: #0a8a55; --warn: #b45309; --err: #b91c1c;
+    --err-bg: #fef2f2; --err-border: #fecaca;
+    --shadow: 0 4px 24px rgba(0,0,0,.10);
+    --accent: #10a37f;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #212121; --bg-side: #171717; --bg-menu: #2f2f2f;
+    --text: #ececec; --text-2: #b4b4b4; --text-3: #8b8b8b;
+    --border: rgba(255,255,255,.12); --border-soft: rgba(255,255,255,.07);
+    --hover: rgba(255,255,255,.06); --active: rgba(255,255,255,.10);
+    --composer: #2f2f2f; --bubble: #2f2f2f;
+    --btn: #ffffff; --btn-fg: #0d0d0d;
+    --code-bg: #171717; --code-head: #2f2f2f; --ic-bg: rgba(255,255,255,.10);
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    --err-bg: rgba(248,113,113,.08); --err-border: rgba(248,113,113,.30);
+    --shadow: 0 8px 32px rgba(0,0,0,.45);
+    --accent: #10a37f;
+  }
+
+  /* Self-hosted color-emoji fallback (Noto COLRv1, served by the app at
+     ./emoji.woff2). local() sources first: a machine that already has an
+     emoji font never downloads it; unicode-range defers the download until
+     a reply actually contains emoji. */
+  @font-face {
+    font-family: "Emoji Fallback";
+    src: local("Apple Color Emoji"), local("Segoe UI Emoji"), local("Noto Color Emoji"),
+         url("emoji.woff2") format("woff2");
+    unicode-range: U+200D, U+20E3, U+2049, U+2122, U+2139, U+2194-21AA, U+231A-23FA,
+      U+24C2, U+25AA-25FE, U+2600-27BF, U+2934-2935, U+2B05-2B55, U+3030, U+303D,
+      U+3297, U+3299, U+FE0F, U+1F000-1FAFF, U+E0060-E00FF;
+    font-display: swap;
+  }
+
+  :root { --side-w: 260px; }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+      "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", "Emoji Fallback";
+    display: flex; height: 100dvh; overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+  button:disabled { cursor: default; }
+  svg { display: block; flex: none; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--active); }
+  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+  /* ------------------------------------------------------------- sidebar -- */
+  #sidebar {
+    width: var(--side-w); flex: none; background: var(--bg-side);
+    display: flex; flex-direction: column; overflow: hidden;
+    position: relative;
+    transition: width .22s ease, transform .22s ease;
+  }
+  #sidebar > .inner {
+    width: var(--side-w); flex: 1; display: flex; flex-direction: column; min-height: 0;
+  }
+  body.collapsed #sidebar { width: 0; }
+  /* drag-to-resize grip on the sidebar's right edge */
+  #sideGrip {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 6px;
+    cursor: col-resize; z-index: 5; touch-action: none;
+  }
+  #sideGrip::after {
+    content: ""; position: absolute; top: 0; bottom: 0; right: 0; width: 2px;
+    background: transparent; transition: background .12s;
+  }
+  #sideGrip:hover::after, #sideGrip:focus-visible::after { background: var(--active); }
+  body.dragging-side #sideGrip::after { background: var(--accent); }
+  body.dragging-side #sidebar { transition: none; }
+  body.dragging-side { user-select: none; cursor: col-resize; }
+  .side-head {
+    display: flex; align-items: center; gap: 8px; padding: 14px 14px 8px;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+  .brand svg { color: var(--accent); }
+  .new-chat {
+    display: flex; align-items: center; gap: 10px; margin: 6px 8px 4px;
+    padding: 10px 12px; border-radius: 10px; font-weight: 500;
+  }
+  .new-chat:hover { background: var(--hover); }
+  .side-label { padding: 14px 16px 4px; font-size: 12px; color: var(--text-3); font-weight: 500; }
+  #chatList { flex: 1; overflow-y: auto; padding: 0 8px 8px; min-height: 0; }
+  .chat-item {
+    display: flex; align-items: center; gap: 8px; padding: 9px 10px;
+    border-radius: 10px; cursor: pointer; position: relative; color: var(--text);
+  }
+  .chat-item:hover { background: var(--hover); }
+  .chat-item.active { background: var(--active); }
+  .chat-item .ct {
+    flex: 1; white-space: nowrap; overflow: hidden; min-width: 0;
+    mask-image: linear-gradient(90deg, #000 85%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, #000 85%, transparent);
+  }
+  .chat-item .live {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .chat-item .del {
+    display: none; padding: 4px; border-radius: 6px; color: var(--text-3);
+  }
+  .chat-item:hover .del { display: block; }
+  .chat-item .del:hover { color: var(--err); background: var(--hover); }
+  .side-empty { padding: 10px 12px; color: var(--text-3); font-size: 13px; }
+  .side-foot {
+    padding: 8px 8px 12px; border-top: 1px solid var(--border-soft);
+    display: flex; flex-direction: column; gap: 8px; color: var(--text-2); font-size: 12px;
+  }
+  #storeToggle {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 8px; border-radius: 10px; text-align: left;
+  }
+  #storeToggle:hover { background: var(--hover); }
+  .st-txt { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .st-name { font-size: 13px; font-weight: 500; color: var(--text); }
+  .st-sub { font-size: 11.5px; color: var(--text-3); }
+  .sw {
+    margin-left: auto; flex: none; width: 34px; height: 20px; border-radius: 999px;
+    background: var(--ic-bg); position: relative; transition: background .15s;
+  }
+  .sw .knob {
+    position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+    background: var(--bg-menu); box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: left .15s;
+  }
+  #storeToggle[aria-checked="true"] .sw { background: var(--accent); }
+  #storeToggle[aria-checked="true"] .sw .knob { left: 16px; background: #fff; }
+  .side-note { display: flex; gap: 10px; align-items: flex-start; padding: 0 8px; }
+  .side-note svg { color: var(--ok); margin-top: 1px; flex: none; }
+
+  #backdrop {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 25;
+  }
+
+  /* ---------------------------------------------------------------- main -- */
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+  header {
+    display: flex; align-items: center; gap: 4px; padding: 10px 14px; flex: none;
+  }
+  .icon-btn {
+    padding: 8px; border-radius: 10px; color: var(--text-2); display: flex;
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  /* while the sidebar is open (desktop) its own close button is the toggle -
+     showing the header one too reads as a duplicated icon */
+  @media (min-width: 769px) {
+    body:not(.collapsed) #menuBtn { display: none; }
+  }
+  .model-wrap { position: relative; }
+  #modelBtn {
+    display: flex; align-items: center; gap: 6px; padding: 8px 12px;
+    border-radius: 10px; font-weight: 600; font-size: 15px;
+  }
+  #modelBtn:hover { background: var(--hover); }
+  #modelBtn .chev { color: var(--text-3); transition: transform .15s; }
+  #modelBtn[aria-expanded="true"] .chev { transform: rotate(180deg); }
+  #modelMenu {
+    position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+    min-width: 300px; background: var(--bg-menu); border: 1px solid var(--border-soft);
+    border-radius: 14px; box-shadow: var(--shadow); padding: 6px; display: none;
+  }
+  #modelMenu.open { display: block; }
+  .menu-label { padding: 8px 12px 4px; font-size: 12px; color: var(--text-3); font-weight: 500; }
+  .m-item {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 9px 12px; border-radius: 10px; text-align: left;
+  }
+  .m-item:hover { background: var(--hover); }
+  .m-item .m-txt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .m-item .m-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .m-item .m-sub { font-size: 12px; color: var(--text-3); }
+  .m-item .tick { color: var(--text); visibility: hidden; }
+  .m-item.sel .tick { visibility: visible; }
+  .menu-sep { height: 1px; background: var(--border-soft); margin: 6px 4px; }
+  .seg-row { display: flex; align-items: center; gap: 10px; padding: 6px 12px 8px; }
+  .seg-row > span { font-size: 12px; color: var(--text-3); font-weight: 500; }
+  .seg { display: flex; background: var(--hover); border-radius: 9px; padding: 3px; margin-left: auto; }
+  .seg button { padding: 4px 12px; border-radius: 7px; font-size: 12.5px; color: var(--text-2); }
+  .seg button.on { background: var(--bg-menu); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 500; }
+
+  #warmPill {
+    display: none; align-items: center; gap: 7px; margin-left: 6px;
+    padding: 5px 12px; border-radius: 999px; font-size: 12.5px;
+    background: var(--hover); color: var(--text-2); max-width: 42vw;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #warmPill.show { display: inline-flex; }
+  #warmPill.ok { color: var(--ok); }
+  #warmPill.fail { color: var(--warn); }
+  .spin {
+    width: 12px; height: 12px; border-radius: 50%; flex: none;
+    border: 2px solid var(--border); border-top-color: var(--text-2);
+    animation: rot .8s linear infinite;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .spacer { flex: 1; }
+
+  /* ------------------------------------------------------------ messages -- */
+  #scroller { flex: 1; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; }
+  #log { width: 100%; max-width: 768px; margin: 0 auto; padding: 20px 20px 8px; }
+
+  #empty {
+    margin: auto; text-align: center; padding: 24px 20px 40px; max-width: 620px; width: 100%;
+  }
+  #empty .mark {
+    width: 56px; height: 56px; margin: 0 auto 18px; border-radius: 16px;
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent);
+  }
+  #empty h1 { font-size: 28px; font-weight: 600; letter-spacing: -.02em; }
+  #empty p { margin-top: 10px; color: var(--text-2); font-size: 14px; }
+  .chips { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 28px; }
+  .chip {
+    padding: 12px 14px; border: 1px solid var(--border-soft); border-radius: 14px;
+    text-align: left; font-size: 13.5px; color: var(--text-2); background: var(--bg);
+    transition: background .12s, border-color .12s;
+  }
+  .chip:hover { background: var(--hover); color: var(--text); }
+
+  .row { margin-bottom: 26px; }
+  .row.user { display: flex; flex-direction: column; align-items: flex-end; }
+  .bubble {
+    background: var(--bubble); border-radius: 18px; padding: 10px 16px;
+    max-width: 78%; white-space: pre-wrap; overflow-wrap: break-word;
+    font-size: 15.5px; line-height: 1.6;
+  }
+  .row .actions {
+    display: flex; align-items: center; gap: 2px; margin-top: 6px;
+    opacity: 0; transition: opacity .12s;
+  }
+  .row:hover .actions, .row.tail .actions { opacity: 1; }
+  .act {
+    padding: 6px; border-radius: 8px; color: var(--text-3); display: flex;
+  }
+  .act:hover { background: var(--hover); color: var(--text); }
+  .act.done { color: var(--ok); }
+  .meta {
+    margin-left: 8px; font-size: 12px; color: var(--text-3); cursor: default;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* in-place editor for a sent user message */
+  .row.user .edit-wrap {
+    width: 100%; background: var(--composer);
+    border: 1px solid var(--border-soft); border-radius: 18px;
+    padding: 12px 14px 10px;
+  }
+  .edit-ta {
+    width: 100%; resize: none; border: 0; outline: none; background: transparent;
+    color: var(--text); font: 15.5px/1.6 inherit; font-family: inherit;
+    max-height: 320px; caret-color: var(--text);
+  }
+  .edit-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  .ebtn {
+    padding: 7px 14px; border-radius: 999px; font-size: 13px; font-weight: 500;
+    background: var(--hover);
+  }
+  .ebtn:hover { background: var(--active); }
+  .ebtn.primary { background: var(--btn); color: var(--btn-fg); }
+  .ebtn.primary:hover { background: var(--btn); opacity: .85; }
+  .ebtn:disabled { opacity: .4; }
+
+  .notice {
+    display: flex; justify-content: center; margin: 0 0 22px;
+  }
+  .notice span {
+    font-size: 12.5px; color: var(--warn); background: var(--hover);
+    padding: 5px 14px; border-radius: 999px; text-align: center;
+  }
+
+  .errcard {
+    border: 1px solid var(--err-border); background: var(--err-bg);
+    border-radius: 14px; padding: 12px 16px; margin-bottom: 26px;
+    display: flex; gap: 12px; align-items: flex-start; font-size: 13.5px;
+  }
+  .errcard svg { color: var(--err); margin-top: 1px; }
+  .errcard .emsg { flex: 1; color: var(--text); overflow-wrap: anywhere; }
+  .errcard .retry {
+    flex: none; padding: 6px 14px; border-radius: 999px; font-weight: 500;
+    border: 1px solid var(--err-border); color: var(--err);
+  }
+  .errcard .retry:hover { background: var(--err); color: #fff; border-color: var(--err); }
+  .partial { opacity: .6; margin-bottom: 10px; }
+
+  /* markdown body */
+  .md { font-size: 15.5px; line-height: 1.7; overflow-wrap: break-word; }
+  .md > * + * { margin-top: 12px; }
+  .md h1 { font-size: 1.4em; line-height: 1.3; margin-top: 18px; }
+  .md h2 { font-size: 1.25em; line-height: 1.3; margin-top: 18px; }
+  .md h3 { font-size: 1.1em; margin-top: 16px; }
+  .md h4 { font-size: 1em; margin-top: 14px; }
+  .md a { color: var(--accent); text-decoration: none; }
+  .md a:hover { text-decoration: underline; }
+  .md ul, .md ol { padding-left: 24px; }
+  .md li { margin-top: 5px; }
+  .md li:first-child { margin-top: 0; }
+  .md blockquote {
+    border-left: 3px solid var(--border); padding: 2px 0 2px 14px; color: var(--text-2);
+  }
+  .md hr { border: 0; border-top: 1px solid var(--border-soft); }
+  .md code.ic {
+    background: var(--ic-bg); padding: .15em .4em; border-radius: 6px;
+    font: .88em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .md .code, .api-card .code {
+    border: 1px solid var(--border-soft); border-radius: 12px; overflow: hidden;
+    background: var(--code-bg);
+  }
+  .code-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 8px 6px 14px; background: var(--code-head);
+    font-size: 12px; color: var(--text-2);
+  }
+  .cbtn {
+    display: flex; align-items: center; gap: 5px; padding: 4px 8px;
+    border-radius: 7px; font-size: 12px; color: var(--text-2);
+  }
+  .cbtn:hover { background: var(--hover); color: var(--text); }
+  .cbtn.done { color: var(--ok); }
+  .md pre {
+    padding: 13px 15px; overflow-x: auto;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .tblwrap { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: 12px; }
+  .md table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  .md th, .md td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border-soft); }
+  .md th { font-weight: 600; background: var(--hover); }
+  .md tr:last-child td { border-bottom: 0; }
+
+  /* <think> reasoning blocks: collapsed disclosures, expandable */
+  .md details.think {
+    border: 1px solid var(--border-soft); border-radius: 12px; overflow: hidden;
+  }
+  .md details.think summary {
+    display: flex; align-items: center; gap: 7px; padding: 9px 14px;
+    cursor: pointer; list-style: none; user-select: none;
+    color: var(--text-3); font-size: 13px; font-weight: 500;
+  }
+  .md details.think summary::-webkit-details-marker { display: none; }
+  .md details.think summary:hover { background: var(--hover); color: var(--text-2); }
+  .md details.think summary .chev { transition: transform .15s; }
+  .md details.think[open] > summary .chev { transform: rotate(90deg); }
+  .md .think-body {
+    padding: 4px 14px 12px; font-size: 13.5px; line-height: 1.6; color: var(--text-2);
+  }
+
+  /* streaming cursor + status shimmer */
+  .streaming .md > :last-child::after, .streaming .md:empty::after {
+    content: ""; display: inline-block; width: .5em; height: 1em;
+    margin-left: 3px; vertical-align: -.12em; border-radius: 2px;
+    background: var(--text); animation: pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: .25; } }
+  /* while reasoning streams: no cursor after the collapsed box (the summary's
+     "Thinking…" shimmer is the indicator); cursor inside the body when the
+     user expands the LIVE block; none inside already-finished blocks */
+  .streaming .md > details.think:last-child::after { content: none; }
+  .streaming details.think:not(.live) .think-body > :last-child::after { content: none; }
+  .statusline { font-size: 14px; }
+  .shimmer {
+    background: linear-gradient(90deg, var(--text-3) 35%, var(--text) 50%, var(--text-3) 65%);
+    background-size: 200% 100%; -webkit-background-clip: text; background-clip: text;
+    color: transparent; animation: shim 2s linear infinite; width: fit-content;
+  }
+  @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+  /* -------------------------------------------------------- API dialog -- */
+  #apiOverlay {
+    display: none; position: fixed; inset: 0; z-index: 60;
+    background: rgba(0,0,0,.5); align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  #apiOverlay.open { display: flex; }
+  .api-card {
+    background: var(--bg-menu); border: 1px solid var(--border-soft);
+    border-radius: 16px; box-shadow: var(--shadow); padding: 20px 22px;
+    max-width: 620px; width: 100%; max-height: 90dvh; overflow-y: auto;
+    font-size: 13.5px; line-height: 1.6;
+  }
+  .api-card > p { color: var(--text-2); }
+  .api-head { display: flex; align-items: center; margin-bottom: 10px; }
+  .api-head h2 { font-size: 16px; font-weight: 600; flex: 1; }
+  .api-url {
+    display: flex; align-items: center; gap: 8px; margin: 10px 0 14px;
+    background: var(--code-bg); border: 1px solid var(--border-soft);
+    border-radius: 10px; padding: 8px 8px 8px 12px;
+  }
+  .api-url code {
+    flex: 1; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow-wrap: anywhere;
+  }
+  .api-card .code { margin: 0 0 14px; }
+  .api-card pre {
+    padding: 12px 14px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .api-fine { color: var(--text-3); font-size: 12.5px; }
+  .api-fine .ic {
+    background: var(--ic-bg); padding: .1em .35em; border-radius: 5px;
+    font: .95em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  #jump {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 128px;
+    width: 34px; height: 34px; border-radius: 50%; display: none;
+    align-items: center; justify-content: center; z-index: 10;
+    background: var(--bg-menu); border: 1px solid var(--border-soft);
+    box-shadow: var(--shadow); color: var(--text-2);
+  }
+  #jump.show { display: flex; }
+  #jump:hover { color: var(--text); }
+
+  /* ------------------------------------------------------------ composer -- */
+  .composer-outer { flex: none; padding: 4px 20px 0; }
+  #composer {
+    display: flex; align-items: flex-end; gap: 8px;
+    max-width: 768px; margin: 0 auto; padding: 10px 10px 10px 20px;
+    background: var(--composer); border-radius: 28px;
+    border: 1px solid var(--border-soft);
+    transition: box-shadow .15s;
+  }
+  #composer:focus-within { box-shadow: 0 2px 12px rgba(0,0,0,.08); border-color: var(--active); }
+  #input {
+    flex: 1; resize: none; border: 0; outline: none; background: transparent;
+    color: var(--text); font: 15.5px/1.5 inherit; font-family: inherit;
+    max-height: 200px; padding: 6px 0; caret-color: var(--text);
+  }
+  #input::placeholder { color: var(--text-3); }
+  #sendBtn {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--btn); color: var(--btn-fg); transition: opacity .12s, transform .08s;
+  }
+  #sendBtn:not(:disabled):active { transform: scale(.92); }
+  #sendBtn:disabled { opacity: .25; }
+  .footnote {
+    text-align: center; color: var(--text-3); font-size: 11.5px;
+    padding: 8px 16px 10px; max-width: 768px; margin: 0 auto;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .01s !important; transition-duration: .01s !important; }
+  }
+
+  @media (max-width: 768px) {
+    #sidebar {
+      position: fixed; inset: 0 auto 0 0; z-index: 30; width: 280px;
+      transform: translateX(-100%); box-shadow: none;
+    }
+    #sidebar > .inner { width: 280px; }
+    body.collapsed #sidebar { width: 280px; }
+    #sideGrip { display: none; } /* the mobile sidebar is a fixed-width overlay */
+    body.side-open #sidebar { transform: none; box-shadow: var(--shadow); }
+    body.side-open #backdrop { display: block; }
+    .chat-item .del { display: block; }
+    .chips { grid-template-columns: 1fr; }
+    .bubble { max-width: 88%; }
+    #log { padding: 16px 16px 8px; }
+    .composer-outer { padding: 4px 12px 0; }
+    #input { font-size: 16px; } /* prevent iOS zoom-on-focus */
+    #empty h1 { font-size: 23px; }
+    #jump { bottom: 118px; }
+  }
+</style>
+</head>
+<body class="collapsed">
+
+<aside id="sidebar">
+  <div class="inner">
+    <div class="side-head">
+      <span class="brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.3 6.7 6.7 2.3-6.7 2.3L12 20.5l-2.3-6.7L3 11.5l6.7-2.3z"/></svg>
+        llm-chat
+      </span>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="closeSide" aria-label="Close sidebar" title="Close sidebar">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9.5 4v16"/></svg>
+      </button>
+    </div>
+    <button class="new-chat" id="newChatBtn">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.7 3.8a2.1 2.1 0 0 1 3 3L7.5 19l-4 1 1-4z"/></svg>
+      New chat
+    </button>
+    <div class="side-label">Chats</div>
+    <nav id="chatList" aria-label="Chat history"></nav>
+    <div class="side-foot">
+      <button id="storeToggle" type="button" role="switch" aria-checked="false"
+              title="Store chat history and preferences in this browser">
+        <span class="st-txt">
+          <span class="st-name">Remember on this device</span>
+          <span class="st-sub" id="storeSub">Nothing is stored in this browser</span>
+        </span>
+        <span class="sw" aria-hidden="true"><span class="knob"></span></span>
+      </button>
+      <div class="side-note">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
+        <span>Confidential inference — runs sandboxed via wasi-nn; chat history never leaves this device.</span>
+      </div>
+    </div>
+  </div>
+  <div id="sideGrip" role="separator" aria-orientation="vertical" aria-label="Resize sidebar (drag, arrow keys, or double-click to reset)" tabindex="0"></div>
+</aside>
+<div id="backdrop"></div>
+
+<main>
+  <header>
+    <button class="icon-btn" id="menuBtn" aria-label="Toggle sidebar" title="Toggle sidebar">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9.5 4v16"/></svg>
+    </button>
+    <div class="model-wrap">
+      <button id="modelBtn" aria-haspopup="menu" aria-expanded="false">
+        <span id="modelLabel">loading&#8230;</span>
+        <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+      <div id="modelMenu" role="menu"></div>
+    </div>
+    <span id="warmPill" role="status"></span>
+    <span class="spacer"></span>
+    <button class="icon-btn" id="apiBtn" aria-label="API access" title="API access">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 5.5L21 12l-5.5 6.5M8.5 5.5L3 12l5.5 6.5"/></svg>
+    </button>
+    <button class="icon-btn" id="themeBtn" aria-label="Toggle theme" title="Toggle theme">
+      <svg id="iconSun" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.4"/><path d="M12 2.5v2.4M12 19.1v2.4M4.3 4.3L6 6M18 18l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.3 19.7L6 18M18 6l1.7-1.7"/></svg>
+      <svg id="iconMoon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </header>
+
+  <div id="scroller">
+    <div id="empty">
+      <div class="mark">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.3 6.7 6.7 2.3-6.7 2.3L12 20.5l-2.3-6.7L3 11.5l6.7-2.3z"/></svg>
+      </div>
+      <h1>What can I help with?</h1>
+      <p>Private inference inside a secure enclave — nothing you type ever leaves it.</p>
+      <div class="chips">
+        <button class="chip">Explain confidential computing in simple terms</button>
+        <button class="chip">Write a haiku about secure enclaves</button>
+        <button class="chip">Draft a short email asking to reschedule a meeting</button>
+        <button class="chip">Show me a Python snippet that parses JSON</button>
+      </div>
+    </div>
+    <div id="log" aria-live="polite"></div>
+  </div>
+
+  <div id="apiOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="apiTitle">
+      <div class="api-head">
+        <h2 id="apiTitle">OpenAI-compatible API</h2>
+        <button class="icon-btn" id="apiClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <p>This deployment serves the same models over an OpenAI-compatible API — point any OpenAI SDK at:</p>
+      <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
+      <div class="code"><div class="code-head"><span>curl</span><button type="button" class="cbtn" id="apiCopyCurl">Copy</button></div><pre><code id="apiCurl"></code></pre></div>
+      <p class="api-fine">Streaming and non-streaming. Also <code class="ic">GET /v1/models</code>, <code class="ic">GET /warmup?model=…</code>.
+      Model names match the picker. If the deployment config sets <code class="ic">api_key</code>, send it as
+      <code class="ic">Authorization: Bearer &lt;key&gt;</code>. Requests run in the same enclave as this chat.</p>
+    </div>
+  </div>
+
+  <button id="jump" aria-label="Scroll to bottom">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+  </button>
+
+  <div class="composer-outer">
+    <form id="composer">
+      <textarea id="input" rows="1" placeholder="Ask anything" autofocus></textarea>
+      <button id="sendBtn" type="submit" aria-label="Send" disabled>
+        <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        <svg id="iconStop" width="18" height="18" viewBox="0 0 24 24" style="display:none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+      </button>
+    </form>
+    <p class="footnote">Answer quality tracks model size — small models are quick and frequently wrong. Chats stay in this browser.</p>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ------------------------------------------------------------------ icons --
+const ICONS = {
+  copy: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 14.5V5.5A2.5 2.5 0 0 1 7.5 3h9"/></svg>',
+  check: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L20 6.5"/></svg>',
+  regen: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/></svg>',
+  edit: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.7 3.8a2.1 2.1 0 0 1 3 3L7.5 19l-4 1 1-4z"/></svg>',
+  trash: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11.5v6M14 11.5v6M6 7l1 12.4A2 2 0 0 0 9 21.2h6a2 2 0 0 0 2-1.8L18 7M9.5 7V4.8A1.8 1.8 0 0 1 11.3 3h1.4a1.8 1.8 0 0 1 1.8 1.8V7"/></svg>',
+  alert: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>',
+  tick: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L20 6.5"/></svg>',
+  chev: '<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+};
+
+// --------------------------------------------------------------- markdown --
+// Minimal dependency-free renderer for assistant replies. Every block is
+// HTML-escaped before any formatting, only http(s)/mailto links survive, and
+// an unterminated ``` fence still renders as a code block so streaming looks
+// right mid-fence.
+const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function esc(s) { return s.replace(/[&<>"']/g, (c) => ESC[c]); }
+
+function safeHref(h) {
+  return /^(https?:|mailto:)/i.test(h.trim()) ? h.trim() : null;
+}
+
+function inline(s) {
+  const slots = [];
+  const stash = (html) => "\u0000" + (slots.push(html) - 1) + "\u0001";
+  let out = esc(s);
+  // inline code first: its content must not be styled further
+  out = out.replace(/`([^`\n]+)`/g, (_, c) => stash('<code class="ic">' + c + "</code>"));
+  out = out.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, t, h) => {
+    const href = safeHref(h);
+    return href ? stash('<a href="' + href + '" target="_blank" rel="noopener">' + t + "</a>") : m;
+  });
+  out = out.replace(/(^|[\s(])(https?:\/\/[^\s<>()\u0000]+[^\s<>()\u0000.,;:!?])/g,
+    (_, pre, u) => pre + stash('<a href="' + u + '" target="_blank" rel="noopener">' + u + "</a>"));
+  out = out
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  return out.replace(/\u0000(\d+)\u0001/g, (_, i) => slots[+i]);
+}
+
+function buildList(items, start, depth) {
+  const ordered = items[start].o;
+  let html = ordered ? "<ol>" : "<ul>";
+  let k = start;
+  while (k < items.length && items[k].d >= depth) {
+    if (items[k].d > depth) {
+      const sub = buildList(items, k, items[k].d);
+      html = html.replace(/<\/li>$/, sub.html + "</li>");
+      k = sub.next;
+    } else {
+      html += "<li>" + inline(items[k].t) + "</li>";
+      k++;
+    }
+  }
+  return { html: html + (ordered ? "</ol>" : "</ul>"), next: k };
+}
+
+function md(src) {
+  const lines = src.replace(/\r\n?/g, "\n").split("\n");
+  let html = "", i = 0, para = [];
+  const flush = () => {
+    if (para.length) { html += "<p>" + para.map(inline).join("<br>") + "</p>"; para = []; }
+  };
+  const isSep = (l) => l.includes("-") && /^\s*\|?(\s*:?-{2,}:?\s*\|)*\s*:?-{2,}:?\s*\|?\s*$/.test(l);
+  const cells = (l) => {
+    let t = l.trim();
+    if (t.startsWith("|")) t = t.slice(1);
+    if (t.endsWith("|")) t = t.slice(0, -1);
+    return t.split("|").map((c) => c.trim());
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```([\w+#.-]*)\s*$/);
+    if (fence) {
+      flush();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) buf.push(lines[i++]);
+      i++; // past the closing fence (or EOF while the fence is still streaming)
+      html += '<div class="code"><div class="code-head"><span>' + (esc(fence[1]) || "code") +
+        '</span><button type="button" class="cbtn" data-copy-code>' + ICONS.copy +
+        "<span>Copy</span></button></div><pre><code>" + esc(buf.join("\n")) + "</code></pre></div>";
+      continue;
+    }
+    if (/^\s*$/.test(line)) { flush(); i++; continue; }
+    const h = line.match(/^\s{0,3}(#{1,4})\s+(.*)$/);
+    if (h) { flush(); const n = h[1].length; html += "<h" + n + ">" + inline(h[2]) + "</h" + n + ">"; i++; continue; }
+    if (/^\s{0,3}([-*_])( *\1){2,} *$/.test(line)) { flush(); html += "<hr>"; i++; continue; }
+    if (/^\s{0,3}>/.test(line)) {
+      flush();
+      const buf = [];
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) buf.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+      html += "<blockquote>" + buf.map(inline).join("<br>") + "</blockquote>";
+      continue;
+    }
+    if (/^(\s*)([-*+]|\d+[.)])\s+/.test(line)) {
+      flush();
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+        if (!m) break;
+        items.push({
+          d: Math.min(3, Math.floor(m[1].replace(/\t/g, "  ").length / 2)),
+          o: /\d/.test(m[2]),
+          t: m[3],
+        });
+        i++;
+      }
+      html += buildList(items, 0, items[0].d).html;
+      continue;
+    }
+    if (line.includes("|") && i + 1 < lines.length && lines[i + 1].includes("|") && isSep(lines[i + 1])) {
+      flush();
+      const head = cells(line);
+      i += 2;
+      let rows = "";
+      while (i < lines.length && lines[i].includes("|") && !/^\s*$/.test(lines[i])) {
+        rows += "<tr>" + cells(lines[i]).map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>";
+        i++;
+      }
+      html += '<div class="tblwrap"><table><thead><tr>' +
+        head.map((c) => "<th>" + inline(c) + "</th>").join("") +
+        "</tr></thead><tbody>" + rows + "</tbody></table></div>";
+      continue;
+    }
+    para.push(line);
+    i++;
+  }
+  flush();
+  return html;
+}
+// ---- <think> blocks (reasoning models): split them out of a reply so they
+// render as collapsed, expandable disclosures instead of raw tags. An
+// unterminated <think> (mid-stream, or a reply stopped inside one) is an
+// OPEN segment - streamed live under a "Thinking…" header.
+function splitThink(src) {
+  const parts = [];
+  let rest = src;
+  for (;;) {
+    const i = rest.indexOf("<think>");
+    if (i < 0) { if (rest) parts.push({ text: rest }); break; }
+    if (i > 0) parts.push({ text: rest.slice(0, i) });
+    const j = rest.indexOf("</think>", i + 7);
+    if (j < 0) { parts.push({ think: rest.slice(i + 7), open: true }); break; }
+    parts.push({ think: rest.slice(i + 7, j) });
+    rest = rest.slice(j + 8);
+  }
+  return parts;
+}
+
+// The visible answer: what message-copy takes, and what goes back to the API
+// as history (reasoning-model convention: prior turns' thinking is dropped).
+function stripThink(src) {
+  return splitThink(src).map((p) => p.text || "").join("").trim();
+}
+
+function assistantHtml(src, streaming) {
+  let html = "";
+  for (const p of splitThink(src)) {
+    if (p.think === undefined) { html += md(p.text); continue; }
+    if (!p.think.trim()) continue; // thinking disabled: an empty block, skip it
+    const live = streaming && p.open;
+    html += '<details class="think' + (live ? " live" : "") + '"><summary>' + ICONS.chev +
+      (live ? '<span class="shimmer">Thinking&#8230;</span>' : "<span>Thoughts</span>") +
+      '</summary><div class="md think-body">' + md(p.think) + "</div></details>";
+  }
+  return html;
+}
+// ----------------------------------------------------------- end markdown --
+
+// ------------------------------------------------------------------ state --
+const state = {
+  chats: [],        // {id, title, messages:[{role,content,meta?}], streaming:null|{reply,status}, error:null|{text,message,partial}}
+  currentId: null,
+  busyChatId: null, // one generation at a time, tab-wide
+  abort: null,
+  models: [],
+  model: "",
+  target: "auto",
+};
+// ids must stay unique across sessions - chats persist to IndexedDB
+const chatId = () => "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+const $ = (id) => document.getElementById(id);
+const scroller = $("scroller"), log = $("log"), emptyEl = $("empty");
+const input = $("input"), form = $("composer"), sendBtn = $("sendBtn");
+const iconSend = $("iconSend"), iconStop = $("iconStop");
+const chatList = $("chatList"), jump = $("jump");
+const modelBtn = $("modelBtn"), modelMenu = $("modelMenu"), modelLabel = $("modelLabel");
+const warmPill = $("warmPill");
+
+const current = () => state.chats.find((c) => c.id === state.currentId) || null;
+const isMobile = () => matchMedia("(max-width: 768px)").matches;
+
+// ------------------------------------------------------------ persistence --
+// Browser storage is OPT-IN ("Remember on this device", default off). The
+// consent flag is only ever written when it is ON, and turning it off wipes
+// everything (IndexedDB chats + preference keys) - an opted-out browser holds
+// zero llm-chat data. While off, history and preferences live in memory for
+// the tab's lifetime only.
+const PREF_KEYS = ["llmchat-store", "llmchat-theme", "llmchat-model", "llmchat-target", "llmchat-sidew"];
+let storeOK = false;
+try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
+function pref(key, val) {
+  if (storeOK) try { localStorage.setItem(key, val); } catch (_) {}
+}
+
+// Chats persist to IndexedDB - local to this browser profile, never sent
+// anywhere (the enclave never sees stored history; each request carries only
+// the messages it needs). A missing/broken IndexedDB (some private windows)
+// degrades silently to tab-lifetime history. Opened lazily so an opted-out
+// visit never creates the database.
+let db = null, dbOpen = null;
+function openDb() {
+  if (dbOpen) return dbOpen;
+  dbOpen = new Promise((resolve) => {
+    let req;
+    try { req = indexedDB.open("llmchat", 1); } catch (_) { resolve(); return; }
+    req.onupgradeneeded = () => { req.result.createObjectStore("chats", { keyPath: "id" }); };
+    req.onsuccess = () => { db = req.result; resolve(); };
+    req.onerror = () => resolve();
+    req.onblocked = () => resolve();
+  });
+  return dbOpen;
+}
+function wipeStorage() {
+  try { for (const k of PREF_KEYS) localStorage.removeItem(k); } catch (_) {}
+  if (db) { try { db.close(); } catch (_) {} db = null; }
+  dbOpen = null;
+  try { indexedDB.deleteDatabase("llmchat"); } catch (_) {}
+}
+
+function renderStoreToggle() {
+  $("storeToggle").setAttribute("aria-checked", String(storeOK));
+  $("storeSub").textContent = storeOK
+    ? "Chats & settings stored in this browser"
+    : "Nothing is stored in this browser";
+}
+async function setStoring(on) {
+  storeOK = on;
+  renderStoreToggle();
+  if (on) {
+    try { localStorage.setItem("llmchat-store", "1"); } catch (_) {}
+    // snapshot the session so far: current prefs + any chats already in memory
+    pref("llmchat-theme", document.documentElement.dataset.theme);
+    if (state.model) pref("llmchat-model", state.model);
+    pref("llmchat-target", state.target);
+    pref("llmchat-sidew", String(sideW));
+    await openDb();
+    for (const c of state.chats) persist(c);
+  } else {
+    wipeStorage();
+  }
+}
+$("storeToggle").addEventListener("click", () => setStoring(!storeOK));
+renderStoreToggle();
+
+function persist(chat) {
+  if (!db || !storeOK) return;
+  try {
+    if (!chat.messages.length && !chat.error) {
+      // emptied out (e.g. stop-before-first-token popped the question):
+      // drop any stale record rather than saving a blank
+      db.transaction("chats", "readwrite").objectStore("chats").delete(chat.id);
+      return;
+    }
+    db.transaction("chats", "readwrite").objectStore("chats").put({
+      id: chat.id, title: chat.title, messages: chat.messages,
+      error: chat.error, t: Date.now(),
+    });
+  } catch (_) {}
+}
+
+function unpersist(id) {
+  if (!db) return;
+  try { db.transaction("chats", "readwrite").objectStore("chats").delete(id); } catch (_) {}
+}
+
+function loadChats() {
+  if (!db) return Promise.resolve([]);
+  return new Promise((resolve) => {
+    try {
+      const req = db.transaction("chats").objectStore("chats").getAll();
+      req.onsuccess = () => resolve((req.result || []).sort((a, b) => (b.t || 0) - (a.t || 0)));
+      req.onerror = () => resolve([]);
+    } catch (_) { resolve([]); }
+  });
+}
+
+function node(html) {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content.firstChild;
+}
+
+function fmtBytes(n) {
+  if (!n) return "";
+  const g = n / (1024 ** 3);
+  return g >= 1 ? g.toFixed(1) + " GB" : Math.round(n / (1024 ** 2)) + " MB";
+}
+
+// ------------------------------------------------------------------ theme --
+function applyThemeIcon() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  $("iconSun").style.display = dark ? "" : "none";
+  $("iconMoon").style.display = dark ? "none" : "";
+}
+$("themeBtn").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  pref("llmchat-theme", next);
+  applyThemeIcon();
+});
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+  let stored = null;
+  try { if (storeOK) stored = localStorage.getItem("llmchat-theme"); } catch (_) {}
+  if (stored !== "light" && stored !== "dark") {
+    document.documentElement.dataset.theme = e.matches ? "dark" : "light";
+    applyThemeIcon();
+  }
+});
+applyThemeIcon();
+
+// ---------------------------------------------------------------- sidebar --
+function setSidebar(open) {
+  if (isMobile()) document.body.classList.toggle("side-open", open);
+  else document.body.classList.toggle("collapsed", !open);
+}
+$("menuBtn").addEventListener("click", () => {
+  const open = isMobile()
+    ? !document.body.classList.contains("side-open")
+    : document.body.classList.contains("collapsed");
+  setSidebar(open);
+  // opening hides #menuBtn on desktop - hand focus to the sidebar's toggle
+  if (open && !isMobile()) $("closeSide").focus();
+});
+$("closeSide").addEventListener("click", () => { setSidebar(false); $("menuBtn").focus(); });
+$("backdrop").addEventListener("click", () => setSidebar(false));
+
+function renderSidebar() {
+  chatList.innerHTML = "";
+  if (!state.chats.length) {
+    chatList.appendChild(node('<div class="side-empty">No chats yet</div>'));
+    return;
+  }
+  for (const c of state.chats) {
+    const item = node('<div class="chat-item" role="button" tabindex="0"></div>');
+    if (c.id === state.currentId) item.classList.add("active");
+    if (c.id === state.busyChatId) item.appendChild(node('<span class="live"></span>'));
+    const t = node('<span class="ct"></span>');
+    t.textContent = c.title || "New chat";
+    item.appendChild(t);
+    const del = node('<button class="del" aria-label="Delete chat" title="Delete chat">' + ICONS.trash + "</button>");
+    del.addEventListener("click", (e) => { e.stopPropagation(); deleteChat(c.id); });
+    item.appendChild(del);
+    item.addEventListener("click", () => { switchChat(c.id); if (isMobile()) setSidebar(false); });
+    item.addEventListener("keydown", (e) => { if (e.key === "Enter") item.click(); });
+    chatList.appendChild(item);
+  }
+}
+
+function newChat() {
+  // reuse the current chat if it is still pristine, instead of piling up blanks
+  const cur = current();
+  if (cur && !cur.messages.length && !cur.streaming && !cur.error) { input.focus(); return cur; }
+  const chat = { id: chatId(), title: "", messages: [], streaming: null, error: null };
+  state.chats.unshift(chat);
+  state.currentId = chat.id;
+  renderSidebar(); renderChat(); updateComposer();
+  input.focus();
+  return chat;
+}
+
+function switchChat(id) {
+  if (id === state.currentId) return;
+  state.currentId = id;
+  pinned = true;
+  renderSidebar(); renderChat(); updateComposer();
+}
+
+function deleteChat(id) {
+  if (id === state.busyChatId) stopGeneration();
+  unpersist(id);
+  state.chats = state.chats.filter((c) => c.id !== id);
+  if (state.currentId === id) {
+    state.currentId = state.chats.length ? state.chats[0].id : null;
+    if (!state.currentId) { newChat(); return; }
+    pinned = true;
+  }
+  renderSidebar(); renderChat(); updateComposer();
+}
+
+$("newChatBtn").addEventListener("click", () => { newChat(); if (isMobile()) setSidebar(false); });
+
+// ---- sidebar resize: drag the right-edge grip (desktop only). Width is a
+// UI preference like the theme, so it persists to localStorage. Dragging
+// under the collapse threshold tucks the sidebar away entirely.
+const grip = $("sideGrip");
+const SIDE_MIN = 200, SIDE_MAX = 440, SIDE_DEF = 260, SIDE_COLLAPSE_AT = 130;
+let sideW = SIDE_DEF;
+
+function setSideWidth(px) {
+  sideW = Math.round(Math.min(SIDE_MAX, Math.max(SIDE_MIN, px)));
+  document.documentElement.style.setProperty("--side-w", sideW + "px");
+  return sideW;
+}
+function saveSideWidth() {
+  pref("llmchat-sidew", String(sideW));
+}
+(function initSideWidth() {
+  let w = NaN;
+  try { if (storeOK) w = parseInt(localStorage.getItem("llmchat-sidew"), 10); } catch (_) {}
+  if (!isNaN(w)) setSideWidth(w);
+})();
+
+// window-level move/up listeners for the drag (not pointer capture): moves
+// land wherever the cursor is, and a lost pointerup can't wedge drag state
+function onSideDrag(e) {
+  if (e.clientX < SIDE_COLLAPSE_AT) { document.body.classList.add("collapsed"); return; }
+  document.body.classList.remove("collapsed");
+  setSideWidth(e.clientX);
+}
+function endSideDrag() {
+  if (!document.body.classList.contains("dragging-side")) return;
+  document.body.classList.remove("dragging-side");
+  window.removeEventListener("pointermove", onSideDrag);
+  window.removeEventListener("pointerup", endSideDrag);
+  window.removeEventListener("pointercancel", endSideDrag);
+  saveSideWidth();
+}
+grip.addEventListener("pointerdown", (e) => {
+  if (isMobile()) return;
+  e.preventDefault();
+  document.body.classList.add("dragging-side");
+  window.addEventListener("pointermove", onSideDrag);
+  window.addEventListener("pointerup", endSideDrag);
+  window.addEventListener("pointercancel", endSideDrag);
+});
+window.addEventListener("blur", endSideDrag);
+grip.addEventListener("dblclick", () => { setSideWidth(SIDE_DEF); saveSideWidth(); });
+grip.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  setSideWidth(sideW + (e.key === "ArrowRight" ? 16 : -16));
+  saveSideWidth();
+});
+
+// ----------------------------------------------------------------- scroll --
+let pinned = true;
+scroller.addEventListener("scroll", () => {
+  pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 60;
+  jump.classList.toggle("show", !pinned);
+});
+function scrollBottom(force) {
+  if (pinned || force) scroller.scrollTop = scroller.scrollHeight;
+}
+jump.addEventListener("click", () => { pinned = true; scrollBottom(true); jump.classList.remove("show"); });
+
+// -------------------------------------------------------------- rendering --
+function copyText(text, btn) {
+  const done = () => {
+    if (!btn) return;
+    const prev = btn.innerHTML;
+    btn.classList.add("done");
+    btn.innerHTML = ICONS.check + (btn.classList.contains("cbtn") ? "<span>Copied</span>" : "");
+    setTimeout(() => { btn.classList.remove("done"); btn.innerHTML = prev; }, 1400);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, done);
+  } else {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (_) {}
+    ta.remove(); done();
+  }
+}
+
+function metaLine(meta) {
+  if (!meta) return null;
+  const span = node('<span class="meta"></span>');
+  if (meta.stopped) { span.textContent = "stopped"; return span; }
+  span.textContent = meta.target + " · " + meta.tokens + " tokens · " + meta.tok_per_s + " tok/s";
+  span.title = "load " + meta.load_ms + " ms · prefill " + meta.prefill_ms + " ms · decode " + meta.decode_ms + " ms";
+  return span;
+}
+
+function renderMessage(m, idx, isTail) {
+  if (m.role === "notice") {
+    const n = node('<div class="notice"><span></span></div>');
+    n.firstChild.textContent = m.content;
+    return n;
+  }
+  if (m.role === "user") {
+    const row = node('<div class="row user"><div class="bubble"></div><div class="actions"></div></div>');
+    row.dataset.midx = idx;
+    row.querySelector(".bubble").textContent = m.content;
+    const acts = row.querySelector(".actions");
+    acts.appendChild(
+      node('<button class="act" data-copy-msg="' + idx + '" aria-label="Copy" title="Copy">' + ICONS.copy + "</button>"));
+    if (!state.busyChatId)
+      acts.appendChild(
+        node('<button class="act" data-edit-msg="' + idx + '" aria-label="Edit message" title="Edit message">' + ICONS.edit + "</button>"));
+    return row;
+  }
+  const row = node('<div class="row assistant"><div class="md"></div><div class="actions"></div></div>');
+  if (isTail) row.classList.add("tail");
+  row.querySelector(".md").innerHTML = assistantHtml(m.content, false);
+  const acts = row.querySelector(".actions");
+  acts.appendChild(node('<button class="act" data-copy-msg="' + idx + '" aria-label="Copy" title="Copy">' + ICONS.copy + "</button>"));
+  if (isTail && !state.busyChatId)
+    acts.appendChild(node('<button class="act" data-regen aria-label="Regenerate" title="Regenerate">' + ICONS.regen + "</button>"));
+  const meta = metaLine(m.meta);
+  if (meta) acts.appendChild(meta);
+  return row;
+}
+
+function renderChat() {
+  const chat = current();
+  log.innerHTML = "";
+  const has = chat && (chat.messages.length || chat.streaming || chat.error);
+  emptyEl.style.display = has ? "none" : "";
+  if (!chat) return;
+  const lastIdx = chat.messages.length - 1;
+  chat.messages.forEach((m, idx) => {
+    log.appendChild(renderMessage(m, idx, idx === lastIdx && m.role === "assistant" && !chat.streaming && !chat.error));
+  });
+  if (chat.error) {
+    const q = node('<div class="row user"><div class="bubble"></div></div>');
+    q.querySelector(".bubble").textContent = chat.error.text;
+    log.appendChild(q);
+    if (chat.error.partial) {
+      const p = node('<div class="row assistant"><div class="md partial"></div></div>');
+      p.querySelector(".md").innerHTML = assistantHtml(chat.error.partial, false);
+      log.appendChild(p);
+    }
+    const card = node('<div class="errcard">' + ICONS.alert +
+      '<div class="emsg"></div><button type="button" class="retry" data-retry>Retry</button></div>');
+    card.querySelector(".emsg").textContent = chat.error.message;
+    log.appendChild(card);
+  }
+  if (chat.streaming) {
+    log.appendChild(node('<div class="row assistant streaming" id="streamrow"><div class="md" id="streambody"></div></div>'));
+    updateStreamDOM(chat);
+  }
+  scrollBottom(); // callers that mean "jump to the bottom" set pinned first
+}
+
+function updateStreamDOM(chat) {
+  if (chat.id !== state.currentId || !chat.streaming) return;
+  const body = $("streambody");
+  if (!body) return;
+  const s = chat.streaming;
+  if (s.reply) {
+    // each delta rebuilds the html - carry the user's expand/collapse choices
+    // across the rebuild (think blocks only ever get appended, so index-match)
+    const open = [...body.querySelectorAll("details.think")].map((d) => d.open);
+    body.innerHTML = assistantHtml(s.reply, true);
+    [...body.querySelectorAll("details.think")].forEach((d, i) => { if (open[i]) d.open = true; });
+  } else if (s.status) {
+    body.innerHTML = '<div class="statusline shimmer"></div>';
+    body.firstChild.textContent = s.status;
+  } else {
+    body.innerHTML = "";
+  }
+  scrollBottom();
+}
+
+// message actions (copy / regenerate / retry / code copy) via delegation,
+// so re-rendered nodes keep working
+log.addEventListener("click", (e) => {
+  const cc = e.target.closest("[data-copy-code]");
+  if (cc) {
+    const code = cc.closest(".code").querySelector("pre code");
+    copyText(code.textContent, cc);
+    return;
+  }
+  const cm = e.target.closest("[data-copy-msg]");
+  if (cm) {
+    const chat = current();
+    const m = chat && chat.messages[+cm.dataset.copyMsg];
+    // copy the visible answer, not the reasoning (unless it was ONLY reasoning)
+    if (m) copyText(m.role === "assistant" ? (stripThink(m.content) || m.content) : m.content, cm);
+    return;
+  }
+  const em = e.target.closest("[data-edit-msg]");
+  if (em) { startEdit(+em.dataset.editMsg); return; }
+  if (e.target.closest("[data-regen]")) regenerate();
+  if (e.target.closest("[data-retry]")) retry();
+});
+
+// --------------------------------------------------------------- composer --
+function autosize() {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 200) + "px";
+}
+
+function updateComposer() {
+  const busyHere = state.busyChatId && state.busyChatId === state.currentId;
+  iconSend.style.display = busyHere ? "none" : "";
+  iconStop.style.display = busyHere ? "" : "none";
+  if (busyHere) {
+    sendBtn.disabled = false;
+    sendBtn.title = "Stop generating";
+    sendBtn.setAttribute("aria-label", "Stop generating");
+  } else if (state.busyChatId) {
+    sendBtn.disabled = true;
+    sendBtn.title = "A response is still streaming in another chat";
+  } else {
+    sendBtn.disabled = !input.value.trim();
+    sendBtn.title = "Send";
+    sendBtn.setAttribute("aria-label", "Send");
+  }
+}
+
+input.addEventListener("input", () => { autosize(); updateComposer(); });
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (!state.busyChatId) form.requestSubmit();
+  }
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (apiOverlay.classList.contains("open")) { closeApi(); return; }
+    if (state.busyChatId) stopGeneration();
+    closeModelMenu();
+  }
+});
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (state.busyChatId === state.currentId && state.busyChatId) { stopGeneration(); return; }
+  sendCurrent();
+});
+// The textarea is one line tall inside a much taller pill - clicking the
+// pill's padding must focus the input too, or the composer looks focused
+// (caret from autofocus) while keystrokes go to <body>.
+form.addEventListener("click", (e) => {
+  if (!e.target.closest("#sendBtn")) input.focus();
+});
+
+document.querySelectorAll(".chip").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    input.value = chip.textContent.trim();
+    autosize(); updateComposer();
+    sendCurrent();
+  });
+});
+
+function sendCurrent() {
+  const text = input.value.trim();
+  if (!text || state.busyChatId) return;
+  const chat = current() || newChat();
+  chat.error = null;
+  chat.messages.push({ role: "user", content: text });
+  if (!chat.title) { chat.title = text.slice(0, 64); }
+  // active chat bubbles to the top of the list, like every chat app
+  const i = state.chats.indexOf(chat);
+  if (i > 0) { state.chats.splice(i, 1); state.chats.unshift(chat); }
+  persist(chat);
+  input.value = "";
+  autosize();
+  pinned = true;
+  renderSidebar(); renderChat();
+  run(chat);
+}
+
+function retry() {
+  const chat = current();
+  if (!chat || !chat.error || state.busyChatId) return;
+  const text = chat.error.text;
+  chat.error = null;
+  chat.messages.push({ role: "user", content: text });
+  persist(chat);
+  renderChat();
+  run(chat);
+}
+
+function regenerate() {
+  const chat = current();
+  if (!chat || state.busyChatId || !chat.messages.length) return;
+  if (chat.messages[chat.messages.length - 1].role !== "assistant") return;
+  chat.messages.pop();
+  pinned = true;
+  renderChat();
+  run(chat);
+}
+
+// ---- edit a sent message: swap its bubble for an in-place editor. Sending
+// branches the chat down a new path - the old message, everything after it,
+// and any error state are dropped, and generation re-runs with the new text.
+function startEdit(idx) {
+  const chat = current();
+  if (!chat || state.busyChatId) return;
+  const m = chat.messages[idx];
+  if (!m || m.role !== "user") return;
+  if (log.querySelector(".row.editing")) renderChat(); // one edit at a time
+  const row = log.querySelector('.row.user[data-midx="' + idx + '"]');
+  if (!row) return;
+  row.classList.add("editing");
+  row.innerHTML =
+    '<div class="edit-wrap"><textarea class="edit-ta" rows="1"></textarea>' +
+    '<div class="edit-btns"><button type="button" class="ebtn">Cancel</button>' +
+    '<button type="button" class="ebtn primary">Send</button></div></div>';
+  const ta = row.querySelector(".edit-ta");
+  const [cancelB, sendB] = row.querySelectorAll(".ebtn");
+  const size = () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 320) + "px"; };
+  ta.value = m.content;
+  size();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  ta.addEventListener("input", () => { size(); sendB.disabled = !ta.value.trim(); });
+  ta.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitEdit(idx, ta.value); }
+    else if (e.key === "Escape") { e.stopPropagation(); renderChat(); }
+  });
+  cancelB.addEventListener("click", () => renderChat());
+  sendB.addEventListener("click", () => commitEdit(idx, ta.value));
+}
+
+function commitEdit(idx, text) {
+  const chat = current();
+  text = text.trim();
+  if (!chat || !text || state.busyChatId) { renderChat(); return; }
+  chat.error = null;
+  chat.messages = chat.messages.slice(0, idx);
+  chat.messages.push({ role: "user", content: text });
+  if (idx === 0) chat.title = text.slice(0, 64);
+  const i = state.chats.indexOf(chat);
+  if (i > 0) { state.chats.splice(i, 1); state.chats.unshift(chat); }
+  persist(chat);
+  pinned = true;
+  renderSidebar(); renderChat();
+  run(chat);
+}
+
+function stopGeneration() {
+  if (!state.abort) return;
+  const e = new Error("stopped");
+  e.userStop = true;
+  state.abort.abort(e);
+}
+
+// ------------------------------------------------------------- generation --
+async function run(chat) {
+  state.busyChatId = chat.id;
+  chat.streaming = { reply: "", status: "Preparing…" };
+  const ctl = new AbortController();
+  state.abort = ctl;
+  renderSidebar(); renderChat(); updateComposer();
+
+  const asked = chat.messages[chat.messages.length - 1].content;
+  let reply = "", meta = null, sawDone = false;
+
+  // An instance that dies mid-generation leaves the proxied stream OPEN but
+  // silent until an upstream idle timeout minutes later - without a watchdog
+  // the input stays locked and the chat looks frozen. 75s of total silence is
+  // abnormal: status events cover session init and every decoded token sends
+  // bytes; the longest legitimate mute stretch is a big CPU prefill.
+  let stallTimer = null;
+  const armStall = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => ctl.abort(
+      new Error("No data for 75s — the instance may have died mid-response. Try again.")), 75000);
+  };
+
+  // drop notices from a failed run, then the unanswered question
+  const stripTail = () => {
+    while (chat.messages.length && chat.messages[chat.messages.length - 1].role === "notice")
+      chat.messages.pop();
+    if (chat.messages.length && chat.messages[chat.messages.length - 1].role === "user")
+      chat.messages.pop();
+  };
+
+  try {
+    armStall();
+    // prior assistant turns go back WITHOUT their <think> blocks - the
+    // reasoning-model convention (and it keeps the context window for content)
+    const payload = chat.messages
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({ role: m.role, content: m.role === "assistant" ? stripThink(m.content) : m.content }));
+    const res = await fetch("chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: payload, target: state.target, model: state.model || undefined }),
+      signal: ctl.signal,
+    });
+    if (!res.ok || !res.body) {
+      let e = "HTTP " + res.status;
+      try { e = (await res.json()).error || e; } catch (_) {}
+      throw new Error(typeof e === "string" ? e : (e.message || JSON.stringify(e)));
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      armStall();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        for (const line of ev.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          const d = JSON.parse(line.slice(6));
+          if (d.delta !== undefined) {
+            reply += d.delta;
+            chat.streaming.reply = reply;
+            chat.streaming.status = null;
+            updateStreamDOM(chat);
+          } else if (d.status) {
+            if (!reply) { chat.streaming.status = d.status; updateStreamDOM(chat); }
+          } else if (d.notice) {
+            // the server restarts generation after a notice (gpu -> cpu retry)
+            chat.messages.push({ role: "notice", content: d.notice });
+            reply = "";
+            chat.streaming.reply = "";
+            chat.streaming.status = null;
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.done) {
+            meta = d;
+            sawDone = true;
+          } else if (d.error) {
+            throw new Error(d.error);
+          }
+        }
+      }
+    }
+    // a stream that closes without the done event was cut mid-response (the
+    // instance died or restarted) - surface it instead of recording a
+    // truncated reply as if it were complete
+    if (!sawDone) throw new Error("The stream ended before the response finished — the instance likely restarted. Try again.");
+    chat.messages.push({ role: "assistant", content: reply, meta });
+  } catch (e) {
+    const err = (ctl.signal.aborted && ctl.signal.reason) || e;
+    if (err && err.userStop) {
+      if (reply) {
+        chat.messages.push({ role: "assistant", content: reply, meta: { stopped: true } });
+      } else {
+        // nothing generated yet: hand the question back to the composer
+        stripTail();
+        if (chat.id === state.currentId) { input.value = asked; autosize(); }
+      }
+    } else {
+      stripTail();
+      chat.error = {
+        text: asked,
+        message: "Error: " + ((err && err.message) || String(err)),
+        partial: reply,
+      };
+    }
+  }
+  clearTimeout(stallTimer);
+  chat.streaming = null;
+  state.busyChatId = null;
+  state.abort = null;
+  persist(chat);
+  renderSidebar(); updateComposer();
+  if (chat.id === state.currentId) { renderChat(); input.focus(); }
+}
+
+// -------------------------------------------------------------- API dialog --
+// The base URL is derived from the page's own location (relative, like every
+// fetch here), so it stays correct behind any proxy prefix.
+const apiOverlay = $("apiOverlay");
+function openApi() {
+  const base = new URL("v1", location.href).href;
+  $("apiBase").textContent = base;
+  $("apiCurl").textContent = "curl " + base + "/chat/completions \\\n" +
+    '  -H "content-type: application/json" \\\n' +
+    "  -d '" + JSON.stringify({
+      model: state.model || "default",
+      messages: [{ role: "user", content: "hello" }],
+      stream: true,
+    }, null, 0).replace(/,"/g, ', "') + "'";
+  apiOverlay.classList.add("open");
+  $("apiClose").focus();
+}
+function closeApi() { apiOverlay.classList.remove("open"); }
+$("apiBtn").addEventListener("click", openApi);
+$("apiClose").addEventListener("click", closeApi);
+apiOverlay.addEventListener("click", (e) => { if (e.target === apiOverlay) closeApi(); });
+$("apiCopyBase").addEventListener("click", (e) => copyText($("apiBase").textContent, e.currentTarget));
+$("apiCopyCurl").addEventListener("click", (e) => copyText($("apiCurl").textContent, e.currentTarget));
+
+// ------------------------------------------------------------ model picker --
+function closeModelMenu() {
+  modelMenu.classList.remove("open");
+  modelBtn.setAttribute("aria-expanded", "false");
+}
+modelBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const open = !modelMenu.classList.contains("open");
+  modelMenu.classList.toggle("open", open);
+  modelBtn.setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", (e) => {
+  if (!modelMenu.contains(e.target) && e.target !== modelBtn) closeModelMenu();
+});
+
+function renderModelMenu() {
+  modelMenu.innerHTML = "";
+  modelMenu.appendChild(node('<div class="menu-label">Model</div>'));
+  const entries = state.models.length
+    ? state.models
+    : [{ name: "", label: "deployment default", sub: "server decides" }];
+  for (const m of entries) {
+    const item = node('<button type="button" class="m-item" role="menuitemradio"><span class="m-txt">' +
+      '<span class="m-name"></span><span class="m-sub"></span></span><span class="tick">' + ICONS.tick + "</span></button>");
+    item.querySelector(".m-name").textContent = m.label || m.name;
+    item.querySelector(".m-sub").textContent = m.sub !== undefined
+      ? m.sub
+      : [fmtBytes(m.bytes), m.backend].filter(Boolean).join(" · ");
+    if ((m.name || "") === state.model) item.classList.add("sel");
+    item.addEventListener("click", () => {
+      const was = state.model;
+      state.model = m.name || "";
+      pref("llmchat-model", state.model);
+      modelLabel.textContent = m.label || m.name || "deployment default";
+      renderModelMenu();
+      closeModelMenu();
+      if (state.model !== was) warm();
+    });
+    modelMenu.appendChild(item);
+  }
+  modelMenu.appendChild(node('<div class="menu-sep"></div>'));
+  const seg = node('<div class="seg-row"><span>Compute</span><div class="seg"></div></div>');
+  for (const t of ["auto", "gpu", "cpu"]) {
+    const b = node("<button type='button'></button>");
+    b.textContent = t;
+    if (state.target === t) b.classList.add("on");
+    b.title = t === "auto" ? "gpu, falling back to cpu" : "run on " + t;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.target = t;
+      pref("llmchat-target", t);
+      seg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+    });
+    seg.querySelector(".seg").appendChild(b);
+  }
+  modelMenu.appendChild(seg);
+}
+
+// Model discovery: the deployment lists its servable models largest-first
+// and the largest is the server-side default, so it arrives preselected -
+// unless the user picked a model before, in which case their stored choice
+// wins (when this deployment still serves it). The compute target restores
+// the same way.
+const modelsReady = (async () => {
+  let storedModel = null, storedTarget = null;
+  try {
+    if (storeOK) {
+      storedModel = localStorage.getItem("llmchat-model");
+      storedTarget = localStorage.getItem("llmchat-target");
+    }
+  } catch (_) {}
+  if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
+  let models = [];
+  try {
+    const res = await fetch("models");
+    models = (await res.json()).models || [];
+  } catch (_) {}
+  state.models = models;
+  const def = models.find((m) => m.name === storedModel) ||
+    models.find((m) => m.default) || models[0];
+  state.model = def ? def.name : "";
+  modelLabel.textContent = def ? def.name : "deployment default";
+  renderModelMenu();
+})();
+
+// ----------------------------------------------------------------- warmup --
+// Warm the selected model: the slow part of the first reply is getting
+// weights into device memory, so start that on page load (the largest model
+// arrives preselected) and again whenever the selection changes. Warmup is
+// GPU-only by design - only an explicit cpu target pick warms the CPU
+// session instead. Non-fatal on failure - a chat request performs the same
+// load itself, with its own status line. Typing meanwhile is fine: the host
+// coalesces concurrent loads onto one init.
+let pillTimer = null;
+function pill(cls, html, text, hideAfter) {
+  clearTimeout(pillTimer);
+  warmPill.className = "show " + cls;
+  warmPill.innerHTML = html;
+  warmPill.appendChild(document.createTextNode(text));
+  if (hideAfter) pillTimer = setTimeout(() => { warmPill.className = ""; }, hideAfter);
+}
+
+async function warm() {
+  const model = state.model;
+  pill("", '<span class="spin"></span>', "Loading " + (model || "model") + "…");
+  const t0 = Date.now();
+  const q = [];
+  if (model) q.push("model=" + encodeURIComponent(model));
+  if (state.target === "cpu") q.push("target=cpu");
+  try {
+    const res = await fetch("warmup" + (q.length ? "?" + q.join("&") : ""),
+      { signal: AbortSignal.timeout(180000) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.ok) {
+      pill("ok", ICONS.tick, " Ready · " + d.target + " · " + ((Date.now() - t0) / 1000).toFixed(1) + "s", 5000);
+    } else {
+      pill("fail", ICONS.alert, " Warmup failed — the first reply will load the model", 10000);
+      warmPill.title = (d.error && d.error.message) || ("HTTP " + res.status);
+    }
+  } catch (_) {
+    pill("fail", ICONS.alert, " Warmup did not finish — the first reply will load the model", 10000);
+  }
+}
+
+// ------------------------------------------------------------------- boot --
+// With storage on: restore saved chats (newest first), then land on a fresh
+// empty chat. If the user starts typing before IndexedDB opens (rare), their
+// chat wins - saved ones just slot in behind it. With storage off: sweep any
+// leftovers (from a session that opted in earlier, or a build that predates
+// the opt-in) so "off" reliably means nothing on disk.
+(async () => {
+  if (storeOK) {
+    await openDb();
+    for (const s of await loadChats()) {
+      if (state.chats.some((c) => c.id === s.id)) continue;
+      state.chats.push({
+        id: s.id, title: s.title || "", messages: s.messages || [],
+        streaming: null, error: s.error || null,
+      });
+    }
+  } else {
+    wipeStorage();
+  }
+  if (current()) renderSidebar();
+  else newChat();
+})();
+if (!isMobile()) document.body.classList.remove("collapsed");
+(async () => { await modelsReady; warm(); })();
+</script>
+</body>
+</html>

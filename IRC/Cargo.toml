@@ -1,0 +1,18 @@
+[package]
+name = "irc"
+version = "0.1.0"
+edition = "2021"
+description = "A zero-dependency IRC server compiled to a wasm32-wasip2 command component, built to run as an Enclave service app (wasi:sockets, ENCLAVE_PORTS contract)."
+license = "MIT"
+
+# No dependencies on purpose: everything is std, which maps to wasi:sockets /
+# wasi:clocks / wasi:cli on the wasm32-wasip2 target. Keeps the component small
+# and the supply chain auditable (the platform attests the bytes).
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
