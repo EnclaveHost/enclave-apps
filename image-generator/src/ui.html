@@ -330,6 +330,7 @@
 const $ = id => document.getElementById(id);
 let steps = 1, running = false, target = "gpu";
 let models = [], cur = null; // catalog from /info; cur = selected model
+let unfit = {}; // model name -> error, from the warmup ladder: attached but does not fit this deployment's share
 
 const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11.5v6M14 11.5v6M6 7l1 12.4A2 2 0 0 0 9 21.2h6a2 2 0 0 0 2-1.8L18 7M9.5 7V4.8A1.8 1.8 0 0 1 11.3 3h1.4a1.8 1.8 0 0 1 1.8 1.8V7"/></svg>';
 
@@ -459,6 +460,8 @@ function pick(name) {
   }
   if (!cur.attached) {
     setStatus(`model volume '${cur.volume}' is not attached - deploy with it ticked in the volume picker`, "err");
+  } else if (unfit[cur.name]) {
+    setStatus(`model '${cur.name}' does not fit this deployment - redeploy with more resources (${unfit[cur.name]})`, "err");
   } else if ($("status").classList.contains("err")) setStatus("");
 }
 $("modelsel").onchange = () => pick($("modelsel").value);
@@ -491,16 +494,46 @@ async function info() {
       $("warm").textContent = "volume missing"; $("warm").className = "pill err";
       return;
     }
-    $("warm").innerHTML = '<span class="spin"></span>warming ' + target;
+    // bare /warmup = the LADDER: the server warms every attached model
+    // smallest-first and reports per-model fit; models that don't fit this
+    // deployment's share come back unfit and get disabled in the picker
+    $("warm").innerHTML = '<span class="spin"></span>warming ' + target + " (smallest first)";
     const t0 = performance.now();
-    const w = await fetch("warmup?target=" + target + "&model=" + encodeURIComponent(cur.name));
-    if (w.ok) {
-      $("warm").textContent = `${target} warm (${((performance.now() - t0) / 1000).toFixed(1)}s)`;
+    const w = await fetch("warmup?target=" + target);
+    const d = await w.json().catch(() => ({}));
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    if (!Array.isArray(d.ladder)) {
+      // pre-ladder server: classic single-model warmup semantics
+      if (w.ok && d.ok) {
+        $("warm").textContent = `${target} warm (${secs}s)`; $("warm").className = "pill ok";
+      } else {
+        $("warm").textContent = "warmup failed"; $("warm").className = "pill err";
+        setStatus(d.error?.message || "warmup failed", "err");
+      }
+      return;
+    }
+    unfit = {};
+    for (const r of d.ladder) if (!r.ok) unfit[r.model] = r.error || "does not fit this deployment";
+    // unfit models stay visible but not selectable - attached, just too big
+    // for this deployment; a larger redeploy re-enables them
+    for (const o of $("modelsel").options) {
+      if (unfit[o.value]) {
+        o.disabled = true;
+        o.textContent = o.value + " (needs more resources)";
+        o.title = unfit[o.value];
+      }
+    }
+    if (unfit[cur.name] && d.default) pick(d.default);
+    const fit = d.ladder.filter(r => r.ok);
+    if (!fit.length) {
+      $("warm").textContent = "no model fits"; $("warm").className = "pill err";
+      setStatus("no attached model fits this deployment - add resources or attach smaller models", "err");
+    } else if (fit.length < d.ladder.length) {
+      $("warm").textContent = `${fit.length} of ${d.ladder.length} warm (${secs}s)`;
       $("warm").className = "pill ok";
+      $("warm").title = d.ladder.filter(r => !r.ok).map(r => `${r.model}: ${r.error || ""}`).join("\n");
     } else {
-      const e = await w.json().catch(() => ({}));
-      $("warm").textContent = "warmup failed"; $("warm").className = "pill err";
-      setStatus(e.error?.message || "warmup failed", "err");
+      $("warm").textContent = `${target} warm (${secs}s)`; $("warm").className = "pill ok";
     }
   } catch (e) { $("warm").textContent = "offline"; $("warm").className = "pill err"; }
 }

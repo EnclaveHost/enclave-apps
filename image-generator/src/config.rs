@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(qi.model_volume, "qwen-image-2512-sd");
         assert_eq!(qi.default_steps, 8); // entry override
         assert_eq!(qi.min_size, 512); // entry override
-        assert_eq!(qi.max_size, 2048); // inherited from template
+        assert_eq!(qi.max_size, 1024); // inherited from template
     }
 
     #[test]
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(cat.models.len(), 3);
         let fk = cat.get(Some("flux2-klein")).unwrap();
         assert_eq!(fk.model_volume, "flux2-klein-sd");
-        assert_eq!(fk.max_size, 2048); // still inherits the template
+        assert_eq!(fk.max_size, 1024); // still inherits the template
         // and the originals survive untouched
         assert_eq!(cat.get(Some("qwen-image-2512")).unwrap().default_steps, 8);
     }
@@ -338,10 +338,10 @@ mod tests {
         assert_eq!(cat.models.len(), 2);
         let zi = cat.get(Some("z-image-turbo")).unwrap();
         assert_eq!(zi.model_volume, "z-image-turbo-sd");
-        assert_eq!((zi.default_steps, zi.max_size), (4, 2048));
+        assert_eq!((zi.default_steps, zi.max_size), (4, 1024));
         let qi = cat.get(Some("qwen-image-2512")).unwrap();
         assert_eq!(qi.model_volume, "qwen-image-2512-sd");
-        assert_eq!((qi.default_steps, qi.min_size, qi.max_size), (8, 512, 2048));
+        assert_eq!((qi.default_steps, qi.min_size, qi.max_size), (8, 512, 1024));
         assert_eq!(cat.default_model().name, "qwen-image-2512"); // flagship
     }
 

@@ -12,10 +12,16 @@
 //!   GET  /ping        - liveness, touches no wasi-nn.
 //!   GET  /info        - config the UI needs (steps, sizes, target, and the
 //!                       `models` catalog with per-model limits).
-//!   GET  /warmup      - load the weights and run one tiny generation so the
-//!                       model is resident before the first real prompt
-//!                       (?target=gpu|cpu, ?size=, ?model=). The playground
-//!                       fires it on page load.
+//!   GET  /warmup      - warm models before the first prompt. With ?model=:
+//!                       that one (a tiny 1-step generation). BARE - the
+//!                       manager's boot warmup, the playground's page load -
+//!                       it is a LADDER: every ATTACHED catalog model tried
+//!                       smallest-volume-first, one at a time; a model that
+//!                       does not fit the share is reported unfit and
+//!                       skipped, not fatal, so one published app serves
+//!                       whatever the deployment can hold (the playground
+//!                       disables the rest in its picker).
+//!                       (?target=gpu|cpu, ?size= for single-model mode.)
 //!   GET  /image       - ?prompt=...&steps=&seed=&w=&h=&target=&model= ->
 //!                       image/png.
 //!   POST /generate    - {prompt, model?, steps?, seed?, width?, height?,
