@@ -261,6 +261,57 @@ fn available_models(raw: &serde_json::Value) -> Vec<ModelEntry> {
     out
 }
 
+/// The deployment's VRAM budget in bytes: ENCLAVE_VRAM_BYTES, set by the
+/// platform from gpuShare x card VRAM - the same number the MPS cap
+/// enforces on this process. None on CPU deployments and older managers.
+fn vram_budget() -> Option<u64> {
+    std::env::var("ENCLAVE_VRAM_BYTES")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|b| *b > 0)
+}
+
+/// Which servable models CANNOT fit the VRAM budget - the manager's preload
+/// rule, mirrored: models claim the budget smallest-first (the preload /
+/// warmup order), so a model is certainly-unfit once the smaller models'
+/// weights plus its own exceed the budget. Weights-only on purpose:
+/// contexts and compute buffers come and go per request, so this gate only
+/// refuses CERTAIN failures - borderline models still get the honest
+/// warmup probe. Returns volume -> reason, for the unfit models only.
+fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(budget) = vram_budget() else { return out };
+    let mut asc: Vec<&ModelEntry> = entries.iter().collect();
+    // same order (and tie-break) as the manager's preload emission, so both
+    // sides always agree on which model crosses the budget line
+    asc.sort_by(|a, b| a.bytes.cmp(&b.bytes).then(a.volume.cmp(&b.volume)));
+    let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut claimed = 0u64;
+    for e in asc {
+        if claimed + e.bytes > budget {
+            out.insert(
+                e.volume.clone(),
+                format!(
+                    "{:.1} GB of weights cannot fit the deployment's {:.1} GB VRAM budget\
+                     {} - redeploy with a larger GPU share to unlock this model",
+                    gb(e.bytes),
+                    gb(budget),
+                    if claimed > 0 {
+                        format!(" ({:.1} GB already claimed by smaller models)", gb(claimed))
+                    } else {
+                        String::new()
+                    }
+                ),
+            );
+        } else {
+            claimed += e.bytes;
+        }
+    }
+    out
+}
+
 /// The AppConfig serving one request. `requested` (the OpenAI `model` field,
 /// or ?model= on /warmup) matches a model name or volume name; an UNKNOWN
 /// name falls back to the default model instead of erroring - OpenAI SDKs
@@ -1120,9 +1171,24 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
             Err(e) => json_err(out, 500, &e),
         };
     }
+    // models the VRAM budget certainly cannot hold are reported unfit
+    // WITHOUT probing - no point starting a multi-GB load that must OOM.
+    // CPU-target warms skip the gate (dev boxes have no VRAM budget).
+    let unfit = if mode == "cpu" {
+        std::collections::HashMap::new()
+    } else {
+        over_budget(&entries)
+    };
     let mut ladder = Vec::with_capacity(entries.len());
     let mut default: Option<String> = None; // largest warmed = last ok in ascending order
     for e in &entries {
+        if let Some(why) = unfit.get(&e.volume) {
+            ladder.push(serde_json::json!({
+                "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
+                "ok": false, "skipped": true, "error": why,
+            }));
+            continue;
+        }
         match warm_one(&e.cfg, mode) {
             Ok((target, load_ms, feed_ms)) => {
                 default = Some(e.cfg.name.clone());
@@ -1153,12 +1219,21 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
 /// facts, so nothing here needs the API key.
 fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     let entries = available_models(raw);
+    let unfit = over_budget(&entries);
     let body = serde_json::json!({
         "default": entries.first().map(|e| e.cfg.name.clone()),
-        "models": entries.iter().enumerate().map(|(i, e)| serde_json::json!({
-            "name": e.cfg.name, "volume": e.volume, "backend": e.cfg.backend,
-            "bytes": e.bytes, "default": i == 0,
-        })).collect::<Vec<_>>(),
+        "vram_budget": vram_budget(),
+        "models": entries.iter().enumerate().map(|(i, e)| {
+            let mut m = serde_json::json!({
+                "name": e.cfg.name, "volume": e.volume, "backend": e.cfg.backend,
+                "bytes": e.bytes, "default": i == 0,
+                "fits": !unfit.contains_key(&e.volume),
+            });
+            if let Some(why) = unfit.get(&e.volume) {
+                m["why"] = serde_json::json!(why);
+            }
+            m
+        }).collect::<Vec<_>>(),
     });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }

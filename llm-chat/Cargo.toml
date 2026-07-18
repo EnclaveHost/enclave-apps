@@ -1,6 +1,6 @@
 [package]
 name = "llm-chat"
-version = "0.7.0"
+version = "0.7.2"
 edition = "2021"
 publish = false
 
