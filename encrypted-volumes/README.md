@@ -45,6 +45,27 @@ signature/password/salt plus a ready `enclave-encvol.sh push` command for
 seeding the bucket — or sign anywhere else:
 `cast wallet sign "$(scripts/enclave-encvol.sh message myvol)"`.
 
+## Credentials envelope (one-signature unlock)
+
+S3 credentials can ride the **public** App Config sealed under the same
+wallet signature, so one signature derives the crypt key AND opens the
+bucket credentials — nothing typed at unlock, after any restart. Seal with
+the panel's **Seal** button or `enclave-encvol.sh seal-creds --sig 0x…`
+(reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), and put the printed
+value in the volume's entry as `"credsEnvelope"`. Byte-exact contract
+(pinned by the platform e2e; the manager ignores the field — this app
+decrypts it in the browser):
+
+```
+encKey   = SHA-256( sig + "\n" + "enclave-encvol-v1:creds-enc" )   32 raw bytes
+macKey   = SHA-256( sig + "\n" + "enclave-encvol-v1:creds-mac" )   32 raw bytes
+envelope = "encv1:" + base64( iv[16] || AES-256-CTR(encKey, iv, credsJSON) || HMAC-SHA256(macKey, iv||ct)[32] )
+```
+
+The envelope is exactly as sensitive as the volume: the wallet that signs
+for the key is the wallet that opens the credentials. Anything typed into
+the unlock form's S3 fields overrides the envelope.
+
 Caveats: needs an injected EOA wallet (`window.ethereum`) that signs
 deterministically (RFC 6979 — MetaMask, Ledger, EOAs generally);
 smart-contract / ERC-1271 wallets and randomized MPC signers won't derive a

@@ -15,7 +15,8 @@
 //!
 //! Routes:
 //!   GET  /               - decryption UI + volume browser (self-contained HTML).
-//!   GET  /api/status     - proxied GET  <ENCLAVE_ENC_API>            (adds the token).
+//!   GET  /api/status     - proxied GET  <ENCLAVE_ENC_API>            (adds the token; grafts each
+//!                          volume's public credsEnvelope from ENCLAVE_CONFIG onto the response).
 //!   POST /api/unlock     - proxied POST <ENCLAVE_ENC_API>/unlock     {name, password, salt?, accessKeyId?, secretAccessKey?, sessionToken?}
 //!   POST /api/sync       - proxied POST <ENCLAVE_ENC_API>/sync       {name}  (push local edits back to the bucket)
 //!   POST /api/lock       - proxied POST <ENCLAVE_ENC_API>/lock       {name}  (wipe plaintext, drop credentials)
@@ -43,6 +44,27 @@ use bindings::wasi::io::streams::StreamError;
 static INDEX_HTML: &str = include_str!("index.html");
 const MAX_LIST: usize = 10_000; // listing cap per volume (guard against huge trees)
 const MAX_BODY: usize = 64 * 1024; // an /api request body (a password + creds) is small
+
+/// Each volume's `credsEnvelope`, read from this deployment's own App Config
+/// (ENCLAVE_CONFIG). The manager deliberately ignores the field - it is
+/// wallet-sealed PUBLIC config data the UI needs at unlock time, so the
+/// status proxy grafts it onto the manager's response by volume name.
+fn creds_envelopes() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(cfg) = std::env::var("ENCLAVE_CONFIG") else { return out };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&cfg) else { return out };
+    if let Some(vols) = v.get("encVolumes").and_then(|e| e.as_array()) {
+        for e in vols {
+            if let (Some(name), Some(env)) = (
+                e.get("name").and_then(|x| x.as_str()),
+                e.get("credsEnvelope").and_then(|x| x.as_str()),
+            ) {
+                out.insert(name.to_string(), env.to_string());
+            }
+        }
+    }
+    out
+}
 
 fn enc_names() -> Vec<String> {
     std::env::var("ENCLAVE_ENC")
@@ -294,7 +316,41 @@ impl Guest for Component {
             (Method::Get, "/ping") => {
                 respond_bytes(out, 200, "application/json", b"{\"ok\":true,\"pong\":true}")
             }
-            (Method::Get, "/api/status") => handle_api(out, Method::Get, "", None),
+            (Method::Get, "/api/status") => match api_call(Method::Get, "", None) {
+                Ok((status, bytes)) => {
+                    let envs = creds_envelopes();
+                    let bytes = if status == 200 && !envs.is_empty() {
+                        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            Ok(mut v) => {
+                                if let Some(vols) =
+                                    v.get_mut("volumes").and_then(|x| x.as_array_mut())
+                                {
+                                    for vol in vols {
+                                        let Some(obj) = vol.as_object_mut() else { continue };
+                                        let Some(name) =
+                                            obj.get("name").and_then(|x| x.as_str()).map(str::to_string)
+                                        else {
+                                            continue;
+                                        };
+                                        if let Some(env) = envs.get(&name) {
+                                            obj.insert(
+                                                "credsEnvelope".into(),
+                                                serde_json::Value::String(env.clone()),
+                                            );
+                                        }
+                                    }
+                                }
+                                v.to_string().into_bytes()
+                            }
+                            Err(_) => bytes,
+                        }
+                    } else {
+                        bytes
+                    };
+                    respond_bytes(out, status, "application/json", &bytes)
+                }
+                Err(msg) => json_err(out, 503, &msg),
+            },
             (Method::Post, "/api/unlock") | (Method::Post, "/api/sync") | (Method::Post, "/api/lock") => {
                 let action = format!("/{}", &path["/api/".len()..]);
                 let body = read_request_body(&req);

@@ -86,7 +86,8 @@
   ciphertext and decrypts onto the CVM's encrypted ramdisk at <span style="font-family:ui-monospace,monospace">/enc/&lt;name&gt;</span>.
   Keys and plaintext never touch the operator's host or the bucket. <b>Lock</b> wipes the plaintext and drops the credentials;
   <b>Push to cloud</b> re-encrypts local edits back to the bucket (needs write-capable S3 credentials at unlock, and the volume
-  not marked readOnly).
+  not marked readOnly). A volume whose config carries a <b>credsEnvelope</b> (S3 credentials sealed under the same wallet
+  signature) unlocks with one signature and nothing typed - after any restart, on any enclave.
 </footer>
 
 <script>
@@ -105,6 +106,45 @@ const volMessage = (keyId) =>
 async function sha256hex(s) {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- credentials envelope -------------------------------------------------
+// S3 credentials sealed under the SAME wallet signature that derives the
+// volume key, riding the PUBLIC App Config as "credsEnvelope" - one signature
+// unlocks everything. BYTE-EXACT contract with enclave-encvol.sh `seal-creds`
+// (pinned by the platform e2e):
+//   encKey/macKey = SHA-256(sig + "\n" + "enclave-encvol-v1:creds-enc"/":creds-mac")
+//   envelope      = "encv1:" + base64( iv[16] || AES-256-CTR(encKey, iv, credsJSON) || HMAC-SHA256(macKey, iv||ct)[32] )
+const sha256bytes = async (s) => new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function openCredsEnvelope(sig, envelope) {
+  if (!envelope.startsWith("encv1:")) throw new Error("unknown credsEnvelope format");
+  const raw = b64decode(envelope.slice(6));
+  if (raw.length < 16 + 32 + 2) throw new Error("credsEnvelope too short");
+  const ivct = raw.slice(0, raw.length - 32), tag = raw.slice(raw.length - 32);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  if (!(await crypto.subtle.verify("HMAC", macKey, tag, ivct)))
+    throw new Error("envelope failed authentication - it was sealed by a different wallet than the one that just signed");
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["decrypt"]);
+  const pt = await crypto.subtle.decrypt({ name: "AES-CTR", counter: ivct.slice(0, 16), length: 128 }, encKey, ivct.slice(16));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+async function sealCredsEnvelope(sig, creds) {
+  const iv = crypto.getRandomValues(new Uint8Array(16));
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CTR", counter: iv, length: 128 }, encKey,
+    new TextEncoder().encode(JSON.stringify(creds))));
+  const ivct = new Uint8Array(16 + ct.length); ivct.set(iv); ivct.set(ct, 16);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const tag = new Uint8Array(await crypto.subtle.sign("HMAC", macKey, ivct));
+  const all = new Uint8Array(ivct.length + 32); all.set(ivct); all.set(tag, ivct.length);
+  return "encv1:" + btoa(String.fromCharCode(...all));
 }
 
 async function walletDerive(keyId) {
@@ -178,7 +218,9 @@ function volCard(v, files) {
   let body = "";
   if (v.status === "locked" && !busy) {
     const walletBtn = `<button type="button" class="wallet" data-wallet="1">Unlock with wallet</button>
-        <span class="empty">signs "volume: ${esc(v.keyId || v.name)}", derives the key locally</span>`;
+        <span class="empty">${v.credsEnvelope
+          ? `one signature derives the key AND opens the sealed S3 credentials - nothing to type`
+          : `signs "volume: ${esc(v.keyId || v.name)}", derives the key locally`}</span>`;
     const passInputs = `
         <input type="password" name="password" placeholder="rclone crypt password" autocomplete="off">
         <input type="password" name="salt" placeholder="salt / password2 (leave empty if none)" autocomplete="off">
@@ -212,6 +254,7 @@ function volCard(v, files) {
 }
 
 let lastVols = [];
+const sealSigs = {};  // volume -> the signature the reveal panel derived (feeds Seal)
 async function refresh() {
   const box = document.getElementById("vols");
   let status;
@@ -284,7 +327,14 @@ document.getElementById("vols").addEventListener("click", async (e) => {
     w.disabled = true;
     try {
       const d = await walletDerive(f.dataset.keyid);
-      await api("unlock", { name: f.dataset.vol, password: d.password, salt: d.salt, ...s3CredsFrom(f) });
+      // credentials: anything typed in the form wins; otherwise the sealed
+      // envelope from the App Config opens under the same signature.
+      let creds = s3CredsFrom(f);
+      const v = lastVols.find((x) => x.name === f.dataset.vol);
+      if (v?.credsEnvelope && !creds.accessKeyId) {
+        creds = { ...(await openCredsEnvelope(d.sig, v.credsEnvelope)), ...creds };
+      }
+      await api("unlock", { name: f.dataset.vol, password: d.password, salt: d.salt, ...creds });
     } catch (err) {
       alert(`wallet unlock failed: ${err.message || err}`);
     }
@@ -298,6 +348,7 @@ document.getElementById("vols").addEventListener("click", async (e) => {
     const panel = document.getElementById(`reveal-${name}`);
     try {
       const d = await walletDerive(v.keyId || v.name);
+      sealSigs[name] = d.sig;
       const pushCmd = `ENCVOL_WALLET_SIG=${d.sig} scripts/enclave-encvol.sh push ./your-dir \\\n  --endpoint ${v.endpoint} --bucket ${v.bucket}${v.path ? ` --path ${v.path}` : ""} --name ${v.name}`;
       panel.style.display = "";
       panel.innerHTML =
@@ -305,9 +356,32 @@ document.getElementById("vols").addEventListener("click", async (e) => {
         `<div style="margin-top:8px"><span class="k">signature (feeds enclave-encvol.sh --sig / ENCVOL_WALLET_SIG)</span><code>${esc(d.sig)}</code>` +
         `<span class="k">derived password (ENCVOL_PASSWORD)</span><code>${esc(d.password)}</code>` +
         `<span class="k">derived salt (ENCVOL_SALT)</span><code>${esc(d.salt)}</code>` +
-        `<span class="k">push data with</span><code>${esc(pushCmd)}</code></div>`;
+        `<span class="k">push data with</span><code>${esc(pushCmd)}</code></div>` +
+        `<div style="margin-top:8px"><span class="k">seal S3 credentials into the App Config - future wallet unlocks then need no typing.
+          The sealed value is safe to publish: it only opens under this wallet's signature.</span>
+          <div class="row">
+            <input data-seal-ak="${esc(name)}" placeholder="access key id" autocomplete="off" style="max-width:200px">
+            <input data-seal-sk="${esc(name)}" type="password" placeholder="secret access key" autocomplete="off" style="max-width:220px">
+            <button type="button" class="ghost" data-seal="${esc(name)}">Seal</button>
+          </div>
+          <div data-seal-out="${esc(name)}"></div></div>`;
     } catch (err) {
       alert(`derive failed: ${err.message || err}`);
+    }
+    return;
+  }
+  const s = e.target.closest("button[data-seal]");
+  if (s) {
+    const name = s.dataset.seal, panel = document.getElementById(`reveal-${name}`);
+    const ak = panel.querySelector(`[data-seal-ak]`)?.value.trim();
+    const sk = panel.querySelector(`[data-seal-sk]`)?.value.trim();
+    if (!ak || !sk) return alert("enter the access key id and secret access key to seal");
+    try {
+      const envlp = await sealCredsEnvelope(sealSigs[name], { accessKeyId: ak, secretAccessKey: sk });
+      panel.querySelector(`[data-seal-out="${name}"]`).innerHTML =
+        `<span class="k">add to this volume's encVolumes entry (next publish):</span><code>"credsEnvelope": "${esc(envlp)}"</code>`;
+    } catch (err) {
+      alert(`seal failed: ${err.message || err}`);
     }
     return;
   }
