@@ -19,12 +19,18 @@
 //!                               config describes), largest first; the
 //!                               largest is the default. Open, unlike
 //!                               /v1/models - the playground dropdown reads it.
-//!   GET  /warmup              - load a model (?model=<name|volume>, default
-//!                               the largest) and run one forward pass, so
-//!                               the weights are resident (and the host's
-//!                               session cache warm) before the first prompt.
-//!                               GPU-only unless ?target= says otherwise.
-//!                               The playground fires it on page load.
+//!   GET  /warmup              - warm models before the first prompt. With
+//!                               ?model=<name|volume>: that one (load + one
+//!                               forward pass). BARE - the manager's boot
+//!                               warmup and the playground's page load - it
+//!                               is a LADDER: every servable model tried
+//!                               SMALLEST-FIRST, one at a time; a model that
+//!                               does not fit the share is reported unfit
+//!                               and skipped, not fatal, so one published
+//!                               app serves whatever the deployment can hold
+//!                               (the playground disables the rest in its
+//!                               menu). GPU-only unless ?target= says
+//!                               otherwise.
 //!   GET  /v1/models           - OpenAI-compatible model list.
 //!   POST /v1/chat/completions - OpenAI-compatible completions, stream and
 //!                               non-stream. Point any OpenAI SDK at the
@@ -1021,29 +1027,14 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
 
 // ------------------------------------------------------------------ warmup --
 
-/// GET /warmup - open an inference session and run a single-token forward
-/// pass, so the model is in device memory BEFORE the first real prompt. The
-/// playground fires this on page load; for API users it is an explicit
-/// primer. Repeat calls are cheap (the load coalesces on the host's session
-/// cache / preloaded graph). ?model=<name|volume> picks the model (default:
-/// the largest attached). ?target= defaults to GPU ONLY - warmup exists to
-/// put weights in VRAM, and a failed GPU should read as a failed warmup, not
-/// silently pre-build the CPU session (chat's auto mode still falls back at
-/// request time). Pass target=cpu (dev boxes) or target=auto explicitly to
-/// warm other paths. Slow by design when cold - the response arrives when
-/// the model is ready.
-fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
-    let mode = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("target="))
-        .unwrap_or("gpu");
-    let model = query.split('&').find_map(|kv| kv.strip_prefix("model="));
-    let cfg = &match resolve_model(raw, model) {
-        Ok(c) => c,
-        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
-    };
-    // one in-vocab token forces the full compute path (workspace allocation,
-    // kernel warm) without generating anything a user could see
+/// Warm one model: open a session and feed a single in-vocab token, which
+/// forces the full compute path (workspace allocation, kernel warm) without
+/// generating anything a user could see. Returns (target, load_ms, feed_ms).
+/// Repeat calls are cheap (the load coalesces on the host's session cache /
+/// preloaded graph). An error here IS the fit signal the ladder consumes:
+/// an absent host graph, a failed context/KV allocation and a failed first
+/// compute all mean this model does not serve under the current share.
+fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
     let warm_tok = cfg.eos.first().copied().unwrap_or(0);
     let mut last_err = String::new();
     for (target, tname) in targets_for(mode) {
@@ -1052,18 +1043,108 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
         let load_ms = now_ms() - t0;
         let t1 = now_ms();
         match opened.and_then(|mut sess| sess.feed(cfg, &[warm_tok], true)) {
-            Ok(_) => {
-                let body = serde_json::json!({
-                    "ok": true, "model": cfg.name, "volume": cfg.model_volume,
-                    "target": tname,
-                    "load_ms": load_ms as u64, "feed_ms": (now_ms() - t1) as u64,
-                });
-                return respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
-            }
+            Ok(_) => return Ok((tname.to_string(), load_ms as u64, (now_ms() - t1) as u64)),
             Err(e) => last_err = format!("{tname}: {e}"),
         }
     }
-    json_err(out, 500, &last_err)
+    Err(last_err)
+}
+
+/// GET /warmup - put weights and kernels in device memory BEFORE the first
+/// real prompt.
+///
+/// `?model=<name|volume>` warms that ONE model (the playground re-warms on
+/// selection change); response shape and error semantics are the classic
+/// single-model ones. BARE `/warmup` is the LADDER: every servable model,
+/// SMALLEST FIRST, warmed one at a time, failures recorded and skipped.
+/// Smallest-first is deliberate on both axes: residency within the share is
+/// first-come-first-served, so the models most likely to fit are resident
+/// (and guaranteed) before a bigger sibling claims - or fails to claim -
+/// the rest; and one published app degrades gracefully across deployment
+/// sizes: a small share serves the small models and reports the big ones
+/// unfit, a bigger share unlocks them. The manager's boot warmup GETs the
+/// bare path, so a fresh deployment sorts itself out at launch; the
+/// playground fires it on page load and disables the unfit models in its
+/// menu. 200 with per-model results while at least one model warmed, 500
+/// when none did.
+///
+/// ?target= defaults to GPU ONLY - warmup exists to put weights in VRAM,
+/// and a failed GPU should read as a failed warmup, not silently pre-build
+/// the CPU session (chat's auto mode still falls back at request time).
+/// Pass target=cpu (dev boxes) or target=auto explicitly to warm other
+/// paths. Slow by design when cold - the response arrives when the models
+/// are ready.
+fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
+    let mode = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("target="))
+        .unwrap_or("gpu");
+    let model = query.split('&').find_map(|kv| kv.strip_prefix("model="));
+
+    if model.is_some() {
+        // single-model mode; unknown names fall back to the default model
+        // (resolve_model semantics), no servable models to the top-level
+        // config whose volume-not-attached error says what to attach
+        let cfg = &match resolve_model(raw, model) {
+            Ok(c) => c,
+            Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+        };
+        return match warm_one(cfg, mode) {
+            Ok((target, load_ms, feed_ms)) => {
+                let body = serde_json::json!({
+                    "ok": true, "model": cfg.name, "volume": cfg.model_volume,
+                    "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
+                });
+                respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
+            }
+            Err(e) => json_err(out, 500, &e),
+        };
+    }
+
+    // ladder mode: smallest first (available_models sorts largest-first)
+    let mut entries = available_models(raw);
+    entries.reverse();
+    if entries.is_empty() {
+        let cfg = &match resolve_model(raw, None) {
+            Ok(c) => c,
+            Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+        };
+        return match warm_one(cfg, mode) {
+            Ok((target, load_ms, feed_ms)) => {
+                let body = serde_json::json!({
+                    "ok": true, "model": cfg.name, "volume": cfg.model_volume,
+                    "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
+                });
+                respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
+            }
+            Err(e) => json_err(out, 500, &e),
+        };
+    }
+    let mut ladder = Vec::with_capacity(entries.len());
+    let mut default: Option<String> = None; // largest warmed = last ok in ascending order
+    for e in &entries {
+        match warm_one(&e.cfg, mode) {
+            Ok((target, load_ms, feed_ms)) => {
+                default = Some(e.cfg.name.clone());
+                ladder.push(serde_json::json!({
+                    "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
+                    "ok": true, "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
+                }));
+            }
+            Err(err) => ladder.push(serde_json::json!({
+                "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
+                "ok": false, "error": err,
+            })),
+        }
+    }
+    let ok = default.is_some();
+    let body = serde_json::json!({ "ok": ok, "ladder": ladder, "default": default });
+    respond_bytes(
+        out,
+        if ok { 200 } else { 500 },
+        "application/json",
+        body.to_string().as_bytes(),
+    );
 }
 
 /// GET /models - the playground's dropdown source: servable models largest

@@ -205,6 +205,8 @@
     padding: 9px 12px; border-radius: 10px; text-align: left;
   }
   .m-item:hover { background: var(--hover); }
+  .m-item:disabled { opacity: .45; cursor: default; }
+  .m-item:disabled:hover { background: none; }
   .m-item .m-txt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .m-item .m-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .m-item .m-sub { font-size: 12px; color: var(--text-3); }
@@ -799,6 +801,7 @@ const state = {
   abort: null,
   models: [],
   model: "",
+  unfit: {},        // model name -> error, from the warmup ladder: attached but does not fit this deployment's share
   target: "auto",
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
@@ -1533,9 +1536,18 @@ function renderModelMenu() {
     const item = node('<button type="button" class="m-item" role="menuitemradio"><span class="m-txt">' +
       '<span class="m-name"></span><span class="m-sub"></span></span><span class="tick">' + ICONS.tick + "</span></button>");
     item.querySelector(".m-name").textContent = m.label || m.name;
-    item.querySelector(".m-sub").textContent = m.sub !== undefined
-      ? m.sub
-      : [fmtBytes(m.bytes), m.backend].filter(Boolean).join(" · ");
+    // a model the warmup ladder reported unfit is visible but not selectable:
+    // it IS attached, this deployment just cannot hold it - redeploy bigger
+    const unfit = m.name && state.unfit[m.name];
+    if (unfit) {
+      item.disabled = true;
+      item.title = unfit;
+      item.querySelector(".m-sub").textContent = "needs a larger deployment";
+    } else {
+      item.querySelector(".m-sub").textContent = m.sub !== undefined
+        ? m.sub
+        : [fmtBytes(m.bytes), m.backend].filter(Boolean).join(" · ");
+    }
     if ((m.name || "") === state.model) item.classList.add("sel");
     item.addEventListener("click", () => {
       const was = state.model;
@@ -1594,13 +1606,17 @@ const modelsReady = (async () => {
 })();
 
 // ----------------------------------------------------------------- warmup --
-// Warm the selected model: the slow part of the first reply is getting
-// weights into device memory, so start that on page load (the largest model
-// arrives preselected) and again whenever the selection changes. Warmup is
-// GPU-only by design - only an explicit cpu target pick warms the CPU
-// session instead. Non-fatal on failure - a chat request performs the same
-// load itself, with its own status line. Typing meanwhile is fine: the host
-// coalesces concurrent loads onto one init.
+// Page load fires the bare-warmup LADDER: the server warms every servable
+// model smallest-first and reports per-model fit, so one published app
+// adapts to the deployment's share - the models that fit are warm, the ones
+// that don't are disabled in the menu (attached, but this deployment cannot
+// hold them). If the preselected model turns out unfit, selection falls to
+// the largest model that warmed. Changing the selection re-warms just that
+// model (cheap once the ladder ran). Warmup is GPU-only by design - only an
+// explicit cpu target pick warms the CPU session instead. Non-fatal on
+// failure - a chat request performs the same load itself, with its own
+// status line. Typing meanwhile is fine: the host coalesces concurrent
+// loads onto one init.
 let pillTimer = null;
 function pill(cls, html, text, hideAfter) {
   clearTimeout(pillTimer);
@@ -1632,6 +1648,43 @@ async function warm() {
   }
 }
 
+// The page-load ladder (see the section comment). Falls back to the classic
+// single-model warm against servers that predate the ladder response shape.
+async function warmLadder() {
+  pill("", '<span class="spin"></span>', "Warming models (smallest first)…");
+  const t0 = Date.now();
+  const q = state.target === "cpu" ? "?target=cpu" : "";
+  try {
+    const res = await fetch("warmup" + q, { signal: AbortSignal.timeout(600000) });
+    const d = await res.json().catch(() => ({}));
+    if (!Array.isArray(d.ladder)) return warm();
+    state.unfit = {};
+    for (const r of d.ladder) if (!r.ok) state.unfit[r.model] = r.error || "did not fit";
+    if (state.model && state.unfit[state.model] && d.default) {
+      // the preselected model doesn't fit here: fall to the largest that
+      // does. The localStorage preference survives untouched, so a larger
+      // redeploy restores the user's pick.
+      state.model = d.default;
+      modelLabel.textContent = d.default;
+    }
+    renderModelMenu();
+    const fit = d.ladder.filter((r) => r.ok);
+    const secs = ((Date.now() - t0) / 1000).toFixed(1) + "s";
+    if (!fit.length) {
+      pill("fail", ICONS.alert, " No attached model fits this deployment — add resources or attach smaller models", 15000);
+      warmPill.title = d.ladder.map((r) => r.model + ": " + (r.error || "")).join("\n");
+    } else if (fit.length < d.ladder.length) {
+      pill("ok", ICONS.tick, " Ready · " + fit.length + " of " + d.ladder.length + " models fit · " + secs, 8000);
+      warmPill.title = d.ladder.filter((r) => !r.ok)
+        .map((r) => r.model + ": " + (r.error || "did not fit")).join("\n");
+    } else {
+      pill("ok", ICONS.tick, " Ready · " + (fit.length > 1 ? fit.length + " models · " : "") + secs, 5000);
+    }
+  } catch (_) {
+    pill("fail", ICONS.alert, " Warmup did not finish — the first reply will load the model", 10000);
+  }
+}
+
 // ------------------------------------------------------------------- boot --
 // With storage on: restore saved chats (newest first), then land on a fresh
 // empty chat. If the user starts typing before IndexedDB opens (rare), their
@@ -1655,7 +1708,7 @@ async function warm() {
   else newChat();
 })();
 if (!isMobile()) document.body.classList.remove("collapsed");
-(async () => { await modelsReady; warm(); })();
+(async () => { await modelsReady; warmLadder(); })();
 </script>
 </body>
 </html>
