@@ -152,8 +152,19 @@ async function view(vol, path) {
 }
 
 // ---- volume cards -----------------------------------------------------------
-function s3CredsBlock() {
-  return `<details class="creds"><summary>private bucket? S3 credentials (optional)</summary><div>
+// The manager relays rclone's stderr verbatim; recognize the shapes that mean
+// "the BUCKET rejected the request's credentials" (not a wrong crypt password)
+// so the fix - filling in the S3 fields - is stated instead of guessed at.
+// R2/S3 answer a credential-less request with `InvalidArgument: Authorization`.
+const CRED_ERR = /InvalidArgument: Authorization|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied/;
+const credHint = (err) => CRED_ERR.test(err || "")
+  ? `<div class="err" style="color:var(--warn)">The bucket rejected this request's S3 credentials${/InvalidArgument: Authorization/.test(err) ? " (it refused an unauthenticated request)" : ""} -
+     the crypt password was never checked. Fill in the access key id + secret access key below.
+     Lock wipes retained credentials, so they are needed again at every unlock.</div>`
+  : "";
+
+function s3CredsBlock(open) {
+  return `<details class="creds"${open ? " open" : ""}><summary>S3 credentials - required unless the bucket allows public reads (Lock wipes them; re-enter at every unlock)</summary><div>
       <input name="accessKeyId" placeholder="access key id" autocomplete="off">
       <input type="password" name="secretAccessKey" placeholder="secret access key" autocomplete="off">
       <input type="password" name="sessionToken" placeholder="session token (optional)" autocomplete="off">
@@ -179,7 +190,7 @@ function volCard(v, files) {
     body = `
       <form class="unlock" data-vol="${esc(v.name)}" data-keyid="${esc(v.keyId || v.name)}">
         ${parts}
-        ${s3CredsBlock()}
+        ${s3CredsBlock(CRED_ERR.test(v.error || ""))}
       </form>
       <div class="row"><a href="#" data-reveal="${esc(v.name)}">derive push credentials (wallet)</a></div>
       <div class="reveal" id="reveal-${esc(v.name)}" style="display:none"></div>`;
@@ -197,7 +208,7 @@ function volCard(v, files) {
     body = `<div class="empty" style="margin-top:8px">${v.status === "syncing" ? "pulling + decrypting from the bucket…" : "encrypting + pushing to the bucket…"}</div>`;
   }
   return `<div class="card"><h2>/enc/${esc(v.name)}${badge}</h2><div class="meta">${where}</div>` +
-    body + (v.error ? `<div class="err">${esc(v.error)}</div>` : "") + "</div>";
+    body + (v.error ? `<div class="err">${esc(v.error)}</div>${credHint(v.error)}` : "") + "</div>";
 }
 
 let lastVols = [];
@@ -207,7 +218,18 @@ async function refresh() {
   try {
     status = await api("status");
   } catch (e) {
-    box.innerHTML = `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(String(e.message || e))}</div></div>`;
+    // The status call failing does NOT mean no volumes exist - /ls is served
+    // from the app's own env/preopens, so it distinguishes "manager
+    // unreachable" (volumes exist, status unknown) from "none configured".
+    let names = [];
+    try { names = Object.keys((await fetch("./ls").then((r) => r.json())).volumes || {}); } catch {}
+    box.innerHTML = names.length
+      ? `<div class="card"><span class="empty">Volumes ${names.map((n) => "<b>/enc/" + esc(n) + "</b>").join(", ")} exist on this deployment,
+           but the in-enclave manager is not answering - status unknown, retrying…</span>
+         <div class="err">${esc(String(e.message || e))}</div></div>`
+      : `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(String(e.message || e))}</div></div>`;
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 5000);
     return;
   }
   const vols = lastVols = status.volumes || [];
