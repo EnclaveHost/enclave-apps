@@ -273,37 +273,95 @@ fn vram_budget() -> Option<u64> {
         .filter(|b| *b > 0)
 }
 
-/// Which servable models CANNOT fit the VRAM budget - the manager's preload
-/// rule, mirrored: models claim the budget smallest-first (the preload /
-/// warmup order), so a model is certainly-unfit once the smaller models'
-/// weights plus its own exceed the budget. Weights-only on purpose:
-/// contexts and compute buffers come and go per request, so this gate only
-/// refuses CERTAIN failures - borderline models still get the honest
-/// warmup probe. Returns volume -> reason, for the unfit models only.
+/// Bytes per KV-cache element, in SIXTEENTHS (q8_0 stores 34 bytes per
+/// 32-element block = 17/16 bytes each; f16 = 32/16; and so on).
+fn kv_elem_sixteenths(t: &str) -> u64 {
+    match t {
+        "f32" => 64,
+        "q8_0" => 17,
+        "q4_0" => 9,
+        "q4_1" => 10,
+        _ => 32, // f16 / bf16 / unknown
+    }
+}
+
+/// Estimated VRAM to SERVE one ggml model beyond its resident weights: the
+/// KV cache at the node's context window plus a flat working-set allowance
+/// (compute buffers, FA workspace, CUDA context). llama.cpp allocates the
+/// FULL window up front regardless of prompt length and does NOT clamp to
+/// the model's training window, so the window term dominates. The node
+/// tuning (ENCLAVE_GGML_N_CTX + KV cache types) is forwarded by the
+/// manager; when absent (older managers, dev boxes) this returns 0 and the
+/// budget gate degrades to weights-only, as before. Returns
+/// (kv_bytes, working_set) - callers sum them.
+const WORKING_SET: u64 = 3 << 29; // 1.5 GiB, deliberately round
+fn serve_cost(cfg: &AppConfig) -> (u64, u64) {
+    if cfg.backend != "ggml" {
+        return (0, 0);
+    }
+    let Some(n_ctx) = std::env::var("ENCLAVE_GGML_N_CTX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+    else {
+        return (0, 0);
+    };
+    let tk = std::env::var("ENCLAVE_GGML_KV_CACHE_TYPE").unwrap_or_default();
+    let tv = std::env::var("ENCLAVE_GGML_KV_CACHE_TYPE_V").unwrap_or_else(|_| tk.clone());
+    let elems = cfg.kv_layers.unwrap_or(cfg.n_layers) as u64
+        * cfg.n_kv_heads as u64
+        * cfg.head_dim as u64;
+    let kv = elems * n_ctx * (kv_elem_sixteenths(tk.trim()) + kv_elem_sixteenths(tv.trim())) / 16;
+    (kv, WORKING_SET)
+}
+
+/// Which servable models CANNOT serve within the VRAM budget. Models claim
+/// the budget smallest-first (the preload / warmup order, same tie-break as
+/// the manager's emission), each needing its weights RESIDENT plus - while
+/// a session is open - its KV cache at the node's window and a working-set
+/// allowance (serve_cost). Refusing here is load-bearing, not cosmetic: a
+/// CUDA OOM inside compute ABORTS the whole wasmtime process (ggml_abort -
+/// no error reaches the guest, every model goes down with it), so a
+/// too-big model must never be probed, let alone served. Single active
+/// session assumed; when the node env is unknown the estimate degrades to
+/// weights-only. Returns volume -> reason, for the unfit models only.
 fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Some(budget) = vram_budget() else { return out };
     let mut asc: Vec<&ModelEntry> = entries.iter().collect();
-    // same order (and tie-break) as the manager's preload emission, so both
-    // sides always agree on which model crosses the budget line
     asc.sort_by(|a, b| a.bytes.cmp(&b.bytes).then(a.volume.cmp(&b.volume)));
     let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
     let mut claimed = 0u64;
     for e in asc {
-        if claimed + e.bytes > budget {
+        let (kv, ws) = serve_cost(&e.cfg);
+        if claimed + e.bytes + kv + ws > budget {
+            let need = e.bytes + kv + ws;
             out.insert(
                 e.volume.clone(),
-                format!(
-                    "{:.1} GB of weights cannot fit the deployment's {:.1} GB VRAM budget\
-                     {} - redeploy with a larger GPU share to unlock this model",
-                    gb(e.bytes),
-                    gb(budget),
-                    if claimed > 0 {
-                        format!(" ({:.1} GB already claimed by smaller models)", gb(claimed))
-                    } else {
-                        String::new()
-                    }
-                ),
+                if kv > 0 {
+                    format!(
+                        "needs ~{:.1} GB to serve ({:.1} GB weights + {:.1} GB KV cache at the \
+                         node's context window + working set) but {:.1} GB of the {:.1} GB VRAM \
+                         budget remains - redeploy with a larger GPU share to unlock this model",
+                        gb(need),
+                        gb(e.bytes),
+                        gb(kv),
+                        gb(budget.saturating_sub(claimed)),
+                        gb(budget)
+                    )
+                } else {
+                    format!(
+                        "{:.1} GB of weights cannot fit the deployment's {:.1} GB VRAM budget\
+                         {} - redeploy with a larger GPU share to unlock this model",
+                        gb(e.bytes),
+                        gb(budget),
+                        if claimed > 0 {
+                            format!(" ({:.1} GB already claimed by smaller models)", gb(claimed))
+                        } else {
+                            String::new()
+                        }
+                    )
+                },
             );
         } else {
             claimed += e.bytes;
@@ -316,15 +374,25 @@ fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, Stri
 /// or ?model= on /warmup) matches a model name or volume name; an UNKNOWN
 /// name falls back to the default model instead of erroring - OpenAI SDKs
 /// require a model string and clients routinely send one this deployment
-/// never heard of. No servable models at all falls back to the top-level
-/// config, whose volume-not-attached error path tells the operator what to
-/// attach.
+/// never heard of. A KNOWN name the VRAM budget cannot serve is REFUSED
+/// with the reason (attempting it can abort the whole tenant - see
+/// over_budget); the default pick is the largest attached model that FITS,
+/// falling back to the plain largest when nothing fits or the budget is
+/// unknown. No servable models at all falls back to the top-level config,
+/// whose volume-not-attached error path tells the operator what to attach.
 fn resolve_model(raw: &serde_json::Value, requested: Option<&str>) -> Result<AppConfig, String> {
     let entries = available_models(raw);
+    let unfit = over_budget(&entries);
     if let Some(want) = requested {
         if let Some(e) = entries.iter().find(|e| e.cfg.name == want || e.volume == want) {
+            if let Some(why) = unfit.get(&e.volume) {
+                return Err(format!("model '{want}' cannot serve on this deployment: {why}"));
+            }
             return Ok(e.cfg.clone());
         }
+    }
+    if let Some(e) = entries.iter().find(|e| !unfit.contains_key(&e.volume)) {
+        return Ok(e.cfg.clone());
     }
     match entries.into_iter().next() {
         Some(e) => Ok(e.cfg),

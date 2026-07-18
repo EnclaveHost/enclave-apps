@@ -30,6 +30,12 @@ pub struct AppConfig {
     pub n_layers: u32,
     pub n_kv_heads: u32,
     pub head_dim: u32,
+    /// layers that actually hold KV cache, for VRAM estimates: hybrid /
+    /// linear-attention models keep KV only in their full-attention layers
+    /// (qwen3.5-9b: 8 of 32; qwen3.5-122b: 12 of 48). Defaults to n_layers -
+    /// the classic all-attention transformer.
+    #[serde(default)]
+    pub kv_layers: Option<u32>,
     pub vocab: usize,
     pub eos: Vec<u32>,
     /// chat template: "chatml" | "llama3" | "gemma" | "phi3" | "raw"

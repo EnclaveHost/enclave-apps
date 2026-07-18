@@ -1,5 +1,5 @@
 {
-  "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). The 'models' catalog is stated in FULL for all three ggml volumes; the retired onnx volume qwen2.5-0.5b is gone from the gpu fleet so its entry is dropped here (the catalog embedded in the wasm keeps it for local dev). qwen2.5-0.5b-gguf sets tokenizer_file to null EXPLICITLY: ENCLAVE_CONFIG merges per FIELD into the embedded catalog, whose entry still points tokenizer_file at the retired onnx volume - omitting the key would keep that stale cross-volume path, null clears it so the re-wrapped volume's own bundled tokenizer.json serves. 122b/9b geometry from the volumes' GGUF headers (qwen35moe/qwen35) + the shared Qwen3.5 tokenizer; both open replies with a <think> block, which the large max_new budgets and rep_penalty 1 (penalties distort long reasoning) are sized for. The 122b needs >=~50% GPU share, the 9b ~10 GB VRAM (6 GB weights + q8 KV at the 96k window). qwen2.5-0.5b-gguf runs its full native window (32k = 24576 prompt + 8192 gen cap; the embedded 3072 was sized for the retired onnx guest-memory path - ggml KV lives host-side, and the node's ENCLAVE_GGML_N_CTX 262144 already covers it). Largest attached model serves as the default.",
+  "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). The 'models' catalog is stated in FULL for all three ggml volumes; the retired onnx volume qwen2.5-0.5b is gone from the gpu fleet so its entry is dropped here (the catalog embedded in the wasm keeps it for local dev). qwen2.5-0.5b-gguf sets tokenizer_file to null EXPLICITLY: ENCLAVE_CONFIG merges per FIELD into the embedded catalog, whose entry still points tokenizer_file at the retired onnx volume - omitting the key would keep that stale cross-volume path, null clears it so the re-wrapped volume's own bundled tokenizer.json serves. 122b/9b geometry from the volumes' GGUF headers (qwen35moe/qwen35) + the shared Qwen3.5 tokenizer; both open replies with a <think> block, which the large max_new budgets and rep_penalty 1 (penalties distort long reasoning) are sized for. kv_layers counts only the FULL-ATTENTION layers (hybrid models keep no KV in the linear-attention ones) so the app's VRAM pricing - weights + KV at the NODE's window (llama.cpp allocates the whole ENCLAVE_GGML_N_CTX up front, not the app's prompt budget) + ~1.5 GB working set - is honest. The 122b needs >=~50% GPU share; the 9b needs ~12 GB (5.6 weights + 4.3 KV at the 256K node window + working set) = gpu 0.09; under that the app now refuses it cleanly instead of the tenant dying by CUDA OOM mid-compute. qwen2.5-0.5b-gguf runs its full native window (32k = 24576 prompt + 8192 gen cap; the embedded 3072 was sized for the retired onnx guest-memory path - ggml KV lives host-side, and the node's ENCLAVE_GGML_N_CTX 262144 already covers it). Largest attached model serves as the default.",
   "volumes": ["qwen2.5-0.5b-gguf", "qwen3.5-122b-gguf", "qwen3.5-9b-gguf"],
   "models": {
     "qwen3.5-122b-gguf": {
@@ -8,6 +8,7 @@
       "n_layers": 48,
       "n_kv_heads": 2,
       "head_dim": 256,
+      "kv_layers": 12,
       "vocab": 248320,
       "eos": [248046, 248044],
       "template": "chatml",
@@ -24,6 +25,7 @@
       "n_layers": 32,
       "n_kv_heads": 4,
       "head_dim": 256,
+      "kv_layers": 8,
       "vocab": 248320,
       "eos": [248046, 248044],
       "template": "chatml",
