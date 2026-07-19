@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#2dd4bf" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#2dd4bf" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- many senders, one sealed envelope -->
+  <g stroke="#3a4256" stroke-width="4" fill="none">
+    <path d="M1060 120 h60 M1060 200 h60 M1060 280 h60"/>
+  </g>
+  <g fill="#3a4256">
+    <circle cx="1050" cy="120" r="10"/><circle cx="1050" cy="200" r="10"/><circle cx="1050" cy="280" r="10"/>
+  </g>
+  <rect x="1180" y="120" width="220" height="160" rx="12" fill="#2dd4bf"/>
+  <path d="M1180 132 L1290 218 L1400 132" fill="none" stroke="#06201c" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="1290" cy="222" r="24" fill="#06201c"/>
+  <rect x="1280" y="222" width="20" height="34" rx="3" fill="#06201c"/>
+  <text x="96" y="180" font-size="84" fill="#2dd4bf">[ tip <tspan fill="#d7dde8" font-weight="bold">line</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">an inbox only you can open</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">sources encrypt to your public key, in a page you can attest first</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">the enclave stores ciphertext it can never read — and can't have swapped the page</text>
+</svg>

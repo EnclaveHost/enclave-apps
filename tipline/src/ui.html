@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>tip line — an inbox only you can open</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #2dd4bf; --accent-hi: #6ee7d7;
+    --amber: #e8a34c; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #10201d 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  textarea {
+    width: 100%; min-height: 150px; resize: vertical;
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 12px 14px; font: 14px/1.55 var(--mono); outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  input.line {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px var(--mono); outline: none;
+  }
+  input.line:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: block; margin: 14px 0 6px; }
+  button {
+    background: var(--accent); color: #06201c; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.danger { background: transparent; color: var(--red); border: 1px solid var(--edge2); font-weight: 400; }
+  button.danger:hover { border-color: var(--red); }
+  button.mini { padding: 5px 12px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .linkbox { display: flex; gap: 8px; margin-top: 8px; align-items: stretch; }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .lbl { color: var(--dim); font-size: 12px; letter-spacing: .05em; margin: 18px 0 2px; text-transform: uppercase; }
+  .lbl:first-child { margin-top: 6px; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); color: #d9a3a3; }
+  .note.green { border-color: var(--green); }
+  .note.amber { border-color: var(--amber); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.live { background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  .tip { border: 1px solid var(--edge); border-radius: 8px; margin-top: 10px; background: #0d1119; overflow: hidden; }
+  .tip.flash { animation: flash 1.4s ease-out; }
+  @keyframes flash { 0% { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); } 100% { border-color: var(--edge); box-shadow: none; } }
+  .thead { display: flex; gap: 10px; align-items: baseline; padding: 9px 12px 4px; }
+  .tmeta { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
+  .tspacer { flex: 1; }
+  pre.tiptext {
+    white-space: pre-wrap; word-break: break-word; margin: 0; padding: 4px 12px 10px;
+    font: 13.5px/1.55 var(--mono); color: var(--ink);
+  }
+  .tiptext.undec { color: var(--faint); font-style: italic; }
+  .contact { color: var(--accent-hi); font-size: 12.5px; padding: 0 12px 8px; overflow-wrap: anywhere; }
+  .tfoot { display: flex; gap: 8px; padding: 0 10px 9px; }
+  .empty { color: var(--faint); font-size: 12.5px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ tip <b>line</b> ]</div>
+    <div class="tag">an inbox only you can open · the page itself is attested</div>
+  </header>
+
+  <!-- CREATE (/) -->
+  <section id="create" class="card hidden">
+    <h2>OPEN A TIP LINE</h2>
+    <p class="sub">a public inbox that only you can read. share the submission link anywhere;
+    tips are encrypted in the sender's browser to a key only you hold.</p>
+    <label for="title">what is this tip line for?</label>
+    <input id="title" class="line" maxlength="80" placeholder="e.g. story tips for the newsroom" autofocus>
+    <div class="row">
+      <span class="spacer"></span>
+      <button id="open">open a tip line →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>your browser makes an ECDH P-256 keypair — the public half goes in the submission link, the private half only in your owner link</li>
+      <li>each sender encrypts to your public key with a throwaway ephemeral key; the server stores ciphertext it cannot read</li>
+      <li>the submission page is served by attested code in a hardware TEE, so a source can verify it <em>before</em> typing</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>YOUR TIP LINE IS OPEN</h2>
+    <div class="lbl">public submission link</div>
+    <p class="sub">share this anywhere — it carries only your PUBLIC key.</p>
+    <div class="linkbox"><input id="publink" readonly><button id="copypub">copy</button></div>
+    <div class="lbl">your owner link — keeps your private key</div>
+    <p class="sub">open it to read tips. it is the ONLY copy of your private key.</p>
+    <div class="linkbox"><input id="ownlink" readonly><button id="copyown">copy</button></div>
+    <div class="note red">
+      save your owner link now, somewhere only you can reach. <b>lose it and every tip is
+      unreadable forever</b> — there is no reset, no backup, the key exists nowhere else.
+      anyone who gets this link reads everything.
+    </div>
+    <div class="row" style="margin-top:18px">
+      <button id="goinbox">open my inbox →</button>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="location.href='/'">open another</button>
+    </div>
+  </section>
+
+  <!-- SUBMIT (/t/<id>) -->
+  <section id="submit" class="card hidden">
+    <h2 id="subtitle">SEND A TIP</h2>
+    <p class="sub" id="subwho"></p>
+    <div class="note">your message is encrypted in this page before it leaves your device; the
+    server stores only ciphertext, and only the recipient's private key can open it.</div>
+    <label for="msg">your message</label>
+    <textarea id="msg" maxlength="60000" placeholder="what do you want them to know?" autofocus></textarea>
+    <label for="contact">how to reach you (optional)</label>
+    <input id="contact" class="line" maxlength="200" placeholder="a signal number, an email, a proton alias — or leave blank">
+    <div class="row">
+      <span class="spacer"></span>
+      <button id="send">send securely →</button>
+    </div>
+    <div class="err" id="serr"></div>
+    <div class="note amber" style="margin-top:16px">once sent, <b>even you cannot read it back</b>:
+    the ephemeral key that encrypted it is discarded the moment you send. only the recipient can open it.</div>
+    <p class="sub" style="margin-top:14px">verify this enclave before trusting it — the page you are
+    typing into is reproducible from source and hardware-attested.
+    <a href="https://enclave.host" rel="noreferrer">check the attestation</a>.</p>
+  </section>
+
+  <!-- SENT -->
+  <section id="sent" class="card hidden">
+    <h2>SENT</h2>
+    <p class="sub">the enclave now holds ciphertext it cannot read. nobody, including you, can
+    decrypt it: your ephemeral key was discarded the instant it left your device.</p>
+    <div class="note green" style="margin-top:14px">delivered to a sealed inbox. only the recipient's
+    private key can open your message.</div>
+    <div class="row" style="margin-top:18px">
+      <button id="another" class="ghost">send another</button>
+    </div>
+    <p class="sub" style="margin-top:16px">if your network position is sensitive, note that the
+    enclave still sees the <em>timing</em> and <em>size</em> of your submission, not its contents —
+    reach it over Tor or a VPN if that matters.</p>
+  </section>
+
+  <!-- INBOX (/i/<id>#k=priv.token) -->
+  <section id="inbox" class="card hidden">
+    <div class="row" style="margin-top:0">
+      <h2 id="inbtitle" style="margin:0">INBOX</h2>
+      <span class="dot" id="livedot"></span>
+      <span class="sub" id="livemsg" style="margin:0">connecting…</span>
+      <span class="spacer"></span>
+      <span class="sub" id="inbcount" style="margin:0"></span>
+    </div>
+    <p class="sub" id="inbsub" style="margin-top:8px"></p>
+    <div class="err" id="ierr"></div>
+    <div class="empty hidden" id="inbempty">no tips yet. share your submission link to start receiving them.</div>
+    <div id="tips" style="margin-top:8px"></div>
+    <details class="fold" style="margin-top:16px">
+      <summary class="sub" style="cursor:pointer">share your submission link</summary>
+      <div class="linkbox" style="margin-top:8px"><input id="inbpub" readonly><button id="inbcopy">copy</button></div>
+    </details>
+  </section>
+
+  <!-- BAD KEY -->
+  <section id="badkey" class="card hidden">
+    <h2>NO KEY IN THIS LINK</h2>
+    <p class="sub">this inbox link is missing its private key, or the key is malformed. the private
+    key lives only in the part after <b>#</b>, which browsers never send to any server — so if it is
+    gone, the tips cannot be read. open your original owner link, exactly as you saved it.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a new tip line</button></div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">no tip line answers to this link — it expired after 30 days idle, or never
+    existed. the server can't tell you which.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a tip line</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  ciphertext only, in enclave RAM only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — the enclave can't read your
+  tips, but it does see their arrival times and sizes; attest it before trusting it.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const sha256hex = async (str) => {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","submit","sent","inbox","badkey","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+// window.confirm is blocked in some contexts; arm on first click instead.
+const armBtn = (btn, fn) => {
+  let armed = 0;
+  btn.dataset.orig = btn.textContent;
+  btn.addEventListener("click", () => {
+    if (Date.now() - armed < 3000) {
+      armed = 0; btn.textContent = btn.dataset.orig; fn();
+    } else {
+      armed = Date.now(); btn.textContent = "sure? click again";
+      setTimeout(() => { if (armed && Date.now() - armed >= 3000) { armed = 0; btn.textContent = btn.dataset.orig; } }, 3200);
+    }
+  });
+};
+const fmtRel = (ts) => {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  return s < 5 ? "just now" : s < 60 ? s + "s ago"
+    : s < 3600 ? Math.floor(s / 60) + "m ago"
+    : s < 86400 ? Math.floor(s / 3600) + "h ago" : Math.floor(s / 86400) + "d ago";
+};
+const fmtSize = (n) => n < 1024 ? n + " B" : (n / 1024).toFixed(1) + " KiB";
+
+// ---- ECDH P-256 -------------------------------------------------------------
+const ECDH = { name: "ECDH", namedCurve: "P-256" };
+// derive an AES-256-GCM key from a private key + a peer's public key
+async function deriveAes(priv, pub, usage) {
+  return crypto.subtle.deriveKey(
+    { name: "ECDH", public: pub }, priv,
+    { name: "AES-GCM", length: 256 }, false, [usage]);
+}
+// ECDH public keys import with EMPTY usages (WebCrypto rule)
+const importPub = (raw) => crypto.subtle.importKey("raw", raw, ECDH, false, []);
+const newLineId = () => {
+  const cs = "abcdefghijklmnopqrstuvwxyz0123456789";
+  return [...rand(12)].map(b => cs[b % 36]).join("");
+};
+
+// ---- create flow ------------------------------------------------------------
+$("open").addEventListener("click", async () => {
+  $("cerr").textContent = "";
+  const title = $("title").value.trim();
+  if (!title) { $("cerr").textContent = "give your tip line a name first."; return; }
+  $("open").disabled = true;
+  try {
+    const pair = await crypto.subtle.generateKey(ECDH, true, ["deriveKey"]);
+    const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));   // 65 bytes
+    const privPk = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+    const id = newLineId();
+    const ownerToken = b64u(rand(16));
+    const res = await api("/api/lines", {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        "x-line-id": id,
+        "x-owner-hash": await sha256hex(ownerToken),
+        "x-pubkey": b64u(pubRaw),
+      },
+      body: encodeURIComponent(title),
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const pub = location.origin + "/t/" + id;
+    const owner = location.origin + "/i/" + id + "#k=" + b64u(privPk) + "." + ownerToken;
+    $("publink").value = pub;
+    $("ownlink").value = owner;
+    $("goinbox").onclick = () => location.href = owner;
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+    $("open").disabled = false;
+  }
+});
+copyBtn($("copypub"), () => $("publink").value);
+copyBtn($("copyown"), () => $("ownlink").value);
+
+// ---- submit flow ------------------------------------------------------------
+let subId = null, subPub = null;
+async function initSubmit(id) {
+  subId = id;
+  const res = await api("/api/line?id=" + encodeURIComponent(id));
+  if (!res.ok) { show("gone"); return; }
+  try { subPub = await importPub(unb64u(res.j.pubkey)); }
+  catch { show("gone"); return; }
+  $("subtitle").textContent = "SEND A TIP";
+  $("subwho").textContent = res.j.title + (res.j.tips ? "  ·  " + res.j.tips + " received" : "");
+  show("submit");
+}
+async function doSend() {
+  $("serr").textContent = "";
+  const text = $("msg").value.trim();
+  if (!text) { $("serr").textContent = "nothing to send."; return; }
+  $("send").disabled = true;
+  try {
+    const contact = $("contact").value.trim();
+    const payload = enc.encode(JSON.stringify({ text, at: Date.now(), contact: contact || undefined }));
+    const eph = await crypto.subtle.generateKey(ECDH, true, ["deriveKey"]);
+    const ephRaw = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey)); // 65
+    const key = await deriveAes(eph.privateKey, subPub, "encrypt");
+    const iv = rand(12);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, payload));
+    const wire = new Uint8Array(65 + 12 + ct.length);
+    wire.set(ephRaw); wire.set(iv, 65); wire.set(ct, 77);
+    // the ephemeral private key is now unreferenced — forward secrecy: the
+    // sender cannot decrypt their own message after this returns.
+    const res = await api("/api/tip", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "id=" + encodeURIComponent(subId) + "&blob=" + b64u(wire),
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    show("sent");
+  } catch (e) {
+    $("serr").textContent = "couldn't send — " + (e.message || e);
+    $("send").disabled = false;
+  }
+}
+$("send").addEventListener("click", doSend);
+$("another").addEventListener("click", () => {
+  $("msg").value = ""; $("contact").value = ""; $("send").disabled = false;
+  show("submit"); $("msg").focus();
+});
+
+// ---- inbox flow -------------------------------------------------------------
+let inbId = null, inbPriv = null, inbToken = null, es = null;
+let seen = new Set(), unseen = 0, baseTitle = document.title;
+
+const streamTok = (() => {
+  let t = sessionStorage.getItem("tl-stream");
+  if (!t) { t = b64u(rand(16)); sessionStorage.setItem("tl-stream", t); }
+  return t;
+})();
+
+async function decryptTip(t) {
+  try {
+    const wire = unb64u(t.blob);
+    if (wire.length < 78) throw new Error("short");
+    const ephPub = await importPub(wire.slice(0, 65));
+    const iv = wire.slice(65, 77), ct = wire.slice(77);
+    const key = await deriveAes(inbPriv, ephPub, "decrypt");
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+    const m = JSON.parse(dec.decode(pt));
+    return { ok: true, text: String(m.text || ""), contact: m.contact ? String(m.contact) : "" };
+  } catch { return { ok: false }; }
+}
+
+async function buildTip(t, flash) {
+  const el = document.createElement("div");
+  el.className = "tip" + (flash ? " flash" : "");
+  const head = document.createElement("div");
+  head.className = "thead";
+  const rel = document.createElement("span");
+  rel.className = "tmeta rel"; rel.dataset.ts = t.ts; rel.textContent = fmtRel(t.ts);
+  const sp = document.createElement("span"); sp.className = "tspacer";
+  const meta = document.createElement("span"); meta.className = "tmeta"; meta.textContent = fmtSize(t.size);
+  head.append(rel, sp, meta);
+  el.appendChild(head);
+  const d = await decryptTip(t);
+  const pre = document.createElement("pre");
+  pre.className = "tiptext" + (d.ok ? "" : " undec");
+  pre.textContent = d.ok ? d.text : "· couldn't decrypt (not encrypted to this key) ·";
+  el.appendChild(pre);
+  if (d.ok && d.contact) {
+    const c = document.createElement("div");
+    c.className = "contact"; c.textContent = "reach: " + d.contact;
+    el.appendChild(c);
+  }
+  const foot = document.createElement("div");
+  foot.className = "tfoot";
+  if (d.ok) {
+    const cp = document.createElement("button");
+    cp.className = "ghost mini"; cp.textContent = "copy text";
+    copyBtn(cp, () => d.text);
+    foot.appendChild(cp);
+  }
+  const sp2 = document.createElement("span"); sp2.className = "tspacer";
+  const del = document.createElement("button");
+  del.className = "danger mini"; del.textContent = "delete";
+  armBtn(del, async () => {
+    const r = await api("/api/tips/remove", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "id=" + encodeURIComponent(inbId) + "&owner=" + encodeURIComponent(inbToken) + "&n=" + t.n,
+    });
+    if (r.ok || r.status === 404) { seen.delete(t.n); el.remove(); refreshCount(); }
+    else $("ierr").textContent = "delete failed (" + r.status + ")";
+  });
+  foot.append(sp2, del);
+  el.appendChild(foot);
+  return el;
+}
+
+function refreshCount() {
+  const n = $("tips").children.length;
+  $("inbcount").textContent = n ? n + (n === 1 ? " tip" : " tips") : "";
+  $("inbempty").classList.toggle("hidden", n > 0);
+}
+function ackTitle() {
+  unseen = 0; document.title = baseTitle;
+}
+
+async function loadInbox() {
+  const res = await api("/api/inbox?id=" + encodeURIComponent(inbId) + "&owner=" + encodeURIComponent(inbToken));
+  if (res.status === 404) { show("gone"); return false; }
+  if (res.status === 403) { show("badkey"); return false; }
+  if (!res.ok) { $("ierr").textContent = "server said " + res.status; return true; }
+  $("inbtitle").textContent = res.j.title.toUpperCase();
+  $("inbsub").textContent = res.j.received + (res.j.received === 1 ? " tip" : " tips") +
+    " ever · " + res.j.kept + " kept here (newest first)";
+  const tips = $("tips");
+  tips.textContent = "";
+  seen = new Set();
+  for (const t of res.j.tips) { // already newest-first
+    seen.add(t.n);
+    tips.appendChild(await buildTip(t, false));
+  }
+  refreshCount();
+  return true;
+}
+
+function subscribe() {
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(inbId) +
+    "&owner=" + encodeURIComponent(inbToken) + "&s=" + streamTok);
+  es.onopen = () => { $("livedot").classList.add("live"); $("livemsg").textContent = "live"; };
+  es.onerror = () => { $("livedot").classList.remove("live"); $("livemsg").textContent = "reconnecting…"; };
+  es.addEventListener("tip", async (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (seen.has(m.n)) return;
+    // the event carries no blob — fetch the inbox to get the ciphertext
+    const res = await api("/api/inbox?id=" + encodeURIComponent(inbId) + "&owner=" + encodeURIComponent(inbToken));
+    if (!res.ok) return;
+    for (const t of res.j.tips) {
+      if (seen.has(t.n)) continue;
+      seen.add(t.n);
+      $("tips").prepend(await buildTip(t, true));
+    }
+    $("inbsub").textContent = res.j.received + (res.j.received === 1 ? " tip" : " tips") +
+      " ever · " + res.j.kept + " kept here (newest first)";
+    refreshCount();
+    if (document.hidden) { unseen++; document.title = "● " + unseen + " new"; }
+  });
+}
+
+async function initInbox(id, priv, token) {
+  inbId = id; inbToken = token;
+  try { inbPriv = await crypto.subtle.importKey("pkcs8", unb64u(priv), ECDH, false, ["deriveKey"]); }
+  catch { show("badkey"); return; }
+  show("inbox");
+  $("inbpub").value = location.origin + "/t/" + id;
+  $("ierr").textContent = "";
+  if (await loadInbox()) subscribe();
+}
+$("inbcopy") && copyBtn($("inbcopy"), () => $("inbpub").value);
+
+window.addEventListener("focus", ackTitle);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) ackTitle(); });
+window.addEventListener("pagehide", () => {
+  if (es) { es.close(); es = null; }
+  if (inbId && navigator.sendBeacon) navigator.sendBeacon("/api/leave", "id=" + inbId + "&s=" + streamTok);
+});
+setInterval(() => {
+  for (const el of document.querySelectorAll(".rel")) el.textContent = fmtRel(+el.dataset.ts);
+}, 5000);
+
+// ---- router (pathname + fragment; a hard reload must Just Work) -------------
+function route() {
+  const path = location.pathname;
+  const sub = path.match(/^\/t\/([a-z0-9]{10,16})$/);
+  if (sub) { initSubmit(sub[1]); return; }
+  const inb = path.match(/^\/i\/([a-z0-9]{10,16})$/);
+  if (inb) {
+    const h = location.hash.slice(1);
+    if (!h.startsWith("k=")) { show("badkey"); return; }
+    const rest = h.slice(2), dot = rest.indexOf(".");
+    if (dot < 1) { show("badkey"); return; }
+    initInbox(inb[1], rest.slice(0, dot), rest.slice(dot + 1));
+    return;
+  }
+  show("create");
+  loadStats();
+}
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "currently holding " + r.j.lines + " tip line" + (r.j.lines === 1 ? "" : "s") +
+      " · " + r.j.tips + " tips sealed in RAM · " + r.j.lifetime_tips + " ever received";
+  } catch {}
+}
+route();
+</script>
+</body>
+</html>

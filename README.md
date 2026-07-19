@@ -32,6 +32,7 @@ app's README (and `wasm/apps/README.md` in the
 | [quorum](quorum/) | M-of-N secret release — break-glass escrow the enclave enforces; who approved stays private. |
 | [fairdraw](fairdraw/) | Provably fair raffles: salt committed before entries, revealed at close, winners recomputable in your browser. |
 | [tripwire](tripwire/) | Canary tokens with a live alarm board — the trip log is append-only in attested RAM, so an intruder can't erase the record of their own trip. |
+| [tipline](tipline/) | Anonymous encrypted inbox — sources encrypt to your key in a page you can attest first. |
 
 ## Building
 

@@ -1,0 +1,15 @@
+[package]
+name = "tipline"
+version = "0.1.0"
+edition = "2021"
+description = "An anonymous encrypted inbox — senders encrypt to a public key in an attested page, only the recipient's private key (held in a link fragment) can open a tip"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
