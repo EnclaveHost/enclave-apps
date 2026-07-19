@@ -34,6 +34,7 @@ app's README (and `wasm/apps/README.md` in the
 | [tripwire](tripwire/) | Canary tokens with a live alarm board — the trip log is append-only in attested RAM, so an intruder can't erase the record of their own trip. |
 | [tipline](tipline/) | Anonymous encrypted inbox — sources encrypt to your key in a page you can attest first. |
 | [keep](keep/) | A confidential notebook on an encrypted volume — notes decrypt only inside the enclave, sync re-encrypts to your bucket. |
+| [shoebox](shoebox/) | A private file locker/gallery on an encrypted volume — upload, browse, download; files decrypt only inside the enclave. |
 
 ## Building
 

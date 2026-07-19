@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#e8a34c" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#e8a34c" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- the box with photos -->
+  <g transform="translate(1140,70)">
+    <rect x="20" y="90" width="300" height="180" rx="10" fill="#e8a34c"/>
+    <rect x="6" y="60" width="328" height="42" rx="8" fill="#ffc46b"/>
+    <g>
+      <rect x="55" y="130" width="80" height="80" rx="4" fill="#0b0e14"/>
+      <circle cx="78" cy="152" r="9" fill="#ffc46b"/>
+      <path d="M60 200 l22 -26 16 16 12 -12 15 22 z" fill="#6fcf8f"/>
+      <rect x="150" y="130" width="80" height="80" rx="4" fill="#0b0e14"/>
+      <path d="M156 200 l20 -30 18 20 10 -10 16 20 z" fill="#4cc9e8"/>
+      <rect x="235" y="130" width="55" height="80" rx="4" fill="#0b0e14"/>
+      <text x="248" y="176" font-size="26" fill="#5a6375">.md</text>
+    </g>
+  </g>
+  <text x="96" y="180" font-size="84" fill="#e8a34c">[ shoe <tspan fill="#d7dde8" font-weight="bold">box</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">your files, decrypted only inside the enclave</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">drop files in, browse the gallery, download — all in the enclave's ramdisk</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">sync re-encrypts to your bucket · the operator only ever sees ciphertext</text>
+</svg>

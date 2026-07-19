@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shoebox — a wallet-unlocked private file locker on Enclave</title>
+<style>
+  :root {
+    --bg: #0c0e13; --panel: #14171f; --panel2: #191d27; --border: #262b38;
+    --text: #e9ecf2; --dim: #8b93a4; --accent: #e8a34c; --accent-hi: #ffc46b;
+    --err: #f2b8c0; --warn: #f5d58a; --ok: #7fd4a8;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 1000px; margin: 0 auto; padding: 0 16px 48px;
+  }
+  header { padding: 22px 0 12px; border-bottom: 1px solid var(--border); }
+  .brand { font: 700 22px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--accent); }
+  .brand b { color: var(--accent-hi); font-weight: 700; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .banner {
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 11px 14px; margin-top: 16px; font-size: 12.5px; color: var(--dim);
+  }
+  .banner b { color: var(--text); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-top: 16px; }
+  .lhead h2 { font: 600 15px ui-monospace, monospace; }
+  .meta { color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace; word-break: break-all; margin-top: 3px; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 9px; margin-left: 8px; vertical-align: 1px; }
+  .badge.locked   { background: #2a2f3e; color: var(--dim); }
+  .badge.syncing, .badge.pushing { background: #3a3320; color: var(--warn); }
+  .badge.unlocked { background: #33280f; color: var(--accent-hi); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hi); }
+  a.link:hover { text-decoration: underline; }
+  .empty { color: var(--dim); font-size: 13px; margin-top: 10px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 10px; white-space: pre-wrap; word-break: break-word; }
+  .hint { color: var(--dim); font-size: 12px; }
+
+  /* ---- unlock panel ---- */
+  form.unlock { margin-top: 10px; display: grid; gap: 8px; }
+  input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font: 13px ui-monospace, monospace;
+  }
+  input::placeholder { color: #59627a; }
+  button {
+    background: var(--accent); color: #241403; border: 0; border-radius: 8px;
+    padding: 8px 15px; font: 600 13px system-ui, sans-serif; cursor: pointer;
+  }
+  button:hover { background: var(--accent-hi); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.ghost:hover { background: var(--panel2); color: var(--text); }
+  button.wallet { background: var(--accent); color: #241403; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  details.creds { font-size: 12.5px; color: var(--dim); margin-top: 4px; }
+  details.creds > summary { cursor: pointer; user-select: none; }
+  details.creds > div { display: grid; gap: 8px; margin-top: 8px; }
+  .reveal { border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; }
+  .reveal .k { color: var(--dim); }
+  .reveal code { display: block; font: 11.5px ui-monospace, monospace; word-break: break-all; margin: 2px 0 8px; color: var(--text); user-select: all; }
+
+  /* ---- locker: dropzone ---- */
+  .dropzone {
+    margin-top: 14px; border: 1.5px dashed var(--border); border-radius: 12px;
+    padding: 20px 16px; text-align: center; background: var(--panel2);
+    transition: border-color .12s, background .12s;
+  }
+  .dropzone.drag { border-color: var(--accent); background: #201a10; }
+  .dztext { font-size: 14px; }
+  .dzhint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  label.pick { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  label.pick:hover { color: var(--accent-hi); }
+  label.pick input { display: none; }
+
+  /* ---- upload progress rows ---- */
+  .uploads { display: grid; gap: 6px; margin-top: 10px; }
+  .uprow { display: grid; grid-template-columns: 1fr 120px auto; gap: 10px; align-items: center; font-size: 12px; }
+  .upname { font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .upbar { height: 6px; background: var(--border); border-radius: 999px; overflow: hidden; }
+  .upfill { height: 100%; width: 0; background: var(--accent); transition: width .1s linear; }
+  .upbar.bad .upfill { background: var(--err); }
+  .upstat { color: var(--dim); font-size: 11.5px; white-space: nowrap; }
+  .upstat.ok { color: var(--ok); }
+  .upstat.bad { color: var(--err); }
+
+  /* ---- actions bar ---- */
+  .actionsbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .actionsbar .sublabel { color: var(--dim); font-size: 12px; margin-right: 6px; }
+  .actionsbar .spacer { flex: 1; }
+  .actionsbar button.primary { background: var(--accent); color: #241403; }
+  .summary { color: var(--dim); font-size: 12.5px; font-family: ui-monospace, monospace; }
+  .dirtytag { color: var(--warn); font-size: 12px; font-weight: 600; margin-right: 10px; }
+
+  /* ---- gallery grid ---- */
+  .folder { color: var(--dim); font: 600 12px ui-monospace, monospace; margin: 16px 0 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-top: 12px; }
+  .tile { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+  .thumb { display: flex; align-items: center; justify-content: center; height: 120px; background: #0f1218; overflow: hidden; }
+  .thumb.img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb.file .ext { font: 700 15px ui-monospace, monospace; color: var(--accent); text-transform: lowercase; }
+  .tname { font-size: 12px; padding: 8px 10px 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; }
+  .trow { display: flex; align-items: center; justify-content: space-between; padding: 2px 10px 10px; }
+  .tsize { color: var(--dim); font-size: 11.5px; }
+  .tacts { display: flex; gap: 6px; align-items: center; }
+  a.dl { font-size: 14px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 6px; }
+  a.dl:hover { border-color: var(--accent); }
+  button.del { background: transparent; color: var(--dim); border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px; font-size: 12px; }
+  button.del:hover { color: var(--err); border-color: var(--err); }
+  button.del.armed { color: #241403; background: var(--err); border-color: var(--err); font-weight: 700; }
+
+  footer { color: var(--dim); font-size: 12px; margin-top: 22px; line-height: 1.6; border-top: 1px solid var(--border); padding-top: 14px; }
+  footer b { color: var(--text); }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--warn); border-top-color: transparent; border-radius: 50%; animation: r .8s linear infinite; vertical-align: -1px; margin-right: 6px; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">[ shoe<b>box</b> ]</div>
+  <div class="tag">your files, decrypted only inside the enclave</div>
+</header>
+
+<div class="banner">
+  Files decrypt into the enclave's in-memory ramdisk. <b>Sync</b> re-encrypts and pushes ciphertext to your S3 bucket;
+  <b>Lock</b> wipes the plaintext. The bucket and the host only ever see ciphertext — the wallet that signs is the only key.
+</div>
+
+<div id="vols"><div class="card"><span class="empty">loading your lockers…</span></div></div>
+
+<footer>
+  <b>How this works.</b> The App Config names where each volume's ciphertext lives (S3 endpoint, bucket, path) — never a key.
+  <b>Unlock with wallet</b> asks your wallet to sign a fixed message naming the volume; the volume key is derived from that
+  signature, so only the wallet holder can produce it — nothing is verified or stored on any server, and no transaction is made.
+  The key goes to <b>this app only</b>, which relays it over loopback to the in-enclave manager; the manager pulls the
+  ciphertext and decrypts onto the CVM's encrypted ramdisk at <span style="font-family:ui-monospace,monospace">/enc/&lt;name&gt;</span>.
+  Uploads write plaintext there; <b>Sync</b> re-encrypts your changes back to the bucket; <b>Lock</b> wipes the plaintext and
+  drops the credentials. Keys and plaintext never touch the operator's host or the bucket.
+  Verify the code that holds your files with the deployment's remote attestation at
+  <a href="https://enclave.host" target="_blank" rel="noreferrer">enclave.host</a>.
+</footer>
+
+<script>
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(1) + " KiB" : n + " B";
+const MAX_UP = 8 * 1024 * 1024;
+let timer = null;
+
+// ===========================================================================
+// VERBATIM security core — byte-exact with scripts/enclave-encvol.sh. Do not
+// edit: the derived password/salt and the credsEnvelope only reproduce if
+// these domain strings and the message stay exactly as pinned by the platform
+// e2e. (Copied unchanged from the encrypted-volumes reference app.)
+// ---------------------------------------------------------------------------
+// The canonical message the wallet personal_signs; password/salt are sha256 of
+// the lowercase 0x-signature + "\n" + a domain label. Deterministic ECDSA
+// (RFC 6979) makes the same wallet always derive the same key.
+const volMessage = (keyId) =>
+  `Enclave encrypted volume key v1\nvolume: ${keyId}\n\nSigning derives this volume's encryption key. Only sign in apps you trust with its contents.`;
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// S3 credentials sealed under the SAME wallet signature that derives the
+// volume key, riding the PUBLIC App Config as "credsEnvelope" — one signature
+// unlocks everything.
+//   encKey/macKey = SHA-256(sig + "\n" + "enclave-encvol-v1:creds-enc"/":creds-mac")
+//   envelope      = "encv1:" + base64( iv[16] || AES-256-CTR(encKey, iv, credsJSON) || HMAC-SHA256(macKey, iv||ct)[32] )
+const sha256bytes = async (s) => new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function openCredsEnvelope(sig, envelope) {
+  if (!envelope.startsWith("encv1:")) throw new Error("unknown credsEnvelope format");
+  const raw = b64decode(envelope.slice(6));
+  if (raw.length < 16 + 32 + 2) throw new Error("credsEnvelope too short");
+  const ivct = raw.slice(0, raw.length - 32), tag = raw.slice(raw.length - 32);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  if (!(await crypto.subtle.verify("HMAC", macKey, tag, ivct)))
+    throw new Error("envelope failed authentication - it was sealed by a different wallet than the one that just signed");
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["decrypt"]);
+  const pt = await crypto.subtle.decrypt({ name: "AES-CTR", counter: ivct.slice(0, 16), length: 128 }, encKey, ivct.slice(16));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+async function sealCredsEnvelope(sig, creds) {
+  const iv = crypto.getRandomValues(new Uint8Array(16));
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CTR", counter: iv, length: 128 }, encKey,
+    new TextEncoder().encode(JSON.stringify(creds))));
+  const ivct = new Uint8Array(16 + ct.length); ivct.set(iv); ivct.set(ct, 16);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const tag = new Uint8Array(await crypto.subtle.sign("HMAC", macKey, ivct));
+  const all = new Uint8Array(ivct.length + 32); all.set(ivct); all.set(tag, ivct.length);
+  return "encv1:" + btoa(String.fromCharCode(...all));
+}
+
+async function walletDerive(keyId) {
+  const eth = window.ethereum;
+  if (!eth) throw new Error("no wallet detected (window.ethereum) - use a browser wallet, or unlock with a password");
+  const [account] = await eth.request({ method: "eth_requestAccounts" });
+  const msg = volMessage(keyId);
+  const hex = "0x" + Array.from(new TextEncoder().encode(msg), (b) => b.toString(16).padStart(2, "0")).join("");
+  let sig = await eth.request({ method: "personal_sign", params: [hex, account] });
+  sig = String(sig).trim().toLowerCase();
+  if (!/^0x[0-9a-f]{130}$/.test(sig)) throw new Error("unexpected signature format (need a 65-byte ECDSA personal_sign; smart-contract wallets are not supported)");
+  return { account, sig,
+           password: await sha256hex(sig + "\nenclave-encvol-v1:password"),
+           salt: await sha256hex(sig + "\nenclave-encvol-v1:salt") };
+}
+
+// The app relays every /api/* call to the in-enclave manager, attaching the
+// bearer token server-side; the browser never sees it.
+async function api(path, body) {
+  const r = await fetch("./api/" + path, body
+    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+    : undefined);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || j.error || `HTTP ${r.status}`);
+  return j;
+}
+// ============================ end verbatim core ============================
+
+// The manager relays rclone's stderr verbatim; recognize the shapes that mean
+// "the BUCKET rejected the request's credentials" (not a wrong crypt password).
+const CRED_ERR = /InvalidArgument: Authorization|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied/;
+const credHint = (err) => CRED_ERR.test(err || "")
+  ? `<div class="err" style="color:var(--warn)">The bucket rejected this request's S3 credentials${/InvalidArgument: Authorization/.test(err) ? " (it refused an unauthenticated request)" : ""} —
+     the crypt password was never checked. Fill in the access key id + secret access key below.
+     Lock wipes retained credentials, so they are needed again at every unlock.</div>`
+  : "";
+
+function s3CredsBlock(open) {
+  return `<details class="creds"${open ? " open" : ""}><summary>S3 credentials — required unless the bucket allows public reads (Lock wipes them; re-enter at every unlock)</summary><div>
+      <input name="accessKeyId" placeholder="access key id" autocomplete="off">
+      <input type="password" name="secretAccessKey" placeholder="secret access key" autocomplete="off">
+      <input type="password" name="sessionToken" placeholder="session token (optional)" autocomplete="off">
+    </div></details>`;
+}
+
+function s3CredsFrom(form) {
+  const body = {};
+  for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+    const el = form?.querySelector(`[name=${k}]`);
+    if (el && el.value) body[k] = el.value;
+  }
+  return body;
+}
+
+// ---- rendering ------------------------------------------------------------
+let lastVols = [];
+const sealSigs = {};          // volume -> signature the reveal panel derived (feeds Seal)
+const dirty = {};             // volume -> unsynced changes since last Sync
+
+function whereOf(v) {
+  return v.endpoint
+    ? `s3 ${esc(v.endpoint)} &rarr; ${esc(v.bucket || "")}${v.path ? "/" + esc(v.path) : ""}`
+    : "ciphertext location comes from the deployment's App Config";
+}
+
+// LOCKED: the reference's unlock panel (wallet-first, password fallback, seal).
+function unlockPanel(v) {
+  const walletBtn = `<button type="button" class="wallet" data-wallet="1">Unlock with wallet</button>
+      <span class="hint">${v.credsEnvelope
+        ? `one signature derives the key AND opens the sealed S3 credentials — nothing to type`
+        : `signs "volume: ${esc(v.keyId || v.name)}", derives the key locally`}</span>`;
+  const passInputs = `
+      <input type="password" name="password" placeholder="rclone crypt password" autocomplete="off">
+      <input type="password" name="salt" placeholder="salt / password2 (leave empty if none)" autocomplete="off">
+      <div class="row"><button type="submit">Unlock with password</button></div>`;
+  const parts = (v.unlock === "password")
+    ? passInputs + `<div class="row">${walletBtn}</div>`
+    : `<div class="row">${walletBtn}</div>
+       <details class="creds"><summary>use a password instead</summary><div>${passInputs}</div></details>`;
+  return `
+    <form class="unlock" data-vol="${esc(v.name)}" data-keyid="${esc(v.keyId || v.name)}">
+      ${parts}
+      ${s3CredsBlock(CRED_ERR.test(v.error || ""))}
+    </form>
+    <div class="row"><a href="#" class="link" data-reveal="${esc(v.name)}">derive push credentials (wallet)</a></div>
+    <div class="reveal" id="reveal-${esc(v.name)}" style="display:none"></div>`;
+}
+
+// UNLOCKED: the file locker / gallery.
+const IMG_EXT = ["png", "jpg", "jpeg", "webp", "gif", "svg"];
+function fileUrl(vol, path) {
+  return `./f/${encodeURIComponent(vol)}/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+function tileHtml(vol, f) {
+  const url = fileUrl(vol, f.path);
+  const base = f.path.split("/").pop();
+  const ext = base.includes(".") ? base.split(".").pop().toLowerCase() : "";
+  const thumb = IMG_EXT.includes(ext)
+    ? `<a class="thumb img" href="${url}" target="_blank" rel="noreferrer"><img loading="lazy" src="${url}" alt="${esc(base)}"></a>`
+    : `<a class="thumb file" href="${url}" target="_blank" rel="noreferrer"><span class="ext">${ext ? "." + esc(ext) : "file"}</span></a>`;
+  return `<div class="tile">
+    ${thumb}
+    <div class="tname" title="${esc(f.path)}">${esc(base)}</div>
+    <div class="trow">
+      <span class="tsize">${fmt(f.size)}</span>
+      <span class="tacts">
+        <a class="dl" href="${url}" download="${esc(base)}" title="download">&darr;</a>
+        <button class="del" data-vol="${esc(vol)}" data-path="${esc(f.path)}" title="delete">&times;</button>
+      </span>
+    </div>
+  </div>`;
+}
+
+function lockerCard(v, files) {
+  const list = (files && files.files) || [];
+  const total = list.reduce((a, f) => a + f.size, 0);
+  // group by folder so subdirs that already exist in the volume are visible;
+  // new uploads land flat at the volume root (the "" group, rendered first).
+  const groups = new Map();
+  for (const f of list) {
+    const i = f.path.lastIndexOf("/");
+    const dir = i >= 0 ? f.path.slice(0, i) : "";
+    if (!groups.has(dir)) groups.set(dir, []);
+    groups.get(dir).push(f);
+  }
+  const dirs = [...groups.keys()].sort((a, b) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+  const grid = dirs.map((d) =>
+    (d ? `<div class="folder">&#128193; ${esc(d)}/</div>` : "") +
+    `<div class="grid">${groups.get(d).map((f) => tileHtml(v.name, f)).join("")}</div>`).join("");
+  const busyPush = v.status === "pushing";
+  return `<div class="card locker">
+    <div class="lhead">
+      <h2>[ ${esc(v.name)} ] <span class="badge unlocked">unlocked</span></h2>
+      <div class="meta">${whereOf(v)}</div>
+    </div>
+    <div class="dropzone" data-vol="${esc(v.name)}">
+      <div class="dztext"><b>Drop files here</b> to add them to this locker, or
+        <label class="pick">choose files<input type="file" multiple data-vol="${esc(v.name)}"></label></div>
+      <div class="dzhint">each file up to 8 MiB · they land decrypted on the enclave ramdisk until you Sync</div>
+    </div>
+    <div class="uploads"></div>
+    <div class="actionsbar">
+      <button class="primary" data-act="sync" data-vol="${esc(v.name)}" ${(v.readOnly || busyPush) ? "disabled" : ""}>${busyPush ? '<span class="spin"></span>syncing…' : "Sync"}</button>
+      <span class="sublabel">re-encrypt &amp; push to your bucket</span>
+      <button class="ghost" data-act="lock" data-vol="${esc(v.name)}">Lock</button>
+      <span class="sublabel">wipe plaintext</span>
+      <span class="spacer"></span>
+      ${dirty[v.name] ? `<span class="dirtytag">&#9679; unsynced changes</span>` : ""}
+      <span class="summary">${list.length} file${list.length === 1 ? "" : "s"} · ${fmt(total)}</span>
+    </div>
+    ${list.length ? grid : `<div class="empty">This locker is empty. Drop a file above to get started.</div>`}
+  </div>`;
+}
+
+function volCard(v, files) {
+  const busy = v.status === "syncing" || v.status === "pushing";
+  if (v.status === "unlocked" || v.status === "pushing") return lockerCard(v, files);
+  let body;
+  if (v.status === "syncing") {
+    body = `<div class="empty"><span class="spin"></span>pulling + decrypting from the bucket…</div>`;
+  } else {
+    body = unlockPanel(v);
+  }
+  const badge = `<span class="badge ${esc(v.status)}">${busy ? '<span class="spin"></span>' : ""}${esc(v.status)}</span>`;
+  return `<div class="card">
+    <div class="lhead"><h2>[ ${esc(v.name)} ] ${badge}</h2><div class="meta">${whereOf(v)}</div></div>
+    ${body}
+    ${v.error ? `<div class="err">${esc(v.error)}</div>${credHint(v.error)}` : ""}
+  </div>`;
+}
+
+async function refresh() {
+  const box = document.getElementById("vols");
+  let status;
+  try {
+    status = await api("status");
+  } catch (e) {
+    // status failing does NOT mean no volumes: /ls is served from the app's
+    // own env/preopens, so distinguish "manager unreachable" from "none".
+    let names = [];
+    try { names = Object.keys((await fetch("./ls").then((r) => r.json())).volumes || {}); } catch {}
+    box.innerHTML = names.length
+      ? `<div class="card"><span class="empty">Locker(s) ${names.map((n) => "<b>[ " + esc(n) + " ]</b>").join(", ")} exist on this deployment,
+           but the in-enclave manager is not answering — status unknown, retrying…</span>
+         <div class="err">${esc(String(e.message || e))}</div></div>`
+      : `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(String(e.message || e))}</div></div>`;
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 5000);
+    return;
+  }
+  const vols = lastVols = status.volumes || [];
+  // normalize: the real manager sends a `status` string; tolerate a bare
+  // `unlocked` boolean too.
+  for (const v of vols) v.status = v.status || (v.unlocked ? "unlocked" : "locked");
+  if (!vols.length) {
+    box.innerHTML = '<div class="card"><span class="empty">No encrypted volumes configured. Add an <b>encVolumes</b> entry to the App Config.</span></div>';
+    return;
+  }
+  let ls = { volumes: {} };
+  if (vols.some((v) => v.status === "unlocked" || v.status === "pushing")) {
+    ls = await fetch("./ls").then((r) => r.json()).catch(() => ({ volumes: {} }));
+  }
+  box.innerHTML = vols.map((v) => volCard(v, ls.volumes[v.name])).join("");
+  if (vols.some((v) => v.status === "syncing" || v.status === "pushing")) {
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 1500);
+  }
+}
+
+// ---- uploads (raw File as the request body; XHR for real per-file progress) -
+function uploadOne(vol, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const path = file.name.split("/").map(encodeURIComponent).join("/");
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `./up/${encodeURIComponent(vol)}/${path}`);
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      let m; try { m = JSON.parse(xhr.responseText).error?.message; } catch {}
+      reject(new Error(m || `HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error("network error"));
+    xhr.send(file);   // the raw File is the request body — not FormData, not JSON
+  });
+}
+
+async function handleFiles(vol, fileList, zone) {
+  const box = zone.parentElement.querySelector(".uploads");
+  let any = false;
+  for (const file of fileList) {
+    const row = document.createElement("div"); row.className = "uprow";
+    const nm = document.createElement("span"); nm.className = "upname"; nm.textContent = file.name;
+    const bar = document.createElement("div"); bar.className = "upbar";
+    const fill = document.createElement("div"); fill.className = "upfill"; bar.appendChild(fill);
+    const st = document.createElement("span"); st.className = "upstat";
+    row.append(nm, bar, st); box.appendChild(row);
+    if (file.size > MAX_UP) {
+      bar.classList.add("bad"); fill.style.width = "100%";
+      st.textContent = `too large — ${fmt(file.size)} (8 MiB max)`; st.classList.add("bad");
+      continue;
+    }
+    st.textContent = "uploading…";
+    try {
+      await uploadOne(vol, file, (p) => { fill.style.width = Math.round(p * 100) + "%"; });
+      fill.style.width = "100%"; st.textContent = "done"; st.classList.add("ok");
+      dirty[vol] = true; any = true;
+    } catch (e) {
+      bar.classList.add("bad"); st.textContent = "failed: " + (e.message || e); st.classList.add("bad");
+    }
+  }
+  if (any) refresh();   // re-render the grid with the new files + dirty tag
+}
+
+// ---- events ---------------------------------------------------------------
+const vbox = document.getElementById("vols");
+
+vbox.addEventListener("dragover", (e) => {
+  const z = e.target.closest(".dropzone"); if (!z) return;
+  e.preventDefault(); z.classList.add("drag");
+});
+vbox.addEventListener("dragleave", (e) => {
+  const z = e.target.closest(".dropzone"); if (z) z.classList.remove("drag");
+});
+vbox.addEventListener("drop", (e) => {
+  const z = e.target.closest(".dropzone"); if (!z) return;
+  e.preventDefault(); z.classList.remove("drag");
+  if (e.dataTransfer?.files?.length) handleFiles(z.dataset.vol, e.dataTransfer.files, z);
+});
+vbox.addEventListener("change", (e) => {
+  const inp = e.target.closest('input[type=file]'); if (!inp) return;
+  const z = inp.closest(".dropzone");
+  if (inp.files.length) handleFiles(inp.dataset.vol, inp.files, z);
+  inp.value = "";
+});
+
+vbox.addEventListener("submit", async (e) => {
+  const f = e.target.closest("form.unlock");
+  if (!f) return;
+  e.preventDefault();
+  const pw = f.querySelector("[name=password]")?.value;
+  if (!pw) return alert("enter the crypt password (or use the wallet button)");
+  const body = { name: f.dataset.vol, password: pw, ...s3CredsFrom(f) };
+  const salt = f.querySelector("[name=salt]")?.value;
+  if (salt) body.salt = salt;
+  const btn = f.querySelector("button[type=submit]");
+  if (btn) btn.disabled = true;
+  try { await api("unlock", body); } catch (err) { alert(`unlock failed: ${err.message || err}`); }
+  refresh();
+});
+
+vbox.addEventListener("click", async (e) => {
+  // delete: 3s double-click arm (first click arms, second within 3s deletes)
+  const del = e.target.closest("button.del");
+  if (del) {
+    if (del.dataset.armed) {
+      del.disabled = true;
+      try {
+        await api("delete", { vol: del.dataset.vol, path: del.dataset.path });
+        dirty[del.dataset.vol] = true;
+        refresh();
+      } catch (err) { alert(`delete failed: ${err.message || err}`); del.disabled = false; }
+    } else {
+      del.dataset.armed = "1"; del.classList.add("armed"); del.textContent = "delete?";
+      setTimeout(() => {
+        if (del.isConnected) { delete del.dataset.armed; del.classList.remove("armed"); del.innerHTML = "&times;"; }
+      }, 3000);
+    }
+    return;
+  }
+
+  // wallet unlock (verbatim flow): form typing wins; else open the sealed
+  // envelope under the same signature.
+  const w = e.target.closest("button[data-wallet]");
+  if (w) {
+    const f = w.closest("form.unlock");
+    w.disabled = true;
+    try {
+      const d = await walletDerive(f.dataset.keyid);
+      let creds = s3CredsFrom(f);
+      const v = lastVols.find((x) => x.name === f.dataset.vol);
+      if (v?.credsEnvelope && !creds.accessKeyId) {
+        creds = { ...(await openCredsEnvelope(d.sig, v.credsEnvelope)), ...creds };
+      }
+      await api("unlock", { name: f.dataset.vol, password: d.password, salt: d.salt, ...creds });
+    } catch (err) {
+      alert(`wallet unlock failed: ${err.message || err}`);
+    }
+    return refresh();
+  }
+
+  // derive push credentials + seal panel (verbatim flow)
+  const r = e.target.closest("a[data-reveal]");
+  if (r) {
+    e.preventDefault();
+    const name = r.dataset.reveal;
+    const v = lastVols.find((x) => x.name === name);
+    const panel = document.getElementById(`reveal-${name}`);
+    try {
+      const d = await walletDerive(v.keyId || v.name);
+      sealSigs[name] = d.sig;
+      const pushCmd = `ENCVOL_WALLET_SIG=${d.sig} scripts/enclave-encvol.sh push ./your-dir \\\n  --endpoint ${v.endpoint} --bucket ${v.bucket}${v.path ? ` --path ${v.path}` : ""} --name ${v.name}`;
+      panel.style.display = "";
+      panel.innerHTML =
+        `<span class="k">These credentials decrypt this volume — treat them like the data itself. Derived locally for ${esc(d.account)}; nothing was sent anywhere.</span>` +
+        `<div style="margin-top:8px"><span class="k">signature (feeds enclave-encvol.sh --sig / ENCVOL_WALLET_SIG)</span><code>${esc(d.sig)}</code>` +
+        `<span class="k">derived password (ENCVOL_PASSWORD)</span><code>${esc(d.password)}</code>` +
+        `<span class="k">derived salt (ENCVOL_SALT)</span><code>${esc(d.salt)}</code>` +
+        `<span class="k">push data with</span><code>${esc(pushCmd)}</code></div>` +
+        `<div style="margin-top:8px"><span class="k">seal S3 credentials into the App Config — future wallet unlocks then need no typing.
+          The sealed value is safe to publish: it only opens under this wallet's signature.</span>
+          <div class="row">
+            <input data-seal-ak="${esc(name)}" placeholder="access key id" autocomplete="off" style="max-width:200px">
+            <input data-seal-sk="${esc(name)}" type="password" placeholder="secret access key" autocomplete="off" style="max-width:220px">
+            <button type="button" class="ghost" data-seal="${esc(name)}">Seal</button>
+          </div>
+          <div data-seal-out="${esc(name)}"></div></div>`;
+    } catch (err) {
+      alert(`derive failed: ${err.message || err}`);
+    }
+    return;
+  }
+  const s = e.target.closest("button[data-seal]");
+  if (s) {
+    const name = s.dataset.seal, panel = document.getElementById(`reveal-${name}`);
+    const ak = panel.querySelector(`[data-seal-ak]`)?.value.trim();
+    const sk = panel.querySelector(`[data-seal-sk]`)?.value.trim();
+    if (!ak || !sk) return alert("enter the access key id and secret access key to seal");
+    try {
+      const envlp = await sealCredsEnvelope(sealSigs[name], { accessKeyId: ak, secretAccessKey: sk });
+      panel.querySelector(`[data-seal-out="${name}"]`).innerHTML =
+        `<span class="k">add to this volume's encVolumes entry (next publish):</span><code>"credsEnvelope": "${esc(envlp)}"</code>`;
+    } catch (err) {
+      alert(`seal failed: ${err.message || err}`);
+    }
+    return;
+  }
+
+  // sync / lock (verbatim wiring; sync also clears the dirty tag)
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  if (b.dataset.act === "lock" && !confirm(`Lock ${b.dataset.vol}? The decrypted files are wiped from the enclave (the ciphertext in your bucket is untouched).`)) return;
+  if (b.dataset.act === "sync" && !confirm(`Sync ${b.dataset.vol}? The current locker contents are re-encrypted and pushed to your bucket, replacing the remote copy.`)) return;
+  b.disabled = true;
+  try {
+    await api(b.dataset.act, { name: b.dataset.vol });
+    if (b.dataset.act === "sync") dirty[b.dataset.vol] = false;
+  } catch (err) { alert(`${b.dataset.act} failed: ${err.message || err}`); }
+  refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>
