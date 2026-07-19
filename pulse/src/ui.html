@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pulse — heartbeats in, status out</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #f2d54f; --accent-hi: #f7e58a;
+    --amber: #e8a34c; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  input.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--accent); color: #14120a; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.small { padding: 5px 12px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* status page: reconnect dot, monitor cards, regularity strip */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.on { animation: pulse 2s ease-in-out infinite; }
+  .dot.off { background: var(--faint); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .empty { color: var(--dim); font-size: 13px; margin-top: 14px; }
+  .mon {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 14px 16px; margin-top: 12px;
+  }
+  .monhead { display: flex; gap: 10px; align-items: center; }
+  .sdot {
+    flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--faint);
+  }
+  .sdot.up { background: var(--green); animation: pulse 2.4s ease-in-out infinite; }
+  .sdot.late { background: var(--amber); }
+  .sdot.down { background: var(--red); }
+  .sdot.waiting { background: var(--faint); }
+  .sdot.flash { animation: flashring .6s ease-out; }
+  @keyframes flashring {
+    0% { box-shadow: 0 0 0 0 rgba(242, 213, 79, .8); }
+    100% { box-shadow: 0 0 0 10px rgba(242, 213, 79, 0); }
+  }
+  .mname { color: var(--ink); font-weight: 600; word-break: break-word; }
+  .sword { margin-left: auto; flex: none; font-size: 11.5px; letter-spacing: .08em; color: var(--faint); }
+  .sword.up { color: var(--green); }
+  .sword.late { color: var(--amber); }
+  .sword.down { color: var(--red); }
+  .sword.waiting { color: var(--faint); }
+  .monmeta { color: var(--dim); font-size: 12.5px; margin-top: 6px; }
+  .strip { display: flex; gap: 3px; margin-top: 10px; }
+  .seg { flex: 1; max-width: 26px; height: 6px; border-radius: 2px; background: var(--edge2); }
+  .seg.g { background: var(--green); }
+  .seg.a { background: var(--amber); }
+  .seg.r { background: var(--red); }
+  .ownrow { display: flex; gap: 8px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ pulse ]</div>
+    <div class="tag">heartbeats in, status out · history nobody can edit</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>NEW STATUS PAGE</h2>
+    <p class="sub">monitoring, inverted: nothing here probes your machines.
+    your cron jobs, backups and services curl a private heartbeat URL into
+    the enclave on their own schedule — the page turns red when the beats stop.</p>
+    <div class="row" style="margin-top:16px">
+      <button id="createbtn">new status page →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>each monitor gets a beat URL only you hold — end a cron line with one <b>curl</b> and it's monitored</li>
+      <li>status derives from arrival times alone: waiting → up → late → down; grace covers slow runs</li>
+      <li>the beat log lives in attested code and enclave RAM — nobody, including whoever hosts this page, can backfill a missed beat or edit history</li>
+      <li>fits the enclave exactly: beats come in, nothing dials out; a page dies after 30 idle days</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>PAGE IS UP</h2>
+    <p class="sub">the public status page — share it freely, it never shows beat URLs:</p>
+    <div class="linkbox"><input id="publink" readonly><button id="copypub">copy</button></div>
+    <p class="sub" style="margin-top:14px">your owner link — the part after <b>#</b> is the only way
+    to add monitors and read beat URLs back. keep it private:</p>
+    <div class="linkbox"><input id="ownlink" readonly><button id="copyown">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="openbtn">open as owner →</button>
+      <button class="ghost" onclick="location.href='/'">make another</button>
+    </div>
+  </section>
+
+  <!-- STATUS -->
+  <section id="status" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="livelabel">connecting…</span></div>
+    <h2 id="pagetag">#……</h2>
+    <div class="note red hidden" id="ownnote">owner link invalid — showing the public view.</div>
+    <p class="sub hidden" id="ownhint">owner view — beat URLs are readable below. keep this link private.</p>
+    <div id="mons"></div>
+    <div class="empty hidden" id="empty"></div>
+    <div class="err" id="serr"></div>
+  </section>
+
+  <!-- ADD (owner only) -->
+  <section id="addcard" class="card hidden">
+    <h2>ADD A MONITOR</h2>
+    <div class="row">
+      <input id="mname" class="text" maxlength="60" placeholder="what beats here — e.g. nightly db backup" autocomplete="off">
+    </div>
+    <div class="row">
+      <label>expect a beat every
+        <select id="period">
+          <option value="60">1m</option>
+          <option value="300" selected>5m</option>
+          <option value="900">15m</option>
+          <option value="3600">1h</option>
+          <option value="21600">6h</option>
+          <option value="86400">24h</option>
+        </select>
+      </label>
+      <label>grace
+        <select id="grace">
+          <option value="0" selected>none</option>
+          <option value="60">1m</option>
+          <option value="300">5m</option>
+          <option value="3600">1h</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="add">add →</button>
+    </div>
+    <div class="err" id="aerr"></div>
+    <div id="newbeat" class="hidden">
+      <p class="sub" style="margin-top:14px">the new monitor's beat URL — put this at the end of your cron job / backup script:</p>
+      <div class="linkbox"><input id="beaturl" readonly><button id="copybeat">copy</button></div>
+    </div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this status page never existed, or went 30 days with no beat,
+    no edit and no viewer, and was swept. the server can't tell you which —
+    pages leave nothing behind.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">make a status page</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  beat history in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> —
+  green means beats arrived; the enclave can't invent them and can't lose them quietly.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const sha256hex = async (str) => {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","status","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+  if (id !== "status") $("addcard").classList.add("hidden");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+// window.confirm is blocked in some contexts; arm on first click instead.
+const armBtn = (btn, fn) => {
+  let armed = 0;
+  btn.dataset.orig = btn.textContent;
+  btn.addEventListener("click", () => {
+    if (Date.now() - armed < 3000) {
+      armed = 0;
+      btn.textContent = btn.dataset.orig;
+      fn();
+    } else {
+      armed = Date.now();
+      btn.textContent = "sure? click again";
+      setTimeout(() => {
+        if (armed && Date.now() - armed >= 3000) { armed = 0; btn.textContent = btn.dataset.orig; }
+      }, 3200);
+    }
+  });
+};
+
+const fmtAgo = (s) => s < 60 ? s + "s"
+  : s < 3600 ? Math.floor(s / 60) + "m " + (s % 60) + "s"
+  : s < 86400 ? Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m"
+  : Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+const fmtPeriod = (s) => s === 86400 ? "24h"
+  : s % 86400 === 0 ? (s / 86400) + "d"
+  : s % 3600 === 0 ? (s / 3600) + "h"
+  : s % 60 === 0 ? (s / 60) + "m" : s + "s";
+const curlFor = (tok) => "curl -fsS " + location.origin + "/hb/" + tok;
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newPageId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("createbtn").addEventListener("click", async () => {
+  $("cerr").textContent = "";
+  $("createbtn").disabled = true;
+  try {
+    const id = newPageId();
+    const ownerToken = b64u(rand(16));
+    const res = await api("/api/pages", {
+      method: "POST",
+      headers: { "x-page-id": id, "x-owner-hash": await sha256hex(ownerToken) },
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const pub = location.origin + "/s/" + id;
+    const own = pub + "#o=" + ownerToken;
+    $("publink").value = pub;
+    $("ownlink").value = own;
+    $("createdmeta").innerHTML = "page <b>#" + id + "</b> · up to 20 monitors · dies after 30 idle days";
+    $("openbtn").onclick = () => { location.href = own; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("createbtn").disabled = false;
+  }
+});
+copyBtn($("copypub"), () => $("publink").value);
+copyBtn($("copyown"), () => $("ownlink").value);
+
+// ---- status page ------------------------------------------------------------
+let pid = null, ownerToken = null, isOwner = false, es = null, everOpen = false;
+let mons = []; // server objects + beatAt (local ms epoch of the last beat, or null)
+let els = []; // per-monitor DOM refs, same order as mons
+
+async function initStatus(id) {
+  pid = id;
+  const m = /(?:^|[#&])o=([^&]+)/.exec(location.hash.slice(1));
+  ownerToken = m ? decodeURIComponent(m[1]) : null;
+  show("status");
+  $("pagetag").textContent = "#" + pid;
+  if (!(await refetch())) return;
+  subscribe();
+  setInterval(tick, 1000);
+}
+
+async function refetch() {
+  let res = null;
+  if (ownerToken) {
+    res = await api("/api/page?id=" + pid + "&owner=" + encodeURIComponent(ownerToken));
+    if (res.status === 403) { // a mangled #o= shouldn't hide the public page
+      $("ownnote").classList.remove("hidden");
+      ownerToken = null;
+      res = null;
+    }
+  }
+  if (!res) res = await api("/api/page?id=" + pid);
+  if (!res.ok) { if (es) es.close(); show("gone"); return false; }
+  isOwner = !!ownerToken;
+  $("addcard").classList.toggle("hidden", !isOwner);
+  adopt(res.j.monitors);
+  renderAll();
+  return true;
+}
+
+// Fold a fresh monitor list into the model. Live events carry public JSON,
+// so beat tokens from an earlier owner fetch are kept across re-adoption.
+function adopt(list) {
+  const tok = new Map(mons.filter(m => m.beat_token).map(m => [m.name, m.beat_token]));
+  mons = list.map(m => ({
+    ...m,
+    beat_token: m.beat_token || tok.get(m.name) || null,
+    beatAt: m.last_beat_ago === null ? null : Date.now() - m.last_beat_ago * 1000,
+  }));
+}
+
+// Status is derived locally between server events — the same boundaries
+// the enclave uses, ticking every second.
+function statusOf(m) {
+  if (m.beatAt === null) return "waiting";
+  const ago = (Date.now() - m.beatAt) / 1000;
+  if (ago <= m.period) return "up";
+  if (ago <= m.period + m.grace) return "late";
+  return "down";
+}
+
+function metaText(m) {
+  const per = "every " + fmtPeriod(m.period) + (m.grace ? " +" + fmtPeriod(m.grace) + " grace" : "");
+  if (m.beatAt === null) return "waiting for the first beat · " + per;
+  const ago = Math.max(0, Math.floor((Date.now() - m.beatAt) / 1000));
+  return "last beat " + fmtAgo(ago) + " ago · " + per + " · " +
+    m.total_beats + " beat" + (m.total_beats === 1 ? "" : "s");
+}
+
+// The regularity strip: the last 12 inter-beat gaps, newest on the right —
+// a beat that arrived on time is green, inside the grace amber, late red.
+function buildStrip(m) {
+  const strip = document.createElement("div");
+  strip.className = "strip";
+  const gaps = m.recent_gaps.slice(-12);
+  strip.title = gaps.length
+    ? "the last " + gaps.length + " beat interval" + (gaps.length === 1 ? "" : "s") + ", newest right"
+    : "no intervals yet — the strip fills as beats arrive";
+  for (let i = 0; i < 12; i++) {
+    const seg = document.createElement("span");
+    seg.className = "seg";
+    const gi = i - (12 - gaps.length);
+    if (gi >= 0) {
+      const g = gaps[gi];
+      seg.classList.add(g <= m.period ? "g" : g <= m.period + m.grace ? "a" : "r");
+      seg.title = "gap " + fmtAgo(g);
+    }
+    strip.append(seg);
+  }
+  return strip;
+}
+
+function buildCard(m) {
+  const card = document.createElement("div");
+  card.className = "mon";
+  const head = document.createElement("div");
+  head.className = "monhead";
+  const dot = document.createElement("span");
+  dot.className = "sdot waiting";
+  const name = document.createElement("span");
+  name.className = "mname";
+  name.textContent = m.name;
+  const sword = document.createElement("span");
+  sword.className = "sword";
+  head.append(dot, name, sword);
+  const meta = document.createElement("div");
+  meta.className = "monmeta";
+  const strip = buildStrip(m);
+  card.append(head, meta, strip);
+  const e = { card, dot, sword, meta, strip };
+  if (isOwner && m.beat_token) {
+    const row = document.createElement("div");
+    row.className = "ownrow";
+    const rev = document.createElement("button");
+    rev.className = "ghost small";
+    rev.textContent = "beat url";
+    const sp = document.createElement("span");
+    sp.className = "spacer";
+    const rm = document.createElement("button");
+    rm.className = "ghost small";
+    rm.textContent = "remove";
+    row.append(rev, sp, rm);
+    const box = document.createElement("div");
+    box.className = "linkbox hidden";
+    const inp = document.createElement("input");
+    inp.readOnly = true;
+    inp.value = curlFor(m.beat_token);
+    const cp = document.createElement("button");
+    cp.textContent = "copy";
+    box.append(inp, cp);
+    copyBtn(cp, () => inp.value);
+    rev.addEventListener("click", () => box.classList.toggle("hidden"));
+    armBtn(rm, async () => {
+      $("serr").textContent = "";
+      const res = await api("/api/monitors/remove", {
+        method: "POST",
+        body: "id=" + pid + "&owner=" + encodeURIComponent(ownerToken) + "&beat=" + m.beat_token,
+      });
+      if (res.ok) refetch();
+      else $("serr").textContent = (res.j && res.j.error) || ("remove failed (" + res.status + ")");
+    });
+    card.append(row, box);
+  }
+  return e;
+}
+
+function renderAll() {
+  const wrap = $("mons");
+  wrap.textContent = "";
+  els = [];
+  $("ownhint").classList.toggle("hidden", !isOwner);
+  $("empty").classList.toggle("hidden", mons.length > 0);
+  if (!mons.length) {
+    $("empty").textContent = "no monitors yet." + (isOwner
+      ? " add one below — each gets a private beat URL for your job to curl."
+      : " the owner hasn't added any.");
+  }
+  for (const m of mons) {
+    const e = buildCard(m);
+    els.push(e);
+    wrap.append(e.card);
+  }
+  tick();
+}
+
+function tickOne(i) {
+  const m = mons[i], e = els[i];
+  if (!e) return;
+  const st = statusOf(m);
+  const flashing = e.dot.classList.contains("flash");
+  e.dot.className = "sdot " + st + (flashing ? " flash" : "");
+  e.sword.textContent = st;
+  e.sword.className = "sword " + st;
+  e.meta.textContent = metaText(m);
+}
+function tick() { for (let i = 0; i < mons.length; i++) tickOne(i); }
+
+function flash(i) {
+  const e = els[i];
+  if (!e) return;
+  e.dot.classList.remove("flash");
+  void e.dot.offsetWidth; // restart the animation
+  e.dot.classList.add("flash");
+  setTimeout(() => e.dot.classList.remove("flash"), 700);
+}
+
+// ---- add / remove (owner) -----------------------------------------------------
+$("add").addEventListener("click", async () => {
+  const name = $("mname").value.trim();
+  $("aerr").textContent = "";
+  if (!name) { $("aerr").textContent = "name the job this beat comes from."; return; }
+  $("add").disabled = true;
+  try {
+    const beat = b64u(rand(16)); // the capability is generated HERE, never by the server
+    const res = await api("/api/monitors", {
+      method: "POST",
+      body: "id=" + pid + "&owner=" + encodeURIComponent(ownerToken) +
+        "&name=" + encodeURIComponent(name) + "&period=" + $("period").value +
+        "&grace=" + $("grace").value + "&beat=" + beat,
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    $("mname").value = "";
+    $("beaturl").value = curlFor(beat);
+    $("newbeat").classList.remove("hidden");
+    await refetch();
+  } catch (e) {
+    $("aerr").textContent = "" + (e.message || e);
+  } finally {
+    $("add").disabled = false;
+  }
+});
+$("mname").addEventListener("keydown", (e) => { if (e.key === "Enter") $("add").click(); });
+copyBtn($("copybeat"), () => $("beaturl").value);
+
+// ---- SSE ----------------------------------------------------------------------
+function subscribe() {
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(pid));
+  es.onopen = () => { setLive(true); if (everOpen) refetch(); everOpen = true; };
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial frame: the full public page
+    setLive(true);
+    try {
+      const j = JSON.parse(ev.data);
+      if (j.monitors) { adopt(j.monitors); renderAll(); }
+    } catch {}
+  };
+  es.addEventListener("beat", (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch { return; }
+    const i = mons.findIndex(m => m.name === d.name);
+    if (i < 0) { refetch(); return; } // a monitor this view hasn't met — resync
+    mons[i] = {
+      ...d,
+      beat_token: mons[i].beat_token || null,
+      beatAt: d.last_beat_ago === null ? null : Date.now() - d.last_beat_ago * 1000,
+    };
+    const ns = buildStrip(mons[i]);
+    els[i].strip.replaceWith(ns);
+    els[i].strip = ns;
+    tickOne(i);
+    flash(i);
+  });
+  es.addEventListener("page", (ev) => { // something slid to late/down — or back
+    let d;
+    try { d = JSON.parse(ev.data); } catch { return; }
+    if (d.monitors) { adopt(d.monitors); renderAll(); }
+  });
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("dot").classList.toggle("on", on);
+  $("livelabel").textContent = on ? "live" : "reconnecting…";
+}
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/s/")) {
+    const m = /^\/s\/([a-z0-9]{10,16})$/.exec(location.pathname);
+    if (m) initStatus(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "watching " + r.j.pages + " page" + (r.j.pages === 1 ? "" : "s") +
+      " · " + r.j.monitors + " monitor" + (r.j.monitors === 1 ? "" : "s") +
+      " · " + r.j.beats_total + " heartbeat" + (r.j.beats_total === 1 ? "" : "s") + " counted";
+  } catch {}
+}
+</script>
+</body>
+</html>

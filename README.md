@@ -28,6 +28,7 @@ app's README (and `wasm/apps/README.md` in the
 | [backchannel](backchannel/) | E2E-encrypted ephemeral chat rooms — the enclave relays ciphertext blind. |
 | [warpad](warpad/) | E2E-encrypted shared scratchpad — every save replaces the only ciphertext; no history, anywhere. |
 | [failsafe](failsafe/) | Time capsules and dead man's switches — ciphertext the enclave refuses to serve until the clock, or the silence, says so. |
+| [pulse](pulse/) | Push-based uptime: cron jobs curl heartbeats into the enclave; status history nobody can edit. |
 
 ## Building
 

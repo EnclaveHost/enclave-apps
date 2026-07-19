@@ -1,0 +1,15 @@
+[package]
+name = "pulse"
+version = "0.1.0"
+edition = "2021"
+description = "Push-based uptime monitoring — cron jobs and backups curl heartbeats into an attested enclave; the status page turns red when the beats stop"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
