@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pixel board — one shared canvas in enclave RAM</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #6fcf8f; --accent-hi: #93e3ae; --red: #e05e5e;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-shrink: 0;
+    padding: 9px 16px; background: var(--panel); border-bottom: 1px solid var(--edge);
+    z-index: 5;
+  }
+  .mark { font-size: 17px; letter-spacing: .14em; color: var(--accent); white-space: nowrap; }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag {
+    color: var(--dim); font-size: 12px; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .live { margin-left: auto; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+  #stats { color: var(--dim); font-size: 12.5px; }
+  #stats b { color: var(--ink); font-weight: 600; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex-shrink: 0; }
+  #dot.on { background: var(--accent); animation: pulse 2s ease-out infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(111,207,143,.45); }
+    70%, 100% { box-shadow: 0 0 0 6px rgba(111,207,143,0); }
+  }
+  #helpbtn {
+    width: 24px; height: 24px; border-radius: 50%; padding: 0; flex-shrink: 0;
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2);
+    font: 600 12px var(--mono); cursor: pointer;
+  }
+  #helpbtn:hover { color: var(--ink); border-color: var(--accent); }
+
+  #stage { position: relative; flex: 1; min-height: 0; }
+  #cv {
+    position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+    cursor: crosshair; touch-action: none; image-rendering: pixelated;
+  }
+  #cv.panning { cursor: grabbing; }
+
+  /* floating palette bar */
+  #bar {
+    position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 7px;
+    max-width: min(92vw, 620px); padding: 10px 12px;
+    background: rgba(16,20,29,.72); border: 1px solid var(--edge2); border-radius: 12px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 4;
+  }
+  .sw {
+    width: 28px; height: 28px; border-radius: 7px; padding: 0; position: relative;
+    background: var(--c); border: 1px solid rgba(255,255,255,.08);
+    cursor: pointer; transition: transform .12s;
+  }
+  .sw:hover { transform: scale(1.12); }
+  .sw.sel { transform: scale(1.15); box-shadow: 0 0 0 2px var(--accent); }
+  /* cooldown ring — one element, parked inside the selected swatch */
+  #ring {
+    position: absolute; left: 50%; top: 50%; width: 44px; height: 44px;
+    transform: translate(-50%,-50%); border-radius: 50%; pointer-events: none;
+    background: conic-gradient(var(--accent) calc(var(--p, 0) * 1turn), transparent 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 4px), #000 calc(100% - 3px));
+  }
+  #ring.flash { animation: ringflash .3s; }
+  @keyframes ringflash {
+    50% { filter: brightness(1.9) drop-shadow(0 0 6px var(--accent)); }
+  }
+
+  /* help card */
+  #help {
+    position: absolute; right: 14px; top: 12px; max-width: 360px; z-index: 6;
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 16px 18px;
+  }
+  #help h2 { font-size: 14px; margin: 0 0 10px; color: var(--ink); letter-spacing: .06em; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 0; }
+  ul.how li { margin-top: 4px; }
+  .note {
+    border-left: 3px solid var(--accent); padding: 2px 0 2px 12px;
+    color: var(--dim); font-size: 12.5px; margin-top: 14px;
+  }
+  footer {
+    flex-shrink: 0; color: var(--faint); font-size: 11.5px; text-align: center;
+    padding: 7px 16px; background: var(--panel); border-top: 1px solid var(--edge);
+  }
+  footer a { color: var(--dim); }
+  .hidden { display: none !important; }
+  @media (max-width: 760px) {
+    .tag, footer { display: none; }
+    #stats { font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="mark">[ pixel <b>board</b> ]</span>
+  <span class="tag">one shared canvas in enclave RAM · it lives while the deployment is funded</span>
+  <span class="live">
+    <span id="stats">connecting…</span>
+    <span id="dot"></span>
+    <button id="helpbtn" title="how this works">?</button>
+  </span>
+</header>
+
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="help" class="hidden">
+    <h2>HOW TO PAINT</h2>
+    <ul class="how">
+      <li>scroll (or pinch) to zoom · drag to pan · click a cell to place</li>
+      <li>pick a color below — one pixel every 2 seconds; the ring on your swatch is the cooldown</li>
+      <li>everyone shares this one 128×128 board, live over SSE</li>
+    </ul>
+    <div class="note">
+      the board is enclave RAM inside a hardware-attested TEE: the cooldown and
+      the canvas are code you can verify — no faster brushes, no rollbacks, no
+      operator thumb on the palette. when the deployment's funding ends, the
+      artwork provably ceases to exist. paint accordingly.
+    </div>
+  </div>
+  <div id="bar"></div>
+</div>
+
+<footer>
+  one canvas, in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — the rules are attested code; when the funding ends, the artwork ends with it.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+const W = 128, H = 128, CELLS = W * H;
+const ACCENT = "#6fcf8f";
+const NAMES = ["void","white","silver","grey","red","amber","yellow","green",
+               "teal","cyan","blue","violet","magenta","umber","slate","ink"];
+
+// session token: 22 chars of base64url, minted once, kept in localStorage.
+// the server never issues identity — this is all it ever sees of you.
+const session = (() => {
+  let s = localStorage.getItem("pb-session");
+  if (!s || !/^[A-Za-z0-9_-]{16,64}$/.test(s)) {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    s = btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    localStorage.setItem("pb-session", s);
+  }
+  return s;
+})();
+
+// ---- board state ------------------------------------------------------------
+// board[] mirrors the server (updated only by /api/board and SSE deltas);
+// optimistic paints touch the offscreen canvas alone, so a rejected pixel
+// is restored by simply repainting from board[].
+let palette = [], rgb = [];
+const board = new Uint8Array(CELLS);
+let ver = 0;
+
+const off = document.createElement("canvas");
+off.width = W; off.height = H;
+const octx = off.getContext("2d");
+
+function paintCell(i, c) {
+  octx.fillStyle = palette[c] || "#000";
+  octx.fillRect(i % W, (i / W) | 0, 1, 1);
+  dirty = true;
+}
+function setCell(i, c) { board[i] = c; paintCell(i, c); }
+function repaintAll() {
+  const img = octx.createImageData(W, H);
+  for (let i = 0; i < CELLS; i++) {
+    const [r, g, b] = rgb[board[i]] || [0, 0, 0];
+    img.data[i * 4] = r; img.data[i * 4 + 1] = g;
+    img.data[i * 4 + 2] = b; img.data[i * 4 + 3] = 255;
+  }
+  octx.putImageData(img, 0, 0);
+  dirty = true;
+}
+
+let fetching = false;
+async function fetchBoard() {
+  if (fetching) return;
+  fetching = true;
+  try {
+    const r = await fetch("/api/board");
+    const j = await r.json();
+    palette = j.palette;
+    rgb = palette.map((h) => [1, 3, 5].map((k) => parseInt(h.slice(k, k + 2), 16)));
+    buildBar();
+    const bin = atob(j.board);
+    for (let i = 0; i < CELLS; i++) board[i] = bin.charCodeAt(i);
+    ver = j.version;
+    repaintAll();
+    setStats(j.painting, j.placed);
+  } catch {} finally { fetching = false; }
+}
+
+// ---- viewport: zoom around the cursor, pan, pinch ----------------------------
+const stage = $("stage"), cv = $("cv"), ctx = cv.getContext("2d");
+let scale = 8, ox = 0, oy = 0, minScale = 2, dpr = 1, vw = 0, vh = 0;
+let hover = -1, dirty = true;
+
+function sizeCanvas() {
+  dpr = window.devicePixelRatio || 1;
+  vw = stage.clientWidth; vh = stage.clientHeight;
+  cv.width = Math.round(vw * dpr);
+  cv.height = Math.round(vh * dpr);
+  dirty = true;
+}
+function fitView() {
+  scale = Math.min(vw, vh) * 0.8 / W;
+  minScale = Math.min(2, scale);
+  ox = (vw - W * scale) / 2;
+  oy = (vh - H * scale) / 2;
+  dirty = true;
+}
+function zoomAt(mx, my, f) {
+  const ns = Math.min(40, Math.max(minScale, scale * f));
+  ox = mx - (mx - ox) * (ns / scale);
+  oy = my - (my - oy) * (ns / scale);
+  scale = ns;
+  dirty = true;
+}
+function cellAt(px, py) {
+  const x = Math.floor((px - ox) / scale), y = Math.floor((py - oy) / scale);
+  return x >= 0 && x < W && y >= 0 && y < H ? y * W + x : -1;
+}
+function updateHover(px, py) {
+  const h = cellAt(px, py);
+  if (h !== hover) { hover = h; dirty = true; }
+}
+
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#0d1119";
+  ctx.fillRect(0, 0, vw, vh);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, ox, oy, W * scale, H * scale);
+  ctx.strokeStyle = "#2a3242";
+  ctx.strokeRect(ox - .5, oy - .5, W * scale + 1, H * scale + 1);
+  if (hover >= 0 && scale >= 6) {
+    const x = ox + (hover % W) * scale, y = oy + ((hover / W) | 0) * scale;
+    ctx.globalAlpha = .6;
+    ctx.fillStyle = palette[sel] || "#fff";
+    ctx.fillRect(x, y, scale, scale);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + .5, y + .5, scale - 1, scale - 1);
+  }
+}
+
+// pointers: one = maybe-a-click (>4px of travel makes it a pan), two = pinch
+const ptrs = new Map();
+let gesture = null;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+cv.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  cv.setPointerCapture(e.pointerId);
+  ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
+  if (ptrs.size === 1) {
+    gesture = { mode: "maybe", btn: e.button, lx: e.offsetX, ly: e.offsetY, moved: 0 };
+  } else if (ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()];
+    gesture = { mode: "pinch", d: dist(a, b), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+    hover = -1; dirty = true;
+  }
+});
+cv.addEventListener("pointermove", (e) => {
+  const p = ptrs.get(e.pointerId);
+  if (!p) { updateHover(e.offsetX, e.offsetY); return; }
+  p.x = e.offsetX; p.y = e.offsetY;
+  if (!gesture) return;
+  if (gesture.mode === "pinch" && ptrs.size === 2) {
+    const [a, b] = [...ptrs.values()];
+    const d = dist(a, b), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    if (gesture.d > 0 && d > 0) zoomAt(mx, my, d / gesture.d);
+    ox += mx - gesture.mx; oy += my - gesture.my;
+    gesture.d = d; gesture.mx = mx; gesture.my = my;
+    dirty = true;
+  } else if (gesture.mode !== "pinch") {
+    gesture.moved += Math.hypot(e.offsetX - gesture.lx, e.offsetY - gesture.ly);
+    if (gesture.moved > 4 && gesture.mode === "maybe") {
+      gesture.mode = "pan";
+      cv.classList.add("panning");
+    }
+    if (gesture.mode === "pan") {
+      ox += e.offsetX - gesture.lx; oy += e.offsetY - gesture.ly;
+      dirty = true;
+    }
+    gesture.lx = e.offsetX; gesture.ly = e.offsetY;
+  }
+  if (e.pointerType === "mouse") updateHover(e.offsetX, e.offsetY);
+});
+cv.addEventListener("pointerup", (e) => {
+  const tap = ptrs.size === 1 && gesture && gesture.mode === "maybe" && gesture.btn === 0;
+  ptrs.delete(e.pointerId);
+  cv.classList.remove("panning");
+  if (tap) {
+    const i = cellAt(e.offsetX, e.offsetY);
+    if (i >= 0) place(i);
+  }
+  if (ptrs.size === 1) {
+    const [a] = [...ptrs.values()];
+    gesture = { mode: "pan", lx: a.x, ly: a.y, moved: 99 };
+  } else if (ptrs.size === 0) gesture = null;
+});
+cv.addEventListener("pointercancel", (e) => {
+  ptrs.delete(e.pointerId);
+  cv.classList.remove("panning");
+  if (!ptrs.size) gesture = null;
+});
+cv.addEventListener("pointerleave", () => { if (hover !== -1) { hover = -1; dirty = true; } });
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0015)));
+  updateHover(e.offsetX, e.offsetY);
+}, { passive: false });
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ---- placing ------------------------------------------------------------------
+let sel = parseInt(localStorage.getItem("pb-color") ?? "7", 10);
+if (!(sel >= 0 && sel <= 15)) sel = 7;
+let coolUntil = 0, coolTotal = 2000;
+const inflight = new Set();
+const ring = document.createElement("span");
+ring.id = "ring";
+
+function flashRing() {
+  ring.classList.remove("flash");
+  void ring.offsetWidth;
+  ring.classList.add("flash");
+}
+
+async function place(i) {
+  if (!palette.length) return;
+  if (performance.now() < coolUntil) { flashRing(); return; }
+  coolUntil = performance.now() + 2000;
+  coolTotal = 2000;
+  paintCell(i, sel); // optimistic — board[] stays authoritative
+  inflight.add(i);
+  try {
+    const r = await fetch("/api/px", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "i=" + i + "&c=" + sel + "&s=" + session,
+    });
+    const j = await r.json().catch(() => null);
+    if (r.status === 429 && j) {
+      // the server didn't take it — restore truth, honor its clock
+      coolUntil = performance.now() + j.wait_ms;
+      paintCell(i, board[i]);
+      flashRing();
+    } else if (!r.ok) {
+      coolUntil = 0;
+      paintCell(i, board[i]);
+    }
+  } catch {
+    coolUntil = 0;
+    paintCell(i, board[i]);
+  } finally {
+    inflight.delete(i);
+  }
+}
+
+// ---- palette bar ---------------------------------------------------------------
+const bar = $("bar");
+function buildBar() {
+  if (bar.childElementCount) return;
+  palette.forEach((c, idx) => {
+    const b = document.createElement("button");
+    b.className = "sw";
+    b.style.setProperty("--c", c);
+    b.title = NAMES[idx] + " · " + c;
+    b.addEventListener("click", () => select(idx));
+    bar.appendChild(b);
+  });
+  select(sel);
+}
+function select(idx) {
+  sel = idx;
+  localStorage.setItem("pb-color", idx);
+  [...bar.children].forEach((b, i) => b.classList.toggle("sel", i === idx));
+  bar.children[idx].appendChild(ring);
+  dirty = true;
+}
+
+// ---- live stream ----------------------------------------------------------------
+function setStats(painting, placed) {
+  $("stats").innerHTML = "<b>" + painting + "</b> painting now · <b>" + placed + "</b> pixels placed";
+}
+function connect() {
+  const es = new EventSource("/api/stream");
+  // a fresh board on every (re)connect — deltas only fill the gaps between
+  es.onopen = () => { $("dot").classList.add("on"); fetchBoard(); };
+  es.onerror = () => { $("dot").classList.remove("on"); };
+  es.addEventListener("px", (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    for (const [i, c] of m.d) setCell(i, c);
+    ver += m.d.length;
+    if (ver !== m.v) { ver = m.v; fetchBoard(); } // missed something — resync
+  });
+  es.addEventListener("n", (e) => {
+    try { const m = JSON.parse(e.data); setStats(m.painting, m.placed); } catch {}
+  });
+}
+
+// ---- help + boot ------------------------------------------------------------------
+$("helpbtn").addEventListener("click", () => $("help").classList.toggle("hidden"));
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("help").classList.add("hidden");
+});
+
+function tick() {
+  if (coolUntil) {
+    const left = coolUntil - performance.now();
+    if (left <= 0) { coolUntil = 0; ring.style.setProperty("--p", 0); }
+    else ring.style.setProperty("--p", (left / coolTotal).toFixed(3));
+  }
+  if (dirty) { dirty = false; render(); }
+  requestAnimationFrame(tick);
+}
+
+window.addEventListener("resize", sizeCanvas);
+sizeCanvas();
+fitView();
+connect();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

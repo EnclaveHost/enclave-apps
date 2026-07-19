@@ -1,0 +1,15 @@
+[package]
+name = "pixelboard"
+version = "0.1.0"
+edition = "2021"
+description = "Collaborative r/place-style pixel canvas — one shared 128×128 board in attested enclave RAM, a 2-second cooldown nobody can bend, artwork that provably dies with the deployment"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and base64 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
