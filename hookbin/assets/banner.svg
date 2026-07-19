@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#4cc9e8" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#4cc9e8" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- the hook, oversized -->
+  <g fill="none" stroke="#4cc9e8" stroke-width="34" stroke-linecap="round">
+    <path d="M1360 60 v150"/>
+    <path d="M1360 210 a92 92 0 1 1 -165 -55"/>
+  </g>
+  <circle cx="1360" cy="60" r="27" fill="#7adcf5"/>
+  <text x="1180" y="352" font-size="26" fill="#39566b">POST /b/a1x9…  204</text>
+  <text x="96" y="180" font-size="84" fill="#4cc9e8">[ hook <tspan fill="#d7dde8" font-weight="bold">bin</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">see exactly what your webhooks sent</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">live SSE capture feed · copy as curl · custom replies</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">payloads live in enclave RAM only, never persisted</text>
+</svg>
