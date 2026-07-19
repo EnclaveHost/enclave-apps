@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>ballot box — anonymous sealed polls</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #a78bfa; --accent-hi: #c4b1ff; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  input.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--accent); color: #120d1f; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.danger { background: var(--red); color: #fff; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .note.green { border-color: var(--green); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* create: option rows + mode cards */
+  #opts { margin-top: 14px; }
+  .optrow { display: flex; gap: 8px; margin-top: 10px; }
+  .optrow input { flex: 1; }
+  .optrow button { padding: 0 13px; }
+  .modes { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .mode {
+    flex: 1 1 230px; display: block; position: relative;
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer; color: var(--dim); font-size: 12.5px; line-height: 1.5;
+  }
+  .mode:hover { border-color: var(--faint); }
+  .mode input { position: absolute; opacity: 0; pointer-events: none; }
+  .mode b { display: block; color: var(--ink); letter-spacing: .05em; margin-bottom: 3px; }
+  .mode:has(input:checked) { border-color: var(--accent); }
+  .mode:has(input:checked) b { color: var(--accent-hi); }
+
+  /* poll: live badge, sealed banner, bar-chart option rows */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.off { background: var(--faint); }
+  .q { font-size: 17px; line-height: 1.5; color: var(--ink); margin: 0; word-break: break-word; }
+  .sealedbox {
+    margin-top: 16px; padding: 15px; text-align: center;
+    border: 1px dashed var(--edge2); border-radius: 8px; color: var(--dim); font-size: 13px;
+  }
+  .sealedbox b { color: var(--accent-hi); font-size: 16px; }
+  #optlist { margin-top: 16px; }
+  .opt {
+    position: relative; display: flex; align-items: center; gap: 10px;
+    width: 100%; margin-top: 8px; padding: 11px 14px; overflow: hidden;
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    color: var(--ink); font: 14px/1.4 var(--mono); text-align: left; letter-spacing: 0;
+  }
+  .opt:hover { background: #0d1119; border-color: var(--accent); }
+  .opt:disabled { background: #0d1119; color: var(--ink); cursor: default; }
+  .opt:disabled:hover { border-color: var(--edge2); }
+  .opt .bar {
+    position: absolute; top: 0; bottom: 0; left: 0; width: 0%;
+    background: var(--accent); opacity: .16;
+    transition: width .6s cubic-bezier(.22, 1, .36, 1);
+  }
+  .opt .lbl { position: relative; flex: 1; word-break: break-word; }
+  .opt .n { position: relative; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
+  .opt.mine { border-color: var(--accent); }
+  .opt.mine .lbl::after { content: " ✓"; color: var(--accent-hi); }
+  .opt.win { border-color: var(--accent); }
+  .opt.win .bar { opacity: .3; }
+  .opt.win .n { color: var(--accent-hi); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ ballot <b>box</b> ]</div>
+    <div class="tag">anonymous polls · sealed inside an attested enclave until you close them</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>ASK A QUESTION</h2>
+    <input id="question" class="text" maxlength="280" placeholder="the question…" autofocus>
+    <div id="opts"></div>
+    <div class="row"><button id="addopt" class="ghost">+ add option</button></div>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="mode" value="sealed" checked>
+        <b>sealed</b>results hidden from EVERYONE, including you, until you close the poll</label>
+      <label class="mode"><input type="radio" name="mode" value="live">
+        <b>live</b>tallies update in real time</label>
+    </div>
+    <div class="row">
+      <label>expires
+        <select id="ttl">
+          <option value="86400">in 1 day</option>
+          <option value="604800" selected>in 7 days</option>
+          <option value="2592000">in 30 days</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="createbtn">open the poll →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>your ballot is keyed by the SHA-256 of a random token this page generates — no name, no cookie, no address</li>
+      <li>in sealed mode the tally exists only in enclave RAM, and the code refuses to reveal it before close — to anyone, creator included</li>
+      <li>the enclave is hardware-attested: "nobody peeks" is a property of the running code, not a promise</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>POLL IS OPEN</h2>
+    <p class="sub">share this link with your voters:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <p class="sub" style="margin-top:16px">admin link — keep this private: it's the only way to close the poll and reveal results:</p>
+    <div class="linkbox"><input id="adminlink" readonly><button id="copyadmin">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="openpoll">open your poll →</button>
+      <button class="ghost" onclick="location.href='/'">ask another</button>
+    </div>
+  </section>
+
+  <!-- POLL -->
+  <section id="poll" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="livetext">connecting…</span></div>
+    <div class="q" id="q"></div>
+    <div class="kv" id="pollmeta"></div>
+    <div class="sealedbox hidden" id="sealedbox">🔒 <b id="scount">0</b> <span id="sword">votes</span> cast · tally sealed in the enclave</div>
+    <div id="optlist"></div>
+    <div class="note hidden" id="votenote"></div>
+    <div class="err" id="perr"></div>
+    <div id="admin" class="hidden">
+      <div class="note" id="adminnote" style="margin-top:20px"></div>
+      <div class="row" style="margin-top:12px"><button id="closebtn"></button></div>
+    </div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this poll never existed, expired unclosed, or was closed long enough
+    ago that the enclave swept it. whatever tally there was is gone with it.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">ask a new question</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  ballots in memory only, tallies sealed until close, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave before trusting a vote to it.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const sha256hex = async (str) => {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","poll","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// ---- create flow -----------------------------------------------------------
+function addOption(focus) {
+  const opts = $("opts");
+  if (opts.children.length >= 12) return;
+  const row = document.createElement("div");
+  row.className = "optrow";
+  const inp = document.createElement("input");
+  inp.className = "text"; inp.maxLength = 120;
+  const x = document.createElement("button");
+  x.className = "ghost"; x.type = "button"; x.textContent = "×"; x.title = "remove option";
+  x.addEventListener("click", () => { row.remove(); refreshOptRows(); });
+  row.append(inp, x);
+  opts.append(row);
+  refreshOptRows();
+  if (focus) inp.focus();
+}
+function refreshOptRows() {
+  const rows = [...$("opts").children];
+  rows.forEach((row, i) => {
+    row.querySelector("input").placeholder = "option " + (i + 1);
+    row.querySelector("button").classList.toggle("hidden", rows.length <= 2);
+  });
+  $("addopt").classList.toggle("hidden", rows.length >= 12);
+}
+addOption(); addOption();
+$("addopt").addEventListener("click", () => addOption(true));
+
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newPollId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("createbtn").addEventListener("click", async () => {
+  const q = $("question").value.trim();
+  const options = [...$("opts").querySelectorAll("input")].map(i => i.value.trim()).filter(Boolean);
+  $("cerr").textContent = "";
+  if (!q) { $("cerr").textContent = "ask something."; return; }
+  if (options.length < 2) { $("cerr").textContent = "a poll needs at least two options."; return; }
+  $("createbtn").disabled = true;
+  try {
+    const id = newPollId();
+    const admToken = b64u(rand(16));
+    const mode = document.querySelector("input[name=mode]:checked").value;
+    const ttl = $("ttl").value;
+    const res = await api("/api/polls", {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        "x-poll-id": id,
+        "x-admin-hash": await sha256hex(admToken),
+        "x-mode": mode,
+        "x-ttl": ttl,
+      },
+      body: [q, ...options].map(encodeURIComponent).join("\n"),
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const share = location.origin + "/p/" + id;
+    const admin = share + "#a=" + admToken;
+    $("sharelink").value = share;
+    $("adminlink").value = admin;
+    $("createdmeta").innerHTML = "<b>" + options.length + "</b> options · <b>" +
+      (mode === "sealed" ? "sealed until you close it" : "live tallies") +
+      "</b> · expires in <b>" + fmtDur(+ttl) + "</b>";
+    $("openpoll").onclick = () => { location.href = admin; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("createbtn").disabled = false;
+  }
+});
+copyBtn($("copyshare"), () => $("sharelink").value);
+copyBtn($("copyadmin"), () => $("adminlink").value);
+
+// ---- poll flow --------------------------------------------------------------
+let pid = null, admToken = null, state = null, myChoice = null, armTimer = null;
+
+function initPoll(id) {
+  pid = id;
+  const m = /(?:^|[#&])a=([^&]+)/.exec(location.hash.slice(1));
+  admToken = m ? decodeURIComponent(m[1]) : null;
+  const stored = localStorage.getItem("ballot-choice-" + pid);
+  myChoice = stored === null ? null : +stored;
+  show("poll");
+  refresh();
+  subscribe();
+}
+
+async function refresh() {
+  const res = await api("/api/poll?id=" + encodeURIComponent(pid));
+  if (!res.ok) { show("gone"); return; }
+  state = res.j;
+  render();
+}
+
+function render() {
+  const p = state;
+  $("q").textContent = p.question;
+  const n = p.total_votes, b = n === 1 ? " ballot" : " ballots";
+  $("pollmeta").innerHTML = p.closed
+    ? "poll closed — final results · <b>" + n + "</b>" + b
+    : "<b>" + n + "</b>" + b + " so far · " + (p.sealed ? "sealed" : "live") +
+      " · expires in <b>" + fmtDur(p.expires_in) + "</b>";
+  const sealedOpen = p.sealed && !p.closed;
+  $("sealedbox").classList.toggle("hidden", !sealedOpen);
+  if (sealedOpen) {
+    $("scount").textContent = n;
+    $("sword").textContent = n === 1 ? "vote" : "votes";
+  }
+  renderOptions();
+  renderAdmin();
+}
+
+function renderOptions() {
+  const p = state, list = $("optlist");
+  if (list.children.length !== p.options.length) {
+    list.textContent = "";
+    p.options.forEach((label, i) => {
+      const btn = document.createElement("button");
+      btn.className = "opt";
+      const bar = document.createElement("span"); bar.className = "bar";
+      const lbl = document.createElement("span"); lbl.className = "lbl"; lbl.textContent = label;
+      const num = document.createElement("span"); num.className = "n";
+      btn.append(bar, lbl, num);
+      btn.addEventListener("click", () => vote(i));
+      list.append(btn);
+    });
+  }
+  const counts = p.counts || null;
+  const total = counts ? counts.reduce((a, c) => a + c, 0) : 0;
+  const max = counts ? Math.max(...counts) : 0;
+  [...list.children].forEach((btn, i) => {
+    btn.disabled = p.closed;
+    btn.classList.toggle("mine", myChoice === i);
+    btn.classList.toggle("win", !!(p.closed && counts && max > 0 && counts[i] === max));
+    const pct = counts && total ? Math.round(counts[i] / total * 100) : 0;
+    btn.querySelector(".bar").style.width = counts ? pct + "%" : "0%";
+    btn.querySelector(".n").textContent = counts ? counts[i] + " · " + pct + "%" : "";
+  });
+}
+
+async function vote(i) {
+  if (!state || state.closed) return;
+  $("perr").textContent = "";
+  let token = localStorage.getItem("ballot-voter-" + pid);
+  if (!token) { token = b64u(rand(16)); localStorage.setItem("ballot-voter-" + pid, token); }
+  const res = await api("/api/vote", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(pid) + "&choice=" + i + "&voter=" + encodeURIComponent(token),
+  });
+  if (!res.ok) {
+    if (res.status === 409) { refresh(); return; } // closed under us — repaint
+    $("perr").textContent = (res.j && res.j.error) || ("vote failed (" + res.status + ")");
+    return;
+  }
+  myChoice = i;
+  localStorage.setItem("ballot-choice-" + pid, "" + i);
+  state.total_votes = res.j.total_votes;
+  if (res.j.counts) state.counts = res.j.counts;
+  const note = $("votenote");
+  note.classList.remove("hidden");
+  note.textContent = "vote recorded — you can change it until the poll closes.";
+  render();
+}
+
+// ---- SSE --------------------------------------------------------------------
+function subscribe() {
+  const es = new EventSource("/api/stream?id=" + encodeURIComponent(pid));
+  es.onopen = () => setLive(true);
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial unnamed event: full /api/poll shape
+    try { state = JSON.parse(ev.data); } catch { return; }
+    setLive(true);
+    render();
+  };
+  es.addEventListener("tally", (ev) => {
+    if (!state) return;
+    const j = JSON.parse(ev.data);
+    state.total_votes = j.total_votes;
+    if (j.counts) state.counts = j.counts;
+    render();
+  });
+  es.addEventListener("closed", (ev) => {
+    if (!state) return;
+    const j = JSON.parse(ev.data);
+    state.closed = true;
+    state.total_votes = j.total_votes;
+    state.counts = j.counts;
+    render();
+  });
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("livetext").textContent = on ? "live" : "reconnecting…";
+}
+
+// ---- admin ------------------------------------------------------------------
+function renderAdmin() {
+  const p = state, panel = $("admin"), btn = $("closebtn");
+  if (!admToken || p.closed) { panel.classList.add("hidden"); return; }
+  panel.classList.remove("hidden");
+  if (!btn.dataset.wired) { btn.dataset.wired = "1"; btn.addEventListener("click", closeClick); }
+  $("adminnote").textContent = p.sealed
+    ? "you hold the admin token. closing the poll is the ONLY way anyone — you included — sees the tally."
+    : "you hold the admin token. closing freezes the tally where it stands.";
+  btn.classList.toggle("danger", p.sealed);
+  if (!btn.dataset.armed) btn.textContent = p.sealed ? "close & reveal results" : "close poll";
+}
+
+async function closeClick() {
+  const btn = $("closebtn");
+  if (!btn.dataset.armed) {
+    // first click arms for 3s; only a second click executes. no confirm().
+    btn.dataset.armed = "1";
+    btn.textContent = state.sealed ? "sure? click again to break the seal" : "sure? click again to close";
+    armTimer = setTimeout(() => { delete btn.dataset.armed; renderAdmin(); }, 3000);
+    return;
+  }
+  clearTimeout(armTimer);
+  delete btn.dataset.armed;
+  btn.disabled = true;
+  const res = await api("/api/close", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(pid) + "&admin=" + encodeURIComponent(admToken),
+  });
+  btn.disabled = false;
+  if (!res.ok) {
+    $("perr").textContent = res.status === 403 ? "wrong admin token."
+      : ((res.j && res.j.error) || "close failed");
+    renderAdmin();
+    return;
+  }
+  state.closed = true;
+  state.counts = res.j.counts;
+  state.total_votes = res.j.counts.reduce((a, c) => a + c, 0);
+  render();
+}
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/p/")) {
+    const m = /^\/p\/([a-z0-9]{8,16})$/.exec(location.pathname);
+    if (m) initPoll(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "holding " + r.j.polls + " poll" + (r.j.polls === 1 ? "" : "s") +
+      " · " + r.j.votes + " ballot" + (r.j.votes === 1 ? "" : "s") +
+      " · lifetime " + r.j.lifetime_polls + " polls, " + r.j.lifetime_votes + " votes cast";
+  } catch {}
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+[package]
+name = "ballot"
+version = "0.1.0"
+edition = "2021"
+description = "Anonymous polls — ballots keyed by token hashes, tallies held in enclave RAM and sealed from everyone (creator included) until the poll is closed"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
