@@ -431,8 +431,17 @@ $("msgs").addEventListener("scroll", () => { if (atBottom()) $("pill").classList
 $("pill").addEventListener("click", scrollBottom);
 
 // ---- SSE ----------------------------------------------------------------------
+// A per-tab stream token: on pagehide a beacon names this exact stream so
+// the enclave closes it immediately — presence never ghosts a closed tab.
+const streamTok = b64u(rand(16));
+window.addEventListener("pagehide", () => {
+  if (es) { es.close(); es = null; }
+  if (rid && navigator.sendBeacon) {
+    navigator.sendBeacon("/api/leave", "id=" + rid + "&s=" + streamTok);
+  }
+});
 function subscribe() {
-  es = new EventSource("/api/stream?id=" + encodeURIComponent(rid));
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(rid) + "&s=" + streamTok);
   es.onopen = () => { setLive(true); if (histLoaded) catchUp(); };
   es.onerror = () => setLive(false); // EventSource retries on its own
   es.onmessage = (ev) => { // the initial unnamed event: {present}

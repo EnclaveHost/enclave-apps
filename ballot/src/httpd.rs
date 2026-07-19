@@ -41,6 +41,9 @@ const IDLE_KEEPALIVE: Duration = Duration::from_secs(60);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
+// A peer whose write buffer stays wedged this long is gone, whatever its
+// socket claims: three missed heartbeats' worth of not draining a byte.
+const WRITE_STALL: Duration = Duration::from_secs(45);
 
 pub struct Request {
     pub method: String,
@@ -101,6 +104,8 @@ struct Conn {
     last_activity: Instant,
     keep_alive: bool,
     sent_continue: bool,
+    tag: Option<String>,          // app-chosen label for targeted SSE drops
+    stuck_since: Option<Instant>, // wbuf continuously non-empty since
 }
 
 pub struct Server {
@@ -174,6 +179,8 @@ impl Server {
                         last_activity: Instant::now(),
                         keep_alive: true,
                         sent_continue: false,
+                        tag: None,
+                        stuck_since: None,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -301,6 +308,32 @@ impl Server {
         conn.state = ConnState::Sse { topic: topic.into(), last_beat: Instant::now() };
     }
 
+    /// Label an SSE subscriber (call right after upgrade_sse) so a
+    /// client-side leave signal can name the exact stream to close: a
+    /// browser's `sendBeacon` on pagehide reaches us even when a proxy
+    /// hop would happily hold the dead stream's socket open forever.
+    pub fn tag_sse(&mut self, key: usize, tag: &str) {
+        if let Some(conn) = self.conns.get_mut(key) {
+            conn.tag = Some(tag.to_string());
+        }
+    }
+
+    /// Close every SSE subscriber of `topic` carrying `tag`. Returns how
+    /// many were dropped; presence counts correct on the next tick.
+    pub fn drop_sse(&mut self, topic: &str, tag: &str) -> usize {
+        let mut dropped = 0;
+        for conn in &mut self.conns {
+            if let ConnState::Sse { topic: t, .. } = &conn.state {
+                if t == topic && conn.tag.as_deref() == Some(tag) {
+                    conn.state = ConnState::Closing;
+                    conn.wbuf.clear();
+                    dropped += 1;
+                }
+            }
+        }
+        dropped
+    }
+
     /// Send one SSE event (pre-framed body WITHOUT the trailing blank line —
     /// e.g. "event: px\ndata: {...}") to every subscriber of `topic`.
     pub fn broadcast(&mut self, topic: &str, event: &str) {
@@ -341,6 +374,17 @@ impl Server {
             }
             if conn.wbuf.len() > MAX_WBUF {
                 return false; // slow client
+            }
+            // Ghost detection: a live peer drains heartbeats within a tick
+            // or two; a buffer that stays wedged across three heartbeat
+            // intervals marks a connection whose far end has left without
+            // saying so. Applies to every state — a mid-response HTTP
+            // client that accepts nothing for 45s is equally gone.
+            match (conn.wbuf.is_empty(), conn.stuck_since) {
+                (true, _) => conn.stuck_since = None,
+                (false, None) => conn.stuck_since = Some(now),
+                (false, Some(t0)) if now.duration_since(t0) > WRITE_STALL => return false,
+                _ => {}
             }
             match &conn.state {
                 ConnState::Closing => !conn.wbuf.is_empty(),

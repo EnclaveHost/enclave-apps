@@ -1,6 +1,6 @@
 [package]
 name = "backchannel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "E2E-encrypted ephemeral chat rooms — browser-side AES-GCM, room key in the URL fragment, ciphertext relayed blind and forgotten inside an attested enclave"
 
