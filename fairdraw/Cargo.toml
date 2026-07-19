@@ -1,0 +1,15 @@
+[package]
+name = "fairdraw"
+version = "0.1.0"
+edition = "2021"
+description = "Provably fair drawings — the enclave commits to sha256(salt) before any entry exists, winners are a pure function of (salt, entry list), and the reveal lets anyone replay the draw"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

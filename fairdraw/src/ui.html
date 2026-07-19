@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>fair draw — raffles nobody can rig</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #c8cdd8; --accent-hi: #ffffff; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  input.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--accent); color: #10141d; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.danger { background: var(--red); color: #fff; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .note.green { border-color: var(--green); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* create: close-mode cards */
+  .modes { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .mode {
+    flex: 1 1 230px; display: block; position: relative;
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer; color: var(--dim); font-size: 12.5px; line-height: 1.5;
+  }
+  .mode:hover { border-color: var(--faint); }
+  .mode input[type=radio] { position: absolute; opacity: 0; pointer-events: none; }
+  .mode b { display: block; color: var(--ink); letter-spacing: .05em; margin-bottom: 3px; }
+  .mode:has(input:checked) { border-color: var(--accent); }
+  .mode:has(input:checked) b { color: var(--accent-hi); }
+  .mode select { margin-left: 6px; }
+
+  /* the commitment, in both its loud and quiet forms */
+  .commitbox {
+    margin-top: 10px; background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; color: var(--accent-hi); word-break: break-all;
+  }
+  .commitline {
+    margin-top: 12px; font-size: 11px; color: var(--faint); word-break: break-all; line-height: 1.7;
+  }
+  .commitline code { color: var(--dim); }
+  .commitline button { padding: 1px 8px; font-size: 10.5px; margin-left: 6px; }
+
+  /* draw: live badge, entrant wall */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.off { background: var(--faint); }
+  .q { font-size: 17px; line-height: 1.5; color: var(--ink); margin: 0; word-break: break-word; }
+  .wall { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .chip {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 999px;
+    padding: 3px 12px; font-size: 12.5px; color: var(--ink); word-break: break-word;
+  }
+  .entrybox { display: flex; gap: 8px; margin-top: 16px; }
+  .entrybox input { flex: 1; min-width: 0; }
+  .entrybox button { white-space: nowrap; }
+
+  /* closed: winners + verify panel */
+  .winner {
+    display: flex; align-items: baseline; gap: 12px; margin-top: 8px; padding: 11px 14px;
+    background: #0d1119; border: 1px solid var(--accent); border-radius: 8px;
+  }
+  .winner .rank { color: var(--accent-hi); font-size: 12.5px; white-space: nowrap; min-width: 3ch; }
+  .winner .who { flex: 1; color: var(--ink); font-size: 14px; word-break: break-word; }
+  .winner .idx { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
+  .verify {
+    margin-top: 18px; padding: 14px 16px;
+    border: 1px dashed var(--edge2); border-radius: 8px;
+  }
+  .verify h3 { margin: 0; font-size: 12.5px; color: var(--dim); letter-spacing: .06em; font-weight: 400; }
+  .vstep { color: var(--dim); font-size: 12.5px; margin-top: 8px; word-break: break-all; }
+  .vstep .ok { color: var(--green); }
+  .vstep .bad { color: var(--red); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ fair <b>draw</b> ]</div>
+    <div class="tag">raffles nobody can rig · commit before, reveal after, verify yourself</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>SET UP A DRAWING</h2>
+    <input id="title" class="text" maxlength="80" placeholder="what's being drawn — 'launch party ticket', 'one signed copy'…" autofocus>
+    <div class="row">
+      <label>winners
+        <select id="winners">
+          <option value="1" selected>1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="5">5</option>
+          <option value="10">10</option>
+        </select>
+      </label>
+    </div>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="close" value="manual" checked>
+        <b>manual</b>I close it with my admin link</label>
+      <label class="mode"><input type="radio" name="close" value="deadline">
+        <b>deadline</b>auto-closes after
+        <select id="deadline">
+          <option value="3600">1 hour</option>
+          <option value="86400" selected>24 hours</option>
+          <option value="259200">3 days</option>
+          <option value="604800">7 days</option>
+        </select></label>
+    </div>
+    <div class="row">
+      <span class="spacer"></span>
+      <button id="createbtn">seal the draw →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>at creation the enclave rolls a secret salt and publishes <em>sha256(salt)</em> — before a single entry exists</li>
+      <li>winners are a pure function of (salt, the exact entry list); nobody can re-roll, reorder, or pick</li>
+      <li>at close the salt is revealed and anyone can replay the draw right in this page and check the commitment</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>THE DRAW IS SEALED</h2>
+    <p class="sub">the draw is already sealed: <b>sha256(salt)</b> below was fixed before anyone could enter —
+    share it so entrants can screenshot it now and check it against the reveal later.</p>
+    <div class="commitbox" id="commitout"></div>
+    <div class="row" style="margin-top:8px"><button id="copycommit" class="ghost">copy commitment</button></div>
+    <p class="sub" style="margin-top:16px">share this link with your entrants:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <p class="sub" style="margin-top:16px">admin link — keep this private: it's the only way to close the draw by hand:</p>
+    <div class="linkbox"><input id="adminlink" readonly><button id="copyadmin">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="opendraw">open your draw →</button>
+      <button class="ghost" onclick="location.href='/'">set up another</button>
+    </div>
+  </section>
+
+  <!-- DRAW -->
+  <section id="draw" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="livetext">connecting…</span></div>
+    <div class="q" id="q"></div>
+    <div class="kv" id="drawmeta"></div>
+    <div class="commitline">sealed at creation: <code>sha256(salt) = <span id="commithex"></span></code><button class="ghost" id="copycommit2">copy</button></div>
+    <div class="entrybox" id="entrybox">
+      <input id="name" class="text" maxlength="40" placeholder="your name or handle">
+      <button id="enterbtn">enter the draw →</button>
+    </div>
+    <div class="note green hidden" id="enternote"></div>
+    <div id="winlist"></div>
+    <div class="commitline hidden" id="saltline"></div>
+    <div class="verify hidden" id="verify">
+      <h3>DON'T TRUST THIS PAGE'S WORD FOR IT</h3>
+      <div class="vstep" id="vintro">the salt, the ordered entry hashes, and the winners are all public now.
+      this button recomputes the whole draw with WebCrypto, in your browser:</div>
+      <div class="row" style="margin-top:12px"><button id="verifybtn" class="ghost">verify this draw</button></div>
+      <div class="vstep hidden" id="v1"></div>
+      <div class="vstep hidden" id="v2"></div>
+      <div class="vstep hidden" id="v3"></div>
+      <div class="vstep hidden" id="vsum"></div>
+    </div>
+    <div class="wall" id="wall"></div>
+    <div class="err" id="derr"></div>
+    <div id="admin" class="hidden">
+      <div class="note" id="adminnote" style="margin-top:20px"></div>
+      <div class="row" style="margin-top:12px"><button id="closebtn"></button></div>
+    </div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this draw never existed, expired unclosed, or was closed long enough ago
+    (7 days) that the enclave swept it. an unclosed draw's salt is never revealed.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">set up a new drawing</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  entries in memory only, the salt sealed until close, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave, then verify the math yourself.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+const sha256hex = async (str) => bytesToHex(await sha256(enc.encode(str)));
+const sha256 = async (bytes) => new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+const bytesToHex = (b) => [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+const hexToBytes = (h) => {
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(2 * i, 2), 16);
+  return out;
+};
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","draw","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const ord = (n) => {
+  const t = n % 10, h = n % 100;
+  return n + (t === 1 && h !== 11 ? "st" : t === 2 && h !== 12 ? "nd" : t === 3 && h !== 13 ? "rd" : "th");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newDrawId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("createbtn").addEventListener("click", async () => {
+  const title = $("title").value.trim();
+  $("cerr").textContent = "";
+  if (!title) { $("cerr").textContent = "say what's being drawn."; return; }
+  $("createbtn").disabled = true;
+  try {
+    const id = newDrawId();
+    const admToken = b64u(rand(16));
+    const winners = $("winners").value;
+    const mode = document.querySelector("input[name=close]:checked").value;
+    const headers = {
+      "content-type": "text/plain",
+      "x-draw-id": id,
+      "x-admin-hash": await sha256hex(admToken),
+      "x-winners": winners,
+    };
+    if (mode === "deadline") headers["x-deadline-in"] = $("deadline").value;
+    const res = await api("/api/draws", { method: "POST", headers, body: encodeURIComponent(title) });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const share = location.origin + "/d/" + id;
+    const admin = share + "#a=" + admToken;
+    $("commitout").textContent = "sha256(salt) = " + res.j.commit;
+    $("sharelink").value = share;
+    $("adminlink").value = admin;
+    $("createdmeta").innerHTML = "<b>" + winners + "</b> winner" + (winners === "1" ? "" : "s") + " · " +
+      (mode === "deadline" ? "auto-closes in <b>" + fmtDur(+$("deadline").value) + "</b>"
+        : "closes when <b>you</b> say so") + " · draw expires in <b>7 days</b> if never closed";
+    $("opendraw").onclick = () => { location.href = admin; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("createbtn").disabled = false;
+  }
+});
+copyBtn($("copycommit"), () => $("commitout").textContent);
+copyBtn($("copyshare"), () => $("sharelink").value);
+copyBtn($("copyadmin"), () => $("adminlink").value);
+
+// ---- draw flow --------------------------------------------------------------
+let did = null, admToken = null, state = null, closesAt = null, armTimer = null;
+
+function initDraw(id) {
+  did = id;
+  const m = /(?:^|[#&])a=([^&]+)/.exec(location.hash.slice(1));
+  admToken = m ? decodeURIComponent(m[1]) : null;
+  const stored = localStorage.getItem("fairdraw-name-" + did);
+  if (stored) $("name").value = stored;
+  show("draw");
+  refresh();
+  subscribe();
+  setInterval(tick, 1000);
+}
+
+async function refresh() {
+  const res = await api("/api/draw?id=" + encodeURIComponent(did));
+  if (!res.ok) { show("gone"); return; }
+  state = res.j;
+  render();
+}
+
+function render() {
+  const p = state;
+  closesAt = !p.closed && p.closes_in !== null ? Math.floor(Date.now() / 1000) + p.closes_in : null;
+  $("q").textContent = p.title;
+  $("commithex").textContent = p.commit;
+  const n = p.count, e = n === 1 ? " entry" : " entries";
+  $("drawmeta").innerHTML = p.closed
+    ? "draw closed — <b>" + p.winners.length + "</b> winner" + (p.winners.length === 1 ? "" : "s") +
+      " from <b>" + n + "</b>" + e + " · verifiable for <b>" + fmtDur(p.expires_in) + "</b>"
+    : "<b>" + n + "</b>" + e + " so far · <b>" + p.winners_n + "</b> winner" + (p.winners_n === 1 ? "" : "s") +
+      (closesAt !== null ? " · auto-closes in <b><span id=cdown>" + fmtDur(p.closes_in) + "</span></b>"
+        : " · closes when the organizer says so");
+  $("entrybox").classList.toggle("hidden", p.closed);
+  if (p.closed) $("enternote").classList.add("hidden");
+  renderWall();
+  renderClosed();
+  renderAdmin();
+}
+
+function tick() {
+  const el = document.getElementById("cdown");
+  if (!el || closesAt === null) return;
+  const left = closesAt - Math.floor(Date.now() / 1000);
+  el.textContent = left > 0 ? fmtDur(left) : "…any moment (enclave sweep)";
+}
+
+function renderWall() {
+  const wall = $("wall");
+  wall.textContent = "";
+  for (const name of state.names) {
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = name;
+    wall.append(chip);
+  }
+}
+
+function renderClosed() {
+  const p = state, list = $("winlist");
+  $("saltline").classList.toggle("hidden", !p.closed);
+  $("verify").classList.toggle("hidden", !p.closed);
+  list.textContent = "";
+  if (!p.closed) return;
+  if (p.winners.length === 0) {
+    const none = document.createElement("div");
+    none.className = "kv";
+    none.textContent = "nobody entered — nothing to draw.";
+    list.append(none);
+  }
+  p.winners.forEach((w, r) => {
+    const row = document.createElement("div");
+    row.className = "winner";
+    const rank = document.createElement("span"); rank.className = "rank"; rank.textContent = ord(r + 1);
+    const who = document.createElement("span"); who.className = "who"; who.textContent = w.name;
+    const idx = document.createElement("span"); idx.className = "idx"; idx.textContent = "entry #" + w.i;
+    row.append(rank, who, idx);
+    list.append(row);
+  });
+  $("saltline").innerHTML = "revealed at close: <code>salt = <span id=salthex></span></code>";
+  document.getElementById("salthex").textContent = p.salt;
+}
+
+// ---- entering ---------------------------------------------------------------
+$("enterbtn").addEventListener("click", async () => {
+  const name = $("name").value.trim();
+  $("derr").textContent = "";
+  if (!name) { $("derr").textContent = "a name, so the winner list means something."; return; }
+  // The token is the entry's identity: same token, same slot — re-entering
+  // from this browser edits your name instead of adding a second chance.
+  let token = localStorage.getItem("fairdraw-token-" + did);
+  if (!token) { token = b64u(rand(24)); localStorage.setItem("fairdraw-token-" + did, token); }
+  $("enterbtn").disabled = true;
+  const res = await api("/api/enter", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(did) + "&name=" + encodeURIComponent(name) +
+      "&token=" + encodeURIComponent(token),
+  });
+  $("enterbtn").disabled = false;
+  if (!res.ok) {
+    if (res.status === 409) { refresh(); return; } // closed under us — repaint
+    $("derr").textContent = (res.j && res.j.error) || ("enter failed (" + res.status + ")");
+    return;
+  }
+  localStorage.setItem("fairdraw-name-" + did, name);
+  const note = $("enternote");
+  note.classList.remove("hidden");
+  note.textContent = "you're in as “" + name + "” — one slot per device; re-enter any time to change the name.";
+  refresh();
+});
+
+// ---- SSE --------------------------------------------------------------------
+function subscribe() {
+  const es = new EventSource("/api/stream?id=" + encodeURIComponent(did));
+  es.onopen = () => setLive(true);
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial unnamed event: full /api/draw shape
+    try { state = JSON.parse(ev.data); } catch { return; }
+    setLive(true);
+    render();
+  };
+  es.addEventListener("entries", () => {
+    // The event carries only the count; the wall wants names, so refetch.
+    if (state && !state.closed) refresh();
+  });
+  es.addEventListener("closed", (ev) => {
+    try { state = JSON.parse(ev.data); } catch { return; }
+    render();
+  });
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("livetext").textContent = on ? "live" : "reconnecting…";
+}
+
+// ---- admin ------------------------------------------------------------------
+function renderAdmin() {
+  const p = state, panel = $("admin"), btn = $("closebtn");
+  if (!admToken || p.closed) { panel.classList.add("hidden"); return; }
+  panel.classList.remove("hidden");
+  if (!btn.dataset.wired) { btn.dataset.wired = "1"; btn.addEventListener("click", closeClick); }
+  $("adminnote").textContent = "you hold the admin token. closing reveals the salt and fixes the winners — " +
+    "a pure function of the commitment and the entry list as it stands.";
+  if (!btn.dataset.armed) btn.textContent = "close & draw winners";
+}
+
+async function closeClick() {
+  const btn = $("closebtn");
+  if (!btn.dataset.armed) {
+    // first click arms for 3s; only a second click executes. no confirm().
+    btn.dataset.armed = "1";
+    btn.textContent = "sure? click again to draw winners";
+    armTimer = setTimeout(() => { delete btn.dataset.armed; renderAdmin(); }, 3000);
+    return;
+  }
+  clearTimeout(armTimer);
+  delete btn.dataset.armed;
+  btn.disabled = true;
+  const res = await api("/api/close", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(did) + "&admin=" + encodeURIComponent(admToken),
+  });
+  btn.disabled = false;
+  if (!res.ok) {
+    $("derr").textContent = res.status === 403 ? "wrong admin token."
+      : ((res.j && res.j.error) || "close failed");
+    renderAdmin();
+    return;
+  }
+  state = res.j; // the close response IS the closed draw state
+  render();
+}
+
+// ---- verification -----------------------------------------------------------
+// Byte-for-byte the server's algorithm: entries_hash = sha256 of the
+// concatenated token-hash hex strings (UTF-8, insertion order); seed =
+// sha256(salt bytes || entries_hash bytes); then a Fisher-Yates prefix where
+// round i hashes sha256(seed || i as 8 LE bytes) and reduces the first 8
+// bytes, little-endian, mod (n - i). BigInt keeps the u64 math exact.
+$("verifybtn").addEventListener("click", async () => {
+  const p = state;
+  if (!p || !p.closed) return;
+  const step = (id, ok, text) => {
+    const el = $(id);
+    el.classList.remove("hidden");
+    el.innerHTML = (ok ? "<span class=ok>✓</span> " : "<span class=bad>✗</span> ") + text;
+    return ok;
+  };
+  const saltBytes = hexToBytes(p.salt);
+  const ok1 = step("v1", bytesToHex(await sha256(saltBytes)) === p.commit,
+    "sha256(revealed salt) equals the commitment published at creation");
+  const ehash = await sha256(enc.encode(p.entry_hashes.join("")));
+  step("v2", true, "entry list locked: sha256 of all " + p.entry_hashes.length +
+    " entry hashes, in order → " + bytesToHex(ehash).slice(0, 16) + "…");
+  const seedIn = new Uint8Array(64);
+  seedIn.set(saltBytes); seedIn.set(ehash, 32);
+  const seed = await sha256(seedIn);
+  const n = p.entry_hashes.length, k = Math.min(p.winners_n, n);
+  const idx = [...Array(n).keys()];
+  for (let i = 0; i < k; i++) {
+    const round = new Uint8Array(40);
+    round.set(seed);
+    new DataView(round.buffer).setBigUint64(32, BigInt(i), true);
+    const r = await sha256(round);
+    const j = i + Number(new DataView(r.buffer).getBigUint64(0, true) % BigInt(n - i));
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  const mine = idx.slice(0, k);
+  const ok3 = step("v3", mine.length === p.winners.length && mine.every((v, i) => v === p.winners[i].i),
+    "Fisher-Yates replay from sha256(salt‖entries_hash) reproduces the winners: [" + mine.join(", ") + "]");
+  const sum = $("vsum");
+  sum.classList.remove("hidden");
+  sum.innerHTML = ok1 && ok3
+    ? "<span class=ok>this result is reproducible from public data; the enclave couldn't have chosen differently.</span>"
+    : "<span class=bad>verification FAILED — do not trust this result; the served data doesn't reproduce it.</span>";
+});
+copyBtn($("copycommit2"), () => state ? state.commit : "");
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/d/")) {
+    const m = /^\/d\/([a-z0-9]{8,16})$/.exec(location.pathname);
+    if (m) initDraw(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "holding " + r.j.draws + " draw" + (r.j.draws === 1 ? "" : "s") +
+      " · " + r.j.entries + (r.j.entries === 1 ? " entry" : " entries") +
+      " · lifetime " + r.j.lifetime_draws + " draws, " + r.j.lifetime_entries + " entries, " +
+      r.j.closed + " closed";
+  } catch {}
+}
+</script>
+</body>
+</html>

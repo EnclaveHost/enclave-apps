@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- fair draw: one ticket rises; the die was committed before it was cast. -->
+  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
+  <g fill="#3a4256">
+    <rect x="18" y="58" width="22" height="14" rx="3"/>
+    <rect x="56" y="58" width="22" height="14" rx="3"/>
+    <rect x="37" y="74" width="22" height="14" rx="3" fill="#2a3242"/>
+  </g>
+  <g transform="rotate(-8 48 34)">
+    <rect x="34" y="22" width="28" height="18" rx="4" fill="#c8cdd8"/>
+    <circle cx="48" cy="31" r="4" fill="#0b0e14"/>
+  </g>
+  <path d="M30 52 l6 -4 M66 52 l-6 -4" stroke="#c8cdd8" stroke-width="3" stroke-linecap="round"/>
+</svg>
