@@ -1,0 +1,14 @@
+[package]
+name = "warpad"
+version = "0.1.0"
+edition = "2021"
+description = "E2E-encrypted shared scratchpad — browser-side AES-GCM, pad key in the URL fragment, one whole-document ciphertext replaced on every save inside an attested enclave"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine and SSE are hand-rolled std. What runs is what you read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

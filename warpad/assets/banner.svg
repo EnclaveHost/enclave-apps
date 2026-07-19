@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#39b3a6" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#39b3a6" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- one page; the ghost of a previous draft, crossed out of existence -->
+  <g opacity=".18">
+    <rect x="1130" y="70" width="200" height="260" rx="14" fill="#39b3a6"/>
+    <line x1="1140" y1="80" x2="1320" y2="320" stroke="#e05e5e" stroke-width="10"/>
+    <line x1="1320" y1="80" x2="1140" y2="320" stroke="#e05e5e" stroke-width="10"/>
+  </g>
+  <g>
+    <rect x="1250" y="50" width="230" height="300" rx="14" fill="#39b3a6"/>
+    <g fill="#0b0e14">
+      <rect x="1280" y="92" width="170" height="16" rx="5"/>
+      <rect x="1280" y="132" width="170" height="16" rx="5"/>
+      <rect x="1280" y="172" width="120" height="16" rx="5"/>
+      <rect x="1280" y="212" width="150" height="16" rx="5"/>
+    </g>
+    <rect x="1404" y="206" width="22" height="26" fill="#5fd4c7"/>
+  </g>
+  <text x="96" y="180" font-size="84" fill="#39b3a6">[ war <tspan fill="#d7dde8" font-weight="bold">pad</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">one shared pad, encrypted before it leaves your machine</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">every save replaces the only ciphertext — no history, anywhere</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">pads die after 24 idle hours · the relay is blind and attested</text>
+</svg>

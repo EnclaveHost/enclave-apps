@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>war pad — e2e-encrypted shared scratchpad</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #39b3a6; --accent-hi: #5fd4c7; --amber: #e8a34c; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  main.wide { max-width: 860px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  textarea.doc {
+    width: 100%; min-height: 60vh; resize: vertical; margin-top: 12px;
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 14px 16px; font: 14px/1.6 var(--mono); outline: none;
+    tab-size: 4;
+  }
+  textarea.doc:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  button {
+    background: var(--accent); color: #0a1613; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.small { padding: 5px 12px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* pad: presence badge, save-state bar, conflict warning */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.on { animation: pulse 2s ease-in-out infinite; }
+  .dot.off { background: var(--faint); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .padbar { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
+  .state { color: var(--dim); font-size: 12px; }
+  .warnbar {
+    display: flex; gap: 10px; align-items: center; margin-top: 12px;
+    border: 1px solid rgba(232, 163, 76, .45); background: rgba(232, 163, 76, .07);
+    border-radius: 8px; padding: 7px 12px; color: var(--amber); font-size: 12.5px;
+  }
+</style>
+</head>
+<body>
+<main id="main">
+  <header>
+    <div class="mark">[ war <b>pad</b> ]</div>
+    <div class="tag">one shared pad · encrypted before it leaves your machine · no history, anywhere</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>OPEN A PAD</h2>
+    <p class="sub">one shared text pad the server cannot read — notes for an incident
+    bridge, a negotiation, an interview panel. this page generates the pad key,
+    and it rides the link's <b>#fragment</b> — never the wire.</p>
+    <div class="row" style="margin-top:16px">
+      <button id="openbtn">open a pad →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>the pad key lives only in the link's #fragment — browsers never send it, so the server never holds it</li>
+      <li>the document is ONE AES-256-GCM blob sealed in your browser; every save replaces it whole, so yesterday's draft provably no longer exists — not here, not on the server, not anywhere</li>
+      <li>a pad dies 24 hours after its last write, in enclave RAM — nothing touches a disk, and the relay is hardware-attested: "blind" is checkable, not marketing</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>PAD IS OPEN</h2>
+    <p class="sub">share this link — the part after <b>#</b> is the pad key and never reaches any server:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="enterbtn">enter the pad →</button>
+      <button class="ghost" onclick="location.href='/'">open another</button>
+    </div>
+  </section>
+
+  <!-- PAD -->
+  <section id="pad" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="here">joining…</span></div>
+    <h2 id="padtag">#……</h2>
+    <div class="padbar">
+      <span class="state" id="state">loading…</span>
+      <span class="spacer"></span>
+      <button id="copylink" class="ghost small">copy link</button>
+    </div>
+    <div class="warnbar hidden" id="warn">
+      <span id="warntext"></span>
+      <span class="spacer"></span>
+      <button id="undo" class="ghost small">undo</button>
+      <button id="dismiss" class="ghost small">×</button>
+    </div>
+    <textarea id="doc" class="doc" spellcheck="false"
+      placeholder="start typing — everyone on this link sees it within a second…"></textarea>
+    <div class="kv" id="padmeta"></div>
+  </section>
+
+  <!-- NO KEY -->
+  <section id="nokey" class="card hidden">
+    <h2>KEY MISSING</h2>
+    <p class="sub">you need the full link — the part after <b>#</b> is the pad key
+    and never reaches the server. without it there is nothing here to read, and
+    the server can't help: it never had the key either. ask whoever shared the
+    pad to re-send the whole link.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a pad of your own</button></div>
+  </section>
+
+  <!-- WRONG KEY -->
+  <section id="badkey" class="card hidden">
+    <h2>WRONG KEY</h2>
+    <p class="sub">this link's key doesn't decrypt this pad's ciphertext — the
+    <b>#fragment</b> got mangled in transit, or it belongs to a different pad.
+    editing is disabled: a save with the wrong key would replace what the others
+    wrote. ask for the link again, sent whole.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a pad of your own</button></div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this pad never existed, or went 24 hours without a write and
+    was swept. the server can't tell you which — and either way the only
+    ciphertext is gone. pads leave nothing behind; that's the point.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a new pad</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  ciphertext only, one version only, in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave before drafting anything you'd whisper.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","pad","nokey","badkey","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// ---- crypto: AES-256-GCM, iv||ct, base64url — the dead-drop shape ----------
+// The WHOLE document is one message. Empty text is the empty blob: a fresh
+// pad and a cleared pad are the same state, and the server sees neither.
+let padKey = null;
+async function importPadKey(b64) {
+  const raw = unb64u(b64);
+  if (raw.length !== 32) throw new Error("bad key");
+  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function sealDoc(text) {
+  if (text === "") return "";
+  const iv = rand(12);
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv }, padKey, enc.encode(text)));
+  const blob = new Uint8Array(iv.length + ct.length);
+  blob.set(iv); blob.set(ct, iv.length);
+  return b64u(blob);
+}
+async function openDoc(blobB64) {
+  if (blobB64 === "") return "";
+  const blob = unb64u(blobB64);
+  const iv = blob.slice(0, 12), ct = blob.slice(12);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, padKey, ct);
+  return dec.decode(pt);
+}
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newPadId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("openbtn").addEventListener("click", async () => {
+  $("cerr").textContent = "";
+  $("openbtn").disabled = true;
+  try {
+    const id = newPadId();
+    const keyBytes = rand(32);
+    const res = await api("/api/pads", { method: "POST", headers: { "x-pad-id": id } });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const link = location.origin + "/p/" + id + "#k=" + b64u(keyBytes);
+    $("sharelink").value = link;
+    $("createdmeta").innerHTML = "pad <b>#" + id + "</b> · one ciphertext, replaced whole on every save · dies after 24 idle hours";
+    $("enterbtn").onclick = () => { location.href = link; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("openbtn").disabled = false;
+  }
+});
+copyBtn($("copyshare"), () => $("sharelink").value);
+
+// ---- pad flow ----------------------------------------------------------------
+let pid = null, es = null;
+let baseVersion = 0, baseText = ""; // the last state we and the server agreed on
+let saving = false, saveTimer = null;
+let held = null;      // remote doc event held back while local edits are pending
+let undoText = null;  // their text, offered back after an overlapping conflict
+let rebasedOnto = 0;  // remote version a rebase resolved against, for the state line
+let locked = false;   // wrong key — nothing may be saved from this page
+
+const ta = () => $("doc");
+const setState = (s) => { $("state").textContent = s; };
+const pendingEdits = () => saving || ta().value !== baseText;
+
+async function initPad(id) {
+  pid = id;
+  const m = /(?:^|[#&])k=([^&]+)/.exec(location.hash.slice(1));
+  if (!m) { show("nokey"); return; }
+  try { padKey = await importPadKey(decodeURIComponent(m[1])); }
+  catch { show("nokey"); return; }
+  const res = await api("/api/pad?id=" + encodeURIComponent(pid));
+  if (!res.ok) { show("gone"); return; }
+  let text;
+  try { text = await openDoc(res.j.blob); }
+  catch { lockBadKey(); return; }
+  baseVersion = res.j.version;
+  baseText = text;
+  $("main").classList.add("wide");
+  show("pad");
+  $("padtag").textContent = "#" + pid.slice(0, 6) + "…";
+  $("padtag").title = "#" + pid;
+  ta().value = text;
+  setState("saved · v" + baseVersion);
+  $("padmeta").innerHTML = "every save replaces the only ciphertext — there is no history to leak · dies after <b>24 idle hours</b> (currently " + fmtDur(res.j.expires_in) + " left)";
+  subscribe();
+  ta().focus();
+}
+copyBtn($("copylink"), () => location.href);
+
+// ---- sync: debounce → seal → save; 409 → client-side rebase ------------------
+$("doc").addEventListener("input", () => {
+  if (locked) return;
+  setState("typing…");
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 800);
+});
+
+async function save() {
+  if (saving || locked) return;
+  clearTimeout(saveTimer);
+  const text = ta().value;
+  if (text === baseText) { setState("saved · v" + baseVersion); applyHeld(); return; }
+  saving = true;
+  setState("saving…");
+  let blob;
+  try { blob = await sealDoc(text); }
+  catch { saving = false; setState("encryption failed"); return; }
+  if (blob.length > 256 * 1024) {
+    saving = false;
+    setState("pad too large — it caps at ~190 KiB of text");
+    return;
+  }
+  const res = await api("/api/save", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(pid) + "&v=" + baseVersion + "&blob=" + blob,
+  });
+  saving = false;
+  if (res.ok) {
+    baseVersion = res.j.version;
+    baseText = text;
+    if (rebasedOnto) { setState("rebased your edit onto v" + rebasedOnto); rebasedOnto = 0; }
+    else setState("saved · v" + baseVersion);
+    if (ta().value !== text) saveTimer = setTimeout(save, 800); // typed mid-flight
+    else applyHeld();
+  } else if (res.status === 409) {
+    await rebase(res.j.version, res.j.blob);
+  } else if (res.status === 404) {
+    if (es) es.close();
+    show("gone");
+  } else {
+    setState("save failed (" + ((res.j && res.j.error) || res.status) + ") — retrying");
+    saveTimer = setTimeout(save, 3000);
+  }
+}
+
+// A 409 means someone saved since our base. Three-way merge is overkill —
+// if their lines and ours touch disjoint ranges of the base, keep both;
+// otherwise prefer LOCAL and offer their text back on the warning bar.
+async function rebase(rv, rblob) {
+  let remoteText;
+  try { remoteText = await openDoc(rblob); }
+  catch { lockBadKey(); return; }
+  const local = ta().value;
+  const m = mergeLines(baseText, local, remoteText);
+  baseVersion = rv;
+  baseText = remoteText;
+  rebasedOnto = rv;
+  if (m.disjoint) {
+    if (m.text !== local) setDocPreserve(m.text);
+  } else {
+    showWarn("someone else saved v" + rv + " — their text was replaced; undo?", remoteText);
+  }
+  save(); // resolve against the new version
+}
+
+// The simplest useful diff: common prefix/suffix LINE counts give each side
+// one changed range against the base; disjoint ranges merge cleanly.
+function lineDiff(base, mod) {
+  const b = base.split("\n"), m = mod.split("\n");
+  let p = 0;
+  while (p < b.length && p < m.length && b[p] === m[p]) p++;
+  let s = 0;
+  while (s < b.length - p && s < m.length - p && b[b.length - 1 - s] === m[m.length - 1 - s]) s++;
+  return { start: p, end: b.length - s, lines: m.slice(p, m.length - s) };
+}
+function mergeLines(base, local, remote) {
+  const L = lineDiff(base, local), R = lineDiff(base, remote);
+  if (L.end > R.start && R.end > L.start) return { disjoint: false, text: local };
+  const out = base.split("\n");
+  // Apply back-to-front so earlier splices don't shift later offsets; on a
+  // shared start line, the wider (non-insertion) edit must go first.
+  for (const e of [L, R].sort((a, b) => b.start - a.start || b.end - a.end)) {
+    out.splice(e.start, e.end - e.start, ...e.lines);
+  }
+  return { disjoint: true, text: out.join("\n") };
+}
+
+// Replace the textarea's content, keeping the cursor where it was when the
+// text before it didn't change — best effort, nothing fancier.
+function setDocPreserve(text) {
+  const el = ta();
+  const focused = document.activeElement === el;
+  const s = el.selectionStart, e = el.selectionEnd, old = el.value;
+  el.value = text;
+  if (focused && text.slice(0, s) === old.slice(0, s)) {
+    el.setSelectionRange(s, Math.min(e, text.length));
+  }
+}
+
+// ---- conflict warning bar ------------------------------------------------------
+function showWarn(text, remote) {
+  undoText = remote;
+  $("warntext").textContent = text;
+  $("warn").classList.remove("hidden");
+}
+function hideWarn() {
+  $("warn").classList.add("hidden");
+  undoText = null;
+}
+$("undo").addEventListener("click", () => {
+  if (undoText === null) return;
+  ta().value = undoText; // deliberately no save: nothing moves until you edit
+  hideWarn();
+  setState("their text restored — edit to save it");
+});
+$("dismiss").addEventListener("click", hideWarn);
+
+// ---- SSE ----------------------------------------------------------------------
+function subscribe() {
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(pid));
+  es.onopen = () => setLive(true);
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial unnamed event: the current document
+    setLive(true);
+    try { handleDoc(JSON.parse(ev.data)); } catch {}
+  };
+  es.addEventListener("doc", (ev) => {
+    try { handleDoc(JSON.parse(ev.data)); } catch {}
+  });
+  es.addEventListener("present", (ev) => {
+    try { $("here").textContent = JSON.parse(ev.data).present + " here"; } catch {}
+  });
+}
+async function handleDoc(j) {
+  if (locked || j.version <= baseVersion) return;
+  if (pendingEdits()) { held = j; return; } // the next save's 409 reconciles
+  let text;
+  try { text = await openDoc(j.blob); }
+  catch { lockBadKey(); return; }
+  baseVersion = j.version;
+  baseText = text;
+  setDocPreserve(text);
+  setState("saved · v" + baseVersion);
+}
+function applyHeld() {
+  if (!held) return;
+  const h = held;
+  held = null;
+  handleDoc(h);
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("dot").classList.toggle("on", on);
+}
+function lockBadKey() {
+  locked = true;
+  if (es) es.close();
+  $("main").classList.remove("wide");
+  show("badkey");
+}
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/p/")) {
+    const m = /^\/p\/([a-z0-9]{10,16})$/.exec(location.pathname);
+    if (m) initPad(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "holding " + r.j.pads + " pad" + (r.j.pads === 1 ? "" : "s") +
+      " · lifetime " + r.j.lifetime_pads + " pads, " + r.j.lifetime_saves + " saves — and zero old versions, anywhere";
+  } catch {}
+}
+</script>
+</body>
+</html>
