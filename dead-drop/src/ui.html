@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>dead drop — burn-after-reading secrets</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --amber: #e8a34c; --amber-hi: #ffc46b; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--amber); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  textarea {
+    width: 100%; min-height: 160px; resize: vertical;
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 12px 14px; font: 14px/1.55 var(--mono); outline: none;
+  }
+  textarea:focus { border-color: var(--amber); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--amber); color: #14100a; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--amber-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--amber); }
+  button.danger { background: var(--red); color: #fff; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--amber-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  pre.secret {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 14px 16px; white-space: pre-wrap; word-break: break-word;
+    font: 14px/1.55 var(--mono); color: var(--ink); margin: 12px 0 0; max-height: 50vh; overflow: auto;
+  }
+  .note { border-left: 3px solid var(--amber); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .note.green { border-color: var(--green); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  .burnline { margin-top: 16px; }
+  .burnline summary { color: var(--faint); font-size: 12px; cursor: pointer; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ dead <b>drop</b> ]</div>
+    <div class="tag">burn-after-reading secrets · sealed inside an attested enclave</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>SEAL A SECRET</h2>
+    <textarea id="plain" placeholder="the secret — a password, a key, a message…" maxlength="65536" autofocus></textarea>
+    <div class="row">
+      <label>reveals
+        <select id="reads">
+          <option value="1" selected>1 — burn on read</option>
+          <option value="3">3</option>
+          <option value="10">10</option>
+          <option value="25">25</option>
+        </select>
+      </label>
+      <label>expires
+        <select id="ttl">
+          <option value="3600">in 1 hour</option>
+          <option value="86400" selected>in 24 hours</option>
+          <option value="604800">in 7 days</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="seal">seal →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>encrypted <em>in this page</em> with AES-256-GCM; the key lives only in the link's #fragment</li>
+      <li>the server holds ciphertext it cannot read, counts reveals, and erases — nothing is ever written to disk</li>
+      <li>it runs in a hardware-attested TEE: the operator can't peek either</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>SEALED</h2>
+    <p class="sub">share this link — the part after <b>#</b> never reaches any server:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <details class="burnline">
+      <summary>sender's burn link (revoke early — keep it private)</summary>
+      <div class="linkbox"><input id="burnlink" readonly><button id="copyburn">copy</button></div>
+    </details>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.hash='';location.reload()">seal another</button></div>
+  </section>
+
+  <!-- RECEIVE -->
+  <section id="receive" class="card hidden">
+    <h2>A DEAD DROP IS WAITING</h2>
+    <div class="kv" id="peekmeta">checking…</div>
+    <div class="row" style="margin-top:18px">
+      <button id="reveal">reveal secret</button>
+      <span class="spacer"></span>
+    </div>
+    <div class="note" id="revealnote">revealing consumes one read. if this is the last read, the secret is erased forever.</div>
+    <div class="err" id="rerr"></div>
+  </section>
+
+  <!-- REVEALED -->
+  <section id="revealed" class="card hidden">
+    <h2>REVEALED</h2>
+    <pre class="secret" id="secretout"></pre>
+    <div class="row" style="margin-top:14px">
+      <button id="copysecret" class="ghost">copy secret</button>
+      <span class="spacer"></span>
+    </div>
+    <div class="note" id="afternote"></div>
+  </section>
+
+  <!-- BURN -->
+  <section id="burn" class="card hidden">
+    <h2>BURN THIS DROP</h2>
+    <div class="kv" id="burnmeta">checking…</div>
+    <div class="row" style="margin-top:18px">
+      <button id="doburn" class="danger">burn it — erase the secret</button>
+    </div>
+    <div class="err" id="berr"></div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this drop never existed, expired, was burned, or has already been read.
+    the server can't tell you which — that ambiguity is deliberate.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.hash='';location.reload()">seal a new secret</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  ciphertext only, in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave before trusting it with more than you'd whisper.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const sha256hex = async (str) => {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","receive","revealed","burn","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// ---- create flow -----------------------------------------------------------
+$("seal").addEventListener("click", async () => {
+  const text = $("plain").value;
+  $("cerr").textContent = "";
+  if (!text) { $("cerr").textContent = "nothing to seal."; return; }
+  $("seal").disabled = true;
+  try {
+    const keyBytes = rand(32), iv = rand(12);
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(text)));
+    const blob = new Uint8Array(iv.length + ct.length);
+    blob.set(iv); blob.set(ct, iv.length);
+    const id = b64u(rand(16));
+    const burnToken = b64u(rand(16));
+    const reads = $("reads").value, ttl = $("ttl").value;
+    const res = await api("/api/drop", {
+      method: "POST",
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-drop-id": id, "x-reads": reads, "x-ttl": ttl,
+        "x-burn-hash": await sha256hex(burnToken),
+      },
+      body: b64u(blob),
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const share = location.origin + "/#" + id + "." + b64u(keyBytes);
+    const burn = location.origin + "/#!" + id + "." + burnToken;
+    $("sharelink").value = share;
+    $("burnlink").value = burn;
+    $("createdmeta").innerHTML =
+      "<b>" + reads + "</b> reveal" + (reads === "1" ? "" : "s") +
+      " · expires in <b>" + fmtDur(+ttl) + "</b> · " + blob.length + " bytes sealed";
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("seal").disabled = false;
+  }
+});
+copyBtn($("copyshare"), () => $("sharelink").value);
+copyBtn($("copyburn"), () => $("burnlink").value);
+
+// ---- receive flow ----------------------------------------------------------
+let rid = null, rkey = null;
+async function initReceive(id, keyb64) {
+  rid = id; rkey = keyb64;
+  show("receive");
+  const res = await api("/api/peek", { method: "POST", body: "id=" + encodeURIComponent(id) });
+  if (!res.ok) { show("gone"); return; }
+  $("peekmeta").innerHTML =
+    "sealed secret · <b>" + res.j.reads_left + "</b> reveal" + (res.j.reads_left === 1 ? "" : "s") +
+    " left · expires in <b>" + fmtDur(res.j.expires_in) + "</b> · " + res.j.size + " bytes";
+  if (res.j.reads_left === 1) $("revealnote").classList.add("red");
+}
+$("reveal").addEventListener("click", async () => {
+  $("reveal").disabled = true;
+  $("rerr").textContent = "";
+  try {
+    const res = await api("/api/take", { method: "POST", body: "id=" + encodeURIComponent(rid) });
+    if (!res.ok) { show("gone"); return; }
+    const blob = unb64u(res.j.blob);
+    const iv = blob.slice(0, 12), ct = blob.slice(12);
+    const key = await crypto.subtle.importKey("raw", unb64u(rkey), "AES-GCM", false, ["decrypt"]);
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+    $("secretout").textContent = dec.decode(pt);
+    const left = res.j.reads_left;
+    const n = $("afternote");
+    if (left === 0) { n.textContent = "that was the last read — the ciphertext has been erased from the enclave."; n.classList.add("green"); }
+    else n.textContent = left + " reveal" + (left === 1 ? "" : "s") + " remain" + (left === 1 ? "s" : "") + ".";
+    show("revealed");
+  } catch (e) {
+    $("rerr").textContent = "decryption failed — wrong or truncated link. one read was still consumed.";
+    $("reveal").disabled = false;
+  }
+});
+copyBtn($("copysecret"), () => $("secretout").textContent);
+
+// ---- burn flow ---------------------------------------------------------------
+let bid = null, btok = null;
+async function initBurn(id, token) {
+  bid = id; btok = token;
+  show("burn");
+  const res = await api("/api/peek", { method: "POST", body: "id=" + encodeURIComponent(id) });
+  if (!res.ok) { show("gone"); return; }
+  $("burnmeta").innerHTML = "this drop is still live: <b>" + res.j.reads_left +
+    "</b> reveal" + (res.j.reads_left === 1 ? "" : "s") + " left, expires in <b>" + fmtDur(res.j.expires_in) + "</b>.";
+}
+$("doburn").addEventListener("click", async () => {
+  $("doburn").disabled = true;
+  const res = await api("/api/burn", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(bid) + "&token=" + encodeURIComponent(btok),
+  });
+  if (res.ok) { $("burnmeta").innerHTML = "<b>erased.</b> the ciphertext is gone; the link is dead."; $("doburn").classList.add("hidden"); }
+  else { $("berr").textContent = (res.j && res.j.error) || "burn failed"; $("doburn").disabled = false; }
+});
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  const h = decodeURIComponent(location.hash.slice(1) || "");
+  if (!h) { show("create"); loadStats(); return; }
+  const burnMode = h.startsWith("!");
+  const body = burnMode ? h.slice(1) : h;
+  const dot = body.indexOf(".");
+  if (dot < 1) { show("gone"); return; }
+  const id = body.slice(0, dot), rest = body.slice(dot + 1);
+  if (burnMode) initBurn(id, rest); else initReceive(id, rest);
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "currently holding " + r.j.drops + " sealed drop" + (r.j.drops === 1 ? "" : "s") +
+      " · " + r.j.consumed + " read out · " + (r.j.expired + r.j.burned) + " erased unread";
+  } catch {}
+}
+</script>
+</body>
+</html>
