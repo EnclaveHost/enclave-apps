@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#ff8c42" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#ff8c42" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- the wire, struck -->
+  <path d="M1040 250 L1230 250 L1270 165 L1310 250 L1520 250" fill="none" stroke="#ff8c42"
+        stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#3a4256">
+    <rect x="1028" y="235" width="20" height="80" rx="5"/>
+    <rect x="1512" y="235" width="20" height="80" rx="5"/>
+  </g>
+  <circle cx="1270" cy="112" r="26" fill="#ffab73"/>
+  <path d="M1270 50 v22 M1204 70 l16 19 M1336 70 l-16 19" stroke="#ff8c42" stroke-width="10" stroke-linecap="round"/>
+  <text x="1120" y="345" font-size="26" fill="#e05e5e">⚠ 1 alarm · 04:12:07</text>
+  <text x="96" y="180" font-size="84" fill="#ff8c42">[ trip <tspan fill="#d7dde8" font-weight="bold">wire</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">canary tokens · an alarm the intruder can't erase</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">plant a link in the file nobody should open — learn the moment they do</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">append-only in attested RAM · records what and when, never who</text>
+</svg>

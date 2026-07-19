@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- trip wire: the taut line, and the moment it's touched. -->
+  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
+  <path d="M14 62 L46 62 L54 46 L62 62 L82 62" fill="none" stroke="#ff8c42" stroke-width="6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#3a4256">
+    <rect x="10" y="56" width="8" height="26" rx="2"/>
+    <rect x="78" y="56" width="8" height="26" rx="2"/>
+  </g>
+  <circle cx="54" cy="30" r="9" fill="#ffab73"/>
+  <path d="M54 14 v6 M40 20 l4 5 M68 20 l-4 5" stroke="#ff8c42" stroke-width="4" stroke-linecap="round"/>
+</svg>
