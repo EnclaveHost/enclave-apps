@@ -1,0 +1,14 @@
+[package]
+name = "backchannel"
+version = "0.1.0"
+edition = "2021"
+description = "E2E-encrypted ephemeral chat rooms — browser-side AES-GCM, room key in the URL fragment, ciphertext relayed blind and forgotten inside an attested enclave"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine and SSE are hand-rolled std. What runs is what you read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

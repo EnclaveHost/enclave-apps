@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#e07ad0" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#e07ad0" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- two bubbles of ciphertext -->
+  <g fill="#e07ad0">
+    <rect x="1130" y="60" width="240" height="110" rx="22"/>
+    <path d="M1170 166 l0 44 44 -44 z"/>
+  </g>
+  <g fill="#f0a3e2">
+    <rect x="1270" y="210" width="220" height="100" rx="22"/>
+    <path d="M1430 306 l0 40 -40 -40 z"/>
+  </g>
+  <g font-size="30" fill="#0b0e14">
+    <text x="1160" y="125">c9•f4•1a•77</text>
+    <text x="1298" y="270">8d•02•e6•b3</text>
+  </g>
+  <text x="96" y="180" font-size="84" fill="#e07ad0">[ back <tspan fill="#d7dde8" font-weight="bold">channel</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">e2e-encrypted rooms, relayed blind</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">the enclave never sees a word — or even a name</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">200-message ring in RAM · rooms die after 2 idle hours</text>
+</svg>

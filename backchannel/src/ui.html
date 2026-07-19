@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>back channel — e2e-encrypted ephemeral rooms</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #e07ad0; --accent-hi: #f0a3e2; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  input.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  button {
+    background: var(--accent); color: #1f0d1c; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* room: presence badge, message ring, composer */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.on { animation: pulse 2s ease-in-out infinite; }
+  .dot.off { background: var(--faint); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .joinrow { display: flex; gap: 8px; margin-top: 14px; }
+  .joinrow input { flex: 1; min-width: 0; }
+  .msgwrap { position: relative; margin-top: 14px; }
+  .msgs {
+    height: 52vh; min-height: 240px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 8px;
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px; padding: 14px;
+  }
+  .msg {
+    max-width: 82%; align-self: flex-start;
+    background: var(--panel); border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 7px 11px; font-size: 13.5px; line-height: 1.5; word-break: break-word;
+  }
+  .msg.own {
+    align-self: flex-end;
+    background: rgba(224, 122, 208, .10); border-color: rgba(224, 122, 208, .4);
+  }
+  .msg.pending { opacity: .55; }
+  .msg .nick { display: block; font-size: 11px; letter-spacing: .05em; margin-bottom: 1px; }
+  .msg .time { display: none; color: var(--faint); font-size: 10.5px; margin-left: 8px; white-space: nowrap; }
+  .msg:hover .time { display: inline; }
+  .sys { align-self: center; color: var(--faint); font-size: 11.5px; }
+  .pill {
+    position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+    border-radius: 999px; padding: 6px 14px; font: 600 12px var(--mono);
+  }
+  .composer { display: flex; gap: 8px; margin-top: 12px; }
+  .composer input { flex: 1; min-width: 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ back <b>channel</b> ]</div>
+    <div class="tag">e2e-encrypted rooms · relayed blind through an attested enclave</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>OPEN A ROOM</h2>
+    <p class="sub">an ephemeral chat room the relay cannot read: this page generates
+    the room key, and it rides the invite link's <b>#fragment</b> — never the wire.</p>
+    <div class="row" style="margin-top:16px">
+      <button id="openbtn">open a room →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>the room key lives only in the link's #fragment — browsers never send it, so the server never holds it</li>
+      <li>every message is AES-256-GCM ciphertext sealed in your browser; even the nicknames travel inside it</li>
+      <li>history is a 200-message ring in enclave RAM — older messages fall off, nothing touches a disk</li>
+      <li>a room dies after 2 idle hours, and the relay is hardware-attested: "blind" is checkable, not marketing</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>ROOM IS OPEN</h2>
+    <p class="sub">share this invite — the part after <b>#</b> is the room key and never reaches any server:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="enterbtn">enter the room →</button>
+      <button class="ghost" onclick="location.href='/'">open another</button>
+    </div>
+  </section>
+
+  <!-- NAME -->
+  <section id="name" class="card hidden">
+    <h2>PICK A NAME</h2>
+    <p class="sub">how this room will see you. it travels inside the ciphertext —
+    the server never learns it.</p>
+    <div class="joinrow">
+      <input id="nickin" class="text" maxlength="24" placeholder="a name for this room…" autocomplete="off">
+      <button id="join">join →</button>
+    </div>
+    <div class="err" id="nerr"></div>
+  </section>
+
+  <!-- CHAT -->
+  <section id="chat" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="here">joining…</span></div>
+    <h2 id="roomtag">#……</h2>
+    <div class="msgwrap">
+      <div class="msgs" id="msgs"></div>
+      <button class="pill hidden" id="pill">new messages ↓</button>
+    </div>
+    <div class="composer">
+      <input id="text" class="text" maxlength="2000" placeholder="say something…" autocomplete="off">
+      <button id="send">send</button>
+    </div>
+    <div class="err" id="rerr"></div>
+  </section>
+
+  <!-- NO KEY -->
+  <section id="nokey" class="card hidden">
+    <h2>KEY MISSING</h2>
+    <p class="sub">you need the full invite link — the part after <b>#</b> is the
+    room key and never reaches the server. without it there is nothing here to
+    read, and the server can't help: it never had the key either. ask whoever
+    invited you to re-send the whole link.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a room of your own</button></div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this room never existed, or went two idle hours without a message
+    and was swept. the server can't tell you which — and either way the ciphertext
+    is gone. rooms leave nothing behind; that's the point.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">open a new room</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  ciphertext in, ciphertext out, in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave before saying anything you'd whisper.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","name","chat","nokey","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+// ---- crypto: AES-256-GCM, iv||ct, base64url — the dead-drop shape ----------
+let roomKey = null;
+async function importRoomKey(b64) {
+  const raw = unb64u(b64);
+  if (raw.length !== 32) throw new Error("bad key");
+  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function sealMsg(obj) {
+  const iv = rand(12);
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv }, roomKey, enc.encode(JSON.stringify(obj))));
+  const blob = new Uint8Array(iv.length + ct.length);
+  blob.set(iv); blob.set(ct, iv.length);
+  return b64u(blob);
+}
+async function openMsg(blobB64) {
+  const blob = unb64u(blobB64);
+  const iv = blob.slice(0, 12), ct = blob.slice(12);
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, roomKey, ct);
+  return JSON.parse(dec.decode(pt));
+}
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newRoomId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("openbtn").addEventListener("click", async () => {
+  $("cerr").textContent = "";
+  $("openbtn").disabled = true;
+  try {
+    const id = newRoomId();
+    const keyBytes = rand(32);
+    const res = await api("/api/rooms", { method: "POST", headers: { "x-room-id": id } });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const invite = location.origin + "/r/" + id + "#k=" + b64u(keyBytes);
+    $("sharelink").value = invite;
+    $("createdmeta").innerHTML = "room <b>#" + id + "</b> · 200-message ring · dies after 2 idle hours";
+    $("enterbtn").onclick = () => { location.href = invite; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("openbtn").disabled = false;
+  }
+});
+copyBtn($("copyshare"), () => $("sharelink").value);
+
+// ---- room flow ---------------------------------------------------------------
+let rid = null, myNick = null, es = null;
+let histSeq = 0, lastN = 0, histLoaded = false, syncing = false;
+const seen = new Set(); // message numbers already rendered
+const queue = []; // msg events that raced the history fetch
+const pendingByBlob = new Map(); // blob -> bubble, optimistic sends awaiting echo
+
+async function initRoom(id) {
+  rid = id;
+  const m = /(?:^|[#&])k=([^&]+)/.exec(location.hash.slice(1));
+  if (!m) { show("nokey"); return; }
+  try { roomKey = await importRoomKey(decodeURIComponent(m[1])); }
+  catch { show("nokey"); return; }
+  myNick = localStorage.getItem("backchannel-nick-" + rid);
+  if (!myNick) { show("name"); $("nickin").focus(); return; }
+  enterChat();
+}
+
+$("join").addEventListener("click", () => {
+  const nick = $("nickin").value.trim();
+  if (!nick) { $("nerr").textContent = "pick something — it never leaves this page unencrypted."; return; }
+  localStorage.setItem("backchannel-nick-" + rid, nick);
+  myNick = nick;
+  enterChat();
+});
+$("nickin").addEventListener("keydown", (e) => { if (e.key === "Enter") $("join").click(); });
+
+async function enterChat() {
+  show("chat");
+  $("roomtag").textContent = "#" + rid.slice(0, 6) + "…";
+  $("roomtag").title = "#" + rid;
+  subscribe();
+  const res = await api("/api/history?id=" + encodeURIComponent(rid));
+  if (!res.ok) { if (es) es.close(); show("gone"); return; }
+  histSeq = res.j.seq;
+  let lostRun = 0;
+  const flushLost = () => {
+    if (!lostRun) return;
+    addSys("· " + lostRun + " message" + (lostRun === 1 ? "" : "s") + " couldn't be decrypted ·");
+    lostRun = 0;
+  };
+  for (const m of res.j.msgs) {
+    seen.add(m.n);
+    lastN = Math.max(lastN, m.n);
+    let inner;
+    try { inner = await openMsg(m.blob); } catch { lostRun++; continue; }
+    flushLost();
+    addBubble(inner, m);
+  }
+  flushLost();
+  histLoaded = true;
+  const raced = queue.splice(0);
+  for (const m of raced) handleMsg(m);
+  scrollBottom();
+  $("text").focus();
+}
+
+// ---- messages ----------------------------------------------------------------
+const NICK_HUES = ["#7ab8e0", "#6fcf8f", "#e8a34c", "#a78bfa", "#5fd0c7", "#e0997a", "#cdd06f", "#8ea6e8"];
+const nickHue = (nick) => {
+  let h = 0;
+  for (const c of nick) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return NICK_HUES[h % NICK_HUES.length];
+};
+
+function addBubble(inner, m) {
+  const own = inner.nick === myNick;
+  const el = document.createElement("div");
+  el.className = "msg" + (own ? " own" : "");
+  if (!own) {
+    const nk = document.createElement("span");
+    nk.className = "nick";
+    nk.textContent = inner.nick || "?";
+    nk.style.color = nickHue(inner.nick || "?");
+    el.append(nk);
+  }
+  const body = document.createElement("span");
+  body.textContent = inner.text || "";
+  el.append(body);
+  const tm = document.createElement("span");
+  tm.className = "time";
+  tm.textContent = fmtTime(inner.t || (m ? m.ts * 1000 : Date.now()));
+  el.append(tm);
+  $("msgs").append(el);
+  return el;
+}
+
+function addSys(text) {
+  const el = document.createElement("div");
+  el.className = "sys";
+  el.textContent = text;
+  $("msgs").append(el);
+}
+
+async function handleMsg(m) {
+  if (m.n <= histSeq || seen.has(m.n)) return; // replay of what history gave us
+  seen.add(m.n);
+  lastN = Math.max(lastN, m.n);
+  const mine = pendingByBlob.get(m.blob);
+  if (mine) { // our own message echoed back — settle the optimistic bubble
+    pendingByBlob.delete(m.blob);
+    mine.classList.remove("pending");
+    return;
+  }
+  const stick = atBottom();
+  try { addBubble(await openMsg(m.blob), m); }
+  catch { addSys("· 1 message couldn't be decrypted ·"); }
+  if (stick) scrollBottom(); else $("pill").classList.remove("hidden");
+}
+
+async function send() {
+  const text = $("text").value.trim();
+  if (!text) return;
+  $("rerr").textContent = "";
+  const inner = { nick: myNick, text, t: Date.now() };
+  let blob;
+  try { blob = await sealMsg(inner); } catch { $("rerr").textContent = "encryption failed."; return; }
+  if (blob.length > 8 * 1024) { $("rerr").textContent = "too long for one message — split it up."; return; }
+  const el = addBubble(inner, null);
+  el.classList.add("pending");
+  pendingByBlob.set(blob, el);
+  $("text").value = "";
+  scrollBottom();
+  const res = await api("/api/msg", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(rid) + "&blob=" + blob,
+  });
+  if (!res.ok) {
+    pendingByBlob.delete(blob);
+    el.remove();
+    $("text").value = text;
+    if (res.status === 404) { show("gone"); return; }
+    $("rerr").textContent = (res.j && res.j.error) || ("send failed (" + res.status + ")");
+  }
+  // settled by the SSE echo: the `msg` event carrying our blob (and its n)
+}
+$("send").addEventListener("click", send);
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+
+// ---- scroll: stick to the bottom unless the reader wandered up ---------------
+const atBottom = () => {
+  const el = $("msgs");
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+};
+function scrollBottom() {
+  const el = $("msgs");
+  el.scrollTop = el.scrollHeight;
+  $("pill").classList.add("hidden");
+}
+$("msgs").addEventListener("scroll", () => { if (atBottom()) $("pill").classList.add("hidden"); });
+$("pill").addEventListener("click", scrollBottom);
+
+// ---- SSE ----------------------------------------------------------------------
+function subscribe() {
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(rid));
+  es.onopen = () => { setLive(true); if (histLoaded) catchUp(); };
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial unnamed event: {present}
+    setLive(true);
+    try { const j = JSON.parse(ev.data); if ("present" in j) setPresent(j.present); } catch {}
+  };
+  es.addEventListener("present", (ev) => {
+    try { setPresent(JSON.parse(ev.data).present); } catch {}
+  });
+  es.addEventListener("msg", (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    if (!histLoaded) { queue.push(m); return; }
+    handleMsg(m);
+  });
+}
+async function catchUp() { // an SSE gap can hide messages; the ring replays them
+  if (syncing) return;
+  syncing = true;
+  try {
+    const res = await api("/api/history?id=" + encodeURIComponent(rid));
+    if (res.ok) for (const m of res.j.msgs) if (m.n > lastN) handleMsg(m);
+  } finally { syncing = false; }
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("dot").classList.toggle("on", on);
+}
+function setPresent(n) {
+  $("here").textContent = n + " here";
+}
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/r/")) {
+    const m = /^\/r\/([a-z0-9]{10,16})$/.exec(location.pathname);
+    if (m) initRoom(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "holding " + r.j.rooms + " room" + (r.j.rooms === 1 ? "" : "s") +
+      " · " + r.j.messages + " message" + (r.j.messages === 1 ? "" : "s") + " in the ring" +
+      " · lifetime " + r.j.lifetime_rooms + " rooms, " + r.j.lifetime_messages + " relayed";
+  } catch {}
+}
+</script>
+</body>
+</html>

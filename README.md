@@ -25,6 +25,7 @@ app's README (and `wasm/apps/README.md` in the
 | [ballot](ballot/) | Anonymous polls sealed inside the enclave until close — the creator can't peek either. |
 | [pixelboard](pixelboard/) | A shared 128×128 pixel canvas in enclave RAM: paint together while it's funded. |
 | [handoff](handoff/) | Files through an attested enclave: chunked browser-side AES-GCM, erased on delivery. |
+| [backchannel](backchannel/) | E2E-encrypted ephemeral chat rooms — the enclave relays ciphertext blind. |
 
 ## Building
 
