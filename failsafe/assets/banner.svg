@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#e05e5e" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#e05e5e" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- the hourglass-keyhole, large -->
+  <g transform="translate(1210,55)" >
+    <path d="M0 0 h180 v24 c0 50 -50 70 -70 100 20 30 70 50 70 100 v24 h-180 v-24 c0 -50 50 -70 70 -100 -20 -30 -70 -50 -70 -100 z" fill="#e05e5e"/>
+    <circle cx="90" cy="196" r="20" fill="#0b0e14"/>
+    <rect x="80" y="204" width="20" height="30" fill="#0b0e14"/>
+    <rect x="60" y="16" width="60" height="16" rx="6" fill="#f28b8b"/>
+  </g>
+  <text x="1180" y="370" font-size="24" fill="#5a6375">releases in 71:59:42…</text>
+  <text x="96" y="180" font-size="84" fill="#e05e5e">[ fail <tspan fill="#d7dde8" font-weight="bold">safe</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">secrets that outlive silence</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">time capsules and dead man's switches, sealed in an attested enclave</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">nobody opens early · nobody suppresses the release · check in, or it speaks</text>
+</svg>
