@@ -1,0 +1,15 @@
+[package]
+name = "handoff"
+version = "0.1.0"
+edition = "2021"
+description = "Files through an attested enclave — chunked AES-GCM in the browser, key in the URL fragment, ciphertext held in enclave RAM and erased on delivery"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

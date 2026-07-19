@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- hand off: a parcel mid-flight between two points. -->
+  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
+  <g fill="#5a8bf5">
+    <rect x="14" y="60" width="14" height="14" rx="3"/>
+    <rect x="68" y="22" width="14" height="14" rx="3"/>
+  </g>
+  <rect x="34" y="34" width="28" height="28" rx="5" fill="#8db0ff"/>
+  <g fill="#3a4256">
+    <rect x="24" y="52" width="8" height="8" rx="2"/>
+    <rect x="64" y="36" width="8" height="8" rx="2"/>
+  </g>
+</svg>
