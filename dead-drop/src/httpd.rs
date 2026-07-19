@@ -100,6 +100,7 @@ struct Conn {
     state: ConnState,
     last_activity: Instant,
     keep_alive: bool,
+    sent_continue: bool,
 }
 
 pub struct Server {
@@ -172,6 +173,7 @@ impl Server {
                         state: ConnState::Http { since: Instant::now(), reading_body: false },
                         last_activity: Instant::now(),
                         keep_alive: true,
+                        sent_continue: false,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -240,9 +242,19 @@ impl Server {
                         }
                         *since = Instant::now();
                         *reading_body = false;
+                        conn.sent_continue = false;
                         out.push((i, req));
                     }
-                    Parse::Partial { in_body } => *reading_body = in_body,
+                    Parse::Partial { in_body } => {
+                        *reading_body = in_body;
+                        // curl and friends send `Expect: 100-continue` and
+                        // stall a beat waiting for the interim response
+                        // before uploading the body — oblige immediately.
+                        if in_body && !conn.sent_continue && expects_continue(&conn.rbuf) {
+                            conn.sent_continue = true;
+                            conn.wbuf.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
+                        }
+                    }
                     Parse::Bad(status, reason) => overflow(conn, status, reason),
                 }
             }
@@ -436,6 +448,18 @@ fn try_parse(rbuf: &mut Vec<u8>, max_body: usize) -> Parse {
 
 fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Case-insensitive scan of a complete header block for `expect: 100-continue`.
+fn expects_continue(rbuf: &[u8]) -> bool {
+    let Some(head_end) = find_crlfcrlf(rbuf) else { return false };
+    let Ok(head) = std::str::from_utf8(&rbuf[..head_end]) else { return false };
+    head.split("\r\n").skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("expect")
+                && v.trim().eq_ignore_ascii_case("100-continue")
+        })
+    })
 }
 
 pub fn url_decode(s: &str) -> Option<String> {
