@@ -92,6 +92,23 @@ fn attached_volumes() -> Vec<String> {
         .collect()
 }
 
+/// The volume names whose graphs the manager put on the wasmtime cmdline at
+/// tenant boot (ENCLAVE_NN_PRELOADS). The graph registry is sealed at process
+/// start, so this is the complete list of names load_by_name() can ever find:
+/// a NotFound on a listed name means the boot preload FAILED (loudly, in the
+/// tenant log); on an unlisted name the host never tried (volume mounted
+/// late, over the VRAM budget, or no unambiguous file). None = the manager
+/// predates the env - no signal, keep the generic diagnosis.
+fn preloaded_graphs() -> Option<Vec<String>> {
+    std::env::var("ENCLAVE_NN_PRELOADS").ok().map(|v| {
+        v.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
 /// Resolve a config path against the model volume: absolute paths are used
 /// verbatim (cross-VOLUME reads - e.g. a tokenizer living in a sibling
 /// volume when the weights repo carries none), everything else is
@@ -434,6 +451,51 @@ fn nn_err(stage: &str, e: bindings::wasi::nn::errors::Error) -> String {
     format!("{stage}: {:?}: {}", e.code(), e.data())
 }
 
+/// Diagnose a failed ggml load_by_name(). A NotFound is NOT one condition -
+/// the graph registry seals at process start, so it splits three ways, and
+/// telling users the wrong one ("volume missing" for a model the platform is
+/// about to load) was exactly the confusion seen live 2026-07-18:
+///   volume dir absent        -> operator error: attach the volume
+///   name in ENCLAVE_NN_PRELOADS -> the boot preload FAILED (tenant log)
+///   name not in it           -> the host never tried: mounted late (the
+///                               platform detects and restarts) or over the
+///                               VRAM budget (the ladder marks it unfit)
+/// The [code] marker rides in the message; json_err lifts it into the error
+/// object's machine-readable `code` and strips it from the text.
+fn ggml_load_err(cfg: &AppConfig, e: bindings::wasi::nn::errors::Error) -> String {
+    use bindings::wasi::nn::errors::ErrorCode;
+    let not_found = matches!(e.code(), ErrorCode::NotFound);
+    let base = nn_err("load_by_name", e);
+    let vol = &cfg.model_volume;
+    if !not_found {
+        return format!("{base} (loading \"{vol}\")");
+    }
+    if !PathBuf::from(MODELS_ROOT).join(vol).is_dir() {
+        return format!(
+            "[volume_not_attached] {base} - the \"{vol}\" volume is not attached; deploy \
+             with {{\"volumes\":[\"{vol}\"]}} in the config, or tick it in the console's \
+             volume picker"
+        );
+    }
+    match preloaded_graphs() {
+        Some(pre) if pre.iter().any(|p| p == vol) => format!(
+            "[host_load_failed] {base} - the host tried to load \"{vol}\" when this \
+             deployment started and FAILED (the deployment log has the reason); if this \
+             persists, the deployment's share cannot hold the model"
+        ),
+        Some(_) => format!(
+            "[model_not_loaded] {base} - \"{vol}\" is attached but was not loaded when \
+             this deployment started (the volume finished mounting later, or it exceeds \
+             the share's VRAM budget); the platform restarts the deployment to load it - \
+             retry shortly"
+        ),
+        None => format!(
+            "{base} (is the \"{vol}\" volume attached, and does it carry a GGUF? \
+             ggml needs a GPU-share deployment - the host preloads the model)"
+        ),
+    }
+}
+
 // ------------------------------------------------------------- generation --
 
 struct StepResult {
@@ -516,14 +578,7 @@ impl Session {
     fn open(cfg: &AppConfig, target: ExecutionTarget) -> Result<Session, String> {
         match cfg.backend.as_str() {
             "ggml" => {
-                let graph = load_by_name(&cfg.model_volume).map_err(|e| {
-                    format!(
-                        "{} (is the \"{}\" volume attached, and does it carry a GGUF? \
-                         ggml needs a GPU-share deployment - the host preloads the model)",
-                        nn_err("load_by_name", e),
-                        cfg.model_volume
-                    )
-                })?;
+                let graph = load_by_name(&cfg.model_volume).map_err(|e| ggml_load_err(cfg, e))?;
                 let ctx = graph.init_execution_context().map_err(|e| nn_err("init", e))?;
                 Ok(Session::Ggml { ctx })
             }
@@ -897,14 +952,33 @@ fn respond_with_cache(
     let _ = OutgoingBody::finish(body, None);
 }
 
+/// Machine-readable conditions ggml_load_err() tags inside its messages (as
+/// "[code] "); json_err lifts the tag into `error.code` so the playground can
+/// render the right state instead of pattern-matching prose.
+const ERR_CODES: &[&str] = &["model_not_loaded", "host_load_failed", "volume_not_attached"];
+
+/// Drop the "[code] " marker from a message bound for a payload without a
+/// code field of its own (the chat stream / SSE error lines).
+fn strip_code(msg: &str) -> String {
+    let mut m = msg.to_string();
+    for c in ERR_CODES {
+        m = m.replacen(&format!("[{c}] "), "", 1);
+    }
+    m
+}
+
 fn json_err(out: ResponseOutparam, status: u16, msg: &str) {
+    let code = ERR_CODES.iter().copied().find(|c| msg.contains(&format!("[{c}] ")));
+    let msg = strip_code(msg);
+    let mut err = serde_json::json!({ "message": msg, "type": "invalid_request_error" });
+    if let Some(c) = code {
+        err["code"] = serde_json::json!(c);
+    }
     respond_bytes(
         out,
         status,
         "application/json",
-        serde_json::json!({ "error": { "message": msg, "type": "invalid_request_error" } })
-            .to_string()
-            .as_bytes(),
+        serde_json::json!({ "error": err }).to_string().as_bytes(),
     );
 }
 
@@ -997,7 +1071,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         }
     }
     if !ok && !last_err.is_empty() {
-        send(serde_json::json!({ "error": last_err }));
+        send(serde_json::json!({ "error": strip_code(&last_err) }));
     }
     drop(stream);
     let _ = OutgoingBody::finish(body, None);
@@ -1099,7 +1173,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             None => {
                 let _ = send_raw(&format!(
                     "data: {}\n\n",
-                    serde_json::json!({ "error": { "message": last_err, "type": "server_error" } })
+                    serde_json::json!({ "error": { "message": strip_code(&last_err), "type": "server_error" } })
                 ));
             }
         }
@@ -1267,7 +1341,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
             }
             Err(err) => ladder.push(serde_json::json!({
                 "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
-                "ok": false, "error": err,
+                "ok": false, "error": strip_code(&err),
             })),
         }
     }
@@ -1288,6 +1362,11 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
 fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     let entries = available_models(raw);
     let unfit = over_budget(&entries);
+    // ENCLAVE_NN_PRELOADS: which ggml volumes the host actually loaded at
+    // boot. `preloaded: false` on a fitting model lets the playground say
+    // "waiting for the host" up front instead of probing into a NotFound
+    // and calling the model missing. Absent on older managers (no field).
+    let preloads = preloaded_graphs();
     let body = serde_json::json!({
         "default": entries.first().map(|e| e.cfg.name.clone()),
         "vram_budget": vram_budget(),
@@ -1299,6 +1378,11 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
             });
             if let Some(why) = unfit.get(&e.volume) {
                 m["why"] = serde_json::json!(why);
+            }
+            if e.cfg.backend == "ggml" {
+                if let Some(pre) = &preloads {
+                    m["preloaded"] = serde_json::json!(pre.iter().any(|p| p == &e.volume));
+                }
             }
             m
         }).collect::<Vec<_>>(),

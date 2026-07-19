@@ -864,6 +864,8 @@ const state = {
   models: [],
   model: "",
   unfit: {},        // model name -> error, from the warmup ladder: attached but does not fit this deployment's share
+  hostPending: {},  // model name -> error: attached and fits, but the HOST hasn't loaded it (yet) - the platform
+                    // restarts the deployment to load it, so this state is transient; the boot ladder re-polls
   target: "auto",
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
@@ -1599,9 +1601,16 @@ function renderModelMenu() {
       '<span class="m-name"></span><span class="m-sub"></span></span><span class="tick">' + ICONS.tick + "</span></button>");
     item.querySelector(".m-name").textContent = m.label || m.name;
     // a model the warmup ladder reported unfit is visible but not selectable:
-    // it IS attached, this deployment just cannot hold it - redeploy bigger
+    // it IS attached, this deployment just cannot hold it - redeploy bigger.
+    // hostPending is the TRANSIENT sibling: attached and fits, the host just
+    // hasn't loaded it (yet) - the platform is on it, the ladder re-polls.
     const unfit = m.name && state.unfit[m.name];
-    if (unfit) {
+    const pending = m.name && state.hostPending[m.name];
+    if (pending) {
+      item.disabled = true;
+      item.title = pending;
+      item.querySelector(".m-sub").textContent = "loading on the host…";
+    } else if (unfit) {
       item.disabled = true;
       item.title = unfit;
       item.querySelector(".m-sub").textContent = "needs a larger deployment";
@@ -1702,7 +1711,14 @@ async function warm() {
     if (res.ok && d.ok) {
       pill("ok", ICONS.tick, " Ready · " + d.target + " · " + ((Date.now() - t0) / 1000).toFixed(1) + "s", 5000);
     } else {
-      pill("fail", ICONS.alert, " Warmup failed — the first reply will load the model", 10000);
+      const code = d.error && d.error.code;
+      if (code === "model_not_loaded" || code === "host_load_failed") {
+        // not a capacity verdict: the host hasn't loaded (or reload-pending)
+        // this model - the platform restarts the deployment to fix it
+        pill("fail", ICONS.alert, " Model isn’t loaded on the host yet — the platform is on it, try again shortly", 12000);
+      } else {
+        pill("fail", ICONS.alert, " Warmup failed — the first reply will load the model", 10000);
+      }
       warmPill.title = (d.error && d.error.message) || ("HTTP " + res.status);
     }
   } catch (_) {
@@ -1733,6 +1749,12 @@ $("bootSkip").addEventListener("click", dismissBoot);
 // network hiccup/timeout does NOT - the host keeps loading regardless, and
 // a chat request would attach to that load. The overlay dismisses at the
 // FIRST warm model (chat works from then on); the pill carries the rest.
+// Re-poll budget for models the HOST hasn't loaded yet (hostPending): the
+// platform restarts the deployment to load them, which takes a restart plus
+// a multi-GB VRAM lift - poll gently, give up loudly.
+const BOOT_RETRY_MS = 15000, BOOT_RETRY_MAX = 40;   // ~10 minutes
+let bootRetries = 0;
+
 async function warmLadder() {
   const ladder = state.models.slice().sort((a, b) => (a.bytes || 0) - (b.bytes || 0));
   if (!ladder.length) {
@@ -1742,6 +1764,7 @@ async function warmLadder() {
     return warm();
   }
   state.unfit = {};
+  state.hostPending = {};
   bootList.innerHTML = "";
   const rows = {};
   for (const m of ladder) {
@@ -1754,6 +1777,16 @@ async function warmLadder() {
   const q = state.target === "cpu" ? "&target=cpu" : "";
   const t0 = Date.now();
   let warmed = 0, unfitCount = 0, largestOk = null;
+  const markPending = (m, li, why, sub) => {
+    // attached and fits, but the HOST hasn't loaded it: the platform
+    // detects this and restarts the deployment, so keep the spinner -
+    // "missing" would be a lie, the model is on its way
+    state.hostPending[m.name] = why;
+    li.classList.add("warming");
+    li.querySelector(".st").innerHTML = '<span class="spin"></span>';
+    li.querySelector(".b-sub").textContent = sub;
+    li.title = why;
+  };
   for (let i = 0; i < ladder.length; i++) {
     const m = ladder[i];
     const li = rows[m.name];
@@ -1770,18 +1803,31 @@ async function warmLadder() {
       renderModelMenu();
       continue;
     }
+    // /models also knows which ggml volumes the host never loaded at boot
+    // (preloaded: false, from ENCLAVE_NN_PRELOADS): probing one can only
+    // NotFound, so skip straight to the honest "loading on the host" state
+    if (m.preloaded === false) {
+      markPending(m, li, "the host has not loaded this model yet - the platform "
+        + "restarts the deployment to load it", "loading on the host…");
+      renderModelMenu();
+      continue;
+    }
     li.classList.add("warming");
     li.querySelector(".st").innerHTML = '<span class="spin"></span>';
     bootMsg.textContent = "Warming " + m.name + " (" + (i + 1) + " of " + ladder.length + ")…";
     if (bootGone) pill("", '<span class="spin"></span>', "Warming " + m.name + " (" + (i + 1) + "/" + ladder.length + ")…");
     const t1 = Date.now();
-    let ok = false, unfit = false, err = "";
+    let ok = false, unfit = false, code = null, err = "";
     try {
       const res = await fetch("warmup?model=" + encodeURIComponent(m.name) + q,
         { signal: AbortSignal.timeout(600000) });
       const d = await res.json().catch(() => ({}));
       ok = res.ok && !!d.ok;
-      if (!ok) { unfit = true; err = (d.error && d.error.message) || ("HTTP " + res.status); }
+      if (!ok) {
+        unfit = true;
+        code = (d.error && d.error.code) || null;
+        err = (d.error && d.error.message) || ("HTTP " + res.status);
+      }
     } catch (_) { err = "warmup did not finish"; }
     li.classList.remove("warming");
     if (ok) {
@@ -1791,6 +1837,13 @@ async function warmLadder() {
       li.querySelector(".st").innerHTML = ICONS.tick;
       li.querySelector(".b-sub").textContent = ((Date.now() - t1) / 1000).toFixed(1) + "s";
       dismissBoot(); // first warm model: the app is usable now
+    } else if (code === "model_not_loaded" || code === "host_load_failed") {
+      // NOT a fit verdict: the host never loaded the graph (volume mounted
+      // after boot) or its boot load failed - both self-heal by a platform
+      // restart of the deployment, so this ladder re-polls instead of
+      // declaring the model missing
+      markPending(m, li, err, code === "host_load_failed"
+        ? "host load failed — recovering…" : "loading on the host…");
     } else if (unfit) {
       unfitCount++;
       state.unfit[m.name] = err;
@@ -1799,23 +1852,49 @@ async function warmLadder() {
       li.querySelector(".b-sub").textContent = "needs more resources";
       li.title = err;
     } else {
-      li.classList.add("unfit");
-      li.querySelector(".st").innerHTML = ICONS.alert;
-      li.querySelector(".b-sub").textContent = err;
+      // no server verdict (network error / deployment mid-restart): keep it
+      // pending - the re-poll below decides, not one failed fetch
+      markPending(m, li, err, "retrying…");
     }
     renderModelMenu();
   }
-  // the preselected model didn't fit: fall to the largest that warmed. The
-  // localStorage preference survives untouched, so a larger redeploy
-  // restores the user's pick.
-  if (state.unfit[state.model] && largestOk) {
+  // the preselected model didn't fit (or is still loading host-side): fall
+  // to the largest that warmed. The localStorage preference survives
+  // untouched, so a larger redeploy restores the user's pick.
+  if ((state.unfit[state.model] || state.hostPending[state.model]) && largestOk) {
     state.model = largestOk;
     modelLabel.textContent = largestOk;
     renderModelMenu();
   }
+  // models the host hasn't loaded yet resolve by a deployment restart the
+  // platform performs on its own - re-poll until they do (or the budget
+  // runs out). /models is re-fetched first so a healed deployment's fresh
+  // preloaded/fits flags replace the stale ones.
+  const pending = Object.keys(state.hostPending);
+  if (pending.length && bootRetries < BOOT_RETRY_MAX) {
+    bootRetries++;
+    const wait = "Waiting for the host to load " + pending.join(", ")
+      + " — retrying (" + bootRetries + "/" + BOOT_RETRY_MAX + ")…";
+    if (!warmed) bootMsg.textContent = wait;
+    if (bootGone || warmed) { pill("", '<span class="spin"></span>', " " + wait); }
+    setTimeout(async () => {
+      try {
+        const res = await fetch("models");
+        const models = (await res.json()).models || [];
+        if (models.length) state.models = models;
+      } catch (_) {}   // deployment mid-restart: keep the stale list, retry anyway
+      warmLadder();
+    }, BOOT_RETRY_MS);
+    return;   // keep the overlay (or pill) alive - this boot isn't settled
+  }
+  if (!pending.length) bootRetries = 0;   // settled: a later re-ladder gets a fresh budget
   const secs = ((Date.now() - t0) / 1000).toFixed(1) + "s";
-  const unfitTitle = () => Object.entries(state.unfit).map(([m, e]) => m + ": " + e).join("\n");
-  if (!warmed && unfitCount >= ladder.length) {
+  const unfitTitle = () => Object.entries(state.unfit).concat(Object.entries(state.hostPending))
+    .map(([m, e]) => m + ": " + e).join("\n");
+  if (!warmed && pending.length) {
+    pill("fail", ICONS.alert, " The host never finished loading the model — redeploy or check the deployment logs", 15000);
+    warmPill.title = unfitTitle();
+  } else if (!warmed && unfitCount >= ladder.length) {
     pill("fail", ICONS.alert, " No attached model fits this deployment — add resources or attach smaller models", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed) {
