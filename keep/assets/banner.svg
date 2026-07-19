@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#2dd4bf" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#2dd4bf" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- the notebook, latched -->
+  <g transform="translate(1200,60)">
+    <rect x="0" y="0" width="230" height="280" rx="14" fill="#2dd4bf"/>
+    <rect x="0" y="0" width="42" height="280" rx="12" fill="#22a89a"/>
+    <g fill="#06201c">
+      <rect x="70" y="52" width="120" height="12" rx="5"/>
+      <rect x="70" y="92" width="120" height="12" rx="5"/>
+      <rect x="70" y="132" width="80" height="12" rx="5"/>
+    </g>
+    <circle cx="150" cy="210" r="20" fill="#06201c"/>
+    <rect x="140" y="210" width="20" height="30" rx="3" fill="#06201c"/>
+  </g>
+  <text x="96" y="180" font-size="84" fill="#2dd4bf">[ <tspan fill="#d7dde8" font-weight="bold">keep</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">a notebook only your wallet can open</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">notes decrypt into the enclave's ramdisk · sync re-encrypts them to your bucket</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">the operator and the network only ever see ciphertext</text>
+</svg>
