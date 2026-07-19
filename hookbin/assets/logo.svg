@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- hook bin: the payload drops in, the hook holds. -->
+  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
+  <g fill="none" stroke="#4cc9e8" stroke-width="9" stroke-linecap="round">
+    <path d="M48 22 v30"/>
+    <path d="M48 52 a14 14 0 1 1 -25 -8"/>
+  </g>
+  <circle cx="48" cy="22" r="7" fill="#7adcf5"/>
+</svg>
