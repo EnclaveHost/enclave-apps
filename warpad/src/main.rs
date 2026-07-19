@@ -22,6 +22,7 @@
 //!
 //! API (bodies are opaque blobs or `k=v&` forms; JSON is emit-only):
 //!   POST /api/pads       header x-pad-id                -> {ok}
+//!   POST /api/leave      id=<pad>&s=<tag>               -> {ok} always (beacon)
 //!   POST /api/save       id=<pad>&v=<base>&blob=<b64u>  -> {ok, version} | 409 {version, blob}
 //!   GET  /api/pad?id=<pad>                              -> {version, blob, expires_in}
 //!   GET  /api/stream?id=<pad>                           -> SSE `doc` / `present` on topic <id>
@@ -67,7 +68,7 @@ fn now() -> u64 {
 }
 
 fn main() {
-    let mut srv = Server::bind("warpad/0.1.0", 8080);
+    let mut srv = Server::bind("warpad/0.1.1", 8080);
     let mut app = App {
         pads: HashMap::new(),
         total_bytes: 0,
@@ -153,6 +154,7 @@ fn route(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
             ),
         ),
         ("POST", "/api/pads") => api_pads(app, req),
+        ("POST", "/api/leave") => api_leave(app, srv, req),
         ("POST", "/api/save") => api_save(app, srv, req),
         ("GET", "/api/pad") => api_pad(app, req),
         ("GET", "/api/stream") => return api_stream(app, srv, key, req),
@@ -307,7 +309,42 @@ fn api_stream(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
                 p.version, p.blob
             );
             srv.upgrade_sse(key, &id, &initial);
+            // An opaque per-tab stream token lets a leave beacon name this
+            // exact stream later — a proxy hop may hold the socket open
+            // long after the tab is gone, and presence shouldn't lie.
+            if let Some(tag) = form_get(&req.query, "s").filter(|t| valid_tag(t)) {
+                srv.tag_sse(key, &tag);
+            }
         }
         Err(resp) => srv.respond(key, resp),
     }
+}
+
+/// Stream tokens are whatever opaque random string the browser minted:
+/// never stored, never logged, compared only to close the right stream.
+fn valid_tag(t: &str) -> bool {
+    (8..=64).contains(&t.len())
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `sendBeacon` on pagehide: close the named stream now instead of waiting
+/// for a proxy to notice the tab died. Fire-and-forget by design — the
+/// answer is 200 whatever happened, so a beacon can't probe pad ids.
+fn api_leave(app: &mut App, srv: &mut Server, req: &Request) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let id = form_get(&body, "id").unwrap_or_default();
+    let tag = form_get(&body, "s").unwrap_or_default();
+    if valid_id(&id) && valid_tag(&tag) && srv.drop_sse(&id, &tag) > 0 {
+        // The count changed this instant; tell the pad now, not next tick —
+        // and record it, so the tick doesn't re-broadcast a stale value.
+        let n = srv.sse_count(&id);
+        if let Some(pad) = app.pads.get_mut(&id) {
+            pad.last_present = n;
+            if n > 0 {
+                srv.broadcast(&id, &format!("event: present\ndata: {{\"present\":{n}}}"));
+            }
+        }
+    }
+    json(200, "OK", "{\"ok\":true}".into())
 }

@@ -16,7 +16,8 @@
 //! API (bodies are `k=v&` forms; JSON is emit-only):
 //!   GET  /api/board            -> {w,h,palette,placed,version,painting,board:b64}
 //!   POST /api/px  i=&c=&s=     -> {ok,wait_ms} · on cooldown 429 {wait_ms}
-//!   GET  /api/stream           -> SSE: "px" delta batches, "n" live counts
+//!   GET  /api/stream?s=<tag>   -> SSE: "px" delta batches, "n" live counts
+//!   POST /api/leave  s=<tag>   -> {ok} always (pagehide beacon)
 //!   GET  /api/stats            -> counts only, never tokens
 //!   GET  /            UI        GET /ping    liveness
 
@@ -64,7 +65,7 @@ fn now_ms() -> u64 {
 }
 
 fn main() {
-    let mut srv = Server::bind("pixelboard/0.1.0", 8080);
+    let mut srv = Server::bind("pixelboard/0.1.1", 8080);
     let mut app = App {
         board: vec![0u8; CELLS],
         sessions: HashMap::new(),
@@ -78,6 +79,18 @@ fn main() {
         for (key, req) in srv.poll(MAX_BODY) {
             if req.method == "GET" && req.path == "/api/stream" {
                 srv.upgrade_sse(key, "board", "");
+                // An opaque per-tab stream token lets a leave beacon name
+                // this exact stream later — a proxy hop may hold the socket
+                // open long after the tab is gone, and "painting now"
+                // shouldn't count hands that left.
+                if let Some(tag) = form_get(&req.query, "s").filter(|t| valid_tag(t)) {
+                    srv.tag_sse(key, &tag);
+                }
+                continue;
+            }
+            if req.method == "POST" && req.path == "/api/leave" {
+                let resp = api_leave(&mut srv, &req, app.placed);
+                srv.respond(key, resp);
                 continue;
             }
             let painting = srv.sse_count("board");
@@ -174,6 +187,34 @@ fn valid_session(s: &str) -> bool {
     (16..=64).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Stream tokens are whatever opaque random string the browser minted —
+/// deliberately NOT the cooldown session token, which is per-person: this
+/// one names a socket and nothing else. Never stored, never logged.
+fn valid_tag(t: &str) -> bool {
+    (8..=64).contains(&t.len())
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// `sendBeacon` on pagehide: close the named stream now instead of waiting
+/// for a proxy to notice the tab died. There is one board, so an `id=` in
+/// the body (the suite's shape) is accepted and ignored. Fire-and-forget by
+/// design — the answer is 200 whatever happened, so a beacon tells a prober
+/// nothing about which streams exist.
+fn api_leave(srv: &mut Server, req: &Request, placed: u64) -> Response {
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let tag = form_get(&body, "s").unwrap_or_default();
+    if valid_tag(&tag) && srv.drop_sse("board", &tag) > 0 {
+        // The count changed this instant; say so now, not up to 5s later.
+        let ev = format!(
+            "event: n\ndata: {{\"painting\":{},\"placed\":{placed}}}",
+            srv.sse_count("board")
+        );
+        srv.broadcast("board", &ev);
+    }
+    json(200, "OK", "{\"ok\":true}".into())
 }
 
 fn api_px(app: &mut App, req: &Request) -> Response {

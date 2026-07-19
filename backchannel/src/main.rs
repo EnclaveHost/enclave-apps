@@ -71,7 +71,7 @@ fn now() -> u64 {
 }
 
 fn main() {
-    let mut srv = Server::bind("backchannel/0.1.1", 8080);
+    let mut srv = Server::bind("backchannel/0.1.2", 8080);
     let mut app = App {
         rooms: HashMap::new(),
         total_bytes: 0,

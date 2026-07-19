@@ -30,6 +30,12 @@ alice's browser                  the enclave                 everyone in the roo
   the same 404 — holding a dead invite proves nothing about what was said.
 - **Presence is a count.** Subscribers learn how many streams are open,
   never who is behind them. Logs carry counts, never ids or blobs.
+  Presence is *self-reported liveness*: a tab names its own stream with an
+  opaque per-tab tag and a `pagehide` beacon (`POST /api/leave`) closes
+  exactly that stream, so the count corrects the instant someone leaves.
+  A beacon lost to a crash is swept by the tab's next one — and failing
+  that, the engine reaps any peer whose writes stall for 45 seconds. The
+  honest bound: a vanished reader is invisible until one of those fires.
 
 ## Features
 

@@ -433,7 +433,14 @@ $("pill").addEventListener("click", scrollBottom);
 // ---- SSE ----------------------------------------------------------------------
 // A per-tab stream token: on pagehide a beacon names this exact stream so
 // the enclave closes it immediately — presence never ghosts a closed tab.
-const streamTok = b64u(rand(16));
+// It lives in sessionStorage, so a reload reuses it: drop_sse closes EVERY
+// stream wearing the tag, and a beacon lost to a crash is swept by the next
+// one instead of orphaning a ghost no tag can ever name again.
+const streamTok = (() => {
+  let t = sessionStorage.getItem("bc-stream");
+  if (!t) { t = b64u(rand(16)); sessionStorage.setItem("bc-stream", t); }
+  return t;
+})();
 window.addEventListener("pagehide", () => {
   if (es) { es.close(); es = null; }
   if (rid && navigator.sendBeacon) {

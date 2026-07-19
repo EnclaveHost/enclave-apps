@@ -1,6 +1,6 @@
 [package]
 name = "pixelboard"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Collaborative r/place-style pixel canvas — one shared 128×128 board in attested enclave RAM, a 2-second cooldown nobody can bend, artwork that provably dies with the deployment"
 

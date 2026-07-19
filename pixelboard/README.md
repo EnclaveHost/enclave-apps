@@ -26,6 +26,13 @@ every browser                        the enclave                      every brow
 - **Nothing touches a disk.** The platform gives service apps no filesystem;
   the artwork is enclave RAM and dies with the deployment — no snapshot, no
   backup, no afterlife. Logs carry counts, never tokens.
+- **"Painting now" is self-reported liveness.** It counts open SSE sockets,
+  nothing more. The page beacons `/api/leave` on pagehide so a closed tab
+  leaves the count instantly, and the engine reaps write-stalled peers as a
+  backstop when a beacon never arrives — a proxy hop will otherwise hold a
+  dead tab's socket open for a long time. The stream tag in that beacon is
+  a separate per-tab token: the cooldown session token is per-person and
+  never becomes stream identity.
 
 ## Features
 
@@ -45,7 +52,8 @@ never generates randomness, never issues a session.
 |---|---|---|
 | `GET /api/board` | — | `{w, h, palette, placed, version, painting, board}` — board is base64 of 16384 palette indices |
 | `POST /api/px` | `i=<0..16383>&c=<0..15>&s=<session>` | `{ok, wait_ms}` · on cooldown `429 {wait_ms}` |
-| `GET /api/stream` | — | SSE: `px` = `{v, d:[[i,c],…]}` delta batches · `n` = `{painting, placed}` |
+| `GET /api/stream?s=` | — | SSE: `px` = `{v, d:[[i,c],…]}` delta batches · `n` = `{painting, placed}`. `s=` is an opaque per-tab stream tag |
+| `POST /api/leave` | `s=<tag>` | `{ok}` always — closes that stream and re-broadcasts `n` at once; `id=` is accepted and ignored (one board) |
 | `GET /api/stats` | — | counts only |
 | `GET /` UI · `GET /ping` liveness | | |
 

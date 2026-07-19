@@ -162,6 +162,19 @@ const session = (() => {
   return s;
 })();
 
+// stream tag: a SEPARATE per-tab token, kept in sessionStorage. the session
+// token above is per-person and must never become stream identity; this one
+// only names a socket, so a pagehide beacon can close it immediately.
+const streamTok = (() => {
+  let s = sessionStorage.getItem("pb-stream");
+  if (!s || !/^[A-Za-z0-9_-]{8,64}$/.test(s)) {
+    const b = crypto.getRandomValues(new Uint8Array(16));
+    s = btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    sessionStorage.setItem("pb-stream", s);
+  }
+  return s;
+})();
+
 // ---- board state ------------------------------------------------------------
 // board[] mirrors the server (updated only by /api/board and SSE deltas);
 // optimistic paints touch the offscreen canvas alone, so a rejected pixel
@@ -404,8 +417,15 @@ function select(idx) {
 function setStats(painting, placed) {
   $("stats").innerHTML = "<b>" + painting + "</b> painting now · <b>" + placed + "</b> pixels placed";
 }
+let es = null;
+// the tab closing is the only reliable signal that a hand left: a proxy hop
+// can hold the dead stream's socket open, so "painting now" would ghost.
+window.addEventListener("pagehide", () => {
+  if (es) { es.close(); es = null; }
+  if (navigator.sendBeacon) navigator.sendBeacon("/api/leave", "s=" + streamTok);
+});
 function connect() {
-  const es = new EventSource("/api/stream");
+  es = new EventSource("/api/stream?s=" + streamTok);
   // a fresh board on every (re)connect — deltas only fill the gaps between
   es.onopen = () => { $("dot").classList.add("on"); fetchBoard(); };
   es.onerror = () => { $("dot").classList.remove("on"); };

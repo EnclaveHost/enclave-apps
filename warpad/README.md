@@ -34,7 +34,12 @@ alice's browser                    the enclave                    everyone on th
   write; the platform gives service apps no filesystem. Misses of every
   kind are the same 404, and logs carry counts, never ids or blobs.
 - **Presence is a count.** Subscribers learn how many streams are open,
-  never who is behind them.
+  never who is behind them. It is self-reported liveness, not proof: the
+  page beacons `/api/leave` on pagehide so a closed tab drops out of the
+  count instantly, and the engine reaps write-stalled peers as a backstop
+  when a beacon never arrives. Between those two, a stale "N here" is
+  possible but short-lived — a count of open sockets is all it ever claims
+  to be.
 
 ## Features
 
@@ -59,7 +64,8 @@ server never parses JSON, never generates randomness, never picks an id.
 | `POST /api/pads` | header `x-pad-id` | `{ok}` — 409 if taken, 507 at capacity |
 | `POST /api/save` | `id=<pad>&v=<base>&blob=<b64u>` | `{ok, version}` — 409 `{version, blob}` on a stale base; empty blob clears |
 | `GET /api/pad?id=` | — | `{version, blob, expires_in}` |
-| `GET /api/stream?id=` | — | SSE `doc` / `present` events on topic `<id>`; the first event is the current document |
+| `GET /api/stream?id=&s=` | — | SSE `doc` / `present` events on topic `<id>`; the first event is the current document. `s=` is an opaque per-tab stream tag |
+| `POST /api/leave` | `id=<pad>&s=<tag>` | `{ok}` always — closes that stream and corrects presence at once; fire-and-forget, so it can't probe pad ids |
 | `GET /api/stats` | — | counts only |
 | `GET /` , `GET /p/<id>` UI · `GET /ping` liveness | | |
 

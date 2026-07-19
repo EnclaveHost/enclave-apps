@@ -426,8 +426,24 @@ $("undo").addEventListener("click", () => {
 $("dismiss").addEventListener("click", hideWarn);
 
 // ---- SSE ----------------------------------------------------------------------
+// A per-tab stream token: on pagehide a beacon names this exact stream so
+// the enclave closes it immediately — presence never ghosts a closed tab.
+const streamTok = (() => {
+  let s = sessionStorage.getItem("wp-stream");
+  if (!s || !/^[A-Za-z0-9_-]{8,64}$/.test(s)) {
+    s = b64u(rand(16));
+    sessionStorage.setItem("wp-stream", s);
+  }
+  return s;
+})();
+window.addEventListener("pagehide", () => {
+  if (es) { es.close(); es = null; }
+  if (pid && navigator.sendBeacon) {
+    navigator.sendBeacon("/api/leave", "id=" + pid + "&s=" + streamTok);
+  }
+});
 function subscribe() {
-  es = new EventSource("/api/stream?id=" + encodeURIComponent(pid));
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(pid) + "&s=" + streamTok);
   es.onopen = () => setLive(true);
   es.onerror = () => setLive(false); // EventSource retries on its own
   es.onmessage = (ev) => { // the initial unnamed event: the current document

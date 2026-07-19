@@ -1,6 +1,6 @@
 [package]
 name = "warpad"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "E2E-encrypted shared scratchpad — browser-side AES-GCM, pad key in the URL fragment, one whole-document ciphertext replaced on every save inside an attested enclave"
 
