@@ -1444,14 +1444,14 @@ async function run(chat) {
 
   // An instance that dies mid-generation leaves the proxied stream OPEN but
   // silent until an upstream idle timeout minutes later - without a watchdog
-  // the input stays locked and the chat looks frozen. 75s of total silence is
+  // the input stays locked and the chat looks frozen. 300s of total silence is
   // abnormal: status events cover session init and every decoded token sends
   // bytes; the longest legitimate mute stretch is a big CPU prefill.
   let stallTimer = null;
   const armStall = () => {
     clearTimeout(stallTimer);
     stallTimer = setTimeout(() => ctl.abort(
-      new Error("No data for 75s — the instance may have died mid-response. Try again.")), 75000);
+      new Error("No data for 300s — the instance may have died mid-response. Try again.")), 300000);
   };
 
   // drop notices from a failed run, then the unanswered question
