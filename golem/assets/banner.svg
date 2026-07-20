@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="18%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#cf8a5b" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#cf8a5b" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#cf8a5b">[ go<tspan fill="#eaa877">lem</tspan> ]</text>
+  <text x="90" y="205" font-size="26" fill="#8a94a6">QEMU machines animated in your browser —</text>
+  <text x="90" y="240" font-size="26" fill="#8a94a6">OS images unsealed only inside the enclave</text>
+  <text x="90" y="300" font-size="20" fill="#5b667a">sealed S3 ciphertext &#8594; wallet signature &#8594; enclave ramdisk &#8594; vCPU in your tab</text>
+
+  <!-- clay head, woken -->
+  <g transform="translate(1050,60) scale(1.55)">
+    <g fill="#cf8a5b">
+      <rect x="26" y="16" width="44" height="40" rx="8"/>
+      <rect x="20" y="30" width="8" height="16" rx="3"/>
+      <rect x="68" y="30" width="8" height="16" rx="3"/>
+    </g>
+    <rect x="34" y="22" width="28" height="10" rx="3" fill="#241403"/>
+    <text x="48" y="30.5" font-size="9" font-weight="700" fill="#eaa877" text-anchor="middle">&#1488;&#1502;&#1514;</text>
+    <rect x="34" y="38" width="10" height="8" rx="2" fill="#0b0e14"/>
+    <rect x="52" y="38" width="10" height="8" rx="2" fill="#0b0e14"/>
+    <rect x="36" y="40" width="6" height="4" fill="#7fd4a8"/>
+    <rect x="54" y="40" width="6" height="4" fill="#7fd4a8"/>
+  </g>
+
+  <!-- serial console -->
+  <g transform="translate(1290,120)">
+    <rect x="0" y="0" width="230" height="160" rx="10" fill="#151b28" stroke="#2a3242" stroke-width="3"/>
+    <text x="16" y="34" font-size="15" fill="#5b667a">OpenRC starting up</text>
+    <text x="16" y="60" font-size="15" fill="#5b667a">Welcome to Alpine</text>
+    <text x="16" y="94" font-size="16" fill="#8a94a6">golem login:</text>
+    <rect x="120" y="82" width="9" height="15" fill="#eaa877"/>
+  </g>
+</svg>

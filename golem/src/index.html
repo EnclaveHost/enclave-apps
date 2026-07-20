@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>golem — QEMU machines from a sealed volume, on Enclave</title>
+<link rel="stylesheet" href="/a/xterm.css">
+<style>
+  :root {
+    --bg: #0c0e13; --panel: #14171f; --panel2: #191d27; --border: #262b38;
+    --text: #e9ecf2; --dim: #8b93a4; --accent: #cf8a5b; --accent-hi: #eaa877;
+    --err: #f2b8c0; --warn: #f5d58a; --ok: #7fd4a8;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 1100px; margin: 0 auto; padding: 0 16px 48px;
+  }
+  header { padding: 22px 0 12px; border-bottom: 1px solid var(--border); }
+  .brand { font: 700 22px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--accent); }
+  .brand b { color: var(--accent-hi); font-weight: 700; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .banner {
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 11px 14px; margin-top: 16px; font-size: 12.5px; color: var(--dim);
+  }
+  .banner b { color: var(--text); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-top: 16px; }
+  .lhead h2 { font: 600 15px ui-monospace, monospace; }
+  .meta { color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace; word-break: break-all; margin-top: 3px; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 9px; margin-left: 8px; vertical-align: 1px; }
+  .badge.locked   { background: #2a2f3e; color: var(--dim); }
+  .badge.syncing, .badge.pushing { background: #3a3320; color: var(--warn); }
+  .badge.unlocked { background: #33240f; color: var(--accent-hi); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hi); }
+  a.link:hover { text-decoration: underline; }
+  .empty { color: var(--dim); font-size: 13px; margin-top: 10px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 10px; white-space: pre-wrap; word-break: break-word; }
+  .hint { color: var(--dim); font-size: 12px; }
+
+  /* ---- unlock panel ---- */
+  form.unlock { margin-top: 10px; display: grid; gap: 8px; }
+  input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font: 13px ui-monospace, monospace;
+  }
+  input::placeholder { color: #59627a; }
+  button {
+    background: var(--accent); color: #241403; border: 0; border-radius: 8px;
+    padding: 8px 15px; font: 600 13px system-ui, sans-serif; cursor: pointer;
+  }
+  button:hover { background: var(--accent-hi); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.ghost:hover { background: var(--panel2); color: var(--text); }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  details.creds { font-size: 12.5px; color: var(--dim); margin-top: 4px; }
+  details.creds > summary { cursor: pointer; user-select: none; }
+  details.creds > div { display: grid; gap: 8px; margin-top: 8px; }
+  .reveal { border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; }
+  .reveal .k { color: var(--dim); }
+  .reveal code { display: block; font: 11.5px ui-monospace, monospace; word-break: break-all; margin: 2px 0 8px; color: var(--text); user-select: all; }
+
+  /* ---- machine room ---- */
+  .machine { border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); padding: 12px 14px; margin-top: 12px; }
+  .mhead { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .mhead .mtitle { font: 600 14px ui-monospace, monospace; }
+  .mhead .msub { color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace; }
+  .mhead .spacer { flex: 1; }
+  .saves { margin-top: 8px; display: grid; gap: 4px; }
+  .saverow { display: flex; gap: 8px; align-items: center; font: 12px ui-monospace, monospace; color: var(--dim); }
+  .saverow .sname { color: var(--text); }
+  .saverow button { padding: 2px 9px; font-size: 11.5px; }
+  button.del { background: transparent; color: var(--dim); border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px; font-size: 12px; }
+  button.del:hover { color: var(--err); border-color: var(--err); }
+  button.del.armed { color: #241403; background: var(--err); border-color: var(--err); font-weight: 700; }
+
+  /* ---- terminal ---- */
+  #vmbox { display: none; }
+  #vmbox.active { display: block; }
+  .vmhead { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .vmhead h2 { font: 600 15px ui-monospace, monospace; }
+  .vmstat { color: var(--warn); font: 12px ui-monospace, monospace; }
+  .vmstat.ok { color: var(--ok); }
+  .vmstat.bad { color: var(--err); }
+  #term { margin-top: 12px; background: #000; border-radius: 8px; padding: 8px; overflow: auto; }
+  .vmbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .vmbar .sublabel { color: var(--dim); font-size: 12px; }
+  .vmbar .spacer { flex: 1; }
+  .upbar { height: 6px; background: var(--border); border-radius: 999px; overflow: hidden; width: 160px; }
+  .upfill { height: 100%; width: 0; background: var(--accent); transition: width .1s linear; }
+
+  /* ---- actions bar ---- */
+  .actionsbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .actionsbar .sublabel { color: var(--dim); font-size: 12px; margin-right: 6px; }
+  .actionsbar .spacer { flex: 1; }
+  .summary { color: var(--dim); font-size: 12.5px; font-family: ui-monospace, monospace; }
+  .dirtytag { color: var(--warn); font-size: 12px; font-weight: 600; margin-right: 10px; }
+
+  footer { color: var(--dim); font-size: 12px; margin-top: 22px; line-height: 1.6; border-top: 1px solid var(--border); padding-top: 14px; }
+  footer b { color: var(--text); }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--warn); border-top-color: transparent; border-radius: 50%; animation: r .8s linear infinite; vertical-align: -1px; margin-right: 6px; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">[ go<b>lem</b> ]</div>
+  <div class="tag">machines animated in your browser — OS images unsealed only inside the enclave</div>
+</header>
+
+<div class="banner">
+  Your machine images live <b>encrypted in your own S3 bucket</b>; the wallet that signs is the only key. Unlock decrypts
+  them onto the enclave's ramdisk, and this page boots them with <b>QEMU compiled to WebAssembly</b> — the CPU runs in
+  <i>your</i> browser tab, fed by the attested enclave. <b>Save disk</b> streams a guest-disk snapshot back into the
+  volume; <b>Sync</b> re-encrypts it to your bucket.
+</div>
+
+<div id="vmbox" class="card">
+  <div class="vmhead">
+    <h2 id="vmtitle">machine</h2>
+    <span class="vmstat" id="vmstat">preparing…</span>
+    <span class="spacer"></span>
+  </div>
+  <div id="term"></div>
+  <div class="vmbar">
+    <button id="savebtn" disabled>Save disk to volume</button>
+    <span class="sublabel">run <b style="color:var(--text)">sync</b> in the guest first, so the disk is quiescent</span>
+    <div class="upbar" id="savebar" style="display:none"><div class="upfill" id="savefill"></div></div>
+    <span class="sublabel" id="savestat"></span>
+    <span class="spacer"></span>
+    <button class="ghost" onclick="location.reload()">Eject (reload page)</button>
+  </div>
+</div>
+
+<div id="vols"><div class="card"><span class="empty">loading the machine room…</span></div></div>
+
+<footer>
+  <b>How this works.</b> The App Config names where each volume's ciphertext lives (S3 endpoint, bucket, path) — never a
+  key. <b>Unlock with wallet</b> signs a fixed message naming the volume; the crypt key is derived from that signature
+  locally, relayed only to this app over the deployment's in-enclave-terminated TLS, and passed over loopback to the
+  in-enclave manager, which pulls and decrypts your machine images onto the CVM's encrypted ramdisk. This page then loads
+  <a href="https://github.com/ktock/qemu-wasm" target="_blank" rel="noreferrer">QEMU-wasm</a> and the guest image from the
+  enclave — served cross-origin-isolated (COOP/COEP), which SharedArrayBuffer threading requires and static S3 hosting
+  can't provide. The emulated CPU runs in this tab; the enclave is the sealed image vault. <b>Save disk</b> writes a
+  snapshot into the volume; <b>Sync</b> re-encrypts to your bucket; <b>Lock</b> wipes the plaintext. Verify the code
+  holding your images with the deployment's remote attestation at
+  <a href="https://enclave.host" target="_blank" rel="noreferrer">enclave.host</a>.
+</footer>
+
+<script src="/a/xterm.js"></script>
+<script src="/a/xterm-pty.js"></script>
+<script>
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n >= 1073741824 ? (n / 1073741824).toFixed(2) + " GiB" : n >= 1048576 ? (n / 1048576).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(1) + " KiB" : n + " B";
+let timer = null;
+
+// ===========================================================================
+// VERBATIM security core — byte-exact with scripts/enclave-encvol.sh. Do not
+// edit: the derived password/salt and the credsEnvelope only reproduce if
+// these domain strings and the message stay exactly as pinned by the platform
+// e2e. (Copied unchanged from the encrypted-volumes reference app.)
+// ---------------------------------------------------------------------------
+// The canonical message the wallet personal_signs; password/salt are sha256 of
+// the lowercase 0x-signature + "\n" + a domain label. Deterministic ECDSA
+// (RFC 6979) makes the same wallet always derive the same key.
+const volMessage = (keyId) =>
+  `Enclave encrypted volume key v1\nvolume: ${keyId}\n\nSigning derives this volume's encryption key. Only sign in apps you trust with its contents.`;
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// S3 credentials sealed under the SAME wallet signature that derives the
+// volume key, riding the PUBLIC App Config as "credsEnvelope" — one signature
+// unlocks everything.
+//   encKey/macKey = SHA-256(sig + "\n" + "enclave-encvol-v1:creds-enc"/":creds-mac")
+//   envelope      = "encv1:" + base64( iv[16] || AES-256-CTR(encKey, iv, credsJSON) || HMAC-SHA256(macKey, iv||ct)[32] )
+const sha256bytes = async (s) => new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function openCredsEnvelope(sig, envelope) {
+  if (!envelope.startsWith("encv1:")) throw new Error("unknown credsEnvelope format");
+  const raw = b64decode(envelope.slice(6));
+  if (raw.length < 16 + 32 + 2) throw new Error("credsEnvelope too short");
+  const ivct = raw.slice(0, raw.length - 32), tag = raw.slice(raw.length - 32);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  if (!(await crypto.subtle.verify("HMAC", macKey, tag, ivct)))
+    throw new Error("envelope failed authentication - it was sealed by a different wallet than the one that just signed");
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["decrypt"]);
+  const pt = await crypto.subtle.decrypt({ name: "AES-CTR", counter: ivct.slice(0, 16), length: 128 }, encKey, ivct.slice(16));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+async function sealCredsEnvelope(sig, creds) {
+  const iv = crypto.getRandomValues(new Uint8Array(16));
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CTR", counter: iv, length: 128 }, encKey,
+    new TextEncoder().encode(JSON.stringify(creds))));
+  const ivct = new Uint8Array(16 + ct.length); ivct.set(iv); ivct.set(ct, 16);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const tag = new Uint8Array(await crypto.subtle.sign("HMAC", macKey, ivct));
+  const all = new Uint8Array(ivct.length + 32); all.set(ivct); all.set(tag, ivct.length);
+  return "encv1:" + btoa(String.fromCharCode(...all));
+}
+
+async function walletDerive(keyId) {
+  const eth = window.ethereum;
+  if (!eth) throw new Error("no wallet detected (window.ethereum) - use a browser wallet, or unlock with a password");
+  const [account] = await eth.request({ method: "eth_requestAccounts" });
+  const msg = volMessage(keyId);
+  const hex = "0x" + Array.from(new TextEncoder().encode(msg), (b) => b.toString(16).padStart(2, "0")).join("");
+  let sig = await eth.request({ method: "personal_sign", params: [hex, account] });
+  sig = String(sig).trim().toLowerCase();
+  if (!/^0x[0-9a-f]{130}$/.test(sig)) throw new Error("unexpected signature format (need a 65-byte ECDSA personal_sign; smart-contract wallets are not supported)");
+  return { account, sig,
+           password: await sha256hex(sig + "\nenclave-encvol-v1:password"),
+           salt: await sha256hex(sig + "\nenclave-encvol-v1:salt") };
+}
+
+// The app relays every /api/* call to the in-enclave manager, attaching the
+// bearer token server-side; the browser never sees it.
+async function api(path, body) {
+  const r = await fetch("./api/" + path, body
+    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+    : undefined);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || j.error || `HTTP ${r.status}`);
+  return j;
+}
+// ============================ end verbatim core ============================
+
+// The manager relays rclone's stderr verbatim; recognize the shapes that mean
+// "the BUCKET rejected the request's credentials" (not a wrong crypt password).
+const CRED_ERR = /InvalidArgument: Authorization|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied/;
+const credHint = (err) => CRED_ERR.test(err || "")
+  ? `<div class="err" style="color:var(--warn)">The bucket rejected this request's S3 credentials${/InvalidArgument: Authorization/.test(err) ? " (it refused an unauthenticated request)" : ""} —
+     the crypt password was never checked. Fill in the access key id + secret access key below.
+     Lock wipes retained credentials, so they are needed again at every unlock.</div>`
+  : "";
+
+function s3CredsBlock(open) {
+  return `<details class="creds"${open ? " open" : ""}><summary>S3 credentials — required unless the bucket allows public reads (Lock wipes them; re-enter at every unlock)</summary><div>
+      <input name="accessKeyId" placeholder="access key id" autocomplete="off">
+      <input type="password" name="secretAccessKey" placeholder="secret access key" autocomplete="off">
+      <input type="password" name="sessionToken" placeholder="session token (optional)" autocomplete="off">
+    </div></details>`;
+}
+
+function s3CredsFrom(form) {
+  const body = {};
+  for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+    const el = form?.querySelector(`[name=${k}]`);
+    if (el && el.value) body[k] = el.value;
+  }
+  return body;
+}
+
+// ---- machine room rendering ------------------------------------------------
+let lastVols = [];
+const sealSigs = {};          // volume -> signature the reveal panel derived (feeds Seal)
+const dirty = {};             // volume -> unsynced changes since last Sync
+const manifests = {};         // "vol/dir" -> parsed machine.json (or {error})
+
+function whereOf(v) {
+  return v.endpoint
+    ? `s3 ${esc(v.endpoint)} &rarr; ${esc(v.bucket || "")}${v.path ? "/" + esc(v.path) : ""}`
+    : "ciphertext location comes from the deployment's App Config";
+}
+
+// LOCKED: the reference's unlock panel (wallet-first, password fallback, seal).
+function unlockPanel(v) {
+  const walletBtn = `<button type="button" class="wallet" data-wallet="1">Unlock with wallet</button>
+      <span class="hint">${v.credsEnvelope
+        ? `one signature derives the key AND opens the sealed S3 credentials — nothing to type`
+        : `signs "volume: ${esc(v.keyId || v.name)}", derives the key locally`}</span>`;
+  const passInputs = `
+      <input type="password" name="password" placeholder="rclone crypt password" autocomplete="off">
+      <input type="password" name="salt" placeholder="salt / password2 (leave empty if none)" autocomplete="off">
+      <div class="row"><button type="submit">Unlock with password</button></div>`;
+  const parts = (v.unlock === "password")
+    ? passInputs + `<div class="row">${walletBtn}</div>`
+    : `<div class="row">${walletBtn}</div>
+       <details class="creds"><summary>use a password instead</summary><div>${passInputs}</div></details>`;
+  return `
+    <form class="unlock" data-vol="${esc(v.name)}" data-keyid="${esc(v.keyId || v.name)}">
+      ${parts}
+      ${s3CredsBlock(CRED_ERR.test(v.error || ""))}
+    </form>
+    <div class="row"><a href="#" class="link" data-reveal="${esc(v.name)}">derive push credentials (wallet)</a></div>
+    <div class="reveal" id="reveal-${esc(v.name)}" style="display:none"></div>`;
+}
+
+function fileUrl(vol, path) {
+  return `/f/${encodeURIComponent(vol)}/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+const joinp = (dir, name) => (dir ? dir + "/" + name : name);
+
+// A machine is any directory in the volume containing a machine.json.
+function machinesOf(files) {
+  const out = [];
+  for (const f of files) {
+    if (f.path === "machine.json") out.push("");
+    else if (f.path.endsWith("/machine.json")) out.push(f.path.slice(0, -"/machine.json".length));
+  }
+  return out;
+}
+
+function machineHtml(vol, dir, files) {
+  const key = vol + "/" + dir;
+  const cfg = manifests[key];
+  const mine = files.filter((f) => dir === "" || f.path.startsWith(dir + "/"));
+  const total = mine.reduce((a, f) => a + f.size, 0);
+  const savePrefix = joinp(dir, "saves/");
+  const saves = mine.filter((f) => f.path.startsWith(savePrefix));
+  if (!cfg) return `<div class="machine"><div class="mhead"><span class="mtitle">${esc(dir || vol)}</span><span class="msub">reading machine.json…</span></div></div>`;
+  if (cfg.error) return `<div class="machine"><div class="mhead"><span class="mtitle">${esc(dir || vol)}</span><span class="msub" style="color:var(--err)">machine.json: ${esc(cfg.error)}</span></div></div>`;
+  const canSaveBoot = cfg.diskLoader && cfg.disk;
+  return `<div class="machine">
+    <div class="mhead">
+      <span class="mtitle">${esc(cfg.title || dir || vol)}</span>
+      <span class="msub">${esc(dir || ".")} · ${mine.length} files · ${fmt(total)}</span>
+      <span class="spacer"></span>
+      <button data-boot data-vol="${esc(vol)}" data-dir="${esc(dir)}">Boot</button>
+    </div>
+    ${saves.length ? `<div class="saves">${saves.map((s) => `
+      <div class="saverow">
+        <span class="sname">${esc(s.path.slice(savePrefix.length))}</span>
+        <span>${fmt(s.size)}</span>
+        ${canSaveBoot ? `<button data-boot data-vol="${esc(vol)}" data-dir="${esc(dir)}" data-save="${esc(s.path)}">Boot this save</button>` : ""}
+        <button class="del" data-vol="${esc(vol)}" data-path="${esc(s.path)}" title="delete save">&times;</button>
+      </div>`).join("")}</div>` : ""}
+    ${canSaveBoot ? "" : `<div class="hint" style="margin-top:6px">this machine's disk shares an image pack with its kernel — snapshots can be saved but not booted directly</div>`}
+  </div>`;
+}
+
+function roomCard(v, files) {
+  const list = (files && files.files) || [];
+  const dirs = machinesOf(list);
+  const busyPush = v.status === "pushing";
+  for (const d of dirs) {
+    const key = v.name + "/" + d;
+    if (!manifests[key]) {
+      fetch(fileUrl(v.name, joinp(d, "machine.json")))
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
+        .then((j) => { manifests[key] = j; rerender(); })
+        .catch((e) => { manifests[key] = { error: String(e.message || e) }; rerender(); });
+    }
+  }
+  return `<div class="card">
+    <div class="lhead">
+      <h2>[ ${esc(v.name)} ] <span class="badge unlocked">unlocked</span></h2>
+      <div class="meta">${whereOf(v)}</div>
+    </div>
+    ${dirs.length
+      ? dirs.map((d) => machineHtml(v.name, d, list)).join("")
+      : `<div class="empty">No machines in this volume yet — seed it with <b>scripts/fetch-machine.sh</b> + <b>enclave-encvol.sh push</b> (see the README).</div>`}
+    <div class="actionsbar">
+      <button class="primary" data-act="sync" data-vol="${esc(v.name)}" ${(v.readOnly || busyPush) ? "disabled" : ""}>${busyPush ? '<span class="spin"></span>syncing…' : "Sync"}</button>
+      <span class="sublabel">re-encrypt &amp; push to your bucket</span>
+      <button class="ghost" data-act="lock" data-vol="${esc(v.name)}">Lock</button>
+      <span class="sublabel">wipe plaintext</span>
+      <span class="spacer"></span>
+      ${dirty[v.name] ? `<span class="dirtytag">&#9679; unsynced changes</span>` : ""}
+      <span class="summary">${list.length} file${list.length === 1 ? "" : "s"}</span>
+    </div>
+  </div>`;
+}
+
+function volCard(v, files) {
+  const busy = v.status === "syncing" || v.status === "pushing";
+  if (v.status === "unlocked" || v.status === "pushing") return roomCard(v, files);
+  let body;
+  if (v.status === "syncing") {
+    body = `<div class="empty"><span class="spin"></span>pulling + decrypting from the bucket…</div>`;
+  } else {
+    body = unlockPanel(v);
+  }
+  const badge = `<span class="badge ${esc(v.status)}">${busy ? '<span class="spin"></span>' : ""}${esc(v.status)}</span>`;
+  return `<div class="card">
+    <div class="lhead"><h2>[ ${esc(v.name)} ] ${badge}</h2><div class="meta">${whereOf(v)}</div></div>
+    ${body}
+    ${v.error ? `<div class="err">${esc(v.error)}</div>${credHint(v.error)}` : ""}
+  </div>`;
+}
+
+let lastLs = { volumes: {} };
+function rerender() {
+  const box = document.getElementById("vols");
+  box.innerHTML = lastVols.map((v) => volCard(v, lastLs.volumes[v.name])).join("");
+}
+
+async function refresh() {
+  const box = document.getElementById("vols");
+  let status;
+  try {
+    status = await api("status");
+  } catch (e) {
+    let names = [];
+    try { names = Object.keys((await fetch("./ls").then((r) => r.json())).volumes || {}); } catch {}
+    box.innerHTML = names.length
+      ? `<div class="card"><span class="empty">Volume(s) ${names.map((n) => "<b>[ " + esc(n) + " ]</b>").join(", ")} exist on this deployment,
+           but the in-enclave manager is not answering — status unknown, retrying…</span>
+         <div class="err">${esc(String(e.message || e))}</div></div>`
+      : `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(String(e.message || e))}</div></div>`;
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 5000);
+    return;
+  }
+  const vols = lastVols = status.volumes || [];
+  for (const v of vols) v.status = v.status || (v.unlocked ? "unlocked" : "locked");
+  if (!vols.length) {
+    box.innerHTML = '<div class="card"><span class="empty">No encrypted volumes configured. Add an <b>encVolumes</b> entry to the App Config.</span></div>';
+    return;
+  }
+  lastLs = { volumes: {} };
+  if (vols.some((v) => v.status === "unlocked" || v.status === "pushing")) {
+    lastLs = await fetch("./ls").then((r) => r.json()).catch(() => ({ volumes: {} }));
+  }
+  rerender();
+  if (vols.some((v) => v.status === "syncing" || v.status === "pushing")) {
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 1500);
+  }
+}
+
+// ---- booting a machine -----------------------------------------------------
+// Mirrors the upstream qemu-wasm-demo wiring: a global Module for the classic
+// file_packager loaders, xterm-pty as the serial console, then the ES6 main
+// module. One machine per page load — Eject reloads.
+let vm = null;   // { vol, dir, cfg }
+
+const setStat = (s, cls) => {
+  const el = document.getElementById("vmstat");
+  el.textContent = s;
+  el.className = "vmstat" + (cls ? " " + cls : "");
+};
+
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = url;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("failed to load " + url));
+    document.body.appendChild(s);
+  });
+}
+
+async function fetchBytes(url, onProgress) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  const total = +(r.headers.get("content-length") || 0);
+  const reader = r.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (onProgress) onProgress(got, total);
+  }
+  const all = new Uint8Array(got);
+  let off = 0;
+  for (const c of chunks) { all.set(c, off); off += c.length; }
+  return all;
+}
+
+function fsMkdirs(FS, path) {
+  const parts = path.split("/").filter(Boolean);
+  let cur = "";
+  for (const p of parts) {
+    cur += "/" + p;
+    try { FS.mkdir(cur); } catch (e) { /* exists */ }
+  }
+}
+
+async function boot(vol, dir, save) {
+  if (vm) return alert("a machine is already running — Eject (reload) first");
+  const cfg = manifests[vol + "/" + dir];
+  if (!cfg || cfg.error) return alert("machine.json is missing or invalid");
+  if (!window.crossOriginIsolated)
+    return alert("this page is not cross-origin isolated (no SharedArrayBuffer) — QEMU-wasm cannot start. Are you behind a proxy that strips COOP/COEP headers?");
+  vm = { vol, dir, cfg };
+  document.getElementById("vmbox").classList.add("active");
+  document.getElementById("vmtitle").textContent = (cfg.title || dir || vol) + (save ? "  ·  " + save.split("/").pop() : "");
+  setStat("preparing…");
+
+  const xterm = new Terminal({ fontSize: 13, scrollback: 5000, cols: 100, rows: 30 });
+  xterm.open(document.getElementById("term"));
+  const { master, slave } = openpty();
+  xterm.loadAddon(master);
+
+  window.Module = {
+    arguments: (cfg.args || []).slice(),
+    locateFile: (p) => fileUrl(vol, joinp(dir, p)),
+    mainScriptUrlOrBlob: fileUrl(vol, joinp(dir, cfg.main || "out.js")),
+    preRun: [],
+    pty: slave,
+    print: (s) => setStat(String(s)),
+    printErr: (s) => console.warn("[qemu]", s),
+    onExit: (code) => { setStat(`halted (exit ${code}) — Save disk still works; Eject to leave`, "bad"); },
+    onAbort: (e) => setStat("aborted: " + e, "bad"),
+    monitorRunDependencies: (n) => setStat(n ? `loading machine… ${n} part${n === 1 ? "" : "s"} pending` : "starting vCPU…"),
+    setStatus: (s) => { if (s) setStat(s); },
+  };
+
+  try {
+    for (const l of cfg.loaders || []) {
+      if (save && l === cfg.diskLoader) continue;   // the saved disk replaces this pack
+      setStat("loading " + l + "…");
+      await loadScript(fileUrl(vol, joinp(dir, l)));
+    }
+    if (save) {
+      const bytes = await fetchBytes(fileUrl(vol, save), (g, t) =>
+        setStat(`fetching saved disk… ${fmt(g)}${t ? " / " + fmt(t) : ""}`));
+      Module.preRun.push((mod) => {
+        const parent = cfg.disk.slice(0, cfg.disk.lastIndexOf("/"));
+        if (parent) fsMkdirs(mod.FS, parent);
+        mod.FS.writeFile(cfg.disk, bytes);
+      });
+    }
+    setStat("compiling QEMU…");
+    const init = (await import(fileUrl(vol, joinp(dir, cfg.main || "out.js")))).default;
+    await init(Module);
+    // upstream demo's TTY poll patch: reflect pty readability into poll()
+    const oldPoll = Module["TTY"].stream_ops.poll;
+    const pty = Module["pty"];
+    Module["TTY"].stream_ops.poll = function (stream, timeout) {
+      if (!pty.readable) {
+        return (pty.readable ? 1 : 0) | (pty.writable ? 4 : 0);
+      }
+      return oldPoll.call(stream, timeout);
+    };
+    setStat("running — console is live", "ok");
+    document.getElementById("savebtn").disabled = !cfg.disk;
+  } catch (e) {
+    setStat("boot failed: " + (e.message || e), "bad");
+    console.error(e);
+  }
+}
+
+// ---- saving the guest disk back into the volume ----------------------------
+const CH = 8 * 1024 * 1024;
+async function saveDisk() {
+  if (!vm || !vm.cfg.disk) return;
+  const label = prompt("name this snapshot (letters/digits/dots/dashes):", "snap-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-"));
+  if (!label) return;
+  const clean = label.replace(/[^a-zA-Z0-9._-]/g, "-");
+  let data;
+  try {
+    data = Module.FS.readFile(vm.cfg.disk);
+  } catch (e) {
+    return alert("could not read the guest disk from the emulator: " + (e.message || e));
+  }
+  const rel = joinp(vm.dir, "saves/" + clean + ".img");
+  const bar = document.getElementById("savebar"), fill = document.getElementById("savefill"), st = document.getElementById("savestat");
+  const btn = document.getElementById("savebtn");
+  bar.style.display = ""; btn.disabled = true;
+  try {
+    for (let off = 0; off < data.length; off += CH) {
+      const chunk = data.subarray(off, Math.min(off + CH, data.length));
+      const r = await fetch(`/up/${encodeURIComponent(vm.vol)}/${rel.split("/").map(encodeURIComponent).join("/")}?off=${off}`,
+        { method: "POST", body: chunk });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw new Error(j.error?.message || `HTTP ${r.status}`);
+      }
+      fill.style.width = Math.round(((off + chunk.length) / data.length) * 100) + "%";
+      st.textContent = `${fmt(off + chunk.length)} / ${fmt(data.length)}`;
+    }
+    st.textContent = `saved ${fmt(data.length)} — Sync the volume to push it to your bucket`;
+    dirty[vm.vol] = true;
+    refresh();
+  } catch (e) {
+    st.textContent = "save failed: " + (e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById("savebtn").addEventListener("click", saveDisk);
+
+// ---- events ---------------------------------------------------------------
+const vbox = document.getElementById("vols");
+
+vbox.addEventListener("submit", async (e) => {
+  const f = e.target.closest("form.unlock");
+  if (!f) return;
+  e.preventDefault();
+  const pw = f.querySelector("[name=password]")?.value;
+  if (!pw) return alert("enter the crypt password (or use the wallet button)");
+  const body = { name: f.dataset.vol, password: pw, ...s3CredsFrom(f) };
+  const salt = f.querySelector("[name=salt]")?.value;
+  if (salt) body.salt = salt;
+  const btn = f.querySelector("button[type=submit]");
+  if (btn) btn.disabled = true;
+  try { await api("unlock", body); } catch (err) { alert(`unlock failed: ${err.message || err}`); }
+  refresh();
+});
+
+vbox.addEventListener("click", async (e) => {
+  // boot buttons
+  const bootBtn = e.target.closest("button[data-boot]");
+  if (bootBtn) {
+    boot(bootBtn.dataset.vol, bootBtn.dataset.dir, bootBtn.dataset.save || null);
+    return;
+  }
+
+  // delete a save: 3s double-click arm
+  const del = e.target.closest("button.del");
+  if (del) {
+    if (del.dataset.armed) {
+      del.disabled = true;
+      try {
+        await api("delete", { vol: del.dataset.vol, path: del.dataset.path });
+        dirty[del.dataset.vol] = true;
+        refresh();
+      } catch (err) { alert(`delete failed: ${err.message || err}`); del.disabled = false; }
+    } else {
+      del.dataset.armed = "1"; del.classList.add("armed"); del.textContent = "delete?";
+      setTimeout(() => {
+        if (del.isConnected) { delete del.dataset.armed; del.classList.remove("armed"); del.innerHTML = "&times;"; }
+      }, 3000);
+    }
+    return;
+  }
+
+  // wallet unlock (verbatim flow): form typing wins; else open the sealed
+  // envelope under the same signature.
+  const w = e.target.closest("button[data-wallet]");
+  if (w) {
+    const f = w.closest("form.unlock");
+    w.disabled = true;
+    try {
+      const d = await walletDerive(f.dataset.keyid);
+      let creds = s3CredsFrom(f);
+      const v = lastVols.find((x) => x.name === f.dataset.vol);
+      if (v?.credsEnvelope && !creds.accessKeyId) {
+        creds = { ...(await openCredsEnvelope(d.sig, v.credsEnvelope)), ...creds };
+      }
+      await api("unlock", { name: f.dataset.vol, password: d.password, salt: d.salt, ...creds });
+    } catch (err) {
+      alert(`wallet unlock failed: ${err.message || err}`);
+    }
+    return refresh();
+  }
+
+  // derive push credentials + seal panel (verbatim flow)
+  const r = e.target.closest("a[data-reveal]");
+  if (r) {
+    e.preventDefault();
+    const name = r.dataset.reveal;
+    const v = lastVols.find((x) => x.name === name);
+    const panel = document.getElementById(`reveal-${name}`);
+    try {
+      const d = await walletDerive(v.keyId || v.name);
+      sealSigs[name] = d.sig;
+      const pushCmd = `ENCVOL_WALLET_SIG=${d.sig} scripts/enclave-encvol.sh push ./machines \\\n  --endpoint ${v.endpoint} --bucket ${v.bucket}${v.path ? ` --path ${v.path}` : ""} --name ${v.name}`;
+      panel.style.display = "";
+      panel.innerHTML =
+        `<span class="k">These credentials decrypt this volume — treat them like the data itself. Derived locally for ${esc(d.account)}; nothing was sent anywhere.</span>` +
+        `<div style="margin-top:8px"><span class="k">signature (feeds enclave-encvol.sh --sig / ENCVOL_WALLET_SIG)</span><code>${esc(d.sig)}</code>` +
+        `<span class="k">derived password (ENCVOL_PASSWORD)</span><code>${esc(d.password)}</code>` +
+        `<span class="k">derived salt (ENCVOL_SALT)</span><code>${esc(d.salt)}</code>` +
+        `<span class="k">push machines with</span><code>${esc(pushCmd)}</code></div>` +
+        `<div style="margin-top:8px"><span class="k">seal S3 credentials into the App Config — future wallet unlocks then need no typing.
+          The sealed value is safe to publish: it only opens under this wallet's signature.</span>
+          <div class="row">
+            <input data-seal-ak="${esc(name)}" placeholder="access key id" autocomplete="off" style="max-width:200px">
+            <input data-seal-sk="${esc(name)}" type="password" placeholder="secret access key" autocomplete="off" style="max-width:220px">
+            <button type="button" class="ghost" data-seal="${esc(name)}">Seal</button>
+          </div>
+          <div data-seal-out="${esc(name)}"></div></div>`;
+    } catch (err) {
+      alert(`derive failed: ${err.message || err}`);
+    }
+    return;
+  }
+  const s = e.target.closest("button[data-seal]");
+  if (s) {
+    const name = s.dataset.seal, panel = document.getElementById(`reveal-${name}`);
+    const ak = panel.querySelector(`[data-seal-ak]`)?.value.trim();
+    const sk = panel.querySelector(`[data-seal-sk]`)?.value.trim();
+    if (!ak || !sk) return alert("enter the access key id and secret access key to seal");
+    try {
+      const envlp = await sealCredsEnvelope(sealSigs[name], { accessKeyId: ak, secretAccessKey: sk });
+      panel.querySelector(`[data-seal-out="${name}"]`).innerHTML =
+        `<span class="k">add to this volume's encVolumes entry (next publish):</span><code>"credsEnvelope": "${esc(envlp)}"</code>`;
+    } catch (err) {
+      alert(`seal failed: ${err.message || err}`);
+    }
+    return;
+  }
+
+  // sync / lock (verbatim wiring; sync also clears the dirty tag)
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  if (b.dataset.act === "lock" && !confirm(`Lock ${b.dataset.vol}? The decrypted machine images are wiped from the enclave (the ciphertext in your bucket is untouched). A running machine keeps running — it lives in this tab.`)) return;
+  if (b.dataset.act === "sync" && !confirm(`Sync ${b.dataset.vol}? The current volume contents (including saved snapshots) are re-encrypted and pushed to your bucket, replacing the remote copy.`)) return;
+  b.disabled = true;
+  try {
+    await api(b.dataset.act, { name: b.dataset.vol });
+    if (b.dataset.act === "sync") dirty[b.dataset.vol] = false;
+  } catch (err) { alert(`${b.dataset.act} failed: ${err.message || err}`); }
+  refresh();
+});
+
+refresh();
+</script>
+</body>
+</html>

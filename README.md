@@ -37,6 +37,7 @@ app's README (and `wasm/apps/README.md` in the
 | [shoebox](shoebox/) | A private file locker/gallery on an encrypted volume — upload, browse, download; files decrypt only inside the enclave. |
 | [gavel](gavel/) | Sealed-bid auctions (Vickrey or first-price): bids sealed in enclave RAM the seller can't peek at, a blinded committed reserve, and losing bids scrubbed — never revealed. |
 | [yardstick](yardstick/) | Measure a group without anyone showing their number: only aggregates of ≥ k submissions leave the enclave; the numbers are scrubbed at close. |
+| [golem](golem/) | QEMU machines booted in your browser from a wallet-sealed S3 volume — the enclave is the attested image vault and cross-origin-isolated server; disk snapshots stream back in. |
 
 ## Building
 
