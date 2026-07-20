@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- yardstick: a ruler whose gradations are visible, whose readings are not. -->
+  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
+  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
+  <!-- the stick, diagonal -->
+  <g transform="rotate(-35 48 48)">
+    <rect x="10" y="38" width="76" height="20" rx="4" fill="#a78bfa"/>
+    <g stroke="#241a3f" stroke-width="3" stroke-linecap="round">
+      <path d="M22 38 v8 M34 38 v12 M46 38 v8 M58 38 v12 M70 38 v8"/>
+    </g>
+  </g>
+  <!-- three sealed submissions beneath -->
+  <g fill="#1e2430" stroke="#2a3242" stroke-width="2">
+    <rect x="16" y="70" width="18" height="12" rx="3"/>
+    <rect x="39" y="70" width="18" height="12" rx="3"/>
+    <rect x="62" y="70" width="18" height="12" rx="3"/>
+  </g>
+  <g fill="#a78bfa">
+    <circle cx="25" cy="76" r="2.5"/><circle cx="48" cy="76" r="2.5"/><circle cx="71" cy="76" r="2.5"/>
+  </g>
+</svg>
