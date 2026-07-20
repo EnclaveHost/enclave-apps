@@ -35,6 +35,7 @@ app's README (and `wasm/apps/README.md` in the
 | [tipline](tipline/) | Anonymous encrypted inbox — sources encrypt to your key in a page you can attest first. |
 | [keep](keep/) | A confidential notebook on an encrypted volume — notes decrypt only inside the enclave, sync re-encrypts to your bucket. |
 | [shoebox](shoebox/) | A private file locker/gallery on an encrypted volume — upload, browse, download; files decrypt only inside the enclave. |
+| [gavel](gavel/) | Sealed-bid auctions (Vickrey or first-price): bids sealed in enclave RAM the seller can't peek at, a blinded committed reserve, and losing bids scrubbed — never revealed. |
 
 ## Building
 
