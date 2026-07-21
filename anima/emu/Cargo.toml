@@ -1,0 +1,18 @@
+# Vendored from https://github.com/takahirox/riscv-rust
+# commit 8ee69d7a5dc7ef6d8b2bda96bf86d2923f2cf176 (MIT, see LICENSE).
+# src/* is byte-exact upstream EXCEPT two additive patches, both tagged
+# "anima patch" in-line:
+#   - device/virtio_block_disk.rs: contents_len field + dump_contents()
+#     (read the guest-modified disk image back out for persisting)
+#   - mmu.rs: get_disk() accessor
+# This Cargo.toml is ours (upstream's declares a cli/wasm workspace we
+# don't vendor).
+[package]
+name = "riscv_emu_rust"
+version = "0.2.0"
+description = "RISC-V emulator written in Rust (vendored for anima)"
+license = "MIT"
+publish = false
+
+[dependencies]
+fnv = "1.0.7"

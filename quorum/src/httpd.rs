@@ -349,6 +349,14 @@ impl Server {
 
     /// Flush write buffers, heartbeat SSE, reap dead/expired conns, sleep.
     pub fn flush_and_sleep(&mut self) {
+        let busy = self.flush();
+        std::thread::sleep(Duration::from_millis(if busy { 2 } else { 25 }));
+    }
+
+    /// Like `flush_and_sleep` but without the sleep, for apps whose main
+    /// loop has real work to do between polls (anima steps a CPU); returns
+    /// whether any bytes moved.
+    pub fn flush(&mut self) -> bool {
         let now = Instant::now();
         let mut busy = false;
         self.conns.retain_mut(|conn| {
@@ -400,7 +408,7 @@ impl Server {
                 }
             }
         });
-        std::thread::sleep(Duration::from_millis(if busy { 2 } else { 25 }));
+        busy
     }
 }
 

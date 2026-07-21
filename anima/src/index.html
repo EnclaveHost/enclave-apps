@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>anima — a machine running on the enclave's CPU</title>
+<link rel="stylesheet" href="/a/xterm.css">
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #13161e; --panel2: #181c26; --border: #252b38;
+    --text: #e8ebf1; --dim: #868ea0; --accent: #6bd0c4; --accent-hi: #9be7dd;
+    --err: #f2b8c0; --warn: #f5d58a; --ok: #7fd4a8;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 1080px; margin: 0 auto; padding: 0 16px 48px;
+  }
+  header { padding: 22px 0 12px; border-bottom: 1px solid var(--border); }
+  .brand { font: 700 22px/1 ui-monospace, "SF Mono", monospace; letter-spacing: .5px; color: var(--accent); }
+  .brand b { color: var(--accent-hi); }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .banner {
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 11px 14px; margin-top: 16px; font-size: 12.5px; color: var(--dim);
+  }
+  .banner b { color: var(--text); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-top: 16px; }
+  h2 { font: 600 15px ui-monospace, monospace; }
+  .meta { color: var(--dim); font-size: 12px; font-family: ui-monospace, monospace; word-break: break-all; margin-top: 4px; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 9px; margin-left: 8px; vertical-align: 1px; }
+  .badge.idle { background: #2a2f3e; color: var(--dim); }
+  .badge.loading { background: #33402f; color: var(--warn); }
+  .badge.running { background: #12332e; color: var(--accent-hi); }
+  .badge.halted { background: #2a2f3e; color: var(--dim); }
+  .badge.error { background: #3a1f24; color: var(--err); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hi); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .spacer { flex: 1; }
+  button {
+    background: var(--accent); color: #062420; border: 0; border-radius: 8px;
+    padding: 8px 15px; font: 600 13px system-ui, sans-serif; cursor: pointer;
+  }
+  button:hover { background: var(--accent-hi); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.ghost:hover { background: var(--panel2); color: var(--text); }
+  button:disabled { opacity: .45; cursor: default; }
+  input {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font: 13px ui-monospace, monospace; min-width: 180px;
+  }
+  input::placeholder { color: #59627a; }
+  details.creds { font-size: 12.5px; color: var(--dim); margin-top: 10px; }
+  details.creds > summary { cursor: pointer; user-select: none; }
+  details.creds .row { margin-top: 8px; }
+  .stat { color: var(--dim); font: 12px ui-monospace, monospace; }
+  .stat b { color: var(--text); font-weight: 600; }
+  #term { margin-top: 14px; background: #000; border-radius: 8px; padding: 8px; min-height: 360px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 10px; white-space: pre-wrap; word-break: break-word; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 22px; line-height: 1.6; border-top: 1px solid var(--border); padding-top: 14px; }
+  footer b { color: var(--text); }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--warn); border-top-color: transparent; border-radius: 50%; animation: r .8s linear infinite; vertical-align: -1px; margin-right: 6px; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">[ an<b>ima</b> ]</div>
+  <div class="tag">a real machine breathing on the enclave's own CPU — you just hold the console</div>
+</header>
+
+<div class="banner">
+  This machine's CPU runs <b>inside the enclave</b>, the way a server-hosted emulator would — not in your browser.
+  The enclave pulls the kernel and root filesystem from an <b>S3 bucket</b>, boots them on a vendored pure-Rust
+  RISC-V system emulator, and streams the serial console here; your keystrokes go back into the guest. <b>Save disk</b>
+  writes the guest's changes back to the bucket.
+</div>
+
+<div class="card">
+  <div class="row">
+    <h2 id="title">machine</h2>
+    <span class="badge idle" id="phase">idle</span>
+    <span class="spacer"></span>
+    <span class="stat" id="stats"></span>
+  </div>
+  <div class="meta" id="where"></div>
+
+  <div class="row" id="controls">
+    <button id="startbtn">Boot machine</button>
+    <button id="resetbtn" class="ghost" style="display:none">Reboot (re-fetch)</button>
+    <button id="savebtn" class="ghost" style="display:none">Save disk to bucket</button>
+    <button id="stopbtn" class="ghost" style="display:none">Halt</button>
+  </div>
+  <details class="creds" id="credsbox">
+    <summary>S3 credentials — needed unless the bucket allows public reads (held in enclave RAM only)</summary>
+    <div class="row">
+      <input id="ak" placeholder="access key id" autocomplete="off">
+      <input id="sk" type="password" placeholder="secret access key" autocomplete="off">
+      <input id="st" type="password" placeholder="session token (optional)" autocomplete="off">
+    </div>
+  </details>
+  <div class="err" id="err" style="display:none"></div>
+
+  <div id="term"></div>
+</div>
+
+<footer>
+  <b>How this works.</b> anima is an Enclave <b>service app</b>: one attested process holds the machine in the
+  enclave's memory and serves this console over the deployment's in-enclave-terminated TLS. The machine is a vendored
+  pure-Rust RISC-V system emulator (RV64GC, Sv39 MMU, CLINT/PLIC/UART/virtio-blk) compiled to the same
+  <span style="font-family:ui-monospace,monospace">wasm32-wasip2</span> target as the rest of the fleet and stepped
+  under wasmtime in the TEE. Images are fetched from the configured S3 bucket over the platform's transparent egress
+  (SigV4-signed when credentials are set, unsigned for public buckets). Credentials you type are sent only to this
+  app, over TLS, and live only in enclave RAM. Verify the code running your machine with the deployment's remote
+  attestation at <a href="https://enclave.host" target="_blank" rel="noreferrer">enclave.host</a>.
+</footer>
+
+<script src="/a/xterm.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const b64dec = (s) => { const bin = atob(s); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+
+const term = new Terminal({ fontSize: 13, scrollback: 8000, cols: 100, rows: 26,
+  theme: { background: "#000000" }, cursorBlink: true });
+term.open($("term"));
+const dec = new TextDecoder();
+let evs = null, poll = null, running = false;
+
+term.onData((d) => {
+  if (!running) return;
+  // send raw bytes (UTF-8) as the request body
+  fetch("/input", { method: "POST", body: new TextEncoder().encode(d) }).catch(() => {});
+});
+
+function connectConsole() {
+  if (evs) return;
+  evs = new EventSource("/console");
+  evs.onmessage = (e) => { if (e.data) term.write(dec.decode(b64dec(e.data))); };
+  evs.onerror = () => {};
+}
+
+function credsBody(extra) {
+  const b = { ...extra };
+  const ak = $("ak").value.trim(), sk = $("sk").value.trim(), st = $("st").value.trim();
+  if (ak) b.accessKeyId = ak;
+  if (sk) b.secretAccessKey = sk;
+  if (st) b.sessionToken = st;
+  return b;
+}
+
+async function start(reset) {
+  $("err").style.display = "none";
+  $("startbtn").disabled = $("resetbtn").disabled = true;
+  $("phase").className = "badge loading"; $("phase").textContent = "loading";
+  try {
+    const r = await fetch("/start", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(credsBody({ reset: !!reset })) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error?.message || `HTTP ${r.status}`); }
+    term.clear();
+    connectConsole();
+  } catch (e) {
+    showErr(e.message || e);
+    $("startbtn").disabled = $("resetbtn").disabled = false;
+  }
+}
+
+async function save() {
+  $("savebtn").disabled = true;
+  const old = $("savebtn").textContent;
+  $("savebtn").innerHTML = '<span class="spin"></span>saving…';
+  try {
+    const r = await fetch("/save", { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+    $("savebtn").textContent = "saved ✓";
+    setTimeout(() => { $("savebtn").textContent = old; $("savebtn").disabled = false; }, 2500);
+  } catch (e) {
+    showErr("save failed: " + (e.message || e));
+    $("savebtn").textContent = old; $("savebtn").disabled = false;
+  }
+}
+
+async function stop() {
+  if (!confirm("Halt the machine? Unsaved disk changes are lost.")) return;
+  await fetch("/stop", { method: "POST" }).catch(() => {});
+  refresh();
+}
+
+function showErr(m) { $("err").style.display = ""; $("err").textContent = m; }
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch("/status")).json(); } catch { return; }
+  $("title").textContent = s.title || "machine";
+  $("phase").className = "badge " + s.phase;
+  $("phase").textContent = s.phase;
+  const imgs = s.kernelBytes != null ? ` · kernel ${fmt(s.kernelBytes)} · fs ${fmt(s.fsBytes)}` : "";
+  $("where").innerHTML = `s3 ${esc(s.endpoint)} → ${esc(s.bucket)} · kernel <b>${esc(s.kernel)}</b>, fs <b>${esc(s.fs)}</b>${imgs}`
+    .replace(/<b>/g, '<b style="color:var(--text)">');
+  running = s.phase === "running";
+  $("startbtn").style.display = (s.phase === "running") ? "none" : "";
+  $("startbtn").disabled = s.phase === "loading";
+  $("startbtn").textContent = (s.phase === "halted" || s.phase === "error") ? "Boot again" : "Boot machine";
+  $("resetbtn").style.display = running ? "" : "none";
+  $("stopbtn").style.display = running ? "" : "none";
+  $("savebtn").style.display = (running && s.saveKey && !s.readOnly) ? "" : "none";
+  $("credsbox").style.display = running ? "none" : "";
+  if (running) {
+    $("stats").innerHTML = `<b>${(s.instret / 1e9).toFixed(2)}B</b> instr · <b>${s.mips.toFixed(1)}</b> MIPS · <b>${fmt(s.consoleBytes)}</b> console`;
+    connectConsole();
+  } else {
+    $("stats").textContent = "";
+  }
+  if (s.error) showErr(s.error); else if (s.phase !== "error") $("err").style.display = "none";
+}
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(1) + " KiB" : n + " B";
+
+$("startbtn").onclick = () => start(false);
+$("resetbtn").onclick = () => { if (confirm("Reboot and re-fetch images from the bucket? Unsaved disk changes are lost.")) start(true); };
+$("savebtn").onclick = save;
+$("stopbtn").onclick = stop;
+
+refresh();
+poll = setInterval(refresh, 1500);
+</script>
+</body>
+</html>

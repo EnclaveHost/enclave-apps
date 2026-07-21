@@ -1,0 +1,28 @@
+[package]
+name = "anima"
+version = "0.1.0"
+edition = "2021"
+description = "Boot a real machine on the enclave's CPU from OS images in S3, with the serial console bridged to the browser — a pure-Rust RISC-V system emulator compiled to wasm32-wasip2, run as an Enclave service app."
+license = "MIT"
+publish = false
+
+# A run-mode service app (single wasm32-wasip2 command component): std maps to
+# wasi:sockets/clocks/cli. Dependencies are the emulator (vendored, path) and a
+# pure-Rust TLS stack — the only one that builds for wasm32-wasip2 — plus the
+# SigV4 hash primitives. serde_json parses the app config. The suite's httpd.rs
+# and the S3 client are hand-rolled std (src/httpd.rs, src/s3.rs).
+[dependencies]
+riscv_emu_rust = { path = "emu" }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+sha2 = "0.10"
+hmac = "0.12"
+
+[profile.release]
+opt-level = 3       # the CPU loop is hot; favor speed over size here
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
