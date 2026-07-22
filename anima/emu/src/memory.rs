@@ -38,12 +38,13 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn read_halfword(&self, address: u64) -> u16 {
-		if (address % 2) == 0 {
-			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
-			(self.data[index] >> pos) as u16
-		} else {
-			self.read_bytes(address, 2) as u16
+		// anima patch: any alignment reads from at most two cells (the
+		// misaligned fallback was a per-byte loop)
+		let index = (address >> 3) as usize;
+		let pos = ((address % 8) as u64) * 8;
+		match pos <= 48 {
+			true => (self.data[index] >> pos) as u16,
+			false => ((self.data[index] >> pos) | (self.data[index + 1] << (64 - pos))) as u16
 		}
 	}
 
@@ -52,12 +53,14 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn read_word(&self, address: u64) -> u32 {
-		if (address % 4) == 0 {
-			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
-			(self.data[index] >> pos) as u32
-		} else {
-			self.read_bytes(address, 4) as u32
+		// anima patch: any alignment reads from at most two cells. This is
+		// hot: compressed instructions put half of all 4-byte fetches at
+		// address % 4 == 2, which used to take the per-byte loop.
+		let index = (address >> 3) as usize;
+		let pos = ((address % 8) as u64) * 8;
+		match pos <= 32 {
+			true => (self.data[index] >> pos) as u32,
+			false => ((self.data[index] >> pos) | (self.data[index + 1] << (64 - pos))) as u32
 		}
 	}
 
@@ -66,13 +69,14 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn read_doubleword(&self, address: u64) -> u64 {
-		if (address % 8) == 0 {
-			let index = (address >> 3) as usize;
-			self.data[index]
-		} else if (address % 4) == 0 {
-			(self.read_word(address) as u64) | ((self.read_word(address.wrapping_add(4)) as u64) << 4)
-		} else {
-			self.read_bytes(address, 8)
+		// anima patch: any alignment reads from at most two cells. Also
+		// fixes an upstream bug: the 4-aligned path shifted the high word
+		// by 4 instead of 32, corrupting misaligned doubleword loads.
+		let index = (address >> 3) as usize;
+		let pos = ((address % 8) as u64) * 8;
+		match pos == 0 {
+			true => self.data[index],
+			false => (self.data[index] >> pos) | (self.data[index + 1] << (64 - pos))
 		}
 	}
 
@@ -106,12 +110,14 @@ impl Memory {
 	/// * `address`
 	/// * `value`
 	pub fn write_halfword(&mut self, address: u64, value: u16) {
-		if (address % 2) == 0 {
-			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
-			self.data[index] = (self.data[index] & !(0xffff << pos)) | ((value as u64) << pos);
-		} else {
-			self.write_bytes(address, value as u64, 2);
+		// anima patch: any alignment writes at most two cells
+		let index = (address >> 3) as usize;
+		let pos = ((address % 8) as u64) * 8;
+		self.data[index] = (self.data[index] & !(0xffffu64 << pos)) | ((value as u64) << pos);
+		if pos > 48 {
+			let shift = 64 - pos;
+			self.data[index + 1] =
+				(self.data[index + 1] & !(0xffffu64 >> shift)) | ((value as u64) >> shift);
 		}
 	}
 
@@ -121,12 +127,14 @@ impl Memory {
 	/// * `address`
 	/// * `value`
 	pub fn write_word(&mut self, address: u64, value: u32) {
-		if (address % 4) == 0 {
-			let index = (address >> 3) as usize;
-			let pos = ((address % 8) as u64) * 8;
-			self.data[index] = (self.data[index] & !(0xffffffff << pos)) | ((value as u64) << pos);
-		} else {
-			self.write_bytes(address, value as u64, 4);
+		// anima patch: any alignment writes at most two cells
+		let index = (address >> 3) as usize;
+		let pos = ((address % 8) as u64) * 8;
+		self.data[index] = (self.data[index] & !(0xffffffffu64 << pos)) | ((value as u64) << pos);
+		if pos > 32 {
+			let shift = 64 - pos;
+			self.data[index + 1] =
+				(self.data[index + 1] & !(0xffffffffu64 >> shift)) | ((value as u64) >> shift);
 		}
 	}
 
@@ -136,14 +144,17 @@ impl Memory {
 	/// * `address`
 	/// * `value`
 	pub fn write_doubleword(&mut self, address: u64, value: u64) {
-		if (address % 8) == 0 {
-			let index = (address >> 3) as usize;
-			self.data[index] = value;
-		} else if (address % 4) == 0 {
-			self.write_word(address, (value & 0xffffffff) as u32);
-			self.write_word(address.wrapping_add(4), (value >> 32) as u32);
-		} else {
-			self.write_bytes(address, value, 8);
+		// anima patch: any alignment writes at most two cells
+		let index = (address >> 3) as usize;
+		let pos = ((address % 8) as u64) * 8;
+		match pos == 0 {
+			true => self.data[index] = value,
+			false => {
+				let shift = 64 - pos;
+				self.data[index] = (self.data[index] & !(u64::MAX << pos)) | (value << pos);
+				self.data[index + 1] =
+					(self.data[index + 1] & !(u64::MAX >> shift)) | (value >> shift);
+			}
 		}
 	}
 

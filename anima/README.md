@@ -26,9 +26,29 @@ anima vendors one:
 RISC-V system emulator (RV64GC, Sv39 MMU, CLINT + PLIC + 16550 UART + virtio
 block) that boots real Linux. It compiles to the same target as the rest of
 the fleet and steps instruction-by-instruction in the TEE. The source lives
-in [`emu/`](emu/), byte-for-byte upstream except two additive, in-line-tagged
-patches (`dump_contents()` / `get_disk()`) that read the guest-modified disk
-back out for saving.
+in [`emu/`](emu/); every divergence from upstream is tagged `anima patch`
+in-line. Beyond the original two (`dump_contents()` / `get_disk()`, which read
+the guest-modified disk back out for saving) there are six performance
+patches, measured end-to-end at 2.8× throughput and 2.5× faster boot:
+
+- a direct-mapped **software TLB** in front of the Sv32/Sv39 page walk,
+  tagged with a generation counter plus the translation-relevant CPU state;
+  satp/mode changes and `SFENCE.VMA` (a no-op upstream — honored here)
+  invalidate in O(1), and entries are filled only by walks that already set
+  the PTE A/D bits, so hits never touch the page table;
+- a **predecoded instruction cache** keyed by virtual PC: on a hit, one tag
+  compare replaces fetch translation, memory read, RVC uncompression, and
+  decode. Self-modifying code is handled properly — pages backing cached
+  instructions are marked, and every DRAM write (CPU store *or* virtio DMA;
+  both funnel through one wrapper) that touches a marked page invalidates
+  the cache by generation bump;
+- the LRU decode cache (hash map + linked list on every hit) replaced by a
+  **direct-mapped decode table** — one shift, one mask, one compare;
+- misaligned memory access **two-cell paths** replacing per-byte loops
+  (compressed instructions put half of all fetches at `pc % 4 == 2`), which
+  also fixes an upstream bug corrupting 4-aligned misaligned 8-byte loads;
+- the cycle CSR materialized **lazily on read** instead of written every tick;
+- `Cpu::is_idle()`, so the host can throttle a guest parked in WFI.
 
 ## Architecture
 
@@ -147,19 +167,26 @@ wasmtime run -Stcp -Sinherit-network -Sallow-ip-name-lookup \
 ```
 
 Open `http://127.0.0.1:8000/`, press **Boot machine**, and a RISC-V Linux
-boots to a login shell in roughly ten seconds. The verification driven over
-this rig covered: a SigV4 GET of a 9.9 MB kernel + 52 MB rootfs from minio, the
-boot reaching a shell, an interactive command typed in the browser reaching the
-guest and echoing back over SSE, and a **52 MB SigV4 PUT** of the guest disk to
-the bucket (confirmed present and correctly sized).
+boots to a shell in about four seconds. The verification driven over this rig
+covered: a SigV4 GET of a 9.9 MB kernel + 52 MB rootfs from minio, the boot
+reaching a shell, an interactive command typed in the browser reaching the
+guest and echoing back over SSE, a file written inside the guest and — after
+**Save disk** — found byte-for-byte inside the **52 MB SigV4 PUT** image in
+the bucket, a script written and then executed inside the guest (the
+self-modifying-code path), and a wake-up round-trip after a long idle
+(throttled) stretch. [`scripts/bench.py`](scripts/bench.py) replays all of
+it.
 
 ## Caveats, honestly
 
 - **RISC-V RV64 only, one hart.** anima runs what the vendored emulator runs:
   a single-core RISC-V `virt`-style machine. Not x86, not multi-core.
-- **Emulated speed.** The interpreter turns tens of MIPS under wasmtime — fine
+- **Emulated speed.** The interpreter turns ~29 MIPS under wasmtime (software
+  TLB + predecoded instruction cache; measured on the sample image) — fine
   for a shell, a build, a demo; not a fast VM. There is no KVM in a TEE wasm
-  sandbox; this is pure interpretation.
+  sandbox; this is pure interpretation. An idle guest parked in WFI is
+  throttled to ~1–2% host CPU; keystrokes force full-speed batches so the
+  console stays snappy.
 - **Blocking image load.** Fetching the images (tens of MB over TLS) happens
   in the event loop, so the console briefly stalls for other clients during a
   boot. One-time, a few seconds.

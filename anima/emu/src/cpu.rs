@@ -1,6 +1,6 @@
 extern crate fnv;
 
-use self::fnv::FnvHashMap;
+// anima patch: FnvHashMap import removed (DecodeCache is direct-mapped now)
 
 use mmu::{AddressingMode, Mmu};
 use terminal::Terminal;
@@ -73,6 +73,14 @@ pub struct Cpu {
 	is_reservation_set: bool,
 	_dump_flag: bool,
 	decode_cache: DecodeCache,
+	// anima patch: predecoded instruction cache, direct-mapped by virtual
+	// PC (see tick_operate). tags = pc, metas = mmu.exec_meta() at fill
+	// time (0 = invalid), words = the uncompressed instruction word,
+	// data = INSTRUCTIONS index | ICACHE_LEN4 for 4-byte instructions.
+	icache_tags: Vec<u64>,
+	icache_metas: Vec<u64>,
+	icache_words: Vec<u32>,
+	icache_data: Vec<u16>,
 	unsigned_data_mask: u64
 }
 
@@ -233,6 +241,11 @@ impl Cpu {
 			is_reservation_set: false,
 			_dump_flag: false,
 			decode_cache: DecodeCache::new(),
+			// anima patch: predecode cache starts empty (meta 0 = invalid)
+			icache_tags: vec![0; ICACHE_ENTRY_NUM],
+			icache_metas: vec![0; ICACHE_ENTRY_NUM],
+			icache_words: vec![0; ICACHE_ENTRY_NUM],
+			icache_data: vec![0; ICACHE_ENTRY_NUM],
 			unsigned_data_mask: 0xffffffffffffffff
 		};
 		cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
@@ -278,6 +291,13 @@ impl Cpu {
 		self.pc
 	}
 
+	// anima patch: true while the hart is parked in WFI with no enabled
+	// interrupt pending (the same condition tick_operate uses to leave WFI).
+	// Lets an embedder throttle ticking when the guest is idle.
+	pub fn is_idle(&self) -> bool {
+		self.wfi && (self.read_csr_raw(CSR_MIE_ADDRESS) & self.read_csr_raw(CSR_MIP_ADDRESS)) == 0
+	}
+
 	/// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
 	pub fn tick(&mut self) {
 		let instruction_address = self.pc;
@@ -292,7 +312,8 @@ impl Cpu {
 		// cpu core clock : mtime clock in clint = 8 : 1 is
 		// just an arbiraty ratio.
 		// @TODO: Implement more properly
-		self.write_csr_raw(CSR_CYCLE_ADDRESS, self.clock * 8);
+		// anima patch: CSR_CYCLE is now materialized lazily in read_csr_raw()
+		// (same pattern as CSR_TIME) instead of being written every tick.
 	}
 
 	// @TODO: Rename?
@@ -303,6 +324,26 @@ impl Cpu {
 				self.wfi = false;
 			}
 			return Ok(());
+		}
+
+		// anima patch: predecoded-instruction fast path. One tag compare
+		// replaces fetch translation, memory read, uncompress, and decode.
+		// The meta embeds every input the cached result depends on: the
+		// TLB generation and CPU translation state, and the code
+		// generation (bumped when a marked executable page is written).
+		let slot = ((self.pc >> 1) as usize) & (ICACHE_ENTRY_NUM - 1);
+		if self.icache_tags[slot] == self.pc && self.icache_metas[slot] == self.mmu.exec_meta() {
+			let instruction_address = self.pc;
+			let word = self.icache_words[slot];
+			let data = self.icache_data[slot];
+			self.pc = self.pc.wrapping_add(match data & ICACHE_LEN4 {
+				0 => 2,
+				_ => 4
+			});
+			let result = (INSTRUCTIONS[(data & !ICACHE_LEN4) as usize].operation)(
+				self, word, instruction_address);
+			self.x[0] = 0; // hardwired zero
+			return result;
 		}
 
 		let original_word = match self.fetch() {
@@ -321,22 +362,51 @@ impl Cpu {
 			}
 		};
 
-		match self.decode(word) {
-			Ok(inst) => {
-				let result = (inst.operation)(self, word, instruction_address);
-				self.x[0] = 0; // hardwired zero
-				return result;
-			},
-			Err(()) => {
-				panic!("Unknown instruction PC:{:x} WORD:{:x}", instruction_address, original_word);
+		// anima patch: decode to an INSTRUCTIONS index (decode() would only
+		// give the reference; the fill below needs the index).
+		let index = match self.decode_cache.get(word) {
+			Some(index) => index,
+			None => match self.decode_and_get_instruction_index(word) {
+				Ok(index) => {
+					self.decode_cache.insert(word, index);
+					index
+				},
+				Err(()) => {
+					panic!("Unknown instruction PC:{:x} WORD:{:x}", instruction_address, original_word);
+				}
 			}
 		};
+
+		// anima patch: fill the predecode cache when the instruction sits
+		// safely inside one DRAM page, so a single page mark covers every
+		// byte the cached entry was built from.
+		if (instruction_address & 0xfff) <= 0xff8 {
+			if let Ok(p_address) = self.mmu.translate_fetch(instruction_address) {
+				if self.mmu.mark_exec_page(p_address) {
+					self.icache_tags[slot] = instruction_address;
+					self.icache_metas[slot] = self.mmu.exec_meta();
+					self.icache_words[slot] = word;
+					self.icache_data[slot] = index as u16
+						| (match (original_word & 0x3) == 0x3 {
+							true => ICACHE_LEN4,
+							false => 0
+						});
+				}
+			}
+		}
+
+		let result = (INSTRUCTIONS[index].operation)(self, word, instruction_address);
+		self.x[0] = 0; // hardwired zero
+		result
 	}
 
 	/// Decodes a word instruction data and returns a reference to
 	/// [`Instruction`](struct.Instruction.html). Using [`DecodeCache`](struct.DecodeCache.html)
 	/// so if cache hits this method returns the result very quickly.
 	/// The result will be stored to cache.
+	// anima patch: tick_operate now decodes inline (it needs the index for
+	// the predecode cache); this remains for the unit tests.
+	#[allow(dead_code)]
 	fn decode(&mut self, word: u32) -> Result<&Instruction, ()> {
 		match self.decode_cache.get(word) {
 			Some(index) => return Ok(&INSTRUCTIONS[index]),
@@ -710,6 +780,9 @@ impl Cpu {
 			CSR_SIE_ADDRESS => self.csr[CSR_MIE_ADDRESS as usize] & 0x222,
 			CSR_SIP_ADDRESS => self.csr[CSR_MIP_ADDRESS as usize] & 0x222,
 			CSR_TIME_ADDRESS => self.mmu.get_clint().read_mtime(),
+			// anima patch: cycle counter computed from clock on read; the
+			// per-tick write_csr_raw(CSR_CYCLE, clock * 8) in tick() is gone.
+			CSR_CYCLE_ADDRESS => self.clock.wrapping_mul(8),
 			_ => self.csr[address as usize]
 		}
 	}
@@ -3038,8 +3111,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		mask: 0xfe007fff,
 		data: 0x12000073,
 		name: "SFENCE.VMA",
-		operation: |_cpu, _word, _address| {
-			// Do nothing?
+		operation: |cpu, _word, _address| {
+			// anima patch: was a no-op; the software TLB must honor it
+			cpu.mmu.sfence_vma();
 			Ok(())
 		},
 		disassemble: dump_empty
@@ -3375,10 +3449,18 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 /// You need to carefully choose the number. Too small number causes
 /// bad cache hit ratio. Too large number causes memory consumption
 /// and host hardware CPU cache memory miss.
-const DECODE_CACHE_ENTRY_NUM: usize = 0x1000;
+const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // anima patch: was 0x1000
 
-const INVALID_CACHE_ENTRY: usize = INSTRUCTION_NUM;
-const NULL_ENTRY: usize = DECODE_CACHE_ENTRY_NUM;
+// anima patch: predecoded instruction cache geometry. Slots are indexed by
+// pc >> 1 (compressed instructions are 2-byte aligned), so the cache covers
+// a 32 KiB direct-mapped code window.
+const ICACHE_ENTRY_NUM: usize = 0x4000;
+const ICACHE_LEN4: u16 = 0x8000;
+
+// anima patch: tag layout for the direct-mapped cache below — the decoded
+// word plus a valid bit above bit 31, so no 32-bit word value (0, all-ones)
+// can false-hit against an empty slot.
+const DECODE_TAG_VALID: u64 = 1 << 32;
 
 /// `DecodeCache` provides a cache system for instruction decoding.
 /// It holds the recent [`DECODE_CACHE_ENTRY_NUM`](constant.DECODE_CACHE_ENTRY_NUM.html)
@@ -3389,28 +3471,18 @@ const NULL_ENTRY: usize = DECODE_CACHE_ENTRY_NUM;
 /// that some loops in a program consume the majority of time then this cache
 /// system is expected to reduce the decoding time very well.
 ///
-/// This cache system is based on LRU algorithm, and consists of a hash map and
-/// a linked list. Linked list is for LRU, front means recently used and back
-/// means least recently used. A content in hash map points to an entry in the
-/// linked list. This is the key to achieve computing in O(1).
-///
-// @TODO: Write performance benchmark test to confirm this cache actually
-//        improves the speed.
+/// anima patch: the original implementation was an FnvHashMap plus a
+/// doubly-linked LRU list — a hash, a probe, and a three-node list splice
+/// on every HIT, in the interpreter's hottest path. Decoding is a pure
+/// function of the word, so eviction policy is only a hit-rate concern;
+/// this direct-mapped table trades a little hit rate for a lookup that is
+/// a shift, a mask, and one compare.
 struct DecodeCache {
-	/// Holds mappings from word instruction data to an index of `entries`
-	/// pointing to the entry having the decoding result. Containing the word
-	/// means cache hit.
-	hash_map: FnvHashMap::<u32, usize>,
+	/// `word | DECODE_TAG_VALID` per slot; 0 = empty slot
+	tags: Vec<u64>,
 
-	/// Holds the entries [`DecodeCacheEntry`](struct.DecodeCacheEntry.html)
-	/// forming linked list.
-	entries: Vec<DecodeCacheEntry>,
-
-	/// An index of `entries` pointing to the head entry in the linked list
-	front_index: usize,
-
-	/// An index of `entries` pointing to the tail entry in the linked list
-	back_index: usize,
+	/// The decode result per slot. An index of [`INSTRUCTIONS`](constant.INSTRUCTIONS.html).
+	vals: Vec<usize>,
 
 	/// Cache hit count for debugging purpose
 	hit_count: u64,
@@ -3422,135 +3494,49 @@ struct DecodeCache {
 impl DecodeCache {
 	/// Creates a new `DecodeCache`.
 	fn new() -> Self {
-		// Initialize linked list
-		let mut entries = Vec::new();
-		for i in 0..DECODE_CACHE_ENTRY_NUM {
-			let next_index = match i == DECODE_CACHE_ENTRY_NUM - 1 {
-				true => NULL_ENTRY,
-				false => i + 1
-			};
-			let prev_index = match i == 0 {
-				true => NULL_ENTRY,
-				false => i - 1
-			};
-			entries.push(DecodeCacheEntry::new(next_index, prev_index));
-		}
-
 		DecodeCache {
-			hash_map: FnvHashMap::default(),
-			entries: entries,
-			front_index: 0,
-			back_index: DECODE_CACHE_ENTRY_NUM - 1,
+			tags: vec![0; DECODE_CACHE_ENTRY_NUM],
+			vals: vec![0; DECODE_CACHE_ENTRY_NUM],
 			hit_count: 0,
 			miss_count: 0
 		}
 	}
 
-	/// Gets the cached decoding result. If hits this method moves the
-	/// cache entry to front of the linked list and returns an index of
-	/// [`INSTRUCTIONS`](constant.INSTRUCTIONS.html).
-	/// Otherwise returns `None`. This operation should compute in O(1) time.
+	/// The slot a word maps to. The low two bits of a full-width RISC-V
+	/// instruction are always 0b11, so they are shifted out; higher funct
+	/// bits are folded in for spread.
+	fn slot(word: u32) -> usize {
+		(((word >> 2) ^ (word >> 17)) as usize) & (DECODE_CACHE_ENTRY_NUM - 1)
+	}
+
+	/// Gets the cached decoding result as an index of
+	/// [`INSTRUCTIONS`](constant.INSTRUCTIONS.html), or `None` on miss.
 	///
 	/// # Arguments
 	/// * `word` word instruction data
 	fn get(&mut self, word: u32) -> Option<usize> {
-		let result = match self.hash_map.get(&word) {
-			Some(index) => {
+		let slot = DecodeCache::slot(word);
+		match self.tags[slot] == word as u64 | DECODE_TAG_VALID {
+			true => {
 				self.hit_count += 1;
-				// Move the entry to front of the list unless it is at front.
-				if self.front_index != *index {
-					let next_index = self.entries[*index].next_index;
-					let prev_index = self.entries[*index].prev_index;
-
-					// Remove the entry from the list
-					if self.back_index == *index {
-						self.back_index = prev_index;
-					} else {
-						self.entries[next_index].prev_index = prev_index;
-					}
-					self.entries[prev_index].next_index = next_index;
-
-					// Push the entry to front
-					self.entries[*index].prev_index = NULL_ENTRY;
-					self.entries[*index].next_index = self.front_index;
-					self.entries[self.front_index].prev_index = *index;
-					self.front_index = *index;
-				}
-				Some(self.entries[*index].instruction_index)
+				Some(self.vals[slot])
 			},
-			None => {
+			false => {
 				self.miss_count += 1;
 				None
 			}
-		};
-		//println!("Hit:{:X}, Miss:{:X}, Ratio:{}", self.hit_count, self.miss_count,
-		//	(self.hit_count as f64) / (self.hit_count + self.miss_count) as f64);
-		result
+		}
 	}
 
-	/// Inserts a new decode result to front of the linked list while removing
-	/// the least recently used result from the list. This operation should
-	/// compute in O(1) time.
+	/// Inserts a new decode result, evicting whatever occupied the slot.
 	///
 	/// # Arguments
 	/// * `word`
 	/// * `instruction_index`
 	fn insert(&mut self, word: u32, instruction_index: usize) {
-		let index = self.back_index;
-
-		// Remove the least recently used entry. The entry resource
-		// is reused as new entry.
-		if self.entries[index].instruction_index != INVALID_CACHE_ENTRY {
-			self.hash_map.remove(&self.entries[index].word);
-		}
-		self.back_index = self.entries[index].prev_index;
-		self.entries[self.back_index].next_index = NULL_ENTRY;
-
-		// Push the new entry to front of the linked list
-		self.hash_map.insert(word, index);
-		self.entries[index].prev_index = NULL_ENTRY;
-		self.entries[index].next_index = self.front_index;
-		self.entries[index].word = word;
-		self.entries[index].instruction_index = instruction_index;
-		self.entries[self.front_index].prev_index = index;
-		self.front_index = index;
-	}
-}
-
-/// An entry of linked list managed by [`DecodeCache`](struct.DecodeCache.html).
-/// An entry consists of a mapping from word instruction data to an index of
-/// [`INSTRUCTIONS`](constant.INSTRUCTIONS.html) and next/previous entry index
-/// in the linked list.
-struct DecodeCacheEntry {
-	/// Instruction word data
-	word: u32,
-
-	/// The result of decoding `word`. An index of [`INSTRUCTIONS`](constant.INSTRUCTIONS.html).
-	instruction_index: usize,
-
-	/// Next entry index in the linked list. [`NULL_ENTRY`](constant.NULL_ENTRY.html)
-	/// represents no next entry, meaning the entry is at tail.
-	next_index: usize,
-
-	/// Previous entry index in the linked list. [`NULL_ENTRY`](constant.NULL_ENTRY.html)
-	/// represents no previous entry, meaning the entry is at head.
-	prev_index: usize
-}
-
-impl DecodeCacheEntry {
-	/// Creates a new entry. Initial `instruction_index` is
-	/// `INVALID_CACHE_ENTRY` meaning the entry is invalid.
-	///
-	/// # Arguments
-	/// * `next_index`
-	/// * `prev_index`
-	fn new(next_index: usize, prev_index: usize) -> Self {
-		DecodeCacheEntry {
-			word: 0,
-			instruction_index: INVALID_CACHE_ENTRY,
-			next_index: next_index,
-			prev_index: prev_index
-		}
+		let slot = DecodeCache::slot(word);
+		self.tags[slot] = word as u64 | DECODE_TAG_VALID;
+		self.vals[slot] = instruction_index;
 	}
 }
 
@@ -3925,8 +3911,10 @@ mod test_decode_cache {
 		};
 	}
 
+	// anima patch: the cache is direct-mapped now (LRU is gone). Colliding
+	// words evict each other; non-colliding words coexist regardless of age.
 	#[test]
-	fn lru() {
+	fn direct_mapped() {
 		let mut cache = DecodeCache::new();
 		cache.insert(0, 1);
 
@@ -3935,29 +3923,31 @@ mod test_decode_cache {
 			None => panic!("Unexpected cache miss")
 		};
 
-		for i in 1..DECODE_CACHE_ENTRY_NUM + 1 {
-			cache.insert(i as u32, i + 1);
-		}
+		// Non-colliding words (slots 1, 2, 3) coexist with word 0 (slot 0)
+		cache.insert(4, 10);
+		cache.insert(8, 11);
+		cache.insert(12, 12);
+		match cache.get(0) {
+			Some(index) => assert_eq!(1, index),
+			None => panic!("Unexpected cache miss")
+		};
 
-		// The oldest entry should have been removed because of the overflow
+		// 0x20004 hashes to slot 0 too and must evict word 0
+		assert_eq!(DecodeCache::slot(0), DecodeCache::slot(0x20004));
+		cache.insert(0x20004, 7);
 		match cache.get(0) {
 			Some(_index) => panic!("Unexpected cache hit"),
 			None => {}
 		};
-
-		// With this .get(), the entry with the word "1" moves to the tail of the list
-		// and the entry with the word "2" becomes the oldest entry.
-		match cache.get(1) {
-			Some(index) => assert_eq!(2, index),
-			None => {}
+		match cache.get(0x20004) {
+			Some(index) => assert_eq!(7, index),
+			None => panic!("Unexpected cache miss")
 		};
 
-		// The oldest entry with the word "2" will be removed due to the overflow
-		cache.insert(DECODE_CACHE_ENTRY_NUM as u32 + 1, DECODE_CACHE_ENTRY_NUM + 2);
-
-		match cache.get(2) {
-			Some(_index) => panic!("Unexpected cache hit"),
-			None => {}
+		// The non-colliding neighbors are untouched by the eviction
+		match cache.get(8) {
+			Some(index) => assert_eq!(11, index),
+			None => panic!("Unexpected cache miss")
 		};
 	}
 }

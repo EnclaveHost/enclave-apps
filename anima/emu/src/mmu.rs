@@ -52,8 +52,30 @@ pub struct Mmu {
 	page_cache_enabled: bool,
 	fetch_page_cache: FnvHashMap<u64, u64>,
 	load_page_cache: FnvHashMap<u64, u64>,
-	store_page_cache: FnvHashMap<u64, u64>
+	store_page_cache: FnvHashMap<u64, u64>,
+
+	// anima patch: direct-mapped software TLB (always on; supersedes the
+	// experimental page cache above). One direct-mapped array per access
+	// type. Tags fold in a generation counter plus the translation-relevant
+	// CPU state (privilege mode, mstatus.MPRV/MPP as this emulator reads
+	// them), so privilege transitions need no flush; satp/xlen/mode changes
+	// and SFENCE.VMA invalidate everything with an O(1) generation bump.
+	// Entries are written only after a successful walk, which has already
+	// set the PTE A (and, for stores, D) bit — so a hit never needs to
+	// touch the PTE again. Skipping the re-walk on later accesses is sound
+	// because the ISA requires an OS to SFENCE.VMA after changing a live
+	// PTE (upstream's page cache ignores that contract; this doesn't).
+	tlb_gen: u32,
+	tlb_tags: [[u64; TLB_SETS]; 3],
+	tlb_metas: [[u32; TLB_SETS]; 3],
+	tlb_ppns: [[u64; TLB_SETS]; 3]
 }
+
+// anima patch: TLB geometry/type indices
+const TLB_SETS: usize = 512;
+const TLB_EXECUTE: usize = 0;
+const TLB_READ: usize = 1;
+const TLB_WRITE: usize = 2;
 
 pub enum AddressingMode {
 	None,
@@ -109,7 +131,12 @@ impl Mmu {
 			page_cache_enabled: false,
 			fetch_page_cache: FnvHashMap::default(),
 			load_page_cache: FnvHashMap::default(),
-			store_page_cache: FnvHashMap::default()
+			store_page_cache: FnvHashMap::default(),
+			// anima patch: TLB starts empty at generation 1 (tag 0 = invalid)
+			tlb_gen: 1,
+			tlb_tags: [[0; TLB_SETS]; 3],
+			tlb_metas: [[0; TLB_SETS]; 3],
+			tlb_ppns: [[0; TLB_SETS]; 3]
 		}
 	}
 
@@ -120,6 +147,7 @@ impl Mmu {
 	pub fn update_xlen(&mut self, xlen: Xlen) {
 		self.xlen = xlen;
 		self.clear_page_cache();
+		self.tlb_flush(); // anima patch
 	}
 
 	/// Initializes Main memory. This method is expected to be called only once.
@@ -167,6 +195,58 @@ impl Mmu {
 		self.store_page_cache.clear();
 	}
 
+	// anima patch: O(1) whole-TLB invalidation via generation bump; a real
+	// wipe only happens when the 24-bit generation wraps.
+	fn tlb_flush(&mut self) {
+		self.tlb_gen = (self.tlb_gen + 1) & 0xffffff;
+		if self.tlb_gen == 0 {
+			self.tlb_tags = [[0; TLB_SETS]; 3];
+			self.tlb_gen = 1;
+			// generation reuse must not revive stale predecoded instructions
+			self.memory.bump_code_gen();
+		}
+	}
+
+	// anima patch: public fetch translation for the CPU's predecode fill.
+	pub fn translate_fetch(&mut self, v_address: u64) -> Result<u64, ()> {
+		self.translate_address(v_address, &MemoryAccessType::Execute)
+	}
+
+	// anima patch: everything a cached predecoded instruction depends on —
+	// the TLB meta (all translation inputs) plus the code generation
+	// (bumped when any marked executable page is written).
+	pub fn exec_meta(&self) -> u64 {
+		(self.tlb_meta() as u64) | ((self.memory.code_gen() as u64) << 32)
+	}
+
+	// anima patch: see MemoryWrapper::mark_exec_page.
+	pub fn mark_exec_page(&mut self, p_address: u64) -> bool {
+		self.memory.mark_exec_page(p_address)
+	}
+
+	// anima patch: SFENCE.VMA entry point (cpu.rs calls this; upstream
+	// treated the instruction as a no-op).
+	pub fn sfence_vma(&mut self) {
+		self.tlb_flush();
+		self.clear_page_cache();
+	}
+
+	// anima patch: the CPU state a translation depends on, packed for the
+	// TLB tag: generation | privilege | mstatus.MPRV | mstatus."MPP"
+	// (bits 17 and 9..10, exactly as translate_address_walk reads them).
+	fn tlb_meta(&self) -> u32 {
+		let priv_enc = match self.privilege_mode {
+			PrivilegeMode::User => 0u32,
+			PrivilegeMode::Supervisor => 1,
+			PrivilegeMode::Reserved => 2,
+			PrivilegeMode::Machine => 3
+		};
+		(self.tlb_gen << 8)
+			| (priv_enc << 6)
+			| ((((self.mstatus >> 17) & 1) as u32) << 5)
+			| ((((self.mstatus >> 9) & 3) as u32) << 3)
+	}
+
 	/// Runs one cycle of MMU and peripheral devices.
 	pub fn tick(&mut self, mip: &mut u64) {
 		self.clint.tick(mip);
@@ -183,6 +263,7 @@ impl Mmu {
 	pub fn update_addressing_mode(&mut self, new_addressing_mode: AddressingMode) {
 		self.addressing_mode = new_addressing_mode;
 		self.clear_page_cache();
+		self.tlb_flush(); // anima patch
 	}
 
 	/// Updates privilege mode
@@ -210,6 +291,7 @@ impl Mmu {
 	pub fn update_ppn(&mut self, ppn: u64) {
 		self.ppn = ppn;
 		self.clear_page_cache();
+		self.tlb_flush(); // anima patch
 	}
 
 	fn get_effective_address(&self, address: u64) -> u64 {
@@ -641,7 +723,37 @@ impl Mmu {
 		Ok(valid)
 	}
 
+	// anima patch: TLB fast path in front of the original walk (renamed to
+	// translate_address_walk below, body untouched). A hit is one array
+	// compare; a successful miss fills the entry for next time. DontCare
+	// accesses and bare (no-translation) mode bypass the TLB.
 	fn translate_address(&mut self, v_address: u64, access_type: &MemoryAccessType) -> Result<u64, ()> {
+		let ti = match access_type {
+			MemoryAccessType::Execute => TLB_EXECUTE,
+			MemoryAccessType::Read => TLB_READ,
+			MemoryAccessType::Write => TLB_WRITE,
+			MemoryAccessType::DontCare => usize::MAX
+		};
+		if ti == usize::MAX || matches!(self.addressing_mode, AddressingMode::None) {
+			return self.translate_address_walk(v_address, access_type);
+		}
+		let address = self.get_effective_address(v_address);
+		let set = ((address >> 12) as usize) & (TLB_SETS - 1);
+		let tag = (address & !0xfff) | 1; // bit 0 marks a valid entry
+		let meta = self.tlb_meta();
+		if self.tlb_tags[ti][set] == tag && self.tlb_metas[ti][set] == meta {
+			return Ok(self.tlb_ppns[ti][set] | (address & 0xfff));
+		}
+		let result = self.translate_address_walk(v_address, access_type);
+		if let Ok(p_address) = result {
+			self.tlb_tags[ti][set] = tag;
+			self.tlb_metas[ti][set] = meta;
+			self.tlb_ppns[ti][set] = p_address & !0xfff;
+		}
+		result
+	}
+
+	fn translate_address_walk(&mut self, v_address: u64, access_type: &MemoryAccessType) -> Result<u64, ()> {
 		let address = self.get_effective_address(v_address);
 		let v_page = address & !0xfff;
 		let cache = match self.page_cache_enabled {
@@ -875,18 +987,75 @@ impl Mmu {
 /// [`Memory`](../memory/struct.Memory.html) wrapper. Converts physical address to the one in memory
 /// using [`DRAM_BASE`](constant.DRAM_BASE.html) and accesses [`Memory`](../memory/struct.Memory.html).
 pub struct MemoryWrapper {
-	memory: Memory
+	memory: Memory,
+	// anima patch: self-modifying-code snoop for the CPU's predecoded
+	// instruction cache. Pages holding cached instructions get marked; any
+	// write that can touch a marked page (CPU store or virtio DMA — every
+	// DRAM write funnels through this wrapper) bumps code_gen, which every
+	// cached entry's meta embeds, killing them all at once.
+	exec_page_marks: Vec<u8>,
+	code_gen: u32
 }
 
 impl MemoryWrapper {
 	fn new() -> Self {
 		MemoryWrapper {
-			memory: Memory::new()
+			memory: Memory::new(),
+			exec_page_marks: vec![],
+			code_gen: 1
 		}
 	}
 
 	fn init(&mut self, capacity: u64) {
 		self.memory.init(capacity);
+		self.exec_page_marks = vec![0; ((capacity + 0xfff) >> 12) as usize]; // anima patch
+	}
+
+	// anima patch: bump code_gen if this write can touch a marked page.
+	fn snoop_exec(&mut self, p_address: u64, width: u64) {
+		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
+		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;
+		let hit = match self.exec_page_marks.get(first) {
+			Some(&m) => m != 0,
+			None => false
+		} || (last != first && match self.exec_page_marks.get(last) {
+			Some(&m) => m != 0,
+			None => false
+		});
+		if hit {
+			self.bump_code_gen();
+		}
+	}
+
+	// anima patch: remember that the page holding p_address backs cached
+	// predecoded instructions; false if the page cannot be snooped.
+	pub fn mark_exec_page(&mut self, p_address: u64) -> bool {
+		if p_address < DRAM_BASE {
+			return false;
+		}
+		let page = ((p_address - DRAM_BASE) >> 12) as usize;
+		match self.exec_page_marks.get_mut(page) {
+			Some(m) => {
+				*m = 1;
+				true
+			},
+			None => false
+		}
+	}
+
+	// anima patch
+	pub fn code_gen(&self) -> u32 {
+		self.code_gen
+	}
+
+	// anima patch: invalidates every cached predecoded instruction (their
+	// metas embed the old generation) and unmarks all pages — new fills
+	// re-mark what is still live.
+	pub fn bump_code_gen(&mut self) {
+		self.code_gen = self.code_gen.wrapping_add(1);
+		for m in self.exec_page_marks.iter_mut() {
+			*m = 0;
+		}
 	}
 
 	pub fn read_byte(&mut self, p_address: u64) -> u8 {
@@ -914,24 +1083,28 @@ impl MemoryWrapper {
 
 	pub fn write_byte(&mut self, p_address: u64, value: u8) {
 		debug_assert!(p_address >= DRAM_BASE, "Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
+		self.snoop_exec(p_address, 1); // anima patch
 		self.memory.write_byte(p_address - DRAM_BASE, value)
 	}
 
 	pub fn write_halfword(&mut self, p_address: u64, value: u16) {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(1) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
+		self.snoop_exec(p_address, 2); // anima patch
 		self.memory.write_halfword(p_address - DRAM_BASE, value)
 	}
 
 	pub fn write_word(&mut self, p_address: u64, value: u32) {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(3) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
+		self.snoop_exec(p_address, 4); // anima patch
 		self.memory.write_word(p_address - DRAM_BASE, value)
 	}
 
 	pub fn write_doubleword(&mut self, p_address: u64, value: u64) {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(7) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
+		self.snoop_exec(p_address, 8); // anima patch
 		self.memory.write_doubleword(p_address - DRAM_BASE, value)
 	}
 

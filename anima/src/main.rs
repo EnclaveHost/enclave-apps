@@ -49,6 +49,9 @@ static XTERM_CSS: &str = include_str!("vendor/xterm.css");
 const DEFAULT_PORT: u16 = 8000; // fleet policy: http:8000, never 8080
 const MAX_BODY: usize = 256 * 1024;
 const TICK_BATCH: u64 = 400_000; // CPU instructions per event-loop turn
+const IDLE_BATCH: u64 = 4_000; // batch while the guest is parked in WFI: keeps
+                               // timers/devices ticking at ~1% of the busy rate
+                               // so an idle machine stops burning the host CPU
 const SCROLLBACK: usize = 256 * 1024; // console bytes retained for late joiners
 
 // ---- config ---------------------------------------------------------------
@@ -159,6 +162,7 @@ struct App {
     live_creds: Option<Creds>, // remembered from the last successful start, for /save
     instret: u64,
     boot_at: Option<Instant>,
+    input_boost: u64, // turns to force full tick batches after POST /input
     scrollback: VecDeque<u8>,
     console_total: u64,
     last_save: Option<String>,
@@ -323,6 +327,10 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 for &b in &req.body {
                     t.put_input(b);
                 }
+                // run full batches until the UART has had time to drain this
+                // input (it polls its terminal every ~230k ticks, one byte per
+                // poll), else the idle throttle would add ~100ms per keystroke
+                app.input_boost = app.input_boost.max(req.body.len() as u64 + 2);
                 server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
             } else {
                 server.respond(key, json(409, "Conflict", err("machine is not running")));
@@ -437,6 +445,7 @@ fn main() {
         live_creds: None,
         instret: 0,
         boot_at: None,
+        input_boost: 0,
         scrollback: VecDeque::new(),
         console_total: 0,
         last_save: None,
@@ -460,10 +469,15 @@ fn main() {
         let mut busy = false;
         if app.phase == Phase::Running {
             if let Some(emu) = app.emu.as_mut() {
-                for _ in 0..TICK_BATCH {
+                let batch = match app.input_boost == 0 && emu.get_cpu().is_idle() {
+                    true => IDLE_BATCH,
+                    false => TICK_BATCH,
+                };
+                app.input_boost = app.input_boost.saturating_sub(1);
+                for _ in 0..batch {
                     emu.tick();
                 }
-                app.instret += TICK_BATCH;
+                app.instret += batch;
                 // drain the guest UART output into scrollback + SSE
                 let mut chunk: Vec<u8> = Vec::new();
                 let t = emu.get_mut_terminal();
