@@ -455,13 +455,17 @@
   }
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
-  /* -------------------------------------------------------- API dialog -- */
-  #apiOverlay {
+  /* ----------------------------------------- API + attestation dialogs -- */
+  #apiOverlay, #attOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
-  #apiOverlay.open { display: flex; }
+  #apiOverlay.open, #attOverlay.open { display: flex; }
+  .att-status { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; font-size: 12.5px; }
+  .att-status svg { flex: none; }
+  .att-status.ok { color: var(--ok); }
+  .att-status.warn { color: var(--warn); }
   .api-card {
     background: var(--bg-menu); border: 1px solid var(--border-soft);
     border-radius: 16px; box-shadow: var(--shadow); padding: 20px 22px;
@@ -597,7 +601,7 @@
       </button>
       <div class="side-note">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
-        <span>Confidential inference — runs sandboxed via wasi-nn; chat history never leaves this device.</span>
+        <span>Confidential inference: runs sandboxed via wasi-nn; chat history never leaves this device.</span>
       </div>
     </div>
   </div>
@@ -619,6 +623,9 @@
     </div>
     <span id="warmPill" role="status"></span>
     <span class="spacer"></span>
+    <button class="icon-btn" id="attBtn" aria-label="Enclave attestation" title="Enclave attestation">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
+    </button>
     <button class="icon-btn" id="apiBtn" aria-label="API access" title="API access">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 5.5L21 12l-5.5 6.5M8.5 5.5L3 12l5.5 6.5"/></svg>
     </button>
@@ -634,7 +641,7 @@
         <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.3 6.7 6.7 2.3-6.7 2.3L12 20.5l-2.3-6.7L3 11.5l6.7-2.3z"/></svg>
       </div>
       <h1>What can I help with?</h1>
-      <p>Private inference inside a secure enclave — nothing you type ever leaves it.</p>
+      <p>Private inference inside a secure enclave. Nothing you type ever leaves it.</p>
       <div class="chips">
         <button class="chip">Explain confidential computing in simple terms</button>
         <button class="chip">Write a haiku about secure enclaves</button>
@@ -653,12 +660,34 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
         </button>
       </div>
-      <p>This deployment serves the same models over an OpenAI-compatible API — point any OpenAI SDK at:</p>
+      <p>This deployment serves the same models over an OpenAI-compatible API. Point any OpenAI SDK at:</p>
       <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
       <div class="code"><div class="code-head"><span>curl</span><button type="button" class="cbtn" id="apiCopyCurl">Copy</button></div><pre><code id="apiCurl"></code></pre></div>
       <p class="api-fine">Streaming and non-streaming. Also <code class="ic">GET /v1/models</code>, <code class="ic">GET /warmup?model=…</code>.
       Model names match the picker. If the deployment config sets <code class="ic">api_key</code>, send it as
       <code class="ic">Authorization: Bearer &lt;key&gt;</code>. Requests run in the same enclave as this chat.</p>
+    </div>
+  </div>
+
+  <div id="attOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="attTitle">
+      <div class="api-head">
+        <h2 id="attTitle">Enclave attestation</h2>
+        <button class="icon-btn" id="attClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <div class="att-status" id="attStatus"></div>
+      <p>This app runs inside a hardware TEE, a measured confidential VM. TLS for this origin terminates
+      <em>inside</em> the enclave, and its remote attestation binds that TLS key to a code measurement whose
+      Sigstore provenance traces to the open-source <code class="ic">EnclaveHost/enclave</code> repo. Verified, it
+      proves the code handling your prompts is exactly the published build, and the operator can't see in.</p>
+      <div class="api-url" id="attIdRow"><code id="attId"></code><button type="button" class="cbtn" id="attCopyId">Copy</button></div>
+      <div class="code"><div class="code-head"><span>verify from your machine</span><button type="button" class="cbtn" id="attCopyCmd">Copy</button></div><pre><code id="attCmd"></code></pre></div>
+      <p class="api-fine">The check runs client-side against the pinned repo: hardware quote &rarr; vendor root,
+      Sigstore provenance, measurement match, TLS binding to this origin. Never take the gateway's word for it:
+      only a check your own machine runs means anything. Programmatic: <code class="ic">@tinfoilsh/verifier</code>.
+      Prompts and replies are processed only inside the enclave; chat history lives only in this browser.</p>
     </div>
   </div>
 
@@ -674,7 +703,7 @@
         <svg id="iconStop" width="18" height="18" viewBox="0 0 24 24" style="display:none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
       </button>
     </form>
-    <p class="footnote">Answer quality tracks model size — small models are quick and frequently wrong. Chats stay in this browser.</p>
+    <p class="footnote">Answer quality tracks model size: small models are quick and frequently wrong. Chats stay in this browser.</p>
   </div>
 </main>
 
@@ -1313,6 +1342,7 @@ input.addEventListener("keydown", (e) => {
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (apiOverlay.classList.contains("open")) { closeApi(); return; }
+    if (attOverlay.classList.contains("open")) { closeAtt(); return; }
     if (state.busyChatId) stopGeneration();
     closeModelMenu();
   }
@@ -1451,7 +1481,7 @@ async function run(chat) {
   const armStall = () => {
     clearTimeout(stallTimer);
     stallTimer = setTimeout(() => ctl.abort(
-      new Error("No data for 300s — the instance may have died mid-response. Try again.")), 300000);
+      new Error("No data for 300s. The instance may have died mid-response. Try again.")), 300000);
   };
 
   // drop notices from a failed run, then the unanswered question
@@ -1521,7 +1551,7 @@ async function run(chat) {
     // a stream that closes without the done event was cut mid-response (the
     // instance died or restarted) - surface it instead of recording a
     // truncated reply as if it were complete
-    if (!sawDone) throw new Error("The stream ended before the response finished — the instance likely restarted. Try again.");
+    if (!sawDone) throw new Error("The stream ended before the response finished. The instance likely restarted. Try again.");
     chat.messages.push({ role: "assistant", content: reply, meta });
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
@@ -1574,6 +1604,36 @@ $("apiClose").addEventListener("click", closeApi);
 apiOverlay.addEventListener("click", (e) => { if (e.target === apiOverlay) closeApi(); });
 $("apiCopyBase").addEventListener("click", (e) => copyText($("apiBase").textContent, e.currentTarget));
 $("apiCopyCurl").addEventListener("click", (e) => copyText($("apiCurl").textContent, e.currentTarget));
+
+// ------------------------------------------------------ attestation dialog --
+// The deployment id prefix is derived from the page's own enclave origin
+// (https://<first-8-hex-of-id>.app.enclave.host). Served from anywhere else
+// (a proxy, local dev) the id can't be known here, so the dialog says so
+// honestly instead of inventing one.
+const attOverlay = $("attOverlay");
+function openAtt() {
+  const m = location.hostname.match(/^([0-9a-f]{8,})\.app\.enclave\.host$/i);
+  const id = m ? "0x" + m[1].toLowerCase() : "<deployment-id>";
+  const status = $("attStatus");
+  status.className = "att-status " + (m ? "ok" : "warn");
+  status.innerHTML = (m ? ICONS.check : ICONS.alert) + "<span></span>";
+  status.querySelector("span").textContent = m
+    ? "Served from an enclave origin: deployment " + id
+    : "Not an *.app.enclave.host origin (proxy or local dev), so the deployment id can't be derived here; use the id of the deployment you actually target.";
+  $("attIdRow").style.display = m ? "" : "none";
+  $("attId").textContent = id;
+  $("attCmd").textContent =
+    "curl -fsSL https://get.enclave.host | sh   # install the CLI once\n" +
+    "enclave attest " + id;
+  attOverlay.classList.add("open");
+  $("attClose").focus();
+}
+function closeAtt() { attOverlay.classList.remove("open"); }
+$("attBtn").addEventListener("click", openAtt);
+$("attClose").addEventListener("click", closeAtt);
+attOverlay.addEventListener("click", (e) => { if (e.target === attOverlay) closeAtt(); });
+$("attCopyId").addEventListener("click", (e) => copyText($("attId").textContent, e.currentTarget));
+$("attCopyCmd").addEventListener("click", (e) => copyText($("attCmd").textContent, e.currentTarget));
 
 // ------------------------------------------------------------ model picker --
 function closeModelMenu() {
@@ -1715,14 +1775,14 @@ async function warm() {
       if (code === "model_not_loaded" || code === "host_load_failed") {
         // not a capacity verdict: the host hasn't loaded (or reload-pending)
         // this model - the platform restarts the deployment to fix it
-        pill("fail", ICONS.alert, " Model isn’t loaded on the host yet — the platform is on it, try again shortly", 12000);
+        pill("fail", ICONS.alert, " Model isn’t loaded on the host yet; the platform is on it, try again shortly", 12000);
       } else {
-        pill("fail", ICONS.alert, " Warmup failed — the first reply will load the model", 10000);
+        pill("fail", ICONS.alert, " Warmup failed; the first reply will load the model", 10000);
       }
       warmPill.title = (d.error && d.error.message) || ("HTTP " + res.status);
     }
   } catch (_) {
-    pill("fail", ICONS.alert, " Warmup did not finish — the first reply will load the model", 10000);
+    pill("fail", ICONS.alert, " Warmup did not finish; the first reply will load the model", 10000);
   }
 }
 
@@ -1843,7 +1903,7 @@ async function warmLadder() {
       // restart of the deployment, so this ladder re-polls instead of
       // declaring the model missing
       markPending(m, li, err, code === "host_load_failed"
-        ? "host load failed — recovering…" : "loading on the host…");
+        ? "host load failed, recovering…" : "loading on the host…");
     } else if (unfit) {
       unfitCount++;
       state.unfit[m.name] = err;
@@ -1874,7 +1934,7 @@ async function warmLadder() {
   if (pending.length && bootRetries < BOOT_RETRY_MAX) {
     bootRetries++;
     const wait = "Waiting for the host to load " + pending.join(", ")
-      + " — retrying (" + bootRetries + "/" + BOOT_RETRY_MAX + ")…";
+      + ", retrying (" + bootRetries + "/" + BOOT_RETRY_MAX + ")…";
     if (!warmed) bootMsg.textContent = wait;
     if (bootGone || warmed) { pill("", '<span class="spin"></span>', " " + wait); }
     setTimeout(async () => {
@@ -1892,13 +1952,13 @@ async function warmLadder() {
   const unfitTitle = () => Object.entries(state.unfit).concat(Object.entries(state.hostPending))
     .map(([m, e]) => m + ": " + e).join("\n");
   if (!warmed && pending.length) {
-    pill("fail", ICONS.alert, " The host never finished loading the model — redeploy or check the deployment logs", 15000);
+    pill("fail", ICONS.alert, " The host never finished loading the model; redeploy or check the deployment logs", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed && unfitCount >= ladder.length) {
-    pill("fail", ICONS.alert, " No attached model fits this deployment — add resources or attach smaller models", 15000);
+    pill("fail", ICONS.alert, " No attached model fits this deployment; add resources or attach smaller models", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed) {
-    pill("fail", ICONS.alert, " Warmup did not finish — the first reply will load the model", 10000);
+    pill("fail", ICONS.alert, " Warmup did not finish; the first reply will load the model", 10000);
   } else if (warmed < ladder.length) {
     pill("ok", ICONS.tick, " Ready · " + warmed + " of " + ladder.length + " models · " + secs, 8000);
     warmPill.title = unfitTitle();

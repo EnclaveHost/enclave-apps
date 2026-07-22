@@ -171,13 +171,17 @@
   .shot:hover .del, .shot .del:focus-visible { display: flex; }
   .shot .del:hover { color: var(--err); }
 
-  /* -------------------------------------------------------- API dialog -- */
-  #apiOverlay {
+  /* ----------------------------------------- API + attestation dialogs -- */
+  #apiOverlay, #attOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
-  #apiOverlay.open { display: flex; }
+  #apiOverlay.open, #attOverlay.open { display: flex; }
+  .att-status { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; font-size: 12.5px; }
+  .att-status svg { flex: none; }
+  .att-status.ok { color: var(--ok); }
+  .att-status.warn { color: var(--warn); }
   .api-card {
     background: var(--bg-menu); border: 1px solid var(--border-soft);
     border-radius: 16px; box-shadow: var(--shadow); padding: 20px 22px;
@@ -252,6 +256,9 @@
   <span class="pill" id="model">&hellip;</span>
   <span class="pill" id="warm">connecting</span>
   <span class="spacer"></span>
+  <button class="icon-btn" id="attBtn" aria-label="Enclave attestation" title="Enclave attestation">
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
+  </button>
   <button class="icon-btn" id="apiBtn" aria-label="API access" title="API access">
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 5.5L21 12l-5.5 6.5M8.5 5.5L3 12l5.5 6.5"/></svg>
   </button>
@@ -309,14 +316,36 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
       </button>
     </div>
-    <p>This deployment serves the same models over HTTP &mdash; the base URL:</p>
+    <p>This deployment serves the same models over HTTP. The base URL:</p>
     <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
-    <div class="code"><div class="code-head"><span>curl &mdash; PNG straight to a file</span><button type="button" class="cbtn" id="apiCopyGet">Copy</button></div><pre><code id="apiGet"></code></pre></div>
-    <div class="code"><div class="code-head"><span>curl &mdash; OpenAI-compatible</span><button type="button" class="cbtn" id="apiCopyPost">Copy</button></div><pre><code id="apiPost"></code></pre></div>
+    <div class="code"><div class="code-head"><span>curl: PNG straight to a file</span><button type="button" class="cbtn" id="apiCopyGet">Copy</button></div><pre><code id="apiGet"></code></pre></div>
+    <div class="code"><div class="code-head"><span>curl: OpenAI-compatible</span><button type="button" class="cbtn" id="apiCopyPost">Copy</button></div><pre><code id="apiPost"></code></pre></div>
     <p class="api-fine">Model names match the picker; omit <code class="ic">model</code> for the largest attached one.
     Also <code class="ic">GET /info</code>, <code class="ic">GET /warmup?model=&hellip;</code>. If the deployment config sets
     <code class="ic">api_key</code>, send <code class="ic">Authorization: Bearer &lt;key&gt;</code> on <code class="ic">/v1/&hellip;</code>.
     Requests run in the same enclave as this page.</p>
+  </div>
+</div>
+
+<div id="attOverlay">
+  <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="attTitle">
+    <div class="api-head">
+      <h2 id="attTitle">Enclave attestation</h2>
+      <button class="icon-btn" id="attClose" aria-label="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+      </button>
+    </div>
+    <div class="att-status" id="attStatus"></div>
+    <p>This app runs inside a hardware TEE, a measured confidential VM. TLS for this origin terminates
+    <em>inside</em> the enclave, and its remote attestation binds that TLS key to a code measurement whose
+    Sigstore provenance traces to the open-source <code class="ic">EnclaveHost/enclave</code> repo. Verified, it
+    proves the code handling your prompts is exactly the published build, and the operator can't see in.</p>
+    <div class="api-url" id="attIdRow"><code id="attId"></code><button type="button" class="cbtn" id="attCopyId">Copy</button></div>
+    <div class="code"><div class="code-head"><span>verify from your machine</span><button type="button" class="cbtn" id="attCopyCmd">Copy</button></div><pre><code id="attCmd"></code></pre></div>
+    <p class="api-fine">The check runs client-side against the pinned repo: hardware quote &rarr; vendor root,
+    Sigstore provenance, measurement match, TLS binding to this origin. Never take the gateway's word for it:
+    only a check your own machine runs means anything. Programmatic: <code class="ic">@tinfoilsh/verifier</code>.
+    Prompts and generated images exist only in enclave RAM and this tab; nothing is stored server-side.</p>
   </div>
 </div>
 
@@ -404,7 +433,39 @@ function closeApi() { $("apiOverlay").classList.remove("open"); }
 $("apiBtn").onclick = openApi;
 $("apiClose").onclick = closeApi;
 $("apiOverlay").addEventListener("click", e => { if (e.target === $("apiOverlay")) closeApi(); });
-window.addEventListener("keydown", e => { if (e.key === "Escape") closeApi(); });
+window.addEventListener("keydown", e => { if (e.key === "Escape") { closeApi(); closeAtt(); } });
+
+// ------------------------------------------------------ attestation dialog --
+// The deployment id prefix is derived from the page's own enclave origin
+// (https://<first-8-hex-of-id>.app.enclave.host). Served from anywhere else
+// (a proxy, local dev) the id can't be known here, so the dialog says so
+// honestly instead of inventing one.
+const ICON_SHIELD_OK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>';
+const ICON_ALERT = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>';
+
+function openAtt() {
+  const m = location.hostname.match(/^([0-9a-f]{8,})\.app\.enclave\.host$/i);
+  const id = m ? "0x" + m[1].toLowerCase() : "<deployment-id>";
+  const status = $("attStatus");
+  status.className = "att-status " + (m ? "ok" : "warn");
+  status.innerHTML = (m ? ICON_SHIELD_OK : ICON_ALERT) + "<span></span>";
+  status.querySelector("span").textContent = m
+    ? "Served from an enclave origin: deployment " + id
+    : "Not an *.app.enclave.host origin (proxy or local dev), so the deployment id can't be derived here; use the id of the deployment you actually target.";
+  $("attIdRow").style.display = m ? "" : "none";
+  $("attId").textContent = id;
+  $("attCmd").textContent =
+    "curl -fsSL https://get.enclave.host | sh   # install the CLI once\n" +
+    "enclave attest " + id;
+  $("attOverlay").classList.add("open");
+  $("attClose").focus();
+}
+function closeAtt() { $("attOverlay").classList.remove("open"); }
+$("attBtn").onclick = openAtt;
+$("attClose").onclick = closeAtt;
+$("attOverlay").addEventListener("click", e => { if (e.target === $("attOverlay")) closeAtt(); });
+$("attCopyId").onclick = e => copyText($("attId").textContent, e.currentTarget);
+$("attCopyCmd").onclick = e => copyText($("attCmd").textContent, e.currentTarget);
 $("apiCopyBase").onclick = e => copyText($("apiBase").textContent, e.currentTarget);
 $("apiCopyGet").onclick = e => copyText($("apiGet").textContent, e.currentTarget);
 $("apiCopyPost").onclick = e => copyText($("apiPost").textContent, e.currentTarget);
