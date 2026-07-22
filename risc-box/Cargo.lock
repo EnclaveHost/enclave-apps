@@ -38,19 +38,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anima"
-version = "0.2.0"
-dependencies = [
- "hmac",
- "riscv_emu_rust",
- "rustls",
- "rustls-rustcrypto",
- "serde_json",
- "sha2",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,6 +639,19 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys",
+]
+
+[[package]]
+name = "risc-box"
+version = "0.2.0"
+dependencies = [
+ "hmac",
+ "riscv_emu_rust",
+ "rustls",
+ "rustls-rustcrypto",
+ "serde_json",
+ "sha2",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

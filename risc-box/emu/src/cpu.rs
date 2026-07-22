@@ -1,6 +1,6 @@
 extern crate fnv;
 
-// anima patch: FnvHashMap import removed (DecodeCache is direct-mapped now)
+// risc-box patch: FnvHashMap import removed (DecodeCache is direct-mapped now)
 
 use mmu::{AddressingMode, Mmu};
 use terminal::Terminal;
@@ -73,7 +73,7 @@ pub struct Cpu {
 	is_reservation_set: bool,
 	_dump_flag: bool,
 	decode_cache: DecodeCache,
-	// anima patch: predecoded instruction cache, direct-mapped by virtual
+	// risc-box patch: predecoded instruction cache, direct-mapped by virtual
 	// PC (see tick_operate). tags = pc, metas = mmu.exec_meta() at fill
 	// time (0 = invalid), words = the uncompressed instruction word,
 	// data = INSTRUCTIONS index | ICACHE_LEN4 for 4-byte instructions.
@@ -241,7 +241,7 @@ impl Cpu {
 			is_reservation_set: false,
 			_dump_flag: false,
 			decode_cache: DecodeCache::new(),
-			// anima patch: predecode cache starts empty (meta 0 = invalid)
+			// risc-box patch: predecode cache starts empty (meta 0 = invalid)
 			icache_tags: vec![0; ICACHE_ENTRY_NUM],
 			icache_metas: vec![0; ICACHE_ENTRY_NUM],
 			icache_words: vec![0; ICACHE_ENTRY_NUM],
@@ -291,7 +291,7 @@ impl Cpu {
 		self.pc
 	}
 
-	// anima patch: true while the hart is parked in WFI with no enabled
+	// risc-box patch: true while the hart is parked in WFI with no enabled
 	// interrupt pending (the same condition tick_operate uses to leave WFI).
 	// Lets an embedder throttle ticking when the guest is idle.
 	pub fn is_idle(&self) -> bool {
@@ -312,7 +312,7 @@ impl Cpu {
 		// cpu core clock : mtime clock in clint = 8 : 1 is
 		// just an arbiraty ratio.
 		// @TODO: Implement more properly
-		// anima patch: CSR_CYCLE is now materialized lazily in read_csr_raw()
+		// risc-box patch: CSR_CYCLE is now materialized lazily in read_csr_raw()
 		// (same pattern as CSR_TIME) instead of being written every tick.
 	}
 
@@ -326,7 +326,7 @@ impl Cpu {
 			return Ok(());
 		}
 
-		// anima patch: predecoded-instruction fast path. One tag compare
+		// risc-box patch: predecoded-instruction fast path. One tag compare
 		// replaces fetch translation, memory read, uncompress, and decode.
 		// The meta embeds every input the cached result depends on: the
 		// TLB generation and CPU translation state, and the code
@@ -362,7 +362,7 @@ impl Cpu {
 			}
 		};
 
-		// anima patch: decode to an INSTRUCTIONS index (decode() would only
+		// risc-box patch: decode to an INSTRUCTIONS index (decode() would only
 		// give the reference; the fill below needs the index).
 		let index = match self.decode_cache.get(word) {
 			Some(index) => index,
@@ -377,7 +377,7 @@ impl Cpu {
 			}
 		};
 
-		// anima patch: fill the predecode cache when the instruction sits
+		// risc-box patch: fill the predecode cache when the instruction sits
 		// safely inside one DRAM page, so a single page mark covers every
 		// byte the cached entry was built from.
 		if (instruction_address & 0xfff) <= 0xff8 {
@@ -404,7 +404,7 @@ impl Cpu {
 	/// [`Instruction`](struct.Instruction.html). Using [`DecodeCache`](struct.DecodeCache.html)
 	/// so if cache hits this method returns the result very quickly.
 	/// The result will be stored to cache.
-	// anima patch: tick_operate now decodes inline (it needs the index for
+	// risc-box patch: tick_operate now decodes inline (it needs the index for
 	// the predecode cache); this remains for the unit tests.
 	#[allow(dead_code)]
 	fn decode(&mut self, word: u32) -> Result<&Instruction, ()> {
@@ -780,7 +780,7 @@ impl Cpu {
 			CSR_SIE_ADDRESS => self.csr[CSR_MIE_ADDRESS as usize] & 0x222,
 			CSR_SIP_ADDRESS => self.csr[CSR_MIP_ADDRESS as usize] & 0x222,
 			CSR_TIME_ADDRESS => self.mmu.get_clint().read_mtime(),
-			// anima patch: cycle counter computed from clock on read; the
+			// risc-box patch: cycle counter computed from clock on read; the
 			// per-tick write_csr_raw(CSR_CYCLE, clock * 8) in tick() is gone.
 			CSR_CYCLE_ADDRESS => self.clock.wrapping_mul(8),
 			_ => self.csr[address as usize]
@@ -3112,7 +3112,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		data: 0x12000073,
 		name: "SFENCE.VMA",
 		operation: |cpu, _word, _address| {
-			// anima patch: was a no-op; the software TLB must honor it
+			// risc-box patch: was a no-op; the software TLB must honor it
 			cpu.mmu.sfence_vma();
 			Ok(())
 		},
@@ -3449,15 +3449,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 /// You need to carefully choose the number. Too small number causes
 /// bad cache hit ratio. Too large number causes memory consumption
 /// and host hardware CPU cache memory miss.
-const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // anima patch: was 0x1000
+const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // risc-box patch: was 0x1000
 
-// anima patch: predecoded instruction cache geometry. Slots are indexed by
+// risc-box patch: predecoded instruction cache geometry. Slots are indexed by
 // pc >> 1 (compressed instructions are 2-byte aligned), so the cache covers
 // a 32 KiB direct-mapped code window.
 const ICACHE_ENTRY_NUM: usize = 0x4000;
 const ICACHE_LEN4: u16 = 0x8000;
 
-// anima patch: tag layout for the direct-mapped cache below — the decoded
+// risc-box patch: tag layout for the direct-mapped cache below — the decoded
 // word plus a valid bit above bit 31, so no 32-bit word value (0, all-ones)
 // can false-hit against an empty slot.
 const DECODE_TAG_VALID: u64 = 1 << 32;
@@ -3471,7 +3471,7 @@ const DECODE_TAG_VALID: u64 = 1 << 32;
 /// that some loops in a program consume the majority of time then this cache
 /// system is expected to reduce the decoding time very well.
 ///
-/// anima patch: the original implementation was an FnvHashMap plus a
+/// risc-box patch: the original implementation was an FnvHashMap plus a
 /// doubly-linked LRU list — a hash, a probe, and a three-node list splice
 /// on every HIT, in the interpreter's hottest path. Decoding is a pure
 /// function of the word, so eviction policy is only a hit-rate concern;
@@ -3911,7 +3911,7 @@ mod test_decode_cache {
 		};
 	}
 
-	// anima patch: the cache is direct-mapped now (LRU is gone). Colliding
+	// risc-box patch: the cache is direct-mapped now (LRU is gone). Colliding
 	// words evict each other; non-colliding words coexist regardless of age.
 	#[test]
 	fn direct_mapped() {

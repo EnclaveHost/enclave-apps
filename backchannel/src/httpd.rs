@@ -354,7 +354,7 @@ impl Server {
     }
 
     /// Like `flush_and_sleep` but without the sleep, for apps whose main
-    /// loop has real work to do between polls (anima steps a CPU); returns
+    /// loop has real work to do between polls (risc-box steps a CPU); returns
     /// whether any bytes moved.
     pub fn flush(&mut self) -> bool {
         let now = Instant::now();

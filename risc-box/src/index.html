@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>anima — a machine running on the enclave's CPU</title>
+<title>RISC Box — a machine running on the enclave's CPU</title>
 <link rel="stylesheet" href="/a/xterm.css">
 <style>
   :root {
@@ -108,7 +108,7 @@
 </div>
 
 <footer>
-  <b>How this works.</b> anima is an Enclave <b>service app</b>: one attested process holds the machine in the
+  <b>How this works.</b> RISC Box is an Enclave <b>service app</b>: one attested process holds the machine in the
   enclave's memory and serves this console over the deployment's in-enclave-terminated TLS. The machine is a vendored
   pure-Rust RISC-V system emulator (RV64GC, Sv39 MMU, CLINT/PLIC/UART/virtio-blk) compiled to the same
   <span style="font-family:ui-monospace,monospace">wasm32-wasip2</span> target as the rest of the fleet and stepped

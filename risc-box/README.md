@@ -1,6 +1,6 @@
-# anima — a real machine on the enclave's CPU, booted from S3
+# RISC Box — a real machine on the enclave's CPU, booted from S3
 
-anima boots a full operating system **inside the enclave**, the way QEMU
+RISC Box boots a full operating system **inside the enclave**, the way QEMU
 installed on a server would — the emulated CPU runs on the TEE's own silicon,
 not in your browser. The enclave pulls a kernel and root filesystem from an
 **S3 bucket**, boots them, and bridges the machine's serial console to your
@@ -9,7 +9,7 @@ back to the bucket.
 
 This is the counterpart to [golem](../golem). golem ships QEMU-wasm to the
 browser and emulates in the tab (the enclave is just the sealed image vault).
-anima is the opposite split, the one the request asked for: **the machine
+RISC Box is the opposite split, the one the request asked for: **the machine
 executes in the enclave.** That difference drives the whole design.
 
 ## Why an emulator, not "QEMU on the enclave"
@@ -21,12 +21,12 @@ exist under a server-side wasm runtime. The platform runs apps as
 never execute there. Running a machine *in* the enclave therefore means a
 system emulator that is itself a native `wasm32-wasip2` program.
 
-anima vendors one:
+RISC Box vendors one:
 [takahirox/riscv-rust](https://github.com/takahirox/riscv-rust) — a pure-Rust
 RISC-V system emulator (RV64GC, Sv39 MMU, CLINT + PLIC + 16550 UART + virtio
 block) that boots real Linux. It compiles to the same target as the rest of
 the fleet and steps instruction-by-instruction in the TEE. The source lives
-in [`emu/`](emu/); every divergence from upstream is tagged `anima patch`
+in [`emu/`](emu/); every divergence from upstream is tagged `risc-box patch`
 in-line. Beyond the original two (`dump_contents()` / `get_disk()`, which read
 the guest-modified disk back out for saving) there are six performance
 patches, measured end-to-end at 2.8× throughput and 2.5× faster boot:
@@ -52,7 +52,7 @@ patches, measured end-to-end at 2.8× throughput and 2.5× faster boot:
 
 ## Architecture
 
-anima is a run-mode **service app** — `wasmtime run` + `wasi:sockets`, one
+RISC Box is a run-mode **service app** — `wasmtime run` + `wasi:sockets`, one
 attested process holding the machine in the enclave's RAM (the same shape as
 [IRC](../IRC) and the utility suite; it reuses the suite's
 [`httpd.rs`](src/httpd.rs) HTTP/1.1 + SSE engine). A single thread interleaves
@@ -81,7 +81,7 @@ signing (GET to fetch, PUT to save) hand-rolled from `sha2`/`hmac` — no
 
 ## Configuration
 
-The deployment's App Config (`ENCLAVE_CONFIG`; locally, `ANIMA_CONFIG`) is a
+The deployment's App Config (`ENCLAVE_CONFIG`; locally, `RISCBOX_CONFIG`) is a
 JSON object:
 
 ```json
@@ -152,18 +152,18 @@ app was verified on):
 cargo build --release --target wasm32-wasip2
 
 # 1. an S3 to boot from
-minio server /tmp/anima-data --address 127.0.0.1:9100 &
+minio server /tmp/RISC Box-data --address 127.0.0.1:9100 &
 # (create a bucket + upload images/fw_payload.elf and images/rootfs.img;
 #  seed-machine.py, mc, or any S3 client does this)
 
-# 2. anima under wasmtime, with the service-app socket grants + config
+# 2. RISC Box under wasmtime, with the service-app socket grants + config
 CFG='{"title":"demo","endpoint":"http://127.0.0.1:9100","region":"us-east-1",
       "bucket":"machines","kernel":"images/fw_payload.elf","fs":"images/rootfs.img",
       "saveKey":"images/rootfs.saved.img",
       "credentials":{"accessKeyId":"…","secretAccessKey":"…"}}'
 wasmtime run -Stcp -Sinherit-network -Sallow-ip-name-lookup \
-  --env ENCLAVE_PORTS=http:8000=8000 --env ANIMA_CONFIG="$CFG" \
-  target/wasm32-wasip2/release/anima.wasm
+  --env ENCLAVE_PORTS=http:8000=8000 --env RISCBOX_CONFIG="$CFG" \
+  target/wasm32-wasip2/release/risc-box.wasm
 ```
 
 Open `http://127.0.0.1:8000/`, press **Boot machine**, and a RISC-V Linux
@@ -179,7 +179,7 @@ it.
 
 ## Caveats, honestly
 
-- **RISC-V RV64 only, one hart.** anima runs what the vendored emulator runs:
+- **RISC-V RV64 only, one hart.** RISC Box runs what the vendored emulator runs:
   a single-core RISC-V `virt`-style machine. Not x86, not multi-core.
 - **Emulated speed.** The interpreter turns ~29 MIPS under wasmtime (software
   TLB + predecoded instruction cache; measured on the sample image) — fine
@@ -203,13 +203,13 @@ it.
 
 The machine, its images, and any typed credentials exist only inside the
 enclave; the bucket and the host operator see S3 traffic, not the running
-guest. anima authenticates nothing about the *images themselves* beyond the
+guest. RISC Box authenticates nothing about the *images themselves* beyond the
 bucket's own integrity — a malicious bucket could serve a different kernel, so
 treat the bucket as part of your trust base and prefer `https` endpoints.
 Confirm the code that runs your machine and handles your credentials with the
 deployment's remote attestation at
 [enclave.host](https://enclave.host).
 
-The vendored emulator is MIT ([`emu/LICENSE`](emu/LICENSE)); anima itself is
+The vendored emulator is MIT ([`emu/LICENSE`](emu/LICENSE)); RISC Box itself is
 MIT. It is a faithful RISC-V emulator, not a security boundary — the enclave
 is the boundary.

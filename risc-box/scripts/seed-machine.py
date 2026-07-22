@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""seed-machine.py — put a machine's OS images into an S3 bucket for anima to
+"""seed-machine.py — put a machine's OS images into an S3 bucket for RISC Box to
 boot, and (optionally) fetch a ready-made RISC-V sample to upload.
 
-Pure stdlib: the SigV4 signing here mirrors anima/src/s3.rs byte for byte, so
+Pure stdlib: the SigV4 signing here mirrors risc-box/src/s3.rs byte for byte, so
 what seeds the bucket and what boots from it agree. No boto3, no aws CLI.
 
 Examples
@@ -19,10 +19,10 @@ Upload them to your bucket (path-style; works with AWS S3, Wasabi, R2, minio):
         ./images/fw_payload.elf  images/fw_payload.elf
     ./seed-machine.py put ... ./images/rootfs.img  images/rootfs.img
 
-Then deploy anima with a config naming endpoint/bucket/kernel/fs (see README).
+Then deploy RISC Box with a config naming endpoint/bucket/kernel/fs (see README).
 
 The sample images come from github.com/takahirox/riscv-rust (MIT); the same
-emulator anima vendors. A RISC-V kernel is an ELF with an SBI payload
+emulator RISC Box vendors. A RISC-V kernel is an ELF with an SBI payload
 (OpenSBI fw_payload or BBL+vmlinux); the rootfs is a raw disk image the guest
 mounts as /dev/vda.
 """

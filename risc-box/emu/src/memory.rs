@@ -38,7 +38,7 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn read_halfword(&self, address: u64) -> u16 {
-		// anima patch: any alignment reads from at most two cells (the
+		// risc-box patch: any alignment reads from at most two cells (the
 		// misaligned fallback was a per-byte loop)
 		let index = (address >> 3) as usize;
 		let pos = ((address % 8) as u64) * 8;
@@ -53,7 +53,7 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn read_word(&self, address: u64) -> u32 {
-		// anima patch: any alignment reads from at most two cells. This is
+		// risc-box patch: any alignment reads from at most two cells. This is
 		// hot: compressed instructions put half of all 4-byte fetches at
 		// address % 4 == 2, which used to take the per-byte loop.
 		let index = (address >> 3) as usize;
@@ -69,7 +69,7 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	pub fn read_doubleword(&self, address: u64) -> u64 {
-		// anima patch: any alignment reads from at most two cells. Also
+		// risc-box patch: any alignment reads from at most two cells. Also
 		// fixes an upstream bug: the 4-aligned path shifted the high word
 		// by 4 instead of 32, corrupting misaligned doubleword loads.
 		let index = (address >> 3) as usize;
@@ -110,7 +110,7 @@ impl Memory {
 	/// * `address`
 	/// * `value`
 	pub fn write_halfword(&mut self, address: u64, value: u16) {
-		// anima patch: any alignment writes at most two cells
+		// risc-box patch: any alignment writes at most two cells
 		let index = (address >> 3) as usize;
 		let pos = ((address % 8) as u64) * 8;
 		self.data[index] = (self.data[index] & !(0xffffu64 << pos)) | ((value as u64) << pos);
@@ -127,7 +127,7 @@ impl Memory {
 	/// * `address`
 	/// * `value`
 	pub fn write_word(&mut self, address: u64, value: u32) {
-		// anima patch: any alignment writes at most two cells
+		// risc-box patch: any alignment writes at most two cells
 		let index = (address >> 3) as usize;
 		let pos = ((address % 8) as u64) * 8;
 		self.data[index] = (self.data[index] & !(0xffffffffu64 << pos)) | ((value as u64) << pos);
@@ -144,7 +144,7 @@ impl Memory {
 	/// * `address`
 	/// * `value`
 	pub fn write_doubleword(&mut self, address: u64, value: u64) {
-		// anima patch: any alignment writes at most two cells
+		// risc-box patch: any alignment writes at most two cells
 		let index = (address >> 3) as usize;
 		let pos = ((address % 8) as u64) * 8;
 		match pos == 0 {

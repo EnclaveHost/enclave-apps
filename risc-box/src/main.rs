@@ -1,8 +1,8 @@
-//! anima — run a real machine on the enclave's CPU, booted from OS images in
+//! risc-box — run a real machine on the enclave's CPU, booted from OS images in
 //! an S3 bucket, with its serial console bridged to your browser.
 //!
 //! Unlike golem (which ships QEMU-wasm to the browser and emulates in the
-//! tab), anima emulates a full RISC-V machine **inside the enclave** — the
+//! tab), risc-box emulates a full RISC-V machine **inside the enclave** — the
 //! way QEMU installed on a server would. A vendored pure-Rust RISC-V system
 //! emulator (takahirox/riscv-rust: RV64GC, Sv39 MMU, CLINT/PLIC/UART/virtio
 //! block) is the "CPU"; it compiles to the same `wasm32-wasip2` target as the
@@ -89,14 +89,14 @@ fn creds_from(v: &serde_json::Value) -> Option<Creds> {
 
 fn load_config() -> Result<Config, String> {
     let raw = std::env::var("ENCLAVE_CONFIG")
-        .or_else(|_| std::env::var("ANIMA_CONFIG"))
-        .map_err(|_| "no ENCLAVE_CONFIG/ANIMA_CONFIG set".to_string())?;
+        .or_else(|_| std::env::var("RISCBOX_CONFIG"))
+        .map_err(|_| "no ENCLAVE_CONFIG/RISCBOX_CONFIG set".to_string())?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("config is not JSON: {e}"))?;
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
     let need = |k: &str| s(k).ok_or_else(|| format!("config missing \"{k}\""));
     Ok(Config {
-        title: s("title").unwrap_or_else(|| "anima machine".to_string()),
+        title: s("title").unwrap_or_else(|| "RISC Box machine".to_string()),
         endpoint: need("endpoint")?,
         region: s("region").unwrap_or_else(|| "us-east-1".to_string()),
         bucket: need("bucket")?,
@@ -246,13 +246,13 @@ impl App {
 fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
     let mut noop = |_: usize, _: usize| {};
-    eprintln!("[anima] fetching s3://{}/{}", cfg.bucket, cfg.kernel);
+    eprintln!("[risc-box] fetching s3://{}/{}", cfg.bucket, cfg.kernel);
     let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
-    eprintln!("[anima]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
+    eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
     let fs = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut noop)
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
-    eprintln!("[anima]   fs {} bytes", fs.len());
+    eprintln!("[risc-box]   fs {} bytes", fs.len());
     let dtb = match &cfg.dtb {
         Some(k) => Some(
             s3::get_object(&ep, &cfg.bucket, k, creds, &mut noop)
@@ -367,7 +367,7 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
         Err(e) => return server.respond(key, json(500, "Error", err(&e))),
     };
     // flush the 202-less response path: PUT blocks the loop, like /start's fetch
-    eprintln!("[anima] saving {} bytes to s3://{}/{}", disk.len(), app.cfg.bucket, save_key);
+    eprintln!("[risc-box] saving {} bytes to s3://{}/{}", disk.len(), app.cfg.bucket, save_key);
     match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &disk) {
         Ok(()) => {
             app.last_save = Some(save_key.clone());
@@ -398,7 +398,7 @@ fn do_start(app: &mut App, start: Start) {
                 app.cache = Some(imgs);
             }
             Err(e) => {
-                eprintln!("[anima] start failed: {e}");
+                eprintln!("[risc-box] start failed: {e}");
                 app.error = Some(e);
                 app.phase = Phase::Error;
                 return;
@@ -413,7 +413,7 @@ fn do_start(app: &mut App, start: Start) {
     app.console_total = 0;
     app.error = None;
     app.phase = Phase::Running;
-    eprintln!("[anima] machine running: {}", app.cfg.title);
+    eprintln!("[risc-box] machine running: {}", app.cfg.title);
 }
 
 fn clone_creds(c: &Creds) -> Creds {
@@ -428,13 +428,13 @@ fn main() {
     let cfg = match load_config() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[anima] config error: {e}");
-            eprintln!("[anima] set ENCLAVE_CONFIG (or ANIMA_CONFIG) to a JSON object with at least endpoint/bucket/kernel/fs");
+            eprintln!("[risc-box] config error: {e}");
+            eprintln!("[risc-box] set ENCLAVE_CONFIG (or RISCBOX_CONFIG) to a JSON object with at least endpoint/bucket/kernel/fs");
             std::process::exit(1);
         }
     };
     let autostart = cfg.autostart;
-    let mut server = Server::bind("anima", DEFAULT_PORT);
+    let mut server = Server::bind("risc-box", DEFAULT_PORT);
     let mut app = App {
         cfg,
         emu: None,

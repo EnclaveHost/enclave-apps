@@ -1,4 +1,4 @@
-//! Minimal S3 client for anima: GET an object (the OS images) and PUT one
+//! Minimal S3 client for risc-box: GET an object (the OS images) and PUT one
 //! back (the guest-modified disk), over the platform's transparent egress.
 //!
 //! - `https://` endpoints use rustls with the pure-Rust RustCrypto provider —

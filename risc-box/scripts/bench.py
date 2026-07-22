@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""anima-bench.py — spawn anima under wasmtime against local minio, drive it
+"""bench.py — spawn risc-box under wasmtime against local minio, drive it
 end-to-end, and measure. Stdlib only.
 
 Measures:
@@ -216,7 +216,7 @@ def s3_total_size(key):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wasm", default="/home/steven/Projects/enclave-apps/anima/target/wasm32-wasip2/release/anima.wasm")
+    ap.add_argument("--wasm", default="/home/steven/Projects/enclave-apps/risc-box/target/wasm32-wasip2/release/risc-box.wasm")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--label", default="run")
     ap.add_argument("--save", action="store_true", help="also test POST /save + verify in bucket")
@@ -234,7 +234,7 @@ def main():
     })
     cmd = ["wasmtime", "run", "-Stcp", "-Sinherit-network", "-Sallow-ip-name-lookup",
            "--env", f"ENCLAVE_PORTS=http:8000={args.port}",
-           "--env", f"ANIMA_CONFIG={cfg}"]
+           "--env", f"RISCBOX_CONFIG={cfg}"]
     for kv in args.env:
         cmd += ["--env", kv]
     cmd.append(args.wasm)
@@ -255,7 +255,7 @@ def main():
                 sys.exit(f"wasmtime exited early:\n{out[-2000:]}")
             time.sleep(0.1)
         else:
-            sys.exit("anima never answered /ping")
+            sys.exit("risc-box never answered /ping")
 
         con = Console(args.port)
         time.sleep(0.3)
@@ -306,8 +306,8 @@ def main():
             # D bits); after save we must find its content in the image
             off0 = con.size()
             http_req(args.port, "POST", "/input",
-                     body=b"echo anima-$((100+23))-proof > /probe.txt; cat /probe.txt\n")
-            con.wait_for([b"anima-123-proof"], timeout=120, start=off0)
+                     body=b"echo riscbox-$((100+23))-proof > /probe.txt; cat /probe.txt\n")
+            con.wait_for([b"riscbox-123-proof"], timeout=120, start=off0)
             res["guest_write"] = True
 
             # write-then-execute: fresh pages holding new code must run
@@ -335,7 +335,7 @@ def main():
             res["save_size"] = sz
             res["save_ok"] = (st == 200 and sz == ROOTFS_SIZE)
             if args.deep and res["save_ok"]:
-                res["saved_content_ok"] = s3_object_contains(SAVEKEY, b"anima-123-proof")
+                res["saved_content_ok"] = s3_object_contains(SAVEKEY, b"riscbox-123-proof")
 
         res["ok"] = True
     finally:

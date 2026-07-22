@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
-  <!-- anima: breath of life into a machine — a serial console with a pulse. -->
+  <!-- RISC Box: a real machine in a sealed box, a serial console with a pulse. -->
   <rect width="96" height="96" rx="18" fill="#0b0d12"/>
   <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#252b38" stroke-width="3"/>
   <!-- console frame -->

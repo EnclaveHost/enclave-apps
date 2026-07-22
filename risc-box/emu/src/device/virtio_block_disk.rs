@@ -37,7 +37,7 @@ pub struct VirtioBlockDisk {
 	status: u32, // read and write
 	notify_clocks: Vec::<u64>,
 	contents: Vec<u64>,
-	contents_len: usize // anima patch: original byte length, for dump_contents()
+	contents_len: usize // risc-box patch: original byte length, for dump_contents()
 }
 
 impl VirtioBlockDisk {
@@ -69,7 +69,7 @@ impl VirtioBlockDisk {
 		(self.interrupt_status & 0x1) == 1
 	}
 
-	/// anima patch: copies the current disk contents (including every write
+	/// risc-box patch: copies the current disk contents (including every write
 	/// the guest has made) back out as plain bytes, for persisting the image.
 	pub fn dump_contents(&self) -> Vec<u8> {
 		let mut out = Vec::with_capacity(self.contents_len);
@@ -88,7 +88,7 @@ impl VirtioBlockDisk {
 	/// * `contents` filesystem content binary
 	pub fn init(&mut self, contents: Vec<u8>) {
 		// @TODO: Optimize
-		self.contents_len = contents.len(); // anima patch
+		self.contents_len = contents.len(); // risc-box patch
 		for _i in 0..((contents.len() + 7) / 8) {
 			self.contents.push(0);
 		}
