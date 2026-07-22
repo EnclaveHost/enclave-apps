@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
   <!-- gavel: the hammer nobody can see past, over three sealed bids. -->
-  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
-  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
   <!-- mallet head, mid-swing at 45° -->
   <g transform="rotate(-45 44 38)">
     <rect x="28" y="30" width="32" height="16" rx="4" fill="#d8b46a"/>

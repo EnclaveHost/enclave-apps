@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
   <!-- tip line: an envelope sealed with a keyhole only one side can open. -->
-  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
-  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
   <rect x="18" y="28" width="60" height="42" rx="6" fill="#2dd4bf"/>
   <path d="M18 32 L48 52 L78 32" fill="none" stroke="#06201c" stroke-width="4" stroke-linejoin="round"/>
   <circle cx="48" cy="56" r="7" fill="#06201c"/>

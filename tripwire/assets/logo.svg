@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
   <!-- trip wire: the taut line, and the moment it's touched. -->
-  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
-  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
   <path d="M14 62 L46 62 L54 46 L62 62 L82 62" fill="none" stroke="#ff8c42" stroke-width="6"
         stroke-linecap="round" stroke-linejoin="round"/>
   <g fill="#3a4256">

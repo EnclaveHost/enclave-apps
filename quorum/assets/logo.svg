@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
   <!-- quorum: three seats, two lit — enough. -->
-  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
-  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
   <g>
     <circle cx="30" cy="36" r="12" fill="#8fa3f7"/>
     <circle cx="66" cy="36" r="12" fill="#8fa3f7"/>

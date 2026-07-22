@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
   <!-- pulse: the beat that proves you're alive. -->
-  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
-  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
   <path d="M14 52 h18 l7 -22 12 38 8 -26 5 10 h18" fill="none" stroke="#f2d54f" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
   <circle cx="82" cy="52" r="6" fill="#f7e58a"/>
 </svg>

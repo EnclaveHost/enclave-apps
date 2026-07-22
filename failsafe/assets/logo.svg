@@ -1,7 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
   <!-- fail safe: an hourglass that is also a keyhole. -->
-  <rect width="96" height="96" rx="18" fill="#0b0e14"/>
-  <rect x="1.5" y="1.5" width="93" height="93" rx="16.5" fill="none" stroke="#1e2430" stroke-width="3"/>
   <g fill="#e05e5e">
     <path d="M30 20 h36 v8 c0 10 -10 14 -14 20 4 6 14 10 14 20 v8 h-36 v-8 c0 -10 10 -14 14 -20 -4 -6 -14 -10 -14 -20 z"/>
   </g>

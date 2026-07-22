@@ -30,7 +30,6 @@
 
   <!-- serial console -->
   <g transform="translate(1290,120)">
-    <rect x="0" y="0" width="230" height="160" rx="10" fill="#151b28" stroke="#2a3242" stroke-width="3"/>
     <text x="16" y="34" font-size="15" fill="#5b667a">OpenRC starting up</text>
     <text x="16" y="60" font-size="15" fill="#5b667a">Welcome to Alpine</text>
     <text x="16" y="94" font-size="16" fill="#8a94a6">golem login:</text>

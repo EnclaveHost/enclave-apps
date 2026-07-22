@@ -8,14 +8,13 @@
   <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#252b38" stroke-width="4"/>
 
   <!-- wordmark -->
-  <text x="90" y="150" font-size="64" font-weight="700" fill="#6bd0c4">[ RISC<tspan fill="#9be7dd"> Box</tspan> ]</text>
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#6bd0c4">[ RISC <tspan fill="#9be7dd">Box</tspan> ]</text>
   <text x="90" y="205" font-size="26" fill="#868ea0">a real machine breathing on the enclave's own CPU —</text>
   <text x="90" y="240" font-size="26" fill="#868ea0">booted from OS images in your S3 bucket</text>
   <text x="90" y="300" font-size="20" fill="#5b667a">S3 image (SigV4) &#8594; RV64 emulator in the TEE &#8594; serial console in your browser</text>
 
   <!-- console with a heartbeat -->
   <g transform="translate(1070,90)">
-    <rect x="0" y="0" width="440" height="230" rx="10" fill="#101620" stroke="#2a3242" stroke-width="3"/>
     <text x="20" y="40" font-size="16" fill="#5b667a">OpenSBI v1.x  &#183;  Linux 6.x (riscv64)</text>
     <text x="20" y="70" font-size="16" fill="#5b667a">Mounted root (ext2) on /dev/vda</text>
     <text x="20" y="100" font-size="16" fill="#868ea0">buildroot login:  root</text>

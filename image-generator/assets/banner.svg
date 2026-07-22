@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <!-- Image Generator: pixel camera wordmark banner; prompts in, pixels out. -->
+  <defs>
+    <radialGradient id="glow" cx="18%" cy="0%" r="90%">
+      <stop offset="0%" stop-color="#7a8cf0" stop-opacity=".10"/>
+      <stop offset="60%" stop-color="#7a8cf0" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glass" cx="36%" cy="30%" r="80%">
+      <stop offset="0%" stop-color="#a9bef2"/>
+      <stop offset="45%" stop-color="#6b74b8"/>
+      <stop offset="100%" stop-color="#454a72"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="400" fill="#0b0d12"/>
+  <rect width="1600" height="400" fill="url(#glow)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#252b38" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#7a8cf0">[ Image <tspan fill="#a9bef2">Generator</tspan> ]</text>
+  <text x="90" y="205" font-size="26" fill="#868ea0">private text-to-image on the enclave's attested GPUs;</text>
+  <text x="90" y="240" font-size="26" fill="#868ea0">prompts in, pixels out, nothing stored server-side</text>
+  <text x="90" y="300" font-size="20" fill="#5b667a">prompt &#8594; wasi-nn diffusion in the TEE &#8594; PNG in your browser</text>
+
+  <!-- the pixel camera, at card scale -->
+  <g transform="translate(1070,90)">
+    <g transform="translate(85.2,-22) scale(2.8)">
+      <rect x="38" y="27" width="20" height="12" rx="3" fill="#f2f4f8"/>
+      <rect x="20" y="33" width="56" height="38" rx="6" fill="#f2f4f8"/>
+      <circle cx="48" cy="52" r="17" fill="#232735"/>
+      <circle cx="48" cy="52" r="12.5" fill="url(#glass)"/>
+      <circle cx="43.5" cy="47.5" r="2.4" fill="#dfe8fb"/>
+    </g>
+  </g>
+</svg>
