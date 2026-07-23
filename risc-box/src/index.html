@@ -72,6 +72,13 @@
   <div class="tag">a real machine breathing on the enclave's own CPU — you just hold the console</div>
 </header>
 
+<div id="authbar" style="display:none; margin:0 0 12px; padding:10px 12px; border:1px solid var(--warn); border-radius:8px; font-size:13px; color:var(--text)">
+  This deployment requires an <b>API key</b> (the config's <code>api_key</code>).
+  <input id="apikey" type="password" placeholder="api key" autocomplete="off"
+    style="margin:0 6px; min-width:220px">
+  <button id="authbtn">Use key</button>
+</div>
+
 <div class="banner">
   This machine's CPU runs <b>inside the enclave</b>, the way a server-hosted emulator would — not in your browser.
   The enclave pulls the kernel and root filesystem from an <b>S3 bucket</b>, boots them on a vendored pure-Rust
@@ -131,18 +138,41 @@ term.open($("term"));
 const dec = new TextDecoder();
 let evs = null, poll = null, running = false;
 
+// ---- API key: sent on every request when the deployment sets api_key. -------
+// EventSource can't set headers, so /console takes it as ?key=; everything
+// else uses Authorization: Bearer. A 401 reveals the key bar.
+let apiKey = "";
+try { apiKey = sessionStorage.getItem("riscbox_key") || ""; } catch (_) {}
+function setKey(k) { apiKey = k; try { sessionStorage.setItem("riscbox_key", k); } catch (_) {} }
+function authFetch(url, opts) {
+  opts = opts || {};
+  const h = opts.headers || {};
+  if (apiKey) h["Authorization"] = "Bearer " + apiKey;
+  opts.headers = h;
+  return fetch(url, opts);
+}
+function needKey() { $("authbar").style.display = ""; $("apikey").focus(); }
+
 term.onData((d) => {
   if (!running) return;
   // send raw bytes (UTF-8) as the request body
-  fetch("/input", { method: "POST", body: new TextEncoder().encode(d) }).catch(() => {});
+  authFetch("/input", { method: "POST", body: new TextEncoder().encode(d) }).catch(() => {});
 });
 
 function connectConsole() {
   if (evs) return;
-  evs = new EventSource("/console");
+  evs = new EventSource("/console" + (apiKey ? "?key=" + encodeURIComponent(apiKey) : ""));
   evs.onmessage = (e) => { if (e.data) term.write(dec.decode(b64dec(e.data))); };
   evs.onerror = () => {};
 }
+function dropConsole() { if (evs) { evs.close(); evs = null; } }
+
+$("authbtn").onclick = () => {
+  setKey($("apikey").value.trim());
+  $("authbar").style.display = "none";
+  dropConsole(); // reopen SSE with the key
+  refresh();
+};
 
 function credsBody(extra) {
   const b = { ...extra };
@@ -158,8 +188,9 @@ async function start(reset) {
   $("startbtn").disabled = $("resetbtn").disabled = true;
   $("phase").className = "badge loading"; $("phase").textContent = "loading";
   try {
-    const r = await fetch("/start", { method: "POST", headers: { "content-type": "application/json" },
+    const r = await authFetch("/start", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify(credsBody({ reset: !!reset })) });
+    if (r.status === 401) { needKey(); throw new Error("API key required"); }
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error?.message || `HTTP ${r.status}`); }
     term.clear();
     connectConsole();
@@ -174,7 +205,8 @@ async function save() {
   const old = $("savebtn").textContent;
   $("savebtn").innerHTML = '<span class="spin"></span>saving…';
   try {
-    const r = await fetch("/save", { method: "POST" });
+    const r = await authFetch("/save", { method: "POST" });
+    if (r.status === 401) { needKey(); throw new Error("API key required"); }
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
     $("savebtn").textContent = "saved ✓";
@@ -187,7 +219,7 @@ async function save() {
 
 async function stop() {
   if (!confirm("Halt the machine? Unsaved disk changes are lost.")) return;
-  await fetch("/stop", { method: "POST" }).catch(() => {});
+  await authFetch("/stop", { method: "POST" }).catch(() => {});
   refresh();
 }
 
@@ -195,7 +227,12 @@ function showErr(m) { $("err").style.display = ""; $("err").textContent = m; }
 
 async function refresh() {
   let s;
-  try { s = await (await fetch("/status")).json(); } catch { return; }
+  try {
+    const r = await authFetch("/status");
+    if (r.status === 401) { needKey(); return; }
+    $("authbar").style.display = "none";
+    s = await r.json();
+  } catch { return; }
   $("title").textContent = s.title || "machine";
   $("phase").className = "badge " + s.phase;
   $("phase").textContent = s.phase;

@@ -1,6 +1,6 @@
 [package]
 name = "risc-box"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Boot a real machine on the enclave's CPU from OS images in S3, with the serial console bridged to the browser — a pure-Rust RISC-V system emulator compiled to wasm32-wasip2, run as an Enclave service app."
 license = "MIT"

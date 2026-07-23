@@ -43,7 +43,7 @@ mod s3;
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use httpd::{json, Request, Response, Server};
+use httpd::{form_get, json, Request, Response, Server};
 use net::{ForwardCfg, HostNet, NetStack};
 use riscv_emu_rust::terminal::Terminal;
 use riscv_emu_rust::Emulator;
@@ -77,6 +77,7 @@ struct Config {
     read_only: bool,
     net_enabled: bool,
     forwards: Vec<ForwardCfg>,
+    api_key: Option<String>,
 }
 
 fn creds_from(v: &serde_json::Value) -> Option<Creds> {
@@ -159,7 +160,33 @@ fn load_config() -> Result<Config, String> {
         read_only: v.get("readOnly").and_then(|x| x.as_bool()).unwrap_or(false),
         net_enabled: v.get("net").and_then(|x| x.as_bool()).unwrap_or(true),
         forwards: forwards_from(v.get("net")),
+        // Optional shared secret. When set (directly or via a $VAR secret), the
+        // control + observation endpoints require it; see `authorized`. Unset
+        // means the deployment is open, which is only safe when it is private.
+        api_key: s("api_key"),
     })
+}
+
+/// Whether a request may touch the machine. With no `api_key` configured the
+/// app is open (fine for a private deployment). With one set, every control
+/// and observation endpoint requires it — presented as `Authorization: Bearer
+/// <key>`, `X-Api-Key: <key>`, or `?key=<key>` (the last for EventSource,
+/// which cannot set headers). Without this a public deployment would hand any
+/// passer-by a root console via /input and start/stop/save over the machine.
+fn authorized(req: &Request, cfg: &Config) -> bool {
+    let Some(want) = cfg.api_key.as_deref() else {
+        return true;
+    };
+    if let Some(h) = req.header("authorization") {
+        let tok = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer "));
+        if tok == Some(want) {
+            return true;
+        }
+    }
+    if req.header("x-api-key") == Some(want) {
+        return true;
+    }
+    form_get(&req.query, "key").as_deref() == Some(want)
 }
 
 /// `net` config: absent or `true` → networking with the default ssh forward
@@ -339,6 +366,14 @@ impl App {
 fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
     let mut noop = |_: usize, _: usize| {};
+    // Make the credential state explicit in the logs: a private bucket needs
+    // signed requests, so "UNSIGNED" here next to an S3 4xx means the creds
+    // never resolved (unset/misnamed secret), while a 401 on a SIGNED request
+    // means the resolved key/secret is wrong (e.g. a rotated token).
+    match creds.is_some() {
+        true => eprintln!("[risc-box] S3 requests will be SIGNED (credentials resolved)"),
+        false => eprintln!("[risc-box] S3 requests will be UNSIGNED (no credentials resolved; set config credentials, or use a public bucket)"),
+    }
     eprintln!("[risc-box] fetching s3://{}/{}", cfg.bucket, cfg.kernel);
     let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
@@ -375,6 +410,16 @@ fn boot(images: &Images, net_enabled: bool) -> Emulator {
 // ---- request routing -------------------------------------------------------
 
 fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
+    // The static shell, its assets, and liveness stay open so the page can
+    // load and prompt for a key; everything that reveals or drives the machine
+    // is gated when api_key is set.
+    let open = matches!(
+        (req.method.as_str(), req.path.as_str()),
+        ("GET", "/") | ("GET", "/ping") | ("GET", "/a/xterm.js") | ("GET", "/a/xterm.css")
+    );
+    if !open && !authorized(&req, &app.cfg) {
+        return server.respond(key, json(401, "Unauthorized", err("api key required")));
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => server.respond(
             key,

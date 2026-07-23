@@ -101,7 +101,8 @@ JSON object:
   "credentials": { "accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "..." },
   "autostart": false,
   "readOnly": false,
-  "net": { "forwards": [ { "listen": 2222, "to": 22 } ] }
+  "net": { "forwards": [ { "listen": 2222, "to": 22 } ] },
+  "api_key": "$RISCBOX_API_KEY"
 }
 ```
 
@@ -121,6 +122,12 @@ JSON object:
   forward (deployment port `tcp:2222` → guest `22`, made for sshd); `false`
   removes the network backend entirely; an object with `forwards` customizes
   the port list. See Networking below.
+- `api_key` is optional but **required for safety on a public deployment**:
+  when set (use a `$VAR` secret, not a literal), every endpoint that drives or
+  observes the machine — `/start`, `/stop`, `/save`, `/input`, `/console`,
+  `/status` — demands it, presented as `Authorization: Bearer <key>`,
+  `X-Api-Key: <key>`, or `?key=<key>` (the last for the SSE console). Only the
+  static shell, its assets, and `/ping` stay open. See Security below.
 - **Credentials** are optional. A public-read bucket needs none (requests go
   unsigned). Otherwise, credentials may sit in the config (the enclave attests
   it) **or** be typed in the browser at boot — they are sent only to this app,
@@ -251,6 +258,26 @@ it.
 - **Credentials.** If the bucket needs credentials and you don't seal them in
   the attested config, they are entered per boot and held only in RAM (a Stop,
   or a restart, drops them).
+
+## Security
+
+The control surface drives a real machine: `/input` is a raw console into the
+guest (a root shell, once one is running), and `/start` / `/stop` / `/save`
+boot it, halt it, or write its disk back to your bucket. On a **public**
+deployment those endpoints are reachable by anyone with the URL, so set
+`api_key` (from a `$VAR` secret): it gates `/start`, `/stop`, `/save`,
+`/input`, `/console`, and `/status`, leaving only the static shell and `/ping`
+open. The browser UI prompts for the key and remembers it for the tab. Without
+`api_key`, deploy **private** — an open deployment hands a stranger the
+machine. The key is a coarse app-level gate, not the trust boundary; the
+enclave is (see below).
+
+Credentials passed at `/start` (rather than baked in the config) live only in
+enclave RAM for that boot and never touch the disk image or the bucket
+listing. The startup log states plainly whether S3 requests are **SIGNED** or
+**UNSIGNED**, so a failing boot is easy to read: `UNSIGNED` next to an S3 4xx
+means the credential secret never resolved (unset or misnamed); a `401` on a
+`SIGNED` request means the resolved key/secret is wrong (e.g. a rotated token).
 
 ## Trust notes
 
