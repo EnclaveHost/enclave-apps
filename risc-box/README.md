@@ -28,8 +28,11 @@ block) that boots real Linux. It compiles to the same target as the rest of
 the fleet and steps instruction-by-instruction in the TEE. The source lives
 in [`emu/`](emu/); every divergence from upstream is tagged `risc-box patch`
 in-line. Beyond the original two (`dump_contents()` / `get_disk()`, which read
-the guest-modified disk back out for saving) there are six performance
-patches, measured end-to-end at 2.8× throughput and 2.5× faster boot:
+the guest-modified disk back out for saving) there is one functional addition
+(a legacy virtio-net MMIO device at `0x10002000`, IRQ 2, with a pluggable
+`NetBackend` mirroring the UART's `Terminal`; see Networking below) and six
+performance patches, measured end-to-end at 2.8× throughput and 2.5× faster
+boot:
 
 - a direct-mapped **software TLB** in front of the Sv32/Sv39 page walk,
   tagged with a generation counter plus the translation-relevant CPU state;
@@ -75,8 +78,9 @@ signing (GET to fetch, PUT to save) hand-rolled from `sha2`/`hmac` — no
  S3 bucket ──GET(SigV4)──►  enclave: riscv-rust emulator (wasm32-wasip2)
  (kernel+rootfs)                       │  steps RV64 Linux on the TEE CPU
        ▲                               │  UART ⇄ SSE / POST /input
-       └──PUT(SigV4)── save disk ──────┘         │
-                                           your browser (xterm.js console)
+       └──PUT(SigV4)── save disk ──────┤         │
+                                       │   your browser (xterm.js console)
+              ssh/tcp ──tcp:2222──► smoltcp ⇄ virtio-net ⇄ guest eth0 :22
 ```
 
 ## Configuration
@@ -96,7 +100,8 @@ JSON object:
   "saveKey": "images/rootfs.img",
   "credentials": { "accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "..." },
   "autostart": false,
-  "readOnly": false
+  "readOnly": false,
+  "net": { "forwards": [ { "listen": 2222, "to": 22 } ] }
 }
 ```
 
@@ -106,6 +111,10 @@ JSON object:
 - `saveKey` is where **Save disk** PUTs the guest-modified image (defaults to
   `fs`; set it aside to keep the pristine image). `readOnly: true` disables
   saving.
+- `net` is optional: absent or `true` enables the guest NIC with the default
+  forward (deployment port `tcp:2222` → guest `22`, made for sshd); `false`
+  removes the network backend entirely; an object with `forwards` customizes
+  the port list. See Networking below.
 - **Credentials** are optional. A public-read bucket needs none (requests go
   unsigned). Otherwise, credentials may sit in the config (the enclave attests
   it) **or** be typed in the browser at boot — they are sent only to this app,
@@ -143,6 +152,42 @@ The sample is the OpenSBI + Linux + Buildroot image set from the vendored
 emulator's own resources. Any RISC-V kernel/rootfs that boots on the
 `virt`-style machine works — build your own with Buildroot and drop them in.
 
+## Networking and SSH
+
+The guest gets a **virtio-net NIC** (eth0). There is no bridge to a real
+network: the app terminates the guest's ethernet in user space with
+[smoltcp](https://github.com/smoltcp-rs/smoltcp) (`src/net.rs`), which plays
+the LAN at `10.0.2.2/24`, answers DHCP with a static lease for `10.0.2.15`,
+and splices **inbound TCP forwards** from the deployment's raw `tcp:` ports
+onto guest connections. The default forward is `tcp:2222` → guest `22`:
+
+```sh
+ssh -p 2222 root@<deployment-host>        # reaches sshd inside the guest
+```
+
+For that to answer, two things must be true in your image:
+
+- **an sshd is installed and running**: the sample Buildroot image has none
+  (verify the path with busybox `nc -l -p 22` instead); build your own with
+  Buildroot (`BR2_PACKAGE_DROPBEAR=y`) or any distro image with openssh;
+- **eth0 has its address**: a DHCP client on eth0 gets the lease
+  (busybox `udhcpc -i eth0` needs its `/usr/share/udhcpc/default.script`
+  present, which minimal images often omit), or configure it statically:
+
+```sh
+ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+```
+
+The deployment must declare the forward ports alongside http:
+`ports="http:8000,tcp:2222"` at publish time; the app resolves the actual
+bind via `ENCLAVE_PORTS` exactly like the http port.
+
+**No outbound NAT (yet).** The guest can be reached through forwards and can
+talk to 10.0.2.2, but cannot open connections out to the internet; the
+machine cannot exfiltrate anything by itself, which keeps the trust story
+simple. `/status` reports the network state under `net`
+(guest IP, forwards, frame counters, active connections).
+
 ## Try it locally
 
 Against [minio](https://min.io) standing in for S3 (this is exactly the rig the
@@ -152,7 +197,7 @@ app was verified on):
 cargo build --release --target wasm32-wasip2
 
 # 1. an S3 to boot from
-minio server /tmp/RISC Box-data --address 127.0.0.1:9100 &
+minio server /tmp/riscbox-data --address 127.0.0.1:9100 &
 # (create a bucket + upload images/fw_payload.elf and images/rootfs.img;
 #  seed-machine.py, mc, or any S3 client does this)
 
@@ -162,7 +207,7 @@ CFG='{"title":"demo","endpoint":"http://127.0.0.1:9100","region":"us-east-1",
       "saveKey":"images/rootfs.saved.img",
       "credentials":{"accessKeyId":"…","secretAccessKey":"…"}}'
 wasmtime run -Stcp -Sinherit-network -Sallow-ip-name-lookup \
-  --env ENCLAVE_PORTS=http:8000=8000 --env RISCBOX_CONFIG="$CFG" \
+  --env ENCLAVE_PORTS=http:8000=8000,tcp:2222=2222 --env RISCBOX_CONFIG="$CFG" \
   target/wasm32-wasip2/release/risc-box.wasm
 ```
 
@@ -179,6 +224,8 @@ it.
 
 ## Caveats, honestly
 
+- **Inbound network only.** The guest NIC reaches the in-app user-mode
+  network: DHCP, the forwards, nothing outbound. One guest IP (10.0.2.15).
 - **RISC-V RV64 only, one hart.** RISC Box runs what the vendored emulator runs:
   a single-core RISC-V `virt`-style machine. Not x86, not multi-core.
 - **Emulated speed.** The interpreter turns ~29 MIPS under wasmtime (software

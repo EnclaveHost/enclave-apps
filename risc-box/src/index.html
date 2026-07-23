@@ -68,7 +68,7 @@
 </head>
 <body>
 <header>
-  <div class="brand">[ an<b>ima</b> ]</div>
+  <div class="brand">[ RISC <b>Box</b> ]</div>
   <div class="tag">a real machine breathing on the enclave's own CPU — you just hold the console</div>
 </header>
 
@@ -76,7 +76,9 @@
   This machine's CPU runs <b>inside the enclave</b>, the way a server-hosted emulator would — not in your browser.
   The enclave pulls the kernel and root filesystem from an <b>S3 bucket</b>, boots them on a vendored pure-Rust
   RISC-V system emulator, and streams the serial console here; your keystrokes go back into the guest. <b>Save disk</b>
-  writes the guest's changes back to the bucket.
+  writes the guest's changes back to the bucket. The guest has a <b>virtio-net NIC</b> on an in-app user-mode
+  network: the deployment's <b>tcp:2222</b> port forwards to guest port 22, so an image with sshd accepts
+  <span style="font-family:ui-monospace,monospace">ssh -p 2222</span> straight into the machine.
 </div>
 
 <div class="card">

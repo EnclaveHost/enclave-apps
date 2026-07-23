@@ -11,6 +11,7 @@ use self::fnv::FnvHashMap;
 use memory::Memory;
 use cpu::{PrivilegeMode, Trap, TrapType, Xlen, get_privilege_mode};
 use device::virtio_block_disk::VirtioBlockDisk;
+use device::virtio_net::VirtioNet; // risc-box patch
 use device::plic::Plic;
 use device::clint::Clint;
 use device::uart::Uart;
@@ -30,6 +31,7 @@ pub struct Mmu {
 	memory: MemoryWrapper,
 	dtb: Vec<u8>,
 	disk: VirtioBlockDisk,
+	net: VirtioNet, // risc-box patch
 	plic: Plic,
 	clint: Clint,
 	uart: Uart,
@@ -124,6 +126,7 @@ impl Mmu {
 			memory: MemoryWrapper::new(),
 			dtb: dtb,
 			disk: VirtioBlockDisk::new(),
+			net: VirtioNet::new(), // risc-box patch
 			plic: Plic::new(),
 			clint: Clint::new(),
 			uart: Uart::new(terminal),
@@ -251,8 +254,9 @@ impl Mmu {
 	pub fn tick(&mut self, mip: &mut u64) {
 		self.clint.tick(mip);
 		self.disk.tick(&mut self.memory);
+		self.net.tick(&mut self.memory); // risc-box patch
 		self.uart.tick();
-		self.plic.tick(self.disk.is_interrupting(), self.uart.is_interrupting(), mip);
+		self.plic.tick(self.disk.is_interrupting(), self.net.is_interrupting(), self.uart.is_interrupting(), mip);
 		self.clock = self.clock.wrapping_add(1);
 	}
 
@@ -554,6 +558,7 @@ impl Mmu {
 				0x0C000000..=0x0fffffff => self.plic.load(effective_address),
 				0x10000000..=0x100000ff => self.uart.load(effective_address),
 				0x10001000..=0x10001FFF => self.disk.load(effective_address),
+				0x10002000..=0x10002FFF => self.net.load(effective_address), // risc-box patch
 				_ => panic!("Unknown memory mapping {:X}.", effective_address)
 			}
 		}
@@ -635,6 +640,7 @@ impl Mmu {
 				0x0c000000..=0x0fffffff => self.plic.store(effective_address, value),
 				0x10000000..=0x100000ff => self.uart.store(effective_address, value),
 				0x10001000..=0x10001FFF => self.disk.store(effective_address, value),
+				0x10002000..=0x10002FFF => self.net.store(effective_address, value), // risc-box patch
 				_ => panic!("Unknown memory mapping {:X}.", effective_address)
 			}
 		};
@@ -717,6 +723,7 @@ impl Mmu {
 				0x0C000000..=0x0fffffff => true,
 				0x10000000..=0x100000ff => true,
 				0x10001000..=0x10001FFF => true,
+				0x10002000..=0x10002FFF => true, // risc-box patch
 				_ => false
 			}
 		};
@@ -979,6 +986,12 @@ impl Mmu {
 
 	/// risc-box patch: immutable access to the virtio disk, so the app can
 	/// dump the (guest-modified) image for persisting.
+	/// risc-box patch: mutable access to the virtio-net device so the
+	/// embedding application can attach a backend and exchange frames.
+	pub fn get_mut_net(&mut self) -> &mut VirtioNet {
+		&mut self.net
+	}
+
 	pub fn get_disk(&self) -> &VirtioBlockDisk {
 		&self.disk
 	}

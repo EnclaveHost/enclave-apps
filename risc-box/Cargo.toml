@@ -1,6 +1,6 @@
 [package]
 name = "risc-box"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Boot a real machine on the enclave's CPU from OS images in S3, with the serial console bridged to the browser — a pure-Rust RISC-V system emulator compiled to wasm32-wasip2, run as an Enclave service app."
 license = "MIT"
@@ -19,6 +19,11 @@ rustls-rustcrypto = "0.0.2-alpha"
 webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
+# User-mode network for the guest's virtio-net: pure-Rust TCP/IP endpoint the
+# app terminates guest ethernet on (DHCP + inbound port-forwards, src/net.rs).
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp",
+] }
 
 [profile.release]
 opt-level = 3       # the CPU loop is hot; favor speed over size here

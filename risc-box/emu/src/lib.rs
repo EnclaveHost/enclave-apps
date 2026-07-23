@@ -8,6 +8,7 @@ use self::fnv::FnvHashMap;
 
 pub mod cpu;
 pub mod terminal;
+pub mod net; // risc-box patch
 pub mod default_terminal;
 pub mod memory;
 pub mod mmu;
@@ -271,6 +272,15 @@ impl Emulator {
 	/// * `content` DTB content binary
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
 		self.cpu.get_mut_mmu().init_dtb(content);
+	}
+
+	/// risc-box patch: attaches a network backend to the virtio-net device.
+	/// Without this the guest sees a NIC with no link partner.
+	///
+	/// # Arguments
+	/// * `backend`
+	pub fn setup_network(&mut self, backend: Box<dyn crate::net::NetBackend>) {
+		self.cpu.get_mut_mmu().get_mut_net().set_backend(backend);
 	}
 
 	/// Updates XLEN (the width of an integer register in bits) in CPU.

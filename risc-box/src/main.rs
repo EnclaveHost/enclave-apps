@@ -18,6 +18,11 @@
 //! port the enclave's TLS proxy forwards to (see network-test / the suite's
 //! httpd.rs). The single thread interleaves CPU batches with HTTP polling.
 //!
+//! The guest also gets a virtio-net NIC terminated in user space by src/net.rs
+//! (smoltcp): a DHCP server leases 10.0.2.15, and raw `tcp:` deployment ports
+//! are spliced onto guest TCP connections (default tcp:2222 -> guest 22, so
+//! `ssh -p 2222` reaches an sshd inside the machine). Inbound only; no NAT.
+//!
 //! Routes:
 //!   GET  /            console UI (self-contained HTML + embedded xterm)
 //!   GET  /a/<asset>   embedded xterm.js / xterm.css
@@ -32,12 +37,14 @@
 //!   GET  /ping        liveness
 
 mod httpd;
+mod net;
 mod s3;
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
 use httpd::{json, Request, Response, Server};
+use net::{ForwardCfg, HostNet, NetStack};
 use riscv_emu_rust::terminal::Terminal;
 use riscv_emu_rust::Emulator;
 use s3::{Creds, Endpoint};
@@ -68,6 +75,8 @@ struct Config {
     config_creds: Option<Creds>,
     autostart: bool,
     read_only: bool,
+    net_enabled: bool,
+    forwards: Vec<ForwardCfg>,
 }
 
 fn creds_from(v: &serde_json::Value) -> Option<Creds> {
@@ -107,16 +116,41 @@ fn load_config() -> Result<Config, String> {
         config_creds: v.get("credentials").and_then(creds_from),
         autostart: v.get("autostart").and_then(|x| x.as_bool()).unwrap_or(false),
         read_only: v.get("readOnly").and_then(|x| x.as_bool()).unwrap_or(false),
+        net_enabled: v.get("net").and_then(|x| x.as_bool()).unwrap_or(true),
+        forwards: forwards_from(v.get("net")),
     })
+}
+
+/// `net` config: absent or `true` → networking with the default ssh forward
+/// (deployment tcp:2222 → guest 22); `false` → no NIC backend; an object
+/// `{"forwards": [{"listen": 2222, "to": 22}, …]}` → custom forwards.
+fn forwards_from(net: Option<&serde_json::Value>) -> Vec<ForwardCfg> {
+    let default = vec![ForwardCfg { listen: 2222, to: 22 }];
+    let Some(list) = net.and_then(|n| n.get("forwards")).and_then(|f| f.as_array()) else {
+        return default;
+    };
+    let parsed: Vec<ForwardCfg> = list
+        .iter()
+        .filter_map(|f| {
+            Some(ForwardCfg {
+                listen: f.get("listen")?.as_u64()?.try_into().ok()?,
+                to: f.get("to")?.as_u64()?.try_into().ok()?,
+            })
+        })
+        .collect();
+    match parsed.is_empty() {
+        true => default,
+        false => parsed,
+    }
 }
 
 // ---- terminal: O(1) queues between the guest UART and HTTP -----------------
 
-struct AnimaTerminal {
+struct RiscBoxTerminal {
     input: VecDeque<u8>,
     output: VecDeque<u8>,
 }
-impl Terminal for AnimaTerminal {
+impl Terminal for RiscBoxTerminal {
     fn put_byte(&mut self, v: u8) {
         self.output.push_back(v);
     }
@@ -166,6 +200,7 @@ struct App {
     scrollback: VecDeque<u8>,
     console_total: u64,
     last_save: Option<String>,
+    net: Option<NetStack>, // listeners live for the whole process
 }
 
 fn b64(data: &[u8]) -> String {
@@ -214,7 +249,7 @@ impl App {
         format!(
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
-             \"instret\":{},\"mips\":{:.1},\"consoleBytes\":{},\"lastSave\":{},\"error\":{}{img}}}",
+             \"instret\":{},\"mips\":{:.1},\"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
@@ -236,6 +271,23 @@ impl App {
             self.error
                 .as_ref()
                 .map(|s| format!("\"{}\"", httpd::json_escape(s)))
+                .unwrap_or_else(|| "null".into()),
+            self.net
+                .as_ref()
+                .map(|n| {
+                    let fw: Vec<String> = n
+                        .forwards()
+                        .iter()
+                        .map(|f| format!("{{\"listen\":{},\"to\":{}}}", f.listen, f.to))
+                        .collect();
+                    format!(
+                        "{{\"guestIp\":\"{}.{}.{}.{}\",\"forwards\":[{}],\
+                         \"rxFrames\":{},\"txFrames\":{},\"activeConns\":{}}}",
+                        net::GUEST_IP[0], net::GUEST_IP[1], net::GUEST_IP[2], net::GUEST_IP[3],
+                        fw.join(","),
+                        n.rx_frames, n.tx_frames, n.active_splices()
+                    )
+                })
                 .unwrap_or_else(|| "null".into()),
         )
     }
@@ -263,8 +315,8 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     Ok(Images { kernel, fs, dtb })
 }
 
-fn boot(images: &Images) -> Emulator {
-    let mut emu = Emulator::new(Box::new(AnimaTerminal {
+fn boot(images: &Images, net_enabled: bool) -> Emulator {
+    let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
         input: VecDeque::new(),
         output: VecDeque::new(),
     }));
@@ -272,6 +324,9 @@ fn boot(images: &Images) -> Emulator {
     emu.setup_filesystem(images.fs.clone());
     if let Some(dtb) = &images.dtb {
         emu.setup_dtb(dtb.clone());
+    }
+    if net_enabled {
+        emu.setup_network(Box::new(HostNet::new()));
     }
     emu
 }
@@ -406,7 +461,7 @@ fn do_start(app: &mut App, start: Start) {
         }
     }
     let imgs = app.cache.as_ref().expect("cache present after fetch");
-    app.emu = Some(boot(imgs));
+    app.emu = Some(boot(imgs, app.cfg.net_enabled));
     app.instret = 0;
     app.boot_at = Some(Instant::now());
     app.scrollback.clear();
@@ -449,7 +504,11 @@ fn main() {
         scrollback: VecDeque::new(),
         console_total: 0,
         last_save: None,
+        net: None,
     };
+    if app.cfg.net_enabled {
+        app.net = Some(NetStack::new(&app.cfg.forwards));
+    }
 
     loop {
         for (key, req) in server.poll(MAX_BODY) {
@@ -501,6 +560,16 @@ fn main() {
                     }
                     server.broadcast("console", &format!("data: {}", b64(&chunk)));
                     busy = true;
+                }
+                // exchange ethernet frames between the guest NIC and the
+                // user-mode network; traffic in flight lifts the WFI throttle
+                // so forwarded connections stay snappy
+                if let Some(stack) = app.net.as_mut() {
+                    let backend = emu.get_mut_cpu().get_mut_mmu().get_mut_net().get_mut_backend();
+                    if stack.pump(backend.as_mut()) {
+                        app.input_boost = app.input_boost.max(3);
+                        busy = true;
+                    }
                 }
             }
         }

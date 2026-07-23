@@ -17,7 +17,7 @@ import signal, socket, subprocess, sys, threading, time
 MINIO = "http://127.0.0.1:9100"
 REGION = "us-east-1"
 BUCKET = "machines"
-AK, SK = "animatest", "animatest123"
+AK, SK = "riscboxtest", "riscboxtest123"
 SAVEKEY = "images/rootfs.saved.img"
 ROOTFS_SIZE = 52428800
 

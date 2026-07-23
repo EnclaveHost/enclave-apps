@@ -14,11 +14,13 @@ pub struct Plic {
 	ips: [u8; 1024],
 	priorities: [u32; 1024],
 	needs_update_irq: bool,
-	virtio_ip_cache: bool
+	virtio_ip_cache: bool,
+	net_ip_cache: bool // risc-box patch
 }
 
 // @TODO: IRQ numbers should be configurable with device tree
 const VIRTIO_IRQ: u32 = 1;
+const NET_IRQ: u32 = 2; // risc-box patch: virtio-net at 0x10002000
 const UART_IRQ: u32 = 10;
 
 impl Plic {
@@ -32,7 +34,8 @@ impl Plic {
 			priorities: [0; 1024],
 			ips: [0; 1024],
 			needs_update_irq: false,
-			virtio_ip_cache: false
+			virtio_ip_cache: false,
+			net_ip_cache: false // risc-box patch
 		}
 	}
 
@@ -45,7 +48,7 @@ impl Plic {
 	/// * `virtio_ip`
 	/// * `uart_ip`
 	/// * `mip`
-	pub fn tick(&mut self, virtio_ip: bool, uart_ip: bool, mip: &mut u64) {
+	pub fn tick(&mut self, virtio_ip: bool, net_ip: bool, uart_ip: bool, mip: &mut u64) {
 		self.clock = self.clock.wrapping_add(1);
 
 		// Handling interrupts as "Edge-triggered" interrupt so far
@@ -58,6 +61,15 @@ impl Plic {
 				self.set_ip(VIRTIO_IRQ);
 			}
 			self.virtio_ip_cache = virtio_ip;
+		}
+
+		// risc-box patch: the virtio-net device is level-triggered like the
+		// disk; detect the rising edge the same way.
+		if self.net_ip_cache != net_ip {
+			if net_ip {
+				self.set_ip(NET_IRQ);
+			}
+			self.net_ip_cache = net_ip;
 		}
 
 		// Our Uart implements an interrupt as "Edge-triggered" and
@@ -77,24 +89,27 @@ impl Plic {
 		// @TODO: Should be configurable with device tree
 
 		let virtio_ip = ((self.ips[(VIRTIO_IRQ >> 3) as usize] >> (VIRTIO_IRQ & 7)) & 1) == 1;
+		let net_ip = ((self.ips[(NET_IRQ >> 3) as usize] >> (NET_IRQ & 7)) & 1) == 1; // risc-box patch
 		let uart_ip = ((self.ips[(UART_IRQ >> 3) as usize] >> (UART_IRQ & 7)) & 1) == 1;
 
 		// Which should be prioritized, virtio or uart?
 
 		let virtio_priority = self.priorities[VIRTIO_IRQ as usize];
+		let net_priority = self.priorities[NET_IRQ as usize]; // risc-box patch
 		let uart_priority = self.priorities[UART_IRQ as usize];
 
 		let virtio_enabled = ((self.enabled >> VIRTIO_IRQ) & 1) == 1;
+		let net_enabled = ((self.enabled >> NET_IRQ) & 1) == 1; // risc-box patch
 		let uart_enabled = ((self.enabled >> UART_IRQ) & 1) == 1;
 
-		let ips = [virtio_ip, uart_ip];
-		let enables = [virtio_enabled, uart_enabled];
-		let priorities = [virtio_priority, uart_priority];
-		let irqs = [VIRTIO_IRQ, UART_IRQ];
+		let ips = [virtio_ip, net_ip, uart_ip];
+		let enables = [virtio_enabled, net_enabled, uart_enabled];
+		let priorities = [virtio_priority, net_priority, uart_priority];
+		let irqs = [VIRTIO_IRQ, NET_IRQ, UART_IRQ];
 
 		let mut irq = 0;
 		let mut priority = 0;
-		for i in 0..2 {
+		for i in 0..3 {
 			if ips[i] && enables[i] &&
 				priorities[i] > self.threshold &&
 				priorities[i] > priority {
