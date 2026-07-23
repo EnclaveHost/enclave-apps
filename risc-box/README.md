@@ -111,6 +111,12 @@ JSON object:
 - `saveKey` is where **Save disk** PUTs the guest-modified image (defaults to
   `fs`; set it aside to keep the pristine image). `readOnly: true` disables
   saving.
+- Any string value in the config may be written as `$NAME` (or `${NAME}`):
+  it is resolved from the app's **environment** at startup, which is where
+  deployment secrets arrive. Whole-value references only. An unresolved
+  reference logs a warning and reads as absent (so unresolved credentials
+  fall back to the browser prompt). The config itself is read once, at
+  process start: config or secret changes need a restart to take effect.
 - `net` is optional: absent or `true` enables the guest NIC with the default
   forward (deployment port `tcp:2222` → guest `22`, made for sshd); `false`
   removes the network backend entirely; an object with `forwards` customizes

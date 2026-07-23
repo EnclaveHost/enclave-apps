@@ -96,13 +96,54 @@ fn creds_from(v: &serde_json::Value) -> Option<Creds> {
     })
 }
 
+/// Resolves config string values of the exact form `$NAME` / `${NAME}` from
+/// the process environment. Deployment secrets arrive as env vars, so this is
+/// what lets a config reference them instead of inlining values. Whole-value
+/// references only, no interpolation inside larger strings. An unresolved
+/// reference becomes "" (with a log line naming it), which downstream treats
+/// as absent, so e.g. credentials fall back to the browser prompt.
+fn expand_env_refs(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            let Some(reference) = s.strip_prefix('$') else { return };
+            let name = reference.strip_prefix('{').and_then(|r| r.strip_suffix('}')).unwrap_or(reference);
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || name.starts_with(|c: char| c.is_ascii_digit())
+            {
+                return; // not a $NAME reference; leave the literal alone
+            }
+            match std::env::var(name) {
+                Ok(val) => {
+                    eprintln!("[risc-box] config: resolved ${name} from the environment");
+                    *s = val;
+                }
+                Err(_) => {
+                    eprintln!("[risc-box] config: ${name} is not set in the environment; treating the value as absent");
+                    s.clear();
+                }
+            }
+        }
+        serde_json::Value::Object(map) => map.values_mut().for_each(expand_env_refs),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(expand_env_refs),
+        _ => {}
+    }
+}
+
 fn load_config() -> Result<Config, String> {
     let raw = std::env::var("ENCLAVE_CONFIG")
         .or_else(|_| std::env::var("RISCBOX_CONFIG"))
         .map_err(|_| "no ENCLAVE_CONFIG/RISCBOX_CONFIG set".to_string())?;
-    let v: serde_json::Value =
+    let mut v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("config is not JSON: {e}"))?;
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    expand_env_refs(&mut v);
+    let v = v;
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+    };
     let need = |k: &str| s(k).ok_or_else(|| format!("config missing \"{k}\""));
     Ok(Config {
         title: s("title").unwrap_or_else(|| "RISC Box machine".to_string()),
