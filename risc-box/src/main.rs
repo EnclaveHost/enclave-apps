@@ -131,12 +131,20 @@ fn expand_env_refs(v: &mut serde_json::Value) {
     }
 }
 
-fn load_config() -> Result<Config, String> {
+/// Reads the config, always returning one. Missing or unresolved fields are
+/// left empty rather than fatal: a fresh deployment whose `$VAR` secrets are
+/// not set yet must still START and serve the UI so they can be provided (and
+/// the process restarted). Booting a machine checks `missing()` first.
+fn load_config() -> Config {
     let raw = std::env::var("ENCLAVE_CONFIG")
         .or_else(|_| std::env::var("RISCBOX_CONFIG"))
-        .map_err(|_| "no ENCLAVE_CONFIG/RISCBOX_CONFIG set".to_string())?;
-    let mut v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("config is not JSON: {e}"))?;
+        .unwrap_or_default();
+    let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| {
+        if !raw.is_empty() {
+            eprintln!("[risc-box] config is not JSON ({e}); starting unconfigured");
+        }
+        serde_json::Value::Null
+    });
     expand_env_refs(&mut v);
     let v = v;
     let s = |k: &str| {
@@ -145,14 +153,13 @@ fn load_config() -> Result<Config, String> {
             .filter(|x| !x.is_empty())
             .map(str::to_string)
     };
-    let need = |k: &str| s(k).ok_or_else(|| format!("config missing \"{k}\""));
-    Ok(Config {
+    Config {
         title: s("title").unwrap_or_else(|| "RISC Box machine".to_string()),
-        endpoint: need("endpoint")?,
+        endpoint: s("endpoint").unwrap_or_default(),
         region: s("region").unwrap_or_else(|| "us-east-1".to_string()),
-        bucket: need("bucket")?,
-        kernel: need("kernel")?,
-        fs: need("fs")?,
+        bucket: s("bucket").unwrap_or_default(),
+        kernel: s("kernel").unwrap_or_default(),
+        fs: s("fs").unwrap_or_default(),
         dtb: s("dtb"),
         save_key: s("saveKey").or_else(|| s("fs")),
         config_creds: v.get("credentials").and_then(creds_from),
@@ -164,7 +171,29 @@ fn load_config() -> Result<Config, String> {
         // control + observation endpoints require it; see `authorized`. Unset
         // means the deployment is open, which is only safe when it is private.
         api_key: s("api_key"),
-    })
+    }
+}
+
+impl Config {
+    /// The fields required to boot a machine. Any that are empty mean the
+    /// deployment is not configured yet (typically an unresolved `$VAR`
+    /// secret); the app still runs, it just can't fetch or boot until set.
+    fn missing(&self) -> Vec<&'static str> {
+        let mut m = Vec::new();
+        if self.endpoint.is_empty() {
+            m.push("endpoint");
+        }
+        if self.bucket.is_empty() {
+            m.push("bucket");
+        }
+        if self.kernel.is_empty() {
+            m.push("kernel");
+        }
+        if self.fs.is_empty() {
+            m.push("fs");
+        }
+        m
+    }
 }
 
 /// Whether a request may touch the machine. With no `api_key` configured the
@@ -455,6 +484,13 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             if app.phase == Phase::Running {
                 return server.respond(key, json(409, "Conflict", err("already running")));
             }
+            let missing = app.cfg.missing();
+            if !missing.is_empty() {
+                return server.respond(key, json(400, "Bad Request", err(&format!(
+                    "configuration incomplete: {} not set — set the deployment's config/secrets and restart",
+                    missing.join(", ")
+                ))));
+            }
             let v: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             let creds = creds_from(&v);
@@ -566,21 +602,33 @@ fn clone_creds(c: &Creds) -> Creds {
 }
 
 fn main() {
-    let cfg = match load_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[risc-box] config error: {e}");
-            eprintln!("[risc-box] set ENCLAVE_CONFIG (or RISCBOX_CONFIG) to a JSON object with at least endpoint/bucket/kernel/fs");
-            std::process::exit(1);
-        }
-    };
-    let autostart = cfg.autostart;
+    // Never exit on config problems: a fresh deployment whose $VAR secrets are
+    // not set yet must still come up so the operator can set them (and restart)
+    // rather than the whole deployment landing in "failed".
+    let cfg = load_config();
+    let missing = cfg.missing();
+    let unconfigured = !missing.is_empty();
+    if unconfigured {
+        eprintln!(
+            "[risc-box] starting UNCONFIGURED: {} not set — serving the UI; set the deployment's config/secrets and restart to boot",
+            missing.join(", ")
+        );
+    }
+    // Only autostart a fully-configured machine.
+    let autostart = cfg.autostart && !unconfigured;
     let mut server = Server::bind("risc-box", DEFAULT_PORT);
     let mut app = App {
         cfg,
         emu: None,
         phase: Phase::Idle,
-        error: None,
+        error: if unconfigured {
+            Some(format!(
+                "configuration incomplete: {} not set — set the deployment's config/secrets and restart",
+                missing.join(", ")
+            ))
+        } else {
+            None
+        },
         pending: if autostart { Some(Start { creds: None, reset: false }) } else { None },
         cache: None,
         live_creds: None,

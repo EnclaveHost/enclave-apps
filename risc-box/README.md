@@ -118,6 +118,12 @@ JSON object:
   reference logs a warning and reads as absent (so unresolved credentials
   fall back to the browser prompt). The config itself is read once, at
   process start: config or secret changes need a restart to take effect.
+- The app **always starts**, even unconfigured. If a required field
+  (`endpoint`/`bucket`/`kernel`/`fs`) is still empty — typically a `$VAR`
+  secret you haven't set yet — it serves the UI and reports the gap in
+  `/status` instead of exiting; it just refuses to boot a machine (a clear
+  400 from `/start`) until the values are set and the process restarted. So a
+  freshly deployed instance comes up ready to configure, not `failed`.
 - `net` is optional: absent or `true` enables the guest NIC with the default
   forward (deployment port `tcp:2222` → guest `22`, made for sshd); `false`
   removes the network backend entirely; an object with `forwards` customizes
