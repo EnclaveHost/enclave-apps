@@ -289,6 +289,9 @@
     <span class="ctl"><span>size</span>
       <select id="size"></select>
     </span>
+    <span class="ctl"><span>aspect</span>
+      <select id="aspect"></select>
+    </span>
     <span class="ctl"><span>seed</span>
       <input type="text" id="seed" placeholder="random">
       <button class="icon-btn" id="dice" title="New random seed" aria-label="New random seed">
@@ -412,11 +415,11 @@ function copyText(text, btn) {
 function openApi() {
   const base = new URL(".", location.href).href.replace(/\/$/, "");
   const model = cur ? cur.name : "";
-  const size = +$("size").value || 1024;
+  const d = dims(); // reflect the picker's size + aspect in the examples
   $("apiBase").textContent = base;
   $("apiGet").textContent =
     'curl "' + base + "/image?prompt=a+red+fox+in+snow&steps=" + steps +
-    "&w=" + size + "&h=" + size + (model ? "&model=" + encodeURIComponent(model) : "") +
+    "&w=" + d.w + "&h=" + d.h + (model ? "&model=" + encodeURIComponent(model) : "") +
     '" -o out.png';
   $("apiPost").textContent =
     "curl " + base + "/v1/images/generations \\\n" +
@@ -424,7 +427,7 @@ function openApi() {
     "  -d '" + JSON.stringify({
       model: model || "default",
       prompt: "a red fox in snow",
-      size: size + "x" + size,
+      size: d.w + "x" + d.h,
     }, null, 0).replace(/,"/g, ', "') + "'";
   $("apiOverlay").classList.add("open");
   $("apiClose").focus();
@@ -478,6 +481,56 @@ $("steps").addEventListener("click", e => {
 });
 $("dice").onclick = () => { $("seed").value = String(Math.floor(Math.random() * 2 ** 32)); };
 
+// The size select picks the LONG edge; the aspect picker shapes the short
+// edge, snapped to sd.cpp's /64 grid. Each option shows the exact WxH it
+// produces, and ratios whose short edge would land below the model's
+// min_size are disabled rather than silently squared off by the server's
+// clamp - at 512 on a min-512 model, only 1:1 is honest.
+const ASPECTS = [
+  { id: "1:1", x: 1, y: 1 }, { id: "4:3", x: 4, y: 3 }, { id: "3:4", x: 3, y: 4 },
+  { id: "3:2", x: 3, y: 2 }, { id: "2:3", x: 2, y: 3 },
+  { id: "16:9", x: 16, y: 9 }, { id: "9:16", x: 9, y: 16 },
+];
+let aspect = "1:1";
+
+function aspectDims(a, size) {
+  const step = (cur && cur.size_step) || 64;
+  const short_ = Math.round(size * Math.min(a.x, a.y) / Math.max(a.x, a.y) / step) * step;
+  const d = a.x >= a.y
+    ? { w: size, h: Math.max(short_, step) }
+    : { w: Math.max(short_, step), h: size };
+  d.ok = short_ >= ((cur && cur.min_size) || step);
+  return d;
+}
+
+function dims() {
+  const size = +$("size").value || (cur ? cur.default_size : 1024);
+  const a = ASPECTS.find(v => v.id === aspect) || ASPECTS[0];
+  const d = aspectDims(a, size);
+  return d.ok ? d : { w: size, h: size };
+}
+
+function renderAspects() {
+  const size = +$("size").value || (cur ? cur.default_size : 1024);
+  $("aspect").innerHTML = "";
+  for (const a of ASPECTS) {
+    const d = aspectDims(a, size);
+    const o = document.createElement("option");
+    o.value = a.id;
+    o.textContent = a.id + " · " + d.w + "×" + d.h;
+    o.disabled = !d.ok;
+    if (!d.ok) o.title = "short edge would fall below this model's " +
+      ((cur && cur.min_size) || 0) + "px minimum - pick a larger size";
+    $("aspect").appendChild(o);
+  }
+  const chosen = ASPECTS.find(a => a.id === aspect);
+  if (!chosen || !aspectDims(chosen, size).ok) aspect = "1:1";
+  $("aspect").value = aspect;
+}
+$("size").onchange = renderAspects;
+$("aspect").onchange = () => { aspect = $("aspect").value; };
+renderAspects(); // don't sit empty before /info answers
+
 function setStatus(msg, cls) {
   $("status").className = "status" + (cls ? " " + cls : "");
   $("status").innerHTML = msg ? (cls === "err" ? "" : '<span class="spin"></span>') + "<span>" + msg + "</span>" : "";
@@ -519,6 +572,7 @@ function pick(name) {
     o.selected = v === (opts.includes(prev) ? prev : cur.default_size);
     $("size").appendChild(o);
   }
+  renderAspects(); // the new model's min_size decides which ratios survive
   if (!cur.attached) {
     setStatus(`model volume '${cur.volume}' is not attached - deploy with it ticked in the volume picker`, "err");
   } else if (unfit[cur.name]) {
@@ -707,8 +761,8 @@ async function go() {
     if (performance.now() - lastActivity > (streaming ? 300000 : 60000)) ctrl.abort();
   }, 1000);
   try {
-    const body = { prompt, steps, target,
-      width: +$("size").value, height: +$("size").value };
+    const d = dims();
+    const body = { prompt, steps, target, width: d.w, height: d.h };
     if (cur && models.length > 1) body.model = cur.name;
     if ($("seed").value.trim()) body.seed = +$("seed").value.trim();
     const r = await fetch("generate", {

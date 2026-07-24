@@ -41,8 +41,11 @@ display `name` **or** volume name); absent/empty means the deployment's
 default: the **largest attached model** (by `max_size`, later catalog
 entries win ties — so the flagship when both are attached). Sizes snap to
 sd.cpp's multiple of 64 inside each model's min/max; the playground offers
-512 / 1024 / 2048. Same seed + params → same image (per sd.cpp build; seeds
-are not torch-compatible).
+512 / 1024 / 2048 as the long edge plus an aspect picker (1:1, 4:3, 3:4,
+3:2, 2:3, 16:9, 9:16; each option shows the exact WxH it produces, and
+ratios whose short edge would fall below the model's min are disabled).
+Same seed + params → same image (per sd.cpp build; seeds are not
+torch-compatible).
 
 Both stock models are step-distilled: `cfg` defaults to 1.0 and the
 useful step counts are 4–8. `negative_prompt` needs `cfg > 1` to have any
