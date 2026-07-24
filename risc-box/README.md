@@ -28,11 +28,15 @@ block) that boots real Linux. It compiles to the same target as the rest of
 the fleet and steps instruction-by-instruction in the TEE. The source lives
 in [`emu/`](emu/); every divergence from upstream is tagged `risc-box patch`
 in-line. Beyond the original two (`dump_contents()` / `get_disk()`, which read
-the guest-modified disk back out for saving) there is one functional addition
-(a legacy virtio-net MMIO device at `0x10002000`, IRQ 2, with a pluggable
-`NetBackend` mirroring the UART's `Terminal`; see Networking below) and six
-performance patches, measured end-to-end at 2.8× throughput and 2.5× faster
-boot:
+the guest-modified disk back out for saving) there are three functional
+additions — a legacy virtio-net MMIO device at `0x10002000`, IRQ 2, with a
+pluggable `NetBackend` mirroring the UART's `Terminal` (see Networking below);
+ten missing RV64D float instructions (the FCVT int↔double family, FSGNJN.D,
+FMIN/FMAX.D, FMSUB/FNMADD.D, FSQRT.D — busybox `ping` hits `FCVT.D.LU` on its
+first timestamp); and unknown instructions now raise a proper
+illegal-instruction trap (guest process gets SIGILL) instead of panicking the
+whole host app — and six performance patches, measured end-to-end at 2.8×
+throughput and 2.5× faster boot:
 
 - a direct-mapped **software TLB** in front of the Sv32/Sv39 page walk,
   tagged with a generation counter plus the translation-relevant CPU state;
@@ -81,6 +85,7 @@ signing (GET to fetch, PUT to save) hand-rolled from `sha2`/`hmac` — no
        └──PUT(SigV4)── save disk ──────┤         │
                                        │   your browser (xterm.js console)
               ssh/tcp ──tcp:2222──► smoltcp ⇄ virtio-net ⇄ guest eth0 :22
+   guest curl/ping ──► smoltcp/NAT ──► real sockets ──► the internet
 ```
 
 ## Configuration
@@ -125,9 +130,11 @@ JSON object:
   400 from `/start`) until the values are set and the process restarted. So a
   freshly deployed instance comes up ready to configure, not `failed`.
 - `net` is optional: absent or `true` enables the guest NIC with the default
-  forward (deployment port `tcp:2222` → guest `22`, made for sshd); `false`
-  removes the network backend entirely; an object with `forwards` customizes
-  the port list. See Networking below.
+  forward (deployment port `tcp:2222` → guest `22`, made for sshd) and
+  outbound NAT; `false` removes the network backend entirely; an object
+  customizes both: `forwards` sets the port list, `"outbound": false` seals
+  the machine to inbound-only (it can then exfiltrate nothing by itself). See
+  Networking below.
 - `api_key` is optional but **required for safety on a public deployment**:
   when set (use a `$VAR` secret, not a literal), every endpoint that drives or
   observes the machine — `/start`, `/stop`, `/save`, `/input`, `/console`,
@@ -201,11 +208,61 @@ The deployment must declare the forward ports alongside http:
 `ports="http:8000,tcp:2222"` at publish time; the app resolves the actual
 bind via `ENCLAVE_PORTS` exactly like the http port.
 
-**No outbound NAT (yet).** The guest can be reached through forwards and can
-talk to 10.0.2.2, but cannot open connections out to the internet; the
-machine cannot exfiltrate anything by itself, which keeps the trust story
-simple. `/status` reports the network state under `net`
-(guest IP, forwards, frame counters, active connections).
+### Outbound: user-mode NAT, slirp-style
+
+The gateway also NATs the guest **outbound**, the way QEMU's user networking
+(slirp) does. wasip2 has no raw sockets, so nothing is bridged — every guest
+flow is re-terminated on a real socket that rides the platform's transparent
+egress:
+
+- **TCP** — a guest SYN to an external `ip:port` opens a real connection and
+  splices it onto the guest's (same machinery as the inbound forwards). A
+  refused or unreachable target answers the guest with an RST instead of a
+  silent hang.
+- **UDP** — one real socket per guest flow (capped at 64, idle-expired after
+  60 s); replies are re-framed to the guest from the external source.
+- **DNS** — the DHCP lease advertises `10.0.2.2` as resolver, and a proxy at
+  `10.0.2.2:53` answers A queries with the platform's own name lookup (so
+  resolution happens where the platform's egress policy lives; it works even
+  where raw UDP egress does not). AAAA gets an empty NOERROR — the guest wire
+  is IPv4-only, so dual-stack guests fall back cleanly.
+- **ICMP echo** — `ping 8.8.8.8` works: the gateway answers echo requests
+  itself, exactly like slirp. A reply confirms the NAT path is up, not that
+  the target really answered an ICMP packet (none can leave the enclave).
+
+In the guest, bring eth0 up (DHCP, or the static config above) and add the
+gateway; then everything just dials out:
+
+```sh
+ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+route add default gw 10.0.2.2
+mkdir -p /etc && echo 'nameserver 10.0.2.2' > /etc/resolv.conf
+
+ping -c 3 8.8.8.8         # answered by the gateway
+nslookup example.com      # resolved via the 10.0.2.2 proxy
+wget http://example.com/  # TCP NAT (needs a working libc resolver, see below)
+```
+
+**Sample-image caveat:** the demo Buildroot images ship a *statically linked
+glibc* busybox, whose `getaddrinfo` cannot resolve names on **any** network
+(it needs NSS shared libraries that aren't in the image) — `wget` by hostname
+says `bad address` without sending a single packet, under QEMU too. busybox
+`nslookup` (its own resolver) works fine, as does any traffic by IP literal.
+Real images with a dynamic libc (musl or full glibc) resolve normally.
+
+`"outbound": false` in the `net` config removes all of this — the sealed,
+inbound-only posture where the machine cannot exfiltrate anything by itself.
+`/status` reports the network state under `net` (guest IP, forwards, frame
+counters, active connections, `outbound`, and live `natTcp`/`natUdp` flow
+counts).
+
+Two honest notes on the TCP path: the one blocking step is the real
+`connect()` (wasip2 has no async connect), bounded at 2.5 s — a guest dialing
+a dead IP stalls the machine that long, once per attempt (up to 32 concurrent
+outbound connections). And after any network activity the emulator runs
+~100 M instructions at full speed before re-entering the idle throttle, so
+interactive flows (ping's 1 s cadence, TCP handshakes) stay at wall-clock
+pace instead of stretching with the idle clock.
 
 ## Try it locally
 
@@ -225,10 +282,13 @@ CFG='{"title":"demo","endpoint":"http://127.0.0.1:9100","region":"us-east-1",
       "bucket":"machines","kernel":"images/fw_payload.elf","fs":"images/rootfs.img",
       "saveKey":"images/rootfs.saved.img",
       "credentials":{"accessKeyId":"…","secretAccessKey":"…"}}'
-wasmtime run -Stcp -Sinherit-network -Sallow-ip-name-lookup \
+wasmtime run -Stcp -Sudp -Sinherit-network -Sallow-ip-name-lookup \
   --env ENCLAVE_PORTS=http:8000=8000,tcp:2222=2222 --env RISCBOX_CONFIG="$CFG" \
   target/wasm32-wasip2/release/risc-box.wasm
 ```
+
+(`-Sudp` is what lets the outbound UDP NAT open real sockets locally;
+`-Sallow-ip-name-lookup` backs the DNS proxy.)
 
 Open `http://127.0.0.1:8000/`, press **Boot machine**, and a RISC-V Linux
 boots to a shell in about four seconds. The verification driven over this rig
@@ -239,12 +299,18 @@ guest and echoing back over SSE, a file written inside the guest and — after
 the bucket, a script written and then executed inside the guest (the
 self-modifying-code path), and a wake-up round-trip after a long idle
 (throttled) stretch. [`scripts/bench.py`](scripts/bench.py) replays all of
-it.
+it. The outbound NAT was verified on the same rig from inside the guest
+shell: `ping -c 3 8.8.8.8` (3/3 replies in 0.7 s wall), `nslookup` through
+the `10.0.2.2` proxy and directly against `8.8.8.8` (UDP NAT), an HTTP body
+fetched from the real internet over the TCP splice, and a dial to a closed
+port answered with a fast RST.
 
 ## Caveats, honestly
 
-- **Inbound network only.** The guest NIC reaches the in-app user-mode
-  network: DHCP, the forwards, nothing outbound. One guest IP (10.0.2.15).
+- **User-mode network, one guest IP (10.0.2.15).** Outbound is NAT at the
+  gateway, not a bridge: TCP and UDP flows work, `ping` is answered by the
+  gateway itself, and exotic protocols (GRE, SCTP, traceroute's ICMP
+  errors...) don't exist. Set `net.outbound: false` for a sealed machine.
 - **RISC-V RV64 only, one hart.** RISC Box runs what the vendored emulator runs:
   a single-core RISC-V `virt`-style machine. Not x86, not multi-core.
 - **Emulated speed.** The interpreter turns ~29 MIPS under wasmtime (software

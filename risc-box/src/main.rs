@@ -21,7 +21,10 @@
 //! The guest also gets a virtio-net NIC terminated in user space by src/net.rs
 //! (smoltcp): a DHCP server leases 10.0.2.15, and raw `tcp:` deployment ports
 //! are spliced onto guest TCP connections (default tcp:2222 -> guest 22, so
-//! `ssh -p 2222` reaches an sshd inside the machine). Inbound only; no NAT.
+//! `ssh -p 2222` reaches an sshd inside the machine). Outbound, the gateway
+//! NATs guest flows onto real sockets slirp-style (TCP splices, per-flow UDP,
+//! a DNS proxy at 10.0.2.2, gateway-answered ICMP echo), so `ping 8.8.8.8`
+//! and `curl` work from the guest shell; `net.outbound: false` seals it.
 //!
 //! Routes:
 //!   GET  /            console UI (self-contained HTML + embedded xterm)
@@ -34,8 +37,12 @@
 //!   GET  /console     Server-Sent Events: base64 console output, scrollback first
 //!   POST /save        dump the (guest-modified) disk and PUT it to saveKey
 //!   POST /stop        halt the machine and drop it from RAM
+//!   GET  /display     Server-Sent Events: the machine's screen as deflated
+//!                     dirty bands (see display.rs) — the browser's monitor
+//!   GET  /fb.png      the current frame as one PNG snapshot
 //!   GET  /ping        liveness
 
+mod display;
 mod httpd;
 mod net;
 mod s3;
@@ -43,6 +50,7 @@ mod s3;
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use display::Display;
 use httpd::{form_get, json, Request, Response, Server};
 use net::{ForwardCfg, HostNet, NetStack};
 use riscv_emu_rust::terminal::Terminal;
@@ -60,6 +68,10 @@ const IDLE_BATCH: u64 = 4_000; // batch while the guest is parked in WFI: keeps
                                // timers/devices ticking at ~1% of the busy rate
                                // so an idle machine stops burning the host CPU
 const SCROLLBACK: usize = 256 * 1024; // console bytes retained for late joiners
+// Full-speed turns after network activity: ~100M instructions ≈ 1.25 guest
+// seconds, enough to span a whole ping/keepalive cadence so an interactive
+// network session never drops into the ~20x-slow idle clock mid-conversation.
+const NET_BOOST_TURNS: u64 = 250;
 
 // ---- config ---------------------------------------------------------------
 
@@ -76,6 +88,7 @@ struct Config {
     autostart: bool,
     read_only: bool,
     net_enabled: bool,
+    net_outbound: bool,
     forwards: Vec<ForwardCfg>,
     api_key: Option<String>,
 }
@@ -166,6 +179,11 @@ fn load_config() -> Config {
         autostart: v.get("autostart").and_then(|x| x.as_bool()).unwrap_or(false),
         read_only: v.get("readOnly").and_then(|x| x.as_bool()).unwrap_or(false),
         net_enabled: v.get("net").and_then(|x| x.as_bool()).unwrap_or(true),
+        net_outbound: v
+            .get("net")
+            .and_then(|n| n.get("outbound"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
         forwards: forwards_from(v.get("net")),
         // Optional shared secret. When set (directly or via a $VAR secret), the
         // control + observation endpoints require it; see `authorized`. Unset
@@ -219,8 +237,9 @@ fn authorized(req: &Request, cfg: &Config) -> bool {
 }
 
 /// `net` config: absent or `true` → networking with the default ssh forward
-/// (deployment tcp:2222 → guest 22); `false` → no NIC backend; an object
-/// `{"forwards": [{"listen": 2222, "to": 22}, …]}` → custom forwards.
+/// (deployment tcp:2222 → guest 22) and outbound NAT; `false` → no NIC
+/// backend; an object `{"forwards": [{"listen": 2222, "to": 22}, …],
+/// "outbound": false}` → custom forwards and/or a sealed (inbound-only) net.
 fn forwards_from(net: Option<&serde_json::Value>) -> Vec<ForwardCfg> {
     let default = vec![ForwardCfg { listen: 2222, to: 22 }];
     let Some(list) = net.and_then(|n| n.get("forwards")).and_then(|f| f.as_array()) else {
@@ -298,6 +317,8 @@ struct App {
     console_total: u64,
     last_save: Option<String>,
     net: Option<NetStack>, // listeners live for the whole process
+    display: Display,      // scanout state (see display.rs)
+    fb_scanned: Option<Instant>, // last display scan (paced by FB_SCAN_MS)
 }
 
 fn b64(data: &[u8]) -> String {
@@ -379,10 +400,12 @@ impl App {
                         .collect();
                     format!(
                         "{{\"guestIp\":\"{}.{}.{}.{}\",\"forwards\":[{}],\
-                         \"rxFrames\":{},\"txFrames\":{},\"activeConns\":{}}}",
+                         \"rxFrames\":{},\"txFrames\":{},\"activeConns\":{},\
+                         \"outbound\":{},\"natTcp\":{},\"natUdp\":{}}}",
                         net::GUEST_IP[0], net::GUEST_IP[1], net::GUEST_IP[2], net::GUEST_IP[3],
                         fw.join(","),
-                        n.rx_frames, n.tx_frames, n.active_splices()
+                        n.rx_frames, n.tx_frames, n.active_splices(),
+                        n.outbound_enabled(), n.nat_tcp_flows(), n.nat_udp_flows()
                     )
                 })
                 .unwrap_or_else(|| "null".into()),
@@ -518,8 +541,33 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             app.emu = None;
             app.phase = Phase::Halted;
             app.boot_at = None;
+            app.display.reset();
             server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
         }
+        ("GET", "/display") => {
+            // the machine's screen: metadata first, then bands (display.rs).
+            // The joiner needs the WHOLE frame once — force it on the next
+            // scan (a broadcast reaches existing watchers too; a duplicate
+            // full band is idempotent on a canvas).
+            app.display.want_full();
+            let initial = format!(
+                "event: mode\ndata: {{\"w\":{},\"h\":{}}}\n\n",
+                display::FB_W, display::FB_H
+            );
+            server.upgrade_sse(key, "display", &initial);
+        }
+        ("GET", "/fb.png") => match (app.phase, app.emu.as_ref()) {
+            (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
+                let png = app.display.png(emu);
+                server.respond(
+                    key,
+                    Response::new(200, "OK")
+                        .with("cache-control", "no-store")
+                        .body("image/png", png),
+                );
+            }
+            _ => server.respond(key, json(409, "Conflict", err("machine is not running"))),
+        },
         _ => server.respond(key, json(404, "Not Found", err("no such route"))),
     }
 }
@@ -589,6 +637,7 @@ fn do_start(app: &mut App, start: Start) {
     app.scrollback.clear();
     app.console_total = 0;
     app.error = None;
+    app.display.reset(); // fresh machine, fresh screen: next watched scan ships a full frame
     app.phase = Phase::Running;
     eprintln!("[risc-box] machine running: {}", app.cfg.title);
 }
@@ -639,9 +688,15 @@ fn main() {
         console_total: 0,
         last_save: None,
         net: None,
+        display: Display::new(),
+        fb_scanned: None,
     };
     if app.cfg.net_enabled {
-        app.net = Some(NetStack::new(&app.cfg.forwards));
+        app.net = Some(NetStack::new(&app.cfg.forwards, app.cfg.net_outbound));
+        match app.cfg.net_outbound {
+            true => eprintln!("[risc-box] net: outbound NAT enabled (tcp/udp/dns/icmp-echo); disable with net.outbound=false"),
+            false => eprintln!("[risc-box] net: outbound disabled — inbound forwards only"),
+        }
     }
 
     loop {
@@ -697,11 +752,36 @@ fn main() {
                 }
                 // exchange ethernet frames between the guest NIC and the
                 // user-mode network; traffic in flight lifts the WFI throttle
-                // so forwarded connections stay snappy
+                // so forwarded connections stay snappy. The boost outlives the
+                // frames by ~0.5s of guest CPU: interactive protocols (ping's
+                // 1s cadence, TCP handshakes) sleep between packets, and
+                // dropping straight back to the idle batch would stretch
+                // guest time ~7x mid-conversation.
                 if let Some(stack) = app.net.as_mut() {
                     let backend = emu.get_mut_cpu().get_mut_mmu().get_mut_net().get_mut_backend();
                     if stack.pump(backend.as_mut()) {
-                        app.input_boost = app.input_boost.max(3);
+                        app.input_boost = app.input_boost.max(NET_BOOST_TURNS);
+                        busy = true;
+                    }
+                }
+                // display scanout: only while someone is actually watching
+                // (an unwatched machine costs zero scan work), paced at
+                // FB_SCAN_MS. Dirty bands go out as deflated SSE events; the
+                // browser blits them onto its canvas (see display.rs).
+                if server.sse_count("display") > 0
+                    && app.fb_scanned.map_or(true, |t| {
+                        t.elapsed() >= std::time::Duration::from_millis(display::FB_SCAN_MS)
+                    })
+                {
+                    app.fb_scanned = Some(Instant::now());
+                    for band in app.display.scan(emu) {
+                        server.broadcast(
+                            "display",
+                            &format!(
+                                "data: {{\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                                band.y, band.h, b64(&band.z)
+                            ),
+                        );
                         busy = true;
                     }
                 }

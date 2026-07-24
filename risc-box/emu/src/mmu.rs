@@ -160,6 +160,13 @@ impl Mmu {
 	pub fn init_memory(&mut self, capacity: u64) {
 		self.memory.init(capacity);
 	}
+
+	// risc-box patch: bulk read of PHYSICAL DRAM (no translation, no device
+	// dispatch, no side effects) — the host's framebuffer scanout. The caller
+	// owns the address contract: the range must sit inside main memory.
+	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
+		self.memory.read_range(p_address, out);
+	}
 	
 	/// Initializes Virtio block disk. This method is expected to be called only once.
 	///
@@ -1069,6 +1076,13 @@ impl MemoryWrapper {
 		for m in self.exec_page_marks.iter_mut() {
 			*m = 0;
 		}
+	}
+
+	// risc-box patch: framebuffer scanout — bulk read of guest DRAM, no side
+	// effects (no exec-page snoop: reads never invalidate the decode cache).
+	pub fn read_range(&self, p_address: u64, out: &mut [u8]) {
+		debug_assert!(p_address >= DRAM_BASE, "Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
+		self.memory.read_range(p_address - DRAM_BASE, out)
 	}
 
 	pub fn read_byte(&mut self, p_address: u64) -> u8 {

@@ -93,6 +93,24 @@ impl Memory {
 		data
 	}
 
+	/// risc-box patch: bulk-copies `out.len()` bytes starting at `address`
+	/// into `out` — the framebuffer scanout path. Byte order matches
+	/// read_byte (little-endian u64 cells), so this IS the guest's byte
+	/// view; walking whole cells keeps it ~8x cheaper than per-byte reads
+	/// (the scanout copies ~2MB per frame).
+	pub fn read_range(&self, address: u64, out: &mut [u8]) {
+		let mut i = 0usize;
+		while i < out.len() {
+			let a = address.wrapping_add(i as u64);
+			let index = (a >> 3) as usize;
+			let off = (a % 8) as usize;
+			let take = core::cmp::min(8 - off, out.len() - i);
+			let bytes = self.data[index].to_le_bytes();
+			out[i..i + take].copy_from_slice(&bytes[off..off + take]);
+			i += take;
+		}
+	}
+
 	/// Writes a byte to memory.
 	///
 	/// # Arguments

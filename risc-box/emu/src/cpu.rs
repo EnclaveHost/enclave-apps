@@ -372,7 +372,15 @@ impl Cpu {
 					index
 				},
 				Err(()) => {
-					panic!("Unknown instruction PC:{:x} WORD:{:x}", instruction_address, original_word);
+					// risc-box patch: an undecodable word must not abort the
+					// embedding host app. Raise illegal-instruction like real
+					// silicon: the guest kernel SIGILLs the process (or
+					// emulates) and the machine lives on. tval carries the
+					// faulting word, epc the address (set by the caller).
+					return Err(Trap {
+						trap_type: TrapType::IllegalInstruction,
+						value: original_word as u64
+					});
 				}
 			}
 		};
@@ -1413,6 +1421,12 @@ impl Cpu {
 		&mut self.mmu
 	}
 
+	/// Returns `Mmu` (risc-box patch: the immutable side of the pair — the
+	/// host's framebuffer scanout reads DRAM without touching CPU state)
+	pub fn get_mmu(&self) -> &Mmu {
+		&self.mmu
+	}
+
 	/// Returns mutable `Terminal`
 	pub fn get_mut_terminal(&mut self) -> &mut Box<dyn Terminal> {
 		self.mmu.get_mut_uart().get_mut_terminal()
@@ -1756,7 +1770,7 @@ fn get_register_name(num: usize) -> &'static str {
 	}
 }
 
-const INSTRUCTION_NUM: usize = 116;
+const INSTRUCTION_NUM: usize = 126;
 
 // @TODO: Reorder in often used order as 
 const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
@@ -2352,6 +2366,19 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		},
 		disassemble: dump_format_r
 	},
+	// risc-box patch: the int↔double conversions upstream left out. Hit in
+	// practice by busybox (e.g. ping converting monotonic nanoseconds).
+	Instruction {
+		mask: 0xfff0007f,
+		data: 0xd2300053,
+		name: "FCVT.D.LU",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.f[f.rd] = cpu.x[f.rs1] as u64 as f64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
 	Instruction {
 		mask: 0xfff0007f,
 		data: 0x42000053,
@@ -2406,6 +2433,42 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			let f = parse_format_r(word);
 			// Is this implementation correct?
 			cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	// risc-box patch: double→int conversions upstream left out (Rust `as`
+	// saturates, matching RISC-V conversion semantics except NaN, which the
+	// existing conversions above don't honor either).
+	Instruction {
+		mask: 0xfff0007f,
+		data: 0xc2100053,
+		name: "FCVT.WU.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xfff0007f,
+		data: 0xc2200053,
+		name: "FCVT.L.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.x[f.rd] = cpu.f[f.rs1] as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xfff0007f,
+		data: 0xc2300053,
+		name: "FCVT.LU.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.x[f.rd] = cpu.f[f.rs1] as u64 as i64;
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2534,6 +2597,63 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		},
 		disassemble: dump_format_r2
 	},
+	// risc-box patch: the rest of the common RV64D set upstream left out
+	// (FMSUB/FNMADD complete the fused quartet; FMIN/FMAX; FSQRT).
+	Instruction {
+		mask: 0x0600007f,
+		data: 0x02000047,
+		name: "FMSUB.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r2(word);
+			cpu.f[f.rd] = cpu.f[f.rs1] * cpu.f[f.rs2] - cpu.f[f.rs3];
+			Ok(())
+		},
+		disassemble: dump_format_r2
+	},
+	Instruction {
+		mask: 0x0600007f,
+		data: 0x0200004f,
+		name: "FNMADD.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r2(word);
+			cpu.f[f.rd] = -(cpu.f[f.rs1] * cpu.f[f.rs2]) - cpu.f[f.rs3];
+			Ok(())
+		},
+		disassemble: dump_format_r2
+	},
+	Instruction {
+		mask: 0xfe00707f,
+		data: 0x2a000053,
+		name: "FMIN.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.f[f.rd] = cpu.f[f.rs1].min(cpu.f[f.rs2]);
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xfe00707f,
+		data: 0x2a001053,
+		name: "FMAX.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.f[f.rd] = cpu.f[f.rs1].max(cpu.f[f.rs2]);
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xfff0007f,
+		data: 0x5a000053,
+		name: "FSQRT.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			cpu.f[f.rd] = cpu.f[f.rs1].sqrt();
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
 	Instruction {
 		mask: 0xfe00007f,
 		data: 0x12000053,
@@ -2620,6 +2740,22 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			let rs1_bits = cpu.f[f.rs1].to_bits();
 			let rs2_bits = cpu.f[f.rs2].to_bits();
 			let sign_bit = rs2_bits & 0x8000000000000000;
+			cpu.f[f.rd] = f64::from_bits(sign_bit | (rs1_bits & 0x7fffffffffffffff));
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	// risc-box patch: FSGNJN.D (this is fneg.d — compilers emit it for every
+	// double negation) was missing while its siblings above/below exist.
+	Instruction {
+		mask: 0xfe00707f,
+		data: 0x22001053,
+		name: "FSGNJN.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let rs1_bits = cpu.f[f.rs1].to_bits();
+			let rs2_bits = cpu.f[f.rs2].to_bits();
+			let sign_bit = !rs2_bits & 0x8000000000000000;
 			cpu.f[f.rd] = f64::from_bits(sign_bit | (rs1_bits & 0x7fffffffffffffff));
 			Ok(())
 		},

@@ -1,8 +1,13 @@
 /dts-v1/;
 
 // risc-box patch: source for the default device tree (upstream ships only the
-// compiled dtb.dtb). Identical to upstream's tree plus one addition, the
-// virtio-net device at 0x10002000 on PLIC IRQ 2. Rebuild with:
+// compiled dtb.dtb). Identical to upstream's tree plus two additions: the
+// virtio-net device at 0x10002000 on PLIC IRQ 2, and a simple-framebuffer —
+// 800x600 XRGB8888 in the top 2 MiB of DRAM (reserved-memory keeps the
+// kernel's allocator off it; the host scans it out to the browser console).
+// A kernel with CONFIG_FB_SIMPLE + CONFIG_FRAMEBUFFER_CONSOLE sees /dev/fb0;
+// a kernel without them ignores the node — the sample serial image is
+// untouched. Rebuild with:
 //   dtc -I dts -O dtb -o dtb.dtb dtb.dts
 // The compiled blob must stay under DTB_SIZE (0xfe0) in mmu.rs; it is mapped
 // at physical 0x1020 and handed to the kernel via a1.
@@ -14,8 +19,35 @@
 	model = "riscv-virtio,qemu";
 
 	chosen {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
 		bootargs = "root=/dev/vda rw ttyS0";
 		stdout-path = "/uart@10000000";
+
+		// risc-box patch: the guest's display. 800*600*4 = 0x1d4c00 bytes at
+		// the top of the 128 MiB DRAM (0x87e00000..0x88000000 reserved below).
+		framebuffer@87e00000 {
+			compatible = "simple-framebuffer";
+			reg = <0x00 0x87e00000 0x00 0x1d4c00>;
+			width = <0x320>;
+			height = <0x258>;
+			stride = <0xc80>;
+			format = "x8r8g8b8";
+			status = "okay";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		// risc-box patch: keep the allocator off the framebuffer pages
+		framebuffer@87e00000 {
+			reg = <0x00 0x87e00000 0x00 0x200000>;
+			no-map;
+		};
 	};
 
 	uart@10000000 {

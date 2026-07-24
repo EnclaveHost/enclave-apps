@@ -116,6 +116,15 @@
   <div id="term"></div>
 </div>
 
+<div class="card" id="dispcard" style="display:none">
+  <div class="row">
+    <h2>display</h2>
+    <span class="stat">simple-framebuffer 800×600 — lights up when the guest kernel drives /dev/fb0 (fbcon, Xorg)</span>
+  </div>
+  <canvas id="fb" width="800" height="600"
+    style="display:block;width:100%;max-width:800px;margin-top:14px;background:#000;border-radius:8px;image-rendering:pixelated"></canvas>
+</div>
+
 <footer>
   <b>How this works.</b> RISC Box is an Enclave <b>service app</b>: one attested process holds the machine in the
   enclave's memory and serves this console over the deployment's in-enclave-terminated TLS. The machine is a vendored
@@ -166,6 +175,37 @@ function connectConsole() {
   evs.onerror = () => {};
 }
 function dropConsole() { if (evs) { evs.close(); evs = null; } }
+
+// ---- display: the machine's screen, streamed as deflated dirty bands. ------
+// Each SSE event is {y, h, b}: `b` inflates (deflate-raw) to h rows of
+// 800px * 4 bytes in the guest's x8r8g8b8 order (B,G,R,X little-endian);
+// the pixels are reordered to RGBA and blitted at row y. Events apply in
+// arrival order through a promise chain (inflate is async).
+let dvs = null, dispQ = Promise.resolve();
+const fbctx = $("fb").getContext("2d");
+async function inflateRaw(u8) {
+  const ds = new DecompressionStream("deflate-raw");
+  const r = new Response(new Blob([u8]).stream().pipeThrough(ds));
+  return new Uint8Array(await r.arrayBuffer());
+}
+function connectDisplay() {
+  if (dvs) return;
+  dvs = new EventSource("/display" + (apiKey ? "?key=" + encodeURIComponent(apiKey) : ""));
+  dvs.onmessage = (e) => {
+    if (!e.data) return;
+    const m = JSON.parse(e.data);
+    dispQ = dispQ.then(async () => {
+      const bgrx = await inflateRaw(b64dec(m.b));
+      const rgba = new Uint8ClampedArray(bgrx.length);
+      for (let i = 0; i < bgrx.length; i += 4) {
+        rgba[i] = bgrx[i + 2]; rgba[i + 1] = bgrx[i + 1]; rgba[i + 2] = bgrx[i]; rgba[i + 3] = 255;
+      }
+      fbctx.putImageData(new ImageData(rgba, 800, m.h), 0, m.y);
+    }).catch(() => {});
+  };
+  dvs.onerror = () => {};
+}
+function dropDisplay() { if (dvs) { dvs.close(); dvs = null; } }
 
 $("authbtn").onclick = () => {
   setKey($("apikey").value.trim());
@@ -247,11 +287,14 @@ async function refresh() {
   $("stopbtn").style.display = running ? "" : "none";
   $("savebtn").style.display = (running && s.saveKey && !s.readOnly) ? "" : "none";
   $("credsbox").style.display = running ? "none" : "";
+  $("dispcard").style.display = running ? "" : "none";
   if (running) {
     $("stats").innerHTML = `<b>${(s.instret / 1e9).toFixed(2)}B</b> instr · <b>${s.mips.toFixed(1)}</b> MIPS · <b>${fmt(s.consoleBytes)}</b> console`;
     connectConsole();
+    connectDisplay();
   } else {
     $("stats").textContent = "";
+    dropDisplay();
   }
   if (s.error) showErr(s.error); else if (s.phase !== "error") $("err").style.display = "none";
 }
