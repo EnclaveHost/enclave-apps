@@ -41,11 +41,16 @@ pub struct AppConfig {
     /// chat template: "chatml" | "llama3" | "gemma" | "phi3" | "raw"
     pub template: String,
     /// this model reasons in <think> blocks before answering (qwen3.x).
-    /// Marks the model so a request's enable_thinking=false can turn the
-    /// reasoning off: the assistant turn is pre-filled with an empty think
-    /// block (chatml only), the trained no-think form. Off (the default)
-    /// means the switch is ignored - pre-filling think tokens a model never
-    /// trained on degrades it.
+    /// The qwen3.x templates FORCE-OPEN the block: `<think>\n` belongs to
+    /// the prompt's assistant turn and the model only generates the
+    /// reasoning + `</think>` - it never emits the opening tag itself (a
+    /// bare assistant turn is out-of-distribution and collapses to the
+    /// empty no-think pair, skipping reasoning entirely). Thinking on =
+    /// prefill `<think>\n` (chatml only) and re-emit the tag in the output
+    /// so clients see a complete block; a request's enable_thinking=false
+    /// swaps in the trained no-think form, a pre-closed empty block. Off
+    /// (the default) means the switch is ignored - pre-filling think
+    /// tokens a model never trained on degrades it.
     #[serde(default)]
     pub thinking: bool,
     pub system_prompt: String,
@@ -197,13 +202,30 @@ fn merge(mut base: serde_json::Value, over: serde_json::Value) -> serde_json::Va
 pub struct Rendered {
     pub prompt: String,
     pub stop_strings: Vec<String>,
+    /// the assistant turn was force-opened with `<think>\n` - the model will
+    /// not re-emit the tag, so callers prepend it to the visible output
+    pub think_open: bool,
+}
+
+/// How the assistant turn opens for a <think>-trained (qwen3.x) model.
+/// Mirrors the models' own jinja templates: the TEMPLATE, not the model,
+/// writes the think tokens that lead every reply (chatml only).
+#[derive(Clone, Copy, PartialEq)]
+pub enum ThinkTurn {
+    /// not a thinking model: bare assistant turn
+    Plain,
+    /// thinking on: force-open with `<think>\n`; the model generates the
+    /// reasoning and the closing tag, never the opening one
+    Open,
+    /// thinking off: the trained no-think form, an empty pre-closed block
+    Closed,
 }
 
 pub fn render_template(
     template: &str,
     system: &str,
     msgs: &[(String, String)], // (role, content), roles pre-filtered to user/assistant
-    no_think: bool, // pre-fill an empty <think> block (chatml thinking models only)
+    think: ThinkTurn,
 ) -> Result<Rendered, String> {
     let mut p = String::new();
     let stops: Vec<String>;
@@ -214,8 +236,10 @@ pub fn render_template(
                 p.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
             }
             p.push_str("<|im_start|>assistant\n");
-            if no_think {
-                p.push_str("<think>\n\n</think>\n\n");
+            match think {
+                ThinkTurn::Open => p.push_str("<think>\n"),
+                ThinkTurn::Closed => p.push_str("<think>\n\n</think>\n\n"),
+                ThinkTurn::Plain => {}
             }
             stops = vec!["<|im_end|>".into(), "<|im_start|>".into()];
         }
@@ -270,5 +294,7 @@ pub fn render_template(
         }
         other => return Err(format!("unknown template '{other}' (chatml|llama3|gemma|phi3|raw)")),
     }
-    Ok(Rendered { prompt: p, stop_strings: stops })
+    // only chatml renders think turns; elsewhere the flag stays inert
+    let think_open = template == "chatml" && think == ThinkTurn::Open;
+    Ok(Rendered { prompt: p, stop_strings: stops, think_open })
 }
