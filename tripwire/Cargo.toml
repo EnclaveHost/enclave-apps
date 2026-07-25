@@ -1,0 +1,15 @@
+[package]
+name = "tripwire"
+version = "0.1.0"
+edition = "2021"
+description = "Canary tokens with a live alarm board — plant a URL where nothing should ever touch it; the trip log is append-only in attested RAM, so an intruder can't erase the record of their own trip"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

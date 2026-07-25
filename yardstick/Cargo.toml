@@ -1,0 +1,15 @@
+[package]
+name = "yardstick"
+version = "0.1.0"
+edition = "2021"
+description = "Measure a group without anyone showing their number — submissions live only in attested enclave RAM, and only aggregates of at least k numbers ever leave"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

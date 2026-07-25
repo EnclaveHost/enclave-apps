@@ -1,0 +1,95 @@
+xkb: install a precompiled keymap instead of forking xkbcomp
+
+The vendored RISC-V emulator cannot reliably fork xkbcomp out of the
+large Xorg process (the child dies before exec), so keyboard init
+aborts. This is a headless framebuffer X with no real keyboard, so
+copy a prebuilt /usr/share/X11/xkb/precompiled.xkm into place instead.
+
+--- a/xkb/ddxLoad.c
++++ b/xkb/ddxLoad.c
+@@ -160,48 +160,46 @@
+         return NULL;
+     }
+ 
+-#ifndef WIN32
+-    out = Popen(buf, "w");
+-#else
+-    out = fopen(tmpname, "w");
+-#endif
++    /* risc-box patch: the vendored RISC-V emulator cannot reliably fork
++       xkbcomp from the large Xorg process — the forked child dies before it
++       execs, so xkbcomp never runs and keyboard init aborts ("Failed to
++       activate virtual core keyboard"). This is a headless framebuffer X with
++       no real keyboard (input reaches the guest over the console UART, not X),
++       so any valid keymap serves. Install a prebuilt one instead of running
++       xkbcomp. The keymap-writing callback is intentionally skipped. */
++    {
++        char outpath[PATH_MAX];
++        FILE *src, *dst;
++        int okcopy = 0;
+ 
+-    if (out != NULL) {
+-        /* Now write to xkbcomp */
+-        (*callback)(out, userdata);
+-
+-#ifndef WIN32
+-        if (Pclose(out) == 0)
+-#else
+-        if (fclose(out) == 0 && System(buf) >= 0)
+-#endif
+-        {
+-            if (xkbDebugFlags)
+-                DebugF("[xkb] xkb executes: %s\n", buf);
+-            free(buf);
+-#ifdef WIN32
+-            unlink(tmpname);
+-#endif
+-            return xnfstrdup(keymap);
+-        }
+-        else {
+-            LogMessage(X_ERROR, "Error compiling keymap (%s) executing '%s'\n",
+-                       keymap, buf);
++        (void) callback;
++        (void) userdata;
++        snprintf(outpath, sizeof(outpath), "%s%s.xkm", xkm_output_dir, keymap);
++        src = fopen("/usr/share/X11/xkb/precompiled.xkm", "rb");
++        dst = fopen(outpath, "wb");
++        if (src != NULL && dst != NULL) {
++            char cbuf[8192];
++            size_t n;
++            okcopy = 1;
++            while ((n = fread(cbuf, 1, sizeof(cbuf), src)) > 0) {
++                if (fwrite(cbuf, 1, n, dst) != n) {
++                    okcopy = 0;
++                    break;
++                }
++            }
+         }
+-#ifdef WIN32
+-        /* remove the temporary file */
+-        unlink(tmpname);
+-#endif
+-    }
+-    else {
+-#ifndef WIN32
+-        LogMessage(X_ERROR, "XKB: Could not invoke xkbcomp\n");
+-#else
+-        LogMessage(X_ERROR, "Could not open file %s\n", tmpname);
+-#endif
++        if (src != NULL)
++            fclose(src);
++        if (dst != NULL)
++            fclose(dst);
++        free(buf);
++        if (okcopy)
++            return xnfstrdup(keymap);
++        LogMessage(X_ERROR,
++                   "XKB: risc-box: could not install prebuilt keymap %s\n",
++                   outpath);
++        return NULL;
+     }
+-    free(buf);
+-    return NULL;
+ }
+ 
+ typedef struct {

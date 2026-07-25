@@ -1,0 +1,15 @@
+[package]
+name = "dead-drop"
+version = "0.1.0"
+edition = "2021"
+description = "Burn-after-reading secret sharing — browser-side AES-GCM, key in the URL fragment, ciphertext counted and erased inside an attested enclave"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

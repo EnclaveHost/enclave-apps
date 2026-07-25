@@ -1,0 +1,9 @@
+#!/bin/sh
+# Launch the Xorg desktop iff this kernel drives the simple-framebuffer.
+case "$1" in
+	start)
+		[ -e /dev/fb0 ] || exit 0
+		/usr/bin/xdesktop.sh > /var/log/xdesktop.log 2>&1 &
+		;;
+	stop) killall spincube twm X 2>/dev/null ;;
+esac

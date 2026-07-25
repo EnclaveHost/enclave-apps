@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <!-- LLM Chat: robot wordmark banner; the model lives in the enclave. -->
+  <defs>
+    <radialGradient id="glow" cx="18%" cy="0%" r="90%">
+      <stop offset="0%" stop-color="#4f8ede" stop-opacity=".10"/>
+      <stop offset="60%" stop-color="#4f8ede" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="400" fill="#0b0d12"/>
+  <rect width="1600" height="400" fill="url(#glow)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#252b38" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#4f8ede">[ LLM <tspan fill="#9cc3f7">Chat</tspan> ]</text>
+  <text x="90" y="205" font-size="26" fill="#868ea0">prompts and replies processed only inside the enclave;</text>
+  <text x="90" y="240" font-size="26" fill="#868ea0">history lives in your browser, the server stores nothing</text>
+  <text x="90" y="300" font-size="20" fill="#5b667a">OpenAI-compatible API &#8594; wasi-nn on attested GPUs &#8594; tokens streamed to your tab</text>
+
+  <!-- the robot, floating at banner scale -->
+  <g transform="translate(1160,60) scale(2.9)">
+    <g stroke="#4f8ede" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="25" cy="17" r="5" stroke-width="5"/>
+      <path d="M31 17 H60 V29" stroke-width="5"/>
+      <rect x="22" y="30" width="52" height="46" rx="12" stroke-width="7"/>
+    </g>
+    <rect x="9" y="45" width="9" height="18" rx="4.5" fill="#4f8ede"/>
+    <rect x="78" y="45" width="9" height="18" rx="4.5" fill="#4f8ede"/>
+    <circle cx="38" cy="50" r="8" fill="#f2f4f8"/>
+    <circle cx="58" cy="50" r="8" fill="#f2f4f8"/>
+    <circle cx="39.5" cy="51" r="3.6" fill="#0b0d12"/>
+    <circle cx="56.5" cy="51" r="3.6" fill="#0b0d12"/>
+    <rect x="40" y="63" width="16" height="5" rx="2.5" fill="#4f8ede"/>
+  </g>
+</svg>

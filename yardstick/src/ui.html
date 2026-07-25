@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>yardstick — measure a group without showing your number</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #c8cdd8; --accent-hi: #ffffff; --red: #e05e5e; --green: #6fcf8f;
+    --violet: #a78bfa;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text, textarea.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  textarea.text { resize: vertical; min-height: 64px; }
+  input.text:focus, textarea.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  input.small {
+    width: 120px; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono); outline: none;
+  }
+  input.small:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #10141d; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  .spacer { flex: 1; }
+  .linkbox { display: flex; gap: 8px; margin-top: 10px; align-items: stretch; }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .note.green { border-color: var(--green); }
+  .note.violet { border-color: var(--violet); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* create: close-mode cards */
+  .modes { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .mode {
+    flex: 1 1 230px; display: block; position: relative;
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer; color: var(--dim); font-size: 12.5px; line-height: 1.5;
+  }
+  .mode:hover { border-color: var(--faint); }
+  .mode input[type=radio] { position: absolute; opacity: 0; pointer-events: none; }
+  .mode b { display: block; color: var(--ink); letter-spacing: .05em; margin-bottom: 3px; }
+  .mode:has(input:checked) { border-color: var(--accent); }
+  .mode:has(input:checked) b { color: var(--accent-hi); }
+  .mode select { margin-left: 6px; }
+
+  /* measure view */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.off { background: var(--faint); }
+  .q { font-size: 17px; line-height: 1.5; color: var(--ink); margin: 0; word-break: break-word; }
+  .desc { color: var(--dim); font-size: 13px; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
+  .subbox { display: flex; gap: 8px; margin-top: 16px; }
+  .subbox input { flex: 1; min-width: 0; }
+  .subbox button { white-space: nowrap; }
+  .sealed {
+    margin-top: 14px; padding: 11px 14px; background: #0d1119;
+    border: 1px solid var(--edge2); border-radius: 8px; color: var(--dim); font-size: 12.5px;
+  }
+  .sealed b { color: var(--ink); }
+
+  /* quorum meter */
+  .meter { margin-top: 14px; }
+  .meter .bar {
+    height: 8px; background: #0d1119; border: 1px solid var(--edge2);
+    border-radius: 99px; overflow: hidden;
+  }
+  .meter .fill { height: 100%; background: var(--violet); width: 0%; transition: width .4s; }
+  .meter .cap { color: var(--faint); font-size: 11.5px; margin-top: 5px; }
+
+  /* revealed stats */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-top: 14px; }
+  .statcard {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; text-align: center;
+  }
+  .statcard.big { border-color: var(--violet); }
+  .statcard .lbl { color: var(--faint); font-size: 11px; letter-spacing: .08em; }
+  .statcard .val { color: var(--accent-hi); font-size: 22px; margin-top: 4px; word-break: break-all; }
+  .statcard.big .val { color: var(--violet); }
+  .statcard .un { color: var(--dim); font-size: 11.5px; }
+  .verify {
+    margin-top: 18px; padding: 14px 16px;
+    border: 1px dashed var(--edge2); border-radius: 8px;
+  }
+  .verify h3 { margin: 0; font-size: 12.5px; color: var(--dim); letter-spacing: .06em; font-weight: 400; }
+  .vstep { color: var(--dim); font-size: 12.5px; margin-top: 8px; word-break: break-all; }
+  .vstep .ok { color: var(--green); }
+  .vstep .bad { color: var(--red); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ yard<b>stick</b> ]</div>
+    <div class="tag">measure a group without anyone showing their number · aggregates out, individuals never</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>SET UP A MEASUREMENT</h2>
+    <input id="title" class="text" maxlength="80" placeholder="what's being measured — 'base salary, senior eng, EU', 'your rate per day'…" autofocus>
+    <textarea id="desc" class="text" maxlength="500" style="margin-top:10px"
+      placeholder="what to include, what currency, any ground rules (optional)"></textarea>
+    <div class="row">
+      <label>reveal needs at least
+        <select id="quorum">
+          <option value="3">3</option>
+          <option value="5" selected>5</option>
+          <option value="8">8</option>
+          <option value="10">10</option>
+          <option value="20">20</option>
+        </select> numbers
+      </label>
+      <label>unit <input id="unit" class="small" maxlength="12" placeholder="EUR, USD/day…"></label>
+    </div>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="close" value="manual" checked>
+        <b>manual</b>I close it with my admin link</label>
+      <label class="mode"><input type="radio" name="close" value="deadline">
+        <b>deadline</b>auto-closes after
+        <select id="deadline">
+          <option value="3600">1 hour</option>
+          <option value="86400" selected>24 hours</option>
+          <option value="259200">3 days</option>
+          <option value="604800">7 days</option>
+        </select></label>
+    </div>
+    <div class="row">
+      <span class="spacer"></span>
+      <button id="createbtn">open the measurement →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>numbers live only in attested enclave RAM — nobody can read them, <em>you included</em></li>
+      <li>at close, the enclave reveals only aggregates — median, mean, quartiles — and only if at least <em>k</em> people submitted</li>
+      <li>below quorum nothing is revealed; either way every individual number is scrubbed at close</li>
+      <li>the median of a few numbers still <em>is</em> someone's number — it just doesn't say whose. pick k accordingly</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>THE MEASUREMENT IS OPEN</h2>
+    <p class="sub">share this link with the people being measured:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <p class="sub" style="margin-top:16px">admin link — keep it private: it closes the measurement (it cannot see any numbers):</p>
+    <div class="linkbox"><input id="adminlink" readonly><button id="copyadmin">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="openmeasure">open your measurement →</button>
+      <button class="ghost" onclick="location.href='/'">set up another</button>
+    </div>
+  </section>
+
+  <!-- MEASURE -->
+  <section id="measure" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="livetext">connecting…</span></div>
+    <div class="q" id="q"></div>
+    <div class="desc" id="descout"></div>
+    <div class="kv" id="meta"></div>
+    <div class="meter" id="meter">
+      <div class="bar"><div class="fill" id="fill"></div></div>
+      <div class="cap" id="metercap"></div>
+    </div>
+    <div class="subbox" id="subbox">
+      <input id="value" class="text" inputmode="numeric" placeholder="your number — whole units, kept sealed">
+      <button id="subbtn">submit sealed →</button>
+    </div>
+    <div class="sealed hidden" id="mine"></div>
+    <div id="result"></div>
+    <div class="verify hidden" id="verify">
+      <h3>DON'T TRUST THIS PAGE'S WORD FOR IT</h3>
+      <div class="vstep">every submission's fingerprint is public now. this button recomputes yours
+      with WebCrypto — inclusion proves your number was in the set the stats were computed from:</div>
+      <div class="row" style="margin-top:12px"><button id="verifybtn" class="ghost">verify my inclusion</button></div>
+      <div class="vstep hidden" id="v1"></div>
+      <div class="vstep hidden" id="v2"></div>
+      <div class="vstep hidden" id="vsum"></div>
+    </div>
+    <div class="err" id="merr"></div>
+    <div id="admin" class="hidden">
+      <div class="note" id="adminnote" style="margin-top:20px"></div>
+      <div class="row" style="margin-top:12px"><button id="closebtn" class="hidden"></button></div>
+    </div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this measurement never existed, expired unclosed, or its results aged out (7 days).
+    numbers from a vanished measurement were scrubbed, not archived.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">set up a new measurement</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  numbers in attested memory only, aggregates the only exit, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave, then check your inclusion yourself.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+const sha256 = async (bytes) => new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+const sha256hex = async (str) => [...await sha256(enc.encode(str))].map(x => x.toString(16).padStart(2, "0")).join("");
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","measure","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const fmtNum = (n) => {
+  const [i, f] = String(n).split(".");
+  return Number(i).toLocaleString("en-US") + (f && f !== "0" ? "." + f : "");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("createbtn").addEventListener("click", async () => {
+  const title = $("title").value.trim();
+  $("cerr").textContent = "";
+  if (!title) { $("cerr").textContent = "say what's being measured."; return; }
+  $("createbtn").disabled = true;
+  try {
+    const id = newId();
+    const admToken = b64u(rand(16));
+    const quorum = $("quorum").value;
+    const mode = document.querySelector("input[name=close]:checked").value;
+    const headers = {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-measure-id": id,
+      "x-admin-hash": await sha256hex(admToken),
+      "x-quorum": quorum,
+    };
+    if (mode === "deadline") headers["x-deadline-in"] = $("deadline").value;
+    const unit = $("unit").value.trim();
+    if (unit) headers["x-unit"] = unit;
+    const body = "title=" + encodeURIComponent(title) + "&desc=" + encodeURIComponent($("desc").value.trim());
+    const res = await api("/api/measures", { method: "POST", headers, body });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const share = location.origin + "/m/" + id;
+    const admin = share + "#a=" + admToken;
+    $("sharelink").value = share;
+    $("adminlink").value = admin;
+    $("createdmeta").innerHTML = "reveal needs <b>" + quorum + "</b> numbers · " +
+      (mode === "deadline" ? "auto-closes in <b>" + fmtDur(+$("deadline").value) + "</b>"
+        : "closes when <b>you</b> say so") + " · expires in <b>7 days</b> if never closed";
+    $("openmeasure").onclick = () => { location.href = admin; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("createbtn").disabled = false;
+  }
+});
+copyBtn($("copyshare"), () => $("sharelink").value);
+copyBtn($("copyadmin"), () => $("adminlink").value);
+
+// ---- measure flow ----------------------------------------------------------
+let mid = null, admToken = null, state = null, closesAt = null, armTimer = null;
+
+function initMeasure(id) {
+  mid = id;
+  const m = /(?:^|[#&])a=([^&]+)/.exec(location.hash.slice(1));
+  admToken = m ? decodeURIComponent(m[1]) : null;
+  show("measure");
+  refresh();
+  subscribe();
+  setInterval(tick, 1000);
+}
+
+async function refresh() {
+  const res = await api("/api/measure?id=" + encodeURIComponent(mid));
+  if (!res.ok) { show("gone"); return; }
+  state = res.j;
+  render();
+  refreshMine();
+}
+
+function render() {
+  const p = state;
+  closesAt = !p.closed && p.closes_in !== null ? Math.floor(Date.now() / 1000) + p.closes_in : null;
+  $("q").textContent = p.title;
+  $("descout").textContent = p.desc || "";
+  $("descout").classList.toggle("hidden", !p.desc);
+  const n = p.count, s = n === 1 ? " sealed number" : " sealed numbers";
+  $("meta").innerHTML = p.closed
+    ? (p.revealed
+        ? "closed at quorum — aggregates of <b>" + n + "</b> numbers below · up for <b>" + fmtDur(p.expires_in) + "</b>"
+        : "closed <b>below quorum</b> (" + n + " of " + p.quorum + ") — nothing was revealed; every number was scrubbed")
+    : "<b>" + n + "</b>" + s + " so far · reveal needs <b>" + p.quorum + "</b>" +
+      (closesAt !== null ? " · auto-closes in <b><span id=cdown>" + fmtDur(p.closes_in) + "</span></b>"
+        : " · closes when the organizer says so");
+  $("meter").classList.toggle("hidden", p.closed);
+  if (!p.closed) {
+    const pct = Math.min(100, Math.round(100 * n / p.quorum));
+    $("fill").style.width = pct + "%";
+    $("metercap").textContent = n >= p.quorum
+      ? "quorum met — closing now would reveal aggregates"
+      : (p.quorum - n) + " more needed before a close reveals anything";
+  }
+  $("subbox").classList.toggle("hidden", p.closed);
+  renderClosed();
+  renderAdmin();
+}
+
+function tick() {
+  const el = document.getElementById("cdown");
+  if (!el || closesAt === null) return;
+  const left = closesAt - Math.floor(Date.now() / 1000);
+  el.textContent = left > 0 ? fmtDur(left) : "…any moment (enclave sweep)";
+}
+
+function renderClosed() {
+  const p = state, box = $("result");
+  $("verify").classList.toggle("hidden", !(p.closed && p.revealed));
+  box.textContent = "";
+  if (!p.closed) return;
+  if (!p.revealed) {
+    const note = document.createElement("div");
+    note.className = "note red";
+    note.textContent = "quorum not met. the enclave revealed nothing — no median, no mean, no count of what might have been. " +
+      "the " + p.count + " number" + (p.count === 1 ? "" : "s") + " submitted were scrubbed unread.";
+    box.append(note);
+    return;
+  }
+  const grid = document.createElement("div");
+  grid.className = "stats";
+  const card = (lbl, val, big) => {
+    const d = document.createElement("div");
+    d.className = "statcard" + (big ? " big" : "");
+    d.innerHTML = "<div class=lbl>" + lbl + "</div><div class=val>" + fmtNum(val) +
+      (p.unit ? " <span class=un>" + p.unit.replace(/</g, "&lt;") + "</span>" : "") + "</div>";
+    return d;
+  };
+  grid.append(card("MEDIAN", p.median, true));
+  grid.append(card("MEAN", p.mean, false));
+  if (p.p25 !== null) grid.append(card("P25 – P75", fmtNum(p.p25) + " – " + fmtNum(p.p75), false));
+  box.append(grid);
+  const note = document.createElement("div");
+  note.className = "note violet";
+  note.textContent = "aggregates of " + p.count + " sealed numbers. the numbers themselves were scrubbed at close — " +
+    "there is nothing left to leak, subpoena, or breach.";
+  box.append(note);
+}
+
+// ---- submitting ------------------------------------------------------------
+$("subbtn").addEventListener("click", async () => {
+  const value = $("value").value.trim().replace(/[,\s]/g, "");
+  $("merr").textContent = "";
+  if (!/^\d{1,13}$/.test(value)) { $("merr").textContent = "a whole number, 0 or more."; return; }
+  // The token is the submission's identity: same token, same slot —
+  // re-submitting from this browser replaces your number, not adds one.
+  let token = localStorage.getItem("yardstick-token-" + mid);
+  if (!token) { token = b64u(rand(24)); localStorage.setItem("yardstick-token-" + mid, token); }
+  $("subbtn").disabled = true;
+  const res = await api("/api/submit", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(mid) + "&token=" + encodeURIComponent(token) +
+      "&value=" + value,
+  });
+  $("subbtn").disabled = false;
+  if (!res.ok) {
+    if (res.status === 409) { refresh(); return; } // closed under us — repaint
+    $("merr").textContent = (res.j && res.j.error) || ("submit failed (" + res.status + ")");
+    return;
+  }
+  localStorage.setItem("yardstick-value-" + mid, String(parseInt(value, 10)));
+  $("value").value = "";
+  refreshMine();
+});
+
+/// Your private echo: while open, proof the seal took; after close, whether
+/// you were counted — the value itself no longer exists to be echoed.
+async function refreshMine() {
+  const token = localStorage.getItem("yardstick-token-" + mid);
+  const box = $("mine");
+  if (!token) { box.classList.add("hidden"); return; }
+  const res = await api("/api/mine?id=" + encodeURIComponent(mid) + "&token=" + encodeURIComponent(token));
+  if (!res.ok || !res.j) { box.classList.add("hidden"); return; }
+  const j = res.j;
+  if (j.closed === false) {
+    if (j.value === null) { box.classList.add("hidden"); return; }
+    box.classList.remove("hidden");
+    box.innerHTML = "your sealed number: <b>" + fmtNum(j.value) + (state.unit ? " " + state.unit.replace(/</g, "&lt;") : "") +
+      "</b> — re-submit any time before close to change it. only this browser and the enclave know it.";
+  } else if (j.counted) {
+    box.classList.remove("hidden");
+    box.innerHTML = "you were counted. your number was scrubbed at close — verify your inclusion below.";
+  } else {
+    box.classList.add("hidden");
+  }
+}
+
+// ---- SSE -------------------------------------------------------------------
+function subscribe() {
+  const es = new EventSource("/api/stream?id=" + encodeURIComponent(mid));
+  es.onopen = () => setLive(true);
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial unnamed event: full /api/measure shape
+    try { state = JSON.parse(ev.data); } catch { return; }
+    setLive(true);
+    render();
+    refreshMine();
+  };
+  es.addEventListener("subs", (ev) => {
+    try { state.count = JSON.parse(ev.data).count; } catch { return; }
+    if (!state.closed) render();
+  });
+  es.addEventListener("closed", (ev) => {
+    try { state = JSON.parse(ev.data); } catch { return; }
+    render();
+    refreshMine();
+  });
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("livetext").textContent = on ? "live" : "reconnecting…";
+}
+
+// ---- admin -----------------------------------------------------------------
+function renderAdmin() {
+  const p = state, panel = $("admin"), btn = $("closebtn");
+  if (!admToken || p.closed) { panel.classList.add("hidden"); return; }
+  panel.classList.remove("hidden");
+  btn.classList.remove("hidden");
+  if (!btn.dataset.wired) { btn.dataset.wired = "1"; btn.addEventListener("click", closeClick); }
+  $("adminnote").textContent = p.count >= p.quorum
+    ? "you hold the admin token — but not the numbers. closing now reveals aggregates of " + p.count + "."
+    : "you hold the admin token — but not the numbers. closing below quorum (" + p.count + " of " +
+      p.quorum + ") reveals NOTHING and scrubs what was submitted.";
+  if (!btn.dataset.armed) btn.textContent = p.count >= p.quorum ? "close & reveal aggregates" : "close (below quorum)";
+}
+
+async function closeClick() {
+  const btn = $("closebtn");
+  if (!btn.dataset.armed) {
+    // first click arms for 3s; only a second click executes. no confirm().
+    btn.dataset.armed = "1";
+    btn.textContent = "sure? click again to close";
+    armTimer = setTimeout(() => { delete btn.dataset.armed; renderAdmin(); }, 3000);
+    return;
+  }
+  clearTimeout(armTimer);
+  delete btn.dataset.armed;
+  btn.disabled = true;
+  const res = await api("/api/close", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(mid) + "&admin=" + encodeURIComponent(admToken),
+  });
+  btn.disabled = false;
+  if (!res.ok) {
+    $("merr").textContent = res.status === 403 ? "wrong admin token."
+      : ((res.j && res.j.error) || "close failed");
+    renderAdmin();
+    return;
+  }
+  state = res.j; // the close response IS the closed measure state
+  render();
+  refreshMine();
+}
+
+// ---- verification ----------------------------------------------------------
+// Byte-for-byte the server's math: a submission's fingerprint is sha256 of
+// "<sha256hex(token)>:<value>". Your token never left this browser, so only
+// you can recompute yours — inclusion proves your number was in the set.
+$("verifybtn").addEventListener("click", async () => {
+  const p = state;
+  if (!p || !p.closed || !p.revealed) return;
+  const step = (id, ok, text) => {
+    const el = $(id);
+    el.classList.remove("hidden");
+    el.innerHTML = (ok ? "<span class=ok>✓</span> " : "<span class=bad>✗</span> ") + text;
+    return ok;
+  };
+  const ok1 = step("v1", p.fingerprints.length === p.count,
+    p.fingerprints.length + " fingerprint" + (p.fingerprints.length === 1 ? "" : "s") +
+    " published for " + p.count + " counted number" + (p.count === 1 ? "" : "s"));
+  let ok2 = true;
+  const token = localStorage.getItem("yardstick-token-" + mid);
+  const myVal = localStorage.getItem("yardstick-value-" + mid);
+  if (token && myVal) {
+    const fp = await sha256hex(await sha256hex(token) + ":" + myVal);
+    ok2 = step("v2", p.fingerprints.includes(fp),
+      "your own fingerprint (recomputed from the token only this browser holds) is in the counted set");
+  } else {
+    step("v2", true, "no sealed number from this browser — nothing of yours to check");
+  }
+  const sum = $("vsum");
+  sum.classList.remove("hidden");
+  sum.innerHTML = ok1 && ok2
+    ? "<span class=ok>the set is the size it claims and your number was in it. that the stats are honest math over that set is what the attestation is for.</span>"
+    : "<span class=bad>verification FAILED — do not trust these stats; the served data doesn't add up.</span>";
+});
+
+// ---- router ----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/m/")) {
+    const m = /^\/m\/([a-z0-9]{8,16})$/.exec(location.pathname);
+    if (m) initMeasure(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "holding " + r.j.measures + " measurement" + (r.j.measures === 1 ? "" : "s") +
+      " · " + r.j.sealed_numbers + " sealed number" + (r.j.sealed_numbers === 1 ? "" : "s") +
+      " · lifetime " + r.j.lifetime_measures + " measurements, " + r.j.lifetime_submissions + " submissions, " +
+      r.j.revealed + " revealed";
+  } catch {}
+}
+</script>
+</body>
+</html>

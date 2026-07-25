@@ -1,0 +1,7 @@
+# Headless twm: this X server has no input devices (no mouse/kbd modules in
+# the image), so twm's default interactive window placement — grab the server,
+# draw the outline grid, wait for a click — would freeze the whole desktop
+# forever on the first mapped window (spincube blocks mid-XPutImage under the
+# grab). Place windows automatically and never grab the server.
+RandomPlacement
+NoGrabServer

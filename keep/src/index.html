@@ -1,0 +1,709 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keep - a notebook only your wallet can open</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131722; --panel2: #0f131c; --border: #232a3a;
+    --text: #e6e9f0; --dim: #8a93a6; --accent: #5eead4; --accent-h: #6ee7d7;
+    --err: #f2b8c0; --warn: #f5d58a; --danger: #f2748a;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 1040px; margin: 0 auto; padding: 0 16px 40px;
+  }
+  header { padding: 18px 0 12px; border-bottom: 1px solid var(--border); }
+  .wordmark { font: 600 20px/1 var(--mono); letter-spacing: .06em; color: var(--accent); }
+  .tagline { color: var(--dim); font-size: 12.5px; margin-top: 5px; }
+  .banner {
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 10px 13px; margin-top: 14px; font-size: 12.5px; color: var(--dim);
+  }
+  .banner b { color: var(--text); font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .card h2 { font-size: 13.5px; font-weight: 600; color: var(--accent); margin-bottom: 2px; }
+  .lock-hd { font-size: 14px; font-weight: 600; margin-top: 16px; color: var(--text); }
+  .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); word-break: break-all; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 1px 9px; margin-left: 8px; vertical-align: 1px; }
+  .badge.locked   { background: #2a2f3e; color: var(--dim); }
+  .badge.syncing, .badge.pushing { background: #3a3320; color: var(--warn); }
+  .badge.unlocked { background: #16322c; color: var(--accent); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-h); text-decoration: underline; }
+  .empty { color: var(--dim); font-size: 13px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
+  form.unlock { margin-top: 10px; display: grid; gap: 8px; }
+  input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px;
+    font: 13px var(--mono);
+  }
+  input::placeholder { color: #59627a; }
+  button {
+    background: var(--accent); color: #06231e; border: 0; border-radius: 7px;
+    padding: 7px 14px; font: 600 13px system-ui, sans-serif; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--accent-h); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.ghost:hover:not(:disabled) { background: var(--panel2); color: var(--text); }
+  button.wallet { background: #7ba7f7; color: #0a1430; }
+  button.wallet:hover:not(:disabled) { background: #9ec0ff; }
+  button.danger { color: var(--danger); border-color: #3a2530; }
+  button.danger.armed { background: var(--danger); color: #2a0d13; border-color: var(--danger); }
+  button.mini { padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .4; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  details.creds { font-size: 12.5px; color: var(--dim); }
+  details.creds > summary { cursor: pointer; user-select: none; }
+  details.creds > div { display: grid; gap: 8px; margin-top: 8px; }
+  .reveal { border: 1px dashed var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; }
+  .reveal .k { color: var(--dim); }
+  .reveal code { display: block; font: 11.5px var(--mono); word-break: break-all; margin: 2px 0 8px; color: var(--text); user-select: all; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--border); line-height: 1.6; }
+  footer b { color: var(--text); }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid var(--warn); border-top-color: transparent; border-radius: 50%; animation: r .8s linear infinite; vertical-align: -1px; margin-right: 5px; }
+  @keyframes r { to { transform: rotate(360deg); } }
+
+  /* ---- notebook ---- */
+  .nb { display: grid; grid-template-columns: 264px 1fr; gap: 14px; margin-top: 14px; align-items: start; }
+  .nb-side { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .nb-side-hd { display: flex; align-items: center; justify-content: space-between; padding: 11px 13px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+  .note-list { max-height: 52vh; overflow-y: auto; padding: 6px; }
+  .note-item { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline; padding: 7px 9px; border-radius: 7px; cursor: pointer; }
+  .note-item:hover { background: var(--panel2); }
+  .note-item.active { background: #16322c; }
+  .note-item .nm { font: 12.5px var(--mono); color: var(--text); word-break: break-all; }
+  .note-item.active .nm { color: var(--accent); }
+  .note-item .nz { font: 11px var(--mono); color: var(--dim); white-space: nowrap; }
+  .note-item .nv { grid-column: 1 / -1; font: 10.5px var(--mono); color: var(--dim); }
+  .vol-bar { border-top: 1px solid var(--border); padding: 6px; }
+  .vol-row { padding: 8px 9px; }
+  .vol-name { font: 12px var(--mono); color: var(--text); }
+  .vol-meta { font: 11px var(--mono); color: var(--dim); margin: 2px 0 6px; }
+  .vol-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .vol-hint { font-size: 10.5px; color: var(--dim); margin-top: 6px; line-height: 1.4; }
+  .nb-main { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; min-height: 60vh; }
+  .ed-hd { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); }
+  .ed-title { font: 13px var(--mono); color: var(--text); word-break: break-all; }
+  .ed-state { font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .ed-state.ok { color: var(--accent); }
+  .ed-state.warn { color: var(--warn); }
+  .ed-body { flex: 1; display: flex; min-height: 320px; }
+  .editor { flex: 1; width: 100%; resize: none; background: var(--bg); color: var(--text); border: 0; padding: 14px; font: 13.5px/1.6 var(--mono); outline: none; }
+  .editor::placeholder { color: #59627a; }
+  .preview { flex: 1; overflow-y: auto; padding: 14px 18px; font-size: 14px; }
+  .preview h1 { font-size: 20px; margin: 12px 0 8px; } .preview h2 { font-size: 17px; margin: 12px 0 7px; }
+  .preview h3 { font-size: 15px; margin: 10px 0 6px; } .preview h4, .preview h5, .preview h6 { font-size: 13.5px; margin: 9px 0 5px; }
+  .preview p { margin: 8px 0; } .preview ul, .preview ol { margin: 8px 0 8px 22px; } .preview li { margin: 2px 0; }
+  .preview code { font: 12.5px var(--mono); background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+  .preview pre.cb { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+  .preview pre.cb code { background: none; border: 0; padding: 0; font-size: 12.5px; }
+  .preview a { word-break: break-all; }
+  .ed-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .ed-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .counts { font: 11.5px var(--mono); color: var(--dim); white-space: nowrap; }
+  @media (max-width: 720px) { .nb { grid-template-columns: 1fr; } .note-list { max-height: 30vh; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="wordmark">[ keep ]</div>
+  <div class="tagline">a notebook only your wallet can open</div>
+</header>
+
+<div class="banner">
+  <b>Save</b> writes plaintext to the enclave's in-memory ramdisk. <b>Sync</b> re-encrypts it and pushes ciphertext to your S3 bucket.
+  <b>Lock</b> wipes the plaintext. The bucket and the host only ever see ciphertext.
+</div>
+
+<div id="app"><div class="card"><span class="empty">loading…</span></div></div>
+
+<footer>
+  keep keeps notes in a wallet-unlocked encrypted volume (rclone crypt over S3). The App Config names <i>where</i> the ciphertext lives &mdash; never a key.
+  <b>Unlock with wallet</b> derives the volume key from a fixed signature; only the wallet holder can reproduce it, and nothing is verified or stored on any server.
+  Once unlocked, <span style="font-family:var(--mono)">/enc/&lt;name&gt;</span> is an ordinary directory this app reads and writes with plain <span style="font-family:var(--mono)">std::fs</span>.
+  <b>Save</b> persists to the enclave's ramdisk, <b>Sync</b> re-encrypts + pushes to your bucket, <b>Lock</b> wipes the plaintext.
+  <b>Verify the enclave before trusting it</b> &mdash; <a href="https://enclave.host" target="_blank" rel="noreferrer">enclave.host</a>.
+</footer>
+
+<script>
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(1) + " KiB" : n + " B";
+let timer = null;
+
+// ==========================================================================
+// SECURITY-SENSITIVE, kept BYTE-EXACT from the encrypted-volumes reference.
+// The wallet derivation and credentials-envelope contracts are pinned by the
+// platform e2e; do not alter the domain strings or the digest construction.
+// ==========================================================================
+
+// ---- wallet key derivation ------------------------------------------------
+// BYTE-EXACT contract with scripts/enclave-encvol.sh (`message` / `derive`):
+// the canonical message the wallet personal_signs, and password/salt as
+// sha256 of the lowercase 0x-signature + "\n" + a domain label. Deterministic
+// ECDSA (RFC 6979) makes the same wallet always derive the same key.
+const volMessage = (keyId) =>
+  `Enclave encrypted volume key v1\nvolume: ${keyId}\n\nSigning derives this volume's encryption key. Only sign in apps you trust with its contents.`;
+
+async function sha256hex(s) {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- credentials envelope -------------------------------------------------
+// S3 credentials sealed under the SAME wallet signature that derives the
+// volume key, riding the PUBLIC App Config as "credsEnvelope" - one signature
+// unlocks everything. BYTE-EXACT contract with enclave-encvol.sh `seal-creds`
+// (pinned by the platform e2e):
+//   encKey/macKey = SHA-256(sig + "\n" + "enclave-encvol-v1:creds-enc"/":creds-mac")
+//   envelope      = "encv1:" + base64( iv[16] || AES-256-CTR(encKey, iv, credsJSON) || HMAC-SHA256(macKey, iv||ct)[32] )
+const sha256bytes = async (s) => new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function openCredsEnvelope(sig, envelope) {
+  if (!envelope.startsWith("encv1:")) throw new Error("unknown credsEnvelope format");
+  const raw = b64decode(envelope.slice(6));
+  if (raw.length < 16 + 32 + 2) throw new Error("credsEnvelope too short");
+  const ivct = raw.slice(0, raw.length - 32), tag = raw.slice(raw.length - 32);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  if (!(await crypto.subtle.verify("HMAC", macKey, tag, ivct)))
+    throw new Error("envelope failed authentication - it was sealed by a different wallet than the one that just signed");
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["decrypt"]);
+  const pt = await crypto.subtle.decrypt({ name: "AES-CTR", counter: ivct.slice(0, 16), length: 128 }, encKey, ivct.slice(16));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+async function sealCredsEnvelope(sig, creds) {
+  const iv = crypto.getRandomValues(new Uint8Array(16));
+  const encKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-enc"),
+    { name: "AES-CTR" }, false, ["encrypt"]);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CTR", counter: iv, length: 128 }, encKey,
+    new TextEncoder().encode(JSON.stringify(creds))));
+  const ivct = new Uint8Array(16 + ct.length); ivct.set(iv); ivct.set(ct, 16);
+  const macKey = await crypto.subtle.importKey("raw", await sha256bytes(sig + "\nenclave-encvol-v1:creds-mac"),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const tag = new Uint8Array(await crypto.subtle.sign("HMAC", macKey, ivct));
+  const all = new Uint8Array(ivct.length + 32); all.set(ivct); all.set(tag, ivct.length);
+  return "encv1:" + btoa(String.fromCharCode(...all));
+}
+
+async function walletDerive(keyId) {
+  const eth = window.ethereum;
+  if (!eth) throw new Error("no wallet detected (window.ethereum) - use a browser wallet, or unlock with a password");
+  const [account] = await eth.request({ method: "eth_requestAccounts" });
+  const msg = volMessage(keyId);
+  const hex = "0x" + Array.from(new TextEncoder().encode(msg), (b) => b.toString(16).padStart(2, "0")).join("");
+  let sig = await eth.request({ method: "personal_sign", params: [hex, account] });
+  sig = String(sig).trim().toLowerCase();
+  if (!/^0x[0-9a-f]{130}$/.test(sig)) throw new Error("unexpected signature format (need a 65-byte ECDSA personal_sign; smart-contract wallets are not supported)");
+  return { account, sig,
+           password: await sha256hex(sig + "\nenclave-encvol-v1:password"),
+           salt: await sha256hex(sig + "\nenclave-encvol-v1:salt") };
+}
+
+// ---- api ------------------------------------------------------------------
+async function api(path, body) {
+  const r = await fetch("./api/" + path, body
+    ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+    : undefined);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+// ==========================================================================
+// LOCKED VIEW - unlock cards (ported from the reference, locked/busy states
+// only; once a volume unlocks the app switches to the notebook below).
+// ==========================================================================
+const CRED_ERR = /InvalidArgument: Authorization|InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied/;
+const credHint = (err) => CRED_ERR.test(err || "")
+  ? `<div class="err" style="color:var(--warn)">The bucket rejected this request's S3 credentials${/InvalidArgument: Authorization/.test(err) ? " (it refused an unauthenticated request)" : ""} -
+     the crypt password was never checked. Fill in the access key id + secret access key below.
+     Lock wipes retained credentials, so they are needed again at every unlock.</div>`
+  : "";
+
+function s3CredsBlock(open) {
+  return `<details class="creds"${open ? " open" : ""}><summary>S3 credentials - required unless the bucket allows public reads (Lock wipes them; re-enter at every unlock)</summary><div>
+      <input name="accessKeyId" placeholder="access key id" autocomplete="off">
+      <input type="password" name="secretAccessKey" placeholder="secret access key" autocomplete="off">
+      <input type="password" name="sessionToken" placeholder="session token (optional)" autocomplete="off">
+    </div></details>`;
+}
+
+function volCard(v) {
+  const busy = v.status === "syncing" || v.status === "pushing";
+  const badge = `<span class="badge ${esc(v.status)}">${busy ? '<span class="spin"></span>' : ""}${esc(v.status)}</span>`;
+  const where = `s3 ${esc(v.endpoint)} &rarr; ${esc(v.bucket)}${v.path ? "/" + esc(v.path) : ""}`;
+  let body = "";
+  if (v.status === "locked" && !busy) {
+    const walletBtn = `<button type="button" class="wallet" data-wallet="1">Unlock with wallet</button>
+        <span class="empty">${v.credsEnvelope
+          ? `one signature derives the key AND opens the sealed S3 credentials - nothing to type`
+          : `signs "volume: ${esc(v.keyId || v.name)}", derives the key locally`}</span>`;
+    const passInputs = `
+        <input type="password" name="password" placeholder="rclone crypt password" autocomplete="off">
+        <input type="password" name="salt" placeholder="salt / password2 (leave empty if none)" autocomplete="off">
+        <div class="row"><button type="submit">Unlock with password</button></div>`;
+    const parts = (v.unlock === "password")
+      ? passInputs + `<div class="row">${walletBtn}</div>`
+      : `<div class="row">${walletBtn}</div>
+         <details class="creds"><summary>use a password instead</summary><div>${passInputs}</div></details>`;
+    body = `
+      <form class="unlock" data-vol="${esc(v.name)}" data-keyid="${esc(v.keyId || v.name)}">
+        ${parts}
+        ${s3CredsBlock(CRED_ERR.test(v.error || ""))}
+      </form>
+      <div class="row"><a href="#" data-reveal="${esc(v.name)}">derive push credentials (wallet)</a></div>
+      <div class="reveal" id="reveal-${esc(v.name)}" style="display:none"></div>`;
+  } else if (busy) {
+    body = `<div class="empty" style="margin-top:8px">${v.status === "syncing" ? "pulling + decrypting from the bucket…" : "encrypting + pushing to the bucket…"}</div>`;
+  }
+  return `<div class="card"><h2>/enc/${esc(v.name)}${badge}</h2><div class="meta">${where}</div>` +
+    body + (v.error ? `<div class="err">${esc(v.error)}</div>${credHint(v.error)}` : "") + "</div>";
+}
+
+function s3CredsFrom(form) {
+  const body = {};
+  for (const k of ["accessKeyId", "secretAccessKey", "sessionToken"]) {
+    const el = form?.querySelector(`[name=${k}]`);
+    if (el && el.value) body[k] = el.value;
+  }
+  return body;
+}
+
+// ==========================================================================
+// NOTEBOOK VIEW - the read-write additions (Save/Sync/Lock over std::fs).
+// ==========================================================================
+let lastVols = [];
+let inNotebook = false;
+let notes = [];            // [{vol, path, size}] - the text notes across unlocked volumes
+let current = null;        // {vol, path, isNew}
+let savedContent = "";     // last persisted content of `current` (null = unsaved new note)
+let editState = "";        // "" | "saved" | "dirty" | "synced"
+let previewing = false;
+let delArmed = false, delTimer = null;
+const sealSigs = {};       // volume -> the signature the reveal panel derived (feeds Seal)
+
+const unlockedVols = () => lastVols.filter((v) => v.status === "unlocked" || v.status === "pushing");
+const isTextNote = (p) => {
+  const base = p.split("/").pop();
+  if (!base.includes(".")) return true;            // no extension
+  const ext = base.split(".").pop().toLowerCase();
+  return ext === "md" || ext === "txt";
+};
+
+// small dependency-free markdown renderer (HTML escaped FIRST):
+// headings, bold/italic, inline code, code fences, links, lists, paragraphs.
+function mdRender(src) {
+  const escH = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const fences = [];
+  src = String(src).replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
+    fences.push(escH(code.replace(/\n$/, ""))); return "" + (fences.length - 1) + "";
+  });
+  const inline = (t) => escH(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  const out = [];
+  let para = [], list = null;
+  const flushP = () => { if (para.length) { out.push("<p>" + para.map(inline).join("<br>") + "</p>"); para = []; } };
+  const flushL = () => { if (list) { out.push(`<${list.t}>` + list.items.map((x) => "<li>" + inline(x) + "</li>").join("") + `</${list.t}>`); list = null; } };
+  for (const ln of String(src).split("\n")) {
+    let m;
+    if ((m = ln.match(/^(\d+)$/))) { flushP(); flushL(); out.push('<pre class="cb"><code>' + fences[+m[1]] + "</code></pre>"); continue; }
+    if ((m = ln.match(/^(#{1,6})\s+(.*)$/))) { flushP(); flushL(); const l = m[1].length; out.push(`<h${l}>` + inline(m[2]) + `</h${l}>`); continue; }
+    if ((m = ln.match(/^\s*[-*]\s+(.*)$/))) { flushP(); if (!list || list.t !== "ul") { flushL(); list = { t: "ul", items: [] }; } list.items.push(m[1]); continue; }
+    if ((m = ln.match(/^\s*\d+\.\s+(.*)$/))) { flushP(); if (!list || list.t !== "ol") { flushL(); list = { t: "ol", items: [] }; } list.items.push(m[1]); continue; }
+    if (ln.trim() === "") { flushP(); flushL(); continue; }
+    flushL(); para.push(ln);
+  }
+  flushP(); flushL();
+  return out.join("\n");
+}
+
+function renderNotebookShell() {
+  document.getElementById("app").innerHTML = `
+    <div class="nb">
+      <aside class="nb-side">
+        <div class="nb-side-hd"><span>notes</span><button class="mini" id="newNote">new note</button></div>
+        <div id="noteList" class="note-list"></div>
+        <div id="volBar" class="vol-bar"></div>
+      </aside>
+      <section class="nb-main">
+        <div class="ed-hd"><span id="edTitle" class="ed-title">select a note</span><span id="edState" class="ed-state"></span></div>
+        <div class="ed-body">
+          <textarea id="editor" class="editor" spellcheck="false" placeholder="select a note on the left, or “new note” to start writing" disabled></textarea>
+          <div id="preview" class="preview" style="display:none"></div>
+        </div>
+        <div class="ed-foot">
+          <div class="ed-actions">
+            <button id="saveBtn" disabled>Save</button>
+            <button id="previewBtn" class="ghost" disabled>Preview</button>
+            <button id="deleteBtn" class="ghost danger" disabled>Delete</button>
+          </div>
+          <span id="counts" class="counts"></span>
+        </div>
+      </section>
+    </div>`;
+}
+
+function renderNoteList() {
+  const el = document.getElementById("noteList");
+  if (!el) return;
+  if (!notes.length) { el.innerHTML = '<div class="empty" style="padding:10px">no notes yet — “new note” to start</div>'; return; }
+  const multiVol = new Set(notes.map((n) => n.vol)).size > 1;
+  el.innerHTML = notes.map((n, i) => {
+    const active = current && current.vol === n.vol && current.path === n.path;
+    return `<div class="note-item${active ? " active" : ""}" data-i="${i}">
+        <span class="nm">${esc(n.path)}</span><span class="nz">${fmt(n.size)}</span>
+        ${multiVol ? `<span class="nv">${esc(n.vol)}</span>` : ""}</div>`;
+  }).join("");
+}
+
+function renderVolBar() {
+  const el = document.getElementById("volBar");
+  if (!el) return;
+  el.innerHTML = unlockedVols().map((v) => {
+    const busy = v.status === "pushing";
+    return `<div class="vol-row">
+        <div class="vol-name">/enc/${esc(v.name)}${busy ? ' <span class="spin"></span>syncing' : ""}</div>
+        <div class="vol-meta">${fmt(v.bytes || 0)} of ${esc(v.maxMb ?? "?")} MiB on ramdisk</div>
+        <div class="vol-acts">
+          ${v.readOnly ? '<span class="empty">read-only</span>'
+            : `<button class="mini" data-act="sync" data-vol="${esc(v.name)}" ${busy ? "disabled" : ""}>Sync</button>`}
+          <button class="mini ghost" data-act="lock" data-vol="${esc(v.name)}">Lock</button>
+        </div>
+        <div class="vol-hint">Sync = re-encrypt &amp; push to your bucket · Lock = wipe plaintext</div>
+      </div>`;
+  }).join("");
+}
+
+async function refreshNotes() {
+  let ls = { volumes: {} };
+  try { ls = await fetch("./ls").then((r) => r.json()); } catch {}
+  notes = [];
+  for (const v of unlockedVols()) {
+    for (const f of (ls.volumes[v.name]?.files || [])) {
+      if (isTextNote(f.path)) notes.push({ vol: v.name, path: f.path, size: f.size });
+    }
+  }
+  notes.sort((a, b) => (a.vol + "/" + a.path).localeCompare(b.vol + "/" + b.path));
+  renderNoteList();
+}
+
+function setState(s) {
+  editState = s;
+  const el = document.getElementById("edState");
+  if (el) {
+    const map = { saved: ["saved", "ok"], dirty: ["unsaved changes", "warn"], synced: ["synced ✓", "ok"] };
+    const [txt, cls] = map[s] || ["", ""];
+    el.textContent = txt; el.className = "ed-state " + cls;
+  }
+  const save = document.getElementById("saveBtn");
+  if (save) save.disabled = s !== "dirty";
+}
+
+function updateCounts() {
+  const ed = document.getElementById("editor"), el = document.getElementById("counts");
+  if (!ed || !el) return;
+  if (ed.disabled) { el.textContent = ""; return; }
+  const bytes = new TextEncoder().encode(ed.value).length;
+  const lines = ed.value === "" ? 0 : ed.value.split("\n").length;
+  el.textContent = `${lines} line${lines === 1 ? "" : "s"} · ${fmt(bytes)}`;
+}
+
+function showEditor() {
+  previewing = false;
+  const ed = document.getElementById("editor"), pv = document.getElementById("preview"), btn = document.getElementById("previewBtn");
+  if (ed) ed.style.display = "";
+  if (pv) pv.style.display = "none";
+  if (btn) btn.textContent = "Preview";
+}
+
+function enableActions(on) {
+  ["previewBtn", "deleteBtn"].forEach((id) => { const b = document.getElementById(id); if (b) b.disabled = !on; });
+  disarmDelete();
+}
+
+function clearEditor() {
+  current = null; savedContent = "";
+  const ed = document.getElementById("editor");
+  if (ed) { ed.value = ""; ed.disabled = true; ed.style.display = ""; }
+  const pv = document.getElementById("preview"); if (pv) pv.style.display = "none";
+  previewing = false;
+  const t = document.getElementById("edTitle"); if (t) t.textContent = "select a note";
+  ["saveBtn", "previewBtn", "deleteBtn"].forEach((id) => { const b = document.getElementById(id); if (b) b.disabled = true; });
+  setState(""); updateCounts(); renderNoteList();
+}
+
+async function openNote(vol, path) {
+  if (editState === "dirty" && !confirm("Discard unsaved changes to the current note?")) return;
+  const r = await fetch(`./f/${encodeURIComponent(vol)}/${path.split("/").map(encodeURIComponent).join("/")}`);
+  const text = r.ok ? await r.text() : "";
+  current = { vol, path, isNew: false };
+  savedContent = text;
+  const ed = document.getElementById("editor");
+  ed.value = text; ed.disabled = false;
+  document.getElementById("edTitle").textContent = `${vol}/${path}`;
+  showEditor(); enableActions(true); setState("saved"); updateCounts(); renderNoteList();
+  if (!r.ok) setState("dirty"); // could not load - treat as unsaved so Save is offered
+}
+
+function newNote() {
+  const vols = unlockedVols();
+  if (!vols.length) return;
+  const vol = vols[0].name;
+  let name = prompt("New note name:", `note-${notes.length + 1}.md`);
+  if (name === null) return;
+  name = name.trim();
+  if (!name) name = `note-${notes.length + 1}.md`;
+  if (name.startsWith("/") || /(^|\/)\.\.?(\/|$)/.test(name)) return alert("invalid note name (no leading slash, no \"..\")");
+  current = { vol, path: name, isNew: true };
+  savedContent = null;
+  const ed = document.getElementById("editor");
+  ed.value = ""; ed.disabled = false; ed.focus();
+  document.getElementById("edTitle").textContent = `${vol}/${name}  · new`;
+  showEditor(); enableActions(true); setState("dirty"); updateCounts(); renderNoteList();
+}
+
+async function saveNote() {
+  if (!current) return;
+  const ed = document.getElementById("editor");
+  const content = ed.value;
+  const btn = document.getElementById("saveBtn");
+  btn.disabled = true;
+  try {
+    await api("write", { vol: current.vol, path: current.path, content });
+    savedContent = content;
+    current.isNew = false;
+    document.getElementById("edTitle").textContent = `${current.vol}/${current.path}`;
+    setState("saved");
+    await refreshNotes(); renderVolBar();
+  } catch (e) {
+    alert(`save failed: ${e.message || e}`);
+    setState("dirty");
+  }
+}
+
+function disarmDelete() {
+  clearTimeout(delTimer); delArmed = false;
+  const btn = document.getElementById("deleteBtn");
+  if (btn) { btn.textContent = "Delete"; btn.classList.remove("armed"); }
+}
+
+async function deleteNote() {
+  if (!current) return;
+  const btn = document.getElementById("deleteBtn");
+  if (!delArmed) {                 // first click: arm for 3s (the suite's double-click pattern)
+    delArmed = true;
+    btn.textContent = "Confirm delete";
+    btn.classList.add("armed");
+    delTimer = setTimeout(disarmDelete, 3000);
+    return;
+  }
+  disarmDelete();
+  const { vol, path, isNew } = current;
+  if (isNew) { clearEditor(); return; }   // never persisted - just drop it
+  try { await api("delete", { vol, path }); }
+  catch (e) { return alert(`delete failed: ${e.message || e}`); }
+  clearEditor(); await refreshNotes(); renderVolBar();
+}
+
+function togglePreview() {
+  const ed = document.getElementById("editor"), pv = document.getElementById("preview"), btn = document.getElementById("previewBtn");
+  if (!ed) return;
+  previewing = !previewing;
+  if (previewing) { pv.innerHTML = mdRender(ed.value); pv.style.display = ""; ed.style.display = "none"; btn.textContent = "Edit"; }
+  else { pv.style.display = "none"; ed.style.display = ""; btn.textContent = "Preview"; }
+}
+
+function onEditorInput() {
+  updateCounts();
+  if (previewing) document.getElementById("preview").innerHTML = mdRender(document.getElementById("editor").value);
+  if (!current) return;
+  const ed = document.getElementById("editor");
+  if (current.isNew || savedContent === null) setState("dirty");
+  else setState(ed.value === savedContent ? "saved" : "dirty");
+}
+
+async function syncVol(name) {
+  try {
+    await api("sync", { name });
+    if (current && current.vol === name && editState !== "dirty") setState("synced");
+  } catch (e) { alert(`sync failed: ${e.message || e}`); }
+  refresh();
+}
+
+async function lockVol(name) {
+  if (!confirm(`Lock ${name}? The decrypted notes are wiped from the enclave (the ciphertext in your bucket is untouched).`)) return;
+  try { await api("lock", { name }); } catch (e) { return alert(`lock failed: ${e.message || e}`); }
+  if (current && current.vol === name) clearEditor();
+  refresh();
+}
+
+// ==========================================================================
+// top-level refresh: switch between locked cards and the notebook.
+// ==========================================================================
+function renderLocked(errMsg) {
+  const app = document.getElementById("app");
+  if (!lastVols.length) {
+    app.innerHTML = errMsg
+      ? `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(errMsg)}</div></div>`
+      : '<div class="card"><span class="empty">No encrypted volumes configured. Add an <b>encVolumes</b> entry to the App Config.</span></div>';
+    return;
+  }
+  app.innerHTML = `<div class="lock-hd">Unlock to open your notebook</div>` + lastVols.map(volCard).join("");
+}
+
+async function refresh() {
+  let status;
+  try {
+    status = await api("status");
+  } catch (e) {
+    // status failing does NOT mean no volumes: /ls is served from the app's own
+    // preopens, so it distinguishes "manager unreachable" from "none configured".
+    inNotebook = false;
+    let names = [];
+    try { names = Object.keys((await fetch("./ls").then((r) => r.json())).volumes || {}); } catch {}
+    const app = document.getElementById("app");
+    app.innerHTML = names.length
+      ? `<div class="card"><span class="empty">Volume(s) ${names.map((n) => "<b>/enc/" + esc(n) + "</b>").join(", ")} exist on this deployment,
+           but the in-enclave manager is not answering - status unknown, retrying…</span>
+         <div class="err">${esc(String(e.message || e))}</div></div>`
+      : `<div class="card"><span class="empty">No encrypted volumes on this deployment.</span><div class="err">${esc(String(e.message || e))}</div></div>`;
+    clearTimeout(timer); timer = setTimeout(refresh, 5000);
+    return;
+  }
+  lastVols = status.volumes || [];
+  const unlocked = unlockedVols();
+  if (unlocked.length) {
+    if (!inNotebook) { renderNotebookShell(); inNotebook = true; clearEditor(); }
+    if (current && !unlocked.some((v) => v.name === current.vol)) clearEditor();
+    await refreshNotes();
+    renderVolBar();
+  } else {
+    inNotebook = false;
+    renderLocked();
+  }
+  if (lastVols.some((v) => v.status === "syncing" || v.status === "pushing")) {
+    clearTimeout(timer); timer = setTimeout(refresh, 1500);
+  }
+}
+
+// ==========================================================================
+// event wiring - one delegated listener set on the stable #app element.
+// ==========================================================================
+const appEl = document.getElementById("app");
+
+appEl.addEventListener("input", (e) => { if (e.target.id === "editor") onEditorInput(); });
+
+// password unlock (locked view)
+appEl.addEventListener("submit", async (e) => {
+  const f = e.target.closest("form.unlock");
+  if (!f) return;
+  e.preventDefault();
+  const pw = f.querySelector("[name=password]")?.value;
+  if (!pw) return alert("enter the crypt password (or use the wallet button)");
+  const body = { name: f.dataset.vol, password: pw, ...s3CredsFrom(f) };
+  const salt = f.querySelector("[name=salt]")?.value;
+  if (salt) body.salt = salt;
+  const btn = f.querySelector("button[type=submit]");
+  if (btn) btn.disabled = true;
+  try { await api("unlock", body); } catch (err) { alert(`unlock failed: ${err.message || err}`); }
+  refresh();
+});
+
+appEl.addEventListener("click", async (e) => {
+  // ---- notebook ----
+  const item = e.target.closest(".note-item");
+  if (item) { const n = notes[+item.dataset.i]; if (n) openNote(n.vol, n.path); return; }
+  const va = e.target.closest("#volBar button[data-act]");
+  if (va) { return va.dataset.act === "sync" ? syncVol(va.dataset.vol) : lockVol(va.dataset.vol); }
+  if (e.target.closest("#newNote")) return newNote();
+  if (e.target.closest("#saveBtn")) return saveNote();
+  if (e.target.closest("#previewBtn")) return togglePreview();
+  if (e.target.closest("#deleteBtn")) return deleteNote();
+
+  // ---- locked view: wallet unlock ----
+  const w = e.target.closest("button[data-wallet]");
+  if (w) {
+    const f = w.closest("form.unlock");
+    w.disabled = true;
+    try {
+      const d = await walletDerive(f.dataset.keyid);
+      // credentials: anything typed in the form wins; otherwise the sealed
+      // envelope from the App Config opens under the same signature.
+      let creds = s3CredsFrom(f);
+      const v = lastVols.find((x) => x.name === f.dataset.vol);
+      if (v?.credsEnvelope && !creds.accessKeyId) {
+        creds = { ...(await openCredsEnvelope(d.sig, v.credsEnvelope)), ...creds };
+      }
+      await api("unlock", { name: f.dataset.vol, password: d.password, salt: d.salt, ...creds });
+    } catch (err) {
+      alert(`wallet unlock failed: ${err.message || err}`);
+    }
+    return refresh();
+  }
+
+  // ---- locked view: derive push credentials ----
+  const r = e.target.closest("a[data-reveal]");
+  if (r) {
+    e.preventDefault();
+    const name = r.dataset.reveal;
+    const v = lastVols.find((x) => x.name === name);
+    const panel = document.getElementById(`reveal-${name}`);
+    try {
+      const d = await walletDerive(v.keyId || v.name);
+      sealSigs[name] = d.sig;
+      const pushCmd = `ENCVOL_WALLET_SIG=${d.sig} scripts/enclave-encvol.sh push ./your-dir \\\n  --endpoint ${v.endpoint} --bucket ${v.bucket}${v.path ? ` --path ${v.path}` : ""} --name ${v.name}`;
+      panel.style.display = "";
+      panel.innerHTML =
+        `<span class="k">These credentials decrypt this volume - treat them like the data itself. Derived locally for ${esc(d.account)}; nothing was sent anywhere.</span>` +
+        `<div style="margin-top:8px"><span class="k">signature (feeds enclave-encvol.sh --sig / ENCVOL_WALLET_SIG)</span><code>${esc(d.sig)}</code>` +
+        `<span class="k">derived password (ENCVOL_PASSWORD)</span><code>${esc(d.password)}</code>` +
+        `<span class="k">derived salt (ENCVOL_SALT)</span><code>${esc(d.salt)}</code>` +
+        `<span class="k">seed the bucket with</span><code>${esc(pushCmd)}</code></div>` +
+        `<div style="margin-top:8px"><span class="k">seal S3 credentials into the App Config - future wallet unlocks then need no typing.
+          The sealed value is safe to publish: it only opens under this wallet's signature.</span>
+          <div class="row">
+            <input data-seal-ak="${esc(name)}" placeholder="access key id" autocomplete="off" style="max-width:200px">
+            <input data-seal-sk="${esc(name)}" type="password" placeholder="secret access key" autocomplete="off" style="max-width:220px">
+            <button type="button" class="ghost" data-seal="${esc(name)}">Seal</button>
+          </div>
+          <div data-seal-out="${esc(name)}"></div></div>`;
+    } catch (err) {
+      alert(`derive failed: ${err.message || err}`);
+    }
+    return;
+  }
+
+  // ---- locked view: seal credentials ----
+  const s = e.target.closest("button[data-seal]");
+  if (s) {
+    const name = s.dataset.seal, panel = document.getElementById(`reveal-${name}`);
+    const ak = panel.querySelector(`[data-seal-ak]`)?.value.trim();
+    const sk = panel.querySelector(`[data-seal-sk]`)?.value.trim();
+    if (!ak || !sk) return alert("enter the access key id and secret access key to seal");
+    try {
+      const envlp = await sealCredsEnvelope(sealSigs[name], { accessKeyId: ak, secretAccessKey: sk });
+      panel.querySelector(`[data-seal-out="${name}"]`).innerHTML =
+        `<span class="k">add to this volume's encVolumes entry (next publish):</span><code>"credsEnvelope": "${esc(envlp)}"</code>`;
+    } catch (err) {
+      alert(`seal failed: ${err.message || err}`);
+    }
+    return;
+  }
+});
+
+refresh();
+</script>
+</body>
+</html>

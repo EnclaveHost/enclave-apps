@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>hook bin — see exactly what they sent</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #4cc9e8; --accent-hi: #7adcf5;
+    --amber: #e8a34c; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 760px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  textarea {
+    width: 100%; min-height: 90px; resize: vertical; margin-top: 12px;
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 12px 14px; font: 14px/1.55 var(--mono); outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  input.cfg {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono); outline: none;
+  }
+  input.cfg:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #0a161c; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.danger { background: var(--red); color: #fff; }
+  button.mini { padding: 5px 12px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 12px; }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  .fold { margin-top: 16px; }
+  .fold summary { color: var(--faint); font-size: 12px; cursor: pointer; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.live { background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  .binrow { display: flex; gap: 12px; align-items: center; padding: 9px 2px; border-top: 1px solid var(--edge); }
+  .binrow:first-child { border-top: 0; }
+  .binrow a { color: var(--accent-hi); text-decoration: none; font-size: 13.5px; overflow-wrap: anywhere; }
+  .binrow a:hover { text-decoration: underline; }
+
+  .req { border: 1px solid var(--edge); border-radius: 8px; margin-top: 10px; background: #0d1119; overflow: hidden; }
+  .rhead { display: flex; gap: 10px; align-items: baseline; padding: 9px 12px; cursor: pointer; }
+  .rhead:hover { background: #121727; }
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 5px;
+    letter-spacing: .05em; flex: none; border: 1px solid var(--faint); color: var(--faint);
+  }
+  .m-get { border-color: var(--green); color: var(--green); }
+  .m-post { border-color: var(--accent); color: var(--accent); }
+  .m-put { border-color: var(--amber); color: var(--amber); }
+  .m-delete { border-color: var(--red); color: var(--red); }
+  .rtarget { flex: 1; color: var(--ink); font-size: 13px; overflow-wrap: anywhere; min-width: 8ch; }
+  .rmeta { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
+  .rdetail { border-top: 1px solid var(--edge); padding: 12px 14px; }
+  table.hdrs { border-collapse: collapse; font-size: 12px; width: 100%; }
+  table.hdrs td { padding: 1px 10px 1px 0; vertical-align: top; overflow-wrap: anywhere; }
+  table.hdrs td.k { color: var(--accent); }
+  table.hdrs td.v { color: var(--dim); }
+  pre.payload {
+    background: #0b0f16; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; white-space: pre-wrap; word-break: break-word;
+    font: 12.5px/1.5 var(--mono); color: var(--ink); margin: 10px 0 0; max-height: 45vh; overflow: auto;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ hook <b>bin</b> ]</div>
+    <div class="tag">see exactly what they sent · payloads stay sealed in an attested enclave</div>
+  </header>
+
+  <!-- LANDING -->
+  <section id="landing" class="card hidden">
+    <h2>A BIN FOR YOUR WEBHOOKS</h2>
+    <p class="sub">create a capture URL, point any webhook or HTTP client at it, and watch every
+    request arrive — live, in full, and nowhere else.</p>
+    <div class="row">
+      <button id="newbin">new bin →</button>
+    </div>
+    <div class="err" id="lerr"></div>
+    <ul class="how">
+      <li>every request to the capture URL is held for inspection: method, target, headers, body — byte for byte</li>
+      <li>webhook payloads carry secrets — Stripe events, tokens, PII. public request bins can read them all; this one runs in a hardware-attested TEE, so the operator can't peek</li>
+      <li>captures live in enclave RAM only — never a disk, gone on delete or after 24h idle</li>
+      <li>each bin answers its callers with a status, content-type and body you configure</li>
+    </ul>
+  </section>
+
+  <!-- YOUR BINS -->
+  <section id="mybins" class="card hidden">
+    <h2>YOUR BINS</h2>
+    <p class="sub">remembered by this browser only — the server has no idea whose bin is whose.</p>
+    <div id="binrows" style="margin-top:10px"></div>
+  </section>
+
+  <!-- INSPECTOR: capture URL + response config -->
+  <section id="urlcard" class="card hidden">
+    <h2>CAPTURE URL</h2>
+    <div class="linkbox"><input id="capurl" readonly><button id="copyurl">copy</button></div>
+    <div class="row">
+      <span class="dot" id="livedot"></span><span class="sub" id="livemsg">connecting…</span>
+      <span class="spacer"></span>
+      <button id="clearbtn" class="ghost mini">clear captures</button>
+      <button id="delbtn" class="danger mini">delete bin</button>
+    </div>
+    <details class="fold">
+      <summary>response sent to callers — status · content-type · body</summary>
+      <div class="row">
+        <label>status <input id="rstatus" class="cfg" size="4" maxlength="3"></label>
+        <label>content-type <input id="rct" class="cfg" size="24" maxlength="100"></label>
+        <span class="spacer"></span>
+        <button id="rsave" class="mini">save</button>
+      </div>
+      <textarea id="rbody" maxlength="8192" spellcheck="false"></textarea>
+      <div class="err" id="rerr"></div>
+    </details>
+    <div class="err" id="ierr"></div>
+  </section>
+
+  <!-- INSPECTOR: request list -->
+  <section id="reqcard" class="card hidden">
+    <h2>REQUESTS <span class="sub" id="reqcount"></span></h2>
+    <div id="empty">
+      <p class="sub">waiting for the first request… point a webhook at the URL above. try:</p>
+      <div class="linkbox"><input id="trycurl" readonly><button id="copytry">copy</button></div>
+    </div>
+    <div id="reqlist"></div>
+  </section>
+
+  <!-- NOT FOUND -->
+  <section id="notfound" class="card hidden">
+    <h2>BIN NOT FOUND</h2>
+    <p class="sub">no bin answers to <b id="nftoken"></b> — it expired, was deleted, or never existed.
+    bins are client-named, so you can claim this token right here.</p>
+    <div class="row" style="margin-top:18px">
+      <button id="createthis">create it →</button>
+      <button id="gohome" class="ghost">back</button>
+    </div>
+    <div class="err" id="nferr"></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  captures live in enclave RAM only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave before pointing anything sensitive at it.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const dec = new TextDecoder();
+const DOM_CAP = 200;
+
+// standard base64 (the server pads, atob expects that)
+const unb64 = (s) => {
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (...ids) => {
+  for (const s of ["landing", "mybins", "urlcard", "reqcard", "notfound"]) $(s).classList.add("hidden");
+  for (const id of ids) $(id).classList.remove("hidden");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+// window.confirm is blocked in some contexts; arm on first click instead.
+const armBtn = (btn, fn) => {
+  let armed = 0;
+  btn.dataset.orig = btn.textContent;
+  btn.addEventListener("click", () => {
+    if (Date.now() - armed < 3000) {
+      armed = 0;
+      btn.textContent = btn.dataset.orig;
+      fn();
+    } else {
+      armed = Date.now();
+      btn.textContent = "sure? click again";
+      setTimeout(() => {
+        if (armed && Date.now() - armed >= 3000) { armed = 0; btn.textContent = btn.dataset.orig; }
+      }, 3200);
+    }
+  });
+};
+
+// ---- bins this browser has touched (the server keeps no such mapping) ------
+const loadBins = () => { try { return JSON.parse(localStorage.getItem("hookbin.bins")) || []; } catch { return []; } };
+const saveBins = (l) => { try { localStorage.setItem("hookbin.bins", JSON.stringify(l)); } catch {} };
+const rememberBin = (t) => { const l = loadBins(); if (!l.some(b => b.t === t)) { l.unshift({ t, c: Date.now(), n: 0 }); saveBins(l); } };
+const noteCount = (t, n) => { const l = loadBins(); const b = l.find(x => x.t === t); if (b && b.n !== n) { b.n = n; saveBins(l); } };
+const forgetBin = (t) => saveBins(loadBins().filter(b => b.t !== t));
+
+const newToken = () => {
+  const cs = "abcdefghijklmnopqrstuvwxyz0123456789";
+  return [...crypto.getRandomValues(new Uint8Array(16))].map(b => cs[b % 36]).join("");
+};
+
+// ---- formatting -------------------------------------------------------------
+const fmtRel = (ts) => {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  return s < 5 ? "just now" : s < 60 ? s + "s ago"
+    : s < 3600 ? Math.floor(s / 60) + "m ago"
+    : s < 86400 ? Math.floor(s / 3600) + "h ago" : Math.floor(s / 86400) + "d ago";
+};
+const fmtSize = (n) => n < 1024 ? n + " B" : (n / 1024).toFixed(1) + " KiB";
+const hdrOf = (c, name) => { const h = c.headers.find(([k]) => k === name); return h ? h[1] : ""; };
+
+const sq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+const toCurl = (c) => {
+  let cmd = "curl -X " + c.method + " " + sq(location.origin + c.target);
+  for (const [k, v] of c.headers) {
+    if (k === "host" || k === "content-length") continue;
+    cmd += " -H " + sq(k + ": " + v);
+  }
+  const bytes = unb64(c.body_b64);
+  if (c.method !== "GET" && bytes.length) cmd += " --data-raw " + sq(dec.decode(bytes));
+  return cmd;
+};
+
+const hexdump = (bytes) => {
+  const lines = [];
+  for (let o = 0; o < bytes.length; o += 16) {
+    const row = [...bytes.slice(o, o + 16)];
+    lines.push(
+      o.toString(16).padStart(4, "0") + "  " +
+      row.map(b => b.toString(16).padStart(2, "0")).join(" ").padEnd(47) + "  " +
+      row.map(b => (b >= 32 && b < 127 ? String.fromCharCode(b) : "·")).join("")
+    );
+  }
+  return lines.join("\n");
+};
+
+// ---- request rows (captures are hostile input: textContent only) -----------
+const buildDetail = (c) => {
+  const d = document.createElement("div");
+  d.className = "rdetail";
+  const tbl = document.createElement("table");
+  tbl.className = "hdrs";
+  for (const [k, v] of c.headers) {
+    const tr = tbl.insertRow();
+    const tk = tr.insertCell(); tk.className = "k"; tk.textContent = k + ":";
+    const tv = tr.insertCell(); tv.className = "v"; tv.textContent = v;
+  }
+  d.appendChild(tbl);
+  const bytes = unb64(c.body_b64);
+  if (c.truncated) {
+    const n = document.createElement("div");
+    n.className = "note";
+    n.textContent = "body truncated — showing the first " + bytes.length + " of " + c.len + " bytes";
+    d.appendChild(n);
+  }
+  const pre = document.createElement("pre");
+  pre.className = "payload";
+  if (!bytes.length) {
+    pre.textContent = "(empty body)";
+  } else if (bytes.some(b => b < 9)) {
+    pre.textContent = "binary — " + c.len + " bytes\n\n" + hexdump(bytes.slice(0, 256));
+  } else {
+    let text = dec.decode(bytes);
+    const t0 = text.trim();
+    if (/json/i.test(hdrOf(c, "content-type")) || t0.startsWith("{") || t0.startsWith("[")) {
+      try { text = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    }
+    pre.textContent = text;
+  }
+  d.appendChild(pre);
+  const row = document.createElement("div");
+  row.className = "row";
+  const cb = document.createElement("button");
+  cb.className = "ghost mini";
+  cb.textContent = "copy as curl";
+  copyBtn(cb, () => toCurl(c));
+  row.appendChild(cb);
+  d.appendChild(row);
+  return d;
+};
+
+const buildRow = (c) => {
+  const el = document.createElement("div");
+  el.className = "req";
+  const head = document.createElement("div");
+  head.className = "rhead";
+  const badge = document.createElement("span");
+  const m = c.method.toLowerCase();
+  badge.className = "badge" + (["get", "post", "put", "delete"].includes(m) ? " m-" + m : "");
+  badge.textContent = c.method;
+  const target = document.createElement("span");
+  target.className = "rtarget";
+  target.textContent = c.target;
+  const meta = document.createElement("span");
+  meta.className = "rmeta";
+  const rel = document.createElement("span");
+  rel.className = "rel";
+  rel.dataset.ts = c.ts;
+  rel.textContent = fmtRel(c.ts);
+  meta.appendChild(rel);
+  meta.appendChild(document.createTextNode(" · " + fmtSize(c.len)));
+  head.append(badge, target, meta);
+  el.appendChild(head);
+  let detail = null; // built lazily on first expand
+  head.addEventListener("click", () => {
+    if (!detail) { detail = buildDetail(c); el.appendChild(detail); }
+    else detail.classList.toggle("hidden");
+  });
+  return el;
+};
+
+// ---- inspector ---------------------------------------------------------------
+let token = null, es = null, count = 0;
+
+const setCount = (n) => {
+  count = n;
+  $("reqcount").textContent = n ? "· " + n + " captured" : "";
+  $("empty").classList.toggle("hidden", n > 0);
+  if (token) noteCount(token, n);
+};
+
+const addCapture = (c) => {
+  const list = $("reqlist");
+  list.prepend(buildRow(c));
+  while (list.children.length > DOM_CAP) list.lastChild.remove();
+  setCount(count + 1);
+};
+
+function openStream(t) {
+  if (es) es.close();
+  es = new EventSource("/api/stream/" + t);
+  es.onopen = () => { $("livedot").classList.add("live"); $("livemsg").textContent = "live — captures stream in as they land"; };
+  es.onerror = () => { $("livedot").classList.remove("live"); $("livemsg").textContent = "reconnecting…"; };
+  es.addEventListener("req", (e) => {
+    try { addCapture(JSON.parse(e.data)); } catch {}
+  });
+}
+
+async function initInspector(t) {
+  token = t;
+  show("urlcard", "reqcard");
+  const url = location.origin + "/b/" + t;
+  $("capurl").value = url;
+  $("trycurl").value = "curl -X POST " + url + " -d '{\"hello\":\"enclave\"}'";
+  $("reqlist").textContent = "";
+  $("ierr").textContent = "";
+  setCount(0);
+  // the bin's reply defaults, mirrored client-side (there is no GET for them)
+  $("rstatus").value = "200";
+  $("rct").value = "application/json";
+  $("rbody").value = "{\"ok\":true}\n";
+  const res = await api("/api/bins/" + t + "/requests");
+  if (res.status === 404) { initNotFound(t); return; }
+  if (!res.ok || !Array.isArray(res.j)) { $("ierr").textContent = "server said " + res.status; return; }
+  rememberBin(t);
+  for (const c of res.j) $("reqlist").prepend(buildRow(c)); // list is oldest first
+  setCount(res.j.length);
+  openStream(t);
+}
+
+copyBtn($("copyurl"), () => $("capurl").value);
+copyBtn($("copytry"), () => $("trycurl").value);
+
+armBtn($("clearbtn"), async () => {
+  const res = await api("/api/bins/" + token + "/clear", { method: "POST" });
+  if (res.ok) { $("reqlist").textContent = ""; setCount(0); }
+  else $("ierr").textContent = "clear failed (" + res.status + ")";
+});
+armBtn($("delbtn"), async () => {
+  const res = await api("/api/bins/" + token, { method: "DELETE" });
+  if (res.ok) { forgetBin(token); navigate("/"); }
+  else $("ierr").textContent = "delete failed (" + res.status + ")";
+});
+
+$("rsave").addEventListener("click", async () => {
+  $("rerr").textContent = "";
+  const res = await api("/api/bins/" + token + "/response", {
+    method: "POST",
+    headers: {
+      "x-status": $("rstatus").value.trim(),
+      "x-ct": $("rct").value.trim(),
+      "content-type": "application/octet-stream",
+    },
+    body: $("rbody").value,
+  });
+  if (res.ok) { $("rsave").textContent = "saved ✓"; setTimeout(() => ($("rsave").textContent = "save"), 1500); }
+  else $("rerr").textContent = (res.j && res.j.error) || "server said " + res.status;
+});
+
+// ---- not found (a shared inspector link can claim its own token) ------------
+function initNotFound(t) {
+  show("notfound");
+  $("nftoken").textContent = t;
+  $("nferr").textContent = "";
+}
+$("createthis").addEventListener("click", async () => {
+  $("nferr").textContent = "";
+  const res = await api("/api/bins", { method: "POST", headers: { "x-bin-id": token } });
+  if (res.ok) { rememberBin(token); initInspector(token); }
+  else $("nferr").textContent = (res.j && res.j.error) || "server said " + res.status;
+});
+$("gohome").addEventListener("click", () => navigate("/"));
+
+// ---- landing ------------------------------------------------------------------
+$("newbin").addEventListener("click", async () => {
+  $("lerr").textContent = "";
+  $("newbin").disabled = true;
+  try {
+    const t = newToken();
+    const res = await api("/api/bins", { method: "POST", headers: { "x-bin-id": t } });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    rememberBin(t);
+    navigate("/i/" + t);
+  } catch (e) {
+    $("lerr").textContent = "" + (e.message || e);
+  } finally {
+    $("newbin").disabled = false;
+  }
+});
+
+function renderBinRows() {
+  const wrap = $("binrows");
+  wrap.textContent = "";
+  const bins = loadBins();
+  $("mybins").classList.toggle("hidden", !bins.length);
+  for (const b of bins) {
+    const row = document.createElement("div");
+    row.className = "binrow";
+    const a = document.createElement("a");
+    a.href = "/i/" + b.t;
+    a.textContent = b.t;
+    a.addEventListener("click", (e) => { e.preventDefault(); navigate("/i/" + b.t); });
+    const sp = document.createElement("span");
+    sp.className = "spacer";
+    const meta = document.createElement("span");
+    meta.className = "sub";
+    meta.style.whiteSpace = "nowrap";
+    meta.textContent = new Date(b.c).toLocaleDateString() + " · " + (b.n || 0) + " captured";
+    const rm = document.createElement("button");
+    rm.className = "ghost mini";
+    rm.textContent = "forget";
+    rm.addEventListener("click", () => { forgetBin(b.t); renderBinRows(); });
+    row.append(a, sp, meta, rm);
+    wrap.appendChild(row);
+  }
+}
+
+function initLanding() {
+  token = null;
+  show("landing", "mybins");
+  renderBinRows();
+  loadStats();
+}
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "currently holding " + r.j.bins + " bin" + (r.j.bins === 1 ? "" : "s") +
+      " · " + r.j.captures + " captures in RAM · " + r.j.lifetime + " ever inspected";
+  } catch {}
+}
+
+// ---- router (pathname, not hash: /i/<token> must survive a hard reload) -----
+function navigate(path) {
+  history.pushState({}, "", path);
+  render();
+}
+function render() {
+  if (es) { es.close(); es = null; }
+  $("livedot").classList.remove("live");
+  $("livemsg").textContent = "connecting…";
+  $("stat").textContent = "";
+  const m = location.pathname.match(/^\/i\/([a-z0-9][a-z0-9-]{7,31})$/);
+  if (m) initInspector(m[1]);
+  else initLanding();
+}
+window.addEventListener("popstate", render);
+setInterval(() => {
+  for (const el of document.querySelectorAll(".rel")) el.textContent = fmtRel(+el.dataset.ts);
+}, 5000);
+render();
+</script>
+</body>
+</html>
