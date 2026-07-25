@@ -109,6 +109,28 @@
    "max_new_cap": 81920,
    "rep_penalty": 1,
    "rep_window": 64
+  },
+  "qwen3.6-27b-mtp-gguf": {
+   "name": "qwen3.6-27b-mtp",
+   "backend": "ggml",
+   "n_layers": 64,
+   "n_kv_heads": 4,
+   "head_dim": 256,
+   "kv_layers": 17,
+   "vocab": 248320,
+   "eos": [
+    248046,
+    248044
+   ],
+   "template": "chatml",
+   "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
+   "max_prompt_tokens": 98304,
+   "default_max_new": 32768,
+   "max_new_cap": 81920,
+   "rep_penalty": 1,
+   "rep_window": 64,
+   "draft": "mtp",
+   "draft_tokens": 6
   }
  }
 }
