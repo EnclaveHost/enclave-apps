@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#a78bfa" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#a78bfa" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- ballot box with one ballot mid-drop -->
+  <g>
+    <rect x="1240" y="190" width="280" height="150" rx="16" fill="#a78bfa"/>
+    <rect x="1282" y="170" width="196" height="26" rx="8" fill="#a78bfa"/>
+    <rect x="1326" y="196" width="108" height="24" rx="12" fill="#0b0e14"/>
+    <rect x="1340" y="60" width="80" height="110" rx="8" fill="#c4b1ff" transform="rotate(8 1380 115)"/>
+  </g>
+  <text x="1255" y="150" font-size="30" fill="#5a6375">?   ?   ?</text>
+  <text x="96" y="180" font-size="84" fill="#a78bfa">[ ballot <tspan fill="#d7dde8" font-weight="bold">box</tspan> ]</text>
+  <text x="100" y="252" font-size="30" fill="#8a94a6">anonymous polls, sealed until you close them</text>
+  <text x="100" y="310" font-size="24" fill="#5a6375">no mid-vote peeking — not even by you</text>
+  <text x="100" y="348" font-size="24" fill="#5a6375">ballots are hashes of random browser tokens</text>
+</svg>

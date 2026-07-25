@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- Image Generator: a camera for pictures that never leave the enclave. -->
+  <defs>
+    <radialGradient id="glass" cx="36%" cy="30%" r="80%">
+      <stop offset="0%" stop-color="#a9bef2"/>
+      <stop offset="45%" stop-color="#6b74b8"/>
+      <stop offset="100%" stop-color="#454a72"/>
+    </radialGradient>
+  </defs>
+  <!-- camera: hump, body, lens -->
+  <rect x="38" y="27" width="20" height="12" rx="3" fill="#f2f4f8"/>
+  <rect x="20" y="33" width="56" height="38" rx="6" fill="#f2f4f8"/>
+  <circle cx="48" cy="52" r="17" fill="#232735"/>
+  <circle cx="48" cy="52" r="12.5" fill="url(#glass)"/>
+  <circle cx="43.5" cy="47.5" r="2.4" fill="#dfe8fb"/>
+</svg>

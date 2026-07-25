@@ -1,0 +1,92 @@
+Enclave Source-Available License v1.0
+
+Copyright (c) 2026 Enclave Host, Inc. All rights reserved.
+
+This is commercial, proprietary software. Its source code is published so
+that anyone can verify what these apps actually run: the platform's chain of
+trust lets you check that an app deployed on Enclave.host was built from the
+exact commits published in this repository. Publication here is for
+transparency, audit and verification — it does not make this software open
+source, and no rights are granted except those below.
+
+1. PERMITTED USES
+
+Subject to the restrictions in section 2, you may, free of charge:
+
+  a. View, clone and fork this repository for the purpose of reading,
+     reviewing and auditing the code.
+
+  b. Build and run the software locally, in non-production settings, solely
+     to audit it, to reproduce published release artifacts and attestation
+     measurements, or to verify that a deployed instance of an app matches
+     this source.
+
+  c. Use the client-side pages and scripts these apps serve, and the code
+     samples in the documentation, to interact with instances deployed on
+     the hosted Enclave.host service.
+
+  d. Perform good-faith security research against your own local builds, and
+     publish or report your findings (responsible disclosure of
+     vulnerabilities affecting deployed instances is appreciated).
+
+2. RESTRICTIONS
+
+Except as expressly permitted in section 1, you may not:
+
+  a. Use the software, or any modified version of it, in production or for
+     any commercial purpose;
+
+  b. Offer the software, or a service substantially derived from it, to
+     third parties (as a hosted service, product, or otherwise);
+
+  c. Redistribute the software or derivative works, in source or binary
+     form, outside of verbatim forks on the hosting platform made for the
+     purposes in section 1;
+
+  d. Remove or alter copyright, license or attribution notices; or
+
+  e. Sublicense any of the rights granted here.
+
+3. THIRD-PARTY COMPONENTS
+
+This repository contains and references third-party components — including
+any bundled or vendored libraries and dependencies fetched at build time —
+which remain under their own licenses. This license applies only to the
+original Enclave code in this repository, and nothing in it limits rights
+you hold in those components under their respective licenses. To the extent
+a third-party component's license so requires (for example the LGPL),
+section 2 does not prohibit modifying that component, or reverse engineering
+the combined work to debug such modifications.
+
+4. CONTRIBUTIONS
+
+By submitting a contribution (for example, a pull request) you license it to
+the copyright holder under these terms and grant the copyright holder a
+perpetual, irrevocable, worldwide right to use, modify, relicense and
+distribute it as part of the software.
+
+5. TRADEMARKS
+
+"Enclave.host" and associated names, logos and domains are trade identifiers
+of the copyright holder. This license grants no rights to use them.
+
+6. TERMINATION
+
+Your rights under this license terminate automatically if you breach it.
+Sections 3 and 7 survive termination.
+
+7. NO WARRANTY; LIMITATION OF LIABILITY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER DEALINGS IN THE
+SOFTWARE. USE OF THE HOSTED ENCLAVE.HOST SERVICE IS GOVERNED SEPARATELY BY
+ITS TERMS OF SERVICE.
+
+8. OTHER LICENSING
+
+For any use not permitted here (including commercial licensing), contact the
+copyright holder via https://enclave.host.

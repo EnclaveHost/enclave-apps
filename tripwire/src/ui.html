@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>trip wire — canary tokens with a live alarm board</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #ff8c42; --accent-hi: #ffab73;
+    --amber: #e8a34c; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 720px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  input.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--accent); color: #1a0f06; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.small { padding: 5px 12px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .linkbox { display: flex; gap: 8px; margin-top: 10px; align-items: stretch; }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 640px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* board: reconnect dot, wire cards, trip log */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.on { animation: pulse 2s ease-in-out infinite; }
+  .dot.off { background: var(--faint); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .empty { color: var(--dim); font-size: 13px; margin-top: 14px; }
+
+  .wire {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 14px 16px; margin-top: 12px;
+  }
+  .wire.tripped { border-color: rgba(224, 94, 94, .55); }
+  .wire.flash { animation: alarm 1.4s ease-out; }
+  @keyframes alarm {
+    0% { box-shadow: 0 0 0 0 rgba(224, 94, 94, .75); border-color: var(--red); }
+    100% { box-shadow: 0 0 0 14px rgba(224, 94, 94, 0); }
+  }
+  .whead { display: flex; gap: 10px; align-items: center; }
+  .wname { color: var(--ink); font-weight: 600; word-break: break-word; }
+  .kind {
+    flex: none; font-size: 11px; padding: 1px 7px; border-radius: 5px;
+    letter-spacing: .06em; border: 1px solid var(--faint); color: var(--faint);
+  }
+  .kind.link { border-color: var(--accent); color: var(--accent); }
+  .kind.pixel { border-color: var(--green); color: var(--green); }
+  .kind.doc { border-color: var(--amber); color: var(--amber); }
+  .count { margin-left: auto; flex: none; font-size: 22px; font-weight: 600; color: var(--faint); }
+  .count.hot { color: var(--red); }
+  .countlbl { color: var(--faint); font-size: 11px; letter-spacing: .06em; flex: none; }
+  .quiet { color: var(--green); font-size: 12.5px; margin-top: 8px; opacity: .8; }
+  .hint { color: var(--faint); font-size: 12px; margin-top: 8px; word-break: break-all; }
+  .ownrow { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+
+  .trips { margin-top: 10px; border-top: 1px solid var(--edge); }
+  .trip { display: flex; gap: 9px; align-items: baseline; padding: 7px 0 6px; border-bottom: 1px solid var(--edge); }
+  .trip:last-child { border-bottom: 0; }
+  .badge {
+    flex: none; font-size: 10.5px; font-weight: 600; padding: 0 6px; border-radius: 4px;
+    letter-spacing: .05em; border: 1px solid var(--faint); color: var(--faint);
+  }
+  .m-get { border-color: var(--green); color: var(--green); }
+  .m-post { border-color: var(--accent); color: var(--accent); }
+  .m-head { border-color: var(--amber); color: var(--amber); }
+  .tbody { flex: 1; min-width: 0; }
+  .twhen { color: var(--ink); font-size: 12px; }
+  .tua {
+    color: var(--dim); font-size: 12px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tref { color: var(--faint); font-size: 11.5px; overflow-wrap: anywhere; }
+  .more { color: var(--faint); font-size: 11.5px; padding-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ trip <b>wire</b> ]</div>
+    <div class="tag">canary tokens · an alarm the intruder can't erase</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>NEW TRIPWIRE BOARD</h2>
+    <p class="sub">plant a URL where nothing should ever touch it — a
+    <b>passwords.xlsx</b> on a share, a honeypot row in a database dump, a fake
+    AWS key in a repo. Nobody has a reason to fetch it. If anything ever does,
+    you learn the second it happened.</p>
+    <div class="row" style="margin-top:16px">
+      <button id="createbtn">new tripwire board →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>each wire is a URL only you hold — plant it, then never touch it again</li>
+      <li>a trip records <b>what and when</b>: method, target, user-agent, referer, timestamp</li>
+      <li>the log is append-only in attested RAM — an intruder who owns the host still can't delete the record of their own trip. Stopping the deployment is visible; rewriting history isn't possible.</li>
+      <li>the canary URL answers every fetch with the same dull 404, live or dead — probing it tells an intruder nothing</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>BOARD IS ARMED</h2>
+    <p class="sub">this is the board — there is no public page. anyone holding
+    this link sees your alarms and your canary URLs, so keep it as private as
+    the wires themselves:</p>
+    <div class="linkbox"><input id="ownlink" readonly><button id="copyown">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="note red">save it now. the part after <b>#</b> never reached the
+    server — nothing here can mail it back to you.</div>
+    <div class="row" style="margin-top:18px">
+      <button id="openbtn">open the board →</button>
+      <button class="ghost" onclick="location.href='/'">make another</button>
+    </div>
+  </section>
+
+  <!-- BOARD -->
+  <section id="board" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="livelabel">connecting…</span></div>
+    <h2 id="boardtag">#……</h2>
+    <p class="sub" id="boardmeta"></p>
+    <div class="row hidden" id="ackrow">
+      <button id="ackbtn" class="small">acknowledge alarms</button>
+    </div>
+    <div id="wires"></div>
+    <div class="empty hidden" id="empty"></div>
+    <div class="err" id="berr"></div>
+  </section>
+
+  <!-- PLANT (owner only, and there is no other kind of viewer) -->
+  <section id="plantcard" class="card hidden">
+    <h2>PLANT A NEW TRIPWIRE</h2>
+    <div class="row">
+      <input id="wname" class="text" maxlength="60" placeholder="where it's planted — e.g. finance share / passwords.xlsx" autocomplete="off">
+    </div>
+    <div class="row">
+      <label>kind
+        <select id="wkind">
+          <option value="link" selected>link</option>
+          <option value="pixel">pixel</option>
+          <option value="doc">doc</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="plant">plant →</button>
+    </div>
+    <p class="sub" id="kindhelp"></p>
+    <div class="err" id="perr"></div>
+    <div id="newwire" class="hidden">
+      <p class="sub" style="margin-top:16px">the canary URL — plant it and forget it:</p>
+      <div class="linkbox"><input id="newurl" readonly><button id="copynew">copy</button></div>
+      <div class="note" id="newhint"></div>
+    </div>
+  </section>
+
+  <!-- NEEDS OWNER -->
+  <section id="needsowner" class="card hidden">
+    <h2>THIS BOARD NEEDS ITS OWNER LINK.</h2>
+    <p class="sub">a tripwire board has no public view — telling the world which
+    of your wires are quiet tells an intruder where to step. the owner token
+    rides the link's <b>#</b> fragment and never reaches the server except to
+    prove ownership.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">make a board</button></div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this board never existed, or went 30 days with no trip, no
+    edit and no owner visit, and was swept. the server can't tell you which —
+    boards leave nothing behind.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">make a board</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  trip log in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> —
+  tripwire records what and when, never who: the enclave never sees the visitor's address.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const sha256hex = async (str) => {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","board","needsowner","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+  if (id !== "board") $("plantcard").classList.add("hidden");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+// window.confirm is blocked in some contexts; arm on first click instead.
+const armBtn = (btn, fn) => {
+  let armed = 0;
+  btn.dataset.orig = btn.textContent;
+  btn.addEventListener("click", () => {
+    if (Date.now() - armed < 3000) {
+      armed = 0;
+      btn.textContent = btn.dataset.orig;
+      fn();
+    } else {
+      armed = Date.now();
+      btn.textContent = "sure? click again";
+      setTimeout(() => {
+        if (armed && Date.now() - armed >= 3000) { armed = 0; btn.textContent = btn.dataset.orig; }
+      }, 3200);
+    }
+  });
+};
+
+const fmtRel = (ts) => {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  return s < 5 ? "just now" : s < 60 ? s + "s ago"
+    : s < 3600 ? Math.floor(s / 60) + "m ago"
+    : s < 86400 ? Math.floor(s / 3600) + "h ago" : Math.floor(s / 86400) + "d ago";
+};
+const fmtWhen = (ts) => new Date(ts * 1000).toLocaleString();
+const fmtDate = (ts) => new Date(ts * 1000).toLocaleDateString();
+const urlFor = (tok) => location.origin + "/t/" + tok;
+
+// What each kind is for, and what to do with the URL once you have it. The
+// server treats all three the same — only the decoy body differs.
+const KIND_HELP = {
+  link: "link — a URL you paste into a doc or config",
+  pixel: "pixel — a 1x1 image for email/HTML",
+  doc: "doc — a fake file link",
+};
+const kindHint = (kind, url) => {
+  if (kind === "pixel") return 'drop this into an HTML email or document body:\n<img src="' + url + '" width="1" height="1">';
+  if (kind === "doc") return "link it as the file itself — name the link something worth stealing (invoices-2026.xlsx, backup-keys.txt). anything that opens it trips the wire.";
+  return "paste it into the document, config or repo you're baiting. it must look worth clicking and never actually be clicked.";
+};
+$("wkind").addEventListener("change", () => { $("kindhelp").textContent = KIND_HELP[$("wkind").value]; });
+$("kindhelp").textContent = KIND_HELP.link;
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newBoardId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("createbtn").addEventListener("click", async () => {
+  $("cerr").textContent = "";
+  $("createbtn").disabled = true;
+  try {
+    const id = newBoardId();
+    const ownerToken = b64u(rand(16));
+    const res = await api("/api/boards", {
+      method: "POST",
+      headers: { "x-board-id": id, "x-owner-hash": await sha256hex(ownerToken) },
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const own = location.origin + "/b/" + id + "#o=" + ownerToken;
+    $("ownlink").value = own;
+    $("createdmeta").innerHTML = "board <b>#" + id + "</b> · up to 25 wires · 100 trips kept per wire · dies after 30 idle days";
+    $("openbtn").onclick = () => { location.href = own; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("createbtn").disabled = false;
+  }
+});
+copyBtn($("copyown"), () => $("ownlink").value);
+
+// ---- board -------------------------------------------------------------------
+let bid = null, ownerToken = null, es = null, everOpen = false;
+let wires = [];        // server objects, in board order
+let els = new Map();   // token -> DOM refs
+let unacked = 0;       // new trips since the last acknowledge; drives the title
+const BASE_TITLE = document.title;
+
+async function initBoard(id) {
+  bid = id;
+  const m = /(?:^|[#&])o=([^&]+)/.exec(location.hash.slice(1));
+  ownerToken = m ? decodeURIComponent(m[1]) : null;
+  if (!ownerToken) { show("needsowner"); return; }
+  show("board");
+  $("boardtag").textContent = "#" + bid;
+  if (!(await refetch())) return;
+  subscribe();
+  setInterval(() => {
+    for (const el of document.querySelectorAll(".rel")) el.textContent = fmtRel(+el.dataset.ts);
+  }, 5000);
+}
+
+async function refetch() {
+  const res = await api("/api/board?id=" + bid + "&owner=" + encodeURIComponent(ownerToken));
+  if (res.status === 403) { if (es) es.close(); show("needsowner"); return false; }
+  if (!res.ok) { if (es) es.close(); show("gone"); return false; }
+  wires = res.j.wires;
+  $("boardmeta").textContent = res.j.alarms_total
+    ? res.j.alarms_total + " alarm" + (res.j.alarms_total === 1 ? "" : "s") + " on this board, ever"
+    : "no wire has ever been tripped.";
+  $("plantcard").classList.remove("hidden");
+  renderAll();
+  return true;
+}
+
+// ---- wire cards (trips are hostile input: textContent only) -----------------
+function buildTrip(t) {
+  const row = document.createElement("div");
+  row.className = "trip";
+  const badge = document.createElement("span");
+  const m = t.method.toLowerCase();
+  badge.className = "badge" + (["get", "post", "head"].includes(m) ? " m-" + m : "");
+  badge.textContent = t.method;
+  const body = document.createElement("div");
+  body.className = "tbody";
+  const when = document.createElement("div");
+  when.className = "twhen";
+  when.textContent = fmtWhen(t.ts) + " · ";
+  const rel = document.createElement("span");
+  rel.className = "rel";
+  rel.dataset.ts = t.ts;
+  rel.textContent = fmtRel(t.ts);
+  when.append(rel);
+  const ua = document.createElement("div");
+  ua.className = "tua";
+  ua.textContent = t.ua || "(no user-agent)";
+  ua.title = t.ua || "(no user-agent)";
+  body.append(when, ua);
+  if (t.referer) {
+    const ref = document.createElement("div");
+    ref.className = "tref";
+    ref.textContent = "from " + t.referer;
+    body.append(ref);
+  }
+  if (t.target && t.target !== "/t/" + t.token) {
+    const tgt = document.createElement("div");
+    tgt.className = "tref";
+    tgt.textContent = t.target;
+    body.append(tgt);
+  }
+  row.append(badge, body);
+  return row;
+}
+
+function buildCard(w) {
+  const card = document.createElement("div");
+  card.className = "wire" + (w.trip_count ? " tripped" : "");
+  const head = document.createElement("div");
+  head.className = "whead";
+  const name = document.createElement("span");
+  name.className = "wname";
+  name.textContent = w.name;
+  const kind = document.createElement("span");
+  kind.className = "kind " + w.kind;
+  kind.textContent = w.kind;
+  const count = document.createElement("span");
+  count.className = "count" + (w.trip_count ? " hot" : "");
+  count.textContent = w.trip_count;
+  const lbl = document.createElement("span");
+  lbl.className = "countlbl";
+  lbl.textContent = w.trip_count === 1 ? "trip" : "trips";
+  head.append(name, kind, count, lbl);
+
+  const box = document.createElement("div");
+  box.className = "linkbox";
+  const inp = document.createElement("input");
+  inp.readOnly = true;
+  inp.value = urlFor(w.token);
+  const cp = document.createElement("button");
+  cp.textContent = "copy";
+  copyBtn(cp, () => inp.value);
+  box.append(inp, cp);
+
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.textContent = KIND_HELP[w.kind] || "";
+
+  const trips = document.createElement("div");
+  const quiet = document.createElement("div");
+  quiet.className = "quiet";
+  card.append(head, box, hint, trips, quiet);
+
+  const row = document.createElement("div");
+  row.className = "ownrow";
+  const sp = document.createElement("span");
+  sp.className = "spacer";
+  const rm = document.createElement("button");
+  rm.className = "ghost small";
+  rm.textContent = "disarm";
+  armBtn(rm, async () => {
+    $("berr").textContent = "";
+    const res = await api("/api/wires/remove", {
+      method: "POST",
+      body: "id=" + bid + "&owner=" + encodeURIComponent(ownerToken) + "&token=" + w.token,
+    });
+    if (res.ok) refetch();
+    else $("berr").textContent = (res.j && res.j.error) || ("disarm failed (" + res.status + ")");
+  });
+  row.append(sp, rm);
+  card.append(row);
+
+  const e = { card, count, lbl, trips, quiet, wire: w };
+  renderTrips(e);
+  return e;
+}
+
+// The log itself: newest first, because the one that matters is the one that
+// just landed. A wire nobody has touched says so, in green.
+function renderTrips(e) {
+  const w = e.wire;
+  e.trips.textContent = "";
+  e.trips.className = w.trips.length ? "trips" : "";
+  for (const t of w.trips) e.trips.append(buildTrip({ ...t, token: w.token }));
+  // Say plainly what the log is and isn't: a 20-deep view of a 100-deep ring,
+  // and how many trips have aged out of it entirely.
+  if (w.trip_count > w.trips.length) {
+    const aged = w.trip_count - w.kept;
+    const more = document.createElement("div");
+    more.className = "more";
+    more.textContent = "showing the newest " + w.trips.length + " of " + w.kept + " kept" +
+      (aged > 0 ? " · " + aged + " older trip" + (aged === 1 ? " has" : "s have") + " aged out of the ring" : "");
+    e.trips.append(more);
+  }
+  e.quiet.textContent = w.trip_count ? "" : "quiet since " + fmtDate(w.armed_at);
+  e.quiet.classList.toggle("hidden", !!w.trip_count);
+}
+
+function renderAll() {
+  const wrap = $("wires");
+  wrap.textContent = "";
+  els = new Map();
+  $("empty").classList.toggle("hidden", wires.length > 0);
+  if (!wires.length) {
+    $("empty").textContent = "no wires planted yet — add one below, then put its URL somewhere nobody has a reason to look.";
+  }
+  for (const w of wires) {
+    const e = buildCard(w);
+    els.set(w.token, e);
+    wrap.append(e.card);
+  }
+}
+
+// ---- alarm state -------------------------------------------------------------
+function setUnacked(n) {
+  unacked = n;
+  document.title = n ? "⚠ " + n + " alarm" + (n === 1 ? "" : "s") : BASE_TITLE;
+  $("ackrow").classList.toggle("hidden", !n);
+}
+$("ackbtn").addEventListener("click", () => setUnacked(0));
+
+function onTrip(d) {
+  const e = els.get(d.token);
+  if (!e) { refetch(); return; } // a wire this view hasn't met — resync
+  const w = e.wire;
+  w.trip_count = d.trip_count;
+  w.kept = Math.min(100, (w.kept || 0) + 1);
+  w.trips.unshift(d.trip);
+  while (w.trips.length > 20) w.trips.pop();
+  e.count.textContent = w.trip_count;
+  e.count.classList.add("hot");
+  e.lbl.textContent = w.trip_count === 1 ? "trip" : "trips";
+  e.card.classList.add("tripped");
+  renderTrips(e);
+  e.card.classList.remove("flash");
+  void e.card.offsetWidth; // restart the animation
+  e.card.classList.add("flash");
+  setTimeout(() => e.card.classList.remove("flash"), 1500);
+  setUnacked(unacked + 1);
+  const total = wires.reduce((a, x) => a + x.trip_count, 0);
+  $("boardmeta").textContent = total + " alarm" + (total === 1 ? "" : "s") + " on the wires shown";
+}
+
+// ---- plant -------------------------------------------------------------------
+$("plant").addEventListener("click", async () => {
+  const name = $("wname").value.trim();
+  $("perr").textContent = "";
+  if (!name) { $("perr").textContent = "name where this wire is planted — you'll want to know which one fired."; return; }
+  $("plant").disabled = true;
+  try {
+    const kind = $("wkind").value;
+    const token = b64u(rand(16)); // the capability is generated HERE, never by the server
+    const res = await api("/api/wires", {
+      method: "POST",
+      body: "id=" + bid + "&owner=" + encodeURIComponent(ownerToken) +
+        "&name=" + encodeURIComponent(name) + "&kind=" + kind + "&token=" + token,
+    });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    $("wname").value = "";
+    $("newurl").value = urlFor(token);
+    $("newhint").textContent = kindHint(kind, urlFor(token));
+    $("newhint").style.whiteSpace = "pre-wrap";
+    $("newwire").classList.remove("hidden");
+    await refetch();
+  } catch (e) {
+    $("perr").textContent = "" + (e.message || e);
+  } finally {
+    $("plant").disabled = false;
+  }
+});
+$("wname").addEventListener("keydown", (e) => { if (e.key === "Enter") $("plant").click(); });
+copyBtn($("copynew"), () => $("newurl").value);
+
+// ---- SSE ----------------------------------------------------------------------
+function subscribe() {
+  es = new EventSource("/api/stream?id=" + encodeURIComponent(bid) +
+    "&owner=" + encodeURIComponent(ownerToken));
+  es.onopen = () => { setLive(true); if (everOpen) refetch(); everOpen = true; };
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.addEventListener("trip", (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch { return; }
+    onTrip(d);
+  });
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("dot").classList.toggle("on", on);
+  $("livelabel").textContent = on ? "armed" : "reconnecting…";
+}
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/b/")) {
+    const m = /^\/b\/([a-z0-9]{10,16})$/.exec(location.pathname);
+    if (m) initBoard(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      r.j.boards + " board" + (r.j.boards === 1 ? "" : "s") +
+      " · " + r.j.wires + " wire" + (r.j.wires === 1 ? "" : "s") + " armed" +
+      " · " + r.j.alarms + " alarm" + (r.j.alarms === 1 ? "" : "s") + " recorded";
+  } catch {}
+}
+</script>
+</body>
+</html>

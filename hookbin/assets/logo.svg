@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- hook bin: the payload drops in, the hook holds. -->
+  <g fill="none" stroke="#4cc9e8" stroke-width="9" stroke-linecap="round">
+    <path d="M48 22 v30"/>
+    <path d="M48 52 a14 14 0 1 1 -25 -8"/>
+  </g>
+  <circle cx="48" cy="22" r="7" fill="#7adcf5"/>
+</svg>

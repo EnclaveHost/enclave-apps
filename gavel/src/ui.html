@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>gavel — sealed-bid auctions nobody can rig</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #c8cdd8; --accent-hi: #ffffff; --red: #e05e5e; --green: #6fcf8f;
+    --gold: #d8b46a;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  input.text, textarea.text {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 11px 14px; font: 14px/1.5 var(--mono); outline: none;
+  }
+  textarea.text { resize: vertical; min-height: 64px; }
+  input.text:focus, textarea.text:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  input.small {
+    width: 130px; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono); outline: none;
+  }
+  input.small:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #10141d; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.danger { background: var(--red); color: #fff; }
+  .spacer { flex: 1; }
+  .linkbox { display: flex; gap: 8px; margin-top: 10px; align-items: stretch; }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .note.green { border-color: var(--green); }
+  .note.gold { border-color: var(--gold); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+
+  /* create: mode cards */
+  .modes { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .mode {
+    flex: 1 1 230px; display: block; position: relative;
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer; color: var(--dim); font-size: 12.5px; line-height: 1.5;
+  }
+  .mode:hover { border-color: var(--faint); }
+  .mode input[type=radio] { position: absolute; opacity: 0; pointer-events: none; }
+  .mode b { display: block; color: var(--ink); letter-spacing: .05em; margin-bottom: 3px; }
+  .mode:has(input:checked) { border-color: var(--accent); }
+  .mode:has(input:checked) b { color: var(--accent-hi); }
+
+  /* the commitment, loud and quiet */
+  .commitbox {
+    margin-top: 10px; background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; color: var(--accent-hi); word-break: break-all;
+  }
+  .commitline {
+    margin-top: 12px; font-size: 11px; color: var(--faint); word-break: break-all; line-height: 1.7;
+  }
+  .commitline code { color: var(--dim); }
+  .commitline button { padding: 1px 8px; font-size: 10.5px; margin-left: 6px; }
+
+  /* auction view */
+  .live { float: right; color: var(--faint); font-size: 11.5px; margin-top: 2px; }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); vertical-align: middle; margin: -1px 4px 0 0;
+  }
+  .dot.off { background: var(--faint); }
+  .q { font-size: 17px; line-height: 1.5; color: var(--ink); margin: 0; word-break: break-word; }
+  .desc { color: var(--dim); font-size: 13px; margin-top: 8px; white-space: pre-wrap; word-break: break-word; }
+  .bidbox { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+  .bidbox .wide { grid-column: 1 / -1; }
+  .sealed {
+    margin-top: 14px; padding: 11px 14px; background: #0d1119;
+    border: 1px solid var(--edge2); border-radius: 8px; color: var(--dim); font-size: 12.5px;
+  }
+  .sealed b { color: var(--ink); }
+
+  /* closed: hammer results */
+  .hammer {
+    display: flex; align-items: baseline; gap: 12px; margin-top: 14px; padding: 13px 16px;
+    background: #0d1119; border: 1px solid var(--gold); border-radius: 8px;
+  }
+  .hammer .what { color: var(--gold); font-size: 12.5px; white-space: nowrap; letter-spacing: .06em; }
+  .hammer .who { flex: 1; color: var(--ink); font-size: 14px; word-break: break-word; }
+  .hammer .amt { color: var(--accent-hi); font-size: 15px; white-space: nowrap; }
+  .hammer.nosale { border-color: var(--edge2); }
+  .hammer.nosale .what { color: var(--dim); }
+  .verify {
+    margin-top: 18px; padding: 14px 16px;
+    border: 1px dashed var(--edge2); border-radius: 8px;
+  }
+  .verify h3 { margin: 0; font-size: 12.5px; color: var(--dim); letter-spacing: .06em; font-weight: 400; }
+  .vstep { color: var(--dim); font-size: 12.5px; margin-top: 8px; word-break: break-all; }
+  .vstep .ok { color: var(--green); }
+  .vstep .bad { color: var(--red); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ ga<b>vel</b> ]</div>
+    <div class="tag">sealed-bid auctions nobody can rig · bids sealed until the hammer · losing bids never revealed</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>PUT SOMETHING UNDER THE HAMMER</h2>
+    <input id="title" class="text" maxlength="80" placeholder="what's for sale — 'the last dev unit', 'weekend cabin, aug 8–10'…" autofocus>
+    <textarea id="desc" class="text" maxlength="500" style="margin-top:10px"
+      placeholder="details bidders should read — condition, how to pay, how you'll hand it over (optional)"></textarea>
+    <div class="modes">
+      <label class="mode"><input type="radio" name="mode" value="second" checked>
+        <b>second-price (Vickrey)</b>the winner pays the second-highest bid — bidding your true value is the winning strategy</label>
+      <label class="mode"><input type="radio" name="mode" value="first">
+        <b>first-price</b>classic sealed tender — the winner pays exactly what they bid</label>
+    </div>
+    <div class="row">
+      <label>hammer falls in
+        <select id="deadline">
+          <option value="3600">1 hour</option>
+          <option value="21600">6 hours</option>
+          <option value="86400" selected>24 hours</option>
+          <option value="259200">3 days</option>
+          <option value="604800">7 days</option>
+        </select>
+      </label>
+      <label>reserve <input id="reserve" class="small" inputmode="numeric" placeholder="none"></label>
+      <label>unit <input id="unit" class="small" maxlength="12" placeholder="USD, sats…"></label>
+    </div>
+    <div class="row">
+      <span class="spacer"></span>
+      <button id="createbtn">seal the auction →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>bids live only in attested enclave RAM — nobody can read them before the hammer, <em>you included</em>: that's what makes honest Vickrey auctions possible at all</li>
+      <li>your reserve is blinded and committed as <em>sha256(salt‖reserve)</em> before the first bid exists — bidders can't even tell if one is set</li>
+      <li>at close, only the winner and clearing price are revealed; every losing bid is scrubbed from memory, never published to anyone</li>
+      <li>every bidder gets a fingerprint proof their bid was in the set the hammer weighed</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>THE AUCTION IS SEALED</h2>
+    <p class="sub">your reserve (even "none") is already committed — the hash below was fixed before anyone
+    could bid. share it so bidders can screenshot it now and check it against the reveal.</p>
+    <div class="commitbox" id="commitout"></div>
+    <div class="row" style="margin-top:8px"><button id="copycommit" class="ghost">copy commitment</button></div>
+    <p class="sub" style="margin-top:16px">share this link with your bidders:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <p class="sub" style="margin-top:16px">admin link — keep it private: it can close early, cancel, and read the result:</p>
+    <div class="linkbox"><input id="adminlink" readonly><button id="copyadmin">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px">
+      <button id="openauction">open your auction →</button>
+      <button class="ghost" onclick="location.href='/'">set up another</button>
+    </div>
+  </section>
+
+  <!-- AUCTION -->
+  <section id="auction" class="card hidden">
+    <div class="live"><span class="dot off" id="dot"></span><span id="livetext">connecting…</span></div>
+    <div class="q" id="q"></div>
+    <div class="desc" id="descout"></div>
+    <div class="kv" id="meta"></div>
+    <div class="commitline">reserve sealed at creation: <code>sha256(salt‖reserve) = <span id="commithex"></span></code><button class="ghost" id="copycommit2">copy</button></div>
+    <div class="bidbox" id="bidbox">
+      <input id="amount" class="text wide" inputmode="numeric" placeholder="your bid — whole number">
+      <input id="name" class="text" maxlength="40" placeholder="your name or handle">
+      <input id="contact" class="text" maxlength="120" placeholder="contact if you win (optional)">
+      <button id="bidbtn" class="wide">place sealed bid →</button>
+    </div>
+    <div class="sealed hidden" id="mine"></div>
+    <div id="result"></div>
+    <div class="commitline hidden" id="saltline"></div>
+    <div class="verify hidden" id="verify">
+      <h3>DON'T TRUST THIS PAGE'S WORD FOR IT</h3>
+      <div class="vstep">the salt, the reserve, and every bid's fingerprint are public now.
+      this button re-checks them with WebCrypto, in your browser:</div>
+      <div class="row" style="margin-top:12px"><button id="verifybtn" class="ghost">verify this auction</button></div>
+      <div class="vstep hidden" id="v1"></div>
+      <div class="vstep hidden" id="v2"></div>
+      <div class="vstep hidden" id="v3"></div>
+      <div class="vstep hidden" id="vsum"></div>
+    </div>
+    <div class="err" id="aerr"></div>
+    <div id="admin" class="hidden">
+      <div class="note" id="adminnote" style="margin-top:20px"></div>
+      <div id="sellerres"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="closebtn" class="hidden"></button>
+        <button id="cancelbtn" class="ghost hidden"></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this auction never existed, or its record aged out (closed auctions stay checkable
+    for 7 days, cancelled ones for 1). sealed bids from a vanished auction were scrubbed, not archived.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.href='/'">set up a new auction</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  bids in attested memory only, the hammer a pure function of them, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — attest the enclave, then check the reveal yourself.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+const sha256 = async (bytes) => new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+const sha256hex = async (str) => bytesToHex(await sha256(enc.encode(str)));
+const bytesToHex = (b) => [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+const hexToBytes = (h) => {
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(2 * i, 2), 16);
+  return out;
+};
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","auction","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const fmtAmt = (n, unit) => Number(n).toLocaleString("en-US") + (unit ? " " + unit : "");
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// ---- create flow -----------------------------------------------------------
+const ID_ABC = "abcdefghijklmnopqrstuvwxyz0123456789";
+const newId = () => [...rand(12)].map(b => ID_ABC[b % 36]).join("");
+
+$("createbtn").addEventListener("click", async () => {
+  const title = $("title").value.trim();
+  const reserveRaw = $("reserve").value.trim();
+  $("cerr").textContent = "";
+  if (!title) { $("cerr").textContent = "say what's for sale."; return; }
+  if (reserveRaw && !/^\d{1,13}$/.test(reserveRaw)) {
+    $("cerr").textContent = "reserve must be a whole number (or empty for none)."; return;
+  }
+  $("createbtn").disabled = true;
+  try {
+    const id = newId();
+    const admToken = b64u(rand(16));
+    const mode = document.querySelector("input[name=mode]:checked").value;
+    const headers = {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-auction-id": id,
+      "x-admin-hash": await sha256hex(admToken),
+      "x-mode": mode,
+      "x-deadline-in": $("deadline").value,
+    };
+    if (reserveRaw) headers["x-reserve"] = String(parseInt(reserveRaw, 10));
+    const unit = $("unit").value.trim();
+    if (unit) headers["x-unit"] = unit;
+    const body = "title=" + encodeURIComponent(title) + "&desc=" + encodeURIComponent($("desc").value.trim());
+    const res = await api("/api/auctions", { method: "POST", headers, body });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    const share = location.origin + "/a/" + id;
+    const admin = share + "#a=" + admToken;
+    $("commitout").textContent = "sha256(salt‖reserve) = " + res.j.commit;
+    $("sharelink").value = share;
+    $("adminlink").value = admin;
+    $("createdmeta").innerHTML = (mode === "second" ? "second-price (Vickrey)" : "first-price") +
+      " · hammer falls in <b>" + fmtDur(+$("deadline").value) + "</b> · reserve: <b>" +
+      (reserveRaw ? "set (sealed)" : "none (sealed)") + "</b>";
+    $("openauction").onclick = () => { location.href = admin; };
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("createbtn").disabled = false;
+  }
+});
+copyBtn($("copycommit"), () => $("commitout").textContent);
+copyBtn($("copyshare"), () => $("sharelink").value);
+copyBtn($("copyadmin"), () => $("adminlink").value);
+
+// ---- auction flow ----------------------------------------------------------
+let aid = null, admToken = null, state = null, closesAt = null, armTimer = null;
+
+function initAuction(id) {
+  aid = id;
+  const m = /(?:^|[#&])a=([^&]+)/.exec(location.hash.slice(1));
+  admToken = m ? decodeURIComponent(m[1]) : null;
+  const nm = localStorage.getItem("gavel-name");
+  if (nm) $("name").value = nm;
+  const ct = localStorage.getItem("gavel-contact");
+  if (ct) $("contact").value = ct;
+  show("auction");
+  refresh();
+  subscribe();
+  setInterval(tick, 1000);
+}
+
+async function refresh() {
+  const res = await api("/api/auction?id=" + encodeURIComponent(aid));
+  if (!res.ok) { show("gone"); return; }
+  state = res.j;
+  render();
+  refreshMine();
+}
+
+function render() {
+  const p = state;
+  closesAt = !p.closed && !p.cancelled && p.closes_in !== null
+    ? Math.floor(Date.now() / 1000) + p.closes_in : null;
+  $("q").textContent = p.title;
+  $("descout").textContent = p.desc || "";
+  $("descout").classList.toggle("hidden", !p.desc);
+  $("commithex").textContent = p.commit;
+  const n = p.count, b = n === 1 ? " sealed bid" : " sealed bids";
+  const modeTxt = p.mode === "second" ? "second-price (Vickrey)" : "first-price";
+  $("meta").innerHTML = p.cancelled
+    ? "auction <b>cancelled</b> by the seller — every sealed bid was erased, nothing revealed"
+    : p.closed
+    ? "hammer fell — <b>" + n + "</b>" + b + " weighed · " + modeTxt +
+      " · checkable for <b>" + fmtDur(p.expires_in) + "</b>"
+    : "<b>" + n + "</b>" + b + " so far · " + modeTxt +
+      " · hammer falls in <b><span id=cdown>" + fmtDur(p.closes_in) + "</span></b>";
+  $("bidbox").classList.toggle("hidden", p.closed || p.cancelled);
+  renderClosed();
+  renderAdmin();
+}
+
+function tick() {
+  const el = document.getElementById("cdown");
+  if (!el || closesAt === null) return;
+  const left = closesAt - Math.floor(Date.now() / 1000);
+  el.textContent = left > 0 ? fmtDur(left) : "…any moment (enclave sweep)";
+}
+
+function renderClosed() {
+  const p = state, box = $("result");
+  $("saltline").classList.toggle("hidden", !p.closed);
+  $("verify").classList.toggle("hidden", !p.closed);
+  box.textContent = "";
+  if (!p.closed) return;
+  const row = document.createElement("div");
+  if (p.sold) {
+    row.className = "hammer";
+    const what = document.createElement("span"); what.className = "what"; what.textContent = "SOLD →";
+    const who = document.createElement("span"); who.className = "who"; who.textContent = p.winner.name;
+    const amt = document.createElement("span"); amt.className = "amt";
+    amt.textContent = fmtAmt(p.price, p.unit);
+    row.append(what, who, amt);
+  } else {
+    row.className = "hammer nosale";
+    const what = document.createElement("span"); what.className = "what"; what.textContent = "NO SALE";
+    const who = document.createElement("span"); who.className = "who";
+    who.textContent = p.count === 0 ? "nobody bid" : "no bid met the reserve";
+    row.append(what, who);
+  }
+  box.append(row);
+  if (p.mode === "second" && p.sold) {
+    const note = document.createElement("div");
+    note.className = "note gold";
+    note.textContent = "second-price: the winner pays the runner-up's bid. what the winner actually bid stays sealed forever — that's the point.";
+    box.append(note);
+  }
+  $("saltline").innerHTML = "revealed at close: <code>salt = <span id=salthex></span> · reserve = <span id=reshex></span></code>";
+  document.getElementById("salthex").textContent = p.salt;
+  document.getElementById("reshex").textContent = p.reserve === 0 ? "0 (none)" : fmtAmt(p.reserve, p.unit);
+}
+
+// ---- bidding ---------------------------------------------------------------
+$("bidbtn").addEventListener("click", async () => {
+  const amount = $("amount").value.trim().replace(/[,\s]/g, "");
+  const name = $("name").value.trim();
+  $("aerr").textContent = "";
+  if (!/^\d{1,13}$/.test(amount) || parseInt(amount, 10) < 1) {
+    $("aerr").textContent = "bid a whole number, 1 or more."; return;
+  }
+  if (!name) { $("aerr").textContent = "a name, so winning means something."; return; }
+  // The token is the bid's identity: same token, same slot — re-bidding from
+  // this browser replaces your sealed amount instead of adding a second bid.
+  let token = localStorage.getItem("gavel-token-" + aid);
+  if (!token) { token = b64u(rand(24)); localStorage.setItem("gavel-token-" + aid, token); }
+  $("bidbtn").disabled = true;
+  const res = await api("/api/bid", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(aid) + "&token=" + encodeURIComponent(token) +
+      "&amount=" + amount + "&name=" + encodeURIComponent(name) +
+      "&contact=" + encodeURIComponent($("contact").value.trim()),
+  });
+  $("bidbtn").disabled = false;
+  if (!res.ok) {
+    if (res.status === 409) { refresh(); return; } // hammer fell under us — repaint
+    $("aerr").textContent = (res.j && res.j.error) || ("bid failed (" + res.status + ")");
+    return;
+  }
+  localStorage.setItem("gavel-name", name);
+  localStorage.setItem("gavel-contact", $("contact").value.trim());
+  localStorage.setItem("gavel-amount-" + aid, String(parseInt(amount, 10)));
+  $("amount").value = "";
+  refreshMine();
+});
+
+/// Your private echo: while open, proof the seal took; after close, the
+/// verdict. The server tells losers nothing but "not you".
+async function refreshMine() {
+  const token = localStorage.getItem("gavel-token-" + aid);
+  const box = $("mine");
+  if (!token || state.cancelled) { box.classList.add("hidden"); return; }
+  const res = await api("/api/mine?id=" + encodeURIComponent(aid) + "&token=" + encodeURIComponent(token));
+  if (!res.ok || !res.j) { box.classList.add("hidden"); return; }
+  const j = res.j;
+  if (j.closed === false) {
+    if (j.bid === null) { box.classList.add("hidden"); return; }
+    box.classList.remove("hidden");
+    box.innerHTML = "your sealed bid: <b>" + fmtAmt(j.bid, state.unit) + "</b> — re-bid any time before the hammer to change it. only this browser and the enclave know it.";
+  } else if (j.won) {
+    box.classList.remove("hidden");
+    box.innerHTML = "🔨 <b>you won.</b> you pay <b>" + fmtAmt(j.pay, state.unit) + "</b>" +
+      (state.mode === "second" ? " — the runner-up's bid, not yours." : ".") +
+      " the seller has the contact you attached; check the item notes for how to settle up.";
+  } else {
+    box.classList.remove("hidden");
+    box.innerHTML = "not this time — and your bid was scrubbed at the hammer, revealed to no one. " +
+      "check your fingerprint below to confirm it was weighed.";
+  }
+}
+
+// ---- SSE -------------------------------------------------------------------
+function subscribe() {
+  const es = new EventSource("/api/stream?id=" + encodeURIComponent(aid));
+  es.onopen = () => setLive(true);
+  es.onerror = () => setLive(false); // EventSource retries on its own
+  es.onmessage = (ev) => { // the initial unnamed event: full /api/auction shape
+    try { state = JSON.parse(ev.data); } catch { return; }
+    setLive(true);
+    render();
+    refreshMine();
+  };
+  es.addEventListener("bids", (ev) => {
+    try { state.count = JSON.parse(ev.data).count; } catch { return; }
+    if (!state.closed) render();
+  });
+  es.addEventListener("closed", (ev) => {
+    try { state = JSON.parse(ev.data); } catch { return; }
+    render();
+    refreshMine();
+  });
+  es.addEventListener("cancelled", () => refresh());
+}
+function setLive(on) {
+  $("dot").classList.toggle("off", !on);
+  $("livetext").textContent = on ? "live" : "reconnecting…";
+}
+
+// ---- admin -----------------------------------------------------------------
+function renderAdmin() {
+  const p = state, panel = $("admin");
+  if (!admToken || p.cancelled) { panel.classList.add("hidden"); return; }
+  panel.classList.remove("hidden");
+  const closeB = $("closebtn"), cancelB = $("cancelbtn");
+  if (!closeB.dataset.wired) {
+    closeB.dataset.wired = "1";
+    closeB.addEventListener("click", () => armed(closeB, "sure? click again to drop the hammer", doClose));
+    cancelB.addEventListener("click", () => armed(cancelB, "sure? click again to cancel & erase bids", doCancel));
+  }
+  if (p.closed) {
+    $("adminnote").textContent = "you hold the admin token. the seller's view below is all the enclave will ever tell you.";
+    closeB.classList.add("hidden");
+    cancelB.classList.add("hidden");
+    loadSellerResult();
+  } else {
+    $("adminnote").textContent = "you hold the admin token — but not the bids. even this link can't see an amount " +
+      "until the hammer falls; it can only make that happen early, or call the whole thing off.";
+    closeB.classList.remove("hidden");
+    cancelB.classList.remove("hidden");
+    if (!closeB.dataset.armed) closeB.textContent = "drop the hammer now";
+    if (!cancelB.dataset.armed) cancelB.textContent = "cancel the auction";
+  }
+}
+
+function armed(btn, prompt, fn) {
+  if (!btn.dataset.armed) {
+    // first click arms for 3s; only a second click executes. no confirm().
+    btn.dataset.armed = "1";
+    btn.textContent = prompt;
+    armTimer = setTimeout(() => { delete btn.dataset.armed; renderAdmin(); }, 3000);
+    return;
+  }
+  clearTimeout(armTimer);
+  delete btn.dataset.armed;
+  fn(btn);
+}
+
+async function doClose(btn) {
+  btn.disabled = true;
+  const res = await api("/api/close", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(aid) + "&admin=" + encodeURIComponent(admToken),
+  });
+  btn.disabled = false;
+  if (!res.ok) {
+    $("aerr").textContent = res.status === 403 ? "wrong admin token." : ((res.j && res.j.error) || "close failed");
+    renderAdmin();
+    return;
+  }
+  state = res.j; // the close response IS the closed auction state
+  render();
+  refreshMine();
+}
+
+async function doCancel(btn) {
+  btn.disabled = true;
+  const res = await api("/api/cancel", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(aid) + "&admin=" + encodeURIComponent(admToken),
+  });
+  btn.disabled = false;
+  if (!res.ok) {
+    $("aerr").textContent = res.status === 403 ? "wrong admin token." : ((res.j && res.j.error) || "cancel failed");
+    renderAdmin();
+    return;
+  }
+  state = res.j;
+  render();
+}
+
+async function loadSellerResult() {
+  const box = $("sellerres");
+  if (box.dataset.loaded) return;
+  const res = await api("/api/result?id=" + encodeURIComponent(aid) + "&admin=" + encodeURIComponent(admToken));
+  if (!res.ok || !res.j) return;
+  box.dataset.loaded = "1";
+  const j = res.j;
+  const note = document.createElement("div");
+  note.className = j.sold ? "note green" : "note";
+  note.textContent = j.sold
+    ? "seller's view — winner: " + j.winner + " · pays " + fmtAmt(j.price, state.unit) +
+      " · contact: " + (j.contact || "(none left)") + " · " + j.count + " bid" + (j.count === 1 ? "" : "s") + " weighed"
+    : "seller's view — no sale from " + j.count + " bid" + (j.count === 1 ? "" : "s") +
+      "; losing amounts were scrubbed, there is nothing more to see.";
+  box.append(note);
+}
+
+// ---- verification ----------------------------------------------------------
+// Byte-for-byte the server's math: the commitment is sha256(salt bytes ||
+// reserve as ASCII decimal); a bid's fingerprint is sha256 of
+// "<sha256hex(token)>:<amount>". Your token never left this browser, so
+// only you can recompute yours — inclusion proves your bid was weighed.
+$("verifybtn").addEventListener("click", async () => {
+  const p = state;
+  if (!p || !p.closed) return;
+  const step = (id, ok, text) => {
+    const el = $(id);
+    el.classList.remove("hidden");
+    el.innerHTML = (ok ? "<span class=ok>✓</span> " : "<span class=bad>✗</span> ") + text;
+    return ok;
+  };
+  const commitIn = new Uint8Array([...hexToBytes(p.salt), ...enc.encode(String(p.reserve))]);
+  const ok1 = step("v1", bytesToHex(await sha256(commitIn)) === p.commit,
+    "sha256(revealed salt ‖ revealed reserve) equals the commitment published at creation — the reserve was fixed before any bid");
+  const ok2 = step("v2", p.fingerprints.length === p.count,
+    p.fingerprints.length + " fingerprint" + (p.fingerprints.length === 1 ? "" : "s") +
+    " published for " + p.count + " sealed bid" + (p.count === 1 ? "" : "s"));
+  let ok3 = true;
+  const token = localStorage.getItem("gavel-token-" + aid);
+  const myAmt = localStorage.getItem("gavel-amount-" + aid);
+  if (token && myAmt) {
+    const fp = await sha256hex(await sha256hex(token) + ":" + myAmt);
+    ok3 = step("v3", p.fingerprints.includes(fp),
+      "your own bid's fingerprint (recomputed from the token only this browser holds) is in the weighed set");
+  } else {
+    step("v3", true, "no sealed bid from this browser — nothing of yours to check");
+  }
+  const sum = $("vsum");
+  sum.classList.remove("hidden");
+  sum.innerHTML = ok1 && ok2 && ok3
+    ? "<span class=ok>the reveal is consistent with what was committed before bidding began. selection of the max is what the attestation is for.</span>"
+    : "<span class=bad>verification FAILED — do not trust this result; the served data doesn't reproduce it.</span>";
+});
+copyBtn($("copycommit2"), () => state ? state.commit : "");
+
+// ---- router ----------------------------------------------------------------
+(function route() {
+  if (location.pathname.startsWith("/a/")) {
+    const m = /^\/a\/([a-z0-9]{8,16})$/.exec(location.pathname);
+    if (m) initAuction(m[1]); else show("gone");
+    return;
+  }
+  show("create");
+  loadStats();
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "holding " + r.j.auctions + " auction" + (r.j.auctions === 1 ? "" : "s") +
+      " · " + r.j.sealed_bids + " sealed bid" + (r.j.sealed_bids === 1 ? "" : "s") +
+      " · lifetime " + r.j.lifetime_auctions + " auctions, " + r.j.lifetime_bids + " bids, " +
+      r.j.sold + " sold";
+  } catch {}
+}
+</script>
+</body>
+</html>

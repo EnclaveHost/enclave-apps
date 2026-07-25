@@ -1,0 +1,15 @@
+[package]
+name = "network-test"
+version = "0.1.0"
+edition = "2021"
+description = "Enclave network test — dedicated-IP identity demo: one IPv6, both directions, zero code changes"
+
+# Zero dependencies on purpose: everything (HTTP serving, the SOCKS5 client,
+# the outbound fetches) is hand-rolled std — the whole point is that PLAIN
+# std::net code is transparently source-tagged by the platform.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

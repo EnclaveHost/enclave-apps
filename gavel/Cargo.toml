@@ -1,0 +1,15 @@
+[package]
+name = "gavel"
+version = "0.1.0"
+edition = "2021"
+description = "Sealed-bid auctions the auctioneer can't rig — bids sit in attested enclave RAM where nobody (seller included) can peek; at close only the winner and clearing price are revealed, losing bids never"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

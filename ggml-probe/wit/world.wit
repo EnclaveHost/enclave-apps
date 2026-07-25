@@ -1,0 +1,15 @@
+// ggml-probe: the first-party smoke for the wasmtime ggml (llama.cpp) wasi-nn
+// backend. Loads a HOST-PRELOADED GGUF by name (load-by-name - the weights
+// never transit guest memory), decodes a few tokens greedily through the
+// stateful execution context, and reports the token ids + timings over HTTP.
+// WIT deps vendored verbatim from wasmtime v45 (wasi@0.2.6,
+// wasi:nn@0.2.0-rc-2024-10-28) so guest and host always agree.
+package enclave:ggml-probe;
+
+world ggml-probe {
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  export wasi:http/incoming-handler@0.2.6;
+}

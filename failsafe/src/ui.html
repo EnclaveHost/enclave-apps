@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>fail safe — time-gated secrets</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --accent: #e05e5e; --accent-hi: #f28b8b; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 680px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 44px 0 8px; }
+  .mark { font-size: 26px; letter-spacing: .14em; color: var(--accent); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 22px; margin-top: 22px;
+  }
+  textarea {
+    width: 100%; min-height: 160px; resize: vertical;
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 8px; padding: 12px 14px; font: 14px/1.55 var(--mono); outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  label { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; }
+  select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 6px; padding: 6px 8px; font: 13px var(--mono);
+  }
+  button {
+    background: var(--accent); color: #170b0b; border: 0; border-radius: 8px;
+    padding: 10px 22px; font: 600 14px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--accent-hi); }
+  button:disabled { background: var(--edge2); color: var(--faint); cursor: default; }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--accent); }
+  button.danger { background: var(--red); color: #fff; }
+  .spacer { flex: 1; }
+  .linkbox {
+    display: flex; gap: 8px; margin-top: 10px; align-items: stretch;
+  }
+  .linkbox input {
+    flex: 1; background: #0d1119; color: var(--accent-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 9px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  .linkbox button { padding: 0 16px; white-space: nowrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: var(--ink); letter-spacing: .06em; }
+  .sub { color: var(--dim); font-size: 12.5px; margin: 4px 0 0; }
+  .sub b { color: var(--ink); }
+  .kv { color: var(--dim); font-size: 13px; margin-top: 12px; }
+  .kv b { color: var(--ink); font-weight: 600; }
+  pre.secret {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 14px 16px; white-space: pre-wrap; word-break: break-word;
+    font: 14px/1.55 var(--mono); color: var(--ink); margin: 12px 0 0; max-height: 50vh; overflow: auto;
+  }
+  .note { border-left: 3px solid var(--accent); padding: 2px 0 2px 12px; color: var(--dim); font-size: 12.5px; margin-top: 16px; }
+  .note.red { border-color: var(--red); }
+  .note.green { border-color: var(--green); }
+  .err { color: var(--red); font-size: 13px; margin-top: 12px; min-height: 1em; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 620px; }
+  footer a { color: var(--dim); }
+  .stat { color: var(--faint); font-size: 11.5px; text-align: center; margin-top: 18px; }
+  .hidden { display: none !important; }
+  ul.how { color: var(--dim); font-size: 12.5px; padding-left: 18px; margin: 10px 0 0; }
+  ul.how li { margin-top: 4px; }
+  .modes { display: flex; gap: 10px; margin-bottom: 14px; }
+  .modecard {
+    flex: 1; display: block; border: 1px solid var(--edge2); border-radius: 8px;
+    padding: 12px 14px; cursor: pointer;
+  }
+  .modecard input { display: none; }
+  .modecard b { display: block; color: var(--ink); font-size: 13.5px; }
+  .modecard span { display: block; color: var(--dim); font-size: 12px; line-height: 1.45; margin-top: 4px; }
+  .modecard:has(input:checked) { border-color: var(--accent); }
+  .modecard:has(input:checked) b { color: var(--accent-hi); }
+  .clock { font-size: 32px; letter-spacing: .06em; color: var(--accent-hi); margin-top: 10px; }
+  .bigbtn { display: block; width: 100%; padding: 16px; font-size: 15px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">[ fail <b>safe</b> ]</div>
+    <div class="tag">secrets that outlive silence · time-gated inside an attested enclave</div>
+  </header>
+
+  <!-- CREATE -->
+  <section id="create" class="card hidden">
+    <h2>ARM A RELEASE</h2>
+    <div class="modes">
+      <label class="modecard"><input type="radio" name="mode" value="capsule" checked>
+        <b>time capsule</b><span>releases at a set time, no exceptions</span></label>
+      <label class="modecard"><input type="radio" name="mode" value="switch">
+        <b>dead man's switch</b><span>releases only if I stop checking in</span></label>
+    </div>
+    <textarea id="plain" placeholder="the secret that outlives your silence — keys, instructions, the truth…" maxlength="65536" autofocus></textarea>
+    <div class="row">
+      <label id="whenrow">releases
+        <select id="releasein">
+          <option value="3600">in 1 hour</option>
+          <option value="86400" selected>in 24 hours</option>
+          <option value="604800">in 7 days</option>
+          <option value="2592000">in 30 days</option>
+        </select>
+      </label>
+      <label id="introw" class="hidden">check in every
+        <select id="interval">
+          <option value="86400" selected>24 hours</option>
+          <option value="259200">72 hours</option>
+          <option value="604800">7 days</option>
+          <option value="2592000">30 days</option>
+        </select>
+      </label>
+      <label>reveals
+        <select id="reads">
+          <option value="1" selected>1</option>
+          <option value="3">3</option>
+          <option value="10">10</option>
+          <option value="25">25</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="arm">arm →</button>
+    </div>
+    <div class="err" id="cerr"></div>
+    <ul class="how">
+      <li>encrypted <em>in this page</em> with AES-256-GCM; the key lives only in the recipients' link #fragment</li>
+      <li>until release the enclave serves the ciphertext to NOBODY — recipients, operator, even you</li>
+      <li>after release it stays readable for 7 days, then the only copy is erased</li>
+    </ul>
+  </section>
+
+  <!-- CREATED -->
+  <section id="created" class="card hidden">
+    <h2>ARMED</h2>
+    <p class="sub">recipients' link — hand this out <b>now</b>; it's useless until release:</p>
+    <div class="linkbox"><input id="sharelink" readonly><button id="copyshare">copy</button></div>
+    <p class="sub" style="margin-top:16px">your owner link — the check-in / disarm key. losing it means nobody can stop the release:</p>
+    <div class="linkbox"><input id="ownerlink" readonly><button id="copyowner">copy</button></div>
+    <div class="kv" id="createdmeta"></div>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.hash='';location.reload()">arm another</button></div>
+  </section>
+
+  <!-- WAIT (recipient, sealed) -->
+  <section id="wait" class="card hidden">
+    <h2>SEALED UNTIL RELEASE</h2>
+    <div class="kv" id="waitmeta">checking…</div>
+    <div class="clock" id="clock"></div>
+    <div class="note" id="waitnote"></div>
+    <div class="err" id="werr"></div>
+  </section>
+
+  <!-- RECEIVE (recipient, released) -->
+  <section id="receive" class="card hidden">
+    <h2>RELEASED</h2>
+    <div class="kv" id="peekmeta">checking…</div>
+    <div class="row" style="margin-top:18px">
+      <button id="reveal">reveal secret</button>
+      <span class="spacer"></span>
+    </div>
+    <div class="note" id="revealnote">revealing consumes one read. if this is the last read, the secret is erased forever.</div>
+    <div class="err" id="rerr"></div>
+  </section>
+
+  <!-- REVEALED -->
+  <section id="revealed" class="card hidden">
+    <h2>REVEALED</h2>
+    <pre class="secret" id="secretout"></pre>
+    <div class="row" style="margin-top:14px">
+      <button id="copysecret" class="ghost">copy secret</button>
+      <span class="spacer"></span>
+    </div>
+    <div class="note" id="afternote"></div>
+  </section>
+
+  <!-- OWNER -->
+  <section id="owner" class="card hidden">
+    <h2>OWNER CONSOLE</h2>
+    <div class="kv" id="ownermeta">checking…</div>
+    <div class="clock" id="oclock"></div>
+    <button id="checkin" class="bigbtn hidden">I'm alive — check in</button>
+    <div class="note green hidden" id="oknote"></div>
+    <div class="row" style="margin-top:16px">
+      <button id="disarm" class="danger">disarm — erase the secret</button>
+      <span class="spacer"></span>
+    </div>
+    <div class="err" id="oerr"></div>
+  </section>
+
+  <!-- ERASED -->
+  <section id="erased" class="card hidden">
+    <h2>ERASED</h2>
+    <p class="sub">the ciphertext is gone from the enclave. every link to it is now dead, and nothing will release.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.hash='';location.reload()">arm a new release</button></div>
+  </section>
+
+  <!-- GONE -->
+  <section id="gone" class="card hidden">
+    <h2>NOTHING HERE</h2>
+    <p class="sub">this never existed, was disarmed, was fully read out, or its window lapsed.
+    the server can't tell you which — that ambiguity is deliberate.</p>
+    <div class="row" style="margin-top:18px"><button class="ghost" onclick="location.hash='';location.reload()">arm a new release</button></div>
+  </section>
+
+  <div class="stat" id="stat"></div>
+</main>
+<footer>
+  ciphertext only, in memory only, inside a hardware TEE on
+  <a href="https://enclave.host" rel="noreferrer">enclave.host</a> — the countdown is enforced by attested code, not by promise. attest the enclave before trusting it with more than you'd whisper.
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// base64url
+const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s) => {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const sha256hex = async (str) => {
+  const d = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+};
+const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+
+const api = async (path, opts) => {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch {}
+  return { ok: r.ok, status: r.status, j };
+};
+const show = (id) => {
+  for (const s of ["create","created","wait","receive","revealed","owner","erased","gone"]) $(s).classList.add("hidden");
+  $(id).classList.remove("hidden");
+};
+const fmtDur = (s) => s >= 172800 ? Math.round(s/86400) + " days"
+  : s >= 7200 ? Math.round(s/3600) + " hours"
+  : s >= 120 ? Math.round(s/60) + " minutes" : s + " seconds";
+const fmtClock = (s) => {
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+        m = Math.floor(s % 3600 / 60), x = s % 60;
+  return (d ? d + "d " : "") + String(h).padStart(2, "0") + ":" +
+         String(m).padStart(2, "0") + ":" + String(x).padStart(2, "0");
+};
+const copyBtn = (btn, getText) => {
+  btn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(getText()); btn.textContent = "copied ✓"; }
+    catch { btn.textContent = "copy failed"; }
+    setTimeout(() => (btn.textContent = btn.dataset.orig), 1500);
+  });
+  btn.dataset.orig = btn.textContent;
+};
+
+// One ticking countdown + one honesty re-peek at a time, whatever the view.
+let tick = null, sync = null;
+const stopTimers = () => { clearInterval(tick); clearInterval(sync); tick = sync = null; };
+
+// ---- create flow -----------------------------------------------------------
+const modeSel = () => document.querySelector('input[name="mode"]:checked').value;
+for (const r of document.querySelectorAll('input[name="mode"]')) {
+  r.addEventListener("change", () => {
+    const m = modeSel();
+    $("whenrow").classList.toggle("hidden", m !== "capsule");
+    $("introw").classList.toggle("hidden", m !== "switch");
+  });
+}
+$("arm").addEventListener("click", async () => {
+  const text = $("plain").value;
+  $("cerr").textContent = "";
+  if (!text) { $("cerr").textContent = "nothing to arm."; return; }
+  $("arm").disabled = true;
+  try {
+    const keyBytes = rand(32), iv = rand(12);
+    const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(text)));
+    const blob = new Uint8Array(iv.length + ct.length);
+    blob.set(iv); blob.set(ct, iv.length);
+    const id = b64u(rand(16));
+    const ownerToken = b64u(rand(16));
+    const mode = modeSel(), reads = $("reads").value;
+    const headers = {
+      "content-type": "application/octet-stream",
+      "x-drop-id": id, "x-mode": mode, "x-reads": reads,
+      "x-owner-hash": await sha256hex(ownerToken),
+    };
+    if (mode === "capsule") headers["x-release-in"] = $("releasein").value;
+    else headers["x-interval"] = $("interval").value;
+    const res = await api("/api/arm", { method: "POST", headers, body: b64u(blob) });
+    if (!res.ok) throw new Error((res.j && res.j.error) || ("server said " + res.status));
+    $("sharelink").value = location.origin + "/#" + id + "." + b64u(keyBytes);
+    $("ownerlink").value = location.origin + "/#!" + id + "." + ownerToken;
+    const rv = "<b>" + reads + "</b> reveal" + (reads === "1" ? "" : "s");
+    $("createdmeta").innerHTML = mode === "capsule"
+      ? "releases in <b>" + fmtDur(+$("releasein").value) + "</b>, no matter what · " + rv + " · readable for 7 days after"
+      : "releases in <b>" + fmtDur(+$("interval").value) + "</b> unless you check in first · " + rv + " · readable for 7 days after";
+    show("created");
+  } catch (e) {
+    $("cerr").textContent = "" + (e.message || e);
+  } finally {
+    $("arm").disabled = false;
+  }
+});
+copyBtn($("copyshare"), () => $("sharelink").value);
+copyBtn($("copyowner"), () => $("ownerlink").value);
+
+// ---- recipient flow --------------------------------------------------------
+let rid = null, rkey = null, rdeadline = 0;
+async function initReceive(id, keyb64) {
+  rid = id; rkey = keyb64;
+  show("wait");
+  await syncReceive();
+}
+async function syncReceive(note) {
+  const res = await api("/api/peek", { method: "POST", body: "id=" + encodeURIComponent(rid) });
+  if (!res.ok) { stopTimers(); show("gone"); return; }
+  const j = res.j;
+  if (j.released) {
+    stopTimers();
+    $("peekmeta").innerHTML =
+      "released secret · <b>" + j.reads_left + "</b> reveal" + (j.reads_left === 1 ? "" : "s") +
+      " left · erased in <b>" + fmtDur(j.window_left) + "</b> · " + j.size + " bytes";
+    if (j.reads_left === 1) $("revealnote").classList.add("red");
+    show("receive");
+    return;
+  }
+  rdeadline = Date.now() + j.releases_in * 1000;
+  $("waitmeta").innerHTML = (j.mode === "switch"
+    ? "a dead man's switch holds" : "a time capsule holds") +
+    " <b>" + j.size + " bytes</b> for <b>" + j.reads_left + "</b> reveal" +
+    (j.reads_left === 1 ? "" : "s") + " — release in:";
+  $("waitnote").textContent = j.mode === "switch"
+    ? "releases only if the owner goes silent — every check-in pushes this deadline out. it may never release at all."
+    : "the enclave will not serve the ciphertext one second early — not to you, not to its operator, not to the sender.";
+  $("werr").textContent = note || "";
+  show("wait");
+  $("clock").textContent = fmtClock((rdeadline - Date.now()) / 1000);
+  if (!tick) {
+    tick = setInterval(() => {
+      const left = (rdeadline - Date.now()) / 1000;
+      $("clock").textContent = fmtClock(left);
+      if (left <= 0) { stopTimers(); syncReceive(); } // the enclave has the last word
+    }, 1000);
+    sync = setInterval(() => syncReceive(), 60000); // stay honest about check-ins
+  }
+}
+$("reveal").addEventListener("click", async () => {
+  $("reveal").disabled = true;
+  $("rerr").textContent = "";
+  try {
+    const res = await api("/api/take", { method: "POST", body: "id=" + encodeURIComponent(rid) });
+    if (res.status === 423) {
+      // Raced a check-in: the deadline moved between our peek and the take.
+      $("reveal").disabled = false;
+      await syncReceive("sealed again — the owner checked in while you were looking.");
+      return;
+    }
+    if (!res.ok) { show("gone"); return; }
+    const blob = unb64u(res.j.blob);
+    const iv = blob.slice(0, 12), ct = blob.slice(12);
+    const key = await crypto.subtle.importKey("raw", unb64u(rkey), "AES-GCM", false, ["decrypt"]);
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+    $("secretout").textContent = dec.decode(pt);
+    const left = res.j.reads_left;
+    const n = $("afternote");
+    if (left === 0) { n.textContent = "that was the last read — the ciphertext has been erased from the enclave."; n.classList.add("green"); }
+    else n.textContent = left + " reveal" + (left === 1 ? "" : "s") + " remain" + (left === 1 ? "s" : "") + ".";
+    show("revealed");
+  } catch (e) {
+    $("rerr").textContent = "decryption failed — wrong or truncated link. one read was still consumed.";
+    $("reveal").disabled = false;
+  }
+});
+copyBtn($("copysecret"), () => $("secretout").textContent);
+
+// ---- owner flow --------------------------------------------------------------
+let oid = null, otok = null, odeadline = 0, oreleased = false;
+async function initOwner(id, token) {
+  oid = id; otok = token;
+  show("owner");
+  await syncOwner();
+}
+async function syncOwner() {
+  const res = await api("/api/peek", { method: "POST", body: "id=" + encodeURIComponent(oid) });
+  if (!res.ok) { stopTimers(); show("gone"); return; }
+  const j = res.j;
+  oreleased = j.released;
+  odeadline = Date.now() + j.releases_in * 1000;
+  const rv = "<b>" + j.reads_left + "</b> reveal" + (j.reads_left === 1 ? "" : "s");
+  if (j.released) {
+    $("ownermeta").innerHTML = "<b>released.</b> " + rv + " left · erased in <b>" +
+      fmtDur(j.window_left) + "</b>. checking in can no longer stop it — disarming still erases.";
+    $("oclock").textContent = "";
+    $("checkin").classList.add("hidden");
+  } else {
+    $("ownermeta").innerHTML = (j.mode === "switch"
+      ? "armed dead man's switch · " + rv + " · releases unless you check in within:"
+      : "armed time capsule · " + rv + " · opens no matter what in:");
+    $("checkin").classList.toggle("hidden", j.mode !== "switch");
+    $("oclock").textContent = fmtClock((odeadline - Date.now()) / 1000);
+  }
+  show("owner");
+  if (!tick) {
+    tick = setInterval(() => {
+      if (oreleased) return;
+      const left = (odeadline - Date.now()) / 1000;
+      $("oclock").textContent = fmtClock(left);
+      if (left <= 0) { stopTimers(); syncOwner(); }
+    }, 1000);
+    sync = setInterval(() => syncOwner(), 60000);
+  }
+}
+$("checkin").addEventListener("click", async () => {
+  $("checkin").disabled = true;
+  $("oerr").textContent = "";
+  $("oknote").classList.add("hidden");
+  const res = await api("/api/checkin", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(oid) + "&token=" + encodeURIComponent(otok),
+  });
+  $("checkin").disabled = false;
+  if (res.ok) {
+    $("oknote").textContent = "checked in — the release moved to " + fmtDur(res.j.releases_in) + " from now.";
+    $("oknote").classList.remove("hidden");
+    await syncOwner();
+  } else if (res.status === 403) {
+    $("oerr").textContent = "that owner link is wrong.";
+  } else if (res.status === 409) {
+    $("oerr").textContent = res.j && res.j.error === "released"
+      ? "too late — it already released. checking in can no longer stop it."
+      : "a time capsule cannot be delayed.";
+    await syncOwner();
+  } else if (res.status === 404) {
+    stopTimers(); show("gone");
+  } else {
+    $("oerr").textContent = (res.j && res.j.error) || ("server said " + res.status);
+  }
+});
+// Disarm is irreversible, so it takes two clicks: the first arms the button
+// for 3 seconds, the second erases.
+let disarmPrimed = null;
+$("disarm").addEventListener("click", async () => {
+  if (!disarmPrimed) {
+    $("disarm").textContent = "click again to erase forever";
+    disarmPrimed = setTimeout(() => {
+      disarmPrimed = null;
+      $("disarm").textContent = "disarm — erase the secret";
+    }, 3000);
+    return;
+  }
+  clearTimeout(disarmPrimed);
+  disarmPrimed = null;
+  $("disarm").disabled = true;
+  $("oerr").textContent = "";
+  const res = await api("/api/disarm", {
+    method: "POST",
+    body: "id=" + encodeURIComponent(oid) + "&token=" + encodeURIComponent(otok),
+  });
+  if (res.ok) { stopTimers(); show("erased"); return; }
+  $("disarm").disabled = false;
+  $("disarm").textContent = "disarm — erase the secret";
+  if (res.status === 403) $("oerr").textContent = "that owner link is wrong.";
+  else if (res.status === 404) { stopTimers(); show("gone"); }
+  else $("oerr").textContent = (res.j && res.j.error) || ("server said " + res.status);
+});
+
+// ---- router -----------------------------------------------------------------
+(function route() {
+  const h = decodeURIComponent(location.hash.slice(1) || "");
+  if (!h) { show("create"); loadStats(); return; }
+  const ownerMode = h.startsWith("!");
+  const body = ownerMode ? h.slice(1) : h;
+  const dot = body.indexOf(".");
+  if (dot < 1) { show("gone"); return; }
+  const id = body.slice(0, dot), rest = body.slice(dot + 1);
+  if (ownerMode) initOwner(id, rest); else initReceive(id, rest);
+})();
+
+async function loadStats() {
+  try {
+    const r = await api("/api/stats");
+    if (r.ok) $("stat").textContent =
+      "currently holding " + r.j.armed + " armed secret" + (r.j.armed === 1 ? "" : "s") +
+      " · " + r.j.released + " released · " + r.j.delivered + " delivered · " +
+      r.j.disarmed + " disarmed in time";
+  } catch {}
+}
+</script>
+</body>
+</html>

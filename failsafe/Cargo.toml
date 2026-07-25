@@ -1,0 +1,15 @@
+[package]
+name = "failsafe"
+version = "0.1.0"
+edition = "2021"
+description = "Dead-man's switch and time capsule for secrets — browser-side AES-GCM, key in the URL fragment, release time-gated by attested code holding RAM-only ciphertext"
+
+# Zero dependencies on purpose, like the suite's other service apps: the
+# HTTP engine, SSE, and SHA-256 are hand-rolled std. What runs is what you
+# read.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

@@ -1,0 +1,27 @@
+# RISC Box guest kernel fragment (on top of the riscv arch defconfig).
+# The display: the emulator's DTB declares a simple-framebuffer at
+# 0x87e00000 — FB_SIMPLE picks it up as /dev/fb0, fbcon puts the console on
+# it, Xorg's fbdev driver runs the desktop.
+CONFIG_FB=y
+CONFIG_FB_SIMPLE=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+CONFIG_LOGO=y
+# Xorg wants SysV SHM (MIT-SHM) and unix sockets; both are defconfig-on for
+# riscv but pinned here because the desktop dies confusingly without them.
+CONFIG_SYSVIPC=y
+CONFIG_UNIX=y
+# the emulator's device set (virtio-mmio block + net, 16550 UART) — all in
+# the riscv defconfig, pinned for the same reason as above
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_EXT4_FS=y
+# risc-box patch: the emulator's virtio-input device (0x10003000) — the
+# machine's HID. VIRTIO_INPUT binds it, EVDEV exposes /dev/input/eventN, and
+# X's libinput driver reads that. Input core + evdev are what a graphical
+# session (and a remote client injecting mouse/keyboard) reach the desktop
+# through.
+CONFIG_INPUT=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_VIRTIO_INPUT=y

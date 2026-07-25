@@ -1,0 +1,9 @@
+# RISC Box user-mode LAN: the app plays 10.0.2.2 (gateway + DNS), the guest
+# is always 10.0.2.15. Static beats DHCP here: no client, no race, no lease.
+auto lo
+iface lo inet loopback
+auto eth0
+iface eth0 inet static
+	address 10.0.2.15
+	netmask 255.255.255.0
+	gateway 10.0.2.2
