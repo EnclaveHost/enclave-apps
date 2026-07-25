@@ -39,7 +39,12 @@
 //!                               `enable_thinking: false` (top-level or in
 //!                               chat_template_kwargs, the vLLM spelling)
 //!                               turns off <think> reasoning on models whose
-//!                               config marks them `thinking`.
+//!                               config marks them `thinking`. Thinking on
+//!                               follows the qwen3.x templates: the prompt
+//!                               force-opens the block and the server
+//!                               re-emits `<think>\n` at the head of the
+//!                               reply; history replays drop prior think
+//!                               blocks.
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!
 //! Generation: autoregressive decode with the model's KV cache. The trick
@@ -1633,14 +1638,26 @@ fn read_body(req: &IncomingRequest) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Reasoning is per-turn scratch: a replayed assistant turn keeps only what
+/// followed its think block, exactly as the qwen3.x templates render history
+/// (split on the last `</think>`, strip leading newlines).
+fn strip_think(content: &str) -> String {
+    match content.rfind("</think>") {
+        Some(i) => content[i + "</think>".len()..].trim_start_matches('\n').to_string(),
+        None => content.to_string(),
+    }
+}
+
 /// Render + tokenize the conversation; drops oldest turns until it fits.
 /// A `system` message in the request overrides the configured default.
+/// The returned bool is Rendered::think_open: the prompt force-opened a
+/// think block that the caller must re-emit in the visible output.
 fn build_prompt(
     cfg: &AppConfig,
     tok: &Tokenizer,
     messages: &[ChatMsg],
     thinking: bool, // the request's switch; only cfg.thinking models act on it
-) -> Result<(Vec<u32>, Vec<String>), String> {
+) -> Result<(Vec<u32>, Vec<String>, bool), String> {
     let system = messages
         .iter()
         .find(|m| m.role == "system")
@@ -1649,14 +1666,27 @@ fn build_prompt(
     let mut msgs: Vec<(String, String)> = messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| (m.role.clone(), m.content.clone()))
+        .map(|m| {
+            let content = if cfg.thinking && m.role == "assistant" {
+                strip_think(&m.content)
+            } else {
+                m.content.clone()
+            };
+            (m.role.clone(), content)
+        })
         .collect();
     if msgs.is_empty() {
         return Err("no user/assistant messages".into());
     }
-    let no_think = cfg.thinking && !thinking;
+    let think = if !cfg.thinking {
+        config::ThinkTurn::Plain
+    } else if thinking {
+        config::ThinkTurn::Open
+    } else {
+        config::ThinkTurn::Closed
+    };
     loop {
-        let rendered = config::render_template(&cfg.template, &system, &msgs, no_think)?;
+        let rendered = config::render_template(&cfg.template, &system, &msgs, think)?;
         let enc = tok
             .encode(rendered.prompt.as_str(), true)
             .map_err(|e| format!("tokenize: {e}"))?;
@@ -1669,7 +1699,7 @@ fn build_prompt(
                     cfg.max_prompt_tokens
                 ));
             }
-            return Ok((ids, rendered.stop_strings));
+            return Ok((ids, rendered.stop_strings, rendered.think_open));
         }
         msgs.remove(0); // drop the oldest turn and retry
     }
@@ -1828,7 +1858,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
-    let (prompt_ids, stops) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
+    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
@@ -1862,7 +1892,17 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         if i > 0 && !send(serde_json::json!({ "notice": format!("gpu failed ({last_err}); retrying on cpu") })) {
             break;
         }
-        let emit = |delta: &str| send(serde_json::json!({ "delta": delta }));
+        // the prompt force-opened the think block; re-emit the tag ahead of
+        // the first real delta so the client sees a complete block. Lazy,
+        // per attempt: a retry notice resets the client's reply buffer, and
+        // an attempt that dies before producing output must not leak a tag.
+        let opened = std::cell::Cell::new(!think_open);
+        let emit = |delta: &str| {
+            if !opened.replace(true) && !send(serde_json::json!({ "delta": "<think>\n" })) {
+                return false;
+            }
+            send(serde_json::json!({ "delta": delta }))
+        };
         let status = |s: &str| send(serde_json::json!({ "status": s }));
         match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
             Ok(s) => {
@@ -1927,7 +1967,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
-    let (prompt_ids, stops) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
+    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
@@ -1971,7 +2011,17 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let mut done_stats: Option<GenStats> = None;
         let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         for (target, tname) in targets_for(cfg, mode).iter() {
-            let emit = |delta: &str| send_raw(&chunk(serde_json::json!({ "content": delta }), None));
+            // re-emit the prompt-side think opening ahead of the first real
+            // delta (see handle_chat) so clients receive a complete block
+            let opened = std::cell::Cell::new(!think_open);
+            let emit = |delta: &str| {
+                if !opened.replace(true)
+                    && !send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None))
+                {
+                    return false;
+                }
+                send_raw(&chunk(serde_json::json!({ "content": delta }), None))
+            };
             // OpenAI protocol has no status events; SSE comments keep the
             // connection warm through cold session init without confusing SDKs
             let status = |s: &str| send_raw(&format!(": {s}\n\n"));
@@ -2014,12 +2064,16 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         }
         match result {
             Some(s) => {
+                // the prompt force-opened the think block; restore the tag
+                // so the reply carries a complete one
+                let content =
+                    if think_open { format!("<think>\n{}", s.text) } else { s.text.clone() };
                 let body_json = serde_json::json!({
                     "id": id, "object": "chat.completion", "created": created,
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "message": { "role": "assistant", "content": s.text },
+                        "message": { "role": "assistant", "content": content },
                         "finish_reason": s.finish_reason,
                     }],
                     "usage": {
