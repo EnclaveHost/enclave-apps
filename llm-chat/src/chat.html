@@ -1287,12 +1287,41 @@ function updateStreamDOM(chat) {
   } else {
     body.innerHTML = "";
   }
+  // each rebuild recreates the shimmer span, which restarts its animation at
+  // token rate and reads as flicker - pin the phase to the clock so the sweep
+  // stays continuous across rebuilds (2000 = the shim keyframe duration)
+  for (const el of body.querySelectorAll(".shimmer"))
+    el.style.animationDelay = -(performance.now() % 2000) + "ms";
   scrollBottom();
 }
+
+// <think> expand/collapse: while a reply streams, every delta rebuilds the
+// message DOM, so the <summary> pressed at mousedown is usually gone by
+// mouseup and the browser drops the click - the native details toggle almost
+// never lands. Toggle by hand on pointerup instead, index-matched across the
+// rebuild (think blocks only ever get appended). pointercancel means the
+// browser claimed the gesture (touch scroll); a mouse drag is distance-filtered.
+let pressedThink = -1, pressedX = 0, pressedY = 0;
+log.addEventListener("pointerdown", (e) => {
+  const s = e.button === 0 ? e.target.closest("details.think > summary") : null;
+  pressedThink = s ? [...log.querySelectorAll("details.think")].indexOf(s.parentElement) : -1;
+  pressedX = e.clientX; pressedY = e.clientY;
+});
+log.addEventListener("pointercancel", () => { pressedThink = -1; });
+log.addEventListener("pointerup", (e) => {
+  const i = pressedThink;
+  pressedThink = -1;
+  if (i < 0 || Math.hypot(e.clientX - pressedX, e.clientY - pressedY) > 8) return;
+  const d = log.querySelectorAll("details.think")[i];
+  if (d) d.open = !d.open;
+});
 
 // message actions (copy / regenerate / retry / code copy) via delegation,
 // so re-rendered nodes keep working
 log.addEventListener("click", (e) => {
+  // pointer toggles are handled on pointerup above - cancel the native summary
+  // toggle so it can't double-fire; keyboard activation (detail 0) stays native
+  if (e.detail && e.target.closest("details.think > summary")) { e.preventDefault(); return; }
   const cc = e.target.closest("[data-copy-code]");
   if (cc) {
     const code = cc.closest(".code").querySelector("pre code");
