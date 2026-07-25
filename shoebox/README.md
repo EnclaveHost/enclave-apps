@@ -1,10 +1,10 @@
-# shoebox — a wallet-unlocked private file locker on Enclave
+# shoebox: a wallet-unlocked private file locker on Enclave
 
 A shoebox under the bed for the cloud era: drop your photos, scans, receipts,
 recordings, and PDFs into a private locker whose contents decrypt **only
 inside the enclave**. The ciphertext lives in your own S3 bucket; the bucket
 operator and the host machine only ever see encrypted blobs. You open the
-locker by signing one message with your wallet — there is no password to store
+locker by signing one message with your wallet; there is no password to store
 and nothing to verify on any server. Inside, shoebox is a plain
 upload / download / delete gallery: images render as thumbnails, everything
 else gets a file tile, and a drag-and-drop zone adds more.
@@ -14,7 +14,7 @@ shoebox is built on Enclave's first-party
 manager contract. It is a **`wasi:http` component**: the platform preopens an
 empty directory per volume at `/enc/<name>` and starts the app immediately;
 the app serves the decryption UI, relays the key over loopback to the
-in-enclave encryption manager, and — once unlocked — reads and writes the
+in-enclave encryption manager, and, once unlocked, reads and writes the
 volume with ordinary `std::fs`. Your code needs no crypto and no S3 client.
 
 ## The lifecycle of a locker
@@ -24,11 +24,11 @@ volume with ordinary `std::fs`. Your code needs no crypto and no S3 client.
    ciphertext to any S3-compatible bucket, using the reference app's
    `scripts/enclave-encvol.sh push`. The wallet signature (or a password)
    derives the crypt key; the bucket never learns it. This step is the only
-   way ciphertext gets into the bucket — **shoebox cannot bootstrap an empty
+   way ciphertext gets into the bucket: **shoebox cannot bootstrap an empty
    bucket for you**; it unlocks and edits what `push` seeded.
 
 2. **Deploy shoebox** with an App Config `encVolumes` entry naming *where* the
-   ciphertext lives (endpoint, bucket, path) — never a key.
+   ciphertext lives (endpoint, bucket, path), never a key.
 
 3. **Unlock.** Open the deployment and **Unlock with wallet**. The wallet signs
    a fixed message naming the volume; the volume key falls out of the
@@ -45,24 +45,24 @@ volume with ordinary `std::fs`. Your code needs no crypto and no S3 client.
    marked `readOnly`). **Lock** wipes the plaintext from the enclave and drops
    the retained credentials; the ciphertext in the bucket is untouched.
 
-**The wallet is the only key.** Nobody — not the host operator, not the bucket
-provider, not Enclave — can decrypt the locker without the signature. Lose the
-wallet and the ciphertext is unrecoverable; that is the point.
+**The wallet is the only key.** Nobody can decrypt the locker without the
+signature: not the host operator, not the bucket provider, not Enclave. Lose
+the wallet and the ciphertext is unrecoverable; that is the point.
 
 ## One-signature unlock (credentials envelope)
 
 S3 credentials can ride the **public** App Config sealed under the same wallet
 signature that derives the crypt key, as `credsEnvelope`. Then a single
-signature both derives the key and opens the bucket credentials — nothing typed
+signature both derives the key and opens the bucket credentials: nothing typed
 at unlock, after any restart. Seal them from the app's **derive push
 credentials → Seal** panel (or `enclave-encvol.sh seal-creds`) and paste the
 printed value into the volume's config. The envelope is exactly as sensitive as
 the volume: the wallet that signs for the key is the wallet that opens it.
 
 Wallet caveats carry over from the reference: you need an injected EOA wallet
-(`window.ethereum`) that signs deterministically (RFC 6979 — MetaMask, Ledger,
+(`window.ethereum`) that signs deterministically (RFC 6979: MetaMask, Ledger,
 EOAs generally). Smart-contract / ERC-1271 wallets and randomized MPC signers
-won't derive a stable key — use password mode for those.
+won't derive a stable key; use password mode for those.
 
 ## Routes
 
@@ -71,9 +71,9 @@ won't derive a stable key — use password mode for those.
 | `GET /`                   | the locker UI (self-contained HTML)                          |
 | `GET /api/status`         | proxied manager status (adds the bearer token server-side)   |
 | `POST /api/unlock`        | `{name, password, salt?, accessKeyId?, secretAccessKey?, sessionToken?}` |
-| `POST /api/sync`          | `{name}` — re-encrypt local edits and push to the bucket     |
-| `POST /api/lock`          | `{name}` — wipe plaintext, drop retained credentials         |
-| `POST /api/delete`        | `{vol, path}` — remove a file from the volume                |
+| `POST /api/sync`          | `{name}`: re-encrypt local edits and push to the bucket      |
+| `POST /api/lock`          | `{name}`: wipe plaintext, drop retained credentials          |
+| `POST /api/delete`        | `{vol, path}`: remove a file from the volume                 |
 | `POST /up/<vol>/<path>`   | **raw file bytes** in the body → written into the volume (8 MiB cap) |
 | `GET /ls`                 | JSON listing of every `ENCLAVE_ENC` volume                   |
 | `GET /f/<vol>/<path>`     | raw file bytes (streamed; any size), typed by extension      |
@@ -96,7 +96,7 @@ wasmtime serve -Scommon --dir ./some-plaintext-dir::/enc/demo \
 ```
 
 Without `ENCLAVE_ENC_API` the `/api/*` routes answer 503, but `/`, `/ls`,
-`/f`, `/up`, and `/api/delete` all work against the preopened directory — a
+`/f`, `/up`, and `/api/delete` all work against the preopened directory: a
 plain, unencrypted locker you can poke at directly.
 
 ## Deploy it for real
@@ -117,7 +117,7 @@ decrypted size on the ramdisk; `readOnly: true` disables push-back (Sync).
 ## Trust notes
 
 rclone crypt authenticates file *contents* (NaCl secretbox), so the bucket
-can't tamper with what you read — but there is no signed manifest of the tree,
+can't tamper with what you read. But there is no signed manifest of the tree,
 so a malicious bucket could serve a stale or partial *set* of files. Prefer
 `https` endpoints; S3 credentials sent at unlock ride the deployment's
 in-enclave-terminated TLS into the enclave and live only in enclave RAM.

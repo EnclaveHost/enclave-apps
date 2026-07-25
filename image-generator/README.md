@@ -1,34 +1,34 @@
-# image-generator — text-to-image on an Enclave GPU share
+# image-generator: text-to-image on an Enclave GPU share
 
 A wasm component that turns prompts into images through Enclave's wasi-nn
 interface on an H200 share, serving **host-preloaded
-stable-diffusion.cpp checkpoints**. Ships **no weights** — models arrive as
+stable-diffusion.cpp checkpoints**. Ships **no weights**: models arrive as
 attached Modelwrap volumes; the ~450 KB component carries only the request
 plumbing, the wasi-nn orchestration, a PNG encoder, and a self-contained
 web playground at `/`. The stock catalog:
 
 | model | what | steps | peak VRAM |
 |---|---|---|---|
-| `qwen-image-2512` | Qwen-Image-2512 (20B MMDiT, Apache-2.0) + lightx2v Lightning 8-step merge — the flagship: SOTA open-weights quality, legible text rendering | 8 | ~34 GB @1024px (tiled VAE) |
-| `z-image-turbo` | Tongyi-MAI Z-Image-Turbo (6B, Apache-2.0) — the fast one | 4–8 | ~13 GB @1024px (tiled VAE) |
+| `qwen-image-2512` | Qwen-Image-2512 (20B MMDiT, Apache-2.0) + lightx2v Lightning 8-step merge; the flagship: SOTA open-weights quality, legible text rendering | 8 | ~34 GB @1024px (tiled VAE) |
+| `z-image-turbo` | Tongyi-MAI Z-Image-Turbo (6B, Apache-2.0); the fast one | 4–8 | ~13 GB @1024px (tiled VAE) |
 
 ```
 prompt ──▶ load_by_name(volume) ──▶ ONE wasi-nn compute() ──▶ RGB ──▶ PNG
-           (host: sd.cpp — text encode, denoise, VAE decode)    (guest)
+           (host: sd.cpp runs text encode, denoise, VAE decode) (guest)
 ```
 
 The node preloads every SD volume's checkpoint components at server startup
 (`-S nn-graph=sd::<dir>` + the `ENCLAVE_SD_*_FILE` envs); the guest opens
 the graph by volume name and one `compute()` runs the whole pipeline
 host-side. Weights never enter guest memory, so model size is bounded by
-the GPU share — not wasm32's 4 GiB — and per-request traffic is the prompt
+the GPU share, not wasm32's 4 GiB, and per-request traffic is the prompt
 in, raw RGB out.
 
 ## Routes
 
 | route | what |
 |---|---|
-| `GET /` | image playground (self-contained HTML; model dropdown when the config lists several — auto-selects the largest attached model and warms it) |
+| `GET /` | image playground (self-contained HTML; model dropdown when the config lists several; auto-selects the largest attached model and warms it) |
 | `GET /ping` | liveness; touches no wasi-nn |
 | `GET /info` | volume attachment, step/size limits, and the `models` catalog (name/limits per entry) |
 | `GET /warmup?model=&size=` | load the weights + one tiny 1-step generation (at `min_size` unless `?size=` says otherwise); the playground fires it on page load |
@@ -39,7 +39,7 @@ in, raw RGB out.
 `model` names an entry from the config's `models` catalog (matched by
 display `name` **or** volume name); absent/empty means the deployment's
 default: the **largest attached model** (by `max_size`, later catalog
-entries win ties — so the flagship when both are attached). Sizes snap to
+entries win ties, so the flagship when both are attached). Sizes snap to
 sd.cpp's multiple of 64 inside each model's min/max; the playground offers
 512 / 1024 / 2048 as the long edge plus an aspect picker (1:1, 4:3, 3:4,
 3:2, 2:3, 16:9, 9:16; each option shows the exact WxH it produces, and
@@ -55,19 +55,19 @@ and is off-recipe for distilled checkpoints.
 ## Model volumes
 
 Component-layout sdcpp volumes (diffusion gguf + LLM text-encoder gguf +
-VAE), pinned in `fetch-model.sh` (revision + sha256 per file — the volume
+VAE), pinned in `fetch-model.sh` (revision + sha256 per file; the volume
 recipes):
 
-- **`z-image-turbo`** — the curated `EnclaveHost/z-image-turbo-sd@07cb261e`
+- **`z-image-turbo`**, the curated `EnclaveHost/z-image-turbo-sd@07cb261e`
   volume: Z-Image 6B Q8_0 + Qwen3-4B Q8_0 (sd.cpp's `--llm` text-encoder
   slot) + FLUX AE, ~11 GB.
-- **`qwen-image-2512`** — Qwen-Image-2512 20B Q8_0 **with the lightx2v
+- **`qwen-image-2512`**: Qwen-Image-2512 20B Q8_0 **with the lightx2v
   Lightning 8-step LoRA merged** + Qwen2.5-VL-7B Q8_0 text encoder + the
   Qwen-Image 16-ch VAE, ~29 GB. The merged `diffusion.gguf` is produced by
   `tools/merge-lightning.sh` (streaming LoRA merge, then Q8_0 quantization
   by the SAME `stable-diffusion.cpp@b5d81200` revision the fleet serves
   with); the other components fetch directly. Undistilled base output at
-  8 steps/cfg 1 is mush — the merge is what makes the flagship interactive.
+  8 steps/cfg 1 is mush; the merge is what makes the flagship interactive.
 
 Component filenames are **generic** (`diffusion.gguf` / `llm.gguf` /
 `vae.safetensors`): the platform's `ENCLAVE_SD_*_FILE` envs are node-global
@@ -83,7 +83,7 @@ The config's `models` catalog is a **map keyed by volume name**. The key is
 the volume the platform mounts at `/models/<key>`; the entry sets the
 display `name` (what the UI shows and a request's `model` selects) plus any
 field overrides on the top-level template. That map **is** the
-volume→model mapping — explicit, no name matching. The embedded catalog:
+volume→model mapping: explicit, no name matching. The embedded catalog:
 
 ```json
 "models": {
@@ -93,7 +93,7 @@ volume→model mapping — explicit, no name matching. The embedded catalog:
 ```
 
 So a volume wrapped as `qwen-image-2512-sd` is served as `qwen-image-2512`
-because the config says so — the `-sd` suffix is just part of the key you
+because the config says so; the `-sd` suffix is just part of the key you
 write. Each entry's effective config is the top-level fields with the
 entry's overlaid, `model_volume` pinned to the key. A deployment attaches
 the volumes by their real (key) names:
@@ -135,7 +135,7 @@ component-file envs. Node envs that matter here:
 ```
 
 **Fleet provisioning**: deployments can only attach volumes the enclave
-carries — Modelwrap entries in `enclaves/gpu/tinfoil-config.yml`:
+carries: Modelwrap entries in `enclaves/gpu/tinfoil-config.yml`:
 
 ```yaml
 models:
@@ -157,17 +157,17 @@ enclave deploy image-generator:1 --gpu 0.36 --cpu 0.02 --fund 5
 ```
 
 Attach volumes by the **exact names the enclave carries** (the `-sd`
-repo-slug names — `enclave apps` / the console volume picker lists them);
+repo-slug names; `enclave apps` / the console volume picker lists them);
 vmmanager matches attach names literally. Those names are the catalog keys,
 so each mounts at `/models/<key>` and serves under its entry's display name
-(`z-image-turbo`, `qwen-image-2512`) — the UI names stay clean.
+(`z-image-turbo`, `qwen-image-2512`); the UI names stay clean.
 
 VRAM budget (the dial that matters): z-image ~13 GB peak, qwen-image-2512
 ~34 GB peak (Q8 weights 20 GB + Qwen2.5-VL 8 GB + compute with tiled VAE),
-plus headroom — **both resident wants ~50 GB ≈ gpu 0.36** on the 141 GB
+plus headroom: **both resident wants ~50 GB ≈ gpu 0.36** on the 141 GB
 H200 (2048px headroom: 0.40); qwen alone ≈ 0.28; z-image alone ≈ 0.10.
 Suggested published minimums: **VRAM 48 GB · GPU 49 TFLOPS · RAM 512 MB ·
-CPU 10 GFLOPS** — the floor must make the DEFAULT config (both volumes)
+CPU 10 GFLOPS**; the floor must make the DEFAULT config (both volumes)
 work, because models are resident **first-come-first-served** within a
 share: warm order decides what fits, and the first failed CUDA alloc
 aborts the process. A z-image-only republish can floor at 14 GB.
@@ -180,7 +180,7 @@ pass `?target=cpu` / `"target":"cpu"` explicitly on dev boxes.
 
 Needs a wasmtime with the Enclave production patches and the sdcpp backend
 (the `nn-ggml` + `nn-sdcpp` patch chain plus `libenclave_sd.so` /
-`libstable-diffusion.so` on the library path — see the platform repo's
+`libstable-diffusion.so` on the library path; see the platform repo's
 `wasm/Dockerfile.wasmtime` for the exact recipe):
 
 ```bash
@@ -202,7 +202,7 @@ curl "127.0.0.1:8080/image?prompt=a+red+barn+at+sunset&steps=4&w=512&h=512&seed=
 ```
 
 CPU generation is slow by nature (z-image 512px 4-step ≈ minutes on 16
-cores) — local runs verify plumbing, not latency. `cargo test` runs the
+cores); local runs verify plumbing, not latency. `cargo test` runs the
 config/catalog logic natively.
 
 ## Config reference

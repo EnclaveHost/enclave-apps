@@ -1,8 +1,8 @@
-# network-test — "who am I on the network?"
+# network-test: "who am I on the network?"
 
 A tiny Enclave (enclave.host) service app that demonstrates **dedicated-IP
 egress**: every deployment gets its own IPv6, its declared ports are served on
-it (inbound), and — with the phase-2 toolchain — **all of its outbound leaves
+it (inbound), and, with the phase-2 toolchain, **all of its outbound leaves
 from that same address, with zero code changes**. This app proves each piece
 from the inside and prints the evidence as one plain-text page.
 
@@ -22,23 +22,23 @@ claim is about *unmodified* code, so the outbound probe is a bare
 
 - **[1]** dials the `ENCLAVE_EGRESS` front and speaks SOCKS5 (RFC 1928/1929) by
   hand; the CONNECT reply's `BND.ADDR` is this deployment's dedicated IPv6 as
-  derived *by the enclave from the authenticated credential* — the platform
+  derived *by the enclave from the authenticated credential*: the platform
   telling you who you are. (Under the phase-2 lockdown this explicit dial
   works because the shim passes a dial to the front itself through.)
 - **[2]** fetches a public ip-echo through that phase-1 tunnel: the internet's
   view of the source address.
-- **[3]** does the same fetch with plain `std::net` — no proxy, no SOCKS, the
+- **[3]** does the same fetch with plain `std::net`: no proxy, no SOCKS, the
   code every app already has. Under the phase-2 toolchain it reports the same
   address as [1]/[2]: outbound was source-tagged without the app knowing.
 - **[4]** dials the enclave's loopback (the supervisor port): denied, because
-  with `-S egress` the guest has **no raw network at all** — that's what makes
+  with `-S egress` the guest has **no raw network at all**; that's what makes
   the identity un-bypassable (and closes loopback SSRF). `[4b]` shows a known
   quirk: a *non-blocking* `connect_timeout` may report a phantom `Ok` for a
-  denied dial — the socket fails on its first read/write; no bytes ever flow.
+  denied dial: the socket fails on its first read/write; no bytes ever flow.
 
 The page is served on **both** declared ports, which is the other half of the
 story: `http:8000` is the ordinary `/x/<id>` HTTP path, and `tcp:7777` is
-reachable at `[<your dedicated IPv6>]:7777` via the tcp6-relay — the **same
+reachable at `[<your dedicated IPv6>]:7777` via the tcp6-relay: the **same
 address** your outbound leaves from. One identity, both directions.
 
 Degraded modes (the app reports them honestly): egress env absent → `[1][2]`
@@ -56,15 +56,15 @@ cargo build --release --target wasm32-wasip2
 
 ## Publish + deploy (on the platform)
 
-> **This is a run-mode (service) app — the open ports are MANDATORY.**
+> **This is a run-mode (service) app: the open ports are MANDATORY.**
 > network-test is a command component that binds raw sockets, not a
 > `wasi:http` serve component. It only runs when the deployment declares
 > open ports, which makes the enclave launch it with `wasmtime run`
 > (+ wasi:sockets, + `-S egress`). **Deploy or publish it without the ports
 > and the enclave falls back to `wasmtime serve`, which fails at instantiation
-> with `no exported instance named wasi:http/incoming-handler` — the app never
+> with `no exported instance named wasi:http/incoming-handler`; the app never
 > starts.** The ports are fixed on-chain at create time and can't be edited
-> after, so a portless deployment can't be repaired — deploy a new one.
+> after, so a portless deployment can't be repaired; deploy a new one.
 
 Specs:
 
@@ -76,7 +76,7 @@ Specs:
 | storage_mb | 0 (no `/data` needed) |
 | open ports | **`http:8000,tcp:7777`** (required) |
 
-**Recommended — publish to the catalog with the ports baked in, then deploy by
+**Recommended: publish to the catalog with the ports baked in, then deploy by
 slug** (every future deploy then carries the ports automatically, and it shows
 up in the Apps tab):
 
@@ -88,7 +88,7 @@ enclave publish target/wasm32-wasip2/release/network-test.wasm \
 enclave deploy network-test:0.1.0 --fund 1        # public by default
 ```
 
-**Or deploy the raw CID directly — but then you MUST pass `--ports` yourself**
+**Or deploy the raw CID directly, but then you MUST pass `--ports` yourself**
 (a raw-CID deploy has no catalog version to supply them):
 
 ```bash
@@ -123,7 +123,7 @@ node dev-run.mjs
 
 Local caveat: without a routed /64 on your box the derived identity is a
 placeholder and the relay dials from your own address (`EGRESS_ALLOW_V4=1`,
-v4-only echo), so `[1]` won't equal `[2]/[3]` — on a real enclave they match.
+v4-only echo), so `[1]` won't equal `[2]/[3]`; on a real enclave they match.
 What the local run does prove: transparent mediation (`[3]` succeeds with no
 raw network), the phase-1 front pass-through (`[1][2]` work under lockdown),
 and the lockdown itself (`[4]` denied).
