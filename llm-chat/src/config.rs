@@ -40,6 +40,14 @@ pub struct AppConfig {
     pub eos: Vec<u32>,
     /// chat template: "chatml" | "llama3" | "gemma" | "phi3" | "raw"
     pub template: String,
+    /// this model reasons in <think> blocks before answering (qwen3.x).
+    /// Marks the model so a request's enable_thinking=false can turn the
+    /// reasoning off: the assistant turn is pre-filled with an empty think
+    /// block (chatml only), the trained no-think form. Off (the default)
+    /// means the switch is ignored - pre-filling think tokens a model never
+    /// trained on degrades it.
+    #[serde(default)]
+    pub thinking: bool,
     pub system_prompt: String,
     pub max_prompt_tokens: usize,
     pub default_max_new: usize,
@@ -195,6 +203,7 @@ pub fn render_template(
     template: &str,
     system: &str,
     msgs: &[(String, String)], // (role, content), roles pre-filtered to user/assistant
+    no_think: bool, // pre-fill an empty <think> block (chatml thinking models only)
 ) -> Result<Rendered, String> {
     let mut p = String::new();
     let stops: Vec<String>;
@@ -205,6 +214,9 @@ pub fn render_template(
                 p.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
             }
             p.push_str("<|im_start|>assistant\n");
+            if no_think {
+                p.push_str("<think>\n\n</think>\n\n");
+            }
             stops = vec!["<|im_end|>".into(), "<|im_start|>".into()];
         }
         "llama3" => {

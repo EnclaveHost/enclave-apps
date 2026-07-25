@@ -160,10 +160,12 @@
   }
   .sw .knob {
     position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
-    background: var(--bg-menu); box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: left .15s;
+    background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: left .15s;
+    /* solid white in BOTH themes: the dark theme's --bg-menu matches the
+       track gray, which made the off state unreadable */
   }
   #storeToggle[aria-checked="true"] .sw { background: var(--accent); }
-  #storeToggle[aria-checked="true"] .sw .knob { left: 16px; background: #fff; }
+  #storeToggle[aria-checked="true"] .sw .knob { left: 16px; }
   .side-note { display: flex; gap: 10px; align-items: flex-start; padding: 0 8px; }
   .side-note svg { color: var(--ok); margin-top: 1px; flex: none; }
 
@@ -338,7 +340,7 @@
   }
   .edit-ta {
     width: 100%; resize: none; border: 0; outline: none; background: transparent;
-    color: var(--text); font: 15.5px/1.6 inherit; font-family: inherit;
+    color: var(--text); font-size: 15.5px; line-height: 1.6; font-family: inherit;
     max-height: 320px; caret-color: var(--text);
   }
   .edit-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
@@ -517,8 +519,10 @@
   #composer:focus-within { box-shadow: 0 2px 12px rgba(0,0,0,.08); border-color: var(--active); }
   #input {
     flex: 1; resize: none; border: 0; outline: none; background: transparent;
-    color: var(--text); font: 15.5px/1.5 inherit; font-family: inherit;
+    color: var(--text); font-size: 15.5px; line-height: 1.5; font-family: inherit;
     max-height: 200px; padding: 6px 0; caret-color: var(--text);
+    /* one line (23.25px) + padding = 35.25px, a hair under the 36px send
+       button it bottom-aligns with - so a single line sits dead center */
   }
   #input::placeholder { color: var(--text-3); }
   #sendBtn {
@@ -896,6 +900,7 @@ const state = {
   hostPending: {},  // model name -> error: attached and fits, but the HOST hasn't loaded it (yet) - the platform
                     // restarts the deployment to load it, so this state is transient; the boot ladder re-polls
   target: "auto",
+  think: true,      // thinking models only: off sends enable_thinking=false
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
 const chatId = () => "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -1502,7 +1507,10 @@ async function run(chat) {
     const res = await fetch("chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages: payload, target: state.target, model: state.model || undefined }),
+      body: JSON.stringify({
+        messages: payload, target: state.target, model: state.model || undefined,
+        enable_thinking: state.think ? undefined : false, // undefined keys are dropped
+      }),
       signal: ctl.signal,
     });
     if (!res.ok || !res.body) {
@@ -1707,6 +1715,29 @@ function renderModelMenu() {
     seg.querySelector(".seg").appendChild(b);
   }
   modelMenu.appendChild(seg);
+  // thinking switch, shown only when the selected model reasons in <think>
+  // blocks: off sends enable_thinking=false and the server pre-fills an
+  // empty think block, so the model answers directly
+  const cur = state.models.find((m) => (m.name || "") === state.model);
+  if (cur && cur.thinking) {
+    const tseg = node('<div class="seg-row"><span>Thinking</span><div class="seg"></div></div>');
+    for (const t of ["on", "off"]) {
+      const b = node("<button type='button'></button>");
+      b.textContent = t;
+      if ((state.think ? "on" : "off") === t) b.classList.add("on");
+      b.title = t === "on"
+        ? "reason in a collapsible Thoughts block before answering"
+        : "answer directly, no thinking";
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.think = t === "on";
+        pref("llmchat-think", t);
+        tseg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      });
+      tseg.querySelector(".seg").appendChild(b);
+    }
+    modelMenu.appendChild(tseg);
+  }
 }
 
 // Model discovery: the deployment lists its servable models largest-first
@@ -1715,14 +1746,16 @@ function renderModelMenu() {
 // wins (when this deployment still serves it). The compute target restores
 // the same way.
 const modelsReady = (async () => {
-  let storedModel = null, storedTarget = null;
+  let storedModel = null, storedTarget = null, storedThink = null;
   try {
     if (storeOK) {
       storedModel = localStorage.getItem("llmchat-model");
       storedTarget = localStorage.getItem("llmchat-target");
+      storedThink = localStorage.getItem("llmchat-think");
     }
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
+  if (storedThink === "off") state.think = false;
   let models = [];
   try {
     const res = await fetch("models");
