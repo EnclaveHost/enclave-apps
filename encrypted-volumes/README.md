@@ -1,14 +1,14 @@
-# encrypted-volumes — the encrypted-volumes app (rclone crypt over S3)
+# encrypted-volumes: the encrypted-volumes app (rclone crypt over S3)
 
 Encrypted volumes are user-held-key confidential storage: you encrypt a
 directory **client-side** with [rclone crypt](https://rclone.org/crypt/) and
 push the ciphertext to any S3-compatible bucket. The deployment's App Config
-names *where* the ciphertext lives — never a key. At runtime the platform
+names *where* the ciphertext lives, never a key. At runtime the platform
 preopens an empty dir per volume at `/enc/<name>` and starts the app
 immediately; this app serves the **decryption UI**: the key enters in the
 browser (over the deployment's in-enclave-terminated TLS), the app relays it
 over loopback to the in-enclave manager (`ENCLAVE_ENC_API`, authenticated
-with `ENCLAVE_ENC_TOKEN` — which never reaches the browser), and the manager
+with `ENCLAVE_ENC_TOKEN`, which never reaches the browser), and the manager
 pulls + decrypts into the live preopen. The bucket, the network, and the
 operator's host only ever see ciphertext; plaintext exists only on the CVM's
 encrypted ramdisk.
@@ -16,7 +16,7 @@ encrypted ramdisk.
 ## Wallet unlock (the primary flow)
 
 **Unlock with wallet** derives the volume key from a deterministic ECDSA
-`personal_sign` — no password to keep, no transaction, nothing stored or
+`personal_sign`: no password to keep, no transaction, nothing stored or
 verified on any server. The wallet signs a canonical message naming the
 volume, and password + salt fall out of the signature; only the wallet
 holder can reproduce them. The backend is untouched by this: the manager
@@ -42,18 +42,18 @@ derives a different key). Config `unlock: "wallet"` makes the UI lead with
 the wallet button (`"password"` leads with the form; both always work).
 The app's **derive push credentials** panel signs and reveals the
 signature/password/salt plus a ready `enclave-encvol.sh push` command for
-seeding the bucket — or sign anywhere else:
+seeding the bucket. Or sign anywhere else:
 `cast wallet sign "$(scripts/enclave-encvol.sh message myvol)"`.
 
 ## Credentials envelope (one-signature unlock)
 
 S3 credentials can ride the **public** App Config sealed under the same
 wallet signature, so one signature derives the crypt key AND opens the
-bucket credentials — nothing typed at unlock, after any restart. Seal with
+bucket credentials: nothing typed at unlock, after any restart. Seal with
 the panel's **Seal** button or `enclave-encvol.sh seal-creds --sig 0x…`
 (reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), and put the printed
 value in the volume's entry as `"credsEnvelope"`. Byte-exact contract
-(pinned by the platform e2e; the manager ignores the field — this app
+(pinned by the platform e2e; the manager ignores the field; this app
 decrypts it in the browser):
 
 ```
@@ -67,9 +67,9 @@ for the key is the wallet that opens the credentials. Anything typed into
 the unlock form's S3 fields overrides the envelope.
 
 Caveats: needs an injected EOA wallet (`window.ethereum`) that signs
-deterministically (RFC 6979 — MetaMask, Ledger, EOAs generally);
+deterministically (RFC 6979: MetaMask, Ledger, EOAs generally);
 smart-contract / ERC-1271 wallets and randomized MPC signers won't derive a
-stable key — use password mode for those. Anyone holding the signature (or
+stable key; use password mode for those. Anyone holding the signature (or
 who gets the wallet to sign this exact message) can derive the key: the
 sign prompt is the security boundary.
 
@@ -84,8 +84,8 @@ names) and plain `std::fs` works.
 | `GET /`                | decryption UI + volume browser                              |
 | `GET /api/status`      | proxied manager status (adds the token server-side)         |
 | `POST /api/unlock`     | `{name, password, salt?, accessKeyId?, secretAccessKey?, sessionToken?}` |
-| `POST /api/sync`       | `{name}` — push local edits back to the bucket (re-encrypted) |
-| `POST /api/lock`       | `{name}` — wipe plaintext, drop retained credentials        |
+| `POST /api/sync`       | `{name}`: push local edits back to the bucket (re-encrypted) |
+| `POST /api/lock`       | `{name}`: wipe plaintext, drop retained credentials         |
 | `GET /ls`              | JSON listing of every `ENCLAVE_ENC` volume                  |
 | `GET /f/<vol>/<path>`  | raw file bytes (streamed; any size)                         |
 | `GET /ping`            | liveness                                                    |
@@ -117,7 +117,7 @@ true` makes the manager drop the credentials right after the pull, disabling
 `/api/sync` push-back.
 
 Trust notes: rclone crypt authenticates file *contents* (NaCl secretbox),
-so the bucket can't tamper with what you read — but there is no signed
+so the bucket can't tamper with what you read, but there is no signed
 manifest of the tree, so a malicious bucket could serve a stale or partial
 *set* of files. Prefer `https` endpoints; S3 credentials sent at unlock ride
 attested TLS into the enclave and live only in enclave RAM.

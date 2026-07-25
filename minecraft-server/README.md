@@ -1,17 +1,17 @@
-# nanmc — a Minecraft server as an Enclave wasm service app
+# nanmc: a Minecraft server as an Enclave wasm service app
 
 A zero-dependency Minecraft server written in Rust, compiled to a
 **wasm32-wasip2 command component**, and shaped to the Enclave hosting platform's
 *service app* contract: the wasm-manager launches it with `wasmtime run` and a
 wasi:sockets grant, it binds the TCP port the platform assigns, and Minecraft
-clients reach it through the enclave's WebSocket bridge — all inside the
+clients reach it through the enclave's WebSocket bridge, all inside the
 attested sandbox (no filesystem, no host env beyond `ENCLAVE_PORTS`, no threads,
 memory-capped).
 
 It speaks **protocol 47**, i.e. any vanilla **1.8–1.8.9** client (still
 selectable in the official launcher: Installations → New → version 1.8.9).
 There is no JVM in the enclave and never will be, so this is not Mojang's
-server — it is the protocol reimplemented from scratch (~1.5k lines, no
+server: it is the protocol reimplemented from scratch (~1.5k lines, no
 crates), which is also why it targets 1.8: the last protocol generation that
 a from-scratch server can speak completely.
 
@@ -27,7 +27,7 @@ a from-scratch server can speak completely.
   rejection for non-1.8 clients at login).
 - **Login**: offline mode (the enclave can't reach Mojang session servers),
   deterministic per-name UUIDs, name validation, duplicate-name and
-  server-full handling. No compression, no encryption — frames stay simple.
+  server-full handling. No compression, no encryption; frames stay simple.
 - **World**: procedural rolling grass hills (value noise, fixed seed),
   bedrock/stone/dirt/grass strata with tall-grass and flower decoration,
   generated on demand and streamed in rings around each player (view
@@ -35,39 +35,39 @@ a from-scratch server can speak completely.
   block states, nibble light arrays, biomes), chunk unloads behind you, and
   a serialized-chunk cache. Time is frozen at noon.
 - **Creative multiplayer**: tab list, spawn/despawn of other players,
-  position/look sync (absolute entity teleports — no drift), arm-swing
+  position/look sync (absolute entity teleports: no drift), arm-swing
   relay, chat (vanilla `chat.type.text` translate component), join/leave
   broadcasts, block **place and break** synced to everyone with
   server-authoritative rollback (reach checks, placement validation,
-  replaceable tall grass, meta from item damage — colored wool works).
+  replaceable tall grass, meta from item damage; colored wool works).
 - **Liveness**: keep-alives every 10s, 30s timeout, pre-login timeouts,
   input frame caps, output backpressure (chunks stream only as fast as the
   socket drains).
 
 Limits (compiled in): 20 players, 64 sockets, view distance 5. **Nothing is
-persisted** — the platform gives apps no disk, so the world regenerates from
+persisted**: the platform gives apps no disk, so the world regenerates from
 the seed on every restart and player edits live exactly as long as the
 deployment. Treat it as an ephemeral build-together canvas, not a world of
 record. No survival mechanics: no mobs, physics, inventory persistence,
-health, or crafting — everyone is in creative.
+health, or crafting; everyone is in creative.
 
 ## Design notes
 
 `wasm32-wasip2` has no threads, so the server is one non-blocking event loop
 (`src/main.rs`): accept, read/dispatch, timers + chunk streaming, flush, reap,
 then a 25ms idle sleep (2ms under load). Rust `std::net` maps directly to
-wasi:sockets on this target — no async runtime, no dependencies, ~193 KB
+wasi:sockets on this target: no async runtime, no dependencies, ~193 KB
 component.
 
 The one platform rule (`wasm/apps/README.md` in the enclave repo): **read `ENCLAVE_PORTS` and bind
 the actual port, never hardcode.** `resolve_port()` prefers our logical entry
 `tcp:15565=<actual>`, falls back to the first tcp entry, and only defaults to
-15565 when `ENCLAVE_PORTS` is absent (local development). It binds loopback only —
+15565 when `ENCLAVE_PORTS` is absent (local development). It binds loopback only;
 that is where the supervisor's bridge connects, and the manager's port audit
 kills apps that bind anything unassigned.
 
 Why 15565 and not Minecraft's 25565: the platform caps logical port labels at
-19999. The logical port is just a label — players' local websocat shim (below)
+19999. The logical port is just a label: players' local websocat shim (below)
 listens on 25565 anyway, so stock clients notice nothing.
 
 ## Build
@@ -131,7 +131,7 @@ need `?token=<JWT>`).
 
 ## Connecting as a player
 
-Minecraft's protocol is raw TCP, not TLS, so it can't ride the SNI relay —
+Minecraft's protocol is raw TCP, not TLS, so it can't ride the SNI relay;
 players use the enclave's WebSocket bridge with
 [websocat](https://github.com/vi/websocat), one shim per player, then connect
 to it as if it were a LAN server:

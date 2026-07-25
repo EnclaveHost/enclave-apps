@@ -1,10 +1,10 @@
-# nanircd — an IRC server as an Enclave wasm service app
+# nanircd: an IRC server as an Enclave wasm service app
 
 A zero-dependency IRC server written in Rust, compiled to a **wasm32-wasip2
 command component**, and shaped to the Enclave hosting platform's *service app*
 contract: the wasm-manager launches it with `wasmtime run` and a wasi:sockets
 grant, it binds the TCP port the platform assigns, and IRC clients reach it
-through the enclave's WebSocket bridge — all inside the attested sandbox (no
+through the enclave's WebSocket bridge, all inside the attested sandbox (no
 filesystem, no host env beyond `ENCLAVE_PORTS`, no threads, memory-capped).
 
 ```
@@ -18,7 +18,7 @@ IRC client ──tcp──> websocat ──wss──> https://<enclave>/x/<dep_i
 RFC 1459/2812 core, single server (no S2S linking):
 
 - **Registration**: `NICK`, `USER`, `PASS` (accepted, unused), CAP negotiation
-  (`CAP LS/LIST/REQ/END` — empty capability set, so modern clients register
+  (`CAP LS/LIST/REQ/END`: empty capability set, so modern clients register
   cleanly), welcome numerics 001–005 with `ISUPPORT`, `LUSERS`, `MOTD`.
 - **Channels**: `JOIN` (incl. `JOIN 0`, keys), `PART`, `TOPIC`, `NAMES`,
   `LIST`, `KICK`, `INVITE`, channel modes `+n +t +k +l +o +v` (defaults `+nt`,
@@ -32,7 +32,7 @@ RFC 1459/2812 core, single server (no S2S linking):
   casemapping.
 
 Limits (compiled in): 512 clients, 32 channels/user, 24-char nicks, 50-char
-channel names, 390-char topics. State is in-memory only — the platform gives
+channel names, 390-char topics. State is in-memory only; the platform gives
 apps no disk, which suits IRC: when the deployment ends, the network vanishes.
 
 ## Design notes
@@ -40,12 +40,12 @@ apps no disk, which suits IRC: when the deployment ends, the network vanishes.
 `wasm32-wasip2` has no threads, so the server is one non-blocking event loop
 (`src/main.rs`): accept, read/dispatch, timers, flush, reap, then a 25ms idle
 sleep (2ms under load). Rust `std::net` maps directly to wasi:sockets on this
-target — no async runtime, no dependencies, ~230 KB component.
+target: no async runtime, no dependencies, ~230 KB component.
 
 The one platform rule (`wasm/apps/README.md` in the enclave repo): **read `ENCLAVE_PORTS` and bind
 the actual port, never hardcode.** `resolve_port()` prefers our logical entry
 `tcp:6667=<actual>`, falls back to the first tcp entry, and only defaults to
-6667 when `ENCLAVE_PORTS` is absent (local development). It binds loopback only —
+6667 when `ENCLAVE_PORTS` is absent (local development). It binds loopback only;
 that is where the supervisor's bridge connects, and the manager's port audit
 kills apps that bind anything unassigned.
 
@@ -110,7 +110,7 @@ then need `?token=<JWT>`).
 ## Connecting as a user
 
 Declared TCP ports ride the enclave's single attested origin as a WebSocket at
-`/x/<dep_id>/tcp/6667` (always the *logical* port — the supervisor resolves the
+`/x/<dep_id>/tcp/6667` (always the *logical* port; the supervisor resolves the
 per-deployment actual). Bridge it to a local socket with
 [websocat](https://github.com/vi/websocat), one bridge per IRC connection:
 

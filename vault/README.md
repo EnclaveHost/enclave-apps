@@ -1,15 +1,15 @@
-# vault — the web UI for wallet-gated encrypted volumes
+# vault: the web UI for wallet-gated encrypted volumes
 
 A `wasi:http` component that serves the browser side of enclave-vault (Phase 4 of
 the encrypted-volumes design). Users connect a wallet, derive their vault key
-(one deterministic `personal_sign` — see `DERIVE_MESSAGE` in
+(one deterministic `personal_sign`; see `DERIVE_MESSAGE` in
 `scripts/enclave-vault.mjs`), self-register on the EnclaveVolumeAccess ACL, and unlock
 deployments by sealing the volume key to an **attestation-verified** enclave.
 Owners create volumes, bootstrap the VEK, grant/revoke members.
 
 The page is fully self-contained: `vault.js` vendors the protocol
 (`scripts/enclave-vault.mjs`), viem and `@tinfoilsh/verifier` at build time.
-Nothing loads from a CDN at runtime — a runtime-fetched script could
+Nothing loads from a CDN at runtime; a runtime-fetched script could
 exfiltrate the wallet-derived key or an unsealed VEK.
 
 ## Routes
@@ -26,14 +26,14 @@ Deep links: `/?owner=0x…&volume=user-data&dep=0x…` (plus `contract=`, `rpc=`
 
 ## Trust chain (what the page enforces, in order)
 
-1. **Discovery from chain state** — `EnclaveDeployments.get(id).runner` is
+1. **Discovery from chain state**: `EnclaveDeployments.get(id).runner` is
    `keccak256` of the runner's EnclaveRegistry endpoint; no gateway is trusted to
    say where a deployment runs.
-2. **Attestation before key release** — `@tinfoilsh/verifier` verifies the
+2. **Attestation before key release**: `@tinfoilsh/verifier` verifies the
    runner origin measures as its registry `repo`; only then is the enclave's
    per-boot vault pubkey fetched over that TLS (deployment-scoped path) and
    the VEK sealed to it.
-3. **On-chain ACL** — SIWE only names the member; the enclave gates
+3. **On-chain ACL**: SIWE only names the member; the enclave gates
    `unlock-sealed` on `isAuthorized(volId, member)`.
 
 Key material (wallet-derived X25519 secret, unsealed VEK) lives in page RAM
@@ -59,7 +59,7 @@ overridden per deployment via `ENCLAVE_CONFIG` (configCid) or `?contract=`.
 
 ## Publish
 
-Pure `wasi:http`, no GPU, no ports beyond the served app, minimal memory —
+Pure `wasi:http`, no GPU, no ports beyond the served app, minimal memory;
 publish like `hello-world`. Pairs with the always-on unlock agent:
 `node scripts/enclave-vault-client.mjs watch --id 0x… --owner 0x… --name <vol>`
 (re-delivers the sealed VEK on failover/restart; detects fresh enclave boots

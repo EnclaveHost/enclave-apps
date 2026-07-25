@@ -1,4 +1,4 @@
-# gs-bridge — a Moonlight/GameStream host for the RISC Box desktop
+# gs-bridge: a Moonlight/GameStream host for the RISC Box desktop
 
 This is the native bridge that lets a real **Moonlight** client stream the RISC
 Box desktop over NVIDIA's GameStream protocol. It's the counterpart to the
@@ -9,8 +9,8 @@ wires those two together.
 
 Why native (not in the wasm app): GameStream needs a plain-HTTP + HTTPS control
 surface, UDP RTP/ENet transports, and (for real speed) hardware video encode.
-That belongs in a native process running where a GPU is reachable — the same
-place the H200 NVENC path would live (see `../docs/encode-path-handoff.md`) —
+That belongs in a native process running where a GPU is reachable, the same
+place the H200 NVENC path would live (see `../docs/encode-path-handoff.md`),
 not inside the `wasm32-wasip2` sandbox. The bridge pulls frames from the app's
 `/video` and posts input back to `/hid`.
 
@@ -40,11 +40,11 @@ host reports `PairStatus=1`. The pairing crypto mirrors Sunshine's
 ## GPU compute: NVENC hardware encode on the H200
 
 The RISC Box app's GPU compute is the video **encode**, and it runs on the GPU's
-NVENC engine — off the emulated CPU and off the wasm app. In production this
+NVENC engine, off the emulated CPU and off the wasm app. In production this
 runs on the fleet GPU node's **H200** (co-located with the RISC Box CVM); the
 NVENC API is identical on a dev GPU, so a pipeline verified locally is the H200
 path. The frame source is the app's `GET /fb.rgb` (raw 800×600 RGB); the native
-bridge pulls it and NVENC-encodes it (`encode-nvenc.sh` — the encoder gs-bridge
+bridge pulls it and NVENC-encodes it (`encode-nvenc.sh`, the encoder gs-bridge
 feeds into the video stream).
 
 **Verified on an RTX 3070** (the local test GPU; production is the H200): pulling
@@ -56,10 +56,10 @@ work. The 3070 also exposes `av1_nvenc` and `hevc_nvenc`.
 
 ## What's implemented vs. remaining
 
-Implemented: the GameStream HTTP control surface for discovery + pairing —
+Implemented: the GameStream HTTP control surface for discovery + pairing,
 `/serverinfo` (so Moonlight lists the host) and `/pair` (the 4-phase handshake),
 on HTTP :47989. Session state, self-signed server cert, and the exact crypto.
-Plus the GPU encode (NVENC) of the desktop — the GPU compute — verified above.
+Plus the GPU encode (NVENC) of the desktop, the GPU compute, verified above.
 
 Remaining for actual video streaming (the larger piece):
 
@@ -68,7 +68,7 @@ Remaining for actual video streaming (the larger piece):
 - **RTSP handshake** (:48010) negotiating the streams.
 - **RTP video** (:47998): packetize the app's AV1 frames in Moonlight's video
   packet format with Reed-Solomon FEC. Modern Moonlight/Sunshine support AV1,
-  so the app's existing `/video` output is the source — no H.264 needed for a
+  so the app's existing `/video` output is the source; no H.264 needed for a
   browser-grade client. (H.264/HEVC via H200 NVENC remains the path for maximum
   compatibility/speed; see `../docs/encode-path-handoff.md`.)
 - **ENet control** (:47999, AES-GCM): input + keepalives. Input maps to the

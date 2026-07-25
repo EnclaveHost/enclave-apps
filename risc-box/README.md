@@ -1,7 +1,7 @@
-# RISC Box — a real machine on the enclave's CPU, booted from S3
+# RISC Box: a real machine on the enclave's CPU, booted from S3
 
 RISC Box boots a full operating system **inside the enclave**, the way QEMU
-installed on a server would — the emulated CPU runs on the TEE's own silicon,
+installed on a server would: the emulated CPU runs on the TEE's own silicon,
 not in your browser. The enclave pulls a kernel and root filesystem from an
 **S3 bucket**, boots them, and bridges the machine's serial console to your
 browser; your keystrokes go back into the guest, and disk writes can be saved
@@ -14,7 +14,7 @@ executes in the enclave.** That difference drives the whole design.
 
 ## Why an emulator, not "QEMU on the enclave"
 
-QEMU's own WebAssembly port only runs in a browser — it is an Emscripten
+QEMU's own WebAssembly port only runs in a browser; it is an Emscripten
 build that needs JS glue, Web Workers, and SharedArrayBuffer, none of which
 exist under a server-side wasm runtime. The platform runs apps as
 `wasm32-wasip2` components under wasmtime, so a browser-targeted QEMU can
@@ -22,46 +22,46 @@ never execute there. Running a machine *in* the enclave therefore means a
 system emulator that is itself a native `wasm32-wasip2` program.
 
 RISC Box vendors one:
-[takahirox/riscv-rust](https://github.com/takahirox/riscv-rust) — a pure-Rust
+[takahirox/riscv-rust](https://github.com/takahirox/riscv-rust), a pure-Rust
 RISC-V system emulator (RV64GC, Sv39 MMU, CLINT + PLIC + 16550 UART + virtio
 block) that boots real Linux. It compiles to the same target as the rest of
 the fleet and steps instruction-by-instruction in the TEE. The source lives
 in [`emu/`](emu/); every divergence from upstream is tagged `risc-box patch`
 in-line. Beyond the original two (`dump_contents()` / `get_disk()`, which read
 the guest-modified disk back out for saving) there are three functional
-additions — a legacy virtio-net MMIO device at `0x10002000`, IRQ 2, with a
+additions: a legacy virtio-net MMIO device at `0x10002000`, IRQ 2, with a
 pluggable `NetBackend` mirroring the UART's `Terminal` (see Networking below);
-the missing float instructions — ten RV64D (the FCVT int↔double family,
-FSGNJN.D, FMIN/FMAX.D, FMSUB/FNMADD.D, FSQRT.D — busybox `ping` hits
+the missing float instructions, ten RV64D (the FCVT int↔double family,
+FSGNJN.D, FMIN/FMAX.D, FMSUB/FNMADD.D, FSQRT.D; busybox `ping` hits
 `FCVT.D.LU` on its first timestamp), then `FCLASS.D` (glibc's
 `fpclassify`/`isnan` compile to it) and the whole single-precision RV64F set
 (upstream had almost none of it; Xorg SIGILLs on `FSGNJ.S` at startup);
 `mstatus.FS` reported **always Dirty** so the guest kernel saves/restores FP
 registers on every context switch (the emulator doesn't track f-register
 writes, and a Clean FS made Linux skip the save while still restoring the
-zeroed save area — any process holding live FP values across a syscall got
+zeroed save area; any process holding live FP values across a syscall got
 them silently wiped); unknown instructions now raise a proper
 illegal-instruction trap (guest process gets SIGILL) instead of panicking the
 whole host app; unmapped physical addresses read as open bus (0, writes
 dropped and rate-limit logged) instead of panicking; virtio-blk reports the
-disk's real capacity (was hardcoded 100 MiB — ext4 saw "bad geometry") and
+disk's real capacity (was hardcoded 100 MiB; ext4 saw "bad geometry") and
 drains its whole avail ring per queue notify (one buffer per notify hung
-large-filesystem mounts in `io_schedule`) — and six performance patches,
+large-filesystem mounts in `io_schedule`). Plus six performance patches,
 measured end-to-end at 2.8× throughput and 2.5× faster boot:
 
 - a direct-mapped **software TLB** in front of the Sv32/Sv39 page walk,
   tagged with a generation counter plus the translation-relevant CPU state;
-  satp/mode changes and `SFENCE.VMA` (a no-op upstream — honored here)
+  satp/mode changes and `SFENCE.VMA` (a no-op upstream, honored here)
   invalidate in O(1), and entries are filled only by walks that already set
   the PTE A/D bits, so hits never touch the page table;
 - a **predecoded instruction cache** keyed by virtual PC: on a hit, one tag
   compare replaces fetch translation, memory read, RVC uncompression, and
-  decode. Self-modifying code is handled properly — pages backing cached
+  decode. Self-modifying code is handled properly: pages backing cached
   instructions are marked, and every DRAM write (CPU store *or* virtio DMA;
   both funnel through one wrapper) that touches a marked page invalidates
   the cache by generation bump;
 - the LRU decode cache (hash map + linked list on every hit) replaced by a
-  **direct-mapped decode table** — one shift, one mask, one compare;
+  **direct-mapped decode table**: one shift, one mask, one compare;
 - misaligned memory access **two-cell paths** replacing per-byte loops
   (compressed instructions put half of all fetches at `pc % 4 == 2`), which
   also fixes an upstream bug corrupting 4-aligned misaligned 8-byte loads;
@@ -70,23 +70,23 @@ measured end-to-end at 2.8× throughput and 2.5× faster boot:
 
 ## Architecture
 
-RISC Box is a run-mode **service app** — `wasmtime run` + `wasi:sockets`, one
+RISC Box is a run-mode **service app**: `wasmtime run` + `wasi:sockets`, one
 attested process holding the machine in the enclave's RAM (the same shape as
 [IRC](../IRC) and the utility suite; it reuses the suite's
 [`httpd.rs`](src/httpd.rs) HTTP/1.1 + SSE engine). A single thread interleaves
 the two jobs a machine host has:
 
-- **be the CPU** — step a batch of guest instructions, drain the UART's output
+- **be the CPU**: step a batch of guest instructions, drain the UART's output
   into a console broadcast, feed queued keystrokes into the UART's receive
   register;
-- **be the front end** — accept HTTP, stream the console over Server-Sent
+- **be the front end**: accept HTTP, stream the console over Server-Sent
   Events, take input and control commands.
 
 Images come from S3 over the platform's transparent egress.
 [`src/s3.rs`](src/s3.rs) is a self-contained client: rustls with the pure-Rust
 RustCrypto provider (the only TLS stack that builds for `wasm32-wasip2`) for
 `https://`, a plain socket for `http://`, path-style requests, and SigV4
-signing (GET to fetch, PUT to save) hand-rolled from `sha2`/`hmac` — no
+signing (GET to fetch, PUT to save) hand-rolled from `sha2`/`hmac`; no
 `aws-sdk`, no `chrono`.
 
 ```
@@ -123,7 +123,7 @@ JSON object:
 ```
 
 - `kernel` is an ELF with an SBI payload (OpenSBI `fw_payload`, or BBL+vmlinux);
-  `fs` is a raw disk image mounted as `/dev/vda`. `dtb` is optional — the
+  `fs` is a raw disk image mounted as `/dev/vda`. `dtb` is optional; the
   emulator ships a default device tree that boots the sample images.
 - `saveKey` is where **Save disk** PUTs the guest-modified image (defaults to
   `fs`; set it aside to keep the pristine image). `readOnly: true` disables
@@ -135,8 +135,8 @@ JSON object:
   fall back to the browser prompt). The config itself is read once, at
   process start: config or secret changes need a restart to take effect.
 - The app **always starts**, even unconfigured. If a required field
-  (`endpoint`/`bucket`/`kernel`/`fs`) is still empty — typically a `$VAR`
-  secret you haven't set yet — it serves the UI and reports the gap in
+  (`endpoint`/`bucket`/`kernel`/`fs`) is still empty, typically a `$VAR`
+  secret you haven't set yet, it serves the UI and reports the gap in
   `/status` instead of exiting; it just refuses to boot a machine (a clear
   400 from `/start`) until the values are set and the process restarted. So a
   freshly deployed instance comes up ready to configure, not `failed`.
@@ -148,13 +148,13 @@ JSON object:
   Networking below.
 - `api_key` is optional but **required for safety on a public deployment**:
   when set (use a `$VAR` secret, not a literal), every endpoint that drives or
-  observes the machine — `/start`, `/stop`, `/save`, `/input`, `/console`,
-  `/status` — demands it, presented as `Authorization: Bearer <key>`,
+  observes the machine (`/start`, `/stop`, `/save`, `/input`, `/console`,
+  `/status`) demands it, presented as `Authorization: Bearer <key>`,
   `X-Api-Key: <key>`, or `?key=<key>` (the last for the SSE console). Only the
   static shell, its assets, and `/ping` stay open. See Security below.
 - **Credentials** are optional. A public-read bucket needs none (requests go
   unsigned). Otherwise, credentials may sit in the config (the enclave attests
-  it) **or** be typed in the browser at boot — they are sent only to this app,
+  it) **or** be typed in the browser at boot; they are sent only to this app,
   over the deployment's in-enclave-terminated TLS, and live only in enclave
   RAM. `autostart: true` boots at process start (needs a public bucket or
   config credentials).
@@ -166,7 +166,7 @@ JSON object:
 | `GET /`           | console UI (self-contained HTML + embedded xterm)                    |
 | `GET /a/<asset>`  | embedded `xterm.js` / `xterm.css`                                    |
 | `GET /status`     | JSON: phase, image sizes, instructions retired, MIPS, console bytes  |
-| `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?}` — fetch from S3 and boot; `reset:true` re-fetches instead of using the cached images |
+| `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?}`: fetch from S3 and boot; `reset:true` re-fetches instead of using the cached images |
 | `POST /input`     | **raw bytes** in the body → the guest UART receive register          |
 | `GET /console`    | Server-Sent Events: base64 console output, scrollback replayed first |
 | `POST /save`      | dump the guest disk and PUT it to `saveKey`                          |
@@ -187,7 +187,7 @@ scripts/seed-machine.py put … ./images/rootfs.img images/rootfs.img
 
 The sample is the OpenSBI + Linux + Buildroot image set from the vendored
 emulator's own resources. Any RISC-V kernel/rootfs that boots on the
-`virt`-style machine works — build your own with Buildroot and drop them in.
+`virt`-style machine works. Build your own with Buildroot and drop them in.
 
 ## Networking and SSH
 
@@ -222,22 +222,22 @@ bind via `ENCLAVE_PORTS` exactly like the http port.
 ### Outbound: user-mode NAT, slirp-style
 
 The gateway also NATs the guest **outbound**, the way QEMU's user networking
-(slirp) does. wasip2 has no raw sockets, so nothing is bridged — every guest
+(slirp) does. wasip2 has no raw sockets, so nothing is bridged: every guest
 flow is re-terminated on a real socket that rides the platform's transparent
 egress:
 
-- **TCP** — a guest SYN to an external `ip:port` opens a real connection and
+- **TCP**: a guest SYN to an external `ip:port` opens a real connection and
   splices it onto the guest's (same machinery as the inbound forwards). A
   refused or unreachable target answers the guest with an RST instead of a
   silent hang.
-- **UDP** — one real socket per guest flow (capped at 64, idle-expired after
+- **UDP**: one real socket per guest flow (capped at 64, idle-expired after
   60 s); replies are re-framed to the guest from the external source.
-- **DNS** — the DHCP lease advertises `10.0.2.2` as resolver, and a proxy at
+- **DNS**: the DHCP lease advertises `10.0.2.2` as resolver, and a proxy at
   `10.0.2.2:53` answers A queries with the platform's own name lookup (so
   resolution happens where the platform's egress policy lives; it works even
-  where raw UDP egress does not). AAAA gets an empty NOERROR — the guest wire
+  where raw UDP egress does not). AAAA gets an empty NOERROR; the guest wire
   is IPv4-only, so dual-stack guests fall back cleanly.
-- **ICMP echo** — `ping 8.8.8.8` works: the gateway answers echo requests
+- **ICMP echo**: `ping 8.8.8.8` works; the gateway answers echo requests
   itself, exactly like slirp. A reply confirms the NAT path is up, not that
   the target really answered an ICMP packet (none can leave the enclave).
 
@@ -256,19 +256,19 @@ wget http://example.com/  # TCP NAT (needs a working libc resolver, see below)
 
 **Sample-image caveat:** the demo Buildroot images ship a *statically linked
 glibc* busybox, whose `getaddrinfo` cannot resolve names on **any** network
-(it needs NSS shared libraries that aren't in the image) — `wget` by hostname
+(it needs NSS shared libraries that aren't in the image); `wget` by hostname
 says `bad address` without sending a single packet, under QEMU too. busybox
 `nslookup` (its own resolver) works fine, as does any traffic by IP literal.
 Real images with a dynamic libc (musl or full glibc) resolve normally.
 
-`"outbound": false` in the `net` config removes all of this — the sealed,
+`"outbound": false` in the `net` config removes all of this: the sealed,
 inbound-only posture where the machine cannot exfiltrate anything by itself.
 `/status` reports the network state under `net` (guest IP, forwards, frame
 counters, active connections, `outbound`, and live `natTcp`/`natUdp` flow
 counts).
 
 Two honest notes on the TCP path: the one blocking step is the real
-`connect()` (wasip2 has no async connect), bounded at 2.5 s — a guest dialing
+`connect()` (wasip2 has no async connect), bounded at 2.5 s; a guest dialing
 a dead IP stalls the machine that long, once per attempt (up to 32 concurrent
 outbound connections). And after any network activity the emulator runs
 ~100 M instructions at full speed before re-entering the idle throttle, so
@@ -305,8 +305,8 @@ Open `http://127.0.0.1:8000/`, press **Boot machine**, and a RISC-V Linux
 boots to a shell in about four seconds. The verification driven over this rig
 covered: a SigV4 GET of a 9.9 MB kernel + 52 MB rootfs from minio, the boot
 reaching a shell, an interactive command typed in the browser reaching the
-guest and echoing back over SSE, a file written inside the guest and — after
-**Save disk** — found byte-for-byte inside the **52 MB SigV4 PUT** image in
+guest and echoing back over SSE, a file written inside the guest and, after
+**Save disk**, found byte-for-byte inside the **52 MB SigV4 PUT** image in
 the bucket, a script written and then executed inside the guest (the
 self-modifying-code path), and a wake-up round-trip after a long idle
 (throttled) stretch. [`scripts/bench.py`](scripts/bench.py) replays all of
@@ -325,7 +325,7 @@ port answered with a fast RST.
 - **RISC-V RV64 only, one hart.** RISC Box runs what the vendored emulator runs:
   a single-core RISC-V `virt`-style machine. Not x86, not multi-core.
 - **Emulated speed.** The interpreter turns ~29 MIPS under wasmtime (software
-  TLB + predecoded instruction cache; measured on the sample image) — fine
+  TLB + predecoded instruction cache; measured on the sample image): fine
   for a shell, a build, a demo; not a fast VM. There is no KVM in a TEE wasm
   sandbox; this is pure interpretation. An idle guest parked in WFI is
   throttled to ~1–2% host CPU; keystrokes force full-speed batches so the
@@ -335,7 +335,7 @@ port answered with a fast RST.
   boot. One-time, a few seconds.
 - **Save consistency.** Save copies the disk while the guest runs; run `sync`
   (or halt) in the guest first, or the snapshot is crash-consistent at best.
-  Only the disk is saved — not live RAM, so this is not a suspend/resume.
+  Only the disk is saved, not live RAM, so this is not a suspend/resume.
 - **RAM budget.** The machine's memory and both images live in enclave RAM
   (the emulator sizes guest DRAM at 128 MiB); size the deployment accordingly.
 - **Credentials.** If the bucket needs credentials and you don't seal them in
@@ -351,7 +351,7 @@ deployment those endpoints are reachable by anyone with the URL, so set
 `api_key` (from a `$VAR` secret): it gates `/start`, `/stop`, `/save`,
 `/input`, `/console`, and `/status`, leaving only the static shell and `/ping`
 open. The browser UI prompts for the key and remembers it for the tab. Without
-`api_key`, deploy **private** — an open deployment hands a stranger the
+`api_key`, deploy **private**: an open deployment hands a stranger the
 machine. The key is a coarse app-level gate, not the trust boundary; the
 enclave is (see below).
 
@@ -367,12 +367,12 @@ means the credential secret never resolved (unset or misnamed); a `401` on a
 The machine, its images, and any typed credentials exist only inside the
 enclave; the bucket and the host operator see S3 traffic, not the running
 guest. RISC Box authenticates nothing about the *images themselves* beyond the
-bucket's own integrity — a malicious bucket could serve a different kernel, so
+bucket's own integrity; a malicious bucket could serve a different kernel, so
 treat the bucket as part of your trust base and prefer `https` endpoints.
 Confirm the code that runs your machine and handles your credentials with the
 deployment's remote attestation at
 [enclave.host](https://enclave.host).
 
 The vendored emulator is MIT ([`emu/LICENSE`](emu/LICENSE)); RISC Box itself is
-MIT. It is a faithful RISC-V emulator, not a security boundary — the enclave
+MIT. It is a faithful RISC-V emulator, not a security boundary; the enclave
 is the boundary.

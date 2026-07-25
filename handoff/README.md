@@ -1,9 +1,9 @@
-# handoff — files through an attested enclave
+# handoff: files through an attested enclave
 
 A file wormhole with a warehouse in the middle: magic-wormhole ergonomics,
 but the relay is a **hardware-attested TEE** that holds only ciphertext it
 cannot name, and the "we delete it after delivery" is a property of code you
-can reproduce from this source via the on-chain catalog — not a promise.
+can reproduce from this source via the on-chain catalog, not a promise.
 
 ```
 sender's browser                      the enclave                     receiver's browser
@@ -15,14 +15,14 @@ sender's browser                      the enclave                     receiver's
 
 - **The key never travels.** It rides the link's URL *fragment*; the server
   stores ciphertext under an id the *client* chose. Even the **filename**
-  travels only inside an encrypted manifest — the enclave's entire knowledge
+  travels only inside an encrypted manifest; the enclave's entire knowledge
   of a handoff is an opaque id, a chunk count, byte totals, timestamps.
 - **Downloads count on completion, not curiosity.** A claim consumes a
-  download only when its final chunk has been served — a dropped connection
+  download only when its final chunk has been served; a dropped connection
   doesn't burn the transfer. At zero downloads, TTL, or the sender's burn
   link, the only copy is erased.
 - **Raw bytes on the wire.** Chunks travel as `application/octet-stream`
-  both directions — no base64 bloat in enclave RAM.
+  both directions; no base64 bloat in enclave RAM.
 - **Misses are uniform.** Unknown, expired, burned and delivered ids are the
   same 404.
 
@@ -41,9 +41,9 @@ Headers + `k=v&` forms in, emit-only JSON out; chunk bodies are raw bytes.
 |---|---|---|
 | `POST /api/new` | headers `x-drop-id`, `x-chunks`, `x-bytes`, `x-reads`, `x-ttl`, `x-burn-hash?`; body = encrypted manifest | `{ok, expires_at}` |
 | `POST /api/put` | headers `x-drop-id`, `x-chunk`; body = chunk ciphertext | `{ok, have, complete}` |
-| `GET /api/meta?id=` | — | `{chunks, bytes, complete, reads_left, expires_in, manifest}` |
-| `POST /api/claim` | `id=&t=<client token>` | `{ok, chunks}` — completion counts it |
-| `GET /api/chunk?id=&i=&t=` | — | raw ciphertext bytes |
+| `GET /api/meta?id=` | (none) | `{chunks, bytes, complete, reads_left, expires_in, manifest}` |
+| `POST /api/claim` | `id=&t=<client token>` | `{ok, chunks}`; completion counts it |
+| `GET /api/chunk?id=&i=&t=` | (none) | raw ciphertext bytes |
 | `POST /api/burn` | `id=&token=` | `{ok}` if SHA-256 matches |
 | `GET /api/stats` · `GET /` UI · `GET /ping` | | |
 
