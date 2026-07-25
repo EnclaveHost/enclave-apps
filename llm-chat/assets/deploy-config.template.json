@@ -20,6 +20,7 @@
     248044
    ],
    "template": "chatml",
+   "thinking": true,
    "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
    "max_prompt_tokens": 98304,
    "default_max_new": 32768,
@@ -41,6 +42,7 @@
     248044
    ],
    "template": "chatml",
+   "thinking": true,
    "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
    "max_prompt_tokens": 98304,
    "default_max_new": 32768,
@@ -62,6 +64,7 @@
     248044
    ],
    "template": "chatml",
+   "thinking": true,
    "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
    "max_prompt_tokens": 98304,
    "default_max_new": 32768,
@@ -103,6 +106,7 @@
     248044
    ],
    "template": "chatml",
+   "thinking": true,
    "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
    "max_prompt_tokens": 98304,
    "default_max_new": 32768,
@@ -123,6 +127,7 @@
     248044
    ],
    "template": "chatml",
+   "thinking": true,
    "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
    "max_prompt_tokens": 98304,
    "default_max_new": 32768,

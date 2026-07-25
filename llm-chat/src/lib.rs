@@ -36,6 +36,10 @@
 //!                               non-stream. Point any OpenAI SDK at the
 //!                               deployment URL. If the config sets api_key,
 //!                               requires `Authorization: Bearer <key>`.
+//!                               `enable_thinking: false` (top-level or in
+//!                               chat_template_kwargs, the vLLM spelling)
+//!                               turns off <think> reasoning on models whose
+//!                               config marks them `thinking`.
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!
 //! Generation: autoregressive decode with the model's KV cache. The trick
@@ -1587,6 +1591,27 @@ struct ChatReq {
     stream: Option<bool>,
     #[serde(default)]
     stop: Option<serde_json::Value>, // string or [string]
+    #[serde(default)]
+    enable_thinking: Option<bool>, // extension: false turns off <think> reasoning (thinking models only)
+    #[serde(default)]
+    chat_template_kwargs: Option<ChatTemplateKwargs>, // vLLM/SGLang spelling of the same switch
+}
+
+#[derive(Deserialize, Default)]
+struct ChatTemplateKwargs {
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+}
+
+impl ChatReq {
+    /// The request's thinking switch: top-level `enable_thinking` wins over
+    /// `chat_template_kwargs.enable_thinking`; absent means on. Only models
+    /// whose config marks them `thinking` act on it (see build_prompt).
+    fn thinking(&self) -> bool {
+        self.enable_thinking
+            .or(self.chat_template_kwargs.as_ref().and_then(|k| k.enable_thinking))
+            .unwrap_or(true)
+    }
 }
 
 fn read_body(req: &IncomingRequest) -> Result<Vec<u8>, String> {
@@ -1614,6 +1639,7 @@ fn build_prompt(
     cfg: &AppConfig,
     tok: &Tokenizer,
     messages: &[ChatMsg],
+    thinking: bool, // the request's switch; only cfg.thinking models act on it
 ) -> Result<(Vec<u32>, Vec<String>), String> {
     let system = messages
         .iter()
@@ -1628,8 +1654,9 @@ fn build_prompt(
     if msgs.is_empty() {
         return Err("no user/assistant messages".into());
     }
+    let no_think = cfg.thinking && !thinking;
     loop {
-        let rendered = config::render_template(&cfg.template, &system, &msgs)?;
+        let rendered = config::render_template(&cfg.template, &system, &msgs, no_think)?;
         let enc = tok
             .encode(rendered.prompt.as_str(), true)
             .map_err(|e| format!("tokenize: {e}"))?;
@@ -1801,7 +1828,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
-    let (prompt_ids, stops) = match build_prompt(cfg, &tok, &creq.messages) {
+    let (prompt_ids, stops) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
@@ -1900,7 +1927,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
-    let (prompt_ids, stops) = match build_prompt(cfg, &tok, &creq.messages) {
+    let (prompt_ids, stops) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
@@ -2188,6 +2215,7 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "name": e.cfg.name, "volume": e.volume, "backend": e.cfg.backend,
                 "bytes": e.bytes, "default": i == 0,
                 "fits": !unfit.contains_key(&e.volume),
+                "thinking": e.cfg.thinking,
             });
             if let Some(why) = unfit.get(&e.volume) {
                 m["why"] = serde_json::json!(why);
