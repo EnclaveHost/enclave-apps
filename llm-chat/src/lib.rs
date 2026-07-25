@@ -454,27 +454,45 @@ fn resolve_model(raw: &serde_json::Value, requested: Option<&str>) -> Result<App
     }
 }
 
-/// The draft AppConfig for speculative decoding, when `cfg` names one and
-/// the pair is compatible - else None plus the reason for a status line.
-/// The tokenizer must be IDENTICAL (byte-equal tokenizer.json): draft token
-/// ids are meaningless in a foreign vocabulary, and differing merge tables
-/// corrupt silently. Two volumes shipping cosmetically different copies of
-/// the same tokenizer can be forced compatible by pointing the draft entry's
-/// tokenizer_file at the target's copy (absolute /models/... paths work).
-fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (Option<AppConfig>, Option<String>) {
-    let Some(want) = cfg.draft.as_deref() else { return (None, None) };
+/// How this generation's tokens get proposed for verification.
+enum DraftPlan {
+    /// no drafting - plain decode
+    Plain,
+    /// a same-tokenizer sibling model proposes (its resolved config)
+    Model(AppConfig),
+    /// the model's own MTP head proposes (host-side; no second model)
+    Mtp,
+}
+
+/// The draft plan for speculative decoding, when `cfg` names one and it is
+/// usable - else Plain plus the reason for a status line. "mtp" = the
+/// model's own head (existence verified against the host at session open).
+/// For a MODEL draft the tokenizer must be IDENTICAL (byte-equal
+/// tokenizer.json): draft token ids are meaningless in a foreign
+/// vocabulary, and differing merge tables corrupt silently. Two volumes
+/// shipping cosmetically different copies of the same tokenizer can be
+/// forced compatible by pointing the draft entry's tokenizer_file at the
+/// target's copy (absolute /models/... paths work).
+fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (DraftPlan, Option<String>) {
+    let Some(want) = cfg.draft.as_deref() else { return (DraftPlan::Plain, None) };
     if cfg.backend != "ggml" {
-        return (None, Some("speculative decoding needs the ggml backend".into()));
+        return (DraftPlan::Plain, Some("speculative decoding needs the ggml backend".into()));
+    }
+    if want == "mtp" {
+        // whether the loaded GGUF actually carries a head is the host's
+        // knowledge - probed via caps at session open, which falls back
+        // with its own note if not
+        return (DraftPlan::Mtp, None);
     }
     let entries = available_models(raw);
     let Some(e) = entries.iter().find(|e| e.cfg.name == want || e.volume == want) else {
-        return (None, Some(format!("draft model '{want}' is not attached (or not in the models catalog)")));
+        return (DraftPlan::Plain, Some(format!("draft model '{want}' is not attached (or not in the models catalog)")));
     };
     if e.cfg.backend != "ggml" {
-        return (None, Some(format!("draft '{want}' is not a ggml model")));
+        return (DraftPlan::Plain, Some(format!("draft '{want}' is not a ggml model")));
     }
     if e.cfg.vocab != cfg.vocab {
-        return (None, Some(format!(
+        return (DraftPlan::Plain, Some(format!(
             "draft '{want}' speaks a different vocabulary ({} vs {}) - a draft must share the              target's tokenizer exactly (qwen3.x models share one; qwen2.5-0.5b does not)",
             e.cfg.vocab, cfg.vocab
         )));
@@ -482,16 +500,16 @@ fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (Option<AppConfig>
     match (read_tokenizer(cfg), read_tokenizer(&e.cfg)) {
         (Ok(a), Ok(b)) if a == b => {}
         (Ok(_), Ok(_)) => {
-            return (None, Some(format!(
+            return (DraftPlan::Plain, Some(format!(
                 "draft '{want}' ships a different tokenizer.json than the target - set the draft                  entry's tokenizer_file to the target's copy (an absolute /models/... path) if                  they are really the same tokenizer"
             )))
         }
-        _ => return (None, Some("couldn't read both tokenizers to verify draft compatibility".into())),
+        _ => return (DraftPlan::Plain, Some("couldn't read both tokenizers to verify draft compatibility".into())),
     }
     if over_budget(&entries).contains_key(&e.volume) {
-        return (None, Some(format!("draft '{want}' does not fit this deployment's share")));
+        return (DraftPlan::Plain, Some(format!("draft '{want}' does not fit this deployment's share")));
     }
-    (Some(e.cfg.clone()), None)
+    (DraftPlan::Model(e.cfg.clone()), None)
 }
 
 const PREFILL_CHUNK: usize = 128;
@@ -764,12 +782,14 @@ impl Session {
             .collect())
     }
 
-    /// ggml only: this session's sequence id inside its graph's shared
-    /// server - the handle another session on the SAME graph names to
-    /// branch from it (`copy_from`). Errors on hosts that predate the
+    /// ggml only: this session's capabilities - (seq_id, recurrent, mtp).
+    /// seq_id is the handle another session on the SAME graph names to
+    /// branch from it (`copy_from`); mtp = the loaded GGUF carries a
+    /// multi-token-prediction head. Errors on hosts that predate the
     /// speculative toolchain, which is the capability probe: no caps, no
-    /// speculative decode.
-    fn seq_id(&mut self) -> Result<i32, String> {
+    /// speculative decode. Hosts before the MTP toolchain return two
+    /// values - a missing third reads as "no head".
+    fn caps(&mut self) -> Result<(i32, bool, bool), String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -784,10 +804,131 @@ impl Session {
             .find(|(n, _)| n == "caps")
             .ok_or("host returned no \"caps\" output")?;
         let data = caps.1.data();
-        if data.len() < 4 {
+        if data.len() < 8 {
             return Err("caps output too short".into());
         }
-        Ok(i32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+        let v = |i: usize| {
+            i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+        };
+        let mtp = data.len() >= 12 && v(2) != 0;
+        Ok((v(0), v(1) != 0, mtp))
+    }
+
+    /// ggml only: MTP-aware feed of this sequence - the host runs an
+    /// all-positions pass, mirrors every position into the model's own MTP
+    /// head, and returns only the LAST logits row. The speculative prefill.
+    fn feed_mtp(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("speculative decoding needs the ggml backend".into());
+        };
+        let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
+        let outs = ctx
+            .compute(vec![
+                ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
+                ("mtp".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+            ])
+            .map_err(|e| nn_err("compute", e))?;
+        let logits = outs
+            .iter()
+            .find(|(n, _)| n == "logits")
+            .ok_or("ggml backend returned no \"logits\" output")?;
+        let data = logits.1.data();
+        if data.len() != cfg.vocab * 4 {
+            return Err(format!(
+                "mtp feed returned {} bytes, config vocab says {}",
+                data.len(),
+                cfg.vocab * 4
+            ));
+        }
+        Ok(data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// ggml only: verify pass that ALSO harvests the target's MTP hidden
+    /// rows for `real_seq` (the verify runs on a scratch branch, but the
+    /// head state belongs to the real sequence).
+    fn feed_all_mtp(
+        &mut self,
+        cfg: &AppConfig,
+        ids: &[u32],
+        real_seq: i32,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("speculative decoding needs the ggml backend".into());
+        };
+        let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
+        let outs = ctx
+            .compute(vec![
+                ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
+                ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+                ("mtp_for".to_string(), Tensor::new(&[1], TensorType::I32, &real_seq.to_le_bytes())),
+            ])
+            .map_err(|e| nn_err("compute", e))?;
+        let logits = outs
+            .iter()
+            .find(|(n, _)| n == "logits")
+            .ok_or("ggml backend returned no \"logits\" output")?;
+        let data = logits.1.data();
+        let row = cfg.vocab * 4;
+        if data.len() != row * ids.len() {
+            return Err(format!(
+                "expected {} logit rows of {} bytes, got {} bytes",
+                ids.len(), row, data.len()
+            ));
+        }
+        Ok(data
+            .chunks_exact(row)
+            .map(|r| r.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+            .collect())
+    }
+
+    /// ggml only: the model's own MTP head proposes up to k tokens (greedy,
+    /// stops when its confidence drops below p_min). May return fewer or none.
+    fn mtp_draft(&mut self, id_last: u32, k: usize, p_min_milli: i32) -> Result<Vec<u32>, String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("speculative decoding needs the ggml backend".into());
+        };
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend_from_slice(&(id_last as i32).to_le_bytes());
+        bytes.extend_from_slice(&(k as i32).to_le_bytes());
+        bytes.extend_from_slice(&p_min_milli.to_le_bytes());
+        let outs = ctx
+            .compute(vec![(
+                "mtp_draft".to_string(),
+                Tensor::new(&[3], TensorType::I32, &bytes),
+            )])
+            .map_err(|e| nn_err("mtp_draft", e))?;
+        let draft = outs
+            .iter()
+            .find(|(n, _)| n == "draft")
+            .ok_or("host returned no \"draft\" output")?;
+        Ok(draft
+            .1
+            .data()
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect())
+    }
+
+    /// ggml only: mirror a verify round's accepted tokens into the MTP head
+    /// (pairs them with the rows harvested by the last mtp-flagged pass).
+    fn mtp_accept(&mut self, pos0: usize, tokens: &[u32]) -> Result<(), String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("speculative decoding needs the ggml backend".into());
+        };
+        let mut bytes = Vec::with_capacity(4 + tokens.len() * 4);
+        bytes.extend_from_slice(&(pos0 as i32).to_le_bytes());
+        for &t in tokens {
+            bytes.extend_from_slice(&(t as i32).to_le_bytes());
+        }
+        ctx.compute(vec![(
+            "mtp_accept".to_string(),
+            Tensor::new(&[(1 + tokens.len()) as u32], TensorType::I32, &bytes),
+        )])
+        .map_err(|e| nn_err("mtp_accept", e))?;
+        Ok(())
     }
 
     /// ggml only: make THIS session an exact branch of `src_seq` (a sibling
@@ -833,14 +974,37 @@ fn open_spec(
     target: ExecutionTarget,
     sess: &mut Session,
 ) -> Result<SpecRig, String> {
-    let t_seq = sess.seq_id()?; // also the host capability probe
+    let (t_seq, _, _) = sess.caps()?; // also the host capability probe
     let mut dsess = Session::open(dcfg, target)?;
-    let d_seq = dsess.seq_id()?;
+    let (d_seq, _, _) = dsess.caps()?;
     let mut tscr = Session::open(cfg, target)?;
-    let tscr_seq = tscr.seq_id()?;
+    let (tscr_seq, _, _) = tscr.caps()?;
     let mut dscr = Session::open(dcfg, target)?;
-    let dscr_seq = dscr.seq_id()?;
+    let (dscr_seq, _, _) = dscr.caps()?;
     Ok(SpecRig { dsess, tscr, dscr, t_seq, d_seq, tscr_seq, dscr_seq })
+}
+
+/// The MTP rig: just the target scratch branch - the model drafts for
+/// itself through the host's head context, so no draft model, no draft
+/// sessions, half the slot cost of a model-draft rig.
+struct MtpRig {
+    tscr: Session,
+    t_seq: i32,
+    tscr_seq: i32,
+}
+
+fn open_mtp(
+    cfg: &AppConfig,
+    target: ExecutionTarget,
+    sess: &mut Session,
+) -> Result<MtpRig, String> {
+    let (t_seq, _, mtp) = sess.caps()?; // also the host capability probe
+    if !mtp {
+        return Err("this model volume carries no MTP head (use an *-mtp volume, or name a draft model)".into());
+    }
+    let mut tscr = Session::open(cfg, target)?;
+    let (tscr_seq, _, _) = tscr.caps()?;
+    Ok(MtpRig { tscr, t_seq, tscr_seq })
 }
 
 struct GenParams {
@@ -946,7 +1110,7 @@ fn generate(
     target: ExecutionTarget,
     tname: &str,
     p: &GenParams,
-    draft: Option<&AppConfig>,
+    draft: &DraftPlan,
     emit: &dyn Fn(&str) -> bool,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
@@ -984,12 +1148,12 @@ fn generate(
     };
     let load_ms = now_ms() - t0;
 
-    // speculative path: the rig (draft session + one scratch branch per
-    // model) opening non-retrying - busy slots, an unfit share, or a host
-    // predating the speculative verbs all quietly downgrade to plain
-    // decode. Drafting is an accelerator, never a dependency.
-    if let Some(dc) = draft {
-        match open_spec(cfg, dc, target, &mut sess) {
+    // speculative path: the rig opening non-retrying - busy slots, an unfit
+    // share, a headless volume, or a host predating the speculative verbs
+    // all quietly downgrade to plain decode. Drafting is an accelerator,
+    // never a dependency.
+    match draft {
+        DraftPlan::Model(dc) => match open_spec(cfg, dc, target, &mut sess) {
             Ok(rig) => {
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via {} - prefilling {} prompt tokens", dc.name, prompt_ids.len())) {
                     return Err("client disconnected".into());
@@ -999,7 +1163,19 @@ fn generate(
             Err(e) => {
                 let _ = status(&format!("draft model unavailable ({}); plain decode", strip_code(&e)));
             }
-        }
+        },
+        DraftPlan::Mtp => match open_mtp(cfg, target, &mut sess) {
+            Ok(rig) => {
+                if !status(&format!("session ready ({load_ms} ms); speculative decode via the model's MTP head - prefilling {} prompt tokens", prompt_ids.len())) {
+                    return Err("client disconnected".into());
+                }
+                return generate_mtp(cfg, tok, prompt_ids, tname, p, sess, rig, load_ms, emit, status);
+            }
+            Err(e) => {
+                let _ = status(&format!("MTP drafting unavailable ({}); plain decode", strip_code(&e)));
+            }
+        },
+        DraftPlan::Plain => {}
     }
     if !status(&format!(
         "session ready ({load_ms} ms); prefilling {} prompt tokens",
@@ -1236,6 +1412,139 @@ fn generate_spec(
             let last = rows.len() - 1;
             pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
             d_behind.push(drafts[drafts.len() - 1]);
+        }
+    }
+    out.flush();
+    let decode_ms = now_ms() - t2;
+    Ok(GenStats {
+        target: tname.to_string(), prompt_tokens: prompt_ids.len(),
+        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+        finish_reason: finish, text: out.text, drafted, accepted,
+    })
+}
+
+/// MTP speculative decode: the branch-commit loop of generate_spec with the
+/// model's OWN multi-token-prediction head as the proposer - no draft
+/// sessions, no second model. Per round the host's head proposes up to k
+/// tokens at near-zero cost (it rides hidden state harvested from prior
+/// passes), the target verifies them on a scratch branch in one pass, and
+/// only ACCEPTED tokens are mirrored back into the head, so its state stays
+/// clean. Verification is EXACT-MATCH on the target's own sampler - output
+/// is byte-for-byte plain decode, the head only changes speed.
+#[allow(clippy::too_many_arguments)]
+fn generate_mtp(
+    cfg: &AppConfig,
+    tok: &Tokenizer,
+    prompt_ids: &[u32],
+    tname: &str,
+    p: &GenParams,
+    mut sess: Session,
+    rig: MtpRig,
+    load_ms: u128,
+    emit: &dyn Fn(&str) -> bool,
+    status: &dyn Fn(&str) -> bool,
+) -> Result<GenStats, String> {
+    let _ = status;
+    let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
+    let k = cfg.draft_tokens.clamp(1, 16);
+    let p_min_milli = (cfg.draft_p_min.clamp(0.05, 0.95) * 1000.0) as i32;
+    // -- prefill through the MTP-aware feed: every chunk's positions are
+    //    mirrored into the head, only last-row logits cross to the guest
+    let t1 = now_ms();
+    let mut done = 0usize;
+    let mut t_logits = Vec::new();
+    while done < prompt_ids.len() {
+        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
+        let l = sess.feed_mtp(cfg, &prompt_ids[done..end])?;
+        if end == prompt_ids.len() { t_logits = l; }
+        done = end;
+    }
+    let prefill_ms = now_ms() - t1;
+
+    let t2 = now_ms();
+    let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
+    let mut out = TextOut::new(tok, emit, &p.stop_strings);
+    let mut finish: &'static str = "stop";
+    let (mut drafted, mut accepted) = (0usize, 0usize);
+    let mut t_fed = prompt_ids.len();
+
+    let recent = out.recent(prompt_ids, p.sample.rep_window);
+    let mut pending = pick_token(&mut t_logits, &recent, &p.sample, &mut rng);
+    'outer: loop {
+        if cfg.eos.contains(&pending) { break; }
+        if out.generated.len() >= p.max_new { finish = "length"; break; }
+        match out.push(pending) {
+            Pushed::More => {}
+            Pushed::Stopped => {
+                let decode_ms = now_ms() - t2;
+                return Ok(GenStats {
+                    target: tname.to_string(), prompt_tokens: prompt_ids.len(),
+                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                    finish_reason: "stop", text: out.text, drafted, accepted,
+                });
+            }
+            Pushed::Gone => break 'outer,
+        }
+        // -- the head proposes (0..=k tokens; an empty draft still verifies
+        //    [pending] alone, which adopts as a plain step)
+        let drafts = sess.mtp_draft(pending, k, p_min_milli)?;
+        drafted += drafts.len();
+        // -- ONE verify pass on the target branch, harvesting head rows for
+        //    the REAL sequence
+        tscr.copy_from(t_seq, t_fed)?;
+        let mut feed: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
+        feed.push(pending);
+        feed.extend_from_slice(&drafts);
+        let mut rows = tscr.feed_all_mtp(cfg, &feed, t_seq)?;
+        let tscr_fed = t_fed + feed.len();
+        // -- verify: accept while the target's own sample agrees
+        let mut acc = 0usize;
+        let mut replacement: Option<u32> = None;
+        for (i, &d) in drafts.iter().enumerate() {
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            let expect = pick_token(&mut rows[i], &recent, &p.sample, &mut rng);
+            if expect != d {
+                replacement = Some(expect);
+                break;
+            }
+            if cfg.eos.contains(&d) {
+                accepted += acc;
+                break 'outer;
+            }
+            if out.generated.len() >= p.max_new {
+                finish = "length";
+                accepted += acc;
+                break 'outer;
+            }
+            match out.push(d) {
+                Pushed::More => {}
+                Pushed::Stopped => {
+                    let decode_ms = now_ms() - t2;
+                    return Ok(GenStats {
+                        target: tname.to_string(), prompt_tokens: prompt_ids.len(),
+                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                    });
+                }
+                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+            }
+            acc += 1;
+        }
+        accepted += acc;
+        // -- the head learns ONLY the accepted tokens (its KV never holds a
+        //    rejected proposal), then the target commits them
+        sess.mtp_accept(t_fed, &feed[..acc + 1])?;
+        if let Some(r) = replacement {
+            sess.feed(cfg, &feed[..acc + 1], false)?;
+            t_fed += acc + 1;
+            pending = r;
+        } else {
+            // full acceptance (also the empty-draft case): adopt the branch
+            sess.copy_from(tscr_seq, tscr_fed)?;
+            t_fed = tscr_fed;
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            let last = rows.len() - 1;
+            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
         }
     }
     out.flush();
@@ -1516,7 +1825,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     };
 
     let mode = creq.target.as_deref().unwrap_or("auto");
-    let (draft_cfg, draft_note) = resolve_draft(raw, cfg);
+    let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
     if let Some(n) = &draft_note {
         let _ = send(serde_json::json!({ "status": format!("speculative decode off: {n}") }));
     }
@@ -1528,7 +1837,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         }
         let emit = |delta: &str| send(serde_json::json!({ "delta": delta }));
         let status = |s: &str| send(serde_json::json!({ "status": s }));
-        match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg.as_ref(), &emit, &status) {
+        match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
             Ok(s) => {
                 let gen_s = (s.decode_ms as f64) / 1000.0;
                 let tok_per_s = if gen_s > 0.0 { s.tokens as f64 / gen_s } else { 0.0 };
@@ -1633,13 +1942,13 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
 
         let mut last_err = String::new();
         let mut done_stats: Option<GenStats> = None;
-        let (draft_cfg, _) = resolve_draft(raw, cfg);
+        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         for (target, tname) in targets_for(cfg, mode).iter() {
             let emit = |delta: &str| send_raw(&chunk(serde_json::json!({ "content": delta }), None));
             // OpenAI protocol has no status events; SSE comments keep the
             // connection warm through cold session init without confusing SDKs
             let status = |s: &str| send_raw(&format!(": {s}\n\n"));
-            match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg.as_ref(), &emit, &status) {
+            match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
                 Ok(s) => {
                     done_stats = Some(s);
                     break;
@@ -1666,9 +1975,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let sink = |_: &str| true;
         let mut last_err = String::new();
         let mut result: Option<GenStats> = None;
-        let (draft_cfg, _) = resolve_draft(raw, cfg);
+        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         for (target, tname) in targets_for(cfg, mode).iter() {
-            match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg.as_ref(), &sink, &sink) {
+            match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &sink, &sink) {
                 Ok(s) => {
                     result = Some(s);
                     break;

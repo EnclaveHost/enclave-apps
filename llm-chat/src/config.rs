@@ -72,13 +72,18 @@ pub struct AppConfig {
     pub model_file: Option<String>,
     #[serde(default)]
     pub tokenizer_file: Option<String>,
-    /// SPECULATIVE DECODING: another catalog model (by volume or name) that
-    /// drafts tokens for this one - a small same-tokenizer sibling proposes
-    /// `draft_tokens` ahead, the target verifies them in ONE pass, and every
-    /// accepted token skips a full target step. Requires the ggml backend on
-    /// both AND an identical tokenizer (same vocab, same tokenizer.json) -
-    /// draft ids are meaningless in a foreign vocabulary, so a mismatched
-    /// pair is REFUSED at request time and generation falls back to plain
+    /// SPECULATIVE DECODING: what proposes tokens for this model to verify.
+    /// The special value "mtp" uses the model's OWN trained multi-token-
+    /// prediction head (an *-MTP GGUF variant; near-zero proposal cost, no
+    /// second model, the preferred setting when the volume carries a head).
+    /// Any other value names a catalog model (by volume or name) - a small
+    /// same-tokenizer sibling that proposes `draft_tokens` ahead. Either
+    /// way the target verifies proposals in ONE pass and every accepted
+    /// token skips a full target step; output is byte-for-byte the
+    /// target's own. A model draft requires the ggml backend on both AND an
+    /// identical tokenizer (same vocab, byte-equal tokenizer.json) - a
+    /// mismatched pair is REFUSED at request time. All draft-side failures
+    /// (no head, unattached, unfit, busy, stale host) fall back to plain
     /// decode with a status note. qwen3.x models share one tokenizer;
     /// qwen2.5-0.5b does NOT draft for them.
     #[serde(default)]
@@ -86,10 +91,18 @@ pub struct AppConfig {
     /// tokens drafted per speculative round (clamped 1..=16; default 8)
     #[serde(default = "default_draft_tokens")]
     pub draft_tokens: usize,
+    /// "mtp" drafts only: minimum head confidence to keep proposing
+    /// (0.05..=0.95; default 0.4 - lower = longer, riskier drafts)
+    #[serde(default = "default_draft_p_min")]
+    pub draft_p_min: f32,
 }
 
 fn default_draft_tokens() -> usize {
     8
+}
+
+fn default_draft_p_min() -> f32 {
+    0.4
 }
 
 fn default_backend() -> String {
