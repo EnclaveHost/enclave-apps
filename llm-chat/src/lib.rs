@@ -19,6 +19,11 @@
 //!                               config describes), largest first; the
 //!                               largest is the default. Open, unlike
 //!                               /v1/models - the playground dropdown reads it.
+//!                               Also carries `gpu`: whether the platform gave
+//!                               this deployment a GPU share (null = not
+//!                               knowable here). False means the fleet had no
+//!                               GPU enclave free and the app is serving in
+//!                               CPU mode - the playground says so on load.
 //!   GET  /warmup              - warm models before the first prompt. With
 //!                               ?model=<name|volume>: that one (load + one
 //!                               forward pass). BARE - the manager's boot
@@ -297,6 +302,32 @@ fn vram_budget() -> Option<u64> {
         .parse::<u64>()
         .ok()
         .filter(|b| *b > 0)
+}
+
+/// Whether this deployment holds GPU resources at all - the fact the
+/// playground's CPU-mode notice is built on.
+///
+/// ENCLAVE_VRAM_BYTES is set from gpuShare x card VRAM on every GPU
+/// deployment and left unset on a CPU one, so a value is PROOF of a share.
+/// The NEGATIVE needs a second witness, because a manager predating the
+/// variable also reports nothing and calling that "no GPU" would put the
+/// notice in front of users on a perfectly healthy GPU node:
+///   * some ENCLAVE_* variable must be in the environment at all - otherwise
+///     this is a dev box, not a tenant, and nothing is known;
+///   * the host must have preloaded NO ggml graphs - a preload is only
+///     possible on a GPU-share deployment (the manager puts the GGUF in
+///     VRAM at tenant boot), so ENCLAVE_NN_PRELOADS with entries means an
+///     older manager on a GPU node, not a CPU one.
+///
+/// Some(true) = GPU share; Some(false) = tenant with no GPU, i.e. CPU mode;
+/// None = unknowable here, and the playground stays quiet rather than guess.
+fn gpu_present() -> Option<bool> {
+    if vram_budget().is_some() {
+        return Some(true);
+    }
+    let tenant = std::env::vars().any(|(k, _)| k.starts_with("ENCLAVE_"));
+    let preloaded = preloaded_graphs().is_some_and(|p| !p.is_empty());
+    (tenant && !preloaded).then_some(false)
 }
 
 /// Bytes per KV-cache element, in SIXTEENTHS (q8_0 stores 34 bytes per
@@ -1741,9 +1772,12 @@ fn targets_for(cfg: &AppConfig, mode: &str) -> Vec<(ExecutionTarget, &'static st
     // device offload is the node env's call), so auto mode's CPU retry would
     // just repeat the SAME failed attempt relabeled "cpu:" — the misleading
     // "cpu: llama.cpp context allocation failed…" users saw live 2026-07-24.
-    // One attempt, honestly labeled.
+    // One attempt, honestly labeled - and the LABEL follows the deployment:
+    // with no GPU share there is nothing to offload to, so the host runs the
+    // graph on CPU and saying "gpu" would be a lie in the status line.
     if cfg.backend == "ggml" {
-        return vec![(ExecutionTarget::Gpu, "gpu")];
+        let label = if gpu_present() == Some(false) { "cpu" } else { "gpu" };
+        return vec![(ExecutionTarget::Gpu, label)];
     }
     match mode {
         "cpu" => vec![(ExecutionTarget::Cpu, "cpu")],
@@ -2137,15 +2171,23 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 ///
 /// ?target= defaults to GPU ONLY - warmup exists to put weights in VRAM,
 /// and a failed GPU should read as a failed warmup, not silently pre-build
-/// the CPU session (chat's auto mode still falls back at request time).
+/// the CPU session (chat's auto mode still falls back at request time). The
+/// one exception is a deployment with no GPU share at all (gpu_present),
+/// where the default drops to auto: there is no VRAM to fail into, and
+/// "every model broken" would bury the actual story the playground tells.
 /// Pass target=cpu (dev boxes) or target=auto explicitly to warm other
 /// paths. Slow by design when cold - the response arrives when the models
 /// are ready.
 fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
+    // GPU by default - but on a deployment the platform gave NO GPU share,
+    // "gpu" is a guaranteed failure for the onnx path, and reporting every
+    // model broken hides the real story (the fleet had no GPU enclave free).
+    // Degrade to auto there, so the CPU session warms and the playground's
+    // CPU-mode notice is what the user sees.
     let mode = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("target="))
-        .unwrap_or("gpu");
+        .unwrap_or(if gpu_present() == Some(false) { "auto" } else { "gpu" });
     let model = query.split('&').find_map(|kv| kv.strip_prefix("model="));
 
     if model.is_some() {
@@ -2264,6 +2306,9 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     let body = serde_json::json!({
         "default": entries.first().map(|e| e.cfg.name.clone()),
         "vram_budget": vram_budget(),
+        // true / false / null (unknown) - the playground raises its CPU-mode
+        // notice on an explicit false, never on a null
+        "gpu": gpu_present(),
         "models": entries.iter().enumerate().map(|(i, e)| {
             let mut m = serde_json::json!({
                 "name": e.cfg.name, "volume": e.volume, "backend": e.cfg.backend,
