@@ -220,6 +220,7 @@
   .seg { display: flex; background: var(--hover); border-radius: 9px; padding: 3px; margin-left: auto; }
   .seg button { padding: 4px 12px; border-radius: 7px; font-size: 12.5px; color: var(--text-2); }
   .seg button.on { background: var(--bg-menu); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 500; }
+  .seg button:disabled { opacity: .4; }
 
   #warmPill {
     display: none; align-items: center; gap: 7px; margin-left: 6px;
@@ -457,13 +458,13 @@
   }
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
-  /* ----------------------------------------- API + attestation dialogs -- */
-  #apiOverlay, #attOverlay {
+  /* ------------------------------ API + attestation + CPU-mode dialogs -- */
+  #apiOverlay, #attOverlay, #gpuOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
-  #apiOverlay.open, #attOverlay.open { display: flex; }
+  #apiOverlay.open, #attOverlay.open, #gpuOverlay.open { display: flex; }
   .att-status { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; font-size: 12.5px; }
   .att-status svg { flex: none; }
   .att-status.ok { color: var(--ok); }
@@ -496,6 +497,30 @@
     background: var(--ic-bg); padding: .1em .35em; border-radius: 5px;
     font: .95em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
+
+  /* the host CTA inside the CPU-mode dialog: the fleet is short of GPUs and
+     the reader may be holding the fix */
+  .gpu-cta {
+    margin: 14px 0 12px; padding: 14px 16px; border-radius: 12px;
+    background: var(--code-bg); border: 1px solid var(--border-soft);
+  }
+  .gpu-cta h3 { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
+  .gpu-cta p { color: var(--text-2); }
+  .gpu-link {
+    display: inline-flex; align-items: center; gap: 7px; margin-top: 12px;
+    padding: 9px 16px; border-radius: 999px; font-size: 13px; font-weight: 500;
+    background: var(--btn); color: var(--btn-fg); text-decoration: none;
+  }
+  .gpu-link:hover { opacity: .88; }
+  /* header chip: present for as long as the deployment is CPU-only, so the
+     notice can be reopened after it is dismissed */
+  #cpuChip {
+    display: none; align-items: center; gap: 6px; margin-left: 6px;
+    padding: 5px 11px; border-radius: 999px; font-size: 12.5px;
+    background: var(--hover); color: var(--warn); white-space: nowrap;
+  }
+  #cpuChip.show { display: inline-flex; }
+  #cpuChip:hover { background: var(--active); }
 
   #jump {
     position: absolute; left: 50%; transform: translateX(-50%); bottom: 128px;
@@ -559,6 +584,8 @@
     #input { font-size: 16px; } /* prevent iOS zoom-on-focus */
     #empty h1 { font-size: 23px; }
     #jump { bottom: 118px; }
+    #cpuChip .lbl { display: none; } /* the icon alone in a crowded header */
+    #cpuChip { padding: 6px; }
   }
 </style>
 </head>
@@ -626,6 +653,11 @@
       <div id="modelMenu" role="menu"></div>
     </div>
     <span id="warmPill" role="status"></span>
+    <button id="cpuChip" aria-label="Running in CPU mode, no GPU capacity - details"
+            title="No GPU capacity in the fleet right now: running in CPU mode">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/></svg>
+      <span class="lbl">CPU mode</span>
+    </button>
     <span class="spacer"></span>
     <button class="icon-btn" id="attBtn" aria-label="Enclave attestation" title="Enclave attestation">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
@@ -692,6 +724,38 @@
       Sigstore provenance, measurement match, TLS binding to this origin. Never take the gateway's word for it:
       only a check your own machine runs means anything. Programmatic: <code class="ic">@tinfoilsh/verifier</code>.
       Prompts and replies are processed only inside the enclave; chat history lives only in this browser.</p>
+    </div>
+  </div>
+
+  <div id="gpuOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="gpuTitle">
+      <div class="api-head">
+        <h2 id="gpuTitle">No GPU capacity right now</h2>
+        <button class="icon-btn" id="gpuClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <div class="att-status warn">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>
+        <span>This deployment holds no GPU share, so it is serving on CPU.</span>
+      </div>
+      <p>Every GPU enclave in the fleet is busy or offline at the moment, so the free tier of LLM Chat is
+      running in CPU mode. Chat still works and it is still confidential, running in the same hardware TEE
+      as always; replies just come back slower, and models that need a GPU share stay disabled in the picker.
+      The free tier moves back onto GPU by itself as soon as a GPU enclave frees up. Nothing for you to do.</p>
+      <div class="gpu-cta">
+        <h3>Have a TEE GPU? Get paid to run it.</h3>
+        <p>Enclave is an open market for confidential compute. Run an enclave on a machine you own, claim
+        funded work from the open queue, and the ledger pays your wallet on chain for every lease you serve.
+        More GPU hosts in the fleet is exactly what keeps LLM Chat fast and free for everyone.</p>
+        <a class="gpu-link" href="https://enclave.host/host" target="_blank" rel="noopener noreferrer">
+          Host an enclave
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M12.5 6l6 6-6 6"/></svg>
+        </a>
+      </div>
+      <p class="api-fine">No application to fill in and no account to approve: your box proves what it is with
+      a hardware attestation and the ledger does the rest. Requirements, the CLI flow and how earning works are
+      all on the host page.</p>
     </div>
   </div>
 
@@ -901,6 +965,7 @@ const state = {
                     // restarts the deployment to load it, so this state is transient; the boot ladder re-polls
   target: "auto",
   think: true,      // thinking models only: off sends enable_thinking=false
+  gpu: null,        // does this deployment hold a GPU share? true | false (CPU mode) | null (unknown)
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
 const chatId = () => "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -1377,6 +1442,7 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (apiOverlay.classList.contains("open")) { closeApi(); return; }
     if (attOverlay.classList.contains("open")) { closeAtt(); return; }
+    if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (state.busyChatId) stopGeneration();
     closeModelMenu();
   }
@@ -1672,6 +1738,30 @@ attOverlay.addEventListener("click", (e) => { if (e.target === attOverlay) close
 $("attCopyId").addEventListener("click", (e) => copyText($("attId").textContent, e.currentTarget));
 $("attCopyCmd").addEventListener("click", (e) => copyText($("attCmd").textContent, e.currentTarget));
 
+// --------------------------------------------------------- CPU-mode notice --
+// The free tier follows fleet capacity: when no GPU enclave has a share free,
+// the deployment lands on CPU-only hardware and /models reports gpu:false.
+// Say that out loud ONCE per page load rather than letting users infer it from
+// slow replies and a picker full of disabled models - and use the moment to
+// ask for the thing that actually fixes it: more TEE GPUs in the fleet.
+// gpu:null (local dev, a manager that predates the field) says nothing at all.
+// After dismissal the header chip stays for as long as the deployment is
+// CPU-only and reopens the dialog.
+const gpuOverlay = $("gpuOverlay"), cpuChip = $("cpuChip");
+let gpuNoticeShown = false;
+function openGpu() { gpuOverlay.classList.add("open"); $("gpuClose").focus(); }
+function closeGpu() { gpuOverlay.classList.remove("open"); }
+// Only once the boot overlay is gone: stacking the dialog behind a full-screen
+// loading screen would waste the one appearance it gets.
+function gpuNotice() {
+  if (gpuNoticeShown || !bootGone || state.gpu !== false) return;
+  gpuNoticeShown = true;
+  openGpu();
+}
+cpuChip.addEventListener("click", openGpu);
+$("gpuClose").addEventListener("click", closeGpu);
+gpuOverlay.addEventListener("click", (e) => { if (e.target === gpuOverlay) closeGpu(); });
+
 // ------------------------------------------------------------ model picker --
 function closeModelMenu() {
   modelMenu.classList.remove("open");
@@ -1710,7 +1800,8 @@ function renderModelMenu() {
     } else if (unfit) {
       item.disabled = true;
       item.title = unfit;
-      item.querySelector(".m-sub").textContent = "needs a larger deployment";
+      item.querySelector(".m-sub").textContent = state.gpu === false
+        ? "needs a GPU enclave" : "needs a larger deployment";
     } else {
       item.querySelector(".m-sub").textContent = m.sub !== undefined
         ? m.sub
@@ -1735,6 +1826,12 @@ function renderModelMenu() {
     b.textContent = t;
     if (state.target === t) b.classList.add("on");
     b.title = t === "auto" ? "gpu, falling back to cpu" : "run on " + t;
+    // no GPU share on this deployment: leaving "gpu" selectable would only let
+    // the user pick their way into a guaranteed failure
+    if (t === "gpu" && state.gpu === false) {
+      b.disabled = true;
+      b.title = "no GPU capacity in the fleet right now - this deployment is CPU only";
+    }
     b.addEventListener("click", (e) => {
       e.stopPropagation();
       state.target = t;
@@ -1785,12 +1882,23 @@ const modelsReady = (async () => {
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
   if (storedThink === "off") state.think = false;
-  let models = [];
+  let models = [], info = {};
   try {
     const res = await fetch("models");
-    models = (await res.json()).models || [];
+    info = (await res.json()) || {};
+    models = info.models || [];
   } catch (_) {}
   state.models = models;
+  // The deployment reports whether the platform gave it a GPU share. On false
+  // the "gpu" compute option is dead, so fall back to auto - but leave the
+  // STORED preference alone, the way an unfit model pick is left alone: it
+  // should come back the moment GPU capacity does.
+  state.gpu = info.gpu === true ? true : info.gpu === false ? false : null;
+  if (state.gpu === false) {
+    if (state.target === "gpu") state.target = "auto";
+    cpuChip.classList.add("show");
+    gpuNotice();   // no-op while the boot overlay is still up; dismissBoot retries
+  }
   const def = models.find((m) => m.name === storedModel) ||
     models.find((m) => m.default) || models[0];
   state.model = def ? def.name : "";
@@ -1859,6 +1967,7 @@ function dismissBoot() {
   bootGone = true;
   bootEl.classList.add("hide");
   setTimeout(() => bootEl.remove(), 450);
+  setTimeout(gpuNotice, 550);   // once the overlay is out of the way
 }
 $("bootSkip").addEventListener("click", dismissBoot);
 
@@ -1929,6 +2038,21 @@ async function warmLadder() {
     // (preloaded: false, from ENCLAVE_NN_PRELOADS): probing one can only
     // NotFound, so skip straight to the honest "loading on the host" state
     if (m.preloaded === false) {
+      // ...unless this deployment has no GPU share at all: the host only
+      // preloads GGUF graphs into VRAM, so no restart can heal this one and
+      // re-polling for ten minutes would be a lie dressed as a spinner. It
+      // takes GPU capacity in the fleet, which the CPU-mode notice explains.
+      if (state.gpu === false) {
+        unfitCount++;
+        state.unfit[m.name] = "this model needs a GPU enclave; the fleet has no GPU "
+          + "capacity free right now, so the deployment is running on CPU";
+        li.classList.add("unfit");
+        li.querySelector(".st").innerHTML = ICONS.alert;
+        li.querySelector(".b-sub").textContent = "needs a GPU enclave";
+        li.title = state.unfit[m.name];
+        renderModelMenu();
+        continue;
+      }
       markPending(m, li, "the host has not loaded this model yet - the platform "
         + "restarts the deployment to load it", "loading on the host…");
       renderModelMenu();
@@ -2013,7 +2137,12 @@ async function warmLadder() {
   const secs = ((Date.now() - t0) / 1000).toFixed(1) + "s";
   const unfitTitle = () => Object.entries(state.unfit).concat(Object.entries(state.hostPending))
     .map(([m, e]) => m + ": " + e).join("\n");
-  if (!warmed && pending.length) {
+  if (!warmed && state.gpu === false) {
+    // the deployment being CPU-only is the whole story; per-model failures
+    // below it are symptoms, and the dialog behind the chip has the detail
+    pill("fail", ICONS.alert, " No GPU capacity right now; see CPU mode", 15000);
+    warmPill.title = unfitTitle();
+  } else if (!warmed && pending.length) {
     pill("fail", ICONS.alert, " The host never finished loading the model; redeploy or check the deployment logs", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed && unfitCount >= ladder.length) {
