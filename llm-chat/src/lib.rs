@@ -308,26 +308,29 @@ fn vram_budget() -> Option<u64> {
 /// playground's CPU-mode notice is built on.
 ///
 /// ENCLAVE_VRAM_BYTES is set from gpuShare x card VRAM on every GPU
-/// deployment and left unset on a CPU one, so a value is PROOF of a share.
-/// The NEGATIVE needs a second witness, because a manager predating the
-/// variable also reports nothing and calling that "no GPU" would put the
-/// notice in front of users on a perfectly healthy GPU node:
-///   * some ENCLAVE_* variable must be in the environment at all - otherwise
-///     this is a dev box, not a tenant, and nothing is known;
-///   * the host must have preloaded NO ggml graphs - a preload is only
-///     possible on a GPU-share deployment (the manager puts the GGUF in
-///     VRAM at tenant boot), so ENCLAVE_NN_PRELOADS with entries means an
-///     older manager on a GPU node, not a CPU one.
+/// deployment and left unset on a CPU one, so a value is PROOF of a share -
+/// and its ABSENCE, inside a tenant environment, is the CPU signal. The one
+/// guard is that a tenant environment exists at all: some ENCLAVE_*
+/// variable must be present, or this is a dev box and nothing is known.
+///
+/// Deliberately does NOT consult ENCLAVE_NN_PRELOADS. It used to, reading a
+/// preload as proof of a GPU node on the theory that only a GPU share can
+/// put a GGUF in VRAM. The fleet's CPU-serving path preloads ggml graphs
+/// too (into host RAM) - that is what makes CPU serving work - so the test
+/// swallowed the exact case this exists for: metal0 served on CPU and
+/// reported "unknown", and the playground said nothing. The residual risk
+/// is the mirror image and much cheaper: a manager that sets no VRAM budget
+/// on a GPU node shows an informational notice it did not need.
 ///
 /// Some(true) = GPU share; Some(false) = tenant with no GPU, i.e. CPU mode;
-/// None = unknowable here, and the playground stays quiet rather than guess.
+/// None = not a platform tenant, and the playground stays quiet.
 fn gpu_present() -> Option<bool> {
     if vram_budget().is_some() {
         return Some(true);
     }
-    let tenant = std::env::vars().any(|(k, _)| k.starts_with("ENCLAVE_"));
-    let preloaded = preloaded_graphs().is_some_and(|p| !p.is_empty());
-    (tenant && !preloaded).then_some(false)
+    std::env::vars()
+        .any(|(k, _)| k.starts_with("ENCLAVE_"))
+        .then_some(false)
 }
 
 /// Bytes per KV-cache element, in SIXTEENTHS (q8_0 stores 34 bytes per
