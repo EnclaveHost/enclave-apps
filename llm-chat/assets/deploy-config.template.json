@@ -1,11 +1,11 @@
 {
- "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). The 'models' catalog is stated in FULL for all four ggml volumes; the retired onnx volume qwen2.5-0.5b is gone from the gpu fleet so its entry is dropped here (the catalog embedded in the wasm keeps it for local dev). qwen2.5-0.5b-gguf sets tokenizer_file to null EXPLICITLY: ENCLAVE_CONFIG merges per FIELD into the embedded catalog, whose entry still points tokenizer_file at the retired onnx volume - omitting the key would keep that stale cross-volume path, null clears it so the re-wrapped volume's own bundled tokenizer.json serves. 122b/9b geometry from the volumes' GGUF headers (qwen35moe/qwen35) + the shared Qwen3.5 tokenizer; both open replies with a <think> block, which the large max_new budgets and rep_penalty 1 (penalties distort long reasoning) are sized for. kv_layers counts only the FULL-ATTENTION layers (hybrid models keep no KV in the linear-attention ones) so the app's VRAM pricing - weights + KV at the NODE's window (llama.cpp allocates the whole ENCLAVE_GGML_N_CTX up front, not the app's prompt budget) + ~1.5 GB working set - is honest. The 122b needs >=~50% GPU share; the qwen3.6-27b (arch qwen35 in the GGUF, same hybrid SSM family, kv_layers 16 of 64) needs ~28 GB (17.6 weights + 9.1 KV at the 256K node window + working set) = gpu 0.21; the 9b needs ~12 GB (5.6 weights + 4.3 KV at the 256K node window + working set) = gpu 0.09; under that the app now refuses it cleanly instead of the tenant dying by CUDA OOM mid-compute. qwen2.5-0.5b-gguf runs its full native window (32k = 24576 prompt + 8192 gen cap; the embedded 3072 was sized for the retired onnx guest-memory path - ggml KV lives host-side, and the node's ENCLAVE_GGML_N_CTX 262144 already covers it). think_budget 16384 is set on every thinking model, half of default_max_new: a model that gets stuck in its <think> block re-deriving the same step would otherwise spend the whole 32768-token budget reasoning and answer nothing, so at 16384 the server closes the block itself and the model writes its answer with the remaining half. It is a runaway guard, not a style knob - raise it for work that legitimately reasons longer, drop the key (or 0) to let a model think until max_new. qwen2.5-0.5b-gguf does not reason, so it has none. Largest attached model serves as the default.",
+ "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). The 'models' catalog is stated in FULL for all four ggml volumes; the retired onnx volume qwen2.5-0.5b is gone from the gpu fleet so its entry is dropped here (the catalog embedded in the wasm keeps it for local dev). qwen2.5-0.5b-gguf sets tokenizer_file to null EXPLICITLY: ENCLAVE_CONFIG merges per FIELD into the embedded catalog, whose entry still points tokenizer_file at the retired onnx volume - omitting the key would keep that stale cross-volume path, null clears it so the re-wrapped volume's own bundled tokenizer.json serves. 122b/9b geometry from the volumes' GGUF headers (qwen35moe/qwen35) + the shared Qwen3.5 tokenizer; both open replies with a <think> block, which the large max_new budgets and rep_penalty 1 (penalties distort long reasoning) are sized for. kv_layers counts only the FULL-ATTENTION layers (hybrid models keep no KV in the linear-attention ones) so the app's VRAM pricing - weights + KV at the NODE's window (llama.cpp allocates the whole ENCLAVE_GGML_N_CTX up front, not the app's prompt budget) + ~1.5 GB working set - is honest. The 122b needs >=~50% GPU share; the qwen3.6-27b (arch qwen35 in the GGUF, same hybrid SSM family, kv_layers 16 of 64) needs ~28 GB (17.6 weights + 9.1 KV at the 256K node window + working set) = gpu 0.21; the 9b needs ~12 GB (5.6 weights + 4.3 KV at the 256K node window + working set) = gpu 0.09; under that the app now refuses it cleanly instead of the tenant dying by CUDA OOM mid-compute. qwen2.5-0.5b-gguf runs its full native window (32k = 24576 prompt + 8192 gen cap; the embedded 3072 was sized for the retired onnx guest-memory path - ggml KV lives host-side, and the node's ENCLAVE_GGML_N_CTX 262144 already covers it). think_budget 16384 is set on every thinking model, half of default_max_new: a model that gets stuck in its <think> block re-deriving the same step would otherwise spend the whole 32768-token budget reasoning and answer nothing, so at 16384 the server closes the block itself and the model writes its answer with the remaining half. It is a runaway guard, not a style knob - raise it for work that legitimately reasons longer, drop the key (or 0) to let a model think until max_new. qwen2.5-0.5b-gguf does not reason, so it has none. The fable-fusion 27b ships in TWO quants and 'volumes' attaches the Q4 one, deliberately: both entries describe the same model and geometry, but the Q4 is the one sized for a small share. At the fleet's 176K q8_0 node window (ENCLAVE_GGML_N_CTX 180224) Q4_K_M costs ~26.8 GB to serve (18.5 weights + 6.7 KV including the lazily-created MTP head context + working set) and Q5_K_M ~29.5 GB, against the 35.1 GB a 25% H200 share holds. That margin was not always there: at the old 256K window the Q5 needed ~32.5 GB, and because the MTP head context is created LAZILY on the first speculative session the deployment served, answered /warmup in 100 ms, and then stalled the first real chat request when the head's KV and buffers exhausted what was left (deployment a025ed60, 2026-07-28). Never attach both fable volumes at once: two 27b preloads is ~40 GB of weights before a byte of KV, and the default pick is the largest attached model that fits. Largest attached model serves as the default.",
  "volumes": [
   "qwen2.5-0.5b-gguf",
   "qwen3.5-122b-gguf",
   "qwen3.5-9b-gguf",
   "qwen3.6-27b-gguf",
-  "fable-fusion-27b-mtp-gguf"
+  "fable-fusion-27b-mtp-q4-gguf"
  ],
  "models": {
   "qwen3.5-122b-gguf": {
@@ -134,6 +134,30 @@
    "template": "chatml",
    "thinking": true,
    "system_prompt": "You are Qwen, a helpful AI assistant. Answer concisely and accurately.",
+   "max_prompt_tokens": 98304,
+   "default_max_new": 32768,
+   "max_new_cap": 81920,
+   "think_budget": 16384,
+   "rep_penalty": 1,
+   "rep_window": 64,
+   "draft": "mtp",
+   "draft_tokens": 6
+  },
+  "fable-fusion-27b-mtp-q4-gguf": {
+   "name": "fable-fusion-27b-mtp",
+   "backend": "ggml",
+   "n_layers": 64,
+   "n_kv_heads": 4,
+   "head_dim": 256,
+   "kv_layers": 17,
+   "vocab": 248320,
+   "eos": [
+    248046,
+    248044
+   ],
+   "template": "chatml",
+   "thinking": true,
+   "system_prompt": "You are a helpful, creative AI assistant.",
    "max_prompt_tokens": 98304,
    "default_max_new": 32768,
    "max_new_cap": 81920,
