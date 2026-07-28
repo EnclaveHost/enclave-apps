@@ -77,6 +77,22 @@ pub struct AppConfig {
     /// all, so this is what it gets.
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// nucleus sampling for requests that don't send one: the smallest set of
+    /// candidates whose probabilities sum to top_p (1.0 = off).
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    /// top-k truncation for requests that don't send one: consider only the k
+    /// likeliest tokens (0 = off, which is the historical default).
+    ///
+    /// Worth setting on a reasoning model. With top_k off the candidate set is
+    /// whatever the nucleus admits out of a 256-wide prefilter, and that tail
+    /// is where a reply that has lost the thread goes wandering: measured on
+    /// the fable 27b (2026-07-28, "write a haiku", 1200 tokens), repeated
+    /// 10-grams ran 36.3% at top_k 0 and 10.6% at top_k 40, while raising
+    /// temperature alone barely moved it (31.8% at 0.9). Truncation, not
+    /// temperature, is the lever against a degenerate reply.
+    #[serde(default)]
+    pub top_k: usize,
     pub rep_penalty: f32,
     pub rep_window: usize,
     /// when set, /v1/* requires `Authorization: Bearer <api_key>`. The chat
@@ -132,6 +148,10 @@ pub struct AppConfig {
 
 fn default_temperature() -> f32 {
     0.7
+}
+
+fn default_top_p() -> f32 {
+    0.9
 }
 
 fn default_draft_tokens() -> usize {

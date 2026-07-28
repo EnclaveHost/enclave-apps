@@ -1937,8 +1937,8 @@ fn gen_params(
             .max(1),
         sample: SampleParams {
             temperature: creq.temperature.unwrap_or(cfg.temperature).clamp(0.0, 2.0),
-            top_p: creq.top_p.unwrap_or(0.9).clamp(0.05, 1.0),
-            top_k: creq.top_k.unwrap_or(0),
+            top_p: creq.top_p.unwrap_or(cfg.top_p).clamp(0.05, 1.0),
+            top_k: creq.top_k.unwrap_or(cfg.top_k),
             rep_penalty: cfg.rep_penalty,
             rep_window: cfg.rep_window,
         },
