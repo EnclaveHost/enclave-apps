@@ -498,17 +498,26 @@
     font: .95em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
 
-  /* the host CTA inside the CPU-mode dialog: the fleet is short of GPUs and
-     the reader may be holding the fix */
+  /* CPU-mode dialog. The outage explains itself in two lines and then gets
+     out of the way of the ask: the fleet is short of GPUs and the reader may
+     own one. Roomier type than the other dialogs - this one is read cold, by
+     someone who did not click anything to summon it. */
+  #gpuOverlay .api-card { font-size: 14px; line-height: 1.65; }
+  #gpuOverlay .api-head h2 { font-size: 17px; }
+  #gpuOverlay .att-status { margin: 2px 0 12px; }
+  .gpu-lead { color: var(--text-2); margin-bottom: 14px; }
   .gpu-cta {
-    margin: 14px 0 12px; padding: 14px 16px; border-radius: 12px;
+    margin: 0 0 12px; padding: 16px 18px; border-radius: 12px;
     background: var(--code-bg); border: 1px solid var(--border-soft);
   }
-  .gpu-cta h3 { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
-  .gpu-cta p { color: var(--text-2); }
+  .gpu-cta h3 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+  .gpu-list { list-style: none; display: flex; flex-direction: column; gap: 11px; }
+  .gpu-list li { display: flex; gap: 11px; color: var(--text-2); }
+  .gpu-list svg { color: var(--accent); margin-top: 4px; flex: none; }
+  .gpu-list b { color: var(--text); font-weight: 600; }
   .gpu-link {
-    display: inline-flex; align-items: center; gap: 7px; margin-top: 12px;
-    padding: 9px 16px; border-radius: 999px; font-size: 13px; font-weight: 500;
+    display: inline-flex; align-items: center; gap: 8px; margin-top: 16px;
+    padding: 11px 18px; border-radius: 999px; font-size: 13.5px; font-weight: 600;
     background: var(--btn); color: var(--btn-fg); text-decoration: none;
   }
   .gpu-link:hover { opacity: .88; }
@@ -586,6 +595,21 @@
     #jump { bottom: 118px; }
     #cpuChip .lbl { display: none; } /* the icon alone in a crowded header */
     #cpuChip { padding: 6px; }
+    /* tighten the CPU-mode dialog so its call to action clears the fold on a
+       phone: a button below the crease is a button nobody presses */
+    #gpuOverlay { padding: 10px; }
+    #gpuOverlay .api-card {
+      font-size: 13.5px; line-height: 1.55; padding: 14px 16px;
+      max-height: 95dvh;   /* the card scrolls; this is what keeps the CTA inside the scrolled view */
+    }
+    #gpuOverlay .api-head { margin-bottom: 8px; }
+    #gpuOverlay .api-head h2 { font-size: 16px; }
+    #gpuOverlay .att-status { margin: 0 0 10px; }
+    .gpu-lead { margin-bottom: 10px; }
+    .gpu-cta { padding: 12px 14px; }
+    .gpu-cta h3 { margin-bottom: 9px; }
+    .gpu-list { gap: 8px; }
+    .gpu-link { margin-top: 12px; }
   }
 </style>
 </head>
@@ -730,32 +754,47 @@
   <div id="gpuOverlay">
     <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="gpuTitle">
       <div class="api-head">
-        <h2 id="gpuTitle">No GPU capacity right now</h2>
+        <h2 id="gpuTitle">Get paid to rent out your GPU</h2>
         <button class="icon-btn" id="gpuClose" aria-label="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
         </button>
       </div>
       <div class="att-status warn">
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>
-        <span>This deployment holds no GPU share, so it is serving on CPU.</span>
+        <span>No GPU capacity right now, so this chat is answering on CPU.</span>
       </div>
-      <p>Every GPU enclave in the fleet is busy or offline at the moment, so the free tier of LLM Chat is
-      running in CPU mode. Chat still works and it is still confidential, running in the same hardware TEE
-      as always; replies just come back slower, and models that need a GPU share stay disabled in the picker.
-      The free tier moves back onto GPU by itself as soon as a GPU enclave frees up. Nothing for you to do.</p>
+      <p class="gpu-lead">LLM Chat is free because people rent their hardware to the fleet, and every GPU
+      enclave is taken right now. A machine with a TEE-capable CPU and a confidential-computing GPU could
+      be earning instead of sitting idle.</p>
       <div class="gpu-cta">
-        <h3>Have a TEE GPU? Get paid to run it.</h3>
-        <p>Enclave is an open market for confidential compute. Run an enclave on a machine you own, claim
-        funded work from the open queue, and the ledger pays your wallet on chain for every lease you serve.
-        More GPU hosts in the fleet is exactly what keeps LLM Chat fast and free for everyone.</p>
+        <h3>What your box would earn</h3>
+        <ul class="gpu-list">
+          <li>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+            <span><b>Paid by the second, in USDC on Base.</b> The ledger escrows the runner's share of
+            what each deployment pays and sweeps it to your own wallet for every second you hold the
+            lease. Nobody holds your earnings for you.</span>
+          </li>
+          <li>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12.5V4.5a1.5 1.5 0 0 1 1.5-1.5h8L21 11.5 12.5 20z"/><path d="M7.4 7.4v.01"/></svg>
+            <span><b>You set the price.</b> Name your hourly rate for the box and for the card, and work
+            paying less is refused. A full GPU card rents for about $6 an hour on this fleet today.</span>
+          </li>
+          <li>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
+            <span><b>No application, no approval.</b> Your box proves what it is with a hardware
+            attestation and the ledger does the rest. Tenants cannot read the work you host, and you
+            cannot either.</span>
+          </li>
+        </ul>
         <a class="gpu-link" href="https://enclave.host/host" target="_blank" rel="noopener noreferrer">
-          Host an enclave
+          Rent out your GPU
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M12.5 6l6 6-6 6"/></svg>
         </a>
       </div>
-      <p class="api-fine">No application to fill in and no account to approve: your box proves what it is with
-      a hardware attestation and the ledger does the rest. Requirements, the CLI flow and how earning works are
-      all on the host page.</p>
+      <p class="api-fine">Linux with KVM, a few GB of RAM for the guest, and a little Base ETH for gas. No
+      public IP needed, so a machine behind CGNAT works. Setup is one command line tool; the full
+      requirements are on the host page.</p>
     </div>
   </div>
 
