@@ -53,6 +53,19 @@ pub struct AppConfig {
     /// tokens a model never trained on degrades it.
     #[serde(default)]
     pub thinking: bool,
+    /// how many tokens the reply may spend INSIDE its <think> block before
+    /// the block is force-closed and the answer has to start (0 = uncapped,
+    /// the default). Reasoning models can get stuck in the block, re-deriving
+    /// the same step until max_new is gone, and the user is left with a wall
+    /// of reasoning and no answer. At the budget the server appends
+    /// `\n</think>\n\n` to the reply AND feeds it to the model, which then
+    /// writes its answer from the reasoning it already has. Only ever armed
+    /// on a turn whose prompt force-opened the block (a `thinking` model with
+    /// thinking left on), so it is inert everywhere else. Counts toward the
+    /// same max_new budget as the rest of the reply: leave enough headroom
+    /// under default_max_new for an answer.
+    #[serde(default)]
+    pub think_budget: usize,
     pub system_prompt: String,
     pub max_prompt_tokens: usize,
     pub default_max_new: usize,

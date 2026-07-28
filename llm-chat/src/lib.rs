@@ -49,7 +49,10 @@
 //!                               force-opens the block and the server
 //!                               re-emits `<think>\n` at the head of the
 //!                               reply; history replays drop prior think
-//!                               blocks.
+//!                               blocks. A config `think_budget` caps the
+//!                               tokens a reply may spend in the block and
+//!                               closes it if the model will not (see
+//!                               ThinkGuard).
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!
 //! Generation: autoregressive decode with the model's KV cache. The trick
@@ -1054,6 +1057,10 @@ struct GenParams {
     max_new: usize,
     sample: SampleParams,
     stop_strings: Vec<String>,
+    /// tokens the reply may spend inside its <think> block before the block
+    /// is forced shut (0 = uncapped). Already resolved against the turn: it
+    /// is nonzero only when the prompt actually force-opened a block.
+    think_budget: usize,
 }
 
 struct GenStats {
@@ -1069,6 +1076,8 @@ struct GenStats {
     /// tokens the draft proposed and how many the target accepted
     drafted: usize,
     accepted: usize,
+    /// the think budget ran out and the server closed the block (see ThinkGuard)
+    think_forced: bool,
 }
 
 /// The incremental text pipeline shared by the plain and speculative decode
@@ -1127,6 +1136,19 @@ impl<'a> TextOut<'a> {
             }
         }
     }
+    /// Push a run of tokens the SERVER chose rather than the model (the
+    /// think-budget close). They are ordinary tokens in every other respect -
+    /// visible, counted, part of the rep-penalty window. Stop strings cannot
+    /// occur inside a run this short and fixed, so the only outcome worth
+    /// reporting is a client disconnect: false = gone.
+    fn push_forced(&mut self, ids: &[u32]) -> bool {
+        for &t in ids {
+            if matches!(self.push(t), Pushed::Gone) {
+                return false;
+            }
+        }
+        true
+    }
     /// the repetition-penalty window: the freshest `w` sampled tokens,
     /// falling back to the prompt tail before anything is generated
     fn recent(&self, prompt_ids: &[u32], w: usize) -> Vec<u32> {
@@ -1135,6 +1157,90 @@ impl<'a> TextOut<'a> {
         } else {
             self.generated[self.generated.len().saturating_sub(w)..].to_vec()
         }
+    }
+}
+
+const THINK_CLOSE: &str = "</think>";
+/// What the server writes into the reply to force the block shut. The leading
+/// newline lands the tag on its own line even when the budget cut the model
+/// off mid-word; the trailing pair matches how the qwen3.x templates end a
+/// think block, so the answer starts exactly where the model expects it to.
+const THINK_CLOSE_TEXT: &str = "\n</think>\n\n";
+
+/// The think-budget watchdog: it keeps a reasoning model from spending a
+/// whole reply inside <think>. Left alone, a model that loops in the block -
+/// re-deriving the same step, second-guessing the same answer - runs to
+/// max_new and the user gets a wall of reasoning and no answer at all.
+///
+/// At the budget the block is FORCE-CLOSED: THINK_CLOSE_TEXT is pushed into
+/// the visible reply and fed to the model as real tokens on the real
+/// sequence, so the model's own context says the reasoning is over and it
+/// writes the answer with what it has. Every decode path does the feed its
+/// own way (plain, speculative, MTP) but they all inject the same tokens at
+/// the same point: right after a sampled token is pushed and before it is
+/// fed, where the sequence is in a known state.
+///
+/// The block is open from the very first generated token whenever the prompt
+/// force-opened it (ThinkTurn::Open - the only way these templates start
+/// one), so the in-block count IS out.generated.len(). A model that opens a
+/// block by itself mid-reply is not tracked; nothing in the qwen3.x family
+/// does that, because the template already wrote the opening tag.
+struct ThinkGuard {
+    budget: usize, // 0 = off, and then nothing below ever runs
+    open: bool,
+    scanned: usize, // bytes of out.text already searched for the closing tag
+    close: Vec<u32>,
+    forced: bool,
+}
+
+impl ThinkGuard {
+    fn new(budget: usize, tok: &Tokenizer) -> ThinkGuard {
+        // a tokenizer that cannot produce the closing tag leaves the guard
+        // off: a budget we cannot act on is better than a mangled reply
+        let close = if budget == 0 {
+            Vec::new()
+        } else {
+            tok.encode(THINK_CLOSE_TEXT, false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default()
+        };
+        ThinkGuard { budget, open: !close.is_empty(), scanned: 0, close, forced: false }
+    }
+
+    /// Called after each pushed token: is the budget spent with the block
+    /// still open? The guard falls silent for the rest of the reply either
+    /// way - once the model closes the block on its own, or once we have.
+    fn over(&mut self, out: &TextOut) -> bool {
+        if !self.open {
+            return false;
+        }
+        // the tag can straddle two pushes, so re-read its own length of
+        // already-scanned text; incremental detokenization can also rewrite
+        // the tail (a replacement char completing into a shorter char), hence
+        // the clamp and the walk back to a char boundary
+        let mut from = self.scanned.saturating_sub(THINK_CLOSE.len()).min(out.text.len());
+        while from > 0 && !out.text.is_char_boundary(from) {
+            from -= 1;
+        }
+        if out.text[from..].contains(THINK_CLOSE) {
+            self.open = false;
+            return false;
+        }
+        self.scanned = out.text.len();
+        if out.generated.len() < self.budget {
+            return false;
+        }
+        self.open = false;
+        self.forced = true;
+        true
+    }
+
+    fn note(&self) -> String {
+        format!(
+            "the think budget of {} tokens is spent and the reasoning block is still open - \
+             closing it so the answer can start",
+            self.budget
+        )
     }
 }
 
@@ -1246,6 +1352,7 @@ fn generate(
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
+    let mut think = ThinkGuard::new(p.think_budget, tok);
     let mut finish: &'static str = "stop";
     loop {
         let recent = out.recent(prompt_ids, p.sample.rep_window);
@@ -1265,9 +1372,22 @@ fn generate(
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: out.text, drafted: 0, accepted: 0,
+                    think_forced: think.forced,
                 });
             }
             Pushed::Gone => break, // client disconnected
+        }
+        // budget spent: close the block in the same pass that feeds `next`,
+        // so the model's next sample is already outside it
+        if think.over(&out) {
+            let _ = status(&think.note());
+            if !out.push_forced(&think.close) {
+                break;
+            }
+            let mut ids = vec![next];
+            ids.extend_from_slice(&think.close);
+            logits = sess.feed(cfg, &ids, true)?;
+            continue;
         }
         logits = sess.feed(cfg, &[next], true)?;
     }
@@ -1277,6 +1397,7 @@ fn generate(
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: out.text, drafted: 0, accepted: 0,
+        think_forced: think.forced,
     })
 }
 
@@ -1316,7 +1437,6 @@ fn generate_spec(
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let SpecRig { mut dsess, mut tscr, mut dscr, t_seq, d_seq, tscr_seq, dscr_seq } = rig;
-    let _ = status; // notes are emitted by the caller; deltas keep the stream warm
     let k = dcfg.draft_tokens.clamp(1, 16).min(cfg.draft_tokens.clamp(1, 16));
     let t1 = now_ms();
     // prefill BOTH models on the prompt; only the target's last row is needed
@@ -1340,6 +1460,7 @@ fn generate_spec(
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
+    let mut think = ThinkGuard::new(p.think_budget, tok);
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     // fed-token cursors, so rewinds land on absolute positions
@@ -1361,9 +1482,28 @@ fn generate_spec(
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: out.text, drafted, accepted,
+                    think_forced: think.forced,
                 });
             }
             Pushed::Gone => break 'outer,
+        }
+        // -- budget spent: force the block shut on the REAL target sequence
+        //    (one plain pass, no speculation to unwind) and resample from the
+        //    row it returns. The draft sees the whole run as ordinary history
+        //    through next round's catchup, so both models stay in step.
+        if think.over(&out) {
+            let _ = status(&think.note());
+            if !out.push_forced(&think.close) {
+                break 'outer;
+            }
+            let mut ids = vec![pending];
+            ids.extend_from_slice(&think.close);
+            let mut row = sess.feed(cfg, &ids, true)?;
+            t_fed += ids.len();
+            d_behind.extend_from_slice(&ids);
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
+            continue 'outer;
         }
         // -- catch the draft's REAL sequence up on accepted history (its
         //    branch only ever carries proposals), then branch it
@@ -1426,6 +1566,7 @@ fn generate_spec(
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        think_forced: think.forced,
                     });
                 }
                 Pushed::Gone => { accepted += acc + 1; break 'outer; }
@@ -1463,6 +1604,7 @@ fn generate_spec(
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: out.text, drafted, accepted,
+        think_forced: think.forced,
     })
 }
 
@@ -1487,7 +1629,6 @@ fn generate_mtp(
     emit: &dyn Fn(&str) -> bool,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
-    let _ = status;
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
     let k = cfg.draft_tokens.clamp(1, 16);
     let p_min_milli = (cfg.draft_p_min.clamp(0.05, 0.95) * 1000.0) as i32;
@@ -1507,6 +1648,7 @@ fn generate_mtp(
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
+    let mut think = ThinkGuard::new(p.think_budget, tok);
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut t_fed = prompt_ids.len();
@@ -1524,9 +1666,33 @@ fn generate_mtp(
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: out.text, drafted, accepted,
+                    think_forced: think.forced,
                 });
             }
             Pushed::Gone => break 'outer,
+        }
+        // -- budget spent: force the block shut. The close rides exactly the
+        //    path a fully-accepted round takes - verified on the branch with
+        //    head rows harvested for the real sequence, mirrored into the
+        //    head, branch adopted - so the MTP head never goes stale on
+        //    tokens the server chose rather than the model.
+        if think.over(&out) {
+            let _ = status(&think.note());
+            if !out.push_forced(&think.close) {
+                break 'outer;
+            }
+            let mut ids = vec![pending];
+            ids.extend_from_slice(&think.close);
+            tscr.copy_from(t_seq, t_fed)?;
+            let mut rows = tscr.feed_all_mtp(cfg, &ids, t_seq)?;
+            let tscr_fed = t_fed + ids.len();
+            sess.mtp_accept(t_fed, &ids)?;
+            sess.copy_from(tscr_seq, tscr_fed)?;
+            t_fed = tscr_fed;
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            let last = rows.len() - 1;
+            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
+            continue 'outer;
         }
         // -- the head proposes (0..=k tokens; an empty draft still verifies
         //    [pending] alone, which adopts as a plain step)
@@ -1567,6 +1733,7 @@ fn generate_mtp(
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        think_forced: think.forced,
                     });
                 }
                 Pushed::Gone => { accepted += acc + 1; break 'outer; }
@@ -1596,6 +1763,7 @@ fn generate_mtp(
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: out.text, drafted, accepted,
+        think_forced: think.forced,
     })
 }
 
@@ -1739,7 +1907,15 @@ fn build_prompt(
     }
 }
 
-fn gen_params(cfg: &AppConfig, creq: &ChatReq, extra_stops: Vec<String>) -> GenParams {
+/// `think_open` is build_prompt's: the think budget only arms on a turn whose
+/// prompt actually force-opened a reasoning block, which is what makes it
+/// inert for non-thinking models and for enable_thinking=false turns.
+fn gen_params(
+    cfg: &AppConfig,
+    creq: &ChatReq,
+    extra_stops: Vec<String>,
+    think_open: bool,
+) -> GenParams {
     let mut stops = extra_stops;
     match &creq.stop {
         Some(serde_json::Value::String(s)) if !s.is_empty() => stops.push(s.clone()),
@@ -1767,6 +1943,7 @@ fn gen_params(cfg: &AppConfig, creq: &ChatReq, extra_stops: Vec<String>) -> GenP
             rep_window: cfg.rep_window,
         },
         stop_strings: stops,
+        think_budget: if think_open { cfg.think_budget } else { 0 },
     }
 }
 
@@ -1899,7 +2076,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
-    let params = gen_params(cfg, &creq, stops);
+    let params = gen_params(cfg, &creq, stops, think_open);
 
     let headers = Fields::new();
     let _ = headers.set(&"content-type".to_string(), &[b"text/event-stream".to_vec()]);
@@ -1957,6 +2134,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     done["draft_tokens"] = serde_json::json!(s.drafted);
                     done["draft_accepted"] = serde_json::json!(s.accepted);
                 }
+                if s.think_forced {
+                    done["think_forced"] = serde_json::json!(true);
+                }
                 send(done);
                 ok = true;
                 break;
@@ -2008,7 +2188,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
-    let params = gen_params(cfg, &creq, stops);
+    let params = gen_params(cfg, &creq, stops, think_open);
     let mode = creq.target.as_deref().unwrap_or("auto");
     let id = completion_id();
     let created = (now_ms() / 1000) as u64;
@@ -2120,7 +2300,8 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                     },
                     "enclave": { "target": s.target, "load_ms": s.load_ms as u64,
                              "prefill_ms": s.prefill_ms as u64, "decode_ms": s.decode_ms as u64,
-                             "draft_tokens": s.drafted, "draft_accepted": s.accepted },
+                             "draft_tokens": s.drafted, "draft_accepted": s.accepted,
+                             "think_forced": s.think_forced },
                 });
                 respond_bytes(out, 200, "application/json", body_json.to_string().as_bytes());
             }
