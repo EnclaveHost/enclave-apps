@@ -1760,7 +1760,7 @@ fn gen_params(cfg: &AppConfig, creq: &ChatReq, extra_stops: Vec<String>) -> GenP
             .min(cfg.max_new_cap)
             .max(1),
         sample: SampleParams {
-            temperature: creq.temperature.unwrap_or(0.7).clamp(0.0, 2.0),
+            temperature: creq.temperature.unwrap_or(cfg.temperature).clamp(0.0, 2.0),
             top_p: creq.top_p.unwrap_or(0.9).clamp(0.05, 1.0),
             top_k: creq.top_k.unwrap_or(0),
             rep_penalty: cfg.rep_penalty,

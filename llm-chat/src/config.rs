@@ -57,6 +57,13 @@ pub struct AppConfig {
     pub max_prompt_tokens: usize,
     pub default_max_new: usize,
     pub max_new_cap: usize,
+    /// sampling temperature for requests that don't send one (0 = greedy,
+    /// clamped 0.0..=2.0 like the request field). Per-model, so a deployment
+    /// can pin the value its model was tuned for instead of relying on every
+    /// client to ask for it: the built-in chat UI sends no sampling params at
+    /// all, so this is what it gets.
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
     pub rep_penalty: f32,
     pub rep_window: usize,
     /// when set, /v1/* requires `Authorization: Bearer <api_key>`. The chat
@@ -108,6 +115,10 @@ pub struct AppConfig {
     /// (0.05..=0.95; default 0.4 - lower = longer, riskier drafts)
     #[serde(default = "default_draft_p_min")]
     pub draft_p_min: f32,
+}
+
+fn default_temperature() -> f32 {
+    0.7
 }
 
 fn default_draft_tokens() -> usize {
