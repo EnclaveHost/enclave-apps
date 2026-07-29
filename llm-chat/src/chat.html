@@ -629,14 +629,21 @@
 
     /* Phone header stacks instead of squeezing. One row of six controls left
        the model name truncated to a few characters - the one label that
-       actually tells you what you are talking to. So: status row, then the
-       model full width, then the actions full width. */
+       actually tells you what you are talking to. So: sidebar toggle and the
+       model share the top line, the warmup pill gets its own, and the actions
+       take a full width of their own. */
     header { flex-wrap: wrap; row-gap: 8px; padding: 8px 12px; }
     header .spacer { display: none; }        /* wrapping does the pushing now */
-    #menuBtn, #warmPill, #cpuChip { order: 1; }
-    #warmPill { max-width: none; flex: 1; }  /* takes the slack on row 1 */
-    .model-wrap { order: 2; flex: 1 1 100%; }
+    #menuBtn, #cpuChip { order: 1; }
+    /* `auto` basis, not 100%: the model shares row 1 with the toggle and
+       grows into whatever is left, rather than forcing itself onto its own
+       line. min-width 0 lets it shrink instead of overflowing. */
+    .model-wrap { order: 1; flex: 1 1 auto; min-width: 0; }
     #modelBtn { width: 100%; justify-content: space-between; }
+    #modelLabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* the pill is a whole sentence; a 100% basis puts it on its own line
+       instead of crushing the model name next to it */
+    #warmPill { order: 2; flex: 1 1 100%; max-width: none; }
     /* the dropdown is anchored to a now-full-width button, so let it match
        rather than keep a 300px min that would overflow a narrow screen */
     #modelMenu { min-width: 0; width: 100%; }
