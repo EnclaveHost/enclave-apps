@@ -95,6 +95,18 @@ pub struct AppConfig {
     pub top_k: usize,
     pub rep_penalty: f32,
     pub rep_window: usize,
+    /// DEGENERATION STOP: how many times one identical block of tokens may
+    /// repeat back-to-back before the reply is cut off (0 = off; default 4).
+    ///
+    /// Unlike rep_penalty and top_k this is not a nudge to the sampler, it is
+    /// a hard stop, and unlike think_budget it applies to the WHOLE reply
+    /// rather than only inside a force-opened `<think>` block. That gap is
+    /// what let a looping haiku run to 80k tokens: the model was reasoning in
+    /// plain prose, so the think budget never armed and rep_penalty 1 meant
+    /// nothing was pushing back. Leave it on; it costs a tail comparison per
+    /// token and only ever fires on text no user wanted.
+    #[serde(default = "default_repeat_guard")]
+    pub repeat_guard: usize,
     /// when set, /v1/* requires `Authorization: Bearer <api_key>`. The chat
     /// UI and legacy /chat stay open - gate those with a PRIVATE deployment.
     #[serde(default)]
@@ -144,6 +156,20 @@ pub struct AppConfig {
     /// (0.05..=0.95; default 0.4 - lower = longer, riskier drafts)
     #[serde(default = "default_draft_p_min")]
     pub draft_p_min: f32,
+    /// WEB SEARCH: absent (the default) means the app never makes an outbound
+    /// request and the UI hides the control entirely - a deployment opts IN.
+    /// Present means a request may ask for search, and the app fetches results
+    /// itself over wasi:http so the query goes out from the deployment's own
+    /// egress identity rather than the user's browser. See search.rs for what
+    /// the provider does and does not learn.
+    #[serde(default)]
+    pub search: Option<crate::search::SearchConfig>,
+    /// IMAGE GENERATION: absent (the default) means the app never calls an
+    /// image service and the model is never told it could. Present points at
+    /// one - normally the sibling image-generator app's deployment - and the
+    /// same router that decides about web search decides about images.
+    #[serde(default)]
+    pub image: Option<crate::image::ImageConfig>,
 }
 
 fn default_temperature() -> f32 {
@@ -152,6 +178,10 @@ fn default_temperature() -> f32 {
 
 fn default_top_p() -> f32 {
     0.9
+}
+
+fn default_repeat_guard() -> usize {
+    4
 }
 
 fn default_draft_tokens() -> usize {

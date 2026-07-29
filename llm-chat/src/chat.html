@@ -238,6 +238,9 @@
   }
   @keyframes rot { to { transform: rotate(360deg); } }
   .spacer { flex: 1; }
+  /* the right-hand icon group: one box on desktop so it can become its own
+     full-width row on a phone (see the mobile block) */
+  .header-actions { display: flex; align-items: center; gap: 4px; }
 
   /* -------------------------------------------------------- boot overlay -- */
   /* Loading screen served with the page: covers the app while the model
@@ -332,6 +335,34 @@
     margin-left: 8px; font-size: 12px; color: var(--text-3); cursor: default;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+
+  /* web-search citations: the [n] markers in the reply are only checkable if
+     the numbered list is right there under it */
+  .sources {
+    margin: 10px 0 2px; padding: 10px 12px; border-radius: 12px;
+    background: var(--hover); font-size: 13px; line-height: 1.55;
+  }
+  .sources .sources-h {
+    color: var(--text-3); font-size: 11.5px; letter-spacing: .04em;
+    text-transform: uppercase; margin-bottom: 6px;
+  }
+  .sources ol { margin: 0; padding-left: 20px; }
+  .sources li { margin: 3px 0; }
+  .sources a { color: var(--text); text-decoration: none; border-bottom: 1px solid var(--border-soft); }
+  .sources a:hover { border-bottom-color: var(--text-3); }
+  .sources .host { color: var(--text-3); font-size: 12px; margin-left: 6px; }
+
+  /* a generated image sits above the reply that talks about it */
+  .genimg { margin: 4px 0 10px; }
+  .genimg img {
+    max-width: min(100%, 512px); height: auto; border-radius: 14px;
+    border: 1px solid var(--border-soft); display: block; background: var(--hover);
+  }
+  .genimg figcaption {
+    color: var(--text-3); font-size: 12px; margin-top: 6px;
+    max-width: min(100%, 512px);
+  }
+  .genimg a.dl { color: var(--text-3); text-decoration: underline; }
 
   /* in-place editor for a sent user message */
   .row.user .edit-wrap {
@@ -595,6 +626,23 @@
     #jump { bottom: 118px; }
     #cpuChip .lbl { display: none; } /* the icon alone in a crowded header */
     #cpuChip { padding: 6px; }
+
+    /* Phone header stacks instead of squeezing. One row of six controls left
+       the model name truncated to a few characters - the one label that
+       actually tells you what you are talking to. So: status row, then the
+       model full width, then the actions full width. */
+    header { flex-wrap: wrap; row-gap: 8px; padding: 8px 12px; }
+    header .spacer { display: none; }        /* wrapping does the pushing now */
+    #menuBtn, #warmPill, #cpuChip { order: 1; }
+    #warmPill { max-width: none; flex: 1; }  /* takes the slack on row 1 */
+    .model-wrap { order: 2; flex: 1 1 100%; }
+    #modelBtn { width: 100%; justify-content: space-between; }
+    /* the dropdown is anchored to a now-full-width button, so let it match
+       rather than keep a 300px min that would overflow a narrow screen */
+    #modelMenu { min-width: 0; width: 100%; }
+    .header-actions { order: 3; flex: 1 1 100%; }
+    /* even thirds: bigger tap targets than the 36px icons they were */
+    .header-actions .icon-btn { flex: 1; justify-content: center; }
     /* tighten the CPU-mode dialog so its call to action clears the fold on a
        phone: a button below the crease is a button nobody presses */
     #gpuOverlay { padding: 10px; }
@@ -683,6 +731,7 @@
       <span class="lbl">CPU mode</span>
     </button>
     <span class="spacer"></span>
+    <div class="header-actions">
     <button class="icon-btn" id="attBtn" aria-label="Enclave attestation" title="Enclave attestation">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
     </button>
@@ -693,6 +742,7 @@
       <svg id="iconSun" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.4"/><path d="M12 2.5v2.4M12 19.1v2.4M4.3 4.3L6 6M18 18l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.3 19.7L6 18M18 6l1.7-1.7"/></svg>
       <svg id="iconMoon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
     </button>
+    </div>
   </header>
 
   <div id="scroller">
@@ -993,7 +1043,7 @@ function assistantHtml(src, streaming) {
 
 // ------------------------------------------------------------------ state --
 const state = {
-  chats: [],        // {id, title, messages:[{role,content,meta?}], streaming:null|{reply,status}, error:null|{text,message,partial}}
+  chats: [],        // {id, title, messages:[{role,content,meta?,sources?,image?}], streaming:null|{reply,status,sources?,image?}, error:null|{text,message,partial}}
   currentId: null,
   busyChatId: null, // one generation at a time, tab-wide
   abort: null,
@@ -1005,6 +1055,15 @@ const state = {
   target: "auto",
   think: true,      // thinking models only: off sends enable_thinking=false
   gpu: null,        // does this deployment hold a GPU share? true | false (CPU mode) | null (unknown)
+  // OFF by default, and that is a product decision, not an oversight. People
+  // choose an enclave because the conversation does not leave it; a default
+  // that quietly sends questions to a search provider would take that away
+  // from exactly the users who came here for it. Reaching outside is opt-in.
+  // Once on, "auto" lets the MODEL decide per turn (the way other chat apps
+  // work) and "always" searches every message.
+  webMode: "off",   // off | auto | always (persisted)
+  search: { enabled: false }, // what /models reported about this deployment's provider
+  image: { enabled: false },  // ...and whether an image service is configured
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
 const chatId = () => "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -1304,6 +1363,78 @@ function copyText(text, btn) {
   }
 }
 
+// The numbered citation list under a searched reply.
+//
+// Every string here came off a web page, so it is built with textContent and
+// explicit DOM nodes - never innerHTML. The href is also scheme-checked:
+// a result title is untrusted, and a `javascript:` URL rendered as a link
+// would turn a search result into script execution in the user's session.
+function sourcesBlock(sources) {
+  if (!sources || !sources.length) return null;
+  const wrap = node('<div class="sources"><div class="sources-h">Sources</div><ol></ol></div>');
+  const ol = wrap.querySelector("ol");
+  for (const s of sources) {
+    const li = document.createElement("li");
+    let safe = null;
+    try {
+      const u = new URL(s.url);
+      if (u.protocol === "http:" || u.protocol === "https:") safe = u;
+    } catch (_) {}
+    if (safe) {
+      const a = document.createElement("a");
+      a.href = safe.href;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer nofollow";
+      a.textContent = s.title || safe.href;
+      li.appendChild(a);
+      const host = document.createElement("span");
+      host.className = "host";
+      host.textContent = safe.hostname.replace(/^www\./, "");
+      li.appendChild(host);
+    } else {
+      li.textContent = s.title || "(unusable link)";
+    }
+    ol.appendChild(li);
+  }
+  return wrap;
+}
+
+// A generated image. The bytes arrive inline as a data: URI, so nothing here
+// reaches out to another origin and a stored chat still renders offline.
+function imageBlock(img) {
+  if (!img || !img.data_uri) return null;
+  // only ever a PNG data URI from our own server; anything else is not rendered
+  if (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(img.data_uri)) return null;
+  const fig = document.createElement("figure");
+  fig.className = "genimg";
+  const el = document.createElement("img");
+  el.src = img.data_uri;
+  el.alt = img.prompt || "generated image";
+  el.loading = "lazy";
+  fig.appendChild(el);
+  const cap = document.createElement("figcaption");
+  cap.textContent = img.prompt || "";
+  const bits = [];
+  if (img.model) bits.push(img.model);
+  if (img.seed !== null && img.seed !== undefined) bits.push("seed " + img.seed);
+  if (img.ms) bits.push((img.ms / 1000).toFixed(1) + "s");
+  if (bits.length) {
+    const sub = document.createElement("div");
+    sub.textContent = bits.join(" · ");
+    cap.appendChild(sub);
+  }
+  const dl = document.createElement("a");
+  dl.className = "dl";
+  dl.href = img.data_uri;
+  dl.download = "image.png";
+  dl.textContent = "Download";
+  const wrap = document.createElement("div");
+  wrap.appendChild(dl);
+  cap.appendChild(wrap);
+  fig.appendChild(cap);
+  return fig;
+}
+
 function metaLine(meta) {
   if (!meta) return null;
   const span = node('<span class="meta"></span>');
@@ -1333,7 +1464,13 @@ function renderMessage(m, idx, isTail) {
   }
   const row = node('<div class="row assistant"><div class="md"></div><div class="actions"></div></div>');
   if (isTail) row.classList.add("tail");
-  row.querySelector(".md").innerHTML = assistantHtml(m.content, false);
+  const md = row.querySelector(".md");
+  md.innerHTML = assistantHtml(m.content, false);
+  // the picture goes ABOVE the sentence that refers to it
+  const fig = imageBlock(m.image);
+  if (fig) md.insertBefore(fig, md.firstChild);
+  const src = sourcesBlock(m.sources);
+  if (src) md.appendChild(src);
   const acts = row.querySelector(".actions");
   acts.appendChild(node('<button class="act" data-copy-msg="' + idx + '" aria-label="Copy" title="Copy">' + ICONS.copy + "</button>"));
   if (isTail && !state.busyChatId)
@@ -1391,6 +1528,14 @@ function updateStreamDOM(chat) {
   } else {
     body.innerHTML = "";
   }
+  // a generated image is already final while the reply is still streaming -
+  // show it immediately rather than making the user wait for the sentence
+  const fig = imageBlock(s.image);
+  if (fig) body.insertBefore(fig, body.firstChild);
+  // sources stay pinned under the reply for the whole stream, so the user can
+  // start opening them while the model is still writing
+  const src = sourcesBlock(s.sources);
+  if (src) body.appendChild(src);
   // each rebuild recreates the shimmer span, which restarts its animation at
   // token rate and reads as flicker - pin the phase to the clock so the sweep
   // stays continuous across rebuilds (2000 = the shim keyframe duration)
@@ -1609,7 +1754,7 @@ async function run(chat) {
   renderSidebar(); renderChat(); updateComposer();
 
   const asked = chat.messages[chat.messages.length - 1].content;
-  let reply = "", meta = null, sawDone = false;
+  let reply = "", meta = null, sawDone = false, sources = null, genImage = null;
 
   // An instance that dies mid-generation leaves the proxied stream OPEN but
   // silent until an upstream idle timeout minutes later - without a watchdog
@@ -1644,6 +1789,9 @@ async function run(chat) {
       body: JSON.stringify({
         messages: payload, target: state.target, model: state.model || undefined,
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
+        // "auto" = the server asks the model whether this turn needs the web
+        web_search: state.webMode === "off" ? undefined
+                  : state.webMode === "always" ? true : "auto",
       }),
       signal: ctl.signal,
     });
@@ -1681,6 +1829,19 @@ async function run(chat) {
             chat.streaming.reply = "";
             chat.streaming.status = null;
             if (chat.id === state.currentId) renderChat();
+          } else if (d.image) {
+            genImage = d.image;
+            chat.streaming.image = genImage;
+            chat.streaming.status = "Image ready; writing…";
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.search) {
+            // sources arrive before the first token: show them straight away
+            // so the user can see WHAT was read while the model reads it
+            sources = d.search.sources || [];
+            chat.streaming.sources = sources;
+            chat.streaming.status = "Read " + sources.length + " source"
+              + (sources.length === 1 ? "" : "s") + " from the web…";
+            if (chat.id === state.currentId) renderChat();
           } else if (d.done) {
             meta = d;
             sawDone = true;
@@ -1694,7 +1855,7 @@ async function run(chat) {
     // instance died or restarted) - surface it instead of recording a
     // truncated reply as if it were complete
     if (!sawDone) throw new Error("The stream ended before the response finished. The instance likely restarted. Try again.");
-    chat.messages.push({ role: "assistant", content: reply, meta });
+    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage });
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
     if (err && err.userStop) {
@@ -1903,6 +2064,43 @@ function renderModelMenu() {
     }
     modelMenu.appendChild(tseg);
   }
+  // Web search, only when the deployment configured a provider. Deliberately
+  // NOT sticky-on: with it on, the question leaves the enclave to a search
+  // provider, so it is a choice the user makes per session rather than a
+  // default they inherit.
+  if ((state.search && state.search.enabled) || (state.image && state.image.enabled)) {
+    // one switch, because one router decides both: the label follows whatever
+    // this deployment actually configured
+    const hasS = state.search && state.search.enabled;
+    const hasI = state.image && state.image.enabled;
+    const label = hasS && hasI ? "Search &amp; images" : hasI ? "Images" : "Web search";
+    const what = hasS && hasI ? "search the web or generate an image"
+               : hasI ? "generate an image" : "search the web";
+    const wseg = node('<div class="seg-row"><span>' + label + '</span><div class="seg"></div></div>');
+    const TITLES = {
+      auto: "the model decides per message whether to " + what,
+      always: hasS
+        ? "search on every message - a research mode, and a provider round trip per turn"
+        : "treat every message as an image request",
+      off: "never " + what + "; answer from the model alone, nothing leaves the enclave",
+    };
+    // "off" first: it is the default and the privacy-preserving end of the
+    // scale, so the switch reads left-to-right as increasing exposure
+    for (const t of ["off", "auto", "always"]) {
+      const b = node("<button type='button'></button>");
+      b.textContent = t;
+      if (state.webMode === t) b.classList.add("on");
+      b.title = TITLES[t];
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.webMode = t;
+        pref("llmchat-web", t);
+        wseg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      });
+      wseg.querySelector(".seg").appendChild(b);
+    }
+    modelMenu.appendChild(wseg);
+  }
 }
 
 // Model discovery: the deployment lists its servable models largest-first
@@ -1911,16 +2109,18 @@ function renderModelMenu() {
 // wins (when this deployment still serves it). The compute target restores
 // the same way.
 const modelsReady = (async () => {
-  let storedModel = null, storedTarget = null, storedThink = null;
+  let storedModel = null, storedTarget = null, storedThink = null, storedWeb = null;
   try {
     if (storeOK) {
       storedModel = localStorage.getItem("llmchat-model");
       storedTarget = localStorage.getItem("llmchat-target");
       storedThink = localStorage.getItem("llmchat-think");
+      storedWeb = localStorage.getItem("llmchat-web");
     }
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
   if (storedThink === "off") state.think = false;
+  if (["auto", "always", "off"].includes(storedWeb)) state.webMode = storedWeb;
   let models = [], info = {};
   try {
     const res = await fetch("models");
@@ -1933,6 +2133,10 @@ const modelsReady = (async () => {
   // STORED preference alone, the way an unfit model pick is left alone: it
   // should come back the moment GPU capacity does.
   state.gpu = info.gpu === true ? true : info.gpu === false ? false : null;
+  state.search = info.search || { enabled: false };
+  state.image = info.image || { enabled: false };
+  // no provider AND no image service: the switch governs nothing
+  if (!state.search.enabled && !state.image.enabled) state.webMode = "off";
   if (state.gpu === false) {
     if (state.target === "gpu") state.target = "auto";
     cpuChip.classList.add("show");

@@ -36,6 +36,11 @@
 //!                               (the playground disables the rest in its
 //!                               menu). GPU-only unless ?target= says
 //!                               otherwise.
+//!   GET  /search              - WEB SEARCH probe (503 unless the config has a
+//!                               `search` block). ?q=<query> runs the provider
+//!                               leg; ?url=<page> runs only the fetch+extract
+//!                               leg. Two separate probes because "no results"
+//!                               and "no egress" look identical from outside.
 //!   GET  /v1/models           - OpenAI-compatible model list.
 //!   POST /v1/chat/completions - OpenAI-compatible completions, stream and
 //!                               non-stream. Point any OpenAI SDK at the
@@ -53,7 +58,23 @@
 //!                               tokens a reply may spend in the block and
 //!                               closes it if the model will not (see
 //!                               ThinkGuard).
+//!                               `web_search`: `"auto"` lets the MODEL decide
+//!                               per turn what the question needs - a web
+//!                               search, an IMAGE, or neither (one short
+//!                               router generation, see route_web_search).
+//!                               `true` searches every turn, absent never
+//!                               does. `/search ` forces a search and
+//!                               `/image ` forces a picture, regardless.
+//!                               Sources come back on `enclave.search`, or as
+//!                               an SSE comment `: enclave-search {...}`
+//!                               streaming. Image generation needs the
+//!                               config's `image` block (see image.rs) and is
+//!                               delivered to /chat as an `{"image":{...}}`
+//!                               event carrying a data: URI.
 //!   POST /chat                - legacy SSE endpoint used by the playground.
+//!                               Same `web_search` switch; sources arrive as a
+//!                               `{"search":{...}}` event before the first
+//!                               token.
 //!
 //! Generation: autoregressive decode with the model's KV cache. The trick
 //! that makes this cheap through wasi-nn: `compute()` returns OWNED tensor
@@ -65,7 +86,10 @@
 mod bindings;
 
 mod config;
+mod http;
+mod image;
 mod sampling;
+mod search;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1061,6 +1085,9 @@ struct GenParams {
     /// is forced shut (0 = uncapped). Already resolved against the turn: it
     /// is nonzero only when the prompt actually force-opened a block.
     think_budget: usize,
+    /// identical consecutive token blocks that end a degenerate reply
+    /// (0 = off). Unlike think_budget this applies to the whole reply.
+    loop_reps: usize,
 }
 
 struct GenStats {
@@ -1185,6 +1212,73 @@ const THINK_CLOSE_TEXT: &str = "\n</think>\n\n";
 /// one), so the in-block count IS out.generated.len(). A model that opens a
 /// block by itself mid-reply is not tracked; nothing in the qwen3.x family
 /// does that, because the template already wrote the opening tag.
+/// Stops a reply that has collapsed into a loop.
+///
+/// This exists because ThinkGuard does NOT cover the case: it only arms on a
+/// turn whose prompt force-opened a `<think>` block, so a model that reasons
+/// in ordinary prose - "Thinking Process:" as literal text, which is exactly
+/// what fable-fusion does with thinking off - has no guard at all. Observed
+/// live 2026-07-29 on "write a haiku about secure enclaves": the reply
+/// repeated one seven-token phrase until it hit max_new_cap, 80k tokens of
+/// the same line.
+///
+/// Sampling settings reduce the odds (top_k especially) but cannot promise
+/// anything: a degenerate loop is always reachable, so the decoder needs a
+/// hard stop and not just better odds.
+///
+/// Detection is exact-block, not fuzzy: the tail must be one identical run of
+/// tokens repeated N times. That will not catch a drifting near-repeat, but
+/// it also cannot fire on prose that merely rhymes or a list with a shared
+/// prefix - and a false stop truncates someone's real answer, which is worse
+/// than a loop that runs a little longer before tripping.
+struct LoopGuard {
+    /// identical consecutive blocks that end the reply; 0 = off
+    reps: usize,
+    /// longest repeating unit considered, in tokens
+    max_period: usize,
+}
+
+impl LoopGuard {
+    fn new(reps: usize) -> LoopGuard {
+        LoopGuard { reps, max_period: 64 }
+    }
+
+    /// Short blocks need more evidence: a couple of repeated newlines or a
+    /// run of dashes in a table is ordinary text, while the same twelve
+    /// tokens four times over is not.
+    fn required(&self, period: usize) -> usize {
+        match period {
+            1 => self.reps * 6,
+            2..=4 => self.reps * 3,
+            _ => self.reps,
+        }
+    }
+
+    fn tripped(&self, g: &[u32]) -> bool {
+        if self.reps == 0 {
+            return false;
+        }
+        for period in 1..=self.max_period {
+            let need = self.required(period);
+            let span = period * need;
+            // NOT `break`: required() demands extra repeats of short blocks,
+            // so span does not grow monotonically with period (period 3 wants
+            // 36 tokens, period 7 only 28). Bailing at the first period that
+            // does not fit skipped every longer one - which is to say, the
+            // whole class of failure this guard exists for.
+            if g.len() < span {
+                continue;
+            }
+            let tail = &g[g.len() - span..];
+            let first = &tail[..period];
+            if tail.chunks(period).all(|c| c == first) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 struct ThinkGuard {
     budget: usize, // 0 = off, and then nothing below ever runs
     open: bool,
@@ -1353,6 +1447,7 @@ fn generate(
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
     let mut think = ThinkGuard::new(p.think_budget, tok);
+    let loop_guard = LoopGuard::new(p.loop_reps);
     let mut finish: &'static str = "stop";
     loop {
         let recent = out.recent(prompt_ids, p.sample.rep_window);
@@ -1376,6 +1471,13 @@ fn generate(
                 });
             }
             Pushed::Gone => break, // client disconnected
+        }
+        // a reply that has collapsed into a loop is finished, whatever it
+        // thinks it is doing - checked here so it covers plain prose, which
+        // the think budget below never sees
+        if loop_guard.tripped(&out.generated) {
+            finish = "repetition";
+            break;
         }
         // budget spent: close the block in the same pass that feeds `next`,
         // so the model's next sample is already outside it
@@ -1461,6 +1563,7 @@ fn generate_spec(
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
     let mut think = ThinkGuard::new(p.think_budget, tok);
+    let loop_guard = LoopGuard::new(p.loop_reps);
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     // fed-token cursors, so rewinds land on absolute positions
@@ -1486,6 +1589,13 @@ fn generate_spec(
                 });
             }
             Pushed::Gone => break 'outer,
+        }
+        // -- degenerate loop: stop. Speculative decode makes this MORE likely
+        //    to run long, not less - a looping target accepts its own drafts
+        //    almost perfectly, so the repetition arrives faster.
+        if loop_guard.tripped(&out.generated) {
+            finish = "repetition";
+            break 'outer;
         }
         // -- budget spent: force the block shut on the REAL target sequence
         //    (one plain pass, no speculation to unwind) and resample from the
@@ -1649,6 +1759,7 @@ fn generate_mtp(
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
     let mut think = ThinkGuard::new(p.think_budget, tok);
+    let loop_guard = LoopGuard::new(p.loop_reps);
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut t_fed = prompt_ids.len();
@@ -1670,6 +1781,13 @@ fn generate_mtp(
                 });
             }
             Pushed::Gone => break 'outer,
+        }
+        // -- degenerate loop: stop (see the plain loop; the MTP head predicts
+        //    a repeating tail near-perfectly, so this path reaches the cap
+        //    fastest of the three)
+        if loop_guard.tripped(&out.generated) {
+            finish = "repetition";
+            break 'outer;
         }
         // -- budget spent: force the block shut. The close rides exactly the
         //    path a fully-accepted round takes - verified on the branch with
@@ -1769,7 +1887,7 @@ fn generate_mtp(
 
 // -------------------------------------------------------------------- http --
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ChatMsg {
     role: String,
     content: String,
@@ -1802,6 +1920,21 @@ struct ChatReq {
     enable_thinking: Option<bool>, // extension: false turns off <think> reasoning (thinking models only)
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>, // vLLM/SGLang spelling of the same switch
+    /// extension (needs config.search): `true` searches every turn, `"auto"`
+    /// asks the MODEL whether this turn needs the web, absent/false never
+    /// searches. Accepts both shapes so an existing `true` client keeps its
+    /// meaning.
+    #[serde(default)]
+    web_search: Option<serde_json::Value>,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum WebMode {
+    Off,
+    /// the model decides, per turn
+    Auto,
+    /// search unconditionally
+    Always,
 }
 
 #[derive(Deserialize, Default)]
@@ -1818,6 +1951,403 @@ impl ChatReq {
         self.enable_thinking
             .or(self.chat_template_kwargs.as_ref().and_then(|k| k.enable_thinking))
             .unwrap_or(true)
+    }
+
+    fn web_mode(&self) -> WebMode {
+        match &self.web_search {
+            Some(v) if v.as_bool() == Some(true) => WebMode::Always,
+            Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("auto")) => WebMode::Auto,
+            _ => WebMode::Off,
+        }
+    }
+}
+
+/// The router pass: ask the model whether answering the last turn needs the
+/// web, and if so for what query.
+///
+/// This is what makes search behave the way people expect from a chat app -
+/// "what changed in Rust 1.90" searches, "rewrite that shorter" does not -
+/// without the user having to operate a switch. It is a SEPARATE, tiny
+/// generation rather than tool-calling in the main pass, for two reasons:
+/// this app renders chatml by hand and has no tools template to hang a
+/// tool_call off, and a decision made before the answer starts means the
+/// results are in the prompt the answer is actually generated from, instead
+/// of being stitched in after the model has already committed to an opening.
+///
+/// Deliberately cheap: thinking OFF, greedy, a few dozen tokens, no drafting.
+/// Every failure - a bad decode, a model that ignores the format, a session
+/// that will not open - returns None and the turn proceeds WITHOUT search.
+/// Routing is an optimisation; it must never be the reason an answer fails.
+fn route_web_search(
+    cfg: &AppConfig,
+    tok: &Tokenizer,
+    messages: &[ChatMsg],
+    mode: &str,
+    want_image: bool,
+) -> Option<RouterVerdict> {
+    // The instructions are assembled from the capabilities this deployment
+    // ACTUALLY has: offering the model a tool that is not configured is how
+    // you get an IMAGE verdict on a deployment with no image service, and a
+    // turn that does nothing while the user waits.
+    let image_rule = if want_image {
+        "\nGenerate an image when the user asks to see, draw, paint, render, \
+design or illustrate something, or asks for a picture, photo, logo, icon or \
+artwork. Do NOT generate one when they are asking ABOUT an image or about art \
+in general, or asking to edit an image you cannot see.\n"
+    } else {
+        ""
+    };
+    let image_option = if want_image {
+        "IMAGE: <a vivid, self-contained description of the picture to make>\nor\n"
+    } else {
+        ""
+    };
+    let router_system = format!(
+        "You decide what is needed to handle the user's last message.
+
+Search the web when the answer depends on information that changes or that a \
+language model would not reliably know: current events, news, prices, weather, \
+sports results, release versions, live status, anything dated after your \
+training, or an obscure named entity, product or person.
+
+Do NOT search for: chit-chat, greetings and thanks, translation, summarising \
+or rewriting text already in the conversation, arithmetic, code the model can \
+simply write, definitions of well-established concepts, opinions, or \
+follow-ups answerable from what was already said.
+{image_rule}
+Reply with EXACTLY ONE line and nothing else:
+SEARCH: <the query to run>
+or
+{image_option}NO"
+    );
+    let router_system = router_system.as_str();
+
+    // Only the tail of the conversation matters for this decision, and a long
+    // history would dominate the router's own budget.
+    let mut router_msgs: Vec<ChatMsg> = vec![ChatMsg {
+        role: "system".into(),
+        content: router_system.into(),
+    }];
+    let tail: Vec<&ChatMsg> = messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .rev()
+        .take(4)
+        .collect();
+    for m in tail.into_iter().rev() {
+        router_msgs.push(ChatMsg {
+            role: m.role.clone(),
+            content: truncate_for_msg_n(&m.content, 1500),
+        });
+    }
+
+    // thinking off: this is a classifier, not a reasoning task
+    let (ids, stops, _) = build_prompt(cfg, tok, &router_msgs, false).ok()?;
+    let params = GenParams {
+        max_new: 48,
+        sample: SampleParams {
+            temperature: 0.0, // greedy: the same question routes the same way
+            top_p: 1.0,
+            top_k: 0,
+            rep_penalty: 1.0,
+            rep_window: 0,
+        },
+        stop_strings: {
+            let mut s = stops;
+            s.push("\n".into()); // one line, then stop
+            s
+        },
+        think_budget: 0,
+        // the router emits one short line; a loop there is still a loop
+        loop_reps: 4,
+    };
+    let (target, tname) = *targets_for(cfg, mode).first()?;
+    let noop_emit = |_: &str| true;
+    let noop_status = |_: &str| true;
+    let stats = generate(
+        cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+    )
+    .ok()?;
+    parse_router_verdict(&stats.text, want_image)
+}
+
+/// What the router decided.
+#[derive(PartialEq, Debug)]
+enum RouterVerdict {
+    Search(String),
+    Image(String),
+}
+
+/// Pull the verdict out of the router's reply. Tolerant of the usual model
+/// noise (a stray think block, markdown bold, quotes, a leading bullet)
+/// because the cost of a false NO is silently skipping work the user wanted,
+/// and the cost of a false positive is one wasted call.
+///
+/// `allow_image` gates the IMAGE verdict rather than trusting the prompt: a
+/// model that hallucinates a capability the deployment never configured
+/// should be ignored, not obeyed.
+fn parse_router_verdict(text: &str, allow_image: bool) -> Option<RouterVerdict> {
+    let cleaned = strip_think(text);
+    for line in cleaned.lines() {
+        let l = line.trim().trim_start_matches(['-', '*', '#', '>', ' ']).trim();
+        let l = l.trim_start_matches("**").trim();
+        let (rest, is_image) = match find_verdict_prefix(l) {
+            Some(v) => v,
+            None => continue,
+        };
+        if is_image && !allow_image {
+            continue;
+        }
+        // markers and whitespace interleave (`**SEARCH:** "q"`), so one pass
+        // of each leaves the other's leftovers behind - alternate to a fixed
+        // point instead
+        let mut q = rest;
+        loop {
+            let next = q.trim().trim_matches(['"', '\'', '`', '*']);
+            if next == q {
+                break;
+            }
+            q = next;
+        }
+        if !q.is_empty() {
+            // an image prompt carries detail and deserves more room than a
+            // search query, which engines truncate anyway
+            let q = truncate_for_msg_n(q, if is_image { 1000 } else { 300 });
+            return Some(if is_image {
+                RouterVerdict::Image(q)
+            } else {
+                RouterVerdict::Search(q)
+            });
+        }
+    }
+    None
+}
+
+/// `(payload, is_image)` for a verdict line, case-insensitively.
+fn find_verdict_prefix(line: &str) -> Option<(&str, bool)> {
+    for (tag, is_image) in [("SEARCH:", false), ("IMAGE:", true)] {
+        if line.len() >= tag.len() && line[..tag.len()].eq_ignore_ascii_case(tag) {
+            return Some((&line[tag.len()..], is_image));
+        }
+    }
+    None
+}
+
+fn truncate_for_msg_n(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// What a completed search leg reports back to the client.
+struct SearchMeta {
+    provider: String,
+    /// (title, url) per hit, in the order the model was shown them, so the
+    /// UI can render a citation list that matches the [n] markers
+    sources: Vec<(String, String)>,
+    ms: u64,
+}
+
+/// Run the web-search leg, if this request asked for one and the deployment
+/// configured a provider, and fold the results into the LAST user turn.
+///
+/// The results go in the user turn rather than the system prompt on purpose.
+/// Retrieved text is data about one question, not standing instruction: it
+/// belongs next to the question it was fetched for, and putting it there also
+/// means build_prompt's overflow trimming (which drops the OLDEST turns) can
+/// never evict the results while keeping the question they belong to.
+///
+/// The query is the user's message verbatim. A model-written query would read
+/// better, but it costs a whole extra generate() round trip in front of every
+/// searched turn, and search engines are already built for the messy phrasing
+/// people type. Worth revisiting if hit quality disappoints.
+fn apply_web_search(
+    cfg: &AppConfig,
+    creq: &ChatReq,
+    messages: &mut Vec<ChatMsg>,
+    tok: &Tokenizer,
+    target_mode: &str,
+    image_out: &mut Option<image::GeneratedImage>,
+    on_status: &dyn Fn(&str),
+) -> Result<Option<SearchMeta>, String> {
+    let web_mode = creq.web_mode();
+    let Some(last) = messages.iter().rposition(|m| m.role == "user") else {
+        if web_mode == WebMode::Always {
+            return Err("no user message to search for".into());
+        }
+        return Ok(None);
+    };
+    // A `/search ` or `/image ` prefix is a per-turn request, independent of
+    // any client-side switch: it travels with the ONE message that wanted it,
+    // so it cannot leak into the next turn the way a sticky toggle does, and
+    // it works for API clients that have no UI to toggle.
+    let stripped = strip_search_prefix(&messages[last].content);
+    let asked_inline = stripped.is_some();
+    let inline_image = strip_image_prefix(&messages[last].content);
+    let has_image = cfg.image.is_some();
+
+    // an explicit /image bypasses the router entirely
+    if let Some(prompt) = inline_image {
+        messages[last].content = prompt.clone();
+        if !has_image {
+            return Ok(None); // no service: answer normally rather than fail
+        }
+        on_status("generating the image…");
+        return run_image(cfg, &prompt, messages, last, image_out).map(|()| None);
+    }
+
+    if !asked_inline && web_mode == WebMode::Off {
+        return Ok(None);
+    }
+    if let Some(rest) = stripped {
+        // the model must never see the command word - it is UI, not content
+        messages[last].content = rest;
+    }
+    // Auto asks the model what this turn needs, ONCE, for both capabilities:
+    // two routers would be two generations of latency to answer one question.
+    if web_mode == WebMode::Auto && !asked_inline {
+        on_status("deciding what this needs…");
+        match route_web_search(cfg, tok, messages, target_mode, has_image) {
+            Some(RouterVerdict::Image(prompt)) => {
+                on_status("generating the image…");
+                return run_image(cfg, &prompt, messages, last, image_out).map(|()| None);
+            }
+            Some(RouterVerdict::Search(q)) => {
+                if cfg.search.is_none() {
+                    return Ok(None);
+                }
+                on_status("searching the web…");
+                return finish_search(cfg, messages, last, q, web_mode, asked_inline);
+            }
+            None => return Ok(None),
+        }
+    }
+    let Some(_) = &cfg.search else {
+        // no provider configured: an inline /search should not eat the turn.
+        // Only an explicit web_search:true, which asked for something we
+        // cannot do, is an error.
+        if web_mode != WebMode::Always {
+            return Ok(None);
+        }
+        return Err("web search is not enabled on this deployment".into());
+    };
+    let query = messages[last].content.trim().to_string();
+    on_status("searching the web…");
+    finish_search(cfg, messages, last, query, web_mode, asked_inline)
+}
+
+/// Generate an image and fold a note about it into the user's turn, so the
+/// model writes a reply that acknowledges the picture it cannot see.
+///
+/// A failure here is returned to the caller only when the user ASKED for an
+/// image; the auto path treats it the way it treats a dead search provider.
+fn run_image(
+    cfg: &AppConfig,
+    prompt: &str,
+    messages: &mut [ChatMsg],
+    last: usize,
+    image_out: &mut Option<image::GeneratedImage>,
+) -> Result<(), String> {
+    let icfg = cfg.image.as_ref().ok_or("image generation is not enabled on this deployment")?;
+    let img = image::generate(icfg, prompt, || now_ms() as u64)?;
+    // The model never sees the bytes - it is a text model. It is told the
+    // image exists and what was asked for, which is enough to write "here is
+    // the fox you asked for" instead of describing a picture it invented.
+    messages[last].content = format!(
+        "{}\n\n[An image has ALREADY been generated for this request and is \
+         displayed to the user directly above your reply. It was generated from \
+         the prompt: \"{}\". Do not describe the image in detail - you cannot \
+         see it. Acknowledge it briefly and naturally, and offer to adjust it.]",
+        messages[last].content.trim(),
+        img.prompt
+    );
+    *image_out = Some(img);
+    Ok(())
+}
+
+fn finish_search(
+    cfg: &AppConfig,
+    messages: &mut [ChatMsg],
+    last: usize,
+    query: String,
+    web_mode: WebMode,
+    asked_inline: bool,
+) -> Result<Option<SearchMeta>, String> {
+    let scfg = cfg.search.as_ref().ok_or("web search is not enabled on this deployment")?;
+    let t0 = now_ms();
+    let hits = match search::search(scfg, &query) {
+        Ok(h) => h,
+        // in auto mode the user never asked for a search, so a provider that
+        // is down must not take the answer down with it - drop to the model's
+        // own knowledge, which is what it would have done anyway
+        Err(e) if web_mode == WebMode::Auto && !asked_inline => {
+            eprintln!("[llm-chat] auto web search failed, answering without it: {e}");
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if hits.is_empty() {
+        if web_mode == WebMode::Auto && !asked_inline {
+            return Ok(None);
+        }
+        return Err(format!("no web results for '{}'", truncate_for_msg(&query)));
+    }
+    let sources = hits.iter().map(|h| (h.title.clone(), h.url.clone())).collect();
+    // The question put back to the model is the USER'S, not the router's
+    // search query - those differ in auto mode, and answering the query
+    // instead of the question is how you get a reply about the wrong thing.
+    let question = messages[last].content.trim().to_string();
+    messages[last].content = format!(
+        "{}\nQuestion: {question}",
+        search::render_context(&query, &hits)
+    );
+    Ok(Some(SearchMeta {
+        provider: scfg.provider.clone(),
+        sources,
+        ms: now_ms().saturating_sub(t0) as u64,
+    }))
+}
+
+/// `/search <query>` or `/web <query>` at the head of a message: returns the
+/// message with the command removed. Case-insensitive, and the command must
+/// be followed by whitespace and something to search for, so a message that
+/// merely BEGINS with the word (or asks about "/search" itself) is untouched.
+fn strip_image_prefix(content: &str) -> Option<String> {
+    strip_cmd_prefix(content, &["/image", "/img", "/draw"])
+}
+
+fn strip_search_prefix(content: &str) -> Option<String> {
+    strip_cmd_prefix(content, &["/search", "/web"])
+}
+
+fn strip_cmd_prefix(content: &str, cmds: &[&str]) -> Option<String> {
+    let t = content.trim_start();
+    for cmd in cmds {
+        if t.len() > cmd.len() && t[..cmd.len()].eq_ignore_ascii_case(cmd) {
+            let rest = &t[cmd.len()..];
+            if rest.starts_with(char::is_whitespace) && !rest.trim().is_empty() {
+                return Some(rest.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn search_meta_json(m: &SearchMeta) -> serde_json::Value {
+    serde_json::json!({
+        "provider": m.provider,
+        "ms": m.ms,
+        "sources": m.sources.iter()
+            .map(|(t, u)| serde_json::json!({ "title": t, "url": u }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn truncate_for_msg(s: &str) -> String {
+    match s.char_indices().nth(60) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
     }
 }
 
@@ -1944,6 +2474,7 @@ fn gen_params(
         },
         stop_strings: stops,
         think_budget: if think_open { cfg.think_budget } else { 0 },
+        loop_reps: cfg.repeat_guard,
     }
 }
 
@@ -2072,12 +2603,13 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
-    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
-        Ok(v) => v,
-        Err(e) => return json_err(out, 400, &e),
-    };
-    let params = gen_params(cfg, &creq, stops, think_open);
-
+    // The SSE stream opens BEFORE the search leg, because in auto mode that
+    // leg can run a router generation and then a provider round trip - several
+    // seconds in which a silent "Preparing…" is all the user would see. With
+    // the stream open first, each step narrates itself, which is the whole
+    // difference between "thinking about it" and "apparently hung". The cost
+    // is that failures here are error EVENTS rather than HTTP status codes;
+    // the playground renders both the same way, and /v1 keeps the status codes.
     let headers = Fields::new();
     let _ = headers.set(&"content-type".to_string(), &[b"text/event-stream".to_vec()]);
     let _ = headers.set(&"cache-control".to_string(), &[b"no-cache".to_vec()]);
@@ -2096,6 +2628,59 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     };
 
     let mode = creq.target.as_deref().unwrap_or("auto");
+
+    // --- web search leg, narrated ---
+    let mut messages = creq.messages.clone();
+    let mut generated_image: Option<image::GeneratedImage> = None;
+    let status_cb = |s: &str| {
+        let _ = send(serde_json::json!({ "status": s }));
+    };
+    let search_meta = match apply_web_search(
+        cfg,
+        &creq,
+        &mut messages,
+        &tok,
+        mode,
+        &mut generated_image,
+        &status_cb,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = send(serde_json::json!({ "error": format!("{e}") }));
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
+    };
+    // tell the client what was read so the sources can be shown while the
+    // model is still working through them
+    if let Some(m) = &search_meta {
+        let _ = send(serde_json::json!({ "search": search_meta_json(m) }));
+    }
+    // the image lands BEFORE the reply, so it is on screen while the model
+    // writes its sentence about it
+    if let Some(img) = &generated_image {
+        let _ = send(serde_json::json!({
+            "image": {
+                "data_uri": img.data_uri(),
+                "prompt": img.prompt,
+                "model": img.model,
+                "seed": img.seed,
+                "ms": img.ms,
+            }
+        }));
+    }
+    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send(serde_json::json!({ "error": e }));
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
+    };
+    let params = gen_params(cfg, &creq, stops, think_open);
+
     let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
     if let Some(n) = &draft_note {
         let _ = send(serde_json::json!({ "status": format!("speculative decode off: {n}") }));
@@ -2184,12 +2769,31 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
-    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &creq.messages, creq.thinking()) {
+    // `"web_search": true` is an Enclave extension to the OpenAI body, so API
+    // clients get the same retrieval the built-in UI does. Sources come back
+    // on the response's `enclave.search` field (streaming: an SSE comment
+    // before the first chunk, since the chunk schema has nowhere to put them).
+    let mode = creq.target.as_deref().unwrap_or("auto");
+    let mut messages = creq.messages.clone();
+    let mut generated_image: Option<image::GeneratedImage> = None;
+    let no_status = |_: &str| {};
+    let search_meta = match apply_web_search(
+        cfg,
+        &creq,
+        &mut messages,
+        &tok,
+        mode,
+        &mut generated_image,
+        &no_status,
+    ) {
+        Ok(m) => m,
+        Err(e) => return json_err(out, 502, &e),
+    };
+    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
         Ok(v) => v,
         Err(e) => return json_err(out, 400, &e),
     };
     let params = gen_params(cfg, &creq, stops, think_open);
-    let mode = creq.target.as_deref().unwrap_or("auto");
     let id = completion_id();
     let created = (now_ms() / 1000) as u64;
     let model = cfg.name.clone();
@@ -2221,6 +2825,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 })
             )
         };
+        // Sources first, as an SSE COMMENT: the chunk schema has no field for
+        // them and inventing one would break strict OpenAI clients, while a
+        // comment line is required to be ignored by every conforming parser.
+        if let Some(m) = &search_meta {
+            let _ = send_raw(&format!(": enclave-search {}\n\n", search_meta_json(m)));
+        }
         // role preamble chunk (OpenAI clients expect it)
         let _ = send_raw(&chunk(serde_json::json!({ "role": "assistant" }), None));
 
@@ -2285,7 +2895,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 // so the reply carries a complete one
                 let content =
                     if think_open { format!("<think>\n{}", s.text) } else { s.text.clone() };
-                let body_json = serde_json::json!({
+                let mut body_json = serde_json::json!({
                     "id": id, "object": "chat.completion", "created": created,
                     "model": model,
                     "choices": [{
@@ -2303,6 +2913,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                              "draft_tokens": s.drafted, "draft_accepted": s.accepted,
                              "think_forced": s.think_forced },
                 });
+                if let Some(m) = &search_meta {
+                    body_json["enclave"]["search"] = search_meta_json(m);
+                }
                 respond_bytes(out, 200, "application/json", body_json.to_string().as_bytes());
             }
             None => json_err(out, 500, &last_err),
@@ -2511,7 +3124,127 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
             m
         }).collect::<Vec<_>>(),
     });
+    let mut body = body;
+    // the playground hides its web-search control unless the deployment
+    // configured a provider - an always-visible button that 502s is worse
+    // than no button. Provider name only; the key is never exposed.
+    let base_cfg = config::from_value(raw.clone()).ok();
+    body["search"] = match base_cfg.as_ref().and_then(|c| c.search.clone()) {
+        Some(s) => serde_json::json!({ "enabled": true, "provider": s.provider,
+                                       "fetch_pages": s.fetch_pages }),
+        None => serde_json::json!({ "enabled": false }),
+    };
+    // the endpoint is NOT exposed: it is deployment topology, and the browser
+    // never talks to it - only this app does
+    body["image"] = match base_cfg.as_ref().and_then(|c| c.image.clone()) {
+        Some(i) => serde_json::json!({ "enabled": true, "size": i.size, "model": i.model }),
+        None => serde_json::json!({ "enabled": false }),
+    };
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
+}
+
+/// GET /search?q=... - the egress probe. Runs exactly the path a chat turn
+/// would (same provider, same timeouts, same page fetches) and returns the
+/// hits as JSON, so "does this deployment actually reach the internet" is one
+/// curl and not a chat transcript to squint at.
+///
+/// Behind the SAME api_key gate as /v1, unlike the other playground routes.
+/// `?url=` fetches an arbitrary URL from this deployment's egress identity and
+/// hands back the text: left open, that is a general-purpose relay anyone can
+/// point anywhere and have the enclave's address wear it. A deployment with no
+/// api_key is open by policy (gate it by deploying PRIVATE), but where the
+/// operator did set one, this must not be the hole in it.
+fn handle_search_probe(
+    raw: &serde_json::Value,
+    req: IncomingRequest,
+    query: &str,
+    out: ResponseOutparam,
+) {
+    let cfg = match config::from_value(raw.clone()) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+    };
+    if !authorized(&cfg, &req) {
+        return json_err(out, 401, "missing or invalid API key");
+    }
+    let Some(scfg) = &cfg.search else {
+        return json_err(out, 501, "web search is not enabled on this deployment");
+    };
+    // ?url=<page> fetches and extracts ONE page, skipping the provider. It
+    // separates the two things that can be broken - "can this deployment
+    // reach the web at all" from "is the search provider talking to us" -
+    // which otherwise fail identically from the outside.
+    if let Some(u) = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("url="))
+        .map(percent_decode_query)
+    {
+        return match search::fetch_page(scfg, &u) {
+            Ok(text) => {
+                let body = serde_json::json!({
+                    "url": u,
+                    "chars": text.chars().count(),
+                    "preview": text.chars().take(600).collect::<String>(),
+                });
+                respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
+            }
+            Err(e) => json_err(out, 502, &e),
+        };
+    }
+    let q = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("q="))
+        .map(percent_decode_query)
+        .unwrap_or_default();
+    if q.trim().is_empty() {
+        return json_err(out, 400, "usage: GET /search?q=<query> | GET /search?url=<page>");
+    }
+    let t0 = now_ms();
+    match search::search(scfg, &q) {
+        Ok(hits) => {
+            let body = serde_json::json!({
+                "query": q,
+                "provider": scfg.provider,
+                "ms": now_ms().saturating_sub(t0),
+                "hits": hits.iter().map(|h| serde_json::json!({
+                    "title": h.title, "url": h.url, "snippet": h.snippet,
+                    "body_chars": h.body.as_ref().map(|b| b.chars().count()),
+                })).collect::<Vec<_>>(),
+            });
+            respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
+        }
+        Err(e) => json_err(out, 502, &e),
+    }
+}
+
+/// `+`-and-`%XX` decode for one query-string value.
+fn percent_decode_query(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn handle_models(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
@@ -2568,6 +3301,7 @@ impl Guest for Component {
                 format!("{{\"ok\":true,\"pong\":true,\"t\":{}}}", now_ms()).as_bytes(),
             ),
             (Method::Get, "/models") => handle_model_list(&raw, out),
+            (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
             (Method::Post, "/chat") => handle_chat(&raw, req, out),
             (Method::Post, "/v1/chat/completions") => handle_completions(&raw, req, out),
@@ -2575,10 +3309,156 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /emoji.woff2, GET /ping, GET /models, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
+                "not found; routes: GET /, GET /emoji.woff2, GET /ping, GET /models, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
             ),
         }
     }
 }
 
 bindings::export!(Component with_types_in bindings);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_of(t: &str) -> Option<String> {
+        match parse_router_verdict(t, true) {
+            Some(RouterVerdict::Search(q)) => Some(q),
+            _ => None,
+        }
+    }
+    fn image_of(t: &str) -> Option<String> {
+        match parse_router_verdict(t, true) {
+            Some(RouterVerdict::Image(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn loop_guard_catches_the_haiku_failure() {
+        let g = LoopGuard::new(4);
+        // the observed shape: one phrase repeating forever
+        let phrase: Vec<u32> = vec![9, 1, 2, 3, 4, 5, 6];
+        let mut looping = vec![100, 101, 102]; // some real text first
+        for _ in 0..4 {
+            looping.extend_from_slice(&phrase);
+        }
+        assert!(g.tripped(&looping));
+        // three repeats is not yet enough
+        let mut three = vec![100, 101, 102];
+        for _ in 0..3 {
+            three.extend_from_slice(&phrase);
+        }
+        assert!(!g.tripped(&three));
+    }
+
+    #[test]
+    fn loop_guard_leaves_ordinary_text_alone() {
+        let g = LoopGuard::new(4);
+        // prose: no exact repeating block
+        let prose: Vec<u32> = (0..500).map(|i| (i * 7919 % 4001) as u32).collect();
+        assert!(!g.tripped(&prose));
+        // a short run of one token (a rule, indentation, "...") is normal and
+        // must survive - the guard demands far more evidence for period 1
+        let mut dashes = vec![5u32; 12];
+        dashes.splice(0..0, [1, 2, 3]);
+        assert!(!g.tripped(&dashes));
+        // ...but a token repeated forever is still a loop
+        assert!(g.tripped(&vec![5u32; 200]));
+        // a two-token alternation needs more than four cycles too
+        let short: Vec<u32> = std::iter::repeat([7u32, 8]).take(5).flatten().collect();
+        assert!(!g.tripped(&short));
+        assert!(g.tripped(&std::iter::repeat([7u32, 8]).take(40).flatten().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn loop_guard_off_when_zero() {
+        assert!(!LoopGuard::new(0).tripped(&vec![5u32; 500]));
+    }
+
+    #[test]
+    fn router_verdict_survives_model_noise() {
+        // the clean cases
+        assert_eq!(search_of("SEARCH: rust 1.90 release notes").as_deref(),
+                   Some("rust 1.90 release notes"));
+        assert_eq!(parse_router_verdict("NO", true), None);
+        assert_eq!(parse_router_verdict("NO\n", true), None);
+        // the noise models actually emit
+        assert_eq!(search_of("**SEARCH:** \"btc price\"").as_deref(), Some("btc price"));
+        assert_eq!(search_of("- search: weather in oslo").as_deref(), Some("weather in oslo"));
+        assert_eq!(search_of("<think>\nneeds fresh data\n</think>\nSEARCH: nvidia stock")
+                       .as_deref(), Some("nvidia stock"));
+        assert_eq!(search_of("Sure!\nSEARCH: who won the 2026 world cup").as_deref(),
+                   Some("who won the 2026 world cup"));
+        // degenerate: a SEARCH with no query is not a search
+        assert_eq!(parse_router_verdict("SEARCH:", true), None);
+        assert_eq!(parse_router_verdict("SEARCH:   \"\"  ", true), None);
+        // a refusal that merely mentions the word must not trigger one
+        assert_eq!(parse_router_verdict("I do not need to search for this.", true), None);
+    }
+
+    #[test]
+    fn image_verdict_is_gated_on_the_capability() {
+        assert_eq!(image_of("IMAGE: a watercolour fox in a snowy forest").as_deref(),
+                   Some("a watercolour fox in a snowy forest"));
+        assert_eq!(image_of("**IMAGE:** \"a red bicycle\"").as_deref(), Some("a red bicycle"));
+        // a model that invents the capability on a deployment without an
+        // image service must be ignored, not obeyed
+        assert_eq!(parse_router_verdict("IMAGE: a red bicycle", false), None);
+        // ...but a SEARCH on the same reply still counts
+        assert_eq!(
+            match parse_router_verdict("IMAGE: a fox\nSEARCH: fox facts", false) {
+                Some(RouterVerdict::Search(q)) => q,
+                other => panic!("{other:?}"),
+            },
+            "fox facts"
+        );
+        // image prompts keep more room than search queries
+        let long = "x".repeat(900);
+        assert_eq!(image_of(&format!("IMAGE: {long}")).unwrap().chars().count(), 900);
+    }
+
+    #[test]
+    fn web_mode_accepts_both_shapes() {
+        let mk = |v: serde_json::Value| -> ChatReq {
+            serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}], "web_search": v
+            })).unwrap()
+        };
+        assert!(mk(serde_json::json!(true)).web_mode() == WebMode::Always);
+        assert!(mk(serde_json::json!("auto")).web_mode() == WebMode::Auto);
+        assert!(mk(serde_json::json!("AUTO")).web_mode() == WebMode::Auto);
+        assert!(mk(serde_json::json!(false)).web_mode() == WebMode::Off);
+        assert!(mk(serde_json::json!("nonsense")).web_mode() == WebMode::Off);
+        // absent entirely
+        let bare: ChatReq = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        })).unwrap();
+        assert!(bare.web_mode() == WebMode::Off);
+    }
+
+    #[test]
+    fn search_prefix_is_stripped_only_when_it_is_a_command() {
+        assert_eq!(strip_search_prefix("/search rust wasm").as_deref(), Some("rust wasm"));
+        assert_eq!(strip_search_prefix("  /web  rust wasm ").as_deref(), Some("rust wasm"));
+        assert_eq!(strip_search_prefix("/SEARCH Rust").as_deref(), Some("Rust"));
+        // not commands: no argument, no delimiter, or merely mentioned
+        assert_eq!(strip_search_prefix("/search"), None);
+        assert_eq!(strip_search_prefix("/search   "), None);
+        assert_eq!(strip_search_prefix("/searching for a job"), None);
+        assert_eq!(strip_search_prefix("what does /search do?"), None);
+        assert_eq!(strip_search_prefix("search the web for rust"), None);
+    }
+
+    #[test]
+    fn image_prefix_is_its_own_command() {
+        assert_eq!(strip_image_prefix("/image a red fox").as_deref(), Some("a red fox"));
+        assert_eq!(strip_image_prefix("/img a red fox").as_deref(), Some("a red fox"));
+        assert_eq!(strip_image_prefix("/DRAW a red fox").as_deref(), Some("a red fox"));
+        assert_eq!(strip_image_prefix("/imagine a red fox"), None);
+        assert_eq!(strip_image_prefix("/image"), None);
+        // the two command families do not overlap
+        assert_eq!(strip_search_prefix("/image a red fox"), None);
+        assert_eq!(strip_image_prefix("/search rust"), None);
+    }
+}

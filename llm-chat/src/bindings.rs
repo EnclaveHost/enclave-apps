@@ -6292,6 +6292,614 @@ pub mod wasi {
                 }
             }
         }
+        /// This interface defines a handler of outgoing HTTP Requests. It should be
+        /// imported by components which wish to make HTTP Requests.
+        #[allow(dead_code, async_fn_in_trait, unused_imports, clippy::all)]
+        pub mod outgoing_handler {
+            #[used]
+            #[doc(hidden)]
+            static __FORCE_SECTION_REF: fn() = super::super::super::__link_custom_section_describing_imports;
+            use super::super::super::_rt;
+            pub type OutgoingRequest = super::super::super::wasi::http::types::OutgoingRequest;
+            pub type RequestOptions = super::super::super::wasi::http::types::RequestOptions;
+            pub type FutureIncomingResponse = super::super::super::wasi::http::types::FutureIncomingResponse;
+            pub type ErrorCode = super::super::super::wasi::http::types::ErrorCode;
+            #[allow(unused_unsafe, clippy::all)]
+            /// This function is invoked with an outgoing HTTP Request, and it returns
+            /// a resource `future-incoming-response` which represents an HTTP Response
+            /// which may arrive in the future.
+            ///
+            /// The `options` argument accepts optional parameters for the HTTP
+            /// protocol's transport layer.
+            ///
+            /// This function may return an error if the `outgoing-request` is invalid
+            /// or not allowed to be made. Otherwise, protocol errors are reported
+            /// through the `future-incoming-response`.
+            pub fn handle(
+                request: OutgoingRequest,
+                options: Option<RequestOptions>,
+            ) -> Result<FutureIncomingResponse, ErrorCode> {
+                unsafe {
+                    #[repr(align(8))]
+                    struct RetArea(
+                        [::core::mem::MaybeUninit<
+                            u8,
+                        >; 24 + 4 * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let mut ret_area = RetArea(
+                        [::core::mem::MaybeUninit::uninit(); 24
+                            + 4 * ::core::mem::size_of::<*const u8>()],
+                    );
+                    let (result0_0, result0_1) = match &options {
+                        Some(e) => (1i32, (e).take_handle() as i32),
+                        None => (0i32, 0i32),
+                    };
+                    let ptr1 = ret_area.0.as_mut_ptr().cast::<u8>();
+                    #[cfg(target_arch = "wasm32")]
+                    #[link(wasm_import_module = "wasi:http/outgoing-handler@0.2.6")]
+                    unsafe extern "C" {
+                        #[link_name = "handle"]
+                        fn wit_import2(_: i32, _: i32, _: i32, _: *mut u8);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    unsafe extern "C" fn wit_import2(
+                        _: i32,
+                        _: i32,
+                        _: i32,
+                        _: *mut u8,
+                    ) {
+                        unreachable!()
+                    }
+                    unsafe {
+                        wit_import2(
+                            (&request).take_handle() as i32,
+                            result0_0,
+                            result0_1,
+                            ptr1,
+                        )
+                    };
+                    let l3 = i32::from(*ptr1.add(0).cast::<u8>());
+                    let result68 = match l3 {
+                        0 => {
+                            let e = {
+                                let l4 = *ptr1.add(8).cast::<i32>();
+                                unsafe {
+                                    super::super::super::wasi::http::types::FutureIncomingResponse::from_handle(
+                                        l4 as u32,
+                                    )
+                                }
+                            };
+                            Ok(e)
+                        }
+                        1 => {
+                            let e = {
+                                let l5 = i32::from(*ptr1.add(8).cast::<u8>());
+                                use super::super::super::wasi::http::types::ErrorCode as V67;
+                                let v67 = match l5 {
+                                    0 => V67::DnsTimeout,
+                                    1 => {
+                                        let e67 = {
+                                            let l6 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            let l10 = i32::from(
+                                                *ptr1
+                                                    .add(16 + 3 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<u8>(),
+                                            );
+                                            super::super::super::wasi::http::types::DnsErrorPayload {
+                                                rcode: match l6 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l7 = *ptr1
+                                                                .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<*mut u8>();
+                                                            let l8 = *ptr1
+                                                                .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<usize>();
+                                                            let len9 = l8;
+                                                            let bytes9 = _rt::Vec::from_raw_parts(
+                                                                l7.cast(),
+                                                                len9,
+                                                                len9,
+                                                            );
+                                                            _rt::string_lift(bytes9)
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                                info_code: match l10 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l11 = i32::from(
+                                                                *ptr1
+                                                                    .add(18 + 3 * ::core::mem::size_of::<*const u8>())
+                                                                    .cast::<u16>(),
+                                                            );
+                                                            l11 as u16
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                            }
+                                        };
+                                        V67::DnsError(e67)
+                                    }
+                                    2 => V67::DestinationNotFound,
+                                    3 => V67::DestinationUnavailable,
+                                    4 => V67::DestinationIpProhibited,
+                                    5 => V67::DestinationIpUnroutable,
+                                    6 => V67::ConnectionRefused,
+                                    7 => V67::ConnectionTerminated,
+                                    8 => V67::ConnectionTimeout,
+                                    9 => V67::ConnectionReadTimeout,
+                                    10 => V67::ConnectionWriteTimeout,
+                                    11 => V67::ConnectionLimitReached,
+                                    12 => V67::TlsProtocolError,
+                                    13 => V67::TlsCertificateError,
+                                    14 => {
+                                        let e67 = {
+                                            let l12 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            let l14 = i32::from(
+                                                *ptr1
+                                                    .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<u8>(),
+                                            );
+                                            super::super::super::wasi::http::types::TlsAlertReceivedPayload {
+                                                alert_id: match l12 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l13 = i32::from(*ptr1.add(17).cast::<u8>());
+                                                            l13 as u8
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                                alert_message: match l14 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l15 = *ptr1
+                                                                .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<*mut u8>();
+                                                            let l16 = *ptr1
+                                                                .add(16 + 3 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<usize>();
+                                                            let len17 = l16;
+                                                            let bytes17 = _rt::Vec::from_raw_parts(
+                                                                l15.cast(),
+                                                                len17,
+                                                                len17,
+                                                            );
+                                                            _rt::string_lift(bytes17)
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                            }
+                                        };
+                                        V67::TlsAlertReceived(e67)
+                                    }
+                                    15 => V67::HttpRequestDenied,
+                                    16 => V67::HttpRequestLengthRequired,
+                                    17 => {
+                                        let e67 = {
+                                            let l18 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l18 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l19 = *ptr1.add(24).cast::<i64>();
+                                                        l19 as u64
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpRequestBodySize(e67)
+                                    }
+                                    18 => V67::HttpRequestMethodInvalid,
+                                    19 => V67::HttpRequestUriInvalid,
+                                    20 => V67::HttpRequestUriTooLong,
+                                    21 => {
+                                        let e67 = {
+                                            let l20 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l20 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l21 = *ptr1.add(20).cast::<i32>();
+                                                        l21 as u32
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpRequestHeaderSectionSize(e67)
+                                    }
+                                    22 => {
+                                        let e67 = {
+                                            let l22 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l22 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l23 = i32::from(
+                                                            *ptr1
+                                                                .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<u8>(),
+                                                        );
+                                                        let l27 = i32::from(
+                                                            *ptr1
+                                                                .add(16 + 4 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<u8>(),
+                                                        );
+                                                        super::super::super::wasi::http::types::FieldSizePayload {
+                                                            field_name: match l23 {
+                                                                0 => None,
+                                                                1 => {
+                                                                    let e = {
+                                                                        let l24 = *ptr1
+                                                                            .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                                            .cast::<*mut u8>();
+                                                                        let l25 = *ptr1
+                                                                            .add(16 + 3 * ::core::mem::size_of::<*const u8>())
+                                                                            .cast::<usize>();
+                                                                        let len26 = l25;
+                                                                        let bytes26 = _rt::Vec::from_raw_parts(
+                                                                            l24.cast(),
+                                                                            len26,
+                                                                            len26,
+                                                                        );
+                                                                        _rt::string_lift(bytes26)
+                                                                    };
+                                                                    Some(e)
+                                                                }
+                                                                _ => _rt::invalid_enum_discriminant(),
+                                                            },
+                                                            field_size: match l27 {
+                                                                0 => None,
+                                                                1 => {
+                                                                    let e = {
+                                                                        let l28 = *ptr1
+                                                                            .add(20 + 4 * ::core::mem::size_of::<*const u8>())
+                                                                            .cast::<i32>();
+                                                                        l28 as u32
+                                                                    };
+                                                                    Some(e)
+                                                                }
+                                                                _ => _rt::invalid_enum_discriminant(),
+                                                            },
+                                                        }
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpRequestHeaderSize(e67)
+                                    }
+                                    23 => {
+                                        let e67 = {
+                                            let l29 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l29 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l30 = *ptr1.add(20).cast::<i32>();
+                                                        l30 as u32
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpRequestTrailerSectionSize(e67)
+                                    }
+                                    24 => {
+                                        let e67 = {
+                                            let l31 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            let l35 = i32::from(
+                                                *ptr1
+                                                    .add(16 + 3 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<u8>(),
+                                            );
+                                            super::super::super::wasi::http::types::FieldSizePayload {
+                                                field_name: match l31 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l32 = *ptr1
+                                                                .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<*mut u8>();
+                                                            let l33 = *ptr1
+                                                                .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<usize>();
+                                                            let len34 = l33;
+                                                            let bytes34 = _rt::Vec::from_raw_parts(
+                                                                l32.cast(),
+                                                                len34,
+                                                                len34,
+                                                            );
+                                                            _rt::string_lift(bytes34)
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                                field_size: match l35 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l36 = *ptr1
+                                                                .add(20 + 3 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<i32>();
+                                                            l36 as u32
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                            }
+                                        };
+                                        V67::HttpRequestTrailerSize(e67)
+                                    }
+                                    25 => V67::HttpResponseIncomplete,
+                                    26 => {
+                                        let e67 = {
+                                            let l37 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l37 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l38 = *ptr1.add(20).cast::<i32>();
+                                                        l38 as u32
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpResponseHeaderSectionSize(e67)
+                                    }
+                                    27 => {
+                                        let e67 = {
+                                            let l39 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            let l43 = i32::from(
+                                                *ptr1
+                                                    .add(16 + 3 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<u8>(),
+                                            );
+                                            super::super::super::wasi::http::types::FieldSizePayload {
+                                                field_name: match l39 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l40 = *ptr1
+                                                                .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<*mut u8>();
+                                                            let l41 = *ptr1
+                                                                .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<usize>();
+                                                            let len42 = l41;
+                                                            let bytes42 = _rt::Vec::from_raw_parts(
+                                                                l40.cast(),
+                                                                len42,
+                                                                len42,
+                                                            );
+                                                            _rt::string_lift(bytes42)
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                                field_size: match l43 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l44 = *ptr1
+                                                                .add(20 + 3 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<i32>();
+                                                            l44 as u32
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                            }
+                                        };
+                                        V67::HttpResponseHeaderSize(e67)
+                                    }
+                                    28 => {
+                                        let e67 = {
+                                            let l45 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l45 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l46 = *ptr1.add(24).cast::<i64>();
+                                                        l46 as u64
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpResponseBodySize(e67)
+                                    }
+                                    29 => {
+                                        let e67 = {
+                                            let l47 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l47 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l48 = *ptr1.add(20).cast::<i32>();
+                                                        l48 as u32
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpResponseTrailerSectionSize(e67)
+                                    }
+                                    30 => {
+                                        let e67 = {
+                                            let l49 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            let l53 = i32::from(
+                                                *ptr1
+                                                    .add(16 + 3 * ::core::mem::size_of::<*const u8>())
+                                                    .cast::<u8>(),
+                                            );
+                                            super::super::super::wasi::http::types::FieldSizePayload {
+                                                field_name: match l49 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l50 = *ptr1
+                                                                .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<*mut u8>();
+                                                            let l51 = *ptr1
+                                                                .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<usize>();
+                                                            let len52 = l51;
+                                                            let bytes52 = _rt::Vec::from_raw_parts(
+                                                                l50.cast(),
+                                                                len52,
+                                                                len52,
+                                                            );
+                                                            _rt::string_lift(bytes52)
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                                field_size: match l53 {
+                                                    0 => None,
+                                                    1 => {
+                                                        let e = {
+                                                            let l54 = *ptr1
+                                                                .add(20 + 3 * ::core::mem::size_of::<*const u8>())
+                                                                .cast::<i32>();
+                                                            l54 as u32
+                                                        };
+                                                        Some(e)
+                                                    }
+                                                    _ => _rt::invalid_enum_discriminant(),
+                                                },
+                                            }
+                                        };
+                                        V67::HttpResponseTrailerSize(e67)
+                                    }
+                                    31 => {
+                                        let e67 = {
+                                            let l55 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l55 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l56 = *ptr1
+                                                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<*mut u8>();
+                                                        let l57 = *ptr1
+                                                            .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<usize>();
+                                                        let len58 = l57;
+                                                        let bytes58 = _rt::Vec::from_raw_parts(
+                                                            l56.cast(),
+                                                            len58,
+                                                            len58,
+                                                        );
+                                                        _rt::string_lift(bytes58)
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpResponseTransferCoding(e67)
+                                    }
+                                    32 => {
+                                        let e67 = {
+                                            let l59 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l59 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l60 = *ptr1
+                                                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<*mut u8>();
+                                                        let l61 = *ptr1
+                                                            .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<usize>();
+                                                        let len62 = l61;
+                                                        let bytes62 = _rt::Vec::from_raw_parts(
+                                                            l60.cast(),
+                                                            len62,
+                                                            len62,
+                                                        );
+                                                        _rt::string_lift(bytes62)
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::HttpResponseContentCoding(e67)
+                                    }
+                                    33 => V67::HttpResponseTimeout,
+                                    34 => V67::HttpUpgradeFailed,
+                                    35 => V67::HttpProtocolError,
+                                    36 => V67::LoopDetected,
+                                    37 => V67::ConfigurationError,
+                                    n => {
+                                        debug_assert_eq!(n, 38, "invalid enum discriminant");
+                                        let e67 = {
+                                            let l63 = i32::from(*ptr1.add(16).cast::<u8>());
+                                            match l63 {
+                                                0 => None,
+                                                1 => {
+                                                    let e = {
+                                                        let l64 = *ptr1
+                                                            .add(16 + 1 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<*mut u8>();
+                                                        let l65 = *ptr1
+                                                            .add(16 + 2 * ::core::mem::size_of::<*const u8>())
+                                                            .cast::<usize>();
+                                                        let len66 = l65;
+                                                        let bytes66 = _rt::Vec::from_raw_parts(
+                                                            l64.cast(),
+                                                            len66,
+                                                            len66,
+                                                        );
+                                                        _rt::string_lift(bytes66)
+                                                    };
+                                                    Some(e)
+                                                }
+                                                _ => _rt::invalid_enum_discriminant(),
+                                            }
+                                        };
+                                        V67::InternalError(e67)
+                                    }
+                                };
+                                v67
+                            };
+                            Err(e)
+                        }
+                        _ => _rt::invalid_enum_discriminant(),
+                    };
+                    result68
+                }
+            }
+        }
     }
     pub mod io {
         /// A poll API intended to let users wait for I/O events on multiple handles
@@ -9099,21 +9707,21 @@ pub(crate) use __export_llm_chat_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 7587] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xa4:\x01A\x02\x01A\x1e\
-\x01B\x11\x01py\x04\0\x11tensor-dimensions\x03\0\0\x01m\x07\x04FP16\x04FP32\x04F\
-P64\x04BF16\x02U8\x03I32\x03I64\x04\0\x0btensor-type\x03\0\x02\x01p}\x04\0\x0bte\
-nsor-data\x03\0\x04\x04\0\x06tensor\x03\x01\x01i\x06\x01@\x03\x0adimensions\x01\x02\
-ty\x03\x04data\x05\0\x07\x04\0\x13[constructor]tensor\x01\x08\x01h\x06\x01@\x01\x04\
-self\x09\0\x01\x04\0\x19[method]tensor.dimensions\x01\x0a\x01@\x01\x04self\x09\0\
-\x03\x04\0\x11[method]tensor.ty\x01\x0b\x01@\x01\x04self\x09\0\x05\x04\0\x13[met\
-hod]tensor.data\x01\x0c\x03\0\"wasi:nn/tensor@0.2.0-rc-2024-10-28\x05\0\x01B\x08\
-\x01m\x09\x10invalid-argument\x10invalid-encoding\x07timeout\x0druntime-error\x15\
-unsupported-operation\x09too-large\x09not-found\x08security\x07unknown\x04\0\x0a\
-error-code\x03\0\0\x04\0\x05error\x03\x01\x01h\x02\x01@\x01\x04self\x03\0\x01\x04\
-\0\x12[method]error.code\x01\x04\x01@\x01\x04self\x03\0s\x04\0\x12[method]error.\
-data\x01\x05\x03\0\"wasi:nn/errors@0.2.0-rc-2024-10-28\x05\x01\x02\x03\0\x01\x05\
-error\x02\x03\0\0\x06tensor\x01B\x0e\x02\x03\x02\x01\x02\x04\0\x05error\x03\0\0\x02\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 7873] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xc2<\x01A\x02\x01A$\x01\
+B\x11\x01py\x04\0\x11tensor-dimensions\x03\0\0\x01m\x07\x04FP16\x04FP32\x04FP64\x04\
+BF16\x02U8\x03I32\x03I64\x04\0\x0btensor-type\x03\0\x02\x01p}\x04\0\x0btensor-da\
+ta\x03\0\x04\x04\0\x06tensor\x03\x01\x01i\x06\x01@\x03\x0adimensions\x01\x02ty\x03\
+\x04data\x05\0\x07\x04\0\x13[constructor]tensor\x01\x08\x01h\x06\x01@\x01\x04sel\
+f\x09\0\x01\x04\0\x19[method]tensor.dimensions\x01\x0a\x01@\x01\x04self\x09\0\x03\
+\x04\0\x11[method]tensor.ty\x01\x0b\x01@\x01\x04self\x09\0\x05\x04\0\x13[method]\
+tensor.data\x01\x0c\x03\0\"wasi:nn/tensor@0.2.0-rc-2024-10-28\x05\0\x01B\x08\x01\
+m\x09\x10invalid-argument\x10invalid-encoding\x07timeout\x0druntime-error\x15uns\
+upported-operation\x09too-large\x09not-found\x08security\x07unknown\x04\0\x0aerr\
+or-code\x03\0\0\x04\0\x05error\x03\x01\x01h\x02\x01@\x01\x04self\x03\0\x01\x04\0\
+\x12[method]error.code\x01\x04\x01@\x01\x04self\x03\0s\x04\0\x12[method]error.da\
+ta\x01\x05\x03\0\"wasi:nn/errors@0.2.0-rc-2024-10-28\x05\x01\x02\x03\0\x01\x05er\
+ror\x02\x03\0\0\x06tensor\x01B\x0e\x02\x03\x02\x01\x02\x04\0\x05error\x03\0\0\x02\
 \x03\x02\x01\x03\x04\0\x06tensor\x03\0\x02\x01i\x03\x01o\x02s\x04\x04\0\x0cnamed\
 -tensor\x03\0\x05\x04\0\x17graph-execution-context\x03\x01\x01h\x07\x01p\x06\x01\
 i\x01\x01j\x01\x09\x01\x0a\x01@\x02\x04self\x08\x06inputs\x09\0\x0b\x04\0'[metho\
@@ -9246,13 +9854,20 @@ uture-incoming-response.subscribe\x01\x85\x01\x01i,\x01j\x01\x86\x01\x01\x1b\x01
 j\x01\x87\x01\0\x01k\x88\x01\x01@\x01\x04self\x84\x01\0\x89\x01\x04\0$[method]fu\
 ture-incoming-response.get\x01\x8a\x01\x01h\x07\x01k\x1b\x01@\x01\x03err\x8b\x01\
 \0\x8c\x01\x04\0\x0fhttp-error-code\x01\x8d\x01\x03\0\x15wasi:http/types@0.2.6\x05\
-\x10\x02\x03\0\x08\x10incoming-request\x02\x03\0\x08\x11response-outparam\x01B\x08\
-\x02\x03\x02\x01\x11\x04\0\x10incoming-request\x03\0\0\x02\x03\x02\x01\x12\x04\0\
-\x11response-outparam\x03\0\x02\x01i\x01\x01i\x03\x01@\x02\x07request\x04\x0cres\
-ponse-out\x05\x01\0\x04\0\x06handle\x01\x06\x04\0\x20wasi:http/incoming-handler@\
-0.2.6\x05\x13\x04\0\x19enclave:llm-chat/llm-chat\x04\0\x0b\x0e\x01\0\x08llm-chat\
-\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10\
-wit-bindgen-rust\x060.41.0";
+\x10\x02\x03\0\x08\x10outgoing-request\x02\x03\0\x08\x0frequest-options\x02\x03\0\
+\x08\x18future-incoming-response\x02\x03\0\x08\x0aerror-code\x01B\x0f\x02\x03\x02\
+\x01\x11\x04\0\x10outgoing-request\x03\0\0\x02\x03\x02\x01\x12\x04\0\x0frequest-\
+options\x03\0\x02\x02\x03\x02\x01\x13\x04\0\x18future-incoming-response\x03\0\x04\
+\x02\x03\x02\x01\x14\x04\0\x0aerror-code\x03\0\x06\x01i\x01\x01i\x03\x01k\x09\x01\
+i\x05\x01j\x01\x0b\x01\x07\x01@\x02\x07request\x08\x07options\x0a\0\x0c\x04\0\x06\
+handle\x01\x0d\x03\0\x20wasi:http/outgoing-handler@0.2.6\x05\x15\x02\x03\0\x08\x10\
+incoming-request\x02\x03\0\x08\x11response-outparam\x01B\x08\x02\x03\x02\x01\x16\
+\x04\0\x10incoming-request\x03\0\0\x02\x03\x02\x01\x17\x04\0\x11response-outpara\
+m\x03\0\x02\x01i\x01\x01i\x03\x01@\x02\x07request\x04\x0cresponse-out\x05\x01\0\x04\
+\0\x06handle\x01\x06\x04\0\x20wasi:http/incoming-handler@0.2.6\x05\x18\x04\0\x19\
+enclave:llm-chat/llm-chat\x04\0\x0b\x0e\x01\0\x08llm-chat\x03\0\0\0G\x09producer\
+s\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x060.4\
+1.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {
