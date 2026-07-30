@@ -66,6 +66,23 @@ pub struct AppConfig {
     /// under default_max_new for an answer.
     #[serde(default)]
     pub think_budget: usize,
+    /// EFFORT SCALING: size the reasoning budget to the QUESTION instead of
+    /// giving every turn the same ceiling. Absent (the default) means
+    /// think_budget applies flat, exactly as before.
+    ///
+    /// Present, a one-line classifier pass rates the turn low / medium / high
+    /// and the budget for THAT turn comes from the matching field below. It is
+    /// the same pass the web-search router already runs when auto search is on,
+    /// so a deployment with both pays for one classification, not two; with
+    /// search off it is one extra short greedy generation per turn.
+    ///
+    /// Read what this does and does not buy: think_budget is a CEILING on a
+    /// runaway, not a target. A model that reasons for 200 tokens and answers
+    /// is untouched by any of these numbers. What scaling changes is how long a
+    /// model that will NOT stop gets to run before the block is closed for it -
+    /// seconds on a greeting instead of the better part of a minute.
+    #[serde(default)]
+    pub effort: Option<EffortConfig>,
     pub system_prompt: String,
     pub max_prompt_tokens: usize,
     pub default_max_new: usize,
@@ -219,6 +236,43 @@ pub struct AppConfig {
     /// the user thinks they are sending.
     #[serde(default = "default_max_images")]
     pub max_images: usize,
+}
+
+/// Reasoning budgets per rated effort, in tokens spent inside the <think>
+/// block. Each is a CEILING for turns of that class, never a target, and none
+/// of them may exceed the model's own think_budget - effort scaling exists to
+/// spend LESS on easy turns, not to hand a model more rope than the deployment
+/// signed up for.
+#[derive(Deserialize, Clone)]
+pub struct EffortConfig {
+    /// greetings, thanks, rewrites, one-line lookups
+    #[serde(default = "default_effort_low")]
+    pub low: usize,
+    /// ordinary explanation, short code, familiar multi-step work
+    #[serde(default = "default_effort_medium")]
+    pub medium: usize,
+    /// proofs, tricky debugging, long derivations, careful comparison.
+    /// 0 (the default) = the model's own think_budget, i.e. no reduction.
+    #[serde(default)]
+    pub high: usize,
+    /// never cut a block shorter than this, whatever the rating says. A
+    /// misjudged "low" on a question that genuinely needs a few steps should
+    /// cost quality nothing: at 256 tokens a model still gets to think, it just
+    /// does not get to think forever.
+    #[serde(default = "default_effort_floor")]
+    pub floor: usize,
+}
+
+fn default_effort_low() -> usize {
+    512
+}
+
+fn default_effort_medium() -> usize {
+    4096
+}
+
+fn default_effort_floor() -> usize {
+    256
 }
 
 fn default_temperature() -> f32 {

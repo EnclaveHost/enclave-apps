@@ -57,6 +57,12 @@
 //!                               and re-fetches the signed document from the
 //!                               enclave's own endpoint so the copy it parses
 //!                               came over the BROWSER's connection.
+//!   POST /title               - name a chat from its opening exchange, for a
+//!                               history list. One short greedy generation,
+//!                               deliberately AFTER the answer has streamed so
+//!                               it is never in front of anything the user is
+//!                               waiting for; a failure answers title: null and
+//!                               the caller keeps its own fallback.
 //!   GET  /search              - WEB SEARCH probe (503 unless the config has a
 //!                               `search` block). ?q=<query> runs the provider
 //!                               leg; ?url=<page> runs only the fetch+extract
@@ -1337,9 +1343,13 @@ struct GenParams {
     sample: SampleParams,
     stop_strings: Vec<String>,
     /// tokens the reply may spend inside its <think> block before the block
-    /// is forced shut (0 = uncapped). Already resolved against the turn: it
-    /// is nonzero only when the prompt actually force-opened a block.
+    /// is forced shut (0 = uncapped).
     think_budget: usize,
+    /// did the prompt force-open a <think> block? Tracked SEPARATELY from the
+    /// budget, because "no cap on the block" and "there is no block" are not
+    /// the same thing: the reply-is-looping rescue below has to know it is
+    /// inside a reasoning block even when nothing caps it.
+    think_open: bool,
     /// identical consecutive token blocks that end a degenerate reply
     /// (0 = off). Unlike think_budget this applies to the whole reply.
     loop_reps: usize,
@@ -1542,25 +1552,55 @@ impl LoopGuard {
 }
 
 struct ThinkGuard {
-    budget: usize, // 0 = off, and then nothing below ever runs
+    budget: usize, // 0 = uncapped; the block is still TRACKED
     open: bool,
     scanned: usize, // bytes of out.text already searched for the closing tag
     close: Vec<u32>,
     forced: bool,
+    /// close on the next check whatever the budget says (the loop rescue)
+    force_now: bool,
+    /// the rescue has been spent; a reply only gets one
+    by_loop: bool,
 }
 
 impl ThinkGuard {
-    fn new(budget: usize, tok: &Tokenizer) -> ThinkGuard {
+    fn new(budget: usize, think_open: bool, tok: &Tokenizer) -> ThinkGuard {
         // a tokenizer that cannot produce the closing tag leaves the guard
-        // off: a budget we cannot act on is better than a mangled reply
-        let close = if budget == 0 {
-            Vec::new()
-        } else {
+        // off: a close we cannot write is better than a mangled reply
+        let close = if think_open {
             tok.encode(THINK_CLOSE_TEXT, false)
                 .map(|e| e.get_ids().to_vec())
                 .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        ThinkGuard { budget, open: !close.is_empty(), scanned: 0, close, forced: false }
+        ThinkGuard {
+            budget,
+            open: !close.is_empty(),
+            scanned: 0,
+            close,
+            forced: false,
+            force_now: false,
+            by_loop: false,
+        }
+    }
+
+    /// The reply has collapsed into a loop. If that is happening INSIDE the
+    /// reasoning block then the BLOCK is what is stuck, and ending the reply
+    /// there is how a user gets a page of thinking and no answer at all - the
+    /// worst outcome available, since the model had not yet written a word
+    /// meant for them. So the block is force-closed instead and the answer
+    /// generates outside it, exactly as when the budget runs out.
+    ///
+    /// Once per reply. A model that loops AGAIN after the block is shut is
+    /// genuinely degenerate, and then stopping is right.
+    fn take_loop(&mut self) -> bool {
+        if !self.open || self.by_loop {
+            return false;
+        }
+        self.by_loop = true;
+        self.force_now = true;
+        true
     }
 
     /// Called after each pushed token: is the budget spent with the block
@@ -1583,7 +1623,9 @@ impl ThinkGuard {
             return false;
         }
         self.scanned = out.text.len();
-        if out.generated.len() < self.budget {
+        // budget 0 is UNCAPPED, not "close immediately": only a rescue closes
+        // a block that nothing caps
+        if !self.force_now && (self.budget == 0 || out.generated.len() < self.budget) {
             return false;
         }
         self.open = false;
@@ -1592,6 +1634,11 @@ impl ThinkGuard {
     }
 
     fn note(&self) -> String {
+        if self.by_loop {
+            return "the reasoning block was repeating itself - closing it so the answer can \
+                    start, instead of ending the reply with nothing but thinking in it"
+                .to_string();
+        }
         format!(
             "the think budget of {} tokens is spent and the reasoning block is still open - \
              closing it so the answer can start",
@@ -1769,8 +1816,11 @@ fn generate(
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, tok);
+    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
     let loop_guard = LoopGuard::new(p.loop_reps);
+    // where the repetition check starts: moved past a force-closed reasoning
+    // block so the answer is not condemned for the loop that preceded it
+    let mut guard_from = 0usize;
     let mut finish: &'static str = "stop";
     loop {
         let recent = out.recent(prompt_ids, p.sample.rep_window);
@@ -1797,18 +1847,24 @@ fn generate(
         }
         // a reply that has collapsed into a loop is finished, whatever it
         // thinks it is doing - checked here so it covers plain prose, which
-        // the think budget below never sees
-        if loop_guard.tripped(&out.generated) {
+        // the think budget below never sees. Inside the reasoning block it is
+        // the BLOCK that ends instead of the reply (take_loop), because a reply
+        // that stops there has nothing in it the user asked for.
+        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break;
         }
-        // budget spent: close the block in the same pass that feeds `next`,
-        // so the model's next sample is already outside it
+        // budget spent (or the rescue above): close the block in the same pass
+        // that feeds `next`, so the model's next sample is already outside it
         if think.over(&out) {
             let _ = status(&think.note());
             if !out.push_forced(&think.close) {
                 break;
             }
+            // the answer is judged for repetition on ITS OWN tokens: the loop
+            // that just ended is still in `generated` and would trip the guard
+            // again on the next token
+            guard_from = out.generated.len();
             let mut ids = vec![next];
             ids.extend_from_slice(&think.close);
             logits = sess.feed(cfg, &ids, true)?;
@@ -1885,8 +1941,9 @@ fn generate_spec(
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, tok);
+    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
     let loop_guard = LoopGuard::new(p.loop_reps);
+    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     // fed-token cursors, so rewinds land on absolute positions
@@ -1913,10 +1970,12 @@ fn generate_spec(
             }
             Pushed::Gone => break 'outer,
         }
-        // -- degenerate loop: stop. Speculative decode makes this MORE likely
-        //    to run long, not less - a looping target accepts its own drafts
-        //    almost perfectly, so the repetition arrives faster.
-        if loop_guard.tripped(&out.generated) {
+        // -- degenerate loop: stop, unless it is the reasoning block that is
+        //    stuck, in which case the block ends and the answer goes on (see
+        //    the plain loop). Speculative decode makes this MORE likely to run
+        //    long, not less - a looping target accepts its own drafts almost
+        //    perfectly, so the repetition arrives faster.
+        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -1929,6 +1988,7 @@ fn generate_spec(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
+            guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             let mut row = sess.feed(cfg, &ids, true)?;
@@ -2081,8 +2141,9 @@ fn generate_mtp(
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
     let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, tok);
+    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
     let loop_guard = LoopGuard::new(p.loop_reps);
+    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut t_fed = prompt_ids.len();
@@ -2105,10 +2166,11 @@ fn generate_mtp(
             }
             Pushed::Gone => break 'outer,
         }
-        // -- degenerate loop: stop (see the plain loop; the MTP head predicts
-        //    a repeating tail near-perfectly, so this path reaches the cap
+        // -- degenerate loop: stop, or end just the reasoning block if that is
+        //    what is stuck (see the plain loop; the MTP head predicts a
+        //    repeating tail near-perfectly, so this path reaches the cap
         //    fastest of the three)
-        if loop_guard.tripped(&out.generated) {
+        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -2122,6 +2184,7 @@ fn generate_mtp(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
+            guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             tscr.copy_from(t_seq, t_fed)?;
@@ -2487,13 +2550,32 @@ impl ChatReq {
 /// Every failure - a bad decode, a model that ignores the format, a session
 /// that will not open - returns None and the turn proceeds WITHOUT search.
 /// Routing is an optimisation; it must never be the reason an answer fails.
+/// What this turn wants out of the router pass, and what it got back. Both are
+/// structs rather than a pile of bools and out-params because the pass answers
+/// two independent questions and either half can be switched off.
+#[derive(Clone, Copy)]
+struct RouterAsk {
+    /// decide search (and images, if `image` is set)
+    route: bool,
+    image: bool,
+    /// rate how much reasoning the turn needs
+    effort: bool,
+}
+
+#[derive(Default)]
+struct RouterOut {
+    verdict: Option<RouterVerdict>,
+    effort: Option<Effort>,
+}
+
 fn route_web_search(
     cfg: &AppConfig,
     tok: &Tokenizer,
     messages: &[ChatMsg],
     mode: &str,
-    want_image: bool,
-) -> Option<RouterVerdict> {
+    ask: RouterAsk,
+) -> RouterOut {
+    let (want_image, want_route, want_effort) = (ask.image && ask.route, ask.route, ask.effort);
     // The instructions are assembled from the capabilities this deployment
     // ACTUALLY has: offering the model a tool that is not configured is how
     // you get an IMAGE verdict on a deployment with no image service, and a
@@ -2511,10 +2593,13 @@ in general, or asking to edit an image you cannot see.\n"
     } else {
         ""
     };
-    let router_system = format!(
-        "You decide what is needed to handle the user's last message.
-
-Search the web when the answer depends on information that changes or that a \
+    // The rating and the routing decision share ONE pass. They are asked
+    // together because the expensive part is prefilling the conversation tail,
+    // not the dozen tokens that come back - two passes would double the cost of
+    // the cheap half to keep the prompts tidy.
+    let route_rules = if want_route {
+        format!(
+            "Search the web when the answer depends on information that changes or that a \
 language model would not reliably know: current events, news, prices, weather, \
 sports results, release versions, live status, anything dated after your \
 training, or an obscure named entity, product or person.
@@ -2523,11 +2608,45 @@ Do NOT search for: chit-chat, greetings and thanks, translation, summarising \
 or rewriting text already in the conversation, arithmetic, code the model can \
 simply write, definitions of well-established concepts, opinions, or \
 follow-ups answerable from what was already said.
-{image_rule}
-Reply with EXACTLY ONE line and nothing else:
-SEARCH: <the query to run>
-or
-{image_option}NO"
+{image_rule}"
+        )
+    } else {
+        String::new()
+    };
+    let effort_rules = if want_effort {
+        "Rate how much step-by-step REASONING the last message needs before it can be \
+answered well:
+low = greetings, thanks, chit-chat, rewriting or translating text already here, \
+a fact you simply know, a one-line answer.
+medium = ordinary explanation, short code, familiar multi-step work.
+high = proofs and derivations, tricky debugging, careful comparison of several \
+options, anything where a wrong intermediate step ruins the answer.
+"
+    } else {
+        ""
+    };
+    let route_line = if want_route {
+        format!("SEARCH: <the query to run>\nor\n{image_option}NO")
+    } else {
+        String::new()
+    };
+    let reply_form = match (want_route, want_effort) {
+        // both: one line, rating first, so a truncated reply still carries it
+        (true, true) => format!(
+            "Reply with EXACTLY ONE line and nothing else, in this form:\n\
+             EFFORT: <low|medium|high> | <one of the following>\n{route_line}"
+        ),
+        (true, false) => format!("Reply with EXACTLY ONE line and nothing else:\n{route_line}"),
+        (false, true) => "Reply with EXACTLY ONE line and nothing else:\n\
+                          EFFORT: <low|medium|high>"
+            .to_string(),
+        (false, false) => return RouterOut::default(),
+    };
+    let router_system = format!(
+        "You decide what is needed to handle the user's last message.
+
+{route_rules}{effort_rules}
+{reply_form}"
     );
     let router_system = router_system.as_str();
 
@@ -2558,7 +2677,9 @@ or
     }
 
     // thinking off: this is a classifier, not a reasoning task
-    let (ids, stops, _) = build_prompt(cfg, tok, &router_msgs, false).ok()?;
+    let Ok((ids, stops, _)) = build_prompt(cfg, tok, &router_msgs, false) else {
+        return RouterOut::default();
+    };
     let params = GenParams {
         max_new: 48,
         sample: SampleParams {
@@ -2574,17 +2695,150 @@ or
             s
         },
         think_budget: 0,
+        think_open: false,
         // the router emits one short line; a loop there is still a loop
+        loop_reps: 4,
+    };
+    let Some(&(target, tname)) = targets_for(cfg, mode).first() else {
+        return RouterOut::default();
+    };
+    let noop_emit = |_: &str| true;
+    let noop_status = |_: &str| true;
+    let Ok(stats) = generate(
+        cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+    ) else {
+        return RouterOut::default();
+    };
+    RouterOut {
+        // a rating the model did not give leaves the flat budget in place
+        effort: want_effort.then(|| parse_effort(&stats.text)).flatten(),
+        verdict: want_route.then(|| parse_router_verdict(&stats.text, want_image)).flatten(),
+    }
+}
+
+/// Name a conversation from its opening exchange, for the history list.
+///
+/// The playground has always had a title: the first message, cut at 64
+/// characters. That is free and it is bad - "can you help me figure out why my
+/// dock" is not a name, it is a fragment. This asks the model for one instead.
+///
+/// EFFICIENCY, which is the whole design: the pass runs AFTER the answer has
+/// streamed, from a route of its own, so it is never in front of anything the
+/// user is waiting for. The reply is on screen; the sidebar entry renames
+/// itself a moment later. It costs one short greedy generation over a short
+/// prompt - the question plus the first few lines of the answer, not the
+/// conversation - and it happens ONCE per chat, on the first exchange only.
+///
+/// The answer is included because it is what rescues a vague opener: "help me
+/// with this error" names nothing, and the reply that follows names it exactly.
+fn make_title(
+    cfg: &AppConfig,
+    tok: &Tokenizer,
+    question: &str,
+    answer: &str,
+    mode: &str,
+) -> Option<String> {
+    let system = "You name conversations for a chat history list, like a file name.
+
+Rules:
+- 3 to 6 words, under 48 characters.
+- Name the SUBJECT, not the interaction: \"Rust mutex deadlock\", never \"User asks for help\".
+- No quotes, no trailing period, no markdown, no emoji.
+- Sentence case, keeping the capitalisation of names and code (Rust, useEffect, K8s).
+- If the opening message is only a greeting, name it Greeting.
+
+Reply with EXACTLY ONE line: the title and nothing else.";
+
+    let mut msgs: Vec<ChatMsg> = vec![ChatMsg::text("system", system)];
+    let q = truncate_for_msg_n(question, 600);
+    let a = truncate_for_msg_n(strip_think(answer).trim(), 300);
+    let opening = if a.is_empty() {
+        format!("Conversation opens with:\n{q}")
+    } else {
+        format!("Conversation opens with:\n{q}\n\nThe reply began:\n{a}")
+    };
+    msgs.push(ChatMsg::text("user", opening));
+
+    // thinking off: naming a thing is not a reasoning task
+    let (prompt, stops, _) = build_prompt(cfg, tok, &msgs, false).ok()?;
+    let params = GenParams {
+        max_new: 24,
+        sample: SampleParams {
+            temperature: 0.0, // greedy: the same chat gets the same name
+            top_p: 1.0,
+            top_k: 0,
+            rep_penalty: 1.0,
+            rep_window: 0,
+        },
+        stop_strings: {
+            let mut s = stops;
+            s.push("\n".into());
+            s
+        },
+        think_budget: 0,
+        think_open: false,
         loop_reps: 4,
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
     let noop_status = |_: &str| true;
     let stats = generate(
-        cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+        cfg, tok, &prompt, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
     )
     .ok()?;
-    parse_router_verdict(&stats.text, want_image)
+    clean_title(&stats.text)
+}
+
+/// Make a model's line usable as a title, or reject it. Models wrap titles in
+/// quotes, prefix them with "Title:", bold them, and add a full stop; a title
+/// list is one place where that noise is glaring, and none of it is worth a
+/// retry when trimming is deterministic.
+fn clean_title(raw: &str) -> Option<String> {
+    let line = strip_think(raw)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?
+        .to_string();
+    let mut t = line.trim().to_string();
+    // peel the wrappers in a loop: `**"Title: x"**` needs several passes, and
+    // one pass of each leaves the others' leftovers behind
+    loop {
+        let before = t.clone();
+        t = t.trim().trim_matches(['"', '\'', '`', '*', '#', '_']).trim().to_string();
+        for p in ["Title:", "title:", "TITLE:", "Chat title:"] {
+            if let Some(rest) = t.strip_prefix(p) {
+                t = rest.trim().to_string();
+            }
+        }
+        t = t.trim_end_matches(['.', ',', ';', ':', '!']).trim().to_string();
+        if t == before {
+            break;
+        }
+    }
+    // collapse any internal whitespace, including a stray newline the stop
+    // string did not catch
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.is_empty() || t.chars().count() > 80 {
+        return None; // a paragraph is not a title; keep the client's fallback
+    }
+    // hard cap on a word boundary, so a long-winded title truncates readably
+    let t = if t.chars().count() > 48 {
+        let mut cut = t
+            .char_indices()
+            .take_while(|(i, _)| *i <= 48)
+            .map(|(i, _)| i)
+            .last()
+            .unwrap_or(48);
+        if let Some(sp) = t[..cut].rfind(' ') {
+            if sp > 20 {
+                cut = sp;
+            }
+        }
+        t[..cut].trim_end().to_string()
+    } else {
+        t
+    };
+    Some(t)
 }
 
 /// What the router decided.
@@ -2592,6 +2846,99 @@ or
 enum RouterVerdict {
     Search(String),
     Image(String),
+}
+
+/// How much reasoning the turn was rated to need. Three classes, not a 0-100
+/// score: a model asked for a number produces a confident-looking one it cannot
+/// actually calibrate, while "is this chit-chat, ordinary work, or hard?" is a
+/// judgement it makes well and a human can check.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    fn parse(s: &str) -> Option<Effort> {
+        let s = s.trim().trim_matches(['"', '\'', '`', '*', '.']).trim();
+        match s.to_ascii_lowercase().as_str() {
+            "low" | "simple" | "easy" => Some(Effort::Low),
+            "medium" | "moderate" | "normal" => Some(Effort::Medium),
+            "high" | "hard" | "complex" => Some(Effort::High),
+            _ => None,
+        }
+    }
+
+    /// The reasoning ceiling for a turn of this class. Clamped BOTH ways: never
+    /// above the model's own think_budget (effort scaling only ever spends
+    /// less), never below the floor (a misrating must not cost real reasoning),
+    /// and 0 anywhere still means uncapped, so a deployment that left
+    /// think_budget at 0 does not silently gain a cap it never asked for.
+    fn budget(self, cfg: &AppConfig) -> usize {
+        let Some(e) = &cfg.effort else {
+            return cfg.think_budget;
+        };
+        let want = match self {
+            Effort::Low => e.low,
+            Effort::Medium => e.medium,
+            Effort::High => e.high,
+        };
+        if want == 0 {
+            return cfg.think_budget; // "no reduction for this class"
+        }
+        let want = want.max(e.floor);
+        if cfg.think_budget == 0 {
+            return want;
+        }
+        want.min(cfg.think_budget)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+}
+
+/// Drop a leading `EFFORT: <class> |` from a router line, leaving the verdict
+/// half untouched - including any `|` inside a query.
+fn strip_effort_prefix(line: &str) -> &str {
+    let l = line.trim_start().trim_start_matches(['-', '*', '#', '>', ' ']);
+    let l = l.trim_start_matches("**").trim_start();
+    if !l.get(..7).is_some_and(|h| h.eq_ignore_ascii_case("effort:")) {
+        return line;
+    }
+    match l.split_once('|') {
+        Some((_, rest)) => rest,
+        None => line,
+    }
+}
+
+/// Pull `EFFORT: <class>` out of the router's reply. Separate from the verdict
+/// parse because the two travel on the same line and either can be missing: a
+/// model that answers the search question and ignores the rating is still worth
+/// listening to about search.
+fn parse_effort(text: &str) -> Option<Effort> {
+    let cleaned = strip_think(text);
+    for line in cleaned.lines() {
+        for seg in line.split('|') {
+            let s = seg.trim().trim_start_matches(['-', '*', '#', '>', ' ']).trim();
+            let s = s.trim_start_matches("**").trim();
+            // `continue`, never `?`: the verdict rides the same line, so most
+            // segments are not the rating and finding one is the exception
+            let Some(head) = s.get(..7) else { continue };
+            if !head.eq_ignore_ascii_case("effort:") {
+                continue;
+            }
+            if let Some(e) = Effort::parse(&s[7..]) {
+                return Some(e);
+            }
+        }
+    }
+    None
 }
 
 /// Pull the verdict out of the router's reply. Tolerant of the usual model
@@ -2604,7 +2951,12 @@ enum RouterVerdict {
 /// should be ignored, not obeyed.
 fn parse_router_verdict(text: &str, allow_image: bool) -> Option<RouterVerdict> {
     let cleaned = strip_think(text);
-    for line in cleaned.lines() {
+    // With effort scaling on the rating shares the line (`EFFORT: high |
+    // SEARCH: …`), so a line-anchored match would find the rating, fail, and
+    // silently skip a search the user wanted. Only the RATING prefix is split
+    // off: splitting the whole line on `|` would truncate a query that
+    // contains one.
+    for line in cleaned.lines().map(strip_effort_prefix) {
         let l = line.trim().trim_start_matches(['-', '*', '#', '>', ' ']).trim();
         let l = l.trim_start_matches("**").trim();
         let (rest, is_image) = match find_verdict_prefix(l) {
@@ -2790,6 +3142,7 @@ ASK: <the question>";
             s
         },
         think_budget: 0,
+        think_open: false,
         loop_reps: 4,
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
@@ -2945,6 +3298,11 @@ fn apply_web_search(
     tok: &Tokenizer,
     target_mode: &str,
     image_out: &mut Option<image::GeneratedImage>,
+    // the reasoning rating, when this turn wants one: it rides OUT of here
+    // because the router pass that decides about search answers both questions
+    // at once, and paying for that pass twice would be the whole saving gone
+    effort_out: &mut Option<Effort>,
+    want_effort: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
     let web_mode = creq.web_mode();
@@ -2984,7 +3342,10 @@ fn apply_web_search(
     // two routers would be two generations of latency to answer one question.
     if web_mode == WebMode::Auto && !asked_inline {
         on_status("deciding what this needs…");
-        match route_web_search(cfg, tok, messages, target_mode, has_image) {
+        let ask = RouterAsk { route: true, image: has_image, effort: want_effort };
+        let out = route_web_search(cfg, tok, messages, target_mode, ask);
+        *effort_out = out.effort;
+        match out.verdict {
             Some(RouterVerdict::Image(prompt)) => {
                 on_status("generating the image…");
                 return run_image(cfg, &prompt, messages, last, image_out, on_status).map(|()| None);
@@ -3329,14 +3690,48 @@ fn strip_marks(s: &str) -> String {
     s.to_string()
 }
 
+/// The reasoning rating for this turn, and the pass that produces one when the
+/// web router did not already run. Returns None when the deployment has not
+/// configured effort scaling, when the turn opens no reasoning block, or when
+/// the model declines to rate it - each of which leaves the flat think_budget
+/// in charge, which is the behaviour every deployment had before this existed.
+fn resolve_effort(
+    cfg: &AppConfig,
+    tok: &Tokenizer,
+    messages: &[ChatMsg],
+    mode: &str,
+    think_open: bool,
+    from_router: Option<Effort>,
+    on_status: &dyn Fn(&str),
+) -> Option<Effort> {
+    if cfg.effort.is_none() || !think_open {
+        return None;
+    }
+    if from_router.is_some() {
+        return from_router; // already paid for, in the router's own pass
+    }
+    on_status("sizing the reasoning budget…");
+    route_web_search(
+        cfg,
+        tok,
+        messages,
+        mode,
+        RouterAsk { route: false, image: false, effort: true },
+    )
+    .effort
+}
+
 /// `think_open` is build_prompt's: the think budget only arms on a turn whose
 /// prompt actually force-opened a reasoning block, which is what makes it
 /// inert for non-thinking models and for enable_thinking=false turns.
+///
+/// `effort` is the turn's rating, when the deployment scales the budget by it.
 fn gen_params(
     cfg: &AppConfig,
     creq: &ChatReq,
     extra_stops: Vec<String>,
     think_open: bool,
+    effort: Option<Effort>,
 ) -> GenParams {
     let mut stops = extra_stops;
     match &creq.stop {
@@ -3365,7 +3760,11 @@ fn gen_params(
             rep_window: cfg.rep_window,
         },
         stop_strings: stops,
-        think_budget: if think_open { cfg.think_budget } else { 0 },
+        think_budget: match effort {
+            Some(e) => e.budget(cfg),
+            None => cfg.think_budget,
+        },
+        think_open,
         loop_reps: cfg.repeat_guard,
     }
 }
@@ -3481,6 +3880,56 @@ fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
 
 // ------------------------------------------------- legacy /chat (playground) --
 
+/// Name a chat from its opening exchange. Takes the same body shape as /chat
+/// (a `messages` array) and reads only the first question and the first reply.
+///
+/// Open, like /chat and /models: it is the playground naming its own sidebar
+/// entry, and it can do nothing a /chat turn could not already do.
+///
+/// A failure is not an error here - it is a 200 with `title: null`, and the
+/// caller keeps whatever placeholder it already showed. Nothing about naming a
+/// conversation is worth an error message in front of a user.
+fn handle_title(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
+    let parsed: Result<ChatReq, String> = read_body(&req)
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
+    let creq = match parsed {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    let cfg = &match resolve_model(raw, creq.model.as_deref()) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+    };
+    let question = creq
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| {
+            // a picture-only opener still names something
+            if m.content.trim().is_empty() && !m.images.is_empty() {
+                format!("[{} image(s), no question]", m.images.len())
+            } else {
+                m.content.clone()
+            }
+        })
+        .unwrap_or_default();
+    if question.trim().is_empty() {
+        return json_err(out, 400, "no user message to name the chat from");
+    }
+    let answer = creq
+        .messages
+        .iter()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let title = read_tokenizer(cfg)
+        .ok()
+        .and_then(|b| Tokenizer::from_bytes(&b).ok())
+        .and_then(|tok| make_title(cfg, &tok, &question, &answer, "auto"));
+    let body = serde_json::json!({ "title": title });
+    respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
+}
+
 fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
@@ -3539,6 +3988,12 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let status_cb = |s: &str| {
         let _ = send(serde_json::json!({ "status": s }));
     };
+    // Effort scaling, when the deployment configured it: the rating comes out
+    // of the router pass below if that runs, and from its own short pass later
+    // if it does not. `want_effort` gates BOTH, so a deployment without the
+    // block pays for neither.
+    let mut router_effort: Option<Effort> = None;
+    let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
     let search_meta = match apply_web_search(
         cfg,
         &creq,
@@ -3546,6 +4001,8 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         &tok,
         mode,
         &mut generated_image,
+        &mut router_effort,
+        want_effort,
         &status_cb,
     ) {
         Ok(m) => m,
@@ -3598,7 +4055,8 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             return;
         }
     };
-    let params = gen_params(cfg, &creq, stops, think_open);
+    let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
+    let params = gen_params(cfg, &creq, stops, think_open, effort);
 
     let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
     if let Some(n) = &draft_note {
@@ -3640,6 +4098,10 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                 }
                 if s.think_forced {
                     done["think_forced"] = serde_json::json!(true);
+                }
+                if let Some(e) = effort {
+                    done["effort"] = serde_json::json!(e.as_str());
+                    done["think_budget"] = serde_json::json!(params.think_budget);
                 }
                 if s.images > 0 {
                     done["images"] = serde_json::json!(s.images);
@@ -3757,6 +4219,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 serde_json::json!({ "error": { "message": strip_code(e), "type": "server_error" } })
             ));
         };
+        // Effort scaling, when the deployment configured it: the rating comes out
+        // of the router pass below if that runs, and from its own short pass later
+        // if it does not. `want_effort` gates BOTH, so a deployment without the
+        // block pays for neither.
+        let mut router_effort: Option<Effort> = None;
+        let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -3764,6 +4232,8 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             &tok,
             mode,
             &mut generated_image,
+            &mut router_effort,
+            want_effort,
             &leg_status,
         ) {
             Ok(m) => m,
@@ -3794,7 +4264,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 return;
             }
         };
-        let params = gen_params(cfg, &creq, stops, think_open);
+        let effort =
+            resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
+        let params = gen_params(cfg, &creq, stops, think_open, effort);
         // Sources first, as an SSE COMMENT: the chunk schema has no field for
         // them and inventing one would break strict OpenAI clients, while a
         // comment line is required to be ignored by every conforming parser.
@@ -3857,6 +4329,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // a big vision read) belongs on stream:true, because the buffered
         // path has a proxy-hop timeout budget it cannot influence.
         let no_status = |_: &str| {};
+        // Effort scaling, when the deployment configured it: the rating comes out
+        // of the router pass below if that runs, and from its own short pass later
+        // if it does not. `want_effort` gates BOTH, so a deployment without the
+        // block pays for neither.
+        let mut router_effort: Option<Effort> = None;
+        let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -3864,6 +4342,8 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             &tok,
             mode,
             &mut generated_image,
+            &mut router_effort,
+            want_effort,
             &no_status,
         ) {
             Ok(m) => m,
@@ -3877,7 +4357,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(v) => v,
             Err(e) => return json_err(out, 400, &e),
         };
-        let params = gen_params(cfg, &creq, stops, think_open);
+        let effort =
+            resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
+        let params = gen_params(cfg, &creq, stops, think_open, effort);
         let sink = |_: &str| true;
         let mut last_err = String::new();
         let mut result: Option<GenStats> = None;
@@ -3913,7 +4395,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                     "enclave": { "target": s.target, "load_ms": s.load_ms as u64,
                              "prefill_ms": s.prefill_ms as u64, "decode_ms": s.decode_ms as u64,
                              "draft_tokens": s.drafted, "draft_accepted": s.accepted,
-                             "think_forced": s.think_forced },
+                             "think_forced": s.think_forced,
+                             "effort": effort.map(|e| e.as_str()),
+                             "think_budget": effort.map(|_| params.think_budget) },
                 });
                 if s.images > 0 {
                     // usage.prompt_tokens counts the text; images are priced
@@ -4388,12 +4872,13 @@ impl Guest for Component {
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
             (Method::Post, "/chat") => handle_chat(&raw, req, out),
+            (Method::Post, "/title") => handle_title(&raw, req, out),
             (Method::Post, "/v1/chat/completions") => handle_completions(&raw, req, out),
             (Method::Get, "/v1/models") => handle_models(&raw, req, out),
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
             ),
         }
     }
@@ -4454,6 +4939,201 @@ mod tests {
             three.extend_from_slice(&phrase);
         }
         assert!(!g.tripped(&three));
+    }
+
+    /// The failure this exists for, reported live 2026-07-30: a thinking model
+    /// loops INSIDE its <think> block, the repetition guard ends the reply
+    /// there, and the user gets a reasoning block and no answer. The reply is
+    /// the only thing they asked for, so the BLOCK is what has to end.
+    /// A throwaway tokenizer that can spell the closing tag, which is the only
+    /// thing the think guard asks of one. No pre-tokenizer, so the tag maps to
+    /// a single id instead of being split into `<`, `/`, `think`, `>`.
+    fn think_tokenizer() -> Tokenizer {
+        let json = format!(
+            r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+                "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
+                "model":{{"type":"WordLevel","vocab":{{"{}":1,"x":2}},"unk_token":"x"}}}}"#,
+            THINK_CLOSE_TEXT.trim()
+        );
+        Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer")
+    }
+
+    fn out_at<'a>(
+        tok: &'a Tokenizer,
+        emit: &'a dyn Fn(&str) -> bool,
+        stops: &'a [String],
+        text: &str,
+        tokens: usize,
+    ) -> TextOut<'a> {
+        let mut out = TextOut::new(tok, emit, stops);
+        out.text.push_str(text);
+        out.generated = vec![2u32; tokens];
+        out
+    }
+
+    /// The failure this exists for, reported live 2026-07-30: a thinking model
+    /// loops INSIDE its <think> block, the repetition guard ends the reply
+    /// there, and the user gets a reasoning block and no answer. The reply is
+    /// the only thing they asked for, so the BLOCK is what has to end.
+    #[test]
+    fn a_loop_inside_the_reasoning_block_closes_the_block_not_the_reply() {
+        let tok = think_tokenizer();
+        let (emit, stops): (&dyn Fn(&str) -> bool, Vec<String>) = (&|_: &str| true, Vec::new());
+        // a reply mid-<think>, nothing written for the user yet
+        let mut g = ThinkGuard::new(0, true, &tok); // budget 0 = UNCAPPED
+        assert!(g.open, "a force-opened block is tracked even with no budget");
+        assert!(!g.close.is_empty(), "the closing tag must be encodable");
+
+        // uncapped means uncapped: length alone never forces the close
+        let mut out = out_at(&tok, emit, &stops, "thinking and thinking", 40_000);
+        assert!(!g.over(&out), "budget 0 must not close on length");
+
+        // ...but a loop does, once
+        assert!(g.take_loop(), "the first trip inside the block is a rescue");
+        assert!(g.over(&out), "and the rescue closes the block on the next check");
+        assert!(g.forced && g.by_loop);
+        assert!(g.note().contains("repeating itself"), "{}", g.note());
+        assert!(!g.open, "the block is shut now");
+
+        // a SECOND loop, now outside the block, is a genuinely degenerate reply
+        // and must stop it - one rescue per turn
+        assert!(!g.take_loop(), "the rescue is spent");
+        out.text.push_str(" and the answer");
+        assert!(!g.over(&out), "a closed block is not closed twice");
+    }
+
+    #[test]
+    fn a_loop_with_no_reasoning_block_still_stops_the_reply() {
+        let tok = think_tokenizer();
+        let (emit, stops): (&dyn Fn(&str) -> bool, Vec<String>) = (&|_: &str| true, Vec::new());
+        // think_open false: plain prose, nothing to rescue, caller stops
+        let mut g = ThinkGuard::new(4096, false, &tok);
+        assert!(!g.open);
+        assert!(!g.take_loop(), "no block means no rescue, so the reply ends");
+        let out = out_at(&tok, emit, &stops, "looping prose", 9_000);
+        assert!(!g.over(&out), "and the budget cannot fire on a block that is not open");
+    }
+
+    /// The budget path must keep working exactly as before: spend it with the
+    /// block open and the guard closes, with the budget's own message.
+    #[test]
+    fn the_think_budget_still_closes_a_block_that_overruns() {
+        let tok = think_tokenizer();
+        let (emit, stops): (&dyn Fn(&str) -> bool, Vec<String>) = (&|_: &str| true, Vec::new());
+        let mut g = ThinkGuard::new(100, true, &tok);
+        let under = out_at(&tok, emit, &stops, "still reasoning", 99);
+        assert!(!g.over(&under), "under budget, nothing happens");
+        let over = out_at(&tok, emit, &stops, "still reasoning", 100);
+        assert!(g.over(&over));
+        assert!(g.forced && !g.by_loop);
+        assert!(g.note().contains("think budget of 100"), "{}", g.note());
+    }
+
+    /// And a model that closes the block ITSELF is left alone by both paths.
+    #[test]
+    fn a_block_the_model_closes_itself_is_never_forced() {
+        let tok = think_tokenizer();
+        let (emit, stops): (&dyn Fn(&str) -> bool, Vec<String>) = (&|_: &str| true, Vec::new());
+        let mut g = ThinkGuard::new(10, true, &tok);
+        let done = out_at(
+            &tok, emit, &stops,
+            &format!("reasoned it out{THINK_CLOSE}now the answer"), 5_000,
+        );
+        assert!(!g.over(&done), "the tag is there, so there is nothing to force");
+        assert!(!g.open && !g.forced);
+        assert!(!g.take_loop(), "and a later loop is a real stop, not a rescue");
+    }
+
+    #[test]
+    fn a_title_is_cleaned_of_everything_a_model_wraps_it_in() {
+        // the shapes models actually return
+        assert_eq!(clean_title("Rust mutex deadlock").unwrap(), "Rust mutex deadlock");
+        assert_eq!(clean_title("\"Rust mutex deadlock\"").unwrap(), "Rust mutex deadlock");
+        assert_eq!(clean_title("**Title: Rust mutex deadlock**").unwrap(), "Rust mutex deadlock");
+        assert_eq!(clean_title("Title: \"Rust mutex deadlock.\"").unwrap(), "Rust mutex deadlock");
+        assert_eq!(clean_title("<think>naming it</think>\nRust mutex deadlock").unwrap(),
+            "Rust mutex deadlock");
+        // whitespace, including a newline the stop string missed
+        assert_eq!(clean_title("  Rust   mutex\tdeadlock  ").unwrap(), "Rust mutex deadlock");
+        // capitalisation of names and code is the model's business, not ours
+        assert_eq!(clean_title("useEffect dependency loop").unwrap(), "useEffect dependency loop");
+
+        // a title that runs long is cut at a WORD boundary
+        let long = clean_title("Debugging a deadlock between two mutexes and a bounded channel")
+            .unwrap();
+        assert!(long.chars().count() <= 48, "{long:?}");
+        assert!(!long.ends_with(' ') && !long.contains("  "), "{long:?}");
+        assert!(long.starts_with("Debugging a deadlock"), "{long:?}");
+
+        // and a model that writes a paragraph instead of a title is REFUSED,
+        // so the caller keeps its own fallback rather than showing an essay
+        assert!(clean_title(&"a very long sentence that keeps going ".repeat(4)).is_none());
+        assert!(clean_title("").is_none());
+        assert!(clean_title("\"\"").is_none());
+        assert!(clean_title("   ").is_none());
+    }
+
+    #[test]
+    fn the_effort_rating_survives_the_router_line() {
+        // the shape the router is asked for, rating first
+        assert_eq!(parse_effort("EFFORT: low | NO"), Some(Effort::Low));
+        assert_eq!(parse_effort("EFFORT: high | SEARCH: rust 1.90 release notes"), Some(Effort::High));
+        // and the shapes models actually produce around it
+        assert_eq!(parse_effort("**EFFORT:** medium | NO"), Some(Effort::Medium));
+        assert_eq!(parse_effort("effort: HIGH"), Some(Effort::High));
+        assert_eq!(parse_effort("<think>hmm</think>\nEFFORT: low"), Some(Effort::Low));
+        assert_eq!(parse_effort("- EFFORT: \"medium\""), Some(Effort::Medium));
+        assert_eq!(parse_effort("EFFORT: simple | NO"), Some(Effort::Low), "synonyms count");
+        // a rating that is not there, or is not a rating, leaves the flat budget
+        assert_eq!(parse_effort("SEARCH: weather in oslo"), None);
+        assert_eq!(parse_effort("EFFORT: whenever"), None);
+        assert_eq!(parse_effort(""), None);
+        // and the verdict still parses out of the same line
+        assert_eq!(
+            parse_router_verdict("EFFORT: high | SEARCH: rust 1.90 release notes", false),
+            Some(RouterVerdict::Search("rust 1.90 release notes".into())),
+        );
+        // a query that itself contains a pipe survives: only the rating prefix
+        // is split off, not every `|` on the line
+        assert_eq!(
+            parse_router_verdict("EFFORT: medium | SEARCH: ffmpeg concat | filter_complex", false),
+            Some(RouterVerdict::Search("ffmpeg concat | filter_complex".into())),
+        );
+        // a plain verdict with no rating is unchanged
+        assert_eq!(
+            parse_router_verdict("SEARCH: oslo weather", false),
+            Some(RouterVerdict::Search("oslo weather".into())),
+        );
+    }
+
+    #[test]
+    fn effort_only_ever_spends_less_than_the_configured_budget() {
+        let mut cfg = test_config();
+        cfg.think_budget = 8000;
+        // no effort block: the rating cannot change anything
+        cfg.effort = None;
+        assert_eq!(Effort::Low.budget(&cfg), 8000);
+
+        cfg.effort = Some(config::EffortConfig { low: 512, medium: 4096, high: 0, floor: 256 });
+        assert_eq!(Effort::Low.budget(&cfg), 512);
+        assert_eq!(Effort::Medium.budget(&cfg), 4096);
+        assert_eq!(Effort::High.budget(&cfg), 8000, "high 0 = the model's own budget");
+
+        // a class configured ABOVE the model's ceiling is clamped to it: this
+        // knob spends less, never more
+        cfg.effort = Some(config::EffortConfig { low: 512, medium: 99_000, high: 0, floor: 256 });
+        assert_eq!(Effort::Medium.budget(&cfg), 8000);
+
+        // the floor protects a misrated question from losing its reasoning
+        cfg.effort = Some(config::EffortConfig { low: 8, medium: 4096, high: 0, floor: 256 });
+        assert_eq!(Effort::Low.budget(&cfg), 256);
+
+        // an uncapped model stays uncapped where the class says 0, and takes
+        // the class's own number where it gives one
+        cfg.think_budget = 0;
+        cfg.effort = Some(config::EffortConfig { low: 512, medium: 4096, high: 0, floor: 256 });
+        assert_eq!(Effort::High.budget(&cfg), 0, "uncapped stays uncapped");
+        assert_eq!(Effort::Low.budget(&cfg), 512, "but chit-chat still gets a ceiling");
     }
 
     #[test]
