@@ -3,10 +3,12 @@
 //! leg (image.rs) go through here, so the timeout, the response cap and the
 //! egress diagnosis are stated once instead of drifting between copies.
 
+use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::http::outgoing_handler;
 use crate::bindings::wasi::http::types::{
     Fields, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
 };
+use crate::bindings::wasi::io::poll;
 use crate::bindings::wasi::io::streams::StreamError;
 
 /// A sane default cap for JSON and HTML. Callers that expect something large
@@ -74,6 +76,23 @@ impl<'a> HttpReq<'a> {
 
 /// One outbound request.
 pub fn request(r: HttpReq) -> Result<Response, String> {
+    request_with_tick(r, 0, &mut |_| {})
+}
+
+/// `request`, but with a heartbeat: while waiting for the response's FIRST
+/// byte, `tick(total_seconds_waited)` fires every `tick_s` seconds (0 = never
+/// tick, identical to `request`). The first-byte wait is where a slow leg
+/// spends its whole life - an image generation queued behind other tenants
+/// answers with one JSON blob only when it is DONE - and callers that hold a
+/// client-facing stream open during that wait need something to write into
+/// it, or every idle-timeout between here and the browser is entitled to
+/// conclude the connection is dead. The tick does not extend the deadline:
+/// `timeout_s` still bounds the wait host-side via first_byte_timeout.
+pub fn request_with_tick(
+    r: HttpReq,
+    tick_s: u64,
+    tick: &mut dyn FnMut(u64),
+) -> Result<Response, String> {
     let (scheme_s, authority, path) = split_url(r.url)?;
     let scheme = match scheme_s.as_str() {
         "https" => Scheme::Https,
@@ -121,7 +140,21 @@ pub fn request(r: HttpReq) -> Result<Response, String> {
     }
     OutgoingBody::finish(out_body, None).map_err(|e| format!("finish body: {e}"))?;
 
-    fut.subscribe().block();
+    let ready = fut.subscribe();
+    if tick_s == 0 {
+        ready.block();
+    } else {
+        let mut waited_s = 0u64;
+        while !ready.ready() {
+            let timer = monotonic_clock::subscribe_duration(tick_s * 1_000_000_000);
+            let woke = poll::poll(&[&ready, &timer]);
+            if woke.contains(&0) || ready.ready() {
+                break;
+            }
+            waited_s += tick_s;
+            tick(waited_s);
+        }
+    }
     let resp = fut
         .get()
         .ok_or("no response")?

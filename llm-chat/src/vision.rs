@@ -179,6 +179,7 @@ pub fn describe(
     question: &str,
     context: Option<&str>,
     now_ms: impl Fn() -> u64,
+    on_status: &dyn Fn(&str),
 ) -> Result<VisionAnswer, String> {
     if cfg.endpoint.trim().is_empty() {
         return Err("vision_service.endpoint is not set".into());
@@ -224,7 +225,13 @@ pub fn describe(
     }
 
     let t0 = now_ms();
-    let r = http::request(req)?;
+    // Same heartbeat story as image::generate: the vision service answers in
+    // one blob when the read is done, and a large picture on a busy share can
+    // hold the wire silent long enough for an idle-timeout in the middle to
+    // kill the stream. Tick every 15s until the first response byte.
+    let r = http::request_with_tick(req, 15, &mut |s| {
+        on_status(&format!("still reading the image… ({s}s)"))
+    })?;
     if r.truncated {
         return Err(format!(
             "the vision service's reply exceeded vision_service.max_bytes ({} bytes)",
