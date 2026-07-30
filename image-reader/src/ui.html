@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>image reader</title>
+<!-- inline, so the page makes no second request for it (and a 404 for
+     /favicon.ico never appears in anyone's console) -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2310a37f' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E">
+<script>
+// Apply the theme before first paint to avoid a flash. Stored preference wins;
+// otherwise follow the OS.
+(function () {
+  var t = null;
+  try { t = localStorage.getItem("image-reader-theme"); } catch (_) {}
+  if (t !== "light" && t !== "dark")
+    t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+<style>
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --bg-2: #f7f7f8; --bg-menu: #ffffff;
+    --text: #0d0d0d; --text-2: #5d5d5d; --text-3: #8f8f8f;
+    --border: rgba(0,0,0,.10); --border-soft: rgba(0,0,0,.06);
+    --hover: rgba(0,0,0,.05); --active: rgba(0,0,0,.08);
+    --btn: #0d0d0d; --btn-fg: #ffffff;
+    --code-bg: #f7f7f8;
+    --ok: #0a8a55; --warn: #b45309; --err: #b91c1c;
+    --shadow: 0 4px 24px rgba(0,0,0,.10);
+    --accent: #10a37f;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #212121; --bg-2: #1a1a1a; --bg-menu: #2f2f2f;
+    --text: #ececec; --text-2: #b4b4b4; --text-3: #8b8b8b;
+    --border: rgba(255,255,255,.12); --border-soft: rgba(255,255,255,.07);
+    --hover: rgba(255,255,255,.06); --active: rgba(255,255,255,.10);
+    --btn: #ffffff; --btn-fg: #0d0d0d;
+    --code-bg: #171717;
+    --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    --shadow: 0 8px 32px rgba(0,0,0,.45);
+    --accent: #10a37f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text); min-height: 100dvh;
+    font: 14px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif,
+      "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { background: none; border: 0; cursor: pointer; }
+  button:disabled { cursor: default; }
+  svg { display: block; flex: none; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+  header {
+    position: sticky; top: 0; z-index: 20; background: var(--bg);
+    display: flex; align-items: center; gap: 8px; padding: 10px 16px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 15px; }
+  .brand svg { color: var(--accent); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 11px; border-radius: 999px; font-size: 12.5px;
+    background: var(--hover); color: var(--text-2);
+    max-width: 46vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pill.ok { color: var(--ok); } .pill.err { color: var(--err); } .pill.warn { color: var(--warn); }
+  .spacer { flex: 1; }
+  .icon-btn { padding: 8px; border-radius: 10px; color: var(--text-2); display: flex; }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+
+  .wrap { width: 100%; max-width: 860px; margin: 0 auto; padding: 20px 20px 64px; }
+
+  /* ------------------------------------------------------------- dropzone -- */
+  #drop {
+    border: 1.5px dashed var(--border); border-radius: 16px; background: var(--bg-2);
+    padding: 34px 20px; text-align: center; color: var(--text-2);
+    transition: border-color .15s, background .15s; cursor: pointer;
+  }
+  #drop:hover, #drop.over { border-color: var(--accent); background: var(--hover); }
+  #drop h2 { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+  #drop p { font-size: 13px; }
+  #drop .eye { color: var(--text-3); margin: 0 auto 12px; }
+
+  #strip { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+  .thumb {
+    position: relative; width: 104px; height: 104px; border-radius: 12px; overflow: hidden;
+    border: 1px solid var(--border); background: var(--bg-2);
+  }
+  /* CONTAIN, not cover: this strip is the only place you can check what the
+     model is about to be shown, and a cropped thumbnail hides exactly the
+     detail (an edge, a truncated line) the answer will turn on. */
+  .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; cursor: zoom-in; }
+  .thumb .x {
+    position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%;
+    background: rgba(0,0,0,.6); color: #fff; display: flex; align-items: center;
+    justify-content: center; font-size: 13px; line-height: 1;
+  }
+  .thumb .sz {
+    position: absolute; bottom: 0; left: 0; right: 0; font-size: 10.5px; text-align: center;
+    background: rgba(0,0,0,.55); color: #fff; padding: 2px 0;
+  }
+
+  /* -------------------------------------------------------------- question -- */
+  .qbox {
+    margin-top: 18px; border: 1px solid var(--border); border-radius: 16px;
+    padding: 12px 14px; background: var(--bg);
+  }
+  .qbox:focus-within { border-color: var(--active); box-shadow: 0 2px 12px rgba(0,0,0,.06); }
+  #q {
+    width: 100%; resize: none; border: 0; outline: none; background: transparent;
+    font-size: 15.5px; line-height: 1.5; min-height: 52px; max-height: 220px;
+  }
+  #q::placeholder { color: var(--text-3); }
+  .qrow { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    font-size: 12.5px; padding: 5px 10px; border-radius: 999px;
+    background: var(--hover); color: var(--text-2);
+  }
+  .chip:hover { background: var(--active); color: var(--text); }
+  #ask {
+    margin-left: auto; padding: 9px 18px; border-radius: 999px;
+    background: var(--btn); color: var(--btn-fg); font-weight: 600; font-size: 14px;
+  }
+  #ask:disabled { opacity: .3; }
+  select.sel {
+    background: var(--hover); border: 0; border-radius: 999px; padding: 6px 10px;
+    font-size: 12.5px; color: var(--text-2);
+  }
+
+  /* ---------------------------------------------------------------- answer -- */
+  #out { margin-top: 22px; }
+  .card {
+    border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px;
+    background: var(--bg); margin-bottom: 14px;
+  }
+  .card.err { border-color: var(--err); }
+  .answer { white-space: pre-wrap; word-break: break-word; font-size: 15px; }
+  .answer:empty::after { content: "…"; color: var(--text-3); }
+  .status {
+    display: flex; align-items: center; gap: 9px; color: var(--text-2); font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .spin {
+    width: 12px; height: 12px; border-radius: 50%; flex: none;
+    border: 2px solid var(--border); border-top-color: var(--text-2);
+    animation: rot .8s linear infinite;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .meta {
+    margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border-soft);
+    display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-3);
+  }
+  .meta b { font-weight: 600; color: var(--text-2); }
+  .qtext { font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
+  .qthumbs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .qthumbs img { width: 54px; height: 54px; object-fit: contain; border-radius: 8px; border: 1px solid var(--border); }
+  .copy { font-size: 12px; color: var(--text-3); }
+  .copy:hover { color: var(--text); }
+
+  /* ------------------------------------------------------------------ api -- */
+  details.api { margin-top: 26px; border-top: 1px solid var(--border-soft); padding-top: 16px; }
+  details.api summary { cursor: pointer; font-size: 13px; color: var(--text-2); }
+  details.api summary:hover { color: var(--text); }
+  pre {
+    background: var(--code-bg); border-radius: 12px; padding: 14px; overflow-x: auto;
+    font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 12px;
+    color: var(--text-2);
+  }
+  pre b { color: var(--text); font-weight: 600; }
+  .note { font-size: 12.5px; color: var(--text-3); margin-top: 10px; }
+
+  dialog {
+    border: 1px solid var(--border); border-radius: 16px; background: var(--bg-menu);
+    color: var(--text); padding: 20px; max-width: 380px; width: calc(100% - 32px);
+    box-shadow: var(--shadow);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  dialog { max-width: 620px; margin: auto; }   /* the * reset above kills dialog's own centering */
+  .api-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  dialog h3 { font-size: 15px; }
+  .api-url {
+    display: flex; align-items: center; gap: 8px; background: var(--code-bg);
+    border-radius: 10px; padding: 9px 12px; margin: 10px 0 4px;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all;
+  }
+  .code { margin-top: 12px; border-radius: 12px; overflow: hidden; background: var(--code-bg); }
+  .code-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 7px 12px; font-size: 12px; color: var(--text-3);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .code pre { margin: 0; border-radius: 0; }
+  .cbtn { font-size: 12px; color: var(--text-3); padding: 2px 6px; border-radius: 6px; flex: none; }
+  .cbtn:hover { color: var(--text); background: var(--hover); }
+  .api-fine { font-size: 12.5px; color: var(--text-3); margin-top: 12px; line-height: 1.55; }
+  code.ic { background: var(--hover); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+  dialog p { font-size: 13px; color: var(--text-2); margin-bottom: 14px; }
+  dialog input {
+    width: 100%; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--bg); outline: none; font-size: 14px;
+  }
+  dialog input:focus { border-color: var(--accent); }
+  .drow { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  .drow button { padding: 8px 14px; border-radius: 10px; font-size: 13.5px; }
+  .drow .primary { background: var(--btn); color: var(--btn-fg); font-weight: 600; }
+  .drow .ghost { color: var(--text-2); }
+  .drow .ghost:hover { background: var(--hover); }
+
+  #lightbox {
+    position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.86);
+    display: none; align-items: center; justify-content: center; padding: 24px; cursor: zoom-out;
+  }
+  #lightbox.on { display: flex; }
+  #lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>
+    </svg>
+    image reader
+  </div>
+  <span class="pill" id="modelPill">loading…</span>
+  <div class="spacer"></div>
+  <button class="icon-btn" id="apiBtn" title="API">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/>
+    </svg>
+  </button>
+  <button class="icon-btn" id="themeBtn" title="Theme">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/>
+    </svg>
+  </button>
+</header>
+
+<div class="wrap">
+  <div id="drop">
+    <svg class="eye" width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+      <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.8"/>
+      <path d="M21 15l-5-5-6 6-3-3-4 4"/>
+    </svg>
+    <h2>Drop an image here</h2>
+    <p>or click to choose, or paste from the clipboard</p>
+  </div>
+  <input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple>
+  <div id="strip"></div>
+
+  <div class="qbox">
+    <textarea id="q" rows="2" placeholder="What should it look for? (blank asks for a full description)"></textarea>
+    <div class="qrow">
+      <div class="chips">
+        <button class="chip" data-q="">Describe</button>
+        <button class="chip" data-q="Transcribe every piece of text in this image exactly as it appears, preserving layout where it matters.">Transcribe</button>
+        <button class="chip" data-q="Read the numbers off this chart and list them with their labels.">Read chart</button>
+        <button class="chip" data-q="What error is shown here, and what does it say exactly?">Read error</button>
+        <button class="chip" data-q="Write a one-sentence alt text for this image.">Alt text</button>
+      </div>
+      <select class="sel" id="modelSel" hidden></select>
+      <button id="ask" disabled>Ask</button>
+    </div>
+  </div>
+
+  <div id="out"></div>
+
+</div>
+
+<dialog id="apiDlg">
+  <div class="api-head">
+    <h3>API</h3>
+    <button class="icon-btn" id="apiClose" aria-label="Close">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+    </button>
+  </div>
+  <p>One picture, one question, prose back. Point anything at:</p>
+  <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
+  <div class="code"><div class="code-head"><span>curl</span><button type="button" class="cbtn" id="apiCopyCurl">Copy</button></div><pre id="apiCurl"></pre></div>
+  <p class="api-fine">Also <code class="ic">POST /v1/chat/completions</code> (OpenAI content parts,
+  <code class="ic">stream: true</code>) and <code class="ic">GET /v1/models</code>. Images must be inlined as
+  base64: this component has no outbound network, so a remote URL is refused rather than fetched. If the
+  deployment config sets <code class="ic">api_key</code>, send it as
+  <code class="ic">Authorization: Bearer &lt;key&gt;</code>. This playground needs no credential either way: it
+  talks to this deployment's own open routes.</p>
+</dialog>
+
+<div id="lightbox"><img alt=""></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const el = (t, c) => { const e = document.createElement(t); if (c) e.className = c; return e; };
+
+// ------------------------------------------------------------------- state --
+let images = [];            // { uri, bytes, w, h, name }
+let limits = { max_images: 4, max_image_bytes: 8 << 20 };
+let models = [];
+let busy = false;
+
+const headers = (extra) => Object.assign({ "content-type": "application/json" }, extra || {});
+
+// --------------------------------------------------------------- image prep --
+// Resized in the BROWSER before upload, for three reasons: the model's encoder
+// downsamples anyway (so the extra pixels buy nothing), a phone photo is
+// several MB of upload on someone's tethered connection, and the deployment's
+// max_image_bytes is a real limit that a 12 MP original walks straight into.
+const MAX_EDGE = 1400;
+const MAX_PIXELS = 1150000;   // ~1.15 MP: about what a dynamic-resolution VLM uses
+
+function prepareImage(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(new Error("could not read " + file.name));
+    fr.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error(file.name + " is not an image this browser can read"));
+      img.onload = () => {
+        let { width: w, height: h } = img;
+        let scale = Math.min(1, MAX_EDGE / Math.max(w, h), Math.sqrt(MAX_PIXELS / (w * h)));
+        if (scale >= 1 && file.size <= limits.max_image_bytes) {
+          // already small enough: keep the original bytes rather than
+          // re-encoding, which would only lose detail
+          resolve({ uri: fr.result, bytes: file.size, w, h, name: file.name });
+          return;
+        }
+        w = Math.max(1, Math.round(w * scale));
+        h = Math.max(1, Math.round(h * scale));
+        const c = el("canvas"); c.width = w; c.height = h;
+        const ctx = c.getContext("2d");
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(img, 0, 0, w, h);
+        // PNG for screenshots (flat colour and text stay crisp, and JPEG
+        // artefacts around small glyphs are exactly what breaks a
+        // transcription), JPEG for photographs
+        const png = /\.png$/i.test(file.name) || file.type === "image/png";
+        const uri = png && w * h <= MAX_PIXELS
+          ? c.toDataURL("image/png")
+          : c.toDataURL("image/jpeg", 0.9);
+        resolve({ uri, bytes: Math.round((uri.length - uri.indexOf(",") - 1) * 0.75), w, h, name: file.name });
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+
+async function addFiles(files) {
+  const list = [...files].filter((f) => f && /^image\//.test(f.type));
+  if (!list.length) return;
+  for (const f of list) {
+    if (images.length >= limits.max_images) {
+      flash("this deployment takes at most " + limits.max_images + " images per request", "warn");
+      break;
+    }
+    try {
+      const im = await prepareImage(f);
+      if (im.bytes > limits.max_image_bytes) {
+        flash(f.name + " is still " + kb(im.bytes) + " after resizing; the limit is " + kb(limits.max_image_bytes), "err");
+        continue;
+      }
+      images.push(im);
+    } catch (e) { flash(e.message, "err"); }
+  }
+  renderStrip();
+}
+
+const kb = (b) => (b > 1048576 ? (b / 1048576).toFixed(1) + " MB" : Math.round(b / 1024) + " KB");
+
+function renderStrip() {
+  const strip = $("#strip");
+  strip.textContent = "";
+  images.forEach((im, i) => {
+    const t = el("div", "thumb");
+    const img = el("img"); img.src = im.uri; img.alt = im.name || "attachment";
+    img.onclick = () => { $("#lightbox img").src = im.uri; $("#lightbox").classList.add("on"); };
+    const x = el("button", "x"); x.textContent = "×"; x.title = "Remove";
+    x.onclick = () => { images.splice(i, 1); renderStrip(); };
+    const sz = el("div", "sz"); sz.textContent = im.w + "×" + im.h + " · " + kb(im.bytes);
+    t.append(img, x, sz);
+    strip.append(t);
+  });
+  $("#ask").disabled = busy || images.length === 0;
+}
+
+// ------------------------------------------------------------------ status --
+function flash(msg, kind) {
+  const pill = $("#modelPill");
+  pill.textContent = msg;
+  pill.className = "pill " + (kind || "");
+  clearTimeout(flash.t);
+  flash.t = setTimeout(showModelPill, 6000);
+}
+
+function showModelPill() {
+  const pill = $("#modelPill");
+  const m = models.find((x) => x.enclave && x.enclave.default) || models[0];
+  if (!m) { pill.textContent = "no model attached"; pill.className = "pill err"; return; }
+  const e = m.enclave || {};
+  if (!e.fits) { pill.textContent = m.id + " · does not fit this share"; pill.className = "pill err"; return; }
+  if (!e.vision) { pill.textContent = m.id + " · no projector in the volume"; pill.className = "pill err"; return; }
+  pill.textContent = m.id;
+  pill.className = "pill ok";
+}
+
+// -------------------------------------------------------------------- boot --
+async function boot() {
+  try {
+    // the OPEN catalog route, not /v1/models: a keyed deployment must not
+    // greet its own operator with a credential prompt
+    const r = await fetch("/models", { headers: headers() });
+    const j = await r.json();
+    models = j.data || [];
+    const def = models.find((m) => m.enclave && m.enclave.default) || models[0];
+    if (def && def.enclave) {
+      limits.max_images = def.enclave.max_images || 4;
+      limits.max_image_bytes = 8 << 20;
+    }
+    if (models.length > 1) {
+      const sel = $("#modelSel");
+      sel.hidden = false;
+      models.forEach((m) => {
+        const o = el("option"); o.value = m.id;
+        o.textContent = m.id + ((m.enclave && m.enclave.vision) ? "" : " (no projector)");
+        if (m.enclave && m.enclave.default) o.selected = true;
+        sel.append(o);
+      });
+      }
+    showModelPill();
+    const bad = models.find((m) => m.enclave && (!m.enclave.fits || !m.enclave.vision));
+    if (bad && bad.enclave.why) console.warn(bad.id + ": " + bad.enclave.why);
+  } catch (e) {
+    flash("cannot reach this deployment: " + e.message, "err");
+  }
+}
+
+// ------------------------------------------------------------------- asking --
+async function ask() {
+  if (busy || !images.length) return;
+  busy = true;
+  $("#ask").disabled = true;
+  const question = $("#q").value.trim();
+  const model = $("#modelSel").hidden ? undefined : $("#modelSel").value;
+
+  const card = el("div", "card");
+  const st = el("div", "status");
+  const sp = el("div", "spin");
+  const stTxt = el("span"); stTxt.textContent = "sending…";
+  st.append(sp, stTxt);
+  if (images.length) {
+    const th = el("div", "qthumbs");
+    images.forEach((im) => { const i = el("img"); i.src = im.uri; i.alt = ""; th.append(i); });
+    card.append(th);
+  }
+  if (question) { const q = el("div", "qtext"); q.textContent = question; card.append(q); }
+  const ans = el("div", "answer");
+  card.append(st, ans);
+  $("#out").prepend(card);
+
+  const body = { images: images.map((i) => i.uri) };
+  if (question) body.question = question;
+  if (model) body.model = model;
+
+  try {
+    const r = await fetch("/ask", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    if (r.status === 401) {
+      st.remove(); card.classList.add("err");
+      ans.textContent = "This deployment requires an API key for /v1. Open the API panel to paste it.";
+      return;
+    }
+    if (!r.ok && r.headers.get("content-type") === "application/json") {
+      const j = await r.json();
+      st.remove(); card.classList.add("err");
+      ans.textContent = (j.error && j.error.message) || ("HTTP " + r.status);
+      return;
+    }
+    const rd = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", text = "";
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!line.startsWith("data: ")) continue;
+        let ev; try { ev = JSON.parse(line.slice(6)); } catch (_) { continue; }
+        if (ev.status) stTxt.textContent = ev.status;
+        if (ev.delta) { text += ev.delta; ans.textContent = text; }
+        if (ev.error) { st.remove(); card.classList.add("err"); ans.textContent = ev.error; }
+        if (ev.done) {
+          st.remove();
+          const meta = el("div", "meta");
+          const bit = (label, v) => { const s = el("span"); s.innerHTML = "<b>" + label + "</b> " + v; return s; };
+          meta.append(bit("model", ev.model));
+          meta.append(bit("images", ev.images + " · " + ev.image_tokens + " positions"));
+          meta.append(bit("prompt", ev.prompt_tokens + " tok"));
+          meta.append(bit("answer", ev.tokens + " tok @ " + ev.tok_per_s + "/s"));
+          meta.append(bit("time", (ev.ms / 1000).toFixed(1) + "s (encode+prefill " + (ev.prefill_ms / 1000).toFixed(1) + "s)"));
+          if (ev.finish_reason !== "stop") meta.append(bit("stopped", ev.finish_reason));
+          const cp = el("button", "copy"); cp.textContent = "copy";
+          cp.onclick = () => { navigator.clipboard.writeText(text); cp.textContent = "copied"; setTimeout(() => cp.textContent = "copy", 1200); };
+          meta.append(cp);
+          card.append(meta);
+        }
+      }
+    }
+    if (st.parentNode) st.remove();
+  } catch (e) {
+    st.remove(); card.classList.add("err"); ans.textContent = "request failed: " + e.message;
+  } finally {
+    busy = false;
+    $("#ask").disabled = images.length === 0;
+  }
+}
+
+
+// ------------------------------------------------------------------- api ui --
+// The same panel the sibling apps show: what to call and how. The key field is
+// only meaningful when the DEPLOYMENT sets api_key - the playground itself needs
+// no credential, because /ask is open exactly like llm-chat's /chat. Locking a
+// deployment down is what a PRIVATE deployment is for.
+function openApi() {
+  const base = new URL("v1", location.href).href.replace(/\/$/, "");
+  $("#apiBase").textContent = base;
+  const model = $("#modelSel").hidden ? "" : '\n    "model": "' + $("#modelSel").value + '",';
+  $("#apiCurl").textContent =
+    "curl -sS " + base + "/vision \\\n" +
+    "  -H 'authorization: Bearer $IMAGE_READER_KEY' \\\n" +   // harmless when unset
+    "  -H 'content-type: application/json' \\\n" +
+    "  -d '{" + model + "\n    \"question\": \"What does this say?\",\n" +
+    "    \"image\": \"data:image/png;base64,'\"$(base64 -w0 shot.png)\"'\"\n  }' | jq -r .answer";
+  $("#apiDlg").showModal();
+}
+$("#apiBtn").onclick = openApi;
+$("#apiClose").onclick = () => $("#apiDlg").close();
+const copyTo = (btn, get) => btn.onclick = () => {
+  navigator.clipboard.writeText(get());
+  const t = btn.textContent; btn.textContent = "Copied"; setTimeout(() => btn.textContent = t, 1200);
+};
+copyTo($("#apiCopyBase"), () => $("#apiBase").textContent);
+copyTo($("#apiCopyCurl"), () => $("#apiCurl").textContent);
+
+// ------------------------------------------------------------------ wiring --
+$("#drop").onclick = () => $("#file").click();
+$("#file").onchange = (e) => { addFiles(e.target.files); e.target.value = ""; };
+["dragenter", "dragover"].forEach((ev) => document.addEventListener(ev, (e) => {
+  e.preventDefault(); $("#drop").classList.add("over");
+}));
+["dragleave", "drop"].forEach((ev) => document.addEventListener(ev, (e) => {
+  e.preventDefault();
+  if (ev === "dragleave" && e.relatedTarget) return;
+  $("#drop").classList.remove("over");
+}));
+document.addEventListener("drop", (e) => {
+  if (e.dataTransfer && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+});
+document.addEventListener("paste", (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const files = [...items].filter((i) => i.kind === "file").map((i) => i.getAsFile());
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+$("#ask").onclick = ask;
+$("#q").oninput = () => {
+  const t = $("#q");
+  t.style.height = "auto";
+  t.style.height = Math.min(220, t.scrollHeight) + "px";
+};
+$("#q").onkeydown = (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); ask(); }
+};
+document.querySelectorAll(".chip").forEach((c) => c.onclick = () => {
+  $("#q").value = c.dataset.q;
+  $("#q").dispatchEvent(new Event("input"));
+  $("#q").focus();
+});
+$("#lightbox").onclick = () => $("#lightbox").classList.remove("on");
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("#lightbox").classList.remove("on");
+});
+$("#themeBtn").onclick = () => {
+  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("image-reader-theme", t); } catch (_) {}
+};
+
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+{
+ "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). Everything else overlays the config embedded in the wasm, per field, and the 'models' catalog merges per volume key, so a deployment adds or tweaks one model without restating the rest. Attach volumes by the EXACT names the enclave carries (the console's volume picker lists them); vmmanager matches attach names literally, and the attach name is the catalog key.",
+ "_sizing_comment": "SIZING is the dial that matters and this app prices it honestly: weights + KV cache at the NODE's context window (llama.cpp allocates the whole ENCLAVE_GGML_N_CTX up front, not the app's prompt budget) + THE PROJECTOR + ~1.5 GB working set. The projector is included even though it loads lazily, on the first image the deployment is sent: a share that fits the language model alone would start fine, answer /health fine, and then die on the first picture, and a CUDA OOM inside compute() calls ggml_abort - the whole tenant goes down and no error reaches the guest. Qwen3-VL is DENSE (all 36 layers hold KV, unlike the hybrid qwen3.5/3.6 models with their kv_layers reduction), so at the fleet's 176K q8_0 node window it works out at ~26 GB = gpu 0.19 of a 141 GB H200; at f16 K/V the KV term nearly doubles and the same model wants ~0.28. Do not guess from these numbers: GET /health computes them from the node's own environment and reports `fits` per model with the shortfall spelled out, and the app REFUSES a model it cannot serve rather than attempting it.",
+ "_auth_comment": "SET AN API KEY. The normal caller is another deployment (an llm-chat pointing its 'vision' block here) reaching this one over the fleet's network, which means anything else that can dial an IPv6 address can reach it too, and inference is the expensive kind of open door. Every route except GET / (markup only) and GET /ping requires Authorization: Bearer when api_key is set - the playground included, which is why the page asks for the key in the browser and keeps it in localStorage. Reference the credential as a SECRET BY NAME as below, never as the literal: this file is published on-chain by CID and world-readable. Set the value in the deployment's secrets (console, or set_secrets with {\"set\":{\"IMAGE_READER_API_KEY\":\"<key>\"}}) and restart, because config and secrets are both read at start. If the secret is missing the placeholder stays a literal string and would become a key nobody can guess - which fails closed, not open.",
+ "_vision_comment": "VISION NEEDS A NODE whose llama.cpp toolchain includes libmtmd. On an older node the volume still loads and the deployment REFUSES images with that reason rather than silently ignoring them; GET /health?probe=1 opens a real session and asks the host which kind of node this is, which is the only way to know without sending a picture. A volume with no *mmproj*.gguf beside its weights is reported with vision:false and a why_no_vision line rather than dropped from the listing, because 'attached but cannot see' is a thing an operator needs to be told. NON-CAUSAL MODELS (gemma-style VLMs) decode an image with a non-causal mask and need the whole image inside one physical batch: on such a model the node needs ENCLAVE_GGML_N_UBATCH >= the image's token count, or requests are refused naming that variable. Qwen3-VL is causal and needs none of that.",
+ "volumes": [
+  "qwen3-vl-8b-gguf"
+ ],
+ "api_key": "$IMAGE_READER_API_KEY",
+ "models": {
+  "qwen3-vl-8b-gguf": {
+   "name": "qwen3-vl-8b",
+   "n_layers": 36,
+   "n_kv_heads": 8,
+   "head_dim": 128,
+   "vocab": 151936,
+   "eos": [
+    151645,
+    151643
+   ],
+   "template": "chatml",
+   "max_prompt_tokens": 32768,
+   "default_max_new": 1024,
+   "max_new_cap": 4096,
+   "image_tokens": 1600,
+   "max_images": 4,
+   "temperature": 0.2,
+   "top_p": 0.9,
+   "top_k": 40,
+   "rep_penalty": 1.05,
+   "rep_window": 64,
+   "repeat_guard": 4
+  }
+ }
+}

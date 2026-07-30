@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- Image Reader: a lens over a picture. The counterpart to Image
+       Generator's camera, in the same white-body language: that one makes
+       pixels, this one reads them.
+       The frame carries a #454a72 outline, which is nearly invisible against
+       the dark card it normally sits on but is the only thing keeping a white
+       body from disappearing on a light one. -->
+  <defs>
+    <radialGradient id="glass" cx="34%" cy="28%" r="82%">
+      <stop offset="0%" stop-color="#e0d2fd"/>
+      <stop offset="45%" stop-color="#b57bea"/>
+      <stop offset="100%" stop-color="#5b3f86"/>
+    </radialGradient>
+  </defs>
+
+  <!-- the picture: frame, sun, hills -->
+  <rect x="10" y="17" width="64" height="52" rx="7" fill="#f2f4f8" stroke="#454a72" stroke-width="2"/>
+  <circle cx="27" cy="32" r="5.5" fill="#b57bea"/>
+  <path d="M15 61 L31 42 L43 57 L52 47 L69 61 Z" fill="#454a72"/>
+
+  <!-- the lens, straddling the corner: far enough out that the picture stays
+       legible behind it, close enough to be obviously ON it -->
+  <circle cx="66" cy="63" r="17" fill="#232735"/>
+  <circle cx="66" cy="63" r="12.5" fill="url(#glass)"/>
+  <circle cx="61" cy="58" r="2.8" fill="#f2f4f8" opacity=".9"/>
+  <rect x="76" y="74" width="17" height="9" rx="4.5"
+        transform="rotate(45 76 74)" fill="#232735"/>
+</svg>
