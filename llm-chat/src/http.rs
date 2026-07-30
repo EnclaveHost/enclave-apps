@@ -221,18 +221,25 @@ pub fn egress_err(authority: &str, err: &str) -> String {
     if !is_literal && (err.contains("ConnectionRefused") || err.contains("ConnectionTimeout")) {
         // An Enclave app URL deserves its own answer. The generic "pick a
         // dual-stack provider" advice is useless here - you cannot pick a
-        // different DNS record for your own deployment, and the reflex is to
-        // go looking at the target app, which is fine. Measured 2026-07-29:
-        // *.app.enclave.host resolves A-only (46.62.128.36, no AAAA) while
-        // the apex enclave.host is dual-stack, so app-to-app HTTP over the
-        // public URL cannot connect in either direction.
+        // different DNS record for your own deployment, and the reflex is to go
+        // looking at the target app, which is usually the wrong place.
+        //
+        // The one thing that has to hold for app-to-app to work at all is that
+        // the gateway answers on IPv6, because a deployment's egress is
+        // IPv6-only. Re-measured 2026-07-29: the wildcard *.app.enclave.host
+        // DOES resolve dual-stack (46.62.128.36 and 2a01:4f9:c013:9b52::1, the
+        // same v6 for every name), so this is no longer the flat "impossible"
+        // it was first written as - a refusal now means the gateway is not
+        // accepting v6 for that name, or the target deployment is not running.
         if host.ends_with(".app.enclave.host") {
             return format!(
-                "cannot reach {host} ({err}). That is another Enclave deployment's app URL, \
-                 and *.app.enclave.host publishes an A record only - while this deployment's \
-                 outbound egress is IPv6-ONLY. So one Enclave app cannot call another over \
-                 its public URL, whatever either app does: the gateway needs an AAAA. \
-                 Nothing to fix in the target app - confirm with `dig AAAA {host}`."
+                "cannot reach {host} ({err}). That is another Enclave deployment's app URL, and \
+                 this deployment's outbound egress is IPv6-ONLY, so app-to-app depends on the \
+                 gateway answering over v6 for that name. Check the record with \
+                 `dig AAAA {host}` (the wildcard did publish an AAAA as of 2026-07-29), then \
+                 check the target is up and funded. This deployment's own view of it is one \
+                 request: GET /search?url=https://{host}/ping - which tests the egress path \
+                 without any inference in the way."
             );
         }
         return format!(
@@ -286,7 +293,8 @@ mod tests {
     fn app_to_app_gets_its_own_diagnosis() {
         let m = egress_err("da09d0f2.app.enclave.host", "ErrorCode::ConnectionRefused");
         assert!(m.contains("another Enclave deployment"), "{m}");
-        assert!(m.contains("Nothing to fix in the target app"), "{m}");
+        // it names the probe that answers the question without inference in the way
+        assert!(m.contains("/search?url=https://da09d0f2.app.enclave.host/ping"), "{m}");
         // the generic provider advice would be actively misleading here
         assert!(!m.contains("exa and serpapi"), "{m}");
         // a non-Enclave host still gets the provider advice

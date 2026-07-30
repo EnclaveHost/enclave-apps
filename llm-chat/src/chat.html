@@ -529,6 +529,47 @@
     font: .95em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
 
+  /* ---- the attestation itself. Register values are long hex: they get their
+     own monospace column that wraps rather than a truncation nobody can copy,
+     because a measurement you cannot read against the release page is
+     decoration. Section headings carry the SOURCE of the numbers under them. */
+  .att-body { margin: 12px 0 14px; }
+  .att-sec { margin-bottom: 14px; }
+  .att-sec > h3 {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--text-3); margin-bottom: 7px;
+  }
+  .att-sec > h3 .src { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 11.5px; }
+  .att-rows {
+    display: grid; grid-template-columns: minmax(88px, auto) 1fr; gap: 5px 14px;
+    background: var(--code-bg); border: 1px solid var(--border-soft);
+    border-radius: 10px; padding: 11px 13px;
+  }
+  .att-rows dt { color: var(--text-3); font-size: 12.5px; }
+  .att-rows dd {
+    color: var(--text); overflow-wrap: anywhere;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .att-rows dd.plain { font-family: inherit; font-size: 12.5px; }
+  .att-rows dd .mute { color: var(--text-3); }
+  .att-rows dd.miss { color: var(--text-3); font-style: italic; font-family: inherit; }
+  .att-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .att-chip {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px;
+    border-radius: 999px; font-size: 11.5px; background: var(--hover); color: var(--text-2);
+  }
+  .att-chip.ok { color: var(--ok); }
+  .att-chip.bad { color: var(--warn); }
+  .att-note { color: var(--text-3); font-size: 12px; margin-top: 7px; }
+  .att-body details { margin-top: 8px; }
+  .att-body summary { cursor: pointer; color: var(--text-3); font-size: 12.5px; }
+  .att-body summary:hover { color: var(--text-2); }
+  .att-body details .att-rows { margin-top: 7px; }
+  .att-links { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 2px; }
+  .att-links a { color: var(--accent); font-size: 12.5px; }
+  .att-spin { color: var(--text-3); font-size: 12.5px; }
+
   /* CPU-mode dialog. The outage explains itself in two lines and then gets
      out of the way of the ask: the fleet is short of GPUs and the reader may
      own one. Roomier type than the other dialogs - this one is read cold, by
@@ -597,6 +638,50 @@
   }
   #sendBtn:not(:disabled):active { transform: scale(.92); }
   #sendBtn:disabled { opacity: .25; }
+
+  /* ---- attachments. The composer becomes a column when something is
+     attached: a thumbnail strip on top, the usual row underneath. */
+  #composer.has-att { flex-direction: column; align-items: stretch; padding-left: 10px; }
+  #composer.has-att .crow { display: flex; align-items: flex-end; gap: 8px; }
+  #composer.has-att #input { padding-left: 10px; }
+  .crow { display: contents; }
+  #attStrip { display: none; gap: 8px; flex-wrap: wrap; padding: 4px 4px 8px; }
+  #composer.has-att #attStrip { display: flex; }
+  .att {
+    position: relative; width: 62px; height: 62px; border-radius: 12px;
+    overflow: hidden; background: var(--bubble); border: 1px solid var(--border-soft);
+  }
+  .att img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .att .x {
+    position: absolute; top: 2px; right: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: rgba(0,0,0,.62); color: #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 12px;
+    line-height: 1; opacity: 0; transition: opacity .12s;
+  }
+  .att:hover .x, .att:focus-within .x { opacity: 1; }
+  .att.pending { display: flex; align-items: center; justify-content: center; }
+  #attachBtn {
+    width: 36px; height: 36px; border-radius: 50%; flex: none; display: none;
+    align-items: center; justify-content: center; color: var(--text-2);
+  }
+  #attachBtn.show { display: flex; }
+  #attachBtn:hover { background: var(--hover); color: var(--text); }
+  /* pictures the USER sent, above their bubble */
+  .row.user .att-row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-bottom: 6px; }
+  .row.user .att-row img {
+    max-width: 220px; max-height: 220px; border-radius: 14px; display: block;
+    border: 1px solid var(--border-soft); cursor: zoom-in;
+  }
+  /* full-size view: any thumbnail opens into it, click anywhere to close */
+  #lightbox {
+    position: fixed; inset: 0; z-index: 60; display: none;
+    align-items: center; justify-content: center; padding: 24px;
+    background: rgba(0,0,0,.72); cursor: zoom-out;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
+  /* dropping a file anywhere over the chat */
+  body.dragging #composer { border-color: var(--active); border-style: dashed; }
   .footnote {
     text-align: center; color: var(--text-3); font-size: 11.5px;
     padding: 8px 16px 10px; max-width: 768px; margin: 0 auto;
@@ -795,16 +880,11 @@
         </button>
       </div>
       <div class="att-status" id="attStatus"></div>
-      <p>This app runs inside a hardware TEE, a measured confidential VM. TLS for this origin terminates
-      <em>inside</em> the enclave, and its remote attestation binds that TLS key to a code measurement whose
-      Sigstore provenance traces to the open-source <code class="ic">EnclaveHost/enclave</code> repo. Verified, it
-      proves the code handling your prompts is exactly the published build, and the operator can't see in.</p>
-      <div class="api-url" id="attIdRow"><code id="attId"></code><button type="button" class="cbtn" id="attCopyId">Copy</button></div>
-      <div class="code"><div class="code-head"><span>verify from your machine</span><button type="button" class="cbtn" id="attCopyCmd">Copy</button></div><pre><code id="attCmd"></code></pre></div>
-      <p class="api-fine">The check runs client-side against the pinned repo: hardware quote &rarr; vendor root,
-      Sigstore provenance, measurement match, TLS binding to this origin. Never take the gateway's word for it:
-      only a check your own machine runs means anything.
-      Prompts and replies are processed only inside the enclave; chat history lives only in this browser.</p>
+      <p>This app runs inside a measured confidential VM. The hardware signs a report over its own launch
+      measurement and over the TLS key that terminates <em>inside</em> the enclave. Those are the numbers
+      below, straight out of the quote.</p>
+      <div class="att-body" id="attBody"></div>
+      <p class="api-fine" id="attFine"></p>
     </div>
   </div>
 
@@ -855,17 +935,29 @@
     </div>
   </div>
 
+  <div id="lightbox"><img alt=""></div>
+
   <button id="jump" aria-label="Scroll to bottom">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
   </button>
 
   <div class="composer-outer">
     <form id="composer">
-      <textarea id="input" rows="1" placeholder="Ask anything" autofocus></textarea>
-      <button id="sendBtn" type="submit" aria-label="Send" disabled>
-        <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
-        <svg id="iconStop" width="18" height="18" viewBox="0 0 24 24" style="display:none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
-      </button>
+      <div id="attStrip"></div>
+      <div class="crow">
+        <button id="attachBtn" type="button" aria-label="Attach an image" title="Attach an image">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5l-7.6 7.6a4.5 4.5 0 0 1-6.4-6.4l8-8a3 3 0 0 1 4.3 4.3l-8 8a1.5 1.5 0 0 1-2.2-2.2l7.1-7.1"/></svg>
+        </button>
+        <textarea id="input" rows="1" placeholder="Ask anything" autofocus></textarea>
+        <button id="sendBtn" type="submit" aria-label="Send" disabled>
+          <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          <svg id="iconStop" width="18" height="18" viewBox="0 0 24 24" style="display:none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+        </button>
+      </div>
+      <!-- extensions as well as mime types: Firefox resolves an accept= mime
+           through the SYSTEM mime database, so a machine that does not map
+           image/webp greys the file out in the picker with no explanation -->
+      <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,.png,.jpg,.jpeg,.webp,.gif,.bmp" multiple hidden>
     </form>
     <p class="footnote">Answer quality tracks model size: small models are quick and frequently wrong. Chats stay in this browser.</p>
   </div>
@@ -1066,11 +1158,17 @@ const state = {
   // choose an enclave because the conversation does not leave it; a default
   // that quietly sends questions to a search provider would take that away
   // from exactly the users who came here for it. Reaching outside is opt-in.
-  // Once on, "auto" lets the MODEL decide per turn (the way other chat apps
-  // work) and "always" searches every message.
-  webMode: "off",   // off | auto | always (persisted)
+  // Once on, the MODEL decides per turn (the way other chat apps work).
+  webMode: "off",   // off | auto (persisted; "always" from an older build reads as auto)
   search: { enabled: false }, // what /models reported about this deployment's provider
   image: { enabled: false },  // ...and whether an image service is configured
+  // IMAGES IN (the other direction from `image`): whether any servable model
+  // can READ pictures, and the limits the composer enforces before uploading.
+  // Vision is per MODEL - the attach button follows the selected one - UNLESS
+  // the deployment configured a vision SERVICE (`service`), which reads for
+  // every model and makes the capability model-independent.
+  vision: { enabled: false, service: false, max_images: 0, max_bytes: 0 },
+  attachments: [],  // pending uploads for the next message: {url, w, h, bytes}
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
 const chatId = () => "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -1082,6 +1180,8 @@ const iconSend = $("iconSend"), iconStop = $("iconStop");
 const chatList = $("chatList"), jump = $("jump");
 const modelBtn = $("modelBtn"), modelMenu = $("modelMenu"), modelLabel = $("modelLabel");
 const warmPill = $("warmPill");
+const attachBtn = $("attachBtn"), attStrip = $("attStrip"), fileInput = $("fileInput");
+const lightbox = $("lightbox");
 
 const current = () => state.chats.find((c) => c.id === state.currentId) || null;
 const isMobile = () => matchMedia("(max-width: 768px)").matches;
@@ -1253,21 +1353,54 @@ function renderSidebar() {
   }
 }
 
-function newChat() {
+// ---- the open chat lives in the URL (?c=<id>), so a refresh, a restored tab
+// or a bookmark comes back to the conversation you were in instead of a blank
+// one. The id is an IndexedDB key in THIS browser profile: it addresses a chat
+// locally and is meaningless anywhere else, so this is navigation state, not a
+// share link - the transcript itself never leaves this browser.
+const CHAT_PARAM = "c";
+
+function urlChatId() {
+  try { return new URLSearchParams(location.search).get(CHAT_PARAM); } catch (_) { return null; }
+}
+
+// `push` for navigation the USER performed (picking a chat, starting one), so
+// Back walks between chats the way it does in any URL-addressed view; replace
+// for corrections the app makes on its own behalf (boot, a deleted chat), which
+// should not become history entries you can navigate back into.
+function setUrlChat(id, push) {
+  try {
+    const u = new URL(location.href);
+    if (id) u.searchParams.set(CHAT_PARAM, id);
+    else u.searchParams.delete(CHAT_PARAM);
+    if (u.href === location.href) return;
+    history[push ? "pushState" : "replaceState"]({ chat: id || null }, "", u.href);
+  } catch (_) {}
+}
+
+// `replaceUrl` for a chat the app opened on the user's behalf rather than at
+// their request - the landing chat at boot, or the one that replaces a deleted
+// last chat. Pushing there would leave a Back entry pointing at a URL that
+// resolves to nothing (a stale or just-deleted id).
+function newChat(replaceUrl) {
   // reuse the current chat if it is still pristine, instead of piling up blanks
   const cur = current();
   if (cur && !cur.messages.length && !cur.streaming && !cur.error) { input.focus(); return cur; }
   const chat = { id: chatId(), title: "", messages: [], streaming: null, error: null };
   state.chats.unshift(chat);
   state.currentId = chat.id;
+  setUrlChat(chat.id, !replaceUrl);
   renderSidebar(); renderChat(); updateComposer();
   input.focus();
   return chat;
 }
 
-function switchChat(id) {
+function switchChat(id, fromHistory) {
   if (id === state.currentId) return;
   state.currentId = id;
+  // a switch that CAME from Back/Forward must not push another entry, or the
+  // history grows a duplicate for every step backwards
+  if (!fromHistory) setUrlChat(id, true);
   pinned = true;
   renderSidebar(); renderChat(); updateComposer();
 }
@@ -1278,11 +1411,22 @@ function deleteChat(id) {
   state.chats = state.chats.filter((c) => c.id !== id);
   if (state.currentId === id) {
     state.currentId = state.chats.length ? state.chats[0].id : null;
-    if (!state.currentId) { newChat(); return; }
+    if (!state.currentId) { newChat(true); return; }
+    setUrlChat(state.currentId, false);
     pinned = true;
   }
   renderSidebar(); renderChat(); updateComposer();
 }
+
+// Back/Forward between chats. A target that no longer exists (deleted in
+// another tab, or storage since turned off) leaves the view where it is rather
+// than blanking it, and the URL is corrected to match what is actually shown.
+window.addEventListener("popstate", () => {
+  const want = urlChatId();
+  if (want && state.chats.some((c) => c.id === want)) { switchChat(want, true); return; }
+  if (!want && state.chats.length) { switchChat(state.chats[0].id, true); return; }
+  setUrlChat(state.currentId, false);
+});
 
 $("newChatBtn").addEventListener("click", () => { newChat(); if (isMobile()) setSidebar(false); });
 
@@ -1446,8 +1590,17 @@ function metaLine(meta) {
   if (!meta) return null;
   const span = node('<span class="meta"></span>');
   if (meta.stopped) { span.textContent = "stopped"; return span; }
-  span.textContent = meta.target + " · " + meta.tokens + " tokens · " + meta.tok_per_s + " tok/s";
-  span.title = "load " + meta.load_ms + " ms · prefill " + meta.prefill_ms + " ms · decode " + meta.decode_ms + " ms";
+  span.textContent = meta.target + " · " + meta.tokens + " tokens · " + meta.tok_per_s + " tok/s"
+    // a DELEGATED look is worth a word in the visible line: the answer above
+    // rests on a second model's report, not on this model having seen anything
+    + (meta.vision ? " · saw via " + (meta.vision.model || "vision service") : "");
+  span.title = "load " + meta.load_ms + " ms · prefill " + meta.prefill_ms + " ms · decode " + meta.decode_ms + " ms"
+    // what the pictures cost the context window, straight from the model
+    + (meta.images ? " · " + meta.images + " image" + (meta.images === 1 ? "" : "s")
+        + (meta.image_tokens ? " (" + meta.image_tokens + " positions)" : "") : "")
+    + (meta.vision ? "\nvision: " + meta.vision.images + " image"
+        + (meta.vision.images === 1 ? "" : "s") + " · " + meta.vision.image_tokens
+        + " positions · " + meta.vision.ms + " ms\nasked: " + meta.vision.question : "");
   return span;
 }
 
@@ -1460,7 +1613,24 @@ function renderMessage(m, idx, isTail) {
   if (m.role === "user") {
     const row = node('<div class="row user"><div class="bubble"></div><div class="actions"></div></div>');
     row.dataset.midx = idx;
-    row.querySelector(".bubble").textContent = m.content;
+    const bubble = row.querySelector(".bubble");
+    bubble.textContent = m.content;
+    // pictures above the words, the way they were composed. A turn that was
+    // only a picture shows no empty bubble.
+    if (m.images && m.images.length) {
+      const strip = document.createElement("div");
+      strip.className = "att-row";
+      for (const u of m.images) {
+        if (!/^data:image\/(png|jpeg|webp|gif|bmp);base64,[A-Za-z0-9+/=]+$/.test(u)) continue;
+        const im = document.createElement("img");
+        im.src = u;
+        im.alt = "attached image";
+        im.loading = "lazy";
+        strip.appendChild(im);
+      }
+      if (strip.childNodes.length) row.insertBefore(strip, bubble);
+      if (!m.content) bubble.remove();
+    }
     const acts = row.querySelector(".actions");
     acts.appendChild(
       node('<button class="act" data-copy-msg="' + idx + '" aria-label="Copy" title="Copy">' + ICONS.copy + "</button>"));
@@ -1598,6 +1768,171 @@ log.addEventListener("click", (e) => {
   if (e.target.closest("[data-retry]")) retry();
 });
 
+// ------------------------------------------------------------ attachments --
+// Pictures are resized IN THE BROWSER before they are sent, and that is not
+// only politeness about upload size: every pixel that reaches the deployment
+// costs vision-encoder time on a shared GPU and positions in a KV window that
+// the rest of the conversation also needs. ~1.15 MP is comfortably above what
+// current vision models resolve internally, so this loses nothing the model
+// would have seen.
+const MAX_EDGE = 1400;      // longest side, pixels
+const MAX_PIXELS = 1150000; // and an area cap, so panoramas shrink too
+
+function visionModel() {
+  // a vision SERVICE reads for every model (the app sends the picture to a
+  // sibling deployment and folds the answer in), so the capability stops
+  // depending on which model is selected
+  if (state.vision && state.vision.service) return true;
+  const m = state.models.find((x) => x.name === state.model);
+  // no listing yet (the models fetch is in flight): trust the deployment-wide
+  // flag rather than hiding a control that is about to be valid
+  return m ? !!m.vision : !!(state.vision && state.vision.enabled);
+}
+
+function updateAttachUI() {
+  attachBtn.classList.toggle("show", visionModel() || state.attachments.length > 0);
+  form.classList.toggle("has-att", state.attachments.length > 0);
+  attStrip.innerHTML = "";
+  state.attachments.forEach((a, i) => {
+    const el = node('<div class="att"><img alt=""><button type="button" class="x" aria-label="Remove image">&times;</button></div>');
+    el.querySelector("img").src = a.url;
+    el.querySelector(".x").addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      state.attachments.splice(i, 1);
+      updateAttachUI(); updateComposer();
+    });
+    attStrip.appendChild(el);
+  });
+}
+
+/// Read one file, downscale it, and return a data: URI. PNG survives as PNG
+/// when it is small enough - screenshots are the common case and JPEG's
+/// ringing around text is exactly what an OCR-ish question cannot afford -
+/// while photographs become JPEG, which is what keeps a phone picture under
+/// the byte cap.
+// A file's type comes from the browser's view of the system mime database and
+// can be blank or plain wrong, so the name gets a say too. The decode attempt
+// below is the real arbiter: anything that draws onto a canvas is a picture.
+const IMG_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i;
+function looksLikeImage(f) {
+  return /^image\//.test(f.type || "") || IMG_EXT.test(f.name || "");
+}
+
+function prepareImage(file) {
+  return new Promise((resolve, reject) => {
+    if (!looksLikeImage(file)) return reject(new Error("not an image"));
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let { width: w, height: h } = img;
+      if (!w || !h) return reject(new Error("empty image"));
+      let scale = Math.min(1, MAX_EDGE / Math.max(w, h));
+      if (w * h * scale * scale > MAX_PIXELS) scale = Math.sqrt(MAX_PIXELS / (w * h));
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const ctx = c.getContext("2d");
+      ctx.imageSmoothingQuality = "high";
+      // a transparent PNG flattened onto white, because the model sees RGB
+      // and unpainted alpha reads as black
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      const cap = (state.vision && state.vision.max_bytes) || 6 * 1024 * 1024;
+      const isPng = file.type === "image/png" || /\.png$/i.test(file.name || "");
+      let out = isPng ? c.toDataURL("image/png") : c.toDataURL("image/jpeg", 0.85);
+      if (bytesOf(out) > cap) out = c.toDataURL("image/jpeg", 0.85);
+      let q = 0.7;
+      while (bytesOf(out) > cap && q >= 0.4) { out = c.toDataURL("image/jpeg", q); q -= 0.15; }
+      if (bytesOf(out) > cap) return reject(new Error("image is too large even after resizing"));
+      resolve({ url: out, w, h, bytes: bytesOf(out) });
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("could not read that image")); };
+    img.src = url;
+  });
+}
+
+// payload bytes behind a base64 data: URI, without decoding it
+function bytesOf(dataUrl) {
+  const i = dataUrl.indexOf(",");
+  if (i < 0) return 0;
+  const b64 = dataUrl.slice(i + 1);
+  const pad = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.floor((b64.length * 3) / 4) - pad;
+}
+
+async function addFiles(files) {
+  const list = [...files].filter(looksLikeImage);
+  if (!list.length) return;
+  if (!visionModel()) {
+    pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot read images"
+      + (state.vision.enabled ? " - pick a vision model from the menu" : ""), 6000);
+    return;
+  }
+  const max = state.vision.max_images || 4;
+  for (const f of list) {
+    if (state.attachments.length >= max) {
+      pill("fail", ICONS.alert, " Up to " + max + " image" + (max === 1 ? "" : "s") + " per message", 5000);
+      break;
+    }
+    try {
+      state.attachments.push(await prepareImage(f));
+      updateAttachUI(); updateComposer();
+    } catch (e) {
+      pill("fail", ICONS.alert, " " + (e.message || "could not attach that image"), 5000);
+    }
+  }
+}
+
+attachBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
+
+// Paste is how a screenshot actually arrives. Only intercept when the
+// clipboard carries an image; pasted text must still paste as text.
+input.addEventListener("paste", (e) => {
+  const items = [...(e.clipboardData ? e.clipboardData.items : [])];
+  const files = items.filter((i) => i.kind === "file" && /^image\//.test(i.type))
+    .map((i) => i.getAsFile()).filter(Boolean);
+  if (!files.length) return;
+  e.preventDefault();
+  addFiles(files);
+});
+
+// Drag and drop anywhere over the page, since the composer is a small target
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => {
+  if (![...(e.dataTransfer ? e.dataTransfer.types : [])].includes("Files")) return;
+  dragDepth++;
+  document.body.classList.add("dragging");
+});
+window.addEventListener("dragleave", () => {
+  if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); }
+});
+window.addEventListener("dragover", (e) => {
+  if ([...(e.dataTransfer ? e.dataTransfer.types : [])].includes("Files")) e.preventDefault();
+});
+window.addEventListener("drop", (e) => {
+  if (!e.dataTransfer || !e.dataTransfer.files.length) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove("dragging");
+  addFiles(e.dataTransfer.files);
+});
+
+// Any thumbnail opens full size
+log.addEventListener("click", (e) => {
+  const img = e.target.closest(".att-row img");
+  if (!img) return;
+  lightbox.querySelector("img").src = img.src;
+  lightbox.classList.add("open");
+});
+lightbox.addEventListener("click", () => {
+  lightbox.classList.remove("open");
+  lightbox.querySelector("img").removeAttribute("src");
+});
+
 // --------------------------------------------------------------- composer --
 function autosize() {
   input.style.height = "auto";
@@ -1616,7 +1951,9 @@ function updateComposer() {
     sendBtn.disabled = true;
     sendBtn.title = "A response is still streaming in another chat";
   } else {
-    sendBtn.disabled = !input.value.trim();
+    // an attached picture is a message on its own: the server asks the model
+    // to describe it when no words came with it
+    sendBtn.disabled = !input.value.trim() && !state.attachments.length;
     sendBtn.title = "Send";
     sendBtn.setAttribute("aria-label", "Send");
   }
@@ -1660,11 +1997,21 @@ document.querySelectorAll(".chip").forEach((chip) => {
 
 function sendCurrent() {
   const text = input.value.trim();
-  if (!text || state.busyChatId) return;
+  const images = state.attachments.map((a) => a.url);
+  if ((!text && !images.length) || state.busyChatId) return;
+  if (images.length && !visionModel()) {
+    pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot read images", 6000);
+    return;
+  }
   const chat = current() || newChat();
   chat.error = null;
-  chat.messages.push({ role: "user", content: text });
-  if (!chat.title) { chat.title = text.slice(0, 64); }
+  chat.messages.push(images.length ? { role: "user", content: text, images } : { role: "user", content: text });
+  state.attachments = [];
+  updateAttachUI();
+  if (!chat.title) {
+    chat.title = text.slice(0, 64) ||
+      (images.length === 1 ? "Image" : images.length + " images");
+  }
   // active chat bubbles to the top of the list, like every chat app
   const i = state.chats.indexOf(chat);
   if (i > 0) { state.chats.splice(i, 1); state.chats.unshift(chat); }
@@ -1680,8 +2027,10 @@ function retry() {
   const chat = current();
   if (!chat || !chat.error || state.busyChatId) return;
   const text = chat.error.text;
+  const images = chat.error.images || [];
   chat.error = null;
-  chat.messages.push({ role: "user", content: text });
+  chat.messages.push(images.length ? { role: "user", content: text, images }
+                                   : { role: "user", content: text });
   persist(chat);
   renderChat();
   run(chat);
@@ -1734,8 +2083,11 @@ function commitEdit(idx, text) {
   text = text.trim();
   if (!chat || !text || state.busyChatId) { renderChat(); return; }
   chat.error = null;
+  // an edit rewords the QUESTION; whatever was attached to it still is
+  const images = (chat.messages[idx] && chat.messages[idx].images) || [];
   chat.messages = chat.messages.slice(0, idx);
-  chat.messages.push({ role: "user", content: text });
+  chat.messages.push(images.length ? { role: "user", content: text, images }
+                                   : { role: "user", content: text });
   if (idx === 0) chat.title = text.slice(0, 64);
   const i = state.chats.indexOf(chat);
   if (i > 0) { state.chats.splice(i, 1); state.chats.unshift(chat); }
@@ -1752,6 +2104,45 @@ function stopGeneration() {
   state.abort.abort(e);
 }
 
+// The messages for one request. Text turns are what they always were; a turn
+// with pictures becomes OpenAI's content-parts array.
+//
+// Only the most recent images are carried. A long chat can accumulate more
+// attachments than the deployment allows in one request, and the alternative
+// to dropping the old ones is a conversation that can never be continued -
+// every further turn would be refused for images the user sent an hour ago.
+// The dropped ones leave a note behind, so the model knows the turn HAD a
+// picture rather than silently reading a question about nothing.
+function buildPayload(chat) {
+  const msgs = chat.messages.filter((m) => m.role === "user" || m.role === "assistant");
+  // fall back to the server's own default rather than 0: if /models never
+  // answered, dropping every picture silently is the worse failure
+  const cap = (state.vision && state.vision.max_images) || 4;
+  let budget = cap;
+  const keep = new Set();
+  for (let i = msgs.length - 1; i >= 0 && budget > 0; i--) {
+    const n = (msgs[i].images || []).length;
+    if (n && n <= budget) { keep.add(i); budget -= n; }
+  }
+  return msgs.map((m, i) => {
+    const text = m.role === "assistant" ? stripThink(m.content) : m.content;
+    const imgs = m.images || [];
+    if (!imgs.length) return { role: m.role, content: text };
+    if (!keep.has(i)) {
+      const note = imgs.length === 1 ? "[image from an earlier turn, no longer in context]"
+                                     : "[" + imgs.length + " images from an earlier turn, no longer in context]";
+      return { role: m.role, content: text ? note + "\n" + text : note };
+    }
+    return {
+      role: m.role,
+      content: [
+        ...imgs.map((u) => ({ type: "image_url", image_url: { url: u } })),
+        ...(text ? [{ type: "text", text }] : []),
+      ],
+    };
+  });
+}
+
 // ------------------------------------------------------------- generation --
 async function run(chat) {
   state.busyChatId = chat.id;
@@ -1760,8 +2151,12 @@ async function run(chat) {
   state.abort = ctl;
   renderSidebar(); renderChat(); updateComposer();
 
-  const asked = chat.messages[chat.messages.length - 1].content;
-  let reply = "", meta = null, sawDone = false, sources = null, genImage = null;
+  const askedMsg = chat.messages[chat.messages.length - 1];
+  const asked = askedMsg.content;
+  // held so a stop (or an error) can hand the question BACK complete: losing
+  // the pictures on the way out would mean re-attaching them by hand
+  const askedImages = askedMsg.images || [];
+  let reply = "", meta = null, sawDone = false, sources = null, genImage = null, visionMeta = null;
 
   // An instance that dies mid-generation leaves the proxied stream OPEN but
   // silent until an upstream idle timeout minutes later - without a watchdog
@@ -1787,9 +2182,7 @@ async function run(chat) {
     armStall();
     // prior assistant turns go back WITHOUT their <think> blocks - the
     // reasoning-model convention (and it keeps the context window for content)
-    const payload = chat.messages
-      .filter((m) => m.role === "user" || m.role === "assistant")
-      .map((m) => ({ role: m.role, content: m.role === "assistant" ? stripThink(m.content) : m.content }));
+    const payload = buildPayload(chat);
     const res = await fetch("chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1797,8 +2190,7 @@ async function run(chat) {
         messages: payload, target: state.target, model: state.model || undefined,
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
         // "auto" = the server asks the model whether this turn needs the web
-        web_search: state.webMode === "off" ? undefined
-                  : state.webMode === "always" ? true : "auto",
+        web_search: state.webMode === "off" ? undefined : "auto",
       }),
       signal: ctl.signal,
     });
@@ -1849,8 +2241,17 @@ async function run(chat) {
             chat.streaming.status = "Read " + sources.length + " source"
               + (sources.length === 1 ? "" : "s") + " from the web…";
             if (chat.id === state.currentId) renderChat();
+          } else if (d.vision) {
+            // the picture went to a sibling vision deployment; say so, and say
+            // WHAT was asked about it - the question was written by this
+            // deployment's model on the user's behalf, so it is theirs to see
+            visionMeta = d.vision;
+            chat.streaming.status = "Asked the vision model: " + (d.vision.question || "")
+              .slice(0, 120);
+            if (chat.id === state.currentId) renderChat();
           } else if (d.done) {
             meta = d;
+            if (visionMeta) meta.vision = visionMeta;
             sawDone = true;
           } else if (d.error) {
             throw new Error(d.error);
@@ -1871,12 +2272,20 @@ async function run(chat) {
       } else {
         // nothing generated yet: hand the question back to the composer
         stripTail();
-        if (chat.id === state.currentId) { input.value = asked; autosize(); }
+        if (chat.id === state.currentId) {
+          input.value = asked;
+          if (askedImages.length && !state.attachments.length) {
+            state.attachments = askedImages.map((u) => ({ url: u }));
+            updateAttachUI();
+          }
+          autosize();
+        }
       }
     } else {
       stripTail();
       chat.error = {
         text: asked,
+        images: askedImages,
         message: "Error: " + ((err && err.message) || String(err)),
         partial: reply,
       };
@@ -1916,34 +2325,332 @@ $("apiCopyBase").addEventListener("click", (e) => copyText($("apiBase").textCont
 $("apiCopyCurl").addEventListener("click", (e) => copyText($("apiCurl").textContent, e.currentTarget));
 
 // ------------------------------------------------------ attestation dialog --
-// The deployment id prefix is derived from the page's own enclave origin
-// (https://<first-8-hex-of-id>.app.enclave.host). Served from anywhere else
-// (a proxy, local dev) the id can't be known here, so the dialog says so
-// honestly instead of inventing one.
+// What the hardware SAYS, rather than how to install a tool that would ask it.
+// Two sources, each labelled with which one a row came from:
+//
+//   GET /attestation  - this deployment relays the platform's record for its own
+//     id. It cannot know that id any other way (the guest environment carries
+//     no deployment id), so it derives the label from the Host it was asked on.
+//   the enclave's own /.well-known/tinfoil-attestation - re-fetched HERE, by
+//     this browser, over its own TLS connection. That endpoint reflects the
+//     requesting origin, so the fetch is permitted, and it is the only copy of
+//     the quote whose delivery this app had no hand in. Preferred when it
+//     arrives; the relayed copy is the fallback.
+//
+// The quote is therefore parsed in the page, not server-side: one parser over
+// whichever copy showed up, and the dialog states which. What is NOT claimed
+// anywhere here is verification - the signature chain to AMD's root and the
+// measurement's Sigstore provenance need a verifier the reader runs, and the
+// links at the bottom go to one.
 const attOverlay = $("attOverlay");
-function openAtt() {
-  const m = location.hostname.match(/^([0-9a-f]{8,})\.app\.enclave\.host$/i);
-  const id = m ? "0x" + m[1].toLowerCase() : "<deployment-id>";
+let attLoaded = null;   // cached across opens; the registers do not change
+
+const b64Bytes = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+const hexOf = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+// The Tinfoil document wraps the raw report as gzip+base64.
+async function radReport(doc) {
+  const raw = b64Bytes(doc.body);
+  if (raw[0] !== 0x1f || raw[1] !== 0x8b) return raw;          // not gzipped
+  const ds = new DecompressionStream("gzip");
+  const buf = await new Response(new Blob([raw]).stream().pipeThrough(ds)).arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+// AMD SEV-SNP ATTESTATION_REPORT, fixed offsets (little-endian scalars). Only
+// the fields a reader can act on: a measurement to compare, the TLS binding, and
+// the policy/TCB that say what the VM was allowed to be.
+function parseSnp(r) {
+  if (!r || r.length < 0x2a0) return null;
+  const v = new DataView(r.buffer, r.byteOffset, r.byteLength);
+  const at = (o, n) => hexOf(r.subarray(o, o + n));
+  const u32 = (o) => v.getUint32(o, true);
+  // TCB_VERSION: bootloader, tee, 4 reserved, snp, microcode
+  const tcb = (o) => ({ boot: r[o], tee: r[o + 1], snp: r[o + 6], ucode: r[o + 7] });
+  const policy = v.getBigUint64(0x008, true);
+  const plat = v.getBigUint64(0x040, true);
+  const bit = (x, i) => (x >> BigInt(i)) & 1n ? true : false;
+  return {
+    version: u32(0x000),
+    guestSvn: u32(0x004),
+    policy: {
+      hex: "0x" + policy.toString(16),
+      smt: bit(policy, 16), migrateMa: bit(policy, 18),
+      debug: bit(policy, 19), singleSocket: bit(policy, 20),
+    },
+    vmpl: u32(0x030),
+    sigAlgo: u32(0x034),
+    currentTcb: tcb(0x038),
+    platform: {
+      hex: "0x" + plat.toString(16),
+      smtEnabled: bit(plat, 0), tsme: bit(plat, 1), ecc: bit(plat, 2),
+      ciphertextHiding: bit(plat, 4),
+    },
+    reportData: at(0x050, 64),
+    measurement: at(0x090, 48),
+    hostData: at(0x0c0, 32),
+    idKeyDigest: at(0x0e0, 48),
+    authorKeyDigest: at(0x110, 48),
+    reportId: at(0x140, 32),
+    reportedTcb: tcb(0x180),
+    chipId: at(0x1a0, 64),
+    // CURRENT_BUILD/MINOR/MAJOR sit at 0x1e8..0x1ea, COMMITTED_* right after,
+    // and LAUNCH_TCB at 0x1f0 - NOT 0x1f8, which is the reserved block and
+    // reads as a TCB of all zeros if you land there.
+    build: `${r[0x1ea]}.${r[0x1e9]}.${r[0x1e8]}`,
+    launchTcb: tcb(0x1f0),
+    committedTcb: tcb(0x1e0),
+    signatureBytes: r.length - 0x2a0,
+  };
+}
+
+const SIG_ALGO = { 0: "none", 1: "ECDSA P-384 with SHA-384" };
+const TEE_NAME = { "amd-sev-snp": "AMD SEV-SNP", "intel-tdx": "Intel TDX", "nvidia-cc": "NVIDIA confidential computing" };
+const tcbStr = (t) => t ? `bootloader ${t.boot} · tee ${t.tee} · snp ${t.snp} · microcode ${t.ucode}` : null;
+
+function attSection(title, source, rows, extra) {
+  const sec = document.createElement("div");
+  sec.className = "att-sec";
+  if (title || source) {
+    const h = document.createElement("h3");
+    h.textContent = title;
+    if (source) {
+      const s = document.createElement("span");
+      s.className = "src";
+      s.textContent = source;
+      h.appendChild(s);
+    }
+    sec.appendChild(h);
+  }
+  const dl = document.createElement("dl");
+  dl.className = "att-rows";
+  let any = false;
+  for (const [k, val, cls] of rows) {
+    if (val === null || val === undefined || val === "") continue;
+    any = true;
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    if (cls) dd.className = cls;
+    if (val instanceof Node) dd.appendChild(val); else dd.textContent = val;
+    dl.append(dt, dd);
+  }
+  if (any) sec.appendChild(dl);
+  if (extra) sec.appendChild(extra);
+  return sec;
+}
+
+// Chips for the bits, because "debug disabled" is a state a reader can judge
+// and 0x30000 is not. Each item is [text, tone]: the text says which way the bit
+// went, the tone is only set where one way is actually worse than the other.
+function attChips(items) {
+  const wrap = document.createElement("div");
+  wrap.className = "att-chips";
+  for (const [text, tone] of items) {
+    const c = document.createElement("span");
+    c.className = "att-chip" + (tone ? " " + tone : "");
+    c.textContent = text;
+    wrap.appendChild(c);
+  }
+  return wrap;
+}
+
+function attNote(text) {
+  const p = document.createElement("p");
+  p.className = "att-note";
+  p.textContent = text;
+  return p;
+}
+
+function renderAtt(d, snp, quoteFrom) {
+  const body = $("attBody");
+  body.innerHTML = "";
+  const dep = d.deployment || {}, vm = d.vm || {}, gpu = d.gpu || {};
+
+  // --- the CPU quote, which is the attestation proper
+  const tls = (d.tlsKeyFingerprint || "").replace(/^sha256:/, "");
+  const p = snp && snp.policy, pf = snp && snp.platform;
+  const rows = [
+    ["hardware", TEE_NAME[vm.technology] || vm.technology || "unknown", "plain"],
+    ["measurement", snp ? snp.measurement : vm.measurement],
+    ["TLS key", snp ? snp.reportData.slice(0, 64) : tls],
+    ["report data 32:64", snp ? snp.reportData.slice(64) : (vm.reportData || "").slice(64)],
+    ["policy", p ? p.hex : null],
+    ["", p ? attChips([
+      [p.debug ? "debug enabled" : "debug disabled", p.debug ? "bad" : "ok"],
+      [p.migrateMa ? "migration agent allowed" : "no migration agent", p.migrateMa ? "bad" : "ok"],
+      [p.smt ? "SMT allowed" : "SMT not allowed", ""],
+      [p.singleSocket ? "single socket" : "multi socket", ""],
+    ]) : null],
+    ["platform", pf ? attChips([
+      [pf.smtEnabled ? "SMT on" : "SMT off", ""],
+      [pf.tsme ? "TSME on" : "TSME off", ""],
+      [pf.ecc ? "ECC on" : "ECC off", ""],
+      [pf.ciphertextHiding ? "ciphertext hiding on" : "ciphertext hiding off", ""],
+    ]) : null],
+    ["TCB", snp ? tcbStr(snp.currentTcb) : null, "plain"],
+    ["firmware", snp ? "build " + snp.build + " · VMPL " + snp.vmpl + " · " +
+      (SIG_ALGO[snp.sigAlgo] || "algo " + snp.sigAlgo) : null, "plain"],
+    ["signature", snp ? snp.signatureBytes + " bytes, signed by the AMD-rooted VCEK" : null, "plain"],
+  ];
+  const under = document.createElement("div");
+  // Which key the quote actually binds. Worth spelling out: this origin's
+  // certificate is a DIFFERENT in-enclave key, so a reader comparing the
+  // fingerprint in their address bar to the one above would find a mismatch and
+  // reasonably conclude the worst.
+  if (snp) under.appendChild(attNote(
+    "The quote binds the TLS key of the enclave's own attestation endpoint, linked at the bottom. Your " +
+    "connection to this origin terminates on a separate certificate issued inside the same CVM, so its " +
+    "fingerprint differs by design - compare the key above at that endpoint, not in this tab."));
+  const raw = snp ? document.createElement("details") : null;
+  if (raw) {
+    raw.innerHTML = "<summary>every other register</summary>";
+    raw.appendChild(attSection("", "", [
+      ["chip id", snp.chipId],
+      ["report id", snp.reportId],
+      ["host data", snp.hostData],
+      ["id key digest", snp.idKeyDigest],
+      ["author key", snp.authorKeyDigest],
+      ["reported TCB", tcbStr(snp.reportedTcb), "plain"],
+      ["committed TCB", tcbStr(snp.committedTcb), "plain"],
+      ["launch TCB", tcbStr(snp.launchTcb), "plain"],
+      ["guest SVN", String(snp.guestSvn), "plain"],
+      ["quote version", String(snp.version), "plain"],
+    ]));
+    under.appendChild(raw);
+  }
+  body.appendChild(attSection("CPU quote", quoteFrom, rows, under));
+
+  // --- the GPU, which is a separate trust domain with its own report
+  if (gpu.technology) {
+    const g = attSection("GPU", "reported by the platform API", [
+      ["mode", (TEE_NAME[gpu.technology] || gpu.technology) +
+        (gpu.ccMode ? ", CC mode " + gpu.ccMode : ""), "plain"],
+      ["card", [gpu.uuid, gpu.vbiosVersion && "vBIOS " + gpu.vbiosVersion].filter(Boolean).join(" · "), "plain"],
+      ["driver", gpu.driverVersion, "plain"],
+      ["nonce", gpu.nonce],
+      ["share", gpu.gpuShare != null ? Math.round(gpu.gpuShare * 100) + "% of the card" +
+        (gpu.vramCapGb ? ", " + gpu.vramCapGb + " GB VRAM cap" : "") : null, "plain"],
+      ["report", gpu.reportBytes ? gpu.reportBytes + " bytes + " + gpu.certChainBytes +
+        " bytes of certificate chain, held by the platform" : null, "plain"],
+    ], gpu.verify ? attNote(gpu.verify) : null);
+    body.appendChild(g);
+  }
+
+  // --- what is running, and the enclave's own diagnostic run of the checks
+  const sc = d.selfCheck;
+  let scExtra = null;
+  if (sc && sc.steps) {
+    scExtra = document.createElement("div");
+    scExtra.appendChild(attChips(Object.entries(sc.steps).map(([k, v]) => [k, v === "pass", true])));
+    scExtra.appendChild(attNote(sc.note || ""));
+  }
+  body.appendChild(attSection("This deployment", "public ledger + the enclave's self-check", [
+    ["deployment", dep.id],
+    ["enclave", [dep.enclave, dep.status].filter(Boolean).join(" · "), "plain"],
+    ["image", dep.image],
+    ["release", sc && sc.release],
+    ["coverage", d.app && d.app.coverage, "plain"],
+  ], scExtra));
+
+  // --- how to stop taking any of the above on faith
+  const fine = $("attFine");
+  fine.innerHTML = "";
+  fine.append(document.createTextNode(
+    "Nothing above is a verification: the quote's signature chain to AMD's root, and the measurement's " +
+    "Sigstore provenance against the pinned source repo, are checked by a verifier YOU run. "));
+  const links = document.createElement("span");
+  links.className = "att-links";
+  const link = (href, text) => {
+    const a = document.createElement("a");
+    a.href = href; a.textContent = text; a.target = "_blank"; a.rel = "noopener noreferrer";
+    return a;
+  };
+  const src = d.source || {};
+  if (src.browserVerifier) links.appendChild(link(src.browserVerifier, "Verify in your browser"));
+  if (src.endpoint) links.appendChild(link(src.endpoint, "Signed attestation document"));
+  if (src.repo) links.appendChild(link("https://github.com/" + src.repo + "/releases", src.repo + " releases"));
+  fine.appendChild(links);
+  fine.append(document.createTextNode(
+    " Prompts and replies are processed only inside the enclave; chat history lives only in this browser."));
+}
+
+function attStatusLine(cls, text) {
   const status = $("attStatus");
-  status.className = "att-status " + (m ? "ok" : "warn");
-  status.innerHTML = (m ? ICONS.check : ICONS.alert) + "<span></span>";
-  status.querySelector("span").textContent = m
-    ? "Served from an enclave origin: deployment " + id
-    : "Not an *.app.enclave.host origin (proxy or local dev), so the deployment id can't be derived here; use the id of the deployment you actually target.";
-  $("attIdRow").style.display = m ? "" : "none";
-  $("attId").textContent = id;
-  $("attCmd").textContent =
-    "curl -fsSL https://get.enclave.host | sh   # install the CLI once\n" +
-    "enclave attest " + id;
+  status.className = "att-status " + cls;
+  status.innerHTML = (cls === "ok" ? ICONS.check : ICONS.alert) + "<span></span>";
+  status.querySelector("span").textContent = text;
+}
+
+async function loadAtt() {
+  const r = await fetch("attestation", { headers: { accept: "application/json" } });
+  const d = await r.json().catch(() => null);
+  if (!r.ok) throw new Error((d && d.error && d.error.message) || "HTTP " + r.status);
+  // Prefer the copy this browser fetches for itself. A failure here is
+  // uninteresting (offline, a CORS change, an enclave behind a tunnel), so it
+  // falls back quietly to the relayed quote and says so in the heading.
+  let snp = null, from = "relayed by this deployment";
+  const ep = d.source && d.source.endpoint;
+  if (ep) {
+    try {
+      const doc = await (await fetch(ep, { mode: "cors" })).json();
+      snp = parseSnp(await radReport(doc));
+      if (snp) from = "fetched by your browser from " + new URL(ep).host;
+    } catch (e) { snp = null; }
+  }
+  if (!snp && d.vm && d.vm.quote) snp = parseSnp(b64Bytes(d.vm.quote));
+  return { d, snp, from };
+}
+
+async function openAtt() {
   attOverlay.classList.add("open");
   $("attClose").focus();
+  if (attLoaded) return renderAtt(attLoaded.d, attLoaded.snp, attLoaded.from);
+  const m = location.hostname.match(/^([0-9a-f]{8,})\.app\.enclave\.host$/i);
+  attStatusLine(m ? "ok" : "warn", m
+    ? "Reading the hardware report for deployment 0x" + m[1].toLowerCase() + "…"
+    : "Not an *.app.enclave.host origin (proxy or local dev): asking this deployment what it is…");
+  $("attBody").innerHTML = '<p class="att-spin">Fetching the quote…</p>';
+  try {
+    attLoaded = await loadAtt();
+    const { d, snp } = attLoaded;
+    const tls = (d.tlsKeyFingerprint || "").replace(/^sha256:/, "");
+    // Three separate claims, and only the ones the bytes support get made: a
+    // quote was parsed, its policy forbids debug, and its report data matches
+    // the endpoint key the platform reports.
+    if (!snp) {
+      attStatusLine("warn", "The platform answered, but no hardware quote could be parsed from it - " +
+        "read the fields below as the platform's claims, not as hardware's");
+    } else if (snp.policy.debug) {
+      attStatusLine("warn", "This VM's guest policy ALLOWS debug, which lets the host inspect it. " +
+        "Do not send anything sensitive to this deployment.");
+    } else if (snp.reportData.slice(0, 64) !== tls) {
+      attStatusLine("warn", "The quote's report data does not match the TLS key the platform reports " +
+        "for this enclave - verify independently before trusting this deployment");
+    } else {
+      attStatusLine("ok", "Hardware quote parsed: debug disabled, and its report data matches the " +
+        "enclave TLS key the platform reports");
+    }
+    renderAtt(d, snp, attLoaded.from);
+  } catch (e) {
+    attStatusLine("warn", "This deployment could not reach its own attestation: " + (e.message || e));
+    $("attBody").innerHTML = "";
+    $("attBody").appendChild(attNote(
+      "The hardware report is fetched from the platform API over this deployment's egress leg. A deployment " +
+      "with no outbound leg, or an API that is briefly unreachable, leaves this empty - the enclave is not " +
+      "less attested for it, the numbers are just not readable from in here. Verify from outside instead."));
+    const fine = $("attFine");
+    fine.textContent = "";
+    const a = document.createElement("a");
+    a.href = "https://enclave.host/#attest"; a.target = "_blank"; a.rel = "noopener noreferrer";
+    a.textContent = "Verify this enclave in your browser";
+    fine.appendChild(a);
+  }
 }
 function closeAtt() { attOverlay.classList.remove("open"); }
 $("attBtn").addEventListener("click", openAtt);
 $("attClose").addEventListener("click", closeAtt);
 attOverlay.addEventListener("click", (e) => { if (e.target === attOverlay) closeAtt(); });
-$("attCopyId").addEventListener("click", (e) => copyText($("attId").textContent, e.currentTarget));
-$("attCopyCmd").addEventListener("click", (e) => copyText($("attCmd").textContent, e.currentTarget));
 
 // --------------------------------------------------------- CPU-mode notice --
 // The free tier follows fleet capacity: when no GPU enclave has a share free,
@@ -2010,9 +2717,12 @@ function renderModelMenu() {
       item.querySelector(".m-sub").textContent = state.gpu === false
         ? "needs a GPU enclave" : "needs a larger deployment";
     } else {
+      // "vision" earns its place in the one-line summary: it is the difference
+      // between a model you can show something to and one you cannot, and the
+      // attach button appearing and disappearing is otherwise unexplained
       item.querySelector(".m-sub").textContent = m.sub !== undefined
         ? m.sub
-        : [fmtBytes(m.bytes), m.backend].filter(Boolean).join(" · ");
+        : [fmtBytes(m.bytes), m.backend, m.vision ? "vision" : null].filter(Boolean).join(" · ");
     }
     if ((m.name || "") === state.model) item.classList.add("sel");
     item.addEventListener("click", () => {
@@ -2022,6 +2732,14 @@ function renderModelMenu() {
       modelLabel.textContent = m.label || m.name || "deployment default";
       renderModelMenu();
       closeModelMenu();
+      // switching to a text-only model with pictures waiting: say so now
+      // rather than at send time, but KEEP them - switching back is one click
+      if (state.attachments.length && !visionModel()) {
+        pill("fail", ICONS.alert,
+          " " + (state.model || "That model") + " cannot read images - your attachment is still here", 6000);
+      }
+      updateAttachUI();
+      updateComposer();
       if (state.model !== was) warm();
     });
     modelMenu.appendChild(item);
@@ -2084,24 +2802,24 @@ function renderModelMenu() {
     const what = hasS && hasI ? "search the web or generate an image"
                : hasI ? "generate an image" : "search the web";
     const wseg = node('<div class="seg-row"><span>' + label + '</span><div class="seg"></div></div>');
-    const TITLES = {
-      auto: "the model decides per message whether to " + what,
-      always: hasS
-        ? "search on every message - a research mode, and a provider round trip per turn"
-        : "treat every message as an image request",
-      off: "never " + what + "; answer from the model alone, nothing leaves the enclave",
-    };
-    // "off" first: it is the default and the privacy-preserving end of the
-    // scale, so the switch reads left-to-right as increasing exposure
-    for (const t of ["off", "auto", "always"]) {
+    // On/off, the same shape as Thinking. ON means the MODEL decides per
+    // message whether the turn needs it, which is what people expect from a
+    // chat app and what makes the control worth leaving on. There is no
+    // "every message" setting: it spent a provider round trip (or an image
+    // generation) on "thanks, that helps", and once the router decides well
+    // the only thing it added was a way to get that wrong. API clients that
+    // really want it can still send web_search: true.
+    for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");
       b.textContent = t;
-      if (state.webMode === t) b.classList.add("on");
-      b.title = TITLES[t];
+      if ((state.webMode === "off" ? "off" : "on") === t) b.classList.add("on");
+      b.title = t === "on"
+        ? "the model decides per message whether to " + what
+        : "never " + what + "; answer from the model alone, nothing leaves the enclave";
       b.addEventListener("click", (e) => {
         e.stopPropagation();
-        state.webMode = t;
-        pref("llmchat-web", t);
+        state.webMode = t === "on" ? "auto" : "off";
+        pref("llmchat-web", state.webMode);
         wseg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
       });
       wseg.querySelector(".seg").appendChild(b);
@@ -2127,7 +2845,10 @@ const modelsReady = (async () => {
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
   if (storedThink === "off") state.think = false;
-  if (["auto", "always", "off"].includes(storedWeb)) state.webMode = storedWeb;
+  // "always" is gone from the control; a browser that stored it gets the
+  // nearest surviving setting rather than a mode with no button to turn it off
+  if (storedWeb === "always") storedWeb = "auto";
+  if (["auto", "off"].includes(storedWeb)) state.webMode = storedWeb;
   let models = [], info = {};
   try {
     const res = await fetch("models");
@@ -2142,6 +2863,7 @@ const modelsReady = (async () => {
   state.gpu = info.gpu === true ? true : info.gpu === false ? false : null;
   state.search = info.search || { enabled: false };
   state.image = info.image || { enabled: false };
+  state.vision = info.vision || { enabled: false, service: false, max_images: 0, max_bytes: 0 };
   // no provider AND no image service: the switch governs nothing
   if (!state.search.enabled && !state.image.enabled) state.webMode = "off";
   if (state.gpu === false) {
@@ -2154,6 +2876,7 @@ const modelsReady = (async () => {
   state.model = def ? def.name : "";
   modelLabel.textContent = def ? def.name : "deployment default";
   renderModelMenu();
+  updateAttachUI();
 })();
 
 // ----------------------------------------------------------------- warmup --
@@ -2410,11 +3133,14 @@ async function warmLadder() {
 }
 
 // ------------------------------------------------------------------- boot --
-// With storage on: restore saved chats (newest first), then land on a fresh
-// empty chat. If the user starts typing before IndexedDB opens (rare), their
-// chat wins - saved ones just slot in behind it. With storage off: sweep any
-// leftovers (from a session that opted in earlier, or a build that predates
-// the opt-in) so "off" reliably means nothing on disk.
+// With storage on: restore saved chats (newest first), then land on whichever
+// one the URL names - that is what makes a refresh resume the conversation
+// instead of opening a blank one. If the user starts typing before IndexedDB
+// opens (rare), their chat wins and the URL follows it; saved ones just slot in
+// behind. With storage off: sweep any leftovers (from a session that opted in
+// earlier, or a build that predates the opt-in) so "off" reliably means nothing
+// on disk - and then the URL cannot name a chat that survived, which is exactly
+// what the stale-param path below handles.
 (async () => {
   if (storeOK) {
     await openDb();
@@ -2428,8 +3154,18 @@ async function warmLadder() {
   } else {
     wipeStorage();
   }
-  if (current()) renderSidebar();
-  else newChat();
+  const want = urlChatId();
+  if (!current() && want && state.chats.some((c) => c.id === want)) state.currentId = want;
+  if (current()) {
+    // includes the "already typing" case: correct the URL to whatever is open
+    setUrlChat(state.currentId, false);
+    renderSidebar(); renderChat(); updateComposer();
+  } else {
+    // no such chat (deleted, another browser profile, or storage off): the new
+    // chat takes over the URL in place, so the stale id is gone and a refresh
+    // from here resumes what the user is about to type
+    newChat(true);
+  }
 })();
 if (!isMobile()) document.body.classList.remove("collapsed");
 (async () => { await modelsReady; warmLadder(); })();

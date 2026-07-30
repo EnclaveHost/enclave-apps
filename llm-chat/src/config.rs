@@ -170,6 +170,55 @@ pub struct AppConfig {
     /// same router that decides about web search decides about images.
     #[serde(default)]
     pub image: Option<crate::image::ImageConfig>,
+    /// VISION BY DELEGATION: absent (the default) means an attached image is
+    /// read by the SERVING model itself, which needs a model whose volume
+    /// carries a projector (`vision` below). Present points at a sibling
+    /// vision deployment - normally the `image-reader` app - and then an image
+    /// turn is handled by asking THAT deployment a question this app's own
+    /// model writes, and folding its answer into the prompt.
+    ///
+    /// Which is right depends on the deployment: reading the picture locally is
+    /// one model and no round trip, but it requires the serving model to be a
+    /// VLM. Delegating lets the chat model be the biggest thing the share can
+    /// hold and keeps the eyes on their own share, their own funding rate and
+    /// their own restart button. See vision.rs for what crosses.
+    #[serde(default)]
+    pub vision_service: Option<crate::vision::VisionConfig>,
+    /// VISION (images IN, the opposite direction from `image` above): this
+    /// model volume carries a vision projector (an *mmproj*.gguf beside the
+    /// weights) and the model was trained to read pictures. A per-model
+    /// catalog flag rather than something probed, because /models is answered
+    /// without opening an inference session and the playground has to know
+    /// whether to offer the attach button before any request happens. The
+    /// HOST is still the authority at request time: a deployment whose node
+    /// predates the vision toolchain reports no vision through `caps` and the
+    /// turn fails with that reason rather than silently ignoring the picture.
+    ///
+    /// ggml only. The onnx path shuttles KV through guest memory and has no
+    /// image verb at all.
+    #[serde(default)]
+    pub vision: bool,
+    /// how many prompt tokens ONE image is BUDGETED at when deciding whether
+    /// a conversation still fits max_prompt_tokens. Only the host knows the
+    /// true cost (a dynamic-resolution model prices an image by its grid, and
+    /// M-RoPE positions differ from token counts again), so this is a
+    /// deliberate over-estimate used for admission control; the real figure
+    /// comes back from the host per image and is reported in the stats.
+    /// Keep it at or above the node's ENCLAVE_GGML_IMAGE_MAX_TOKENS.
+    #[serde(default = "default_image_tokens")]
+    pub image_tokens: usize,
+    /// hard cap on ONE attached image, bytes (after the browser's downscale).
+    /// A phone photo is 3-8 MB; the playground resizes to ~1.2 MP before
+    /// upload, which lands under 1 MB, so this is the guard against a client
+    /// that does not.
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: usize,
+    /// how many images one REQUEST may carry, across all its turns. Each one
+    /// costs image_tokens of the window and a vision-encoder pass, so a long
+    /// chat that replays ten pictures is a very different request from the one
+    /// the user thinks they are sending.
+    #[serde(default = "default_max_images")]
+    pub max_images: usize,
 }
 
 fn default_temperature() -> f32 {
@@ -194,6 +243,18 @@ fn default_draft_p_min() -> f32 {
 
 fn default_backend() -> String {
     "onnx".into()
+}
+
+fn default_image_tokens() -> usize {
+    1024
+}
+
+fn default_max_image_bytes() -> usize {
+    6 * 1024 * 1024
+}
+
+fn default_max_images() -> usize {
+    4
 }
 
 /// The merged config JSON - embedded defaults overlaid with ENCLAVE_CONFIG
@@ -270,6 +331,15 @@ fn merge(mut base: serde_json::Value, over: serde_json::Value) -> serde_json::Va
     }
     base
 }
+
+/// Where an image sits inside a message's text. The template renders the
+/// conversation as ONE string, so an attachment leaves this mark behind and
+/// the prompt is split on it afterwards into (text, image, text) runs; the
+/// text runs tokenize normally and the image goes to the host as file bytes.
+/// A private-use codepoint pair: no tokenizer vocabulary contains it, no
+/// keyboard produces it, and build_prompt strips it out of incoming content
+/// so a crafted message cannot forge an image slot it did not attach.
+pub const MEDIA_MARK: &str = "\u{E000}\u{E001}";
 
 /// A rendered prompt plus the strings that should terminate generation for
 /// this template (in addition to the tokenizer-level EOS ids).
