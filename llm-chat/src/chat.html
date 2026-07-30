@@ -511,6 +511,7 @@
   /* while reasoning streams: no cursor after the collapsed box (the summary's
      "Thinking…" shimmer is the indicator); cursor inside the body when the
      user expands the LIVE block; none inside already-finished blocks */
+  .think-empty { color: var(--text-3); font-size: 13.5px; margin-top: 8px; }
   .streaming .md > details.think:last-child::after { content: none; }
   .streaming details.think:not(.live) .think-body > :last-child::after { content: none; }
   .statusline { font-size: 14px; }
@@ -1211,6 +1212,15 @@ function assistantHtml(src, streaming) {
       (live ? '<span class="shimmer">Thinking&#8230;</span>' : "<span>Thoughts</span>") +
       '</summary><div class="md think-body">' + md(p.think) + "</div></details>";
   }
+  // A finished reply that is ALL thinking and no answer: the model stopped
+  // inside its own reasoning (ran out of budget mid-block, or hit EOS there).
+  // The server force-closes a looping block so the answer still gets written,
+  // but nothing can make a model that stopped say something - and a bubble
+  // holding one collapsed "Thoughts" disclosure and no words reads as the app
+  // having lost the reply. Name what happened instead.
+  if (!streaming && html && !stripThink(src).trim())
+    html += '<p class="think-empty">The model stopped while still reasoning and never wrote an ' +
+      "answer. Its thinking is above; asking again usually gets one.</p>";
   return html;
 }
 // ----------------------------------------------------------- end markdown --
@@ -2387,6 +2397,47 @@ async function run(chat) {
   persist(chat);
   renderSidebar(); updateComposer();
   if (chat.id === state.currentId) { renderChat(); input.focus(); }
+  nameChat(chat);
+}
+
+// ---- the sidebar entry's name. The first message truncated at 64 characters
+// is what the list showed until the model answers, and it is a fragment, not a
+// name. This asks the model for a real one - but only AFTER the reply is on
+// screen, so the naming pass is never in front of anything anyone is waiting
+// for, and only ONCE per chat, on the opening exchange.
+//
+// Every failure keeps the fragment: no error, no retry, no spinner. A chat
+// history entry is not worth interrupting anyone over.
+async function nameChat(chat) {
+  if (chat.named || chat.error) return;
+  const first = chat.messages.find((m) => m.role === "user");
+  const reply = chat.messages.find((m) => m.role === "assistant");
+  if (!first || !reply) return;
+  // opening exchange only: a chat already several turns deep was named on its
+  // first, and renaming it later would move a familiar entry out from under
+  // whoever is reading the list
+  if (chat.messages.filter((m) => m.role === "user").length !== 1) return;
+  chat.named = true;                       // one attempt, success or not
+  try {
+    const body = {
+      model: state.model || undefined,
+      messages: [
+        { role: "user", content: first.content || "" },
+        { role: "assistant", content: (reply.content || "").slice(0, 1200) },
+      ],
+    };
+    const res = await fetch("title", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return;
+    const d = await res.json();
+    if (!d || !d.title) return;
+    chat.title = d.title;
+    persist(chat);
+    renderSidebar();
+  } catch (_) { /* the fragment stands */ }
 }
 
 // -------------------------------------------------------------- API dialog --
