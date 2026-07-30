@@ -87,6 +87,17 @@ pub struct SearchConfig {
     /// per-request timeout, seconds. Applied to connect and to first byte.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
+    /// whether the playground's search switch STARTS on. False by default, and
+    /// that default is a product decision rather than an oversight: people
+    /// choose an enclave because the conversation does not leave it, so a
+    /// deployment that quietly sends questions to a provider would take that
+    /// away from exactly the users who came for it.
+    ///
+    /// A deployment whose whole point is answering from the live web sets this
+    /// true and says so. It also governs the web_search TOOL, which is the same
+    /// capability wearing a different hat (see tools.rs).
+    #[serde(default)]
+    pub default_on: bool,
 }
 
 impl SearchConfig {
@@ -1040,6 +1051,7 @@ mod tests {
             fetch_pages: 0,
             page_chars: 6000,
             timeout_s: 15,
+            default_on: false,
         }
     }
 

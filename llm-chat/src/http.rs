@@ -22,8 +22,22 @@ pub struct Response {
     pub body: Vec<u8>,
     pub location: Option<String>,
     pub ctype: Option<String>,
+    /// every response header, lowercased. `location` and `ctype` above are the
+    /// two this app has always needed by name; MCP needs one more
+    /// (`mcp-session-id`) and a future caller will need another, so the whole
+    /// set is kept rather than growing a field per protocol.
+    pub headers: Vec<(String, String)>,
     /// the response was cut off at `max_bytes`
     pub truncated: bool,
+}
+
+impl Response {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 pub struct HttpReq<'a> {
@@ -164,6 +178,11 @@ pub fn request_with_tick(
     let rh = resp.headers();
     let location = first_header(&rh, "location");
     let ctype = first_header(&rh, "content-type");
+    let headers: Vec<(String, String)> = rh
+        .entries()
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), String::from_utf8_lossy(&v).into_owned()))
+        .collect();
 
     let mut out = Vec::new();
     let mut truncated = false;
@@ -185,7 +204,7 @@ pub fn request_with_tick(
             }
         }
     }
-    Ok(Response { status, body: out, location, ctype, truncated })
+    Ok(Response { status, body: out, location, ctype, headers, truncated })
 }
 
 pub fn first_header(fields: &Fields, name: &str) -> Option<String> {
