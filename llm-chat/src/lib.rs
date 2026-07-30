@@ -36,6 +36,16 @@
 //!                               (the playground disables the rest in its
 //!                               menu). GPU-only unless ?target= says
 //!                               otherwise.
+//!   GET  /attestation         - THIS deployment's hardware attestation: the
+//!                               SEV-SNP quote, its measurement, the GPU's CC
+//!                               mode and nonce, relayed from the platform API
+//!                               over the egress leg (attest.rs). Open, like
+//!                               /models: what the hardware is has to be
+//!                               readable before you decide to type into the
+//!                               box. The playground's shield dialog renders it,
+//!                               and re-fetches the signed document from the
+//!                               enclave's own endpoint so the copy it parses
+//!                               came over the BROWSER's connection.
 //!   GET  /search              - WEB SEARCH probe (503 unless the config has a
 //!                               `search` block). ?q=<query> runs the provider
 //!                               leg; ?url=<page> runs only the fetch+extract
@@ -71,6 +81,12 @@
 //!                               config's `image` block (see image.rs) and is
 //!                               delivered to /chat as an `{"image":{...}}`
 //!                               event carrying a data: URI.
+//!                               IMAGES IN: a message's `content` may be
+//!                               OpenAI's array of parts, with attachments as
+//!                               base64 data: URIs. They are read by the
+//!                               MODEL, on models whose volume carries a
+//!                               vision projector and whose config says
+//!                               `vision` (see the vision section below).
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!                               Same `web_search` switch; sources arrive as a
 //!                               `{"search":{...}}` event before the first
@@ -82,14 +98,58 @@
 //! straight back as the next step's `past_key_values.*` inputs - the cache
 //! bytes never cross into guest memory. Only the logits are read out
 //! (one vocab row per decode step).
+//!
+//! VISION (ggml, models whose volume pairs the weights with an *mmproj*.gguf
+//! projector and whose catalog entry sets `vision`): a turn's attachments are
+//! carried to the model as PICTURES, not as a description of one. The prompt
+//! stops being a flat token list and becomes runs of text with images spliced
+//! between them (PromptPart): the chat template renders as usual with a
+//! private mark where each image goes, the rendered string is cut at those
+//! marks, the text runs tokenize normally, and each image crosses to the host
+//! as its raw FILE BYTES through the wasi-nn "image" verb. The host encodes it
+//! and answers with the POSITIONS it consumed - which the guest cannot derive,
+//! since a dynamic-resolution model prices an image by its own grid and M-RoPE
+//! numbers image positions differently again. WebP is the one exception to
+//! "raw file bytes": the host's encoder has no VP8, so a webp is decoded and
+//! re-encoded as JPEG on the way in (see webp.rs).
+//!
+//! Nothing about any particular VLM lives here as a result: the marker tokens
+//! that wrap an image, the non-causal mask some models want around it, the
+//! 2-D position arithmetic - all of that is llama.cpp's, behind the host. What
+//! this app owns is the parts that are its own: which requests are allowed to
+//! carry pictures (check_images), what one costs against the context window,
+//! and the fact that speculative decoding sits out any turn with an image in
+//! it, because its bookkeeping counts one position per token.
+//!
+//! VISION BY DELEGATION (the config's `vision_service` block, see vision.rs):
+//! the other way to answer a picture, for a deployment whose chat model is
+//! bigger than any VLM it could afford to attach beside it. The image goes to a
+//! sibling `image-reader` deployment and comes back as prose, which is folded into
+//! the turn. What crosses is NOT the conversation: one image, and a QUESTION
+//! that THIS deployment's model writes after reading the conversation - so the
+//! detail the answer depends on ("the spec said two buttons") travels as part of
+//! the question rather than as a transcript. Costs one extra short generation
+//! and one round trip, and the look is single-shot: there is no tool-call loop
+//! in the render path, so the question asks for the specific answer AND enough
+//! surrounding description to survive the obvious follow-up.
+//!
+//! The two paths are exclusive per turn and vision_plan() decides: a request
+//! that NAMES a vision model reads locally, everything else prefers the service
+//! when one is configured. With a service configured, EVERY model in the
+//! catalog can be sent a picture, which is what /models reports as
+//! `vision.service` so the playground stops gating the attach button on the
+//! selected model.
 #[allow(warnings)]
 mod bindings;
 
+mod attest;
 mod config;
 mod http;
 mod image;
 mod sampling;
 mod search;
+mod vision;
+mod webp;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,6 +311,11 @@ fn weights_size(cfg: &AppConfig) -> Option<u64> {
                     .ok()?
                     .filter_map(|e| e.ok().map(|e| e.path()))
                     .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false) && p.is_file())
+                    // a vision volume's SECOND gguf is the projector, not a
+                    // second model - the host tells them apart by this same
+                    // name convention, and counting it here would make every
+                    // vision volume look ambiguous and drop out of the listing
+                    .filter(|p| !is_mmproj(p))
                     .collect();
                 match ggufs.len() {
                     0 => return None,
@@ -399,12 +464,21 @@ fn serve_cost(cfg: &AppConfig) -> (u64, u64) {
         * cfg.n_kv_heads as u64
         * cfg.head_dim as u64;
     let kv = elems * n_ctx * (kv_elem_sixteenths(tk.trim()) + kv_elem_sixteenths(tv.trim())) / 16;
+    // A VISION model's projector is resident VRAM too, once an image has been
+    // sent: the encoder weights plus its own compute buffers. It is loaded
+    // lazily, which is exactly why it has to be priced HERE - a deployment
+    // that fits the language model and nothing else would load fine, serve
+    // text fine, and then die on the first picture (a CUDA OOM inside compute
+    // aborts the whole tenant, taking every model with it). The projector
+    // file sits in the volume, so its real size is knowable rather than
+    // guessed; the allowance on top covers the encode workspace.
+    let vision = if cfg.vision { mmproj_size(cfg).unwrap_or(1 << 30) + (1 << 29) } else { 0 };
     if pooled_backend() {
         // Continuous-batching host: ONE shared KV pool of n_ctx tokens per
         // model serves every concurrent session - the pool prices once,
         // regardless of ENCLAVE_GGML_MAX_SESSIONS (that only caps sequences
         // sharing it).
-        return (kv, WORKING_SET);
+        return (kv + vision, WORKING_SET);
     }
     // Pre-batching host: up to ENCLAVE_GGML_MAX_SESSIONS concurrent contexts,
     // EACH with its own full window + working set - price the worst case.
@@ -415,7 +489,30 @@ fn serve_cost(cfg: &AppConfig) -> (u64, u64) {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(1);
-    (kv * sessions, WORKING_SET * sessions)
+    (kv * sessions + vision, WORKING_SET * sessions)
+}
+
+/// Does this file name mark a vision projector rather than a model? The HOST
+/// picks the projector out of a volume by exactly this convention, so the two
+/// sides must agree or they will disagree about which gguf is the model.
+fn is_mmproj(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase().contains("mmproj"))
+        .unwrap_or(false)
+}
+
+/// The vision projector's size in the model volume, if it carries one. Same
+/// name convention the host matches on (*mmproj*.gguf), so the two agree
+/// about which file this is.
+fn mmproj_size(cfg: &AppConfig) -> Option<u64> {
+    let root = PathBuf::from(MODELS_ROOT).join(&cfg.model_volume);
+    std::fs::read_dir(&root)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false) && is_mmproj(p))
+        .filter_map(|p| std::fs::metadata(&p).ok().map(|m| m.len()))
+        .max()
 }
 
 /// The manager sets ENCLAVE_GGML_POOLED on hosts whose ggml backend serves
@@ -583,7 +680,13 @@ fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (DraftPlan, Option
 }
 
 const PREFILL_CHUNK: usize = 128;
-const MAX_BODY_BYTES: usize = 256 * 1024;
+/// Request-body ceiling. Generous because attachments arrive base64'd INSIDE
+/// the JSON (~1.35x the file), and a vision turn can legitimately carry
+/// several: max_images * max_image_bytes * 1.35 has to fit, plus the
+/// conversation around it. The per-image and per-request limits in
+/// check_images are the real policy; this is only the wall that stops a body
+/// from being read into guest memory at all.
+const MAX_BODY_BYTES: usize = 40 * 1024 * 1024;
 
 /// The host's ggml session gate (ENCLAVE_GGML_MAX_SESSIONS) tags its
 /// fail-fast error with this marker. Every llama context pre-allocates the
@@ -819,6 +922,60 @@ impl Session {
 }
 
 impl Session {
+    /// ggml only: hand ONE image to the host, which encodes it and splices the
+    /// result into this sequence at the current position. Returns the POSITIONS
+    /// it consumed - not a token count, and not something the guest can derive:
+    /// a dynamic-resolution model prices an image by its own grid, and M-RoPE
+    /// numbers image positions differently again.
+    ///
+    /// The bytes cross as the file, not as pixels. Decoding, resizing, the
+    /// vision encoder and the model's marker tokens all live behind the host's
+    /// projector, so this app carries no image code at all.
+    fn feed_image(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("vision needs the ggml backend".into());
+        };
+        let outs = ctx
+            .compute(vec![(
+                "image".to_string(),
+                Tensor::new(&[bytes.len() as u32], TensorType::U8, bytes),
+            )])
+            .map_err(|e| {
+                let e = nn_err("image", e);
+                // A host that KNOWS the verb tags what went wrong with one of
+                // its own markers. Anything else came from a host that does
+                // not know it at all - and what such a host says ("missing
+                // \"tokens\" input", "unknown input") is not a sentence anyone
+                // can act on, so name the real condition instead.
+                const KNOWN: &[&str] = &[
+                    "[image_undecodable]", "[image_too_wide]", "[vision_unavailable]",
+                    "[kv_pool_full]",
+                ];
+                if KNOWN.iter().any(|m| e.contains(m)) {
+                    e
+                } else {
+                    format!(
+                        "[vision_unsupported] this deployment's node cannot read images: its \
+                         llama.cpp toolchain predates vision support, so the model never got \
+                         the picture (host said: {e})"
+                    )
+                }
+            })?;
+        let n = outs
+            .iter()
+            .find(|(n, _)| n == "image_pos")
+            .ok_or("[vision_unsupported] host returned no \"image_pos\" output")?;
+        let data = n.1.data();
+        if data.len() < 4 {
+            return Err("host returned a malformed image_pos".into());
+        }
+        let pos = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if pos <= 0 {
+            return Err("the model consumed no positions for this image".into());
+        }
+        Ok(pos as usize)
+    }
+
     /// ggml only: feed `ids` and get EVERY position's logits row back
     /// (dims [n, vocab]) - the speculative verify pass: the target consumes
     /// the draft's proposals in ONE forward pass.
@@ -852,14 +1009,15 @@ impl Session {
             .collect())
     }
 
-    /// ggml only: this session's capabilities - (seq_id, recurrent, mtp).
-    /// seq_id is the handle another session on the SAME graph names to
-    /// branch from it (`copy_from`); mtp = the loaded GGUF carries a
-    /// multi-token-prediction head. Errors on hosts that predate the
+    /// ggml only: this session's capabilities - (seq_id, recurrent, mtp,
+    /// vision). seq_id is the handle another session on the SAME graph names
+    /// to branch from it (`copy_from`); mtp = the loaded GGUF carries a
+    /// multi-token-prediction head; vision = the volume carries a projector
+    /// AND the node can drive it. Errors on hosts that predate the
     /// speculative toolchain, which is the capability probe: no caps, no
-    /// speculative decode. Hosts before the MTP toolchain return two
-    /// values - a missing third reads as "no head".
-    fn caps(&mut self) -> Result<(i32, bool, bool), String> {
+    /// speculative decode. The list has only grown, so an older host simply
+    /// returns fewer values and each missing one reads as "no".
+    fn caps(&mut self) -> Result<Caps, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -880,8 +1038,12 @@ impl Session {
         let v = |i: usize| {
             i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
         };
-        let mtp = data.len() >= 12 && v(2) != 0;
-        Ok((v(0), v(1) != 0, mtp))
+        Ok(Caps {
+            seq: v(0),
+            recurrent: v(1) != 0,
+            mtp: data.len() >= 12 && v(2) != 0,
+            vision: data.len() >= 16 && v(3) != 0,
+        })
     }
 
     /// ggml only: MTP-aware feed of this sequence - the host runs an
@@ -1023,6 +1185,77 @@ impl Session {
     }
 }
 
+/// Vet a request's attachments against the model and the deployment's limits,
+/// BEFORE any of the expensive machinery starts. Returns how many images the
+/// turn carries.
+///
+/// Everything here fails with a sentence naming the thing to change, because
+/// every one of these is a mistake someone can only fix if they know which of
+/// four different reasons stopped them: this model cannot see, this backend
+/// cannot see, too many pictures, or one picture too large.
+fn check_images(
+    raw: &serde_json::Value,
+    cfg: &AppConfig,
+    messages: &[ChatMsg],
+) -> Result<usize, String> {
+    let n: usize = messages.iter().map(|m| m.images.len()).sum();
+    if n == 0 {
+        return Ok(0);
+    }
+    // A configured vision service reads for EVERY model, so the serving
+    // model's own inability is no longer a reason to refuse the turn - the
+    // picture goes to the sibling deployment instead (see apply_vision).
+    if (!cfg.vision || cfg.backend != "ggml") && cfg.vision_service.is_none() {
+        let others: Vec<String> = available_models(raw)
+            .iter()
+            .filter(|e| e.cfg.vision && e.cfg.backend == "ggml")
+            .map(|e| e.cfg.name.clone())
+            .collect();
+        return Err(format!(
+            "[no_vision] {} cannot read images{}",
+            cfg.name,
+            if others.is_empty() {
+                ". No model attached to this deployment can; attach a vision model volume \
+                 (weights plus an mmproj projector) and add it to the config's catalog, or \
+                 point the config's vision_service at an image-reader deployment and every \
+                 model here gains the capability"
+                    .to_string()
+            } else {
+                format!(", but this deployment also serves {} - select it and resend", others.join(", "))
+            }
+        ));
+    }
+    if n > cfg.max_images {
+        return Err(format!(
+            "[too_many_images] {n} images in one request; this deployment allows {} \
+             (each one costs about {} tokens of the context window)",
+            cfg.max_images, cfg.image_tokens
+        ));
+    }
+    if let Some(big) = messages
+        .iter()
+        .flat_map(|m| m.images.iter())
+        .find(|b| b.len() > cfg.max_image_bytes)
+    {
+        return Err(format!(
+            "[image_too_large] an image is {} KB; the limit is {} KB - resize it before \
+             sending (the playground does this in the browser)",
+            big.len() / 1024,
+            cfg.max_image_bytes / 1024
+        ));
+    }
+    Ok(n)
+}
+
+/// What the host says this session can do (see Session::caps).
+struct Caps {
+    seq: i32,
+    #[allow(dead_code)] // read through the tuple destructuring in open_spec
+    recurrent: bool,
+    mtp: bool,
+    vision: bool,
+}
+
 /// Everything speculative decoding needs beyond the target session: the
 /// draft session plus one scratch branch per model, with the sequence ids
 /// to branch from / adopt into. Opened non-retrying: a busy slot or a host
@@ -1044,13 +1277,13 @@ fn open_spec(
     target: ExecutionTarget,
     sess: &mut Session,
 ) -> Result<SpecRig, String> {
-    let (t_seq, _, _) = sess.caps()?; // also the host capability probe
+    let t_seq = sess.caps()?.seq; // also the host capability probe
     let mut dsess = Session::open(dcfg, target)?;
-    let (d_seq, _, _) = dsess.caps()?;
+    let d_seq = dsess.caps()?.seq;
     let mut tscr = Session::open(cfg, target)?;
-    let (tscr_seq, _, _) = tscr.caps()?;
+    let tscr_seq = tscr.caps()?.seq;
     let mut dscr = Session::open(dcfg, target)?;
-    let (dscr_seq, _, _) = dscr.caps()?;
+    let dscr_seq = dscr.caps()?.seq;
     Ok(SpecRig { dsess, tscr, dscr, t_seq, d_seq, tscr_seq, dscr_seq })
 }
 
@@ -1068,12 +1301,13 @@ fn open_mtp(
     target: ExecutionTarget,
     sess: &mut Session,
 ) -> Result<MtpRig, String> {
-    let (t_seq, _, mtp) = sess.caps()?; // also the host capability probe
-    if !mtp {
+    let caps = sess.caps()?; // also the host capability probe
+    if !caps.mtp {
         return Err("this model volume carries no MTP head (use an *-mtp volume, or name a draft model)".into());
     }
+    let t_seq = caps.seq;
     let mut tscr = Session::open(cfg, target)?;
-    let (tscr_seq, _, _) = tscr.caps()?;
+    let tscr_seq = tscr.caps()?.seq;
     Ok(MtpRig { tscr, t_seq, tscr_seq })
 }
 
@@ -1105,7 +1339,14 @@ struct GenStats {
     accepted: usize,
     /// the think budget ran out and the server closed the block (see ThinkGuard)
     think_forced: bool,
+    /// images the host encoded into this prompt, and the positions they
+    /// actually cost (0/0 on a text turn). The positions are the host's own
+    /// figure, not the config's budget estimate, so a deployment can see what
+    /// its window is really being spent on.
+    images: usize,
+    image_pos: usize,
 }
+
 
 /// The incremental text pipeline shared by the plain and speculative decode
 /// loops: push sampled tokens one at a time; it detokenizes the sequence,
@@ -1349,7 +1590,7 @@ impl ThinkGuard {
 fn generate(
     cfg: &AppConfig,
     tok: &Tokenizer,
-    prompt_ids: &[u32],
+    prompt: &Prompt,
     target: ExecutionTarget,
     tname: &str,
     p: &GenParams,
@@ -1357,6 +1598,9 @@ fn generate(
     emit: &dyn Fn(&str) -> bool,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
+    // The repetition window and the RNG seed read the text side of the
+    // prompt; images contribute no token ids to look back at.
+    let prompt_ids: &[u32] = &prompt.text_ids;
     if !status(&format!(
         "loading the model on {tname} - the first request after a node boot initializes the session and can take a while"
     )) {
@@ -1395,50 +1639,108 @@ fn generate(
     // share, a headless volume, or a host predating the speculative verbs
     // all quietly downgrade to plain decode. Drafting is an accelerator,
     // never a dependency.
-    match draft {
-        DraftPlan::Model(dc) => match open_spec(cfg, dc, target, &mut sess) {
+    // The config said this model can see; ask the HOST, which is the half that
+    // actually has to (the volume's projector, and a node new enough to drive
+    // it). Doing it here, before the prefill, means a deployment whose node
+    // predates vision fails in a sentence instead of after a minute of encode
+    // work. A host too old to answer `caps` at all is not judged: the image
+    // feed itself will say so, and that path already has the better message.
+    if prompt.images > 0 {
+        if let Ok(caps) = sess.caps() {
+            if !caps.vision {
+                return Err(format!(
+                    "[no_vision] the \"{}\" volume on this node cannot read images: the \
+                     model is configured for vision, but the node reports no projector \
+                     (is the mmproj gguf in the volume, and is this node's llama.cpp \
+                     toolchain new enough?)",
+                    cfg.model_volume
+                ));
+            }
+        }
+    }
+
+    // Speculative decode counts POSITIONS in tokens (a branch is adopted at a
+    // token offset, a partial accept re-feeds a token count). An image does not
+    // occupy one position per token, so a prompt carrying one takes the plain
+    // path - correctness first, and the drafting was only ever an accelerator.
+    match (draft, prompt.text_only()) {
+        (DraftPlan::Model(dc), Some(ids)) => match open_spec(cfg, dc, target, &mut sess) {
             Ok(rig) => {
-                if !status(&format!("session ready ({load_ms} ms); speculative decode via {} - prefilling {} prompt tokens", dc.name, prompt_ids.len())) {
+                if !status(&format!("session ready ({load_ms} ms); speculative decode via {} - prefilling {} prompt tokens", dc.name, ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_spec(cfg, dc, tok, prompt_ids, tname, p, sess, rig, load_ms, emit, status);
+                return generate_spec(cfg, dc, tok, ids, tname, p, sess, rig, load_ms, emit, status);
             }
             Err(e) => {
                 let _ = status(&format!("draft model unavailable ({}); plain decode", strip_code(&e)));
             }
         },
-        DraftPlan::Mtp => match open_mtp(cfg, target, &mut sess) {
+        (DraftPlan::Mtp, Some(ids)) => match open_mtp(cfg, target, &mut sess) {
             Ok(rig) => {
-                if !status(&format!("session ready ({load_ms} ms); speculative decode via the model's MTP head - prefilling {} prompt tokens", prompt_ids.len())) {
+                if !status(&format!("session ready ({load_ms} ms); speculative decode via the model's MTP head - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_mtp(cfg, tok, prompt_ids, tname, p, sess, rig, load_ms, emit, status);
+                return generate_mtp(cfg, tok, ids, tname, p, sess, rig, load_ms, emit, status);
             }
             Err(e) => {
                 let _ = status(&format!("MTP drafting unavailable ({}); plain decode", strip_code(&e)));
             }
         },
-        DraftPlan::Plain => {}
+        (DraftPlan::Model(_) | DraftPlan::Mtp, None) => {
+            let _ = status("speculative decode off for this turn: the prompt carries an image");
+        }
+        (DraftPlan::Plain, _) => {}
     }
     if !status(&format!(
-        "session ready ({load_ms} ms); prefilling {} prompt tokens",
-        prompt_ids.len()
+        "session ready ({load_ms} ms); prefilling {} prompt tokens{}",
+        prompt_ids.len(),
+        match prompt.images {
+            0 => String::new(),
+            1 => " and 1 image".into(),
+            n => format!(" and {n} images"),
+        }
     )) {
         return Err("client disconnected".into());
     }
 
-    // -- prefill, in chunks so no single logits tensor gets huge
+    // -- prefill. Text goes in chunks so no single logits tensor gets huge;
+    // an image goes whole, to the host, which encodes it and splices the
+    // result into the sequence at the position the text left off.
     let t1 = now_ms();
-    let mut done = 0usize;
     let mut logits = Vec::new();
-    while done < prompt_ids.len() {
-        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
-        let last = end == prompt_ids.len();
-        let l = sess.feed(cfg, &prompt_ids[done..end], last)?;
-        if last {
-            logits = l;
+    let mut image_pos = 0usize;
+    let last_part = prompt.parts.len().saturating_sub(1);
+    for (i, part) in prompt.parts.iter().enumerate() {
+        match part {
+            PromptPart::Text(ids) => {
+                let mut done = 0usize;
+                while done < ids.len() {
+                    let end = (done + PREFILL_CHUNK).min(ids.len());
+                    // only the very last token of the whole prompt needs logits
+                    let last = i == last_part && end == ids.len();
+                    let l = sess.feed(cfg, &ids[done..end], last)?;
+                    if last {
+                        logits = l;
+                    }
+                    done = end;
+                }
+            }
+            PromptPart::Image(bytes) => {
+                if !status(&format!(
+                    "reading the image ({} KB) - the vision encoder runs on the same share as the model",
+                    bytes.len() / 1024
+                )) {
+                    return Err("client disconnected".into());
+                }
+                image_pos += sess.feed_image(bytes)?;
+            }
         }
-        done = end;
+    }
+    if logits.is_empty() {
+        // A prompt whose last part is an image: nothing sampled a row yet. The
+        // templates all end an assistant turn's opening with text, so this
+        // means the render went wrong rather than the model.
+        return Err("prompt ended without a text turn to answer from".into());
     }
     let prefill_ms = now_ms() - t1;
 
@@ -1467,7 +1769,7 @@ fn generate(
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: out.text, drafted: 0, accepted: 0,
-                    think_forced: think.forced,
+                    think_forced: think.forced, images: prompt.images, image_pos,
                 });
             }
             Pushed::Gone => break, // client disconnected
@@ -1499,7 +1801,7 @@ fn generate(
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: out.text, drafted: 0, accepted: 0,
-        think_forced: think.forced,
+        think_forced: think.forced, images: prompt.images, image_pos,
     })
 }
 
@@ -1585,7 +1887,7 @@ fn generate_spec(
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: out.text, drafted, accepted,
-                    think_forced: think.forced,
+                    think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
             Pushed::Gone => break 'outer,
@@ -1676,7 +1978,7 @@ fn generate_spec(
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
-                        think_forced: think.forced,
+                        think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
                 Pushed::Gone => { accepted += acc + 1; break 'outer; }
@@ -1714,7 +2016,7 @@ fn generate_spec(
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: out.text, drafted, accepted,
-        think_forced: think.forced,
+        think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
 
@@ -1777,7 +2079,7 @@ fn generate_mtp(
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: out.text, drafted, accepted,
-                    think_forced: think.forced,
+                    think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
             Pushed::Gone => break 'outer,
@@ -1851,7 +2153,7 @@ fn generate_mtp(
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
-                        think_forced: think.forced,
+                        think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
                 Pushed::Gone => { accepted += acc + 1; break 'outer; }
@@ -1881,16 +2183,202 @@ fn generate_mtp(
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: out.text, drafted, accepted,
-        think_forced: think.forced,
+        think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
 
 // -------------------------------------------------------------------- http --
 
-#[derive(Deserialize, Clone)]
+#[derive(Clone, Default)]
 struct ChatMsg {
     role: String,
     content: String,
+    /// attachments on THIS turn, as the raw file bytes the client uploaded.
+    /// They are placed at the head of the turn when the prompt is rendered,
+    /// which is how every VLM chat template puts them: picture first, then
+    /// the question about it.
+    images: Vec<Vec<u8>>,
+}
+
+impl ChatMsg {
+    fn text(role: &str, content: impl Into<String>) -> ChatMsg {
+        ChatMsg { role: role.into(), content: content.into(), images: Vec::new() }
+    }
+}
+
+/// OpenAI's message content is either a string or an array of typed parts.
+/// The array form is how images arrive, and there are three spellings of it
+/// in the wild; all three are accepted, because the alternative is a user
+/// whose SDK "supports vision" getting a 400 for reasons they cannot see:
+///   {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+///   {"type":"input_image","image_url":"data:..."}            (Responses API)
+///   {"type":"image","source":{"type":"base64","data":"..."}} (Anthropic)
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Deserialize)]
+struct ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image_url: Option<ImageRef>,
+    #[serde(default)]
+    source: Option<ImageSource>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ImageRef {
+    Url(String),
+    Obj { url: String },
+}
+
+#[derive(Deserialize)]
+struct ImageSource {
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ChatMsg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<ChatMsg, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            role: String,
+            #[serde(default)]
+            content: Option<RawContent>,
+        }
+        let w = Wire::deserialize(d)?;
+        let mut msg = ChatMsg { role: w.role, ..Default::default() };
+        match w.content {
+            None => {}
+            Some(RawContent::Text(t)) => msg.content = t,
+            Some(RawContent::Parts(parts)) => {
+                let mut text = String::new();
+                for p in parts {
+                    if let Some(t) = p.text {
+                        if !text.is_empty() && !t.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&t);
+                    }
+                    let src = match (&p.image_url, &p.source) {
+                        (Some(ImageRef::Url(u)), _) => Some(u.clone()),
+                        (Some(ImageRef::Obj { url }), _) => Some(url.clone()),
+                        (None, Some(s)) => s.url.clone().or_else(|| s.data.clone()),
+                        (None, None) => None,
+                    };
+                    if let Some(src) = src {
+                        msg.images.push(decode_image_src(&src).map_err(serde::de::Error::custom)?);
+                    }
+                }
+                msg.content = text;
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Turn one `image_url` into file bytes. Data URIs (and bare base64, which is
+/// what the Anthropic shape sends) only: a remote URL is REFUSED rather than
+/// fetched, on both counts that matter here. Fetching would tell a third-party
+/// host what this deployment is looking at, which is the whole thing the app
+/// exists to avoid, and the fleet's egress is IPv6-only anyway, so most such
+/// URLs would fail in a way nobody could diagnose from the outside.
+fn decode_image_src(src: &str) -> Result<Vec<u8>, String> {
+    let s = src.trim();
+    let b64 = if let Some(rest) = s.strip_prefix("data:") {
+        let (meta, payload) = rest
+            .split_once(',')
+            .ok_or("malformed data: URI (no comma before the payload)")?;
+        if !meta.contains("base64") {
+            return Err("only base64 data: URIs are supported for images".into());
+        }
+        payload
+    } else if s.starts_with("http://") || s.starts_with("https://") {
+        return Err(
+            "image URLs are not fetched: send the image inline as a base64 data: URI. \
+             This app never resolves an attachment against a third-party host - that \
+             request would leak what you are looking at, which is the point of running \
+             the model in an enclave."
+                .into(),
+        );
+    } else {
+        s
+    };
+    let bytes = b64_decode(b64)?;
+    match image_kind(&bytes) {
+        // The vision encoder decodes through stb_image, which has no VP8, so a
+        // webp is transcoded to JPEG here rather than refused at the door - the
+        // playground's canvas already does this for uploads, and this covers
+        // everyone else (SDKs, pasted data URIs, the vision-service leg).
+        Some("webp") => webp::to_jpeg(&bytes),
+        Some(_) => Ok(bytes),
+        None => Err(
+            "attachment is not a recognisable image (png, jpeg, webp, gif or bmp)".into(),
+        ),
+    }
+}
+
+/// The image format, by magic bytes. Sniffing here rather than trusting the
+/// data: URI's own mime type means a mislabelled upload fails in this app with
+/// a sentence a user can act on, instead of inside the vision encoder.
+fn image_kind(b: &[u8]) -> Option<&'static str> {
+    if b.len() < 12 {
+        return None;
+    }
+    if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some("png");
+    }
+    if b.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("jpeg");
+    }
+    if b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if b.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    None
+}
+
+/// Standard base64, tolerating whitespace and missing padding (both are
+/// common in hand-assembled requests). No dependency for this: the crate
+/// carries a tokenizer and serde and nothing else, and a decoder is 20 lines.
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b'\n' | b'\r' | b' ' | b'\t' => continue,
+            _ => return Err("image payload is not valid base64".into()),
+        } as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    if out.is_empty() {
+        return Err("image payload is empty".into());
+    }
+    Ok(out)
 }
 
 /// Request shape shared by /chat (legacy) and /v1/chat/completions (OpenAI).
@@ -2024,10 +2512,7 @@ or
 
     // Only the tail of the conversation matters for this decision, and a long
     // history would dominate the router's own budget.
-    let mut router_msgs: Vec<ChatMsg> = vec![ChatMsg {
-        role: "system".into(),
-        content: router_system.into(),
-    }];
+    let mut router_msgs: Vec<ChatMsg> = vec![ChatMsg::text("system", router_system)];
     let tail: Vec<&ChatMsg> = messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
@@ -2035,10 +2520,20 @@ or
         .take(4)
         .collect();
     for m in tail.into_iter().rev() {
-        router_msgs.push(ChatMsg {
-            role: m.role.clone(),
-            content: truncate_for_msg_n(&m.content, 1500),
-        });
+        // TEXT ONLY, deliberately: the router is a cheap classifier and
+        // re-encoding every attached picture for it would cost more than the
+        // answer it is routing. An image turn with no words still says
+        // something useful here, so it is announced rather than dropped.
+        let mut c = truncate_for_msg_n(&m.content, 1500);
+        if !m.images.is_empty() {
+            let note = if m.images.len() == 1 {
+                "[the user attached an image]".to_string()
+            } else {
+                format!("[the user attached {} images]", m.images.len())
+            };
+            c = if c.trim().is_empty() { note } else { format!("{note}\n{c}") };
+        }
+        router_msgs.push(ChatMsg::text(&m.role, c));
     }
 
     // thinking off: this is a classifier, not a reasoning task
@@ -2141,6 +2636,266 @@ fn truncate_for_msg_n(s: &str, max: usize) -> String {
 }
 
 /// What a completed search leg reports back to the client.
+// ------------------------------------------------------ vision (images IN) --
+
+/// Who reads the picture on this turn.
+#[derive(PartialEq, Debug)]
+enum VisionPlan {
+    /// the SERVING model reads it itself: its volume carries a projector, and
+    /// the image goes into its own prompt (the path in build_prompt/generate)
+    Local,
+    /// a sibling vision deployment reads it and this app folds the answer in
+    Delegate,
+}
+
+/// Decide it once, here, so both request paths agree.
+///
+/// An explicitly NAMED vision model always keeps the picture local: a request
+/// that said `"model": "qwen3-vl-8b"` asked for that model to look, and a
+/// deployment default has no business overriding it. Everything else prefers
+/// the service when one is configured, because that is what configuring one
+/// means - the sibling exists so the chat model does not have to be a VLM.
+fn vision_plan(cfg: &AppConfig, requested: Option<&str>) -> VisionPlan {
+    let Some(vcfg) = &cfg.vision_service else { return VisionPlan::Local };
+    let can_local = cfg.vision && cfg.backend == "ggml";
+    let named_this = requested
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .is_some_and(|r| r == cfg.name || r == cfg.model_volume);
+    if can_local && (named_this || vcfg.prefer_local) {
+        return VisionPlan::Local;
+    }
+    VisionPlan::Delegate
+}
+
+/// What the delegated look cost and what was asked, for the reply's metadata.
+/// Only ever produced for a DELEGATED turn: when the serving model reads the
+/// picture itself there is no second party to report on, and the per-image
+/// position count already comes back in the generation stats.
+struct VisionMeta {
+    model: Option<String>,
+    question: String,
+    images: usize,
+    image_tokens: usize,
+    ms: u64,
+}
+
+fn vision_meta_json(m: &VisionMeta) -> serde_json::Value {
+    serde_json::json!({
+        "model": m.model,
+        // the question this app's own model wrote on the user's behalf. Shown,
+        // not hidden: a user is entitled to know what was asked about their
+        // picture, and it is also the first thing to look at when an answer
+        // comes back about the wrong detail.
+        "question": m.question,
+        "images": m.images,
+        "image_tokens": m.image_tokens,
+        "ms": m.ms,
+    })
+}
+
+/// Have THIS deployment's model write the question for the vision model.
+///
+/// This is the step that makes delegation more than a caption sidecar. The
+/// vision model sees only the image and this one line - it has no access to the
+/// conversation - so the line has to CARRY whatever from the conversation the
+/// answer depends on: the spec the user pasted, the value they expect, the
+/// thing they said was wrong last time. A model that has read the conversation
+/// can write that; a fixed "describe this image" cannot, because it has to
+/// choose what matters before anyone has said.
+///
+/// Returns None on any failure, and the caller falls back to the user's own
+/// words - one cheap generation is worth a better question, but never worth
+/// losing the turn.
+fn author_vision_query(
+    cfg: &AppConfig,
+    tok: &Tokenizer,
+    messages: &[ChatMsg],
+    mode: &str,
+) -> Option<String> {
+    let system = "A vision model is about to look at the image the user just attached. It sees \
+ONLY the image and the one question you write - it cannot see this conversation, and it will \
+not be asked again on this turn.
+
+Write the question. Rules:
+- Self-contained: name any detail from the conversation the answer depends on (a value to check \
+against, a spec to compare with, what the user said was wrong).
+- Ask for what the user actually needs, AND for a short description of the rest of the image, so \
+an obvious follow-up does not need a second look.
+- Ask for exact transcription when text, numbers or labels matter.
+- Never answer it yourself, never refer to \"the user\" or \"the conversation\".
+
+Reply with EXACTLY ONE line and nothing else:
+ASK: <the question>";
+
+    let mut msgs: Vec<ChatMsg> = vec![ChatMsg::text("system", system)];
+    // Only the tail matters, and a long history would dominate this small
+    // generation's own budget.
+    let tail: Vec<&ChatMsg> = messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .rev()
+        .take(4)
+        .collect();
+    for m in tail.into_iter().rev() {
+        // TEXT ONLY: re-encoding the picture for the model that is delegating
+        // BECAUSE it cannot see would be absurd. The attachment is announced.
+        let mut c = truncate_for_msg_n(&m.content, 1500);
+        if !m.images.is_empty() {
+            let note = if m.images.len() == 1 {
+                "[the user attached an image here]".to_string()
+            } else {
+                format!("[the user attached {} images here]", m.images.len())
+            };
+            c = if c.trim().is_empty() { note } else { format!("{note}\n{c}") };
+        }
+        msgs.push(ChatMsg::text(&m.role, c));
+    }
+
+    // thinking off: this is a one-line writing task, not a reasoning one
+    let (prompt, stops, _) = build_prompt(cfg, tok, &msgs, false).ok()?;
+    let params = GenParams {
+        max_new: 120,
+        sample: SampleParams {
+            temperature: 0.0, // greedy: the same turn asks the same question
+            top_p: 1.0,
+            top_k: 0,
+            rep_penalty: 1.0,
+            rep_window: 0,
+        },
+        stop_strings: {
+            let mut s = stops;
+            s.push("\n".into()); // one line, then stop
+            s
+        },
+        think_budget: 0,
+        loop_reps: 4,
+    };
+    let (target, tname) = *targets_for(cfg, mode).first()?;
+    let noop_emit = |_: &str| true;
+    let noop_status = |_: &str| true;
+    let stats = generate(
+        cfg, tok, &prompt, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+    )
+    .ok()?;
+    parse_ask_line(&stats.text)
+}
+
+/// Pull the question out of the authoring generation. Tolerant of the usual
+/// model noise (a think block, markdown bold, a leading bullet, a missing
+/// prefix) because the cost of being strict is falling back to a worse question
+/// for no reason.
+fn parse_ask_line(text: &str) -> Option<String> {
+    let cleaned = strip_think(text);
+    for line in cleaned.lines() {
+        let l = line.trim().trim_start_matches(['-', '*', '#', '>', ' ']).trim();
+        let l = l.trim_start_matches("**").trim();
+        let body = match l.strip_prefix("ASK:").or_else(|| l.strip_prefix("ask:")) {
+            Some(rest) => rest.trim(),
+            // a model that just wrote the question without the prefix has still
+            // done the job, as long as the line looks like a question and not
+            // like commentary about the task
+            None if l.len() > 12 && l.ends_with('?') => l,
+            None => continue,
+        };
+        // a model that bolded the prefix leaves the closing `**` on the body
+        let body = body.trim().trim_start_matches("**").trim().trim_matches('"').trim();
+        if body.len() >= 8 {
+            return Some(body.chars().take(600).collect());
+        }
+    }
+    None
+}
+
+/// Run the delegated vision leg, if this turn carries images and the deployment
+/// configured a service, and fold the answer into the turn it belongs to.
+///
+/// The report goes in the USER turn rather than the system prompt for the same
+/// reason search results do: it is data about one question, not standing
+/// instruction, and build_prompt's overflow trimming drops the OLDEST turns -
+/// so the report can never be evicted while the question it belongs to stays.
+///
+/// After this returns, NO message carries image bytes any more. That is the
+/// point: the serving model is (usually) not a VLM, and an image left on a turn
+/// would either be refused or fed to a model that cannot use it. Older turns
+/// that carried pictures keep a one-line marker, so the model does not read a
+/// bare "what about this one?" as a reference to nothing.
+fn apply_vision(
+    cfg: &AppConfig,
+    creq: &ChatReq,
+    messages: &mut [ChatMsg],
+    tok: &Tokenizer,
+    target_mode: &str,
+    on_status: &dyn Fn(&str),
+) -> Result<Option<VisionMeta>, String> {
+    let Some(vcfg) = cfg.vision_service.clone() else { return Ok(None) };
+    // the LAST turn carrying pictures is the one this request is about
+    let Some(idx) = messages.iter().rposition(|m| !m.images.is_empty()) else { return Ok(None) };
+    if vision_plan(cfg, creq.model.as_deref()) == VisionPlan::Local {
+        return Ok(None);
+    }
+
+    let user_text = messages[idx].content.trim().to_string();
+    let question = if vcfg.author_query {
+        on_status("working out what to ask about the image…");
+        author_vision_query(cfg, tok, messages, target_mode).unwrap_or_else(|| {
+            if user_text.is_empty() {
+                "Describe this image in detail, and transcribe any text exactly as it appears."
+                    .to_string()
+            } else {
+                user_text.clone()
+            }
+        })
+    } else if user_text.is_empty() {
+        "Describe this image in detail, and transcribe any text exactly as it appears.".to_string()
+    } else {
+        user_text.clone()
+    };
+
+    let images = messages[idx].images.clone();
+    on_status(&format!(
+        "looking at the {} with the vision model…",
+        if images.len() == 1 { "image" } else { "images" }
+    ));
+    let answer = vision::describe(&vcfg, &images, &question, None, || now_ms() as u64)?;
+
+    // Drop every picture: nothing downstream can use the bytes now.
+    for (i, m) in messages.iter_mut().enumerate() {
+        if m.images.is_empty() || i == idx {
+            continue;
+        }
+        let note = if m.images.len() == 1 {
+            "[an image the user attached earlier in this conversation]"
+        } else {
+            "[images the user attached earlier in this conversation]"
+        };
+        m.content = if m.content.trim().is_empty() {
+            note.to_string()
+        } else {
+            format!("{note}\n{}", m.content.trim())
+        };
+        m.images.clear();
+    }
+    messages[idx].images.clear();
+    messages[idx].content = if user_text.is_empty() {
+        format!(
+            "{}\nThe user sent the image with no message. Tell them what it shows, in your own \
+             words.",
+            vision::render_context(&answer)
+        )
+    } else {
+        format!("{}\nQuestion: {user_text}", vision::render_context(&answer))
+    };
+
+    Ok(Some(VisionMeta {
+        model: answer.model,
+        question: answer.question,
+        images: answer.images,
+        image_tokens: answer.image_tokens,
+        ms: answer.ms,
+    }))
+}
+
 struct SearchMeta {
     provider: String,
     /// (title, url) per hit, in the order the model was shown them, so the
@@ -2380,33 +3135,84 @@ fn strip_think(content: &str) -> String {
     }
 }
 
+/// One run of a prompt: either tokens, or a picture the HOST has to encode.
+enum PromptPart {
+    Text(Vec<u32>),
+    /// raw image file bytes, handed to the host's "image" verb verbatim
+    Image(Vec<u8>),
+}
+
+/// A prompt ready to feed: its parts in order, plus the flat token stream for
+/// everything that IS text. A text-only prompt is exactly what it always was,
+/// which is what lets every existing path (speculative decode, the repetition
+/// window, the token stats) keep working untouched.
+struct Prompt {
+    parts: Vec<PromptPart>,
+    text_ids: Vec<u32>,
+    images: usize,
+}
+
+impl Prompt {
+    /// The whole prompt as tokens, or None when a picture is in the way. The
+    /// paths that cannot express an image (speculative decode: its position
+    /// bookkeeping counts tokens, and an image advances positions by its own
+    /// arithmetic) ask for this and fall back to the plain path on None.
+    fn text_only(&self) -> Option<&[u32]> {
+        (self.images == 0).then_some(self.text_ids.as_slice())
+    }
+
+}
+
 /// Render + tokenize the conversation; drops oldest turns until it fits.
 /// A `system` message in the request overrides the configured default.
 /// The returned bool is Rendered::think_open: the prompt force-opened a
 /// think block that the caller must re-emit in the visible output.
+///
+/// IMAGES: an attachment leaves a MEDIA_MARK in its turn's text, the template
+/// renders the conversation as usual, and the result is split back apart on
+/// those marks. So the model receives its own chat format exactly as it was
+/// trained on it, with the pictures sitting where the marks were, and this
+/// function needs to know nothing about how any particular VLM wraps an image
+/// (the host's projector adds whatever tokens the model expects around it).
 fn build_prompt(
     cfg: &AppConfig,
     tok: &Tokenizer,
     messages: &[ChatMsg],
     thinking: bool, // the request's switch; only cfg.thinking models act on it
-) -> Result<(Vec<u32>, Vec<String>, bool), String> {
+) -> Result<(Prompt, Vec<String>, bool), String> {
     let system = messages
         .iter()
         .find(|m| m.role == "system")
-        .map(|m| m.content.clone())
+        .map(|m| strip_marks(&m.content))
         .unwrap_or_else(|| cfg.system_prompt.clone());
-    let mut msgs: Vec<(String, String)> = messages
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| {
-            let content = if cfg.thinking && m.role == "assistant" {
-                strip_think(&m.content)
+    // (role, text) per turn, with the turn's images kept alongside by INDEX.
+    // Marks are stripped from incoming text FIRST: they are our own private
+    // punctuation, and a message that arrived carrying one must not be able to
+    // claim an image slot.
+    let mut msgs: Vec<(String, String)> = Vec::new();
+    let mut turn_images: Vec<&[Vec<u8>]> = Vec::new();
+    for m in messages.iter().filter(|m| m.role == "user" || m.role == "assistant") {
+        let content = if cfg.thinking && m.role == "assistant" {
+            strip_think(&m.content)
+        } else {
+            m.content.clone()
+        };
+        let mut content = strip_marks(&content);
+        // Pictures lead the turn, then the words about them. An image-only
+        // turn still gets a sentence: a bare image with no instruction is
+        // out of distribution for chat-tuned VLMs, and "describe it" is
+        // what a user who typed nothing meant.
+        if !m.images.is_empty() {
+            let marks = config::MEDIA_MARK.repeat(m.images.len());
+            content = if content.trim().is_empty() {
+                format!("{marks}\nDescribe this image in detail.")
             } else {
-                m.content.clone()
+                format!("{marks}\n{content}")
             };
-            (m.role.clone(), content)
-        })
-        .collect();
+        }
+        msgs.push((m.role.clone(), content));
+        turn_images.push(&m.images);
+    }
     if msgs.is_empty() {
         return Err("no user/assistant messages".into());
     }
@@ -2419,22 +3225,86 @@ fn build_prompt(
     };
     loop {
         let rendered = config::render_template(&cfg.template, &system, &msgs, think)?;
-        let enc = tok
-            .encode(rendered.prompt.as_str(), true)
-            .map_err(|e| format!("tokenize: {e}"))?;
-        let ids = enc.get_ids().to_vec();
-        if ids.len() <= cfg.max_prompt_tokens || msgs.len() <= 1 {
-            if ids.len() > cfg.max_prompt_tokens {
+        // The picture bytes are cloned ONCE, for the render that actually
+        // fits: a trim round that is about to be thrown away has no business
+        // copying several megabytes to find that out.
+        let images: usize = turn_images.iter().map(|im| im.len()).sum();
+        let total = tokens_of(tok, &rendered.prompt)? + images * cfg.image_tokens;
+        if total <= cfg.max_prompt_tokens || msgs.len() <= 1 {
+            if total > cfg.max_prompt_tokens {
                 return Err(format!(
-                    "message too long: {} tokens (limit {})",
-                    ids.len(),
-                    cfg.max_prompt_tokens
+                    "message too long: {total} tokens (limit {}){}",
+                    cfg.max_prompt_tokens,
+                    if images > 0 {
+                        format!(" - {images} image(s) are budgeted at {} tokens each",
+                                cfg.image_tokens)
+                    } else {
+                        String::new()
+                    }
                 ));
             }
-            return Ok((ids, rendered.stop_strings, rendered.think_open));
+            let bytes: Vec<Vec<u8>> =
+                turn_images.iter().flat_map(|im| im.iter().cloned()).collect();
+            let prompt = split_rendered(tok, &rendered.prompt, bytes)?;
+            return Ok((prompt, rendered.stop_strings, rendered.think_open));
         }
         msgs.remove(0); // drop the oldest turn and retry
+        turn_images.remove(0); // ...and the pictures that were part of it
     }
+}
+
+/// How many tokens a rendered prompt costs, media marks excluded (they are
+/// punctuation for the splitter, not text for the model).
+fn tokens_of(tok: &Tokenizer, rendered: &str) -> Result<usize, String> {
+    let text = rendered.replace(config::MEDIA_MARK, "");
+    Ok(tok.encode(text.as_str(), true).map_err(|e| format!("tokenize: {e}"))?.len())
+}
+
+/// Cut the rendered prompt at its media marks and tokenize the text between
+/// them. Only the FIRST run gets the tokenizer's special-token treatment, the
+/// same as a whole prompt would: later runs continue a sequence that already
+/// began, so re-adding a BOS at each image would corrupt it.
+fn split_rendered(
+    tok: &Tokenizer,
+    rendered: &str,
+    images: Vec<Vec<u8>>,
+) -> Result<Prompt, String> {
+    let chunks: Vec<&str> = rendered.split(config::MEDIA_MARK).collect();
+    if chunks.len() - 1 != images.len() {
+        return Err(format!(
+            "prompt has {} image slots but {} images",
+            chunks.len() - 1,
+            images.len()
+        ));
+    }
+    let mut parts = Vec::with_capacity(chunks.len() + images.len());
+    let mut text_ids = Vec::new();
+    let mut imgs = images.into_iter();
+    for (i, chunk) in chunks.iter().enumerate() {
+        if !chunk.is_empty() {
+            let enc = tok
+                .encode(*chunk, i == 0)
+                .map_err(|e| format!("tokenize: {e}"))?;
+            let ids = enc.get_ids().to_vec();
+            if !ids.is_empty() {
+                text_ids.extend_from_slice(&ids);
+                parts.push(PromptPart::Text(ids));
+            }
+        }
+        if let Some(img) = imgs.next() {
+            parts.push(PromptPart::Image(img));
+        }
+    }
+    let images = parts.iter().filter(|p| matches!(p, PromptPart::Image(_))).count();
+    Ok(Prompt { parts, text_ids, images })
+}
+
+/// Remove media marks from text that came from outside.
+fn strip_marks(s: &str) -> String {
+    if s.contains(config::MEDIA_MARK) {
+        return s.replace(config::MEDIA_MARK, "");
+    }
+    s.to_string()
 }
 
 /// `think_open` is build_prompt's: the think budget only arms on a turn whose
@@ -2537,8 +3407,13 @@ fn respond_with_cache(
 /// Machine-readable conditions ggml_load_err() tags inside its messages (as
 /// "[code] "); json_err lifts the tag into `error.code` so the playground can
 /// render the right state instead of pattern-matching prose.
-const ERR_CODES: &[&str] =
-    &["model_not_loaded", "host_load_failed", "volume_not_attached", "sessions_busy"];
+const ERR_CODES: &[&str] = &[
+    "model_not_loaded", "host_load_failed", "volume_not_attached", "sessions_busy",
+    // vision: the first three are the user's to fix (wrong model, too many,
+    // too big), the rest describe the deployment or its node
+    "no_vision", "too_many_images", "image_too_large", "vision_unsupported",
+    "vision_unavailable", "image_undecodable", "image_too_wide",
+];
 
 /// Drop the "[code] " marker from a message bound for a payload without a
 /// code field of its own (the chat stream / SSE error lines).
@@ -2595,6 +3470,13 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
     };
+    // Attachments are vetted BEFORE the stream opens: this is the one class of
+    // failure where a plain HTTP status is better than an error event, because
+    // the client can then keep the picture and let the user pick another model
+    // rather than treating it as a failed turn.
+    if let Err(e) = check_images(raw, cfg, &creq.messages) {
+        return json_err(out, 400, &e);
+    }
     let tok_bytes = match read_tokenizer(cfg) {
         Ok(b) => b,
         Err(e) => return json_err(out, 500, &e),
@@ -2656,6 +3538,21 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // model is still working through them
     if let Some(m) = &search_meta {
         let _ = send(serde_json::json!({ "search": search_meta_json(m) }));
+    }
+    // --- vision leg, narrated. AFTER the search leg so a "/search ..." prefix
+    // is still at the head of the message where strip_search_prefix looks for
+    // it; the report is prepended to whatever that leg left behind.
+    let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &status_cb) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = send(serde_json::json!({ "error": format!("{e}") }));
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
+    };
+    if let Some(m) = &vision_meta {
+        let _ = send(serde_json::json!({ "vision": vision_meta_json(m) }));
     }
     // the image lands BEFORE the reply, so it is on screen while the model
     // writes its sentence about it
@@ -2722,6 +3619,12 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                 if s.think_forced {
                     done["think_forced"] = serde_json::json!(true);
                 }
+                if s.images > 0 {
+                    done["images"] = serde_json::json!(s.images);
+                    // what the pictures REALLY cost, from the host - the
+                    // config's per-image budget is only for admission control
+                    done["image_tokens"] = serde_json::json!(s.image_pos);
+                }
                 send(done);
                 ok = true;
                 break;
@@ -2761,6 +3664,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
     };
+    if let Err(e) = check_images(raw, cfg, &creq.messages) {
+        return json_err(out, 400, &e);
+    }
     let tok_bytes = match read_tokenizer(cfg) {
         Ok(b) => b,
         Err(e) => return json_err(out, 500, &e),
@@ -2786,6 +3692,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         &mut generated_image,
         &no_status,
     ) {
+        Ok(m) => m,
+        Err(e) => return json_err(out, 502, &e),
+    };
+    // the delegated vision leg (see apply_vision); a deployment with no
+    // vision_service, or a serving model reading the picture itself, no-ops here
+    let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
         Ok(m) => m,
         Err(e) => return json_err(out, 502, &e),
     };
@@ -2830,6 +3742,11 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // comment line is required to be ignored by every conforming parser.
         if let Some(m) = &search_meta {
             let _ = send_raw(&format!(": enclave-search {}\n\n", search_meta_json(m)));
+        }
+        // same trick for the delegated vision look: what was asked about the
+        // picture and what it cost, where a strict OpenAI parser will ignore it
+        if let Some(m) = &vision_meta {
+            let _ = send_raw(&format!(": enclave-vision {}\n\n", vision_meta_json(m)));
         }
         // role preamble chunk (OpenAI clients expect it)
         let _ = send_raw(&chunk(serde_json::json!({ "role": "assistant" }), None));
@@ -2913,8 +3830,18 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                              "draft_tokens": s.drafted, "draft_accepted": s.accepted,
                              "think_forced": s.think_forced },
                 });
+                if s.images > 0 {
+                    // usage.prompt_tokens counts the text; images are priced
+                    // in positions and reported beside it rather than folded
+                    // in, so an OpenAI client's arithmetic still adds up
+                    body_json["enclave"]["images"] = serde_json::json!(s.images);
+                    body_json["enclave"]["image_tokens"] = serde_json::json!(s.image_pos);
+                }
                 if let Some(m) = &search_meta {
                     body_json["enclave"]["search"] = search_meta_json(m);
+                }
+                if let Some(m) = &vision_meta {
+                    body_json["enclave"]["vision"] = vision_meta_json(m);
                 }
                 respond_bytes(out, 200, "application/json", body_json.to_string().as_bytes());
             }
@@ -3112,6 +4039,11 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "bytes": e.bytes, "default": i == 0,
                 "fits": !unfit.contains_key(&e.volume),
                 "thinking": e.cfg.thinking,
+                // whether this model can READ pictures. The playground offers
+                // the attach button per model, so switching to a text-only
+                // model visibly takes the capability away instead of failing
+                // a turn the user has already typed.
+                "vision": e.cfg.vision && e.cfg.backend == "ggml",
             });
             if let Some(why) = unfit.get(&e.volume) {
                 m["why"] = serde_json::json!(why);
@@ -3140,6 +4072,20 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
         Some(i) => serde_json::json!({ "enabled": true, "size": i.size, "model": i.model }),
         None => serde_json::json!({ "enabled": false }),
     };
+    // Vision is normally a MODEL property (each entry carries its own flag
+    // above), EXCEPT when the deployment configured a vision service: that
+    // reads for every model, so the composer must offer the attach button
+    // whatever is selected. `service` is the flag it uses for that; the
+    // endpoint is NOT exposed - it is deployment topology, and the browser
+    // never talks to it, only this app does.
+    let vision_any = entries.iter().any(|e| e.cfg.vision && e.cfg.backend == "ggml");
+    let service = base_cfg.as_ref().map(|c| c.vision_service.is_some()).unwrap_or(false);
+    body["vision"] = serde_json::json!({
+        "enabled": vision_any || service,
+        "service": service,
+        "max_images": base_cfg.as_ref().map(|c| c.max_images).unwrap_or(0),
+        "max_bytes": base_cfg.as_ref().map(|c| c.max_image_bytes).unwrap_or(0),
+    });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }
 
@@ -3154,6 +4100,24 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
 /// point anywhere and have the enclave's address wear it. A deployment with no
 /// api_key is open by policy (gate it by deploying PRIVATE), but where the
 /// operator did set one, this must not be the hole in it.
+/// This deployment's own hardware attestation, for the dialog behind the shield
+/// icon. OPEN, like /models: what the hardware is has to be readable BEFORE you
+/// decide to type into the box, so putting it behind the deployment's API key
+/// would defeat the purpose.
+///
+/// Failure is normal and is reported as such: a deployment with no egress leg
+/// cannot reach the platform API at all, and the dialog then falls back to the
+/// deployment id and the verify-it-yourself links.
+fn handle_attestation(req: IncomingRequest, out: ResponseOutparam) {
+    let host = req.authority();
+    match attest::document(host.as_deref()) {
+        Ok(doc) => respond_bytes(out, 200, "application/json", doc.to_string().as_bytes()),
+        // 503, not 500: nothing is broken in the app - the attestation is
+        // momentarily unreachable from in here, and the page says so.
+        Err(e) => json_err(out, 503, &e),
+    }
+}
+
 fn handle_search_probe(
     raw: &serde_json::Value,
     req: IncomingRequest,
@@ -3301,6 +4265,7 @@ impl Guest for Component {
                 format!("{{\"ok\":true,\"pong\":true,\"t\":{}}}", now_ms()).as_bytes(),
             ),
             (Method::Get, "/models") => handle_model_list(&raw, out),
+            (Method::Get, "/attestation") => handle_attestation(req, out),
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
             (Method::Post, "/chat") => handle_chat(&raw, req, out),
@@ -3309,7 +4274,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /emoji.woff2, GET /ping, GET /models, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
+                "not found; routes: GET /, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
             ),
         }
     }
@@ -3332,6 +4297,26 @@ mod tests {
             Some(RouterVerdict::Image(p)) => Some(p),
             _ => None,
         }
+    }
+
+    /// A tiny real tokenizer, so the prompt-splitting tests exercise the same
+    /// code path production does instead of a stand-in. Word level, unknown
+    /// words map to [UNK]: the tests care about STRUCTURE (which runs of text
+    /// became which parts), never about the specific ids.
+    fn test_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
+            "decoder":null,
+            "model":{"type":"WordLevel","vocab":{"[UNK]":0,"before":1,"after":2,"caption":3,
+            "this":4,"no":5,"pictures":6,"here":7,"slot":8},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer")
+    }
+
+    /// The app's own embedded defaults, which is what a deployment starts from.
+    fn test_config() -> AppConfig {
+        let v: serde_json::Value =
+            serde_json::from_slice(config::APP_CONFIG_JSON).expect("embedded config is JSON");
+        config::from_value(v).expect("embedded config parses")
     }
 
     #[test]
@@ -3460,5 +4445,311 @@ mod tests {
         // the two command families do not overlap
         assert_eq!(strip_search_prefix("/image a red fox"), None);
         assert_eq!(strip_image_prefix("/search rust"), None);
+    }
+
+    // ---------------------------------------------------------- vision --
+
+    /// The smallest valid PNG header the sniffer accepts, padded past the
+    /// 12-byte minimum.
+    fn png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(b"IHDRxxxx");
+        v
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_roundtrips_and_rejects_junk() {
+        let img = png_bytes();
+        assert_eq!(b64_decode(&b64(&img)).unwrap(), img);
+        // padding is optional and whitespace is ignored (hand-built requests)
+        let padded = b64(&img);
+        let loose = format!("{}\n {}", &padded[..8], &padded[8..].replace('=', ""));
+        assert_eq!(b64_decode(&loose).unwrap(), img);
+        assert!(b64_decode("not base64!").is_err());
+        assert!(b64_decode("").is_err());
+    }
+
+    #[test]
+    fn image_formats_are_sniffed_not_trusted() {
+        assert_eq!(image_kind(&png_bytes()), Some("png"));
+        assert_eq!(image_kind(&[0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0]), Some("jpeg"));
+        let mut webp = b"RIFF0000WEBPVP8 ".to_vec();
+        webp.truncate(16);
+        assert_eq!(image_kind(&webp), Some("webp"));
+        assert_eq!(image_kind(b"GIF89a000000"), Some("gif"));
+        // a mislabelled upload is caught here, not in the vision encoder
+        assert_eq!(image_kind(b"<html>not an image"), None);
+        assert_eq!(image_kind(b"short"), None);
+    }
+
+    #[test]
+    fn a_webp_upload_reaches_the_encoder_as_jpeg() {
+        // stb_image inside mtmd has no VP8, so bytes that arrive as webp must
+        // leave this function as something the encoder can actually read. The
+        // failure this prevents was a live one: the host refused the picture
+        // with a message that listed webp among the formats it reads.
+        let mut src = Vec::new();
+        for _ in 0..(24 * 24) {
+            src.extend_from_slice(&[7, 130, 255]);
+        }
+        let mut wp = Vec::new();
+        image_webp::WebPEncoder::new(&mut wp)
+            .encode(&src, 24, 24, image_webp::ColorType::Rgb8)
+            .unwrap();
+        assert_eq!(image_kind(&wp), Some("webp"));
+        let out = decode_image_src(&format!("data:image/webp;base64,{}", b64(&wp))).unwrap();
+        assert_eq!(image_kind(&out), Some("jpeg"), "webp must not survive the door");
+        // every other format is passed through untouched
+        assert_eq!(decode_image_src(&format!("data:image/png;base64,{}", b64(&png_bytes()))).unwrap(),
+            png_bytes());
+    }
+
+    #[test]
+    fn image_src_takes_data_uris_and_refuses_remote_urls() {
+        let uri = format!("data:image/png;base64,{}", b64(&png_bytes()));
+        assert_eq!(decode_image_src(&uri).unwrap(), png_bytes());
+        // bare base64 (the Anthropic content shape) needs no envelope
+        assert_eq!(decode_image_src(&b64(&png_bytes())).unwrap(), png_bytes());
+        // a remote URL is refused rather than fetched: fetching would tell a
+        // third party what this deployment is looking at
+        let e = decode_image_src("https://example.com/cat.png").unwrap_err();
+        assert!(e.contains("not fetched"), "{e}");
+        // and a data: URI holding something that is not an image
+        let junk = format!("data:image/png;base64,{}", b64(b"<html>nope, plain text"));
+        assert!(decode_image_src(&junk).is_err());
+    }
+
+    #[test]
+    fn content_parts_parse_in_all_three_spellings() {
+        let uri = format!("data:image/png;base64,{}", b64(&png_bytes()));
+        let openai: ChatMsg = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": uri}},
+            ]
+        })).unwrap();
+        assert_eq!(openai.content, "what is this");
+        assert_eq!(openai.images.len(), 1);
+        assert_eq!(openai.images[0], png_bytes());
+
+        let responses: ChatMsg = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": format!("data:image/png;base64,{}", b64(&png_bytes()))}]
+        })).unwrap();
+        assert_eq!(responses.images.len(), 1);
+
+        let anthropic: ChatMsg = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                     "data": b64(&png_bytes())}}]
+        })).unwrap();
+        assert_eq!(anthropic.images.len(), 1);
+
+        // and the plain string form is untouched
+        let plain: ChatMsg = serde_json::from_value(serde_json::json!({
+            "role": "user", "content": "just words"
+        })).unwrap();
+        assert_eq!(plain.content, "just words");
+        assert!(plain.images.is_empty());
+    }
+
+    #[test]
+    fn media_marks_cannot_be_forged_by_a_message() {
+        // a message that arrives carrying our private marker must not be able
+        // to claim an image slot: the mark is stripped before rendering
+        let sneaky = format!("look{}here", config::MEDIA_MARK);
+        assert_eq!(strip_marks(&sneaky), "lookhere");
+        assert!(!strip_marks(&sneaky).contains(config::MEDIA_MARK));
+    }
+
+    #[test]
+    fn rendered_prompt_splits_around_its_images() {
+        let tok = test_tokenizer();
+        let rendered = format!("before {} after", config::MEDIA_MARK);
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()]).unwrap();
+        assert_eq!(p.images, 1);
+        assert_eq!(p.parts.len(), 3);
+        assert!(matches!(p.parts[0], PromptPart::Text(_)));
+        assert!(matches!(p.parts[1], PromptPart::Image(_)));
+        assert!(matches!(p.parts[2], PromptPart::Text(_)));
+        // the flat token stream is the text runs, in order, and nothing else
+        let joined: Vec<u32> = p.parts.iter().filter_map(|x| match x {
+            PromptPart::Text(t) => Some(t.clone()),
+            _ => None,
+        }).flatten().collect();
+        assert_eq!(joined, p.text_ids);
+        // text-only prompts stay exactly what they were
+        let plain = split_rendered(&tok, "no pictures here", vec![]).unwrap();
+        assert!(plain.text_only().is_some());
+        assert!(p.text_only().is_none());
+        // slot/image count mismatches are caught rather than silently misaligned
+        assert!(split_rendered(&tok, &rendered, vec![]).is_err());
+        assert!(split_rendered(&tok, "no slot", vec![png_bytes()]).is_err());
+    }
+
+    #[test]
+    fn an_image_at_the_end_leaves_no_dangling_slot() {
+        let tok = test_tokenizer();
+        let rendered = format!("caption this {}", config::MEDIA_MARK);
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()]).unwrap();
+        // trailing empty chunk contributes no part
+        assert_eq!(p.parts.len(), 2);
+        assert!(matches!(p.parts[1], PromptPart::Image(_)));
+    }
+
+    #[test]
+    fn a_projector_is_not_mistaken_for_a_model() {
+        // both sides of the boundary use this rule: the app to pick the
+        // weights file out of a vision volume, the host to pick the projector
+        assert!(is_mmproj(Path::new("/models/vl/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf")));
+        assert!(is_mmproj(Path::new("/models/vl/MMPROJ-model-f16.gguf")));
+        assert!(!is_mmproj(Path::new("/models/vl/model.gguf")));
+        assert!(!is_mmproj(Path::new("/models/vl/Qwen3VL-8B-Instruct-Q4_K_M.gguf")));
+    }
+
+    #[test]
+    fn images_are_refused_by_models_that_cannot_see() {
+        let raw = serde_json::json!({});
+        let mut cfg = test_config();
+        let msgs = vec![ChatMsg {
+            role: "user".into(),
+            content: "what is this".into(),
+            images: vec![png_bytes()],
+        }];
+        // text-only model: refused, and the message says which knob is wrong
+        cfg.vision = false;
+        let e = check_images(&raw, &cfg, &msgs).unwrap_err();
+        assert!(e.starts_with("[no_vision]"), "{e}");
+        // the onnx backend has no image verb at all, vision flag or not
+        cfg.vision = true;
+        cfg.backend = "onnx".into();
+        assert!(check_images(&raw, &cfg, &msgs).is_err());
+        // a vision model on ggml accepts it
+        cfg.backend = "ggml".into();
+        assert_eq!(check_images(&raw, &cfg, &msgs).unwrap(), 1);
+        // ...within the deployment's limits
+        cfg.max_images = 1;
+        let two = vec![msgs[0].clone(), msgs[0].clone()];
+        assert!(check_images(&raw, &cfg, &two).unwrap_err().starts_with("[too_many_images]"));
+        cfg.max_images = 4;
+        cfg.max_image_bytes = 4;
+        assert!(check_images(&raw, &cfg, &msgs).unwrap_err().starts_with("[image_too_large]"));
+        // a text-only request never touches any of this
+        cfg.vision = false;
+        assert_eq!(check_images(&raw, &cfg, &[ChatMsg::text("user", "hi")]).unwrap(), 0);
+    }
+
+    fn vision_service() -> vision::VisionConfig {
+        serde_json::from_value(serde_json::json!({ "endpoint": "https://eye.app.enclave.host" }))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_vision_service_lets_a_text_only_model_take_pictures() {
+        let raw = serde_json::json!({});
+        let mut cfg = test_config();
+        cfg.vision = false;
+        let msgs =
+            vec![ChatMsg { role: "user".into(), content: "what is this".into(), images: vec![png_bytes()] }];
+        // without a service this is the refusal asserted above...
+        assert!(check_images(&raw, &cfg, &msgs).is_err());
+        // ...with one, the turn is accepted and the sibling deployment reads it
+        cfg.vision_service = Some(vision_service());
+        assert_eq!(check_images(&raw, &cfg, &msgs).unwrap(), 1);
+        // the per-request limits still bind - they are about THIS app's window
+        cfg.max_image_bytes = 4;
+        assert!(check_images(&raw, &cfg, &msgs).unwrap_err().starts_with("[image_too_large]"));
+    }
+
+    #[test]
+    fn who_reads_the_picture() {
+        let mut cfg = test_config();
+        cfg.backend = "ggml".into(); // the only backend with an image verb
+        // no service configured: always the serving model, whatever it can do
+        cfg.vision = true;
+        assert_eq!(vision_plan(&cfg, None), VisionPlan::Local);
+        cfg.vision = false;
+        assert_eq!(vision_plan(&cfg, None), VisionPlan::Local);
+
+        cfg.vision_service = Some(vision_service());
+        // a text-only serving model has nothing to decide
+        assert_eq!(vision_plan(&cfg, None), VisionPlan::Delegate);
+        // a serving model that CAN see still delegates by default: that is what
+        // configuring a service means
+        cfg.vision = true;
+        assert_eq!(vision_plan(&cfg, None), VisionPlan::Delegate);
+        // ...unless the request NAMED it, by model name or by volume
+        assert_eq!(vision_plan(&cfg, Some(&cfg.name.clone())), VisionPlan::Local);
+        assert_eq!(vision_plan(&cfg, Some(&cfg.model_volume.clone())), VisionPlan::Local);
+        // naming some OTHER model is not an instruction about this one
+        assert_eq!(vision_plan(&cfg, Some("something-else")), VisionPlan::Delegate);
+        // ...or unless the deployment asked for local reads
+        cfg.vision_service.as_mut().unwrap().prefer_local = true;
+        assert_eq!(vision_plan(&cfg, None), VisionPlan::Local);
+        // prefer_local cannot conjure a capability the model does not have
+        cfg.vision = false;
+        assert_eq!(vision_plan(&cfg, None), VisionPlan::Delegate);
+    }
+
+    #[test]
+    fn the_authored_question_survives_model_noise() {
+        assert_eq!(
+            parse_ask_line("ASK: What does the error dialog say, exactly?").as_deref(),
+            Some("What does the error dialog say, exactly?")
+        );
+        // a think block, a bullet, bold, quotes, a lowercase prefix
+        assert_eq!(
+            parse_ask_line("<think>hmm</think>\n- **ask:** \"Read the total.\""),
+            Some("Read the total.".to_string())
+        );
+        // no prefix at all, but it is plainly a question
+        assert_eq!(
+            parse_ask_line("Which of the three buttons is disabled?").as_deref(),
+            Some("Which of the three buttons is disabled?")
+        );
+        // commentary is not a question, and nothing usable means fall back
+        assert_eq!(parse_ask_line("Sure, I can help with that."), None);
+        assert_eq!(parse_ask_line("ASK:"), None);
+        assert_eq!(parse_ask_line(""), None);
+    }
+
+    #[test]
+    fn a_delegated_turn_ends_up_with_no_image_bytes_and_a_report() {
+        // the fold itself, without the network: render_context + the rewrite
+        // rules apply_vision uses
+        let a = vision::VisionAnswer {
+            text: "A red barn beside a fence.".into(),
+            question: "What is in this photo?".into(),
+            model: Some("qwen3-vl-8b".into()),
+            images: 1,
+            image_tokens: 258,
+            ms: 1200,
+            truncated: false,
+        };
+        let report = vision::render_context(&a);
+        let folded = format!("{report}\nQuestion: what is this");
+        // the model is told it did not see the picture, and the user's own
+        // question is the last thing in the turn
+        assert!(folded.contains("VISION REPORT"));
+        assert!(folded.trim_end().ends_with("Question: what is this"));
+        assert!(folded.contains("A red barn beside a fence."));
     }
 }
