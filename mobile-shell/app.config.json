@@ -1,0 +1,10 @@
+{
+  "name": "eyesoff",
+  "displayName": "eyesoff.ai",
+  "appId": "ai.eyesoff.app",
+  "url": "https://eyesoff.ai",
+  "attestationPath": "/attestation",
+  "repo": "EnclaveHost/enclave",
+  "backgroundColor": "#212121",
+  "themeColor": "#212121"
+}

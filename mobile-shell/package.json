@@ -1,0 +1,27 @@
+{
+  "name": "enclave-mobile-shell",
+  "version": "1.0.0",
+  "description": "Verify-first mobile shell that wraps an Enclave app for Android/iOS",
+  "scripts": {
+    "configure": "node configure.mjs",
+    "bundle": "esbuild src/splash.js --bundle --minify --format=iife --platform=browser --external:zlib --outfile=www/splash.bundle.js",
+    "build": "npm run configure && npm run bundle",
+    "test:live": "node test/verify.live.mjs",
+    "sync": "npm run build && cap sync android"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@capacitor/core": "^8.4.2",
+    "@tinfoilsh/verifier": "^1.1.10"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.4.2",
+    "@capacitor/cli": "^8.4.2",
+    "@capacitor/ios": "^8.4.2",
+    "esbuild": "^0.28.1"
+  },
+  "private": true
+}
