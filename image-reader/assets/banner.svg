@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <!-- Image Reader: lens-over-picture wordmark banner; pictures in, prose out,
+       and no socket to send either anywhere. -->
+  <defs>
+    <radialGradient id="glow" cx="18%" cy="0%" r="90%">
+      <stop offset="0%" stop-color="#b57bea" stop-opacity=".10"/>
+      <stop offset="60%" stop-color="#b57bea" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glass" cx="34%" cy="28%" r="82%">
+      <stop offset="0%" stop-color="#e0d2fd"/>
+      <stop offset="45%" stop-color="#b57bea"/>
+      <stop offset="100%" stop-color="#5b3f86"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="400" fill="#0b0d12"/>
+  <rect width="1600" height="400" fill="url(#glow)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#252b38" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#b57bea">[ Image <tspan fill="#dcc6fb">Reader</tspan> ]</text>
+  <text x="90" y="205" font-size="26" fill="#868ea0">private vision on the enclave's attested GPUs; send a picture</text>
+  <text x="90" y="240" font-size="26" fill="#868ea0">and a question, get an answer, and nothing is kept</text>
+  <text x="90" y="300" font-size="20" fill="#5b667a">image + question &#8594; vision model in the TEE &#8594; prose; no outbound socket, nothing on disk</text>
+
+  <!-- the lens, at card scale -->
+  <g transform="translate(1150,58) scale(2.9)">
+    <!-- the picture: frame, sun, hills -->
+    <rect x="10" y="17" width="64" height="52" rx="7" fill="#f2f4f8" stroke="#454a72" stroke-width="2"/>
+    <circle cx="27" cy="32" r="5.5" fill="#b57bea"/>
+    <path d="M15 61 L31 42 L43 57 L52 47 L69 61 Z" fill="#454a72"/>
+
+    <!-- the lens, straddling the corner: far enough out that the picture stays
+    legible behind it, close enough to be obviously ON it -->
+    <circle cx="66" cy="63" r="17" fill="#232735"/>
+    <circle cx="66" cy="63" r="12.5" fill="url(#glass)"/>
+    <circle cx="61" cy="58" r="2.8" fill="#f2f4f8" opacity=".9"/>
+    <rect x="76" y="74" width="17" height="9" rx="4.5"
+    transform="rotate(45 76 74)" fill="#232735"/>
+  </g>
+</svg>

@@ -1,0 +1,33 @@
+{
+  "name": "qwen3-vl-8b",
+  "model_volume": "qwen3-vl-8b-gguf",
+  "n_layers": 36,
+  "n_kv_heads": 8,
+  "head_dim": 128,
+  "vocab": 151936,
+  "eos": [
+   151645,
+   151643
+  ],
+  "template": "chatml",
+  "system_prompt": "You are a careful visual analyst. Answer only from what is actually visible in the image. Transcribe text exactly as it appears, including punctuation and case. Report numbers, labels and colours precisely. When something is cut off, blurred or too small to read, say so and say where, rather than guessing. When you are asked a yes/no question, answer it first and then give the evidence you saw. Do not speculate about what is outside the frame, and do not describe what you would expect to be there.",
+  "default_question": "Describe this image in detail. Transcribe any text exactly as it appears.",
+  "max_prompt_tokens": 32768,
+  "default_max_new": 1024,
+  "max_new_cap": 4096,
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "top_k": 40,
+  "rep_penalty": 1.05,
+  "rep_window": 64,
+  "repeat_guard": 4,
+  "image_tokens": 1600,
+  "max_image_bytes": 8388608,
+  "max_images": 4,
+  "require_image": true,
+  "models": {
+   "qwen3-vl-8b-gguf": {
+    "name": "qwen3-vl-8b"
+   }
+  }
+}

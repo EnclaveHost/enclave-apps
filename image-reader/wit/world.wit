@@ -1,0 +1,22 @@
+// image-reader: a vision-language model that answers questions about images,
+// as a wasm component with a built-in web UI. Imports wasi:nn (the GPU
+// interface bought with gpuShare) and exports the wasi:http handler.
+//
+// It does NOT import wasi:http/outgoing-handler, and that absence is a
+// FEATURE rather than an omission: this component cannot make an outbound
+// request of any kind, so an image it is shown cannot be forwarded anywhere,
+// and a remote image URL is something it is structurally incapable of
+// fetching (callers inline the bytes). The attestation covers the component,
+// so this is a property a caller can verify rather than a promise.
+//
+// WIT deps are vendored verbatim from wasmtime v45 (wasi@0.2.6,
+// wasi:nn@0.2.0-rc-2024-10-28) so guest and host always agree.
+package enclave:image-reader;
+
+world image-reader {
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  export wasi:http/incoming-handler@0.2.6;
+}
