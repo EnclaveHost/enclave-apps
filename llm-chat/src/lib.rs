@@ -2528,6 +2528,13 @@ struct ChatReq {
     /// meaning.
     #[serde(default)]
     web_search: Option<serde_json::Value>,
+    /// extension (needs config.image): whether the model may decide this turn
+    /// wants a PICTURE. Absent takes the deployment's `image.default_on`, which
+    /// is true - see ImageConfig. Separate from `web_search` on purpose: the
+    /// two send different things to different places, so one switch could only
+    /// ever be wrong about one of them.
+    #[serde(default)]
+    image_gen: Option<serde_json::Value>,
     /// extension (needs config.tools): `true` lets the model call the tools
     /// this DEPLOYMENT configured, `false` withholds them. Absent takes the
     /// deployment's `default_on`, which is false unless it says otherwise.
@@ -2588,6 +2595,20 @@ impl ChatReq {
     /// exact failure this whole feature exists to remove.
     fn client_declared_tools(&self) -> bool {
         self.tools.as_ref().and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+    }
+
+    /// Does this request let the router reach for an image? `false`/`"off"`
+    /// withholds it, `true`/`"auto"` allows it, absent takes the deployment's
+    /// default. There is no "always": an image on every turn is not a mode
+    /// anyone wants, and `/image ` already forces one.
+    fn image_on(&self, default_on: bool) -> bool {
+        match &self.image_gen {
+            Some(v) if v.as_bool() == Some(true) => true,
+            Some(v) if v.as_bool() == Some(false) => false,
+            Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("auto")) => true,
+            Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("off")) => false,
+            _ => default_on,
+        }
     }
 
     fn web_mode(&self) -> WebMode {
@@ -3765,30 +3786,38 @@ fn apply_web_search(
     let stripped = strip_search_prefix(&messages[last].content);
     let asked_inline = stripped.is_some();
     let inline_image = strip_image_prefix(&messages[last].content);
-    let has_image = cfg.image.is_some();
+    // TWO capabilities, TWO gates. They used to share one switch, so a user who
+    // did not want their questions going to a search provider also lost image
+    // generation - a service this operator runs themselves, with an entirely
+    // different disclosure. `image_configured` is the DEPLOYMENT'S gate, which
+    // an explicit /image answers to alone because typing the command is the
+    // consent; `image_live` is this turn's, and it is what the router sees.
+    let image_configured = cfg.image.is_some();
+    let image_live = image_configured
+        && creq.image_on(cfg.image.as_ref().map(|i| i.default_on).unwrap_or(false));
 
     // an explicit /image bypasses the router entirely
     if let Some(prompt) = inline_image {
         messages[last].content = prompt.clone();
-        if !has_image {
+        if !image_configured {
             return Ok(None); // no service: answer normally rather than fail
         }
         on_status("generating the image…");
         return run_image(cfg, &prompt, messages, last, image_out, on_status).map(|()| None);
     }
 
-    if !asked_inline && web_mode == WebMode::Off {
-        return Ok(None);
-    }
     if let Some(rest) = stripped {
         // the model must never see the command word - it is UI, not content
         messages[last].content = rest;
     }
-    // Auto asks the model what this turn needs, ONCE, for both capabilities:
-    // two routers would be two generations of latency to answer one question.
-    if web_mode == WebMode::Auto && !asked_inline {
+    // ONE router pass, asked only about the capabilities live for this turn:
+    // two passes would be two generations of latency to answer one question,
+    // and offering a verdict the turn cannot act on is how you get an IMAGE
+    // back on a turn whose user switched images off.
+    let router_search = web_mode == WebMode::Auto && !model_searches;
+    if !asked_inline && web_mode != WebMode::Always && (router_search || image_live) {
         on_status("deciding what this needs…");
-        let ask = RouterAsk { search: !model_searches, image: has_image, effort: want_effort };
+        let ask = RouterAsk { search: router_search, image: image_live, effort: want_effort };
         let out = route_web_search(cfg, tok, messages, target_mode, ask);
         *effort_out = out.effort;
         match out.verdict {
@@ -3805,6 +3834,10 @@ fn apply_web_search(
             }
             None => return Ok(None),
         }
+    }
+    // nothing left to do unless the turn asked for a search outright
+    if !asked_inline && web_mode != WebMode::Always {
+        return Ok(None);
     }
     let Some(_) = &cfg.search else {
         // no provider configured: an inline /search should not eat the turn.
@@ -4309,6 +4342,15 @@ fn respond_asset(out: ResponseOutparam, ctype: &str, body_bytes: &[u8]) {
     respond_with_cache(out, 200, ctype, body_bytes, Some("public, max-age=31536000, immutable"))
 }
 
+/// Public, cross-origin-readable JSON. The attestation document and the
+/// /.well-known files exist for OTHER parties' verifiers - the mobile shell's
+/// bundled splash, Google/Apple link validators, anyone's monitor - so they
+/// carry an open CORS header; no-cache because both are how a stable custom
+/// domain announces its CURRENT state.
+fn respond_public_json(out: ResponseOutparam, status: u16, body_bytes: &[u8]) {
+    respond_full(out, status, "application/json", body_bytes, Some("no-cache"), true)
+}
+
 fn respond_with_cache(
     out: ResponseOutparam,
     status: u16,
@@ -4316,10 +4358,24 @@ fn respond_with_cache(
     body_bytes: &[u8],
     cache: Option<&str>,
 ) {
+    respond_full(out, status, ctype, body_bytes, cache, false)
+}
+
+fn respond_full(
+    out: ResponseOutparam,
+    status: u16,
+    ctype: &str,
+    body_bytes: &[u8],
+    cache: Option<&str>,
+    cors: bool,
+) {
     let headers = Fields::new();
     let _ = headers.set(&"content-type".to_string(), &[ctype.as_bytes().to_vec()]);
     if let Some(c) = cache {
         let _ = headers.set(&"cache-control".to_string(), &[c.as_bytes().to_vec()]);
+    }
+    if cors {
+        let _ = headers.set(&"access-control-allow-origin".to_string(), &[b"*".to_vec()]);
     }
     let resp = OutgoingResponse::new(headers);
     let _ = resp.set_status_code(status);
@@ -5359,7 +5415,8 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     // the endpoint is NOT exposed: it is deployment topology, and the browser
     // never talks to it - only this app does
     body["image"] = match base_cfg.as_ref().and_then(|c| c.image.clone()) {
-        Some(i) => serde_json::json!({ "enabled": true, "size": i.size, "model": i.model }),
+        Some(i) => serde_json::json!({ "enabled": true, "size": i.size, "model": i.model,
+                                       "default_on": i.default_on }),
         None => serde_json::json!({ "enabled": false }),
     };
     // Vision is normally a MODEL property (each entry carries its own flag
@@ -5423,11 +5480,31 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
 fn handle_attestation(req: IncomingRequest, out: ResponseOutparam) {
     let host = req.authority();
     match attest::document(host.as_deref()) {
-        Ok(doc) => respond_bytes(out, 200, "application/json", doc.to_string().as_bytes()),
+        Ok(doc) => respond_public_json(out, 200, doc.to_string().as_bytes()),
         // 503, not 500: nothing is broken in the app - the attestation is
-        // momentarily unreachable from in here, and the page says so.
-        Err(e) => json_err(out, 503, &e),
+        // momentarily unreachable from in here, and the page says so. Same
+        // open-CORS shape as success, so a cross-origin verifier reads the
+        // real reason instead of an opaque network error.
+        Err(e) => respond_public_json(
+            out,
+            503,
+            serde_json::json!({ "error": { "message": e, "type": "invalid_request_error" } })
+                .to_string()
+                .as_bytes(),
+        ),
     }
+}
+
+/// Per-deployment /.well-known files - Android's assetlinks.json, Apple's
+/// apple-app-site-association - for the mobile shells wrapping this app. The
+/// VALUES ride the deployment config (`well_known` object, filename -> JSON),
+/// because they carry per-customer signing-cert fingerprints and team ids
+/// that must never require republishing the wasm.
+fn well_known_lookup(raw: &serde_json::Value, name: &str) -> Option<String> {
+    raw.get("well_known")?
+        .as_object()?
+        .get(name)
+        .map(|v| v.to_string())
 }
 
 fn handle_search_probe(
@@ -5701,6 +5778,16 @@ impl Guest for Component {
                 SW_JS.replace("__REV__", ASSET_REV).as_bytes(),
                 Some("no-cache"),
             ),
+            (Method::Get, p) if p.starts_with("/.well-known/") => {
+                match well_known_lookup(&raw, &p["/.well-known/".len()..]) {
+                    Some(body) => respond_public_json(out, 200, body.as_bytes()),
+                    None => json_err(
+                        out,
+                        404,
+                        "no such well-known file; this deployment's config declares none by that name under \"well_known\"",
+                    ),
+                }
+            }
             (Method::Get, "/ping") => respond_bytes(
                 out,
                 200,
@@ -5719,7 +5806,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
             ),
         }
     }
@@ -5787,6 +5874,27 @@ mod tests {
         assert!(
             entries.contains(&""),
             "the page itself must be in the precache or offline serves nothing"
+        );
+    }
+
+    #[test]
+    fn well_known_serves_only_declared_files() {
+        let raw = serde_json::json!({
+            "well_known": {
+                "assetlinks.json": [{ "relation": ["delegate_permission/common.handle_all_urls"] }],
+                "apple-app-site-association": { "applinks": { "details": [] } }
+            }
+        });
+        let body = well_known_lookup(&raw, "assetlinks.json").expect("declared file serves");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("served body is JSON");
+        assert!(parsed.is_array());
+        assert!(well_known_lookup(&raw, "apple-app-site-association").is_some());
+        assert!(well_known_lookup(&raw, "security.txt").is_none(), "undeclared name is a 404");
+        assert!(well_known_lookup(&raw, "").is_none());
+        assert!(well_known_lookup(&serde_json::json!({}), "assetlinks.json").is_none(), "no well_known key at all");
+        assert!(
+            well_known_lookup(&serde_json::json!({ "well_known": 7 }), "assetlinks.json").is_none(),
+            "a non-object well_known serves nothing rather than panicking"
         );
     }
 
@@ -5915,6 +6023,30 @@ mod tests {
         // a template the format was never trained into gets nothing
         cfg.template = "llama3".into();
         assert!(tools_enabled(&cfg, &chat_req(on)).is_none());
+    }
+
+    /// The two switches are independent, and absent means the deployment's
+    /// default: images on, search off. A user who will not send questions to a
+    /// search provider keeps the picture generator the operator runs.
+    #[test]
+    fn search_and_images_switch_separately() {
+        let req = |v: serde_json::Value| chat_req(v);
+        // nothing said: each takes its own default, and they differ
+        let bare = req(serde_json::json!({ "messages": [] }));
+        assert!(bare.image_on(true));
+        assert!(!bare.image_on(false));
+        assert_eq!(bare.web_mode(), WebMode::Off);
+        // images off, search on: the combination one switch could never express
+        let split = req(serde_json::json!({
+            "messages": [], "image_gen": false, "web_search": "auto"
+        }));
+        assert!(!split.image_on(true));
+        assert_eq!(split.web_mode(), WebMode::Auto);
+        // ...and the other way round
+        let split = req(serde_json::json!({ "messages": [], "image_gen": "auto" }));
+        assert!(split.image_on(false));
+        assert_eq!(split.web_mode(), WebMode::Off);
+        assert!(!req(serde_json::json!({ "messages": [], "image_gen": "off" })).image_on(true));
     }
 
     /// A client that declares its OWN tools is asking for something this app
