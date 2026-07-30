@@ -104,10 +104,28 @@
 //!                               MODEL, on models whose volume carries a
 //!                               vision projector and whose config says
 //!                               `vision` (see the vision section below).
+//!                               TOOLS: `tools: true` lets the model call the
+//!                               endpoints and MCP servers THIS DEPLOYMENT
+//!                               configured (see tools.rs and the config's
+//!                               `tools` block); `tool_choice: "none"` withholds
+//!                               them. A client-declared `tools: [...]` array is
+//!                               REFUSED - this app executes its own registry
+//!                               and never a caller's. What ran comes back on
+//!                               `enclave.tools`, or as SSE comments
+//!                               `: enclave-tool {...}` while streaming.
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!                               Same `web_search` switch; sources arrive as a
 //!                               `{"search":{...}}` event before the first
-//!                               token.
+//!                               token. Tool calls arrive as `{"tool":{...}}`
+//!                               (before the round trip) and
+//!                               `{"tool_result":{...}}` (after it); the reply
+//!                               regenerates from the result, so a `tool` event
+//!                               resets the client's buffer the way a `notice`
+//!                               does.
+//!   GET  /tools               - operator probe: resolve the registry (which
+//!                               DIALS any MCP server) and show what a turn
+//!                               would be offered, with `?call=<name>&args=<json>`
+//!                               to run one. The counterpart of /search?q=.
 //!
 //! Generation: autoregressive decode with the model's KV cache. The trick
 //! that makes this cheap through wasi-nn: `compute()` returns OWNED tensor
@@ -165,6 +183,7 @@ mod http;
 mod image;
 mod sampling;
 mod search;
+mod tools;
 mod vision;
 mod webp;
 
@@ -198,6 +217,17 @@ static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
 static FAVICON_SVG: &str = include_str!("../assets/eyesoff.svg");
 static FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 static TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
+/// The installable-app shell: a manifest so browsers offer install, PNG icons
+/// at the launcher sizes (plus a full-bleed maskable), and a service worker
+/// that caches the whole static shell for offline. The worker's cache is keyed
+/// on ASSET_REV (build.rs hashes every shell byte into it), which is what lets
+/// a stable custom domain swap versions without serving a stale shell.
+static MANIFEST_JSON: &[u8] = include_bytes!("../assets/manifest.webmanifest");
+static SW_JS: &str = include_str!("sw.js");
+static ICON_192_PNG: &[u8] = include_bytes!("../assets/icon-192.png");
+static ICON_512_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
+static ICON_MASKABLE_PNG: &[u8] = include_bytes!("../assets/icon-maskable-512.png");
+static ASSET_REV: &str = env!("ASSET_REV");
 
 // ------------------------------------------------------------ model volumes --
 // Weights + tokenizer arrive as ATTACHED MODEL VOLUMES (Tinfoil Modelwrap):
@@ -2498,6 +2528,20 @@ struct ChatReq {
     /// meaning.
     #[serde(default)]
     web_search: Option<serde_json::Value>,
+    /// extension (needs config.tools): `true` lets the model call the tools
+    /// this DEPLOYMENT configured, `false` withholds them. Absent takes the
+    /// deployment's `default_on`, which is false unless it says otherwise.
+    ///
+    /// This is the OpenAI `tools` field's slot, and an array there means
+    /// something this app deliberately does not do - see tools.rs - so the
+    /// array form is refused with an explanation rather than ignored.
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    /// OpenAI's switch: "none" withholds the tools, anything else is the
+    /// default. A client that already speaks OpenAI turns them off the way it
+    /// knows how.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -2523,6 +2567,27 @@ impl ChatReq {
         self.enable_thinking
             .or(self.chat_template_kwargs.as_ref().and_then(|k| k.enable_thinking))
             .unwrap_or(true)
+    }
+
+    /// Does this request want the deployment's tools? `tool_choice: "none"`
+    /// wins over everything, then the explicit `tools` boolean, then the
+    /// deployment's default.
+    fn tools_on(&self, default_on: bool) -> bool {
+        if self.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
+            return false;
+        }
+        match self.tools.as_ref().and_then(|v| v.as_bool()) {
+            Some(b) => b,
+            None => default_on,
+        }
+    }
+
+    /// A client-DECLARED tool array, which this app does not execute. Returned
+    /// as an error rather than ignored: a client that declared tools is waiting
+    /// for `tool_calls` in the reply, and silently answering in prose is the
+    /// exact failure this whole feature exists to remove.
+    fn client_declared_tools(&self) -> bool {
+        self.tools.as_ref().and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
     }
 
     fn web_mode(&self) -> WebMode {
@@ -2555,8 +2620,14 @@ impl ChatReq {
 /// two independent questions and either half can be switched off.
 #[derive(Clone, Copy)]
 struct RouterAsk {
-    /// decide search (and images, if `image` is set)
-    route: bool,
+    /// SEARCH is one of the verdicts this turn may come back with. False when
+    /// the deployment gave the MODEL a web_search tool: the point of the tool
+    /// is that the decision happens after it has thought about the question,
+    /// so a classifier guessing beforehand would only get in the way (and
+    /// would spend a provider round trip the model never asked for).
+    search: bool,
+    /// ...and IMAGE. Independent of `search`, because a deployment can hand
+    /// the model search as a tool while keeping image generation on the router.
     image: bool,
     /// rate how much reasoning the turn needs
     effort: bool,
@@ -2575,7 +2646,9 @@ fn route_web_search(
     mode: &str,
     ask: RouterAsk,
 ) -> RouterOut {
-    let (want_image, want_route, want_effort) = (ask.image && ask.route, ask.route, ask.effort);
+    let (want_search, want_image, want_effort) = (ask.search, ask.image, ask.effort);
+    // the routing half runs when EITHER verdict is on offer
+    let want_route = want_search || want_image;
     // The instructions are assembled from the capabilities this deployment
     // ACTUALLY has: offering the model a tool that is not configured is how
     // you get an IMAGE verdict on a deployment with no image service, and a
@@ -2597,22 +2670,49 @@ in general, or asking to edit an image you cannot see.\n"
     // together because the expensive part is prefilling the conversation tail,
     // not the dozen tokens that come back - two passes would double the cost of
     // the cheap half to keep the prompts tidy.
-    let route_rules = if want_route {
-        format!(
-            "Search the web when the answer depends on information that changes or that a \
-language model would not reliably know: current events, news, prices, weather, \
-sports results, release versions, live status, anything dated after your \
-training, or an obscure named entity, product or person.
+    // WHY THIS DEFAULTS TO SEARCHING, and why the old wording did not work.
+    //
+    // The rule used to read "search when the answer depends on information a
+    // language model would not reliably know ... or an obscure named entity",
+    // which asks the model to predict its own recall. It cannot. Reported live
+    // 2026-07-30: "What happened to Omar in the Wire?" routed to NO, and the
+    // answer that came back named the wrong season, the wrong killer and a
+    // character who had died four seasons earlier - fluently, with no hedge.
+    // The Wire is not obscure, so the rule read as "you know this"; the model
+    // was certain and wrong, which is the whole failure mode.
+    //
+    // So the question is no longer "do you know it" but "is it checkable". A
+    // fact about a person, work, product or event goes to the provider whether
+    // or not the model believes it remembers, and the NO list is what carries
+    // the exceptions - the cheap turns that must never spend a round trip.
+    //
+    // MEASURED against the fable-fusion 27b on a live deployment, 2026-07-30,
+    // reproducing this pass exactly (same model, greedy, thinking off): the old
+    // wording scored 5/8 on a mixed battery, this one 8/8, and then 7/7 on a
+    // second battery written to catch over-searching (thanks / haiku /
+    // translate / write a function / opinion / follow-up all still NO). The
+    // cost of the change is real and worth stating: more turns now spend a
+    // provider round trip, and with fetch_pages set, page fetches too.
+    let search_rules = if want_search {
+        "DEFAULT TO SEARCHING. If answering involves any specific fact about the world - a \
+person, place, work, product, organisation or event, real or fictional; a date, number, name, \
+outcome, plot point, credit or biography - then SEARCH, even when you are certain you remember \
+it. Model recall of these details is wrong often enough, and confidently enough, that the reader \
+cannot tell. Mechanical test: if the answer could be looked up on a reference site, SEARCH.
 
-Do NOT search for: chit-chat, greetings and thanks, translation, summarising \
+Search too whenever the answer depends on information that changes: current events, news, \
+prices, weather, sports results, release versions, live status, or anything dated after your \
+training.
+
+Answer NO only for: chit-chat, greetings and thanks, translation, summarising \
 or rewriting text already in the conversation, arithmetic, code the model can \
-simply write, definitions of well-established concepts, opinions, or \
-follow-ups answerable from what was already said.
-{image_rule}"
-        )
+simply write, definitions of well-established concepts, opinions, creative \
+writing, and follow-ups answerable from what was already said.
+"
     } else {
-        String::new()
+        ""
     };
+    let route_rules = format!("{search_rules}{image_rule}");
     let effort_rules = if want_effort {
         "Rate how much step-by-step REASONING the last message needs before it can be \
 answered well:
@@ -2625,8 +2725,11 @@ options, anything where a wrong intermediate step ruins the answer.
     } else {
         ""
     };
+    // only the verdicts actually on offer are named: a model shown a SEARCH
+    // line it must not use will eventually use it
+    let search_option = if want_search { "SEARCH: <the query to run>\nor\n" } else { "" };
     let route_line = if want_route {
-        format!("SEARCH: <the query to run>\nor\n{image_option}NO")
+        format!("{search_option}{image_option}NO")
     } else {
         String::new()
     };
@@ -2677,7 +2780,7 @@ options, anything where a wrong intermediate step ruins the answer.
     }
 
     // thinking off: this is a classifier, not a reasoning task
-    let Ok((ids, stops, _)) = build_prompt(cfg, tok, &router_msgs, false) else {
+    let Ok((ids, stops, _)) = build_prompt(cfg, tok, &router_msgs, false, Capabilities::Internal) else {
         return RouterOut::default();
     };
     let params = GenParams {
@@ -2712,8 +2815,345 @@ options, anything where a wrong intermediate step ruins the answer.
     RouterOut {
         // a rating the model did not give leaves the flat budget in place
         effort: want_effort.then(|| parse_effort(&stats.text)).flatten(),
-        verdict: want_route.then(|| parse_router_verdict(&stats.text, want_image)).flatten(),
+        verdict: want_route
+            .then(|| parse_router_verdict(&stats.text, want_search, want_image))
+            .flatten(),
     }
+}
+
+/// A reply that is really a fabricated tool call, and the query inside it.
+///
+/// Models under a "call a search tool" instruction emit these in half a dozen
+/// dialects: `<tool_code>`, ```tool_code fences, `<tool_call>` with JSON, a bare
+/// `search_tool(query="…")`. This app has no tool API, so nothing executes any
+/// of them and the user is left looking at the call. Rather than argue with the
+/// prompt that caused it, take the query the model asked for and run the search
+/// it wanted (see the /chat path).
+///
+/// STRICT on purpose. It fires only when the call is essentially the WHOLE
+/// reply, because a legitimate answer may quote tool syntax - someone asking
+/// "how do I write a tool_code block?" must get their answer, not a web search.
+fn fabricated_tool_query(text: &str) -> Option<String> {
+    let body = strip_think(text);
+    let t = body.trim();
+    if t.is_empty() || t.len() > 600 {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    // the call has to OPEN the reply, not appear somewhere inside a real answer
+    let opens = ["<tool_code", "<tool_call", "```tool", "```json", "<function", "{\"name\":"];
+    let starts_with_call = opens.iter().any(|p| lower.starts_with(p));
+    let bare_call = lower.starts_with("search") && t.contains('(') && t.contains(')');
+    if !starts_with_call && !bare_call {
+        return None;
+    }
+    // and it has to look like a SEARCH, not some other invented tool
+    if !lower.contains("search") && !lower.contains("browse") && !lower.contains("web") {
+        return None;
+    }
+    // the query: the first quoted string long enough to be one
+    let mut q = None;
+    for quote in ['"', '\''] {
+        let mut parts = t.split(quote);
+        parts.next(); // before the first quote
+        while let Some(cand) = parts.next() {
+            let c = cand.trim();
+            // skip the argument NAMES that sit in quotes in JSON dialects
+            if c.len() >= 3 && !matches!(c.to_ascii_lowercase().as_str(),
+                "query" | "q" | "search" | "name" | "arguments" | "parameters" | "web_search"
+                | "search_tool" | "type" | "function")
+            {
+                q = Some(c.to_string());
+                break;
+            }
+            parts.next(); // the text between this closing quote and the next opening one
+        }
+        if q.is_some() {
+            break;
+        }
+    }
+    let q = q?;
+    if q.chars().count() < 3 || q.chars().count() > 300 {
+        return None;
+    }
+    Some(q)
+}
+
+/// Arm the ONE retry after a fabricated tool call with something the model
+/// cannot read past: it just wrote a call, nothing ran it, and the answer has
+/// to come from what it knows. Written into the SYSTEM turn rather than as a
+/// user message, because it is a fact about the deployment and not something
+/// the person at the keyboard said.
+fn no_tools_nudge(cfg: &AppConfig, messages: &mut Vec<ChatMsg>, have_results: bool) {
+    const NO_WEB: &str = "IMPORTANT: you just wrote a tool call. Nothing executed it, because this \
+deployment gives you no tools at all. Do not write another one. Answer the question now, in prose, \
+from your own knowledge, and say plainly at the end that the answer is unverified.";
+    const HAVE_WEB: &str = "IMPORTANT: you just wrote a tool call. Nothing executed it, because \
+this deployment gives you no tools at all - the search already ran and its results are in the \
+user's message. Do not write another call. Answer the question now, in prose, from those results, \
+citing them as [1], [2].";
+    let nudge = if have_results { HAVE_WEB } else { NO_WEB };
+    match messages.iter_mut().find(|m| m.role == "system") {
+        Some(sys) => sys.content = format!("{}\n\n{nudge}", sys.content.trim_end()),
+        // no system turn in the request means build_prompt falls back to the
+        // deployment's own prompt, so carry that across rather than dropping it
+        None => messages.insert(
+            0,
+            ChatMsg::text("system", format!("{}\n\n{nudge}", cfg.system_prompt.trim_end())),
+        ),
+    }
+}
+
+// ------------------------------------------------------------- tool calls --
+
+/// The tool-calling loop, shared by the playground and both /v1 shapes.
+///
+/// Each transport narrates differently - SSE events on /chat, SSE comments on
+/// streaming /v1, nothing at all on buffered /v1 - so the loop keeps the STATE
+/// and the decisions, and the caller keeps the writing. One `step` per finished
+/// generation: it returns true when it has appended a call and its result to
+/// the conversation and the answer should be generated again.
+struct ToolLoop<'a> {
+    cfg: &'a tools::ToolsConfig,
+    /// what the built-in tools are wired to (the deployment's search leg)
+    builtins: tools::Builtins<'a>,
+    reg: tools::Registry,
+    calls: usize,
+    /// the model was already told it has run out of calls. Without this a model
+    /// that keeps calling would loop forever: told, calls again, told again.
+    limit_told: bool,
+    /// what ran, for the reply's stats
+    log: Vec<serde_json::Value>,
+}
+
+impl<'a> ToolLoop<'a> {
+    /// Resolve the registry for this turn. MCP discovery happens HERE, before
+    /// the prompt exists, because the schemas have to be in it.
+    fn open(
+        cfg: &'a tools::ToolsConfig,
+        builtins: tools::Builtins<'a>,
+        on_status: &dyn Fn(&str),
+    ) -> ToolLoop<'a> {
+        ToolLoop {
+            cfg,
+            builtins,
+            reg: tools::build(cfg, builtins, on_status),
+            calls: 0,
+            limit_told: false,
+            log: Vec::new(),
+        }
+    }
+
+    /// The model owns the search decision this turn, so the router must not
+    /// also make it.
+    fn owns_search(&self) -> bool {
+        self.reg.find("web_search").is_some()
+    }
+
+    fn armed(&self) -> bool {
+        !self.reg.is_empty()
+    }
+
+    fn tools(&self) -> &[tools::Tool] {
+        &self.reg.tools
+    }
+
+    /// Handle one finished generation. `on_call` fires before the round trip
+    /// (so a slow tool is visible while it runs) and `on_result` after.
+    /// Returns true when the answer should be regenerated.
+    fn step(
+        &mut self,
+        text: &str,
+        messages: &mut Vec<ChatMsg>,
+        on_call: &dyn Fn(&serde_json::Value),
+        on_result: &dyn Fn(&serde_json::Value),
+    ) -> bool {
+        if !self.armed() {
+            return false;
+        }
+        let Some(c) = tools::parse_calls(text).into_iter().next() else { return false };
+        // Out of calls: say so once and let it write the answer. Saying it
+        // twice is a loop, so the second offence is delivered to the user as
+        // it stands - a visible fake call beats an endless turn.
+        if self.calls >= self.cfg.max_calls {
+            if self.limit_told {
+                return false;
+            }
+            self.limit_told = true;
+            messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+            messages.push(ChatMsg::text(
+                "user",
+                tools::response_turn(
+                    &c.name,
+                    "This call was NOT run: the limit on tool calls for one answer has been \
+                     reached. Do not call anything else. Answer now from what you already have, \
+                     and say plainly what you could not check.",
+                ),
+            ));
+            return true;
+        }
+        self.calls += 1;
+        on_call(&serde_json::json!({
+            "name": c.name, "arguments": c.args, "n": self.calls,
+        }));
+        let r = tools::call(&mut self.reg, self.cfg, self.builtins, &c.name, &c.args, || {
+            now_ms() as u64
+        });
+        let mut entry = serde_json::json!({
+            "name": c.name, "arguments": c.args, "n": self.calls,
+            "ok": !r.is_error, "ms": r.ms,
+            "chars": r.text.chars().count(),
+        });
+        // a search the MODEL asked for gets the same numbered source list a
+        // routed one does, so its [1] and [2] resolve to something
+        if !r.sources.is_empty() {
+            // the SAME shape search_meta_json emits, so the playground's
+            // existing source list renders it without knowing where it came from
+            entry["sources"] = serde_json::json!(r
+                .sources
+                .iter()
+                .map(|(t, u)| serde_json::json!({ "title": t, "url": u }))
+                .collect::<Vec<_>>());
+        }
+        on_result(&entry);
+        self.log.push(entry);
+        // The model's own call goes back in as the assistant turn it was, so
+        // the next pass sees what it asked for beside what came back.
+        messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+        messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &r.text)));
+        true
+    }
+}
+
+/// Holds back the beginning of an answer just long enough to tell whether it
+/// is a tool call this app is about to execute itself.
+///
+/// Without it every call flashes on screen as raw JSON before the client is
+/// told to drop it, and on /v1 - whose protocol has no "ignore that" event at
+/// all - the JSON simply stays in the content. Reasoning is NOT held: the
+/// decision point is the first thing written after the think block closes, so
+/// a model that reasons for thirty seconds still streams for thirty seconds.
+///
+/// The gate holds only while what it has could still BECOME an opener, so the
+/// worst case is a dozen characters of latency on an ordinary answer.
+struct CallGate {
+    /// the answer has been judged: everything from here on flows (or is
+    /// dropped, if it was a call)
+    decided: bool,
+    suppress: bool,
+    /// the prompt force-opened a think block, so the body starts after the
+    /// closing tag rather than at the first token
+    thinking: bool,
+    held: String,
+}
+
+/// What an answer looks like when it is really a call. A model that opens with
+/// either of these is asking for a tool, not writing prose.
+const CALL_OPENERS: [&str; 2] = ["<tool_call>", "{\"name\""];
+
+impl CallGate {
+    fn new(armed: bool, think_open: bool) -> CallGate {
+        CallGate { decided: !armed, suppress: false, thinking: think_open, held: String::new() }
+    }
+
+    /// Feed one delta; returns what should go out to the client now.
+    fn push(&mut self, delta: &str) -> Option<String> {
+        if self.decided {
+            // a suppressed call keeps accumulating, because it still has to be
+            // deliverable if it turns out nothing executed it
+            if self.suppress {
+                self.held.push_str(delta);
+                return None;
+            }
+            return Some(delta.to_string());
+        }
+        self.held.push_str(delta);
+        if self.thinking {
+            // inside the reasoning block nothing is held back
+            let Some(i) = self.held.find("</think>") else {
+                return Some(std::mem::take(&mut self.held));
+            };
+            let head = self.held[..i + "</think>".len()].to_string();
+            self.held = self.held[i + "</think>".len()..].to_string();
+            self.thinking = false;
+            return match self.judge() {
+                Some(rest) => Some(format!("{head}{rest}")),
+                None => (!head.is_empty()).then_some(head),
+            };
+        }
+        self.judge()
+    }
+
+    /// Look at the body written so far and decide, or keep waiting.
+    fn judge(&mut self) -> Option<String> {
+        let trimmed = self.held.trim_start();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if CALL_OPENERS.iter().any(|o| trimmed.starts_with(o)) {
+            self.decided = true;
+            self.suppress = true;
+            return None;
+        }
+        // still ambiguous: what we have could yet grow into an opener
+        if CALL_OPENERS.iter().any(|o| o.starts_with(trimmed)) {
+            return None;
+        }
+        self.decided = true;
+        Some(std::mem::take(&mut self.held))
+    }
+
+    /// Generation ended with text still held - either an ordinary answer too
+    /// short to have been judged, or a call nothing executed. Either way it
+    /// belongs to the user now: silence would be the worse failure.
+    fn flush(&mut self) -> Option<String> {
+        self.decided = true;
+        self.suppress = false;
+        let out = std::mem::take(&mut self.held);
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// The call, rewritten in the trained form. The raw reply may carry a
+/// half-open tag (the stop string ate the closer) or a fence, and feeding that
+/// back would teach the model its own malformed output was acceptable.
+fn canonical_call(c: &tools::ToolCall) -> String {
+    format!(
+        "<tool_call>\n{}\n</tool_call>",
+        serde_json::json!({ "name": c.name, "arguments": c.args })
+    )
+}
+
+/// Whether this request gets the deployment's tools: the config has some, the
+/// model's template is one tool calling was trained into, and the client did
+/// not opt out (nor is it a client that has not opted IN, when the deployment
+/// leaves `default_on` false).
+/// Everything the built-ins could be wired to. Used by the /tools probe, which
+/// answers "what does this deployment have", not "what may this turn use".
+fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
+    tools::Builtins { search: cfg.search.as_ref(), web_withheld: false }
+}
+
+/// ...and what THIS turn may use. The web_search tool is still web search, so
+/// the user's search switch governs it exactly as it governs the router: off
+/// means the tool is not in the registry and the model is never told it exists.
+/// Without this, turning the router off would hand the same capability straight
+/// back through the tools switch, which is the opposite of what either control
+/// says on the tin.
+fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
+    let withheld = creq.web_mode() == WebMode::Off;
+    tools::Builtins {
+        search: if withheld { None } else { cfg.search.as_ref() },
+        web_withheld: withheld,
+    }
+}
+
+fn tools_enabled<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> Option<&'a tools::ToolsConfig> {
+    let tc = cfg.tools.as_ref()?;
+    if tc.is_empty() || !tools::template_supported(&cfg.template) {
+        return None;
+    }
+    creq.tools_on(tc.default_on).then_some(tc)
 }
 
 /// Name a conversation from its opening exchange, for the history list.
@@ -2760,7 +3200,7 @@ Reply with EXACTLY ONE line: the title and nothing else.";
     msgs.push(ChatMsg::text("user", opening));
 
     // thinking off: naming a thing is not a reasoning task
-    let (prompt, stops, _) = build_prompt(cfg, tok, &msgs, false).ok()?;
+    let (prompt, stops, _) = build_prompt(cfg, tok, &msgs, false, Capabilities::Internal).ok()?;
     let params = GenParams {
         max_new: 24,
         sample: SampleParams {
@@ -2946,10 +3386,12 @@ fn parse_effort(text: &str) -> Option<Effort> {
 /// because the cost of a false NO is silently skipping work the user wanted,
 /// and the cost of a false positive is one wasted call.
 ///
-/// `allow_image` gates the IMAGE verdict rather than trusting the prompt: a
-/// model that hallucinates a capability the deployment never configured
-/// should be ignored, not obeyed.
-fn parse_router_verdict(text: &str, allow_image: bool) -> Option<RouterVerdict> {
+/// `allow_search` / `allow_image` gate the verdicts rather than trusting the
+/// prompt: a model that hallucinates a capability the deployment never
+/// configured should be ignored, not obeyed. Search is gated for a second
+/// reason too - when the MODEL holds a web_search tool, a router that
+/// pre-fetched anyway would spend a round trip on a decision it no longer owns.
+fn parse_router_verdict(text: &str, allow_search: bool, allow_image: bool) -> Option<RouterVerdict> {
     let cleaned = strip_think(text);
     // With effort scaling on the rating shares the line (`EFFORT: high |
     // SEARCH: …`), so a line-anchored match would find the rating, fail, and
@@ -2963,7 +3405,7 @@ fn parse_router_verdict(text: &str, allow_image: bool) -> Option<RouterVerdict> 
             Some(v) => v,
             None => continue,
         };
-        if is_image && !allow_image {
+        if (is_image && !allow_image) || (!is_image && !allow_search) {
             continue;
         }
         // markers and whitespace interleave (`**SEARCH:** "q"`), so one pass
@@ -3126,7 +3568,7 @@ ASK: <the question>";
     }
 
     // thinking off: this is a one-line writing task, not a reasoning one
-    let (prompt, stops, _) = build_prompt(cfg, tok, &msgs, false).ok()?;
+    let (prompt, stops, _) = build_prompt(cfg, tok, &msgs, false, Capabilities::Internal).ok()?;
     let params = GenParams {
         max_new: 120,
         sample: SampleParams {
@@ -3303,6 +3745,10 @@ fn apply_web_search(
     // at once, and paying for that pass twice would be the whole saving gone
     effort_out: &mut Option<Effort>,
     want_effort: bool,
+    // the MODEL holds a web_search tool this turn, so the router must not
+    // decide about search. Image routing is untouched: the two verdicts are
+    // independent (see RouterAsk).
+    model_searches: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
     let web_mode = creq.web_mode();
@@ -3342,7 +3788,7 @@ fn apply_web_search(
     // two routers would be two generations of latency to answer one question.
     if web_mode == WebMode::Auto && !asked_inline {
         on_status("deciding what this needs…");
-        let ask = RouterAsk { route: true, image: has_image, effort: want_effort };
+        let ask = RouterAsk { search: !model_searches, image: has_image, effort: want_effort };
         let out = route_web_search(cfg, tok, messages, target_mode, ask);
         *effort_out = out.effort;
         match out.verdict {
@@ -3557,17 +4003,75 @@ impl Prompt {
 /// trained on it, with the pictures sitting where the marks were, and this
 /// function needs to know nothing about how any particular VLM wraps an image
 /// (the host's projector adds whatever tokens the model expects around it).
+/// State the model's ACTUAL capabilities at the end of the system prompt.
+///
+/// This app has no tool-calling API. Web search is a decision made BEFORE the
+/// answer starts (see route_web_search) and the results arrive inside the user's
+/// turn, so a model instructed to "call a web search tool" has no way to comply
+/// and does the only thing left: it writes something that looks like a tool
+/// call. Reported 2026-07-30 as a reply of nothing but
+/// `<tool_code>search_tool(query="…")</tool_code>`, which is not a bug in the
+/// model so much as an unanswered question about what it can do.
+///
+/// So the prompt answers it. Appended rather than prepended: a deployment's own
+/// system prompt is what sets the assistant's character, and this is a footnote
+/// about the machinery, not a competing instruction. Only when the deployment
+/// actually has a search leg - a model told about a capability nobody
+/// configured would be worse off than one told nothing.
+/// What the system prompt tells the model about what it can do this turn.
+#[derive(Clone, Copy)]
+enum Capabilities<'a> {
+    /// this app's own internal passes (router, title, vision query): say
+    /// nothing. A pass asked to rate a turn does not need to be told it cannot
+    /// browse, and a tools block would invite it to answer with a call.
+    Internal,
+    /// the answer at a deployment with no tools: the "you cannot call anything"
+    /// note, which is what stops a model from writing a fake tool call
+    Note,
+    /// the answer with a tool registry: the real signatures, and the stop
+    /// string that ends generation the moment a call is complete
+    Tools(&'a [tools::Tool], usize),
+}
+
+fn with_capability_note(cfg: &AppConfig, system: &str) -> String {
+    if cfg.search.is_none() {
+        return system.to_string();
+    }
+    let note = "How this app works, which overrides any instruction to the contrary: you have NO \
+tools and cannot call one. You cannot search, browse, run code, or fetch a URL yourself. When a \
+turn needs the web, this app decides that BEFORE you are asked and the results are already in the \
+user's message under \"Web results\", with numbered sources to cite as [1], [2]. If there are no \
+results in the message, none were fetched: answer from your own knowledge and say plainly that it \
+is unverified. NEVER write a tool call, a function call, or a code block that pretends to search - \
+nothing executes it, and the user sees the fake call instead of an answer.";
+    if system.trim().is_empty() {
+        return note.to_string();
+    }
+    format!("{}\n\n{note}", system.trim_end())
+}
+
 fn build_prompt(
     cfg: &AppConfig,
     tok: &Tokenizer,
     messages: &[ChatMsg],
     thinking: bool, // the request's switch; only cfg.thinking models act on it
+    caps: Capabilities,
 ) -> Result<(Prompt, Vec<String>, bool), String> {
     let system = messages
         .iter()
         .find(|m| m.role == "system")
         .map(|m| strip_marks(&m.content))
         .unwrap_or_else(|| cfg.system_prompt.clone());
+    let system = match caps {
+        Capabilities::Internal => system,
+        Capabilities::Note => with_capability_note(cfg, &system),
+        // the tools block REPLACES the note rather than joining it: the note
+        // says "you have no tools and cannot call one", which is a lie at a
+        // deployment that just handed the model three of them
+        Capabilities::Tools(list, max) => {
+            format!("{}{}", system.trim_end(), tools::system_block(list, max))
+        }
+    };
     // (role, text) per turn, with the turn's images kept alongside by INDEX.
     // Marks are stripped from incoming text FIRST: they are our own private
     // punctuation, and a message that arrived carrying one must not be able to
@@ -3629,7 +4133,14 @@ fn build_prompt(
             let bytes: Vec<Vec<u8>> =
                 turn_images.iter().flat_map(|im| im.iter().cloned()).collect();
             let prompt = split_rendered(tok, &rendered.prompt, bytes)?;
-            return Ok((prompt, rendered.stop_strings, rendered.think_open));
+            let mut stops = rendered.stop_strings;
+            // A completed call is the end of the turn: stopping here saves the
+            // model from narrating past its own call, and the parser accepts
+            // the unterminated form the stop string leaves behind.
+            if matches!(caps, Capabilities::Tools(..)) {
+                stops.push("</tool_call>".into());
+            }
+            return Ok((prompt, stops, rendered.think_open));
         }
         msgs.remove(0); // drop the oldest turn and retry
         turn_images.remove(0); // ...and the pictures that were part of it
@@ -3716,7 +4227,7 @@ fn resolve_effort(
         tok,
         messages,
         mode,
-        RouterAsk { route: false, image: false, effort: true },
+        RouterAsk { search: false, image: false, effort: true },
     )
     .effort
 }
@@ -3994,6 +4505,21 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // block pays for neither.
     let mut router_effort: Option<Effort> = None;
     let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
+    // --- tools, resolved FIRST. Two reasons for the order: the schemas have to
+    // be in the prompt, and a deployment that gave the model a web_search tool
+    // must stop the router deciding about search, or the turn pays for a
+    // provider round trip the model never asked for and then gets the tool too.
+    let mut tl = tools_enabled(cfg, &creq)
+        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &status_cb));
+    if let Some(t) = &tl {
+        for n in &t.reg.notes {
+            let _ = send(serde_json::json!({ "notice": format!("tools: {n}") }));
+        }
+    }
+    if tl.as_ref().is_some_and(|t| !t.armed()) {
+        tl = None;
+    }
+    let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
     let search_meta = match apply_web_search(
         cfg,
         &creq,
@@ -4003,6 +4529,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         &mut generated_image,
         &mut router_effort,
         want_effort,
+        model_searches,
         &status_cb,
     ) {
         Ok(m) => m,
@@ -4046,75 +4573,183 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             }
         }));
     }
-    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = send(serde_json::json!({ "error": e }));
-            drop(stream);
-            let _ = OutgoingBody::finish(body, None);
-            return;
-        }
-    };
-    let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
-    let params = gen_params(cfg, &creq, stops, think_open, effort);
-
     let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
     if let Some(n) = &draft_note {
         let _ = send(serde_json::json!({ "status": format!("speculative decode off: {n}") }));
     }
+    // One retry in hand for a fabricated tool call: a model told to "call a
+    // search tool" can write one anyway, and this app has no tool to call. If
+    // the turn is allowed to reach the web, the search it asked for is run for
+    // real and the answer regenerates from the results. Only with the user's
+    // web switch on: a fake tool call is not consent to send their question to
+    // a provider. See fabricated_tool_query.
+    // Two remedies, each usable once: fetch what it asked for, and then, if
+    // it writes ANOTHER call with the results already in front of it, tell it
+    // plainly that there are no tools. A prompt emphatic enough to keep
+    // faking calls is the user's to fix; two passes is where this app stops.
+    let (mut tool_searched, mut tool_nudged) = (false, false);
+    let may_search = cfg.search.is_some() && creq.web_mode() != WebMode::Off;
+    let last_user = messages.iter().rposition(|m| m.role == "user");
     let mut last_err = String::new();
     let mut ok = false;
-    for (i, (target, tname)) in targets_for(cfg, mode).iter().enumerate() {
-        if i > 0 && !send(serde_json::json!({ "notice": format!("gpu failed ({last_err}); retrying on cpu") })) {
-            break;
-        }
-        // the prompt force-opened the think block; re-emit the tag ahead of
-        // the first real delta so the client sees a complete block. Lazy,
-        // per attempt: a retry notice resets the client's reply buffer, and
-        // an attempt that dies before producing output must not leak a tag.
-        let opened = std::cell::Cell::new(!think_open);
-        let emit = |delta: &str| {
-            if !opened.replace(true) && !send(serde_json::json!({ "delta": "<think>\n" })) {
-                return false;
-            }
-            send(serde_json::json!({ "delta": delta }))
+    'answer: loop {
+        let caps = match &tl {
+            Some(t) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            None => Capabilities::Note,
         };
-        let status = |s: &str| send(serde_json::json!({ "status": s }));
-        match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
-            Ok(s) => {
-                let gen_s = (s.decode_ms as f64) / 1000.0;
-                let tok_per_s = if gen_s > 0.0 { s.tokens as f64 / gen_s } else { 0.0 };
-                let mut done = serde_json::json!({
-                    "done": true, "target": s.target,
-                    "prompt_tokens": s.prompt_tokens, "tokens": s.tokens,
-                    "load_ms": s.load_ms as u64, "prefill_ms": s.prefill_ms as u64,
-                    "decode_ms": s.decode_ms as u64,
-                    "finish_reason": s.finish_reason,
-                    "tok_per_s": (tok_per_s * 10.0).round() / 10.0,
-                });
-                if s.drafted > 0 {
-                    done["draft_tokens"] = serde_json::json!(s.drafted);
-                    done["draft_accepted"] = serde_json::json!(s.accepted);
-                }
-                if s.think_forced {
-                    done["think_forced"] = serde_json::json!(true);
-                }
-                if let Some(e) = effort {
-                    done["effort"] = serde_json::json!(e.as_str());
-                    done["think_budget"] = serde_json::json!(params.think_budget);
-                }
-                if s.images > 0 {
-                    done["images"] = serde_json::json!(s.images);
-                    // what the pictures REALLY cost, from the host - the
-                    // config's per-image budget is only for admission control
-                    done["image_tokens"] = serde_json::json!(s.image_pos);
-                }
-                send(done);
-                ok = true;
+        let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = send(serde_json::json!({ "error": e }));
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
+        };
+        let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
+        let params = gen_params(cfg, &creq, stops, think_open, effort);
+        for (i, (target, tname)) in targets_for(cfg, mode).iter().enumerate() {
+            if i > 0 && !send(serde_json::json!({ "notice": format!("gpu failed ({last_err}); retrying on cpu") })) {
                 break;
             }
-            Err(e) => last_err = format!("{tname}: {e}"),
+            // the prompt force-opened the think block; re-emit the tag ahead of
+            // the first real delta so the client sees a complete block. Lazy,
+            // per attempt: a retry notice resets the client's reply buffer, and
+            // an attempt that dies before producing output must not leak a tag.
+            let opened = std::cell::Cell::new(!think_open);
+            // a call is held back rather than shown and then retracted
+            let gate = std::cell::RefCell::new(CallGate::new(tl.is_some(), think_open));
+            let emit = |delta: &str| {
+                let Some(out) = gate.borrow_mut().push(delta) else { return true };
+                if !opened.replace(true) && !send(serde_json::json!({ "delta": "<think>\n" })) {
+                    return false;
+                }
+                send(serde_json::json!({ "delta": out }))
+            };
+            let status = |s: &str| send(serde_json::json!({ "status": s }));
+            match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
+                Ok(s) => {
+                    // the model asked for a tool this deployment actually has:
+                    // run it, put the result in the conversation, answer again
+                    if let Some(t) = &mut tl {
+                        let on_call = |c: &serde_json::Value| {
+                            let _ = send(serde_json::json!({ "tool": c }));
+                        };
+                        let on_result = |r: &serde_json::Value| {
+                            let _ = send(serde_json::json!({ "tool_result": r }));
+                            // a web_search the MODEL asked for feeds the same
+                            // numbered source list a routed search does, so the
+                            // citations in its answer resolve to something
+                            if let Some(src) = r.get("sources") {
+                                let _ = send(serde_json::json!({ "search": {
+                                    "provider": cfg.search.as_ref()
+                                        .map(|s| s.provider.clone()).unwrap_or_default(),
+                                    "sources": src,
+                                    "ms": r.get("ms").cloned().unwrap_or(serde_json::json!(0)),
+                                } }));
+                            }
+                        };
+                        if t.step(&s.text, &mut messages, &on_call, &on_result) {
+                            continue 'answer;
+                        }
+                    }
+                    // nothing ran: whatever the gate is still holding is the
+                    // answer, and the user has been waiting for it
+                    if let Some(rest) = gate.borrow_mut().flush() {
+                        if !opened.replace(true) {
+                            let _ = send(serde_json::json!({ "delta": "<think>\n" }));
+                        }
+                        let _ = send(serde_json::json!({ "delta": rest }));
+                    }
+                    // the model wrote a tool call at a deployment with no tools:
+                    // run the search it wanted, then answer again from the results
+                    if tl.is_none() {
+                    if let Some(q) = fabricated_tool_query(&s.text) {
+                        // the web is open and this is the first call: run the
+                        // search it asked for, answer again from the results
+                        if may_search && !tool_searched {
+                            if let Some(li) = last_user {
+                                tool_searched = true;
+                                let _ = send(serde_json::json!({ "notice": format!(
+                                    "the model asked to search the web for \"{}\"; running that \
+                                     search and answering again",
+                                    truncate_for_msg_n(&q, 120)) }));
+                                let _ = send(serde_json::json!({ "status": "searching the web…" }));
+                                // Always, not Auto: the model asked for this one
+                                // by name, so a provider that fails should say
+                                // so rather than quietly answering from memory
+                                match finish_search(cfg, &mut messages, li, q, WebMode::Always, true) {
+                                    Ok(Some(m)) => {
+                                        let _ = send(serde_json::json!({ "search": search_meta_json(&m) }));
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        let _ = send(serde_json::json!({ "notice": format!(
+                                            "that search failed ({e}); answering without it") }));
+                                    }
+                                }
+                                continue 'answer;
+                            }
+                        }
+                        // either the web is closed to this turn - a fabricated
+                        // call is not consent to send someone's question to a
+                        // provider - or the results are already in front of it
+                        // and it faked a call anyway. Say so and make it answer.
+                        if !tool_nudged {
+                            tool_nudged = true;
+                            let _ = send(serde_json::json!({ "notice": if tool_searched {
+                                "the model wrote another tool call with the results already in \
+                                 front of it; answering from those results".to_string()
+                            } else {
+                                "the model tried to call a search tool, which this deployment does \
+                                 not give it; answering from the model's own knowledge (turn on web \
+                                 search to let it look things up)".to_string()
+                            } }));
+                            no_tools_nudge(cfg, &mut messages, tool_searched);
+                            continue 'answer;
+                        }
+                    }
+                    }
+                    let gen_s = (s.decode_ms as f64) / 1000.0;
+                    let tok_per_s = if gen_s > 0.0 { s.tokens as f64 / gen_s } else { 0.0 };
+                    let mut done = serde_json::json!({
+                        "done": true, "target": s.target,
+                        "prompt_tokens": s.prompt_tokens, "tokens": s.tokens,
+                        "load_ms": s.load_ms as u64, "prefill_ms": s.prefill_ms as u64,
+                        "decode_ms": s.decode_ms as u64,
+                        "finish_reason": s.finish_reason,
+                        "tok_per_s": (tok_per_s * 10.0).round() / 10.0,
+                    });
+                    if s.drafted > 0 {
+                        done["draft_tokens"] = serde_json::json!(s.drafted);
+                        done["draft_accepted"] = serde_json::json!(s.accepted);
+                    }
+                    if s.think_forced {
+                        done["think_forced"] = serde_json::json!(true);
+                    }
+                    if let Some(e) = effort {
+                        done["effort"] = serde_json::json!(e.as_str());
+                        done["think_budget"] = serde_json::json!(params.think_budget);
+                    }
+                    if s.images > 0 {
+                        done["images"] = serde_json::json!(s.images);
+                        // what the pictures REALLY cost, from the host - the
+                        // config's per-image budget is only for admission control
+                        done["image_tokens"] = serde_json::json!(s.image_pos);
+                    }
+                    if let Some(t) = &tl {
+                        if !t.log.is_empty() {
+                            done["tools"] = serde_json::json!(t.log);
+                        }
+                    }
+                    send(done);
+                    ok = true;
+                    break;
+                }
+                Err(e) => last_err = format!("{tname}: {e}"),
+            }
         }
+        break 'answer;
     }
     if !ok && !last_err.is_empty() {
         send(serde_json::json!({ "error": strip_code(&last_err) }));
@@ -4144,6 +4779,20 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
+    // A client-declared `tools` array asks this app to hand back `tool_calls`
+    // for the CLIENT to execute. It does not do that yet, and answering in
+    // prose while an SDK waits for a tool call is the failure this whole
+    // feature exists to remove - so say what is true instead of guessing.
+    if creq.client_declared_tools() {
+        return json_err(
+            out,
+            400,
+            "this deployment executes its OWN configured tools and does not run tools declared \
+             by a client, so `tools: [...]` cannot be honoured. Send `tools: true` to let the \
+             model call what this deployment configured, or `tool_choice: \"none\"` to answer \
+             without tools.",
+        );
+    }
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
@@ -4225,6 +4874,17 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // block pays for neither.
         let mut router_effort: Option<Effort> = None;
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
+        let mut tl = tools_enabled(cfg, &creq)
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status));
+        if let Some(t) = &tl {
+            for n in &t.reg.notes {
+                let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
+            }
+        }
+        if tl.as_ref().is_some_and(|t| !t.armed()) {
+            tl = None;
+        }
+        let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -4234,6 +4894,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             &mut generated_image,
             &mut router_effort,
             want_effort,
+            model_searches,
             &leg_status,
         ) {
             Ok(m) => m,
@@ -4255,18 +4916,6 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 return;
             }
         };
-        let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
-            Ok(v) => v,
-            Err(e) => {
-                send_err(&e);
-                drop(stream);
-                let _ = OutgoingBody::finish(body, None);
-                return;
-            }
-        };
-        let effort =
-            resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
-        let params = gen_params(cfg, &creq, stops, think_open, effort);
         // Sources first, as an SSE COMMENT: the chunk schema has no field for
         // them and inventing one would break strict OpenAI clients, while a
         // comment line is required to be ignored by every conforming parser.
@@ -4284,27 +4933,72 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let mut last_err = String::new();
         let mut done_stats: Option<GenStats> = None;
         let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        'answer: loop {
+        let caps = match &tl {
+            Some(t) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            None => Capabilities::Note,
+        };
+        let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
+            Ok(v) => v,
+            Err(e) => {
+                send_err(&e);
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
+        };
+        let effort =
+            resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
+        let params = gen_params(cfg, &creq, stops, think_open, effort);
         for (target, tname) in targets_for(cfg, mode).iter() {
             // re-emit the prompt-side think opening ahead of the first real
             // delta (see handle_chat) so clients receive a complete block
             let opened = std::cell::Cell::new(!think_open);
+            let gate = std::cell::RefCell::new(CallGate::new(tl.is_some(), think_open));
             let emit = |delta: &str| {
+                let Some(out) = gate.borrow_mut().push(delta) else { return true };
                 if !opened.replace(true)
                     && !send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None))
                 {
                     return false;
                 }
-                send_raw(&chunk(serde_json::json!({ "content": delta }), None))
+                send_raw(&chunk(serde_json::json!({ "content": out }), None))
             };
             // OpenAI protocol has no status events; SSE comments keep the
             // connection warm through cold session init without confusing SDKs
             let status = |s: &str| send_raw(&format!(": {s}\n\n"));
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
                 Ok(s) => {
+                    if let Some(t) = &mut tl {
+                        // the call and its result travel as comments, for the
+                        // same reason the sources do
+                        let on_call = |c: &serde_json::Value| {
+                            let _ = send_raw(&format!(": enclave-tool {c}\n\n"));
+                        };
+                        let on_result = |r: &serde_json::Value| {
+                            let _ = send_raw(&format!(": enclave-tool-result {r}\n\n"));
+                        };
+                        if t.step(&s.text, &mut messages, &on_call, &on_result) {
+                            continue 'answer;
+                        }
+                    }
+                    if let Some(rest) = gate.borrow_mut().flush() {
+                        if !opened.replace(true) {
+                            let _ = send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None));
+                        }
+                        let _ = send_raw(&chunk(serde_json::json!({ "content": rest }), None));
+                    }
                     done_stats = Some(s);
                     break;
                 }
                 Err(e) => last_err = format!("{tname}: {e}"),
+            }
+        }
+        break 'answer;
+        }
+        if let Some(t) = &tl {
+            if !t.log.is_empty() {
+                let _ = send_raw(&format!(": enclave-tools-ran {}\n\n", serde_json::json!(t.log)));
             }
         }
         match done_stats {
@@ -4335,6 +5029,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // block pays for neither.
         let mut router_effort: Option<Effort> = None;
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
+        let mut tl = tools_enabled(cfg, &creq)
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status));
+        if tl.as_ref().is_some_and(|t| !t.armed()) {
+            tl = None;
+        }
+        let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -4344,6 +5044,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             &mut generated_image,
             &mut router_effort,
             want_effort,
+            model_searches,
             &no_status,
         ) {
             Ok(m) => m,
@@ -4353,25 +5054,39 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(m) => m,
             Err(e) => return json_err(out, 502, &e),
         };
-        let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
-            Ok(v) => v,
-            Err(e) => return json_err(out, 400, &e),
-        };
-        let effort =
-            resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
-        let params = gen_params(cfg, &creq, stops, think_open, effort);
         let sink = |_: &str| true;
         let mut last_err = String::new();
         let mut result: Option<GenStats> = None;
+        let (mut think_open, mut effort, mut params);
         let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        'answer: loop {
+        let caps = match &tl {
+            Some(t) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            None => Capabilities::Note,
+        };
+        let (prompt_ids, stops, opened) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
+            Ok(v) => v,
+            Err(e) => return json_err(out, 400, &e),
+        };
+        think_open = opened;
+        effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
+        params = gen_params(cfg, &creq, stops, think_open, effort);
         for (target, tname) in targets_for(cfg, mode).iter() {
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &sink, &sink) {
                 Ok(s) => {
+                    if let Some(t) = &mut tl {
+                        let quiet = |_: &serde_json::Value| {};
+                        if t.step(&s.text, &mut messages, &quiet, &quiet) {
+                            continue 'answer;
+                        }
+                    }
                     result = Some(s);
                     break;
                 }
                 Err(e) => last_err = format!("{tname}: {e}"),
             }
+        }
+        break 'answer;
         }
         match result {
             Some(s) => {
@@ -4411,6 +5126,11 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 }
                 if let Some(m) = &vision_meta {
                     body_json["enclave"]["vision"] = vision_meta_json(m);
+                }
+                if let Some(t) = &tl {
+                    if !t.log.is_empty() {
+                        body_json["enclave"]["tools"] = serde_json::json!(t.log);
+                    }
                 }
                 respond_bytes(out, 200, "application/json", body_json.to_string().as_bytes());
             }
@@ -4632,7 +5352,8 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     let base_cfg = config::from_value(raw.clone()).ok();
     body["search"] = match base_cfg.as_ref().and_then(|c| c.search.clone()) {
         Some(s) => serde_json::json!({ "enabled": true, "provider": s.provider,
-                                       "fetch_pages": s.fetch_pages }),
+                                       "fetch_pages": s.fetch_pages,
+                                       "default_on": s.default_on }),
         None => serde_json::json!({ "enabled": false }),
     };
     // the endpoint is NOT exposed: it is deployment topology, and the browser
@@ -4647,6 +5368,28 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     // whatever is selected. `service` is the flag it uses for that; the
     // endpoint is NOT exposed - it is deployment topology, and the browser
     // never talks to it, only this app does.
+    // Tools: the playground shows a switch when the deployment configured any.
+    // NAMES only - a URL is deployment topology, a header may carry a
+    // credential, and the browser never talks to either; only this app does.
+    // `default_on` tells the switch where to start; it still starts off unless
+    // the deployment deliberately said otherwise.
+    body["tools"] = match base_cfg.as_ref().and_then(|c| c.tools.clone()) {
+        Some(t) if !t.is_empty() => {
+            serde_json::json!({
+                "enabled": true,
+                "default_on": t.default_on,
+                "max_calls": t.max_calls,
+                // what a turn would really be offered, not what was typed: a
+                // duplicate or an unusable name is dropped at resolution, and
+                // naming it here would put a tool in the UI nothing can call
+                "http": t.http_names(),
+                // an MCP server's tools are only known after discovery, which
+                // happens per turn - so the count is what can be promised here
+                "mcp": t.mcp.len(),
+            })
+        }
+        _ => serde_json::json!({ "enabled": false }),
+    };
     let vision_any = entries.iter().any(|e| e.cfg.vision && e.cfg.backend == "ggml");
     let service = base_cfg.as_ref().map(|c| c.vision_service.is_some()).unwrap_or(false);
     body["vision"] = serde_json::json!({
@@ -4748,6 +5491,81 @@ fn handle_search_probe(
         }
         Err(e) => json_err(out, 502, &e),
     }
+}
+
+/// GET /tools - the tool-leg probe, and the exact counterpart of /search?q=.
+///
+/// Resolving the registry is where a tools deployment goes wrong: an MCP server
+/// that will not answer, a `$SECRET` nobody set, a name collision that silently
+/// dropped an entry. All of those look identical from a chat window - the model
+/// simply never calls the thing - so this runs the same resolution a turn runs
+/// and shows what came back, with no inference in the way.
+///
+/// `?call=<name>&args=<json>` then executes ONE tool, which separates "can this
+/// deployment see the tool" from "does the tool work". Behind the API key,
+/// because it reaches an endpoint from this deployment's egress identity.
+fn handle_tools_probe(
+    raw: &serde_json::Value,
+    req: IncomingRequest,
+    query: &str,
+    out: ResponseOutparam,
+) {
+    let cfg = match config::from_value(raw.clone()) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+    };
+    if !authorized(&cfg, &req) {
+        return json_err(out, 401, "missing or invalid API key");
+    }
+    let Some(tcfg) = &cfg.tools else {
+        return json_err(out, 501, "no tools are configured on this deployment");
+    };
+    let param = |k: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+            .map(percent_decode_query)
+    };
+    let t0 = now_ms();
+    let b = builtins_of(&cfg);
+    let mut reg = tools::build(tcfg, b, &|_| {});
+    let discover_ms = now_ms().saturating_sub(t0);
+    if let Some(name) = param("call") {
+        let args: serde_json::Value = match param("args") {
+            Some(a) => match serde_json::from_str(&a) {
+                Ok(v) => v,
+                Err(e) => return json_err(out, 400, &format!("args is not valid JSON: {e}")),
+            },
+            None => serde_json::json!({}),
+        };
+        let r = tools::call(&mut reg, tcfg, b, &name, &args, || now_ms() as u64);
+        let mut body = serde_json::json!({
+            "name": name, "arguments": args, "ok": !r.is_error, "ms": r.ms,
+            "result": r.text,
+        });
+        if !r.sources.is_empty() {
+            body["sources"] = serde_json::json!(r.sources);
+        }
+        return respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
+    }
+    let body = serde_json::json!({
+        "discover_ms": discover_ms,
+        "max_calls": tcfg.max_calls,
+        "default_on": tcfg.default_on,
+        "notes": reg.notes,
+        "tools": reg.tools.iter().map(|t| serde_json::json!({
+            "name": t.name,
+            "description": t.description,
+            "source": match &t.src {
+                tools::ToolSrc::Builtin(_) => "builtin".to_string(),
+                tools::ToolSrc::Http(_) => "http".to_string(),
+                tools::ToolSrc::Mcp { server, remote } =>
+                    format!("mcp[{server}]:{remote}"),
+            },
+            "parameters": t.parameters,
+        })).collect::<Vec<_>>(),
+    });
+    respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }
 
 /// `+`-and-`%XX` decode for one query-string value.
@@ -4861,6 +5679,28 @@ impl Guest for Component {
             | (Method::Get, "/apple-touch-icon-precomposed.png") => {
                 respond_asset(out, "image/png", TOUCH_ICON_PNG)
             }
+            (Method::Get, "/icon-192.png") => respond_asset(out, "image/png", ICON_192_PNG),
+            (Method::Get, "/icon-512.png") => respond_asset(out, "image/png", ICON_512_PNG),
+            (Method::Get, "/icon-maskable-512.png") => {
+                respond_asset(out, "image/png", ICON_MASKABLE_PNG)
+            }
+            // no-cache rather than immutable: at a stable custom domain these
+            // two are how a NEW version announces itself, so they must never
+            // outlive the version that served them
+            (Method::Get, "/manifest.webmanifest") => respond_with_cache(
+                out,
+                200,
+                "application/manifest+json",
+                MANIFEST_JSON,
+                Some("no-cache"),
+            ),
+            (Method::Get, "/sw.js") => respond_with_cache(
+                out,
+                200,
+                "text/javascript; charset=utf-8",
+                SW_JS.replace("__REV__", ASSET_REV).as_bytes(),
+                Some("no-cache"),
+            ),
             (Method::Get, "/ping") => respond_bytes(
                 out,
                 200,
@@ -4870,6 +5710,7 @@ impl Guest for Component {
             (Method::Get, "/models") => handle_model_list(&raw, out),
             (Method::Get, "/attestation") => handle_attestation(req, out),
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
+            (Method::Get, "/tools") => handle_tools_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
             (Method::Post, "/chat") => handle_chat(&raw, req, out),
             (Method::Post, "/title") => handle_title(&raw, req, out),
@@ -4878,7 +5719,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
             ),
         }
     }
@@ -4890,14 +5731,84 @@ bindings::export!(Component with_types_in bindings);
 mod tests {
     use super::*;
 
+    /// Routes the router serves statics from, spelled scope-relative the way
+    /// the manifest and the worker's precache list must spell them (the app
+    /// also serves under the /x/<id>/https/ prefix, where an absolute path
+    /// would escape the app).
+    const SHELL_ROUTES: &[&str] = &[
+        "",
+        "emoji.woff2",
+        "favicon.svg",
+        "favicon.ico",
+        "apple-touch-icon.png",
+        "manifest.webmanifest",
+        "icon-192.png",
+        "icon-512.png",
+        "icon-maskable-512.png",
+    ];
+
+    #[test]
+    fn manifest_parses_and_stays_base_relative() {
+        let m: serde_json::Value =
+            serde_json::from_slice(MANIFEST_JSON).expect("manifest is valid JSON");
+        for key in ["start_url", "scope", "id"] {
+            let v = m[key].as_str().unwrap_or_else(|| panic!("manifest has {key}"));
+            assert!(
+                !v.starts_with('/'),
+                "manifest {key} must stay base-relative, got {v}"
+            );
+        }
+        let icons = m["icons"].as_array().expect("manifest has icons");
+        assert!(!icons.is_empty());
+        for icon in icons {
+            let src = icon["src"].as_str().expect("icon has src");
+            assert!(
+                SHELL_ROUTES.contains(&src),
+                "manifest icon {src} is not a route the router serves"
+            );
+        }
+    }
+
+    #[test]
+    fn sw_precache_list_matches_served_routes() {
+        let list = SW_JS
+            .split("var SHELL = [")
+            .nth(1)
+            .and_then(|rest| rest.split("];").next())
+            .expect("sw.js declares var SHELL = [...]");
+        let entries: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert!(!entries.is_empty());
+        for e in &entries {
+            assert!(
+                SHELL_ROUTES.contains(e),
+                "sw.js precaches {e:?}, which the router does not serve"
+            );
+        }
+        assert!(
+            entries.contains(&""),
+            "the page itself must be in the precache or offline serves nothing"
+        );
+    }
+
+    #[test]
+    fn sw_rev_is_stamped() {
+        assert_eq!(ASSET_REV.len(), 16, "build.rs emits a 16-hex-char rev");
+        assert!(ASSET_REV.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            SW_JS.contains("\"__REV__\""),
+            "sw.js must carry the placeholder the /sw.js route stamps"
+        );
+        assert!(!SW_JS.replace("__REV__", ASSET_REV).contains("__REV__"));
+    }
+
     fn search_of(t: &str) -> Option<String> {
-        match parse_router_verdict(t, true) {
+        match parse_router_verdict(t, true, true) {
             Some(RouterVerdict::Search(q)) => Some(q),
             _ => None,
         }
     }
     fn image_of(t: &str) -> Option<String> {
-        match parse_router_verdict(t, true) {
+        match parse_router_verdict(t, true, true) {
             Some(RouterVerdict::Image(p)) => Some(p),
             _ => None,
         }
@@ -4921,6 +5832,169 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(config::APP_CONFIG_JSON).expect("embedded config is JSON");
         config::from_value(v).expect("embedded config parses")
+    }
+
+    fn chat_req(body: serde_json::Value) -> ChatReq {
+        serde_json::from_value(body).expect("request parses")
+    }
+
+    /// The gate's whole job: a call never reaches the client, an answer is not
+    /// delayed by more than the few characters it takes to tell them apart.
+    #[test]
+    fn a_tool_call_is_never_streamed_to_the_client() {
+        let mut g = CallGate::new(true, false);
+        let mut seen = String::new();
+        for d in ["<tool", "_call>", "\n{\"name\": \"a\"", ", \"arguments\": {}}"] {
+            if let Some(s) = g.push(d) {
+                seen.push_str(&s);
+            }
+        }
+        assert_eq!(seen, "", "the call leaked to the client");
+        // and it was NOT lost: nothing executed it, so it is still deliverable
+        assert!(g.flush().unwrap().contains("tool_call"));
+    }
+
+    #[test]
+    fn an_ordinary_answer_flows_almost_immediately() {
+        let mut g = CallGate::new(true, false);
+        // "The" diverges from every opener on the first character
+        assert_eq!(g.push("The").as_deref(), Some("The"));
+        assert_eq!(g.push(" answer").as_deref(), Some(" answer"));
+        assert_eq!(g.flush(), None);
+    }
+
+    /// Reasoning is not held back: a model that thinks for thirty seconds
+    /// still streams for thirty seconds, and only the body is judged.
+    #[test]
+    fn reasoning_streams_while_the_body_waits() {
+        let mut g = CallGate::new(true, true);
+        assert_eq!(g.push("I should look this up.").as_deref(), Some("I should look this up."));
+        // the tag flows; the newline after it is the start of the body, so it
+        // waits with everything else until the body can be judged
+        assert_eq!(g.push("\n</think>\n").as_deref(), Some("\n</think>"));
+        assert_eq!(g.push("<tool_call>"), None);
+        assert_eq!(g.push("{\"name\":\"a\"}"), None);
+        // the reasoning went out, the call did not
+        assert!(g.flush().unwrap().trim_start().starts_with("<tool_call>"));
+    }
+
+    #[test]
+    fn an_unarmed_gate_is_a_pipe() {
+        let mut g = CallGate::new(false, false);
+        assert_eq!(g.push("<tool_call>").as_deref(), Some("<tool_call>"));
+        assert_eq!(g.flush(), None);
+    }
+
+    /// Who gets tools: the deployment has to configure them, the model has to
+    /// be one the format was trained into, and the request has to want them.
+    #[test]
+    fn tools_are_off_until_everything_agrees() {
+        let mut cfg = test_config();
+        cfg.template = "chatml".into();
+        let on = serde_json::json!({ "messages": [], "tools": true });
+        // no config block at all
+        assert!(tools_enabled(&cfg, &chat_req(on.clone())).is_none());
+
+        cfg.tools = Some(
+            serde_json::from_value(serde_json::json!({
+                "http": [{ "name": "t", "url": "https://h/x" }]
+            }))
+            .unwrap(),
+        );
+        // configured and asked for
+        assert!(tools_enabled(&cfg, &chat_req(on.clone())).is_some());
+        // configured but the request said nothing, and default_on is false:
+        // reaching outside is never a default someone inherits
+        assert!(tools_enabled(&cfg, &chat_req(serde_json::json!({ "messages": [] }))).is_none());
+        // ...unless the deployment says so
+        cfg.tools.as_mut().unwrap().default_on = true;
+        assert!(tools_enabled(&cfg, &chat_req(serde_json::json!({ "messages": [] }))).is_some());
+        // an OpenAI client turns them off the way it knows how
+        let off = serde_json::json!({ "messages": [], "tool_choice": "none" });
+        assert!(tools_enabled(&cfg, &chat_req(off)).is_none());
+        // a template the format was never trained into gets nothing
+        cfg.template = "llama3".into();
+        assert!(tools_enabled(&cfg, &chat_req(on)).is_none());
+    }
+
+    /// A client that declares its OWN tools is asking for something this app
+    /// does not do, and has to be told rather than quietly answered in prose.
+    #[test]
+    fn client_declared_tools_are_refused_not_ignored() {
+        let r = chat_req(serde_json::json!({
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+        }));
+        assert!(r.client_declared_tools());
+        // the boolean extension is not an array and must not trip it
+        assert!(!chat_req(serde_json::json!({ "messages": [], "tools": true })).client_declared_tools());
+        assert!(!chat_req(serde_json::json!({ "messages": [], "tools": [] })).client_declared_tools());
+    }
+
+    /// The loop runs a call, feeds the result back, and stops when the budget
+    /// is spent instead of calling forever.
+    #[test]
+    fn the_tool_loop_stops_at_its_budget() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 1,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let mut tl = ToolLoop { cfg: &tc, builtins: b, reg: tools::build(&tc, b, &|_| {}),
+                                calls: 0, limit_told: false, log: Vec::new() };
+        assert!(tl.armed());
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        // a name the registry does NOT have, so the loop is exercised without
+        // wasi:http, which does not exist under a native `cargo test`. It is
+        // also the interesting failure: a call that cannot run must not take
+        // the answer down with it.
+        let call = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
+        // first call: attempted, conversation grows by the call and its result
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(tl.calls, 1);
+        assert!(msgs[2].content.contains("<tool_response>"));
+        // second: over budget, so it is refused with an instruction to answer
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}));
+        assert!(msgs[4].content.contains("NOT run"), "{}", msgs[4].content);
+        // third: it was already told once - telling it again is an infinite
+        // loop, so the reply goes to the user as it stands
+        assert!(!tl.step(call, &mut msgs, &|_| {}, &|_| {}));
+        // a reply with no call in it never regenerates
+        assert!(!tl.step("Here is the answer.", &mut msgs, &|_| {}, &|_| {}));
+    }
+
+    /// What the model is actually shown. The signatures have to reach the
+    /// system turn, and the stop string has to be armed, or the loop never
+    /// gets a call to parse.
+    #[test]
+    fn tools_reach_the_rendered_prompt() {
+        let tok = test_tokenizer();
+        let mut cfg = test_config();
+        cfg.template = "chatml".into();
+        cfg.thinking = false;
+        let list = [tools::Tool {
+            name: "get_weather".into(),
+            description: "Current weather for a city.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}}}),
+            src: tools::ToolSrc::Http(0),
+        }];
+        let msgs = vec![ChatMsg::text("user", "weather in Oslo?")];
+        // the system prompt is rendered into the prompt string, so checking
+        // the token count alone would prove nothing - render it directly
+        let system = format!("{}{}", cfg.system_prompt, tools::system_block(&list, 3));
+        let r = config::render_template("chatml", &system, &[("user".into(), "hi".into())],
+                                        config::ThinkTurn::Plain).unwrap();
+        assert!(r.prompt.contains("<tools>"), "{}", r.prompt);
+        assert!(r.prompt.contains("get_weather"), "{}", r.prompt);
+        // ...and the stop string that ends a turn the moment a call completes
+        let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false,
+                                        Capabilities::Tools(&list, 3)).unwrap();
+        assert!(stops.iter().any(|s| s == "</tool_call>"), "{stops:?}");
+        // a deployment with no tools keeps the old stop set and the note
+        let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false, Capabilities::Note).unwrap();
+        assert!(!stops.iter().any(|s| s == "</tool_call>"), "{stops:?}");
     }
 
     #[test]
@@ -5044,6 +6118,72 @@ mod tests {
         assert!(!g.take_loop(), "and a later loop is a real stop, not a rescue");
     }
 
+    /// Reported live 2026-07-30: a system prompt told the model to call a web
+    /// search tool, this app has none, and the reply was the fake call itself.
+    #[test]
+    fn a_fabricated_tool_call_yields_the_query_it_wanted() {
+        // the exact shape reported
+        assert_eq!(
+            fabricated_tool_query("<tool_code>\nsearch_tool(query=\"what happened to omar in the wire\")\n</tool_code>").unwrap(),
+            "what happened to omar in the wire",
+        );
+        // the other dialects models reach for
+        assert_eq!(
+            fabricated_tool_query("<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"omar little death\"}}</tool_call>").unwrap(),
+            "omar little death",
+        );
+        assert_eq!(
+            fabricated_tool_query("```tool_code\nweb_search(query='omar little death')\n```").unwrap(),
+            "omar little death",
+        );
+        assert_eq!(
+            fabricated_tool_query("search(\"who killed omar\")").unwrap(),
+            "who killed omar",
+        );
+        // a think block in front of it does not hide it
+        assert_eq!(
+            fabricated_tool_query("<think>I should search</think>\n<tool_code>search_tool(query=\"omar\")</tool_code>")
+                .as_deref(),
+            Some("omar"),
+        );
+    }
+
+    #[test]
+    fn a_real_answer_is_never_mistaken_for_a_tool_call() {
+        // the case that must not become a web search: someone ASKING about the
+        // syntax, and getting a real answer that quotes it
+        let lesson = "You write a tool call like this:\n\n```tool_code\nsearch_tool(query=\"x\")\n```\n\n\
+                      The model emits that block and the runtime executes it, then feeds the result back.";
+        assert_eq!(fabricated_tool_query(lesson), None);
+        // ordinary answers
+        assert_eq!(fabricated_tool_query("Omar Little is shot by Kenard in season 5."), None);
+        assert_eq!(fabricated_tool_query(""), None);
+        assert_eq!(fabricated_tool_query("<think>hmm</think>"), None);
+        // an invented tool that is not a search is not this feature's business
+        assert_eq!(fabricated_tool_query("<tool_code>run_python(code=\"print(1)\")</tool_code>"), None);
+        // a call with no usable query
+        assert_eq!(fabricated_tool_query("<tool_code>search_tool()</tool_code>"), None);
+        assert_eq!(fabricated_tool_query("<tool_code>search_tool(query=\"ab\")</tool_code>"), None);
+    }
+
+    #[test]
+    fn the_capability_note_only_lands_where_there_is_a_search_leg() {
+        let mut cfg = test_config();
+        cfg.search = None;
+        assert_eq!(with_capability_note(&cfg, "Be helpful."), "Be helpful.");
+
+        // any configured provider will do; the note keys off presence alone
+        cfg.search = serde_json::from_str("{\"provider\":\"exa\"}").ok();
+        assert!(cfg.search.is_some(), "search config fixture parses");
+        let noted = with_capability_note(&cfg, "Be helpful.");
+        assert!(noted.starts_with("Be helpful."), "the deployment's own prompt leads");
+        assert!(noted.contains("NO tools"), "and the machinery is a footnote after it");
+        assert!(noted.contains("Web results"), "naming where results actually appear");
+        // an empty system prompt gets the note alone rather than a leading blank
+        let bare = with_capability_note(&cfg, "");
+        assert!(bare.starts_with("How this app works"), "{bare:?}");
+    }
+
     #[test]
     fn a_title_is_cleaned_of_everything_a_model_wraps_it_in() {
         // the shapes models actually return
@@ -5090,18 +6230,18 @@ mod tests {
         assert_eq!(parse_effort(""), None);
         // and the verdict still parses out of the same line
         assert_eq!(
-            parse_router_verdict("EFFORT: high | SEARCH: rust 1.90 release notes", false),
+            parse_router_verdict("EFFORT: high | SEARCH: rust 1.90 release notes", true, false),
             Some(RouterVerdict::Search("rust 1.90 release notes".into())),
         );
         // a query that itself contains a pipe survives: only the rating prefix
         // is split off, not every `|` on the line
         assert_eq!(
-            parse_router_verdict("EFFORT: medium | SEARCH: ffmpeg concat | filter_complex", false),
+            parse_router_verdict("EFFORT: medium | SEARCH: ffmpeg concat | filter_complex", true, false),
             Some(RouterVerdict::Search("ffmpeg concat | filter_complex".into())),
         );
         // a plain verdict with no rating is unchanged
         assert_eq!(
-            parse_router_verdict("SEARCH: oslo weather", false),
+            parse_router_verdict("SEARCH: oslo weather", true, false),
             Some(RouterVerdict::Search("oslo weather".into())),
         );
     }
@@ -5165,8 +6305,8 @@ mod tests {
         // the clean cases
         assert_eq!(search_of("SEARCH: rust 1.90 release notes").as_deref(),
                    Some("rust 1.90 release notes"));
-        assert_eq!(parse_router_verdict("NO", true), None);
-        assert_eq!(parse_router_verdict("NO\n", true), None);
+        assert_eq!(parse_router_verdict("NO", true, true), None);
+        assert_eq!(parse_router_verdict("NO\n", true, true), None);
         // the noise models actually emit
         assert_eq!(search_of("**SEARCH:** \"btc price\"").as_deref(), Some("btc price"));
         assert_eq!(search_of("- search: weather in oslo").as_deref(), Some("weather in oslo"));
@@ -5175,10 +6315,10 @@ mod tests {
         assert_eq!(search_of("Sure!\nSEARCH: who won the 2026 world cup").as_deref(),
                    Some("who won the 2026 world cup"));
         // degenerate: a SEARCH with no query is not a search
-        assert_eq!(parse_router_verdict("SEARCH:", true), None);
-        assert_eq!(parse_router_verdict("SEARCH:   \"\"  ", true), None);
+        assert_eq!(parse_router_verdict("SEARCH:", true, true), None);
+        assert_eq!(parse_router_verdict("SEARCH:   \"\"  ", true, true), None);
         // a refusal that merely mentions the word must not trigger one
-        assert_eq!(parse_router_verdict("I do not need to search for this.", true), None);
+        assert_eq!(parse_router_verdict("I do not need to search for this.", true, true), None);
     }
 
     #[test]
@@ -5188,10 +6328,10 @@ mod tests {
         assert_eq!(image_of("**IMAGE:** \"a red bicycle\"").as_deref(), Some("a red bicycle"));
         // a model that invents the capability on a deployment without an
         // image service must be ignored, not obeyed
-        assert_eq!(parse_router_verdict("IMAGE: a red bicycle", false), None);
+        assert_eq!(parse_router_verdict("IMAGE: a red bicycle", true, false), None);
         // ...but a SEARCH on the same reply still counts
         assert_eq!(
-            match parse_router_verdict("IMAGE: a fox\nSEARCH: fox facts", false) {
+            match parse_router_verdict("IMAGE: a fox\nSEARCH: fox facts", true, false) {
                 Some(RouterVerdict::Search(q)) => q,
                 other => panic!("{other:?}"),
             },

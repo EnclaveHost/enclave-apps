@@ -34,6 +34,13 @@
   } catch (_) {}
 })();
 </script>
+<!-- after the base pin so the href resolves through it: the manifest is what
+     makes browsers offer an install, and its own relative start_url/scope/
+     icons then resolve against wherever the manifest was fetched from -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#212121">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="eyesoff">
 <script>
 // Apply the theme before first paint to avoid a flash. A stored preference wins
 // (only present when "Remember on this device" is on); with none, the app is
@@ -383,6 +390,27 @@
   .sources a { color: var(--text); text-decoration: none; border-bottom: 1px solid var(--border-soft); }
   .sources a:hover { border-bottom-color: var(--text-3); }
   .sources .host { color: var(--text-3); font-size: 12px; margin-left: 6px; }
+
+  /* what the model called, above the answer it wrote from the results. The
+     arguments are shown because they are what actually left the enclave */
+  .toolcalls { margin: 2px 0 10px; display: flex; flex-direction: column; gap: 4px; }
+  .toolcall {
+    display: flex; align-items: baseline; gap: 8px; font-size: 12.5px;
+    padding: 6px 10px; border-radius: 10px; background: var(--hover);
+    border: 1px solid var(--border-soft);
+  }
+  .toolcall .tname {
+    color: var(--text); white-space: nowrap;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .toolcall .targs {
+    color: var(--text-3); flex: 1; min-width: 0;
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .toolcall .tms { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+  .toolcall.err .tname { color: var(--err); }
+  .toolcall.run .tms { color: var(--text-3); opacity: .75; }
 
   /* a generated image sits above the reply that talks about it */
   .genimg { margin: 4px 0 10px; }
@@ -1247,6 +1275,12 @@ const state = {
   webMode: "off",   // off | auto (persisted; "always" from an older build reads as auto)
   search: { enabled: false }, // what /models reported about this deployment's provider
   image: { enabled: false },  // ...and whether an image service is configured
+  // TOOLS: endpoints and MCP servers this deployment lets the model call. Off
+  // for the same reason web search is off - a call leaves the enclave, so it
+  // is the user's choice per session, not a default they inherit - unless the
+  // deployment set default_on.
+  toolsOn: false,
+  tools: { enabled: false },
   // IMAGES IN (the other direction from `image`): whether any servable model
   // can READ pictures, and the limits the composer enforces before uploading.
   // Vision is per MODEL - the attach button follows the selected one - UNLESS
@@ -1619,6 +1653,31 @@ function copyText(text, btn) {
 // explicit DOM nodes - never innerHTML. The href is also scheme-checked:
 // a result title is untrusted, and a `javascript:` URL rendered as a link
 // would turn a search result into script execution in the user's session.
+// What the model called, and with what. The arguments are shown in full
+// (elided by CSS, not by truncation) because they are the part that actually
+// left the enclave: a user is entitled to see what was sent on their behalf.
+function toolsBlock(calls) {
+  if (!calls || !calls.length) return null;
+  const wrap = node('<div class="toolcalls"></div>');
+  for (const c of calls) {
+    const row = node('<div class="toolcall"><span class="tname"></span><span class="targs"></span><span class="tms"></span></div>');
+    row.querySelector(".tname").textContent = c.name;
+    let args = "";
+    try { args = JSON.stringify(c.arguments || {}); } catch (_) { args = "{}"; }
+    row.querySelector(".targs").textContent = args === "{}" ? "" : args;
+    if (c.ok === undefined) {
+      row.classList.add("run");
+      row.querySelector(".tms").textContent = "running…";
+    } else {
+      if (!c.ok) row.classList.add("err");
+      row.querySelector(".tms").textContent =
+        (c.ok ? "" : "failed · ") + Math.round((c.ms || 0) / 100) / 10 + "s";
+    }
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
 function sourcesBlock(sources) {
   if (!sources || !sources.length) return null;
   const wrap = node('<div class="sources"><div class="sources-h">Sources</div><ol></ol></div>');
@@ -1745,6 +1804,9 @@ function renderMessage(m, idx, isTail) {
   // the picture goes ABOVE the sentence that refers to it
   const fig = imageBlock(m.image);
   if (fig) md.insertBefore(fig, md.firstChild);
+  // the calls happened BEFORE the answer, so they read above it
+  const tls = toolsBlock(m.tools);
+  if (tls) md.insertBefore(tls, md.firstChild);
   const src = sourcesBlock(m.sources);
   if (src) md.appendChild(src);
   const acts = row.querySelector(".actions");
@@ -1808,6 +1870,8 @@ function updateStreamDOM(chat) {
   // show it immediately rather than making the user wait for the sentence
   const fig = imageBlock(s.image);
   if (fig) body.insertBefore(fig, body.firstChild);
+  const tls = toolsBlock(s.tools);
+  if (tls) body.insertBefore(tls, body.firstChild);
   // sources stay pinned under the reply for the whole stream, so the user can
   // start opening them while the model is still writing
   const src = sourcesBlock(s.sources);
@@ -2255,7 +2319,7 @@ async function run(chat) {
   // held so a stop (or an error) can hand the question BACK complete: losing
   // the pictures on the way out would mean re-attaching them by hand
   const askedImages = askedMsg.images || [];
-  let reply = "", meta = null, sawDone = false, sources = null, genImage = null, visionMeta = null;
+  let reply = "", meta = null, sawDone = false, sources = null, genImage = null, visionMeta = null, toolCalls = null;
 
   // An instance that dies mid-generation leaves the proxied stream OPEN but
   // silent until an upstream idle timeout minutes later - without a watchdog
@@ -2290,6 +2354,9 @@ async function run(chat) {
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
         // "auto" = the server asks the model whether this turn needs the web
         web_search: state.webMode === "off" ? undefined : "auto",
+        // the deployment's OWN tools, which it executes itself; this only says
+        // whether the model is allowed to reach for them on this turn
+        tools: state.tools.enabled && state.toolsOn ? true : undefined,
       }),
       signal: ctl.signal,
     });
@@ -2332,6 +2399,24 @@ async function run(chat) {
             chat.streaming.image = genImage;
             chat.streaming.status = "Image ready; writing…";
             if (chat.id === state.currentId) renderChat();
+          } else if (d.tool) {
+            // A call is starting. The answer is generated AGAIN once the
+            // result comes back, so the reply buffer resets the way it does
+            // after a notice - what is on screen is about to be superseded.
+            toolCalls = toolCalls || [];
+            toolCalls.push({ name: d.tool.name, arguments: d.tool.arguments });
+            chat.streaming.tools = toolCalls;
+            reply = "";
+            chat.streaming.reply = "";
+            chat.streaming.status = "Calling " + d.tool.name + "…";
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.tool_result) {
+            const last = toolCalls && toolCalls[toolCalls.length - 1];
+            if (last) { last.ok = d.tool_result.ok; last.ms = d.tool_result.ms; }
+            chat.streaming.status = d.tool_result.ok
+              ? "Read the result; answering…"
+              : d.tool_result.name + " failed; answering anyway…";
+            if (chat.id === state.currentId) renderChat();
           } else if (d.search) {
             // sources arrive before the first token: show them straight away
             // so the user can see WHAT was read while the model reads it
@@ -2362,7 +2447,7 @@ async function run(chat) {
     // instance died or restarted) - surface it instead of recording a
     // truncated reply as if it were complete
     if (!sawDone) throw new Error("The stream ended before the response finished. The instance likely restarted. Try again.");
-    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage });
+    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: toolCalls });
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
     if (err && err.userStop) {
@@ -2979,6 +3064,37 @@ function renderModelMenu() {
     }
     modelMenu.appendChild(wseg);
   }
+  // Tools, only when the deployment configured some. Same stance as web
+  // search, for the same reason: a call reaches an endpoint outside the
+  // enclave, so it is a choice rather than an inheritance. The tooltip names
+  // what is actually wired up - a switch whose effect you cannot see is worse
+  // than no switch.
+  if (state.tools && state.tools.enabled) {
+    const names = (state.tools.http || []).slice();
+    if (state.tools.mcp) names.push(state.tools.mcp + " MCP server" + (state.tools.mcp === 1 ? "" : "s"));
+    const what = names.length ? names.join(", ") : "the configured tools";
+    // web_search is still web search: the Search switch above governs it, and a
+    // user who turns Tools on expecting it would otherwise be left guessing
+    const needsWeb = (state.tools.http || []).some((n) => n === "web_search" || n === "fetch_url");
+    const tsg = node('<div class="seg-row"><span>Tools</span><div class="seg"></div></div>');
+    for (const t of ["on", "off"]) {
+      const b = node("<button type='button'></button>");
+      b.textContent = t;
+      if ((state.toolsOn ? "on" : "off") === t) b.classList.add("on");
+      b.title = t === "on"
+        ? "let the model call this deployment's tools when a question needs one (" + what + ")"
+          + (needsWeb ? ". Web tools also need the search switch on" : "")
+        : "never call a tool; answer from the model alone, nothing leaves the enclave";
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.toolsOn = t === "on";
+        pref("llmchat-tools", state.toolsOn ? "on" : "off");
+        tsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      });
+      tsg.querySelector(".seg").appendChild(b);
+    }
+    modelMenu.appendChild(tsg);
+  }
 }
 
 // Model discovery: the deployment lists its servable models largest-first
@@ -2987,13 +3103,15 @@ function renderModelMenu() {
 // wins (when this deployment still serves it). The compute target restores
 // the same way.
 const modelsReady = (async () => {
-  let storedModel = null, storedTarget = null, storedThink = null, storedWeb = null;
+  let storedModel = null, storedTarget = null, storedThink = null, storedWeb = null,
+      storedTools = null;
   try {
     if (storeOK) {
       storedModel = localStorage.getItem("llmchat-model");
       storedTarget = localStorage.getItem("llmchat-target");
       storedThink = localStorage.getItem("llmchat-think");
       storedWeb = localStorage.getItem("llmchat-web");
+      storedTools = localStorage.getItem("llmchat-tools");
     }
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
@@ -3015,8 +3133,17 @@ const modelsReady = (async () => {
   // should come back the moment GPU capacity does.
   state.gpu = info.gpu === true ? true : info.gpu === false ? false : null;
   state.search = info.search || { enabled: false };
+  // the deployment may start the search switch on; a stored choice still wins,
+  // being the more recent statement of what this person wants
+  if (state.search.default_on === true && storedWeb !== "off") state.webMode = "auto";
   state.image = info.image || { enabled: false };
   state.vision = info.vision || { enabled: false, service: false, max_images: 0, max_bytes: 0 };
+  state.tools = info.tools || { enabled: false };
+  // the deployment may start the switch on; a stored choice still wins, since
+  // it is the more recent statement of what this person wants
+  state.toolsOn = state.tools.enabled && state.tools.default_on === true;
+  if (state.tools.enabled && (storedTools === "on" || storedTools === "off"))
+    state.toolsOn = storedTools === "on";
   // no provider AND no image service: the switch governs nothing
   if (!state.search.enabled && !state.image.enabled) state.webMode = "off";
   if (state.gpu === false) {
@@ -3322,6 +3449,16 @@ async function warmLadder() {
 })();
 if (!isMobile()) document.body.classList.remove("collapsed");
 (async () => { await modelsReady; warmLadder(); })();
+
+// Installable-app shell: the worker caches the static shell (page, font,
+// icons) keyed on the build's asset rev, so an installed app opens instantly
+// and offline. Registered base-relative so it follows the prefix the app is
+// served under, which also scopes it to exactly this app.
+if ("serviceWorker" in navigator) {
+  addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
 </script>
 </body>
 </html>

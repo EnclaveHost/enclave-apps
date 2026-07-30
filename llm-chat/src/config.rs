@@ -187,6 +187,20 @@ pub struct AppConfig {
     /// same router that decides about web search decides about images.
     #[serde(default)]
     pub image: Option<crate::image::ImageConfig>,
+    /// TOOLS: HTTP endpoints and MCP servers this deployment lets the model
+    /// call mid-answer. Absent (the default) means the model is never told a
+    /// tool exists and the app never calls one.
+    ///
+    /// The registry is the DEPLOYMENT'S, never the client's: a request can turn
+    /// the feature off (and by default it is off, exactly like web search) but
+    /// it cannot add an entry or change a URL. See tools.rs for why that
+    /// boundary is not negotiable.
+    ///
+    /// Tool calling is a TRAINED format, so this only arms on a `chatml`
+    /// (qwen-family) model; elsewhere the block is not rendered and the
+    /// pre-pass router keeps doing the work.
+    #[serde(default)]
+    pub tools: Option<crate::tools::ToolsConfig>,
     /// VISION BY DELEGATION: absent (the default) means an attached image is
     /// read by the SERVING model itself, which needs a model whose volume
     /// carries a projector (`vision` below). Present points at a sibling
