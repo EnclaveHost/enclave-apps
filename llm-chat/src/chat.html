@@ -3,8 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>llm-chat on Enclave</title>
+<!-- dark first, so the UA's own surfaces (scrollbars, form controls, the paint
+     before the theme script runs) start dark like the rest of the app -->
+<meta name="color-scheme" content="dark light">
+<title>eyesoff.ai on Enclave</title>
+<!-- the same mark as a tab icon, inline as a data: URI so the tab is right on
+     first paint and the app serves no extra request for it (# in the gradient
+     references has to be %23, or the URI ends at the first fragment) -->
+<!-- iOS reads this one from the SERVER (it has no data:-URI path for a
+     home-screen tile), and it is base-relative so a prefixed deployment
+     resolves it correctly -->
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23221A63'/%3E%3Cstop offset='1' stop-color='%230E0A2E'/%3E%3C/linearGradient%3E%3ClinearGradient id='c' gradientUnits='userSpaceOnUse' x1='110' y1='120' x2='420' y2='420'%3E%3Cstop offset='0' stop-color='%238CF5D2'/%3E%3Cstop offset='1' stop-color='%232DD4BF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='512' height='512' rx='116' fill='url(%23b)'/%3E%3Crect x='96' y='128' width='320' height='216' rx='62' fill='url(%23c)'/%3E%3Cpath d='M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z' fill='url(%23c)'/%3E%3Cpath d='M178 214 Q256 280 334 214' fill='none' stroke='%23131039' stroke-width='27' stroke-linecap='round'/%3E%3Cpath d='M256 268 V304' stroke='%23131039' stroke-width='25' stroke-linecap='round'/%3E%3Cpath d='M211 259 L189 289' stroke='%23131039' stroke-width='25' stroke-linecap='round'/%3E%3Cpath d='M301 259 L323 289' stroke='%23131039' stroke-width='25' stroke-linecap='round'/%3E%3Cpath d='M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z' fill='%238CF5D2'/%3E%3C/svg%3E">
 <script>
 // The open chat is a PATH (/c/<id>), so this page is served from more than one
 // URL and every relative URL in the file - the fetches, the emoji font - would
@@ -25,18 +35,18 @@
 })();
 </script>
 <script>
-// Apply the theme before first paint to avoid a flash. Stored preference
-// wins (only present when "Remember on this device" is on); otherwise
-// follow the OS.
+// Apply the theme before first paint to avoid a flash. A stored preference wins
+// (only present when "Remember on this device" is on); with none, the app is
+// DARK - it is the app's own look rather than a mirror of the desktop, and a
+// light OS no longer overrides it. The toggle in the header still switches, and
+// switching is what creates the stored preference.
 (function () {
   var t = null;
   try {
     if (localStorage.getItem("llmchat-store") === "1")
       t = localStorage.getItem("llmchat-theme");
   } catch (_) {}
-  if (t !== "light" && t !== "dark")
-    t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  document.documentElement.dataset.theme = t;
+  document.documentElement.dataset.theme = t === "light" ? "light" : "dark";
 })();
 </script>
 <style>
@@ -83,7 +93,9 @@
     font-display: swap;
   }
 
-  :root { --side-w: 260px; }
+  /* the sidebar's default width; SIDE_DEF in the script below is the same
+     number, and a saved preference overrides both */
+  :root { --side-w: 300px; }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
@@ -132,7 +144,9 @@
     display: flex; align-items: center; gap: 8px; padding: 14px 14px 8px;
   }
   .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
-  .brand svg { color: var(--accent); }
+  /* the mark is artwork with its own palette, not a glyph tinted by currentColor,
+     so it gets a corner radius instead of a colour */
+  .brand svg { border-radius: 6px; flex: none; }
   .new-chat {
     display: flex; align-items: center; gap: 10px; margin: 6px 8px 4px;
     padding: 10px 12px; border-radius: 10px; font-weight: 500;
@@ -276,8 +290,8 @@
   .boot-card { text-align: center; max-width: 400px; width: 100%; padding: 24px; }
   .boot-mark { position: relative; width: 72px; height: 72px; margin: 0 auto 18px; }
   .boot-mark svg {
-    position: absolute; inset: 0; margin: auto; width: 30px; height: 30px;
-    color: var(--accent); animation: boot-pulse 1.8s ease-in-out infinite;
+    position: absolute; inset: 0; margin: auto; width: 36px; height: 36px;
+    border-radius: 9px; animation: boot-pulse 1.8s ease-in-out infinite;
   }
   .boot-mark::before {
     content: ""; position: absolute; inset: 0; border-radius: 50%;
@@ -318,11 +332,10 @@
   #empty {
     margin: auto; text-align: center; padding: 24px 20px 40px; max-width: 620px; width: 100%;
   }
-  #empty .mark {
-    width: 56px; height: 56px; margin: 0 auto 18px; border-radius: 16px;
-    display: flex; align-items: center; justify-content: center;
-    background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent);
-  }
+  /* the mark IS the tile now: it brings its own rounded body and background,
+     so the tinted container behind the old glyph would only double the corner */
+  #empty .mark { width: 56px; height: 56px; margin: 0 auto 18px; }
+  #empty .mark svg { width: 100%; height: 100%; border-radius: 15px; display: block; }
   #empty h1 { font-size: 28px; font-weight: 600; letter-spacing: -.02em; }
   #empty p { margin-top: 10px; color: var(--text-2); font-size: 14px; }
   .chips { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 28px; }
@@ -519,6 +532,8 @@
   .att-status svg { flex: none; }
   .att-status.ok { color: var(--ok); }
   .att-status.warn { color: var(--warn); }
+  /* still fetching: same line, no icon, no colour that means anything */
+  .att-status.wait { color: var(--text-3); }
   .api-card {
     background: var(--bg-menu); border: 1px solid var(--border-soft);
     border-radius: 16px; box-shadow: var(--shadow); padding: 20px 22px;
@@ -774,12 +789,53 @@
 </head>
 <body class="collapsed">
 
+<!-- The eyesoff.ai mark, defined ONCE and <use>d wherever the brand appears
+     (boot card, sidebar, empty state, tab icon). Inline rather than fetched:
+     this page is a single self-contained document embedded in the wasm, so an
+     <img src="/assets/..."> would be one more request the app would have to
+     serve and one more thing to 404 offline. Gradient ids are prefixed eo- to
+     keep them out of the rest of the document's id namespace, and the artwork
+     carries its own colours, so unlike the icon it replaces it does not follow
+     currentColor. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="eyesoff" viewBox="0 0 512 512">
+    <defs>
+      <linearGradient id="eo-bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#221A63"/>
+        <stop offset="1" stop-color="#0E0A2E"/>
+      </linearGradient>
+      <radialGradient id="eo-glow" cx="0.5" cy="0.4" r="0.65">
+        <stop offset="0" stop-color="#6C5CE7" stop-opacity="0.45"/>
+        <stop offset="1" stop-color="#6C5CE7" stop-opacity="0"/>
+      </radialGradient>
+      <linearGradient id="eo-bubble" gradientUnits="userSpaceOnUse" x1="110" y1="120" x2="420" y2="420">
+        <stop offset="0" stop-color="#8CF5D2"/>
+        <stop offset="1" stop-color="#2DD4BF"/>
+      </linearGradient>
+    </defs>
+    <rect width="512" height="512" rx="116" fill="url(#eo-bg)"/>
+    <rect width="512" height="512" rx="116" fill="url(#eo-glow)"/>
+    <rect x="13" y="13" width="486" height="486" rx="105" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="3"/>
+    <!-- chat bubble -->
+    <rect x="96" y="128" width="320" height="216" rx="62" fill="url(#eo-bubble)"/>
+    <path d="M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z" fill="url(#eo-bubble)"/>
+    <!-- closed eye -->
+    <path d="M178 214 Q256 280 334 214" fill="none" stroke="#131039" stroke-width="27" stroke-linecap="round"/>
+    <path d="M256 268 V304" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M211 259 L189 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M301 259 L323 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <!-- AI spark -->
+    <path d="M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z" fill="#8CF5D2" opacity="0.95"/>
+  </symbol>
+</svg>
+
+
 <div id="boot" role="status" aria-live="polite">
   <div class="boot-card">
     <div class="boot-mark" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.3 6.7 6.7 2.3-6.7 2.3L12 20.5l-2.3-6.7L3 11.5l6.7-2.3z"/></svg>
+      <svg viewBox="0 0 512 512"><use href="#eyesoff"/></svg>
     </div>
-    <h1>llm-chat</h1>
+    <h1>eyesoff.ai</h1>
     <p id="bootMsg">Contacting the enclave&hellip;</p>
     <ul id="bootList"></ul>
     <button id="bootSkip" type="button">Continue while models warm</button>
@@ -790,8 +846,8 @@
   <div class="inner">
     <div class="side-head">
       <span class="brand">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.3 6.7 6.7 2.3-6.7 2.3L12 20.5l-2.3-6.7L3 11.5l6.7-2.3z"/></svg>
-        llm-chat
+        <svg width="22" height="22" viewBox="0 0 512 512" aria-hidden="true"><use href="#eyesoff"/></svg>
+        eyesoff.ai
       </span>
       <span class="spacer"></span>
       <button class="icon-btn" id="closeSide" aria-label="Close sidebar" title="Close sidebar">
@@ -858,8 +914,8 @@
 
   <div id="scroller">
     <div id="empty">
-      <div class="mark">
-        <svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.5l2.3 6.7 6.7 2.3-6.7 2.3L12 20.5l-2.3-6.7L3 11.5l6.7-2.3z"/></svg>
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 512 512"><use href="#eyesoff"/></svg>
       </div>
       <h1>What can I help with?</h1>
       <p>Private inference inside a secure enclave. Nothing you type ever leaves it.</p>
@@ -919,7 +975,7 @@
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>
         <span>No GPU capacity right now, so this chat is answering on CPU.</span>
       </div>
-      <p class="gpu-lead">LLM Chat is free because people rent their hardware to the fleet, and every GPU
+      <p class="gpu-lead">eyesoff.ai is free because people rent their hardware to the fleet, and every GPU
       enclave is taken right now. A machine with a TEE-capable CPU and a confidential-computing GPU could
       be earning instead of sitting idle.</p>
       <div class="gpu-cta">
@@ -1209,8 +1265,12 @@ const isMobile = () => matchMedia("(max-width: 768px)").matches;
 // Browser storage is OPT-IN ("Remember on this device", default off). The
 // consent flag is only ever written when it is ON, and turning it off wipes
 // everything (IndexedDB chats + preference keys) - an opted-out browser holds
-// zero llm-chat data. While off, history and preferences live in memory for
-// the tab's lifetime only.
+// zero data from this app. While off, history and preferences live in memory
+// for the tab's lifetime only.
+//
+// The llmchat- key prefix is deliberately NOT renamed with the brand: it is the
+// address of what people already have stored, and changing it would silently
+// orphan every saved chat and preference in every browser that has one.
 const PREF_KEYS = ["llmchat-store", "llmchat-theme", "llmchat-model", "llmchat-target", "llmchat-sidew"];
 let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
@@ -1324,14 +1384,10 @@ $("themeBtn").addEventListener("click", () => {
   pref("llmchat-theme", next);
   applyThemeIcon();
 });
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-  let stored = null;
-  try { if (storeOK) stored = localStorage.getItem("llmchat-theme"); } catch (_) {}
-  if (stored !== "light" && stored !== "dark") {
-    document.documentElement.dataset.theme = e.matches ? "dark" : "light";
-    applyThemeIcon();
-  }
-});
+// No OS-change listener any more: the app defaults to dark rather than to
+// whatever the desktop is doing, so following a switch to light would undo that
+// default in a browser that never asked for light. The header toggle is the way
+// to change it, and it records the choice.
 applyThemeIcon();
 
 // ---------------------------------------------------------------- sidebar --
@@ -1465,7 +1521,9 @@ $("newChatBtn").addEventListener("click", () => { newChat(); if (isMobile()) set
 // UI preference like the theme, so it persists to localStorage. Dragging
 // under the collapse threshold tucks the sidebar away entirely.
 const grip = $("sideGrip");
-const SIDE_MIN = 200, SIDE_MAX = 440, SIDE_DEF = 260, SIDE_COLLAPSE_AT = 130;
+// SIDE_DEF must match the --side-w in the stylesheet, which is what the panel
+// is until this script runs; they drift into a first-paint jump otherwise.
+const SIDE_MIN = 200, SIDE_MAX = 440, SIDE_DEF = 300, SIDE_COLLAPSE_AT = 130;
 let sideW = SIDE_DEF;
 
 function setSideWidth(px) {
@@ -2608,10 +2666,16 @@ function renderAtt(d, snp, quoteFrom) {
     " Prompts and replies are processed only inside the enclave; chat history lives only in this browser."));
 }
 
+// ok = a verdict in this deployment's favour, warn = one against it, and
+// "wait" = no verdict yet. The waiting state gets NO icon and muted text on
+// purpose: an alert triangle on a line that only means "still fetching" reads
+// as a security finding, and the one thing an attestation dialog must not do is
+// alarm people about nothing.
 function attStatusLine(cls, text) {
   const status = $("attStatus");
   status.className = "att-status " + cls;
-  status.innerHTML = (cls === "ok" ? ICONS.check : ICONS.alert) + "<span></span>";
+  const icon = cls === "ok" ? ICONS.check : cls === "warn" ? ICONS.alert : "";
+  status.innerHTML = icon + "<span></span>";
   status.querySelector("span").textContent = text;
 }
 
@@ -2639,10 +2703,15 @@ async function openAtt() {
   attOverlay.classList.add("open");
   $("attClose").focus();
   if (attLoaded) return renderAtt(attLoaded.d, attLoaded.snp, attLoaded.from);
+  // One neutral line while the fetch is in flight. It deliberately does NOT
+  // branch on the hostname any more: a custom domain is a supported setup, the
+  // deployment resolves its own id from ENCLAVE_HOSTS either way, and flagging
+  // the origin here warned about a situation that is fine. If the fetch really
+  // cannot resolve an id, the failure path below says so with the reason.
   const m = location.hostname.match(/^([0-9a-f]{8,})\.app\.enclave\.host$/i);
-  attStatusLine(m ? "ok" : "warn", m
+  attStatusLine("wait", m
     ? "Reading the hardware report for deployment 0x" + m[1].toLowerCase() + "…"
-    : "Not an *.app.enclave.host origin (proxy or local dev): asking this deployment what it is…");
+    : "Reading this deployment's hardware report…");
   $("attBody").innerHTML = '<p class="att-spin">Fetching the quote…</p>';
   try {
     attLoaded = await loadAtt();

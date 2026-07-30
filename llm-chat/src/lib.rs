@@ -14,6 +14,12 @@
 //!                               returns to it. The id is an IndexedDB key in
 //!                               one browser profile, so the server neither
 //!                               knows nor needs to know what it names.
+//!   GET  /favicon.svg         - the brand mark, for whoever asks the SERVER for
+//!   GET  /favicon.ico           an icon instead of reading the page's <link>
+//!   GET  /apple-touch-icon.png  (crawlers, unfurlers, iOS home screens, a tab
+//!                               opened straight onto a JSON route). The page
+//!                               carries the mark inline, so these are never on
+//!                               its own critical path.
 //!   GET  /emoji.woff2         - color-emoji fallback font (Noto COLRv1): the
 //!                               playground declares it with local() sources
 //!                               first + unicode-range, so a browser only
@@ -176,6 +182,16 @@ use sampling::{pick_token, Rng, SampleParams};
 
 static CHAT_HTML: &str = include_str!("chat.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
+/// The brand mark, for the consumers that ask the SERVER for an icon rather
+/// than reading the page's <link>: browsers hitting a non-HTML route, crawlers,
+/// link unfurlers, bookmark managers, and iOS adding a home-screen tile. The
+/// page itself carries the mark inline, so none of these are on its critical
+/// path. SVG for anything that will take it, a 32px PNG inside an ICO container
+/// for /favicon.ico, and a 180px full-bleed PNG for iOS - which masks the icon
+/// with its own squircle, so a transparent rounded corner would come out black.
+static FAVICON_SVG: &str = include_str!("../assets/eyesoff.svg");
+static FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+static TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
 
 // ------------------------------------------------------------ model volumes --
 // Weights + tokenizer arrive as ATTACHED MODEL VOLUMES (Tinfoil Modelwrap):
@@ -4289,6 +4305,14 @@ impl Guest for Component {
                 respond_bytes(out, 200, "text/html; charset=utf-8", CHAT_HTML.as_bytes())
             }
             (Method::Get, "/emoji.woff2") => respond_asset(out, "font/woff2", EMOJI_WOFF2),
+            (Method::Get, "/favicon.svg") | (Method::Get, "/icon.svg") => {
+                respond_asset(out, "image/svg+xml", FAVICON_SVG.as_bytes())
+            }
+            (Method::Get, "/favicon.ico") => respond_asset(out, "image/x-icon", FAVICON_ICO),
+            (Method::Get, "/apple-touch-icon.png")
+            | (Method::Get, "/apple-touch-icon-precomposed.png") => {
+                respond_asset(out, "image/png", TOUCH_ICON_PNG)
+            }
             (Method::Get, "/ping") => respond_bytes(
                 out,
                 200,
@@ -4305,7 +4329,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
             ),
         }
     }
