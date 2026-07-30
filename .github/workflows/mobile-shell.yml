@@ -1,0 +1,58 @@
+name: mobile-shell
+
+# Builds the verify-first shell and produces an installable debug APK as a
+# workflow artifact. This box has no Android SDK; the runner does.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mobile-shell/**"
+      - ".github/workflows/mobile-shell.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile-shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile-shell/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # Network-dependent by nature (live deployment + Sigstore + GitHub), so
+      # informative, never a merge gate.
+      - name: verify live deployment (non-blocking)
+        run: npm run test:live
+        continue-on-error: true
+
+      - run: npx cap sync android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: build debug APK
+        working-directory: mobile-shell/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eyesoff-debug-apk
+          path: mobile-shell/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

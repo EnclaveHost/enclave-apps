@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>eyesoff</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: #212121; color: #ececec;
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  main { text-align: center; max-width: 30rem; padding: 2rem; }
+  .mark { width: 96px; height: 96px; border-radius: 22%; }
+  h1 { font-size: 1.3rem; font-weight: 600; margin: 1rem 0 0.25rem; }
+  #status { color: #a8a8a8; min-height: 3em; margin-top: 0.75rem; }
+  .pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.55; } }
+  #failed h2 { color: #ff8a80; font-size: 1.05rem; margin: 1rem 0 0.5rem; }
+  #fail-reason { color: #d8d8d8; }
+  #fail-steps {
+    text-align: left; white-space: pre-wrap; color: #9a9a9a;
+    background: #1a1a1a; border-radius: 10px; padding: 0.75rem 1rem;
+    font: 12px/1.6 ui-monospace, monospace; margin: 1rem 0; overflow-x: auto;
+  }
+  button {
+    font: inherit; cursor: pointer; border: 0; border-radius: 999px;
+    padding: 0.6rem 1.5rem; margin: 0.25rem;
+  }
+  #retry { background: #2dd4bf; color: #10201d; font-weight: 600; }
+  #enter-anyway { background: none; color: #8a8a8a; text-decoration: underline; font-size: 0.85rem; }
+  .fineprint { color: #6f6f6f; font-size: 0.75rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+<main>
+  <svg class="mark" viewBox="0 0 512 512" role="img" aria-label="eyesoff">
+    <defs>
+      <linearGradient id="b" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#221A63"/><stop offset="1" stop-color="#0E0A2E"/>
+      </linearGradient>
+      <linearGradient id="c" gradientUnits="userSpaceOnUse" x1="110" y1="120" x2="420" y2="420">
+        <stop offset="0" stop-color="#8CF5D2"/><stop offset="1" stop-color="#2DD4BF"/>
+      </linearGradient>
+    </defs>
+    <rect width="512" height="512" rx="116" fill="url(#b)"/>
+    <rect x="96" y="128" width="320" height="216" rx="62" fill="url(#c)"/>
+    <path d="M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z" fill="url(#c)"/>
+    <path d="M178 214 Q256 280 334 214" fill="none" stroke="#131039" stroke-width="27" stroke-linecap="round"/>
+    <path d="M256 268 V304" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M211 259 L189 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M301 259 L323 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z" fill="#8CF5D2"/>
+  </svg>
+
+  <div id="verifying">
+    <h1 id="app-name">eyesoff.ai</h1>
+    <div id="status" class="pulse">checking the enclave&hellip;</div>
+  </div>
+
+  <div id="failed" hidden>
+    <h2>The enclave could not be verified</h2>
+    <div id="fail-reason"></div>
+    <pre id="fail-steps"></pre>
+    <button id="retry">Try again</button>
+    <br>
+    <button id="enter-anyway">continue without verification</button>
+  </div>
+
+  <div class="fineprint">
+    A pass means the deployment behind this app runs the signed
+    EnclaveHost/enclave release inside real enclave hardware, checked on this
+    device against vendor and Sigstore roots.
+  </div>
+</main>
+<script src="splash.bundle.js"></script>
+</body>
+</html>
