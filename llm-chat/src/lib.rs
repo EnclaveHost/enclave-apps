@@ -9,6 +9,11 @@
 //!
 //! Routes:
 //!   GET  /                    - chat playground (self-contained HTML).
+//!   GET  /c/<chat>            - the SAME page: the open conversation is
+//!                               addressed by path so a refresh or a bookmark
+//!                               returns to it. The id is an IndexedDB key in
+//!                               one browser profile, so the server neither
+//!                               knows nor needs to know what it names.
 //!   GET  /emoji.woff2         - color-emoji fallback font (Noto COLRv1): the
 //!                               playground declares it with local() sources
 //!                               first + unicode-range, so a browser only
@@ -4241,6 +4246,24 @@ fn handle_models(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOut
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }
 
+/// Does this path address an open conversation? Exactly `/c`, `/c/`, or
+/// `/c/<id>` with an optional trailing slash. Deeper paths are REFUSED rather
+/// than served the page: the page pins its <base> by stripping one `/c/<id>`
+/// segment, so `/c/a/b` would load a playground whose every fetch resolves one
+/// directory too deep and 404s. A wrong URL should fail as a wrong URL.
+fn is_chat_path(p: &str) -> bool {
+    if p == "/c" || p == "/c/" {
+        return true;
+    }
+    match p.strip_prefix("/c/") {
+        Some(rest) => {
+            let id = rest.trim_end_matches('/');
+            !id.is_empty() && !id.contains('/')
+        }
+        None => false,
+    }
+}
+
 struct Component;
 
 impl Guest for Component {
@@ -4255,6 +4278,14 @@ impl Guest for Component {
         let method = req.method();
         match (method, path) {
             (Method::Get, "/") | (Method::Get, "") => {
+                respond_bytes(out, 200, "text/html; charset=utf-8", CHAT_HTML.as_bytes())
+            }
+            // The open conversation is addressed by PATH (/c/<id>), so every one
+            // of those paths serves the same page and the client reads the id
+            // out of its own pathname. Nothing here resolves the id: it is an
+            // IndexedDB key in ONE browser profile, so this deployment has never
+            // heard of it and could not honour it if it wanted to.
+            (Method::Get, p) if is_chat_path(p) => {
                 respond_bytes(out, 200, "text/html; charset=utf-8", CHAT_HTML.as_bytes())
             }
             (Method::Get, "/emoji.woff2") => respond_asset(out, "font/woff2", EMOJI_WOFF2),
@@ -4274,7 +4305,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
+                "not found; routes: GET /, GET /c/<chat>, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat",
             ),
         }
     }
@@ -4484,6 +4515,22 @@ mod tests {
         assert_eq!(b64_decode(&loose).unwrap(), img);
         assert!(b64_decode("not base64!").is_err());
         assert!(b64_decode("").is_err());
+    }
+
+    #[test]
+    fn the_open_chat_is_addressed_by_path() {
+        // what the playground writes into the URL bar
+        assert!(is_chat_path("/c/c1a2b3c4d5e"));
+        assert!(is_chat_path("/c/c1a2b3c4d5e/"));
+        assert!(is_chat_path("/c"), "the bare prefix lands on a new chat");
+        assert!(is_chat_path("/c/"));
+        // and what must NOT quietly serve a broken page
+        assert!(!is_chat_path("/c/a/b"), "one segment only; the page's base strips one");
+        assert!(!is_chat_path("/cx"));
+        assert!(!is_chat_path("/chat"), "the POST route, not a chat address");
+        assert!(!is_chat_path("/models"));
+        assert!(!is_chat_path("/"));
+        assert!(!is_chat_path(""));
     }
 
     #[test]

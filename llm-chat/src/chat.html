@@ -6,6 +6,25 @@
 <meta name="color-scheme" content="light dark">
 <title>llm-chat on Enclave</title>
 <script>
+// The open chat is a PATH (/c/<id>), so this page is served from more than one
+// URL and every relative URL in the file - the fetches, the emoji font - would
+// otherwise resolve against /c/ and 404. Pin a <base> to the app ROOT instead
+// of rewriting them all absolute, because relative is what keeps the app
+// working when it is served under a PREFIX (the platform's /x/<id>/https/
+// bridge, or any reverse proxy): an absolute /models would leave the prefix
+// behind, while a base-relative "models" follows it.
+//
+// First script in the document, and before the stylesheet, because a base
+// inserted after a relative URL has already been resolved is too late.
+(function () {
+  try {
+    var b = document.createElement("base");
+    b.href = location.pathname.replace(/\/c(\/[^/]*)?\/?$/, "/") || "/";
+    document.head.appendChild(b);
+  } catch (_) {}
+})();
+</script>
+<script>
 // Apply the theme before first paint to avoid a flash. Stored preference
 // wins (only present when "Remember on this device" is on); otherwise
 // follow the OS.
@@ -1353,14 +1372,22 @@ function renderSidebar() {
   }
 }
 
-// ---- the open chat lives in the URL (?c=<id>), so a refresh, a restored tab
-// or a bookmark comes back to the conversation you were in instead of a blank
-// one. The id is an IndexedDB key in THIS browser profile: it addresses a chat
-// locally and is meaningless anywhere else, so this is navigation state, not a
-// share link - the transcript itself never leaves this browser.
-const CHAT_PARAM = "c";
+// ---- the open chat lives in the URL as a PATH (/c/<id>), so a refresh, a
+// restored tab or a bookmark comes back to the conversation you were in instead
+// of a blank one. The id is an IndexedDB key in THIS browser profile: it
+// addresses a chat locally and is meaningless anywhere else, so this is
+// navigation state and NOT a share link - a /c/<id> link opened by anyone else
+// (or in another profile, or with storage off) lands on a fresh chat, because
+// the transcript never left this browser to begin with.
+const CHAT_PARAM = "c";   // the old spelling, still read below
 
 function urlChatId() {
+  // the path form, anchored at the END so it composes with a serving prefix
+  const m = location.pathname.match(/\/c\/([^/]+)\/?$/);
+  if (m) { try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; } }
+  // ?c=<id> is what this used to be. Still honoured so old bookmarks and tabs
+  // restored from before the change open the right conversation; boot rewrites
+  // the URL to the path form on the way in.
   try { return new URLSearchParams(location.search).get(CHAT_PARAM); } catch (_) { return null; }
 }
 
@@ -1370,9 +1397,13 @@ function urlChatId() {
 // should not become history entries you can navigate back into.
 function setUrlChat(id, push) {
   try {
-    const u = new URL(location.href);
-    if (id) u.searchParams.set(CHAT_PARAM, id);
-    else u.searchParams.delete(CHAT_PARAM);
+    // built from the BASE, not from "/", so a prefixed deployment keeps its
+    // prefix: base /x/<dep>/https/ + "c/<id>" stays inside the app
+    const u = new URL(id ? "c/" + encodeURIComponent(id) : ".", document.baseURI);
+    // carry any other query along, and drop the old ?c= if this URL still has it
+    const q = new URLSearchParams(location.search);
+    q.delete(CHAT_PARAM);
+    u.search = q.toString();
     if (u.href === location.href) return;
     history[push ? "pushState" : "replaceState"]({ chat: id || null }, "", u.href);
   } catch (_) {}
@@ -2301,11 +2332,13 @@ async function run(chat) {
 }
 
 // -------------------------------------------------------------- API dialog --
-// The base URL is derived from the page's own location (relative, like every
-// fetch here), so it stays correct behind any proxy prefix.
+// The base URL is derived from the page's own base (relative, like every fetch
+// here), so it stays correct behind any proxy prefix. From document.baseURI
+// rather than location.href: the location can be /c/<id>, which would advertise
+// an endpoint of <origin>/c/v1 that serves nothing.
 const apiOverlay = $("apiOverlay");
 function openApi() {
-  const base = new URL("v1", location.href).href;
+  const base = new URL("v1", document.baseURI).href;
   $("apiBase").textContent = base;
   $("apiCurl").textContent = "curl " + base + "/chat/completions \\\n" +
     '  -H "content-type: application/json" \\\n' +
