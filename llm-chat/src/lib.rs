@@ -2878,7 +2878,7 @@ fn apply_vision(
         "looking at the {} with the vision model…",
         if images.len() == 1 { "image" } else { "images" }
     ));
-    let answer = vision::describe(&vcfg, &images, &question, None, || now_ms() as u64)?;
+    let answer = vision::describe(&vcfg, &images, &question, None, || now_ms() as u64, on_status)?;
 
     // Drop every picture: nothing downstream can use the bytes now.
     for (i, m) in messages.iter_mut().enumerate() {
@@ -2970,7 +2970,7 @@ fn apply_web_search(
             return Ok(None); // no service: answer normally rather than fail
         }
         on_status("generating the image…");
-        return run_image(cfg, &prompt, messages, last, image_out).map(|()| None);
+        return run_image(cfg, &prompt, messages, last, image_out, on_status).map(|()| None);
     }
 
     if !asked_inline && web_mode == WebMode::Off {
@@ -2987,7 +2987,7 @@ fn apply_web_search(
         match route_web_search(cfg, tok, messages, target_mode, has_image) {
             Some(RouterVerdict::Image(prompt)) => {
                 on_status("generating the image…");
-                return run_image(cfg, &prompt, messages, last, image_out).map(|()| None);
+                return run_image(cfg, &prompt, messages, last, image_out, on_status).map(|()| None);
             }
             Some(RouterVerdict::Search(q)) => {
                 if cfg.search.is_none() {
@@ -3024,9 +3024,10 @@ fn run_image(
     messages: &mut [ChatMsg],
     last: usize,
     image_out: &mut Option<image::GeneratedImage>,
+    on_status: &dyn Fn(&str),
 ) -> Result<(), String> {
     let icfg = cfg.image.as_ref().ok_or("image generation is not enabled on this deployment")?;
-    let img = image::generate(icfg, prompt, || now_ms() as u64)?;
+    let img = image::generate(icfg, prompt, || now_ms() as u64, on_status)?;
     // The model never sees the bytes - it is a text model. It is told the
     // image exists and what was asked for, which is enough to write "here is
     // the fox you asked for" instead of describing a picture it invented.
@@ -3703,36 +3704,23 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     let mode = creq.target.as_deref().unwrap_or("auto");
     let mut messages = creq.messages.clone();
     let mut generated_image: Option<image::GeneratedImage> = None;
-    let no_status = |_: &str| {};
-    let search_meta = match apply_web_search(
-        cfg,
-        &creq,
-        &mut messages,
-        &tok,
-        mode,
-        &mut generated_image,
-        &no_status,
-    ) {
-        Ok(m) => m,
-        Err(e) => return json_err(out, 502, &e),
-    };
-    // the delegated vision leg (see apply_vision); a deployment with no
-    // vision_service, or a serving model reading the picture itself, no-ops here
-    let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
-        Ok(m) => m,
-        Err(e) => return json_err(out, 502, &e),
-    };
-    let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
-        Ok(v) => v,
-        Err(e) => return json_err(out, 400, &e),
-    };
-    let params = gen_params(cfg, &creq, stops, think_open);
     let id = completion_id();
     let created = (now_ms() / 1000) as u64;
     let model = cfg.name.clone();
 
     if creq.stream.unwrap_or(false) {
-        // ---- streaming: OpenAI chunk protocol over SSE
+        // ---- streaming: OpenAI chunk protocol over SSE.
+        //
+        // The response opens BEFORE the search/image/vision legs run. Those
+        // legs can hold a turn for minutes (a diffusion job queued behind
+        // other tenants, a big picture on a busy share), and response headers
+        // held back that long are how proxy response timeouts and SDK read
+        // timeouts kill the request before its first byte. Open first, and
+        // the legs heartbeat as SSE comments, which conforming OpenAI parsers
+        // are required to ignore. The trade: a leg failure now arrives as an
+        // in-stream error event on a 200 rather than a 502 status - the same
+        // trade /chat makes, with the same error text. Non-streaming keeps
+        // its status codes below; it has no stream to keep warm.
         let headers = Fields::new();
         let _ = headers.set(&"content-type".to_string(), &[b"text/event-stream".to_vec()]);
         let _ = headers.set(&"cache-control".to_string(), &[b"no-cache".to_vec()]);
@@ -3758,6 +3746,55 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 })
             )
         };
+        // leg progress as SSE comments: the OpenAI protocol has no status
+        // events, and a comment both narrates and keeps the connection warm
+        let leg_status = |s: &str| {
+            let _ = send_raw(&format!(": {s}\n\n"));
+        };
+        let send_err = |e: &str| {
+            let _ = send_raw(&format!(
+                "data: {}\n\n",
+                serde_json::json!({ "error": { "message": strip_code(e), "type": "server_error" } })
+            ));
+        };
+        let search_meta = match apply_web_search(
+            cfg,
+            &creq,
+            &mut messages,
+            &tok,
+            mode,
+            &mut generated_image,
+            &leg_status,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                send_err(&e);
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
+        };
+        // the delegated vision leg (see apply_vision); a deployment with no
+        // vision_service, or a serving model reading the picture itself, no-ops here
+        let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &leg_status) {
+            Ok(m) => m,
+            Err(e) => {
+                send_err(&e);
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
+        };
+        let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
+            Ok(v) => v,
+            Err(e) => {
+                send_err(&e);
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
+        };
+        let params = gen_params(cfg, &creq, stops, think_open);
         // Sources first, as an SSE COMMENT: the chunk schema has no field for
         // them and inventing one would break strict OpenAI clients, while a
         // comment line is required to be ignored by every conforming parser.
@@ -3813,7 +3850,34 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         drop(stream);
         let _ = OutgoingBody::finish(body, None);
     } else {
-        // ---- non-streaming: run to completion, one JSON response
+        // ---- non-streaming: run to completion, one JSON response. The legs
+        // run before the response by necessity - there is no stream to
+        // heartbeat - so this path keeps real HTTP status codes and keeps the
+        // standing advice: a request that can take minutes (image generation,
+        // a big vision read) belongs on stream:true, because the buffered
+        // path has a proxy-hop timeout budget it cannot influence.
+        let no_status = |_: &str| {};
+        let search_meta = match apply_web_search(
+            cfg,
+            &creq,
+            &mut messages,
+            &tok,
+            mode,
+            &mut generated_image,
+            &no_status,
+        ) {
+            Ok(m) => m,
+            Err(e) => return json_err(out, 502, &e),
+        };
+        let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
+            Ok(m) => m,
+            Err(e) => return json_err(out, 502, &e),
+        };
+        let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking()) {
+            Ok(v) => v,
+            Err(e) => return json_err(out, 400, &e),
+        };
+        let params = gen_params(cfg, &creq, stops, think_open);
         let sink = |_: &str| true;
         let mut last_err = String::new();
         let mut result: Option<GenStats> = None;

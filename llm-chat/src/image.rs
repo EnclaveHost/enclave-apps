@@ -124,7 +124,12 @@ impl GeneratedImage {
 /// Generate one image. Errors carry the service's own message where there is
 /// one, because "image generation failed" alone tells an operator nothing
 /// about whether the model is unattached, the share too small, or the key wrong.
-pub fn generate(cfg: &ImageConfig, prompt: &str, now_ms: impl Fn() -> u64) -> Result<GeneratedImage, String> {
+pub fn generate(
+    cfg: &ImageConfig,
+    prompt: &str,
+    now_ms: impl Fn() -> u64,
+    on_status: &dyn Fn(&str),
+) -> Result<GeneratedImage, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err("empty image prompt".into());
@@ -159,7 +164,16 @@ pub fn generate(cfg: &ImageConfig, prompt: &str, now_ms: impl Fn() -> u64) -> Re
     }
 
     let t0 = now_ms();
-    let r = http::request(req)?;
+    // The service answers only when the picture is DONE - tens of seconds to
+    // minutes of nothing on the wire, during which every idle-timeout between
+    // this app and the user's client is entitled to kill the (until now
+    // silent) stream. Measured on a live deployment 2026-07-30: gaps up to
+    // 58.5s against the common 60s proxy default. The heartbeat closes that
+    // window: on_status reaches the client as an SSE status event (/chat) or
+    // comment (/v1 streaming) every 15s until the first response byte.
+    let r = http::request_with_tick(req, 15, &mut |s| {
+        on_status(&format!("still generating the image… ({s}s)"))
+    })?;
     if r.truncated {
         return Err(format!(
             "image response exceeded image.max_bytes ({} bytes) - raise it, or ask the \
