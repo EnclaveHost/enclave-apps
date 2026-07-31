@@ -20,24 +20,55 @@ import { Verifier } from "@tinfoilsh/verifier";
  * @param {string} opts.url             bare app origin, e.g. https://eyesoff.ai
  * @param {string} opts.attestationPath usually /attestation
  * @param {string} opts.repo            pinned GitHub repo, exact casing
+ * @param {string} [opts.deploymentId]  0x… on-chain id, for the API fallback
+ * @param {string} [opts.apiBase]       https://api.enclave.host
  * @param {(url: string) => Promise<any>} opts.getJson
  *        fetches CROSS-ORIGIN json; injected because the webview build routes
  *        this one call through native HTTP (the app origin sends no CORS
  *        headers yet) while node tests just use fetch.
  * @param {(stage: string) => void} [opts.onStage]
  */
-export async function verifyApp({ url, attestationPath, repo, getJson, onStage = () => {} }) {
+export async function verifyApp({ url, attestationPath, repo, deploymentId, apiBase, getJson, onStage = () => {} }) {
   onStage("fetching the app's attestation document");
-  let doc;
+  // The app's own /attestation is a llm-chat-style convention, not a platform
+  // contract - a generic wrap can't assume it. The PLATFORM's per-deployment
+  // attestation is public and exists for every deployment, so it is the
+  // fallback (and, given a deployment id but no serving app, the primary):
+  // same flow as `enclave attest`. An origin like <label>.app.enclave.host
+  // even yields the id: the API resolves the 0x<label> prefix to the record.
+  let doc = null, lastErr = null;
   try {
     doc = await getJson(url + attestationPath);
   } catch (e) {
-    return fail("unreachable", `could not fetch ${url}${attestationPath}: ${e.message || e}`);
+    lastErr = e;
   }
-
-  const endpoint = doc?.source?.endpoint;
+  let endpoint = doc?.source?.endpoint;
+  if ((typeof endpoint !== "string" || !/^https:\/\//.test(endpoint)) && apiBase) {
+    let id = deploymentId;
+    try {
+      if (!id) {
+        const m = new URL(url).host.match(/^([0-9a-f]{8})\.app\.enclave\.host$/i);
+        if (m) id = (await getJson(`${apiBase}/v1/deployments/0x${m[1]}`))?.id;
+      }
+      if (id) {
+        onStage("fetching the platform's attestation record");
+        const att = await getJson(`${apiBase}/v1/deployments/${id}/attestation`);
+        const ep = att?.verification?.attestationEndpoint;
+        if (typeof ep === "string" && /^https:\/\//.test(ep)) {
+          endpoint = ep;
+          doc = doc || { deployment: { id } };
+        }
+      }
+    } catch (e) {
+      lastErr = lastErr || e;
+    }
+  }
   if (typeof endpoint !== "string" || !/^https:\/\//.test(endpoint)) {
-    return fail("no-endpoint", "the app's attestation document names no https attestation endpoint");
+    return fail(
+      doc || lastErr === null ? "no-endpoint" : "unreachable",
+      doc ? "no attestation endpoint found for this app"
+          : `could not fetch an attestation for ${url}: ${lastErr?.message || lastErr}`
+    );
   }
   const origin = new URL(endpoint).origin;
 

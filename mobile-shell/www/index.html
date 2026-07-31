@@ -31,8 +31,19 @@
     font: inherit; cursor: pointer; border: 0; border-radius: 999px;
     padding: 0.6rem 1.5rem; margin: 0.25rem;
   }
-  #retry { background: #2dd4bf; color: #10201d; font-weight: 600; }
+  #retry, #pair-go { background: #2dd4bf; color: #10201d; font-weight: 600; }
+  #switch-app { background: #2a2f36; color: #d8d8d8; }
   #enter-anyway { background: none; color: #8a8a8a; text-decoration: underline; font-size: 0.85rem; }
+  .pair-h { font-size: 1.05rem; margin: 1rem 0 0.5rem; }
+  .pair-p { color: #a8a8a8; font-size: 0.9rem; }
+  .pair-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 0.75rem; }
+  #pair-in {
+    flex: 1 1 auto; min-width: 0; max-width: 20rem; font: inherit; color: inherit;
+    background: #101318; border: 1px solid #2a2f36; border-radius: 10px; padding: 0.55rem 0.8rem;
+  }
+  #pair-in:focus { outline: none; border-color: #2dd4bf; }
+  #pair-err { color: #ff8a80; font-size: 0.85rem; min-height: 1.4em; margin-top: 0.5rem; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   .fineprint { color: #6f6f6f; font-size: 0.75rem; margin-top: 2rem; }
 </style>
 </head>
@@ -53,8 +64,22 @@
     <div id="fail-reason"></div>
     <pre id="fail-steps"></pre>
     <button id="retry">Try again</button>
+    <button id="switch-app" hidden>use a different app</button>
     <br>
     <button id="enter-anyway">continue without verification</button>
+  </div>
+
+  <div id="pairing" hidden>
+    <h2 class="pair-h">Which app should this open?</h2>
+    <p class="pair-p">Tap <strong>Get the app → open in the Enclave app</strong> on your
+    dashboard, or enter your app’s origin:</p>
+    <div class="pair-row">
+      <label class="sr-only" for="pair-in">App origin</label>
+      <input id="pair-in" type="text" inputmode="url" spellcheck="false" autocomplete="off"
+             placeholder="cc1f4f3f.app.enclave.host">
+      <button id="pair-go">Open</button>
+    </div>
+    <div id="pair-err" role="alert"></div>
   </div>
 
   <div class="fineprint">

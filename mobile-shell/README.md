@@ -28,6 +28,21 @@ leg still terminates at the platform relay until in-enclave app TLS ships;
 after that, the shell is where certificate pinning against the attested key
 belongs.
 
+## The generic shell: any running app, no build at all
+
+`apps/enclave` is the platform's own build - **one signed APK that wraps any
+`*.app.enclave.host` deployment**, paired at runtime instead of branded at
+build time. The dashboard's "Get the app" section offers it on every running
+public app with two steps: install the APK, then tap the pairing deep link
+(`enclave://open?u=<origin>&d=<deployment id>&n=<name>`). The splash stores
+the target, verifies it on the phone (falling back to the platform's public
+per-deployment attestation API for apps that don't serve `/attestation`
+themselves), and loads it; thereafter the app opens directly. A pairing
+target must clear the same `allowNavigation` allowlist the webview enforces,
+so a hostile link can never point the shell at a foreign site. Launcher
+name/icon stay "Enclave" - a branded launcher identity, or a custom-domain
+app, is what the per-app matrix below is for.
+
 ## White-label: one shell, many apps
 
 Every directory under `apps/` is a branded app: an `app.json` (name,
