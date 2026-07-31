@@ -29,5 +29,8 @@
       "model_file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
       "tokenizer_file": "/models/qwen2.5-0.5b/tokenizer.json"
     }
+  },
+  "_mobile": {
+    "android": "https://github.com/EnclaveHost/enclave-apps/releases/download/mobile-eyesoff/eyesoff.apk"
   }
 }
