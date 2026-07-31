@@ -476,6 +476,13 @@
   .md h4 { font-size: 1em; margin-top: 14px; }
   .md a { color: var(--accent); text-decoration: none; }
   .md a:hover { text-decoration: underline; }
+  /* a link the USER typed sits on the bubble's own fill, where the accent
+     green reads as a different element rather than as text. Underline it
+     instead and keep the bubble's colour. Long URLs break rather than
+     stretching the bubble past its max-width. */
+  .bubble a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+  .bubble a:hover { text-decoration-thickness: 2px; }
+  .md a, .bubble a { overflow-wrap: anywhere; }
   .md ul, .md ol { padding-left: 24px; }
   .md li { margin-top: 5px; }
   .md li:first-child { margin-top: 0; }
@@ -769,17 +776,22 @@
   .att:hover .x, .att:focus-within .x { opacity: 1; }
   .att.pending { display: flex; align-items: center; justify-content: center; }
   #attachBtn {
-    width: 36px; height: 36px; border-radius: 50%; flex: none; display: none;
+    width: 36px; height: 36px; border-radius: 50%; flex: none; display: flex;
     align-items: center; justify-content: center; color: var(--text-2);
   }
-  #attachBtn.show { display: flex; }
   #attachBtn:hover { background: var(--hover); color: var(--text); }
-  #cameraBtn {
-    width: 36px; height: 36px; border-radius: 50%; flex: none; display: none;
-    align-items: center; justify-content: center; color: var(--text-2);
+  /* the wrapper is what shows and hides, because it anchors the popup and an
+     empty one would still eat a flex gap in the composer row */
+  #attachWrap { position: relative; flex: none; display: none; }
+  #attachWrap.show { display: flex; }
+  #attachMenu {
+    position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 40;
+    min-width: 196px; background: var(--bg-menu); border: 1px solid var(--border-soft);
+    border-radius: 14px; box-shadow: var(--shadow); padding: 6px; display: none;
   }
-  #cameraBtn.show { display: flex; }
-  #cameraBtn:hover { background: var(--hover); color: var(--text); }
+  #attachMenu.open { display: block; }
+  #attachMenu .m-item { gap: 11px; padding: 9px 11px; font-size: 13.5px; }
+  #attachMenu .m-item svg { flex: none; color: var(--text-2); }
   /* pictures the USER sent, above their bubble */
   .row.user .att-row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-bottom: 6px; }
   .row.user .att-row img {
@@ -1156,12 +1168,22 @@
     <form id="composer">
       <div id="attStrip"></div>
       <div class="crow">
-        <button id="attachBtn" type="button" aria-label="Attach an image" title="Attach an image">
-          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5l-7.6 7.6a4.5 4.5 0 0 1-6.4-6.4l8-8a3 3 0 0 1 4.3 4.3l-8 8a1.5 1.5 0 0 1-2.2-2.2l7.1-7.1"/></svg>
-        </button>
-        <button id="cameraBtn" type="button" aria-label="Take a photo" title="Take a photo">
-          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5h3l1.4-2.2a1 1 0 0 1 .85-.47h5.5a1 1 0 0 1 .85.47L17 8.5h3a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.2"/></svg>
-        </button>
+        <div id="attachWrap">
+          <button id="attachBtn" type="button" aria-label="Add an image"
+                  title="Add an image" aria-haspopup="menu" aria-expanded="false">
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5l-7.6 7.6a4.5 4.5 0 0 1-6.4-6.4l8-8a3 3 0 0 1 4.3 4.3l-8 8a1.5 1.5 0 0 1-2.2-2.2l7.1-7.1"/></svg>
+          </button>
+          <div id="attachMenu" role="menu" aria-label="Add an image">
+            <button class="m-item" type="button" id="menuUpload" role="menuitem">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="8.5" cy="10" r="1.7"/><path d="M4 17l4.7-4.5a2 2 0 0 1 2.7 0L16 17"/><path d="M14 14.5l1.6-1.5a2 2 0 0 1 2.7 0L21 15.4"/></svg>
+              <span class="m-name" id="menuUploadTxt">Upload an image</span>
+            </button>
+            <button class="m-item" type="button" id="menuCamera" role="menuitem">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5h3l1.4-2.2a1 1 0 0 1 .85-.47h5.5a1 1 0 0 1 .85.47L17 8.5h3a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.2"/></svg>
+              <span class="m-name">Take a photo</span>
+            </button>
+          </div>
+        </div>
         <textarea id="input" rows="1" placeholder="Ask anything" autofocus></textarea>
         <button id="sendBtn" type="submit" aria-label="Send" disabled>
           <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
@@ -1211,18 +1233,92 @@ function safeHref(h) {
   return /^(https?:|mailto:)/i.test(h.trim()) ? h.trim() : null;
 }
 
+/// One anchor, with the rel the whole app uses. `noreferrer` is not
+/// boilerplate here: without it the destination is told which page sent the
+/// visitor, and on a deployment whose point is that the conversation does not
+/// leave, handing a third party the referring URL of a chat is exactly the
+/// kind of quiet leak this app exists to avoid.
+function anchor(href, text) {
+  return '<a href="' + href + '" target="_blank" rel="noopener noreferrer nofollow">'
+       + text + "</a>";
+}
+
+/// Where a URL really ends when it is sitting in a sentence.
+///
+/// Prose puts punctuation right up against a link, and the old rule - "a URL
+/// contains no parentheses" - was wrong in the direction that matters most
+/// here: web results are full of Wikipedia titles like
+/// /wiki/Omar_Little_(The_Wire), and cutting at the first bracket produced a
+/// link that 404s. So parens are allowed INSIDE, and only the ones left
+/// unbalanced at the end are given back to the sentence, along with any
+/// trailing sentence punctuation.
+function urlEnd(u) {
+  let end = u.length;
+  for (;;) {
+    const last = u[end - 1];
+    if (end > 0 && ".,;:!?'\"".indexOf(last) >= 0) {
+      end--;
+      continue;
+    }
+    if (last === ")") {
+      const head = u.slice(0, end);
+      const opens = (head.match(/\(/g) || []).length;
+      const closes = (head.match(/\)/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
+    break;
+  }
+  return end;
+}
+
+/// Bare URLs and email addresses, turned into links. Shared by the assistant's
+/// markdown and by the user's own bubble, which gets ONLY this - running the
+/// full renderer over what someone typed would silently italicise their
+/// asterisks and eat their underscores.
+function autolink(out, stash) {
+  // http(s) and the schemeless www. form people actually type
+  out = out.replace(/(^|[\s(<])((?:https?:\/\/|www\.)[^\s<>\u0000]+)/gi, (m, pre, raw) => {
+    const cut = urlEnd(raw);
+    const u = raw.slice(0, cut);
+    const tail = raw.slice(cut);
+    if (!/^(https?:\/\/|www\.)\S/i.test(u)) return m;
+    const href = /^www\./i.test(u) ? "https://" + u : u;
+    return pre + stash(anchor(href, u)) + tail;
+  });
+  // plain email addresses. Safe to run after the URLs above, which are already
+  // stashed out of reach, so the @ inside a userinfo URL cannot be caught here.
+  out = out.replace(
+    /(^|[\s(<])([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})/g,
+    (_, pre, addr) => pre + stash(anchor("mailto:" + addr, addr)));
+  return out;
+}
+
+/// Escape, then link, and nothing else. What the user typed keeps its own
+/// punctuation.
+function linkifyText(s) {
+  const slots = [];
+  const stash = (html) => "\u0000" + (slots.push(html) - 1) + "\u0001";
+  const out = autolink(esc(s), stash);
+  return out.replace(/\u0000(\d+)\u0001/g, (_, i) => slots[+i]);
+}
+
 function inline(s) {
   const slots = [];
   const stash = (html) => "\u0000" + (slots.push(html) - 1) + "\u0001";
   let out = esc(s);
   // inline code first: its content must not be styled further
   out = out.replace(/`([^`\n]+)`/g, (_, c) => stash('<code class="ic">' + c + "</code>"));
-  out = out.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, t, h) => {
+  // [text](url), where the url may itself carry one balanced pair - a
+  // /wiki/Foo_(bar) target is common enough that stopping at the first ')'
+  // produced a broken link out of a correct one
+  out = out.replace(/\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, (m, t, h) => {
     const href = safeHref(h);
-    return href ? stash('<a href="' + href + '" target="_blank" rel="noopener">' + t + "</a>") : m;
+    return href ? stash(anchor(href, t)) : m;
   });
-  out = out.replace(/(^|[\s(])(https?:\/\/[^\s<>()\u0000]+[^\s<>()\u0000.,;:!?])/g,
-    (_, pre, u) => pre + stash('<a href="' + u + '" target="_blank" rel="noopener">' + u + "</a>"));
+  out = autolink(out, stash);
   out = out
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
@@ -1424,7 +1520,7 @@ const chatList = $("chatList"), jump = $("jump");
 const modelBtn = $("modelBtn"), modelMenu = $("modelMenu"), modelLabel = $("modelLabel");
 const warmPill = $("warmPill");
 const attachBtn = $("attachBtn"), attStrip = $("attStrip"), fileInput = $("fileInput");
-const cameraBtn = $("cameraBtn"), camInput = $("camInput");
+const attachWrap = $("attachWrap"), attachMenu = $("attachMenu"), camInput = $("camInput");
 
 // ONE button, TWO mechanisms, because the right answer differs by platform.
 //
@@ -1449,6 +1545,8 @@ const MOBILE_OS = (() => {
 // only fail.
 const CAN_GUM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const HAS_CAMERA = MOBILE_OS || CAN_GUM;
+// what the OTHER item actually opens, in the platform's own words
+$("menuUploadTxt").textContent = MOBILE_OS ? "Photo library" : "Upload an image";
 const lightbox = $("lightbox");
 
 const current = () => state.chats.find((c) => c.id === state.currentId) || null;
@@ -1937,7 +2035,11 @@ function renderMessage(m, idx, isTail) {
     const row = node('<div class="row user"><div class="bubble"></div><div class="actions"></div></div>');
     row.dataset.midx = idx;
     const bubble = row.querySelector(".bubble");
-    bubble.textContent = m.content;
+    // a URL someone typed should be clickable when they scroll back to it.
+    // linkifyText escapes first and applies ONLY autolinking, so their own
+    // asterisks and underscores survive as typed (the bubble is pre-wrap, so
+    // newlines still lay out the way they did in the composer)
+    bubble.innerHTML = linkifyText(m.content);
     // pictures above the words, the way they were composed. A turn that was
     // only a picture shows no empty bubble.
     if (m.images && m.images.length) {
@@ -2118,9 +2220,7 @@ function visionModel() {
 }
 
 function updateAttachUI() {
-  attachBtn.classList.toggle("show", visionModel() || state.attachments.length > 0);
-  cameraBtn.classList.toggle("show",
-    HAS_CAMERA && (visionModel() || state.attachments.length > 0));
+  attachWrap.classList.toggle("show", visionModel() || state.attachments.length > 0);
   form.classList.toggle("has-att", state.attachments.length > 0);
   attStrip.innerHTML = "";
   state.attachments.forEach((a, i) => {
@@ -2216,12 +2316,36 @@ async function addFiles(files) {
   }
 }
 
-attachBtn.addEventListener("click", () => fileInput.click());
-fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
+// ONE affordance in the composer, because two icons cost real width next to a
+// text box: on an iPhone SE the pair left the textarea at 132px. The paperclip
+// opens a small menu instead - and only when there IS a choice to make. With no
+// camera reachable the menu would have exactly one item, which is a worse
+// button than the button, so it goes straight to the picker.
+function closeAttachMenu() {
+  attachMenu.classList.remove("open");
+  attachBtn.setAttribute("aria-expanded", "false");
+}
+function openAttachMenu() {
+  attachMenu.classList.add("open");
+  attachBtn.setAttribute("aria-expanded", "true");
+  $("menuUpload").focus();
+}
+attachBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!HAS_CAMERA) return fileInput.click();
+  if (attachMenu.classList.contains("open")) closeAttachMenu();
+  else openAttachMenu();
+});
+$("menuUpload").addEventListener("click", () => { closeAttachMenu(); fileInput.click(); });
 // the shot goes through the SAME path as an upload: same vision gate, same
 // per-message limit, same browser-side downscale - a 12 MP phone photo has no
 // business being uploaded whole
-cameraBtn.addEventListener("click", () => (MOBILE_OS ? camInput.click() : openCam()));
+$("menuCamera").addEventListener("click", () => {
+  closeAttachMenu();
+  if (MOBILE_OS) camInput.click();
+  else openCam();
+});
+fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
 camInput.addEventListener("change", () => { addFiles(camInput.files); camInput.value = ""; });
 
 // ------------------------------------------------------ in-page camera --
@@ -2403,6 +2527,7 @@ window.addEventListener("keydown", (e) => {
     if (camOverlay.classList.contains("open")) { closeCam(); return; }
     if (webOverlay.classList.contains("open")) { answerWeb(false); return; }
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
+    if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
     if (state.busyChatId) stopGeneration();
     closeModelMenu();
   }
@@ -3266,6 +3391,7 @@ modelBtn.addEventListener("click", (e) => {
 });
 document.addEventListener("click", (e) => {
   if (!modelMenu.contains(e.target) && e.target !== modelBtn) closeModelMenu();
+  if (!attachWrap.contains(e.target)) closeAttachMenu();
 });
 
 function renderModelMenu() {
