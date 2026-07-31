@@ -54,6 +54,21 @@ pub struct ImageConfig {
     /// letting a runaway response exhaust guest memory.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
+    /// whether the playground's image switch STARTS on. TRUE by default, unlike
+    /// web search, and the difference is the disclosure rather than the
+    /// principle. A search sends the user's question to a THIRD PARTY who keeps
+    /// their own logs; an image prompt goes to a deployment this operator runs,
+    /// inside the same fleet, under the same attestation. Configuring an
+    /// endpoint is the opt-in, and there is no second party to warn about.
+    ///
+    /// An operator who points `endpoint` at something they do NOT run should
+    /// set this false and let the user choose, the way search does.
+    #[serde(default = "default_on")]
+    pub default_on: bool,
+}
+
+fn default_on() -> bool {
+    true
 }
 
 fn default_size() -> String {
@@ -222,6 +237,7 @@ mod tests {
             size: "1024x1024".into(),
             timeout_s: 180,
             max_bytes: 12 * 1024 * 1024,
+            default_on: true,
         }
     }
 
