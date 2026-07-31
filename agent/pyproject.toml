@@ -1,0 +1,19 @@
+[project]
+name = "enclave-agent"
+version = "0.1.0"
+description = "LangGraph agent that drives an Enclave llm-chat deployment as its OpenAI backend"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-openai>=0.2",
+]
+
+[project.scripts]
+enclave-agent = "enclave_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
