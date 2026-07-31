@@ -6,9 +6,10 @@
     "configure": "node configure.mjs",
     "bundle": "esbuild src/splash.js --bundle --minify --format=iife --platform=browser --external:zlib --outfile=www/splash.bundle.js",
     "brand": "node brand.mjs",
-    "build": "npm run configure && npm run bundle && npm run brand",
+    "build": "npm run configure && npm run bundle && npm run brand && npm run snap",
     "test:live": "node test/verify.live.mjs",
-    "sync": "npm run build && cap sync android"
+    "sync": "npm run build && cap sync android",
+    "snap": "node snapshot.mjs"
   },
   "keywords": [],
   "author": "",

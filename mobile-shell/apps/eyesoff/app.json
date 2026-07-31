@@ -8,5 +8,6 @@
   "icon": "icon.svg",
   "backgroundColor": "#212121",
   "themeColor": "#212121",
-  "iconBackground": "#181242"
+  "iconBackground": "#181242",
+  "snapshot": true
 }
