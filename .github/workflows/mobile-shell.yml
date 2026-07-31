@@ -10,8 +10,10 @@ on:
       - ".github/workflows/mobile-shell.yml"
   workflow_dispatch:
 
+# contents: write solely for the fixed-tag release upload the dashboard
+# links to; the build itself never writes to the repo
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   android-apk:
@@ -45,14 +47,41 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - name: build debug APK
+      - name: build signed release APK
         working-directory: mobile-shell/android
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 1.0.${{ github.run_number }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          ./gradlew assembleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEYSTORE_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEYSTORE_PASSWORD"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: eyesoff-debug-apk
-          path: mobile-shell/android/app/build/outputs/apk/debug/app-debug.apk
+          name: eyesoff-release-apk
+          path: mobile-shell/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+
+      # The download the dashboard links to: a FIXED tag whose asset is
+      # replaced on every main push, so the URL end users hit never changes:
+      # https://github.com/EnclaveHost/enclave-apps/releases/download/mobile-eyesoff/eyesoff.apk
+      - name: publish APK to the stable release tag
+        if: github.ref == 'refs/heads/main'
+        working-directory: mobile-shell/android
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk eyesoff.apk
+          gh release view mobile-eyesoff --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create mobile-eyesoff --repo "$GITHUB_REPOSITORY" \
+              --title "eyesoff.ai for Android" \
+              --notes "Always the latest signed build of the eyesoff.ai mobile shell. Verifies the enclave before the app loads."
+          gh release upload mobile-eyesoff eyesoff.apk --clobber --repo "$GITHUB_REPOSITORY"
