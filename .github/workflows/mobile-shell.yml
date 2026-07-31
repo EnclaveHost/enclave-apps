@@ -220,8 +220,11 @@ jobs:
           git add mobile-index.json
           git diff --cached --quiet && { echo "index unchanged"; exit 0; }
           git commit -m "mobile-index: prepackaged deployment APKs now available"
-          # the build re-stamps committed files (gradle appId, icons) for the
-          # deployment it packaged; those must never ride this commit
-          git checkout -- .
+          # the build re-stamps committed files (gradle appId, icons, cap sync
+          # regenerations) for the deployment it packaged; none of that may
+          # ride this commit or block the rebase - the index is committed, so
+          # everything else in the tree is disposable
+          git status --short | head -20
+          git reset --hard HEAD
           git pull --rebase origin main
           git push origin main
