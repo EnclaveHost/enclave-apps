@@ -79,7 +79,7 @@ pub struct SearchConfig {
     #[serde(default)]
     pub fetch_pages: usize,
     /// characters of extracted text kept per fetched page. 6000 chars is
-    /// roughly 1.5k tokens: five of those still sit far inside a 98k prompt
+    /// roughly 1.5k tokens: three of those still sit far inside a 98k prompt
     /// budget, and truncating here is what keeps a pathological page from
     /// evicting the actual conversation.
     #[serde(default = "default_page_chars")]
@@ -153,7 +153,7 @@ fn default_provider() -> String {
     "ddg".into()
 }
 fn default_max_results() -> usize {
-    5
+    3
 }
 fn default_page_chars() -> usize {
     6000
@@ -195,10 +195,13 @@ pub struct Hit {
 /// Search, then optionally fetch the top `fetch_pages` results.
 ///
 /// A page fetch that fails is dropped to `body: None` rather than failing the
-/// turn: a dead link among five hits should cost the user that link, not the
-/// answer. A failure of the SEARCH itself is an error, because there is
-/// nothing to answer from and silently pretending the web was consulted is
-/// the one outcome worse than saying it was not.
+/// turn: a dead link among three hits should cost the user that link, not the
+/// answer. A failure of the SEARCH itself comes back as Err - there is
+/// nothing to answer from - and what that costs is the CALLER'S decision: the
+/// chat paths answer without the web and fold a note telling the model to say
+/// so (see finish_search in lib.rs), because a dead turn helps nobody and
+/// silently pretending the web was consulted is the one outcome worse than
+/// admitting it was not.
 pub fn search(cfg: &SearchConfig, query: &str) -> Result<Vec<Hit>, String> {
     let query = query.trim();
     if query.is_empty() {

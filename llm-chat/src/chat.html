@@ -375,21 +375,28 @@
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
 
-  /* web-search citations: the [n] markers in the reply are only checkable if
-     the numbered list is right there under it */
-  .sources {
-    margin: 10px 0 2px; padding: 10px 12px; border-radius: 12px;
-    background: var(--hover); font-size: 13px; line-height: 1.55;
+  /* web-search citations: a collapsed disclosure like the think block. The
+     [n] markers in the reply stay checkable - the summary says how many, one
+     tap opens the numbered list - without a link box crowding every searched
+     answer. */
+  details.sources {
+    margin: 10px 0 2px; border: 1px solid var(--border-soft); border-radius: 12px;
+    overflow: hidden; font-size: 13px; line-height: 1.55;
   }
-  .sources .sources-h {
-    color: var(--text-3); font-size: 11.5px; letter-spacing: .04em;
-    text-transform: uppercase; margin-bottom: 6px;
+  details.sources summary {
+    display: flex; align-items: center; gap: 7px; padding: 9px 14px;
+    cursor: pointer; list-style: none; user-select: none;
+    color: var(--text-3); font-size: 13px; font-weight: 500;
   }
-  .sources ol { margin: 0; padding-left: 20px; }
-  .sources li { margin: 3px 0; }
-  .sources a { color: var(--text); text-decoration: none; border-bottom: 1px solid var(--border-soft); }
-  .sources a:hover { border-bottom-color: var(--text-3); }
-  .sources .host { color: var(--text-3); font-size: 12px; margin-left: 6px; }
+  details.sources summary::-webkit-details-marker { display: none; }
+  details.sources summary:hover { background: var(--hover); color: var(--text-2); }
+  details.sources summary .chev { transition: transform .15s; }
+  details.sources[open] > summary .chev { transform: rotate(90deg); }
+  details.sources ol { margin: 0; padding: 0 14px 12px 35px; }
+  details.sources li { margin: 3px 0; }
+  details.sources a { color: var(--text); text-decoration: none; border-bottom: 1px solid var(--border-soft); }
+  details.sources a:hover { border-bottom-color: var(--text-3); }
+  details.sources .host { color: var(--text-3); font-size: 12px; margin-left: 6px; }
 
   /* what the model called, above the answer it wrote from the results. The
      arguments are shown because they are what actually left the enclave */
@@ -549,6 +556,9 @@
   .think-empty { color: var(--text-3); font-size: 13.5px; margin-top: 8px; }
   .streaming .md > details.think:last-child::after { content: none; }
   .streaming details.think:not(.live) .think-body > :last-child::after { content: none; }
+  /* the pinned sources disclosure is the md's last child for the whole
+     stream; the cursor belongs to the text above it, not to the box */
+  .streaming .md > details.sources:last-child::after { content: none; }
   .statusline { font-size: 14px; }
   .shimmer {
     background: linear-gradient(90deg, var(--text-3) 35%, var(--text) 50%, var(--text-3) 65%);
@@ -843,7 +853,12 @@
        actually tells you what you are talking to. So: sidebar toggle and the
        model share the top line, the warmup pill gets its own, and the actions
        take a full width of their own. */
-    header { flex-wrap: wrap; row-gap: 8px; padding: 8px 12px; }
+    /* breathing room above the header on a phone - flush against the screen
+       edge (or a status bar, in the installed shells) it reads as cramped */
+    header {
+      flex-wrap: wrap; row-gap: 8px;
+      padding: calc(16px + env(safe-area-inset-top, 0px)) 12px 8px;
+    }
     header .spacer { display: none; }        /* wrapping does the pushing now */
     #menuBtn, #cpuChip { order: 1; }
     /* `auto` basis, not 100%: the model shares row 1 with the toggle and
@@ -1943,7 +1958,10 @@ function toolsBlock(calls) {
 
 function sourcesBlock(sources) {
   if (!sources || !sources.length) return null;
-  const wrap = node('<div class="sources"><div class="sources-h">Sources</div><ol></ol></div>');
+  const wrap = node('<details class="sources"><summary>' + ICONS.chev +
+    "<span></span></summary><ol></ol></details>");
+  wrap.querySelector("summary span").textContent =
+    "Sources · " + sources.length;
   const ol = wrap.querySelector("ol");
   for (const s of sources) {
     const li = document.createElement("li");
@@ -2121,6 +2139,9 @@ function updateStreamDOM(chat) {
   const body = $("streambody");
   if (!body) return;
   const s = chat.streaming;
+  // the sources disclosure is rebuilt fresh below; keep the user's choice
+  const srcPrev = body.querySelector("details.sources");
+  const srcWasOpen = !!(srcPrev && srcPrev.open);
   if (s.reply) {
     // each delta rebuilds the html - carry the user's expand/collapse choices
     // across the rebuild (think blocks only ever get appended, so index-match)
@@ -2142,7 +2163,10 @@ function updateStreamDOM(chat) {
   // sources stay pinned under the reply for the whole stream, so the user can
   // start opening them while the model is still writing
   const src = sourcesBlock(s.sources);
-  if (src) body.appendChild(src);
+  if (src) {
+    src.open = srcWasOpen;
+    body.appendChild(src);
+  }
   // each rebuild recreates the shimmer span, which restarts its animation at
   // token rate and reads as flicker - pin the phase to the clock so the sweep
   // stays continuous across rebuilds (2000 = the shim keyframe duration)
@@ -2151,16 +2175,19 @@ function updateStreamDOM(chat) {
   scrollBottom();
 }
 
-// <think> expand/collapse: while a reply streams, every delta rebuilds the
-// message DOM, so the <summary> pressed at mousedown is usually gone by
-// mouseup and the browser drops the click - the native details toggle almost
-// never lands. Toggle by hand on pointerup instead, index-matched across the
-// rebuild (think blocks only ever get appended). pointercancel means the
-// browser claimed the gesture (touch scroll); a mouse drag is distance-filtered.
+// <think> / sources expand/collapse: while a reply streams, every delta
+// rebuilds the message DOM, so the <summary> pressed at mousedown is usually
+// gone by mouseup and the browser drops the click - the native details toggle
+// almost never lands. Toggle by hand on pointerup instead, index-matched
+// across the rebuild (think blocks only ever get appended, and the sources
+// disclosure sits after them). pointercancel means the browser claimed the
+// gesture (touch scroll); a mouse drag is distance-filtered.
+const TOGGLES = "details.think, details.sources";
+const TOGGLE_SUMMARIES = "details.think > summary, details.sources > summary";
 let pressedThink = -1, pressedX = 0, pressedY = 0;
 log.addEventListener("pointerdown", (e) => {
-  const s = e.button === 0 ? e.target.closest("details.think > summary") : null;
-  pressedThink = s ? [...log.querySelectorAll("details.think")].indexOf(s.parentElement) : -1;
+  const s = e.button === 0 ? e.target.closest(TOGGLE_SUMMARIES) : null;
+  pressedThink = s ? [...log.querySelectorAll(TOGGLES)].indexOf(s.parentElement) : -1;
   pressedX = e.clientX; pressedY = e.clientY;
 });
 log.addEventListener("pointercancel", () => { pressedThink = -1; });
@@ -2168,7 +2195,7 @@ log.addEventListener("pointerup", (e) => {
   const i = pressedThink;
   pressedThink = -1;
   if (i < 0 || Math.hypot(e.clientX - pressedX, e.clientY - pressedY) > 8) return;
-  const d = log.querySelectorAll("details.think")[i];
+  const d = log.querySelectorAll(TOGGLES)[i];
   if (d) d.open = !d.open;
 });
 
@@ -2177,7 +2204,7 @@ log.addEventListener("pointerup", (e) => {
 log.addEventListener("click", (e) => {
   // pointer toggles are handled on pointerup above - cancel the native summary
   // toggle so it can't double-fire; keyboard activation (detail 0) stays native
-  if (e.detail && e.target.closest("details.think > summary")) { e.preventDefault(); return; }
+  if (e.detail && e.target.closest(TOGGLE_SUMMARIES)) { e.preventDefault(); return; }
   const cc = e.target.closest("[data-copy-code]");
   if (cc) {
     const code = cc.closest(".code").querySelector("pre code");
