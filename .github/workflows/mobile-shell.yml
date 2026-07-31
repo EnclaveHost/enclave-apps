@@ -13,6 +13,15 @@ on:
       - "mobile-shell/**"
       - ".github/workflows/mobile-shell.yml"
   workflow_dispatch:
+    inputs:
+      deployment:
+        description: "0x id (or 8-hex label) of a running public deployment to prepackage as an APK; empty runs the normal apps/* matrix"
+        required: false
+        default: ""
+  # refresh every prepackaged deployment APK (the UI snapshot inside goes
+  # stale when a deployment upgrades versions)
+  schedule:
+    - cron: "23 */6 * * *"
 
 # contents: write solely for the fixed-tag release upload the dashboard
 # links to; the build itself never writes to the repo
@@ -21,6 +30,7 @@ permissions:
 
 jobs:
   apps:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deployment == '')
     runs-on: ubuntu-latest
     outputs:
       list: ${{ steps.list.outputs.list }}
@@ -110,3 +120,105 @@ jobs:
               --title "$NAME for Android" \
               --notes "Always the latest signed build of the $NAME mobile shell. Verifies the enclave before the app loads."
           gh release upload "mobile-$APP" "$APP.apk" --clobber --repo "$GITHUB_REPOSITORY"
+
+  # Prepackaged per-deployment APKs: the app's whole UI is snapshotted from
+  # its live origin into the APK, pre-linked to that deployment - it opens
+  # with zero downloads and only its API calls touch the network. Dispatch
+  # with a deployment id to build one; the cron leg re-snapshots everything
+  # mobile-index.json already lists. The index (committed at the repo root)
+  # is what the dashboard reads to decide which rows offer a direct APK.
+  deployment-apks:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deployment != '')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: mobile-dep-builds
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: mobile-shell
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile-shell/package-lock.json
+
+      - name: install librsvg (brand.mjs renders the native art with it)
+        run: sudo apt-get update -q && sudo apt-get install -y -q librsvg2-bin
+
+      - run: npm ci
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: build + publish each deployment APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 1.0.${{ github.run_number }}
+          REQUESTED: ${{ github.event.inputs.deployment }}
+        run: |
+          set -e
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          LIST="$REQUESTED"
+          if [ -z "$LIST" ] && [ -f ../mobile-index.json ]; then
+            LIST=$(jq -r '.deployments[]' ../mobile-index.json | tr '\n' ' ')
+          fi
+          [ -n "$LIST" ] || { echo "nothing to build"; exit 0; }
+          BUILT=""
+          for T in $LIST; do
+            LABEL=$(echo "$T" | tr 'A-Z' 'a-z' | sed 's/^0x//' | cut -c1-8)
+            echo "::group::deployment $LABEL"
+            if ! node gen-dep-app.mjs "$T"; then
+              echo "::warning::deployment $LABEL is not answering - skipped (kept in the index if it was there)"
+              echo "::endgroup::"; continue
+            fi
+            APP="dep-$LABEL" npm run build
+            npx cap sync android
+            ( cd android && chmod +x gradlew && ./gradlew assembleRelease --no-daemon \
+                -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \
+                -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+                -Pandroid.injected.signing.key.alias="$ANDROID_KEYSTORE_ALIAS" \
+                -Pandroid.injected.signing.key.password="$ANDROID_KEYSTORE_PASSWORD" )
+            # the point of the build: the UI must actually be inside the APK
+            unzip -l android/app/build/outputs/apk/release/app-release.apk | grep -q "assets/appsnapshot/manifest.json"
+            NAME=$(jq -r '.displayName' "apps/dep-$LABEL/app.json")
+            cp android/app/build/outputs/apk/release/app-release.apk "$LABEL.apk"
+            gh release view "mobile-dep-$LABEL" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+              gh release create "mobile-dep-$LABEL" --repo "$GITHUB_REPOSITORY" \
+                --title "$NAME for Android (deployment $LABEL)" \
+                --notes "Prepackaged build of deployment $LABEL: the app's UI ships inside the APK and only API calls touch the network. Re-snapshotted on a schedule."
+            gh release upload "mobile-dep-$LABEL" "$LABEL.apk" --clobber --repo "$GITHUB_REPOSITORY"
+            BUILT="$BUILT $LABEL"
+            echo "::endgroup::"
+          done
+          # index = what was already there + what built now; a transient miss
+          # never silently drops a live entry
+          export BUILT
+          node -e '
+            const fs = require("fs");
+            let old = [];
+            try { old = JSON.parse(fs.readFileSync("../mobile-index.json", "utf8")).deployments || []; } catch {}
+            const built = (process.env.BUILT || "").split(/\s+/).filter(Boolean);
+            const all = [...new Set([...old, ...built])].sort();
+            fs.writeFileSync("../mobile-index.json", JSON.stringify({ updatedAt: new Date().toISOString(), deployments: all }, null, 2) + "\n");
+            console.log("index:", all.join(", ") || "(empty)");
+          '
+
+      - name: commit the refreshed index
+        working-directory: .
+        run: |
+          git config user.name "mobile-shell-ci"
+          git config user.email "actions@users.noreply.github.com"
+          git add mobile-index.json
+          git diff --cached --quiet && { echo "index unchanged"; exit 0; }
+          git commit -m "mobile-index: prepackaged deployment APKs now available"
+          git pull --rebase origin main
+          git push origin main
