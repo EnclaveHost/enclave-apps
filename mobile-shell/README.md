@@ -28,6 +28,28 @@ leg still terminates at the platform relay until in-enclave app TLS ships;
 after that, the shell is where certificate pinning against the attested key
 belongs.
 
+## Prepackaged builds: the APK ships the app inside it
+
+An app with `"snapshot": true` gets its whole UI **bundled into the APK**:
+`snapshot.mjs` crawls the live origin at build time (the app's own
+service-worker precache list when it serves one, plus every `href`/`src`
+and css `url()` the page names), and `MainActivity`'s request interceptor
+answers those GETs from the bundle while the webview browses the **real
+origin** - API calls, cookies and streams stay natively same-origin, and
+the HTML never crosses the network. The app opens instantly, works
+offline, and only its API callouts leave the phone.
+
+`gen-dep-app.mjs <deployment id>` turns any running public deployment into
+such a build with zero hand-written config (name, colors and icon read
+from the app's own web manifest). The `deployment-apks` CI job does this on
+demand - dispatch the workflow with a deployment id - publishing to
+`releases/download/mobile-dep-<label>/<label>.apk`, re-snapshotting
+everything on a 6h cron (snapshots go stale when deployments upgrade), and
+committing `mobile-index.json`, which the dashboard reads to offer the
+direct install on those rows. iOS cannot intercept https in WKWebView -
+the prepackaged trick is Android-only until the shell grows an iOS-native
+equivalent.
+
 ## The generic shell: any running app, no build at all
 
 `apps/enclave` is the platform's own build - **one signed APK that wraps any
