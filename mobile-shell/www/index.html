@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>eyesoff</title>
+<title>Enclave</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --bg: #16181d; }
   html, body { height: 100%; margin: 0; }
   body {
     display: flex; align-items: center; justify-content: center;
-    background: #212121; color: #ececec;
+    background: var(--bg); color: #ececec;
     font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   }
@@ -38,27 +38,13 @@
 </head>
 <body>
 <main>
-  <svg class="mark" viewBox="0 0 512 512" role="img" aria-label="eyesoff">
-    <defs>
-      <linearGradient id="b" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0" stop-color="#221A63"/><stop offset="1" stop-color="#0E0A2E"/>
-      </linearGradient>
-      <linearGradient id="c" gradientUnits="userSpaceOnUse" x1="110" y1="120" x2="420" y2="420">
-        <stop offset="0" stop-color="#8CF5D2"/><stop offset="1" stop-color="#2DD4BF"/>
-      </linearGradient>
-    </defs>
-    <rect width="512" height="512" rx="116" fill="url(#b)"/>
-    <rect x="96" y="128" width="320" height="216" rx="62" fill="url(#c)"/>
-    <path d="M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z" fill="url(#c)"/>
-    <path d="M178 214 Q256 280 334 214" fill="none" stroke="#131039" stroke-width="27" stroke-linecap="round"/>
-    <path d="M256 268 V304" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
-    <path d="M211 259 L189 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
-    <path d="M301 259 L323 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
-    <path d="M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z" fill="#8CF5D2"/>
-  </svg>
+  <!-- the mark, the name, and the background all come from the bundled
+       per-app config (splash.js stamps them before first paint settles):
+       one static page serves every branded shell -->
+  <img class="mark" id="mark" alt="" hidden>
 
   <div id="verifying">
-    <h1 id="app-name">eyesoff.ai</h1>
+    <h1 id="app-name"></h1>
     <div id="status" class="pulse">checking the enclave&hellip;</div>
   </div>
 
@@ -72,9 +58,9 @@
   </div>
 
   <div class="fineprint">
-    A pass means the deployment behind this app runs the signed
-    EnclaveHost/enclave release inside real enclave hardware, checked on this
-    device against vendor and Sigstore roots.
+    A pass means the deployment behind this app runs its signed release
+    inside real enclave hardware, checked on this device against vendor and
+    Sigstore roots.
   </div>
 </main>
 <script src="splash.bundle.js"></script>

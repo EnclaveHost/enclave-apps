@@ -1,7 +1,11 @@
 name: mobile-shell
 
-# Builds the verify-first shell and produces an installable debug APK as a
-# workflow artifact. This box has no Android SDK; the runner does.
+# One shell, many apps: every directory under mobile-shell/apps/ is a branded
+# build. Each matrix leg re-stamps the shell for its app (configure + brand),
+# builds a SIGNED release APK, and - unless the app says publish: false -
+# republishes it to that app's fixed release tag, the stable URL the
+# dashboard's "Get the app" section links:
+#   releases/download/mobile-<app>/<app>.apk
 on:
   push:
     branches: [main]
@@ -16,8 +20,24 @@ permissions:
   contents: write
 
 jobs:
-  android-apk:
+  apps:
     runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: echo "list=$(ls mobile-shell/apps | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+
+  android-apk:
+    needs: apps
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.apps.outputs.list) }}
+    env:
+      APP: ${{ matrix.app }}
     defaults:
       run:
         working-directory: mobile-shell
@@ -30,13 +50,18 @@ jobs:
           cache: npm
           cache-dependency-path: mobile-shell/package-lock.json
 
+      - name: install librsvg (brand.mjs renders the native art with it)
+        run: sudo apt-get update -q && sudo apt-get install -y -q librsvg2-bin
+
       - run: npm ci
 
       - run: npm run build
 
       # Network-dependent by nature (live deployment + Sigstore + GitHub), so
-      # informative, never a merge gate.
+      # informative, never a merge gate; only meaningful for published apps
+      # whose url is live.
       - name: verify live deployment (non-blocking)
+        if: matrix.app == 'eyesoff'
         run: npm run test:live
         continue-on-error: true
 
@@ -66,22 +91,22 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: eyesoff-release-apk
+          name: ${{ matrix.app }}-release-apk
           path: mobile-shell/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
 
-      # The download the dashboard links to: a FIXED tag whose asset is
-      # replaced on every main push, so the URL end users hit never changes:
-      # https://github.com/EnclaveHost/enclave-apps/releases/download/mobile-eyesoff/eyesoff.apk
-      - name: publish APK to the stable release tag
+      - name: publish APK to the app's stable release tag
         if: github.ref == 'refs/heads/main'
-        working-directory: mobile-shell/android
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/release/app-release.apk eyesoff.apk
-          gh release view mobile-eyesoff --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create mobile-eyesoff --repo "$GITHUB_REPOSITORY" \
-              --title "eyesoff.ai for Android" \
-              --notes "Always the latest signed build of the eyesoff.ai mobile shell. Verifies the enclave before the app loads."
-          gh release upload mobile-eyesoff eyesoff.apk --clobber --repo "$GITHUB_REPOSITORY"
+          if [ "$(jq -r '.publish != false' "apps/$APP/app.json")" != "true" ]; then
+            echo "apps/$APP has publish: false - artifact only"; exit 0
+          fi
+          NAME=$(jq -r '.displayName // .name' "apps/$APP/app.json")
+          cp android/app/build/outputs/apk/release/app-release.apk "$APP.apk"
+          gh release view "mobile-$APP" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "mobile-$APP" --repo "$GITHUB_REPOSITORY" \
+              --title "$NAME for Android" \
+              --notes "Always the latest signed build of the $NAME mobile shell. Verifies the enclave before the app loads."
+          gh release upload "mobile-$APP" "$APP.apk" --clobber --repo "$GITHUB_REPOSITORY"

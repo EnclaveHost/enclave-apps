@@ -5,7 +5,8 @@
   "scripts": {
     "configure": "node configure.mjs",
     "bundle": "esbuild src/splash.js --bundle --minify --format=iife --platform=browser --external:zlib --outfile=www/splash.bundle.js",
-    "build": "npm run configure && npm run bundle",
+    "brand": "node brand.mjs",
+    "build": "npm run configure && npm run bundle && npm run brand",
     "test:live": "node test/verify.live.mjs",
     "sync": "npm run build && cap sync android"
   },

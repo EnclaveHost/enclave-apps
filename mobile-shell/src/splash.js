@@ -108,6 +108,13 @@ $("retry").addEventListener("click", () => {
 // once without a verified deployment behind it.
 $("enter-anyway").addEventListener("click", enter);
 
+// Brand the static page from the bundled config: one page, every app.
 document.title = cfg.displayName;
 $("app-name").textContent = cfg.displayName;
+if (cfg.backgroundColor) document.documentElement.style.setProperty("--bg", cfg.backgroundColor);
+if (cfg.iconDataUri) {
+  const mark = $("mark");
+  mark.src = cfg.iconDataUri;
+  mark.hidden = false;
+}
 run().catch((e) => showFail({ error: String(e && e.message ? e.message : e), steps: {} }));
