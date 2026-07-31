@@ -1,0 +1,16 @@
+{
+  "name": "enclave",
+  "displayName": "Enclave",
+  "appId": "host.enclave.app",
+  "scheme": "enclave",
+  "generic": true,
+  "url": "https://enclave.host",
+  "allowNavigation": ["*.app.enclave.host"],
+  "attestationPath": "/attestation",
+  "repo": "EnclaveHost/enclave",
+  "icon": "icon.svg",
+  "backgroundColor": "#0b1119",
+  "themeColor": "#0b1119",
+  "iconBackground": "#070A0F",
+  "_comment": "The GENERIC shell: one install wraps any *.app.enclave.host deployment. It pairs at runtime via enclave://open?u=<origin>&d=<deployment id>&n=<name> (the dashboard's 'Get the app' section mints that link) or by typing the origin, and verifies whatever it wraps. Custom-domain apps and branded launcher identity stay on the per-app matrix path."
+}

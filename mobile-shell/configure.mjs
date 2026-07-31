@@ -24,6 +24,10 @@ if (origin !== app.url.replace(/\/$/, "")) {
   throw new Error(`"url" must be a bare origin, got ${app.url}`);
 }
 const bg = app.backgroundColor || "#212121";
+// A generic shell wraps any platform origin (wildcard); a branded one wraps
+// exactly its app's host. The splash trusts this same list when it decides
+// whether a pairing link's target is allowed to load at all.
+const allowNav = app.allowNavigation || [new URL(app.url).host];
 
 // -- capacitor.config.json (generated, gitignored) ---------------------------
 const capacitor = {
@@ -32,10 +36,10 @@ const capacitor = {
   webDir: "www",
   backgroundColor: bg,
   server: {
-    // The remote app stays INSIDE the webview; every other origin falls out
+    // The wrapped app stays INSIDE the webview; every other origin falls out
     // to the system browser. The repo pin and the verify flow assume this
-    // list holds exactly the one app origin.
-    allowNavigation: [new URL(app.url).host],
+    // list holds only origins the platform serves.
+    allowNavigation: allowNav,
   },
 };
 writeFileSync(new URL("./capacitor.config.json", import.meta.url), JSON.stringify(capacitor, null, 2) + "\n");
@@ -49,8 +53,13 @@ const cfg = {
   name: app.name,
   displayName: app.displayName,
   url: origin,
+  generic: !!app.generic,
+  allowNavigation: allowNav,
   attestationPath: app.attestationPath || "/attestation",
   repo: app.repo,
+  // where the verify flow falls back for apps that do not serve their own
+  // /attestation: the platform's public per-deployment attestation endpoint
+  apiBase: "https://api.enclave.host",
   backgroundColor: bg,
   iconDataUri: `data:${iconMime};base64,${iconBytes.toString("base64")}`,
 };
@@ -78,7 +87,7 @@ stamp("./android/app/src/main/res/values/strings.xml", () =>
   `    <string name="app_name">${xml(app.displayName)}</string>\n` +
   `    <string name="title_activity_main">${xml(app.displayName)}</string>\n` +
   `    <string name="package_name">${app.appId}</string>\n` +
-  `    <string name="custom_url_scheme">${app.appId}</string>\n` +
+  `    <string name="custom_url_scheme">${app.scheme || app.appId}</string>\n` +
   `</resources>\n`);
 
 stamp("./ios/App/App/Info.plist", (s) =>
