@@ -24,6 +24,13 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- REQUIRED, not optional: the web app's composer has a camera button
+	     (an <input type="file" capture>), and iOS terminates the app the
+	     moment a camera is invoked without this string. It is the user-facing
+	     reason, so say what actually happens to the photo. Nothing here opens
+	     the camera on its own - only that button does. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Take a photo to ask about it. The picture is sent only to the enclave that answers you, and never to anyone else.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

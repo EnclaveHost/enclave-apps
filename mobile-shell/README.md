@@ -37,6 +37,27 @@ plus icon art - the shell itself never changes. Store publishing follows the
 Mobile Publisher model: each customer publishes under their **own** developer
 accounts (Apple's template-app rule), with builds produced by CI.
 
+## Camera
+
+The wrapped app's composer offers "take a photo", which is an
+`<input type="file" accept="image/*" capture="environment">`. The webview
+hands that to the platform camera; no Capacitor camera plugin is involved and
+none is needed.
+
+Two platform details, both easy to get wrong in opposite directions:
+
+- **iOS requires `NSCameraUsageDescription`** in `ios/App/App/Info.plist`.
+  Without it, iOS does not degrade or prompt: it **terminates the app** the
+  instant the camera is invoked. It is set.
+- **Android must NOT declare `android.permission.CAMERA`.**
+  `ACTION_IMAGE_CAPTURE` is serviced by the user's camera app and needs no
+  permission from us, but Android has a trap: an app that *declares* the
+  permission without holding it at runtime gets a `SecurityException` from
+  that same intent. Declaring it "to be safe" is precisely what breaks it.
+  The manifest carries only `INTERNET`, and the `FileProvider` +
+  `res/xml/file_paths.xml` that Capacitor's file chooser needs to hand back
+  the captured file. Leave all three alone.
+
 ## Building
 
 ```sh
