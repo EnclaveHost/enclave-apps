@@ -483,6 +483,13 @@
   .md h4 { font-size: 1em; margin-top: 14px; }
   .md a { color: var(--accent); text-decoration: none; }
   .md a:hover { text-decoration: underline; }
+  /* citation markers: quieter than prose links - the [n] is an annotation,
+     not part of the sentence - but visibly pressable */
+  .md a.cite {
+    color: var(--text-2); font-weight: 500;
+    border-bottom: 1px dotted var(--border-soft);
+  }
+  .md a.cite:hover { color: var(--text); text-decoration: none; border-bottom-color: var(--text-3); }
   /* a link the USER typed sits on the bubble's own fill, where the accent
      green reads as a different element rather than as text. Underline it
      instead and keep the bubble's colour. Long URLs break rather than
@@ -1989,6 +1996,61 @@ function sourcesBlock(sources) {
   return wrap;
 }
 
+// The [n] markers the model writes become links to the source they cite, so a
+// claim is checkable at the sentence instead of by cross-referencing the list
+// below. DOM pass rather than a markdown feature: it runs only on replies that
+// HAVE sources, and only over prose - never inside code (where [0] is an
+// index), never inside an existing link. A bracket whose numbers do not all
+// resolve ("[2024]", a range past the list) is left exactly as written.
+function linkCitations(root, sources) {
+  if (!sources || !sources.length) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (t) => t.parentElement && t.parentElement.closest("a, code, pre")
+      ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+  });
+  const texts = [];
+  for (let t = walker.nextNode(); t; t = walker.nextNode())
+    if (t.nodeValue.includes("[")) texts.push(t);
+  const re = /\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]/g;
+  for (const t of texts) {
+    const text = t.nodeValue;
+    let m, last = 0, frag = null;
+    re.lastIndex = 0;
+    while ((m = re.exec(text))) {
+      const links = m[1].split(",").map((raw) => {
+        const n = parseInt(raw, 10);
+        const s = n >= 1 && n <= sources.length ? sources[n - 1] : null;
+        try {
+          const u = new URL(s ? s.url : "");
+          if (u.protocol === "http:" || u.protocol === "https:")
+            return { n, href: u.href, title: s.title || u.hostname };
+        } catch (_) {}
+        return null;
+      });
+      if (links.some((l) => !l)) continue;
+      frag = frag || document.createDocumentFragment();
+      frag.appendChild(document.createTextNode(text.slice(last, m.index) + "["));
+      links.forEach((l, i) => {
+        if (i) frag.appendChild(document.createTextNode(", "));
+        const a = document.createElement("a");
+        a.className = "cite";
+        a.href = l.href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer nofollow";
+        a.title = l.title;
+        a.textContent = l.n;
+        frag.appendChild(a);
+      });
+      frag.appendChild(document.createTextNode("]"));
+      last = m.index + m[0].length;
+    }
+    if (frag) {
+      frag.appendChild(document.createTextNode(text.slice(last)));
+      t.parentNode.replaceChild(frag, t);
+    }
+  }
+}
+
 // A generated image. The bytes arrive inline as a data: URI, so nothing here
 // reaches out to another origin and a stored chat still renders offline.
 function imageBlock(img) {
@@ -2086,6 +2148,8 @@ function renderMessage(m, idx, isTail) {
   if (isTail) row.classList.add("tail");
   const md = row.querySelector(".md");
   md.innerHTML = assistantHtml(m.content, false);
+  // before the sources list is attached, so only the prose is walked
+  linkCitations(md, m.sources);
   // the picture goes ABOVE the sentence that refers to it
   const fig = imageBlock(m.image);
   if (fig) md.insertBefore(fig, md.firstChild);
@@ -2148,6 +2212,9 @@ function updateStreamDOM(chat) {
     const open = [...body.querySelectorAll("details.think")].map((d) => d.open);
     body.innerHTML = assistantHtml(s.reply, true);
     [...body.querySelectorAll("details.think")].forEach((d, i) => { if (open[i]) d.open = true; });
+    // the markers link up as they stream in; a half-written "[1" waits for
+    // its bracket, and the sources list is not in the body yet
+    linkCitations(body, s.sources);
   } else if (s.status) {
     body.innerHTML = '<div class="statusline shimmer"></div>';
     body.firstChild.textContent = s.status;
