@@ -17,10 +17,12 @@
 //! IS off, like web search), but it cannot add an entry, change a URL or set a
 //! header. The alternative - letting a request declare a tool the enclave then
 //! executes - would be an open fetcher running with this deployment's egress
-//! identity and its secrets, which is egress laundering with extra steps. If you
-//! want client-declared tools, they belong in the OTHER mode: parse the model's
-//! call, hand it back over /v1 as `tool_calls`, and let the CLIENT execute it.
-//! That mode costs this app nothing and is not what this file does.
+//! identity and its secrets, which is egress laundering with extra steps.
+//! Client-declared tools live in the OTHER mode, which /v1 implements (the
+//! PASSTHROUGH, see client_tools in lib.rs): the model's call is parsed and
+//! handed back as OpenAI `tool_calls`, and the CLIENT executes it. Nothing
+//! here ever runs one of those - a request that declares tools gets its own
+//! list INSTEAD of this registry, never merged with it.
 //!
 //! WHERE THE WORK HAPPENS: in the enclave, never in the browser. Same reasoning
 //! as search.rs - a browser-side fetch would send the query and the user's IP
@@ -313,6 +315,9 @@ pub enum ToolSrc {
     /// index into Registry::mcp, plus the name the SERVER knows it by (which
     /// differs from the exposed name whenever a prefix is set)
     Mcp { server: usize, remote: String },
+    /// declared by the REQUEST (the /v1 passthrough): rendered into the
+    /// prompt, never executed here - the call goes back to the client
+    Client,
 }
 
 /// A tool as the model sees it.
@@ -472,7 +477,7 @@ fn check_name(n: &str) -> Result<(), String> {
 
 /// Whatever was configured, as an object schema. A model handed a schema that
 /// is not an object tends to answer with a bare value the caller cannot bind.
-fn object_schema(v: Option<serde_json::Value>) -> serde_json::Value {
+pub fn object_schema(v: Option<serde_json::Value>) -> serde_json::Value {
     match v {
         Some(v) if v.is_object() => v,
         _ => serde_json::json!({ "type": "object", "properties": {} }),
@@ -547,6 +552,55 @@ fn unresolved_in(s: &str) -> Option<String> {
 /// a family that was taught a different one needs its own arm here rather than
 /// a generic guess (see tools_supported).
 pub fn system_block(tools: &[Tool], max_calls: usize) -> String {
+    let mut s = signatures(tools);
+    s.push_str(&format!(
+        "Rules for this app: the call is executed by the server and its result comes back in a \
+         <tool_response> block; wait for it rather than inventing one. Call ONLY the functions \
+         listed above, by their exact names - nothing else exists, and a call to anything else \
+         is shown to the user as a failure. You may make at most {max_calls} call{} in one \
+         answer, so make each one count. When a call fails, say so plainly and answer from what \
+         you have. When you have enough to answer, stop calling and write the answer.",
+        if max_calls == 1 { "" } else { "s" }
+    ));
+    s
+}
+
+/// The block for CLIENT-declared tools (the /v1 passthrough). Same trained
+/// format, different contract: the model still writes `<tool_call>`, but the
+/// call ends the turn and goes back to the client as OpenAI `tool_calls`; the
+/// result returns as a `<tool_response>` block in the NEXT request. From where
+/// the model sits that is indistinguishable from the server loop, so the rules
+/// only drop what is no longer true (the per-answer budget - the client owns
+/// the loop).
+///
+/// `require` is OpenAI's forcing `tool_choice`: Some("") for `"required"`,
+/// Some(name) for a named function. It can only be ASKED for - this runtime
+/// has no grammar constraint - so it arrives as an instruction, and a model
+/// that answers in prose anyway is reported as it stands.
+pub fn client_system_block(tools: &[Tool], require: Option<&str>) -> String {
+    let mut s = signatures(tools);
+    s.push_str(
+        "Rules for this app: after you write a call, STOP - it is executed for you and its \
+         result arrives in a <tool_response> block in the next turn; never invent one. Call \
+         ONLY the functions listed above, by their exact names - nothing else exists. One \
+         call at a time. When a result reports an error, say so plainly and answer from what \
+         you have. When you have enough to answer, stop calling and write the answer.",
+    );
+    match require {
+        Some("") => s.push_str(
+            "\n\nFor THIS turn you MUST respond with a tool call, not a prose answer.",
+        ),
+        Some(name) => s.push_str(&format!(
+            "\n\nFor THIS turn you MUST call `{name}`, not answer in prose.",
+        )),
+        None => {}
+    }
+    s
+}
+
+/// The part both modes share: the signature list, in the format the model was
+/// trained on.
+fn signatures(tools: &[Tool]) -> String {
     let mut s = String::from(
         "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
          You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
@@ -568,15 +622,6 @@ pub fn system_block(tools: &[Tool], max_calls: usize) -> String {
          arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
          {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n",
     );
-    s.push_str(&format!(
-        "Rules for this app: the call is executed by the server and its result comes back in a \
-         <tool_response> block; wait for it rather than inventing one. Call ONLY the functions \
-         listed above, by their exact names - nothing else exists, and a call to anything else \
-         is shown to the user as a failure. You may make at most {max_calls} call{} in one \
-         answer, so make each one count. When a call fails, say so plainly and answer from what \
-         you have. When you have enough to answer, stop calling and write the answer.",
-        if max_calls == 1 { "" } else { "s" }
-    ));
     s
 }
 
@@ -769,6 +814,10 @@ pub fn call(
         ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources),
         ToolSrc::Http(i) => call_http(&cfg.http[i], cfg, args),
         ToolSrc::Mcp { server, remote } => call_mcp(&mut reg.mcp[server], &remote, args),
+        // never built into a Registry - the passthrough renders client tools
+        // into the prompt and hands the call back, so reaching this arm is a
+        // wiring bug, and the failure must say which side executes
+        ToolSrc::Client => Err("client-declared tools are executed by the client, not here".into()),
     };
     let (text, is_error) = match r {
         Ok(t) => (truncate(&t, max_chars), false),

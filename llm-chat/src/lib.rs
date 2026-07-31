@@ -104,15 +104,26 @@
 //!                               MODEL, on models whose volume carries a
 //!                               vision projector and whose config says
 //!                               `vision` (see the vision section below).
-//!                               TOOLS: `tools: true` lets the model call the
-//!                               endpoints and MCP servers THIS DEPLOYMENT
-//!                               configured (see tools.rs and the config's
-//!                               `tools` block); `tool_choice: "none"` withholds
-//!                               them. A client-declared `tools: [...]` array is
-//!                               REFUSED - this app executes its own registry
-//!                               and never a caller's. What ran comes back on
-//!                               `enclave.tools`, or as SSE comments
-//!                               `: enclave-tool {...}` while streaming.
+//!                               TOOLS, two modes told apart by the `tools`
+//!                               field's shape. `tools: true` lets the model
+//!                               call the endpoints and MCP servers THIS
+//!                               DEPLOYMENT configured (see tools.rs and the
+//!                               config's `tools` block); what ran comes back
+//!                               on `enclave.tools`, or as SSE comments
+//!                               `: enclave-tool {...}` while streaming. An
+//!                               OpenAI `tools: [...]` ARRAY is the
+//!                               PASSTHROUGH: the client's own functions are
+//!                               offered to the model INSTEAD of the
+//!                               deployment's registry, its call comes back as
+//!                               `tool_calls` with finish_reason
+//!                               "tool_calls", and the CLIENT executes it -
+//!                               nothing here runs a caller's tool. Send the
+//!                               result as a `role: "tool"` message (agent
+//!                               frameworks do this on their own). In both
+//!                               modes `tool_choice: "none"` withholds the
+//!                               lot; `"required"` and the named-function form
+//!                               are honoured as an instruction in the prompt
+//!                               (there is no grammar constraint here).
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!                               Same `web_search` switch; sources arrive as a
 //!                               `{"search":{...}}` event before the first
@@ -755,6 +766,47 @@ const MAX_BODY_BYTES: usize = 40 * 1024 * 1024;
 const BUSY_MARKER: &str = "[sessions_busy]";
 const BUSY_POLL_MS: u64 = 2000;
 const BUSY_WAIT_BUDGET_MS: u128 = 300_000; // stop queueing after 5 minutes
+/// generate()'s queue keepalive opens with this, and internal_status
+/// prefix-matches it to tell the wait ticks from the load/ready lines
+/// around them.
+const BUSY_STATUS: &str = "all inference sessions are busy";
+/// Busy-queue allowance for the INTERNAL generations (the router verdict, the
+/// vision question, the chat title): long enough to ride out a normal turn
+/// finishing ahead, far short of the main leg's five minutes. An optional
+/// pass that cannot start is dropped, so the queue allowance stays with the
+/// answer the user is actually waiting for.
+const INTERNAL_BUSY_BUDGET_MS: u128 = 30_000;
+
+/// Status relay for an internal generation (router verdict, vision question,
+/// chat title). generate() narrates its busy queue through the status
+/// callback, and these passes used to hand it a no-op - which held the turn
+/// SILENT while they queued on a saturated node. Bytes are what keep a stream
+/// alive: measured on this fleet 2026-07-31, ~180s without one and the
+/// gateway cuts the response mid-turn, which the playground reports as "the
+/// instance likely restarted" - and a retry meets the same queue. So the wait
+/// ticks are forwarded under the leg's own label, and once the queue has
+/// eaten `budget_ms` the relay returns false, which generate() already treats
+/// as "stop waiting"; every caller of these passes falls back the way it does
+/// on any other failure. The load/ready lines are swallowed: mid-leg they
+/// would only garble the narration.
+fn internal_status<'a>(
+    label: &'static str,
+    on_status: &'a dyn Fn(&str),
+    budget_ms: u128,
+) -> impl Fn(&str) -> bool + 'a {
+    let t0 = now_ms();
+    move |s: &str| {
+        if !s.starts_with(BUSY_STATUS) {
+            return true;
+        }
+        let waited = now_ms() - t0;
+        if waited >= budget_ms {
+            return false;
+        }
+        on_status(&format!("{label} (waiting for a free inference slot, {}s)", waited / 1000));
+        true
+    }
+}
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -1721,7 +1773,7 @@ fn generate(
                     ));
                 }
                 if !status(&format!(
-                    "all inference sessions are busy ({}s) - waiting for a free slot",
+                    "{BUSY_STATUS} ({}s) - waiting for a free slot",
                     (now_ms() - t0) / 1000
                 )) {
                     return Err("client disconnected".into());
@@ -2312,11 +2364,20 @@ struct ChatMsg {
     /// which is how every VLM chat template puts them: picture first, then
     /// the question about it.
     images: Vec<Vec<u8>>,
+    /// OpenAI tool history (the /v1 passthrough): calls an assistant turn
+    /// carried, as (id, name, arguments). Held here until fold_tool_history
+    /// renders them into the trained text form - build_prompt itself never
+    /// looks at them.
+    tool_calls: Vec<(Option<String>, String, serde_json::Value)>,
+    /// role:"tool" only: the call this result answers, and (deprecated in
+    /// OpenAI's schema but still widely sent) the function's own name
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
 }
 
 impl ChatMsg {
     fn text(role: &str, content: impl Into<String>) -> ChatMsg {
-        ChatMsg { role: role.into(), content: content.into(), images: Vec::new() }
+        ChatMsg { role: role.into(), content: content.into(), ..ChatMsg::default() }
     }
 }
 
@@ -2366,9 +2427,44 @@ impl<'de> Deserialize<'de> for ChatMsg {
             role: String,
             #[serde(default)]
             content: Option<RawContent>,
+            // OpenAI tool history: an assistant turn that called tools carries
+            // them here (content is usually null beside them), and a
+            // role:"tool" turn names the call it answers
+            #[serde(default)]
+            tool_calls: Vec<WireToolCall>,
+            #[serde(default)]
+            tool_call_id: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct WireToolCall {
+            #[serde(default)]
+            id: Option<String>,
+            function: WireFunction,
+        }
+        #[derive(Deserialize)]
+        struct WireFunction {
+            name: String,
+            // the spec says a JSON-encoded STRING; a client that sends the
+            // object itself is accepted rather than corrected
+            #[serde(default)]
+            arguments: Option<serde_json::Value>,
         }
         let w = Wire::deserialize(d)?;
         let mut msg = ChatMsg { role: w.role, ..Default::default() };
+        msg.tool_call_id = w.tool_call_id;
+        msg.tool_name = w.name;
+        for c in w.tool_calls {
+            let args = match c.function.arguments {
+                Some(serde_json::Value::String(s)) => {
+                    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                }
+                Some(a) => a,
+                None => serde_json::json!({}),
+            };
+            msg.tool_calls.push((c.id, c.function.name, args));
+        }
         match w.content {
             None => {}
             Some(RawContent::Text(t)) => msg.content = t,
@@ -2535,13 +2631,12 @@ struct ChatReq {
     /// ever be wrong about one of them.
     #[serde(default)]
     image_gen: Option<serde_json::Value>,
-    /// extension (needs config.tools): `true` lets the model call the tools
-    /// this DEPLOYMENT configured, `false` withholds them. Absent takes the
-    /// deployment's `default_on`, which is false unless it says otherwise.
-    ///
-    /// This is the OpenAI `tools` field's slot, and an array there means
-    /// something this app deliberately does not do - see tools.rs - so the
-    /// array form is refused with an explanation rather than ignored.
+    /// Two meanings, told apart by shape. The boolean is an extension (needs
+    /// config.tools): `true` lets the model call the tools this DEPLOYMENT
+    /// configured, `false` withholds them, absent takes the deployment's
+    /// `default_on`. OpenAI's ARRAY is the PASSTHROUGH (see client_tools):
+    /// the client's own functions are rendered into the prompt, the model's
+    /// call comes back as `tool_calls`, and the CLIENT executes it.
     #[serde(default)]
     tools: Option<serde_json::Value>,
     /// OpenAI's switch: "none" withholds the tools, anything else is the
@@ -2589,12 +2684,65 @@ impl ChatReq {
         }
     }
 
-    /// A client-DECLARED tool array, which this app does not execute. Returned
-    /// as an error rather than ignored: a client that declared tools is waiting
-    /// for `tool_calls` in the reply, and silently answering in prose is the
-    /// exact failure this whole feature exists to remove.
-    fn client_declared_tools(&self) -> bool {
-        self.tools.as_ref().and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+    /// The client-declared tool array (OpenAI `tools: [...]`), as a registry
+    /// the prompt can render. This is the PASSTHROUGH mode tools.rs describes:
+    /// the model is offered the CLIENT's functions, its call comes back on the
+    /// reply as `tool_calls`, and the client executes it - nothing here ever
+    /// runs one. A request that declares tools gets them INSTEAD of the
+    /// deployment's registry, never merged with it: the model sees one list,
+    /// and a client-supplied name must not be able to select a server-executed
+    /// capability that merely shares it.
+    ///
+    /// Err when the array is present but not a shape this side can name a
+    /// function from - a client waiting for `tool_calls` has to hear why it
+    /// will never get one, not receive prose.
+    fn client_tools(&self) -> Result<Option<Vec<tools::Tool>>, String> {
+        if self.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
+            return Ok(None);
+        }
+        let Some(arr) = self.tools.as_ref().and_then(|v| v.as_array()) else { return Ok(None) };
+        if arr.is_empty() {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, t) in arr.iter().enumerate() {
+            // OpenAI nests the function under "function"; a flat
+            // {"name": ...} entry (the Anthropic/Responses spelling) works too
+            let f = t.get("function").unwrap_or(t);
+            let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            if name.is_empty() {
+                return Err(format!(
+                    "tools[{i}] names no function: expected \
+                     {{\"type\": \"function\", \"function\": {{\"name\": ...}}}}"
+                ));
+            }
+            out.push(tools::Tool {
+                name: name.to_string(),
+                description: f
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parameters: tools::object_schema(
+                    f.get("parameters").or_else(|| f.get("input_schema")).cloned(),
+                ),
+                src: tools::ToolSrc::Client,
+            });
+        }
+        Ok(Some(out))
+    }
+
+    /// OpenAI's `tool_choice` when it FORCES a call: Some("") for
+    /// `"required"` (any tool), Some(name) for
+    /// `{"type": "function", "function": {"name": ...}}`. `"auto"`, `"none"`
+    /// and absent are all None - only the forcing forms need words in the
+    /// prompt.
+    fn tool_must_call(&self) -> Option<String> {
+        let v = self.tool_choice.as_ref()?;
+        if v.as_str() == Some("required") {
+            return Some(String::new());
+        }
+        v.get("function")?.get("name")?.as_str().map(str::to_string)
     }
 
     /// Does this request let the router reach for an image? `false`/`"off"`
@@ -2666,6 +2814,7 @@ fn route_web_search(
     messages: &[ChatMsg],
     mode: &str,
     ask: RouterAsk,
+    on_status: &dyn Fn(&str),
 ) -> RouterOut {
     let (want_search, want_image, want_effort) = (ask.search, ask.image, ask.effort);
     // the routing half runs when EITHER verdict is on offer
@@ -2827,9 +2976,13 @@ options, anything where a wrong intermediate step ruins the answer.
         return RouterOut::default();
     };
     let noop_emit = |_: &str| true;
-    let noop_status = |_: &str| true;
+    let status = internal_status(
+        if want_route { "deciding what this needs…" } else { "sizing the reasoning budget…" },
+        on_status,
+        INTERNAL_BUSY_BUDGET_MS,
+    );
     let Ok(stats) = generate(
-        cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+        cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &status,
     ) else {
         return RouterOut::default();
     };
@@ -3133,6 +3286,17 @@ impl CallGate {
         let out = std::mem::take(&mut self.held);
         (!out.is_empty()).then_some(out)
     }
+
+    /// The held text was a call the CLIENT will execute (the /v1 passthrough):
+    /// drop it, because it leaves as structured `tool_calls` rather than as
+    /// content. A gate that was not suppressing holds prose, which the flush
+    /// after this still delivers.
+    fn drop_call(&mut self) {
+        if self.suppress {
+            self.suppress = false;
+            self.held.clear();
+        }
+    }
 }
 
 /// The call, rewritten in the trained form. The raw reply may carry a
@@ -3143,6 +3307,98 @@ fn canonical_call(c: &tools::ToolCall) -> String {
         "<tool_call>\n{}\n</tool_call>",
         serde_json::json!({ "name": c.name, "arguments": c.args })
     )
+}
+
+// ------------------------------------------- client tools (the passthrough) --
+
+/// Rewrite OpenAI tool history into the trained chatml text forms: an
+/// assistant `tool_calls` array becomes `<tool_call>` blocks in that turn's
+/// content, a `role:"tool"` result becomes a `<tool_response>` block in a
+/// USER turn (Qwen's own template renders it exactly there), and consecutive
+/// results share one turn the way that template merges them. The result names
+/// itself by matching its `tool_call_id` against the calls already seen,
+/// because OpenAI's schema stopped sending the function name alongside.
+///
+/// Runs on every /v1 request - a turn with none of these shapes passes
+/// through untouched - and never on /chat, whose client is the playground.
+fn fold_tool_history(messages: &mut Vec<ChatMsg>) {
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut out: Vec<ChatMsg> = Vec::with_capacity(messages.len());
+    for mut m in messages.drain(..) {
+        if m.role == "assistant" && !m.tool_calls.is_empty() {
+            let mut content = m.content.trim_end().to_string();
+            for (id, name, args) in std::mem::take(&mut m.tool_calls) {
+                if let Some(id) = id {
+                    names.insert(id, name.clone());
+                }
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&canonical_call(&tools::ToolCall { name, args }));
+            }
+            m.content = content;
+            out.push(m);
+        } else if m.role == "tool" {
+            let name = m
+                .tool_name
+                .clone()
+                .or_else(|| m.tool_call_id.as_ref().and_then(|id| names.get(id).cloned()))
+                .unwrap_or_default();
+            let block = tools::response_turn(&name, &m.content);
+            match out.last_mut() {
+                Some(prev) if prev.role == "user" && prev.content.starts_with("<tool_response>") =>
+                {
+                    prev.content.push('\n');
+                    prev.content.push_str(&block);
+                }
+                _ => out.push(ChatMsg::text("user", block)),
+            }
+        } else {
+            out.push(m);
+        }
+    }
+    *messages = out;
+}
+
+/// The parsed calls in OpenAI's reply shape. `arguments` is a JSON-encoded
+/// STRING - that is the spec, and every SDK parses it back. Ids are
+/// synthesized from `seed` (the clock): this side never saw an id, the client
+/// only needs them to pair results with calls, and a deterministic input
+/// keeps this testable.
+fn openai_tool_calls(calls: &[tools::ToolCall], seed: u128, streaming: bool) -> serde_json::Value {
+    serde_json::Value::Array(
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut v = serde_json::json!({
+                    "id": format!("call_{seed:x}_{i}"),
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.args.to_string() },
+                });
+                // the chunk schema addresses calls by index; the buffered
+                // message schema has no such field, so it is not invented there
+                if streaming {
+                    v["index"] = serde_json::json!(i);
+                }
+                v
+            })
+            .collect(),
+    )
+}
+
+/// What of a reply that ended in a call is still CONTENT: the reasoning and
+/// any prose before it. With the trained form that is everything before the
+/// first `<tool_call>` of the BODY (a call discussed inside <think> is
+/// reasoning, not a call - same rule as parse_calls); with the bare-object
+/// form the whole body was the call, so only the think block survives.
+fn visible_before_call(text: &str) -> &str {
+    let body = text.rfind("</think>").map_or(0, |i| i + "</think>".len());
+    let cut = match text[body..].find("<tool_call>") {
+        Some(i) => body + i,
+        None => body,
+    };
+    text[..cut].trim_end()
 }
 
 /// Whether this request gets the deployment's tools: the config has some, the
@@ -3242,9 +3498,11 @@ Reply with EXACTLY ONE line: the title and nothing else.";
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
-    let noop_status = |_: &str| true;
+    // no stream to narrate to (the client fires-and-forgets titles), but the
+    // budget still applies: a name is never worth five minutes in the queue
+    let status = internal_status("naming the chat", &|_: &str| {}, INTERNAL_BUSY_BUDGET_MS);
     let stats = generate(
-        cfg, tok, &prompt, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+        cfg, tok, &prompt, target, tname, &params, &DraftPlan::Plain, &noop_emit, &status,
     )
     .ok()?;
     clean_title(&stats.text)
@@ -3548,6 +3806,7 @@ fn author_vision_query(
     tok: &Tokenizer,
     messages: &[ChatMsg],
     mode: &str,
+    on_status: &dyn Fn(&str),
 ) -> Option<String> {
     let system = "A vision model is about to look at the image the user just attached. It sees \
 ONLY the image and the one question you write - it cannot see this conversation, and it will \
@@ -3610,9 +3869,13 @@ ASK: <the question>";
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
-    let noop_status = |_: &str| true;
+    let status = internal_status(
+        "working out what to ask about the image…",
+        on_status,
+        INTERNAL_BUSY_BUDGET_MS,
+    );
     let stats = generate(
-        cfg, tok, &prompt, target, tname, &params, &DraftPlan::Plain, &noop_emit, &noop_status,
+        cfg, tok, &prompt, target, tname, &params, &DraftPlan::Plain, &noop_emit, &status,
     )
     .ok()?;
     parse_ask_line(&stats.text)
@@ -3675,7 +3938,7 @@ fn apply_vision(
     let user_text = messages[idx].content.trim().to_string();
     let question = if vcfg.author_query {
         on_status("working out what to ask about the image…");
-        author_vision_query(cfg, tok, messages, target_mode).unwrap_or_else(|| {
+        author_vision_query(cfg, tok, messages, target_mode, on_status).unwrap_or_else(|| {
             if user_text.is_empty() {
                 "Describe this image in detail, and transcribe any text exactly as it appears."
                     .to_string()
@@ -3819,7 +4082,7 @@ fn apply_web_search(
     if !asked_inline && web_mode != WebMode::Always && (router_search || image_live) {
         on_status("deciding what this needs…");
         let ask = RouterAsk { search: router_search, image: image_live, effort: want_effort };
-        let out = route_web_search(cfg, tok, messages, target_mode, ask);
+        let out = route_web_search(cfg, tok, messages, target_mode, ask, on_status);
         *effort_out = out.effort;
         match out.verdict {
             Some(RouterVerdict::Image(prompt)) => {
@@ -3831,7 +4094,7 @@ fn apply_web_search(
                     return Ok(None);
                 }
                 on_status("searching the web…");
-                return finish_search(cfg, messages, last, q, web_mode, asked_inline);
+                return finish_search(cfg, messages, last, q, web_mode, asked_inline, on_status);
             }
             None => return Ok(None),
         }
@@ -3851,7 +4114,7 @@ fn apply_web_search(
     };
     let query = messages[last].content.trim().to_string();
     on_status("searching the web…");
-    finish_search(cfg, messages, last, query, web_mode, asked_inline)
+    finish_search(cfg, messages, last, query, web_mode, asked_inline, on_status)
 }
 
 /// Generate an image and fold a note about it into the user's turn, so the
@@ -3884,6 +4147,21 @@ fn run_image(
     Ok(())
 }
 
+/// Tell the model a search the user wanted did not happen, in the turn it
+/// belongs to. Same bracketed-note pattern as run_image: a fact about this
+/// request, travelling with the message rather than rewriting the system
+/// prompt. Without it the model answers as if the web had never been in play,
+/// and the user who flipped the switch is misled by an answer that LOOKS
+/// checked.
+fn note_failed_search(messages: &mut [ChatMsg], last: usize) {
+    messages[last].content = format!(
+        "{}\n\n[Web search was attempted for this request but FAILED: no results were \
+         retrieved. Answer from your own knowledge, and say plainly that you could not \
+         check the web and the answer is unverified. Do not invent sources or citations.]",
+        messages[last].content.trim()
+    );
+}
+
 fn finish_search(
     cfg: &AppConfig,
     messages: &mut [ChatMsg],
@@ -3891,25 +4169,33 @@ fn finish_search(
     query: String,
     web_mode: WebMode,
     asked_inline: bool,
+    on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
     let scfg = cfg.search.as_ref().ok_or("web search is not enabled on this deployment")?;
     let t0 = now_ms();
     let hits = match search::search(scfg, &query) {
         Ok(h) => h,
-        // in auto mode the user never asked for a search, so a provider that
-        // is down must not take the answer down with it - drop to the model's
-        // own knowledge, which is what it would have done anyway
-        Err(e) if web_mode == WebMode::Auto && !asked_inline => {
-            eprintln!("[llm-chat] auto web search failed, answering without it: {e}");
+        // A retrieval that failed must not take the answer down with it - in
+        // ANY mode. Auto never asked, so it degrades silently; a turn that DID
+        // ask (the switch, /search) gets the model told instead, so the reply
+        // says plainly that the web could not be checked rather than the whole
+        // request dying on a flaky egress. The real error goes to the log and
+        // the /search?q= probe still surfaces it for the operator.
+        Err(e) => {
+            eprintln!("[llm-chat] web search failed, answering without it: {e}");
+            if web_mode != WebMode::Auto || asked_inline {
+                on_status("search failed; answering from model knowledge…");
+                note_failed_search(messages, last);
+            }
             return Ok(None);
         }
-        Err(e) => return Err(e),
     };
     if hits.is_empty() {
-        if web_mode == WebMode::Auto && !asked_inline {
-            return Ok(None);
+        if web_mode != WebMode::Auto || asked_inline {
+            on_status("no results; answering from model knowledge…");
+            note_failed_search(messages, last);
         }
-        return Err(format!("no web results for '{}'", truncate_for_msg(&query)));
+        return Ok(None);
     }
     let sources = hits.iter().map(|h| (h.title.clone(), h.url.clone())).collect();
     // The question put back to the model is the USER'S, not the router's
@@ -3960,13 +4246,6 @@ fn search_meta_json(m: &SearchMeta) -> serde_json::Value {
             .map(|(t, u)| serde_json::json!({ "title": t, "url": u }))
             .collect::<Vec<_>>(),
     })
-}
-
-fn truncate_for_msg(s: &str) -> String {
-    match s.char_indices().nth(60) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_string(),
-    }
 }
 
 fn read_body(req: &IncomingRequest) -> Result<Vec<u8>, String> {
@@ -4065,6 +4344,11 @@ enum Capabilities<'a> {
     /// the answer with a tool registry: the real signatures, and the stop
     /// string that ends generation the moment a call is complete
     Tools(&'a [tools::Tool], usize),
+    /// the answer with CLIENT-declared tools (the /v1 passthrough): the block
+    /// is pre-rendered by the handler (see tools::client_system_block), and
+    /// the same stop string arms - a completed call ends the turn, because
+    /// executing it is the client's job
+    Client(&'a str),
 }
 
 fn with_capability_note(cfg: &AppConfig, system: &str) -> String {
@@ -4105,6 +4389,7 @@ fn build_prompt(
         Capabilities::Tools(list, max) => {
             format!("{}{}", system.trim_end(), tools::system_block(list, max))
         }
+        Capabilities::Client(block) => format!("{}{}", system.trim_end(), block),
     };
     // (role, text) per turn, with the turn's images kept alongside by INDEX.
     // Marks are stripped from incoming text FIRST: they are our own private
@@ -4171,7 +4456,7 @@ fn build_prompt(
             // A completed call is the end of the turn: stopping here saves the
             // model from narrating past its own call, and the parser accepts
             // the unterminated form the stop string leaves behind.
-            if matches!(caps, Capabilities::Tools(..)) {
+            if matches!(caps, Capabilities::Tools(..) | Capabilities::Client(_)) {
                 stops.push("</tool_call>".into());
             }
             return Ok((prompt, stops, rendered.think_open));
@@ -4262,6 +4547,7 @@ fn resolve_effort(
         messages,
         mode,
         RouterAsk { search: false, image: false, effort: true },
+        on_status,
     )
     .effort
 }
@@ -4733,9 +5019,14 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                                     truncate_for_msg_n(&q, 120)) }));
                                 let _ = send(serde_json::json!({ "status": "searching the web…" }));
                                 // Always, not Auto: the model asked for this one
-                                // by name, so a provider that fails should say
-                                // so rather than quietly answering from memory
-                                match finish_search(cfg, &mut messages, li, q, WebMode::Always, true) {
+                                // by name, so a provider that fails must be
+                                // owned up to - finish_search folds the
+                                // could-not-check note into the turn and the
+                                // regenerated answer says so
+                                let leg = |s: &str| {
+                                    let _ = send(serde_json::json!({ "status": s }));
+                                };
+                                match finish_search(cfg, &mut messages, li, q, WebMode::Always, true, &leg) {
                                     Ok(Some(m)) => {
                                         let _ = send(serde_json::json!({ "search": search_meta_json(&m) }));
                                     }
@@ -4836,20 +5127,17 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
-    // A client-declared `tools` array asks this app to hand back `tool_calls`
-    // for the CLIENT to execute. It does not do that yet, and answering in
-    // prose while an SDK waits for a tool call is the failure this whole
-    // feature exists to remove - so say what is true instead of guessing.
-    if creq.client_declared_tools() {
-        return json_err(
-            out,
-            400,
-            "this deployment executes its OWN configured tools and does not run tools declared \
-             by a client, so `tools: [...]` cannot be honoured. Send `tools: true` to let the \
-             model call what this deployment configured, or `tool_choice: \"none\"` to answer \
-             without tools.",
-        );
-    }
+    // A client-declared `tools` array is the PASSTHROUGH (see client_tools):
+    // the model is offered the client's functions and its call goes back on
+    // the reply as `tool_calls`, for the CLIENT to execute. The registry the
+    // deployment configured sits the turn out - the model sees ONE list.
+    let client_reg = match creq.client_tools() {
+        Ok(r) => r,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    let client_block = client_reg
+        .as_ref()
+        .map(|list| tools::client_system_block(list, creq.tool_must_call().as_deref()));
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
@@ -4871,6 +5159,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     // before the first chunk, since the chunk schema has nowhere to put them).
     let mode = creq.target.as_deref().unwrap_or("auto");
     let mut messages = creq.messages.clone();
+    // OpenAI tool history (assistant `tool_calls`, role:"tool" results) into
+    // the trained text forms, whether or not THIS request declares tools - an
+    // agent's final wrap-up turn still carries the transcript
+    fold_tool_history(&mut messages);
     let mut generated_image: Option<image::GeneratedImage> = None;
     let id = completion_id();
     let created = (now_ms() / 1000) as u64;
@@ -4931,8 +5223,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // block pays for neither.
         let mut router_effort: Option<Effort> = None;
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
-        let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status));
+        let mut tl = if client_reg.is_some() {
+            None
+        } else {
+            tools_enabled(cfg, &creq)
+                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status))
+        };
         if let Some(t) = &tl {
             for n in &t.reg.notes {
                 let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
@@ -4989,11 +5285,13 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
 
         let mut last_err = String::new();
         let mut done_stats: Option<GenStats> = None;
+        let mut client_calls: Vec<tools::ToolCall> = Vec::new();
         let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         'answer: loop {
-        let caps = match &tl {
-            Some(t) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
-            None => Capabilities::Note,
+        let caps = match (&client_block, &tl) {
+            (Some(b), _) => Capabilities::Client(b),
+            (None, Some(t)) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            (None, None) => Capabilities::Note,
         };
         let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
             Ok(v) => v,
@@ -5011,7 +5309,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             // re-emit the prompt-side think opening ahead of the first real
             // delta (see handle_chat) so clients receive a complete block
             let opened = std::cell::Cell::new(!think_open);
-            let gate = std::cell::RefCell::new(CallGate::new(tl.is_some(), think_open));
+            let gate = std::cell::RefCell::new(CallGate::new(
+                tl.is_some() || client_block.is_some(),
+                think_open,
+            ));
             let emit = |delta: &str| {
                 let Some(out) = gate.borrow_mut().push(delta) else { return true };
                 if !opened.replace(true)
@@ -5039,6 +5340,14 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                             continue 'answer;
                         }
                     }
+                    if client_block.is_some() {
+                        client_calls = tools::parse_calls(&s.text);
+                        if !client_calls.is_empty() {
+                            // the held call leaves as structured `tool_calls`
+                            // below, not as content
+                            gate.borrow_mut().drop_call();
+                        }
+                    }
                     if let Some(rest) = gate.borrow_mut().flush() {
                         if !opened.replace(true) {
                             let _ = send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None));
@@ -5060,7 +5369,20 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         }
         match done_stats {
             Some(s) => {
-                let _ = send_raw(&chunk(serde_json::json!({}), Some(s.finish_reason)));
+                if client_calls.is_empty() {
+                    let _ = send_raw(&chunk(serde_json::json!({}), Some(s.finish_reason)));
+                } else {
+                    // the whole call in one delta - the protocol allows
+                    // argument fragments, but nothing here is gained by
+                    // slicing what is already complete
+                    let _ = send_raw(&chunk(
+                        serde_json::json!({
+                            "tool_calls": openai_tool_calls(&client_calls, now_ms(), true)
+                        }),
+                        None,
+                    ));
+                    let _ = send_raw(&chunk(serde_json::json!({}), Some("tool_calls")));
+                }
                 let _ = send_raw("data: [DONE]\n\n");
             }
             None => {
@@ -5086,8 +5408,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // block pays for neither.
         let mut router_effort: Option<Effort> = None;
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
-        let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status));
+        let mut tl = if client_reg.is_some() {
+            None
+        } else {
+            tools_enabled(cfg, &creq)
+                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status))
+        };
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
@@ -5117,9 +5443,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let (mut think_open, mut effort, mut params);
         let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         'answer: loop {
-        let caps = match &tl {
-            Some(t) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
-            None => Capabilities::Note,
+        let caps = match (&client_block, &tl) {
+            (Some(b), _) => Capabilities::Client(b),
+            (None, Some(t)) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            (None, None) => Capabilities::Note,
         };
         let (prompt_ids, stops, opened) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
             Ok(v) => v,
@@ -5147,17 +5474,47 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         }
         match result {
             Some(s) => {
-                // the prompt force-opened the think block; restore the tag
-                // so the reply carries a complete one
-                let content =
-                    if think_open { format!("<think>\n{}", s.text) } else { s.text.clone() };
+                let client_calls = if client_block.is_some() {
+                    tools::parse_calls(&s.text)
+                } else {
+                    Vec::new()
+                };
+                let (message, finish) = if client_calls.is_empty() {
+                    // the prompt force-opened the think block; restore the tag
+                    // so the reply carries a complete one
+                    let content =
+                        if think_open { format!("<think>\n{}", s.text) } else { s.text.clone() };
+                    (
+                        serde_json::json!({ "role": "assistant", "content": content }),
+                        s.finish_reason,
+                    )
+                } else {
+                    // the reasoning stays as content, the call leaves as
+                    // structured `tool_calls`; null content when there was
+                    // nothing but the call, which is what SDKs expect
+                    let visible = visible_before_call(&s.text);
+                    let content = if visible.is_empty() {
+                        serde_json::Value::Null
+                    } else if think_open {
+                        serde_json::json!(format!("<think>\n{visible}"))
+                    } else {
+                        serde_json::json!(visible)
+                    };
+                    (
+                        serde_json::json!({
+                            "role": "assistant", "content": content,
+                            "tool_calls": openai_tool_calls(&client_calls, now_ms(), false),
+                        }),
+                        "tool_calls",
+                    )
+                };
                 let mut body_json = serde_json::json!({
                     "id": id, "object": "chat.completion", "created": created,
                     "model": model,
                     "choices": [{
                         "index": 0,
-                        "message": { "role": "assistant", "content": content },
-                        "finish_reason": s.finish_reason,
+                        "message": message,
+                        "finish_reason": finish,
                     }],
                     "usage": {
                         "prompt_tokens": s.prompt_tokens,
@@ -5639,6 +5996,9 @@ fn handle_tools_probe(
                 tools::ToolSrc::Http(_) => "http".to_string(),
                 tools::ToolSrc::Mcp { server, remote } =>
                     format!("mcp[{server}]:{remote}"),
+                // the probe resolves the deployment's registry, which never
+                // holds a client-declared tool
+                tools::ToolSrc::Client => "client".to_string(),
             },
             "parameters": t.parameters,
         })).collect::<Vec<_>>(),
@@ -6026,6 +6386,22 @@ mod tests {
         assert!(tools_enabled(&cfg, &chat_req(on)).is_none());
     }
 
+    /// A search the user asked for that could not be run must not kill the
+    /// turn: the model is told, in the turn, and instructed to say the answer
+    /// is unverified. (The retrieval failure itself degrades in finish_search;
+    /// this pins the note that makes the degradation honest.)
+    #[test]
+    fn a_failed_search_leaves_the_turn_alive_with_a_note() {
+        let mut msgs =
+            vec![ChatMsg::text("system", "be brief"), ChatMsg::text("user", "what changed today?")];
+        note_failed_search(&mut msgs, 1);
+        assert!(msgs[1].content.starts_with("what changed today?"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("FAILED"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("unverified"), "{}", msgs[1].content);
+        // the note rides the user turn, never the system prompt
+        assert_eq!(msgs[0].content, "be brief");
+    }
+
     /// The two switches are independent, and absent means the deployment's
     /// default: images on, search off. A user who will not send questions to a
     /// search provider keeps the picture generator the operator runs.
@@ -6050,18 +6426,123 @@ mod tests {
         assert!(!req(serde_json::json!({ "messages": [], "image_gen": "off" })).image_on(true));
     }
 
-    /// A client that declares its OWN tools is asking for something this app
-    /// does not do, and has to be told rather than quietly answered in prose.
+    /// A client that declares its OWN tools gets the passthrough: the array
+    /// becomes a registry the prompt renders, the boolean extension stays the
+    /// deployment-tools switch, and `tool_choice: "none"` still withholds
+    /// everything.
     #[test]
-    fn client_declared_tools_are_refused_not_ignored() {
+    fn client_declared_tools_become_a_registry() {
         let r = chat_req(serde_json::json!({
             "messages": [],
-            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Current weather for a city.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }}],
         }));
-        assert!(r.client_declared_tools());
+        let list = r.client_tools().unwrap().expect("an array is the passthrough");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "get_weather");
+        assert!(list[0].parameters["properties"]["city"].is_object());
         // the boolean extension is not an array and must not trip it
-        assert!(!chat_req(serde_json::json!({ "messages": [], "tools": true })).client_declared_tools());
-        assert!(!chat_req(serde_json::json!({ "messages": [], "tools": [] })).client_declared_tools());
+        assert!(chat_req(serde_json::json!({ "messages": [], "tools": true }))
+            .client_tools().unwrap().is_none());
+        assert!(chat_req(serde_json::json!({ "messages": [], "tools": [] }))
+            .client_tools().unwrap().is_none());
+        // the OpenAI off switch means off in this mode too
+        let off = chat_req(serde_json::json!({
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "tool_choice": "none",
+        }));
+        assert!(off.client_tools().unwrap().is_none());
+        // a nameless entry is an error the client hears, not prose it waits
+        // behind
+        assert!(chat_req(serde_json::json!({
+            "messages": [], "tools": [{"type": "function", "function": {}}],
+        }))
+        .client_tools()
+        .is_err());
+    }
+
+    /// OpenAI tool history renders into the trained chatml forms: the
+    /// assistant's calls as `<tool_call>` blocks, results as `<tool_response>`
+    /// USER turns (named by matching the call id), consecutive results
+    /// sharing one turn.
+    #[test]
+    fn client_tool_history_folds_into_trained_turns() {
+        let r = chat_req(serde_json::json!({ "messages": [
+            {"role": "user", "content": "weather in Oslo and Bergen?"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function":
+                    {"name": "get_weather", "arguments": "{\"city\": \"Oslo\"}"}},
+                {"id": "call_2", "type": "function", "function":
+                    {"name": "get_weather", "arguments": "{\"city\": \"Bergen\"}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "12C, rain"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "9C, more rain"},
+        ]}));
+        let mut msgs = r.messages.clone();
+        fold_tool_history(&mut msgs);
+        assert_eq!(msgs.len(), 3, "two results share one user turn");
+        assert_eq!(msgs[1].role, "assistant");
+        // the STRING arguments were re-parsed, so the model sees real JSON
+        assert!(msgs[1].content.contains("<tool_call>"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("\"city\":\"Oslo\""), "{}", msgs[1].content);
+        assert_eq!(msgs[2].role, "user");
+        assert!(msgs[2].content.contains("<tool_response>"));
+        assert!(msgs[2].content.contains("get_weather"), "the id resolved to its name");
+        assert!(msgs[2].content.contains("more rain"));
+        // a turn with none of these shapes passes through untouched
+        assert_eq!(msgs[0].content, "weather in Oslo and Bergen?");
+    }
+
+    /// The reply side of the passthrough: the call leaves as OpenAI
+    /// `tool_calls` with STRING arguments, and the content keeps the
+    /// reasoning while losing the call text.
+    #[test]
+    fn a_call_leaves_as_openai_tool_calls() {
+        let text = "<think>\nneed the weather\n</think>\n<tool_call>\n\
+                    {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}\n</tool_call>";
+        let calls = tools::parse_calls(text);
+        assert_eq!(calls.len(), 1);
+        let j = openai_tool_calls(&calls, 0xabc, false);
+        assert_eq!(j[0]["type"], "function");
+        assert_eq!(j[0]["function"]["name"], "get_weather");
+        assert!(j[0]["id"].as_str().unwrap().starts_with("call_"));
+        assert!(j[0].get("index").is_none(), "index is the chunk schema's field");
+        let args: serde_json::Value =
+            serde_json::from_str(j[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Oslo");
+        // the streaming shape addresses calls by index
+        assert_eq!(openai_tool_calls(&calls, 0xabc, true)[0]["index"], 0);
+        // content: the reasoning survives, the call does not
+        assert_eq!(visible_before_call(text), "<think>\nneed the weather\n</think>");
+        // the bare-object form was ALL call
+        assert_eq!(visible_before_call("{\"name\": \"x\", \"arguments\": {}}"), "");
+    }
+
+    /// `tool_choice` can force a call. It arrives as an instruction - this
+    /// runtime has no grammar constraint - so all this proves is that the
+    /// words reach the block.
+    #[test]
+    fn a_forced_tool_choice_reaches_the_block() {
+        let named = chat_req(serde_json::json!({ "messages": [], "tool_choice":
+            {"type": "function", "function": {"name": "get_weather"}} }));
+        assert_eq!(named.tool_must_call().as_deref(), Some("get_weather"));
+        let any = chat_req(serde_json::json!({ "messages": [], "tool_choice": "required" }));
+        assert_eq!(any.tool_must_call().as_deref(), Some(""));
+        assert_eq!(chat_req(serde_json::json!({ "messages": [] })).tool_must_call(), None);
+        let list = [tools::Tool {
+            name: "get_weather".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            src: tools::ToolSrc::Client,
+        }];
+        let block = tools::client_system_block(&list, Some("get_weather"));
+        assert!(block.contains("<tools>"));
+        assert!(block.contains("MUST call `get_weather`"), "{block}");
+        assert!(tools::client_system_block(&list, Some("")).contains("MUST respond with"));
     }
 
     /// The loop runs a call, feeds the result back, and stops when the budget
@@ -6434,6 +6915,31 @@ mod tests {
     }
 
     #[test]
+    fn internal_status_narrates_the_queue_and_gives_up_on_budget() {
+        use std::cell::RefCell;
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let sink = |s: &str| seen.borrow_mut().push(s.to_string());
+        let relay = internal_status("deciding what this needs…", &sink, 60_000);
+        // the load/ready lines are swallowed, not forwarded - and never abort
+        assert!(relay("loading the model on gpu - the first request after a node boot..."));
+        assert!(relay("session ready (3 ms); prefilling 900 prompt tokens"));
+        assert!(seen.borrow().is_empty());
+        // a queue tick is forwarded under the leg's own label: these bytes are
+        // what keeps the gateway from cutting the stream mid-wait
+        assert!(relay(&format!("{BUSY_STATUS} (2s) - waiting for a free slot")));
+        let got = seen.borrow().last().cloned().unwrap();
+        assert!(got.starts_with("deciding what this needs…"), "{got}");
+        assert!(got.contains("waiting for a free inference slot"), "{got}");
+        // budget spent: the relay says stop, and nothing more is forwarded
+        let spent = internal_status("deciding what this needs…", &sink, 0);
+        let n = seen.borrow().len();
+        assert!(!spent(&format!("{BUSY_STATUS} (31s) - waiting for a free slot")));
+        assert_eq!(seen.borrow().len(), n);
+        // but even with no budget, non-queue lines still pass without aborting
+        assert!(spent("loading the model on cpu - ..."));
+    }
+
+    #[test]
     fn router_verdict_survives_model_noise() {
         // the clean cases
         assert_eq!(search_of("SEARCH: rust 1.90 release notes").as_deref(),
@@ -6721,6 +7227,7 @@ mod tests {
             role: "user".into(),
             content: "what is this".into(),
             images: vec![png_bytes()],
+            ..ChatMsg::default()
         }];
         // text-only model: refused, and the message says which knob is wrong
         cfg.vision = false;
@@ -6755,8 +7262,12 @@ mod tests {
         let raw = serde_json::json!({});
         let mut cfg = test_config();
         cfg.vision = false;
-        let msgs =
-            vec![ChatMsg { role: "user".into(), content: "what is this".into(), images: vec![png_bytes()] }];
+        let msgs = vec![ChatMsg {
+            role: "user".into(),
+            content: "what is this".into(),
+            images: vec![png_bytes()],
+            ..ChatMsg::default()
+        }];
         // without a service this is the refusal asserted above...
         assert!(check_images(&raw, &cfg, &msgs).is_err());
         // ...with one, the turn is accepted and the sibling deployment reads it
