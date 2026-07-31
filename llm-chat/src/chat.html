@@ -551,12 +551,57 @@
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
   /* ------------------------------ API + attestation + CPU-mode dialogs -- */
-  #apiOverlay, #attOverlay, #gpuOverlay {
+  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
-  #apiOverlay.open, #attOverlay.open, #gpuOverlay.open { display: flex; }
+  #apiOverlay.open, #attOverlay.open, #gpuOverlay.open, #webOverlay.open,
+  #camOverlay.open { display: flex; }
+  #camOverlay .api-card { max-width: 560px; }
+  .cam-stage {
+    position: relative; margin: 8px 0 0; border-radius: 14px; overflow: hidden;
+    background: #000; aspect-ratio: 4 / 3; display: flex;
+    align-items: center; justify-content: center;
+  }
+  #camVideo { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .cam-err {
+    position: absolute; margin: 0; padding: 0 18px; text-align: center;
+    color: var(--text-2); font-size: 13.5px; line-height: 1.55;
+  }
+  .cam-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .cam-actions .web-btn[hidden] { display: none; }
+  #webOverlay .api-card { font-size: 14px; line-height: 1.65; max-width: 540px; }
+  #webOverlay .api-head h2 { font-size: 17px; }
+  .web-trade {
+    margin: 14px 0 4px; padding: 12px 14px; border-radius: 12px;
+    background: var(--hover); border: 1px solid var(--border-soft);
+  }
+  .web-trade h3 {
+    margin: 0 0 6px; font-size: 11.5px; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--text-3); font-weight: 600;
+  }
+  .web-trade p { margin: 0 0 8px; font-size: 13.5px; }
+  .web-trade p:last-child { margin-bottom: 0; }
+  .web-note { color: var(--text-2); }
+  .web-store {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    margin-top: 12px; padding: 10px 12px; border-radius: 12px;
+    border: 1px solid var(--border-soft); background: transparent;
+  }
+  .web-store:hover { background: var(--hover); }
+  .web-store[aria-checked="true"] .sw { background: var(--accent); }
+  .web-store[aria-checked="true"] .sw .knob { left: 16px; }
+  .web-store .st-sub { white-space: normal; line-height: 1.45; }
+  .web-actions { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+  .web-btn {
+    flex: 1 1 160px; padding: 10px 14px; border-radius: 10px; font-size: 14px;
+    border: 1px solid var(--border); color: var(--text); background: transparent;
+  }
+  .web-btn:hover { background: var(--hover); }
+  .web-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .web-btn.primary:hover { filter: brightness(1.08); }
+  .web-foot { margin: 12px 0 0; font-size: 12.5px; color: var(--text-3); }
   .att-status { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; font-size: 12.5px; }
   .att-status svg { flex: none; }
   .att-status.ok { color: var(--ok); }
@@ -729,6 +774,12 @@
   }
   #attachBtn.show { display: flex; }
   #attachBtn:hover { background: var(--hover); color: var(--text); }
+  #cameraBtn {
+    width: 36px; height: 36px; border-radius: 50%; flex: none; display: none;
+    align-items: center; justify-content: center; color: var(--text-2);
+  }
+  #cameraBtn.show { display: flex; }
+  #cameraBtn:hover { background: var(--hover); color: var(--text); }
   /* pictures the USER sent, above their bubble */
   .row.user .att-row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-bottom: 6px; }
   .row.user .att-row img {
@@ -992,6 +1043,62 @@
     </div>
   </div>
 
+  <div id="camOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="camTitle">
+      <div class="api-head">
+        <h2 id="camTitle">Take a photo</h2>
+        <button class="icon-btn" id="camClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <div class="cam-stage">
+        <video id="camVideo" playsinline autoplay muted></video>
+        <p class="cam-err" id="camErr" hidden></p>
+      </div>
+      <div class="cam-actions">
+        <button class="web-btn" id="camSwitch" hidden>Switch camera</button>
+        <button class="web-btn primary" id="camShoot">Take photo</button>
+      </div>
+      <p class="web-foot">The photo is attached to your next message. Nothing is recorded, and
+      the picture stays in this browser until you send it.</p>
+    </div>
+  </div>
+  <div id="webOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="webTitle">
+      <div class="api-head">
+        <h2 id="webTitle">Let answers use the web?</h2>
+        <button class="icon-btn" id="webClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <p class="gpu-lead">A model answering from memory alone gets details wrong and sounds
+      certain doing it: wrong dates, wrong names, a plot point from the wrong season. With web
+      search on, the answer is written from pages fetched at the time you ask, with sources you
+      can open. It is the single biggest difference in answer quality here.</p>
+      <div class="web-trade">
+        <h3>What it costs you, exactly</h3>
+        <p>Your question, or a short query written from it, goes to <b id="webProv">a search
+        provider</b> outside this enclave. They see that query and this deployment's IP address.
+        They do not see who you are, and they never see the rest of the conversation: the request
+        leaves from the enclave, not from your browser.</p>
+        <p class="web-note">Everything else stays as it was. With the switch off, nothing about
+        your questions leaves this enclave at all.</p>
+      </div>
+      <button id="webStore" class="web-store" type="button" role="switch" aria-checked="false"
+              title="Store chat history and preferences in this browser">
+        <span class="st-txt">
+          <span class="st-name">Remember on this device</span>
+          <span class="st-sub" id="webStoreSub"></span>
+        </span>
+        <span class="sw" aria-hidden="true"><span class="knob"></span></span>
+      </button>
+      <div class="web-actions">
+        <button class="web-btn primary" id="webYes">Turn on web search</button>
+        <button class="web-btn" id="webNo">Not now</button>
+      </div>
+      <p class="web-foot" id="webFoot"></p>
+    </div>
+  </div>
   <div id="gpuOverlay">
     <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="gpuTitle">
       <div class="api-head">
@@ -1052,6 +1159,9 @@
         <button id="attachBtn" type="button" aria-label="Attach an image" title="Attach an image">
           <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5l-7.6 7.6a4.5 4.5 0 0 1-6.4-6.4l8-8a3 3 0 0 1 4.3 4.3l-8 8a1.5 1.5 0 0 1-2.2-2.2l7.1-7.1"/></svg>
         </button>
+        <button id="cameraBtn" type="button" aria-label="Take a photo" title="Take a photo">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5h3l1.4-2.2a1 1 0 0 1 .85-.47h5.5a1 1 0 0 1 .85.47L17 8.5h3a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.2"/></svg>
+        </button>
         <textarea id="input" rows="1" placeholder="Ask anything" autofocus></textarea>
         <button id="sendBtn" type="submit" aria-label="Send" disabled>
           <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
@@ -1062,6 +1172,13 @@
            through the SYSTEM mime database, so a machine that does not map
            image/webp greys the file out in the picker with no explanation -->
       <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,.png,.jpg,.jpeg,.webp,.gif,.bmp" multiple hidden>
+      <!-- A SECOND input, because `capture` belongs on this one and not on the
+           picker above: with it there, the paperclip would open the camera and
+           the photo library would become unreachable. `environment` asks for
+           the rear camera, which is what "take a picture of this" means; the
+           camera UI still offers the switch. One at a time - a phone camera
+           returns one shot per invocation, so `multiple` would be a lie. -->
+      <input id="camInput" type="file" accept="image/*" capture="environment" hidden>
     </form>
     <p class="footnote">Answer quality tracks model size: small models are quick and frequently wrong. Chats stay in this browser.</p>
   </div>
@@ -1275,6 +1392,13 @@ const state = {
   webMode: "off",   // off | auto (persisted; "always" from an older build reads as auto)
   search: { enabled: false }, // what /models reported about this deployment's provider
   image: { enabled: false },  // ...and whether an image service is configured
+  // Images have their OWN switch, and it starts ON. They used to share the web
+  // switch, which meant refusing to send questions to a search provider also
+  // cost you the picture generator - two very different disclosures behind one
+  // control. A generated image goes to a deployment this operator runs; a
+  // search goes to a third party who keeps their own logs. Only the second one
+  // needs the user's permission, so only the second one starts off.
+  imageOn: true,
   // TOOLS: endpoints and MCP servers this deployment lets the model call. Off
   // for the same reason web search is off - a call leaves the enclave, so it
   // is the user's choice per session, not a default they inherit - unless the
@@ -1300,6 +1424,31 @@ const chatList = $("chatList"), jump = $("jump");
 const modelBtn = $("modelBtn"), modelMenu = $("modelMenu"), modelLabel = $("modelLabel");
 const warmPill = $("warmPill");
 const attachBtn = $("attachBtn"), attStrip = $("attStrip"), fileInput = $("fileInput");
+const cameraBtn = $("cameraBtn"), camInput = $("camInput");
+
+// ONE button, TWO mechanisms, because the right answer differs by platform.
+//
+// On a phone or tablet, `capture` hands off to the OS camera app: better
+// optics handling, tap-to-focus, HDR, retake, and no permission dialog for
+// this page to manage. On a desktop it is simply IGNORED - it degrades to a
+// second file picker beside the one that already exists - so there the button
+// opens an in-page preview through getUserMedia instead.
+//
+// The gate is the OS, not the pointer: a touchscreen laptop has a coarse
+// pointer and would have taken the `capture` path straight to a file picker.
+// iPadOS 13+ lies about being a Mac, so it is caught by touch points.
+const MOBILE_OS = (() => {
+  try {
+    if (navigator.userAgentData && navigator.userAgentData.mobile === true) return true;
+    if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) return true;
+    return navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+  } catch (_) { return false; }
+})();
+// getUserMedia needs a SECURE context, so this is false over plain http on a
+// LAN address - the button then hides rather than opening a dialog that can
+// only fail.
+const CAN_GUM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+const HAS_CAMERA = MOBILE_OS || CAN_GUM;
 const lightbox = $("lightbox");
 
 const current = () => state.chats.find((c) => c.id === state.currentId) || null;
@@ -1315,7 +1464,14 @@ const isMobile = () => matchMedia("(max-width: 768px)").matches;
 // The llmchat- key prefix is deliberately NOT renamed with the brand: it is the
 // address of what people already have stored, and changing it would silently
 // orphan every saved chat and preference in every browser that has one.
-const PREF_KEYS = ["llmchat-store", "llmchat-theme", "llmchat-model", "llmchat-target", "llmchat-sidew"];
+// EVERY key pref() can write, because this list is what turning storage off
+// erases, and "an opted-out browser holds zero data from this app" is only true
+// if it is complete. It was not: think/web had been written for releases
+// without being listed, so switching storage off left them behind. Anything
+// added to pref() belongs here in the same commit.
+const PREF_KEYS = ["llmchat-store", "llmchat-theme", "llmchat-model", "llmchat-target",
+                   "llmchat-sidew", "llmchat-think", "llmchat-web", "llmchat-web-asked",
+                   "llmchat-tools", "llmchat-image"];
 let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
 function pref(key, val) {
@@ -1352,6 +1508,15 @@ function renderStoreToggle() {
   $("storeSub").textContent = storeOK
     ? "Chats & settings stored in this browser"
     : "Nothing is stored in this browser";
+  // the first-run dialog carries the same switch, so the two must never
+  // disagree about what this browser is doing
+  const w = $("webStore");
+  if (w) {
+    w.setAttribute("aria-checked", String(storeOK));
+    $("webStoreSub").textContent = storeOK
+      ? "Your answer below is kept, so you will not be asked again."
+      : "Nothing is stored, so this choice lasts for this tab only and you will be asked again next visit.";
+  }
 }
 async function setStoring(on) {
   storeOK = on;
@@ -1954,6 +2119,8 @@ function visionModel() {
 
 function updateAttachUI() {
   attachBtn.classList.toggle("show", visionModel() || state.attachments.length > 0);
+  cameraBtn.classList.toggle("show",
+    HAS_CAMERA && (visionModel() || state.attachments.length > 0));
   form.classList.toggle("has-att", state.attachments.length > 0);
   attStrip.innerHTML = "";
   state.attachments.forEach((a, i) => {
@@ -2051,6 +2218,106 @@ async function addFiles(files) {
 
 attachBtn.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
+// the shot goes through the SAME path as an upload: same vision gate, same
+// per-message limit, same browser-side downscale - a 12 MP phone photo has no
+// business being uploaded whole
+cameraBtn.addEventListener("click", () => (MOBILE_OS ? camInput.click() : openCam()));
+camInput.addEventListener("change", () => { addFiles(camInput.files); camInput.value = ""; });
+
+// ------------------------------------------------------ in-page camera --
+// Desktop capture, where `capture` does nothing. A live preview, a shutter,
+// and one rule that matters more than the rest: EVERY exit stops the tracks.
+// A MediaStream nobody stopped keeps the camera light on after the dialog is
+// gone, which is exactly the thing a user of this app would least forgive.
+const camOverlay = $("camOverlay"), camVideo = $("camVideo");
+let camStream = null, camList = [], camAt = 0;
+
+function stopCam() {
+  if (camStream) {
+    for (const t of camStream.getTracks()) t.stop();
+    camStream = null;
+  }
+  camVideo.srcObject = null;
+}
+
+function closeCam() {
+  camOverlay.classList.remove("open");
+  stopCam();
+}
+
+function camError(e) {
+  stopCam();
+  const name = (e && e.name) || "";
+  const msg =
+    name === "NotAllowedError" || name === "SecurityError"
+      ? "Camera access was blocked. Allow it for this site in your browser's address bar, then try again."
+      : name === "NotFoundError" || name === "OverconstrainedError"
+      ? "No camera found on this device. You can still attach a picture with the paperclip."
+      : name === "NotReadableError"
+      ? "The camera is already in use by another app. Close that and try again."
+      : "Could not start the camera" + (e && e.message ? ": " + e.message : ".");
+  const el = $("camErr");
+  el.textContent = msg;
+  el.hidden = false;
+}
+
+async function startCam(deviceId) {
+  stopCam();
+  $("camErr").hidden = true;
+  // `ideal`, never `exact`: a laptop has no environment-facing camera and an
+  // exact constraint would fail outright rather than giving us the one it has
+  const video = deviceId ? { deviceId: { exact: deviceId } }
+                         : { facingMode: { ideal: "environment" } };
+  camStream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+  camVideo.srcObject = camStream;
+  try { await camVideo.play(); } catch (_) {}
+  // device LABELS only exist once permission has been granted, so the list is
+  // read after the stream, not before
+  try {
+    camList = (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === "videoinput");
+  } catch (_) { camList = []; }
+  $("camSwitch").hidden = camList.length < 2;
+}
+
+async function openCam() {
+  camOverlay.classList.add("open");
+  $("camShoot").focus();
+  try {
+    await startCam();
+  } catch (e) {
+    camError(e);
+  }
+}
+
+// The frame at the sensor's own size; the shared pipeline downscales it to the
+// same ~1.15 MP an upload gets, so this path has no size rules of its own.
+// NOT mirrored, deliberately: a mirrored preview with an unmirrored file is a
+// nasty surprise when the subject is text, and preview == result is the rule
+// people can actually predict.
+async function shootCam() {
+  const w = camVideo.videoWidth, h = camVideo.videoHeight;
+  if (!w || !h) return camError(new Error("the camera has not started yet"));
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  c.getContext("2d").drawImage(camVideo, 0, 0, w, h);
+  const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.92));
+  if (!blob) return camError(new Error("the frame could not be encoded"));
+  closeCam();
+  addFiles([new File([blob], "photo-" + Date.now() + ".jpg", { type: "image/jpeg" })]);
+}
+
+$("camShoot").addEventListener("click", shootCam);
+$("camClose").addEventListener("click", closeCam);
+camOverlay.addEventListener("click", (e) => { if (e.target === camOverlay) closeCam(); });
+$("camSwitch").addEventListener("click", async () => {
+  if (camList.length < 2) return;
+  camAt = (camAt + 1) % camList.length;
+  try { await startCam(camList[camAt].deviceId); } catch (e) { camError(e); }
+});
+// a tab that goes away must not leave the camera running
+window.addEventListener("pagehide", stopCam);
 
 // Paste is how a screenshot actually arrives. Only intercept when the
 // clipboard carries an image; pasted text must still paste as text.
@@ -2133,6 +2400,8 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (apiOverlay.classList.contains("open")) { closeApi(); return; }
     if (attOverlay.classList.contains("open")) { closeAtt(); return; }
+    if (camOverlay.classList.contains("open")) { closeCam(); return; }
+    if (webOverlay.classList.contains("open")) { answerWeb(false); return; }
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (state.busyChatId) stopGeneration();
     closeModelMenu();
@@ -2354,6 +2623,7 @@ async function run(chat) {
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
         // "auto" = the server asks the model whether this turn needs the web
         web_search: state.webMode === "off" ? undefined : "auto",
+        image_gen: state.image.enabled ? (state.imageOn ? "auto" : "off") : undefined,
         // the deployment's OWN tools, which it executes itself; this only says
         // whether the model is allowed to reach for them on this turn
         tools: state.tools.enabled && state.toolsOn ? true : undefined,
@@ -2902,13 +3172,82 @@ attOverlay.addEventListener("click", (e) => { if (e.target === attOverlay) close
 const gpuOverlay = $("gpuOverlay"), cpuChip = $("cpuChip");
 let gpuNoticeShown = false;
 function openGpu() { gpuOverlay.classList.add("open"); $("gpuClose").focus(); }
-function closeGpu() { gpuOverlay.classList.remove("open"); }
+function closeGpu() {
+  gpuOverlay.classList.remove("open");
+  setTimeout(() => webNotice(), 200);   // the question it was standing in front of
+}
 // Only once the boot overlay is gone: stacking the dialog behind a full-screen
 // loading screen would waste the one appearance it gets.
 function gpuNotice() {
   if (gpuNoticeShown || !bootGone || state.gpu !== false) return;
   gpuNoticeShown = true;
   openGpu();
+}
+
+// ------------------------------------------------- first-run web disclosure --
+// Web search is off until someone chooses it, and a switch nobody finds is the
+// same as no feature: people ask a question, get a confidently wrong answer from
+// memory, and conclude the model is bad. So the choice is put in front of them
+// ONCE, with what it costs stated plainly - the provider's name, what that
+// provider learns - and either answer is remembered so they are never asked
+// again. Shown only when there is a real decision to make: a provider is
+// configured and the switch is currently off.
+const webOverlay = $("webOverlay");
+let webAsked = false;
+function openWeb() {
+  $("webProv").textContent = provName(state.search && state.search.provider);
+  // An opted-out browser stores nothing from this app - by design, and that
+  // includes the record of having answered this, so the dialog would reappear
+  // every visit looking like a bug. The fix belongs HERE rather than in a
+  // footnote pointing at a switch in the sidebar: the same switch is in the
+  // dialog, off by default like everywhere else, and its subtitle says exactly
+  // what turning it on buys.
+  renderStoreToggle();
+  $("webFoot").textContent =
+    "You can change either of these any time: web search under the model name, storage at the "
+    + "bottom of the chat list.";
+  webOverlay.classList.add("open");
+  $("webYes").focus();
+}
+function closeWeb() { webOverlay.classList.remove("open"); }
+// the config value is a slug; say the name people would recognise
+function provName(p) {
+  const known = { exa: "Exa", brave: "Brave Search", serper: "Serper", ddg: "DuckDuckGo",
+                  serpapi: "SerpApi", searxng: "a SearXNG instance" };
+  return known[p] || (p ? p : "a search provider");
+}
+function answerWeb(on) {
+  state.webMode = on ? "auto" : "off";
+  pref("llmchat-web", state.webMode);
+  pref("llmchat-web-asked", "1");
+  closeWeb();
+  renderModelMenu();   // the switch reflects what they just chose
+}
+// Toggling storage here is the same action as toggling it in the sidebar, so
+// it goes through the same function: one path that snapshots the session, one
+// that erases it. answerWeb runs AFTER, so whichever way this is left is what
+// decides whether the answer below is remembered.
+$("webStore").addEventListener("click", (e) => {
+  e.stopPropagation();
+  setStoring($("webStore").getAttribute("aria-checked") !== "true");
+});
+$("webYes").addEventListener("click", () => answerWeb(true));
+$("webNo").addEventListener("click", () => answerWeb(false));
+$("webClose").addEventListener("click", () => answerWeb(false));
+webOverlay.addEventListener("click", (e) => { if (e.target === webOverlay) answerWeb(false); });
+
+// Queued behind boot AND behind the CPU notice: two modals at once reads as a
+// broken page, and the GPU one is about whether the app works at all.
+function webNotice() {
+  if (webAsked || !bootGone) return;
+  if (!state.search || !state.search.enabled) return;
+  if (state.webMode !== "off") return;          // already on: nothing to ask
+  let asked = null;
+  try { if (storeOK) asked = localStorage.getItem("llmchat-web-asked"); } catch (_) {}
+  if (asked === "1") return;
+  if (gpuOverlay.classList.contains("open")) return;   // retried on its close
+  webAsked = true;
+  openWeb();
 }
 cpuChip.addEventListener("click", openGpu);
 $("gpuClose").addEventListener("click", closeGpu);
@@ -3031,22 +3370,38 @@ function renderModelMenu() {
   // NOT sticky-on: with it on, the question leaves the enclave to a search
   // provider, so it is a choice the user makes per session rather than a
   // default they inherit.
-  if ((state.search && state.search.enabled) || (state.image && state.image.enabled)) {
-    // one switch, because one router decides both: the label follows whatever
-    // this deployment actually configured
-    const hasS = state.search && state.search.enabled;
-    const hasI = state.image && state.image.enabled;
-    const label = hasS && hasI ? "Search &amp; images" : hasI ? "Images" : "Web search";
-    const what = hasS && hasI ? "search the web or generate an image"
-               : hasI ? "generate an image" : "search the web";
-    const wseg = node('<div class="seg-row"><span>' + label + '</span><div class="seg"></div></div>');
+  // Images: their own switch, on by default. The picture is made by a
+  // deployment this operator runs, so there is no third party to disclose and
+  // nothing for the user to weigh - configuring the endpoint was the decision.
+  if (state.image && state.image.enabled) {
+    const iseg = node('<div class="seg-row"><span>Images</span><div class="seg"></div></div>');
+    for (const t of ["on", "off"]) {
+      const b = node("<button type='button'></button>");
+      b.textContent = t;
+      if ((state.imageOn ? "on" : "off") === t) b.classList.add("on");
+      b.title = t === "on"
+        ? "the model decides per message whether to generate a picture"
+        : "never generate a picture; answer in words";
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.imageOn = t === "on";
+        pref("llmchat-image", state.imageOn ? "on" : "off");
+        iseg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      });
+      iseg.querySelector(".seg").appendChild(b);
+    }
+    modelMenu.appendChild(iseg);
+  }
+  if (state.search && state.search.enabled) {
+    const what = "search the web";
+    const wseg = node('<div class="seg-row"><span>Web search</span><div class="seg"></div></div>');
     // On/off, the same shape as Thinking. ON means the MODEL decides per
     // message whether the turn needs it, which is what people expect from a
     // chat app and what makes the control worth leaving on. There is no
-    // "every message" setting: it spent a provider round trip (or an image
-    // generation) on "thanks, that helps", and once the router decides well
-    // the only thing it added was a way to get that wrong. API clients that
-    // really want it can still send web_search: true.
+    // "every message" setting: it spent a provider round trip on "thanks, that
+    // helps", and once the router decides well the only thing it added was a
+    // way to get that wrong. API clients that really want it can still send
+    // web_search: true.
     for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");
       b.textContent = t;
@@ -3104,7 +3459,7 @@ function renderModelMenu() {
 // the same way.
 const modelsReady = (async () => {
   let storedModel = null, storedTarget = null, storedThink = null, storedWeb = null,
-      storedTools = null;
+      storedTools = null, storedImage = null;
   try {
     if (storeOK) {
       storedModel = localStorage.getItem("llmchat-model");
@@ -3112,6 +3467,7 @@ const modelsReady = (async () => {
       storedThink = localStorage.getItem("llmchat-think");
       storedWeb = localStorage.getItem("llmchat-web");
       storedTools = localStorage.getItem("llmchat-tools");
+      storedImage = localStorage.getItem("llmchat-image");
     }
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
@@ -3137,6 +3493,9 @@ const modelsReady = (async () => {
   // being the more recent statement of what this person wants
   if (state.search.default_on === true && storedWeb !== "off") state.webMode = "auto";
   state.image = info.image || { enabled: false };
+  state.imageOn = state.image.enabled && state.image.default_on !== false;
+  if (state.image.enabled && (storedImage === "on" || storedImage === "off"))
+    state.imageOn = storedImage === "on";
   state.vision = info.vision || { enabled: false, service: false, max_images: 0, max_bytes: 0 };
   state.tools = info.tools || { enabled: false };
   // the deployment may start the switch on; a stored choice still wins, since
@@ -3144,8 +3503,8 @@ const modelsReady = (async () => {
   state.toolsOn = state.tools.enabled && state.tools.default_on === true;
   if (state.tools.enabled && (storedTools === "on" || storedTools === "off"))
     state.toolsOn = storedTools === "on";
-  // no provider AND no image service: the switch governs nothing
-  if (!state.search.enabled && !state.image.enabled) state.webMode = "off";
+  // no provider: the web switch governs nothing
+  if (!state.search.enabled) state.webMode = "off";
   if (state.gpu === false) {
     if (state.target === "gpu") state.target = "auto";
     cpuChip.classList.add("show");
@@ -3157,6 +3516,7 @@ const modelsReady = (async () => {
   modelLabel.textContent = def ? def.name : "deployment default";
   renderModelMenu();
   updateAttachUI();
+  webNotice();
 })();
 
 // ----------------------------------------------------------------- warmup --
@@ -3221,6 +3581,7 @@ function dismissBoot() {
   bootEl.classList.add("hide");
   setTimeout(() => bootEl.remove(), 450);
   setTimeout(gpuNotice, 550);   // once the overlay is out of the way
+  setTimeout(webNotice, 700);   // ...and the web question after that
 }
 $("bootSkip").addEventListener("click", dismissBoot);
 

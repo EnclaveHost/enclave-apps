@@ -2551,7 +2551,7 @@ struct ChatReq {
     tool_choice: Option<serde_json::Value>,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum WebMode {
     Off,
     /// the model decides, per turn
@@ -3754,6 +3754,7 @@ struct SearchMeta {
 /// better, but it costs a whole extra generate() round trip in front of every
 /// searched turn, and search engines are already built for the messy phrasing
 /// people type. Worth revisiting if hit quality disappoints.
+#[allow(clippy::too_many_arguments)]
 fn apply_web_search(
     cfg: &AppConfig,
     creq: &ChatReq,
