@@ -1,4 +1,4 @@
-package ai.eyesoff.app;
+package host.enclave.shell;
 
 import com.getcapacitor.BridgeActivity;
 

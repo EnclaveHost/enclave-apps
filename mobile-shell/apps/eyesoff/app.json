@@ -5,6 +5,8 @@
   "url": "https://eyesoff.ai",
   "attestationPath": "/attestation",
   "repo": "EnclaveHost/enclave",
+  "icon": "icon.svg",
   "backgroundColor": "#212121",
-  "themeColor": "#212121"
+  "themeColor": "#212121",
+  "iconBackground": "#181242"
 }

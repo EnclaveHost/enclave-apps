@@ -5,7 +5,8 @@
 import { readFileSync } from "node:fs";
 import { verifyApp } from "../src/verify.mjs";
 
-const app = JSON.parse(readFileSync(new URL("../app.config.json", import.meta.url), "utf8"));
+const APP = process.env.APP || "eyesoff";
+const app = JSON.parse(readFileSync(new URL(`../apps/${APP}/app.json`, import.meta.url), "utf8"));
 
 const getJson = async (url) => {
   const r = await fetch(url, { headers: { accept: "application/json" } });

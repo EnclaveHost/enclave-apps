@@ -28,14 +28,31 @@ leg still terminates at the platform relay until in-enclave app TLS ships;
 after that, the shell is where certificate pinning against the attested key
 belongs.
 
-## White-label
+## White-label: one shell, many apps
 
-Everything app-specific lives in `app.config.json` (name, appId, url, pinned
-repo, colors). `npm run build` projects it into `capacitor.config.json` and
-the splash config. A different customer app is a different `app.config.json`
-plus icon art - the shell itself never changes. Store publishing follows the
-Mobile Publisher model: each customer publishes under their **own** developer
-accounts (Apple's template-app rule), with builds produced by CI.
+Every directory under `apps/` is a branded app: an `app.json` (name,
+displayName, appId, url, pinned repo, colors, `icon`) plus its icon file
+(SVG or PNG). `APP=<name> npm run build` stamps that identity into
+everything - the capacitor config, the bundled splash (name, mark, colors),
+the Android applicationId/strings and iOS bundle id/display name
+(`configure.mjs`), and every launcher icon and splash screen
+(`brand.mjs`, rendered from the one icon file). The committed tree carries
+the eyesoff values; CI re-stamps per matrix leg, so **adding a customer app
+is adding a directory**, never editing the shell. The Android code
+namespace stays the neutral `host.enclave.shell` for every app.
+
+CI builds each `apps/*` entry into a signed release APK and, unless the
+app declares `"publish": false`, republishes it to that app's fixed release
+tag - `releases/download/mobile-<name>/<name>.apk` - the stable URL a
+version's `_mobile` config block points the dashboard's "Get the app"
+section at. `apps/demo` is the never-published smoke entry that keeps the
+pipeline honest about genericity.
+
+Store publishing follows the Mobile Publisher model: each customer
+publishes under their **own** developer accounts (Apple's template-app
+rule), with builds produced by CI. Platform-distributed APKs share the
+platform signing key; a customer taking their app to Play gets a fresh
+keystore of their own.
 
 ## Camera
 
