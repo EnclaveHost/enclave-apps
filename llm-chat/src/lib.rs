@@ -1503,8 +1503,23 @@ enum Pushed {
     Stopped,     // a stop string landed; text is truncated at the match
     Gone,        // client disconnected mid-emit
 }
+/// The tokenizer's incremental decoder: one per generation. Replaces the
+/// old whole-history re-decode (tok.decode(&generated) EVERY token - O(n^2)
+/// over a reply, and a full-text stop-string scan on top). The stream hands
+/// back each token's text the moment its bytes complete a character;
+/// partial UTF-8 is withheld by the stream itself, so the old U+FFFD tail
+/// check is gone with the quadratic work.
+type TokStream<'a> = tokenizers::tokenizer::DecodeStream<
+    'a,
+    tokenizers::ModelWrapper,
+    tokenizers::NormalizerWrapper,
+    tokenizers::PreTokenizerWrapper,
+    tokenizers::PostProcessorWrapper,
+    tokenizers::DecoderWrapper,
+>;
+
 struct TextOut<'a> {
-    tok: &'a Tokenizer,
+    stream: TokStream<'a>,
     emit: &'a dyn Fn(&str) -> bool,
     stops: &'a [String],
     holdback: usize,
@@ -1515,30 +1530,43 @@ struct TextOut<'a> {
 impl<'a> TextOut<'a> {
     fn new(tok: &'a Tokenizer, emit: &'a dyn Fn(&str) -> bool, stops: &'a [String]) -> TextOut<'a> {
         TextOut {
-            tok, emit, stops,
+            stream: tok.decode_stream(true), emit, stops,
             holdback: stops.iter().map(|s| s.len()).max().unwrap_or(0),
             generated: Vec::new(), emitted: 0, text: String::new(),
         }
     }
     fn push(&mut self, next: u32) -> Pushed {
         self.generated.push(next);
-        if let Ok(text) = self.tok.decode(&self.generated, true) {
-            if let Some(pos) = self.stops.iter().filter_map(|s| text.find(s.as_str())).min() {
-                self.text = text[..pos].to_string();
-                if pos > self.emitted {
-                    if !(self.emit)(&text[self.emitted..pos]) { return Pushed::Gone; }
-                    self.emitted = pos;
-                }
-                return Pushed::Stopped;
+        let delta = match self.stream.step(next) {
+            Ok(Some(d)) if !d.is_empty() => d,
+            _ => return Pushed::More, // withheld partial char, special token, or a decoder hiccup
+        };
+        // a stop string can only COMPLETE inside (old holdback tail + delta):
+        // scan that window, not the whole reply (backed off to a char boundary)
+        let mut sf = self.text.len().saturating_sub(self.holdback);
+        self.text.push_str(&delta);
+        while sf > 0 && !self.text.is_char_boundary(sf) {
+            sf -= 1;
+        }
+        if let Some(pos) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.text[sf..].find(s.as_str()).map(|p| p + sf))
+            .min()
+        {
+            self.text.truncate(pos);
+            if pos > self.emitted {
+                if !(self.emit)(&self.text[self.emitted..pos]) { return Pushed::Gone; }
+                self.emitted = pos;
             }
-            let visible = text.len().saturating_sub(self.holdback);
-            if !text.ends_with('\u{FFFD}') && visible > self.emitted {
-                if let Some(delta) = text.get(self.emitted..visible) {
-                    if !(self.emit)(delta) { return Pushed::Gone; }
-                    self.emitted = visible;
-                }
+            return Pushed::Stopped;
+        }
+        let visible = self.text.len().saturating_sub(self.holdback);
+        if visible > self.emitted {
+            if let Some(delta) = self.text.get(self.emitted..visible) {
+                if !(self.emit)(delta) { return Pushed::Gone; }
+                self.emitted = visible;
             }
-            self.text = text;
         }
         Pushed::More
     }
