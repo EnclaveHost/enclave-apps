@@ -756,6 +756,21 @@ fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (DraftPlan, Option
 }
 
 const PREFILL_CHUNK: usize = 128;
+
+/// The chunk size prefill actually uses: the host's own ubatch cap when it
+/// exports one (caps value 5), the historical 128 otherwise. Costs one
+/// cheap caps probe per generation on ggml; onnx keeps the constant.
+fn prefill_chunk(sess: &mut Session) -> usize {
+    match sess {
+        Session::Ggml { .. } => sess
+            .caps()
+            .ok()
+            .and_then(|c| c.n_batch)
+            .map(|n| (n as usize).clamp(PREFILL_CHUNK, 2048))
+            .unwrap_or(PREFILL_CHUNK),
+        _ => PREFILL_CHUNK,
+    }
+}
 /// Request-body ceiling. Generous because attachments arrive base64'd INSIDE
 /// the JSON (~1.35x the file), and a vision turn can legitimately carry
 /// several: max_images * max_image_bytes * 1.35 has to fit, plus the
@@ -1235,6 +1250,7 @@ impl Session {
             recurrent: v(1) != 0,
             mtp: data.len() >= 12 && v(2) != 0,
             vision: data.len() >= 16 && v(3) != 0,
+            n_batch: if data.len() >= 20 && v(4) > 0 { Some(v(4) as u32) } else { None },
         })
     }
 
@@ -1428,6 +1444,10 @@ struct Caps {
     recurrent: bool,
     mtp: bool,
     vision: bool,
+    /// the host's real ubatch cap; None on hosts that predate its export.
+    /// Prefill chunks size to it, so a fleet ENCLAVE_GGML_N_BATCH re-save
+    /// delivers fewer, bigger prefill passes with no app change.
+    n_batch: Option<u32>,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -1971,6 +1991,7 @@ fn generate(
         return Err("client disconnected".into());
     }
 
+    let chunk = prefill_chunk(&mut sess);
     // -- prefill. Text goes in chunks so no single logits tensor gets huge;
     // an image goes whole, to the host, which encodes it and splices the
     // result into the sequence at the position the text left off.
@@ -1983,7 +2004,7 @@ fn generate(
             PromptPart::Text(ids) => {
                 let mut done = 0usize;
                 while done < ids.len() {
-                    let end = (done + PREFILL_CHUNK).min(ids.len());
+                    let end = (done + chunk).min(ids.len());
                     // only the very last token of the whole prompt needs logits
                     let last = i == last_part && end == ids.len();
                     let l = sess.feed(cfg, &ids[done..end], last)?;
@@ -2121,10 +2142,12 @@ fn generate_spec(
     let k = dcfg.draft_tokens.clamp(1, 16).min(cfg.draft_tokens.clamp(1, 16));
     let t1 = now_ms();
     // prefill BOTH models on the prompt; only the target's last row is needed
+    let chunk = prefill_chunk(&mut sess);
+    let d_chunk = prefill_chunk(&mut dsess);
     let mut done = 0usize;
     let mut t_logits = Row::dense(Vec::new());
     while done < prompt_ids.len() {
-        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
+        let end = (done + chunk).min(prompt_ids.len());
         let last = end == prompt_ids.len();
         let l = sess.feed(cfg, &prompt_ids[done..end], last)?;
         if last { t_logits = l; }
@@ -2132,7 +2155,7 @@ fn generate_spec(
     }
     done = 0;
     while done < prompt_ids.len() {
-        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
+        let end = (done + d_chunk).min(prompt_ids.len());
         dsess.feed(dcfg, &prompt_ids[done..end], false)?;
         done = end;
     }
@@ -2328,10 +2351,11 @@ fn generate_mtp(
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
     let t1 = now_ms();
+    let chunk = prefill_chunk(&mut sess);
     let mut done = 0usize;
     let mut t_logits = Row::dense(Vec::new());
     while done < prompt_ids.len() {
-        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
+        let end = (done + chunk).min(prompt_ids.len());
         let l = sess.feed_mtp(cfg, &prompt_ids[done..end])?;
         if end == prompt_ids.len() { t_logits = l; }
         done = end;
@@ -2539,10 +2563,11 @@ fn generate_lookup(
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
     let k = cfg.draft_tokens.clamp(1, 16);
     let t1 = now_ms();
+    let chunk = prefill_chunk(&mut sess);
     let mut done = 0usize;
     let mut t_logits = Row::dense(Vec::new());
     while done < prompt_ids.len() {
-        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
+        let end = (done + chunk).min(prompt_ids.len());
         let last = end == prompt_ids.len();
         let l = sess.feed(cfg, &prompt_ids[done..end], last)?;
         if last {
