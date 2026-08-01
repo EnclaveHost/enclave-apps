@@ -1057,8 +1057,23 @@ fn topk_input() -> (String, Tensor) {
 /// verb return nothing and the frame omits the block. One instance serves
 /// one request, so a plain thread_local needs no reset discipline.
 thread_local! {
-    static VERB_TIMING: std::cell::RefCell<std::collections::BTreeMap<&'static str, (u64, u64)>> =
+    static VERB_TIMING: std::cell::RefCell<std::collections::BTreeMap<String, (u64, u64)>> =
         std::cell::RefCell::new(std::collections::BTreeMap::new());
+    /// label prefix for the current phase ("router_" during the routing
+    /// pass), so the done-frame decomposition separates the classifier's
+    /// verbs from the answer's
+    static VERB_PHASE: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") };
+}
+
+struct PhaseGuard;
+fn timing_phase(p: &'static str) -> PhaseGuard {
+    VERB_PHASE.with(|v| *v.borrow_mut() = p);
+    PhaseGuard
+}
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        VERB_PHASE.with(|v| *v.borrow_mut() = "");
+    }
 }
 
 fn timing_input() -> (String, Tensor) {
@@ -1070,9 +1085,10 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
         let d = t.1.data();
         if d.len() >= 4 {
             let us = i32::from_le_bytes([d[0], d[1], d[2], d[3]]).max(0) as u64;
+            let phase = VERB_PHASE.with(|v| *v.borrow());
             VERB_TIMING.with(|m| {
                 let mut m = m.borrow_mut();
-                let e = m.entry(label).or_insert((0, 0));
+                let e = m.entry(format!("{phase}{label}")).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += us;
             });
@@ -1081,7 +1097,7 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
 }
 
 fn timing_snapshot() -> Vec<(String, u64, u64)> {
-    VERB_TIMING.with(|m| m.borrow().iter().map(|(k, v)| (k.to_string(), v.0, v.1)).collect())
+    VERB_TIMING.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), v.0, v.1)).collect())
 }
 
 /// Parse a compute()'s logits outputs into Rows: sparse "topk_ids"/
@@ -3341,11 +3357,13 @@ options, anything where a wrong intermediate step ruins the answer.
         on_status,
         INTERNAL_BUSY_BUDGET_MS,
     );
+    let _phase = timing_phase("router_");
     let Ok(stats) = generate(
         cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &status,
     ) else {
         return RouterOut::default();
     };
+    drop(_phase);
     RouterOut {
         // a rating the model did not give leaves the flat budget in place
         effort: want_effort.then(|| parse_effort(&stats.text)).flatten(),
