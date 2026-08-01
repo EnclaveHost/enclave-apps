@@ -1015,7 +1015,9 @@ impl Session {
                 if want_logits {
                     inputs.push(topk_input());
                 }
+                inputs.push(timing_input());
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
+                note_timing("feed", &outs);
                 if !want_logits {
                     return Ok(Row::dense(Vec::new()));
                 }
@@ -1032,6 +1034,39 @@ const HOST_TOPK: i32 = 256;
 
 fn topk_input() -> (String, Tensor) {
     ("topk".to_string(), Tensor::new(&[1], TensorType::I32, &HOST_TOPK.to_le_bytes()))
+}
+
+/// Per-request wasi-nn verb timing: every compute call asks the host for its
+/// wall time ({"timing":1} -> "elapsed_us"), accumulated per verb label and
+/// reported in the /chat done frame as "verb_us". Hosts that predate the
+/// verb return nothing and the frame omits the block. One instance serves
+/// one request, so a plain thread_local needs no reset discipline.
+thread_local! {
+    static VERB_TIMING: std::cell::RefCell<std::collections::BTreeMap<&'static str, (u64, u64)>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
+}
+
+fn timing_input() -> (String, Tensor) {
+    ("timing".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes()))
+}
+
+fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
+    if let Some(t) = outs.iter().find(|(n, _)| n == "elapsed_us") {
+        let d = t.1.data();
+        if d.len() >= 4 {
+            let us = i32::from_le_bytes([d[0], d[1], d[2], d[3]]).max(0) as u64;
+            VERB_TIMING.with(|m| {
+                let mut m = m.borrow_mut();
+                let e = m.entry(label).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += us;
+            });
+        }
+    }
+}
+
+fn timing_snapshot() -> Vec<(String, u64, u64)> {
+    VERB_TIMING.with(|m| m.borrow().iter().map(|(k, v)| (k.to_string(), v.0, v.1)).collect())
 }
 
 /// Parse a compute()'s logits outputs into Rows: sparse "topk_ids"/
@@ -1159,8 +1194,10 @@ impl Session {
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 topk_input(),
+                timing_input(),
             ])
             .map_err(|e| nn_err("compute", e))?;
+        note_timing("feed_all", &outs);
         rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
 
@@ -1214,8 +1251,10 @@ impl Session {
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("mtp".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 topk_input(),
+                timing_input(),
             ])
             .map_err(|e| nn_err("compute", e))?;
+        note_timing("feed_mtp", &outs);
         let mut rows = rows_from_outs(&outs, 1, cfg.vocab)?;
         Ok(rows.pop().unwrap())
     }
@@ -1239,8 +1278,10 @@ impl Session {
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 ("mtp_for".to_string(), Tensor::new(&[1], TensorType::I32, &real_seq.to_le_bytes())),
                 topk_input(),
+                timing_input(),
             ])
             .map_err(|e| nn_err("compute", e))?;
+        note_timing("feed_all_mtp", &outs);
         rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
 
@@ -1255,11 +1296,12 @@ impl Session {
         bytes.extend_from_slice(&(k as i32).to_le_bytes());
         bytes.extend_from_slice(&p_min_milli.to_le_bytes());
         let outs = ctx
-            .compute(vec![(
-                "mtp_draft".to_string(),
-                Tensor::new(&[3], TensorType::I32, &bytes),
-            )])
+            .compute(vec![
+                ("mtp_draft".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
+                timing_input(),
+            ])
             .map_err(|e| nn_err("mtp_draft", e))?;
+        note_timing("mtp_draft", &outs);
         let draft = outs
             .iter()
             .find(|(n, _)| n == "draft")
@@ -1283,11 +1325,13 @@ impl Session {
         for &t in tokens {
             bytes.extend_from_slice(&(t as i32).to_le_bytes());
         }
-        ctx.compute(vec![(
-            "mtp_accept".to_string(),
-            Tensor::new(&[(1 + tokens.len()) as u32], TensorType::I32, &bytes),
-        )])
-        .map_err(|e| nn_err("mtp_accept", e))?;
+        let outs = ctx
+            .compute(vec![
+                ("mtp_accept".to_string(), Tensor::new(&[(1 + tokens.len()) as u32], TensorType::I32, &bytes)),
+                timing_input(),
+            ])
+            .map_err(|e| nn_err("mtp_accept", e))?;
+        note_timing("mtp_accept", &outs);
         Ok(())
     }
 
@@ -1304,11 +1348,13 @@ impl Session {
         let mut bytes = Vec::with_capacity(8);
         bytes.extend_from_slice(&src_seq.to_le_bytes());
         bytes.extend_from_slice(&(src_fed as i32).to_le_bytes());
-        ctx.compute(vec![(
-            "copy_from".to_string(),
-            Tensor::new(&[2], TensorType::I32, &bytes),
-        )])
-        .map_err(|e| nn_err("copy_from", e))?;
+        let outs = ctx
+            .compute(vec![
+                ("copy_from".to_string(), Tensor::new(&[2], TensorType::I32, &bytes)),
+                timing_input(),
+            ])
+            .map_err(|e| nn_err("copy_from", e))?;
+        note_timing("copy_from", &outs);
         Ok(())
     }
 }
@@ -5363,6 +5409,14 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     }
                     if s.think_forced {
                         done["think_forced"] = serde_json::json!(true);
+                    }
+                    let vt = timing_snapshot();
+                    if !vt.is_empty() {
+                        let mut m = serde_json::Map::new();
+                        for (label, n, us) in vt {
+                            m.insert(label, serde_json::json!({ "n": n, "us": us }));
+                        }
+                        done["verb_us"] = serde_json::Value::Object(m);
                     }
                     if let Some(e) = effort {
                         done["effort"] = serde_json::json!(e.as_str());
