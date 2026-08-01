@@ -1051,11 +1051,11 @@ fn topk_input() -> (String, Tensor) {
     ("topk".to_string(), Tensor::new(&[1], TensorType::I32, &HOST_TOPK.to_le_bytes()))
 }
 
-/// Per-request wasi-nn verb timing: every compute call asks the host for its
-/// wall time ({"timing":1} -> "elapsed_us"), accumulated per verb label and
-/// reported in the /chat done frame as "verb_us". Hosts that predate the
-/// verb return nothing and the frame omits the block. One instance serves
-/// one request, so a plain thread_local needs no reset discipline.
+// Per-request wasi-nn verb timing: every compute call asks the host for its
+// wall time ({"timing":1} -> "elapsed_us"), accumulated per verb label and
+// reported in the /chat done frame as "verb_us". Hosts that predate the
+// verb return nothing and the frame omits the block. One instance serves
+// one request, so a plain thread_local needs no reset discipline.
 thread_local! {
     static VERB_TIMING: std::cell::RefCell<std::collections::BTreeMap<String, (u64, u64)>> =
         std::cell::RefCell::new(std::collections::BTreeMap::new());
@@ -1063,6 +1063,97 @@ thread_local! {
     /// pass), so the done-frame decomposition separates the classifier's
     /// verbs from the answer's
     static VERB_PHASE: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") };
+}
+
+/// The model's tokenizer, from whichever side has it cheapest. Local =
+/// parsed tokenizer.json, the historical path: every fresh instance pays the
+/// multi-MB JSON parse (~535ms of TTFT measured in-fleet). Host = the GGUF's
+/// own tokenizer through the session verbs: prompts encode via "tokenize" on
+/// a short-lived session that lives only through prompt building, and
+/// decoding uses the vocabulary piece table fetched once per request -
+/// detokenization becomes an array lookup. Selected by config `tokenizer`
+/// ("local" default; "host" falls back to Local on any failure).
+enum Tok {
+    Local(Tokenizer),
+    Host {
+        /// encode-side session; drop_enc() empties it before generation so
+        /// the slot frees (all prompt building happens first)
+        enc: std::cell::RefCell<Option<Session>>,
+        /// piece i = pieces[offsets[i] as usize..offsets[i+1] as usize]
+        pieces: Vec<u8>,
+        offsets: Vec<u32>,
+        /// THINK_CLOSE_TEXT ids, precomputed while the enc session lives
+        think_close: Vec<u32>,
+    },
+}
+
+impl Tok {
+    fn encode_ids(&self, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
+        match self {
+            Tok::Local(t) => t
+                .encode(text, add_special)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| format!("tokenize: {e}")),
+            Tok::Host { enc, .. } => {
+                let mut b = enc.borrow_mut();
+                let sess = b
+                    .as_mut()
+                    .ok_or("host tokenizer: encode requested after the prompt phase")?;
+                sess.tokenize(text)
+            }
+        }
+    }
+    fn think_close_ids(&self) -> Vec<u32> {
+        match self {
+            Tok::Local(t) => t
+                .encode(THINK_CLOSE_TEXT, false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default(),
+            Tok::Host { think_close, .. } => think_close.clone(),
+        }
+    }
+    /// free the encode session's slot; prompt building is over
+    fn drop_enc(&self) {
+        if let Tok::Host { enc, .. } = self {
+            *enc.borrow_mut() = None;
+        }
+    }
+}
+
+/// Build the request's tokenizer per config `tokenizer`. "host" opens a
+/// session, checks caps, pulls the piece table and precomputes the think
+/// close - any failure falls back to the parsed tokenizer.json.
+fn make_tok(cfg: &AppConfig, mode: &str, since: u128) -> Result<Tok, String> {
+    if cfg.tokenizer == "host" {
+        if let Some(&(target, _)) = targets_for(cfg, mode).first() {
+            if let Ok(mut sess) = Session::open(cfg, target) {
+                let r = (|| -> Result<(Vec<u8>, Vec<u32>, Vec<u32>), String> {
+                    let caps = sess.caps()?;
+                    if !caps.host_tok {
+                        return Err("host predates the tokenizer verbs".into());
+                    }
+                    let (pieces, offsets) = sess.vocab_pieces()?;
+                    let think_close = sess.tokenize(THINK_CLOSE_TEXT)?;
+                    Ok((pieces, offsets, think_close))
+                })();
+                if let Ok((pieces, offsets, think_close)) = r {
+                    let _ = init_note("tok_host", since);
+                    return Ok(Tok::Host {
+                        enc: std::cell::RefCell::new(Some(sess)),
+                        pieces,
+                        offsets,
+                        think_close,
+                    });
+                }
+            }
+        }
+        // fall through: local
+    }
+    let bytes = read_tokenizer(cfg)?;
+    let t2 = init_note("tok_read", since);
+    let t = Tokenizer::from_bytes(&bytes).map_err(|e| format!("tokenizer: {e}"))?;
+    let _ = init_note("tok_parse", t2);
+    Ok(Tok::Local(t))
 }
 
 thread_local! {
@@ -1279,6 +1370,7 @@ impl Session {
             mtp: data.len() >= 12 && v(2) != 0,
             vision: data.len() >= 16 && v(3) != 0,
             n_batch: if data.len() >= 20 && v(4) > 0 { Some(v(4) as u32) } else { None },
+            host_tok: data.len() >= 24 && v(5) != 0,
         })
     }
 
@@ -1379,6 +1471,66 @@ impl Session {
         Ok(())
     }
 
+    /// ggml only: the GGUF's own tokenizer (parse_special on - template
+    /// markers map to their single special ids)
+    fn tokenize(&mut self, text: &str) -> Result<Vec<u32>, String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("host tokenization needs the ggml backend".into());
+        };
+        let outs = ctx
+            .compute(vec![
+                ("tokenize".to_string(), Tensor::new(&[text.len() as u32], TensorType::U8, text.as_bytes())),
+                timing_input(),
+            ])
+            .map_err(|e| nn_err("tokenize", e))?;
+        note_timing("tokenize", &outs);
+        let ids = outs
+            .iter()
+            .find(|(n, _)| n == "ids")
+            .ok_or("host returned no \"ids\" output (toolchain predates the host tokenizer)")?;
+        Ok(ids
+            .1
+            .data()
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect())
+    }
+
+    /// ggml only: the whole vocabulary's raw byte pieces (one ~2-3MB copy
+    /// per request replaces the guest tokenizer for decoding entirely)
+    fn vocab_pieces(&mut self) -> Result<(Vec<u8>, Vec<u32>), String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("host tokenization needs the ggml backend".into());
+        };
+        let outs = ctx
+            .compute(vec![
+                ("vocab_pieces".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+                timing_input(),
+            ])
+            .map_err(|e| nn_err("vocab_pieces", e))?;
+        note_timing("vocab_pieces", &outs);
+        let bytes = outs
+            .iter()
+            .find(|(n, _)| n == "bytes")
+            .ok_or("host returned no \"bytes\" output")?
+            .1
+            .data()
+            .to_vec();
+        let offsets: Vec<u32> = outs
+            .iter()
+            .find(|(n, _)| n == "offsets")
+            .ok_or("host returned no \"offsets\" output")?
+            .1
+            .data()
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]).max(0) as u32)
+            .collect();
+        if offsets.len() < 2 || offsets.last().copied().unwrap_or(0) as usize != bytes.len() {
+            return Err("host returned a malformed piece table".into());
+        }
+        Ok((bytes, offsets))
+    }
+
     /// ggml only: make THIS session an exact branch of `src_seq` (a sibling
     /// session on the same graph, at `src_fed` fed tokens). Attention KV is
     /// shared cells; recurrent state is copy-on-write - branching is free
@@ -1476,6 +1628,8 @@ struct Caps {
     /// Prefill chunks size to it, so a fleet ENCLAVE_GGML_N_BATCH re-save
     /// delivers fewer, bigger prefill passes with no app change.
     n_batch: Option<u32>,
+    /// the host exports its GGUF tokenizer ("tokenize"/"vocab_pieces")
+    host_tok: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -1612,8 +1766,44 @@ type TokStream<'a> = tokenizers::tokenizer::DecodeStream<
     tokenizers::DecoderWrapper,
 >;
 
+/// The decode side of a Tok: an incremental tokenizer stream (Local) or the
+/// piece table with UTF-8 withholding done by hand (Host - a piece can end
+/// mid-character; bytes wait in `pending` until they complete one).
+enum Detok<'a> {
+    Stream(TokStream<'a>),
+    Table { pieces: &'a [u8], offsets: &'a [u32], pending: Vec<u8> },
+}
+
+impl<'a> Detok<'a> {
+    fn step(&mut self, next: u32) -> Option<String> {
+        match self {
+            Detok::Stream(st) => match st.step(next) {
+                Ok(Some(d)) if !d.is_empty() => Some(d),
+                _ => None,
+            },
+            Detok::Table { pieces, offsets, pending } => {
+                let i = next as usize;
+                if i + 1 < offsets.len() {
+                    let (a, b) = (offsets[i] as usize, offsets[i + 1] as usize);
+                    pending.extend_from_slice(&pieces[a..b]);
+                }
+                let valid = match std::str::from_utf8(pending) {
+                    Ok(_) => pending.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid == 0 {
+                    return None;
+                }
+                let out = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                pending.drain(..valid);
+                Some(out)
+            }
+        }
+    }
+}
+
 struct TextOut<'a> {
-    stream: TokStream<'a>,
+    detok: Detok<'a>,
     emit: &'a dyn Fn(&str) -> bool,
     stops: &'a [String],
     holdback: usize,
@@ -1622,18 +1812,24 @@ struct TextOut<'a> {
     text: String,
 }
 impl<'a> TextOut<'a> {
-    fn new(tok: &'a Tokenizer, emit: &'a dyn Fn(&str) -> bool, stops: &'a [String]) -> TextOut<'a> {
+    fn new(tok: &'a Tok, emit: &'a dyn Fn(&str) -> bool, stops: &'a [String]) -> TextOut<'a> {
+        let detok = match tok {
+            Tok::Local(t) => Detok::Stream(t.decode_stream(true)),
+            Tok::Host { pieces, offsets, .. } => {
+                Detok::Table { pieces, offsets, pending: Vec::new() }
+            }
+        };
         TextOut {
-            stream: tok.decode_stream(true), emit, stops,
+            detok, emit, stops,
             holdback: stops.iter().map(|s| s.len()).max().unwrap_or(0),
             generated: Vec::new(), emitted: 0, text: String::new(),
         }
     }
     fn push(&mut self, next: u32) -> Pushed {
         self.generated.push(next);
-        let delta = match self.stream.step(next) {
-            Ok(Some(d)) if !d.is_empty() => d,
-            _ => return Pushed::More, // withheld partial char, special token, or a decoder hiccup
+        let delta = match self.detok.step(next) {
+            Some(d) => d,
+            None => return Pushed::More, // withheld partial char, special token, or a decoder hiccup
         };
         // a stop string can only COMPLETE inside (old holdback tail + delta):
         // scan that window, not the whole reply (backed off to a char boundary)
@@ -1801,16 +1997,10 @@ struct ThinkGuard {
 }
 
 impl ThinkGuard {
-    fn new(budget: usize, think_open: bool, tok: &Tokenizer) -> ThinkGuard {
+    fn new(budget: usize, think_open: bool, tok: &Tok) -> ThinkGuard {
         // a tokenizer that cannot produce the closing tag leaves the guard
         // off: a close we cannot write is better than a mangled reply
-        let close = if think_open {
-            tok.encode(THINK_CLOSE_TEXT, false)
-                .map(|e| e.get_ids().to_vec())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let close = if think_open { tok.think_close_ids() } else { Vec::new() };
         ThinkGuard {
             budget,
             open: !close.is_empty(),
@@ -1894,7 +2084,7 @@ impl ThinkGuard {
 /// falls back to plain decode with a status note.
 fn generate(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     prompt: &Prompt,
     target: ExecutionTarget,
     tname: &str,
@@ -2156,7 +2346,7 @@ fn generate(
 fn generate_spec(
     cfg: &AppConfig,
     dcfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     prompt_ids: &[u32],
     tname: &str,
     p: &GenParams,
@@ -2363,7 +2553,7 @@ fn generate_spec(
 #[allow(clippy::too_many_arguments)]
 fn generate_mtp(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     prompt_ids: &[u32],
     tname: &str,
     p: &GenParams,
@@ -2578,7 +2768,7 @@ const LOOKUP_NGRAM_MAX: usize = 6;
 #[allow(clippy::too_many_arguments)]
 fn generate_lookup(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     prompt_ids: &[u32],
     tname: &str,
     p: &GenParams,
@@ -3198,7 +3388,7 @@ struct RouterOut {
 
 fn route_web_search(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     messages: &[ChatMsg],
     mode: &str,
     ask: RouterAsk,
@@ -3840,7 +4030,7 @@ fn tools_enabled<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> Option<&'a tools::To
 /// with this error" names nothing, and the reply that follows names it exactly.
 fn make_title(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     question: &str,
     answer: &str,
     mode: &str,
@@ -4193,7 +4383,7 @@ fn vision_meta_json(m: &VisionMeta) -> serde_json::Value {
 /// losing the turn.
 fn author_vision_query(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     messages: &[ChatMsg],
     mode: &str,
     on_status: &dyn Fn(&str),
@@ -4314,7 +4504,7 @@ fn apply_vision(
     cfg: &AppConfig,
     creq: &ChatReq,
     messages: &mut [ChatMsg],
-    tok: &Tokenizer,
+    tok: &Tok,
     target_mode: &str,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<VisionMeta>, String> {
@@ -4412,7 +4602,7 @@ fn apply_web_search(
     cfg: &AppConfig,
     creq: &ChatReq,
     messages: &mut Vec<ChatMsg>,
-    tok: &Tokenizer,
+    tok: &Tok,
     target_mode: &str,
     image_out: &mut Option<image::GeneratedImage>,
     // the reasoning rating, when this turn wants one: it rides OUT of here
@@ -4760,7 +4950,7 @@ nothing executes it, and the user sees the fake call instead of an answer.";
 
 fn build_prompt(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     messages: &[ChatMsg],
     thinking: bool, // the request's switch; only cfg.thinking models act on it
     caps: Capabilities,
@@ -4858,9 +5048,9 @@ fn build_prompt(
 
 /// How many tokens a rendered prompt costs, media marks excluded (they are
 /// punctuation for the splitter, not text for the model).
-fn tokens_of(tok: &Tokenizer, rendered: &str) -> Result<usize, String> {
+fn tokens_of(tok: &Tok, rendered: &str) -> Result<usize, String> {
     let text = rendered.replace(config::MEDIA_MARK, "");
-    Ok(tok.encode(text.as_str(), true).map_err(|e| format!("tokenize: {e}"))?.len())
+    Ok(tok.encode_ids(text.as_str(), true)?.len())
 }
 
 /// Cut the rendered prompt at its media marks and tokenize the text between
@@ -4868,7 +5058,7 @@ fn tokens_of(tok: &Tokenizer, rendered: &str) -> Result<usize, String> {
 /// same as a whole prompt would: later runs continue a sequence that already
 /// began, so re-adding a BOS at each image would corrupt it.
 fn split_rendered(
-    tok: &Tokenizer,
+    tok: &Tok,
     rendered: &str,
     images: Vec<Vec<u8>>,
 ) -> Result<Prompt, String> {
@@ -4885,10 +5075,7 @@ fn split_rendered(
     let mut imgs = images.into_iter();
     for (i, chunk) in chunks.iter().enumerate() {
         if !chunk.is_empty() {
-            let enc = tok
-                .encode(*chunk, i == 0)
-                .map_err(|e| format!("tokenize: {e}"))?;
-            let ids = enc.get_ids().to_vec();
+            let ids = tok.encode_ids(*chunk, i == 0)?;
             if !ids.is_empty() {
                 text_ids.extend_from_slice(&ids);
                 parts.push(PromptPart::Text(ids));
@@ -4917,7 +5104,7 @@ fn strip_marks(s: &str) -> String {
 /// in charge, which is the behaviour every deployment had before this existed.
 fn resolve_effort(
     cfg: &AppConfig,
-    tok: &Tokenizer,
+    tok: &Tok,
     messages: &[ChatMsg],
     mode: &str,
     think_open: bool,
@@ -5166,9 +5353,8 @@ fn handle_title(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutp
         .find(|m| m.role == "assistant")
         .map(|m| m.content.clone())
         .unwrap_or_default();
-    let title = read_tokenizer(cfg)
+    let title = make_tok(cfg, "auto", now_ms())
         .ok()
-        .and_then(|b| Tokenizer::from_bytes(&b).ok())
         .and_then(|tok| make_title(cfg, &tok, &question, &answer, "auto"));
     let body = serde_json::json!({ "title": title });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
@@ -5194,16 +5380,10 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     if let Err(e) = check_images(raw, cfg, &creq.messages) {
         return json_err(out, 400, &e);
     }
-    let tok_bytes = match read_tokenizer(cfg) {
-        Ok(b) => b,
+    let tok = match make_tok(cfg, "auto", t1) {
+        Ok(t) => t,
         Err(e) => return json_err(out, 500, &e),
     };
-    let t2 = init_note("tok_read", t1);
-    let tok = match Tokenizer::from_bytes(&tok_bytes) {
-        Ok(t) => t,
-        Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
-    };
-    let _ = init_note("tok_parse", t2);
     // The SSE stream opens BEFORE the search leg, because in auto mode that
     // leg can run a router generation and then a provider round trip - several
     // seconds in which a silent "Preparing…" is all the user would see. With
@@ -5345,6 +5525,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         };
         let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
         let params = gen_params(cfg, &creq, stops, think_open, effort);
+        tok.drop_enc(); // prompt building is over; free the encode slot
         for (i, (target, tname)) in targets_for(cfg, mode).iter().enumerate() {
             if i > 0 && !send(serde_json::json!({ "notice": format!("gpu failed ({last_err}); retrying on cpu") })) {
                 break;
@@ -5555,13 +5736,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     if let Err(e) = check_images(raw, cfg, &creq.messages) {
         return json_err(out, 400, &e);
     }
-    let tok_bytes = match read_tokenizer(cfg) {
-        Ok(b) => b,
-        Err(e) => return json_err(out, 500, &e),
-    };
-    let tok = match Tokenizer::from_bytes(&tok_bytes) {
+    let tok = match make_tok(cfg, "auto", now_ms()) {
         Ok(t) => t,
-        Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
+        Err(e) => return json_err(out, 500, &e),
     };
     // `"web_search": true` is an Enclave extension to the OpenAI body, so API
     // clients get the same retrieval the built-in UI does. Sources come back
@@ -5715,6 +5892,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let effort =
             resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
         let params = gen_params(cfg, &creq, stops, think_open, effort);
+        tok.drop_enc(); // prompt building is over; free the encode slot
         for (target, tname) in targets_for(cfg, mode).iter() {
             // re-emit the prompt-side think opening ahead of the first real
             // delta (see handle_chat) so clients receive a complete block
@@ -5865,6 +6043,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         think_open = opened;
         effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
         params = gen_params(cfg, &creq, stops, think_open, effort);
+        tok.drop_enc(); // prompt building is over; free the encode slot
         for (target, tname) in targets_for(cfg, mode).iter() {
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &sink, &sink) {
                 Ok(s) => {
