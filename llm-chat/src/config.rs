@@ -170,7 +170,12 @@ pub struct AppConfig {
     #[serde(default = "default_draft_tokens")]
     pub draft_tokens: usize,
     /// "mtp" drafts only: minimum head confidence to keep proposing
-    /// (0.05..=0.95; default 0.4 - lower = longer, riskier drafts)
+    /// (0.0..=0.95; default 0.4 - lower = longer, riskier drafts). 0 means
+    /// ALWAYS draft the full `draft_tokens`: the engine skips the confidence
+    /// softmax outright, and constant-length drafts keep every verify pass
+    /// the same ubatch shape so the CUDA backend can keep replaying its
+    /// captured graph instead of re-warming (the launch-latency win that
+    /// makes speculation beat plain decode).
     #[serde(default = "default_draft_p_min")]
     pub draft_p_min: f32,
     /// WEB SEARCH: absent (the default) means the app never makes an outbound

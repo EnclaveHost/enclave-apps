@@ -2206,7 +2206,7 @@ fn generate_mtp(
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
     let k = cfg.draft_tokens.clamp(1, 16);
-    let p_min_milli = (cfg.draft_p_min.clamp(0.05, 0.95) * 1000.0) as i32;
+    let p_min_milli = (cfg.draft_p_min.clamp(0.0, 0.95) * 1000.0) as i32;
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
     let t1 = now_ms();
