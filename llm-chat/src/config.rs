@@ -150,6 +150,12 @@ pub struct AppConfig {
     pub model_file: Option<String>,
     #[serde(default)]
     pub tokenizer_file: Option<String>,
+    /// "local" (default) parses tokenizer.json in the guest; "host" uses the
+    /// GGUF's own tokenizer through the session verbs (encode + piece table),
+    /// skipping the multi-MB parse every fresh instance pays - falls back to
+    /// local on hosts that predate the verbs.
+    #[serde(default = "default_tokenizer")]
+    pub tokenizer: String,
     /// SPECULATIVE DECODING: what proposes tokens for this model to verify.
     /// The special value "mtp" uses the model's OWN trained multi-token-
     /// prediction head (an *-MTP GGUF variant; near-zero proposal cost, no
@@ -311,6 +317,9 @@ fn default_repeat_guard() -> usize {
     4
 }
 
+fn default_tokenizer() -> String {
+    "local".into()
+}
 fn default_draft_tokens() -> usize {
     8
 }
