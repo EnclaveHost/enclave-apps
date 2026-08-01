@@ -214,7 +214,7 @@ use bindings::wasi::nn::inference::GraphExecutionContext;
 use bindings::wasi::nn::tensor::{Tensor, TensorType};
 
 use config::AppConfig;
-use sampling::{pick_token, Rng, SampleParams};
+use sampling::{pick_row, Rng, Row, SampleParams};
 
 static CHAT_HTML: &str = include_str!("chat.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
@@ -997,45 +997,98 @@ impl Session {
     }
 
     /// Feed `ids`; with `want_logits`, return the LAST token's logits row.
-    fn feed(&mut self, cfg: &AppConfig, ids: &[u32], want_logits: bool) -> Result<Vec<f32>, String> {
+    fn feed(&mut self, cfg: &AppConfig, ids: &[u32], want_logits: bool) -> Result<Row, String> {
         match self {
             Session::Onnx { ctx, past, total } => {
                 let ids64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
                 let r = step(cfg, ctx, &ids64, std::mem::take(past), *total, want_logits)?;
                 *past = r.past;
                 *total += ids.len();
-                Ok(r.logits)
+                Ok(Row::dense(r.logits))
             }
             Session::Ggml { ctx } => {
                 let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-                let outs = ctx
-                    .compute(vec![(
-                        "tokens".to_string(),
-                        Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes),
-                    )])
-                    .map_err(|e| nn_err("compute", e))?;
+                let mut inputs = vec![(
+                    "tokens".to_string(),
+                    Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes),
+                )];
+                if want_logits {
+                    inputs.push(topk_input());
+                }
+                let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
                 if !want_logits {
-                    return Ok(Vec::new());
+                    return Ok(Row::dense(Vec::new()));
                 }
-                let logits = outs
-                    .iter()
-                    .find(|(n, _)| n == "logits")
-                    .ok_or("ggml backend returned no \"logits\" output")?;
-                let data = logits.1.data();
-                if data.len() != cfg.vocab * 4 {
-                    return Err(format!(
-                        "ggml logits are {} bytes, config vocab says {} - wrong model_volume for this config?",
-                        data.len(),
-                        cfg.vocab * 4
-                    ));
-                }
-                Ok(data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect())
+                let mut rows = rows_from_outs(&outs, 1, cfg.vocab)?;
+                Ok(rows.pop().unwrap())
             }
         }
     }
+}
+
+/// candidates per row the host keeps when asked to reduce logits (the
+/// "topk" verb); 256 comfortably covers the sampler's top_k <= 256 bound
+const HOST_TOPK: i32 = 256;
+
+fn topk_input() -> (String, Tensor) {
+    ("topk".to_string(), Tensor::new(&[1], TensorType::I32, &HOST_TOPK.to_le_bytes()))
+}
+
+/// Parse a compute()'s logits outputs into Rows: sparse "topk_ids"/
+/// "topk_logits" when the host knows the topk verb, dense "logits" from
+/// hosts that predate it (the request input is simply ignored there).
+fn rows_from_outs(
+    outs: &[(String, Tensor)],
+    n_rows: usize,
+    vocab: usize,
+) -> Result<Vec<Row>, String> {
+    if let (Some(ti), Some(tv)) = (
+        outs.iter().find(|(n, _)| n == "topk_ids"),
+        outs.iter().find(|(n, _)| n == "topk_logits"),
+    ) {
+        let idata = ti.1.data();
+        let vdata = tv.1.data();
+        if n_rows == 0 || idata.len() != vdata.len() || idata.len() % (n_rows * 4) != 0 {
+            return Err("host returned malformed topk rows".into());
+        }
+        let per = idata.len() / n_rows;
+        let mut rows = Vec::with_capacity(n_rows);
+        for r in 0..n_rows {
+            let ids: Vec<u32> = idata[r * per..(r + 1) * per]
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+                .collect();
+            let vals: Vec<f32> = vdata[r * per..(r + 1) * per]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            rows.push(Row { ids: Some(ids), vals });
+        }
+        return Ok(rows);
+    }
+    let logits = outs
+        .iter()
+        .find(|(n, _)| n == "logits")
+        .ok_or("ggml backend returned no \"logits\" output")?;
+    let data = logits.1.data();
+    let row = vocab * 4;
+    if data.len() != row * n_rows {
+        return Err(format!(
+            "expected {} logit rows of {} bytes, got {} bytes - wrong model_volume \
+             for this config, or the host predates per-position logits?",
+            n_rows, row, data.len()
+        ));
+    }
+    Ok(data
+        .chunks_exact(row)
+        .map(|r| {
+            Row::dense(
+                r.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )
+        })
+        .collect())
 }
 
 impl Session {
@@ -1096,7 +1149,7 @@ impl Session {
     /// ggml only: feed `ids` and get EVERY position's logits row back
     /// (dims [n, vocab]) - the speculative verify pass: the target consumes
     /// the draft's proposals in ONE forward pass.
-    fn feed_all(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+    fn feed_all(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Vec<Row>, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1105,25 +1158,10 @@ impl Session {
             .compute(vec![
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+                topk_input(),
             ])
             .map_err(|e| nn_err("compute", e))?;
-        let logits = outs
-            .iter()
-            .find(|(n, _)| n == "logits")
-            .ok_or("ggml backend returned no \"logits\" output")?;
-        let data = logits.1.data();
-        let row = cfg.vocab * 4;
-        if data.len() != row * ids.len() {
-            return Err(format!(
-                "expected {} logit rows of {} bytes, got {} bytes - the host predates \
-                 speculative decoding? (per-position logits need the spec toolchain)",
-                ids.len(), row, data.len()
-            ));
-        }
-        Ok(data
-            .chunks_exact(row)
-            .map(|r| r.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-            .collect())
+        rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
 
     /// ggml only: this session's capabilities - (seq_id, recurrent, mtp,
@@ -1166,7 +1204,7 @@ impl Session {
     /// ggml only: MTP-aware feed of this sequence - the host runs an
     /// all-positions pass, mirrors every position into the model's own MTP
     /// head, and returns only the LAST logits row. The speculative prefill.
-    fn feed_mtp(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Vec<f32>, String> {
+    fn feed_mtp(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Row, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1175,24 +1213,11 @@ impl Session {
             .compute(vec![
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("mtp".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+                topk_input(),
             ])
             .map_err(|e| nn_err("compute", e))?;
-        let logits = outs
-            .iter()
-            .find(|(n, _)| n == "logits")
-            .ok_or("ggml backend returned no \"logits\" output")?;
-        let data = logits.1.data();
-        if data.len() != cfg.vocab * 4 {
-            return Err(format!(
-                "mtp feed returned {} bytes, config vocab says {}",
-                data.len(),
-                cfg.vocab * 4
-            ));
-        }
-        Ok(data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+        let mut rows = rows_from_outs(&outs, 1, cfg.vocab)?;
+        Ok(rows.pop().unwrap())
     }
 
     /// ggml only: verify pass that ALSO harvests the target's MTP hidden
@@ -1203,7 +1228,7 @@ impl Session {
         cfg: &AppConfig,
         ids: &[u32],
         real_seq: i32,
-    ) -> Result<Vec<Vec<f32>>, String> {
+    ) -> Result<Vec<Row>, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1213,24 +1238,10 @@ impl Session {
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 ("mtp_for".to_string(), Tensor::new(&[1], TensorType::I32, &real_seq.to_le_bytes())),
+                topk_input(),
             ])
             .map_err(|e| nn_err("compute", e))?;
-        let logits = outs
-            .iter()
-            .find(|(n, _)| n == "logits")
-            .ok_or("ggml backend returned no \"logits\" output")?;
-        let data = logits.1.data();
-        let row = cfg.vocab * 4;
-        if data.len() != row * ids.len() {
-            return Err(format!(
-                "expected {} logit rows of {} bytes, got {} bytes",
-                ids.len(), row, data.len()
-            ));
-        }
-        Ok(data
-            .chunks_exact(row)
-            .map(|r| r.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-            .collect())
+        rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
 
     /// ggml only: the model's own MTP head proposes up to k tokens (greedy,
@@ -1890,7 +1901,7 @@ fn generate(
     // an image goes whole, to the host, which encodes it and splices the
     // result into the sequence at the position the text left off.
     let t1 = now_ms();
-    let mut logits = Vec::new();
+    let mut logits = Row::dense(Vec::new());
     let mut image_pos = 0usize;
     let last_part = prompt.parts.len().saturating_sub(1);
     for (i, part) in prompt.parts.iter().enumerate() {
@@ -1919,7 +1930,7 @@ fn generate(
             }
         }
     }
-    if logits.is_empty() {
+    if logits.vals.is_empty() {
         // A prompt whose last part is an image: nothing sampled a row yet. The
         // templates all end an assistant turn's opening with text, so this
         // means the render went wrong rather than the model.
@@ -1939,7 +1950,7 @@ fn generate(
     let mut finish: &'static str = "stop";
     loop {
         let recent = out.recent(prompt_ids, p.sample.rep_window);
-        let next = pick_token(&mut logits, &recent, &p.sample, &mut rng);
+        let next = pick_row(&mut logits, &recent, &p.sample, &mut rng);
         if cfg.eos.contains(&next) {
             break;
         }
@@ -2037,7 +2048,7 @@ fn generate_spec(
     let t1 = now_ms();
     // prefill BOTH models on the prompt; only the target's last row is needed
     let mut done = 0usize;
-    let mut t_logits = Vec::new();
+    let mut t_logits = Row::dense(Vec::new());
     while done < prompt_ids.len() {
         let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
         let last = end == prompt_ids.len();
@@ -2068,7 +2079,7 @@ fn generate_spec(
 
     // the first token comes straight off the target's prefill row
     let recent = out.recent(prompt_ids, p.sample.rep_window);
-    let mut pending = pick_token(&mut t_logits, &recent, &p.sample, &mut rng);
+    let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
     'outer: loop {
         if cfg.eos.contains(&pending) { break; }
         if out.generated.len() >= p.max_new { finish = "length"; break; }
@@ -2110,7 +2121,7 @@ fn generate_spec(
             t_fed += ids.len();
             d_behind.extend_from_slice(&ids);
             let recent = out.recent(prompt_ids, p.sample.rep_window);
-            pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut row, &recent, &p.sample, &mut rng);
             continue 'outer;
         }
         // -- catch the draft's REAL sequence up on accepted history (its
@@ -2127,7 +2138,7 @@ fn generate_spec(
             let mut rec = out.recent(prompt_ids, p.sample.rep_window);
             rec.extend_from_slice(&drafts);
             let rec = rec[rec.len().saturating_sub(p.sample.rep_window)..].to_vec();
-            let d = pick_token(&mut d_row, &rec, &p.sample, &mut rng);
+            let d = pick_row(&mut d_row, &rec, &p.sample, &mut rng);
             drafts.push(d);
             if i + 1 < k {
                 d_row = dscr.feed(dcfg, &[d], true)?;
@@ -2150,7 +2161,7 @@ fn generate_spec(
         let mut replacement: Option<u32> = None;
         for (i, &d) in drafts.iter().enumerate() {
             let recent = out.recent(prompt_ids, p.sample.rep_window);
-            let expect = pick_token(&mut rows[i], &recent, &p.sample, &mut rng);
+            let expect = pick_row(&mut rows[i], &recent, &p.sample, &mut rng);
             if expect != d {
                 replacement = Some(expect);
                 break;
@@ -2202,7 +2213,7 @@ fn generate_spec(
             d_fed = dscr_fed;
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
-            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
             d_behind.push(drafts[drafts.len() - 1]);
         }
     }
@@ -2244,7 +2255,7 @@ fn generate_mtp(
     //    mirrored into the head, only last-row logits cross to the guest
     let t1 = now_ms();
     let mut done = 0usize;
-    let mut t_logits = Vec::new();
+    let mut t_logits = Row::dense(Vec::new());
     while done < prompt_ids.len() {
         let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
         let l = sess.feed_mtp(cfg, &prompt_ids[done..end])?;
@@ -2264,7 +2275,7 @@ fn generate_mtp(
     let mut t_fed = prompt_ids.len();
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
-    let mut pending = pick_token(&mut t_logits, &recent, &p.sample, &mut rng);
+    let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
     'outer: loop {
         if cfg.eos.contains(&pending) { break; }
         if out.generated.len() >= p.max_new { finish = "length"; break; }
@@ -2310,7 +2321,7 @@ fn generate_mtp(
             t_fed = tscr_fed;
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
-            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
             continue 'outer;
         }
         // -- the head proposes (0..=k tokens; an empty draft still verifies
@@ -2330,7 +2341,7 @@ fn generate_mtp(
         let mut replacement: Option<u32> = None;
         for (i, &d) in drafts.iter().enumerate() {
             let recent = out.recent(prompt_ids, p.sample.rep_window);
-            let expect = pick_token(&mut rows[i], &recent, &p.sample, &mut rng);
+            let expect = pick_row(&mut rows[i], &recent, &p.sample, &mut rng);
             if expect != d {
                 replacement = Some(expect);
                 break;
@@ -2373,7 +2384,7 @@ fn generate_mtp(
             t_fed = tscr_fed;
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
-            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
         }
     }
     out.flush();
@@ -2424,9 +2435,11 @@ fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> 
 }
 
 /// tokens of trailing context that must match history before lookup proposes
-/// (tried longest-first from LOOKUP_NGRAM_MAX down to LOOKUP_NGRAM)
-const LOOKUP_NGRAM: usize = 3;
-const LOOKUP_NGRAM_MAX: usize = 5;
+/// (tried longest-first from LOOKUP_NGRAM_MAX down to LOOKUP_NGRAM). The
+/// 2026-08-01 GPU matrix put 3-gram misfire acceptance at ~6-7%, pure round
+/// tax - only well-anchored matches are worth a verify round.
+const LOOKUP_NGRAM: usize = 5;
+const LOOKUP_NGRAM_MAX: usize = 6;
 
 /// Prompt-lookup speculative decode: the branch-commit loop with n-gram
 /// matches against the conversation as the proposer - no draft model, no
@@ -2453,7 +2466,7 @@ fn generate_lookup(
     let k = cfg.draft_tokens.clamp(1, 16);
     let t1 = now_ms();
     let mut done = 0usize;
-    let mut t_logits = Vec::new();
+    let mut t_logits = Row::dense(Vec::new());
     while done < prompt_ids.len() {
         let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
         let last = end == prompt_ids.len();
@@ -2476,7 +2489,7 @@ fn generate_lookup(
     let mut t_fed = prompt_ids.len();
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
-    let mut pending = pick_token(&mut t_logits, &recent, &p.sample, &mut rng);
+    let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
     'outer: loop {
         if cfg.eos.contains(&pending) { break; }
         if out.generated.len() >= p.max_new { finish = "length"; break; }
@@ -2513,7 +2526,7 @@ fn generate_lookup(
             let mut row = sess.feed(cfg, &ids, true)?;
             t_fed += ids.len();
             let recent = out.recent(prompt_ids, p.sample.rep_window);
-            pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut row, &recent, &p.sample, &mut rng);
             continue 'outer;
         }
         // -- history proposes, longest context first (a 5-gram match predicts
@@ -2530,7 +2543,7 @@ fn generate_lookup(
             let mut row = sess.feed(cfg, &[pending], true)?;
             t_fed += 1;
             let recent = out.recent(prompt_ids, p.sample.rep_window);
-            pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut row, &recent, &p.sample, &mut rng);
             continue 'outer;
         }
         drafted += drafts.len();
@@ -2546,7 +2559,7 @@ fn generate_lookup(
         let mut replacement: Option<u32> = None;
         for (i, &d) in drafts.iter().enumerate() {
             let recent = out.recent(prompt_ids, p.sample.rep_window);
-            let expect = pick_token(&mut rows[i], &recent, &p.sample, &mut rng);
+            let expect = pick_row(&mut rows[i], &recent, &p.sample, &mut rng);
             if expect != d {
                 replacement = Some(expect);
                 break;
@@ -2588,7 +2601,7 @@ fn generate_lookup(
             t_fed = tscr_fed;
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
-            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
+            pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
         }
     }
     out.flush();
