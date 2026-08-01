@@ -108,3 +108,90 @@ pub fn pick_token(logits: &mut [f32], recent: &[u32], p: &SampleParams, rng: &mu
     }
     cand[0].0 as u32
 }
+
+/// A logits row as the host returned it: dense (full vocab, index = token
+/// id) or sparse (the host's top-K - ids + values, rows sorted descending).
+/// Sparse rows exist because shipping a full 248320-float row per position
+/// across the wasi-nn boundary - and scanning it in wasm - was most of what
+/// made a speculative verify round cost 5-6 plain decode steps.
+pub struct Row {
+    pub ids: Option<Vec<u32>>,
+    pub vals: Vec<f32>,
+}
+
+impl Row {
+    pub fn dense(vals: Vec<f32>) -> Row {
+        Row { ids: None, vals }
+    }
+}
+
+/// pick_token over either row shape.
+pub fn pick_row(row: &mut Row, recent: &[u32], p: &SampleParams, rng: &mut Rng) -> u32 {
+    match &row.ids {
+        None => pick_token(&mut row.vals, recent, p, rng),
+        Some(ids) => {
+            let ids = ids.clone();
+            pick_sparse(&ids, &mut row.vals, recent, p, rng)
+        }
+    }
+}
+
+/// The sparse twin of pick_token: the host already did the top-K selection,
+/// so what remains is the repetition penalty (by membership now, not by
+/// index), the guest's own top_k bound, and the softmax/nucleus sample -
+/// all over K entries instead of the vocabulary.
+fn pick_sparse(ids: &[u32], vals: &mut [f32], recent: &[u32], p: &SampleParams, rng: &mut Rng) -> u32 {
+    for (i, &id) in ids.iter().enumerate() {
+        if recent.contains(&id) {
+            if vals[i] > 0.0 {
+                vals[i] /= p.rep_penalty;
+            } else {
+                vals[i] *= p.rep_penalty;
+            }
+        }
+    }
+    if p.temperature <= 0.0 {
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in vals.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i;
+            }
+        }
+        return ids[best];
+    }
+    let k = if p.top_k > 0 { p.top_k.min(ids.len()) } else { ids.len() };
+    let mut cand: Vec<(u32, f32)> = ids.iter().copied().zip(vals.iter().copied()).collect();
+    cand.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    cand.truncate(k.max(1));
+    let max_l = cand[0].1;
+    let mut probs: Vec<f32> = cand
+        .iter()
+        .map(|&(_, v)| ((v - max_l) / p.temperature).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    for q in probs.iter_mut() {
+        *q /= sum;
+    }
+    let mut cut = probs.len();
+    if p.top_p < 1.0 {
+        let mut acc = 0.0;
+        for (i, &q) in probs.iter().enumerate() {
+            acc += q;
+            if acc >= p.top_p {
+                cut = i + 1;
+                break;
+            }
+        }
+    }
+    let mass: f32 = probs[..cut].iter().sum();
+    let mut r = rng.next_f32() * mass;
+    for i in 0..cut {
+        r -= probs[i];
+        if r <= 0.0 {
+            return cand[i].0;
+        }
+    }
+    cand[0].0
+}
