@@ -2424,7 +2424,9 @@ fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> 
 }
 
 /// tokens of trailing context that must match history before lookup proposes
+/// (tried longest-first from LOOKUP_NGRAM_MAX down to LOOKUP_NGRAM)
 const LOOKUP_NGRAM: usize = 3;
+const LOOKUP_NGRAM_MAX: usize = 5;
 
 /// Prompt-lookup speculative decode: the branch-commit loop with n-gram
 /// matches against the conversation as the proposer - no draft model, no
@@ -2514,8 +2516,16 @@ fn generate_lookup(
             pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
             continue 'outer;
         }
-        // -- history proposes; no match = one ordinary plain step
-        let drafts = lookup_propose(prompt_ids, &out.generated, LOOKUP_NGRAM, k);
+        // -- history proposes, longest context first (a 5-gram match predicts
+        //    its continuation far better than a bare 3-gram); no match at any
+        //    length = one ordinary plain step
+        let mut drafts = Vec::new();
+        for ng in (LOOKUP_NGRAM..=LOOKUP_NGRAM_MAX).rev() {
+            drafts = lookup_propose(prompt_ids, &out.generated, ng, k);
+            if !drafts.is_empty() {
+                break;
+            }
+        }
         if drafts.is_empty() {
             let mut row = sess.feed(cfg, &[pending], true)?;
             t_fed += 1;
