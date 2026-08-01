@@ -697,6 +697,9 @@ enum DraftPlan {
     Model(AppConfig),
     /// the model's own MTP head proposes (host-side; no second model)
     Mtp,
+    /// prompt-lookup: n-gram matches against the conversation itself propose
+    /// (no model at all - free drafts; rounds without a match decode plain)
+    Lookup,
 }
 
 /// The draft plan for speculative decoding, when `cfg` names one and it is
@@ -718,6 +721,11 @@ fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (DraftPlan, Option
         // knowledge - probed via caps at session open, which falls back
         // with its own note if not
         return (DraftPlan::Mtp, None);
+    }
+    if want == "lookup" {
+        // needs nothing beyond the ggml branch-verify verbs (any model,
+        // no head, no second volume)
+        return (DraftPlan::Lookup, None);
     }
     let entries = available_models(raw);
     let Some(e) = entries.iter().find(|e| e.cfg.name == want || e.volume == want) else {
@@ -1420,6 +1428,20 @@ fn open_mtp(
     Ok(MtpRig { tscr, t_seq, tscr_seq })
 }
 
+/// Prompt-lookup uses the same rig shape as MTP (target + one scratch
+/// branch) but needs no head - only the branch-verify verbs, so any ggml
+/// model qualifies.
+fn open_lookup(
+    cfg: &AppConfig,
+    target: ExecutionTarget,
+    sess: &mut Session,
+) -> Result<MtpRig, String> {
+    let t_seq = sess.caps()?.seq; // also the host capability probe
+    let mut tscr = Session::open(cfg, target)?;
+    let tscr_seq = tscr.caps()?.seq;
+    Ok(MtpRig { tscr, t_seq, tscr_seq })
+}
+
 struct GenParams {
     max_new: usize,
     sample: SampleParams,
@@ -1836,7 +1858,18 @@ fn generate(
                 let _ = status(&format!("MTP drafting unavailable ({}); plain decode", strip_code(&e)));
             }
         },
-        (DraftPlan::Model(_) | DraftPlan::Mtp, None) => {
+        (DraftPlan::Lookup, Some(ids)) => match open_lookup(cfg, target, &mut sess) {
+            Ok(rig) => {
+                if !status(&format!("session ready ({load_ms} ms); speculative decode via prompt lookup - prefilling {} prompt tokens", ids.len())) {
+                    return Err("client disconnected".into());
+                }
+                return generate_lookup(cfg, tok, ids, tname, p, sess, rig, load_ms, emit, status);
+            }
+            Err(e) => {
+                let _ = status(&format!("prompt-lookup drafting unavailable ({}); plain decode", strip_code(&e)));
+            }
+        },
+        (DraftPlan::Model(_) | DraftPlan::Mtp | DraftPlan::Lookup, None) => {
             let _ = status("speculative decode off for this turn: the prompt carries an image");
         }
         (DraftPlan::Plain, _) => {}
@@ -2336,6 +2369,211 @@ fn generate_mtp(
             pending = r;
         } else {
             // full acceptance (also the empty-draft case): adopt the branch
+            sess.copy_from(tscr_seq, tscr_fed)?;
+            t_fed = tscr_fed;
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            let last = rows.len() - 1;
+            pending = pick_token(&mut rows[last], &recent, &p.sample, &mut rng);
+        }
+    }
+    out.flush();
+    let decode_ms = now_ms() - t2;
+    Ok(GenStats {
+        target: tname.to_string(), prompt_tokens: prompt_ids.len(),
+        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+        finish_reason: finish, text: out.text, drafted, accepted,
+        think_forced: think.forced, images: 0, image_pos: 0,
+    })
+}
+
+/// Prompt-lookup n-gram proposer: find the most recent PRIOR occurrence of
+/// the sequence's last `ng` tokens and propose up to `k` tokens of what
+/// followed it. The "model" is the conversation itself - names, phrases,
+/// quoted code and structure recur constantly in chat - so proposals cost
+/// nothing. A proposal may run into the current tail (self-overlapping
+/// repetition), which correctly predicts a repeating pattern continuing.
+fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> {
+    let total = prompt.len() + gen.len();
+    if total < ng + 1 {
+        return Vec::new();
+    }
+    let at = |i: usize| if i < prompt.len() { prompt[i] } else { gen[i - prompt.len()] };
+    let key_start = total - ng;
+    for i in (0..key_start).rev() {
+        let mut m = true;
+        for j in 0..ng {
+            if at(i + j) != at(key_start + j) {
+                m = false;
+                break;
+            }
+        }
+        if !m {
+            continue;
+        }
+        let mut prop = Vec::with_capacity(k);
+        let mut p = i + ng;
+        while p < total && prop.len() < k {
+            prop.push(at(p));
+            p += 1;
+        }
+        if !prop.is_empty() {
+            return prop;
+        }
+    }
+    Vec::new()
+}
+
+/// tokens of trailing context that must match history before lookup proposes
+const LOOKUP_NGRAM: usize = 3;
+
+/// Prompt-lookup speculative decode: the branch-commit loop with n-gram
+/// matches against the conversation as the proposer - no draft model, no
+/// MTP head, no host-side state beyond the branch-verify verbs, so it runs
+/// on ANY ggml model. Rounds WITHOUT a match are literally plain decode
+/// (one step on the real sequence, branch untouched): the scheme can only
+/// spend the k extra verify rows on rounds where history actually matched,
+/// which is what bounds its downside. Exact-match verification as always -
+/// output is byte-for-byte the target's own.
+#[allow(clippy::too_many_arguments)]
+fn generate_lookup(
+    cfg: &AppConfig,
+    tok: &Tokenizer,
+    prompt_ids: &[u32],
+    tname: &str,
+    p: &GenParams,
+    mut sess: Session,
+    rig: MtpRig,
+    load_ms: u128,
+    emit: &dyn Fn(&str) -> bool,
+    status: &dyn Fn(&str) -> bool,
+) -> Result<GenStats, String> {
+    let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
+    let k = cfg.draft_tokens.clamp(1, 16);
+    let t1 = now_ms();
+    let mut done = 0usize;
+    let mut t_logits = Vec::new();
+    while done < prompt_ids.len() {
+        let end = (done + PREFILL_CHUNK).min(prompt_ids.len());
+        let last = end == prompt_ids.len();
+        let l = sess.feed(cfg, &prompt_ids[done..end], last)?;
+        if last {
+            t_logits = l;
+        }
+        done = end;
+    }
+    let prefill_ms = now_ms() - t1;
+
+    let t2 = now_ms();
+    let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
+    let mut out = TextOut::new(tok, emit, &p.stop_strings);
+    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let loop_guard = LoopGuard::new(p.loop_reps);
+    let mut guard_from = 0usize; // see the plain loop
+    let mut finish: &'static str = "stop";
+    let (mut drafted, mut accepted) = (0usize, 0usize);
+    let mut t_fed = prompt_ids.len();
+
+    let recent = out.recent(prompt_ids, p.sample.rep_window);
+    let mut pending = pick_token(&mut t_logits, &recent, &p.sample, &mut rng);
+    'outer: loop {
+        if cfg.eos.contains(&pending) { break; }
+        if out.generated.len() >= p.max_new { finish = "length"; break; }
+        match out.push(pending) {
+            Pushed::More => {}
+            Pushed::Stopped => {
+                let decode_ms = now_ms() - t2;
+                return Ok(GenStats {
+                    target: tname.to_string(), prompt_tokens: prompt_ids.len(),
+                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    think_forced: think.forced, images: 0, image_pos: 0,
+                });
+            }
+            Pushed::Gone => break 'outer,
+        }
+        // -- degenerate loop: same policy as the other loops; lookup makes a
+        //    stuck repetition ACCELERATE (its own tail matches perfectly), so
+        //    this guard earns its keep here
+        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+            finish = "repetition";
+            break 'outer;
+        }
+        // -- budget spent: force the block shut on the real sequence (one
+        //    plain pass), same as the model-draft loop
+        if think.over(&out) {
+            let _ = status(&think.note());
+            if !out.push_forced(&think.close) {
+                break 'outer;
+            }
+            guard_from = out.generated.len();
+            let mut ids = vec![pending];
+            ids.extend_from_slice(&think.close);
+            let mut row = sess.feed(cfg, &ids, true)?;
+            t_fed += ids.len();
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
+            continue 'outer;
+        }
+        // -- history proposes; no match = one ordinary plain step
+        let drafts = lookup_propose(prompt_ids, &out.generated, LOOKUP_NGRAM, k);
+        if drafts.is_empty() {
+            let mut row = sess.feed(cfg, &[pending], true)?;
+            t_fed += 1;
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            pending = pick_token(&mut row, &recent, &p.sample, &mut rng);
+            continue 'outer;
+        }
+        drafted += drafts.len();
+        // -- ONE verify pass over [pending, d1..dm] on the target BRANCH
+        tscr.copy_from(t_seq, t_fed)?;
+        let mut feed: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
+        feed.push(pending);
+        feed.extend_from_slice(&drafts);
+        let mut rows = tscr.feed_all(cfg, &feed)?;
+        let tscr_fed = t_fed + feed.len();
+        // -- verify: accept while the target's own sample agrees
+        let mut acc = 0usize;
+        let mut replacement: Option<u32> = None;
+        for (i, &d) in drafts.iter().enumerate() {
+            let recent = out.recent(prompt_ids, p.sample.rep_window);
+            let expect = pick_token(&mut rows[i], &recent, &p.sample, &mut rng);
+            if expect != d {
+                replacement = Some(expect);
+                break;
+            }
+            if cfg.eos.contains(&d) {
+                accepted += acc;
+                break 'outer;
+            }
+            if out.generated.len() >= p.max_new {
+                finish = "length";
+                accepted += acc;
+                break 'outer;
+            }
+            match out.push(d) {
+                Pushed::More => {}
+                Pushed::Stopped => {
+                    let decode_ms = now_ms() - t2;
+                    return Ok(GenStats {
+                        target: tname.to_string(), prompt_tokens: prompt_ids.len(),
+                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        think_forced: think.forced, images: 0, image_pos: 0,
+                    });
+                }
+                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+            }
+            acc += 1;
+        }
+        accepted += acc;
+        if let Some(r) = replacement {
+            // partial round: commit only the accepted tokens to the real
+            // sequence, abandon the branch (re-branched fresh next round)
+            sess.feed(cfg, &feed[..acc + 1], false)?;
+            t_fed += acc + 1;
+            pending = r;
+        } else {
+            // full acceptance: adopt the branch, bonus token from the last row
             sess.copy_from(tscr_seq, tscr_fed)?;
             t_fed = tscr_fed;
             let recent = out.recent(prompt_ids, p.sample.rep_window);

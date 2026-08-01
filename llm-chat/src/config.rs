@@ -154,6 +154,11 @@ pub struct AppConfig {
     /// The special value "mtp" uses the model's OWN trained multi-token-
     /// prediction head (an *-MTP GGUF variant; near-zero proposal cost, no
     /// second model, the preferred setting when the volume carries a head).
+    /// "lookup" = prompt-lookup drafting: n-gram matches against the
+    /// conversation itself propose what followed last time - zero proposal
+    /// cost, works on ANY ggml model, and rounds without a match decode
+    /// plain, so it never costs baseline speed. Shines on repetition-heavy
+    /// output (code, quoting, lists); modest on freeform prose.
     /// Any other value names a catalog model (by volume or name) - a small
     /// same-tokenizer sibling that proposes `draft_tokens` ahead. Either
     /// way the target verifies proposals in ONE pass and every accepted
