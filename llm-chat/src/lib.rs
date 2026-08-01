@@ -1065,6 +1065,18 @@ thread_local! {
     static VERB_PHASE: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") };
 }
 
+thread_local! {
+    /// pre-generation phase costs (ms), reported as "init_ms" in the done
+    /// frame: where the TTFT that is neither prefill nor decode goes
+    static INIT_MS: std::cell::RefCell<Vec<(&'static str, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+fn init_note(label: &'static str, since: u128) -> u128 {
+    let t = now_ms();
+    INIT_MS.with(|v| v.borrow_mut().push((label, (t - since) as u64)));
+    t
+}
+
 struct PhaseGuard;
 fn timing_phase(p: &'static str) -> PhaseGuard {
     VERB_PHASE.with(|v| *v.borrow_mut() = p);
@@ -5163,12 +5175,14 @@ fn handle_title(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutp
 }
 
 fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
+    let t0 = now_ms();
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let creq = match parsed {
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
+    let t1 = init_note("body", t0);
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
@@ -5184,10 +5198,12 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Ok(b) => b,
         Err(e) => return json_err(out, 500, &e),
     };
+    let t2 = init_note("tok_read", t1);
     let tok = match Tokenizer::from_bytes(&tok_bytes) {
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &format!("tokenizer: {e}")),
     };
+    let _ = init_note("tok_parse", t2);
     // The SSE stream opens BEFORE the search leg, because in auto mode that
     // leg can run a router generation and then a provider round trip - several
     // seconds in which a silent "Preparing…" is all the user would see. With
@@ -5452,6 +5468,14 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     }
                     if s.think_forced {
                         done["think_forced"] = serde_json::json!(true);
+                    }
+                    let im = INIT_MS.with(|v| v.borrow().clone());
+                    if !im.is_empty() {
+                        let mut m = serde_json::Map::new();
+                        for (label, ms) in im {
+                            m.insert(label.to_string(), serde_json::json!(ms));
+                        }
+                        done["init_ms"] = serde_json::Value::Object(m);
                     }
                     let vt = timing_snapshot();
                     if !vt.is_empty() {
