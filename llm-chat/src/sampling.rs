@@ -195,3 +195,57 @@ fn pick_sparse(ids: &[u32], vals: &mut [f32], recent: &[u32], p: &SampleParams, 
     }
     cand[0].0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(temp: f32, top_k: usize, rep: f32) -> SampleParams {
+        SampleParams { temperature: temp, top_p: 1.0, top_k, rep_penalty: rep, rep_window: 64 }
+    }
+
+    /// temp-0 sparse pick = the id with the highest value, exactly like the
+    /// dense argmax over a row whose top-K these candidates are
+    #[test]
+    fn sparse_greedy_matches_dense() {
+        let mut dense = vec![0.0f32; 100];
+        dense[7] = 5.0;
+        dense[42] = 9.0;
+        dense[93] = 3.0;
+        let mut rng = Rng::new(1);
+        let d = pick_token(&mut dense.clone(), &[], &params(0.0, 0, 1.0), &mut rng);
+        let mut row = Row { ids: Some(vec![42, 7, 93]), vals: vec![9.0, 5.0, 3.0] };
+        let s = pick_row(&mut row, &[], &params(0.0, 0, 1.0), &mut rng);
+        assert_eq!(d, s);
+        assert_eq!(s, 42);
+    }
+
+    /// the repetition penalty applies by MEMBERSHIP in sparse rows: a recent
+    /// top candidate can be demoted below the runner-up
+    #[test]
+    fn sparse_penalty_by_membership() {
+        let mut row = Row { ids: Some(vec![10, 20]), vals: vec![2.0, 1.9] };
+        let mut rng = Rng::new(1);
+        let picked = pick_row(&mut row, &[10], &params(0.0, 0, 1.2), &mut rng);
+        assert_eq!(picked, 20); // 2.0/1.2 = 1.67 < 1.9
+    }
+
+    /// negative logits are suppressed by the penalty in both directions
+    #[test]
+    fn sparse_penalty_negative_suppresses() {
+        let mut row = Row { ids: Some(vec![10, 20]), vals: vec![-1.0, -1.1] };
+        let mut rng = Rng::new(1);
+        let picked = pick_row(&mut row, &[10], &params(0.0, 0, 1.2), &mut rng);
+        assert_eq!(picked, 20); // -1.0*1.2 = -1.2 < -1.1
+    }
+
+    /// at temperature, top_k bounds the candidate set even within the
+    /// host's top-256 (a peaked distribution stays on its winner)
+    #[test]
+    fn sparse_top_k_truncates() {
+        let mut row = Row { ids: Some(vec![1, 2, 3, 4]), vals: vec![100.0, 1.0, 0.5, 0.1] };
+        let mut rng = Rng::new(42);
+        let picked = pick_row(&mut row, &[], &params(0.7, 1, 1.0), &mut rng);
+        assert_eq!(picked, 1); // top_k=1 = greedy on the max
+    }
+}
