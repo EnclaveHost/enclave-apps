@@ -1184,6 +1184,24 @@ fn timing_input() -> (String, Tensor) {
 }
 
 fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
+    // mm9 engines return "phase_us" [gate, alloc, turn, decode, harvest,
+    // topk] on the verify verb - fold each slot into its own bucket so the
+    // done frame names where the multi-token pass spends its time.
+    if let Some(t) = outs.iter().find(|(n, _)| n == "phase_us") {
+        let d = t.1.data();
+        const PH: [&str; 6] = ["gate", "alloc", "turn", "decode", "harvest", "topk"];
+        for (i, ph) in PH.iter().enumerate() {
+            if d.len() >= (i + 1) * 4 {
+                let us = i32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]).max(0) as u64;
+                VERB_TIMING.with(|m| {
+                    let mut m = m.borrow_mut();
+                    let e = m.entry(format!("{label}#{ph}")).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += us;
+                });
+            }
+        }
+    }
     if let Some(t) = outs.iter().find(|(n, _)| n == "elapsed_us") {
         let d = t.1.data();
         if d.len() >= 4 {
