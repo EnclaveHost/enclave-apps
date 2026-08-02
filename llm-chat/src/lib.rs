@@ -1032,7 +1032,7 @@ impl Session {
                 }
                 inputs.push(timing_input());
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
-                note_timing("feed", &outs);
+                note_timing(if ids.len() > 1 { "feed_batch" } else { "feed" }, &outs);
                 if !want_logits {
                     return Ok(Row::dense(Vec::new()));
                 }
