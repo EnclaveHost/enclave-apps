@@ -1191,7 +1191,22 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
             let phase = VERB_PHASE.with(|v| *v.borrow());
             VERB_TIMING.with(|m| {
                 let mut m = m.borrow_mut();
-                let e = m.entry(format!("{phase}{label}")).or_insert((0, 0));
+                // the first few decode steps go to their own bucket: if the
+                // engine's CUDA-graph warmup is real, feed_warm's mean sits
+                // visibly above feed's; if the two match, capture never
+                // engaged and the whole launch-latency budget is headroom
+                let key = if label == "feed" {
+                    let warm = m.get("feed_warm").map(|e| e.0).unwrap_or(0);
+                    let done = m.get("feed").map(|e| e.0).unwrap_or(0);
+                    if phase.is_empty() && warm < 4 && done == 0 {
+                        "feed_warm".to_string()
+                    } else {
+                        format!("{phase}{label}")
+                    }
+                } else {
+                    format!("{phase}{label}")
+                };
+                let e = m.entry(key).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += us;
             });
