@@ -1215,31 +1215,40 @@ fn rows_from_outs(
         outs.iter().find(|(n, _)| n == "topk_ids"),
         outs.iter().find(|(n, _)| n == "topk_logits"),
     ) {
-        let idata = ti.1.data();
-        let vdata = tv.1.data();
-        if n_rows == 0 || idata.len() != vdata.len() || idata.len() % (n_rows * 4) != 0 {
-            return Err("host returned malformed topk rows".into());
-        }
-        let per = idata.len() / n_rows;
-        let mut rows = Vec::with_capacity(n_rows);
-        for r in 0..n_rows {
-            let ids: Vec<u32> = idata[r * per..(r + 1) * per]
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-                .collect();
-            let vals: Vec<f32> = vdata[r * per..(r + 1) * per]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            rows.push(Row { ids: Some(ids), vals });
-        }
-        return Ok(rows);
+        return sparse_rows(&ti.1.data(), &tv.1.data(), n_rows);
     }
     let logits = outs
         .iter()
         .find(|(n, _)| n == "logits")
         .ok_or("ggml backend returned no \"logits\" output")?;
-    let data = logits.1.data();
+    dense_rows(&logits.1.data(), n_rows, vocab)
+}
+
+/// byte-level core of the sparse parse (see rows_from_outs), split out so
+/// the contract is testable without wit-binding Tensors (whose host-target
+/// constructors abort outside wasm)
+fn sparse_rows(idata: &[u8], vdata: &[u8], n_rows: usize) -> Result<Vec<Row>, String> {
+    if n_rows == 0 || idata.len() != vdata.len() || idata.len() % (n_rows * 4) != 0 {
+        return Err("host returned malformed topk rows".into());
+    }
+    let per = idata.len() / n_rows;
+    let mut rows = Vec::with_capacity(n_rows);
+    for r in 0..n_rows {
+        let ids: Vec<u32> = idata[r * per..(r + 1) * per]
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect();
+        let vals: Vec<f32> = vdata[r * per..(r + 1) * per]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        rows.push(Row { ids: Some(ids), vals });
+    }
+    Ok(rows)
+}
+
+/// byte-level core of the dense fallback (see rows_from_outs)
+fn dense_rows(data: &[u8], n_rows: usize, vocab: usize) -> Result<Vec<Row>, String> {
     let row = vocab * 4;
     if data.len() != row * n_rows {
         return Err(format!(
@@ -6765,6 +6774,112 @@ impl Guest for Component {
 bindings::export!(Component with_types_in bindings);
 
 #[cfg(test)]
+mod tests_2026_08_01 {
+    //! Seams added in the 2026-08-01 perf campaign: sparse logits rows,
+    //! prompt-lookup proposals, and the piece-table detokenizer. Each was
+    //! validated live; these pin the contracts against regression.
+    use super::*;
+
+    // ---- Detok::Table: UTF-8 withholding across piece boundaries ----
+    fn table(pieces: &[&[u8]]) -> (Vec<u8>, Vec<u32>) {
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0u32];
+        for p in pieces {
+            bytes.extend_from_slice(p);
+            offsets.push(bytes.len() as u32);
+        }
+        (bytes, offsets)
+    }
+
+    #[test]
+    fn table_detok_withholds_split_chars() {
+        // token 0 = "a" + first 2 bytes of a 4-byte emoji; token 1 = the rest
+        let emoji = "\u{1F600}".as_bytes(); // 4 bytes
+        let t0: Vec<u8> = [b"a" as &[u8], &emoji[..2]].concat();
+        let t1: Vec<u8> = [&emoji[2..], b"b" as &[u8]].concat();
+        let (bytes, offsets) = table(&[&t0, &t1]);
+        let mut d = Detok::Table { pieces: &bytes, offsets: &offsets, pending: Vec::new() };
+        // first step: only "a" is complete; the split emoji waits
+        assert_eq!(d.step(0).as_deref(), Some("a"));
+        // second step completes the emoji and adds "b"
+        assert_eq!(d.step(1).as_deref(), Some("\u{1F600}b"));
+    }
+
+    #[test]
+    fn table_detok_empty_and_out_of_range() {
+        let (bytes, offsets) = table(&[b"hi", b""]);
+        let mut d = Detok::Table { pieces: &bytes, offsets: &offsets, pending: Vec::new() };
+        assert_eq!(d.step(0).as_deref(), Some("hi"));
+        assert_eq!(d.step(1), None); // empty piece
+        assert_eq!(d.step(999), None); // out of range = ignored, not a panic
+    }
+
+    // ---- lookup_propose ----
+    #[test]
+    fn lookup_prefers_most_recent_match() {
+        // ...1 2 3 9... then ...1 2 3 7... then key 1 2 3 -> most recent
+        // continuation is 7
+        let gen = vec![1, 2, 3, 9, 5, 1, 2, 3, 7, 6, 1, 2, 3];
+        let prop = lookup_propose(&[], &gen, 3, 4);
+        assert_eq!(prop, vec![7, 6, 1, 2]);
+    }
+
+    #[test]
+    fn lookup_spans_prompt_and_generation() {
+        // the match lives in the PROMPT, the key at the generation tail
+        let prompt = vec![10, 11, 12, 13, 14];
+        let gen = vec![10, 11, 12];
+        let prop = lookup_propose(&prompt, &gen, 3, 8);
+        assert_eq!(prop, vec![13, 14, 10, 11, 12]);
+    }
+
+    #[test]
+    fn lookup_no_match_is_empty() {
+        assert!(lookup_propose(&[1, 2, 3], &[4, 5, 6], 3, 4).is_empty());
+        assert!(lookup_propose(&[], &[1, 2], 3, 4).is_empty()); // too short
+    }
+
+    #[test]
+    fn lookup_self_overlap_predicts_repetition() {
+        // a pure run: the MOST RECENT match sits one position back, so its
+        // continuation is bounded by the sequence end - one token proposed,
+        // still a correct prediction of the run continuing (recency beats
+        // proposal length by design; older matches would propose more)
+        let gen = vec![7, 7, 7, 7, 7];
+        let prop = lookup_propose(&[], &gen, 3, 2);
+        assert_eq!(prop, vec![7]);
+    }
+
+    // ---- sparse/dense row parsing (byte cores; wit Tensors abort on host) ----
+    #[test]
+    fn rows_sparse_roundtrip() {
+        // 2 rows x K=2: ids [[5,9],[3,1]], vals [[2.0,1.0],[4.0,3.0]]
+        let ids: Vec<u8> = [5i32, 9, 3, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let vals: Vec<u8> = [2.0f32, 1.0, 4.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rows = sparse_rows(&ids, &vals, 2).unwrap();
+        assert_eq!(rows[0].ids.as_deref(), Some(&[5u32, 9][..]));
+        assert_eq!(rows[1].vals, vec![4.0, 3.0]);
+    }
+
+    #[test]
+    fn rows_dense_fallback_checks_shape() {
+        let vals: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rows = dense_rows(&vals, 1, 4).unwrap();
+        assert!(rows[0].ids.is_none());
+        assert_eq!(rows[0].vals, vec![1.0, 2.0, 3.0, 4.0]);
+        // wrong vocab = loud error, not silent garbage
+        assert!(dense_rows(&vals, 1, 5).is_err());
+    }
+
+    #[test]
+    fn rows_malformed_sparse_rejected() {
+        let ids: Vec<u8> = [1i32, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let vals: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(sparse_rows(&ids, &vals, 1).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -6876,13 +6991,13 @@ mod tests {
     /// code path production does instead of a stand-in. Word level, unknown
     /// words map to [UNK]: the tests care about STRUCTURE (which runs of text
     /// became which parts), never about the specific ids.
-    fn test_tokenizer() -> Tokenizer {
+    fn test_tokenizer() -> Tok {
         let json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
             "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
             "decoder":null,
             "model":{"type":"WordLevel","vocab":{"[UNK]":0,"before":1,"after":2,"caption":3,
             "this":4,"no":5,"pictures":6,"here":7,"slot":8},"unk_token":"[UNK]"}}"#;
-        Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer")
+        Tok::Local(Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer"))
     }
 
     /// The app's own embedded defaults, which is what a deployment starts from.
@@ -7225,18 +7340,18 @@ mod tests {
     /// A throwaway tokenizer that can spell the closing tag, which is the only
     /// thing the think guard asks of one. No pre-tokenizer, so the tag maps to
     /// a single id instead of being split into `<`, `/`, `think`, `>`.
-    fn think_tokenizer() -> Tokenizer {
+    fn think_tokenizer() -> Tok {
         let json = format!(
             r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
                 "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
                 "model":{{"type":"WordLevel","vocab":{{"{}":1,"x":2}},"unk_token":"x"}}}}"#,
             THINK_CLOSE_TEXT.trim()
         );
-        Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer")
+        Tok::Local(Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer"))
     }
 
     fn out_at<'a>(
-        tok: &'a Tokenizer,
+        tok: &'a Tok,
         emit: &'a dyn Fn(&str) -> bool,
         stops: &'a [String],
         text: &str,
