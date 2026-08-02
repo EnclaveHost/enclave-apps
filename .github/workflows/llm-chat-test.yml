@@ -1,0 +1,33 @@
+# llm-chat's test suite (119 tests: prompt building, think budget, stop
+# strings, sampling incl. the sparse rows, lookup drafting, the piece-table
+# detokenizer). Host-target `cargo test` - no wasm toolchain, no model
+# assets, runs anywhere. Added 2026-08-01 after a refactor shipped with the
+# test module broken for a full version: the lib built (cdylib skips
+# #[cfg(test)]) and nothing said otherwise until the next local `cargo test`.
+name: llm-chat tests
+
+on:
+  push:
+    branches: [main]
+    paths: ["llm-chat/**", ".github/workflows/llm-chat-test.yml"]
+  pull_request:
+    paths: ["llm-chat/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            llm-chat/target
+          key: llm-chat-test-${{ hashFiles('llm-chat/Cargo.lock') }}
+      - name: cargo test
+        working-directory: llm-chat
+        run: cargo test --locked
