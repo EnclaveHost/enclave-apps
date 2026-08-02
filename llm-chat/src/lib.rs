@@ -1189,7 +1189,7 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
     // done frame names where the multi-token pass spends its time.
     if let Some(t) = outs.iter().find(|(n, _)| n == "phase_us") {
         let d = t.1.data();
-        const PH: [&str; 6] = ["gate", "alloc", "turn", "decode", "harvest", "topk"];
+        const PH: [&str; 10] = ["gate", "alloc", "turn", "decode", "harvest", "topk", "gbuild", "galloc", "ginput", "slot"];
         for (i, ph) in PH.iter().enumerate() {
             if d.len() >= (i + 1) * 4 {
                 let us = i32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]).max(0) as u64;
