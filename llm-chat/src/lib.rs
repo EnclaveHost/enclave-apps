@@ -1367,6 +1367,34 @@ impl Session {
     /// speculative toolchain, which is the capability probe: no caps, no
     /// speculative decode. The list has only grown, so an older host simply
     /// returns fewer values and each missing one reads as "no".
+    /// {"d2h_probe": size_mb} -> [pinned_ok, pinned_us, pageable_us]. The
+    /// engine times a real device->host copy into pinned and pageable memory
+    /// (mm8 instrumentation; the CVM-side answer to where multi-row logits
+    /// copies spend their ~20ms). Errors on engines without the verb.
+    fn d2h_probe(&mut self, size_mb: i32) -> Result<[i32; 3], String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("the d2h probe needs the ggml backend".into());
+        };
+        let outs = ctx
+            .compute(vec![(
+                "d2h_probe".to_string(),
+                Tensor::new(&[1], TensorType::I32, &size_mb.to_le_bytes()),
+            )])
+            .map_err(|e| nn_err("d2h_probe", e))?;
+        let d2h = outs
+            .iter()
+            .find(|(n, _)| n == "d2h")
+            .ok_or("host returned no \"d2h\" output (engine predates mm8)")?;
+        let data = d2h.1.data();
+        if data.len() < 12 {
+            return Err("d2h output too short".into());
+        }
+        let v = |i: usize| {
+            i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
+        };
+        Ok([v(0), v(1), v(2)])
+    }
+
     fn caps(&mut self) -> Result<Caps, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
@@ -6218,6 +6246,34 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 /// Pass target=cpu (dev boxes) or target=auto explicitly to warm other
 /// paths. Slow by design when cold - the response arrives when the models
 /// are ready.
+/// GET /d2h?mb=N - engine D2H path measurement (mm8). Owner-bearer-gated by
+/// the platform on private deployments like every other route here.
+fn handle_d2h(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
+    let mb: i32 = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("mb="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let cfg = match resolve_model(raw, None) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+    };
+    let mut sess = match Session::open(&cfg, ExecutionTarget::Gpu) {
+        Ok(s) => s,
+        Err(e) => return json_err(out, 503, &format!("session open failed: {e}")),
+    };
+    match sess.d2h_probe(mb) {
+        Ok([ok, pinned, pageable]) => {
+            let body = serde_json::json!({
+                "size_mb": mb, "pinned_ok": ok == 1,
+                "pinned_us": pinned, "pageable_us": pageable,
+            });
+            respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
+        }
+        Err(e) => json_err(out, 500, &e),
+    }
+}
+
 fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     // GPU by default - but on a deployment the platform gave NO GPU share,
     // "gpu" is a guaranteed failure for the onnx path, and reporting every
@@ -6752,6 +6808,7 @@ impl Guest for Component {
                 SW_JS.replace("__REV__", ASSET_REV).as_bytes(),
                 Some("no-cache"),
             ),
+            (Method::Get, "/d2h") => handle_d2h(&raw, query, out),
             (Method::Get, p) if p.starts_with("/.well-known/") => {
                 match well_known_lookup(&raw, &p["/.well-known/".len()..]) {
                     Some(body) => respond_public_json(out, 200, body.as_bytes()),

@@ -7,9 +7,13 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wasi = "0.14"
+# =0.6.0 exactly: its world is wasi:http@0.3.0-rc-2026-03-15, the rc the
+# fleet's wasmtime 45 serves. 0.7.x tracks wasi-0.3.0 final and will not
+# instantiate against the rc host; move both together at the next
+# toolchain cut.
+wasip3 = { version = "=0.6.0", features = ["async-spawn"] }
 
 [profile.release]
 opt-level = "s"
-lto = true
+lto = "thin"
 strip = true
