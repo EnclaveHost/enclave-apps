@@ -1221,6 +1221,19 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
                     } else {
                         format!("{phase}{label}")
                     }
+                } else if label == "feed_all" || label == "feed_all_mtp" {
+                    // first two verify passes bucket separately: if CUDA-graph
+                    // capture engages on the batched shape, warm >> rest; if
+                    // warm == rest, capture never engages for batch>1 and the
+                    // whole verify tax is the un-graphed launch path.
+                    let wkey = format!("{label}_warm");
+                    let warm = m.get(wkey.as_str()).map(|e| e.0).unwrap_or(0);
+                    let done = m.get(label).map(|e| e.0).unwrap_or(0);
+                    if phase.is_empty() && warm < 2 && done == 0 {
+                        wkey
+                    } else {
+                        format!("{phase}{label}")
+                    }
                 } else {
                     format!("{phase}{label}")
                 };
