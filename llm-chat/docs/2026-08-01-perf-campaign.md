@@ -25,13 +25,23 @@ on the workstation, ready for `enclave config set`):
 ## Why speculation is off
 
 Measured with the per-verb timing instrument (`verb_us` in the /chat done
-frame): a verify pass costs ~46 ms for 5 tokens and ~109 ms for 9 — the
-cost scales ~linearly with batch size because the model is expert-sparse
-(k distinct tokens route to ~k expert sets; batching amortizes nothing).
-Even perfect drafts can't out-earn a 15.5 ms plain step. This holds for
-any expert-sparse target; dense targets keep the classic speculation win.
-`draft: "lookup"` (prompt-lookup, added 0.28.x) is safe everywhere —
-no-match rounds are plain decode — but not faster here.
+frame): a verify pass costs ~46 ms for 5 tokens and ~109 ms for 9, while
+a plain step is 15.5 ms — a k=4 round needs near-perfect acceptance to
+break even, and any partial-accept round (which adds a ~44 ms refeed
+pass) loses outright.
+
+*Corrected 2026-08-01*: the first write-up blamed expert sparsity, but
+fable-fusion-27b is **dense** (GGUF arch `qwen35`, no expert tensors —
+the 122B is the MoE). The real cost structure is a large **fixed
+overhead on every multi-token pass**: refeeds of 2–5 tokens cost ~44 ms,
+nearly the same as a 5-token verify, while a 396-token prefill chunk
+amortizes to ~0.45 ms/token. Small batched passes pay un-graphed kernel
+launches under confidential compute plus the hybrid-SSM multi-token
+scan setup — costs the batch-1 path avoids via CUDA-graph replay. That
+is an engine property, not model physics, but it holds on the current
+engine, so the config recommendation stands. `draft: "lookup"`
+(prompt-lookup, added 0.28.x) is safe everywhere — no-match rounds are
+plain decode — but not faster here.
 
 ## Where the remaining latency lives (all measured)
 
