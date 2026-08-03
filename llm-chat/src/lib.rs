@@ -3102,6 +3102,15 @@ impl LookupGate {
     fn new() -> Self {
         Self { ema: 0.6, paused_until: 0, pause_len: 64 }
     }
+    /// draft depth for this round: escalate past the base k only on a hot
+    /// acceptance streak (fixed k=6 measured NEGATIVE fleet-wide - the
+    /// losses were low-quality tails paying batch-7 verifies; gating the
+    /// escalation on the EMA targets only the stretches where depth pays).
+    /// Capped by the host's snapshot depth via the caller.
+    fn k_for_round(&self, base: usize, max_k: usize) -> usize {
+        if self.ema > 0.65 { max_k.max(base) } else { base }
+    }
+
     /// minimum anchor length to propose with right now; None = don't
     fn min_anchor(&mut self, generated: usize) -> Option<usize> {
         if generated < self.paused_until {
@@ -3176,6 +3185,9 @@ fn generate_lookup(
     let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
     let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
+    // hot-streak escalation ceiling: +2 over configured k, bounded by the
+    // host's rollback depth (rewind mode) - see LookupGate::k_for_round
+    let k_hot = (k + 2).min(if depth > 0 { depth } else { k });
     let t1 = now_ms();
     let chunk = prefill_chunk(&mut sess);
     let mut done = 0usize;
@@ -3250,8 +3262,9 @@ fn generate_lookup(
         //    acceptance: drafting off, re-probed periodically).
         let mut drafts = Vec::new();
         if let Some(min_ng) = gate.min_anchor(out.generated.len()) {
+            let k_round = gate.k_for_round(k, k_hot);
             for ng in (min_ng..=LOOKUP_NGRAM_MAX).rev() {
-                drafts = lookup_propose(prompt_ids, &out.generated, ng, k);
+                drafts = lookup_propose(prompt_ids, &out.generated, ng, k_round);
                 if !drafts.is_empty() {
                     break;
                 }
