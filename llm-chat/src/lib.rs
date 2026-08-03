@@ -3096,11 +3096,13 @@ struct LookupGate {
     ema: f32,
     paused_until: usize, // out.generated.len() threshold to resume at
     pause_len: usize,    // exponential backoff on consecutive failed probes
+    floor: usize,        // shortest anchor allowed (config draft_min_ngram)
+    enabled: bool,       // false = never pause, never escalate (config draft_gate)
 }
 
 impl LookupGate {
-    fn new() -> Self {
-        Self { ema: 0.6, paused_until: 0, pause_len: 64 }
+    fn with(floor: usize, enabled: bool) -> Self {
+        Self { ema: 0.6, paused_until: 0, pause_len: 64, floor: floor.clamp(2, LOOKUP_NGRAM_MAX), enabled }
     }
     // (hot-streak k escalation was tried 2026-08-03 and measured a soft
     // NEGATIVE on the fleet - quote 60.7 vs 63.1 baseline - consistent
@@ -3109,6 +3111,9 @@ impl LookupGate {
 
     /// minimum anchor length to propose with right now; None = don't
     fn min_anchor(&mut self, generated: usize) -> Option<usize> {
+        if !self.enabled {
+            return Some(self.floor);
+        }
         if generated < self.paused_until {
             return None;
         }
@@ -3125,9 +3130,9 @@ impl LookupGate {
         }
         self.pause_len = 64; // quality recovered: probes get eager again
         if self.ema < 0.45 {
-            return Some(LOOKUP_NGRAM + 1); // well-anchored matches only
+            return Some(self.floor + 1); // well-anchored matches only
         }
-        Some(LOOKUP_NGRAM)
+        Some(self.floor)
     }
     fn observe(&mut self, accepted: usize, drafted: usize) {
         if drafted == 0 {
@@ -3205,7 +3210,10 @@ fn generate_lookup(
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut t_fed = prompt_ids.len();
-    let mut gate = LookupGate::new();
+    let mut gate = LookupGate::with(
+        cfg.draft_min_ngram.unwrap_or(LOOKUP_NGRAM),
+        cfg.draft_gate.unwrap_or(true),
+    );
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
     let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
