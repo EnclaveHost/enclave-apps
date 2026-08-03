@@ -1,0 +1,38 @@
+[package]
+name = "speech-generator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.39.0", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: the `models` catalog is a JSON object keyed by volume, and
+# its written order is the catalog order the UI shows
+serde_json = { version = "1", features = ["preserve_order"] }
+# unstable_wasm swaps the C regex backend (onig) for pure-Rust fancy-regex so
+# the tokenizer compiles to wasm32-wasip2.
+tokenizers = { version = "0.21", default-features = false, features = ["unstable_wasm"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+strip = true
+lto = true
+
+[package.metadata.component]
+package = "enclave:speech-generator"
+
+[package.metadata.component.target]
+path = "wit"
+world = "speech-generator"
+
+# WIT deps vendored from wasmtime v45 (see wit/world.wit)
+[package.metadata.component.target.dependencies]
+"wasi:nn" = { path = "wit/deps/nn" }
+"wasi:http" = { path = "wit/deps/http" }
+"wasi:io" = { path = "wit/deps/io" }
+"wasi:clocks" = { path = "wit/deps/clocks" }

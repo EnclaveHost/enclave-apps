@@ -1,0 +1,37 @@
+{
+  "name": "maya1",
+  "n_layers": 28,
+  "n_kv_heads": 8,
+  "head_dim": 128,
+  "vocab": 156960,
+  "model_volume": "maya1-gguf",
+  "default_voice": "aria",
+  "voices": {
+    "aria": "Female voice in her early 30s, warm and friendly, American accent, clear diction, conversational pace, medium pitch",
+    "marcus": "Male voice in his 40s, deep and calm, American accent, measured pace, authoritative but warm",
+    "poppy": "Female voice in her mid 20s, bright and energetic, British accent, expressive intonation, slightly fast pace",
+    "sage": "Male voice in his 60s, gravelly warmth, slow deliberate pace, a storyteller's cadence, American accent",
+    "iris": "Female voice in her 40s, smooth and low-pitched, neutral accent, calm newsreader delivery, precise articulation",
+    "kit": "Young male voice in his early 20s, light and playful, American accent, quick casual pace, upbeat energy",
+    "alloy": "Neutral adult voice, medium pitch, American accent, even and clear, steady conversational pace",
+    "echo": "Male voice in his 30s, resonant and confident, American accent, moderate pace, broadcast quality",
+    "fable": "Male voice in his 50s, warm British accent, animated storytelling delivery, rich expressive intonation",
+    "onyx": "Male voice in his 40s, very deep and authoritative, American accent, slow deliberate pace, commanding presence",
+    "nova": "Female voice in her late 20s, energetic and friendly, American accent, lively pace, bright tone",
+    "shimmer": "Female voice in her 30s, soft and soothing, American accent, gentle unhurried pace, calming warmth"
+  },
+  "temperature": 0.4,
+  "top_p": 0.9,
+  "rep_penalty": 1.1,
+  "rep_window": 0,
+  "max_text_chars": 4000,
+  "chunk_max_chars": 600,
+  "max_new_tokens": 2048,
+  "min_frames": 4,
+  "trim_warmup_samples": 2048,
+  "models": {
+    "maya1-gguf": {
+      "name": "maya1"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+// speech-generator: text to speech on Enclave's wasi-nn GPU interface, as a
+// wasm component with a built-in web UI. The language model half (Maya1, a
+// Llama-style 3B that predicts SNAC audio-codec tokens) runs behind the host's
+// ggml backend like any other model volume; the codec half (the SNAC 24 kHz
+// decoder) runs IN THIS COMPONENT as pure Rust, because the host has no audio
+// verb and the decoder is small enough (13M params) that it does not need one.
+//
+// It does NOT import wasi:http/outgoing-handler, and that absence is a FEATURE
+// rather than an omission: this component cannot make an outbound request of
+// any kind, so text sent here to be spoken cannot be forwarded anywhere. The
+// attestation covers the component, so a caller can verify that rather than
+// believe it.
+//
+// WIT deps are vendored verbatim from wasmtime v45 (wasi@0.2.6,
+// wasi:nn@0.2.0-rc-2024-10-28) so guest and host always agree.
+package enclave:speech-generator;
+
+world speech-generator {
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  export wasi:http/incoming-handler@0.2.6;
+}
