@@ -2929,7 +2929,12 @@ fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> 
 /// (tried longest-first from LOOKUP_NGRAM_MAX down to LOOKUP_NGRAM). The
 /// 2026-08-01 GPU matrix put 3-gram misfire acceptance at ~6-7%, pure round
 /// tax - only well-anchored matches are worth a verify round.
-const LOOKUP_NGRAM: usize = 5;
+/// 2026-08-03, mm18 rewind economics: a misfired verify round no longer
+/// pays a re-feed decode - it costs ~14ms over a plain step and still
+/// emits the round's replacement token - so the anchor can afford one
+/// step looser than the branch-era 5 (3-gram stays out: 6-7% acceptance
+/// was waste even at half tax).
+const LOOKUP_NGRAM: usize = 4;
 const LOOKUP_NGRAM_MAX: usize = 6;
 
 /// Prompt-lookup speculative decode: n-gram matches against the
