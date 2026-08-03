@@ -1167,7 +1167,26 @@ thread_local! {
     /// instrumented. Reported as "sync_ms"/"sync_calls" in the done frame.
     static SYNC_DELTA: std::cell::Cell<Option<(i64, i64)>> =
         const { std::cell::Cell::new(None) };
+    /// per-generation llama decode-stage deltas (ms) from the mm21 "gperf"
+    /// verb: [build, alloc, input, slot, mem-init, compute-call, output].
+    /// Reported as "gperf_ms" in the done frame.
+    static GPERF_DELTA: std::cell::Cell<Option<[i64; 7]>> =
+        const { std::cell::Cell::new(None) };
 }
+/// snapshot the host's cumulative llama decode-stage millis (mm21 "gperf"
+/// verb) at generation start; the closing call stores per-stage deltas
+fn gperf_note(sess: &mut Session, start: Option<[i32; 7]>) -> Option<[i32; 7]> {
+    let now = sess.gperf().ok()?;
+    if let Some(s0) = start {
+        let mut d = [0i64; 7];
+        for i in 0..7 {
+            d[i] = (now[i] as i64) - (s0[i] as i64);
+        }
+        GPERF_DELTA.with(|s| s.set(Some(d)));
+    }
+    Some(now)
+}
+
 /// snapshot caps' cumulative sync counters at generation start; the closing
 /// call stores the delta for the done frame
 fn sync_note(sess: &mut Session, start: Option<(i64, i64)>) -> Option<(i64, i64)> {
@@ -1453,6 +1472,34 @@ impl Session {
             i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]])
         };
         Ok([v(0), v(1), v(2)])
+    }
+
+    /// ggml only: the host's cumulative llama decode-stage millis (mm21
+    /// "gperf" verb) - [build, alloc, input, slot, mem-init, compute-call,
+    /// output]. Monotonic; callers report start/end deltas.
+    fn gperf(&mut self) -> Result<[i32; 7], String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("gperf needs the ggml backend".into());
+        };
+        let outs = ctx
+            .compute(vec![(
+                "gperf".to_string(),
+                Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes()),
+            )])
+            .map_err(|e| nn_err("gperf", e))?;
+        let g = outs
+            .iter()
+            .find(|(n, _)| n == "gperf")
+            .ok_or("host returned no \"gperf\" output (engine predates mm21)")?;
+        let data = g.1.data();
+        if data.len() < 28 {
+            return Err("gperf output too short".into());
+        }
+        let mut out = [0i32; 7];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
+        }
+        Ok(out)
     }
 
     fn caps(&mut self) -> Result<Caps, String> {
@@ -2407,6 +2454,7 @@ fn generate(
 
     let chunk = prefill_chunk(&mut sess);
     let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
+    let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     // -- prefill. Text goes in chunks so no single logits tensor gets huge;
     // an image goes whole, to the host, which encodes it and splices the
     // result into the sequence at the position the text left off.
@@ -2511,6 +2559,7 @@ fn generate(
     out.flush();
     let decode_ms = now_ms() - t2;
     sync_note(&mut sess, sync0);
+    gperf_note(&mut sess, gperf0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
@@ -3125,6 +3174,7 @@ fn generate_lookup(
     // generation (see the function doc); 0 = branch-commit, unchanged
     let depth = sess.caps().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
     let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
+    let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let t1 = now_ms();
     let chunk = prefill_chunk(&mut sess);
@@ -3301,6 +3351,7 @@ fn generate_lookup(
     out.flush();
     let decode_ms = now_ms() - t2;
     sync_note(&mut sess, sync0);
+    gperf_note(&mut sess, gperf0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
@@ -6043,6 +6094,13 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                             done["sync_ms"] = serde_json::json!(sm);
                             done["sync_calls"] = serde_json::json!(sc);
                         }
+                    }
+                    // mm21: llama decode-stage deltas (plain + lookup paths)
+                    if let Some(g) = GPERF_DELTA.with(|s| s.take()) {
+                        done["gperf_ms"] = serde_json::json!({
+                            "build": g[0], "alloc": g[1], "input": g[2],
+                            "mem": g[4], "comp": g[5], "out": g[6],
+                        });
                     }
                     let vt = timing_snapshot();
                     if !vt.is_empty() {
