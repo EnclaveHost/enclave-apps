@@ -2901,7 +2901,11 @@ fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> 
     }
     let at = |i: usize| if i < prompt.len() { prompt[i] } else { gen[i - prompt.len()] };
     let key_start = total - ng;
-    for i in (0..key_start).rev() {
+    // bounded most-recent-first: the scan runs on EVERY no-match token, so
+    // unbounded it becomes O(history) guest cpu per token by a few thousand
+    // tokens of context (see LOOKUP_WINDOW)
+    let scan_floor = key_start.saturating_sub(LOOKUP_WINDOW);
+    for i in (scan_floor..key_start).rev() {
         let mut m = true;
         for j in 0..ng {
             if at(i + j) != at(key_start + j) {
@@ -2936,6 +2940,53 @@ fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> 
 /// was waste even at half tax).
 const LOOKUP_NGRAM: usize = 4;
 const LOOKUP_NGRAM_MAX: usize = 6;
+/// how far back lookup_propose scans (most-recent-first). Unbounded, the
+/// scan is O(history) GUEST cpu on EVERY no-match token - measurable drag
+/// by 1-2k tokens of context under SNP. Recency is also where the
+/// predictive matches live.
+const LOOKUP_WINDOW: usize = 2048;
+
+/// Rolling drafting-quality gate (2026-08-03): on long novel prose the
+/// 1024-token fleet leg measured 36% acceptance and lookup NET-LOST ~2.6
+/// tok/s - mediocre rounds (verify ~31ms for ~2.4 tokens) plus scan drag
+/// beat the parity floor out of "floor by construction". Track an
+/// acceptance EMA; demand longer anchors when quality sags, stop
+/// proposing entirely when it collapses, and re-probe periodically so a
+/// quote-heavy stretch turns drafting back on.
+struct LookupGate {
+    ema: f32,
+    paused_until: usize, // out.generated.len() threshold to resume at
+}
+
+impl LookupGate {
+    fn new() -> Self {
+        Self { ema: 0.6, paused_until: 0 }
+    }
+    /// minimum anchor length to propose with right now; None = don't
+    fn min_anchor(&mut self, generated: usize) -> Option<usize> {
+        if generated < self.paused_until {
+            return None;
+        }
+        if self.ema < 0.30 {
+            // collapsed: pause, then re-probe (the probe round's own
+            // acceptance updates the ema and decides what happens next)
+            self.paused_until = generated + 64;
+            self.ema = 0.35; // probe optimism: one clean round reopens
+            return None;
+        }
+        if self.ema < 0.45 {
+            return Some(LOOKUP_NGRAM + 1); // well-anchored matches only
+        }
+        Some(LOOKUP_NGRAM)
+    }
+    fn observe(&mut self, accepted: usize, drafted: usize) {
+        if drafted == 0 {
+            return;
+        }
+        let r = accepted as f32 / drafted as f32;
+        self.ema = 0.8 * self.ema + 0.2 * r;
+    }
+}
 
 /// Prompt-lookup speculative decode: n-gram matches against the
 /// conversation as the proposer - no draft model, no MTP head, so it runs
@@ -3002,6 +3053,7 @@ fn generate_lookup(
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
     let mut t_fed = prompt_ids.len();
+    let mut gate = LookupGate::new();
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
     let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
@@ -3046,12 +3098,16 @@ fn generate_lookup(
         }
         // -- history proposes, longest context first (a 5-gram match predicts
         //    its continuation far better than a bare 3-gram); no match at any
-        //    length = one ordinary plain step
+        //    length = one ordinary plain step. The gate decides the minimum
+        //    anchor worth a round right now - or that none is (sustained low
+        //    acceptance: drafting off, re-probed periodically).
         let mut drafts = Vec::new();
-        for ng in (LOOKUP_NGRAM..=LOOKUP_NGRAM_MAX).rev() {
-            drafts = lookup_propose(prompt_ids, &out.generated, ng, k);
-            if !drafts.is_empty() {
-                break;
+        if let Some(min_ng) = gate.min_anchor(out.generated.len()) {
+            for ng in (min_ng..=LOOKUP_NGRAM_MAX).rev() {
+                drafts = lookup_propose(prompt_ids, &out.generated, ng, k);
+                if !drafts.is_empty() {
+                    break;
+                }
             }
         }
         if drafts.is_empty() {
@@ -3115,6 +3171,7 @@ fn generate_lookup(
             acc += 1;
         }
         accepted += acc;
+        gate.observe(acc, m);
         if let Some(r) = replacement {
             if depth > 0 {
                 // partial round, rewind-commit: drop the rejected tail off
