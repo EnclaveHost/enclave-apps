@@ -1,0 +1,23 @@
+{
+ "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (mounted at /models/<name>). Everything else overlays the config embedded in the wasm, per field, and the 'models' catalog merges per volume key. Attach volumes by the EXACT names the enclave carries; the attach name is the catalog key.",
+ "_sizing_comment": "SIZING: weights + KV cache at the NODE's context window + THE AUDIO ENCODER + ~1.5 GB working set. Granite Speech 4.1's LM is a dense 40-layer granite with only 4 KV heads (head_dim 128 = ~40 KiB/token at f16 K/V, ~21 KiB at q8_0 - a pleasantly small window term), and the encoder mmproj is 1.2 GB, priced in even though it loads LAZILY on the first clip: a share that fits the LM alone would serve /health fine and then abort the whole tenant on the first recording (CUDA OOM inside compute() calls ggml_abort). At a 176K q8_0 node window: ~2 GB weights + ~3.7 GB KV + ~1.7 GB encoder+allowance + 1.5 GB working set = ~9 GB = gpu 0.07 of a 141 GB H200. Trust GET /health over these numbers - it computes from the node's own environment and REFUSES a model it cannot serve.",
+ "_auth_comment": "SET AN API KEY. api_key gates the /v1/* surface; the playground routes (including /transcribe, the page's engine) stay open, the same posture as every sibling GPU app - a PRIVATE deployment is the fleet's real gate for the data path. Reference the credential as a SECRET BY NAME as below, never the literal: this file is published on-chain by CID and world-readable. Set the value in the deployment's secrets ({\"set\":{\"SPEECH_READER_API_KEY\":\"<key>\"}}) and restart.",
+ "_audio_comment": "AUDIO NEEDS A NODE whose shim carries the mtmd audio verb - PLATFORM.md in this app is the complete spec (it is the image verb's mirror; the pinned llama.cpp already compiles the granite-speech encoder graph). On an older node the app refuses recordings with [audio_unsupported] and the reason rather than silently failing; GET /health?probe=1 opens a real session and asks the host, which is the only way to know without sending a clip. A volume without its *mmproj*.gguf audio encoder is reported with hears:false and a why_deaf line rather than dropped from the listing. Inputs: wav (chunked at quiet points into ~4 min episodes - the model is trained at 4096 positions), mp3/flac (passed whole, admitted by byte cap). ogg/opus/webm are refused by name - the playground records raw WAV precisely so browsers never send them.",
+ "volumes": [
+  "granite-speech-4.1-2b-gguf"
+ ],
+ "api_key": "$SPEECH_READER_API_KEY",
+ "models": {
+  "granite-speech-4.1-2b-gguf": {
+   "name": "granite-speech-4.1-2b",
+   "n_layers": 40,
+   "n_kv_heads": 4,
+   "head_dim": 128,
+   "vocab": 100353,
+   "eos": [100257],
+   "chunk_seconds": 240,
+   "max_positions": 4000,
+   "temperature": 0.0
+  }
+ }
+}

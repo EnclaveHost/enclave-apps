@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>speech-reader</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --edge: #30363d; --text: #e6edf3;
+    --dim: #8b949e; --accent: #58a6ff; --ok: #3fb950; --err: #f85149; --rec: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; min-height: 100vh;
+  }
+  main { width: min(720px, 100%); padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 .tag { color: var(--dim); font-weight: 400; font-size: 14px; margin-left: 8px; }
+  p.sub { color: var(--dim); margin: 0 0 20px; font-size: 13px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  button {
+    padding: 10px 18px; font: inherit; font-weight: 600; border-radius: 8px;
+    border: 1px solid var(--edge); background: var(--panel); color: var(--text);
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #rec.recording { background: var(--rec); color: #fff; border-color: var(--rec); }
+  #drop {
+    border: 1px dashed var(--edge); border-radius: 8px; padding: 14px;
+    color: var(--dim); font-size: 13px; text-align: center; cursor: pointer;
+  }
+  #drop.over { border-color: var(--accent); color: var(--text); }
+  select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 10px 12px; font: inherit;
+  }
+  #out {
+    margin-top: 16px; background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 14px; min-height: 120px; white-space: pre-wrap;
+    font-size: 15px;
+  }
+  #out:empty::before { content: "The transcript appears here."; color: var(--dim); }
+  #status { margin-top: 10px; font-size: 13px; color: var(--dim); min-height: 20px; }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+  .actions { margin-top: 8px; display: flex; gap: 12px; font-size: 13px; }
+  .actions a { color: var(--accent); cursor: pointer; }
+  footer { margin-top: 32px; font-size: 12px; color: var(--dim); }
+  code { background: var(--panel); border: 1px solid var(--edge); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>speech-reader<span class="tag">Granite Speech 4.1 &middot; 6 languages</span></h1>
+  <p class="sub">Speech to text inside the enclave. The recording goes to an attested
+  component with no outbound network: transcribed to you, kept by no one.</p>
+
+  <div class="row">
+    <button id="rec">&#9679; Record</button>
+    <select id="task">
+      <option value="transcribe" selected>Transcribe</option>
+      <option value="translate">Translate to English</option>
+    </select>
+  </div>
+  <div id="drop">&hellip;or drop / choose an audio file (wav, mp3, flac)
+    <input type="file" id="file" accept=".wav,.mp3,.flac,audio/*" hidden>
+  </div>
+
+  <div id="out"></div>
+  <div id="status"></div>
+  <div class="actions">
+    <a id="copy" style="display:none">Copy</a>
+    <a id="dltxt" style="display:none" download="transcript.txt">Download .txt</a>
+  </div>
+
+  <footer>
+    API: <code>POST /v1/audio/transcriptions</code> (OpenAI-compatible) &middot;
+    <code>curl --data-binary @a.wav /transcribe</code> &middot; <code>GET /health?probe=1</code>
+  </footer>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+// ---- recording: raw PCM -> 16 kHz mono s16 WAV, in the page. MediaRecorder
+// would hand us webm/opus, which the deployment (rightly) refuses; capturing
+// samples ourselves means what we upload is exactly what the host can read.
+let media = null, ctx = null, node = null, srcNode = null, buffers = [], recRate = 16000;
+
+function encodeWav(chunks, rate) {
+  let n = 0;
+  for (const c of chunks) n += c.length;
+  const data = new Int16Array(n);
+  let o = 0;
+  for (const c of chunks) { data.set(c, o); o += c.length; }
+  const b = new ArrayBuffer(44 + data.length * 2);
+  const v = new DataView(b);
+  const w = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + data.length * 2, true); w(8, "WAVE");
+  w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, data.length * 2, true);
+  new Int16Array(b, 44).set(data);
+  return new Blob([b], { type: "audio/wav" });
+}
+
+async function startRec() {
+  media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 }, video: false });
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  recRate = ctx.sampleRate; // the browser may refuse 16k and give us 48k; the host resamples
+  srcNode = ctx.createMediaStreamSource(media);
+  node = ctx.createScriptProcessor(4096, 1, 1);
+  buffers = [];
+  node.onaudioprocess = e => {
+    const f = e.inputBuffer.getChannelData(0);
+    const s = new Int16Array(f.length);
+    for (let i = 0; i < f.length; i++) {
+      const x = Math.max(-1, Math.min(1, f[i]));
+      s[i] = x < 0 ? x * 32768 : x * 32767;
+    }
+    buffers.push(s);
+    const secs = buffers.reduce((a, c) => a + c.length, 0) / recRate;
+    $("status").textContent = "Recording… " + secs.toFixed(0) + " s (click Stop to transcribe)";
+  };
+  srcNode.connect(node);
+  node.connect(ctx.destination);
+}
+
+function stopRec() {
+  if (node) { node.disconnect(); srcNode.disconnect(); }
+  if (media) media.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close();
+  const wav = encodeWav(buffers, recRate);
+  media = ctx = node = srcNode = null; buffers = [];
+  return wav;
+}
+
+$("rec").onclick = async () => {
+  const b = $("rec");
+  if (b.classList.contains("recording")) {
+    b.classList.remove("recording");
+    b.innerHTML = "&#9679; Record";
+    transcribe(stopRec());
+  } else {
+    try {
+      await startRec();
+      b.classList.add("recording");
+      b.textContent = "Stop";
+      $("status").className = "";
+    } catch (e) {
+      $("status").className = "err";
+      $("status").textContent = "Microphone: " + e.message;
+    }
+  }
+};
+
+// ---- file input
+$("drop").onclick = () => $("file").click();
+$("file").onchange = () => { if ($("file").files[0]) transcribe($("file").files[0]); };
+for (const ev of ["dragover", "dragleave", "drop"]) {
+  $("drop").addEventListener(ev, e => {
+    e.preventDefault();
+    $("drop").classList.toggle("over", ev === "dragover");
+    if (ev === "drop" && e.dataTransfer.files[0]) transcribe(e.dataTransfer.files[0]);
+  });
+}
+
+// ---- the SSE engine
+let busy = false;
+async function transcribe(blob) {
+  if (busy) return;
+  busy = true;
+  const st = $("status"), outEl = $("out");
+  outEl.textContent = "";
+  $("copy").style.display = "none"; $("dltxt").style.display = "none";
+  st.className = ""; st.textContent = "Uploading " + (blob.size / 1024 / 1024).toFixed(1) + " MB…";
+  const t0 = performance.now();
+  try {
+    const task = $("task").value;
+    const resp = await fetch("transcribe" + (task === "translate" ? "?task=translate" : ""), {
+      method: "POST",
+      headers: { "content-type": blob.type || "application/octet-stream" },
+      body: blob,
+    });
+    if (!resp.ok || !resp.headers.get("content-type")?.includes("event-stream")) {
+      const e = await resp.json().catch(() => null);
+      throw new Error((e && e.error && e.error.message) || ("HTTP " + resp.status));
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!frame.startsWith("data: ")) continue;
+        const m = JSON.parse(frame.slice(6));
+        if (m.delta) outEl.textContent += m.delta;
+        else if (m.status) st.textContent = m.status;
+        else if (m.error) throw new Error(m.error);
+        else if (m.done) {
+          const secs = ((performance.now() - t0) / 1000).toFixed(1);
+          st.className = "ok";
+          st.textContent = "Done: " + (m.tokens || 0) + " tokens, " +
+            (m.audio_positions || 0) + " audio positions, " + secs + " s" +
+            (m.duration_seconds ? " (" + m.duration_seconds.toFixed(0) + " s of audio)" : "") + ".";
+        }
+      }
+    }
+    if (outEl.textContent.trim()) {
+      $("copy").style.display = "inline";
+      $("dltxt").style.display = "inline";
+      $("dltxt").href = URL.createObjectURL(new Blob([outEl.textContent], { type: "text/plain" }));
+    } else if (!st.classList.contains("ok")) {
+      st.className = "err"; st.textContent = st.textContent || "No transcript arrived.";
+    }
+  } catch (e) {
+    st.className = "err";
+    st.textContent = "Failed: " + e.message;
+  } finally {
+    busy = false;
+  }
+}
+
+$("copy").onclick = () => navigator.clipboard.writeText($("out").textContent);
+</script>
+</body>
+</html>
