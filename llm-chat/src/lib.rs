@@ -1161,6 +1161,26 @@ thread_local! {
     /// frame: where the TTFT that is neither prefill nor decode goes
     static INIT_MS: std::cell::RefCell<Vec<(&'static str, u64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// per-generation CUDA stream-sync delta [ms, calls] (mm20 engines,
+    /// caps[8]/[9]): the direct measurement of the CVM's per-decode fixed
+    /// cost. (-1,-1) = engine predates the instrument; unset = path not
+    /// instrumented. Reported as "sync_ms"/"sync_calls" in the done frame.
+    static SYNC_DELTA: std::cell::Cell<Option<(i64, i64)>> =
+        const { std::cell::Cell::new(None) };
+}
+/// snapshot caps' cumulative sync counters at generation start; the closing
+/// call stores the delta for the done frame
+fn sync_note(sess: &mut Session, start: Option<(i64, i64)>) -> Option<(i64, i64)> {
+    let c = sess.caps().ok()?;
+    if c.sync_ms < 0 {
+        SYNC_DELTA.with(|s| s.set(Some((-1, -1))));
+        return None;
+    }
+    let now = (c.sync_ms as i64, c.sync_calls as i64);
+    if let Some((m0, c0)) = start {
+        SYNC_DELTA.with(|s| s.set(Some((now.0 - m0, now.1 - c0))));
+    }
+    Some(now)
 }
 fn init_note(label: &'static str, since: u128) -> u128 {
     let t = now_ms();
@@ -1465,6 +1485,8 @@ impl Session {
             host_tok: data.len() >= 24 && v(5) != 0,
             rewind_depth: if data.len() >= 28 { v(6).max(0) } else { 0 },
             mtp_fold: data.len() >= 32 && v(7) != 0,
+            sync_ms: if data.len() >= 36 { v(8) } else { -1 },
+            sync_calls: if data.len() >= 40 { v(9) } else { -1 },
         })
     }
 
@@ -1774,6 +1796,11 @@ struct Caps {
     /// (mm19+), replacing the per-round mtp_accept trip and its arbiter
     /// grant. false on older hosts: keep the explicit accept.
     mtp_fold: bool,
+    /// cumulative CUDA stream-sync ms / call count since process start
+    /// (mm20 sync-instr; -1 = engine predates it). Generations report the
+    /// DELTA as "sync_ms"/"sync_calls" - the per-decode fixed-cost probe.
+    sync_ms: i32,
+    sync_calls: i32,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -2379,6 +2406,7 @@ fn generate(
     }
 
     let chunk = prefill_chunk(&mut sess);
+    let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
     // -- prefill. Text goes in chunks so no single logits tensor gets huge;
     // an image goes whole, to the host, which encodes it and splices the
     // result into the sequence at the position the text left off.
@@ -2482,6 +2510,7 @@ fn generate(
     }
     out.flush();
     let decode_ms = now_ms() - t2;
+    sync_note(&mut sess, sync0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
@@ -3095,6 +3124,7 @@ fn generate_lookup(
     // one cheap caps probe decides the round-commit strategy for the whole
     // generation (see the function doc); 0 = branch-commit, unchanged
     let depth = sess.caps().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
+    let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let t1 = now_ms();
     let chunk = prefill_chunk(&mut sess);
@@ -3270,6 +3300,7 @@ fn generate_lookup(
     }
     out.flush();
     let decode_ms = now_ms() - t2;
+    sync_note(&mut sess, sync0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
@@ -6004,6 +6035,14 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                             m.insert(label.to_string(), serde_json::json!(ms));
                         }
                         done["init_ms"] = serde_json::Value::Object(m);
+                    }
+                    // mm20 sync-instr: per-generation CUDA stream-sync delta
+                    // (plain + lookup paths). take() clears between requests.
+                    if let Some((sm, sc)) = SYNC_DELTA.with(|s| s.take()) {
+                        if sm >= 0 {
+                            done["sync_ms"] = serde_json::json!(sm);
+                            done["sync_calls"] = serde_json::json!(sc);
+                        }
                     }
                     let vt = timing_snapshot();
                     if !vt.is_empty() {
