@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>speech-generator</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --edge: #30363d; --text: #e6edf3;
+    --dim: #8b949e; --accent: #58a6ff; --ok: #3fb950; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; min-height: 100vh;
+  }
+  main { width: min(720px, 100%); padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 .tag { color: var(--dim); font-weight: 400; font-size: 14px; margin-left: 8px; }
+  p.sub { color: var(--dim); margin: 0 0 20px; font-size: 13px; }
+  textarea, select, input[type=text] {
+    width: 100%; background: var(--panel); color: var(--text);
+    border: 1px solid var(--edge); border-radius: 8px; padding: 10px 12px;
+    font: inherit; resize: vertical;
+  }
+  textarea:focus, select:focus, input:focus { outline: 1px solid var(--accent); }
+  #text { min-height: 120px; }
+  label { display: block; color: var(--dim); font-size: 12px; margin: 14px 0 4px; text-transform: uppercase; letter-spacing: .05em; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 200px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chips button {
+    background: var(--panel); color: var(--dim); border: 1px solid var(--edge);
+    border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer;
+  }
+  .chips button:hover { color: var(--text); border-color: var(--accent); }
+  #go {
+    margin-top: 18px; width: 100%; padding: 12px; font: inherit; font-weight: 600;
+    background: var(--accent); color: #0d1117; border: 0; border-radius: 8px;
+    cursor: pointer;
+  }
+  #go:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 12px; font-size: 13px; color: var(--dim); min-height: 20px; }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+  #player { margin-top: 12px; width: 100%; display: none; }
+  #dl { display: none; margin-top: 8px; font-size: 13px; color: var(--accent); }
+  footer { margin-top: 32px; font-size: 12px; color: var(--dim); }
+  footer a { color: var(--dim); }
+  code { background: var(--panel); border: 1px solid var(--edge); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>speech-generator<span class="tag">Maya1 &middot; SNAC &middot; 24&nbsp;kHz</span></h1>
+  <p class="sub">Text to speech inside the enclave. The 3B voice model runs on the GPU share;
+  the SNAC codec decodes in the wasm sandbox. No outbound network exists in this component:
+  what you type is spoken to you and kept by no one.</p>
+
+  <label for="text">Text</label>
+  <textarea id="text" placeholder="Type something to say. Emotion tags go inline: I can't believe it <laugh> that actually worked!"></textarea>
+  <div class="chips" id="tags"></div>
+
+  <div class="row">
+    <div>
+      <label for="voice">Voice</label>
+      <select id="voice"></select>
+    </div>
+    <div>
+      <label for="seed">Seed (optional)</label>
+      <input type="text" id="seed" inputmode="numeric" placeholder="random">
+    </div>
+  </div>
+
+  <div id="descwrap" style="display:none">
+    <label for="desc">Voice description</label>
+    <textarea id="desc" rows="2" placeholder="Describe the voice like a casting brief: age, accent, pitch, pace, character."></textarea>
+  </div>
+
+  <button id="go">Speak</button>
+  <div id="status"></div>
+  <audio id="player" controls></audio>
+  <a id="dl" download="speech.wav">Download WAV</a>
+
+  <footer>
+    API: <code>POST /v1/audio/speech</code> (OpenAI-compatible) &middot;
+    <code>GET /speak?text=hello</code> &middot; <code>GET /health?probe=1</code>
+  </footer>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const EMOTIONS = ["laugh","giggle","chuckle","sigh","gasp","whisper","cry","angry","excited","sing","snort","scream"];
+for (const t of EMOTIONS) {
+  const b = document.createElement("button");
+  b.textContent = "<" + t + ">";
+  b.onclick = () => {
+    const ta = $("text"), a = ta.selectionStart, z = ta.selectionEnd;
+    ta.value = ta.value.slice(0, a) + "<" + t + "> " + ta.value.slice(z);
+    ta.focus(); ta.selectionStart = ta.selectionEnd = a + t.length + 3;
+  };
+  $("tags").appendChild(b);
+}
+
+fetch("voices").then(r => r.json()).then(v => {
+  const sel = $("voice");
+  for (const name of Object.keys(v.voices)) {
+    const o = document.createElement("option");
+    o.value = name;
+    o.textContent = name + " — " + v.voices[name].slice(0, 60) + (v.voices[name].length > 60 ? "…" : "");
+    if (name === v.default) o.selected = true;
+    sel.appendChild(o);
+  }
+  const custom = document.createElement("option");
+  custom.value = "__custom__";
+  custom.textContent = "custom — describe the voice yourself";
+  sel.appendChild(custom);
+  sel.onchange = () => { $("descwrap").style.display = sel.value === "__custom__" ? "" : "none"; };
+}).catch(() => {});
+
+let audioCtx = null;
+
+$("go").onclick = async () => {
+  const text = $("text").value.trim();
+  const st = $("status");
+  if (!text) { st.textContent = "Type something first."; st.className = "err"; return; }
+  $("go").disabled = true;
+  st.className = ""; st.textContent = "Requesting…";
+  $("player").style.display = "none"; $("dl").style.display = "none";
+
+  const body = { text };
+  if ($("voice").value === "__custom__") body.description = $("desc").value.trim();
+  else body.voice = $("voice").value;
+  const seed = $("seed").value.trim();
+  if (seed) body.seed = Number(seed);
+
+  // progressive playback: parse the PCM out of the WAV stream and schedule it
+  // into the audio clock as it arrives, so speech is audible while the model
+  // is still talking
+  audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+  await audioCtx.resume();
+  let playhead = 0;
+  const t0 = performance.now();
+  const all = [];           // every byte, for the download blob
+  let pcmCarry = new Uint8Array(0);
+  let headerSkipped = false;
+  let samplesHeard = 0;
+
+  const schedule = bytes => {
+    // bytes -> i16 -> f32 buffer at 24 kHz, scheduled back to back
+    const n = bytes.length >> 1;
+    if (!n) return;
+    const buf = audioCtx.createBuffer(1, n, 24000);
+    const ch = buf.getChannelData(0);
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+    for (let i = 0; i < n; i++) ch[i] = dv.getInt16(i * 2, true) / 32768;
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf; src.connect(audioCtx.destination);
+    if (playhead < audioCtx.currentTime) playhead = audioCtx.currentTime + 0.25;
+    src.start(playhead);
+    playhead += buf.duration;
+    samplesHeard += n;
+  };
+
+  try {
+    const resp = await fetch("speak", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => null);
+      throw new Error((e && e.error && e.error.message) || ("HTTP " + resp.status));
+    }
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      all.push(value);
+      // strip the 44-byte header once, then keep i16 alignment across chunks
+      let merged = new Uint8Array(pcmCarry.length + value.length);
+      merged.set(pcmCarry); merged.set(value, pcmCarry.length);
+      if (!headerSkipped) {
+        if (merged.length < 44) { pcmCarry = merged; continue; }
+        merged = merged.subarray(44); headerSkipped = true;
+      }
+      const even = merged.length & ~1;
+      schedule(merged.subarray(0, even));
+      pcmCarry = merged.subarray(even).slice();
+      const secs = (samplesHeard / 24000).toFixed(1);
+      st.textContent = "Speaking… " + secs + " s of audio (" + ((performance.now() - t0) / 1000).toFixed(0) + " s elapsed)";
+    }
+    if (!headerSkipped) throw new Error("stream ended before any audio arrived");
+    const secs = samplesHeard / 24000;
+    if (secs === 0) throw new Error("the model produced no audio - try /health?probe=1");
+    st.className = "ok";
+    st.textContent = "Done: " + secs.toFixed(1) + " s of speech in " + ((performance.now() - t0) / 1000).toFixed(1) + " s.";
+    // hand the complete take to a normal player + download link. The stream
+    // header says "unknown length", so rewrite it with the real sizes.
+    const total = all.reduce((s, a) => s + a.length, 0);
+    const wav = new Uint8Array(total);
+    let off = 0; for (const a of all) { wav.set(a, off); off += a.length; }
+    const dvh = new DataView(wav.buffer);
+    dvh.setUint32(4, total - 8, true);
+    dvh.setUint32(40, total - 44, true);
+    const url = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
+    $("player").src = url; $("player").style.display = "";
+    $("dl").href = url; $("dl").style.display = "inline";
+  } catch (e) {
+    st.className = "err";
+    st.textContent = "Failed: " + e.message;
+  } finally {
+    $("go").disabled = false;
+  }
+};
+</script>
+</body>
+</html>

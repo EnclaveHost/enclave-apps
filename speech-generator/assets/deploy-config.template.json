@@ -1,0 +1,26 @@
+{
+ "_comment": "Publish-console 'App config' template (deployment defaults, becomes ENCLAVE_CONFIG via configCid). 'volumes' names the attested model volumes the platform attaches (the wasm-manager mounts each at /models/<name> in the guest - no paths here by design). Everything else overlays the config embedded in the wasm, per field, and the 'models' catalog merges per volume key, so a deployment adds or tweaks one model without restating the rest. Attach volumes by the EXACT names the enclave carries; the attach name is the catalog key.",
+ "_sizing_comment": "SIZING: weights + KV cache at the NODE's context window + ~1.5 GB working set. Maya1 is a dense 3B (28 layers, 8 KV heads, head_dim 128 = ~112 KiB/token at f16 K/V, ~60 KiB at q8_0), and the weights are only 3.5 GB, so the NODE WINDOW is the whole bill: at a 176K q8_0 window the KV term is ~10.7 GB and the deployment wants ~16 GB = gpu 0.12 of a 141 GB H200; f16 K/V nearly doubles that. The app itself never needs a long window (a speaking episode is ~200 prompt tokens + 2048 audio tokens), but llama.cpp allocates the node's full window up front regardless. Do not guess from these numbers: GET /health computes them from the node's own environment and reports `fits` per model with the shortfall spelled out, and the app REFUSES a model it cannot serve rather than attempting it (a CUDA OOM inside compute() aborts the whole tenant).",
+ "_auth_comment": "SET AN API KEY. api_key gates the /v1/* surface (the OpenAI-compatible endpoint); the playground routes - including /speak, which is the page's engine - stay open, same posture as the sibling GPU apps: an app-level password on a public page protects nothing an attacker wants, and a PRIVATE deployment is the fleet's real gate for the data path. Reference the credential as a SECRET BY NAME as below, never the literal: this file is published on-chain by CID and world-readable. Set the value in the deployment's secrets ({\"set\":{\"SPEECH_GENERATOR_API_KEY\":\"<key>\"}}) and restart.",
+ "_speech_comment": "A SPEECH VOLUME is an ordinary ggml volume plus snac_decoder.bin (the guest-side audio codec; fetch-model.sh derives it deterministically and pins its sha256). A volume missing that file is listed by /health with why_mute rather than served silently wrong. The host needs NO audio support of any kind - the model is an ordinary Llama to it - so any node that serves llm-chat serves this. GET /health?probe=1 checks both halves: a real session open (GPU) and a real parse of the volume's SNAC decoder (CPU).",
+ "volumes": [
+  "maya1-gguf"
+ ],
+ "api_key": "$SPEECH_GENERATOR_API_KEY",
+ "models": {
+  "maya1-gguf": {
+   "name": "maya1",
+   "n_layers": 28,
+   "n_kv_heads": 8,
+   "head_dim": 128,
+   "vocab": 156960,
+   "temperature": 0.4,
+   "top_p": 0.9,
+   "rep_penalty": 1.1,
+   "rep_window": 0,
+   "max_text_chars": 4000,
+   "chunk_max_chars": 600,
+   "max_new_tokens": 2048
+  }
+ }
+}
