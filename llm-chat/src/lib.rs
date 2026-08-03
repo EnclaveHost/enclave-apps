@@ -1464,6 +1464,7 @@ impl Session {
             n_batch: if data.len() >= 20 && v(4) > 0 { Some(v(4) as u32) } else { None },
             host_tok: data.len() >= 24 && v(5) != 0,
             rewind_depth: if data.len() >= 28 { v(6).max(0) } else { 0 },
+            mtp_fold: data.len() >= 32 && v(7) != 0,
         })
     }
 
@@ -1516,7 +1517,12 @@ impl Session {
 
     /// ggml only: the model's own MTP head proposes up to k tokens (greedy,
     /// stops when its confidence drops below p_min). May return fewer or none.
-    fn mtp_draft(&mut self, id_last: u32, k: usize, p_min_milli: i32) -> Result<Vec<u32>, String> {
+    /// `obs`: fold the previous round's accepted tokens into the same call
+    /// (mm19 engines, caps mtp_fold) - saves the mtp_accept round trip AND
+    /// an arbiter grant per round. Only pass it when the host reports the
+    /// capability; older hosts ignore unknown inputs at best.
+    fn mtp_draft(&mut self, id_last: u32, k: usize, p_min_milli: i32,
+                 obs: Option<(usize, &[u32])>) -> Result<Vec<u32>, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1524,11 +1530,23 @@ impl Session {
         bytes.extend_from_slice(&(id_last as i32).to_le_bytes());
         bytes.extend_from_slice(&(k as i32).to_le_bytes());
         bytes.extend_from_slice(&p_min_milli.to_le_bytes());
+        let mut inputs = vec![
+            ("mtp_draft".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
+            timing_input(),
+        ];
+        if let Some((pos0, toks)) = obs {
+            let mut ob = Vec::with_capacity((toks.len() + 1) * 4);
+            ob.extend_from_slice(&(pos0 as i32).to_le_bytes());
+            for t in toks {
+                ob.extend_from_slice(&(*t as i32).to_le_bytes());
+            }
+            inputs.push((
+                "mtp_obs".to_string(),
+                Tensor::new(&[(toks.len() + 1) as u32], TensorType::I32, &ob),
+            ));
+        }
         let outs = ctx
-            .compute(vec![
-                ("mtp_draft".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
-                timing_input(),
-            ])
+            .compute(inputs)
             .map_err(|e| nn_err("mtp_draft", e))?;
         note_timing("mtp_draft", &outs);
         let draft = outs
@@ -1752,6 +1770,10 @@ struct Caps {
     /// caches hot - instead of branch-verify. 0 on hosts that predate the
     /// export or contexts without snapshots: branch via copy_from.
     rewind_depth: i32,
+    /// mtp observe-fold: "mtp_draft" accepts a companion "mtp_obs" input
+    /// (mm19+), replacing the per-round mtp_accept trip and its arbiter
+    /// grant. false on older hosts: keep the explicit accept.
+    mtp_fold: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -1807,20 +1829,26 @@ fn open_mtp(
     // context works (locally proven: depth 1 on CUDA, rewind-commit,
     // +50% over plain) but the head context adds its own full-window
     // attention KV on top of the snapshot groups' VRAM, and at depth 4 on
-    // a 27b/25%-share the sum sits AT the MPS pinned-memory limit - where
-    // an over-limit allocation BLOCKS instead of failing, wedging the
-    // decode turn forever (observed live: "prefilling N prompt tokens"
-    // then nothing; depth-4-without-mtp and mtp-without-depth both run).
-    // Until the fit math prices snapshots + head together, allow only
-    // shallow depths with clear headroom and refuse the rest loudly.
+    // a 27b/25%-share at the 256K node window the sum sits AT the MPS
+    // pinned-memory limit - where an over-limit allocation BLOCKS instead
+    // of failing, wedging the decode turn forever. Depths 3-4 are allowed
+    // when the deployment shrank its pool (nnCtx <= 128K, forwarded to the
+    // guest as ENCLAVE_GGML_N_CTX) - that frees several GB, which is the
+    // knob's whole point. Deeper than 4 stays refused with MTP.
     if caps.rewind_depth > 2 {
-        return Err(
-            "[mtp_snapshots] this deployment's nnRsSeq depth plus the MTP head's KV can \
-             exceed the share's pinned-VRAM limit, which wedges instead of failing (seen \
-             at depth 4 on a 27b). Use nnRsSeq <= 2 with MTP, or draft:\"lookup\" for \
-             deeper snapshots"
-                .into(),
-        );
+        let n_ctx: u64 = std::env::var("ENCLAVE_GGML_N_CTX")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(u64::MAX);
+        if caps.rewind_depth > 4 || n_ctx > 131072 {
+            return Err(
+                "[mtp_snapshots] this deployment's nnRsSeq depth plus the MTP head's KV \
+                 can exceed the share's pinned-VRAM limit, which wedges instead of \
+                 failing (seen at depth 4 on a 27b at 256K). With MTP use nnRsSeq <= 2, \
+                 or nnRsSeq <= 4 with nnCtx <= 131072; draft:\"lookup\" has no depth cap"
+                    .into(),
+            );
+        }
     }
     let t_seq = caps.seq;
     let mut tscr = Session::open(cfg, target)?;
@@ -2709,7 +2737,14 @@ fn generate_mtp(
     // when the host keeps recurrent snapshots deep enough for a whole round,
     // branch-commit otherwise. MTP drafts EVERY round (no n-gram luck), so
     // the stable (seq, shape) rewind mode buys replay on every verify.
-    let depth = sess.caps().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
+    let gcaps = sess.caps().ok();
+    let depth = gcaps.as_ref().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
+    // observe-fold (mm19 hosts): the round's accepted tokens ride the NEXT
+    // draft call instead of their own mtp_accept trip. The deferred tokens
+    // stay valid because verify_h rows are only rewritten by the next
+    // mtp-flagged pass, which the fold always precedes.
+    let fold = gcaps.as_ref().map(|c| c.mtp_fold).unwrap_or(false);
+    let mut pending_obs: Option<(usize, Vec<u32>)> = None;
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let p_min_milli = (cfg.draft_p_min.clamp(0.0, 0.95) * 1000.0) as i32;
     // -- prefill through the MTP-aware feed: every chunk's positions are
@@ -2773,6 +2808,11 @@ fn generate_mtp(
                 break 'outer;
             }
             guard_from = out.generated.len();
+            // a deferred observe must land BEFORE the forced pass below
+            // overwrites the harvest rows it pairs with
+            if let Some((op, ot)) = pending_obs.take() {
+                sess.mtp_accept(op, &ot)?;
+            }
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             // every id is force-accepted, so rewind mode needs no rewind -
@@ -2797,7 +2837,22 @@ fn generate_mtp(
         }
         // -- the head proposes (0..=k tokens; an empty draft still verifies
         //    [pending] alone, which adopts as a plain step)
-        let drafts = sess.mtp_draft(pending, k, p_min_milli)?;
+        let obs_now = pending_obs.take();
+        let mut drafts = sess.mtp_draft(
+            pending, k, p_min_milli,
+            obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
+        )?;
+        if drafts.is_empty() {
+            if let Some((op, ot)) = obs_now {
+                // a folded call returning nothing is ambiguous: the observe
+                // may have failed before drafting. Re-observe explicitly
+                // (idempotent - same rows, same positions) so the head never
+                // silently desyncs, then draft once more without the fold.
+                sess.mtp_accept(op, &ot)?;
+                drafts = sess.mtp_draft(pending, k, p_min_milli, None)?;
+            }
+        }
+        let drafts = drafts;
         drafted += drafts.len();
         let m = drafts.len();
         let t_fed0 = t_fed; // mtp_accept mirrors at the PRE-round position
@@ -2852,8 +2907,14 @@ fn generate_mtp(
         }
         accepted += acc;
         // -- the head learns ONLY the accepted tokens (its KV never holds a
-        //    rejected proposal), then the target commits them
-        sess.mtp_accept(t_fed0, &feed[..acc + 1])?;
+        //    rejected proposal), then the target commits them. On fold-aware
+        //    hosts the observe rides the NEXT round's draft call instead of
+        //    paying its own trip (and arbiter grant) here.
+        if fold {
+            pending_obs = Some((t_fed0, feed[..acc + 1].to_vec()));
+        } else {
+            sess.mtp_accept(t_fed0, &feed[..acc + 1])?;
+        }
         if let Some(r) = replacement {
             if depth > 0 {
                 // rewind-commit: drop the rejected tail (m - acc <= k <=
