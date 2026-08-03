@@ -1803,6 +1803,23 @@ fn open_mtp(
     if !caps.mtp {
         return Err("this model volume carries no MTP head (use an *-mtp volume, or name a draft model)".into());
     }
+    // WEDGE GUARD (2026-08-03, mm18): under a recurrent-snapshot context
+    // (deployment nnRsSeq > 0) the MTP-aware prefill hangs on the fleet -
+    // the nextn-enabled target graph plus the keep_rs delta-net path is a
+    // combination the CUDA engine has never scheduled before, and the pass
+    // never returns (observed live: "prefilling N prompt tokens" then
+    // nothing, decode turn held). Until an engine build proves the combo
+    // out, refuse MTP here so the caller's existing fallback runs instead
+    // of wedging the deployment. Snapshot deployments should use
+    // draft:"lookup", which is validated AND faster under snapshots.
+    if caps.rewind_depth > 0 {
+        return Err(
+            "[mtp_snapshots] this deployment enables recurrent snapshots (nnRsSeq), and the \
+             MTP pass is not yet validated under them on this engine - use draft:\"lookup\" \
+             with snapshots, or drop nnRsSeq for MTP"
+                .into(),
+        );
+    }
     let t_seq = caps.seq;
     let mut tscr = Session::open(cfg, target)?;
     let tscr_seq = tscr.caps()?.seq;
