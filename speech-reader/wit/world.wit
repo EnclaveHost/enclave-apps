@@ -1,0 +1,25 @@
+// speech-reader: speech to text on Enclave's wasi-nn GPU interface, as a wasm
+// component with a built-in web UI. The model (Granite Speech 4.1 2B: a
+// conformer audio encoder + projector feeding a dense granite LM, adapters
+// merged) runs behind the host's ggml backend like any other GGUF volume; the
+// audio file itself crosses to the host through the mtmd "audio" verb, the
+// exact mirror of image-reader's "image" verb (see PLATFORM.md for the small
+// host-side addition that verb is).
+//
+// It does NOT import wasi:http/outgoing-handler, and that absence is a FEATURE
+// rather than an omission: this component cannot make an outbound request of
+// any kind, so a recording sent here to be transcribed cannot be forwarded
+// anywhere. The attestation covers the component, so a caller can verify that
+// rather than believe it.
+//
+// WIT deps are vendored verbatim from wasmtime v45 (wasi@0.2.6,
+// wasi:nn@0.2.0-rc-2024-10-28) so guest and host always agree.
+package enclave:speech-reader;
+
+world speech-reader {
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  export wasi:http/incoming-handler@0.2.6;
+}

@@ -20,6 +20,7 @@ app's README (and `wasm/apps/README.md` in the
 | [image-generator](image-generator/) | Text-to-image on a GPU share via wasi-nn, serving host-preloaded models. |
 | [image-reader](image-reader/) | The other direction: a vision model that answers questions about images you send it. Its own deployment, so the eyes start, stop and resize without touching the chat; no outbound socket, so what it sees cannot leave. |
 | [speech-generator](speech-generator/) | Text to speech: Maya1 (a 3B Llama that predicts SNAC audio tokens) on the GPU share, the SNAC codec decoded in-component in pure Rust, natural-language voice design, streamed WAV. No outbound socket, so what you say stays said to you. |
+| [speech-reader](speech-reader/) | The other direction: speech to text with Granite Speech 4.1 2B (top of the Open ASR leaderboard, Apache-2.0), audio crossing to the host through the mtmd audio verb (PLATFORM.md is the spec), long recordings chunked at quiet points, OpenAI-compatible transcription API. What you record is transcribed to you and kept by no one. |
 | [encrypted-volumes](encrypted-volumes/) | User-held-key confidential storage: client-side rclone crypt over S3, unlocked in the enclave. |
 | [vault](vault/) | The web UI for wallet-gated encrypted volumes (`wasi:http` component). |
 | [dead-drop](dead-drop/) | Burn-after-reading secrets: browser-side AES-GCM, key in the URL fragment, ciphertext counted and erased in enclave RAM. |

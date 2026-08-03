@@ -1,0 +1,32 @@
+{
+  "name": "granite-speech-4.1-2b",
+  "n_layers": 40,
+  "n_kv_heads": 4,
+  "head_dim": 128,
+  "vocab": 100353,
+  "eos": [100257],
+  "model_volume": "granite-speech-4.1-2b-gguf",
+  "instruction": "transcribe the speech with proper punctuation and capitalization.",
+  "translate_instruction": "translate the speech to English.",
+  "prompt_prefix": "USER: ",
+  "prompt_suffix": "\n ASSISTANT:",
+  "stop_strings": ["USER:"],
+  "audio_tokens_per_second": 12,
+  "max_positions": 4000,
+  "chunk_seconds": 240,
+  "max_audio_seconds": 7200,
+  "max_audio_bytes": 33554432,
+  "default_max_new": 2048,
+  "max_new_cap": 4096,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "top_k": 0,
+  "rep_penalty": 1.0,
+  "rep_window": 64,
+  "repeat_guard": 4,
+  "models": {
+    "granite-speech-4.1-2b-gguf": {
+      "name": "granite-speech-4.1-2b"
+    }
+  }
+}
