@@ -2686,7 +2686,12 @@ fn generate_mtp(
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
-    let k = cfg.draft_tokens.clamp(1, 16);
+    // same two-strategy split as generate_lookup (see its doc): rewind-commit
+    // when the host keeps recurrent snapshots deep enough for a whole round,
+    // branch-commit otherwise. MTP drafts EVERY round (no n-gram luck), so
+    // the stable (seq, shape) rewind mode buys replay on every verify.
+    let depth = sess.caps().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
+    let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let p_min_milli = (cfg.draft_p_min.clamp(0.0, 0.95) * 1000.0) as i32;
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
@@ -2751,12 +2756,21 @@ fn generate_mtp(
             guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
-            tscr.copy_from(t_seq, t_fed)?;
-            let mut rows = tscr.feed_all_mtp(cfg, &ids, t_seq)?;
-            let tscr_fed = t_fed + ids.len();
-            sess.mtp_accept(t_fed, &ids)?;
-            sess.copy_from(tscr_seq, tscr_fed)?;
-            t_fed = tscr_fed;
+            // every id is force-accepted, so rewind mode needs no rewind -
+            // just run the pass on the real sequence
+            let mut rows;
+            if depth > 0 {
+                rows = sess.feed_all_mtp(cfg, &ids, t_seq)?;
+                sess.mtp_accept(t_fed, &ids)?;
+                t_fed += ids.len();
+            } else {
+                tscr.copy_from(t_seq, t_fed)?;
+                rows = tscr.feed_all_mtp(cfg, &ids, t_seq)?;
+                let tscr_fed = t_fed + ids.len();
+                sess.mtp_accept(t_fed, &ids)?;
+                sess.copy_from(tscr_seq, tscr_fed)?;
+                t_fed = tscr_fed;
+            }
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
             pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
@@ -2766,14 +2780,23 @@ fn generate_mtp(
         //    [pending] alone, which adopts as a plain step)
         let drafts = sess.mtp_draft(pending, k, p_min_milli)?;
         drafted += drafts.len();
-        // -- ONE verify pass on the target branch, harvesting head rows for
-        //    the REAL sequence
-        tscr.copy_from(t_seq, t_fed)?;
-        let mut feed: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
+        let m = drafts.len();
+        let t_fed0 = t_fed; // mtp_accept mirrors at the PRE-round position
+        let mut feed: Vec<u32> = Vec::with_capacity(m + 1);
         feed.push(pending);
         feed.extend_from_slice(&drafts);
-        let mut rows = tscr.feed_all_mtp(cfg, &feed, t_seq)?;
-        let tscr_fed = t_fed + feed.len();
+        // -- ONE verify pass harvesting head rows for the REAL sequence: on
+        //    that sequence itself in rewind mode, on the branch otherwise
+        let mut rows;
+        let mut tscr_fed = 0usize;
+        if depth > 0 {
+            rows = sess.feed_all_mtp(cfg, &feed, t_seq)?;
+            t_fed += feed.len();
+        } else {
+            tscr.copy_from(t_seq, t_fed)?;
+            rows = tscr.feed_all_mtp(cfg, &feed, t_seq)?;
+            tscr_fed = t_fed + feed.len();
+        }
         // -- verify: accept while the target's own sample agrees
         let mut acc = 0usize;
         let mut replacement: Option<u32> = None;
@@ -2811,15 +2834,26 @@ fn generate_mtp(
         accepted += acc;
         // -- the head learns ONLY the accepted tokens (its KV never holds a
         //    rejected proposal), then the target commits them
-        sess.mtp_accept(t_fed, &feed[..acc + 1])?;
+        sess.mtp_accept(t_fed0, &feed[..acc + 1])?;
         if let Some(r) = replacement {
-            sess.feed(cfg, &feed[..acc + 1], false)?;
-            t_fed += acc + 1;
+            if depth > 0 {
+                // rewind-commit: drop the rejected tail (m - acc <= k <=
+                // depth trailing tokens of the pass that just ran); no
+                // re-feed decode
+                sess.rewind_to(t_fed0 + acc + 1)?;
+                t_fed = t_fed0 + acc + 1;
+            } else {
+                sess.feed(cfg, &feed[..acc + 1], false)?;
+                t_fed += acc + 1;
+            }
             pending = r;
         } else {
-            // full acceptance (also the empty-draft case): adopt the branch
-            sess.copy_from(tscr_seq, tscr_fed)?;
-            t_fed = tscr_fed;
+            // full acceptance (also the empty-draft case): rewind-commit
+            // already ran on the real sequence; branch-commit adopts
+            if depth == 0 {
+                sess.copy_from(tscr_seq, tscr_fed)?;
+                t_fed = tscr_fed;
+            }
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
             pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
