@@ -189,6 +189,21 @@ pub struct AppConfig {
     /// makes speculation beat plain decode).
     #[serde(default = "default_draft_p_min")]
     pub draft_p_min: f32,
+    /// "lookup" drafts only: shortest n-gram anchor allowed to propose
+    /// (clamped 2..=6; absent = the built-in 4). The right floor depends on
+    /// `draft_tokens`, because a misfired verify round costs only the
+    /// batch-width difference over a plain step: ~12.7 ms at k=4 but ~2.0 ms
+    /// at k=1 (measured, 9b, in-app feed_all#decode). Break-even acceptance
+    /// is that tax over the plain step cost, so k=4 needs ~33% and k=1 needs
+    /// ~11% - anchors that are pure waste at k=4 can pay at k=1.
+    #[serde(default)]
+    pub draft_min_ngram: Option<usize>,
+    /// "lookup" drafts only: set false to disable the acceptance gate (the
+    /// EMA pause + anchor escalation). The gate exists because a mediocre
+    /// k=4 round is expensive; at k=1 the tax is small enough that pausing
+    /// can cost more throughput than the misfires it avoids.
+    #[serde(default)]
+    pub draft_gate: Option<bool>,
     /// WEB SEARCH: absent (the default) means the app never makes an outbound
     /// request and the UI hides the control entirely - a deployment opts IN.
     /// Present means a request may ask for search, and the app fetches results
