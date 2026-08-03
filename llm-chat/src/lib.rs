@@ -1463,6 +1463,7 @@ impl Session {
             vision: data.len() >= 16 && v(3) != 0,
             n_batch: if data.len() >= 20 && v(4) > 0 { Some(v(4) as u32) } else { None },
             host_tok: data.len() >= 24 && v(5) != 0,
+            rewind_depth: if data.len() >= 28 { v(6).max(0) } else { 0 },
         })
     }
 
@@ -1645,6 +1646,27 @@ impl Session {
         note_timing("copy_from", &outs);
         Ok(())
     }
+
+    /// ggml only: drop this session's tokens from `n_keep` onward. Plain
+    /// attention models always honor it; recurrent/hybrid models only when
+    /// caps' rewind_depth covers the tail being dropped (host recurrent
+    /// snapshots) - never call it deeper than that. The no-branch
+    /// speculative primitive: verify the draft on THIS session, rewind the
+    /// rejected tail, and the sequence id and batch shape the engine sees
+    /// never change.
+    fn rewind_to(&mut self, n_keep: usize) -> Result<(), String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("rewind needs the ggml backend".into());
+        };
+        let outs = ctx
+            .compute(vec![
+                ("rewind".to_string(), Tensor::new(&[1], TensorType::I32, &(n_keep as i32).to_le_bytes())),
+                timing_input(),
+            ])
+            .map_err(|e| nn_err("rewind", e))?;
+        note_timing("rewind", &outs);
+        Ok(())
+    }
 }
 
 /// Vet a request's attachments against the model and the deployment's limits,
@@ -1722,6 +1744,14 @@ struct Caps {
     n_batch: Option<u32>,
     /// the host exports its GGUF tokenizer ("tokenize"/"vocab_pieces")
     host_tok: bool,
+    /// recurrent-snapshot rewind depth: > 0 means "rewind" of up to that
+    /// many trailing tokens of the LAST decode works even on recurrent/
+    /// hybrid models (the host context keeps per-token state snapshots).
+    /// The lookup loop then verifies on the REAL sequence and rewinds the
+    /// rejected tail - stable sequence and shape keep the engine's graph
+    /// caches hot - instead of branch-verify. 0 on hosts that predate the
+    /// export or contexts without snapshots: branch via copy_from.
+    rewind_depth: i32,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -2849,14 +2879,29 @@ fn lookup_propose(prompt: &[u32], gen: &[u32], ng: usize, k: usize) -> Vec<u32> 
 const LOOKUP_NGRAM: usize = 5;
 const LOOKUP_NGRAM_MAX: usize = 6;
 
-/// Prompt-lookup speculative decode: the branch-commit loop with n-gram
-/// matches against the conversation as the proposer - no draft model, no
-/// MTP head, no host-side state beyond the branch-verify verbs, so it runs
+/// Prompt-lookup speculative decode: n-gram matches against the
+/// conversation as the proposer - no draft model, no MTP head, so it runs
 /// on ANY ggml model. Rounds WITHOUT a match are literally plain decode
-/// (one step on the real sequence, branch untouched): the scheme can only
-/// spend the k extra verify rows on rounds where history actually matched,
-/// which is what bounds its downside. Exact-match verification as always -
-/// output is byte-for-byte the target's own.
+/// (one step on the real sequence): the scheme can only spend the k extra
+/// verify rows on rounds where history actually matched, which is what
+/// bounds its downside. Exact-match verification as always - output is
+/// byte-for-byte the target's own.
+///
+/// TWO commit strategies, picked by the host's caps at generation start:
+///  - rewind-commit (caps rewind_depth >= 1, mm18+ engines): the verify
+///    pass runs on the REAL sequence and a partial accept rewinds the
+///    rejected tail, restored host-side from per-token recurrent
+///    snapshots. Every round then hands the engine the same sequence id
+///    and (for full-length drafts) the same batch shape, which is what
+///    lets llama's graph slots and CUDA-graph capture REPLAY instead of
+///    rebuilding - and a partial accept costs no re-feed decode at all.
+///    Draft length is capped at the depth so a zero-accept round can
+///    always roll all the way back.
+///  - branch-commit (depth 0, the historical contract): proposals verify
+///    on a scratch branch (copy_from), full accept adopts the branch,
+///    partial accept re-feeds only the accepted tokens on the real
+///    sequence. Works on any architecture, no snapshots, but the branch
+///    churn is exactly what kept the engine's graphs from replaying.
 #[allow(clippy::too_many_arguments)]
 fn generate_lookup(
     cfg: &AppConfig,
@@ -2871,7 +2916,10 @@ fn generate_lookup(
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
-    let k = cfg.draft_tokens.clamp(1, 16);
+    // one cheap caps probe decides the round-commit strategy for the whole
+    // generation (see the function doc); 0 = branch-commit, unchanged
+    let depth = sess.caps().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
+    let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let t1 = now_ms();
     let chunk = prefill_chunk(&mut sess);
     let mut done = 0usize;
@@ -2956,13 +3004,24 @@ fn generate_lookup(
             continue 'outer;
         }
         drafted += drafts.len();
-        // -- ONE verify pass over [pending, d1..dm] on the target BRANCH
-        tscr.copy_from(t_seq, t_fed)?;
-        let mut feed: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
+        let m = drafts.len();
+        let mut feed: Vec<u32> = Vec::with_capacity(m + 1);
         feed.push(pending);
         feed.extend_from_slice(&drafts);
-        let mut rows = tscr.feed_all(cfg, &feed)?;
-        let tscr_fed = t_fed + feed.len();
+        // -- ONE verify pass over [pending, d1..dm]: on the REAL sequence
+        //    when the host can rewind the tail (rewind-commit), on the
+        //    target BRANCH otherwise (branch-commit; the real sequence
+        //    stays clean of rejects)
+        let mut rows;
+        let mut tscr_fed = 0usize;
+        if depth > 0 {
+            rows = sess.feed_all(cfg, &feed)?;
+            t_fed += feed.len();
+        } else {
+            tscr.copy_from(t_seq, t_fed)?;
+            rows = tscr.feed_all(cfg, &feed)?;
+            tscr_fed = t_fed + feed.len();
+        }
         // -- verify: accept while the target's own sample agrees
         let mut acc = 0usize;
         let mut replacement: Option<u32> = None;
@@ -2999,15 +3058,29 @@ fn generate_lookup(
         }
         accepted += acc;
         if let Some(r) = replacement {
-            // partial round: commit only the accepted tokens to the real
-            // sequence, abandon the branch (re-branched fresh next round)
-            sess.feed(cfg, &feed[..acc + 1], false)?;
-            t_fed += acc + 1;
+            if depth > 0 {
+                // partial round, rewind-commit: drop the rejected tail off
+                // the real sequence (m - acc <= k <= depth trailing tokens
+                // of the pass that just ran - the host restores recurrent
+                // state from its snapshots). No re-feed decode at all.
+                sess.rewind_to(t_fed - (m - acc))?;
+                t_fed -= m - acc;
+            } else {
+                // partial round, branch-commit: commit only the accepted
+                // tokens to the real sequence, abandon the branch
+                // (re-branched fresh next round)
+                sess.feed(cfg, &feed[..acc + 1], false)?;
+                t_fed += acc + 1;
+            }
             pending = r;
         } else {
-            // full acceptance: adopt the branch, bonus token from the last row
-            sess.copy_from(tscr_seq, tscr_fed)?;
-            t_fed = tscr_fed;
+            // full acceptance: rewind-commit already ran on the real
+            // sequence - nothing to move; branch-commit adopts the branch.
+            // Bonus token from the last row either way.
+            if depth == 0 {
+                sess.copy_from(tscr_seq, tscr_fed)?;
+                t_fed = tscr_fed;
+            }
             let recent = out.recent(prompt_ids, p.sample.rep_window);
             let last = rows.len() - 1;
             pending = pick_row(&mut rows[last], &recent, &p.sample, &mut rng);
