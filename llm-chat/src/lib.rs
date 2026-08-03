@@ -2956,11 +2956,12 @@ const LOOKUP_WINDOW: usize = 2048;
 struct LookupGate {
     ema: f32,
     paused_until: usize, // out.generated.len() threshold to resume at
+    pause_len: usize,    // exponential backoff on consecutive failed probes
 }
 
 impl LookupGate {
     fn new() -> Self {
-        Self { ema: 0.6, paused_until: 0 }
+        Self { ema: 0.6, paused_until: 0, pause_len: 64 }
     }
     /// minimum anchor length to propose with right now; None = don't
     fn min_anchor(&mut self, generated: usize) -> Option<usize> {
@@ -2969,11 +2970,16 @@ impl LookupGate {
         }
         if self.ema < 0.30 {
             // collapsed: pause, then re-probe (the probe round's own
-            // acceptance updates the ema and decides what happens next)
-            self.paused_until = generated + 64;
+            // acceptance updates the ema and decides what happens next).
+            // Backoff doubles while probes keep failing - on hostile
+            // content the 1024-token fleet leg showed 64-token probing
+            // still buys ~15 break-even rounds per generation.
+            self.paused_until = generated + self.pause_len;
+            self.pause_len = (self.pause_len * 2).min(512);
             self.ema = 0.35; // probe optimism: one clean round reopens
             return None;
         }
+        self.pause_len = 64; // quality recovered: probes get eager again
         if self.ema < 0.45 {
             return Some(LOOKUP_NGRAM + 1); // well-anchored matches only
         }
