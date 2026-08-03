@@ -1803,20 +1803,22 @@ fn open_mtp(
     if !caps.mtp {
         return Err("this model volume carries no MTP head (use an *-mtp volume, or name a draft model)".into());
     }
-    // WEDGE GUARD (2026-08-03, mm18): under a recurrent-snapshot context
-    // (deployment nnRsSeq > 0) the MTP-aware prefill hangs on the fleet -
-    // the nextn-enabled target graph plus the keep_rs delta-net path is a
-    // combination the CUDA engine has never scheduled before, and the pass
-    // never returns (observed live: "prefilling N prompt tokens" then
-    // nothing, decode turn held). Until an engine build proves the combo
-    // out, refuse MTP here so the caller's existing fallback runs instead
-    // of wedging the deployment. Snapshot deployments should use
-    // draft:"lookup", which is validated AND faster under snapshots.
-    if caps.rewind_depth > 0 {
+    // DEPTH GUARD (2026-08-03, mm18): MTP under a recurrent-snapshot
+    // context works (locally proven: depth 1 on CUDA, rewind-commit,
+    // +50% over plain) but the head context adds its own full-window
+    // attention KV on top of the snapshot groups' VRAM, and at depth 4 on
+    // a 27b/25%-share the sum sits AT the MPS pinned-memory limit - where
+    // an over-limit allocation BLOCKS instead of failing, wedging the
+    // decode turn forever (observed live: "prefilling N prompt tokens"
+    // then nothing; depth-4-without-mtp and mtp-without-depth both run).
+    // Until the fit math prices snapshots + head together, allow only
+    // shallow depths with clear headroom and refuse the rest loudly.
+    if caps.rewind_depth > 2 {
         return Err(
-            "[mtp_snapshots] this deployment enables recurrent snapshots (nnRsSeq), and the \
-             MTP pass is not yet validated under them on this engine - use draft:\"lookup\" \
-             with snapshots, or drop nnRsSeq for MTP"
+            "[mtp_snapshots] this deployment's nnRsSeq depth plus the MTP head's KV can \
+             exceed the share's pinned-VRAM limit, which wedges instead of failing (seen \
+             at depth 4 on a 27b). Use nnRsSeq <= 2 with MTP, or draft:\"lookup\" for \
+             deeper snapshots"
                 .into(),
         );
     }
