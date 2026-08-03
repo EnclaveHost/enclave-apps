@@ -1167,19 +1167,19 @@ thread_local! {
     /// instrumented. Reported as "sync_ms"/"sync_calls" in the done frame.
     static SYNC_DELTA: std::cell::Cell<Option<(i64, i64)>> =
         const { std::cell::Cell::new(None) };
-    /// per-generation llama decode-stage deltas (ms) from the mm21 "gperf"
-    /// verb: [build, alloc, input, slot, mem-init, compute-call, output].
-    /// Reported as "gperf_ms" in the done frame.
-    static GPERF_DELTA: std::cell::Cell<Option<[i64; 7]>> =
+    /// per-generation llama decode-stage deltas (ms) from the mm21/22
+    /// "gperf" verb: [build, alloc, input, slot, mem-init, compute-call,
+    /// output, out-get]. Reported as "gperf_ms" in the done frame.
+    static GPERF_DELTA: std::cell::Cell<Option<[i64; 8]>> =
         const { std::cell::Cell::new(None) };
 }
 /// snapshot the host's cumulative llama decode-stage millis (mm21 "gperf"
 /// verb) at generation start; the closing call stores per-stage deltas
-fn gperf_note(sess: &mut Session, start: Option<[i32; 7]>) -> Option<[i32; 7]> {
+fn gperf_note(sess: &mut Session, start: Option<[i32; 8]>) -> Option<[i32; 8]> {
     let now = sess.gperf().ok()?;
     if let Some(s0) = start {
-        let mut d = [0i64; 7];
-        for i in 0..7 {
+        let mut d = [0i64; 8];
+        for i in 0..8 {
             d[i] = (now[i] as i64) - (s0[i] as i64);
         }
         GPERF_DELTA.with(|s| s.set(Some(d)));
@@ -1477,7 +1477,7 @@ impl Session {
     /// ggml only: the host's cumulative llama decode-stage millis (mm21
     /// "gperf" verb) - [build, alloc, input, slot, mem-init, compute-call,
     /// output]. Monotonic; callers report start/end deltas.
-    fn gperf(&mut self) -> Result<[i32; 7], String> {
+    fn gperf(&mut self) -> Result<[i32; 8], String> {
         let Session::Ggml { ctx } = self else {
             return Err("gperf needs the ggml backend".into());
         };
@@ -1492,10 +1492,10 @@ impl Session {
             .find(|(n, _)| n == "gperf")
             .ok_or("host returned no \"gperf\" output (engine predates mm21)")?;
         let data = g.1.data();
-        if data.len() < 28 {
+        if data.len() < 32 {
             return Err("gperf output too short".into());
         }
-        let mut out = [0i32; 7];
+        let mut out = [0i32; 8];
         for (i, o) in out.iter_mut().enumerate() {
             *o = i32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
         }
@@ -6100,6 +6100,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                         done["gperf_ms"] = serde_json::json!({
                             "build": g[0], "alloc": g[1], "input": g[2],
                             "mem": g[4], "comp": g[5], "out": g[6],
+                            "out_get": g[7],
                         });
                     }
                     let vt = timing_snapshot();
