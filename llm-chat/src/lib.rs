@@ -1214,9 +1214,18 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
                 // visibly above feed's; if the two match, capture never
                 // engaged and the whole launch-latency budget is headroom
                 let key = if label == "feed" {
+                    let cold = m.get("feed_cold").map(|e| e.0).unwrap_or(0);
                     let warm = m.get("feed_warm").map(|e| e.0).unwrap_or(0);
                     let done = m.get("feed").map(|e| e.0).unwrap_or(0);
-                    if phase.is_empty() && warm < 4 && done == 0 {
+                    // the FIRST single-token step alone: before it, no CUDA
+                    // graph exists for this shape, so it measures the true
+                    // un-graphed pass cost. feed_warm (the next 3) mixes cold
+                    // and replayed steps and understates it - which is what
+                    // made the graph-replay saving look like 5-8ms instead of
+                    // its real value.
+                    if phase.is_empty() && cold == 0 && warm == 0 && done == 0 {
+                        "feed_cold".to_string()
+                    } else if phase.is_empty() && warm < 3 && done == 0 {
                         "feed_warm".to_string()
                     } else {
                         format!("{phase}{label}")
