@@ -1027,9 +1027,12 @@ impl Session {
                     "tokens".to_string(),
                     Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes),
                 )];
-                if want_logits {
-                    inputs.push(topk_input());
-                }
+                // topk rides EVERY feed, even when the logits are discarded
+                // (early prefill chunks): a device-top-k-armed engine (mm26,
+                // nnDevTopk) refuses dense requests outright - the full row
+                // never leaves the device - and the discarded top-K costs
+                // ~2 KB. Unarmed engines behave identically either way.
+                inputs.push(topk_input());
                 inputs.push(timing_input());
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
                 note_timing(if ids.len() > 1 { "feed_batch" } else { "feed" }, &outs);
