@@ -2841,7 +2841,10 @@ async function run(chat) {
         messages: payload, target: state.target, model: state.model || undefined,
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
         // "auto" = the server asks the model whether this turn needs the web
-        web_search: state.webMode === "off" ? undefined : "auto",
+        // explicit "off", not undefined: an absent field now takes the
+        // DEPLOYMENT's search.default_on server-side, so a user who chose
+        // off must say so or a default-on deployment would re-enable them
+        web_search: state.webMode === "off" ? "off" : "auto",
         image_gen: state.image.enabled ? (state.imageOn ? "auto" : "off") : undefined,
         // the deployment's OWN tools, which it executes itself; this only says
         // whether the model is allowed to reach for them on this turn
