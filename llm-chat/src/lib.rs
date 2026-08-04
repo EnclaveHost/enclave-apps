@@ -3881,11 +3881,23 @@ impl ChatReq {
         }
     }
 
-    fn web_mode(&self) -> WebMode {
+    /// `true` forces a search, `"auto"` lets the router/model decide,
+    /// `"off"`/`false` withholds the web, and an ABSENT field takes the
+    /// deployment's `search.default_on` - the same contract as tools_on and
+    /// image_on. It did not always: absent used to hard-default to Off, which
+    /// silently disarmed search AND the web_search/fetch_url builtins for
+    /// every API caller (and every UI whose stored switch predated the
+    /// default) no matter what the deployment configured (found live
+    /// 2026-08-04: a default_on deployment that never cited because nothing
+    /// ever searched).
+    fn web_mode(&self, default_on: bool) -> WebMode {
         match &self.web_search {
             Some(v) if v.as_bool() == Some(true) => WebMode::Always,
+            Some(v) if v.as_bool() == Some(false) => WebMode::Off,
             Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("auto")) => WebMode::Auto,
-            _ => WebMode::Off,
+            Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("off")) => WebMode::Off,
+            Some(_) => WebMode::Off,
+            None => if default_on { WebMode::Auto } else { WebMode::Off },
         }
     }
 }
@@ -4542,7 +4554,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
 /// back through the tools switch, which is the opposite of what either control
 /// says on the tin.
 fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
-    let withheld = creq.web_mode() == WebMode::Off;
+    let withheld = creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on)) == WebMode::Off;
     tools::Builtins {
         search: if withheld { None } else { cfg.search.as_ref() },
         web_withheld: withheld,
@@ -5160,7 +5172,7 @@ fn apply_web_search(
     model_searches: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
-    let web_mode = creq.web_mode();
+    let web_mode = creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on));
     let Some(last) = messages.iter().rposition(|m| m.role == "user") else {
         if web_mode == WebMode::Always {
             return Err("no user message to search for".into());
@@ -6049,7 +6061,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // plainly that there are no tools. A prompt emphatic enough to keep
     // faking calls is the user's to fix; two passes is where this app stops.
     let (mut tool_searched, mut tool_nudged) = (false, false);
-    let may_search = cfg.search.is_some() && creq.web_mode() != WebMode::Off;
+    let may_search = cfg.search.is_some() && creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on)) != WebMode::Off;
     let last_user = messages.iter().rposition(|m| m.role == "user");
     let mut last_err = String::new();
     let mut ok = false;
@@ -7710,17 +7722,17 @@ mod tests {
         let bare = req(serde_json::json!({ "messages": [] }));
         assert!(bare.image_on(true));
         assert!(!bare.image_on(false));
-        assert_eq!(bare.web_mode(), WebMode::Off);
+        assert_eq!(bare.web_mode(false), WebMode::Off);
         // images off, search on: the combination one switch could never express
         let split = req(serde_json::json!({
             "messages": [], "image_gen": false, "web_search": "auto"
         }));
         assert!(!split.image_on(true));
-        assert_eq!(split.web_mode(), WebMode::Auto);
+        assert_eq!(split.web_mode(false), WebMode::Auto);
         // ...and the other way round
         let split = req(serde_json::json!({ "messages": [], "image_gen": "auto" }));
         assert!(split.image_on(false));
-        assert_eq!(split.web_mode(), WebMode::Off);
+        assert_eq!(split.web_mode(false), WebMode::Off);
         assert!(!req(serde_json::json!({ "messages": [], "image_gen": "off" })).image_on(true));
     }
 
@@ -8286,16 +8298,21 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}], "web_search": v
             })).unwrap()
         };
-        assert!(mk(serde_json::json!(true)).web_mode() == WebMode::Always);
-        assert!(mk(serde_json::json!("auto")).web_mode() == WebMode::Auto);
-        assert!(mk(serde_json::json!("AUTO")).web_mode() == WebMode::Auto);
-        assert!(mk(serde_json::json!(false)).web_mode() == WebMode::Off);
-        assert!(mk(serde_json::json!("nonsense")).web_mode() == WebMode::Off);
+        assert!(mk(serde_json::json!(true)).web_mode(false) == WebMode::Always);
+        assert!(mk(serde_json::json!("auto")).web_mode(false) == WebMode::Auto);
+        assert!(mk(serde_json::json!("AUTO")).web_mode(false) == WebMode::Auto);
+        assert!(mk(serde_json::json!(false)).web_mode(false) == WebMode::Off);
+        assert!(mk(serde_json::json!("nonsense")).web_mode(false) == WebMode::Off);
         // absent entirely
         let bare: ChatReq = serde_json::from_value(serde_json::json!({
             "messages": [{"role": "user", "content": "hi"}]
         })).unwrap();
-        assert!(bare.web_mode() == WebMode::Off);
+        assert!(bare.web_mode(false) == WebMode::Off);
+        // an absent field follows the deployment's search.default_on; an
+        // explicit off (either spelling) beats it
+        assert!(bare.web_mode(true) == WebMode::Auto);
+        assert!(mk(serde_json::json!("off")).web_mode(true) == WebMode::Off);
+        assert!(mk(serde_json::json!(false)).web_mode(true) == WebMode::Off);
     }
 
     #[test]
