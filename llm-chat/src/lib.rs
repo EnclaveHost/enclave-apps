@@ -1228,7 +1228,7 @@ fn note_timing(label: &'static str, outs: &[(String, Tensor)]) {
     // done frame names where the multi-token pass spends its time.
     if let Some(t) = outs.iter().find(|(n, _)| n == "phase_us") {
         let d = t.1.data();
-        const PH: [&str; 10] = ["gate", "alloc", "turn", "decode", "harvest", "topk", "gbuild", "galloc", "ginput", "slot"];
+        const PH: [&str; 11] = ["gate", "alloc", "turn", "decode", "harvest", "topk", "gbuild", "galloc", "ginput", "slot", "draft"];
         for (i, ph) in PH.iter().enumerate() {
             if d.len() >= (i + 1) * 4 {
                 let us = i32::from_le_bytes([d[i * 4], d[i * 4 + 1], d[i * 4 + 2], d[i * 4 + 3]]).max(0) as u64;
@@ -1534,6 +1534,7 @@ impl Session {
             mtp_fold: data.len() >= 32 && v(7) != 0,
             sync_ms: if data.len() >= 36 { v(8) } else { -1 },
             sync_calls: if data.len() >= 40 { v(9) } else { -1 },
+            mtp_round: data.len() >= 44 && v(10) != 0,
         })
     }
 
@@ -1628,6 +1629,59 @@ impl Session {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
             .collect())
+    }
+
+    /// ggml only: the FUSED speculative round (mm25 hosts, caps mtp_round) -
+    /// the deferred observe, the head's k-draft chain, and the verify of
+    /// [pending.., drafts..] in ONE call under one arbiter grant. Rewind
+    /// mode only: the verify runs on THIS sequence with rows harvested for
+    /// it. Returns the drafts and one Row per fed position. An error
+    /// containing "[mtp_obs_failed]" means the folded observe failed BEFORE
+    /// any decode - the harvest rows are intact, so recover exactly like
+    /// the standalone path: explicit mtp_accept, then retry without obs.
+    fn mtp_round(&mut self, cfg: &AppConfig, id_last: u32, k: usize,
+                 p_min_milli: i32, obs: Option<(usize, &[u32])>,
+                 pending: &[u32]) -> Result<(Vec<u32>, Vec<Row>), String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("speculative decoding needs the ggml backend".into());
+        };
+        let mut bytes = Vec::with_capacity(12);
+        bytes.extend_from_slice(&(id_last as i32).to_le_bytes());
+        bytes.extend_from_slice(&(k as i32).to_le_bytes());
+        bytes.extend_from_slice(&p_min_milli.to_le_bytes());
+        let pbytes: Vec<u8> =
+            pending.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
+        let mut inputs = vec![
+            ("mtp_round".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
+            ("tokens".to_string(),
+             Tensor::new(&[1, pending.len() as u32], TensorType::I32, &pbytes)),
+            topk_input(),
+            timing_input(),
+        ];
+        if let Some((pos0, toks)) = obs {
+            let mut ob = Vec::with_capacity((toks.len() + 1) * 4);
+            ob.extend_from_slice(&(pos0 as i32).to_le_bytes());
+            for t in toks {
+                ob.extend_from_slice(&(*t as i32).to_le_bytes());
+            }
+            inputs.push((
+                "mtp_obs".to_string(),
+                Tensor::new(&[(toks.len() + 1) as u32], TensorType::I32, &ob),
+            ));
+        }
+        let outs = ctx.compute(inputs).map_err(|e| nn_err("mtp_round", e))?;
+        note_timing("mtp_round", &outs);
+        let drafts: Vec<u32> = outs
+            .iter()
+            .find(|(n, _)| n == "draft")
+            .ok_or("host returned no \"draft\" output")?
+            .1
+            .data()
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect();
+        let rows = rows_from_outs(&outs, pending.len() + drafts.len(), cfg.vocab)?;
+        Ok((drafts, rows))
     }
 
     /// ggml only: mirror a verify round's accepted tokens into the MTP head
@@ -1848,6 +1902,10 @@ struct Caps {
     /// DELTA as "sync_ms"/"sync_calls" - the per-decode fixed-cost probe.
     sync_ms: i32,
     sync_calls: i32,
+    /// fused speculative round: "mtp_round" runs the deferred observe, the
+    /// head's draft chain and the verify in ONE call under one arbiter
+    /// grant (mm25+). false on older hosts: keep the two-call loop.
+    mtp_round: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -2822,6 +2880,14 @@ fn generate_mtp(
     // stay valid because verify_h rows are only rewritten by the next
     // mtp-flagged pass, which the fold always precedes.
     let fold = gcaps.as_ref().map(|c| c.mtp_fold).unwrap_or(false);
+    // fused round (mm25 hosts): the whole draft/verify sequence in one call
+    // under one arbiter grant. Needs rewind mode (the verify runs on the
+    // real sequence) and the fold (the observe rides the same call); the
+    // knob exists so an A/B can pin the two-call loop on a fused host.
+    let fused = depth > 0
+        && fold
+        && gcaps.as_ref().map(|c| c.mtp_round).unwrap_or(false)
+        && cfg.draft_fused.unwrap_or(true);
     let mut pending_obs: Option<(usize, Vec<u32>)> = None;
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let p_min_milli = (cfg.draft_p_min.clamp(0.0, 0.95) * 1000.0) as i32;
@@ -2916,39 +2982,72 @@ fn generate_mtp(
         // -- the head proposes (0..=k tokens; an empty draft still verifies
         //    [pending] alone, which adopts as a plain step)
         let obs_now = pending_obs.take();
-        let mut drafts = sess.mtp_draft(
-            pending, k, p_min_milli,
-            obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
-        )?;
-        if drafts.is_empty() {
-            if let Some((op, ot)) = obs_now {
-                // a folded call returning nothing is ambiguous: the observe
-                // may have failed before drafting. Re-observe explicitly
-                // (idempotent - same rows, same positions) so the head never
-                // silently desyncs, then draft once more without the fold.
-                sess.mtp_accept(op, &ot)?;
-                drafts = sess.mtp_draft(pending, k, p_min_milli, None)?;
-            }
-        }
-        let drafts = drafts;
-        drafted += drafts.len();
-        let m = drafts.len();
         let t_fed0 = t_fed; // mtp_accept mirrors at the PRE-round position
-        let mut feed: Vec<u32> = Vec::with_capacity(m + 1);
-        feed.push(pending);
-        feed.extend_from_slice(&drafts);
-        // -- ONE verify pass harvesting head rows for the REAL sequence: on
-        //    that sequence itself in rewind mode, on the branch otherwise
-        let mut rows;
         let mut tscr_fed = 0usize;
-        if depth > 0 {
-            rows = sess.feed_all_mtp(cfg, &feed, t_seq)?;
+        let drafts: Vec<u32>;
+        let feed: Vec<u32>;
+        let mut rows: Vec<Row>;
+        if fused {
+            // -- fused round (mm25): observe + draft + verify in ONE host
+            //    call under one arbiter grant; rows come back for
+            //    [pending, drafts..] exactly as the two-call path built them
+            let (d, r) = match sess.mtp_round(
+                cfg, pending, k, p_min_milli,
+                obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
+                &[pending],
+            ) {
+                Ok(v) => v,
+                Err(e) if e.contains("[mtp_obs_failed]") => {
+                    // the observe failed BEFORE any decode ran, so the
+                    // harvest rows are intact: land it explicitly
+                    // (idempotent - same rows, same positions), then retry
+                    // the round without the fold
+                    if let Some((op, ot)) = obs_now.as_ref() {
+                        sess.mtp_accept(*op, ot)?;
+                    }
+                    sess.mtp_round(cfg, pending, k, p_min_milli, None, &[pending])?
+                }
+                Err(e) => return Err(e),
+            };
+            drafts = d;
+            let mut f: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
+            f.push(pending);
+            f.extend_from_slice(&drafts);
+            feed = f;
+            rows = r;
             t_fed += feed.len();
         } else {
-            tscr.copy_from(t_seq, t_fed)?;
-            rows = tscr.feed_all_mtp(cfg, &feed, t_seq)?;
-            tscr_fed = t_fed + feed.len();
+            let mut d = sess.mtp_draft(
+                pending, k, p_min_milli,
+                obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
+            )?;
+            if d.is_empty() {
+                if let Some((op, ot)) = obs_now {
+                    // a folded call returning nothing is ambiguous: the observe
+                    // may have failed before drafting. Re-observe explicitly
+                    // (idempotent - same rows, same positions) so the head never
+                    // silently desyncs, then draft once more without the fold.
+                    sess.mtp_accept(op, &ot)?;
+                    d = sess.mtp_draft(pending, k, p_min_milli, None)?;
+                }
+            }
+            drafts = d;
+            let mut f: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
+            f.push(pending);
+            f.extend_from_slice(&drafts);
+            feed = f;
+            // -- ONE verify pass harvesting head rows for the REAL sequence: on
+            //    that sequence itself in rewind mode, on the branch otherwise
+            if depth > 0 {
+                rows = sess.feed_all_mtp(cfg, &feed, t_seq)?;
+                t_fed += feed.len();
+            } else {
+                tscr.copy_from(t_seq, t_fed)?;
+                rows = tscr.feed_all_mtp(cfg, &feed, t_seq)?;
+                tscr_fed = t_fed + feed.len();
+            }
         }
+        drafted += drafts.len();
         // -- verify: accept while the target's own sample agrees
         let mut acc = 0usize;
         let mut replacement: Option<u32> = None;

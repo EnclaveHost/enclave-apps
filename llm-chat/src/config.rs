@@ -204,6 +204,14 @@ pub struct AppConfig {
     /// can cost more throughput than the misfires it avoids.
     #[serde(default)]
     pub draft_gate: Option<bool>,
+    /// "mtp" drafts only: set false to refuse the engine's fused round verb
+    /// ("mtp_round", mm25 hosts) and keep the two-call draft/verify loop.
+    /// The fused call is semantically identical - same observe ordering,
+    /// same verify batch, same rows - and saves a guest boundary crossing
+    /// plus an arbiter grant per round (~2-3 ms of a ~28 ms k=1 round on
+    /// the fleet). This knob exists for A/B measurement, not as a mode.
+    #[serde(default)]
+    pub draft_fused: Option<bool>,
     /// WEB SEARCH: absent (the default) means the app never makes an outbound
     /// request and the UI hides the control entirely - a deployment opts IN.
     /// Present means a request may ask for search, and the app fetches results
