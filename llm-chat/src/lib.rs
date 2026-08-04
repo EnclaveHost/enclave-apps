@@ -6069,7 +6069,15 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         };
         let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
         let params = gen_params(cfg, &creq, stops, think_open, effort);
-        tok.drop_enc(); // prompt building is over; free the encode slot
+        // free the encode slot ONLY when nothing can re-enter this loop: a
+        // tool call (or the tools-less search remedy) appends messages and
+        // rebuilds the prompt, which must re-encode - a dropped host-tokenizer
+        // session made that a hard error ("encode requested after the prompt
+        // phase", live 2026-08-04). Holding it costs one extra session slot
+        // for the request's lifetime; tools deployments run MAX_SESSIONS >= 2.
+        if tl.is_none() && !may_search {
+            tok.drop_enc(); // prompt building is over; free the encode slot
+        }
         for (i, (target, tname)) in targets_for(cfg, mode).iter().enumerate() {
             if i > 0 && !send(serde_json::json!({ "notice": format!("gpu failed ({last_err}); retrying on cpu") })) {
                 break;
@@ -6452,7 +6460,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let effort =
             resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
         let params = gen_params(cfg, &creq, stops, think_open, effort);
-        tok.drop_enc(); // prompt building is over; free the encode slot
+        if tl.is_none() {
+            // see handle_chat: a tool step re-encodes; keep the session then
+            tok.drop_enc(); // prompt building is over; free the encode slot
+        }
         for (target, tname) in targets_for(cfg, mode).iter() {
             // re-emit the prompt-side think opening ahead of the first real
             // delta (see handle_chat) so clients receive a complete block
@@ -6603,7 +6614,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         think_open = opened;
         effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
         params = gen_params(cfg, &creq, stops, think_open, effort);
-        tok.drop_enc(); // prompt building is over; free the encode slot
+        if tl.is_none() {
+            // see handle_chat: a tool step re-encodes; keep the session then
+            tok.drop_enc(); // prompt building is over; free the encode slot
+        }
         for (target, tname) in targets_for(cfg, mode).iter() {
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &sink, &sink) {
                 Ok(s) => {
