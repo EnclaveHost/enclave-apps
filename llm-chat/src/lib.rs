@@ -4849,9 +4849,18 @@ fn parse_router_verdict(text: &str, allow_search: bool, allow_image: bool) -> Op
 }
 
 /// `(payload, is_image)` for a verdict line, case-insensitively.
+///
+/// Compared as BYTES: `line[..tag.len()]` panics when a multibyte char spans
+/// the cut ("Here’s…" puts the apostrophe across byte 6, and models answer
+/// the routing question conversationally often enough that this killed live
+/// instances). A byte-wise ASCII match needs no boundary check, and a prefix
+/// that matched an all-ASCII tag ends ON a boundary, so the payload slice
+/// after it is safe.
 fn find_verdict_prefix(line: &str) -> Option<(&str, bool)> {
     for (tag, is_image) in [("SEARCH:", false), ("IMAGE:", true)] {
-        if line.len() >= tag.len() && line[..tag.len()].eq_ignore_ascii_case(tag) {
+        if line.len() >= tag.len()
+            && line.as_bytes()[..tag.len()].eq_ignore_ascii_case(tag.as_bytes())
+        {
             return Some((&line[tag.len()..], is_image));
         }
     }
@@ -5364,7 +5373,9 @@ fn strip_search_prefix(content: &str) -> Option<String> {
 fn strip_cmd_prefix(content: &str, cmds: &[&str]) -> Option<String> {
     let t = content.trim_start();
     for cmd in cmds {
-        if t.len() > cmd.len() && t[..cmd.len()].eq_ignore_ascii_case(cmd) {
+        // bytes, not a str slice: a message opening with multibyte text
+        // ("😀😀…") panics `t[..cmd.len()]`; see find_verdict_prefix
+        if t.len() > cmd.len() && t.as_bytes()[..cmd.len()].eq_ignore_ascii_case(cmd.as_bytes()) {
             let rest = &t[cmd.len()..];
             if rest.starts_with(char::is_whitespace) && !rest.trim().is_empty() {
                 return Some(rest.trim().to_string());
@@ -8268,6 +8279,32 @@ mod tests {
         assert_eq!(parse_router_verdict("SEARCH:   \"\"  ", true, true), None);
         // a refusal that merely mentions the word must not trigger one
         assert_eq!(parse_router_verdict("I do not need to search for this.", true, true), None);
+    }
+
+    /// 2026-08-05, found live: the router crashed the instance on multi-turn
+    /// chats. The model answered the routing question conversationally -
+    /// "Here’s a simple way to think about it:" - and the curly apostrophe
+    /// spans bytes 4..7, so the IMAGE: tag probe's `line[..6]` fell mid-char
+    /// and panicked; the wasm trapped and every retry of the same chat died
+    /// at "deciding what this needs…". Multibyte model output must parse to
+    /// None, never panic.
+    #[test]
+    fn router_verdict_survives_multibyte_output() {
+        assert_eq!(parse_router_verdict("Here’s a simple way to think about it:", true, true), None);
+        assert_eq!(parse_router_verdict("“NO”", true, true), None);
+        assert_eq!(parse_router_verdict("更多信息如下，请看解释", true, true), None);
+        assert_eq!(parse_router_verdict("——NO", true, true), None);
+    }
+
+    /// same class on the user-typed side: the inline /search-/image command
+    /// scan slices the message head, which must survive a message that OPENS
+    /// with multibyte text
+    #[test]
+    fn cmd_prefix_survives_multibyte_message() {
+        assert_eq!(strip_search_prefix("😀😀 what a day"), None);
+        assert_eq!(strip_image_prefix("“图片” means picture"), None);
+        // and the commands themselves still work
+        assert_eq!(strip_search_prefix("/search oslo weather").as_deref(), Some("oslo weather"));
     }
 
     #[test]
