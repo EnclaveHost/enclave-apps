@@ -342,6 +342,42 @@ pub struct HttpTool {
     /// image to the CLIENT and tells the model a picture was made.
     #[serde(default)]
     pub result: Option<ResultMap>,
+    /// FORMATTING AS A PROMPT: an instruction applied to the response by a
+    /// short internal pass before the model sees it ("render the results as
+    /// a numbered list: [n] Title - URL - snippet"). This is how an arbitrary
+    /// API's response gets the shaping the bespoke search leg does in code -
+    /// configured, not programmed. Costs one short greedy generation per
+    /// call; any failure keeps the raw text.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// ROUTING AS A PROMPT: when this tool should fire on a turn where the
+    /// tool LOOP is not armed (most commonly a model without the trained
+    /// call format). One classifier pass reads the conversation and these
+    /// lines, picks a service or NONE, and the result is folded into the
+    /// turn the way a routed search always has been. Ignored on armed turns:
+    /// there the description does this job, after the model has thought.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// which parameter the routed line binds to. Optional when the entry has
+    /// exactly one required parameter, which is then used.
+    #[serde(default)]
+    pub route_arg: Option<String>,
+    /// CITATIONS, generically: dot paths into the JSON response naming the
+    /// hit array and each hit's title/url, so a model-called (or routed)
+    /// tool feeds the same numbered source list a routed search does.
+    #[serde(default)]
+    pub sources: Option<SourcesMap>,
+}
+
+/// Where a response's citable hits live: `list` names the array, `title` and
+/// `url` name fields WITHIN one hit.
+#[derive(Deserialize, Clone)]
+pub struct SourcesMap {
+    pub list: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// Where in a JSON response the result lives, and what it IS. Paths are
@@ -381,6 +417,19 @@ impl HttpTool {
     /// The response carries a picture for the client (see ResultMap).
     pub fn makes_image(&self) -> bool {
         self.result.as_ref().is_some_and(|r| r.image.is_some())
+    }
+
+    /// The parameter a routed line binds to: `route_arg`, or the entry's
+    /// sole required parameter. None means `route` cannot be used.
+    pub fn route_binding(&self) -> Option<String> {
+        if let Some(a) = self.route_arg.as_deref() {
+            return Some(a.to_string());
+        }
+        let req = self.parameters.as_ref()?.get("required")?.as_array()?;
+        if req.len() == 1 {
+            return req[0].as_str().map(str::to_string);
+        }
+        None
     }
 }
 
@@ -545,6 +594,15 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         });
     }
     for (i, t) in cfg.http.iter().enumerate() {
+        // a misconfigured route IS worth a note: the operator wrote a prompt
+        // that can never fire
+        if t.route.is_some() && t.route_binding().is_none() {
+            reg.notes.push(format!(
+                "tool '{}': `route` needs `route_arg` (or exactly one required parameter) \
+                 to bind the routed input to",
+                t.name
+            ));
+        }
         // a tool that asks for the turn's pictures only exists when there are
         // pictures to give it, and not when the serving model reads them
         // itself. Silent either way: a per-turn fact, not a misconfiguration.
@@ -990,13 +1048,46 @@ pub fn call(
     let mut image = None;
     let r = match src {
         ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources),
-        ToolSrc::Http(i) => call_http(&cfg.http[i], cfg, args, images, &mut image, on_status),
+        ToolSrc::Http(i) => {
+            call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status)
+        }
         ToolSrc::Mcp { server, remote } => call_mcp(&mut reg.mcp[server], &remote, args),
         // never built into a Registry - the passthrough renders client tools
         // into the prompt and hands the call back, so reaching this arm is a
         // wiring bug, and the failure must say which side executes
         ToolSrc::Client => Err("client-declared tools are executed by the client, not here".into()),
     };
+    finish_call(r, max_chars, sources, image, t0, now_ms)
+}
+
+/// Run ONE http entry outside a registry: the routed pre-pass path, which
+/// already knows exactly which tool it wants and must not pay MCP discovery
+/// for the privilege.
+pub fn call_http_entry(
+    cfg: &ToolsConfig,
+    i: usize,
+    args: &serde_json::Value,
+    images: &[Vec<u8>],
+    now_ms: impl Fn() -> u64,
+    on_status: &dyn Fn(&str),
+) -> ToolResult {
+    let t0 = now_ms();
+    let t = &cfg.http[i];
+    let mut sources = Vec::new();
+    let mut image = None;
+    let r = call_http(t, cfg, args, images, &mut sources, &mut image, on_status);
+    finish_call(r, t.max_chars.unwrap_or(cfg.max_chars), sources, image, t0, now_ms)
+}
+
+/// The shared tail of a call: truncation, error hygiene, the clock.
+fn finish_call(
+    r: Result<String, String>,
+    max_chars: usize,
+    mut sources: Vec<(String, String)>,
+    mut image: Option<crate::image::GeneratedImage>,
+    t0: u64,
+    now_ms: impl Fn() -> u64,
+) -> ToolResult {
     let (text, is_error) = match r {
         Ok(t) => (truncate(&t, max_chars), false),
         Err(e) => (e, true),
@@ -1133,6 +1224,7 @@ fn call_http(
     cfg: &ToolsConfig,
     args: &serde_json::Value,
     images: &[Vec<u8>],
+    sources: &mut Vec<(String, String)>,
     image_out: &mut Option<crate::image::GeneratedImage>,
     on_status: &dyn Fn(&str),
 ) -> Result<String, String> {
@@ -1212,7 +1304,33 @@ fn call_http(
     if r.truncated {
         return Ok(format!("{text}\n[response was cut off at {} bytes]", req_max(t, cfg)));
     }
+    extract_sources(t, &text, sources);
     map_result(t, text, args, image_out)
+}
+
+/// The hits a sources map names, as (title, url) rows for the citation list.
+/// Tolerant like everything on this path: a path that misses simply yields
+/// no sources, never an error.
+fn extract_sources(t: &HttpTool, text: &str, sources: &mut Vec<(String, String)>) {
+    let Some(sm) = &t.sources else { return };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    let Some(arr) = json_path(&parsed, &sm.list).and_then(|v| v.as_array()) else { return };
+    for hit in arr {
+        let field = |p: &Option<String>| -> Option<String> {
+            p.as_deref()
+                .and_then(|p| json_path(hit, p))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let title = field(&sm.title);
+        let url = field(&sm.url);
+        if title.is_none() && url.is_none() {
+            continue;
+        }
+        let u = url.clone().unwrap_or_default();
+        sources.push((title.or(url).unwrap_or_default(), u));
+    }
 }
 
 /// A response cap that fits what the tool RETURNS: a picture arrives as
@@ -1982,6 +2100,65 @@ mod tests {
         // whereas a deployment that simply forgot the search block IS told
         let reg = build(&cfg, Builtins::default(), &|_| {});
         assert_eq!(reg.notes.len(), 1);
+    }
+
+    /// A routed line needs a parameter to bind to: route_arg, or the sole
+    /// required one; ambiguity is a config note, not a guess.
+    #[test]
+    fn route_binding_resolves_or_refuses() {
+        let t = |v: serde_json::Value| -> HttpTool { serde_json::from_value(v).unwrap() };
+        let explicit = t(serde_json::json!({
+            "name": "a", "url": "https://h/x", "route": "when x", "route_arg": "q",
+            "parameters": {"type": "object", "required": ["q", "n"]}
+        }));
+        assert_eq!(explicit.route_binding().as_deref(), Some("q"));
+        let sole = t(serde_json::json!({
+            "name": "b", "url": "https://h/x", "route": "when y",
+            "parameters": {"type": "object", "required": ["query"]}
+        }));
+        assert_eq!(sole.route_binding().as_deref(), Some("query"));
+        let ambiguous = t(serde_json::json!({
+            "name": "c", "url": "https://h/x", "route": "when z",
+            "parameters": {"type": "object", "required": ["q", "n"]}
+        }));
+        assert_eq!(ambiguous.route_binding(), None);
+        // ...and build says so instead of arming a route that can never fire
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "http": [{ "name": "c", "url": "https://h/x", "route": "when z",
+                       "parameters": {"type": "object", "required": ["q", "n"]} }]
+        }))
+        .unwrap();
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.notes.iter().any(|n| n.contains("route_arg")), "{:?}", reg.notes);
+    }
+
+    /// Citations from any API: a sources map pulls (title, url) rows out of
+    /// the response, tolerantly.
+    #[test]
+    fn sources_maps_extract_hits() {
+        let t: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "s", "url": "https://h/x",
+            "sources": { "list": "results", "title": "meta.name", "url": "link" }
+        }))
+        .unwrap();
+        let body = serde_json::json!({ "results": [
+            { "meta": { "name": "First" }, "link": "https://a" },
+            { "meta": {}, "link": "https://b" },
+            { "meta": { "name": "" } }
+        ]})
+        .to_string();
+        let mut sources = Vec::new();
+        extract_sources(&t, &body, &mut sources);
+        assert_eq!(
+            sources,
+            vec![("First".to_string(), "https://a".to_string()),
+                 ("https://b".to_string(), "https://b".to_string())]
+        );
+        // a path that misses, or a body that is not JSON, yields nothing
+        let mut sources = Vec::new();
+        extract_sources(&t, "{\"other\": 1}", &mut sources);
+        extract_sources(&t, "plain text", &mut sources);
+        assert!(sources.is_empty());
     }
 
     /// The pre-0.38 config names keep resolving - config CIDs are immutable
