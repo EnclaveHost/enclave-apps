@@ -2902,6 +2902,21 @@ async function run(chat) {
             chat.streaming.reply = "";
             chat.streaming.status = "Calling " + d.tool.name + "…";
             if (chat.id === state.currentId) renderChat();
+          } else if (d.callnote) {
+            // The model wrote a tool call nothing could run (unparseable, or
+            // past the per-answer limit). The server held the raw block back;
+            // trim any copy that already streamed and say why instead.
+            const i = reply.lastIndexOf("<tool_call>");
+            if (i >= 0) reply = reply.slice(0, i).trimEnd();
+            if (reply) {
+              chat.messages.push({ role: "notice", content: d.callnote });
+            } else {
+              // the whole answer was the dead call; the reason takes its place
+              reply = "(" + d.callnote + ")";
+            }
+            chat.streaming.reply = reply;
+            chat.streaming.status = null;
+            if (chat.id === state.currentId) renderChat();
           } else if (d.tool_result) {
             const last = toolCalls && toolCalls[toolCalls.length - 1];
             if (last) { last.ok = d.tool_result.ok; last.ms = d.tool_result.ms; }

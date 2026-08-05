@@ -132,7 +132,11 @@
 //!                               `{"tool_result":{...}}` (after it); the reply
 //!                               regenerates from the result, so a `tool` event
 //!                               resets the client's buffer the way a `notice`
-//!                               does.
+//!                               does. A call that was attempted but ran
+//!                               nothing (unparseable, or past the per-answer
+//!                               limit) arrives as `{"callnote":"<why>"}`: the
+//!                               client trims the raw block it streamed and
+//!                               shows the reason instead.
 //!   GET  /tools               - operator probe: resolve the registry (which
 //!                               DIALS any MCP server) and show what a turn
 //!                               would be offered, with `?call=<name>&args=<json>`
@@ -4263,9 +4267,22 @@ struct ToolLoop<'a> {
     /// the model was already told it has run out of calls. Without this a model
     /// that keeps calling would loop forever: told, calls again, told again.
     limit_told: bool,
+    /// the model was already told its unparseable call was not run - the same
+    /// one-correction rule as limit_told, for the same reason
+    malformed_told: bool,
+    /// why the finished reply's call ran nothing, when one was attempted: the
+    /// legs deliver this readable reason in place of the raw block
+    refused: Option<&'static str>,
     /// what ran, for the reply's stats
     log: Vec<serde_json::Value>,
 }
+
+/// The reasons a call that WAS in the reply ran nothing. Shown to the user in
+/// place of the dead JSON, so the wording has to stand alone.
+const REFUSED_MALFORMED: &str =
+    "the model wrote a tool call this app could not parse, so it was not run";
+const REFUSED_LIMIT: &str =
+    "the model wrote another tool call after the per-answer limit, so it was not run";
 
 impl<'a> ToolLoop<'a> {
     /// Resolve the registry for this turn. MCP discovery happens HERE, before
@@ -4281,6 +4298,8 @@ impl<'a> ToolLoop<'a> {
             reg: tools::build(cfg, builtins, on_status),
             calls: 0,
             limit_told: false,
+            malformed_told: false,
+            refused: None,
             log: Vec::new(),
         }
     }
@@ -4301,6 +4320,8 @@ impl<'a> ToolLoop<'a> {
 
     /// Handle one finished generation. `on_call` fires before the round trip
     /// (so a slow tool is visible while it runs) and `on_result` after.
+    /// `on_note` narrates a decision that ran NOTHING but regenerates the
+    /// answer anyway, so the client knows why its buffer is about to restart.
     /// Returns true when the answer should be regenerated.
     fn step(
         &mut self,
@@ -4308,19 +4329,50 @@ impl<'a> ToolLoop<'a> {
         messages: &mut Vec<ChatMsg>,
         on_call: &dyn Fn(&serde_json::Value),
         on_result: &dyn Fn(&serde_json::Value),
+        on_note: &dyn Fn(&str),
     ) -> bool {
         if !self.armed() {
             return false;
         }
-        let Some(c) = tools::parse_calls(text).into_iter().next() else { return false };
+        let Some(c) = tools::parse_calls(text).into_iter().next() else {
+            // No call parsed - but was one ATTEMPTED? Left alone it reaches
+            // the user as raw JSON, which the next turn then copies back out
+            // of history (seen live 2026-08-05: {"arguments":{"url":...}}
+            // with no name at all). Same two-strike shape as the budget:
+            // correct it once, refuse with a reason the second time.
+            if attempted_call(text) {
+                if self.malformed_told {
+                    self.refused = Some(REFUSED_MALFORMED);
+                } else {
+                    self.malformed_told = true;
+                    on_note("the model wrote a tool call this app could not parse; asking it to rewrite the call");
+                    messages.push(ChatMsg::text("assistant", strip_think(text).trim().to_string()));
+                    messages.push(ChatMsg::text(
+                        "user",
+                        tools::response_turn(
+                            "tool_call",
+                            "This call was NOT run: it could not be parsed. A call is ONE \
+                             JSON object with exactly two top-level fields, \"name\" (the \
+                             function to call) and \"arguments\" (an object with its \
+                             parameters), between <tool_call> and </tool_call> tags. Rewrite \
+                             the call in exactly that shape, or answer in prose without one.",
+                        ),
+                    ));
+                    return true;
+                }
+            }
+            return false;
+        };
         // Out of calls: say so once and let it write the answer. Saying it
-        // twice is a loop, so the second offence is delivered to the user as
-        // it stands - a visible fake call beats an endless turn.
+        // twice is a loop, so the second offence ends the turn - refused, so
+        // the legs deliver the reason rather than a visible fake call.
         if self.calls >= self.cfg.max_calls {
             if self.limit_told {
+                self.refused = Some(REFUSED_LIMIT);
                 return false;
             }
             self.limit_told = true;
+            on_note("the tool-call limit for one answer was reached; the model will finish with what it has");
             messages.push(ChatMsg::text("assistant", canonical_call(&c)));
             messages.push(ChatMsg::text(
                 "user",
@@ -4454,10 +4506,10 @@ impl CallGate {
         (!out.is_empty()).then_some(out)
     }
 
-    /// The held text was a call the CLIENT will execute (the /v1 passthrough):
-    /// drop it, because it leaves as structured `tool_calls` rather than as
-    /// content. A gate that was not suppressing holds prose, which the flush
-    /// after this still delivers.
+    /// The held text is a call that leaves some other way: as structured
+    /// `tool_calls` (the /v1 passthrough), or as a refusal note (a call that
+    /// was attempted but ran nothing). Drop it. A gate that was not
+    /// suppressing holds prose, which the flush after this still delivers.
     fn drop_call(&mut self) {
         if self.suppress {
             self.suppress = false;
@@ -4566,6 +4618,28 @@ fn visible_before_call(text: &str) -> &str {
         None => body,
     };
     text[..cut].trim_end()
+}
+
+/// A `<tool_call>` tag with an object after it in the reply BODY: a call was
+/// ATTEMPTED, whatever the parser made of it. The object requirement is what
+/// separates a failed call from an answer that merely mentions the tag.
+fn attempted_call(text: &str) -> bool {
+    let body = text.rfind("</think>").map_or(0, |i| i + "</think>".len());
+    text[body..]
+        .find("<tool_call>")
+        .is_some_and(|i| text[body + i + "<tool_call>".len()..].trim_start().starts_with('{'))
+}
+
+/// The reply with its unrun call replaced by the refusal, for the /v1 legs,
+/// whose protocol has no side channel: the reasoning and prose survive, the
+/// dead JSON does not.
+fn note_for_unrun(text: &str, note: &str) -> String {
+    let head = visible_before_call(text).trim_end();
+    if head.is_empty() {
+        format!("[{note}]")
+    } else {
+        format!("{head}\n\n[{note}]")
+    }
 }
 
 /// Whether this request gets the deployment's tools: the config has some, the
@@ -6173,9 +6247,20 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                                 } }));
                             }
                         };
-                        if t.step(&s.text, &mut messages, &on_call, &on_result) {
+                        let on_note = |n: &str| {
+                            // a notice resets the client's reply buffer, which
+                            // is right: the answer is about to regenerate
+                            let _ = send(serde_json::json!({ "notice": n }));
+                        };
+                        if t.step(&s.text, &mut messages, &on_call, &on_result, &on_note) {
                             continue 'answer;
                         }
+                    }
+                    // a call that was attempted but ran nothing must not reach
+                    // the screen as raw JSON: hold it back and say why instead
+                    if let Some(note) = tl.as_mut().and_then(|t| t.refused.take()) {
+                        gate.borrow_mut().drop_call();
+                        let _ = send(serde_json::json!({ "callnote": note }));
                     }
                     // nothing ran: whatever the gate is still holding is the
                     // answer, and the user has been waiting for it
@@ -6549,10 +6634,21 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                         let on_result = |r: &serde_json::Value| {
                             let _ = send_raw(&format!(": enclave-tool-result {r}\n\n"));
                         };
-                        if t.step(&s.text, &mut messages, &on_call, &on_result) {
+                        let on_note = |n: &str| {
+                            let _ = send_raw(&format!(": enclave-tool-note {n}\n\n"));
+                        };
+                        if t.step(&s.text, &mut messages, &on_call, &on_result, &on_note) {
                             continue 'answer;
                         }
                     }
+                    // an attempted call that ran nothing: the raw block is
+                    // held back and the reason goes out as content, because
+                    // this protocol has no side channel a client must read
+                    let note_text = tl.as_mut().and_then(|t| t.refused.take()).map(|note| {
+                        let bare = gate.borrow().suppress; // the whole answer was the call
+                        gate.borrow_mut().drop_call();
+                        if bare { format!("[{note}]") } else { format!("\n\n[{note}]") }
+                    });
                     if client_block.is_some() {
                         client_calls = tools::parse_calls(&s.text);
                         if !client_calls.is_empty() {
@@ -6566,6 +6662,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                             let _ = send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None));
                         }
                         let _ = send_raw(&chunk(serde_json::json!({ "content": rest }), None));
+                    }
+                    if let Some(n) = note_text {
+                        if !opened.replace(true) {
+                            let _ = send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None));
+                        }
+                        let _ = send_raw(&chunk(serde_json::json!({ "content": n }), None));
                     }
                     done_stats = Some(s);
                     break;
@@ -6677,7 +6779,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 Ok(s) => {
                     if let Some(t) = &mut tl {
                         let quiet = |_: &serde_json::Value| {};
-                        if t.step(&s.text, &mut messages, &quiet, &quiet) {
+                        if t.step(&s.text, &mut messages, &quiet, &quiet, &|_| {}) {
                             continue 'answer;
                         }
                     }
@@ -6696,11 +6798,18 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 } else {
                     Vec::new()
                 };
+                let refused = tl.as_mut().and_then(|t| t.refused.take());
                 let (message, finish) = if client_calls.is_empty() {
+                    // an attempted call that ran nothing is replaced by its
+                    // refusal; raw dead JSON is not an answer
+                    let text = match refused {
+                        Some(n) => note_for_unrun(&s.text, n),
+                        None => s.text.clone(),
+                    };
                     // the prompt force-opened the think block; restore the tag
                     // so the reply carries a complete one
                     let content =
-                        if think_open { format!("<think>\n{}", s.text) } else { s.text.clone() };
+                        if think_open { format!("<think>\n{text}") } else { text };
                     (
                         serde_json::json!({ "role": "assistant", "content": content }),
                         s.finish_reason,
@@ -7908,7 +8017,8 @@ mod tests {
         .unwrap();
         let b = tools::Builtins::default();
         let mut tl = ToolLoop { cfg: &tc, builtins: b, reg: tools::build(&tc, b, &|_| {}),
-                                calls: 0, limit_told: false, log: Vec::new() };
+                                calls: 0, limit_told: false, malformed_told: false,
+                                refused: None, log: Vec::new() };
         assert!(tl.armed());
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // a name the registry does NOT have, so the loop is exercised without
@@ -7917,18 +8027,67 @@ mod tests {
         // the answer down with it.
         let call = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
         // first call: attempted, conversation grows by the call and its result
-        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}));
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert_eq!(msgs.len(), 3);
         assert_eq!(tl.calls, 1);
         assert!(msgs[2].content.contains("<tool_response>"));
         // second: over budget, so it is refused with an instruction to answer
-        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}));
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert!(msgs[4].content.contains("NOT run"), "{}", msgs[4].content);
         // third: it was already told once - telling it again is an infinite
-        // loop, so the reply goes to the user as it stands
-        assert!(!tl.step(call, &mut msgs, &|_| {}, &|_| {}));
+        // loop, so the turn ends with the refusal for the legs to deliver
+        assert!(!tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.refused, Some(REFUSED_LIMIT));
         // a reply with no call in it never regenerates
-        assert!(!tl.step("Here is the answer.", &mut msgs, &|_| {}, &|_| {}));
+        tl.refused = None;
+        assert!(!tl.step("Here is the answer.", &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.refused, None);
+    }
+
+    /// An attempted call the parser cannot accept is corrected once, refused
+    /// with a reason the second time, and never mistaken for prose that only
+    /// mentions the tag.
+    #[test]
+    fn unparseable_calls_are_corrected_then_refused() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let mut tl = ToolLoop { cfg: &tc, builtins: b, reg: tools::build(&tc, b, &|_| {}),
+                                calls: 0, limit_told: false, malformed_told: false,
+                                refused: None, log: Vec::new() };
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        // the live shape of 2026-08-05: no name anywhere, tag left unclosed
+        let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";
+        let noted = std::cell::Cell::new(0);
+        assert!(tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_: &str| noted.set(noted.get() + 1)));
+        assert_eq!(noted.get(), 1);
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[2].content.contains("could not be parsed"), "{}", msgs[2].content);
+        // still malformed after the correction: refused, not delivered raw
+        assert!(!tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.refused, Some(REFUSED_MALFORMED));
+        // prose that mentions the tag without an object is an answer
+        tl.refused = None;
+        assert!(!tl.step("Write it inside <tool_call> tags.", &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.refused, None);
+        // ...and a call discussed inside <think> was never attempted
+        assert!(!attempted_call("<think>maybe <tool_call>{\"name\":\"a\"} would do</think>Done."));
+        assert!(attempted_call("<think>plan</think>prose first\n<tool_call>\n{\"arguments\":{}}"));
+    }
+
+    /// What the /v1 legs deliver in place of a refused call: prose and
+    /// reasoning survive, the dead JSON becomes the reason.
+    #[test]
+    fn refused_calls_are_replaced_readably() {
+        let t = "Some prose first.\n<tool_call>\n{\"arguments\":{\"url\":\"x\"}}";
+        assert_eq!(
+            note_for_unrun(t, REFUSED_MALFORMED),
+            format!("Some prose first.\n\n[{REFUSED_MALFORMED}]")
+        );
+        let bare = "<tool_call>\n{\"arguments\":{}}";
+        assert_eq!(note_for_unrun(bare, REFUSED_LIMIT), format!("[{REFUSED_LIMIT}]"));
     }
 
     /// What the model is actually shown. The signatures have to reach the
