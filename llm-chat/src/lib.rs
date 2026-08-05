@@ -3957,11 +3957,31 @@ fn route_web_search(
     // ACTUALLY has: offering the model a tool that is not configured is how
     // you get an IMAGE verdict on a deployment with no image service, and a
     // turn that does nothing while the user waits.
+    // WHY THIS DEMANDS A PLAIN PICTURE REQUEST, and why the old wording did
+    // not. It used to fire on "asks to see, draw, render, design or
+    // illustrate something" - a verb list, and technical chat uses every one
+    // of those verbs without wanting a picture ("show me how", "design a
+    // REST API", "illustrate the difference with an example"). Reported live
+    // 2026-08-05 as images firing constantly; reproduced against the live
+    // deployment (this pass exactly: same model, greedy, thinking off):
+    // "illustrate the difference between TCP and UDP", "make a flowchart of
+    // the login flow" and "[attached photo] make this brighter" all routed
+    // IMAGE. The rule now says what IMAGE does, requires the picture to be
+    // the turn's PRODUCT, and names the verb families that are not picture
+    // requests. Measured 2026-08-05: old wording 22/26, this one 26/26 on a
+    // battery of 6 positives + 12 traps + the search/NO regression set (the
+    // follow-up-tweak positive also needed the opener below).
     let image_rule = if want_image {
-        "\nGenerate an image when the user asks to see, draw, paint, render, \
-design or illustrate something, or asks for a picture, photo, logo, icon or \
-artwork. Do NOT generate one when they are asking ABOUT an image or about art \
-in general, or asking to edit an image you cannot see.\n"
+        "\nIMAGE sends a prompt to an image generator and shows the user the \
+picture. Choose it only when the user plainly wants a picture as this turn's \
+product - draw / paint / generate / make me an image, picture, photo, logo, \
+icon, poster, wallpaper or artwork - or asks to change an image you generated \
+earlier in this conversation. Words like show, see, look like, design, render, \
+sketch, draw up, illustrate or visualize usually ask you to explain, give an \
+example, or write code or text: that is NOT a picture request. Never IMAGE for \
+diagrams, charts, flowcharts or graphs (answer those in text), for questions \
+about an existing image or artwork, or for edits to a photo the user attached. \
+When unsure, it is not IMAGE.\n"
     } else {
         ""
     };
@@ -4049,8 +4069,19 @@ options, anything where a wrong intermediate step ruins the answer.
             .to_string(),
         (false, false) => return RouterOut::default(),
     };
+    // The opener is a ROLE sentence, not a nicety. Shown a transcript that
+    // ends mid-flow ("Want any tweaks?" / "love it, but make it night time"),
+    // a model told only "you decide what is needed" kept CONTINUING the chat
+    // - answered the user, format gone - so a follow-up tweak to a generated
+    // image silently did nothing, on the very turn the reply invited
+    // (run_image says "offer to adjust it"). Naming it a classifier reading
+    // a transcript ends that: the tweak now routes IMAGE with the full
+    // amended description (measured live 2026-08-05, alongside image_rule's
+    // battery above).
     let router_system = format!(
-        "You decide what is needed to handle the user's last message.
+        "You are a routing classifier reading a conversation transcript. You never \
+answer the user's message or continue the conversation yourself - you only \
+decide what is needed to handle the last user message.
 
 {route_rules}{effort_rules}
 {reply_form}"
