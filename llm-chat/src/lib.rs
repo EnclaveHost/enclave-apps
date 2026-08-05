@@ -2887,27 +2887,12 @@ fn generate_mtp(
     // under one arbiter grant. Needs rewind mode (the verify runs on the
     // real sequence) and the fold (the observe rides the same call); the
     // knob exists so an A/B can pin the two-call loop on a fused host.
-    // lookup-assist (see config): on rounds with a LONG n-gram match, draft
-    // free lookup tokens instead of the head's one. A lookup round can't use
-    // the fused mtp_round (that verb drafts via the head), so assist forces
-    // the two-call path for the whole generation - MTP rounds pay the ~0.5ms
-    // boundary, lookup rounds win a wider verify. Needs rewind depth to cover
-    // the wider draft.
-    let lookup_assist = cfg.draft_lookup_assist.unwrap_or(false) && depth > 0;
     let fused = depth > 0
         && fold
         && gcaps.as_ref().map(|c| c.mtp_round).unwrap_or(false)
-        && cfg.draft_fused.unwrap_or(true)
-        && !lookup_assist;
+        && cfg.draft_fused.unwrap_or(true);
     let mut pending_obs: Option<(usize, Vec<u32>)> = None;
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
-    // MTP alone wants k=1 (batch-2 has no nextn verify premium; k>=2 explodes).
-    // Lookup rides the wider budget: `k` covers its draft, MTP stays at 1 when
-    // assisting. LK_ASSIST_FLOOR = the shortest anchor a lookup round may use;
-    // long only, so its deep positions actually accept (short matches are the
-    // rounds MTP already handles well at k=1).
-    let mtp_k = if lookup_assist { 1 } else { k };
-    let lk_floor = cfg.draft_min_ngram.unwrap_or(LOOKUP_NGRAM).clamp(4, LOOKUP_NGRAM_MAX);
     let p_min_milli = (cfg.draft_p_min.clamp(0.0, 0.95) * 1000.0) as i32;
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
@@ -2931,17 +2916,11 @@ fn generate_mtp(
     let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
     let (mut drafted, mut accepted) = (0usize, 0usize);
-    // lookup-assist engagement instrumentation (prototype): how many rounds
-    // took the lookup path, and how wide/accepted they were. The workload
-    // signal that predicts the fleet win (engagement + acceptance are
-    // hardware-independent); emitted to stderr at generation end.
-    let (mut lk_rounds, mut lk_drafted, mut lk_accepted, mut lk_total_rounds) = (0usize, 0usize, 0usize, 0usize);
     let mut t_fed = prompt_ids.len();
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
     let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
     'outer: loop {
-        lk_total_rounds += 1;
         if cfg.eos.contains(&pending) { break; }
         if out.generated.len() >= p.max_new { finish = "length"; break; }
         match out.push(pending) {
@@ -3011,7 +2990,6 @@ fn generate_mtp(
         let drafts: Vec<u32>;
         let feed: Vec<u32>;
         let mut rows: Vec<Row>;
-        let mut round_via_lookup = false;
         if fused {
             // -- fused round (mm25): observe + draft + verify in ONE host
             //    call under one arbiter grant; rows come back for
@@ -3042,45 +3020,18 @@ fn generate_mtp(
             rows = r;
             t_fed += feed.len();
         } else {
-            // lookup-assist: try a LONG n-gram anchor first (longest context
-            // wins). A strong match (>=2 proposed) drafts free & wide - the
-            // head is idle this round, so the deferred observe is flushed
-            // explicitly (its rows are still the previous verify's, intact
-            // until this round's verify overwrites them) to keep the head
-            // synced. No match -> the k=1 head draft, exactly as MTP-only.
-            let lk = if lookup_assist {
-                let mut v = Vec::new();
-                for ng in (lk_floor..=LOOKUP_NGRAM_MAX).rev() {
-                    v = lookup_propose(prompt_ids, &out.generated, ng, k);
-                    if !v.is_empty() {
-                        break;
-                    }
-                }
-                v
-            } else {
-                Vec::new()
-            };
-            let mut d;
-            if lk.len() >= 2 {
-                round_via_lookup = true;
+            let mut d = sess.mtp_draft(
+                pending, k, p_min_milli,
+                obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
+            )?;
+            if d.is_empty() {
                 if let Some((op, ot)) = obs_now {
+                    // a folded call returning nothing is ambiguous: the observe
+                    // may have failed before drafting. Re-observe explicitly
+                    // (idempotent - same rows, same positions) so the head never
+                    // silently desyncs, then draft once more without the fold.
                     sess.mtp_accept(op, &ot)?;
-                }
-                d = lk;
-            } else {
-                d = sess.mtp_draft(
-                    pending, mtp_k, p_min_milli,
-                    obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
-                )?;
-                if d.is_empty() {
-                    if let Some((op, ot)) = obs_now {
-                        // a folded call returning nothing is ambiguous: the observe
-                        // may have failed before drafting. Re-observe explicitly
-                        // (idempotent - same rows, same positions) so the head never
-                        // silently desyncs, then draft once more without the fold.
-                        sess.mtp_accept(op, &ot)?;
-                        d = sess.mtp_draft(pending, mtp_k, p_min_milli, None)?;
-                    }
+                    d = sess.mtp_draft(pending, k, p_min_milli, None)?;
                 }
             }
             drafts = d;
@@ -3135,11 +3086,6 @@ fn generate_mtp(
             acc += 1;
         }
         accepted += acc;
-        if round_via_lookup {
-            lk_rounds += 1;
-            lk_drafted += drafts.len();
-            lk_accepted += acc;
-        }
         // -- the head learns ONLY the accepted tokens (its KV never holds a
         //    rejected proposal), then the target commits them. On fold-aware
         //    hosts the observe rides the NEXT round's draft call instead of
@@ -3175,15 +3121,6 @@ fn generate_mtp(
     }
     out.flush();
     let decode_ms = now_ms() - t2;
-    if lookup_assist {
-        eprintln!(
-            "[lk-assist] rounds={lk_total_rounds} lookup_rounds={lk_rounds} \
-             ({}%) lk_drafted={lk_drafted} lk_accepted={lk_accepted} \
-             (lk_accept={}%) total_accepted={accepted}",
-            if lk_total_rounds > 0 { lk_rounds * 100 / lk_total_rounds } else { 0 },
-            if lk_drafted > 0 { lk_accepted * 100 / lk_drafted } else { 0 },
-        );
-    }
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
