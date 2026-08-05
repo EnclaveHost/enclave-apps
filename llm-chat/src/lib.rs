@@ -4268,6 +4268,10 @@ struct ToolLoop<'a> {
     /// (an image generation is minutes) must tick the client stream while
     /// they wait, or every idle timeout between here and the browser fires
     status: &'a dyn Fn(&str),
+    /// runs an entry's config-supplied `format` prompt over a result
+    /// (format_tool_result, closed over the leg's generation context). None
+    /// from it keeps the raw text: formatting must never cost the answer.
+    formatter: &'a dyn Fn(&str, &str) -> Option<String>,
     /// the attached pictures, taken OUT of the messages when the model holds
     /// view_image (this model cannot see, and the prompt refuses image turns
     /// on blind models) and held here for the tool to look at
@@ -4303,12 +4307,14 @@ impl<'a> ToolLoop<'a> {
         cfg: &'a tools::ToolsConfig,
         builtins: tools::Builtins<'a>,
         on_status: &'a dyn Fn(&str),
+        formatter: &'a dyn Fn(&str, &str) -> Option<String>,
     ) -> ToolLoop<'a> {
         ToolLoop {
             cfg,
             builtins,
             reg: tools::build(cfg, builtins, on_status),
             status: on_status,
+            formatter,
             images: Vec::new(),
             image_out: None,
             calls: 0,
@@ -4429,7 +4435,7 @@ impl<'a> ToolLoop<'a> {
         on_call(&serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
         }));
-        let r = tools::call(
+        let mut r = tools::call(
             &mut self.reg,
             self.cfg,
             self.builtins,
@@ -4439,7 +4445,20 @@ impl<'a> ToolLoop<'a> {
             || now_ms() as u64,
             self.status,
         );
-        if let Some(img) = r.image {
+        // the entry's config-supplied format prompt, applied before anything
+        // downstream sees the result
+        if !r.is_error {
+            if let Some(tools::ToolSrc::Http(i)) =
+                self.reg.find(&c.name).map(|t| t.src.clone())
+            {
+                if let Some(instr) = self.cfg.http[i].format.as_deref() {
+                    if let Some(f) = (self.formatter)(instr, &r.text) {
+                        r.text = f;
+                    }
+                }
+            }
+        }
+        if let Some(img) = r.image.take() {
             self.image_out = Some(img);
         }
         let mut entry = serde_json::json!({
@@ -5529,6 +5548,235 @@ fn note_failed_search(messages: &mut [ChatMsg], last: usize) {
     );
 }
 
+/// Run an entry's config-supplied `format` prompt over its result: the
+/// shaping the bespoke search leg does in code, expressed as configuration.
+/// One short greedy pass; the instruction is the operator's, the response is
+/// data. Any failure returns None and the caller keeps the raw text, because
+/// formatting must never cost the answer.
+fn format_tool_result(
+    cfg: &AppConfig,
+    tok: &Tok,
+    mode: &str,
+    instruction: &str,
+    raw: &str,
+    on_status: &dyn Fn(&str),
+) -> Option<String> {
+    let system = format!(
+        "You reformat one API response for another assistant to read. Follow this \
+         instruction exactly and output ONLY the reformatted content - never answer it, \
+         comment on it, or add anything of your own:\n{instruction}"
+    );
+    let msgs = vec![ChatMsg::text("system", system), ChatMsg::text("user", raw)];
+    // thinking off: this is transcription work, not a reasoning task
+    let (ids, stops, _) = build_prompt(cfg, tok, &msgs, false, Capabilities::Internal).ok()?;
+    let params = GenParams {
+        max_new: 1024,
+        sample: SampleParams {
+            temperature: 0.0, // greedy: the same response formats the same way
+            top_p: 1.0,
+            top_k: 0,
+            rep_penalty: 1.0,
+            rep_window: 0,
+        },
+        stop_strings: stops,
+        think_budget: 0,
+        think_open: false,
+        loop_reps: 4,
+    };
+    let &(target, tname) = targets_for(cfg, mode).first()?;
+    let status = internal_status("formatting the result…", on_status, INTERNAL_BUSY_BUDGET_MS);
+    let noop_emit = |_: &str| true;
+    let stats =
+        generate(cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &status)
+            .ok()?;
+    let out = strip_think(&stats.text).trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// One classifier line into (service, input): "searchweb: rust 1.90 changes".
+/// The name must match a routable entry; NO, or anything else, is a no.
+fn parse_routed(text: &str, names: &[&str]) -> Option<(String, String)> {
+    let body = strip_think(text);
+    let line = body.trim();
+    let (name, rest) = line.split_once(':')?;
+    let name = name.trim().trim_start_matches('-').trim();
+    let rest = rest.trim();
+    if rest.is_empty() || !names.contains(&name) {
+        return None;
+    }
+    Some((name.to_string(), rest.to_string()))
+}
+
+/// The generic pre-pass: config-supplied ROUTE prompts, for turns where the
+/// tool loop is not armed - most commonly a model without the trained call
+/// format, which this hands the same capabilities. One classifier pass reads
+/// the conversation tail and the route lines, picks a service or NONE, runs
+/// it through the same executor an armed turn uses (format prompt included),
+/// and folds the result into the last user turn the way a routed search
+/// always has been. The user's tools switch still governs it: the route
+/// prompt is the deployment's, consent is the client's. Failures fold a note
+/// and cost the turn nothing.
+fn apply_tool_routes(
+    cfg: &AppConfig,
+    creq: &ChatReq,
+    messages: &mut Vec<ChatMsg>,
+    tok: &Tok,
+    mode: &str,
+    image_out: &mut Option<image::GeneratedImage>,
+    on_status: &dyn Fn(&str),
+) -> Option<SearchMeta> {
+    let tc = cfg.tools.as_ref()?;
+    if !creq.tools_on(tc.default_on) {
+        return None;
+    }
+    let b = builtins_for(cfg, creq);
+    let routable: Vec<(usize, &tools::HttpTool)> = tc
+        .http
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.route.is_some() && t.route_binding().is_some())
+        .filter(|(_, t)| !t.wants_images() || (b.images_present && !b.images_local))
+        .collect();
+    if routable.is_empty() {
+        return None;
+    }
+    let last = messages.iter().rposition(|m| m.role == "user")?;
+
+    // the same classifier shape route_web_search uses, with the offer list
+    // written by the config instead of by this file
+    let mut system = String::from(
+        "You are a routing classifier reading a conversation transcript. You never answer \
+         the user's message or continue the conversation yourself - you only decide \
+         whether handling the last user message needs one of these services, and with \
+         what input:\n",
+    );
+    for (_, t) in &routable {
+        system.push_str(&format!("- {}: {}\n", t.name, t.route.as_deref().unwrap_or("")));
+    }
+    system.push_str(
+        "\nReply with EXACTLY ONE line and nothing else:\n\
+         <service name>: <the input to send it>\nor\nNO",
+    );
+    let mut router_msgs: Vec<ChatMsg> = vec![ChatMsg::text("system", system)];
+    let tail: Vec<&ChatMsg> = messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .rev()
+        .take(4)
+        .collect();
+    for m in tail.into_iter().rev() {
+        let mut c = truncate_for_msg_n(&m.content, 1500);
+        if !m.images.is_empty() {
+            let note = if m.images.len() == 1 {
+                "[the user attached an image]".to_string()
+            } else {
+                format!("[the user attached {} images]", m.images.len())
+            };
+            c = if c.trim().is_empty() { note } else { format!("{note}\n{c}") };
+        }
+        router_msgs.push(ChatMsg::text(&m.role, c));
+    }
+    let (ids, stops, _) = build_prompt(cfg, tok, &router_msgs, false, Capabilities::Internal).ok()?;
+    let params = GenParams {
+        max_new: 96,
+        sample: SampleParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            rep_penalty: 1.0,
+            rep_window: 0,
+        },
+        stop_strings: {
+            let mut s = stops;
+            s.push("\n".into());
+            s
+        },
+        think_budget: 0,
+        think_open: false,
+        loop_reps: 4,
+    };
+    let &(target, tname) = targets_for(cfg, mode).first()?;
+    let noop_emit = |_: &str| true;
+    let status = internal_status("deciding what this needs…", on_status, INTERNAL_BUSY_BUDGET_MS);
+    let stats =
+        generate(cfg, tok, &ids, target, tname, &params, &DraftPlan::Plain, &noop_emit, &status)
+            .ok()?;
+    let names: Vec<&str> = routable.iter().map(|(_, t)| t.name.as_str()).collect();
+    let (name, input) = parse_routed(&stats.text, &names)?;
+    let (i, t) = *routable.iter().find(|(_, t)| t.name == name)?;
+    let input = input.to_string();
+
+    on_status(&format!("calling {name}…"));
+    let mut argmap = serde_json::Map::new();
+    argmap.insert(t.route_binding()?, serde_json::json!(input));
+    let args = serde_json::Value::Object(argmap);
+    let images: Vec<Vec<u8>> = messages
+        .iter()
+        .rev()
+        .find(|m| !m.images.is_empty())
+        .map(|m| m.images.clone())
+        .unwrap_or_default();
+    let mut r = tools::call_http_entry(tc, i, &args, &images, || now_ms() as u64, on_status);
+
+    // pictures a routed tool consumed leave the prompt, exactly as the
+    // vision pre-pass leaves them
+    if t.wants_images() {
+        for m in messages.iter_mut() {
+            if m.images.is_empty() {
+                continue;
+            }
+            let note = if m.images.len() == 1 {
+                "[an image the user attached here]"
+            } else {
+                "[images the user attached here]"
+            };
+            m.content = if m.content.trim().is_empty() {
+                note.to_string()
+            } else {
+                format!("{note}\n{}", m.content.trim())
+            };
+            m.images.clear();
+        }
+    }
+    if r.is_error {
+        // same contract as a failed search: the model is told, the user is
+        // not misled by an answer that LOOKS checked
+        messages[last].content = format!(
+            "{}\n\n[{name} was attempted for this request but FAILED: {}. Answer from what \
+             you have, and say plainly what you could not check.]",
+            messages[last].content.trim(),
+            r.text
+        );
+        return None;
+    }
+    if let Some(instr) = t.format.as_deref() {
+        if let Some(f) = format_tool_result(cfg, tok, mode, instr, &r.text, on_status) {
+            r.text = f;
+        }
+    }
+    if let Some(img) = r.image.take() {
+        messages[last].content = format!(
+            "{}\n\n[An image has ALREADY been generated for this request and is displayed \
+             to the user directly above your reply. It was made by {name} from: \
+             \"{input}\". Do not describe the image in detail - you cannot see it. \
+             Acknowledge it briefly and naturally, and offer to adjust it.]",
+            messages[last].content.trim()
+        );
+        *image_out = Some(img);
+        return None;
+    }
+    messages[last].content = format!(
+        "[Context from {name}, fetched for this question:]\n{}\n\nQuestion: {}",
+        r.text,
+        messages[last].content.trim()
+    );
+    (!r.sources.is_empty()).then(|| SearchMeta {
+        provider: name.to_string(),
+        sources: std::mem::take(&mut r.sources),
+        ms: r.ms,
+    })
+}
+
 fn finish_search(
     cfg: &AppConfig,
     messages: &mut [ChatMsg],
@@ -6215,8 +6463,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // be in the prompt, and a deployment that gave the model a web_search tool
     // must stop the router deciding about search, or the turn pays for a
     // provider round trip the model never asked for and then gets the tool too.
+    let formatter = |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &status_cb);
     let mut tl = tools_enabled(cfg, &creq)
-        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &status_cb));
+        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &status_cb, &formatter));
     if let Some(t) = &tl {
         for n in &t.reg.notes {
             let _ = send(serde_json::json!({ "notice": format!("tools: {n}") }));
@@ -6276,6 +6525,17 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     };
     if let Some(m) = &vision_meta {
         let _ = send(serde_json::json!({ "vision": vision_meta_json(m) }));
+    }
+    // the generic route pre-pass, for turns where the tool loop is not armed:
+    // config-supplied ROUTE prompts pick a service, its result folds in like
+    // a routed search, and its sources ride the same event
+    let route_meta = if tl.is_none() {
+        apply_tool_routes(cfg, &creq, &mut messages, &tok, mode, &mut generated_image, &status_cb)
+    } else {
+        None
+    };
+    if let Some(m) = &route_meta {
+        let _ = send(serde_json::json!({ "search": search_meta_json(m) }));
     }
     // the image lands BEFORE the reply, so it is on screen while the model
     // writes its sentence about it
@@ -6659,11 +6919,13 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // block pays for neither.
         let mut router_effort: Option<Effort> = None;
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
+        let formatter =
+            |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
         let mut tl = if client_reg.is_some() {
             None
         } else {
             tools_enabled(cfg, &creq)
-                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status))
+                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status, &formatter))
         };
         if let Some(t) = &tl {
             for n in &t.reg.notes {
@@ -6716,6 +6978,15 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 }
             }
         };
+        // the generic route pre-pass (config-supplied ROUTE prompts), for
+        // turns where the tool loop is not armed; its sources ride the same
+        // comment a routed search uses
+        let route_meta = if tl.is_none() {
+            apply_tool_routes(cfg, &creq, &mut messages, &tok, mode, &mut generated_image, &leg_status)
+        } else {
+            None
+        };
+        let search_meta = search_meta.or(route_meta);
         // Sources first, as an SSE COMMENT: the chunk schema has no field for
         // them and inventing one would break strict OpenAI clients, while a
         // comment line is required to be ignored by every conforming parser.
@@ -6905,11 +7176,13 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // block pays for neither.
         let mut router_effort: Option<Effort> = None;
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
+        let formatter =
+            |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
         let mut tl = if client_reg.is_some() {
             None
         } else {
             tools_enabled(cfg, &creq)
-                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status))
+                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status, &formatter))
         };
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
@@ -6943,6 +7216,14 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 Err(e) => return json_err(out, 502, &e),
             }
         };
+        // the generic route pre-pass, for turns where the tool loop is not
+        // armed; its sources land in enclave.search like a routed search's
+        let route_meta = if tl.is_none() {
+            apply_tool_routes(cfg, &creq, &mut messages, &tok, mode, &mut generated_image, &no_status)
+        } else {
+            None
+        };
+        let search_meta = search_meta.or(route_meta);
         let sink = |_: &str| true;
         let mut last_err = String::new();
         let mut result: Option<GenStats> = None;
@@ -8224,7 +8505,8 @@ mod tests {
         .unwrap();
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
-        let mut tl = ToolLoop::open(&tc, b, &nop);
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
         assert!(tl.armed());
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // a name the registry does NOT have, so the loop is exercised without
@@ -8261,7 +8543,8 @@ mod tests {
         .unwrap();
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
-        let mut tl = ToolLoop::open(&tc, b, &nop);
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // the live shape of 2026-08-05: no name anywhere, tag left unclosed
         let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";
@@ -8280,6 +8563,28 @@ mod tests {
         // ...and a call discussed inside <think> was never attempted
         assert!(!attempted_call("<think>maybe <tool_call>{\"name\":\"a\"} would do</think>Done."));
         assert!(attempted_call("<think>plan</think>prose first\n<tool_call>\n{\"arguments\":{}}"));
+    }
+
+    /// The route classifier's one line, parsed: a known service and its
+    /// input, or nothing. Reasoning and refusals never route.
+    #[test]
+    fn routed_lines_parse_strictly() {
+        let names = ["searchweb", "draw"];
+        assert_eq!(
+            parse_routed("searchweb: rust 1.90 release notes", &names),
+            Some(("searchweb".into(), "rust 1.90 release notes".into()))
+        );
+        // a leading list dash and think blocks are tolerated
+        assert_eq!(
+            parse_routed("<think>hm</think>\n- draw: a fox in the snow", &names),
+            Some(("draw".into(), "a fox in the snow".into()))
+        );
+        assert_eq!(parse_routed("NO", &names), None);
+        assert_eq!(parse_routed("NONE", &names), None);
+        // an unknown service is a no, not a guess
+        assert_eq!(parse_routed("teleport: home", &names), None);
+        // a service with no input is a no
+        assert_eq!(parse_routed("searchweb:", &names), None);
     }
 
     /// The search block's two homes resolve to one leg, the flattened one
