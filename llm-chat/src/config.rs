@@ -218,6 +218,11 @@ pub struct AppConfig {
     /// itself over wasi:http so the query goes out from the deployment's own
     /// egress identity rather than the user's browser. See search.rs for what
     /// the provider does and does not learn.
+    ///
+    /// LEGACY LOCATION: since 0.39 the block's home is `tools.search`, beside
+    /// the other external capabilities. This top-level spelling still parses
+    /// forever (config CIDs are immutable on-chain); when both are present the
+    /// tools one wins. Read it through search_cfg(), never directly.
     #[serde(default)]
     pub search: Option<crate::search::SearchConfig>,
     /// IMAGE GENERATION: absent (the default) means the app never calls an
@@ -289,6 +294,20 @@ pub struct AppConfig {
     /// the user thinks they are sending.
     #[serde(default = "default_max_images")]
     pub max_images: usize,
+}
+
+impl AppConfig {
+    /// The search leg, wherever it was configured: `tools.search` (its home
+    /// since 0.39) wins over the legacy top-level block. Everything that
+    /// reaches the web - the router pre-pass, the web builtins, the /search
+    /// probe - resolves it through here, so the two spellings behave
+    /// identically.
+    pub fn search_cfg(&self) -> Option<&crate::search::SearchConfig> {
+        self.tools
+            .as_ref()
+            .and_then(|t| t.search.as_ref())
+            .or(self.search.as_ref())
+    }
 }
 
 /// Reasoning budgets per rated effort, in tokens spent inside the <think>

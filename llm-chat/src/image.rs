@@ -122,8 +122,11 @@ fn is_unresolved_ref(s: &str) -> bool {
 }
 
 pub struct GeneratedImage {
-    /// base64 PNG, exactly as the service returned it
+    /// base64 image bytes, exactly as the service returned them
     pub b64: String,
+    /// what the bytes are ("image/png" unless the service said otherwise via
+    /// a data URI - see tools::image_payload)
+    pub mime: String,
     pub prompt: String,
     pub model: Option<String>,
     pub seed: Option<i64>,
@@ -132,7 +135,7 @@ pub struct GeneratedImage {
 
 impl GeneratedImage {
     pub fn data_uri(&self) -> String {
-        format!("data:image/png;base64,{}", self.b64)
+        format!("data:{};base64,{}", self.mime, self.b64)
     }
 }
 
@@ -218,6 +221,7 @@ pub fn generate(
     }
     Ok(GeneratedImage {
         b64,
+        mime: "image/png".into(),
         prompt: prompt.to_string(),
         model: v["model"].as_str().or(cfg.model.as_deref()).map(str::to_string),
         seed: first["seed"].as_i64(),
@@ -265,7 +269,8 @@ mod tests {
     #[test]
     fn data_uri_is_a_png() {
         let g = GeneratedImage {
-            b64: "AAAB".into(), prompt: "x".into(), model: None, seed: None, ms: 1,
+            b64: "AAAB".into(), mime: "image/png".into(), prompt: "x".into(),
+            model: None, seed: None, ms: 1,
         };
         assert_eq!(g.data_uri(), "data:image/png;base64,AAAB");
     }

@@ -108,7 +108,21 @@ pub struct ToolsConfig {
     /// leave the prompt and wait for the model to ask).
     #[serde(default)]
     pub builtin: Vec<String>,
-    /// plain HTTP endpoints, described here in full
+    /// The search leg's home since 0.39: provider, key, result and fetch
+    /// budgets (see search.rs). It lives HERE because it is an external
+    /// capability like every other entry in this block - it backs the
+    /// web_search and request builtins, and the pre-pass router falls back to
+    /// it on turns where the tools are not armed. The legacy top-level
+    /// `search` block still parses (config CIDs are immutable on-chain);
+    /// AppConfig::search_cfg resolves the two, this one winning.
+    #[serde(default)]
+    pub search: Option<crate::search::SearchConfig>,
+    /// plain HTTP endpoints, described here in full. This is the fully
+    /// general half: ANY API becomes a tool, including ones that produce a
+    /// picture for the client (`result: {"image": ...}`) or read the turn's
+    /// attached pictures (`"$images"` in the body template) - which is how a
+    /// deployment wires image generation and vision since 0.39, against any
+    /// endpoint rather than through bespoke config blocks.
     #[serde(default)]
     pub http: Vec<HttpTool>,
     /// MCP servers, whose tools are discovered (or declared inline)
@@ -116,10 +130,10 @@ pub struct ToolsConfig {
     pub mcp: Vec<McpServer>,
 }
 
-/// The capabilities a built-in tool is wired to. Passed in rather than read
-/// from config here, because they belong to the app, not to the tools block:
-/// `web_search` IS the search leg, with the deployment's provider and key;
-/// `generate_image` IS the image leg; `view_image` IS the vision delegation.
+/// What this TURN wires the tool registry to. The search leg is the one
+/// capability that stays bespoke (provider abstraction, the citation list,
+/// the router fallback all hang off it); everything else external is a plain
+/// http entry, and the per-turn facts here gate which of those are offered.
 #[derive(Clone, Copy, Default)]
 pub struct Builtins<'a> {
     pub search: Option<&'a crate::search::SearchConfig>,
@@ -128,31 +142,20 @@ pub struct Builtins<'a> {
     /// showing the model a tool is a stronger guarantee than asking it not to
     /// use one, and a user's choice is not a misconfiguration to report.
     pub web_withheld: bool,
-    /// the image-generation leg, when configured AND live for this turn: the
-    /// user's image switch governs the tool exactly as it governs the router
-    pub image: Option<&'a crate::image::ImageConfig>,
-    /// image is configured but the user's switch is off this turn - skipped
-    /// silently, same stance as web_withheld
-    pub image_withheld: bool,
-    /// the vision delegation leg, when configured and this turn DELEGATES
-    /// (a serving model reading the picture itself keeps it local; there is
-    /// nothing for a tool to do)
-    pub vision: Option<&'a crate::vision::VisionConfig>,
-    /// vision_service is configured but this turn reads the picture locally -
-    /// skipped silently, the capability is not missing
-    pub vision_withheld: bool,
-    /// the conversation carries at least one attached image. Without one,
-    /// view_image is silently not offered: a tool with nothing to look at is
-    /// prompt noise, not a misconfiguration.
+    /// the conversation carries at least one attached image. Without one, an
+    /// http tool that asks for `$images` is silently not offered: a tool with
+    /// nothing to look at is prompt noise, not a misconfiguration.
     pub images_present: bool,
+    /// the SERVING model reads pictures itself this turn (a vision volume,
+    /// prefer_local or named outright), so image-reading tools are silently
+    /// stood down: there is nothing to delegate.
+    pub images_local: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Builtin {
     WebSearch,
     Request,
-    GenerateImage,
-    ViewImage,
 }
 
 impl Builtin {
@@ -163,8 +166,6 @@ impl Builtin {
             // request tool. Config CIDs are immutable on-chain, so the old
             // names must keep resolving forever.
             "request" | "fetch_url" | "post_url" => Some(Builtin::Request),
-            "generate_image" => Some(Builtin::GenerateImage),
-            "view_image" => Some(Builtin::ViewImage),
             _ => None,
         }
     }
@@ -173,8 +174,6 @@ impl Builtin {
         match self {
             Builtin::WebSearch => "web_search",
             Builtin::Request => "request",
-            Builtin::GenerateImage => "generate_image",
-            Builtin::ViewImage => "view_image",
         }
     }
 
@@ -190,16 +189,6 @@ impl Builtin {
                  user gave you, or a JSON endpoint. POST/PUT/PATCH/DELETE send `body` to an \
                  API or webhook the user pointed you at - tell the user what you sent and \
                  where.",
-            Builtin::GenerateImage =>
-                "Generate an image from a text prompt. The picture is shown to the user \
-                 directly, above your reply; you never see it, so acknowledge it briefly \
-                 rather than describing it. Write the prompt as a full visual description of \
-                 the desired picture.",
-            Builtin::ViewImage =>
-                "Look at the image(s) the user attached and answer one question about them. \
-                 The vision model sees ONLY the image and your question, not the conversation, \
-                 so make the question self-contained and ask for exact transcription when \
-                 text, numbers or labels matter.",
         }
     }
 
@@ -236,26 +225,6 @@ impl Builtin {
                 },
                 "required": ["url"],
             }),
-            Builtin::GenerateImage => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "full visual description of the image to generate",
-                    }
-                },
-                "required": ["prompt"],
-            }),
-            Builtin::ViewImage => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "one self-contained question about the attached image(s)",
-                    }
-                },
-                "required": ["question"],
-            }),
         }
     }
 
@@ -263,21 +232,14 @@ impl Builtin {
     fn available(self, b: &Builtins) -> bool {
         match self {
             Builtin::WebSearch | Builtin::Request => b.search.is_some(),
-            Builtin::GenerateImage => b.image.is_some(),
-            Builtin::ViewImage => b.vision.is_some() && b.images_present,
         }
     }
 
     /// An unavailable builtin that is a CHOICE, not a misconfiguration: the
-    /// user's switch withheld it, or there is simply no image this turn.
-    /// Skipped without a note.
+    /// user's switch withheld it. Skipped without a note.
     fn withheld(self, b: &Builtins) -> bool {
         match self {
             Builtin::WebSearch | Builtin::Request => b.web_withheld,
-            Builtin::GenerateImage => b.image_withheld,
-            Builtin::ViewImage => {
-                b.vision_withheld || (b.vision.is_some() && !b.images_present)
-            }
         }
     }
 
@@ -285,8 +247,6 @@ impl Builtin {
     fn missing(self) -> &'static str {
         match self {
             Builtin::WebSearch | Builtin::Request => "`search`",
-            Builtin::GenerateImage => "`image`",
-            Builtin::ViewImage => "`vision_service`",
         }
     }
 }
@@ -376,6 +336,52 @@ pub struct HttpTool {
     pub max_bytes: Option<usize>,
     #[serde(default)]
     pub max_chars: Option<usize>,
+    /// how the HTTP response becomes a RESULT. Absent = the whole body as
+    /// text. This is what lets an arbitrary API produce a picture: a tool
+    /// with `result: {"image": "data.0.b64_json"}` delivers the extracted
+    /// image to the CLIENT and tells the model a picture was made.
+    #[serde(default)]
+    pub result: Option<ResultMap>,
+}
+
+/// Where in a JSON response the result lives, and what it IS. Paths are
+/// dot-separated keys and array indexes ("data.0.b64_json").
+#[derive(Deserialize, Clone, Default)]
+pub struct ResultMap {
+    /// the field holding a picture, as base64 or a data URI. The bytes go to
+    /// the client through the leg's image delivery, never into the prompt.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// the field holding the text the model should read, extracted instead of
+    /// handing it the whole response. A path that does not resolve falls back
+    /// to the full body: a readable result beats an error.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+impl HttpTool {
+    /// The body template asks for the turn's attached pictures (`"$images"`
+    /// expands to an array of data URIs, `"$image"` to the first one). Such a
+    /// tool is only offered on turns that HAVE pictures, and it is what makes
+    /// vision "just a tool": any API that takes images can receive them.
+    pub fn wants_images(&self) -> bool {
+        fn scan(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::String(s) => {
+                    matches!(s.trim(), "$images" | "$image" | "${images}" | "${image}")
+                }
+                serde_json::Value::Array(a) => a.iter().any(scan),
+                serde_json::Value::Object(o) => o.values().any(scan),
+                _ => false,
+            }
+        }
+        self.body.as_ref().is_some_and(scan)
+    }
+
+    /// The response carries a picture for the client (see ResultMap).
+    pub fn makes_image(&self) -> bool {
+        self.result.as_ref().is_some_and(|r| r.image.is_some())
+    }
 }
 
 /// One MCP server reachable over the streamable-HTTP transport.
@@ -471,6 +477,28 @@ impl Registry {
     pub fn find(&self, name: &str) -> Option<&Tool> {
         self.tools.iter().find(|t| t.name == name)
     }
+
+    /// Some armed tool produces a picture for the client. The router's image
+    /// verdict stands down when this is true: the model owns the decision.
+    pub fn makes_image(&self, cfg: &ToolsConfig) -> bool {
+        self.tools.iter().any(|t| match t.src {
+            ToolSrc::Http(i) => cfg.http[i].makes_image(),
+            _ => false,
+        })
+    }
+
+    /// The name of the first armed tool that reads the turn's pictures, if
+    /// any. The legs use it to stand the vision pre-pass down, stash the
+    /// pictures for the tool, and tell the model what to call.
+    pub fn image_reader<'a>(&'a self, cfg: &ToolsConfig) -> Option<&'a str> {
+        self.tools
+            .iter()
+            .find(|t| match t.src {
+                ToolSrc::Http(i) => cfg.http[i].wants_images(),
+                _ => false,
+            })
+            .map(|t| t.name.as_str())
+    }
 }
 
 /// Assemble the registry for one request: config entries verbatim, MCP servers
@@ -517,6 +545,12 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         });
     }
     for (i, t) in cfg.http.iter().enumerate() {
+        // a tool that asks for the turn's pictures only exists when there are
+        // pictures to give it, and not when the serving model reads them
+        // itself. Silent either way: a per-turn fact, not a misconfiguration.
+        if t.wants_images() && (!b.images_present || b.images_local) {
+            continue;
+        }
         match check_name(&t.name) {
             Err(e) => reg.notes.push(format!("tool '{}' ignored: {e}", t.name)),
             Ok(()) if reg.find(&t.name).is_some() => {
@@ -955,10 +989,8 @@ pub fn call(
     let mut sources = Vec::new();
     let mut image = None;
     let r = match src {
-        ToolSrc::Builtin(k) => {
-            call_builtin(k, &b, args, images, &mut sources, &mut image, &now_ms, on_status)
-        }
-        ToolSrc::Http(i) => call_http(&cfg.http[i], cfg, args),
+        ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources),
+        ToolSrc::Http(i) => call_http(&cfg.http[i], cfg, args, images, &mut image, on_status),
         ToolSrc::Mcp { server, remote } => call_mcp(&mut reg.mcp[server], &remote, args),
         // never built into a Registry - the passthrough renders client tools
         // into the prompt and hands the call back, so reaching this arm is a
@@ -973,6 +1005,9 @@ pub fn call(
         sources.clear();
         image = None;
     }
+    if let Some(img) = &mut image {
+        img.ms = now_ms().saturating_sub(t0);
+    }
     ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources, image }
 }
 
@@ -980,19 +1015,12 @@ pub fn call(
 ///
 /// web_search renders EXACTLY what the pre-pass renders (search::render_context),
 /// so the numbering the model cites is the numbering it has always cited and
-/// the answer path needs no second convention. generate_image and view_image
-/// run the same legs the router and the vision pre-pass run, for the same
-/// reason: one implementation per capability, whoever decided to use it.
-#[allow(clippy::too_many_arguments)]
+/// the answer path needs no second convention.
 fn call_builtin(
     k: Builtin,
     b: &Builtins,
     args: &serde_json::Value,
-    images: &[Vec<u8>],
     sources: &mut Vec<(String, String)>,
-    image_out: &mut Option<crate::image::GeneratedImage>,
-    now_ms: &impl Fn() -> u64,
-    on_status: &dyn Fn(&str),
 ) -> Result<String, String> {
     match k {
         Builtin::WebSearch => {
@@ -1061,40 +1089,6 @@ fn call_builtin(
             sources.push((u.to_string(), u.to_string()));
             Ok(text)
         }
-        Builtin::GenerateImage => {
-            let icfg = b.image.ok_or("image generation is not configured on this deployment")?;
-            let prompt = args
-                .get("prompt")
-                .and_then(|p| p.as_str())
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .ok_or("generate_image needs a non-empty `prompt` string")?;
-            let img = crate::image::generate(icfg, prompt, now_ms, on_status)?;
-            let text = format!(
-                "An image has been generated from the prompt \"{}\" and is displayed to the \
-                 user directly above your reply. You cannot see it. Acknowledge it briefly \
-                 and naturally, and offer to adjust it; do not describe details you cannot \
-                 verify, and do not call generate_image again unless the user wants a \
-                 different picture.",
-                img.prompt
-            );
-            *image_out = Some(img);
-            Ok(text)
-        }
-        Builtin::ViewImage => {
-            let vcfg = b.vision.ok_or("vision delegation is not configured on this deployment")?;
-            if images.is_empty() {
-                return Err("there is no attached image in this conversation to look at".into());
-            }
-            let q = args
-                .get("question")
-                .and_then(|q| q.as_str())
-                .map(str::trim)
-                .filter(|q| !q.is_empty())
-                .ok_or("view_image needs a non-empty `question` string")?;
-            let a = crate::vision::describe(vcfg, images, q, None, now_ms, on_status)?;
-            Ok(a.text)
-        }
     }
 }
 
@@ -1134,7 +1128,14 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{head}\n[truncated at {max} characters]")
 }
 
-fn call_http(t: &HttpTool, cfg: &ToolsConfig, args: &serde_json::Value) -> Result<String, String> {
+fn call_http(
+    t: &HttpTool,
+    cfg: &ToolsConfig,
+    args: &serde_json::Value,
+    images: &[Vec<u8>],
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    on_status: &dyn Fn(&str),
+) -> Result<String, String> {
     let empty = serde_json::Map::new();
     let obj = args.as_object().unwrap_or(&empty);
     let method = match t.method.as_deref().unwrap_or("GET").to_ascii_uppercase().as_str() {
@@ -1170,7 +1171,9 @@ fn call_http(t: &HttpTool, cfg: &ToolsConfig, args: &serde_json::Value) -> Resul
         None
     } else {
         let payload = match &t.body {
-            Some(tpl) => fill_template(tpl, obj),
+            // the turn's pictures ride the template as $images / $image -
+            // bytes the model could never put in its arguments itself
+            Some(tpl) => fill_template(tpl, &with_images(obj, images)),
             None if as_query => serde_json::json!({}),
             None => args.clone(),
         };
@@ -1180,7 +1183,7 @@ fn call_http(t: &HttpTool, cfg: &ToolsConfig, args: &serde_json::Value) -> Resul
     let mut req = HttpReq::get(&url);
     req.method = method;
     req.timeout_s = t.timeout_s.unwrap_or(cfg.timeout_s);
-    req.max_bytes = t.max_bytes.unwrap_or(cfg.max_bytes);
+    req.max_bytes = req_max(t, cfg);
     req.body = body.as_deref();
     req = req.header("accept", b"application/json, text/plain;q=0.9, */*;q=0.8");
     if body.is_some() {
@@ -1194,7 +1197,13 @@ fn call_http(t: &HttpTool, cfg: &ToolsConfig, args: &serde_json::Value) -> Resul
         return Err(n.clone());
     }
 
-    let r = http::request(req)?;
+    // ticked, because a tool is allowed to be slow (an image generation
+    // queued behind other tenants is minutes) and the client stream must see
+    // SOMETHING inside every idle-timeout window between here and the browser
+    let name = t.name.clone();
+    let r = http::request_with_tick(req, 15, &mut |secs| {
+        on_status(&format!("waiting on {name}… {secs}s"));
+    })?;
     let text = String::from_utf8_lossy(&r.body).trim().to_string();
     if r.status >= 400 {
         let hint: String = text.chars().take(400).collect();
@@ -1203,11 +1212,120 @@ fn call_http(t: &HttpTool, cfg: &ToolsConfig, args: &serde_json::Value) -> Resul
     if r.truncated {
         return Ok(format!("{text}\n[response was cut off at {} bytes]", req_max(t, cfg)));
     }
+    map_result(t, text, args, image_out)
+}
+
+/// A response cap that fits what the tool RETURNS: a picture arrives as
+/// megabytes of base64 inside JSON, so an image-producing tool that sets no
+/// cap of its own gets an image-sized default instead of the text one.
+fn req_max(t: &HttpTool, cfg: &ToolsConfig) -> usize {
+    match t.max_bytes {
+        Some(n) => n,
+        None if t.makes_image() => (12 * 1024 * 1024).max(cfg.max_bytes),
+        None => cfg.max_bytes,
+    }
+}
+
+/// The substitution map for a BODY template: the model's arguments plus the
+/// turn's pictures under the reserved names `images` (array of data URIs) and
+/// `image` (the first one). Reserved means reserved: an argument that happens
+/// to share the name is shadowed, because bytes the model cannot produce must
+/// win over text it can.
+fn with_images(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    images: &[Vec<u8>],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = obj.clone();
+    if !images.is_empty() {
+        let uris: Vec<serde_json::Value> = images
+            .iter()
+            .map(|b| serde_json::Value::String(crate::vision::to_data_uri(b)))
+            .collect();
+        out.insert("image".into(), uris[0].clone());
+        out.insert("images".into(), serde_json::Value::Array(uris));
+    }
+    out
+}
+
+/// The response, shaped by the tool's ResultMap: an extracted picture goes to
+/// the client and the model gets a note; an extracted text field spares the
+/// model the envelope; no map (or a text path that misses) hands over the
+/// body as-is.
+fn map_result(
+    t: &HttpTool,
+    text: String,
+    args: &serde_json::Value,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+) -> Result<String, String> {
+    let Some(rm) = &t.result else { return Ok(text) };
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+    if let Some(path) = &rm.image {
+        let raw = parsed
+            .as_ref()
+            .and_then(|j| json_path(j, path))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                let hint: String = text.chars().take(200).collect();
+                format!(
+                    "tool '{}' answered without an image at result.image path '{path}': {hint}",
+                    t.name
+                )
+            })?;
+        let (mime, b64) = image_payload(raw);
+        let prompt = args
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| truncate(&args.to_string(), 200));
+        *image_out = Some(crate::image::GeneratedImage {
+            b64,
+            mime,
+            prompt: prompt.clone(),
+            model: None,
+            seed: None,
+            ms: 0, // stamped by call(), which owns the clock
+        });
+        return Ok(format!(
+            "The call succeeded: an image has been generated and is displayed to the user \
+             directly above your reply (request: \"{prompt}\"). You cannot see it. \
+             Acknowledge it briefly and naturally, and offer to adjust it; do not describe \
+             details you cannot verify, and do not call the tool again unless the user wants \
+             a different picture."
+        ));
+    }
+    if let Some(path) = &rm.text {
+        if let Some(v) = parsed.as_ref().and_then(|j| json_path(j, path)) {
+            return Ok(match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
+        }
+    }
     Ok(text)
 }
 
-fn req_max(t: &HttpTool, cfg: &ToolsConfig) -> usize {
-    t.max_bytes.unwrap_or(cfg.max_bytes)
+/// Walk a dot path ("data.0.b64_json") through keys and array indexes.
+fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
+    for seg in path.split('.') {
+        cur = match seg.parse::<usize>() {
+            Ok(i) => cur.get(i)?,
+            Err(_) => cur.get(seg)?,
+        };
+    }
+    Some(cur)
+}
+
+/// (mime, base64) from a field that may be raw base64 or a full data URI.
+fn image_payload(raw: &str) -> (String, String) {
+    if let Some(rest) = raw.strip_prefix("data:") {
+        if let Some((meta, b64)) = rest.split_once(',') {
+            let mime = meta.split(';').next().unwrap_or("").trim();
+            let mime = if mime.is_empty() { "image/png" } else { mime };
+            return (mime.to_string(), b64.to_string());
+        }
+    }
+    ("image/png".to_string(), raw.to_string())
 }
 
 /// A scalar argument as a bare string: JSON strings lose their quotes, numbers
@@ -1698,64 +1816,133 @@ mod tests {
         assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "request".to_string()]);
     }
 
-    /// generate_image and view_image ride their own config blocks, and
-    /// view_image only exists on a turn that actually carries a picture.
+    /// The generic powers that let ANY API be an image or vision tool: a
+    /// $images body template gates the entry on the turn's pictures, and a
+    /// result map types what comes back.
     #[test]
-    fn image_and_vision_builtins_follow_their_legs() {
+    fn image_reading_and_making_ride_generic_entries() {
         let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
-            "builtin": ["generate_image", "view_image"]
+            "http": [
+                {
+                    "name": "draw",
+                    "url": "https://img.example/v1/images/generations",
+                    "method": "POST",
+                    "body": { "prompt": "$prompt", "n": 1 },
+                    "result": { "image": "data.0.b64_json" }
+                },
+                {
+                    "name": "look",
+                    "url": "https://eyes.example/v1/vision",
+                    "method": "POST",
+                    "body": { "question": "$question", "images": "$images" },
+                    "result": { "text": "answer" }
+                }
+            ]
         }))
         .unwrap();
-        let icfg: crate::image::ImageConfig =
-            serde_json::from_value(serde_json::json!({ "endpoint": "https://img.example" }))
-                .unwrap();
-        let vcfg: crate::vision::VisionConfig =
-            serde_json::from_value(serde_json::json!({ "endpoint": "https://eyes.example" }))
-                .unwrap();
-        // both configured, image attached: both offered
-        let b = Builtins {
-            image: Some(&icfg),
-            vision: Some(&vcfg),
-            images_present: true,
-            ..Default::default()
-        };
+        assert!(cfg.http[0].makes_image() && !cfg.http[0].wants_images());
+        assert!(cfg.http[1].wants_images() && !cfg.http[1].makes_image());
+        // image attached: both offered, and the registry knows their roles
+        let b = Builtins { images_present: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["generate_image", "view_image"]);
-        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        // no picture this turn: view_image vanishes silently
-        let b = Builtins {
-            image: Some(&icfg),
-            vision: Some(&vcfg),
-            images_present: false,
-            ..Default::default()
-        };
-        let reg = build(&cfg, b, &|_| {});
-        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["generate_image"]);
-        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        // the user's image switch withholds generate_image silently too
-        let b = Builtins {
-            image: None,
-            image_withheld: true,
-            vision: Some(&vcfg),
-            images_present: true,
-            ..Default::default()
-        };
-        let reg = build(&cfg, b, &|_| {});
-        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["view_image"]);
-        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        // whereas blocks that are simply absent ARE reported
+        assert_eq!(names, vec!["draw", "look"]);
+        assert!(reg.makes_image(&cfg));
+        assert_eq!(reg.image_reader(&cfg), Some("look"));
+        // no picture this turn: the reader vanishes silently
         let reg = build(&cfg, Builtins::default(), &|_| {});
-        assert!(reg.is_empty());
-        assert_eq!(reg.notes.len(), 2, "{:?}", reg.notes);
-        assert!(reg.notes.iter().any(|n| n.contains("`image` block")), "{:?}", reg.notes);
-        assert!(
-            reg.notes.iter().any(|n| n.contains("`vision_service` block")),
-            "{:?}",
-            reg.notes
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["draw"]);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        assert_eq!(reg.image_reader(&cfg), None);
+        // the serving model reads pictures itself: same silent stand-down
+        let b = Builtins { images_present: true, images_local: true, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["draw"]);
+    }
+
+    /// The response side of the generic entries: extraction by dot path, an
+    /// image result leaving as bytes-for-the-client plus a note the model can
+    /// act on, and tolerant fallbacks.
+    #[test]
+    fn result_maps_shape_what_comes_back() {
+        let draw: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "draw", "url": "https://img.example/g", "method": "POST",
+            "result": { "image": "data.0.b64_json" }
+        }))
+        .unwrap();
+        let mut img = None;
+        let out = map_result(
+            &draw,
+            serde_json::json!({"data": [{"b64_json": "QUJD"}]}).to_string(),
+            &serde_json::json!({"prompt": "a fox"}),
+            &mut img,
+        )
+        .unwrap();
+        assert!(out.contains("a fox"), "{out}");
+        let g = img.expect("image extracted");
+        assert_eq!(g.b64, "QUJD");
+        assert_eq!(g.mime, "image/png");
+        // a data URI keeps its own mime
+        let mut img = None;
+        map_result(
+            &draw,
+            serde_json::json!({"data": [{"b64_json": "data:image/webp;base64,QUJD"}]}).to_string(),
+            &serde_json::json!({}),
+            &mut img,
+        )
+        .unwrap();
+        let g = img.expect("image extracted");
+        assert_eq!((g.mime.as_str(), g.b64.as_str()), ("image/webp", "QUJD"));
+        // a response with no image at the path is an error naming the path
+        let mut img = None;
+        let e = map_result(&draw, "{\"error\": \"busy\"}".into(), &serde_json::json!({}), &mut img)
+            .unwrap_err();
+        assert!(e.contains("data.0.b64_json"), "{e}");
+        assert!(img.is_none());
+        // a text path extracts the field; a missing one falls back to the body
+        let look: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "look", "url": "https://eyes.example/v", "method": "POST",
+            "result": { "text": "answer" }
+        }))
+        .unwrap();
+        let mut img = None;
+        let out = map_result(
+            &look,
+            serde_json::json!({"answer": "a receipt", "tokens": 512}).to_string(),
+            &serde_json::json!({}),
+            &mut img,
+        )
+        .unwrap();
+        assert_eq!(out, "a receipt");
+        let whole = serde_json::json!({"other": 1}).to_string();
+        let out = map_result(&look, whole.clone(), &serde_json::json!({}), &mut img).unwrap();
+        assert_eq!(out, whole);
+    }
+
+    /// The turn's pictures ride the body template as reserved names, and they
+    /// shadow any argument the model wrote under those names.
+    #[test]
+    fn images_are_injected_into_body_templates() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("question".into(), serde_json::json!("what is this?"));
+        obj.insert("images".into(), serde_json::json!("model-written nonsense"));
+        let png = vec![0x89, b'P', b'N', b'G', 0];
+        let filled = fill_template(
+            &serde_json::json!({ "q": "$question", "imgs": "$images", "one": "$image" }),
+            &with_images(&obj, &[png]),
         );
+        assert_eq!(filled["q"], "what is this?");
+        let uri = filled["imgs"][0].as_str().unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "{uri}");
+        assert_eq!(filled["one"].as_str().unwrap(), uri);
+        // no pictures: the model's own argument is left alone
+        let filled = fill_template(
+            &serde_json::json!({ "imgs": "$images" }),
+            &with_images(&obj, &[]),
+        );
+        assert_eq!(filled["imgs"], "model-written nonsense");
     }
 
     #[test]
