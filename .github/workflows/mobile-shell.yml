@@ -15,13 +15,16 @@ on:
   workflow_dispatch:
     inputs:
       deployment:
-        description: "0x id (or 8-hex label) of a running public deployment to prepackage as an APK; empty runs the normal apps/* matrix"
+        description: "0x id (or 8-hex label) of a running public deployment to prepackage as an APK; 'discover' builds only missing APKs for auto-listed owners; empty runs the normal apps/* matrix"
         required: false
         default: ""
   # refresh every prepackaged deployment APK (the UI snapshot inside goes
   # stale when a deployment upgrades versions)
   schedule:
     - cron: "23 */6 * * *"
+    # discovery tick: a new running public deployment of an auto-listed owner
+    # (mobile-auto.json) gets its prepackaged APK within ~30min of going live
+    - cron: "11,41 * * * *"
 
 # contents: write solely for the fixed-tag release upload the dashboard
 # links to; the build itself never writes to the repo
@@ -171,14 +174,34 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
           VERSION_NAME: 1.0.${{ github.run_number }}
           REQUESTED: ${{ github.event.inputs.deployment }}
+          SCHED: ${{ github.event.schedule }}
         run: |
           set -e
           printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
-          LIST="$REQUESTED"
-          if [ -z "$LIST" ] && [ -f ../mobile-index.json ]; then
-            LIST=$(jq -r '.deployments[]' ../mobile-index.json | tr '\n' ' ')
+          # three modes:
+          #  - dispatch with an id/label: build exactly that one
+          #  - discovery (the frequent cron, or dispatch=discover): build only
+          #    running public deployments of mobile-auto.json owners that are
+          #    MISSING from the index - the "new deployment went live" path
+          #  - the 6-hourly cron: refresh everything indexed + fold in strays
+          norm(){ tr ' ' '\n' | tr 'A-Z' 'a-z' | sed 's/^0x//' | cut -c1-8 | grep -v '^$' | sort -u; }
+          INDEXED=""; [ -f ../mobile-index.json ] && INDEXED=$(jq -r '.deployments[]' ../mobile-index.json | tr '\n' ' ')
+          DISCOVERED=""
+          if [ -f ../mobile-auto.json ]; then
+            for O in $(jq -r '.owners[]' ../mobile-auto.json); do
+              DISCOVERED="$DISCOVERED $(curl -sf --max-time 20 "https://api.enclave.host/v1/deployments?owner=$O" | jq -r '.data[]? | select(.public == true and .status == "running") | .id' | tr '\n' ' ' || true)"
+            done
           fi
-          [ -n "$LIST" ] || { echo "nothing to build"; exit 0; }
+          echo "indexed:    $(echo "$INDEXED" | norm | tr '\n' ' ')"
+          echo "discovered: $(echo "$DISCOVERED" | norm | tr '\n' ' ')"
+          if [ -n "$REQUESTED" ] && [ "$REQUESTED" != "discover" ]; then
+            LIST="$REQUESTED"
+          elif [ "$SCHED" = "23 */6 * * *" ]; then
+            LIST=$(printf '%s %s' "$INDEXED" "$DISCOVERED" | norm | tr '\n' ' ')
+          else
+            LIST=$(comm -13 <(echo "$INDEXED" | norm) <(echo "$DISCOVERED" | norm) | tr '\n' ' ')
+          fi
+          [ -n "${LIST// }" ] || { echo "nothing to build"; exit 0; }
           BUILT=""
           for T in $LIST; do
             LABEL=$(echo "$T" | tr 'A-Z' 'a-z' | sed 's/^0x//' | cut -c1-8)
