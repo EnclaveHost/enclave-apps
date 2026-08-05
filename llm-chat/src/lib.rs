@@ -4325,22 +4325,29 @@ impl<'a> ToolLoop<'a> {
         self.reg.find("web_search").is_some()
     }
 
-    /// The model owns the picture decision this turn, so the router's image
-    /// verdict stands down the same way its search verdict does.
+    /// The model owns the picture decision this turn (some armed tool has an
+    /// image result), so the router's image verdict stands down the same way
+    /// its search verdict does.
     fn owns_image(&self) -> bool {
-        self.reg.find("generate_image").is_some()
+        self.reg.makes_image(self.cfg)
     }
 
-    /// The model owns the looking this turn: the delegated-vision pre-pass
-    /// stands down, and the leg stashes the pictures here (stash_images).
+    /// The model owns the looking this turn (some armed tool takes $images):
+    /// the delegated-vision pre-pass stands down, and the leg stashes the
+    /// pictures here (stash_images).
     fn owns_vision(&self) -> bool {
-        self.reg.find("view_image").is_some()
+        self.reg.image_reader(self.cfg).is_some()
     }
 
     /// Take the attached pictures out of the conversation and hold them for
-    /// view_image. Called by the legs exactly when owns_vision().
+    /// the image-reading tool. Called by the legs exactly when owns_vision().
     fn stash_images(&mut self, messages: &mut [ChatMsg]) {
-        self.images = stash_images_for_tool(messages);
+        let name = self
+            .reg
+            .image_reader(self.cfg)
+            .unwrap_or("the image tool")
+            .to_string();
+        self.images = stash_images_for_tool(messages, &name);
     }
 
     fn armed(&self) -> bool {
@@ -4673,13 +4680,13 @@ fn attempted_call(text: &str) -> bool {
         .is_some_and(|i| text[body + i + "<tool_call>".len()..].trim_start().starts_with('{'))
 }
 
-/// When the model holds `view_image`, the pictures must leave the prompt -
-/// this model cannot see, and build_prompt refuses image turns on blind
-/// models - but the bytes stay reachable for the tool. The turn the request
-/// is about (the LAST one carrying pictures, same rule as apply_vision) gets
-/// a note telling the model to call the tool; older image turns get the same
-/// note apply_vision leaves.
-fn stash_images_for_tool(messages: &mut [ChatMsg]) -> Vec<Vec<u8>> {
+/// When the model holds an image-reading tool, the pictures must leave the
+/// prompt - this model cannot see, and build_prompt refuses image turns on
+/// blind models - but the bytes stay reachable for the tool. The turn the
+/// request is about (the LAST one carrying pictures, same rule as
+/// apply_vision) gets a note naming the tool to call; older image turns get
+/// the same note apply_vision leaves.
+fn stash_images_for_tool(messages: &mut [ChatMsg], tool: &str) -> Vec<Vec<u8>> {
     let Some(idx) = messages.iter().rposition(|m| !m.images.is_empty()) else {
         return Vec::new();
     };
@@ -4689,20 +4696,18 @@ fn stash_images_for_tool(messages: &mut [ChatMsg]) -> Vec<Vec<u8>> {
             continue;
         }
         let note = if i == idx {
-            if stash.len() == 1 {
-                "[the user attached an image to this message. You cannot see it directly; \
-                 call view_image with a specific question to look at it.]"
-            } else {
-                "[the user attached images to this message. You cannot see them directly; \
-                 call view_image with a specific question to look at them.]"
-            }
+            let (noun, pron) = if stash.len() == 1 { ("an image", "it") } else { ("images", "them") };
+            format!(
+                "[the user attached {noun} to this message. You cannot see {pron} directly; \
+                 call {tool} with a specific question to look at {pron}.]"
+            )
         } else if m.images.len() == 1 {
-            "[an image the user attached earlier in this conversation]"
+            "[an image the user attached earlier in this conversation]".to_string()
         } else {
-            "[images the user attached earlier in this conversation]"
+            "[images the user attached earlier in this conversation]".to_string()
         };
         m.content = if m.content.trim().is_empty() {
-            note.to_string()
+            note
         } else {
             format!("{note}\n{}", m.content.trim())
         };
@@ -4731,16 +4736,12 @@ fn note_for_unrun(text: &str, note: &str) -> String {
 /// answers "what does this deployment have", not "what may this turn use".
 fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
     tools::Builtins {
-        search: cfg.search.as_ref(),
+        search: cfg.search_cfg(),
         web_withheld: false,
-        image: cfg.image.as_ref(),
-        image_withheld: false,
-        vision: cfg.vision_service.as_ref(),
-        vision_withheld: false,
-        // the probe answers "what does this deployment have", and view_image
-        // exists whenever the vision leg does - a turn without a picture is a
-        // per-turn fact, not a capability
+        // the probe answers "what does this deployment have"; a turn without
+        // a picture is a per-turn fact, not a capability
         images_present: true,
+        images_local: false,
     }
 }
 
@@ -4749,21 +4750,31 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
 /// the router: off means the tool is not in the registry and the model is
 /// never told it exists. Without this, turning the router off would hand the
 /// same capability straight back through the tools switch, which is the
-/// opposite of what either control says on the tin. The image switch governs
-/// generate_image the same way, and view_image follows the vision plan: a
-/// serving model that reads the picture itself has nothing to delegate.
+/// opposite of what either control says on the tin. The image facts gate the
+/// http tools that read pictures: none attached, or a serving model that
+/// reads them itself, and those entries are not offered.
 fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
-    let withheld = creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on)) == WebMode::Off;
-    let image_live = creq.image_on(cfg.image.as_ref().map(|i| i.default_on).unwrap_or(false));
-    let delegates = vision_plan(cfg, creq.model.as_deref()) == VisionPlan::Delegate;
+    let withheld = creq.web_mode(cfg.search_cfg().is_some_and(|sc| sc.default_on)) == WebMode::Off;
     tools::Builtins {
-        search: if withheld { None } else { cfg.search.as_ref() },
+        search: if withheld { None } else { cfg.search_cfg() },
         web_withheld: withheld,
-        image: if image_live { cfg.image.as_ref() } else { None },
-        image_withheld: cfg.image.is_some() && !image_live,
-        vision: if delegates { cfg.vision_service.as_ref() } else { None },
-        vision_withheld: cfg.vision_service.is_some() && !delegates,
         images_present: creq.messages.iter().any(|m| !m.images.is_empty()),
+        images_local: images_read_locally(cfg, creq.model.as_deref()),
+    }
+}
+
+/// Whether THIS turn's pictures are read by the serving model itself, in
+/// which case delegating them to a tool would be absurd. Mirrors vision_plan,
+/// except that a deployment with no vision_service at all still answers
+/// honestly: local if the model can see, otherwise nobody reads them.
+fn images_read_locally(cfg: &AppConfig, requested: Option<&str>) -> bool {
+    let can_local = cfg.vision && cfg.backend == "ggml";
+    if !can_local {
+        return false;
+    }
+    match &cfg.vision_service {
+        None => true,
+        Some(_) => vision_plan(cfg, requested) == VisionPlan::Local,
     }
 }
 
@@ -5391,7 +5402,7 @@ fn apply_web_search(
     model_images: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
-    let web_mode = creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on));
+    let web_mode = creq.web_mode(cfg.search_cfg().is_some_and(|sc| sc.default_on));
     let Some(last) = messages.iter().rposition(|m| m.role == "user") else {
         if web_mode == WebMode::Always {
             return Err("no user message to search for".into());
@@ -5446,7 +5457,7 @@ fn apply_web_search(
                 return run_image(cfg, &prompt, messages, last, image_out, on_status).map(|()| None);
             }
             Some(RouterVerdict::Search(q)) => {
-                if cfg.search.is_none() {
+                if cfg.search_cfg().is_none() {
                     return Ok(None);
                 }
                 on_status("searching the web…");
@@ -5459,7 +5470,7 @@ fn apply_web_search(
     if !asked_inline && web_mode != WebMode::Always {
         return Ok(None);
     }
-    let Some(_) = &cfg.search else {
+    let Some(_) = cfg.search_cfg() else {
         // no provider configured: an inline /search should not eat the turn.
         // Only an explicit web_search:true, which asked for something we
         // cannot do, is an error.
@@ -5527,7 +5538,7 @@ fn finish_search(
     asked_inline: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
-    let scfg = cfg.search.as_ref().ok_or("web search is not enabled on this deployment")?;
+    let scfg = cfg.search_cfg().ok_or("web search is not enabled on this deployment")?;
     let t0 = now_ms();
     let hits = match search::search(scfg, &query) {
         Ok(h) => h,
@@ -5710,7 +5721,7 @@ enum Capabilities<'a> {
 }
 
 fn with_capability_note(cfg: &AppConfig, system: &str) -> String {
-    if cfg.search.is_none() {
+    if cfg.search_cfg().is_none() {
         return system.to_string();
     }
     let note = "How this app works, which overrides any instruction to the contrary: you have NO \
@@ -6294,7 +6305,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // plainly that there are no tools. A prompt emphatic enough to keep
     // faking calls is the user's to fix; two passes is where this app stops.
     let (mut tool_searched, mut tool_nudged) = (false, false);
-    let may_search = cfg.search.is_some() && creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on)) != WebMode::Off;
+    let may_search = cfg.search_cfg().is_some() && creq.web_mode(cfg.search_cfg().is_some_and(|sc| sc.default_on)) != WebMode::Off;
     let last_user = messages.iter().rposition(|m| m.role == "user");
     let mut last_err = String::new();
     let mut ok = false;
@@ -6357,7 +6368,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                             // citations in its answer resolve to something
                             if let Some(src) = r.get("sources") {
                                 let _ = send(serde_json::json!({ "search": {
-                                    "provider": cfg.search.as_ref()
+                                    "provider": cfg.search_cfg()
                                         .map(|s| s.provider.clone()).unwrap_or_default(),
                                     "sources": src,
                                     "ms": r.get("ms").cloned().unwrap_or(serde_json::json!(0)),
@@ -7426,7 +7437,7 @@ fn handle_search_probe(
     if !authorized(&cfg, &req) {
         return json_err(out, 401, "missing or invalid API key");
     }
-    let Some(scfg) = &cfg.search else {
+    let Some(scfg) = cfg.search_cfg() else {
         return json_err(out, 501, "web search is not enabled on this deployment");
     };
     // ?url=<page> fetches and extracts ONE page, skipping the provider. It
@@ -8269,6 +8280,26 @@ mod tests {
         // ...and a call discussed inside <think> was never attempted
         assert!(!attempted_call("<think>maybe <tool_call>{\"name\":\"a\"} would do</think>Done."));
         assert!(attempted_call("<think>plan</think>prose first\n<tool_call>\n{\"arguments\":{}}"));
+    }
+
+    /// The search block's two homes resolve to one leg, the flattened one
+    /// winning: a config migrated into tools.search behaves identically, and
+    /// a legacy CID keeps working untouched.
+    #[test]
+    fn search_config_lives_in_tools_or_top_level() {
+        let mut cfg = test_config();
+        cfg.search = None;
+        cfg.tools = serde_json::from_value(serde_json::json!({
+            "builtin": ["web_search"],
+            "search": { "provider": "exa" }
+        }))
+        .ok();
+        assert_eq!(cfg.search_cfg().map(|s| s.provider.as_str()), Some("exa"));
+        // legacy top-level still resolves, and loses to tools.search
+        cfg.search = serde_json::from_value(serde_json::json!({ "provider": "ddg" })).ok();
+        assert_eq!(cfg.search_cfg().map(|s| s.provider.as_str()), Some("exa"));
+        cfg.tools = None;
+        assert_eq!(cfg.search_cfg().map(|s| s.provider.as_str()), Some("ddg"));
     }
 
     /// What the /v1 legs deliver in place of a refused call: prose and

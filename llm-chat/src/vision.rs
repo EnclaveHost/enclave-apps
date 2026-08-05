@@ -188,11 +188,7 @@ pub fn describe(
         return Err("no image to look at".into());
     }
     let question = question.trim();
-    let uris: Vec<String> = images
-        .iter()
-        .take(cfg.max_images.max(1))
-        .map(|b| format!("data:{};base64,{}", mime_of(b), b64_encode(b)))
-        .collect();
+    let uris: Vec<String> = images.iter().take(cfg.max_images.max(1)).map(|b| to_data_uri(b)).collect();
     let sent = uris.len();
     let mut payload = serde_json::json!({ "images": uris });
     if !question.is_empty() {
@@ -303,6 +299,13 @@ fn cap_chars(s: &str, max: usize) -> (String, bool) {
         return (s.to_string(), false);
     }
     (s.chars().take(max).collect(), true)
+}
+
+/// Image bytes as a data: URI, the way every service this app talks to takes
+/// them. Shared with the tools layer, which injects the turn's pictures into
+/// any http tool whose body template asks for `$images`.
+pub(crate) fn to_data_uri(b: &[u8]) -> String {
+    format!("data:{};base64,{}", mime_of(b), b64_encode(b))
 }
 
 /// The mime type, by magic bytes. The sibling sniffs the bytes itself and does
