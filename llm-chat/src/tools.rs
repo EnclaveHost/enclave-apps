@@ -85,8 +85,10 @@ pub struct ToolsConfig {
     pub default_on: bool,
     /// Capabilities this deployment ALREADY has, handed to the model as tools
     /// instead of being decided for it by a pre-pass: `["web_search",
-    /// "fetch_url"]`. Both are backed by the `search` config block and neither
-    /// appears without one.
+    /// "fetch_url", "post_url"]`. All are backed by the `search` config block
+    /// and none appears without one - the block is where a deployment consents
+    /// to the model reaching the web at all, and post_url (the model SENDING
+    /// data out, not just reading) deserves that gate more than the other two.
     ///
     /// web_search is the interesting one. The router decides before the model
     /// has thought about the question, from four messages of context, and it
@@ -124,6 +126,7 @@ pub struct Builtins<'a> {
 pub enum Builtin {
     WebSearch,
     FetchUrl,
+    PostUrl,
 }
 
 impl Builtin {
@@ -131,6 +134,7 @@ impl Builtin {
         match name.trim() {
             "web_search" => Some(Builtin::WebSearch),
             "fetch_url" => Some(Builtin::FetchUrl),
+            "post_url" => Some(Builtin::PostUrl),
             _ => None,
         }
     }
@@ -139,6 +143,7 @@ impl Builtin {
         match self {
             Builtin::WebSearch => "web_search",
             Builtin::FetchUrl => "fetch_url",
+            Builtin::PostUrl => "post_url",
         }
     }
 
@@ -151,6 +156,10 @@ impl Builtin {
             Builtin::FetchUrl =>
                 "Fetch one web page and return its text. Use it to read a result from web_search \
                  in full, or a URL the user gave you.",
+            Builtin::PostUrl =>
+                "Send an HTTP POST request to a URL and return the response text. Use it to \
+                 submit data to an API or webhook the user pointed you at, and tell the user \
+                 what you sent and where.",
         }
     }
 
@@ -173,13 +182,28 @@ impl Builtin {
                 },
                 "required": ["url"],
             }),
+            Builtin::PostUrl => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "absolute http(s) URL to POST to" },
+                    "body": {
+                        "description": "request body: a JSON object is sent as JSON, a string \
+                                        is sent exactly as written",
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "MIME type of the body (default application/json)",
+                    }
+                },
+                "required": ["url", "body"],
+            }),
         }
     }
 
     /// Which config block has to be present for this to be offered at all.
     fn available(self, b: &Builtins) -> bool {
         match self {
-            Builtin::WebSearch | Builtin::FetchUrl => b.search.is_some(),
+            Builtin::WebSearch | Builtin::FetchUrl | Builtin::PostUrl => b.search.is_some(),
         }
     }
 }
@@ -375,7 +399,8 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
     for want in &cfg.builtin {
         let Some(k) = Builtin::parse(want) else {
             reg.notes.push(format!(
-                "builtin '{want}' is not a tool this app has (known: web_search, fetch_url)"
+                "builtin '{want}' is not a tool this app has (known: web_search, fetch_url, \
+                 post_url)"
             ));
             continue;
         };
@@ -872,7 +897,49 @@ fn call_builtin(
             sources.push((u.to_string(), u.to_string()));
             Ok(text)
         }
+        Builtin::PostUrl => {
+            let u = args
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .ok_or("post_url needs a non-empty `url` string")?;
+            if !u.starts_with("http://") && !u.starts_with("https://") {
+                return Err(format!("'{u}' is not an absolute http(s) URL"));
+            }
+            let (body, ctype) = post_payload(args)?;
+            let text = crate::search::post_url(scfg, u, body.as_bytes(), &ctype)?;
+            // the POST target joins the source list for the same reason a
+            // fetched page does, plus one of its own: the user gets told
+            // where their data went without having to trust the prose
+            sources.push((u.to_string(), u.to_string()));
+            Ok(text)
+        }
     }
+}
+
+/// The body and content type a post_url call actually sends. A JSON object or
+/// array is serialized and posted as JSON; a string goes as-is, defaulting to
+/// application/json because that is what the APIs a model reaches for speak.
+/// `content_type` overrides the default either way.
+fn post_payload(args: &serde_json::Value) -> Result<(String, String), String> {
+    let body = match args.get("body") {
+        None | Some(serde_json::Value::Null) => {
+            return Err(
+                "post_url needs a `body` (a JSON object, or a string sent as-is)".into()
+            )
+        }
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+    };
+    let ctype = args
+        .get("content_type")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or("application/json")
+        .to_string();
+    Ok((body, ctype))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1400,25 +1467,46 @@ mod tests {
     #[test]
     fn builtins_need_the_capability_they_are_backed_by() {
         let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
-            "builtin": ["web_search", "fetch_url", "teleport"]
+            "builtin": ["web_search", "fetch_url", "post_url", "teleport"]
         }))
         .unwrap();
-        // no search block: nothing is offered, and both reasons are reported
+        // no search block: nothing is offered, and every reason is reported
         let reg = build(&cfg, Builtins::default(), &|_| {});
         assert!(reg.is_empty());
-        assert_eq!(reg.notes.len(), 3);
+        assert_eq!(reg.notes.len(), 4);
         assert!(reg.notes.iter().any(|n| n.contains("teleport")), "{:?}", reg.notes);
         assert!(reg.notes.iter().any(|n| n.contains("`search` block")), "{:?}", reg.notes);
 
-        // with one, the two real ones resolve and the invented one still does not
+        // with one, the real ones resolve and the invented one still does not
         let scfg: crate::search::SearchConfig =
             serde_json::from_value(serde_json::json!({ "provider": "exa" })).unwrap();
         let reg = build(&cfg, Builtins { search: Some(&scfg), web_withheld: false }, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["web_search", "fetch_url"]);
+        assert_eq!(names, vec!["web_search", "fetch_url", "post_url"]);
         assert_eq!(reg.notes.len(), 1);
         // and /models advertises exactly those
-        assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "fetch_url".to_string()]);
+        assert_eq!(
+            cfg.http_names(),
+            vec!["web_search".to_string(), "fetch_url".to_string(), "post_url".to_string()]
+        );
+    }
+
+    #[test]
+    fn post_payloads_take_both_shapes() {
+        // a JSON object is serialized and defaults to application/json
+        let (b, ct) = post_payload(&serde_json::json!({"body": {"x": 1}})).unwrap();
+        assert_eq!(b, "{\"x\":1}");
+        assert_eq!(ct, "application/json");
+        // a string goes as-is, and content_type overrides the default
+        let (b, ct) = post_payload(&serde_json::json!({
+            "body": "a=1&b=2", "content_type": "application/x-www-form-urlencoded"
+        }))
+        .unwrap();
+        assert_eq!(b, "a=1&b=2");
+        assert_eq!(ct, "application/x-www-form-urlencoded");
+        // a missing body is an error that names the field, not an empty POST
+        assert!(post_payload(&serde_json::json!({})).unwrap_err().contains("body"));
+        assert!(post_payload(&serde_json::json!({"body": null})).is_err());
     }
 
     /// The user's search switch governs the tool, and turning it off is not a

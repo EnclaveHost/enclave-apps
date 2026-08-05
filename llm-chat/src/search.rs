@@ -589,6 +589,52 @@ pub fn fetch_page(cfg: &SearchConfig, url: &str) -> Result<String, String> {
     Err("too many redirects".into())
 }
 
+/// POST a body to a URL and return the response as text. The counterpart of
+/// `fetch_page` for the write direction, and deliberately simpler: no redirect
+/// following (silently replaying a POST at whatever address a server named is
+/// how a request gets sent somewhere the model never chose) and no
+/// content-type refusal, because the APIs this reaches answer in JSON, which
+/// the model can read as-is. HTML is still stripped: an error page raw is tag
+/// soup that spends the result budget on markup.
+pub fn post_url(
+    cfg: &SearchConfig,
+    url: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<String, String> {
+    let r = http::request(
+        HttpReq::post(url, body)
+            .timeout(cfg.timeout_s)
+            .header(
+                "user-agent",
+                b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)",
+            )
+            .header("content-type", content_type.as_bytes())
+            .header("accept", b"application/json, text/plain;q=0.9, */*;q=0.8"),
+    )?;
+    if (300..400).contains(&r.status) {
+        let to = r.location.unwrap_or_else(|| "(no location given)".into());
+        return Err(format!(
+            "HTTP {} redirect to {to} - post_url does not follow redirects; POST to the \
+             final URL directly",
+            r.status
+        ));
+    }
+    if r.status >= 400 {
+        let hint: String = String::from_utf8_lossy(&r.body).chars().take(400).collect();
+        return Err(format!("HTTP {}: {}", r.status, hint.trim()));
+    }
+    let ct = r.ctype.unwrap_or_default().to_ascii_lowercase();
+    let raw = String::from_utf8_lossy(&r.body);
+    let text = if ct.contains("html") { html_to_text(&raw) } else { raw.into_owned() };
+    if text.trim().is_empty() {
+        // a 201/204 with no body is success with nothing to read; say so, or
+        // the model is left to invent what the server "answered"
+        return Ok(format!("HTTP {} (empty response body)", r.status));
+    }
+    Ok(text)
+}
+
 // -------------------------------------------------------------- http plumbing
 
 // ------------------------------------------------------------------ text
