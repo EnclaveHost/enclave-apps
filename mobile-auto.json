@@ -1,0 +1,6 @@
+{
+  "_comment": "Owners whose RUNNING PUBLIC deployments get prepackaged APKs automatically: the mobile-shell workflow's discovery cron (every 30min) builds any of their deployments missing from mobile-index.json. Owner addresses are public on-chain data.",
+  "owners": [
+    "0x0b2d009c0c9af05b12100d77f3c815fea822ee61"
+  ]
+}
