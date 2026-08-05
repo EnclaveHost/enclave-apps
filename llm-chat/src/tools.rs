@@ -735,7 +735,10 @@ fn strip_fence(t: &str) -> Option<&str> {
 
 /// One `{"name": ..., "arguments": {...}}`, from a chunk that may carry
 /// whitespace or a fence around it. Arguments that arrived as a JSON STRING
-/// (a common near-miss) are re-parsed rather than rejected.
+/// (a common near-miss) are re-parsed rather than rejected, and so is a name
+/// tucked INSIDE the arguments object - `{"arguments": {"url": ..., "name":
+/// "fetch_url"}}` - which then poisons the conversation: the raw call is
+/// delivered as assistant text and every retry copies it verbatim.
 fn one_call(chunk: &str) -> Option<ToolCall> {
     let t = chunk.trim();
     let t = strip_fence(t).unwrap_or(t);
@@ -745,17 +748,27 @@ fn one_call(chunk: &str) -> Option<ToolCall> {
         let end = balanced_end(t)?;
         serde_json::from_str(&t[..end]).ok()
     })?;
-    let name = v.get("name").and_then(|n| n.as_str())?.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let args = match v.get("arguments").or_else(|| v.get("parameters")) {
+    let mut args = match v.get("arguments").or_else(|| v.get("parameters")) {
         Some(serde_json::Value::String(s)) => {
             serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))
         }
         Some(a) => a.clone(),
         None => serde_json::json!({}),
     };
+    let name = match v.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n.trim().to_string(),
+        // no top-level name: pull it OUT of the arguments, where a `name` key
+        // can only be the function name the model misplaced
+        None => {
+            let o = args.as_object_mut()?;
+            let n = o.get("name")?.as_str()?.trim().to_string();
+            o.remove("name");
+            n
+        }
+    };
+    if name.is_empty() {
+        return None;
+    }
     Some(ToolCall { name, args })
 }
 
@@ -1376,6 +1389,29 @@ mod tests {
     fn stringified_arguments_are_reparsed() {
         let c = parse_calls("<tool_call>{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}</tool_call>");
         assert_eq!(c[0].args["x"], 1);
+    }
+
+    #[test]
+    fn name_inside_arguments_is_rescued() {
+        // seen live (fable-fusion-27b, 2026-08-05): the name tucked into the
+        // arguments object and no top-level name at all. The stop string had
+        // also eaten </tool_call>.
+        let c = parse_calls(
+            "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/develop#api\",\"name\":\"fetch_url\"}}",
+        );
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "fetch_url");
+        assert_eq!(c[0].args["url"], "https://enclave.host/develop#api");
+        // the function name is not an argument
+        assert!(c[0].args.get("name").is_none(), "{:?}", c[0].args);
+    }
+
+    #[test]
+    fn a_real_name_argument_is_kept() {
+        // the rescue must not touch a call whose TOOL takes a `name` parameter
+        let c = parse_calls("<tool_call>{\"name\":\"lookup\",\"arguments\":{\"name\":\"steve\"}}</tool_call>");
+        assert_eq!(c[0].name, "lookup");
+        assert_eq!(c[0].args["name"], "steve");
     }
 
     #[test]
