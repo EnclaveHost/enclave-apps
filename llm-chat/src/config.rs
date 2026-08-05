@@ -212,19 +212,6 @@ pub struct AppConfig {
     /// the fleet). This knob exists for A/B measurement, not as a mode.
     #[serde(default)]
     pub draft_fused: Option<bool>,
-    /// "mtp" drafts only: layer prompt-lookup ON TOP of the MTP head. When a
-    /// LONG n-gram anchor matches the conversation (high-confidence, so its
-    /// deep positions actually accept), that round drafts up to `draft_tokens`
-    /// FREE lookup tokens instead of the head's single token - one wider
-    /// verify pass yields more accepted tokens where MTP alone is stuck at
-    /// k=1. Rounds without a strong match fall back to the k=1 head draft, so
-    /// prose (few matches) is unchanged and code/quoting/structured output
-    /// (frequent long matches) gains. Needs rewind depth >= draft_tokens
-    /// (nnRsSeq) to cover the wider lookup draft; forces the two-call path on
-    /// lookup rounds (the fused mtp_round drafts via the head by construction).
-    /// Default off.
-    #[serde(default)]
-    pub draft_lookup_assist: Option<bool>,
     /// WEB SEARCH: absent (the default) means the app never makes an outbound
     /// request and the UI hides the control entirely - a deployment opts IN.
     /// Present means a request may ask for search, and the app fetches results
