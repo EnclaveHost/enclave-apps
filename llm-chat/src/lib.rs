@@ -4260,9 +4260,21 @@ citing them as [1], [2].";
 /// the conversation and the answer should be generated again.
 struct ToolLoop<'a> {
     cfg: &'a tools::ToolsConfig,
-    /// what the built-in tools are wired to (the deployment's search leg)
+    /// what the built-in tools are wired to (the deployment's search, image
+    /// and vision legs)
     builtins: tools::Builtins<'a>,
     reg: tools::Registry,
+    /// the status narrator, kept for the calls themselves: the slow builtins
+    /// (an image generation is minutes) must tick the client stream while
+    /// they wait, or every idle timeout between here and the browser fires
+    status: &'a dyn Fn(&str),
+    /// the attached pictures, taken OUT of the messages when the model holds
+    /// view_image (this model cannot see, and the prompt refuses image turns
+    /// on blind models) and held here for the tool to look at
+    images: Vec<Vec<u8>>,
+    /// what a generate_image call produced, for the leg to deliver: the legs
+    /// already know how to hand an image to their client
+    image_out: Option<image::GeneratedImage>,
     calls: usize,
     /// the model was already told it has run out of calls. Without this a model
     /// that keeps calling would loop forever: told, calls again, told again.
@@ -4290,12 +4302,15 @@ impl<'a> ToolLoop<'a> {
     fn open(
         cfg: &'a tools::ToolsConfig,
         builtins: tools::Builtins<'a>,
-        on_status: &dyn Fn(&str),
+        on_status: &'a dyn Fn(&str),
     ) -> ToolLoop<'a> {
         ToolLoop {
             cfg,
             builtins,
             reg: tools::build(cfg, builtins, on_status),
+            status: on_status,
+            images: Vec::new(),
+            image_out: None,
             calls: 0,
             limit_told: false,
             malformed_told: false,
@@ -4308,6 +4323,24 @@ impl<'a> ToolLoop<'a> {
     /// also make it.
     fn owns_search(&self) -> bool {
         self.reg.find("web_search").is_some()
+    }
+
+    /// The model owns the picture decision this turn, so the router's image
+    /// verdict stands down the same way its search verdict does.
+    fn owns_image(&self) -> bool {
+        self.reg.find("generate_image").is_some()
+    }
+
+    /// The model owns the looking this turn: the delegated-vision pre-pass
+    /// stands down, and the leg stashes the pictures here (stash_images).
+    fn owns_vision(&self) -> bool {
+        self.reg.find("view_image").is_some()
+    }
+
+    /// Take the attached pictures out of the conversation and hold them for
+    /// view_image. Called by the legs exactly when owns_vision().
+    fn stash_images(&mut self, messages: &mut [ChatMsg]) {
+        self.images = stash_images_for_tool(messages);
     }
 
     fn armed(&self) -> bool {
@@ -4389,9 +4422,19 @@ impl<'a> ToolLoop<'a> {
         on_call(&serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
         }));
-        let r = tools::call(&mut self.reg, self.cfg, self.builtins, &c.name, &c.args, || {
-            now_ms() as u64
-        });
+        let r = tools::call(
+            &mut self.reg,
+            self.cfg,
+            self.builtins,
+            &c.name,
+            &c.args,
+            &self.images,
+            || now_ms() as u64,
+            self.status,
+        );
+        if let Some(img) = r.image {
+            self.image_out = Some(img);
+        }
         let mut entry = serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
             "ok": !r.is_error, "ms": r.ms,
@@ -4630,6 +4673,44 @@ fn attempted_call(text: &str) -> bool {
         .is_some_and(|i| text[body + i + "<tool_call>".len()..].trim_start().starts_with('{'))
 }
 
+/// When the model holds `view_image`, the pictures must leave the prompt -
+/// this model cannot see, and build_prompt refuses image turns on blind
+/// models - but the bytes stay reachable for the tool. The turn the request
+/// is about (the LAST one carrying pictures, same rule as apply_vision) gets
+/// a note telling the model to call the tool; older image turns get the same
+/// note apply_vision leaves.
+fn stash_images_for_tool(messages: &mut [ChatMsg]) -> Vec<Vec<u8>> {
+    let Some(idx) = messages.iter().rposition(|m| !m.images.is_empty()) else {
+        return Vec::new();
+    };
+    let stash = std::mem::take(&mut messages[idx].images);
+    for (i, m) in messages.iter_mut().enumerate() {
+        if m.images.is_empty() && i != idx {
+            continue;
+        }
+        let note = if i == idx {
+            if stash.len() == 1 {
+                "[the user attached an image to this message. You cannot see it directly; \
+                 call view_image with a specific question to look at it.]"
+            } else {
+                "[the user attached images to this message. You cannot see them directly; \
+                 call view_image with a specific question to look at them.]"
+            }
+        } else if m.images.len() == 1 {
+            "[an image the user attached earlier in this conversation]"
+        } else {
+            "[images the user attached earlier in this conversation]"
+        };
+        m.content = if m.content.trim().is_empty() {
+            note.to_string()
+        } else {
+            format!("{note}\n{}", m.content.trim())
+        };
+        m.images.clear();
+    }
+    stash
+}
+
 /// The reply with its unrun call replaced by the refusal, for the /v1 legs,
 /// whose protocol has no side channel: the reasoning and prose survive, the
 /// dead JSON does not.
@@ -4649,20 +4730,40 @@ fn note_for_unrun(text: &str, note: &str) -> String {
 /// Everything the built-ins could be wired to. Used by the /tools probe, which
 /// answers "what does this deployment have", not "what may this turn use".
 fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
-    tools::Builtins { search: cfg.search.as_ref(), web_withheld: false }
+    tools::Builtins {
+        search: cfg.search.as_ref(),
+        web_withheld: false,
+        image: cfg.image.as_ref(),
+        image_withheld: false,
+        vision: cfg.vision_service.as_ref(),
+        vision_withheld: false,
+        // the probe answers "what does this deployment have", and view_image
+        // exists whenever the vision leg does - a turn without a picture is a
+        // per-turn fact, not a capability
+        images_present: true,
+    }
 }
 
-/// ...and what THIS turn may use. The web_search tool is still web search, so
-/// the user's search switch governs it exactly as it governs the router: off
-/// means the tool is not in the registry and the model is never told it exists.
-/// Without this, turning the router off would hand the same capability straight
-/// back through the tools switch, which is the opposite of what either control
-/// says on the tin.
+/// ...and what THIS turn may use. The web_search and request tools are still
+/// the web, so the user's search switch governs them exactly as it governs
+/// the router: off means the tool is not in the registry and the model is
+/// never told it exists. Without this, turning the router off would hand the
+/// same capability straight back through the tools switch, which is the
+/// opposite of what either control says on the tin. The image switch governs
+/// generate_image the same way, and view_image follows the vision plan: a
+/// serving model that reads the picture itself has nothing to delegate.
 fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
     let withheld = creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on)) == WebMode::Off;
+    let image_live = creq.image_on(cfg.image.as_ref().map(|i| i.default_on).unwrap_or(false));
+    let delegates = vision_plan(cfg, creq.model.as_deref()) == VisionPlan::Delegate;
     tools::Builtins {
         search: if withheld { None } else { cfg.search.as_ref() },
         web_withheld: withheld,
+        image: if image_live { cfg.image.as_ref() } else { None },
+        image_withheld: cfg.image.is_some() && !image_live,
+        vision: if delegates { cfg.vision_service.as_ref() } else { None },
+        vision_withheld: cfg.vision_service.is_some() && !delegates,
+        images_present: creq.messages.iter().any(|m| !m.images.is_empty()),
     }
 }
 
@@ -5281,9 +5382,13 @@ fn apply_web_search(
     effort_out: &mut Option<Effort>,
     want_effort: bool,
     // the MODEL holds a web_search tool this turn, so the router must not
-    // decide about search. Image routing is untouched: the two verdicts are
-    // independent (see RouterAsk).
+    // decide about search. Image routing is independent (see RouterAsk) and
+    // has the same rule via model_images.
     model_searches: bool,
+    // the MODEL holds generate_image this turn: the router's image verdict
+    // stands down. An explicit /image is untouched - a typed command beats
+    // both deciders.
+    model_images: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
     let web_mode = creq.web_mode(cfg.search.as_ref().is_some_and(|sc| sc.default_on));
@@ -5308,7 +5413,8 @@ fn apply_web_search(
     // consent; `image_live` is this turn's, and it is what the router sees.
     let image_configured = cfg.image.is_some();
     let image_live = image_configured
-        && creq.image_on(cfg.image.as_ref().map(|i| i.default_on).unwrap_or(false));
+        && creq.image_on(cfg.image.as_ref().map(|i| i.default_on).unwrap_or(false))
+        && !model_images;
 
     // an explicit /image bypasses the router entirely
     if let Some(prompt) = inline_image {
@@ -6109,6 +6215,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         tl = None;
     }
     let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
+    let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
     let search_meta = match apply_web_search(
         cfg,
         &creq,
@@ -6119,6 +6226,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         &mut router_effort,
         want_effort,
         model_searches,
+        model_images,
         &status_cb,
     ) {
         Ok(m) => m,
@@ -6136,14 +6244,23 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     }
     // --- vision leg, narrated. AFTER the search leg so a "/search ..." prefix
     // is still at the head of the message where strip_search_prefix looks for
-    // it; the report is prepended to whatever that leg left behind.
-    let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &status_cb) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = send(serde_json::json!({ "error": format!("{e}") }));
-            drop(stream);
-            let _ = OutgoingBody::finish(body, None);
-            return;
+    // it; the report is prepended to whatever that leg left behind. When the
+    // MODEL holds view_image the pre-pass stands down: the pictures leave the
+    // prompt and wait for the tool instead.
+    let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
+        if let Some(t) = &mut tl {
+            t.stash_images(&mut messages);
+        }
+        None
+    } else {
+        match apply_vision(cfg, &creq, &mut messages, &tok, mode, &status_cb) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = send(serde_json::json!({ "error": format!("{e}") }));
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
         }
     };
     if let Some(m) = &vision_meta {
@@ -6253,6 +6370,20 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                             let _ = send(serde_json::json!({ "notice": n }));
                         };
                         if t.step(&s.text, &mut messages, &on_call, &on_result, &on_note) {
+                            // a generate_image call produced a picture: it
+                            // lands NOW, so it is on screen while the model
+                            // writes its sentence about it
+                            if let Some(img) = t.image_out.take() {
+                                let _ = send(serde_json::json!({
+                                    "image": {
+                                        "data_uri": img.data_uri(),
+                                        "prompt": img.prompt,
+                                        "model": img.model,
+                                        "seed": img.seed,
+                                        "ms": img.ms,
+                                    }
+                                }));
+                            }
                             continue 'answer;
                         }
                     }
@@ -6532,6 +6663,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             tl = None;
         }
         let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
+        let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -6542,6 +6674,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             &mut router_effort,
             want_effort,
             model_searches,
+            model_images,
             &leg_status,
         ) {
             Ok(m) => m,
@@ -6553,14 +6686,23 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             }
         };
         // the delegated vision leg (see apply_vision); a deployment with no
-        // vision_service, or a serving model reading the picture itself, no-ops here
-        let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &leg_status) {
-            Ok(m) => m,
-            Err(e) => {
-                send_err(&e);
-                drop(stream);
-                let _ = OutgoingBody::finish(body, None);
-                return;
+        // vision_service, or a serving model reading the picture itself,
+        // no-ops here. When the MODEL holds view_image the pre-pass stands
+        // down and the pictures wait for the tool.
+        let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
+            if let Some(t) = &mut tl {
+                t.stash_images(&mut messages);
+            }
+            None
+        } else {
+            match apply_vision(cfg, &creq, &mut messages, &tok, mode, &leg_status) {
+                Ok(m) => m,
+                Err(e) => {
+                    send_err(&e);
+                    drop(stream);
+                    let _ = OutgoingBody::finish(body, None);
+                    return;
+                }
             }
         };
         // Sources first, as an SSE COMMENT: the chunk schema has no field for
@@ -6573,6 +6715,20 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // picture and what it cost, where a strict OpenAI parser will ignore it
         if let Some(m) = &vision_meta {
             let _ = send_raw(&format!(": enclave-vision {}\n\n", vision_meta_json(m)));
+        }
+        // ...and for a router-generated picture, which used to be generated
+        // and then never delivered on this leg at all
+        if let Some(img) = &generated_image {
+            let _ = send_raw(&format!(
+                ": enclave-image {}\n\n",
+                serde_json::json!({
+                    "data_uri": img.data_uri(),
+                    "prompt": img.prompt,
+                    "model": img.model,
+                    "seed": img.seed,
+                    "ms": img.ms,
+                })
+            ));
         }
         // role preamble chunk (OpenAI clients expect it)
         let _ = send_raw(&chunk(serde_json::json!({ "role": "assistant" }), None));
@@ -6638,6 +6794,21 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                             let _ = send_raw(&format!(": enclave-tool-note {n}\n\n"));
                         };
                         if t.step(&s.text, &mut messages, &on_call, &on_result, &on_note) {
+                            // a generated picture leaves as an SSE comment,
+                            // like the sources: the chunk schema has no field
+                            // for it and strict parsers must ignore comments
+                            if let Some(img) = t.image_out.take() {
+                                let _ = send_raw(&format!(
+                                    ": enclave-image {}\n\n",
+                                    serde_json::json!({
+                                        "data_uri": img.data_uri(),
+                                        "prompt": img.prompt,
+                                        "model": img.model,
+                                        "seed": img.seed,
+                                        "ms": img.ms,
+                                    })
+                                ));
+                            }
                             continue 'answer;
                         }
                     }
@@ -6733,6 +6904,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             tl = None;
         }
         let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
+        let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -6743,14 +6915,22 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             &mut router_effort,
             want_effort,
             model_searches,
+            model_images,
             &no_status,
         ) {
             Ok(m) => m,
             Err(e) => return json_err(out, 502, &e),
         };
-        let vision_meta = match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
-            Ok(m) => m,
-            Err(e) => return json_err(out, 502, &e),
+        let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
+            if let Some(t) = &mut tl {
+                t.stash_images(&mut messages);
+            }
+            None
+        } else {
+            match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
+                Ok(m) => m,
+                Err(e) => return json_err(out, 502, &e),
+            }
         };
         let sink = |_: &str| true;
         let mut last_err = String::new();
@@ -6866,6 +7046,20 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 }
                 if let Some(m) = &vision_meta {
                     body_json["enclave"]["vision"] = vision_meta_json(m);
+                }
+                // a picture, whoever decided on it (the router leg or a
+                // generate_image call): the OpenAI schema has no field for
+                // it, so it rides the enclave envelope like everything else
+                if let Some(img) =
+                    tl.as_mut().and_then(|t| t.image_out.take()).or(generated_image)
+                {
+                    body_json["enclave"]["image"] = serde_json::json!({
+                        "data_uri": img.data_uri(),
+                        "prompt": img.prompt,
+                        "model": img.model,
+                        "seed": img.seed,
+                        "ms": img.ms,
+                    });
                 }
                 if let Some(t) = &tl {
                     if !t.log.is_empty() {
@@ -7327,7 +7521,9 @@ fn handle_tools_probe(
             },
             None => serde_json::json!({}),
         };
-        let r = tools::call(&mut reg, tcfg, b, &name, &args, || now_ms() as u64);
+        // no attached images and no stream to tick on a probe call: a
+        // view_image probe reports "no image", which is itself the answer
+        let r = tools::call(&mut reg, tcfg, b, &name, &args, &[], || now_ms() as u64, &|_| {});
         let mut body = serde_json::json!({
             "name": name, "arguments": args, "ok": !r.is_error, "ms": r.ms,
             "result": r.text,
@@ -8016,9 +8212,8 @@ mod tests {
         }))
         .unwrap();
         let b = tools::Builtins::default();
-        let mut tl = ToolLoop { cfg: &tc, builtins: b, reg: tools::build(&tc, b, &|_| {}),
-                                calls: 0, limit_told: false, malformed_told: false,
-                                refused: None, log: Vec::new() };
+        let nop = |_: &str| {};
+        let mut tl = ToolLoop::open(&tc, b, &nop);
         assert!(tl.armed());
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // a name the registry does NOT have, so the loop is exercised without
@@ -8054,9 +8249,8 @@ mod tests {
         }))
         .unwrap();
         let b = tools::Builtins::default();
-        let mut tl = ToolLoop { cfg: &tc, builtins: b, reg: tools::build(&tc, b, &|_| {}),
-                                calls: 0, limit_told: false, malformed_told: false,
-                                refused: None, log: Vec::new() };
+        let nop = |_: &str| {};
+        let mut tl = ToolLoop::open(&tc, b, &nop);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // the live shape of 2026-08-05: no name anywhere, tag left unclosed
         let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";

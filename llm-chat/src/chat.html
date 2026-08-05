@@ -3668,7 +3668,7 @@ function renderModelMenu() {
     const what = names.length ? names.join(", ") : "the configured tools";
     // web_search is still web search: the Search switch above governs it, and a
     // user who turns Tools on expecting it would otherwise be left guessing
-    const needsWeb = (state.tools.http || []).some((n) => n === "web_search" || n === "fetch_url" || n === "post_url");
+    const needsWeb = (state.tools.http || []).some((n) => n === "web_search" || n === "request" || n === "fetch_url" || n === "post_url");
     const tsg = node('<div class="seg-row"><span>Tools</span><div class="seg"></div></div>');
     for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");

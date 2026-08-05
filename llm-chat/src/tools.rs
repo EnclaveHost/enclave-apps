@@ -85,20 +85,27 @@ pub struct ToolsConfig {
     pub default_on: bool,
     /// Capabilities this deployment ALREADY has, handed to the model as tools
     /// instead of being decided for it by a pre-pass: `["web_search",
-    /// "fetch_url", "post_url"]`. All are backed by the `search` config block
-    /// and none appears without one - the block is where a deployment consents
-    /// to the model reaching the web at all, and post_url (the model SENDING
-    /// data out, not just reading) deserves that gate more than the other two.
+    /// "request", "generate_image", "view_image"]`. Each is backed by its own
+    /// config block and never appears without it: web_search and request by
+    /// `search` (the block where a deployment consents to the model reaching
+    /// the web at all - and request can SEND data out, which deserves that
+    /// gate more than reading does), generate_image by `image`, view_image by
+    /// `vision_service`. The legacy names fetch_url and post_url still parse -
+    /// on-chain config CIDs are immutable - and both resolve to `request`.
     ///
-    /// web_search is the interesting one. The router decides before the model
-    /// has thought about the question, from four messages of context, and it
-    /// gets one guess; as a tool the model asks when it finds it needs to, with
-    /// the query it actually wants, and can search again after reading what
-    /// came back. The cost is a re-prefill per call (see max_calls) against the
-    /// router's single extra generation.
+    /// The principle is one decider per capability. The router decides before
+    /// the model has thought about the question, from four messages of
+    /// context, and it gets one guess; as a tool the model asks when it finds
+    /// it needs to, with the query (or prompt, or question) it actually wants,
+    /// and can ask again after reading what came back. The cost is a
+    /// re-prefill per call (see max_calls) against the router's single extra
+    /// generation.
     ///
-    /// Listing web_search here TURNS THE ROUTER'S SEARCH DECISION OFF for any
-    /// turn the tools are armed on, so a deployment never pays for both.
+    /// Arming a capability as a tool TURNS THE PRE-PASS FOR IT OFF for that
+    /// turn, so a deployment never pays for both: web_search silences the
+    /// router's search verdict, generate_image its image verdict, and
+    /// view_image stands the delegated-vision pre-pass down (the pictures
+    /// leave the prompt and wait for the model to ask).
     #[serde(default)]
     pub builtin: Vec<String>,
     /// plain HTTP endpoints, described here in full
@@ -111,7 +118,8 @@ pub struct ToolsConfig {
 
 /// The capabilities a built-in tool is wired to. Passed in rather than read
 /// from config here, because they belong to the app, not to the tools block:
-/// `web_search` IS the search leg, with the deployment's provider and key.
+/// `web_search` IS the search leg, with the deployment's provider and key;
+/// `generate_image` IS the image leg; `view_image` IS the vision delegation.
 #[derive(Clone, Copy, Default)]
 pub struct Builtins<'a> {
     pub search: Option<&'a crate::search::SearchConfig>,
@@ -120,21 +128,43 @@ pub struct Builtins<'a> {
     /// showing the model a tool is a stronger guarantee than asking it not to
     /// use one, and a user's choice is not a misconfiguration to report.
     pub web_withheld: bool,
+    /// the image-generation leg, when configured AND live for this turn: the
+    /// user's image switch governs the tool exactly as it governs the router
+    pub image: Option<&'a crate::image::ImageConfig>,
+    /// image is configured but the user's switch is off this turn - skipped
+    /// silently, same stance as web_withheld
+    pub image_withheld: bool,
+    /// the vision delegation leg, when configured and this turn DELEGATES
+    /// (a serving model reading the picture itself keeps it local; there is
+    /// nothing for a tool to do)
+    pub vision: Option<&'a crate::vision::VisionConfig>,
+    /// vision_service is configured but this turn reads the picture locally -
+    /// skipped silently, the capability is not missing
+    pub vision_withheld: bool,
+    /// the conversation carries at least one attached image. Without one,
+    /// view_image is silently not offered: a tool with nothing to look at is
+    /// prompt noise, not a misconfiguration.
+    pub images_present: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Builtin {
     WebSearch,
-    FetchUrl,
-    PostUrl,
+    Request,
+    GenerateImage,
+    ViewImage,
 }
 
 impl Builtin {
     fn parse(name: &str) -> Option<Builtin> {
         match name.trim() {
             "web_search" => Some(Builtin::WebSearch),
-            "fetch_url" => Some(Builtin::FetchUrl),
-            "post_url" => Some(Builtin::PostUrl),
+            // fetch_url / post_url are the pre-0.38 names for what is now ONE
+            // request tool. Config CIDs are immutable on-chain, so the old
+            // names must keep resolving forever.
+            "request" | "fetch_url" | "post_url" => Some(Builtin::Request),
+            "generate_image" => Some(Builtin::GenerateImage),
+            "view_image" => Some(Builtin::ViewImage),
             _ => None,
         }
     }
@@ -142,8 +172,9 @@ impl Builtin {
     pub fn name(self) -> &'static str {
         match self {
             Builtin::WebSearch => "web_search",
-            Builtin::FetchUrl => "fetch_url",
-            Builtin::PostUrl => "post_url",
+            Builtin::Request => "request",
+            Builtin::GenerateImage => "generate_image",
+            Builtin::ViewImage => "view_image",
         }
     }
 
@@ -153,13 +184,22 @@ impl Builtin {
                 "Search the web and get back numbered results with page text. Use it for any \
                  fact about the world you cannot verify from this conversation, including ones \
                  you believe you remember. Cite what you use as [1], [2].",
-            Builtin::FetchUrl =>
-                "Fetch one web page and return its text. Use it to read a result from web_search \
-                 in full, or a URL the user gave you.",
-            Builtin::PostUrl =>
-                "Send an HTTP POST request to a URL and return the response text. Use it to \
-                 submit data to an API or webhook the user pointed you at, and tell the user \
-                 what you sent and where.",
+            Builtin::Request =>
+                "Send an HTTP request to a URL and return the response text. GET (the default) \
+                 reads a page or API - use it to read a web_search result in full, a URL the \
+                 user gave you, or a JSON endpoint. POST/PUT/PATCH/DELETE send `body` to an \
+                 API or webhook the user pointed you at - tell the user what you sent and \
+                 where.",
+            Builtin::GenerateImage =>
+                "Generate an image from a text prompt. The picture is shown to the user \
+                 directly, above your reply; you never see it, so acknowledge it briefly \
+                 rather than describing it. Write the prompt as a full visual description of \
+                 the desired picture.",
+            Builtin::ViewImage =>
+                "Look at the image(s) the user attached and answer one question about them. \
+                 The vision model sees ONLY the image and your question, not the conversation, \
+                 so make the question self-contained and ask for exact transcription when \
+                 text, numbers or labels matter.",
         }
     }
 
@@ -175,27 +215,46 @@ impl Builtin {
                 },
                 "required": ["query"],
             }),
-            Builtin::FetchUrl => serde_json::json!({
+            Builtin::Request => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "absolute http(s) URL" }
-                },
-                "required": ["url"],
-            }),
-            Builtin::PostUrl => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "absolute http(s) URL to POST to" },
+                    "url": { "type": "string", "description": "absolute http(s) URL" },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                        "description": "HTTP method (default GET)",
+                    },
                     "body": {
-                        "description": "request body: a JSON object is sent as JSON, a string \
-                                        is sent exactly as written",
+                        "description": "request body, required for POST/PUT/PATCH: a JSON \
+                                        object is sent as JSON, a string is sent exactly as \
+                                        written",
                     },
                     "content_type": {
                         "type": "string",
                         "description": "MIME type of the body (default application/json)",
                     }
                 },
-                "required": ["url", "body"],
+                "required": ["url"],
+            }),
+            Builtin::GenerateImage => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "full visual description of the image to generate",
+                    }
+                },
+                "required": ["prompt"],
+            }),
+            Builtin::ViewImage => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "one self-contained question about the attached image(s)",
+                    }
+                },
+                "required": ["question"],
             }),
         }
     }
@@ -203,7 +262,31 @@ impl Builtin {
     /// Which config block has to be present for this to be offered at all.
     fn available(self, b: &Builtins) -> bool {
         match self {
-            Builtin::WebSearch | Builtin::FetchUrl | Builtin::PostUrl => b.search.is_some(),
+            Builtin::WebSearch | Builtin::Request => b.search.is_some(),
+            Builtin::GenerateImage => b.image.is_some(),
+            Builtin::ViewImage => b.vision.is_some() && b.images_present,
+        }
+    }
+
+    /// An unavailable builtin that is a CHOICE, not a misconfiguration: the
+    /// user's switch withheld it, or there is simply no image this turn.
+    /// Skipped without a note.
+    fn withheld(self, b: &Builtins) -> bool {
+        match self {
+            Builtin::WebSearch | Builtin::Request => b.web_withheld,
+            Builtin::GenerateImage => b.image_withheld,
+            Builtin::ViewImage => {
+                b.vision_withheld || (b.vision.is_some() && !b.images_present)
+            }
+        }
+    }
+
+    /// What is missing when it is neither available nor deliberately withheld.
+    fn missing(self) -> &'static str {
+        match self {
+            Builtin::WebSearch | Builtin::Request => "`search`",
+            Builtin::GenerateImage => "`image`",
+            Builtin::ViewImage => "`vision_service`",
         }
     }
 }
@@ -237,8 +320,12 @@ impl ToolsConfig {
     pub fn http_names(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for b in &self.builtin {
+            // parse() folds the legacy fetch_url/post_url aliases into ONE
+            // request tool, so the same dedup build() applies must apply here
             if let Some(k) = Builtin::parse(b) {
-                out.push(k.name().to_string());
+                if !out.iter().any(|n| n == k.name()) {
+                    out.push(k.name().to_string());
+                }
             }
         }
         for t in &self.http {
@@ -399,17 +486,23 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
     for want in &cfg.builtin {
         let Some(k) = Builtin::parse(want) else {
             reg.notes.push(format!(
-                "builtin '{want}' is not a tool this app has (known: web_search, fetch_url, \
-                 post_url)"
+                "builtin '{want}' is not a tool this app has (known: web_search, request, \
+                 generate_image, view_image)"
             ));
             continue;
         };
         if !k.available(&b) {
-            if !b.web_withheld {
-                reg.notes.push(format!(
-                    "builtin '{}' needs this deployment's `search` block, which is not configured",
-                    k.name()
-                ));
+            if !k.withheld(&b) {
+                let note = format!(
+                    "builtin '{}' needs this deployment's {} block, which is not configured",
+                    k.name(),
+                    k.missing()
+                );
+                // fetch_url and post_url alias to one request tool; one
+                // missing capability is one note, not one per alias
+                if !reg.notes.contains(&note) {
+                    reg.notes.push(note);
+                }
             }
             continue;
         }
@@ -814,18 +907,29 @@ pub struct ToolResult {
     /// numbered source list under a reply; a search the MODEL asked for
     /// deserves the same one, or its [1] and [2] point at nothing.
     pub sources: Vec<(String, String)>,
+    /// the picture a generate_image call produced. The model only reads the
+    /// text beside it; the bytes ride out to the client through the leg's
+    /// existing image delivery.
+    pub image: Option<crate::image::GeneratedImage>,
 }
 
 /// Run one call. Never returns Err: a failure IS a result, handed back to the
 /// model so it can try something else or tell the user plainly. A tool that is
 /// down should cost an answer its accuracy, not its existence.
+///
+/// `images` is the current conversation's attached pictures (for view_image)
+/// and `on_status` keeps the client stream warm through the slow builtins - an
+/// image generation queued behind other tenants is minutes, and every
+/// server-side wait on a response path must tick.
 pub fn call(
     reg: &mut Registry,
     cfg: &ToolsConfig,
     b: Builtins,
     name: &str,
     args: &serde_json::Value,
+    images: &[Vec<u8>],
     now_ms: impl Fn() -> u64,
+    on_status: &dyn Fn(&str),
 ) -> ToolResult {
     let t0 = now_ms();
     let src = match reg.find(name) {
@@ -840,6 +944,7 @@ pub fn call(
                 is_error: true,
                 ms: now_ms().saturating_sub(t0),
                 sources: Vec::new(),
+                image: None,
             };
         }
     };
@@ -848,8 +953,11 @@ pub fn call(
         _ => cfg.max_chars,
     };
     let mut sources = Vec::new();
+    let mut image = None;
     let r = match src {
-        ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources),
+        ToolSrc::Builtin(k) => {
+            call_builtin(k, &b, args, images, &mut sources, &mut image, &now_ms, on_status)
+        }
         ToolSrc::Http(i) => call_http(&cfg.http[i], cfg, args),
         ToolSrc::Mcp { server, remote } => call_mcp(&mut reg.mcp[server], &remote, args),
         // never built into a Registry - the passthrough renders client tools
@@ -863,24 +971,32 @@ pub fn call(
     };
     if is_error {
         sources.clear();
+        image = None;
     }
-    ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources }
+    ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources, image }
 }
 
 /// The app's own capabilities, called the way any other tool is.
 ///
 /// web_search renders EXACTLY what the pre-pass renders (search::render_context),
 /// so the numbering the model cites is the numbering it has always cited and
-/// the answer path needs no second convention.
+/// the answer path needs no second convention. generate_image and view_image
+/// run the same legs the router and the vision pre-pass run, for the same
+/// reason: one implementation per capability, whoever decided to use it.
+#[allow(clippy::too_many_arguments)]
 fn call_builtin(
     k: Builtin,
     b: &Builtins,
     args: &serde_json::Value,
+    images: &[Vec<u8>],
     sources: &mut Vec<(String, String)>,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    now_ms: &impl Fn() -> u64,
+    on_status: &dyn Fn(&str),
 ) -> Result<String, String> {
-    let scfg = b.search.ok_or("web search is not configured on this deployment")?;
     match k {
         Builtin::WebSearch => {
+            let scfg = b.search.ok_or("web search is not configured on this deployment")?;
             let q = args
                 .get("query")
                 .and_then(|q| q.as_str())
@@ -896,54 +1012,109 @@ fn call_builtin(
             *sources = hits.iter().map(|h| (h.title.clone(), h.url.clone())).collect();
             Ok(crate::search::render_context(q, &hits))
         }
-        Builtin::FetchUrl => {
+        Builtin::Request => {
+            let scfg = b.search.ok_or("outbound requests are not configured on this deployment")?;
             let u = args
                 .get("url")
                 .and_then(|u| u.as_str())
                 .map(str::trim)
                 .filter(|u| !u.is_empty())
-                .ok_or("fetch_url needs a non-empty `url` string")?;
+                .ok_or("request needs a non-empty `url` string")?;
             if !u.starts_with("http://") && !u.starts_with("https://") {
                 return Err(format!("'{u}' is not an absolute http(s) URL"));
             }
-            let text = crate::search::fetch_page(scfg, u)?;
-            sources.push((u.to_string(), u.to_string()));
-            Ok(text)
-        }
-        Builtin::PostUrl => {
-            let u = args
-                .get("url")
-                .and_then(|u| u.as_str())
+            let method = args
+                .get("method")
+                .and_then(|m| m.as_str())
                 .map(str::trim)
-                .filter(|u| !u.is_empty())
-                .ok_or("post_url needs a non-empty `url` string")?;
-            if !u.starts_with("http://") && !u.starts_with("https://") {
-                return Err(format!("'{u}' is not an absolute http(s) URL"));
-            }
-            let (body, ctype) = post_payload(args)?;
-            let text = crate::search::post_url(scfg, u, body.as_bytes(), &ctype)?;
-            // the POST target joins the source list for the same reason a
-            // fetched page does, plus one of its own: the user gets told
+                .filter(|m| !m.is_empty())
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            let text = match method.as_str() {
+                "GET" => crate::search::fetch_page(scfg, u)?,
+                "POST" | "PUT" | "PATCH" | "DELETE" => {
+                    let m = match method.as_str() {
+                        "POST" => Method::Post,
+                        "PUT" => Method::Put,
+                        "PATCH" => Method::Patch,
+                        _ => Method::Delete,
+                    };
+                    // a write needs a body; DELETE conventionally goes without
+                    let (body, ctype) = request_payload(args, method != "DELETE")?;
+                    crate::search::send_request(
+                        scfg,
+                        m,
+                        u,
+                        body.as_deref().map(str::as_bytes),
+                        &ctype,
+                    )?
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported method '{other}' - use GET, POST, PUT, PATCH or DELETE"
+                    ))
+                }
+            };
+            // the target joins the source list for the same reason a fetched
+            // page does, plus one of its own on a write: the user gets told
             // where their data went without having to trust the prose
             sources.push((u.to_string(), u.to_string()));
             Ok(text)
         }
+        Builtin::GenerateImage => {
+            let icfg = b.image.ok_or("image generation is not configured on this deployment")?;
+            let prompt = args
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .ok_or("generate_image needs a non-empty `prompt` string")?;
+            let img = crate::image::generate(icfg, prompt, now_ms, on_status)?;
+            let text = format!(
+                "An image has been generated from the prompt \"{}\" and is displayed to the \
+                 user directly above your reply. You cannot see it. Acknowledge it briefly \
+                 and naturally, and offer to adjust it; do not describe details you cannot \
+                 verify, and do not call generate_image again unless the user wants a \
+                 different picture.",
+                img.prompt
+            );
+            *image_out = Some(img);
+            Ok(text)
+        }
+        Builtin::ViewImage => {
+            let vcfg = b.vision.ok_or("vision delegation is not configured on this deployment")?;
+            if images.is_empty() {
+                return Err("there is no attached image in this conversation to look at".into());
+            }
+            let q = args
+                .get("question")
+                .and_then(|q| q.as_str())
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .ok_or("view_image needs a non-empty `question` string")?;
+            let a = crate::vision::describe(vcfg, images, q, None, now_ms, on_status)?;
+            Ok(a.text)
+        }
     }
 }
 
-/// The body and content type a post_url call actually sends. A JSON object or
-/// array is serialized and posted as JSON; a string goes as-is, defaulting to
-/// application/json because that is what the APIs a model reaches for speak.
-/// `content_type` overrides the default either way.
-fn post_payload(args: &serde_json::Value) -> Result<(String, String), String> {
+/// The body and content type a write-method request call actually sends. A
+/// JSON object or array is serialized and sent as JSON; a string goes as-is,
+/// defaulting to application/json because that is what the APIs a model
+/// reaches for speak. `content_type` overrides the default either way.
+fn request_payload(
+    args: &serde_json::Value,
+    required: bool,
+) -> Result<(Option<String>, String), String> {
     let body = match args.get("body") {
-        None | Some(serde_json::Value::Null) => {
+        None | Some(serde_json::Value::Null) if required => {
             return Err(
-                "post_url needs a `body` (a JSON object, or a string sent as-is)".into()
+                "this method needs a `body` (a JSON object, or a string sent as-is)".into()
             )
         }
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(v) => v.to_string(),
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(v) => Some(v.to_string()),
     };
     let ctype = args
         .get("content_type")
@@ -1506,43 +1677,109 @@ mod tests {
             "builtin": ["web_search", "fetch_url", "post_url", "teleport"]
         }))
         .unwrap();
-        // no search block: nothing is offered, and every reason is reported
+        // no capability blocks: nothing is offered, and every reason is
+        // reported - once per capability, not once per alias
         let reg = build(&cfg, Builtins::default(), &|_| {});
         assert!(reg.is_empty());
-        assert_eq!(reg.notes.len(), 4);
+        assert_eq!(reg.notes.len(), 3, "{:?}", reg.notes);
         assert!(reg.notes.iter().any(|n| n.contains("teleport")), "{:?}", reg.notes);
         assert!(reg.notes.iter().any(|n| n.contains("`search` block")), "{:?}", reg.notes);
 
-        // with one, the real ones resolve and the invented one still does not
+        // with a search block, the real ones resolve (fetch_url and post_url
+        // folding into ONE request tool) and the invented one still does not
         let scfg: crate::search::SearchConfig =
             serde_json::from_value(serde_json::json!({ "provider": "exa" })).unwrap();
-        let reg = build(&cfg, Builtins { search: Some(&scfg), web_withheld: false }, &|_| {});
+        let b = Builtins { search: Some(&scfg), ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["web_search", "fetch_url", "post_url"]);
+        assert_eq!(names, vec!["web_search", "request"]);
         assert_eq!(reg.notes.len(), 1);
         // and /models advertises exactly those
-        assert_eq!(
-            cfg.http_names(),
-            vec!["web_search".to_string(), "fetch_url".to_string(), "post_url".to_string()]
+        assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "request".to_string()]);
+    }
+
+    /// generate_image and view_image ride their own config blocks, and
+    /// view_image only exists on a turn that actually carries a picture.
+    #[test]
+    fn image_and_vision_builtins_follow_their_legs() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "builtin": ["generate_image", "view_image"]
+        }))
+        .unwrap();
+        let icfg: crate::image::ImageConfig =
+            serde_json::from_value(serde_json::json!({ "endpoint": "https://img.example" }))
+                .unwrap();
+        let vcfg: crate::vision::VisionConfig =
+            serde_json::from_value(serde_json::json!({ "endpoint": "https://eyes.example" }))
+                .unwrap();
+        // both configured, image attached: both offered
+        let b = Builtins {
+            image: Some(&icfg),
+            vision: Some(&vcfg),
+            images_present: true,
+            ..Default::default()
+        };
+        let reg = build(&cfg, b, &|_| {});
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["generate_image", "view_image"]);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        // no picture this turn: view_image vanishes silently
+        let b = Builtins {
+            image: Some(&icfg),
+            vision: Some(&vcfg),
+            images_present: false,
+            ..Default::default()
+        };
+        let reg = build(&cfg, b, &|_| {});
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["generate_image"]);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        // the user's image switch withholds generate_image silently too
+        let b = Builtins {
+            image: None,
+            image_withheld: true,
+            vision: Some(&vcfg),
+            images_present: true,
+            ..Default::default()
+        };
+        let reg = build(&cfg, b, &|_| {});
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["view_image"]);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        // whereas blocks that are simply absent ARE reported
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.is_empty());
+        assert_eq!(reg.notes.len(), 2, "{:?}", reg.notes);
+        assert!(reg.notes.iter().any(|n| n.contains("`image` block")), "{:?}", reg.notes);
+        assert!(
+            reg.notes.iter().any(|n| n.contains("`vision_service` block")),
+            "{:?}",
+            reg.notes
         );
     }
 
     #[test]
-    fn post_payloads_take_both_shapes() {
+    fn request_payloads_take_both_shapes() {
         // a JSON object is serialized and defaults to application/json
-        let (b, ct) = post_payload(&serde_json::json!({"body": {"x": 1}})).unwrap();
-        assert_eq!(b, "{\"x\":1}");
+        let (b, ct) = request_payload(&serde_json::json!({"body": {"x": 1}}), true).unwrap();
+        assert_eq!(b.as_deref(), Some("{\"x\":1}"));
         assert_eq!(ct, "application/json");
         // a string goes as-is, and content_type overrides the default
-        let (b, ct) = post_payload(&serde_json::json!({
-            "body": "a=1&b=2", "content_type": "application/x-www-form-urlencoded"
-        }))
+        let (b, ct) = request_payload(
+            &serde_json::json!({
+                "body": "a=1&b=2", "content_type": "application/x-www-form-urlencoded"
+            }),
+            true,
+        )
         .unwrap();
-        assert_eq!(b, "a=1&b=2");
+        assert_eq!(b.as_deref(), Some("a=1&b=2"));
         assert_eq!(ct, "application/x-www-form-urlencoded");
-        // a missing body is an error that names the field, not an empty POST
-        assert!(post_payload(&serde_json::json!({})).unwrap_err().contains("body"));
-        assert!(post_payload(&serde_json::json!({"body": null})).is_err());
+        // a missing body on a write method is an error that names the field
+        assert!(request_payload(&serde_json::json!({}), true).unwrap_err().contains("body"));
+        assert!(request_payload(&serde_json::json!({"body": null}), true).is_err());
+        // ...but a DELETE goes without one
+        let (b, _) = request_payload(&serde_json::json!({}), false).unwrap();
+        assert!(b.is_none());
     }
 
     /// The user's search switch governs the tool, and turning it off is not a
@@ -1551,12 +1788,22 @@ mod tests {
     fn withholding_the_web_removes_the_tool_silently() {
         let cfg: ToolsConfig =
             serde_json::from_value(serde_json::json!({ "builtin": ["web_search"] })).unwrap();
-        let reg = build(&cfg, Builtins { search: None, web_withheld: true }, &|_| {});
+        let b = Builtins { search: None, web_withheld: true, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
         assert!(reg.is_empty());
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
         // whereas a deployment that simply forgot the search block IS told
-        let reg = build(&cfg, Builtins { search: None, web_withheld: false }, &|_| {});
+        let reg = build(&cfg, Builtins::default(), &|_| {});
         assert_eq!(reg.notes.len(), 1);
+    }
+
+    /// The pre-0.38 config names keep resolving - config CIDs are immutable
+    /// on-chain - and both land on the one request tool.
+    #[test]
+    fn legacy_builtin_names_alias_to_request() {
+        assert!(matches!(Builtin::parse("fetch_url"), Some(Builtin::Request)));
+        assert!(matches!(Builtin::parse("post_url"), Some(Builtin::Request)));
+        assert!(matches!(Builtin::parse("request"), Some(Builtin::Request)));
     }
 
     /// A built-in cannot be shadowed by an http entry that borrows its name:
@@ -1570,7 +1817,8 @@ mod tests {
         .unwrap();
         let scfg: crate::search::SearchConfig =
             serde_json::from_value(serde_json::json!({ "provider": "exa" })).unwrap();
-        let reg = build(&cfg, Builtins { search: Some(&scfg), web_withheld: false }, &|_| {});
+        let b = Builtins { search: Some(&scfg), ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
         assert_eq!(reg.tools.len(), 1);
         assert!(matches!(reg.tools[0].src, ToolSrc::Builtin(_)));
         assert_eq!(reg.notes.len(), 1);

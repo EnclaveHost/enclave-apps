@@ -563,7 +563,10 @@ pub fn fetch_page(cfg: &SearchConfig, url: &str) -> Result<String, String> {
                     "user-agent",
                     b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)",
                 )
-                .header("accept", b"text/html,text/plain"),
+                .header(
+                    "accept",
+                    b"text/html, application/json;q=0.9, text/plain;q=0.9, */*;q=0.5",
+                ),
         )?;
         if (300..400).contains(&r.status) {
             let Some(next) = r.location else {
@@ -576,47 +579,60 @@ pub fn fetch_page(cfg: &SearchConfig, url: &str) -> Result<String, String> {
             return Err(format!("HTTP {}", r.status));
         }
         let ct = r.ctype.unwrap_or_default().to_ascii_lowercase();
-        if !ct.is_empty() && !ct.contains("html") && !ct.contains("text/plain") {
+        // anything textual reads as-is - JSON is what an API answers with, and
+        // a model exploring one must be able to read it - while binary is
+        // refused rather than dumped into the prompt as mojibake
+        let is_html = ct.contains("html");
+        if !(ct.is_empty()
+            || is_html
+            || ct.starts_with("text/")
+            || ct.contains("json")
+            || ct.contains("xml")
+            || ct.contains("javascript"))
+        {
             return Err(format!("unsupported content-type '{ct}'"));
         }
         let raw = String::from_utf8_lossy(&r.body);
-        return Ok(if ct.contains("text/plain") {
-            raw.into_owned()
-        } else {
-            html_to_text(&raw)
-        });
+        return Ok(if is_html { html_to_text(&raw) } else { raw.into_owned() });
     }
     Err("too many redirects".into())
 }
 
-/// POST a body to a URL and return the response as text. The counterpart of
+/// Send a non-GET request and return the response as text. The counterpart of
 /// `fetch_page` for the write direction, and deliberately simpler: no redirect
-/// following (silently replaying a POST at whatever address a server named is
+/// following (silently replaying a write at whatever address a server named is
 /// how a request gets sent somewhere the model never chose) and no
 /// content-type refusal, because the APIs this reaches answer in JSON, which
 /// the model can read as-is. HTML is still stripped: an error page raw is tag
 /// soup that spends the result budget on markup.
-pub fn post_url(
+pub fn send_request(
     cfg: &SearchConfig,
+    method: Method,
     url: &str,
-    body: &[u8],
+    body: Option<&[u8]>,
     content_type: &str,
 ) -> Result<String, String> {
-    let r = http::request(
-        HttpReq::post(url, body)
-            .timeout(cfg.timeout_s)
-            .header(
-                "user-agent",
-                b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)",
-            )
-            .header("content-type", content_type.as_bytes())
-            .header("accept", b"application/json, text/plain;q=0.9, */*;q=0.8"),
-    )?;
+    let mut req = match body {
+        Some(b) => HttpReq::post(url, b),
+        None => HttpReq::get(url),
+    };
+    req.method = method;
+    let mut req = req
+        .timeout(cfg.timeout_s)
+        .header(
+            "user-agent",
+            b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)",
+        )
+        .header("accept", b"application/json, text/plain;q=0.9, */*;q=0.8");
+    if body.is_some() {
+        req = req.header("content-type", content_type.as_bytes());
+    }
+    let r = http::request(req)?;
     if (300..400).contains(&r.status) {
         let to = r.location.unwrap_or_else(|| "(no location given)".into());
         return Err(format!(
-            "HTTP {} redirect to {to} - post_url does not follow redirects; POST to the \
-             final URL directly",
+            "HTTP {} redirect to {to} - write requests do not follow redirects; send to \
+             the final URL directly",
             r.status
         ));
     }
