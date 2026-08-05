@@ -25,6 +25,13 @@ on:
 
 # contents: write solely for the fixed-tag release upload the dashboard
 # links to; the build itself never writes to the repo
+# Serialize runs: two concurrent dispatches race on the mobile-index.json
+# commit (observed 2026-08-05: the loser's rebase conflicts and the run
+# fails after a good build). Queue instead; never cancel a signing build.
+concurrency:
+  group: mobile-shell
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
