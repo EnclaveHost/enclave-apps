@@ -43,6 +43,17 @@ done
 # repaint is whatever the framebuffer happened to contain.
 xsetroot -solid "#204060" 2>/dev/null
 
+run_twm_session() {
+    echo "xdesktop: starting twm + spincube" >&2
+    twm &
+    # the spinning cube; if it ever exits, pause before relaunch so a crash
+    # loop can't starve the emulated CPU
+    while :; do
+        /usr/bin/spincube
+        sleep 5
+    done
+}
+
 if [ -x /usr/bin/xfce4-session ]; then
     # XFCE reaches xfconfd and the session manager over a session bus, so one
     # has to exist. dbus-run-session creates it, runs the session under it,
@@ -52,18 +63,19 @@ if [ -x /usr/bin/xfce4-session ]; then
     # tens of MIPS. Startup is minutes rather than seconds, and that time is
     # real work (icon cache, fontconfig, gsettings), not a hang.
     echo "xdesktop: starting XFCE session" >&2
-    while :; do
+    tries=0
+    while [ $tries -lt 3 ]; do
         dbus-run-session -- /usr/bin/xfce4-session
-        echo "xdesktop: XFCE session exited, restarting in 5s" >&2
-        sleep 5
+        tries=$((tries+1))
+        echo "xdesktop: XFCE session exited (attempt $tries), restarting in 10s" >&2
+        sleep 10
     done
+    # Three straight exits means XFCE is not going to come up on this image.
+    # A machine reachable only through a framebuffer is miserable to debug, so
+    # leave something driveable on screen rather than an empty root window.
+    echo "xdesktop: XFCE failed three times, falling back to twm" >&2
+    run_twm_session
 else
-    echo "xdesktop: no XFCE in this image, using twm + spincube" >&2
-    twm &
-    # the spinning cube; if it ever exits, pause before relaunch so a crash
-    # loop can't starve the emulated CPU
-    while :; do
-        /usr/bin/spincube
-        sleep 5
-    done
+    echo "xdesktop: no XFCE in this image" >&2
+    run_twm_session
 fi
