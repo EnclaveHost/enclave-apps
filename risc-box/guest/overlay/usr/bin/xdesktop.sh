@@ -70,8 +70,20 @@ run_matchbox_session() {
         matchbox-window-manager -use_titlebar yes &
         WM_PID=$!
         sleep 8
-        [ -x /usr/bin/matchbox-panel ] && matchbox-panel --no-menu &
-        [ -x /usr/bin/matchbox-desktop ] && matchbox-desktop &
+        # --no-session, not --no-menu: matchbox-panel rejects an unknown flag
+        # and exits, which looks exactly like a desktop that never painted.
+        # There is nowhere to save a session to on a machine whose disk is
+        # thrown away at stop, so turning it off is right anyway.
+        [ -x /usr/bin/matchbox-panel ] && matchbox-panel --no-session &
+        # matchbox-desktop is deliberately NOT started. It segfaults inside
+        # libmb on this target ("unhandled signal 11 ... in libmb.so.1.0.9"),
+        # and what it contributes — the icon folder and a backdrop — is worth
+        # less than the black screen it paints on its way down. The same
+        # judgement as xfdesktop on the XFCE image, for a blunter reason.
+        #
+        # Something must own the root once the window manager has taken the
+        # screen, or the desktop is a black void with a panel floating on it.
+        (sleep 12; xsetroot -solid "#204060" 2>/dev/null) &
         # Keep the session alive as long as the window manager is.
         wait $WM_PID
         tries=$((tries+1))
