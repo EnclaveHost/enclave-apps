@@ -1,12 +1,13 @@
 # Vendored from https://github.com/takahirox/riscv-rust
 # commit 8ee69d7a5dc7ef6d8b2bda96bf86d2923f2cf176 (MIT, see LICENSE).
-# src/* is byte-exact upstream EXCEPT two additive patches, both tagged
-# "risc-box patch" in-line:
-#   - device/virtio_block_disk.rs: contents_len field + dump_contents()
-#     (read the guest-modified disk image back out for persisting)
-#   - mmu.rs: get_disk() accessor
+# src/* is upstream plus a set of local changes, every one of them tagged
+# "risc-box patch" in-line — `git grep "risc-box patch" src/` is the index.
+# They have outgrown the list that used to live here (disk readback, the
+# software TLB and predecoded instruction cache, virtio-net and virtio-input,
+# decimated device servicing); read the tags rather than trusting a summary
+# here to have kept up.
 # This Cargo.toml is ours (upstream's declares a cli/wasm workspace we
-# don't vendor).
+# don't vendor), as is examples/ (the throughput benchmark).
 [package]
 name = "riscv_emu_rust"
 version = "0.2.0"

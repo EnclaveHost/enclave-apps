@@ -316,6 +316,55 @@ the `10.0.2.2` proxy and directly against `8.8.8.8` (UDP NAT), an HTTP body
 fetched from the real internet over the TCP splice, and a dial to a closed
 port answered with a fast RST.
 
+## Measuring the interpreter
+
+`/status` reports MIPS, but that figure is not a property of the emulator: the
+event loop runs the guest, serves HTTP, scans the framebuffer and encodes video
+on one thread, so it moves with what the browser is doing. Optimise against the
+benchmark instead, which runs the emulator and nothing else:
+
+```sh
+cargo run --release --manifest-path emu/Cargo.toml --example boot-bench -- \
+    images/fw_payload.elf images/rootfs.ext2 --until "login:"
+```
+
+It reports **instructions** to reach a console marker as well as MIPS, and the
+instruction count is the one to watch. It is deterministic — the same guest
+doing the same work — so it stays put while the emulator underneath it gets
+faster, and it catches the failure that matters most here: a change that speeds
+the host loop up while making the *guest* spin for longer is a loss, and only
+the instruction count shows it.
+
+That is not hypothetical. Devices used to be serviced on every retired
+instruction — six device ticks and two CSR reads wrapped around an instruction
+whose own work is a tag compare and an indirect call, which cost more than the
+emulation did. They now run every `DEVICE_TICK_INTERVAL` instructions
+(`emu/src/cpu.rs`), with device clocks advanced by the whole interval so guest
+time passes at the same rate in coarser steps, and with interrupt delivery
+re-armed by any CSR write that changes what is pending or enabled. Measured on
+the XFCE image, booting to a login prompt:
+
+| interval | instructions | MIPS |
+|---|---|---|
+| 1 (as before) | 1231M | 29.7 |
+| 8 | 1241M | 44.8 |
+| **16 (shipping)** | **1233M** | **47.8** |
+| 32 | 1229M | 50.8 |
+
+Guest work is flat across the whole sweep, so the speedup is real rather than
+borrowed from somewhere else. **16 is deliberate, not the fastest number in the
+table**: the UART drains its transmit register on a 16-cycle cadence of its
+own, so 16 is the largest interval that cannot change console behaviour. At 64
+the console visibly corrupts (`Saving 25 bits of ceditable sed`) and the guest
+needs twice the instructions to boot, because it spends the difference spinning
+on a serial port that has become four times slower. Going higher means making
+the UART emit on store instead of on a cadence; the table says that is worth
+about another 6%.
+
+Setting `DEVICE_TICK_INTERVAL = 1` restores exactly the old behaviour, which is
+how the refactor was checked: it reproduces the baseline instruction count to
+the digit.
+
 ## Caveats, honestly
 
 - **User-mode network, one guest IP (10.0.2.15).** Outbound is NAT at the
@@ -324,12 +373,13 @@ port answered with a fast RST.
   errors...) don't exist. Set `net.outbound: false` for a sealed machine.
 - **RISC-V RV64 only, one hart.** RISC Box runs what the vendored emulator runs:
   a single-core RISC-V `virt`-style machine. Not x86, not multi-core.
-- **Emulated speed.** The interpreter turns ~29 MIPS under wasmtime (software
-  TLB + predecoded instruction cache; measured on the sample image): fine
-  for a shell, a build, a demo; not a fast VM. There is no KVM in a TEE wasm
-  sandbox; this is pure interpretation. An idle guest parked in WFI is
-  throttled to ~1–2% host CPU; keystrokes force full-speed batches so the
-  console stays snappy.
+- **Emulated speed.** Software TLB, a predecoded instruction cache and
+  decimated device servicing; fine for a shell, a build, a demo, but not a
+  fast VM. There is no KVM in a TEE wasm sandbox, so this is pure
+  interpretation and always will be. An idle guest parked in WFI is throttled
+  to ~1–2% host CPU; keystrokes force full-speed batches so the console stays
+  snappy. See **Measuring the interpreter** below before trying to make it
+  quicker — the number the app reports is not the number to optimise against.
 - **Blocking image load.** Fetching the images (tens of MB over TLS) happens
   in the event loop, so the console briefly stalls for other clients during a
   boot. One-time, a few seconds.

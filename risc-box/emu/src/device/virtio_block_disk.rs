@@ -104,8 +104,18 @@ impl VirtioBlockDisk {
 	///
 	/// # Arguments
 	/// * `memory`
-	pub fn tick(&mut self, memory: &mut MemoryWrapper) {
-		if self.notify_clocks.len() > 0 && (self.clock == self.notify_clocks[0] + DISK_ACCESS_DELAY) {
+	// risc-box patch: `n` = instructions retired since the last service.
+	//
+	// The completion test below was an exact equality against the clock, which
+	// only ever matched because the clock advanced one at a time. It now
+	// advances in steps (see Cpu::tick), which would step straight over the
+	// completion instant: the interrupt would never be raised and the guest
+	// would hang on its first disk read. So test for "due" rather than
+	// "exactly now", and drain everything that has come due — virtio reports a
+	// batch of completed buffers with a single interrupt, and holding requests
+	// back to one per service would stretch disk latency by the interval.
+	pub fn tick(&mut self, n: u64, memory: &mut MemoryWrapper) {
+		while self.notify_clocks.len() > 0 && self.clock >= self.notify_clocks[0] + DISK_ACCESS_DELAY {
 			// bit 0 in interrupt_status register indicates
 			// the interrupt was asserted because the device has used a buffer
 			// in at least one of the active virtual queues.
@@ -113,7 +123,7 @@ impl VirtioBlockDisk {
 			self.handle_disk_access(memory);
 			self.notify_clocks.remove(0);
 		}
-		self.clock = self.clock.wrapping_add(1);
+		self.clock = self.clock.wrapping_add(n);
 	}
 
 	/// Loads register content

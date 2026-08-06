@@ -274,15 +274,19 @@ impl Mmu {
 	}
 
 	/// Runs one cycle of MMU and peripheral devices.
-	pub fn tick(&mut self, mip: &mut u64) {
-		self.clint.tick(mip);
-		self.disk.tick(&mut self.memory);
+	// risc-box patch: `n` is how many instructions have retired since the last
+	// service (see Cpu::tick). Devices that keep a clock advance it by that
+	// much rather than by one, so guest time runs at the same rate it always
+	// did; devices that only poll queues simply get polled less often.
+	pub fn tick(&mut self, n: u64, mip: &mut u64) {
+		self.clint.tick(n, mip);
+		self.disk.tick(n, &mut self.memory);
 		self.net.tick(&mut self.memory); // risc-box patch
 		self.input.tick(&mut self.memory); // risc-box patch
-		self.uart.tick();
-		self.plic.tick(self.disk.is_interrupting(), self.net.is_interrupting(),
+		self.uart.tick(n);
+		self.plic.tick(n, self.disk.is_interrupting(), self.net.is_interrupting(),
 			self.input.is_interrupting(), self.uart.is_interrupting(), mip);
-		self.clock = self.clock.wrapping_add(1);
+		self.clock = self.clock.wrapping_add(n);
 	}
 
 	/// Updates addressing mode

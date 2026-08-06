@@ -46,6 +46,12 @@ pub struct Band {
 
 pub struct Display {
     frame: Vec<u8>,        // last scanned frame (guest byte order)
+    // Scratch the next frame is read into, then swapped with `frame`. It only
+    // exists so a scan allocates nothing: this buffer is megabytes, a scan
+    // happens ten times a second, and the allocation, the zeroing Vec does on
+    // the way in and the free on the way out are all pure overhead charged to
+    // the same thread that runs the guest.
+    scratch: Vec<u8>,
     row_hash: Vec<u64>,    // FNV-1a per row of `frame`
     force_full: bool,      // a watcher joined: next scan ships the whole frame
     primed: bool,          // false until the first scan after boot
@@ -55,6 +61,7 @@ impl Display {
     pub fn new() -> Self {
         Display {
             frame: vec![0; FB_BYTES],
+            scratch: vec![0; FB_BYTES],
             row_hash: vec![0; FB_H],
             force_full: true,
             primed: false,
@@ -78,12 +85,14 @@ impl Display {
     /// Scan the guest framebuffer and return the changed bands (possibly one
     /// full-frame band). Empty when nothing changed.
     pub fn scan(&mut self, emu: &Emulator) -> Vec<Band> {
-        let mut fresh = vec![0u8; FB_BYTES];
-        emu.read_physical_range(FB_BASE, &mut fresh);
+        // Read into the scratch buffer and swap it in, rather than allocating
+        // a fresh frame each time: the row hashes carry everything needed to
+        // find what changed, so the previous frame's bytes are not consulted.
+        emu.read_physical_range(FB_BASE, &mut self.scratch);
         let mut dirty = vec![false; FB_H];
         let mut any = false;
         for y in 0..FB_H {
-            let h = fnv1a(&fresh[y * FB_STRIDE..(y + 1) * FB_STRIDE]);
+            let h = fnv1a(&self.scratch[y * FB_STRIDE..(y + 1) * FB_STRIDE]);
             if h != self.row_hash[y] || !self.primed {
                 self.row_hash[y] = h;
                 dirty[y] = true;
@@ -93,7 +102,7 @@ impl Display {
         let full = self.force_full;
         self.force_full = false;
         self.primed = true;
-        self.frame = fresh;
+        std::mem::swap(&mut self.frame, &mut self.scratch);
         if full {
             return vec![self.band(0, FB_H)];
         }
