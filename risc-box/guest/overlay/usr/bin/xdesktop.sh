@@ -62,10 +62,27 @@ if [ -x /usr/bin/xfce4-session ]; then
     # On expectations: this is a full GTK3 desktop on an emulated CPU in the
     # tens of MIPS. Startup is minutes rather than seconds, and that time is
     # real work (icon cache, fontconfig, gsettings), not a hang.
+    # Start the components in order rather than letting xfce4-session race
+    # them. On hardware this slow xfwm4 needs tens of seconds to claim the
+    # screen, and xfce4-panel and xfdesktop check for a registered window
+    # manager the moment they start — losing that race, they print "No window
+    # manager registered on screen 0" and never draw. Starting the WM first
+    # and passing --disable-wm-check to the other two removes the race
+    # entirely instead of hoping the timing works out.
     echo "xdesktop: starting XFCE session" >&2
     tries=0
     while [ $tries -lt 3 ]; do
-        dbus-run-session -- /usr/bin/xfce4-session
+        dbus-run-session -- sh -c '
+            xfsettingsd &
+            xfwm4 &
+            # Give the window manager time to take the screen before anything
+            # asks whether it has.
+            sleep 25
+            xfce4-panel --disable-wm-check &
+            xfdesktop --disable-wm-check &
+            # Keep the session alive as long as the window manager is.
+            wait %2
+        '
         tries=$((tries+1))
         echo "xdesktop: XFCE session exited (attempt $tries), restarting in 10s" >&2
         sleep 10

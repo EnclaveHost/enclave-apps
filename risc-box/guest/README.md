@@ -26,9 +26,20 @@ spincube demo makes it obvious at a glance that the display path works.
 The XFCE image is a real desktop environment — panel, window manager, desktop
 icons, file manager, settings — and it is correspondingly heavy. Be clear-eyed
 about the hardware: an emulated RV64GC core in the tens of MIPS, 512 MiB of
-RAM, a software framebuffer, and no GPU. Session startup is minutes rather
-than seconds, and interaction is deliberate. It is genuinely driveable, and it
-is genuinely not fast. If the goal is responsiveness, use twm.
+RAM, a software framebuffer, and no GPU.
+
+Measured, so you can decide for yourself: the image boots, X comes up, and
+xfwm4, xfce4-session, xfconfd, xfsettingsd, xfdesktop and xfce4-panel all
+start and stay running. The guest then sits at **0% idle with a load average
+above 7 on a single emulated core** while the panel loads its plugins, and
+first paint takes many minutes. RAM is not the constraint (about 127 MiB of
+482 MiB in use) — CPU is, entirely.
+
+So: XFCE runs, and it is a fair demonstration that the machine is a real
+Linux desktop. It is not a desktop you would choose to work in at this
+emulation speed. **The twm image is the one to use** unless you specifically
+want to show XFCE running. Everything that makes XFCE lighter here is already
+applied (see the tuning note below); the remaining cost is GTK3 itself.
 
 The guest tuning that makes XFCE bearable is in the overlay and is worth
 keeping if you change things: xfwm4's compositor is off, GTK animations are
@@ -36,6 +47,15 @@ off, and window move/resize draw outlines rather than live content
 (`overlay/etc/xdg/`). Each of those removes full-screen software repaints,
 which cost twice here — once in the guest's CPU and again in the encoder that
 has to carry every changed pixel to a streaming client.
+
+`xdesktop.sh` also starts the session's parts in order rather than handing the
+job to `xfce4-session`, and that is not stylistic. xfce4-panel and xfdesktop
+check for a registered window manager the moment they start; on hardware this
+slow, xfwm4 has not yet claimed the screen, so both lose the race, log "No
+window manager registered on screen 0", and never draw — while continuing to
+run, so `ps` makes everything look healthy. Starting xfwm4 first, giving it a
+real head start, and passing `--disable-wm-check` to the other two removes the
+race rather than hoping the timing lands.
 
 ## Why XFCE lives in `br2-external/`
 
