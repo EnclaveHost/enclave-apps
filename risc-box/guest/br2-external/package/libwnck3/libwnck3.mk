@@ -15,9 +15,12 @@ LIBWNCK3_DEPENDENCIES = libgtk3 libglib2 xlib_libXres host-pkgconf
 
 # introspection needs to run target binaries; startup-notification is optional
 # and drags in more X plumbing than the panel needs here.
+# NB: introspection and startup_notification are meson *features*
+# (enabled/disabled/auto), not booleans — passing false to them is a
+# configure error, not a warning.
 LIBWNCK3_CONF_OPTS = \
 	-Dinstall_tools=false \
-	-Dintrospection=false \
+	-Dintrospection=disabled \
 	-Dstartup_notification=disabled \
 	-Dgtk_doc=false
 
