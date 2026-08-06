@@ -98,6 +98,18 @@ GOTCHA: the moonlight and sunshine AppImages both `--appimage-extract` to the sa
 
 (Memory: `risc-box-moonlight-streaming.md`, `risc-box-xorg-guest.md`.)
 
+## UPDATE: the from-scratch host is finished and streaming
+
+Item **B** below is **done**. `gs-bridge` now implements the entire GameStream
+host — HTTPS control (:47984), RTSP (:48010, plain TCP at this appversion),
+RTP video with Reed-Solomon FEC (:47998), the AES-128-GCM ENet control channel
+(:47999), and audio (:48000) — and a real Moonlight client decodes a live
+stream of the emulated machine (826 frames / 14 IDRs in a 15 s session against
+the actual RISC Box app), with input reaching the guest's virtio-input HID.
+Real Sunshine is no longer needed. See `gs-bridge/README.md` for the protocol
+gotchas (SPS-led IDR access units, filler-NAL stripping, the negative
+appversion component, RTSP half-close). Only item **A** remains.
+
 ## What is LEFT
 
 **A. Production H200 deploy — the operator's step (blocked for an LLM).** The

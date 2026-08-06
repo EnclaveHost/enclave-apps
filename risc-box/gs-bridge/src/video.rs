@@ -1,0 +1,661 @@
+// The video stream: RISC Box desktop -> NVENC -> GameStream RTP on :47998.
+//
+// Three stages, mirroring Sunshine's videoBroadcastThread:
+//
+//   1. a feeder thread pulls raw RGB frames from the app's GET /fb.rgb and
+//      writes them into ffmpeg's stdin;
+//   2. ffmpeg hardware-encodes on the GPU's NVENC engine (h264_nvenc — it
+//      errors out rather than falling back to CPU, so a running pipeline is
+//      itself proof the GPU is doing the work) and writes Annex-B to stdout;
+//   3. this module splits that into access units and packetizes each one into
+//      RTP + NV_VIDEO_PACKET shards with Reed-Solomon parity.
+//
+// The packet layout the client expects (moonlight-common-c Video.h,
+// RtpVideoQueue.c) is, per shard:
+//
+//   [RTP_PACKET 12][reserved 4][NV_VIDEO_PACKET 16][payload ...]
+//
+// with the first shard of a frame carrying an 8-byte short frame header
+// ahead of the bitstream.
+
+use std::io::{Read, Write};
+use std::net::UdpSocket;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::app::App;
+use crate::fec;
+use crate::session::Session;
+
+/// moonlight-common-c Video.h: MAX_RTP_HEADER_SIZE.
+const MAX_RTP_HEADER_SIZE: usize = 16;
+/// sizeof(video_packet_raw_t): RTP_PACKET(12) + reserved(4) + NV_VIDEO_PACKET(16).
+const VIDEO_PACKET_HEADER: usize = 32;
+/// sizeof(video_short_frame_header_t).
+const FRAME_HEADER: usize = 8;
+/// 2 bits of multiFecBlocks means at most 4 blocks per frame.
+const MAX_FEC_BLOCKS: usize = 4;
+/// nanors' shard ceiling.
+const DATA_SHARDS_MAX: usize = fec::DATA_SHARDS_MAX;
+
+const FLAG_CONTAINS_PIC_DATA: u8 = 0x1;
+const FLAG_EOF: u8 = 0x2;
+const FLAG_SOF: u8 = 0x4;
+/// RTP header bit the client asserts on every video packet.
+const FLAG_EXTENSION: u8 = 0x10;
+
+/// Percentage of parity shards to generate. Sunshine's default is 20.
+const FEC_PERCENTAGE: usize = 20;
+
+pub struct Encoder {
+    child: Child,
+}
+
+impl Encoder {
+    /// Spawn ffmpeg reading raw RGB on stdin and emitting Annex-B H.264 on
+    /// stdout, encoded on the GPU's NVENC engine.
+    ///
+    /// The IDR interval is pinned to ~1s so that a client IDR request (or a
+    /// mid-stream join) is satisfied promptly: we cannot signal a keyframe
+    /// through a pipe, so a short GOP is what bounds recovery time.
+    pub fn spawn(
+        cfg: &crate::session::StreamConfig,
+        codec: &str,
+        source: (u32, u32),
+    ) -> std::io::Result<Encoder> {
+        // The source is the machine's framebuffer, which has its own fixed
+        // size; the client negotiates its own. Scale between them on the GPU
+        // side rather than pretending they match.
+        let in_size = format!("{}x{}", source.0, source.1);
+        let scale = format!("scale={}:{}:flags=bilinear", cfg.width, cfg.height);
+        let fps = cfg.fps.max(1).to_string();
+        let bitrate = format!("{}k", cfg.bitrate_kbps.max(500));
+        // One IDR per second.
+        let gop = cfg.fps.max(1).to_string();
+
+        let child = Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &in_size, "-r", &fps, "-i", "-",
+                "-vf", &scale,
+                "-c:v", codec,
+                "-preset", "p1",           // lowest latency NVENC preset
+                "-tune", "ull",            // ultra-low-latency
+                "-zerolatency", "1",
+                // VBR rather than CBR: the emulated desktop is mostly static,
+                // and CBR would pad every frame with filler data to hit the
+                // target rate. Capping at the negotiated bitrate keeps us
+                // inside what the client asked for.
+                "-rc", "vbr",
+                "-b:v", &bitrate,
+                "-maxrate", &bitrate,
+                "-bf", "0",                // no B-frames: they add latency and reordering
+                "-g", &gop,
+                "-forced-idr", "1",
+                "-pix_fmt", "yuv420p",
+                // Repeat SPS/PPS ahead of every keyframe. NVENC otherwise
+                // emits them once, and the client identifies an IDR frame by
+                // the frame starting with an SPS — without this, every IDR is
+                // invisible to it and the stream never starts.
+                "-bsf:v", "dump_extra=freq=keyframe",
+                "-f", "h264", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        Ok(Encoder { child })
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Pull frames from the app and feed the encoder until the session stops.
+fn feeder(session: Arc<Session>, app: Arc<App>, mut stdin: std::process::ChildStdin, fps: u32) {
+    let interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
+    let mut last_frame: Option<Vec<u8>> = None;
+
+    while !session.is_stopping() {
+        let started = Instant::now();
+
+        let frame = match app.get("/fb.rgb") {
+            Ok(f) if !f.is_empty() => {
+                last_frame = Some(f.clone());
+                f
+            }
+            // A failed or empty fetch repeats the previous frame rather than
+            // stalling the encoder, which would stall the whole stream.
+            _ => match &last_frame {
+                Some(f) => f.clone(),
+                None => {
+                    if !session.wait(interval) {
+                        break;
+                    }
+                    continue;
+                }
+            },
+        };
+
+        if stdin.write_all(&frame).is_err() {
+            break;
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed < interval && !session.wait(interval - elapsed) {
+            break;
+        }
+    }
+}
+
+/// Split an Annex-B byte stream into access units.
+///
+/// A new access unit begins at the first VCL NAL (type 1 or 5) whose
+/// first_mb_in_slice is 0 — that ue(v) is 0 exactly when the high bit of the
+/// first byte after the NAL header is set. Crucially, any parameter sets and
+/// SEI immediately preceding that slice belong to the *new* access unit, not
+/// the one just finished: the client identifies an IDR frame by the frame
+/// starting with an SPS (VideoDepacketizer.c isIdrFrameStart), so attaching
+/// the SPS/PPS to the previous frame makes every IDR undetectable.
+struct AnnexBSplitter {
+    buf: Vec<u8>,
+    /// Whether a VCL NAL has been seen in the access unit being accumulated.
+    seen_vcl: bool,
+    /// Start of the run of non-VCL NALs following the last VCL, if any. This
+    /// is where the next access unit begins.
+    nonvcl_run: Option<usize>,
+    scan: usize,
+}
+
+impl AnnexBSplitter {
+    fn new() -> Self {
+        AnnexBSplitter { buf: Vec::new(), seen_vcl: false, nonvcl_run: None, scan: 0 }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Return the next complete access unit, if one has been fully seen.
+    fn next_au(&mut self) -> Option<Vec<u8>> {
+        while let Some((sc_pos, sc_len)) = find_start_code(&self.buf, self.scan) {
+            let nal_pos = sc_pos + sc_len;
+            // Need the NAL header, plus one more byte for the VCL test.
+            if nal_pos + 1 >= self.buf.len() {
+                self.scan = sc_pos;
+                return None;
+            }
+
+            let nal_type = self.buf[nal_pos] & 0x1F;
+            let is_vcl = nal_type == 1 || nal_type == 5;
+            let starts_au = is_vcl && (self.buf[nal_pos + 1] & 0x80) != 0;
+
+            if starts_au && self.seen_vcl {
+                // Cut before any parameter sets / SEI that lead into this slice.
+                let split = self.nonvcl_run.unwrap_or(sc_pos);
+                let au = self.buf[..split].to_vec();
+                self.buf.drain(..split);
+                self.seen_vcl = false;
+                self.nonvcl_run = None;
+                self.scan = 0;
+                return Some(au);
+            }
+
+            if is_vcl {
+                self.seen_vcl = true;
+                self.nonvcl_run = None;
+            } else if self.seen_vcl && self.nonvcl_run.is_none() {
+                self.nonvcl_run = Some(sc_pos);
+            }
+
+            self.scan = nal_pos;
+        }
+        None
+    }
+}
+
+/// Find the next Annex-B start code at or after `from`. Returns (position, length).
+fn find_start_code(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 {
+            if buf[i + 2] == 1 {
+                return Some((i, 3));
+            }
+            if i + 4 <= buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
+                return Some((i, 4));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Remove filler-data NALs (type 12) from an access unit.
+///
+/// NVENC emits filler to pad a static screen up to the target bitrate. It
+/// carries no picture data, and when it lands at the head of an access unit
+/// it hides the SPS that the client uses to recognize an IDR frame
+/// (VideoDepacketizer.c skips AUD and SEI when looking for it, but not
+/// filler). Dropping it also stops us from paying real bandwidth for padding.
+fn strip_filler(au: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(au.len());
+    let mut scan = 0usize;
+
+    while let Some((sc_pos, sc_len)) = find_start_code(au, scan) {
+        let nal_pos = sc_pos + sc_len;
+        if nal_pos >= au.len() {
+            break;
+        }
+        let nal_type = au[nal_pos] & 0x1F;
+        let end = find_start_code(au, nal_pos)
+            .map(|(p, _)| p)
+            .unwrap_or(au.len());
+        if nal_type != 12 {
+            out.extend_from_slice(&au[sc_pos..end]);
+        }
+        scan = end;
+        if end == au.len() {
+            break;
+        }
+    }
+
+    if out.is_empty() {
+        au.to_vec()
+    } else {
+        out
+    }
+}
+
+/// True if the access unit contains an IDR slice (NAL type 5).
+fn au_is_idr(au: &[u8]) -> bool {
+    let mut scan = 0usize;
+    while let Some((pos, len)) = find_start_code(au, scan) {
+        let np = pos + len;
+        if np >= au.len() {
+            break;
+        }
+        if au[np] & 0x1F == 5 {
+            return true;
+        }
+        scan = np;
+    }
+    false
+}
+
+/// Packetize and send one access unit as a GameStream video frame.
+///
+/// Mirrors Sunshine stream.cpp:1493-1785 — the shard geometry, the fecInfo
+/// bit packing, and the per-block SOF/EOF flags all have to match what
+/// RtpVideoQueue.c reconstructs.
+#[allow(clippy::too_many_arguments)]
+fn send_frame(
+    sock: &UdpSocket,
+    peer: std::net::SocketAddr,
+    au: &[u8],
+    frame_index: u32,
+    lowseq: &mut u16,
+    timestamp: u32,
+    packet_size: usize,
+    min_required_fec_packets: usize,
+    is_idr: bool,
+) -> std::io::Result<()> {
+    let blocksize = packet_size + MAX_RTP_HEADER_SIZE;
+    let payload_blocksize = blocksize - VIDEO_PACKET_HEADER;
+
+    // The 8-byte short frame header precedes the bitstream.
+    let mut frame_header = [0u8; FRAME_HEADER];
+    frame_header[0] = 0x01; // short header type
+    // bytes 1..3: frame_processing_latency (LE16), left 0
+    frame_header[3] = if is_idr { 2 } else { 1 };
+    let last_payload_len = {
+        let n = (au.len() + FRAME_HEADER) % (packet_size - 16);
+        if n == 0 { (packet_size - 16) as u16 } else { n as u16 }
+    };
+    frame_header[4..6].copy_from_slice(&last_payload_len.to_le_bytes());
+
+    // Build the interleaved buffer: every `blocksize` element is
+    // [32 bytes reserved for headers][payload_blocksize bytes of data],
+    // with the final element short. (Sunshine's concat_and_insert.)
+    let data_len = FRAME_HEADER + au.len();
+    let pad = data_len % payload_blocksize != 0;
+    let elements = data_len / payload_blocksize + if pad { 1 } else { 0 };
+    let mut buf = vec![0u8; elements * VIDEO_PACKET_HEADER + data_len];
+    {
+        let joined: Vec<u8> = frame_header.iter().copied().chain(au.iter().copied()).collect();
+        for x in 0..elements {
+            let take = if x == elements - 1 { data_len - x * payload_blocksize } else { payload_blocksize };
+            let dst = x * (VIDEO_PACKET_HEADER + payload_blocksize) + VIDEO_PACKET_HEADER;
+            let src = x * payload_blocksize;
+            buf[dst..dst + take].copy_from_slice(&joined[src..src + take]);
+        }
+    }
+
+    // Split into FEC blocks, each aligned to blocksize.
+    let mut fec_percentage = FEC_PERCENTAGE;
+    let max_data_shards_per_block = (DATA_SHARDS_MAX * 100) / (100 + fec_percentage);
+    let max_data_per_block = max_data_shards_per_block * blocksize;
+    let mut blocks_needed = (buf.len() + max_data_per_block - 1) / max_data_per_block;
+    if blocks_needed > MAX_FEC_BLOCKS {
+        // Enormous frame: drop FEC rather than exceed the 2-bit block count.
+        fec_percentage = 0;
+        blocks_needed = MAX_FEC_BLOCKS;
+    }
+    let blocks_needed = blocks_needed.max(1);
+
+    let unaligned = buf.len() / blocks_needed;
+    let aligned = ((unaligned + blocksize - 1) / blocksize) * blocksize;
+
+    for block_index in 0..blocks_needed {
+        let start = block_index * aligned;
+        if start >= buf.len() {
+            break;
+        }
+        let end = if block_index == blocks_needed - 1 { buf.len() } else { (start + aligned).min(buf.len()) };
+        let block = &mut buf[start..end];
+
+        let packets = (block.len() + blocksize - 1) / blocksize;
+
+        // Fill each data shard's NV_VIDEO_PACKET header.
+        for x in 0..packets {
+            let off = x * blocksize;
+            let hdr = &mut block[off..off + VIDEO_PACKET_HEADER];
+            let mut flags = FLAG_CONTAINS_PIC_DATA;
+            if x == 0 {
+                flags |= FLAG_SOF;
+            }
+            if x == packets - 1 {
+                flags |= FLAG_EOF;
+            }
+            write_nv_header(hdr, frame_index, lowseq.wrapping_add(x as u16), flags, block_index, blocks_needed);
+        }
+
+        // Each data shard must be exactly `blocksize` for the RS encoder;
+        // the last one is zero-padded into its own buffer.
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(packets);
+        for x in 0..packets {
+            let off = x * blocksize;
+            let take = (block.len() - off).min(blocksize);
+            let mut shard = vec![0u8; blocksize];
+            shard[..take].copy_from_slice(&block[off..off + take]);
+            shards.push(shard);
+        }
+
+        let data_shards = shards.len();
+        let parity_shards = if fec_percentage == 0 {
+            0
+        } else {
+            let n = (data_shards * fec_percentage + 99) / 100;
+            // Small frames get bumped up to the client's requested minimum.
+            n.max(min_required_fec_packets.min(DATA_SHARDS_MAX - data_shards))
+        };
+        let effective_percentage = if parity_shards == 0 {
+            0
+        } else {
+            ((100 * parity_shards) / data_shards).max(fec_percentage)
+        };
+
+        // Parity is computed over the data shards *including* their headers,
+        // which is why the header fields the client re-derives on recovery
+        // (RTP, frameIndex, multiFecBlocks, fecInfo) are stamped only after
+        // this point, while the ones it trusts from recovery (flags,
+        // streamPacketIndex, multiFecFlags) were stamped before it.
+        if parity_shards > 0 {
+            let refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
+            shards.extend(fec::encode(&refs, parity_shards));
+        }
+
+        let total = data_shards + parity_shards;
+        let multi_fec_blocks = ((block_index as u8) << 4) | (((blocks_needed - 1) as u8) << 6);
+        for (x, shard) in shards.iter_mut().enumerate().take(total) {
+            let seq = lowseq.wrapping_add(x as u16);
+
+            let fec_info: u32 =
+                ((x as u32) << 12) | ((data_shards as u32) << 22) | ((effective_percentage as u32) << 4);
+            shard[28..32].copy_from_slice(&fec_info.to_le_bytes());
+            shard[20..24].copy_from_slice(&frame_index.to_le_bytes());
+            shard[27] = multi_fec_blocks;
+
+            // RTP header. Sequence number and timestamp are big-endian.
+            shard[0] = 0x80 | FLAG_EXTENSION;
+            shard[1] = 0x00; // packetType
+            shard[2..4].copy_from_slice(&seq.to_be_bytes());
+            shard[4..8].copy_from_slice(&timestamp.to_be_bytes());
+            shard[8..12].copy_from_slice(&0u32.to_be_bytes()); // ssrc
+
+            if x == 0 && std::env::var_os("GSB_DUMP_SHARD").is_some() {
+                let head: Vec<String> = shard[..48.min(shard.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                eprintln!("[video] shard0 frame={frame_index} len={} : {}", shard.len(), head.join(" "));
+            }
+
+            sock.send_to(shard, peer)?;
+        }
+
+        *lowseq = lowseq.wrapping_add(total as u16);
+    }
+
+    Ok(())
+}
+
+/// Write the NV_VIDEO_PACKET fields inside a shard's 32-byte header area.
+///
+/// Shard layout: RTP_PACKET(0..12), reserved(12..16), NV_VIDEO_PACKET(16..32),
+/// where the NV header is
+///   streamPacketIndex u32 LE @16, frameIndex u32 LE @20, flags @24,
+///   extraFlags @25, multiFecFlags @26, multiFecBlocks @27, fecInfo u32 LE @28.
+fn write_nv_header(hdr: &mut [u8], frame_index: u32, seq: u16, flags: u8, block_index: usize, blocks_needed: usize) {
+    // streamPacketIndex is the RTP sequence number shifted left 8; the client
+    // masks the low byte off and requires it to be contiguous across the stream.
+    let spi: u32 = (seq as u32) << 8;
+    hdr[16..20].copy_from_slice(&spi.to_le_bytes());
+    hdr[20..24].copy_from_slice(&frame_index.to_le_bytes());
+    hdr[24] = flags;
+    hdr[25] = 0; // extraFlags
+    hdr[26] = 0x10; // multiFecFlags, matching what Moonlight expects
+    hdr[27] = ((block_index as u8) << 4) | (((blocks_needed - 1) as u8) << 6);
+}
+
+/// Run the video stream for a session until it stops.
+pub fn run(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>, codec: String, source: (u32, u32)) {
+    let cfg = session.config.lock().unwrap().clone();
+
+    let mut encoder = match Encoder::spawn(&cfg, &codec, source) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[video] failed to spawn ffmpeg ({codec}): {e}");
+            session.stop();
+            return;
+        }
+    };
+    eprintln!(
+        "[video] NVENC {codec}: {}x{} framebuffer -> {}x{}@{} {}kbps RTP",
+        source.0, source.1, cfg.width, cfg.height, cfg.fps, cfg.bitrate_kbps
+    );
+
+    let stdin = encoder.child.stdin.take().unwrap();
+    let mut stdout = encoder.child.stdout.take().unwrap();
+
+    {
+        let session = session.clone();
+        let app = app.clone();
+        let fps = cfg.fps;
+        std::thread::spawn(move || feeder(session, app, stdin, fps));
+    }
+
+    let mut splitter = AnnexBSplitter::new();
+    let mut read_buf = vec![0u8; 256 * 1024];
+    let mut frame_index: u32 = 0;
+    let mut lowseq: u16 = 0;
+    let epoch = Instant::now();
+
+    while !session.is_stopping() {
+        let n = match stdout.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        splitter.push(&read_buf[..n]);
+
+        while let Some(au) = splitter.next_au() {
+            if session.is_stopping() {
+                break;
+            }
+            let au = strip_filler(&au);
+            let Some(peer) = *session.video_peer.lock().unwrap() else {
+                // No client ping yet — nothing to send to.
+                continue;
+            };
+
+            // RTP video timestamps run on a 90 kHz clock.
+            let ts = (epoch.elapsed().as_secs_f64() * 90_000.0) as u32;
+            let is_idr = au_is_idr(&au);
+            if is_idr {
+                session.idr_requested.store(false, Ordering::Release);
+            }
+
+            if is_idr || frame_index % 60 == 0 {
+                eprintln!(
+                    "[video] frame {frame_index} {} {} bytes",
+                    if is_idr { "IDR" } else { "P" },
+                    au.len()
+                );
+            }
+
+            let cfg = session.config.lock().unwrap().clone();
+            if let Err(e) = send_frame(
+                &sock,
+                peer,
+                &au,
+                frame_index,
+                &mut lowseq,
+                ts,
+                cfg.packet_size,
+                cfg.min_required_fec_packets,
+                is_idr,
+            ) {
+                eprintln!("[video] send failed: {e}");
+                break;
+            }
+            frame_index = frame_index.wrapping_add(1);
+        }
+    }
+
+    eprintln!("[video] stream ended after {frame_index} frames");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_access_units_at_first_slice() {
+        let mut s = AnnexBSplitter::new();
+        // SPS, PPS, IDR slice, then a P slice starting the next AU.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // SPS
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE]); // PPS
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]); // IDR, first_mb=0
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]); // P slice, first_mb=0
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x11]); // next P slice
+        s.push(&stream);
+
+        let au1 = s.next_au().expect("first AU");
+        assert!(au_is_idr(&au1), "first AU should carry the IDR slice");
+        assert!(au1.windows(2).any(|w| w == [0x67, 0x42]), "SPS belongs to the IDR AU");
+
+        let au2 = s.next_au().expect("second AU");
+        assert!(!au_is_idr(&au2));
+    }
+
+    /// The client only runs its IDR detection when the access unit *starts*
+    /// with an SPS, so parameter sets preceding an IDR slice must land at the
+    /// head of the IDR's access unit — never appended to the previous frame.
+    #[test]
+    fn parameter_sets_lead_the_idr_access_unit() {
+        let mut s = AnnexBSplitter::new();
+        let mut stream = Vec::new();
+        // A P frame, then SPS/PPS/SEI introducing an IDR, then another P.
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]);
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // SPS
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE, 0x00]); // PPS
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x06, 0x05, 0x00]); // SEI
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]); // IDR
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x11]); // next P
+        s.push(&stream);
+
+        let p_au = s.next_au().expect("P frame");
+        assert!(!au_is_idr(&p_au));
+        assert_eq!(
+            p_au,
+            vec![0, 0, 0, 1, 0x41, 0x9A, 0x00],
+            "the P frame must not absorb the following parameter sets"
+        );
+
+        let idr_au = s.next_au().expect("IDR frame");
+        assert!(au_is_idr(&idr_au));
+        assert_eq!(
+            idr_au[4] & 0x1F,
+            7,
+            "the IDR access unit must begin with an SPS or the client ignores it"
+        );
+    }
+
+    /// A filler NAL ahead of the parameter sets hides the SPS from the
+    /// client's IDR check, which silently costs you every mid-stream IDR.
+    #[test]
+    fn filler_is_stripped_so_the_sps_leads() {
+        let mut au = Vec::new();
+        au.extend_from_slice(&[0, 0, 1, 0x0C, 0xFF, 0xFF, 0xFF]); // filler
+        au.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // SPS
+        au.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE]); // PPS
+        au.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]); // IDR
+
+        let cleaned = strip_filler(&au);
+        assert_eq!(cleaned[4] & 0x1F, 7, "SPS must lead once filler is gone");
+        assert!(au_is_idr(&cleaned));
+        assert!(
+            !cleaned.windows(4).any(|w| w[3] == 0x0C && w[0] == 0 && w[1] == 0 && w[2] == 1),
+            "no filler NAL should remain"
+        );
+    }
+
+    #[test]
+    fn stripping_keeps_a_normal_access_unit_intact() {
+        let mut au = Vec::new();
+        au.extend_from_slice(&[0, 0, 0, 1, 0x06, 0x05, 0x00]); // SEI
+        au.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x11]); // P slice
+        assert_eq!(strip_filler(&au), au);
+    }
+
+    #[test]
+    fn fec_info_packs_the_fields_the_client_unpacks() {
+        // The client reads: index = (fecInfo & 0x3FF000) >> 12,
+        // dataShards = (fecInfo & 0xFFC00000) >> 22, pct = (fecInfo & 0xFF0) >> 4.
+        let (idx, shards, pct) = (7u32, 33u32, 20u32);
+        let fec_info = (idx << 12) | (shards << 22) | (pct << 4);
+        assert_eq!((fec_info & 0x3FF000) >> 12, idx);
+        assert_eq!((fec_info & 0xFFC0_0000) >> 22, shards);
+        assert_eq!((fec_info & 0xFF0) >> 4, pct);
+    }
+
+    #[test]
+    fn multi_fec_blocks_byte_round_trips() {
+        for blocks in 1..=4usize {
+            for idx in 0..blocks {
+                let b = ((idx as u8) << 4) | (((blocks - 1) as u8) << 6);
+                assert_eq!(((b >> 4) & 0x3) as usize, idx);
+                assert_eq!((((b >> 6) & 0x3) + 1) as usize, blocks);
+            }
+        }
+    }
+}

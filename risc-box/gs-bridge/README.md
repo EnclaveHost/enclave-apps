@@ -1,91 +1,134 @@
 # gs-bridge: a Moonlight/GameStream host for the RISC Box desktop
 
 This is the native bridge that lets a real **Moonlight** client stream the RISC
-Box desktop over NVIDIA's GameStream protocol. It's the counterpart to the
-in-app pieces: the app already produces an efficient **AV1** video stream
-(`GET /video`) and accepts input (`POST /hid`, backed by the emulated
-virtio-input HID). gs-bridge speaks the GameStream protocol to Moonlight and
-wires those two together.
+Box desktop over NVIDIA's GameStream protocol. It speaks the whole protocol
+itself — discovery, pairing, the HTTPS control surface, RTSP negotiation, RTP
+video with Reed-Solomon FEC, and the encrypted ENet control channel — and wires
+those to the app's two endpoints: `GET /fb.rgb` for frames and `POST /hid` for
+input, which lands on the emulated virtio-input device.
 
-Why native (not in the wasm app): GameStream needs a plain-HTTP + HTTPS control
-surface, UDP RTP/ENet transports, and (for real speed) hardware video encode.
-That belongs in a native process running where a GPU is reachable, the same
-place the H200 NVENC path would live (see `../docs/encode-path-handoff.md`),
-not inside the `wasm32-wasip2` sandbox. The bridge pulls frames from the app's
-`/video` and posts input back to `/hid`.
+Why native (not in the wasm app): GameStream needs plain-HTTP + HTTPS control
+surfaces, UDP RTP/ENet transports, and hardware video encode. That belongs in a
+native process running where a GPU is reachable — the same place the H200 NVENC
+path lives (see `../docs/encode-path-handoff.md`) — not inside the
+`wasm32-wasip2` sandbox.
 
-## Status
+## Status: streaming works end to end
 
-**Pairing works and is verified against a real client.** A stock
-**moonlight-qt 6.1.0** discovers this host, runs all four phases of the
-GameStream pairing handshake, and both cryptographic checks pass:
+A real Moonlight client pairs, connects, and **decodes a live H.264 stream of
+the emulated machine**, with input flowing back into the guest. Verified against
+the actual RISC Box app (RISC-V Linux booted under wasmtime from a minio-backed
+S3, serving its real 800x600 framebuffer):
 
 ```
-[gshost] phase2 clientchallenge ok
-[gshost] phase3 serverchallengeresp ok
-[gshost] *** PAIRED *** (hash_ok=true sig_ok=true)
+[client] decoder setup: H.264 1280x720 @ 60 fps
+[client] FIRST FRAME: 972 bytes, type=IDR
+frames_decoded: 826
+idr_frames: 14
+terminated: no (code 0)
 ```
 
-After pairing, Moonlight advances to `/applist` (a paired-only request) and the
-host reports `PairStatus=1`. The pairing crypto mirrors Sunshine's
-`src/nvhttp.cpp` + `crypto.cpp` exactly:
+The client is **moonlight-common-c** itself — the same protocol library
+moonlight-qt links — driven headlessly so a decode can be counted rather than
+merely rendered. Pairing was verified separately with stock **moonlight-qt
+6.1.0**, which completes all four handshake phases plus the HTTPS
+`pairchallenge` and then lists apps over TLS.
 
-- `getservercert`: `aes_key = SHA256(salt ‖ pin)[:16]`; return the server cert.
-- `clientchallenge`: `resp = AES128-ECB( SHA256(clientChal ‖ serverCertSig ‖
-  serverSecret) ‖ serverChallenge )`.
-- `serverchallengeresp`: return `serverSecret ‖ RSA-SHA256-sign(serverSecret)`.
-- `clientpairingsecret`: verify `SHA256(serverChal ‖ clientCertSig ‖ secret) ==
-  clientHash` **and** RSA-verify(clientCert, secret, sign).
+Every input class was verified reaching the guest: absolute and relative
+pointer motion, the three mouse buttons, keyboard, and scroll — each accepted
+by the app's `/hid` (`{"ok":true,"events":1}`).
 
-## GPU compute: NVENC hardware encode on the H200
+**GPU encode**: the video is hardware-encoded on the GPU's NVENC engine
+(`h264_nvenc` errors out rather than falling back to CPU, so a running stream is
+itself proof), with the encoder engine measurably active during a session
+(`nvidia-smi` encoder utilization non-zero throughout). Verified on an RTX 3070,
+the local test GPU; production encode is the fleet's **H200**, where the NVENC
+API is identical.
 
-The RISC Box app's GPU compute is the video **encode**, and it runs on the GPU's
-NVENC engine, off the emulated CPU and off the wasm app. In production this
-runs on the fleet GPU node's **H200** (co-located with the RISC Box CVM); the
-NVENC API is identical on a dev GPU, so a pipeline verified locally is the H200
-path. The frame source is the app's `GET /fb.rgb` (raw 800×600 RGB); the native
-bridge pulls it and NVENC-encodes it (`encode-nvenc.sh`, the encoder gs-bridge
-feeds into the video stream).
+## What it implements
 
-**Verified on an RTX 3070** (the local test GPU; production is the H200): pulling
-the RISC Box desktop from `/fb.rgb` and encoding with `h264_nvenc` drove the
-GPU's **NVENC engine to 100% utilization**, producing valid yuv420p H.264 that
-decodes to the desktop. `h264_nvenc` errors out if NVENC is unavailable (it
-never falls back to CPU), so a successful encode is itself proof the GPU did the
-work. The 3070 also exposes `av1_nvenc` and `hevc_nvenc`.
+| Port | Transport | Role |
+|---|---|---|
+| 47989 | TCP | discovery + the 4-phase pairing handshake |
+| 47984 | TLS | `/serverinfo`, `/applist`, `/launch`, `/resume`, `/cancel` |
+| 48010 | TCP | RTSP: OPTIONS, DESCRIBE, SETUP x3, ANNOUNCE, PLAY |
+| 47998 | UDP | RTP video: NV_VIDEO_PACKET framing + Reed-Solomon FEC |
+| 47999 | UDP | ENet control, AES-128-GCM both directions; input, IDR requests |
+| 48000 | UDP | RTP audio (silent Opus; the guest has no sound device) |
 
-## What's implemented vs. remaining
+The wire formats mirror Sunshine and moonlight-common-c exactly. Notable points
+the protocol is unforgiving about, all learned the hard way:
 
-Implemented: the GameStream HTTP control surface for discovery + pairing,
-`/serverinfo` (so Moonlight lists the host) and `/pair` (the 4-phase handshake),
-on HTTP :47989. Session state, self-signed server cert, and the exact crypto.
-Plus the GPU encode (NVENC) of the desktop, the GPU compute, verified above.
+- **`appversion` must end in a negative component** (`7.1.431.-1`). That is the
+  only thing that makes the client's `IS_SUNSHINE()` true, which in turn enables
+  the encrypted control stream, multi-block FEC, and the `control/13/0` stream id.
+- **RTSP is plain TCP** at this version, one connection per request, and every
+  response must be followed by a half-close — the client reads until EOF. Every
+  response also needs a `CSeq` header, because the client's parser cannot
+  terminate a message that has no headers at all.
+- **An IDR frame is recognized by its access unit starting with an SPS**, not by
+  containing an IDR slice. So SPS/PPS must be repeated ahead of every keyframe
+  (`dump_extra=freq=keyframe`), the parameter sets must lead the IDR's access
+  unit rather than trailing the previous frame, and **filler-data NALs must be
+  stripped** — NVENC's CBR padding otherwise sits in front of the SPS and hides
+  it, and the client silently drops every keyframe.
+- **Client certificates are the authorization model**: pairing stores the
+  client's cert, and the TLS listener admits only those, answering everyone else
+  with the 401 XML body.
 
-Remaining for actual video streaming (the larger piece):
-
-- **HTTPS :47984** for post-pair requests (`/applist`, `/launch`, `/resume`),
-  using the paired cert. Moonlight moves here right after pairing.
-- **RTSP handshake** (:48010) negotiating the streams.
-- **RTP video** (:47998): packetize the app's AV1 frames in Moonlight's video
-  packet format with Reed-Solomon FEC. Modern Moonlight/Sunshine support AV1,
-  so the app's existing `/video` output is the source; no H.264 needed for a
-  browser-grade client. (H.264/HEVC via H200 NVENC remains the path for maximum
-  compatibility/speed; see `../docs/encode-path-handoff.md`.)
-- **ENet control** (:47999, AES-GCM): input + keepalives. Input maps to the
-  app's `POST /hid`.
-- **Audio** (:48000): Opus over RTP (optional).
-
-## Run / reproduce the pairing test
+## Build and run
 
 ```
 cargo build --release
-./target/release/gs-bridge          # GameStream host on :47989
+./target/release/gs-bridge --app 127.0.0.1:8000
+```
 
-# with a real Moonlight client (moonlight-qt), pin fixed so both sides agree:
-curl 'http://127.0.0.1:47989/pin?uniqueid=0123456789ABCDEF&pin=1234'   # pre-seed the pin
-moonlight pair <host-ip> --pin 1234                                    # pairs -> "*** PAIRED ***"
+Options: `--app <host:port>` (the RISC Box app), `--fb <WxH>` (its framebuffer
+size, default 800x600), `--codec <name>` (default `h264_nvenc`), `--state <dir>`
+(server identity and paired certs).
+
+Pairing with a real client, with the PIN pre-seeded so it can run unattended:
+
+```
+curl 'http://127.0.0.1:47989/pin?uniqueid=0123456789ABCDEF&pin=1234'
+moonlight pair <host-ip> --pin 1234        # -> *** PAIRED ***
 ```
 
 (The `/pin` endpoint is a headless-test convenience for delivering the PIN that
-Moonlight would normally show in its UI; a real deployment would surface the PIN
-to the operator.)
+Moonlight would normally show in its UI; a real deployment would surface it to
+the operator.)
+
+`vendor/enet/` is Moonlight's ENet fork (MIT, commit `aca8784`), vendored and
+linked so the control channel is wire-compatible by construction rather than by
+reimplementation.
+
+## Architecture
+
+```
+  Moonlight client
+        │  GameStream (pair/HTTPS/RTSP/RTP/ENet)
+        ▼
+   gs-bridge  ──GET /fb.rgb──▶  RISC Box app (wasm32-wasip2)
+        │                              │
+        │  NVENC encode on the GPU     │ emulated RISC-V machine
+        └──POST /hid───────────────────▶ virtio-input HID
+```
+
+Frames are pulled from the app, hardware-encoded, split into access units,
+packetized into RTP shards with parity, and paced onto the wire. Input arrives
+on the encrypted control channel and is translated into the app's `/hid` schema
+— which means mapping Moonlight's **Windows virtual-key codes onto Linux
+keycodes**, and integrating relative mouse motion into an absolute position,
+since the emulated pointer is absolute-only.
+
+## What is not done
+
+- **Production H200 deploy.** The encode is GPU-agnostic NVENC, but placing this
+  service on the fleet GPU node next to the RISC Box CVM is an operational step
+  that needs access to that node.
+- **Audio is silence.** The emulated machine has no sound device; the stream
+  exists so the client's audio path stays healthy.
+- **HEVC/AV1.** DESCRIBE deliberately advertises H.264 only. The codec markers
+  the client greps for are understood, so adding them is mostly encoder work.
+- **Gamepad, touch, and pen** input is parsed and dropped — the emulated HID has
+  no equivalent device.

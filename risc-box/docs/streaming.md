@@ -30,7 +30,7 @@ needs.** A streaming host's defining job on the input side is to inject the
 remote client's mouse/keyboard/gamepad into the session (Sunshine does this via
 uinput/evdev). RISC Box now emulates exactly that hardware.
 
-## Moonlight / GameStream: pairing works; video is the remaining piece
+## Moonlight / GameStream: the host is built and streaming works
 
 Moonlight is a *client* for NVIDIA GameStream; the *host* is what it connects
 to. Rather than cross-compile Sunshine into the emulated guest (CPU-bound, no
@@ -39,15 +39,20 @@ alongside where a GPU is reachable. It speaks GameStream to Moonlight and wires
 in the app's existing pieces: the AV1 `/video` stream (the frame source — modern
 Moonlight supports AV1) and `/hid` (input back).
 
-Status: **discovery + pairing are implemented and verified against a real
-client.** A stock moonlight-qt 6.1.0 discovers the host, completes all four
-phases of the GameStream pairing handshake (both crypto checks pass —
-`hash_ok=true sig_ok=true`), and the host then reports `PairStatus=1`. See
-`gs-bridge/README.md`.
+Status: **the full host is implemented and a real client streams the emulated
+machine.** `gs-bridge` now speaks every stage of the protocol itself — pairing,
+the HTTPS control surface (:47984), the RTSP handshake (:48010), RTP video with
+Reed-Solomon FEC (:47998), the AES-128-GCM ENet control channel (:47999), and
+audio (:48000).
 
-Remaining in `gs-bridge` for a from-scratch host: the HTTPS control port
-(:47984), the RTSP handshake, RTP video packetization with Reed-Solomon FEC, and
-the ENet control channel (mapping input to `/hid`) — the larger protocol work.
+Verified against the real RISC Box app (RISC-V Linux booted under wasmtime,
+serving its actual 800x600 framebuffer): a Moonlight client connected and
+decoded **826 frames including 14 IDR frames** in a 15-second session, ending
+cleanly, with pointer, button, keyboard and scroll input all reaching the guest
+through `/hid`. The client used for that measurement is moonlight-common-c
+itself — the protocol library moonlight-qt links — driven headlessly so decodes
+can be counted; stock moonlight-qt 6.1.0 was used to verify pairing. See
+`gs-bridge/README.md` for the protocol details that turned out to matter.
 
 ## End-to-end streaming: verified with real Sunshine + Moonlight + NVENC
 
