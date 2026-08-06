@@ -1,0 +1,15 @@
+config BR2_PACKAGE_XFCE4_SESSION
+	bool "xfce4-session"
+	select BR2_PACKAGE_LIBXFCE4UI
+	select BR2_PACKAGE_LIBXFCE4UTIL
+	select BR2_PACKAGE_XFCONF
+	select BR2_PACKAGE_LIBWNCK3
+	select BR2_PACKAGE_LIBGTK3
+	select BR2_PACKAGE_LIBGTK3_X11
+	depends on BR2_PACKAGE_XORG7
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  XFCE desktop component: xfce4-session.
+
+	  https://docs.xfce.org/

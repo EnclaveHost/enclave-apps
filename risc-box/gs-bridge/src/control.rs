@@ -15,7 +15,7 @@
 
 use std::os::raw::c_void;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::app::App;
@@ -273,12 +273,63 @@ fn notches_from_high_res(amount: i32) -> i32 {
     }
 }
 
-/// Translate a GameStream input event and inject it into the machine.
-fn handle_input(app: &App, session: &Session, payload: &[u8]) {
-    let Some(event) = input_event_json(session, payload) else { return };
-    let body = format!(r#"{{"events":[{event}]}}"#);
-    if let Err(e) = app.post_json("/hid", &body) {
-        eprintln!("[control] /hid post failed: {e}");
+/// Queue of input events waiting to be handed to the machine.
+///
+/// Driving a desktop produces a flood of pointer motion, and posting each
+/// event on its own connection would spend more time in TCP setup than in the
+/// emulator. The app's /hid takes a batch, so events accumulate here and a
+/// drainer ships them together.
+#[derive(Default)]
+pub struct InputQueue {
+    events: Mutex<Vec<String>>,
+    cv: Condvar,
+}
+
+impl InputQueue {
+    fn push(&self, event: String) {
+        let mut q = self.events.lock().unwrap();
+        // Pointer motion is absolute and idempotent: if a move is already
+        // pending, the newer position supersedes it rather than replaying a
+        // path the guest would only have to redraw twice.
+        if event.contains(r#""t":"move""#) {
+            if let Some(last) = q.last_mut() {
+                if last.contains(r#""t":"move""#) {
+                    *last = event;
+                    self.cv.notify_one();
+                    return;
+                }
+            }
+        }
+        q.push(event);
+        self.cv.notify_one();
+    }
+
+    /// Wait briefly for events and return everything queued.
+    fn drain(&self, wait: Duration) -> Vec<String> {
+        let q = self.events.lock().unwrap();
+        let (mut q, _) = self.cv.wait_timeout_while(q, wait, |q| q.is_empty()).unwrap();
+        std::mem::take(&mut *q)
+    }
+}
+
+/// Ship queued input into the machine until the session ends.
+fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
+    while !session.is_stopping() {
+        let batch = queue.drain(Duration::from_millis(50));
+        if batch.is_empty() {
+            continue;
+        }
+        let body = format!(r#"{{"events":[{}]}}"#, batch.join(","));
+        if let Err(e) = app.post_json("/hid", &body) {
+            eprintln!("[control] /hid post failed: {e}");
+        }
+    }
+}
+
+/// Translate a GameStream input event and queue it for the machine.
+fn handle_input(queue: &InputQueue, session: &Session, payload: &[u8]) {
+    if let Some(event) = input_event_json(session, payload) {
+        queue.push(event);
     }
 }
 
@@ -304,6 +355,13 @@ pub fn run(session: Arc<Session>, app: Arc<App>, on_running: impl Fn()) {
         return;
     }
     eprintln!("[control] ENet listening on :{}", crate::session::PORT_CONTROL);
+
+    // Input is queued here and shipped in batches; see InputQueue.
+    let queue = Arc::new(InputQueue::default());
+    {
+        let (s, a, q) = (session.clone(), app.clone(), queue.clone());
+        std::thread::spawn(move || input_drainer(s, a, q));
+    }
 
     let mut peer: *mut c_void = std::ptr::null_mut();
     let mut ping_deadline = Instant::now() + Duration::from_secs(30);
@@ -365,7 +423,7 @@ pub fn run(session: Arc<Session>, app: Arc<App>, on_running: impl Fn()) {
 
                     match unseal(&session, &data) {
                         Some((msg_type, payload)) => match msg_type {
-                            CTRL_INPUT_DATA => handle_input(&app, &session, &payload),
+                            CTRL_INPUT_DATA => handle_input(&queue, &session, &payload),
                             CTRL_REQUEST_IDR => {
                                 eprintln!("[control] IDR requested");
                                 session.request_idr();

@@ -1,0 +1,19 @@
+menu "RISC Box guest packages"
+
+# XFCE is not carried by Buildroot (checked through master), so the
+# desktop it needs lives here. Ordered by dependency depth so the
+# menu reads the way the build runs.
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/libwnck3/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/libxfce4util/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/xfconf/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/libxfce4ui/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/garcon/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/exo/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/xfwm4/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/xfce4-panel/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/xfdesktop/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/xfce4-session/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/xfce4-settings/Config.in"
+source "$BR2_EXTERNAL_RISCBOX_PATH/package/thunar/Config.in"
+
+endmenu

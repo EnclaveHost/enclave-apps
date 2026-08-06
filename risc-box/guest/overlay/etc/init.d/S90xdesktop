@@ -5,5 +5,7 @@ case "$1" in
 		[ -e /dev/fb0 ] || exit 0
 		/usr/bin/xdesktop.sh > /var/log/xdesktop.log 2>&1 &
 		;;
-	stop) killall spincube twm X 2>/dev/null ;;
+	# Either session may be the one running (see xdesktop.sh), so stop both.
+	stop) killall xfce4-session xfdesktop xfce4-panel xfwm4 xfsettingsd \
+		xfconfd spincube twm X 2>/dev/null ;;
 esac

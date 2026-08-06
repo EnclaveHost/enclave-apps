@@ -1,0 +1,2 @@
+name: RISCBOX
+desc: RISC Box guest packages (XFCE desktop, not carried by Buildroot)

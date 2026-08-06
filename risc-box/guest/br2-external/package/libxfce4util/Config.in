@@ -1,0 +1,10 @@
+config BR2_PACKAGE_LIBXFCE4UTIL
+	bool "libxfce4util"
+	select BR2_PACKAGE_LIBGLIB2
+	depends on BR2_PACKAGE_XORG7
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  XFCE desktop component: libxfce4util.
+
+	  https://docs.xfce.org/
