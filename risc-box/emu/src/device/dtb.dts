@@ -37,14 +37,18 @@
 		             e2 91 0c 7f 38 ca 46 19 d3 84 5b a8 2f 6e c1 90
 		             13 77 bd 40 e9 52 8c 21 fa 65 3d 9e 08 b7 4a d6 ];
 
-		// risc-box patch: the guest's display. 800*600*4 = 0x1d4c00 bytes at
-		// the top of the 128 MiB DRAM (0x87e00000..0x88000000 reserved below).
+		// risc-box patch: the guest's display. 1024*768*4 = 0x300000 bytes at
+		// 0x87e00000 (0x87e00000..0x88200000 reserved below). The geometry
+		// lives here and nowhere in the guest, so a resolution change needs
+		// no guest rebuild: the kernel's simple-framebuffer reads it from
+		// this node. It must stay in step with display.rs's FB_W/FB_H, which
+		// is what the app scans out.
 		framebuffer@87e00000 {
 			compatible = "simple-framebuffer";
-			reg = <0x00 0x87e00000 0x00 0x1d4c00>;
-			width = <0x320>;
-			height = <0x258>;
-			stride = <0xc80>;
+			reg = <0x00 0x87e00000 0x00 0x300000>;
+			width = <0x400>;
+			height = <0x300>;
+			stride = <0x1000>;
 			format = "x8r8g8b8";
 			status = "okay";
 		};
@@ -57,7 +61,7 @@
 
 		// risc-box patch: keep the allocator off the framebuffer pages
 		framebuffer@87e00000 {
-			reg = <0x00 0x87e00000 0x00 0x200000>;
+			reg = <0x00 0x87e00000 0x00 0x400000>;
 			no-map;
 		};
 	};

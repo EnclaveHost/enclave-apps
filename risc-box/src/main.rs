@@ -624,7 +624,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             }
             _ => server.respond(key, json(409, "Conflict", err("machine is not running"))),
         },
-        // Raw framebuffer (packed RGB, 800x600, no header) — the frame source
+        // Raw framebuffer (packed RGB, FB_W x FB_H, no header) — the frame source
         // for a HARDWARE encoder. The wasm app can't call NVENC, so the native
         // GPU bridge (gs-bridge) pulls raw frames here and NVENC-encodes them
         // on the GPU (the H200 on the fleet; a dev GPU locally). This is the

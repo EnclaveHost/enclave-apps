@@ -1,7 +1,7 @@
 //! The machine's display, scanned out of guest RAM to the browser.
 //!
 //! The emulator's default device tree declares a `simple-framebuffer`:
-//! 800x600, 32-bit XRGB, in the top 2 MiB of the guest's 128 MiB DRAM
+//! 1024x768, 32-bit XRGB, in a 4 MiB reserved window of the guest DRAM
 //! (0x87e00000). A guest kernel with CONFIG_FB_SIMPLE drives it as /dev/fb0
 //! (fbcon, fbdev Xorg, Wayland via wlroots' fbdev — anything); a kernel
 //! without it ignores the node and the serial console remains the only view.
@@ -28,8 +28,8 @@
 use riscv_emu_rust::Emulator;
 
 pub const FB_BASE: u64 = 0x87e0_0000;
-pub const FB_W: usize = 800;
-pub const FB_H: usize = 600;
+pub const FB_W: usize = 1024;
+pub const FB_H: usize = 768;
 pub const FB_STRIDE: usize = FB_W * 4;
 pub const FB_BYTES: usize = FB_STRIDE * FB_H;
 /// Scan cadence while watched: 10 fps of DIFFS is generous against a ~29 MIPS
