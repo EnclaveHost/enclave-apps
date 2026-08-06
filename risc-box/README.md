@@ -351,6 +351,21 @@ the XFCE image, booting to a login prompt:
 | **16 (shipping)** | **1233M** | **47.8** |
 | 32 | 1229M | 50.8 |
 
+Those are native numbers. **The build that ships is wasm, and it gains less**:
+measured under wasmtime against the same image, on the same host, one instance
+at a time, sampling instantaneous instret rate rather than `/status` MIPS (that
+figure divides by time since start, so the blocking image fetch dilutes it):
+
+| build | MIPS (two runs) |
+|---|---|
+| before | 17.2, 17.2 |
+| after | 23.0, 22.5 |
+
+**1.3x, not 1.6x.** The saving is a fixed cost per instruction, and wasm makes
+the *useful* work of an instruction more expensive, so the same saving is a
+smaller share of a bigger total. Quote the wasm number when talking about what
+a deployment will feel.
+
 Guest work is flat across the whole sweep, so the speedup is real rather than
 borrowed from somewhere else. **16 is deliberate, not the fastest number in the
 table**: the UART drains its transmit register on a 16-cycle cadence of its
