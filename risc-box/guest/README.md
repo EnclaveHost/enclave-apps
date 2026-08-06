@@ -27,15 +27,19 @@ finishing its startup and parking in WFI, and it is unambiguous in a way that
 
 | | XFCE | matchbox |
 |---|---|---|
-| X server up | — | 1.6G |
-| panel painted | — | 4.9G |
-| **guest settles idle** | **~22G** | **~4.9G** |
+| X server up | 1.7G | 1.6G |
+| **guest settles idle** | **~13.7G** | **~4.9G** |
 | installed tree | 163 MiB | 72 MiB |
 | gzipped image | 53 MiB | 24.6 MiB |
 
-**About 4.5x fewer instructions**, and less than half the image. At the ~21 MIPS
+**About 2.8x fewer instructions**, and less than half the image. At the ~21 MIPS
 a deployment gets, that is roughly four minutes to a usable desktop instead of
-seventeen.
+eleven.
+
+Both figures are *after* the prebuilt fontconfig cache (see post-build.sh),
+which is worth about 1.5x on its own to either desktop — XFCE settled at ~22G
+without it and matchbox at ~7.2G. Font scanning was a larger share of desktop
+startup here than anything specific to the toolkit.
 
 The difference is structural rather than tuning. XFCE is GTK3, which
 hard-depends on an OpenGL provider (so Mesa comes too) and wants an icon theme
