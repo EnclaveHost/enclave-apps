@@ -1,0 +1,13 @@
+config BR2_PACKAGE_LIBXFCE4UI
+	bool "libxfce4ui"
+	select BR2_PACKAGE_LIBXFCE4UTIL
+	select BR2_PACKAGE_XFCONF
+	select BR2_PACKAGE_LIBGTK3
+	select BR2_PACKAGE_LIBGTK3_X11
+	depends on BR2_PACKAGE_XORG7
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  XFCE desktop component: libxfce4ui.
+
+	  https://docs.xfce.org/

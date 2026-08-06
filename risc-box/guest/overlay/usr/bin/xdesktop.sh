@@ -1,6 +1,10 @@
 #!/bin/sh
-# The RISC Box desktop: Xorg on /dev/fb0, twm, and the spincube demo.
+# The RISC Box desktop: Xorg on /dev/fb0, then a session on top of it.
 # Started by S90xdesktop when the kernel has a framebuffer.
+#
+# Two sessions are supported. If the image carries XFCE that is what runs;
+# otherwise it falls back to twm plus the spincube demo, which is what the
+# minimal image ships. Both paths share the X startup below.
 #
 # LD_PRELOAD note: xf86-video-fbdev's fbdev_drv.so has undefined symbols that
 # live in helper modules — the fbdevHW* family in libfbdevhw.so and the
@@ -10,6 +14,7 @@
 # puts them there and the driver resolves. (xorg.conf also Loads them as
 # belt-and-suspenders.)
 export DISPLAY=:0
+export HOME=/root
 XMOD=/usr/lib/xorg/modules
 PRELOAD="$XMOD/libfbdevhw.so $XMOD/libshadow.so"
 
@@ -34,12 +39,31 @@ until start_x; do
     pkill X 2>/dev/null; sleep 10
 done
 
-twm &
+# Something must own the root window before a session starts, or the first
+# repaint is whatever the framebuffer happened to contain.
 xsetroot -solid "#204060" 2>/dev/null
 
-# the spinning cube; if it ever exits, pause before relaunch so a crash loop
-# can't starve the emulated CPU
-while :; do
-    /usr/bin/spincube
-    sleep 5
-done
+if [ -x /usr/bin/xfce4-session ]; then
+    # XFCE reaches xfconfd and the session manager over a session bus, so one
+    # has to exist. dbus-run-session creates it, runs the session under it,
+    # and tears it down when the session exits.
+    #
+    # On expectations: this is a full GTK3 desktop on an emulated CPU in the
+    # tens of MIPS. Startup is minutes rather than seconds, and that time is
+    # real work (icon cache, fontconfig, gsettings), not a hang.
+    echo "xdesktop: starting XFCE session" >&2
+    while :; do
+        dbus-run-session -- /usr/bin/xfce4-session
+        echo "xdesktop: XFCE session exited, restarting in 5s" >&2
+        sleep 5
+    done
+else
+    echo "xdesktop: no XFCE in this image, using twm + spincube" >&2
+    twm &
+    # the spinning cube; if it ever exits, pause before relaunch so a crash
+    # loop can't starve the emulated CPU
+    while :; do
+        /usr/bin/spincube
+        sleep 5
+    done
+fi

@@ -1,0 +1,15 @@
+config BR2_PACKAGE_LIBWNCK3
+	bool "libwnck3"
+	select BR2_PACKAGE_LIBGTK3
+	select BR2_PACKAGE_LIBGTK3_X11
+	select BR2_PACKAGE_LIBGLIB2
+	select BR2_PACKAGE_XLIB_LIBXRES
+	depends on BR2_PACKAGE_XORG7
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  Window Navigator Construction Kit: the library window managers
+	  and taskbars use to enumerate and control windows. xfwm4 and
+	  xfce4-panel both need it.
+
+	  https://gitlab.gnome.org/GNOME/libwnck

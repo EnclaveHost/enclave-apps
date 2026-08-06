@@ -1,0 +1,12 @@
+config BR2_PACKAGE_XFCONF
+	bool "xfconf"
+	select BR2_PACKAGE_LIBXFCE4UTIL
+	select BR2_PACKAGE_DBUS
+	select BR2_PACKAGE_LIBGLIB2
+	depends on BR2_PACKAGE_XORG7
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  XFCE desktop component: xfconf.
+
+	  https://docs.xfce.org/

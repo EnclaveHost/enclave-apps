@@ -1,0 +1,16 @@
+config BR2_PACKAGE_XFCE4_PANEL
+	bool "xfce4-panel"
+	select BR2_PACKAGE_LIBXFCE4UI
+	select BR2_PACKAGE_LIBXFCE4UTIL
+	select BR2_PACKAGE_GARCON
+	select BR2_PACKAGE_EXO
+	select BR2_PACKAGE_LIBWNCK3
+	select BR2_PACKAGE_LIBGTK3
+	select BR2_PACKAGE_LIBGTK3_X11
+	depends on BR2_PACKAGE_XORG7
+	depends on BR2_USE_MMU
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  XFCE desktop component: xfce4-panel.
+
+	  https://docs.xfce.org/
