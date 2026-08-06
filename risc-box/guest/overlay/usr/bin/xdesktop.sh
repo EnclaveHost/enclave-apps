@@ -87,6 +87,11 @@ if [ -x /usr/bin/xfce4-session ]; then
             # asks whether it has.
             sleep 25
             xfce4-panel --disable-wm-check &
+            # Repaint the root once the panel is up. Without xfdesktop nothing
+            # owns the backdrop, and the colour set before the session started
+            # does not survive the session taking the screen — the desktop
+            # would otherwise be a black void with panels floating on it.
+            (sleep 90; xsetroot -solid "#204060" 2>/dev/null) &
             # Keep the session alive as long as the window manager is.
             wait %2
         '
