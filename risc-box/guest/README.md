@@ -35,18 +35,23 @@ icons, file manager, settings — and it is correspondingly heavy. Be clear-eyed
 about the hardware: an emulated RV64GC core in the tens of MIPS, 512 MiB of
 RAM, a software framebuffer, and no GPU.
 
-Measured, so you can decide for yourself: the image boots, X comes up, and
-xfwm4, xfce4-session, xfconfd, xfsettingsd, xfdesktop and xfce4-panel all
-start and stay running. The guest then sits at **0% idle with a load average
-above 7 on a single emulated core** while the panel loads its plugins, and
-first paint takes many minutes. RAM is not the constraint (about 127 MiB of
-482 MiB in use) — CPU is, entirely.
+Measured, so you can decide for yourself. It does work: the image boots, X
+comes up, xfwm4 takes the screen, and the panel paints — Applications menu,
+window buttons, the dock along the bottom. The pointer works, and a Moonlight
+client streams it (1158 frames / 20 IDR in a 25 s session, cursor tracking
+injected input exactly).
 
-So: XFCE runs, and it is a fair demonstration that the machine is a real
-Linux desktop. It is not a desktop you would choose to work in at this
-emulation speed. **The twm image is the one to use** unless you specifically
-want to show XFCE running. Everything that makes XFCE lighter here is already
-applied (see the tuning note below); the remaining cost is GTK3 itself.
+What it costs is time. The guest sits at **0% idle with a load average above
+7 on a single emulated core** through startup, and the panel's first paint
+arrives on the order of ten minutes after boot, not seconds. While that is
+happening the machine is saturated enough that `ssh` cannot complete a banner
+exchange. RAM is not the constraint (about 127 MiB of 482 MiB in use) — CPU
+is, entirely.
+
+So: XFCE genuinely runs and is driveable, and it is a fair demonstration that
+this is a real Linux desktop. It is not what you would pick for interactive
+work. **Use the twm image unless you specifically want XFCE**; it boots in
+seconds and leaves the CPU to whatever you are actually doing.
 
 The guest tuning that makes XFCE bearable is in the overlay and is worth
 keeping if you change things: xfwm4's compositor is off, GTK animations are
