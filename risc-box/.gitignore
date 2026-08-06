@@ -1,1 +1,5 @@
 images/
+# The emulator is a path dependency; the app's lockfile is the one that counts.
+# This one only appears because `--example boot-bench` builds from emu's own
+# manifest.
+emu/Cargo.lock

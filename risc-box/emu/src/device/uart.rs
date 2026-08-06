@@ -10,6 +10,13 @@ const IIR_NO_INTERRUPT: u8 = 0x7;
 const LSR_DATA_AVAILABLE: u8 = 0x1;
 const LSR_THR_EMPTY: u8 = 0x20;
 
+// risc-box patch: did the clock cross a multiple of `period` when it advanced
+// from `previous` to `now`? Replaces `clock % period == 0`, which silently
+// stops firing once the clock advances in steps larger than one.
+fn crossed(previous: u64, now: u64, period: u64) -> bool {
+	(now / period) != (previous / period)
+}
+
 /// Emulates UART. Refer to the [specification](http://www.ti.com/lit/ug/sprugp1/sprugp1.pdf)
 /// for the detail.
 pub struct Uart {
@@ -48,13 +55,19 @@ impl Uart {
 
 	/// Runs one cycle. `Uart` gets/puts input/output data via `Terminal`
 	/// at certain timing.
-	pub fn tick(&mut self) {
-		self.clock = self.clock.wrapping_add(1);
+	// risc-box patch: `n` = instructions retired since the last service. The
+	// two cadences below used to test for an exact multiple of the clock,
+	// which only holds while the clock advances one at a time; the clock now
+	// moves in steps (see Cpu::tick), so they test for CROSSING a multiple
+	// instead. Same average cadence, and a step can no longer jump over it.
+	pub fn tick(&mut self, n: u64) {
+		let previous_clock = self.clock;
+		self.clock = self.clock.wrapping_add(n);
 		let mut rx_ip = false;
 
 		// Reads input.
 		// 0x38400 is just an arbitary number @TODO: Fix me
-		if (self.clock % 0x38400) == 0 && self.rbr == 0 {
+		if crossed(previous_clock, self.clock, 0x38400) && self.rbr == 0 {
 			let value = self.terminal.get_input();
 			if value != 0 {
 				self.rbr = value;
@@ -68,7 +81,7 @@ impl Uart {
 
 		// Writes output.
 		// 0x10 is just an arbitary number @TODO: Fix me
-		if (self.clock % 0x10) == 0 && self.thr != 0 {
+		if crossed(previous_clock, self.clock, 0x10) && self.thr != 0 {
 			self.terminal.put_byte(self.thr);
 			self.thr = 0;
 			self.lsr |= LSR_THR_EMPTY;

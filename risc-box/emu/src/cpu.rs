@@ -60,6 +60,13 @@ const CSR_TIME_ADDRESS: u16 = 0xc01;
 const _CSR_INSERT_ADDRESS: u16 = 0xc02;
 const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 
+// risc-box patch: retired instructions between device services (see Cpu::tick).
+// The devices this machine has are a timer, a UART and three virtio queues;
+// none of them need to be looked at 13 million times a second, and looking
+// cost more than the instructions did. 64 keeps timer granularity far finer
+// than the guest's 100 Hz tick while removing 63/64 of the overhead.
+const DEVICE_TICK_INTERVAL: u64 = 16;
+
 const MIP_MEIP: u64 = 0x800;
 pub const MIP_MTIP: u64 = 0x080;
 pub const MIP_MSIP: u64 = 0x008;
@@ -92,7 +99,13 @@ pub struct Cpu {
 	icache_metas: Vec<u64>,
 	icache_words: Vec<u32>,
 	icache_data: Vec<u16>,
-	unsigned_data_mask: u64
+	unsigned_data_mask: u64,
+	// risc-box patch: instructions left before the next device service, and
+	// whether an interrupt check is owed before the next instruction (see
+	// tick). Set DEVICE_TICK_INTERVAL to 1 to get the original per-instruction
+	// behaviour back for a bisect.
+	device_countdown: u64,
+	check_interrupt: bool
 }
 
 #[derive(Clone)]
@@ -257,7 +270,11 @@ impl Cpu {
 			icache_metas: vec![0; ICACHE_ENTRY_NUM],
 			icache_words: vec![0; ICACHE_ENTRY_NUM],
 			icache_data: vec![0; ICACHE_ENTRY_NUM],
-			unsigned_data_mask: 0xffffffffffffffff
+			unsigned_data_mask: 0xffffffffffffffff,
+			// risc-box patch: service devices on the first tick, so a machine
+			// that traps immediately still sees its clint before running far.
+			device_countdown: 1,
+			check_interrupt: true
 		};
 		cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
 		cpu.write_csr_raw(CSR_MISA_ADDRESS, 0x800000008014312f);
@@ -316,8 +333,28 @@ impl Cpu {
 			Ok(()) => {},
 			Err(e) => self.handle_exception(e, instruction_address)
 		}
-		self.mmu.tick(&mut self.csr[CSR_MIP_ADDRESS as usize]);
-		self.handle_interrupt(self.pc);
+		// risc-box patch: devices and interrupt delivery used to run on every
+		// retired instruction — six device ticks (clint, disk, net, input,
+		// uart, plic) plus two CSR reads, for an instruction whose own work is
+		// a tag compare and an indirect call. That overhead dominated the
+		// interpreter. Both now run every DEVICE_TICK_INTERVAL instructions,
+		// with the device clocks advanced by the whole interval so guest time
+		// passes at exactly the old rate, just in coarser steps.
+		//
+		// Interrupt delivery is not purely periodic: any CSR write that can
+		// change what is pending or enabled re-arms the check (see
+		// write_csr_raw), so enabling an already-pending interrupt still takes
+		// effect on the next instruction rather than waiting out the interval.
+		self.device_countdown -= 1;
+		if self.device_countdown == 0 {
+			self.device_countdown = DEVICE_TICK_INTERVAL;
+			self.mmu.tick(DEVICE_TICK_INTERVAL, &mut self.csr[CSR_MIP_ADDRESS as usize]);
+			self.check_interrupt = true;
+		}
+		if self.check_interrupt {
+			self.check_interrupt = false;
+			self.handle_interrupt(self.pc);
+		}
 		self.clock = self.clock.wrapping_add(1);
 
 		// cpu core clock : mtime clock in clint = 8 : 1 is
@@ -822,6 +859,17 @@ impl Cpu {
 	}
 
 	fn write_csr_raw(&mut self, address: u16, value: u64) {
+		// risc-box patch: interrupt delivery is no longer checked after every
+		// instruction (see tick), so a write that changes what is pending,
+		// what is enabled, or where it would be delivered has to re-arm the
+		// check itself. Without this, a guest that unmasks an already-pending
+		// interrupt would not take it until the next device service.
+		match address {
+			CSR_MIP_ADDRESS | CSR_MIE_ADDRESS | CSR_MSTATUS_ADDRESS
+			| CSR_SIP_ADDRESS | CSR_SIE_ADDRESS | CSR_SSTATUS_ADDRESS
+			| CSR_MIDELEG_ADDRESS => self.check_interrupt = true,
+			_ => {}
+		}
 		match address {
 			CSR_FFLAGS_ADDRESS => {
 				self.csr[CSR_FCSR_ADDRESS as usize] &= !0x1f;

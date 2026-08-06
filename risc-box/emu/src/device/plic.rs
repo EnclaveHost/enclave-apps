@@ -51,8 +51,9 @@ impl Plic {
 	/// * `virtio_ip`
 	/// * `uart_ip`
 	/// * `mip`
-	pub fn tick(&mut self, virtio_ip: bool, net_ip: bool, input_ip: bool, uart_ip: bool, mip: &mut u64) {
-		self.clock = self.clock.wrapping_add(1);
+	// risc-box patch: `n` = instructions retired since the last service.
+	pub fn tick(&mut self, n: u64, virtio_ip: bool, net_ip: bool, input_ip: bool, uart_ip: bool, mip: &mut u64) {
+		self.clock = self.clock.wrapping_add(n);
 
 		// Handling interrupts as "Edge-triggered" interrupt so far
 

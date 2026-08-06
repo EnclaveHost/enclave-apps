@@ -25,9 +25,12 @@ impl Clint {
 	///
 	/// # Arguments
 	/// * `mip` CPU `mip` register. It can be updated if interrupt occurs.
-	pub fn tick(&mut self, mip: &mut u64) {
-		self.clock = self.clock.wrapping_add(1);
-		self.mtime = self.mtime.wrapping_add(1);
+	// risc-box patch: `n` instructions have retired since the last call. mtime
+	// advances by exactly that, so the guest's clock keeps the same rate it
+	// had when this ran every instruction — only its granularity changes.
+	pub fn tick(&mut self, n: u64, mip: &mut u64) {
+		self.clock = self.clock.wrapping_add(n);
+		self.mtime = self.mtime.wrapping_add(n);
 
 		if (self.msip & 1) != 0 {
 			*mip |= MIP_MSIP;
