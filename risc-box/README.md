@@ -189,6 +189,32 @@ The sample is the OpenSBI + Linux + Buildroot image set from the vendored
 emulator's own resources. Any RISC-V kernel/rootfs that boots on the
 `virt`-style machine works. Build your own with Buildroot and drop them in.
 
+### Gzip your rootfs
+
+**Name the object `.gz` and it is fetched, cached and saved compressed.** Guest
+disks are mostly empty, so this is not a marginal saving: the XFCE image is
+320 MiB raw and 53 MiB gzipped, a 6.3x cut.
+
+```sh
+gzip -6 rootfs.ext2                       # -> rootfs.ext2.gz
+scripts/seed-machine.py put … ./rootfs.ext2.gz xfce/rootfs.ext2.gz
+#   "fs": "xfce/rootfs.ext2.gz"
+```
+
+It buys two different things. The fetch **blocks the event loop** — the
+machine, the console and every other client wait on it — so six times less to
+download is six times less of the boot spent stalled. And the fetched bytes are
+held for the lifetime of the app so a restart need not re-download; cached
+compressed, that copy costs 53 MiB instead of 320 MiB, beside a running machine
+that already holds the expanded disk plus its DRAM. On a 2 GiB deployment that
+headroom is the difference between comfortable and not.
+
+Saving follows the name: `saveKey` falls back to the `fs` key, so a machine
+booted from a `.gz` image writes its disk back as real gzip rather than raw
+bytes under a `.gz` name — which would boot exactly once more and then fail
+forever with "bad magic". The output is ordinary gzip, `gunzip -t`-clean CRC
+and all, so the bucket stays readable with normal tools.
+
 ## Networking and SSH
 
 The guest gets a **virtio-net NIC** (eth0). There is no bridge to a real
