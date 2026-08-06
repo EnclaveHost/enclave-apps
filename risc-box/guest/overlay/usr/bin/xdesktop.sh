@@ -72,6 +72,14 @@ if [ -x /usr/bin/xfce4-session ]; then
     echo "xdesktop: starting XFCE session" >&2
     tries=0
     while [ $tries -lt 3 ]; do
+        # xfdesktop is deliberately not started. Its visible contributions are
+        # the backdrop, desktop icons and the root menu; the backdrop is
+        # already painted above by xsetroot, and the other two are not worth
+        # what they cost here. Left running it paints a black backdrop over
+        # that root colour and then competes with the panel for a CPU that has
+        # none to spare — the observable result was a black screen with an
+        # unpainted panel. Dropping it gives back a visible desktop and lets
+        # the panel reach first paint sooner.
         dbus-run-session -- sh -c '
             xfsettingsd &
             xfwm4 &
@@ -79,7 +87,6 @@ if [ -x /usr/bin/xfce4-session ]; then
             # asks whether it has.
             sleep 25
             xfce4-panel --disable-wm-check &
-            xfdesktop --disable-wm-check &
             # Keep the session alive as long as the window manager is.
             wait %2
         '
