@@ -7,7 +7,7 @@ an ext2 root the emulator attaches as `/dev/vda`):
 | defconfig | what you get | rootfs |
 |---|---|---|
 | `buildroot.config` | Xorg (fbdev) + twm + dropbear + the spincube demo | 96 MiB |
-| `buildroot-xfce.config` | the above plus XFCE 4.18 | 768 MiB |
+| `buildroot-xfce.config` | the above plus XFCE 4.18 | 320 MiB |
 
 ```sh
 guest/build.sh <buildroot-tree> <build-dir>                              # twm
@@ -16,6 +16,13 @@ guest/build.sh <buildroot-tree> <build-dir> guest/buildroot-xfce.config  # XFCE
 
 Both leave `images/fw_payload.elf` and `images/rootfs.ext2` in the build dir.
 Seed them into the deployment's S3 bucket with `scripts/seed-machine.py put`.
+
+**Size the rootfs to its content.** The app holds the whole disk image in its
+wasm32 linear memory alongside the guest's 512 MiB of DRAM. An earlier 768 MiB
+XFCE image tipped that over — the read grew a buffer to 1 GiB, the allocation
+failed, and the module trapped before the machine booted (`memory allocation
+of 1073741824 bytes failed`). The XFCE tree installs to about 143 MiB, so
+320 MiB is generous; treat roughly half a gigabyte as the ceiling.
 
 ## Which one to use
 
