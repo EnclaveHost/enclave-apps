@@ -16,17 +16,31 @@ path lives (see `../docs/encode-path-handoff.md`) — not inside the
 ## Status: streaming works end to end
 
 A real Moonlight client pairs, connects, and **decodes a live H.264 stream of
-the emulated machine**, with input flowing back into the guest. Verified against
-the actual RISC Box app (RISC-V Linux booted under wasmtime from a minio-backed
-S3, serving its real 800x600 framebuffer):
+the emulated machine's desktop**, with input flowing back into the guest.
+Verified against the actual RISC Box app (RISC-V Linux booted under wasmtime
+from a minio-backed S3, running Xorg on its 800x600 framebuffer):
 
 ```
 [client] decoder setup: H.264 1280x720 @ 60 fps
-[client] FIRST FRAME: 972 bytes, type=IDR
-frames_decoded: 826
-idr_frames: 14
+[client] FIRST FRAME: 49356 bytes, type=IDR
+frames_decoded: 867
+idr_frames: 15
 terminated: no (code 0)
 ```
+
+Worth knowing how easy it is to fool yourself here: an earlier run of this
+same test reported 826 frames and a clean teardown while the guest's
+framebuffer was **entirely black** — the sample rootfs boots to a serial
+console and never draws. A blank screen encodes, packetizes and streams
+exactly as well as a desktop does, so frame counts alone prove the transport
+and nothing about the picture. The tell is the frame size: under 1 KB for
+black, ~49 KB once there is a desktop on it. Build the guest from
+`../guest/` if you want something on screen.
+
+Input was confirmed against the running X server rather than assumed: driving
+the pointer to two different positions puts the cursor at each one (pixels
+appear in a previously-black region at the requested spot and vanish when the
+pointer moves away).
 
 The client is **moonlight-common-c** itself — the same protocol library
 moonlight-qt links — driven headlessly so a decode can be counted rather than

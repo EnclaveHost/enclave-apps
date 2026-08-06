@@ -46,13 +46,21 @@ Reed-Solomon FEC (:47998), the AES-128-GCM ENet control channel (:47999), and
 audio (:48000).
 
 Verified against the real RISC Box app (RISC-V Linux booted under wasmtime,
-serving its actual 800x600 framebuffer): a Moonlight client connected and
-decoded **826 frames including 14 IDR frames** in a 15-second session, ending
-cleanly, with pointer, button, keyboard and scroll input all reaching the guest
-through `/hid`. The client used for that measurement is moonlight-common-c
-itself — the protocol library moonlight-qt links — driven headlessly so decodes
-can be counted; stock moonlight-qt 6.1.0 was used to verify pairing. See
+running Xorg on its actual 800x600 framebuffer): a Moonlight client connected
+and decoded **867 frames including 15 IDR frames** in an 18-second session,
+ending cleanly, with pointer, button, keyboard and scroll input all reaching
+the guest through `/hid` — and the X cursor demonstrably tracking the injected
+positions. The client used for that measurement is moonlight-common-c itself —
+the protocol library moonlight-qt links — driven headlessly so decodes can be
+counted; stock moonlight-qt 6.1.0 was used to verify pairing. See
 `gs-bridge/README.md` for the protocol details that turned out to matter.
+
+One caveat that cost a round of false confidence: the same test passes with
+identical-looking numbers when the guest's framebuffer is entirely black,
+which is what the stock sample rootfs produces (it boots to a serial console
+and never draws). Frame counts prove the transport, not the picture. Build a
+guest that actually runs X — `guest/buildroot.config` or the XFCE variant —
+before believing a screenshot exists.
 
 ## End-to-end streaming: verified with real Sunshine + Moonlight + NVENC
 
