@@ -7,12 +7,48 @@ an ext2 root the emulator attaches as `/dev/vda`):
 | defconfig | what you get | rootfs |
 |---|---|---|
 | `buildroot.config` | Xorg (fbdev) + twm + dropbear + the spincube demo | 96 MiB |
+| `buildroot-matchbox.config` | the above plus the matchbox desktop | 128 MiB |
 | `buildroot-xfce.config` | the above plus XFCE 4.18 | 320 MiB |
 
 ```sh
-guest/build.sh <buildroot-tree> <build-dir>                              # twm
-guest/build.sh <buildroot-tree> <build-dir> guest/buildroot-xfce.config  # XFCE
+guest/build.sh <buildroot-tree> <build-dir>                                  # twm
+guest/build.sh <buildroot-tree> <build-dir> guest/buildroot-matchbox.config  # matchbox
+guest/build.sh <buildroot-tree> <build-dir> guest/buildroot-xfce.config      # XFCE
 ```
+
+## What a desktop costs
+
+Measured in **retired guest instructions**, not seconds. Instructions are a
+property of the guest, so they hold still while the emulator underneath gets
+faster and while the host does other things; seconds do neither. The number
+that matters is where the instret curve flattens — that is the desktop
+finishing its startup and parking in WFI, and it is unambiguous in a way that
+"looks painted" is not.
+
+| | XFCE | matchbox |
+|---|---|---|
+| X server up | — | 1.6G |
+| panel painted | — | 4.9G |
+| **guest settles idle** | **~22G** | **~4.9G** |
+| installed tree | 163 MiB | 72 MiB |
+| gzipped image | 53 MiB | 24.6 MiB |
+
+**About 4.5x fewer instructions**, and less than half the image. At the ~21 MIPS
+a deployment gets, that is roughly four minutes to a usable desktop instead of
+seventeen.
+
+The difference is structural rather than tuning. XFCE is GTK3, which
+hard-depends on an OpenGL provider (so Mesa comes too) and wants an icon theme
+— Adwaita is 42 MiB and ~6000 files. Every XFCE process pays GTK3 startup:
+linking an ~8 MiB library, parsing the theme CSS, building icon caches.
+Matchbox's window manager and panel were written for handhelds and depend on
+matchbox-lib, Xext, Xpm, expat and zlib. There is no toolkit, so none of that
+work exists to be optimised away.
+
+Matchbox is a window manager, a panel and xterm — sparse next to XFCE's file
+manager, settings dialogs and applications menu. Pick it when you want a
+desktop that is *there*; pick XFCE when you want one that is *furnished*, and
+budget the seventeen minutes.
 
 Both leave `images/fw_payload.elf` and `images/rootfs.ext2` in the build dir.
 Seed them into the deployment's S3 bucket with `scripts/seed-machine.py put`.
