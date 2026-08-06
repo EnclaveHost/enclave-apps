@@ -48,8 +48,9 @@ fn parse_args() -> Args {
     let mut app_url = "127.0.0.1:8000".to_string();
     let mut codec = "h264_nvenc".to_string();
     let mut state_dir = dirs_state();
-    // The RISC Box guest's simple-framebuffer is 800x600.
-    let mut fb = (800u32, 600u32);
+    // The RISC Box guest's simple-framebuffer, as declared in the emulator's
+    // DTB and mirrored by the app's display::FB_W/FB_H.
+    let mut fb = (1024u32, 768u32);
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -72,7 +73,7 @@ fn parse_args() -> Args {
                 match spec.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))) {
                     Some(v) => fb = v,
                     None => {
-                        eprintln!("--fb expects WxH, e.g. 800x600");
+                        eprintln!("--fb expects WxH, e.g. 1024x768");
                         std::process::exit(2);
                     }
                 }
@@ -83,7 +84,7 @@ fn parse_args() -> Args {
                     "gs-bridge — GameStream host for RISC Box\n\n\
                        --app <host:port>   RISC Box app HTTP endpoint (default 127.0.0.1:8000)\n\
                        --codec <name>      NVENC encoder (default h264_nvenc)\n\
-                       --fb <WxH>          size of the app's /fb.rgb framebuffer (default 800x600)\n\
+                       --fb <WxH>          size of the app's /fb.rgb framebuffer (default 1024x768)\n\
                        --state <dir>       where to keep the server identity and paired certs"
                 );
                 std::process::exit(0);

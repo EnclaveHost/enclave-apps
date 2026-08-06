@@ -18,13 +18,13 @@ path lives (see `../docs/encode-path-handoff.md`) — not inside the
 A real Moonlight client pairs, connects, and **decodes a live H.264 stream of
 the emulated machine's desktop**, with input flowing back into the guest.
 Verified against the actual RISC Box app (RISC-V Linux booted under wasmtime
-from a minio-backed S3, running Xorg on its 800x600 framebuffer):
+from a minio-backed S3, running Xorg on its 1024x768 framebuffer):
 
 ```
 [client] decoder setup: H.264 1280x720 @ 60 fps
-[client] FIRST FRAME: 49356 bytes, type=IDR
-frames_decoded: 867
-idr_frames: 15
+[client] FIRST FRAME: 34236 bytes, type=IDR
+frames_decoded: 485
+idr_frames: 9
 terminated: no (code 0)
 ```
 
@@ -34,7 +34,7 @@ framebuffer was **entirely black** — the sample rootfs boots to a serial
 console and never draws. A blank screen encodes, packetizes and streams
 exactly as well as a desktop does, so frame counts alone prove the transport
 and nothing about the picture. The tell is the frame size: under 1 KB for
-black, ~49 KB once there is a desktop on it. Build the guest from
+black, tens of KB once there is a desktop on it. Build the guest from
 `../guest/` if you want something on screen.
 
 Input was confirmed against the running X server rather than assumed: driving
@@ -98,7 +98,7 @@ cargo build --release
 ```
 
 Options: `--app <host:port>` (the RISC Box app), `--fb <WxH>` (its framebuffer
-size, default 800x600), `--codec <name>` (default `h264_nvenc`), `--state <dir>`
+size, default 1024x768), `--codec <name>` (default `h264_nvenc`), `--state <dir>`
 (server identity and paired certs).
 
 Pairing with a real client, with the PIN pre-seeded so it can run unattended:
