@@ -1,0 +1,19 @@
+# RISC Box fluxbox root menu (right-click the desktop).
+#
+# Shipped rather than left to fluxbox-generate_menu, which shells out to a long
+# chain of probes at first start — minutes of that on an emulated core, to
+# rediscover a package list we already know at build time.
+[begin] (RISC Box)
+    [exec] (Terminal) {xterm -fa DejaVuSansMono -fs 11}
+    [exec] (Terminal (large)) {xterm -fa DejaVuSansMono -fs 16}
+    [submenu] (Display)
+        [exec] (Blue background) {xsetroot -solid "#204060"}
+        [exec] (Grey background) {xsetroot -solid "#303030"}
+    [end]
+    [submenu] (Window manager)
+        [workspaces] (Workspaces)
+        [config] (Configure)
+        [restart] (Restart)
+    [end]
+    [exec] (Reboot machine) {reboot}
+[end]
