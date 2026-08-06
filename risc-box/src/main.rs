@@ -342,6 +342,10 @@ struct App {
     fb_scanned: Option<Instant>, // last display scan (paced by FB_SCAN_MS)
     av1: Option<video::Av1Encoder>, // the /video AV1 stream's encoder (stateful, inter-frame)
     video_scanned: Option<Instant>, // last /video frame (paced)
+    /// Smoothed wall time one AV1 frame costs. The stream is paced off this
+    /// rather than a fixed rate, so encoding can never take most of the thread
+    /// the guest is running on (see the event loop).
+    video_cost: Duration,
     // Boot-fetch retry: an image fetch can fail transiently — the platform's
     // egress front may reject the app's very first connect while the
     // deployment record is still mid-provision, S3 can blip — so a failed
@@ -969,6 +973,7 @@ fn main() {
         fb_scanned: None,
         av1: None,
         video_scanned: None,
+        video_cost: Duration::from_millis(0),
         retry: 0,
         retry_at: None,
         retry_start: None,
@@ -1127,11 +1132,29 @@ fn main() {
                     if app.av1.is_none() {
                         app.av1 = video::Av1Encoder::new(display::FB_W, display::FB_H, 4_000_000, 10);
                     }
+                    // Pace the encoder by what it COSTS, not by the clock.
+                    //
+                    // Encoding AV1 in here is not free work on an idle thread —
+                    // it is the same thread the guest runs on, so every frame
+                    // is emulator time the machine did not get. Measured on a
+                    // pinned workload, a fixed 10 fps cadence took 82% of the
+                    // guest's speed: 36 MIPS with nobody watching, 6.6 MIPS
+                    // with the AV1 stream attached. A desktop that starts in
+                    // four minutes takes twenty while you watch it start.
+                    //
+                    // So: after each frame, wait until at least
+                    // VIDEO_COST_RATIO times as long has been spent NOT
+                    // encoding. The stream slows down on a machine that is
+                    // working hard and speeds up on one that is idle, which is
+                    // the right way round — and the guest keeps the large
+                    // majority of the thread either way.
+                    const VIDEO_COST_RATIO: u32 = 4; // encode ≤ 1/(1+4) of the time
                     let due = app.video_scanned.map_or(true, |t| {
-                        t.elapsed() >= std::time::Duration::from_millis(display::FB_SCAN_MS)
+                        let floor = std::time::Duration::from_millis(display::FB_SCAN_MS);
+                        t.elapsed() >= floor.max(app.video_cost * VIDEO_COST_RATIO)
                     });
                     if due {
-                        app.video_scanned = Some(Instant::now());
+                        let began = Instant::now();
                         let (rgb, w, h) = video::capture_rgb(emu);
                         if let Some(enc) = app.av1.as_mut() {
                             for f in enc.encode(&rgb, w, h) {
@@ -1142,6 +1165,10 @@ fn main() {
                                 busy = true;
                             }
                         }
+                        // What this frame actually cost, smoothed so one slow
+                        // keyframe does not stall the stream for seconds.
+                        app.video_cost = (app.video_cost + began.elapsed()) / 2;
+                        app.video_scanned = Some(Instant::now());
                     }
                 } else if app.av1.is_some() {
                     app.av1 = None;

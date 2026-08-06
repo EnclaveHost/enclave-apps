@@ -120,7 +120,7 @@
   <div class="row">
     <h2>display</h2>
     <span class="stat">simple-framebuffer <span id="dispgeom">—</span> — lights up when the guest kernel drives /dev/fb0 (fbcon, Xorg). Click the canvas, then mouse + keyboard drive the desktop through the virtio-input HID.</span>
-    <label style="margin-left:auto;font-size:12px;white-space:nowrap"><input type="checkbox" id="av1toggle"> AV1 stream (efficient)</label>
+    <label style="margin-left:auto;font-size:12px;white-space:nowrap"><input type="checkbox" id="av1toggle" title="Encodes AV1 inside the enclave, on the same thread that runs the machine. Saves bandwidth, costs the guest a lot of CPU."> AV1 stream (saves bandwidth, slows the machine)</label>
   </div>
   <canvas id="fb" width="800" height="600"
     style="display:block;width:100%;max-width:800px;margin-top:14px;background:#000;border-radius:8px;image-rendering:pixelated"></canvas>
