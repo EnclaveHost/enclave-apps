@@ -54,7 +54,39 @@ run_twm_session() {
     done
 }
 
-if [ -x /usr/bin/xfce4-session ]; then
+run_matchbox_session() {
+    # Matchbox: a desktop environment built for handhelds, which is the same
+    # problem this machine has — a slow CPU, a framebuffer, and no GPU. There
+    # is no toolkit to initialise and no icon theme to index, so unlike XFCE it
+    # reaches first paint without minutes of one-time work.
+    #
+    # Started component by component rather than through matchbox-session for
+    # the same reason XFCE is: the panel and desktop both want a window manager
+    # already owning the screen, and on hardware this slow they will win that
+    # race against the WM and come up unmanaged.
+    echo "xdesktop: starting matchbox session" >&2
+    tries=0
+    while [ $tries -lt 3 ]; do
+        matchbox-window-manager -use_titlebar yes &
+        WM_PID=$!
+        sleep 8
+        [ -x /usr/bin/matchbox-panel ] && matchbox-panel --no-menu &
+        [ -x /usr/bin/matchbox-desktop ] && matchbox-desktop &
+        # Keep the session alive as long as the window manager is.
+        wait $WM_PID
+        tries=$((tries+1))
+        echo "xdesktop: matchbox session exited (attempt $tries), restarting in 10s" >&2
+        pkill matchbox-panel 2>/dev/null
+        pkill matchbox-desktop 2>/dev/null
+        sleep 10
+    done
+    echo "xdesktop: matchbox failed three times, falling back to twm" >&2
+    run_twm_session
+}
+
+if [ -x /usr/bin/matchbox-window-manager ]; then
+    run_matchbox_session
+elif [ -x /usr/bin/xfce4-session ]; then
     # XFCE reaches xfconfd and the session manager over a session bus, so one
     # has to exist. dbus-run-session creates it, runs the session under it,
     # and tears it down when the session exits.
