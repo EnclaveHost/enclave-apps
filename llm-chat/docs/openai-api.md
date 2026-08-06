@@ -46,11 +46,11 @@ default when a request names no model.
   "object": "list",
   "data": [
     {
-      "id": "qwen3.5-122b",
+      "id": "fable-fusion-27b-mtp",
       "object": "model",
       "owned_by": "enclave-deployment",
-      "enclave": { "volume": "qwen3.5-122b-a10b", "backend": "ggml",
-                   "bytes": 61203283968, "default": true }
+      "enclave": { "volume": "fable-fusion-27b-mtp-q4-gguf", "backend": "ggml",
+                   "bytes": 18500000000, "default": true }
     }
   ]
 }
@@ -265,7 +265,7 @@ document with real HTTP status codes.
   "id": "chatcmpl-enclave18c2f4a1b3e",
   "object": "chat.completion",
   "created": 1770000000,
-  "model": "qwen3.5-122b",
+  "model": "fable-fusion-27b-mtp",
   "choices": [{
     "index": 0,
     "message": { "role": "assistant", "content": "<think>\n...\n</think>\n\n..." },
@@ -400,7 +400,7 @@ curl -N https://<id8>.app.enclave.host/v1/chat/completions \
 from openai import OpenAI
 client = OpenAI(base_url="https://<id8>.app.enclave.host/v1", api_key="<key or any string>")
 stream = client.chat.completions.create(
-    model="qwen3.5-122b",              # or omit: largest attached wins
+    model="fable-fusion-27b-mtp",      # or omit: largest attached wins
     messages=[{"role": "user", "content": "What changed in Rust 1.90?"}],
     stream=True,
     extra_body={"web_search": "auto"}, # Enclave extension
