@@ -44,6 +44,7 @@
 
 mod display;
 mod egress;
+mod gz;
 mod httpd;
 mod net;
 mod s3;
@@ -295,8 +296,26 @@ enum Phase {
 
 struct Images {
     kernel: Vec<u8>,
-    fs: Vec<u8>,
+    /// The root filesystem exactly as the bucket serves it — still gzipped
+    /// when the key says so. Keeping the fetched form rather than the expanded
+    /// one is what makes caching it affordable: this is held for the lifetime
+    /// of the app so a restart need not re-download, and beside it the running
+    /// machine already holds a full expanded copy of the same disk plus its
+    /// DRAM. Cached compressed, a 320 MiB image costs 53 MiB here instead.
+    fs_stored: Vec<u8>,
+    fs_gzipped: bool,
     dtb: Option<Vec<u8>>,
+}
+
+impl Images {
+    /// The disk to hand a fresh machine. Expanded per boot rather than held
+    /// expanded, so the cost is paid only while a machine is actually running.
+    fn disk(&self) -> Result<Vec<u8>, String> {
+        match self.fs_gzipped {
+            true => gz::gunzip(&self.fs_stored),
+            false => Ok(self.fs_stored.clone()),
+        }
+    }
 }
 
 struct Start {
@@ -373,9 +392,10 @@ impl App {
             .as_ref()
             .map(|i| {
                 format!(
-                    ",\"kernelBytes\":{},\"fsBytes\":{}",
+                    ",\"kernelBytes\":{},\"fsBytes\":{},\"fsGzipped\":{}",
                     i.kernel.len(),
-                    i.fs.len()
+                    i.fs_stored.len(),
+                    i.fs_gzipped
                 )
             })
             .unwrap_or_default();
@@ -445,9 +465,24 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
-    let fs = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut noop)
+    let fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut noop)
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
-    eprintln!("[risc-box]   fs {} bytes", fs.len());
+    // A `.gz` key is fetched and cached compressed and expanded per boot; see
+    // Images::disk. Verify it inflates now rather than at boot, so a bad object
+    // fails the fetch (which retries) instead of the machine start.
+    let fs_gzipped = gz::is_gzip_key(&cfg.fs);
+    match fs_gzipped {
+        true => {
+            let n = gz::gunzip(&fs_stored)?.len();
+            eprintln!(
+                "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x)",
+                fs_stored.len(),
+                n,
+                n as f64 / fs_stored.len().max(1) as f64
+            );
+        }
+        false => eprintln!("[risc-box]   fs {} bytes", fs_stored.len()),
+    }
     let dtb = match &cfg.dtb {
         Some(k) => Some(
             s3::get_object(&ep, &cfg.bucket, k, creds, &mut noop)
@@ -455,23 +490,23 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
         ),
         None => None,
     };
-    Ok(Images { kernel, fs, dtb })
+    Ok(Images { kernel, fs_stored, fs_gzipped, dtb })
 }
 
-fn boot(images: &Images, net_enabled: bool) -> Emulator {
+fn boot(images: &Images, net_enabled: bool) -> Result<Emulator, String> {
     let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
         input: VecDeque::new(),
         output: VecDeque::new(),
     }));
     emu.setup_program(images.kernel.clone());
-    emu.setup_filesystem(images.fs.clone());
+    emu.setup_filesystem(images.disk()?);
     if let Some(dtb) = &images.dtb {
         emu.setup_dtb(dtb.clone());
     }
     if net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
     }
-    emu
+    Ok(emu)
 }
 
 // ---- request routing -------------------------------------------------------
@@ -766,8 +801,24 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
         Ok(e) => e,
         Err(e) => return server.respond(key, json(500, "Error", err(&e))),
     };
+    // Match the object to the name it is being stored under. saveKey falls
+    // back to the fs key, so a machine booted from a `.gz` image would
+    // otherwise write its disk back raw under a `.gz` name — bootable exactly
+    // once more, then permanently "bad magic".
+    let raw_len = disk.len();
+    let disk = match gz::is_gzip_key(&save_key) {
+        true => gz::gzip(&disk),
+        false => disk,
+    };
     // flush the 202-less response path: PUT blocks the loop, like /start's fetch
-    eprintln!("[risc-box] saving {} bytes to s3://{}/{}", disk.len(), app.cfg.bucket, save_key);
+    match raw_len == disk.len() {
+        true => eprintln!("[risc-box] saving {raw_len} bytes to s3://{}/{save_key}", app.cfg.bucket),
+        false => eprintln!(
+            "[risc-box] saving {raw_len} bytes gzipped to {} to s3://{}/{save_key}",
+            disk.len(),
+            app.cfg.bucket
+        ),
+    }
     match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &disk) {
         Ok(()) => {
             app.last_save = Some(save_key.clone());
@@ -822,7 +873,20 @@ fn do_start(app: &mut App, start: Start) {
         }
     }
     let imgs = app.cache.as_ref().expect("cache present after fetch");
-    app.emu = Some(boot(imgs, app.cfg.net_enabled));
+    // Expanding a gzipped image can fail (corrupt object, or no room for the
+    // expanded disk beside everything else). Treat it exactly like a failed
+    // fetch: report it and leave the machine stopped, rather than unwrapping
+    // and taking the whole app down with it.
+    let emu = match boot(imgs, app.cfg.net_enabled) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[risc-box] start failed: {e}");
+            app.error = Some(e);
+            app.phase = Phase::Error;
+            return;
+        }
+    };
+    app.emu = Some(emu);
     app.instret = 0;
     app.boot_at = Some(Instant::now());
     app.scrollback.clear();
