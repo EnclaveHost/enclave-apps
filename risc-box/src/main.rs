@@ -450,6 +450,27 @@ impl App {
 
 // ---- image fetch + boot ----------------------------------------------------
 
+/// A fetch progress reporter that logs at every 10% of the object.
+///
+/// Image fetches are tens to hundreds of megabytes and they block the event
+/// loop, so from outside the app a slow one is indistinguishable from a hang —
+/// and on a private deployment, where the HTTP surface is not reachable, the
+/// log is the only thing anyone can see. Ten lines per object is enough to
+/// tell "downloading" from "stuck", and few enough to stay out of the way.
+fn progress_logger(what: &str) -> impl FnMut(usize, usize) + '_ {
+    let mut last_decile = 0usize;
+    move |got, total| {
+        if total == 0 {
+            return;
+        }
+        let decile = got * 10 / total;
+        if decile > last_decile {
+            last_decile = decile;
+            eprintln!("[risc-box]   {what}: {}% ({got}/{total} bytes)", decile * 10);
+        }
+    }
+}
+
 fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
     let mut noop = |_: usize, _: usize| {};
@@ -465,7 +486,7 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
-    let fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut noop)
+    let fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
     // A `.gz` key is fetched and cached compressed and expanded per boot; see
     // Images::disk. Verify it inflates now rather than at boot, so a bad object
@@ -960,9 +981,46 @@ fn main() {
         }
     }
 
+    // Periodic health line. The HTTP surface already reports all of this, but
+    // it is not always reachable: a PRIVATE deployment has no public data path,
+    // so its log is the only window into it, and that is exactly when you most
+    // want to know whether the guest is running, wedged, or quietly stopped.
+    // One line a minute is cheap enough to leave on always.
+    const HEARTBEAT: Duration = Duration::from_secs(60);
+    let mut last_heartbeat = Instant::now();
+
     loop {
         for (key, req) in server.poll(MAX_BODY) {
             route(&mut app, &mut server, key, req);
+        }
+
+        if last_heartbeat.elapsed() >= HEARTBEAT {
+            last_heartbeat = Instant::now();
+            let phase = match app.phase {
+                Phase::Idle => "idle",
+                Phase::Running => "running",
+                Phase::Halted => "halted",
+                Phase::Error => "error",
+            };
+            // Guest MIPS is the number worth watching over time: it moves with
+            // what else the loop is doing (scanning the framebuffer, encoding
+            // video), and a fall to zero on a "running" machine is the shape
+            // of a wedged guest.
+            let secs = app.boot_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            let mips = match secs > 0.0 {
+                true => app.instret as f64 / 1e6 / secs,
+                false => 0.0,
+            };
+            let idle = app.emu.as_ref().map_or(false, |e| e.get_cpu().is_idle());
+            eprintln!(
+                "[risc-box] heartbeat: phase={phase} up={secs:.0}s instret={:.2}G mips={mips:.1} \
+                 guest_idle={idle} console={}KiB watchers={}/{}{}",
+                app.instret as f64 / 1e9,
+                app.console_total / 1024,
+                server.sse_count("display"),
+                server.sse_count("video"),
+                app.error.as_deref().map(|e| format!(" error={e}")).unwrap_or_default(),
+            );
         }
 
         // Get responses (the 202 for /start, errors, etc.) onto the wire
