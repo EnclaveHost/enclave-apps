@@ -93,9 +93,13 @@ fn describe_body() -> String {
     let mut ss = String::new();
     // Feature flags: no pen/touch capability to report.
     ss.push_str("a=x-ss-general.featureFlags:0\n");
-    // Control-stream encryption v2 is the modern path and costs little; video
-    // and audio stay in the clear.
-    ss.push_str(&format!("a=x-ss-general.encryptionSupported:{}\n", SS_ENC_CONTROL_V2));
+    // Control-stream encryption v2 is the modern path and costs little, so it
+    // is both supported and requested. Video encryption is offered but not
+    // demanded: on a trusted link it is wasted CPU on an already CPU-bound
+    // box, and on a public address the client should be the one insisting.
+    // A client that asks for it (ENCFLG_VIDEO) gets it.
+    let supported = SS_ENC_CONTROL_V2 | crate::session::SS_ENC_VIDEO;
+    ss.push_str(&format!("a=x-ss-general.encryptionSupported:{supported}\n"));
     ss.push_str(&format!("a=x-ss-general.encryptionRequested:{}\n", SS_ENC_CONTROL_V2));
     // Stereo Opus, the only layout we generate.
     ss.push_str("a=fmtp:97 surround-params=21101\n");

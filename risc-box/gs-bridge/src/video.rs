@@ -49,6 +49,11 @@ const FLAG_EXTENSION: u8 = 0x10;
 /// Percentage of parity shards to generate. Sunshine's default is 20.
 const FEC_PERCENTAGE: usize = 20;
 
+/// sizeof(ENC_VIDEO_HEADER): iv[12] + frameNumber u32 + tag[16]. Prefixed to
+/// each shard when video encryption is negotiated. Deliberately a multiple of
+/// 16 so the FEC block size stays one too (moonlight-common-c Video.h:12-19).
+const ENC_VIDEO_HEADER: usize = 32;
+
 pub struct Encoder {
     child: Child,
 }
@@ -306,6 +311,7 @@ fn send_frame(
     packet_size: usize,
     min_required_fec_packets: usize,
     is_idr: bool,
+    cipher: Option<(&[u8], &std::sync::atomic::AtomicU64)>,
 ) -> std::io::Result<()> {
     let blocksize = packet_size + MAX_RTP_HEADER_SIZE;
     let payload_blocksize = blocksize - VIDEO_PACKET_HEADER;
@@ -430,6 +436,28 @@ fn send_frame(
             shard[4..8].copy_from_slice(&timestamp.to_be_bytes());
             shard[8..12].copy_from_slice(&0u32.to_be_bytes()); // ssrc
 
+            // Encrypt the finished shard, if the client negotiated it. Each
+            // shard gets its own IV built the NIST SP 800-38D deterministic
+            // way: a 64-bit counter in the low bytes and a fixed 'V' marking
+            // this as the video stream, so the counter can never collide with
+            // the control channel's use of the same key.
+            if let Some((key, counter)) = cipher {
+                let n = counter.fetch_add(1, Ordering::Relaxed);
+                let mut iv = [0u8; 12];
+                iv[0..8].copy_from_slice(&n.to_le_bytes());
+                iv[11] = b'V';
+
+                let (tag, ciphertext) = crate::crypto::gcm_encrypt(key, &iv, shard);
+
+                let mut packet = Vec::with_capacity(ENC_VIDEO_HEADER + ciphertext.len());
+                packet.extend_from_slice(&iv);
+                packet.extend_from_slice(&frame_index.to_le_bytes());
+                packet.extend_from_slice(&tag);
+                packet.extend_from_slice(&ciphertext);
+                sock.send_to(&packet, peer)?;
+                continue;
+            }
+
             if x == 0 && std::env::var_os("GSB_DUMP_SHARD").is_some() {
                 let head: Vec<String> = shard[..48.min(shard.len())]
                     .iter()
@@ -497,6 +525,9 @@ pub fn run(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>, codec: St
     let mut frame_index: u32 = 0;
     let mut lowseq: u16 = 0;
     let epoch = Instant::now();
+    // One IV counter for the whole video stream; never reset, so no two
+    // shards are ever encrypted under the same key and nonce.
+    let video_iv_counter = std::sync::atomic::AtomicU64::new(0);
 
     while !session.is_stopping() {
         let n = match stdout.read(&mut read_buf) {
@@ -532,6 +563,11 @@ pub fn run(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>, codec: St
             }
 
             let cfg = session.config.lock().unwrap().clone();
+            let cipher = if cfg.encryption_flags & crate::session::SS_ENC_VIDEO != 0 {
+                Some((session.key.as_slice(), &video_iv_counter))
+            } else {
+                None
+            };
             if let Err(e) = send_frame(
                 &sock,
                 peer,
@@ -542,6 +578,7 @@ pub fn run(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>, codec: St
                 cfg.packet_size,
                 cfg.min_required_fec_packets,
                 is_idr,
+                cipher,
             ) {
                 eprintln!("[video] send failed: {e}");
                 break;
