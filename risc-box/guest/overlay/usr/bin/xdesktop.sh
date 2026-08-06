@@ -96,7 +96,47 @@ run_matchbox_session() {
     run_twm_session
 }
 
-if [ -x /usr/bin/matchbox-window-manager ]; then
+run_fluxbox_session() {
+    # fluxbox carries the launcher and the taskbar in the same binary as the
+    # window manager: right-click the root for the menu, and the toolbar lists
+    # windows and workspaces. That matters more than it sounds — matchbox is
+    # lighter, but its launcher is a separate binary that crashes here, which
+    # leaves a session you cannot start anything from.
+    echo "xdesktop: starting fluxbox session" >&2
+    # Point fluxbox at the menu the image ships. Generating one at first start
+    # probes the filesystem for minutes at emulated speed to rediscover a
+    # package list that was known at build time.
+    mkdir -p /root/.fluxbox
+    : > /root/.fluxbox/init
+    # Point at our menu only if it is really there. fluxbox ships a usable
+    # default at /usr/share/fluxbox/menu, and naming a menuFile that does not
+    # exist produces an EMPTY right-click menu — a desktop you cannot launch
+    # anything from, which is exactly the failure this session is fixing.
+    if [ -f /etc/fluxbox/menu ]; then
+        cp /etc/fluxbox/menu /root/.fluxbox/menu
+        echo "session.menuFile: /root/.fluxbox/menu" >> /root/.fluxbox/init
+    else
+        echo "xdesktop: no /etc/fluxbox/menu; using fluxbox's default menu" >&2
+    fi
+    echo "session.screen0.toolbar.visible: true" >> /root/.fluxbox/init
+    # Rendering every window move/resize live means a full-screen software
+    # repaint per motion event, which this machine cannot afford.
+    echo "session.screen0.opaqueMove: false" >> /root/.fluxbox/init
+    echo "session.screen0.fullMaximization: true" >> /root/.fluxbox/init
+    tries=0
+    while [ $tries -lt 3 ]; do
+        fluxbox
+        tries=$((tries+1))
+        echo "xdesktop: fluxbox exited (attempt $tries), restarting in 10s" >&2
+        sleep 10
+    done
+    echo "xdesktop: fluxbox failed three times, falling back to twm" >&2
+    run_twm_session
+}
+
+if [ -x /usr/bin/fluxbox ]; then
+    run_fluxbox_session
+elif [ -x /usr/bin/matchbox-window-manager ]; then
     run_matchbox_session
 elif [ -x /usr/bin/xfce4-session ]; then
     # XFCE reaches xfconfd and the session manager over a session bus, so one
