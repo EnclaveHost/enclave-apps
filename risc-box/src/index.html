@@ -119,7 +119,7 @@
 <div class="card" id="dispcard" style="display:none">
   <div class="row">
     <h2>display</h2>
-    <span class="stat">simple-framebuffer <span id="dispgeom">—</span> — lights up when the guest kernel drives /dev/fb0 (fbcon, Xorg). Click the canvas, then mouse + keyboard drive the desktop through the virtio-input HID.</span>
+    <span class="stat">simple-framebuffer <span id="dispgeom">—</span> — lights up when the guest kernel drives /dev/fb0 (fbcon, Xorg). Mouse and keyboard drive the desktop through the virtio-input HID. <b id="ptrhint">click the screen to capture the pointer</b></span>
     <label style="margin-left:auto;font-size:12px;white-space:nowrap"><input type="checkbox" id="av1toggle" title="Encodes AV1 inside the enclave, on the same thread that runs the machine. Saves bandwidth, costs the guest a lot of CPU."> AV1 stream (saves bandwidth, slows the machine)</label>
   </div>
   <canvas id="fb" width="800" height="600"
@@ -302,19 +302,60 @@ function normXY(e) {
   return { x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
            y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
 }
-let lastMove = 0;
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+// Pointer capture. Click the canvas and the cursor is locked to it: no host
+// pointer drifting off over the page mid-drag, no two cursors on screen, and
+// the guest's own pointer becomes the only one. Esc gives it back (the browser
+// enforces that; it cannot be suppressed).
+//
+// The guest's virtio-input is an ABSOLUTE device, but a locked pointer reports
+// only relative movement — so while captured we integrate those deltas into a
+// virtual position and keep sending absolute coordinates. `ptrX/ptrY` hold that
+// position and are kept in step in BOTH modes, so capturing does not teleport
+// the guest cursor and a click always lands where the pointer already is.
+let ptrX = 0.5, ptrY = 0.5;
+const isLocked = () => document.pointerLockElement === fbEl;
+
+fbEl.addEventListener("click", () => {
+  if (running && !isLocked() && fbEl.requestPointerLock) fbEl.requestPointerLock();
+});
+document.addEventListener("pointerlockchange", () => {
+  // Hide the host cursor while captured; the guest draws its own.
+  fbEl.style.cursor = isLocked() ? "none" : "";
+  const h = $("ptrhint");
+  if (h) h.textContent = isLocked() ? "pointer captured — Esc to release"
+                                    : "click the screen to capture the pointer";
+});
+
+let lastMove = 0, trailing = null;
 fbEl.addEventListener("mousemove", (e) => {
+  if (isLocked()) {
+    // Scale by the canvas's on-screen size so capture feels 1:1 with the
+    // uncaptured mapping, whatever the page has scaled the canvas to.
+    const r = fbEl.getBoundingClientRect();
+    ptrX = clamp01(ptrX + e.movementX / r.width);
+    ptrY = clamp01(ptrY + e.movementY / r.height);
+  } else {
+    const p = normXY(e);
+    ptrX = p.x; ptrY = p.y;
+  }
+  // Coalesce the SEND, never the accumulation. Dropping an absolute position
+  // is free — the next one is still true — but dropping a relative delta loses
+  // that movement for good, and a captured pointer would drift away from the
+  // real one and never come back.
   const now = Date.now();
-  if (now - lastMove < 40) return; // coalesce
+  clearTimeout(trailing);
+  trailing = setTimeout(() => sendHid([{ t: "move", x: ptrX, y: ptrY }]), 50);
+  if (now - lastMove < 40) return;
   lastMove = now;
-  const p = normXY(e);
-  sendHid([{ t: "move", x: p.x, y: p.y }]);
+  sendHid([{ t: "move", x: ptrX, y: ptrY }]);
 });
 const BTN = { 0: "left", 1: "middle", 2: "right" };
 fbEl.addEventListener("mousedown", (e) => {
   e.preventDefault(); fbEl.focus();
-  const p = normXY(e);
-  sendHid([{ t: "move", x: p.x, y: p.y }, { t: "button", b: BTN[e.button] || "left", down: true }]);
+  // ptrX/ptrY, not the event: while captured clientX/clientY are meaningless.
+  sendHid([{ t: "move", x: ptrX, y: ptrY }, { t: "button", b: BTN[e.button] || "left", down: true }]);
 });
 fbEl.addEventListener("mouseup", (e) => {
   e.preventDefault();
