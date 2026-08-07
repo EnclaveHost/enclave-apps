@@ -208,6 +208,9 @@
   #storeToggle[aria-checked="true"] .sw .knob { left: 16px; }
   .side-note { display: flex; gap: 10px; align-items: flex-start; padding: 0 8px; }
   .side-note svg { color: var(--ok); margin-top: 1px; flex: none; }
+  .side-legal { display: flex; gap: 6px; padding: 0 8px; font-size: 11.5px; color: var(--text-3); }
+  .side-legal a { color: inherit; text-decoration: none; }
+  .side-legal a:hover { color: var(--text-2); text-decoration: underline; }
 
   #backdrop {
     display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 25;
@@ -986,6 +989,14 @@
       <div class="side-note">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
         <span>Confidential inference: runs sandboxed via wasi-nn; chat history never leaves this device.</span>
+      </div>
+      <!-- base-relative like every other link, so the pair follows a proxy
+           prefix; a new tab, because the chat page holds unsaved state when
+           "Remember on this device" is off -->
+      <div class="side-legal">
+        <a href="privacy" target="_blank" rel="noopener">Privacy</a>
+        <span aria-hidden="true">&middot;</span>
+        <a href="terms" target="_blank" rel="noopener">Terms</a>
       </div>
     </div>
   </div>
