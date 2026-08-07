@@ -7481,7 +7481,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                 let body = serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "busy": true,
-                    "note": "another chat holds the inference session right now; the model is loaded and serving",
+                    "note": "another chat holds the inference session right now; retry shortly",
                 });
                 respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
             }
@@ -7534,8 +7534,11 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                     "ok": true, "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
                 }));
             }
-            // busy = an active chat holds the session slot; the model is
-            // loaded and serving, which is exactly what "warm" means here
+            // busy = an active chat holds the session slot, which NORMALLY
+            // means loaded and serving - but a wedged engine looks identical
+            // from here (the 2026-08-07 outage), so the note must not swear
+            // to more than the busy marker proves. The host-side nn watchdog
+            // bounds how long the wedged case can last.
             Err(err) if err.contains(BUSY_MARKER) => {
                 default = Some(e.cfg.name.clone());
                 ladder.push(serde_json::json!({
