@@ -39,8 +39,9 @@ pub struct PairState {
     x509: X509,
     pkey: PKey<Private>,
     sessions: Mutex<HashMap<String, PairSession>>,
-    /// PEM of every client we have completed pairing with.
-    paired: Mutex<Vec<Vec<u8>>>,
+    /// Every client we have completed pairing with, keyed by the uniqueid it
+    /// paired under, so one client can be unpaired without disturbing the rest.
+    paired: Mutex<HashMap<String, Vec<u8>>>,
     state_dir: PathBuf,
 }
 
@@ -108,12 +109,20 @@ impl PairState {
             _ => Self::generate(&cert_path, &key_path),
         };
 
-        let mut paired = Vec::new();
+        let mut paired = HashMap::new();
         let paired_dir = state_dir.join("paired");
         if let Ok(entries) = std::fs::read_dir(&paired_dir) {
             for e in entries.flatten() {
-                if let Ok(pem) = std::fs::read(e.path()) {
-                    paired.push(pem);
+                let path = e.path();
+                // The file stem is the uniqueid it paired under. Older state
+                // named files after a hash of the certificate; those still
+                // load and still authorize, they just cannot be unpaired
+                // individually, which is no worse than before.
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+                    continue;
+                };
+                if let Ok(pem) = std::fs::read(&path) {
+                    paired.insert(id, pem);
                 }
             }
         }
@@ -168,7 +177,7 @@ impl PairState {
     /// so it is exact.
     pub fn is_paired_cert(&self, cert: &X509) -> bool {
         let Ok(der) = cert.to_der() else { return false };
-        self.paired.lock().unwrap().iter().any(|pem| {
+        self.paired.lock().unwrap().values().any(|pem| {
             X509::from_pem(pem)
                 .and_then(|c| c.to_der())
                 .map(|d| d == der)
@@ -176,21 +185,52 @@ impl PairState {
         })
     }
 
-    fn remember(&self, cert: &X509) {
+    fn remember(&self, id: &str, cert: &X509) {
         let Ok(pem) = cert.to_pem() else { return };
-        if self.is_paired_cert(cert) {
-            return;
-        }
+        let key = safe_id(id);
         let dir = self.state_dir.join("paired");
         let _ = std::fs::create_dir_all(&dir);
-        let name = hex(&sha256(&pem)[..8]);
-        let _ = std::fs::write(dir.join(format!("{name}.pem")), &pem);
-        self.paired.lock().unwrap().push(pem);
-        eprintln!("[pair] stored client certificate {name}");
+        match std::fs::write(dir.join(format!("{key}.pem")), &pem) {
+            Ok(()) => {}
+            // Worth saying out loud: a pairing that lives only in memory works
+            // until the bridge restarts and then silently stops working.
+            Err(e) => eprintln!("[pair] WARNING could not persist pairing for {key}: {e}"),
+        }
+        self.paired.lock().unwrap().insert(key.clone(), pem);
+        eprintln!("[pair] stored client certificate for {key}");
     }
+}
+
+/// A uniqueid is client-supplied and is used as a FILENAME, so it has to be
+/// reduced to something that cannot escape the directory or surprise the
+/// filesystem. Everything outside [A-Za-z0-9] goes, and the result is bounded.
+fn safe_id(id: &str) -> String {
+    let cleaned: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(64).collect();
+    match cleaned.is_empty() {
+        true => "unknown".to_string(),
+        false => cleaned,
+    }
+}
+
+impl PairState {
 
     /// Forget every paired client — the client calls this when it wants to
     /// re-pair from scratch.
+    /// Forget ONE client. `/unpair` is unauthenticated plain HTTP in this
+    /// protocol, so it must not be able to take everyone else down with it:
+    /// a single confused client calling it (Moonlight does this by itself when
+    /// it cannot verify a host) would otherwise wipe every pairing on the box.
+    pub fn unpair(&self, id: &str) {
+        let key = safe_id(id);
+        let removed = self.paired.lock().unwrap().remove(&key).is_some();
+        let _ = std::fs::remove_file(self.state_dir.join("paired").join(format!("{key}.pem")));
+        self.sessions.lock().unwrap().remove(&key);
+        match removed {
+            true => eprintln!("[pair] unpaired {key}"),
+            false => eprintln!("[pair] unpair for {key}: was not paired"),
+        }
+    }
+
     pub fn unpair_all(&self) {
         self.paired.lock().unwrap().clear();
         let dir = self.state_dir.join("paired");
@@ -325,7 +365,7 @@ pub fn handle(st: &PairState, args: &HashMap<String, String>) -> String {
             eprintln!("[pair] *** PAIRED *** (hash_ok={same_hash} sig_ok={sig_ok})");
             // Drop the lock before touching the paired store.
             drop(sessions);
-            st.remember(&client_cert);
+            st.remember(&id, &client_cert);
             return xml(&[("paired", "1".into())]);
         }
         eprintln!("[pair] pairing FAILED (hash_ok={same_hash} sig_ok={sig_ok})");
