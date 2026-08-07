@@ -190,7 +190,14 @@ fn route(srv: &Server, path: &str, https: bool, local_ip: &str) -> String {
             "<?xml version=\"1.0\"?><root status_code=\"200\"><pin>ok</pin></root>".into()
         }
         "/unpair" => {
-            srv.pair.unpair_all();
+            // Only the caller's own pairing. This endpoint is unauthenticated
+            // plain HTTP, and Moonlight calls it by itself whenever it cannot
+            // verify a host — so wiping every pairing here means one confused
+            // client logs everyone out.
+            match args.get("uniqueid") {
+                Some(id) => srv.pair.unpair(id),
+                None => eprintln!("[pair] /unpair without a uniqueid; ignoring"),
+            }
             xml(&[("unpaired", "1".into())])
         }
         "/applist" if https => applist(),
