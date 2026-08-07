@@ -122,6 +122,37 @@ impl App {
         Ok(split_body(raw))
     }
 
+    /// Open a streaming GET and hand back the connection positioned just after
+    /// the response headers. Used for the long-lived /display event stream,
+    /// where `get()` is useless — it reads to EOF and the stream never ends.
+    pub fn get_stream(&self, path: &str) -> std::io::Result<impl std::io::BufRead> {
+        let mut s = self.connect()?;
+        // No read timeout: an idle screen sends nothing for as long as it
+        // stays idle, and that is not an error.
+        if let Conn::Plain(t) = &s {
+            t.set_read_timeout(None)?;
+        }
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Accept: text/event-stream\r\n\r\n",
+            self.host,
+            self.auth_header()
+        );
+        s.write_all(req.as_bytes())?;
+        let mut r = std::io::BufReader::new(s);
+        // Consume the status line and headers.
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if std::io::BufRead::read_line(&mut r, &mut line)? == 0 {
+                return Err(std::io::Error::other("stream closed during headers"));
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+        }
+        Ok(r)
+    }
+
     /// POST a JSON body, ignoring the response.
     pub fn post_json(&self, path: &str, body: &str) -> std::io::Result<()> {
         let mut s = self.connect()?;
