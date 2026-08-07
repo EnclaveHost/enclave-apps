@@ -123,33 +123,58 @@ impl Drop for Encoder {
     }
 }
 
-/// Pull frames from the app and feed the encoder until the session stops.
-fn feeder(session: Arc<Session>, app: Arc<App>, mut stdin: std::process::ChildStdin, fps: u32) {
+/// Feed the encoder until the session stops.
+///
+/// Two sources, chosen by where the bridge is running:
+///
+/// * a local mirror kept current by the app's `/display` band stream
+///   (`Some(screen)`), which is what makes a REMOTE bridge possible at all —
+///   only changed rows cross the network, and reading a frame is a memcpy;
+/// * `GET /fb.rgb` per frame otherwise, which is simplest and perfectly good
+///   when the bridge sits beside the app, but fetches 2.25 MiB every time and
+///   measured 2.9 seconds per frame against a deployment on the fleet.
+fn feeder(
+    session: Arc<Session>,
+    app: Arc<App>,
+    screen: Option<Arc<crate::screen::Screen>>,
+    mut stdin: std::process::ChildStdin,
+    fps: u32,
+) {
     let interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let mut last_frame: Option<Vec<u8>> = None;
+    let mut buf: Vec<u8> = Vec::new();
 
     while !session.is_stopping() {
         let started = Instant::now();
 
-        let frame = match app.get("/fb.rgb") {
-            Ok(f) if !f.is_empty() => {
-                last_frame = Some(f.clone());
-                f
+        let frame = match &screen {
+            Some(sc) => {
+                // The mirror always holds a whole picture, so there is no
+                // failure case here — before the first band lands it is black,
+                // which is exactly what the guest's screen looked like anyway.
+                sc.snapshot_into(&mut buf);
+                &buf
             }
-            // A failed or empty fetch repeats the previous frame rather than
-            // stalling the encoder, which would stall the whole stream.
-            _ => match &last_frame {
-                Some(f) => f.clone(),
-                None => {
-                    if !session.wait(interval) {
-                        break;
-                    }
-                    continue;
+            None => match app.get("/fb.rgb") {
+                Ok(f) if !f.is_empty() => {
+                    last_frame = Some(f);
+                    last_frame.as_ref().unwrap()
                 }
+                // A failed or empty fetch repeats the previous frame rather
+                // than stalling the encoder, which would stall the stream.
+                _ => match &last_frame {
+                    Some(f) => f,
+                    None => {
+                        if !session.wait(interval) {
+                            break;
+                        }
+                        continue;
+                    }
+                },
             },
         };
 
-        if stdin.write_all(&frame).is_err() {
+        if stdin.write_all(frame).is_err() {
             break;
         }
 
@@ -494,7 +519,14 @@ fn write_nv_header(hdr: &mut [u8], frame_index: u32, seq: u16, flags: u8, block_
 }
 
 /// Run the video stream for a session until it stops.
-pub fn run(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>, codec: String, source: (u32, u32)) {
+pub fn run(
+    session: Arc<Session>,
+    app: Arc<App>,
+    screen: Option<Arc<crate::screen::Screen>>,
+    sock: Arc<UdpSocket>,
+    codec: String,
+    source: (u32, u32),
+) {
     let cfg = session.config.lock().unwrap().clone();
 
     let mut encoder = match Encoder::spawn(&cfg, &codec, source) {
@@ -517,7 +549,7 @@ pub fn run(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>, codec: St
         let session = session.clone();
         let app = app.clone();
         let fps = cfg.fps;
-        std::thread::spawn(move || feeder(session, app, stdin, fps));
+        std::thread::spawn(move || feeder(session, app, screen, stdin, fps));
     }
 
     let mut splitter = AnnexBSplitter::new();

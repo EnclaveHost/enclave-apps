@@ -26,6 +26,7 @@ mod enet;
 mod fec;
 mod httpx;
 mod pair;
+mod screen;
 mod ping;
 mod rtsp;
 mod session;
@@ -46,6 +47,18 @@ struct Args {
     api_key: Option<String>,
     /// Fetch one frame, report what came back, and exit.
     probe: bool,
+    frames: FrameSource,
+}
+
+/// Where the encoder's pictures come from.
+#[derive(Clone, Copy, PartialEq)]
+enum FrameSource {
+    /// Bands for a remote (https) app, raw fetches for a local one.
+    Auto,
+    /// Mirror the /display band stream.
+    Bands,
+    /// GET /fb.rgb per frame.
+    Raw,
 }
 
 fn parse_args() -> Args {
@@ -59,6 +72,7 @@ fn parse_args() -> Args {
     // in the process list on a shared box.
     let mut api_key = std::env::var("RISCBOX_API_KEY").ok().filter(|k| !k.is_empty());
     let mut probe = false;
+    let mut frames = FrameSource::Auto;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -91,6 +105,18 @@ fn parse_args() -> Args {
                 }
                 i += 2;
             }
+            "--frames" if i + 1 < argv.len() => {
+                frames = match argv[i + 1].as_str() {
+                    "bands" => FrameSource::Bands,
+                    "raw" => FrameSource::Raw,
+                    "auto" => FrameSource::Auto,
+                    other => {
+                        eprintln!("--frames expects auto, bands or raw (got {other})");
+                        std::process::exit(2);
+                    }
+                };
+                i += 2;
+            }
             "--probe" => {
                 probe = true;
                 i += 1;
@@ -107,6 +133,10 @@ fn parse_args() -> Args {
                        --codec <name>      NVENC encoder (default h264_nvenc)\n\
                        --fb <WxH>          size of the app's /fb.rgb framebuffer (default 1024x768)\n\
                        --state <dir>       where to keep the server identity and paired certs\n\
+                       --frames <mode>     auto (default), bands or raw. bands mirrors the\n\
+                                           app's /display stream so only changed rows cross\n\
+                                           the network; raw fetches a whole framebuffer per\n\
+                                           frame. auto picks bands for an https app.\n\
                        --probe             fetch one frame, report it, and exit"
                 );
                 std::process::exit(0);
@@ -118,7 +148,7 @@ fn parse_args() -> Args {
         }
     }
 
-    Args { app_url, codec, state_dir, fb, api_key, probe }
+    Args { app_url, codec, state_dir, fb, api_key, probe, frames }
 }
 
 fn dirs_state() -> std::path::PathBuf {
@@ -132,7 +162,13 @@ fn dirs_state() -> std::path::PathBuf {
 }
 
 /// Bring up the per-session workers once RTSP ANNOUNCE has settled the config.
-fn start_session_workers(session: Arc<Session>, app: Arc<app::App>, codec: String, fb: (u32, u32)) {
+fn start_session_workers(
+    session: Arc<Session>,
+    app: Arc<app::App>,
+    screen: Option<Arc<screen::Screen>>,
+    codec: String,
+    fb: (u32, u32),
+) {
     // Video and audio sockets are bound per session so a restart rebinds cleanly.
     let video_sock = match UdpSocket::bind(("0.0.0.0", PORT_VIDEO)) {
         Ok(s) => Arc::new(s),
@@ -167,7 +203,8 @@ fn start_session_workers(session: Arc<Session>, app: Arc<app::App>, codec: Strin
     }
     {
         let (s, a, sock) = (session.clone(), app.clone(), video_sock.clone());
-        std::thread::spawn(move || video::run(s, a, sock, codec, fb));
+        let sc = screen.clone();
+        std::thread::spawn(move || video::run(s, a, sc, sock, codec, fb));
     }
 
     // The control channel owns the ENet host and runs until teardown.
@@ -188,6 +225,46 @@ fn main() {
     // (a deployment serves https only and an api_key may be set), and both
     // produce identical symptoms much later, as a stream that connects and
     // shows nothing.
+    if args.probe && args.frames == FrameSource::Bands {
+        // Prove the MIRROR, not just the connection: start it, wait for bands
+        // to land, and report the reconstructed picture. Inflating and
+        // re-ordering BGRX into rgb24 is the part that can silently produce a
+        // plausible-looking wrong image, so this also writes the frame out for
+        // eyeballing against the app's own /fb.png.
+        let sc = screen::Screen::start(app.clone(), args.fb.0 as usize, args.fb.1 as usize);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while sc.generation() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if sc.generation() == 0 {
+            eprintln!("[probe] FAILED: no bands arrived in 30s");
+            std::process::exit(1);
+        }
+        let mut buf = Vec::new();
+        let gen = sc.snapshot_into(&mut buf);
+        eprintln!("[probe] mirrored {} bytes after {gen} bands", buf.len());
+        let distinct = {
+            let mut seen = std::collections::HashSet::new();
+            for px in buf.chunks_exact(3).step_by(997).take(4096) {
+                seen.insert([px[0], px[1], px[2]]);
+            }
+            seen.len()
+        };
+        match distinct {
+            1 => eprintln!("[probe] mirror is a SINGLE FLAT COLOUR — nothing drawn yet"),
+            n => eprintln!("[probe] mirror has {n} distinct colours in a sample"),
+        }
+        if let Ok(path) = std::env::var("GS_PROBE_PPM") {
+            let mut out = format!("P6\n{} {}\n255\n", args.fb.0, args.fb.1).into_bytes();
+            out.extend_from_slice(&buf);
+            match std::fs::write(&path, out) {
+                Ok(()) => eprintln!("[probe] wrote {path}"),
+                Err(e) => eprintln!("[probe] could not write {path}: {e}"),
+            }
+        }
+        std::process::exit(0);
+    }
+
     if args.probe {
         let began = std::time::Instant::now();
         match app.get("/fb.rgb") {
@@ -241,6 +318,27 @@ fn main() {
 
     eprintln!("[main] state in {}", args.state_dir.display());
 
+    // Where frames come from. Fetching a whole framebuffer per frame is fine
+    // beside the app and hopeless across a network (2.25 MiB each, measured at
+    // 2.9s against the fleet), so a remote app is mirrored from the /display
+    // band stream instead: only changed rows cross the wire. --frames forces
+    // either one.
+    let mirror = match args.frames {
+        FrameSource::Auto => args.app_url.starts_with("https://"),
+        FrameSource::Bands => true,
+        FrameSource::Raw => false,
+    };
+    let screen = match mirror {
+        true => {
+            eprintln!("[main] frames: mirroring the /display band stream");
+            Some(screen::Screen::start(app.clone(), args.fb.0 as usize, args.fb.1 as usize))
+        }
+        false => {
+            eprintln!("[main] frames: fetching /fb.rgb per frame");
+            None
+        }
+    };
+
     let pair_state = Arc::new(pair::PairState::load(&args.state_dir));
 
     // Wiring: /launch mints a session, RTSP ANNOUNCE starts its workers.
@@ -266,10 +364,13 @@ fn main() {
         let app = app.clone();
         let codec = args.codec.clone();
         let fb = args.fb;
+        let screen = screen.clone();
         std::thread::spawn(move || {
             rtsp::run(
                 move || launched.lock().unwrap().clone(),
-                move |session| start_session_workers(session, app.clone(), codec.clone(), fb),
+                move |session| {
+                    start_session_workers(session, app.clone(), screen.clone(), codec.clone(), fb)
+                },
             );
         });
     }
