@@ -143,6 +143,29 @@ H.264 directly, and it has a second argument in its favour now: the app is
 single-threaded (wasip2 cannot spawn one, on p2 or p3), so anything encoded in
 there competes with the emulator for the only core it has.
 
+#### A ceiling worth knowing about before you tune anything
+
+When the bridge runs on your own machine, **Moonlight cannot be more responsive
+than the browser tab**, and it is worth being blunt about why: both are fed by
+the same `/display` band stream. The browser inflates a band and blits it. The
+bridge inflates the same band, then adds an H.264 encode, a packetize, a UDP
+hop, a decode and a present. Same source, strictly more work — so a local
+bridge buys the GameStream input path and client ecosystem, not lower latency.
+
+The arrangement where Moonlight wins is the one where the encoder sits next to
+the framebuffer, inside the enclave, and the band stream is never in the loop.
+That is the `nvenc` verb, and this ceiling is the strongest argument for it.
+
+Two settings do matter while the bridge is local:
+
+* **Stream at the framebuffer's own size, 1024x768.** Anything else makes
+  ffmpeg resample every frame on the CPU, which is the most expensive thing
+  this process does, to produce a picture strictly worse than the original.
+  The bridge logs a line when it catches itself doing this.
+* **Frame rate is set upstream, not here.** The guest can only repaint so fast,
+  and the app only scans when the picture moves; the encoder's `new frames/s of
+  encoded/s` line every ten seconds says which of the two is the limit.
+
 Pairing with a real client, with the PIN pre-seeded so it can run unattended:
 
 ```

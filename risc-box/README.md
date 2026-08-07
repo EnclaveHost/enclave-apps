@@ -357,14 +357,21 @@ disagreement between the no-watcher samples:
 | | MIPS | cost |
 |---|---|---|
 | nobody watching | 36.3 | — |
-| `/display` (deflated dirty bands) | 34.2 | 6% |
+| `/display` (deflated dirty bands, fixed 10 fps) | 34.2 | 6% |
 | `/video` (AV1, fixed 10 fps) | 6.6 | **82%** |
 
 At 82% a desktop that starts in four minutes takes twenty, and it looks broken
-rather than slow. The AV1 encoder is now paced by what it *costs* instead of by
-the clock — after each frame it waits until at least four times as long has
-passed not encoding — which puts it at 20% and lets it speed up on an idle
+rather than slow. Both encoders are now paced by what they *cost* instead of by
+the clock — after each frame they wait until at least four times as long has
+passed not encoding — which puts AV1 at 20% and lets either speed up on an idle
 machine and back off on a busy one.
+
+For `/display` that budget alone would be a regression, because a still screen
+makes a scan cheap and the budget would happily spend it looking for nothing
+sixty times a second. So the scan also backs off while the picture holds still,
+doubling its interval up to the old 100 ms, and snaps straight back to 16 ms
+the moment a band comes out. A still desktop therefore costs what it always
+did; a moving one gets up to six times the frame rate it used to.
 
 **Prefer the `/display` stream.** It is a tenth the cost, and the AV1 toggle
 trades bandwidth for exactly the CPU the guest needs. That trade is worth it on

@@ -231,17 +231,10 @@ impl PairState {
         }
     }
 
-    pub fn unpair_all(&self) {
-        self.paired.lock().unwrap().clear();
-        let dir = self.state_dir.join("paired");
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-        self.sessions.lock().unwrap().clear();
-        eprintln!("[pair] unpaired all clients");
-    }
+    // There is deliberately no unpair_all(). /unpair is unauthenticated plain
+    // HTTP, and Moonlight calls it by itself whenever it cannot verify a host,
+    // so a version that forgets everyone turns one confused client into a
+    // fleet-wide logout — which is exactly how this pairing was lost twice.
 
     pub fn set_pin(&self, id: &str, pin: &str) {
         self.sessions
