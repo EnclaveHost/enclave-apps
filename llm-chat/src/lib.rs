@@ -221,6 +221,7 @@ use config::AppConfig;
 use sampling::{pick_row, Rng, Row, SampleParams};
 
 static CHAT_HTML: &str = include_str!("chat.html");
+static LEGAL_HTML: &str = include_str!("legal.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
 /// The brand mark, for the consumers that ask the SERVER for an icon rather
 /// than reading the page's <link>: browsers hitting a non-HTML route, crawlers,
@@ -7963,6 +7964,13 @@ impl Guest for Component {
             (Method::Get, "/icon-512.png") => respond_asset(out, "image/png", ICON_512_PNG),
             (Method::Get, "/icon-maskable-512.png") => {
                 respond_asset(out, "image/png", ICON_MASKABLE_PNG)
+            }
+            // One document answers all three paths and scrolls itself to the
+            // section the path names. Default caching, not immutable: at a
+            // stable custom domain an updated policy must actually reach
+            // people.
+            (Method::Get, "/legal") | (Method::Get, "/privacy") | (Method::Get, "/terms") => {
+                respond_bytes(out, 200, "text/html; charset=utf-8", LEGAL_HTML.as_bytes())
             }
             // no-cache rather than immutable: at a stable custom domain these
             // two are how a NEW version announces itself, so they must never

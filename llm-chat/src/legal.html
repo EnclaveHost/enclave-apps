@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Privacy &amp; Terms &middot; eyesoff.ai</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23221A63'/%3E%3Cstop offset='1' stop-color='%230E0A2E'/%3E%3C/linearGradient%3E%3ClinearGradient id='c' gradientUnits='userSpaceOnUse' x1='110' y1='120' x2='420' y2='420'%3E%3Cstop offset='0' stop-color='%238CF5D2'/%3E%3Cstop offset='1' stop-color='%232DD4BF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='512' height='512' rx='116' fill='url(%23b)'/%3E%3Crect x='96' y='128' width='320' height='216' rx='62' fill='url(%23c)'/%3E%3Cpath d='M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z' fill='url(%23c)'/%3E%3Cpath d='M178 214 Q256 280 334 214' fill='none' stroke='%23131039' stroke-width='27' stroke-linecap='round'/%3E%3Cpath d='M256 268 V304' stroke='%23131039' stroke-width='25' stroke-linecap='round'/%3E%3Cpath d='M211 259 L189 289' stroke='%23131039' stroke-width='25' stroke-linecap='round'/%3E%3Cpath d='M301 259 L323 289' stroke='%23131039' stroke-width='25' stroke-linecap='round'/%3E%3Cpath d='M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z' fill='%238CF5D2'/%3E%3C/svg%3E">
+<script>
+// Same theme rule as the app: a stored preference wins (only present when
+// "Remember on this device" is on), otherwise dark.
+(function () {
+  var t = null;
+  try {
+    if (localStorage.getItem("llmchat-store") === "1")
+      t = localStorage.getItem("llmchat-theme");
+  } catch (_) {}
+  document.documentElement.dataset.theme = t === "light" ? "light" : "dark";
+})();
+</script>
+<style>
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #ffffff; --text: #0d0d0d; --text-2: #5d5d5d; --text-3: #8f8f8f;
+    --border: rgba(0,0,0,.10); --border-soft: rgba(0,0,0,.06);
+    --card: #f9f9f9; --ic-bg: rgba(0,0,0,.06);
+    --accent: #10a37f; --ok: #0a8a55;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #212121; --text: #ececec; --text-2: #b4b4b4; --text-3: #8b8b8b;
+    --border: rgba(255,255,255,.12); --border-soft: rgba(255,255,255,.07);
+    --card: #171717; --ic-bg: rgba(255,255,255,.10);
+    --accent: #10a37f; --ok: #34d399;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 28px 20px 72px; }
+  .top {
+    display: flex; align-items: center; gap: 10px;
+    padding-bottom: 20px; margin-bottom: 28px; border-bottom: 1px solid var(--border-soft);
+  }
+  .top svg { border-radius: 7px; }
+  .top .brand { font-weight: 600; font-size: 15px; }
+  .top .spacer { flex: 1; }
+  .top a.back { color: var(--text-2); text-decoration: none; font-size: 13.5px; }
+  .top a.back:hover { color: var(--text); text-decoration: underline; }
+  h1 { font-size: 26px; line-height: 1.25; margin-bottom: 6px; }
+  .updated { color: var(--text-3); font-size: 13px; margin-bottom: 26px; }
+  h2 {
+    font-size: 20px; margin: 40px 0 12px; padding-top: 24px;
+    border-top: 1px solid var(--border-soft);
+  }
+  h3 { font-size: 15.5px; margin: 22px 0 6px; }
+  p, ul { margin-bottom: 12px; color: var(--text-2); }
+  p b, li b { color: var(--text); font-weight: 600; }
+  ul { padding-left: 22px; }
+  li { margin-bottom: 8px; }
+  a { color: var(--accent); }
+  code {
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--ic-bg); padding: 1.5px 5px; border-radius: 5px;
+  }
+  .lede {
+    background: var(--card); border: 1px solid var(--border-soft);
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 8px;
+  }
+  .lede p { margin: 0; }
+  .caps { font-size: 13.5px; }
+  footer {
+    margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border-soft);
+    color: var(--text-3); font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="top">
+  <svg width="26" height="26" viewBox="0 0 512 512" aria-hidden="true"><use href="#eyesoff"/></svg>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="eyesoff" viewBox="0 0 512 512">
+      <defs>
+        <linearGradient id="eo-bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#221A63"/><stop offset="1" stop-color="#0E0A2E"/>
+        </linearGradient>
+        <linearGradient id="eo-bubble" gradientUnits="userSpaceOnUse" x1="110" y1="120" x2="420" y2="420">
+          <stop offset="0" stop-color="#8CF5D2"/><stop offset="1" stop-color="#2DD4BF"/>
+        </linearGradient>
+      </defs>
+      <rect width="512" height="512" rx="116" fill="url(#eo-bg)"/>
+      <rect x="96" y="128" width="320" height="216" rx="62" fill="url(#eo-bubble)"/>
+      <path d="M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z" fill="url(#eo-bubble)"/>
+      <path d="M178 214 Q256 280 334 214" fill="none" stroke="#131039" stroke-width="27" stroke-linecap="round"/>
+      <path d="M256 268 V304" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+      <path d="M211 259 L189 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+      <path d="M301 259 L323 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+      <path d="M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z" fill="#8CF5D2" opacity="0.95"/>
+    </symbol>
+  </svg>
+  <span class="brand">eyesoff.ai</span>
+  <span class="spacer"></span>
+  <a class="back" href=".">Back to the chat</a>
+</div>
+
+<h1>Privacy &amp; Terms</h1>
+<p class="updated">Last updated 7 August 2026</p>
+
+<div class="lede">
+  <p><b>The short version:</b> your conversations are answered inside a hardware enclave
+  that nobody, including us, can look into. They are stored nowhere but your own browser,
+  and nothing about them leaves the enclave unless you turn on a feature that tells you
+  exactly what it sends. No accounts, no cookies, no analytics. You do not have to take
+  this page's word for it: the enclave proves what it is running, and the app shows you
+  the proof.</p>
+</div>
+
+<h2 id="privacy">Privacy policy</h2>
+
+<p>"We" means the operator of eyesoff.ai. This policy describes what the service does
+with data, and just as importantly, what it is built to be unable to do.</p>
+
+<h3>Where your conversation happens</h3>
+<p>Every message is decrypted and answered inside a confidential virtual machine
+(a hardware enclave) on the <a href="https://enclave.host" rel="noopener">Enclave</a>
+fleet. The encrypted connection from your browser terminates inside that enclave: the
+owner of the machine, the network in between, and we ourselves see only ciphertext.
+The hardware signs a report over the exact code the enclave booted and over the key
+your connection is encrypted to. The shield icon in the app shows that report, and
+<code>GET /attestation</code> returns it raw, so you can verify the claim rather than
+trust it.</p>
+
+<h3>What we store about you</h3>
+<p>Nothing. There are no accounts, no sign-in, and no server-side storage of
+conversations. A chat's address (<code>/c/&lt;id&gt;</code>) is a key in your own
+browser's database; the server has never heard of it and could not look it up if asked.
+The enclave holds a conversation in memory while it writes the reply and never writes it
+to storage. Diagnostic logs record operational events (errors, startup), not
+conversation content.</p>
+
+<h3>What stays in your browser</h3>
+<ul>
+  <li><b>Chat history and preferences.</b> The "Remember on this device" switch is off
+  by default, and while it is off this browser stores nothing. Turning it on keeps your
+  chats and settings (theme, model choice) in this browser's local database so they
+  survive a reload. Turning it off deletes all of it. Either way, that data is never
+  uploaded: it exists in exactly one place, your browser profile.</li>
+  <li><b>Photos.</b> A photo you take in the app stays in your browser until you attach
+  it to a message you send. Nothing is recorded beyond the single frame you shoot.</li>
+  <li><b>Offline cache.</b> A service worker caches the app's own files (the page,
+  icons, a font) so it opens fast and works offline. It never caches conversations or
+  answers.</li>
+</ul>
+
+<h3>What leaves the enclave, and when</h3>
+<p>With every optional feature off, nothing about your conversations leaves the enclave
+at all. Each feature below sends exactly what it says, and sends it from the enclave's
+own network address, never from your browser:</p>
+<ul>
+  <li><b>Web search</b> (off until you accept the dialog that explains it). Your
+  question, or a short query written from it, goes to the search provider this
+  deployment is configured with; the dialog names the provider. It sees the query and
+  the deployment's IP address. It does not see who you are, your IP address, or the rest
+  of the conversation. Pages fetched while writing the answer, and any configured tool
+  that makes web requests on the model's behalf, likewise show sites the deployment's
+  address, not yours.</li>
+  <li><b>Reading images.</b> When this deployment delegates image understanding to a
+  sibling service, your picture and one model-written question about it go to that
+  service. It runs in its own enclave with its own attestation and no outbound network
+  access at all, so what it is shown cannot be forwarded anywhere. The conversation
+  itself does not cross.</li>
+  <li><b>Generating images.</b> An image prompt goes to a sibling image-generation
+  service, also inside an enclave. The finished picture comes back into the chat and is
+  stored, like everything else, only in your browser.</li>
+</ul>
+
+<h3>What the network can see</h3>
+<p>Traffic between your browser and the enclave is carried by the Enclave platform's
+relays. Like any carrier, they can observe connection metadata: your IP address, timing,
+and how many encrypted bytes moved. They cannot read any of it, because the key that
+would decrypt it never leaves the enclave.</p>
+
+<h3>Cookies and analytics</h3>
+<p>None. No cookies, no analytics, no fingerprinting, no third-party scripts. The app is
+a single self-contained page served by the enclave itself.</p>
+
+<h3>The API</h3>
+<p>Requests to the OpenAI-compatible API (<code>/v1</code>) run in the same enclave
+under the same rules as the chat: answered in memory, stored nowhere, subject to the
+same optional outbound features if the request asks for them.</p>
+
+<h3>Children</h3>
+<p>eyesoff.ai is not directed at children under 13, and they should not use it.</p>
+
+<h3>Your rights</h3>
+<p>Privacy laws give you rights over personal data an operator holds about you: access,
+correction, deletion, portability. We hold none, so there is nothing to request a copy
+of and nothing to delete; your chat history is in your browser, where deleting it is
+one switch. If you believe we hold personal data about you anyway,
+<a href="https://github.com/EnclaveHost/enclave-apps/issues" rel="noopener">contact
+us</a> and we will answer plainly.</p>
+
+<h3>Changes</h3>
+<p>If the service's data practices change, this page changes with them and the date at
+the top moves. The stronger guarantee does not live on this page: the app's source is
+available and the enclave attests to what is actually running, which no policy edit can
+quietly undo.</p>
+
+<h2 id="terms">Terms of service</h2>
+
+<h3>1. What this is</h3>
+<p>eyesoff.ai is a free chat interface to open-weight language models running inside
+hardware enclaves on the Enclave platform. By using the service you accept these terms;
+if you do not accept them, do not use it.</p>
+
+<h3>2. Your content</h3>
+<p>What you type, attach, and generate is yours. We claim no ownership of it and take no
+license to it, and by design we cannot read it. You are responsible for what you submit
+and for having the right to submit it.</p>
+
+<h3>3. Model output</h3>
+<p>Answers are produced by machine-learning models. They can be wrong, out of date, or
+inappropriate, and they can be wrong while sounding certain. Output is not medical,
+legal, or financial advice. Verify anything that matters before acting on it; you are
+responsible for how you use what the models produce.</p>
+
+<h3>4. Acceptable use</h3>
+<p>Do not use the service to break the law or to harm others. In particular, do not use
+it to create or spread content that is illegal, to attack third parties through the
+web-search or web-request features, to probe, overload, or disrupt the service or the
+platform it runs on, to attempt to defeat the isolation or attestation of any enclave,
+or to resell the service as your own. We may rate-limit or block traffic that harms the
+service or other people, which is the extent of the enforcement a service that cannot
+read its own traffic can do.</p>
+
+<h3>5. Third-party services</h3>
+<p>Web search, when you enable it, uses an outside search provider under that provider's
+own terms. Pages the enclave fetches belong to their own operators. The Enclave platform
+that hosts the service has its own terms for hosting and payment.</p>
+
+<h3>6. Availability</h3>
+<p>The service is free and runs on rented capacity that comes and goes; when no GPU is
+available it answers on CPU, slowly, and sometimes it may not answer at all. There is no
+promise of uptime. Models, features, and limits change without notice, and the service
+may be suspended or discontinued at any time.</p>
+
+<h3>7. Disclaimer of warranties</h3>
+<p class="caps">THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTIES
+OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, NON-INFRINGEMENT, AND UNINTERRUPTED OR ERROR-FREE OPERATION, TO THE FULLEST
+EXTENT PERMITTED BY LAW.</p>
+
+<h3>8. Limitation of liability</h3>
+<p>To the fullest extent permitted by law, we are not liable for indirect, incidental,
+special, consequential, or exemplary damages, or for lost profits, data, or goodwill,
+arising from your use of the service. Our total liability for any claim is capped at
+what you paid us to use the service in the year before the claim arose; the service is
+free, so that is zero. Where the law does not permit these limits, they apply to the
+greatest extent it does permit.</p>
+
+<h3>9. Changes and termination</h3>
+<p>We may change these terms; when we do, the date at the top of this page moves, and
+continued use after a change is acceptance of it. We may refuse or cut off service to
+traffic that violates these terms.</p>
+
+<h3>10. Contact</h3>
+<p>The app's source is available in the
+<a href="https://github.com/EnclaveHost/enclave-apps" rel="noopener">enclave-apps</a>
+repository; questions, reports, and requests are welcome as
+<a href="https://github.com/EnclaveHost/enclave-apps/issues" rel="noopener">issues</a>
+there.</p>
+
+<footer>
+  eyesoff.ai runs on <a href="https://enclave.host" rel="noopener">enclave.host</a>.
+  Verify this deployment at <a href="attestation"><code>/attestation</code></a>.
+</footer>
+
+</div>
+<script>
+// The same document answers /legal, /privacy and /terms; when the path names a
+// section, open on it.
+(function () {
+  var m = location.pathname.match(/\/(privacy|terms)\/?$/);
+  if (m) {
+    var el = document.getElementById(m[1]);
+    if (el) el.scrollIntoView();
+  }
+})();
+</script>
+</body>
+</html>
