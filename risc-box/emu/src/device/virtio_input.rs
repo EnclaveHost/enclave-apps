@@ -133,8 +133,28 @@ impl VirtioInput {
 	/// guest input core dispatches the group atomically.
 	pub fn push_event(&mut self, kind: u16, code: u16, value: u32) {
 		const CAP: usize = 4096;
+		// risc-box patch: when this overflowed it used to drop the OLDEST
+		// event, which for input is the worst thing to drop. Key events come
+		// in pairs, and losing a release leaves that key held down in the
+		// guest forever — which does not present as a lost keystroke, it
+		// presents as a key repeating endlessly.
+		//
+		// Pointer motion is safe to drop instead: this is an ABSOLUTE device
+		// (INPUT_PROP_POINTER, ABS_X/ABS_Y), so a discarded position is
+		// corrected by the very next one. Scroll deltas are droppable for the
+		// same practical reason. So on overflow, evict the oldest motion or
+		// scroll event and let every key and button transition through. Only
+		// if the backlog is somehow ALL key traffic does this fall back to
+		// dropping the oldest, which at 4096 events should not happen.
 		if self.pending.len() >= CAP {
-			self.pending.pop_front();
+			let victim = self
+				.pending
+				.iter()
+				.position(|e| e.kind == EV_ABS || e.kind == EV_REL);
+			match victim {
+				Some(i) => { self.pending.remove(i); },
+				None => { self.pending.pop_front(); },
+			}
 		}
 		self.pending.push_back(InputEvent { kind, code, value });
 	}
@@ -468,4 +488,45 @@ fn set_byte32(reg: &mut u32, pos: u64, value: u32) {
 fn set_byte64(reg: &mut u64, pos: u64, value: u8) {
 	let sh = pos * 8;
 	*reg = (*reg & !(0xffu64 << sh)) | ((value as u64) << sh);
+}
+
+// risc-box patch: the overflow policy is a correctness property, not a
+// preference — a dropped key RELEASE leaves that key held down in the guest
+// for good, which presents as a key repeating rather than as a lost keystroke.
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn queue_len(d: &VirtioInput) -> usize {
+		d.pending.len()
+	}
+
+	#[test]
+	fn overflow_evicts_motion_and_keeps_keys() {
+		let mut d = VirtioInput::new();
+		// Fill well past capacity with pointer motion, then send a key press
+		// and its release. Both must survive.
+		for i in 0..8192 {
+			d.push_event(EV_ABS, 0, i as u32);
+		}
+		d.push_event(EV_KEY, 30, 1); // KEY_A down
+		d.push_event(EV_KEY, 30, 0); // KEY_A up
+		let keys: Vec<_> = d.pending.iter().filter(|e| e.kind == EV_KEY).collect();
+		assert_eq!(keys.len(), 2, "key transitions must not be evicted by motion");
+		assert_eq!(keys[0].value, 1);
+		assert_eq!(keys[1].value, 0, "the RELEASE is the one that must never be lost");
+		assert!(queue_len(&d) <= 4097, "queue must stay bounded");
+	}
+
+	#[test]
+	fn key_pairs_survive_a_flood_between_them() {
+		let mut d = VirtioInput::new();
+		d.push_event(EV_KEY, 42, 1); // shift down
+		for i in 0..8192 {
+			d.push_event(EV_ABS, 1, i as u32);
+		}
+		d.push_event(EV_KEY, 42, 0); // shift up
+		let shift: Vec<_> = d.pending.iter().filter(|e| e.kind == EV_KEY).collect();
+		assert_eq!(shift.len(), 2, "a held modifier must still get its release");
+	}
 }

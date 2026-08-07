@@ -292,10 +292,55 @@ document.addEventListener("DOMContentLoaded", () => {
 // are coalesced (pointer moves at most ~every 40ms) to keep the emulated CPU
 // from drowning in HID traffic.
 const fbEl = $("fb");
+// Input goes through ONE ordered queue with a single request in flight.
+//
+// Firing a POST per event looks fine and is not: separate requests can land
+// out of order, and a keyup that overtakes its keydown leaves that key held
+// down in the guest — which does not look like a lost event, it looks like a
+// key repeating forever. A dropped request does the same thing, and the old
+// `.catch(() => {})` dropped them silently.
+//
+// So: append to a queue, send at most one batch at a time, and put a failed
+// batch back at the FRONT so ordering survives a retry.
+const hidQ = [];
+let hidBusy = false, hidRetry = 0;
+const HID_QMAX = 512;    // bound the queue if the app goes away entirely
+const HID_BATCH = 64;
+
 function sendHid(events) {
   if (!running || !events.length) return;
+  for (const e of events) hidQ.push(e);
+  // If the app is unreachable the queue must not grow without limit. Drop
+  // pointer motion first: it is an ABSOLUTE device, so a dropped move is
+  // corrected by the next one. Key and button transitions are never dropped,
+  // because losing one half of a press/release pair is what sticks a key.
+  while (hidQ.length > HID_QMAX) {
+    const i = hidQ.findIndex((e) => e.t === "move" || e.t === "scroll");
+    hidQ.splice(i < 0 ? 0 : i, 1);
+  }
+  pumpHid();
+}
+
+function pumpHid() {
+  if (hidBusy || !hidQ.length || !running) return;
+  hidBusy = true;
+  const batch = hidQ.splice(0, HID_BATCH);
   authFetch("/hid", { method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ events }) }).catch(() => {});
+    body: JSON.stringify({ events: batch }) })
+    .then((r) => {
+      if (!r.ok) throw new Error("hid " + r.status);
+      hidRetry = 0;
+    })
+    .catch(() => {
+      // Back to the front, in order. Back off so a machine that is busy or
+      // briefly gone does not get hammered.
+      hidQ.unshift(...batch);
+      hidRetry = Math.min(hidRetry + 1, 6);
+    })
+    .finally(() => {
+      hidBusy = false;
+      if (hidQ.length) setTimeout(pumpHid, hidRetry ? 50 * hidRetry : 0);
+    });
 }
 function normXY(e) {
   const r = fbEl.getBoundingClientRect();
@@ -383,13 +428,37 @@ const KEYCODE = {
   ArrowLeft:105, ArrowRight:106, End:107, ArrowDown:108, PageDown:109, Insert:110,
   Delete:111, MetaLeft:125, MetaRight:126,
 };
+// Keys currently held, so they can be released if focus leaves.
+const heldKeys = new Set();
+
 function hidKey(e) {
   if (!running) return;
   const code = KEYCODE[e.code];
   if (code === undefined) return;
   e.preventDefault();
-  sendHid([{ t: "key", code, down: e.type === "keydown" }]);
+  const down = e.type === "keydown";
+  // Ignore the browser's auto-repeat. Holding a key makes the browser emit
+  // keydown over and over, and the guest's own input core ALSO repeats held
+  // keys — forwarding both is what duplicates characters. The guest only needs
+  // to be told when the key actually changes state.
+  if (down && e.repeat) return;
+  if (down) heldKeys.add(code); else heldKeys.delete(code);
+  sendHid([{ t: "key", code, down }]);
 }
+
+// Release everything on the way out. Without this a key held when the window
+// loses focus (alt-tab is the classic) stays down in the guest forever,
+// because the keyup is delivered to whatever took focus instead. Modifiers
+// are the worst of these: a stuck Ctrl makes every later keystroke a shortcut.
+function releaseAllKeys() {
+  const evs = [...heldKeys].map((code) => ({ t: "key", code, down: false }));
+  heldKeys.clear();
+  for (const b of ["left", "middle", "right"]) evs.push({ t: "button", b, down: false });
+  if (evs.length) sendHid(evs);
+}
+window.addEventListener("blur", releaseAllKeys);
+fbEl.addEventListener("blur", releaseAllKeys);
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAllKeys(); });
 fbEl.setAttribute("tabindex", "0"); // focusable, so it can take key events
 fbEl.style.outline = "none";
 fbEl.addEventListener("keydown", hidKey);
