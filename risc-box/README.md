@@ -342,6 +342,56 @@ the `10.0.2.2` proxy and directly against `8.8.8.8` (UDP NAT), an HTTP body
 fetched from the real internet over the TCP splice, and a dial to a closed
 port answered with a fast RST.
 
+## Watching the machine costs the machine
+
+The app runs the guest, serves HTTP, scans the framebuffer and encodes video on
+**one thread** — `wasm32-wasip2` cannot spawn another, on p2 or p3 (`std::thread`
+returns "Not supported", `available_parallelism()` is 1). So a browser with the
+page open is not a passive observer. Every frame it is sent is emulator time the
+guest did not get.
+
+Measured against a pinned workload (a busy loop in the guest, so its demand is
+constant), alternating no-watcher / watcher / no-watcher so drift shows up as
+disagreement between the no-watcher samples:
+
+| | MIPS | cost |
+|---|---|---|
+| nobody watching | 36.3 | — |
+| `/display` (deflated dirty bands) | 34.2 | 6% |
+| `/video` (AV1, fixed 10 fps) | 6.6 | **82%** |
+
+At 82% a desktop that starts in four minutes takes twenty, and it looks broken
+rather than slow. The AV1 encoder is now paced by what it *costs* instead of by
+the clock — after each frame it waits until at least four times as long has
+passed not encoding — which puts it at 20% and lets it speed up on an idle
+machine and back off on a busy one.
+
+**Prefer the `/display` stream.** It is a tenth the cost, and the AV1 toggle
+trades bandwidth for exactly the CPU the guest needs. That trade is worth it on
+a slow link and nowhere else.
+
+This also explains a failure that looked like three unrelated bugs: giving the
+guest a 1024x768 screen without updating `index.html` (which hardcoded 800)
+broke the `/display` path silently, which left AV1 as the only way to see
+anything, which starved the guest to a tenth speed, which made a half-started
+desktop look like a dead one.
+
+## Buying CPU share does not buy speed
+
+The app is single-threaded, so it cannot use more than one core whatever
+`cpuShare` says. Measured on the fleet, same image and same boot phase:
+
+| cpuShare | vCPU | MIPS | rate |
+|---|---|---|---|
+| 0.04 | 0.64 | 21.3 | $0.1224/h |
+| 0.07 | 1.12 | 21.3 | $0.2124/h |
+| 0.25 | 4.00 | 21.8 | $0.7524/h |
+
+Flat across a 6.25x range, including below one core — so on an uncontended node
+the share is not a throughput cap. It reads as proportional weight, which only
+bites when the node is busy. Buy share for priority under contention, not for
+speed; the fleet was ~79% idle for these runs.
+
 ## Measuring the interpreter
 
 `/status` reports MIPS, but that figure is not a property of the emulator: the
