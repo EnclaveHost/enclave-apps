@@ -9,7 +9,7 @@
 //! RAM the kernel is told about, and this module is the monitor cable.
 //!
 //! Scanout: while at least one browser watches (SSE topic "display"), the
-//! frame is read out of guest physical memory every FB_SCAN_MS and diffed
+//! frame is read out of guest physical memory and diffed
 //! row-wise against the previous scan (FNV-1a per row). Runs of changed rows
 //! become BANDS; each band ships as one SSE event of raw-deflate bytes
 //! (base64) that the browser inflates with DecompressionStream("deflate-raw")
@@ -32,10 +32,35 @@ pub const FB_W: usize = 1024;
 pub const FB_H: usize = 768;
 pub const FB_STRIDE: usize = FB_W * 4;
 pub const FB_BYTES: usize = FB_STRIDE * FB_H;
-/// Scan cadence while watched: 10 fps of DIFFS is generous against a ~29 MIPS
-/// guest redraw rate, and one scan is ~2 MB copied + hashed (~a millisecond
-/// class of work) — invisible next to the 400k-instruction tick batch.
+/// Slowest the scan is allowed to get, and the floor the AV1 path paces
+/// against. Also the cadence a scan falls back to when it is expensive.
 pub const FB_SCAN_MS: u64 = 100;
+/// Fastest the scan is allowed to get. 60 fps of diffs is already more than a
+/// ~30 MIPS guest can redraw, so scanning harder than this only spends guest
+/// time to re-send pixels nobody changed.
+pub const FB_SCAN_FLOOR_MS: u64 = 16;
+
+/// Fraction of the emulator thread a scan may take: at most 1/(1+RATIO).
+const SCAN_COST_RATIO: u32 = 4;
+/// Doublings of the interval allowed while the picture is not moving.
+const SCAN_MAX_BACKOFF: u32 = 3;
+
+/// How long to wait before the next scan, given what the last one cost and how
+/// many scans in a row have found nothing.
+///
+/// Two pressures, pulling opposite ways. Scanning costs the guest directly —
+/// it is the same thread — so an expensive scan has to be followed by a longer
+/// gap or watching the machine slows the machine. But a still screen makes
+/// scans CHEAP, and a pure cost budget would then scan flat out to keep
+/// finding nothing. Hence the backoff: cost sets the fast rate, stillness
+/// decides whether we are entitled to it.
+pub fn scan_interval(cost: std::time::Duration, still: u32) -> std::time::Duration {
+    use std::time::Duration;
+    let floor = Duration::from_millis(FB_SCAN_FLOOR_MS);
+    let ceiling = Duration::from_millis(FB_SCAN_MS);
+    let base = (cost * SCAN_COST_RATIO).clamp(floor, ceiling);
+    (base * (1u32 << still.min(SCAN_MAX_BACKOFF))).min(ceiling)
+}
 
 pub struct Band {
     pub y: usize,
@@ -215,5 +240,77 @@ impl Crc32 {
     }
     fn finish(&self) -> u32 {
         self.value ^ 0xffff_ffff
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The whole point of pacing by cost is that an expensive scan buys itself
+    /// a longer gap. Pin the budget: a scan may never take more than a fifth
+    /// of the thread, however cheap it looks.
+    #[test]
+    fn an_expensive_scan_earns_a_longer_gap() {
+        let cheap = scan_interval(Duration::from_millis(1), 0);
+        let dear = scan_interval(Duration::from_millis(15), 0);
+        assert!(dear > cheap, "a costlier scan must wait longer, got {dear:?} vs {cheap:?}");
+
+        for ms in [1u64, 4, 6, 15, 40] {
+            let cost = Duration::from_millis(ms);
+            let gap = scan_interval(cost, 0);
+            // Unless we are pinned at the floor, the gap covers RATIO times
+            // the work, so scanning stays under 1/(1+RATIO) of the thread.
+            if gap > Duration::from_millis(FB_SCAN_FLOOR_MS) && gap < Duration::from_millis(FB_SCAN_MS) {
+                assert!(gap >= cost * 4, "cost {cost:?} only earned {gap:?}");
+            }
+        }
+    }
+
+    /// A still picture must not be more expensive to watch than it was under
+    /// the old fixed clock: backing off has to reach FB_SCAN_MS.
+    #[test]
+    fn a_still_screen_backs_off_to_the_old_cadence() {
+        let cheap = Duration::from_millis(1);
+        assert_eq!(scan_interval(cheap, 0), Duration::from_millis(FB_SCAN_FLOOR_MS));
+
+        let settled = scan_interval(cheap, 10);
+        assert_eq!(
+            settled,
+            Duration::from_millis(FB_SCAN_MS),
+            "a screen that has been still for a while should cost no more than it used to"
+        );
+
+        // Monotonic on the way there, so the cost falls off smoothly.
+        let mut previous = Duration::ZERO;
+        for still in 0..12 {
+            let gap = scan_interval(cheap, still);
+            assert!(gap >= previous, "backoff went backwards at {still}");
+            previous = gap;
+        }
+    }
+
+    /// ...and the moment something moves, the fast rate is available again.
+    #[test]
+    fn motion_snaps_back_to_the_fast_rate() {
+        let cheap = Duration::from_millis(1);
+        assert_eq!(scan_interval(cheap, 5), Duration::from_millis(FB_SCAN_MS));
+        assert_eq!(scan_interval(cheap, 0), Duration::from_millis(FB_SCAN_FLOOR_MS));
+    }
+
+    /// The interval is always inside the declared bounds, whatever it is fed.
+    #[test]
+    fn the_interval_stays_within_its_bounds() {
+        for ms in [0u64, 1, 7, 50, 250, 5_000] {
+            for still in [0u32, 1, 3, 7, u32::MAX] {
+                let gap = scan_interval(Duration::from_millis(ms), still);
+                assert!(
+                    gap >= Duration::from_millis(FB_SCAN_FLOOR_MS)
+                        && gap <= Duration::from_millis(FB_SCAN_MS),
+                    "cost {ms}ms still {still} produced {gap:?}"
+                );
+            }
+        }
     }
 }

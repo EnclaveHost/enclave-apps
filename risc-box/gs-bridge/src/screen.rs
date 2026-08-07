@@ -10,7 +10,8 @@
 //! `/display` is the same picture at a fraction of the bytes. The app already
 //! scans its framebuffer, finds the rows that changed, and ships them
 //! deflate-compressed as SSE events; that is the path the browser uses, and it
-//! costs the guest ~6% against AV1's 20%. So: hold one long-lived connection,
+//! costs the guest a fifth of its thread at most, against AV1's same budget
+//! for far more work per frame. So: hold one long-lived connection,
 //! apply each band to a locally-held copy, and let the encoder read that copy
 //! as fast as it likes. Bandwidth becomes proportional to what MOVED rather
 //! than to frame rate, which for a desktop that is mostly still is close to
@@ -65,6 +66,28 @@ impl Screen {
     /// Copy the current picture out, in rgb24. Returns the generation so the
     /// caller can skip re-encoding an unchanged screen if it wants to.
     pub fn snapshot_into(&self, out: &mut Vec<u8>) -> u64 {
+        let f = self.frame.lock().unwrap();
+        out.clear();
+        out.extend_from_slice(&f);
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Same, but skip the copy entirely when nothing has changed since
+    /// `since`. Returns the current generation, so `== since` means `out` was
+    /// left alone and still holds a good picture.
+    ///
+    /// Worth the extra entry point: the encoder asks for a frame at the
+    /// negotiated rate (60/s), the mirror changes far less often than that,
+    /// and the copy is 2.25 MiB held under the same lock `apply` needs. Doing
+    /// it unconditionally does not just waste memory bandwidth — it stands in
+    /// the way of the bands coming in off the network.
+    pub fn snapshot_if_changed(&self, out: &mut Vec<u8>, since: u64) -> u64 {
+        // Checked before taking the lock: the common case is "unchanged", and
+        // that case should not touch the mutex at all.
+        let now = self.generation.load(Ordering::Acquire);
+        if now == since && !out.is_empty() {
+            return now;
+        }
         let f = self.frame.lock().unwrap();
         out.clear();
         out.extend_from_slice(&f);
@@ -128,7 +151,9 @@ impl Screen {
             }
         }
         drop(f);
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        // Release, so a reader that sees this generation with an acquire load
+        // is guaranteed to see the rows written above.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 }
 

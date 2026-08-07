@@ -366,6 +366,7 @@ pub fn run(session: Arc<Session>, app: Arc<App>, on_running: impl Fn()) {
     let mut peer: *mut c_void = std::ptr::null_mut();
     let mut ping_deadline = Instant::now() + Duration::from_secs(30);
     let mut notified_running = false;
+    let mut fec_reports = FecReports::default();
 
     loop {
         if session.is_stopping() {
@@ -429,13 +430,20 @@ pub fn run(session: Arc<Session>, app: Arc<App>, on_running: impl Fn()) {
                                 session.request_idr();
                             }
                             CTRL_INVALIDATE_REF_FRAMES => session.request_idr(),
+                            // The client's own account of a frame it could not
+                            // assemble. This is the only direct evidence of
+                            // WHY a stream is dropping frames, so it is worth
+                            // decoding rather than discarding.
+                            CTRL_FRAME_FEC_STATUS => fec_reports.record(&payload),
                             // Keepalives and telemetry: nothing to do, but
                             // receiving them is what keeps the peer alive.
+                            // (CTRL_LOSS_STATS carries a hardcoded zero loss
+                            // count on current clients; the FEC status above
+                            // is the one with real numbers in it.)
                             CTRL_PERIODIC_PING
                             | CTRL_LOSS_STATS
                             | CTRL_START_B
-                            | CTRL_LTR_ACK
-                            | CTRL_FRAME_FEC_STATUS => {}
+                            | CTRL_LTR_ACK => {}
                             other => {
                                 eprintln!("[control] unhandled message type {other:#06x}");
                             }
@@ -466,7 +474,127 @@ pub fn run(session: Arc<Session>, app: Arc<App>, on_running: impl Fn()) {
         }
     }
     unsafe { enet::enet_host_destroy(host) };
+    fec_reports.summarize();
     eprintln!("[control] stopped");
+}
+
+/// One SS_FRAME_FEC_STATUS, as the client packs it (moonlight-common-c
+/// Video.h — packed, big-endian throughout).
+///
+/// The client only sends this when a frame needed FEC recovery or had to be
+/// abandoned, so its mere arrival means that frame was damaged. What it tells
+/// us that nothing else does is WHERE the damage was: `received_data` short of
+/// `total_data` with the parity also short means packets genuinely went
+/// missing on the wire, while full counts with a bad sequence number means the
+/// host built the frame wrong.
+#[derive(Debug, Clone, Copy)]
+struct FecStatus {
+    frame_index: u32,
+    highest_seq: u16,
+    next_contiguous_seq: u16,
+    missing_before_highest: u16,
+    total_data: u16,
+    total_parity: u16,
+    received_data: u16,
+    received_parity: u16,
+    fec_percentage: u8,
+    block_index: u8,
+    block_count: u8,
+}
+
+impl FecStatus {
+    /// 4 + 2*7 + 3 = 21 bytes.
+    const WIRE_LEN: usize = 21;
+
+    fn parse(p: &[u8]) -> Option<FecStatus> {
+        if p.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let be16 = |i: usize| u16::from_be_bytes([p[i], p[i + 1]]);
+        Some(FecStatus {
+            frame_index: u32::from_be_bytes([p[0], p[1], p[2], p[3]]),
+            highest_seq: be16(4),
+            next_contiguous_seq: be16(6),
+            missing_before_highest: be16(8),
+            total_data: be16(10),
+            total_parity: be16(12),
+            received_data: be16(14),
+            received_parity: be16(16),
+            fec_percentage: p[18],
+            block_index: p[19],
+            block_count: p[20],
+        })
+    }
+
+    /// True when every shard we sent for this block did arrive. A damaged
+    /// frame with nothing missing is the host's fault, not the network's.
+    fn nothing_missing(&self) -> bool {
+        self.received_data >= self.total_data && self.received_parity >= self.total_parity
+    }
+}
+
+/// Running tally of the client's damage reports, so a session ends with a
+/// verdict instead of a wall of per-frame lines.
+#[derive(Default)]
+struct FecReports {
+    count: u64,
+    lost_shards: u64,
+    complete_but_damaged: u64,
+    logged: u64,
+}
+
+impl FecReports {
+    fn record(&mut self, payload: &[u8]) {
+        let Some(s) = FecStatus::parse(payload) else {
+            eprintln!("[control] FEC status too short ({} bytes)", payload.len());
+            return;
+        };
+        self.count += 1;
+        let missing_data = s.total_data.saturating_sub(s.received_data) as u64;
+        let missing_parity = s.total_parity.saturating_sub(s.received_parity) as u64;
+        self.lost_shards += missing_data + missing_parity;
+        if s.nothing_missing() {
+            self.complete_but_damaged += 1;
+        }
+        // The first few in full, then only a summary: a stream that is losing
+        // every frame would otherwise bury everything else in the log.
+        if self.logged < 10 {
+            self.logged += 1;
+            eprintln!(
+                "[control] frame {} damaged: data {}/{}, parity {}/{}, missing-before-highest {}, \
+                 seq next={} highest={}, fec {}%, block {}/{}",
+                s.frame_index,
+                s.received_data,
+                s.total_data,
+                s.received_parity,
+                s.total_parity,
+                s.missing_before_highest,
+                s.next_contiguous_seq,
+                s.highest_seq,
+                s.fec_percentage,
+                s.block_index,
+                s.block_count,
+            );
+        }
+    }
+
+    fn summarize(&self) {
+        if self.count == 0 {
+            eprintln!("[control] client reported no damaged frames");
+            return;
+        }
+        eprintln!(
+            "[control] client reported {} damaged frame(s), {} shard(s) never arrived, \
+             {} damaged with every shard present",
+            self.count, self.lost_shards, self.complete_but_damaged
+        );
+        if self.complete_but_damaged > 0 {
+            eprintln!(
+                "[control] frames damaged with nothing missing point at how this host \
+                 packetizes, not at the network"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -648,5 +776,59 @@ mod tests {
         wire.extend_from_slice(&ct);
 
         assert!(unseal(&s, &wire).is_none(), "a forged tag must not authenticate");
+    }
+
+    /// The FEC status is packed big-endian in field order. Reading it with the
+    /// wrong endianness still "parses" — it just reports nonsense — so pin the
+    /// layout against a hand-built buffer.
+    #[test]
+    fn fec_status_parses_the_clients_big_endian_layout() {
+        let mut w = Vec::new();
+        w.extend_from_slice(&1234u32.to_be_bytes()); // frameIndex
+        w.extend_from_slice(&600u16.to_be_bytes()); // highestReceivedSequenceNumber
+        w.extend_from_slice(&598u16.to_be_bytes()); // nextContiguousSequenceNumber
+        w.extend_from_slice(&2u16.to_be_bytes()); // missingPacketsBeforeHighestReceived
+        w.extend_from_slice(&3u16.to_be_bytes()); // totalDataPackets
+        w.extend_from_slice(&2u16.to_be_bytes()); // totalParityPackets
+        w.extend_from_slice(&1u16.to_be_bytes()); // receivedDataPackets
+        w.extend_from_slice(&2u16.to_be_bytes()); // receivedParityPackets
+        w.push(66); // fecPercentage
+        w.push(0); // multiFecBlockIndex
+        w.push(1); // multiFecBlockCount
+        assert_eq!(w.len(), FecStatus::WIRE_LEN);
+
+        let s = FecStatus::parse(&w).expect("well-formed status must parse");
+        assert_eq!(s.frame_index, 1234);
+        assert_eq!((s.received_data, s.total_data), (1, 3));
+        assert_eq!((s.received_parity, s.total_parity), (2, 2));
+        assert_eq!(s.fec_percentage, 66);
+        assert_eq!(s.block_count, 1);
+        assert!(!s.nothing_missing(), "two data shards short is not complete");
+
+        assert!(FecStatus::parse(&w[..20]).is_none(), "a short status must be rejected");
+    }
+
+    /// A frame the client reports as damaged while acknowledging every shard
+    /// we sent cannot be a network loss, and the tally has to separate the two
+    /// or the diagnosis points at the wrong layer.
+    #[test]
+    fn tally_separates_lost_shards_from_host_side_damage() {
+        let status = |rx_data: u16, rx_parity: u16| {
+            let mut w = Vec::new();
+            w.extend_from_slice(&7u32.to_be_bytes());
+            for v in [10u16, 10, 0, 3, 2, rx_data, rx_parity] {
+                w.extend_from_slice(&v.to_be_bytes());
+            }
+            w.extend_from_slice(&[66, 0, 1]);
+            w
+        };
+
+        let mut r = FecReports::default();
+        r.record(&status(1, 2)); // two data shards never arrived
+        r.record(&status(3, 2)); // everything arrived, still damaged
+
+        assert_eq!(r.count, 2);
+        assert_eq!(r.lost_shards, 2);
+        assert_eq!(r.complete_but_damaged, 1);
     }
 }

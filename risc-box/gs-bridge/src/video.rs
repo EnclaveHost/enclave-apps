@@ -71,20 +71,38 @@ impl Encoder {
         source: (u32, u32),
     ) -> std::io::Result<Encoder> {
         // The source is the machine's framebuffer, which has its own fixed
-        // size; the client negotiates its own. Scale between them on the GPU
-        // side rather than pretending they match.
+        // size; the client negotiates its own.
+        //
+        // When they differ, the scale filter runs on the CPU (the frames
+        // arrive in system memory, so there is no GPU surface to scale), and
+        // resampling 1024x768 to 1280x720 sixty times a second is the single
+        // most expensive thing this process does — for a picture that is
+        // strictly worse than the original. When they match, the filter is
+        // dropped entirely rather than left in as a no-op, which is the case
+        // worth aiming for: stream at the framebuffer's own size.
         let in_size = format!("{}x{}", source.0, source.1);
+        let rescaling = (cfg.width, cfg.height) != (source.0, source.1);
         let scale = format!("scale={}:{}:flags=bilinear", cfg.width, cfg.height);
         let fps = cfg.fps.max(1).to_string();
         let bitrate = format!("{}k", cfg.bitrate_kbps.max(500));
         // One IDR per second.
         let gop = cfg.fps.max(1).to_string();
 
+        let mut args: Vec<&str> = vec![
+            "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &in_size, "-r", &fps, "-i", "-",
+        ];
+        if rescaling {
+            eprintln!(
+                "[video] rescaling {}x{} -> {}x{} on the CPU; stream at {}x{} to avoid it",
+                source.0, source.1, cfg.width, cfg.height, source.0, source.1
+            );
+            args.extend_from_slice(&["-vf", &scale]);
+        }
+
         let child = Command::new("ffmpeg")
+            .args(args)
             .args([
-                "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &in_size, "-r", &fps, "-i", "-",
-                "-vf", &scale,
                 "-c:v", codec,
                 "-preset", "p1",           // lowest latency NVENC preset
                 "-tune", "ull",            // ultra-low-latency
@@ -143,6 +161,9 @@ fn feeder(
     let interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let mut last_frame: Option<Vec<u8>> = None;
     let mut buf: Vec<u8> = Vec::new();
+    let mut generation = u64::MAX;
+    let (mut fed, mut fresh) = (0u64, 0u64);
+    let mut reported = Instant::now();
 
     while !session.is_stopping() {
         let started = Instant::now();
@@ -152,7 +173,16 @@ fn feeder(
                 // The mirror always holds a whole picture, so there is no
                 // failure case here — before the first band lands it is black,
                 // which is exactly what the guest's screen looked like anyway.
-                sc.snapshot_into(&mut buf);
+                //
+                // A frame still goes to the encoder on every tick, because the
+                // encoder's input is a fixed-rate raw stream and skipping one
+                // would shift every timestamp after it. What is skipped is the
+                // 2.25 MiB copy when the picture is the one we already hold.
+                let now = sc.snapshot_if_changed(&mut buf, generation);
+                if now != generation {
+                    fresh += 1;
+                    generation = now;
+                }
                 &buf
             }
             None => match app.get("/fb.rgb") {
@@ -176,6 +206,21 @@ fn feeder(
 
         if stdin.write_all(frame).is_err() {
             break;
+        }
+        fed += 1;
+
+        // How much of what we encode is actually new is the number that says
+        // whether the bottleneck is here or upstream in the guest.
+        if reported.elapsed() >= Duration::from_secs(10) {
+            let secs = reported.elapsed().as_secs_f64();
+            eprintln!(
+                "[video] source: {:.1} new frames/s of {:.1} encoded/s",
+                fresh as f64 / secs,
+                fed as f64 / secs
+            );
+            reported = Instant::now();
+            fed = 0;
+            fresh = 0;
         }
 
         let elapsed = started.elapsed();

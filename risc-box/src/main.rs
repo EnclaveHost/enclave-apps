@@ -339,7 +339,9 @@ struct App {
     last_save: Option<String>,
     net: Option<NetStack>, // listeners live for the whole process
     display: Display,      // scanout state (see display.rs)
-    fb_scanned: Option<Instant>, // last display scan (paced by FB_SCAN_MS)
+    fb_scanned: Option<Instant>, // last display scan (paced by its own cost)
+    fb_cost: Duration,           // smoothed cost of one display scan
+    fb_still: u32,               // consecutive scans that found nothing
     av1: Option<video::Av1Encoder>, // the /video AV1 stream's encoder (stateful, inter-frame)
     video_scanned: Option<Instant>, // last /video frame (paced)
     /// Smoothed wall time one AV1 frame costs. The stream is paced off this
@@ -971,6 +973,8 @@ fn main() {
         net: None,
         display: Display::new(),
         fb_scanned: None,
+        fb_cost: Duration::from_millis(0),
+        fb_still: 0,
         av1: None,
         video_scanned: None,
         video_cost: Duration::from_millis(0),
@@ -1101,16 +1105,39 @@ fn main() {
                     }
                 }
                 // display scanout: only while someone is actually watching
-                // (an unwatched machine costs zero scan work), paced at
-                // FB_SCAN_MS. Dirty bands go out as deflated SSE events; the
-                // browser blits them onto its canvas (see display.rs).
+                // (an unwatched machine costs zero scan work). Dirty bands go
+                // out as deflated SSE events; the browser blits them onto its
+                // canvas (see display.rs).
+                //
+                // Paced by what a scan COSTS rather than by a fixed clock, the
+                // same way the AV1 path below is. A flat 100 ms capped the
+                // picture at 10 fps whatever the machine was doing — which is
+                // both too slow for an idle guest, where a scan is a couple of
+                // milliseconds and the thread is free, and too eager for a
+                // busy one, where every scan is emulator time the desktop
+                // wanted. Spending at most 1/(1+ratio) of the thread lets the
+                // frame rate rise on a quiet machine and fall on a working
+                // one, which is the right way round for both.
+                // A cost budget alone would make a STILL screen more expensive
+                // than the old fixed clock did: finding nothing is cheap, so
+                // the budget would happily look for nothing sixty times a
+                // second. So back off toward the old cadence while the picture
+                // is not moving, and snap back to the floor the moment it is.
+                // A motion's first frame can then be up to FB_SCAN_MS late —
+                // exactly as late as it always was — and every frame after it
+                // arrives at the fast rate.
                 if server.sse_count("display") > 0
                     && app.fb_scanned.map_or(true, |t| {
-                        t.elapsed() >= std::time::Duration::from_millis(display::FB_SCAN_MS)
+                        t.elapsed() >= display::scan_interval(app.fb_cost, app.fb_still)
                     })
                 {
-                    app.fb_scanned = Some(Instant::now());
-                    for band in app.display.scan(emu) {
+                    let began = Instant::now();
+                    let bands = app.display.scan(emu);
+                    app.fb_still = match bands.is_empty() {
+                        true => app.fb_still.saturating_add(1),
+                        false => 0,
+                    };
+                    for band in bands {
                         server.broadcast(
                             "display",
                             &format!(
@@ -1120,6 +1147,11 @@ fn main() {
                         );
                         busy = true;
                     }
+                    // Smoothed, so one expensive full-frame band (a new
+                    // watcher, or a whole-screen repaint) does not stall the
+                    // stream for a second afterwards.
+                    app.fb_cost = (app.fb_cost + began.elapsed()) / 2;
+                    app.fb_scanned = Some(Instant::now());
                 }
                 // AV1 video scan: same watch-gating + pacing as the display,
                 // but capture -> rav1e encode -> base64 SSE. A fresh viewing
