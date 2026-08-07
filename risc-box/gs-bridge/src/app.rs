@@ -9,36 +9,112 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use openssl::ssl::{SslConnector, SslMethod};
+
+/// Either a plain socket or a TLS one. A deployment on the fleet terminates
+/// TLS inside the enclave and serves nothing in the clear, so reaching one at
+/// all means speaking https; a local `wasmtime run` serves plain http. Both
+/// are just a Read + Write to everything above this.
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<openssl::ssl::SslStream<TcpStream>>),
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.read(buf),
+            Conn::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(s) => s.write(buf),
+            Conn::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => s.flush(),
+            Conn::Tls(s) => s.flush(),
+        }
+    }
+}
+
 pub struct App {
     /// host:port of the RISC Box app, e.g. "127.0.0.1:8000".
     addr: String,
+    /// Hostname without the port — TLS needs it for SNI and cert validation,
+    /// and it is what belongs in the Host header.
+    host: String,
+    tls: bool,
+    /// Bearer token for a deployment whose config sets `api_key`.
+    api_key: Option<String>,
 }
 
 impl App {
+    /// Accepts "host:port", "http://host[:port]" or "https://host[:port]".
+    /// https defaults to port 443, http to the port given (or 80).
     pub fn new(base: &str) -> App {
-        // Accept either "host:port" or "http://host:port".
-        let addr = base.trim_start_matches("http://").trim_end_matches('/').to_string();
-        App { addr }
+        let tls = base.starts_with("https://");
+        let rest = base
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/');
+        let host = rest.split(':').next().unwrap_or(rest).to_string();
+        let addr = match rest.contains(':') {
+            true => rest.to_string(),
+            false => format!("{rest}:{}", if tls { 443 } else { 80 }),
+        };
+        App { addr, host, tls, api_key: None }
+    }
+
+    /// Set the bearer token sent with every request.
+    pub fn with_api_key(mut self, key: Option<String>) -> App {
+        self.api_key = key;
+        self
     }
 
     pub fn addr(&self) -> &str {
         &self.addr
     }
 
-    fn connect(&self) -> std::io::Result<TcpStream> {
+    fn auth_header(&self) -> String {
+        match &self.api_key {
+            Some(k) => format!("Authorization: Bearer {k}\r\n"),
+            None => String::new(),
+        }
+    }
+
+    fn connect(&self) -> std::io::Result<Conn> {
         let s = TcpStream::connect(&self.addr)?;
         s.set_nodelay(true)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
-        s.set_write_timeout(Some(Duration::from_secs(10)))?;
-        Ok(s)
+        // Generous: a frame read crosses the internet on the remote path, and
+        // the app's event loop can be mid-instruction-batch when it arrives.
+        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        s.set_write_timeout(Some(Duration::from_secs(30)))?;
+        if !self.tls {
+            return Ok(Conn::Plain(s));
+        }
+        let connector = SslConnector::builder(SslMethod::tls_client())
+            .map_err(|e| std::io::Error::other(format!("tls setup: {e}")))?
+            .build();
+        let stream = connector
+            .connect(&self.host, s)
+            .map_err(|e| std::io::Error::other(format!("tls handshake with {}: {e}", self.host)))?;
+        Ok(Conn::Tls(Box::new(stream)))
     }
 
     /// GET a path and return the response body.
     pub fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
         let mut s = self.connect()?;
         let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n\r\n",
-            self.addr
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\nAccept: */*\r\n\r\n",
+            self.host,
+            self.auth_header()
         );
         s.write_all(req.as_bytes())?;
         let mut raw = Vec::new();
@@ -50,9 +126,10 @@ impl App {
     pub fn post_json(&self, path: &str, body: &str) -> std::io::Result<()> {
         let mut s = self.connect()?;
         let req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+            "POST {path} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            self.addr,
+            self.host,
+            self.auth_header(),
             body.len()
         );
         s.write_all(req.as_bytes())?;
