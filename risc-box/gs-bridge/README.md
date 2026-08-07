@@ -94,12 +94,54 @@ the protocol is unforgiving about, all learned the hard way:
 
 ```
 cargo build --release
-./target/release/gs-bridge --app 127.0.0.1:8000
+./target/release/gs-bridge --app 127.0.0.1:8000            # a local RISC Box
+./target/release/gs-bridge --app https://<id>.app.enclave.host   # one on the fleet
 ```
 
-Options: `--app <host:port>` (the RISC Box app), `--fb <WxH>` (its framebuffer
-size, default 1024x768), `--codec <name>` (default `h264_nvenc`), `--state <dir>`
-(server identity and paired certs).
+Options: `--app <url>` (host:port, `http://…` or `https://…`), `--api-key
+<token>` or `RISCBOX_API_KEY` (if the app config sets `api_key`), `--fb <WxH>`
+(framebuffer size, default 1024x768), `--codec <name>` (default `h264_nvenc`),
+`--state <dir>` (server identity and paired certs), `--frames auto|bands|raw`,
+`--probe`.
+
+**Check the connection first.** `--probe` fetches one frame, says whether it
+matches `--fb`, and reports whether anything is actually drawn on it; add
+`--frames bands` to prove the mirror rather than the connection, and set
+`GS_PROBE_PPM=/tmp/f.ppm` to write the frame out and look at it.
+
+```
+$ gs-bridge --app https://<id>.app.enclave.host --frames bands --probe
+[screen] mirroring 1024x768 from /display
+[probe] mirrored 2359296 bytes after 1 bands
+[probe] mirror has 16 distinct colours in a sample
+```
+
+### Where frames come from, and why it matters remotely
+
+`GET /fb.rgb` hands over a whole framebuffer. Beside the app that is the right
+answer — no state, no protocol. Across a network it is hopeless: the frame is
+2.25 MiB and one measured **2.9 seconds** from a deployment on the fleet, about
+a third of a frame per second.
+
+So a remote bridge mirrors the app's **`/display` band stream** instead. The app
+already scans its framebuffer, finds the rows that changed and ships them
+deflated; gs-bridge holds that stream open, applies each band to a local copy,
+and the encoder reads that copy as a memcpy. Traffic becomes proportional to
+what moved rather than to frame rate:
+
+| source | mostly-idle desktop | at 30 fps |
+|---|---|---|
+| `/fb.rgb` per frame | 68 MiB/s | 68 MiB/s |
+| `/display` bands | **479 bytes/s** | proportional to change |
+
+`--frames` defaults to `auto`: bands for an `https://` app, raw for a local one.
+
+One thing this does NOT fix: raw frames still leave the enclave. The bands are
+the guest's own pixels, just compressed. Encoding *inside* the enclave — the
+`nvenc` verb specced in `../PLATFORM.md` — is what would keep pixels in and emit
+H.264 directly, and it has a second argument in its favour now: the app is
+single-threaded (wasip2 cannot spawn one, on p2 or p3), so anything encoded in
+there competes with the emulator for the only core it has.
 
 Pairing with a real client, with the PIN pre-seeded so it can run unattended:
 
