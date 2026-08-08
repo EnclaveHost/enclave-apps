@@ -988,7 +988,7 @@
       </button>
       <div class="side-note">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
-        <span>Confidential inference: runs sandboxed via wasi-nn; chat history never leaves this device.</span>
+        <span>Private by design: answers are computed inside a secure enclave, and chat history never leaves this device.</span>
       </div>
       <!-- base-relative like every other link, so the pair follows a proxy
            prefix; a new tab, because the chat page holds unsaved state when
@@ -1018,7 +1018,7 @@
     </div>
     <span id="warmPill" role="status"></span>
     <button id="cpuChip" aria-label="Running in CPU mode, no GPU capacity - details"
-            title="No GPU capacity in the fleet right now: running in CPU mode">
+            title="No GPU available right now: running in CPU mode">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/></svg>
       <span class="lbl">CPU mode</span>
     </button>
@@ -1043,7 +1043,7 @@
         <svg viewBox="0 0 512 512"><use href="#eyesoff"/></svg>
       </div>
       <h1>What can I help with?</h1>
-      <p>Private inference inside a secure enclave. Nothing you type ever leaves it.</p>
+      <p>Private chat inside a secure enclave. Nothing you type ever leaves it.</p>
       <div class="chips">
         <button class="chip">Explain confidential computing in simple terms</button>
         <button class="chip">Write a haiku about secure enclaves</button>
@@ -1062,11 +1062,11 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
         </button>
       </div>
-      <p>This deployment serves the same models over an OpenAI-compatible API. Point any OpenAI SDK at:</p>
+      <p>This server exposes the same models over an OpenAI-compatible API. Point any OpenAI SDK at:</p>
       <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
       <div class="code"><div class="code-head"><span>curl</span><button type="button" class="cbtn" id="apiCopyCurl">Copy</button></div><pre><code id="apiCurl"></code></pre></div>
       <p class="api-fine">Streaming and non-streaming. Also <code class="ic">GET /v1/models</code>, <code class="ic">GET /warmup?model=…</code>.
-      Model names match the picker. If the deployment config sets <code class="ic">api_key</code>, send it as
+      Model names match the picker. If the server config sets <code class="ic">api_key</code>, send it as
       <code class="ic">Authorization: Bearer &lt;key&gt;</code>. Requests run in the same enclave as this chat.</p>
     </div>
   </div>
@@ -1123,7 +1123,7 @@
       <div class="web-trade">
         <h3>What it costs you, exactly</h3>
         <p>Your question, or a short query written from it, goes to <b id="webProv">a search
-        provider</b> outside this enclave. They see that query and this deployment's IP address.
+        provider</b> outside this enclave. They see that query and this server's IP address.
         They do not see who you are, and they never see the rest of the conversation: the request
         leaves from the enclave, not from your browser.</p>
         <p class="web-note">Everything else stays as it was. With the switch off, nothing about
@@ -3379,7 +3379,7 @@ async function openAtt() {
         "read the fields below as the platform's claims, not as hardware's");
     } else if (snp.policy.debug) {
       attStatusLine("warn", "This VM's guest policy ALLOWS debug, which lets the host inspect it. " +
-        "Do not send anything sensitive to this deployment.");
+        "Do not send anything sensitive to this server.");
     } else if (snp.reportData.slice(0, 64) !== tls) {
       attStatusLine("warn", "The quote's report data does not match the TLS key the platform reports " +
         "for this enclave - verify independently before trusting this deployment");
@@ -3389,12 +3389,12 @@ async function openAtt() {
     }
     renderAtt(d, snp, attLoaded.from);
   } catch (e) {
-    attStatusLine("warn", "This deployment could not reach its own attestation: " + (e.message || e));
+    attStatusLine("warn", "This server could not fetch its own attestation report: " + (e.message || e));
     $("attBody").innerHTML = "";
     $("attBody").appendChild(attNote(
-      "The hardware report is fetched from the platform API over this deployment's egress leg. A deployment " +
-      "with no outbound leg, or an API that is briefly unreachable, leaves this empty - the enclave is not " +
-      "less attested for it, the numbers are just not readable from in here. Verify from outside instead."));
+      "The hardware report is fetched from the platform API over this server's own outbound connection. A " +
+      "server with no outbound access, or an API that is briefly unreachable, leaves this empty - the enclave is " +
+      "not less attested for it, the numbers are just not readable from in here. Verify from outside instead."));
     const fine = $("attFine");
     fine.textContent = "";
     const a = document.createElement("a");
@@ -3522,7 +3522,7 @@ function renderModelMenu() {
   modelMenu.appendChild(node('<div class="menu-label">Model</div>'));
   const entries = state.models.length
     ? state.models
-    : [{ name: "", label: "deployment default", sub: "server decides" }];
+    : [{ name: "", label: "server default", sub: "server decides" }];
   for (const m of entries) {
     const item = node('<button type="button" class="m-item" role="menuitemradio"><span class="m-txt">' +
       '<span class="m-name"></span><span class="m-sub"></span></span><span class="tick">' + ICONS.tick + "</span></button>");
@@ -3536,26 +3536,26 @@ function renderModelMenu() {
     if (pending) {
       item.disabled = true;
       item.title = pending;
-      item.querySelector(".m-sub").textContent = "loading on the host…";
+      item.querySelector(".m-sub").textContent = "loading on the server…";
     } else if (unfit) {
       item.disabled = true;
       item.title = unfit;
       item.querySelector(".m-sub").textContent = state.gpu === false
-        ? "needs a GPU enclave" : "needs a larger deployment";
+        ? "needs a GPU" : "needs a bigger server";
     } else {
       // "vision" earns its place in the one-line summary: it is the difference
       // between a model you can show something to and one you cannot, and the
       // attach button appearing and disappearing is otherwise unexplained
       item.querySelector(".m-sub").textContent = m.sub !== undefined
         ? m.sub
-        : [fmtBytes(m.bytes), m.backend, m.vision ? "vision" : null].filter(Boolean).join(" · ");
+        : [fmtBytes(m.bytes), m.vision ? "vision" : null].filter(Boolean).join(" · ");
     }
     if ((m.name || "") === state.model) item.classList.add("sel");
     item.addEventListener("click", () => {
       const was = state.model;
       state.model = m.name || "";
       pref("llmchat-model", state.model);
-      modelLabel.textContent = m.label || m.name || "deployment default";
+      modelLabel.textContent = m.label || m.name || "server default";
       renderModelMenu();
       closeModelMenu();
       // switching to a text-only model with pictures waiting: say so now
@@ -3581,7 +3581,7 @@ function renderModelMenu() {
     // the user pick their way into a guaranteed failure
     if (t === "gpu" && state.gpu === false) {
       b.disabled = true;
-      b.title = "no GPU capacity in the fleet right now - this deployment is CPU only";
+      b.title = "no GPU available right now - this server is CPU only";
     }
     b.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -3686,7 +3686,7 @@ function renderModelMenu() {
       b.textContent = t;
       if ((state.toolsOn ? "on" : "off") === t) b.classList.add("on");
       b.title = t === "on"
-        ? "let the model call this deployment's tools when a question needs one (" + what + ")"
+        ? "let the model call this server's tools when a question needs one (" + what + ")"
           + (needsWeb ? ". Web tools also need the search switch on" : "")
         : "never call a tool; answer from the model alone, nothing leaves the enclave";
       b.addEventListener("click", (e) => {
@@ -3762,7 +3762,7 @@ const modelsReady = (async () => {
   const def = models.find((m) => m.name === storedModel) ||
     models.find((m) => m.default) || models[0];
   state.model = def ? def.name : "";
-  modelLabel.textContent = def ? def.name : "deployment default";
+  modelLabel.textContent = def ? def.name : "server default";
   renderModelMenu();
   updateAttachUI();
   webNotice();
@@ -3807,7 +3807,7 @@ async function warm() {
       if (code === "model_not_loaded" || code === "host_load_failed") {
         // not a capacity verdict: the host hasn't loaded (or reload-pending)
         // this model - the platform restarts the deployment to fix it
-        pill("fail", ICONS.alert, " Model isn’t loaded on the host yet; the platform is on it, try again shortly", 12000);
+        pill("fail", ICONS.alert, " Model isn’t loaded on the server yet; the platform is on it, try again shortly", 12000);
       } else {
         pill("fail", ICONS.alert, " Warmup failed; the first reply will load the model", 10000);
       }
@@ -3889,10 +3889,10 @@ async function warmLadder() {
     // no doomed multi-GB load is ever started
     if (m.fits === false && state.target !== "cpu") {
       unfitCount++;
-      state.unfit[m.name] = m.why || "exceeds the deployment's VRAM budget";
+      state.unfit[m.name] = m.why || "too big for this server's GPU memory";
       li.classList.add("unfit");
       li.querySelector(".st").innerHTML = ICONS.alert;
-      li.querySelector(".b-sub").textContent = "exceeds VRAM budget";
+      li.querySelector(".b-sub").textContent = "needs more GPU memory";
       li.title = state.unfit[m.name];
       renderModelMenu();
       continue;
@@ -3907,17 +3907,17 @@ async function warmLadder() {
       // takes GPU capacity in the fleet, which the CPU-mode notice explains.
       if (state.gpu === false) {
         unfitCount++;
-        state.unfit[m.name] = "this model needs a GPU enclave; the fleet has no GPU "
-          + "capacity free right now, so the deployment is running on CPU";
+        state.unfit[m.name] = "this model needs a GPU, and none is available "
+          + "right now, so answers are running on CPU";
         li.classList.add("unfit");
         li.querySelector(".st").innerHTML = ICONS.alert;
-        li.querySelector(".b-sub").textContent = "needs a GPU enclave";
+        li.querySelector(".b-sub").textContent = "needs a GPU";
         li.title = state.unfit[m.name];
         renderModelMenu();
         continue;
       }
-      markPending(m, li, "the host has not loaded this model yet - the platform "
-        + "restarts the deployment to load it", "loading on the host…");
+      markPending(m, li, "the server has not loaded this model yet - it becomes "
+        + "selectable once it is ready", "loading on the server…");
       renderModelMenu();
       continue;
     }
@@ -3952,7 +3952,7 @@ async function warmLadder() {
       // restart of the deployment, so this ladder re-polls instead of
       // declaring the model missing
       markPending(m, li, err, code === "host_load_failed"
-        ? "host load failed, recovering…" : "loading on the host…");
+        ? "load failed, recovering…" : "loading on the server…");
     } else if (unfit) {
       unfitCount++;
       state.unfit[m.name] = err;
@@ -3982,7 +3982,7 @@ async function warmLadder() {
   const pending = Object.keys(state.hostPending);
   if (pending.length && bootRetries < BOOT_RETRY_MAX) {
     bootRetries++;
-    const wait = "Waiting for the host to load " + pending.join(", ")
+    const wait = "Waiting for the server to load " + pending.join(", ")
       + ", retrying (" + bootRetries + "/" + BOOT_RETRY_MAX + ")…";
     if (!warmed) bootMsg.textContent = wait;
     if (bootGone || warmed) { pill("", '<span class="spin"></span>', " " + wait); }
@@ -4006,10 +4006,10 @@ async function warmLadder() {
     pill("fail", ICONS.alert, " No GPU capacity right now; see CPU mode", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed && pending.length) {
-    pill("fail", ICONS.alert, " The host never finished loading the model; redeploy or check the deployment logs", 15000);
+    pill("fail", ICONS.alert, " The server never finished loading the model; redeploy or check the server logs", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed && unfitCount >= ladder.length) {
-    pill("fail", ICONS.alert, " No attached model fits this deployment; add resources or attach smaller models", 15000);
+    pill("fail", ICONS.alert, " No attached model fits this server; add resources or attach smaller models", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed) {
     pill("fail", ICONS.alert, " Warmup did not finish; the first reply will load the model", 10000);
