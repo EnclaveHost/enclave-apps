@@ -636,9 +636,9 @@ fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, Stri
                 e.volume.clone(),
                 if kv > 0 {
                     format!(
-                        "needs ~{:.1} GB to serve ({:.1} GB weights + {:.1} GB KV cache at the \
-                         node's context window + working set) but {:.1} GB of the {:.1} GB VRAM \
-                         budget remains - redeploy with a larger GPU share to unlock this model",
+                        "needs ~{:.1} GB of GPU memory ({:.1} GB model + {:.1} GB working \
+                         memory) but only {:.1} GB of {:.1} GB is free - a larger GPU share \
+                         unlocks this model",
                         gb(need),
                         gb(e.bytes),
                         gb(kv),
@@ -647,12 +647,12 @@ fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, Stri
                     )
                 } else {
                     format!(
-                        "{:.1} GB of weights cannot fit the deployment's {:.1} GB VRAM budget\
-                         {} - redeploy with a larger GPU share to unlock this model",
+                        "this {:.1} GB model cannot fit in the server's {:.1} GB of GPU memory\
+                         {} - a larger GPU share unlocks this model",
                         gb(e.bytes),
                         gb(budget),
                         if claimed > 0 {
-                            format!(" ({:.1} GB already claimed by smaller models)", gb(claimed))
+                            format!(" ({:.1} GB already used by smaller models)", gb(claimed))
                         } else {
                             String::new()
                         }
@@ -797,7 +797,7 @@ const BUSY_WAIT_BUDGET_MS: u128 = 300_000; // stop queueing after 5 minutes
 /// generate()'s queue keepalive opens with this, and internal_status
 /// prefix-matches it to tell the wait ticks from the load/ready lines
 /// around them.
-const BUSY_STATUS: &str = "all inference sessions are busy";
+const BUSY_STATUS: &str = "busy with other chats";
 /// Busy-queue allowance for the INTERNAL generations (the router verdict, the
 /// vision question, the chat title): long enough to ride out a normal turn
 /// finishing ahead, far short of the main leg's five minutes. An optional
@@ -831,7 +831,7 @@ fn internal_status<'a>(
         if waited >= budget_ms {
             return false;
         }
-        on_status(&format!("{label} (waiting for a free inference slot, {}s)", waited / 1000));
+        on_status(&format!("{label} (waiting for a free slot, {}s)", waited / 1000));
         true
     }
 }
@@ -902,14 +902,14 @@ fn ggml_load_err(cfg: &AppConfig, e: bindings::wasi::nn::errors::Error) -> Strin
     }
     match preloaded_graphs() {
         Some(pre) if pre.iter().any(|p| p == vol) => format!(
-            "[host_load_failed] {base} - the host tried to load \"{vol}\" when this \
-             deployment started and FAILED (the deployment log has the reason); if this \
-             persists, the deployment's share cannot hold the model"
+            "[host_load_failed] {base} - the server tried to load \"{vol}\" when it \
+             started and FAILED (the server log has the reason); if this persists, \
+             the server cannot hold the model"
         ),
         Some(_) => format!(
             "[model_not_loaded] {base} - \"{vol}\" is attached but was not loaded when \
-             this deployment started (the volume finished mounting later, or it exceeds \
-             the share's VRAM budget); the platform restarts the deployment to load it - \
+             this server started (the volume finished mounting later, or it does not \
+             fit in GPU memory); the platform restarts the server to load it - \
              retry shortly"
         ),
         None => format!(
@@ -8981,7 +8981,7 @@ mod tests {
         assert!(relay(&format!("{BUSY_STATUS} (2s) - waiting for a free slot")));
         let got = seen.borrow().last().cloned().unwrap();
         assert!(got.starts_with("deciding what this needs…"), "{got}");
-        assert!(got.contains("waiting for a free inference slot"), "{got}");
+        assert!(got.contains("waiting for a free slot"), "{got}");
         // budget spent: the relay says stop, and nothing more is forwarded
         let spent = internal_status("deciding what this needs…", &sink, 0);
         let n = seen.borrow().len();

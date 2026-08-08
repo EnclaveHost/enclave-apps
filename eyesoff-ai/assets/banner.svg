@@ -18,7 +18,7 @@
   <text x="90" y="150" font-size="64" font-weight="700" fill="#2DD4BF">eyesoff<tspan fill="#8CF5D2">.ai</tspan></text>
   <text x="90" y="205" font-size="26" fill="#868ea0">prompts and replies processed only inside the enclave;</text>
   <text x="90" y="240" font-size="26" fill="#868ea0">history lives in your browser, the server stores nothing</text>
-  <text x="90" y="300" font-size="20" fill="#5b667a">OpenAI-compatible API &#8594; wasi-nn on attested GPUs &#8594; tokens streamed to your tab</text>
+  <text x="90" y="300" font-size="20" fill="#5b667a">OpenAI-compatible API &#8594; GPUs that prove what they run &#8594; answers streamed to your tab</text>
 
   <!-- the mark, floating at banner scale -->
   <g transform="translate(1180,72) scale(0.5)">
