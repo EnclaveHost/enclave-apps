@@ -1,0 +1,14 @@
+# PINNED after the 2026-08-07 fleet outage: llm-chat 1.4.7 was byte-identical
+# source to working code but built with the floating rustup nightly, which had
+# moved to nightly-2026-08-06 - and every build from that compiler (and back
+# through nightly-2026-07-28) hangs FOREVER at the guest's first wasi-nn call
+# on the fleet engine, while the same source built with nightly-2026-07-25
+# works. Bisect: 07-25 GOOD, 07-28 BAD, 08-01 BAD, 08-05 BAD, 08-06 BAD
+# (= the published, broken 1.4.7). Verified locally against the exact fleet
+# engine image (49-dev ac0772970, CPU ggml, qwen3.5-0.8b).
+#
+# Do not bump this channel without re-running that check: build, then serve
+# under the pinned WASMTIME_IMAGE and confirm GET /warmup answers.
+[toolchain]
+channel = "nightly-2026-07-25"
+targets = ["wasm32-wasip2", "wasm32-wasip1"]
