@@ -1362,7 +1362,10 @@ function inline(s) {
 
 function buildList(items, start, depth) {
   const ordered = items[start].o;
-  let html = ordered ? "<ol>" : "<ul>";
+  // A list that opens on something other than 1 keeps its own count, so a
+  // reply picking up at "7." numbers 7, 8, 9 rather than starting over.
+  const first = ordered ? items[start].n : 1;
+  let html = ordered ? (first > 1 ? '<ol start="' + first + '">' : "<ol>") : "<ul>";
   let k = start;
   while (k < items.length && items[k].d >= depth) {
     if (items[k].d > depth) {
@@ -1420,10 +1423,23 @@ function md(src) {
       const items = [];
       while (i < lines.length) {
         const m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
-        if (!m) break;
+        if (!m) {
+          // A loose list - the shape a model reaches for once the items get
+          // long - puts a blank line between them. Peek past the gap: if
+          // another item follows, the list is still running. Stopping here
+          // would close the <ol> and open a fresh one on the next item, and
+          // every item after the first would render as "1.".
+          if (!/^\s*$/.test(lines[i])) break;
+          let j = i;
+          while (j < lines.length && /^\s*$/.test(lines[j])) j++;
+          if (j >= lines.length || !/^\s*([-*+]|\d+[.)])\s+/.test(lines[j])) break;
+          i = j;
+          continue;
+        }
         items.push({
           d: Math.min(3, Math.floor(m[1].replace(/\t/g, "  ").length / 2)),
           o: /\d/.test(m[2]),
+          n: parseInt(m[2], 10),
           t: m[3],
         });
         i++;
