@@ -454,7 +454,7 @@ fn search_ddg(cfg: &SearchConfig, query: &str) -> Result<Vec<Hit>, String> {
         // no UA at all gets a bot page; this is the plainest honest one
         (
             "user-agent".to_string(),
-            b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)".to_vec(),
+            b"Mozilla/5.0 (compatible; enclave-eyesoff-ai/1.0)".to_vec(),
         ),
         ("accept".to_string(), b"text/html".to_vec()),
     ];
@@ -561,7 +561,7 @@ pub fn fetch_page(cfg: &SearchConfig, url: &str) -> Result<String, String> {
                 .timeout(cfg.timeout_s)
                 .header(
                     "user-agent",
-                    b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)",
+                    b"Mozilla/5.0 (compatible; enclave-eyesoff-ai/1.0)",
                 )
                 .header(
                     "accept",
@@ -621,7 +621,7 @@ pub fn send_request(
         .timeout(cfg.timeout_s)
         .header(
             "user-agent",
-            b"Mozilla/5.0 (compatible; enclave-llm-chat/1.0)",
+            b"Mozilla/5.0 (compatible; enclave-eyesoff-ai/1.0)",
         )
         .header("accept", b"application/json, text/plain;q=0.9, */*;q=0.8");
     if body.is_some() {

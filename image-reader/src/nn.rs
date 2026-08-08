@@ -1,7 +1,7 @@
 //! The inference half: model volumes, the ggml session, the image verb, and
 //! one generation.
 //!
-//! BACKEND: ggml (llama.cpp) only, unlike the sibling llm-chat app which also
+//! BACKEND: ggml (llama.cpp) only, unlike the sibling eyesoff-ai app which also
 //! carries an ONNX path. That is not a simplification for its own sake - the
 //! ONNX path shuttles the KV cache through guest memory as tensors and has no
 //! image verb at all, so there is nothing for a vision app to fall back to.

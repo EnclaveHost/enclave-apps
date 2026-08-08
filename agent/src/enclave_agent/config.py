@@ -17,16 +17,16 @@ def _env(name: str, default: str) -> str:
 
 @dataclass
 class Settings:
-    # The llm-chat deployment's OpenAI surface. Client-declared tools need
+    # The eyesoff-ai deployment's OpenAI surface. Client-declared tools need
     # catalog 1.4.0+ (crate 0.26.0); older versions refuse the tools array
     # with a 400 that says so.
     base_url: str = field(default_factory=lambda: _env(
         "ENCLAVE_AGENT_BASE_URL", "https://cc1f4f3f.app.enclave.host/v1"))
-    # llm-chat only checks this when the deployment config sets an api_key;
+    # eyesoff-ai only checks this when the deployment config sets an api_key;
     # the OpenAI client insists on some value either way.
     api_key: str = field(default_factory=lambda: _env(
         "ENCLAVE_AGENT_API_KEY", "unused"))
-    # Any name works: llm-chat resolves unknown models to the largest one the
+    # Any name works: eyesoff-ai resolves unknown models to the largest one the
     # deployment serves (GET /v1/models lists what is attached).
     model: str = field(default_factory=lambda: _env(
         "ENCLAVE_AGENT_MODEL", "auto"))
@@ -35,11 +35,11 @@ class Settings:
     max_tokens: int = field(default_factory=lambda: int(_env(
         "ENCLAVE_AGENT_MAX_TOKENS", "4096")))
     # Streaming keeps long turns alive: the gateway cuts a response stream
-    # that goes quiet for ~180s, and llm-chat heartbeats SSE comments while
+    # that goes quiet for ~180s, and eyesoff-ai heartbeats SSE comments while
     # it thinks. The buffered path has no heartbeat to send.
     streaming: bool = field(default_factory=lambda: _env(
         "ENCLAVE_AGENT_STREAMING", "1") not in ("0", "false", "no"))
-    # LangGraph recursion cap. llm-chat's passthrough yields ONE tool call
+    # LangGraph recursion cap. eyesoff-ai's passthrough yields ONE tool call
     # per model turn, so a task that needs N calls costs 2N+1 graph steps.
     recursion_limit: int = field(default_factory=lambda: int(_env(
         "ENCLAVE_AGENT_RECURSION_LIMIT", "25")))

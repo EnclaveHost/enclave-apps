@@ -9,7 +9,7 @@
 //! volume; nothing platform-side knows this app makes sound.
 //!
 //! THE SPLIT: the 3B transformer runs on the GPU share behind wasi-nn's
-//! `tokens` verb, exactly like llm-chat's models. The guest samples the audio
+//! `tokens` verb, exactly like eyesoff-ai's models. The guest samples the audio
 //! tokens itself (the host returns dense logits, so the sampler can enforce
 //! the 7-slot frame structure by construction - sampling.rs), unpacks frames
 //! into SNAC codebook streams (maya.rs), and runs the SNAC 24 kHz decoder -

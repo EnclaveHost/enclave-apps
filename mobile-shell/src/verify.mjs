@@ -30,7 +30,7 @@ import { Verifier } from "@tinfoilsh/verifier";
  */
 export async function verifyApp({ url, attestationPath, repo, deploymentId, apiBase, getJson, onStage = () => {} }) {
   onStage("fetching the app's attestation document");
-  // The app's own /attestation is a llm-chat-style convention, not a platform
+  // The app's own /attestation is a eyesoff-ai-style convention, not a platform
   // contract - a generic wrap can't assume it. The PLATFORM's per-deployment
   // attestation is public and exists for every deployment, so it is the
   // fallback (and, given a deployment id but no serving app, the primary):

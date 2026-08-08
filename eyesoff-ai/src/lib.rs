@@ -1,4 +1,4 @@
-//! llm-chat: a general-purpose LLM service compiled into a wasm component,
+//! eyesoff-ai: a general-purpose LLM service compiled into a wasm component,
 //! running on Enclave's wasi-nn GPU interface. Ships NO weights - models
 //! arrive as attached Modelwrap volumes, and every attached volume the
 //! config's `models` catalog describes is servable, largest one the default
@@ -5798,7 +5798,7 @@ fn finish_search(
         // request dying on a flaky egress. The real error goes to the log and
         // the /search?q= probe still surfaces it for the operator.
         Err(e) => {
-            eprintln!("[llm-chat] web search failed, answering without it: {e}");
+            eprintln!("[eyesoff-ai] web search failed, answering without it: {e}");
             if web_mode != WebMode::Auto || asked_inline {
                 on_status("search failed; answering from model knowledge…");
                 note_failed_search(messages, last);

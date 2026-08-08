@@ -3,7 +3,7 @@ the agent - that is the passthrough contract: the enclave relays the model's
 call and never executes a caller's tool.
 
 That placement is a feature, not a compromise. The fleet's outbound egress is
-IPv6-only, so most of the web is unreachable from inside llm-chat; read_url
+IPv6-only, so most of the web is unreachable from inside eyesoff-ai; read_url
 running here reaches the IPv4 internet the enclave cannot. The trade travels
 the other way too: what these tools fetch and compute is visible to THIS
 machine, so nothing here should handle material that must stay in the TEE.

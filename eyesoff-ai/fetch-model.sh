@@ -6,7 +6,7 @@
 #
 #   wasmtime serve -Snn \
 #     --dir model-volume/qwen2.5-0.5b::/models/qwen2.5-0.5b \
-#     --env ENCLAVE_MODELS=qwen2.5-0.5b ... llm_chat.wasm
+#     --env ENCLAVE_MODELS=qwen2.5-0.5b ... eyesoff_ai.wasm
 #
 # Pinned to an exact HuggingFace revision and sha256 - the same artifacts the
 # production Modelwrap volume carries, so this doubles as the volume recipe.

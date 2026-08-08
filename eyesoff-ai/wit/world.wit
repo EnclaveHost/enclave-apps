@@ -1,13 +1,13 @@
-// llm-chat: an LLM served from an attached model volume, in a wasm component
+// eyesoff-ai: an LLM served from an attached model volume, in a wasm component
 // with a built-in web chat UI. Imports wasi:nn (the GPU interface bought with
 // gpuShare), exports the wasi:http handler. outgoing-handler is the web-search
 // path: the app fetches search results and pages ITSELF, from the deployment's
 // dedicated egress identity, so the user's query never leaves the browser to a
 // third party (see search.rs). WIT deps are vendored verbatim from wasmtime
 // v45 (wasi@0.2.6, wasi:nn@0.2.0-rc-2024-10-28) so guest and host always agree.
-package enclave:llm-chat;
+package enclave:eyesoff-ai;
 
-world llm-chat {
+world eyesoff-ai {
   import wasi:nn/tensor@0.2.0-rc-2024-10-28;
   import wasi:nn/errors@0.2.0-rc-2024-10-28;
   import wasi:nn/inference@0.2.0-rc-2024-10-28;

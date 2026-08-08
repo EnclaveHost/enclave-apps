@@ -16,7 +16,7 @@ app's README (and `wasm/apps/README.md` in the
 | [minecraft-server](minecraft-server/) | `nanmc`: a from-scratch Minecraft 1.8.9 (protocol 47) server. An ephemeral creative world, no JVM. |
 | [nn-demo](nn-demo/) | Minimal end-to-end wasi-nn inference (bundled ONNX model). |
 | [ggml-probe](ggml-probe/) | Smoke-tests the ggml (llama.cpp) wasi-nn backend end to end. |
-| [llm-chat](llm-chat/) | OpenAI-compatible LLM chat service over wasi-nn; models come from attached read-only model volumes, and a vision volume lets the model read images you attach. |
+| [eyesoff-ai](eyesoff-ai/) | OpenAI-compatible LLM chat service over wasi-nn; models come from attached read-only model volumes, and a vision volume lets the model read images you attach. |
 | [image-generator](image-generator/) | Text-to-image on a GPU share via wasi-nn, serving host-preloaded models. |
 | [image-reader](image-reader/) | The other direction: a vision model that answers questions about images you send it. Its own deployment, so the eyes start, stop and resize without touching the chat; no outbound socket, so what it sees cannot leave. |
 | [speech-generator](speech-generator/) | Text to speech: Maya1 (a 3B Llama that predicts SNAC audio tokens) on the GPU share, the SNAC codec decoded in-component in pure Rust, natural-language voice design, streamed WAV. No outbound socket, so what you say stays said to you. |

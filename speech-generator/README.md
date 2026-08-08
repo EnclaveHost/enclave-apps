@@ -50,7 +50,7 @@ that matter here.
 ```
 
 - **The host needs no audio support.** Maya1 is an ordinary GGUF volume to
-  it; any node that serves llm-chat serves this. The audio protocol lives
+  it; any node that serves eyesoff-ai serves this. The audio protocol lives
   entirely in which token ids the guest samples and what it does with them.
 - **The guest owns sampling** (the host returns the full dense logits row),
   so the sampler enforces the frame structure *by construction*: at step `g`

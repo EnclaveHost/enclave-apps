@@ -84,7 +84,7 @@ pub struct AppConfig {
     /// ("$IMAGE_READER_API_KEY") in a deployment config, never the literal -
     /// app config is published on-chain by CID.
     ///
-    /// Set it. The usual caller is a sibling llm-chat deployment reaching this
+    /// Set it. The usual caller is a sibling eyesoff-ai deployment reaching this
     /// one over the fleet's network, which means the endpoint is reachable by
     /// anything else that can dial an IPv6 address, and inference is the
     /// expensive kind of open door.
@@ -257,7 +257,7 @@ pub struct Rendered {
 }
 
 /// Render the conversation in the model's own chat format. Deliberately the
-/// same four templates (plus "raw") the sibling llm-chat app renders, and
+/// same four templates (plus "raw") the sibling eyesoff-ai app renders, and
 /// deliberately NO think-turn handling: a VLM that reasons before answering
 /// is welcome to, but this app never force-opens a `<think>` block, because
 /// its answers are consumed programmatically as often as they are read.

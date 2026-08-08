@@ -34,10 +34,10 @@ rather than by a conversation backlog, and the thing an operator wants is to
 **start it, stop it, resize it or restart it without touching the chat everyone
 is using**. Two deployments, two funding rates, two lifecycles.
 
-The sibling [llm-chat](../llm-chat/) app then points its `vision` config block
+The sibling [eyesoff-ai](../eyesoff-ai/) app then points its `vision` config block
 at this deployment and folds the answer into its own reply, which is what lets
 the chat model be the biggest thing the fleet holds while the eyes stay small
-and separate. llm-chat can also read images *itself* when a vision volume is
+and separate. eyesoff-ai can also read images *itself* when a vision volume is
 attached to it directly - that path still exists and is the right one when the
 image IS the subject (transcription, "read this table"). Use this app when the
 picture is one input to a larger conversation, or when something other than a
@@ -174,7 +174,7 @@ node the volume still loads and the deployment **refuses images with that
 reason** rather than silently ignoring them; `GET /health?probe=1` says which
 kind of node you landed on.
 
-## Wiring it into llm-chat
+## Wiring it into eyesoff-ai
 
 In the chat deployment's config:
 
@@ -186,9 +186,9 @@ In the chat deployment's config:
 }
 ```
 
-llm-chat then routes an attached image here, has its own model write the
+eyesoff-ai then routes an attached image here, has its own model write the
 question, and folds the answer into the turn it is about to answer. See
-`llm-chat/src/vision.rs` for what crosses and what does not.
+`eyesoff-ai/src/vision.rs` for what crosses and what does not.
 
 **Check reachability before you wire it.** A deployment's outbound egress is
 IPv6-ONLY, so app-to-app depends on the gateway answering over v6 for the
