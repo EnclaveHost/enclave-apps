@@ -4,7 +4,7 @@
 //! the host is concerned - the audio protocol lives entirely in which token
 //! ids the GUEST samples (sampling.rs) and what it does with them afterwards
 //! (snac.rs). The host hands back one dense logits row per feed; this app
-//! never asks for the sparse top-k rows the sibling llm-chat uses, because
+//! never asks for the sparse top-k rows the sibling eyesoff-ai uses, because
 //! slot-constrained sampling needs an arbitrary 4096-id window of the row and
 //! a top-256 could miss it entirely.
 //!

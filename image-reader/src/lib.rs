@@ -6,13 +6,13 @@
 //! projector) and a tokenizer.json; the node preloads the graph at startup and
 //! the guest load_by_name()s it. See fetch-model.sh for the reference volume.
 //!
-//! WHY THIS IS ITS OWN APP, and not a mode of the sibling llm-chat: seeing and
+//! WHY THIS IS ITS OWN APP, and not a mode of the sibling eyesoff-ai: seeing and
 //! chatting have different lifecycles. A vision model is idle most of the time
 //! and expensive while it runs, its VRAM share is sized by one dense KV window
 //! rather than by a conversation backlog, and the thing an operator wants to do
 //! with it is start it, stop it, resize it or restart it WITHOUT touching the
 //! chat everyone is using. Two deployments, two funding rates, two lifecycles.
-//! llm-chat then reaches this one over the fleet's network and folds the answer
+//! eyesoff-ai then reaches this one over the fleet's network and folds the answer
 //! into its own reply (its src/vision.rs), which means the chat model can be
 //! the biggest thing the fleet holds while the eyes stay small and separate.
 //!
@@ -952,7 +952,7 @@ impl Guest for Component {
         let query = pq.split_once('?').map(|(_, q)| q).unwrap_or("");
         let method = req.method();
 
-        // The playground's own surface, open like llm-chat's: the page, liveness,
+        // The playground's own surface, open like eyesoff-ai's: the page, liveness,
         // the catalog the model picker reads, the health/probe an operator needs
         // when something is wrong, and the SSE endpoint the page posts to. A key
         // that locked these would lock the operator out of their own diagnostics.

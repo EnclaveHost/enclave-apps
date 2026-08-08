@@ -207,6 +207,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
+name = "eyesoff-ai"
+version = "0.42.0"
+dependencies = [
+ "image-webp",
+ "jpeg-encoder",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "wit-bindgen-rt",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -289,18 +301,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "llm-chat"
-version = "0.41.1"
-dependencies = [
- "image-webp",
- "jpeg-encoder",
- "serde",
- "serde_json",
- "tokenizers",
- "wit-bindgen-rt",
-]
 
 [[package]]
 name = "log"

@@ -9689,7 +9689,7 @@ mod _rt {
 /// ```
 #[allow(unused_macros)]
 #[doc(hidden)]
-macro_rules! __export_llm_chat_impl {
+macro_rules! __export_eyesoff_ai_impl {
     ($ty:ident) => {
         self::export!($ty with_types_in self);
     };
@@ -9700,15 +9700,15 @@ macro_rules! __export_llm_chat_impl {
     };
 }
 #[doc(inline)]
-pub(crate) use __export_llm_chat_impl as export;
+pub(crate) use __export_eyesoff_ai_impl as export;
 #[cfg(target_arch = "wasm32")]
 #[unsafe(
-    link_section = "component-type:wit-bindgen:0.41.0:enclave:llm-chat:llm-chat:encoded world"
+    link_section = "component-type:wit-bindgen:0.41.0:enclave:eyesoff-ai:eyesoff-ai:encoded world"
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 7873] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xc2<\x01A\x02\x01A$\x01\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 7879] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xc6<\x01A\x02\x01A$\x01\
 B\x11\x01py\x04\0\x11tensor-dimensions\x03\0\0\x01m\x07\x04FP16\x04FP32\x04FP64\x04\
 BF16\x02U8\x03I32\x03I64\x04\0\x0btensor-type\x03\0\x02\x01p}\x04\0\x0btensor-da\
 ta\x03\0\x04\x04\0\x06tensor\x03\x01\x01i\x06\x01@\x03\x0adimensions\x01\x02ty\x03\
@@ -9864,10 +9864,10 @@ handle\x01\x0d\x03\0\x20wasi:http/outgoing-handler@0.2.6\x05\x15\x02\x03\0\x08\x
 incoming-request\x02\x03\0\x08\x11response-outparam\x01B\x08\x02\x03\x02\x01\x16\
 \x04\0\x10incoming-request\x03\0\0\x02\x03\x02\x01\x17\x04\0\x11response-outpara\
 m\x03\0\x02\x01i\x01\x01i\x03\x01@\x02\x07request\x04\x0cresponse-out\x05\x01\0\x04\
-\0\x06handle\x01\x06\x04\0\x20wasi:http/incoming-handler@0.2.6\x05\x18\x04\0\x19\
-enclave:llm-chat/llm-chat\x04\0\x0b\x0e\x01\0\x08llm-chat\x03\0\0\0G\x09producer\
-s\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x060.4\
-1.0";
+\0\x06handle\x01\x06\x04\0\x20wasi:http/incoming-handler@0.2.6\x05\x18\x04\0\x1d\
+enclave:eyesoff-ai/eyesoff-ai\x04\0\x0b\x10\x01\0\x0aeyesoff-ai\x03\0\0\0G\x09pr\
+oducers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bindgen-rust\x06\
+0.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {

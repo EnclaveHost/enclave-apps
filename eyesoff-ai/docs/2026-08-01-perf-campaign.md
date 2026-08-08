@@ -61,7 +61,7 @@ plain decode — but not faster here.
   exercised on the fleet post-refactor
 - 119 cargo tests incl. the new seams (piece-table UTF-8 withholding,
   sparse rows, lookup semantics, sparse sampler); CI runs them on every
-  push/PR (`.github/workflows/llm-chat-test.yml`), and the engine repo
+  push/PR (`.github/workflows/eyesoff-ai-test.yml`), and the engine repo
   CI-checks the wasmtime patch stack
 - instruments ship in the app: `verb_us` (per-verb µs), `init_ms`
   (pre-generation phases), `feed_warm` (graph warmup visibility)

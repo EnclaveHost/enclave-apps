@@ -39,7 +39,7 @@ def _narrate(messages: list, start: int, verbose: bool) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="enclave-agent",
-        description="LangGraph agent backed by an Enclave llm-chat deployment")
+        description="LangGraph agent backed by an Enclave eyesoff-ai deployment")
     ap.add_argument("-p", "--prompt", help="run one prompt and exit")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="keep <think> blocks in the printed answer")

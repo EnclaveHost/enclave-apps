@@ -1,6 +1,6 @@
 [package]
-name = "llm-chat"
-version = "0.41.1"
+name = "eyesoff-ai"
+version = "0.42.0"
 edition = "2021"
 publish = false
 
@@ -24,11 +24,11 @@ strip = true
 lto = true
 
 [package.metadata.component]
-package = "enclave:llm-chat"
+package = "enclave:eyesoff-ai"
 
 [package.metadata.component.target]
 path = "wit"
-world = "llm-chat"
+world = "eyesoff-ai"
 
 # WIT deps vendored from wasmtime v45 (see wit/world.wit)
 [package.metadata.component.target.dependencies]

@@ -86,7 +86,7 @@ Volume ready. Locally:
     --env ENCLAVE_CONFIG='{"model_volume":"qwen3-vl-8b-gguf","backend":"ggml",
       "name":"qwen3-vl-8b","vision":true,"template":"chatml","n_layers":36,
       "n_kv_heads":8,"head_dim":128,"vocab":151936,"eos":[151645,151643]}' \
-    target/wasm32-wasip2/release/llm_chat.wasm
+    target/wasm32-wasip2/release/eyesoff_ai.wasm
 
 In production: wrap this directory as a Modelwrap volume, attach it, and add
 the matching `models` catalog entry (see assets/deploy-config.template.json).

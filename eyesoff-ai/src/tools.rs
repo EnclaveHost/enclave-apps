@@ -1529,7 +1529,7 @@ fn discover(sess: &mut McpSession) -> Result<Vec<McpToolDecl>, String> {
         Some(serde_json::json!({
             "protocolVersion": sess.version,
             "capabilities": {},
-            "clientInfo": { "name": "llm-chat", "version": env!("CARGO_PKG_VERSION") },
+            "clientInfo": { "name": "eyesoff-ai", "version": env!("CARGO_PKG_VERSION") },
         })),
     )?;
     // the server may answer with a revision of its own choosing; speak its
@@ -1572,7 +1572,7 @@ fn call_mcp(
             Some(serde_json::json!({
                 "protocolVersion": sess.version,
                 "capabilities": {},
-                "clientInfo": { "name": "llm-chat", "version": env!("CARGO_PKG_VERSION") },
+                "clientInfo": { "name": "eyesoff-ai", "version": env!("CARGO_PKG_VERSION") },
             })),
         )?;
         if let Some(v) = init.get("protocolVersion").and_then(|v| v.as_str()) {

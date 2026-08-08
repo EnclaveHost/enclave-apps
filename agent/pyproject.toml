@@ -1,7 +1,7 @@
 [project]
 name = "enclave-agent"
 version = "0.1.0"
-description = "LangGraph agent that drives an Enclave llm-chat deployment as its OpenAI backend"
+description = "LangGraph agent that drives an Enclave eyesoff-ai deployment as its OpenAI backend"
 requires-python = ">=3.11"
 dependencies = [
     "langgraph>=0.2",

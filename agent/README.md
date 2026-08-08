@@ -1,13 +1,13 @@
 # enclave-agent
 
-A LangGraph agent whose model is an Enclave `llm-chat` deployment. The graph,
+A LangGraph agent whose model is an Enclave `eyesoff-ai` deployment. The graph,
 the tools, and the conversation state live on your machine; the model, its
 weights, and every token of inference live inside the attested enclave. The
-two meet at llm-chat's OpenAI-compatible `/v1/chat/completions`, so the whole
+two meet at eyesoff-ai's OpenAI-compatible `/v1/chat/completions`, so the whole
 LangChain toolchain works unmodified: `ChatOpenAI(base_url=...)` and nothing
 else knows a TEE is involved.
 
-Requires llm-chat catalog 1.4.0+ (crate 0.26.0): that release added the
+Requires eyesoff-ai catalog 1.4.0+ (crate 0.26.0): that release added the
 client-tools passthrough, where an OpenAI `tools: [...]` array is rendered
 into the model's prompt and its call comes back as `tool_calls` for THIS side
 to execute. Older versions refuse the array with a 400 that says so.
@@ -19,7 +19,7 @@ to execute. Older versions refuse the array with a 400 that says so.
 - What this machine sees: everything the tools do. `read_url` fetches from
   here (which is a feature: the fleet's egress is IPv6-only, and the agent
   host reaches the IPv4 web the enclave cannot). Do not put a tool here whose
-  inputs must stay inside the TEE; that is what llm-chat's own server-side
+  inputs must stay inside the TEE; that is what eyesoff-ai's own server-side
   tool registry is for.
 
 ## Quick start
@@ -40,7 +40,7 @@ output. Tool activity is narrated to stderr as it happens.
 | `ENCLAVE_AGENT_MODEL` | `auto` | unknown names resolve to the largest attached model |
 | `ENCLAVE_AGENT_MAX_TOKENS` | `4096` | per-generation cap |
 | `ENCLAVE_AGENT_TEMPERATURE` | `0.6` | sampling |
-| `ENCLAVE_AGENT_STREAMING` | `1` | keep on: the gateway cuts streams silent for ~180s and llm-chat heartbeats only while streaming |
+| `ENCLAVE_AGENT_STREAMING` | `1` | keep on: the gateway cuts streams silent for ~180s and eyesoff-ai heartbeats only while streaming |
 | `ENCLAVE_AGENT_RECURSION_LIMIT` | `25` | LangGraph step cap; the passthrough yields ONE tool call per model turn, so N calls cost 2N+1 steps |
 | `ENCLAVE_AGENT_SYSTEM_PROMPT` | (see config.py) | the agent's standing instructions |
 

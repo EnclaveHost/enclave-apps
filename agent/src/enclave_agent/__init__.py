@@ -1,4 +1,4 @@
-"""LangGraph agent driving an Enclave llm-chat deployment as its OpenAI
+"""LangGraph agent driving an Enclave eyesoff-ai deployment as its OpenAI
 backend. See README.md; the interesting files are agent.py (the graph) and
 tools.py (the client-side tool belt)."""
 

@@ -7,7 +7,7 @@ documentation: everything the agent can do is visible in the dozen lines
 below, and nothing depends on a helper whose signature moves between
 langgraph releases.
 
-One llm-chat particular: the passthrough ends the model's turn at its FIRST
+One eyesoff-ai particular: the passthrough ends the model's turn at its FIRST
 completed tool call (the trained stop string), so tool_calls always carries
 exactly one entry and a task needing N calls makes N round trips through
 this loop. The recursion limit in Settings is the harness against a model

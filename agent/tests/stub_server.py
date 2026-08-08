@@ -1,8 +1,8 @@
-"""A pocket llm-chat: just enough of the /v1 passthrough contract to prove
+"""A pocket eyesoff-ai: just enough of the /v1 passthrough contract to prove
 the agent loop without a GPU, a wallet, or a network.
 
 Faithful to the real thing where the contract matters:
-  - exactly ONE tool call per model turn (llm-chat stops generation at the
+  - exactly ONE tool call per model turn (eyesoff-ai stops generation at the
     first completed call)
   - `arguments` is a JSON-encoded STRING
   - finish_reason "tool_calls", content null on a call turn

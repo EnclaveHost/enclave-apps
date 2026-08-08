@@ -1,8 +1,8 @@
-# llm-chat OpenAI-compatible API reference
+# eyesoff-ai OpenAI-compatible API reference
 
-The service-provider interface of the llm-chat app: everything a client can
+The service-provider interface of the eyesoff-ai app (formerly llm-chat): everything a client can
 send to the `/v1` endpoints and everything that comes back, as implemented in
-`src/lib.rs` (accurate as of llm-chat **0.40.0**). Point any OpenAI SDK at a
+`src/lib.rs` (accurate as of **0.40.0**). Point any OpenAI SDK at a
 deployment's URL and it works; this document is the contract, including the
 Enclave extensions the OpenAI schema has no words for.
 

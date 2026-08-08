@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <!-- eyesoff.ai: wordmark banner; the model lives in the enclave and nothing looks at your prompts. -->
+  <defs>
+    <radialGradient id="glow" cx="18%" cy="0%" r="90%">
+      <stop offset="0%" stop-color="#6C5CE7" stop-opacity=".14"/>
+      <stop offset="60%" stop-color="#6C5CE7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="bubble" gradientUnits="userSpaceOnUse" x1="110" y1="120" x2="420" y2="420">
+      <stop offset="0" stop-color="#8CF5D2"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="400" fill="#0b0d12"/>
+  <rect width="1600" height="400" fill="url(#glow)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#252b38" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#2DD4BF">eyesoff<tspan fill="#8CF5D2">.ai</tspan></text>
+  <text x="90" y="205" font-size="26" fill="#868ea0">prompts and replies processed only inside the enclave;</text>
+  <text x="90" y="240" font-size="26" fill="#868ea0">history lives in your browser, the server stores nothing</text>
+  <text x="90" y="300" font-size="20" fill="#5b667a">OpenAI-compatible API &#8594; wasi-nn on attested GPUs &#8594; tokens streamed to your tab</text>
+
+  <!-- the mark, floating at banner scale -->
+  <g transform="translate(1180,72) scale(0.5)">
+    <rect x="96" y="128" width="320" height="216" rx="62" fill="url(#bubble)"/>
+    <path d="M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z" fill="url(#bubble)"/>
+    <path d="M178 214 Q256 280 334 214" fill="none" stroke="#131039" stroke-width="27" stroke-linecap="round"/>
+    <path d="M256 268 V304" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M211 259 L189 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M301 259 L323 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+    <path d="M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z" fill="#8CF5D2" opacity="0.95"/>
+  </g>
+</svg>

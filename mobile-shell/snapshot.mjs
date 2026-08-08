@@ -9,7 +9,7 @@
 //   - "/" (the page itself)
 //   - every href/src the HTML references
 //   - the service worker's precache list when the app serves sw.js
-//     (llm-chat-style `var SHELL = [...]`), plus sw.js itself
+//     (eyesoff-ai-style `var SHELL = [...]`), plus sw.js itself
 //   - manifest.webmanifest and its icons
 //
 //   node snapshot.mjs [app]     (or APP=<app>; default eyesoff)
