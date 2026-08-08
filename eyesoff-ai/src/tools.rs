@@ -868,6 +868,13 @@ pub struct ToolCall {
 /// `{"name": ..., "arguments": ...}`. Reasoning inside a <think> block is
 /// skipped: a model that talks through calling a tool has not called it.
 pub fn parse_calls(text: &str) -> Vec<ToolCall> {
+    parse_calls_for(text, &[])
+}
+
+/// As `parse_calls`, but with the caller's declared tools on hand so a call
+/// that names no function at all can still be identified. Use this on the /v1
+/// passthrough; the builtin path has no registry to match against.
+pub fn parse_calls_for(text: &str, tools: &[Tool]) -> Vec<ToolCall> {
     let body = after_think(text);
     let mut out = Vec::new();
     let mut rest = body;
@@ -877,7 +884,7 @@ pub fn parse_calls(text: &str) -> Vec<ToolCall> {
             Some(j) => (&after[..j], &after[j + "</tool_call>".len()..]),
             None => (after, ""),
         };
-        if let Some(c) = one_call(chunk) {
+        if let Some(c) = one_call(chunk, tools) {
             out.push(c);
         }
         rest = tail;
@@ -894,11 +901,39 @@ pub fn parse_calls(text: &str) -> Vec<ToolCall> {
     let t = body.trim();
     let inner = strip_fence(t).unwrap_or(t);
     if inner.starts_with('{') && inner.ends_with('}') {
-        if let Some(c) = one_call(inner) {
+        if let Some(c) = one_call(inner, tools) {
             return vec![c];
         }
     }
     Vec::new()
+}
+
+/// A call that names no function ANYWHERE - `{"arguments": {"content": ...,
+/// "filePath": ...}}` and nothing else - observed from the fable 27b writing a
+/// file through an agent. The argument keys still identify it whenever exactly
+/// one declared tool can accept them: every required key present, and no key
+/// the schema does not declare. Ambiguity returns None, because running the
+/// wrong tool is worse than showing the block.
+fn infer_name(args: &serde_json::Value, tools: &[Tool]) -> Option<String> {
+    let obj = args.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut fits = tools.iter().filter(|t| {
+        let Some(props) = t.parameters.get("properties").and_then(|v| v.as_object()) else {
+            return false;
+        };
+        let required = t.parameters.get("required").and_then(|v| v.as_array());
+        obj.keys().all(|k| props.contains_key(k))
+            && required.is_none_or(|a| {
+                a.iter().filter_map(|v| v.as_str()).all(|r| obj.contains_key(r))
+            })
+    });
+    let first = fits.next()?;
+    if fits.next().is_some() {
+        return None; // more than one tool fits: do not guess
+    }
+    Some(first.name.clone())
 }
 
 /// Everything after a closed `<think>` block, or the whole text when there is
@@ -923,8 +958,10 @@ fn strip_fence(t: &str) -> Option<&str> {
 /// (a common near-miss) are re-parsed rather than rejected, and so is a name
 /// tucked INSIDE the arguments object - `{"arguments": {"url": ..., "name":
 /// "fetch_url"}}` - which then poisons the conversation: the raw call is
-/// delivered as assistant text and every retry copies it verbatim.
-fn one_call(chunk: &str) -> Option<ToolCall> {
+/// delivered as assistant text and every retry copies it verbatim. A call that
+/// names nothing at all falls back to `infer_name` against the caller's own
+/// tools, which is the only evidence left.
+fn one_call(chunk: &str, tools: &[Tool]) -> Option<ToolCall> {
     let t = chunk.trim();
     let t = strip_fence(t).unwrap_or(t);
     let v: serde_json::Value = serde_json::from_str(t).ok().or_else(|| {
@@ -940,15 +977,24 @@ fn one_call(chunk: &str) -> Option<ToolCall> {
         Some(a) => a.clone(),
         None => serde_json::json!({}),
     };
-    let name = match v.get("name").and_then(|n| n.as_str()) {
-        Some(n) => n.trim().to_string(),
-        // no top-level name: pull it OUT of the arguments, where a `name` key
-        // can only be the function name the model misplaced
+    let named = |v: Option<&serde_json::Value>| {
+        v.and_then(|n| n.as_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string)
+    };
+    let name = match named(v.get("name")) {
+        Some(n) => n,
         None => {
-            let o = args.as_object_mut()?;
-            let n = o.get("name")?.as_str()?.trim().to_string();
-            o.remove("name");
-            n
+            // no top-level name: pull it OUT of the arguments, where a `name`
+            // key can only be the function name the model misplaced
+            match named(args.as_object().and_then(|o| o.get("name"))) {
+                Some(n) => {
+                    if let Some(o) = args.as_object_mut() {
+                        o.remove("name");
+                    }
+                    n
+                }
+                // named nowhere at all: let the argument keys identify it
+                None => infer_name(&args, tools)?,
+            }
         }
     };
     if name.is_empty() {
@@ -1811,6 +1857,56 @@ mod tests {
         assert_eq!(c[0].args["url"], "https://enclave.host/develop#api");
         // the function name is not an argument
         assert!(c[0].args.get("name").is_none(), "{:?}", c[0].args);
+    }
+
+    fn client_tool(name: &str, props: &[&str], required: &[&str]) -> Tool {
+        let properties: serde_json::Map<String, serde_json::Value> =
+            props.iter().map(|p| ((*p).to_string(), serde_json::json!({"type": "string"}))).collect();
+        Tool {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            }),
+            src: ToolSrc::Client,
+        }
+    }
+
+    #[test]
+    fn call_with_no_name_at_all_is_identified_by_its_arguments() {
+        // seen live (fable-fusion-27b, 2026-08-08, opencode writing a file):
+        // a complete, valid tool_call block carrying ONLY `arguments`
+        let reg = [
+            client_tool("write", &["filePath", "content"], &["filePath", "content"]),
+            client_tool("bash", &["command", "workdir"], &["command"]),
+        ];
+        let raw = "<tool_call>\n{\"arguments\":{\"content\":\"print(1)\\n\",\
+                   \"filePath\":\"/home/steven/pacman/pacman.py\"}}\n</tool_call>";
+        // without the registry there is nothing to match against
+        assert!(parse_calls(raw).is_empty());
+        let c = parse_calls_for(raw, &reg);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].name, "write");
+        assert_eq!(c[0].args["filePath"], "/home/steven/pacman/pacman.py");
+    }
+
+    #[test]
+    fn an_ambiguous_nameless_call_is_not_guessed() {
+        let reg = [
+            client_tool("read", &["path"], &["path"]),
+            client_tool("stat", &["path"], &["path"]),
+        ];
+        let raw = "<tool_call>{\"arguments\":{\"path\":\"/etc/hosts\"}}</tool_call>";
+        assert!(parse_calls_for(raw, &reg).is_empty());
+    }
+
+    #[test]
+    fn a_nameless_call_with_undeclared_keys_is_not_guessed() {
+        let reg = [client_tool("write", &["filePath", "content"], &["filePath"])];
+        let raw = "<tool_call>{\"arguments\":{\"filePath\":\"/a\",\"mode\":\"755\"}}</tool_call>";
+        assert!(parse_calls_for(raw, &reg).is_empty(), "`mode` is not in the schema");
     }
 
     #[test]
