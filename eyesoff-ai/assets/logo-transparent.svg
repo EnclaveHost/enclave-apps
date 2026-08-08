@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="eyesoff.ai logo">
+  <!-- eyesoff.ai mark on transparency: logo.svg minus the rounded background tile. -->
+  <defs>
+    <linearGradient id="bubble" gradientUnits="userSpaceOnUse" x1="110" y1="120" x2="420" y2="420">
+      <stop offset="0" stop-color="#8CF5D2"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- chat bubble -->
+  <rect x="96" y="128" width="320" height="216" rx="62" fill="url(#bubble)"/>
+  <path d="M236 340 L172 402 C162 411 147 403 150 391 L163 340 Z" fill="url(#bubble)"/>
+
+  <!-- closed eye -->
+  <path d="M178 214 Q256 280 334 214" fill="none" stroke="#131039" stroke-width="27" stroke-linecap="round"/>
+  <path d="M256 268 V304" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+  <path d="M211 259 L189 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+  <path d="M301 259 L323 289" stroke="#131039" stroke-width="25" stroke-linecap="round"/>
+
+  <!-- AI spark -->
+  <path d="M418 82 C421.5 96 426 100.5 440 104 C426 107.5 421.5 112 418 126 C414.5 112 410 107.5 396 104 C410 100.5 414.5 96 418 82 Z" fill="#8CF5D2" opacity="0.95"/>
+</svg>
