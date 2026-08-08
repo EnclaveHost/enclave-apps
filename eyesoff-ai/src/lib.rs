@@ -4514,6 +4514,13 @@ struct CallGate {
 /// either of these is asking for a tool, not writing prose.
 const CALL_OPENERS: [&str; 2] = ["<tool_call>", "{\"name\""];
 
+/// How long a streamed response may go without writing a byte before the
+/// gateway gives up on it, minus a wide margin. The gateway drops a stream
+/// roughly 180s after its last byte, and a SUPPRESSED call writes nothing at
+/// all while the model composes it: a /v1 client that passes its own tools can
+/// ask for a whole source file as one argument, which is minutes of silence.
+const STREAM_TICK_MS: u128 = 15_000;
+
 impl CallGate {
     fn new(armed: bool, think_open: bool) -> CallGate {
         CallGate { decided: !armed, suppress: false, thinking: think_open, held: String::new() }
@@ -7050,13 +7057,26 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 tl.is_some() || client_block.is_some(),
                 think_open,
             ));
+            // when the last byte reached the client, so a long silence can be
+            // broken before the gateway mistakes it for a dead stream
+            let last_tx = std::cell::Cell::new(now_ms());
             let emit = |delta: &str| {
-                let Some(out) = gate.borrow_mut().push(delta) else { return true };
+                let Some(out) = gate.borrow_mut().push(delta) else {
+                    // the gate is holding a call: nothing legible can go out
+                    // yet, but the connection still has to prove it is alive.
+                    // A comment is invisible to every OpenAI SDK.
+                    if now_ms().saturating_sub(last_tx.get()) < STREAM_TICK_MS {
+                        return true;
+                    }
+                    last_tx.set(now_ms());
+                    return send_raw(": generating\n\n");
+                };
                 if !opened.replace(true)
                     && !send_raw(&chunk(serde_json::json!({ "content": "<think>\n" }), None))
                 {
                     return false;
                 }
+                last_tx.set(now_ms());
                 send_raw(&chunk(serde_json::json!({ "content": out }), None))
             };
             // OpenAI protocol has no status events; SSE comments keep the
@@ -7104,7 +7124,8 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                         if bare { format!("[{note}]") } else { format!("\n\n[{note}]") }
                     });
                     if client_block.is_some() {
-                        client_calls = tools::parse_calls(&s.text);
+                        client_calls =
+                            tools::parse_calls_for(&s.text, client_reg.as_deref().unwrap_or(&[]));
                         if !client_calls.is_empty() {
                             // the held call leaves as structured `tool_calls`
                             // below, not as content
@@ -7267,7 +7288,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         match result {
             Some(s) => {
                 let client_calls = if client_block.is_some() {
-                    tools::parse_calls(&s.text)
+                    tools::parse_calls_for(&s.text, client_reg.as_deref().unwrap_or(&[]))
                 } else {
                     Vec::new()
                 };
