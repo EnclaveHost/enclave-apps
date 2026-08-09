@@ -27,16 +27,17 @@
 #                    script - rerun it to reproduce diffusion.gguf
 #                    bit-for-bit provenance.
 #
-#   realesrgan-x4plus  the stock UPSCALER volume: Real-ESRGAN x4plus
-#                    (xinntao, BSD-3-Clause official weights, RRDBNet
-#                    23-block 4x - the architecture sd.cpp's upscaler engine
-#                    runs; heavier archs like DAT/HAT don't, and the better
-#                    community finetunes carry non-commercial licenses).
-#                    Built HERE, not fetched: the official release .pth
-#                    converts torch-free to a plain safetensors
-#                    (tools/convert_esrgan.py, deterministic - the pinned
-#                    output sha256 IS the provenance chain). To be wrapped
-#                    as EnclaveHost/realesrgan-x4plus-sd.
+#   realesrgan-x4plus  repo: EnclaveHost/realesrgan-x4plus-sd@f7b73b7949e01f9129c9be9f27337b87dceee51c
+#                    The stock UPSCALER volume: Real-ESRGAN x4plus (xinntao,
+#                    BSD-3-Clause official weights, RRDBNet 23-block 4x -
+#                    the architecture sd.cpp's upscaler engine runs; heavier
+#                    archs like DAT/HAT don't, and the better community
+#                    finetunes carry non-commercial licenses). The curated
+#                    repo holds the official v0.1.0 release .pth converted
+#                    torch-free by tools/convert_esrgan.py (deterministic:
+#                    source sha256 4fa0d389..., output sha256 d3024198... -
+#                    rerun the tool on the release .pth to reproduce the
+#                    file bit for bit; full provenance in the repo README).
 #
 # Component filenames are GENERIC in both volumes (diffusion.gguf /
 # llm.gguf / vae.safetensors): the platform's ENCLAVE_SD_*_FILE envs are
@@ -86,21 +87,10 @@ if [ "$want" = qwen-image-2512 ] || [ "$want" = all ]; then
 fi
 
 if [ "$want" = realesrgan-x4plus ] || [ "$want" = all ]; then
+    REPO=EnclaveHost/realesrgan-x4plus-sd
+    REV=f7b73b7949e01f9129c9be9f27337b87dceee51c
     DEST=model-volume/realesrgan-x4plus-sd
-    OUT=$DEST/upscaler.safetensors
-    OUT_SHA=d30241986d4f29502949e1b46558a8c2a42067605a78428229f758429c94dda4
-    if [ -f "$OUT" ] && echo "$OUT_SHA  $OUT" | sha256sum -c --quiet - 2>/dev/null; then
-        echo "$OUT: cached, checksum ok"
-    else
-        mkdir -p "$DEST"
-        PTH=$DEST/RealESRGAN_x4plus.pth.src
-        curl -fSL --retry 3 -C - -o "$PTH" \
-            https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
-        echo "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1  $PTH" | sha256sum -c -
-        python3 tools/convert_esrgan.py "$PTH" "$OUT"
-        echo "$OUT_SHA  $OUT" | sha256sum -c -
-        rm -f "$PTH"
-    fi
+    fetch $REPO $REV upscaler.safetensors d30241986d4f29502949e1b46558a8c2a42067605a78428229f758429c94dda4 $DEST
 fi
 
 echo

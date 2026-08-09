@@ -199,7 +199,7 @@ models:
   - name: "qwen-image-2512"      # from tools/merge-lightning.sh output
     repo: "EnclaveHost/qwen-image-2512-sd@a82dcb53ef8ff3c675dd0b636788ebb332fa973f"
   - name: "realesrgan-x4plus"    # upscaler; from fetch-model.sh realesrgan-x4plus
-    repo: "EnclaveHost/realesrgan-x4plus-sd@<rev after wrapping>"
+    repo: "EnclaveHost/realesrgan-x4plus-sd@f7b73b7949e01f9129c9be9f27337b87dceee51c"
 ```
 
 ## Publish & deploy
