@@ -157,6 +157,73 @@ pub fn generate(
     })
 }
 
+// --------------------------------------------------------------- upscaler --
+
+pub struct UpscaleOutput {
+    pub rgb: Vec<u8>, // HWC, width*height*3 at the UPSCALED size
+    pub width: u32,
+    pub height: u32,
+    pub load_ms: u128,
+    pub upscale_ms: u128,
+}
+
+/// Upscale an RGB image through an ESRGAN upscaler volume (host-side, one
+/// compute(); the output tensor's dimensions carry the real factor). Same
+/// status/abort contract as generate().
+pub fn upscale(
+    volume: &str,
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    status: &mut dyn FnMut(&str) -> bool,
+) -> Result<UpscaleOutput, String> {
+    if !status("opening the preloaded upscaler") {
+        return Err("client disconnected".into());
+    }
+    let t0 = now_ms();
+    let graph = load_by_name(volume).map_err(|e| {
+        format!(
+            "{} (is the \"{volume}\" upscaler volume attached, and did the host \
+             preload it? upscaler volumes need the node's ENCLAVE_SD_UPSCALE_FILE \
+             env and a toolchain with the sd upscale verb)",
+            nn_err("load_by_name", e),
+        )
+    })?;
+    let ctx = graph.init_execution_context().map_err(|e| nn_err("init", e))?;
+    let load_ms = now_ms() - t0;
+
+    if !status(&format!(
+        "upscaling {width}x{height} (host-side ESRGAN, tiled; blocks until done)"
+    )) {
+        return Err("client disconnected".into());
+    }
+    let t1 = now_ms();
+    let inputs = vec![(
+        "image".to_string(),
+        Tensor::new(&[1, height, width, 3], TensorType::U8, rgb),
+    )];
+    let outputs = ctx.compute(inputs).map_err(|e| nn_err("upscale", e))?;
+    let upscale_ms = now_ms() - t1;
+    let image = outputs
+        .into_iter()
+        .find(|(n, _)| n == "image")
+        .map(|(_, t)| t)
+        .ok_or("sd backend returned no \"image\" output")?;
+    let (out_w, out_h) = match image.dimensions()[..] {
+        [1, h, w, 3] => (w, h),
+        ref d => return Err(format!("unexpected upscale output dimensions {d:?}")),
+    };
+    let rgb = image.data();
+    if rgb.len() != (out_w as u64 * out_h as u64 * 3) as usize {
+        return Err(format!(
+            "upscaler returned {} bytes, expected {} ({out_w}x{out_h}x3)",
+            rgb.len(),
+            out_w as u64 * out_h as u64 * 3,
+        ));
+    }
+    Ok(UpscaleOutput { rgb, width: out_w, height: out_h, load_ms, upscale_ms })
+}
+
 /// PNG-encode an RGB buffer (8-bit, no alpha).
 pub fn to_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -170,4 +237,35 @@ pub fn to_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("png data: {e}"))?;
     }
     Ok(out)
+}
+
+/// Decode a PNG into 8-bit RGB. Alpha is dropped, gray expands; 16-bit and
+/// palette images normalize to 8-bit color first. `max_side` gates the
+/// DECLARED dimensions before any frame buffer is allocated, so an
+/// oversized (or decompression-bomb) upload fails on its header.
+pub fn from_png(bytes: &[u8], max_side: u32) -> Result<(Vec<u8>, u32, u32), String> {
+    let mut limits = png::Limits::default();
+    limits.bytes = 512 << 20;
+    let mut dec = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), limits);
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info().map_err(|e| format!("not a decodable PNG: {e}"))?;
+    let (w, h) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if w == 0 || h == 0 || w > max_side || h > max_side {
+        return Err(format!("image is {w}x{h}; this upscaler accepts up to {max_side}px a side"));
+    }
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let out = reader.next_frame(&mut buf).map_err(|e| format!("png decode: {e}"))?;
+    buf.truncate(out.buffer_size());
+    use png::ColorType::*;
+    let rgb = match out.color_type {
+        Rgb => buf,
+        Rgba => buf.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
+        Grayscale => buf.iter().flat_map(|&g| [g, g, g]).collect(),
+        GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect(),
+        other => return Err(format!("unsupported PNG color type {other:?}")),
+    };
+    Ok((rgb, out.width, out.height))
 }

@@ -324,7 +324,9 @@
     <div class="code"><div class="code-head"><span>curl: PNG straight to a file</span><button type="button" class="cbtn" id="apiCopyGet">Copy</button></div><pre><code id="apiGet"></code></pre></div>
     <div class="code"><div class="code-head"><span>curl: OpenAI-compatible</span><button type="button" class="cbtn" id="apiCopyPost">Copy</button></div><pre><code id="apiPost"></code></pre></div>
     <p class="api-fine">Model names match the picker; omit <code class="ic">model</code> for the largest attached one.
-    Also <code class="ic">GET /info</code>, <code class="ic">GET /warmup?model=&hellip;</code>. If the deployment config sets
+    Also <code class="ic">GET /info</code>, <code class="ic">GET /warmup?model=&hellip;</code>, and
+    <code class="ic">POST /upscale</code> (raw PNG body in, ESRGAN-upscaled PNG out; <code class="ic">curl --data-binary @in.png</code>).
+    If the deployment config sets
     <code class="ic">api_key</code>, send <code class="ic">Authorization: Bearer &lt;key&gt;</code> on <code class="ic">/v1/&hellip;</code>.
     Requests run in the same enclave as this page.</p>
   </div>
@@ -363,6 +365,7 @@ const $ = id => document.getElementById(id);
 let steps = 1, running = false, target = "gpu";
 let models = [], cur = null; // catalog from /info; cur = selected model
 let unfit = {}; // model name -> error, from the warmup ladder: attached but does not fit this deployment's share
+let upscalers = [], upscaling = false; // ATTACHED upscaler entries from /info
 
 const ICON_TRASH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11.5v6M14 11.5v6M6 7l1 12.4A2 2 0 0 0 9 21.2h6a2 2 0 0 0 2-1.8L18 7M9.5 7V4.8A1.8 1.8 0 0 1 11.3 3h1.4a1.8 1.8 0 0 1 1.8 1.8V7"/></svg>';
 
@@ -585,6 +588,7 @@ async function info() {
   try {
     const r = await (await fetch("info")).json();
     target = r.default_target;
+    upscalers = (r.upscalers || []).filter(u => u.attached);
     models = (r.models && r.models.length) ? r.models : [{
       name: r.name, volume: r.volume, backend: r.backend, attached: r.volume_attached,
       default_steps: r.default_steps, max_steps: r.max_steps,
@@ -671,7 +675,8 @@ function b64ToBlob(b64) {
 
 function addShot(blob, meta) {
   const id = "i" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-  shots.unshift({ id, url: URL.createObjectURL(blob), meta });
+  // the blob stays alongside the URL: /upscale re-posts it verbatim
+  shots.unshift({ id, url: URL.createObjectURL(blob), blob, meta });
   while (shots.length > MAX_SHOTS) {
     URL.revokeObjectURL(shots.pop().url);
   }
@@ -718,17 +723,70 @@ function show(src, m, id) {
   $("img").src = src;
   $("out").style.display = "block";
   const t = m.timings || {};
+  // the upscale link appears on shots an attached upscaler can take: not
+  // already upscaled, and within its input ceiling
+  const u = upscalers[0];
+  const canUp = id && u && !m.upscaled && Math.max(m.width, m.height) <= u.max_input;
   $("meta").innerHTML =
     (m.model ? `<span>${m.model}</span>` : "") +
     `<span>${m.width}&times;${m.height}</span><span>${m.steps} step${m.steps > 1 ? "s" : ""}</span>` +
     `<span>seed ${m.seed}</span>` +
+    (m.upscaled ? `<span>upscaled &middot; ${m.upscaler}</span>` : "") +
     (t.gen_ms != null ? `<span>gen ${(t.gen_ms / 1000).toFixed(1)} s &middot; load ${t.load_ms} ms</span>` : "") +
-    `<a href="${src}" download="enclave-${m.seed}.png">download</a>` +
+    `<a href="${src}" download="enclave-${m.seed}${m.upscaled ? "-up" : ""}.png">download</a>` +
+    (canUp ? `<a href="#" id="upbtn">upscale ${u.factor}&times;</a>` : "") +
     `<a href="#" id="reuse">reuse seed</a>` +
     (id ? `<a href="#" id="delcur" class="danger">delete</a>` : "");
   document.getElementById("reuse").onclick = e => { e.preventDefault(); $("seed").value = String(m.seed); };
+  const up = document.getElementById("upbtn");
+  if (up) up.onclick = e => { e.preventDefault(); upscaleShot(id); };
   const del = document.getElementById("delcur");
   if (del) del.onclick = e => { e.preventDefault(); deleteShot(id); };
+}
+
+// -------------------------------------------------------------- upscale -- --
+// POST the shot's own PNG back through /upscale (host-side ESRGAN; the
+// stock volume is Real-ESRGAN x4plus). The result joins the gallery as its
+// own shot - the original stays.
+async function upscaleShot(id) {
+  const s = shots.find(x => x.id === id);
+  const u = upscalers[0];
+  if (!s || !u || upscaling) return;
+  upscaling = true;
+  const t0 = performance.now();
+  const tick = setInterval(() => {
+    const el = document.querySelector("#status u");
+    if (el) el.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+  }, 100);
+  setStatus(`upscaling ${s.meta.width}&times;${s.meta.height} with ${u.name}&hellip; <u>0.0s</u>`);
+  const ctrl = new AbortController();
+  const watchdog = setTimeout(() => ctrl.abort(), 300000);
+  try {
+    const r = await fetch("upscale?upscaler=" + encodeURIComponent(u.name), {
+      method: "POST", body: s.blob, signal: ctrl.signal,
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error?.message || r.status + " " + r.statusText);
+    }
+    const blob = await r.blob();
+    const w = +r.headers.get("x-width") || s.meta.width * u.factor;
+    const h = +r.headers.get("x-height") || s.meta.height * u.factor;
+    const meta = { ...s.meta, width: w, height: h, upscaled: true, upscaler: u.name, timings: {} };
+    const ns = addShot(blob, meta);
+    show(ns.url, meta, ns.id);
+    $("status").className = "status";
+    $("status").innerHTML = `upscaled to ${w}&times;${h} in ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      setStatus("upscale timed out after 300s", "err");
+    } else {
+      setStatus("upscale failed: " + (e.message || e), "err");
+    }
+  } finally {
+    clearTimeout(watchdog); clearInterval(tick);
+    upscaling = false;
+  }
 }
 
 // ------------------------------------------------------------- generate -- --

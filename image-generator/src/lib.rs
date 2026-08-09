@@ -25,10 +25,17 @@
 //!   GET  /image       - ?prompt=...&steps=&seed=&w=&h=&target=&model= ->
 //!                       image/png.
 //!   POST /generate    - {prompt, model?, steps?, seed?, width?, height?,
-//!                       target?, ancestral?, cfg?} -> SSE: {status} lines
-//!                       while loading/generating, then {done, image:
-//!                       <b64 png>, model, seed, timings}. The playground's
-//!                       endpoint.
+//!                       target?, ancestral?, cfg?, upscale?, upscaler?} ->
+//!                       SSE: {status} lines while loading/generating, then
+//!                       {done, image: <b64 png>, model, seed, timings}.
+//!                       upscale: true runs the result through an upscaler
+//!                       volume first (best effort: a failed upscale reports
+//!                       next to the BASE image instead of discarding the
+//!                       generation). The playground's endpoint.
+//!   POST /upscale     - raw PNG body -> ESRGAN-upscaled PNG (the stock
+//!                       catalog: Real-ESRGAN x4plus, 4x). ?upscaler= picks
+//!                       a catalog entry; output geometry rides x-width /
+//!                       x-height / x-upscale-factor response headers.
 //!   POST /v1/images/generations - OpenAI-compatible: {prompt, model?, n?,
 //!                       size?, seed?} -> {created, data: [{b64_json, seed}]}.
 //!                       Always returns b64_json (no url storage in an

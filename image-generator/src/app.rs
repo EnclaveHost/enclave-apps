@@ -11,6 +11,9 @@ use serde::Deserialize;
 
 static UI_HTML: &str = include_str!("ui.html");
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// /upscale takes a whole PNG in the body: a 2048px RGB photo PNG tops out
+/// around 12 MB; 32 MB leaves headroom without inviting memory events.
+const MAX_UPSCALE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
@@ -68,6 +71,10 @@ fn json_err(out: ResponseOutparam, status: u16, msg: &str) {
 }
 
 fn read_body(req: &IncomingRequest) -> Result<Vec<u8>, String> {
+    read_body_limit(req, MAX_BODY_BYTES)
+}
+
+fn read_body_limit(req: &IncomingRequest, limit: usize) -> Result<Vec<u8>, String> {
     let body = req.consume().map_err(|_| "request has no body")?;
     let stream = body.stream().map_err(|_| "cannot read request body")?;
     let mut out = Vec::new();
@@ -75,7 +82,7 @@ fn read_body(req: &IncomingRequest) -> Result<Vec<u8>, String> {
         match stream.blocking_read(64 * 1024) {
             Ok(chunk) => {
                 out.extend_from_slice(&chunk);
-                if out.len() > MAX_BODY_BYTES {
+                if out.len() > limit {
                     return Err("request body too large".into());
                 }
             }
@@ -155,6 +162,12 @@ struct GenBody {
     size: Option<String>, // "512x512"
     #[serde(default)]
     response_format: Option<String>,
+    /// run the generated image through an upscaler volume before returning
+    /// (/generate only); `upscaler` picks a catalog entry, absent = default
+    #[serde(default)]
+    upscale: Option<bool>,
+    #[serde(default)]
+    upscaler: Option<String>,
 }
 
 fn parse_target(cfg: &AppConfig, s: Option<&str>) -> Result<ExecutionTarget, String> {
@@ -258,18 +271,57 @@ fn handle_generate(cat: &Catalog, req: IncomingRequest, out: ResponseOutparam) {
     let result = generate(cfg, &greq, &mut status);
     match result {
         Ok(o) => {
+            let (load_ms, gen_ms) = (o.load_ms, o.gen_ms);
+            let (mut rgb, mut w, mut h) = (o.rgb, o.width, o.height);
+            // Optional post-generation upscale, best effort: a failed
+            // upscale reports NEXT TO the finished base image instead of
+            // discarding a multi-second generation over a two-second step.
+            let (mut upscaled, mut upscale_error, mut upscale_ms) = (None, None, 0u128);
+            if body.upscale.unwrap_or(false) {
+                match cat.get_upscaler(body.upscaler.as_deref()) {
+                    Ok(up) if w.max(h) > up.max_input => {
+                        upscale_error = Some(format!(
+                            "{w}x{h} exceeds upscaler '{}' max_input {}px",
+                            up.name, up.max_input
+                        ));
+                    }
+                    Ok(up) => match pipeline::upscale(&up.volume, &rgb, w, h, &mut status) {
+                        Ok(u) => {
+                            upscale_ms = u.load_ms + u.upscale_ms;
+                            upscaled = Some(serde_json::json!({
+                                "upscaler": up.name, "from": [w, h],
+                            }));
+                            (rgb, w, h) = (u.rgb, u.width, u.height);
+                        }
+                        Err(e) => upscale_error = Some(e),
+                    },
+                    Err(e) => upscale_error = Some(e),
+                }
+            }
             let t = now_ms();
-            match to_png(&o.rgb, o.width, o.height) {
+            match to_png(&rgb, w, h) {
                 Ok(png) => {
                     let png_ms = now_ms() - t;
-                    send(serde_json::json!({
+                    let mut done = serde_json::json!({
                         "done": true,
                         "image": b64encode(&png),
                         "model": cfg.name,
-                        "width": o.width, "height": o.height,
+                        "width": w, "height": h,
                         "seed": greq.seed, "steps": greq.steps,
-                        "timings": timings_json(&o, png_ms),
-                    }));
+                        "timings": {
+                            "load_ms": load_ms as u64,
+                            "gen_ms": gen_ms as u64,
+                            "png_ms": png_ms as u64,
+                            "upscale_ms": upscale_ms as u64,
+                        },
+                    });
+                    if let Some(u) = upscaled {
+                        done["upscaled"] = u;
+                    }
+                    if let Some(e) = upscale_error {
+                        done["upscale_error"] = serde_json::json!(e);
+                    }
+                    send(done);
                 }
                 Err(e) => {
                     send(serde_json::json!({ "error": e }));
@@ -282,6 +334,59 @@ fn handle_generate(cat: &Catalog, req: IncomingRequest, out: ResponseOutparam) {
     }
     drop(stream);
     let _ = OutgoingBody::finish(sse_body, None);
+}
+
+// ----------------------------------------------------------- POST /upscale --
+
+/// Raw PNG in, upscaled PNG out (curl: `--data-binary @image.png`). The
+/// `?upscaler=` query picks a catalog entry by name or volume; absent = the
+/// first attached one. Output geometry rides response headers (x-width /
+/// x-height / x-upscale-factor) so clients need not decode to know it.
+fn handle_upscale(cat: &Catalog, req: IncomingRequest, query: &str, out: ResponseOutparam) {
+    let up = match cat.get_upscaler(query_get(query, "upscaler").as_deref()) {
+        Ok(u) => u,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    let body = match read_body_limit(&req, MAX_UPSCALE_BODY_BYTES) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => return json_err(out, 400, "empty body - POST the PNG to upscale"),
+        Err(e) => return json_err(out, 400, &e),
+    };
+    let (rgb, w, h) = match pipeline::from_png(&body, up.max_input) {
+        Ok(v) => v,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    if w < 16 || h < 16 {
+        return json_err(out, 400, &format!("image is {w}x{h}; the upscaler wants at least 16px a side"));
+    }
+    let mut status = |_: &str| true; // nothing to stream on a binary route
+    match pipeline::upscale(&up.volume, &rgb, w, h, &mut status)
+        .and_then(|o| to_png(&o.rgb, o.width, o.height).map(|png| (o, png)))
+    {
+        Ok((o, png)) => {
+            let headers = Fields::new();
+            let _ = headers.set(&"content-type".to_string(), &[b"image/png".to_vec()]);
+            let _ = headers.set(&"x-width".to_string(), &[o.width.to_string().into_bytes()]);
+            let _ = headers.set(&"x-height".to_string(), &[o.height.to_string().into_bytes()]);
+            let _ = headers.set(
+                &"x-upscale-factor".to_string(),
+                &[(o.width / w.max(1)).to_string().into_bytes()],
+            );
+            let resp = OutgoingResponse::new(headers);
+            let _ = resp.set_status_code(200);
+            let resp_body = resp.body().unwrap();
+            ResponseOutparam::set(out, Ok(resp));
+            let stream = resp_body.write().unwrap();
+            for chunk in png.chunks(4000) {
+                if stream.blocking_write_and_flush(chunk).is_err() {
+                    break;
+                }
+            }
+            drop(stream);
+            let _ = OutgoingBody::finish(resp_body, None);
+        }
+        Err(e) => json_err(out, 500, &e),
+    }
 }
 
 // ------------------------------------------------------------- GET /image --
@@ -551,7 +656,27 @@ fn handle_warmup(cat: &Catalog, query: &str, out: ResponseOutparam) {
         }
     }
     let ok = default.is_some();
-    let body = serde_json::json!({ "ok": ok, "ladder": ladder, "default": default });
+    // Warm the default upscaler too (a ~65 MB ESRGAN: the load is the whole
+    // cost, one tiny upscale proves it serves). OUTSIDE the ladder array -
+    // the ladder is the MODEL fit report the playground's picker consumes -
+    // and never part of `ok`: image generation serving is the contract,
+    // upscaling is the option.
+    let upscaler = cat.default_upscaler().map(|up| {
+        let t0 = now_ms();
+        let mut quiet = |_: &str| true;
+        match pipeline::upscale(&up.volume, &vec![127u8; 64 * 64 * 3], 64, 64, &mut quiet) {
+            Ok(u) => serde_json::json!({
+                "upscaler": up.name, "volume": up.volume, "ok": true,
+                "factor": u.width / 64, "total_ms": (now_ms() - t0) as u64,
+            }),
+            Err(e) => serde_json::json!({
+                "upscaler": up.name, "volume": up.volume, "ok": false, "error": e,
+            }),
+        }
+    });
+    let body = serde_json::json!({
+        "ok": ok, "ladder": ladder, "default": default, "upscaler": upscaler,
+    });
     respond_bytes(
         out,
         if ok { 200 } else { 500 },
@@ -579,6 +704,19 @@ fn handle_info(cat: &Catalog, out: ResponseOutparam) {
             })
         })
         .collect();
+    let upscalers: Vec<serde_json::Value> = cat
+        .upscalers
+        .iter()
+        .map(|u| {
+            serde_json::json!({
+                "name": u.name,
+                "volume": u.volume,
+                "attached": u.volume_attached(),
+                "factor": u.factor,
+                "max_input": u.max_input,
+            })
+        })
+        .collect();
     // top-level fields mirror the DEFAULT model - the pre-catalog shape,
     // kept so old clients/scripts don't break
     let cfg = cat.default_model();
@@ -597,6 +735,8 @@ fn handle_info(cat: &Catalog, out: ResponseOutparam) {
             "default_target": cfg.default_target,
             "backend": "sdcpp",
             "models": models,
+            "upscalers": upscalers,
+            "default_upscaler": cat.default_upscaler().map(|u| u.name.clone()),
         })
         .to_string()
         .as_bytes(),
@@ -628,11 +768,12 @@ impl Guest for Component {
             (Method::Get, "/warmup") => handle_warmup(&cat, query, out),
             (Method::Get, "/image") => handle_image(&cat, query, out),
             (Method::Post, "/generate") => handle_generate(&cat, req, out),
+            (Method::Post, "/upscale") => handle_upscale(&cat, req, query, out),
             (Method::Post, "/v1/images/generations") => handle_openai(&cat, req, out),
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /ping, GET /info, GET /warmup, GET /image, POST /generate, POST /v1/images/generations",
+                "not found; routes: GET /, GET /ping, GET /info, GET /warmup, GET /image, POST /generate, POST /upscale, POST /v1/images/generations",
             ),
         }
     }

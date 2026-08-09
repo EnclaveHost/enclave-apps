@@ -85,10 +85,48 @@ fn default_cfg() -> f32 {
     1.0
 }
 
+/// One entry of the `upscalers` catalog: an ESRGAN super-resolution volume
+/// (RRDBNet family) served through the same sdcpp backend. Same map shape as
+/// `models` - keyed by volume name, the entry naming what requests select -
+/// but the entries are small and self-contained (no template overlay: an
+/// upscaler shares none of the generation knobs).
+#[derive(Deserialize, Clone)]
+pub struct UpscalerConfig {
+    /// display name; a request's `upscaler` matches this or the volume
+    pub name: String,
+    /// the attached volume (map KEY), mounted at /models/<volume>
+    #[serde(default)]
+    pub volume: String,
+    /// the model's native scale, for the UI label and output sizing; the
+    /// host reads the real factor from the weights and the output tensor's
+    /// dimensions are the truth
+    #[serde(default = "default_factor")]
+    pub factor: u32,
+    /// long-edge cap on the INPUT image: 2048 at 4x = an 8192px output,
+    /// ~200 MB of RGB through the guest - the practical ceiling
+    #[serde(default = "default_max_input")]
+    pub max_input: u32,
+}
+
+impl UpscalerConfig {
+    pub fn volume_attached(&self) -> bool {
+        std::path::Path::new(MODELS_ROOT).join(&self.volume).is_dir()
+    }
+}
+
+fn default_factor() -> u32 {
+    4
+}
+
+fn default_max_input() -> u32 {
+    2048
+}
+
 /// Every model this deployment can serve, resolved and validated up front,
 /// in catalog order.
 pub struct Catalog {
     pub models: Vec<AppConfig>,
+    pub upscalers: Vec<UpscalerConfig>,
 }
 
 impl Catalog {
@@ -131,6 +169,40 @@ impl Catalog {
                 )
             })
     }
+
+    /// The upscaler for requests that don't name one: the first ATTACHED
+    /// catalog entry (map order). None when no upscaler volume is attached.
+    pub fn default_upscaler(&self) -> Option<&UpscalerConfig> {
+        self.upscalers.iter().find(|u| u.volume_attached())
+    }
+
+    /// Resolve a request's upscaler choice; None/"" means the default.
+    /// Matches a display `name` or a volume name, same as models.
+    pub fn get_upscaler(&self, name: Option<&str>) -> Result<&UpscalerConfig, String> {
+        let n = name.unwrap_or("").trim();
+        if n.is_empty() {
+            return self.default_upscaler().ok_or_else(|| {
+                if self.upscalers.is_empty() {
+                    "this deployment has no upscalers configured".to_string()
+                } else {
+                    format!(
+                        "no upscaler volume is attached (configured: {}) - deploy with one \
+                         ticked in the volume picker",
+                        self.upscalers.iter().map(|u| u.volume.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                }
+            });
+        }
+        self.upscalers
+            .iter()
+            .find(|u| u.name == n || u.volume == n)
+            .ok_or_else(|| {
+                format!(
+                    "unknown upscaler '{n}' (available: {})",
+                    self.upscalers.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            })
+    }
 }
 
 /// Embedded defaults with ENCLAVE_CONFIG overlaid, then the catalog resolved.
@@ -151,17 +223,18 @@ fn load_raw() -> Result<Value, String> {
     }
 }
 
-/// Shallow key-wise overlay, except `models`: the catalog merges per volume
-/// key, and each entry's fields merge shallowly - so an override can add one
-/// model (or tweak one field of a known entry) without restating the rest.
+/// Shallow key-wise overlay, except the catalogs (`models`, `upscalers`):
+/// those merge per volume key, and each entry's fields merge shallowly - so
+/// an override can add one model (or tweak one field of a known entry)
+/// without restating the rest.
 fn merge(mut base: Value, over: Value) -> Value {
     let (Some(b), Some(o)) = (base.as_object_mut(), over.as_object()) else {
         return over;
     };
     for (k, v) in o {
-        if k == "models" {
+        if k == "models" || k == "upscalers" {
             if let (Some(bm), Some(om)) = (
-                b.get_mut("models").and_then(|m| m.as_object_mut()),
+                b.get_mut(k.as_str()).and_then(|m| m.as_object_mut()),
                 v.as_object(),
             ) {
                 for (vol, entry) in om {
@@ -206,7 +279,43 @@ fn catalog_from(raw: Value) -> Result<Catalog, String> {
             ));
         }
     }
-    Ok(Catalog { models })
+    let upscalers = upscalers_from(&raw)?;
+    Ok(Catalog { models, upscalers })
+}
+
+/// The `upscalers` catalog: a map keyed by volume name, each entry a small
+/// self-contained object (no template overlay). Absent/empty = no upscalers.
+fn upscalers_from(raw: &Value) -> Result<Vec<UpscalerConfig>, String> {
+    let mut ups: Vec<UpscalerConfig> = Vec::new();
+    match raw.get("upscalers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            for (volume, entry) in map {
+                let mut v = entry.clone();
+                let Some(o) = v.as_object_mut() else {
+                    return Err(format!("config upscalers['{volume}'] must be a JSON object"));
+                };
+                o.entry("name").or_insert(Value::String(volume.clone()));
+                o.insert("volume".into(), Value::String(volume.clone()));
+                let u: UpscalerConfig =
+                    serde_json::from_value(v).map_err(|e| format!("upscaler '{volume}': {e}"))?;
+                if !(1..=8).contains(&u.factor) || u.max_input < 64 {
+                    return Err(format!(
+                        "upscaler '{}': factor {} / max_input {} out of range",
+                        u.name, u.factor, u.max_input
+                    ));
+                }
+                ups.push(u);
+            }
+        }
+        Some(_) => return Err("config 'upscalers' must be a JSON object keyed by volume name".into()),
+    }
+    for i in 1..ups.len() {
+        if ups[..i].iter().any(|u| u.name == ups[i].name) {
+            return Err(format!("config: duplicate upscaler name '{}'", ups[i].name));
+        }
+    }
+    Ok(ups)
 }
 
 /// The single model described by the top-level config (no catalog).
@@ -353,6 +462,56 @@ mod tests {
         assert_eq!(cat.models.len(), 1);
         assert_eq!(cat.default_model().name, "z-image-turbo");
         assert_eq!(cat.default_model().model_volume, "z-image-turbo-sd");
+    }
+
+    #[test]
+    fn upscaler_catalog_resolves() {
+        let cat = catalog_from(embedded()).unwrap();
+        assert_eq!(cat.upscalers.len(), 1);
+        let u = cat.get_upscaler(Some("realesrgan-x4plus")).unwrap();
+        assert_eq!(u.volume, "realesrgan-x4plus-sd");
+        assert_eq!((u.factor, u.max_input), (4, 2048)); // defaults
+        // selectable by volume name too
+        assert_eq!(cat.get_upscaler(Some("realesrgan-x4plus-sd")).unwrap().name, "realesrgan-x4plus");
+        // nothing attached in tests: the default resolution says what to attach
+        let err = cat.get_upscaler(None).err().unwrap();
+        assert!(err.contains("no upscaler volume is attached"), "{err}");
+        assert!(err.contains("realesrgan-x4plus-sd"), "{err}");
+        let err = cat.get_upscaler(Some("nope")).err().unwrap();
+        assert!(err.contains("unknown upscaler 'nope'"), "{err}");
+        // upscaler volumes never enter the MODEL catalog or its default
+        assert!(cat.models.iter().all(|m| m.model_volume != "realesrgan-x4plus-sd"));
+    }
+
+    #[test]
+    fn enclave_config_tweaks_upscaler() {
+        // a deployment caps the input (or adds a second upscaler) per key,
+        // without restating the embedded entry's other fields
+        let over = serde_json::json!({ "upscalers": {
+            "realesrgan-x4plus-sd": { "max_input": 1024 },
+            "realesrgan-x4plus-anime-sd": { "name": "realesrgan-x4plus-anime" }
+        }});
+        let cat = catalog_from(merge(embedded(), over)).unwrap();
+        assert_eq!(cat.upscalers.len(), 2);
+        let u = cat.get_upscaler(Some("realesrgan-x4plus")).unwrap();
+        assert_eq!((u.max_input, u.factor), (1024, 4)); // tweak kept the name+factor
+        assert!(cat.get_upscaler(Some("realesrgan-x4plus-anime")).is_ok());
+    }
+
+    #[test]
+    fn no_upscalers_key_is_none() {
+        let mut raw = embedded();
+        raw.as_object_mut().unwrap().remove("upscalers");
+        let cat = catalog_from(raw).unwrap();
+        assert!(cat.upscalers.is_empty());
+        assert!(cat.get_upscaler(None).err().unwrap().contains("no upscalers configured"));
+    }
+
+    #[test]
+    fn bad_upscaler_config_rejected() {
+        let mut raw = embedded();
+        raw["upscalers"] = serde_json::json!({ "a-sd": { "factor": 9 } });
+        assert!(catalog_from(raw).err().unwrap().contains("out of range"));
     }
 
     #[test]

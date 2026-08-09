@@ -11,5 +11,8 @@
   "models": {
     "z-image-turbo-sd": { "name": "z-image-turbo" },
     "qwen-image-2512-sd": { "name": "qwen-image-2512", "default_steps": 8, "min_size": 512 }
+  },
+  "upscalers": {
+    "realesrgan-x4plus-sd": { "name": "realesrgan-x4plus" }
   }
 }

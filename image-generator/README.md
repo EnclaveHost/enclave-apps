@@ -12,6 +12,11 @@ web playground at `/`. The stock catalog:
 | `qwen-image-2512` | Qwen-Image-2512 (20B MMDiT, Apache-2.0) + lightx2v Lightning 8-step merge; the flagship: SOTA open-weights quality, legible text rendering | 8 | ~34 GB @1024px (tiled VAE) |
 | `z-image-turbo` | Tongyi-MAI Z-Image-Turbo (6B, Apache-2.0); the fast one | 4–8 | ~13 GB @1024px (tiled VAE) |
 
+Plus an **upscale option** over the same interface: Real-ESRGAN x4plus
+(official BSD-3 weights, 4x) as its own tiny upscaler volume, run by
+sd.cpp's ESRGAN engine behind one wasi-nn `compute()` - a `POST /upscale`
+route and a per-image "upscale 4x" link in the playground.
+
 ```
 prompt ──▶ load_by_name(volume) ──▶ ONE wasi-nn compute() ──▶ RGB ──▶ PNG
            (host: sd.cpp runs text encode, denoise, VAE decode) (guest)
@@ -33,7 +38,8 @@ in, raw RGB out.
 | `GET /info` | volume attachment, step/size limits, and the `models` catalog (name/limits per entry) |
 | `GET /warmup?model=&size=` | load the weights + one tiny 1-step generation (at `min_size` unless `?size=` says otherwise); the playground fires it on page load |
 | `GET /image?prompt=...&steps=8&seed=7&w=1024&h=1024&model=` | → `image/png` (curl-friendly) |
-| `POST /generate` | `{prompt, model?, steps?, seed?, width?, height?, negative_prompt?, cfg?, ancestral?}` → SSE status lines, then `{done, image: <b64 png>, model, seed, timings}` |
+| `POST /generate` | `{prompt, model?, steps?, seed?, width?, height?, negative_prompt?, cfg?, ancestral?, upscale?, upscaler?}` → SSE status lines, then `{done, image: <b64 png>, model, seed, timings}`. `upscale: true` runs the result through an upscaler volume before returning (best effort: a failed upscale reports as `upscale_error` NEXT TO the finished base image) |
+| `POST /upscale` | raw PNG body → ESRGAN-upscaled PNG (`curl --data-binary @in.png`); `?upscaler=` picks a catalog entry by name or volume, absent = the first attached; output geometry rides `x-width` / `x-height` / `x-upscale-factor` response headers. The playground's per-image "upscale 4x" link |
 | `POST /v1/images/generations` | OpenAI-compatible: `{prompt, model?, n?, size?, seed?}` → `{created, data:[{b64_json, seed}]}`; `Authorization: Bearer` enforced when the config sets `api_key` |
 
 `model` names an entry from the config's `models` catalog (matched by
@@ -77,6 +83,31 @@ relative names to coexist. Both curated repos carry the generic names
 `07cb261e`); the production volumes must be **re-wrapped from these
 revisions** before both models can preload on one node.
 
+### The upscaler volume
+
+- **`realesrgan-x4plus`**, to be wrapped as `EnclaveHost/realesrgan-x4plus-sd`:
+  Real-ESRGAN x4plus (xinntao, official BSD-3-Clause weights), the stock
+  upscaler behind `/upscale`. RRDBNet 23-block 4x, one ~64 MB
+  `upscaler.safetensors`, built by `fetch-model.sh realesrgan-x4plus`: the
+  pinned release `.pth` converts torch-free through
+  `tools/convert_esrgan.py` (deterministic, output sha256 pinned in the
+  recipe).
+
+  Why this model: sd.cpp's upscaler engine runs the RRDBNet/ESRGAN
+  architecture, and within it the official Real-ESRGAN x4plus is the
+  strongest cleanly-licensed general model. The popular community finetunes
+  that beat it (4x-UltraSharp, UltraSharpV2) are CC-BY-NC (non-commercial),
+  and UltraSharpV2 is DAT2 anyway; transformer/diffusion upscalers
+  (DAT/HAT/SeedVR2) would need new architectures in the substrate. The
+  anime 6B variant and Nomos8kSC (CC-BY-4.0) are drop-in alternatives: any
+  RRDBNet `.pth` through `convert_esrgan.py` makes a volume, scale (1/2/4)
+  read from the weights.
+
+  The `upscaler.safetensors` name is the node's `ENCLAVE_SD_UPSCALE_FILE`,
+  and its **presence is what marks an upscaler volume** (the platform
+  serves such a volume as an upscale graph, not a checkpoint), so the file
+  must never appear inside a generation volume.
+
 ### Serving several models at once
 
 The config's `models` catalog is a **map keyed by volume name**. The key is
@@ -115,6 +146,22 @@ Written map order is the UI/catalog order and the default's tie-break; drop
 the `models` key entirely to serve just the top-level `name`/`model_volume`
 as a single model.
 
+`upscalers` is the same shape for the upscale option - a map keyed by
+volume, small self-contained entries (`name`, `factor` default 4,
+`max_input` default 2048 - the input long-edge cap; 2048 at 4x is an
+8192 px output, ~200 MB of RGB through the guest). The embedded catalog:
+
+```json
+"upscalers": {
+  "realesrgan-x4plus-sd": { "name": "realesrgan-x4plus" }
+}
+```
+
+Requests select by `name` or volume; absent means the first attached entry.
+It merges per key under `ENCLAVE_CONFIG` like `models`, an entry whose
+volume isn't attached just hides the playground's upscale link, and
+dropping the key disables the option entirely.
+
 ## Platform pieces
 
 See `wasm/sd-shim/README.md` in the platform repo: `wasmtime-nn-sdcpp.patch`
@@ -124,15 +171,23 @@ the volume names listed in the enclave's `MODEL_VOLUMES_SD` env, and the
 component-file envs. Node envs that matter here:
 
 ```yaml
-- MODEL_VOLUMES_SD: "z-image-turbo,qwen-image-2512"
+- MODEL_VOLUMES_SD: "z-image-turbo,qwen-image-2512,realesrgan-x4plus"
 - ENCLAVE_SD_DIFFUSION_FILE: "diffusion.gguf"      # generic names: see above
 - ENCLAVE_SD_LLM_FILE: "llm.gguf"
 - ENCLAVE_SD_VAE_FILE: "vae.safetensors"
+- ENCLAVE_SD_UPSCALE_FILE: "upscaler.safetensors"  # marks upscaler volumes
 - ENCLAVE_SD_VAE_TILING: "64:0.25"   # 512px tiles: <=512 single-tile, 3x3 @1024
 - ENCLAVE_SD_FLASH_ATTN: "1"         # REQUIRED: unfused attention fails >1024px
+# ENCLAVE_SD_UPSCALE_TILE defaults to 256 (px, input-side); the upscale
+# path needs no flash attention and no VAE - it is a separate tiny engine
 # NO ENCLAVE_SD_WTYPE: the volumes ship Q8_0 - forcing f16 UP-converts and
 # doubles VRAM
 ```
+
+The upscale verb needs a toolchain tarball whose `libenclave_sd` carries the
+`esd_load_upscaler`/`esd_upscale` entry points (dlsym-gated: an older
+tarball keeps serving txt2img, upscaler volumes fail preload with a
+"rebuild the toolchain" error).
 
 **Fleet provisioning**: deployments can only attach volumes the enclave
 carries: Modelwrap entries in `enclaves/gpu/tinfoil-config.yml`:
@@ -143,6 +198,8 @@ models:
     repo: "EnclaveHost/z-image-turbo-sd@d7aeefc33a479d183cedf4dce3c294ea71db29ab"
   - name: "qwen-image-2512"      # from tools/merge-lightning.sh output
     repo: "EnclaveHost/qwen-image-2512-sd@a82dcb53ef8ff3c675dd0b636788ebb332fa973f"
+  - name: "realesrgan-x4plus"    # upscaler; from fetch-model.sh realesrgan-x4plus
+    repo: "EnclaveHost/realesrgan-x4plus-sd@<rev after wrapping>"
 ```
 
 ## Publish & deploy
@@ -152,7 +209,8 @@ cargo component build --release --target wasm32-wasip2
 # → target/wasm32-wasip1/release/image_generator.wasm (~450 KB)
 
 enclave publish target/wasm32-wasip1/release/image_generator.wasm \
-  --slug image-generator --config '{"volumes":["z-image-turbo-sd","qwen-image-2512-sd"]}'
+  --slug image-generator \
+  --config '{"volumes":["z-image-turbo-sd","qwen-image-2512-sd","realesrgan-x4plus-sd"]}'
 enclave deploy image-generator:1 --gpu 0.36 --cpu 0.02 --fund 5
 ```
 
@@ -166,6 +224,8 @@ VRAM budget (the dial that matters): z-image ~13 GB peak, qwen-image-2512
 ~34 GB peak (Q8 weights 20 GB + Qwen2.5-VL 8 GB + compute with tiled VAE),
 plus headroom: **both resident wants ~50 GB ≈ gpu 0.36** on the 141 GB
 H200 (2048px headroom: 0.40); qwen alone ≈ 0.28; z-image alone ≈ 0.10.
+The upscaler is noise in this budget: ~64 MB of weights plus a sub-GB
+tiled compute buffer (estimate; input tiles are 256px by default).
 Suggested published minimums: **VRAM 48 GB · GPU 49 TFLOPS · RAM 512 MB ·
 CPU 10 GFLOPS**; the floor must make the DEFAULT config (both volumes)
 work, because models are resident **first-come-first-served** within a
@@ -201,6 +261,18 @@ wasmtime serve -Scli -Shttp -Snn \
 curl "127.0.0.1:8080/image?prompt=a+red+barn+at+sunset&steps=4&w=512&h=512&seed=7" -o out.png
 ```
 
+The upscaler serves the same way - build the volume with
+`./fetch-model.sh realesrgan-x4plus` (64 MB, no GPU needed), then add
+`ENCLAVE_SD_UPSCALE_FILE=upscaler.safetensors`, a second
+`-S nn-graph=sd::model-volume/realesrgan-x4plus-sd`, its `--dir` mount, and
+the volume in `ENCLAVE_MODELS`:
+
+```bash
+curl -X POST --data-binary @out.png 127.0.0.1:8080/upscale -o out-4x.png
+```
+
+(96px to 384px runs ~4 s on CPU; generation stays the slow part.)
+
 CPU generation is slow by nature (z-image 512px 4-step ≈ minutes on 16
 cores); local runs verify plumbing, not latency. `cargo test` runs the
 config/catalog logic natively.
@@ -214,6 +286,8 @@ CID-verified App Config JSON). Highlights: `model_volume`, `default_steps`,
 `default_target`, `cfg_scale` (1.0 for distilled models),
 `sample_method`/`scheduler` (sd.cpp sampler names; unset = euler_a/euler by
 the request's `ancestral` flag), `max_images` (n cap for the OpenAI route),
-`api_key`, and `models` (the catalog: a map keyed by volume name, each value
+`api_key`, `models` (the catalog: a map keyed by volume name, each value
 a field-overlay carrying the display `name`; requests select by `name` or
-volume, absent `model` = the largest attached entry).
+volume, absent `model` = the largest attached entry), and `upscalers` (the
+upscale catalog: same map shape, entries `name`/`factor`/`max_input`;
+absent `upscaler` = the first attached entry).
