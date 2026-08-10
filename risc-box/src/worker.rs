@@ -1,0 +1,239 @@
+//! Watching the machine, moved off the machine's thread.
+//!
+//! Everything this app does has always run in one loop: the emulator ticks,
+//! then the framebuffer is scanned and deflated, then AV1 encodes a frame,
+//! then HTTP is served. That is not four things sharing a machine, it is four
+//! things sharing ONE CORE, because a wasip2 component cannot spawn a thread
+//! (`std::thread::spawn` -> os error 58, on p2 and p3 alike). So watching the
+//! machine has always been paid for by the machine: measured, the AV1 stream
+//! cost **82%** of guest speed (36.3 -> 6.6 MIPS) and the deflate band stream
+//! costs a fifth of the thread at its budget. Both are throttled in the main
+//! loop for exactly that reason.
+//!
+//! Shared-everything-threads changes the arithmetic. `thread.spawn-indirect`
+//! runs guest code on a REAL second core inside the same component instance,
+//! over the same linear memory, so the expensive half can simply leave.
+//!
+//! Two constraints shape the design, and neither is negotiable:
+//!
+//! 1. **The emulator cannot leave the main thread.** `Emulator` is the whole
+//!    machine and the HTTP handlers mutate it. So the split is not "move the
+//!    display code" — it is "the emulator's thread does the one thing that
+//!    needs the emulator (a memcpy of the framebuffer out of guest RAM) and
+//!    the worker does everything else": hashing, diffing, deflating, RGB
+//!    conversion, AV1.
+//!
+//! 2. **A worker cannot touch a socket.** SET gives every thread its own fd
+//!    namespace (`fd = namespace << 13 | index`); a descriptor opened on the
+//!    main thread is `EBADF` on a worker, deliberately. So the worker never
+//!    writes to a client. It returns BYTES, and the main thread broadcasts
+//!    them — which is fine, because framing an SSE event is nothing next to
+//!    the compression that produced it.
+//!
+//! The result is a one-job-in-flight pipeline with a two-buffer pool, so a
+//! steady state allocates nothing: the main thread captures into a spare
+//! buffer, hands it over, and gets the previous frame back to capture into
+//! next time.
+//!
+//! When SET is not available — the ordinary wasip2 component, which is what
+//! ships today — `start()` returns false and every caller falls back to doing
+//! the work inline. Same code path, same output, just paid for by the guest.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use crate::display::{self, Display};
+use crate::video::{self, EncodedFrame, VideoEncoder};
+
+/// One captured framebuffer, plus what the watchers currently want done to it.
+pub struct Job {
+    pub frame: Vec<u8>,
+    pub want_bands: bool,
+    pub want_video: bool,
+}
+
+/// What came back. `spare` is the buffer to capture into next.
+pub struct Out {
+    pub bands: Vec<display::Band>,
+    pub video: Vec<EncodedFrame>,
+    pub spare: Vec<u8>,
+    /// Wall time the worker spent. Only used for reporting: with a worker this
+    /// is no longer a budget the guest pays, which is the entire point.
+    pub cost: Duration,
+}
+
+#[derive(Default)]
+struct Pipe {
+    jobs: Mutex<VecDeque<Job>>,
+    outs: Mutex<VecDeque<Out>>,
+    spare: Mutex<Vec<Vec<u8>>>,
+    /// A watcher joined: the next band pass must ship a whole frame.
+    force_full: AtomicBool,
+    /// The machine stopped or rebooted: drop the diff state.
+    reset: AtomicBool,
+    running: AtomicBool,
+    inflight: AtomicU32,
+}
+
+fn pipe() -> &'static Pipe {
+    static PIPE: OnceLock<Pipe> = OnceLock::new();
+    PIPE.get_or_init(Pipe::default)
+}
+
+/// True once a worker is running and offloading is worth attempting.
+pub fn available() -> bool {
+    pipe().running.load(Ordering::Acquire)
+}
+
+/// Jobs handed over but not yet collected. The caller uses this to keep
+/// exactly one frame in flight: capturing faster than the worker can compress
+/// would just grow a queue of stale screens.
+pub fn inflight() -> u32 {
+    pipe().inflight.load(Ordering::Acquire)
+}
+
+/// A buffer to capture into, recycled if one is going spare.
+pub fn take_buffer() -> Vec<u8> {
+    pipe().spare.lock().unwrap().pop().unwrap_or_default()
+}
+
+pub fn submit(job: Job) {
+    let p = pipe();
+    p.inflight.fetch_add(1, Ordering::AcqRel);
+    p.jobs.lock().unwrap().push_back(job);
+}
+
+pub fn collect() -> Option<Out> {
+    let p = pipe();
+    let out = p.outs.lock().unwrap().pop_front();
+    if out.is_some() {
+        p.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+    out
+}
+
+/// Give a buffer back to the pool. Two is all a one-in-flight pipeline can
+/// use, so the pool is capped there rather than growing without bound.
+pub fn recycle(mut buf: Vec<u8>) {
+    let mut pool = pipe().spare.lock().unwrap();
+    if pool.len() < 2 {
+        buf.clear();
+        pool.push(buf);
+    }
+}
+
+pub fn want_full() {
+    pipe().force_full.store(true, Ordering::Release);
+}
+
+pub fn reset() {
+    pipe().reset.store(true, Ordering::Release);
+}
+
+/// The worker's own loop. Owns the diff state and the encoder, because both
+/// are per-stream state that only it touches. Runs for the life of the
+/// component: there is no stop path because there is nothing to stop for — a
+/// machine that halts just stops producing jobs.
+#[cfg_attr(not(feature = "set"), allow(dead_code))]
+fn serve() {
+    let p = pipe();
+    let mut display = Display::new();
+    let mut av1: Option<video::Av1Encoder> = None;
+
+    loop {
+        let job = p.jobs.lock().unwrap().pop_front();
+        let Some(job) = job else {
+            // Nothing to do. A short sleep rather than a spin: this thread is
+            // a real core, and burning it while the screen is still would be
+            // the same mistake in a new place.
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        };
+
+        let began = Instant::now();
+        if p.reset.swap(false, Ordering::AcqRel) {
+            display.reset();
+            av1 = None;
+        }
+        if p.force_full.swap(false, Ordering::AcqRel) {
+            display.want_full();
+        }
+
+        let mut video = Vec::new();
+        if job.want_video {
+            if av1.is_none() {
+                av1 = video::Av1Encoder::new(display::FB_W, display::FB_H, 4_000_000, 10);
+            }
+            let (rgb, w, h) = video::rgb_from_capture(&job.frame);
+            if let Some(enc) = av1.as_mut() {
+                video = enc.encode(&rgb, w, h);
+            }
+        } else if av1.is_some() {
+            av1 = None;
+        }
+
+        // Bands last: it consumes the frame and hands back the buffer.
+        let (bands, spare) = match job.want_bands {
+            true => display.bands(job.frame),
+            false => (Vec::new(), job.frame),
+        };
+
+        p.outs.lock().unwrap().push_back(Out { bands, video, spare, cost: began.elapsed() });
+    }
+}
+
+#[cfg(feature = "set")]
+mod spawn {
+    use std::os::raw::{c_int, c_void};
+
+    extern "C" {
+        fn pthread_create(
+            thread: *mut usize,
+            attr: *const c_void,
+            start: extern "C" fn(*mut c_void) -> *mut c_void,
+            arg: *mut c_void,
+        ) -> c_int;
+    }
+
+    extern "C" fn entry(_: *mut c_void) -> *mut c_void {
+        super::serve();
+        std::ptr::null_mut()
+    }
+
+    /// Spawn through the SET libc's pthreads, which route to the component
+    /// model's `thread.spawn-indirect` builtin. Note this is NOT
+    /// `std::thread::spawn`: Rust's std threading targets wasi-threads' host
+    /// import, a different mechanism that this engine does not serve.
+    pub fn worker() -> bool {
+        let mut tid: usize = 0;
+        let rc = unsafe { pthread_create(&mut tid, std::ptr::null(), entry, std::ptr::null_mut()) };
+        rc == 0
+    }
+}
+
+#[cfg(not(feature = "set"))]
+mod spawn {
+    /// Without the SET toolchain there is no thread to spawn — a wasip2
+    /// component is one core and `pthread_create` would not even link.
+    pub fn worker() -> bool {
+        false
+    }
+}
+
+/// Try to bring a worker up. False means every caller should keep doing the
+/// work inline, which is exactly what this app did before.
+pub fn start() -> bool {
+    let p = pipe();
+    if p.running.load(Ordering::Acquire) {
+        return true;
+    }
+    if !spawn::worker() {
+        eprintln!("[risc-box] no display worker: watching the machine costs the machine");
+        return false;
+    }
+    p.running.store(true, Ordering::Release);
+    eprintln!("[risc-box] display worker running on its own core");
+    true
+}

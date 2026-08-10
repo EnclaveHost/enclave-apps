@@ -91,6 +91,16 @@ pub fn rgb_to_i420(rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>
 pub fn capture_rgb(emu: &Emulator) -> (Vec<u8>, usize, usize) {
     let mut fresh = vec![0u8; FB_BYTES];
     emu.read_physical_range(FB_BASE, &mut fresh);
+    let (rgb, w, h) = rgb_from_capture(&fresh);
+    (rgb, w, h)
+}
+
+/// The same conversion against a framebuffer someone else already copied out
+/// of guest RAM. Splitting it out is what lets the display and video paths
+/// share ONE capture: the emulator's thread does a single memcpy, and both the
+/// band diff and the encoder work from that copy — on another thread, where
+/// neither of them is charged to the guest.
+pub fn rgb_from_capture(fresh: &[u8]) -> (Vec<u8>, usize, usize) {
     let mut rgb = Vec::with_capacity(FB_W * FB_H * 3);
     for y in 0..FB_H {
         let row = &fresh[y * FB_STRIDE..(y + 1) * FB_STRIDE];

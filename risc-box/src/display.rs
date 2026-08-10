@@ -113,11 +113,31 @@ impl Display {
         // Read into the scratch buffer and swap it in, rather than allocating
         // a fresh frame each time: the row hashes carry everything needed to
         // find what changed, so the previous frame's bytes are not consulted.
-        emu.read_physical_range(FB_BASE, &mut self.scratch);
+        let mut buf = std::mem::take(&mut self.scratch);
+        Self::capture(emu, &mut buf);
+        let (bands, spare) = self.bands(buf);
+        self.scratch = spare;
+        bands
+    }
+
+    /// The half of a scan that needs the emulator: copy the framebuffer out of
+    /// guest RAM. This is a memcpy and nothing else, which is the point — it
+    /// is the only part that cannot leave the emulator's thread, so it is kept
+    /// as small as possible. Everything expensive (hashing, diffing,
+    /// deflating) is in `bands` and can run anywhere.
+    pub fn capture(emu: &Emulator, out: &mut Vec<u8>) {
+        out.resize(FB_BYTES, 0);
+        emu.read_physical_range(FB_BASE, out);
+    }
+
+    /// Turn a captured frame into bands. Takes the frame by value and hands
+    /// back the frame it replaced, so a caller holding a buffer pool can keep
+    /// recycling two buffers forever instead of allocating megabytes per scan.
+    pub fn bands(&mut self, mut frame: Vec<u8>) -> (Vec<Band>, Vec<u8>) {
         let mut dirty = vec![false; FB_H];
         let mut any = false;
         for y in 0..FB_H {
-            let h = fnv1a(&self.scratch[y * FB_STRIDE..(y + 1) * FB_STRIDE]);
+            let h = fnv1a(&frame[y * FB_STRIDE..(y + 1) * FB_STRIDE]);
             if h != self.row_hash[y] || !self.primed {
                 self.row_hash[y] = h;
                 dirty[y] = true;
@@ -127,13 +147,19 @@ impl Display {
         let full = self.force_full;
         self.force_full = false;
         self.primed = true;
-        std::mem::swap(&mut self.frame, &mut self.scratch);
+        // `frame` becomes the current one; the old current goes back to the
+        // caller as the next capture target.
+        std::mem::swap(&mut self.frame, &mut frame);
         if full {
-            return vec![self.band(0, FB_H)];
+            return (vec![self.band(0, FB_H)], frame);
         }
         if !any {
-            return Vec::new();
+            return (Vec::new(), frame);
         }
+        (self.group_dirty(&dirty), frame)
+    }
+
+    fn group_dirty(&self, dirty: &[bool]) -> Vec<Band> {
         // group consecutive dirty rows; sew gaps under 8 rows into one band
         // (fewer events beats a few clean rows re-sent inside a run)
         let mut bands = Vec::new();

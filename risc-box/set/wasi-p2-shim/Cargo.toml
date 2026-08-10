@@ -1,0 +1,12 @@
+[package]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+edition = "2021"
+publish = false
+
+# Stands in for the real `wasi` 0.11 crate, and ONLY for the SET build (see
+# set/build.sh, which applies it with `cargo --config patch...`). Nothing here
+# is a general-purpose wasi binding; it exists to satisfy one caller.
+[features]
+default = []
+rustc-dep-of-std = []
