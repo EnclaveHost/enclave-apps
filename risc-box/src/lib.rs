@@ -947,6 +947,19 @@ pub extern "C" fn risc_box_main() -> i32 {
 }
 
 pub fn run() {
+    // What the platform actually handed us, by NAME only — never a value.
+    //
+    // A deployment whose $NAME placeholders come out unresolved has two very
+    // different causes that look identical from the config alone: the platform
+    // substituted nothing because it had no secrets, or it had them and the
+    // env never reached this process. One line here separates those, and
+    // without it the answer costs a day of tracing across three machines.
+    // Names are already public (they are in the app config); values are not,
+    // and never appear here.
+    let mut names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    names.sort();
+    eprintln!("[risc-box] guest env ({}): {}", names.len(), names.join(" "));
+
     // Never exit on config problems: a fresh deployment whose $VAR secrets are
     // not set yet must still come up so the operator can set them (and restart)
     // rather than the whole deployment landing in "failed".
