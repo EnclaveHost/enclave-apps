@@ -723,10 +723,12 @@ function show(src, m, id) {
   $("img").src = src;
   $("out").style.display = "block";
   const t = m.timings || {};
-  // the upscale link appears on shots an attached upscaler can take: not
-  // already upscaled, and within its input ceiling
+  // the upscale links appear on shots an attached upscaler can take: not
+  // already upscaled, and within its input ceiling. The model runs at its
+  // native factor; smaller offered factors are supersampled down from it.
   const u = upscalers[0];
   const canUp = id && u && !m.upscaled && Math.max(m.width, m.height) <= u.max_input;
+  const factors = !u ? [] : (u.factor > 2 && u.factor % 2 === 0 ? [u.factor / 2, u.factor] : [u.factor]);
   $("meta").innerHTML =
     (m.model ? `<span>${m.model}</span>` : "") +
     `<span>${m.width}&times;${m.height}</span><span>${m.steps} step${m.steps > 1 ? "s" : ""}</span>` +
@@ -734,12 +736,13 @@ function show(src, m, id) {
     (m.upscaled ? `<span>upscaled &middot; ${m.upscaler}</span>` : "") +
     (t.gen_ms != null ? `<span>gen ${(t.gen_ms / 1000).toFixed(1)} s &middot; load ${t.load_ms} ms</span>` : "") +
     `<a href="${src}" download="enclave-${m.seed}${m.upscaled ? "-up" : ""}.png">download</a>` +
-    (canUp ? `<a href="#" id="upbtn">upscale ${u.factor}&times;</a>` : "") +
+    (canUp ? factors.map(f => `<a href="#" class="upbtn" data-f="${f}">upscale ${f}&times;</a>`).join("") : "") +
     `<a href="#" id="reuse">reuse seed</a>` +
     (id ? `<a href="#" id="delcur" class="danger">delete</a>` : "");
   document.getElementById("reuse").onclick = e => { e.preventDefault(); $("seed").value = String(m.seed); };
-  const up = document.getElementById("upbtn");
-  if (up) up.onclick = e => { e.preventDefault(); upscaleShot(id); };
+  document.querySelectorAll("#meta .upbtn").forEach(a => {
+    a.onclick = e => { e.preventDefault(); upscaleShot(id, +a.dataset.f); };
+  });
   const del = document.getElementById("delcur");
   if (del) del.onclick = e => { e.preventDefault(); deleteShot(id); };
 }
@@ -748,21 +751,22 @@ function show(src, m, id) {
 // POST the shot's own PNG back through /upscale (host-side ESRGAN; the
 // stock volume is Real-ESRGAN x4plus). The result joins the gallery as its
 // own shot - the original stays.
-async function upscaleShot(id) {
+async function upscaleShot(id, factor) {
   const s = shots.find(x => x.id === id);
   const u = upscalers[0];
   if (!s || !u || upscaling) return;
+  const f = factor || u.factor;
   upscaling = true;
   const t0 = performance.now();
   const tick = setInterval(() => {
     const el = document.querySelector("#status u");
     if (el) el.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
   }, 100);
-  setStatus(`upscaling ${s.meta.width}&times;${s.meta.height} with ${u.name}&hellip; <u>0.0s</u>`);
+  setStatus(`upscaling ${s.meta.width}&times;${s.meta.height} to ${f}&times; with ${u.name}&hellip; <u>0.0s</u>`);
   const ctrl = new AbortController();
   const watchdog = setTimeout(() => ctrl.abort(), 300000);
   try {
-    const r = await fetch("upscale?upscaler=" + encodeURIComponent(u.name), {
+    const r = await fetch("upscale?upscaler=" + encodeURIComponent(u.name) + "&factor=" + f, {
       method: "POST", body: s.blob, signal: ctrl.signal,
     });
     if (!r.ok) {
@@ -770,8 +774,8 @@ async function upscaleShot(id) {
       throw new Error(d.error?.message || r.status + " " + r.statusText);
     }
     const blob = await r.blob();
-    const w = +r.headers.get("x-width") || s.meta.width * u.factor;
-    const h = +r.headers.get("x-height") || s.meta.height * u.factor;
+    const w = +r.headers.get("x-width") || s.meta.width * f;
+    const h = +r.headers.get("x-height") || s.meta.height * f;
     const meta = { ...s.meta, width: w, height: h, upscaled: true, upscaler: u.name, timings: {} };
     const ns = addShot(blob, meta);
     show(ns.url, meta, ns.id);

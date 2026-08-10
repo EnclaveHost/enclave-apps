@@ -34,7 +34,11 @@
 //!                       generation). The playground's endpoint.
 //!   POST /upscale     - raw PNG body -> ESRGAN-upscaled PNG (the stock
 //!                       catalog: Real-ESRGAN x4plus, 4x). ?upscaler= picks
-//!                       a catalog entry; output geometry rides x-width /
+//!                       a catalog entry; ?factor= asks for a divisor of
+//!                       the native scale (2 on the 4x model = the native
+//!                       output box-averaged down: supersampled, so quality
+//!                       meets or beats a native 2x model; 1 = a same-size
+//!                       cleanup pass). Output geometry rides x-width /
 //!                       x-height / x-upscale-factor response headers.
 //!   POST /v1/images/generations - OpenAI-compatible: {prompt, model?, n?,
 //!                       size?, seed?} -> {created, data: [{b64_json, seed}]}.
@@ -54,6 +58,7 @@
 mod bindings;
 
 pub mod config;
+pub mod imageops;
 
 #[cfg(target_arch = "wasm32")]
 mod pipeline;

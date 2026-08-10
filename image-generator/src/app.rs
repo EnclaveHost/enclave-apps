@@ -163,11 +163,41 @@ struct GenBody {
     #[serde(default)]
     response_format: Option<String>,
     /// run the generated image through an upscaler volume before returning
-    /// (/generate only); `upscaler` picks a catalog entry, absent = default
+    /// (/generate only); `upscaler` picks a catalog entry, absent = default.
+    /// `upscale_factor` asks for a sub-native factor (any divisor of the
+    /// model's native scale, e.g. 2 on the 4x model): the model runs at
+    /// native scale and the output is box-averaged down - supersampling.
     #[serde(default)]
     upscale: Option<bool>,
     #[serde(default)]
     upscaler: Option<String>,
+    #[serde(default)]
+    upscale_factor: Option<u32>,
+}
+
+/// Produce the requested output factor from a native-scale upscale. The
+/// model always runs at its native scale s (read back from the output
+/// geometry); a factor f dividing s comes from an exact (s/f):1 box average
+/// of the native output (imageops::box_downscale - supersampled, so quality
+/// meets or beats a native f-x model). None = native.
+fn apply_factor(
+    o: pipeline::UpscaleOutput,
+    in_w: u32,
+    factor: Option<u32>,
+) -> Result<pipeline::UpscaleOutput, String> {
+    let Some(f) = factor else { return Ok(o) };
+    let native = if in_w > 0 { o.width / in_w } else { 0 };
+    if f == native {
+        return Ok(o);
+    }
+    if f == 0 || native == 0 || f > native || native % f != 0 {
+        return Err(format!(
+            "factor {f} is not available from this upscaler (native {native}x; \
+             factors: the divisors of {native})"
+        ));
+    }
+    let (rgb, w, h) = crate::imageops::box_downscale(&o.rgb, o.width, o.height, native / f);
+    Ok(pipeline::UpscaleOutput { rgb, width: w, height: h, ..o })
 }
 
 fn parse_target(cfg: &AppConfig, s: Option<&str>) -> Result<ExecutionTarget, String> {
@@ -285,7 +315,9 @@ fn handle_generate(cat: &Catalog, req: IncomingRequest, out: ResponseOutparam) {
                             up.name, up.max_input
                         ));
                     }
-                    Ok(up) => match pipeline::upscale(&up.volume, &rgb, w, h, &mut status) {
+                    Ok(up) => match pipeline::upscale(&up.volume, &rgb, w, h, &mut status)
+                        .and_then(|u| apply_factor(u, w, body.upscale_factor))
+                    {
                         Ok(u) => {
                             upscale_ms = u.load_ms + u.upscale_ms;
                             upscaled = Some(serde_json::json!({
@@ -347,6 +379,23 @@ fn handle_upscale(cat: &Catalog, req: IncomingRequest, query: &str, out: Respons
         Ok(u) => u,
         Err(e) => return json_err(out, 400, &e),
     };
+    // ?factor=: pre-checked against the CONFIG's native factor so a bad
+    // request fails before the GPU runs; re-checked after against the real
+    // output geometry (the weights are the truth about the native scale)
+    let factor = match query_get(query, "factor").map(|v| v.parse::<u32>()) {
+        None => None,
+        Some(Ok(f)) if f >= 1 && f <= up.factor && up.factor % f == 0 => Some(f),
+        Some(_) => {
+            return json_err(
+                out,
+                400,
+                &format!(
+                    "factor must be a divisor of this upscaler's native {}x",
+                    up.factor
+                ),
+            );
+        }
+    };
     let body = match read_body_limit(&req, MAX_UPSCALE_BODY_BYTES) {
         Ok(b) if !b.is_empty() => b,
         Ok(_) => return json_err(out, 400, "empty body - POST the PNG to upscale"),
@@ -361,6 +410,7 @@ fn handle_upscale(cat: &Catalog, req: IncomingRequest, query: &str, out: Respons
     }
     let mut status = |_: &str| true; // nothing to stream on a binary route
     match pipeline::upscale(&up.volume, &rgb, w, h, &mut status)
+        .and_then(|o| apply_factor(o, w, factor))
         .and_then(|o| to_png(&o.rgb, o.width, o.height).map(|png| (o, png)))
     {
         Ok((o, png)) => {

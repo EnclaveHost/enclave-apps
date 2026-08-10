@@ -38,8 +38,8 @@ in, raw RGB out.
 | `GET /info` | volume attachment, step/size limits, and the `models` catalog (name/limits per entry) |
 | `GET /warmup?model=&size=` | load the weights + one tiny 1-step generation (at `min_size` unless `?size=` says otherwise); the playground fires it on page load |
 | `GET /image?prompt=...&steps=8&seed=7&w=1024&h=1024&model=` | → `image/png` (curl-friendly) |
-| `POST /generate` | `{prompt, model?, steps?, seed?, width?, height?, negative_prompt?, cfg?, ancestral?, upscale?, upscaler?}` → SSE status lines, then `{done, image: <b64 png>, model, seed, timings}`. `upscale: true` runs the result through an upscaler volume before returning (best effort: a failed upscale reports as `upscale_error` NEXT TO the finished base image) |
-| `POST /upscale` | raw PNG body → ESRGAN-upscaled PNG (`curl --data-binary @in.png`); `?upscaler=` picks a catalog entry by name or volume, absent = the first attached; output geometry rides `x-width` / `x-height` / `x-upscale-factor` response headers. The playground's per-image "upscale 4x" link |
+| `POST /generate` | `{prompt, model?, steps?, seed?, width?, height?, negative_prompt?, cfg?, ancestral?, upscale?, upscaler?, upscale_factor?}` → SSE status lines, then `{done, image: <b64 png>, model, seed, timings}`. `upscale: true` runs the result through an upscaler volume before returning (best effort: a failed upscale reports as `upscale_error` NEXT TO the finished base image) |
+| `POST /upscale` | raw PNG body → ESRGAN-upscaled PNG (`curl --data-binary @in.png`); `?upscaler=` picks a catalog entry by name or volume, absent = the first attached; `?factor=` asks for a divisor of the model's native scale (see below); output geometry rides `x-width` / `x-height` / `x-upscale-factor` response headers. The playground's per-image "upscale 2x / 4x" links |
 | `POST /v1/images/generations` | OpenAI-compatible: `{prompt, model?, n?, size?, seed?}` → `{created, data:[{b64_json, seed}]}`; `Authorization: Bearer` enforced when the config sets `api_key` |
 
 `model` names an entry from the config's `models` catalog (matched by
@@ -159,8 +159,17 @@ volume, small self-contained entries (`name`, `factor` default 4,
 
 Requests select by `name` or volume; absent means the first attached entry.
 It merges per key under `ENCLAVE_CONFIG` like `models`, an entry whose
-volume isn't attached just hides the playground's upscale link, and
+volume isn't attached just hides the playground's upscale links, and
 dropping the key disables the option entirely.
+
+Sub-native factors ride the native pass: `factor` (the `?factor=` query, or
+`upscale_factor` on `/generate`) accepts any divisor of the model's native
+scale. The model always runs at native scale and the output box-averages
+down by exact integer blocks - supersampling, which cancels upscaler
+hallucination noise instead of resampling it, so a `factor=2` from the 4x
+model meets or beats a native 2x model (chaining a 2x model UP would do the
+opposite: each pass amplifies the previous one's artifacts). `factor=1` is
+a same-size cleanup pass. The playground offers `native/2` and `native`.
 
 ## Platform pieces
 
