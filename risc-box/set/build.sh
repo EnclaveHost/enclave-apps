@@ -90,8 +90,23 @@ cp set/main.c "$WORK/link/main.c"
 # is not a nice message — the guard page is just linear memory, so it surfaces
 # as `wasm trap: out of bounds memory access` inside whatever function was
 # unlucky (here `std::env::var`, which looks like an env bug and is not).
+# --max-memory, because the wrapper's default is 1 GiB and this app does not
+# fit in it. A shared memory must declare its maximum at LINK time and can
+# never grow past it, so the ceiling is fixed in the binary — unlike the
+# ordinary build, where wasmtime's `-W max-memory-size` (the deployment's own
+# RAM slice) is the only limit. The guest's DRAM alone is 512 MiB; add a
+# decompressed rootfs (128 MiB), the image being fetched, and the framebuffer
+# buffers, and a clean boot fits in 1 GiB while a boot whose image fetch
+# RETRIES does not:
+#
+#     memory allocation of 536870912 bytes failed   (Mmu::init_memory)
+#
+# Raising it costs nothing: the engine still enforces the real per-deployment
+# ceiling, so this only stops the LINKER from being the smaller of the two.
+# Passed after the wrapper's own flag, which is what makes it win.
 docker run --rm -v "$PWD/$WORK/link":/src "$IMG" \
-  main.c librisc_box.a -O2 -Wl,--export=cabi_realloc -Wl,-z,stack-size=1048576 -o out.wasm
+  main.c librisc_box.a -O2 -Wl,--export=cabi_realloc -Wl,-z,stack-size=1048576 \
+  -Wl,--max-memory=3221225472 -o out.wasm
 cp "$WORK/link/out.wasm" "$OUT"
 
 python3 - "$OUT" <<'PY'
