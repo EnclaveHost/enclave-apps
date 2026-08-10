@@ -325,7 +325,9 @@
     <div class="code"><div class="code-head"><span>curl: OpenAI-compatible</span><button type="button" class="cbtn" id="apiCopyPost">Copy</button></div><pre><code id="apiPost"></code></pre></div>
     <p class="api-fine">Model names match the picker; omit <code class="ic">model</code> for the largest attached one.
     Also <code class="ic">GET /info</code>, <code class="ic">GET /warmup?model=&hellip;</code>, and
-    <code class="ic">POST /upscale</code> (raw PNG body in, ESRGAN-upscaled PNG out; <code class="ic">curl --data-binary @in.png</code>).
+    <code class="ic">POST /upscale</code> (raw PNG body in, ESRGAN-upscaled PNG out; <code class="ic">curl --data-binary @in.png</code>;
+    <code class="ic">?factor=2</code> for a supersampled 2&times;). JSON clients: <code class="ic">POST /v1/images/upscale</code>
+    <code class="ic">{image, factor?}</code>, and <code class="ic">upscale: true</code> on <code class="ic">/v1/images/generations</code>.
     If the deployment config sets
     <code class="ic">api_key</code>, send <code class="ic">Authorization: Bearer &lt;key&gt;</code> on <code class="ic">/v1/&hellip;</code>.
     Requests run in the same enclave as this page.</p>

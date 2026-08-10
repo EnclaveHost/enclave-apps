@@ -40,7 +40,8 @@ in, raw RGB out.
 | `GET /image?prompt=...&steps=8&seed=7&w=1024&h=1024&model=` | → `image/png` (curl-friendly) |
 | `POST /generate` | `{prompt, model?, steps?, seed?, width?, height?, negative_prompt?, cfg?, ancestral?, upscale?, upscaler?, upscale_factor?}` → SSE status lines, then `{done, image: <b64 png>, model, seed, timings}`. `upscale: true` runs the result through an upscaler volume before returning (best effort: a failed upscale reports as `upscale_error` NEXT TO the finished base image) |
 | `POST /upscale` | raw PNG body → ESRGAN-upscaled PNG (`curl --data-binary @in.png`); `?upscaler=` picks a catalog entry by name or volume, absent = the first attached; `?factor=` asks for a divisor of the model's native scale (see below); output geometry rides `x-width` / `x-height` / `x-upscale-factor` response headers. The playground's per-image "upscale 2x / 4x" links |
-| `POST /v1/images/generations` | OpenAI-compatible: `{prompt, model?, n?, size?, seed?}` → `{created, data:[{b64_json, seed}]}`; `Authorization: Bearer` enforced when the config sets `api_key` |
+| `POST /v1/images/generations` | OpenAI-compatible: `{prompt, model?, n?, size?, seed?}` → `{created, data:[{b64_json, seed, width, height}]}`; `Authorization: Bearer` enforced when the config sets `api_key`. Extension fields `upscale: true`, `upscaler?`, `upscale_factor?` upscale each image before returning (validated up front: an API caller gets what they asked for or an error, unlike `/generate`'s best-effort) |
+| `POST /v1/images/upscale` | the `/v1`-shaped, `api_key`-gated twin of `/upscale` (nonstandard: OpenAI has no upscale concept): `{image: <base64 png>, upscaler?, factor?}` → `{created, data:[{b64_json, width, height, factor}]}` |
 
 `model` names an entry from the config's `models` catalog (matched by
 display `name` **or** volume name); absent/empty means the deployment's

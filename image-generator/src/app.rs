@@ -24,20 +24,7 @@ fn now_ms() -> u128 {
 
 // ------------------------------------------------------------------ base64 --
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn b64encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(B64[(n >> 18) as usize & 63] as char);
-        out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
+use crate::b64::encode as b64encode;
 
 // -------------------------------------------------------------------- http --
 
@@ -513,23 +500,135 @@ fn handle_openai(cat: &Catalog, req: IncomingRequest, out: ResponseOutparam) {
         Ok(r) => r,
         Err(e) => return json_err(out, 400, &e),
     };
+    // upscale extension fields (nonstandard, ignored-by-default clients are
+    // unaffected). Unlike /generate's best-effort SSE, an API caller gets
+    // WHAT THEY ASKED FOR or an error - so everything checkable is checked
+    // BEFORE any GPU time: catalog entry, factor divisibility, input size.
+    let up = if body.upscale.unwrap_or(false) {
+        let up = match cat.get_upscaler(body.upscaler.as_deref()) {
+            Ok(u) => u,
+            Err(e) => return json_err(out, 400, &e),
+        };
+        if base.width.max(base.height) > up.max_input {
+            return json_err(
+                out,
+                400,
+                &format!(
+                    "{}x{} exceeds upscaler '{}' max_input {}px",
+                    base.width, base.height, up.name, up.max_input
+                ),
+            );
+        }
+        if let Some(f) = body.upscale_factor {
+            if f == 0 || f > up.factor || up.factor % f != 0 {
+                return json_err(
+                    out,
+                    400,
+                    &format!("upscale_factor must be a divisor of this upscaler's native {}x", up.factor),
+                );
+            }
+        }
+        Some(up)
+    } else {
+        None
+    };
     let mut data = Vec::with_capacity(n);
     for i in 0..n {
         let mut greq = base.clone();
         greq.seed = base.seed.wrapping_add(i as u64);
         let mut status = |_: &str| true;
-        match generate(cfg, &greq, &mut status)
-            .and_then(|o| to_png(&o.rgb, o.width, o.height))
-        {
-            Ok(png) => data.push(serde_json::json!({
+        let img = generate(cfg, &greq, &mut status).and_then(|o| match up {
+            None => Ok((o.rgb, o.width, o.height)),
+            Some(up) => pipeline::upscale(&up.volume, &o.rgb, o.width, o.height, &mut status)
+                .and_then(|u| apply_factor(u, o.width, body.upscale_factor))
+                .map(|u| (u.rgb, u.width, u.height)),
+        });
+        match img.and_then(|(rgb, w, h)| to_png(&rgb, w, h).map(|png| (png, w, h))) {
+            Ok((png, w, h)) => data.push(serde_json::json!({
                 "b64_json": b64encode(&png),
                 "seed": greq.seed,
+                "width": w, "height": h,
             })),
             Err(e) => return json_err(out, 500, &format!("image {}/{n}: {e}", i + 1)),
         }
     }
     let resp = serde_json::json!({ "created": (now_ms() / 1000) as u64, "data": data });
     respond_bytes(out, 200, "application/json", resp.to_string().as_bytes());
+}
+
+// ------------------------------------------------- POST /v1/images/upscale --
+
+/// Nonstandard but /v1-shaped (and api_key-gated like the rest of /v1):
+/// standalone upscaling for JSON clients. {image: <base64 png>, upscaler?,
+/// factor?} -> {created, data: [{b64_json, width, height, factor}]}. The
+/// binary-friendly twin is POST /upscale.
+#[derive(Deserialize)]
+struct UpscaleBody {
+    image: String,
+    #[serde(default)]
+    upscaler: Option<String>,
+    #[serde(default)]
+    factor: Option<u32>,
+}
+
+/// base64 of a 32 MB PNG plus JSON scaffolding
+const MAX_UPSCALE_JSON_BYTES: usize = 44 * 1024 * 1024;
+
+fn handle_openai_upscale(cat: &Catalog, req: IncomingRequest, out: ResponseOutparam) {
+    if !authorized(cat.default_model(), &req) {
+        return json_err(out, 401, "missing or invalid API key");
+    }
+    let parsed: Result<UpscaleBody, String> = read_body_limit(&req, MAX_UPSCALE_JSON_BYTES)
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
+    let body = match parsed {
+        Ok(b) => b,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    let up = match cat.get_upscaler(body.upscaler.as_deref()) {
+        Ok(u) => u,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    if let Some(f) = body.factor {
+        if f == 0 || f > up.factor || up.factor % f != 0 {
+            return json_err(
+                out,
+                400,
+                &format!("factor must be a divisor of this upscaler's native {}x", up.factor),
+            );
+        }
+    }
+    // tolerate a data-URL wrapper: the b64 payload is what matters
+    let b64_data = body.image.split_once(";base64,").map_or(body.image.as_str(), |(_, d)| d);
+    let png_in = match crate::b64::decode(b64_data) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => return json_err(out, 400, "empty image"),
+        Err(e) => return json_err(out, 400, &format!("image is not valid base64: {e}")),
+    };
+    let (rgb, w, h) = match pipeline::from_png(&png_in, up.max_input) {
+        Ok(v) => v,
+        Err(e) => return json_err(out, 400, &e),
+    };
+    if w < 16 || h < 16 {
+        return json_err(out, 400, &format!("image is {w}x{h}; the upscaler wants at least 16px a side"));
+    }
+    let mut status = |_: &str| true;
+    match pipeline::upscale(&up.volume, &rgb, w, h, &mut status)
+        .and_then(|o| apply_factor(o, w, body.factor))
+        .and_then(|o| to_png(&o.rgb, o.width, o.height).map(|png| (o, png)))
+    {
+        Ok((o, png)) => {
+            let resp = serde_json::json!({
+                "created": (now_ms() / 1000) as u64,
+                "data": [{
+                    "b64_json": b64encode(&png),
+                    "width": o.width, "height": o.height,
+                    "factor": o.width / w.max(1),
+                }],
+            });
+            respond_bytes(out, 200, "application/json", resp.to_string().as_bytes());
+        }
+        Err(e) => json_err(out, 500, &e),
+    }
 }
 
 // ------------------------------------------------------------ warmup/info --
@@ -820,10 +919,11 @@ impl Guest for Component {
             (Method::Post, "/generate") => handle_generate(&cat, req, out),
             (Method::Post, "/upscale") => handle_upscale(&cat, req, query, out),
             (Method::Post, "/v1/images/generations") => handle_openai(&cat, req, out),
+            (Method::Post, "/v1/images/upscale") => handle_openai_upscale(&cat, req, out),
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /ping, GET /info, GET /warmup, GET /image, POST /generate, POST /upscale, POST /v1/images/generations",
+                "not found; routes: GET /, GET /ping, GET /info, GET /warmup, GET /image, POST /generate, POST /upscale, POST /v1/images/generations, POST /v1/images/upscale",
             ),
         }
     }

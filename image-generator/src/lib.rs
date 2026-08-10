@@ -40,6 +40,11 @@
 //!                       meets or beats a native 2x model; 1 = a same-size
 //!                       cleanup pass). Output geometry rides x-width /
 //!                       x-height / x-upscale-factor response headers.
+//!   POST /v1/images/upscale - the /v1-shaped (api_key-gated) twin of
+//!                       /upscale: {image: <base64 png>, upscaler?, factor?}
+//!                       -> {created, data: [{b64_json, width, height,
+//!                       factor}]}. Nonstandard route; OpenAI's schema has
+//!                       no upscale concept.
 //!   POST /v1/images/generations - OpenAI-compatible: {prompt, model?, n?,
 //!                       size?, seed?} -> {created, data: [{b64_json, seed}]}.
 //!                       Always returns b64_json (no url storage in an
@@ -57,6 +62,7 @@
 #[allow(warnings)]
 mod bindings;
 
+pub mod b64;
 pub mod config;
 pub mod imageops;
 
