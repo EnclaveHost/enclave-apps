@@ -1310,8 +1310,12 @@ fn call_http(
     } else {
         let payload = match &t.body {
             // the turn's pictures ride the template as $images / $image -
-            // bytes the model could never put in its arguments itself
-            Some(tpl) => fill_template(tpl, &with_images(obj, images)),
+            // bytes the model could never put in its arguments itself.
+            // Pruning after the fill is what makes an OPTIONAL parameter
+            // expressible in a template at all: a hole the model left
+            // unfilled is dropped rather than sent as the literal string
+            // "$factor" for the endpoint to choke on.
+            Some(tpl) => prune_unfilled(fill_template(tpl, &with_images(obj, images)), t),
             None if as_query => serde_json::json!({}),
             None => args.clone(),
         };
@@ -1440,7 +1444,22 @@ fn map_result(
             .get("prompt")
             .and_then(|p| p.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| truncate(&args.to_string(), 200));
+            .unwrap_or_else(|| {
+                // no prompt argument (an upscale-style tool): echo the args
+                // minus any image payloads - kilobytes of base64 are not a
+                // "request" the model should read back
+                match args {
+                    serde_json::Value::Object(o) => {
+                        let slim: serde_json::Map<String, serde_json::Value> = o
+                            .iter()
+                            .filter(|(k, _)| k.as_str() != "image" && k.as_str() != "images")
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        truncate(&serde_json::Value::Object(slim).to_string(), 200)
+                    }
+                    other => truncate(&other.to_string(), 200),
+                }
+            });
         *image_out = Some(crate::image::GeneratedImage {
             b64,
             mime,
@@ -1525,6 +1544,39 @@ fn substitute<'a>(
     }
     out.push_str(rest);
     (out, used)
+}
+
+/// Drop template holes the fill left behind, so a declared-but-omitted
+/// argument means "send nothing" instead of sending the literal "$name".
+/// Scoped tightly: only a WHOLE string value (fill_template's own rule)
+/// naming one of the tool's DECLARED parameters (or the reserved image
+/// slots, for a template used on an imageless routed turn) is a hole -
+/// literal text containing a `$` still travels untouched.
+fn prune_unfilled(v: serde_json::Value, t: &HttpTool) -> serde_json::Value {
+    fn hole(v: &serde_json::Value, t: &HttpTool) -> bool {
+        let Some(name) = v.as_str().and_then(|s| s.strip_prefix('$')) else { return false };
+        let name = name.strip_prefix('{').and_then(|x| x.strip_suffix('}')).unwrap_or(name);
+        if matches!(name, "image" | "images") {
+            return true;
+        }
+        t.parameters
+            .as_ref()
+            .and_then(|p| p.get("properties"))
+            .and_then(|p| p.as_object())
+            .is_some_and(|props| props.contains_key(name))
+    }
+    match v {
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.into_iter()
+                .filter(|(_, val)| !hole(val, t))
+                .map(|(k, val)| (k, prune_unfilled(val, t)))
+                .collect(),
+        ),
+        serde_json::Value::Array(a) => serde_json::Value::Array(
+            a.into_iter().filter(|x| !hole(x, t)).map(|x| prune_unfilled(x, t)).collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Fill `"$arg"` holes in a body template. Only a WHOLE string value is
@@ -1941,6 +1993,34 @@ mod tests {
         assert_eq!(out["opts"]["n"], 3);
         // "$5 each" is not an identifier, so it stays literal
         assert_eq!(out["lit"], "$5 each");
+    }
+
+    #[test]
+    fn omitted_optional_args_are_pruned_from_body_templates() {
+        // the upscale-tool shape: image reserved, factor optional
+        let t: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "upscale_image",
+            "url": "https://h/v1/images/upscale",
+            "method": "POST",
+            "parameters": {
+                "type": "object",
+                "properties": { "factor": { "type": "integer", "enum": [1, 2, 4] } },
+            },
+            "body": { "image": "$image", "factor": "$factor", "lit": "$5 each", "keep": "$UNDECLARED" },
+        }))
+        .unwrap();
+        // factor omitted by the model, no image on the turn either
+        let obj = serde_json::Map::new();
+        let filled = prune_unfilled(fill_template(t.body.as_ref().unwrap(), &obj), &t);
+        assert!(filled.get("factor").is_none(), "{filled}");
+        assert!(filled.get("image").is_none(), "{filled}");
+        assert_eq!(filled["lit"], "$5 each"); // not an identifier hole
+        assert_eq!(filled["keep"], "$UNDECLARED"); // not a declared parameter
+        // factor provided: filled and kept
+        let mut obj = serde_json::Map::new();
+        obj.insert("factor".into(), serde_json::json!(2));
+        let filled = prune_unfilled(fill_template(t.body.as_ref().unwrap(), &obj), &t);
+        assert_eq!(filled["factor"], 2);
     }
 
     #[test]
