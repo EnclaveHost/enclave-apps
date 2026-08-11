@@ -4347,14 +4347,12 @@ impl<'a> ToolLoop<'a> {
     }
 
     /// Take the attached pictures out of the conversation and hold them for
-    /// the image-reading tool. Called by the legs exactly when owns_vision().
+    /// the image-taking tools. Called by the legs exactly when owns_vision().
     fn stash_images(&mut self, messages: &mut [ChatMsg]) {
-        let name = self
-            .reg
-            .image_reader(self.cfg)
-            .unwrap_or("the image tool")
-            .to_string();
-        self.images = stash_images_for_tool(messages, &name);
+        let (reader, transformer) = self.reg.image_tool_names(self.cfg);
+        let (reader, transformer) =
+            (reader.map(str::to_string), transformer.map(str::to_string));
+        self.images = stash_images_for_tool(messages, reader.as_deref(), transformer.as_deref());
     }
 
     fn armed(&self) -> bool {
@@ -4713,7 +4711,16 @@ fn attempted_call(text: &str) -> bool {
 /// request is about (the LAST one carrying pictures, same rule as
 /// apply_vision) gets a note naming the tool to call; older image turns get
 /// the same note apply_vision leaves.
-fn stash_images_for_tool(messages: &mut [ChatMsg], tool: &str) -> Vec<Vec<u8>> {
+/// `reader` answers questions about pictures (view_image); `transformer`
+/// turns one into another (upscale_image). The note only ever promises what
+/// an armed tool can actually do. An assistant message carrying images is one
+/// whose GENERATED picture the client folded back into the history, so
+/// "upscale the tiger you just made" has bytes to bind to.
+fn stash_images_for_tool(
+    messages: &mut [ChatMsg],
+    reader: Option<&str>,
+    transformer: Option<&str>,
+) -> Vec<Vec<u8>> {
     let Some(idx) = messages.iter().rposition(|m| !m.images.is_empty()) else {
         return Vec::new();
     };
@@ -4724,14 +4731,30 @@ fn stash_images_for_tool(messages: &mut [ChatMsg], tool: &str) -> Vec<Vec<u8>> {
         }
         let note = if i == idx {
             let (noun, pron) = if stash.len() == 1 { ("an image", "it") } else { ("images", "them") };
-            format!(
-                "[the user attached {noun} to this message. You cannot see {pron} directly; \
-                 call {tool} with a specific question to look at {pron}.]"
-            )
+            let carrier = if m.role == "assistant" {
+                format!("[this reply of yours produced {noun}")
+            } else {
+                format!("[the user attached {noun} to this message")
+            };
+            let abilities = match (reader, transformer) {
+                (Some(r), Some(t)) => format!(
+                    "call {r} with a specific question to look at {pron}, or {t} to produce \
+                     a new image from {pron}"
+                ),
+                (Some(r), None) => format!("call {r} with a specific question to look at {pron}"),
+                (None, Some(t)) => format!(
+                    "you have no tool to view {pron} this turn, but {t} can produce a new \
+                     image from {pron}"
+                ),
+                (None, None) => "no armed tool can take {pron} this turn".replace("{pron}", pron),
+            };
+            format!("{carrier}. You cannot see {pron} directly; {abilities}.]")
+        } else if m.role == "assistant" && m.images.len() == 1 {
+            "[an image generated earlier in this conversation]".to_string()
         } else if m.images.len() == 1 {
             "[an image the user attached earlier in this conversation]".to_string()
         } else {
-            "[images the user attached earlier in this conversation]".to_string()
+            "[images attached earlier in this conversation]".to_string()
         };
         m.content = if m.content.trim().is_empty() {
             note
@@ -8159,6 +8182,37 @@ mod tests_2026_08_01 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stash_notes_name_tools_for_what_they_do() {
+        let png = vec![1u8, 2, 3];
+        let mk = |role: &str| {
+            let mut m = ChatMsg::text(role, "make it bigger");
+            m.images = vec![png.clone()];
+            m
+        };
+        // generated image on an ASSISTANT message, transformer only: the
+        // note must not promise looking, and must not say "the user attached"
+        let mut msgs = vec![ChatMsg::text("user", "draw a tiger"), mk("assistant")];
+        let stash = stash_images_for_tool(&mut msgs, None, Some("upscale_image"));
+        assert_eq!(stash.len(), 1);
+        assert!(msgs[1].content.contains("this reply of yours produced"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("no tool to view"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("upscale_image"), "{}", msgs[1].content);
+        assert!(msgs[1].images.is_empty());
+        // user attachment, reader AND transformer armed: both named, both verbs
+        let mut msgs = vec![mk("user")];
+        let _ = stash_images_for_tool(&mut msgs, Some("view_image"), Some("upscale_image"));
+        let c = &msgs[0].content;
+        assert!(c.contains("the user attached"), "{c}");
+        assert!(c.contains("view_image") && c.contains("look at"), "{c}");
+        assert!(c.contains("upscale_image") && c.contains("new image"), "{c}");
+        // an EARLIER assistant image gets the generated wording
+        let mut msgs = vec![mk("assistant"), mk("user")];
+        let _ = stash_images_for_tool(&mut msgs, Some("view_image"), None);
+        assert!(msgs[0].content.contains("generated earlier"), "{}", msgs[0].content);
+        assert!(msgs[0].images.is_empty());
+    }
 
     /// Routes the router serves statics from, spelled scope-relative the way
     /// the manifest and the worker's precache list must spell them (the app

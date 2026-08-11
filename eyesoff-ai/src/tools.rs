@@ -540,13 +540,27 @@ impl Registry {
     /// any. The legs use it to stand the vision pre-pass down, stash the
     /// pictures for the tool, and tell the model what to call.
     pub fn image_reader<'a>(&'a self, cfg: &ToolsConfig) -> Option<&'a str> {
-        self.tools
-            .iter()
-            .find(|t| match t.src {
-                ToolSrc::Http(i) => cfg.http[i].wants_images(),
-                _ => false,
-            })
-            .map(|t| t.name.as_str())
+        self.image_tool_names(cfg).0.or(self.image_tool_names(cfg).1)
+    }
+
+    /// The armed image-taking tools by NATURE: (reader, transformer). A
+    /// reader takes pictures and answers in text (view_image); a transformer
+    /// takes one and produces another (upscale_image). The stash note names
+    /// them for what they do - telling the model to "look" with a tool that
+    /// only upscales earns a call that cannot answer the question.
+    pub fn image_tool_names<'a>(&'a self, cfg: &ToolsConfig) -> (Option<&'a str>, Option<&'a str>) {
+        let pick = |transform: bool| {
+            self.tools
+                .iter()
+                .find(|t| match t.src {
+                    ToolSrc::Http(i) => {
+                        cfg.http[i].wants_images() && cfg.http[i].makes_image() == transform
+                    }
+                    _ => false,
+                })
+                .map(|t| t.name.as_str())
+        };
+        (pick(false), pick(true))
     }
 }
 

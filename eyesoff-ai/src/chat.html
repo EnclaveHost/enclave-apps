@@ -2796,15 +2796,26 @@ function buildPayload(chat) {
   // fall back to the server's own default rather than 0: if /models never
   // answered, dropping every picture silently is the worse failure
   const cap = (state.vision && state.vision.max_images) || 4;
+  const maxBytes = (state.vision && state.vision.max_bytes) || 6 * 1024 * 1024;
+  // A picture this chat GENERATED re-enters the history as that reply's
+  // image, so "upscale it" / "what did you draw" have bytes to bind to -
+  // unless it is too big for the server's per-image cap (an upscaled result
+  // can be; the whole request would be refused, so it is dropped instead).
+  const imagesOf = (m) => {
+    const own = m.images || [];
+    const gen = m.image && m.image.data_uri;
+    if (gen && Math.floor(gen.length * 3 / 4) <= maxBytes) return [...own, gen];
+    return own;
+  };
   let budget = cap;
   const keep = new Set();
   for (let i = msgs.length - 1; i >= 0 && budget > 0; i--) {
-    const n = (msgs[i].images || []).length;
+    const n = imagesOf(msgs[i]).length;
     if (n && n <= budget) { keep.add(i); budget -= n; }
   }
   return msgs.map((m, i) => {
     const text = m.role === "assistant" ? stripThink(m.content) : m.content;
-    const imgs = m.images || [];
+    const imgs = imagesOf(m);
     if (!imgs.length) return { role: m.role, content: text };
     if (!keep.has(i)) {
       const note = imgs.length === 1 ? "[image from an earlier turn, no longer in context]"
