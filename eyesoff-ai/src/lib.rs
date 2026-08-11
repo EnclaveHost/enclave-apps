@@ -124,6 +124,26 @@
 //!                               lot; `"required"` and the named-function form
 //!                               are honoured as an instruction in the prompt
 //!                               (there is no grammar constraint here).
+//!                               PICTURES are registry entries like any other
+//!                               (docs/openai-api.md, "Picture tools"): a
+//!                               `$image`/`$images` body template binds the
+//!                               turn's attachments, so such an entry is only
+//!                               offered on a turn that HAS one (a model with
+//!                               local vision loses the readers and keeps the
+//!                               transformers, which it cannot substitute
+//!                               for), and a `result: {"image": ...}` entry
+//!                               delivers what it made on `enclave.image`
+//!                               like a routed picture: generate_image with
+//!                               an optional `size` for the shape,
+//!                               upscale_image with an optional `factor`
+//!                               (ESRGAN keeps the aspect ratio, so there is
+//!                               nothing to choose). An omitted optional
+//!                               argument is PRUNED from the body rather than
+//!                               sent as its "$name" hole. A picture the
+//!                               model made only comes back within reach of
+//!                               those tools if the client sends it back as
+//!                               that assistant turn's image, which the
+//!                               playground does.
 //!   POST /chat                - legacy SSE endpoint used by the playground.
 //!                               Same `web_search` switch; sources arrive as a
 //!                               `{"search":{...}}` event before the first

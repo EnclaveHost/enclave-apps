@@ -2,7 +2,7 @@
 
 The service-provider interface of the eyesoff-ai app (formerly llm-chat): everything a client can
 send to the `/v1` endpoints and everything that comes back, as implemented in
-`src/lib.rs` (accurate as of **0.40.0**). Point any OpenAI SDK at a
+`src/lib.rs` (accurate as of **0.46.0**). Point any OpenAI SDK at a
 deployment's URL and it works; this document is the contract, including the
 Enclave extensions the OpenAI schema has no words for.
 
@@ -128,6 +128,18 @@ deployment: a `vision` model reads them itself, a configured
 `vision_service` delegates to a sibling deployment — see the VISION sections
 of the `lib.rs` header. Requests with images sit out speculative decoding.
 
+**Images may ride any role, including `assistant`.** That is how a picture
+this deployment just made comes back into the conversation: take
+`enclave.image.data_uri` from the previous response and send it as an image
+part on that assistant message in the next request. Without it the model's
+last picture is gone the moment it reaches you, and "upscale that" has no
+bytes to bind to (see [Picture tools](#picture-tools)). The playground does
+this for you from 0.45.0: every reply's generated image is folded back into
+the history it sends, the oldest pictures dropped first to stay inside
+`max_images`, and a generated picture bigger than `max_image_bytes` left out
+rather than getting the whole request refused. A 4x upscale is often that big,
+so upscaling an upscale is not something a client can count on.
+
 **Tool history** (the agent-framework round trip) is understood regardless of
 whether the current request declares tools:
 
@@ -198,6 +210,13 @@ never draws, and never advertises either.
 - A generated image arrives on `enclave.image` (non-streaming) or a
   `: enclave-image` comment (streaming):
   `{"data_uri": "data:image/png;base64,...", "prompt": ..., "model": ..., "seed": ..., "ms": ...}`.
+  One envelope whichever leg made it: the router's `image` block, or a
+  registry tool with an image result (`generate_image`, `upscale_image`, or
+  whatever the deployment named its own). From a tool, `model` and `seed` are
+  `null` and `prompt` carries the tool's `prompt` argument, or the rest of its
+  arguments when it has none (`{"factor":2}` for an upscale). Arming an
+  image-producing tool stands the router's image verdict down for that turn,
+  so a deployment never pays for both deciders.
 
 ### Tools
 
@@ -213,6 +232,9 @@ URL — the registry is the deployment's, never the request's. `false`
 withholds it; absent takes the deployment's `tools.default_on`. What ran is
 reported on `enclave.tools` (non-streaming) or `: enclave-tool` /
 `: enclave-tool-result` / `: enclave-tools-ran` comments (streaming).
+
+Drawing, looking and upscaling live here, as ordinary registry entries rather
+than as built-ins: see [Picture tools](#picture-tools) below.
 
 **2. Client passthrough — `tools: [...]` (array, OpenAI).**
 The client's own functions are offered to the model **instead of** the
@@ -252,6 +274,70 @@ and the named-function form `{"type":"function","function":{"name":...}}`
 are honoured **as an instruction in the prompt** — there is no grammar
 constraint, so a model can still disobey; check `finish_reason` rather than
 assuming.
+
+#### Picture tools
+
+Drawing, looking and upscaling are not built-ins: they are ordinary `http`
+entries in the deployment registry (mode 1 above), so the same wiring drives
+any API, not just the sibling Enclave apps. Three generic powers make that
+work, and all three are visible from the client side.
+
+**Entries that take the turn's pictures.** A body template may use the
+reserved `"$image"` (the first attachment) or `"$images"` (all of them), which
+the server fills with data URIs: bytes the model could never write into its
+own arguments. Such an entry is offered **only on turns that actually carry a
+picture**. On a model that reads pictures itself, readers (picture in, text
+out, like `view_image`) are dropped while transformers (picture in, picture
+out, like `upscale_image`) stay, because local vision cannot substitute for an
+upscale. Calling one on a turn with no picture does not answer "no such tool",
+which a model repeats to the user as the capability not existing; it answers
+that the tool exists, that it needs a picture, and that the user should be
+asked to attach one.
+
+**Entries that produce a picture.** `result: {"image": "<dot path>"}` pulls
+base64 (or a data URI) out of the response, delivers it to the client exactly
+as a routed image is delivered, and hands the model a note saying a picture
+was made, that it cannot see it, and to acknowledge it briefly. An
+image-producing entry gets a 12 MB response cap by default, since a picture
+arrives as megabytes of base64; a 4x upscale of a large attachment is tens of
+MB, which is why the canonical upscale entry raises its own `max_bytes`.
+
+**Optional arguments cost nothing to omit.** A declared parameter the model
+leaves out leaves a `"$name"` hole in the body template, and the hole is
+pruned from the request rather than posted as the literal string `"$name"`.
+That is what makes optional knobs expressible at all: `factor` on an upscale,
+`size` on a generation.
+
+The canonical pair, as a client meets them at `GET /tools` (the names are the
+operator's to choose; these are the ones the config template ships):
+
+| tool | arguments | what comes back |
+|---|---|---|
+| `generate_image` | `prompt` (required), `size` (optional) | a new picture on `enclave.image` |
+| `upscale_image` | `factor` (optional); the picture is bound from the turn | the enlarged picture on `enclave.image` |
+
+**Aspect ratio.** `generate_image` takes an optional `size` whose enum the
+deployment writes (`"1024x1024"`, `"1024x768"`, `"768x1024"`, `"1024x576"`,
+`"576x1024"`, ...), kept inside the generator's own `min_size`/`max_size` so
+no value silently snaps to a different shape. The model picks the shape the
+request implies: wide for landscapes and banners, tall for portraits and
+posters, square when nothing argues otherwise. Omitted, the size is pruned
+from the request and the generator's `default_size` applies, exactly as before
+the knob existed.
+
+**Upscaling.** `upscale_image` reads the turn's picture and returns a bigger
+one: Real-ESRGAN, where `factor` 4 quadruples each side (the upscaler's native
+scale, and what an omitted argument serves), 2 doubles it (supersampled down
+from the 4x pass), 1 cleans the picture up at its current size. There is no
+shape argument, because ESRGAN preserves the input's aspect ratio by
+construction. The picture comes from the turn rather than from the model's
+arguments, so upscaling something the model itself drew depends on the client
+having sent that picture back (see [Messages](#messages)); a picture the user
+attached is already there.
+
+The canonical entries live in `assets/deploy-config.template.json` under
+`_tools_comment`, url/body/result and all: the operator wires them, and a
+client only ever sees the resolved names and schemas.
 
 ---
 
@@ -412,6 +498,39 @@ for chunk in stream:
 The SDK ignores the SSE comments and the `enclave` envelope on its own;
 `api_key` may be any non-empty string when the deployment configured none.
 
+Draw a picture, then enlarge the one that came back. The second request has to
+carry the picture: the model's own output reaches the client, not the server's
+memory of it.
+
+```python
+draw = client.chat.completions.create(
+    model="fable-fusion-27b-mtp",
+    messages=[{"role": "user", "content": "Draw a tiger in tall grass, wide"}],
+    extra_body={"tools": True},          # the deployment's registry
+)
+picture = draw.model_extra["enclave"]["image"]["data_uri"]   # data:image/png;base64,…
+
+bigger = client.chat.completions.create(
+    model="fable-fusion-27b-mtp",
+    messages=[
+        {"role": "user", "content": "Draw a tiger in tall grass, wide"},
+        {"role": "assistant", "content": [
+            {"type": "image_url", "image_url": {"url": picture}},
+            {"type": "text", "text": draw.choices[0].message.content or ""}]},
+        {"role": "user", "content": "Upscale it 2x"},
+    ],
+    extra_body={"tools": True},
+)
+enlarged = bigger.model_extra["enclave"]["image"]["data_uri"]
+```
+
+The shape of the first picture is the model's call (`generate_image`'s `size`,
+picked from "wide"); the second keeps that shape whatever `factor` it asks
+for. Both requests assume the deployment wired those entries, which
+`GET /tools` answers, and both can run long: a real client streams them and
+reads the `: enclave-image` comments instead, since three minutes is the
+platform proxy's patience for a buffered response.
+
 ---
 
 ## Adjacent (non-/v1) endpoints
@@ -427,6 +546,7 @@ around API integrations — see the `lib.rs` header for each:
 | `GET /attestation` | this deployment's SEV-SNP quote, measurement, GPU CC mode |
 | `GET /search?q=…` / `?url=…` | web-search probe: provider leg / fetch-extract leg, separately |
 | `GET /tools[?call=…&args=…]` | resolve the tool registry; run one entry |
+| `GET /legal`, `/privacy`, `/terms` | the deployment's legal document (one embedded page, linked from the playground) |
 | `POST /chat` | legacy SSE endpoint the playground uses (its own event schema) |
 | `POST /title` | name a chat from its opening exchange; failures answer `title: null` |
 
