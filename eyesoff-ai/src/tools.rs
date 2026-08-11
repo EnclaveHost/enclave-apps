@@ -620,7 +620,12 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         // a tool that asks for the turn's pictures only exists when there are
         // pictures to give it, and not when the serving model reads them
         // itself. Silent either way: a per-turn fact, not a misconfiguration.
-        if t.wants_images() && (!b.images_present || b.images_local) {
+        // No pictures this turn = no image-taking tools, reader or not. A
+        // model that reads pictures ITSELF (images_local) drops only the
+        // READERS - delegating the looking would be absurd - but keeps the
+        // transformers (upscale: picture in, picture out), which local
+        // vision cannot substitute for.
+        if t.wants_images() && (!b.images_present || (b.images_local && !t.makes_image())) {
             continue;
         }
         match check_name(&t.name) {
@@ -1087,12 +1092,27 @@ pub fn call(
     let src = match reg.find(name) {
         Some(t) => t.src.clone(),
         None => {
-            let known: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-            return ToolResult {
-                text: format!(
+            // A CONFIGURED image-taking entry that was gated off this turn
+            // deserves the real reason: "no tool named X" reads as a
+            // deployment gap, and the model then tells the user the
+            // capability does not exist (seen live: an upscale ask on a
+            // turn whose history carried no picture).
+            let text = if cfg.http.iter().any(|t| t.name == name && t.wants_images()) {
+                format!(
+                    "the {name} tool exists on this deployment but takes a picture, and this \
+                     turn's conversation carries none - it is only offered when one is \
+                     present. Ask the user to attach (or re-send) the image they mean; do \
+                     not retry without a picture."
+                )
+            } else {
+                let known: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+                format!(
                     "there is no tool named '{name}' on this deployment. Available: {}",
                     if known.is_empty() { "(none)".into() } else { known.join(", ") }
-                ),
+                )
+            };
+            return ToolResult {
+                text,
                 is_error: true,
                 ms: now_ms().saturating_sub(t0),
                 sources: Vec::new(),
