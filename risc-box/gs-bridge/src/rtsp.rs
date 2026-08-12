@@ -94,11 +94,23 @@ fn describe_body() -> String {
     // Feature flags: no pen/touch capability to report.
     ss.push_str("a=x-ss-general.featureFlags:0\n");
     // Control-stream encryption v2 is the modern path and costs little, so it
-    // is both supported and requested. Video encryption is offered but not
-    // demanded: on a trusted link it is wasted CPU on an already CPU-bound
-    // box, and on a public address the client should be the one insisting.
-    // A client that asks for it (ENCFLG_VIDEO) gets it.
-    let supported = SS_ENC_CONTROL_V2 | crate::session::SS_ENC_VIDEO;
+    // is both supported and requested.
+    //
+    // Video encryption is NOT advertised, and that is deliberate. When it was
+    // offered, stock moonlight-qt 6.1.0 opted in (encryptionEnabled arrives as
+    // 0x3, control+video) and then dropped ~90% of frames — the stream became a
+    // 2-3 fps slideshow while every client-side stat (decode 0.75ms, network
+    // latency 1ms, queue 0.25ms) stayed healthy, i.e. the frames never
+    // reconstructed. A current-tree moonlight-common-c client decrypts the same
+    // stream at 30fps with zero loss, so the bridge's encryption is correct
+    // against the latest spec; moonlight-qt 6.1.0 ships an older
+    // moonlight-common-c whose SS_ENC_VIDEO handling does not agree with it.
+    // The plaintext video path is the one verified end to end against real
+    // clients, so we stay on it. On a loopback or trusted-LAN bridge the picture
+    // never leaves the machine anyway. Re-enable only after the encrypted path
+    // is validated against the actual moonlight-qt build in use, not just the
+    // headless library.
+    let supported = SS_ENC_CONTROL_V2;
     ss.push_str(&format!("a=x-ss-general.encryptionSupported:{supported}\n"));
     ss.push_str(&format!("a=x-ss-general.encryptionRequested:{}\n", SS_ENC_CONTROL_V2));
     // Stereo Opus, the only layout we generate.
