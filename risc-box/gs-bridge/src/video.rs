@@ -107,6 +107,12 @@ impl Encoder {
                 "-preset", "p1",           // lowest latency NVENC preset
                 "-tune", "ull",            // ultra-low-latency
                 "-zerolatency", "1",
+                // ffmpeg's nvenc wrapper defaults -delay to its async encode
+                // depth, which HOLDS finished frames inside the encoder.
+                // Measured on this exact command line: 68 ms write-to-output
+                // by default, 2 ms with the delay forced to zero. "ull" does
+                // not imply it; it must be explicit.
+                "-delay", "0",
                 // VBR rather than CBR: the emulated desktop is mostly static,
                 // and CBR would pad every frame with filler data to hit the
                 // target rate. Capping at the negotiated bitrate keeps us
@@ -293,6 +299,26 @@ impl AnnexBSplitter {
             self.scan = nal_pos;
         }
         None
+    }
+
+    /// Give up waiting for the next access unit to begin and emit what is
+    /// buffered, if it already contains a complete slice.
+    ///
+    /// `next_au` can only cut when the FOLLOWING frame's first slice arrives,
+    /// so a stream that pauses (or simply runs at 30 fps) holds every finished
+    /// frame for a full frame interval. The caller invokes this after a few
+    /// milliseconds of encoder silence instead: with `-delay 0` the encoder
+    /// writes each access unit within ~2 ms of its frame going in, so a quiet
+    /// pipe means the buffered bytes ARE the complete frame, not half of one.
+    fn flush_pending(&mut self) -> Option<Vec<u8>> {
+        if !self.seen_vcl || self.buf.is_empty() {
+            return None;
+        }
+        let au = std::mem::take(&mut self.buf);
+        self.seen_vcl = false;
+        self.nonvcl_run = None;
+        self.scan = 0;
+        Some(au)
     }
 }
 
@@ -597,8 +623,30 @@ pub fn run(
         std::thread::spawn(move || feeder(session, app, screen, stdin, fps));
     }
 
+    // The encoder's stdout is read on its own thread and handed over as
+    // chunks, so this loop can WAIT WITH A DEADLINE. An Annex-B stream only
+    // proves a frame complete when the next one begins, which at f fps holds
+    // every finished frame for 1/f seconds. With `-delay 0` the encoder
+    // writes an access unit within ~2 ms of its frame going in, so a few
+    // milliseconds of pipe silence is proof enough — flush_pending then ships
+    // the frame instead of waiting a frame interval for its successor.
+    const FLUSH_SILENCE: Duration = Duration::from_millis(8);
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut read_buf = vec![0u8; 256 * 1024];
+        loop {
+            match stdout.read(&mut read_buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if chunk_tx.send(read_buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
     let mut splitter = AnnexBSplitter::new();
-    let mut read_buf = vec![0u8; 256 * 1024];
     let mut frame_index: u32 = 0;
     let mut lowseq: u16 = 0;
     let epoch = Instant::now();
@@ -606,61 +654,69 @@ pub fn run(
     // shards are ever encrypted under the same key and nonce.
     let video_iv_counter = std::sync::atomic::AtomicU64::new(0);
 
-    while !session.is_stopping() {
-        let n = match stdout.read(&mut read_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
+    let mut emit = |au: Vec<u8>, frame_index: &mut u32, lowseq: &mut u16| -> bool {
+        let au = strip_filler(&au);
+        let Some(peer) = *session.video_peer.lock().unwrap() else {
+            // No client ping yet — nothing to send to.
+            return true;
         };
-        splitter.push(&read_buf[..n]);
 
-        while let Some(au) = splitter.next_au() {
-            if session.is_stopping() {
-                break;
-            }
-            let au = strip_filler(&au);
-            let Some(peer) = *session.video_peer.lock().unwrap() else {
-                // No client ping yet — nothing to send to.
-                continue;
-            };
+        // RTP video timestamps run on a 90 kHz clock.
+        let ts = (epoch.elapsed().as_secs_f64() * 90_000.0) as u32;
+        let is_idr = au_is_idr(&au);
+        if is_idr {
+            session.idr_requested.store(false, Ordering::Release);
+        }
 
-            // RTP video timestamps run on a 90 kHz clock.
-            let ts = (epoch.elapsed().as_secs_f64() * 90_000.0) as u32;
-            let is_idr = au_is_idr(&au);
-            if is_idr {
-                session.idr_requested.store(false, Ordering::Release);
-            }
+        if is_idr || *frame_index % 60 == 0 {
+            eprintln!(
+                "[video] frame {frame_index} {} {} bytes",
+                if is_idr { "IDR" } else { "P" },
+                au.len()
+            );
+        }
 
-            if is_idr || frame_index % 60 == 0 {
-                eprintln!(
-                    "[video] frame {frame_index} {} {} bytes",
-                    if is_idr { "IDR" } else { "P" },
-                    au.len()
-                );
-            }
+        let cfg = session.config.lock().unwrap().clone();
+        let cipher = if cfg.encryption_flags & crate::session::SS_ENC_VIDEO != 0 {
+            Some((session.key.as_slice(), &video_iv_counter))
+        } else {
+            None
+        };
+        if let Err(e) = send_frame(
+            &sock,
+            peer,
+            &au,
+            *frame_index,
+            lowseq,
+            ts,
+            cfg.packet_size,
+            cfg.min_required_fec_packets,
+            is_idr,
+            cipher,
+        ) {
+            eprintln!("[video] send failed: {e}");
+            return false;
+        }
+        *frame_index = frame_index.wrapping_add(1);
+        true
+    };
 
-            let cfg = session.config.lock().unwrap().clone();
-            let cipher = if cfg.encryption_flags & crate::session::SS_ENC_VIDEO != 0 {
-                Some((session.key.as_slice(), &video_iv_counter))
-            } else {
-                None
-            };
-            if let Err(e) = send_frame(
-                &sock,
-                peer,
-                &au,
-                frame_index,
-                &mut lowseq,
-                ts,
-                cfg.packet_size,
-                cfg.min_required_fec_packets,
-                is_idr,
-                cipher,
-            ) {
-                eprintln!("[video] send failed: {e}");
-                break;
+    while !session.is_stopping() {
+        match chunk_rx.recv_timeout(FLUSH_SILENCE) {
+            Ok(chunk) => {
+                splitter.push(&chunk);
+                while let Some(au) = splitter.next_au() {
+                    if session.is_stopping() || !emit(au, &mut frame_index, &mut lowseq) {
+                        break;
+                    }
+                }
             }
-            frame_index = frame_index.wrapping_add(1);
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(au) = splitter.flush_pending() {
+                    emit(au, &mut frame_index, &mut lowseq);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -722,6 +778,40 @@ mod tests {
             7,
             "the IDR access unit must begin with an SPS or the client ignores it"
         );
+    }
+
+    /// A finished frame must not wait for its successor: after encoder
+    /// silence, flush_pending ships the buffered access unit whole, and the
+    /// splitter state is clean for the frame that arrives later.
+    #[test]
+    fn flush_pending_ships_the_buffered_frame_and_resets() {
+        let mut s = AnnexBSplitter::new();
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // SPS
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE]); // PPS
+        stream.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]); // IDR
+        s.push(&stream);
+
+        assert!(s.next_au().is_none(), "no successor yet, next_au cannot cut");
+        let au = s.flush_pending().expect("a complete slice is buffered");
+        assert!(au_is_idr(&au));
+        assert_eq!(au[4] & 0x1F, 7, "the SPS still leads the flushed AU");
+        assert!(s.flush_pending().is_none(), "nothing left after the flush");
+
+        // The next frame flows through the normal path untouched.
+        s.push(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]); // P slice
+        assert!(s.next_au().is_none());
+        let p = s.flush_pending().expect("the P frame flushes too");
+        assert!(!au_is_idr(&p));
+    }
+
+    /// Silence with no complete slice buffered must flush nothing: half an
+    /// access unit on the wire is a corrupted frame, not a fast one.
+    #[test]
+    fn flush_pending_refuses_a_sliceless_buffer() {
+        let mut s = AnnexBSplitter::new();
+        s.push(&[0, 0, 0, 1, 0x67, 0x42, 0x00]); // SPS only
+        assert!(s.flush_pending().is_none());
     }
 
     /// A filler NAL ahead of the parameter sets hides the SPS from the
