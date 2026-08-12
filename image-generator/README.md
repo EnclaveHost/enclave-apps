@@ -31,6 +31,9 @@ in, raw RGB out.
 
 ## Routes
 
+Summarised here; the field-by-field contract (every parameter, every response
+shape, the error and timing rules) is [docs/api.md](docs/api.md).
+
 | route | what |
 |---|---|
 | `GET /` | image playground (self-contained HTML; model dropdown when the config lists several; auto-selects the largest attached model and warms it) |
