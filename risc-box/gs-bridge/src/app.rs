@@ -44,6 +44,11 @@ impl Write for Conn {
     }
 }
 
+/// Idle connections kept for reuse. Small on purpose: the callers are the
+/// input drainer and the screen, so two is the steady state and four absorbs
+/// a burst without holding sockets open on the app for no reason.
+const IDLE_MAX: usize = 4;
+
 pub struct App {
     /// host:port of the RISC Box app, e.g. "127.0.0.1:8000".
     addr: String,
@@ -53,6 +58,24 @@ pub struct App {
     tls: bool,
     /// Bearer token for a deployment whose config sets `api_key`.
     api_key: Option<String>,
+    /// Warm connections for the one-shot calls (`get` / `post_json`).
+    ///
+    /// Dialling per request is free beside the app and ruinous across the
+    /// internet, and this client was written for the former. Measured against
+    /// a deployment on the fleet at 171 ms RTT: 1.62 s for a request on a new
+    /// connection, 0.35 s for the same request on a warm one. `/hid` pays that
+    /// on EVERY input event, so a mouse move cost about a second and a half of
+    /// TCP and TLS handshaking to deliver a 60-byte body.
+    ///
+    /// Nothing on the app's side ever wanted this: its httpd keeps connections
+    /// alive and frames every response with content-length (`src/httpd.rs`).
+    /// The only thing closing them was this client sending `Connection: close`.
+    ///
+    /// A free list rather than one slot, because the screen's `get` must not
+    /// put the input drainer's `/hid` behind it — they are different threads
+    /// sharing one `Arc<App>`, and HTTP/1.1 has no way to interleave two
+    /// exchanges on one socket.
+    idle: std::sync::Mutex<Vec<Conn>>,
 }
 
 impl App {
@@ -69,7 +92,7 @@ impl App {
             true => rest.to_string(),
             false => format!("{rest}:{}", if tls { 443 } else { 80 }),
         };
-        App { addr, host, tls, api_key: None }
+        App { addr, host, tls, api_key: None, idle: std::sync::Mutex::new(Vec::new()) }
     }
 
     /// Set the bearer token sent with every request.
@@ -108,18 +131,116 @@ impl App {
         Ok(Conn::Tls(Box::new(stream)))
     }
 
+    fn take_idle(&self) -> Option<Conn> {
+        self.idle.lock().ok().and_then(|mut v| v.pop())
+    }
+
+    fn put_idle(&self, c: Conn) {
+        if let Ok(mut v) = self.idle.lock() {
+            if v.len() < IDLE_MAX {
+                v.push(c);
+            }
+        }
+    }
+
+    /// One request/response, on a warm connection when there is one.
+    ///
+    /// Retried once, and only when the connection came from the pool: a socket
+    /// that has been idle can have been closed by the peer since we last used
+    /// it, and we discover that on the write or the first read rather than up
+    /// front. That failure is not the request failing, it is the connection
+    /// having expired, so it earns a fresh dial. A connection we just opened
+    /// failing is a real error and is returned as one.
+    fn round_trip(&self, head: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut pooled = self.take_idle();
+        loop {
+            let reused = pooled.is_some();
+            let mut c = match pooled.take() {
+                Some(c) => c,
+                None => self.connect()?,
+            };
+            match Self::exchange(&mut c, head, body) {
+                Ok((resp, keep)) => {
+                    if keep {
+                        self.put_idle(c);
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if reused => {
+                    // fall through to a fresh dial exactly once
+                    let _ = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Write one request and read exactly one response. Returns the body and
+    /// whether the connection may be kept. Reading is bounded by
+    /// content-length rather than by EOF, which is what makes reuse possible
+    /// at all: read-to-EOF needs the server to hang up to know it is done.
+    fn exchange(c: &mut Conn, head: &str, body: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
+        c.write_all(head.as_bytes())?;
+        if !body.is_empty() {
+            c.write_all(body)?;
+        }
+        c.flush()?;
+
+        let mut raw: Vec<u8> = Vec::with_capacity(8192);
+        let mut buf = [0u8; 8192];
+        let hdr_end = loop {
+            if let Some(p) = find(&raw, b"\r\n\r\n") {
+                break p + 4;
+            }
+            let n = c.read(&mut buf)?;
+            if n == 0 {
+                return Err(std::io::Error::other("closed before the response headers"));
+            }
+            raw.extend_from_slice(&buf[..n]);
+        };
+        let head_txt = String::from_utf8_lossy(&raw[..hdr_end]).to_ascii_lowercase();
+        let keep = !head_txt.contains("connection: close");
+
+        // Only the SSE stream is chunked, and that goes through get_stream.
+        // Anything else arriving chunked is unexpected: drain it and retire the
+        // connection rather than leave a framing desync for the next caller.
+        if head_txt.contains("transfer-encoding: chunked") {
+            let mut rest = Vec::new();
+            c.read_to_end(&mut rest)?;
+            raw.extend_from_slice(&rest);
+            return Ok((dechunk(&raw[hdr_end..]), false));
+        }
+
+        let len = head_txt
+            .split("\r\n")
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let Some(len) = len else {
+            // No framing at all: EOF is the only end marker, so this one cannot
+            // be reused.
+            let mut rest = Vec::new();
+            c.read_to_end(&mut rest)?;
+            raw.extend_from_slice(&rest);
+            return Ok((raw[hdr_end..].to_vec(), false));
+        };
+        while raw.len() - hdr_end < len {
+            let n = c.read(&mut buf)?;
+            if n == 0 {
+                return Err(std::io::Error::other("closed mid-body"));
+            }
+            raw.extend_from_slice(&buf[..n]);
+        }
+        Ok((raw[hdr_end..hdr_end + len].to_vec(), keep))
+    }
+
     /// GET a path and return the response body.
     pub fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
-        let mut s = self.connect()?;
         let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\nAccept: */*\r\n\r\n",
+            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Accept: */*\r\n\r\n",
             self.host,
             self.auth_header()
         );
-        s.write_all(req.as_bytes())?;
-        let mut raw = Vec::new();
-        s.read_to_end(&mut raw)?;
-        Ok(split_body(raw))
+        self.round_trip(&req, &[])
     }
 
     /// Open a streaming GET and hand back the connection positioned just after
@@ -154,34 +275,20 @@ impl App {
     }
 
     /// POST a JSON body, ignoring the response.
+    ///
+    /// The response is still READ to completion, not discarded by hanging up:
+    /// this is the input path, it runs on a kept connection, and a body left
+    /// unread is the next caller's framing error.
     pub fn post_json(&self, path: &str, body: &str) -> std::io::Result<()> {
-        let mut s = self.connect()?;
         let req = format!(
             "POST {path} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             Content-Length: {}\r\n\r\n",
             self.host,
             self.auth_header(),
             body.len()
         );
-        s.write_all(req.as_bytes())?;
-        let mut sink = Vec::new();
-        let _ = s.read_to_end(&mut sink);
+        self.round_trip(&req, body.as_bytes())?;
         Ok(())
-    }
-}
-
-/// Strip HTTP headers (and de-chunk if needed) from a raw response.
-fn split_body(raw: Vec<u8>) -> Vec<u8> {
-    let Some(hdr_end) = find(&raw, b"\r\n\r\n") else {
-        return Vec::new();
-    };
-    let head = String::from_utf8_lossy(&raw[..hdr_end]).to_ascii_lowercase();
-    let body = raw[hdr_end + 4..].to_vec();
-
-    if head.contains("transfer-encoding: chunked") {
-        dechunk(&body)
-    } else {
-        body
     }
 }
 
