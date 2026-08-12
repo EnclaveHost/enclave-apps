@@ -17,10 +17,21 @@ impl Memory {
 	///
 	/// # Arguments
 	/// * `capacity`
+	// risc-box patch: allocate the guest's DRAM in ONE sized allocation instead
+	// of pushing it a word at a time. `push` grows by doubling, so the final
+	// step holds the old buffer AND the new one — 768 MiB live to arrive at a
+	// 512 MiB array — and memcpys the whole thing across. Under the SET build,
+	// whose shared memory has its maximum fixed at LINK time and cannot grow
+	// past it, that transient is the difference between booting and:
+	//
+	//     memory allocation of 536870912 bytes failed   (Mmu::init_memory)
+	//
+	// with a 128 MiB rootfs already resident. One sized allocation has no old
+	// buffer, no copy, and no 64-million-iteration loop to walk at every boot.
+	// `init` is called once on a fresh Memory (upstream's own contract, stated
+	// just above), so replacing the vector is what appending to it meant.
 	pub fn init(&mut self, capacity: u64) {
-		for _i in 0..((capacity + 7) / 8) {
-			self.data.push(0);
-		}
+		self.data = vec![0; ((capacity + 7) / 8) as usize];
 	}
 	
 	/// Reads a byte from memory.
