@@ -85,8 +85,13 @@ impl Encoder {
         let scale = format!("scale={}:{}:flags=bilinear", cfg.width, cfg.height);
         let fps = cfg.fps.max(1).to_string();
         let bitrate = format!("{}k", cfg.bitrate_kbps.max(500));
-        // One IDR per second.
-        let gop = cfg.fps.max(1).to_string();
+        // One IDR per second by default. GSB_GOP overrides the interval (in
+        // frames) for measurement rigs that want the periodic keyframe out of
+        // the way; unset, behaviour is unchanged.
+        let gop = std::env::var("GSB_GOP")
+            .ok()
+            .filter(|v| v.parse::<u32>().is_ok())
+            .unwrap_or_else(|| cfg.fps.max(1).to_string());
 
         let mut args: Vec<&str> = vec![
             "-hide_banner", "-loglevel", "error", "-nostdin",

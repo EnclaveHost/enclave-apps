@@ -331,6 +331,9 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
             continue;
         }
         let body = format!(r#"{{"events":[{}]}}"#, batch.join(","));
+        if std::env::var_os("GSB_DEBUG_INPUT").is_some() {
+            eprintln!("[control] /hid POST {} events: {body}", batch.len());
+        }
         if let Err(e) = app.post_json("/hid", &body) {
             eprintln!("[control] /hid post failed: {e}");
         }
