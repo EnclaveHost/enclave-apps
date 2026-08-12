@@ -44,6 +44,19 @@ impl Write for Conn {
     }
 }
 
+impl Conn {
+    /// The underlying TCP socket, for setting timeouts under either transport.
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Conn::Plain(s) => s,
+            Conn::Tls(s) => s.get_ref(),
+        }
+    }
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.tcp().set_read_timeout(d)
+    }
+}
+
 /// Idle connections kept for reuse. Small on purpose: the callers are the
 /// input drainer and the screen, so two is the steady state and four absorbs
 /// a burst without holding sockets open on the app for no reason.
@@ -308,6 +321,155 @@ impl App {
         );
         self.round_trip(&req, body.as_bytes())?;
         Ok(())
+    }
+
+    /// A dedicated connection for firing input POSTs without waiting on each
+    /// response — see [`InputPipe`].
+    pub fn input_pipe(self: &std::sync::Arc<Self>) -> InputPipe {
+        InputPipe { app: self.clone(), conn: None, buf: Vec::new(), pending: 0 }
+    }
+}
+
+/// A dedicated connection that fires input POSTs WITHOUT blocking on each
+/// response.
+///
+/// `post_json` writes a request and then reads its whole response before
+/// returning, so back-to-back input costs a full round trip apiece — measured
+/// ~80 ms on the fleet — and a keystroke sits behind the previous one's
+/// response even though the app already applied it. On the input path that
+/// round trip is pure latency.
+///
+/// Here requests are PIPELINED on one connection: written one after another
+/// without waiting, and the responses drained opportunistically. HTTP/1.1
+/// processes requests on a connection in order and replies in the same order,
+/// so keystroke order is preserved exactly — we just stop paying the return
+/// trip before sending the next key. The responses are tiny and unneeded, so a
+/// short-timeout read discards whatever has come back and never blocks on what
+/// has not. A write error, a peer close, or too many unanswered requests drops
+/// the connection and the next send redials.
+pub struct InputPipe {
+    app: std::sync::Arc<App>,
+    conn: Option<Conn>,
+    /// Bytes of a partially-received response carried between drains.
+    buf: Vec<u8>,
+    /// Requests written whose responses have not yet been drained.
+    pending: u32,
+}
+
+impl InputPipe {
+    fn reset(&mut self) {
+        self.conn = None;
+        self.buf.clear();
+        self.pending = 0;
+    }
+
+    fn head(&self, method: &str, path: &str, body_len: usize) -> String {
+        let auth = self.app.auth_header();
+        if body_len == 0 {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth}Accept: */*\r\n\r\n",
+                self.app.host
+            )
+        } else {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth}Content-Type: application/json\r\n\
+                 Content-Length: {body_len}\r\n\r\n",
+                self.app.host
+            )
+        }
+    }
+
+    /// Consume one complete response out of `buf`, if a whole one is present.
+    /// `/hid` and `/ping` are always content-length framed, which is what lets
+    /// this skip a full HTTP parser.
+    fn consume_one(&mut self) -> bool {
+        let Some(pos) = find(&self.buf, b"\r\n\r\n") else { return false };
+        let head = String::from_utf8_lossy(&self.buf[..pos]).to_ascii_lowercase();
+        let len = head
+            .split("\r\n")
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let total = pos + 4 + len;
+        if self.buf.len() < total {
+            return false;
+        }
+        self.buf.drain(..total);
+        self.pending = self.pending.saturating_sub(1);
+        true
+    }
+
+    /// Drain responses that have already arrived, without blocking on ones that
+    /// have not. Safe to call when idle to notice a dead peer.
+    pub fn poll(&mut self) {
+        let mut tmp = [0u8; 4096];
+        loop {
+            while self.consume_one() {}
+            if self.pending == 0 {
+                break;
+            }
+            let Some(conn) = self.conn.as_mut() else { break };
+            match conn.read(&mut tmp) {
+                Ok(0) => {
+                    self.reset();
+                    break;
+                }
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                // A 2 ms read timeout with nothing there is the common case, not
+                // an error: it means "no more responses ready", so stop draining.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(_) => {
+                    self.reset();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Fire a request and return without waiting for its response. Drains any
+    /// responses already back first so the socket does not accumulate, and
+    /// redials on a write error or a peer that has stopped answering.
+    pub fn send(&mut self, method: &str, path: &str, body: &[u8]) {
+        self.poll();
+        // A peer whose answers are not coming back must not let requests pile up
+        // unbounded — redial and start clean.
+        if self.pending > 16 {
+            self.reset();
+        }
+        let head = self.head(method, path, body.len());
+        for _ in 0..2 {
+            if self.conn.is_none() {
+                match self.app.connect() {
+                    Ok(c) => {
+                        // The short read timeout is what makes `poll` non-blocking:
+                        // a drain reads what is there and times out on the rest.
+                        let _ = c.set_read_timeout(Some(Duration::from_millis(2)));
+                        self.conn = Some(c);
+                    }
+                    Err(e) => {
+                        eprintln!("[control] input pipe dial failed: {e}");
+                        return;
+                    }
+                }
+            }
+            let conn = self.conn.as_mut().unwrap();
+            let ok = conn.write_all(head.as_bytes()).is_ok()
+                && (body.is_empty() || conn.write_all(body).is_ok())
+                && conn.flush().is_ok();
+            if ok {
+                self.pending += 1;
+                return;
+            }
+            // A stale socket the peer already closed: drop it and redial once.
+            self.reset();
+        }
     }
 }
 

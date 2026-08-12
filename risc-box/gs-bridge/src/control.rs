@@ -329,12 +329,20 @@ impl InputQueue {
 /// dial before it moves. Input latency is judged by exactly that first event.
 fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     const KEEPALIVE: Duration = Duration::from_secs(15);
+    // A pipelined connection: each batch is fired without waiting for the app's
+    // response, so a keystroke never sits behind the previous one's ~80 ms round
+    // trip. Order is preserved (one connection, HTTP/1.1 in-order replies); we
+    // just stop paying the return trip per key. See InputPipe.
+    let mut pipe = app.input_pipe();
     let mut last_used = std::time::Instant::now();
     while !session.is_stopping() {
         let batch = queue.drain(Duration::from_millis(50));
         if batch.is_empty() {
+            // Drain any responses now back, so the socket stays clean and a dead
+            // peer is noticed even while idle.
+            pipe.poll();
             if last_used.elapsed() >= KEEPALIVE {
-                let _ = app.get("/ping");
+                pipe.send("GET", "/ping", &[]);
                 last_used = std::time::Instant::now();
             }
             continue;
@@ -343,9 +351,7 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
         if std::env::var_os("GSB_DEBUG_INPUT").is_some() {
             eprintln!("[control] /hid POST {} events: {body}", batch.len());
         }
-        if let Err(e) = app.post_json("/hid", &body) {
-            eprintln!("[control] /hid post failed: {e}");
-        }
+        pipe.send("POST", "/hid", body.as_bytes());
         last_used = std::time::Instant::now();
     }
 }
