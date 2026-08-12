@@ -241,7 +241,16 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
         }
         KEY_DOWN_EVENT_MAGIC | KEY_UP_EVENT_MAGIC if body.len() >= 4 => {
             // [flags u8][keyCode u16 LE][modifiers u8]
-            let vk = u16::from_le_bytes([body[1], body[2]]);
+            //
+            // moonlight-qt sets bit 0x8000 on the key code of every keypress
+            // it sends (keyboard.cpp: `LiSendKeyboardEvent(0x8000 | keyCode…)`);
+            // Sunshine masks it off and so must we, or every real keystroke
+            // looks up as 0x80xx, misses the table, and is silently dropped —
+            // which is exactly the "keyboard does nothing" symptom, while a
+            // test client sending the bare VK code works. Strip the flag before
+            // the lookup. (Some paths, e.g. release-on-focus-loss, send the
+            // bare code; masking leaves those unchanged.)
+            let vk = u16::from_le_bytes([body[1], body[2]]) & 0x7FFF;
             let code = vk_to_linux_keycode(vk);
             if code == 0 {
                 return None;
