@@ -313,16 +313,28 @@ impl InputQueue {
 }
 
 /// Ship queued input into the machine until the session ends.
+///
+/// Between bursts it keeps one pooled connection warm with a cheap `/ping`:
+/// the relay cuts idle kept-alive connections, and without the ping the first
+/// event of every gesture pays a discovered-dead-socket plus a fresh TCP+TLS
+/// dial before it moves. Input latency is judged by exactly that first event.
 fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
+    const KEEPALIVE: Duration = Duration::from_secs(15);
+    let mut last_used = std::time::Instant::now();
     while !session.is_stopping() {
         let batch = queue.drain(Duration::from_millis(50));
         if batch.is_empty() {
+            if last_used.elapsed() >= KEEPALIVE {
+                let _ = app.get("/ping");
+                last_used = std::time::Instant::now();
+            }
             continue;
         }
         let body = format!(r#"{{"events":[{}]}}"#, batch.join(","));
         if let Err(e) = app.post_json("/hid", &body) {
             eprintln!("[control] /hid post failed: {e}");
         }
+        last_used = std::time::Instant::now();
     }
 }
 

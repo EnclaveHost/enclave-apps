@@ -49,6 +49,14 @@ impl Write for Conn {
 /// a burst without holding sockets open on the app for no reason.
 const IDLE_MAX: usize = 4;
 
+/// How long a parked connection is still trusted. The relay cuts idle spliced
+/// connections well before a minute is up, and a dead pooled socket costs the
+/// next input event a discovered-EOF plus a fresh TCP+TLS dial — the exact
+/// burst-start hitch the pool exists to prevent. Past this age the redial is
+/// cheaper than the gamble, so the connection is dropped on the floor instead
+/// of handed out.
+const IDLE_FRESH: Duration = Duration::from_secs(20);
+
 pub struct App {
     /// host:port of the RISC Box app, e.g. "127.0.0.1:8000".
     addr: String,
@@ -75,7 +83,9 @@ pub struct App {
     /// put the input drainer's `/hid` behind it — they are different threads
     /// sharing one `Arc<App>`, and HTTP/1.1 has no way to interleave two
     /// exchanges on one socket.
-    idle: std::sync::Mutex<Vec<Conn>>,
+    /// Each entry carries when it was parked; `take_idle` refuses anything
+    /// older than [`IDLE_FRESH`].
+    idle: std::sync::Mutex<Vec<(Conn, std::time::Instant)>>,
 }
 
 impl App {
@@ -132,13 +142,22 @@ impl App {
     }
 
     fn take_idle(&self) -> Option<Conn> {
-        self.idle.lock().ok().and_then(|mut v| v.pop())
+        let mut v = self.idle.lock().ok()?;
+        // Newest first; anything stale enough to refuse means everything older
+        // is stale too, so the leftovers are dropped rather than re-offered.
+        while let Some((c, parked)) = v.pop() {
+            if parked.elapsed() < IDLE_FRESH {
+                return Some(c);
+            }
+            v.clear();
+        }
+        None
     }
 
     fn put_idle(&self, c: Conn) {
         if let Ok(mut v) = self.idle.lock() {
             if v.len() < IDLE_MAX {
-                v.push(c);
+                v.push((c, std::time::Instant::now()));
             }
         }
     }
