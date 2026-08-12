@@ -126,6 +126,13 @@ impl Encoder {
                 "-b:v", &bitrate,
                 "-maxrate", &bitrate,
                 "-bf", "0",                // no B-frames: they add latency and reordering
+                // A single reference frame: each P-frame refers only to the one
+                // before it. NVENC defaults to multiple references, and a real
+                // hardware decoder (moonlight-qt on VDPAU) then throws "missing
+                // reference picture" on the P-frames after a keyframe and drops
+                // everything until the next one — a 2 fps slideshow. One
+                // reference keeps the chain trivial and the decoder happy.
+                "-refs", "1",
                 "-g", &gop,
                 "-forced-idr", "1",
                 "-pix_fmt", "yuv420p",
