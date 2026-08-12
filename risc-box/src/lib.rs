@@ -1167,9 +1167,20 @@ pub fn run() {
                 // compress would only queue up stale screens.
                 let watching_display = server.sse_count("display") > 0;
                 let watching_video = server.sse_count("video") > 0;
+                // Keep the display scan at its fast floor while input is recent
+                // (the same boost window the CPU uses). The stillness backoff
+                // stretches the scan interval toward 100 ms when the screen has
+                // been quiet, which is right for an idle machine but wrong right
+                // after a keystroke: the character lands during a backed-off
+                // interval and is not scanned out for up to a full one. Measured
+                // ~130 ms input->pixel after a pause vs ~30 ms during continuous
+                // input — and the reason typing felt laggier than the mouse,
+                // which keeps the scan awake simply by moving. Both the worker
+                // and inline scans below pace off this.
+                let scan_still = if app.input_boost > 0 { 0 } else { app.fb_still };
                 if worker::available() {
                     let due = app.fb_scanned.map_or(true, |t| {
-                        t.elapsed() >= display::scan_interval(app.fb_cost, app.fb_still)
+                        t.elapsed() >= display::scan_interval(app.fb_cost, scan_still)
                     });
                     if (watching_display || watching_video) && due && worker::inflight() == 0 {
                         let began = Instant::now();
@@ -1187,7 +1198,7 @@ pub fn run() {
                     }
                 } else if watching_display
                     && app.fb_scanned.map_or(true, |t| {
-                        t.elapsed() >= display::scan_interval(app.fb_cost, app.fb_still)
+                        t.elapsed() >= display::scan_interval(app.fb_cost, scan_still)
                     })
                 {
                     let began = Instant::now();
