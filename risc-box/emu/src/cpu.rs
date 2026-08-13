@@ -1337,10 +1337,11 @@ impl Cpu {
 							((halfword >> 7) & 0x20) | // offset[5] <= [12]
 							((halfword >> 2) & 0x18) | // offset[4:3] <= [6:5]
 							((halfword << 4) & 0x1c0); // offset[8:6] <= [4:2]
-						if rd != 0 {
-							return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 0x7;
-						}
-						// rd == 0 is reseved instruction
+						// rd is a FLOAT register here, so rd == 0 means f0, which is valid
+						// (unlike x0 for the integer LWSP/LDSP forms). gcc emits
+						// `c.fldsp f0, off(sp)` for FP spill reloads; gating on rd != 0
+						// wrongly raised SIGILL in Xorg's pixman/fb render path.
+						return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 0x7;
 					},
 					2 => {
 						// C.LWSP
