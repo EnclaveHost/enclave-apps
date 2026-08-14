@@ -117,10 +117,23 @@ hot their block was):
     execs 64-255     3.0%
 
 92.6% of the dynamic mix runs in blocks executed 256+ times — a
-compile-everything distribution (hot blocks are overwhelmingly loop
-bodies, the raw material of regions). 5.6x on 93% of the stream puts
-the end-to-end ceiling near 4.6x: the desktop boot in the 7-8 s band,
-and firefox's 20-minutes-and-counting startup at roughly four.
+compile-everything distribution. Region structure is measured as well
+(block-successor edges recorded at dispatch, Tarjan SCCs over
+function-local edges only — calls and returns excluded, since a region
+compiler doesn't cross them): 57.4% of retired mass sits inside
+function-local LOOPS, in healthily-sized units (the top regions run 3
+to ~1100 blocks). The remaining 43% is hot but call-shaped.
+
+That splits the app-side plan into two tiers with known values:
+loop-region translation alone is worth ~1.9x end-to-end; reaching the
+~4.6x ceiling (5.6x on 93%) needs function-granular units that reach
+each other with `call_indirect` INSIDE wasm — compiled-to-compiled
+calls through the app's own table, which is cheap, unlike the measured
+host-dispatch boundary (1.0x). The verb surface already permits both:
+a unit is just a module, and the table indices it returns are exactly
+what compiled units call each other by. End state: the desktop boot in
+the 7-8 s band, and firefox's 20-minutes-and-counting startup at
+roughly four.
 
 Two conclusions with teeth. First, block-granular dispatch cannot pay
 for the call boundary: the translator must form REGIONS — compile a

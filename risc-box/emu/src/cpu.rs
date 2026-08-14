@@ -360,6 +360,14 @@ pub struct Cpu {
 	stat_hist: [u64; 6], // buckets by exec count: 1-3,4-15,16-63,64-255,256-4095,4096+
 	#[cfg(feature = "blockstats")]
 	stat_singlestep: u64,
+	// block-graph edges (pred pc -> succ pc -> count) and per-pc node
+	// counts (execs, retired), for region/loop discovery at dump time
+	#[cfg(feature = "blockstats")]
+	stat_edges: std::collections::HashMap<(u64, u64), u64>,
+	#[cfg(feature = "blockstats")]
+	stat_nodes: std::collections::HashMap<u64, (u64, u64)>,
+	#[cfg(feature = "blockstats")]
+	stat_prev: u64,
 	unsigned_data_mask: u64,
 	// risc-box patch: instructions retired since the last device service
 	// (blocks may overshoot a boundary by up to BLOCK_MAX-1; the true count
@@ -537,6 +545,12 @@ impl Cpu {
 			stat_hist: [0; 6],
 			#[cfg(feature = "blockstats")]
 			stat_singlestep: 0,
+			#[cfg(feature = "blockstats")]
+			stat_edges: std::collections::HashMap::new(),
+			#[cfg(feature = "blockstats")]
+			stat_nodes: std::collections::HashMap::new(),
+			#[cfg(feature = "blockstats")]
+			stat_prev: 0,
 			unsigned_data_mask: 0xffffffffffffffff,
 			// risc-box patch: service devices after the first instruction, so
 			// a machine that traps immediately still sees its clint before
@@ -663,6 +677,7 @@ impl Cpu {
 						{
 							self.stat_execs[slot] += 1;
 							self.stat_retired[slot] += r;
+							self.stat_note_block(h.tag, r);
 						}
 						done += r;
 					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
@@ -671,6 +686,8 @@ impl Cpu {
 						{
 							self.stat_execs[slot] += 1;
 							self.stat_retired[slot] += r;
+							let tag = self.block_heads[slot].tag;
+							self.stat_note_block(tag, r);
 						}
 						done += r;
 					} else {
@@ -680,7 +697,10 @@ impl Cpu {
 							Err(e) => self.handle_exception(e, instruction_address)
 						}
 						#[cfg(feature = "blockstats")]
-						{ self.stat_singlestep += 1; }
+						{
+							self.stat_singlestep += 1;
+							self.stat_prev = 0; // region chain broken
+						}
 						done += 1;
 					}
 				} else {
@@ -780,6 +800,132 @@ impl Cpu {
 		}
 	}
 
+	#[cfg(feature = "blockstats")]
+	fn stat_note_block(&mut self, tag: u64, retired: u64) {
+		let e = self.stat_nodes.entry(tag).or_insert((0, 0));
+		e.0 += 1;
+		e.1 += retired;
+		if self.stat_prev != 0 && self.stat_edges.len() < 4_000_000 {
+			*self.stat_edges.entry((self.stat_prev, tag)).or_insert(0) += 1;
+		}
+		self.stat_prev = tag;
+	}
+
+	/// risc-box patch (blockstats): iterative Tarjan SCC over the block
+	/// graph; returns for each node index its SCC id, plus SCC sizes.
+	#[cfg(feature = "blockstats")]
+	fn stat_regions(&self) -> (Vec<u64>, Vec<(usize, u64, u64)>) {
+		// index nodes
+		let mut ids: Vec<u64> = self.stat_nodes.keys().cloned().collect();
+		ids.sort();
+		let index_of = |pc: u64| ids.binary_search(&pc).ok();
+		let n = ids.len();
+		let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+		let mut self_loop = vec![false; n];
+		for (&(a, b), _) in self.stat_edges.iter() {
+			// only LOCAL edges: intra-function branches. Calls and returns
+			// jump far and would collapse the whole program into one SCC;
+			// a region compiler wouldn't cross them either.
+			if a.abs_diff(b) > 0x1_0000 {
+				continue;
+			}
+			if let (Some(ia), Some(ib)) = (index_of(a), index_of(b)) {
+				if ia == ib {
+					self_loop[ia] = true;
+				} else {
+					adj[ia].push(ib as u32);
+				}
+			}
+		}
+		// iterative Tarjan
+		let mut index = vec![u32::MAX; n];
+		let mut low = vec![0u32; n];
+		let mut on_stack = vec![false; n];
+		let mut scc_of = vec![u32::MAX; n];
+		let mut stack: Vec<u32> = Vec::new();
+		let mut next_index = 0u32;
+		let mut scc_count = 0u32;
+		let mut call: Vec<(u32, usize)> = Vec::new();
+		for start in 0..n {
+			if index[start] != u32::MAX {
+				continue;
+			}
+			call.push((start as u32, 0));
+			index[start] = next_index;
+			low[start] = next_index;
+			next_index += 1;
+			stack.push(start as u32);
+			on_stack[start] = true;
+			while let Some(&mut (v, ref mut ei)) = call.last_mut() {
+				let v = v as usize;
+				if *ei < adj[v].len() {
+					let w = adj[v][*ei] as usize;
+					*ei += 1;
+					if index[w] == u32::MAX {
+						index[w] = next_index;
+						low[w] = next_index;
+						next_index += 1;
+						stack.push(w as u32);
+						on_stack[w] = true;
+						call.push((w as u32, 0));
+					} else if on_stack[w] {
+						low[v] = low[v].min(index[w]);
+					}
+				} else {
+					call.pop();
+					if let Some(&(pv, _)) = call.last() {
+						let pv = pv as usize;
+						low[pv] = low[pv].min(low[v]);
+					}
+					if low[v] == index[v] {
+						loop {
+							let w = stack.pop().unwrap();
+							on_stack[w as usize] = false;
+							scc_of[w as usize] = scc_count;
+							if w as usize == v {
+								break;
+							}
+						}
+						scc_count += 1;
+					}
+				}
+			}
+		}
+		// per-SCC: node count, execs, retired
+		let mut sccs: Vec<(usize, u64, u64)> = vec![(0, 0, 0); scc_count as usize];
+		let mut node_scc = vec![0u64; n];
+		for i in 0..n {
+			let sid = scc_of[i] as usize;
+			let (ex, rt) = self.stat_nodes[&ids[i]];
+			sccs[sid].0 += 1;
+			sccs[sid].1 += ex;
+			sccs[sid].2 += rt;
+			// cyclic if SCC has >1 node or the node self-loops
+			node_scc[i] = match sccs[sid].0 > 1 || self_loop[i] {
+				true => 1,
+				false => 0
+			};
+		}
+		// second pass: a node joined before its SCC grew past 1 needs the flag
+		for i in 0..n {
+			let sid = scc_of[i] as usize;
+			if sccs[sid].0 > 1 || self_loop[i] {
+				node_scc[i] = 1;
+			}
+		}
+		// retired mass by cyclicity
+		let mut cyc = 0u64;
+		let mut lin = 0u64;
+		for i in 0..n {
+			let (_, rt) = self.stat_nodes[&ids[i]];
+			match node_scc[i] {
+				1 => cyc += rt,
+				_ => lin += rt
+			}
+		}
+		(vec![cyc, lin], sccs)
+	}
+
 	/// risc-box patch (blockstats): flush live slots and print the coverage
 	/// histogram: retired instructions bucketed by the block's execution
 	/// count, plus the single-step share.
@@ -797,6 +943,24 @@ impl Cpu {
 		}
 		eprintln!("  {:>15}: {:>12}  {:>5.1}%", "single-step", self.stat_singlestep,
 			self.stat_singlestep as f64 * 100.0 / total as f64);
+		// region/loop discovery over the recorded block graph
+		let (mass, mut sccs) = self.stat_regions();
+		let node_total: u64 = mass[0] + mass[1];
+		eprintln!("block graph: {} nodes, {} edges", self.stat_nodes.len(), self.stat_edges.len());
+		eprintln!("  in-cycle retired mass: {:>12}  {:>5.1}%", mass[0],
+			mass[0] as f64 * 100.0 / node_total as f64);
+		eprintln!("  straight-line mass:    {:>12}  {:>5.1}%", mass[1],
+			mass[1] as f64 * 100.0 / node_total as f64);
+		sccs.sort_by(|a, b| b.2.cmp(&a.2));
+		eprintln!("  top cyclic regions (blocks, execs, retired):");
+		let mut shown = 0;
+		for &(nn, ex, rt) in sccs.iter() {
+			if nn > 1 && shown < 8 {
+				eprintln!("    {:>4} blocks  {:>12} execs  {:>12} retired ({:.1}%)",
+					nn, ex, rt, rt as f64 * 100.0 / node_total as f64);
+				shown += 1;
+			}
+		}
 	}
 
 	/// risc-box patch: builds a block starting at the current pc into
