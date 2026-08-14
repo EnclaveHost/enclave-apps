@@ -5689,6 +5689,110 @@ mod test_jit_equivalence {
 		assert!(checked > 300, "too few cases ran: {}", checked);
 	}
 
+	fn op(kind: u8, rd: u8, rs1: u8, rs2: u8, imm: i32) -> BlockOp {
+		BlockOp { imm: imm, word: 0, data: 0, kind: kind, rd: rd, rs1: rs1, rs2: rs2, len: 4, _pad: 0 }
+	}
+
+	/// Reference: interpreter-dispatch the region until pc leaves it or the
+	/// fuel bound is met at a block entry. Mirrors the compiled contract.
+	fn dispatch_ref(cpu: &mut Cpu, blocks: &[(u64, Vec<BlockOp>)], fuel: u64) -> u64 {
+		let mut retired = 0u64;
+		loop {
+			let at = cpu.pc;
+			let Some((slot, _)) = blocks.iter().enumerate().find(|(_, b)| b.0 == at) else {
+				return retired;
+			};
+			if retired >= fuel {
+				return retired;
+			}
+			retired += cpu.exec_block(slot);
+			// slots were installed 1:1 with block order
+		}
+	}
+
+	fn region_layout(cpu: &Cpu) -> jit::Layout {
+		jit::Layout {
+			x_base: XB, f_base: FB, pc_addr: PCA, gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen(),
+			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		}
+	}
+
+	fn run_region(bytes: &[u8], cpu_pre: &Cpu, entry: u32, fuel: u64) -> (u64, [i64; 32], u64) {
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, bytes).expect("valid region module");
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
+			}
+			d[GENA as usize..GENA as usize + 4]
+				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
+			let mut win = vec![0u8; WIN as usize];
+			cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
+			d[DB as usize..DB as usize + WIN as usize].copy_from_slice(&win);
+		}
+		let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = instance
+			.get_typed_func::<(i64, i32), i64>(&mut store, "run")
+			.unwrap();
+		let retired = run.call(&mut store, (fuel as i64, entry as i32)).unwrap() as u64;
+		let d = mem.data(&store);
+		let mut x = [0i64; 32];
+		for i in 0..32 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[XB as usize + i * 8..XB as usize + i * 8 + 8]);
+			x[i] = i64::from_le_bytes(b);
+		}
+		let mut b = [0u8; 8];
+		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
+		(retired, x, u64::from_le_bytes(b))
+	}
+
+	/// two-block counted loop: A does work and loops on itself via BNE,
+	/// falls through to B, which stores the result and leaves the region
+	fn loop_region() -> Vec<(u64, Vec<BlockOp>)> {
+		let a = DRAM_BASE;
+		let b = DRAM_BASE + 12;
+		vec![
+			(a, vec![
+				op(HOT_ADD, 5, 5, 7, 0),      // x5 += x7
+				op(HOT_ADDI, 6, 6, 0, -1),    // x6 -= 1
+				op(HOT_BNE, 0, 6, 0, -8),     // while x6 != 0 -> A
+			]),
+			(b, vec![
+				op(HOT_SD, 0, 10, 5, 0),      // [x10] = x5
+				op(HOT_ADDI, 28, 28, 0, 99),
+			]),
+		]
+	}
+
+	#[test]
+	fn region_loop_matches_dispatch() {
+		for &(iters, fuel) in
+			&[(1u64, 1u64 << 40), (7, 1 << 40), (1000, 1 << 40), (1000, 7), (1000, 1700), (5, 0)]
+		{
+			let blocks = loop_region();
+			let mut cpu = fresh_cpu(&mut Rng(31337));
+			cpu.x[6] = iters as i64;
+			cpu.x[10] = (DRAM_BASE + 9000 & !7) as i64;
+			let lay = region_layout(&cpu);
+			let bytes = jit::emit_region(&blocks, &lay).expect("region emits");
+			let (rw, xw, pcw) = run_region(&bytes, &cpu, 0, fuel);
+			cpu.update_pc(blocks[0].0);
+			for (slot, (start, ops)) in blocks.iter().enumerate() {
+				cpu.install_block_for_test(slot, *start, 0, ops);
+			}
+			let ri = dispatch_ref(&mut cpu, &blocks, fuel);
+			assert_eq!(ri, rw, "retired mismatch iters={} fuel={}", iters, fuel);
+			assert_eq!(cpu.pc, pcw, "pc mismatch iters={} fuel={}", iters, fuel);
+			assert_eq!(cpu.x, xw, "registers mismatch iters={} fuel={}", iters, fuel);
+		}
+	}
+
 	#[test]
 	fn store_bails_on_stale_generation() {
 		let mut r = Rng(97);

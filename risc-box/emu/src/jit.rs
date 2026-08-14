@@ -68,6 +68,26 @@ fn sleb(out: &mut Vec<u8>, mut v: i64) {
 struct Emit<'a> {
 	code: Vec<u8>,
 	lay: &'a Layout,
+	// index of the i64 scratch local (0 in single-block mode; shifted in
+	// region mode where params occupy the low indices)
+	scratch: u32,
+	// how many `if` labels currently enclose the emission point — a region
+	// transfer's br to the dispatch loop must add this to its depth
+	if_depth: u32,
+	// region mode: map from guest block start pc -> region block index,
+	// plus the local indices for the dispatch loop
+	region: Option<RegionEmit>,
+}
+
+#[derive(Clone)]
+struct RegionEmit {
+	targets: std::collections::HashMap<u64, u32>,
+	cur_local: u32,     // i32: which region block to run next
+	retired_local: u32, // i64: ops retired so far
+	fuel_param: u32,    // i64 param: stop once retired >= fuel
+	// br depth from the CURRENT emission point to the dispatch loop head;
+	// set per-block during region emission
+	loop_depth: u32,
 }
 
 // opcode bytes used below
@@ -141,36 +161,109 @@ impl<'a> Emit<'a> {
 		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
 	}
 
-	/// pc <- const, return const retired
+	/// pc <- const, then leave. Single-block mode returns the constant
+	/// retired count. Region mode: if pc names another region block, add
+	/// this block's retired-so-far and branch back to the dispatch loop;
+	/// otherwise return retired_local + the constant.
 	fn exit(&mut self, pc: u64, retired: u64) {
-		self.i32c(0);
-		self.i64c(pc as i64);
-		self.op(I64_STORE);
-		self.memarg(3, self.lay.pc_addr as u64);
-		self.i64c(retired as i64);
-		self.op(RETURN);
+		match self.region.clone() {
+			None => {
+				self.i32c(0);
+				self.i64c(pc as i64);
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.pc_addr as u64);
+				self.i64c(retired as i64);
+				self.op(RETURN);
+			}
+			Some(r) => {
+				self.op(0x20);
+				uleb(&mut self.code, r.retired_local as u64);
+				self.i64c(retired as i64);
+				self.op(0x7c);
+				self.op(0x21);
+				uleb(&mut self.code, r.retired_local as u64);
+				match r.targets.get(&pc) {
+					Some(&idx) => {
+						self.i32c(idx as i32);
+						self.op(0x21);
+						uleb(&mut self.code, r.cur_local as u64);
+						self.op(0x0c); // br to dispatch loop
+						uleb(&mut self.code, (r.loop_depth + self.if_depth) as u64);
+					}
+					None => {
+						self.i32c(0);
+						self.i64c(pc as i64);
+						self.op(I64_STORE);
+						self.memarg(3, self.lay.pc_addr as u64);
+						self.op(0x20);
+						uleb(&mut self.code, r.retired_local as u64);
+						self.op(RETURN);
+					}
+				}
+			}
+		}
+	}
+
+	/// A bail: pc <- const, return retired. Bails NEVER transfer within a
+	/// region — a bail pc that happens to be a block start must still hand
+	/// control back (a gen bail means this module is stale; a memory bail
+	/// at a block's first op would otherwise loop forever re-entering it).
+	fn bail(&mut self, pc: u64, retired: u64) {
+		match self.region.clone() {
+			None => self.exit(pc, retired),
+			Some(r) => {
+				self.i32c(0);
+				self.i64c(pc as i64);
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.pc_addr as u64);
+				self.op(0x20);
+				uleb(&mut self.code, r.retired_local as u64);
+				self.i64c(retired as i64);
+				self.op(0x7c);
+				self.op(RETURN);
+			}
+		}
+	}
+
+	/// JALR's exit tail after the pc store (target already stored): the
+	/// runtime target cannot be an in-region transfer in v1, so it always
+	/// returns.
+	fn jalr_ret(&mut self, retired: u64) {
+		match self.region.clone() {
+			None => {
+				self.i64c(retired as i64);
+				self.op(RETURN);
+			}
+			Some(r) => {
+				self.op(0x20);
+				uleb(&mut self.code, r.retired_local as u64);
+				self.i64c(retired as i64);
+				self.op(0x7c);
+				self.op(RETURN);
+			}
+		}
 	}
 	/// stack: guest address (i64). Leaves LINEAR i32 address on the stack.
 	/// Bails (pc=op_addr, return retired) unless the whole `width` fits in
 	/// the DRAM window. Uses local 0 as scratch.
 	fn dram_addr(&mut self, width: u64, op_addr: u64, retired: u64) {
-		// local0 = guest_addr - guest_dram_base
+		// scratch = guest_addr - guest_dram_base
 		self.i64c(self.lay.guest_dram_base as i64);
 		self.op(0x7d); // i64.sub
-		self.op(0x21); // local.set 0
-		uleb(&mut self.code, 0);
-		// if local0 > dram_len - width (unsigned): bail
-		self.op(0x20); // local.get 0
-		uleb(&mut self.code, 0);
+		self.op(0x21); // local.set scratch
+		uleb(&mut self.code, self.scratch as u64);
+		// if scratch > dram_len - width (unsigned): bail
+		self.op(0x20); // local.get scratch
+		uleb(&mut self.code, self.scratch as u64);
 		self.i64c((self.lay.dram_len - width) as i64);
 		self.op(0x56); // i64.gt_u
 		self.op(0x04); // if (empty)
 		self.op(0x40);
-		self.exit(op_addr, retired);
+		self.bail(op_addr, retired);
 		self.op(0x0b); // end if
-		// linear = dram_base + local0 (wrapped to i32)
+		// linear = dram_base + scratch (wrapped to i32)
 		self.op(0x20);
-		uleb(&mut self.code, 0);
+		uleb(&mut self.code, self.scratch as u64);
 		self.op(0xa7); // i32.wrap_i64
 		self.i32c(self.lay.dram_base as i32);
 		self.op(0x6a); // i32.add
@@ -184,7 +277,7 @@ impl<'a> Emit<'a> {
 		self.op(0x47); // i32.ne
 		self.op(0x04);
 		self.op(0x40);
-		self.exit(next_pc, retired);
+		self.bail(next_pc, retired);
 		self.op(0x0b);
 	}
 }
@@ -192,7 +285,18 @@ impl<'a> Emit<'a> {
 /// Emit ops[..] starting at guest pc `start`. Returns None if any op is
 /// outside the supported subset (caller keeps interpreting that block).
 pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
-	let mut e = Emit { code: Vec::new(), lay };
+	let mut e = Emit { code: Vec::new(), lay, scratch: 0, if_depth: 0, region: None };
+	if !emit_seq(&mut e, ops, start) {
+		return None;
+	}
+	Some(assemble(e.code))
+}
+
+/// The shared per-op emission: the whole sequence plus its fallthrough
+/// exit. Returns false only in single-block mode when the FIRST op is
+/// unsupported (nothing to compile); region mode emits a bail stub
+/// instead so the dispatcher interprets that block.
+fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 	let mut pc = start;
 	for (i, op) in ops.iter().enumerate() {
 		let addr = pc;
@@ -204,22 +308,22 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 		let rs2 = op.rs2;
 		let imm = op.imm as i64;
 		match op.kind {
-			HOT_ADDI => bin_imm(&mut e, rd, rs1, imm, 0x7c),
-			HOT_ADD => bin_reg(&mut e, rd, rs1, rs2, 0x7c),
-			HOT_SUB => bin_reg(&mut e, rd, rs1, rs2, 0x7d),
-			HOT_AND => bin_reg(&mut e, rd, rs1, rs2, 0x83),
-			HOT_OR => bin_reg(&mut e, rd, rs1, rs2, 0x84),
-			HOT_XOR => bin_reg(&mut e, rd, rs1, rs2, 0x85),
-			HOT_ANDI => bin_imm(&mut e, rd, rs1, imm, 0x83),
-			HOT_ORI => bin_imm(&mut e, rd, rs1, imm, 0x84),
-			HOT_XORI => bin_imm(&mut e, rd, rs1, imm, 0x85),
-			HOT_MUL => bin_reg(&mut e, rd, rs1, rs2, 0x7e),
-			HOT_SLL => bin_reg(&mut e, rd, rs1, rs2, 0x86),
-			HOT_SRL => bin_reg(&mut e, rd, rs1, rs2, 0x88),
-			HOT_SRA => bin_reg(&mut e, rd, rs1, rs2, 0x87),
-			HOT_SLLI => shift_imm(&mut e, rd, rs1, op.word, 0x86),
-			HOT_SRLI => shift_imm(&mut e, rd, rs1, op.word, 0x88),
-			HOT_SRAI => shift_imm(&mut e, rd, rs1, op.word, 0x87),
+			HOT_ADDI => bin_imm(e, rd, rs1, imm, 0x7c),
+			HOT_ADD => bin_reg(e, rd, rs1, rs2, 0x7c),
+			HOT_SUB => bin_reg(e, rd, rs1, rs2, 0x7d),
+			HOT_AND => bin_reg(e, rd, rs1, rs2, 0x83),
+			HOT_OR => bin_reg(e, rd, rs1, rs2, 0x84),
+			HOT_XOR => bin_reg(e, rd, rs1, rs2, 0x85),
+			HOT_ANDI => bin_imm(e, rd, rs1, imm, 0x83),
+			HOT_ORI => bin_imm(e, rd, rs1, imm, 0x84),
+			HOT_XORI => bin_imm(e, rd, rs1, imm, 0x85),
+			HOT_MUL => bin_reg(e, rd, rs1, rs2, 0x7e),
+			HOT_SLL => bin_reg(e, rd, rs1, rs2, 0x86),
+			HOT_SRL => bin_reg(e, rd, rs1, rs2, 0x88),
+			HOT_SRA => bin_reg(e, rd, rs1, rs2, 0x87),
+			HOT_SLLI => shift_imm(e, rd, rs1, op.word, 0x86),
+			HOT_SRLI => shift_imm(e, rd, rs1, op.word, 0x88),
+			HOT_SRAI => shift_imm(e, rd, rs1, op.word, 0x87),
 			HOT_LUI => {
 				e.set_x_pre(rd);
 				e.i64c(imm);
@@ -235,7 +339,7 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
-				wrap32(&mut e);
+				wrap32(e);
 				e.set_x_post(rd);
 			}
 			HOT_ADDW => {
@@ -243,7 +347,7 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.get_x(rs1);
 				e.get_x(rs2);
 				e.op(0x7c);
-				wrap32(&mut e);
+				wrap32(e);
 				e.set_x_post(rd);
 			}
 			HOT_SUBW => {
@@ -251,7 +355,7 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.get_x(rs1);
 				e.get_x(rs2);
 				e.op(0x7d);
-				wrap32(&mut e);
+				wrap32(e);
 				e.set_x_post(rd);
 			}
 			HOT_SLLIW => {
@@ -260,7 +364,7 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.get_x(rs1);
 				e.i64c(rs2 as i64);
 				e.op(0x86);
-				wrap32(&mut e);
+				wrap32(e);
 				e.set_x_post(rd);
 			}
 			HOT_SRLIW => {
@@ -284,42 +388,42 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.op(0xac);
 				e.set_x_post(rd);
 			}
-			HOT_SLLW => w_shift_reg(&mut e, rd, rs1, rs2, 0x74),
-			HOT_SRLW => w_shift_reg(&mut e, rd, rs1, rs2, 0x76),
-			HOT_SRAW => w_shift_reg(&mut e, rd, rs1, rs2, 0x75),
-			HOT_SLT => cmp_reg(&mut e, rd, rs1, rs2, 0x53),
-			HOT_SLTU => cmp_reg(&mut e, rd, rs1, rs2, 0x54),
-			HOT_SLTI => cmp_imm(&mut e, rd, rs1, imm, 0x53),
-			HOT_SLTIU => cmp_imm(&mut e, rd, rs1, imm, 0x54),
-			HOT_LD => load(&mut e, rd, rs1, imm, addr, ret_before, 8, I64_LOAD, 3),
-			HOT_LW => load(&mut e, rd, rs1, imm, addr, ret_before, 4, 0x34, 2),
-			HOT_LWU => load(&mut e, rd, rs1, imm, addr, ret_before, 4, 0x35, 2),
-			HOT_LH => load(&mut e, rd, rs1, imm, addr, ret_before, 2, 0x32, 1),
-			HOT_LHU => load(&mut e, rd, rs1, imm, addr, ret_before, 2, 0x33, 1),
-			HOT_LB => load(&mut e, rd, rs1, imm, addr, ret_before, 1, 0x30, 0),
-			HOT_LBU => load(&mut e, rd, rs1, imm, addr, ret_before, 1, 0x31, 0),
+			HOT_SLLW => w_shift_reg(e, rd, rs1, rs2, 0x74),
+			HOT_SRLW => w_shift_reg(e, rd, rs1, rs2, 0x76),
+			HOT_SRAW => w_shift_reg(e, rd, rs1, rs2, 0x75),
+			HOT_SLT => cmp_reg(e, rd, rs1, rs2, 0x53),
+			HOT_SLTU => cmp_reg(e, rd, rs1, rs2, 0x54),
+			HOT_SLTI => cmp_imm(e, rd, rs1, imm, 0x53),
+			HOT_SLTIU => cmp_imm(e, rd, rs1, imm, 0x54),
+			HOT_LD => load(e, rd, rs1, imm, addr, ret_before, 8, I64_LOAD, 3),
+			HOT_LW => load(e, rd, rs1, imm, addr, ret_before, 4, 0x34, 2),
+			HOT_LWU => load(e, rd, rs1, imm, addr, ret_before, 4, 0x35, 2),
+			HOT_LH => load(e, rd, rs1, imm, addr, ret_before, 2, 0x32, 1),
+			HOT_LHU => load(e, rd, rs1, imm, addr, ret_before, 2, 0x33, 1),
+			HOT_LB => load(e, rd, rs1, imm, addr, ret_before, 1, 0x30, 0),
+			HOT_LBU => load(e, rd, rs1, imm, addr, ret_before, 1, 0x31, 0),
 			HOT_SD => {
-				store(&mut e, rs1, rs2, imm, addr, ret_before, 8, I64_STORE, 3);
+				store(e, rs1, rs2, imm, addr, ret_before, 8, I64_STORE, 3);
 				e.gen_check(next, ret_after);
 			}
 			HOT_SW => {
-				store(&mut e, rs1, rs2, imm, addr, ret_before, 4, 0x3e, 2);
+				store(e, rs1, rs2, imm, addr, ret_before, 4, 0x3e, 2);
 				e.gen_check(next, ret_after);
 			}
 			HOT_SH => {
-				store(&mut e, rs1, rs2, imm, addr, ret_before, 2, 0x3d, 1);
+				store(e, rs1, rs2, imm, addr, ret_before, 2, 0x3d, 1);
 				e.gen_check(next, ret_after);
 			}
 			HOT_SB => {
-				store(&mut e, rs1, rs2, imm, addr, ret_before, 1, 0x3c, 0);
+				store(e, rs1, rs2, imm, addr, ret_before, 1, 0x3c, 0);
 				e.gen_check(next, ret_after);
 			}
-			HOT_BEQ => branch(&mut e, rs1, rs2, 0x51, addr, imm, next, ret_after),
-			HOT_BNE => branch(&mut e, rs1, rs2, 0x52, addr, imm, next, ret_after),
-			HOT_BLT => branch(&mut e, rs1, rs2, 0x53, addr, imm, next, ret_after),
-			HOT_BGE => branch(&mut e, rs1, rs2, 0x59, addr, imm, next, ret_after),
-			HOT_BLTU => branch(&mut e, rs1, rs2, 0x54, addr, imm, next, ret_after),
-			HOT_BGEU => branch(&mut e, rs1, rs2, 0x5a, addr, imm, next, ret_after),
+			HOT_BEQ => branch(e, rs1, rs2, 0x51, addr, imm, next, ret_after),
+			HOT_BNE => branch(e, rs1, rs2, 0x52, addr, imm, next, ret_after),
+			HOT_BLT => branch(e, rs1, rs2, 0x53, addr, imm, next, ret_after),
+			HOT_BGE => branch(e, rs1, rs2, 0x59, addr, imm, next, ret_after),
+			HOT_BLTU => branch(e, rs1, rs2, 0x54, addr, imm, next, ret_after),
+			HOT_BGEU => branch(e, rs1, rs2, 0x5a, addr, imm, next, ret_after),
 			HOT_JAL => {
 				e.set_x_pre(rd);
 				e.i64c(next as i64);
@@ -338,24 +442,23 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
-				e.op(0x21); // local.set 0 (target)
-				uleb(&mut e.code, 0);
+				e.op(0x21); // local.set scratch (target)
+				uleb(&mut e.code, e.scratch as u64);
 				e.set_x_pre(rd);
 				e.i64c(next as i64);
 				e.set_x_post(rd);
-				e.op(0x20); // local.get 0
-				uleb(&mut e.code, 0);
+				e.op(0x20); // local.get scratch
+				uleb(&mut e.code, e.scratch as u64);
 				e.i64c(next as i64);
 				e.op(0x52); // i64.ne
 				e.op(0x04); // if
 				e.op(0x40);
 				e.i32c(0);
 				e.op(0x20);
-				uleb(&mut e.code, 0);
+				uleb(&mut e.code, e.scratch as u64);
 				e.op(I64_STORE);
-				e.memarg(3, lay.pc_addr as u64);
-				e.i64c(ret_after as i64);
-				e.op(RETURN);
+				e.memarg(3, e.lay.pc_addr as u64);
+				e.jalr_ret(ret_after);
 				e.op(0x0b); // end if; fall through when target == next
 			}
 			HOT_FLD => {
@@ -400,9 +503,9 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.memarg(2, 0);
 				e.gen_check(next, ret_after);
 			}
-			HOT_FADD_D => fp_bin(&mut e, rd, rs1, rs2, 0xa0),
-			HOT_FSUB_D => fp_bin(&mut e, rd, rs1, rs2, 0xa1),
-			HOT_FMUL_D => fp_bin(&mut e, rd, rs1, rs2, 0xa2),
+			HOT_FADD_D => fp_bin(e, rd, rs1, rs2, 0xa0),
+			HOT_FSUB_D => fp_bin(e, rd, rs1, rs2, 0xa1),
+			HOT_FMUL_D => fp_bin(e, rd, rs1, rs2, 0xa2),
 			HOT_FSGNJ_D => {
 				// f[rd] = (bits(rs2) & SIGN) | (bits(rs1) & !SIGN)
 				e.set_f_bits_pre();
@@ -435,21 +538,100 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 			}
 			_ => {
 				// outside the subset. A first-op miss means nothing to
-				// compile; mid-block, emit a bail so the interpreter takes
-				// over at exactly this op, and stop emitting (the rest is
-				// unreachable through this function).
-				if i == 0 {
-					return None;
+				// compile (single-block mode) or a bail stub (region mode);
+				// mid-block, emit a bail so the interpreter takes over at
+				// exactly this op, and stop emitting.
+				if i == 0 && e.region.is_none() {
+					return false;
 				}
-				e.exit(addr, ret_before);
-				break;
+				e.bail(addr, ret_before);
+				return true;
 			}
 		}
 		pc = next;
 	}
 	// fallthrough exit
 	e.exit(pc, ops.len() as u64);
-	Some(assemble(e.code))
+	true
+}
+
+/// Emit a REGION: several blocks in one module, in-region control
+/// transfers compiled as branches back through a dispatch loop, exits
+/// leaving pc exact like everything else. Signature:
+/// run(fuel: i64, entry: i32) -> retired: i64 — the function stops at a
+/// block boundary once `retired >= fuel` (device servicing keeps its
+/// cadence), and `entry` picks the starting block. A call can retire 0
+/// (fuel exhausted at entry, or an unsupported first op): the dispatcher
+/// must make progress another way before retrying.
+pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u8>> {
+	if blocks.is_empty() || blocks.len() > 512 {
+		return None;
+	}
+	let n = blocks.len();
+	let mut targets = std::collections::HashMap::new();
+	for (i, &(start, _)) in blocks.iter().enumerate() {
+		targets.insert(start, i as u32);
+	}
+	let mut e = Emit {
+		code: Vec::new(),
+		lay,
+		scratch: 2, // params fuel=0, entry=1; locals scratch=2, cur=3, retired=4
+		if_depth: 0,
+		region: None,
+	};
+	// cur = entry
+	e.op(0x20);
+	uleb(&mut e.code, 1);
+	e.op(0x21);
+	uleb(&mut e.code, 3);
+	// dispatch loop
+	e.op(0x03); // loop
+	e.op(0x40);
+	for _ in 0..n {
+		e.op(0x02); // block
+		e.op(0x40);
+	}
+	// br_table on cur
+	e.op(0x20);
+	uleb(&mut e.code, 3);
+	e.op(0x0e); // br_table
+	uleb(&mut e.code, n as u64);
+	for i in 0..n {
+		uleb(&mut e.code, i as u64);
+	}
+	uleb(&mut e.code, 0); // default: block 0
+	for (i, &(start, ref ops)) in blocks.iter().enumerate() {
+		e.op(0x0b); // end of label B_i; code for block i follows
+		// fuel check: retired >= fuel -> pc = start, return retired
+		e.op(0x20);
+		uleb(&mut e.code, 4);
+		e.op(0x20);
+		uleb(&mut e.code, 0);
+		e.op(0x59); // i64.ge_s
+		e.op(0x04); // if
+		e.op(0x40);
+		e.i32c(0);
+		e.i64c(start as i64);
+		e.op(I64_STORE);
+		e.memarg(3, e.lay.pc_addr as u64);
+		e.op(0x20);
+		uleb(&mut e.code, 4);
+		e.op(RETURN);
+		e.op(0x0b);
+		// per-op emission with region transfers armed
+		e.region = Some(RegionEmit {
+			targets: targets.clone(),
+			cur_local: 3,
+			retired_local: 4,
+			fuel_param: 0,
+			loop_depth: (n - 1 - i) as u32,
+		});
+		let ok = emit_seq(&mut e, ops, start);
+		debug_assert!(ok);
+	}
+	e.op(0x0b); // end loop
+	e.op(0x00); // unreachable (loop never falls through)
+	Some(assemble_region(e.code))
 }
 
 /// ... as i32 as i64 (wrap then sign-extend)
@@ -554,8 +736,60 @@ fn branch(e: &mut Emit, rs1: u8, rs2: u8, cmp: u8, addr: u64, imm: i64, next: u6
 	e.op(cmp);
 	e.op(0x04); // if
 	e.op(0x40);
+	e.if_depth += 1;
 	e.exit(target, ret);
+	e.if_depth -= 1;
 	e.op(0x0b);
+}
+
+fn assemble_region(body_expr: Vec<u8>) -> Vec<u8> {
+	let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
+	// type: (i64, i32) -> i64
+	let mut sec = Vec::new();
+	uleb(&mut sec, 1);
+	sec.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]);
+	m.push(1);
+	uleb(&mut m, sec.len() as u64);
+	m.extend_from_slice(&sec);
+	// import env.mem
+	let mut sec = Vec::new();
+	uleb(&mut sec, 1);
+	uleb(&mut sec, 3);
+	sec.extend_from_slice(b"env");
+	uleb(&mut sec, 3);
+	sec.extend_from_slice(b"mem");
+	sec.extend_from_slice(&[0x02, 0x00, 1]);
+	m.push(2);
+	uleb(&mut m, sec.len() as u64);
+	m.extend_from_slice(&sec);
+	m.extend_from_slice(&[3, 2, 1, 0]);
+	let mut sec = Vec::new();
+	uleb(&mut sec, 1);
+	uleb(&mut sec, 3);
+	sec.extend_from_slice(b"run");
+	sec.extend_from_slice(&[0x00, 0]);
+	m.push(7);
+	uleb(&mut m, sec.len() as u64);
+	m.extend_from_slice(&sec);
+	// locals: 1x i64 (scratch), 1x i32 (cur), 1x i64 (retired)
+	let mut body = Vec::new();
+	uleb(&mut body, 3);
+	uleb(&mut body, 1);
+	body.push(0x7e);
+	uleb(&mut body, 1);
+	body.push(0x7f);
+	uleb(&mut body, 1);
+	body.push(0x7e);
+	body.extend_from_slice(&body_expr);
+	body.push(0x0b);
+	let mut sec = Vec::new();
+	uleb(&mut sec, 1);
+	uleb(&mut sec, body.len() as u64);
+	sec.extend_from_slice(&body);
+	m.push(10);
+	uleb(&mut m, sec.len() as u64);
+	m.extend_from_slice(&sec);
+	m
 }
 
 fn assemble(body_expr: Vec<u8>) -> Vec<u8> {
