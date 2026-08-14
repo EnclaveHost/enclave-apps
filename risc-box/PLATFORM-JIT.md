@@ -96,17 +96,22 @@ emitter for the hot-op subset, run under wasmtime-the-crate natively,
 state-equivalence asserted on 199 randomized blocks before timing; a
 DOOM-shaped fixed-point loop, 12 ops/iteration, 3M iterations):
 
-    interpreter tier          275 MIPS
-    call-per-BLOCK compiled   258 MIPS   (0.94x — worthless)
-    call-per-REGION compiled 2254 MIPS   (8.2x)
+    interpreter tier           247 MIPS
+    call-per-BLOCK compiled    247 MIPS   (1.0x — worthless)
+    call-per-REGION compiled  2070 MIPS   (8.4x)
+    region + TLB probe on
+      every memory access     1379 MIPS   (5.6x)
+
+The last row is the honest one: every load and store runs the same
+direct-mapped TLB-hit sequence the interpreter's fast path uses (probe,
+compare, bail to the interpreter on miss), and the multiplier that
+survives is 5.6x.
 
 Two conclusions with teeth. First, block-granular dispatch cannot pay
 for the call boundary: the translator must form REGIONS — compile a
 loop's branches into internal `br_if`s so one call runs the whole loop.
 (The verb needs nothing extra for this; a region is just a bigger
-module.) Second, the top of the estimated band is real: compiled guest
-code with memory-resident registers runs at ~2.2 GIPS native on fleet-
-class hardware. The achievable end-to-end multiplier is then set by
+module.) Second, the estimated band holds under realistic memory semantics: 5.6x with per-access TLB probes, 8.4x without. The achievable end-to-end multiplier is then set by
 region coverage of the dynamic mix and the inlined TLB checks, which is
 exactly the app-side tiering work RISC Box owns. That lands busy
 throughput in the several-hundred-MIPS band conservatively: the desktop

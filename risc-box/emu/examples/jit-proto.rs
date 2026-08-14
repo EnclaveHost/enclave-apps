@@ -451,6 +451,119 @@ fn emit_region_module(ops: &[Op]) -> Vec<u8> {
     assemble(b, 1)
 }
 
+
+const TLB_OFF: i64 = 2048;
+
+/// emit: [addr on stack] -> probe TLB, bail to end-of-function on miss,
+/// leave translated address on stack. Uses local 1 as scratch (i64 addr).
+fn emit_tlb_probe(b: &mut Body, bail_depth: u32) {
+    // local1 = addr
+    b.0.push(0x21); uleb(&mut b.0, 1); // local.set 1
+    // set index = (addr >> 12) & 127; entry offset = TLB_OFF + set*16
+    b.0.push(0x20); uleb(&mut b.0, 1); // local.get 1
+    b.i64_const(12);
+    b.0.push(0x88); // shr_u
+    b.i64_const(127);
+    b.0.push(0x83); // and
+    b.i64_const(16);
+    b.0.push(0x7e); // mul
+    b.i64_const(TLB_OFF);
+    b.0.push(0x7c); // add -> entry byte offset (i64)
+    b.0.push(0x21); uleb(&mut b.0, 2); // local.set 2 (entry off)
+    // tag check: mem[entry] == (addr >> 12) | (1<<63) ?
+    b.0.push(0x20); uleb(&mut b.0, 2);
+    b.0.push(0xa7); // wrap to i32 for address
+    b.0.extend_from_slice(&[0x29, 0, 0]); // i64.load (tag)
+    b.0.push(0x20); uleb(&mut b.0, 1);
+    b.i64_const(12);
+    b.0.push(0x88); // shr_u
+    b.i64_const(1);
+    b.0.push(0x84); // or (valid bit)
+    b.0.push(0x52); // i64.ne
+    b.0.push(0x0d); uleb(&mut b.0, bail_depth as u64); // br_if bail
+    // hit: translated = mem[entry+8] + (addr & 0xfff)
+    b.0.push(0x20); uleb(&mut b.0, 2);
+    b.0.push(0xa7);
+    b.0.extend_from_slice(&[0x29, 0, 8]); // i64.load ppn (off 8)
+    b.0.push(0x20); uleb(&mut b.0, 1);
+    b.i64_const(0xfff);
+    b.0.push(0x83); // and
+    b.0.push(0x7c); // add
+}
+
+/// Region emitter with a TLB probe before every memory access. Layout adds
+/// a 128-entry TLB at offset 2048. Bail path: pc <- op pc, return retired.
+fn emit_region_module_tlb(ops: &[Op]) -> Vec<u8> {
+    let mut b = Body(Vec::new());
+    let n = ops.len() as i64;
+    // block wrapping the loop so a TLB miss can br out to the bail path
+    b.0.push(0x02); b.0.push(0x40); // block (bail target, depth relative)
+    b.0.push(0x03); b.0.push(0x40); // loop
+    for op in ops.iter() {
+        match *op {
+            Op::Ld { rd, rs1, imm } => {
+                b.set_x_prologue(rd);
+                b.get_x(rs1);
+                b.i64_const(imm as i64);
+                b.0.push(0x7c);
+                emit_tlb_probe(&mut b, 1); // br out of loop+block = depth 1
+                b.0.push(0xa7);
+                b.0.extend_from_slice(&[0x29, 0, 0]);
+                b.set_x_epilogue(rd);
+            }
+            Op::Sd { rs1, rs2, imm } => {
+                b.get_x(rs1);
+                b.i64_const(imm as i64);
+                b.0.push(0x7c);
+                emit_tlb_probe(&mut b, 1);
+                b.0.push(0xa7);
+                b.get_x(rs2);
+                b.0.extend_from_slice(&[0x37, 0, 0]);
+            }
+            Op::Lw { rd, rs1, imm } => {
+                b.set_x_prologue(rd);
+                b.get_x(rs1);
+                b.i64_const(imm as i64);
+                b.0.push(0x7c);
+                emit_tlb_probe(&mut b, 1);
+                b.0.push(0xa7);
+                b.0.extend_from_slice(&[0x34, 0, 0]);
+                b.set_x_epilogue(rd);
+            }
+            Op::Sw { rs1, rs2, imm } => {
+                b.get_x(rs1);
+                b.i64_const(imm as i64);
+                b.0.push(0x7c);
+                emit_tlb_probe(&mut b, 1);
+                b.0.push(0xa7);
+                b.get_x(rs2);
+                b.0.extend_from_slice(&[0x3e, 0, 0]);
+            }
+            Op::Bne { rs1, rs2, .. } => {
+                b.0.push(0x20); uleb(&mut b.0, 0);
+                b.i64_const(n);
+                b.0.push(0x7c);
+                b.0.push(0x21); uleb(&mut b.0, 0);
+                b.get_x(rs1);
+                b.get_x(rs2);
+                b.0.push(0x52);
+                b.0.push(0x0d); uleb(&mut b.0, 0); // br_if loop head
+            }
+            other => emit_op(&mut b, other),
+        }
+    }
+    b.0.push(0x0b); // end loop
+    b.0.push(0x0b); // end block (bail lands here too)
+    let fall = match ops.last() {
+        Some(Op::Bne { fall_pc, .. }) => *fall_pc,
+        _ => 0,
+    };
+    b.set_pc(fall);
+    b.0.push(0x20); uleb(&mut b.0, 0);
+    b.0.push(0x0b);
+    assemble(b, 3) // locals: retired, addr scratch, entry scratch
+}
+
 // ---- harness ------------------------------------------------------------
 
 struct WasmBlock {
@@ -677,9 +790,49 @@ fn main() {
     assert_eq!(sti.pc, str_.pc, "region pc mismatch");
     let mips_r = retired_r as f64 / 1e6 / tr.as_secs_f64();
 
+    // region tier with a TLB probe on every memory access
+    let bytes = emit_region_module_tlb(&body);
+    let module = wasmtime::Module::new(&engine, &bytes).expect("valid tlb module");
+    let mut store = wasmtime::Store::new(&engine, ());
+    let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+    let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+    let run = instance.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+    let mut wt = WasmBlock { store, mem, run };
+    let mut stt = fresh_state(42);
+    stt.x[29] = ITERS;
+    stt.x[10] = 8192;
+    stt.x[31] = 8192;
+    write_state(&mut wt, &stt);
+    {
+        // fill the identity TLB: every set maps vpage -> same page. The
+        // loop touches vpages 2..6 (addrs 8192..16368+8192); fill all 128
+        // sets with the identity so probes always hit.
+        let d = wt.mem.data_mut(&mut wt.store);
+        for set in 0..128u64 {
+            // this mock is identity-mapped: any vpage whose set index is
+            // `set` would need its own tag; the loop's working set is
+            // vpages 2..=6, all distinct sets, so fill those exactly
+            for vpage in [2u64, 3, 4, 5, 6, 0, 1, 7] {
+                if vpage & 127 == set {
+                    let off = (2048 + set * 16) as usize;
+                    d[off..off + 8].copy_from_slice(&((vpage) | 1).to_le_bytes());
+                    d[off + 8..off + 16]
+                        .copy_from_slice(&(vpage << 12).to_le_bytes());
+                }
+            }
+        }
+    }
+    let t0 = Instant::now();
+    let retired_t = wt.run.call(&mut wt.store, ()).unwrap() as u64;
+    let tt = t0.elapsed();
+    read_state(&mut wt, &mut stt);
+    assert_eq!(retired_i, retired_t, "tlb-region retired mismatch");
+    assert_eq!(sti.x, stt.x, "tlb-region register mismatch");
+    let mips_t = retired_t as f64 / 1e6 / tt.as_secs_f64();
+
     println!(
-        "hot loop ({} ops/iter, {} iters):\n  interpreter        {:>8.1} MIPS\n  call-per-block JIT {:>8.1} MIPS  ({:.2}x)\n  region JIT         {:>8.1} MIPS  ({:.2}x)",
+        "hot loop ({} ops/iter, {} iters):\n  interpreter        {:>8.1} MIPS\n  call-per-block JIT {:>8.1} MIPS  ({:.2}x)\n  region JIT         {:>8.1} MIPS  ({:.2}x)\n  region JIT + TLB   {:>8.1} MIPS  ({:.2}x)",
         body.len(), ITERS,
-        mips_i, mips_w, mips_w / mips_i, mips_r, mips_r / mips_i
+        mips_i, mips_w, mips_w / mips_i, mips_r, mips_r / mips_i, mips_t, mips_t / mips_i
     );
 }
