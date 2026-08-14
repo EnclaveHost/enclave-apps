@@ -3,9 +3,16 @@ const TEST_MEMORY_CAPACITY: u64 = 1024 * 512;
 // risc-box patch: 512 MiB (was 128). A desktop guest needs it — Xorg's
 // System()/fork of xkbcomp during keyboard init fails silently under 128 MiB
 // (heuristic overcommit refuses to commit the forked address space of the
-// large X process, so the child never runs and X aborts). Must match the DTB
-// `memory@80000000` size. The framebuffer (0x87e00000, reserved) stays inside.
-const PROGRAM_MEMORY_CAPACITY: u64 = 1024 * 1024 * 512; // big enough for a Linux desktop
+// large X process, so the child never runs and X aborts). The DTB's
+// `memory@80000000` size cell is synced to the allocation at init (mmu.rs);
+// the framebuffer (0x87e00000, reserved) stays inside.
+const PROGRAM_MEMORY_CAPACITY: u64 = 1024 * 1024 * 512; // default; see setup_ram_bytes()
+// Guest RAM is overridable per machine via setup_ram_bytes() (risc-box wires it to the
+// deployment config's `ramMiB`; 512 MiB default). Ceilings, measured 2026-08-13: RAM is
+// ONE contiguous Vec and Rust caps a single allocation at isize::MAX (2 GiB on wasm32) —
+// 2.5 GiB panics `capacity overflow` on any engine, so the usable max is just under 2 GiB.
+// Separately, TOTAL linear memory (this Vec + the fs image Vec + overhead) needs a
+// wasmtime 49+ engine: 47 refuses growth past ~1.5 GiB total.
 
 extern crate fnv;
 
@@ -40,6 +47,9 @@ use terminal::Terminal;
 pub struct Emulator {
 	cpu: Cpu,
 
+	// risc-box patch: per-machine RAM override (bytes); None = PROGRAM_MEMORY_CAPACITY.
+	ram_bytes: Option<u64>,
+
 	/// Stores mapping from symbol to virtual address
 	symbol_map: FnvHashMap::<String, u64>,
 
@@ -62,6 +72,8 @@ impl Emulator {
 	pub fn new(terminal: Box<dyn Terminal>) -> Self {
 		Emulator {
 			cpu: Cpu::new(terminal),
+
+			ram_bytes: None,
 
 			symbol_map: FnvHashMap::default(),
 
@@ -204,7 +216,8 @@ impl Emulator {
 			self.cpu.get_mut_mmu().init_memory(TEST_MEMORY_CAPACITY);
 		} else {
 			self.is_test = false;
-			self.cpu.get_mut_mmu().init_memory(PROGRAM_MEMORY_CAPACITY);
+			let ram = self.ram_bytes.unwrap_or(PROGRAM_MEMORY_CAPACITY);
+			self.cpu.get_mut_mmu().init_memory(ram);
 		}
 
 		for i in 0..program_data_section_headers.len() {
@@ -275,6 +288,13 @@ impl Emulator {
 	///
 	/// # Arguments
 	/// * `content` DTB content binary
+	/// risc-box patch: sets guest RAM size in bytes. Call BEFORE setup_program()
+	/// (which allocates the memory). The DTB memory@80000000 node is patched to
+	/// match when memory is initialized, so the kernel and the Vec agree.
+	pub fn setup_ram_bytes(&mut self, bytes: u64) {
+		self.ram_bytes = Some(bytes);
+	}
+
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
 		self.cpu.get_mut_mmu().init_dtb(content);
 	}

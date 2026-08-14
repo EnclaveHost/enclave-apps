@@ -94,6 +94,11 @@ struct Config {
     net_enabled: bool,
     net_outbound: bool,
     forwards: Vec<ForwardCfg>,
+    // Guest RAM in MiB (`ramMiB`). Default 512 keeps existing deployments'
+    // footprint; the alpine/firefox image wants 1792. Clamped to [128, 1920]:
+    // the emulator's RAM is one contiguous Vec and a wasm32 allocation caps at
+    // 2 GiB, and a machine under 128 MiB can't even finish X startup.
+    ram_mib: u64,
     api_key: Option<String>,
 }
 
@@ -189,6 +194,11 @@ fn load_config() -> Config {
             .and_then(|x| x.as_bool())
             .unwrap_or(true),
         forwards: forwards_from(v.get("net")),
+        ram_mib: v
+            .get("ramMiB")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(512)
+            .clamp(128, 1920),
         // Optional shared secret. When set (directly or via a $VAR secret), the
         // control + observation endpoints require it; see `authorized`. Unset
         // means the deployment is open, which is only safe when it is private.
@@ -409,7 +419,7 @@ impl App {
         format!(
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
-             \"instret\":{},\"mips\":{:.1},\"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{}{img}}}",
+             \"instret\":{},\"mips\":{:.1},\"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
@@ -451,6 +461,7 @@ impl App {
                     )
                 })
                 .unwrap_or_else(|| "null".into()),
+            self.cfg.ram_mib,
         )
     }
 }
@@ -521,11 +532,14 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     Ok(Images { kernel, fs_stored, fs_gzipped, dtb })
 }
 
-fn boot(images: &Images, net_enabled: bool) -> Result<Emulator, String> {
+fn boot(images: &Images, net_enabled: bool, ram_mib: u64) -> Result<Emulator, String> {
     let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
         input: VecDeque::new(),
         output: VecDeque::new(),
     }));
+    // before setup_program: that's where the RAM Vec is allocated and the
+    // DTB memory node gets synced to it
+    emu.setup_ram_bytes(ram_mib * 1024 * 1024);
     emu.setup_program(images.kernel.clone());
     emu.setup_filesystem(images.disk()?);
     if let Some(dtb) = &images.dtb {
@@ -907,7 +921,7 @@ fn do_start(app: &mut App, start: Start) {
     // expanded disk beside everything else). Treat it exactly like a failed
     // fetch: report it and leave the machine stopped, rather than unwrapping
     // and taking the whole app down with it.
-    let emu = match boot(imgs, app.cfg.net_enabled) {
+    let emu = match boot(imgs, app.cfg.net_enabled, app.cfg.ram_mib) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[risc-box] start failed: {e}");

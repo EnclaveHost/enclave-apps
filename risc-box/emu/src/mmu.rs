@@ -43,6 +43,8 @@ pub struct Mmu {
 	addressing_mode: AddressingMode,
 	privilege_mode: PrivilegeMode,
 	memory: MemoryWrapper,
+	// risc-box patch: configured RAM size (bytes); mirrored into the DTB memory node.
+	ram_capacity: u64,
 	dtb: Vec<u8>,
 	disk: VirtioBlockDisk,
 	net: VirtioNet, // risc-box patch
@@ -139,6 +141,7 @@ impl Mmu {
 			addressing_mode: AddressingMode::None,
 			privilege_mode: PrivilegeMode::Machine,
 			memory: MemoryWrapper::new(),
+			ram_capacity: 0,
 			dtb: dtb,
 			disk: VirtioBlockDisk::new(),
 			net: VirtioNet::new(), // risc-box patch
@@ -175,6 +178,31 @@ impl Mmu {
 	/// * `capacity`
 	pub fn init_memory(&mut self, capacity: u64) {
 		self.memory.init(capacity);
+		// risc-box patch: keep the DTB's memory@80000000 size in step with the
+		// actual allocation, so a configured RAM size needs no hand-edited DTB.
+		self.ram_capacity = capacity;
+		self.sync_dtb_memory_size();
+	}
+
+	/// risc-box patch: rewrites the size cell of the DTB's memory@80000000 reg
+	/// (<0x0 0x80000000 0x0 SIZE>, big-endian cells) to `ram_capacity`. Works on
+	/// the embedded DTB and any init_dtb() override; called from both paths.
+	/// A DTB without exactly one such reg is left alone (with a log line) —
+	/// better an honest mismatch than a corrupted tree.
+	fn sync_dtb_memory_size(&mut self) {
+		if self.ram_capacity == 0 || self.ram_capacity >= 0x1_0000_0000 {
+			return; // unset, or needs a 2-cell size (never: single-alloc cap is 2 GiB)
+		}
+		let pat: [u8; 12] = [0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0]; // base-hi, base-lo=0x80000000, size-hi=0
+		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(16))
+			.filter(|&i| self.dtb[i..i + 12] == pat)
+			.collect();
+		if hits.len() != 1 {
+			eprintln!("[emu] dtb: expected exactly one memory@80000000 reg, found {}; leaving DTB as is", hits.len());
+			return;
+		}
+		let at = hits[0] + 12;
+		self.dtb[at..at + 4].copy_from_slice(&(self.ram_capacity as u32).to_be_bytes());
 	}
 
 	// risc-box patch: bulk read of PHYSICAL DRAM (no translation, no device
@@ -203,6 +231,8 @@ impl Mmu {
 		for i in data.len()..self.dtb.len() {
 			self.dtb[i] = 0;
 		}
+		// risc-box patch: a custom DTB gets the same memory-node sync
+		self.sync_dtb_memory_size();
 	}
 
 	/// Enables or disables page cache optimization.
