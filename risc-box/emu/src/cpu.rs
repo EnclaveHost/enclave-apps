@@ -132,54 +132,68 @@ const BLOCK_MAX: usize = 32; // ops per block
 // instructions that dominate any Linux dynamic mix; everything else keeps
 // the INSTRUCTIONS-table path. Each exec_hot arm is a verbatim copy of the
 // table closure with the parse_format_* call replaced by the entry fields.
-const HOT_ADDI: u8 = 5;
-const HOT_ADD: u8 = 6;
-const HOT_LD: u8 = 7;
+const HOT_ADDI: u8 = 7;
+const HOT_ADD: u8 = 8;
+const HOT_LD: u8 = 9;
 const HOT_SD: u8 = 4;
-const HOT_LW: u8 = 8;
+const HOT_LW: u8 = 10;
 const HOT_SW: u8 = 3;
-const HOT_BEQ: u8 = 9;
-const HOT_BNE: u8 = 10;
-const HOT_BLT: u8 = 11;
-const HOT_BGE: u8 = 12;
-const HOT_BLTU: u8 = 13;
-const HOT_BGEU: u8 = 14;
-const HOT_LUI: u8 = 15;
-const HOT_AUIPC: u8 = 16;
-const HOT_JAL: u8 = 17;
-const HOT_JALR: u8 = 18;
-const HOT_ANDI: u8 = 19;
-const HOT_ORI: u8 = 20;
-const HOT_XORI: u8 = 21;
-const HOT_AND: u8 = 22;
-const HOT_OR: u8 = 23;
-const HOT_XOR: u8 = 24;
-const HOT_SUB: u8 = 25;
-const HOT_SLLI: u8 = 26;
-const HOT_SRLI: u8 = 27;
-const HOT_SRAI: u8 = 28;
-const HOT_ADDIW: u8 = 29;
-const HOT_ADDW: u8 = 30;
-const HOT_SUBW: u8 = 31;
-const HOT_SLLIW: u8 = 32;
-const HOT_SRLIW: u8 = 33;
-const HOT_SRAIW: u8 = 34;
-const HOT_SLLW: u8 = 35;
-const HOT_SRLW: u8 = 36;
-const HOT_SRAW: u8 = 37;
-const HOT_SLL: u8 = 38;
-const HOT_SRL: u8 = 39;
-const HOT_SRA: u8 = 40;
-const HOT_SLT: u8 = 41;
-const HOT_SLTI: u8 = 42;
-const HOT_SLTU: u8 = 43;
-const HOT_SLTIU: u8 = 44;
-const HOT_MUL: u8 = 45;
-const HOT_LB: u8 = 46;
-const HOT_LBU: u8 = 47;
-const HOT_LH: u8 = 48;
-const HOT_LHU: u8 = 49;
-const HOT_LWU: u8 = 50;
+const HOT_BEQ: u8 = 11;
+const HOT_BNE: u8 = 12;
+const HOT_BLT: u8 = 13;
+const HOT_BGE: u8 = 14;
+const HOT_BLTU: u8 = 15;
+const HOT_BGEU: u8 = 16;
+const HOT_LUI: u8 = 17;
+const HOT_AUIPC: u8 = 18;
+const HOT_JAL: u8 = 19;
+const HOT_JALR: u8 = 20;
+const HOT_ANDI: u8 = 21;
+const HOT_ORI: u8 = 22;
+const HOT_XORI: u8 = 23;
+const HOT_AND: u8 = 24;
+const HOT_OR: u8 = 25;
+const HOT_XOR: u8 = 26;
+const HOT_SUB: u8 = 27;
+const HOT_SLLI: u8 = 28;
+const HOT_SRLI: u8 = 29;
+const HOT_SRAI: u8 = 30;
+const HOT_ADDIW: u8 = 31;
+const HOT_ADDW: u8 = 32;
+const HOT_SUBW: u8 = 33;
+const HOT_SLLIW: u8 = 34;
+const HOT_SRLIW: u8 = 35;
+const HOT_SRAIW: u8 = 36;
+const HOT_SLLW: u8 = 37;
+const HOT_SRLW: u8 = 38;
+const HOT_SRAW: u8 = 39;
+const HOT_SLL: u8 = 40;
+const HOT_SRL: u8 = 41;
+const HOT_SRA: u8 = 42;
+const HOT_SLT: u8 = 43;
+const HOT_SLTI: u8 = 44;
+const HOT_SLTU: u8 = 45;
+const HOT_SLTIU: u8 = 46;
+const HOT_MUL: u8 = 47;
+const HOT_LB: u8 = 48;
+const HOT_LBU: u8 = 49;
+const HOT_LH: u8 = 50;
+const HOT_LHU: u8 = 51;
+const HOT_LWU: u8 = 52;
+const HOT_FSW: u8 = 5;
+const HOT_FSD: u8 = 6;
+// stores are 1..=HOT_STORE_MAX so the in-block SMC re-check is one compare
+const HOT_STORE_MAX: u8 = 6;
+const HOT_FLD: u8 = 53;
+const HOT_FLW: u8 = 54;
+const HOT_FADD_D: u8 = 55;
+const HOT_FSUB_D: u8 = 56;
+const HOT_FMUL_D: u8 = 57;
+const HOT_FDIV_D: u8 = 58;
+const HOT_FSGNJ_D: u8 = 59;
+const HOT_FMV_X_D: u8 = 60;
+const HOT_FMV_D_X: u8 = 61;
+const HOT_FCVT_D_W: u8 = 62;
 const HOT_SB: u8 = 1;
 const HOT_SH: u8 = 2;
 
@@ -244,6 +258,18 @@ fn classify_hot(name: &str, word: u32) -> (u8, u8, u8, u8, i32) {
 		"LWU" => HOT_LWU,
 		"SB" => HOT_SB,
 		"SH" => HOT_SH,
+		"FSW" => HOT_FSW,
+		"FSD" => HOT_FSD,
+		"FLD" => HOT_FLD,
+		"FLW" => HOT_FLW,
+		"FADD.D" => HOT_FADD_D,
+		"FSUB.D" => HOT_FSUB_D,
+		"FMUL.D" => HOT_FMUL_D,
+		"FDIV.D" => HOT_FDIV_D,
+		"FSGNJ.D" => HOT_FSGNJ_D,
+		"FMV.X.D" => HOT_FMV_X_D,
+		"FMV.D.X" => HOT_FMV_D_X,
+		"FCVT.D.W" => HOT_FCVT_D_W,
 		_ => 0
 	};
 	let rd = ((word >> 7) & 0x1f) as u8;
@@ -254,13 +280,13 @@ fn classify_hot(name: &str, word: u32) -> (u8, u8, u8, u8, i32) {
 	let imm: i32 = match kind {
 		HOT_ADDI | HOT_SLTI | HOT_SLTIU | HOT_XORI | HOT_ORI | HOT_ANDI
 		| HOT_ADDIW | HOT_JALR | HOT_LB | HOT_LBU | HOT_LH | HOT_LHU
-		| HOT_LW | HOT_LWU | HOT_LD => (
+		| HOT_LW | HOT_LWU | HOT_LD | HOT_FLD | HOT_FLW => (
 			match word & 0x80000000 {
 				0x80000000 => 0xfffff800u32,
 				_ => 0
 			} | ((word >> 20) & 0x000007ff)
 		) as i32,
-		HOT_SB | HOT_SH | HOT_SW | HOT_SD => (
+		HOT_SB | HOT_SH | HOT_SW | HOT_SD | HOT_FSW | HOT_FSD => (
 			match word & 0x80000000 {
 				0x80000000 => 0xfffff000u32,
 				_ => 0
@@ -675,7 +701,7 @@ impl Cpu {
 			}
 			// hot stores (kind 1..=4) can overwrite this very block; the
 			// write snoop bumps the code generation, which this meta embeds
-			if op.kind <= HOT_SD && self.mmu.exec_meta() != head.meta {
+			if op.kind <= HOT_STORE_MAX && self.mmu.exec_meta() != head.meta {
 				return retired;
 			}
 		}
@@ -1046,6 +1072,62 @@ impl Cpu {
 			},
 			HOT_SH => {
 				return self.mmu.store_halfword(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u16);
+			},
+			HOT_FSW => {
+				return self.mmu.store_word(self.x[rs1].wrapping_add(imm) as u64, self.f[rs2].to_bits() as u32);
+			},
+			HOT_FSD => {
+				return self.mmu.store_doubleword(self.x[rs1].wrapping_add(imm) as u64, self.f[rs2].to_bits());
+			},
+			HOT_FLD => {
+				self.f[rd] = match self.mmu.load_doubleword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => f64::from_bits(data),
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_FLW => {
+				self.f[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => f64::from_bits(data as i32 as i64 as u64),
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_FADD_D => {
+				self.f[rd] = self.f[rs1] + self.f[rs2];
+			},
+			HOT_FSUB_D => {
+				self.f[rd] = self.f[rs1] - self.f[rs2];
+			},
+			HOT_FMUL_D => {
+				self.f[rd] = self.f[rs1] * self.f[rs2];
+			},
+			HOT_FDIV_D => {
+				let dividend = self.f[rs1];
+				let divisor = self.f[rs2];
+				// Is this implementation correct? (verbatim from the table)
+				if divisor == 0.0 {
+					self.f[rd] = std::f64::INFINITY;
+					self.set_fcsr_dz();
+				} else if divisor == -0.0 {
+					self.f[rd] = std::f64::NEG_INFINITY;
+					self.set_fcsr_dz();
+				} else {
+					self.f[rd] = dividend / divisor;
+				}
+			},
+			HOT_FSGNJ_D => {
+				let rs1_bits = self.f[rs1].to_bits();
+				let rs2_bits = self.f[rs2].to_bits();
+				let sign_bit = rs2_bits & 0x8000000000000000;
+				self.f[rd] = f64::from_bits(sign_bit | (rs1_bits & 0x7fffffffffffffff));
+			},
+			HOT_FMV_X_D => {
+				self.x[rd] = self.f[rs1].to_bits() as i64;
+			},
+			HOT_FMV_D_X => {
+				self.f[rd] = f64::from_bits(self.x[rs1] as u64);
+			},
+			HOT_FCVT_D_W => {
+				self.f[rd] = self.x[rs1] as i32 as f64;
 			},
 			// kind is only ever written by classify_hot, so this arm is dead;
 			// the table dispatch (not a panic — a guest must never crash the
