@@ -451,17 +451,40 @@ a deployment will feel.
 
 Guest work is flat across the whole sweep, so the speedup is real rather than
 borrowed from somewhere else. **16 is deliberate, not the fastest number in the
-table**: the UART drains its transmit register on a 16-cycle cadence of its
-own, so 16 is the largest interval that cannot change console behaviour. At 64
-the console visibly corrupts (`Saving 25 bits of ceditable sed`) and the guest
-needs twice the instructions to boot, because it spends the difference spinning
-on a serial port that has become four times slower. Going higher means making
-the UART emit on store instead of on a cadence; the table says that is worth
-about another 6%.
+table.** The UART now emits on store (it used to drain one byte per service,
+which serialized every console byte behind an interrupt round trip and, at
+coarser intervals, dropped characters outright), so output can no longer
+corrupt at any interval — but at 64 the guest stops waking on serial *input*
+at the shell prompt, so 16 stays.
 
 Setting `DEVICE_TICK_INTERVAL = 1` restores exactly the old behaviour, which is
 how the refactor was checked: it reproduces the baseline instruction count to
 the digit.
+
+### The 2026-08 rework: superblocks
+
+The table above predates the second round of interpreter work, which replaced
+the per-instruction predecode cache with a superblock cache: straight-line
+runs of up to 32 pre-decoded instructions execute from a single tag+meta
+probe, with operands extracted once at build time and the ~60 hottest integer
+and double ops (the FP working set matters: every context switch is a run of
+FLD/FSD) inlined behind a jump table instead of an indirect call. Interrupt
+delivery, WFI, self-modifying code and precise traps keep their exact
+single-step semantics — the boot log is byte-identical, and `bench.py`'s
+write-then-execute gate covers the SMC path.
+
+Measured on the sample image, same host, before → after the round:
+
+| | before | after |
+|---|---|---|
+| native, busy shell workload | 53.2 MIPS | 127 MIPS |
+| native, boot to userspace | 1.91 s | 0.88 s |
+| wasm (wasmtime), busy | ~63 MIPS | ~85 MIPS |
+| native, Alpine desktop first paint | 88 s | 52 s |
+
+An idle (WFI-parked) guest now consumes its tick batch in one step instead of
+spinning, so an idle machine costs the event loop ~nothing and the whole
+budget goes to the scanout and encoders.
 
 ## Caveats, honestly
 
