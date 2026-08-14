@@ -229,8 +229,11 @@ impl VirtioNet {
 				let shift = (address - 0x10002030) * 8;
 				self.queue_select =
 					(self.queue_select & !(0xff << shift)) | ((value as u32) << shift);
+				// risc-box patch: a guest selecting a queue beyond rx=0/tx=1
+				// must not panic the host; queue_mut() clamps, and the log
+				// line keeps a misbehaving driver diagnosable.
 				if address == 0x10002033 && self.queue_select > 1 {
-					panic!("VirtioNet: queue {} is not supported (rx=0/tx=1 only).", self.queue_select);
+					eprintln!("[emu] virtio-net: queue {} selected (rx=0/tx=1 only)", self.queue_select);
 				}
 			},
 			0x10002038..=0x1000203b => {

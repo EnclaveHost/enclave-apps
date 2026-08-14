@@ -249,8 +249,12 @@ impl VirtioBlockDisk {
 			},
 			0x10001033 => {
 				self.queue_select = (self.queue_select & !(0xff << 24)) | ((value as u32) << 24);
+				// risc-box patch: selecting a queue this single-queue device
+				// does not have is the driver's problem, not grounds to
+				// panic the host. The spec's answer is QueueNumMax = 0 for
+				// a nonexistent queue; the guest reads that and moves on.
 				if self.queue_select != 0 {
-					panic!("Virtio: No multi queue support yet.");
+					eprintln!("[emu] virtio-blk: queue {} selected (single-queue device)", self.queue_select);
 				}
 			},
 			0x10001038 => {
