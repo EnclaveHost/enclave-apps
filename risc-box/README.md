@@ -480,7 +480,18 @@ Measured on the sample image, same host, before → after the round:
 | native, busy shell workload | 53.2 MIPS | 127 MIPS |
 | native, boot to userspace | 1.91 s | 0.88 s |
 | wasm (wasmtime), busy | ~63 MIPS | ~85 MIPS |
-| native, Alpine desktop first paint | 88 s | 52 s |
+| native, Alpine desktop first paint | 88 s | ~34 s |
+
+The desktop row got its biggest cut from tagging superblocks by the
+PHYSICAL page they were decoded from instead of by translation state:
+satp writes and SFENCE.VMA had been invalidating every block on every
+context switch, so fault-storm workloads — a desktop assembling itself,
+a browser starting — rebuilt the whole cache continuously. The probe
+re-translates the start pc through the TLB and compares physical pages,
+so remapping can never run a stale block while an unchanged mapping
+keeps its blocks across every flush. Measure changes like this with
+interleaved A/B runs (alternating builds back to back): a loaded host
+makes sequential before/after numbers lie.
 
 An idle (WFI-parked) guest now consumes its tick batch in one step instead of
 spinning, so an idle machine costs the event loop ~nothing and the whole
