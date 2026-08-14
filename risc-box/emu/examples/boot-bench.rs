@@ -87,6 +87,7 @@ fn main() {
     let mut type_script: Vec<(u64, String)> = Vec::new();
     let mut xkey_script: Vec<(u64, String)> = Vec::new();
     let mut snap_script: Vec<(u64, String)> = Vec::new();
+    let mut xclick_script: Vec<(u64, u32, u32)> = Vec::new();
     let mut trace_file: Option<String> = None;
     let mut trace_limit: u64 = 200_000;
     let mut trace_sub: Option<(u64, u64)> = None;
@@ -117,6 +118,19 @@ fn main() {
                 i += 1;
                 let (secs, path) = args[i].split_once(':').expect("--snap SECONDS:FILE");
                 snap_script.push((secs.parse::<u64>().expect("seconds"), path.to_string()));
+            }
+            "--xclick" => {
+                // SECONDS:X:Y -- left-click at screen pixel (X,Y) via the
+                // absolute virtio-input pointer. Use before --xkey: fluxbox
+                // assigns initial focus nondeterministically, and a click
+                // makes the target window focused for certain.
+                i += 1;
+                let parts: Vec<&str> = args[i].split(':').collect();
+                xclick_script.push((
+                    parts[0].parse::<u64>().expect("seconds"),
+                    parts[1].parse::<u32>().expect("x"),
+                    parts[2].parse::<u32>().expect("y"),
+                ));
             }
             "--xkey" => {
                 // SECONDS:TEXT -- once the wall clock passes SECONDS, inject
@@ -366,6 +380,28 @@ fn main() {
                     true
                 }
             });
+            let mut clicks: Vec<(u32, u32)> = Vec::new();
+            xclick_script.retain(|(at, x, y)| {
+                if *at <= elapsed_s {
+                    clicks.push((*x, *y));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (x, y) in clicks {
+                let max = riscv_emu_rust::Emulator::input_abs_max() as u64;
+                let ax = (x as u64 * max / 1023) as u32;
+                let ay = (y as u64 * max / 767) as u32;
+                emu.push_input_event(3, 0, ax); // EV_ABS ABS_X
+                emu.push_input_event(3, 1, ay); // EV_ABS ABS_Y
+                emu.push_input_event(0, 0, 0);
+                emu.push_input_event(1, 0x110, 1); // BTN_LEFT down
+                emu.push_input_event(0, 0, 0);
+                emu.push_input_event(1, 0x110, 0); // BTN_LEFT up
+                emu.push_input_event(0, 0, 0);
+                eprintln!("XCLICKED@{}s: {},{}", elapsed_s, x, y);
+            }
             let mut fired: Vec<String> = Vec::new();
             xkey_script.retain(|(at, txt)| {
                 if *at <= elapsed_s {
