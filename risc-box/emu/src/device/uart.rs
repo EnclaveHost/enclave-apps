@@ -79,17 +79,14 @@ impl Uart {
 			}
 		}
 
-		// Writes output.
-		// 0x10 is just an arbitary number @TODO: Fix me
-		if crossed(previous_clock, self.clock, 0x10) && self.thr != 0 {
-			self.terminal.put_byte(self.thr);
-			self.thr = 0;
-			self.lsr |= LSR_THR_EMPTY;
-			self.update_iir();
-			if (self.ier & IER_THREINT_BIT) != 0 {
-				self.thre_ip = true;
-			}
-		}
+		// risc-box patch: output used to be consumed here, one byte per
+		// service, with LSR_THR_EMPTY only returning at that moment. That
+		// serialized every console byte behind a service interval plus an
+		// interrupt round trip, and a driver whose bounded LSR wait expired
+		// first would overwrite the pending byte — at coarser service
+		// intervals the console visibly dropped characters. The terminal is
+		// host-buffered, so THR is consumed at the store now (see store());
+		// this tick only delivers the pending THRE edge at service cadence.
 
 		if self.thre_ip || rx_ip {
 			self.interrupting = true;
@@ -165,11 +162,19 @@ impl Uart {
 		//println!("UART Store AD:{:X} VAL:{:X}", address, value);
 		match address {
 			// Transfer Holding Register
+			// risc-box patch: consumed immediately (the terminal buffers);
+			// THR is never busy, so no write can ever overwrite a pending
+			// byte. The THRE interrupt is armed here and delivered at the
+			// next device service, which is when the PLIC looks anyway.
 			0x10000000 => match (self.lcr >> 7) == 0 {
 				true => {
-					self.thr = value;
-					self.lsr &= !LSR_THR_EMPTY;
+					self.terminal.put_byte(value);
+					self.thr = 0;
+					self.lsr |= LSR_THR_EMPTY;
 					self.update_iir();
+					if (self.ier & IER_THREINT_BIT) != 0 {
+						self.thre_ip = true;
+					}
 				},
 				false => {} // @TODO: Implement properly
 			},

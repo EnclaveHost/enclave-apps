@@ -123,8 +123,8 @@ impl BlockHead {
 	const EMPTY: BlockHead = BlockHead { tag: 0, meta: 0, count: 0, _pad: 0 };
 }
 
-const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1)
-const BLOCK_MAX: usize = 16; // ops per block
+const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1); 32k x (24B + 32x16B) = 17 MiB
+const BLOCK_MAX: usize = 32; // ops per block
 
 // risc-box patch: hot-op ids. SB/SH/SW/SD are 1..=4 so "is this a store"
 // — the ops that need the in-block SMC meta re-check — is one range
