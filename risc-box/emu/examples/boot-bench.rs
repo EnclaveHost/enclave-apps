@@ -75,6 +75,16 @@ fn main() {
     let mut budget: u64 = 2_000_000_000;
     let mut until: Option<String> = None;
     let mut echo = false;
+    // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
+    // the code's start address + size, then log every executed instruction in
+    // that range (pc offset + which registers changed to what) to FILE. This
+    // is the execution-truth companion to the static dump: any mis-executed
+    // instruction shows up as a register value inconsistent with its inputs.
+    let mut trace_file: Option<String> = None;
+    let mut trace_limit: u64 = 200_000;
+    let mut trace_sub: Option<(u64, u64)> = None;
+    let mut trace_call: Option<u64> = None;
+    let mut callee_range: Option<(u64, u64)> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -87,6 +97,35 @@ fn main() {
                 until = Some(args[i].clone());
             }
             "--console" => echo = true,
+            "--trace-tf" => {
+                i += 1;
+                trace_file = Some(args[i].clone());
+            }
+            "--trace-limit" => {
+                i += 1;
+                trace_limit = args[i].replace('_', "").parse().expect("--trace-limit takes a number");
+            }
+            "--trace-call" => {
+                // OFFSET (hex, relative to the armed code start) of a jalr
+                // call site: on reaching it, read t6 (the target), dump the
+                // callee's first 8 KiB of code words, then trace the callee's
+                // execution (entry snapshots + reg diffs) instead of the
+                // caller range.
+                i += 1;
+                trace_call = Some(u64::from_str_radix(args[i].trim_start_matches("+"), 16).expect("hex off"));
+            }
+            "--trace-sub" => {
+                // OFFLO:OFFHI (hex, relative to the armed code start): only log
+                // instructions inside this sub-window, with a full register
+                // snapshot each time execution ENTERS it, so a verifier has
+                // complete state per visit.
+                i += 1;
+                let parts: Vec<&str> = args[i].split(':').collect();
+                trace_sub = Some((
+                    u64::from_str_radix(parts[0].trim_start_matches("+"), 16).expect("hex off"),
+                    u64::from_str_radix(parts[1].trim_start_matches("+"), 16).expect("hex off"),
+                ));
+            }
             other => positional.push(other.to_string()),
         }
         i += 1;
@@ -125,9 +164,129 @@ fn main() {
     let mut window = Instant::now();
     let mut window_insns: u64 = 0;
 
+    // --trace-tf state
+    let mut trace_range: Option<(u64, u64)> = None; // armed once the dump is seen
+    let mut trace_out: Option<std::io::BufWriter<std::fs::File>> = None;
+    let mut traced: u64 = 0;
+    let mut was_in = false;
+    let mut skip_visit = false;
+    let mut prev_regs = [0i64; 32];
+
     while done < budget {
-        for _ in 0..BATCH {
-            emu.tick();
+        match trace_range {
+            Some((lo, hi)) if traced < trace_limit => {
+                // armed: single-step so every in-range instruction is observed
+                use std::io::Write;
+                for _ in 0..BATCH {
+                    let pc = emu.get_cpu().read_pc();
+                    // callee-tracing mode: arm the callee range at the call site.
+                    // The site is found by its unique signature rather than a
+                    // fixed offset (TF layouts drift between compilations):
+                    // `jalr ra, 0(t6)` immediately followed by `srai a4, a0, 32`.
+                    if let (Some(_), None) = (trace_call, callee_range) {
+                        let in_range = pc >= lo && pc < hi;
+                        let sig = in_range
+                            && emu.get_mut_cpu().get_mut_mmu().load_word(pc).map(|w| w == 0x000f80e7).unwrap_or(false)
+                            && emu.get_mut_cpu().get_mut_mmu().load_word(pc + 4).map(|w| w == 0x42055713).unwrap_or(false);
+                        if sig {
+                            let t6 = emu.get_cpu().read_register(31) as u64;
+                            callee_range = Some((t6, t6 + 0x2000));
+                            eprintln!("CALLEE_ARMED {:#x}", t6);
+                            // dump the callee's code words for the verifier
+                            if let Some(w) = trace_out.as_mut() {
+                                use std::io::Write;
+                                for a in (t6..t6 + 0x2000).step_by(8) {
+                                    match emu.get_mut_cpu().get_mut_mmu().load_doubleword(a) {
+                                        Ok(d) => { let _ = w.write_all(format!("CODE {:x} {:016x}\n", a - t6, d).as_bytes()); }
+                                        Err(_) => break,
+                                    }
+                                }
+                                let _ = w.flush();
+                            }
+                        }
+                    }
+                    let (slo, shi) = match (callee_range, trace_call) {
+                        (Some((a, b)), _) => (a, b),
+                        (None, Some(_)) => (u64::MAX, u64::MAX), // callee not armed yet: trace nothing
+                        _ => match trace_sub {
+                            Some((a, b)) => (lo + a, lo + b),
+                            None => (lo, hi),
+                        },
+                    };
+                    let mut hit = pc >= slo && pc < shi;
+                    if hit && !was_in && callee_range.is_some() {
+                        // only trace builtin visits CALLED FROM the TF code
+                        let ra = emu.get_cpu().read_register(1) as u64;
+                        if !(ra >= lo && ra < hi) {
+                            skip_visit = true;
+                        } else {
+                            skip_visit = false;
+                        }
+                    }
+                    if callee_range.is_some() && skip_visit {
+                        hit = false;
+                    }
+                    if hit && !was_in {
+                        // full snapshot on entry: the verifier gets complete state
+                        if let Some(w) = trace_out.as_mut() {
+                            use std::io::Write;
+                            let mut line = format!("={:x}", pc - slo);
+                            for r in 1..32 {
+                                line.push_str(&format!(" x{}={:x}", r, emu.get_cpu().read_register(r as u8) as u64));
+                            }
+                            line.push('\n');
+                            let _ = w.write_all(line.as_bytes());
+                        }
+                    }
+                    was_in = hit;
+                    if hit {
+                        for r in 1..32 {
+                            prev_regs[r] = emu.get_cpu().read_register(r as u8);
+                        }
+                    }
+                    emu.tick();
+                    if hit {
+                        if let Some(w) = trace_out.as_mut() {
+                            let mut line = format!("+{:x}", pc - slo);
+                            for r in 1..32 {
+                                let v = emu.get_cpu().read_register(r as u8);
+                                if v != prev_regs[r] {
+                                    line.push_str(&format!(" x{}={:x}", r, v as u64));
+                                }
+                            }
+                            line.push('\n');
+                            let _ = w.write_all(line.as_bytes());
+                        }
+                        traced += 1;
+                        if traced == trace_limit {
+                            if let Some(w) = trace_out.as_mut() { let _ = w.flush(); }
+                            eprintln!("TRACE_CAPTURED {} lines", traced);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for _ in 0..BATCH {
+                    emu.tick();
+                }
+            }
+        }
+        if trace_file.is_some() && trace_range.is_none() {
+            // Not armed yet: watch the console for the dump header, then the
+            // first instruction line:  "Instructions (size = N)\n0xADDR ..."
+            let buf = console.borrow();
+            if let Some(pos) = find_sub(&buf, b"Instructions (size = ") {
+                let tail = &buf[pos..];
+                if let Some((size, rest_off)) = parse_usize_after(tail, b"Instructions (size = ") {
+                    if let Some(addr) = parse_hex_line_start(&tail[rest_off..]) {
+                        drop(buf);
+                        let f = std::fs::File::create(trace_file.as_ref().unwrap()).expect("trace file");
+                        trace_out = Some(std::io::BufWriter::new(f));
+                        trace_range = Some((addr, addr + size as u64));
+                        eprintln!("TRACE_ARMED {:#x}..{:#x}", addr, addr + size as u64);
+                    }
+                }
+            }
         }
         done += BATCH;
         window_insns += BATCH;
@@ -172,4 +331,63 @@ fn main() {
         secs,
         done as f64 / 1e6 / secs
     );
+}
+
+
+// --trace-tf helpers -----------------------------------------------------
+
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parses the decimal number that follows `prefix` inside `tail` (which must
+/// start with `prefix`); returns (number, offset just past the number).
+fn parse_usize_after(tail: &[u8], prefix: &[u8]) -> Option<(usize, usize)> {
+    let mut i = prefix.len();
+    let mut n: usize = 0;
+    let mut any = false;
+    while i < tail.len() && tail[i].is_ascii_digit() {
+        n = n * 10 + (tail[i] - b'0') as usize;
+        i += 1;
+        any = true;
+    }
+    match any {
+        true => Some((n, i)),
+        false => None,
+    }
+}
+
+/// Finds the first "0x<hex>" at a line start in `tail` and parses it — the
+/// first disassembly line's instruction address.
+fn parse_hex_line_start(tail: &[u8]) -> Option<u64> {
+    let mut i = 0;
+    while i + 2 < tail.len() {
+        // seek to just after a newline
+        while i < tail.len() && tail[i] != b'\n' {
+            i += 1;
+        }
+        i += 1;
+        if i + 2 >= tail.len() {
+            return None;
+        }
+        if tail[i] == b'0' && tail[i + 1] == b'x' {
+            let mut j = i + 2;
+            let mut v: u64 = 0;
+            let mut any = false;
+            while j < tail.len() && tail[j].is_ascii_hexdigit() {
+                v = v * 16
+                    + match tail[j] {
+                        b'0'..=b'9' => (tail[j] - b'0') as u64,
+                        b'a'..=b'f' => (tail[j] - b'a') as u64 + 10,
+                        _ => (tail[j] - b'A') as u64 + 10,
+                    };
+                j += 1;
+                any = true;
+            }
+            if any {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
