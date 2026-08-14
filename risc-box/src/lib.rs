@@ -321,10 +321,13 @@ struct Images {
 impl Images {
     /// The disk to hand a fresh machine. Expanded per boot rather than held
     /// expanded, so the cost is paid only while a machine is actually running.
-    fn disk(&self) -> Result<Vec<u8>, String> {
+    /// The raw ext2 bytes to hand the emulator. Takes the stored image by
+    /// value when it is already raw: a clone of a half-gigabyte fs is real
+    /// wasm32 linear memory, and the cache is refilled on the next start.
+    fn take_disk(&mut self) -> Result<Vec<u8>, String> {
         match self.fs_gzipped {
             true => gz::gunzip(&self.fs_stored),
-            false => Ok(self.fs_stored.clone()),
+            false => Ok(std::mem::take(&mut self.fs_stored)),
         }
     }
 }
@@ -504,8 +507,12 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
-    let fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
+    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
+    // The download Vec doubles as it grows, so an image just past a power of
+    // two carries up to 2x its size in dead capacity — real linear memory on
+    // wasm32, where fs + guest RAM already crowd the budget. Return it.
+    fs_stored.shrink_to_fit();
     // A `.gz` key is fetched and cached compressed and expanded per boot; see
     // Images::disk. Verify it inflates now rather than at boot, so a bad object
     // fails the fetch (which retries) instead of the machine start.
@@ -532,7 +539,7 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     Ok(Images { kernel, fs_stored, fs_gzipped, dtb })
 }
 
-fn boot(images: &Images, net_enabled: bool, ram_mib: u64) -> Result<Emulator, String> {
+fn boot(images: &mut Images, net_enabled: bool, ram_mib: u64) -> Result<Emulator, String> {
     let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
         input: VecDeque::new(),
         output: VecDeque::new(),
@@ -541,7 +548,7 @@ fn boot(images: &Images, net_enabled: bool, ram_mib: u64) -> Result<Emulator, St
     // DTB memory node gets synced to it
     emu.setup_ram_bytes(ram_mib * 1024 * 1024);
     emu.setup_program(images.kernel.clone());
-    emu.setup_filesystem(images.disk()?);
+    emu.setup_filesystem(images.take_disk()?);
     if let Some(dtb) = &images.dtb {
         emu.setup_dtb(dtb.clone());
     }
@@ -916,7 +923,7 @@ fn do_start(app: &mut App, start: Start) {
             }
         }
     }
-    let imgs = app.cache.as_ref().expect("cache present after fetch");
+    let imgs = app.cache.as_mut().expect("cache present after fetch");
     // Expanding a gzipped image can fail (corrupt object, or no room for the
     // expanded disk beside everything else). Treat it exactly like a failed
     // fetch: report it and leave the machine stopped, rather than unwrapping

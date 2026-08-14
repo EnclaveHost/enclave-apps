@@ -38,6 +38,8 @@ use std::time::Instant;
 /// batches without reaching back through the emulator.
 struct BenchTerminal {
     out: Rc<RefCell<Vec<u8>>>,
+    // --type: bytes queued here are fed to the guest UART as serial input
+    input: Rc<RefCell<std::collections::VecDeque<u8>>>,
     // Buffered, and flushed a line at a time. Echoing straight to stdout costs
     // a syscall per character, which is slow enough to halve the measured MIPS
     // and make `--console` runs look like they stalled.
@@ -61,9 +63,11 @@ impl Terminal for BenchTerminal {
         }
     }
     fn get_input(&mut self) -> u8 {
-        0
+        self.input.borrow_mut().pop_front().unwrap_or(0)
     }
-    fn put_input(&mut self, _value: u8) {}
+    fn put_input(&mut self, value: u8) {
+        self.input.borrow_mut().push_back(value);
+    }
     fn get_output(&mut self) -> u8 {
         0
     }
@@ -80,6 +84,7 @@ fn main() {
     // that range (pc offset + which registers changed to what) to FILE. This
     // is the execution-truth companion to the static dump: any mis-executed
     // instruction shows up as a register value inconsistent with its inputs.
+    let mut type_script: Vec<(u64, String)> = Vec::new();
     let mut trace_file: Option<String> = None;
     let mut trace_limit: u64 = 200_000;
     let mut trace_sub: Option<(u64, u64)> = None;
@@ -97,6 +102,13 @@ fn main() {
                 until = Some(args[i].clone());
             }
             "--console" => echo = true,
+            "--type" => {
+                // SECONDS:COMMAND -- queue COMMAND (plus newline) as serial
+                // input once the wall clock passes SECONDS. Repeatable.
+                i += 1;
+                let (secs, cmd) = args[i].split_once(':').expect("--type SECONDS:COMMAND");
+                type_script.push((secs.parse::<u64>().expect("seconds"), format!("{}\n", cmd)));
+            }
             "--trace-tf" => {
                 i += 1;
                 trace_file = Some(args[i].clone());
@@ -146,8 +158,10 @@ fn main() {
     // Mirror the app's boot exactly (src/main.rs `boot`), minus the network:
     // no host sockets, so the measurement has no external dependency.
     let console = Rc::new(RefCell::new(Vec::new()));
+    let ser_in = Rc::new(RefCell::new(std::collections::VecDeque::new()));
     let mut emu = Emulator::new(Box::new(BenchTerminal {
         out: console.clone(),
+        input: ser_in.clone(),
         echo: match echo {
             true => Some(std::io::BufWriter::new(std::io::stdout())),
             false => None,
@@ -161,6 +175,7 @@ fn main() {
     const BATCH: u64 = 400_000;
     let start = Instant::now();
     let mut done: u64 = 0;
+    let mut last_fbw: u64 = 0;
     let mut window = Instant::now();
     let mut window_insns: u64 = 0;
 
@@ -312,12 +327,43 @@ fn main() {
         }
 
         if window.elapsed().as_secs_f64() >= 2.0 {
+            let elapsed_s = start.elapsed().as_secs();
+            type_script.retain(|(at, cmd)| {
+                if *at <= elapsed_s {
+                    for b in cmd.bytes() {
+                        ser_in.borrow_mut().push_back(b);
+                    }
+                    eprintln!("TYPED@{}s: {}", elapsed_s, cmd.trim_end());
+                    false
+                } else {
+                    true
+                }
+            });
             let mips = window_insns as f64 / 1e6 / window.elapsed().as_secs_f64();
+            // debug aid: framebuffer store rate + a two-pixel probe (origin and
+            // center) so display transitions land in the same log as the rate.
+            let fbw = emu.fb_writes();
+            let dfbw = fbw.wrapping_sub(last_fbw);
+            last_fbw = fbw;
+            let mut px = [0u8; 4];
+            emu.read_physical_range(0x87e0_0000, &mut px);
+            let mut cx = [0u8; 4];
+            emu.read_physical_range(0x87e0_0000 + (384 * 4096 + 512 * 4) as u64, &mut cx);
+            // corner probes OUTSIDE a 640x480 window at origin: bottom-right + right-mid
+            let mut br = [0u8; 4];
+            emu.read_physical_range(0x87e0_0000 + (740 * 4096 + 1000 * 4) as u64, &mut br);
+            let mut rm = [0u8; 4];
+            emu.read_physical_range(0x87e0_0000 + (300 * 4096 + 900 * 4) as u64, &mut rm);
             eprintln!(
-                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS",
+                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS  fbw+{} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
                 start.elapsed().as_secs_f64(),
                 done as f64 / 1e6,
-                mips
+                mips,
+                dfbw,
+                px[2], px[1], px[0],
+                cx[2], cx[1], cx[0],
+                rm[2], rm[1], rm[0],
+                br[2], br[1], br[0]
             );
             window = Instant::now();
             window_insns = 0;

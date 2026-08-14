@@ -348,6 +348,11 @@ impl Emulator {
 	/// risc-box patch: bulk read of guest PHYSICAL memory, no side effects —
 	/// the framebuffer scanout path (the app reads the simple-framebuffer
 	/// region the default DTB reserves at the top of DRAM).
+	// risc-box patch (debug aid): stores that landed in the framebuffer window.
+	pub fn fb_writes(&self) -> u64 {
+		self.cpu.get_mmu().fb_writes()
+	}
+
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
 		self.cpu.get_mmu().read_physical_range(p_address, out);
 	}

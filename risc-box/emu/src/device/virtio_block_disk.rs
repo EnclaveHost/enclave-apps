@@ -87,15 +87,24 @@ impl VirtioBlockDisk {
 	/// # Arguments
 	/// * `contents` filesystem content binary
 	pub fn init(&mut self, contents: Vec<u8>) {
-		// @TODO: Optimize
-		self.contents_len = contents.len(); // risc-box patch
-		for _i in 0..((contents.len() + 7) / 8) {
-			self.contents.push(0);
+		// risc-box patch: pack the image into u64 cells with ONE exactly-sized
+		// allocation. The original pushed a zero per cell, so the Vec doubled
+		// its way up and briefly held ~2x the image in dead capacity — a real
+		// cost on wasm32, where the disk and the guest RAM share one linear
+		// memory and a half-gigabyte image leaves little headroom.
+		self.contents_len = contents.len();
+		let cells = (contents.len() + 7) / 8;
+		self.contents = Vec::with_capacity(cells);
+		let full = contents.len() / 8;
+		for i in 0..full {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&contents[i * 8..i * 8 + 8]);
+			self.contents.push(u64::from_le_bytes(b));
 		}
-		for i in 0..contents.len() {
-			let index = (i >> 3) as usize;
-			let pos = (i % 8) * 8;
-			self.contents[index] = (self.contents[index] & !(0xff << pos)) | ((contents[i] as u64) << pos);
+		if full < cells {
+			let mut b = [0u8; 8];
+			b[..contents.len() - full * 8].copy_from_slice(&contents[full * 8..]);
+			self.contents.push(u64::from_le_bytes(b));
 		}
 	}
 

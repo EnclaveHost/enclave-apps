@@ -211,6 +211,11 @@ impl Mmu {
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
 		self.memory.read_range(p_address, out);
 	}
+
+	// risc-box patch (debug aid): see MemoryWrapper::fb_writes.
+	pub fn fb_writes(&self) -> u64 {
+		self.memory.fb_writes()
+	}
 	
 	/// Initializes Virtio block disk. This method is expected to be called only once.
 	///
@@ -1080,7 +1085,8 @@ pub struct MemoryWrapper {
 	// DRAM write funnels through this wrapper) bumps code_gen, which every
 	// cached entry's meta embeds, killing them all at once.
 	exec_page_marks: Vec<u8>,
-	code_gen: u32
+	code_gen: u32,
+	fb_writes: u64
 }
 
 impl MemoryWrapper {
@@ -1088,7 +1094,8 @@ impl MemoryWrapper {
 		MemoryWrapper {
 			memory: Memory::new(),
 			exec_page_marks: vec![],
-			code_gen: 1
+			code_gen: 1,
+			fb_writes: 0
 		}
 	}
 
@@ -1097,8 +1104,18 @@ impl MemoryWrapper {
 		self.exec_page_marks = vec![0; ((capacity + 0xfff) >> 12) as usize]; // risc-box patch
 	}
 
+	// risc-box patch (debug aid): count stores landing in the framebuffer's
+	// physical window; boot-bench polls the delta to tell "guest stopped
+	// writing the fb" apart from "writes are being diverted elsewhere".
+	pub fn fb_writes(&self) -> u64 {
+		self.fb_writes
+	}
+
 	// risc-box patch: bump code_gen if this write can touch a marked page.
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
+		if p_address >= 0x87e0_0000 && p_address < 0x8810_0000 {
+			self.fb_writes = self.fb_writes.wrapping_add(1);
+		}
 		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let hit = match self.exec_page_marks.get(first) {
