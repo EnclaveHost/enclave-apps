@@ -717,6 +717,15 @@ impl Cpu {
 
 		// So, this trap should be taken
 
+		// risc-box patch: an LR/SC reservation must not survive a trap. On a
+		// single emulated hart, every context switch passes through here; a
+		// reservation that lives across the switch lets thread B's plain
+		// stores go unnoticed and thread A's SC then succeeds against a stale
+		// read -- a lost update. That silently corrupted CAS loops under
+		// contention (V8's concurrent TurboFan thread vs its main thread:
+		// the compiler read poisoned feedback and emitted wrong code).
+		self.is_reservation_set = false;
+
 		self.privilege_mode = new_privilege_mode;
 		self.mmu.update_privilege_mode(self.privilege_mode.clone());
 		let csr_epc_address = match self.privilege_mode {
@@ -3552,7 +3561,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 					},
 					Err(e) => return Err(e)
 				},
-				false => 1
+				false => {
+					// risc-box patch: SC consumes the reservation win or lose
+					cpu.is_reservation_set = false;
+					1
+				}
 			};
 			Ok(())
 		},
@@ -3573,7 +3586,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 					},
 					Err(e) => return Err(e)
 				},
-				false => 1
+				false => {
+					// risc-box patch: SC consumes the reservation win or lose
+					cpu.is_reservation_set = false;
+					1
+				}
 			};
 			Ok(())
 		},
