@@ -2498,8 +2498,18 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.W.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// Is this implementation correct?
-			cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+			// risc-box patch: this converted through `as u32` (UNSIGNED), so any
+			// negative double became 0 -- e.g. FCVT.W.D(-1.0) = 0. gcc lowers
+			// (int32_t)double to exactly this instruction, so every negative
+			// double->int cast in guest C code was wrong; V8's TurboFan constant
+			// lowering (DoubleToInt32(-1.0)) turned -1 graph constants into 0 and
+			// silently miscompiled JS. Signed saturating truncation, NaN -> MAX
+			// per the RISC-V spec (Rust `as` gives NaN -> 0).
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => i32::MAX as i64,
+				false => a as i32 as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2513,7 +2523,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.WU.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+			// risc-box patch: NaN -> u32::MAX per spec (result sign-extended)
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => u32::MAX as i32 as i64,
+				false => a as u32 as i32 as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2524,7 +2539,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.L.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = cpu.f[f.rs1] as i64;
+			// risc-box patch: NaN -> i64::MAX per spec
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => i64::MAX,
+				false => a as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2535,7 +2555,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.LU.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = cpu.f[f.rs1] as u64 as i64;
+			// risc-box patch: NaN -> u64::MAX per spec
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => u64::MAX as i64,
+				false => a as u64 as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
