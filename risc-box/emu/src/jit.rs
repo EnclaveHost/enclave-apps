@@ -32,12 +32,31 @@ use cpu::*;
 pub struct Layout {
 	pub x_base: u32,          // x[32] as i64
 	pub f_base: u32,          // f[32] as f64 (raw 8-byte cells)
+	// Some(_) when the guest runs under paging: memory ops probe the
+	// emulator's software TLB (hit -> translated physical -> flat DRAM
+	// window; miss/meta-stale -> bail, the interpreter walks and fills so
+	// the retry hits). None for bare/physical addressing.
+	pub tlb: Option<TlbLayout>,
 	pub pc_addr: u32,         // u64
 	pub gen_addr: u32,        // u32 write-snoop generation cell
 	pub baked_gen: u32,       // generation this block was built against
 	pub dram_base: u32,       // linear offset of guest DRAM byte 0
 	pub guest_dram_base: u64, // 0x8000_0000
 	pub dram_len: u64,
+}
+
+/// Where the software TLB's READ and WRITE ways live, mirroring
+/// Mmu::translate_address's hit path: set = (vaddr >> 12) & (sets-1);
+/// hit iff tags[set] == (vaddr & !0xfff) | 1 && metas[set] == *meta_cache.
+pub struct TlbLayout {
+	pub sets: u32, // power of two (the emulator uses 512)
+	pub read_tags: u32,
+	pub read_metas: u32,
+	pub read_ppns: u32,
+	pub write_tags: u32,
+	pub write_metas: u32,
+	pub write_ppns: u32,
+	pub meta_cache: u32, // u32 cell holding tlb_meta_cache
 }
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -71,6 +90,9 @@ struct Emit<'a> {
 	// index of the i64 scratch local (0 in single-block mode; shifted in
 	// region mode where params occupy the low indices)
 	scratch: u32,
+	// second i64 scratch (TLB probes need vaddr and the entry offset live
+	// at once)
+	scratch2: u32,
 	// how many `if` labels currently enclose the emission point — a region
 	// transfer's br to the dispatch loop must add this to its depth
 	if_depth: u32,
@@ -243,10 +265,87 @@ impl<'a> Emit<'a> {
 			}
 		}
 	}
-	/// stack: guest address (i64). Leaves LINEAR i32 address on the stack.
-	/// Bails (pc=op_addr, return retired) unless the whole `width` fits in
-	/// the DRAM window. Uses local 0 as scratch.
-	fn dram_addr(&mut self, width: u64, op_addr: u64, retired: u64) {
+	/// stack: guest VIRTUAL address (i64). Leaves LINEAR i32 address on the
+	/// stack, translating through the software TLB when the layout has one
+	/// (bailing on miss) and bounds-checking the DRAM window either way.
+	fn dram_addr(&mut self, width: u64, op_addr: u64, retired: u64, write: bool) {
+		if self.lay.tlb.is_some() {
+			self.tlb_translate(op_addr, retired, write);
+		}
+		self.dram_addr_flat(width, op_addr, retired);
+	}
+
+	/// stack: guest virtual address -> stack: guest PHYSICAL address, or
+	/// bail on TLB miss / stale meta. Scratch: vaddr; scratch2: entry off.
+	fn tlb_translate(&mut self, op_addr: u64, retired: u64, write: bool) {
+		let t = match &self.lay.tlb {
+			Some(t) => TlbLayout { ..TlbLayout {
+				sets: t.sets,
+				read_tags: t.read_tags, read_metas: t.read_metas, read_ppns: t.read_ppns,
+				write_tags: t.write_tags, write_metas: t.write_metas, write_ppns: t.write_ppns,
+				meta_cache: t.meta_cache,
+			} },
+			None => unreachable!(),
+		};
+		let (tags, metas, ppns) = match write {
+			false => (t.read_tags, t.read_metas, t.read_ppns),
+			true => (t.write_tags, t.write_metas, t.write_ppns),
+		};
+		let sc = self.scratch as u64;
+		let sc2 = self.scratch2 as u64;
+		// scratch = vaddr
+		self.op(0x21); uleb(&mut self.code, sc);
+		// scratch2 = ((vaddr >> 12) & (sets-1)) * 8   (tag/ppn entry offset)
+		self.op(0x20); uleb(&mut self.code, sc);
+		self.i64c(12);
+		self.op(0x88); // shr_u
+		self.i64c((t.sets - 1) as i64);
+		self.op(0x83); // and
+		self.i64c(8);
+		self.op(0x7e); // mul
+		self.op(0x21); uleb(&mut self.code, sc2);
+		// tag hit? mem[tags + scratch2] == (vaddr & !0xfff) | 1
+		self.op(0x20); uleb(&mut self.code, sc2);
+		self.op(0xa7); // wrap
+		self.op(I64_LOAD);
+		self.memarg(3, tags as u64);
+		self.op(0x20); uleb(&mut self.code, sc);
+		self.i64c(!0xfffi64);
+		self.op(0x83);
+		self.i64c(1);
+		self.op(0x84); // or
+		self.op(0x52); // i64.ne
+		self.op(0x04); self.op(0x40);
+		self.bail(op_addr, retired);
+		self.op(0x0b);
+		// meta fresh? metas is u32-per-set: offset = scratch2/2
+		self.op(0x20); uleb(&mut self.code, sc2);
+		self.i64c(1);
+		self.op(0x88); // shr_u -> *4 scale
+		self.op(0xa7);
+		self.op(0x28); // i32.load
+		self.memarg(2, metas as u64);
+		self.i32c(0);
+		self.op(0x28);
+		self.memarg(2, t.meta_cache as u64);
+		self.op(0x47); // i32.ne
+		self.op(0x04); self.op(0x40);
+		self.bail(op_addr, retired);
+		self.op(0x0b);
+		// phys = ppns[set] | (vaddr & 0xfff)
+		self.op(0x20); uleb(&mut self.code, sc2);
+		self.op(0xa7);
+		self.op(I64_LOAD);
+		self.memarg(3, ppns as u64);
+		self.op(0x20); uleb(&mut self.code, sc);
+		self.i64c(0xfff);
+		self.op(0x83);
+		self.op(0x84); // or
+	}
+
+	/// stack: guest PHYSICAL address. Leaves LINEAR i32 address on the
+	/// stack. Bails unless the whole `width` fits in the DRAM window.
+	fn dram_addr_flat(&mut self, width: u64, op_addr: u64, retired: u64) {
 		// scratch = guest_addr - guest_dram_base
 		self.i64c(self.lay.guest_dram_base as i64);
 		self.op(0x7d); // i64.sub
@@ -285,7 +384,7 @@ impl<'a> Emit<'a> {
 /// Emit ops[..] starting at guest pc `start`. Returns None if any op is
 /// outside the supported subset (caller keeps interpreting that block).
 pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
-	let mut e = Emit { code: Vec::new(), lay, scratch: 0, if_depth: 0, region: None };
+	let mut e = Emit { code: Vec::new(), lay, scratch: 0, scratch2: 1, if_depth: 0, region: None };
 	if !emit_seq(&mut e, ops, start) {
 		return None;
 	}
@@ -467,7 +566,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
-				e.dram_addr(8, addr, ret_before);
+				e.dram_addr(8, addr, ret_before, false);
 				e.op(I64_LOAD);
 				e.memarg(3, 0);
 				e.set_f_bits_post(rd);
@@ -478,7 +577,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
-				e.dram_addr(4, addr, ret_before);
+				e.dram_addr(4, addr, ret_before, false);
 				e.op(0x34); // i64.load32_s
 				e.memarg(2, 0);
 				e.set_f_bits_post(rd);
@@ -487,7 +586,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
-				e.dram_addr(8, addr, ret_before);
+				e.dram_addr(8, addr, ret_before, true);
 				e.get_f_bits(rs2);
 				e.op(I64_STORE);
 				e.memarg(3, 0);
@@ -497,7 +596,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
-				e.dram_addr(4, addr, ret_before);
+				e.dram_addr(4, addr, ret_before, true);
 				e.get_f_bits(rs2);
 				e.op(0x3e); // i64.store32 (low 32 bits = to_bits() as u32)
 				e.memarg(2, 0);
@@ -575,7 +674,8 @@ pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u
 	let mut e = Emit {
 		code: Vec::new(),
 		lay,
-		scratch: 2, // params fuel=0, entry=1; locals scratch=2, cur=3, retired=4
+		scratch: 2, // params fuel=0, entry=1; locals scratch=2, cur=3, retired=4, scratch2=5
+		scratch2: 5,
 		if_depth: 0,
 		region: None,
 	};
@@ -708,7 +808,7 @@ fn load(e: &mut Emit, rd: u8, rs1: u8, imm: i64, addr: u64, ret: u64, width: u64
 	e.get_x(rs1);
 	e.i64c(imm);
 	e.op(0x7c); // guest addr
-	e.dram_addr(width, addr, ret);
+	e.dram_addr(width, addr, ret, false);
 	e.op(lop);
 	e.memarg(align, 0);
 	e.set_x_post(rd);
@@ -718,7 +818,7 @@ fn store(e: &mut Emit, rs1: u8, rs2: u8, imm: i64, addr: u64, ret: u64, width: u
 	e.get_x(rs1);
 	e.i64c(imm);
 	e.op(0x7c);
-	e.dram_addr(width, addr, ret);
+	e.dram_addr(width, addr, ret, true);
 	e.get_x(rs2);
 	e.op(sop);
 	e.memarg(align, 0);
@@ -771,13 +871,15 @@ fn assemble_region(body_expr: Vec<u8>) -> Vec<u8> {
 	m.push(7);
 	uleb(&mut m, sec.len() as u64);
 	m.extend_from_slice(&sec);
-	// locals: 1x i64 (scratch), 1x i32 (cur), 1x i64 (retired)
+	// locals: i64 scratch, i32 cur, i64 retired, i64 scratch2
 	let mut body = Vec::new();
-	uleb(&mut body, 3);
+	uleb(&mut body, 4);
 	uleb(&mut body, 1);
 	body.push(0x7e);
 	uleb(&mut body, 1);
 	body.push(0x7f);
+	uleb(&mut body, 1);
+	body.push(0x7e);
 	uleb(&mut body, 1);
 	body.push(0x7e);
 	body.extend_from_slice(&body_expr);
@@ -823,10 +925,10 @@ fn assemble(body_expr: Vec<u8>) -> Vec<u8> {
 	m.push(7);
 	uleb(&mut m, sec.len() as u64);
 	m.extend_from_slice(&sec);
-	// code: one body, one i64 local (scratch)
+	// code: one body, two i64 locals (scratch, scratch2)
 	let mut body = Vec::new();
 	uleb(&mut body, 1);
-	uleb(&mut body, 1);
+	uleb(&mut body, 2);
 	body.push(0x7e);
 	body.extend_from_slice(&body_expr);
 	body.push(0x0b); // end

@@ -5659,6 +5659,7 @@ mod test_jit_equivalence {
 			let lay = jit::Layout {
 				x_base: XB,
 				f_base: FB,
+				tlb: None,
 				pc_addr: PCA,
 				gen_addr: GENA,
 				baked_gen: cpu.mmu.code_gen(),
@@ -5712,7 +5713,7 @@ mod test_jit_equivalence {
 
 	fn region_layout(cpu: &Cpu) -> jit::Layout {
 		jit::Layout {
-			x_base: XB, f_base: FB, pc_addr: PCA, gen_addr: GENA,
+			x_base: XB, f_base: FB, tlb: None, pc_addr: PCA, gen_addr: GENA,
 			baked_gen: cpu.mmu.code_gen(),
 			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
 		}
@@ -5794,6 +5795,128 @@ mod test_jit_equivalence {
 	}
 
 	#[test]
+	fn tlb_tier_translates_hits_and_bails_misses() {
+		// synthetic single-page TLB: virtual page V maps to physical page P
+		// inside the DRAM window; everything else must bail.
+		const SETS: u32 = 512;
+		const T_RT: u32 = 8192; // read tags (512 * 8)
+		const T_RM: u32 = 8192 + 4096; // read metas (512 * 4)
+		const T_RP: u32 = 8192 + 4096 + 2048; // read ppns
+		const T_MC: u32 = 8192 + 4096 + 2048 + 4096; // meta cache cell
+		let vpage: u64 = 0x4000_2000; // arbitrary virtual page
+		let ppage: u64 = DRAM_BASE + 0x3000; // physical page in DRAM
+		let meta: u32 = 0xabcd_1234;
+
+		let mut cpu = fresh_cpu(&mut Rng(4242));
+		cpu.x[10] = (vpage + 0x40) as i64; // pointer into the mapped page
+		cpu.x[11] = 0x5000_0000; // pointer with NO mapping
+		let ops_hit = vec![op(HOT_LD, 5, 10, 0, 8), op(HOT_SD, 0, 10, 6, 16)];
+		let ops_miss = vec![op(HOT_ADDI, 5, 5, 0, 1), op(HOT_LD, 7, 11, 0, 0)];
+		let lay = jit::Layout {
+			x_base: XB, f_base: FB,
+			tlb: Some(jit::TlbLayout {
+				sets: SETS,
+				read_tags: T_RT, read_metas: T_RM, read_ppns: T_RP,
+				// write set shares the arrays in this synthetic setup
+				write_tags: T_RT, write_metas: T_RM, write_ppns: T_RP,
+				meta_cache: T_MC,
+			}),
+			pc_addr: PCA, gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen(),
+			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		};
+		let fill_tlb = |d: &mut [u8]| {
+			let set = ((vpage >> 12) & (SETS as u64 - 1)) as usize;
+			let tag = (vpage & !0xfff) | 1;
+			d[T_RT as usize + set * 8..T_RT as usize + set * 8 + 8]
+				.copy_from_slice(&tag.to_le_bytes());
+			d[T_RM as usize + set * 4..T_RM as usize + set * 4 + 4]
+				.copy_from_slice(&meta.to_le_bytes());
+			d[T_RP as usize + set * 8..T_RP as usize + set * 8 + 8]
+				.copy_from_slice(&(ppage & !0xfff).to_le_bytes());
+			d[T_MC as usize..T_MC as usize + 4].copy_from_slice(&meta.to_le_bytes());
+		};
+
+		// hit case: LD then SD through the mapping run to completion
+		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu.x[i].to_le_bytes());
+			}
+			d[GENA as usize..GENA as usize + 4]
+				.copy_from_slice(&cpu.mmu.code_gen().to_le_bytes());
+			fill_tlb(d);
+			// plant a known value at the translated load address
+			let lin = DB as u64 + (ppage - DRAM_BASE) + 0x40 + 8;
+			d[lin as usize..lin as usize + 8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+		}
+		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap();
+		assert_eq!(retired, 2, "hit case must complete");
+		{
+			let d = mem.data(&store);
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[XB as usize + 5 * 8..XB as usize + 5 * 8 + 8]);
+			assert_eq!(u64::from_le_bytes(b), 0x1122_3344_5566_7788, "loaded through mapping");
+			// the SD wrote x6 at translated +0x40+16
+			let lin = DB as u64 + (ppage - DRAM_BASE) + 0x40 + 16;
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[lin as usize..lin as usize + 8]);
+			assert_eq!(i64::from_le_bytes(b), cpu.x[6], "stored through mapping");
+		}
+
+		// miss case: first op runs, the unmapped LD bails with pc at it
+		let bytes = jit::emit_block(&ops_miss, DRAM_BASE, &lay).unwrap();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu.x[i].to_le_bytes());
+			}
+			fill_tlb(d);
+		}
+		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap();
+		assert_eq!(retired, 1, "miss bails before the load");
+		{
+			let d = mem.data(&store);
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
+			assert_eq!(u64::from_le_bytes(b), DRAM_BASE + 4, "pc at the bailing op");
+		}
+
+		// stale meta: flip the cache cell; the mapped LD must now bail at op 0
+		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu.x[i].to_le_bytes());
+			}
+			fill_tlb(d);
+			d[T_MC as usize..T_MC as usize + 4].copy_from_slice(&meta.wrapping_add(1).to_le_bytes());
+		}
+		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap();
+		assert_eq!(retired, 0, "stale meta bails immediately");
+	}
+
+	#[test]
 	fn store_bails_on_stale_generation() {
 		let mut r = Rng(97);
 		let cpu = fresh_cpu(&mut r);
@@ -5803,7 +5926,7 @@ mod test_jit_equivalence {
 			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 8, rs1: 9, rs2: 0, len: 4, _pad: 0 },
 		];
 		let lay = jit::Layout {
-			x_base: XB, f_base: FB, pc_addr: PCA, gen_addr: GENA,
+			x_base: XB, f_base: FB, tlb: None, pc_addr: PCA, gen_addr: GENA,
 			baked_gen: cpu.mmu.code_gen().wrapping_add(1), // stale on purpose
 			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
 		};
