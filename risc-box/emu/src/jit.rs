@@ -31,6 +31,7 @@ use cpu::*;
 /// are a synthetic layout the harness serializes into.
 pub struct Layout {
 	pub x_base: u32,          // x[32] as i64
+	pub f_base: u32,          // f[32] as f64 (raw 8-byte cells)
 	pub pc_addr: u32,         // u64
 	pub gen_addr: u32,        // u32 write-snoop generation cell
 	pub baked_gen: u32,       // generation this block was built against
@@ -116,6 +117,30 @@ impl<'a> Emit<'a> {
 		self.op(I64_STORE);
 		self.memarg(3, self.lay.x_base as u64 + r as u64 * 8);
 	}
+	/// push f[r] bit pattern as i64
+	fn get_f_bits(&mut self, r: u8) {
+		self.i32c(0);
+		self.op(I64_LOAD);
+		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+	}
+	fn set_f_bits_pre(&mut self) {
+		self.i32c(0);
+	}
+	fn set_f_bits_post(&mut self, r: u8) {
+		self.op(I64_STORE);
+		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+	}
+	/// push f[r] as f64
+	fn get_f(&mut self, r: u8) {
+		self.i32c(0);
+		self.op(0x2b); // f64.load
+		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+	}
+	fn set_f_post(&mut self, r: u8) {
+		self.op(0x39); // f64.store
+		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+	}
+
 	/// pc <- const, return const retired
 	fn exit(&mut self, pc: u64, retired: u64) {
 		self.i32c(0);
@@ -333,7 +358,92 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 				e.op(RETURN);
 				e.op(0x0b); // end if; fall through when target == next
 			}
-			_ => return None, // outside the subset: keep interpreting
+			HOT_FLD => {
+				// f[rd] = f64::from_bits(load_doubleword)
+				e.set_f_bits_pre();
+				e.get_x(rs1);
+				e.i64c(imm);
+				e.op(0x7c);
+				e.dram_addr(8, addr, ret_before);
+				e.op(I64_LOAD);
+				e.memarg(3, 0);
+				e.set_f_bits_post(rd);
+			}
+			HOT_FLW => {
+				// f[rd] = f64::from_bits(load_word as i32 as i64 as u64)
+				e.set_f_bits_pre();
+				e.get_x(rs1);
+				e.i64c(imm);
+				e.op(0x7c);
+				e.dram_addr(4, addr, ret_before);
+				e.op(0x34); // i64.load32_s
+				e.memarg(2, 0);
+				e.set_f_bits_post(rd);
+			}
+			HOT_FSD => {
+				e.get_x(rs1);
+				e.i64c(imm);
+				e.op(0x7c);
+				e.dram_addr(8, addr, ret_before);
+				e.get_f_bits(rs2);
+				e.op(I64_STORE);
+				e.memarg(3, 0);
+				e.gen_check(next, ret_after);
+			}
+			HOT_FSW => {
+				e.get_x(rs1);
+				e.i64c(imm);
+				e.op(0x7c);
+				e.dram_addr(4, addr, ret_before);
+				e.get_f_bits(rs2);
+				e.op(0x3e); // i64.store32 (low 32 bits = to_bits() as u32)
+				e.memarg(2, 0);
+				e.gen_check(next, ret_after);
+			}
+			HOT_FADD_D => fp_bin(&mut e, rd, rs1, rs2, 0xa0),
+			HOT_FSUB_D => fp_bin(&mut e, rd, rs1, rs2, 0xa1),
+			HOT_FMUL_D => fp_bin(&mut e, rd, rs1, rs2, 0xa2),
+			HOT_FSGNJ_D => {
+				// f[rd] = (bits(rs2) & SIGN) | (bits(rs1) & !SIGN)
+				e.set_f_bits_pre();
+				e.get_f_bits(rs2);
+				e.i64c(i64::MIN); // 0x8000...0
+				e.op(0x83); // and
+				e.get_f_bits(rs1);
+				e.i64c(i64::MAX); // 0x7fff...f
+				e.op(0x83);
+				e.op(0x84); // or
+				e.set_f_bits_post(rd);
+			}
+			HOT_FMV_X_D => {
+				e.set_x_pre(rd);
+				e.get_f_bits(rs1);
+				e.set_x_post(rd);
+			}
+			HOT_FMV_D_X => {
+				e.set_f_bits_pre();
+				e.get_x(rs1);
+				e.set_f_bits_post(rd);
+			}
+			HOT_FCVT_D_W => {
+				// f[rd] = x[rs1] as i32 as f64 (exact conversion)
+				e.set_f_bits_pre();
+				e.get_x(rs1);
+				e.op(0xa7); // i32.wrap_i64
+				e.op(0xb7); // f64.convert_i32_s
+				e.set_f_post(rd);
+			}
+			_ => {
+				// outside the subset. A first-op miss means nothing to
+				// compile; mid-block, emit a bail so the interpreter takes
+				// over at exactly this op, and stop emitting (the rest is
+				// unreachable through this function).
+				if i == 0 {
+					return None;
+				}
+				e.exit(addr, ret_before);
+				break;
+			}
 		}
 		pc = next;
 	}
@@ -346,6 +456,14 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 fn wrap32(e: &mut Emit) {
 	e.op(0xa7); // i32.wrap_i64
 	e.op(0xac); // i64.extend_i32_s
+}
+
+fn fp_bin(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, fop: u8) {
+	e.set_f_bits_pre();
+	e.get_f(rs1);
+	e.get_f(rs2);
+	e.op(fop);
+	e.set_f_post(rd);
 }
 
 fn bin_reg(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, wop: u8) {

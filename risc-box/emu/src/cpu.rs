@@ -5468,6 +5468,7 @@ mod test_jit_equivalence {
 	const XB: u32 = 0; // x[32] at 0
 	const PCA: u32 = 256;
 	const GENA: u32 = 264;
+	const FB: u32 = 512; // f[32] as raw 8-byte cells
 	const DB: u32 = 4096; // linear offset of guest DRAM window
 	const WIN: u64 = 64 * 1024; // mirrored DRAM window size
 
@@ -5496,7 +5497,7 @@ mod test_jit_equivalence {
 			let shamt6 = (r.next() % 64) as u32;
 			let shamt5 = (r.next() % 32) as u32;
 			let bimm = (((r.next() % 512) as i32) - 256) & !1; // branch offset, even
-			let (kind, rrd, rrs1, rrs2, imm, word) = match r.next() % 44 {
+			let (kind, rrd, rrs1, rrs2, imm, word) = match r.next() % 55 {
 				0 => (HOT_ADDI, rd, ra, 0, imm12, 0),
 				1 => (HOT_ADD, rd, ra, rb, 0, 0),
 				2 => (HOT_SUB, rd, ra, rb, 0, 0),
@@ -5544,15 +5545,21 @@ mod test_jit_equivalence {
 				},
 				38 => (HOT_JAL, rd, 0, 0, bimm, 0),
 				39 => (HOT_JALR, rd, ra, 0, imm12, 0),
-				_ => {
-					// W-shift family
-					match r.next() % 4 {
-						0 => (HOT_SLLIW, rd, ra, shamt5 as u8, 0, 0),
-						1 => (HOT_SLLW, rd, ra, rb, 0, 0),
-						2 => (HOT_SRLW, rd, ra, rb, 0, 0),
-						_ => (HOT_SRAW, rd, ra, rb, 0, 0),
-					}
-				}
+				40 => (HOT_SLLIW, rd, ra, shamt5 as u8, 0, 0),
+				41 => (HOT_SLLW, rd, ra, rb, 0, 0),
+				42 => (HOT_SRLW, rd, ra, rb, 0, 0),
+				43 => (HOT_SRAW, rd, ra, rb, 0, 0),
+				44 => (HOT_FLD, rd, p, 0, mem_imm, 0),
+				45 => (HOT_FSD, 0, p, rb, mem_imm, 0),
+				46 => (HOT_FADD_D, rd, ra, rb, 0, 0),
+				47 => (HOT_FSUB_D, rd, ra, rb, 0, 0),
+				48 => (HOT_FMUL_D, rd, ra, rb, 0, 0),
+				49 => (HOT_FSGNJ_D, rd, ra, rb, 0, 0),
+				50 => (HOT_FMV_X_D, rd, ra, 0, 0, 0),
+				51 => (HOT_FMV_D_X, rd, ra, 0, 0, 0),
+				52 => (HOT_FLW, rd, p, 0, mem_imm, 0),
+				53 => (HOT_FSW, 0, p, rb, mem_imm, 0),
+				_ => (HOT_FCVT_D_W, rd, ra, 0, 0, 0),
 			};
 			let _ = shamt5;
 			ops.push(BlockOp {
@@ -5580,6 +5587,14 @@ mod test_jit_equivalence {
 			cpu.x[p] = (DRAM_BASE + 8192 + (r.next() % 16384 & !7)) as i64;
 		}
 		cpu.x[0] = 0;
+		for i in 0..32 {
+			// finite doubles only: NaN payload propagation differs between
+			// the native interpreter (host FPU) and engine-canonicalized
+			// wasm in some configurations; production runs BOTH sides under
+			// the same engine, so finite inputs are the honest test domain
+			let m = (r.next() % 2000000) as f64 / 1000.0 - 1000.0;
+			cpu.f[i] = m;
+		}
 		for a in (0..WIN).step_by(8) {
 			let v = r.next();
 			let _ = cpu.get_mut_mmu().store_doubleword(DRAM_BASE + a, v);
@@ -5587,7 +5602,7 @@ mod test_jit_equivalence {
 		cpu
 	}
 
-	fn run_wasm(bytes: &[u8], cpu_pre: &Cpu, start: u64) -> (u64, [i64; 32], u64, Vec<u8>) {
+	fn run_wasm(bytes: &[u8], cpu_pre: &Cpu, start: u64) -> (u64, [i64; 32], u64, Vec<u8>, [u64; 32]) {
 		let engine = wasmtime::Engine::default();
 		let module = wasmtime::Module::new(&engine, bytes).expect("valid module");
 		let mut store = wasmtime::Store::new(&engine, ());
@@ -5599,6 +5614,10 @@ mod test_jit_equivalence {
 					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
 			}
 			d[PCA as usize..PCA as usize + 8].copy_from_slice(&start.to_le_bytes());
+			for i in 0..32 {
+				d[FB as usize + i * 8..FB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu_pre.f[i].to_bits().to_le_bytes());
+			}
 			d[GENA as usize..GENA as usize + 4]
 				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
 			let mut win = vec![0u8; WIN as usize];
@@ -5619,7 +5638,13 @@ mod test_jit_equivalence {
 		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
 		let pc = u64::from_le_bytes(b);
 		let dram = d[DB as usize..DB as usize + WIN as usize].to_vec();
-		(retired, x, pc, dram)
+		let mut f = [0u64; 32];
+		for i in 0..32 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[FB as usize + i * 8..FB as usize + i * 8 + 8]);
+			f[i] = u64::from_le_bytes(b);
+		}
+		(retired, x, pc, dram, f)
 	}
 
 	#[test]
@@ -5633,6 +5658,7 @@ mod test_jit_equivalence {
 			let mut cpu = fresh_cpu(&mut Rng(seed * 40503 | 1));
 			let lay = jit::Layout {
 				x_base: XB,
+				f_base: FB,
 				pc_addr: PCA,
 				gen_addr: GENA,
 				baked_gen: cpu.mmu.code_gen(),
@@ -5645,7 +5671,7 @@ mod test_jit_equivalence {
 				None => continue,
 			};
 			// wasm first (from the pristine state), then the real engine
-			let (rw, xw, pcw, dramw) = run_wasm(&bytes, &cpu, start);
+			let (rw, xw, pcw, dramw, fw) = run_wasm(&bytes, &cpu, start);
 			cpu.update_pc(start);
 			cpu.install_block_for_test(0, start, 0, &ops);
 			let ri = cpu.exec_block(0);
@@ -5655,6 +5681,9 @@ mod test_jit_equivalence {
 			let mut dram_i = vec![0u8; WIN as usize];
 			cpu.mmu.read_physical_range(DRAM_BASE, &mut dram_i);
 			assert_eq!(dram_i, dramw, "dram mismatch seed {}", seed);
+			for i in 0..32 {
+				assert_eq!(cpu.f[i].to_bits(), fw[i], "f{} mismatch seed {}", i, seed);
+			}
 			checked += 1;
 		}
 		assert!(checked > 300, "too few cases ran: {}", checked);
@@ -5670,12 +5699,12 @@ mod test_jit_equivalence {
 			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 8, rs1: 9, rs2: 0, len: 4, _pad: 0 },
 		];
 		let lay = jit::Layout {
-			x_base: XB, pc_addr: PCA, gen_addr: GENA,
+			x_base: XB, f_base: FB, pc_addr: PCA, gen_addr: GENA,
 			baked_gen: cpu.mmu.code_gen().wrapping_add(1), // stale on purpose
 			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
 		};
 		let bytes = jit::emit_block(&ops, DRAM_BASE, &lay).unwrap();
-		let (retired, _x, pc, _d) = run_wasm(&bytes, &cpu, DRAM_BASE);
+		let (retired, _x, pc, _d, _f) = run_wasm(&bytes, &cpu, DRAM_BASE);
 		// the store executes, the gen check fires after it: 2 retired,
 		// pc at the third op
 		assert_eq!(retired, 2);
