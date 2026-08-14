@@ -85,16 +85,34 @@ tags, write-snoop generation, SFENCE-immune — and adds a third tier:
     interpret once -> build predecoded block -> (hot) emit wasm, compile,
     dispatch via call_indirect until the page's generation dies -> drop
 
-A compiled block loads guest registers from the register file's fixed
-offset in linear memory, runs its ops as straight-line wasm (loads and
-stores inline the TLB fast path; a miss or trap bails back to the
-interpreter with pc exact, the same contract exec_block already keeps),
-and returns the retired-instruction count. Template-JIT literature and
-the shape of what is being removed (dispatch, operand re-loads, the
-per-op probe) both put the multiplier at 3–8× on hot code. That lands
-busy throughput in the 300–800 MIPS band: the desktop boot drops toward
-ten seconds, DOOM toward launch-speed, and a browser stops being a
-different category of software from everything else this machine runs.
+A compiled function loads guest registers from the register file's
+fixed offset in linear memory, runs its ops as wasm (loads and stores
+inline the TLB fast path; a miss or trap bails back to the interpreter
+with pc exact, the same contract exec_block already keeps), and returns
+the retired-instruction count.
+
+**Measured, not estimated** (`emu/examples/jit-proto.rs`: a hand-encoded
+emitter for the hot-op subset, run under wasmtime-the-crate natively,
+state-equivalence asserted on 199 randomized blocks before timing; a
+DOOM-shaped fixed-point loop, 12 ops/iteration, 3M iterations):
+
+    interpreter tier          275 MIPS
+    call-per-BLOCK compiled   258 MIPS   (0.94x — worthless)
+    call-per-REGION compiled 2254 MIPS   (8.2x)
+
+Two conclusions with teeth. First, block-granular dispatch cannot pay
+for the call boundary: the translator must form REGIONS — compile a
+loop's branches into internal `br_if`s so one call runs the whole loop.
+(The verb needs nothing extra for this; a region is just a bigger
+module.) Second, the top of the estimated band is real: compiled guest
+code with memory-resident registers runs at ~2.2 GIPS native on fleet-
+class hardware. The achievable end-to-end multiplier is then set by
+region coverage of the dynamic mix and the inlined TLB checks, which is
+exactly the app-side tiering work RISC Box owns. That lands busy
+throughput in the several-hundred-MIPS band conservatively: the desktop
+boot drops toward ten seconds, DOOM toward launch-speed, and a browser
+stops being a different category of software from everything else this
+machine runs.
 
 ## 4. Fallback
 

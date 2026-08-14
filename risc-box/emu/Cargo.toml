@@ -17,3 +17,9 @@ publish = false
 
 [dependencies]
 fnv = "1.0.7"
+
+# examples/jit-proto.rs only: executes runtime-emitted wasm natively to
+# measure the translator half of PLATFORM-JIT.md before the platform verb
+# exists. Never linked into the library or the shipped app.
+[dev-dependencies]
+wasmtime = { version = "24", default-features = false, features = ["cranelift", "runtime"] }
