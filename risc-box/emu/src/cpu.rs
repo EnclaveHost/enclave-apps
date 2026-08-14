@@ -1080,17 +1080,10 @@ impl Cpu {
 						} | // imm[31:6] <= [12]
 						((halfword >> 7) & 0x20) | // imm[5] <= [12]
 						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-						if r == 0 && imm == 0 {
-							// C.NOP
-							// addi x0, x0, 0
-							return 0x13;
-						} else if r != 0 {
-							// C.ADDI
-							// addi r, r, imm
-							return (imm << 20) | (r << 15) | (r << 7) | 0x13;
-						}
-						// @TODO: Support HINTs
-						// r == 0 and imm != 0 is HINTs
+						// C.ADDI (r=0,imm=0 is C.NOP; r=0,imm!=0 is a HINT -- hints
+						// execute as their expansion; x0 discards the write anyway)
+						// addi r, r, imm
+						return (imm << 20) | (r << 15) | (r << 7) | 0x13;
 					},
 					1 => {
 						// @TODO: Support C.JAL in 32-bit mode
@@ -1118,11 +1111,8 @@ impl Cpu {
 						} | // imm[31:6] <= [12]
 						((halfword >> 7) & 0x20) | // imm[5] <= [12]
 						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-						if r != 0 {
-							return (imm << 20) | (r << 7) | 0x13;
-						}
-						// @TODO: Support HINTs
-						// r == 0 is for HINTs
+						// r == 0 is a HINT; addi x0, x0, imm is a no-op, emit it anyway
+						return (imm << 20) | (r << 7) | 0x13;
 					},
 					3 => {
 						let r = (halfword >> 7) & 0x1f; // [11:7]
@@ -1143,7 +1133,7 @@ impl Cpu {
 							}
 							// imm == 0 is for reserved instruction
 						}
-						if r != 0 && r != 2 {
+						if r != 2 { // r == 0 is a HINT; lui x0 is a no-op
 							// C.LUI
 							// lui r, nzimm
 							let nzimm = match halfword & 0x1000 {
@@ -1288,7 +1278,7 @@ impl Cpu {
 						let imm1 =
 							(offset & 0x1e) | // imm1[4:1] <= [4:1]
 							((offset >> 11) & 0x1); // imm1[0] <= [11]
-						return (imm2 << 25) | ((r + 8) << 20) | (imm1 << 7) | 0x63;
+						return (imm2 << 25) | ((r + 8) << 15) | (imm1 << 7) | 0x63; // beq r+8, x0 (canonical operand order)
 					},
 					7 => {
 						// C.BNEZ
@@ -1310,7 +1300,7 @@ impl Cpu {
 						let imm1 =
 							(offset & 0x1e) | // imm1[4:1] <= [4:1]
 							((offset >> 11) & 0x1); // imm1[0] <= [11]
-						return (imm2 << 25) | ((r + 8) << 20) | (1 << 12) | (imm1 << 7) | 0x63;
+						return (imm2 << 25) | ((r + 8) << 15) | (1 << 12) | (imm1 << 7) | 0x63; // bne r+8, x0 (canonical operand order)
 					},
 					_ => {} // No happens
 				};
@@ -1324,10 +1314,8 @@ impl Cpu {
 						let shamt =
 							((halfword >> 7) & 0x20) | // imm[5] <= [12]
 							((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-						if r != 0 {
-							return (shamt << 20) | (r << 15) | (1 << 12) | (r << 7) | 0x13;
-						}
-						// r == 0 is reserved instruction?
+						// r == 0 (and shamt == 0) are HINTs; slli x0 is a no-op
+						return (shamt << 20) | (r << 15) | (1 << 12) | (r << 7) | 0x13;
 					},
 					1 => {
 						// C.FLDSP
@@ -1382,14 +1370,11 @@ impl Cpu {
 									return (rs1 << 15) | 0x67;
 								}
 								// rs1 == 0 is reserved instruction
-								if rs1 != 0 && rs2 != 0 {
-									// C.MV
-									// add rs1, x0, rs2
-									// println!("C.MV RS1:{:x} RS2:{:x}", rs1, rs2);
+								if rs2 != 0 {
+									// C.MV (rd == 0 is a HINT; add x0 is a no-op)
+									// add rd, x0, rs2
 									return (rs2 << 20) | (rs1 << 7) | 0x33;
 								}
-								// rs1 == 0 && rs2 != 0 is Hints
-								// @TODO: Support Hints
 							},
 							1 => {
 								if rs1 == 0 && rs2 == 0 {
@@ -1402,13 +1387,11 @@ impl Cpu {
 									// jalr x1, 0(rs1)
 									return (rs1 << 15) | (1 << 7) | 0x67;
 								}
-								if rs1 != 0 && rs2 != 0 {
-									// C.ADD
-									// add rs1, rs1, rs2
+								if rs2 != 0 {
+									// C.ADD (rd == 0 is a HINT; add x0 is a no-op)
+									// add rd, rd, rs2
 									return (rs2 << 20) | (rs1 << 15) | (rs1 << 7) | 0x33;
 								}
-								// rs1 == 0 && rs2 != 0 is Hists
-								// @TODO: Supports Hinsts
 							},
 							_ => {} // Not happens
 						};
@@ -4373,6 +4356,28 @@ mod test_cpu {
 
 		// No effect to PC
 		assert_eq!(DRAM_BASE, cpu.read_pc());
+	}
+}
+
+#[cfg(test)]
+mod test_dump_uncompress {
+	use super::*;
+	use terminal::DummyTerminal;
+
+	// Not an assertion: dumps every 16-bit halfword's uncompress() expansion so
+	// an external reference decoder can diff it (the C.FLDSP rd==0 bug class).
+	// Run with: cargo test dump_uncompress -- --ignored
+	#[test]
+	#[ignore]
+	fn dump_uncompress() {
+		let cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		let mut out = String::with_capacity(0x10000 * 14);
+		for hw in 0..0x10000u32 {
+			if hw & 0x3 == 0x3 { continue; } // not a compressed encoding
+			let w = cpu.uncompress(hw);
+			out.push_str(&format!("{:04x}\t{:08x}\n", hw, w));
+		}
+		std::fs::write("/tmp/uncompress-dump.tsv", out).unwrap();
 	}
 }
 
