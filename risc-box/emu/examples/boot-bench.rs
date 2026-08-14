@@ -199,8 +199,28 @@ fn main() {
         std::process::exit(2);
     }
 
-    let kernel = std::fs::read(&positional[0]).expect("read kernel");
-    let fs = std::fs::read(&positional[1]).expect("read rootfs");
+    // Exact-size, chunked reads. std::fs::read grows its buffer by doubling
+    // (a 640 MiB rootfs transiently holds ~1.3 GiB), and a single fd_read of
+    // the whole image makes the preview1 adapter materialize a host buffer
+    // that big, which an engine's store limiter rejects — either way the
+    // wasm build of this benchmark OOMed loading a desktop image. One
+    // exactly-sized buffer, filled 32 MiB per read, fits everywhere (the
+    // app's own S3 fetch sizes exactly for the same reason).
+    let read_exact_file = |path: &str| -> Vec<u8> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).expect("open image");
+        let len = f.metadata().expect("stat image").len() as usize;
+        let mut buf = vec![0u8; len];
+        let mut off = 0usize;
+        while off < len {
+            let end = (off + 32 * 1024 * 1024).min(len);
+            f.read_exact(&mut buf[off..end]).expect("read image");
+            off = end;
+        }
+        buf
+    };
+    let kernel = read_exact_file(&positional[0]);
+    let fs = read_exact_file(&positional[1]);
     eprintln!(
         "boot-bench: kernel {} bytes, rootfs {} bytes",
         kernel.len(),
