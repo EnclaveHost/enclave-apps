@@ -347,6 +347,19 @@ pub struct Cpu {
 	// heads[slot] tags a run of ops[slot*BLOCK_MAX ..][..count].
 	block_heads: Vec<BlockHead>,
 	block_ops: Vec<BlockOp>,
+	// risc-box patch (blockstats feature): per-slot execution/retired
+	// counters plus a histogram of retired-instructions bucketed by how many
+	// times the retiring block had executed when replaced — the coverage
+	// number PLATFORM-JIT.md needs (how much of the dynamic mix a region
+	// JIT could compile).
+	#[cfg(feature = "blockstats")]
+	stat_execs: Vec<u64>,
+	#[cfg(feature = "blockstats")]
+	stat_retired: Vec<u64>,
+	#[cfg(feature = "blockstats")]
+	stat_hist: [u64; 6], // buckets by exec count: 1-3,4-15,16-63,64-255,256-4095,4096+
+	#[cfg(feature = "blockstats")]
+	stat_singlestep: u64,
 	unsigned_data_mask: u64,
 	// risc-box patch: instructions retired since the last device service
 	// (blocks may overshoot a boundary by up to BLOCK_MAX-1; the true count
@@ -516,6 +529,14 @@ impl Cpu {
 			// risc-box patch: block cache starts empty (tag 0 = invalid)
 			block_heads: vec![BlockHead::EMPTY; BLOCK_SLOTS],
 			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
+			#[cfg(feature = "blockstats")]
+			stat_execs: vec![0; BLOCK_SLOTS],
+			#[cfg(feature = "blockstats")]
+			stat_retired: vec![0; BLOCK_SLOTS],
+			#[cfg(feature = "blockstats")]
+			stat_hist: [0; 6],
+			#[cfg(feature = "blockstats")]
+			stat_singlestep: 0,
 			unsigned_data_mask: 0xffffffffffffffff,
 			// risc-box patch: service devices after the first instruction, so
 			// a machine that traps immediately still sees its clint before
@@ -637,15 +658,29 @@ impl Cpu {
 							Err(_) => false
 						};
 					if hit {
-						done += self.exec_block(slot);
+						let r = self.exec_block(slot);
+						#[cfg(feature = "blockstats")]
+						{
+							self.stat_execs[slot] += 1;
+							self.stat_retired[slot] += r;
+						}
+						done += r;
 					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
-						done += self.exec_block(slot);
+						let r = self.exec_block(slot);
+						#[cfg(feature = "blockstats")]
+						{
+							self.stat_execs[slot] += 1;
+							self.stat_retired[slot] += r;
+						}
+						done += r;
 					} else {
 						let instruction_address = self.pc;
 						match self.tick_operate() {
 							Ok(()) => {},
 							Err(e) => self.handle_exception(e, instruction_address)
 						}
+						#[cfg(feature = "blockstats")]
+						{ self.stat_singlestep += 1; }
 						done += 1;
 					}
 				} else {
@@ -726,6 +761,44 @@ impl Cpu {
 		retired
 	}
 
+	#[cfg(feature = "blockstats")]
+	fn stat_flush_slot(&mut self, slot: usize) {
+		let e = self.stat_execs[slot];
+		let r = self.stat_retired[slot];
+		if e > 0 {
+			let b = match e {
+				1..=3 => 0,
+				4..=15 => 1,
+				16..=63 => 2,
+				64..=255 => 3,
+				256..=4095 => 4,
+				_ => 5
+			};
+			self.stat_hist[b] += r;
+			self.stat_execs[slot] = 0;
+			self.stat_retired[slot] = 0;
+		}
+	}
+
+	/// risc-box patch (blockstats): flush live slots and print the coverage
+	/// histogram: retired instructions bucketed by the block's execution
+	/// count, plus the single-step share.
+	#[cfg(feature = "blockstats")]
+	pub fn dump_block_stats(&mut self) {
+		for slot in 0..BLOCK_SLOTS {
+			self.stat_flush_slot(slot);
+		}
+		let total: u64 = self.stat_hist.iter().sum::<u64>() + self.stat_singlestep;
+		let names = ["execs 1-3", "execs 4-15", "execs 16-63", "execs 64-255", "execs 256-4095", "execs 4096+"];
+		eprintln!("block coverage (retired instructions by block hotness):");
+		for i in 0..6 {
+			eprintln!("  {:>15}: {:>12}  {:>5.1}%", names[i], self.stat_hist[i],
+				self.stat_hist[i] as f64 * 100.0 / total as f64);
+		}
+		eprintln!("  {:>15}: {:>12}  {:>5.1}%", "single-step", self.stat_singlestep,
+			self.stat_singlestep as f64 * 100.0 / total as f64);
+	}
+
 	/// risc-box patch: builds a block starting at the current pc into
 	/// `slot`. Returns false when no block can be built here (page-tail
 	/// start, fetch fault, executing outside DRAM, or an undecodable first
@@ -789,6 +862,8 @@ impl Cpu {
 		if count == 0 {
 			return false;
 		}
+		#[cfg(feature = "blockstats")]
+		self.stat_flush_slot(slot);
 		self.block_heads[slot] = BlockHead {
 			tag: start,
 			phys_page: p_start & !0xfff,

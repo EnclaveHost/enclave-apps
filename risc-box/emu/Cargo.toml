@@ -18,6 +18,12 @@ publish = false
 [dependencies]
 fnv = "1.0.7"
 
+[features]
+# jit-proto sizing aid: per-block execution counters + a coverage histogram
+# (what share of retired instructions ran in blocks hot enough to compile).
+# Costs a counter bump per block dispatch; never enabled in shipped builds.
+blockstats = []
+
 # examples/jit-proto.rs only: executes runtime-emitted wasm natively to
 # measure the translator half of PLATFORM-JIT.md before the platform verb
 # exists. Never linked into the library or the shipped app.

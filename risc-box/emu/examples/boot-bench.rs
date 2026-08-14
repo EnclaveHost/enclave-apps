@@ -540,6 +540,8 @@ fn main() {
         }
     }
 
+    #[cfg(feature = "blockstats")]
+    emu.dump_block_stats();
     let secs = start.elapsed().as_secs_f64();
     println!(
         "TOTAL {:.0}M instructions in {:.2}s = {:.1} MIPS",

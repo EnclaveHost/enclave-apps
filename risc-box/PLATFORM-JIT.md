@@ -107,6 +107,21 @@ direct-mapped TLB-hit sequence the interpreter's fast path uses (probe,
 compare, bail to the interpreter on miss), and the multiplier that
 survives is 5.6x.
 
+Coverage is measured too (`--features blockstats`, the Alpine desktop
+boot's first 4.8G instructions, retired instructions bucketed by how
+hot their block was):
+
+    execs 1-3        0.9%      execs 256-4095   13.4%
+    execs 4-15       1.3%      execs 4096+      79.2%
+    execs 16-63      2.2%      single-step       0.1%
+    execs 64-255     3.0%
+
+92.6% of the dynamic mix runs in blocks executed 256+ times — a
+compile-everything distribution (hot blocks are overwhelmingly loop
+bodies, the raw material of regions). 5.6x on 93% of the stream puts
+the end-to-end ceiling near 4.6x: the desktop boot in the 7-8 s band,
+and firefox's 20-minutes-and-counting startup at roughly four.
+
 Two conclusions with teeth. First, block-granular dispatch cannot pay
 for the call boundary: the translator must form REGIONS — compile a
 loop's branches into internal `br_if`s so one call runs the whole loop.

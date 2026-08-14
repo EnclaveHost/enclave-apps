@@ -159,6 +159,12 @@ impl Emulator {
 		self.cpu.run(n);
 	}
 
+	/// risc-box patch (blockstats feature): coverage histogram dump.
+	#[cfg(feature = "blockstats")]
+	pub fn dump_block_stats(&mut self) {
+		self.cpu.dump_block_stats();
+	}
+
 	/// Sets up program run by the program. This method analyzes the passed content
 	/// and configure CPU properly. If the passed contend doesn't seem ELF file,
 	/// it panics. This method is expected to be called only once.
