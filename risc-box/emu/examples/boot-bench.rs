@@ -77,6 +77,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut positional = Vec::new();
     let mut budget: u64 = 2_000_000_000;
+    let mut ram_mib: u64 = 0; // 0 = emulator default (512 MiB)
     let mut until: Option<String> = None;
     let mut echo = false;
     // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
@@ -100,6 +101,12 @@ fn main() {
             "--insns" => {
                 i += 1;
                 budget = args[i].replace('_', "").parse().expect("--insns takes a number");
+            }
+            "--ram-mib" => {
+                // guest DRAM size; the app wires the deployment's ramMiB the
+                // same way. The Alpine desktop runs the fleet at 1792.
+                i += 1;
+                ram_mib = args[i].parse().expect("--ram-mib takes MiB");
             }
             "--until" => {
                 i += 1;
@@ -212,6 +219,9 @@ fn main() {
             false => None,
         },
     }));
+    if ram_mib > 0 {
+        emu.setup_ram_bytes(ram_mib * 1024 * 1024);
+    }
     emu.setup_program(kernel);
     emu.setup_filesystem(fs);
 
