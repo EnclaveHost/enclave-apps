@@ -1109,3 +1109,226 @@ mod test_formation {
 		assert!(regions[0].contains(&0x5000), "hottest kept");
 	}
 }
+
+// ---- tier-2 dispatch ----------------------------------------------------
+
+/// What executes compiled regions. Production implements this over the
+/// platform codegen verb (compile -> table index; call_indirect; drop);
+/// tests implement it however they like. The dispatcher only assumes the
+/// contract shared with emit_region: run(fuel, entry_index) executes the
+/// region starting at its entry block, leaves guest pc exact, and returns
+/// instructions retired (possibly 0).
+pub trait CodegenBackend {
+	/// Compile a region module (bytes from emit_region). The entry-pc list
+	/// maps region block indices to guest pcs. Returns an opaque handle,
+	/// or None when compilation is unavailable/failed (the dispatcher then
+	/// blacklists the region and keeps interpreting).
+	fn compile(&mut self, module: &[u8], entry_pcs: &[u64]) -> Option<u32>;
+	/// Execute: fuel-bounded, entry by region block index.
+	fn call(&mut self, handle: u32, fuel: u64, entry: u32) -> u64;
+	fn drop_region(&mut self, handle: u32);
+}
+
+/// Dispatcher state: block heat, formed-region cache, blacklists.
+pub struct Tier2 {
+	pub backend: Box<dyn CodegenBackend>,
+	// per-pc heat since the last formation pass (pc -> retired)
+	heat: std::collections::HashMap<u64, u64>,
+	// observed block successions for formation
+	edges: std::collections::HashMap<(u64, u64), u64>,
+	prev_pc: u64,
+	// compiled: entry pc -> (handle, entry index, generation at compile)
+	compiled: std::collections::HashMap<u64, (u32, u32, u32)>,
+	// pcs that failed to form/compile: don't retry until the next epoch
+	blacklist: std::collections::HashSet<u64>,
+	// retire budget between formation passes
+	since_form: u64,
+	pub form_interval: u64,
+	pub max_blocks: usize,
+	pub min_heat: u64,
+}
+
+impl Tier2 {
+	pub fn new(backend: Box<dyn CodegenBackend>) -> Self {
+		Tier2 {
+			backend,
+			heat: std::collections::HashMap::new(),
+			edges: std::collections::HashMap::new(),
+			prev_pc: 0,
+			compiled: std::collections::HashMap::new(),
+			blacklist: std::collections::HashSet::new(),
+			since_form: 0,
+			form_interval: 50_000_000,
+			max_blocks: 64,
+			min_heat: 1_000_000,
+		}
+	}
+
+	/// Record one interpreted block execution (pc, retired).
+	pub fn note_block(&mut self, pc: u64, retired: u64) {
+		*self.heat.entry(pc).or_insert(0) += retired;
+		if self.prev_pc != 0 && self.edges.len() < 1_000_000 {
+			*self.edges.entry((self.prev_pc, pc)).or_insert(0) += 1;
+		}
+		self.prev_pc = pc;
+		self.since_form += retired;
+	}
+
+	/// The interpreter took a non-block path: break the edge chain.
+	pub fn note_break(&mut self) {
+		self.prev_pc = 0;
+	}
+
+	/// A compiled region for this pc, valid against the current write-snoop
+	/// generation? Returns (handle, entry index).
+	pub fn lookup(&mut self, pc: u64, current_gen: u32) -> Option<(u32, u32)> {
+		match self.compiled.get(&pc) {
+			Some(&(h, idx, gen)) if gen == current_gen => Some((h, idx)),
+			Some(&(h, _, _)) => {
+				// stale: drop every entry sharing the handle
+				self.backend.drop_region(h);
+				self.compiled.retain(|_, &mut (hh, _, _)| hh != h);
+				None
+			}
+			None => None,
+		}
+	}
+
+	/// Formation pass, driven by the caller once enough has retired. The
+	/// caller supplies a way to read a block's ops (from its cache) so the
+	/// region emitter sees exactly what the interpreter runs.
+	pub fn maybe_form<F>(&mut self, lay: &Layout, current_gen: u32, mut ops_of: F)
+	where
+		F: FnMut(u64) -> Option<(u64, Vec<BlockOp>)>,
+	{
+		if self.since_form < self.form_interval {
+			return;
+		}
+		self.since_form = 0;
+		let nodes: Vec<(u64, u64)> = self.heat.iter().map(|(&pc, &h)| (pc, h)).collect();
+		let edges: Vec<(u64, u64)> = self.edges.keys().cloned().collect();
+		for region_pcs in form_regions(&nodes, &edges, self.max_blocks, self.min_heat) {
+			if region_pcs.iter().any(|pc| {
+				self.compiled.contains_key(pc) || self.blacklist.contains(pc)
+			}) {
+				continue;
+			}
+			let mut blocks = Vec::new();
+			let mut ok = true;
+			for &pc in &region_pcs {
+				match ops_of(pc) {
+					Some(b) => blocks.push(b),
+					None => {
+						ok = false;
+						break;
+					}
+				}
+			}
+			if !ok {
+				for pc in region_pcs {
+					self.blacklist.insert(pc);
+				}
+				continue;
+			}
+			let entry_pcs: Vec<u64> = blocks.iter().map(|&(pc, _)| pc).collect();
+			match emit_region(&blocks, lay).and_then(|m| self.backend.compile(&m, &entry_pcs)) {
+				Some(handle) => {
+					for (idx, &pc) in entry_pcs.iter().enumerate() {
+						self.compiled.insert(pc, (handle, idx as u32, current_gen));
+					}
+				}
+				None => {
+					for pc in region_pcs {
+						self.blacklist.insert(pc);
+					}
+				}
+			}
+		}
+		// heat decays fully between passes; edges persist (bounded)
+		self.heat.clear();
+	}
+}
+
+#[cfg(test)]
+mod test_tier2 {
+	use super::*;
+
+	/// Mock backend: records compilations, "executes" by returning a fixed
+	/// retire count and moving a fake pc — enough to validate dispatch,
+	/// caching, staleness and blacklisting without wasm.
+	struct Mock {
+		compiled: Vec<Vec<u64>>,
+		dropped: Vec<u32>,
+		fail: bool,
+	}
+	impl CodegenBackend for Mock {
+		fn compile(&mut self, _m: &[u8], entry_pcs: &[u64]) -> Option<u32> {
+			if self.fail {
+				return None;
+			}
+			self.compiled.push(entry_pcs.to_vec());
+			Some(self.compiled.len() as u32 - 1)
+		}
+		fn call(&mut self, _h: u32, _fuel: u64, _entry: u32) -> u64 {
+			7
+		}
+		fn drop_region(&mut self, h: u32) {
+			self.dropped.push(h);
+		}
+	}
+
+	fn lay() -> Layout {
+		Layout {
+			x_base: 0, f_base: 512, tlb: None, pc_addr: 256, gen_addr: 264,
+			baked_gen: 1, dram_base: 4096, guest_dram_base: 0x8000_0000,
+			dram_len: 65536,
+		}
+	}
+
+	fn hot_loop(t2: &mut Tier2, a: u64, b: u64, times: u64) {
+		for _ in 0..times {
+			t2.note_block(a, 20);
+			t2.note_block(b, 10);
+		}
+	}
+
+	fn simple_ops(pc: u64) -> Option<(u64, Vec<BlockOp>)> {
+		Some((pc, vec![BlockOp {
+			imm: 1, word: 0, data: 0, kind: ::cpu::HOT_ADDI,
+			rd: 5, rs1: 5, rs2: 0, len: 4, _pad: 0,
+		}]))
+	}
+
+	#[test]
+	fn forms_compiles_caches_and_invalidates() {
+		let mut t2 = Tier2::new(Box::new(Mock { compiled: vec![], dropped: vec![], fail: false }));
+		t2.form_interval = 1000;
+		t2.min_heat = 100;
+		let (a, b) = (0x8000_1000u64, 0x8000_1010u64);
+		hot_loop(&mut t2, a, b, 100);
+		assert!(t2.lookup(a, 1).is_none(), "nothing compiled yet");
+		t2.maybe_form(&lay(), 1, simple_ops);
+		let got = t2.lookup(a, 1);
+		assert!(got.is_some(), "hot loop compiled");
+		assert!(t2.lookup(b, 1).is_some(), "both entries mapped");
+		// staleness: a new generation drops the region
+		assert!(t2.lookup(a, 2).is_none(), "stale generation invalidates");
+		assert!(t2.lookup(b, 2).is_none(), "shared handle fully dropped");
+	}
+
+	#[test]
+	fn failed_compile_blacklists() {
+		let mut t2 = Tier2::new(Box::new(Mock { compiled: vec![], dropped: vec![], fail: true }));
+		t2.form_interval = 1000;
+		t2.min_heat = 100;
+		let (a, b) = (0x8000_2000u64, 0x8000_2010u64);
+		hot_loop(&mut t2, a, b, 100);
+		t2.maybe_form(&lay(), 1, simple_ops);
+		assert!(t2.lookup(a, 1).is_none());
+		assert!(t2.blacklist.contains(&a) && t2.blacklist.contains(&b));
+		// and it doesn't retry compilation next pass
+		hot_loop(&mut t2, a, b, 100);
+		t2.maybe_form(&lay(), 1, simple_ops);
+		assert!(t2.lookup(a, 1).is_none());
+	}
+}

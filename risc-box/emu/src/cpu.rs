@@ -102,7 +102,7 @@ pub(crate) struct BlockOp {
 	pub(crate) rs1: u8,
 	pub(crate) rs2: u8,
 	pub(crate) len: u8, // 2 or 4
-	_pad: u8
+	pub(crate) _pad: u8
 }
 
 impl BlockOp {
