@@ -74,84 +74,114 @@ pub const MIP_SEIP: u64 = 0x200;
 const MIP_STIP: u64 = 0x020;
 const MIP_SSIP: u64 = 0x002;
 
-// risc-box patch: one predecoded-instruction cache entry. 32 bytes so a
-// probe touches exactly one cache line. `kind` selects an inline hot-op
-// implementation in exec_hot (0 = none: dispatch through INSTRUCTIONS).
+// risc-box patch: superblock ("trace") cache. A block is a run of
+// predecoded instructions starting at a virtual pc, built lazily on first
+// execution and executed from a single probe: one tag+meta compare covers
+// every instruction in the run, where the per-instruction cache paid a
+// probe per retired instruction. Invariants that keep this exactly
+// equivalent to single-stepping:
+// - a block holds hot-set ops (kind != 0) with at most ONE non-hot op,
+//   always LAST — so an instruction that can arm the interrupt check,
+//   change translation state, or park the hart ends its block, and the
+//   run loop observes the effect at the same boundary single-stepping
+//   would;
+// - every op lives in the block's first (only) page, fill-eligible like
+//   the old per-instruction cache (offset <= 0xff8), and the page is
+//   marked for the SMC write snoop; hot stores re-check the meta after
+//   executing so a block writing over ITSELF stops before running stale
+//   ops (the write-then-execute gate in bench.py);
+// - a trap or taken branch exits the block with pc exact; JAL/JALR are
+//   terminal at build time so slots aren't wasted on unreachable tails.
 #[derive(Clone, Copy)]
-struct ICacheEntry {
-	tag: u64,
-	meta: u64,
-	word: u32,
+struct BlockOp {
 	imm: i32,
-	data: u16,
+	word: u32,
+	data: u16, // INSTRUCTIONS index | ICACHE_LEN4
 	kind: u8,
 	rd: u8,
 	rs1: u8,
 	rs2: u8,
-	_pad: u16
+	len: u8, // 2 or 4
+	_pad: u8
 }
 
-impl ICacheEntry {
-	const EMPTY: ICacheEntry = ICacheEntry {
-		tag: 0, meta: 0, word: 0, imm: 0, data: 0,
-		kind: 0, rd: 0, rs1: 0, rs2: 0, _pad: 0
+impl BlockOp {
+	const EMPTY: BlockOp = BlockOp {
+		imm: 0, word: 0, data: 0, kind: 0, rd: 0, rs1: 0, rs2: 0, len: 0, _pad: 0
 	};
 }
 
-// risc-box patch: hot-op ids for ICacheEntry.kind. The set is the integer
+#[derive(Clone, Copy)]
+struct BlockHead {
+	tag: u64, // start pc (0 = never valid: DRAM starts at 0x80000000)
+	meta: u64, // mmu.exec_meta() at build time
+	count: u32,
+	_pad: u32
+}
+
+impl BlockHead {
+	const EMPTY: BlockHead = BlockHead { tag: 0, meta: 0, count: 0, _pad: 0 };
+}
+
+const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1)
+const BLOCK_MAX: usize = 16; // ops per block
+
+// risc-box patch: hot-op ids. SB/SH/SW/SD are 1..=4 so "is this a store"
+// — the ops that need the in-block SMC meta re-check — is one range
+// compare. The set is the integer
 // instructions that dominate any Linux dynamic mix; everything else keeps
 // the INSTRUCTIONS-table path. Each exec_hot arm is a verbatim copy of the
 // table closure with the parse_format_* call replaced by the entry fields.
-const HOT_ADDI: u8 = 1;
-const HOT_ADD: u8 = 2;
-const HOT_LD: u8 = 3;
+const HOT_ADDI: u8 = 5;
+const HOT_ADD: u8 = 6;
+const HOT_LD: u8 = 7;
 const HOT_SD: u8 = 4;
-const HOT_LW: u8 = 5;
-const HOT_SW: u8 = 6;
-const HOT_BEQ: u8 = 7;
-const HOT_BNE: u8 = 8;
-const HOT_BLT: u8 = 9;
-const HOT_BGE: u8 = 10;
-const HOT_BLTU: u8 = 11;
-const HOT_BGEU: u8 = 12;
-const HOT_LUI: u8 = 13;
-const HOT_AUIPC: u8 = 14;
-const HOT_JAL: u8 = 15;
-const HOT_JALR: u8 = 16;
-const HOT_ANDI: u8 = 17;
-const HOT_ORI: u8 = 18;
-const HOT_XORI: u8 = 19;
-const HOT_AND: u8 = 20;
-const HOT_OR: u8 = 21;
-const HOT_XOR: u8 = 22;
-const HOT_SUB: u8 = 23;
-const HOT_SLLI: u8 = 24;
-const HOT_SRLI: u8 = 25;
-const HOT_SRAI: u8 = 26;
-const HOT_ADDIW: u8 = 27;
-const HOT_ADDW: u8 = 28;
-const HOT_SUBW: u8 = 29;
-const HOT_SLLIW: u8 = 30;
-const HOT_SRLIW: u8 = 31;
-const HOT_SRAIW: u8 = 32;
-const HOT_SLLW: u8 = 33;
-const HOT_SRLW: u8 = 34;
-const HOT_SRAW: u8 = 35;
-const HOT_SLL: u8 = 36;
-const HOT_SRL: u8 = 37;
-const HOT_SRA: u8 = 38;
-const HOT_SLT: u8 = 39;
-const HOT_SLTI: u8 = 40;
-const HOT_SLTU: u8 = 41;
-const HOT_SLTIU: u8 = 42;
-const HOT_MUL: u8 = 43;
-const HOT_LB: u8 = 44;
-const HOT_LBU: u8 = 45;
-const HOT_LH: u8 = 46;
-const HOT_LHU: u8 = 47;
-const HOT_LWU: u8 = 48;
-const HOT_SB: u8 = 49;
-const HOT_SH: u8 = 50;
+const HOT_LW: u8 = 8;
+const HOT_SW: u8 = 3;
+const HOT_BEQ: u8 = 9;
+const HOT_BNE: u8 = 10;
+const HOT_BLT: u8 = 11;
+const HOT_BGE: u8 = 12;
+const HOT_BLTU: u8 = 13;
+const HOT_BGEU: u8 = 14;
+const HOT_LUI: u8 = 15;
+const HOT_AUIPC: u8 = 16;
+const HOT_JAL: u8 = 17;
+const HOT_JALR: u8 = 18;
+const HOT_ANDI: u8 = 19;
+const HOT_ORI: u8 = 20;
+const HOT_XORI: u8 = 21;
+const HOT_AND: u8 = 22;
+const HOT_OR: u8 = 23;
+const HOT_XOR: u8 = 24;
+const HOT_SUB: u8 = 25;
+const HOT_SLLI: u8 = 26;
+const HOT_SRLI: u8 = 27;
+const HOT_SRAI: u8 = 28;
+const HOT_ADDIW: u8 = 29;
+const HOT_ADDW: u8 = 30;
+const HOT_SUBW: u8 = 31;
+const HOT_SLLIW: u8 = 32;
+const HOT_SRLIW: u8 = 33;
+const HOT_SRAIW: u8 = 34;
+const HOT_SLLW: u8 = 35;
+const HOT_SRLW: u8 = 36;
+const HOT_SRAW: u8 = 37;
+const HOT_SLL: u8 = 38;
+const HOT_SRL: u8 = 39;
+const HOT_SRA: u8 = 40;
+const HOT_SLT: u8 = 41;
+const HOT_SLTI: u8 = 42;
+const HOT_SLTU: u8 = 43;
+const HOT_SLTIU: u8 = 44;
+const HOT_MUL: u8 = 45;
+const HOT_LB: u8 = 46;
+const HOT_LBU: u8 = 47;
+const HOT_LH: u8 = 48;
+const HOT_LHU: u8 = 49;
+const HOT_LWU: u8 = 50;
+const HOT_SB: u8 = 1;
+const HOT_SH: u8 = 2;
 
 // risc-box patch: fill-time classification for the predecode cache. Keyed
 // by the NAME of the INSTRUCTIONS entry the decode already matched — the
@@ -275,22 +305,16 @@ pub struct Cpu {
 	is_reservation_set: bool,
 	_dump_flag: bool,
 	decode_cache: DecodeCache,
-	// risc-box patch: predecoded instruction cache, direct-mapped by virtual
-	// PC (see tick_operate). One 32-byte entry per slot (a single cache line
-	// touched per probe; the previous four parallel arrays touched four).
-	// tag = pc, meta = mmu.exec_meta() at fill time (0 = invalid), word =
-	// the uncompressed instruction word, data = INSTRUCTIONS index |
-	// ICACHE_LEN4 for 4-byte instructions. kind/rd/rs1/rs2/imm are the
-	// fill-time pre-decode for the hot integer subset (see classify_hot):
-	// kind 0 falls back to the INSTRUCTIONS table, anything else executes
-	// inline in exec_hot without re-extracting operand bitfields.
-	icache: Vec<ICacheEntry>,
+	// risc-box patch: superblock cache (see BlockOp/BlockHead above).
+	// heads[slot] tags a run of ops[slot*BLOCK_MAX ..][..count].
+	block_heads: Vec<BlockHead>,
+	block_ops: Vec<BlockOp>,
 	unsigned_data_mask: u64,
-	// risc-box patch: instructions left before the next device service, and
-	// whether an interrupt check is owed before the next instruction (see
-	// tick). Set DEVICE_TICK_INTERVAL to 1 to get the original per-instruction
-	// behaviour back for a bisect.
-	device_countdown: u64,
+	// risc-box patch: instructions retired since the last device service
+	// (blocks may overshoot a boundary by up to BLOCK_MAX-1; the true count
+	// is what device clocks advance by), and whether an interrupt check is
+	// owed before the next instruction (see run).
+	since_service: u64,
 	check_interrupt: bool
 }
 
@@ -451,12 +475,14 @@ impl Cpu {
 			is_reservation_set: false,
 			_dump_flag: false,
 			decode_cache: DecodeCache::new(),
-			// risc-box patch: predecode cache starts empty (meta 0 = invalid)
-			icache: vec![ICacheEntry::EMPTY; ICACHE_ENTRY_NUM],
+			// risc-box patch: block cache starts empty (tag 0 = invalid)
+			block_heads: vec![BlockHead::EMPTY; BLOCK_SLOTS],
+			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
 			unsigned_data_mask: 0xffffffffffffffff,
-			// risc-box patch: service devices on the first tick, so a machine
-			// that traps immediately still sees its clint before running far.
-			device_countdown: 1,
+			// risc-box patch: service devices after the first instruction, so
+			// a machine that traps immediately still sees its clint before
+			// running far.
+			since_service: DEVICE_TICK_INTERVAL - 1,
 			check_interrupt: true
 		};
 		cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
@@ -538,13 +564,18 @@ impl Cpu {
 	///   CSR_TIME) instead of being written every tick.
 	pub fn run(&mut self, n: u64) {
 		let mut remaining = n;
+		// Superblocks retire several instructions per dispatch, so a call
+		// stepping fewer instructions than a block might hold has to stay on
+		// the single-instruction path — tick()/run(1) keeps exact stepping
+		// for the tests and boot-bench's tracer.
+		let allow_blocks = n >= BLOCK_MAX as u64;
 		while remaining > 0 {
-			// device_countdown is always >= 1 here (constructor starts it at
-			// 1; the service block below refills it), so every burst makes
-			// progress.
-			let burst = match remaining < self.device_countdown {
+			// since_service < DEVICE_TICK_INTERVAL here (the service block
+			// below resets it), so every burst makes progress.
+			let until_service = DEVICE_TICK_INTERVAL - self.since_service;
+			let burst = match remaining < until_service {
 				true => remaining,
-				false => self.device_countdown
+				false => until_service
 			};
 			let mut done: u64 = 0;
 			if self.wfi {
@@ -558,15 +589,34 @@ impl Cpu {
 				}
 			}
 			while done < burst {
-				let instruction_address = self.pc;
-				match self.tick_operate() {
-					Ok(()) => {},
-					Err(e) => self.handle_exception(e, instruction_address)
+				if allow_blocks {
+					let slot = ((self.pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+					let h = self.block_heads[slot];
+					if h.tag == self.pc && h.meta == self.mmu.exec_meta() {
+						done += self.exec_block(slot);
+					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
+						done += self.exec_block(slot);
+					} else {
+						let instruction_address = self.pc;
+						match self.tick_operate() {
+							Ok(()) => {},
+							Err(e) => self.handle_exception(e, instruction_address)
+						}
+						done += 1;
+					}
+				} else {
+					let instruction_address = self.pc;
+					match self.tick_operate() {
+						Ok(()) => {},
+						Err(e) => self.handle_exception(e, instruction_address)
+					}
+					done += 1;
 				}
-				done += 1;
 				// Delivery stays where the old tick() had it — after the
-				// retired instruction — so a CSR write that enables a
-				// pending interrupt takes effect at exactly the old boundary.
+				// retired instruction that armed it. Nothing inside a block
+				// can arm the check (CSR writes are terminal ops), so the
+				// boundary a block ends on is the same one single-stepping
+				// would deliver at.
 				if self.check_interrupt {
 					self.check_interrupt = false;
 					self.handle_interrupt(self.pc);
@@ -577,19 +627,131 @@ impl Cpu {
 					break;
 				}
 			}
-			self.device_countdown -= done;
+			self.since_service += done;
 			self.clock = self.clock.wrapping_add(done);
-			remaining -= done;
+			remaining = remaining.saturating_sub(done);
 			// Device-service boundary, at the same stream position as the
 			// old per-tick countdown: the end of the interval's last
-			// instruction, delivery attempted in the same step.
-			if self.device_countdown == 0 {
-				self.device_countdown = DEVICE_TICK_INTERVAL;
-				self.mmu.tick(DEVICE_TICK_INTERVAL, &mut self.csr[CSR_MIP_ADDRESS as usize]);
+			// instruction, delivery attempted in the same step. Blocks may
+			// overshoot the boundary by up to BLOCK_MAX-1 instructions; the
+			// device clocks advance by the true retired count either way,
+			// so guest time stays tied to instructions retired.
+			if self.since_service >= DEVICE_TICK_INTERVAL {
+				let served = self.since_service;
+				self.since_service = 0;
+				self.mmu.tick(served, &mut self.csr[CSR_MIP_ADDRESS as usize]);
 				self.check_interrupt = false;
 				self.handle_interrupt(self.pc);
 			}
 		}
+	}
+
+	/// risc-box patch: executes the block at `slot` (probe already matched).
+	/// Returns instructions retired (>= 1). Exits early — with pc exact —
+	/// on a trap, a taken branch/jump, or a hot store that invalidated the
+	/// block's own meta (self-modifying code).
+	fn exec_block(&mut self, slot: usize) -> u64 {
+		let head = self.block_heads[slot];
+		let base = slot * BLOCK_MAX;
+		let count = head.count as usize;
+		let mut retired: u64 = 0;
+		for i in 0..count {
+			let op = self.block_ops[base + i];
+			let address = self.pc;
+			let next = address.wrapping_add(op.len as u64);
+			self.pc = next;
+			let result = self.exec_op(&op, address);
+			self.x[0] = 0; // hardwired zero
+			retired += 1;
+			match result {
+				Ok(()) => {},
+				Err(e) => {
+					self.handle_exception(e, address);
+					return retired;
+				}
+			}
+			if self.pc != next {
+				return retired; // taken branch/jump left the block
+			}
+			// hot stores (kind 1..=4) can overwrite this very block; the
+			// write snoop bumps the code generation, which this meta embeds
+			if op.kind <= HOT_SD && self.mmu.exec_meta() != head.meta {
+				return retired;
+			}
+		}
+		retired
+	}
+
+	/// risc-box patch: builds a block starting at the current pc into
+	/// `slot`. Returns false when no block can be built here (page-tail
+	/// start, fetch fault, executing outside DRAM, or an undecodable first
+	/// word) — the caller falls back to single-stepping.
+	fn build_block(&mut self, slot: usize) -> bool {
+		let start = self.pc;
+		let p_start = match self.mmu.translate_fetch(start) {
+			Ok(p) => p,
+			Err(_) => return false
+		};
+		if !self.mmu.mark_exec_page(p_start) {
+			return false;
+		}
+		let base = slot * BLOCK_MAX;
+		let mut pc = start;
+		let mut count = 0usize;
+		while count < BLOCK_MAX && (pc & 0xfff) <= 0xff8 {
+			// same page as start, so the frame is the translation we already
+			// have — no per-op walk
+			let p = (p_start & !0xfff) | (pc & 0xfff);
+			let original_word = self.mmu.load_word_raw(p);
+			let (word, len) = match (original_word & 0x3) == 0x3 {
+				true => (original_word, 4u8),
+				false => (self.uncompress(original_word & 0xffff), 2u8)
+			};
+			let index = match self.decode_cache.get(word) {
+				Some(index) => index,
+				None => match self.decode_and_get_instruction_index(word) {
+					Ok(index) => {
+						self.decode_cache.insert(word, index);
+						index
+					},
+					// Undecodable: stop the block before it so the illegal
+					// instruction raises through the ordinary path with its
+					// pc exact.
+					Err(()) => break
+				}
+			};
+			let (kind, rd, rs1, rs2, imm) = classify_hot(INSTRUCTIONS[index].name, word);
+			self.block_ops[base + count] = BlockOp {
+				imm: imm,
+				word: word,
+				data: index as u16
+					| (match len { 4 => ICACHE_LEN4, _ => 0 }),
+				kind: kind,
+				rd: rd,
+				rs1: rs1,
+				rs2: rs2,
+				len: len,
+				_pad: 0
+			};
+			count += 1;
+			pc = pc.wrapping_add(len as u64);
+			// Terminal ops: a non-hot instruction may change interrupt or
+			// translation state (it must stay the block's last op), and
+			// JAL/JALR always leave, so anything after them is unreachable.
+			if kind == 0 || kind == HOT_JAL || kind == HOT_JALR {
+				break;
+			}
+		}
+		if count == 0 {
+			return false;
+		}
+		self.block_heads[slot] = BlockHead {
+			tag: start,
+			meta: self.mmu.exec_meta(),
+			count: count as u32,
+			_pad: 0
+		};
+		true
 	}
 
 	// @TODO: Rename?
@@ -602,31 +764,9 @@ impl Cpu {
 			return Ok(());
 		}
 
-		// risc-box patch: predecoded-instruction fast path. One tag compare
-		// replaces fetch translation, memory read, uncompress, and decode.
-		// The meta embeds every input the cached result depends on: the
-		// TLB generation and CPU translation state, and the code
-		// generation (bumped when a marked executable page is written).
-		let slot = ((self.pc >> 1) as usize) & (ICACHE_ENTRY_NUM - 1);
-		let e = self.icache[slot];
-		if e.tag == self.pc && e.meta == self.mmu.exec_meta() {
-			let instruction_address = self.pc;
-			self.pc = self.pc.wrapping_add(match e.data & ICACHE_LEN4 {
-				0 => 2,
-				_ => 4
-			});
-			// kind != 0: the operands were pre-extracted at fill time and
-			// the operation runs inline — no indirect call, no per-execution
-			// bitfield parsing. kind 0 dispatches through the table as ever.
-			let result = match e.kind {
-				0 => (INSTRUCTIONS[(e.data & !ICACHE_LEN4) as usize].operation)(
-					self, e.word, instruction_address),
-				_ => self.exec_hot(&e, instruction_address)
-			};
-			self.x[0] = 0; // hardwired zero
-			return result;
-		}
-
+		// risc-box patch: the predecoded fast path lives in run()'s block
+		// cache now; this is the exact single-step used by tick()/run(1),
+		// page-tail pcs and block-build failures.
 		let original_word = match self.fetch() {
 			Ok(word) => word,
 			Err(e) => return Err(e)
@@ -667,34 +807,6 @@ impl Cpu {
 			}
 		};
 
-		// risc-box patch: fill the predecode cache when the instruction sits
-		// safely inside one DRAM page, so a single page mark covers every
-		// byte the cached entry was built from.
-		if (instruction_address & 0xfff) <= 0xff8 {
-			if let Ok(p_address) = self.mmu.translate_fetch(instruction_address) {
-				if self.mmu.mark_exec_page(p_address) {
-					let (kind, rd, rs1, rs2, imm) =
-						classify_hot(INSTRUCTIONS[index].name, word);
-					self.icache[slot] = ICacheEntry {
-						tag: instruction_address,
-						meta: self.mmu.exec_meta(),
-						word: word,
-						imm: imm,
-						data: index as u16
-							| (match (original_word & 0x3) == 0x3 {
-								true => ICACHE_LEN4,
-								false => 0
-							}),
-						kind: kind,
-						rd: rd,
-						rs1: rs1,
-						rs2: rs2,
-						_pad: 0
-					};
-				}
-			}
-		}
-
 		let result = (INSTRUCTIONS[index].operation)(self, word, instruction_address);
 		self.x[0] = 0; // hardwired zero
 		result
@@ -702,13 +814,14 @@ impl Cpu {
 
 	// risc-box patch: inline execution of the predecoded hot set. Every arm
 	// is the corresponding INSTRUCTIONS closure body verbatim, with the
-	// parse_format_* call replaced by the entry's fill-time fields (shift
+	// parse_format_* call replaced by the op's build-time fields (shift
 	// amounts still come from the word so the xlen-dependent masks run
 	// exactly as upstream wrote them). Keeping the bodies identical is the
 	// correctness argument: this is the same code, minus re-parsing and an
-	// indirect call.
+	// indirect call. kind 0 (the block's terminal non-hot op) dispatches
+	// through the table.
 	#[inline(always)]
-	fn exec_hot(&mut self, e: &ICacheEntry, address: u64) -> Result<(), Trap> {
+	fn exec_op(&mut self, e: &BlockOp, address: u64) -> Result<(), Trap> {
 		let rd = e.rd as usize;
 		let rs1 = e.rs1 as usize;
 		let rs2 = e.rs2 as usize;
@@ -4463,16 +4576,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 /// and host hardware CPU cache memory miss.
 const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // risc-box patch: was 0x1000
 
-// risc-box patch: predecoded instruction cache geometry. Slots are indexed by
-// pc >> 1 (compressed instructions are 2-byte aligned), so the cache covers
-// a 32 KiB direct-mapped code window.
-// risc-box patch: 128k slots. Direct-mapped by (pc >> 1), so the table
-// covers 256 KiB of distinct code addresses before aliasing; at the old
-// 0x4000 (32 KiB of coverage) the kernel and userspace thrashed each
-// other's entries on every syscall and the fill path (two translations,
-// uncompress, decode, classify) showed up at ~5% of the interpreter.
-// 128k x 32-byte entries = 4 MiB, noise next to the guest's DRAM.
-const ICACHE_ENTRY_NUM: usize = 0x20000;
+// risc-box patch: marks a 4-byte (non-compressed) instruction in the
+// INSTRUCTIONS-index field of a predecoded BlockOp.
 const ICACHE_LEN4: u16 = 0x8000;
 
 // risc-box patch: tag layout for the direct-mapped cache below — the decoded
