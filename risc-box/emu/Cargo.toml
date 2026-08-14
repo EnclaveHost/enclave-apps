@@ -23,6 +23,8 @@ fnv = "1.0.7"
 # (what share of retired instructions ran in blocks hot enough to compile).
 # Costs a counter bump per block dispatch; never enabled in shipped builds.
 blockstats = []
+# the PLATFORM-JIT.md translator (src/jit.rs); equivalence tests in cpu.rs
+jit = []
 
 # examples/jit-proto.rs only: executes runtime-emitted wasm natively to
 # measure the translator half of PLATFORM-JIT.md before the platform verb

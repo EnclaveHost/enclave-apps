@@ -93,20 +93,20 @@ const MIP_SSIP: u64 = 0x002;
 // - a trap or taken branch exits the block with pc exact; JAL/JALR are
 //   terminal at build time so slots aren't wasted on unreachable tails.
 #[derive(Clone, Copy)]
-struct BlockOp {
-	imm: i32,
-	word: u32,
-	data: u16, // INSTRUCTIONS index | ICACHE_LEN4
-	kind: u8,
-	rd: u8,
-	rs1: u8,
-	rs2: u8,
-	len: u8, // 2 or 4
+pub(crate) struct BlockOp {
+	pub(crate) imm: i32,
+	pub(crate) word: u32,
+	pub(crate) data: u16, // INSTRUCTIONS index | ICACHE_LEN4
+	pub(crate) kind: u8,
+	pub(crate) rd: u8,
+	pub(crate) rs1: u8,
+	pub(crate) rs2: u8,
+	pub(crate) len: u8, // 2 or 4
 	_pad: u8
 }
 
 impl BlockOp {
-	const EMPTY: BlockOp = BlockOp {
+	pub(crate) const EMPTY: BlockOp = BlockOp {
 		imm: 0, word: 0, data: 0, kind: 0, rd: 0, rs1: 0, rs2: 0, len: 0, _pad: 0
 	};
 }
@@ -144,70 +144,70 @@ const BLOCK_MAX: usize = 32; // ops per block
 // instructions that dominate any Linux dynamic mix; everything else keeps
 // the INSTRUCTIONS-table path. Each exec_hot arm is a verbatim copy of the
 // table closure with the parse_format_* call replaced by the entry fields.
-const HOT_ADDI: u8 = 7;
-const HOT_ADD: u8 = 8;
-const HOT_LD: u8 = 9;
-const HOT_SD: u8 = 4;
-const HOT_LW: u8 = 10;
-const HOT_SW: u8 = 3;
-const HOT_BEQ: u8 = 11;
-const HOT_BNE: u8 = 12;
-const HOT_BLT: u8 = 13;
-const HOT_BGE: u8 = 14;
-const HOT_BLTU: u8 = 15;
-const HOT_BGEU: u8 = 16;
-const HOT_LUI: u8 = 17;
-const HOT_AUIPC: u8 = 18;
-const HOT_JAL: u8 = 19;
-const HOT_JALR: u8 = 20;
-const HOT_ANDI: u8 = 21;
-const HOT_ORI: u8 = 22;
-const HOT_XORI: u8 = 23;
-const HOT_AND: u8 = 24;
-const HOT_OR: u8 = 25;
-const HOT_XOR: u8 = 26;
-const HOT_SUB: u8 = 27;
-const HOT_SLLI: u8 = 28;
-const HOT_SRLI: u8 = 29;
-const HOT_SRAI: u8 = 30;
-const HOT_ADDIW: u8 = 31;
-const HOT_ADDW: u8 = 32;
-const HOT_SUBW: u8 = 33;
-const HOT_SLLIW: u8 = 34;
-const HOT_SRLIW: u8 = 35;
-const HOT_SRAIW: u8 = 36;
-const HOT_SLLW: u8 = 37;
-const HOT_SRLW: u8 = 38;
-const HOT_SRAW: u8 = 39;
-const HOT_SLL: u8 = 40;
-const HOT_SRL: u8 = 41;
-const HOT_SRA: u8 = 42;
-const HOT_SLT: u8 = 43;
-const HOT_SLTI: u8 = 44;
-const HOT_SLTU: u8 = 45;
-const HOT_SLTIU: u8 = 46;
-const HOT_MUL: u8 = 47;
-const HOT_LB: u8 = 48;
-const HOT_LBU: u8 = 49;
-const HOT_LH: u8 = 50;
-const HOT_LHU: u8 = 51;
-const HOT_LWU: u8 = 52;
-const HOT_FSW: u8 = 5;
-const HOT_FSD: u8 = 6;
+pub(crate) const HOT_ADDI: u8 = 7;
+pub(crate) const HOT_ADD: u8 = 8;
+pub(crate) const HOT_LD: u8 = 9;
+pub(crate) const HOT_SD: u8 = 4;
+pub(crate) const HOT_LW: u8 = 10;
+pub(crate) const HOT_SW: u8 = 3;
+pub(crate) const HOT_BEQ: u8 = 11;
+pub(crate) const HOT_BNE: u8 = 12;
+pub(crate) const HOT_BLT: u8 = 13;
+pub(crate) const HOT_BGE: u8 = 14;
+pub(crate) const HOT_BLTU: u8 = 15;
+pub(crate) const HOT_BGEU: u8 = 16;
+pub(crate) const HOT_LUI: u8 = 17;
+pub(crate) const HOT_AUIPC: u8 = 18;
+pub(crate) const HOT_JAL: u8 = 19;
+pub(crate) const HOT_JALR: u8 = 20;
+pub(crate) const HOT_ANDI: u8 = 21;
+pub(crate) const HOT_ORI: u8 = 22;
+pub(crate) const HOT_XORI: u8 = 23;
+pub(crate) const HOT_AND: u8 = 24;
+pub(crate) const HOT_OR: u8 = 25;
+pub(crate) const HOT_XOR: u8 = 26;
+pub(crate) const HOT_SUB: u8 = 27;
+pub(crate) const HOT_SLLI: u8 = 28;
+pub(crate) const HOT_SRLI: u8 = 29;
+pub(crate) const HOT_SRAI: u8 = 30;
+pub(crate) const HOT_ADDIW: u8 = 31;
+pub(crate) const HOT_ADDW: u8 = 32;
+pub(crate) const HOT_SUBW: u8 = 33;
+pub(crate) const HOT_SLLIW: u8 = 34;
+pub(crate) const HOT_SRLIW: u8 = 35;
+pub(crate) const HOT_SRAIW: u8 = 36;
+pub(crate) const HOT_SLLW: u8 = 37;
+pub(crate) const HOT_SRLW: u8 = 38;
+pub(crate) const HOT_SRAW: u8 = 39;
+pub(crate) const HOT_SLL: u8 = 40;
+pub(crate) const HOT_SRL: u8 = 41;
+pub(crate) const HOT_SRA: u8 = 42;
+pub(crate) const HOT_SLT: u8 = 43;
+pub(crate) const HOT_SLTI: u8 = 44;
+pub(crate) const HOT_SLTU: u8 = 45;
+pub(crate) const HOT_SLTIU: u8 = 46;
+pub(crate) const HOT_MUL: u8 = 47;
+pub(crate) const HOT_LB: u8 = 48;
+pub(crate) const HOT_LBU: u8 = 49;
+pub(crate) const HOT_LH: u8 = 50;
+pub(crate) const HOT_LHU: u8 = 51;
+pub(crate) const HOT_LWU: u8 = 52;
+pub(crate) const HOT_FSW: u8 = 5;
+pub(crate) const HOT_FSD: u8 = 6;
 // stores are 1..=HOT_STORE_MAX so the in-block SMC re-check is one compare
-const HOT_STORE_MAX: u8 = 6;
-const HOT_FLD: u8 = 53;
-const HOT_FLW: u8 = 54;
-const HOT_FADD_D: u8 = 55;
-const HOT_FSUB_D: u8 = 56;
-const HOT_FMUL_D: u8 = 57;
-const HOT_FDIV_D: u8 = 58;
-const HOT_FSGNJ_D: u8 = 59;
-const HOT_FMV_X_D: u8 = 60;
-const HOT_FMV_D_X: u8 = 61;
-const HOT_FCVT_D_W: u8 = 62;
-const HOT_SB: u8 = 1;
-const HOT_SH: u8 = 2;
+pub(crate) const HOT_STORE_MAX: u8 = 6;
+pub(crate) const HOT_FLD: u8 = 53;
+pub(crate) const HOT_FLW: u8 = 54;
+pub(crate) const HOT_FADD_D: u8 = 55;
+pub(crate) const HOT_FSUB_D: u8 = 56;
+pub(crate) const HOT_FMUL_D: u8 = 57;
+pub(crate) const HOT_FDIV_D: u8 = 58;
+pub(crate) const HOT_FSGNJ_D: u8 = 59;
+pub(crate) const HOT_FMV_X_D: u8 = 60;
+pub(crate) const HOT_FMV_D_X: u8 = 61;
+pub(crate) const HOT_FCVT_D_W: u8 = 62;
+pub(crate) const HOT_SB: u8 = 1;
+pub(crate) const HOT_SH: u8 = 2;
 
 // risc-box patch: fill-time classification for the predecode cache. Keyed
 // by the NAME of the INSTRUCTIONS entry the decode already matched — the
@@ -749,7 +749,24 @@ impl Cpu {
 	/// Returns instructions retired (>= 1). Exits early — with pc exact —
 	/// on a trap, a taken branch/jump, or a hot store that invalidated the
 	/// block's own meta (self-modifying code).
-	fn exec_block(&mut self, slot: usize) -> u64 {
+	/// risc-box patch (jit feature tests): install a block directly so the
+	/// translator's equivalence tests can drive exec_block on hand-built op
+	/// sequences without going through fetch/decode.
+	#[cfg(feature = "jit")]
+	pub(crate) fn install_block_for_test(&mut self, slot: usize, tag: u64, phys_page: u64, ops: &[BlockOp]) {
+		let base = slot * BLOCK_MAX;
+		for (i, op) in ops.iter().enumerate() {
+			self.block_ops[base + i] = *op;
+		}
+		self.block_heads[slot] = BlockHead {
+			tag: tag,
+			phys_page: phys_page,
+			count: ops.len() as u32,
+			code_gen: self.mmu.code_gen()
+		};
+	}
+
+	pub(crate) fn exec_block(&mut self, slot: usize) -> u64 {
 		let head = self.block_heads[slot];
 		let base = slot * BLOCK_MAX;
 		let count = head.count as usize;
@@ -1104,7 +1121,7 @@ impl Cpu {
 	// indirect call. kind 0 (the block's terminal non-hot op) dispatches
 	// through the table.
 	#[inline(always)]
-	fn exec_op(&mut self, e: &BlockOp, address: u64) -> Result<(), Trap> {
+	pub(crate) fn exec_op(&mut self, e: &BlockOp, address: u64) -> Result<(), Trap> {
 		let rd = e.rd as usize;
 		let rs1 = e.rs1 as usize;
 		let rs2 = e.rs2 as usize;
@@ -5433,5 +5450,235 @@ mod test_decode_cache {
 			Some(index) => assert_eq!(11, index),
 			None => panic!("Unexpected cache miss")
 		};
+	}
+}
+
+// risc-box patch (jit feature): equivalence between the translator
+// (src/jit.rs) and the REAL exec_block, on randomized op sequences over
+// the supported integer subset. This lives here because it compares
+// private machine state.
+#[cfg(all(test, feature = "jit"))]
+mod test_jit_equivalence {
+	extern crate wasmtime;
+	use super::*;
+	use jit;
+	use mmu::DRAM_BASE;
+	use terminal::DummyTerminal;
+
+	const XB: u32 = 0; // x[32] at 0
+	const PCA: u32 = 256;
+	const GENA: u32 = 264;
+	const DB: u32 = 4096; // linear offset of guest DRAM window
+	const WIN: u64 = 64 * 1024; // mirrored DRAM window size
+
+	struct Rng(u64);
+	impl Rng {
+		fn next(&mut self) -> u64 {
+			self.0 ^= self.0 << 13;
+			self.0 ^= self.0 >> 7;
+			self.0 ^= self.0 << 17;
+			self.0
+		}
+	}
+
+	fn rand_ops(r: &mut Rng, len: usize) -> Vec<BlockOp> {
+		let mut ops = Vec::new();
+		for _ in 0..len {
+			let rd = match (r.next() % 32) as u8 {
+				v @ 10..=13 => v + 10,
+				v => v,
+			};
+			let ra = (r.next() % 32) as u8;
+			let rb = (r.next() % 32) as u8;
+			let p = (10 + r.next() % 4) as u8; // stable pointer regs
+			let imm12 = ((r.next() % 4096) as i32) - 2048;
+			let mem_imm = ((r.next() % 2048) as i32) & !7; // 0..2040, aligned
+			let shamt6 = (r.next() % 64) as u32;
+			let shamt5 = (r.next() % 32) as u32;
+			let bimm = (((r.next() % 512) as i32) - 256) & !1; // branch offset, even
+			let (kind, rrd, rrs1, rrs2, imm, word) = match r.next() % 44 {
+				0 => (HOT_ADDI, rd, ra, 0, imm12, 0),
+				1 => (HOT_ADD, rd, ra, rb, 0, 0),
+				2 => (HOT_SUB, rd, ra, rb, 0, 0),
+				3 => (HOT_AND, rd, ra, rb, 0, 0),
+				4 => (HOT_OR, rd, ra, rb, 0, 0),
+				5 => (HOT_XOR, rd, ra, rb, 0, 0),
+				6 => (HOT_ANDI, rd, ra, 0, imm12, 0),
+				7 => (HOT_ORI, rd, ra, 0, imm12, 0),
+				8 => (HOT_XORI, rd, ra, 0, imm12, 0),
+				9 => (HOT_MUL, rd, ra, rb, 0, 0),
+				10 => (HOT_SLL, rd, ra, rb, 0, 0),
+				11 => (HOT_SRL, rd, ra, rb, 0, 0),
+				12 => (HOT_SRA, rd, ra, rb, 0, 0),
+				13 => (HOT_SLLI, rd, ra, 0, 0, shamt6 << 20),
+				14 => (HOT_SRLI, rd, ra, 0, 0, shamt6 << 20),
+				15 => (HOT_SRAI, rd, ra, 0, 0, shamt6 << 20),
+				16 => (HOT_LUI, rd, 0, 0, ((r.next() as i32) & !0xfff), 0),
+				17 => (HOT_AUIPC, rd, 0, 0, ((r.next() as i32) & !0xfff), 0),
+				18 => (HOT_ADDIW, rd, ra, 0, imm12, 0),
+				19 => (HOT_ADDW, rd, ra, rb, 0, 0),
+				20 => (HOT_SUBW, rd, ra, rb, 0, 0),
+				21 => (HOT_SRAIW, rd, ra, 0, 0, shamt5 << 20),
+				22 => (HOT_LD, rd, p, 0, mem_imm, 0),
+				23 => (HOT_SD, 0, p, rb, mem_imm, 0),
+				24 => (HOT_LW, rd, p, 0, mem_imm, 0),
+				25 => (HOT_LWU, rd, p, 0, mem_imm, 0),
+				26 => (HOT_LH, rd, p, 0, mem_imm, 0),
+				27 => (HOT_LHU, rd, p, 0, mem_imm, 0),
+				28 => (HOT_LB, rd, p, 0, mem_imm, 0),
+				29 => (HOT_LBU, rd, p, 0, mem_imm, 0),
+				30 => (HOT_SW, 0, p, rb, mem_imm, 0),
+				31 => (HOT_SH, 0, p, rb, mem_imm, 0),
+				32 => (HOT_SB, 0, p, rb, mem_imm, 0),
+				33 => (HOT_SLT, rd, ra, rb, 0, 0),
+				34 => (HOT_SLTU, rd, ra, rb, 0, 0),
+				35 => (HOT_SLTI, rd, ra, 0, imm12, 0),
+				36 => (HOT_SLTIU, rd, ra, 0, imm12, 0),
+				37 => match r.next() % 6 {
+					0 => (HOT_BEQ, 0, ra, rb, bimm, 0),
+					1 => (HOT_BNE, 0, ra, rb, bimm, 0),
+					2 => (HOT_BLT, 0, ra, rb, bimm, 0),
+					3 => (HOT_BGE, 0, ra, rb, bimm, 0),
+					4 => (HOT_BLTU, 0, ra, rb, bimm, 0),
+					_ => (HOT_BGEU, 0, ra, rb, bimm, 0),
+				},
+				38 => (HOT_JAL, rd, 0, 0, bimm, 0),
+				39 => (HOT_JALR, rd, ra, 0, imm12, 0),
+				_ => {
+					// W-shift family
+					match r.next() % 4 {
+						0 => (HOT_SLLIW, rd, ra, shamt5 as u8, 0, 0),
+						1 => (HOT_SLLW, rd, ra, rb, 0, 0),
+						2 => (HOT_SRLW, rd, ra, rb, 0, 0),
+						_ => (HOT_SRAW, rd, ra, rb, 0, 0),
+					}
+				}
+			};
+			let _ = shamt5;
+			ops.push(BlockOp {
+				imm: imm,
+				word: word,
+				data: 0,
+				kind: kind,
+				rd: rrd,
+				rs1: rrs1,
+				rs2: rrs2,
+				len: 4,
+				_pad: 0,
+			});
+		}
+		ops
+	}
+
+	fn fresh_cpu(r: &mut Rng) -> Cpu {
+		let mut cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		cpu.get_mut_mmu().init_memory(WIN);
+		for i in 1..32 {
+			cpu.x[i] = r.next() as i64;
+		}
+		for p in 10..14 {
+			cpu.x[p] = (DRAM_BASE + 8192 + (r.next() % 16384 & !7)) as i64;
+		}
+		cpu.x[0] = 0;
+		for a in (0..WIN).step_by(8) {
+			let v = r.next();
+			let _ = cpu.get_mut_mmu().store_doubleword(DRAM_BASE + a, v);
+		}
+		cpu
+	}
+
+	fn run_wasm(bytes: &[u8], cpu_pre: &Cpu, start: u64) -> (u64, [i64; 32], u64, Vec<u8>) {
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, bytes).expect("valid module");
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
+			}
+			d[PCA as usize..PCA as usize + 8].copy_from_slice(&start.to_le_bytes());
+			d[GENA as usize..GENA as usize + 4]
+				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
+			let mut win = vec![0u8; WIN as usize];
+			cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
+			d[DB as usize..DB as usize + WIN as usize].copy_from_slice(&win);
+		}
+		let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = instance.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap() as u64;
+		let d = mem.data(&store);
+		let mut x = [0i64; 32];
+		for i in 0..32 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[XB as usize + i * 8..XB as usize + i * 8 + 8]);
+			x[i] = i64::from_le_bytes(b);
+		}
+		let mut b = [0u8; 8];
+		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
+		let pc = u64::from_le_bytes(b);
+		let dram = d[DB as usize..DB as usize + WIN as usize].to_vec();
+		(retired, x, pc, dram)
+	}
+
+	#[test]
+	fn translator_matches_exec_block() {
+		let mut checked = 0;
+		for seed in 1..400u64 {
+			let mut r = Rng(seed * 2654435761 | 1);
+			let len = 2 + (r.next() % 12) as usize;
+			let ops = rand_ops(&mut r, len);
+			let start = DRAM_BASE; // block's pc; DRAM phys tag irrelevant here
+			let mut cpu = fresh_cpu(&mut Rng(seed * 40503 | 1));
+			let lay = jit::Layout {
+				x_base: XB,
+				pc_addr: PCA,
+				gen_addr: GENA,
+				baked_gen: cpu.mmu.code_gen(),
+				dram_base: DB,
+				guest_dram_base: DRAM_BASE,
+				dram_len: WIN,
+			};
+			let bytes = match jit::emit_block(&ops, start, &lay) {
+				Some(b) => b,
+				None => continue,
+			};
+			// wasm first (from the pristine state), then the real engine
+			let (rw, xw, pcw, dramw) = run_wasm(&bytes, &cpu, start);
+			cpu.update_pc(start);
+			cpu.install_block_for_test(0, start, 0, &ops);
+			let ri = cpu.exec_block(0);
+			assert_eq!(ri, rw, "retired mismatch seed {}", seed);
+			assert_eq!(cpu.x, xw, "registers mismatch seed {}", seed);
+			assert_eq!(cpu.pc, pcw, "pc mismatch seed {}", seed);
+			let mut dram_i = vec![0u8; WIN as usize];
+			cpu.mmu.read_physical_range(DRAM_BASE, &mut dram_i);
+			assert_eq!(dram_i, dramw, "dram mismatch seed {}", seed);
+			checked += 1;
+		}
+		assert!(checked > 300, "too few cases ran: {}", checked);
+	}
+
+	#[test]
+	fn store_bails_on_stale_generation() {
+		let mut r = Rng(97);
+		let cpu = fresh_cpu(&mut r);
+		let ops = vec![
+			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 5, rs1: 6, rs2: 0, len: 4, _pad: 0 },
+			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_SD, rd: 0, rs1: 10, rs2: 7, len: 4, _pad: 0 },
+			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 8, rs1: 9, rs2: 0, len: 4, _pad: 0 },
+		];
+		let lay = jit::Layout {
+			x_base: XB, pc_addr: PCA, gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen().wrapping_add(1), // stale on purpose
+			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		};
+		let bytes = jit::emit_block(&ops, DRAM_BASE, &lay).unwrap();
+		let (retired, _x, pc, _d) = run_wasm(&bytes, &cpu, DRAM_BASE);
+		// the store executes, the gen check fires after it: 2 retired,
+		// pc at the third op
+		assert_eq!(retired, 2);
+		assert_eq!(pc, DRAM_BASE + 8);
 	}
 }

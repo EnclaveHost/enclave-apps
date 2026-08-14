@@ -26,6 +26,8 @@ pub mod memory;
 pub mod mmu;
 pub mod elf_analyzer;
 pub mod device;
+#[cfg(feature = "jit")]
+pub mod jit; // risc-box patch: PLATFORM-JIT.md translator (feature-gated)
 
 use cpu::{Cpu, Xlen};
 use elf_analyzer::{ElfAnalyzer};
