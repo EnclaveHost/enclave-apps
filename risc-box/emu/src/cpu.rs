@@ -4466,7 +4466,13 @@ const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // risc-box patch: was 0x1000
 // risc-box patch: predecoded instruction cache geometry. Slots are indexed by
 // pc >> 1 (compressed instructions are 2-byte aligned), so the cache covers
 // a 32 KiB direct-mapped code window.
-const ICACHE_ENTRY_NUM: usize = 0x4000;
+// risc-box patch: 128k slots. Direct-mapped by (pc >> 1), so the table
+// covers 256 KiB of distinct code addresses before aliasing; at the old
+// 0x4000 (32 KiB of coverage) the kernel and userspace thrashed each
+// other's entries on every syscall and the fill path (two translations,
+// uncompress, decode, classify) showed up at ~5% of the interpreter.
+// 128k x 32-byte entries = 4 MiB, noise next to the guest's DRAM.
+const ICACHE_ENTRY_NUM: usize = 0x20000;
 const ICACHE_LEN4: u16 = 0x8000;
 
 // risc-box patch: tag layout for the direct-mapped cache below — the decoded
