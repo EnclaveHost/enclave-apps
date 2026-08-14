@@ -111,16 +111,28 @@ impl BlockOp {
 	};
 }
 
+// risc-box patch: a block is tagged by the PHYSICAL page it was decoded
+// from plus the write-snoop code generation — the two things its cached
+// content actually depends on. It is deliberately NOT tagged by
+// translation state: satp writes and SFENCE.VMA flush the TLB on every
+// context switch, and when the meta embedded the TLB generation every
+// switch threw away every block in the machine — page-fault storms
+// (desktop boot, app launch) spent their time rebuilding blocks instead
+// of running them. The probe instead re-translates the start pc through
+// the TLB (a hit is a few compares; a miss re-walks exactly as a fetch
+// would) and compares the physical page, so a remapped pc can never run
+// a stale block while an unchanged mapping keeps its blocks across
+// flushes.
 #[derive(Clone, Copy)]
 struct BlockHead {
 	tag: u64, // start pc (0 = never valid: DRAM starts at 0x80000000)
-	meta: u64, // mmu.exec_meta() at build time
+	phys_page: u64, // physical page the ops were decoded from
 	count: u32,
-	_pad: u32
+	code_gen: u32 // mmu.code_gen() at build time
 }
 
 impl BlockHead {
-	const EMPTY: BlockHead = BlockHead { tag: 0, meta: 0, count: 0, _pad: 0 };
+	const EMPTY: BlockHead = BlockHead { tag: 0, phys_page: 0, count: 0, code_gen: 0 };
 }
 
 const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1); 32k x (24B + 32x16B) = 17 MiB
@@ -618,7 +630,13 @@ impl Cpu {
 				if allow_blocks {
 					let slot = ((self.pc >> 1) as usize) & (BLOCK_SLOTS - 1);
 					let h = self.block_heads[slot];
-					if h.tag == self.pc && h.meta == self.mmu.exec_meta() {
+					let hit = h.tag == self.pc
+						&& h.code_gen == self.mmu.code_gen()
+						&& match self.mmu.translate_fetch_probe(self.pc) {
+							Ok(p) => (p & !0xfff) == h.phys_page,
+							Err(_) => false
+						};
+					if hit {
 						done += self.exec_block(slot);
 					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
 						done += self.exec_block(slot);
@@ -701,7 +719,7 @@ impl Cpu {
 			}
 			// hot stores (kind 1..=4) can overwrite this very block; the
 			// write snoop bumps the code generation, which this meta embeds
-			if op.kind <= HOT_STORE_MAX && self.mmu.exec_meta() != head.meta {
+			if op.kind <= HOT_STORE_MAX && self.mmu.code_gen() != head.code_gen {
 				return retired;
 			}
 		}
@@ -773,9 +791,9 @@ impl Cpu {
 		}
 		self.block_heads[slot] = BlockHead {
 			tag: start,
-			meta: self.mmu.exec_meta(),
+			phys_page: p_start & !0xfff,
 			count: count as u32,
-			_pad: 0
+			code_gen: self.mmu.code_gen()
 		};
 		true
 	}

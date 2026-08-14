@@ -283,6 +283,27 @@ impl Mmu {
 		self.translate_address(v_address, &MemoryAccessType::Execute)
 	}
 
+	// risc-box patch: the superblock probe's fetch translation, specialized
+	// by hand. It runs once per BLOCK dispatch, and the generic
+	// translate_address path (access-type match through a reference) is
+	// exactly the kind of dispatch wasm backends fail to fold; this is the
+	// TLB hit written out flat, falling back to the ordinary translation
+	// (which walks and fills the TLB) only on a miss.
+	#[inline(always)]
+	pub fn translate_fetch_probe(&mut self, v_address: u64) -> Result<u64, ()> {
+		if matches!(self.addressing_mode, AddressingMode::None) {
+			return Ok(self.get_effective_address(v_address));
+		}
+		let address = self.get_effective_address(v_address);
+		let set = ((address >> 12) as usize) & (TLB_SETS - 1);
+		let tag = (address & !0xfff) | 1;
+		if self.tlb_tags[TLB_EXECUTE][set] == tag
+			&& self.tlb_metas[TLB_EXECUTE][set] == self.tlb_meta_cache {
+			return Ok(self.tlb_ppns[TLB_EXECUTE][set] | (address & 0xfff));
+		}
+		self.translate_address(v_address, &MemoryAccessType::Execute)
+	}
+
 	// risc-box patch: everything a cached predecoded instruction depends on —
 	// the TLB meta (all translation inputs) plus the code generation
 	// (bumped when any marked executable page is written).
@@ -293,6 +314,15 @@ impl Mmu {
 	// risc-box patch: see MemoryWrapper::mark_exec_page.
 	pub fn mark_exec_page(&mut self, p_address: u64) -> bool {
 		self.memory.mark_exec_page(p_address)
+	}
+
+	// risc-box patch: the write-snoop generation alone — what a superblock's
+	// content validity depends on (a store can invalidate code pages but can
+	// never change what physical page a block was decoded from; the probe
+	// re-checks the mapping through the TLB separately).
+	#[inline(always)]
+	pub fn code_gen(&self) -> u32 {
+		self.memory.code_gen()
 	}
 
 	// risc-box patch: SFENCE.VMA entry point (cpu.rs calls this; upstream
