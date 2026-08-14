@@ -941,3 +941,171 @@ fn assemble(body_expr: Vec<u8>) -> Vec<u8> {
 	m.extend_from_slice(&sec);
 	m
 }
+
+// ---- region formation ----------------------------------------------------
+
+/// Pick compilation regions from a recorded block graph: nodes are block
+/// start pcs with a heat (retired instructions), edges are observed
+/// block-to-block successions. Only LOCAL edges (|Δpc| <= 64K) join blocks
+/// into a region — calls and returns collapse a whole program into one
+/// hairball otherwise, and a region compiler doesn't cross them (compiled
+/// units reach each other through the dispatcher instead). Regions are
+/// function-local SCCs (loops), ranked by heat, each capped at
+/// `max_blocks` by dropping its coldest members; singleton nodes without a
+/// self-loop are not regions (a lone block is the single-block emitter's
+/// job).
+pub fn form_regions(
+	nodes: &[(u64, u64)],
+	edges: &[(u64, u64)],
+	max_blocks: usize,
+	min_heat: u64,
+) -> Vec<Vec<u64>> {
+	use std::collections::HashMap;
+	let mut ids: Vec<u64> = nodes.iter().map(|&(pc, _)| pc).collect();
+	ids.sort();
+	ids.dedup();
+	let index_of = |pc: u64| ids.binary_search(&pc).ok();
+	let heat: HashMap<u64, u64> = nodes.iter().cloned().collect();
+	let n = ids.len();
+	let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+	let mut self_loop = vec![false; n];
+	for &(a, b) in edges {
+		if a.abs_diff(b) > 0x1_0000 {
+			continue;
+		}
+		if let (Some(ia), Some(ib)) = (index_of(a), index_of(b)) {
+			if ia == ib {
+				self_loop[ia] = true;
+			} else {
+				adj[ia].push(ib as u32);
+			}
+		}
+	}
+	// iterative Tarjan
+	let mut index = vec![u32::MAX; n];
+	let mut low = vec![0u32; n];
+	let mut on_stack = vec![false; n];
+	let mut scc_of = vec![u32::MAX; n];
+	let mut stack: Vec<u32> = Vec::new();
+	let mut next_index = 0u32;
+	let mut scc_count = 0u32;
+	let mut call: Vec<(u32, usize)> = Vec::new();
+	for start in 0..n {
+		if index[start] != u32::MAX {
+			continue;
+		}
+		call.push((start as u32, 0));
+		index[start] = next_index;
+		low[start] = next_index;
+		next_index += 1;
+		stack.push(start as u32);
+		on_stack[start] = true;
+		while let Some(&mut (v, ref mut ei)) = call.last_mut() {
+			let v = v as usize;
+			if *ei < adj[v].len() {
+				let w = adj[v][*ei] as usize;
+				*ei += 1;
+				if index[w] == u32::MAX {
+					index[w] = next_index;
+					low[w] = next_index;
+					next_index += 1;
+					stack.push(w as u32);
+					on_stack[w] = true;
+					call.push((w as u32, 0));
+				} else if on_stack[w] {
+					low[v] = low[v].min(index[w]);
+				}
+			} else {
+				call.pop();
+				if let Some(&(pv, _)) = call.last() {
+					let pv = pv as usize;
+					low[pv] = low[pv].min(low[v]);
+				}
+				if low[v] == index[v] {
+					loop {
+						let w = stack.pop().unwrap();
+						on_stack[w as usize] = false;
+						scc_of[w as usize] = scc_count;
+						if w as usize == v {
+							break;
+						}
+					}
+					scc_count += 1;
+				}
+			}
+		}
+	}
+	// group, filter to cyclic, rank
+	let mut groups: Vec<Vec<usize>> = vec![Vec::new(); scc_count as usize];
+	for i in 0..n {
+		groups[scc_of[i] as usize].push(i);
+	}
+	let mut regions: Vec<(u64, Vec<u64>)> = Vec::new();
+	for g in groups {
+		let cyclic = g.len() > 1 || (g.len() == 1 && self_loop[g[0]]);
+		if !cyclic {
+			continue;
+		}
+		let mut members: Vec<(u64, u64)> = g
+			.iter()
+			.map(|&i| (ids[i], heat.get(&ids[i]).cloned().unwrap_or(0)))
+			.collect();
+		// hottest first; cap the region size by dropping the cold tail
+		members.sort_by(|a, b| b.1.cmp(&a.1));
+		members.truncate(max_blocks);
+		let total: u64 = members.iter().map(|&(_, h)| h).sum();
+		if total < min_heat {
+			continue;
+		}
+		let mut pcs: Vec<u64> = members.into_iter().map(|(pc, _)| pc).collect();
+		pcs.sort();
+		regions.push((total, pcs));
+	}
+	regions.sort_by(|a, b| b.0.cmp(&a.0));
+	regions.into_iter().map(|(_, pcs)| pcs).collect()
+}
+
+#[cfg(test)]
+mod test_formation {
+	use super::form_regions;
+
+	#[test]
+	fn finds_loops_ranks_and_caps() {
+		// two loops: hot A<->B, cold C->D->C; a self-loop E; straight-line F->G;
+		// a far "call" edge that must not merge X into A's region
+		let nodes = vec![
+			(0x1000, 500u64), (0x1010, 400), // A B
+			(0x2000, 30), (0x2010, 20),      // C D
+			(0x3000, 100),                   // E (self-loop)
+			(0x4000, 900), (0x4010, 900),    // F G straight-line (no cycle)
+			(0x9_0000, 1000),                // X, far away
+		];
+		let edges = vec![
+			(0x1000, 0x1010), (0x1010, 0x1000),
+			(0x2000, 0x2010), (0x2010, 0x2000),
+			(0x3000, 0x3000),
+			(0x4000, 0x4010),
+			(0x1000, 0x9_0000), (0x9_0000, 0x1000), // far edges: excluded
+		];
+		let regions = form_regions(&nodes, &edges, 8, 0);
+		assert_eq!(regions.len(), 3, "two loops and a self-loop");
+		assert_eq!(regions[0], vec![0x1000, 0x1010], "hottest first");
+		assert_eq!(regions[1], vec![0x3000]);
+		assert_eq!(regions[2], vec![0x2000, 0x2010]);
+
+		// min_heat filters the cold loop
+		let regions = form_regions(&nodes, &edges, 8, 60);
+		assert_eq!(regions.len(), 2);
+
+		// size cap drops the coldest members
+		let big: Vec<(u64, u64)> = (0..10u64).map(|i| (0x5000 + i * 16, 100 - i)).collect();
+		let mut ring: Vec<(u64, u64)> = (0..10u64)
+			.map(|i| (0x5000 + i * 16, 0x5000 + ((i + 1) % 10) * 16))
+			.collect();
+		ring.push((0x5000, 0x5000 + 16));
+		let regions = form_regions(&big, &ring, 4, 0);
+		assert_eq!(regions.len(), 1);
+		assert_eq!(regions[0].len(), 4, "capped");
+		assert!(regions[0].contains(&0x5000), "hottest kept");
+	}
+}

@@ -147,7 +147,38 @@ boot drops toward ten seconds, DOOM toward launch-speed, and a browser
 stops being a different category of software from everything else this
 machine runs.
 
-## 4. Fallback
+## 4. State of the app side
+
+Everything the app owns is built and equivalence-tested behind the
+`jit` cargo feature (zero impact on shipped builds):
+
+- `emu/src/jit.rs` translates real superblock ops — the full integer
+  and double-precision hot set — into wasm modules, keeping
+  exec_block's contract exactly (pc-exact exits, constant retired
+  counts, stale-generation bails after stores).
+- `emit_region` compiles block sets into one fuel-bounded function
+  (br_table-in-loop lowering; in-region branches are internal
+  transfers; `run(fuel, entry)` stops at a block boundary once the
+  fuel is spent, so device servicing keeps its cadence).
+- The TLB tier makes translated code correct under paging: memory ops
+  probe the software TLB's real layout and bail to the interpreter on
+  miss or stale meta.
+- `form_regions` picks regions from the recorded block graph:
+  function-local SCCs over near edges, heat-ranked, size-capped.
+
+What cannot be finished before the verb exists is the last seam:
+executing the emitted modules over the app's OWN memory. In
+production this costs nothing by construction — the register file,
+pc cell, generation counter, TLB arrays and guest DRAM all already
+live in the app's linear memory, so the Layout just names their real
+addresses and a compiled function touches the same bytes the
+interpreter does. There is no native shortcut for that (a host
+wasmtime cannot wrap the emulator's Rust heap as a wasm memory
+without copying whole DRAM per call), which is one more way of
+saying the verb is the right platform boundary: instantiate over the
+caller's memory, and the entire tier works with zero marshalling.
+
+## 5. Fallback
 
 Absent the verb, RISC Box stays as shipped: the interpreter is at its
 local optimum and every path in this document degrades gracefully to it.
