@@ -88,6 +88,7 @@ fn main() {
     let mut xkey_script: Vec<(u64, String)> = Vec::new();
     let mut snap_script: Vec<(u64, String)> = Vec::new();
     let mut xclick_script: Vec<(u64, u32, u32)> = Vec::new();
+    let mut xkey_on_script: Vec<(Vec<u8>, String)> = Vec::new();
     let mut trace_file: Option<String> = None;
     let mut trace_limit: u64 = 200_000;
     let mut trace_sub: Option<(u64, u64)> = None;
@@ -131,6 +132,17 @@ fn main() {
                     parts[1].parse::<u32>().expect("x"),
                     parts[2].parse::<u32>().expect("y"),
                 ));
+            }
+            "--xkey-on" => {
+                // MARKER:TEXT -- inject TEXT as X keyboard events when MARKER
+                // appears on the guest console. Wall-clock --xkey races the X
+                // session's keyboard subdevice, which arrives seconds after
+                // the desktop LOOKS ready (later still when Xorg retried);
+                // pair this with a serial poll that prints the marker once
+                // /var/log/Xorg.0.log shows 'type: KEYBOARD'.
+                i += 1;
+                let (marker, txt) = args[i].split_once(':').expect("--xkey-on MARKER:TEXT");
+                xkey_on_script.push((marker.as_bytes().to_vec(), txt.to_string()));
             }
             "--xkey" => {
                 // SECONDS:TEXT -- once the wall clock passes SECONDS, inject
@@ -411,6 +423,17 @@ fn main() {
                     true
                 }
             });
+            {
+                let buf = console.borrow();
+                xkey_on_script.retain(|(marker, txt)| {
+                    if buf.windows(marker.len()).any(|w| w == &marker[..]) {
+                        fired.push(txt.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             let mut snaps: Vec<String> = Vec::new();
             snap_script.retain(|(at, path)| {
                 if *at <= elapsed_s {
