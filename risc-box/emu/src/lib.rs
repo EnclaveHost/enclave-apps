@@ -151,6 +151,14 @@ impl Emulator {
 		self.cpu.tick();
 	}
 
+	/// risc-box patch: runs `n` instructions in one call — the per-call and
+	/// per-instruction loop overhead is amortized inside Cpu::run, and a
+	/// WFI-parked guest consumes the batch without spinning. Embedders'
+	/// tick-batches should call this instead of tick() in a loop.
+	pub fn run_n(&mut self, n: u64) {
+		self.cpu.run(n);
+	}
+
 	/// Sets up program run by the program. This method analyzes the passed content
 	/// and configure CPU properly. If the passed contend doesn't seem ELF file,
 	/// it panics. This method is expected to be called only once.

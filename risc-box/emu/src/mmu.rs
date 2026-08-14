@@ -87,7 +87,13 @@ pub struct Mmu {
 	tlb_gen: u32,
 	tlb_tags: [[u64; TLB_SETS]; 3],
 	tlb_metas: [[u32; TLB_SETS]; 3],
-	tlb_ppns: [[u64; TLB_SETS]; 3]
+	tlb_ppns: [[u64; TLB_SETS]; 3],
+
+	// risc-box patch: tlb_meta() used to be recomputed on every translation
+	// AND every predecode-cache probe (once per retired instruction); it only
+	// changes when the generation, privilege mode or mstatus does, so it is
+	// materialized here at those points instead.
+	tlb_meta_cache: u32
 }
 
 // risc-box patch: TLB geometry/type indices
@@ -134,7 +140,7 @@ impl Mmu {
 			dtb[i] = content[i];
 		}
 
-		Mmu {
+		let mut mmu = Mmu {
 			clock: 0,
 			xlen: xlen,
 			ppn: 0,
@@ -158,8 +164,11 @@ impl Mmu {
 			tlb_gen: 1,
 			tlb_tags: [[0; TLB_SETS]; 3],
 			tlb_metas: [[0; TLB_SETS]; 3],
-			tlb_ppns: [[0; TLB_SETS]; 3]
-		}
+			tlb_ppns: [[0; TLB_SETS]; 3],
+			tlb_meta_cache: 0
+		};
+		mmu.refresh_tlb_meta();
+		mmu
 	}
 
 	/// Updates XLEN, 32-bit or 64-bit
@@ -266,6 +275,7 @@ impl Mmu {
 			// generation reuse must not revive stale predecoded instructions
 			self.memory.bump_code_gen();
 		}
+		self.refresh_tlb_meta(); // risc-box patch: meta embeds the generation
 	}
 
 	// risc-box patch: public fetch translation for the CPU's predecode fill.
@@ -295,14 +305,21 @@ impl Mmu {
 	// risc-box patch: the CPU state a translation depends on, packed for the
 	// TLB tag: generation | privilege | mstatus.MPRV | mstatus."MPP"
 	// (bits 17 and 9..10, exactly as translate_address_walk reads them).
+	// Materialized in tlb_meta_cache whenever one of those inputs changes;
+	// the hot paths read the field.
+	#[inline(always)]
 	fn tlb_meta(&self) -> u32 {
+		self.tlb_meta_cache
+	}
+
+	fn refresh_tlb_meta(&mut self) {
 		let priv_enc = match self.privilege_mode {
 			PrivilegeMode::User => 0u32,
 			PrivilegeMode::Supervisor => 1,
 			PrivilegeMode::Reserved => 2,
 			PrivilegeMode::Machine => 3
 		};
-		(self.tlb_gen << 8)
+		self.tlb_meta_cache = (self.tlb_gen << 8)
 			| (priv_enc << 6)
 			| ((((self.mstatus >> 17) & 1) as u32) << 5)
 			| ((((self.mstatus >> 9) & 3) as u32) << 3)
@@ -341,6 +358,7 @@ impl Mmu {
 	pub fn update_privilege_mode(&mut self, mode: PrivilegeMode) {
 		self.privilege_mode = mode;
 		self.clear_page_cache();
+		self.refresh_tlb_meta(); // risc-box patch
 	}
 
 	/// Updates mstatus copy. `CPU` needs to call this method whenever
@@ -350,6 +368,7 @@ impl Mmu {
 	/// * `mstatus`
 	pub fn update_mstatus(&mut self, mstatus: u64) {
 		self.mstatus = mstatus;
+		self.refresh_tlb_meta(); // risc-box patch
 	}
 
 	/// Updates PPN used for address translation

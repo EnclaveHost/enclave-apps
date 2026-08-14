@@ -1113,9 +1113,11 @@ pub fn run() {
                     false => TICK_BATCH,
                 };
                 app.input_boost = app.input_boost.saturating_sub(1);
-                for _ in 0..batch {
-                    emu.tick();
-                }
+                // batched entry point: per-instruction loop overhead is
+                // amortized inside the emulator, and a WFI-parked guest
+                // consumes the batch without spinning (idle turns cost the
+                // loop almost nothing, leaving the budget to scan/encode).
+                emu.run_n(batch);
                 app.instret += batch;
                 // drain the guest UART output into scrollback + SSE
                 let mut chunk: Vec<u8> = Vec::new();

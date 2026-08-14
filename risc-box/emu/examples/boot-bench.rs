@@ -281,8 +281,16 @@ fn main() {
                 }
             }
             _ => {
-                for _ in 0..BATCH {
-                    emu.tick();
+                // batched entry point: same instruction count, loop overhead
+                // amortized inside the emulator (mirrors the app's loop)
+                emu.run_n(BATCH);
+                // A WFI-parked guest consumes its batch without executing, so
+                // an idle guest would otherwise burn the whole --insns budget
+                // in moments of wall time and break the --type/--until script.
+                // Pace idle batches to roughly the pre-fast-forward idle rate
+                // (~400 MIPS) so script timings stay comparable.
+                if emu.get_cpu().is_idle() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
         }

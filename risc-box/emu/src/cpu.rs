@@ -327,41 +327,86 @@ impl Cpu {
 	}
 
 	/// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
+	// risc-box patch: tick() is now the single-instruction form of run() —
+	// kept for the tests and for callers that need per-instruction stepping
+	// (boot-bench's tracer).
 	pub fn tick(&mut self) {
-		let instruction_address = self.pc;
-		match self.tick_operate() {
-			Ok(()) => {},
-			Err(e) => self.handle_exception(e, instruction_address)
-		}
-		// risc-box patch: devices and interrupt delivery used to run on every
-		// retired instruction — six device ticks (clint, disk, net, input,
-		// uart, plic) plus two CSR reads, for an instruction whose own work is
-		// a tag compare and an indirect call. That overhead dominated the
-		// interpreter. Both now run every DEVICE_TICK_INTERVAL instructions,
-		// with the device clocks advanced by the whole interval so guest time
-		// passes at exactly the old rate, just in coarser steps.
-		//
-		// Interrupt delivery is not purely periodic: any CSR write that can
-		// change what is pending or enabled re-arms the check (see
-		// write_csr_raw), so enabling an already-pending interrupt still takes
-		// effect on the next instruction rather than waiting out the interval.
-		self.device_countdown -= 1;
-		if self.device_countdown == 0 {
-			self.device_countdown = DEVICE_TICK_INTERVAL;
-			self.mmu.tick(DEVICE_TICK_INTERVAL, &mut self.csr[CSR_MIP_ADDRESS as usize]);
-			self.check_interrupt = true;
-		}
-		if self.check_interrupt {
-			self.check_interrupt = false;
-			self.handle_interrupt(self.pc);
-		}
-		self.clock = self.clock.wrapping_add(1);
+		self.run(1);
+	}
 
-		// cpu core clock : mtime clock in clint = 8 : 1 is
-		// just an arbiraty ratio.
-		// @TODO: Implement more properly
-		// risc-box patch: CSR_CYCLE is now materialized lazily in read_csr_raw()
-		// (same pattern as CSR_TIME) instead of being written every tick.
+	/// risc-box patch: runs `n` instructions with the loop bookkeeping hoisted
+	/// out of the per-instruction path. Semantically this is n calls to the
+	/// old tick():
+	/// - devices and interrupt delivery used to run on every retired
+	///   instruction — six device ticks plus two CSR reads, for an instruction
+	///   whose own work is a tag compare and an indirect call. Both run every
+	///   DEVICE_TICK_INTERVAL instructions, with the device clocks advanced by
+	///   the whole interval so guest time passes at exactly the old rate, just
+	///   in coarser steps.
+	/// - interrupt delivery is not purely periodic: any CSR write that can
+	///   change what is pending or enabled re-arms the check (see
+	///   write_csr_raw), so enabling an already-pending interrupt still takes
+	///   effect on the next instruction rather than waiting out the interval.
+	/// - a hart parked in WFI consumes guest time without executing: the
+	///   whole burst until the next device service is charged in one step, so
+	///   an idle guest costs the host almost nothing while waking at exactly
+	///   the same clint/plic boundaries as before.
+	/// - CSR_CYCLE is materialized lazily in read_csr_raw() (same pattern as
+	///   CSR_TIME) instead of being written every tick.
+	pub fn run(&mut self, n: u64) {
+		let mut remaining = n;
+		while remaining > 0 {
+			// device_countdown is always >= 1 here (constructor starts it at
+			// 1; the service block below refills it), so every burst makes
+			// progress.
+			let burst = match remaining < self.device_countdown {
+				true => remaining,
+				false => self.device_countdown
+			};
+			let mut done: u64 = 0;
+			if self.wfi {
+				// Parked: leave WFI the moment an enabled interrupt is
+				// pending (tick_operate's own wake condition); otherwise the
+				// whole burst passes as guest time with no execution.
+				match (self.read_csr_raw(CSR_MIE_ADDRESS)
+					& self.read_csr_raw(CSR_MIP_ADDRESS)) != 0 {
+					true => self.wfi = false,
+					false => done = burst
+				}
+			}
+			while done < burst {
+				let instruction_address = self.pc;
+				match self.tick_operate() {
+					Ok(()) => {},
+					Err(e) => self.handle_exception(e, instruction_address)
+				}
+				done += 1;
+				// Delivery stays where the old tick() had it — after the
+				// retired instruction — so a CSR write that enables a
+				// pending interrupt takes effect at exactly the old boundary.
+				if self.check_interrupt {
+					self.check_interrupt = false;
+					self.handle_interrupt(self.pc);
+				}
+				if self.wfi {
+					// the rest of the burst is idle time; charged as such by
+					// the wfi branch of the next outer iteration
+					break;
+				}
+			}
+			self.device_countdown -= done;
+			self.clock = self.clock.wrapping_add(done);
+			remaining -= done;
+			// Device-service boundary, at the same stream position as the
+			// old per-tick countdown: the end of the interval's last
+			// instruction, delivery attempted in the same step.
+			if self.device_countdown == 0 {
+				self.device_countdown = DEVICE_TICK_INTERVAL;
+				self.mmu.tick(DEVICE_TICK_INTERVAL, &mut self.csr[CSR_MIP_ADDRESS as usize]);
+				self.check_interrupt = false;
+				self.handle_interrupt(self.pc);
+			}
+		}
 	}
 
 	// @TODO: Rename?

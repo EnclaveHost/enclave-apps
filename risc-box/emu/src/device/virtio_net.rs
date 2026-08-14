@@ -78,8 +78,18 @@ pub struct VirtioNet {
 	queues: [Queue; 2],
 	tx_notified: bool,
 	pending_rx: Option<Vec<u8>>,
+	// risc-box patch: tick() is called every DEVICE_TICK_INTERVAL retired
+	// instructions, and polling the backend for a receive frame through the
+	// dyn call that often was ~4% of the whole interpreter. RX is polled
+	// every RX_POLL_DIVIDER-th tick instead: worst-case delivery latency is
+	// ~2k instructions (tens of microseconds of guest time), and TX (the
+	// latency-visible direction) still drains on the very next tick after
+	// its queue notify.
+	rx_poll_countdown: u32,
 	backend: Box<dyn NetBackend>
 }
+
+const RX_POLL_DIVIDER: u32 = 128;
 
 impl VirtioNet {
 	pub fn new() -> Self {
@@ -95,6 +105,7 @@ impl VirtioNet {
 			queues: [Queue::new(), Queue::new()],
 			tx_notified: false,
 			pending_rx: None,
+			rx_poll_countdown: 1,
 			backend: Box::new(NullNetBackend::new())
 		}
 	}
@@ -121,13 +132,25 @@ impl VirtioNet {
 		if self.tx_notified {
 			self.tx_notified = false;
 			self.handle_tx(memory);
+			// a TX burst often gets an immediate reply (ARP, TCP ACK):
+			// poll for it on this same tick rather than waiting out the
+			// divider
+			self.rx_poll_countdown = 1;
 		}
-		if self.driver_ready() {
-			if self.pending_rx.is_none() {
-				self.pending_rx = self.backend.guest_rx();
+		if self.pending_rx.is_none() {
+			self.rx_poll_countdown -= 1;
+			if self.rx_poll_countdown == 0 {
+				self.rx_poll_countdown = RX_POLL_DIVIDER;
+				if self.driver_ready() {
+					self.pending_rx = self.backend.guest_rx();
+				}
 			}
-			if self.pending_rx.is_some() {
-				self.handle_rx(memory);
+		}
+		if self.pending_rx.is_some() && self.driver_ready() {
+			self.handle_rx(memory);
+			if self.pending_rx.is_none() {
+				// delivered: a burst likely has more frames right behind it
+				self.rx_poll_countdown = 1;
 			}
 		}
 	}
