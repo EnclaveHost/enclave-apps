@@ -74,6 +74,190 @@ pub const MIP_SEIP: u64 = 0x200;
 const MIP_STIP: u64 = 0x020;
 const MIP_SSIP: u64 = 0x002;
 
+// risc-box patch: one predecoded-instruction cache entry. 32 bytes so a
+// probe touches exactly one cache line. `kind` selects an inline hot-op
+// implementation in exec_hot (0 = none: dispatch through INSTRUCTIONS).
+#[derive(Clone, Copy)]
+struct ICacheEntry {
+	tag: u64,
+	meta: u64,
+	word: u32,
+	imm: i32,
+	data: u16,
+	kind: u8,
+	rd: u8,
+	rs1: u8,
+	rs2: u8,
+	_pad: u16
+}
+
+impl ICacheEntry {
+	const EMPTY: ICacheEntry = ICacheEntry {
+		tag: 0, meta: 0, word: 0, imm: 0, data: 0,
+		kind: 0, rd: 0, rs1: 0, rs2: 0, _pad: 0
+	};
+}
+
+// risc-box patch: hot-op ids for ICacheEntry.kind. The set is the integer
+// instructions that dominate any Linux dynamic mix; everything else keeps
+// the INSTRUCTIONS-table path. Each exec_hot arm is a verbatim copy of the
+// table closure with the parse_format_* call replaced by the entry fields.
+const HOT_ADDI: u8 = 1;
+const HOT_ADD: u8 = 2;
+const HOT_LD: u8 = 3;
+const HOT_SD: u8 = 4;
+const HOT_LW: u8 = 5;
+const HOT_SW: u8 = 6;
+const HOT_BEQ: u8 = 7;
+const HOT_BNE: u8 = 8;
+const HOT_BLT: u8 = 9;
+const HOT_BGE: u8 = 10;
+const HOT_BLTU: u8 = 11;
+const HOT_BGEU: u8 = 12;
+const HOT_LUI: u8 = 13;
+const HOT_AUIPC: u8 = 14;
+const HOT_JAL: u8 = 15;
+const HOT_JALR: u8 = 16;
+const HOT_ANDI: u8 = 17;
+const HOT_ORI: u8 = 18;
+const HOT_XORI: u8 = 19;
+const HOT_AND: u8 = 20;
+const HOT_OR: u8 = 21;
+const HOT_XOR: u8 = 22;
+const HOT_SUB: u8 = 23;
+const HOT_SLLI: u8 = 24;
+const HOT_SRLI: u8 = 25;
+const HOT_SRAI: u8 = 26;
+const HOT_ADDIW: u8 = 27;
+const HOT_ADDW: u8 = 28;
+const HOT_SUBW: u8 = 29;
+const HOT_SLLIW: u8 = 30;
+const HOT_SRLIW: u8 = 31;
+const HOT_SRAIW: u8 = 32;
+const HOT_SLLW: u8 = 33;
+const HOT_SRLW: u8 = 34;
+const HOT_SRAW: u8 = 35;
+const HOT_SLL: u8 = 36;
+const HOT_SRL: u8 = 37;
+const HOT_SRA: u8 = 38;
+const HOT_SLT: u8 = 39;
+const HOT_SLTI: u8 = 40;
+const HOT_SLTU: u8 = 41;
+const HOT_SLTIU: u8 = 42;
+const HOT_MUL: u8 = 43;
+const HOT_LB: u8 = 44;
+const HOT_LBU: u8 = 45;
+const HOT_LH: u8 = 46;
+const HOT_LHU: u8 = 47;
+const HOT_LWU: u8 = 48;
+const HOT_SB: u8 = 49;
+const HOT_SH: u8 = 50;
+
+// risc-box patch: fill-time classification for the predecode cache. Keyed
+// by the NAME of the INSTRUCTIONS entry the decode already matched — the
+// hot path can never disagree with the table about which instruction a
+// word is, because the kind is derived from the table's own match. Returns
+// (kind, rd, rs1, rs2, imm); kind 0 means "not in the hot set". The stored
+// immediates all fit in i32 (I/S/B: 12-13 bits, U: the sign-extended
+// upper-immediate value itself, J: 21 bits); shift amounts are re-read
+// from the word at execution so the xlen-dependent masking in the table
+// bodies stays exactly where it was.
+fn classify_hot(name: &str, word: u32) -> (u8, u8, u8, u8, i32) {
+	let kind = match name {
+		"ADDI" => HOT_ADDI,
+		"ADD" => HOT_ADD,
+		"LD" => HOT_LD,
+		"SD" => HOT_SD,
+		"LW" => HOT_LW,
+		"SW" => HOT_SW,
+		"BEQ" => HOT_BEQ,
+		"BNE" => HOT_BNE,
+		"BLT" => HOT_BLT,
+		"BGE" => HOT_BGE,
+		"BLTU" => HOT_BLTU,
+		"BGEU" => HOT_BGEU,
+		"LUI" => HOT_LUI,
+		"AUIPC" => HOT_AUIPC,
+		"JAL" => HOT_JAL,
+		"JALR" => HOT_JALR,
+		"ANDI" => HOT_ANDI,
+		"ORI" => HOT_ORI,
+		"XORI" => HOT_XORI,
+		"AND" => HOT_AND,
+		"OR" => HOT_OR,
+		"XOR" => HOT_XOR,
+		"SUB" => HOT_SUB,
+		"SLLI" => HOT_SLLI,
+		"SRLI" => HOT_SRLI,
+		"SRAI" => HOT_SRAI,
+		"ADDIW" => HOT_ADDIW,
+		"ADDW" => HOT_ADDW,
+		"SUBW" => HOT_SUBW,
+		"SLLIW" => HOT_SLLIW,
+		"SRLIW" => HOT_SRLIW,
+		"SRAIW" => HOT_SRAIW,
+		"SLLW" => HOT_SLLW,
+		"SRLW" => HOT_SRLW,
+		"SRAW" => HOT_SRAW,
+		"SLL" => HOT_SLL,
+		"SRL" => HOT_SRL,
+		"SRA" => HOT_SRA,
+		"SLT" => HOT_SLT,
+		"SLTI" => HOT_SLTI,
+		"SLTU" => HOT_SLTU,
+		"SLTIU" => HOT_SLTIU,
+		"MUL" => HOT_MUL,
+		"LB" => HOT_LB,
+		"LBU" => HOT_LBU,
+		"LH" => HOT_LH,
+		"LHU" => HOT_LHU,
+		"LWU" => HOT_LWU,
+		"SB" => HOT_SB,
+		"SH" => HOT_SH,
+		_ => 0
+	};
+	let rd = ((word >> 7) & 0x1f) as u8;
+	let rs1 = ((word >> 15) & 0x1f) as u8;
+	let rs2 = ((word >> 20) & 0x1f) as u8;
+	// The immediate each hot arm expects, by the format its table closure
+	// parsed (parse_format_i/s/b/u/j reproduced bit for bit).
+	let imm: i32 = match kind {
+		HOT_ADDI | HOT_SLTI | HOT_SLTIU | HOT_XORI | HOT_ORI | HOT_ANDI
+		| HOT_ADDIW | HOT_JALR | HOT_LB | HOT_LBU | HOT_LH | HOT_LHU
+		| HOT_LW | HOT_LWU | HOT_LD => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfffff800u32,
+				_ => 0
+			} | ((word >> 20) & 0x000007ff)
+		) as i32,
+		HOT_SB | HOT_SH | HOT_SW | HOT_SD => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfffff000u32,
+				_ => 0
+			} | ((word >> 20) & 0xfe0) | ((word >> 7) & 0x1f)
+		) as i32,
+		HOT_BEQ | HOT_BNE | HOT_BLT | HOT_BGE | HOT_BLTU | HOT_BGEU => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfffff000u32,
+				_ => 0
+			} | ((word << 4) & 0x00000800)
+				| ((word >> 20) & 0x000007e0)
+				| ((word >> 7) & 0x0000001e)
+		) as i32,
+		HOT_LUI | HOT_AUIPC => (word & 0xfffff000) as i32,
+		HOT_JAL => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfff00000u32,
+				_ => 0
+			} | (word & 0x000ff000)
+				| ((word & 0x00100000) >> 9)
+				| ((word & 0x7fe00000) >> 20)
+		) as i32,
+		_ => 0
+	};
+	(kind, rd, rs1, rs2, imm)
+}
+
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
 	clock: u64,
@@ -92,13 +276,15 @@ pub struct Cpu {
 	_dump_flag: bool,
 	decode_cache: DecodeCache,
 	// risc-box patch: predecoded instruction cache, direct-mapped by virtual
-	// PC (see tick_operate). tags = pc, metas = mmu.exec_meta() at fill
-	// time (0 = invalid), words = the uncompressed instruction word,
-	// data = INSTRUCTIONS index | ICACHE_LEN4 for 4-byte instructions.
-	icache_tags: Vec<u64>,
-	icache_metas: Vec<u64>,
-	icache_words: Vec<u32>,
-	icache_data: Vec<u16>,
+	// PC (see tick_operate). One 32-byte entry per slot (a single cache line
+	// touched per probe; the previous four parallel arrays touched four).
+	// tag = pc, meta = mmu.exec_meta() at fill time (0 = invalid), word =
+	// the uncompressed instruction word, data = INSTRUCTIONS index |
+	// ICACHE_LEN4 for 4-byte instructions. kind/rd/rs1/rs2/imm are the
+	// fill-time pre-decode for the hot integer subset (see classify_hot):
+	// kind 0 falls back to the INSTRUCTIONS table, anything else executes
+	// inline in exec_hot without re-extracting operand bitfields.
+	icache: Vec<ICacheEntry>,
 	unsigned_data_mask: u64,
 	// risc-box patch: instructions left before the next device service, and
 	// whether an interrupt check is owed before the next instruction (see
@@ -266,10 +452,7 @@ impl Cpu {
 			_dump_flag: false,
 			decode_cache: DecodeCache::new(),
 			// risc-box patch: predecode cache starts empty (meta 0 = invalid)
-			icache_tags: vec![0; ICACHE_ENTRY_NUM],
-			icache_metas: vec![0; ICACHE_ENTRY_NUM],
-			icache_words: vec![0; ICACHE_ENTRY_NUM],
-			icache_data: vec![0; ICACHE_ENTRY_NUM],
+			icache: vec![ICacheEntry::EMPTY; ICACHE_ENTRY_NUM],
 			unsigned_data_mask: 0xffffffffffffffff,
 			// risc-box patch: service devices on the first tick, so a machine
 			// that traps immediately still sees its clint before running far.
@@ -425,16 +608,21 @@ impl Cpu {
 		// TLB generation and CPU translation state, and the code
 		// generation (bumped when a marked executable page is written).
 		let slot = ((self.pc >> 1) as usize) & (ICACHE_ENTRY_NUM - 1);
-		if self.icache_tags[slot] == self.pc && self.icache_metas[slot] == self.mmu.exec_meta() {
+		let e = self.icache[slot];
+		if e.tag == self.pc && e.meta == self.mmu.exec_meta() {
 			let instruction_address = self.pc;
-			let word = self.icache_words[slot];
-			let data = self.icache_data[slot];
-			self.pc = self.pc.wrapping_add(match data & ICACHE_LEN4 {
+			self.pc = self.pc.wrapping_add(match e.data & ICACHE_LEN4 {
 				0 => 2,
 				_ => 4
 			});
-			let result = (INSTRUCTIONS[(data & !ICACHE_LEN4) as usize].operation)(
-				self, word, instruction_address);
+			// kind != 0: the operands were pre-extracted at fill time and
+			// the operation runs inline — no indirect call, no per-execution
+			// bitfield parsing. kind 0 dispatches through the table as ever.
+			let result = match e.kind {
+				0 => (INSTRUCTIONS[(e.data & !ICACHE_LEN4) as usize].operation)(
+					self, e.word, instruction_address),
+				_ => self.exec_hot(&e, instruction_address)
+			};
 			self.x[0] = 0; // hardwired zero
 			return result;
 		}
@@ -485,14 +673,24 @@ impl Cpu {
 		if (instruction_address & 0xfff) <= 0xff8 {
 			if let Ok(p_address) = self.mmu.translate_fetch(instruction_address) {
 				if self.mmu.mark_exec_page(p_address) {
-					self.icache_tags[slot] = instruction_address;
-					self.icache_metas[slot] = self.mmu.exec_meta();
-					self.icache_words[slot] = word;
-					self.icache_data[slot] = index as u16
-						| (match (original_word & 0x3) == 0x3 {
-							true => ICACHE_LEN4,
-							false => 0
-						});
+					let (kind, rd, rs1, rs2, imm) =
+						classify_hot(INSTRUCTIONS[index].name, word);
+					self.icache[slot] = ICacheEntry {
+						tag: instruction_address,
+						meta: self.mmu.exec_meta(),
+						word: word,
+						imm: imm,
+						data: index as u16
+							| (match (original_word & 0x3) == 0x3 {
+								true => ICACHE_LEN4,
+								false => 0
+							}),
+						kind: kind,
+						rd: rd,
+						rs1: rs1,
+						rs2: rs2,
+						_pad: 0
+					};
 				}
 			}
 		}
@@ -500,6 +698,251 @@ impl Cpu {
 		let result = (INSTRUCTIONS[index].operation)(self, word, instruction_address);
 		self.x[0] = 0; // hardwired zero
 		result
+	}
+
+	// risc-box patch: inline execution of the predecoded hot set. Every arm
+	// is the corresponding INSTRUCTIONS closure body verbatim, with the
+	// parse_format_* call replaced by the entry's fill-time fields (shift
+	// amounts still come from the word so the xlen-dependent masks run
+	// exactly as upstream wrote them). Keeping the bodies identical is the
+	// correctness argument: this is the same code, minus re-parsing and an
+	// indirect call.
+	#[inline(always)]
+	fn exec_hot(&mut self, e: &ICacheEntry, address: u64) -> Result<(), Trap> {
+		let rd = e.rd as usize;
+		let rs1 = e.rs1 as usize;
+		let rs2 = e.rs2 as usize;
+		let imm = e.imm as i64;
+		match e.kind {
+			HOT_ADDI => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_add(imm));
+			},
+			HOT_ADD => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_add(self.x[rs2]));
+			},
+			HOT_LD => {
+				self.x[rd] = match self.mmu.load_doubleword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_SD => {
+				return self.mmu.store_doubleword(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u64);
+			},
+			HOT_LW => {
+				self.x[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i32 as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_SW => {
+				return self.mmu.store_word(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u32);
+			},
+			HOT_BEQ => {
+				if self.sign_extend(self.x[rs1]) == self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BNE => {
+				if self.sign_extend(self.x[rs1]) != self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BLT => {
+				if self.sign_extend(self.x[rs1]) < self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BGE => {
+				if self.sign_extend(self.x[rs1]) >= self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BLTU => {
+				if self.unsigned_data(self.x[rs1]) < self.unsigned_data(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BGEU => {
+				if self.unsigned_data(self.x[rs1]) >= self.unsigned_data(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_LUI => {
+				self.x[rd] = imm;
+			},
+			HOT_AUIPC => {
+				self.x[rd] = self.sign_extend(address.wrapping_add(imm as u64) as i64);
+			},
+			HOT_JAL => {
+				self.x[rd] = self.sign_extend(self.pc as i64);
+				self.pc = address.wrapping_add(imm as u64);
+			},
+			HOT_JALR => {
+				let tmp = self.sign_extend(self.pc as i64);
+				self.pc = (self.x[rs1] as u64).wrapping_add(imm as u64);
+				self.x[rd] = tmp;
+			},
+			HOT_ANDI => {
+				self.x[rd] = self.sign_extend(self.x[rs1] & imm);
+			},
+			HOT_ORI => {
+				self.x[rd] = self.sign_extend(self.x[rs1] | imm);
+			},
+			HOT_XORI => {
+				self.x[rd] = self.sign_extend(self.x[rs1] ^ imm);
+			},
+			HOT_AND => {
+				self.x[rd] = self.sign_extend(self.x[rs1] & self.x[rs2]);
+			},
+			HOT_OR => {
+				self.x[rd] = self.sign_extend(self.x[rs1] | self.x[rs2]);
+			},
+			HOT_XOR => {
+				self.x[rd] = self.sign_extend(self.x[rs1] ^ self.x[rs2]);
+			},
+			HOT_SUB => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_sub(self.x[rs2]));
+			},
+			HOT_SLLI => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = self.sign_extend(self.x[rs1] << shamt);
+			},
+			HOT_SRLI => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = self.sign_extend((self.unsigned_data(self.x[rs1]) >> shamt) as i64);
+			},
+			HOT_SRAI => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = self.sign_extend(self.x[rs1] >> shamt);
+			},
+			HOT_ADDIW => {
+				self.x[rd] = self.x[rs1].wrapping_add(imm) as i32 as i64;
+			},
+			HOT_ADDW => {
+				self.x[rd] = self.x[rs1].wrapping_add(self.x[rs2]) as i32 as i64;
+			},
+			HOT_SUBW => {
+				self.x[rd] = self.x[rs1].wrapping_sub(self.x[rs2]) as i32 as i64;
+			},
+			HOT_SLLIW => {
+				let shamt = e.rs2 as u32;
+				self.x[rd] = (self.x[rs1] << shamt) as i32 as i64;
+			},
+			HOT_SRLIW => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = ((self.x[rs1] as u32) >> shamt) as i32 as i64;
+			},
+			HOT_SRAIW => {
+				let shamt = ((e.word >> 20) & 0x1f) as u32;
+				self.x[rd] = ((self.x[rs1] as i32) >> shamt) as i64;
+			},
+			HOT_SLLW => {
+				self.x[rd] = (self.x[rs1] as u32).wrapping_shl(self.x[rs2] as u32) as i32 as i64;
+			},
+			HOT_SRLW => {
+				self.x[rd] = (self.x[rs1] as u32).wrapping_shr(self.x[rs2] as u32) as i32 as i64;
+			},
+			HOT_SRAW => {
+				self.x[rd] = (self.x[rs1] as i32).wrapping_shr(self.x[rs2] as u32) as i64;
+			},
+			HOT_SLL => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_shl(self.x[rs2] as u32));
+			},
+			HOT_SRL => {
+				self.x[rd] = self.sign_extend(self.unsigned_data(self.x[rs1]).wrapping_shr(self.x[rs2] as u32) as i64);
+			},
+			HOT_SRA => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_shr(self.x[rs2] as u32));
+			},
+			HOT_SLT => {
+				self.x[rd] = match self.x[rs1] < self.x[rs2] {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_SLTI => {
+				self.x[rd] = match self.x[rs1] < imm {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_SLTU => {
+				self.x[rd] = match self.unsigned_data(self.x[rs1]) < self.unsigned_data(self.x[rs2]) {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_SLTIU => {
+				self.x[rd] = match self.unsigned_data(self.x[rs1]) < self.unsigned_data(imm) {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_MUL => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_mul(self.x[rs2]));
+			},
+			HOT_LB => {
+				self.x[rd] = match self.mmu.load(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i8 as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LBU => {
+				self.x[rd] = match self.mmu.load(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LH => {
+				self.x[rd] = match self.mmu.load_halfword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i16 as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LHU => {
+				self.x[rd] = match self.mmu.load_halfword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LWU => {
+				self.x[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_SB => {
+				return self.mmu.store(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u8);
+			},
+			HOT_SH => {
+				return self.mmu.store_halfword(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u16);
+			},
+			// kind is only ever written by classify_hot, so this arm is dead;
+			// the table dispatch (not a panic — a guest must never crash the
+			// host) keeps it safe anyway.
+			_ => {
+				return (INSTRUCTIONS[(e.data & !ICACHE_LEN4) as usize].operation)(
+					self, e.word, address);
+			}
+		}
+		Ok(())
 	}
 
 	/// Decodes a word instruction data and returns a reference to
