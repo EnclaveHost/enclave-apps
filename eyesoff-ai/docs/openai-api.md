@@ -237,11 +237,20 @@ Drawing, looking and upscaling live here, as ordinary registry entries rather
 than as built-ins: see [Picture tools](#picture-tools) below.
 
 **2. Client passthrough — `tools: [...]` (array, OpenAI).**
-The client's own functions are offered to the model **instead of** the
-deployment's registry (never merged — a client-supplied name must not select
-a server-executed capability that shares it). Nothing here executes a
-caller's tool: the model's call comes back structured and the **client**
-runs it, then sends the result as a `role: "tool"` message.
+The client's own functions are offered to the model, and nothing here executes
+one: the model's call comes back structured and the **client** runs it, then
+sends the result as a `role: "tool"` message.
+
+From 0.46 they are offered **alongside** the deployment's registry rather than
+instead of it, so an agent that brings its own file tools still reaches
+`web_search`. The model sees one list and is told nothing about which entry is
+whose; a finished call is routed by the entry's **source**, never by its name.
+A server entry runs here, in the loop, and the client never sees it; a client
+entry ends the turn and comes back on `tool_calls`. A name declared on **both**
+sides resolves to the client's, and the deployment's twin is dropped from the
+list entirely — so a client-supplied name still cannot select a server-executed
+capability. `"web_search": false` withholds the web builtins from the merged
+list too, and `tool_choice: "none"` withholds everything.
 
 ```json
 "tools": [{"type": "function",

@@ -3835,10 +3835,14 @@ impl ChatReq {
     /// the prompt can render. This is the PASSTHROUGH mode tools.rs describes:
     /// the model is offered the CLIENT's functions, its call comes back on the
     /// reply as `tool_calls`, and the client executes it - nothing here ever
-    /// runs one. A request that declares tools gets them INSTEAD of the
-    /// deployment's registry, never merged with it: the model sees one list,
-    /// and a client-supplied name must not be able to select a server-executed
-    /// capability that merely shares it.
+    /// runs one of THESE.
+    ///
+    /// They are offered alongside the deployment's own registry, not instead of
+    /// it (tools::merge_registries). The model still sees ONE list; what decides
+    /// who executes an entry is its `src`, never its name. A client-supplied
+    /// name still cannot select a server-executed capability that merely shares
+    /// it, because the client's entry WINS the collision and the server's twin
+    /// is dropped from the list entirely.
     ///
     /// Err when the array is present but not a shape this side can name a
     /// function from - a client waiting for `tool_calls` has to hear why it
@@ -4848,6 +4852,59 @@ fn images_read_locally(cfg: &AppConfig, requested: Option<&str>) -> bool {
     }
 }
 
+/// The calls in a finished reply that belong to the CLIENT.
+///
+/// `merged` is the one list the model was actually shown. When the deployment's
+/// own loop is live beside it, ownership is read off each entry's `src` - so a
+/// call naming a server tool is left alone for the loop to run, and only the
+/// client's own come back as `tool_calls`. When the loop is not live this is the
+/// plain passthrough and every call the parser finds goes back, including one
+/// naming a tool the client never declared: the client can report that far
+/// better than this side can, and silently swallowing it would leave the turn
+/// looking like prose.
+fn client_calls_in(
+    text: &str,
+    merged: Option<&[tools::Tool]>,
+    loop_live: bool,
+) -> Vec<tools::ToolCall> {
+    let Some(all) = merged else { return Vec::new() };
+    let found = tools::parse_calls_for(text, all);
+    if !loop_live {
+        return found;
+    }
+    found
+        .into_iter()
+        .filter(|c| {
+            all.iter()
+                .any(|t| t.name == c.name && matches!(t.src, tools::ToolSrc::Client))
+        })
+        .collect()
+}
+
+/// The one list the model is shown, and the block that renders it. `None` when
+/// the request declared no tools of its own, which leaves every existing path
+/// exactly as it was.
+fn merge_client_tools(
+    client_reg: Option<&Vec<tools::Tool>>,
+    tl: Option<&ToolLoop>,
+    must_call: Option<&str>,
+) -> (Option<Vec<tools::Tool>>, Option<String>) {
+    let Some(cl) = client_reg else { return (None, None) };
+    match tl {
+        // ONE list, TWO executors. A client that brought its own tools used to
+        // lose the deployment's registry outright, which is why an agent on
+        // this endpoint could not search: it held the caller's file tools and
+        // nothing else, while web_search sat in a registry it was never shown.
+        Some(t) => {
+            let all = tools::merge_registries(t.tools(), cl);
+            let block = tools::merged_system_block(&all, t.cfg.max_calls, must_call);
+            (Some(all), Some(block))
+        }
+        // nothing of ours is armed this turn: the passthrough, unchanged
+        None => (Some(cl.clone()), Some(tools::client_system_block(cl, must_call))),
+    }
+}
+
 fn tools_enabled<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> Option<&'a tools::ToolsConfig> {
     let tc = cfg.tools.as_ref()?;
     if tc.is_empty() || !tools::template_supported(&cfg.template) {
@@ -5462,13 +5519,15 @@ fn apply_web_search(
     // at once, and paying for that pass twice would be the whole saving gone
     effort_out: &mut Option<Effort>,
     want_effort: bool,
-    // the MODEL holds a web_search tool this turn, so the router must not
-    // decide about search. Image routing is independent (see RouterAsk) and
-    // has the same rule via model_images.
+    // the search decision is already SOMEONE ELSE'S this turn, so the router
+    // must not take it: either the MODEL holds a web_search tool, or the
+    // client declared its own `tools` array and brought its own retrieval
+    // loop with it. Image routing is independent (see RouterAsk) and has the
+    // same rule via model_images.
     model_searches: bool,
-    // the MODEL holds generate_image this turn: the router's image verdict
-    // stands down. An explicit /image is untouched - a typed command beats
-    // both deciders.
+    // same, for pictures: the MODEL holds generate_image, or the client's own
+    // tools own the turn. An explicit /image is untouched - a typed command
+    // beats every decider.
     model_images: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
@@ -6012,10 +6071,12 @@ enum Capabilities<'a> {
     /// the answer with a tool registry: the real signatures, and the stop
     /// string that ends generation the moment a call is complete
     Tools(&'a [tools::Tool], usize),
-    /// the answer with CLIENT-declared tools (the /v1 passthrough): the block
-    /// is pre-rendered by the handler (see tools::client_system_block), and
-    /// the same stop string arms - a completed call ends the turn, because
-    /// executing it is the client's job
+    /// the answer with CLIENT-declared tools (the /v1 passthrough), and with
+    /// this deployment's own merged in beside them when any are armed. The
+    /// block is pre-rendered by the handler (client_system_block for the
+    /// client's alone, merged_system_block for both), and the same stop string
+    /// arms either way - what differs is only what happens to a completed call,
+    /// which the handler decides from the tool's source, not from this variant
     Client(&'a str),
 }
 
@@ -6880,15 +6941,13 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     };
     // A client-declared `tools` array is the PASSTHROUGH (see client_tools):
     // the model is offered the client's functions and its call goes back on
-    // the reply as `tool_calls`, for the CLIENT to execute. The registry the
-    // deployment configured sits the turn out - the model sees ONE list.
+    // the reply as `tool_calls`, for the CLIENT to execute. The deployment's
+    // own registry is offered BESIDE them rather than sitting the turn out -
+    // see the merge each leg builds once its tool loop is open.
     let client_reg = match creq.client_tools() {
         Ok(r) => r,
         Err(e) => return json_err(out, 400, &e),
     };
-    let client_block = client_reg
-        .as_ref()
-        .map(|list| tools::client_system_block(list, creq.tool_must_call().as_deref()));
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
@@ -6972,12 +7031,8 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
-        let mut tl = if client_reg.is_some() {
-            None
-        } else {
-            tools_enabled(cfg, &creq)
-                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status, &formatter))
-        };
+        let mut tl = tools_enabled(cfg, &creq)
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status, &formatter));
         if let Some(t) = &tl {
             for n in &t.reg.notes {
                 let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
@@ -6986,8 +7041,25 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
-        let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
-        let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
+        let (merged, client_block) = merge_client_tools(
+            client_reg.as_ref(),
+            tl.as_ref(),
+            creq.tool_must_call().as_deref(),
+        );
+        // A client that declared its OWN tools brought its own retrieval loop,
+        // so the pre-pass router stands down: rewriting that client's user turn
+        // with search results is this deployment competing with the agent it is
+        // serving. Measured 2026-08-14 against opencode on "build a pacman clone
+        // in this folder": the router searched, pasted ~5 KB of Pac-Man articles
+        // into the turn, and the prompt went 304 -> 5439 tokens. The model then
+        // spent its whole think budget reasoning about the ARTICLES and never
+        // called the client's `list` - a coding request answered as trivia. With
+        // the router disarmed the same request calls `list(".")` in 70 tokens.
+        // An explicit `web_search: true` or a `/search ` prefix still searches:
+        // that is the caller asking for it, not the deployment deciding.
+        let router_yields = client_reg.is_some();
+        let model_searches = router_yields || tl.as_ref().is_some_and(|t| t.owns_search());
+        let model_images = router_yields || tl.as_ref().is_some_and(|t| t.owns_image());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -7127,7 +7199,15 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             let status = |s: &str| send_raw(&format!(": {s}\n\n"));
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
                 Ok(s) => {
-                    if let Some(t) = &mut tl {
+                    // Whose call is this? Read off the merged list's entries,
+                    // never guessed from the name: a client's tool ends the
+                    // turn and travels back as `tool_calls`, and anything else
+                    // falls through to the loop below and runs here, which the
+                    // client never sees.
+                    let client_now =
+                        client_calls_in(&s.text, merged.as_deref(), tl.is_some());
+                    let ours = client_now.is_empty();
+                    if let Some(t) = tl.as_mut().filter(|_| ours) {
                         // the call and its result travel as comments, for the
                         // same reason the sources do
                         let on_call = |c: &serde_json::Value| {
@@ -7166,14 +7246,11 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                         gate.borrow_mut().drop_call();
                         if bare { format!("[{note}]") } else { format!("\n\n[{note}]") }
                     });
-                    if client_block.is_some() {
-                        client_calls =
-                            tools::parse_calls_for(&s.text, client_reg.as_deref().unwrap_or(&[]));
-                        if !client_calls.is_empty() {
-                            // the held call leaves as structured `tool_calls`
-                            // below, not as content
-                            gate.borrow_mut().drop_call();
-                        }
+                    if !client_now.is_empty() {
+                        // the held call leaves as structured `tool_calls`
+                        // below, not as content
+                        client_calls = client_now;
+                        gate.borrow_mut().drop_call();
                     }
                     if let Some(rest) = gate.borrow_mut().flush() {
                         if !opened.replace(true) {
@@ -7243,17 +7320,30 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
-        let mut tl = if client_reg.is_some() {
-            None
-        } else {
-            tools_enabled(cfg, &creq)
-                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status, &formatter))
-        };
+        let mut tl = tools_enabled(cfg, &creq)
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status, &formatter));
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
-        let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
-        let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
+        let (merged, client_block) = merge_client_tools(
+            client_reg.as_ref(),
+            tl.as_ref(),
+            creq.tool_must_call().as_deref(),
+        );
+        // A client that declared its OWN tools brought its own retrieval loop,
+        // so the pre-pass router stands down: rewriting that client's user turn
+        // with search results is this deployment competing with the agent it is
+        // serving. Measured 2026-08-14 against opencode on "build a pacman clone
+        // in this folder": the router searched, pasted ~5 KB of Pac-Man articles
+        // into the turn, and the prompt went 304 -> 5439 tokens. The model then
+        // spent its whole think budget reasoning about the ARTICLES and never
+        // called the client's `list` - a coding request answered as trivia. With
+        // the router disarmed the same request calls `list(".")` in 70 tokens.
+        // An explicit `web_search: true` or a `/search ` prefix still searches:
+        // that is the caller asking for it, not the deployment deciding.
+        let router_yields = client_reg.is_some();
+        let model_searches = router_yields || tl.as_ref().is_some_and(|t| t.owns_search());
+        let model_images = router_yields || tl.as_ref().is_some_and(|t| t.owns_image());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -7314,7 +7404,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         for (target, tname) in targets_for(cfg, mode).iter() {
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &sink, &sink) {
                 Ok(s) => {
-                    if let Some(t) = &mut tl {
+                    // ownership before execution, exactly as the streaming leg
+                    let ours =
+                        client_calls_in(&s.text, merged.as_deref(), tl.is_some()).is_empty();
+                    if let Some(t) = tl.as_mut().filter(|_| ours) {
                         let quiet = |_: &serde_json::Value| {};
                         if t.step(&s.text, &mut messages, &quiet, &quiet, &|_| {}) {
                             continue 'answer;
@@ -7330,11 +7423,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         }
         match result {
             Some(s) => {
-                let client_calls = if client_block.is_some() {
-                    tools::parse_calls_for(&s.text, client_reg.as_deref().unwrap_or(&[]))
-                } else {
-                    Vec::new()
-                };
+                let client_calls = client_calls_in(&s.text, merged.as_deref(), tl.is_some());
                 let refused = tl.as_mut().and_then(|t| t.refused.take());
                 let (message, finish) = if client_calls.is_empty() {
                     // an attempted call that ran nothing is replaced by its
@@ -8479,6 +8568,43 @@ mod tests {
         assert!(split.image_on(false));
         assert_eq!(split.web_mode(false), WebMode::Off);
         assert!(!req(serde_json::json!({ "messages": [], "image_gen": "off" })).image_on(true));
+    }
+
+    /// With both lists live, a call is routed by its SOURCE. The client's own
+    /// come back as `tool_calls` and end the turn; the deployment's are left
+    /// for the loop to execute here, so the client never sees a call it has no
+    /// way to run. This is what lets an agent hold its file tools and this
+    /// deployment's web_search in the same answer.
+    #[test]
+    fn a_call_goes_to_whoever_owns_the_tool() {
+        let mk = |name: &str, src: tools::ToolSrc| tools::Tool {
+            name: name.into(),
+            description: String::new(),
+            parameters: tools::object_schema(None),
+            src,
+        };
+        let all = vec![
+            mk("read", tools::ToolSrc::Client),
+            mk("web_search", tools::ToolSrc::Http(0)),
+        ];
+        let client_call = "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"p\": \"x\"}}\n</tool_call>";
+        let server_call =
+            "<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"x\"}}\n</tool_call>";
+
+        // loop live: ours stays here, theirs goes back
+        let mine = client_calls_in(client_call, Some(&all), true);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].name, "read");
+        assert!(
+            client_calls_in(server_call, Some(&all), true).is_empty(),
+            "a server tool must never be handed to the client to run"
+        );
+
+        // no loop: the plain passthrough, where every call found goes back -
+        // including a name the client never declared, which it reports better
+        // than this side can
+        assert_eq!(client_calls_in(server_call, Some(&all), false).len(), 1);
+        assert!(client_calls_in(client_call, None, false).is_empty());
     }
 
     /// A client that declares its OWN tools gets the passthrough: the array
