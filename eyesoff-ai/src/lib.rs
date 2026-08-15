@@ -2274,17 +2274,29 @@ struct LoopGuard {
 
 impl LoopGuard {
     fn new(reps: usize) -> LoopGuard {
-        LoopGuard { reps, max_period: 64 }
+        // 512, not 64. The unit a stuck model repeats is not a phrase, it is a
+        // PARAGRAPH: measured 2026-08-15, qwen3.8 spent ~18k tokens restating
+        // the same 200-token plan ("Let me write the game now. I'll create the
+        // HTML file...") after its think block was force-closed. At 64 the
+        // repeating unit was longer than anything the detector could see, so
+        // the guard scanned the whole reply and found nothing.
+        LoopGuard { reps, max_period: 512 }
     }
 
     /// Short blocks need more evidence: a couple of repeated newlines or a
     /// run of dashes in a table is ordinary text, while the same twelve
     /// tokens four times over is not.
+    ///
+    /// Long blocks are the other extreme and need LESS. Prose does not restate
+    /// a whole paragraph word for word, so three of them is already proof;
+    /// demanding the full `reps` there means a 200-token paragraph has to
+    /// repeat forty times - eight thousand tokens - before anything notices.
     fn required(&self, period: usize) -> usize {
         match period {
             1 => self.reps * 6,
             2..=4 => self.reps * 3,
-            _ => self.reps,
+            5..=63 => self.reps,
+            _ => self.reps.min(3),
         }
     }
 
@@ -2301,6 +2313,13 @@ impl LoopGuard {
             // does not fit skipped every longer one - which is to say, the
             // whole class of failure this guard exists for.
             if g.len() < span {
+                continue;
+            }
+            // O(1) reject before the O(span) walk: if the last token does not
+            // match the one a period back, this period cannot be the unit.
+            // Scanning to 512 without it costs ~400k comparisons per token,
+            // which is the reason the ceiling was low in the first place.
+            if g[g.len() - 1] != g[g.len() - 1 - period] {
                 continue;
             }
             let tail = &g[g.len() - span..];
@@ -8784,6 +8803,40 @@ mod tests {
         tl.refused = None;
         assert!(!tl.step("Here is the answer.", &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert_eq!(tl.refused, None);
+    }
+
+    /// The failure LoopGuard exists for, at the scale it actually happens:
+    /// a model whose think block was force-closed carries on restating the
+    /// same PARAGRAPH in prose. Measured 2026-08-15 at ~18k tokens. The unit
+    /// is far longer than a phrase, so a 64-token ceiling could not see it and
+    /// `required() == reps` would have wanted forty repeats of it.
+    #[test]
+    fn a_repeated_paragraph_is_a_loop() {
+        // 200 distinct tokens: a paragraph, not a phrase
+        let para: Vec<u32> = (1000..1200).collect();
+        let guard = LoopGuard::new(40); // the live repeat_guard
+        let two: Vec<u32> = para.iter().chain(para.iter()).copied().collect();
+        assert!(!guard.tripped(&two), "twice could still be deliberate");
+        let three: Vec<u32> =
+            para.iter().chain(para.iter()).chain(para.iter()).copied().collect();
+        assert!(guard.tripped(&three), "a 200-token paragraph three times over is a loop");
+
+        // ordinary prose must not trip: 3000 non-repeating tokens
+        let prose: Vec<u32> = (0..3000).collect();
+        assert!(!guard.tripped(&prose));
+
+        // a short phrase still needs a lot of evidence before it counts
+        let phrase: Vec<u32> = (0..7).collect();
+        let few: Vec<u32> = phrase.iter().cycle().take(7 * 10).copied().collect();
+        assert!(!guard.tripped(&few), "ten repeats of a short phrase is not proof");
+        // ...but a long enough run trips anyway, because 13 phrases in a row
+        // ARE a 91-token block and three of those are a loop by the rule
+        // above. Catching it sooner by a different route is the point.
+        let many: Vec<u32> = phrase.iter().cycle().take(7 * 39).copied().collect();
+        assert!(guard.tripped(&many));
+
+        // reps 0 is off, whatever the shape
+        assert!(!LoopGuard::new(0).tripped(&three));
     }
 
     /// An attempted call the parser cannot accept is corrected up to
