@@ -4308,9 +4308,15 @@ struct ToolLoop<'a> {
     /// the model was already told it has run out of calls. Without this a model
     /// that keeps calling would loop forever: told, calls again, told again.
     limit_told: bool,
-    /// the model was already told its unparseable call was not run - the same
-    /// one-correction rule as limit_told, for the same reason
-    malformed_told: bool,
+    /// how many times the model has been told its call could not be parsed.
+    /// A COUNT, not a flag: one correction was enough when a malformed call
+    /// meant a confused model, but this family writes four different call
+    /// spellings at temperature 0.6 and picks between them per turn, so a
+    /// single bad draft was ending turns the very next attempt would have got
+    /// right. Observed live 2026-08-14: the model reasoned its way to "I must
+    /// search the web for the maze layout", searched, judged the result wrong,
+    /// and its retry died on one unparseable call.
+    malformed_tries: usize,
     /// why the finished reply's call ran nothing, when one was attempted: the
     /// legs deliver this readable reason in place of the raw block
     refused: Option<&'static str>,
@@ -4322,6 +4328,10 @@ struct ToolLoop<'a> {
 /// place of the dead JSON, so the wording has to stand alone.
 const REFUSED_MALFORMED: &str =
     "the model wrote a tool call this app could not parse, so it was not run";
+/// How many unparseable calls in one answer get a rewrite before the turn
+/// ends. Each costs a re-prefill and a generation, so it is not free; the
+/// alternative is losing a turn the model was one draft away from finishing.
+const MALFORMED_RETRIES: usize = 3;
 const REFUSED_LIMIT: &str =
     "the model wrote another tool call after the per-answer limit, so it was not run";
 
@@ -4344,7 +4354,7 @@ impl<'a> ToolLoop<'a> {
             image_out: None,
             calls: 0,
             limit_told: false,
-            malformed_told: false,
+            malformed_tries: 0,
             refused: None,
             log: Vec::new(),
         }
@@ -4407,23 +4417,35 @@ impl<'a> ToolLoop<'a> {
             // No call parsed - but was one ATTEMPTED? Left alone it reaches
             // the user as raw JSON, which the next turn then copies back out
             // of history (seen live 2026-08-05: {"arguments":{"url":...}}
-            // with no name at all). Same two-strike shape as the budget:
-            // correct it once, refuse with a reason the second time.
+            // with no name at all). Correct it up to MALFORMED_RETRIES times,
+            // then refuse with a reason: a bad draft must not end a turn the
+            // next draft would finish.
             if attempted_call(text) {
-                if self.malformed_told {
+                if self.malformed_tries >= MALFORMED_RETRIES {
                     self.refused = Some(REFUSED_MALFORMED);
                 } else {
-                    self.malformed_told = true;
+                    self.malformed_tries += 1;
                     on_note("the model wrote a tool call this app could not parse; asking it to rewrite the call");
                     messages.push(ChatMsg::text("assistant", strip_think(text).trim().to_string()));
                     messages.push(ChatMsg::text(
                         "user",
                         tools::response_turn(
                             "tool_call",
-                            "This call was NOT run: it could not be parsed. A call is ONE \
-                             JSON object with exactly two top-level fields, \"name\" (the \
-                             function to call) and \"arguments\" (an object with its \
-                             parameters), between <tool_call> and </tool_call> tags. Rewrite \
+                            // The wrong shapes are NAMED, because this model does
+                            // not make one kind of mistake - it picks between
+                            // several. Telling it only what the right shape looks
+                            // like leaves it free to choose a different wrong one
+                            // on the retry, which is what the live traces show.
+                            "This call was NOT run: it could not be parsed. Write it as ONE \
+                             JSON object between <tool_call> and </tool_call>, with exactly \
+                             two top-level fields, \"name\" and \"arguments\", like this:\n\
+                             <tool_call>\n\
+                             {\"name\": \"web_search\", \"arguments\": {\"query\": \"what to \
+                             search for\"}}\n\
+                             </tool_call>\n\
+                             Do NOT write <function=name>. Do NOT put the name inside \
+                             \"arguments\". Do NOT send \"arguments\" as a quoted string; it \
+                             is an object. Always close the tag with </tool_call>. Rewrite \
                              the call in exactly that shape, or answer in prose without one.",
                         ),
                     ));
@@ -8764,9 +8786,12 @@ mod tests {
         assert_eq!(tl.refused, None);
     }
 
-    /// An attempted call the parser cannot accept is corrected once, refused
-    /// with a reason the second time, and never mistaken for prose that only
-    /// mentions the tag.
+    /// An attempted call the parser cannot accept is corrected up to
+    /// MALFORMED_RETRIES times, refused with a reason after that, and never
+    /// mistaken for prose that only mentions the tag. The budget is a COUNT
+    /// rather than one strike because a model with several call spellings can
+    /// pick a different wrong one on the retry, and ending the turn on the
+    /// first bad draft throws away work the next draft would land.
     #[test]
     fn unparseable_calls_are_corrected_then_refused() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
@@ -8781,11 +8806,22 @@ mod tests {
         // the live shape of 2026-08-05: no name anywhere, tag left unclosed
         let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";
         let noted = std::cell::Cell::new(0);
-        assert!(tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_: &str| noted.set(noted.get() + 1)));
-        assert_eq!(noted.get(), 1);
-        assert_eq!(msgs.len(), 3);
-        assert!(msgs[2].content.contains("could not be parsed"), "{}", msgs[2].content);
-        // still malformed after the correction: refused, not delivered raw
+        for i in 1..=MALFORMED_RETRIES {
+            assert!(
+                tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_: &str| noted.set(noted.get() + 1)),
+                "attempt {i} should be corrected, not refused"
+            );
+            assert_eq!(noted.get(), i);
+            assert_eq!(msgs.len(), 1 + 2 * i);
+        }
+        let last = msgs.last().unwrap().content.clone();
+        assert!(last.contains("could not be parsed"), "{last}");
+        // the correction NAMES the shapes this model actually gets wrong, so a
+        // retry cannot simply choose a different one
+        for wrong in ["<function=name>", "inside \\\"arguments\\\"", "quoted string"] {
+            assert!(last.contains(wrong), "missing {wrong}: {last}");
+        }
+        // still malformed after the budget: refused, not delivered raw
         assert!(!tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert_eq!(tl.refused, Some(REFUSED_MALFORMED));
         // prose that mentions the tag without an object is an answer
