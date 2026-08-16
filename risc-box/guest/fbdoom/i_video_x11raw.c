@@ -48,6 +48,9 @@
 #include <sys/time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
 
 // globals the rest of the tree expects from a video/input backend
 byte *I_VideoBuffer = NULL;
@@ -81,11 +84,31 @@ static int shm_id[NBUF];
 static uint32_t *shm_buf[NBUF];
 static int cur_buf, pending;
 
+// Direct-to-framebuffer overlay (opt-in, -overlay; see I_InitGraphics).
+//
+// The idea: with MIT-SHM the frame is written once by us and copied once by
+// the server, and the pixels are already in the same DRAM the framebuffer
+// lives in, so the scale could write THERE and the copy would stop happening.
+// It works — "100 direct / 0 via X" — and it is not faster, because the
+// server's copy was a smaller share of the frame than it appeared.
+//
+// It is only safe while the window is fully visible and where it is, so the
+// window's origin is tracked with TranslateCoordinates and its visibility with
+// VisibilityNotify; anything else (obscured, moved and not yet re-resolved, no
+// /dev/fb0) falls back to the ShmPutImage path, which is always correct.
+static uint8_t *fbmem;
+static size_t fbmem_len;
+static int fb_stride, fb_w_px, fb_h_px;
+static int org_x = -1, org_y = -1;    // window origin in root coordinates
+static int visible;                   // VisibilityUnobscured
+static int overlay_frames, x_frames;  // how each frame got to the screen
+
 static int frames;
 static struct timeval fps_t0;
 static int fps_report = 1;
 
 void I_GetEvent_blocking(void);
+static int have_prev;   // defined with `prev` below
 
 static uint32_t new_id(void)
 {
@@ -247,7 +270,8 @@ static void x_create_window(void)
     cw.mask = 0x00000002 | 0x00000800;   // CWBackPixel | CWEventMask
     cw.bg = 0;
     // KeyPress | KeyRelease | Exposure | StructureNotify
-    cw.events = 0x00000001 | 0x00000002 | 0x00008000 | 0x00020000;
+    // KeyPress | KeyRelease | Exposure | VisibilityChange | StructureNotify
+    cw.events = 0x00000001 | 0x00000002 | 0x00008000 | 0x00010000 | 0x00020000;
     wr(&cw, sizeof(cw));
 
     mw.op = 8;
@@ -264,6 +288,71 @@ static void x_create_window(void)
     cg.drawable = win;
     cg.mask = 0;
     wr(&cg, sizeof(cg));
+}
+
+// Map the framebuffer for the overlay path. Failure is not fatal: without it
+// every frame simply goes through the server.
+static void fb_open(void)
+{
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    int fd = open("/dev/fb0", O_RDWR);
+
+    if (fd < 0)
+        return;
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo) < 0 ||
+        ioctl(fd, FBIOGET_FSCREENINFO, &finfo) < 0 ||
+        vinfo.bits_per_pixel != 32) {
+        close(fd);
+        return;
+    }
+    fb_stride = finfo.line_length;
+    fb_w_px = vinfo.xres;
+    fb_h_px = vinfo.yres;
+    fbmem_len = (size_t)fb_stride * fb_h_px;
+    fbmem = mmap(NULL, fbmem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (fbmem == MAP_FAILED)
+        fbmem = NULL;
+}
+
+// Where is this window on the root, right now? (The window manager reparents
+// and decorates, so the answer is not the position we asked for.)
+static void x_resolve_origin(void)
+{
+    struct {
+        uint8_t op, pad;
+        uint16_t len;
+        uint32_t src, dst;
+        int16_t x, y;
+    } tc = { 40, 0, 4, 0, 0, 0, 0 };
+    uint8_t r[32];
+
+    tc.src = win;
+    tc.dst = root_win;
+    org_x = org_y = -1;
+    if (wr(&tc, sizeof(tc)) < 0)
+        return;
+    // Read until the reply; events seen on the way are handled as usual.
+    for (;;) {
+        if (rd(r, sizeof(r)) < 0)
+            return;
+        if ((r[0] & 0x7f) == 1) {                 // reply
+            uint32_t extra = *(uint32_t *)(r + 4);
+            while (extra--) {
+                uint8_t junk[4];
+                if (rd(junk, 4) < 0)
+                    return;
+            }
+            org_x = *(int16_t *)(r + 8);
+            org_y = *(int16_t *)(r + 10);
+            return;
+        }
+        if (shm_ev && (r[0] & 0x7f) == shm_ev && pending > 0)
+            pending--;
+        else if ((r[0] & 0x7f) == 15)             // VisibilityNotify
+            visible = (r[8] == 0);
+    }
 }
 
 // Ask for MIT-SHM and set up the shared frames. Returns 0 if anything is
@@ -372,6 +461,25 @@ void I_InitGraphics(void)
     X_width = win_w;
     X_height = win_h;
 
+    // Opt-IN, because it was measured and it did not pay: same binary, same
+    // boot, same scenes, DOOM's own counter gave 24-40 fps with the overlay
+    // against 35-40 with the server doing the copy. The server's blit out of
+    // shared memory is simply not the expensive part it looked like, and an
+    // overlay owes correctness work the copy gets for free -- it paints
+    // outside the window whenever the window has moved and the origin has not
+    // been re-resolved, and only the window manager knows when that is. Kept
+    // behind a flag because the measurement, not the idea, is what settled it.
+    if (M_CheckParm("-overlay")) {
+        fb_open();
+        if (fbmem) {
+            x_resolve_origin();
+            printf("I_InitGraphics: overlay on /dev/fb0 %dx%d stride %d, window at %d,%d\n",
+                   fb_w_px, fb_h_px, fb_stride, org_x, org_y);
+        } else {
+            printf("I_InitGraphics: no /dev/fb0 overlay; every frame goes through X\n");
+        }
+    }
+
     if (M_CheckParm("-nofps"))
         fps_report = 0;
     gettimeofday(&fps_t0, NULL);
@@ -419,48 +527,117 @@ static void put_rows(int y0, int rows)
     wr(img + (size_t)y0 * win_w, bytes);
 }
 
+// The rows of I_VideoBuffer as they were last presented, so a row that did not
+// change is neither scaled nor sent. DOOM redraws its whole 320x200 buffer
+// every frame — including the status bar, which changes when the player's
+// health does and not otherwise — and the server's blit out of shared memory
+// is about half of what a frame costs on this machine. Comparing 320 bytes a
+// row is nothing next to writing 2560 and having X copy them.
+static uint8_t prev[SCREENWIDTH * SCREENHEIGHT];
+
+
 void I_FinishUpdate(void)
 {
     const uint8_t *src = (const uint8_t *)I_VideoBuffer;
     int y, x, rows_per_req, y0;
+    int first = -1, last = -1;
+
+    // Which source rows moved? (Everything, in a busy scene; the bottom 32 —
+    // the status bar — almost never, and nothing at all while a menu sits
+    // still.) The range is contiguous rather than per-row: one PutImage of a
+    // slightly larger rectangle beats several of exactly the right ones.
+    if (have_prev) {
+        for (y = 0; y < SCREENHEIGHT; y++) {
+            if (memcmp(src + y * SCREENWIDTH, prev + y * SCREENWIDTH, SCREENWIDTH)) {
+                if (first < 0)
+                    first = y;
+                last = y;
+            }
+        }
+        if (first < 0) {
+            // Nothing changed at all: the frame is already on the screen.
+            if (fps_report && ++frames >= 100) {
+                struct timeval now;
+                double dt;
+                gettimeofday(&now, NULL);
+                dt = (now.tv_sec - fps_t0.tv_sec) + (now.tv_usec - fps_t0.tv_usec) / 1e6;
+                printf("FPS %.2f (%d frames in %.2fs)\n", frames / dt, frames, dt);
+                fflush(stdout);
+                frames = 0;
+                fps_t0 = now;
+            }
+            return;
+        }
+    } else {
+        first = 0;
+        last = SCREENHEIGHT - 1;
+    }
+    memcpy(prev, src, SCREENWIDTH * SCREENHEIGHT);
+    have_prev = 1;
+
+    // Can this frame go straight to the screen? Only if the framebuffer is
+    // mapped, the window is wholly visible, we know where it is, it fits, and
+    // the destination is 8-byte aligned (the doubled-pixel store is 64 bits;
+    // a misaligned one on this guest is emulated a byte at a time and would
+    // cost more than the copy it saves).
+    if (fbmem && org_x < 0)
+        x_resolve_origin();
+    int overlay = fbmem && visible && org_x >= 0 && org_y >= 0
+        && org_x + win_w <= fb_w_px && org_y + win_h <= fb_h_px
+        && ((org_x * 4) % 8) == 0;
+    uint8_t *dst_base = overlay
+        ? fbmem + (size_t)org_y * fb_stride + (size_t)org_x * 4
+        : (uint8_t *)img;
+    int dst_stride = overlay ? fb_stride : win_w * 4;
 
     // Palette lookup fused into the scale. Two horizontally-doubled pixels are
     // one 64-bit store, and the duplicated rows are the same bytes again, so a
     // scaled frame costs about one store per two output pixels and nothing
     // else per pixel.
     if (scale == 1) {
-        uint32_t *out = img;
-        for (y = 0; y < SCREENHEIGHT; y++)
+        for (y = first; y <= last; y++) {
+            uint32_t *out = (uint32_t *)(dst_base + (size_t)y * dst_stride);
+            const uint8_t *in = src + (size_t)y * SCREENWIDTH;
             for (x = 0; x < SCREENWIDTH; x++)
-                *out++ = palette[src[y * SCREENWIDTH + x]];
+                out[x] = palette[in[x]];
+        }
     } else if (scale == 2) {
-        for (y = 0; y < SCREENHEIGHT; y++) {
-            uint64_t *o0 = (uint64_t *)(img + (size_t)(y * 2) * win_w);
-            uint64_t *o1 = (uint64_t *)(img + (size_t)(y * 2 + 1) * win_w);
+        for (y = first; y <= last; y++) {
+            uint64_t *o0 = (uint64_t *)(dst_base + (size_t)(y * 2) * dst_stride);
+            uint64_t *o1 = (uint64_t *)(dst_base + (size_t)(y * 2 + 1) * dst_stride);
+            const uint8_t *in = src + (size_t)y * SCREENWIDTH;
             for (x = 0; x < SCREENWIDTH; x++) {
-                uint32_t c = palette[src[x]];
+                uint32_t c = palette[in[x]];
                 uint64_t cc = ((uint64_t)c << 32) | c;
                 o0[x] = cc;
                 o1[x] = cc;
             }
-            src += SCREENWIDTH;
         }
     } else {
         int i, j;
-        for (y = 0; y < SCREENHEIGHT; y++) {
-            uint32_t *row = img + (size_t)(y * scale) * win_w;
-            uint32_t *out = row;
+        for (y = first; y <= last; y++) {
+            uint8_t *row = dst_base + (size_t)(y * scale) * dst_stride;
+            uint32_t *out = (uint32_t *)row;
+            const uint8_t *in = src + (size_t)y * SCREENWIDTH;
             for (x = 0; x < SCREENWIDTH; x++) {
-                uint32_t c = palette[src[x]];
+                uint32_t c = palette[in[x]];
                 for (j = 0; j < scale; j++)
                     *out++ = c;
             }
             // the remaining scale-1 rows are byte-identical to the first
             for (i = 1; i < scale; i++)
-                memcpy(row + (size_t)i * win_w, row, (size_t)win_w * 4);
-            src += SCREENWIDTH;
+                memcpy(row + (size_t)i * dst_stride, row, (size_t)win_w * 4);
         }
     }
+
+    // Only the window rows the changed source rows cover — and nothing at all
+    // when the pixels were written to the screen directly.
+    if (overlay) {
+        overlay_frames++;
+    } else {
+        int wy0 = first * scale;
+        int wh = (last - first + 1) * scale;
+        x_frames++;
 
     if (shm_op) {
         // The frame is already where the server can see it: one small request
@@ -483,11 +660,11 @@ void I_FinishUpdate(void)
         pi.total_w = win_w;
         pi.total_h = win_h;
         pi.src_x = 0;
-        pi.src_y = 0;
+        pi.src_y = wy0;
         pi.src_w = win_w;
-        pi.src_h = win_h;
+        pi.src_h = wh;
         pi.dst_x = 0;
-        pi.dst_y = 0;
+        pi.dst_y = wy0;
         pi.depth = root_depth;
         pi.format = 2;           // ZPixmap
         pi.send_event = 1;       // completion tells us the buffer is free again
@@ -508,12 +685,13 @@ void I_FinishUpdate(void)
         rows_per_req = (int)(((size_t)max_request * 4 - 64) / ((size_t)win_w * 4));
         if (rows_per_req < 1)
             rows_per_req = 1;
-        for (y0 = 0; y0 < win_h; y0 += rows_per_req) {
-            int rows = win_h - y0;
+        for (y0 = wy0; y0 < wy0 + wh; y0 += rows_per_req) {
+            int rows = wy0 + wh - y0;
             if (rows > rows_per_req)
                 rows = rows_per_req;
             put_rows(y0, rows);
         }
+    }
     }
 
     if (fps_report && ++frames >= 100) {
@@ -521,9 +699,11 @@ void I_FinishUpdate(void)
         double dt;
         gettimeofday(&now, NULL);
         dt = (now.tv_sec - fps_t0.tv_sec) + (now.tv_usec - fps_t0.tv_usec) / 1e6;
-        printf("FPS %.2f (%d frames in %.2fs)\n", frames / dt, frames, dt);
+        printf("FPS %.2f (%d frames in %.2fs, %d direct / %d via X)\n",
+               frames / dt, frames, dt, overlay_frames, x_frames);
         fflush(stdout);
         frames = 0;
+        overlay_frames = x_frames = 0;
         fps_t0 = now;
     }
 }
@@ -683,8 +863,18 @@ static void x_pump(int blocking)
                 }
                 break;
             }
+            case 15:     // VisibilityNotify
+                visible = (ev[8] == 0);
+                break;
+            case 22:     // ConfigureNotify: the window moved or resized
+                org_x = org_y = -1;   // re-resolved before the next overlay frame
+                have_prev = 0;        // and repaint all of it
+                break;
+            case 12:     // Expose: X blanked part of us; redraw everything
+                have_prev = 0;
+                break;
             default:
-                break;   // errors, Expose, ConfigureNotify: nothing to do
+                break;
         }
     }
 }

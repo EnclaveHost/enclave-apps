@@ -30,4 +30,4 @@ jit = []
 # measure the translator half of PLATFORM-JIT.md before the platform verb
 # exists. Never linked into the library or the shipped app.
 [dev-dependencies]
-wasmtime = { version = "24", default-features = false, features = ["cranelift", "runtime"] }
+

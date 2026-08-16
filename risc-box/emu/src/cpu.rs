@@ -65,7 +65,7 @@ const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 // none of them need to be looked at 13 million times a second, and looking
 // cost more than the instructions did. 64 keeps timer granularity far finer
 // than the guest's 100 Hz tick while removing 63/64 of the overhead.
-const DEVICE_TICK_INTERVAL: u64 = 16;
+const DEVICE_TICK_INTERVAL: u64 = 32;
 
 const MIP_MEIP: u64 = 0x800;
 pub const MIP_MTIP: u64 = 0x080;
