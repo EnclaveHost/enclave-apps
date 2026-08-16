@@ -4336,6 +4336,12 @@ struct ToolLoop<'a> {
     /// search the web for the maze layout", searched, judged the result wrong,
     /// and its retry died on one unparseable call.
     malformed_tries: usize,
+    /// the calls already questioned for an unfilled argument, canonical form.
+    /// A LIST of what was asked rather than a flag, because the question is
+    /// "did you mean this" and the answer is the call coming back: an identical
+    /// resend runs, so a model that really did want to search for the word
+    /// "placeholder" loses one generation and nothing else.
+    stub_asked: Vec<String>,
     /// why the finished reply's call ran nothing, when one was attempted: the
     /// legs deliver this readable reason in place of the raw block
     refused: Option<&'static str>,
@@ -4353,6 +4359,15 @@ const REFUSED_MALFORMED: &str =
 const MALFORMED_RETRIES: usize = 3;
 const REFUSED_LIMIT: &str =
     "the model wrote another tool call after the per-answer limit, so it was not run";
+const REFUSED_STUB: &str =
+    "the model kept writing tool calls with arguments it had not filled in, so none were run";
+/// How many DISTINCT unfilled calls one answer may ask about. Each costs a
+/// re-prefill and a generation, and the answer loop has no bound of its own -
+/// without this a model that stubs a different argument every round spins it
+/// forever. Three is the same allowance a malformed call gets, for the same
+/// reason: one bad draft is a slip, three is a model that is not going to
+/// author the value.
+const STUB_RETRIES: usize = 3;
 
 impl<'a> ToolLoop<'a> {
     /// Resolve the registry for this turn. MCP discovery happens HERE, before
@@ -4374,6 +4389,7 @@ impl<'a> ToolLoop<'a> {
             calls: 0,
             limit_told: false,
             malformed_tries: 0,
+            stub_asked: Vec::new(),
             refused: None,
             log: Vec::new(),
         }
@@ -4494,6 +4510,43 @@ impl<'a> ToolLoop<'a> {
                 ),
             ));
             return true;
+        }
+        // An argument the model never filled in. Running it is worse than not
+        // running it: a stubbed `generate_image` costs half a minute of a GPU
+        // deployment's time and puts a picture the user never asked for above
+        // the answer, then folds a note about that picture into the context the
+        // rest of the turn is written from. So ASK - once per distinct call, and
+        // the identical call coming back runs, because the only thing this can
+        // be wrong about is a model that genuinely meant the literal string.
+        if let Some((arg, val)) = tools::stub_arg(&c.args) {
+            let key = canonical_call(&c);
+            if !self.stub_asked.iter().any(|k| k == &key) {
+                if self.stub_asked.len() >= STUB_RETRIES {
+                    self.refused = Some(REFUSED_STUB);
+                    return false;
+                }
+                self.stub_asked.push(key);
+                on_note(
+                    "the model wrote a tool call with an argument it had not filled in; \
+                     asking it what the call is actually for",
+                );
+                messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+                messages.push(ChatMsg::text(
+                    "user",
+                    tools::response_turn(
+                        &c.name,
+                        &format!(
+                            "This call was NOT run: its \"{arg}\" argument is \"{val}\", which \
+                             is a placeholder, not a value - nothing decided what it should be. \
+                             Either work out what this call actually needs and write the \
+                             argument out in full, or do not call anything and answer the user \
+                             directly. If \"{val}\" is genuinely the value you meant, send the \
+                             identical call again and it will run."
+                        ),
+                    ),
+                ));
+                return true;
+            }
         }
         self.calls += 1;
         on_call(&serde_json::json!({
@@ -5616,8 +5669,23 @@ fn apply_web_search(
     // and offering a verdict the turn cannot act on is how you get an IMAGE
     // back on a turn whose user switched images off.
     let router_search = web_mode == WebMode::Auto && !model_searches;
-    if !asked_inline && web_mode != WebMode::Always && (router_search || image_live) {
-        on_status("deciding what this needs…");
+    // `want_effort` belongs in this gate on its own. The pass answers TWO
+    // questions and route_web_search already handles either half being absent
+    // (it has an effort-only reply form), but the gate used to admit it only
+    // alongside a routing verdict - so on a deployment where the model owns
+    // both search and images, which is every tools-on deployment, the rating
+    // never ran and think_budget silently stayed flat for every turn no matter
+    // how hard. That is the same flat budget that force-closed a block mid-plan
+    // in the 2026-08-16 trace behind tools::stub_arg.
+    if !asked_inline && web_mode != WebMode::Always && (router_search || image_live || want_effort)
+    {
+        // same words route_web_search uses, so an effort-only pass does not
+        // announce a decision it is not making
+        on_status(if router_search || image_live {
+            "deciding what this needs…"
+        } else {
+            "sizing the reasoning budget…"
+        });
         let ask = RouterAsk { search: router_search, image: image_live, effort: want_effort };
         let out = route_web_search(cfg, tok, messages, target_mode, ask, on_status);
         *effort_out = out.effort;
@@ -8803,6 +8871,70 @@ mod tests {
         tl.refused = None;
         assert!(!tl.step("Here is the answer.", &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert_eq!(tl.refused, None);
+    }
+
+    /// The 2026-08-16 failure, end to end through the loop: a call whose
+    /// argument was never authored must not RUN. The live turn asked for a
+    /// self-contained HTML file, the think budget force-closed the block
+    /// mid-plan, and the model's next act was
+    /// `generate_image {"prompt": "placeholder"}` - thirty seconds of a GPU
+    /// deployment and a picture of nothing anyone asked for, above the answer.
+    #[test]
+    fn a_call_the_model_never_filled_in_is_questioned_not_run() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 8,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut msgs = vec![ChatMsg::text("user", "write me a self-contained HTML file")];
+        let stub =
+            "<tool_call>{\"name\":\"generate_image\",\"arguments\":{\"prompt\":\"placeholder\"}}\
+             </tool_call>";
+        let ran = std::cell::Cell::new(0);
+        let seen = |_: &serde_json::Value| ran.set(ran.get() + 1);
+        let count = |_: &serde_json::Value| {};
+
+        // questioned: the conversation grows, and NOTHING was called
+        assert!(tl.step(stub, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(ran.get(), 0, "the stubbed call was executed");
+        assert_eq!(tl.calls, 0);
+        assert!(msgs[2].content.contains("NOT run"), "{}", msgs[2].content);
+        assert!(msgs[2].content.contains("placeholder"), "{}", msgs[2].content);
+
+        // the model meant it after all: the identical call runs on the resend,
+        // so the guard costs one generation and never a capability
+        assert!(tl.step(stub, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(ran.get(), 1, "the resent call must run");
+        assert_eq!(tl.calls, 1);
+
+        // and a call with a real argument is untouched from the start. The
+        // name is one the registry does NOT hold, like the budget test above:
+        // that exercises the loop without a wasi:http round trip, which does
+        // not exist under a native `cargo test`.
+        let real = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"query\":\"falcon 9 fin count\"}}\
+                    </tool_call>";
+        assert!(tl.step(real, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(ran.get(), 2);
+
+        // the answer loop has no bound of its own, so a model that stubs a
+        // DIFFERENT argument every round has to hit one here
+        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        for v in ["placeholder", "TODO", "tbd"] {
+            let c = format!(
+                "<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"prompt\":\"{v}\"}}}}</tool_call>"
+            );
+            assert!(tl.step(&c, &mut msgs, &seen, &count, &|_| {}), "{v} should be questioned");
+        }
+        let fourth =
+            "<tool_call>{\"name\":\"nope\",\"arguments\":{\"prompt\":\"fixme\"}}</tool_call>";
+        assert!(!tl.step(fourth, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(tl.refused, Some(REFUSED_STUB));
+        assert_eq!(ran.get(), 2, "no stubbed call ever ran");
     }
 
     /// The failure LoopGuard exists for, at the scale it actually happens:

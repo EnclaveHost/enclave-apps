@@ -937,6 +937,103 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
+/// The values a model writes when it emits the SHAPE of a call without having
+/// decided its content: schema type names, the word placeholder itself, the
+/// filler an example would use. Matched whole, never as a substring, because
+/// every one of these is also a legitimate thing to search for.
+const STUB_VALUES: &[&str] = &[
+    "placeholder",
+    "placeholder prompt",
+    "placeholder text",
+    "placeholder query",
+    "placeholder description",
+    "your prompt here",
+    "your query here",
+    "your text here",
+    "your description here",
+    "prompt here",
+    "query here",
+    "text here",
+    "description here",
+    "prompt goes here",
+    "query goes here",
+    "insert prompt here",
+    "insert query here",
+    "example prompt",
+    "example query",
+    "sample prompt",
+    "sample text",
+    "some text",
+    "string",
+    "todo",
+    "tbd",
+    "fixme",
+    "...",
+    "…",
+];
+
+/// An argument the model never actually filled in: `(name, value)`.
+///
+/// This is what a call looks like when the reasoning that was going to author
+/// the argument never happened - most sharply after the think budget force-
+/// closes a block mid-plan, which drops the model into answer position with a
+/// decision half made. Observed live 2026-08-16 on a "write me a self-contained
+/// HTML file" turn: the budget ran out mid-sentence, the model's very next act
+/// was `generate_image {"prompt": "placeholder"}`, and the user got thirty
+/// seconds of GPU and a picture of nothing they asked for. The model's own next
+/// block read "I accidentally called generate_image with a placeholder prompt -
+/// that was a mistake", which is the tell that nothing about the call was meant.
+///
+/// Deliberately narrow. It matches a whole trimmed value against a closed list,
+/// or a value that is nothing but a bracketed slot (`<prompt>`, `[your query]`)
+/// - never a substring, because "what does placeholder mean" is a real question
+/// and a real query. The caller is expected to ASK rather than refuse (see
+/// ToolLoop::step): a model that meant the literal string sends it again.
+pub fn stub_arg(args: &serde_json::Value) -> Option<(String, String)> {
+    let obj = args.as_object()?;
+    for (k, v) in obj {
+        let Some(s) = v.as_str() else { continue };
+        if is_stub_value(s) {
+            return Some((k.clone(), s.trim().to_string()));
+        }
+    }
+    None
+}
+
+fn is_stub_value(s: &str) -> bool {
+    let s = s.trim().trim_matches(['"', '\'', '`']).trim();
+    if s.is_empty() {
+        return false;
+    }
+    // A bracketed slot is a stub whatever is written inside it, but only when
+    // the inside is a short run of words: `{"a": 1}` is a request body and
+    // `<html>...</html>` is a document, and neither is a slot.
+    let bracketed = [('<', '>'), ('[', ']'), ('{', '}')].iter().any(|&(o, c)| {
+        s.starts_with(o)
+            && s.ends_with(c)
+            && s.len() > 2
+            && {
+                let inner = &s[1..s.len() - 1];
+                inner.len() <= 48
+                    && !inner.contains([o, c, '"', ':', '\n', '/'])
+                    && inner.chars().any(char::is_alphabetic)
+            }
+    });
+    if bracketed {
+        return true;
+    }
+    // whole-value match, case- and punctuation-insensitive: models write
+    // "Placeholder." and "TODO" for the same non-decision. The trailing
+    // punctuation comes off SECOND, never first: an ellipsis is a stub in its
+    // own right and stripping it leaves nothing to match.
+    let norm: String = s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    if STUB_VALUES.contains(&norm.as_str()) {
+        return true;
+    }
+    let trimmed = norm.trim_end_matches(['.', ':', '!']);
+    !trimmed.is_empty() && STUB_VALUES.contains(&trimmed)
+}
+
 /// Pull tool calls out of a reply.
 ///
 /// Tolerant on purpose, because the failure mode is expensive: a call this
@@ -2713,6 +2810,55 @@ mod tests {
         let all = merge_registries(&server, &client);
         assert_eq!(all.len(), 1);
         assert!(matches!(all[0].src, ToolSrc::Client));
+    }
+
+    /// The detector's whole job is to be narrow: an unfilled slot is caught,
+    /// and a real value that merely READS like one is not, because the cost of
+    /// a false positive is a wasted generation on every turn that asks about
+    /// any of these words.
+    #[test]
+    fn an_unfilled_argument_is_told_from_a_real_one() {
+        let a = |v: serde_json::Value| stub_arg(&v).map(|(k, val)| format!("{k}={val}"));
+
+        // the live 2026-08-16 call
+        assert_eq!(
+            a(serde_json::json!({"prompt": "placeholder", "size": "1024x1024"})).as_deref(),
+            Some("prompt=placeholder")
+        );
+        // the other spellings of not having decided
+        for v in [
+            "Placeholder.", "TODO", "tbd", "...", "…", "string", "your prompt here",
+            "  Some text  ", "<prompt>", "[your query]", "{description}",
+        ] {
+            assert!(
+                stub_arg(&serde_json::json!({ "prompt": v })).is_some(),
+                "{v:?} is a slot the model never filled"
+            );
+        }
+
+        // REAL values, including every one that contains a stub word
+        for v in [
+            "a tall white multi-stage rocket on a tropical island launch pad",
+            "what does placeholder mean in typography",
+            "placeholder text generators",
+            "rust string vs &str",
+            "TODO comments in the rust standard library",
+            "{\"id\": 7}",                       // a request body, not a slot
+            "<html><body>hi</body></html>",      // a document, not a slot
+            "<a very long bracketed run of words that is clearly real content>",
+            "/v1/models",
+        ] {
+            assert_eq!(
+                stub_arg(&serde_json::json!({ "query": v })),
+                None,
+                "{v:?} is a value the model chose"
+            );
+        }
+
+        // non-strings and absent arguments are nothing to do with this
+        assert_eq!(stub_arg(&serde_json::json!({"n": 1, "on": true})), None);
+        assert_eq!(stub_arg(&serde_json::json!({})), None);
+        assert_eq!(stub_arg(&serde_json::json!("placeholder")), None);
     }
 
     /// A routed line needs a parameter to bind to: route_arg, or the sole
