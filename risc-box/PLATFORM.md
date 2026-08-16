@@ -1,5 +1,15 @@
 # The `nvenc` verb: host-side spec
 
+> **STATUS: the platform side is built** (EnclaveHost/enclave, `wasm/nvenc-shim/`,
+> `wasm/wasmtime-nn-nvenc.patch`, manager gate + `NVIDIA_DRIVER_CAPABILITIES`
+> on both GPU flavors). Verified on an RTX 3070: all three settings below are
+> in the bitstream, and the three preload paths (encoder present / no GPU /
+> toolchain without the backend) behave as specified. What remains is
+> operational — dispatch the Wasmtime Toolchain workflow, repin
+> `WASMTIME_IMAGE`, redeploy the GPU enclaves — and then section 4, moving this
+> app's GameStream host inside the CVM. The spec below is kept as written; the
+> one thing it did not anticipate is in section 3.
+
 RISC Box streams its desktop to a real Moonlight client today, but only from a
 **native** host process (`gs-bridge/`) running beside the CVM. That works and is
 verified end to end, and it is the wrong shape for the product: the sidecar has
@@ -115,6 +125,14 @@ sustained rate is the thing to measure.
 
 ## 3. Manager (`wasm/wasm_manager.py`)
 
+- **Not in the original spec, and it is the thing that would have made this
+  fail on a working card:** the NVIDIA container runtime injects driver
+  libraries by *capability*, and the default `compute,utility` does not include
+  `libnvidia-encode.so.1`. Without `NVIDIA_DRIVER_CAPABILITIES` carrying
+  `video`, the H200 is present, CUDA initializes, and the encoder dlopen finds
+  nothing — which reads as "this card cannot encode". Set on the `wasm-manager`
+  container (the one that spawns tenant wasmtimes) in both `enclaves/gpu` and
+  `enclaves/gpu8`.
 - Rides the existing `-Snn` grant and `gpuShare` purchase; no new launch flag.
 - **Accounting needs thought, and it is not the SM share.** The arbiter
   (`wasmtime-nn-arbiter.patch`) exists because MPS statically partitions SMs.
