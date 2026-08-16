@@ -1343,8 +1343,8 @@ pub fn run() {
                         server.broadcast(
                             "display",
                             &format!(
-                                "data: {{\"y\":{},\"h\":{},\"b\":\"{}\"}}",
-                                band.y, band.h, b64(&band.z)
+                                "data: {{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                                band.x, band.w, band.y, band.h, b64(&band.z)
                             ),
                         );
                         busy = true;
@@ -1424,7 +1424,8 @@ pub fn run() {
             for band in out.bands {
                 server.broadcast(
                     "display",
-                    &format!("data: {{\"y\":{},\"h\":{},\"b\":\"{}\"}}", band.y, band.h, b64(&band.z)),
+                    &format!("data: {{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                             band.x, band.w, band.y, band.h, b64(&band.z)),
                 );
                 busy = true;
             }

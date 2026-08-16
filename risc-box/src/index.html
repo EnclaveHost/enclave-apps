@@ -236,7 +236,11 @@ function connectDisplay() {
       for (let i = 0; i < bgrx.length; i += 4) {
         rgba[i] = bgrx[i + 2]; rgba[i + 1] = bgrx[i + 1]; rgba[i + 2] = bgrx[i]; rgba[i + 3] = 255;
       }
-      fbctx.putImageData(new ImageData(rgba, dispW, m.h), 0, m.y);
+      // A band is a RECTANGLE: x/w crop it to the columns that changed, so a
+      // game in a window costs its own width and not the screen's. Older
+      // senders omit x/w, which reads as the full row — the same picture.
+      const bx = m.x || 0, bw = m.w || dispW;
+      fbctx.putImageData(new ImageData(rgba, bw, m.h), bx, m.y);
     }).catch(() => {});
   };
   dvs.onerror = () => {};
