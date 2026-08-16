@@ -240,6 +240,25 @@ fn main() {
             eprintln!("[probe] FAILED: no bands arrived in 30s");
             std::process::exit(1);
         }
+        // The first band is not a picture. The app ships the whole frame when a
+        // watcher joins, but a busy screen also has its own small rectangles in
+        // flight, and whichever lands first sets generation to 1 — so snapshotting
+        // there catches a game's status bar on a black field and calls it the
+        // desktop. Let the bands stop arriving first: quiet for half a second, or
+        // five seconds of a screen that never holds still, whichever comes first.
+        let settle = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = sc.generation();
+        let mut quiet = std::time::Instant::now();
+        while std::time::Instant::now() < settle {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = sc.generation();
+            if now != last {
+                last = now;
+                quiet = std::time::Instant::now();
+            } else if quiet.elapsed() >= std::time::Duration::from_millis(500) {
+                break;
+            }
+        }
         let mut buf = Vec::new();
         let gen = sc.snapshot_into(&mut buf);
         eprintln!("[probe] mirrored {} bytes after {gen} bands", buf.len());

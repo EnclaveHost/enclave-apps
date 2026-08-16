@@ -70,6 +70,11 @@ const IDLE_MAX: usize = 4;
 /// of handed out.
 const IDLE_FRESH: Duration = Duration::from_secs(20);
 
+/// How long an SSE stream may go completely silent before it is treated as
+/// wedged and redialled. Above the app's 15 s SSE heartbeat, so a still screen
+/// is never mistaken for a dead one.
+const SSE_STALL: Duration = Duration::from_secs(20);
+
 pub struct App {
     /// host:port of the RISC Box app, e.g. "127.0.0.1:8000".
     addr: String,
@@ -278,13 +283,26 @@ impl App {
     /// Open a streaming GET and hand back the connection positioned just after
     /// the response headers. Used for the long-lived /display event stream,
     /// where `get()` is useless — it reads to EOF and the stream never ends.
-    pub fn get_stream(&self, path: &str) -> std::io::Result<impl std::io::BufRead> {
+    pub fn get_stream(&self, path: &str) -> std::io::Result<Box<dyn std::io::BufRead>> {
         let mut s = self.connect()?;
-        // No read timeout: an idle screen sends nothing for as long as it
-        // stays idle, and that is not an error.
-        if let Conn::Plain(t) = &s {
-            t.set_read_timeout(None)?;
-        }
+        // A stall timeout rather than no timeout, and it has to reach the
+        // socket under TLS too — clearing it only for `Conn::Plain` left every
+        // https app, which is every deployment on the fleet, on the 30 s
+        // timeout from `connect`.
+        //
+        // An idle screen sends no bands for as long as it stays idle, so bands
+        // cannot be what we time out on. Heartbeats can: the app's httpd sends
+        // `:hb` every 15 s on an SSE connection whatever the screen is doing
+        // (`src/httpd.rs`, SSE_HEARTBEAT), so silence longer than that is the
+        // connection being dead rather than the picture being still.
+        //
+        // Something has to notice, because a wedged stream here does not close.
+        // A single unrelated request to the same deployment — a `/status`, an
+        // input POST from this very process — silences an open `/display`
+        // stream permanently, with the socket still ESTABLISHED and its receive
+        // queue empty. Reconnecting is the only way back, and a reader with no
+        // timeout waits for a byte that never comes.
+        s.set_read_timeout(Some(SSE_STALL))?;
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Accept: text/event-stream\r\n\r\n",
             self.host,
@@ -294,6 +312,7 @@ impl App {
         let mut r = std::io::BufReader::new(s);
         // Consume the status line and headers.
         let mut line = String::new();
+        let mut chunked = false;
         loop {
             line.clear();
             if std::io::BufRead::read_line(&mut r, &mut line)? == 0 {
@@ -302,8 +321,15 @@ impl App {
             if line == "\r\n" || line == "\n" {
                 break;
             }
+            let h = line.to_ascii_lowercase();
+            if h.starts_with("transfer-encoding:") && h.contains("chunked") {
+                chunked = true;
+            }
         }
-        Ok(r)
+        Ok(match chunked {
+            true => Box::new(std::io::BufReader::new(Chunked::new(r))),
+            false => Box::new(r),
+        })
     }
 
     /// POST a JSON body, ignoring the response.
@@ -497,4 +523,76 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Decodes HTTP/1.1 chunked transfer encoding as a stream.
+///
+/// This has to be a `Read` and not a "dechunk the whole body" helper, because
+/// the body here never ends: `/display` stays open for the life of the session.
+///
+/// Skipping it appears to work, which is the dangerous part. The app writes one
+/// SSE event per write, so against a local app each event lands in its own
+/// chunk, and a line-oriented reader that knows nothing about chunking just
+/// sees a stray hex line between events and ignores it as "not a data: line".
+/// Through the gateway the framing is re-cut to the transport's own sizes, so
+/// chunk boundaries fall INSIDE large events — and a band split down the middle
+/// loses its closing quote, fails to parse, and is dropped without a word.
+///
+/// The result was a bridge that mirrored every small band and silently lost
+/// every big one. Since the big one is the whole-frame band the app sends when
+/// a watcher joins, Moonlight got the moving parts of the screen painted onto a
+/// black field that never filled in.
+struct Chunked<R: std::io::BufRead> {
+    inner: R,
+    /// Bytes left in the chunk currently being read.
+    remaining: usize,
+    done: bool,
+}
+
+impl<R: std::io::BufRead> Chunked<R> {
+    fn new(inner: R) -> Self {
+        Chunked { inner, remaining: 0, done: false }
+    }
+}
+
+impl<R: std::io::BufRead> Read for Chunked<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || out.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            // The size line, plus the blank CRLF that terminated the previous
+            // chunk. Reading until a non-empty line covers both without having
+            // to track which of the two we are at.
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if self.inner.read_line(&mut line)? == 0 {
+                    self.done = true;
+                    return Ok(0);
+                }
+                if !line.trim().is_empty() {
+                    break;
+                }
+            }
+            // `size[;extension]` in hex.
+            let size = line.trim().split(';').next().unwrap_or("").trim().to_string();
+            let n = usize::from_str_radix(&size, 16).map_err(|_| {
+                std::io::Error::other(format!("bad chunk size {size:?}"))
+            })?;
+            if n == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+            self.remaining = n;
+        }
+        let want = out.len().min(self.remaining);
+        let n = self.inner.read(&mut out[..want])?;
+        if n == 0 {
+            self.done = true;
+            return Ok(0);
+        }
+        self.remaining -= n;
+        Ok(n)
+    }
 }

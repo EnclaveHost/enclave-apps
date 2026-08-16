@@ -115,6 +115,12 @@ impl Screen {
             let (Some(y), Some(h)) = (json_num(payload, "y"), json_num(payload, "h")) else {
                 continue;
             };
+            // A band used to be a run of whole rows; it is now a rectangle, and
+            // carries only the columns that changed. Absent x/w means an older
+            // app on the other end, where full width was the only shape there
+            // was — so that is what they default to.
+            let x = json_num(payload, "x").unwrap_or(0);
+            let w = json_num(payload, "w").unwrap_or(self.width);
             let Some(deflated) = b64_decode(b64) else {
                 eprintln!("[screen] band with undecodable base64, skipped");
                 continue;
@@ -123,17 +129,28 @@ impl Screen {
                 eprintln!("[screen] band failed to inflate, skipped");
                 continue;
             };
-            self.apply(y, h, &rows);
+            if std::env::var_os("GS_SCREEN_TRACE").is_some() {
+                eprintln!(
+                    "[screen] band x={x} w={w} y={y} h={h} b64={} inflated={}",
+                    b64.len(),
+                    rows.len()
+                );
+            }
+            self.apply(x, w, y, h, &rows);
         }
     }
 
-    /// Write `h` rows of B,G,R,X starting at row `y` into the rgb24 mirror.
-    fn apply(&self, y: usize, h: usize, rows: &[u8]) {
-        let stride_in = self.width * BAND_BPP;
+    /// Write the `w`x`h` rectangle of B,G,R,X at (`x`,`y`) into the rgb24
+    /// mirror. The band's rows are packed to `w` pixels, not to the screen's
+    /// width, so the source stride comes from the band and the destination
+    /// stride from the screen; conflating the two silently reads a shifted,
+    /// sheared picture.
+    fn apply(&self, x: usize, w: usize, y: usize, h: usize, rows: &[u8]) {
+        let stride_in = w * BAND_BPP;
         let stride_out = self.width * RGB_BPP;
-        if y + h > self.height || rows.len() < h * stride_in {
+        if x + w > self.width || y + h > self.height || rows.len() < h * stride_in {
             eprintln!(
-                "[screen] band y={y} h={h} does not fit {}x{} ({} bytes); skipped",
+                "[screen] band x={x} w={w} y={y} h={h} does not fit {}x{} ({} bytes); skipped",
                 self.width,
                 self.height,
                 rows.len()
@@ -143,7 +160,8 @@ impl Screen {
         let mut f = self.frame.lock().unwrap();
         for row in 0..h {
             let src = &rows[row * stride_in..row * stride_in + stride_in];
-            let dst = &mut f[(y + row) * stride_out..(y + row) * stride_out + stride_out];
+            let start = (y + row) * stride_out + x * RGB_BPP;
+            let dst = &mut f[start..start + w * RGB_BPP];
             for (px_in, px_out) in src.chunks_exact(BAND_BPP).zip(dst.chunks_exact_mut(RGB_BPP)) {
                 px_out[0] = px_in[2]; // R
                 px_out[1] = px_in[1]; // G
