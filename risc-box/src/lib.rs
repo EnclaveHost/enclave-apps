@@ -1296,8 +1296,18 @@ pub fn run() {
                 // than a compressor, so it barely bites — and one frame is
                 // kept in flight, because capturing faster than the worker can
                 // compress would only queue up stale screens.
-                let watching_display = server.sse_count("display") > 0;
-                let watching_video = server.sse_count("video") > 0;
+                // Pace to the SLOWEST watcher as well as to the cost of a
+                // scan. A frame is only worth producing if the last one has
+                // mostly reached someone: past this backlog the extra frames
+                // are not seen, they queue — and the queue ends at MAX_WBUF,
+                // where the server closes the connection and the viewer loses
+                // the stream entirely. On a loopback this never triggers; over
+                // a relay, at 1024x768, it triggered within a second.
+                const SSE_BACKLOG_LIMIT: usize = 192 * 1024;
+                let display_backed_up = server.sse_backlog("display") > SSE_BACKLOG_LIMIT;
+                let video_backed_up = server.sse_backlog("video") > SSE_BACKLOG_LIMIT;
+                let watching_display = server.sse_count("display") > 0 && !display_backed_up;
+                let watching_video = server.sse_count("video") > 0 && !video_backed_up;
                 // Keep the display scan at its fast floor while input is recent
                 // (the same boost window the CPU uses). The stillness backoff
                 // stretches the scan interval toward 100 ms when the screen has
