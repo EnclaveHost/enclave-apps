@@ -16,7 +16,22 @@ they are the paths that look obviously right and are not.
 | chocolate-doom 640x480 window, as the image ships | 8.5M | 16 |
 | xdoom (raw X11), PutImage | 4.2M | 28 |
 | xdoom, MIT-SHM | 2.9M | 45 (this workstation) |
-| same, on kryptos | 2.9M | mean 26.9, median 25.8, **floor 19.7** |
+| same, on kryptos | 2.9M | mean 26.9, median 25.8, floor 19.7 |
+| + device tick 32, dirty-row upload, game at -O3 (0.7.5) | — | **mean 35.5, median 34.5, floor 25.7** |
+
+Final, on the live deployment (`0x458a63b9…`, kryptos), by the game's own
+wall-clock counter over 53 consecutive samples of 100 frames — about 2.6
+minutes of unbroken gameplay, every frame through X (`0 direct / N via X`):
+
+    min 25.7    p10 29.9    median 34.5    mean 35.5    max 66.4
+    below 24 fps: 0 of 53
+
+The goal is met on the shipped desktop at its real resolution: the floor
+clears 24 and the median clears the 30 stretch. Of the three changes that took
+it there from a 19.7 floor, the dirty-row upload was much the largest —
+larger than its estimate, because DOOM redraws its whole 320x200 buffer every
+frame and in most scenes a good part of it has not changed, not just the
+status bar.
 
 MIPS is flat at 76-79 across every fleet sample, so the 2x swing is DOOM's own
 geometry (1.97M-3.94M instructions a frame), not the machine. The floor is a
