@@ -518,17 +518,56 @@
   .code-head {
     display: flex; align-items: center; justify-content: space-between;
     padding: 6px 8px 6px 14px; background: var(--code-head);
-    font-size: 12px; color: var(--text-2);
+    font-size: 12px; color: var(--text-2); gap: 8px;
   }
+  .code-head .cbtns { display: flex; align-items: center; gap: 2px; flex: none; }
   .cbtn {
     display: flex; align-items: center; gap: 5px; padding: 4px 8px;
     border-radius: 7px; font-size: 12px; color: var(--text-2);
   }
   .cbtn:hover { background: var(--hover); color: var(--text); }
   .cbtn.done { color: var(--ok); }
+  .cbtn:disabled { opacity: .4; }
+  .cbtn[hidden] { display: none; } /* a display rule of its own outranks [hidden] */
   .md pre {
     padding: 13px 15px; overflow-x: auto;
     font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  /* ---- a page the model wrote, running in a frame that cannot reach this one.
+     White backing, always: a document with no background of its own is written
+     for a browser's white canvas, and showing it through to the app's dark
+     surface turns black body text invisible. */
+  .htmlblock .prev { position: relative; background: #fff; }
+  .htmlblock .prevframe {
+    display: block; width: 100%; height: 360px; border: 0; background: #fff;
+  }
+  /* what the frame was stopped from fetching, and the offer to let it. Sits
+     above the page rather than over it - a page is allowed to use its own
+     corners, and a banner floating on top would cover whatever it renders */
+  .htmlblock .prevnote {
+    display: flex; align-items: center; gap: 10px; padding: 7px 10px 7px 14px;
+    font-size: 12px; color: var(--text-2); background: var(--code-head);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .htmlblock .prevnote span { flex: 1; min-width: 0; }
+  .htmlblock .prevnote button {
+    flex: none; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+    color: var(--text-2); border: 1px solid var(--border);
+  }
+  .htmlblock .prevnote button:hover { background: var(--hover); color: var(--text); }
+  /* full screen: the header stays (its Expand button is the way back out) and
+     the frame takes everything under it. The inline height the frame reports
+     for itself does not apply here, hence the override. */
+  .htmlblock:fullscreen { border-radius: 0; display: flex; flex-direction: column; }
+  .htmlblock:fullscreen .prev { flex: 1; min-height: 0; }
+  .htmlblock:fullscreen .prevframe { height: 100% !important; }
+  .htmlblock:fullscreen pre { display: none; }
+  /* four labelled buttons do not fit a phone's width. The icons carry it from
+     here; every one of them keeps a title and an aria-label. */
+  @media (max-width: 560px) {
+    .htmlblock .code-head .cbtn span { display: none; }
+    .htmlblock .code-head .cbtn { padding: 5px 7px; }
   }
   .tblwrap { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: 12px; }
   .md table { border-collapse: collapse; width: 100%; font-size: 14px; }
@@ -1252,6 +1291,12 @@ const ICONS = {
   alert: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>',
   tick: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L20 6.5"/></svg>',
   chev: '<svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+  // a browser frame (show the page), angle brackets (show the source), a tray
+  // (save it), arrows out (fill the screen)
+  frame: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9.5h18M6.4 7h.01M9 7h.01"/></svg>',
+  code: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/></svg>',
+  dl: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M7.5 11l4.5 4.5 4.5-4.5"/><path d="M5 19.5h14"/></svg>',
+  expand: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4H4v5M15 4h5v5M15 20h5v-5M9 20H4v-5"/></svg>',
 };
 
 // --------------------------------------------------------------- markdown --
@@ -1380,6 +1425,31 @@ function buildList(items, start, depth) {
   return { html: html + (ordered ? "</ol>" : "</ul>"), next: k };
 }
 
+// A fenced block. HTML is the one language where the source is also the
+// artifact: a page can be RUN, and the thing someone wants from a page is
+// usually to look at it, not to read its tags. So an html fence gets a preview
+// and a download beside Copy, and hydrateHtml (below) opens the preview by
+// itself when what arrived is a whole document rather than a snippet.
+const HTML_FENCE = /^(html|htm|xhtml)$/i;
+const IS_DOC = /<!doctype\s+html|<html[\s>]/i;
+
+function codeBlock(lang, body, closed) {
+  const runnable = closed && HTML_FENCE.test(lang);
+  const btn = (attr, icon, label) =>
+    '<button type="button" class="cbtn" ' + attr + ' title="' + label + '" aria-label="' + label + '">' +
+    icon + "<span>" + label + "</span></button>";
+  let acts = btn("data-copy-code", ICONS.copy, "Copy");
+  if (runnable)
+    acts = btn("data-html-view", ICONS.frame, "Preview") + acts + btn("data-dl-html", ICONS.dl, "Download") +
+      (FULLSCREEN ? btn("data-html-full hidden", ICONS.expand, "Expand") : "");
+  return '<div class="code' + (runnable ? " htmlblock" : "") + '"' +
+    (runnable && IS_DOC.test(body) ? ' data-doc="1"' : "") + '>' +
+    '<div class="code-head"><span>' + (esc(lang) || "code") + '</span>' +
+    '<div class="cbtns">' + acts + "</div></div>" +
+    (runnable ? '<div class="prev" hidden></div>' : "") +
+    "<pre><code>" + esc(body) + "</code></pre></div>";
+}
+
 function md(src) {
   const lines = src.replace(/\r\n?/g, "\n").split("\n");
   let html = "", i = 0, para = [];
@@ -1401,10 +1471,12 @@ function md(src) {
       const buf = [];
       i++;
       while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) buf.push(lines[i++]);
+      // running off the end means the fence is still open: the model is mid-file
+      // and what is in the buffer is a fragment of one. Nothing that treats the
+      // block as a whole document - preview, download - is offered until it closes.
+      const closed = i < lines.length;
       i++; // past the closing fence (or EOF while the fence is still streaming)
-      html += '<div class="code"><div class="code-head"><span>' + (esc(fence[1]) || "code") +
-        '</span><button type="button" class="cbtn" data-copy-code>' + ICONS.copy +
-        "<span>Copy</span></button></div><pre><code>" + esc(buf.join("\n")) + "</code></pre></div>";
+      html += codeBlock(fence[1], buf.join("\n"), closed);
       continue;
     }
     if (/^\s*$/.test(line)) { flush(); i++; continue; }
@@ -1514,6 +1586,242 @@ function assistantHtml(src, streaming) {
   return html;
 }
 // ----------------------------------------------------------- end markdown --
+
+// ----------------------------------------------------------- html preview --
+// A model that writes a page has written a FILE, and the useful thing to do
+// with a file is run it. Every closed ```html block therefore carries the page
+// rendered (a frame) and the page saved (a download) next to its Copy button,
+// and a whole document - one with a doctype or an <html> - shows itself
+// rendered without being asked.
+//
+// The frame is deliberately hostile to what it runs:
+//
+//   - sandbox WITHOUT allow-same-origin, so the document gets an opaque origin
+//     of its own. It cannot read this page's DOM, its localStorage, or the
+//     conversations in IndexedDB, and it cannot call the API as the user. That
+//     rules out srcdoc's more convenient alternatives: a blob: URL would
+//     inherit THIS origin, which is the whole thing being avoided.
+//   - an injected CSP that allows inline script and style - a generated page is
+//     inline by nature - and blocks every remote load. On a deployment whose
+//     premise is that the conversation stays in the enclave, a page the model
+//     wrote must not be the thing that phones out: one remote <img> is enough
+//     to tell a third party what was generated and when.
+//
+// Blocking silently would be its own kind of lie (a page whose CDN stylesheet
+// never arrives just looks broken), so the frame reports what was refused and
+// the block offers to reload with the network allowed. Opt-in, per block, in
+// the user's hands - the same shape as the web-search switch.
+const FULLSCREEN = !!document.fullscreenEnabled;
+const PREV_MIN = 90, PREV_MAX = 720, PREV_DEF = 360;
+
+const PREV_CSP = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:; " +
+  "worker-src blob:; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; " +
+  "media-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'";
+
+// Injected last, so it measures a page that has finished parsing. A frame on an
+// opaque origin cannot be measured from out here (its document is cross-origin
+// by construction), so it reports its own height instead; the parent still
+// decides what to do with the number.
+//
+// What it measures is the BODY and the bottom edge of everything in it, never
+// documentElement.scrollHeight - that one is floored at the viewport, so a
+// short page would report the frame's current height back and every page would
+// sit at whatever it was first given. Taking the lowest child's bottom edge
+// also catches the absolutely positioned layouts a canvas demo tends to use.
+// The parent applies the number as-is, without padding: a page written to fill
+// the viewport (min-height:100vh) reports whatever height it was handed, so any
+// slack added here would be added again on the next measurement, and the frame
+// would creep taller for as long as anyone watched it.
+const PREV_SHIM = "<script>(function(){var last=-1,n=0;" +
+  "function post(m){try{parent.postMessage(m,'*')}catch(e){}}" +
+  "function measure(){var b=document.body;if(!b)return 0;" +
+  "var h=Math.max(b.scrollHeight,b.offsetHeight),k=b.children;" +
+  "for(var i=0;i<k.length;i++){var r=k[i].getBoundingClientRect();if(r.bottom>h)h=r.bottom}" +
+  "return Math.ceil(h+(parseFloat(getComputedStyle(b).marginBottom)||0))}" +
+  "function tick(){var h=measure();" +
+  // nothing laid out yet (or a page that paints entirely outside its body):
+  // no measurement is better than collapsing the frame to a sliver
+  "if(h>24&&Math.abs(h-last)>2){last=h;post({eo:'h',h:h})}}" +
+  "document.addEventListener('securitypolicyviolation',function(e){" +
+  "post({eo:'csp',n:++n,uri:String(e.blockedURI||'').slice(0,200)})});" +
+  "addEventListener('load',tick);addEventListener('resize',tick);" +
+  "try{new ResizeObserver(tick).observe(document.documentElement)}catch(e){}" +
+  "[0,60,200,600,1500].forEach(function(t){setTimeout(tick,t)})})();<\/script>";
+
+// The CSP has to reach the parser before the loads it exists to stop, so it
+// goes as early as the document's own shape allows: inside <head> when there is
+// one, otherwise straight after <html> or the doctype. Never in FRONT of a
+// doctype - that would drop the page into quirks mode and lay it out
+// differently from the file the user downloads.
+function previewDoc(src, net) {
+  const head = (net ? "" : '<meta http-equiv="Content-Security-Policy" content="' + PREV_CSP + '">') +
+    '<meta name="referrer" content="no-referrer">';
+  const at = (re) => { const m = src.match(re); return m ? m.index + m[0].length : -1; };
+  let p = at(/<head[^>]*>/i);
+  if (p < 0) p = at(/<html[^>]*>/i);
+  if (p < 0) p = at(/^\s*<!doctype[^>]*>/i);
+  if (p < 0) p = 0;
+  return src.slice(0, p) + head + src.slice(p) + PREV_SHIM;
+}
+
+const blockSrc = (block) => block.querySelector("pre code").textContent;
+
+// A block is known by what it holds, not by where it sits: message indices
+// shift as the conversation grows, and every new message rebuilds the whole
+// log, so a choice pinned to a position would not survive the next turn.
+function prevKey(block) {
+  const s = blockSrc(block);
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h + ":" + s.length;
+}
+const prevView = new Map();  // key -> "code" | "preview", the user's own choice
+const prevNet = new Set();   // keys the user has let reach the network
+
+function mountPreview(block) {
+  const wrap = block.querySelector(".prev");
+  let fr = wrap.querySelector("iframe");
+  if (!fr) {
+    fr = document.createElement("iframe");
+    fr.className = "prevframe";
+    fr.title = "Rendered HTML preview";
+    // no allow-same-origin, and that omission is the point (see above)
+    fr.setAttribute("sandbox", "allow-scripts allow-modals allow-popups allow-forms allow-pointer-lock");
+    fr.setAttribute("referrerpolicy", "no-referrer");
+    fr.style.height = PREV_DEF + "px";
+    wrap.appendChild(fr);
+  }
+  const note = wrap.querySelector(".prevnote");
+  if (note) note.remove();          // a reload starts the count over
+  fr.srcdoc = previewDoc(blockSrc(block), prevNet.has(prevKey(block)));
+}
+
+// Mounting is deferred until the block is near the viewport: a long chat can
+// hold a dozen pages, and each one is a document with its own scripts. Nothing
+// runs until there is a reason to look at it.
+const prevIO = "IntersectionObserver" in window
+  ? new IntersectionObserver((es) => {
+      for (const e of es) {
+        // a rebuilt log leaves its old blocks observed and detached; drop them
+        // rather than holding the dead DOM alive for the rest of the session
+        if (!e.target.isConnected) { prevIO.unobserve(e.target); continue; }
+        if (e.isIntersecting) { prevIO.unobserve(e.target); mountPreview(e.target); }
+      }
+    }, { rootMargin: "800px 0px" })
+  : null;
+
+function setPrevView(block, view, remember) {
+  const on = view === "preview";
+  block.querySelector(".prev").hidden = !on;
+  block.querySelector("pre").hidden = on;
+  block.classList.toggle("previewing", on);
+  const btn = block.querySelector("[data-html-view]");
+  if (btn) {
+    const label = on ? "Code" : "Preview";
+    btn.innerHTML = (on ? ICONS.code : ICONS.frame) + "<span>" + label + "</span>";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+  }
+  const full = block.querySelector("[data-html-full]");
+  if (full) full.hidden = !on;
+  if (on && !block.querySelector(".prev iframe")) {
+    if (prevIO) prevIO.observe(block); else mountPreview(block);
+  }
+  if (remember) prevView.set(prevKey(block), view);
+}
+
+// Called on every rebuild of a message body. While the reply is still streaming
+// the buttons are held disabled rather than hidden: the block below the cursor
+// is finished html, but the next delta replaces this DOM wholesale, so a frame
+// mounted now would be torn down and re-run token by token.
+function hydrateHtml(root, streaming) {
+  for (const b of root.querySelectorAll(".htmlblock")) {
+    if (streaming) {
+      for (const btn of b.querySelectorAll("[data-html-view],[data-html-full]")) btn.disabled = true;
+      continue;
+    }
+    if ((prevView.get(prevKey(b)) || (b.dataset.doc ? "preview" : "code")) === "preview")
+      setPrevView(b, "preview", false);
+  }
+}
+
+// The name someone will look for in their downloads folder. A page that titled
+// itself gets to keep the name; three files called page.html do not.
+function htmlFileName(src) {
+  const m = src.match(/<title[^>]*>([^<]{1,120})<\/title>/i);
+  const t = (m ? m[1] : "").trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  return (t || "page") + ".html";
+}
+
+// The file, byte for byte as the model wrote it: the sandbox meta and the
+// height shim exist for the preview only and have no business in what lands on
+// someone's disk.
+function downloadHtml(block, btn) {
+  const src = blockSrc(block);
+  const url = URL.createObjectURL(new Blob([src], { type: "text/html;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = htmlFileName(src);
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  flashDone(btn, "Saved");
+}
+
+// What the frames have to say for themselves: how tall they are, and what they
+// were stopped from fetching. The source window identifies the frame - there is
+// no origin to check, by design - and every value is clamped or escaped before
+// it touches the page, because the sender is a document the model wrote.
+addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || (d.eo !== "h" && d.eo !== "csp")) return;
+  let fr = null;
+  for (const f of document.querySelectorAll(".htmlblock .prev iframe"))
+    if (f.contentWindow === e.source) { fr = f; break; }
+  if (!fr) return;
+  if (d.eo === "h") {
+    // full screen sizes the frame itself; taking its word for it there would
+    // leave a screen-tall block behind on the way out
+    if (document.fullscreenElement && document.fullscreenElement.contains(fr)) return;
+    const h = Math.round(Number(d.h) || 0);
+    if (h > 0) fr.style.height = Math.min(Math.max(h, PREV_MIN), PREV_MAX) + "px";
+    return;
+  }
+  const wrap = fr.parentElement;
+  let note = wrap.querySelector(".prevnote");
+  if (!note) {
+    note = node('<div class="prevnote"><span></span>' +
+      '<button type="button" data-html-net>Allow</button></div>');
+    wrap.insertBefore(note, fr);
+  }
+  const n = Math.max(1, Math.min(9999, Math.round(Number(d.n) || 1)));
+  note.firstChild.textContent = n + (n === 1 ? " request" : " requests") + " out of the enclave blocked";
+  note.title = "blocked: " + String(d.uri || "").slice(0, 200);
+});
+
+// Expand: the frame stays exactly where it is and the BLOCK goes full screen.
+// Re-parenting an iframe reloads its document, which would throw away whatever
+// the page was in the middle of.
+function toggleFull(block) {
+  if (document.fullscreenElement) { document.exitFullscreen(); return; }
+  const p = block.requestFullscreen();
+  if (p && p.catch) p.catch(() => {});
+}
+// the same button is the way out, so it has to stop saying Expand once it is
+addEventListener("fullscreenchange", () => {
+  for (const b of document.querySelectorAll(".htmlblock")) {
+    const btn = b.querySelector("[data-html-full]");
+    if (!btn) continue;
+    const label = document.fullscreenElement === b ? "Close" : "Expand";
+    btn.innerHTML = ICONS.expand + "<span>" + label + "</span>";
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+  }
+});
+// -------------------------------------------------------- end html preview --
 
 // ------------------------------------------------------------------ state --
 const state = {
@@ -1940,14 +2248,18 @@ function scrollBottom(force) {
 jump.addEventListener("click", () => { pinned = true; scrollBottom(true); jump.classList.remove("show"); });
 
 // -------------------------------------------------------------- rendering --
+// the check-and-revert that says a one-shot button did its one thing. A labelled
+// button in a code header says what happened; an icon-only action just ticks.
+function flashDone(btn, label) {
+  if (!btn) return;
+  const prev = btn.innerHTML;
+  btn.classList.add("done");
+  btn.innerHTML = ICONS.check + (btn.classList.contains("cbtn") ? "<span>" + label + "</span>" : "");
+  setTimeout(() => { btn.classList.remove("done"); btn.innerHTML = prev; }, 1400);
+}
+
 function copyText(text, btn) {
-  const done = () => {
-    if (!btn) return;
-    const prev = btn.innerHTML;
-    btn.classList.add("done");
-    btn.innerHTML = ICONS.check + (btn.classList.contains("cbtn") ? "<span>Copied</span>" : "");
-    setTimeout(() => { btn.classList.remove("done"); btn.innerHTML = prev; }, 1400);
-  };
+  const done = () => flashDone(btn, "Copied");
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(done, done);
   } else {
@@ -2175,6 +2487,8 @@ function renderMessage(m, idx, isTail) {
   if (isTail) row.classList.add("tail");
   const md = row.querySelector(".md");
   md.innerHTML = assistantHtml(m.content, false);
+  // the reply is settled, so a page it contains can be shown as a page
+  hydrateHtml(md, false);
   // before the sources list is attached, so only the prose is walked
   linkCitations(md, m.sources);
   // the picture goes ABOVE the sentence that refers to it
@@ -2239,6 +2553,7 @@ function updateStreamDOM(chat) {
     const open = [...body.querySelectorAll("details.think")].map((d) => d.open);
     body.innerHTML = assistantHtml(s.reply, true);
     [...body.querySelectorAll("details.think")].forEach((d, i) => { if (open[i]) d.open = true; });
+    hydrateHtml(body, true);
     // the markers link up as they stream in; a half-written "[1" waits for
     // its bracket, and the sources list is not in the body yet
     linkCitations(body, s.sources);
@@ -2303,6 +2618,25 @@ log.addEventListener("click", (e) => {
   if (cc) {
     const code = cc.closest(".code").querySelector("pre code");
     copyText(code.textContent, cc);
+    return;
+  }
+  const hv = e.target.closest("[data-html-view]");
+  if (hv) {
+    const b = hv.closest(".htmlblock");
+    setPrevView(b, b.classList.contains("previewing") ? "code" : "preview", true);
+    return;
+  }
+  const hd = e.target.closest("[data-dl-html]");
+  if (hd) { downloadHtml(hd.closest(".htmlblock"), hd); return; }
+  const hf = e.target.closest("[data-html-full]");
+  if (hf) { toggleFull(hf.closest(".htmlblock")); return; }
+  const hn = e.target.closest("[data-html-net]");
+  if (hn) {
+    // the user's decision, and it stays made: the block reloads with the
+    // network open, and stays that way through the log rebuilds to come
+    const b = hn.closest(".htmlblock");
+    prevNet.add(prevKey(b));
+    mountPreview(b);
     return;
   }
   const cm = e.target.closest("[data-copy-msg]");
