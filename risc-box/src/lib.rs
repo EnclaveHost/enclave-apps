@@ -1051,6 +1051,24 @@ pub fn run() {
     // without it the answer costs a day of tracing across three machines.
     // Names are already public (they are in the app config); values are not,
     // and never appear here.
+    // Say which build this is, first line, before anything can go wrong.
+    //
+    // Nothing in the logs or /status identified the running build, so "which
+    // version is that deployment actually on" had to be answered by reading a
+    // catalog index back through the ledger — and during a rollout, when two
+    // versions differ by one changed default, that is exactly the question
+    // being asked. The threading model is on the same line because it decides
+    // whether watching the machine costs the machine, and it is a build-time
+    // fact, not a config one.
+    eprintln!(
+        "[risc-box] risc-box {} ({} build)",
+        env!("CARGO_PKG_VERSION"),
+        match cfg!(feature = "set") {
+            true => "shared-everything-threads",
+            false => "single-threaded wasip2",
+        }
+    );
+
     let mut names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
     names.sort();
     eprintln!("[risc-box] guest env ({}): {}", names.len(), names.join(" "));
