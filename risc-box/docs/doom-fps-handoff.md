@@ -26,6 +26,26 @@ minutes of unbroken gameplay, every frame through X (`0 direct / N via X`):
     min 25.7    p10 29.9    median 34.5    mean 35.5    max 66.4
     below 24 fps: 0 of 53
 
+A later run with the desktop's terminal moved clear of the game window (fluxbox
+was placing it across the lower-right corner, which also gave Xorg's blit a
+multi-rectangle clip) — 129 samples, ~6.5 min:
+
+    min 11.5    p10 28.5    median 33.1    mean 35.2    max 69.5
+    below 24: 4 of 129
+
+and the series says exactly what those four are:
+
+    54.1  68.7  69.5 | 15.6  11.5 | 28.1  32.9  30.8  31.5 ...
+       title screen  |  demo load |        gameplay
+
+Every sub-24 sample is the three-to-six seconds where one demo ends and the
+next loads (level load plus DOOM's melt wipe). **In gameplay the floor is
+25.4.** Quote it that way; a single number hides which is which.
+
+Method caveat: reading the game's log through the /console SSE can double-count,
+because the stream replays scrollback before live output. Sample counts above
+are therefore approximate; the distribution is not.
+
 The goal is met on the shipped desktop at its real resolution: the floor
 clears 24 and the median clears the 30 stretch. Of the three changes that took
 it there from a 19.7 floor, the dirty-row upload was much the largest —
