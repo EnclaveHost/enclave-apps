@@ -3,3 +3,4 @@ images/
 # This one only appears because `--example boot-bench` builds from emu's own
 # manifest.
 emu/Cargo.lock
+set/*.wasm

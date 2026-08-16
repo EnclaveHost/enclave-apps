@@ -87,15 +87,24 @@ impl VirtioBlockDisk {
 	/// # Arguments
 	/// * `contents` filesystem content binary
 	pub fn init(&mut self, contents: Vec<u8>) {
-		// @TODO: Optimize
-		self.contents_len = contents.len(); // risc-box patch
-		for _i in 0..((contents.len() + 7) / 8) {
-			self.contents.push(0);
+		// risc-box patch: pack the image into u64 cells with ONE exactly-sized
+		// allocation. The original pushed a zero per cell, so the Vec doubled
+		// its way up and briefly held ~2x the image in dead capacity — a real
+		// cost on wasm32, where the disk and the guest RAM share one linear
+		// memory and a half-gigabyte image leaves little headroom.
+		self.contents_len = contents.len();
+		let cells = (contents.len() + 7) / 8;
+		self.contents = Vec::with_capacity(cells);
+		let full = contents.len() / 8;
+		for i in 0..full {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&contents[i * 8..i * 8 + 8]);
+			self.contents.push(u64::from_le_bytes(b));
 		}
-		for i in 0..contents.len() {
-			let index = (i >> 3) as usize;
-			let pos = (i % 8) * 8;
-			self.contents[index] = (self.contents[index] & !(0xff << pos)) | ((contents[i] as u64) << pos);
+		if full < cells {
+			let mut b = [0u8; 8];
+			b[..contents.len() - full * 8].copy_from_slice(&contents[full * 8..]);
+			self.contents.push(u64::from_le_bytes(b));
 		}
 	}
 
@@ -240,8 +249,12 @@ impl VirtioBlockDisk {
 			},
 			0x10001033 => {
 				self.queue_select = (self.queue_select & !(0xff << 24)) | ((value as u32) << 24);
+				// risc-box patch: selecting a queue this single-queue device
+				// does not have is the driver's problem, not grounds to
+				// panic the host. The spec's answer is QueueNumMax = 0 for
+				// a nonexistent queue; the guest reads that and moves on.
 				if self.queue_select != 0 {
-					panic!("Virtio: No multi queue support yet.");
+					eprintln!("[emu] virtio-blk: queue {} selected (single-queue device)", self.queue_select);
 				}
 			},
 			0x10001038 => {
@@ -295,12 +308,15 @@ impl VirtioBlockDisk {
 				self.notify_clocks.push(self.clock);
 			},
 			0x10001064 => {
-				// interrupt ack
-				if (value & 0x1) == 1 {
-					self.interrupt_status &= !0x1;
-				} else {
-					panic!("Unknown ack {:X}", value);
-				}
+				// interrupt ack. The driver writes back the ISR bits it is
+				// acknowledging; clear exactly those. A zero ack (seen from
+				// Linux when a batched service interval makes a PLIC level
+				// interrupt outlive its cause: claim, read ISR=0, ack 0) is
+				// spec-legal and clears nothing.
+				// risc-box patch: upstream panicked on any value but 1 — a
+				// guest-reachable host panic, which a tenant guest must
+				// never have.
+				self.interrupt_status &= !(value as u32 & 0x3);
 			},
 			0x10001070 => {
 				self.status = (self.status & !0xff) | (value as u32);
@@ -514,14 +530,14 @@ impl VirtioBlockDisk {
 					};
 				},
 				2 => {
-					// Third descriptor: Result status
-					if (desc_flags & VIRTQ_DESC_F_WRITE) == 0 {
-						panic!("Third descriptor should be write.");
+					// Third descriptor: Result status.
+					// risc-box patch: a malformed status descriptor (not
+					// write, wrong length) is the driver's bug; write the
+					// status if it is writable and move on — never panic
+					// the host over guest-authored ring contents.
+					if (desc_flags & VIRTQ_DESC_F_WRITE) != 0 && desc_len >= 1 {
+						memory.write_byte(desc_addr, 0); // 0 means succeeded
 					}
-					if desc_len != 1 {
-						panic!("Third descriptor length should be one.");
-					}
-					memory.write_byte(desc_addr, 0); // 0 means succeeded
 				},
 				_ => {}
 			};
@@ -533,9 +549,10 @@ impl VirtioBlockDisk {
 			}
 		}
 
-		if desc_num != 3 {
-			panic!("Descript chain length should be three.");
-		}
+		// risc-box patch: upstream asserted desc_num == 3 with a panic. A
+		// guest that posts a shorter or longer chain gets its head marked
+		// used like any other request — its driver sees the request as
+		// consumed and life goes on; the host does not crash.
 
 		memory.write_word(base_used_address.wrapping_add(4).wrapping_add((self.used_ring_index as u64 % queue_size) * 8), desc_head_index as u32);
 

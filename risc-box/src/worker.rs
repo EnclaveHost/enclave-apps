@@ -164,7 +164,7 @@ fn serve() {
         let mut video = Vec::new();
         if job.want_video {
             if av1.is_none() {
-                av1 = video::Av1Encoder::new(display::FB_W, display::FB_H, 4_000_000, 10);
+                av1 = video::Av1Encoder::new(display::fb_w(), display::fb_h(), 4_000_000, 10);
             }
             let (rgb, w, h) = video::rgb_from_capture(&job.frame);
             if let Some(enc) = av1.as_mut() {

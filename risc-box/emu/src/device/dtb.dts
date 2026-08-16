@@ -133,7 +133,8 @@
 
 	memory@80000000 {
 		device_type = "memory";
-		// risc-box patch: 512 MiB (was 128) — a desktop guest needs the RAM for
+		// risc-box patch: 512 MiB DEFAULT (was 128); the size cell here is rewritten at
+		// boot to the configured RAM (RISCBOX_CONFIG ramMiB) by Mmu::sync_dtb_memory_size — a desktop guest needs the RAM for
 		// Xorg + clients, and X's fork of xkbcomp fails under 128 MiB. Must match
 		// PROGRAM_MEMORY_CAPACITY in lib.rs. The framebuffer + its reserved-memory
 		// hole at 0x87e00000 sit inside this range.

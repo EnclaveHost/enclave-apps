@@ -94,6 +94,21 @@ struct Config {
     net_enabled: bool,
     net_outbound: bool,
     forwards: Vec<ForwardCfg>,
+    // Guest RAM in MiB (`ramMiB`). Default 512 keeps existing deployments'
+    // footprint; the alpine/firefox image wants 1792. Clamped to [128, 1920]:
+    // the emulator's RAM is one contiguous Vec and a wasm32 allocation caps at
+    // 2 GiB, and a machine under 128 MiB can't even finish X startup.
+    ram_mib: u64,
+    // Display size (`display: {width, height}`), default 1024x768. Must fit the
+    // DTB's 3 MiB framebuffer window; the emulator applies the same guard to
+    // the device tree, so app and guest cannot disagree.
+    fb_w: u64,
+    fb_h: u64,
+    // `realtime`: drive the guest's clock from the host's, instead of from
+    // retired instructions. Anything that paces itself off the clock — a game,
+    // a video player, a benchmark inside the guest — needs this to be true or
+    // it runs at (emulated MIPS / 10) times speed.
+    realtime: bool,
     api_key: Option<String>,
 }
 
@@ -189,6 +204,25 @@ fn load_config() -> Config {
             .and_then(|x| x.as_bool())
             .unwrap_or(true),
         forwards: forwards_from(v.get("net")),
+        ram_mib: v
+            .get("ramMiB")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(512)
+            .clamp(128, 1920),
+        fb_w: v
+            .get("display")
+            .and_then(|d| d.get("width"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(1024),
+        fb_h: v
+            .get("display")
+            .and_then(|d| d.get("height"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(768),
+        realtime: v
+            .get("realtime")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         // Optional shared secret. When set (directly or via a $VAR secret), the
         // control + observation endpoints require it; see `authorized`. Unset
         // means the deployment is open, which is only safe when it is private.
@@ -311,10 +345,13 @@ struct Images {
 impl Images {
     /// The disk to hand a fresh machine. Expanded per boot rather than held
     /// expanded, so the cost is paid only while a machine is actually running.
-    fn disk(&self) -> Result<Vec<u8>, String> {
+    /// The raw ext2 bytes to hand the emulator. Takes the stored image by
+    /// value when it is already raw: a clone of a half-gigabyte fs is real
+    /// wasm32 linear memory, and the cache is refilled on the next start.
+    fn take_disk(&mut self) -> Result<Vec<u8>, String> {
         match self.fs_gzipped {
             true => gz::gunzip(&self.fs_stored),
-            false => Ok(self.fs_stored.clone()),
+            false => Ok(std::mem::take(&mut self.fs_stored)),
         }
     }
 }
@@ -334,6 +371,19 @@ struct App {
     live_creds: Option<Creds>, // remembered from the last successful start, for /save
     instret: u64,
     boot_at: Option<Instant>,
+    // Presented frames per real second, sampled from the framebuffer's byte
+    // counter (see `sample_fps`).
+    fps_now: f64,
+    fps_bytes: u64,
+    fps_at: Instant,
+    // Frames actually put on the wire for watchers (a scan that found any
+    // change), and the rate derived from it. The guest's rate and this one are
+    // different questions: the machine can draw faster than the scan is paced
+    // to ship, and a viewer only ever sees this one.
+    sent_frames: u64,
+    sent_fps: f64,
+    sent_at: Instant,
+    sent_mark: u64,
     input_boost: u64, // turns to force full tick batches after POST /input
     scrollback: VecDeque<u8>,
     console_total: u64,
@@ -377,6 +427,17 @@ fn b64(data: &[u8]) -> String {
 }
 
 impl App {
+    /// Frames the guest has presented per real second, over the last sampling
+    /// window (see `sample_fps`).
+    ///
+    /// A frame is `width * height * 4` bytes painted into the framebuffer, so
+    /// this counts what the machine actually put on screen, not what it claims:
+    /// the guest's own timing is only as honest as the guest's clock, and
+    /// unless `realtime` is set that clock runs at (MIPS / 10) times speed.
+    fn fps(&self) -> f64 {
+        self.fps_now
+    }
+
     fn mips(&self) -> f64 {
         match self.boot_at {
             Some(t) if self.instret > 0 => {
@@ -409,7 +470,8 @@ impl App {
         format!(
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
-             \"instret\":{},\"mips\":{:.1},\"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{}{img}}}",
+             \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
@@ -423,6 +485,11 @@ impl App {
             self.cfg.read_only,
             self.instret,
             self.mips(),
+            self.fps(),
+            self.sent_fps,
+            display::fb_w(),
+            display::fb_h(),
+            self.cfg.realtime,
             self.console_total,
             self.last_save
                 .as_ref()
@@ -451,6 +518,7 @@ impl App {
                     )
                 })
                 .unwrap_or_else(|| "null".into()),
+            self.cfg.ram_mib,
         )
     }
 }
@@ -493,8 +561,12 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
-    let fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
+    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
+    // The download Vec doubles as it grows, so an image just past a power of
+    // two carries up to 2x its size in dead capacity — real linear memory on
+    // wasm32, where fs + guest RAM already crowd the budget. Return it.
+    fs_stored.shrink_to_fit();
     // A `.gz` key is fetched and cached compressed and expanded per boot; see
     // Images::disk. Verify it inflates now rather than at boot, so a bad object
     // fails the fetch (which retries) instead of the machine start.
@@ -521,17 +593,40 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     Ok(Images { kernel, fs_stored, fs_gzipped, dtb })
 }
 
-fn boot(images: &Images, net_enabled: bool) -> Result<Emulator, String> {
+fn boot(images: &mut Images, cfg: &Config) -> Result<Emulator, String> {
     let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
         input: VecDeque::new(),
         output: VecDeque::new(),
     }));
+    // before setup_program: that's where the RAM Vec is allocated and the
+    // DTB memory node gets synced to it
+    emu.setup_ram_bytes(cfg.ram_mib * 1024 * 1024);
+    // Display size and clock source, both of which the guest reads exactly once
+    // at boot: the DTB node for the framebuffer, the timebase for the clock.
+    if cfg.fb_w != 1024 || cfg.fb_h != 768 {
+        match emu.set_framebuffer_size(cfg.fb_w as u32, cfg.fb_h as u32)
+            && display::set_size(cfg.fb_w as usize, cfg.fb_h as usize)
+        {
+            true => eprintln!("[risc-box] display {}x{}", cfg.fb_w, cfg.fb_h),
+            false => eprintln!(
+                "[risc-box] display {}x{} rejected (must be even and fit 3 MiB); staying at {}x{}",
+                cfg.fb_w,
+                cfg.fb_h,
+                display::fb_w(),
+                display::fb_h()
+            ),
+        }
+    }
+    if cfg.realtime {
+        emu.set_wall_clock(true);
+        eprintln!("[risc-box] guest clock: host monotonic (realtime)");
+    }
     emu.setup_program(images.kernel.clone());
-    emu.setup_filesystem(images.disk()?);
+    emu.setup_filesystem(images.take_disk()?);
     if let Some(dtb) = &images.dtb {
         emu.setup_dtb(dtb.clone());
     }
-    if net_enabled {
+    if cfg.net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
     }
     Ok(emu)
@@ -637,7 +732,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             worker::want_full();
             let initial = format!(
                 "event: mode\ndata: {{\"w\":{},\"h\":{}}}\n\n",
-                display::FB_W, display::FB_H
+                display::fb_w(), display::fb_h()
             );
             server.upgrade_sse(key, "display", &initial);
         }
@@ -648,11 +743,11 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // keyframe. `event: codec` carries the WebCodecs codec string + size.
         ("GET", "/video") => {
             use video::VideoEncoder;
-            let codec = video::Av1Encoder::new(display::FB_W, display::FB_H, 1, 10)
+            let codec = video::Av1Encoder::new(display::fb_w(), display::fb_h(), 1, 10)
                 .map(|e| e.webcodec()).unwrap_or("");
             let initial = format!(
                 "event: codec\ndata: {{\"codec\":\"{}\",\"w\":{},\"h\":{}}}\n\n",
-                codec, display::FB_W, display::FB_H
+                codec, display::fb_w(), display::fb_h()
             );
             server.upgrade_sse(key, "video", &initial);
         }
@@ -902,12 +997,12 @@ fn do_start(app: &mut App, start: Start) {
             }
         }
     }
-    let imgs = app.cache.as_ref().expect("cache present after fetch");
+    let imgs = app.cache.as_mut().expect("cache present after fetch");
     // Expanding a gzipped image can fail (corrupt object, or no room for the
     // expanded disk beside everything else). Treat it exactly like a failed
     // fetch: report it and leave the machine stopped, rather than unwrapping
     // and taking the whole app down with it.
-    let emu = match boot(imgs, app.cfg.net_enabled) {
+    let emu = match boot(imgs, &app.cfg) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[risc-box] start failed: {e}");
@@ -996,6 +1091,13 @@ pub fn run() {
         live_creds: None,
         instret: 0,
         boot_at: None,
+        fps_now: 0.0,
+        fps_bytes: 0,
+        fps_at: Instant::now(),
+        sent_frames: 0,
+        sent_fps: 0.0,
+        sent_at: Instant::now(),
+        sent_mark: 0,
         input_boost: 0,
         scrollback: VecDeque::new(),
         console_total: 0,
@@ -1087,15 +1189,44 @@ pub fn run() {
         let mut busy = false;
         if app.phase == Phase::Running {
             if let Some(emu) = app.emu.as_mut() {
-                let batch = match app.input_boost == 0 && emu.get_cpu().is_idle() {
+                let parked = app.input_boost == 0 && emu.get_cpu().is_idle();
+                let batch = match parked {
                     true => IDLE_BATCH,
                     false => TICK_BATCH,
                 };
+                // A guest that is RUNNING has already paced this turn: it just
+                // spent a full batch of real work, and the loop must not add a
+                // sleep on top. `busy` used to be set only by console bytes and
+                // encoded frames, so a compute-bound guest that prints nothing
+                // — a game, a build, a long boot phase — was silently throttled
+                // by a millisecond every turn. At the ~6 ms a batch takes that
+                // is a quarter of the machine, given away for nothing.
+                busy = !parked;
                 app.input_boost = app.input_boost.saturating_sub(1);
-                for _ in 0..batch {
-                    emu.tick();
-                }
+                // batched entry point: per-instruction loop overhead is
+                // amortized inside the emulator, and a WFI-parked guest
+                // consumes the batch without spinning (idle turns cost the
+                // loop almost nothing, leaving the budget to scan/encode).
+                emu.run_n(batch);
                 app.instret += batch;
+                // Presented frames per real second. Written out here rather
+                // than behind a method because `emu` holds a borrow of app.emu
+                // for the rest of this block, and these are disjoint fields.
+                {
+                    let bytes = emu.fb_bytes();
+                    let now = Instant::now();
+                    let dt = now.duration_since(app.fps_at).as_secs_f64();
+                    if dt >= 1.0 {
+                        let per = (display::fb_bytes() as f64).max(1.0);
+                        app.fps_now = bytes.wrapping_sub(app.fps_bytes) as f64 / per / dt;
+                        app.fps_bytes = bytes;
+                        app.fps_at = now;
+                        let sdt = now.duration_since(app.sent_at).as_secs_f64();
+                        app.sent_fps = (app.sent_frames - app.sent_mark) as f64 / sdt;
+                        app.sent_mark = app.sent_frames;
+                        app.sent_at = now;
+                    }
+                }
                 // drain the guest UART output into scrollback + SSE
                 let mut chunk: Vec<u8> = Vec::new();
                 let t = emu.get_mut_terminal();
@@ -1165,8 +1296,18 @@ pub fn run() {
                 // than a compressor, so it barely bites — and one frame is
                 // kept in flight, because capturing faster than the worker can
                 // compress would only queue up stale screens.
-                let watching_display = server.sse_count("display") > 0;
-                let watching_video = server.sse_count("video") > 0;
+                // Pace to the SLOWEST watcher as well as to the cost of a
+                // scan. A frame is only worth producing if the last one has
+                // mostly reached someone: past this backlog the extra frames
+                // are not seen, they queue — and the queue ends at MAX_WBUF,
+                // where the server closes the connection and the viewer loses
+                // the stream entirely. On a loopback this never triggers; over
+                // a relay, at 1024x768, it triggered within a second.
+                const SSE_BACKLOG_LIMIT: usize = 192 * 1024;
+                let display_backed_up = server.sse_backlog("display") > SSE_BACKLOG_LIMIT;
+                let video_backed_up = server.sse_backlog("video") > SSE_BACKLOG_LIMIT;
+                let watching_display = server.sse_count("display") > 0 && !display_backed_up;
+                let watching_video = server.sse_count("video") > 0 && !video_backed_up;
                 // Keep the display scan at its fast floor while input is recent
                 // (the same boost window the CPU uses). The stillness backoff
                 // stretches the scan interval toward 100 ms when the screen has
@@ -1207,12 +1348,13 @@ pub fn run() {
                         true => app.fb_still.saturating_add(1),
                         false => 0,
                     };
+                    app.sent_frames += !bands.is_empty() as u64;
                     for band in bands {
                         server.broadcast(
                             "display",
                             &format!(
-                                "data: {{\"y\":{},\"h\":{},\"b\":\"{}\"}}",
-                                band.y, band.h, b64(&band.z)
+                                "data: {{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                                band.x, band.w, band.y, band.h, b64(&band.z)
                             ),
                         );
                         busy = true;
@@ -1231,7 +1373,7 @@ pub fn run() {
                 if watching_video && !worker::available() {
                     use video::VideoEncoder;
                     if app.av1.is_none() {
-                        app.av1 = video::Av1Encoder::new(display::FB_W, display::FB_H, 4_000_000, 10);
+                        app.av1 = video::Av1Encoder::new(display::fb_w(), display::fb_h(), 4_000_000, 10);
                     }
                     // Pace the encoder by what it COSTS, not by the clock.
                     //
@@ -1288,10 +1430,12 @@ pub fn run() {
                 true => app.fb_still.saturating_add(1),
                 false => 0,
             };
+            app.sent_frames += !out.bands.is_empty() as u64;
             for band in out.bands {
                 server.broadcast(
                     "display",
-                    &format!("data: {{\"y\":{},\"h\":{},\"b\":\"{}\"}}", band.y, band.h, b64(&band.z)),
+                    &format!("data: {{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                             band.x, band.w, band.y, band.h, b64(&band.z)),
                 );
                 busy = true;
             }

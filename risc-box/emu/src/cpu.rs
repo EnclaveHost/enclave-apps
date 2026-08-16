@@ -65,7 +65,7 @@ const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 // none of them need to be looked at 13 million times a second, and looking
 // cost more than the instructions did. 64 keeps timer granularity far finer
 // than the guest's 100 Hz tick while removing 63/64 of the overhead.
-const DEVICE_TICK_INTERVAL: u64 = 16;
+const DEVICE_TICK_INTERVAL: u64 = 32;
 
 const MIP_MEIP: u64 = 0x800;
 pub const MIP_MTIP: u64 = 0x080;
@@ -73,6 +73,258 @@ pub const MIP_MSIP: u64 = 0x008;
 pub const MIP_SEIP: u64 = 0x200;
 const MIP_STIP: u64 = 0x020;
 const MIP_SSIP: u64 = 0x002;
+
+// risc-box patch: superblock ("trace") cache. A block is a run of
+// predecoded instructions starting at a virtual pc, built lazily on first
+// execution and executed from a single probe: one tag+meta compare covers
+// every instruction in the run, where the per-instruction cache paid a
+// probe per retired instruction. Invariants that keep this exactly
+// equivalent to single-stepping:
+// - a block holds hot-set ops (kind != 0) with at most ONE non-hot op,
+//   always LAST — so an instruction that can arm the interrupt check,
+//   change translation state, or park the hart ends its block, and the
+//   run loop observes the effect at the same boundary single-stepping
+//   would;
+// - every op lives in the block's first (only) page, fill-eligible like
+//   the old per-instruction cache (offset <= 0xff8), and the page is
+//   marked for the SMC write snoop; hot stores re-check the meta after
+//   executing so a block writing over ITSELF stops before running stale
+//   ops (the write-then-execute gate in bench.py);
+// - a trap or taken branch exits the block with pc exact; JAL/JALR are
+//   terminal at build time so slots aren't wasted on unreachable tails.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockOp {
+	pub(crate) imm: i32,
+	pub(crate) word: u32,
+	pub(crate) data: u16, // INSTRUCTIONS index | ICACHE_LEN4
+	pub(crate) kind: u8,
+	pub(crate) rd: u8,
+	pub(crate) rs1: u8,
+	pub(crate) rs2: u8,
+	pub(crate) len: u8, // 2 or 4
+	pub(crate) _pad: u8
+}
+
+impl BlockOp {
+	pub(crate) const EMPTY: BlockOp = BlockOp {
+		imm: 0, word: 0, data: 0, kind: 0, rd: 0, rs1: 0, rs2: 0, len: 0, _pad: 0
+	};
+}
+
+// risc-box patch: a block is tagged by the PHYSICAL page it was decoded
+// from plus the write-snoop code generation — the two things its cached
+// content actually depends on. It is deliberately NOT tagged by
+// translation state: satp writes and SFENCE.VMA flush the TLB on every
+// context switch, and when the meta embedded the TLB generation every
+// switch threw away every block in the machine — page-fault storms
+// (desktop boot, app launch) spent their time rebuilding blocks instead
+// of running them. The probe instead re-translates the start pc through
+// the TLB (a hit is a few compares; a miss re-walks exactly as a fetch
+// would) and compares the physical page, so a remapped pc can never run
+// a stale block while an unchanged mapping keeps its blocks across
+// flushes.
+#[derive(Clone, Copy)]
+struct BlockHead {
+	tag: u64, // start pc (0 = never valid: DRAM starts at 0x80000000)
+	phys_page: u64, // physical page the ops were decoded from
+	count: u32,
+	code_gen: u32 // mmu.code_gen() at build time
+}
+
+impl BlockHead {
+	const EMPTY: BlockHead = BlockHead { tag: 0, phys_page: 0, count: 0, code_gen: 0 };
+}
+
+const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1); 32k x (24B + 32x16B) = 17 MiB
+const BLOCK_MAX: usize = 32; // ops per block
+
+// risc-box patch: hot-op ids. SB/SH/SW/SD are 1..=4 so "is this a store"
+// — the ops that need the in-block SMC meta re-check — is one range
+// compare. The set is the integer
+// instructions that dominate any Linux dynamic mix; everything else keeps
+// the INSTRUCTIONS-table path. Each exec_hot arm is a verbatim copy of the
+// table closure with the parse_format_* call replaced by the entry fields.
+pub(crate) const HOT_ADDI: u8 = 7;
+pub(crate) const HOT_ADD: u8 = 8;
+pub(crate) const HOT_LD: u8 = 9;
+pub(crate) const HOT_SD: u8 = 4;
+pub(crate) const HOT_LW: u8 = 10;
+pub(crate) const HOT_SW: u8 = 3;
+pub(crate) const HOT_BEQ: u8 = 11;
+pub(crate) const HOT_BNE: u8 = 12;
+pub(crate) const HOT_BLT: u8 = 13;
+pub(crate) const HOT_BGE: u8 = 14;
+pub(crate) const HOT_BLTU: u8 = 15;
+pub(crate) const HOT_BGEU: u8 = 16;
+pub(crate) const HOT_LUI: u8 = 17;
+pub(crate) const HOT_AUIPC: u8 = 18;
+pub(crate) const HOT_JAL: u8 = 19;
+pub(crate) const HOT_JALR: u8 = 20;
+pub(crate) const HOT_ANDI: u8 = 21;
+pub(crate) const HOT_ORI: u8 = 22;
+pub(crate) const HOT_XORI: u8 = 23;
+pub(crate) const HOT_AND: u8 = 24;
+pub(crate) const HOT_OR: u8 = 25;
+pub(crate) const HOT_XOR: u8 = 26;
+pub(crate) const HOT_SUB: u8 = 27;
+pub(crate) const HOT_SLLI: u8 = 28;
+pub(crate) const HOT_SRLI: u8 = 29;
+pub(crate) const HOT_SRAI: u8 = 30;
+pub(crate) const HOT_ADDIW: u8 = 31;
+pub(crate) const HOT_ADDW: u8 = 32;
+pub(crate) const HOT_SUBW: u8 = 33;
+pub(crate) const HOT_SLLIW: u8 = 34;
+pub(crate) const HOT_SRLIW: u8 = 35;
+pub(crate) const HOT_SRAIW: u8 = 36;
+pub(crate) const HOT_SLLW: u8 = 37;
+pub(crate) const HOT_SRLW: u8 = 38;
+pub(crate) const HOT_SRAW: u8 = 39;
+pub(crate) const HOT_SLL: u8 = 40;
+pub(crate) const HOT_SRL: u8 = 41;
+pub(crate) const HOT_SRA: u8 = 42;
+pub(crate) const HOT_SLT: u8 = 43;
+pub(crate) const HOT_SLTI: u8 = 44;
+pub(crate) const HOT_SLTU: u8 = 45;
+pub(crate) const HOT_SLTIU: u8 = 46;
+pub(crate) const HOT_MUL: u8 = 47;
+pub(crate) const HOT_LB: u8 = 48;
+pub(crate) const HOT_LBU: u8 = 49;
+pub(crate) const HOT_LH: u8 = 50;
+pub(crate) const HOT_LHU: u8 = 51;
+pub(crate) const HOT_LWU: u8 = 52;
+pub(crate) const HOT_FSW: u8 = 5;
+pub(crate) const HOT_FSD: u8 = 6;
+// stores are 1..=HOT_STORE_MAX so the in-block SMC re-check is one compare
+pub(crate) const HOT_STORE_MAX: u8 = 6;
+pub(crate) const HOT_FLD: u8 = 53;
+pub(crate) const HOT_FLW: u8 = 54;
+pub(crate) const HOT_FADD_D: u8 = 55;
+pub(crate) const HOT_FSUB_D: u8 = 56;
+pub(crate) const HOT_FMUL_D: u8 = 57;
+pub(crate) const HOT_FDIV_D: u8 = 58;
+pub(crate) const HOT_FSGNJ_D: u8 = 59;
+pub(crate) const HOT_FMV_X_D: u8 = 60;
+pub(crate) const HOT_FMV_D_X: u8 = 61;
+pub(crate) const HOT_FCVT_D_W: u8 = 62;
+pub(crate) const HOT_SB: u8 = 1;
+pub(crate) const HOT_SH: u8 = 2;
+
+// risc-box patch: fill-time classification for the predecode cache. Keyed
+// by the NAME of the INSTRUCTIONS entry the decode already matched — the
+// hot path can never disagree with the table about which instruction a
+// word is, because the kind is derived from the table's own match. Returns
+// (kind, rd, rs1, rs2, imm); kind 0 means "not in the hot set". The stored
+// immediates all fit in i32 (I/S/B: 12-13 bits, U: the sign-extended
+// upper-immediate value itself, J: 21 bits); shift amounts are re-read
+// from the word at execution so the xlen-dependent masking in the table
+// bodies stays exactly where it was.
+fn classify_hot(name: &str, word: u32) -> (u8, u8, u8, u8, i32) {
+	let kind = match name {
+		"ADDI" => HOT_ADDI,
+		"ADD" => HOT_ADD,
+		"LD" => HOT_LD,
+		"SD" => HOT_SD,
+		"LW" => HOT_LW,
+		"SW" => HOT_SW,
+		"BEQ" => HOT_BEQ,
+		"BNE" => HOT_BNE,
+		"BLT" => HOT_BLT,
+		"BGE" => HOT_BGE,
+		"BLTU" => HOT_BLTU,
+		"BGEU" => HOT_BGEU,
+		"LUI" => HOT_LUI,
+		"AUIPC" => HOT_AUIPC,
+		"JAL" => HOT_JAL,
+		"JALR" => HOT_JALR,
+		"ANDI" => HOT_ANDI,
+		"ORI" => HOT_ORI,
+		"XORI" => HOT_XORI,
+		"AND" => HOT_AND,
+		"OR" => HOT_OR,
+		"XOR" => HOT_XOR,
+		"SUB" => HOT_SUB,
+		"SLLI" => HOT_SLLI,
+		"SRLI" => HOT_SRLI,
+		"SRAI" => HOT_SRAI,
+		"ADDIW" => HOT_ADDIW,
+		"ADDW" => HOT_ADDW,
+		"SUBW" => HOT_SUBW,
+		"SLLIW" => HOT_SLLIW,
+		"SRLIW" => HOT_SRLIW,
+		"SRAIW" => HOT_SRAIW,
+		"SLLW" => HOT_SLLW,
+		"SRLW" => HOT_SRLW,
+		"SRAW" => HOT_SRAW,
+		"SLL" => HOT_SLL,
+		"SRL" => HOT_SRL,
+		"SRA" => HOT_SRA,
+		"SLT" => HOT_SLT,
+		"SLTI" => HOT_SLTI,
+		"SLTU" => HOT_SLTU,
+		"SLTIU" => HOT_SLTIU,
+		"MUL" => HOT_MUL,
+		"LB" => HOT_LB,
+		"LBU" => HOT_LBU,
+		"LH" => HOT_LH,
+		"LHU" => HOT_LHU,
+		"LWU" => HOT_LWU,
+		"SB" => HOT_SB,
+		"SH" => HOT_SH,
+		"FSW" => HOT_FSW,
+		"FSD" => HOT_FSD,
+		"FLD" => HOT_FLD,
+		"FLW" => HOT_FLW,
+		"FADD.D" => HOT_FADD_D,
+		"FSUB.D" => HOT_FSUB_D,
+		"FMUL.D" => HOT_FMUL_D,
+		"FDIV.D" => HOT_FDIV_D,
+		"FSGNJ.D" => HOT_FSGNJ_D,
+		"FMV.X.D" => HOT_FMV_X_D,
+		"FMV.D.X" => HOT_FMV_D_X,
+		"FCVT.D.W" => HOT_FCVT_D_W,
+		_ => 0
+	};
+	let rd = ((word >> 7) & 0x1f) as u8;
+	let rs1 = ((word >> 15) & 0x1f) as u8;
+	let rs2 = ((word >> 20) & 0x1f) as u8;
+	// The immediate each hot arm expects, by the format its table closure
+	// parsed (parse_format_i/s/b/u/j reproduced bit for bit).
+	let imm: i32 = match kind {
+		HOT_ADDI | HOT_SLTI | HOT_SLTIU | HOT_XORI | HOT_ORI | HOT_ANDI
+		| HOT_ADDIW | HOT_JALR | HOT_LB | HOT_LBU | HOT_LH | HOT_LHU
+		| HOT_LW | HOT_LWU | HOT_LD | HOT_FLD | HOT_FLW => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfffff800u32,
+				_ => 0
+			} | ((word >> 20) & 0x000007ff)
+		) as i32,
+		HOT_SB | HOT_SH | HOT_SW | HOT_SD | HOT_FSW | HOT_FSD => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfffff000u32,
+				_ => 0
+			} | ((word >> 20) & 0xfe0) | ((word >> 7) & 0x1f)
+		) as i32,
+		HOT_BEQ | HOT_BNE | HOT_BLT | HOT_BGE | HOT_BLTU | HOT_BGEU => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfffff000u32,
+				_ => 0
+			} | ((word << 4) & 0x00000800)
+				| ((word >> 20) & 0x000007e0)
+				| ((word >> 7) & 0x0000001e)
+		) as i32,
+		HOT_LUI | HOT_AUIPC => (word & 0xfffff000) as i32,
+		HOT_JAL => (
+			match word & 0x80000000 {
+				0x80000000 => 0xfff00000u32,
+				_ => 0
+			} | (word & 0x000ff000)
+				| ((word & 0x00100000) >> 9)
+				| ((word & 0x7fe00000) >> 20)
+		) as i32,
+		_ => 0
+	};
+	(kind, rd, rs1, rs2, imm)
+}
 
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
@@ -91,20 +343,37 @@ pub struct Cpu {
 	is_reservation_set: bool,
 	_dump_flag: bool,
 	decode_cache: DecodeCache,
-	// risc-box patch: predecoded instruction cache, direct-mapped by virtual
-	// PC (see tick_operate). tags = pc, metas = mmu.exec_meta() at fill
-	// time (0 = invalid), words = the uncompressed instruction word,
-	// data = INSTRUCTIONS index | ICACHE_LEN4 for 4-byte instructions.
-	icache_tags: Vec<u64>,
-	icache_metas: Vec<u64>,
-	icache_words: Vec<u32>,
-	icache_data: Vec<u16>,
+	// risc-box patch: superblock cache (see BlockOp/BlockHead above).
+	// heads[slot] tags a run of ops[slot*BLOCK_MAX ..][..count].
+	block_heads: Vec<BlockHead>,
+	block_ops: Vec<BlockOp>,
+	// risc-box patch (blockstats feature): per-slot execution/retired
+	// counters plus a histogram of retired-instructions bucketed by how many
+	// times the retiring block had executed when replaced — the coverage
+	// number PLATFORM-JIT.md needs (how much of the dynamic mix a region
+	// JIT could compile).
+	#[cfg(feature = "blockstats")]
+	stat_execs: Vec<u64>,
+	#[cfg(feature = "blockstats")]
+	stat_retired: Vec<u64>,
+	#[cfg(feature = "blockstats")]
+	stat_hist: [u64; 6], // buckets by exec count: 1-3,4-15,16-63,64-255,256-4095,4096+
+	#[cfg(feature = "blockstats")]
+	stat_singlestep: u64,
+	// block-graph edges (pred pc -> succ pc -> count) and per-pc node
+	// counts (execs, retired), for region/loop discovery at dump time
+	#[cfg(feature = "blockstats")]
+	stat_edges: std::collections::HashMap<(u64, u64), u64>,
+	#[cfg(feature = "blockstats")]
+	stat_nodes: std::collections::HashMap<u64, (u64, u64)>,
+	#[cfg(feature = "blockstats")]
+	stat_prev: u64,
 	unsigned_data_mask: u64,
-	// risc-box patch: instructions left before the next device service, and
-	// whether an interrupt check is owed before the next instruction (see
-	// tick). Set DEVICE_TICK_INTERVAL to 1 to get the original per-instruction
-	// behaviour back for a bisect.
-	device_countdown: u64,
+	// risc-box patch: instructions retired since the last device service
+	// (blocks may overshoot a boundary by up to BLOCK_MAX-1; the true count
+	// is what device clocks advance by), and whether an interrupt check is
+	// owed before the next instruction (see run).
+	since_service: u64,
 	check_interrupt: bool
 }
 
@@ -265,15 +534,28 @@ impl Cpu {
 			is_reservation_set: false,
 			_dump_flag: false,
 			decode_cache: DecodeCache::new(),
-			// risc-box patch: predecode cache starts empty (meta 0 = invalid)
-			icache_tags: vec![0; ICACHE_ENTRY_NUM],
-			icache_metas: vec![0; ICACHE_ENTRY_NUM],
-			icache_words: vec![0; ICACHE_ENTRY_NUM],
-			icache_data: vec![0; ICACHE_ENTRY_NUM],
+			// risc-box patch: block cache starts empty (tag 0 = invalid)
+			block_heads: vec![BlockHead::EMPTY; BLOCK_SLOTS],
+			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
+			#[cfg(feature = "blockstats")]
+			stat_execs: vec![0; BLOCK_SLOTS],
+			#[cfg(feature = "blockstats")]
+			stat_retired: vec![0; BLOCK_SLOTS],
+			#[cfg(feature = "blockstats")]
+			stat_hist: [0; 6],
+			#[cfg(feature = "blockstats")]
+			stat_singlestep: 0,
+			#[cfg(feature = "blockstats")]
+			stat_edges: std::collections::HashMap::new(),
+			#[cfg(feature = "blockstats")]
+			stat_nodes: std::collections::HashMap::new(),
+			#[cfg(feature = "blockstats")]
+			stat_prev: 0,
 			unsigned_data_mask: 0xffffffffffffffff,
-			// risc-box patch: service devices on the first tick, so a machine
-			// that traps immediately still sees its clint before running far.
-			device_countdown: 1,
+			// risc-box patch: service devices after the first instruction, so
+			// a machine that traps immediately still sees its clint before
+			// running far.
+			since_service: DEVICE_TICK_INTERVAL - 1,
 			check_interrupt: true
 		};
 		cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
@@ -327,41 +609,449 @@ impl Cpu {
 	}
 
 	/// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
+	// risc-box patch: tick() is now the single-instruction form of run() —
+	// kept for the tests and for callers that need per-instruction stepping
+	// (boot-bench's tracer).
 	pub fn tick(&mut self) {
-		let instruction_address = self.pc;
-		match self.tick_operate() {
-			Ok(()) => {},
-			Err(e) => self.handle_exception(e, instruction_address)
-		}
-		// risc-box patch: devices and interrupt delivery used to run on every
-		// retired instruction — six device ticks (clint, disk, net, input,
-		// uart, plic) plus two CSR reads, for an instruction whose own work is
-		// a tag compare and an indirect call. That overhead dominated the
-		// interpreter. Both now run every DEVICE_TICK_INTERVAL instructions,
-		// with the device clocks advanced by the whole interval so guest time
-		// passes at exactly the old rate, just in coarser steps.
-		//
-		// Interrupt delivery is not purely periodic: any CSR write that can
-		// change what is pending or enabled re-arms the check (see
-		// write_csr_raw), so enabling an already-pending interrupt still takes
-		// effect on the next instruction rather than waiting out the interval.
-		self.device_countdown -= 1;
-		if self.device_countdown == 0 {
-			self.device_countdown = DEVICE_TICK_INTERVAL;
-			self.mmu.tick(DEVICE_TICK_INTERVAL, &mut self.csr[CSR_MIP_ADDRESS as usize]);
-			self.check_interrupt = true;
-		}
-		if self.check_interrupt {
-			self.check_interrupt = false;
-			self.handle_interrupt(self.pc);
-		}
-		self.clock = self.clock.wrapping_add(1);
+		self.run(1);
+	}
 
-		// cpu core clock : mtime clock in clint = 8 : 1 is
-		// just an arbiraty ratio.
-		// @TODO: Implement more properly
-		// risc-box patch: CSR_CYCLE is now materialized lazily in read_csr_raw()
-		// (same pattern as CSR_TIME) instead of being written every tick.
+	/// risc-box patch: runs `n` instructions with the loop bookkeeping hoisted
+	/// out of the per-instruction path. Semantically this is n calls to the
+	/// old tick():
+	/// - devices and interrupt delivery used to run on every retired
+	///   instruction — six device ticks plus two CSR reads, for an instruction
+	///   whose own work is a tag compare and an indirect call. Both run every
+	///   DEVICE_TICK_INTERVAL instructions, with the device clocks advanced by
+	///   the whole interval so guest time passes at exactly the old rate, just
+	///   in coarser steps.
+	/// - interrupt delivery is not purely periodic: any CSR write that can
+	///   change what is pending or enabled re-arms the check (see
+	///   write_csr_raw), so enabling an already-pending interrupt still takes
+	///   effect on the next instruction rather than waiting out the interval.
+	/// - a hart parked in WFI consumes guest time without executing: the
+	///   whole burst until the next device service is charged in one step, so
+	///   an idle guest costs the host almost nothing while waking at exactly
+	///   the same clint/plic boundaries as before.
+	/// - CSR_CYCLE is materialized lazily in read_csr_raw() (same pattern as
+	///   CSR_TIME) instead of being written every tick.
+	pub fn run(&mut self, n: u64) {
+		let mut remaining = n;
+		// Superblocks retire several instructions per dispatch, so a call
+		// stepping fewer instructions than a block might hold has to stay on
+		// the single-instruction path — tick()/run(1) keeps exact stepping
+		// for the tests and boot-bench's tracer.
+		let allow_blocks = n >= BLOCK_MAX as u64;
+		while remaining > 0 {
+			// since_service < DEVICE_TICK_INTERVAL here (the service block
+			// below resets it), so every burst makes progress.
+			let until_service = DEVICE_TICK_INTERVAL - self.since_service;
+			let burst = match remaining < until_service {
+				true => remaining,
+				false => until_service
+			};
+			let mut done: u64 = 0;
+			if self.wfi {
+				// Parked: leave WFI the moment an enabled interrupt is
+				// pending (tick_operate's own wake condition); otherwise the
+				// whole burst passes as guest time with no execution.
+				match (self.read_csr_raw(CSR_MIE_ADDRESS)
+					& self.read_csr_raw(CSR_MIP_ADDRESS)) != 0 {
+					true => self.wfi = false,
+					false => done = burst
+				}
+			}
+			while done < burst {
+				if allow_blocks {
+					let slot = ((self.pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+					let h = self.block_heads[slot];
+					let hit = h.tag == self.pc
+						&& h.code_gen == self.mmu.code_gen()
+						&& match self.mmu.translate_fetch_probe(self.pc) {
+							Ok(p) => (p & !0xfff) == h.phys_page,
+							Err(_) => false
+						};
+					if hit {
+						let r = self.exec_block(slot);
+						#[cfg(feature = "blockstats")]
+						{
+							self.stat_execs[slot] += 1;
+							self.stat_retired[slot] += r;
+							self.stat_note_block(h.tag, r);
+						}
+						done += r;
+					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
+						let r = self.exec_block(slot);
+						#[cfg(feature = "blockstats")]
+						{
+							self.stat_execs[slot] += 1;
+							self.stat_retired[slot] += r;
+							let tag = self.block_heads[slot].tag;
+							self.stat_note_block(tag, r);
+						}
+						done += r;
+					} else {
+						let instruction_address = self.pc;
+						match self.tick_operate() {
+							Ok(()) => {},
+							Err(e) => self.handle_exception(e, instruction_address)
+						}
+						#[cfg(feature = "blockstats")]
+						{
+							self.stat_singlestep += 1;
+							self.stat_prev = 0; // region chain broken
+						}
+						done += 1;
+					}
+				} else {
+					let instruction_address = self.pc;
+					match self.tick_operate() {
+						Ok(()) => {},
+						Err(e) => self.handle_exception(e, instruction_address)
+					}
+					done += 1;
+				}
+				// Delivery stays where the old tick() had it — after the
+				// retired instruction that armed it. Nothing inside a block
+				// can arm the check (CSR writes are terminal ops), so the
+				// boundary a block ends on is the same one single-stepping
+				// would deliver at.
+				if self.check_interrupt {
+					self.check_interrupt = false;
+					self.handle_interrupt(self.pc);
+				}
+				if self.wfi {
+					// the rest of the burst is idle time; charged as such by
+					// the wfi branch of the next outer iteration
+					break;
+				}
+			}
+			self.since_service += done;
+			self.clock = self.clock.wrapping_add(done);
+			remaining = remaining.saturating_sub(done);
+			// Device-service boundary, at the same stream position as the
+			// old per-tick countdown: the end of the interval's last
+			// instruction, delivery attempted in the same step. Blocks may
+			// overshoot the boundary by up to BLOCK_MAX-1 instructions; the
+			// device clocks advance by the true retired count either way,
+			// so guest time stays tied to instructions retired.
+			if self.since_service >= DEVICE_TICK_INTERVAL {
+				let served = self.since_service;
+				self.since_service = 0;
+				self.mmu.tick(served, &mut self.csr[CSR_MIP_ADDRESS as usize]);
+				self.check_interrupt = false;
+				self.handle_interrupt(self.pc);
+			}
+		}
+	}
+
+	/// risc-box patch: executes the block at `slot` (probe already matched).
+	/// Returns instructions retired (>= 1). Exits early — with pc exact —
+	/// on a trap, a taken branch/jump, or a hot store that invalidated the
+	/// block's own meta (self-modifying code).
+	/// risc-box patch (jit feature tests): install a block directly so the
+	/// translator's equivalence tests can drive exec_block on hand-built op
+	/// sequences without going through fetch/decode.
+	#[cfg(feature = "jit")]
+	pub(crate) fn install_block_for_test(&mut self, slot: usize, tag: u64, phys_page: u64, ops: &[BlockOp]) {
+		let base = slot * BLOCK_MAX;
+		for (i, op) in ops.iter().enumerate() {
+			self.block_ops[base + i] = *op;
+		}
+		self.block_heads[slot] = BlockHead {
+			tag: tag,
+			phys_page: phys_page,
+			count: ops.len() as u32,
+			code_gen: self.mmu.code_gen()
+		};
+	}
+
+	pub(crate) fn exec_block(&mut self, slot: usize) -> u64 {
+		let head = self.block_heads[slot];
+		let base = slot * BLOCK_MAX;
+		let count = head.count as usize;
+		let mut retired: u64 = 0;
+		for i in 0..count {
+			let op = self.block_ops[base + i];
+			let address = self.pc;
+			let next = address.wrapping_add(op.len as u64);
+			self.pc = next;
+			let result = self.exec_op(&op, address);
+			self.x[0] = 0; // hardwired zero
+			retired += 1;
+			match result {
+				Ok(()) => {},
+				Err(e) => {
+					self.handle_exception(e, address);
+					return retired;
+				}
+			}
+			if self.pc != next {
+				return retired; // taken branch/jump left the block
+			}
+			// hot stores (kind 1..=4) can overwrite this very block; the
+			// write snoop bumps the code generation, which this meta embeds
+			if op.kind <= HOT_STORE_MAX && self.mmu.code_gen() != head.code_gen {
+				return retired;
+			}
+		}
+		retired
+	}
+
+	#[cfg(feature = "blockstats")]
+	fn stat_flush_slot(&mut self, slot: usize) {
+		let e = self.stat_execs[slot];
+		let r = self.stat_retired[slot];
+		if e > 0 {
+			let b = match e {
+				1..=3 => 0,
+				4..=15 => 1,
+				16..=63 => 2,
+				64..=255 => 3,
+				256..=4095 => 4,
+				_ => 5
+			};
+			self.stat_hist[b] += r;
+			self.stat_execs[slot] = 0;
+			self.stat_retired[slot] = 0;
+		}
+	}
+
+	#[cfg(feature = "blockstats")]
+	fn stat_note_block(&mut self, tag: u64, retired: u64) {
+		let e = self.stat_nodes.entry(tag).or_insert((0, 0));
+		e.0 += 1;
+		e.1 += retired;
+		if self.stat_prev != 0 && self.stat_edges.len() < 4_000_000 {
+			*self.stat_edges.entry((self.stat_prev, tag)).or_insert(0) += 1;
+		}
+		self.stat_prev = tag;
+	}
+
+	/// risc-box patch (blockstats): iterative Tarjan SCC over the block
+	/// graph; returns for each node index its SCC id, plus SCC sizes.
+	#[cfg(feature = "blockstats")]
+	fn stat_regions(&self) -> (Vec<u64>, Vec<(usize, u64, u64)>) {
+		// index nodes
+		let mut ids: Vec<u64> = self.stat_nodes.keys().cloned().collect();
+		ids.sort();
+		let index_of = |pc: u64| ids.binary_search(&pc).ok();
+		let n = ids.len();
+		let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+		let mut self_loop = vec![false; n];
+		for (&(a, b), _) in self.stat_edges.iter() {
+			// only LOCAL edges: intra-function branches. Calls and returns
+			// jump far and would collapse the whole program into one SCC;
+			// a region compiler wouldn't cross them either.
+			if a.abs_diff(b) > 0x1_0000 {
+				continue;
+			}
+			if let (Some(ia), Some(ib)) = (index_of(a), index_of(b)) {
+				if ia == ib {
+					self_loop[ia] = true;
+				} else {
+					adj[ia].push(ib as u32);
+				}
+			}
+		}
+		// iterative Tarjan
+		let mut index = vec![u32::MAX; n];
+		let mut low = vec![0u32; n];
+		let mut on_stack = vec![false; n];
+		let mut scc_of = vec![u32::MAX; n];
+		let mut stack: Vec<u32> = Vec::new();
+		let mut next_index = 0u32;
+		let mut scc_count = 0u32;
+		let mut call: Vec<(u32, usize)> = Vec::new();
+		for start in 0..n {
+			if index[start] != u32::MAX {
+				continue;
+			}
+			call.push((start as u32, 0));
+			index[start] = next_index;
+			low[start] = next_index;
+			next_index += 1;
+			stack.push(start as u32);
+			on_stack[start] = true;
+			while let Some(&mut (v, ref mut ei)) = call.last_mut() {
+				let v = v as usize;
+				if *ei < adj[v].len() {
+					let w = adj[v][*ei] as usize;
+					*ei += 1;
+					if index[w] == u32::MAX {
+						index[w] = next_index;
+						low[w] = next_index;
+						next_index += 1;
+						stack.push(w as u32);
+						on_stack[w] = true;
+						call.push((w as u32, 0));
+					} else if on_stack[w] {
+						low[v] = low[v].min(index[w]);
+					}
+				} else {
+					call.pop();
+					if let Some(&(pv, _)) = call.last() {
+						let pv = pv as usize;
+						low[pv] = low[pv].min(low[v]);
+					}
+					if low[v] == index[v] {
+						loop {
+							let w = stack.pop().unwrap();
+							on_stack[w as usize] = false;
+							scc_of[w as usize] = scc_count;
+							if w as usize == v {
+								break;
+							}
+						}
+						scc_count += 1;
+					}
+				}
+			}
+		}
+		// per-SCC: node count, execs, retired
+		let mut sccs: Vec<(usize, u64, u64)> = vec![(0, 0, 0); scc_count as usize];
+		let mut node_scc = vec![0u64; n];
+		for i in 0..n {
+			let sid = scc_of[i] as usize;
+			let (ex, rt) = self.stat_nodes[&ids[i]];
+			sccs[sid].0 += 1;
+			sccs[sid].1 += ex;
+			sccs[sid].2 += rt;
+			// cyclic if SCC has >1 node or the node self-loops
+			node_scc[i] = match sccs[sid].0 > 1 || self_loop[i] {
+				true => 1,
+				false => 0
+			};
+		}
+		// second pass: a node joined before its SCC grew past 1 needs the flag
+		for i in 0..n {
+			let sid = scc_of[i] as usize;
+			if sccs[sid].0 > 1 || self_loop[i] {
+				node_scc[i] = 1;
+			}
+		}
+		// retired mass by cyclicity
+		let mut cyc = 0u64;
+		let mut lin = 0u64;
+		for i in 0..n {
+			let (_, rt) = self.stat_nodes[&ids[i]];
+			match node_scc[i] {
+				1 => cyc += rt,
+				_ => lin += rt
+			}
+		}
+		(vec![cyc, lin], sccs)
+	}
+
+	/// risc-box patch (blockstats): flush live slots and print the coverage
+	/// histogram: retired instructions bucketed by the block's execution
+	/// count, plus the single-step share.
+	#[cfg(feature = "blockstats")]
+	pub fn dump_block_stats(&mut self) {
+		for slot in 0..BLOCK_SLOTS {
+			self.stat_flush_slot(slot);
+		}
+		let total: u64 = self.stat_hist.iter().sum::<u64>() + self.stat_singlestep;
+		let names = ["execs 1-3", "execs 4-15", "execs 16-63", "execs 64-255", "execs 256-4095", "execs 4096+"];
+		eprintln!("block coverage (retired instructions by block hotness):");
+		for i in 0..6 {
+			eprintln!("  {:>15}: {:>12}  {:>5.1}%", names[i], self.stat_hist[i],
+				self.stat_hist[i] as f64 * 100.0 / total as f64);
+		}
+		eprintln!("  {:>15}: {:>12}  {:>5.1}%", "single-step", self.stat_singlestep,
+			self.stat_singlestep as f64 * 100.0 / total as f64);
+		// region/loop discovery over the recorded block graph
+		let (mass, mut sccs) = self.stat_regions();
+		let node_total: u64 = mass[0] + mass[1];
+		eprintln!("block graph: {} nodes, {} edges", self.stat_nodes.len(), self.stat_edges.len());
+		eprintln!("  in-cycle retired mass: {:>12}  {:>5.1}%", mass[0],
+			mass[0] as f64 * 100.0 / node_total as f64);
+		eprintln!("  straight-line mass:    {:>12}  {:>5.1}%", mass[1],
+			mass[1] as f64 * 100.0 / node_total as f64);
+		sccs.sort_by(|a, b| b.2.cmp(&a.2));
+		eprintln!("  top cyclic regions (blocks, execs, retired):");
+		let mut shown = 0;
+		for &(nn, ex, rt) in sccs.iter() {
+			if nn > 1 && shown < 8 {
+				eprintln!("    {:>4} blocks  {:>12} execs  {:>12} retired ({:.1}%)",
+					nn, ex, rt, rt as f64 * 100.0 / node_total as f64);
+				shown += 1;
+			}
+		}
+	}
+
+	/// risc-box patch: builds a block starting at the current pc into
+	/// `slot`. Returns false when no block can be built here (page-tail
+	/// start, fetch fault, executing outside DRAM, or an undecodable first
+	/// word) — the caller falls back to single-stepping.
+	fn build_block(&mut self, slot: usize) -> bool {
+		let start = self.pc;
+		let p_start = match self.mmu.translate_fetch(start) {
+			Ok(p) => p,
+			Err(_) => return false
+		};
+		if !self.mmu.mark_exec_page(p_start) {
+			return false;
+		}
+		let base = slot * BLOCK_MAX;
+		let mut pc = start;
+		let mut count = 0usize;
+		while count < BLOCK_MAX && (pc & 0xfff) <= 0xff8 {
+			// same page as start, so the frame is the translation we already
+			// have — no per-op walk
+			let p = (p_start & !0xfff) | (pc & 0xfff);
+			let original_word = self.mmu.load_word_raw(p);
+			let (word, len) = match (original_word & 0x3) == 0x3 {
+				true => (original_word, 4u8),
+				false => (self.uncompress(original_word & 0xffff), 2u8)
+			};
+			let index = match self.decode_cache.get(word) {
+				Some(index) => index,
+				None => match self.decode_and_get_instruction_index(word) {
+					Ok(index) => {
+						self.decode_cache.insert(word, index);
+						index
+					},
+					// Undecodable: stop the block before it so the illegal
+					// instruction raises through the ordinary path with its
+					// pc exact.
+					Err(()) => break
+				}
+			};
+			let (kind, rd, rs1, rs2, imm) = classify_hot(INSTRUCTIONS[index].name, word);
+			self.block_ops[base + count] = BlockOp {
+				imm: imm,
+				word: word,
+				data: index as u16
+					| (match len { 4 => ICACHE_LEN4, _ => 0 }),
+				kind: kind,
+				rd: rd,
+				rs1: rs1,
+				rs2: rs2,
+				len: len,
+				_pad: 0
+			};
+			count += 1;
+			pc = pc.wrapping_add(len as u64);
+			// Terminal ops: a non-hot instruction may change interrupt or
+			// translation state (it must stay the block's last op), and
+			// JAL/JALR always leave, so anything after them is unreachable.
+			if kind == 0 || kind == HOT_JAL || kind == HOT_JALR {
+				break;
+			}
+		}
+		if count == 0 {
+			return false;
+		}
+		#[cfg(feature = "blockstats")]
+		self.stat_flush_slot(slot);
+		self.block_heads[slot] = BlockHead {
+			tag: start,
+			phys_page: p_start & !0xfff,
+			count: count as u32,
+			code_gen: self.mmu.code_gen()
+		};
+		true
 	}
 
 	// @TODO: Rename?
@@ -374,26 +1064,9 @@ impl Cpu {
 			return Ok(());
 		}
 
-		// risc-box patch: predecoded-instruction fast path. One tag compare
-		// replaces fetch translation, memory read, uncompress, and decode.
-		// The meta embeds every input the cached result depends on: the
-		// TLB generation and CPU translation state, and the code
-		// generation (bumped when a marked executable page is written).
-		let slot = ((self.pc >> 1) as usize) & (ICACHE_ENTRY_NUM - 1);
-		if self.icache_tags[slot] == self.pc && self.icache_metas[slot] == self.mmu.exec_meta() {
-			let instruction_address = self.pc;
-			let word = self.icache_words[slot];
-			let data = self.icache_data[slot];
-			self.pc = self.pc.wrapping_add(match data & ICACHE_LEN4 {
-				0 => 2,
-				_ => 4
-			});
-			let result = (INSTRUCTIONS[(data & !ICACHE_LEN4) as usize].operation)(
-				self, word, instruction_address);
-			self.x[0] = 0; // hardwired zero
-			return result;
-		}
-
+		// risc-box patch: the predecoded fast path lives in run()'s block
+		// cache now; this is the exact single-step used by tick()/run(1),
+		// page-tail pcs and block-build failures.
 		let original_word = match self.fetch() {
 			Ok(word) => word,
 			Err(e) => return Err(e)
@@ -434,27 +1107,311 @@ impl Cpu {
 			}
 		};
 
-		// risc-box patch: fill the predecode cache when the instruction sits
-		// safely inside one DRAM page, so a single page mark covers every
-		// byte the cached entry was built from.
-		if (instruction_address & 0xfff) <= 0xff8 {
-			if let Ok(p_address) = self.mmu.translate_fetch(instruction_address) {
-				if self.mmu.mark_exec_page(p_address) {
-					self.icache_tags[slot] = instruction_address;
-					self.icache_metas[slot] = self.mmu.exec_meta();
-					self.icache_words[slot] = word;
-					self.icache_data[slot] = index as u16
-						| (match (original_word & 0x3) == 0x3 {
-							true => ICACHE_LEN4,
-							false => 0
-						});
-				}
-			}
-		}
-
 		let result = (INSTRUCTIONS[index].operation)(self, word, instruction_address);
 		self.x[0] = 0; // hardwired zero
 		result
+	}
+
+	// risc-box patch: inline execution of the predecoded hot set. Every arm
+	// is the corresponding INSTRUCTIONS closure body verbatim, with the
+	// parse_format_* call replaced by the op's build-time fields (shift
+	// amounts still come from the word so the xlen-dependent masks run
+	// exactly as upstream wrote them). Keeping the bodies identical is the
+	// correctness argument: this is the same code, minus re-parsing and an
+	// indirect call. kind 0 (the block's terminal non-hot op) dispatches
+	// through the table.
+	#[inline(always)]
+	pub(crate) fn exec_op(&mut self, e: &BlockOp, address: u64) -> Result<(), Trap> {
+		let rd = e.rd as usize;
+		let rs1 = e.rs1 as usize;
+		let rs2 = e.rs2 as usize;
+		let imm = e.imm as i64;
+		match e.kind {
+			HOT_ADDI => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_add(imm));
+			},
+			HOT_ADD => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_add(self.x[rs2]));
+			},
+			HOT_LD => {
+				self.x[rd] = match self.mmu.load_doubleword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_SD => {
+				return self.mmu.store_doubleword(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u64);
+			},
+			HOT_LW => {
+				self.x[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i32 as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_SW => {
+				return self.mmu.store_word(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u32);
+			},
+			HOT_BEQ => {
+				if self.sign_extend(self.x[rs1]) == self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BNE => {
+				if self.sign_extend(self.x[rs1]) != self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BLT => {
+				if self.sign_extend(self.x[rs1]) < self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BGE => {
+				if self.sign_extend(self.x[rs1]) >= self.sign_extend(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BLTU => {
+				if self.unsigned_data(self.x[rs1]) < self.unsigned_data(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_BGEU => {
+				if self.unsigned_data(self.x[rs1]) >= self.unsigned_data(self.x[rs2]) {
+					self.pc = address.wrapping_add(imm as u64);
+				}
+			},
+			HOT_LUI => {
+				self.x[rd] = imm;
+			},
+			HOT_AUIPC => {
+				self.x[rd] = self.sign_extend(address.wrapping_add(imm as u64) as i64);
+			},
+			HOT_JAL => {
+				self.x[rd] = self.sign_extend(self.pc as i64);
+				self.pc = address.wrapping_add(imm as u64);
+			},
+			HOT_JALR => {
+				let tmp = self.sign_extend(self.pc as i64);
+				self.pc = (self.x[rs1] as u64).wrapping_add(imm as u64);
+				self.x[rd] = tmp;
+			},
+			HOT_ANDI => {
+				self.x[rd] = self.sign_extend(self.x[rs1] & imm);
+			},
+			HOT_ORI => {
+				self.x[rd] = self.sign_extend(self.x[rs1] | imm);
+			},
+			HOT_XORI => {
+				self.x[rd] = self.sign_extend(self.x[rs1] ^ imm);
+			},
+			HOT_AND => {
+				self.x[rd] = self.sign_extend(self.x[rs1] & self.x[rs2]);
+			},
+			HOT_OR => {
+				self.x[rd] = self.sign_extend(self.x[rs1] | self.x[rs2]);
+			},
+			HOT_XOR => {
+				self.x[rd] = self.sign_extend(self.x[rs1] ^ self.x[rs2]);
+			},
+			HOT_SUB => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_sub(self.x[rs2]));
+			},
+			HOT_SLLI => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = self.sign_extend(self.x[rs1] << shamt);
+			},
+			HOT_SRLI => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = self.sign_extend((self.unsigned_data(self.x[rs1]) >> shamt) as i64);
+			},
+			HOT_SRAI => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = self.sign_extend(self.x[rs1] >> shamt);
+			},
+			HOT_ADDIW => {
+				self.x[rd] = self.x[rs1].wrapping_add(imm) as i32 as i64;
+			},
+			HOT_ADDW => {
+				self.x[rd] = self.x[rs1].wrapping_add(self.x[rs2]) as i32 as i64;
+			},
+			HOT_SUBW => {
+				self.x[rd] = self.x[rs1].wrapping_sub(self.x[rs2]) as i32 as i64;
+			},
+			HOT_SLLIW => {
+				let shamt = e.rs2 as u32;
+				self.x[rd] = (self.x[rs1] << shamt) as i32 as i64;
+			},
+			HOT_SRLIW => {
+				let mask = match self.xlen {
+					Xlen::Bit32 => 0x1f,
+					Xlen::Bit64 => 0x3f
+				};
+				let shamt = (e.word >> 20) & mask;
+				self.x[rd] = ((self.x[rs1] as u32) >> shamt) as i32 as i64;
+			},
+			HOT_SRAIW => {
+				let shamt = ((e.word >> 20) & 0x1f) as u32;
+				self.x[rd] = ((self.x[rs1] as i32) >> shamt) as i64;
+			},
+			HOT_SLLW => {
+				self.x[rd] = (self.x[rs1] as u32).wrapping_shl(self.x[rs2] as u32) as i32 as i64;
+			},
+			HOT_SRLW => {
+				self.x[rd] = (self.x[rs1] as u32).wrapping_shr(self.x[rs2] as u32) as i32 as i64;
+			},
+			HOT_SRAW => {
+				self.x[rd] = (self.x[rs1] as i32).wrapping_shr(self.x[rs2] as u32) as i64;
+			},
+			HOT_SLL => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_shl(self.x[rs2] as u32));
+			},
+			HOT_SRL => {
+				self.x[rd] = self.sign_extend(self.unsigned_data(self.x[rs1]).wrapping_shr(self.x[rs2] as u32) as i64);
+			},
+			HOT_SRA => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_shr(self.x[rs2] as u32));
+			},
+			HOT_SLT => {
+				self.x[rd] = match self.x[rs1] < self.x[rs2] {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_SLTI => {
+				self.x[rd] = match self.x[rs1] < imm {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_SLTU => {
+				self.x[rd] = match self.unsigned_data(self.x[rs1]) < self.unsigned_data(self.x[rs2]) {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_SLTIU => {
+				self.x[rd] = match self.unsigned_data(self.x[rs1]) < self.unsigned_data(imm) {
+					true => 1,
+					false => 0
+				};
+			},
+			HOT_MUL => {
+				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_mul(self.x[rs2]));
+			},
+			HOT_LB => {
+				self.x[rd] = match self.mmu.load(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i8 as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LBU => {
+				self.x[rd] = match self.mmu.load(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LH => {
+				self.x[rd] = match self.mmu.load_halfword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i16 as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LHU => {
+				self.x[rd] = match self.mmu.load_halfword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_LWU => {
+				self.x[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => data as i64,
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_SB => {
+				return self.mmu.store(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u8);
+			},
+			HOT_SH => {
+				return self.mmu.store_halfword(self.x[rs1].wrapping_add(imm) as u64, self.x[rs2] as u16);
+			},
+			HOT_FSW => {
+				return self.mmu.store_word(self.x[rs1].wrapping_add(imm) as u64, self.f[rs2].to_bits() as u32);
+			},
+			HOT_FSD => {
+				return self.mmu.store_doubleword(self.x[rs1].wrapping_add(imm) as u64, self.f[rs2].to_bits());
+			},
+			HOT_FLD => {
+				self.f[rd] = match self.mmu.load_doubleword(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => f64::from_bits(data),
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_FLW => {
+				self.f[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
+					Ok(data) => f64::from_bits(data as i32 as i64 as u64),
+					Err(e) => return Err(e)
+				};
+			},
+			HOT_FADD_D => {
+				self.f[rd] = self.f[rs1] + self.f[rs2];
+			},
+			HOT_FSUB_D => {
+				self.f[rd] = self.f[rs1] - self.f[rs2];
+			},
+			HOT_FMUL_D => {
+				self.f[rd] = self.f[rs1] * self.f[rs2];
+			},
+			HOT_FDIV_D => {
+				let dividend = self.f[rs1];
+				let divisor = self.f[rs2];
+				// Is this implementation correct? (verbatim from the table)
+				if divisor == 0.0 {
+					self.f[rd] = std::f64::INFINITY;
+					self.set_fcsr_dz();
+				} else if divisor == -0.0 {
+					self.f[rd] = std::f64::NEG_INFINITY;
+					self.set_fcsr_dz();
+				} else {
+					self.f[rd] = dividend / divisor;
+				}
+			},
+			HOT_FSGNJ_D => {
+				let rs1_bits = self.f[rs1].to_bits();
+				let rs2_bits = self.f[rs2].to_bits();
+				let sign_bit = rs2_bits & 0x8000000000000000;
+				self.f[rd] = f64::from_bits(sign_bit | (rs1_bits & 0x7fffffffffffffff));
+			},
+			HOT_FMV_X_D => {
+				self.x[rd] = self.f[rs1].to_bits() as i64;
+			},
+			HOT_FMV_D_X => {
+				self.f[rd] = f64::from_bits(self.x[rs1] as u64);
+			},
+			HOT_FCVT_D_W => {
+				self.f[rd] = self.x[rs1] as i32 as f64;
+			},
+			// kind is only ever written by classify_hot, so this arm is dead;
+			// the table dispatch (not a panic — a guest must never crash the
+			// host) keeps it safe anyway.
+			_ => {
+				return (INSTRUCTIONS[(e.data & !ICACHE_LEN4) as usize].operation)(
+					self, e.word, address);
+			}
+		}
+		Ok(())
 	}
 
 	/// Decodes a word instruction data and returns a reference to
@@ -716,6 +1673,15 @@ impl Cpu {
 		}
 
 		// So, this trap should be taken
+
+		// risc-box patch: an LR/SC reservation must not survive a trap. On a
+		// single emulated hart, every context switch passes through here; a
+		// reservation that lives across the switch lets thread B's plain
+		// stores go unnoticed and thread A's SC then succeeds against a stale
+		// read -- a lost update. That silently corrupted CAS loops under
+		// contention (V8's concurrent TurboFan thread vs its main thread:
+		// the compiler read poisoned feedback and emitted wrong code).
+		self.is_reservation_set = false;
 
 		self.privilege_mode = new_privilege_mode;
 		self.mmu.update_privilege_mode(self.privilege_mode.clone());
@@ -1080,17 +2046,10 @@ impl Cpu {
 						} | // imm[31:6] <= [12]
 						((halfword >> 7) & 0x20) | // imm[5] <= [12]
 						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-						if r == 0 && imm == 0 {
-							// C.NOP
-							// addi x0, x0, 0
-							return 0x13;
-						} else if r != 0 {
-							// C.ADDI
-							// addi r, r, imm
-							return (imm << 20) | (r << 15) | (r << 7) | 0x13;
-						}
-						// @TODO: Support HINTs
-						// r == 0 and imm != 0 is HINTs
+						// C.ADDI (r=0,imm=0 is C.NOP; r=0,imm!=0 is a HINT -- hints
+						// execute as their expansion; x0 discards the write anyway)
+						// addi r, r, imm
+						return (imm << 20) | (r << 15) | (r << 7) | 0x13;
 					},
 					1 => {
 						// @TODO: Support C.JAL in 32-bit mode
@@ -1118,11 +2077,8 @@ impl Cpu {
 						} | // imm[31:6] <= [12]
 						((halfword >> 7) & 0x20) | // imm[5] <= [12]
 						((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-						if r != 0 {
-							return (imm << 20) | (r << 7) | 0x13;
-						}
-						// @TODO: Support HINTs
-						// r == 0 is for HINTs
+						// r == 0 is a HINT; addi x0, x0, imm is a no-op, emit it anyway
+						return (imm << 20) | (r << 7) | 0x13;
 					},
 					3 => {
 						let r = (halfword >> 7) & 0x1f; // [11:7]
@@ -1143,7 +2099,7 @@ impl Cpu {
 							}
 							// imm == 0 is for reserved instruction
 						}
-						if r != 0 && r != 2 {
+						if r != 2 { // r == 0 is a HINT; lui x0 is a no-op
 							// C.LUI
 							// lui r, nzimm
 							let nzimm = match halfword & 0x1000 {
@@ -1288,7 +2244,7 @@ impl Cpu {
 						let imm1 =
 							(offset & 0x1e) | // imm1[4:1] <= [4:1]
 							((offset >> 11) & 0x1); // imm1[0] <= [11]
-						return (imm2 << 25) | ((r + 8) << 20) | (imm1 << 7) | 0x63;
+						return (imm2 << 25) | ((r + 8) << 15) | (imm1 << 7) | 0x63; // beq r+8, x0 (canonical operand order)
 					},
 					7 => {
 						// C.BNEZ
@@ -1310,7 +2266,7 @@ impl Cpu {
 						let imm1 =
 							(offset & 0x1e) | // imm1[4:1] <= [4:1]
 							((offset >> 11) & 0x1); // imm1[0] <= [11]
-						return (imm2 << 25) | ((r + 8) << 20) | (1 << 12) | (imm1 << 7) | 0x63;
+						return (imm2 << 25) | ((r + 8) << 15) | (1 << 12) | (imm1 << 7) | 0x63; // bne r+8, x0 (canonical operand order)
 					},
 					_ => {} // No happens
 				};
@@ -1324,10 +2280,8 @@ impl Cpu {
 						let shamt =
 							((halfword >> 7) & 0x20) | // imm[5] <= [12]
 							((halfword >> 2) & 0x1f); // imm[4:0] <= [6:2]
-						if r != 0 {
-							return (shamt << 20) | (r << 15) | (1 << 12) | (r << 7) | 0x13;
-						}
-						// r == 0 is reserved instruction?
+						// r == 0 (and shamt == 0) are HINTs; slli x0 is a no-op
+						return (shamt << 20) | (r << 15) | (1 << 12) | (r << 7) | 0x13;
 					},
 					1 => {
 						// C.FLDSP
@@ -1337,10 +2291,11 @@ impl Cpu {
 							((halfword >> 7) & 0x20) | // offset[5] <= [12]
 							((halfword >> 2) & 0x18) | // offset[4:3] <= [6:5]
 							((halfword << 4) & 0x1c0); // offset[8:6] <= [4:2]
-						if rd != 0 {
-							return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 0x7;
-						}
-						// rd == 0 is reseved instruction
+						// rd is a FLOAT register here, so rd == 0 means f0, which is valid
+						// (unlike x0 for the integer LWSP/LDSP forms). gcc emits
+						// `c.fldsp f0, off(sp)` for FP spill reloads; gating on rd != 0
+						// wrongly raised SIGILL in Xorg's pixman/fb render path.
+						return (offset << 20) | (2 << 15) | (3 << 12) | (rd << 7) | 0x7;
 					},
 					2 => {
 						// C.LWSP
@@ -1381,14 +2336,11 @@ impl Cpu {
 									return (rs1 << 15) | 0x67;
 								}
 								// rs1 == 0 is reserved instruction
-								if rs1 != 0 && rs2 != 0 {
-									// C.MV
-									// add rs1, x0, rs2
-									// println!("C.MV RS1:{:x} RS2:{:x}", rs1, rs2);
+								if rs2 != 0 {
+									// C.MV (rd == 0 is a HINT; add x0 is a no-op)
+									// add rd, x0, rs2
 									return (rs2 << 20) | (rs1 << 7) | 0x33;
 								}
-								// rs1 == 0 && rs2 != 0 is Hints
-								// @TODO: Support Hints
 							},
 							1 => {
 								if rs1 == 0 && rs2 == 0 {
@@ -1401,13 +2353,11 @@ impl Cpu {
 									// jalr x1, 0(rs1)
 									return (rs1 << 15) | (1 << 7) | 0x67;
 								}
-								if rs1 != 0 && rs2 != 0 {
-									// C.ADD
-									// add rs1, rs1, rs2
+								if rs2 != 0 {
+									// C.ADD (rd == 0 is a HINT; add x0 is a no-op)
+									// add rd, rd, rs2
 									return (rs2 << 20) | (rs1 << 15) | (rs1 << 7) | 0x33;
 								}
-								// rs1 == 0 && rs2 != 0 is Hists
-								// @TODO: Supports Hinsts
 							},
 							_ => {} // Not happens
 						};
@@ -2505,8 +3455,18 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.W.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// Is this implementation correct?
-			cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+			// risc-box patch: this converted through `as u32` (UNSIGNED), so any
+			// negative double became 0 -- e.g. FCVT.W.D(-1.0) = 0. gcc lowers
+			// (int32_t)double to exactly this instruction, so every negative
+			// double->int cast in guest C code was wrong; V8's TurboFan constant
+			// lowering (DoubleToInt32(-1.0)) turned -1 graph constants into 0 and
+			// silently miscompiled JS. Signed saturating truncation, NaN -> MAX
+			// per the RISC-V spec (Rust `as` gives NaN -> 0).
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => i32::MAX as i64,
+				false => a as i32 as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2520,7 +3480,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.WU.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = cpu.f[f.rs1] as u32 as i32 as i64;
+			// risc-box patch: NaN -> u32::MAX per spec (result sign-extended)
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => u32::MAX as i32 as i64,
+				false => a as u32 as i32 as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2531,7 +3496,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.L.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = cpu.f[f.rs1] as i64;
+			// risc-box patch: NaN -> i64::MAX per spec
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => i64::MAX,
+				false => a as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -2542,7 +3512,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.LU.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = cpu.f[f.rs1] as u64 as i64;
+			// risc-box patch: NaN -> u64::MAX per spec
+			let a = cpu.f[f.rs1];
+			cpu.x[f.rd] = match a.is_nan() {
+				true => u64::MAX as i64,
+				false => a as u64 as i64
+			};
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -3568,7 +4543,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 					},
 					Err(e) => return Err(e)
 				},
-				false => 1
+				false => {
+					// risc-box patch: SC consumes the reservation win or lose
+					cpu.is_reservation_set = false;
+					1
+				}
 			};
 			Ok(())
 		},
@@ -3589,7 +4568,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 					},
 					Err(e) => return Err(e)
 				},
-				false => 1
+				false => {
+					// risc-box patch: SC consumes the reservation win or lose
+					cpu.is_reservation_set = false;
+					1
+				}
 			};
 			Ok(())
 		},
@@ -3949,10 +4932,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 /// and host hardware CPU cache memory miss.
 const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // risc-box patch: was 0x1000
 
-// risc-box patch: predecoded instruction cache geometry. Slots are indexed by
-// pc >> 1 (compressed instructions are 2-byte aligned), so the cache covers
-// a 32 KiB direct-mapped code window.
-const ICACHE_ENTRY_NUM: usize = 0x4000;
+// risc-box patch: marks a 4-byte (non-compressed) instruction in the
+// INSTRUCTIONS-index field of a predecoded BlockOp.
 const ICACHE_LEN4: u16 = 0x8000;
 
 // risc-box patch: tag layout for the direct-mapped cache below — the decoded
@@ -4376,6 +5357,28 @@ mod test_cpu {
 }
 
 #[cfg(test)]
+mod test_dump_uncompress {
+	use super::*;
+	use terminal::DummyTerminal;
+
+	// Not an assertion: dumps every 16-bit halfword's uncompress() expansion so
+	// an external reference decoder can diff it (the C.FLDSP rd==0 bug class).
+	// Run with: cargo test dump_uncompress -- --ignored
+	#[test]
+	#[ignore]
+	fn dump_uncompress() {
+		let cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		let mut out = String::with_capacity(0x10000 * 14);
+		for hw in 0..0x10000u32 {
+			if hw & 0x3 == 0x3 { continue; } // not a compressed encoding
+			let w = cpu.uncompress(hw);
+			out.push_str(&format!("{:04x}\t{:08x}\n", hw, w));
+		}
+		std::fs::write("/tmp/uncompress-dump.tsv", out).unwrap();
+	}
+}
+
+#[cfg(test)]
 
 mod test_decode_cache {
 	use super::*;
@@ -4447,5 +5450,491 @@ mod test_decode_cache {
 			Some(index) => assert_eq!(11, index),
 			None => panic!("Unexpected cache miss")
 		};
+	}
+}
+
+// risc-box patch (jit feature): equivalence between the translator
+// (src/jit.rs) and the REAL exec_block, on randomized op sequences over
+// the supported integer subset. This lives here because it compares
+// private machine state.
+#[cfg(all(test, feature = "jit"))]
+mod test_jit_equivalence {
+	extern crate wasmtime;
+	use super::*;
+	use jit;
+	use mmu::DRAM_BASE;
+	use terminal::DummyTerminal;
+
+	const XB: u32 = 0; // x[32] at 0
+	const PCA: u32 = 256;
+	const GENA: u32 = 264;
+	const FB: u32 = 512; // f[32] as raw 8-byte cells
+	const DB: u32 = 4096; // linear offset of guest DRAM window
+	const WIN: u64 = 64 * 1024; // mirrored DRAM window size
+
+	struct Rng(u64);
+	impl Rng {
+		fn next(&mut self) -> u64 {
+			self.0 ^= self.0 << 13;
+			self.0 ^= self.0 >> 7;
+			self.0 ^= self.0 << 17;
+			self.0
+		}
+	}
+
+	fn rand_ops(r: &mut Rng, len: usize) -> Vec<BlockOp> {
+		let mut ops = Vec::new();
+		for _ in 0..len {
+			let rd = match (r.next() % 32) as u8 {
+				v @ 10..=13 => v + 10,
+				v => v,
+			};
+			let ra = (r.next() % 32) as u8;
+			let rb = (r.next() % 32) as u8;
+			let p = (10 + r.next() % 4) as u8; // stable pointer regs
+			let imm12 = ((r.next() % 4096) as i32) - 2048;
+			let mem_imm = ((r.next() % 2048) as i32) & !7; // 0..2040, aligned
+			let shamt6 = (r.next() % 64) as u32;
+			let shamt5 = (r.next() % 32) as u32;
+			let bimm = (((r.next() % 512) as i32) - 256) & !1; // branch offset, even
+			let (kind, rrd, rrs1, rrs2, imm, word) = match r.next() % 55 {
+				0 => (HOT_ADDI, rd, ra, 0, imm12, 0),
+				1 => (HOT_ADD, rd, ra, rb, 0, 0),
+				2 => (HOT_SUB, rd, ra, rb, 0, 0),
+				3 => (HOT_AND, rd, ra, rb, 0, 0),
+				4 => (HOT_OR, rd, ra, rb, 0, 0),
+				5 => (HOT_XOR, rd, ra, rb, 0, 0),
+				6 => (HOT_ANDI, rd, ra, 0, imm12, 0),
+				7 => (HOT_ORI, rd, ra, 0, imm12, 0),
+				8 => (HOT_XORI, rd, ra, 0, imm12, 0),
+				9 => (HOT_MUL, rd, ra, rb, 0, 0),
+				10 => (HOT_SLL, rd, ra, rb, 0, 0),
+				11 => (HOT_SRL, rd, ra, rb, 0, 0),
+				12 => (HOT_SRA, rd, ra, rb, 0, 0),
+				13 => (HOT_SLLI, rd, ra, 0, 0, shamt6 << 20),
+				14 => (HOT_SRLI, rd, ra, 0, 0, shamt6 << 20),
+				15 => (HOT_SRAI, rd, ra, 0, 0, shamt6 << 20),
+				16 => (HOT_LUI, rd, 0, 0, ((r.next() as i32) & !0xfff), 0),
+				17 => (HOT_AUIPC, rd, 0, 0, ((r.next() as i32) & !0xfff), 0),
+				18 => (HOT_ADDIW, rd, ra, 0, imm12, 0),
+				19 => (HOT_ADDW, rd, ra, rb, 0, 0),
+				20 => (HOT_SUBW, rd, ra, rb, 0, 0),
+				21 => (HOT_SRAIW, rd, ra, 0, 0, shamt5 << 20),
+				22 => (HOT_LD, rd, p, 0, mem_imm, 0),
+				23 => (HOT_SD, 0, p, rb, mem_imm, 0),
+				24 => (HOT_LW, rd, p, 0, mem_imm, 0),
+				25 => (HOT_LWU, rd, p, 0, mem_imm, 0),
+				26 => (HOT_LH, rd, p, 0, mem_imm, 0),
+				27 => (HOT_LHU, rd, p, 0, mem_imm, 0),
+				28 => (HOT_LB, rd, p, 0, mem_imm, 0),
+				29 => (HOT_LBU, rd, p, 0, mem_imm, 0),
+				30 => (HOT_SW, 0, p, rb, mem_imm, 0),
+				31 => (HOT_SH, 0, p, rb, mem_imm, 0),
+				32 => (HOT_SB, 0, p, rb, mem_imm, 0),
+				33 => (HOT_SLT, rd, ra, rb, 0, 0),
+				34 => (HOT_SLTU, rd, ra, rb, 0, 0),
+				35 => (HOT_SLTI, rd, ra, 0, imm12, 0),
+				36 => (HOT_SLTIU, rd, ra, 0, imm12, 0),
+				37 => match r.next() % 6 {
+					0 => (HOT_BEQ, 0, ra, rb, bimm, 0),
+					1 => (HOT_BNE, 0, ra, rb, bimm, 0),
+					2 => (HOT_BLT, 0, ra, rb, bimm, 0),
+					3 => (HOT_BGE, 0, ra, rb, bimm, 0),
+					4 => (HOT_BLTU, 0, ra, rb, bimm, 0),
+					_ => (HOT_BGEU, 0, ra, rb, bimm, 0),
+				},
+				38 => (HOT_JAL, rd, 0, 0, bimm, 0),
+				39 => (HOT_JALR, rd, ra, 0, imm12, 0),
+				40 => (HOT_SLLIW, rd, ra, shamt5 as u8, 0, 0),
+				41 => (HOT_SLLW, rd, ra, rb, 0, 0),
+				42 => (HOT_SRLW, rd, ra, rb, 0, 0),
+				43 => (HOT_SRAW, rd, ra, rb, 0, 0),
+				44 => (HOT_FLD, rd, p, 0, mem_imm, 0),
+				45 => (HOT_FSD, 0, p, rb, mem_imm, 0),
+				46 => (HOT_FADD_D, rd, ra, rb, 0, 0),
+				47 => (HOT_FSUB_D, rd, ra, rb, 0, 0),
+				48 => (HOT_FMUL_D, rd, ra, rb, 0, 0),
+				49 => (HOT_FSGNJ_D, rd, ra, rb, 0, 0),
+				50 => (HOT_FMV_X_D, rd, ra, 0, 0, 0),
+				51 => (HOT_FMV_D_X, rd, ra, 0, 0, 0),
+				52 => (HOT_FLW, rd, p, 0, mem_imm, 0),
+				53 => (HOT_FSW, 0, p, rb, mem_imm, 0),
+				_ => (HOT_FCVT_D_W, rd, ra, 0, 0, 0),
+			};
+			let _ = shamt5;
+			ops.push(BlockOp {
+				imm: imm,
+				word: word,
+				data: 0,
+				kind: kind,
+				rd: rrd,
+				rs1: rrs1,
+				rs2: rrs2,
+				len: 4,
+				_pad: 0,
+			});
+		}
+		ops
+	}
+
+	fn fresh_cpu(r: &mut Rng) -> Cpu {
+		let mut cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		cpu.get_mut_mmu().init_memory(WIN);
+		for i in 1..32 {
+			cpu.x[i] = r.next() as i64;
+		}
+		for p in 10..14 {
+			cpu.x[p] = (DRAM_BASE + 8192 + (r.next() % 16384 & !7)) as i64;
+		}
+		cpu.x[0] = 0;
+		for i in 0..32 {
+			// finite doubles only: NaN payload propagation differs between
+			// the native interpreter (host FPU) and engine-canonicalized
+			// wasm in some configurations; production runs BOTH sides under
+			// the same engine, so finite inputs are the honest test domain
+			let m = (r.next() % 2000000) as f64 / 1000.0 - 1000.0;
+			cpu.f[i] = m;
+		}
+		for a in (0..WIN).step_by(8) {
+			let v = r.next();
+			let _ = cpu.get_mut_mmu().store_doubleword(DRAM_BASE + a, v);
+		}
+		cpu
+	}
+
+	fn run_wasm(bytes: &[u8], cpu_pre: &Cpu, start: u64) -> (u64, [i64; 32], u64, Vec<u8>, [u64; 32]) {
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, bytes).expect("valid module");
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
+			}
+			d[PCA as usize..PCA as usize + 8].copy_from_slice(&start.to_le_bytes());
+			for i in 0..32 {
+				d[FB as usize + i * 8..FB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu_pre.f[i].to_bits().to_le_bytes());
+			}
+			d[GENA as usize..GENA as usize + 4]
+				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
+			let mut win = vec![0u8; WIN as usize];
+			cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
+			d[DB as usize..DB as usize + WIN as usize].copy_from_slice(&win);
+		}
+		let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = instance.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap() as u64;
+		let d = mem.data(&store);
+		let mut x = [0i64; 32];
+		for i in 0..32 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[XB as usize + i * 8..XB as usize + i * 8 + 8]);
+			x[i] = i64::from_le_bytes(b);
+		}
+		let mut b = [0u8; 8];
+		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
+		let pc = u64::from_le_bytes(b);
+		let dram = d[DB as usize..DB as usize + WIN as usize].to_vec();
+		let mut f = [0u64; 32];
+		for i in 0..32 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[FB as usize + i * 8..FB as usize + i * 8 + 8]);
+			f[i] = u64::from_le_bytes(b);
+		}
+		(retired, x, pc, dram, f)
+	}
+
+	#[test]
+	fn translator_matches_exec_block() {
+		let mut checked = 0;
+		for seed in 1..400u64 {
+			let mut r = Rng(seed * 2654435761 | 1);
+			let len = 2 + (r.next() % 12) as usize;
+			let ops = rand_ops(&mut r, len);
+			let start = DRAM_BASE; // block's pc; DRAM phys tag irrelevant here
+			let mut cpu = fresh_cpu(&mut Rng(seed * 40503 | 1));
+			let lay = jit::Layout {
+				x_base: XB,
+				f_base: FB,
+				tlb: None,
+				pc_addr: PCA,
+				gen_addr: GENA,
+				baked_gen: cpu.mmu.code_gen(),
+				dram_base: DB,
+				guest_dram_base: DRAM_BASE,
+				dram_len: WIN,
+			};
+			let bytes = match jit::emit_block(&ops, start, &lay) {
+				Some(b) => b,
+				None => continue,
+			};
+			// wasm first (from the pristine state), then the real engine
+			let (rw, xw, pcw, dramw, fw) = run_wasm(&bytes, &cpu, start);
+			cpu.update_pc(start);
+			cpu.install_block_for_test(0, start, 0, &ops);
+			let ri = cpu.exec_block(0);
+			assert_eq!(ri, rw, "retired mismatch seed {}", seed);
+			assert_eq!(cpu.x, xw, "registers mismatch seed {}", seed);
+			assert_eq!(cpu.pc, pcw, "pc mismatch seed {}", seed);
+			let mut dram_i = vec![0u8; WIN as usize];
+			cpu.mmu.read_physical_range(DRAM_BASE, &mut dram_i);
+			assert_eq!(dram_i, dramw, "dram mismatch seed {}", seed);
+			for i in 0..32 {
+				assert_eq!(cpu.f[i].to_bits(), fw[i], "f{} mismatch seed {}", i, seed);
+			}
+			checked += 1;
+		}
+		assert!(checked > 300, "too few cases ran: {}", checked);
+	}
+
+	fn op(kind: u8, rd: u8, rs1: u8, rs2: u8, imm: i32) -> BlockOp {
+		BlockOp { imm: imm, word: 0, data: 0, kind: kind, rd: rd, rs1: rs1, rs2: rs2, len: 4, _pad: 0 }
+	}
+
+	/// Reference: interpreter-dispatch the region until pc leaves it or the
+	/// fuel bound is met at a block entry. Mirrors the compiled contract.
+	fn dispatch_ref(cpu: &mut Cpu, blocks: &[(u64, Vec<BlockOp>)], fuel: u64) -> u64 {
+		let mut retired = 0u64;
+		loop {
+			let at = cpu.pc;
+			let Some((slot, _)) = blocks.iter().enumerate().find(|(_, b)| b.0 == at) else {
+				return retired;
+			};
+			if retired >= fuel {
+				return retired;
+			}
+			retired += cpu.exec_block(slot);
+			// slots were installed 1:1 with block order
+		}
+	}
+
+	fn region_layout(cpu: &Cpu) -> jit::Layout {
+		jit::Layout {
+			x_base: XB, f_base: FB, tlb: None, pc_addr: PCA, gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen(),
+			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		}
+	}
+
+	fn run_region(bytes: &[u8], cpu_pre: &Cpu, entry: u32, fuel: u64) -> (u64, [i64; 32], u64) {
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, bytes).expect("valid region module");
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
+			}
+			d[GENA as usize..GENA as usize + 4]
+				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
+			let mut win = vec![0u8; WIN as usize];
+			cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
+			d[DB as usize..DB as usize + WIN as usize].copy_from_slice(&win);
+		}
+		let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = instance
+			.get_typed_func::<(i64, i32), i64>(&mut store, "run")
+			.unwrap();
+		let retired = run.call(&mut store, (fuel as i64, entry as i32)).unwrap() as u64;
+		let d = mem.data(&store);
+		let mut x = [0i64; 32];
+		for i in 0..32 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[XB as usize + i * 8..XB as usize + i * 8 + 8]);
+			x[i] = i64::from_le_bytes(b);
+		}
+		let mut b = [0u8; 8];
+		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
+		(retired, x, u64::from_le_bytes(b))
+	}
+
+	/// two-block counted loop: A does work and loops on itself via BNE,
+	/// falls through to B, which stores the result and leaves the region
+	fn loop_region() -> Vec<(u64, Vec<BlockOp>)> {
+		let a = DRAM_BASE;
+		let b = DRAM_BASE + 12;
+		vec![
+			(a, vec![
+				op(HOT_ADD, 5, 5, 7, 0),      // x5 += x7
+				op(HOT_ADDI, 6, 6, 0, -1),    // x6 -= 1
+				op(HOT_BNE, 0, 6, 0, -8),     // while x6 != 0 -> A
+			]),
+			(b, vec![
+				op(HOT_SD, 0, 10, 5, 0),      // [x10] = x5
+				op(HOT_ADDI, 28, 28, 0, 99),
+			]),
+		]
+	}
+
+	#[test]
+	fn region_loop_matches_dispatch() {
+		for &(iters, fuel) in
+			&[(1u64, 1u64 << 40), (7, 1 << 40), (1000, 1 << 40), (1000, 7), (1000, 1700), (5, 0)]
+		{
+			let blocks = loop_region();
+			let mut cpu = fresh_cpu(&mut Rng(31337));
+			cpu.x[6] = iters as i64;
+			cpu.x[10] = (DRAM_BASE + 9000 & !7) as i64;
+			let lay = region_layout(&cpu);
+			let bytes = jit::emit_region(&blocks, &lay).expect("region emits");
+			let (rw, xw, pcw) = run_region(&bytes, &cpu, 0, fuel);
+			cpu.update_pc(blocks[0].0);
+			for (slot, (start, ops)) in blocks.iter().enumerate() {
+				cpu.install_block_for_test(slot, *start, 0, ops);
+			}
+			let ri = dispatch_ref(&mut cpu, &blocks, fuel);
+			assert_eq!(ri, rw, "retired mismatch iters={} fuel={}", iters, fuel);
+			assert_eq!(cpu.pc, pcw, "pc mismatch iters={} fuel={}", iters, fuel);
+			assert_eq!(cpu.x, xw, "registers mismatch iters={} fuel={}", iters, fuel);
+		}
+	}
+
+	#[test]
+	fn tlb_tier_translates_hits_and_bails_misses() {
+		// synthetic single-page TLB: virtual page V maps to physical page P
+		// inside the DRAM window; everything else must bail.
+		const SETS: u32 = 512;
+		const T_RT: u32 = 8192; // read tags (512 * 8)
+		const T_RM: u32 = 8192 + 4096; // read metas (512 * 4)
+		const T_RP: u32 = 8192 + 4096 + 2048; // read ppns
+		const T_MC: u32 = 8192 + 4096 + 2048 + 4096; // meta cache cell
+		let vpage: u64 = 0x4000_2000; // arbitrary virtual page
+		let ppage: u64 = DRAM_BASE + 0x3000; // physical page in DRAM
+		let meta: u32 = 0xabcd_1234;
+
+		let mut cpu = fresh_cpu(&mut Rng(4242));
+		cpu.x[10] = (vpage + 0x40) as i64; // pointer into the mapped page
+		cpu.x[11] = 0x5000_0000; // pointer with NO mapping
+		let ops_hit = vec![op(HOT_LD, 5, 10, 0, 8), op(HOT_SD, 0, 10, 6, 16)];
+		let ops_miss = vec![op(HOT_ADDI, 5, 5, 0, 1), op(HOT_LD, 7, 11, 0, 0)];
+		let lay = jit::Layout {
+			x_base: XB, f_base: FB,
+			tlb: Some(jit::TlbLayout {
+				sets: SETS,
+				read_tags: T_RT, read_metas: T_RM, read_ppns: T_RP,
+				// write set shares the arrays in this synthetic setup
+				write_tags: T_RT, write_metas: T_RM, write_ppns: T_RP,
+				meta_cache: T_MC,
+			}),
+			pc_addr: PCA, gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen(),
+			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		};
+		let fill_tlb = |d: &mut [u8]| {
+			let set = ((vpage >> 12) & (SETS as u64 - 1)) as usize;
+			let tag = (vpage & !0xfff) | 1;
+			d[T_RT as usize + set * 8..T_RT as usize + set * 8 + 8]
+				.copy_from_slice(&tag.to_le_bytes());
+			d[T_RM as usize + set * 4..T_RM as usize + set * 4 + 4]
+				.copy_from_slice(&meta.to_le_bytes());
+			d[T_RP as usize + set * 8..T_RP as usize + set * 8 + 8]
+				.copy_from_slice(&(ppage & !0xfff).to_le_bytes());
+			d[T_MC as usize..T_MC as usize + 4].copy_from_slice(&meta.to_le_bytes());
+		};
+
+		// hit case: LD then SD through the mapping run to completion
+		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
+		let engine = wasmtime::Engine::default();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu.x[i].to_le_bytes());
+			}
+			d[GENA as usize..GENA as usize + 4]
+				.copy_from_slice(&cpu.mmu.code_gen().to_le_bytes());
+			fill_tlb(d);
+			// plant a known value at the translated load address
+			let lin = DB as u64 + (ppage - DRAM_BASE) + 0x40 + 8;
+			d[lin as usize..lin as usize + 8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+		}
+		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap();
+		assert_eq!(retired, 2, "hit case must complete");
+		{
+			let d = mem.data(&store);
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[XB as usize + 5 * 8..XB as usize + 5 * 8 + 8]);
+			assert_eq!(u64::from_le_bytes(b), 0x1122_3344_5566_7788, "loaded through mapping");
+			// the SD wrote x6 at translated +0x40+16
+			let lin = DB as u64 + (ppage - DRAM_BASE) + 0x40 + 16;
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[lin as usize..lin as usize + 8]);
+			assert_eq!(i64::from_le_bytes(b), cpu.x[6], "stored through mapping");
+		}
+
+		// miss case: first op runs, the unmapped LD bails with pc at it
+		let bytes = jit::emit_block(&ops_miss, DRAM_BASE, &lay).unwrap();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu.x[i].to_le_bytes());
+			}
+			fill_tlb(d);
+		}
+		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap();
+		assert_eq!(retired, 1, "miss bails before the load");
+		{
+			let d = mem.data(&store);
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
+			assert_eq!(u64::from_le_bytes(b), DRAM_BASE + 4, "pc at the bailing op");
+		}
+
+		// stale meta: flip the cache cell; the mapped LD must now bail at op 0
+		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
+		{
+			let d = mem.data_mut(&mut store);
+			for i in 0..32 {
+				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
+					.copy_from_slice(&cpu.x[i].to_le_bytes());
+			}
+			fill_tlb(d);
+			d[T_MC as usize..T_MC as usize + 4].copy_from_slice(&meta.wrapping_add(1).to_le_bytes());
+		}
+		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
+		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
+		let retired = run.call(&mut store, ()).unwrap();
+		assert_eq!(retired, 0, "stale meta bails immediately");
+	}
+
+	#[test]
+	fn store_bails_on_stale_generation() {
+		let mut r = Rng(97);
+		let cpu = fresh_cpu(&mut r);
+		let ops = vec![
+			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 5, rs1: 6, rs2: 0, len: 4, _pad: 0 },
+			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_SD, rd: 0, rs1: 10, rs2: 7, len: 4, _pad: 0 },
+			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 8, rs1: 9, rs2: 0, len: 4, _pad: 0 },
+		];
+		let lay = jit::Layout {
+			x_base: XB, f_base: FB, tlb: None, pc_addr: PCA, gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen().wrapping_add(1), // stale on purpose
+			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		};
+		let bytes = jit::emit_block(&ops, DRAM_BASE, &lay).unwrap();
+		let (retired, _x, pc, _d, _f) = run_wasm(&bytes, &cpu, DRAM_BASE);
+		// the store executes, the gen check fires after it: 2 retired,
+		// pc at the third op
+		assert_eq!(retired, 2);
+		assert_eq!(pc, DRAM_BASE + 8);
 	}
 }

@@ -6,8 +6,22 @@ pub struct Clint {
 	clock: u64,
 	msip: u32,
 	mtimecmp: u64,
-	mtime: u64
+	mtime: u64,
+	// risc-box patch: see `set_wall_clock`.
+	wall: Option<Wall>
 }
+
+/// risc-box patch: state for wall-clock mtime.
+struct Wall {
+	start: std::time::Instant,
+	since_sample: u64
+}
+
+/// How many retired instructions between host-clock samples. The host clock is
+/// a syscall-ish cost, so it cannot be read per instruction; at any speed this
+/// emulator runs, 4096 instructions is tens of microseconds, far finer than the
+/// 10 ms the guest kernel's tick and the 28.6 ms a DOOM tic care about.
+const WALL_SAMPLE_INSNS: u64 = 4096;
 
 impl Clint {
 	/// Creates a new `Clint`
@@ -16,8 +30,33 @@ impl Clint {
 			clock: 0,
 			msip: 0,
 			mtimecmp: 0,
-			mtime: 0 // @TODO: Should be bound to csr time register
+			mtime: 0, // @TODO: Should be bound to csr time register
+			wall: None
 		}
+	}
+
+	/// risc-box patch: drive `mtime` from the host's monotonic clock instead of
+	/// from retired instructions.
+	///
+	/// Instruction-driven time is right for a benchmark — it makes a boot
+	/// deterministic — but it is a lie to anything that watches the clock to
+	/// pace itself. The DTB advertises a 10 MHz timebase, so a guest believes
+	/// one second has passed every 10M instructions; an emulator retiring
+	/// 120M/s therefore hands the guest twelve seconds per real second, and a
+	/// game paced off that clock runs at twelve times speed while still
+	/// *looking* correct from inside. Under this mode the guest's second is a
+	/// real second: `sleep 1` takes a second, the kernel takes HZ timer
+	/// interrupts per real second rather than twelve times HZ, and a frame rate
+	/// measured in the guest means what it says.
+	pub fn set_wall_clock(&mut self, on: bool) {
+		self.wall = match on {
+			true => Some(Wall {
+				start: std::time::Instant::now(),
+				// sample on the very first tick so the guest never sees zero
+				since_sample: WALL_SAMPLE_INSNS
+			}),
+			false => None
+		};
 	}
 
 	/// Runs one cycle. `Clint` can raise interrupt. If it does it rises a certain bit
@@ -30,7 +69,20 @@ impl Clint {
 	// had when this ran every instruction — only its granularity changes.
 	pub fn tick(&mut self, n: u64, mip: &mut u64) {
 		self.clock = self.clock.wrapping_add(n);
-		self.mtime = self.mtime.wrapping_add(n);
+		match self.wall {
+			// risc-box patch: wall-clock mode. mtime is the host's monotonic
+			// clock at 10 MHz (the timebase the DTB advertises), resampled
+			// every WALL_SAMPLE_INSNS; between samples it holds still, which
+			// is monotonic and finer-grained than any deadline the guest sets.
+			Some(ref mut w) => {
+				w.since_sample = w.since_sample.wrapping_add(n);
+				if w.since_sample >= WALL_SAMPLE_INSNS {
+					w.since_sample = 0;
+					self.mtime = (w.start.elapsed().as_nanos() as u64) / 100;
+				}
+			},
+			None => self.mtime = self.mtime.wrapping_add(n)
+		}
 
 		if (self.msip & 1) != 0 {
 			*mip |= MIP_MSIP;

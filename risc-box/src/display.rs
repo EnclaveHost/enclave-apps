@@ -26,12 +26,47 @@
 //! per-pixel work outside a dirty band).
 
 use riscv_emu_rust::Emulator;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FB_BASE: u64 = 0x87e0_0000;
-pub const FB_W: usize = 1024;
-pub const FB_H: usize = 768;
-pub const FB_STRIDE: usize = FB_W * 4;
-pub const FB_BYTES: usize = FB_STRIDE * FB_H;
+/// The DTB's simple-framebuffer window: 4 MiB reserved, of which a frame may
+/// use 3 MiB (1024x768x4, the largest mode).
+pub const FB_MAX_BYTES: usize = 0x30_0000;
+
+/// The display's size, fixed for the life of the process by `set_size` before
+/// the machine boots (it has to agree with the DTB node the guest kernel reads
+/// once, at boot).
+///
+/// It is a knob because every pixel is paid for three times — the guest draws
+/// it, the scan reads it back, the encoder ships it — so a machine running a
+/// 320x200 game at 1024x768 spends nine tenths of that work on borders.
+static FB_W_CELL: AtomicUsize = AtomicUsize::new(1024);
+static FB_H_CELL: AtomicUsize = AtomicUsize::new(768);
+
+pub fn fb_w() -> usize {
+    FB_W_CELL.load(Ordering::Relaxed)
+}
+pub fn fb_h() -> usize {
+    FB_H_CELL.load(Ordering::Relaxed)
+}
+pub fn fb_stride() -> usize {
+    fb_w() * 4
+}
+pub fn fb_bytes() -> usize {
+    fb_stride() * fb_h()
+}
+
+/// Returns false, changing nothing, for a size that would not fit the reserved
+/// window — the same guard the emulator applies to the DTB, so the app and the
+/// guest can never disagree about the shape of the screen.
+pub fn set_size(w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 || w % 2 != 0 || w * h * 4 > FB_MAX_BYTES {
+        return false;
+    }
+    FB_W_CELL.store(w, Ordering::Relaxed);
+    FB_H_CELL.store(h, Ordering::Relaxed);
+    true
+}
 /// Slowest the scan is allowed to get, and the floor the AV1 path paces
 /// against. Also the cadence a scan falls back to when it is expensive.
 pub const FB_SCAN_MS: u64 = 100;
@@ -63,6 +98,14 @@ pub fn scan_interval(cost: std::time::Duration, still: u32) -> std::time::Durati
 }
 
 pub struct Band {
+    /// Left edge and width in pixels. A band used to be a run of WHOLE rows,
+    /// which is right for a desktop repainting a strip and wrong for the case
+    /// that actually needs the bandwidth: a game in a window, where two thirds
+    /// of every "changed" row is a background that did not move. Cropping to
+    /// the columns that really changed cuts what the worker deflates and what
+    /// the wire carries by the same fraction.
+    pub x: usize,
+    pub w: usize,
     pub y: usize,
     pub h: usize,
     /// raw-deflate of the band's rows, still B,G,R,X
@@ -85,9 +128,9 @@ pub struct Display {
 impl Display {
     pub fn new() -> Self {
         Display {
-            frame: vec![0; FB_BYTES],
-            scratch: vec![0; FB_BYTES],
-            row_hash: vec![0; FB_H],
+            frame: vec![0; fb_bytes()],
+            scratch: vec![0; fb_bytes()],
+            row_hash: vec![0; fb_h()],
             force_full: true,
             primed: false,
         }
@@ -126,7 +169,7 @@ impl Display {
     /// as small as possible. Everything expensive (hashing, diffing,
     /// deflating) is in `bands` and can run anywhere.
     pub fn capture(emu: &Emulator, out: &mut Vec<u8>) {
-        out.resize(FB_BYTES, 0);
+        out.resize(fb_bytes(), 0);
         emu.read_physical_range(FB_BASE, out);
     }
 
@@ -134,37 +177,73 @@ impl Display {
     /// back the frame it replaced, so a caller holding a buffer pool can keep
     /// recycling two buffers forever instead of allocating megabytes per scan.
     pub fn bands(&mut self, mut frame: Vec<u8>) -> (Vec<Band>, Vec<u8>) {
-        let mut dirty = vec![false; FB_H];
+        let mut dirty = vec![false; fb_h()];
         let mut any = false;
-        for y in 0..FB_H {
-            let h = fnv1a(&frame[y * FB_STRIDE..(y + 1) * FB_STRIDE]);
-            if h != self.row_hash[y] || !self.primed {
-                self.row_hash[y] = h;
-                dirty[y] = true;
-                any = true;
+        // Columns that changed anywhere on the screen, in 8-byte units (two
+        // pixels). Found while the OLD frame is still in place, because a
+        // column range needs the two frames compared, not just their hashes —
+        // and it is what lets a band be a rectangle instead of a full-width
+        // strip. Two u64 compares per changed pair of pixels is cheap next to
+        // deflating the columns that did not change.
+        let stride = fb_stride();
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for y in 0..fb_h() {
+            let row = &frame[y * stride..(y + 1) * stride];
+            let h = fnv1a(row);
+            if h == self.row_hash[y] && self.primed {
+                continue;
+            }
+            self.row_hash[y] = h;
+            dirty[y] = true;
+            any = true;
+            if !self.primed {
+                continue; // no previous frame to compare against
+            }
+            let old = &self.frame[y * stride..(y + 1) * stride];
+            let mut i = 0usize;
+            while i < stride {
+                if row[i..i + 8] != old[i..i + 8] {
+                    if i < lo {
+                        lo = i;
+                    }
+                    if i + 8 > hi {
+                        hi = i + 8;
+                    }
+                }
+                i += 8;
             }
         }
         let full = self.force_full;
         self.force_full = false;
+        let was_primed = self.primed;
         self.primed = true;
         // `frame` becomes the current one; the old current goes back to the
         // caller as the next capture target.
         std::mem::swap(&mut self.frame, &mut frame);
         if full {
-            return (vec![self.band(0, FB_H)], frame);
+            return (vec![self.band(0, fb_w(), 0, fb_h())], frame);
         }
         if !any {
             return (Vec::new(), frame);
         }
-        (self.group_dirty(&dirty), frame)
+        // A dirty row with no differing column pair cannot happen (the hash
+        // changed), but a hash collision or an unprimed first scan can leave
+        // the range unset — fall back to the whole width rather than crop
+        // wrongly.
+        let (x, w) = match was_primed && lo != usize::MAX && hi > lo {
+            true => (lo / 4, (hi - lo) / 4),
+            false => (0, fb_w()),
+        };
+        (self.group_dirty(&dirty, x, w), frame)
     }
 
-    fn group_dirty(&self, dirty: &[bool]) -> Vec<Band> {
+    fn group_dirty(&self, dirty: &[bool], x: usize, w: usize) -> Vec<Band> {
         // group consecutive dirty rows; sew gaps under 8 rows into one band
         // (fewer events beats a few clean rows re-sent inside a run)
         let mut bands = Vec::new();
         let mut y = 0usize;
-        while y < FB_H {
+        while y < fb_h() {
             if !dirty[y] {
                 y += 1;
                 continue;
@@ -173,7 +252,7 @@ impl Display {
             let mut end = y + 1; // exclusive
             let mut gap = 0usize;
             let mut z = end;
-            while z < FB_H && gap < 8 {
+            while z < fb_h() && gap < 8 {
                 if dirty[z] {
                     end = z + 1;
                     gap = 0;
@@ -182,27 +261,53 @@ impl Display {
                 }
                 z += 1;
             }
-            bands.push(self.band(start, end - start));
+            bands.push(self.band(x, w, start, end - start));
             y = end + gap;
         }
         bands
     }
 
-    fn band(&self, y: usize, h: usize) -> Band {
-        let rows = &self.frame[y * FB_STRIDE..(y + h) * FB_STRIDE];
-        Band { y, h, z: miniz_oxide::deflate::compress_to_vec(rows, 6) }
+    fn band(&self, x: usize, w: usize, y: usize, h: usize) -> Band {
+        let stride = fb_stride();
+        // A full-width band is already contiguous; a cropped one is gathered
+        // into a scratch buffer so the compressor still sees one run of bytes.
+        let cropped;
+        let rows: &[u8] = match w == fb_w() {
+            true => &self.frame[y * stride..(y + h) * stride],
+            false => {
+                let mut out = Vec::with_capacity(w * 4 * h);
+                for row in y..y + h {
+                    let off = row * stride + x * 4;
+                    out.extend_from_slice(&self.frame[off..off + w * 4]);
+                }
+                cropped = out;
+                &cropped
+            }
+        };
+        // A big band is a moving picture, and there the limit on what a watcher
+        // sees is how fast this can be produced, not how fast it can be sent:
+        // one frame is in flight at a time, so the deflate time IS the frame
+        // interval. Level 1 runs about three times faster for about a quarter
+        // more bytes, which is the right trade at 30 frames a second and the
+        // wrong one for a text screen changing a single line — where the bytes
+        // are few, the time is nothing, and level 6 compresses text far better.
+        let level = match rows.len() > 256 * 1024 {
+            true => 1,
+            false => 6,
+        };
+        Band { x, y, w, h, z: miniz_oxide::deflate::compress_to_vec(rows, level) }
     }
 
     /// The current frame as a PNG (fresh scan first so a GET with no SSE
     /// watcher still sees live pixels).
     pub fn png(&mut self, emu: &Emulator) -> Vec<u8> {
-        let mut fresh = vec![0u8; FB_BYTES];
+        let mut fresh = vec![0u8; fb_bytes()];
         emu.read_physical_range(FB_BASE, &mut fresh);
         // raw scanlines: filter byte 0 + RGB (drop X, reorder BGR -> RGB)
-        let mut raw = Vec::with_capacity(FB_H * (1 + FB_W * 3));
-        for y in 0..FB_H {
+        let mut raw = Vec::with_capacity(fb_h() * (1 + fb_w() * 3));
+        for y in 0..fb_h() {
             raw.push(0u8);
-            let row = &fresh[y * FB_STRIDE..(y + 1) * FB_STRIDE];
+            let row = &fresh[y * fb_stride()..(y + 1) * fb_stride()];
             for px in row.chunks_exact(4) {
                 raw.push(px[2]); // R
                 raw.push(px[1]); // G
@@ -213,8 +318,8 @@ impl Display {
         let mut png = Vec::with_capacity(idat.len() + 64);
         png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
         let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&(FB_W as u32).to_be_bytes());
-        ihdr.extend_from_slice(&(FB_H as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(fb_w() as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(fb_h() as u32).to_be_bytes());
         ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolor, deflate, filter 0, no interlace
         chunk(&mut png, b"IHDR", &ihdr);
         chunk(&mut png, b"IDAT", &idat);
@@ -223,9 +328,23 @@ impl Display {
     }
 }
 
+/// FNV-1a, eight bytes at a time.
+///
+/// Not the standard byte-wise mixing — this is a row-change detector, not a
+/// hash anyone else consumes, and a row is 4 KiB. Byte-wise it was 3 million
+/// multiply-xor rounds per 1024x768 scan, which on the display worker's core
+/// cost more than deflating the bands did. Reading `u64` at a time keeps the
+/// avalanche (every input byte still reaches the accumulator through the
+/// multiply) at an eighth of the rounds; rows are 4-byte pixels so the tail is
+/// at most seven bytes.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in bytes {
+    let (chunks, tail) = bytes.split_at(bytes.len() & !7);
+    for c in chunks.chunks_exact(8) {
+        h ^= u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    for &b in tail {
         h ^= b as u64;
         h = h.wrapping_mul(0x1000_0000_01b3);
     }

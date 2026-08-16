@@ -1,7 +1,14 @@
 /// Emulates main memory.
+// risc-box patch: DRAM is a byte array. It was a Vec<u64> whose accessors
+// assembled every read and write from shifted/masked cells (a store was a
+// read-modify-write of up to two cells); to_le_bytes/from_le_bytes on a
+// byte slice compile to single unaligned loads/stores on x86 and wasm,
+// and the byte order the guest sees is identical (little-endian cells).
+use std::convert::TryInto; // edition-2015 crate: not in the prelude
+
 pub struct Memory {
 	/// Memory content
-	data: Vec<u64>
+	data: Vec<u8>
 }
 
 impl Memory {
@@ -31,64 +38,48 @@ impl Memory {
 	// `init` is called once on a fresh Memory (upstream's own contract, stated
 	// just above), so replacing the vector is what appending to it meant.
 	pub fn init(&mut self, capacity: u64) {
-		self.data = vec![0; ((capacity + 7) / 8) as usize];
+		// rounded up to a whole number of 8-byte cells like the old layout,
+		// so edge-of-DRAM doubleword accesses stay in bounds
+		self.data = vec![0; (((capacity + 7) / 8) * 8) as usize];
 	}
-	
+
 	/// Reads a byte from memory.
 	///
 	/// # Arguments
 	/// * `address`
+	#[inline(always)]
 	pub fn read_byte(&self, address: u64) -> u8 {
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		(self.data[index] >> pos) as u8
+		self.data[address as usize]
 	}
 
 	/// Reads two bytes from memory.
 	///
 	/// # Arguments
 	/// * `address`
+	#[inline(always)]
 	pub fn read_halfword(&self, address: u64) -> u16 {
-		// risc-box patch: any alignment reads from at most two cells (the
-		// misaligned fallback was a per-byte loop)
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		match pos <= 48 {
-			true => (self.data[index] >> pos) as u16,
-			false => ((self.data[index] >> pos) | (self.data[index + 1] << (64 - pos))) as u16
-		}
+		let a = address as usize;
+		u16::from_le_bytes(self.data[a..a + 2].try_into().unwrap())
 	}
 
 	/// Reads four bytes from memory.
 	///
 	/// # Arguments
 	/// * `address`
+	#[inline(always)]
 	pub fn read_word(&self, address: u64) -> u32 {
-		// risc-box patch: any alignment reads from at most two cells. This is
-		// hot: compressed instructions put half of all 4-byte fetches at
-		// address % 4 == 2, which used to take the per-byte loop.
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		match pos <= 32 {
-			true => (self.data[index] >> pos) as u32,
-			false => ((self.data[index] >> pos) | (self.data[index + 1] << (64 - pos))) as u32
-		}
+		let a = address as usize;
+		u32::from_le_bytes(self.data[a..a + 4].try_into().unwrap())
 	}
 
 	/// Reads eight bytes from memory.
 	///
 	/// # Arguments
 	/// * `address`
+	#[inline(always)]
 	pub fn read_doubleword(&self, address: u64) -> u64 {
-		// risc-box patch: any alignment reads from at most two cells. Also
-		// fixes an upstream bug: the 4-aligned path shifted the high word
-		// by 4 instead of 32, corrupting misaligned doubleword loads.
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		match pos == 0 {
-			true => self.data[index],
-			false => (self.data[index] >> pos) | (self.data[index + 1] << (64 - pos))
-		}
+		let a = address as usize;
+		u64::from_le_bytes(self.data[a..a + 8].try_into().unwrap())
 	}
 
 	/// Reads multiple bytes from memory.
@@ -105,21 +96,11 @@ impl Memory {
 	}
 
 	/// risc-box patch: bulk-copies `out.len()` bytes starting at `address`
-	/// into `out` — the framebuffer scanout path. Byte order matches
-	/// read_byte (little-endian u64 cells), so this IS the guest's byte
-	/// view; walking whole cells keeps it ~8x cheaper than per-byte reads
-	/// (the scanout copies ~2MB per frame).
+	/// into `out` — the framebuffer scanout path. With byte-backed DRAM this
+	/// is a straight memcpy.
 	pub fn read_range(&self, address: u64, out: &mut [u8]) {
-		let mut i = 0usize;
-		while i < out.len() {
-			let a = address.wrapping_add(i as u64);
-			let index = (a >> 3) as usize;
-			let off = (a % 8) as usize;
-			let take = core::cmp::min(8 - off, out.len() - i);
-			let bytes = self.data[index].to_le_bytes();
-			out[i..i + take].copy_from_slice(&bytes[off..off + take]);
-			i += take;
-		}
+		let a = address as usize;
+		out.copy_from_slice(&self.data[a..a + out.len()]);
 	}
 
 	/// Writes a byte to memory.
@@ -127,10 +108,9 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	/// * `value`
+	#[inline(always)]
 	pub fn write_byte(&mut self, address: u64, value: u8) {
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		self.data[index] = (self.data[index] & !(0xff << pos)) | ((value as u64) << pos);
+		self.data[address as usize] = value;
 	}
 
 	/// Writes two bytes to memory.
@@ -138,16 +118,10 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	/// * `value`
+	#[inline(always)]
 	pub fn write_halfword(&mut self, address: u64, value: u16) {
-		// risc-box patch: any alignment writes at most two cells
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		self.data[index] = (self.data[index] & !(0xffffu64 << pos)) | ((value as u64) << pos);
-		if pos > 48 {
-			let shift = 64 - pos;
-			self.data[index + 1] =
-				(self.data[index + 1] & !(0xffffu64 >> shift)) | ((value as u64) >> shift);
-		}
+		let a = address as usize;
+		self.data[a..a + 2].copy_from_slice(&value.to_le_bytes());
 	}
 
 	/// Writes four bytes to memory.
@@ -155,16 +129,10 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	/// * `value`
+	#[inline(always)]
 	pub fn write_word(&mut self, address: u64, value: u32) {
-		// risc-box patch: any alignment writes at most two cells
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		self.data[index] = (self.data[index] & !(0xffffffffu64 << pos)) | ((value as u64) << pos);
-		if pos > 32 {
-			let shift = 64 - pos;
-			self.data[index + 1] =
-				(self.data[index + 1] & !(0xffffffffu64 >> shift)) | ((value as u64) >> shift);
-		}
+		let a = address as usize;
+		self.data[a..a + 4].copy_from_slice(&value.to_le_bytes());
 	}
 
 	/// Writes eight bytes to memory.
@@ -172,19 +140,10 @@ impl Memory {
 	/// # Arguments
 	/// * `address`
 	/// * `value`
+	#[inline(always)]
 	pub fn write_doubleword(&mut self, address: u64, value: u64) {
-		// risc-box patch: any alignment writes at most two cells
-		let index = (address >> 3) as usize;
-		let pos = ((address % 8) as u64) * 8;
-		match pos == 0 {
-			true => self.data[index] = value,
-			false => {
-				let shift = 64 - pos;
-				self.data[index] = (self.data[index] & !(u64::MAX << pos)) | (value << pos);
-				self.data[index + 1] =
-					(self.data[index + 1] & !(u64::MAX >> shift)) | (value >> shift);
-			}
-		}
+		let a = address as usize;
+		self.data[a..a + 8].copy_from_slice(&value.to_le_bytes());
 	}
 
 	/// Write multiple bytes to memory.

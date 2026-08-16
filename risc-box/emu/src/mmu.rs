@@ -43,6 +43,8 @@ pub struct Mmu {
 	addressing_mode: AddressingMode,
 	privilege_mode: PrivilegeMode,
 	memory: MemoryWrapper,
+	// risc-box patch: configured RAM size (bytes); mirrored into the DTB memory node.
+	ram_capacity: u64,
 	dtb: Vec<u8>,
 	disk: VirtioBlockDisk,
 	net: VirtioNet, // risc-box patch
@@ -85,7 +87,13 @@ pub struct Mmu {
 	tlb_gen: u32,
 	tlb_tags: [[u64; TLB_SETS]; 3],
 	tlb_metas: [[u32; TLB_SETS]; 3],
-	tlb_ppns: [[u64; TLB_SETS]; 3]
+	tlb_ppns: [[u64; TLB_SETS]; 3],
+
+	// risc-box patch: tlb_meta() used to be recomputed on every translation
+	// AND every predecode-cache probe (once per retired instruction); it only
+	// changes when the generation, privilege mode or mstatus does, so it is
+	// materialized here at those points instead.
+	tlb_meta_cache: u32
 }
 
 // risc-box patch: TLB geometry/type indices
@@ -132,13 +140,14 @@ impl Mmu {
 			dtb[i] = content[i];
 		}
 
-		Mmu {
+		let mut mmu = Mmu {
 			clock: 0,
 			xlen: xlen,
 			ppn: 0,
 			addressing_mode: AddressingMode::None,
 			privilege_mode: PrivilegeMode::Machine,
 			memory: MemoryWrapper::new(),
+			ram_capacity: 0,
 			dtb: dtb,
 			disk: VirtioBlockDisk::new(),
 			net: VirtioNet::new(), // risc-box patch
@@ -155,8 +164,11 @@ impl Mmu {
 			tlb_gen: 1,
 			tlb_tags: [[0; TLB_SETS]; 3],
 			tlb_metas: [[0; TLB_SETS]; 3],
-			tlb_ppns: [[0; TLB_SETS]; 3]
-		}
+			tlb_ppns: [[0; TLB_SETS]; 3],
+			tlb_meta_cache: 0
+		};
+		mmu.refresh_tlb_meta();
+		mmu
 	}
 
 	/// Updates XLEN, 32-bit or 64-bit
@@ -175,6 +187,73 @@ impl Mmu {
 	/// * `capacity`
 	pub fn init_memory(&mut self, capacity: u64) {
 		self.memory.init(capacity);
+		// risc-box patch: keep the DTB's memory@80000000 size in step with the
+		// actual allocation, so a configured RAM size needs no hand-edited DTB.
+		self.ram_capacity = capacity;
+		self.sync_dtb_memory_size();
+	}
+
+	/// risc-box patch: rewrites the size cell of the DTB's memory@80000000 reg
+	/// (<0x0 0x80000000 0x0 SIZE>, big-endian cells) to `ram_capacity`. Works on
+	/// the embedded DTB and any init_dtb() override; called from both paths.
+	/// A DTB without exactly one such reg is left alone (with a log line) —
+	/// better an honest mismatch than a corrupted tree.
+	fn sync_dtb_memory_size(&mut self) {
+		if self.ram_capacity == 0 || self.ram_capacity >= 0x1_0000_0000 {
+			return; // unset, or needs a 2-cell size (never: single-alloc cap is 2 GiB)
+		}
+		let pat: [u8; 12] = [0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0]; // base-hi, base-lo=0x80000000, size-hi=0
+		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(16))
+			.filter(|&i| self.dtb[i..i + 12] == pat)
+			.collect();
+		if hits.len() != 1 {
+			eprintln!("[emu] dtb: expected exactly one memory@80000000 reg, found {}; leaving DTB as is", hits.len());
+			return;
+		}
+		let at = hits[0] + 12;
+		self.dtb[at..at + 4].copy_from_slice(&(self.ram_capacity as u32).to_be_bytes());
+	}
+
+	/// risc-box patch: rewrites the simple-framebuffer node's width/height/
+	/// stride so the display size is a deployment knob rather than a rebuild.
+	///
+	/// Every pixel of the screen is paid for three times over — the guest draws
+	/// it, the host scans it out, and the encoder ships it — so a machine whose
+	/// job is a 320x200 game should not be made to run a 1024x768 desktop's
+	/// worth of framebuffer. The node's `reg` window is left alone: it is the
+	/// 3 MiB the reserved-memory node keeps the allocator off, and every size
+	/// this accepts fits inside it.
+	///
+	/// Returns false (leaving the DTB untouched) if the size does not fit or
+	/// the node is not the one this emulator ships.
+	pub fn set_dtb_framebuffer(&mut self, width: u32, height: u32) -> bool {
+		const FB_WINDOW: u64 = 0x30_0000;
+		if width == 0 || height == 0 || (width as u64) * (height as u64) * 4 > FB_WINDOW {
+			eprintln!("[emu] dtb: framebuffer {}x{} does not fit the 3 MiB window; keeping the default", width, height);
+			return false;
+		}
+		// width/height/stride sit consecutively in the struct block, each one
+		// an FDT_PROP token + length + name offset (12 bytes) followed by its
+		// 4-byte value, so consecutive values are 16 bytes apart. Matching all
+		// three defaults at once, on 4-byte alignment, identifies the node
+		// without a full FDT walk and refuses to guess if the tree changes
+		// shape (verified unique against the shipped blob).
+		let (w0, h0, s0) = (1024u32.to_be_bytes(), 768u32.to_be_bytes(), 4096u32.to_be_bytes());
+		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(36))
+			.step_by(4)
+			.filter(|&i| self.dtb[i..i + 4] == w0
+				&& self.dtb[i + 16..i + 20] == h0
+				&& self.dtb[i + 32..i + 36] == s0)
+			.collect();
+		if hits.len() != 1 {
+			eprintln!("[emu] dtb: expected exactly one simple-framebuffer size triple, found {}; leaving DTB as is", hits.len());
+			return false;
+		}
+		let at = hits[0];
+		self.dtb[at..at + 4].copy_from_slice(&width.to_be_bytes());
+		self.dtb[at + 16..at + 20].copy_from_slice(&height.to_be_bytes());
+		self.dtb[at + 32..at + 36].copy_from_slice(&(width * 4).to_be_bytes());
+		true
 	}
 
 	// risc-box patch: bulk read of PHYSICAL DRAM (no translation, no device
@@ -182,6 +261,16 @@ impl Mmu {
 	// owns the address contract: the range must sit inside main memory.
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
 		self.memory.read_range(p_address, out);
+	}
+
+	// risc-box patch (debug aid): see MemoryWrapper::fb_writes.
+	pub fn fb_writes(&self) -> u64 {
+		self.memory.fb_writes()
+	}
+
+	// risc-box patch (measurement): see MemoryWrapper::fb_bytes.
+	pub fn fb_bytes(&self) -> u64 {
+		self.memory.fb_bytes()
 	}
 	
 	/// Initializes Virtio block disk. This method is expected to be called only once.
@@ -203,6 +292,8 @@ impl Mmu {
 		for i in data.len()..self.dtb.len() {
 			self.dtb[i] = 0;
 		}
+		// risc-box patch: a custom DTB gets the same memory-node sync
+		self.sync_dtb_memory_size();
 	}
 
 	/// Enables or disables page cache optimization.
@@ -231,10 +322,32 @@ impl Mmu {
 			// generation reuse must not revive stale predecoded instructions
 			self.memory.bump_code_gen();
 		}
+		self.refresh_tlb_meta(); // risc-box patch: meta embeds the generation
 	}
 
 	// risc-box patch: public fetch translation for the CPU's predecode fill.
 	pub fn translate_fetch(&mut self, v_address: u64) -> Result<u64, ()> {
+		self.translate_address(v_address, &MemoryAccessType::Execute)
+	}
+
+	// risc-box patch: the superblock probe's fetch translation, specialized
+	// by hand. It runs once per BLOCK dispatch, and the generic
+	// translate_address path (access-type match through a reference) is
+	// exactly the kind of dispatch wasm backends fail to fold; this is the
+	// TLB hit written out flat, falling back to the ordinary translation
+	// (which walks and fills the TLB) only on a miss.
+	#[inline(always)]
+	pub fn translate_fetch_probe(&mut self, v_address: u64) -> Result<u64, ()> {
+		if matches!(self.addressing_mode, AddressingMode::None) {
+			return Ok(self.get_effective_address(v_address));
+		}
+		let address = self.get_effective_address(v_address);
+		let set = ((address >> 12) as usize) & (TLB_SETS - 1);
+		let tag = (address & !0xfff) | 1;
+		if self.tlb_tags[TLB_EXECUTE][set] == tag
+			&& self.tlb_metas[TLB_EXECUTE][set] == self.tlb_meta_cache {
+			return Ok(self.tlb_ppns[TLB_EXECUTE][set] | (address & 0xfff));
+		}
 		self.translate_address(v_address, &MemoryAccessType::Execute)
 	}
 
@@ -250,6 +363,15 @@ impl Mmu {
 		self.memory.mark_exec_page(p_address)
 	}
 
+	// risc-box patch: the write-snoop generation alone — what a superblock's
+	// content validity depends on (a store can invalidate code pages but can
+	// never change what physical page a block was decoded from; the probe
+	// re-checks the mapping through the TLB separately).
+	#[inline(always)]
+	pub fn code_gen(&self) -> u32 {
+		self.memory.code_gen()
+	}
+
 	// risc-box patch: SFENCE.VMA entry point (cpu.rs calls this; upstream
 	// treated the instruction as a no-op).
 	pub fn sfence_vma(&mut self) {
@@ -260,14 +382,21 @@ impl Mmu {
 	// risc-box patch: the CPU state a translation depends on, packed for the
 	// TLB tag: generation | privilege | mstatus.MPRV | mstatus."MPP"
 	// (bits 17 and 9..10, exactly as translate_address_walk reads them).
+	// Materialized in tlb_meta_cache whenever one of those inputs changes;
+	// the hot paths read the field.
+	#[inline(always)]
 	fn tlb_meta(&self) -> u32 {
+		self.tlb_meta_cache
+	}
+
+	fn refresh_tlb_meta(&mut self) {
 		let priv_enc = match self.privilege_mode {
 			PrivilegeMode::User => 0u32,
 			PrivilegeMode::Supervisor => 1,
 			PrivilegeMode::Reserved => 2,
 			PrivilegeMode::Machine => 3
 		};
-		(self.tlb_gen << 8)
+		self.tlb_meta_cache = (self.tlb_gen << 8)
 			| (priv_enc << 6)
 			| ((((self.mstatus >> 17) & 1) as u32) << 5)
 			| ((((self.mstatus >> 9) & 3) as u32) << 3)
@@ -306,6 +435,7 @@ impl Mmu {
 	pub fn update_privilege_mode(&mut self, mode: PrivilegeMode) {
 		self.privilege_mode = mode;
 		self.clear_page_cache();
+		self.refresh_tlb_meta(); // risc-box patch
 	}
 
 	/// Updates mstatus copy. `CPU` needs to call this method whenever
@@ -315,6 +445,7 @@ impl Mmu {
 	/// * `mstatus`
 	pub fn update_mstatus(&mut self, mstatus: u64) {
 		self.mstatus = mstatus;
+		self.refresh_tlb_meta(); // risc-box patch
 	}
 
 	/// Updates PPN used for address translation
@@ -389,6 +520,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `v_address` Virtual address
+	#[inline(always)]
 	pub fn load(&mut self, v_address: u64) -> Result<u8, Trap> {
 		let effective_address = self.get_effective_address(v_address);
 		match self.translate_address(effective_address, &MemoryAccessType::Read) {
@@ -406,6 +538,11 @@ impl Mmu {
 	/// # Arguments
 	/// * `v_address` Virtual address
 	/// * `width` Must be 1, 2, 4, or 8
+	// risc-box patch: #[inline(always)] with the cross-page tail split out —
+	// every load from the interpreter's hot set lands here with a constant
+	// `width`, so inlining folds the width match away and the TLB probe in
+	// translate_address specializes per call site.
+	#[inline(always)]
 	fn load_bytes(&mut self, v_address: u64, width: u64) -> Result<u64, Trap> {
 		debug_assert!(width == 1 || width == 2 || width == 4 || width == 8,
 			"Width must be 1, 2, 4, or 8. {:X}", width);
@@ -427,19 +564,22 @@ impl Mmu {
 					value: v_address
 				})
 			},
-			false => {
-				let mut data = 0 as u64;
-				for i in 0..width {
-					match self.load(v_address.wrapping_add(i)) {
-						Ok(byte) => {
-							data |= (byte as u64) << (i * 8)
-						},
-						Err(e) => return Err(e)
-					};
-				}
-				Ok(data)
-			}
+			false => self.load_bytes_cross_page(v_address, width)
 		}
+	}
+
+	#[cold]
+	fn load_bytes_cross_page(&mut self, v_address: u64, width: u64) -> Result<u64, Trap> {
+		let mut data = 0 as u64;
+		for i in 0..width {
+			match self.load(v_address.wrapping_add(i)) {
+				Ok(byte) => {
+					data |= (byte as u64) << (i * 8)
+				},
+				Err(e) => return Err(e)
+			};
+		}
+		Ok(data)
 	}
 
 	/// Loads two bytes. This method takes virtual address and translates
@@ -447,6 +587,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `v_address` Virtual address
+	#[inline(always)]
 	pub fn load_halfword(&mut self, v_address: u64) -> Result<u16, Trap> {
 		match self.load_bytes(v_address, 2) {
 			Ok(data) => Ok(data as u16),
@@ -459,6 +600,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `v_address` Virtual address
+	#[inline(always)]
 	pub fn load_word(&mut self, v_address: u64) -> Result<u32, Trap> {
 		match self.load_bytes(v_address, 4) {
 			Ok(data) => Ok(data as u32),
@@ -471,6 +613,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `v_address` Virtual address
+	#[inline(always)]
 	pub fn load_doubleword(&mut self, v_address: u64) -> Result<u64, Trap> {
 		match self.load_bytes(v_address, 8) {
 			Ok(data) => Ok(data as u64),
@@ -484,6 +627,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `v_address` Virtual address
 	/// * `value`
+	#[inline(always)]
 	pub fn store(&mut self, v_address: u64, value: u8) -> Result<(), Trap> {
 		match self.translate_address(v_address, &MemoryAccessType::Write) {
 			Ok(p_address) => {
@@ -504,6 +648,9 @@ impl Mmu {
 	/// * `v_address` Virtual address
 	/// * `value` data written
 	/// * `width` Must be 1, 2, 4, or 8
+	// risc-box patch: same shape as load_bytes — constant-width call sites,
+	// cold cross-page tail.
+	#[inline(always)]
 	fn store_bytes(&mut self, v_address: u64, value: u64, width: u64) -> Result<(), Trap> {
 		debug_assert!(width == 1 || width == 2 || width == 4 || width == 8,
 			"Width must be 1, 2, 4, or 8. {:X}", width);
@@ -526,16 +673,19 @@ impl Mmu {
 					value: v_address
 				})
 			},
-			false => {
-				for i in 0..width {
-					match self.store(v_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8) {
-						Ok(()) => {},
-						Err(e) => return Err(e)
-					}
-				}
-				Ok(())
+			false => self.store_bytes_cross_page(v_address, value, width)
+		}
+	}
+
+	#[cold]
+	fn store_bytes_cross_page(&mut self, v_address: u64, value: u64, width: u64) -> Result<(), Trap> {
+		for i in 0..width {
+			match self.store(v_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
 			}
 		}
+		Ok(())
 	}
 
 	/// Stores two bytes. This method takes virtual address and translates
@@ -544,6 +694,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `v_address` Virtual address
 	/// * `value` data written
+	#[inline(always)]
 	pub fn store_halfword(&mut self, v_address: u64, value: u16) -> Result<(), Trap> {
 		self.store_bytes(v_address, value as u64, 2)
 	}
@@ -554,6 +705,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `v_address` Virtual address
 	/// * `value` data written
+	#[inline(always)]
 	pub fn store_word(&mut self, v_address: u64, value: u32) -> Result<(), Trap> {
 		self.store_bytes(v_address, value as u64, 4)
 	}
@@ -564,6 +716,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `v_address` Virtual address
 	/// * `value` data written
+	#[inline(always)]
 	pub fn store_doubleword(&mut self, v_address: u64, value: u64) -> Result<(), Trap> {
 		self.store_bytes(v_address, value as u64, 8)
 	}
@@ -573,6 +726,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `p_address` Physical address
+	#[inline(always)]
 	fn load_raw(&mut self, p_address: u64) -> u8 {
 		let effective_address = self.get_effective_address(p_address);
 		// @TODO: Mapping should be configurable with dtb
@@ -602,6 +756,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `p_address` Physical address
+	#[inline(always)]
 	fn load_halfword_raw(&mut self, p_address: u64) -> u16 {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(1) > effective_address {
@@ -622,6 +777,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `p_address` Physical address
+	#[inline(always)]
 	pub fn load_word_raw(&mut self, p_address: u64) -> u32 {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(3) > effective_address {
@@ -642,6 +798,7 @@ impl Mmu {
 	///
 	/// # Arguments
 	/// * `p_address` Physical address
+	#[inline(always)]
 	fn load_doubleword_raw(&mut self, p_address: u64) -> u64 {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(7) > effective_address {
@@ -663,6 +820,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `p_address` Physical address
 	/// * `value` data written
+	#[inline(always)]
 	pub fn store_raw(&mut self, p_address: u64, value: u8) {
 		let effective_address = self.get_effective_address(p_address);
 		// @TODO: Mapping should be configurable with dtb
@@ -688,6 +846,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `p_address` Physical address
 	/// * `value` data written
+	#[inline(always)]
 	fn store_halfword_raw(&mut self, p_address: u64, value: u16) {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(1) > effective_address {
@@ -707,6 +866,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `p_address` Physical address
 	/// * `value` data written
+	#[inline(always)]
 	fn store_word_raw(&mut self, p_address: u64, value: u32) {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(3) > effective_address {
@@ -726,6 +886,7 @@ impl Mmu {
 	/// # Arguments
 	/// * `p_address` Physical address
 	/// * `value` data written
+	#[inline(always)]
 	fn store_doubleword_raw(&mut self, p_address: u64, value: u64) {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(7) > effective_address {
@@ -771,6 +932,7 @@ impl Mmu {
 	// translate_address_walk below, body untouched). A hit is one array
 	// compare; a successful miss fills the entry for next time. DontCare
 	// accesses and bare (no-translation) mode bypass the TLB.
+	#[inline(always)]
 	fn translate_address(&mut self, v_address: u64, access_type: &MemoryAccessType) -> Result<u64, ()> {
 		let ti = match access_type {
 			MemoryAccessType::Execute => TLB_EXECUTE,
@@ -797,6 +959,7 @@ impl Mmu {
 		result
 	}
 
+	#[cold]
 	fn translate_address_walk(&mut self, v_address: u64, access_type: &MemoryAccessType) -> Result<u64, ()> {
 		let address = self.get_effective_address(v_address);
 		let v_page = address & !0xfff;
@@ -1050,7 +1213,9 @@ pub struct MemoryWrapper {
 	// DRAM write funnels through this wrapper) bumps code_gen, which every
 	// cached entry's meta embeds, killing them all at once.
 	exec_page_marks: Vec<u8>,
-	code_gen: u32
+	code_gen: u32,
+	fb_writes: u64,
+	fb_bytes: u64
 }
 
 impl MemoryWrapper {
@@ -1058,7 +1223,9 @@ impl MemoryWrapper {
 		MemoryWrapper {
 			memory: Memory::new(),
 			exec_page_marks: vec![],
-			code_gen: 1
+			code_gen: 1,
+			fb_writes: 0,
+			fb_bytes: 0
 		}
 	}
 
@@ -1067,8 +1234,29 @@ impl MemoryWrapper {
 		self.exec_page_marks = vec![0; ((capacity + 0xfff) >> 12) as usize]; // risc-box patch
 	}
 
+	// risc-box patch (debug aid): count stores landing in the framebuffer's
+	// physical window; boot-bench polls the delta to tell "guest stopped
+	// writing the fb" apart from "writes are being diverted elsewhere".
+	pub fn fb_writes(&self) -> u64 {
+		self.fb_writes
+	}
+
+	// risc-box patch (measurement): BYTES stored into the framebuffer window.
+	// Frame rate is the honest question for a game, and a presented frame is
+	// exactly w*h*4 bytes of blit, so bytes/frame-bytes counts frames without
+	// the guest having to cooperate — stores alone cannot, since the width of
+	// a store varies with how the blitter was compiled.
+	pub fn fb_bytes(&self) -> u64 {
+		self.fb_bytes
+	}
+
 	// risc-box patch: bump code_gen if this write can touch a marked page.
+	#[inline(always)]
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
+		if p_address >= 0x87e0_0000 && p_address < 0x8810_0000 {
+			self.fb_writes = self.fb_writes.wrapping_add(1);
+			self.fb_bytes = self.fb_bytes.wrapping_add(width);
+		}
 		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let hit = match self.exec_page_marks.get(first) {
@@ -1121,35 +1309,41 @@ impl MemoryWrapper {
 		self.memory.read_range(p_address - DRAM_BASE, out)
 	}
 
+	#[inline(always)]
 	pub fn read_byte(&mut self, p_address: u64) -> u8 {
 		debug_assert!(p_address >= DRAM_BASE, "Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
 		self.memory.read_byte(p_address - DRAM_BASE)
 	}
 
+	#[inline(always)]
 	pub fn read_halfword(&mut self, p_address: u64) -> u16 {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(1) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
 		self.memory.read_halfword(p_address - DRAM_BASE)
 	}
 
+	#[inline(always)]
 	pub fn read_word(&mut self, p_address: u64) -> u32 {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(3) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
 		self.memory.read_word(p_address - DRAM_BASE)
 	}
 
+	#[inline(always)]
 	pub fn read_doubleword(&mut self, p_address: u64) -> u64 {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(7) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
 		self.memory.read_doubleword(p_address - DRAM_BASE)
 	}
 
+	#[inline(always)]
 	pub fn write_byte(&mut self, p_address: u64, value: u8) {
 		debug_assert!(p_address >= DRAM_BASE, "Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
 		self.snoop_exec(p_address, 1); // risc-box patch
 		self.memory.write_byte(p_address - DRAM_BASE, value)
 	}
 
+	#[inline(always)]
 	pub fn write_halfword(&mut self, p_address: u64, value: u16) {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(1) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
@@ -1157,6 +1351,7 @@ impl MemoryWrapper {
 		self.memory.write_halfword(p_address - DRAM_BASE, value)
 	}
 
+	#[inline(always)]
 	pub fn write_word(&mut self, p_address: u64, value: u32) {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(3) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);
@@ -1164,6 +1359,7 @@ impl MemoryWrapper {
 		self.memory.write_word(p_address - DRAM_BASE, value)
 	}
 
+	#[inline(always)]
 	pub fn write_doubleword(&mut self, p_address: u64, value: u64) {
 		debug_assert!(p_address >= DRAM_BASE && p_address.wrapping_add(7) >= DRAM_BASE,
 			"Memory address must equals to or bigger than DRAM_BASE. {:X}", p_address);

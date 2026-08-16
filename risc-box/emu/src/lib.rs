@@ -3,9 +3,16 @@ const TEST_MEMORY_CAPACITY: u64 = 1024 * 512;
 // risc-box patch: 512 MiB (was 128). A desktop guest needs it — Xorg's
 // System()/fork of xkbcomp during keyboard init fails silently under 128 MiB
 // (heuristic overcommit refuses to commit the forked address space of the
-// large X process, so the child never runs and X aborts). Must match the DTB
-// `memory@80000000` size. The framebuffer (0x87e00000, reserved) stays inside.
-const PROGRAM_MEMORY_CAPACITY: u64 = 1024 * 1024 * 512; // big enough for a Linux desktop
+// large X process, so the child never runs and X aborts). The DTB's
+// `memory@80000000` size cell is synced to the allocation at init (mmu.rs);
+// the framebuffer (0x87e00000, reserved) stays inside.
+const PROGRAM_MEMORY_CAPACITY: u64 = 1024 * 1024 * 512; // default; see setup_ram_bytes()
+// Guest RAM is overridable per machine via setup_ram_bytes() (risc-box wires it to the
+// deployment config's `ramMiB`; 512 MiB default). Ceilings, measured 2026-08-13: RAM is
+// ONE contiguous Vec and Rust caps a single allocation at isize::MAX (2 GiB on wasm32) —
+// 2.5 GiB panics `capacity overflow` on any engine, so the usable max is just under 2 GiB.
+// Separately, TOTAL linear memory (this Vec + the fs image Vec + overhead) needs a
+// wasmtime 49+ engine: 47 refuses growth past ~1.5 GiB total.
 
 extern crate fnv;
 
@@ -19,6 +26,8 @@ pub mod memory;
 pub mod mmu;
 pub mod elf_analyzer;
 pub mod device;
+#[cfg(feature = "jit")]
+pub mod jit; // risc-box patch: PLATFORM-JIT.md translator (feature-gated)
 
 use cpu::{Cpu, Xlen};
 use elf_analyzer::{ElfAnalyzer};
@@ -39,6 +48,9 @@ use terminal::Terminal;
 /// ```
 pub struct Emulator {
 	cpu: Cpu,
+
+	// risc-box patch: per-machine RAM override (bytes); None = PROGRAM_MEMORY_CAPACITY.
+	ram_bytes: Option<u64>,
 
 	/// Stores mapping from symbol to virtual address
 	symbol_map: FnvHashMap::<String, u64>,
@@ -62,6 +74,8 @@ impl Emulator {
 	pub fn new(terminal: Box<dyn Terminal>) -> Self {
 		Emulator {
 			cpu: Cpu::new(terminal),
+
+			ram_bytes: None,
 
 			symbol_map: FnvHashMap::default(),
 
@@ -139,6 +153,20 @@ impl Emulator {
 		self.cpu.tick();
 	}
 
+	/// risc-box patch: runs `n` instructions in one call — the per-call and
+	/// per-instruction loop overhead is amortized inside Cpu::run, and a
+	/// WFI-parked guest consumes the batch without spinning. Embedders'
+	/// tick-batches should call this instead of tick() in a loop.
+	pub fn run_n(&mut self, n: u64) {
+		self.cpu.run(n);
+	}
+
+	/// risc-box patch (blockstats feature): coverage histogram dump.
+	#[cfg(feature = "blockstats")]
+	pub fn dump_block_stats(&mut self) {
+		self.cpu.dump_block_stats();
+	}
+
 	/// Sets up program run by the program. This method analyzes the passed content
 	/// and configure CPU properly. If the passed contend doesn't seem ELF file,
 	/// it panics. This method is expected to be called only once.
@@ -204,7 +232,8 @@ impl Emulator {
 			self.cpu.get_mut_mmu().init_memory(TEST_MEMORY_CAPACITY);
 		} else {
 			self.is_test = false;
-			self.cpu.get_mut_mmu().init_memory(PROGRAM_MEMORY_CAPACITY);
+			let ram = self.ram_bytes.unwrap_or(PROGRAM_MEMORY_CAPACITY);
+			self.cpu.get_mut_mmu().init_memory(ram);
 		}
 
 		for i in 0..program_data_section_headers.len() {
@@ -275,6 +304,34 @@ impl Emulator {
 	///
 	/// # Arguments
 	/// * `content` DTB content binary
+	/// risc-box patch: sets guest RAM size in bytes. Call BEFORE setup_program()
+	/// (which allocates the memory). The DTB memory@80000000 node is patched to
+	/// match when memory is initialized, so the kernel and the Vec agree.
+	pub fn setup_ram_bytes(&mut self, bytes: u64) {
+		self.ram_bytes = Some(bytes);
+	}
+
+	/// risc-box patch: the guest's clock, in its own 10 MHz ticks — what
+	/// `rdtime` returns. Compared against the host's elapsed time it says
+	/// directly whether the guest is living faster or slower than the world.
+	pub fn guest_mtime(&self) -> u64 {
+		self.cpu.get_mmu().get_clint().read_mtime()
+	}
+
+	/// risc-box patch: set the simple-framebuffer's resolution (see
+	/// `Mmu::set_dtb_framebuffer`). Call before boot; returns false if the size
+	/// was rejected, in which case the default 1024x768 still stands.
+	pub fn set_framebuffer_size(&mut self, width: u32, height: u32) -> bool {
+		self.cpu.get_mut_mmu().set_dtb_framebuffer(width, height)
+	}
+
+	/// risc-box patch: run the guest's clock off the host's monotonic clock
+	/// rather than off retired instructions (see `Clint::set_wall_clock`).
+	/// Call before the guest boots: the kernel reads the timebase once.
+	pub fn set_wall_clock(&mut self, on: bool) {
+		self.cpu.get_mut_mmu().get_mut_clint().set_wall_clock(on);
+	}
+
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
 		self.cpu.get_mut_mmu().init_dtb(content);
 	}
@@ -328,6 +385,17 @@ impl Emulator {
 	/// risc-box patch: bulk read of guest PHYSICAL memory, no side effects —
 	/// the framebuffer scanout path (the app reads the simple-framebuffer
 	/// region the default DTB reserves at the top of DRAM).
+	// risc-box patch (debug aid): stores that landed in the framebuffer window.
+	pub fn fb_writes(&self) -> u64 {
+		self.cpu.get_mmu().fb_writes()
+	}
+
+	// risc-box patch (measurement): framebuffer bytes painted, the numerator of
+	// an honest frame rate (see MemoryWrapper::fb_bytes).
+	pub fn fb_bytes(&self) -> u64 {
+		self.cpu.get_mmu().fb_bytes()
+	}
+
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
 		self.cpu.get_mmu().read_physical_range(p_address, out);
 	}

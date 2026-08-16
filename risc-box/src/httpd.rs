@@ -160,6 +160,25 @@ impl Server {
             .count()
     }
 
+    /// Bytes still queued for the SLOWEST subscriber of `topic`.
+    ///
+    /// A producer of frames has to know this or it does the wrong thing twice
+    /// over. Without it, a stream that outruns the link fills `wbuf` until the
+    /// client trips MAX_WBUF and gets CLOSED — a viewer far enough away is
+    /// disconnected for the crime of being far away, which is exactly what
+    /// happened to the display stream through the relay: locally the loopback
+    /// drained instantly and nothing ever backed up, so it looked perfect.
+    /// A picture stream is lossy by nature; the right answer to a watcher that
+    /// cannot keep up is fewer frames, not no connection.
+    pub fn sse_backlog(&self, topic: &str) -> usize {
+        self.conns
+            .iter()
+            .filter(|c| matches!(&c.state, ConnState::Sse { topic: t, .. } if t == topic))
+            .map(|c| c.wbuf.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// One pass: accept, read, parse. Returns complete requests as
     /// (conn_key, Request); answer each with respond()/upgrade_sse() before
     /// the next poll (a key is only stable until then).

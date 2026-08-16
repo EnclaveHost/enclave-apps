@@ -104,9 +104,17 @@ cp set/main.c "$WORK/link/main.c"
 # Raising it costs nothing: the engine still enforces the real per-deployment
 # ceiling, so this only stops the LINKER from being the smaller of the two.
 # Passed after the wrapper's own flag, which is what makes it win.
+#
+# Now at the wasm32 maximum (4 GiB = 65536 pages) rather than 3 GiB, because a
+# configurable `ramMiB` moved the ceiling within reach: booting the alpine
+# desktop image (528 MiB) with ramMiB=1792 peaks at ~2.85 GiB, since the disk
+# is briefly held twice while virtio packs it into u64 cells. That left ~220
+# MiB for everything else, and a shared memory can NEVER grow past its
+# link-time max — so a fetch retry or a larger image would trap. The engine's
+# own -W max-memory-size (the deployment's RAM slice) is the real limit.
 docker run --rm -v "$PWD/$WORK/link":/src "$IMG" \
   main.c librisc_box.a -O2 -Wl,--export=cabi_realloc -Wl,-z,stack-size=1048576 \
-  -Wl,--max-memory=3221225472 -o out.wasm
+  -Wl,--max-memory=4294967296 -o out.wasm
 cp "$WORK/link/out.wasm" "$OUT"
 
 python3 - "$OUT" <<'PY'
