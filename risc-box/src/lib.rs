@@ -1189,10 +1189,19 @@ pub fn run() {
         let mut busy = false;
         if app.phase == Phase::Running {
             if let Some(emu) = app.emu.as_mut() {
-                let batch = match app.input_boost == 0 && emu.get_cpu().is_idle() {
+                let parked = app.input_boost == 0 && emu.get_cpu().is_idle();
+                let batch = match parked {
                     true => IDLE_BATCH,
                     false => TICK_BATCH,
                 };
+                // A guest that is RUNNING has already paced this turn: it just
+                // spent a full batch of real work, and the loop must not add a
+                // sleep on top. `busy` used to be set only by console bytes and
+                // encoded frames, so a compute-bound guest that prints nothing
+                // — a game, a build, a long boot phase — was silently throttled
+                // by a millisecond every turn. At the ~6 ms a batch takes that
+                // is a quarter of the machine, given away for nothing.
+                busy = !parked;
                 app.input_boost = app.input_boost.saturating_sub(1);
                 // batched entry point: per-instruction loop overhead is
                 // amortized inside the emulator, and a WFI-parked guest
