@@ -1,4 +1,4 @@
-# The DOOM machine's guest side
+# DOOM on the RISC Box desktop
 
 What turns the Alpine image into a machine that plays Freedoom at the engine's
 own 35 fps. Two files, and neither of them is emulator work: the frame budget
@@ -76,3 +76,38 @@ the app's `/console` stream carries it to the browser.
 
 The WAD is already at `/usr/share/games/doom/freedoom1.wad` in the Alpine
 desktop image.
+
+## i_video_x11raw.c — the one that runs on the desktop
+
+`i_video_rbfb.c` above owns the whole screen. This one is an ordinary X client
+on the shipped Alpine desktop, in a window, with the screen left at 1024x768 —
+and it is the interesting measurement, because it isolates how much of DOOM's
+cost on this machine was never DOOM.
+
+Measured in the app's wasm build, same guest, same screen, same window:
+
+| what draws the window | instructions/frame | fps |
+|---|---|---|
+| chocolate-doom 640x480 (SDL) | 8.5M | 16 |
+| xdoom 640x400, PutImage | 4.2M | 28 |
+| xdoom 640x400, MIT-SHM | 2.9M | **45** |
+| xdoom 960x600, MIT-SHM | 4.8M | 25 |
+
+Three things account for the difference, none of them emulator work:
+
+1. **The palette lookup is fused into the scale**, and a doubled pixel pair is
+   one 64-bit store. SDL converts 8-bit to ARGB into a surface, then blits that
+   through a generic scaler into a differently-formatted surface: about twenty
+   emulated instructions per presented pixel against about two.
+2. **MIT-SHM.** Without it the frame is copied into the socket by the client
+   and out of it by the server — two copies of 1 MB, per frame, worth 1.3M
+   instructions. With it the scale writes where the server can already see, and
+   a frame is a 40-byte request. Two buffers alternate, with ShmCompletion
+   telling us when one is free again.
+3. **No Xlib.** Speaking the protocol directly means no per-frame library
+   buffering or format negotiation, and a static binary that does not care that
+   the guest is musl and the toolchain is glibc.
+
+What is left per frame is DOOM's own renderer (~1.2M) plus the server's blit
+out of shared memory into the framebuffer (~4 instructions per pixel, which is
+Xorg's to own).

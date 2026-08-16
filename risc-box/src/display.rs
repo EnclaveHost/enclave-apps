@@ -225,7 +225,18 @@ impl Display {
 
     fn band(&self, y: usize, h: usize) -> Band {
         let rows = &self.frame[y * fb_stride()..(y + h) * fb_stride()];
-        Band { y, h, z: miniz_oxide::deflate::compress_to_vec(rows, 6) }
+        // A big band is a moving picture, and there the limit on what a watcher
+        // sees is how fast this can be produced, not how fast it can be sent:
+        // one frame is in flight at a time, so the deflate time IS the frame
+        // interval. Level 1 runs about three times faster for about a quarter
+        // more bytes, which is the right trade at 30 frames a second and the
+        // wrong one for a text screen changing a single line — where the bytes
+        // are few, the time is nothing, and level 6 compresses text far better.
+        let level = match rows.len() > 256 * 1024 {
+            true => 1,
+            false => 6,
+        };
+        Band { y, h, z: miniz_oxide::deflate::compress_to_vec(rows, level) }
     }
 
     /// The current frame as a PNG (fresh scan first so a GET with no SSE
