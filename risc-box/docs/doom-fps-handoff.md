@@ -86,10 +86,16 @@ a menu or the demo-loop wipe.
    changed), the row hash reads u64 instead of u8, and the scan gates on
    `Server::sse_backlog` so frames are produced at the rate the link takes
    instead of filling `MAX_WBUF` and closing the connection.
-5. **`DEVICE_TICK_INTERVAL` 16 -> 32**: +4.3-4.6% in wasm (87.2-87.4 -> 91.2
-   MIPS over a deterministic 3G-instruction boot). The README kept it at 16
-   because the UART drains on a 16-cycle cadence and 64 visibly corrupts the
-   console; 32 was checked against a full boot's console output and is clean.
+5. **`DEVICE_TICK_INTERVAL` 16 -> 32**: **+1.8%**, measured as four
+   INTERLEAVED A/B pairs on two saved binaries (tick16: 87.4 88.5 87.7 87.9;
+   tick32: 89.6 89.3 89.7 89.3 — consistent, the two sets do not overlap).
+   Two earlier non-interleaved runs put this at +4.3-4.6% (87.2-87.4 -> 91.2);
+   that was wrong. The same code measures 91.2 in one session and 88.5 in
+   another, so a baseline taken minutes apart drifts about as much as the
+   effect. **Interleave, or do not claim a single-digit percentage.** The
+   README kept the interval at 16 because the UART drains on a 16-cycle
+   cadence and 64 visibly corrupts the console; 32 was checked against a full
+   boot's console output and is clean.
 6. **xdoom uploads only the source rows DOOM redrew.** It redraws its whole
    320x200 buffer every frame including the status bar, which changes when the
    player's health does and not otherwise. Comparing 320 bytes a row is nothing
@@ -139,6 +145,10 @@ a menu or the demo-loop wipe.
   number means nothing.
 - boot-bench's fixed-instruction run is the only deterministic A/B rig for the
   emulator: `boot-bench.wasm <kernel> <rootfs> --ram-mib 1792 --insns 3_000_000_000`.
+  It is deterministic in INSTRUCTIONS, not in wall time: the same binary
+  measured 91.2 MIPS in one session and 88.5 in another. Build both arms,
+  save them as separate .wasm files, and run them A/B/A/B — a control taken
+  before a rebuild is worth nothing at this effect size.
 
 ## What is left
 
