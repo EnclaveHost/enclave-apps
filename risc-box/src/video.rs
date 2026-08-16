@@ -29,7 +29,7 @@
 
 use riscv_emu_rust::Emulator;
 
-use crate::display::{FB_BASE, FB_BYTES, FB_H, FB_STRIDE, FB_W};
+use crate::display::{fb_bytes, fb_h, fb_stride, fb_w, FB_BASE};
 
 /// One encoded frame and whether it is a keyframe (self-contained). Motion
 /// JPEG frames are all keyframes; an inter-frame codec (H.264) marks only IDR
@@ -89,7 +89,7 @@ pub fn rgb_to_i420(rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>
 /// never involved in — a native-speed copy out of guest RAM plus a channel
 /// swap. Returns `(rgb, w, h)`.
 pub fn capture_rgb(emu: &Emulator) -> (Vec<u8>, usize, usize) {
-    let mut fresh = vec![0u8; FB_BYTES];
+    let mut fresh = vec![0u8; fb_bytes()];
     emu.read_physical_range(FB_BASE, &mut fresh);
     let (rgb, w, h) = rgb_from_capture(&fresh);
     (rgb, w, h)
@@ -101,16 +101,16 @@ pub fn capture_rgb(emu: &Emulator) -> (Vec<u8>, usize, usize) {
 /// band diff and the encoder work from that copy — on another thread, where
 /// neither of them is charged to the guest.
 pub fn rgb_from_capture(fresh: &[u8]) -> (Vec<u8>, usize, usize) {
-    let mut rgb = Vec::with_capacity(FB_W * FB_H * 3);
-    for y in 0..FB_H {
-        let row = &fresh[y * FB_STRIDE..(y + 1) * FB_STRIDE];
+    let mut rgb = Vec::with_capacity(fb_w() * fb_h() * 3);
+    for y in 0..fb_h() {
+        let row = &fresh[y * fb_stride()..(y + 1) * fb_stride()];
         for px in row.chunks_exact(4) {
             rgb.push(px[2]); // R
             rgb.push(px[1]); // G
             rgb.push(px[0]); // B
         }
     }
-    (rgb, FB_W, FB_H)
+    (rgb, fb_w(), fb_h())
 }
 
 /// Motion JPEG: each frame is an independent baseline JPEG. The first real

@@ -311,6 +311,27 @@ impl Emulator {
 		self.ram_bytes = Some(bytes);
 	}
 
+	/// risc-box patch: the guest's clock, in its own 10 MHz ticks — what
+	/// `rdtime` returns. Compared against the host's elapsed time it says
+	/// directly whether the guest is living faster or slower than the world.
+	pub fn guest_mtime(&self) -> u64 {
+		self.cpu.get_mmu().get_clint().read_mtime()
+	}
+
+	/// risc-box patch: set the simple-framebuffer's resolution (see
+	/// `Mmu::set_dtb_framebuffer`). Call before boot; returns false if the size
+	/// was rejected, in which case the default 1024x768 still stands.
+	pub fn set_framebuffer_size(&mut self, width: u32, height: u32) -> bool {
+		self.cpu.get_mut_mmu().set_dtb_framebuffer(width, height)
+	}
+
+	/// risc-box patch: run the guest's clock off the host's monotonic clock
+	/// rather than off retired instructions (see `Clint::set_wall_clock`).
+	/// Call before the guest boots: the kernel reads the timebase once.
+	pub fn set_wall_clock(&mut self, on: bool) {
+		self.cpu.get_mut_mmu().get_mut_clint().set_wall_clock(on);
+	}
+
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
 		self.cpu.get_mut_mmu().init_dtb(content);
 	}
@@ -367,6 +388,12 @@ impl Emulator {
 	// risc-box patch (debug aid): stores that landed in the framebuffer window.
 	pub fn fb_writes(&self) -> u64 {
 		self.cpu.get_mmu().fb_writes()
+	}
+
+	// risc-box patch (measurement): framebuffer bytes painted, the numerator of
+	// an honest frame rate (see MemoryWrapper::fb_bytes).
+	pub fn fb_bytes(&self) -> u64 {
+		self.cpu.get_mmu().fb_bytes()
 	}
 
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {

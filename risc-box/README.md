@@ -117,6 +117,9 @@ JSON object:
   "credentials": { "accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "..." },
   "autostart": false,
   "readOnly": false,
+  "ramMiB": 512,
+  "display": { "width": 1024, "height": 768 },
+  "realtime": false,
   "net": { "forwards": [ { "listen": 2222, "to": 22 } ] },
   "api_key": "$RISCBOX_API_KEY"
 }
@@ -146,6 +149,16 @@ JSON object:
   customizes both: `forwards` sets the port list, `"outbound": false` seals
   the machine to inbound-only (it can then exfiltrate nothing by itself). See
   Networking below.
+- `display` sets the simple-framebuffer's resolution (default 1024x768; must be
+  even and fit the DTB's 3 MiB window). The emulator rewrites the device tree
+  node and the app scans out the same shape, so the two can never disagree. It
+  is worth setting, because **every pixel is paid for three times**: the guest
+  draws it, the scan reads it back, the encoder ships it. A machine whose job is
+  a 320x200 game spends nine tenths of that work on borders at 1024x768. The
+  browser scales whatever it is given to a 4:3 window, so a small framebuffer is
+  cheap to run without being small to look at.
+- `realtime` runs the guest's clock off the **host's monotonic clock** instead
+  of off retired instructions (default false; see *What time it is inside*).
 - `api_key` is optional but **required for safety on a public deployment**:
   when set (use a `$VAR` secret, not a literal), every endpoint that drives or
   observes the machine (`/start`, `/stop`, `/save`, `/input`, `/console`,
@@ -165,7 +178,7 @@ JSON object:
 |-------------------|----------------------------------------------------------------------|
 | `GET /`           | console UI (self-contained HTML + embedded xterm)                    |
 | `GET /a/<asset>`  | embedded `xterm.js` / `xterm.css`                                    |
-| `GET /status`     | JSON: phase, image sizes, instructions retired, MIPS, console bytes  |
+| `GET /status`     | JSON: phase, image sizes, instructions retired, MIPS, frames presented (`fps`) and shipped (`sentFps`), display mode, console bytes |
 | `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?}`: fetch from S3 and boot; `reset:true` re-fetches instead of using the cached images |
 | `POST /input`     | **raw bytes** in the body → the guest UART receive register          |
 | `GET /console`    | Server-Sent Events: base64 console output, scrollback replayed first |
@@ -341,6 +354,67 @@ shell: `ping -c 3 8.8.8.8` (3/3 replies in 0.7 s wall), `nslookup` through
 the `10.0.2.2` proxy and directly against `8.8.8.8` (UDP NAT), an HTTP body
 fetched from the real internet over the TCP splice, and a dial to a closed
 port answered with a fast RST.
+
+## What time it is inside
+
+The device tree advertises a 10 MHz timebase, and `mtime` — the register behind
+`rdtime`, the kernel's clocksource and every `gettimeofday` in the guest —
+advances by one tick per retired instruction. That makes a boot deterministic,
+which is exactly what the benchmark below wants. It also means **the guest's
+second is not a second**: at the 130 MIPS this interpreter now retires, ten
+million ticks pass in 77 ms, so the machine lives thirteen seconds for every one
+of ours.
+
+Nothing that only computes can tell. Everything that paces itself off the clock
+can: `sleep 1` returns in 77 ms, a kernel takes thirteen times HZ timer
+interrupts per real second, and a game runs at thirteen times speed while
+looking perfectly correct from inside. It is also why an in-guest frame counter
+cannot answer "how fast is this really" — it is measuring a ruler that stretches
+with the thing it measures.
+
+`realtime: true` swaps the source: `mtime` becomes the host's monotonic clock at
+the same 10 MHz, resampled every few thousand instructions (a clock read per
+instruction would cost more than the instruction). Then a guest second is a
+second, `sleep 1` takes one, the kernel's timer interrupt rate drops by that
+same factor of thirteen — real work, not just honesty — and a frame rate
+measured in the guest means what it says.
+
+The cost is determinism: with time coming from outside, interrupts land at
+host-dependent points and the instruction count to reach a marker stops being
+repeatable. So it is a knob, not a default, and `boot-bench --realtime` matches
+it for measuring anything that involves time.
+
+## A game, at the speed a game should run
+
+The machine plays DOOM. Freedoom Phase 1, running on the framebuffer of a
+RISC-V Linux that is itself an interpreter inside a TEE, at **35 frames per
+second** — the rate the DOOM engine itself tops out at, since its world advances
+35 tics a second and it has no frame to draw between them.
+
+Getting there was not emulator work. Measured against the same guest, same
+emulator, in the app's own wasm build:
+
+| what the guest ran | instructions per frame | frames per real second |
+|---|---|---|
+| chocolate-doom, 640x480 window, X11 + fluxbox, 1024x768 screen | 12.6M | 14 |
+| fbdoom straight to /dev/fb0, 320x200 screen | 1.6M | 35 (engine cap) |
+
+Nearly eight times the per-frame cost was the X server, SDL's scaler and the
+window manager — a chain in which the game's own renderer was the cheapest
+link. DOOM draws 320x200; the X path then scaled that to 640x480, converted it,
+pushed it through the X protocol, and had Xorg blit it into a 1024x768
+framebuffer, which the app then had to scan and deflate in full. Deleting the
+chain — a 400-line video backend that mmaps `/dev/fb0`, fuses the palette lookup
+into the scale, and reads the keyboard straight off evdev — leaves the game
+paying for its own pixels and nothing else.
+
+Two numbers, not one, describe what a viewer gets, and `/status` reports both:
+`fps` is what the guest presented (framebuffer bytes painted ÷ bytes per frame,
+so it counts what actually reached the screen rather than what the guest claims)
+and `sentFps` is what the scan shipped to watchers. On the single-threaded
+build the second is the smaller one — the scan is paced by what it costs, and it
+costs the same thread the guest runs on — which is precisely what the SET
+worker below exists to fix.
 
 ## Watching the machine costs the machine
 

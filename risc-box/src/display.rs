@@ -26,12 +26,47 @@
 //! per-pixel work outside a dirty band).
 
 use riscv_emu_rust::Emulator;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FB_BASE: u64 = 0x87e0_0000;
-pub const FB_W: usize = 1024;
-pub const FB_H: usize = 768;
-pub const FB_STRIDE: usize = FB_W * 4;
-pub const FB_BYTES: usize = FB_STRIDE * FB_H;
+/// The DTB's simple-framebuffer window: 4 MiB reserved, of which a frame may
+/// use 3 MiB (1024x768x4, the largest mode).
+pub const FB_MAX_BYTES: usize = 0x30_0000;
+
+/// The display's size, fixed for the life of the process by `set_size` before
+/// the machine boots (it has to agree with the DTB node the guest kernel reads
+/// once, at boot).
+///
+/// It is a knob because every pixel is paid for three times — the guest draws
+/// it, the scan reads it back, the encoder ships it — so a machine running a
+/// 320x200 game at 1024x768 spends nine tenths of that work on borders.
+static FB_W_CELL: AtomicUsize = AtomicUsize::new(1024);
+static FB_H_CELL: AtomicUsize = AtomicUsize::new(768);
+
+pub fn fb_w() -> usize {
+    FB_W_CELL.load(Ordering::Relaxed)
+}
+pub fn fb_h() -> usize {
+    FB_H_CELL.load(Ordering::Relaxed)
+}
+pub fn fb_stride() -> usize {
+    fb_w() * 4
+}
+pub fn fb_bytes() -> usize {
+    fb_stride() * fb_h()
+}
+
+/// Returns false, changing nothing, for a size that would not fit the reserved
+/// window — the same guard the emulator applies to the DTB, so the app and the
+/// guest can never disagree about the shape of the screen.
+pub fn set_size(w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 || w % 2 != 0 || w * h * 4 > FB_MAX_BYTES {
+        return false;
+    }
+    FB_W_CELL.store(w, Ordering::Relaxed);
+    FB_H_CELL.store(h, Ordering::Relaxed);
+    true
+}
 /// Slowest the scan is allowed to get, and the floor the AV1 path paces
 /// against. Also the cadence a scan falls back to when it is expensive.
 pub const FB_SCAN_MS: u64 = 100;
@@ -85,9 +120,9 @@ pub struct Display {
 impl Display {
     pub fn new() -> Self {
         Display {
-            frame: vec![0; FB_BYTES],
-            scratch: vec![0; FB_BYTES],
-            row_hash: vec![0; FB_H],
+            frame: vec![0; fb_bytes()],
+            scratch: vec![0; fb_bytes()],
+            row_hash: vec![0; fb_h()],
             force_full: true,
             primed: false,
         }
@@ -126,7 +161,7 @@ impl Display {
     /// as small as possible. Everything expensive (hashing, diffing,
     /// deflating) is in `bands` and can run anywhere.
     pub fn capture(emu: &Emulator, out: &mut Vec<u8>) {
-        out.resize(FB_BYTES, 0);
+        out.resize(fb_bytes(), 0);
         emu.read_physical_range(FB_BASE, out);
     }
 
@@ -134,10 +169,10 @@ impl Display {
     /// back the frame it replaced, so a caller holding a buffer pool can keep
     /// recycling two buffers forever instead of allocating megabytes per scan.
     pub fn bands(&mut self, mut frame: Vec<u8>) -> (Vec<Band>, Vec<u8>) {
-        let mut dirty = vec![false; FB_H];
+        let mut dirty = vec![false; fb_h()];
         let mut any = false;
-        for y in 0..FB_H {
-            let h = fnv1a(&frame[y * FB_STRIDE..(y + 1) * FB_STRIDE]);
+        for y in 0..fb_h() {
+            let h = fnv1a(&frame[y * fb_stride()..(y + 1) * fb_stride()]);
             if h != self.row_hash[y] || !self.primed {
                 self.row_hash[y] = h;
                 dirty[y] = true;
@@ -151,7 +186,7 @@ impl Display {
         // caller as the next capture target.
         std::mem::swap(&mut self.frame, &mut frame);
         if full {
-            return (vec![self.band(0, FB_H)], frame);
+            return (vec![self.band(0, fb_h())], frame);
         }
         if !any {
             return (Vec::new(), frame);
@@ -164,7 +199,7 @@ impl Display {
         // (fewer events beats a few clean rows re-sent inside a run)
         let mut bands = Vec::new();
         let mut y = 0usize;
-        while y < FB_H {
+        while y < fb_h() {
             if !dirty[y] {
                 y += 1;
                 continue;
@@ -173,7 +208,7 @@ impl Display {
             let mut end = y + 1; // exclusive
             let mut gap = 0usize;
             let mut z = end;
-            while z < FB_H && gap < 8 {
+            while z < fb_h() && gap < 8 {
                 if dirty[z] {
                     end = z + 1;
                     gap = 0;
@@ -189,20 +224,20 @@ impl Display {
     }
 
     fn band(&self, y: usize, h: usize) -> Band {
-        let rows = &self.frame[y * FB_STRIDE..(y + h) * FB_STRIDE];
+        let rows = &self.frame[y * fb_stride()..(y + h) * fb_stride()];
         Band { y, h, z: miniz_oxide::deflate::compress_to_vec(rows, 6) }
     }
 
     /// The current frame as a PNG (fresh scan first so a GET with no SSE
     /// watcher still sees live pixels).
     pub fn png(&mut self, emu: &Emulator) -> Vec<u8> {
-        let mut fresh = vec![0u8; FB_BYTES];
+        let mut fresh = vec![0u8; fb_bytes()];
         emu.read_physical_range(FB_BASE, &mut fresh);
         // raw scanlines: filter byte 0 + RGB (drop X, reorder BGR -> RGB)
-        let mut raw = Vec::with_capacity(FB_H * (1 + FB_W * 3));
-        for y in 0..FB_H {
+        let mut raw = Vec::with_capacity(fb_h() * (1 + fb_w() * 3));
+        for y in 0..fb_h() {
             raw.push(0u8);
-            let row = &fresh[y * FB_STRIDE..(y + 1) * FB_STRIDE];
+            let row = &fresh[y * fb_stride()..(y + 1) * fb_stride()];
             for px in row.chunks_exact(4) {
                 raw.push(px[2]); // R
                 raw.push(px[1]); // G
@@ -213,8 +248,8 @@ impl Display {
         let mut png = Vec::with_capacity(idat.len() + 64);
         png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
         let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&(FB_W as u32).to_be_bytes());
-        ihdr.extend_from_slice(&(FB_H as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(fb_w() as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(fb_h() as u32).to_be_bytes());
         ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolor, deflate, filter 0, no interlace
         chunk(&mut png, b"IHDR", &ihdr);
         chunk(&mut png, b"IDAT", &idat);

@@ -200,7 +200,15 @@ function setGeometry(w, h) {
   if (fbCanvas.width !== w || fbCanvas.height !== h) {
     fbCanvas.width = w;
     fbCanvas.height = h;
-    fbCanvas.style.maxWidth = w + "px";
+    // Presented at 4:3 whatever the guest's pixel grid is. Every mode this
+    // machine offers is meant for a 4:3 screen — 1024x768 and 800x600 already
+    // are one, and 640x400 is DOOM's 320x200 doubled, which was always meant
+    // to be stretched. Scaling is the browser's job and costs the guest
+    // nothing, so a small framebuffer is cheap to run without being small to
+    // look at.
+    fbCanvas.style.maxWidth = Math.max(w, 960) + "px";
+    fbCanvas.style.aspectRatio = "4 / 3";
+    fbCanvas.style.height = "auto";
   }
   const g = $("dispgeom");
   if (g) g.textContent = w + "×" + h;

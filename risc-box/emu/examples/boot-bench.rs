@@ -80,6 +80,9 @@ fn main() {
     let mut ram_mib: u64 = 0; // 0 = emulator default (512 MiB)
     let mut until: Option<String> = None;
     let mut echo = false;
+    let mut fps_frame_bytes: Option<u64> = None;
+    let mut realtime = false;
+    let mut fb_size: Option<(u32, u32)> = None;
     // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
     // the code's start address + size, then log every executed instruction in
     // that range (pc offset + which registers changed to what) to FILE. This
@@ -107,6 +110,26 @@ fn main() {
                 // same way. The Alpine desktop runs the fleet at 1792.
                 i += 1;
                 ram_mib = args[i].parse().expect("--ram-mib takes MiB");
+            }
+            "--realtime" => realtime = true,
+            "--fb" => {
+                // W:H -- the simple-framebuffer's resolution, as the app's
+                // display config sets it on the fleet.
+                i += 1;
+                let (w, h) = args[i].split_once(':').expect("--fb W:H");
+                fb_size = Some((w.parse::<u32>().expect("width"), h.parse::<u32>().expect("height")));
+            }
+            "--fps" => {
+                // W:H -- report presented frames per WALL second, counted as
+                // framebuffer bytes painted divided by the bytes one frame of
+                // a W*H window costs. Guest-side timing cannot answer this:
+                // the guest's clock is driven by retired instructions, so a
+                // slow emulator makes the guest believe time slowed down too.
+                i += 1;
+                let (w, h) = args[i].split_once(':').expect("--fps W:H");
+                fps_frame_bytes = Some(
+                    w.parse::<u64>().expect("width") * h.parse::<u64>().expect("height") * 4,
+                );
             }
             "--until" => {
                 i += 1;
@@ -242,6 +265,10 @@ fn main() {
     if ram_mib > 0 {
         emu.setup_ram_bytes(ram_mib * 1024 * 1024);
     }
+    if let Some((w, h)) = fb_size {
+        emu.set_framebuffer_size(w, h);
+    }
+    emu.set_wall_clock(realtime);
     emu.setup_program(kernel);
     emu.setup_filesystem(fs);
 
@@ -251,6 +278,7 @@ fn main() {
     let start = Instant::now();
     let mut done: u64 = 0;
     let mut last_fbw: u64 = 0;
+    let mut last_fbb: u64 = 0;
     let mut window = Instant::now();
     let mut window_insns: u64 = 0;
 
@@ -474,8 +502,12 @@ fn main() {
                 }
             });
             for path in snaps {
-                // simplefb: 1024x768 XRGB8888 at 0x87e00000, 4096-byte stride
-                let (w, h, stride) = (1024usize, 768usize, 4096usize);
+                // simplefb: XRGB8888 at 0x87e00000, stride = width * 4
+                let (w, h) = match fb_size {
+                    Some((w, h)) => (w as usize, h as usize),
+                    None => (1024usize, 768usize)
+                };
+                let stride = w * 4;
                 let mut fb = vec![0u8; stride * h];
                 emu.read_physical_range(0x87e0_0000, &mut fb);
                 let mut ppm = format!("P6\n{} {}\n255\n", w, h).into_bytes();
@@ -515,6 +547,16 @@ fn main() {
             let fbw = emu.fb_writes();
             let dfbw = fbw.wrapping_sub(last_fbw);
             last_fbw = fbw;
+            let fbb = emu.fb_bytes();
+            let dfbb = fbb.wrapping_sub(last_fbb);
+            last_fbb = fbb;
+            let fps = match fps_frame_bytes {
+                Some(per) => format!(
+                    " {:>5.1} fps",
+                    dfbb as f64 / per as f64 / window.elapsed().as_secs_f64()
+                ),
+                None => String::new(),
+            };
             let mut px = [0u8; 4];
             emu.read_physical_range(0x87e0_0000, &mut px);
             let mut cx = [0u8; 4];
@@ -525,10 +567,12 @@ fn main() {
             let mut rm = [0u8; 4];
             emu.read_physical_range(0x87e0_0000 + (300 * 4096 + 900 * 4) as u64, &mut rm);
             eprintln!(
-                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS  fbw+{} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
+                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS{} guest{:>7.1}s fbw+{} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
                 start.elapsed().as_secs_f64(),
                 done as f64 / 1e6,
                 mips,
+                fps,
+                emu.guest_mtime() as f64 / 1e7,
                 dfbw,
                 px[2], px[1], px[0],
                 cx[2], cx[1], cx[0],

@@ -214,6 +214,48 @@ impl Mmu {
 		self.dtb[at..at + 4].copy_from_slice(&(self.ram_capacity as u32).to_be_bytes());
 	}
 
+	/// risc-box patch: rewrites the simple-framebuffer node's width/height/
+	/// stride so the display size is a deployment knob rather than a rebuild.
+	///
+	/// Every pixel of the screen is paid for three times over — the guest draws
+	/// it, the host scans it out, and the encoder ships it — so a machine whose
+	/// job is a 320x200 game should not be made to run a 1024x768 desktop's
+	/// worth of framebuffer. The node's `reg` window is left alone: it is the
+	/// 3 MiB the reserved-memory node keeps the allocator off, and every size
+	/// this accepts fits inside it.
+	///
+	/// Returns false (leaving the DTB untouched) if the size does not fit or
+	/// the node is not the one this emulator ships.
+	pub fn set_dtb_framebuffer(&mut self, width: u32, height: u32) -> bool {
+		const FB_WINDOW: u64 = 0x30_0000;
+		if width == 0 || height == 0 || (width as u64) * (height as u64) * 4 > FB_WINDOW {
+			eprintln!("[emu] dtb: framebuffer {}x{} does not fit the 3 MiB window; keeping the default", width, height);
+			return false;
+		}
+		// width/height/stride sit consecutively in the struct block, each one
+		// an FDT_PROP token + length + name offset (12 bytes) followed by its
+		// 4-byte value, so consecutive values are 16 bytes apart. Matching all
+		// three defaults at once, on 4-byte alignment, identifies the node
+		// without a full FDT walk and refuses to guess if the tree changes
+		// shape (verified unique against the shipped blob).
+		let (w0, h0, s0) = (1024u32.to_be_bytes(), 768u32.to_be_bytes(), 4096u32.to_be_bytes());
+		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(36))
+			.step_by(4)
+			.filter(|&i| self.dtb[i..i + 4] == w0
+				&& self.dtb[i + 16..i + 20] == h0
+				&& self.dtb[i + 32..i + 36] == s0)
+			.collect();
+		if hits.len() != 1 {
+			eprintln!("[emu] dtb: expected exactly one simple-framebuffer size triple, found {}; leaving DTB as is", hits.len());
+			return false;
+		}
+		let at = hits[0];
+		self.dtb[at..at + 4].copy_from_slice(&width.to_be_bytes());
+		self.dtb[at + 16..at + 20].copy_from_slice(&height.to_be_bytes());
+		self.dtb[at + 32..at + 36].copy_from_slice(&(width * 4).to_be_bytes());
+		true
+	}
+
 	// risc-box patch: bulk read of PHYSICAL DRAM (no translation, no device
 	// dispatch, no side effects) — the host's framebuffer scanout. The caller
 	// owns the address contract: the range must sit inside main memory.
@@ -224,6 +266,11 @@ impl Mmu {
 	// risc-box patch (debug aid): see MemoryWrapper::fb_writes.
 	pub fn fb_writes(&self) -> u64 {
 		self.memory.fb_writes()
+	}
+
+	// risc-box patch (measurement): see MemoryWrapper::fb_bytes.
+	pub fn fb_bytes(&self) -> u64 {
+		self.memory.fb_bytes()
 	}
 	
 	/// Initializes Virtio block disk. This method is expected to be called only once.
@@ -1167,7 +1214,8 @@ pub struct MemoryWrapper {
 	// cached entry's meta embeds, killing them all at once.
 	exec_page_marks: Vec<u8>,
 	code_gen: u32,
-	fb_writes: u64
+	fb_writes: u64,
+	fb_bytes: u64
 }
 
 impl MemoryWrapper {
@@ -1176,7 +1224,8 @@ impl MemoryWrapper {
 			memory: Memory::new(),
 			exec_page_marks: vec![],
 			code_gen: 1,
-			fb_writes: 0
+			fb_writes: 0,
+			fb_bytes: 0
 		}
 	}
 
@@ -1192,11 +1241,21 @@ impl MemoryWrapper {
 		self.fb_writes
 	}
 
+	// risc-box patch (measurement): BYTES stored into the framebuffer window.
+	// Frame rate is the honest question for a game, and a presented frame is
+	// exactly w*h*4 bytes of blit, so bytes/frame-bytes counts frames without
+	// the guest having to cooperate — stores alone cannot, since the width of
+	// a store varies with how the blitter was compiled.
+	pub fn fb_bytes(&self) -> u64 {
+		self.fb_bytes
+	}
+
 	// risc-box patch: bump code_gen if this write can touch a marked page.
 	#[inline(always)]
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
 		if p_address >= 0x87e0_0000 && p_address < 0x8810_0000 {
 			self.fb_writes = self.fb_writes.wrapping_add(1);
+			self.fb_bytes = self.fb_bytes.wrapping_add(width);
 		}
 		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;
