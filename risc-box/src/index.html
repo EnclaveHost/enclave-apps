@@ -191,6 +191,27 @@ function dropConsole() { if (evs) { evs.close(); evs = null; } }
 // w*h*4, and the catch below swallowed that on every single band, so the
 // screen stayed blank with no error anywhere.
 let dvs = null, dispQ = Promise.resolve(), dispW = 800;
+// How many bands may be waiting to paint before we start dropping them.
+//
+// Painting one costs an inflate plus a pass over every pixel of the rectangle,
+// and bands arrive at whatever rate the guest repaints — which, for a game, is
+// faster than a browser tab can convert them. An unbounded promise chain turns
+// that deficit into a leak rather than a delay: every queued link holds its own
+// base64 payload alive (a full frame is ~280 KB of it), so the tab grows,
+// slows, and eventually stops answering. That is the "decays then goes
+// unresponsive" failure, and it is why the native bridge is smooth on the same
+// stream — it applies bands at memcpy speed and never falls behind.
+//
+// Four deep is enough to ride out a burst without going stale to the eye.
+// Dropping past that leaves a rectangle showing its previous contents until
+// something repaints that area, which for a live view is the right trade: a
+// queue that never catches up shows old pixels too, just later and forever.
+const DISP_MAX_PENDING = 4;
+let dispPending = 0, dispDropped = 0;
+// Silence longer than this means the stream is wedged, not the screen
+// still: the app heartbeats every 15s regardless.
+const DISP_STALL_MS = 20000;
+let dispLastMsg = 0, dispWatch = null;
 const fbctx = $("fb").getContext("2d");
 const fbCanvas = $("fb");
 // Point the canvas at the guest's actual geometry. Assigning width/height
@@ -228,24 +249,59 @@ function connectDisplay() {
     setGeometry(m.w, m.h);
   });
   dvs.onmessage = (e) => {
+    dispLastMsg = Date.now();
     if (!e.data) return;
     const m = JSON.parse(e.data);
+    if (dispPending >= DISP_MAX_PENDING) { dispDropped++; return; }
+    dispPending++;
     dispQ = dispQ.then(async () => {
       const bgrx = await inflateRaw(b64dec(m.b));
       const rgba = new Uint8ClampedArray(bgrx.length);
-      for (let i = 0; i < bgrx.length; i += 4) {
-        rgba[i] = bgrx[i + 2]; rgba[i + 1] = bgrx[i + 1]; rgba[i + 2] = bgrx[i]; rgba[i + 3] = 255;
+      // A word at a time, not a byte at a time: the guest's pixels are
+      // B,G,R,X little-endian, so one 32-bit read is 0xXXRRGGBB and the swap
+      // is two shifts and a mask. Verified byte-identical to the per-channel
+      // version it replaces. Worth measuring before believing, though — it is
+      // only 1.2x (37ms -> 32ms for twenty full 1024x768 frames), because the
+      // JIT already handled the byte loop well. At ~1.9ms a full frame this
+      // was never what made the tab slow; the queue below is.
+      const src = new Uint32Array(bgrx.buffer, bgrx.byteOffset, bgrx.length >> 2);
+      const dst = new Uint32Array(rgba.buffer);
+      for (let i = 0; i < src.length; i++) {
+        const p = src[i];
+        dst[i] = 0xff000000 | ((p & 0xff) << 16) | (p & 0xff00) | ((p >>> 16) & 0xff);
       }
       // A band is a RECTANGLE: x/w crop it to the columns that changed, so a
       // game in a window costs its own width and not the screen's. Older
       // senders omit x/w, which reads as the full row — the same picture.
       const bx = m.x || 0, bw = m.w || dispW;
       fbctx.putImageData(new ImageData(rgba, bw, m.h), bx, m.y);
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => { dispPending--; });
   };
+  // Watchdog. A wedged stream does not close and does not error — it simply
+  // stops delivering, so EventSource never reconnects and the picture freezes
+  // for good. That is the whole difference between this page and the native
+  // bridge, which redials on the same silence and therefore stays live.
+  //
+  // The app sends a named `hb` every 15s whatever the screen is doing, so
+  // silence longer than that is the connection being dead rather than the
+  // picture being still. Redial on it.
+  const beat = () => { dispLastMsg = Date.now(); };
+  dvs.addEventListener("hb", beat);
+  dvs.addEventListener("mode", beat);
+  beat();
+  clearInterval(dispWatch);
+  dispWatch = setInterval(() => {
+    if (!dvs || Date.now() - dispLastMsg < DISP_STALL_MS) return;
+    console.warn("display stream silent for " + DISP_STALL_MS + "ms; redialling");
+    dropDisplay();
+    connectDisplay();
+  }, 5000);
   dvs.onerror = () => {};
 }
-function dropDisplay() { if (dvs) { dvs.close(); dvs = null; } }
+function dropDisplay() {
+  clearInterval(dispWatch); dispWatch = null;
+  if (dvs) { dvs.close(); dvs = null; }
+}
 
 // ---- video: the desktop as an efficient AV1 stream, decoded with WebCodecs. -
 // The app encodes the guest framebuffer as AV1 (rav1e) and ships each coded

@@ -382,7 +382,15 @@ impl Server {
             if let ConnState::Sse { last_beat, .. } = &mut conn.state {
                 if now.duration_since(*last_beat) >= SSE_HEARTBEAT {
                     *last_beat = now;
-                    chunk_into(&mut conn.wbuf, b":hb\n\n");
+                    // A NAMED event, not a `:hb` comment. A comment keeps the
+                    // connection warm through proxies, which is what it was
+                    // for, but EventSource discards comments without telling
+                    // the page — so a browser cannot tell a still screen from
+                    // a stream that has gone silent, and it never reconnects,
+                    // because a silent stream raises no error either. That is
+                    // the difference between a client that recovers from a
+                    // wedged stream and one that freezes on it forever.
+                    chunk_into(&mut conn.wbuf, b"event: hb\ndata: 1\n\n");
                 }
             }
             // Flush.
