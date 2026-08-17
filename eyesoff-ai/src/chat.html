@@ -176,11 +176,14 @@
     width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.2s ease-in-out infinite;
   }
-  .chat-item .del {
+  .chat-item .del, .chat-item .save {
     display: none; padding: 4px; border-radius: 6px; color: var(--text-3);
   }
-  .chat-item:hover .del { display: block; }
+  .chat-item:hover .del, .chat-item:hover .save { display: block; }
   .chat-item .del:hover { color: var(--err); background: var(--hover); }
+  .chat-item .save:hover { color: var(--text); background: var(--hover); }
+  /* ICONS.dl is drawn at 16 for the html-block header; match the trash beside it */
+  .chat-item .save svg { width: 15px; height: 15px; }
   .side-empty { padding: 10px 12px; color: var(--text-3); font-size: 13px; }
   .side-foot {
     padding: 8px 8px 12px; border-top: 1px solid var(--border-soft);
@@ -886,7 +889,7 @@
     #sideGrip { display: none; } /* the mobile sidebar is a fixed-width overlay */
     body.side-open #sidebar { transform: none; box-shadow: var(--shadow); }
     body.side-open #backdrop { display: block; }
-    .chat-item .del { display: block; }
+    .chat-item .del, .chat-item .save { display: block; }
     .chips { grid-template-columns: 1fr; }
     .bubble { max-width: 88%; }
     #log { padding: 16px 16px 8px; }
@@ -2083,6 +2086,13 @@ function renderSidebar() {
     const t = node('<span class="ct"></span>');
     t.textContent = c.title || "New chat";
     item.appendChild(t);
+    // the transcript action only appears once there is a transcript: a blank
+    // "New chat" row has nothing to save
+    if (c.messages.length || c.error) {
+      const save = node('<button class="save" aria-label="Download transcript" title="Download transcript">' + ICONS.dl + "</button>");
+      save.addEventListener("click", (e) => { e.stopPropagation(); downloadTranscript(c); });
+      item.appendChild(save);
+    }
     const del = node('<button class="del" aria-label="Delete chat" title="Delete chat">' + ICONS.trash + "</button>");
     del.addEventListener("click", (e) => { e.stopPropagation(); deleteChat(c.id); });
     item.appendChild(del);
@@ -2167,6 +2177,104 @@ function deleteChat(id) {
     pinned = true;
   }
   renderSidebar(); renderChat(); updateComposer();
+}
+
+// ------------------------------------------------------------- transcript --
+// A whole conversation as one Markdown file, saved from the sidebar. There is
+// no server copy to export - the transcript is rebuilt from the same message
+// objects the view renders, and the download is a local blob, so the chat
+// leaves this browser only as a file in the user's own hands.
+//
+// Choices that follow the rest of the app:
+//  - thinking is dropped the way message-copy drops it, kept only when a reply
+//    never got past its reasoning (otherwise that turn would export empty);
+//  - images ride along as the data: URIs they already are, after the same
+//    pattern checks the renderer applies, so the file is self-contained and
+//    renders offline at the cost of being as large as its pictures;
+//  - sources keep their on-screen numbering, so the [n] citations in the
+//    prose still point at the right entries.
+function transcriptMd(chat) {
+  const out = ["# " + (chat.title || "New chat"), ""];
+  out.push("*eyesoff.ai · saved " + new Date().toISOString().slice(0, 10) + "*", "");
+  // markdown link syntax cannot hold brackets or newlines in its text
+  const flat = (s) => String(s).replace(/[\[\]\n]/g, " ").trim();
+  for (const m of chat.messages) {
+    if (m.role === "notice") { out.push("> " + m.content, ""); continue; }
+    if (m.role === "user") {
+      out.push("## You", "");
+      for (const u of m.images || [])
+        if (/^data:image\/(png|jpeg|webp|gif|bmp);base64,[A-Za-z0-9+/=]+$/.test(u))
+          out.push("![attached image](" + u + ")", "");
+      if (m.content) out.push(m.content, "");
+      continue;
+    }
+    // which model answered is part of the record in a chat where the picker
+    // can change between turns
+    out.push("## Assistant" + (m.meta && m.meta.target ? " (" + m.meta.target + ")" : ""), "");
+    // same order as the rendered turn: calls, then the picture, then the words
+    if (m.tools && m.tools.length) {
+      for (const c of m.tools) {
+        let args = "";
+        try { args = JSON.stringify(c.arguments || {}); } catch (_) { args = "{}"; }
+        out.push("- called `" + c.name + (args === "{}" ? "" : " " + args) + "`"
+          + (c.ok === false ? " (failed)" : ""));
+      }
+      out.push("");
+    }
+    if (m.image && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(m.image.data_uri || ""))
+      out.push("![" + flat(m.image.prompt || "generated image") + "](" + m.image.data_uri + ")", "");
+    const body = stripThink(m.content);
+    if (body) out.push(body, "");
+    else {
+      // a reply that never got past its reasoning: export the thoughts rather
+      // than an empty heading - as a quote, not with literal <think> tags,
+      // which a markdown renderer would swallow as unknown HTML and hide
+      const th = splitThink(m.content).map((p) => p.think || "").join("").trim();
+      if (th) out.push("> Thoughts: " + th.replace(/\n/g, "\n> "), "");
+    }
+    if (m.meta && m.meta.stopped) out.push("*(stopped)*", "");
+    if (m.sources && m.sources.length) {
+      out.push("Sources:", "");
+      m.sources.forEach((s, i) => {
+        let safe = null;
+        try {
+          const u = new URL(s.url);
+          if (u.protocol === "http:" || u.protocol === "https:") safe = u.href;
+        } catch (_) {}
+        const title = flat(s.title || safe || "(unusable link)");
+        out.push((i + 1) + ". " + (safe ? "[" + title + "](" + safe + ")" : title));
+      });
+      out.push("");
+    }
+  }
+  // the failed turn is still part of what happened
+  if (chat.error) {
+    out.push("## You", "", chat.error.text, "");
+    if (chat.error.partial) out.push("## Assistant", "", chat.error.partial, "");
+    out.push("*(failed: " + chat.error.message + ")*", "");
+  }
+  if (chat.streaming) out.push("*(a reply was still being written when this file was saved)*", "");
+  return out.join("\n");
+}
+
+// The name someone will look for in their downloads folder: the chat's own
+// title, reduced the same way page downloads are.
+function transcriptFileName(chat) {
+  const t = (chat.title || "").trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  return (t || "chat") + ".md";
+}
+
+function downloadTranscript(chat) {
+  const url = URL.createObjectURL(new Blob([transcriptMd(chat)], { type: "text/markdown;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = transcriptFileName(chat);
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // Back/Forward between chats. A target that no longer exists (deleted in
