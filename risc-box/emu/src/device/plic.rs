@@ -13,10 +13,7 @@ pub struct Plic {
 	threshold: u32,
 	ips: [u8; 1024],
 	priorities: [u32; 1024],
-	needs_update_irq: bool,
-	virtio_ip_cache: bool,
-	net_ip_cache: bool, // risc-box patch
-	input_ip_cache: bool // risc-box patch
+	needs_update_irq: bool
 }
 
 // @TODO: IRQ numbers should be configurable with device tree
@@ -35,10 +32,7 @@ impl Plic {
 			threshold: 0,
 			priorities: [0; 1024],
 			ips: [0; 1024],
-			needs_update_irq: false,
-			virtio_ip_cache: false,
-			net_ip_cache: false, // risc-box patch
-			input_ip_cache: false // risc-box patch
+			needs_update_irq: false
 		}
 	}
 
@@ -55,33 +49,28 @@ impl Plic {
 	pub fn tick(&mut self, n: u64, virtio_ip: bool, net_ip: bool, input_ip: bool, uart_ip: bool, mip: &mut u64) {
 		self.clock = self.clock.wrapping_add(n);
 
-		// Handling interrupts as "Edge-triggered" interrupt so far
-
-		// Our VirtIO disk implements an interrupt as "Level-triggered" and
-		// virtio_ip is always true while interrupt pending bit is asserted.
-		// Then our Plic caches virtio_ip and detects the rise edge.
-		if self.virtio_ip_cache != virtio_ip {
-			if virtio_ip {
-				self.set_ip(VIRTIO_IRQ);
-			}
-			self.virtio_ip_cache = virtio_ip;
+		// risc-box patch: the virtio lines are LEVEL-triggered, and the PLIC
+		// used to edge-detect them through a cached copy sampled once per
+		// device-service tick. That loses interrupts: the guest's ACK
+		// (level drops) and the device's next raise (level returns) can both
+		// happen BETWEEN two samples, the cache sees high==high, and no
+		// interrupt is ever posted again — after which the ring exhausts,
+		// the level sticks high, and the device is dead for the life of the
+		// guest. Batched device servicing made that window big enough for a
+		// human moving a mouse to hit it in seconds (the frozen-cursor bug,
+		// 2026-08-16). Proper level semantics need no cache: re-arm whenever
+		// the line is high and the pending bit is clear (i.e. the guest has
+		// claimed/completed the previous one). A spurious re-run of an ISR
+		// that finds nothing new is the worst this can produce, and that is
+		// how level-triggered lines behave everywhere.
+		if virtio_ip && !self.ip_bit(VIRTIO_IRQ) {
+			self.set_ip(VIRTIO_IRQ);
 		}
-
-		// risc-box patch: the virtio-net device is level-triggered like the
-		// disk; detect the rising edge the same way.
-		if self.net_ip_cache != net_ip {
-			if net_ip {
-				self.set_ip(NET_IRQ);
-			}
-			self.net_ip_cache = net_ip;
+		if net_ip && !self.ip_bit(NET_IRQ) {
+			self.set_ip(NET_IRQ);
 		}
-
-		// risc-box patch: the virtio-input device is level-triggered too.
-		if self.input_ip_cache != input_ip {
-			if input_ip {
-				self.set_ip(INPUT_IRQ);
-			}
-			self.input_ip_cache = input_ip;
+		if input_ip && !self.ip_bit(INPUT_IRQ) {
+			self.set_ip(INPUT_IRQ);
 		}
 
 		// Our Uart implements an interrupt as "Edge-triggered" and
@@ -140,15 +129,22 @@ impl Plic {
 		}
 	}
 
+	fn ip_bit(&self, irq: u32) -> bool {
+		((self.ips[(irq >> 3) as usize] >> (irq & 7)) & 1) == 1
+	}
+
 	fn set_ip(&mut self, irq: u32) {
 		let index = (irq >> 3) as usize;
-		self.ips[index] = self.ips[index] | (1 << irq);
+		self.ips[index] = self.ips[index] | (1 << (irq & 7));
 		self.needs_update_irq = true;
 	}
 
 	fn clear_ip(&mut self, irq: u32) {
 		let index = (irq >> 3) as usize;
-		self.ips[index] = self.ips[index] & !(1 << irq);
+		// `irq & 7`, not `irq`: shifting a u8 by 10 (the UART line) is a
+		// masked shift in release — which happened to land on the right bit —
+		// and a panic in debug. Say what is meant.
+		self.ips[index] = self.ips[index] & !(1 << (irq & 7));
 		self.needs_update_irq = true;
 	}
 
