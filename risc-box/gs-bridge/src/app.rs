@@ -134,8 +134,13 @@ impl App {
     }
 
     fn auth_header(&self) -> String {
+        // Both forms of the same key: the app accepts either, but the
+        // app.enclave.host gateway CONSUMES Authorization (it is the
+        // gateway's own auth channel for private deployments) and never
+        // forwards it, so through the gateway only x-api-key reaches the
+        // app. Bearer stays for direct/loopback use.
         match &self.api_key {
-            Some(k) => format!("Authorization: Bearer {k}\r\n"),
+            Some(k) => format!("Authorization: Bearer {k}\r\nx-api-key: {k}\r\n"),
             None => String::new(),
         }
     }
