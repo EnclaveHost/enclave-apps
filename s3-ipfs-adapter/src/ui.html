@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>s3-ipfs-adapter</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --amber: #e8a34c; --amber-hi: #ffc46b; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 980px; padding: 0 20px 40px; }
+  header { text-align: center; padding: 40px 0 6px; }
+  .mark { font-size: 24px; letter-spacing: .1em; color: var(--amber); }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+    padding: 18px 22px; margin-top: 20px;
+  }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--dim); letter-spacing: .08em; font-weight: 600; }
+  .kv { display: flex; gap: 10px 26px; flex-wrap: wrap; font-size: 13px; color: var(--dim); }
+  .kv b { color: var(--ink); font-weight: 600; }
+  .state-ready { color: var(--green); }
+  .state-busy { color: var(--amber-hi); }
+  .state-bad { color: var(--red); }
+  .rootline { display: flex; gap: 8px; margin-top: 12px; align-items: stretch; }
+  .rootline input {
+    flex: 1; background: #0d1119; color: var(--amber-hi); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 8px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  button {
+    background: var(--amber); color: #14100a; border: 0; border-radius: 8px;
+    padding: 8px 18px; font: 600 13px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--amber-hi); }
+  button.ghost {
+    background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--amber); }
+  .bar { height: 6px; background: #0d1119; border: 1px solid var(--edge2); border-radius: 4px; margin-top: 12px; overflow: hidden; }
+  .bar div { height: 100%; background: var(--amber); width: 0; transition: width .4s; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+  th { text-align: left; color: var(--faint); font-weight: 400; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--edge2); }
+  td { padding: 5px 10px 5px 0; border-bottom: 1px solid var(--edge); vertical-align: top; }
+  td.sz { color: var(--dim); white-space: nowrap; }
+  td.cid { color: var(--dim); }
+  a { color: var(--amber); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .mini { font-size: 11.5px; color: var(--faint); }
+  .mini a { color: var(--dim); }
+  .copy { cursor: pointer; color: var(--dim); border: 1px solid var(--edge2); border-radius: 5px; padding: 0 7px; font-size: 11px; background: transparent; margin-left: 6px; }
+  .copy:hover { color: var(--ink); border-color: var(--amber); }
+  input.filter {
+    width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 8px 12px; font: 13px var(--mono); margin-top: 4px;
+  }
+  input.filter:focus { border-color: var(--amber); outline: none; }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 720px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="mark">s3 <b>&rarr;</b> ipfs</div>
+    <div class="tag" id="title">bucket as content-addressed data, served from an enclave</div>
+  </header>
+
+  <section class="card">
+    <h2>INDEX</h2>
+    <div class="kv">
+      <span>state <b id="state">…</b></span>
+      <span>bucket <b id="bucket">…</b></span>
+      <span>files <b id="files">…</b></span>
+      <span>size <b id="bytes">…</b></span>
+      <span>dag nodes <b id="nodes">…</b></span>
+      <span>indexed <b id="age">…</b></span>
+      <span id="refreshwrap"><button class="ghost" id="refresh">re-index</button></span>
+    </div>
+    <div class="bar hidden" id="bar"><div id="barfill"></div></div>
+    <div class="mini" id="progress"></div>
+    <div class="rootline hidden" id="rootline">
+      <input id="root" readonly title="root directory CID of the whole bucket">
+      <button class="copy" id="copyroot">copy</button>
+      <a id="rootlink"><button class="ghost">browse</button></a>
+      <a id="carlink"><button class="ghost">.car</button></a>
+    </div>
+    <div class="err hidden" id="err"></div>
+  </section>
+
+  <section class="card">
+    <h2>FILES</h2>
+    <input class="filter" id="filter" placeholder="filter by path…">
+    <table>
+      <thead><tr><th>path</th><th>size</th><th>cid</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="mini" id="count"></div>
+  </section>
+
+  <footer>
+    CIDs are computed exactly as <code>ipfs add --cid-version 1</code> would
+    (256 KiB chunks, raw leaves, balanced DAG), so they can be verified,
+    pinned, or fetched anywhere. Every served byte is re-hashed against the
+    index before it leaves the enclave. /ipfs/&lt;cid&gt; supports
+    ?format=raw and ?format=car (trustless gateway) and HTTP ranges.
+  </footer>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  let files = [], loadedOnce = false;
+
+  function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  function human(n) {
+    if (n >= 2**30) return (n / 2**30).toFixed(2) + ' GiB';
+    if (n >= 2**20) return (n / 2**20).toFixed(2) + ' MiB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KiB';
+    return n + ' B';
+  }
+  function shortCid(c) { return c.length > 16 ? c.slice(0, 8) + '…' + c.slice(-6) : c; }
+  function encPath(p) { return p.split('/').map(encodeURIComponent).join('/'); }
+
+  async function copyText(t, btn) {
+    try { await navigator.clipboard.writeText(t); } catch (e) {
+      const i = document.createElement('textarea'); i.value = t; document.body.appendChild(i);
+      i.select(); document.execCommand('copy'); i.remove();
+    }
+    if (btn) { const old = btn.textContent; btn.textContent = 'ok'; setTimeout(() => btn.textContent = old, 900); }
+  }
+
+  function render() {
+    const q = $('filter').value.toLowerCase();
+    const rows = [];
+    let shown = 0;
+    for (const f of files) {
+      if (q && !f.path.toLowerCase().includes(q)) continue;
+      if (++shown > 500) break;
+      rows.push(`<tr>
+        <td><a href="/ipfs/${f.cid}?filename=${encodeURIComponent(f.path.split('/').pop())}">${esc(f.path)}</a></td>
+        <td class="sz">${human(f.size)}</td>
+        <td class="cid"><a href="/ipfs/${f.cid}" title="${esc(f.cid)}">${shortCid(f.cid)}</a></td>
+        <td><button class="copy" data-cid="${esc(f.cid)}">copy</button>
+            <a class="mini" href="/ipfs/${f.cid}?format=car">car</a></td>
+      </tr>`);
+    }
+    $('rows').innerHTML = rows.join('');
+    $('count').textContent = shown > 500
+      ? `showing 500 of ${files.length} files (filter to narrow)`
+      : `${shown} of ${files.length} files`;
+    for (const b of $('rows').querySelectorAll('button.copy'))
+      b.onclick = () => copyText(b.dataset.cid, b);
+  }
+
+  async function loadFiles() {
+    try {
+      files = await (await fetch('/api/files')).json();
+      render();
+    } catch (e) {}
+  }
+
+  async function tick() {
+    let s;
+    try { s = await (await fetch('/api/status')).json(); }
+    catch (e) { $('state').textContent = 'unreachable'; $('state').className = 'state-bad'; return schedule(3000); }
+    $('title').textContent = s.title;
+    $('bucket').textContent = s.bucket ? s.bucket + (s.prefix ? '/' + s.prefix : '') : '(unset)';
+    $('files').textContent = s.files;
+    $('bytes').textContent = human(s.totalBytes);
+    $('nodes').textContent = s.dagNodes;
+    $('age').textContent = s.lastIndexAge === null ? 'never' : s.lastIndexAge + 's ago';
+    const busy = s.state === 'listing' || s.state === 'hashing';
+    $('state').textContent = s.state + (s.truncated ? ' (truncated)' : '');
+    $('state').className = s.state === 'ready' ? 'state-ready' : busy ? 'state-busy' : 'state-bad';
+    $('err').classList.toggle('hidden', !s.error && s.state !== 'unconfigured');
+    if (s.state === 'unconfigured')
+      $('err').textContent = 'unconfigured: set ' + (s.missing || []).join(', ') + ' in the deployment config, then restart';
+    else if (s.error) $('err').textContent = s.error;
+    $('bar').classList.toggle('hidden', s.state !== 'hashing');
+    if (s.state === 'hashing') {
+      const pct = s.toHashBytes ? Math.min(100, 100 * s.hashedBytes / s.toHashBytes) : 100;
+      $('barfill').style.width = pct.toFixed(1) + '%';
+      $('progress').textContent =
+        `hashing ${s.hashing || ''}: ${human(s.hashedBytes)} of ${human(s.toHashBytes)}, ${s.queue} files queued, ${s.unchanged} unchanged`;
+    } else if (s.state === 'listing') {
+      $('progress').textContent = `listing bucket… ${s.listed || 0} objects so far`;
+    } else {
+      $('progress').textContent = '';
+    }
+    if (s.rootCid) {
+      $('rootline').classList.remove('hidden');
+      if ($('root').value !== s.rootCid) {
+        $('root').value = s.rootCid;
+        $('rootlink').href = '/ipfs/' + s.rootCid;
+        $('carlink').href = '/ipfs/' + s.rootCid + '?format=car';
+        loadFiles();
+      } else if (!loadedOnce) { loadedOnce = true; loadFiles(); }
+    }
+    schedule(busy ? 1500 : 10000);
+  }
+  let timer = null;
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms); }
+
+  $('filter').oninput = render;
+  $('copyroot').onclick = () => copyText($('root').value, $('copyroot'));
+  $('refresh').onclick = async () => {
+    await fetch('/api/refresh', { method: 'POST' });
+    schedule(300);
+  };
+  tick();
+</script>
+</body>
+</html>

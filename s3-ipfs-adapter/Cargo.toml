@@ -1,0 +1,27 @@
+[package]
+name = "s3-ipfs-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Expose an S3 bucket as IPFS content: index the bucket into UnixFS DAGs (CIDs identical to ipfs add) and serve them over an IPFS path + trustless gateway, from inside an attested enclave. Raw bytes stay in S3; leaf blocks are range-fetched on demand and hash-verified."
+license-file = "../LICENSE"
+publish = false
+
+# A run-mode service app (single wasm32-wasip2 command component), the
+# risc-box shape: std maps to wasi:sockets/clocks/cli. The HTTP engine
+# (src/httpd.rs, the suite's nanhttpd with streaming bodies instead of SSE),
+# the S3 client (src/s3.rs) and the IPFS merkle codec (src/ipfs.rs) are
+# hand-rolled std. Dependencies are the pure-Rust TLS stack (the only one
+# that builds for wasm32-wasip2) plus the SigV4 hash primitives; serde_json
+# parses the app config.
+[dependencies]
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+sha2 = "0.10"
+hmac = "0.12"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
