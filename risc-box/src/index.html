@@ -157,7 +157,13 @@ function setKey(k) { apiKey = k; try { sessionStorage.setItem("riscbox_key", k);
 function authFetch(url, opts) {
   opts = opts || {};
   const h = opts.headers || {};
-  if (apiKey) h["Authorization"] = "Bearer " + apiKey;
+  // Present the key as X-Api-Key, not Authorization: Bearer. The platform's TLS
+  // proxy consumes the Authorization header for its own owner-token auth and
+  // does not forward it, so the app never sees a Bearer token from a browser
+  // (or another app) — the request arrives unauthenticated and 401s, which is
+  // what made the key bar reappear the instant it was dismissed. X-Api-Key
+  // passes through, as does ?key= on the SSE paths.
+  if (apiKey) h["X-Api-Key"] = apiKey;
   opts.headers = h;
   return fetch(url, opts);
 }
