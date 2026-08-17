@@ -218,6 +218,7 @@ mod http;
 mod image;
 mod sampling;
 mod search;
+mod sso;
 mod tools;
 mod vision;
 mod webp;
@@ -6523,6 +6524,8 @@ const ERR_CODES: &[&str] = &[
     // too big), the rest describe the deployment or its node
     "no_vision", "too_many_images", "image_too_large", "vision_unsupported",
     "vision_unavailable", "image_undecodable", "image_too_wide",
+    // sign-in gate: the playground opens its sign-in dialog on this one
+    "sso_required",
 ];
 
 /// Drop the "[code] " marker from a message bound for a payload without a
@@ -6550,21 +6553,58 @@ fn json_err(out: ResponseOutparam, status: u16, msg: &str) {
     );
 }
 
-/// Bearer-token check for /v1/*. No key configured = open (gate with a
-/// private deployment instead when that is the intent).
-fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
-    let Some(key) = &cfg.api_key else { return true };
+/// The request's `Authorization: Bearer` value, if it sent one.
+fn bearer_token(req: &IncomingRequest) -> Option<String> {
     let headers = req.headers();
     for v in headers.get(&"authorization".to_string()) {
         if let Ok(s) = String::from_utf8(v) {
             if let Some(tok) = s.strip_prefix("Bearer ") {
-                if tok.trim() == key {
-                    return true;
-                }
+                return Some(tok.trim().to_string());
             }
         }
     }
-    false
+    None
+}
+
+/// Bearer check for /v1/*: the deployment's api_key, or a platform sign-in
+/// token when `sso` is configured - one API, either credential. Neither gate
+/// configured = open (gate with a private deployment instead when that is the
+/// intent), and sso with required=false leaves /v1 open too: optional sign-in
+/// exists to name the visitor, not to close the API on everyone else.
+fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
+    let tok = bearer_token(req);
+    if let (Some(key), Some(t)) = (&cfg.api_key, &tok) {
+        if t == key {
+            return true;
+        }
+    }
+    if let (Some(s), Some(t)) = (&cfg.sso, &tok) {
+        if sso::verify(s, t, (now_ms() / 1000) as u64).is_ok() {
+            return true;
+        }
+    }
+    cfg.api_key.is_none() && !cfg.sso.as_ref().map_or(false, |s| s.required)
+}
+
+/// The playground's sign-in gate (POST /chat and /title): nothing unless the
+/// deployment configured `sso` with `required`, then a valid token or a 401.
+/// Runs BEFORE the handler takes the request, because IncomingRequest moves
+/// into the body-reading handlers and headers must be read first. Only the
+/// generation routes are gated: GET / must serve the page that CARRIES the
+/// sign-in button, /models is how that page learns where to send people, and
+/// /attestation stays readable because deciding whether to trust this app
+/// with a login is exactly when someone verifies it.
+fn require_user(raw: &serde_json::Value, req: &IncomingRequest) -> Result<(), String> {
+    let Some(cfg) = sso::SsoConfig::from_raw(raw) else { return Ok(()) };
+    if !cfg.required {
+        return Ok(());
+    }
+    match bearer_token(req) {
+        Some(t) => sso::verify(&cfg, &t, (now_ms() / 1000) as u64)
+            .map(|_| ())
+            .map_err(|e| format!("[sso_required] {e}")),
+        None => Err("[sso_required] this deployment asks you to sign in with your Enclave account".into()),
+    }
 }
 
 // ------------------------------------------------- legacy /chat (playground) --
@@ -7911,6 +7951,15 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
         }
         _ => serde_json::json!({ "enabled": false }),
     };
+    // Sign-in: what the playground needs to START the flow - where to send
+    // the visitor and which audience to ask for - plus whether the composer
+    // is gated or the link is merely offered. The signer address is NOT
+    // exposed: the browser never verifies a token, it only carries one.
+    body["auth"] = match base_cfg.as_ref().and_then(|c| c.sso.clone()) {
+        Some(s) => serde_json::json!({ "enabled": true, "required": s.required,
+                                       "authorize_url": s.authorize_url, "aud": s.audience }),
+        None => serde_json::json!({ "enabled": false }),
+    };
     let vision_any = entries.iter().any(|e| e.cfg.vision && e.cfg.backend == "ggml");
     let service = base_cfg.as_ref().map(|c| c.vision_service.is_some()).unwrap_or(false);
     body["vision"] = serde_json::json!({
@@ -8276,8 +8325,16 @@ impl Guest for Component {
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/tools") => handle_tools_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
-            (Method::Post, "/chat") => handle_chat(&raw, req, out),
-            (Method::Post, "/title") => handle_title(&raw, req, out),
+            // the two generation routes carry the sign-in gate; see
+            // require_user() for why the rest of the playground stays open
+            (Method::Post, "/chat") => match require_user(&raw, &req) {
+                Ok(()) => handle_chat(&raw, req, out),
+                Err(e) => json_err(out, 401, &e),
+            },
+            (Method::Post, "/title") => match require_user(&raw, &req) {
+                Ok(()) => handle_title(&raw, req, out),
+                Err(e) => json_err(out, 401, &e),
+            },
             (Method::Post, "/v1/chat/completions") => handle_completions(&raw, req, out),
             (Method::Get, "/v1/models") => handle_models(&raw, req, out),
             _ => json_err(

@@ -33,6 +33,14 @@ without it. **No key configured = open.** Gate with a private deployment when
 that is the intent; the chat playground and the legacy `/chat` route stay open
 either way (see `authorized()` and the `api_key` doc in `config.rs`).
 
+A deployment configured for **Sign in with Enclave** (top-level `sso` block)
+additionally accepts a platform sign-in token in the same header, on `/v1/*`
+and on the playground routes alike - one login, either surface. With
+`sso.required` true the playground's `/chat` and `/title` demand one; a 401
+there carries `"code": "sso_required"`, which is what tells the playground to
+open its sign-in dialog. See `sso.rs` for the token format and
+`PLATFORM-sso.md` for the mint side.
+
 ---
 
 ## GET /v1/models

@@ -108,15 +108,16 @@
 </div>
 
 <h1>Privacy &amp; Terms</h1>
-<p class="updated">Last updated 7 August 2026</p>
+<p class="updated">Last updated 17 August 2026</p>
 
 <div class="lede">
   <p><b>The short version:</b> your conversations are answered inside a hardware enclave
   that nobody, including us, can look into. They are stored nowhere but your own browser,
   and nothing about them leaves the enclave unless you turn on a feature that tells you
-  exactly what it sends. No accounts, no cookies, no analytics. You do not have to take
-  this page's word for it: the enclave proves what it is running, and the app shows you
-  the proof.</p>
+  exactly what it sends. No cookies, no analytics, and no accounts here: if this
+  deployment asks you to sign in, the login happens at enclave.host and this service
+  still stores nothing about you. You do not have to take this page's word for it: the
+  enclave proves what it is running, and the app shows you the proof.</p>
 </div>
 
 <h2 id="privacy">Privacy policy</h2>
@@ -135,12 +136,18 @@ your connection is encrypted to. The shield icon in the app shows that report, a
 trust it.</p>
 
 <h3>What we store about you</h3>
-<p>Nothing. There are no accounts, no sign-in, and no server-side storage of
-conversations. A chat's address (<code>/c/&lt;id&gt;</code>) is a key in your own
-browser's database; the server has never heard of it and could not look it up if asked.
-The enclave holds a conversation in memory while it writes the reply and never writes it
-to storage. Diagnostic logs record operational events (errors, startup), not
-conversation content.</p>
+<p>Nothing. This service keeps no accounts and no server-side storage of conversations.
+A chat's address (<code>/c/&lt;id&gt;</code>) is a key in your own browser's database;
+the server has never heard of it and could not look it up if asked. The enclave holds a
+conversation in memory while it writes the reply and never writes it to storage.
+Diagnostic logs record operational events (errors, startup), not conversation
+content.</p>
+<p>Some deployments require signing in with an <a href="https://enclave.host"
+rel="noopener">Enclave</a> account. The login itself (passkey or wallet) happens at
+enclave.host, never here; what this app receives is a short-lived signed note naming
+your account's wallet address, sent along with each message you send. The enclave checks
+the note's signature and expiry and keeps none of it: no session table, no user record,
+nothing written. Signing out is your browser discarding the note.</p>
 
 <h3>What stays in your browser</h3>
 <ul>
@@ -154,6 +161,10 @@ conversation content.</p>
   <li><b>Offline cache.</b> A service worker caches the app's own files (the page,
   icons, a font) so it opens fast and works offline. It never caches conversations or
   answers.</li>
+  <li><b>Sign-in note.</b> On a deployment with sign-in, the signed note from
+  enclave.host lives in this tab's session storage, regardless of the "Remember on this
+  device" switch: it is a credential, not history, and it is gone when the tab
+  closes.</li>
 </ul>
 
 <h3>What leaves the enclave, and when</h3>

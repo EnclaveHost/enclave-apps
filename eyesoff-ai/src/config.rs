@@ -125,9 +125,19 @@ pub struct AppConfig {
     #[serde(default = "default_repeat_guard")]
     pub repeat_guard: usize,
     /// when set, /v1/* requires `Authorization: Bearer <api_key>`. The chat
-    /// UI and legacy /chat stay open - gate those with a PRIVATE deployment.
+    /// UI and legacy /chat stay open - gate those with a PRIVATE deployment,
+    /// or with `sso` below when the gate should be a LOGIN rather than a key.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// SIGN IN WITH ENCLAVE: when set (and `required`, its default), POST
+    /// /chat and /title demand a platform sign-in token, and /v1/* accepts
+    /// one beside api_key. The token is minted by enclave.host after the
+    /// visitor authenticates there (passkey or wallet) and is verified HERE,
+    /// statelessly - signature against `signer`, audience against this
+    /// deployment's id, expiry against the clock. See sso.rs for the format
+    /// and PLATFORM-sso.md for the platform half of the contract.
+    #[serde(default)]
+    pub sso: Option<crate::sso::SsoConfig>,
     /// inference backend: "onnx" (default - model bytes read from the volume,
     /// KV cache shuttled through wasi-nn tensors, model must fit guest memory)
     /// or "ggml" (a GGUF the HOST preloaded from the same volume; weights

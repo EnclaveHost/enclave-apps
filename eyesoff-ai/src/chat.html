@@ -620,13 +620,14 @@
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
   /* ------------------------------ API + attestation + CPU-mode dialogs -- */
-  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay {
+  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #ssoOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
   #apiOverlay.open, #attOverlay.open, #gpuOverlay.open, #webOverlay.open,
-  #camOverlay.open { display: flex; }
+  #camOverlay.open, #ssoOverlay.open { display: flex; }
+  #ssoOverlay .api-card { font-size: 14px; line-height: 1.65; max-width: 520px; }
   #camOverlay .api-card { max-width: 560px; }
   .cam-stage {
     position: relative; margin: 8px 0 0; border-radius: 14px; overflow: hidden;
@@ -1039,6 +1040,10 @@
         <a href="privacy" target="_blank" rel="noopener">Privacy</a>
         <span aria-hidden="true">&middot;</span>
         <a href="terms" target="_blank" rel="noopener">Terms</a>
+        <!-- sign-in state, only when the deployment configured it: a "Sign in"
+             link, or the signed-in address doubling as the sign-out control -->
+        <span aria-hidden="true" id="ssoSep" hidden>&middot;</span>
+        <a href="#" id="ssoLink" hidden></a>
       </div>
     </div>
   </div>
@@ -1109,7 +1114,8 @@
       <div class="code"><div class="code-head"><span>curl</span><button type="button" class="cbtn" id="apiCopyCurl">Copy</button></div><pre><code id="apiCurl"></code></pre></div>
       <p class="api-fine">Streaming and non-streaming. Also <code class="ic">GET /v1/models</code>, <code class="ic">GET /warmup?model=…</code>.
       Model names match the picker. If the server config sets <code class="ic">api_key</code>, send it as
-      <code class="ic">Authorization: Bearer &lt;key&gt;</code>. Requests run in the same enclave as this chat.</p>
+      <code class="ic">Authorization: Bearer &lt;key&gt;</code>; a deployment with sign-in configured
+      accepts your sign-in token there too. Requests run in the same enclave as this chat.</p>
     </div>
   </div>
 
@@ -1184,6 +1190,25 @@
         <button class="web-btn" id="webNo">Not now</button>
       </div>
       <p class="web-foot" id="webFoot"></p>
+    </div>
+  </div>
+  <div id="ssoOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="ssoTitle">
+      <div class="api-head">
+        <h2 id="ssoTitle">Sign in to continue</h2>
+        <button class="icon-btn" id="ssoClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <p class="gpu-lead">This deployment asks you to sign in with your <b>Enclave</b> account,
+      the same passkey or wallet you use on enclave.host. You will be sent there, asked to
+      approve, and brought straight back.</p>
+      <p class="web-note">This app never sees the passkey or wallet itself, only a short-lived
+      signed note naming your account address, kept in this tab and gone when it closes.
+      Conversations still stay in your browser; nothing about you is stored server-side.</p>
+      <div class="web-actions">
+        <button class="web-btn primary" id="ssoGo">Sign in with Enclave</button>
+      </div>
     </div>
   </div>
   <div id="gpuOverlay">
@@ -1861,6 +1886,10 @@ const state = {
   // deployment set default_on.
   toolsOn: false,
   tools: { enabled: false },
+  // SIGN IN WITH ENCLAVE: what /models reported about this deployment's
+  // sign-in flow. `required` gates the two generation routes server-side;
+  // everything here is just the UI knowing where to send people.
+  auth: { enabled: false },
   // IMAGES IN (the other direction from `image`): whether any servable model
   // can READ pictures, and the limits the composer enforces before uploading.
   // Vision is per MODEL - the attach button follows the selected one - UNLESS
@@ -1934,6 +1963,69 @@ let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
 function pref(key, val) {
   if (storeOK) try { localStorage.setItem(key, val); } catch (_) {}
+}
+
+// ------------------------------------------------- sign in with enclave --
+// The deployment may require (or merely offer) signing in with the visitor's
+// Enclave account. The whole client side is: send them to enclave.host's
+// authorize page, take the token off the return fragment, and attach it as a
+// bearer header to /chat and /title. The token lives in SESSION storage, not
+// local: it is a credential, its natural lifetime is the tab's, and it must
+// not depend on the "Remember on this device" switch to exist (a gated
+// deployment with storage off still has to be usable).
+const SSO_KEY = "llmchat-sso", SSO_STATE_KEY = "llmchat-sso-state";
+let ssoToken = null;
+try { ssoToken = sessionStorage.getItem(SSO_KEY) || null; } catch (_) {}
+// The return leg: enclave.host redirects back with #sso=<token>&state=<s> in
+// the FRAGMENT, which never reaches a server or a log. Only a token this tab
+// asked for is accepted - the state echo must match the one stored when the
+// flow started - so a crafted link cannot log a visitor into an account they
+// never chose. Either way the fragment is stripped from the address bar.
+(function () {
+  const h = location.hash || "";
+  const m = /[#&]sso=([^&]+)/.exec(h);
+  if (!m) return;
+  const st = /[#&]state=([^&]+)/.exec(h);
+  let expect = null;
+  try { expect = sessionStorage.getItem(SSO_STATE_KEY); } catch (_) {}
+  if (expect && st && decodeURIComponent(st[1]) === expect) {
+    ssoToken = decodeURIComponent(m[1]);
+    try {
+      sessionStorage.setItem(SSO_KEY, ssoToken);
+      sessionStorage.removeItem(SSO_STATE_KEY);
+    } catch (_) {}
+  }
+  history.replaceState(null, "", location.pathname + location.search);
+})();
+function ssoHeaders() { return ssoToken ? { authorization: "Bearer " + ssoToken } : {}; }
+// display only - the server re-verifies every request; nothing here trusts
+// what the payload claims
+function ssoAddress() {
+  if (!ssoToken) return null;
+  try {
+    const p = JSON.parse(atob(ssoToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof p.sub === "string" ? p.sub : null;
+  } catch (_) { return null; }
+}
+function ssoPending() { return state.auth.enabled && state.auth.required && !ssoToken; }
+function ssoStart() {
+  if (!state.auth.enabled) return;
+  let s = "";
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  b.forEach((x) => { s += x.toString(16).padStart(2, "0"); });
+  try { sessionStorage.setItem(SSO_STATE_KEY, s); } catch (_) {}
+  // return to this very page (path included - a proxy prefix must survive);
+  // the fragment the platform appends is for this script, not the server
+  const back = location.origin + location.pathname + location.search;
+  location.href = state.auth.authorize_url
+    + "?aud=" + encodeURIComponent(state.auth.aud || "")
+    + "&redirect_uri=" + encodeURIComponent(back)
+    + "&state=" + s;
+}
+function ssoDrop() {
+  ssoToken = null;
+  try { sessionStorage.removeItem(SSO_KEY); } catch (_) {}
 }
 
 // Chats persist to IndexedDB - local to this browser profile, never sent
@@ -3088,6 +3180,7 @@ window.addEventListener("keydown", (e) => {
     if (apiOverlay.classList.contains("open")) { closeApi(); return; }
     if (attOverlay.classList.contains("open")) { closeAtt(); return; }
     if (camOverlay.classList.contains("open")) { closeCam(); return; }
+    if (ssoOverlay.classList.contains("open")) { closeSso(); return; }
     if (webOverlay.classList.contains("open")) { answerWeb(false); return; }
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
@@ -3316,7 +3409,7 @@ async function run(chat) {
     const payload = buildPayload(chat);
     const res = await fetch("chat", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...ssoHeaders() },
       body: JSON.stringify({
         messages: payload, target: state.target, model: state.model || undefined,
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
@@ -3333,6 +3426,14 @@ async function run(chat) {
       signal: ctl.signal,
     });
     if (!res.ok || !res.body) {
+      // a 401 with sign-in configured is not an error to render, it is the
+      // gate: drop whatever token was sent (absent and expired get the same
+      // answer), reopen the dialog, and let the server's message stand
+      if (res.status === 401 && state.auth.enabled) {
+        ssoDrop();
+        renderSsoUI();
+        openSso();
+      }
       let e = "HTTP " + res.status;
       try { e = (await res.json()).error || e; } catch (_) {}
       throw new Error(typeof e === "string" ? e : (e.message || JSON.stringify(e)));
@@ -3500,7 +3601,7 @@ async function nameChat(chat) {
     };
     const res = await fetch("title", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...ssoHeaders() },
       body: JSON.stringify(body),
     });
     if (!res.ok) return;
@@ -3957,6 +4058,9 @@ webOverlay.addEventListener("click", (e) => { if (e.target === webOverlay) answe
 // broken page, and the GPU one is about whether the app works at all.
 function webNotice() {
   if (webAsked || !bootGone) return;
+  // sign-in first: a gated composer makes the web question moot, and after
+  // the sign-in round trip this page loads fresh and asks then
+  if (ssoPending()) return;
   if (!state.search || !state.search.enabled) return;
   if (state.webMode !== "off") return;          // already on: nothing to ask
   let asked = null;
@@ -3966,6 +4070,43 @@ function webNotice() {
   webAsked = true;
   openWeb();
 }
+
+// ------------------------------------------------ sign-in gate + indicator --
+const ssoOverlay = $("ssoOverlay");
+// Closable on purpose, required or not: the page stays readable (history,
+// attestation, the legal pages) - only generation is gated, and a send just
+// brings the dialog back with the server's own 401 beside it.
+function openSso() { ssoOverlay.classList.add("open"); $("ssoGo").focus(); }
+function closeSso() { ssoOverlay.classList.remove("open"); }
+$("ssoGo").addEventListener("click", ssoStart);
+$("ssoClose").addEventListener("click", closeSso);
+ssoOverlay.addEventListener("click", (e) => { if (e.target === ssoOverlay) closeSso(); });
+function ssoNotice() { if (bootGone && ssoPending()) openSso(); }
+// the sidebar line: "Sign in", or the signed-in address doubling as sign-out
+function renderSsoUI() {
+  const link = $("ssoLink"), sep = $("ssoSep");
+  const show = state.auth.enabled;
+  link.hidden = sep.hidden = !show;
+  if (!show) return;
+  const addr = ssoToken ? ssoAddress() : null;
+  if (addr) {
+    link.textContent = "Sign out (" + addr.slice(0, 6) + "…" + addr.slice(-4) + ")";
+    link.title = "Signed in as " + addr + " - click to sign out";
+  } else {
+    link.textContent = "Sign in";
+    link.title = "Sign in with your Enclave account";
+  }
+}
+$("ssoLink").addEventListener("click", (e) => {
+  e.preventDefault();
+  if (ssoToken) {
+    ssoDrop();
+    renderSsoUI();
+    if (ssoPending()) openSso();   // a required gate re-asserts itself
+  } else {
+    openSso();
+  }
+});
 cpuChip.addEventListener("click", openGpu);
 $("gpuClose").addEventListener("click", closeGpu);
 gpuOverlay.addEventListener("click", (e) => { if (e.target === gpuOverlay) closeGpu(); });
@@ -4221,6 +4362,8 @@ const modelsReady = (async () => {
   state.toolsOn = state.tools.enabled && state.tools.default_on === true;
   if (state.tools.enabled && (storedTools === "on" || storedTools === "off"))
     state.toolsOn = storedTools === "on";
+  state.auth = info.auth || { enabled: false };
+  renderSsoUI();
   // no provider: the web switch governs nothing
   if (!state.search.enabled) state.webMode = "off";
   if (state.gpu === false) {
@@ -4299,7 +4442,8 @@ function dismissBoot() {
   bootEl.classList.add("hide");
   setTimeout(() => bootEl.remove(), 450);
   setTimeout(gpuNotice, 550);   // once the overlay is out of the way
-  setTimeout(webNotice, 700);   // ...and the web question after that
+  setTimeout(ssoNotice, 600);   // the gate outranks the web question...
+  setTimeout(webNotice, 700);   // ...which webNotice() itself defers to
 }
 $("bootSkip").addEventListener("click", dismissBoot);
 
