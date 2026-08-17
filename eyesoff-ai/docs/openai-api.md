@@ -33,9 +33,15 @@ without it. **No key configured = open.** Gate with a private deployment when
 that is the intent; the chat playground and the legacy `/chat` route stay open
 either way (see `authorized()` and the `api_key` doc in `config.rs`).
 
+The same credential is also read from `x-api-key: <value>`, and where the
+fleet's inbound TLS proxy eats `Authorization` (observed 2026-08-17: a
+correct Bearer answered 401 while the same value as `X-Api-Key` answered
+200), that spelling is the one that reliably arrives - send both when in
+doubt, the server checks either.
+
 A deployment configured for **Sign in with Enclave** (top-level `sso` block)
-additionally accepts a platform sign-in token in the same header, on `/v1/*`
-and on the playground routes alike - one login, either surface. With
+additionally accepts a platform sign-in token as the same credential, on
+`/v1/*` and on the playground routes alike - one login, either surface. With
 `sso.required` true the playground's `/chat` and `/title` demand one; a 401
 there carries `"code": "sso_required"`, which is what tells the playground to
 open its sign-in dialog. See `sso.rs` for the token format and

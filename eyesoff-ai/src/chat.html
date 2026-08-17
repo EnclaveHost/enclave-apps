@@ -1997,7 +1997,15 @@ try { ssoToken = sessionStorage.getItem(SSO_KEY) || null; } catch (_) {}
   }
   history.replaceState(null, "", location.pathname + location.search);
 })();
-function ssoHeaders() { return ssoToken ? { authorization: "Bearer " + ssoToken } : {}; }
+// Both spellings, same value: the fleet's inbound TLS proxy has been seen
+// eating Authorization (Bearer 401 while X-Api-Key 200, e64f7cba,
+// 2026-08-17), and the server takes the credential from either header, so
+// sending both works whatever a given proxy hop does.
+function ssoHeaders() {
+  return ssoToken
+    ? { authorization: "Bearer " + ssoToken, "x-api-key": ssoToken }
+    : {};
+}
 // display only - the server re-verifies every request; nothing here trusts
 // what the payload claims
 function ssoAddress() {

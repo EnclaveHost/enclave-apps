@@ -151,6 +151,13 @@ compatible.
 - The playground starts the flow with `aud`, `redirect_uri` (its own page)
   and a random `state` kept in sessionStorage, and stores the returned token
   in sessionStorage for the tab's lifetime.
+- **Header transport caveat.** The fleet's inbound TLS proxy has been
+  observed stripping `Authorization` (2026-08-17, deployment e64f7cba: a
+  correct Bearer answered 401 while the same value as `X-Api-Key` answered
+  200). The app therefore reads the credential from `Authorization: Bearer`
+  OR `x-api-key`, and the playground sends both. Platform fix worth making
+  regardless: the proxy should pass `Authorization` through untouched; until
+  it does, `x-api-key` is the spelling that provably arrives.
 
 ## Non-goals, stated so they stay stated
 

@@ -6553,13 +6553,27 @@ fn json_err(out: ResponseOutparam, status: u16, msg: &str) {
     );
 }
 
-/// The request's `Authorization: Bearer` value, if it sent one.
+/// The request's bearer credential: `Authorization: Bearer <v>`, or the
+/// same value as `x-api-key: <v>` (see below for why both spellings exist).
 fn bearer_token(req: &IncomingRequest) -> Option<String> {
     let headers = req.headers();
     for v in headers.get(&"authorization".to_string()) {
         if let Ok(s) = String::from_utf8(v) {
             if let Some(tok) = s.strip_prefix("Bearer ") {
                 return Some(tok.trim().to_string());
+            }
+        }
+    }
+    // The fleet's inbound TLS proxy has been observed EATING Authorization
+    // (proven on e64f7cba, 2026-08-17: correct Bearer answered 401 while the
+    // same value as X-Api-Key answered 200), so the same credential - api_key
+    // or sign-in token - is taken from x-api-key too. The playground sends
+    // both spellings; a client may send either.
+    for v in headers.get(&"x-api-key".to_string()) {
+        if let Ok(s) = String::from_utf8(v) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
             }
         }
     }
