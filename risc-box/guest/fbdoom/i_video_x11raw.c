@@ -317,7 +317,15 @@ static void fb_open(void)
 }
 
 // Where is this window on the root, right now? (The window manager reparents
-// and decorates, so the answer is not the position we asked for.)
+// and decorates, so the answer is not the position we asked for.) The request
+// is fire-and-forget: the reply is consumed by x_pump, the client's single
+// reply/event reader — a second reader here raced it for the reply and could
+// block forever on a reply the pump had already drained. Until the answer
+// arrives org stays -1 and frames go through the server, which is always
+// correct.
+static int tc_pending;
+static int tc_discard;   // in-flight replies made stale by a window move
+
 static void x_resolve_origin(void)
 {
     struct {
@@ -326,33 +334,15 @@ static void x_resolve_origin(void)
         uint32_t src, dst;
         int16_t x, y;
     } tc = { 40, 0, 4, 0, 0, 0, 0 };
-    uint8_t r[32];
 
+    if (tc_pending)
+        return;
     tc.src = win;
     tc.dst = root_win;
     org_x = org_y = -1;
     if (wr(&tc, sizeof(tc)) < 0)
         return;
-    // Read until the reply; events seen on the way are handled as usual.
-    for (;;) {
-        if (rd(r, sizeof(r)) < 0)
-            return;
-        if ((r[0] & 0x7f) == 1) {                 // reply
-            uint32_t extra = *(uint32_t *)(r + 4);
-            while (extra--) {
-                uint8_t junk[4];
-                if (rd(junk, 4) < 0)
-                    return;
-            }
-            org_x = *(int16_t *)(r + 8);
-            org_y = *(int16_t *)(r + 10);
-            return;
-        }
-        if (shm_ev && (r[0] & 0x7f) == shm_ev && pending > 0)
-            pending--;
-        else if ((r[0] & 0x7f) == 15)             // VisibilityNotify
-            visible = (r[8] == 0);
-    }
+    tc_pending = 1;
 }
 
 // Ask for MIT-SHM and set up the shared frames. Returns 0 if anything is
@@ -576,15 +566,15 @@ void I_FinishUpdate(void)
     have_prev = 1;
 
     // Can this frame go straight to the screen? Only if the framebuffer is
-    // mapped, the window is wholly visible, we know where it is, it fits, and
-    // the destination is 8-byte aligned (the doubled-pixel store is 64 bits;
-    // a misaligned one on this guest is emulated a byte at a time and would
-    // cost more than the copy it saves).
+    // mapped, the window is wholly visible, we know where it is, and it fits.
+    // An 8-byte-misaligned destination (the WM's frame border makes org_x odd)
+    // drops the doubled-pixel store to 32-bit halves rather than the whole
+    // path to the server: two extra stores a pixel pair is nothing against
+    // the copy through Xorg they replace.
     if (fbmem && org_x < 0)
         x_resolve_origin();
     int overlay = fbmem && visible && org_x >= 0 && org_y >= 0
-        && org_x + win_w <= fb_w_px && org_y + win_h <= fb_h_px
-        && ((org_x * 4) % 8) == 0;
+        && org_x + win_w <= fb_w_px && org_y + win_h <= fb_h_px;
     uint8_t *dst_base = overlay
         ? fbmem + (size_t)org_y * fb_stride + (size_t)org_x * 4
         : (uint8_t *)img;
@@ -601,7 +591,7 @@ void I_FinishUpdate(void)
             for (x = 0; x < SCREENWIDTH; x++)
                 out[x] = palette[in[x]];
         }
-    } else if (scale == 2) {
+    } else if (scale == 2 && ((uintptr_t)dst_base % 8) == 0) {
         for (y = first; y <= last; y++) {
             uint64_t *o0 = (uint64_t *)(dst_base + (size_t)(y * 2) * dst_stride);
             uint64_t *o1 = (uint64_t *)(dst_base + (size_t)(y * 2 + 1) * dst_stride);
@@ -611,6 +601,20 @@ void I_FinishUpdate(void)
                 uint64_t cc = ((uint64_t)c << 32) | c;
                 o0[x] = cc;
                 o1[x] = cc;
+            }
+        }
+    } else if (scale == 2) {
+        // the odd-org_x overlay: same fused lookup, 32-bit stores
+        for (y = first; y <= last; y++) {
+            uint32_t *o0 = (uint32_t *)(dst_base + (size_t)(y * 2) * dst_stride);
+            uint32_t *o1 = (uint32_t *)(dst_base + (size_t)(y * 2 + 1) * dst_stride);
+            const uint8_t *in = src + (size_t)y * SCREENWIDTH;
+            for (x = 0; x < SCREENWIDTH; x++) {
+                uint32_t c = palette[in[x]];
+                o0[x * 2] = c;
+                o0[x * 2 + 1] = c;
+                o1[x * 2] = c;
+                o1[x * 2 + 1] = c;
             }
         }
     } else {
@@ -861,6 +865,18 @@ static void x_pump(int blocking)
                     if (rd(junk, 4) < 0)
                         return;
                 }
+                // The only reply this client awaits after setup is
+                // TranslateCoordinates: child window at +8, then the root
+                // coordinates at +12/+14 (NOT +8/+10 — that is the child id,
+                // and reading it as x/y is what painted the overlay's ghost).
+                if (tc_discard > 0) {
+                    tc_discard--;      // answers a position we no longer hold
+                    tc_pending = 0;
+                } else if (tc_pending) {
+                    org_x = *(int16_t *)(ev + 12);
+                    org_y = *(int16_t *)(ev + 14);
+                    tc_pending = 0;
+                }
                 break;
             }
             case 15:     // VisibilityNotify
@@ -868,6 +884,8 @@ static void x_pump(int blocking)
                 break;
             case 22:     // ConfigureNotify: the window moved or resized
                 org_x = org_y = -1;   // re-resolved before the next overlay frame
+                if (tc_pending)
+                    tc_discard++;     // any answer in flight names the old spot
                 have_prev = 0;        // and repaint all of it
                 break;
             case 12:     // Expose: X blanked part of us; redraw everything

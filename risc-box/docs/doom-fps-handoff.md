@@ -103,18 +103,26 @@ a menu or the demo-loop wipe.
 
 ## What did not pay — measured, do not repeat
 
-- **Direct-to-framebuffer overlay** (write the scaled frame into `/dev/fb0`,
-  skipping the server's copy out of shared memory). It works — the game reports
-  "100 direct / 0 via X" — and it is not faster: same binary, same boot,
-  24-40 fps with it against 35-40 without. It also owes correctness the copy
-  gets for free: it paints outside the window whenever the window has moved and
-  the origin has not been re-resolved, visible as a ghost on the desktop. Kept
-  behind `-overlay`, off by default.
-  *Caveat worth knowing:* a separate single observation on this workstation
-  read 65-70 fps with the overlay on, but it was not a controlled A/B and was
-  taken right after boot when the demo is in light scenes. The A/B is the
-  better evidence; the discrepancy is unexplained and would need same-scene
-  repetition to settle.
+- ~~**Direct-to-framebuffer overlay**: not faster (24-40 vs 35-40)~~ —
+  **RETRACTED 2026-08-17: every overlay measurement above was invalid.**
+  `x_resolve_origin` parsed the TranslateCoordinates reply at +8/+10 — the
+  child window id's halves — instead of the root coordinates at +12/+14, so
+  the "origin" was garbage: under a reparenting WM the fits check failed and
+  the overlay silently never engaged (`0 direct`, including in this file's
+  own headline runs), and when it did pass, it painted at a wrong origin —
+  the "ghost" documented here was this bug, not a re-resolve latency. Two
+  more defects stacked on top: the reply wait raced `x_pump` (whichever read
+  the socket first consumed the reply; the loser blocked forever — the
+  mid-demo freeze), and the engagement gate required an 8-byte-aligned
+  destination, which fluxbox's 1px frame border (client x = 1, odd) makes
+  permanently false. With all three fixed and the overlay genuinely engaged
+  for the first time, the same-rig A/B (real image, demo1 timedemo,
+  boot-bench --type, this workstation) reads **via X 58.8 fps / overlay 78.1
+  fps = 1.33x** — the server's copy out of shared memory was ~25% of the
+  whole frame budget. Shipped: the deployment boots `doom/rootfs-ov.ext2.gz`
+  (config override) with the fixed xdoom; the demo loop on kryptos moved
+  from a 21.8 floor / 33 median to holding the engine's 35 cap with the
+  floor above 24 (see the addendum at the end).
 - **Unchecked memory accessors in the emulator** — the accessors already do an
   explicit `fits()` test and then index a slice, which checks the same bound
   again. Replacing the second check with an unaligned raw read: 88.6-90.8 vs

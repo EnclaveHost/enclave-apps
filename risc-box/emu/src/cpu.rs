@@ -831,7 +831,7 @@ impl Cpu {
 	/// risc-box patch (blockstats): iterative Tarjan SCC over the block
 	/// graph; returns for each node index its SCC id, plus SCC sizes.
 	#[cfg(feature = "blockstats")]
-	fn stat_regions(&self) -> (Vec<u64>, Vec<(usize, u64, u64)>) {
+	fn stat_regions(&self) -> (Vec<u64>, Vec<(usize, u64, u64, Vec<u64>)>) {
 		// index nodes
 		let mut ids: Vec<u64> = self.stat_nodes.keys().cloned().collect();
 		ids.sort();
@@ -908,8 +908,8 @@ impl Cpu {
 				}
 			}
 		}
-		// per-SCC: node count, execs, retired
-		let mut sccs: Vec<(usize, u64, u64)> = vec![(0, 0, 0); scc_count as usize];
+		// per-SCC: node count, execs, retired, member pcs (capped)
+		let mut sccs: Vec<(usize, u64, u64, Vec<u64>)> = vec![(0, 0, 0, Vec::new()); scc_count as usize];
 		let mut node_scc = vec![0u64; n];
 		for i in 0..n {
 			let sid = scc_of[i] as usize;
@@ -917,6 +917,9 @@ impl Cpu {
 			sccs[sid].0 += 1;
 			sccs[sid].1 += ex;
 			sccs[sid].2 += rt;
+			if sccs[sid].3.len() < 8 {
+				sccs[sid].3.push(ids[i]);
+			}
 			// cyclic if SCC has >1 node or the node self-loops
 			node_scc[i] = match sccs[sid].0 > 1 || self_loop[i] {
 				true => 1,
@@ -971,10 +974,11 @@ impl Cpu {
 		sccs.sort_by(|a, b| b.2.cmp(&a.2));
 		eprintln!("  top cyclic regions (blocks, execs, retired):");
 		let mut shown = 0;
-		for &(nn, ex, rt) in sccs.iter() {
-			if nn > 1 && shown < 8 {
-				eprintln!("    {:>4} blocks  {:>12} execs  {:>12} retired ({:.1}%)",
-					nn, ex, rt, rt as f64 * 100.0 / node_total as f64);
+		for (nn, ex, rt, pcs) in sccs.iter() {
+			if *nn > 1 && shown < 8 {
+				let hex: Vec<String> = pcs.iter().map(|p| format!("{:#x}", p)).collect();
+				eprintln!("    {:>4} blocks  {:>12} execs  {:>12} retired ({:.1}%)  pcs: {}",
+					nn, ex, rt, *rt as f64 * 100.0 / node_total as f64, hex.join(" "));
 				shown += 1;
 			}
 		}
