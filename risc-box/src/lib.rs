@@ -1153,6 +1153,21 @@ pub fn run() {
             route(&mut app, &mut server, key, req);
         }
 
+        // A subscriber that fell behind was starved rather than closed
+        // (httpd.rs, SSE_SKIP_WBUF); the events it missed were dropped, not
+        // queued. Now that it has drained it owes nothing — WE owe it a
+        // complete picture: a whole-frame scan for the display, a fresh
+        // encoder (hence keyframe) for the video stream. Console watchers
+        // just lose the gap; scrollback only ever replays on join.
+        if server.sse_take_recovered("display") {
+            app.display.want_full();
+            worker::want_full();
+        }
+        if server.sse_take_recovered("video") {
+            app.av1 = None;
+            worker::reset();
+        }
+
         if last_heartbeat.elapsed() >= HEARTBEAT {
             last_heartbeat = Instant::now();
             let phase = match app.phase {

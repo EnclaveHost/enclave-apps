@@ -37,12 +37,26 @@ pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub const MAX_TARGET_BYTES: usize = 4 * 1024;
 pub const MAX_CONNS: usize = 384;
 pub const MAX_WBUF: usize = 512 * 1024; // close a client that can't drain this
+// SSE subscribers are never closed for a backlog — they are STARVED. Past
+// SSE_SKIP_WBUF a subscriber stops receiving new broadcasts (each skipped
+// event is dropped for that subscriber, not queued); below SSE_RESUME_WBUF it
+// receives again and is reported via sse_take_recovered() so the app can owe
+// it a whole picture. Closing was the old rule, and it was wrong twice over:
+// a burst the app itself produced (a whole-screen repaint) could jump the
+// backlog from under the pacing gate straight past MAX_WBUF between two
+// checks, so a healthy watcher on a real link was closed for the crime of a
+// scene change — and through the platform proxy that close arrived at the
+// browser as permanent silence, not an error (the SSE wedge, 2026-08-16).
+pub const SSE_SKIP_WBUF: usize = 256 * 1024;
+const SSE_RESUME_WBUF: usize = 64 * 1024;
 const IDLE_KEEPALIVE: Duration = Duration::from_secs(60);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
-// A peer whose write buffer stays wedged this long is gone, whatever its
-// socket claims: three missed heartbeats' worth of not draining a byte.
+// A peer that has not drained a single byte for this long is gone, whatever
+// its socket claims: three missed heartbeats' worth of moving nothing. (Not
+// "non-empty this long" — a starved subscriber paying down a backlog is
+// non-empty for the whole paydown and very much alive.)
 const WRITE_STALL: Duration = Duration::from_secs(45);
 
 pub struct Request {
@@ -106,6 +120,8 @@ struct Conn {
     sent_continue: bool,
     tag: Option<String>,          // app-chosen label for targeted SSE drops
     stuck_since: Option<Instant>, // wbuf continuously non-empty since
+    starved: bool,                // SSE: backlog over SSE_SKIP_WBUF; broadcasts skip it
+    recovered: bool,              // SSE: was starved, has drained; app owes a full frame
 }
 
 pub struct Server {
@@ -170,13 +186,36 @@ impl Server {
     /// drained instantly and nothing ever backed up, so it looked perfect.
     /// A picture stream is lossy by nature; the right answer to a watcher that
     /// cannot keep up is fewer frames, not no connection.
+    /// Starved subscribers are excluded: they receive nothing until they
+    /// recover, so their backlog is theirs to drain — letting it gate the
+    /// scan would hand one dead-behind-a-proxy peer the power to freeze the
+    /// picture for every live watcher (measured doing exactly that).
     pub fn sse_backlog(&self, topic: &str) -> usize {
         self.conns
             .iter()
+            .filter(|c| !c.starved)
             .filter(|c| matches!(&c.state, ConnState::Sse { topic: t, .. } if t == topic))
             .map(|c| c.wbuf.len())
             .max()
             .unwrap_or(0)
+    }
+
+    /// True when any subscriber of `topic` has just drained out of starvation
+    /// (clears the flag). A skipped event is dropped, never delivered late, so
+    /// the app owes recovered subscribers a complete picture: a whole-frame
+    /// scan for a display topic, a fresh keyframe for a video one. Console-like
+    /// topics may ignore this (the gap is simply lost output).
+    pub fn sse_take_recovered(&mut self, topic: &str) -> bool {
+        let mut any = false;
+        for conn in &mut self.conns {
+            if conn.recovered
+                && matches!(&conn.state, ConnState::Sse { topic: t, .. } if t == topic)
+            {
+                conn.recovered = false;
+                any = true;
+            }
+        }
+        any
     }
 
     /// One pass: accept, read, parse. Returns complete requests as
@@ -200,6 +239,8 @@ impl Server {
                         sent_continue: false,
                         tag: None,
                         stuck_since: None,
+                        starved: false,
+                        recovered: false,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -360,6 +401,15 @@ impl Server {
         for conn in &mut self.conns {
             if let ConnState::Sse { topic: t, .. } = &conn.state {
                 if t == topic {
+                    // A subscriber that cannot drain what it already holds
+                    // gets no more; see SSE_SKIP_WBUF. Marked, not closed —
+                    // flush() reports it via sse_take_recovered when it
+                    // catches up, and WRITE_STALL still reaps it if the far
+                    // end has actually stopped draining altogether.
+                    if conn.starved || conn.wbuf.len() > SSE_SKIP_WBUF {
+                        conn.starved = true;
+                        continue;
+                    }
                     chunk_into(&mut conn.wbuf, framed.as_bytes());
                 }
             }
@@ -378,6 +428,14 @@ impl Server {
     pub fn flush(&mut self) -> bool {
         let now = Instant::now();
         let mut busy = false;
+        let app = self.app;
+        // One line per involuntary drop. Rare by design, and exactly what a
+        // fleet log needs when a watcher reports a stream that went quiet.
+        let dropped = |conn: &Conn, why: &str| {
+            if let ConnState::Sse { topic, .. } = &conn.state {
+                eprintln!("[{app}] sse drop ({topic}): {why} (wbuf={})", conn.wbuf.len());
+            }
+        };
         self.conns.retain_mut(|conn| {
             if let ConnState::Sse { last_beat, .. } = &mut conn.state {
                 if now.duration_since(*last_beat) >= SSE_HEARTBEAT {
@@ -397,18 +455,38 @@ impl Server {
             while !conn.wbuf.is_empty() {
                 let (front, _) = conn.wbuf.as_slices();
                 match conn.stream.write(front) {
-                    Ok(0) => return false,
+                    Ok(0) => { dropped(conn, "write returned 0"); return false }
                     Ok(n) => {
                         conn.wbuf.drain(..n);
                         conn.last_activity = now;
+                        // Draining at all is proof of life: the stall timer
+                        // measures a peer that moves NOTHING, not one whose
+                        // queue never quite empties (a starved subscriber
+                        // paying down its backlog stays non-empty for as
+                        // long as the backlog lasts).
+                        conn.stuck_since = None;
                         busy = true;
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(_) => return false,
+                    Err(e) => { dropped(conn, &format!("write error: {e}")); return false }
                 }
             }
+            if conn.starved && conn.wbuf.len() < SSE_RESUME_WBUF {
+                conn.starved = false;
+                conn.recovered = true; // sse_take_recovered() hands this to the app
+            }
             if conn.wbuf.len() > MAX_WBUF {
-                return false; // slow client
+                // A bounded response to a client that will not drain it is a
+                // dead loss: close. An SSE subscriber is different — the
+                // backlog is often OUR burst (one whole-screen repaint can
+                // exceed the gap between the pacing gate and this cap), and
+                // closing it here is how a healthy watcher on a real link
+                // lost its stream. Starve it instead; the queue only drains
+                // from here on, and WRITE_STALL covers a peer that is gone.
+                match conn.state {
+                    ConnState::Sse { .. } => conn.starved = true,
+                    _ => return false, // slow client
+                }
             }
             // Ghost detection: a live peer drains heartbeats within a tick
             // or two; a buffer that stays wedged across three heartbeat
@@ -418,7 +496,10 @@ impl Server {
             match (conn.wbuf.is_empty(), conn.stuck_since) {
                 (true, _) => conn.stuck_since = None,
                 (false, None) => conn.stuck_since = Some(now),
-                (false, Some(t0)) if now.duration_since(t0) > WRITE_STALL => return false,
+                (false, Some(t0)) if now.duration_since(t0) > WRITE_STALL => {
+                    dropped(conn, "write stall: nothing drained for 45s");
+                    return false;
+                }
                 _ => {}
             }
             match &conn.state {

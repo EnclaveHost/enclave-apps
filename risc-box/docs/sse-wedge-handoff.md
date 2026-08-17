@@ -1,5 +1,39 @@
 # Handoff: one request silences an open SSE stream, for good
 
+> **RESOLVED 2026-08-16 — it was BOTH layers, stacked, and the trigger was a
+> red herring.** Bisection per this doc's protocol: the app, run locally under
+> plain wasmtime (idle AND with a running guest), never drops a heartbeat
+> through any number of `/status` triggers — and a lone stream against the
+> deployment with the box otherwise silent died at t+2.9s with no second
+> request at all, so "any other request wedges it" was coincidence of timing.
+> The mechanism, both halves measured:
+>
+> 1. **App (`src/httpd.rs`)**: over a real backpressured path the SSE write
+>    buffer rides near the 192 KiB pacing gate, and one large band burst (a
+>    whole-screen repaint) jumps it straight past `MAX_WBUF` (512 KiB), where
+>    `flush()` CLOSED the connection. On loopback the buffer never fills,
+>    which is why the app looked innocent locally and why the local test in
+>    this doc, run alone, gives the wrong verdict.
+> 2. **Platform (`~/Projects/enclave/supervisor.js`, the `/x/:id` proxy)**:
+>    `upRes.pipe(res)` forwards only a CLEAN upstream end. The app's close
+>    arrived as an aborted upstream response — unhandled — so the pipe simply
+>    stopped and the CLIENT socket stayed ESTABLISHED and silent forever: no
+>    FIN, no error, no heartbeat. Reproduced locally with the handler's exact
+>    code shape: app killed mid-stream, client hung 25s+ until its own
+>    timeout. That swallow is what turned a recoverable stream-end (an
+>    EventSource redials instantly on a visible close) into the permanent
+>    wedge this doc describes.
+>
+> Fixes, verified locally: httpd.rs now STARVES an over-backlog SSE
+> subscriber instead of closing it (skip past `SSE_SKIP_WBUF`, resume below
+> `SSE_RESUME_WBUF`, `sse_take_recovered()` owes it a full frame/keyframe;
+> the stall reaper now keys on "nothing drained for 45s", not "non-empty for
+> 45s"), and the supervisor/api-relay proxies destroy the client leg when the
+> tenant leg dies mid-response (abort propagates in ~20 ms, measured). The
+> cold-connect collapse was re-measured absent with the box quiet and is
+> state-dependent on wedge activity; re-check it after both fixes deploy.
+> Confirmation on a live deployment still requires shipping both layers.
+
 You are picking up a reproducible defect on RISC Box (`~/Projects/enclave-apps/risc-box`;
 platform repo `~/Projects/enclave`). Everything below was measured, not assumed.
 Read the ruled-out list before repeating any of it.
