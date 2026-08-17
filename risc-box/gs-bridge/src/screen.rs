@@ -63,6 +63,26 @@ impl Screen {
         screen
     }
 
+    /// Like `start`, but pull-paced (see `run_pull`). Needs an app serving
+    /// GET /fb.bands (risc-box 0.6.29+ / risc-box-doom 0.7.7+).
+    pub fn start_pull(app: Arc<App>, width: usize, height: usize) -> Arc<Screen> {
+        let screen = Arc::new(Screen {
+            frame: Mutex::new(vec![0u8; width * height * RGB_BPP]),
+            generation: AtomicU64::new(0),
+            width,
+            height,
+        });
+        let worker = screen.clone();
+        std::thread::spawn(move || loop {
+            match worker.run_pull(&app) {
+                Ok(()) => eprintln!("[screen] /fb.bands pull ended; redialing"),
+                Err(e) => eprintln!("[screen] /fb.bands pull failed ({e}); redialing"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        screen
+    }
+
     /// Copy the current picture out, in rgb24. Returns the generation so the
     /// caller can skip re-encoding an unchanged screen if it wants to.
     pub fn snapshot_into(&self, out: &mut Vec<u8>) -> u64 {
@@ -111,9 +131,17 @@ impl Screen {
             let payload = payload.trim_end();
             // The first frame is `event: mode` with the geometry; the rest are
             // bands. Anything without a "b" field is not a band.
-            let Some(b64) = json_str(payload, "b") else { continue };
+            self.apply_band_payload(payload);
+        }
+    }
+
+    /// One band, as its JSON object (the SSE `data:` payload and each
+    /// /fb.bands event are the same shape). Not-a-band payloads are ignored.
+    fn apply_band_payload(&self, payload: &str) {
+        {
+            let Some(b64) = json_str(payload, "b") else { return };
             let (Some(y), Some(h)) = (json_num(payload, "y"), json_num(payload, "h")) else {
-                continue;
+                return;
             };
             // A band used to be a run of whole rows; it is now a rectangle, and
             // carries only the columns that changed. Absent x/w means an older
@@ -123,11 +151,11 @@ impl Screen {
             let w = json_num(payload, "w").unwrap_or(self.width);
             let Some(deflated) = b64_decode(b64) else {
                 eprintln!("[screen] band with undecodable base64, skipped");
-                continue;
+                return;
             };
             let Ok(rows) = miniz_oxide::inflate::decompress_to_vec(&deflated) else {
                 eprintln!("[screen] band failed to inflate, skipped");
-                continue;
+                return;
             };
             if std::env::var_os("GS_SCREEN_TRACE").is_some() {
                 eprintln!(
@@ -137,6 +165,39 @@ impl Screen {
                 );
             }
             self.apply(x, w, y, h, &rows);
+        }
+    }
+
+    /// The pull-paced mirror: ask /fb.bands for whatever changed since the
+    /// last reply, apply it, ask again. In-flight data is never more than one
+    /// response, so the mirror's lag is this link's latency — not the
+    /// megabytes of relay buffering the pushed stream accumulates whenever
+    /// the screen changes faster than the link can carry (which is what put
+    /// a driven cursor seconds behind a perfectly smooth picture). When the
+    /// screen outruns the link the app re-bases us with a fresh full frame:
+    /// fewer, current pictures instead of every stale delta.
+    fn run_pull(&self, app: &App) -> std::io::Result<()> {
+        eprintln!("[screen] pull-mirroring {}x{} from /fb.bands", self.width, self.height);
+        let mut since: usize = 0;
+        loop {
+            let body = app.get(&format!("/fb.bands?since={since}"))?;
+            let body = String::from_utf8_lossy(&body);
+            let gen = json_num(&body, "gen").unwrap_or(since);
+            let empty = match body.find("\"events\":[") {
+                Some(i) => {
+                    let evs = &body[i + 10..body.rfind(']').map(|j| j.max(i + 10)).unwrap_or(i + 10)];
+                    for part in evs.split("},{") {
+                        self.apply_band_payload(part);
+                    }
+                    evs.trim().is_empty()
+                }
+                None => true,
+            };
+            since = gen;
+            if empty {
+                // nothing new; don't hammer the app — poll at ~60 Hz
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
         }
     }
 

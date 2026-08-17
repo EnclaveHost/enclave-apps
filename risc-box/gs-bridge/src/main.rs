@@ -57,6 +57,9 @@ enum FrameSource {
     Auto,
     /// Mirror the /display band stream.
     Bands,
+    /// Poll GET /fb.bands (pull-paced deltas; lowest latency over a link
+    /// slower than the screen changes).
+    Pull,
     /// GET /fb.rgb per frame.
     Raw,
 }
@@ -108,10 +111,11 @@ fn parse_args() -> Args {
             "--frames" if i + 1 < argv.len() => {
                 frames = match argv[i + 1].as_str() {
                     "bands" => FrameSource::Bands,
+                    "pull" => FrameSource::Pull,
                     "raw" => FrameSource::Raw,
                     "auto" => FrameSource::Auto,
                     other => {
-                        eprintln!("--frames expects auto, bands or raw (got {other})");
+                        eprintln!("--frames expects auto, bands, pull or raw (got {other})");
                         std::process::exit(2);
                     }
                 };
@@ -342,17 +346,20 @@ fn main() {
     // 2.9s against the fleet), so a remote app is mirrored from the /display
     // band stream instead: only changed rows cross the wire. --frames forces
     // either one.
-    let mirror = match args.frames {
-        FrameSource::Auto => args.app_url.starts_with("https://"),
-        FrameSource::Bands => true,
-        FrameSource::Raw => false,
-    };
-    let screen = match mirror {
-        true => {
+    let screen = match args.frames {
+        FrameSource::Pull => {
+            eprintln!("[main] frames: pull-pacing /fb.bands");
+            Some(screen::Screen::start_pull(app.clone(), args.fb.0 as usize, args.fb.1 as usize))
+        }
+        FrameSource::Bands => {
             eprintln!("[main] frames: mirroring the /display band stream");
             Some(screen::Screen::start(app.clone(), args.fb.0 as usize, args.fb.1 as usize))
         }
-        false => {
+        FrameSource::Auto if args.app_url.starts_with("https://") => {
+            eprintln!("[main] frames: mirroring the /display band stream");
+            Some(screen::Screen::start(app.clone(), args.fb.0 as usize, args.fb.1 as usize))
+        }
+        _ => {
             eprintln!("[main] frames: fetching /fb.rgb per frame");
             None
         }

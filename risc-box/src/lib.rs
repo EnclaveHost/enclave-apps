@@ -252,6 +252,74 @@ impl Config {
     }
 }
 
+/// The retained tail of the display's band stream, for GET /fb.bands. Bands
+/// are deltas, so a puller must receive them contiguously — the ring hands
+/// out events strictly from `since`+1, except that a retained FULL frame may
+/// re-base a client that fell behind (a full band supersedes everything
+/// before it, which is also why one clears the ring). A gap it cannot bridge
+/// is answered with `resync`, and the caller schedules a full-frame scan.
+struct BandRing {
+    events: VecDeque<(u64, bool, String)>, // (gen, full-frame?, band JSON)
+    gen: u64,
+    bytes: usize,
+}
+
+impl BandRing {
+    fn new() -> Self {
+        BandRing { events: VecDeque::new(), gen: 0, bytes: 0 }
+    }
+
+    fn push(&mut self, ev: &str, full: bool) {
+        self.gen += 1;
+        if full {
+            self.events.clear();
+            self.bytes = 0;
+        }
+        self.bytes += ev.len();
+        self.events.push_back((self.gen, full, ev.to_string()));
+        // Bounded: a puller further behind than this is re-based or resynced.
+        while self.bytes > (4 << 20) && self.events.len() > 1 {
+            if let Some((_, _, e)) = self.events.pop_front() {
+                self.bytes -= e.len();
+            }
+        }
+    }
+
+    /// Everything after `since`, contiguous, capped at `max_bytes` per reply
+    /// (the caller polls again for the rest). Returns (last gen served,
+    /// events, resync).
+    fn since(&self, since: u64, max_bytes: usize) -> (u64, Vec<String>, bool) {
+        if since >= self.gen {
+            return (self.gen, Vec::new(), false);
+        }
+        let Some(&(first, first_full, _)) = self.events.front() else {
+            return (since, Vec::new(), true);
+        };
+        let start = if since + 1 >= first {
+            since + 1
+        } else if first_full {
+            first // the retained full frame re-bases the client
+        } else {
+            return (since, Vec::new(), true);
+        };
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        let mut last = since;
+        for (g, _full, e) in &self.events {
+            if *g < start {
+                continue;
+            }
+            if bytes + e.len() > max_bytes && !out.is_empty() {
+                break;
+            }
+            bytes += e.len();
+            out.push(e.clone());
+            last = *g;
+        }
+        (last, out, false)
+    }
+}
+
 /// Whether a request may touch the machine. With no `api_key` configured the
 /// app is open (fine for a private deployment). With one set, every control
 /// and observation endpoint requires it — presented as `Authorization: Bearer
@@ -390,6 +458,15 @@ struct App {
     last_save: Option<String>,
     net: Option<NetStack>, // listeners live for the whole process
     display: Display,      // scanout state (see display.rs)
+    // Pull-paced frame delivery (GET /fb.bands): the ring retains the band
+    // events the scan already produced, so a puller consumes at ITS OWN pace
+    // with never more than one response in flight. Push-SSE cannot bound
+    // latency on a link slower than production — the kernel and the relay
+    // buffer megabytes the app cannot see, so a driving viewer (Moonlight)
+    // sits seconds behind a perfectly smooth picture. One response in flight
+    // caps that: current-but-choppier beats smooth-but-late.
+    pull: BandRing,
+    pull_seen: Option<Instant>, // a puller counts as a display watcher this recently
     fb_scanned: Option<Instant>, // last display scan (paced by its own cost)
     fb_cost: Duration,           // smoothed cost of one display scan
     fb_still: u32,               // consecutive scans that found nothing
@@ -790,6 +867,35 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // on the GPU (the H200 on the fleet; a dev GPU locally). This is the
         // "GPU compute for the RISC Box app runs on the H200" path — the encode
         // is offloaded off the emulated CPU AND off this wasm app to the GPU.
+        // Pull-paced frame delivery: the band events the scan already
+        // produced, from `since` on, in one bounded response. The client's
+        // in-flight window is one reply deep, so its latency is its own
+        // link's, not the megabytes of relay buffering a pushed stream
+        // accumulates when production outruns the link (which is what made
+        // a driven cursor sit seconds behind a smooth picture). `resync`
+        // tells the client its `since` fell out of the ring; a full-frame
+        // scan is already scheduled and a later poll re-bases it.
+        ("GET", "/fb.bands") => {
+            app.pull_seen = Some(Instant::now());
+            let since = form_get(&req.query, "since")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let (gen, events, resync) = app.pull.since(since, 240 * 1024);
+            if resync {
+                app.display.want_full();
+                worker::want_full();
+            }
+            let body = format!(
+                "{{\"gen\":{},\"resync\":{},\"w\":{},\"h\":{},\"events\":[{}]}}",
+                gen, resync, display::fb_w(), display::fb_h(), events.join(",")
+            );
+            server.respond(
+                key,
+                Response::new(200, "OK")
+                    .with("cache-control", "no-store")
+                    .body("application/json", body.into_bytes()),
+            );
+        }
         ("GET", "/fb.rgb") => match (app.phase, app.emu.as_ref()) {
             (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
                 let (rgb, _w, _h) = video::capture_rgb(emu);
@@ -1122,6 +1228,8 @@ pub fn run() {
         last_save: None,
         net: None,
         display: Display::new(),
+        pull: BandRing::new(),
+        pull_seen: None,
         fb_scanned: None,
         fb_cost: Duration::from_millis(0),
         fb_still: 0,
@@ -1339,7 +1447,10 @@ pub fn run() {
                 const SSE_BACKLOG_LIMIT: usize = 192 * 1024;
                 let display_backed_up = server.sse_backlog("display") > SSE_BACKLOG_LIMIT;
                 let video_backed_up = server.sse_backlog("video") > SSE_BACKLOG_LIMIT;
-                let watching_display = server.sse_count("display") > 0 && !display_backed_up;
+                let pull_watching =
+                    app.pull_seen.map_or(false, |t| t.elapsed() < Duration::from_secs(3));
+                let watching_display =
+                    (server.sse_count("display") > 0 && !display_backed_up) || pull_watching;
                 let watching_video = server.sse_count("video") > 0 && !video_backed_up;
                 // Keep the display scan at its fast floor while input is recent
                 // (the same boost window the CPU uses). The stillness backoff
@@ -1383,13 +1494,14 @@ pub fn run() {
                     };
                     app.sent_frames += !bands.is_empty() as u64;
                     for band in bands {
-                        server.broadcast(
-                            "display",
-                            &format!(
-                                "data: {{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
-                                band.x, band.w, band.y, band.h, b64(&band.z)
-                            ),
+                        let full = band.x == 0 && band.w == display::fb_w()
+                            && band.y == 0 && band.h == display::fb_h();
+                        let ev = format!(
+                            "{{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                            band.x, band.w, band.y, band.h, b64(&band.z)
                         );
+                        app.pull.push(&ev, full);
+                        server.broadcast("display", &format!("data: {ev}"));
                         busy = true;
                     }
                     // Smoothed, so one expensive full-frame band (a new
@@ -1465,11 +1577,12 @@ pub fn run() {
             };
             app.sent_frames += !out.bands.is_empty() as u64;
             for band in out.bands {
-                server.broadcast(
-                    "display",
-                    &format!("data: {{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
-                             band.x, band.w, band.y, band.h, b64(&band.z)),
-                );
+                let full = band.x == 0 && band.w == display::fb_w()
+                    && band.y == 0 && band.h == display::fb_h();
+                let ev = format!("{{\"x\":{},\"w\":{},\"y\":{},\"h\":{},\"b\":\"{}\"}}",
+                                 band.x, band.w, band.y, band.h, b64(&band.z));
+                app.pull.push(&ev, full);
+                server.broadcast("display", &format!("data: {ev}"));
                 busy = true;
             }
             for f in out.video {
