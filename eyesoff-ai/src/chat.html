@@ -1614,6 +1614,10 @@ function assistantHtml(src, streaming) {
 // never arrives just looks broken), so the frame reports what was refused and
 // the block offers to reload with the network allowed. Opt-in, per block, in
 // the user's hands - the same shape as the web-search switch.
+//
+// The frame is also not allowed to NAVIGATE, for a reason particular to srcdoc:
+// it inherits the embedder's base URL, so an href without a scheme resolves
+// against this app. See the link handling in PREV_SHIM below.
 const FULLSCREEN = !!document.fullscreenEnabled;
 const PREV_MIN = 90, PREV_MAX = 720, PREV_DEF = 360;
 
@@ -1649,7 +1653,32 @@ const PREV_SHIM = "<script>(function(){var last=-1,n=0;" +
   "post({eo:'csp',n:++n,uri:String(e.blockedURI||'').slice(0,200)})});" +
   "addEventListener('load',tick);addEventListener('resize',tick);" +
   "try{new ResizeObserver(tick).observe(document.documentElement)}catch(e){}" +
-  "[0,60,200,600,1500].forEach(function(t){setTimeout(tick,t)})})();<\/script>";
+  "[0,60,200,600,1500].forEach(function(t){setTimeout(tick,t)})" +
+  // LINKS. A srcdoc document inherits the EMBEDDER's base URL, so an href that
+  // does not name its own scheme resolves against this app: "about.html"
+  // becomes eyesoff.ai/about.html, and "#section" - which has no separate
+  // document URL to be relative to - becomes the CHAT's own URL. The frame then
+  // loads it, and the user watching a page they asked for gets the app itself,
+  // broken, inside a 400px box. So nothing in here is allowed to navigate the
+  // frame. A fragment scrolls, a real URL is handed out for a new tab, and a
+  // link into a site that was never written says so instead of going nowhere
+  // quietly. preventDefault only stops the navigation: a page's own click
+  // handler still runs, because propagation is untouched.
+  ";function go(e,a){var h=a.getAttribute('href')||'';e.preventDefault();" +
+  "if(/^javascript:/i.test(h))return;" +   // a no-op href whose onclick does the work
+  "if(h.charAt(0)==='#'){var id=decodeURIComponent(h.slice(1)),t=id?(document.getElementById(id)||" +
+  "document.getElementsByName(id)[0]):document.body;" +
+  "if(t&&t.scrollIntoView)t.scrollIntoView({block:'start',behavior:'smooth'});return}" +
+  "post({eo:'nav',href:a.href,raw:h})}" +
+  "function tap(e){var t=e.target,a=t&&t.closest?t.closest('a[href]'):null;if(a)go(e,a)}" +
+  "addEventListener('click',tap,true);addEventListener('auxclick',tap,true);" +
+  // a form with no absolute action posts to the same phantom URL. One with a
+  // real one is left alone: whether it may leave is the network switch's call
+  "addEventListener('submit',function(e){var f=e.target," +
+  "a=f&&f.getAttribute?f.getAttribute('action'):'';" +
+  "if(a&&/^[a-z][a-z0-9+.-]*:/i.test(a))return;" +
+  "e.preventDefault();post({eo:'nav',form:1,raw:a||''})},true)" +
+  "})();<\/script>";
 
 // The CSP has to reach the parser before the loads it exists to stop, so it
 // goes as early as the document's own shape allows: inside <head> when there is
@@ -1694,9 +1723,27 @@ function mountPreview(block) {
     fr.style.height = PREV_DEF + "px";
     wrap.appendChild(fr);
   }
-  const note = wrap.querySelector(".prevnote");
-  if (note) note.remove();          // a reload starts the count over
+  for (const n of wrap.querySelectorAll(".prevnote")) n.remove();  // a reload starts the count over
   fr.srcdoc = previewDoc(blockSrc(block), prevNet.has(prevKey(block)));
+}
+
+// One thin bar above the page for the two things a frame has to say about
+// itself: what it was stopped from fetching, and where a link inside it could
+// not go. The first waits for an answer, so it stays; the second describes a
+// single click, so it clears itself rather than sitting there as an accusation.
+function prevNote(wrap, kind, text) {
+  let note = wrap.querySelector(".prevnote." + kind);
+  if (!note) {
+    note = node('<div class="prevnote ' + kind + '"><span></span></div>');
+    if (kind === "net") note.appendChild(node('<button type="button" data-html-net>Allow</button>'));
+    wrap.insertBefore(note, wrap.querySelector("iframe"));
+  }
+  note.firstChild.textContent = text;
+  if (kind !== "net") {
+    clearTimeout(note.clearTimer);
+    note.clearTimer = setTimeout(() => note.remove(), 6000);
+  }
+  return note;
 }
 
 // Mounting is deferred until the block is near the viewport: a long chat can
@@ -1774,13 +1821,14 @@ function downloadHtml(block, btn) {
   flashDone(btn, "Saved");
 }
 
-// What the frames have to say for themselves: how tall they are, and what they
-// were stopped from fetching. The source window identifies the frame - there is
-// no origin to check, by design - and every value is clamped or escaped before
-// it touches the page, because the sender is a document the model wrote.
+// What the frames have to say for themselves: how tall they are, what they were
+// stopped from fetching, and where a link wanted to go. The source window
+// identifies the frame - there is no origin to check, by design - and every
+// value is clamped, scheme-checked or written with textContent before it
+// touches this page, because the sender is a document the model wrote.
 addEventListener("message", (e) => {
   const d = e.data;
-  if (!d || (d.eo !== "h" && d.eo !== "csp")) return;
+  if (!d || (d.eo !== "h" && d.eo !== "csp" && d.eo !== "nav")) return;
   let fr = null;
   for (const f of document.querySelectorAll(".htmlblock .prev iframe"))
     if (f.contentWindow === e.source) { fr = f; break; }
@@ -1794,15 +1842,35 @@ addEventListener("message", (e) => {
     return;
   }
   const wrap = fr.parentElement;
-  let note = wrap.querySelector(".prevnote");
-  if (!note) {
-    note = node('<div class="prevnote"><span></span>' +
-      '<button type="button" data-html-net>Allow</button></div>');
-    wrap.insertBefore(note, fr);
+  if (d.eo === "nav") {
+    const raw = String(d.raw || "").slice(0, 200);
+    let u = null;
+    try { u = new URL(String(d.href || "")); } catch (_) {}
+    // Only a link that named its own scheme points at anything real. The
+    // browser resolved everything else against THIS app's URL, so following it
+    // opens the chat inside its own preview - which is the bug this exists to
+    // stop, not a destination. The scheme is checked on the RESOLVED url too:
+    // a `javascript:` href reaching window.open would run here, in the app.
+    if (!d.form && /^[a-z][a-z0-9+.-]*:/i.test(raw) && u && /^(https?|mailto|tel):$/.test(u.protocol)) {
+      // a new tab, never this one: a link in a preview must not be able to take
+      // the conversation away with it
+      const a = document.createElement("a");
+      a.href = u.href;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
+    prevNote(wrap, "nav", d.form
+      ? "this form has nowhere to send: the preview is a single file"
+      : (raw ? '"' + raw + '"' : "that link") + " is not part of this file, so there is nothing to open");
+    return;
   }
   const n = Math.max(1, Math.min(9999, Math.round(Number(d.n) || 1)));
-  note.firstChild.textContent = n + (n === 1 ? " request" : " requests") + " out of the enclave blocked";
-  note.title = "blocked: " + String(d.uri || "").slice(0, 200);
+  prevNote(wrap, "net", n + (n === 1 ? " request" : " requests") + " out of the enclave blocked")
+    .title = "blocked: " + String(d.uri || "").slice(0, 200);
 });
 
 // Expand: the frame stays exactly where it is and the BLOCK goes full screen.
