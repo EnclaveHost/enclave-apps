@@ -169,3 +169,30 @@ platform `codegen` verb.
 
 Separately, what a remote viewer sees is capped well below what the machine
 renders: see `app-bandwidth-handoff.md`.
+
+## Addendum 2026-08-17: the overlay, actually engaged
+
+A longer verification soak (29 min clean, one /display watcher, no other
+interference) first showed the "floor clears 24" claim above did not survive a
+bigger sample: median 33.2 but **15/570 windows below 24**, and screenshots
+inside the dip windows proved heavy firefights at 21.8-23.9, not level loads.
+The morning's 6.5-minute window had simply missed the heaviest scenes.
+
+The gap closed from inside the guest: the `-overlay` retraction above (the
+TranslateCoordinates parse bug, the reply race, the alignment gate). With the
+fixed xdoom baked into `doom/rootfs-ov.ext2.gz` and the deployment's config
+override pointing at it, the same clean soak on the same kryptos deployment
+(26.2 min, 664 windows of 100 frames, every frame `0 via X` — all direct):
+
+    min 27.4    p5 32.5    p10 34.9    median 43.2    max 68.9
+    below 24 fps: 0 of 664
+
+Gameplay rides the engine's own 35-tic cap; the sub-35 tail is the heavy
+fights, whose floor moved 21.8 -> 27.4 — the 1.33x the local A/B predicted,
+delivered live. Demo-load transitions no longer dip under 24 at all.
+
+Catalog housekeeping from the same night: risc-box-doom 0.7.6 published (main
+0.6.28 SET build — the SSE starve-not-close fix and the PLIC level-trigger
+re-arm; the latter is why typing into a busy console dropped leading bytes all
+through this investigation). The deployment still runs 0.7.5 + the rootfs
+override; upgrading to 0.7.6 is one build_upgrade when wanted.
