@@ -214,9 +214,38 @@
 
   $('filter').oninput = render;
   $('copyroot').onclick = () => copyText($('root').value, $('copyroot'));
+
+  // Re-index. When the deployment sets an api_key, present it as X-Api-Key
+  // (the fleet's TLS proxy strips Authorization); learned once via prompt,
+  // kept in localStorage, forgotten again if it stops working.
+  async function postRefresh(k) {
+    const headers = k ? { 'x-api-key': k } : {};
+    return fetch('/api/refresh', { method: 'POST', headers });
+  }
   $('refresh').onclick = async () => {
-    await fetch('/api/refresh', { method: 'POST' });
-    schedule(300);
+    $('progress').textContent = 're-index requested…';
+    try {
+      let k = localStorage.getItem('s3ipfs-key') || new URLSearchParams(location.search).get('key');
+      let r = await postRefresh(k);
+      if (r.status === 403) {
+        localStorage.removeItem('s3ipfs-key');
+        k = prompt('this deployment protects re-index with an api key:');
+        if (k) {
+          r = await postRefresh(k);
+          if (r.ok) localStorage.setItem('s3ipfs-key', k);
+        }
+      }
+      if (!r.ok) {
+        $('err').classList.remove('hidden');
+        $('err').textContent = `re-index failed: HTTP ${r.status}`;
+        $('progress').textContent = '';
+      }
+    } catch (e) {
+      $('err').classList.remove('hidden');
+      $('err').textContent = 're-index failed: ' + e;
+      $('progress').textContent = '';
+    }
+    schedule(400);
   };
   tick();
 </script>

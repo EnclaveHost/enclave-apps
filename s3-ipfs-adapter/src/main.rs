@@ -341,13 +341,18 @@ struct HashJob {
     meta: s3::ObjMeta,
     offset: u64,
     leaves: Vec<[u8; 32]>,
+    attempts: u32, // failed tries for THIS object; skipped past MAX_ATTEMPTS
 }
+
+/// One persistently failing object must not wedge the whole index: after
+/// this many failed hash attempts it is skipped until the next refresh.
+const MAX_ATTEMPTS: u32 = 5;
 
 enum Phase {
     Idle, // unconfigured
     List { cont: Option<String>, acc: Vec<s3::ObjMeta> },
     Hash {
-        queue: VecDeque<s3::ObjMeta>,
+        queue: VecDeque<(s3::ObjMeta, u32)>, // (object, failed attempts so far)
         staged: Vec<FileEntry>,
         cur: Option<HashJob>,
         hashed: u64,
@@ -363,6 +368,7 @@ struct Indexer {
     errors: u32,
     last_error: Option<String>,
     retry_at: Option<Instant>,
+    skipped: u32, // objects given up on during the current/last hash cycle
 }
 
 impl Indexer {
@@ -474,8 +480,8 @@ impl App {
                 if cur.is_none() {
                     match queue.pop_front() {
                         None => After::Commit(std::mem::take(staged)),
-                        Some(meta) => {
-                            *cur = Some(HashJob { meta, offset: 0, leaves: Vec::new() });
+                        Some((meta, attempts)) => {
+                            *cur = Some(HashJob { meta, offset: 0, leaves: Vec::new(), attempts });
                             After::Worked
                         }
                     }
@@ -512,10 +518,23 @@ impl App {
                     };
                     match step {
                         Err(e) => {
-                            // Requeue the object from scratch; fail() paces the retry.
                             let job = cur.take().unwrap();
-                            queue.push_front(job.meta);
-                            After::Fail(e)
+                            if job.attempts + 1 >= MAX_ATTEMPTS {
+                                // Skip it; everything else still gets indexed.
+                                eprintln!(
+                                    "[s3-ipfs-adapter] skipping {} after {} failed attempts: {e}",
+                                    job.meta.key,
+                                    job.attempts + 1
+                                );
+                                self.indexer.last_error =
+                                    Some(format!("skipped {}: {e}", job.meta.key));
+                                self.indexer.skipped += 1;
+                                After::Worked
+                            } else {
+                                // Requeue from scratch; fail() paces the retry.
+                                queue.push_front((job.meta, job.attempts + 1));
+                                After::Fail(e)
+                            }
                         }
                         Ok(()) => {
                             if job.offset >= job.meta.size {
@@ -560,7 +579,12 @@ impl App {
                 );
                 self.snap = Rc::new(snap);
                 self.indexer.last_list = Some(Instant::now());
-                self.indexer.last_error = None;
+                self.indexer.last_error = (self.indexer.skipped > 0).then(|| {
+                    format!(
+                        "{} object(s) failed to hash and are missing from this index; see logs, then re-index",
+                        self.indexer.skipped
+                    )
+                });
                 self.indexer.phase = Phase::Ready;
                 true
             }
@@ -586,7 +610,7 @@ impl App {
                 Some(f) => staged.push(f.clone()),
                 None => {
                     to_hash += meta.size;
-                    queue.push_back(meta);
+                    queue.push_back((meta, 0));
                 }
             }
         }
@@ -596,6 +620,7 @@ impl App {
             queue.len(),
             to_hash
         );
+        self.indexer.skipped = 0;
         self.indexer.phase = Phase::Hash { queue, staged, cur: None, hashed: 0, to_hash };
     }
 }
@@ -648,6 +673,7 @@ fn main() {
             errors: 0,
             last_error: None,
             retry_at: None,
+            skipped: 0,
         },
     };
     let mut srv = Server::bind(APP, 8000);
@@ -777,14 +803,13 @@ fn api_refresh(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
     if app.s3.is_none() {
         return srv.respond(key, json(503, "Service Unavailable", "{\"error\":\"unconfigured\"}".into()));
     }
-    match app.indexer.phase {
-        Phase::Ready | Phase::Idle => {
-            app.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
-            app.indexer.retry_at = None;
-            srv.respond(key, json(200, "OK", "{\"ok\":true}".into()))
-        }
-        _ => srv.respond(key, json(200, "OK", "{\"ok\":true,\"note\":\"already indexing\"}".into())),
-    }
+    // Restart listing from ANY phase: a refresh must always visibly do its
+    // job. Dropping in-flight staging is safe (serving runs from the
+    // committed snapshot), and it is also the way out of a wedged hash job.
+    app.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
+    app.indexer.retry_at = None;
+    app.indexer.errors = 0;
+    srv.respond(key, json(200, "OK", "{\"ok\":true,\"note\":\"listing restarted\"}".into()))
 }
 
 /// Send a buffered Response, spilling into a stream when it is larger than
