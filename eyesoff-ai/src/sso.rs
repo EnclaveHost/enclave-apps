@@ -24,9 +24,10 @@
 //! can eyeball against enclave.host's published one, and any wallet tool can
 //! mint a test token (`cast wallet sign` writes exactly this signature).
 //!
-//! Claims: `{"v":1,"sub":"0x<40-hex>","aud":"0x<64-hex>","iat":<s>,"exp":<s>}`.
-//! `sub` is the signed-in account's address - the only identity the platform
-//! has. `aud` is THIS deployment's id, and it is checked, not decorative: a
+//! Claims: `{"v":1,"sub":<identity>,"aud":"0x<64-hex>","iat":<s>,"exp":<s>}`.
+//! `sub` is the signed-in ACCOUNT: a relay account id (`acct_<hex>` - the
+//! passkey is the person, no wallet required) or a bare wallet address.
+//! `aud` is THIS deployment's id, and it is checked, not decorative: a
 //! token minted for someone else's deployment must not open this one, however
 //! valid its signature. Expiry is the only revocation there is (the app can
 //! store no denylist), so the platform keeps TTLs short; skew_secs absorbs
@@ -87,7 +88,8 @@ impl SsoConfig {
     }
 }
 
-/// What a verified token says. `sub` is normalized to lowercase 0x hex.
+/// What a verified token says. Address subs normalize to lowercase 0x hex;
+/// account-id subs pass through as minted.
 #[derive(Debug)]
 pub struct Claims {
     pub sub: String,
@@ -141,7 +143,7 @@ pub fn verify(cfg: &SsoConfig, token: &str, now_secs: u64) -> Result<Claims, Str
     if claims.get("v").and_then(|v| v.as_u64()) != Some(1) {
         return Err("unsupported sign-in token version".into());
     }
-    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or_default().to_lowercase();
+    let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let aud = claims.get("aud").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let iat = claims.get("iat").and_then(|v| v.as_u64()).unwrap_or(0);
     let exp = claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -178,9 +180,20 @@ pub fn verify(cfg: &SsoConfig, token: &str, now_secs: u64) -> Result<Claims, Str
     if now_secs >= exp {
         return Err("sign-in expired; sign in again".into());
     }
-    if sub.len() != 42 || !sub.starts_with("0x") {
+    // the signed-in identity, in either of the platform's shapes: a relay
+    // ACCOUNT id (acct_<hex> - the passkey IS the identity, no wallet
+    // involved) or a bare wallet address (the original shape; addresses
+    // canonicalize to lowercase, account ids pass through as minted)
+    let addr_like = sub.len() == 42
+        && sub.starts_with("0x")
+        && sub[2..].chars().all(|c| c.is_ascii_hexdigit());
+    let acct_like = (6..=80).contains(&sub.len())
+        && sub.starts_with("acct_")
+        && sub[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !(addr_like || acct_like) {
         return Err("malformed sign-in token payload".into());
     }
+    let sub = if addr_like { sub.to_lowercase() } else { sub };
     Ok(Claims { sub, aud, iat, exp })
 }
 
@@ -284,6 +297,18 @@ mod tests {
         assert!(verify(&cfg(), &t, NOW).is_ok());
         let t = mint(&test_key(), &claims(SUB, AUD, NOW + 301, NOW + 3600), true);
         assert!(verify(&cfg(), &t, NOW).is_err());
+    }
+
+    #[test]
+    fn account_id_subs_are_identities_too() {
+        let t = mint(&test_key(), &claims("acct_0e64d1897f10b32d3a1bc84e", AUD, NOW, NOW + 3600), true);
+        let c = verify(&cfg(), &t, NOW).expect("account-id sub verifies");
+        assert_eq!(c.sub, "acct_0e64d1897f10b32d3a1bc84e");
+        // neither of the platform's shapes: refused
+        for bad in ["bob", "acct_", "0x1234", ""] {
+            let t = mint(&test_key(), &claims(bad, AUD, NOW, NOW + 3600), true);
+            assert!(verify(&cfg(), &t, NOW).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

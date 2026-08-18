@@ -145,7 +145,8 @@ content.</p>
 <p>Some deployments require signing in with an <a href="https://enclave.host"
 rel="noopener">Enclave</a> account. The login itself (passkey or wallet) happens at
 enclave.host, never here; what this app receives is a short-lived signed note naming
-your account's wallet address, sent along with each message you send. The enclave checks
+your account (an opaque account id, or a wallet address), sent along with each message
+you send. The enclave checks
 the note's signature and expiry and keeps none of it: no session table, no user record,
 nothing written. Signing out is your browser discarding the note.</p>
 

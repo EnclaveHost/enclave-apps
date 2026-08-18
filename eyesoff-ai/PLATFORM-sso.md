@@ -9,10 +9,10 @@ repo without reading the app.
 
 ## Why this shape
 
-The platform's only identity is a wallet address; passkey and WalletConnect
-are just two ways a session at enclave.host ends up able to speak for one.
-Sharing the LOGIN therefore means sharing a claim about the address, not the
-credential: a WalletConnect pairing is per dapp and a passkey is bound to its
+The identity is the relay ACCOUNT - the passkey is the person; a wallet is
+one way an account authenticates (SIWE keys accounts by wallet, so wallet
+users get a stable account too). Sharing the LOGIN therefore means sharing
+a claim about the account, not the credential: a WalletConnect pairing is per dapp and a passkey is bound to its
 RP, but a short-lived signed note saying "this address is signed in, for that
 deployment, until then" can be carried by the browser to any app that knows
 the platform's signing address.
@@ -52,8 +52,7 @@ Behavior:
    through: every return origin is one of the platform's own deployments,
    and the platform accepts its apps learning a signed-in visitor's address
    without a click. Interaction remains only where something genuinely
-   forks: signing in at all, linking a first wallet to a passkey-only
-   account, or choosing among several linked wallets.
+   forks: signing in at all when there is no session.
 4. **Mint** (format below) and 302 to:
 
 ```
@@ -78,7 +77,7 @@ EST1.<base64url_nopad(claims JSON)>.<base64url_nopad(65-byte r||s||v signature)>
 Claims, all required:
 
 ```json
-{"v":1,"sub":"0x<40 hex, signed-in address, lowercase>",
+{"v":1,"sub":"<the signed-in ACCOUNT: acct_<hex> account id, or a 0x<40 hex> wallet address, lowercase>",
  "aud":"0x<64 hex, deployment id>",
  "iat":<unix seconds>,"exp":<unix seconds>}
 ```
