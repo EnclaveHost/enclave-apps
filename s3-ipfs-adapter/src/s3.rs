@@ -217,7 +217,13 @@ impl Write for Wire {
 }
 
 fn connect(ep: &Endpoint) -> Result<Wire, String> {
-    let sock = crate::egress::dial(ep.host.as_str(), ep.port, Some(Duration::from_secs(20)))?;
+    // No connect timeout, deliberately: dial(None) is plain TcpStream::connect,
+    // which resolves names and tries each address itself. connect_timeout is
+    // not trustworthy on wasm32-wasip2 (it can hand back a socket whose
+    // connect never completed; the failure then surfaces as ENOTCONN on the
+    // first write). Post-connect, the read timeout below and the caller's
+    // REQUEST_DEADLINE bound every request.
+    let sock = crate::egress::dial(ep.host.as_str(), ep.port, None)?;
     // A read timeout so a wedged peer surfaces as an error instead of
     // stalling the (single-threaded) event loop forever.
     let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
