@@ -181,10 +181,94 @@ JSON object:
 | `GET /status`     | JSON: phase, image sizes, instructions retired, MIPS, frames presented (`fps`) and shipped (`sentFps`), display mode, console bytes |
 | `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?}`: fetch from S3 and boot; `reset:true` re-fetches instead of using the cached images |
 | `POST /input`     | **raw bytes** in the body → the guest UART receive register          |
+| `POST /exec`      | `{cmd, timeout_s?, max_bytes?}`: run a shell command on the guest console and return its stdout + exit code as JSON (see below) |
 | `GET /console`    | Server-Sent Events: base64 console output, scrollback replayed first |
 | `POST /save`      | dump the guest disk and PUT it to `saveKey`                          |
 | `POST /stop`      | halt the machine and drop it from RAM                                |
 | `GET /ping`       | liveness                                                             |
+
+## Running commands: `POST /exec`
+
+`/input` and `/console` are the raw serial line — bytes in, bytes out. `/exec`
+is the verb built on top of them for a **program** driving the machine (another
+enclave app, a script), where "type this, wait, scrape the output" is exactly
+what you do not want to reimplement. It runs one shell command on the guest and
+answers with its stdout and exit code:
+
+```sh
+curl -s -XPOST http://<host>/exec \
+  -d '{"cmd":"apk info | wc -l; uname -a","timeout_s":30}'
+# {"ok":true,"exitCode":0,"output":"57\nLinux … riscv64 …","truncated":false,"ms":412}
+```
+
+Body: `cmd` (required), `timeout_s` (1–120, default 30, covers login **and** the
+command), `max_bytes` (output cap, default 64 KiB). It answers `{"ok":true,
+"exitCode":N,"output":"…","truncated":bool,"ms":N}`, or `{"ok":false,"error":
+"…","output":"<whatever came back>"}` on a timeout or a console that never
+reached a prompt. `409` when the machine is not running, `403` when exec is
+disabled.
+
+How it works, so its limits are legible: there is no exec channel inside the
+guest, so this drives the serial console the way [`scripts/bench.py`](scripts/bench.py)
+does, server-side. It first sends a newline and waits for a shell prompt —
+answering a `login:` from the configured credentials (passwordless `root` by
+default) — so a getty is logged into automatically and an already-open shell is
+used as-is. Then it writes the command **base64-wrapped** (so any bytes, quotes
+and newlines survive) bracketed by two `printf` markers whose tag is a printf
+*argument*, so the command line the tty echoes back never contains the expanded
+marker and cannot be mistaken for the real output. stdout is everything printed
+between the markers; the exit code rides the closing one.
+
+Consequences worth knowing: the call **blocks the event loop** until the command
+finishes or times out (the same way `/start`'s image fetch does), so keep
+`timeout_s` well under the platform gateway's ~180 s idle cut; the guest UART
+accepts ~one byte per 230 k instructions, so a very long command line takes a
+moment to land; and it needs a shell on `ttyS0` — an image that boots straight
+to a desktop with no serial getty has nothing to exec into. It adds **no new
+authority** over `/input` (both are a root console) and sits behind the same
+`api_key` gate. Configure the login and an off-switch with an `exec` block:
+
+```json
+"exec": { "enabled": true, "user": "root", "password": "$GUEST_ROOT_PW" }
+```
+
+### Driving the machine from another enclave app (e.g. eyesoff-ai)
+
+Because `/exec` is a plain request/response JSON API, an app whose only outbound
+door is `wasi:http` can call it as a tool with **no code** — for eyesoff-ai, one
+`tools.http` entry in the deployment config:
+
+```json
+{
+  "name": "run_vm_command",
+  "description": "Run a shell command on the Alpine Linux virtual machine and get its stdout and exit code. Use it to inspect or operate the machine: list files, read logs, install packages, edit files, run programs. One independent command per call; keep state on the machine (files, not shell variables) between calls.",
+  "parameters": {
+    "type": "object",
+    "properties": { "cmd": { "type": "string", "description": "the shell command to run" } },
+    "required": ["cmd"]
+  },
+  "url": "https://<riscbox-id8>.app.enclave.host/exec",
+  "method": "POST",
+  "headers": { "x-api-key": "$RISCBOX_API_KEY" },
+  "body": { "cmd": "$cmd", "timeout_s": 60 },
+  "timeout_s": 70
+}
+```
+
+The model calls it mid-answer, reads the JSON back, and can call again — the
+tool loop's `max_calls` bounds a run-look-run sequence. Deployment notes:
+
+- **Present the key as `X-Api-Key`, not `Authorization: Bearer`.** The platform's
+  TLS proxy consumes the `Authorization` header for its own owner-token auth and
+  never forwards it, so a Bearer token from another app (or a browser) arrives
+  stripped and the request 401s. `X-Api-Key` and `?key=` pass through; the app
+  accepts all three (`authorized()`), but only the latter two survive the proxy.
+- Because eyesoff reaches risc-box over the public origin, the risc-box
+  deployment must be **public with an `api_key` set** (the `$RISCBOX_API_KEY`
+  secret above), or the proxy refuses the call before the app sees it.
+- Outbound egress is IPv6-only, but `*.app.enclave.host` publishes an AAAA, so
+  app-to-app works. Set eyesoff's per-tool `timeout_s` above risc-box's so the
+  model sees a real error rather than a truncated connection.
 
 ## Seeding a bucket
 
@@ -600,13 +684,13 @@ budget goes to the scanout and encoders.
 
 ## Security
 
-The control surface drives a real machine: `/input` is a raw console into the
-guest (a root shell, once one is running), and `/start` / `/stop` / `/save`
-boot it, halt it, or write its disk back to your bucket. On a **public**
-deployment those endpoints are reachable by anyone with the URL, so set
-`api_key` (from a `$VAR` secret): it gates `/start`, `/stop`, `/save`,
-`/input`, `/console`, and `/status`, leaving only the static shell and `/ping`
-open. The browser UI prompts for the key and remembers it for the tab. Without
+The control surface drives a real machine: `/input` and `/exec` are a raw
+console into the guest (a root shell, once one is running), and `/start` /
+`/stop` / `/save` boot it, halt it, or write its disk back to your bucket. On a
+**public** deployment those endpoints are reachable by anyone with the URL, so
+set `api_key` (from a `$VAR` secret): it gates `/start`, `/stop`, `/save`,
+`/input`, `/exec`, `/console`, and `/status`, leaving only the static shell and
+`/ping` open. The browser UI prompts for the key and remembers it for the tab. Without
 `api_key`, deploy **private**: an open deployment hands a stranger the
 machine. The key is a coarse app-level gate, not the trust boundary; the
 enclave is (see below).

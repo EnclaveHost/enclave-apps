@@ -34,6 +34,8 @@
 //!                     fetch images from S3 (creds: body > config > unsigned)
 //!                     and boot; reset:true re-fetches instead of using cache
 //!   POST /input       raw bytes → the guest UART receive register
+//!   POST /exec        {cmd,timeout_s?,max_bytes?} run a shell command on the
+//!                     guest console and return its stdout + exit code (JSON)
 //!   GET  /console     Server-Sent Events: base64 console output, scrollback first
 //!   POST /save        dump the (guest-modified) disk and PUT it to saveKey
 //!   POST /stop        halt the machine and drop it from RAM
@@ -110,6 +112,15 @@ struct Config {
     // it runs at (emulated MIPS / 10) times speed.
     realtime: bool,
     api_key: Option<String>,
+    // POST /exec: run a shell command on the guest's serial console and hand
+    // back its stdout and exit code (see `exec`). It is the app-to-app control
+    // channel — another enclave app can only reach this deployment over HTTP,
+    // never ssh, so a command verb has to live here. Enabled by default; an
+    // `exec` config object can turn it off, or set the serial login used when
+    // the console sits at a getty rather than an already-open shell.
+    exec_enabled: bool,
+    exec_user: String,
+    exec_password: Option<String>,
 }
 
 fn creds_from(v: &serde_json::Value) -> Option<Creds> {
@@ -227,6 +238,26 @@ fn load_config() -> Config {
         // control + observation endpoints require it; see `authorized`. Unset
         // means the deployment is open, which is only safe when it is private.
         api_key: s("api_key"),
+        exec_enabled: v
+            .get("exec")
+            .and_then(|e| e.get("enabled"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
+        // The serial login /exec uses when the console is at a getty. Defaults
+        // to a passwordless root, which is what the images in this repo present;
+        // an image with a real password references a secret by name here.
+        exec_user: v
+            .get("exec")
+            .and_then(|e| e.get("user"))
+            .and_then(|x| x.as_str())
+            .filter(|x| !x.is_empty())
+            .unwrap_or("root")
+            .to_string(),
+        exec_password: v
+            .get("exec")
+            .and_then(|e| e.get("password"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
     }
 }
 
@@ -470,6 +501,7 @@ struct App {
     sent_at: Instant,
     sent_mark: u64,
     input_boost: u64, // turns to force full tick batches after POST /input
+    exec_seq: u64,    // per-command nonce for /exec console markers
     scrollback: VecDeque<u8>,
     console_total: u64,
     last_save: Option<String>,
@@ -545,6 +577,19 @@ impl App {
             }
             _ => 0.0,
         }
+    }
+
+    /// Push bytes into the guest's serial input, and keep the CPU on full
+    /// batches long enough for the UART to drain them (it polls one byte per
+    /// ~230k instructions). The same boost /input applies to a keystroke.
+    fn push_input(&mut self, bytes: &[u8]) {
+        if let Some(emu) = self.emu.as_mut() {
+            let t = emu.get_mut_terminal();
+            for &b in bytes {
+                t.put_input(b);
+            }
+        }
+        self.input_boost = self.input_boost.max(bytes.len() as u64 + 2);
     }
 
     fn status_json(&self) -> String {
@@ -818,6 +863,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // framing or response work (see httpd::upgrade_instream).
         ("POST", "/hid-stream") => server.upgrade_instream(key, "/hid-stream-event"),
         ("POST", "/hid-stream-event") => hid_inner(app, server, key, &req.body, false),
+        ("POST", "/exec") => exec(app, server, key, &req.body),
         ("POST", "/save") => save(app, server, key),
         ("POST", "/stop") => {
             app.emu = None;
@@ -1068,6 +1114,259 @@ fn hid_inner(app: &mut App, server: &mut Server, key: usize, body: &[u8], respon
     }
 }
 
+// ---- POST /exec: run a shell command on the guest serial console -----------
+
+/// Ceiling on how long one /exec may hold the event loop. A command runs the
+/// CPU inline (the way /start's image fetch does), so nothing else is serviced
+/// while it runs; keep it well under the platform gateway's ~180s idle cut. The
+/// request's own timeout is clamped to this, and covers login + the command.
+const EXEC_MAX_TIMEOUT_S: u64 = 120;
+const EXEC_DEFAULT_TIMEOUT_S: u64 = 30;
+const EXEC_DEFAULT_MAX_BYTES: usize = 64 * 1024;
+
+/// POST /exec — run a shell command on the guest and return its stdout and exit
+/// code. Body: {"cmd":"<shell>", "timeout_s"?:1..120, "max_bytes"?:<output cap>}.
+/// Answers {"ok":true,"exitCode":N,"output":"…","truncated":bool,"ms":N}, or
+/// {"ok":false,"error":"…","output":"<what came back>"} on a timeout or a
+/// console that never reached a prompt. 409 when the machine is not running,
+/// 403 when exec is disabled.
+///
+/// There is no exec channel inside the guest for a caller to reach — an enclave
+/// app can only speak HTTP to this deployment, never ssh — so this is built from
+/// the serial console the way scripts/bench.py drives it, moved server-side
+/// where the fiddly parts belong. The command is base64-wrapped so the single
+/// line written to the UART carries arbitrary bytes, quotes and newlines intact,
+/// and it is bracketed by two `printf` markers whose unique tag is passed as a
+/// printf ARGUMENT: the command line the tty echoes back contains the format
+/// string, never the expanded marker, so scanning the console for the marker
+/// can never match our own echo. stdout is everything printed between the two
+/// markers; the exit code rides the closing one.
+///
+/// It blocks the event loop until the command finishes or the timeout fires,
+/// stepping the CPU inline and pumping the guest NIC so a networked command
+/// still works, broadcasting the same bytes to console watchers, and flushing
+/// periodically so SSE heartbeats keep going out.
+fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
+    if !app.cfg.exec_enabled {
+        return server.respond(key, json(403, "Forbidden", err("exec is disabled on this deployment")));
+    }
+    if app.phase != Phase::Running || app.emu.is_none() {
+        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+    }
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return server.respond(key, json(400, "Bad Request", err(&format!("bad JSON: {e}")))),
+    };
+    let Some(cmd) = v.get("cmd").and_then(|c| c.as_str()).filter(|c| !c.is_empty()) else {
+        return server.respond(key, json(400, "Bad Request", err("expected {\"cmd\": \"<shell command>\"}")));
+    };
+    let timeout = Duration::from_secs(
+        v.get("timeout_s")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(EXEC_DEFAULT_TIMEOUT_S)
+            .clamp(1, EXEC_MAX_TIMEOUT_S),
+    );
+    let max_out = v
+        .get("max_bytes")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(EXEC_DEFAULT_MAX_BYTES)
+        .clamp(1024, MAX_BODY);
+
+    let seq = app.exec_seq;
+    app.exec_seq = app.exec_seq.wrapping_add(1);
+    let tag = format!("RBX{seq}Z");
+    let begin = format!("{tag}B");
+    let end = format!("{tag}E:");
+    // One line, the command base64'd inside it so its own bytes never need
+    // escaping and can hold newlines. The tag is a printf argument, so the
+    // echoed line shows `'RBX0Z'` and `%sB`/`%sE:%s`, never `RBX0ZB`/`RBX0ZE:`.
+    let line = format!(
+        "printf '%sB\\n' '{tag}'; printf %s '{}' | base64 -d | sh; __rc=$?; printf '%sE:%s\\n' '{tag}' \"$__rc\"\n",
+        b64(cmd.as_bytes())
+    );
+
+    let user = app.cfg.exec_user.clone();
+    let pass = app.cfg.exec_password.clone().unwrap_or_default();
+    let began = Instant::now();
+    let mut cap: Vec<u8> = Vec::new();
+    let mut last_flush = began;
+
+    // Phase 1 — reach a shell prompt. A bare newline draws a prompt from an
+    // open shell, or `login:` from a getty, which we answer from the configured
+    // (passwordless-root by default) credentials. The command is only sent once
+    // a prompt is in hand, so a login prompt can never consume it as a username.
+    app.push_input(b"\n");
+    let ready_budget = (timeout / 2).min(Duration::from_secs(10));
+    let (mut sent_user, mut sent_pass, mut ready) = (false, false, false);
+    while began.elapsed() < ready_budget {
+        exec_pump(app, server, &mut cap, &mut last_flush);
+        if tail_is_prompt(&cap) {
+            ready = true;
+            break;
+        }
+        if !sent_user && contains(&cap, b"ogin:") {
+            app.push_input(format!("{user}\n").as_bytes());
+            sent_user = true;
+        } else if sent_user && !sent_pass && contains(&cap, b"assword:") {
+            app.push_input(format!("{pass}\n").as_bytes());
+            sent_pass = true;
+        }
+    }
+    if !ready {
+        let tail = &cap[cap.len().saturating_sub(800)..];
+        return server.respond(
+            key,
+            json(200, "OK", format!(
+                "{{\"ok\":false,\"error\":\"{}\",\"output\":\"{}\",\"ms\":{}}}",
+                httpd::json_escape(&format!(
+                    "guest shell not ready: no prompt appeared on the serial console within {}s (is a getty running on ttyS0, or is the guest still booting?)",
+                    ready_budget.as_secs()
+                )),
+                httpd::json_escape(&String::from_utf8_lossy(tail)),
+                began.elapsed().as_millis()
+            )),
+        );
+    }
+
+    // Phase 2 — send the command and wait for the closing marker (with its
+    // whole exit-code line, i.e. a newline after it).
+    let cmd_off = cap.len();
+    app.push_input(line.as_bytes());
+    let mut end_at: Option<usize> = None;
+    while began.elapsed() < timeout {
+        exec_pump(app, server, &mut cap, &mut last_flush);
+        if let Some(ei) = find_from(&cap, end.as_bytes(), cmd_off) {
+            if find_from(&cap, b"\n", ei + end.len()).is_some() {
+                end_at = Some(ei);
+                break;
+            }
+        }
+    }
+
+    // Everything the command printed starts after the begin marker's own line.
+    let out_start = find_from(&cap, begin.as_bytes(), cmd_off)
+        .and_then(|bi| find_from(&cap, b"\n", bi).map(|nl| nl + 1))
+        .unwrap_or(cmd_off);
+
+    let (ok, exit_code, out_end) = match end_at {
+        Some(ei) => {
+            let rc: i64 = cap[ei + end.len()..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .fold(String::new(), |mut s, &b| {
+                    s.push(b as char);
+                    s
+                })
+                .parse()
+                .unwrap_or(-1);
+            (true, rc, ei)
+        }
+        None => (false, -1, cap.len()),
+    };
+
+    let mut text = String::from_utf8_lossy(&cap[out_start.min(out_end)..out_end])
+        .replace("\r\n", "\n");
+    while text.ends_with('\n') || text.ends_with('\r') {
+        text.pop();
+    }
+    let truncated = text.len() > max_out;
+    if truncated {
+        let mut n = max_out;
+        while n > 0 && !text.is_char_boundary(n) {
+            n -= 1;
+        }
+        text.truncate(n);
+    }
+
+    let payload = if ok {
+        format!(
+            "{{\"ok\":true,\"exitCode\":{exit_code},\"output\":\"{}\",\"truncated\":{truncated},\"ms\":{}}}",
+            httpd::json_escape(&text),
+            began.elapsed().as_millis()
+        )
+    } else {
+        format!(
+            "{{\"ok\":false,\"error\":\"{}\",\"output\":\"{}\",\"truncated\":{truncated},\"ms\":{}}}",
+            httpd::json_escape(&format!("exec timed out after {}s", timeout.as_secs())),
+            httpd::json_escape(&text),
+            began.elapsed().as_millis()
+        )
+    };
+    server.respond(key, json(200, "OK", payload));
+}
+
+/// One event-loop turn's worth of guest work, for the inline /exec wait: step
+/// the CPU, drain the UART into the console (scrollback + SSE + the capture
+/// buffer), pump the NIC, and periodically flush so SSE heartbeats still fire.
+fn exec_pump(app: &mut App, server: &mut Server, cap: &mut Vec<u8>, last_flush: &mut Instant) {
+    let mut chunk: Vec<u8> = Vec::new();
+    if let Some(emu) = app.emu.as_mut() {
+        emu.run_n(TICK_BATCH);
+        app.instret += TICK_BATCH;
+        let t = emu.get_mut_terminal();
+        loop {
+            let b = t.get_output();
+            if b == 0 {
+                break;
+            }
+            chunk.push(b);
+            if chunk.len() >= 64 * 1024 {
+                break;
+            }
+        }
+        // keep forwarded/outbound guest connections alive across a networked cmd
+        if let Some(stack) = app.net.as_mut() {
+            let backend = emu.get_mut_cpu().get_mut_mmu().get_mut_net().get_mut_backend();
+            stack.pump(backend.as_mut());
+        }
+    }
+    if !chunk.is_empty() {
+        app.console_total += chunk.len() as u64;
+        for &b in &chunk {
+            if app.scrollback.len() >= SCROLLBACK {
+                app.scrollback.pop_front();
+            }
+            app.scrollback.push_back(b);
+        }
+        server.broadcast("console", &format!("data: {}", b64(&chunk)));
+        cap.extend_from_slice(&chunk);
+    }
+    if last_flush.elapsed() >= Duration::from_millis(50) {
+        server.flush();
+        *last_flush = Instant::now();
+    }
+}
+
+/// The tail of the console looks like a shell prompt waiting for input: the
+/// last non-blank line ends in one of the usual prompt characters. Enough to
+/// tell "ready for a command" from "still booting"; a false positive only sends
+/// the command a beat early, and the marker wait absorbs that.
+fn tail_is_prompt(cap: &[u8]) -> bool {
+    let start = cap.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+    let line = &cap[start..];
+    match line.iter().rposition(|&b| b != b' ' && b != b'\r' && b != b'\t') {
+        Some(i) => matches!(line[i], b'#' | b'$' | b'>'),
+        None => false,
+    }
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    find_from(hay, needle, 0).is_some()
+}
+
+/// First index of `needle` in `hay` at or after `from`.
+fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let from = from.min(hay.len());
+    if needle.is_empty() || needle.len() > hay.len() - from {
+        return None;
+    }
+    hay[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| i + from)
+}
+
 fn save(app: &mut App, server: &mut Server, key: usize) {
     if app.cfg.read_only {
         return server.respond(key, json(403, "Forbidden", err("this machine is read-only")));
@@ -1274,6 +1573,7 @@ pub fn run() {
         sent_at: Instant::now(),
         sent_mark: 0,
         input_boost: 0,
+        exec_seq: 0,
         scrollback: VecDeque::new(),
         console_total: 0,
         last_save: None,
