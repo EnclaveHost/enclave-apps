@@ -90,6 +90,10 @@ fn main() {
     // instruction shows up as a register value inconsistent with its inputs.
     let mut type_script: Vec<(u64, String)> = Vec::new();
     let mut xkey_script: Vec<(u64, String)> = Vec::new();
+    // --lat START:N — guest-internal input->pixel latency: from START s, N
+    // times: wait for a still framebuffer, inject one keystroke, then step
+    // the emulator in ~1ms slices until fb bytes move. Realtime only.
+    let mut lat_script: Option<(u64, u32)> = None;
     let mut snap_script: Vec<(u64, String)> = Vec::new();
     let mut xclick_script: Vec<(u64, u32, u32)> = Vec::new();
     let mut xkey_on_script: Vec<(Vec<u8>, String)> = Vec::new();
@@ -173,6 +177,11 @@ fn main() {
                 i += 1;
                 let (marker, txt) = args[i].split_once(':').expect("--xkey-on MARKER:TEXT");
                 xkey_on_script.push((marker.as_bytes().to_vec(), txt.to_string()));
+            }
+            "--lat" => {
+                i += 1;
+                let (secs, n) = args[i].split_once(':').expect("--lat START:N");
+                lat_script = Some((secs.parse().expect("seconds"), n.parse().expect("count")));
             }
             "--xkey" => {
                 // SECONDS:TEXT -- once the wall clock passes SECONDS, inject
@@ -540,6 +549,57 @@ fn main() {
                     }
                 }
                 eprintln!("XKEYED@{}s: {}", elapsed_s, txt);
+            }
+            if let Some((at, n)) = lat_script {
+                if at <= elapsed_s {
+                    lat_script = None;
+                    let slice: u64 = 200_000; // ~1ms of guest at bench speed
+                    let mut samples: Vec<f64> = Vec::new();
+                    for _ in 0..n {
+                        // settle: still framebuffer for 300ms
+                        let mut last = emu.fb_bytes();
+                        let mut still = std::time::Instant::now();
+                        let settle = std::time::Instant::now();
+                        while still.elapsed().as_millis() < 300 {
+                            emu.run_n(slice);
+                            let now_b = emu.fb_bytes();
+                            if now_b != last {
+                                last = now_b;
+                                still = std::time::Instant::now();
+                            }
+                            if settle.elapsed().as_secs() > 10 {
+                                eprintln!("LAT: screen never settled; is the demo still running?");
+                                break;
+                            }
+                        }
+                        let before = emu.fb_bytes();
+                        let t0 = std::time::Instant::now();
+                        emu.push_input_event(1, 30, 1); // KEY_A down
+                        emu.push_input_event(0, 0, 0);
+                        emu.push_input_event(1, 30, 0);
+                        emu.push_input_event(0, 0, 0);
+                        loop {
+                            emu.run_n(slice);
+                            if emu.fb_bytes() != before {
+                                samples.push(t0.elapsed().as_secs_f64() * 1e3);
+                                break;
+                            }
+                            if t0.elapsed().as_secs() > 5 {
+                                eprintln!("LAT: no pixel within 5s (focus lost?)");
+                                break;
+                            }
+                        }
+                    }
+                    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    if !samples.is_empty() {
+                        let m = samples.len();
+                        eprintln!(
+                            "LAT keypress->fb-write: n={} min {:.1} p25 {:.1} median {:.1} p75 {:.1} max {:.1} ms",
+                            m, samples[0], samples[m / 4], samples[m / 2],
+                            samples[3 * m / 4], samples[m - 1]
+                        );
+                    }
+                }
             }
             let mips = window_insns as f64 / 1e6 / window.elapsed().as_secs_f64();
             // debug aid: framebuffer store rate + a two-pixel probe (origin and
