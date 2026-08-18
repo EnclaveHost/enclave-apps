@@ -399,6 +399,26 @@ impl Server {
                         conn.sent_continue = false;
                         out.push((i, req));
                     }
+                    Parse::Stream(req) => {
+                        // Chunked request: this connection is the stream's for
+                        // as long as it lives. If the route answers instead of
+                        // upgrading, respond() must close (the unread body
+                        // would desync the next parse) — cleared keep_alive
+                        // makes that automatic. A curl-style peer holding the
+                        // body for `Expect: 100-continue` gets its interim nod.
+                        conn.keep_alive = false;
+                        *since = Instant::now();
+                        *reading_body = false;
+                        conn.sent_continue = false;
+                        if req
+                            .header("expect")
+                            .map(|v| v.eq_ignore_ascii_case("100-continue"))
+                            .unwrap_or(false)
+                        {
+                            conn.wbuf.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
+                        }
+                        out.push((i, req));
+                    }
                     Parse::Partial { in_body } => {
                         *reading_body = in_body;
                         // curl and friends send `Expect: 100-continue` and
@@ -665,6 +685,12 @@ fn chunk_into(wbuf: &mut VecDeque<u8>, data: &[u8]) {
 
 enum Parse {
     Complete(Request),
+    /// A chunked request, delivered at end-of-headers with an empty body so
+    /// the router can claim the connection via `upgrade_instream()`; the body
+    /// that follows is dechunked by poll()'s InStream arm. A route that
+    /// answers instead of upgrading closes the connection (poll clears
+    /// keep_alive), because the unconsumed body would desync the next parse.
+    Stream(Request),
     Partial { in_body: bool },
     Bad(u16, &'static str),
 }
@@ -713,7 +739,16 @@ fn try_parse(rbuf: &mut Vec<u8>, max_body: usize) -> Parse {
         headers.push((name, value));
     }
     if has_te {
-        return Parse::Bad(501, "Not Implemented"); // no chunked requests
+        let body_start = head_end + 4;
+        rbuf.drain(..body_start);
+        let (raw_path, query) = match target.split_once('?') {
+            Some((p, q)) => (p, q.to_string()),
+            None => (target, String::new()),
+        };
+        let Some(path) = url_decode(raw_path) else {
+            return Parse::Bad(400, "Bad Request");
+        };
+        return Parse::Stream(Request { method: method.into(), path, query, headers, body: Vec::new() });
     }
     if content_length > max_body {
         return Parse::Bad(413, "Payload Too Large");
