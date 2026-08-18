@@ -56,8 +56,14 @@ from the snapshot they started in.
 | `?filename=x&download=1` | content-disposition helpers |
 | `GET /api/status` | index state, progress, root CID |
 | `GET /api/files` | `[{path, size, cid}]` |
-| `POST /api/refresh` | re-list now (honors `api_key` when set) |
+| `POST /api/refresh` | re-list now |
+| `POST /api/upload?key=<path>` | body = raw bytes; PUT into the bucket (32 MiB cap), then re-index |
+| `POST /api/delete` | body `key=<path>`; DELETE from the bucket, then re-index |
 | `GET /` UI, `GET /ping` liveness | |
+
+The UI is also a small bucket browser: folder navigation with breadcrumbs,
+upload-into-the-current-folder, per-file delete, and a whole-bucket search.
+The three mutating routes (refresh, upload, delete) honor `api_key`.
 
 Gateway responses carry `etag`, immutable `cache-control`, `x-ipfs-path`,
 `x-ipfs-roots`, `accept-ranges`; single absolute HTTP ranges and HEAD are
@@ -88,10 +94,12 @@ resolve from the environment, which is how deployment secrets arrive:
 `endpoint` and `bucket` are required; the app still starts without them and
 says so in the UI. Omit `credentials` for a public bucket (requests go
 unsigned). `refreshSecs: 0` disables the timer (manual refresh only).
-`api_key` is a shared secret of your choosing; when set, it protects
-`POST /api/refresh` (reads stay open, they only serve content-addressed
-data). Present it as `X-Api-Key: <key>` or `?key=<key>`; on the fleet the
-TLS proxy strips `Authorization`, so Bearer only works locally.
+`api_key` is a shared secret of your choosing; when set, it protects the
+mutating routes: refresh, upload, delete (reads stay open, they only serve
+content-addressed data). Present it as `X-Api-Key: <key>` or `?key=<key>`;
+on the fleet the TLS proxy strips `Authorization`, so Bearer only works
+locally. A public deployment without an `api_key` leaves the bucket
+writable by anyone: set one.
 
 ## Limits, by design
 

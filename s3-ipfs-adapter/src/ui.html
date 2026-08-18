@@ -63,9 +63,17 @@
   .copy:hover { color: var(--ink); border-color: var(--amber); }
   input.filter {
     width: 100%; background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
-    border-radius: 7px; padding: 8px 12px; font: 13px var(--mono); margin-top: 4px;
+    border-radius: 7px; padding: 8px 12px; font: 13px var(--mono); margin-top: 10px;
   }
   input.filter:focus { border-color: var(--amber); outline: none; }
+  .pathbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .crumbs { flex: 1; min-width: 0; color: var(--dim); font-size: 13px; word-break: break-all; }
+  .crumbs a { color: var(--amber); }
+  .crumbs b { color: var(--ink); font-weight: 600; }
+  td.dir a { color: var(--ink); font-weight: 600; }
+  td.dir a::before { content: "▸ "; color: var(--amber); }
+  button.del { cursor: pointer; color: var(--faint); border: 1px solid var(--edge2); border-radius: 5px; padding: 0 7px; font-size: 11px; background: transparent; margin-left: 6px; }
+  button.del:hover { color: #fff; background: var(--red); border-color: var(--red); }
   .err { color: var(--red); font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
   footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 20px 34px; max-width: 720px; }
   .hidden { display: none !important; }
@@ -102,9 +110,14 @@
 
   <section class="card">
     <h2>FILES</h2>
-    <input class="filter" id="filter" placeholder="filter by path…">
+    <div class="pathbar">
+      <span class="crumbs" id="crumbs"></span>
+      <button id="upbtn">upload here</button>
+      <input type="file" id="upfile" multiple class="hidden">
+    </div>
+    <input class="filter" id="filter" placeholder="search the whole bucket…">
     <table>
-      <thead><tr><th>path</th><th>size</th><th>cid</th><th></th></tr></thead>
+      <thead><tr><th>name</th><th>size</th><th>cid</th><th></th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div class="mini" id="count"></div>
@@ -120,7 +133,14 @@
 </main>
 <script>
   const $ = id => document.getElementById(id);
-  let files = [], loadedOnce = false;
+  let files = [], loadedOnce = false, bucketLabel = '', uiErr = '';
+
+  function showErr(msg) {
+    uiErr = msg;
+    $('err').classList.remove('hidden');
+    $('err').textContent = msg;
+    setTimeout(() => { if (uiErr === msg) uiErr = ''; }, 12000);
+  }
 
   function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
   function human(n) {
@@ -140,32 +160,85 @@
     if (btn) { const old = btn.textContent; btn.textContent = 'ok'; setTimeout(() => btn.textContent = old, 900); }
   }
 
+  let cwd = []; // current folder as path segments
+
+  function fileRow(f, label) {
+    return `<tr>
+      <td><a href="/ipfs/${f.cid}?filename=${encodeURIComponent(f.path.split('/').pop())}">${esc(label)}</a></td>
+      <td class="sz">${human(f.size)}</td>
+      <td class="cid"><a href="/ipfs/${f.cid}" title="${esc(f.cid)}">${shortCid(f.cid)}</a></td>
+      <td><button class="copy" data-cid="${esc(f.cid)}">copy</button>
+          <a class="mini" href="/ipfs/${f.cid}?format=car">car</a>
+          <button class="del" data-path="${esc(f.path)}" title="delete from S3">&#10005;</button></td>
+    </tr>`;
+  }
+
+  function renderCrumbs() {
+    let html = `<a href="#" data-depth="0">${esc(bucketLabel || 'bucket')}</a>`;
+    cwd.forEach((seg, i) => {
+      html += i === cwd.length - 1
+        ? ` / <b>${esc(seg)}</b>`
+        : ` / <a href="#" data-depth="${i + 1}">${esc(seg)}</a>`;
+    });
+    $('crumbs').innerHTML = html;
+    for (const a of $('crumbs').querySelectorAll('a'))
+      a.onclick = e => { e.preventDefault(); cwd = cwd.slice(0, +a.dataset.depth); render(); };
+  }
+
   function render() {
+    renderCrumbs();
     const q = $('filter').value.toLowerCase();
     const rows = [];
-    let shown = 0;
-    for (const f of files) {
-      if (q && !f.path.toLowerCase().includes(q)) continue;
-      if (++shown > 500) break;
-      rows.push(`<tr>
-        <td><a href="/ipfs/${f.cid}?filename=${encodeURIComponent(f.path.split('/').pop())}">${esc(f.path)}</a></td>
-        <td class="sz">${human(f.size)}</td>
-        <td class="cid"><a href="/ipfs/${f.cid}" title="${esc(f.cid)}">${shortCid(f.cid)}</a></td>
-        <td><button class="copy" data-cid="${esc(f.cid)}">copy</button>
-            <a class="mini" href="/ipfs/${f.cid}?format=car">car</a></td>
-      </tr>`);
+    let shown = 0, total = files.length;
+    if (q) {
+      // flat search across the whole bucket
+      for (const f of files) {
+        if (!f.path.toLowerCase().includes(q)) continue;
+        if (++shown > 500) break;
+        rows.push(fileRow(f, f.path));
+      }
+      $('count').textContent = shown > 500
+        ? `showing 500 matches (narrow the search)` : `${shown} matching files`;
+    } else {
+      // folder view of cwd
+      const base = cwd.length ? cwd.join('/') + '/' : '';
+      const dirs = new Map(); // name -> {size, count}
+      const here = [];
+      for (const f of files) {
+        if (!f.path.startsWith(base)) continue;
+        const rest = f.path.slice(base.length);
+        const slash = rest.indexOf('/');
+        if (slash === -1) { here.push(f); continue; }
+        const d = rest.slice(0, slash);
+        const agg = dirs.get(d) || { size: 0, count: 0 };
+        agg.size += f.size; agg.count++;
+        dirs.set(d, agg);
+      }
+      for (const name of [...dirs.keys()].sort()) {
+        const d = dirs.get(name);
+        rows.push(`<tr><td class="dir"><a href="#" data-dir="${esc(name)}">${esc(name)}/</a></td>
+          <td class="sz">${human(d.size)}</td><td class="cid">${d.count} file${d.count > 1 ? 's' : ''}</td><td></td></tr>`);
+      }
+      here.sort((a, b) => a.path < b.path ? -1 : 1);
+      for (const f of here) rows.push(fileRow(f, f.path.slice(base.length)));
+      shown = here.length;
+      $('count').textContent = `${dirs.size} folders, ${here.length} files here · ${total} files in the bucket`;
     }
     $('rows').innerHTML = rows.join('');
-    $('count').textContent = shown > 500
-      ? `showing 500 of ${files.length} files (filter to narrow)`
-      : `${shown} of ${files.length} files`;
     for (const b of $('rows').querySelectorAll('button.copy'))
       b.onclick = () => copyText(b.dataset.cid, b);
+    for (const a of $('rows').querySelectorAll('td.dir a'))
+      a.onclick = e => { e.preventDefault(); cwd.push(a.dataset.dir); render(); };
+    for (const b of $('rows').querySelectorAll('button.del'))
+      b.onclick = () => delFile(b.dataset.path);
   }
 
   async function loadFiles() {
     try {
       files = await (await fetch('/api/files')).json();
+      // a re-index may have removed the folder we were standing in
+      const base = cwd.length ? cwd.join('/') + '/' : '';
+      if (base && !files.some(f => f.path.startsWith(base))) cwd = [];
       render();
     } catch (e) {}
   }
@@ -176,6 +249,8 @@
     catch (e) { $('state').textContent = 'unreachable'; $('state').className = 'state-bad'; return schedule(3000); }
     $('title').textContent = s.title;
     $('bucket').textContent = s.bucket ? s.bucket + (s.prefix ? '/' + s.prefix : '') : '(unset)';
+    const newLabel = s.bucket ? s.bucket + (s.prefix ? '/' + s.prefix.replace(/\/$/, '') : '') : 'bucket';
+    if (newLabel !== bucketLabel) { bucketLabel = newLabel; renderCrumbs(); }
     $('files').textContent = s.files;
     $('bytes').textContent = human(s.totalBytes);
     $('nodes').textContent = s.dagNodes;
@@ -183,10 +258,12 @@
     const busy = s.state === 'listing' || s.state === 'hashing';
     $('state').textContent = s.state + (s.truncated ? ' (truncated)' : '');
     $('state').className = s.state === 'ready' ? 'state-ready' : busy ? 'state-busy' : 'state-bad';
-    $('err').classList.toggle('hidden', !s.error && s.state !== 'unconfigured');
-    if (s.state === 'unconfigured')
-      $('err').textContent = 'unconfigured: set ' + (s.missing || []).join(', ') + ' in the deployment config, then restart';
-    else if (s.error) $('err').textContent = s.error;
+    const serverErr = s.state === 'unconfigured'
+      ? 'unconfigured: set ' + (s.missing || []).join(', ') + ' in the deployment config, then restart'
+      : (s.error || '');
+    const errMsg = uiErr || serverErr;
+    $('err').classList.toggle('hidden', !errMsg);
+    $('err').textContent = errMsg;
     $('bar').classList.toggle('hidden', s.state !== 'hashing');
     if (s.state === 'hashing') {
       const pct = s.toHashBytes ? Math.min(100, 100 * s.hashedBytes / s.toHashBytes) : 100;
@@ -215,38 +292,72 @@
   $('filter').oninput = render;
   $('copyroot').onclick = () => copyText($('root').value, $('copyroot'));
 
-  // Re-index. When the deployment sets an api_key, present it as X-Api-Key
-  // (the fleet's TLS proxy strips Authorization); learned once via prompt,
-  // kept in localStorage, forgotten again if it stops working.
-  async function postRefresh(k) {
-    const headers = k ? { 'x-api-key': k } : {};
-    return fetch('/api/refresh', { method: 'POST', headers });
+  // Writes (re-index, upload, delete) present the deployment's api_key as
+  // X-Api-Key (the fleet's TLS proxy strips Authorization): learned once
+  // via prompt, kept in localStorage, forgotten again if it stops working.
+  async function authedFetch(path, opts = {}) {
+    opts.headers = Object.assign({}, opts.headers);
+    const k = localStorage.getItem('s3ipfs-key') || new URLSearchParams(location.search).get('key');
+    if (k) opts.headers['x-api-key'] = k;
+    let r = await fetch(path, opts);
+    if (r.status === 403) {
+      localStorage.removeItem('s3ipfs-key');
+      const fresh = prompt('this deployment protects writes with an api key:');
+      if (fresh) {
+        opts.headers['x-api-key'] = fresh;
+        r = await fetch(path, opts);
+        if (r.ok) localStorage.setItem('s3ipfs-key', fresh);
+      }
+    }
+    return r;
   }
+  async function apiError(r) {
+    const e = await r.json().catch(() => ({}));
+    return e.error || ('HTTP ' + r.status);
+  }
+
   $('refresh').onclick = async () => {
     $('progress').textContent = 're-index requested…';
     try {
-      let k = localStorage.getItem('s3ipfs-key') || new URLSearchParams(location.search).get('key');
-      let r = await postRefresh(k);
-      if (r.status === 403) {
-        localStorage.removeItem('s3ipfs-key');
-        k = prompt('this deployment protects re-index with an api key:');
-        if (k) {
-          r = await postRefresh(k);
-          if (r.ok) localStorage.setItem('s3ipfs-key', k);
-        }
-      }
-      if (!r.ok) {
-        $('err').classList.remove('hidden');
-        $('err').textContent = `re-index failed: HTTP ${r.status}`;
-        $('progress').textContent = '';
-      }
-    } catch (e) {
-      $('err').classList.remove('hidden');
-      $('err').textContent = 're-index failed: ' + e;
-      $('progress').textContent = '';
-    }
+      const r = await authedFetch('/api/refresh', { method: 'POST' });
+      if (!r.ok) { showErr('re-index failed: ' + await apiError(r)); $('progress').textContent = ''; }
+    } catch (e) { showErr('re-index failed: ' + e); $('progress').textContent = ''; }
     schedule(400);
   };
+
+  $('upbtn').onclick = () => $('upfile').click();
+  $('upfile').onchange = async () => {
+    const list = [...$('upfile').files];
+    $('upfile').value = '';
+    const CAP = 32 * 1024 * 1024;
+    let done = 0;
+    for (const f of list) {
+      if (f.size > CAP) { showErr(`${f.name}: over the 32 MiB upload cap (use S3 tooling for big objects)`); continue; }
+      $('progress').textContent = `uploading ${f.name} (${human(f.size)})…`;
+      try {
+        const key = cwd.concat(f.name).join('/');
+        const r = await authedFetch('/api/upload?key=' + encodeURIComponent(key), { method: 'POST', body: f });
+        if (r.ok) done++;
+        else showErr(`upload ${f.name}: ` + await apiError(r));
+      } catch (e) { showErr(`upload ${f.name}: ` + e); }
+    }
+    $('progress').textContent = done ? `${done} uploaded; re-indexing…` : '';
+    schedule(400);
+  };
+
+  async function delFile(path) {
+    if (!confirm(`delete ${path} from the bucket?`)) return;
+    try {
+      const r = await authedFetch('/api/delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'key=' + encodeURIComponent(path),
+      });
+      if (r.ok) $('progress').textContent = `deleted ${path}; re-indexing…`;
+      else showErr('delete failed: ' + await apiError(r));
+    } catch (e) { showErr('delete failed: ' + e); }
+    schedule(400);
+  }
   tick();
 </script>
 </body>

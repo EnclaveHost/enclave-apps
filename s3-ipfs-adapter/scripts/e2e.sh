@@ -211,5 +211,42 @@ NEW_ROOT=$(status | jget rootCid)
 [ "$NEW_ROOT" != "$APP_ROOT" ] || fail "root CID did not change on refresh"
 pass "refresh re-indexed the changed object (new root: $NEW_ROOT)"
 
+echo "== upload / delete through the app =="
+head -c $((1 * 1024 * 1024 + 77)) /dev/urandom > "$WORK/upload.bin"
+UP_EXPECT=$(ipfs add --cid-version 1 -Q --only-hash "$WORK/upload.bin" 2>/dev/null)
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WORK/upload.bin" \
+  "$BASE/api/upload?key=incoming/upload%20me.bin")
+[ "$code" = 200 ] || fail "upload -> $code"
+for i in $(seq 1 120); do
+  NOW=$(curl -s "$BASE/api/files" | python3 -c 'import sys,json;print({f["path"]:f["cid"] for f in json.load(sys.stdin)}.get("incoming/upload me.bin",""))' 2>/dev/null || echo "")
+  [ "$NOW" = "$UP_EXPECT" ] && break
+  sleep 0.5
+  [ "$i" = 120 ] && fail "uploaded file never appeared with the right CID (have '$NOW', want $UP_EXPECT)"
+done
+curl -sf "$BASE/ipfs/$UP_EXPECT" -o "$WORK/upload-back.bin"
+cmp "$WORK/upload-back.bin" "$WORK/upload.bin" || fail "uploaded bytes differ on the way back"
+pass "upload lands in S3, indexes with the kubo-identical CID, round-trips"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'content-type: application/x-www-form-urlencoded' \
+  --data 'key=incoming%2Fupload%20me.bin' "$BASE/api/delete")
+[ "$code" = 200 ] || fail "delete -> $code"
+for i in $(seq 1 120); do
+  GONE=$(curl -s "$BASE/api/files" | python3 -c 'import sys,json;print("incoming/upload me.bin" in {f["path"] for f in json.load(sys.stdin)})' 2>/dev/null || echo "")
+  [ "$GONE" = False ] && break
+  sleep 0.5
+  [ "$i" = 120 ] && fail "deleted file still in the index"
+done
+code=$(curl -s -o /dev/null -w '%{http_code}' "$S3/$BUCKET/incoming/upload%20me.bin" \
+  --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK")
+[ "$code" = 404 ] || fail "object still in S3 after delete ($code)"
+pass "delete removes the object from S3 and the index"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?key=../escape.bin" --data-binary 'x')
+[ "$code" = 400 ] || fail "dot-dot key accepted ($code)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?key=trailing/")
+[ "$code" = 400 ] || fail "trailing-slash key accepted ($code)"
+pass "bad upload keys rejected"
+
 echo
 echo "ALL PASS"

@@ -243,7 +243,9 @@ fn connect(ep: &Endpoint) -> Result<Wire, String> {
     Ok(Wire::Tls(Box::new(rustls::StreamOwned::new(conn, sock))))
 }
 
-/// One S3 GET-family request. Returns (status, body).
+/// One S3 request. GETs pass an empty `body`; PUTs sign and send theirs
+/// (the payload hash of an empty body IS the empty-body hash, so every
+/// method takes the same path). Returns (status, response body).
 fn request(
     method: &str,
     ep: &Endpoint,
@@ -252,6 +254,7 @@ fn request(
     query: &[(String, String)],
     range: Option<(u64, u64)>, // inclusive byte range
     creds: Option<&Creds>,
+    body: &[u8],
 ) -> Result<(u16, Vec<u8>), String> {
     let canonical_uri = if key.is_empty() {
         format!("/{}", uri_encode(bucket, true))
@@ -259,7 +262,11 @@ fn request(
         format!("/{}/{}", uri_encode(bucket, true), uri_encode(key, true))
     };
     let canonical_query = query_string(query);
-    let payload_hash = EMPTY_SHA256.to_string();
+    let payload_hash = if body.is_empty() {
+        EMPTY_SHA256.to_string()
+    } else {
+        hex(&Sha256::digest(body))
+    };
     let host_header = if (ep.https && ep.port == 443) || (!ep.https && ep.port == 80) {
         ep.host.clone()
     } else {
@@ -284,13 +291,22 @@ fn request(
             for (k, v) in &extra {
                 head.push_str(&format!("{k}: {v}\r\n"));
             }
+            // unsigned PUT (public bucket / mock): still send the content
+            // hash, some stores want it
+            if method == "PUT" {
+                head.push_str(&format!("x-amz-content-sha256: {payload_hash}\r\n"));
+            }
         }
     }
-    head.push_str("content-length: 0\r\nconnection: close\r\n\r\n");
+    head.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", body.len()));
 
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut wire = connect(ep)?;
     wire.write_all(head.as_bytes()).map_err(|e| format!("send: {e}"))?;
+    // 64 KiB body chunks keep the TLS record path and wasi write sizes sane
+    for chunk in body.chunks(64 * 1024) {
+        wire.write_all(chunk).map_err(|e| format!("send body: {e}"))?;
+    }
     wire.flush().ok();
 
     // Read the full response (headers + body).
@@ -405,7 +421,7 @@ pub fn get_range(
         return Ok(Vec::new());
     }
     let (status, mut body) =
-        request("GET", ep, bucket, key, &[], Some((start, start + len - 1)), creds)?;
+        request("GET", ep, bucket, key, &[], Some((start, start + len - 1)), creds, &[])?;
     match status {
         206 => Ok(body),
         // A store that ignores Range answers 200 with the whole object.
@@ -422,6 +438,35 @@ pub struct ObjMeta {
     pub key: String,
     pub size: u64,
     pub etag: String,
+}
+
+/// PUT one object. S3 answers 200 with an ETag header.
+pub fn put_object(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    body: &[u8],
+) -> Result<(), String> {
+    let (status, resp) = request("PUT", ep, bucket, key, &[], None, creds, body)?;
+    if status != 200 {
+        return Err(s3_error(status, &resp));
+    }
+    Ok(())
+}
+
+/// DELETE one object. S3 answers 204 (idempotent: also for absent keys).
+pub fn delete_object(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+) -> Result<(), String> {
+    let (status, resp) = request("DELETE", ep, bucket, key, &[], None, creds, &[])?;
+    if !matches!(status, 200 | 202 | 204) {
+        return Err(s3_error(status, &resp));
+    }
+    Ok(())
 }
 
 /// One page of ListObjectsV2. Returns (objects, next continuation token).
@@ -442,7 +487,7 @@ pub fn list_page(
     if let Some(c) = cont {
         query.push(("continuation-token".to_string(), c.to_string()));
     }
-    let (status, body) = request("GET", ep, bucket, "", &query, None, creds)?;
+    let (status, body) = request("GET", ep, bucket, "", &query, None, creds, &[])?;
     if status != 200 {
         return Err(s3_error(status, &body));
     }

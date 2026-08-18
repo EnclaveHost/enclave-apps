@@ -44,7 +44,7 @@ pub const MAX_CONNS: usize = 384;
 pub const MAX_WBUF: usize = 512 * 1024; // close a buffered client that can't drain this
 const IDLE_KEEPALIVE: Duration = Duration::from_secs(60);
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+const BODY_TIMEOUT: Duration = Duration::from_secs(120); // big-route uploads included
 // A peer that has not drained a single byte for this long is gone, whatever
 // its socket claims. (Not "non-empty this long": a streaming client paying
 // down a window is non-empty for the whole paydown and very much alive.)
@@ -181,7 +181,12 @@ impl Server {
     /// One pass: accept, read, parse. Returns complete requests as
     /// (conn_key, Request); answer each with respond()/respond_stream()
     /// before the next poll (a key is only stable until then).
-    pub fn poll(&mut self, max_body: usize) -> Vec<(usize, Request)> {
+    ///
+    /// `max_body` caps ordinary request bodies; targets under `big_prefix`
+    /// (the upload route) are allowed `big_body` instead, decided from the
+    /// request line once the header block is complete.
+    pub fn poll(&mut self, max_body: usize, big_body: usize, big_prefix: &str) -> Vec<(usize, Request)> {
+        let read_cap = MAX_HEADER_BYTES + max_body.max(big_body);
         // Accept.
         loop {
             match self.listener.accept() {
@@ -241,7 +246,7 @@ impl Server {
                     Ok(n) => {
                         conn.rbuf.extend_from_slice(&buf[..n]);
                         conn.last_activity = Instant::now();
-                        if conn.rbuf.len() > MAX_HEADER_BYTES + max_body {
+                        if conn.rbuf.len() > read_cap {
                             overflow(conn, 413, "Payload Too Large");
                             break;
                         }
@@ -255,7 +260,7 @@ impl Server {
                 }
             }
             if let ConnState::Http { since, reading_body } = &mut conn.state {
-                match try_parse(&mut conn.rbuf, max_body) {
+                match try_parse(&mut conn.rbuf, max_body, big_body, big_prefix) {
                     Parse::Complete(req) => {
                         if req
                             .header("connection")
@@ -484,7 +489,7 @@ enum Parse {
     Bad(u16, &'static str),
 }
 
-fn try_parse(rbuf: &mut Vec<u8>, max_body: usize) -> Parse {
+fn try_parse(rbuf: &mut Vec<u8>, max_body: usize, big_body: usize, big_prefix: &str) -> Parse {
     let Some(head_end) = find_crlfcrlf(rbuf) else {
         if rbuf.len() > MAX_HEADER_BYTES {
             return Parse::Bad(431, "Request Header Fields Too Large");
@@ -530,7 +535,14 @@ fn try_parse(rbuf: &mut Vec<u8>, max_body: usize) -> Parse {
     if has_te {
         return Parse::Bad(501, "Not Implemented"); // no chunked requests
     }
-    if content_length > max_body {
+    let cap = if !big_prefix.is_empty()
+        && target.split('?').next().unwrap_or("").starts_with(big_prefix)
+    {
+        big_body
+    } else {
+        max_body
+    };
+    if content_length > cap {
         return Parse::Bad(413, "Payload Too Large");
     }
     let body_start = head_end + 4;

@@ -51,6 +51,10 @@ const UI: &str = include_str!("ui.html");
 const APP: &str = concat!("s3-ipfs-adapter/", env!("CARGO_PKG_VERSION"));
 
 const MAX_BODY: usize = 16 * 1024;
+/// Upload cap. Bodies buffer in memory (the engine has no request
+/// streaming), so this is a deliberate ceiling; bigger objects belong in
+/// S3 tooling, this is an admin convenience.
+const MAX_UPLOAD: usize = 32 * 1024 * 1024;
 /// Bytes fetched per indexing tick (whole chunks; 16 chunks).
 const INDEX_WINDOW: u64 = 4 * 1024 * 1024;
 /// Bytes fetched per streaming pull (whole chunks; 8 chunks).
@@ -679,7 +683,7 @@ fn main() {
     let mut srv = Server::bind(APP, 8000);
     let mut tick: u64 = 0;
     loop {
-        for (key, req) in srv.poll(MAX_BODY) {
+        for (key, req) in srv.poll(MAX_BODY, MAX_UPLOAD, "/api/upload") {
             route(&mut app, &mut srv, key, &req);
         }
         tick += 1;
@@ -714,6 +718,8 @@ fn route(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
         ("GET", "/api/status") => srv.respond(key, api_status(app, srv.uptime_secs())),
         ("GET", "/api/files") => api_files(app, srv, key),
         ("POST", "/api/refresh") => api_refresh(app, srv, key, req),
+        ("POST", "/api/upload") => api_upload(app, srv, key, req),
+        ("POST", "/api/delete") => api_delete(app, srv, key, req),
         ("GET", p) | ("HEAD", p) if p == "/ipfs" || p.starts_with("/ipfs/") => {
             gateway(app, srv, key, req)
         }
@@ -803,13 +809,99 @@ fn api_refresh(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
     if app.s3.is_none() {
         return srv.respond(key, json(503, "Service Unavailable", "{\"error\":\"unconfigured\"}".into()));
     }
-    // Restart listing from ANY phase: a refresh must always visibly do its
-    // job. Dropping in-flight staging is safe (serving runs from the
-    // committed snapshot), and it is also the way out of a wedged hash job.
+    restart_listing(app);
+    srv.respond(key, json(200, "OK", "{\"ok\":true,\"note\":\"listing restarted\"}".into()))
+}
+
+/// Restart listing from ANY phase: a refresh must always visibly do its
+/// job. Dropping in-flight staging is safe (serving runs from the
+/// committed snapshot), and it is also the way out of a wedged hash job.
+fn restart_listing(app: &mut App) {
     app.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
     app.indexer.retry_at = None;
     app.indexer.errors = 0;
-    srv.respond(key, json(200, "OK", "{\"ok\":true,\"note\":\"listing restarted\"}".into()))
+}
+
+/// `k=v` lookup with percent-decoding ONLY: object keys and paths keep
+/// their literal '+' (the space alias is a form convention that browsers'
+/// encodeURIComponent never produces).
+fn raw_get(pairs: &str, key: &str) -> Option<String> {
+    for pair in pairs.split('&') {
+        let Some((k, v)) = pair.split_once('=') else { continue };
+        if k == key {
+            return httpd::percent_decode(v);
+        }
+    }
+    None
+}
+
+/// A relative object key as accepted from the UI: non-empty, no leading or
+/// trailing slash, no empty or dot-only segments, no control bytes, and
+/// short enough for S3's 1024-byte key limit once the prefix is prepended.
+fn valid_rel_key(k: &str, prefix: &str) -> bool {
+    !k.is_empty()
+        && k.len() + prefix.len() <= 1024
+        && !k.starts_with('/')
+        && !k.ends_with('/')
+        && !k.bytes().any(|b| b < 0x20 || b == 0x7f)
+        && k.split('/').all(|s| !s.is_empty() && s != "." && s != "..")
+}
+
+fn api_upload(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
+    if !authorized(&app.cfg, req) {
+        return srv.respond(key, json(403, "Forbidden", "{\"error\":\"bad key\"}".into()));
+    }
+    let Some(s3ctx) = app.s3.clone() else {
+        return srv.respond(key, json(503, "Service Unavailable", "{\"error\":\"unconfigured\"}".into()));
+    };
+    let Some(rel) = raw_get(&req.query, "key").filter(|k| valid_rel_key(k, &app.cfg.prefix))
+    else {
+        return srv.respond(key, json(400, "Bad Request", "{\"error\":\"bad or missing ?key=\"}".into()));
+    };
+    let full = format!("{}{rel}", app.cfg.prefix);
+    match s3::put_object(&s3ctx.ep, &s3ctx.bucket, &full, s3ctx.creds.as_ref(), &req.body) {
+        Ok(()) => {
+            eprintln!(
+                "[s3-ipfs-adapter] uploaded {} ({} bytes); re-listing",
+                full,
+                req.body.len()
+            );
+            restart_listing(app);
+            srv.respond(
+                key,
+                json(200, "OK", format!("{{\"ok\":true,\"key\":\"{}\"}}", json_escape(&rel))),
+            )
+        }
+        Err(e) => srv.respond(
+            key,
+            json(502, "Bad Gateway", format!("{{\"error\":\"{}\"}}", json_escape(&e))),
+        ),
+    }
+}
+
+fn api_delete(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
+    if !authorized(&app.cfg, req) {
+        return srv.respond(key, json(403, "Forbidden", "{\"error\":\"bad key\"}".into()));
+    }
+    let Some(s3ctx) = app.s3.clone() else {
+        return srv.respond(key, json(503, "Service Unavailable", "{\"error\":\"unconfigured\"}".into()));
+    };
+    let body = String::from_utf8_lossy(&req.body).to_string();
+    let Some(rel) = raw_get(&body, "key").filter(|k| valid_rel_key(k, &app.cfg.prefix)) else {
+        return srv.respond(key, json(400, "Bad Request", "{\"error\":\"bad or missing key=\"}".into()));
+    };
+    let full = format!("{}{rel}", app.cfg.prefix);
+    match s3::delete_object(&s3ctx.ep, &s3ctx.bucket, &full, s3ctx.creds.as_ref()) {
+        Ok(()) => {
+            eprintln!("[s3-ipfs-adapter] deleted {full}; re-listing");
+            restart_listing(app);
+            srv.respond(key, json(200, "OK", "{\"ok\":true}".into()))
+        }
+        Err(e) => srv.respond(
+            key,
+            json(502, "Bad Gateway", format!("{{\"error\":\"{}\"}}", json_escape(&e))),
+        ),
+    }
 }
 
 /// Send a buffered Response, spilling into a stream when it is larger than
