@@ -196,7 +196,6 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
             let mut cur = session.cursor.lock().unwrap();
             cur.0 = (cur.0 + dx / w).clamp(0.0, 1.0);
             cur.1 = (cur.1 + dy / h).clamp(0.0, 1.0);
-            crate::screen::cursor_set(cur.0, cur.1);
             Some(format!(r#"{{"t":"move","x":{:.6},"y":{:.6}}}"#, cur.0, cur.1))
         }
         MOUSE_MOVE_ABS_MAGIC if body.len() >= 10 => {
@@ -210,7 +209,6 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
             let nx = (x / ref_w).clamp(0.0, 1.0);
             let ny = (y / ref_h).clamp(0.0, 1.0);
             *session.cursor.lock().unwrap() = (nx, ny);
-            crate::screen::cursor_set(nx, ny);
             Some(format!(r#"{{"t":"move","x":{nx:.6},"y":{ny:.6}}}"#))
         }
         MOUSE_BUTTON_DOWN_MAGIC_GEN5 | MOUSE_BUTTON_UP_MAGIC_GEN5 if !body.is_empty() => {

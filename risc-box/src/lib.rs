@@ -1814,11 +1814,20 @@ pub fn run() {
                 // input — and the reason typing felt laggier than the mouse,
                 // which keeps the scan awake simply by moving. Both the worker
                 // and inline scans below pace off this.
-                let scan_still = if app.input_boost > 0 { 0 } else { app.fb_still };
+                // …but only a QUIET screen needs snapping awake. When the
+                // frame is already animating (fb_still == 0 on its own), the
+                // floor-paced scan carries every change anyway, and halving
+                // the floor just doubles scan+deflate work exactly while the
+                // player is providing input — measured as "DOOM lags out when
+                // I move the mouse or type", the encode stealing the emulator
+                // cycles the game needed. Boost from stillness, never from
+                // motion.
+                let snap = app.input_boost > 0 && app.fb_still > 0;
+                let scan_still = if snap { 0 } else { app.fb_still };
                 if worker::available() {
                     let due = app.fb_scanned.map_or(true, |t| {
                         t.elapsed() >= display::scan_interval_boosted(
-                            app.fb_cost, scan_still, app.input_boost > 0)
+                            app.fb_cost, scan_still, snap)
                     });
                     if (watching_display || watching_video) && due && worker::inflight() == 0 {
                         let began = Instant::now();
@@ -1837,7 +1846,7 @@ pub fn run() {
                 } else if watching_display
                     && app.fb_scanned.map_or(true, |t| {
                         t.elapsed() >= display::scan_interval_boosted(
-                            app.fb_cost, scan_still, app.input_boost > 0)
+                            app.fb_cost, scan_still, snap)
                     })
                 {
                     let began = Instant::now();

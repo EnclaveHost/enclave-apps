@@ -20,12 +20,7 @@ echo 0 > /proc/sys/kernel/printk 2>/dev/null
 start_x() {
     killall -9 Xorg 2>/dev/null
     rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
-    # -nocursor: the server never draws a pointer. Every remote viewer already
-    # has one — the browser's own cursor hovers the canvas, and the GameStream
-    # bridge composites a local sprite at the position it forwarded — so the
-    # in-frame arrow was only ever a shadow trailing the real one by a full
-    # round trip.
-    /usr/libexec/Xorg :0 -nocursor -nolisten tcp vt2 &
+    /usr/libexec/Xorg :0 -nolisten tcp vt2 &
     X_PID=$!
     n=0
     while [ ! -S /tmp/.X11-unix/X0 ] && [ $n -lt 90 ]; do

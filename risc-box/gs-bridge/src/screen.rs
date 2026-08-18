@@ -29,51 +29,6 @@ use crate::app::App;
 
 /// Bytes per pixel in a `/display` band (the guest's own B,G,R,X layout).
 const BAND_BPP: usize = 4;
-/// The client-side pointer. The guest's X server runs -nocursor (an in-frame
-/// arrow could only ever trail the real pointer by a full round trip), so the
-/// bridge composites its own sprite at the position it last FORWARDED — the
-/// cursor moves with zero perceived latency and the screen underneath catches
-/// up. Packed (x<<32)|y plus a "shown" bit; updated by the control channel.
-static CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// Position is NORMALIZED (0..1 of the frame), stored as micro-units; the
-/// compositor scales by its own frame size, so the control channel needs no
-/// knowledge of the screen geometry.
-pub fn cursor_set(fx: f64, fy: f64) {
-    let x = (fx.clamp(0.0, 1.0) * 1_000_000.0) as u64;
-    let y = (fy.clamp(0.0, 1.0) * 1_000_000.0) as u64;
-    CURSOR.store((x << 32) | y, std::sync::atomic::Ordering::Relaxed);
-    // A moved pointer is a changed picture even when no band arrived: nudge
-    // every snapshot_if_changed consumer to re-encode.
-    CURSOR_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-static CURSOR_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn cursor_get() -> Option<(usize, usize)> {
-    let v = CURSOR.load(std::sync::atomic::Ordering::Relaxed);
-    match v == u64::MAX {
-        true => None,
-        false => Some(((v >> 32) as usize, (v & 0xffff_ffff) as usize)),
-    }
-}
-
-/// A tiny left-arrow: 1 = black border, 2 = white fill, 0 = transparent.
-const CURSOR_SPRITE: [[u8; 8]; 12] = [
-    [1,0,0,0,0,0,0,0],
-    [1,1,0,0,0,0,0,0],
-    [1,2,1,0,0,0,0,0],
-    [1,2,2,1,0,0,0,0],
-    [1,2,2,2,1,0,0,0],
-    [1,2,2,2,2,1,0,0],
-    [1,2,2,2,2,2,1,0],
-    [1,2,2,2,2,2,2,1],
-    [1,2,2,1,1,1,1,1],
-    [1,2,1,0,0,0,0,0],
-    [1,1,0,0,0,0,0,0],
-    [1,0,0,0,0,0,0,0],
-];
-
 /// Bytes per pixel the encoder is fed.
 const RGB_BPP: usize = 3;
 
@@ -130,24 +85,6 @@ impl Screen {
 
     /// Copy the current picture out, in rgb24. Returns the generation so the
     /// caller can skip re-encoding an unchanged screen if it wants to.
-    fn composite_cursor(&self, out: &mut [u8]) {
-        let Some((ux, uy)) = cursor_get() else { return };
-        let cx = ux * self.width / 1_000_000;
-        let cy = uy * self.height / 1_000_000;
-        for (dy, row) in CURSOR_SPRITE.iter().enumerate() {
-            let y = cy + dy;
-            if y >= self.height { break; }
-            for (dx, &c) in row.iter().enumerate() {
-                if c == 0 { continue; }
-                let x = cx + dx;
-                if x >= self.width { break; }
-                let o = (y * self.width + x) * RGB_BPP;
-                let v = if c == 1 { 0u8 } else { 255u8 };
-                out[o] = v; out[o + 1] = v; out[o + 2] = v;
-            }
-        }
-    }
-
     pub fn snapshot_into(&self, out: &mut Vec<u8>) -> u64 {
         let g = {
             let f = self.frame.lock().unwrap();
@@ -155,7 +92,6 @@ impl Screen {
             out.extend_from_slice(&f);
             self.generation.load(Ordering::Relaxed)
         };
-        self.composite_cursor(out);
         g
     }
 
@@ -170,10 +106,8 @@ impl Screen {
     /// the way of the bands coming in off the network.
     pub fn snapshot_if_changed(&self, out: &mut Vec<u8>, since: u64) -> u64 {
         // Checked before taking the lock: the common case is "unchanged", and
-        // that case should not touch the mutex at all. Cursor motion counts
-        // as change: the composited pointer is part of the picture.
-        let now = self.generation.load(Ordering::Acquire)
-            .wrapping_add(CURSOR_MOVES.load(Ordering::Relaxed) << 20);
+        // that case should not touch the mutex at all.
+        let now = self.generation.load(Ordering::Acquire);
         if now == since && !out.is_empty() {
             return now;
         }
@@ -183,7 +117,6 @@ impl Screen {
             out.extend_from_slice(&f);
             self.generation.load(Ordering::Relaxed)
         };
-        self.composite_cursor(out);
         g
     }
 
