@@ -338,8 +338,42 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     // the pipelined per-request channel, which every app speaks.
     let mut stream = Some(app.input_stream());
     let mut pipe: Option<crate::app::InputPipe> = None;
+    // A lost stream is a fallback, not a verdict: the platform kills long-held
+    // request streams periodically (lease-slice churn), and against an OLD app
+    // the answer arrives on every dial. So the pipe carries input while a
+    // fresh dial sits a 1s probation holding only a benign empty line; silence
+    // promotes it back, an answer reschedules with backoff (5s..60s), which
+    // against a genuinely old app costs one idle connection a minute.
+    let mut candidate: Option<(crate::app::InputStream, std::time::Instant)> = None;
+    let mut retry_at: Option<std::time::Instant> = None;
+    let mut retry_backoff = Duration::from_secs(5);
     let mut last_used = std::time::Instant::now();
     while !session.is_stopping() {
+        if stream.is_none() {
+            if let Some((mut cand, since)) = candidate.take() {
+                if cand.answered() {
+                    retry_at = Some(std::time::Instant::now() + retry_backoff);
+                    retry_backoff = (retry_backoff * 2).min(Duration::from_secs(60));
+                } else if since.elapsed() >= Duration::from_secs(1) {
+                    eprintln!("[control] /hid-stream restored");
+                    stream = Some(cand);
+                    pipe = None;
+                    retry_backoff = Duration::from_secs(5);
+                } else {
+                    candidate = Some((cand, since));
+                }
+            } else if retry_at.is_some_and(|t| std::time::Instant::now() >= t) {
+                retry_at = None;
+                let mut cand = app.input_stream();
+                match cand.send(r#"{"events":[]}"#) {
+                    Ok(()) => candidate = Some((cand, std::time::Instant::now())),
+                    Err(_) => {
+                        retry_at = Some(std::time::Instant::now() + retry_backoff);
+                        retry_backoff = (retry_backoff * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
+        }
         let batch = queue.drain(Duration::from_millis(50));
         if batch.is_empty() {
             if let Some(p) = pipe.as_mut() {
@@ -348,11 +382,13 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
                     p.send("GET", "/ping", &[]);
                     last_used = std::time::Instant::now();
                 }
-            } else if let Some(st) = stream.as_mut() {
+            }
+            if let Some(st) = stream.as_mut() {
                 if st.answered() {
                     eprintln!("[control] /hid-stream answered by the app — falling back to pipelined /hid");
                     stream = None;
                     pipe = Some(app.input_pipe());
+                    retry_at = Some(std::time::Instant::now() + retry_backoff);
                 } else if last_used.elapsed() >= KEEPALIVE {
                     let _ = st.send(r#"{"events":[]}"#);
                     last_used = std::time::Instant::now();
@@ -372,6 +408,7 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
                     let mut p = app.input_pipe();
                     p.send("POST", "/hid", body.as_bytes());
                     pipe = Some(p);
+                    retry_at = Some(std::time::Instant::now() + retry_backoff);
                 }
             }
             (None, Some(p)) => p.send("POST", "/hid", body.as_bytes()),
