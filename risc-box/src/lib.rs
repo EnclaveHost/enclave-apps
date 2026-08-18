@@ -812,6 +812,12 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             }
         }
         ("POST", "/hid") => hid(app, server, key, &req.body),
+        // The streamed variant: this request never ends and is never answered;
+        // each newline-delimited body line arrives back through poll() as a
+        // synthesized /hid-stream-event and is injected with zero per-batch
+        // framing or response work (see httpd::upgrade_instream).
+        ("POST", "/hid-stream") => server.upgrade_instream(key, "/hid-stream-event"),
+        ("POST", "/hid-stream-event") => hid_inner(app, server, key, &req.body, false),
         ("POST", "/save") => save(app, server, key),
         ("POST", "/stop") => {
             app.emu = None;
@@ -969,15 +975,30 @@ const BTN_MIDDLE: u16 = 0x112;
 /// interface a remote/streaming client drives the desktop through; it is also
 /// the hook a GameStream host's input backend targets.
 fn hid(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
+    hid_inner(app, server, key, body, true)
+}
+
+fn hid_inner(app: &mut App, server: &mut Server, key: usize, body: &[u8], respond: bool) {
     if app.phase != Phase::Running || app.emu.is_none() {
-        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+        if respond {
+            server.respond(key, json(409, "Conflict", err("machine is not running")));
+        }
+        return;
     }
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return server.respond(key, json(400, "Bad Request", err(&format!("bad JSON: {e}")))),
+        Err(e) => {
+            if respond {
+                server.respond(key, json(400, "Bad Request", err(&format!("bad JSON: {e}"))));
+            }
+            return;
+        }
     };
     let Some(events) = v.get("events").and_then(|e| e.as_array()) else {
-        return server.respond(key, json(400, "Bad Request", err("expected {\"events\":[…]}")));
+        if respond {
+            server.respond(key, json(400, "Bad Request", err("expected {\"events\":[…]}")));
+        }
+        return;
     };
     let emu = app.emu.as_mut().expect("emu present (checked above)");
     let abs_max = Emulator::input_abs_max() as f64;
@@ -1042,7 +1063,9 @@ fn hid(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
     // Run full CPU batches for a bit so the guest services the input IRQ and
     // X repaints promptly instead of at the idle-throttle rate.
     app.input_boost = app.input_boost.max(NET_BOOST_TURNS);
-    server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
+    if respond {
+        server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
+    }
 }
 
 fn save(app: &mut App, server: &mut Server, key: usize) {

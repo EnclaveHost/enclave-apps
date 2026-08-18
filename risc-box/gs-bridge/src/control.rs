@@ -331,29 +331,52 @@ impl InputQueue {
 /// dial before it moves. Input latency is judged by exactly that first event.
 fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     const KEEPALIVE: Duration = Duration::from_secs(15);
-    // A pipelined connection: each batch is fired without waiting for the app's
-    // response, so a keystroke never sits behind the previous one's ~80 ms round
-    // trip. Order is preserved (one connection, HTTP/1.1 in-order replies); we
-    // just stop paying the return trip per key. See InputPipe.
-    let mut pipe = app.input_pipe();
+    // The streamed channel first: one POST /hid-stream whose chunked body
+    // carries every batch as a line — no per-batch request framing and no
+    // responses at all. A modern app never answers it, so the moment the
+    // peer says ANYTHING (an old app 404ing, a proxy erroring) this drops to
+    // the pipelined per-request channel, which every app speaks.
+    let mut stream = Some(app.input_stream());
+    let mut pipe: Option<crate::app::InputPipe> = None;
     let mut last_used = std::time::Instant::now();
     while !session.is_stopping() {
         let batch = queue.drain(Duration::from_millis(50));
         if batch.is_empty() {
-            // Drain any responses now back, so the socket stays clean and a dead
-            // peer is noticed even while idle.
-            pipe.poll();
-            if last_used.elapsed() >= KEEPALIVE {
-                pipe.send("GET", "/ping", &[]);
-                last_used = std::time::Instant::now();
+            if let Some(p) = pipe.as_mut() {
+                p.poll();
+                if last_used.elapsed() >= KEEPALIVE {
+                    p.send("GET", "/ping", &[]);
+                    last_used = std::time::Instant::now();
+                }
+            } else if let Some(st) = stream.as_mut() {
+                if st.answered() {
+                    eprintln!("[control] /hid-stream answered by the app — falling back to pipelined /hid");
+                    stream = None;
+                    pipe = Some(app.input_pipe());
+                } else if last_used.elapsed() >= KEEPALIVE {
+                    let _ = st.send(r#"{"events":[]}"#);
+                    last_used = std::time::Instant::now();
+                }
             }
             continue;
         }
         let body = format!(r#"{{"events":[{}]}}"#, batch.join(","));
         if std::env::var_os("GSB_DEBUG_INPUT").is_some() {
-            eprintln!("[control] /hid POST {} events: {body}", batch.len());
+            eprintln!("[control] input {} events: {body}", batch.len());
         }
-        pipe.send("POST", "/hid", body.as_bytes());
+        match (stream.as_mut(), pipe.as_mut()) {
+            (Some(st), _) => {
+                if st.send(&body).is_err() || st.answered() {
+                    eprintln!("[control] /hid-stream unavailable — falling back to pipelined /hid");
+                    stream = None;
+                    let mut p = app.input_pipe();
+                    p.send("POST", "/hid", body.as_bytes());
+                    pipe = Some(p);
+                }
+            }
+            (None, Some(p)) => p.send("POST", "/hid", body.as_bytes()),
+            (None, None) => unreachable!(),
+        }
         last_used = std::time::Instant::now();
     }
 }

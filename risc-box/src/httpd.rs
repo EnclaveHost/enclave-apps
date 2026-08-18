@@ -107,6 +107,12 @@ pub fn json(status: u16, reason: &'static str, body: String) -> Response {
 enum ConnState {
     Http { since: Instant, reading_body: bool },
     Sse { topic: String, last_beat: Instant },
+    // An inbound event stream (POST /hid-stream): the request never ends and
+    // is never answered; the chunked body is newline-delimited JSON event
+    // batches, each dispatched the moment its line is complete. No per-batch
+    // request parsing, no responses — input's framing cost drops to a chunk
+    // header, and the path is immune to any per-request overhead by shape.
+    InStream { path: &'static str, chunk_left: usize, line: Vec<u8> },
     Closing, // flush wbuf, then drop
 }
 
@@ -261,6 +267,78 @@ impl Server {
             if conn.held.is_some() {
                 continue;
             }
+            if matches!(conn.state, ConnState::InStream { .. }) {
+                let mut closing = false;
+                loop {
+                    match conn.stream.read(&mut buf) {
+                        Ok(0) => {
+                            closing = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            conn.last_activity = Instant::now();
+                            conn.rbuf.extend_from_slice(&buf[..n]);
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            closing = true;
+                            break;
+                        }
+                    }
+                }
+                let ConnState::InStream { path, chunk_left, line } = &mut conn.state else {
+                    unreachable!()
+                };
+                let path = *path;
+                let mut lines: Vec<Vec<u8>> = Vec::new();
+                // Dechunk in place: hex-size line, then that many body bytes,
+                // then CRLF. Body bytes split on '\n' into event lines.
+                let mut consumed = 0usize;
+                {
+                    let r = &conn.rbuf;
+                    loop {
+                        if *chunk_left == 0 {
+                            let Some(pos) = r[consumed..].iter().position(|&b| b == b'\n') else { break };
+                            let hdr = &r[consumed..consumed + pos];
+                            let hex: String = hdr.iter().map(|&b| b as char)
+                                .filter(|c| c.is_ascii_hexdigit()).collect();
+                            consumed += pos + 1;
+                            match usize::from_str_radix(&hex, 16) {
+                                Ok(0) => { consumed = r.len(); break } // terminal chunk: peer is done
+                                Ok(nn) => *chunk_left = nn,
+                                Err(_) => continue, // stray CRLF between chunks
+                            }
+                        }
+                        let take = (*chunk_left).min(r.len() - consumed);
+                        if take == 0 { break }
+                        for &b in &r[consumed..consumed + take] {
+                            if b == b'\n' {
+                                if !line.is_empty() {
+                                    lines.push(std::mem::take(line));
+                                }
+                            } else {
+                                line.push(b);
+                            }
+                        }
+                        consumed += take;
+                        *chunk_left -= take;
+                    }
+                }
+                conn.rbuf.drain(..consumed);
+                if closing {
+                    conn.state = ConnState::Closing;
+                }
+                for l in lines {
+                    out.push((i, Request {
+                        method: "POST".into(),
+                        path: path.into(),
+                        query: String::new(),
+                        headers: Vec::new(),
+                        body: l,
+                    }));
+                }
+                continue;
+            }
             if !matches!(conn.state, ConnState::Http { .. }) {
                 // SSE subscribers and closing conns: drain+discard any input.
                 loop {
@@ -392,6 +470,15 @@ impl Server {
 
     /// Convert the connection into an SSE subscriber on `topic`; `initial`
     /// (already `data: ...\n\n`-framed lines, or "") goes out first.
+    /// Convert this request's connection into an inbound event stream: the
+    /// remaining body bytes (chunked) feed poll() as synthesized requests on
+    /// `path`, one per newline-terminated line. The request itself is never
+    /// answered.
+    pub fn upgrade_instream(&mut self, key: usize, path: &'static str) {
+        let Some(conn) = self.conns.get_mut(key) else { return };
+        conn.state = ConnState::InStream { path, chunk_left: 0, line: Vec::new() };
+    }
+
     pub fn upgrade_sse(&mut self, key: usize, topic: &str, initial: &str) {
         let Some(conn) = self.conns.get_mut(key) else { return };
         let head = format!(
@@ -550,6 +637,11 @@ impl Server {
                             < if *reading_body { BODY_TIMEOUT } else { HEADER_TIMEOUT }
                     }
                 }
+                // An inbound event stream is kept exactly as long as its peer
+                // keeps feeding it (the bridge sends a keepalive batch well
+                // inside this window); silence means the peer is gone.
+                ConnState::InStream { .. } =>
+                    now.duration_since(conn.last_activity) < IDLE_KEEPALIVE,
             }
         });
         busy

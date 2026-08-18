@@ -55,6 +55,30 @@ impl Conn {
     fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
         self.tcp().set_read_timeout(d)
     }
+
+    /// A ~1ms peek at the read side. Ok(n>0) and EOF both mean the peer said
+    /// something (or hung up); a timeout means silence. Restores the normal
+    /// read timeout either way.
+    fn read_peek(&mut self, buf: &mut [u8]) -> PeekResult {
+        let _ = self.set_read_timeout(Some(Duration::from_millis(1)));
+        let r = self.read(buf);
+        let _ = self.set_read_timeout(Some(Duration::from_secs(30)));
+        match r {
+            Ok(0) => PeekResult::Spoke, // EOF: the peer is done with us
+            Ok(_) => PeekResult::Spoke,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                PeekResult::Silent,
+            Err(_) => PeekResult::Spoke,
+        }
+    }
+}
+
+#[derive(PartialEq)]
+enum PeekResult {
+    Spoke,
+    Silent,
 }
 
 /// Idle connections kept for reuse. Small on purpose: the callers are the
@@ -358,6 +382,61 @@ impl App {
     /// response — see [`InputPipe`].
     pub fn input_pipe(self: &std::sync::Arc<Self>) -> InputPipe {
         InputPipe { app: self.clone(), conn: None, buf: Vec::new(), pending: 0 }
+    }
+
+    /// The streamed input channel: one POST /hid-stream whose chunked body
+    /// carries every batch as a newline-terminated line — no per-batch
+    /// request framing and no responses at all. An app that predates the
+    /// endpoint ANSWERS the request instead of consuming it forever; the
+    /// first bytes it sends back are the detection signal, and the caller
+    /// falls back to the pipelined per-request channel.
+    pub fn input_stream(self: &std::sync::Arc<Self>) -> InputStream {
+        InputStream { app: self.clone(), conn: None }
+    }
+}
+
+pub struct InputStream {
+    app: std::sync::Arc<App>,
+    conn: Option<Conn>,
+}
+
+impl InputStream {
+    fn dial(&mut self) -> std::io::Result<()> {
+        let mut c = self.app.connect()?;
+        let head = format!(
+            "POST /hid-stream HTTP/1.1\r\nHost: {}\r\n{}transfer-encoding: chunked\r\ncontent-type: application/json\r\n\r\n",
+            self.app.host, self.app.auth_header()
+        );
+        c.write_all(head.as_bytes())?;
+        c.flush()?;
+        self.conn = Some(c);
+        Ok(())
+    }
+
+    /// Ship one batch line. Errors surface so the drainer can redial or
+    /// switch channels.
+    pub fn send(&mut self, line: &str) -> std::io::Result<()> {
+        if self.conn.is_none() {
+            self.dial()?;
+        }
+        let c = self.conn.as_mut().unwrap();
+        let chunk = format!("{:x}\r\n{}\n\r\n", line.len() + 1, line);
+        match c.write_all(chunk.as_bytes()).and_then(|_| c.flush()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.conn = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// True when the peer wrote anything back: a modern app never answers
+    /// /hid-stream, so any response (or a hangup) means an old app 404'd it
+    /// and the caller should fall back to the pipelined channel.
+    pub fn answered(&mut self) -> bool {
+        let Some(c) = self.conn.as_mut() else { return false };
+        let mut probe = [0u8; 256];
+        c.read_peek(&mut probe) == PeekResult::Spoke
     }
 }
 
