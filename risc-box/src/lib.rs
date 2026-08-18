@@ -320,6 +320,23 @@ impl BandRing {
     }
 }
 
+/// How long a /fb.bands?wait=1 request may stay parked before it is answered
+/// empty. Short enough that the connection always ticks well inside every
+/// proxy timeout, long enough that a 60 Hz consumer parks instead of polling.
+const PULL_HOLD_MS: u64 = 150;
+
+fn fb_bands_body(app: &mut App, since: u64) -> String {
+    let (gen, events, resync) = app.pull.since(since, 240 * 1024);
+    if resync {
+        app.display.want_full();
+        worker::want_full();
+    }
+    format!(
+        "{{\"gen\":{},\"resync\":{},\"w\":{},\"h\":{},\"events\":[{}]}}",
+        gen, resync, display::fb_w(), display::fb_h(), events.join(",")
+    )
+}
+
 /// Whether a request may touch the machine. With no `api_key` configured the
 /// app is open (fine for a private deployment). With one set, every control
 /// and observation endpoint requires it — presented as `Authorization: Bearer
@@ -467,6 +484,11 @@ struct App {
     // caps that: current-but-choppier beats smooth-but-late.
     pull: BandRing,
     pull_seen: Option<Instant>, // a puller counts as a display watcher this recently
+    // Long-polled /fb.bands?wait=1 requests: parked until the ring moves past
+    // their `since` or the deadline lapses. The band leaves the app the
+    // instant it exists instead of on the client's next poll — over a real
+    // link that is the whole poll round trip saved, every frame.
+    pull_waiters: Vec<(u64, u64, Instant)>, // (hold ticket, since, deadline)
     fb_scanned: Option<Instant>, // last display scan (paced by its own cost)
     fb_cost: Duration,           // smoothed cost of one display scan
     fb_still: u32,               // consecutive scans that found nothing
@@ -880,15 +902,21 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             let since = form_get(&req.query, "since")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            let (gen, events, resync) = app.pull.since(since, 240 * 1024);
-            if resync {
-                app.display.want_full();
-                worker::want_full();
+            let wait = form_get(&req.query, "wait").as_deref() == Some("1");
+            // Nothing to say yet and the client offered to wait: park it.
+            // The release pass in the main loop answers the moment the ring
+            // moves (or after PULL_HOLD_MS, so the connection always ticks).
+            if wait && since >= app.pull.gen {
+                if let Some(ticket) = server.hold(key) {
+                    app.pull_waiters.push((
+                        ticket,
+                        since,
+                        Instant::now() + Duration::from_millis(PULL_HOLD_MS),
+                    ));
+                    return;
+                }
             }
-            let body = format!(
-                "{{\"gen\":{},\"resync\":{},\"w\":{},\"h\":{},\"events\":[{}]}}",
-                gen, resync, display::fb_w(), display::fb_h(), events.join(",")
-            );
+            let body = fb_bands_body(app, since);
             server.respond(
                 key,
                 Response::new(200, "OK")
@@ -1230,6 +1258,7 @@ pub fn run() {
         display: Display::new(),
         pull: BandRing::new(),
         pull_seen: None,
+        pull_waiters: Vec::new(),
         fb_scanned: None,
         fb_cost: Duration::from_millis(0),
         fb_still: 0,
@@ -1465,7 +1494,8 @@ pub fn run() {
                 let scan_still = if app.input_boost > 0 { 0 } else { app.fb_still };
                 if worker::available() {
                     let due = app.fb_scanned.map_or(true, |t| {
-                        t.elapsed() >= display::scan_interval(app.fb_cost, scan_still)
+                        t.elapsed() >= display::scan_interval_boosted(
+                            app.fb_cost, scan_still, app.input_boost > 0)
                     });
                     if (watching_display || watching_video) && due && worker::inflight() == 0 {
                         let began = Instant::now();
@@ -1483,7 +1513,8 @@ pub fn run() {
                     }
                 } else if watching_display
                     && app.fb_scanned.map_or(true, |t| {
-                        t.elapsed() >= display::scan_interval(app.fb_cost, scan_still)
+                        t.elapsed() >= display::scan_interval_boosted(
+                            app.fb_cost, scan_still, app.input_boost > 0)
                     })
                 {
                     let began = Instant::now();
@@ -1596,6 +1627,31 @@ pub fn run() {
             // guest's, which is the whole reason for the worker.
             app.video_cost = (app.video_cost + out.cost) / 2;
             worker::recycle(out.spare);
+        }
+
+        // Long-poll release: answer parked /fb.bands waiters the moment the
+        // ring has moved past their `since`, or empty at their deadline so
+        // the connection never sits silent long enough for anything between
+        // here and the client to declare it dead.
+        if !app.pull_waiters.is_empty() {
+            let now = Instant::now();
+            let waiters = std::mem::take(&mut app.pull_waiters);
+            for (ticket, since, deadline) in waiters {
+                if app.pull.gen > since || now >= deadline {
+                    let body = fb_bands_body(&mut app, since);
+                    let ok = server.release(
+                        ticket,
+                        Response::new(200, "OK")
+                            .with("cache-control", "no-store")
+                            .body("application/json", body.into_bytes()),
+                    );
+                    if ok {
+                        busy = true;
+                    }
+                } else {
+                    app.pull_waiters.push((ticket, since, deadline));
+                }
+            }
         }
 
         let flushed = server.flush();

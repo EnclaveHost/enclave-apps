@@ -90,8 +90,20 @@ const SCAN_MAX_BACKOFF: u32 = 3;
 /// finding nothing. Hence the backoff: cost sets the fast rate, stillness
 /// decides whether we are entitled to it.
 pub fn scan_interval(cost: std::time::Duration, still: u32) -> std::time::Duration {
+    scan_interval_boosted(cost, still, false)
+}
+
+/// `boosted` halves the floor while input is in flight: a keystroke's pixel
+/// is worth scanning for sooner, and the boost window is short enough that
+/// the extra captures cost the guest nothing it would notice.
+pub fn scan_interval_boosted(cost: std::time::Duration, still: u32, boosted: bool)
+    -> std::time::Duration
+{
     use std::time::Duration;
-    let floor = Duration::from_millis(FB_SCAN_FLOOR_MS);
+    let floor = Duration::from_millis(match boosted {
+        true => FB_SCAN_FLOOR_MS / 2,
+        false => FB_SCAN_FLOOR_MS,
+    });
     let ceiling = Duration::from_millis(FB_SCAN_MS);
     let base = (cost * SCAN_COST_RATIO).clamp(floor, ceiling);
     (base * (1u32 << still.min(SCAN_MAX_BACKOFF))).min(ceiling)

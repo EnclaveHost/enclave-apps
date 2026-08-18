@@ -119,6 +119,7 @@ struct Conn {
     keep_alive: bool,
     sent_continue: bool,
     tag: Option<String>,          // app-chosen label for targeted SSE drops
+    held: Option<u64>,            // long-poll: parked awaiting release() with this ticket
     stuck_since: Option<Instant>, // wbuf continuously non-empty since
     starved: bool,                // SSE: backlog over SSE_SKIP_WBUF; broadcasts skip it
     recovered: bool,              // SSE: was starved, has drained; app owes a full frame
@@ -129,6 +130,7 @@ pub struct Server {
     conns: Vec<Conn>,
     app: &'static str,
     started: Instant,
+    hold_seq: u64, // long-poll tickets (see hold/release)
 }
 
 /// `ENCLAVE_PORTS=http:8080=18321,tcp:7777=18322` → the actual port to bind.
@@ -162,7 +164,7 @@ impl Server {
             .set_nonblocking(true)
             .expect("non-blocking listener");
         println!("[{app}] listening on 127.0.0.1:{port}");
-        Server { listener, conns: Vec::new(), app, started: Instant::now() }
+        Server { listener, conns: Vec::new(), app, started: Instant::now(), hold_seq: 0 }
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -240,6 +242,7 @@ impl Server {
                         tag: None,
                         stuck_since: None,
                         starved: false,
+                        held: None,
                         recovered: false,
                     });
                 }
@@ -252,6 +255,12 @@ impl Server {
         let mut out = Vec::new();
         let mut buf = [0u8; 16 * 1024];
         for (i, conn) in self.conns.iter_mut().enumerate() {
+            // A held (long-polled) connection stays exactly as it is: its
+            // answer comes via release(), and any pipelined follow-up the
+            // peer optimistically sent must not be dispatched ahead of it.
+            if conn.held.is_some() {
+                continue;
+            }
             if !matches!(conn.state, ConnState::Http { .. }) {
                 // SSE subscribers and closing conns: drain+discard any input.
                 loop {
@@ -327,6 +336,33 @@ impl Server {
             }
         }
         out
+    }
+
+    /// Long-poll support: park this request's connection. The response comes
+    /// later via `release`, matched by the returned ticket — the ticket is
+    /// what makes a stale key harmless: if the peer went away and the slot
+    /// was reused, the ticket no longer matches and release() is a no-op.
+    /// A held connection is skipped by poll(), so a pipelined follow-up
+    /// cannot be dispatched out of order while the hold stands.
+    pub fn hold(&mut self, key: usize) -> Option<u64> {
+        self.hold_seq += 1;
+        let t = self.hold_seq;
+        let conn = self.conns.get_mut(key)?;
+        conn.held = Some(t);
+        Some(t)
+    }
+
+    /// Answer a held request, located by TICKET — never by key: the reaper
+    /// compacts `conns` with retain_mut, so an index taken at hold time may
+    /// point at a different connection by release time. False if the hold is
+    /// gone (peer died) — the caller just drops its bookkeeping.
+    pub fn release(&mut self, ticket: u64, resp: Response) -> bool {
+        let Some(key) = self.conns.iter().position(|c| c.held == Some(ticket)) else {
+            return false;
+        };
+        self.conns[key].held = None;
+        self.respond(key, resp);
+        true
     }
 
     pub fn respond(&mut self, key: usize, mut resp: Response) {
