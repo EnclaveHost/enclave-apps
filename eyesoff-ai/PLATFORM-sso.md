@@ -47,10 +47,13 @@ Behavior:
    redirect to an unvalidated URI is a token exfiltration primitive. Compare
    origins exactly (scheme, host, port); the path may be anything, since the
    app returns to the page the visitor was on.
-3. **Consent.** Show what is about to happen, first time per (account, aud)
-   at minimum: the deployment id and origin being signed into, the address
-   about to be named, an approve button. This is the phishing boundary: the
-   page a visitor trusts with their passkey must say plainly who is asking.
+3. **No consent interstitial** (operator decision, 2026-08-17; the original
+   draft asked for one). A visitor with a live session passes straight
+   through: every return origin is one of the platform's own deployments,
+   and the platform accepts its apps learning a signed-in visitor's address
+   without a click. Interaction remains only where something genuinely
+   forks: signing in at all, linking a first wallet to a passkey-only
+   account, or choosing among several linked wallets.
 4. **Mint** (format below) and 302 to:
 
 ```
