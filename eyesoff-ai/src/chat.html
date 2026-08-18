@@ -1976,27 +1976,46 @@ function pref(key, val) {
 const SSO_KEY = "llmchat-sso", SSO_STATE_KEY = "llmchat-sso-state";
 let ssoToken = null;
 try { ssoToken = sessionStorage.getItem(SSO_KEY) || null; } catch (_) {}
-// The return leg: enclave.host redirects back with #sso=<token>&state=<s> in
-// the FRAGMENT, which never reaches a server or a log. Only a token this tab
-// asked for is accepted - the state echo must match the one stored when the
-// flow started - so a crafted link cannot log a visitor into an account they
-// never chose. Either way the fragment is stripped from the address bar.
-(function () {
-  const h = location.hash || "";
-  const m = /[#&]sso=([^&]+)/.exec(h);
-  if (!m) return;
-  const st = /[#&]state=([^&]+)/.exec(h);
+// The return leg: enclave.host hands back #sso=<token>&state=<s> in the
+// FRAGMENT, which never reaches a server or a log. It arrives one of two
+// ways - on this page's own URL (the full-page flow) or ferried over
+// postMessage by /sso-return (the popup flow) - and BOTH run this one
+// acceptance: only a token this tab asked for is taken, because the state
+// echo must match the one stored when the flow started, so a crafted link
+// (or a crafted message) cannot log a visitor into an account they never
+// chose. Returns true when a token was stored.
+function ssoAccept(frag) {
+  const m = /[#&]sso=([^&]+)/.exec(frag || "");
+  if (!m) return false;
+  const st = /[#&]state=([^&]+)/.exec(frag || "");
   let expect = null;
   try { expect = sessionStorage.getItem(SSO_STATE_KEY); } catch (_) {}
-  if (expect && st && decodeURIComponent(st[1]) === expect) {
-    ssoToken = decodeURIComponent(m[1]);
-    try {
-      sessionStorage.setItem(SSO_KEY, ssoToken);
-      sessionStorage.removeItem(SSO_STATE_KEY);
-    } catch (_) {}
-  }
+  if (!(expect && st && decodeURIComponent(st[1]) === expect)) return false;
+  ssoToken = decodeURIComponent(m[1]);
+  try {
+    sessionStorage.setItem(SSO_KEY, ssoToken);
+    sessionStorage.removeItem(SSO_STATE_KEY);
+  } catch (_) {}
+  return true;
+}
+(function () {
+  const h = location.hash || "";
+  if (!/[#&]sso=/.test(h)) return;
+  ssoAccept(h);
+  // accepted or refused, the fragment leaves the address bar
   history.replaceState(null, "", location.pathname + location.search);
 })();
+// the popup flow's return leg: /sso-return is THIS origin, nothing else is
+// listened to, and the ferried fragment still faces the state check above
+addEventListener("message", (e) => {
+  if (e.origin !== location.origin) return;
+  const d = e.data;
+  if (!d || typeof d.enclave_sso !== "string") return;
+  if (ssoAccept(d.enclave_sso)) {
+    renderSsoUI();
+    closeSso();
+  }
+});
 // Both spellings, same value: the fleet's inbound TLS proxy has been seen
 // eating Authorization (Bearer 401 while X-Api-Key 200, e64f7cba,
 // 2026-08-17), and the server takes the credential from either header, so
@@ -2023,13 +2042,25 @@ function ssoStart() {
   crypto.getRandomValues(b);
   b.forEach((x) => { s += x.toString(16).padStart(2, "0"); });
   try { sessionStorage.setItem(SSO_STATE_KEY, s); } catch (_) {}
-  // return to this very page (path included - a proxy prefix must survive);
-  // the fragment the platform appends is for this script, not the server
-  const back = location.origin + location.pathname + location.search;
-  location.href = state.auth.authorize_url
+  const authorize = (back, popup) => state.auth.authorize_url
     + "?aud=" + encodeURIComponent(state.auth.aud || "")
     + "&redirect_uri=" + encodeURIComponent(back)
-    + "&state=" + s;
+    + "&state=" + s
+    + (popup ? "&display=popup" : "");
+  // POPUP first: the chat stays exactly where it is, the sign-in floats
+  // above it, and /sso-return (resolved against the app BASE, so a proxy
+  // prefix survives) ferries the token back over postMessage. An already
+  // signed-in visitor sees the window flash and close. Blocked popup =
+  // the full-page flow, returning to this very page so the boot parser
+  // picks the fragment up on the way back in.
+  let w = null;
+  try {
+    w = window.open(authorize(new URL("sso-return", document.baseURI).href, true),
+                    "enclave-signin", "popup,width=430,height=680");
+  } catch (_) {}
+  if (w) return;
+  const back = location.origin + location.pathname + location.search;
+  location.href = authorize(back, false);
 }
 function ssoDrop() {
   ssoToken = null;

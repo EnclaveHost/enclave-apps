@@ -243,6 +243,7 @@ use sampling::{pick_row, Rng, Row, SampleParams};
 
 static CHAT_HTML: &str = include_str!("chat.html");
 static LEGAL_HTML: &str = include_str!("legal.html");
+static SSO_RETURN_HTML: &str = include_str!("sso-return.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
 /// The brand mark, for the consumers that ask the SERVER for an icon rather
 /// than reading the page's <link>: browsers hitting a non-HTML route, crawlers,
@@ -8339,6 +8340,13 @@ impl Guest for Component {
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/tools") => handle_tools_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
+            // the popup sign-in's landing pad: same-origin with the opener
+            // again, so it may hand the return fragment over and close (see
+            // src/sso-return.html). Open like the page that carries the
+            // sign-in button, for the same reason.
+            (Method::Get, "/sso-return") => {
+                respond_bytes(out, 200, "text/html; charset=utf-8", SSO_RETURN_HTML.as_bytes())
+            }
             // the two generation routes carry the sign-in gate; see
             // require_user() for why the rest of the playground stays open
             (Method::Post, "/chat") => match require_user(&raw, &req) {
@@ -8354,7 +8362,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
             ),
         }
     }

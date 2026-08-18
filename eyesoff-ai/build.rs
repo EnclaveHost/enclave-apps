@@ -9,6 +9,7 @@ use std::path::Path;
 fn main() {
     let files = [
         "src/chat.html",
+        "src/sso-return.html",
         "src/sw.js",
         "assets/manifest.webmanifest",
         "assets/emoji.woff2",

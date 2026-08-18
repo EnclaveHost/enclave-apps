@@ -154,6 +154,18 @@ compatible.
 - The playground starts the flow with `aud`, `redirect_uri` (its own page)
   and a random `state` kept in sessionStorage, and stores the returned token
   in sessionStorage for the tab's lifetime.
+- **Popup mode** (0.52.0, the default when popups are allowed): the app opens
+  the authorize URL in a `window.open` popup with `display=popup` (the
+  console drops its site chrome) and `redirect_uri` pointing at the app's
+  `/sso-return` page. The popup is a TOP-LEVEL enclave.host context, so it
+  sees the first-party session - a signed-in visitor's popup flashes and
+  closes. `/sso-return`, being same-origin with its opener again, ferries the
+  return fragment over `postMessage` and closes; the chat page runs the same
+  state-echo acceptance either way. This sidesteps both storage partitioning
+  (which blinds an IFRAME embed to the first-party session - why embedding is
+  not offered) and any COOP on the console (the postMessage hop happens
+  between two app-origin documents). A blocked popup falls back to the
+  full-page redirect flow above.
 - **Header transport caveat.** The fleet's inbound TLS proxy has been
   observed stripping `Authorization` (2026-08-17, deployment e64f7cba: a
   correct Bearer answered 401 while the same value as `X-Api-Key` answered

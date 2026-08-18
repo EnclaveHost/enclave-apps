@@ -319,7 +319,7 @@ checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
 name = "eyesoff-ai"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
  "base64 0.22.1",
  "image-webp",
