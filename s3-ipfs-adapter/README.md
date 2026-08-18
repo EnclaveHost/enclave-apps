@@ -57,8 +57,8 @@ from the snapshot they started in.
 | `GET /api/status` | index state, progress, root CID |
 | `GET /api/files` | `[{path, size, cid}]` |
 | `POST /api/refresh` | re-list now |
-| `POST /api/upload?key=<path>` | body = raw bytes; PUT into the bucket (32 MiB cap), then re-index |
-| `POST /api/delete` | body `key=<path>`; DELETE from the bucket, then re-index |
+| `POST /api/upload?path=<path>` | body = raw bytes; PUT into the bucket (32 MiB cap), then re-index |
+| `POST /api/delete` | body `path=<path>`; DELETE from the bucket, then re-index |
 | `GET /` UI, `GET /ping` liveness | |
 
 The UI is also a small bucket browser: folder navigation with breadcrumbs,

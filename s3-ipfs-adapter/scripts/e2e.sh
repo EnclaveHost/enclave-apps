@@ -215,7 +215,7 @@ echo "== upload / delete through the app =="
 head -c $((1 * 1024 * 1024 + 77)) /dev/urandom > "$WORK/upload.bin"
 UP_EXPECT=$(ipfs add --cid-version 1 -Q --only-hash "$WORK/upload.bin" 2>/dev/null)
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WORK/upload.bin" \
-  "$BASE/api/upload?key=incoming/upload%20me.bin")
+  "$BASE/api/upload?path=incoming/upload%20me.bin")
 [ "$code" = 200 ] || fail "upload -> $code"
 for i in $(seq 1 120); do
   NOW=$(curl -s "$BASE/api/files" | python3 -c 'import sys,json;print({f["path"]:f["cid"] for f in json.load(sys.stdin)}.get("incoming/upload me.bin",""))' 2>/dev/null || echo "")
@@ -229,7 +229,7 @@ pass "upload lands in S3, indexes with the kubo-identical CID, round-trips"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
   -H 'content-type: application/x-www-form-urlencoded' \
-  --data 'key=incoming%2Fupload%20me.bin' "$BASE/api/delete")
+  --data 'path=incoming%2Fupload%20me.bin' "$BASE/api/delete")
 [ "$code" = 200 ] || fail "delete -> $code"
 for i in $(seq 1 120); do
   GONE=$(curl -s "$BASE/api/files" | python3 -c 'import sys,json;print("incoming/upload me.bin" in {f["path"] for f in json.load(sys.stdin)})' 2>/dev/null || echo "")
@@ -242,9 +242,9 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$S3/$BUCKET/incoming/upload%20me.
 [ "$code" = 404 ] || fail "object still in S3 after delete ($code)"
 pass "delete removes the object from S3 and the index"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?key=../escape.bin" --data-binary 'x')
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?path=../escape.bin" --data-binary 'x')
 [ "$code" = 400 ] || fail "dot-dot key accepted ($code)"
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?key=trailing/")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?path=trailing/")
 [ "$code" = 400 ] || fail "trailing-slash key accepted ($code)"
 pass "bad upload keys rejected"
 

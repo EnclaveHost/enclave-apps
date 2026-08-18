@@ -335,8 +335,8 @@
       if (f.size > CAP) { showErr(`${f.name}: over the 32 MiB upload cap (use S3 tooling for big objects)`); continue; }
       $('progress').textContent = `uploading ${f.name} (${human(f.size)})…`;
       try {
-        const key = cwd.concat(f.name).join('/');
-        const r = await authedFetch('/api/upload?key=' + encodeURIComponent(key), { method: 'POST', body: f });
+        const dest = cwd.concat(f.name).join('/');
+        const r = await authedFetch('/api/upload?path=' + encodeURIComponent(dest), { method: 'POST', body: f });
         if (r.ok) done++;
         else showErr(`upload ${f.name}: ` + await apiError(r));
       } catch (e) { showErr(`upload ${f.name}: ` + e); }
@@ -351,7 +351,7 @@
       const r = await authedFetch('/api/delete', {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: 'key=' + encodeURIComponent(path),
+        body: 'path=' + encodeURIComponent(path),
       });
       if (r.ok) $('progress').textContent = `deleted ${path}; re-indexing…`;
       else showErr('delete failed: ' + await apiError(r));

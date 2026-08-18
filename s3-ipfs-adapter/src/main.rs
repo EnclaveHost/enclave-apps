@@ -854,9 +854,10 @@ fn api_upload(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
     let Some(s3ctx) = app.s3.clone() else {
         return srv.respond(key, json(503, "Service Unavailable", "{\"error\":\"unconfigured\"}".into()));
     };
-    let Some(rel) = raw_get(&req.query, "key").filter(|k| valid_rel_key(k, &app.cfg.prefix))
+    // ?path= names the object; ?key= stays reserved for the api key.
+    let Some(rel) = raw_get(&req.query, "path").filter(|k| valid_rel_key(k, &app.cfg.prefix))
     else {
-        return srv.respond(key, json(400, "Bad Request", "{\"error\":\"bad or missing ?key=\"}".into()));
+        return srv.respond(key, json(400, "Bad Request", "{\"error\":\"bad or missing ?path=\"}".into()));
     };
     let full = format!("{}{rel}", app.cfg.prefix);
     match s3::put_object(&s3ctx.ep, &s3ctx.bucket, &full, s3ctx.creds.as_ref(), &req.body) {
@@ -869,7 +870,7 @@ fn api_upload(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
             restart_listing(app);
             srv.respond(
                 key,
-                json(200, "OK", format!("{{\"ok\":true,\"key\":\"{}\"}}", json_escape(&rel))),
+                json(200, "OK", format!("{{\"ok\":true,\"path\":\"{}\"}}", json_escape(&rel))),
             )
         }
         Err(e) => srv.respond(
@@ -887,8 +888,8 @@ fn api_delete(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
         return srv.respond(key, json(503, "Service Unavailable", "{\"error\":\"unconfigured\"}".into()));
     };
     let body = String::from_utf8_lossy(&req.body).to_string();
-    let Some(rel) = raw_get(&body, "key").filter(|k| valid_rel_key(k, &app.cfg.prefix)) else {
-        return srv.respond(key, json(400, "Bad Request", "{\"error\":\"bad or missing key=\"}".into()));
+    let Some(rel) = raw_get(&body, "path").filter(|k| valid_rel_key(k, &app.cfg.prefix)) else {
+        return srv.respond(key, json(400, "Bad Request", "{\"error\":\"bad or missing path=\"}".into()));
     };
     let full = format!("{}{rel}", app.cfg.prefix);
     match s3::delete_object(&s3ctx.ep, &s3ctx.bucket, &full, s3ctx.creds.as_ref()) {
