@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#e8a34c" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#e8a34c" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="170" font-size="84" fill="#e8a34c">[ s3 <tspan fill="#5a6375">&#8594;</tspan> <tspan fill="#d7dde8" font-weight="bold">ipfs</tspan> ]</text>
+  <text x="96" y="252" font-size="30" fill="#8a94a6">your bucket, content-addressed: an IPFS gateway in a TEE</text>
+  <text x="96" y="310" font-size="24" fill="#5a6375">CIDs identical to ipfs add &#183; every served byte re-hashed</text>
+  <text x="96" y="348" font-size="24" fill="#5a6375">S3 (SigV4) &#8594; UnixFS merkle DAG &#8594; /ipfs/&lt;cid&gt; &#183; raw &#183; car &#183; ranges</text>
+
+  <!-- the motif: objects rise out of the bucket and merkelize into one root -->
+  <!-- dag edges first, so the shapes sit on them -->
+  <g stroke="#5a6375" stroke-width="3" stroke-linecap="round">
+    <line x1="1300" y1="121" x2="1210" y2="149"/>
+    <line x1="1300" y1="121" x2="1390" y2="149"/>
+    <line x1="1210" y1="201" x2="1170" y2="240"/>
+    <line x1="1210" y1="201" x2="1256" y2="240"/>
+    <line x1="1390" y1="201" x2="1344" y2="240"/>
+    <line x1="1390" y1="201" x2="1430" y2="240"/>
+  </g>
+  <!-- the S3 bucket -->
+  <path d="M1130 265 v70 a170 26 0 0 0 340 0 v-70" fill="#10141d" stroke="#2a3242" stroke-width="4"/>
+  <ellipse cx="1300" cy="265" rx="170" ry="26" fill="#151b28" stroke="#2a3242" stroke-width="4"/>
+  <text x="1300" y="322" font-size="22" fill="#6b7488" text-anchor="middle">s3</text>
+  <!-- raw leaves: 256 KiB chunks, half out of the bucket's mouth -->
+  <g fill="#10141d" stroke="#e8a34c" stroke-width="3" stroke-linejoin="round">
+    <polygon points="1170,240 1185.6,249 1185.6,267 1170,276 1154.4,267 1154.4,249"/>
+    <polygon points="1256,240 1271.6,249 1271.6,267 1256,276 1240.4,267 1240.4,249"/>
+    <polygon points="1344,240 1359.6,249 1359.6,267 1344,276 1328.4,267 1328.4,249"/>
+    <polygon points="1430,240 1445.6,249 1445.6,267 1430,276 1414.4,267 1414.4,249"/>
+  </g>
+  <!-- internal dag-pb nodes -->
+  <g fill="#10141d" stroke="#8a94a6" stroke-width="3" stroke-linejoin="round">
+    <polygon points="1210,149 1232.5,162 1232.5,188 1210,201 1187.5,188 1187.5,162"/>
+    <polygon points="1390,149 1412.5,162 1412.5,188 1390,201 1367.5,188 1367.5,162"/>
+  </g>
+  <!-- the root CID: one solid hex everything verifies against -->
+  <polygon points="1300,49 1331.2,67 1331.2,103 1300,121 1268.8,103 1268.8,67" fill="#e8a34c"/>
+  <text x="1300" y="93" font-size="22" font-weight="bold" fill="#14100a" text-anchor="middle">bafy</text>
+</svg>

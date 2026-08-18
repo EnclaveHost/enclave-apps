@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- s3-ipfs-adapter: objects rise out of an S3 bucket and merkelize into
+       one root hex. The "b" is the multibase prefix every CID it mints
+       starts with (CIDv1, base32). -->
+  <!-- dag edges, drawn first so everything sits on top of them -->
+  <g stroke="#5a6375" stroke-width="2" stroke-linecap="round">
+    <line x1="48" y1="42" x2="34" y2="51"/>
+    <line x1="48" y1="42" x2="62" y2="51"/>
+  </g>
+  <!-- the bucket: an S3 cylinder -->
+  <path d="M22 62 v16 a26 8 0 0 0 52 0 v-16" fill="#101620" stroke="#2a3242" stroke-width="2"/>
+  <ellipse cx="48" cy="62" rx="26" ry="8" fill="#151b28" stroke="#2a3242" stroke-width="2"/>
+  <text x="48" y="77.5" font-family="monospace" font-size="7" fill="#6b7488" text-anchor="middle">s3</text>
+  <!-- raw leaves, half out of the bucket's mouth -->
+  <g fill="#101620" stroke="#e8a34c" stroke-width="2" stroke-linejoin="round">
+    <polygon points="34,50 40.1,53.5 40.1,60.5 34,64 27.9,60.5 27.9,53.5"/>
+    <polygon points="62,50 68.1,53.5 68.1,60.5 62,64 55.9,60.5 55.9,53.5"/>
+  </g>
+  <!-- the root: one solid hex, the CID everything verifies against -->
+  <polygon points="48,10 61.9,18 61.9,34 48,42 34.1,34 34.1,18" fill="#e8a34c"/>
+  <text x="48" y="30.5" font-family="monospace" font-size="13" font-weight="bold"
+        fill="#101620" text-anchor="middle">b</text>
+</svg>
