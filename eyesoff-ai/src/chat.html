@@ -630,19 +630,65 @@
   /* The sign-in gate is NOT a dialog: full-screen, opaque, nothing to
      dismiss - a required deployment is signed-in-or-nothing, the way the
      big chat apps gate. Sits UNDER the boot overlay (z 100), so the boot
-     screen fades straight into it. */
+     screen fades straight into it. Every animation is transform/opacity
+     only (GPU-cheap) and stands down under prefers-reduced-motion. */
   #ssoOverlay {
     display: none; position: fixed; inset: 0; z-index: 95;
     background: var(--bg); align-items: center; justify-content: center;
-    padding: 24px;
+    padding: 24px; overflow: hidden;
   }
   #ssoOverlay.open { display: flex; }
-  .sso-gate { max-width: 400px; text-align: center; }
-  .sso-gate .mark { width: 64px; height: 64px; margin: 0 auto 20px; }
-  .sso-gate .mark svg { width: 100%; height: 100%; border-radius: 17px; display: block; }
+  /* ambient breath behind everything, in the mark's own violet */
+  #ssoOverlay::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(640px 420px at 50% 36%, rgba(108,92,231,.18), transparent 70%);
+  }
+  .sso-gate { position: relative; max-width: 400px; text-align: center; }
+  .sso-gate .mark { position: relative; width: 72px; height: 72px; margin: 0 auto 22px; }
+  .sso-gate .mark svg { position: relative; width: 100%; height: 100%; border-radius: 19px; display: block; }
+  /* the halo: a blurred conic swirl of the mark's own gradient, slowly
+     orbiting behind it - the "enclave ring" */
+  .sso-gate .mark::before {
+    content: ""; position: absolute; inset: -16px; border-radius: 28px;
+    background: conic-gradient(from 0deg, #6C5CE7, #8CF5D2 30%, transparent 55%, #6C5CE7);
+    filter: blur(18px); opacity: .5;
+  }
   .sso-gate h1 { font-size: 22px; margin: 0 0 10px; }
   .sso-gate p { color: var(--text-2); font-size: 14px; line-height: 1.6; margin: 0 0 22px; }
-  .sso-gate .web-btn.primary { width: 100%; padding: 11px 18px; font-size: 15px; }
+  .sso-gate .web-btn.primary {
+    width: 100%; padding: 12px 18px; font-size: 15px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+    background: linear-gradient(135deg, #6C5CE7, #4b3fd4); border-color: transparent;
+    transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
+  }
+  .sso-gate .web-btn.primary:hover {
+    transform: translateY(-1px); filter: brightness(1.08);
+    box-shadow: 0 8px 26px rgba(108,92,231,.35);
+  }
+  .sso-gate .web-btn.primary:active { transform: translateY(0); }
+  .sso-gate .web-btn.primary .spin { border-color: rgba(255,255,255,.35); border-top-color: #fff; }
+  /* leaving = a token arrived: the gate breathes out and dissolves into
+     the chat it was covering */
+  #ssoOverlay.leaving { opacity: 0; transition: opacity .45s ease .05s; }
+  #ssoOverlay.leaving .sso-gate {
+    opacity: 0; transform: scale(1.06);
+    transition: transform .5s cubic-bezier(.2,.7,.2,1), opacity .4s ease;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    #ssoOverlay::before { animation: ssoBreathe 6s ease-in-out infinite alternate; }
+    .sso-gate .mark::before { animation: ssoOrbit 8s linear infinite; }
+    /* entrance: the mark springs in, then title, copy and button rise in turn
+       (display:none -> flex restarts these on every re-gate, by design) */
+    .sso-gate > * { opacity: 0; animation: ssoRise .55s cubic-bezier(.2,.7,.2,1) forwards; }
+    .sso-gate .mark { animation: ssoPop .6s cubic-bezier(.34,1.56,.64,1) forwards; }
+    .sso-gate h1 { animation-delay: .1s; }
+    .sso-gate p { animation-delay: .2s; }
+    .sso-gate .web-btn.primary { animation-delay: .3s; }
+  }
+  @keyframes ssoBreathe { from { opacity: .55; } to { opacity: 1; } }
+  @keyframes ssoOrbit { to { transform: rotate(1turn); } }
+  @keyframes ssoRise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+  @keyframes ssoPop { from { opacity: 0; transform: scale(.7); } to { opacity: 1; transform: none; } }
   #camOverlay .api-card { max-width: 560px; }
   .cam-stage {
     position: relative; margin: 8px 0 0; border-radius: 14px; overflow: hidden;
@@ -2065,7 +2111,7 @@ function ssoStart() {
     w = window.open(authorize(new URL("sso-return", document.baseURI).href, true),
                     "enclave-signin", "popup,width=430,height=680");
   } catch (_) {}
-  if (w) return;
+  if (w) { ssoGoWaiting(w); return; }
   const back = location.origin + location.pathname + location.search;
   location.href = authorize(back, false);
 }
@@ -4122,8 +4168,40 @@ const ssoOverlay = $("ssoOverlay");
 // signed-in-or-nothing, so the gate is the screen, not a dialog: it leaves
 // only when a token arrives (closeSso, the acceptance paths' exit) and comes
 // back when one dies.
-function openSso() { ssoOverlay.classList.add("open"); $("ssoGo").focus(); }
-function closeSso() { ssoOverlay.classList.remove("open"); }
+let ssoWaitTimer = null;
+function openSso() {
+  ssoOverlay.classList.remove("leaving");
+  ssoGoReset();
+  ssoOverlay.classList.add("open");
+  $("ssoGo").focus();
+}
+// A token arrived: breathe out (transform + opacity only) and dissolve into
+// the chat underneath. Instant under prefers-reduced-motion.
+function closeSso() {
+  if (!ssoOverlay.classList.contains("open")) return;
+  clearInterval(ssoWaitTimer);
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    ssoOverlay.classList.remove("open");
+    return;
+  }
+  ssoOverlay.classList.add("leaving");
+  setTimeout(() => { ssoOverlay.classList.remove("open", "leaving"); }, 520);
+}
+function ssoGoReset() {
+  clearInterval(ssoWaitTimer);
+  $("ssoGo").textContent = "Sign in with Enclave";
+}
+// while the sign-in window is up the button says so; if it closes without
+// delivering a token, the button comes back for another go
+function ssoGoWaiting(w) {
+  $("ssoGo").innerHTML = '<span class="spin"></span>Waiting for the sign-in window…';
+  clearInterval(ssoWaitTimer);
+  ssoWaitTimer = setInterval(() => {
+    if (!w.closed) return;
+    clearInterval(ssoWaitTimer);
+    if (ssoPending()) ssoGoReset();
+  }, 400);
+}
 $("ssoGo").addEventListener("click", ssoStart);
 function ssoNotice() { if (ssoPending()) openSso(); }
 // the sidebar line: "Sign in", or the signed-in address doubling as sign-out
