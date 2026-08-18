@@ -85,13 +85,25 @@ for i in range(N):
     t0 = do_move(*pos[i % 2])
     deadline = t0 + 3.0
     got = None
+    pending = True
     while time.time() < deadline:
-        g2, n = pull_read()
+        try:
+            g2, n = pull_read()
+        except Exception:
+            pending = False
+            break
+        pending = False
         if n:
             got = time.time()
             gen = g2
             break
         pull_send(gen)
+        pending = True
+    if pending:
+        # a parked request is still outstanding: the connection cannot take
+        # another send, so start over on a fresh one
+        pull.close()
+        pull = http.client.HTTPSConnection(HOST, 443, context=ctx, timeout=15)
     if got:
         samples.append((got - t0) * 1000)
     # let the screen still again between samples
