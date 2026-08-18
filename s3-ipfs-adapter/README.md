@@ -88,8 +88,10 @@ resolve from the environment, which is how deployment secrets arrive:
 `endpoint` and `bucket` are required; the app still starts without them and
 says so in the UI. Omit `credentials` for a public bucket (requests go
 unsigned). `refreshSecs: 0` disables the timer (manual refresh only).
-`api_key`, when set, protects `POST /api/refresh`; reads are open, they
-only serve content-addressed data.
+`api_key` is a shared secret of your choosing; when set, it protects
+`POST /api/refresh` (reads stay open, they only serve content-addressed
+data). Present it as `X-Api-Key: <key>` or `?key=<key>`; on the fleet the
+TLS proxy strips `Authorization`, so Bearer only works locally.
 
 ## Limits, by design
 
