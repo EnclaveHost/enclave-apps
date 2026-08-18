@@ -620,14 +620,29 @@
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
   /* ------------------------------ API + attestation + CPU-mode dialogs -- */
-  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #ssoOverlay {
+  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
   #apiOverlay.open, #attOverlay.open, #gpuOverlay.open, #webOverlay.open,
-  #camOverlay.open, #ssoOverlay.open { display: flex; }
-  #ssoOverlay .api-card { font-size: 14px; line-height: 1.65; max-width: 520px; }
+  #camOverlay.open { display: flex; }
+  /* The sign-in gate is NOT a dialog: full-screen, opaque, nothing to
+     dismiss - a required deployment is signed-in-or-nothing, the way the
+     big chat apps gate. Sits UNDER the boot overlay (z 100), so the boot
+     screen fades straight into it. */
+  #ssoOverlay {
+    display: none; position: fixed; inset: 0; z-index: 95;
+    background: var(--bg); align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  #ssoOverlay.open { display: flex; }
+  .sso-gate { max-width: 400px; text-align: center; }
+  .sso-gate .mark { width: 64px; height: 64px; margin: 0 auto 20px; }
+  .sso-gate .mark svg { width: 100%; height: 100%; border-radius: 17px; display: block; }
+  .sso-gate h1 { font-size: 22px; margin: 0 0 10px; }
+  .sso-gate p { color: var(--text-2); font-size: 14px; line-height: 1.6; margin: 0 0 22px; }
+  .sso-gate .web-btn.primary { width: 100%; padding: 11px 18px; font-size: 15px; }
   #camOverlay .api-card { max-width: 560px; }
   .cam-stage {
     position: relative; margin: 8px 0 0; border-radius: 14px; overflow: hidden;
@@ -1192,23 +1207,15 @@
       <p class="web-foot" id="webFoot"></p>
     </div>
   </div>
-  <div id="ssoOverlay">
-    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="ssoTitle">
-      <div class="api-head">
-        <h2 id="ssoTitle">Sign in to continue</h2>
-        <button class="icon-btn" id="ssoClose" aria-label="Close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
-        </button>
-      </div>
-      <p class="gpu-lead">This deployment asks you to sign in with your <b>Enclave</b> account,
-      the same passkey or wallet you use on enclave.host. You will be sent there, asked to
-      approve, and brought straight back.</p>
-      <p class="web-note">This app never sees the passkey or wallet itself, only a short-lived
-      signed note naming your account, kept in this tab and gone when it closes.
-      Conversations still stay in your browser; nothing about you is stored server-side.</p>
-      <div class="web-actions">
-        <button class="web-btn primary" id="ssoGo">Sign in with Enclave</button>
-      </div>
+  <div id="ssoOverlay" role="dialog" aria-modal="true" aria-labelledby="ssoTitle">
+    <div class="sso-gate">
+      <div class="mark" aria-hidden="true"><svg viewBox="0 0 512 512"><use href="#eyesoff"/></svg></div>
+      <h1 id="ssoTitle">Sign in to continue</h1>
+      <p>This deployment asks you to sign in with your <b>Enclave</b> account - the same
+      passkey or wallet you use on enclave.host. A sign-in window will open; this app never
+      sees the credential, only a short-lived note naming your account, and your
+      conversations still never leave the enclave.</p>
+      <button class="web-btn primary" id="ssoGo">Sign in with Enclave</button>
     </div>
   </div>
   <div id="gpuOverlay">
@@ -3219,7 +3226,6 @@ window.addEventListener("keydown", (e) => {
     if (apiOverlay.classList.contains("open")) { closeApi(); return; }
     if (attOverlay.classList.contains("open")) { closeAtt(); return; }
     if (camOverlay.classList.contains("open")) { closeCam(); return; }
-    if (ssoOverlay.classList.contains("open")) { closeSso(); return; }
     if (webOverlay.classList.contains("open")) { answerWeb(false); return; }
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
@@ -4112,15 +4118,14 @@ function webNotice() {
 
 // ------------------------------------------------ sign-in gate + indicator --
 const ssoOverlay = $("ssoOverlay");
-// Closable on purpose, required or not: the page stays readable (history,
-// attestation, the legal pages) - only generation is gated, and a send just
-// brings the dialog back with the server's own 401 beside it.
+// NOT closable - no X, no Esc, no backdrop click. A required deployment is
+// signed-in-or-nothing, so the gate is the screen, not a dialog: it leaves
+// only when a token arrives (closeSso, the acceptance paths' exit) and comes
+// back when one dies.
 function openSso() { ssoOverlay.classList.add("open"); $("ssoGo").focus(); }
 function closeSso() { ssoOverlay.classList.remove("open"); }
 $("ssoGo").addEventListener("click", ssoStart);
-$("ssoClose").addEventListener("click", closeSso);
-ssoOverlay.addEventListener("click", (e) => { if (e.target === ssoOverlay) closeSso(); });
-function ssoNotice() { if (bootGone && ssoPending()) openSso(); }
+function ssoNotice() { if (ssoPending()) openSso(); }
 // the sidebar line: "Sign in", or the signed-in address doubling as sign-out
 function renderSsoUI() {
   const link = $("ssoLink"), sep = $("ssoSep");
@@ -4403,6 +4408,9 @@ const modelsReady = (async () => {
     state.toolsOn = storedTools === "on";
   state.auth = info.auth || { enabled: false };
   renderSsoUI();
+  // the gate can rise UNDER the boot overlay right now - boot fades into it
+  // instead of into a chat the visitor cannot use
+  ssoNotice();
   // no provider: the web switch governs nothing
   if (!state.search.enabled) state.webMode = "off";
   if (state.gpu === false) {
