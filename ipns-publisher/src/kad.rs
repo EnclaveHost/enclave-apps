@@ -251,6 +251,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_messages_never_panic() {
+        // Peer messages are untrusted; parse_message must return None/handle
+        // any garbage rather than panic. Sweep a range of byte patterns.
+        for len in 0..64usize {
+            for seed in 0..8u8 {
+                let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect();
+                let _ = parse_message(&bytes); // must not panic
+            }
+        }
+        // truncated length-prefixed fields
+        let _ = parse_message(&[0x08, 0x04, 0x12, 0xff, 0xff]);
+        let _ = parse_message(&[0x42, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        assert!(parse_message(&[]).is_none());
+    }
+
+    #[test]
     fn message_roundtrip_via_parse() {
         let key = b"/ipns/binaryid";
         let msg = find_node(key);

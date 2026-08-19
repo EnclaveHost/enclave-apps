@@ -516,6 +516,43 @@ mod tests {
     }
 
     #[test]
+    fn malformed_multiaddrs_never_panic() {
+        // multiaddrs arrive inside untrusted peer messages.
+        for len in 0..48usize {
+            for seed in 0..8u8 {
+                let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed)).collect();
+                if let Some(segs) = multiaddr_decode(&bytes) {
+                    let _ = tcp_target(&segs);
+                    let _ = multiaddr_to_string(&segs);
+                }
+            }
+        }
+        // truncated ip4/ip6/dns length prefixes
+        assert!(multiaddr_decode(&[0x04, 1, 2]).is_none());
+        assert!(multiaddr_decode(&[0x29, 0, 0]).is_none());
+        assert!(multiaddr_decode(&[0x35, 0xff]).is_none());
+    }
+
+    #[test]
+    fn private_addresses_are_dropped() {
+        for bin in [
+            [0x04, 127, 0, 0, 1, 0x06, 0x0f, 0xa1], // loopback
+            [0x04, 10, 0, 0, 1, 0x06, 0x0f, 0xa1],  // 10/8
+            [0x04, 192, 168, 1, 1, 0x06, 0x0f, 0xa1], // 192.168/16
+            [0x04, 169, 254, 0, 1, 0x06, 0x0f, 0xa1], // link-local
+        ] {
+            let segs = multiaddr_decode(&bin).unwrap();
+            assert_eq!(tcp_target(&segs), None, "{bin:?}");
+        }
+        // a public v4 survives
+        let segs = multiaddr_decode(&[0x04, 139, 178, 91, 71, 0x06, 0x0f, 0xa1]).unwrap();
+        assert_eq!(tcp_target(&segs), Some(("139.178.91.71".into(), 4001)));
+        // ::1 loopback dropped, a public v6 survives
+        let mut lo = vec![0x29]; lo.extend([0u8; 15]); lo.push(1); lo.extend([0x06, 0x0f, 0xa1]);
+        assert_eq!(tcp_target(&multiaddr_decode(&lo).unwrap()), None);
+    }
+
+    #[test]
     fn multiaddr_tcp_targets() {
         // /ip4/139.178.91.71/tcp/4001
         let bin = [0x04, 139, 178, 91, 71, 0x06, 0x0f, 0xa1];

@@ -526,6 +526,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_records_never_panic() {
+        // DHT peers can return arbitrary bytes under a routing key; verify
+        // must reject, never panic.
+        let pubkey: [u8; 32] = hex_decode(PUB).unwrap().try_into().unwrap();
+        for len in 0..80usize {
+            for seed in 0..6u8 {
+                let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed)).collect();
+                let _ = parse_record(&bytes);
+                let _ = verify_record(&bytes, &pubkey); // must not panic
+            }
+        }
+        // a well-formed record truncated at every length is still safe
+        let full = hex_decode(RECORD).unwrap();
+        for cut in 0..full.len() {
+            let _ = verify_record(&full[..cut], &pubkey);
+        }
+        // an over-size record is rejected before any work
+        assert!(verify_record(&vec![0u8; MAX_RECORD_BYTES + 1], &pubkey).is_err());
+    }
+
+    #[test]
     fn pubkey_recovered_from_peer_id() {
         let id = id();
         let pk = peer_mh_pubkey(&id.peer_mh).unwrap();
