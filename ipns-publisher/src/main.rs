@@ -22,6 +22,7 @@ mod kad;
 mod multiformats;
 mod noise;
 mod p2p;
+mod provider;
 mod webreq;
 mod yamux;
 
@@ -52,6 +53,12 @@ struct Config {
     bootstrap: Vec<String>,
     dht: bool,
     api_key: String,
+    // IPNI HTTP-provider: announce the adapter as a discoverable HTTP
+    // retrieval provider so third-party gateways fetch the content over HTTP.
+    ipni_gateway_url: Option<String>,   // the adapter, e.g. https://ipfs.enclave.host
+    ipni_publisher_url: Option<String>, // this app's own public https URL
+    ipni_indexers: Vec<String>,
+    ipni_all_blocks: bool,
 }
 
 /// The public bootstrap set, filtered to what Step 0 allows: TCP only.
@@ -121,6 +128,7 @@ fn load_config() -> Config {
         },
         None => (None, Some("ipnsKey is not configured".to_string())),
     };
+    let ipni = v.get("ipni");
     Config {
         identity,
         key_error,
@@ -133,6 +141,14 @@ fn load_config() -> Config {
             .unwrap_or_else(|| DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect()),
         dht: v.get("dht").and_then(|x| x.as_bool()).unwrap_or(true),
         api_key: s("api_key").unwrap_or_default(),
+        ipni_gateway_url: ipni.and_then(|i| i.get("gatewayUrl")).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string),
+        ipni_publisher_url: ipni.and_then(|i| i.get("publisherUrl")).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string),
+        ipni_indexers: ipni
+            .and_then(|i| i.get("indexers"))
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string).collect())
+            .unwrap_or_else(|| vec!["https://cid.contact".into()]),
+        ipni_all_blocks: ipni.and_then(|i| i.get("announceAllBlocks")).and_then(|x| x.as_bool()).unwrap_or(true),
     }
 }
 
@@ -176,10 +192,32 @@ struct App {
     next_publish: Instant,
     durable_state: bool,
     dht: Option<p2p::Dht>,
+    provider: Option<provider::Provider>,
 }
 
 impl App {
     fn new(cfg: Config) -> App {
+        // The IPNI provider needs the app's key, the adapter gateway URL, and
+        // this app's own public URL (so the indexer can crawl the ad chain).
+        let provider = match (&cfg.identity, &cfg.ipni_gateway_url, &cfg.ipni_publisher_url) {
+            (Some(id), Some(gw), Some(pubu)) if !cfg.ipni_indexers.is_empty() => {
+                match provider::Provider::new(id.signing.clone(), gw.clone(), pubu, cfg.ipni_indexers.clone(), cfg.ipni_all_blocks) {
+                    Ok(p) => {
+                        eprintln!("[ipns-publisher] IPNI provider ON: gateway {gw}, publisher {pubu}, indexers {:?}", cfg.ipni_indexers);
+                        Some(p)
+                    }
+                    Err(e) => {
+                        eprintln!("[ipns-publisher] IPNI provider misconfigured, disabled: {e}");
+                        None
+                    }
+                }
+            }
+            (_, Some(_), _) | (_, _, Some(_)) => {
+                eprintln!("[ipns-publisher] IPNI provider needs both gatewayUrl and publisherUrl; disabled");
+                None
+            }
+            _ => None,
+        };
         let mut app = App {
             cfg,
             tasks: VecDeque::new(),
@@ -194,12 +232,26 @@ impl App {
             next_publish: Instant::now(),
             durable_state: false,
             dht: None,
+            provider,
         };
         app.load_state();
         if app.cfg.identity.is_some() {
             app.enqueue_publish();
         }
         app
+    }
+
+    /// When the published value is an /ipfs/<cid>, tell the IPNI provider to
+    /// advertise that root over HTTP. Called from do_sign on the signed value.
+    fn announce_provider(&mut self) {
+        let Some(provider) = &mut self.provider else { return };
+        let value = String::from_utf8_lossy(&self.value);
+        let Some(cid_str) = value.strip_prefix("/ipfs/") else { return };
+        let cid_str = cid_str.split('/').next().unwrap_or("");
+        match cid_str.strip_prefix('b').and_then(multiformats::base32_decode) {
+            Some(cid) => provider.announce_root(cid),
+            None => eprintln!("[ipns-publisher] IPNI: value {cid_str} is not a base32 CIDv1; not advertising"),
+        }
     }
 
     fn load_state(&mut self) {
@@ -414,6 +466,8 @@ impl App {
                 if self.cfg.dht {
                     self.tasks.push_back(Task::DhtPublish);
                 }
+                // advertise the new site root over HTTP (IPNI), if enabled
+                self.announce_provider();
             }
             Err(e) => {
                 eprintln!("[ipns-publisher] record build failed: {e}");
@@ -513,6 +567,30 @@ fn route(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
         ("GET", "/healthz") => srv.respond(key, json(200, "OK", "{\"ok\":true}".into())),
         ("GET", "/") => srv.respond(key, status_page(app, srv.uptime_secs())),
         ("GET", "/api/status") => srv.respond(key, api_status(app, srv.uptime_secs())),
+        // IPNI ad-chain publisher surface, crawled by the indexer.
+        ("GET", "/ipni/v1/ad/head") => {
+            match app.provider.as_ref().and_then(|p| p.serve_head()) {
+                Some(head) => srv.respond(
+                    key,
+                    Response::new(200, "OK")
+                        .with("cache-control", "no-store")
+                        .body("application/json", head),
+                ),
+                None => srv.respond(key, json(404, "Not Found", "{\"error\":\"no advertisement yet\"}".into())),
+            }
+        }
+        ("GET", _) if path.starts_with("/ipni/v1/ad/") => {
+            let cid = &path["/ipni/v1/ad/".len()..];
+            match app.provider.as_ref().and_then(|p| p.serve_block(cid)) {
+                Some(block) => srv.respond(
+                    key,
+                    Response::new(200, "OK")
+                        .with("cache-control", "public, max-age=86400, immutable")
+                        .body("application/vnd.ipld.dag-cbor", block),
+                ),
+                None => srv.respond(key, json(404, "Not Found", "{\"error\":\"no such ad block\"}".into())),
+            }
+        }
         ("POST", "/publish") => {
             if !authorized(&app.cfg, req) {
                 return srv.respond(key, json(401, "Unauthorized", "{\"error\":\"api key required\"}".into()));
@@ -579,11 +657,15 @@ fn api_status(app: &App, uptime: u64) -> Response {
         Some((seq, _, src)) => format!("{{\"sequence\":{seq},\"source\":\"{}\"}}", json_escape(src)),
         None => "null".into(),
     };
+    let ipni = match &app.provider {
+        Some(p) => p.status_json(),
+        None => "null".into(),
+    };
     json(
         200,
         "OK",
         format!(
-            "{{{id_block},\"sequence\":{},\"value\":\"{}\",\"validUntil\":{},\"publishedAt\":{},\"recovered\":{recovered},\"delegates\":[{}],\"mode\":\"{dht_mode}\",\"dht\":{dht_detail},\"durableState\":{},\"queuedTasks\":{},\"uptimeSecs\":{uptime}}}",
+            "{{{id_block},\"sequence\":{},\"value\":\"{}\",\"validUntil\":{},\"publishedAt\":{},\"recovered\":{recovered},\"delegates\":[{}],\"mode\":\"{dht_mode}\",\"dht\":{dht_detail},\"ipni\":{ipni},\"durableState\":{},\"queuedTasks\":{},\"uptimeSecs\":{uptime}}}",
             app.sequence,
             json_escape(&String::from_utf8_lossy(&app.value)),
             app.validity_unix,
@@ -750,8 +832,12 @@ fn serve() {
             Some(dht) => dht.drive(),
             None => false,
         };
+        let ipni_busy = match &mut app.provider {
+            Some(p) => p.drive(),
+            None => false,
+        };
         let flushed = srv.flush();
-        if !(worked || p2p_busy || flushed) {
+        if !(worked || p2p_busy || ipni_busy || flushed) {
             std::thread::sleep(Duration::from_millis(25));
         }
     }

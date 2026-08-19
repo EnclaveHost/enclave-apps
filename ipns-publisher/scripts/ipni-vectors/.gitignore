@@ -1,0 +1,1 @@
+# go build cache only; sources + go.mod/go.sum are tracked

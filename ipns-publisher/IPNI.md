@@ -97,16 +97,50 @@ endpoint, where the indexer fetches the chain), *not* the retrieval endpoint.
 - **Announce Message.Addrs** = where the *indexer* fetches the *ad chain*:
   this app's own `/dns4/<app-host>/tcp/443/https` (serving `/ipni/v1/ad/*`).
 
+## Config
+
+An `ipni` block in `ENCLAVE_CONFIG` turns the provider on (absent → off):
+
+```json
+"ipni": {
+  "gatewayUrl": "https://ipfs.enclave.host",
+  "publisherUrl": "https://<this-app's-public-https-url>",
+  "indexers": ["https://cid.contact"],
+  "announceAllBlocks": true
+}
+```
+
+- `gatewayUrl` — the adapter serving the content (the retrieval endpoint
+  advertised in the ad's `Addresses`, and where the CAR is fetched).
+- `publisherUrl` — this app's OWN public HTTPS URL, where the indexer crawls
+  the ad chain (`/ipni/v1/ad/*`); it goes in the announce message. Must be
+  stable and publicly reachable (the deployment URL, or a custom domain).
+- `indexers` — announce targets (default `https://cid.contact`).
+- `announceAllBlocks` — `true` (default) announces every block multihash so
+  each block is independently discoverable (a gateway walking the DAG queries
+  IPNI per block); `false` announces only the root.
+
+Provider status is surfaced under `ipni` in `GET /api/status`.
+
 ## Build plan (each milestone verified)
 
 1. Findings (this file). ✓
 2. IPNI codec — ad, entry chunk, signature, signed head, announce message —
-   with go-libipni byte-for-byte vector tests.
+   go-libipni byte-for-byte vector tests (`src/ipni.rs`). ✓
 3. Serve the ad chain (`/ipni/v1/ad/head`, `/ipni/v1/ad/<cid>`) + announce to
-   cid.contact; multihash set pulled from the adapter's
-   `?format=car&dag-scope=all`.
-4. Live gate (post-deploy): announce a throwaway adapter-served CID, prove
-   ipfs.io/dweb.link fetches it over HTTP with Kubo not providing it.
-5. Re-announce on site-root change (chain to previous, optional IsRm of the
-   old context); head/sequence persistence + announce retries; status in
-   `/api/status`.
+   the indexers; multihash set pulled from the adapter's
+   `?format=car&dag-scope=all` (`src/provider.rs`). ✓ **Verified locally**:
+   against a real 7-block kubo site DAG served by a mock adapter, the app
+   enumerated multihashes **identical to `ipfs refs -r`** (7/7), and a
+   **go-libipni crawler (the code cid.contact runs) validated the served
+   signed head, the advertisement signature, and parsed the entry chunk**;
+   go-libipni also parsed the emitted announce message. See
+   `scripts/ipni-vectors/verify` and `/parseann`.
+4. Live gate (post-deploy, needs a public publisherUrl + content in the
+   adapter): announce a throwaway adapter-served CID, prove ipfs.io/dweb.link
+   fetches it over HTTP with Kubo not providing it.
+5. Re-announce on site-root change is wired (each new `/ipfs/<root>` chains a
+   new ad to the previous head and re-announces); the chain persists to
+   `/data/ipni-chain.json` and recovers on restart, pruned to the last 32
+   generations. Remaining hardening: announce retry/backoff, IsRm of a retired
+   context, multi-chunk entry chains for very large DAGs (>~120k blocks).
