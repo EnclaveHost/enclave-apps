@@ -35,9 +35,13 @@
 
 mod egress;
 mod httpd;
+mod imgcheck;
 mod ipfs;
 mod s3;
+mod upload;
+mod wasmscan;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -77,6 +81,7 @@ struct Config {
     refresh_secs: u64,
     max_keys: usize,
     api_key: Option<String>,
+    upload: Option<upload::UploadCfg>,
 }
 
 fn creds_from(v: &serde_json::Value) -> Option<s3::Creds> {
@@ -155,6 +160,35 @@ fn load_config() -> Config {
     if !prefix.is_empty() && !prefix.ends_with('/') {
         prefix.push('/');
     }
+    // The pin routes appear only when an `upload` object is configured.
+    // uploadKey is the HMAC secret shared with the api-relay (reference a
+    // deployment secret: "uploadKey": "$UPLOAD_KEY"); without it the routes
+    // answer 503 unless allowUnsigned (dev/e2e) opens them.
+    let upload = v.get("upload").and_then(|u| {
+        if !u.is_object() {
+            return None;
+        }
+        let us = |k: &str| u.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty());
+        let un = |k: &str, d: u64| u.get(k).and_then(|x| x.as_u64()).unwrap_or(d);
+        Some(upload::UploadCfg {
+            upload_key: us("uploadKey").unwrap_or_default().to_string(),
+            allow_unsigned: u.get("allowUnsigned").and_then(|x| x.as_bool()).unwrap_or(false),
+            allow_origins: match u.get("allowOrigins").and_then(|x| x.as_array()) {
+                Some(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|s| s.trim_end_matches('/').to_string())
+                    .collect(),
+                None => vec!["https://enclave.host".to_string()],
+            },
+            max_wasm: un("maxWasmBytes", 2 * 1024 * 1024 * 1024),
+            max_image: un("maxImageBytes", 4 * 1024 * 1024) as usize,
+            max_json: un("maxJsonBytes", 1024 * 1024) as usize,
+            per_addr_daily: un("perAddrDailyBytes", 4 * 1024 * 1024 * 1024),
+            global_daily: un("globalDailyBytes", 16 * 1024 * 1024 * 1024),
+            json_per_ip_hourly: un("jsonPerIpHourly", 60) as f64,
+        })
+    });
     Config {
         title: s("title").unwrap_or_else(|| "S3 bucket over IPFS".to_string()),
         endpoint: s("endpoint").unwrap_or_default(),
@@ -169,6 +203,7 @@ fn load_config() -> Config {
             .unwrap_or(50_000)
             .clamp(1, 500_000) as usize,
         api_key: s("api_key"),
+        upload,
     }
 }
 
@@ -391,6 +426,12 @@ struct App {
     s3: Option<Rc<S3Ctx>>,
     snap: Rc<Snapshot>,
     indexer: Indexer,
+    upload_shared: Rc<RefCell<upload::Shared>>,
+    /// Uploads merged into the snapshot that no LIST has confirmed yet: a
+    /// refresh that began before an upload landed would otherwise commit a
+    /// snapshot WITHOUT it (its listing predates the object). Kept until a
+    /// listing includes the key, unioned into every commit meanwhile.
+    recent_uploads: Vec<FileEntry>,
 }
 
 impl App {
@@ -571,7 +612,13 @@ impl App {
                 self.start_hash();
                 true
             }
-            After::Commit(staged) => {
+            After::Commit(mut staged) => {
+                // Union in uploads no listing has seen yet (see recent_uploads).
+                for f in &self.recent_uploads {
+                    if !staged.iter().any(|s| s.key == f.key) {
+                        staged.push(f.clone());
+                    }
+                }
                 let files = staged.len();
                 let snap = commit(staged);
                 eprintln!(
@@ -600,6 +647,10 @@ impl App {
         else {
             return;
         };
+        // A listing that names a recent upload has confirmed it: the normal
+        // (size, etag) reuse below carries it from here on.
+        self.recent_uploads
+            .retain(|f| !acc.iter().any(|m| m.key == f.key));
         let mut staged = Vec::new();
         let mut queue = VecDeque::new();
         let mut to_hash = 0u64;
@@ -666,6 +717,16 @@ fn main() {
     } else {
         Phase::Idle
     };
+    match &cfg.upload {
+        Some(u) if u.enabled() => eprintln!(
+            "[s3-ipfs-adapter] pin routes ON (/add-wasm /add-json /add-image), {}",
+            if u.upload_key.is_empty() { "UNSIGNED (dev)" } else { "wallet-signed" }
+        ),
+        Some(_) => eprintln!(
+            "[s3-ipfs-adapter] pin routes configured but uploadKey unresolved - they answer 503 until the secret is set"
+        ),
+        None => {}
+    }
     let mut app = App {
         cfg,
         s3: s3ctx,
@@ -679,22 +740,65 @@ fn main() {
             retry_at: None,
             skipped: 0,
         },
+        upload_shared: upload::Shared::new(),
+        recent_uploads: Vec::new(),
     };
     let mut srv = Server::bind(APP, 8000);
     let mut tick: u64 = 0;
     loop {
-        for (key, req) in srv.poll(MAX_BODY, MAX_UPLOAD, "/api/upload") {
+        for (key, req) in srv.poll(
+            MAX_BODY,
+            MAX_UPLOAD,
+            &["/api/upload", "/add-json", "/add-image"],
+            "/add-wasm",
+        ) {
             route(&mut app, &mut srv, key, &req);
         }
+        merge_commits(&mut app);
         tick += 1;
         // Streams get the loop's blocking budget first; the indexer still
         // gets every 4th tick so an endless download cannot starve it.
         let pumped = srv.pump();
         let indexed = if !pumped || tick % 4 == 0 { app.tick() } else { false };
+        merge_commits(&mut app);
         let flushed = srv.flush();
         if !(pumped || indexed || flushed) {
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+/// Fold completed uploads into the served snapshot so a freshly pinned CID
+/// resolves immediately (a publish is typically followed by a deploy within
+/// seconds; waiting for the next LIST would 404 it). The rebuild is skeleton
+/// CPU only - no S3.
+fn merge_commits(app: &mut App) {
+    let pending = std::mem::take(&mut app.upload_shared.borrow_mut().commits);
+    if pending.is_empty() {
+        return;
+    }
+    let prefix_len = app.cfg.prefix.len();
+    let mut entries: Vec<FileEntry> = app.snap.files.clone();
+    let mut changed = false;
+    for c in pending {
+        if entries.iter().any(|f| f.key == c.key) {
+            continue; // duplicate pin of an already-indexed object
+        }
+        let entry = FileEntry {
+            rel: c.key[prefix_len..].to_string(),
+            key: c.key,
+            size: c.size,
+            etag: c.etag,
+            leaves: Rc::new(c.leaves),
+            root: Cid::raw([0; 32]), // filled by commit()
+            dag_size: 0,
+        };
+        app.recent_uploads.push(entry.clone());
+        entries.push(entry);
+        changed = true;
+    }
+    if changed {
+        app.snap = Rc::new(commit(entries));
     }
 }
 
@@ -715,6 +819,20 @@ fn route(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
                 .body("text/html; charset=utf-8", UI),
         ),
         ("GET", "/ping") => srv.respond(key, Response::new(200, "OK").body("text/plain", "ok\n")),
+        // The upload gateway's liveness probe, kept verbatim: deploy tooling
+        // and the gateway test suites wait on it.
+        ("GET", "/healthz") => srv.respond(key, json(200, "OK", "{\"ok\":true}".into())),
+        ("POST", "/add-wasm") => upload::add_wasm(app, srv, key, req),
+        ("POST", "/add-json") => upload::add_json(app, srv, key, req),
+        ("POST", "/add-image") => upload::add_image(app, srv, key, req),
+        ("OPTIONS", "/add-wasm") | ("OPTIONS", "/add-json") | ("OPTIONS", "/add-image") => {
+            let resp = Response::new(204, "No Content");
+            let resp = match &app.cfg.upload {
+                Some(cfg) => upload::cors(resp, req, cfg),
+                None => resp,
+            };
+            srv.respond(key, resp)
+        }
         ("GET", "/api/status") => srv.respond(key, api_status(app, srv.uptime_secs())),
         ("GET", "/api/files") => api_files(app, srv, key),
         ("POST", "/api/refresh") => api_refresh(app, srv, key, req),
@@ -1014,6 +1132,14 @@ fn gateway_headers(root: &Cid, cur: &Cid, req: &Request) -> Response {
         .with("x-ipfs-path", &req.path)
         .with("x-ipfs-roots", &root.to_string())
         .with("x-content-type-options", "nosniff")
+        // Pinned bytes include publisher SVGs: sandbox kills script on a
+        // direct navigation (image contexts never ran it) - the second layer
+        // behind the /add-image validator. Caddy used to add this in front
+        // of Kubo; there is no Caddy in front of this app.
+        .with(
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; sandbox",
+        )
 }
 
 /// One verified block, as application/vnd.ipld.raw.
@@ -1129,11 +1255,25 @@ fn serve_unixfs(
         return respond_sized(srv, key, resp, head_only);
     }
     // A dag-pb UnixFS file node: its content is a contiguous chunk span of
-    // some indexed object. filesize comes from the node; the span's start is
-    // the leftmost leaf's chunk slot.
+    // some indexed object. filesize comes from the node.
     let Some(filesize) = ipfs::unixfs_file_size(&data) else {
         return srv.respond(key, json(500, "Internal Server Error", "{\"error\":\"unsupported unixfs node\"}".into()));
     };
+    let name = walked
+        .last()
+        .cloned()
+        .or_else(|| snap.file_root.get(&cur.digest).map(|&i| leaf_name(snap, i)));
+    // A file ROOT resolves through file_root: exact by construction. The
+    // leftmost-leaf shortcut below is only for interior nodes, and it can
+    // pick the WRONG file when two objects share their leading chunk bytes
+    // (leaf_of keeps the first writer) - e.g. a file and an extended copy of
+    // it. Trusting it unchecked served a span past the shorter file's end,
+    // which was an out-of-bounds panic in FileBody - one hostile pair of
+    // uploads away from killing the process. Roots never hit that; interior
+    // spans are bounds-checked against the file they landed on.
+    if let Some(&fi) = snap.file_root.get(&cur.digest) {
+        return serve_span(snap, s3ctx, srv, key, req, root, cur, fi, 0, filesize, name, head_only);
+    }
     let mut first = *cur;
     let mut guard = 0;
     while first.codec == CODEC_DAG_PB {
@@ -1156,10 +1296,12 @@ fn serve_unixfs(
         return srv.respond(key, not_indexed(&first));
     };
     let start = u64::from(ci) * CHUNK;
-    let name = walked
-        .last()
-        .cloned()
-        .or_else(|| snap.file_root.get(&cur.digest).map(|&i| leaf_name(snap, i)));
+    if start + filesize > snap.files[fi as usize].size {
+        // The leaf run continues in a different (longer) object than the one
+        // leaf_of recorded. Serving it as a byte span is not possible from
+        // this index; the CAR/raw forms of the same content still work.
+        return srv.respond(key, json(404, "Not Found", "{\"error\":\"this node spans an object the index maps elsewhere; fetch it as ?format=car\"}".into()));
+    }
     serve_span(snap, s3ctx, srv, key, req, root, cur, fi, start, filesize, name, head_only)
 }
 
@@ -1413,6 +1555,15 @@ impl Body for FileBody {
             return Ok(None);
         }
         let f = &self.snap.files[self.file as usize];
+        // Belt over the router's braces: a span outside the file must be a
+        // clean truncation error, never a slice panic (one panic is the
+        // whole process).
+        if self.end > f.size {
+            return Err(format!(
+                "span [{}, {}) exceeds {} ({} bytes)",
+                self.pos, self.end, f.key, f.size
+            ));
+        }
         let chunk0 = self.pos / CHUNK;
         let last_needed = (self.end - 1) / CHUNK;
         let max_chunks = (STREAM_WINDOW / CHUNK).max(1);

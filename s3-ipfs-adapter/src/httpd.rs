@@ -63,12 +63,36 @@ pub trait Body {
     fn pull(&mut self) -> Result<Option<Vec<u8>>, String>;
 }
 
+/// A push-based request-body consumer for STREAMING uploads (the /add-wasm
+/// route): the engine feeds body bytes as they arrive instead of buffering
+/// the request, because a 2 GiB component cannot live in a wasm32 guest's
+/// memory. Each feed may do bounded blocking work (at most one or two part
+/// uploads); an Err(response) rejects the upload mid-body — the engine sends
+/// it and closes (the sink must have cleaned up its own upstream state
+/// before returning Err). `abort` is the cleanup hook for a connection that
+/// dies mid-body; it too must bound its blocking work.
+pub trait Sink {
+    fn feed(&mut self, data: &[u8]) -> Result<(), Response>;
+    fn finish(&mut self) -> Response;
+    fn abort(&mut self);
+}
+
+/// Inactivity ceiling for a streaming upload: a client that sends nothing
+/// for this long is gone. (Deliberately not a total-body deadline — a slow
+/// but live 2 GiB upload must keep its connection.)
+const RECV_STALL: Duration = Duration::from_secs(90);
+
 pub struct Request {
     pub method: String,
     pub path: String,   // percent-decoded, no query
     pub query: String,  // raw, after '?'
     pub headers: Vec<(String, String)>, // names lowercased
     pub body: Vec<u8>,
+    /// Headers-only request on the streaming route: the body (`stream_len`
+    /// bytes) has NOT been read. The app must either call `begin_body(key,
+    /// sink)` to consume it or respond an error (the engine then closes the
+    /// connection rather than resynchronize past an unread body).
+    pub stream_len: Option<u64>,
 }
 
 impl Request {
@@ -111,6 +135,7 @@ pub fn json(status: u16, reason: &'static str, body: String) -> Response {
 enum ConnState {
     Http { since: Instant, reading_body: bool },
     Streaming { src: Box<dyn Body>, chunked: bool },
+    RecvBody { sink: Box<dyn Sink>, remaining: u64 },
     Closing, // flush wbuf, then drop
 }
 
@@ -123,6 +148,10 @@ struct Conn {
     keep_alive: bool,
     sent_continue: bool,
     stuck_since: Option<Instant>, // wbuf continuously undrained since
+    // A streaming-route request was emitted and awaits begin_body(): the
+    // unread body length, plus whether the client asked for 100-continue.
+    pending_stream: Option<u64>,
+    pending_expect: bool,
 }
 
 pub struct Server {
@@ -182,10 +211,19 @@ impl Server {
     /// (conn_key, Request); answer each with respond()/respond_stream()
     /// before the next poll (a key is only stable until then).
     ///
-    /// `max_body` caps ordinary request bodies; targets under `big_prefix`
-    /// (the upload route) are allowed `big_body` instead, decided from the
-    /// request line once the header block is complete.
-    pub fn poll(&mut self, max_body: usize, big_body: usize, big_prefix: &str) -> Vec<(usize, Request)> {
+    /// `max_body` caps ordinary request bodies; targets under any of
+    /// `big_prefixes` (upload routes) are allowed `big_body` instead,
+    /// decided from the request line once the header block is complete.
+    /// Targets under `stream_prefix` are not buffered at all: the request is
+    /// emitted at end-of-headers with `stream_len` set, and the body is
+    /// consumed by the Sink the app registers via `begin_body`.
+    pub fn poll(
+        &mut self,
+        max_body: usize,
+        big_body: usize,
+        big_prefixes: &[&str],
+        stream_prefix: &str,
+    ) -> Vec<(usize, Request)> {
         let read_cap = MAX_HEADER_BYTES + max_body.max(big_body);
         // Accept.
         loop {
@@ -203,6 +241,8 @@ impl Server {
                         keep_alive: true,
                         sent_continue: false,
                         stuck_since: None,
+                        pending_stream: None,
+                        pending_expect: false,
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -213,8 +253,9 @@ impl Server {
         // Read and parse.
         let mut out = Vec::new();
         let mut buf = [0u8; 16 * 1024];
+        let app = self.app;
         for (i, conn) in self.conns.iter_mut().enumerate() {
-            if !matches!(conn.state, ConnState::Http { .. }) {
+            if !matches!(conn.state, ConnState::Http { .. } | ConnState::RecvBody { .. }) {
                 // Streaming and closing conns: drain+discard any input.
                 loop {
                     match conn.stream.read(&mut buf) {
@@ -234,11 +275,13 @@ impl Server {
                 }
                 continue;
             }
+            let mut peer_gone = false;
             loop {
                 match conn.stream.read(&mut buf) {
                     Ok(0) => {
                         conn.keep_alive = false;
-                        if conn.rbuf.is_empty() {
+                        peer_gone = true;
+                        if conn.rbuf.is_empty() && matches!(conn.state, ConnState::Http { .. }) {
                             conn.state = ConnState::Closing;
                         }
                         break;
@@ -246,21 +289,63 @@ impl Server {
                     Ok(n) => {
                         conn.rbuf.extend_from_slice(&buf[..n]);
                         conn.last_activity = Instant::now();
-                        if conn.rbuf.len() > read_cap {
+                        if conn.rbuf.len() > read_cap
+                            && matches!(conn.state, ConnState::Http { .. })
+                            && conn.pending_stream.is_none()
+                        {
                             overflow(conn, 413, "Payload Too Large");
                             break;
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(_) => {
-                        conn.state = ConnState::Closing;
-                        conn.wbuf.clear();
+                        conn.keep_alive = false;
+                        peer_gone = true;
+                        if matches!(conn.state, ConnState::Http { .. }) {
+                            conn.state = ConnState::Closing;
+                            conn.wbuf.clear();
+                        }
                         break;
                     }
                 }
             }
+            // A registered sink consumes body bytes as they arrive.
+            if let ConnState::RecvBody { sink, remaining } = &mut conn.state {
+                if !conn.rbuf.is_empty() && *remaining > 0 {
+                    let take = (*remaining).min(conn.rbuf.len() as u64) as usize;
+                    let fed = sink.feed(&conn.rbuf[..take]);
+                    conn.rbuf.drain(..take);
+                    *remaining -= take as u64;
+                    if let Err(resp) = fed {
+                        conn.keep_alive = false;
+                        write_response(conn, app, resp, false);
+                        conn.state = ConnState::Closing;
+                        continue;
+                    }
+                }
+                if let ConnState::RecvBody { sink, remaining } = &mut conn.state {
+                    if *remaining == 0 {
+                        let resp = sink.finish();
+                        let keep = conn.keep_alive && resp.status < 500;
+                        write_response(conn, app, resp, keep);
+                        conn.state = if keep {
+                            ConnState::Http { since: Instant::now(), reading_body: false }
+                        } else {
+                            ConnState::Closing
+                        };
+                    } else if peer_gone {
+                        sink.abort();
+                        conn.wbuf.clear();
+                        conn.state = ConnState::Closing;
+                    }
+                }
+                continue;
+            }
+            if conn.pending_stream.is_some() {
+                continue; // emitted last poll; the app answers before this one
+            }
             if let ConnState::Http { since, reading_body } = &mut conn.state {
-                match try_parse(&mut conn.rbuf, max_body, big_body, big_prefix) {
+                match try_parse(&mut conn.rbuf, max_body, big_body, big_prefixes, stream_prefix) {
                     Parse::Complete(req) => {
                         if req
                             .header("connection")
@@ -272,6 +357,13 @@ impl Server {
                         *since = Instant::now();
                         *reading_body = false;
                         conn.sent_continue = false;
+                        if let Some(len) = req.stream_len {
+                            conn.pending_stream = Some(len);
+                            conn.pending_expect =
+                                req.header("expect").is_some_and(|v| {
+                                    v.eq_ignore_ascii_case("100-continue")
+                                });
+                        }
                         out.push((i, req));
                     }
                     Parse::Partial { in_body } => {
@@ -291,26 +383,31 @@ impl Server {
         out
     }
 
-    pub fn respond(&mut self, key: usize, mut resp: Response) {
+    /// Register the Sink that consumes a streaming request's body (a request
+    /// that arrived with `stream_len` set). Any body bytes already buffered
+    /// are fed on the next poll.
+    pub fn begin_body(&mut self, key: usize, sink: Box<dyn Sink>) {
         let Some(conn) = self.conns.get_mut(key) else { return };
-        let keep = conn.keep_alive && resp.status < 500;
-        let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
-        resp.headers.push(("server".into(), self.app.into()));
-        resp.headers
-            .push(("content-length".into(), resp.body.len().to_string()));
-        resp.headers.push((
-            "connection".into(),
-            if keep { "keep-alive" } else { "close" }.into(),
-        ));
-        for (k, v) in &resp.headers {
-            head.push_str(k);
-            head.push_str(": ");
-            head.push_str(v);
-            head.push_str("\r\n");
+        let Some(remaining) = conn.pending_stream.take() else { return };
+        if conn.pending_expect && !conn.sent_continue {
+            conn.sent_continue = true;
+            conn.wbuf.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
         }
-        head.push_str("\r\n");
-        conn.wbuf.extend(head.as_bytes());
-        conn.wbuf.extend(&resp.body);
+        conn.pending_expect = false;
+        conn.state = ConnState::RecvBody { sink, remaining };
+    }
+
+    pub fn respond(&mut self, key: usize, resp: Response) {
+        let Some(conn) = self.conns.get_mut(key) else { return };
+        // Answering a streaming-route request WITHOUT consuming its body:
+        // the engine will not resynchronize past an unread body, so the
+        // connection closes after this response.
+        if conn.pending_stream.take().is_some() {
+            conn.keep_alive = false;
+            conn.pending_expect = false;
+        }
+        let keep = conn.keep_alive && resp.status < 500;
+        write_response(conn, self.app, resp, keep);
         if !keep {
             conn.state = ConnState::Closing;
         }
@@ -420,52 +517,87 @@ impl Server {
         let now = Instant::now();
         let mut busy = false;
         self.conns.retain_mut(|conn| {
-            // Flush.
-            while !conn.wbuf.is_empty() {
-                let (front, _) = conn.wbuf.as_slices();
-                match conn.stream.write(front) {
-                    Ok(0) => return false,
-                    Ok(n) => {
-                        conn.wbuf.drain(..n);
-                        conn.last_activity = now;
-                        // Draining at all is proof of life: the stall timer
-                        // measures a peer that moves NOTHING, not one whose
-                        // queue never quite empties.
-                        conn.stuck_since = None;
-                        busy = true;
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(_) => return false,
+            let keep = flush_conn(conn, now, &mut busy);
+            if !keep {
+                // A reaped mid-body upload must release its upstream state.
+                if let ConnState::RecvBody { sink, .. } = &mut conn.state {
+                    sink.abort();
                 }
             }
-            // The slow-client rule is for buffered responses; a streaming
-            // conn's wbuf is bounded by the pump's low-water mark + one pull
-            // window, and WRITE_STALL below reaps the truly dead.
-            if conn.wbuf.len() > MAX_WBUF && !matches!(conn.state, ConnState::Streaming { .. }) {
-                return false;
-            }
-            match (conn.wbuf.is_empty(), conn.stuck_since) {
-                (true, _) => conn.stuck_since = None,
-                (false, None) => conn.stuck_since = Some(now),
-                (false, Some(t0)) if now.duration_since(t0) > WRITE_STALL => return false,
-                _ => {}
-            }
-            match &conn.state {
-                ConnState::Closing => !conn.wbuf.is_empty(),
-                ConnState::Streaming { .. } => true,
-                ConnState::Http { since, reading_body } => {
-                    let idle = now.duration_since(conn.last_activity);
-                    if conn.rbuf.is_empty() && !reading_body {
-                        idle < IDLE_KEEPALIVE
-                    } else {
-                        now.duration_since(*since)
-                            < if *reading_body { BODY_TIMEOUT } else { HEADER_TIMEOUT }
-                    }
-                }
-            }
+            keep
         });
         busy
     }
+}
+
+/// Flush one connection's write buffer and decide whether it lives on.
+fn flush_conn(conn: &mut Conn, now: Instant, busy: &mut bool) -> bool {
+    while !conn.wbuf.is_empty() {
+        let (front, _) = conn.wbuf.as_slices();
+        match conn.stream.write(front) {
+            Ok(0) => return false,
+            Ok(n) => {
+                conn.wbuf.drain(..n);
+                conn.last_activity = now;
+                // Draining at all is proof of life: the stall timer
+                // measures a peer that moves NOTHING, not one whose
+                // queue never quite empties.
+                conn.stuck_since = None;
+                *busy = true;
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => return false,
+        }
+    }
+    // The slow-client rule is for buffered responses; a streaming
+    // conn's wbuf is bounded by the pump's low-water mark + one pull
+    // window, and WRITE_STALL below reaps the truly dead.
+    if conn.wbuf.len() > MAX_WBUF && !matches!(conn.state, ConnState::Streaming { .. }) {
+        return false;
+    }
+    match (conn.wbuf.is_empty(), conn.stuck_since) {
+        (true, _) => conn.stuck_since = None,
+        (false, None) => conn.stuck_since = Some(now),
+        (false, Some(t0)) if now.duration_since(t0) > WRITE_STALL => return false,
+        _ => {}
+    }
+    match &conn.state {
+        ConnState::Closing => !conn.wbuf.is_empty(),
+        ConnState::Streaming { .. } => true,
+        // A streaming upload is timed on inactivity, not a total-body
+        // deadline: a slow 2 GiB body must live, a silent peer must not.
+        ConnState::RecvBody { .. } => now.duration_since(conn.last_activity) < RECV_STALL,
+        ConnState::Http { since, reading_body } => {
+            let idle = now.duration_since(conn.last_activity);
+            if conn.rbuf.is_empty() && !reading_body && conn.pending_stream.is_none() {
+                idle < IDLE_KEEPALIVE
+            } else {
+                now.duration_since(*since)
+                    < if *reading_body { BODY_TIMEOUT } else { HEADER_TIMEOUT }
+            }
+        }
+    }
+}
+
+/// Serialize a buffered response onto a connection's write queue.
+fn write_response(conn: &mut Conn, app: &str, mut resp: Response, keep: bool) {
+    let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
+    resp.headers.push(("server".into(), app.into()));
+    resp.headers
+        .push(("content-length".into(), resp.body.len().to_string()));
+    resp.headers.push((
+        "connection".into(),
+        if keep { "keep-alive" } else { "close" }.into(),
+    ));
+    for (k, v) in &resp.headers {
+        head.push_str(k);
+        head.push_str(": ");
+        head.push_str(v);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    conn.wbuf.extend(head.as_bytes());
+    conn.wbuf.extend(&resp.body);
 }
 
 fn overflow(conn: &mut Conn, status: u16, reason: &'static str) {
@@ -489,7 +621,13 @@ enum Parse {
     Bad(u16, &'static str),
 }
 
-fn try_parse(rbuf: &mut Vec<u8>, max_body: usize, big_body: usize, big_prefix: &str) -> Parse {
+fn try_parse(
+    rbuf: &mut Vec<u8>,
+    max_body: usize,
+    big_body: usize,
+    big_prefixes: &[&str],
+    stream_prefix: &str,
+) -> Parse {
     let Some(head_end) = find_crlfcrlf(rbuf) else {
         if rbuf.len() > MAX_HEADER_BYTES {
             return Parse::Bad(431, "Request Header Fields Too Large");
@@ -535,22 +673,34 @@ fn try_parse(rbuf: &mut Vec<u8>, max_body: usize, big_body: usize, big_prefix: &
     if has_te {
         return Parse::Bad(501, "Not Implemented"); // no chunked requests
     }
-    let cap = if !big_prefix.is_empty()
-        && target.split('?').next().unwrap_or("").starts_with(big_prefix)
-    {
+    let bare_target = target.split('?').next().unwrap_or("");
+    // A streaming route's body is not buffered: emit the request at
+    // end-of-headers and let the app's Sink consume the body. Its size cap
+    // is the app's business (it knows the route's ceiling), not the parser's.
+    let is_stream = !stream_prefix.is_empty()
+        && bare_target.starts_with(stream_prefix)
+        && method == "POST"
+        && content_length > 0;
+    let cap = if big_prefixes.iter().any(|p| bare_target.starts_with(p)) {
         big_body
     } else {
         max_body
     };
-    if content_length > cap {
+    if !is_stream && content_length > cap {
         return Parse::Bad(413, "Payload Too Large");
     }
     let body_start = head_end + 4;
-    if rbuf.len() < body_start + content_length {
+    if !is_stream && rbuf.len() < body_start + content_length {
         return Parse::Partial { in_body: true };
     }
-    let body = rbuf[body_start..body_start + content_length].to_vec();
-    rbuf.drain(..body_start + content_length);
+    let (body, stream_len) = if is_stream {
+        rbuf.drain(..body_start);
+        (Vec::new(), Some(content_length as u64))
+    } else {
+        let body = rbuf[body_start..body_start + content_length].to_vec();
+        rbuf.drain(..body_start + content_length);
+        (body, None)
+    };
     let (raw_path, query) = match target.split_once('?') {
         Some((p, q)) => (p, q.to_string()),
         None => (target, String::new()),
@@ -560,7 +710,7 @@ fn try_parse(rbuf: &mut Vec<u8>, max_body: usize, big_body: usize, big_prefix: &
     let Some(path) = percent_decode(raw_path) else {
         return Parse::Bad(400, "Bad Request");
     };
-    Parse::Complete(Request { method: method.into(), path, query, headers, body })
+    Parse::Complete(Request { method: method.into(), path, query, headers, body, stream_len })
 }
 
 fn find_crlfcrlf(buf: &[u8]) -> Option<usize> {

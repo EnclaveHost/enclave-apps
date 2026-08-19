@@ -1,6 +1,6 @@
 [package]
 name = "s3-ipfs-adapter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Expose an S3 bucket as IPFS content: index the bucket into UnixFS DAGs (CIDs identical to ipfs add) and serve them over an IPFS path + trustless gateway, from inside an attested enclave. Raw bytes stay in S3; leaf blocks are range-fetched on demand and hash-verified."
 license-file = "../LICENSE"

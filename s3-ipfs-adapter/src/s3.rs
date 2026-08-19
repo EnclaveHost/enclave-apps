@@ -245,7 +245,10 @@ fn connect(ep: &Endpoint) -> Result<Wire, String> {
 
 /// One S3 request. GETs pass an empty `body`; PUTs sign and send theirs
 /// (the payload hash of an empty body IS the empty-body hash, so every
-/// method takes the same path). Returns (status, response body).
+/// method takes the same path). `extra` headers (e.g. x-amz-copy-source)
+/// are included in the signature. Returns (status, body, response headers
+/// lowercased).
+#[allow(clippy::too_many_arguments)]
 fn request(
     method: &str,
     ep: &Endpoint,
@@ -255,7 +258,8 @@ fn request(
     range: Option<(u64, u64)>, // inclusive byte range
     creds: Option<&Creds>,
     body: &[u8],
-) -> Result<(u16, Vec<u8>), String> {
+    extra: &[(String, String)],
+) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
     let canonical_uri = if key.is_empty() {
         format!("/{}", uri_encode(bucket, true))
     } else {
@@ -277,9 +281,10 @@ fn request(
     } else {
         format!("{canonical_uri}?{canonical_query}")
     };
-    let extra: Vec<(String, String)> = range
-        .map(|(a, b)| vec![("range".to_string(), format!("bytes={a}-{b}"))])
-        .unwrap_or_default();
+    let mut extra: Vec<(String, String)> = extra.to_vec();
+    if let Some((a, b)) = range {
+        extra.push(("range".to_string(), format!("bytes={a}-{b}")));
+    }
     let mut head = format!("{method} {target} HTTP/1.1\r\nhost: {host_header}\r\n");
     match creds {
         Some(c) => {
@@ -316,6 +321,7 @@ fn request(
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut status: u16 = 0;
+    let mut resp_headers: Vec<(String, String)> = Vec::new();
     loop {
         if Instant::now() > deadline {
             return Err("request deadline exceeded".into());
@@ -344,8 +350,13 @@ fn request(
                             if k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked") {
                                 chunked = true;
                             }
+                            resp_headers.push((k, v.to_string()));
                         }
                     }
+                }
+                // HEAD answers carry content-length but never a body.
+                if method == "HEAD" && head_end.is_some() {
+                    break;
                 }
                 if let (Some(he), Some(cl)) = (head_end, content_length) {
                     if rbuf.len() >= he + cl {
@@ -369,6 +380,9 @@ fn request(
         }
     }
     let he = head_end.ok_or("response ended before headers completed")?;
+    if method == "HEAD" {
+        return Ok((status, Vec::new(), resp_headers));
+    }
     let raw = &rbuf[he..];
     let body = if chunked { dechunk(raw)? } else { raw.to_vec() };
     if let Some(cl) = content_length {
@@ -376,7 +390,7 @@ fn request(
             return Err(format!("short body: {} of {cl} bytes", body.len()));
         }
     }
-    Ok((status, body))
+    Ok((status, body, resp_headers))
 }
 
 /// Minimal HTTP/1.1 chunked-body decoder.
@@ -420,8 +434,8 @@ pub fn get_range(
     if len == 0 {
         return Ok(Vec::new());
     }
-    let (status, mut body) =
-        request("GET", ep, bucket, key, &[], Some((start, start + len - 1)), creds, &[])?;
+    let (status, mut body, _) =
+        request("GET", ep, bucket, key, &[], Some((start, start + len - 1)), creds, &[], &[])?;
     match status {
         206 => Ok(body),
         // A store that ignores Range answers 200 with the whole object.
@@ -448,11 +462,27 @@ pub fn put_object(
     creds: Option<&Creds>,
     body: &[u8],
 ) -> Result<(), String> {
-    let (status, resp) = request("PUT", ep, bucket, key, &[], None, creds, body)?;
+    put_object_etag(ep, bucket, key, creds, body).map(|_| ())
+}
+
+/// PUT one object and return its ETag (the LIST-visible identity, which the
+/// upload path records so the next refresh recognizes the object unchanged).
+pub fn put_object_etag(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    body: &[u8],
+) -> Result<String, String> {
+    let (status, resp, headers) = request("PUT", ep, bucket, key, &[], None, creds, body, &[])?;
     if status != 200 {
         return Err(s3_error(status, &resp));
     }
-    Ok(())
+    Ok(headers
+        .iter()
+        .find(|(k, _)| k == "etag")
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .unwrap_or_default())
 }
 
 /// DELETE one object. S3 answers 204 (idempotent: also for absent keys).
@@ -462,11 +492,163 @@ pub fn delete_object(
     key: &str,
     creds: Option<&Creds>,
 ) -> Result<(), String> {
-    let (status, resp) = request("DELETE", ep, bucket, key, &[], None, creds, &[])?;
+    let (status, resp, _) = request("DELETE", ep, bucket, key, &[], None, creds, &[], &[])?;
     if !matches!(status, 200 | 202 | 204) {
         return Err(s3_error(status, &resp));
     }
     Ok(())
+}
+
+/// HEAD one object: Some((size, etag)) when it exists, None on 404.
+pub fn head_object(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+) -> Result<Option<(u64, String)>, String> {
+    let (status, _, headers) = request("HEAD", ep, bucket, key, &[], None, creds, &[], &[])?;
+    match status {
+        200 => {
+            let size = headers
+                .iter()
+                .find(|(k, _)| k == "content-length")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            let etag = headers
+                .iter()
+                .find(|(k, _)| k == "etag")
+                .map(|(_, v)| v.trim_matches('"').to_string())
+                .unwrap_or_default();
+            Ok(Some((size, etag)))
+        }
+        404 => Ok(None),
+        _ => Err(format!("S3 HEAD answered {status}")),
+    }
+}
+
+// ---- multipart upload -------------------------------------------------------
+//
+// The streaming upload path: parts are uploaded as body bytes arrive, then
+// completed in one call. Every part except the last must be the same size
+// (R2 enforces uniformity; classic S3 only enforces the 5 MiB minimum).
+
+/// Start a multipart upload; returns the UploadId.
+pub fn create_multipart(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+) -> Result<String, String> {
+    let query = vec![("uploads".to_string(), String::new())];
+    let (status, body, _) = request("POST", ep, bucket, key, &query, None, creds, &[], &[])?;
+    if status != 200 {
+        return Err(s3_error(status, &body));
+    }
+    let xml = String::from_utf8_lossy(&body);
+    xml_field(&xml, "UploadId")
+        .map(|s| xml_unescape(&s))
+        .ok_or_else(|| "CreateMultipartUpload returned no UploadId".into())
+}
+
+/// Upload one part (1-based part numbers); returns its ETag.
+pub fn upload_part(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    upload_id: &str,
+    part_number: u32,
+    body: &[u8],
+) -> Result<String, String> {
+    let query = vec![
+        ("partNumber".to_string(), part_number.to_string()),
+        ("uploadId".to_string(), upload_id.to_string()),
+    ];
+    let (status, resp, headers) =
+        request("PUT", ep, bucket, key, &query, None, creds, body, &[])?;
+    if status != 200 {
+        return Err(s3_error(status, &resp));
+    }
+    headers
+        .iter()
+        .find(|(k, _)| k == "etag")
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .ok_or_else(|| "UploadPart returned no ETag".into())
+}
+
+/// Complete a multipart upload from (part number, etag) pairs, in order.
+/// S3 can answer 200 with an <Error> body, so success is checked on the XML.
+pub fn complete_multipart(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    upload_id: &str,
+    parts: &[(u32, String)],
+) -> Result<(), String> {
+    let query = vec![("uploadId".to_string(), upload_id.to_string())];
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (n, etag) in parts {
+        xml.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>\"{}\"</ETag></Part>",
+            etag.trim_matches('"')
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    let (status, body, _) =
+        request("POST", ep, bucket, key, &query, None, creds, xml.as_bytes(), &[])?;
+    if status != 200 {
+        return Err(s3_error(status, &body));
+    }
+    let text = String::from_utf8_lossy(&body);
+    if text.contains("<Error>") || !text.contains("CompleteMultipartUploadResult") {
+        return Err(format!(
+            "CompleteMultipartUpload failed: {}",
+            &text[..text.len().min(300)]
+        ));
+    }
+    Ok(())
+}
+
+/// Abort a multipart upload (idempotent enough for cleanup paths).
+pub fn abort_multipart(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    upload_id: &str,
+) -> Result<(), String> {
+    let query = vec![("uploadId".to_string(), upload_id.to_string())];
+    let (status, body, _) = request("DELETE", ep, bucket, key, &query, None, creds, &[], &[])?;
+    if !matches!(status, 200 | 202 | 204 | 404) {
+        return Err(s3_error(status, &body));
+    }
+    Ok(())
+}
+
+/// Server-side copy within the bucket; returns the new object's ETag.
+/// (Bounded at 5 GiB per copy by S3/R2 — well above this app's upload cap.)
+pub fn copy_object(
+    ep: &Endpoint,
+    bucket: &str,
+    dst_key: &str,
+    src_key: &str,
+    creds: Option<&Creds>,
+) -> Result<String, String> {
+    let source = format!("/{}/{}", uri_encode(bucket, true), uri_encode(src_key, true));
+    let extra = vec![("x-amz-copy-source".to_string(), source)];
+    let (status, body, _) =
+        request("PUT", ep, bucket, dst_key, &[], None, creds, &[], &extra)?;
+    if status != 200 {
+        return Err(s3_error(status, &body));
+    }
+    let xml = String::from_utf8_lossy(&body);
+    if xml.contains("<Error>") {
+        return Err(format!("CopyObject failed: {}", &xml[..xml.len().min(300)]));
+    }
+    Ok(xml_field(&xml, "ETag")
+        .map(|s| xml_unescape(&s).trim_matches('"').to_string())
+        .unwrap_or_default())
 }
 
 /// One page of ListObjectsV2. Returns (objects, next continuation token).
@@ -487,7 +669,7 @@ pub fn list_page(
     if let Some(c) = cont {
         query.push(("continuation-token".to_string(), c.to_string()));
     }
-    let (status, body) = request("GET", ep, bucket, "", &query, None, creds, &[])?;
+    let (status, body, _) = request("GET", ep, bucket, "", &query, None, creds, &[], &[])?;
     if status != 200 {
         return Err(s3_error(status, &body));
     }

@@ -61,6 +61,28 @@ from the snapshot they started in.
 | `POST /api/delete` | body `path=<path>`; DELETE from the bucket, then re-index |
 | `GET /` UI, `GET /ping` liveness | |
 
+With an `upload` config block (below), the app additionally serves the
+Enclave pin routes — the wire contract of the platform's validating upload
+gateway, so `ipfs.enclave.host` can point at this app and every publish
+client keeps working unchanged:
+
+| route | what |
+|---|---|
+| `POST /add-wasm` | a wasm component (Tier-1 validated: preamble + layer; wasm64 core-module carve-out), streamed through an S3 multipart upload — a 2 GiB body never lives in guest memory. Answers `{cid, wasi, world, threads, set, mem64}` (the wasi-world classifier rides back for claim routing) |
+| `POST /add-json` | an app-config JSON OBJECT (catalog rev-7 large configs), 1 MiB cap in lockstep with the runner's `CONFIG_MAX_BYTES` |
+| `POST /add-image` | an app thumbnail/banner: raster by magic bytes, or SVG through the strict fail-closed validator (reject, never sanitize). Answers `{cid, svg}` |
+| `GET /healthz` | `{"ok":true}` — the gateway liveness contract deploy tooling waits on |
+
+All three pin routes require the platform's wallet-signed upload token
+(`x-upload-address` / `x-upload-expiry` / `x-upload-token`, minted by the
+api-relay as `HMAC-SHA256(uploadKey, "<address>:<sha256(bytes)>:<expiry>")`),
+enforce per-wallet and global daily byte budgets, and echo CORS for the
+configured origins. Pins land in the bucket at `pins/<cid>` — the CID is
+computed by the same code that serves it, and a freshly pinned CID resolves
+immediately (the snapshot is patched without waiting for a LIST). Gateway
+responses carry `Content-Security-Policy: sandbox` + nosniff, the second
+layer behind the SVG validator.
+
 The UI is also a small bucket browser: folder navigation with breadcrumbs,
 upload-into-the-current-folder, per-file delete, and a whole-bucket search.
 The three mutating routes (refresh, upload, delete) honor `api_key`.
@@ -87,9 +109,25 @@ resolve from the environment, which is how deployment secrets arrive:
   },
   "refreshSecs": 300,
   "maxKeys": 50000,
-  "api_key": "$API_KEY"
+  "api_key": "$API_KEY",
+  "upload": {
+    "uploadKey": "$UPLOAD_KEY",
+    "allowOrigins": ["https://enclave.host"],
+    "maxWasmBytes": 2147483648,
+    "maxImageBytes": 4194304,
+    "maxJsonBytes": 1048576,
+    "perAddrDailyBytes": 4294967296,
+    "globalDailyBytes": 17179869184,
+    "jsonPerIpHourly": 60
+  }
 }
 ```
+
+The `upload` block is optional; without it the pin routes answer 503.
+`uploadKey` is the HMAC secret shared with the api-relay (reference a
+deployment secret, never inline it). All other keys default to the values
+shown. `allowUnsigned: true` opens the routes with no token — dev/e2e only,
+never on a public deployment.
 
 `endpoint` and `bucket` are required; the app still starts without them and
 says so in the UI. Omit `credentials` for a public bucket (requests go

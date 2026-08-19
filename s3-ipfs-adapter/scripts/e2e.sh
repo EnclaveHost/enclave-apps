@@ -19,9 +19,16 @@ SK=testsecret12345
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/s3ipfs-e2e.XXXXXX")
 PIDS=()
+OK=0
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
-  rm -rf "$WORK"
+  if [ "$OK" = 1 ]; then
+    rm -rf "$WORK"
+  else
+    # keep the evidence: app logs + fixtures survive a failed run
+    echo "FAILED - work dir kept at $WORK" >&2
+    tail -5 "$WORK"/app*.log 2>/dev/null >&2 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -248,5 +255,167 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/upload?path=tra
 [ "$code" = 400 ] || fail "trailing-slash key accepted ($code)"
 pass "bad upload keys rejected"
 
+echo "== pin routes (/add-wasm /add-json /add-image) =="
+# A second instance with the pin routes on, wallet-signed with a test key -
+# the same HMAC the api-relay mints. Same bucket; pins land under pins/<cid>.
+APP2_PORT=18401
+BASE2="http://127.0.0.1:$APP2_PORT"
+UPKEY=test-upload-key
+ADDR=0x00000000000000000000000000000000000000aa
+CONFIG2=$(python3 - <<EOF
+import json
+print(json.dumps({
+  "endpoint": "$S3", "region": "us-east-1", "bucket": "$BUCKET",
+  "credentials": {"accessKeyId": "$AK", "secretAccessKey": "$SK"},
+  "refreshSecs": 0,
+  "upload": {"uploadKey": "$UPKEY", "allowOrigins": ["https://enclave.host"]},
+}))
+EOF
+)
+wasmtime run -Scli -Stcp -Sinherit-network -Sallow-ip-name-lookup \
+  --env "ENCLAVE_PORTS=http:8000=$APP2_PORT" --env "ENCLAVE_CONFIG=$CONFIG2" \
+  target/wasm32-wasip2/release/s3-ipfs-adapter.wasm >"$WORK/app2.log" 2>&1 &
+PIDS+=($!)
+for i in $(seq 1 60); do
+  curl -sf "$BASE2/healthz" | grep -q '"ok":true' && break
+  sleep 0.5
+  [ "$i" = 60 ] && { cat "$WORK/app2.log"; fail "pin app did not come up"; }
+done
+pass "/healthz answers (the gateway liveness contract)"
+for i in $(seq 1 600); do
+  [ "$(curl -sf "$BASE2/api/status" | jget state)" = ready ] && break
+  sleep 0.5
+  [ "$i" = 600 ] && { cat "$WORK/app2.log"; fail "pin app index never became ready"; }
+done
+
+mint() { # file, expiry -> token (the api-relay's exact HMAC)
+  python3 - "$UPKEY" "$1" "$ADDR" "$2" <<'EOF'
+import hashlib, hmac, sys
+key, path, addr, exp = sys.argv[1:5]
+digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+print(hmac.new(key.encode(), f"{addr}:{digest}:{exp}".encode(), hashlib.sha256).hexdigest())
+EOF
+}
+EXP=$(( $(date +%s) + 300 ))
+
+WASM=target/wasm32-wasip2/release/s3-ipfs-adapter.wasm
+WASM_EXPECT=$(ipfs add --cid-version 1 -Q --only-hash "$WASM" 2>/dev/null)
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WASM" "$BASE2/add-wasm")
+[ "$code" = 401 ] || fail "unsigned /add-wasm -> $code (want 401)"
+pass "unsigned upload refused (401)"
+
+TOK=$(mint "$WASM" "$EXP")
+curl -s -X POST --data-binary "@$WASM" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK" \
+  -H "origin: https://enclave.host" \
+  "$BASE2/add-wasm" >"$WORK/addwasm.json"
+CID=$(jget cid <"$WORK/addwasm.json")
+[ "$CID" = "$WASM_EXPECT" ] || { cat "$WORK/addwasm.json"; fail "/add-wasm CID $CID != ipfs add $WASM_EXPECT"; }
+WASI=$(jget wasi <"$WORK/addwasm.json")
+[ "$WASI" = "0.2" ] || fail "/add-wasm classified wasi='$WASI' (want 0.2)"
+pass "/add-wasm pins with the kubo-identical CID and classifies the world"
+
+# The freshly pinned CID must serve IMMEDIATELY (no refresh in between):
+# a publish is followed by a deploy within seconds.
+curl -sf "$BASE2/ipfs/$CID" -o "$WORK/wasm-back.bin"
+cmp "$WORK/wasm-back.bin" "$WASM" || fail "pinned wasm bytes differ on the way back"
+pass "pinned CID serves immediately (incremental index commit)"
+
+# The fleet's exact fetch shape: CAR + verify by import.
+curl -sf -H 'Accept: application/vnd.ipld.car' "$BASE2/ipfs/$CID?format=car&dag-scope=all" -o "$WORK/wasm.car"
+export IPFS_PATH="$WORK/ipfs3"
+ipfs init -e >/dev/null 2>&1
+ipfs dag import "$WORK/wasm.car" >/dev/null 2>&1 || fail "kubo rejected the /add-wasm CAR"
+ipfs cat "$CID" 2>/dev/null | cmp - "$WASM" || fail "CAR round-trip bytes differ"
+pass "wasm CAR (?format=car&dag-scope=all) verifies block-for-block in kubo"
+
+TOK_OTHER=$(mint "$D/hello.txt" "$EXP")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WASM" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_OTHER" \
+  "$BASE2/add-wasm")
+[ "$code" = 403 ] || fail "wrong-bytes token -> $code (want 403)"
+EXP_OLD=$(( $(date +%s) - 10 ))
+TOK_OLD=$(mint "$WASM" "$EXP_OLD")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WASM" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP_OLD" -H "x-upload-token: $TOK_OLD" \
+  "$BASE2/add-wasm")
+[ "$code" = 401 ] || fail "expired token -> $code (want 401)"
+pass "token binds to the bytes (403) and to time (401)"
+
+# The multipart path: a >8 MiB body (real component followed by padding -
+# layer 1 accepts, so only the CID math and the S3 multipart plumbing are
+# under test). CID must still be kubo-identical.
+cat "$WASM" >"$WORK/big.wasm"
+head -c $((20 * 1024 * 1024)) /dev/urandom >>"$WORK/big.wasm"
+BIG_EXPECT=$(ipfs add --cid-version 1 -Q --only-hash "$WORK/big.wasm" 2>/dev/null)
+TOK_BIG=$(mint "$WORK/big.wasm" "$EXP")
+BIG_CID=$(curl -s -X POST --data-binary "@$WORK/big.wasm" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_BIG" \
+  "$BASE2/add-wasm" | jget cid)
+[ "$BIG_CID" = "$BIG_EXPECT" ] || fail "multipart CID $BIG_CID != ipfs add $BIG_EXPECT"
+curl -sf "$BASE2/ipfs/$BIG_CID" -o "$WORK/big-back.bin"
+cmp "$WORK/big-back.bin" "$WORK/big.wasm" || fail "multipart bytes differ on the way back"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$S3/$BUCKET/staging/" \
+  --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK")
+pass "20 MiB body streams through S3 multipart, CID kubo-identical"
+
+printf 'not wasm at all' >"$WORK/noise.bin"
+TOK_NOISE=$(mint "$WORK/noise.bin" "$EXP")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WORK/noise.bin" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_NOISE" \
+  "$BASE2/add-wasm")
+[ "$code" = 415 ] || fail "non-wasm -> $code (want 415)"
+pass "not-a-component refused (415)"
+
+printf '{"model":"x","ctx":4096}' >"$WORK/cfg.json"
+JSON_EXPECT=$(ipfs add --cid-version 1 -Q --only-hash "$WORK/cfg.json" 2>/dev/null)
+TOK_JSON=$(mint "$WORK/cfg.json" "$EXP")
+J_CID=$(curl -s -X POST --data-binary "@$WORK/cfg.json" -H 'content-type: application/json' \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_JSON" \
+  "$BASE2/add-json" | jget cid)
+[ "$J_CID" = "$JSON_EXPECT" ] || fail "/add-json CID $J_CID != $JSON_EXPECT"
+[ "$(curl -sf "$BASE2/ipfs/$J_CID")" = '{"model":"x","ctx":4096}' ] || fail "config bytes differ"
+printf '[1,2,3]' >"$WORK/arr.json"
+TOK_ARR=$(mint "$WORK/arr.json" "$EXP")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WORK/arr.json" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_ARR" \
+  "$BASE2/add-json")
+[ "$code" = 415 ] || fail "non-object config -> $code (want 415)"
+pass "/add-json pins objects, refuses non-objects"
+
+printf '<svg xmlns="http://www.w3.org/2000/svg"><rect width="4" height="4" fill="#e8a34c"/></svg>' >"$WORK/ok.svg"
+TOK_SVG=$(mint "$WORK/ok.svg" "$EXP")
+curl -s -X POST --data-binary "@$WORK/ok.svg" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_SVG" \
+  "$BASE2/add-image" >"$WORK/addsvg.json"
+[ "$(jget svg <"$WORK/addsvg.json")" = "True" ] || { cat "$WORK/addsvg.json"; fail "clean SVG not accepted as svg"; }
+SVG_CID=$(jget cid <"$WORK/addsvg.json")
+CT=$(curl -sfI "$BASE2/ipfs/$SVG_CID?filename=i.svg" | tr -d '\r' | awk 'tolower($1)=="content-type:"{print $2}')
+[ "$CT" = "image/svg+xml" ] || fail "?filename=i.svg content-type '$CT'"
+CSP=$(curl -sfI "$BASE2/ipfs/$SVG_CID" | tr -d '\r' | grep -i '^content-security-policy:' || true)
+echo "$CSP" | grep -q sandbox || fail "gateway response missing CSP sandbox"
+pass "/add-image accepts a clean SVG; gateway serves it typed + sandboxed"
+
+printf '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>' >"$WORK/evil.svg"
+TOK_EVIL=$(mint "$WORK/evil.svg" "$EXP")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WORK/evil.svg" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_EVIL" \
+  "$BASE2/add-image")
+[ "$code" = 415 ] || fail "hostile SVG -> $code (want 415)"
+printf '\x89PNG\r\n\x1a\n0000IHDR' >"$WORK/ok.png"
+TOK_PNG=$(mint "$WORK/ok.png" "$EXP")
+[ "$(curl -s -X POST --data-binary "@$WORK/ok.png" \
+  -H "x-upload-address: $ADDR" -H "x-upload-expiry: $EXP" -H "x-upload-token: $TOK_PNG" \
+  "$BASE2/add-image" | jget svg)" = "False" ] || fail "raster PNG not accepted"
+pass "hostile SVG refused (415), raster accepted"
+
+ACAO=$(curl -s -o /dev/null -D - -X OPTIONS -H 'origin: https://enclave.host' \
+  -H 'access-control-request-method: POST' "$BASE2/add-wasm" | tr -d '\r' \
+  | awk 'tolower($1)=="access-control-allow-origin:"{print $2}')
+[ "$ACAO" = "https://enclave.host" ] || fail "preflight allow-origin '$ACAO'"
+pass "CORS preflight echoes the allowed origin"
+
 echo
+OK=1
 echo "ALL PASS"
