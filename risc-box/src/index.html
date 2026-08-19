@@ -247,8 +247,7 @@ function connectDisplay() {
 // out-produced the link (cursor motion over a busy game was enough), and
 // the picture ran seconds behind: the "web UI freeze". The native bridge
 // has pulled since 0.6.35; this brings the page onto the same path.
-async function drawBand(m) {
-  const bgrx = await inflateRaw(b64dec(m.b));
+function paintBand(m, bgrx) {
   const rgba = new Uint8ClampedArray(bgrx.length);
   // A word at a time, not a byte at a time: the guest's pixels are
   // B,G,R,X little-endian, so one 32-bit read is 0xXXRRGGBB and the swap
@@ -265,7 +264,15 @@ async function drawBand(m) {
 }
 async function pullLoop(run) {
   let gen = 0, failures = 0;
+  // The pull must not wait for the draw: serializing fetch -> inflate ->
+  // paint -> next fetch caps the frame rate at 1/(RTT + decode), which reads
+  // as chop on any real link. Decode+draw chain behind the loop instead, and
+  // when the tab falls more than a few responses behind, pulling pauses — the
+  // backlog then accumulates in the server-side ring (which re-bases), not in
+  // tab memory, and the picture stays CURRENT when the tab catches up.
+  let drawQ = Promise.resolve(), behind = 0;
   while (run.on) {
+    while (behind >= 3 && run.on) await drawQ;
     let j;
     try {
       const r = await authFetch("/fb.bands?since=" + gen + "&wait=1");
@@ -273,16 +280,22 @@ async function pullLoop(run) {
       j = await r.json();
       failures = 0;
     } catch (e) {
-      // A dead machine or a mid-restart 502: back off, keep redialling.
       failures++;
       await new Promise((res) => setTimeout(res, Math.min(300 * failures, 3000)));
       continue;
     }
     if (j.w && j.h && (j.w !== dispW || fbCanvas.height !== j.h)) setGeometry(j.w, j.h);
     gen = j.gen;
-    for (const m of j.events) {
-      try { await drawBand(m); } catch (e) {}
-    }
+    if (!j.events.length) continue;
+    const evs = j.events;
+    behind++;
+    drawQ = drawQ.then(async () => {
+      // bands of one response are disjoint rectangles: inflate them all in
+      // parallel, paint in order
+      const decoded = await Promise.all(
+        evs.map((m) => inflateRaw(b64dec(m.b)).then((bgrx) => ({ m, bgrx })).catch(() => null)));
+      for (const d of decoded) { if (d) paintBand(d.m, d.bgrx); }
+    }).catch(() => {}).finally(() => { behind--; });
   }
 }
 function dropDisplay() {
