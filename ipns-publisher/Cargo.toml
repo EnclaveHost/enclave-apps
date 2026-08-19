@@ -1,0 +1,30 @@
+[package]
+name = "ipns-publisher"
+version = "0.1.0"
+edition = "2021"
+description = "Sign IPNS records inside an attested enclave and publish them to the public IPFS DHT over a hand-rolled, outbound-only libp2p stack (TCP + Noise XX + yamux + Kademlia PUT_VALUE), plus an HTTP record server and delegated-routing fallback. The ed25519 name key lives in attestation, never on disk."
+license-file = "../LICENSE"
+publish = false
+
+# A run-mode service app (single wasm32-wasip2 command component), the
+# s3-ipfs-adapter shape: std maps to wasi:sockets/clocks/cli. The HTTP engine
+# (src/httpd.rs), the libp2p transport (multistream + Noise + yamux), the
+# Kademlia client and the IPNS record codec are hand-rolled std. Dependencies
+# are the pure-Rust TLS stack (for https delegates), the RustCrypto/dalek
+# primitives for Noise + ed25519, and serde_json for the app config.
+[dependencies]
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+sha2 = "0.10"
+hmac = "0.12"
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
