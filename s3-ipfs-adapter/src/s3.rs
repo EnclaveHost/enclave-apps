@@ -371,8 +371,19 @@ fn request(
                 return Err("read timeout".into());
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // TLS close-notify omission and plain EOF both end the body
-            Err(e) if head_end.is_some() && content_length.is_none() && !chunked => {
+            // A peer that closes the connection without the TLS close_notify
+            // alert surfaces as UnexpectedEof; R2 does this routinely, and
+            // rustls (unlike OpenSSL/curl) is strict about it. Once the header
+            // block is in, treat it as end-of-body: a genuinely truncated
+            // response is still caught by the content-length check below, so
+            // this can only turn a clean-but-impolite close into success, not
+            // admit short bytes. Also covers connection-close framing (no
+            // content-length, not chunked).
+            Err(e)
+                if head_end.is_some()
+                    && (e.kind() == std::io::ErrorKind::UnexpectedEof
+                        || (content_length.is_none() && !chunked)) =>
+            {
                 let _ = e;
                 break;
             }
