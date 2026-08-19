@@ -16,6 +16,7 @@
 
 mod egress;
 mod httpd;
+mod ipni;
 mod ipns;
 mod kad;
 mod multiformats;

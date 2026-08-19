@@ -77,6 +77,16 @@ pub fn base64(data: &[u8]) -> String {
     out
 }
 
+/// Standard base64, no padding — the IPLD dag-json bytes encoding
+/// (`{"/":{"bytes":"..."}}`).
+pub fn base64_nopad(data: &[u8]) -> String {
+    let mut s = base64(data);
+    while s.ends_with('=') {
+        s.pop();
+    }
+    s
+}
+
 pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim().trim_end_matches('=');
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
@@ -236,6 +246,74 @@ pub const MA_CIRCUIT: u64 = 0x0122;
 pub const MA_WEBTRANSPORT: u64 = 0x01d1;
 pub const MA_CERTHASH: u64 = 0x01d2;
 pub const MA_WEBRTC_DIRECT: u64 = 0x0118;
+pub const MA_HTTP: u64 = 0x01e0;
+pub const MA_HTTPS: u64 = 0x01bb; // valueless flag (== /tls/http sugar)
+pub const MA_TLS: u64 = 0x01c0;
+
+/// Encode a textual multiaddr to its binary form, for the protocols an IPNI
+/// publisher/retrieval address uses. Returns None on an unsupported protocol.
+pub fn multiaddr_encode(s: &str) -> Option<Vec<u8>> {
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < parts.len() {
+        let proto = parts[i];
+        let val = |j: usize| parts.get(j).copied();
+        match proto {
+            "ip4" => {
+                let ip: std::net::Ipv4Addr = val(i + 1)?.parse().ok()?;
+                varint(&mut out, MA_IP4);
+                out.extend_from_slice(&ip.octets());
+                i += 2;
+            }
+            "ip6" => {
+                let ip: std::net::Ipv6Addr = val(i + 1)?.parse().ok()?;
+                varint(&mut out, MA_IP6);
+                out.extend_from_slice(&ip.octets());
+                i += 2;
+            }
+            "dns" | "dns4" | "dns6" => {
+                let code = match proto {
+                    "dns" => MA_DNS,
+                    "dns4" => MA_DNS4,
+                    _ => MA_DNS6,
+                };
+                let name = val(i + 1)?;
+                varint(&mut out, code);
+                varint(&mut out, name.len() as u64);
+                out.extend_from_slice(name.as_bytes());
+                i += 2;
+            }
+            "tcp" | "udp" => {
+                let port: u16 = val(i + 1)?.parse().ok()?;
+                varint(&mut out, if proto == "tcp" { MA_TCP } else { MA_UDP });
+                out.extend_from_slice(&port.to_be_bytes());
+                i += 2;
+            }
+            "https" => {
+                varint(&mut out, MA_HTTPS);
+                i += 1;
+            }
+            "http" => {
+                varint(&mut out, MA_HTTP);
+                i += 1;
+            }
+            "tls" => {
+                varint(&mut out, MA_TLS);
+                i += 1;
+            }
+            "p2p" | "ipfs" => {
+                let id = peer_id_str_decode(val(i + 1)?)?;
+                varint(&mut out, MA_P2P);
+                varint(&mut out, id.len() as u64);
+                out.extend_from_slice(&id);
+                i += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Seg {
