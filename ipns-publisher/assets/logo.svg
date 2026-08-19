@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- ipns-publisher: an ed25519 key whose bow is a hexagon (the enclave /
+       CID motif shared with its siblings), broadcasting the signed name
+       outward to DHT peers. The key never leaves the enclave; the name does. -->
+
+  <!-- broadcast waves: the signed record published out to the DHT -->
+  <g fill="none" stroke="#a78bfa" stroke-width="2.5" stroke-linecap="round">
+    <path d="M71.1 41.9 A8 8 0 0 1 71.1 54.1" opacity="0.9"/>
+    <path d="M75.6 36.5 A15 15 0 0 1 75.6 59.5" opacity="0.55"/>
+    <path d="M80.1 31.2 A22 22 0 0 1 80.1 64.9" opacity="0.32"/>
+  </g>
+  <!-- peer nodes receiving the record -->
+  <g fill="#a78bfa">
+    <circle cx="80.1" cy="31.2" r="2.1" opacity="0.7"/>
+    <circle cx="86" cy="48" r="2.4"/>
+    <circle cx="80.1" cy="64.9" r="2.1" opacity="0.7"/>
+  </g>
+
+  <!-- the key: hexagonal bow + shaft + bit, one solid violet -->
+  <g fill="#a78bfa">
+    <!-- shaft -->
+    <rect x="48.7" y="45" width="17.2" height="6"/>
+    <!-- bit (teeth), hanging off the shaft near the tip -->
+    <rect x="55" y="51" width="3.5" height="6"/>
+    <rect x="61.5" y="51" width="4" height="9"/>
+    <!-- bow: a pointy-top hexagon (cx 34, cy 48, r 17) -->
+    <polygon points="34,31 48.72,39.5 48.72,56.5 34,65 19.28,56.5 19.28,39.5"/>
+  </g>
+  <!-- keyhole cut into the bow: this is the custody, held in the enclave -->
+  <g fill="#0e1220">
+    <circle cx="34" cy="44" r="4.5"/>
+    <polygon points="31.4,47 36.6,47 37.6,55 30.4,55"/>
+  </g>
+
+  <!-- the name it publishes (the multibase 'k' prefix of every IPNS name) -->
+  <text x="34" y="82.5" font-family="monospace" font-size="9" font-weight="bold"
+        fill="#8a94a6" text-anchor="middle">k51</text>
+</svg>

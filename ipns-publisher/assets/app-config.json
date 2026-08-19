@@ -1,0 +1,10 @@
+{
+  "ipnsKey": "$IPNS_ED25519_SK",
+  "value": "/ipfs/bafy...",
+  "lifetimeSecs": 172800,
+  "republishSecs": 14400,
+  "ttlSecs": 3600,
+  "delegates": ["https://delegated-ipfs.dev"],
+  "dht": true,
+  "api_key": "$API_KEY"
+}
