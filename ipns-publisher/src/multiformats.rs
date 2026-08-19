@@ -334,15 +334,25 @@ pub fn multiaddr_decode(mut buf: &[u8]) -> Option<Vec<Seg>> {
     Some(segs)
 }
 
-/// A dial target this platform can reach: plain TCP, no relay hops, no
-/// QUIC/WS layers (Step 0: fleet egress is SOCKS5 CONNECT, TCP only).
+/// A dial target this platform can reach: plain TCP, publicly routable, no
+/// relay hops, no QUIC/WS layers (Step 0: fleet egress is SOCKS5 CONNECT,
+/// TCP only). Private/loopback/link-local addresses are dropped — the fleet
+/// egress SSRF guard refuses them anyway, and dialing them wastes a slot.
 pub fn tcp_target(segs: &[Seg]) -> Option<(String, u16)> {
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
     for s in segs {
         match s {
-            Seg::Ip4(ip) => host = Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])),
+            Seg::Ip4(ip) => {
+                if !ipv4_global(ip) {
+                    return None;
+                }
+                host = Some(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
+            }
             Seg::Ip6(ip) => {
+                if !ipv6_global(ip) {
+                    return None;
+                }
                 let mut g = Vec::with_capacity(8);
                 for i in 0..8 {
                     g.push(format!("{:x}", (u16::from(ip[i * 2]) << 8) | u16::from(ip[i * 2 + 1])));
@@ -359,6 +369,44 @@ pub fn tcp_target(segs: &[Seg]) -> Option<(String, u16)> {
         }
     }
     Some((host?, port?))
+}
+
+/// Publicly routable IPv4: not private/loopback/link-local/CGNAT/multicast/
+/// this-network/broadcast (mirrors the fleet net-guard's blocklist).
+fn ipv4_global(o: &[u8; 4]) -> bool {
+    !(o[0] == 0                                   // 0.0.0.0/8
+        || o[0] == 10                             // 10/8
+        || o[0] == 127                            // loopback
+        || (o[0] == 100 && (64..128).contains(&o[1])) // 100.64/10 CGNAT
+        || (o[0] == 169 && o[1] == 254)           // link-local
+        || (o[0] == 172 && (16..32).contains(&o[1])) // 172.16/12
+        || (o[0] == 192 && o[1] == 168)           // 192.168/16
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2) // TEST-NET-1
+        || o[0] >= 224)                           // multicast + reserved + broadcast
+}
+
+/// Publicly routable IPv6: not loopback/unspecified/ULA(fc00::/7)/link-local
+/// (fe80::/10)/multicast(ff00::/8)/v4-mapped.
+fn ipv6_global(a: &[u8; 16]) -> bool {
+    if a.iter().all(|&b| b == 0) {
+        return false; // ::
+    }
+    if a[..15].iter().all(|&b| b == 0) && a[15] == 1 {
+        return false; // ::1
+    }
+    if a[0] == 0xff {
+        return false; // multicast
+    }
+    if a[0] & 0xfe == 0xfc {
+        return false; // ULA fc00::/7
+    }
+    if a[0] == 0xfe && (a[1] & 0xc0) == 0x80 {
+        return false; // link-local fe80::/10
+    }
+    if a[..10].iter().all(|&b| b == 0) && a[10] == 0xff && a[11] == 0xff {
+        return false; // ::ffff:0:0/96 v4-mapped
+    }
+    true
 }
 
 pub fn multiaddr_to_string(segs: &[Seg]) -> String {

@@ -141,12 +141,16 @@ fn load_config() -> Config {
 enum Task {
     /// Ask one delegate for the current record (sequence recovery).
     Recover(String),
+    /// Recover the sequence from the DHT (a GET_VALUE walk). Non-blocking:
+    /// re-enqueues itself each tick until the walk converges. `started` is
+    /// false until the walk is kicked off.
+    RecoverDht { started: bool },
     /// Resolve the value, choose the sequence, build + sign the record.
     Sign,
     /// PUT the current record to one delegate.
     Put(String),
-    /// Kick the DHT publish machinery (milestone 5+; non-blocking, the
-    /// p2p engine advances in the event loop).
+    /// Kick the DHT publish machinery: non-blocking, the p2p engine advances
+    /// in the event loop.
     DhtPublish,
 }
 
@@ -237,18 +241,23 @@ impl App {
         }
     }
 
-    /// Queue a full publish round: recover sequence from every delegate
-    /// first (cheap, idempotent), then sign, then push everywhere.
+    /// Queue a full publish round: recover the sequence (from every delegate,
+    /// and from the DHT when enabled) before signing, then push everywhere.
     fn enqueue_publish(&mut self) {
+        if self.tasks.iter().any(|t| matches!(t, Task::Sign | Task::RecoverDht { .. })) {
+            return; // a round is already queued; don't stack another
+        }
         for d in &self.cfg.delegates {
-            let t = Task::Recover(d.clone());
-            if !self.tasks.contains(&t) {
-                self.tasks.push_back(t);
-            }
+            self.tasks.push_back(Task::Recover(d.clone()));
         }
-        if !self.tasks.contains(&Task::Sign) {
-            self.tasks.push_back(Task::Sign);
+        // A DHT-only deployment with no durable disk relies on this to learn
+        // its last sequence; skip it when a delegate or the state file will
+        // already carry the sequence (recovery is best-effort belt-and-braces
+        // otherwise, and the walk costs ~20s).
+        if self.cfg.dht && self.cfg.delegates.is_empty() && !self.durable_state {
+            self.tasks.push_back(Task::RecoverDht { started: false });
         }
+        self.tasks.push_back(Task::Sign);
     }
 
     /// Advance one bounded task. Returns whether work happened.
@@ -260,11 +269,38 @@ impl App {
         let Some(task) = self.tasks.pop_front() else { return false };
         match task {
             Task::Recover(delegate) => self.do_recover(&delegate),
+            Task::RecoverDht { started } => self.do_recover_dht(started),
             Task::Sign => self.do_sign(),
             Task::Put(delegate) => self.do_put(&delegate),
             Task::DhtPublish => self.do_dht_publish(),
         }
         true
+    }
+
+    /// Non-blocking DHT sequence recovery: kick the GET walk on the first
+    /// visit, then re-enqueue this task (ahead of Sign) until it converges.
+    fn do_recover_dht(&mut self, started: bool) {
+        let Some(id) = &self.cfg.identity else { return };
+        let key = id.routing_key();
+        let signing = id.signing.clone();
+        let bootstrap = self.cfg.bootstrap.clone();
+        let dht = self.dht.get_or_insert_with(|| p2p::Dht::new(bootstrap, signing));
+        if !started {
+            dht.start_recover(key);
+            self.tasks.push_front(Task::RecoverDht { started: true });
+            return;
+        }
+        match dht.recover_result() {
+            Some(Some((seq, value))) => {
+                eprintln!("[ipns-publisher] DHT recovery: sequence {seq}");
+                self.note_recovered(seq, value, "dht");
+            }
+            Some(None) => eprintln!("[ipns-publisher] DHT recovery: no existing record (fresh name)"),
+            None => {
+                // still walking: yield, retry next tick, keep it before Sign
+                self.tasks.push_front(Task::RecoverDht { started: true });
+            }
+        }
     }
 
     fn do_recover(&mut self, delegate: &str) {

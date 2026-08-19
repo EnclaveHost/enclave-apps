@@ -29,6 +29,33 @@ Three publish surfaces, in order of increasing self-sufficiency:
    No rust-libp2p: it does not build for wasm32-wasip2; this stack is
    hand-rolled the way the suite hand-rolls S3, IPFS and HTTP.
 
+All three are proven: records minted here pass `ipfs name inspect --verify`
+and are accepted by kubo's `/routing/v1` PUT; a name published to the public
+DHT by this stack is resolved by an independent, freshly-bootstrapped kubo
+with an empty cache and no delegate — the whole point, the key never leaving
+the enclave. `scripts/e2e.sh` runs the record + HTTP + delegate layer
+hermetically against a local kubo; `E2E_DHT=1 scripts/e2e.sh` adds the
+public-DHT round trip (needs outbound internet and a throwaway key).
+
+### How the libp2p stack is laid out
+
+Single-threaded, one non-blocking event loop (`src/p2p.rs`): each outbound
+connection climbs a fixed ladder one step per tick — TCP connect, then
+multistream-select `/noise`, the Noise XX handshake (which authenticates the
+peer ID and encrypts everything after), multistream `/yamux/1.0.0` over that
+channel, then per-stream `/ipfs/kad/1.0.0`. On the wire the layers nest:
+Noise transport messages (2-byte length prefix) carry yamux frames, which
+carry length-prefixed multistream tokens then varint-prefixed Kademlia
+messages. The walk issues `GET_VALUE` (go-libp2p answers with both the
+closer peers, so the walk converges, and any stored record, so recovery is
+free), converges on the 20 closest peers, then `PUT_VALUE`s the record to
+them. Concurrency is ~12 sockets multiplexed in the loop, not threads; new
+dials are one per tick (the connect blocks through the SOCKS egress, so the
+suite's "one bounded blocking op per tick" rule keeps the HTTP server
+responsive). The codecs (`src/multiformats.rs`, `src/ipns.rs`, `src/kad.rs`)
+and the Noise/yamux framing (`src/noise.rs`, `src/yamux.rs`) are hand-rolled
+and unit-tested against kubo byte vectors.
+
 ## Step 0 finding: fleet egress is TCP-only
 
 Recorded per the transport decision: the platform's egress front is SOCKS5
@@ -54,11 +81,24 @@ CBOR; V1 stays for back-compat; records stay under the spec's 10 KiB cap.
 IPNS resolvers keep the highest sequence they have seen (ties: longest
 validity), so a publisher that forgets its sequence bricks its name until
 the old record expires. This app has no durable disk guarantee, so on
-boot it recovers: reads `/data/ipns-publisher-state.json` when the
-platform persists it, and asks every delegate (later: the DHT) for the
-current record, verifying the signature before believing a sequence. An
-unchanged value keeps its sequence and extends the EOL; a changed value
-publishes max(known)+1.
+boot it recovers the sequence from three sources, strongest first, before
+signing:
+
+1. `/data/ipns-publisher-state.json`, when the platform gives the
+   deployment a persistent volume (the app writes it after every publish).
+2. every configured delegate's `/routing/v1/ipns/<name>` (verifying the
+   signature before believing a sequence).
+3. the DHT itself — a `GET_VALUE` walk — but only when there is neither a
+   durable volume nor a delegate to ask, since the walk costs ~20s. This is
+   what lets a **DHT-only deployment with no disk** still find its last
+   sequence.
+
+An unchanged value keeps its sequence and extends the EOL; a changed value
+publishes max(known)+1. If, despite recovery, the DHT is found to already
+hold a sequence at or above the one being published (the record would be
+rejected as stale), the app logs a loud warning — the failure mode the
+handoff flags. A durable `/data` volume makes this airtight; without one,
+keep at least one delegate configured.
 
 ## Config
 
@@ -112,9 +152,14 @@ rustup target add wasm32-wasip2
 cargo build --release --target wasm32-wasip2
 # → target/wasm32-wasip2/release/ipns-publisher.wasm
 
-cargo test          # unit: kubo byte vectors (records, identities), bases, urls
-scripts/e2e.sh      # against a local kubo: sign, PUT, recover, serve
+cargo test               # unit: kubo byte vectors (records, identities, Noise
+                         # XX self-handshake, yamux/kad codecs), bases, urls
+scripts/e2e.sh           # hermetic: sign, serve, delegate PUT, recover (local kubo)
+E2E_DHT=1 scripts/e2e.sh # + public-DHT PUT → independent kubo resolves (needs internet)
 ```
+
+The e2e leaves background daemons; run it in a real terminal (its `trap`
+cleans them up), not inside a tool that waits on child processes.
 
 Local run:
 

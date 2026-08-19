@@ -52,7 +52,6 @@ enum StreamPhase {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum StreamKind {
-    Query,
     GetValue,
     Put,
 }
@@ -106,7 +105,6 @@ struct Conn {
     last_progress: Instant,
     want_query: bool,
     want_put: bool,
-    want_get: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -118,9 +116,18 @@ pub enum State {
     Failed,
 }
 
+/// What this walk is for: recover the current sequence (GET only, no store),
+/// or publish a record (GET while walking, then PUT the store set).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Job {
+    Recover,
+    Publish,
+}
+
 pub struct Dht {
     bootstrap_specs: Vec<String>,
     identity: SigningKey,
+    job: Job,
     lookup: Option<Lookup>,
     routing_key: Vec<u8>,
     record: Vec<u8>,
@@ -130,6 +137,11 @@ pub struct Dht {
     stores_ok: usize,
     stores_failed: usize,
     get_result: Option<(u64, bool)>,
+    /// Best valid record seen during the walk: (sequence, value bytes).
+    best_seen: Option<(u64, Vec<u8>)>,
+    /// Store set awaiting a dial, drained one per tick during Storing:
+    /// (peer multihash, addr).
+    store_queue: VecDeque<(Vec<u8>, (String, u16))>,
     last_note: String,
     dialed: Vec<Vec<u8>>,
 }
@@ -139,6 +151,7 @@ impl Dht {
         Dht {
             bootstrap_specs: bootstrap,
             identity,
+            job: Job::Publish,
             lookup: None,
             routing_key: Vec::new(),
             record: Vec::new(),
@@ -148,6 +161,8 @@ impl Dht {
             stores_ok: 0,
             stores_failed: 0,
             get_result: None,
+            best_seen: None,
+            store_queue: VecDeque::new(),
             last_note: "idle".into(),
             dialed: Vec::new(),
         }
@@ -158,9 +173,38 @@ impl Dht {
             self.last_note = "publish already in flight; re-runs on the next timer".into();
             return;
         }
+        self.job = Job::Publish;
         self.routing_key = routing_key;
         self.record = record;
         self.begin_walk();
+    }
+
+    /// Start a GET-only walk to recover the current sequence from the DHT
+    /// (for a deployment with no durable disk). Poll `recover_result()`.
+    pub fn start_recover(&mut self, routing_key: Vec<u8>) {
+        if matches!(self.state, State::Walking | State::Storing) {
+            return;
+        }
+        self.job = Job::Recover;
+        self.routing_key = routing_key;
+        self.record = Vec::new();
+        self.begin_walk();
+    }
+
+    /// None while a recover walk is still running; Some(best) once done —
+    /// inner is Some((seq, value)) if the DHT held a valid record, else None.
+    pub fn recover_result(&self) -> Option<Option<(u64, Vec<u8>)>> {
+        if self.job != Job::Recover {
+            return None;
+        }
+        match self.state {
+            State::Done | State::Failed => Some(self.best_seen.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, State::Walking | State::Storing)
     }
 
     fn begin_walk(&mut self) {
@@ -186,9 +230,10 @@ impl Dht {
         self.stores_ok = 0;
         self.stores_failed = 0;
         self.get_result = None;
+        self.best_seen = None;
         self.state = State::Walking;
         self.started = Some(Instant::now());
-        self.last_note = format!("walking from {seeded} bootstrap peers");
+        self.last_note = format!("{:?}: walking from {seeded} bootstrap peers", self.job);
         eprintln!("[ipns-publisher] DHT: {}", self.last_note);
     }
 
@@ -202,6 +247,7 @@ impl Dht {
             return true;
         }
         let mut busy = self.spawn_dials();
+        busy |= self.spawn_store_dials();
         let mut i = 0;
         while i < self.conns.len() {
             busy |= self.service_conn(i);
@@ -219,11 +265,16 @@ impl Dht {
         if self.state != State::Walking {
             return false;
         }
-        let mut busy = false;
+        // At most ONE new dial per drive(): the connect goes through the
+        // fleet SOCKS front and blocks until it resolves (the suite's
+        // "one bounded blocking op per tick" discipline). Filling all the
+        // slots in one call would freeze the event loop — and the HTTP
+        // server — for the sum of those connects. Slots ramp over ticks;
+        // once connected, a conn is serviced fully non-blocking.
         while self.conns.len() < MAX_DIALS {
             let (mh, addrs) = {
-                let Some(lookup) = &self.lookup else { break };
-                let Some(cand) = lookup.next_fresh() else { break };
+                let Some(lookup) = &self.lookup else { return false };
+                let Some(cand) = lookup.next_fresh() else { return false };
                 (cand.mh.clone(), cand.addrs.clone())
             };
             if self.dialed.contains(&mh) {
@@ -250,17 +301,18 @@ impl Dht {
                         last_progress: now,
                         want_query: true,
                         want_put: false,
-                        want_get: false,
                     });
-                    busy = true;
+                    return true; // one dial per tick
                 }
                 Err(e) => {
                     eprintln!("[ipns-publisher] dial {}:{} failed: {e}", addr.0, addr.1);
                     self.lookup.as_mut().unwrap().mark(&mh, CandState::Failed);
+                    // a fast-failing dial (bad address) doesn't count as the
+                    // tick's blocking budget; try the next candidate
                 }
             }
         }
-        busy
+        false
     }
 
     fn reap(&mut self, i: usize) {
@@ -279,10 +331,22 @@ impl Dht {
             let stalled = self.conns.is_empty()
                 && self.lookup.as_ref().map(|l| l.next_fresh().is_none()).unwrap_or(true);
             if done || stalled {
-                self.begin_storing();
+                // A recover walk stops at convergence with the best sequence
+                // it found; only a publish walk goes on to store.
+                if self.job == Job::Recover {
+                    self.conns.clear();
+                    self.state = State::Done;
+                    self.last_note = match &self.best_seen {
+                        Some((seq, _)) => format!("recovered sequence {seq} from the DHT"),
+                        None => "no existing record on the DHT (fresh name)".into(),
+                    };
+                    eprintln!("[ipns-publisher] DHT: {}", self.last_note);
+                } else {
+                    self.begin_storing();
+                }
             }
         }
-        if self.state == State::Storing && self.conns.is_empty() {
+        if self.state == State::Storing && self.conns.is_empty() && self.store_queue.is_empty() {
             self.finish_publish("store phase complete");
         }
     }
@@ -299,23 +363,47 @@ impl Dht {
             self.finish_publish("no peers responded to the walk");
             return;
         }
+        // Guard against a stale publish: if the DHT already holds a record at
+        // or above the sequence we are about to store, ours will be rejected.
+        // Recovery should have caught this pre-sign; say so loudly.
+        if let (Some((seen, _)), Ok(mine)) = (&self.best_seen, self.our_sequence()) {
+            if *seen >= mine {
+                eprintln!(
+                    "[ipns-publisher] WARNING: DHT already has sequence {seen} but we are publishing {mine}; \
+                     this record may be rejected as stale. Enable a durable /data volume or a delegate for recovery."
+                );
+            }
+        }
         eprintln!("[ipns-publisher] DHT: walk converged, storing on {} peers", closest.len());
         self.last_note = format!("storing on {} peers", closest.len());
         self.state = State::Storing;
         self.conns.clear();
         self.dialed.clear();
-        for (n, mh) in closest.iter().enumerate() {
+        // Queue the store set; dials happen one per tick in spawn_store_dials
+        // (the same non-blocking discipline as the walk).
+        self.store_queue.clear();
+        for mh in &closest {
             let addrs = self.lookup.as_ref().unwrap().addrs_of(mh);
-            let Some(addr) = addrs.into_iter().next() else {
-                self.stores_failed += 1;
-                continue;
-            };
+            match addrs.into_iter().next() {
+                Some(addr) => self.store_queue.push_back((mh.clone(), addr)),
+                None => self.stores_failed += 1,
+            }
+        }
+    }
+
+    /// Dial one store-set peer per tick (see spawn_dials for the rationale).
+    fn spawn_store_dials(&mut self) -> bool {
+        if self.state != State::Storing {
+            return false;
+        }
+        while self.conns.len() < MAX_DIALS {
+            let Some((mh, addr)) = self.store_queue.pop_front() else { return false };
             match dial_nonblocking(&addr.0, addr.1) {
                 Ok(sock) => {
                     let now = Instant::now();
                     self.conns.push(Conn {
                         sock,
-                        peer_mh: mh.clone(),
+                        peer_mh: mh,
                         addr,
                         phase: Phase::Connecting,
                         rbuf: Vec::new(),
@@ -324,30 +412,27 @@ impl Dht {
                         last_progress: now,
                         want_query: false,
                         want_put: true,
-                        want_get: n == 0, // read back from the closest peer
                     });
+                    return true; // one dial per tick
                 }
-                Err(_) => self.stores_failed += 1,
+                Err(_) => self.stores_failed += 1, // fast-fail; try the next
             }
         }
-        if self.conns.is_empty() {
-            self.finish_publish("no store peers dialable");
-        }
+        false
     }
 
     fn finish_publish(&mut self, why: &str) {
         self.conns.clear();
+        self.store_queue.clear();
         self.state = if self.stores_ok > 0 { State::Done } else { State::Failed };
-        self.last_note = format!(
-            "{why}: {} stored, {} failed{}",
-            self.stores_ok,
-            self.stores_failed,
-            match self.get_result {
-                Some((seq, true)) => format!(", read-back verified seq {seq}"),
-                Some((seq, false)) => format!(", read-back seq {seq} FAILED verify"),
-                None => String::new(),
-            }
-        );
+        // best_seen is what the walk's GET_VALUE queries observed on the DHT
+        // BEFORE we stored — the honest, non-racy statement of prior state.
+        let prior = match &self.best_seen {
+            Some((seq, _)) => format!(", DHT previously held seq {seq}"),
+            None => String::new(),
+        };
+        self.last_note =
+            format!("{why}: {} stored, {} failed{prior}", self.stores_ok, self.stores_failed);
         eprintln!("[ipns-publisher] DHT: {}", self.last_note);
     }
 
@@ -600,10 +685,11 @@ impl Dht {
     fn open_initial_streams(&mut self, i: usize, muxed: &mut Muxed) {
         let c = &self.conns[i];
         let mut kinds = Vec::new();
+        // The walk uses GET_VALUE, not FIND_NODE: go-libp2p answers it with
+        // BOTH the closer peers (so the walk converges) AND the stored record
+        // (so a record is recovered for free as we walk, and best_seen tracks
+        // what the DHT already holds — no separate read-back needed).
         if c.want_query {
-            kinds.push(StreamKind::Query);
-        }
-        if c.want_get {
             kinds.push(StreamKind::GetValue);
         }
         if c.want_put {
@@ -661,7 +747,14 @@ impl Dht {
             && !muxed.streams.is_empty()
             && muxed.streams.iter().all(|s| s.phase == StreamPhase::Done)
         {
-            return (Phase::Dead, true);
+            // Don't drop the socket until our queued bytes (notably a
+            // PUT_VALUE + FIN) have actually left for the peer; closing on
+            // top of an unflushed wbuf would lose the store.
+            let flushed = muxed.out.is_empty() && self.conns[i].wbuf.is_empty();
+            if flushed {
+                return (Phase::Dead, true);
+            }
+            return (Phase::Muxed(muxed), true);
         }
         (Phase::Muxed(muxed), busy)
     }
@@ -724,6 +817,7 @@ impl Dht {
         let mut responded: Vec<Vec<u8>> = Vec::new();
         let mut store_ok = 0usize;
         let mut get_seq: Option<(u64, bool)> = None;
+        let mut found: Option<(u64, Vec<u8>)> = None; // best valid record this pass
         let peer_mh = muxed.remote_mh.clone();
 
         for s in muxed.streams.iter_mut() {
@@ -742,7 +836,6 @@ impl Dht {
                         s.ms_done = true;
                         busy = true;
                         let payload = match s.kind {
-                            StreamKind::Query => kad::find_node(&self.routing_key),
                             StreamKind::GetValue => kad::get_value(&self.routing_key),
                             StreamKind::Put => kad::put_value(&self.routing_key, &self.record),
                         };
@@ -772,17 +865,24 @@ impl Dht {
                     s.phase = StreamPhase::Done;
                     busy = true;
                 }
-                StreamKind::Query | StreamKind::GetValue => {
+                StreamKind::GetValue => {
                     if let Some(msg) = take_varint_frame(&mut s.recv) {
                         busy = true;
                         if let Some(km) = kad::parse_message(&msg) {
                             for p in &km.closer {
                                 walk_updates.push((p.mh.clone(), p.tcp_addrs.clone()));
                             }
+                            trace!("{} GET_VALUE reply: {} closer peers, record={}", short(&peer_mh), km.closer.len(), km.record.is_some());
                             responded.push(peer_mh.clone());
-                            if matches!(s.kind, StreamKind::GetValue) {
-                                if let Some((_k, val)) = &km.record {
-                                    get_seq = Some(verify_get(val, &self.routing_key));
+                            if let Some((_k, val)) = &km.record {
+                                match verify_get(val, &self.routing_key) {
+                                    Some((seq, value)) => {
+                                        get_seq = Some((seq, true));
+                                        if found.as_ref().map(|(s, _)| seq > *s).unwrap_or(true) {
+                                            found = Some((seq, value));
+                                        }
+                                    }
+                                    None => get_seq = Some((0, false)),
                                 }
                             }
                         }
@@ -806,7 +906,20 @@ impl Dht {
         if let Some(g) = get_seq {
             self.get_result = Some(g);
         }
+        if let Some((seq, value)) = found {
+            if self.best_seen.as_ref().map(|(s, _)| seq > *s).unwrap_or(true) {
+                self.best_seen = Some((seq, value));
+            }
+        }
         busy
+    }
+
+    /// The sequence in the record we are about to publish (for the stale-PUT
+    /// guard); Err if no record is staged.
+    fn our_sequence(&self) -> Result<u64, ()> {
+        crate::ipns::parse_record(&self.record)
+            .map(|(rec, _, _)| rec.sequence)
+            .ok_or(())
     }
 
     // ---- status ------------------------------------------------------------
@@ -827,15 +940,13 @@ impl Dht {
     }
 }
 
-fn verify_get(record: &[u8], routing_key: &[u8]) -> (u64, bool) {
+/// Verify a DHT-returned value against the name's key; Some((seq, value)) if
+/// it is a valid record for this name, None otherwise.
+fn verify_get(record: &[u8], routing_key: &[u8]) -> Option<(u64, Vec<u8>)> {
     let mh = &routing_key[6..]; // strip "/ipns/"
-    match crate::ipns::peer_mh_pubkey(mh) {
-        Some(pk) => match crate::ipns::verify_record(record, &pk) {
-            Ok(rec) => (rec.sequence, true),
-            Err(_) => (0, false),
-        },
-        None => (0, false),
-    }
+    let pk = crate::ipns::peer_mh_pubkey(mh)?;
+    let rec = crate::ipns::verify_record(record, &pk).ok()?;
+    Some((rec.sequence, rec.value))
 }
 
 fn state_str(s: State) -> &'static str {
@@ -946,8 +1057,10 @@ fn short(mh: &[u8]) -> String {
 fn dial_nonblocking(host: &str, port: u16) -> Result<TcpStream, String> {
     // dial() goes through the fleet egress and returns a blocking-connected
     // stream (the SOCKS CONNECT completes inline). Non-blocking afterwards so
-    // the rest of the ladder is event-loop friendly.
-    let sock = crate::egress::dial(host, port, Some(Duration::from_secs(15)))?;
+    // the rest of the ladder is event-loop friendly. A tight connect timeout
+    // keeps a dead peer (the DHT is full of stale/unroutable addresses) from
+    // pinning a dial slot for long; there are always more peers to try.
+    let sock = crate::egress::dial(host, port, Some(Duration::from_secs(8)))?;
     sock.set_nonblocking(true).map_err(|e| format!("set_nonblocking: {e}"))?;
     Ok(sock)
 }
