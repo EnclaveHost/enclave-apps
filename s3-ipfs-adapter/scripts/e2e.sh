@@ -416,6 +416,22 @@ ACAO=$(curl -s -o /dev/null -D - -X OPTIONS -H 'origin: https://enclave.host' \
 [ "$ACAO" = "https://enclave.host" ] || fail "preflight allow-origin '$ACAO'"
 pass "CORS preflight echoes the allowed origin"
 
+# An over-cap /add-json (2 MB vs the 1 MiB ceiling) must be refused from the
+# Content-Length alone, before the body is buffered - the parser enforces the
+# per-route cap, so an unauthenticated client can't force 32 MiB of buffering
+# on a 1 MiB route (guest-OOM regression).
+head -c $((2 * 1024 * 1024)) /dev/urandom > "$WORK/toobig.json"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary "@$WORK/toobig.json" \
+  -H 'content-type: application/json' "$BASE2/add-json")
+[ "$code" = 413 ] || fail "over-cap /add-json -> $code (want 413)"
+pass "per-route body cap enforced pre-buffer (413)"
+
+# Two conflicting Content-Length headers -> 400 (request-smuggling desync).
+code=$(printf 'POST /add-json HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntest' \
+  | { exec 3<>/dev/tcp/127.0.0.1/$APP2_PORT; cat >&3; head -c 20 <&3; } | grep -o '40[0-9]' | head -1)
+[ "$code" = 400 ] || fail "duplicate Content-Length -> '$code' (want 400)"
+pass "duplicate Content-Length refused (400)"
+
 echo
 OK=1
 echo "ALL PASS"

@@ -81,6 +81,14 @@ pub trait Sink {
 /// for this long is gone. (Deliberately not a total-body deadline — a slow
 /// but live 2 GiB upload must keep its connection.)
 const RECV_STALL: Duration = Duration::from_secs(90);
+/// Minimum sustained upload throughput once past the grace window. A trickle
+/// slower than this is a slowloris holding an upload slot, not a slow client
+/// (this floor is far below any real uploader, so it never reaps a genuine
+/// upload). Bounds how long the four slots can be pinned by dead weight.
+const RECV_GRACE: Duration = Duration::from_secs(120);
+const MIN_RECV_RATE: u64 = 8 * 1024; // bytes/sec
+/// Cap on body bytes handed to a Sink per poll (see the RecvBody feed site).
+const MAX_FEED_PER_POLL: usize = 16 * 1024 * 1024;
 
 pub struct Request {
     pub method: String,
@@ -135,7 +143,7 @@ pub fn json(status: u16, reason: &'static str, body: String) -> Response {
 enum ConnState {
     Http { since: Instant, reading_body: bool },
     Streaming { src: Box<dyn Body>, chunked: bool },
-    RecvBody { sink: Box<dyn Sink>, remaining: u64 },
+    RecvBody { sink: Box<dyn Sink>, remaining: u64, body_len: u64, started: Instant },
     Closing, // flush wbuf, then drop
 }
 
@@ -211,20 +219,20 @@ impl Server {
     /// (conn_key, Request); answer each with respond()/respond_stream()
     /// before the next poll (a key is only stable until then).
     ///
-    /// `max_body` caps ordinary request bodies; targets under any of
-    /// `big_prefixes` (upload routes) are allowed `big_body` instead,
-    /// decided from the request line once the header block is complete.
-    /// Targets under `stream_prefix` are not buffered at all: the request is
-    /// emitted at end-of-headers with `stream_len` set, and the body is
-    /// consumed by the Sink the app registers via `begin_body`.
+    /// `max_body` caps ordinary request bodies; a target matching a prefix in
+    /// `big_routes` gets THAT route's cap (each buffered upload route has its
+    /// own ceiling — a blanket cap over-buffers the smaller routes). Targets
+    /// under `stream_prefix` are not buffered at all: the request is emitted
+    /// at end-of-headers with `stream_len` set, and the body is consumed by
+    /// the Sink the app registers via `begin_body`.
     pub fn poll(
         &mut self,
         max_body: usize,
-        big_body: usize,
-        big_prefixes: &[&str],
+        big_routes: &[(&str, usize)],
         stream_prefix: &str,
     ) -> Vec<(usize, Request)> {
-        let read_cap = MAX_HEADER_BYTES + max_body.max(big_body);
+        let biggest = big_routes.iter().map(|(_, c)| *c).max().unwrap_or(0);
+        let read_cap = MAX_HEADER_BYTES + max_body.max(biggest);
         // Accept.
         loop {
             match self.listener.accept() {
@@ -309,13 +317,24 @@ impl Server {
                     }
                 }
             }
-            // A registered sink consumes body bytes as they arrive.
-            if let ConnState::RecvBody { sink, remaining } = &mut conn.state {
+            // A registered sink consumes body bytes as they arrive. Bounded
+            // per poll (MAX_FEED_PER_POLL): one read can accumulate a large
+            // rbuf, and feeding it whole would flush many S3 parts back to
+            // back, freezing every other connection (including in-flight
+            // gateway downloads) for the whole run. Capping the feed spreads
+            // the blocking S3 work across polls; the rest of rbuf waits for
+            // the next one.
+            if let ConnState::RecvBody { sink, remaining, .. } = &mut conn.state {
                 if !conn.rbuf.is_empty() && *remaining > 0 {
-                    let take = (*remaining).min(conn.rbuf.len() as u64) as usize;
+                    let take = (*remaining)
+                        .min(conn.rbuf.len() as u64)
+                        .min(MAX_FEED_PER_POLL as u64) as usize;
                     let fed = sink.feed(&conn.rbuf[..take]);
                     conn.rbuf.drain(..take);
                     *remaining -= take as u64;
+                    if take > 0 {
+                        conn.last_activity = Instant::now();
+                    }
                     if let Err(resp) = fed {
                         conn.keep_alive = false;
                         write_response(conn, app, resp, false);
@@ -323,7 +342,7 @@ impl Server {
                         continue;
                     }
                 }
-                if let ConnState::RecvBody { sink, remaining } = &mut conn.state {
+                if let ConnState::RecvBody { sink, remaining, .. } = &mut conn.state {
                     if *remaining == 0 {
                         let resp = sink.finish();
                         let keep = conn.keep_alive && resp.status < 500;
@@ -345,7 +364,7 @@ impl Server {
                 continue; // emitted last poll; the app answers before this one
             }
             if let ConnState::Http { since, reading_body } = &mut conn.state {
-                match try_parse(&mut conn.rbuf, max_body, big_body, big_prefixes, stream_prefix) {
+                match try_parse(&mut conn.rbuf, max_body, big_routes, stream_prefix) {
                     Parse::Complete(req) => {
                         if req
                             .header("connection")
@@ -394,7 +413,12 @@ impl Server {
             conn.wbuf.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
         }
         conn.pending_expect = false;
-        conn.state = ConnState::RecvBody { sink, remaining };
+        conn.state = ConnState::RecvBody {
+            sink,
+            remaining,
+            body_len: remaining,
+            started: Instant::now(),
+        };
     }
 
     pub fn respond(&mut self, key: usize, resp: Response) {
@@ -564,9 +588,23 @@ fn flush_conn(conn: &mut Conn, now: Instant, busy: &mut bool) -> bool {
     match &conn.state {
         ConnState::Closing => !conn.wbuf.is_empty(),
         ConnState::Streaming { .. } => true,
-        // A streaming upload is timed on inactivity, not a total-body
-        // deadline: a slow 2 GiB body must live, a silent peer must not.
-        ConnState::RecvBody { .. } => now.duration_since(conn.last_activity) < RECV_STALL,
+        // A streaming upload is timed on inactivity (a silent peer), plus a
+        // throughput floor past a grace window (a trickle that stays under
+        // RECV_STALL forever but moves almost nothing, pinning an upload
+        // slot). A genuine slow 2 GiB body clears both.
+        ConnState::RecvBody { remaining, body_len, started, .. } => {
+            if now.duration_since(conn.last_activity) >= RECV_STALL {
+                return false;
+            }
+            let elapsed = now.duration_since(*started);
+            if elapsed > RECV_GRACE {
+                let fed = body_len.saturating_sub(*remaining);
+                if fed < MIN_RECV_RATE.saturating_mul(elapsed.as_secs()) {
+                    return false; // below the throughput floor
+                }
+            }
+            true
+        }
         ConnState::Http { since, reading_body } => {
             let idle = now.duration_since(conn.last_activity);
             if conn.rbuf.is_empty() && !reading_body && conn.pending_stream.is_none() {
@@ -624,8 +662,7 @@ enum Parse {
 fn try_parse(
     rbuf: &mut Vec<u8>,
     max_body: usize,
-    big_body: usize,
-    big_prefixes: &[&str],
+    big_routes: &[(&str, usize)],
     stream_prefix: &str,
 ) -> Parse {
     let Some(head_end) = find_crlfcrlf(rbuf) else {
@@ -654,12 +691,14 @@ fn try_parse(
     }
     let mut headers = Vec::new();
     let mut content_length: usize = 0;
+    let mut cl_seen = 0u32;
     let mut has_te = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else { continue };
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim().to_string();
         if name == "content-length" {
+            cl_seen += 1;
             content_length = match value.parse() {
                 Ok(n) => n,
                 Err(_) => return Parse::Bad(400, "Bad Request"),
@@ -673,6 +712,13 @@ fn try_parse(
     if has_te {
         return Parse::Bad(501, "Not Implemented"); // no chunked requests
     }
+    // Conflicting/duplicate Content-Length is a request-smuggling desync
+    // primitive (RFC 9112 §6.3): if a hop in front resolves the length
+    // differently than we do, the two disagree on where this body ends and
+    // the next request begins. Refuse rather than pick a winner.
+    if cl_seen > 1 {
+        return Parse::Bad(400, "Bad Request");
+    }
     let bare_target = target.split('?').next().unwrap_or("");
     // A streaming route's body is not buffered: emit the request at
     // end-of-headers and let the app's Sink consume the body. Its size cap
@@ -681,11 +727,16 @@ fn try_parse(
         && bare_target.starts_with(stream_prefix)
         && method == "POST"
         && content_length > 0;
-    let cap = if big_prefixes.iter().any(|p| bare_target.starts_with(p)) {
-        big_body
-    } else {
-        max_body
-    };
+    // Per-route cap, enforced against Content-Length BEFORE a byte is
+    // buffered (as the reference gateway's Caddy did). A single blanket
+    // "big body" cap let an unauthenticated client force the largest cap's
+    // worth of buffering on the smallest-cap route (e.g. 32 MiB on /add-json,
+    // whose real ceiling is 1 MiB) - MAX_CONNS of those OOMs a wasm32 guest.
+    let cap = big_routes
+        .iter()
+        .find(|(p, _)| bare_target.starts_with(p))
+        .map(|(_, c)| *c)
+        .unwrap_or(max_body);
     if !is_stream && content_length > cap {
         return Parse::Bad(413, "Payload Too Large");
     }
@@ -782,6 +833,78 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROUTES: [(&str, usize); 3] =
+        [("/api/upload", 32 * 1024 * 1024), ("/add-json", 1024 * 1024), ("/add-image", 4 * 1024 * 1024)];
+
+    fn parse(head: &str) -> Parse {
+        let mut rbuf = head.as_bytes().to_vec();
+        try_parse(&mut rbuf, 16 * 1024, &ROUTES, "/add-wasm")
+    }
+
+    #[test]
+    fn per_route_cap_rejects_before_buffering() {
+        // 2 MB to /add-json (1 MiB cap) is refused from the Content-Length
+        // alone - the HIGH regression: a blanket 32 MiB cap would have let
+        // this buffer. Same size to /api/upload (32 MiB cap) is accepted.
+        assert!(matches!(
+            parse("POST /add-json HTTP/1.1\r\ncontent-length: 2000000\r\n\r\n"),
+            Parse::Bad(413, _)
+        ));
+        assert!(matches!(
+            parse("POST /add-image HTTP/1.1\r\ncontent-length: 5000000\r\n\r\n"),
+            Parse::Bad(413, _)
+        ));
+        assert!(matches!(
+            parse("POST /api/upload?path=x HTTP/1.1\r\ncontent-length: 2000000\r\n\r\n"),
+            Parse::Partial { in_body: true }
+        ));
+        // an unlisted route falls back to max_body (16 KiB)
+        assert!(matches!(
+            parse("POST /whatever HTTP/1.1\r\ncontent-length: 200000\r\n\r\n"),
+            Parse::Bad(413, _)
+        ));
+    }
+
+    #[test]
+    fn duplicate_content_length_refused() {
+        assert!(matches!(
+            parse("POST /add-json HTTP/1.1\r\ncontent-length: 10\r\ncontent-length: 20\r\n\r\n"),
+            Parse::Bad(400, _)
+        ));
+    }
+
+    #[test]
+    fn streaming_route_emits_headers_only() {
+        match parse("POST /add-wasm HTTP/1.1\r\ncontent-length: 100000000\r\n\r\n") {
+            Parse::Complete(req) => {
+                assert_eq!(req.stream_len, Some(100_000_000));
+                assert!(req.body.is_empty()); // body NOT buffered
+            }
+            other => panic!("expected Complete, got {}", parse_kind(&other)),
+        }
+    }
+
+    #[test]
+    fn transfer_encoding_still_refused() {
+        assert!(matches!(
+            parse("POST /add-wasm HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n"),
+            Parse::Bad(501, _)
+        ));
+    }
+
+    fn parse_kind(p: &Parse) -> &'static str {
+        match p {
+            Parse::Complete(_) => "Complete",
+            Parse::Partial { .. } => "Partial",
+            Parse::Bad(..) => "Bad",
+        }
     }
 }
 

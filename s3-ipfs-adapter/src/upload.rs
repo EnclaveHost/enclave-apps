@@ -108,7 +108,46 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Reserve nbytes against the per-wallet + global daily caps.
+fn roll_day(sh: &mut Shared) {
+    let day = now_secs() / 86400;
+    if sh.day != day {
+        sh.day = day;
+        sh.global = 0;
+        sh.addr.clear();
+    }
+}
+
+/// Reserve nbytes against the FLEET (global) daily cap only. Keyed on nothing
+/// but the total, so it cannot be used to grief a specific wallet's budget -
+/// which is why the streaming route reserves this at header time (before the
+/// wallet is verified) and refunds it on any failure.
+fn reserve_global(sh: &mut Shared, global_daily: u64, n: u64) -> Result<(), String> {
+    roll_day(sh);
+    if sh.global + n > global_daily {
+        return Err("fleet daily upload limit reached; retry tomorrow".into());
+    }
+    sh.global += n;
+    Ok(())
+}
+
+fn release_global(sh: &mut Shared, n: u64) {
+    sh.global = sh.global.saturating_sub(n);
+}
+
+/// Reserve against one wallet's daily cap. Only ever called post-auth (a
+/// verified address), so it cannot be griefed by a forged X-Upload-Address.
+fn reserve_addr(sh: &mut Shared, per_addr_daily: u64, address: &str, n: u64) -> Result<(), String> {
+    roll_day(sh);
+    let used = sh.addr.get(address).copied().unwrap_or(0);
+    if used + n > per_addr_daily {
+        return Err("this wallet's daily upload limit reached; retry tomorrow".into());
+    }
+    sh.addr.insert(address.to_string(), used + n);
+    Ok(())
+}
+
+/// Reserve nbytes against the per-wallet + global daily caps atomically (the
+/// buffered routes, where the wallet is already verified).
 fn reserve_bytes(
     sh: &mut Shared,
     per_addr_daily: u64,
@@ -116,21 +155,11 @@ fn reserve_bytes(
     address: &str,
     n: u64,
 ) -> Result<(), String> {
-    let day = now_secs() / 86400;
-    if sh.day != day {
-        sh.day = day;
-        sh.global = 0;
-        sh.addr.clear();
+    reserve_global(sh, global_daily, n)?;
+    if let Err(e) = reserve_addr(sh, per_addr_daily, address, n) {
+        release_global(sh, n); // roll back the global half
+        return Err(e);
     }
-    if sh.global + n > global_daily {
-        return Err("fleet daily upload limit reached; retry tomorrow".into());
-    }
-    let used = sh.addr.get(address).copied().unwrap_or(0);
-    if used + n > per_addr_daily {
-        return Err("this wallet's daily upload limit reached; retry tomorrow".into());
-    }
-    sh.global += n;
-    sh.addr.insert(address.to_string(), used + n);
     Ok(())
 }
 
@@ -445,6 +474,18 @@ pub fn add_wasm(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
         if sh.slots >= UPLOAD_SLOTS {
             return refuse(srv, conn, req, cfg, 429, "too many concurrent uploads; retry shortly");
         }
+        // Reserve the declared size against the FLEET daily budget up front,
+        // before a single body byte (and so before any S3 multipart write on
+        // the >8 MiB path). The token can only be checked once the whole body
+        // has streamed, so without this a well-formed-but-forged token drives
+        // unbounded pre-auth S3 churn - the daily ceiling never engaged
+        // because it was only reserved on success. Global-only (never keyed
+        // on the unverified address), and refunded on every failure/abort, so
+        // it bounds cost without letting a forged address grief a wallet or
+        // permanently burn the fleet budget.
+        if let Err(msg) = reserve_global(&mut sh, cfg.global_daily, declared) {
+            return refuse(srv, conn, req, cfg, 429, &msg);
+        }
         sh.slots += 1;
         sh.seq += 1;
     }
@@ -471,7 +512,7 @@ pub fn add_wasm(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
         pin_prefix: format!("{}{}", app.cfg.prefix, PIN_PREFIX),
         staging,
         per_addr_daily: cfg.per_addr_daily,
-        global_daily: cfg.global_daily,
+        global_held: declared, // the provisional fleet-budget reservation
         small: declared as usize <= PART_SIZE,
         buf: Vec::new(),
         upload_id: None,
@@ -496,7 +537,7 @@ struct WasmSink {
     pin_prefix: String,
     staging: String,
     per_addr_daily: u64,
-    global_daily: u64,
+    global_held: u64, // fleet-budget bytes reserved provisionally (0 once settled)
     small: bool,    // whole body fits one part: buffer, skip multipart
     buf: Vec<u8>,   // small: whole body; big: the part being filled
     upload_id: Option<String>,
@@ -521,7 +562,17 @@ impl WasmSink {
 
     fn fail(&mut self, code: u16, reason: &'static str, msg: &str) -> Response {
         self.cleanup_upstream();
+        self.refund_global(); // a failed upload does not consume fleet budget
         self.resp(code, reason, format!("{{\"error\":\"{}\"}}", json_escape(msg)))
+    }
+
+    /// Release any still-provisional fleet-budget reservation. Idempotent
+    /// (zeroes the held amount), so fail()/abort()/Drop can all call it.
+    fn refund_global(&mut self) {
+        let n = std::mem::take(&mut self.global_held);
+        if n > 0 {
+            release_global(&mut self.shared.borrow_mut(), n);
+        }
     }
 
     fn cleanup_upstream(&mut self) {
@@ -610,16 +661,19 @@ impl Sink for WasmSink {
                 let reason = if code == 401 { "Unauthorized" } else { "Forbidden" };
                 return self.fail(code, reason, &msg);
             }
-            let reserved = reserve_bytes(
-                &mut self.shared.borrow_mut(),
-                self.per_addr_daily,
-                self.global_daily,
-                &a.address,
-                self.fed,
-            );
+            // The fleet-budget bytes are already held (reserved at header
+            // time on `declared`, which equals `fed` for a completed body):
+            // settle that hold as consumed and add only the per-WALLET half,
+            // now that the address is verified. A wallet over budget releases
+            // the fleet hold too, so a refused upload consumes neither.
+            // Bind in its own statement so the RefMut temporary is dropped
+            // before self.fail() may take &mut self.
+            let reserved =
+                reserve_addr(&mut self.shared.borrow_mut(), self.per_addr_daily, &a.address, self.fed);
             if let Err(msg) = reserved {
                 return self.fail(429, "Too Many Requests", &msg);
             }
+            self.global_held = 0; // consumed: the successful upload keeps its fleet bytes
         }
         if let Some(msg) = self.scan.accept_error() {
             return self.fail(415, "Unsupported Media Type", &msg);
@@ -685,12 +739,20 @@ impl Sink for WasmSink {
 
     fn abort(&mut self) {
         self.cleanup_upstream();
+        self.refund_global(); // a connection that died mid-body consumed nothing
     }
 }
 
 impl Drop for WasmSink {
     fn drop(&mut self) {
+        // Backstop: any reservation not settled by finish()/fail()/abort() is
+        // refunded here (e.g. the sink dropped on a reap the loop did not route
+        // through abort). borrow the shared state once for both.
+        let held = std::mem::take(&mut self.global_held);
         let mut sh = self.shared.borrow_mut();
         sh.slots = sh.slots.saturating_sub(1);
+        if held > 0 {
+            release_global(&mut sh, held);
+        }
     }
 }

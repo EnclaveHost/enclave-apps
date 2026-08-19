@@ -174,8 +174,14 @@ fn check_element(el: &Element) -> Option<String> {
                 "SVG references must be internal (#id) or embedded raster data: URIs".into(),
             );
         }
-        if lname == "attributename" && (sval == "href" || sval == "xlink:href") {
-            return Some("SVG must not animate href attributes".into());
+        if lname == "attributename" {
+            // Animating href re-points a link; animating an on* handler
+            // (<set attributeName="onclick" to="…"/>) is a known SVG XSS
+            // vector the element/attribute scan misses, because the dangerous
+            // name rides as a VALUE here rather than as an attribute.
+            if sval == "href" || sval == "xlink:href" || sval.starts_with("on") {
+                return Some("SVG must not animate href or event-handler attributes".into());
+            }
         }
         // url() is not only a CSS thing: fill/stroke/filter/mask/clip-path/
         // marker-* take a funciri too, and `fill="url(https://evil/x)"` is an
@@ -595,6 +601,10 @@ mod tests {
             .contains("script URLs"));
         assert!(err(r##"<svg xmlns="http://www.w3.org/2000/svg"><animate attributeName="href" to="#x"/></svg>"##)
             .contains("animate href"));
+        // animating an event-handler attribute is an XSS vector even though
+        // `onclick` is a value here, not an attribute the element scan sees
+        assert!(err(r##"<svg xmlns="http://www.w3.org/2000/svg"><set attributeName="onclick" to="alert(1)"/></svg>"##)
+            .contains("event-handler"));
     }
 
     #[test]

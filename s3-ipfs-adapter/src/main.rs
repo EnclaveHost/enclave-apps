@@ -744,14 +744,21 @@ fn main() {
         recent_uploads: Vec::new(),
     };
     let mut srv = Server::bind(APP, 8000);
+    // Per-route buffered-body caps, enforced in the parser against
+    // Content-Length before anything is buffered. The pin routes use their
+    // CONFIGURED ceilings (defaults 1 MiB / 4 MiB) so an unauthenticated
+    // request can never make the parser buffer more than that route allows;
+    // /add-wasm is streamed, capped by the app in add_wasm().
+    let json_cap = app.cfg.upload.as_ref().map_or(MAX_BODY, |u| u.max_json);
+    let image_cap = app.cfg.upload.as_ref().map_or(MAX_BODY, |u| u.max_image);
+    let big_routes: [(&str, usize); 3] = [
+        ("/api/upload", MAX_UPLOAD),
+        ("/add-json", json_cap),
+        ("/add-image", image_cap),
+    ];
     let mut tick: u64 = 0;
     loop {
-        for (key, req) in srv.poll(
-            MAX_BODY,
-            MAX_UPLOAD,
-            &["/api/upload", "/add-json", "/add-image"],
-            "/add-wasm",
-        ) {
+        for (key, req) in srv.poll(MAX_BODY, &big_routes, "/add-wasm") {
             route(&mut app, &mut srv, key, &req);
         }
         merge_commits(&mut app);
