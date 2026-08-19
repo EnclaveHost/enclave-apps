@@ -349,6 +349,55 @@ static void wm_delete_setup(void)
         uint32_t atom;
     } cp;
 
+    // WM_HINTS first: without an input hint the WM has no license to give
+    // this window keyboard focus — fluxbox never focuses it, keys land in
+    // whatever was focused before, and the game looks deaf: the menu cannot
+    // open, so its QUIT is unreachable. XA_WM_HINTS is predefined atom 35.
+    struct {
+        uint8_t op, mode;
+        uint16_t len;
+        uint32_t win, prop, type;
+        uint8_t fmt, pad[3];
+        uint32_t n;
+        uint32_t hints[9];
+    } wh;
+    wh.op = 18;                   // ChangeProperty
+    wh.mode = 0;
+    wh.len = sizeof(wh) / 4;
+    wh.win = win;
+    wh.prop = 35;                 // XA_WM_HINTS
+    wh.type = 35;
+    wh.fmt = 32;
+    memset(wh.pad, 0, sizeof(wh.pad));
+    wh.n = 9;
+    memset(wh.hints, 0, sizeof(wh.hints));
+    wh.hints[0] = 1 | 2;          // InputHint | StateHint
+    wh.hints[1] = 1;              // input = True
+    wh.hints[2] = 1;              // NormalState
+    wr(&wh, sizeof(wh));
+
+    // A name, so the taskbar stops saying "Unnamed". XA_WM_NAME 39, STRING 31.
+    static const char name[] = "FreeDoom";
+    struct {
+        uint8_t op, mode;
+        uint16_t len;
+        uint32_t win, prop, type;
+        uint8_t fmt, pad[3];
+        uint32_t n;
+        char text[8];
+    } wn;
+    wn.op = 18;
+    wn.mode = 0;
+    wn.len = sizeof(wn) / 4;
+    wn.win = win;
+    wn.prop = 39;                 // XA_WM_NAME
+    wn.type = 31;                 // XA_STRING
+    wn.fmt = 8;
+    memset(wn.pad, 0, sizeof(wn.pad));
+    wn.n = 8;
+    memcpy(wn.text, name, 8);
+    wr(&wn, sizeof(wn));
+
     wm_protocols = intern_atom("WM_PROTOCOLS");
     wm_delete = intern_atom("WM_DELETE_WINDOW");
     if (!wm_protocols || !wm_delete)
