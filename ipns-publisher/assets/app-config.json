@@ -1,6 +1,6 @@
 {
   "ipnsKey": "$IPNS_ED25519_SK",
-  "value": "/ipfs/bafy...",
+  "value": "/ipfs/<site-root-cid>",
   "lifetimeSecs": 172800,
   "republishSecs": 14400,
   "ttlSecs": 3600,
