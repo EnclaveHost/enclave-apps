@@ -58,10 +58,12 @@ struct Config {
 /// These are the long-lived Protocol Labs bootstrappers; config `bootstrap`
 /// replaces the list wholesale.
 const DEFAULT_BOOTSTRAP: &[&str] = &[
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+    // the canonical bootstrap.libp2p.io set, in its stable /dns/…/tcp/4001
+    // form (the /dnsaddr umbrella needs TXT lookups the fleet cannot do)
+    "/dns/am6.bootstrap.libp2p.io/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    "/dns/ny5.bootstrap.libp2p.io/tcp/4001/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+    "/dns/sg1.bootstrap.libp2p.io/tcp/4001/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+    "/dns/sv15.bootstrap.libp2p.io/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ];
 
@@ -421,10 +423,11 @@ impl App {
         let Some(record) = self.record.clone() else { return };
         let Some(id) = &self.cfg.identity else { return };
         let key = id.routing_key();
+        let signing = id.signing.clone();
         match &mut self.dht {
             Some(dht) => dht.publish(key, record),
             None => {
-                let mut dht = p2p::Dht::new(self.cfg.bootstrap.clone());
+                let mut dht = p2p::Dht::new(self.cfg.bootstrap.clone(), signing);
                 dht.publish(key, record);
                 self.dht = Some(dht);
             }
@@ -631,6 +634,36 @@ fn main() {
             println!("peer-id:   {}", id.peer_id());
             println!("ipns-name: {}", id.ipns_name());
             println!("routing:   {}", multiformats::hex(&id.routing_key()));
+        }
+        // dhtpublish <key> <value> [ttl-secs] — build a record and PUT it on
+        // the public DHT, driving the engine to completion with live logging.
+        Some("dhtpublish") => {
+            let id = Identity::parse(&args[2]).expect("parse key");
+            let value = args[3].as_bytes().to_vec();
+            let ttl_secs: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3600);
+            let validity = ipns::rfc3339(now_unix() + 48 * 3600);
+            let record = ipns::build_record(&id, &value, &validity, 1, ttl_secs * 1_000_000_000)
+                .expect("build record");
+            eprintln!("[dhtpublish] name {} ({} record bytes)", id.ipns_name(), record.len());
+            let bootstrap: Vec<String> = DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect();
+            let mut dht = p2p::Dht::new(bootstrap, id.signing.clone());
+            dht.publish(id.routing_key(), record);
+            let start = Instant::now();
+            loop {
+                let busy = dht.drive();
+                let line = dht.status_line();
+                if line.starts_with("done") || line.starts_with("failed") {
+                    println!("[dhtpublish] {line}");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(200) {
+                    println!("[dhtpublish] gave up after 200s: {line}");
+                    break;
+                }
+                if !busy {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
         Some("mkrecord") => {
             let id = Identity::parse(&args[2]).expect("parse key");

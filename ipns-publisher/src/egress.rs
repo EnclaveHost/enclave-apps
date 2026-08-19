@@ -11,7 +11,7 @@
 //! deployment's dedicated address) is drained and discarded here.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// Connect to `host:port` — through the SOCKS front when one is configured.
@@ -26,15 +26,28 @@ pub fn dial(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStrea
 fn direct(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, String> {
     match timeout {
         Some(t) => {
-            // connect_timeout wants a resolved SocketAddr; NAT hands us IPs
-            let ip: IpAddr = host
-                .parse()
-                .map_err(|_| format!("connect_timeout needs an IP, got {host}"))?;
-            TcpStream::connect_timeout(&SocketAddr::new(ip, port), t)
+            // connect_timeout wants a resolved SocketAddr. A literal IP is
+            // used directly; a name is resolved (the local, no-egress path —
+            // on the fleet, names resolve remotely at the SOCKS relay), and
+            // each resolved address is tried until one connects.
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                return TcpStream::connect_timeout(&SocketAddr::new(ip, port), t)
+                    .map_err(|e| format!("connect {host}:{port}: {e}"));
+            }
+            let addrs = (host, port)
+                .to_socket_addrs()
+                .map_err(|e| format!("resolve {host}: {e}"))?;
+            let mut last = format!("no addresses for {host}");
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, t) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last = format!("connect {addr}: {e}"),
+                }
+            }
+            Err(last)
         }
-        None => TcpStream::connect((host, port)),
+        None => TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}")),
     }
-    .map_err(|e| format!("connect {host}:{port}: {e}"))
 }
 
 fn socks_connect(url: &str, host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, String> {

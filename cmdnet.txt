@@ -1,0 +1,1 @@
+echo NET:; wget -q -T 8 -O /dev/null https://dl-cdn.alpinelinux.org/alpine/edge/main/riscv64/APKINDEX.tar.gz 2>&1 && echo NET_OK || echo NET_FAIL
