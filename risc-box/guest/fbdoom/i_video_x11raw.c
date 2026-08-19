@@ -30,6 +30,7 @@
 #include "m_argv.h"
 #include "d_event.h"
 #include "d_main.h"
+#include "i_system.h"
 #include "i_video.h"
 #include "z_zone.h"
 #include "tables.h"
@@ -233,6 +234,8 @@ static int x_setup(void)
     return 0;
 }
 
+static void wm_delete_setup(void);
+
 static void x_create_window(void)
 {
     struct {
@@ -274,6 +277,12 @@ static void x_create_window(void)
     cw.events = 0x00000001 | 0x00000002 | 0x00008000 | 0x00010000 | 0x00020000;
     wr(&cw, sizeof(cw));
 
+    // Register for the WM's close button BEFORE the map: the window manager
+    // reads WM_PROTOCOLS when it starts managing the window, and a property
+    // that arrives after MapWindow was never seen — the close button then
+    // falls back to XKillClient.
+    wm_delete_setup();
+
     mw.op = 8;
     mw.pad = 0;
     mw.len = 2;
@@ -288,6 +297,112 @@ static void x_create_window(void)
     cg.drawable = win;
     cg.mask = 0;
     wr(&cg, sizeof(cg));
+}
+
+// ------------------------------------------------- window-manager close ---
+// The WM's close button is a ClientMessage carrying WM_DELETE_WINDOW — but
+// only to clients that registered for it. Without this the button falls back
+// to XKillClient: the frame vanishes while the game keeps running headless,
+// which on the desktop read as "closing DOOM doesn't close DOOM".
+static uint32_t wm_protocols, wm_delete;
+
+static uint32_t intern_atom(const char *name)
+{
+    size_t n = strlen(name);
+    size_t pad = (4 - (n & 3)) & 3;
+    static const uint8_t zeros[4];
+    struct {
+        uint8_t op, only;
+        uint16_t len;
+        uint16_t nlen, pad2;
+    } req;
+    uint8_t reply[32];
+
+    req.op = 16;                  // InternAtom
+    req.only = 0;
+    req.len = 2 + (n + pad) / 4;
+    req.nlen = n;
+    req.pad2 = 0;
+    if (wr(&req, sizeof(req)) < 0 || wr((void *)name, n) < 0)
+        return 0;
+    if (pad && wr((void *)zeros, pad) < 0)
+        return 0;
+    // Synchronous: the event pump is not running yet, and nothing else with a
+    // reply is outstanding. Anything that is not a reply (an early MapNotify,
+    // an error) is a 32-byte unit, already consumed by the read.
+    for (;;) {
+        if (rd(reply, 32) < 0)
+            return 0;
+        if (reply[0] == 1)
+            return *(uint32_t *)(reply + 8);
+    }
+}
+
+static void wm_delete_setup(void)
+{
+    struct {
+        uint8_t op, mode;
+        uint16_t len;
+        uint32_t win, prop, type;
+        uint8_t fmt, pad[3];
+        uint32_t n;
+        uint32_t atom;
+    } cp;
+
+    wm_protocols = intern_atom("WM_PROTOCOLS");
+    wm_delete = intern_atom("WM_DELETE_WINDOW");
+    if (!wm_protocols || !wm_delete)
+        return;
+    cp.op = 18;                   // ChangeProperty
+    cp.mode = 0;                  // Replace
+    cp.len = sizeof(cp) / 4;
+    cp.win = win;
+    cp.prop = wm_protocols;
+    cp.type = 4;                  // ATOM
+    cp.fmt = 32;
+    memset(cp.pad, 0, sizeof(cp.pad));
+    cp.n = 1;
+    cp.atom = wm_delete;
+    wr(&cp, sizeof(cp));
+
+    // Read it back: a silent X error would otherwise leave the protocol
+    // unregistered with nothing in the log to say so.
+    struct {
+        uint8_t op, del;
+        uint16_t len;
+        uint32_t win, prop, type, off, count;
+    } gp;
+    uint8_t reply[32];
+    gp.op = 20;                   // GetProperty
+    gp.del = 0;
+    gp.len = sizeof(gp) / 4;
+    gp.win = win;
+    gp.prop = wm_protocols;
+    gp.type = 0;                  // AnyPropertyType
+    gp.off = 0;
+    gp.count = 8;
+    wr(&gp, sizeof(gp));
+    for (;;) {
+        if (rd(reply, 32) < 0)
+            return;
+        if (reply[0] == 0) {
+            printf("wm_delete_setup: X error code %d on seq %u\n",
+                   reply[1], *(uint16_t *)(reply + 2));
+            continue;
+        }
+        if (reply[0] != 1)
+            continue;
+        uint32_t vlen = *(uint32_t *)(reply + 4) * 4;
+        uint32_t rtype = *(uint32_t *)(reply + 8);
+        uint32_t nitems = *(uint32_t *)(reply + 16);
+        uint8_t buf[64];
+        uint32_t got = vlen > sizeof(buf) ? sizeof(buf) : vlen;
+        if (got && rd(buf, got) < 0)
+            return;
+        printf("wm_delete_setup: readback type=%u fmt=%d items=%u first=%u\n",
+               rtype, reply[1], nitems, nitems ? *(uint32_t *)buf : 0);
+        break;
+    }
 }
 
 // Map the framebuffer for the overlay path. Failure is not fatal: without it
@@ -404,6 +519,7 @@ void I_InitGraphics(void)
 {
     int i;
 
+    setvbuf(stdout, NULL, _IONBF, 0);
     xfd = x_connect();
     if (xfd < 0) {
         printf("I_InitGraphics: cannot reach the X server on %s\n", getenv("DISPLAY"));
@@ -445,6 +561,9 @@ void I_InitGraphics(void)
     memset(img, 0, (size_t)win_w * win_h * 4);
 
     x_create_window();
+    printf("I_InitGraphics: WM_DELETE_WINDOW %s (atoms %u/%u)\n",
+           wm_protocols && wm_delete ? "registered" : "UNAVAILABLE",
+           wm_protocols, wm_delete);
 
     I_VideoBuffer = (byte *)Z_Malloc(SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
     screenvisible = true;
@@ -831,6 +950,11 @@ static void x_pump(int blocking)
     uint8_t ev[32];
     event_t e;
 
+    // TryRunTics polls input BEFORE I_InitGraphics has connected: xfd is
+    // still 0 and every read fails. That must stay a quiet no-op — treating
+    // it as "the server hung up" exited the game before its window existed.
+    if (xfd <= 0)
+        return;
     for (;;) {
         ssize_t n;
         int fl = fcntl(xfd, F_GETFL, 0);
@@ -839,6 +963,13 @@ static void x_pump(int blocking)
         n = read(xfd, ev, sizeof(ev));
         if (!blocking)
             fcntl(xfd, F_SETFL, fl);
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK
+                             && errno != EINTR)) {
+            // The server hung up — the WM killed the window out from under
+            // us (a client without WM_DELETE gets XKillClient). Nothing left
+            // to draw to or hear from: leave, instead of ticking headless.
+            exit(0);
+        }
         if (n != (ssize_t)sizeof(ev))
             return;
         blocking = 0;   // one blocking read is enough; drain the rest cheaply
@@ -848,6 +979,14 @@ static void x_pump(int blocking)
             continue;
         }
         switch (ev[0] & 0x7f) {
+            case 33: // ClientMessage: the WM's close button, by arrangement
+                printf("x_pump: ClientMessage win=%u type=%u data0=%u (want %u/%u)\n",
+                       *(uint32_t *)(ev + 4), *(uint32_t *)(ev + 8),
+                       *(uint32_t *)(ev + 12), wm_protocols, wm_delete);
+                if (wm_delete && *(uint32_t *)(ev + 8) == wm_protocols
+                              && *(uint32_t *)(ev + 12) == wm_delete)
+                    I_Quit();
+                break;
             case 2:  // KeyPress
             case 3:  // KeyRelease
                 e.data1 = x_key_to_doom(ev[1]);
