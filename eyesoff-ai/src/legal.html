@@ -148,7 +148,11 @@ enclave.host, never here; what this app receives is a short-lived signed note na
 your account (an opaque account id, or a wallet address), sent along with each message
 you send. The enclave checks
 the note's signature and expiry and keeps none of it: no session table, no user record,
-nothing written. Signing out is your browser discarding the note.</p>
+nothing written. Signing out is your browser discarding the note. A deployment that
+offers API keys derives yours, on request, from that same sign-in: computed inside the
+enclave from your account identity and stored nowhere, so revealing it later just
+derives it again. Such a key does not expire; the operator voids every derived key at
+once by rotating the secret they are derived from.</p>
 
 <h3>What stays in your browser</h3>
 <ul>

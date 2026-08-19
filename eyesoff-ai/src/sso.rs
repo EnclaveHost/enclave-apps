@@ -122,6 +122,27 @@ fn address_of(vk: &VerifyingKey) -> String {
     s
 }
 
+/// Is `sub` one of the platform's two identity shapes? A relay ACCOUNT id
+/// (acct_<hex> - the passkey IS the identity, no wallet involved) or a bare
+/// wallet address (the original shape). Returns the canonical form: addresses
+/// lowercase, account ids as minted. Shared with apikey.rs, whose derived
+/// keys carry exactly these identities.
+pub fn canonical_sub(sub: &str) -> Option<String> {
+    let addr_like = sub.len() == 42
+        && sub.starts_with("0x")
+        && sub[2..].chars().all(|c| c.is_ascii_hexdigit());
+    let acct_like = (6..=80).contains(&sub.len())
+        && sub.starts_with("acct_")
+        && sub[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if addr_like {
+        Some(sub.to_lowercase())
+    } else if acct_like {
+        Some(sub.to_string())
+    } else {
+        None
+    }
+}
+
 /// hex comparison that forgives 0x and case, nothing else
 fn hex_eq(a: &str, b: &str) -> bool {
     let strip = |s: &str| s.trim().trim_start_matches("0x").trim_start_matches("0X").to_lowercase();
@@ -180,20 +201,8 @@ pub fn verify(cfg: &SsoConfig, token: &str, now_secs: u64) -> Result<Claims, Str
     if now_secs >= exp {
         return Err("sign-in expired; sign in again".into());
     }
-    // the signed-in identity, in either of the platform's shapes: a relay
-    // ACCOUNT id (acct_<hex> - the passkey IS the identity, no wallet
-    // involved) or a bare wallet address (the original shape; addresses
-    // canonicalize to lowercase, account ids pass through as minted)
-    let addr_like = sub.len() == 42
-        && sub.starts_with("0x")
-        && sub[2..].chars().all(|c| c.is_ascii_hexdigit());
-    let acct_like = (6..=80).contains(&sub.len())
-        && sub.starts_with("acct_")
-        && sub[5..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !(addr_like || acct_like) {
-        return Err("malformed sign-in token payload".into());
-    }
-    let sub = if addr_like { sub.to_lowercase() } else { sub };
+    // the signed-in identity, in either of the platform's shapes
+    let sub = canonical_sub(&sub).ok_or("malformed sign-in token payload")?;
     Ok(Claims { sub, aud, iat, exp })
 }
 

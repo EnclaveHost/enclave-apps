@@ -69,6 +69,10 @@
 //!                               leg. Two separate probes because "no results"
 //!                               and "no egress" look identical from outside.
 //!   GET  /v1/models           - OpenAI-compatible model list.
+//!   POST /v1/keys             - derived personal API key for a signed-in
+//!                               user (sso + api_key_seed both configured):
+//!                               a valid sign-in token in, the caller's own
+//!                               deterministic key out. See apikey.rs.
 //!   POST /v1/chat/completions - OpenAI-compatible completions, stream and
 //!                               non-stream. Point any OpenAI SDK at the
 //!                               deployment URL. If the config sets api_key,
@@ -212,6 +216,7 @@
 #[allow(warnings)]
 mod bindings;
 
+mod apikey;
 mod attest;
 mod config;
 mod http;
@@ -6581,8 +6586,9 @@ fn bearer_token(req: &IncomingRequest) -> Option<String> {
     None
 }
 
-/// Bearer check for /v1/*: the deployment's api_key, or a platform sign-in
-/// token when `sso` is configured - one API, either credential. Neither gate
+/// Bearer check for /v1/*: the deployment's api_key, a platform sign-in
+/// token when `sso` is configured, or a derived personal key when
+/// `api_key_seed` is - one API, any of the three credentials. Neither gate
 /// configured = open (gate with a private deployment instead when that is the
 /// intent), and sso with required=false leaves /v1 open too: optional sign-in
 /// exists to name the visitor, not to close the API on everyone else.
@@ -6598,7 +6604,65 @@ fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
             return true;
         }
     }
+    if let (Some(seed), Some(t)) = (cfg.key_seed(), &tok) {
+        if apikey::verify(seed, t).is_ok() {
+            return true;
+        }
+    }
     cfg.api_key.is_none() && !cfg.sso.as_ref().map_or(false, |s| s.required)
+}
+
+/// POST /v1/keys - hand a signed-in user their derived API key. The identity
+/// comes from a verified sign-in token, never from the request body: whoever
+/// can sign in as an account is exactly who may hold its key. Deterministic
+/// (see apikey.rs), so this is as much "show me my key" as "make me one",
+/// and calling it twice is harmless.
+fn handle_keys(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
+    let base = match config::from_value(raw.clone()) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+    };
+    let Some(seed) = base.key_seed() else {
+        return json_err(
+            out,
+            404,
+            "this deployment does not offer derived API keys; its config sets no api_key_seed",
+        );
+    };
+    let Some(sso_cfg) = &base.sso else {
+        return json_err(
+            out,
+            404,
+            "derived API keys need sign-in: this deployment's config sets api_key_seed but no sso block, so there is no identity to derive from",
+        );
+    };
+    let Some(tok) = bearer_token(&req) else {
+        return json_err(
+            out,
+            401,
+            "[sso_required] sign in with your Enclave account to derive your API key",
+        );
+    };
+    // an EST1 token only: a static api_key names no identity, and a derived
+    // key must not mint itself a fresh copy forever - the sign-in, with its
+    // expiry, stays the root of this chain
+    let claims = match sso::verify(sso_cfg, &tok, (now_ms() / 1000) as u64) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 401, &format!("[sso_required] {e}")),
+    };
+    let Some(key) = apikey::derive(seed, &claims.sub) else {
+        // unreachable for any sub sso::verify admits, but never panic on it
+        return json_err(out, 500, "sign-in identity has no derivable key");
+    };
+    let body = serde_json::json!({
+        "object": "api_key",
+        "key": key,
+        "sub": claims.sub,
+        // stated in the payload because clients script against this: the same
+        // identity always derives the same key, and nothing was stored
+        "deterministic": true,
+    });
+    respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }
 
 /// The playground's sign-in gate (POST /chat and /title): nothing unless the
@@ -7972,7 +8036,10 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     // exposed: the browser never verifies a token, it only carries one.
     body["auth"] = match base_cfg.as_ref().and_then(|c| c.sso.clone()) {
         Some(s) => serde_json::json!({ "enabled": true, "required": s.required,
-                                       "authorize_url": s.authorize_url, "aud": s.audience }),
+                                       "authorize_url": s.authorize_url, "aud": s.audience,
+                                       // POST /v1/keys works here: a signed-in
+                                       // visitor can derive a personal API key
+                                       "keys": base_cfg.as_ref().map_or(false, |c| c.key_seed().is_some()) }),
         None => serde_json::json!({ "enabled": false }),
     };
     let vision_any = entries.iter().any(|e| e.cfg.vision && e.cfg.backend == "ggml");
@@ -8359,10 +8426,11 @@ impl Guest for Component {
             },
             (Method::Post, "/v1/chat/completions") => handle_completions(&raw, req, out),
             (Method::Get, "/v1/models") => handle_models(&raw, req, out),
+            (Method::Post, "/v1/keys") => handle_keys(&raw, req, out),
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /v1/keys, POST /chat, POST /title",
             ),
         }
     }

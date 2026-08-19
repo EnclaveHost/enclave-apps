@@ -762,6 +762,11 @@
     padding: 12px 14px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
     font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
+  .api-key-head { display: flex; align-items: center; gap: 8px; margin: 14px 0 4px; }
+  .api-key-head h3 {
+    flex: 1; font-size: 12px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--text-3);
+  }
   .api-fine { color: var(--text-3); font-size: 12.5px; }
   .api-fine .ic {
     background: var(--ic-bg); padding: .1em .35em; border-radius: 5px;
@@ -1173,6 +1178,19 @@
       <p>This server exposes the same models over an OpenAI-compatible API. Point any OpenAI SDK at:</p>
       <div class="api-url"><code id="apiBase"></code><button type="button" class="cbtn" id="apiCopyBase">Copy</button></div>
       <div class="code"><div class="code-head"><span>curl</span><button type="button" class="cbtn" id="apiCopyCurl">Copy</button></div><pre><code id="apiCurl"></code></pre></div>
+      <!-- derived personal key: only shown when the deployment offers one
+           (sso + api_key_seed configured; /models "auth" advertises it) -->
+      <div id="apiKeySec" hidden>
+        <div class="api-key-head">
+          <h3>Your API key</h3>
+          <button type="button" class="cbtn" id="apiKeyGo">Reveal</button>
+        </div>
+        <div class="api-url" id="apiKeyRow" hidden><code id="apiKeyVal"></code><button type="button" class="cbtn" id="apiKeyCopy">Copy</button></div>
+        <p class="api-fine">Derived inside the enclave from your signed-in identity: the account your
+        wallet or passkey unlocks. Nothing is stored anywhere; the same sign-in always derives the same key,
+        so revealing it later is a fresh derivation, not a lookup. Send it as
+        <code class="ic">x-api-key</code> (or <code class="ic">Authorization: Bearer</code>).</p>
+      </div>
       <p class="api-fine">Streaming and non-streaming. Also <code class="ic">GET /v1/models</code>, <code class="ic">GET /warmup?model=…</code>.
       Model names match the picker. If the server config sets <code class="ic">api_key</code>, send it as
       <code class="ic">Authorization: Bearer &lt;key&gt;</code>; a deployment with sign-in configured
@@ -2067,6 +2085,10 @@ addEventListener("message", (e) => {
   if (ssoAccept(d.enclave_sso)) {
     renderSsoUI();
     closeSso();
+    // a sign-in that started from the API dialog's "Sign in to reveal"
+    // finishes what it was for: the dialog is still open, so the click's
+    // intent is unambiguous
+    if (apiOverlay.classList.contains("open") && !apiKey) revealApiKey();
   }
 });
 // Both spellings, same value: the fleet's inbound TLS proxy has been seen
@@ -2117,6 +2139,9 @@ function ssoStart() {
 }
 function ssoDrop() {
   ssoToken = null;
+  // the revealed key names the identity that just signed out; the next
+  // sign-in may be someone else, whose key must be their own derivation
+  apiKey = null;
   try { sessionStorage.removeItem(SSO_KEY); } catch (_) {}
 }
 
@@ -3710,16 +3735,26 @@ async function nameChat(chat) {
 // rather than location.href: the location can be /c/<id>, which would advertise
 // an endpoint of <origin>/c/v1 that serves nothing.
 const apiOverlay = $("apiOverlay");
-function openApi() {
+function renderApiCurl() {
   const base = new URL("v1", document.baseURI).href;
   $("apiBase").textContent = base;
+  // a deployment that offers derived keys is one whose /v1 wants a
+  // credential, so the sample carries the header: the real key once
+  // revealed, a placeholder to make the requirement visible before that
+  const keyLine = state.auth.enabled && state.auth.keys
+    ? '  -H "x-api-key: ' + (apiKey || "<your key>") + '" \\\n'
+    : "";
   $("apiCurl").textContent = "curl " + base + "/chat/completions \\\n" +
-    '  -H "content-type: application/json" \\\n' +
+    '  -H "content-type: application/json" \\\n' + keyLine +
     "  -d '" + JSON.stringify({
       model: state.model || "default",
       messages: [{ role: "user", content: "hello" }],
       stream: true,
     }, null, 0).replace(/,"/g, ', "') + "'";
+}
+function openApi() {
+  renderApiCurl();
+  renderApiKey();
   apiOverlay.classList.add("open");
   $("apiClose").focus();
 }
@@ -3729,6 +3764,55 @@ $("apiClose").addEventListener("click", closeApi);
 apiOverlay.addEventListener("click", (e) => { if (e.target === apiOverlay) closeApi(); });
 $("apiCopyBase").addEventListener("click", (e) => copyText($("apiBase").textContent, e.currentTarget));
 $("apiCopyCurl").addEventListener("click", (e) => copyText($("apiCurl").textContent, e.currentTarget));
+
+// ---- your API key: derived, personal, revealed on demand -------------------
+// POST /v1/keys derives the key from the signed-in identity (the account the
+// visitor's wallet or passkey unlocks at enclave.host) under a seed only the
+// enclave holds - deterministic and stored nowhere, so the button is "show
+// me", not "make me one". Held in memory only, and revealed on a deliberate
+// click rather than on dialog open: a dialog that auto-prints a credential
+// is a screen-share accident.
+let apiKey = null;
+function renderApiKey() {
+  const offer = state.auth.enabled && !!state.auth.keys;
+  $("apiKeySec").hidden = !offer;
+  if (!offer) return;
+  $("apiKeyRow").hidden = !apiKey;
+  if (apiKey) $("apiKeyVal").textContent = apiKey;
+  const go = $("apiKeyGo");
+  go.hidden = !!apiKey;
+  go.textContent = ssoToken ? "Reveal" : "Sign in to reveal";
+}
+async function revealApiKey() {
+  // no token: this click starts the sign-in (popup; the message handler
+  // finishes the reveal when the token lands, since the dialog stays open)
+  if (!ssoToken) { ssoStart(); return; }
+  const go = $("apiKeyGo");
+  go.disabled = true;
+  try {
+    const res = await fetch(new URL("v1/keys", document.baseURI), {
+      method: "POST",
+      headers: { ...ssoHeaders() },
+    });
+    const d = await res.json().catch(() => null);
+    if (res.ok && d && d.key) {
+      apiKey = d.key;
+      renderApiKey();
+      renderApiCurl();
+      return;
+    }
+    if (res.status === 401) {
+      // the sign-in behind this tab's token has expired: shed it, and let
+      // the button honestly read "Sign in to reveal" for the next click
+      ssoDrop();
+      renderSsoUI();
+      renderApiKey();
+    }
+  } catch (_) { /* the button stays; a retry is one click away */ }
+  finally { go.disabled = false; }
+}
+$("apiKeyGo").addEventListener("click", revealApiKey);
+$("apiKeyCopy").addEventListener("click", (e) => copyText(apiKey || "", e.currentTarget));
 
 // ------------------------------------------------------ attestation dialog --
 // What the hardware SAYS, rather than how to install a tool that would ask it.
