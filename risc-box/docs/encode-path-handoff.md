@@ -191,12 +191,14 @@ compatibility is required.
 - **Test /frame.jpg:** `curl -s http://127.0.0.1:18010/frame.jpg -o f.jpg`;
   verify it decodes (Python `PIL`/`imghdr`, or the JPEG SOI/EOI markers
   FFD8..FFD9) and that two grabs a few seconds apart differ (the cube spins).
-- **Fleet publish/deploy:** throwaway wallet PK
-  `0xREDACTED-WALLET-KEY-ROTATED` (addr
-  0x337EcabC…7319, has USDC+ETH on Base). R2 `machines` bucket: endpoint
-  `https://0f4fd20d9b44134b04692dd8b6f50e30.r2.cloudflarestorage.com`, AK
-  `REDACTED-R2-ACCESS-KEY`, SK
-  `REDACTED-R2-SECRET-KEY`. NEVER put
+- **Fleet publish/deploy:** ask the operator for the wallet key and the R2
+  `machines` credentials, and keep both out of the tree. The key that used to
+  sit here (addr 0x337EcabC…7319) and the R2 access/secret pair beside it were
+  published with this file and must be treated as burned — see the sibling
+  `engine-freeze-handoff.md`, where the same habit cost a wallet: a leaked key
+  there was picked up within a day, delegated via EIP-7702 and swept. R2
+  endpoint (not a secret):
+  `https://0f4fd20d9b44134b04692dd8b6f50e30.r2.cloudflarestorage.com`. NEVER put
   S3 keys in on-chain config — use `$S3_*` placeholders + `deploy --secrets`.
   Full recipe (publish → dev-mode private deploy → SOCKS-egress + boot-retry
   gotchas → owner-token verify) is in `[[risc-box-xorg-guest]]`.
