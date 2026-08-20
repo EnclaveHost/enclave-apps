@@ -69,6 +69,10 @@
 //!                               leg. Two separate probes because "no results"
 //!                               and "no egress" look identical from outside.
 //!   GET  /v1/models           - OpenAI-compatible model list.
+//!   POST /v1/keys             - derived personal API key for a signed-in
+//!                               user (sso + api_key_seed both configured):
+//!                               a valid sign-in token in, the caller's own
+//!                               deterministic key out. See apikey.rs.
 //!   POST /v1/chat/completions - OpenAI-compatible completions, stream and
 //!                               non-stream. Point any OpenAI SDK at the
 //!                               deployment URL. If the config sets api_key,
@@ -212,12 +216,14 @@
 #[allow(warnings)]
 mod bindings;
 
+mod apikey;
 mod attest;
 mod config;
 mod http;
 mod image;
 mod sampling;
 mod search;
+mod sso;
 mod tools;
 mod vision;
 mod webp;
@@ -242,6 +248,7 @@ use sampling::{pick_row, Rng, Row, SampleParams};
 
 static CHAT_HTML: &str = include_str!("chat.html");
 static LEGAL_HTML: &str = include_str!("legal.html");
+static SSO_RETURN_HTML: &str = include_str!("sso-return.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
 /// The brand mark, for the consumers that ask the SERVER for an icon rather
 /// than reading the page's <link>: browsers hitting a non-HTML route, crawlers,
@@ -2274,17 +2281,29 @@ struct LoopGuard {
 
 impl LoopGuard {
     fn new(reps: usize) -> LoopGuard {
-        LoopGuard { reps, max_period: 64 }
+        // 512, not 64. The unit a stuck model repeats is not a phrase, it is a
+        // PARAGRAPH: measured 2026-08-15, qwen3.8 spent ~18k tokens restating
+        // the same 200-token plan ("Let me write the game now. I'll create the
+        // HTML file...") after its think block was force-closed. At 64 the
+        // repeating unit was longer than anything the detector could see, so
+        // the guard scanned the whole reply and found nothing.
+        LoopGuard { reps, max_period: 512 }
     }
 
     /// Short blocks need more evidence: a couple of repeated newlines or a
     /// run of dashes in a table is ordinary text, while the same twelve
     /// tokens four times over is not.
+    ///
+    /// Long blocks are the other extreme and need LESS. Prose does not restate
+    /// a whole paragraph word for word, so three of them is already proof;
+    /// demanding the full `reps` there means a 200-token paragraph has to
+    /// repeat forty times - eight thousand tokens - before anything notices.
     fn required(&self, period: usize) -> usize {
         match period {
             1 => self.reps * 6,
             2..=4 => self.reps * 3,
-            _ => self.reps,
+            5..=63 => self.reps,
+            _ => self.reps.min(3),
         }
     }
 
@@ -2301,6 +2320,13 @@ impl LoopGuard {
             // does not fit skipped every longer one - which is to say, the
             // whole class of failure this guard exists for.
             if g.len() < span {
+                continue;
+            }
+            // O(1) reject before the O(span) walk: if the last token does not
+            // match the one a period back, this period cannot be the unit.
+            // Scanning to 512 without it costs ~400k comparisons per token,
+            // which is the reason the ceiling was low in the first place.
+            if g[g.len() - 1] != g[g.len() - 1 - period] {
                 continue;
             }
             let tail = &g[g.len() - span..];
@@ -3835,10 +3861,14 @@ impl ChatReq {
     /// the prompt can render. This is the PASSTHROUGH mode tools.rs describes:
     /// the model is offered the CLIENT's functions, its call comes back on the
     /// reply as `tool_calls`, and the client executes it - nothing here ever
-    /// runs one. A request that declares tools gets them INSTEAD of the
-    /// deployment's registry, never merged with it: the model sees one list,
-    /// and a client-supplied name must not be able to select a server-executed
-    /// capability that merely shares it.
+    /// runs one of THESE.
+    ///
+    /// They are offered alongside the deployment's own registry, not instead of
+    /// it (tools::merge_registries). The model still sees ONE list; what decides
+    /// who executes an entry is its `src`, never its name. A client-supplied
+    /// name still cannot select a server-executed capability that merely shares
+    /// it, because the client's entry WINS the collision and the server's twin
+    /// is dropped from the list entirely.
     ///
     /// Err when the array is present but not a shape this side can name a
     /// function from - a client waiting for `tool_calls` has to hear why it
@@ -4304,9 +4334,21 @@ struct ToolLoop<'a> {
     /// the model was already told it has run out of calls. Without this a model
     /// that keeps calling would loop forever: told, calls again, told again.
     limit_told: bool,
-    /// the model was already told its unparseable call was not run - the same
-    /// one-correction rule as limit_told, for the same reason
-    malformed_told: bool,
+    /// how many times the model has been told its call could not be parsed.
+    /// A COUNT, not a flag: one correction was enough when a malformed call
+    /// meant a confused model, but this family writes four different call
+    /// spellings at temperature 0.6 and picks between them per turn, so a
+    /// single bad draft was ending turns the very next attempt would have got
+    /// right. Observed live 2026-08-14: the model reasoned its way to "I must
+    /// search the web for the maze layout", searched, judged the result wrong,
+    /// and its retry died on one unparseable call.
+    malformed_tries: usize,
+    /// the calls already questioned for an unfilled argument, canonical form.
+    /// A LIST of what was asked rather than a flag, because the question is
+    /// "did you mean this" and the answer is the call coming back: an identical
+    /// resend runs, so a model that really did want to search for the word
+    /// "placeholder" loses one generation and nothing else.
+    stub_asked: Vec<String>,
     /// why the finished reply's call ran nothing, when one was attempted: the
     /// legs deliver this readable reason in place of the raw block
     refused: Option<&'static str>,
@@ -4318,8 +4360,21 @@ struct ToolLoop<'a> {
 /// place of the dead JSON, so the wording has to stand alone.
 const REFUSED_MALFORMED: &str =
     "the model wrote a tool call this app could not parse, so it was not run";
+/// How many unparseable calls in one answer get a rewrite before the turn
+/// ends. Each costs a re-prefill and a generation, so it is not free; the
+/// alternative is losing a turn the model was one draft away from finishing.
+const MALFORMED_RETRIES: usize = 3;
 const REFUSED_LIMIT: &str =
     "the model wrote another tool call after the per-answer limit, so it was not run";
+const REFUSED_STUB: &str =
+    "the model kept writing tool calls with arguments it had not filled in, so none were run";
+/// How many DISTINCT unfilled calls one answer may ask about. Each costs a
+/// re-prefill and a generation, and the answer loop has no bound of its own -
+/// without this a model that stubs a different argument every round spins it
+/// forever. Three is the same allowance a malformed call gets, for the same
+/// reason: one bad draft is a slip, three is a model that is not going to
+/// author the value.
+const STUB_RETRIES: usize = 3;
 
 impl<'a> ToolLoop<'a> {
     /// Resolve the registry for this turn. MCP discovery happens HERE, before
@@ -4340,7 +4395,8 @@ impl<'a> ToolLoop<'a> {
             image_out: None,
             calls: 0,
             limit_told: false,
-            malformed_told: false,
+            malformed_tries: 0,
+            stub_asked: Vec::new(),
             refused: None,
             log: Vec::new(),
         }
@@ -4403,23 +4459,35 @@ impl<'a> ToolLoop<'a> {
             // No call parsed - but was one ATTEMPTED? Left alone it reaches
             // the user as raw JSON, which the next turn then copies back out
             // of history (seen live 2026-08-05: {"arguments":{"url":...}}
-            // with no name at all). Same two-strike shape as the budget:
-            // correct it once, refuse with a reason the second time.
+            // with no name at all). Correct it up to MALFORMED_RETRIES times,
+            // then refuse with a reason: a bad draft must not end a turn the
+            // next draft would finish.
             if attempted_call(text) {
-                if self.malformed_told {
+                if self.malformed_tries >= MALFORMED_RETRIES {
                     self.refused = Some(REFUSED_MALFORMED);
                 } else {
-                    self.malformed_told = true;
+                    self.malformed_tries += 1;
                     on_note("the model wrote a tool call this app could not parse; asking it to rewrite the call");
                     messages.push(ChatMsg::text("assistant", strip_think(text).trim().to_string()));
                     messages.push(ChatMsg::text(
                         "user",
                         tools::response_turn(
                             "tool_call",
-                            "This call was NOT run: it could not be parsed. A call is ONE \
-                             JSON object with exactly two top-level fields, \"name\" (the \
-                             function to call) and \"arguments\" (an object with its \
-                             parameters), between <tool_call> and </tool_call> tags. Rewrite \
+                            // The wrong shapes are NAMED, because this model does
+                            // not make one kind of mistake - it picks between
+                            // several. Telling it only what the right shape looks
+                            // like leaves it free to choose a different wrong one
+                            // on the retry, which is what the live traces show.
+                            "This call was NOT run: it could not be parsed. Write it as ONE \
+                             JSON object between <tool_call> and </tool_call>, with exactly \
+                             two top-level fields, \"name\" and \"arguments\", like this:\n\
+                             <tool_call>\n\
+                             {\"name\": \"web_search\", \"arguments\": {\"query\": \"what to \
+                             search for\"}}\n\
+                             </tool_call>\n\
+                             Do NOT write <function=name>. Do NOT put the name inside \
+                             \"arguments\". Do NOT send \"arguments\" as a quoted string; it \
+                             is an object. Always close the tag with </tool_call>. Rewrite \
                              the call in exactly that shape, or answer in prose without one.",
                         ),
                     ));
@@ -4449,6 +4517,43 @@ impl<'a> ToolLoop<'a> {
                 ),
             ));
             return true;
+        }
+        // An argument the model never filled in. Running it is worse than not
+        // running it: a stubbed `generate_image` costs half a minute of a GPU
+        // deployment's time and puts a picture the user never asked for above
+        // the answer, then folds a note about that picture into the context the
+        // rest of the turn is written from. So ASK - once per distinct call, and
+        // the identical call coming back runs, because the only thing this can
+        // be wrong about is a model that genuinely meant the literal string.
+        if let Some((arg, val)) = tools::stub_arg(&c.args) {
+            let key = canonical_call(&c);
+            if !self.stub_asked.iter().any(|k| k == &key) {
+                if self.stub_asked.len() >= STUB_RETRIES {
+                    self.refused = Some(REFUSED_STUB);
+                    return false;
+                }
+                self.stub_asked.push(key);
+                on_note(
+                    "the model wrote a tool call with an argument it had not filled in; \
+                     asking it what the call is actually for",
+                );
+                messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+                messages.push(ChatMsg::text(
+                    "user",
+                    tools::response_turn(
+                        &c.name,
+                        &format!(
+                            "This call was NOT run: its \"{arg}\" argument is \"{val}\", which \
+                             is a placeholder, not a value - nothing decided what it should be. \
+                             Either work out what this call actually needs and write the \
+                             argument out in full, or do not call anything and answer the user \
+                             directly. If \"{val}\" is genuinely the value you meant, send the \
+                             identical call again and it will run."
+                        ),
+                    ),
+                ));
+                return true;
+            }
         }
         self.calls += 1;
         on_call(&serde_json::json!({
@@ -4845,6 +4950,59 @@ fn images_read_locally(cfg: &AppConfig, requested: Option<&str>) -> bool {
     match &cfg.vision_service {
         None => true,
         Some(_) => vision_plan(cfg, requested) == VisionPlan::Local,
+    }
+}
+
+/// The calls in a finished reply that belong to the CLIENT.
+///
+/// `merged` is the one list the model was actually shown. When the deployment's
+/// own loop is live beside it, ownership is read off each entry's `src` - so a
+/// call naming a server tool is left alone for the loop to run, and only the
+/// client's own come back as `tool_calls`. When the loop is not live this is the
+/// plain passthrough and every call the parser finds goes back, including one
+/// naming a tool the client never declared: the client can report that far
+/// better than this side can, and silently swallowing it would leave the turn
+/// looking like prose.
+fn client_calls_in(
+    text: &str,
+    merged: Option<&[tools::Tool]>,
+    loop_live: bool,
+) -> Vec<tools::ToolCall> {
+    let Some(all) = merged else { return Vec::new() };
+    let found = tools::parse_calls_for(text, all);
+    if !loop_live {
+        return found;
+    }
+    found
+        .into_iter()
+        .filter(|c| {
+            all.iter()
+                .any(|t| t.name == c.name && matches!(t.src, tools::ToolSrc::Client))
+        })
+        .collect()
+}
+
+/// The one list the model is shown, and the block that renders it. `None` when
+/// the request declared no tools of its own, which leaves every existing path
+/// exactly as it was.
+fn merge_client_tools(
+    client_reg: Option<&Vec<tools::Tool>>,
+    tl: Option<&ToolLoop>,
+    must_call: Option<&str>,
+) -> (Option<Vec<tools::Tool>>, Option<String>) {
+    let Some(cl) = client_reg else { return (None, None) };
+    match tl {
+        // ONE list, TWO executors. A client that brought its own tools used to
+        // lose the deployment's registry outright, which is why an agent on
+        // this endpoint could not search: it held the caller's file tools and
+        // nothing else, while web_search sat in a registry it was never shown.
+        Some(t) => {
+            let all = tools::merge_registries(t.tools(), cl);
+            let block = tools::merged_system_block(&all, t.cfg.max_calls, must_call);
+            (Some(all), Some(block))
+        }
+        // nothing of ours is armed this turn: the passthrough, unchanged
+        None => (Some(cl.clone()), Some(tools::client_system_block(cl, must_call))),
     }
 }
 
@@ -5462,13 +5620,15 @@ fn apply_web_search(
     // at once, and paying for that pass twice would be the whole saving gone
     effort_out: &mut Option<Effort>,
     want_effort: bool,
-    // the MODEL holds a web_search tool this turn, so the router must not
-    // decide about search. Image routing is independent (see RouterAsk) and
-    // has the same rule via model_images.
+    // the search decision is already SOMEONE ELSE'S this turn, so the router
+    // must not take it: either the MODEL holds a web_search tool, or the
+    // client declared its own `tools` array and brought its own retrieval
+    // loop with it. Image routing is independent (see RouterAsk) and has the
+    // same rule via model_images.
     model_searches: bool,
-    // the MODEL holds generate_image this turn: the router's image verdict
-    // stands down. An explicit /image is untouched - a typed command beats
-    // both deciders.
+    // same, for pictures: the MODEL holds generate_image, or the client's own
+    // tools own the turn. An explicit /image is untouched - a typed command
+    // beats every decider.
     model_images: bool,
     on_status: &dyn Fn(&str),
 ) -> Result<Option<SearchMeta>, String> {
@@ -5516,8 +5676,23 @@ fn apply_web_search(
     // and offering a verdict the turn cannot act on is how you get an IMAGE
     // back on a turn whose user switched images off.
     let router_search = web_mode == WebMode::Auto && !model_searches;
-    if !asked_inline && web_mode != WebMode::Always && (router_search || image_live) {
-        on_status("deciding what this needs…");
+    // `want_effort` belongs in this gate on its own. The pass answers TWO
+    // questions and route_web_search already handles either half being absent
+    // (it has an effort-only reply form), but the gate used to admit it only
+    // alongside a routing verdict - so on a deployment where the model owns
+    // both search and images, which is every tools-on deployment, the rating
+    // never ran and think_budget silently stayed flat for every turn no matter
+    // how hard. That is the same flat budget that force-closed a block mid-plan
+    // in the 2026-08-16 trace behind tools::stub_arg.
+    if !asked_inline && web_mode != WebMode::Always && (router_search || image_live || want_effort)
+    {
+        // same words route_web_search uses, so an effort-only pass does not
+        // announce a decision it is not making
+        on_status(if router_search || image_live {
+            "deciding what this needs…"
+        } else {
+            "sizing the reasoning budget…"
+        });
         let ask = RouterAsk { search: router_search, image: image_live, effort: want_effort };
         let out = route_web_search(cfg, tok, messages, target_mode, ask, on_status);
         *effort_out = out.effort;
@@ -6012,10 +6187,12 @@ enum Capabilities<'a> {
     /// the answer with a tool registry: the real signatures, and the stop
     /// string that ends generation the moment a call is complete
     Tools(&'a [tools::Tool], usize),
-    /// the answer with CLIENT-declared tools (the /v1 passthrough): the block
-    /// is pre-rendered by the handler (see tools::client_system_block), and
-    /// the same stop string arms - a completed call ends the turn, because
-    /// executing it is the client's job
+    /// the answer with CLIENT-declared tools (the /v1 passthrough), and with
+    /// this deployment's own merged in beside them when any are armed. The
+    /// block is pre-rendered by the handler (client_system_block for the
+    /// client's alone, merged_system_block for both), and the same stop string
+    /// arms either way - what differs is only what happens to a completed call,
+    /// which the handler decides from the tool's source, not from this variant
     Client(&'a str),
 }
 
@@ -6353,6 +6530,8 @@ const ERR_CODES: &[&str] = &[
     // too big), the rest describe the deployment or its node
     "no_vision", "too_many_images", "image_too_large", "vision_unsupported",
     "vision_unavailable", "image_undecodable", "image_too_wide",
+    // sign-in gate: the playground opens its sign-in dialog on this one
+    "sso_required",
 ];
 
 /// Drop the "[code] " marker from a message bound for a payload without a
@@ -6380,21 +6559,131 @@ fn json_err(out: ResponseOutparam, status: u16, msg: &str) {
     );
 }
 
-/// Bearer-token check for /v1/*. No key configured = open (gate with a
-/// private deployment instead when that is the intent).
-fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
-    let Some(key) = &cfg.api_key else { return true };
+/// The request's bearer credential: `Authorization: Bearer <v>`, or the
+/// same value as `x-api-key: <v>` (see below for why both spellings exist).
+fn bearer_token(req: &IncomingRequest) -> Option<String> {
     let headers = req.headers();
     for v in headers.get(&"authorization".to_string()) {
         if let Ok(s) = String::from_utf8(v) {
             if let Some(tok) = s.strip_prefix("Bearer ") {
-                if tok.trim() == key {
-                    return true;
-                }
+                return Some(tok.trim().to_string());
             }
         }
     }
-    false
+    // The fleet's inbound TLS proxy has been observed EATING Authorization
+    // (proven on e64f7cba, 2026-08-17: correct Bearer answered 401 while the
+    // same value as X-Api-Key answered 200), so the same credential - api_key
+    // or sign-in token - is taken from x-api-key too. The playground sends
+    // both spellings; a client may send either.
+    for v in headers.get(&"x-api-key".to_string()) {
+        if let Ok(s) = String::from_utf8(v) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Bearer check for /v1/*: the deployment's api_key, a platform sign-in
+/// token when `sso` is configured, or a derived personal key when
+/// `api_key_seed` is - one API, any of the three credentials. Neither gate
+/// configured = open (gate with a private deployment instead when that is the
+/// intent), and sso with required=false leaves /v1 open too: optional sign-in
+/// exists to name the visitor, not to close the API on everyone else.
+fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
+    let tok = bearer_token(req);
+    if let (Some(key), Some(t)) = (&cfg.api_key, &tok) {
+        if t == key {
+            return true;
+        }
+    }
+    if let (Some(s), Some(t)) = (&cfg.sso, &tok) {
+        if sso::verify(s, t, (now_ms() / 1000) as u64).is_ok() {
+            return true;
+        }
+    }
+    if let (Some(seed), Some(t)) = (cfg.key_seed(), &tok) {
+        if apikey::verify(seed, t).is_ok() {
+            return true;
+        }
+    }
+    cfg.api_key.is_none() && !cfg.sso.as_ref().map_or(false, |s| s.required)
+}
+
+/// POST /v1/keys - hand a signed-in user their derived API key. The identity
+/// comes from a verified sign-in token, never from the request body: whoever
+/// can sign in as an account is exactly who may hold its key. Deterministic
+/// (see apikey.rs), so this is as much "show me my key" as "make me one",
+/// and calling it twice is harmless.
+fn handle_keys(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
+    let base = match config::from_value(raw.clone()) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
+    };
+    let Some(seed) = base.key_seed() else {
+        return json_err(
+            out,
+            404,
+            "this deployment does not offer derived API keys; its config sets no api_key_seed",
+        );
+    };
+    let Some(sso_cfg) = &base.sso else {
+        return json_err(
+            out,
+            404,
+            "derived API keys need sign-in: this deployment's config sets api_key_seed but no sso block, so there is no identity to derive from",
+        );
+    };
+    let Some(tok) = bearer_token(&req) else {
+        return json_err(
+            out,
+            401,
+            "[sso_required] sign in with your Enclave account to derive your API key",
+        );
+    };
+    // an EST1 token only: a static api_key names no identity, and a derived
+    // key must not mint itself a fresh copy forever - the sign-in, with its
+    // expiry, stays the root of this chain
+    let claims = match sso::verify(sso_cfg, &tok, (now_ms() / 1000) as u64) {
+        Ok(c) => c,
+        Err(e) => return json_err(out, 401, &format!("[sso_required] {e}")),
+    };
+    let Some(key) = apikey::derive(seed, &claims.sub) else {
+        // unreachable for any sub sso::verify admits, but never panic on it
+        return json_err(out, 500, "sign-in identity has no derivable key");
+    };
+    let body = serde_json::json!({
+        "object": "api_key",
+        "key": key,
+        "sub": claims.sub,
+        // stated in the payload because clients script against this: the same
+        // identity always derives the same key, and nothing was stored
+        "deterministic": true,
+    });
+    respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
+}
+
+/// The playground's sign-in gate (POST /chat and /title): nothing unless the
+/// deployment configured `sso` with `required`, then a valid token or a 401.
+/// Runs BEFORE the handler takes the request, because IncomingRequest moves
+/// into the body-reading handlers and headers must be read first. Only the
+/// generation routes are gated: GET / must serve the page that CARRIES the
+/// sign-in button, /models is how that page learns where to send people, and
+/// /attestation stays readable because deciding whether to trust this app
+/// with a login is exactly when someone verifies it.
+fn require_user(raw: &serde_json::Value, req: &IncomingRequest) -> Result<(), String> {
+    let Some(cfg) = sso::SsoConfig::from_raw(raw) else { return Ok(()) };
+    if !cfg.required {
+        return Ok(());
+    }
+    match bearer_token(req) {
+        Some(t) => sso::verify(&cfg, &t, (now_ms() / 1000) as u64)
+            .map(|_| ())
+            .map_err(|e| format!("[sso_required] {e}")),
+        None => Err("[sso_required] this deployment asks you to sign in with your Enclave account".into()),
+    }
 }
 
 // ------------------------------------------------- legacy /chat (playground) --
@@ -6880,15 +7169,13 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     };
     // A client-declared `tools` array is the PASSTHROUGH (see client_tools):
     // the model is offered the client's functions and its call goes back on
-    // the reply as `tool_calls`, for the CLIENT to execute. The registry the
-    // deployment configured sits the turn out - the model sees ONE list.
+    // the reply as `tool_calls`, for the CLIENT to execute. The deployment's
+    // own registry is offered BESIDE them rather than sitting the turn out -
+    // see the merge each leg builds once its tool loop is open.
     let client_reg = match creq.client_tools() {
         Ok(r) => r,
         Err(e) => return json_err(out, 400, &e),
     };
-    let client_block = client_reg
-        .as_ref()
-        .map(|list| tools::client_system_block(list, creq.tool_must_call().as_deref()));
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
@@ -6972,12 +7259,8 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
-        let mut tl = if client_reg.is_some() {
-            None
-        } else {
-            tools_enabled(cfg, &creq)
-                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status, &formatter))
-        };
+        let mut tl = tools_enabled(cfg, &creq)
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status, &formatter));
         if let Some(t) = &tl {
             for n in &t.reg.notes {
                 let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
@@ -6986,8 +7269,25 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
-        let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
-        let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
+        let (merged, client_block) = merge_client_tools(
+            client_reg.as_ref(),
+            tl.as_ref(),
+            creq.tool_must_call().as_deref(),
+        );
+        // A client that declared its OWN tools brought its own retrieval loop,
+        // so the pre-pass router stands down: rewriting that client's user turn
+        // with search results is this deployment competing with the agent it is
+        // serving. Measured 2026-08-14 against opencode on "build a pacman clone
+        // in this folder": the router searched, pasted ~5 KB of Pac-Man articles
+        // into the turn, and the prompt went 304 -> 5439 tokens. The model then
+        // spent its whole think budget reasoning about the ARTICLES and never
+        // called the client's `list` - a coding request answered as trivia. With
+        // the router disarmed the same request calls `list(".")` in 70 tokens.
+        // An explicit `web_search: true` or a `/search ` prefix still searches:
+        // that is the caller asking for it, not the deployment deciding.
+        let router_yields = client_reg.is_some();
+        let model_searches = router_yields || tl.as_ref().is_some_and(|t| t.owns_search());
+        let model_images = router_yields || tl.as_ref().is_some_and(|t| t.owns_image());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -7127,7 +7427,15 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             let status = |s: &str| send_raw(&format!(": {s}\n\n"));
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
                 Ok(s) => {
-                    if let Some(t) = &mut tl {
+                    // Whose call is this? Read off the merged list's entries,
+                    // never guessed from the name: a client's tool ends the
+                    // turn and travels back as `tool_calls`, and anything else
+                    // falls through to the loop below and runs here, which the
+                    // client never sees.
+                    let client_now =
+                        client_calls_in(&s.text, merged.as_deref(), tl.is_some());
+                    let ours = client_now.is_empty();
+                    if let Some(t) = tl.as_mut().filter(|_| ours) {
                         // the call and its result travel as comments, for the
                         // same reason the sources do
                         let on_call = |c: &serde_json::Value| {
@@ -7166,14 +7474,11 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                         gate.borrow_mut().drop_call();
                         if bare { format!("[{note}]") } else { format!("\n\n[{note}]") }
                     });
-                    if client_block.is_some() {
-                        client_calls =
-                            tools::parse_calls_for(&s.text, client_reg.as_deref().unwrap_or(&[]));
-                        if !client_calls.is_empty() {
-                            // the held call leaves as structured `tool_calls`
-                            // below, not as content
-                            gate.borrow_mut().drop_call();
-                        }
+                    if !client_now.is_empty() {
+                        // the held call leaves as structured `tool_calls`
+                        // below, not as content
+                        client_calls = client_now;
+                        gate.borrow_mut().drop_call();
                     }
                     if let Some(rest) = gate.borrow_mut().flush() {
                         if !opened.replace(true) {
@@ -7243,17 +7548,30 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
-        let mut tl = if client_reg.is_some() {
-            None
-        } else {
-            tools_enabled(cfg, &creq)
-                .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status, &formatter))
-        };
+        let mut tl = tools_enabled(cfg, &creq)
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status, &formatter));
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
-        let model_searches = tl.as_ref().is_some_and(|t| t.owns_search());
-        let model_images = tl.as_ref().is_some_and(|t| t.owns_image());
+        let (merged, client_block) = merge_client_tools(
+            client_reg.as_ref(),
+            tl.as_ref(),
+            creq.tool_must_call().as_deref(),
+        );
+        // A client that declared its OWN tools brought its own retrieval loop,
+        // so the pre-pass router stands down: rewriting that client's user turn
+        // with search results is this deployment competing with the agent it is
+        // serving. Measured 2026-08-14 against opencode on "build a pacman clone
+        // in this folder": the router searched, pasted ~5 KB of Pac-Man articles
+        // into the turn, and the prompt went 304 -> 5439 tokens. The model then
+        // spent its whole think budget reasoning about the ARTICLES and never
+        // called the client's `list` - a coding request answered as trivia. With
+        // the router disarmed the same request calls `list(".")` in 70 tokens.
+        // An explicit `web_search: true` or a `/search ` prefix still searches:
+        // that is the caller asking for it, not the deployment deciding.
+        let router_yields = client_reg.is_some();
+        let model_searches = router_yields || tl.as_ref().is_some_and(|t| t.owns_search());
+        let model_images = router_yields || tl.as_ref().is_some_and(|t| t.owns_image());
         let search_meta = match apply_web_search(
             cfg,
             &creq,
@@ -7314,7 +7632,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         for (target, tname) in targets_for(cfg, mode).iter() {
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &sink, &sink) {
                 Ok(s) => {
-                    if let Some(t) = &mut tl {
+                    // ownership before execution, exactly as the streaming leg
+                    let ours =
+                        client_calls_in(&s.text, merged.as_deref(), tl.is_some()).is_empty();
+                    if let Some(t) = tl.as_mut().filter(|_| ours) {
                         let quiet = |_: &serde_json::Value| {};
                         if t.step(&s.text, &mut messages, &quiet, &quiet, &|_| {}) {
                             continue 'answer;
@@ -7330,11 +7651,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         }
         match result {
             Some(s) => {
-                let client_calls = if client_block.is_some() {
-                    tools::parse_calls_for(&s.text, client_reg.as_deref().unwrap_or(&[]))
-                } else {
-                    Vec::new()
-                };
+                let client_calls = client_calls_in(&s.text, merged.as_deref(), tl.is_some());
                 let refused = tl.as_mut().and_then(|t| t.refused.take());
                 let (message, finish) = if client_calls.is_empty() {
                     // an attempted call that ran nothing is replaced by its
@@ -7713,6 +8030,18 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
         }
         _ => serde_json::json!({ "enabled": false }),
     };
+    // Sign-in: what the playground needs to START the flow - where to send
+    // the visitor and which audience to ask for - plus whether the composer
+    // is gated or the link is merely offered. The signer address is NOT
+    // exposed: the browser never verifies a token, it only carries one.
+    body["auth"] = match base_cfg.as_ref().and_then(|c| c.sso.clone()) {
+        Some(s) => serde_json::json!({ "enabled": true, "required": s.required,
+                                       "authorize_url": s.authorize_url, "aud": s.audience,
+                                       // POST /v1/keys works here: a signed-in
+                                       // visitor can derive a personal API key
+                                       "keys": base_cfg.as_ref().map_or(false, |c| c.key_seed().is_some()) }),
+        None => serde_json::json!({ "enabled": false }),
+    };
     let vision_any = entries.iter().any(|e| e.cfg.vision && e.cfg.backend == "ggml");
     let service = base_cfg.as_ref().map(|c| c.vision_service.is_some()).unwrap_or(false);
     body["vision"] = serde_json::json!({
@@ -8078,14 +8407,30 @@ impl Guest for Component {
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/tools") => handle_tools_probe(&raw, req, query, out),
             (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
-            (Method::Post, "/chat") => handle_chat(&raw, req, out),
-            (Method::Post, "/title") => handle_title(&raw, req, out),
+            // the popup sign-in's landing pad: same-origin with the opener
+            // again, so it may hand the return fragment over and close (see
+            // src/sso-return.html). Open like the page that carries the
+            // sign-in button, for the same reason.
+            (Method::Get, "/sso-return") => {
+                respond_bytes(out, 200, "text/html; charset=utf-8", SSO_RETURN_HTML.as_bytes())
+            }
+            // the two generation routes carry the sign-in gate; see
+            // require_user() for why the rest of the playground stays open
+            (Method::Post, "/chat") => match require_user(&raw, &req) {
+                Ok(()) => handle_chat(&raw, req, out),
+                Err(e) => json_err(out, 401, &e),
+            },
+            (Method::Post, "/title") => match require_user(&raw, &req) {
+                Ok(()) => handle_title(&raw, req, out),
+                Err(e) => json_err(out, 401, &e),
+            },
             (Method::Post, "/v1/chat/completions") => handle_completions(&raw, req, out),
             (Method::Get, "/v1/models") => handle_models(&raw, req, out),
+            (Method::Post, "/v1/keys") => handle_keys(&raw, req, out),
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /v1/keys, POST /chat, POST /title",
             ),
         }
     }
@@ -8481,6 +8826,43 @@ mod tests {
         assert!(!req(serde_json::json!({ "messages": [], "image_gen": "off" })).image_on(true));
     }
 
+    /// With both lists live, a call is routed by its SOURCE. The client's own
+    /// come back as `tool_calls` and end the turn; the deployment's are left
+    /// for the loop to execute here, so the client never sees a call it has no
+    /// way to run. This is what lets an agent hold its file tools and this
+    /// deployment's web_search in the same answer.
+    #[test]
+    fn a_call_goes_to_whoever_owns_the_tool() {
+        let mk = |name: &str, src: tools::ToolSrc| tools::Tool {
+            name: name.into(),
+            description: String::new(),
+            parameters: tools::object_schema(None),
+            src,
+        };
+        let all = vec![
+            mk("read", tools::ToolSrc::Client),
+            mk("web_search", tools::ToolSrc::Http(0)),
+        ];
+        let client_call = "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"p\": \"x\"}}\n</tool_call>";
+        let server_call =
+            "<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"x\"}}\n</tool_call>";
+
+        // loop live: ours stays here, theirs goes back
+        let mine = client_calls_in(client_call, Some(&all), true);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].name, "read");
+        assert!(
+            client_calls_in(server_call, Some(&all), true).is_empty(),
+            "a server tool must never be handed to the client to run"
+        );
+
+        // no loop: the plain passthrough, where every call found goes back -
+        // including a name the client never declared, which it reports better
+        // than this side can
+        assert_eq!(client_calls_in(server_call, Some(&all), false).len(), 1);
+        assert!(client_calls_in(client_call, None, false).is_empty());
+    }
+
     /// A client that declares its OWN tools gets the passthrough: the array
     /// becomes a registry the prompt renders, the boolean extension stays the
     /// deployment-tools switch, and `tool_choice: "none"` still withholds
@@ -8638,9 +9020,110 @@ mod tests {
         assert_eq!(tl.refused, None);
     }
 
-    /// An attempted call the parser cannot accept is corrected once, refused
-    /// with a reason the second time, and never mistaken for prose that only
-    /// mentions the tag.
+    /// The 2026-08-16 failure, end to end through the loop: a call whose
+    /// argument was never authored must not RUN. The live turn asked for a
+    /// self-contained HTML file, the think budget force-closed the block
+    /// mid-plan, and the model's next act was
+    /// `generate_image {"prompt": "placeholder"}` - thirty seconds of a GPU
+    /// deployment and a picture of nothing anyone asked for, above the answer.
+    #[test]
+    fn a_call_the_model_never_filled_in_is_questioned_not_run() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 8,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut msgs = vec![ChatMsg::text("user", "write me a self-contained HTML file")];
+        let stub =
+            "<tool_call>{\"name\":\"generate_image\",\"arguments\":{\"prompt\":\"placeholder\"}}\
+             </tool_call>";
+        let ran = std::cell::Cell::new(0);
+        let seen = |_: &serde_json::Value| ran.set(ran.get() + 1);
+        let count = |_: &serde_json::Value| {};
+
+        // questioned: the conversation grows, and NOTHING was called
+        assert!(tl.step(stub, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(ran.get(), 0, "the stubbed call was executed");
+        assert_eq!(tl.calls, 0);
+        assert!(msgs[2].content.contains("NOT run"), "{}", msgs[2].content);
+        assert!(msgs[2].content.contains("placeholder"), "{}", msgs[2].content);
+
+        // the model meant it after all: the identical call runs on the resend,
+        // so the guard costs one generation and never a capability
+        assert!(tl.step(stub, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(ran.get(), 1, "the resent call must run");
+        assert_eq!(tl.calls, 1);
+
+        // and a call with a real argument is untouched from the start. The
+        // name is one the registry does NOT hold, like the budget test above:
+        // that exercises the loop without a wasi:http round trip, which does
+        // not exist under a native `cargo test`.
+        let real = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"query\":\"falcon 9 fin count\"}}\
+                    </tool_call>";
+        assert!(tl.step(real, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(ran.get(), 2);
+
+        // the answer loop has no bound of its own, so a model that stubs a
+        // DIFFERENT argument every round has to hit one here
+        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        for v in ["placeholder", "TODO", "tbd"] {
+            let c = format!(
+                "<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"prompt\":\"{v}\"}}}}</tool_call>"
+            );
+            assert!(tl.step(&c, &mut msgs, &seen, &count, &|_| {}), "{v} should be questioned");
+        }
+        let fourth =
+            "<tool_call>{\"name\":\"nope\",\"arguments\":{\"prompt\":\"fixme\"}}</tool_call>";
+        assert!(!tl.step(fourth, &mut msgs, &seen, &count, &|_| {}));
+        assert_eq!(tl.refused, Some(REFUSED_STUB));
+        assert_eq!(ran.get(), 2, "no stubbed call ever ran");
+    }
+
+    /// The failure LoopGuard exists for, at the scale it actually happens:
+    /// a model whose think block was force-closed carries on restating the
+    /// same PARAGRAPH in prose. Measured 2026-08-15 at ~18k tokens. The unit
+    /// is far longer than a phrase, so a 64-token ceiling could not see it and
+    /// `required() == reps` would have wanted forty repeats of it.
+    #[test]
+    fn a_repeated_paragraph_is_a_loop() {
+        // 200 distinct tokens: a paragraph, not a phrase
+        let para: Vec<u32> = (1000..1200).collect();
+        let guard = LoopGuard::new(40); // the live repeat_guard
+        let two: Vec<u32> = para.iter().chain(para.iter()).copied().collect();
+        assert!(!guard.tripped(&two), "twice could still be deliberate");
+        let three: Vec<u32> =
+            para.iter().chain(para.iter()).chain(para.iter()).copied().collect();
+        assert!(guard.tripped(&three), "a 200-token paragraph three times over is a loop");
+
+        // ordinary prose must not trip: 3000 non-repeating tokens
+        let prose: Vec<u32> = (0..3000).collect();
+        assert!(!guard.tripped(&prose));
+
+        // a short phrase still needs a lot of evidence before it counts
+        let phrase: Vec<u32> = (0..7).collect();
+        let few: Vec<u32> = phrase.iter().cycle().take(7 * 10).copied().collect();
+        assert!(!guard.tripped(&few), "ten repeats of a short phrase is not proof");
+        // ...but a long enough run trips anyway, because 13 phrases in a row
+        // ARE a 91-token block and three of those are a loop by the rule
+        // above. Catching it sooner by a different route is the point.
+        let many: Vec<u32> = phrase.iter().cycle().take(7 * 39).copied().collect();
+        assert!(guard.tripped(&many));
+
+        // reps 0 is off, whatever the shape
+        assert!(!LoopGuard::new(0).tripped(&three));
+    }
+
+    /// An attempted call the parser cannot accept is corrected up to
+    /// MALFORMED_RETRIES times, refused with a reason after that, and never
+    /// mistaken for prose that only mentions the tag. The budget is a COUNT
+    /// rather than one strike because a model with several call spellings can
+    /// pick a different wrong one on the retry, and ending the turn on the
+    /// first bad draft throws away work the next draft would land.
     #[test]
     fn unparseable_calls_are_corrected_then_refused() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
@@ -8655,11 +9138,22 @@ mod tests {
         // the live shape of 2026-08-05: no name anywhere, tag left unclosed
         let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";
         let noted = std::cell::Cell::new(0);
-        assert!(tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_: &str| noted.set(noted.get() + 1)));
-        assert_eq!(noted.get(), 1);
-        assert_eq!(msgs.len(), 3);
-        assert!(msgs[2].content.contains("could not be parsed"), "{}", msgs[2].content);
-        // still malformed after the correction: refused, not delivered raw
+        for i in 1..=MALFORMED_RETRIES {
+            assert!(
+                tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_: &str| noted.set(noted.get() + 1)),
+                "attempt {i} should be corrected, not refused"
+            );
+            assert_eq!(noted.get(), i);
+            assert_eq!(msgs.len(), 1 + 2 * i);
+        }
+        let last = msgs.last().unwrap().content.clone();
+        assert!(last.contains("could not be parsed"), "{last}");
+        // the correction NAMES the shapes this model actually gets wrong, so a
+        // retry cannot simply choose a different one
+        for wrong in ["<function=name>", "inside \\\"arguments\\\"", "quoted string"] {
+            assert!(last.contains(wrong), "missing {wrong}: {last}");
+        }
+        // still malformed after the budget: refused, not delivered raw
         assert!(!tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert_eq!(tl.refused, Some(REFUSED_MALFORMED));
         // prose that mentions the tag without an object is an answer

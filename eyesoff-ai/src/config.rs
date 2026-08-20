@@ -125,9 +125,29 @@ pub struct AppConfig {
     #[serde(default = "default_repeat_guard")]
     pub repeat_guard: usize,
     /// when set, /v1/* requires `Authorization: Bearer <api_key>`. The chat
-    /// UI and legacy /chat stay open - gate those with a PRIVATE deployment.
+    /// UI and legacy /chat stay open - gate those with a PRIVATE deployment,
+    /// or with `sso` below when the gate should be a LOGIN rather than a key.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// DERIVED PERSONAL API KEYS: when set (alongside `sso`), POST /v1/keys
+    /// hands a signed-in user a permanent key derived - deterministically,
+    /// nothing stored - from their identity under this seed, and /v1/*
+    /// accepts such keys beside api_key and sign-in tokens. Reference a
+    /// secret (`"$API_KEY_SEED"`), never a literal: config is published, and
+    /// whoever holds the seed can mint any identity's key. Rotating the
+    /// secret revokes every derived key at once - the only revocation a
+    /// stateless verifier has. See apikey.rs for the format.
+    #[serde(default)]
+    pub api_key_seed: Option<String>,
+    /// SIGN IN WITH ENCLAVE: when set (and `required`, its default), POST
+    /// /chat and /title demand a platform sign-in token, and /v1/* accepts
+    /// one beside api_key. The token is minted by enclave.host after the
+    /// visitor authenticates there (passkey or wallet) and is verified HERE,
+    /// statelessly - signature against `signer`, audience against this
+    /// deployment's id, expiry against the clock. See sso.rs for the format
+    /// and PLATFORM-sso.md for the platform half of the contract.
+    #[serde(default)]
+    pub sso: Option<crate::sso::SsoConfig>,
     /// inference backend: "onnx" (default - model bytes read from the volume,
     /// KV cache shuttled through wasi-nn tensors, model must fit guest memory)
     /// or "ggml" (a GGUF the HOST preloaded from the same volume; weights
@@ -307,6 +327,18 @@ impl AppConfig {
             .as_ref()
             .and_then(|t| t.search.as_ref())
             .or(self.search.as_ref())
+    }
+
+    /// The derived-key seed, usable. Guards the `"$API_KEY_SEED"`-with-no-
+    /// secret-set case (the platform leaves the placeholder literal when the
+    /// secret is missing), which would otherwise derive every user's key from
+    /// a string printed in the published config.
+    pub fn key_seed(&self) -> Option<&str> {
+        let s = self.api_key_seed.as_deref()?.trim();
+        if s.is_empty() || s.starts_with('$') {
+            return None;
+        }
+        Some(s)
     }
 }
 

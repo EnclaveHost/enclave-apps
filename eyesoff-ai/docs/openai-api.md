@@ -2,7 +2,7 @@
 
 The service-provider interface of the eyesoff-ai app (formerly llm-chat): everything a client can
 send to the `/v1` endpoints and everything that comes back, as implemented in
-`src/lib.rs` (accurate as of **0.46.0**). Point any OpenAI SDK at a
+`src/lib.rs` (accurate as of **0.53.0**). Point any OpenAI SDK at a
 deployment's URL and it works; this document is the contract, including the
 Enclave extensions the OpenAI schema has no words for.
 
@@ -10,6 +10,7 @@ Enclave extensions the OpenAI schema has no words for.
 base URL:  https://<id8>.app.enclave.host        (or the deployment's custom domain)
            └── /v1/models
            └── /v1/chat/completions
+           └── /v1/keys
 ```
 
 Everything here is served **by the model's own enclave**. There is no gateway
@@ -32,6 +33,67 @@ and answer `401 {"error":{"message":"missing or invalid API key","type":"invalid
 without it. **No key configured = open.** Gate with a private deployment when
 that is the intent; the chat playground and the legacy `/chat` route stay open
 either way (see `authorized()` and the `api_key` doc in `config.rs`).
+
+The same credential is also read from `x-api-key: <value>`, and where the
+fleet's inbound TLS proxy eats `Authorization` (observed 2026-08-17: a
+correct Bearer answered 401 while the same value as `X-Api-Key` answered
+200), that spelling is the one that reliably arrives - send both when in
+doubt, the server checks either.
+
+A deployment configured for **Sign in with Enclave** (top-level `sso` block)
+additionally accepts a platform sign-in token as the same credential, on
+`/v1/*` and on the playground routes alike - one login, either surface. With
+`sso.required` true the playground's `/chat` and `/title` demand one; a 401
+there carries `"code": "sso_required"`, which is what tells the playground to
+open its sign-in dialog. See `sso.rs` for the token format and
+`PLATFORM-sso.md` for the mint side.
+
+A deployment that also sets `api_key_seed` (a secret reference:
+`"$API_KEY_SEED"`) accepts a third credential on `/v1/*`: a **derived
+personal API key** (`EAK1.…`), minted at `POST /v1/keys` below. Three
+credentials, one check, any of them opens the API.
+
+---
+
+## POST /v1/keys
+
+Your own permanent API key, derived from your sign-in. Requires both the
+`sso` block and `api_key_seed` in the deployment config (404 otherwise), and
+a valid sign-in token as the request credential (401 with
+`"code": "sso_required"` without one). No request body.
+
+```json
+{
+  "object": "api_key",
+  "key": "EAK1.eyJzdWIiOiJhY2N0XzBlNjRkMTg5N2YxMGIzMmQzYTFiYzg0ZSIsInYiOjF9.uZIhoolqA1yzEDBoI6RM-ckj5RjieCQvWmtPxbB1InI",
+  "sub": "acct_0e64d1897f10b32d3a1bc84e",
+  "deterministic": true
+}
+```
+
+The key is not issued and stored, it is **derived**: a MAC, under the
+deployment's seed, over the identity your wallet or passkey unlocked at
+enclave.host (the sign-in token's `sub`). That buys three properties worth
+scripting against:
+
+- **Deterministic.** The same identity always derives the same key
+  (`"deterministic": true` states it in the payload). Losing the key costs a
+  fresh sign-in, not a rotation.
+- **Stateless.** The deployment stores nothing; verification recomputes the
+  MAC. There is no key list to read or leak.
+- **No expiry.** The trade a permanent credential makes. Revocation is the
+  operator rotating `api_key_seed`, which revokes *every* derived key at
+  once - there is no per-key revocation, and this document will not pretend
+  otherwise.
+
+Format (`apikey.rs` is the implementation and carries a pinned test vector):
+`EAK1.<base64url({"sub":…,"v":1})>.<base64url(Keccak-256(len(seed) || seed ||
+"EAK1.<payload>"))>`. The sign-in token, with its expiry, stays the root of
+the chain: a derived key cannot mint another key.
+
+`GET /models` (the playground route) advertises availability as
+`auth.keys: true`, and the playground's API dialog offers signed-in visitors
+a Reveal button wired to exactly this endpoint.
 
 ---
 
@@ -237,11 +299,20 @@ Drawing, looking and upscaling live here, as ordinary registry entries rather
 than as built-ins: see [Picture tools](#picture-tools) below.
 
 **2. Client passthrough — `tools: [...]` (array, OpenAI).**
-The client's own functions are offered to the model **instead of** the
-deployment's registry (never merged — a client-supplied name must not select
-a server-executed capability that shares it). Nothing here executes a
-caller's tool: the model's call comes back structured and the **client**
-runs it, then sends the result as a `role: "tool"` message.
+The client's own functions are offered to the model, and nothing here executes
+one: the model's call comes back structured and the **client** runs it, then
+sends the result as a `role: "tool"` message.
+
+From 0.46 they are offered **alongside** the deployment's registry rather than
+instead of it, so an agent that brings its own file tools still reaches
+`web_search`. The model sees one list and is told nothing about which entry is
+whose; a finished call is routed by the entry's **source**, never by its name.
+A server entry runs here, in the loop, and the client never sees it; a client
+entry ends the turn and comes back on `tool_calls`. A name declared on **both**
+sides resolves to the client's, and the deployment's twin is dropped from the
+list entirely — so a client-supplied name still cannot select a server-executed
+capability. `"web_search": false` withholds the web builtins from the merged
+list too, and `tool_choice: "none"` withholds everything.
 
 ```json
 "tools": [{"type": "function",

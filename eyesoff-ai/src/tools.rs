@@ -179,10 +179,20 @@ impl Builtin {
 
     fn description(self) -> &'static str {
         match self {
+            // This description is the ONLY instruction that reaches an agent
+            // client: a request carrying its own system message replaces the
+            // deployment's prompt entirely (build_prompt), so the two-attempt
+            // rule has to live here to bind on the case that needs it.
             Builtin::WebSearch =>
                 "Search the web and get back numbered results with page text. Use it for any \
                  fact about the world you cannot verify from this conversation, including ones \
-                 you believe you remember. Cite what you use as [1], [2].",
+                 you believe you remember. TWO-ATTEMPT RULE: if you have already tried to \
+                 reconstruct the same thing from memory twice - a layout, a table, a spec, a \
+                 set of constants, an exact quote - stop and call this instead. A third attempt \
+                 from memory is never better than one search. Re-deriving reference data step \
+                 by step in your reasoning, or writing \"let me recall\" a second time, is the \
+                 signal that you needed to search rather than think harder. Cite what you use \
+                 as [1], [2].",
             Builtin::Request =>
                 "Send an HTTP request to a URL and return the response text. GET (the default) \
                  reads a page or API - use it to read a web_search result in full, a URL the \
@@ -815,6 +825,13 @@ pub fn client_system_block(tools: &[Tool], require: Option<&str>) -> String {
          call at a time. When a result reports an error, say so plainly and answer from what \
          you have. When you have enough to answer, stop calling and write the answer.",
     );
+    push_forced(&mut s, require);
+    s
+}
+
+/// OpenAI's forcing `tool_choice`, as words. Shared by every block that can
+/// carry client entries, because only those can be forced.
+fn push_forced(s: &mut String, require: Option<&str>) {
     match require {
         Some("") => s.push_str(
             "\n\nFor THIS turn you MUST respond with a tool call, not a prose answer.",
@@ -824,6 +841,48 @@ pub fn client_system_block(tools: &[Tool], require: Option<&str>) -> String {
         )),
         None => {}
     }
+}
+
+/// The deployment's own tools offered ALONGSIDE a client's declared ones.
+///
+/// The client's entries come FIRST and win every name collision, which is what
+/// keeps the invariant `ChatReq::client_tools` has always stated: a
+/// client-supplied name must never select a server-executed capability that
+/// merely shares it. Dropping the server's twin is the only resolution that
+/// holds it, since renaming either side would hand the model two entries it
+/// has no way to tell apart.
+pub fn merge_registries(server: &[Tool], client: &[Tool]) -> Vec<Tool> {
+    let mut out: Vec<Tool> = client.to_vec();
+    out.extend(
+        server
+            .iter()
+            .filter(|s| !client.iter().any(|c| c.name == s.name))
+            .cloned(),
+    );
+    out
+}
+
+/// The block when BOTH lists are live: the client's declared tools and this
+/// deployment's own, rendered as one list.
+///
+/// The model is told nothing about which entry is whose, deliberately. From
+/// where it sits every call is the same act - write it, stop, the result comes
+/// back in a `<tool_response>` - and which side executes it is this app's
+/// business, not something a model should be reasoning about mid-answer. The
+/// budget is the one place the split leaks, because it bounds only the server's
+/// half; the client owns its own loop and its own limit.
+pub fn merged_system_block(tools: &[Tool], max_calls: usize, require: Option<&str>) -> String {
+    let mut s = signatures(tools);
+    s.push_str(&format!(
+        "Rules for this app: after you write a call, STOP - it is executed for you and its \
+         result comes back in a <tool_response> block; never invent one. Call ONLY the \
+         functions listed above, by their exact names - nothing else exists, and a call to \
+         anything else is shown to the user as a failure. One call at a time, and at most \
+         {max_calls} of them are run by this server in a single answer. When a call fails, \
+         say so plainly and answer from what you have. When you have enough to answer, stop \
+         calling and write the answer."
+    ));
+    push_forced(&mut s, require);
     s
 }
 
@@ -878,6 +937,103 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
+/// The values a model writes when it emits the SHAPE of a call without having
+/// decided its content: schema type names, the word placeholder itself, the
+/// filler an example would use. Matched whole, never as a substring, because
+/// every one of these is also a legitimate thing to search for.
+const STUB_VALUES: &[&str] = &[
+    "placeholder",
+    "placeholder prompt",
+    "placeholder text",
+    "placeholder query",
+    "placeholder description",
+    "your prompt here",
+    "your query here",
+    "your text here",
+    "your description here",
+    "prompt here",
+    "query here",
+    "text here",
+    "description here",
+    "prompt goes here",
+    "query goes here",
+    "insert prompt here",
+    "insert query here",
+    "example prompt",
+    "example query",
+    "sample prompt",
+    "sample text",
+    "some text",
+    "string",
+    "todo",
+    "tbd",
+    "fixme",
+    "...",
+    "…",
+];
+
+/// An argument the model never actually filled in: `(name, value)`.
+///
+/// This is what a call looks like when the reasoning that was going to author
+/// the argument never happened - most sharply after the think budget force-
+/// closes a block mid-plan, which drops the model into answer position with a
+/// decision half made. Observed live 2026-08-16 on a "write me a self-contained
+/// HTML file" turn: the budget ran out mid-sentence, the model's very next act
+/// was `generate_image {"prompt": "placeholder"}`, and the user got thirty
+/// seconds of GPU and a picture of nothing they asked for. The model's own next
+/// block read "I accidentally called generate_image with a placeholder prompt -
+/// that was a mistake", which is the tell that nothing about the call was meant.
+///
+/// Deliberately narrow. It matches a whole trimmed value against a closed list,
+/// or a value that is nothing but a bracketed slot (`<prompt>`, `[your query]`)
+/// - never a substring, because "what does placeholder mean" is a real question
+/// and a real query. The caller is expected to ASK rather than refuse (see
+/// ToolLoop::step): a model that meant the literal string sends it again.
+pub fn stub_arg(args: &serde_json::Value) -> Option<(String, String)> {
+    let obj = args.as_object()?;
+    for (k, v) in obj {
+        let Some(s) = v.as_str() else { continue };
+        if is_stub_value(s) {
+            return Some((k.clone(), s.trim().to_string()));
+        }
+    }
+    None
+}
+
+fn is_stub_value(s: &str) -> bool {
+    let s = s.trim().trim_matches(['"', '\'', '`']).trim();
+    if s.is_empty() {
+        return false;
+    }
+    // A bracketed slot is a stub whatever is written inside it, but only when
+    // the inside is a short run of words: `{"a": 1}` is a request body and
+    // `<html>...</html>` is a document, and neither is a slot.
+    let bracketed = [('<', '>'), ('[', ']'), ('{', '}')].iter().any(|&(o, c)| {
+        s.starts_with(o)
+            && s.ends_with(c)
+            && s.len() > 2
+            && {
+                let inner = &s[1..s.len() - 1];
+                inner.len() <= 48
+                    && !inner.contains([o, c, '"', ':', '\n', '/'])
+                    && inner.chars().any(char::is_alphabetic)
+            }
+    });
+    if bracketed {
+        return true;
+    }
+    // whole-value match, case- and punctuation-insensitive: models write
+    // "Placeholder." and "TODO" for the same non-decision. The trailing
+    // punctuation comes off SECOND, never first: an ellipsis is a stub in its
+    // own right and stripping it leaves nothing to match.
+    let norm: String = s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+    if STUB_VALUES.contains(&norm.as_str()) {
+        return true;
+    }
+    let trimmed = norm.trim_end_matches(['.', ':', '!']);
+    !trimmed.is_empty() && STUB_VALUES.contains(&trimmed)
+}
+
 /// Pull tool calls out of a reply.
 ///
 /// Tolerant on purpose, because the failure mode is expensive: a call this
@@ -896,19 +1052,18 @@ pub fn parse_calls(text: &str) -> Vec<ToolCall> {
 pub fn parse_calls_for(text: &str, tools: &[Tool]) -> Vec<ToolCall> {
     let body = after_think(text);
     let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(i) = rest.find("<tool_call>") {
-        let after = &rest[i + "<tool_call>".len()..];
-        let (chunk, tail) = match after.find("</tool_call>") {
-            Some(j) => (&after[..j], &after[j + "</tool_call>".len()..]),
-            None => (after, ""),
-        };
+    // Scan the WHOLE reply, skipping only the calls that sit inside reasoning.
+    //
+    // `body` (everything past the LAST </think>) is not enough on its own: a
+    // model that never writes </tool_call> leaves the stop string unfired, so
+    // one reply can carry a complete call, THEN another <think> block, then a
+    // second call the token cap cut in half. Anchoring on the last </think>
+    // sees only that truncated tail and throws the good call away - observed
+    // live 2026-08-14 from qwen3.8 through opencode, where a valid `todowrite`
+    // was discarded and the reply was delivered as raw JSON prose.
+    for chunk in call_chunks(text) {
         if let Some(c) = one_call(chunk, tools) {
             out.push(c);
-        }
-        rest = tail;
-        if tail.is_empty() {
-            break;
         }
     }
     if !out.is_empty() {
@@ -955,6 +1110,60 @@ fn infer_name(args: &serde_json::Value, tools: &[Tool]) -> Option<String> {
     Some(first.name.clone())
 }
 
+/// The `<tool_call>` bodies in a reply, in order, skipping any that sit INSIDE
+/// a reasoning block.
+///
+/// Think-depth is counted rather than assumed: a call is reasoning if more
+/// `<think>` tags opened before it than closed. That is the rule the old
+/// `after_think` anchor was approximating, and the approximation broke the
+/// moment a model interleaved a real call with more thinking - which qwen3.8
+/// does whenever it omits `</tool_call>`, because nothing then stops it.
+///
+/// A body runs to its `</tool_call>`, or to the next `<think>` when the model
+/// never closed the tag, or to the end of the reply. Stopping at `<think>`
+/// matters: without it a complete call would swallow the rest of the reply and
+/// fail to parse as one object.
+fn call_chunks(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut depth = 0i32;
+    while pos < text.len() {
+        let rest = &text[pos..];
+        let open = rest.find("<think>");
+        let close = rest.find("</think>");
+        let call = rest.find("<tool_call>");
+        // whichever marker comes first decides what happens next
+        let next = [open, close, call].into_iter().flatten().min();
+        let Some(n) = next else { break };
+        if Some(n) == open && depth >= 0 {
+            depth += 1;
+            pos += n + "<think>".len();
+        } else if Some(n) == close {
+            depth -= 1;
+            pos += n + "</think>".len();
+        } else {
+            let after = pos + n + "<tool_call>".len();
+            let tail = &text[after..];
+            // A body ends at the first thing that cannot be part of it. All
+            // four matter, because this model omits `</tool_call>` and then
+            // writes whatever it likes next: a stray `</think>` with no opener,
+            // or simply the NEXT call. Ending only at `</tool_call>`/`<think>`
+            // let one truncated body swallow the rest of the reply - including
+            // the good call after it (measured live 2026-08-14, run 6).
+            let end = ["</tool_call>", "<think>", "</think>", "<tool_call>"]
+                .iter()
+                .filter_map(|m| tail.find(m))
+                .min()
+                .unwrap_or(tail.len());
+            if depth <= 0 {
+                out.push(&tail[..end]);
+            }
+            pos = after + end;
+        }
+    }
+    out
+}
+
 /// Everything after a closed `<think>` block, or the whole text when there is
 /// no block (or it never closed - a reply still inside its reasoning has not
 /// called anything).
@@ -983,23 +1192,55 @@ fn strip_fence(t: &str) -> Option<&str> {
 fn one_call(chunk: &str, tools: &[Tool]) -> Option<ToolCall> {
     let t = chunk.trim();
     let t = strip_fence(t).unwrap_or(t);
-    let v: serde_json::Value = serde_json::from_str(t).ok().or_else(|| {
-        // a trailing sentence after the object is common; take the balanced
-        // prefix that parses
-        let end = balanced_end(t)?;
-        serde_json::from_str(&t[..end]).ok()
-    })?;
+    if let Some(c) = function_tag_call(t) {
+        return Some(c);
+    }
+    let v: serde_json::Value = serde_json::from_str(t)
+        .ok()
+        .or_else(|| {
+            // a trailing sentence after the object is common; take the balanced
+            // prefix that parses
+            let end = balanced_end(t)?;
+            serde_json::from_str(&t[..end]).ok()
+        })
+        .or_else(|| {
+            // ...and a call the generation budget cut off mid-object, which is
+            // the NORMAL ending for a model that never writes </tool_call>:
+            // nothing stops it, so the reply runs to max_new and the last thing
+            // in it is a call missing its closing braces. Measured live
+            // 2026-08-14: a `write` carrying a COMPLETE 29 KB index.html, one
+            // `}` short, thrown away in full.
+            let repaired = close_truncated(t)?;
+            serde_json::from_str(&repaired).ok()
+        })?;
+    // OpenAI's OWN nesting, `{"function": {"name": ..., "arguments": ...}}`,
+    // carries both halves, so unwrap it before reading either.
+    let v = match v.get("function") {
+        Some(f) if f.is_object() => f.clone(),
+        _ => v,
+    };
     let mut args = match v.get("arguments").or_else(|| v.get("parameters")) {
-        Some(serde_json::Value::String(s)) => {
-            serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))
-        }
+        // double-encoded arguments, which this family emits too: the object
+        // arrives as a STRING of JSON. Truncation hits that inner document the
+        // same way it hits the outer one, so it gets the same repair.
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s)
+            .ok()
+            .or_else(|| close_truncated(s).and_then(|r| serde_json::from_str(&r).ok()))
+            .unwrap_or_else(|| serde_json::Value::String(s.clone())),
         Some(a) => a.clone(),
         None => serde_json::json!({}),
     };
     let named = |v: Option<&serde_json::Value>| {
         v.and_then(|n| n.as_str()).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string)
     };
-    let name = match named(v.get("name")) {
+    // `name` is the trained key; `function` is OpenAI's, and qwen3.x reaches
+    // for it often enough that leaving it out was a real failure class. Those
+    // calls only ran when infer_name happened to pick them out of their
+    // argument keys, which is luck: two tools sharing a key shape make it
+    // ambiguous and the whole call - a written FILE, in the case that found
+    // this - is shown to the user as raw JSON instead. Read the name the model
+    // actually wrote before trying to deduce one.
+    let name = match named(v.get("name")).or_else(|| named(v.get("function"))) {
         Some(n) => n,
         None => {
             // no top-level name: pull it OUT of the arguments, where a `name`
@@ -1020,6 +1261,86 @@ fn one_call(chunk: &str, tools: &[Tool]) -> Option<ToolCall> {
         return None;
     }
     Some(ToolCall { name, args })
+}
+
+/// The `<function=name>` spelling: the functionary/Llama tool syntax, which
+/// this family reaches for perhaps one turn in three even when the prompt only
+/// ever showed it the Hermes form.
+///
+/// What follows the tag is not reliably the documented `{args}` either. Live on
+/// 2026-08-14 qwen3.8 wrote `<function=read>, "arguments": {"filePath": ...}}`
+/// - the tag welded onto a fragment of the trained form. Taking the name from
+/// the tag and the arguments from the first balanced object after it reads both
+/// spellings correctly, and a call with no object at all is still a call with
+/// no arguments rather than a dead block shown to the user as prose.
+fn function_tag_call(t: &str) -> Option<ToolCall> {
+    let rest = t.strip_prefix("<function=")?;
+    let (name, after) = rest.split_once('>')?;
+    let name = name.trim().trim_end_matches(['"', '\'']).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args = after
+        .find('{')
+        .map(|i| &after[i..])
+        .and_then(|s| Some(&s[..balanced_end(s)?]))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some(ToolCall { name: name.to_string(), args })
+}
+
+/// Close a JSON object the token budget cut off, or None when nothing is open.
+///
+/// Only ever APPENDS the closers the text is already short of, so it cannot
+/// change the meaning of what the model actually wrote: a truncated call comes
+/// back as the call it was going to be, and a merely malformed one still fails.
+/// The arguments a truncation drops are the LAST ones, which is why this is
+/// worth doing at all - the payload (a file's contents, typically) is complete
+/// long before the wrapper is.
+fn close_truncated(s: &str) -> Option<String> {
+    if !s.trim_start().starts_with('{') {
+        return None;
+    }
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_str = false;
+    let mut esc = false;
+    for c in s.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    if stack.is_empty() && !in_str {
+        return None; // nothing was open: this is malformed, not truncated
+    }
+    let mut out = String::with_capacity(s.len() + stack.len() + 2);
+    out.push_str(s);
+    if esc {
+        // a dangling backslash would escape the quote we are about to add
+        out.push('n');
+    }
+    if in_str {
+        out.push('"');
+    }
+    while let Some(c) = stack.pop() {
+        out.push(c);
+    }
+    Some(out)
 }
 
 /// Index just past the first balanced `{...}`, string-aware.
@@ -2310,6 +2631,234 @@ mod tests {
         // whereas a deployment that simply forgot the search block IS told
         let reg = build(&cfg, Builtins::default(), &|_| {});
         assert_eq!(reg.notes.len(), 1);
+    }
+
+    /// `tool`, but with the source that decides who executes it.
+    fn from(name: &str, src: ToolSrc) -> Tool {
+        Tool { src, ..tool(name) }
+    }
+
+    /// Run 6, live: a truncated nameless call with double-encoded arguments,
+    /// then a STRAY `</think>` with no opener, then the real `write`. A body
+    /// must end at the next marker of any kind or the first one swallows the
+    /// reply and the good call is never seen. The nameless one is recovered
+    /// too, from its argument keys, once its inner JSON is closed.
+    #[test]
+    fn a_truncated_body_does_not_swallow_the_call_after_it() {
+        let mut todowrite = tool("todowrite");
+        todowrite.parameters =
+            serde_json::json!({"type":"object","properties":{"todos":{"type":"array"}}});
+        let reg = [todowrite, tool("write")];
+        let reply = "</think>\n\n<tool_call>\n\
+                     {\"arguments\":\"{\\\"todos\\\":[{\\\"content\\\":\\\"plan the maze\
+                     \n</think>\n\n<tool_call>\n\
+                     {\"name\": \"write\", \"arguments\": {\"filePath\": \"/a.html\", \
+                     \"content\": \"<!DOCTYPE html>\\n</html>\\n\"}";
+        let calls = parse_calls_for(reply, &reg);
+        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"write"), "the write must survive: {names:?}");
+        let w = calls.iter().find(|c| c.name == "write").unwrap();
+        assert_eq!(w.args["content"], "<!DOCTYPE html>\n</html>\n");
+    }
+
+    /// A model that omits `</tool_call>` never fires the stop string, so one
+    /// reply carries a COMPLETE call, another think block, and then a second
+    /// call the token cap cut in half. BOTH come back: the complete one because
+    /// a truncated tail is not evidence it never happened, and the cut one
+    /// because close_truncated can finish it. Observed live 2026-08-14 from
+    /// qwen3.8 through opencode, where anchoring on the last </think> threw the
+    /// complete call away and the cut one would not parse.
+    #[test]
+    fn both_calls_survive_a_reply_that_never_closed_its_tag() {
+        let reg = [tool("todowrite"), tool("write")];
+        let reply = "<think>\nplanning\n</think>\n\
+                     <tool_call>\n{\"function\": \"todowrite\", \"arguments\": {\"q\": \"a\"}}\n\
+                     <think>\nnow the file, let me count the maze rows\n</think>\n\
+                     <tool_call>\n{\"function\": \"write\", \"arguments\": {\"q\": \"<!DOCTYPE";
+        let calls = parse_calls_for(reply, &reg);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].name, "todowrite");
+        assert_eq!(calls[0].args["q"], "a");
+        assert_eq!(calls[1].name, "write");
+        assert_eq!(calls[1].args["q"], "<!DOCTYPE");
+    }
+
+    /// A model that never writes `</tool_call>` never fires the stop string, so
+    /// its reply ends when the budget does - mid-object, one or two closers
+    /// short, with the actual payload already complete. Measured live
+    /// 2026-08-14: a `write` carrying a finished 29 KB index.html, exactly one
+    /// `}` short, discarded in full. Closing what is open recovers the file.
+    #[test]
+    fn a_call_the_budget_cut_off_is_still_run() {
+        let reg = [tool("write")];
+        let cut = "<tool_call>\n{\"name\": \"write\", \"arguments\": \
+                   {\"filePath\": \"/a.html\", \"content\": \"<html>done</html>\\n\"}";
+        let c = parse_calls_for(cut, &reg);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].name, "write");
+        assert_eq!(c[0].args["content"], "<html>done</html>\n");
+
+        // cut INSIDE the string: the partial value survives, the call still runs
+        let mid = "<tool_call>\n{\"name\": \"write\", \"arguments\": \
+                   {\"filePath\": \"/a.html\", \"content\": \"<html>half";
+        let c = parse_calls_for(mid, &reg);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].args["content"], "<html>half");
+
+        // genuinely malformed is still refused: nothing was left open
+        assert!(close_truncated("{\"a\": 1}").is_none());
+        assert!(close_truncated("not json").is_none());
+    }
+
+    /// The third spelling this model produces, captured live 2026-08-14: the
+    /// functionary `<function=name>` tag welded onto a fragment of the trained
+    /// form. Both that hybrid and the documented `<function=name>{args}` have
+    /// to read, because which one arrives is a coin toss.
+    #[test]
+    fn the_function_tag_spelling_is_still_a_call() {
+        let reg = [tool("read")];
+        let hybrid = "<tool_call>\n<function=read>, \"arguments\": \
+                      {\"filePath\": \"/x/game\"}}";
+        let c = parse_calls_for(hybrid, &reg);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].name, "read");
+        assert_eq!(c[0].args["filePath"], "/x/game");
+
+        let documented = "<tool_call>\n<function=read>{\"filePath\": \"/y\"}</function>\n</tool_call>";
+        let c = parse_calls_for(documented, &reg);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "read");
+        assert_eq!(c[0].args["filePath"], "/y");
+    }
+
+    /// The rule the scan actually enforces: a call written INSIDE reasoning is
+    /// a model talking about calling something, not a call.
+    #[test]
+    fn a_call_inside_reasoning_is_still_not_a_call() {
+        let reg = [tool("write")];
+        let inside = "<think>\nI could write \
+                      <tool_call>\n{\"name\": \"write\", \"arguments\": {\"q\": \"x\"}}\n</tool_call>\n\
+                      but first let me check\n</think>\n\nLet me check the folder.";
+        assert!(parse_calls_for(inside, &reg).is_empty());
+    }
+
+    /// The name under OpenAI's key rather than the trained one. Observed from
+    /// qwen3.8 through opencode, where a `write` carrying a whole file was
+    /// shown to the user as raw JSON because nothing read `"function"` and the
+    /// argument keys were not unique enough for infer_name to rescue it.
+    #[test]
+    fn a_call_named_under_function_is_still_a_call() {
+        let mut read = tool("read");
+        read.parameters =
+            serde_json::json!({"type":"object","properties":{"filePath":{"type":"string"}}});
+        let mut write = tool("write");
+        write.parameters = serde_json::json!({
+            "type":"object",
+            "properties":{"filePath":{"type":"string"},"content":{"type":"string"}}
+        });
+        let reg = [read, write];
+
+        // the flat spelling this model reaches for
+        let flat = "<tool_call>\n{\"function\": \"write\", \"arguments\": \
+                    {\"filePath\": \"/a.html\", \"content\": \"<!DOCTYPE html>\"}}\n</tool_call>";
+        let c = parse_calls_for(flat, &reg);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "write");
+        assert_eq!(c[0].args["content"], "<!DOCTYPE html>");
+
+        // and OpenAI's own nesting, which carries the arguments with it
+        let nested = "<tool_call>\n{\"function\": {\"name\": \"read\", \"arguments\": \
+                      {\"filePath\": \"/a.html\"}}}\n</tool_call>";
+        let c = parse_calls_for(nested, &reg);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "read");
+        assert_eq!(c[0].args["filePath"], "/a.html");
+
+        // the trained spelling still wins when both are somehow present
+        let both = "<tool_call>\n{\"name\": \"read\", \"function\": \"write\", \
+                    \"arguments\": {\"filePath\": \"/a.html\"}}\n</tool_call>";
+        assert_eq!(parse_calls_for(both, &reg)[0].name, "read");
+    }
+
+    /// The deployment's tools join the client's rather than replacing them, so
+    /// an agent that brought its own file tools can still reach web_search.
+    #[test]
+    fn the_merge_offers_both_lists_at_once() {
+        let server = [from("web_search", ToolSrc::Http(0)), from("request", ToolSrc::Http(1))];
+        let client = [from("read", ToolSrc::Client), from("write", ToolSrc::Client)];
+        let all = merge_registries(&server, &client);
+        let names: Vec<&str> = all.iter().map(|t| t.name.as_str()).collect();
+        // the client's lead: they are the caller's own job, ours supplement it
+        assert_eq!(names, ["read", "write", "web_search", "request"]);
+        // and one block carries them all, in the trained format
+        let block = merged_system_block(&all, 32, None);
+        for n in names {
+            assert!(block.contains(&format!("\"name\":\"{n}\"")), "{n} missing from {block}");
+        }
+        // one list, not two: the tag also appears in the prose above it, so
+        // count the opening tag as it is actually emitted, on its own line
+        assert_eq!(block.matches("\n<tools>\n").count(), 1);
+    }
+
+    /// The invariant client_tools has always stated: a client-supplied NAME can
+    /// never select a server-executed capability. The client's entry wins and
+    /// the server's twin leaves the list, so there is nothing to select.
+    #[test]
+    fn a_name_collision_is_won_by_the_client() {
+        let server = [from("web_search", ToolSrc::Http(0))];
+        let client = [from("web_search", ToolSrc::Client)];
+        let all = merge_registries(&server, &client);
+        assert_eq!(all.len(), 1);
+        assert!(matches!(all[0].src, ToolSrc::Client));
+    }
+
+    /// The detector's whole job is to be narrow: an unfilled slot is caught,
+    /// and a real value that merely READS like one is not, because the cost of
+    /// a false positive is a wasted generation on every turn that asks about
+    /// any of these words.
+    #[test]
+    fn an_unfilled_argument_is_told_from_a_real_one() {
+        let a = |v: serde_json::Value| stub_arg(&v).map(|(k, val)| format!("{k}={val}"));
+
+        // the live 2026-08-16 call
+        assert_eq!(
+            a(serde_json::json!({"prompt": "placeholder", "size": "1024x1024"})).as_deref(),
+            Some("prompt=placeholder")
+        );
+        // the other spellings of not having decided
+        for v in [
+            "Placeholder.", "TODO", "tbd", "...", "…", "string", "your prompt here",
+            "  Some text  ", "<prompt>", "[your query]", "{description}",
+        ] {
+            assert!(
+                stub_arg(&serde_json::json!({ "prompt": v })).is_some(),
+                "{v:?} is a slot the model never filled"
+            );
+        }
+
+        // REAL values, including every one that contains a stub word
+        for v in [
+            "a tall white multi-stage rocket on a tropical island launch pad",
+            "what does placeholder mean in typography",
+            "placeholder text generators",
+            "rust string vs &str",
+            "TODO comments in the rust standard library",
+            "{\"id\": 7}",                       // a request body, not a slot
+            "<html><body>hi</body></html>",      // a document, not a slot
+            "<a very long bracketed run of words that is clearly real content>",
+            "/v1/models",
+        ] {
+            assert_eq!(
+                stub_arg(&serde_json::json!({ "query": v })),
+                None,
+                "{v:?} is a value the model chose"
+            );
+        }
+
+        // non-strings and absent arguments are nothing to do with this
+        assert_eq!(stub_arg(&serde_json::json!({"n": 1, "on": true})), None);
+        assert_eq!(stub_arg(&serde_json::json!({})), None);
+        assert_eq!(stub_arg(&serde_json::json!("placeholder")), None);
     }
 
     /// A routed line needs a parameter to bind to: route_arg, or the sole
