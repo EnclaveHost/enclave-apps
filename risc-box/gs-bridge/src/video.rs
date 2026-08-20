@@ -414,7 +414,7 @@ fn send_frame(
     peer: std::net::SocketAddr,
     au: &[u8],
     frame_index: u32,
-    lowseq: &mut u16,
+    lowseq: &mut u32,
     timestamp: u32,
     packet_size: usize,
     min_required_fec_packets: usize,
@@ -488,7 +488,7 @@ fn send_frame(
             if x == packets - 1 {
                 flags |= FLAG_EOF;
             }
-            write_nv_header(hdr, frame_index, lowseq.wrapping_add(x as u16), flags, block_index, blocks_needed);
+            write_nv_header(hdr, frame_index, lowseq.wrapping_add(x as u32), flags, block_index, blocks_needed);
         }
 
         // Each data shard must be exactly `blocksize` for the RS encoder;
@@ -529,7 +529,7 @@ fn send_frame(
         let total = data_shards + parity_shards;
         let multi_fec_blocks = ((block_index as u8) << 4) | (((blocks_needed - 1) as u8) << 6);
         for (x, shard) in shards.iter_mut().enumerate().take(total) {
-            let seq = lowseq.wrapping_add(x as u16);
+            let seq = lowseq.wrapping_add(x as u32);
 
             let fec_info: u32 =
                 ((x as u32) << 12) | ((data_shards as u32) << 22) | ((effective_percentage as u32) << 4);
@@ -538,9 +538,17 @@ fn send_frame(
             shard[27] = multi_fec_blocks;
 
             // RTP header. Sequence number and timestamp are big-endian.
+            // The wire sequence is the low 16 bits of the running counter —
+            // it wraps every 65536 packets and the client's RTP queue expects
+            // that. streamPacketIndex (write_nv_header) is the SAME counter's
+            // low 24 bits, which wrap ~256x later; deriving it from the u16
+            // (as this code once did) replays the first 65536 packet indexes
+            // forever, and the depacketizer reads the jump backwards as an
+            // unrecoverable loss — every frame after ~65K packets (about two
+            // minutes at 40 fps with FEC) arrived pre-declared corrupt.
             shard[0] = 0x80 | FLAG_EXTENSION;
             shard[1] = 0x00; // packetType
-            shard[2..4].copy_from_slice(&seq.to_be_bytes());
+            shard[2..4].copy_from_slice(&(seq as u16).to_be_bytes());
             shard[4..8].copy_from_slice(&timestamp.to_be_bytes());
             shard[8..12].copy_from_slice(&0u32.to_be_bytes()); // ssrc
 
@@ -577,7 +585,7 @@ fn send_frame(
             sock.send_to(shard, peer)?;
         }
 
-        *lowseq = lowseq.wrapping_add(total as u16);
+        *lowseq = lowseq.wrapping_add(total as u32);
     }
 
     Ok(())
@@ -589,10 +597,13 @@ fn send_frame(
 /// where the NV header is
 ///   streamPacketIndex u32 LE @16, frameIndex u32 LE @20, flags @24,
 ///   extraFlags @25, multiFecFlags @26, multiFecBlocks @27, fecInfo u32 LE @28.
-fn write_nv_header(hdr: &mut [u8], frame_index: u32, seq: u16, flags: u8, block_index: usize, blocks_needed: usize) {
-    // streamPacketIndex is the RTP sequence number shifted left 8; the client
-    // masks the low byte off and requires it to be contiguous across the stream.
-    let spi: u32 = (seq as u32) << 8;
+fn write_nv_header(hdr: &mut [u8], frame_index: u32, seq: u32, flags: u8, block_index: usize, blocks_needed: usize) {
+    // streamPacketIndex is the low 24 bits of the running packet counter,
+    // shifted left 8. The client masks the low byte off and requires the
+    // 24-bit value to be contiguous across the WHOLE stream — so it must come
+    // from the full counter, never from the 16-bit RTP sequence (which wraps
+    // 256 times per streamPacketIndex cycle).
+    let spi: u32 = seq << 8;
     hdr[16..20].copy_from_slice(&spi.to_le_bytes());
     hdr[20..24].copy_from_slice(&frame_index.to_le_bytes());
     hdr[24] = flags;
@@ -693,7 +704,7 @@ struct AuSink {
     /// shards are ever encrypted under the same key and nonce.
     iv_counter: std::sync::atomic::AtomicU64,
     frame_index: u32,
-    lowseq: u16,
+    lowseq: u32,
 }
 
 impl AuSink {
@@ -959,6 +970,21 @@ mod tests {
         au.extend_from_slice(&[0, 0, 0, 1, 0x06, 0x05, 0x00]); // SEI
         au.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x11]); // P slice
         assert_eq!(strip_filler(&au), au);
+    }
+
+    /// The 24-bit streamPacketIndex must keep counting where the 16-bit RTP
+    /// sequence wraps — deriving it from the u16 replayed the first 65536
+    /// indexes forever and every frame after ~two minutes arrived corrupt.
+    #[test]
+    fn stream_packet_index_survives_the_u16_wrap() {
+        let mut a = vec![0u8; 32];
+        let mut b = vec![0u8; 32];
+        write_nv_header(&mut a, 0, 0xFFFF, 0, 0, 1);
+        write_nv_header(&mut b, 0, 0x1_0000, 0, 0, 1);
+        let spi = |h: &[u8]| u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+        assert_eq!(spi(&a), 0xFFFF00);
+        assert_eq!(spi(&b), 0x100_0000 & 0xFFFFFF00 | 0); // 0x1000000: the next 24-bit index, not zero
+        assert_eq!(spi(&b).wrapping_sub(spi(&a)), 0x100, "consecutive packets stay contiguous");
     }
 
     #[test]
