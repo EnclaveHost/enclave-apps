@@ -50,6 +50,32 @@ and the relay ~40 ms from this client, so ~310 ms is being spent inside the
 machinery per request. The old "inbound request tax" note (ACK-lockstep,
 below the app layer) was very likely this same thing seen from the side.
 
+## Addendum, same night: it is the BOX, not the tunnel
+
+The same signature reproduced on kryptos's DIRECT endpoint — no relay, no
+tunnel: a 31-minute H.264 soak (3 Mbps) held a flat 40 fps for minutes at a
+time and then dropped into multi-second freezes clustered into multi-minute
+bad periods (456 of 1856 seconds below 30). During a nine-second freeze,
+captured live:
+
+- ICMP to the very same host (69.46.85.219) ran flat: 0 spikes over 80 ms,
+  0 losses, no sequence gaps, in 1198 pings at 0.3 s intervals;
+- ICMP to 8.8.8.8 equally clean (rules out the client's uplink);
+- a warm HTTPS probe on a SEPARATE connection to the same box froze in the
+  same windows (p50 34 ms clean, multi-second outliers up to 8.2 s);
+- the app's own gauges showed it still producing 40 fps into a socket that
+  had stopped draining (the SSE production gate then pauses it, correctly).
+
+Every TCP stream through the box freezes together while ICMP sails: the
+network path is innocent, and so are the relay and the tunnel — metal0 just
+adds its relay tax on top of the same box-side seizure. The prime suspect is
+an event-loop block in the supervisor/wasm-manager (Node): `saveStateNow`'s
+synchronous `writeFileSync` ticks every 2 s while billing keeps the state
+dirty, and a CVM disk under IO pressure turns a millisecond write into a
+multi-second stall that freezes every proxied byte on the box. Instrument
+with blocked-at (or clinic.js) under streaming load; move the state save off
+the loop (async write or a worker).
+
 ## How to reproduce in five minutes
 
 1. Any deployment on a tunnel box; api_key set; owner app-token in hand.
