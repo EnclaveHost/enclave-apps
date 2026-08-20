@@ -56,11 +56,26 @@ moment never re-fires — a socket that STAYS writable generates no new edges
 serve, until an unrelated dispatch resyncs it. Two SET guest threads
 multiply the bad interleavings (~12:1 divergence rate vs plain, matching the
 stall differential); the defect exists on plain too, exactly as the fleet
-A/B said. One honest loose end: `poll_write_ready(noop)` reports Pending
-while `try_write` microseconds later succeeds — tokio's two readiness views
-disagree with EACH OTHER, not just with the kernel; the tokio-internal
-misstep behind that is unresolved (upstream-report material), the fix below
-sidesteps it entirely.
+A/B said.
+
+**The named mechanism** (settled by re-polling under
+`tokio::task::unconstrained` at each divergence — the sockdbg line carries
+the verdict): `coop_was_the_blocker=true` in **1,004 of 1,006** write-ready
+divergences. The CLI runs the whole guest inside one `runtime.block_on`, so
+every sync hostcall shares that poll's tokio **coop budget** (128), and
+tokio's `Registration::poll_ready` — the path under p2 `check-write` —
+gates on `coop::poll_proceed` BEFORE consulting readiness. An exhausted
+budget makes every socket's `check-write` report "not ready" collectively
+until the next fiber yield resets the budget: the whole-socket-set freeze
+and the same-instant release, exactly as observed. `try_read`/`try_write`
+have no coop gate — why reads kept working and the kernel always
+disagreed. The remaining ~0.2% (and the read-side 96-byte hand-offs) are
+genuine cache lag: an edge awaiting driver dispatch. The fix neutralizes
+BOTH classes; a coop-only fix (unconstrained shims) would miss the second.
+This bites ANY wasip2 sync guest doing many nonblocking stream ops between
+yields — not just risc-box. Upstream-report material for wasmtime: sync
+host shims poll coop-gated tokio APIs with noop wakers inside the CLI's
+block_on budget.
 
 ## The fix
 
@@ -79,6 +94,8 @@ Verified locally, same rig, same pins, same load, interleaved arms:
 
 - SET: 10-min soak **4,198/4,198 probes, 0 stalls, worst 23ms** (was 59
   stalls, worst 1.2s). Plain: **4,198/4,198, 0 stalls, worst 21ms**.
+- 30-min soaks, both arms concurrently: **12,594/12,594 each, 0 stalls,
+  worst 14ms (SET) / 16ms (plain)** — the ≥25-min bar, cleared locally.
 - The fallback absorbed 36k (SET) / 3k (plain) cache-vs-kernel divergences
   while doing it. `videoFps` held ~40 throughout.
 - `cargo test -p wasmtime-wasi --release`: 228 passed, 3 failed — all three
