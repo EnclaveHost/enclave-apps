@@ -1,85 +1,74 @@
-# The tunnel path stalls whole-hog under streaming load
+# The tenant socket freeze: engine-layer, SET-amplified
 
-Platform-side defect, measured 2026-08-20 against metal0 (tunnel-attached,
-Phoenix — guest egress exits 4.15.13.178) through the us-west relay
-(cc5cd64e.app.enclave.host → 5.78.85.108). It is what stands between metal0's
-excellent CPU and a stall-free video stream; kryptos's direct endpoint has no
-trace of it.
+Rewritten 2026-08-20 (third pass tonight — each earlier conclusion was
+falsified by a sharper probe; the ladder below is the whole story and each
+rung is measured, so start at the bottom).
 
-## The signature
+## The defect
 
-One H.264 SSE stream at a modest, steady rate (2-3 Mbps → 330-500 KB/s on the
-wire including base64) plus a warm-connection probe (`GET /status` every
-100 ms on its own persistent TLS connection):
+A tenant streaming SSE (any stream: H.264 /video or deflate /display) while
+serving a handful of concurrent requests intermittently freezes — ALL of that
+tenant's TCP at once, 0.5-14 s per episode, clustered — while the guest keeps
+executing at full speed. A Moonlight player feels it as the game freezing
+whenever they do anything that generates requests (mouse, keys).
 
-| condition | probe p50 | probe p90 | probe >500 ms |
-|---|---|---|---|
-| idle (no stream) | 389 ms | 394 ms | 1 of 58 |
-| while streaming | 400 ms | **1008 ms** | **26 of 131** |
+## The exoneration ladder (measure in this order next time)
 
-The stream itself shows the same windows: ~1 s holes with ZERO events, every
-~10-20 s, followed by a catch-up burst (the bytes were queued, not lost).
-Lowering the stream to 2 Mbps does not remove them. The client's own uplink
-pinged 8.8.8.8 240/240 with nothing over 60 ms through the worst of it, and the
-app's `videoFps` gauge shows production pausing only AFTER the socket stops
-draining (the SSE backlog gate at 192 KB doing its job) — so the stall is
-below the app and beyond the client.
+1. **The client's network**: ping 8.8.8.8 through the worst of it — 240/240,
+   nothing over 60 ms.
+2. **The path**: ICMP to the serving host itself, flat, zero loss, while its
+   TCP stalled (kryptos 69.46.85.219, metal0 via 5.78.85.108).
+3. **The relay/tunnel**: same freezes on kryptos's DIRECT endpoint — no
+   relay, no tunnel. (metal0's relay path adds a fixed 389 ms/request tax and
+   its own exposure, but it is not the cause.)
+4. **The ingress shim**: /.well-known/tinfoil-attestation flat (p90 109 ms,
+   0 stalls) during tenant stalls.
+5. **The supervisor's event loop**: its own /v1/pricing flat (p90 116 ms,
+   0 stalls) during tenant stalls.
+6. **The box / other tenants**: a second tenant on the same box answered
+   250/250 clean, interleaved with 16 stalls on this one. Per-tenant, not
+   box-wide.
+7. **The app's own loop**: per-turn telemetry (0.6.43: turnMaxMs/turnMax in
+   /status, SLOW TURN log lines) — worst turn 11-13 ms while a warm probe on
+   the same app waited 4.8-14 s. The Rust loop never stopped; its bytes did.
 
-Two more data points that localize it:
+What remains between a healthy guest loop and a healthy supervisor is the
+per-tenant wasmtime host: the wasip2 socket/stream layer of the fleet engine.
 
-- A warm request through this path costs 389 ms IDLE — flat, so it is a fixed
-  tax, not congestion. The direct kryptos endpoint answers ~100 ms cold.
-- The probe rides a DIFFERENT TCP connection than the stream and freezes in
-  the same windows: whatever stalls, stalls the whole tunnel, not one stream.
+## The differential that names the suspect
 
-## Suspects, in the order I would look
+Same deployment, same box, same load pattern (one SSE stream + ~7/s warm
+probes):
 
-1. **The supervisor/wasm-manager event loop on the box** — everything proxied
-   shares it. A periodic synchronous chunk of work that scales with traffic
-   fits the "only under load" shape; `saveStateNow`'s `writeFileSync` ticks
-   every 2 s when dirty (supervisor.js:1901), and the billing/lease beats run
-   at ~15 s, which rhymes with the observed period.
-2. **The relay↔box tunnel transport** — if it is one multiplexed TCP, one
-   loss puts every stream behind an in-order hole (HOL); the fix shape is
-   per-stream connections or a window bump.
-3. **The relay's HTTP proxy layer** (us-west, node) — GC or a buffer-copy
-   path that only hurts at streaming rates.
+| build | stalls / probes | worst |
+|---|---|---|
+| SET (shared-everything-threads) | 5 / 162 and 16 / 178 across runs | **14.2 s** |
+| plain wasip2 | 0 / 243 | 317 ms |
 
-The 389 ms idle floor is its own finding: metal0 is ~30-40 ms from the relay
-and the relay ~40 ms from this client, so ~310 ms is being spent inside the
-machinery per request. The old "inbound request tax" note (ACK-lockstep,
-below the app layer) was very likely this same thing seen from the side.
+Doubling the load on the plain build (two streams + 8/s probes) does
+reproduce the class — 9 / 361, worst 2.1 s, loop still 12 ms — so the base
+engine's socket layer is implicated too, but the SET patch drops the trigger
+threshold and raises the ceiling by an order of magnitude.
 
-## Addendum, same night: it is the BOX, not the tunnel
+## Where to look (engine repo)
 
-The same signature reproduced on kryptos's DIRECT endpoint — no relay, no
-tunnel: a 31-minute H.264 soak (3 Mbps) held a flat 40 fps for minutes at a
-time and then dropped into multi-second freezes clustered into multi-minute
-bad periods (456 of 1856 seconds below 30). During a nine-second freeze,
-captured live:
+- The CLI p2 socket/stream host path under `-S inherit-network`: what pumps
+  output-stream flushes and pollables when one writer streams continuously
+  and several keep-alive connections poll — a starved driver or a lock
+  convoy here freezes every socket of the instance while guest code runs on,
+  which is exactly the signature.
+- `wasmtime-set-threads.patch`: the per-thread fd-namespace layer sits on
+  that same path on every fd op; whatever it serializes, both the app thread
+  and the worker thread cross it. The 10x severity delta is the tell.
+- Reproduce anywhere: risc-box 0.7.17 (SET) vs 0.7.18-plain are published
+  side by side; stream `/video?codec=h264` and hammer `/status` at ~7/s on a
+  warm connection; stalls >500 ms appear within a minute on SET.
 
-- ICMP to the very same host (69.46.85.219) ran flat: 0 spikes over 80 ms,
-  0 losses, no sequence gaps, in 1198 pings at 0.3 s intervals;
-- ICMP to 8.8.8.8 equally clean (rules out the client's uplink);
-- a warm HTTPS probe on a SEPARATE connection to the same box froze in the
-  same windows (p50 34 ms clean, multi-second outliers up to 8.2 s);
-- the app's own gauges showed it still producing 40 fps into a socket that
-  had stopped draining (the SSE production gate then pauses it, correctly).
+## What this is NOT (also measured tonight, all fixed app/bridge-side)
 
-Every TCP stream through the box freezes together while ICMP sails: the
-network path is innocent, and so are the relay and the tunnel — metal0 just
-adds its relay tax on top of the same box-side seizure. The prime suspect is
-an event-loop block in the supervisor/wasm-manager (Node): `saveStateNow`'s
-synchronous `writeFileSync` ticks every 2 s while billing keeps the state
-dirty, and a CVM disk under IO pressure turns a millisecond write into a
-multi-second stall that freezes every proxied byte on the box. Instrument
-with blocked-at (or clinic.js) under streaming load; move the state save off
-the loop (async write or a worker).
-
-## How to reproduce in five minutes
-
-1. Any deployment on a tunnel box; api_key set; owner app-token in hand.
-2. Stream: `curl -sN ".../video?codec=h264&kbps=3000" > /dev/null`.
-3. Probe (same box, separate connection): the warm-probe.py pattern — one
-   persistent HTTPS connection, `GET /status` every 100 ms, log latencies.
-4. Watch stalls >500 ms cluster only while (2) runs.
+Encoder overshoot at motion (fixed: MB-level RC), pointer event storms
+(fixed: coalesced cursor state), the /hid-stream body-buffering blackhole
+(fixed: loopback-only), the streamPacketIndex u16 wrap (fixed), keyframe
+burst oscillation (fixed: gop=0, bounded IDRs). After all of those the app
+produces a flat 40 fps through 250 Hz mouse input — this engine freeze is
+the only thing left between the chain and an uninterrupted stable 30+.
