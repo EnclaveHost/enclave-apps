@@ -184,22 +184,28 @@ fn start_session_workers(
     fb: (u32, u32),
     app_h264: bool,
 ) {
-    // Video and audio sockets are bound per session so a restart rebinds cleanly.
-    let video_sock = match UdpSocket::bind(("0.0.0.0", PORT_VIDEO)) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("[main] failed to bind video :{PORT_VIDEO}: {e}");
-            session.stop();
-            return;
+    // Video and audio sockets are bound per session so a restart rebinds
+    // cleanly. The PREVIOUS session's workers may still be releasing theirs
+    // (on_launch stopped it, but its threads notice on their next tick), so
+    // a fresh bind gets a few seconds of patience instead of failing the
+    // whole session on a race it always wins a moment later.
+    let bind_patiently = |port: u16, what: &str| -> Option<Arc<UdpSocket>> {
+        for _ in 0..25 {
+            match UdpSocket::bind(("0.0.0.0", port)) {
+                Ok(s) => return Some(Arc::new(s)),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
         }
+        eprintln!("[main] failed to bind {what} :{port} after 5s");
+        None
     };
-    let audio_sock = match UdpSocket::bind(("0.0.0.0", PORT_AUDIO)) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("[main] failed to bind audio :{PORT_AUDIO}: {e}");
-            session.stop();
-            return;
-        }
+    let Some(video_sock) = bind_patiently(PORT_VIDEO, "video") else {
+        session.stop();
+        return;
+    };
+    let Some(audio_sock) = bind_patiently(PORT_AUDIO, "audio") else {
+        session.stop();
+        return;
     };
 
     // Learn the client's media ports from its pings.
@@ -399,7 +405,14 @@ fn main() {
         on_launch: {
             let launched = launched.clone();
             Box::new(move |s: Arc<Session>| {
-                *launched.lock().unwrap() = Some(s);
+                // A client that vanished without teardown (crash, kill, power
+                // loss) leaves its session workers holding the media sockets;
+                // the next launch must evict it or every later session fails
+                // to bind :47998 and streams nothing — which is exactly what a
+                // reconnecting client looks like after its predecessor died.
+                if let Some(old) = launched.lock().unwrap().replace(s) {
+                    old.stop();
+                }
             })
         },
         host_name: "RISC Box".to_string(),

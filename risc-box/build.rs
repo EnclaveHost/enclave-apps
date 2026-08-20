@@ -16,7 +16,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=vendor/minih264");
+    // Individual files, not the directory: a directory's mtime moves on
+    // entry add/remove, NOT on an edit inside a file, so watching the dir
+    // silently shipped stale C once already.
+    println!("cargo:rerun-if-changed=vendor/minih264/wrapper.c");
+    println!("cargo:rerun-if-changed=vendor/minih264/minih264e.h");
+    println!("cargo:rerun-if-changed=vendor/minih264/shim");
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();

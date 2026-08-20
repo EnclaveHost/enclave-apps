@@ -19,9 +19,16 @@ static void fill_create(H264E_create_param_t *cp, int w, int h, int gop, int kbp
     cp->width = w;
     cp->height = h;
     cp->gop = gop;
-    /* One second of VBV at the target rate: enough smoothing that an IDR does
-     * not blow the budget, small enough that the rate stays honest. */
-    cp->vbv_size_bytes = kbps * 1000 / 8;
+    /* Half a second of VBV: frame-level rate control adapts on VBV feedback,
+     * and a full second let a hard view rotation run 8-9 Mbps against a
+     * 2.4 Mbps session for ~500 ms — a wire backlog the viewer feels as a
+     * freeze the moment the motion stops. */
+    cp->vbv_size_bytes = kbps * 1000 / 16;
+    /* Macroblock-level rate control: holds the byte budget WITHIN a frame
+     * instead of noticing the overshoot one frame later. Slightly lower
+     * quality at a given rate; a real-time stream cares more that the rate
+     * is real. */
+    cp->fine_rate_control_flag = 1;
     /* The input planes are Rust-owned slices; the encoder must not scribble
      * on them (aliasing rules), so it gets its own internal copy buffer. */
     cp->const_input_flag = 1;
