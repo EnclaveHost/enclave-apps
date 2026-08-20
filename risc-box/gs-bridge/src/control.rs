@@ -189,14 +189,19 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
     match magic {
         MOUSE_MOVE_REL_MAGIC_GEN5 if body.len() >= 4 => {
             // The emulated pointer is absolute, so integrate the delta into
-            // the cursor we track and send the resulting position.
+            // the cursor we track. No event is queued: position is state, and
+            // the drainer ships the latest once per cycle — forwarding every
+            // 125-1000 Hz mouse sample drowned the emulated CPU in input IRQs
+            // and froze the game for exactly as long as the mouse moved.
             let (dx, dy) = (be16(body, 0) as f64, be16(body, 2) as f64);
             let cfg = session.config.lock().unwrap().clone();
             let (w, h) = (cfg.width.max(1) as f64, cfg.height.max(1) as f64);
             let mut cur = session.cursor.lock().unwrap();
             cur.0 = (cur.0 + dx / w).clamp(0.0, 1.0);
             cur.1 = (cur.1 + dy / h).clamp(0.0, 1.0);
-            Some(format!(r#"{{"t":"move","x":{:.6},"y":{:.6}}}"#, cur.0, cur.1))
+            drop(cur);
+            session.cursor_dirty.store(true, Ordering::Release);
+            None
         }
         MOUSE_MOVE_ABS_MAGIC if body.len() >= 10 => {
             // x/y are in the client's reference space, whose inclusive bounds
@@ -209,7 +214,8 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
             let nx = (x / ref_w).clamp(0.0, 1.0);
             let ny = (y / ref_h).clamp(0.0, 1.0);
             *session.cursor.lock().unwrap() = (nx, ny);
-            Some(format!(r#"{{"t":"move","x":{nx:.6},"y":{ny:.6}}}"#))
+            session.cursor_dirty.store(true, Ordering::Release);
+            None
         }
         MOUSE_BUTTON_DOWN_MAGIC_GEN5 | MOUSE_BUTTON_UP_MAGIC_GEN5 if !body.is_empty() => {
             let down = magic == MOUSE_BUTTON_DOWN_MAGIC_GEN5;
@@ -351,6 +357,7 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     let mut retry_at: Option<std::time::Instant> = None;
     let mut retry_backoff = Duration::from_secs(5);
     let mut last_used = std::time::Instant::now();
+    let mut last_cursor: Option<std::time::Instant> = None;
     while !session.is_stopping() {
         if stream.is_none() {
             if let Some((mut cand, since)) = candidate.take() {
@@ -377,7 +384,24 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
                 }
             }
         }
-        let batch = queue.drain(Duration::from_millis(50));
+        let mut batch = queue.drain(Duration::from_millis(50));
+        // The coalesced pointer: at most one position update per cycle, the
+        // latest, ahead of any queued clicks so they land where the cursor
+        // is. Pure motion (nothing else queued) ships at half cadence — the
+        // cursor serves desktop clicks, not the game, and every request is
+        // load on the box the video stream shares.
+        if session.cursor_dirty.load(Ordering::Acquire) {
+            let due = !batch.is_empty()
+                || last_cursor.map_or(true, |t: std::time::Instant| {
+                    t.elapsed() >= Duration::from_millis(100)
+                });
+            if due {
+                session.cursor_dirty.store(false, Ordering::Release);
+                let cur = *session.cursor.lock().unwrap();
+                batch.insert(0, format!(r#"{{"t":"move","x":{:.6},"y":{:.6}}}"#, cur.0, cur.1));
+                last_cursor = Some(std::time::Instant::now());
+            }
+        }
         if batch.is_empty() {
             if let Some(p) = pipe.as_mut() {
                 p.poll();
@@ -768,6 +792,8 @@ mod tests {
 
     #[test]
     fn absolute_mouse_maps_into_normalized_coordinates() {
+        // Moves are coalesced: the event updates cursor state and queues
+        // nothing; the drainer ships the latest position once per cycle.
         let s = test_session();
         s.config.lock().unwrap().width = 1280;
         s.config.lock().unwrap().height = 720;
@@ -780,9 +806,11 @@ mod tests {
         body.extend_from_slice(&1279i16.to_be_bytes()); // width
         body.extend_from_slice(&719i16.to_be_bytes()); // height
 
-        let json = input_event_json(&s, &input_payload(MOUSE_MOVE_ABS_MAGIC, &body)).expect("event");
-        assert!(json.contains(r#""t":"move""#), "app expects the 't' discriminator: {json}");
-        assert!(json.contains("0.499") || json.contains("0.500"), "x should be ~0.5: {json}");
+        let queued = input_event_json(&s, &input_payload(MOUSE_MOVE_ABS_MAGIC, &body));
+        assert!(queued.is_none(), "moves are state, not queue entries: {queued:?}");
+        assert!(s.cursor_dirty.load(std::sync::atomic::Ordering::Acquire));
+        let cur = *s.cursor.lock().unwrap();
+        assert!((cur.0 - 0.4996).abs() < 1e-3, "x should be ~0.5: {cur:?}");
     }
 
     #[test]
@@ -795,13 +823,13 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&100i16.to_be_bytes()); // dx
         body.extend_from_slice(&(-250i16).to_be_bytes()); // dy
-        let json =
-            input_event_json(&s, &input_payload(MOUSE_MOVE_REL_MAGIC_GEN5, &body)).expect("event");
+        let queued = input_event_json(&s, &input_payload(MOUSE_MOVE_REL_MAGIC_GEN5, &body));
+        assert!(queued.is_none(), "moves are state, not queue entries: {queued:?}");
+        assert!(s.cursor_dirty.load(std::sync::atomic::Ordering::Acquire));
 
         let cur = *s.cursor.lock().unwrap();
         assert!((cur.0 - 0.6).abs() < 1e-6, "x should advance by dx/width: {cur:?}");
         assert!((cur.1 - 0.25).abs() < 1e-6, "y should advance by dy/height: {cur:?}");
-        assert!(json.contains(r#""t":"move""#));
     }
 
     #[test]

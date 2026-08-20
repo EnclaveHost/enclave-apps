@@ -103,6 +103,13 @@ pub struct Session {
     /// an absolute pointer, so relative mouse motion has to be integrated
     /// here before it can be injected.
     pub cursor: Mutex<(f64, f64)>,
+    /// The cursor moved since the input drainer last shipped a position. A
+    /// position is STATE, not a stream: a real mouse polls at 125-1000 Hz and
+    /// forwarding every sample gave the ~70 MIPS guest hundreds of
+    /// IRQ+evdev+X-sprite cycles a second — measured as the game collapsing
+    /// to 0-23 fps for exactly as long as the mouse was moving. The drainer
+    /// ships the LATEST position once per cycle instead.
+    pub cursor_dirty: AtomicBool,
 
     stop_flag: AtomicBool,
     stop_cv: Condvar,
@@ -126,6 +133,7 @@ impl Session {
             idr_requested: AtomicBool::new(true),
             generation: AtomicU64::new(0),
             cursor: Mutex::new((0.5, 0.5)),
+            cursor_dirty: AtomicBool::new(false),
             stop_flag: AtomicBool::new(false),
             stop_cv: Condvar::new(),
             stop_mutex: Mutex::new(()),
