@@ -152,7 +152,11 @@ compatible.
   deployment's `api_key`.
 - The playground starts the flow with `aud`, `redirect_uri` (its own page)
   and a random `state` kept in sessionStorage, and stores the returned token
-  in sessionStorage for the tab's lifetime.
+  in sessionStorage for the tab's lifetime. With "Remember on this device"
+  on (0.54.0) it also keeps a copy in localStorage and asks for
+  `ttl=604800`, so a return visit inside 7 days is already signed in;
+  sign-out and switching storage off both remove the copy, and a copy past
+  `exp` is dropped at boot.
 - **Popup mode** (0.52.0, the default when popups are allowed): the app opens
   the authorize URL in a `window.open` popup with `display=popup` (the
   console drops its site chrome) and `redirect_uri` pointing at the app's

@@ -2029,7 +2029,7 @@ const isMobile = () => matchMedia("(max-width: 768px)").matches;
 // added to pref() belongs here in the same commit.
 const PREF_KEYS = ["llmchat-store", "llmchat-theme", "llmchat-model", "llmchat-target",
                    "llmchat-sidew", "llmchat-think", "llmchat-web", "llmchat-web-asked",
-                   "llmchat-tools", "llmchat-image"];
+                   "llmchat-tools", "llmchat-image", "llmchat-sso"];
 let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
 function pref(key, val) {
@@ -2040,13 +2040,33 @@ function pref(key, val) {
 // The deployment may require (or merely offer) signing in with the visitor's
 // Enclave account. The whole client side is: send them to enclave.host's
 // authorize page, take the token off the return fragment, and attach it as a
-// bearer header to /chat and /title. The token lives in SESSION storage, not
-// local: it is a credential, its natural lifetime is the tab's, and it must
-// not depend on the "Remember on this device" switch to exist (a gated
-// deployment with storage off still has to be usable).
+// bearer header to /chat and /title. The token always lives in SESSION
+// storage - it must not depend on the "Remember on this device" switch to
+// exist (a gated deployment with storage off still has to be usable) - and,
+// when that switch is on, ALSO in local storage, so a return visit inside
+// the token's lifetime is already signed in. A remembered sign-in asks the
+// platform for its maximum ttl (7 days); an unremembered one keeps the
+// default (24 h), which outlives any tab that will ever hold it.
 const SSO_KEY = "llmchat-sso", SSO_STATE_KEY = "llmchat-sso-state";
+// claims are segment 1 of EST1.<claims>.<sig>; parsed for display and the
+// boot-time expiry triage only - the server re-verifies every request
+function ssoClaims(t) {
+  try { return JSON.parse(atob(t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))); }
+  catch (_) { return null; }
+}
 let ssoToken = null;
 try { ssoToken = sessionStorage.getItem(SSO_KEY) || null; } catch (_) {}
+if (!ssoToken && storeOK) try { ssoToken = localStorage.getItem(SSO_KEY) || null; } catch (_) {}
+// a remembered token past its exp would only bounce off the server's 401;
+// drop it now so the gate (or the "Sign in" link) is honest at first paint
+{
+  const c = ssoToken && ssoClaims(ssoToken);
+  if (ssoToken && !(c && typeof c.exp === "number" && Date.now() / 1000 < c.exp)) {
+    ssoToken = null;
+    try { sessionStorage.removeItem(SSO_KEY); } catch (_) {}
+    try { localStorage.removeItem(SSO_KEY); } catch (_) {}
+  }
+}
 // The return leg: enclave.host hands back #sso=<token>&state=<s> in the
 // FRAGMENT, which never reaches a server or a log. It arrives one of two
 // ways - on this page's own URL (the full-page flow) or ferried over
@@ -2067,6 +2087,7 @@ function ssoAccept(frag) {
     sessionStorage.setItem(SSO_KEY, ssoToken);
     sessionStorage.removeItem(SSO_STATE_KEY);
   } catch (_) {}
+  pref(SSO_KEY, ssoToken);
   return true;
 }
 (function () {
@@ -2103,11 +2124,8 @@ function ssoHeaders() {
 // display only - the server re-verifies every request; nothing here trusts
 // what the payload claims
 function ssoAddress() {
-  if (!ssoToken) return null;
-  try {
-    const p = JSON.parse(atob(ssoToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
-    return typeof p.sub === "string" ? p.sub : null;
-  } catch (_) { return null; }
+  const p = ssoToken ? ssoClaims(ssoToken) : null;
+  return p && typeof p.sub === "string" ? p.sub : null;
 }
 function ssoPending() { return state.auth.enabled && state.auth.required && !ssoToken; }
 function ssoStart() {
@@ -2121,6 +2139,9 @@ function ssoStart() {
     + "?aud=" + encodeURIComponent(state.auth.aud || "")
     + "&redirect_uri=" + encodeURIComponent(back)
     + "&state=" + s
+    // a token this browser will remember is worth the platform's maximum
+    // life (7 days); one that dies with the tab keeps the 24 h default
+    + (storeOK ? "&ttl=604800" : "")
     + (popup ? "&display=popup" : "");
   // POPUP first: the chat stays exactly where it is, the sign-in floats
   // above it, and /sso-return (resolved against the app BASE, so a proxy
@@ -2143,6 +2164,9 @@ function ssoDrop() {
   // sign-in may be someone else, whose key must be their own derivation
   apiKey = null;
   try { sessionStorage.removeItem(SSO_KEY); } catch (_) {}
+  // unconditional: a copy remembered under an earlier opt-in must not
+  // outlive the sign-out that revoked it
+  try { localStorage.removeItem(SSO_KEY); } catch (_) {}
 }
 
 // Chats persist to IndexedDB - local to this browser profile, never sent
@@ -2195,6 +2219,7 @@ async function setStoring(on) {
     if (state.model) pref("llmchat-model", state.model);
     pref("llmchat-target", state.target);
     pref("llmchat-sidew", String(sideW));
+    if (ssoToken) pref(SSO_KEY, ssoToken);
     await openDb();
     for (const c of state.chats) persist(c);
   } else {
