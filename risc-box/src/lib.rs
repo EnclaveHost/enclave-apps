@@ -507,6 +507,13 @@ struct App {
     video_fps: f64,
     video_mark: u64,
     input_boost: u64, // turns to force full tick batches after POST /input
+    // Worst main-loop turn since the last /status read, with its per-phase
+    // breakdown. The loop is the app: a slow turn is every client's stall at
+    // once, and until this existed those stalls were misattributed to the
+    // platform (a warm probe against the box's own control plane finally
+    // separated the layers).
+    turn_max_ms: f64,
+    turn_max_detail: String,
     exec_seq: u64,    // per-command nonce for /exec console markers
     scrollback: VecDeque<u8>,
     console_total: u64,
@@ -622,7 +629,7 @@ impl App {
         format!(
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
-             \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
+             \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
              \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
@@ -642,6 +649,8 @@ impl App {
             self.video_fps,
             self.video_cost.as_secs_f64() * 1000.0,
             self.fb_cost.as_secs_f64() * 1000.0,
+            self.turn_max_ms,
+            httpd::json_escape(&self.turn_max_detail),
             display::fb_w(),
             display::fb_h(),
             self.cfg.realtime,
@@ -1633,6 +1642,8 @@ pub fn run() {
         sent_at: Instant::now(),
         sent_mark: 0,
         input_boost: 0,
+        turn_max_ms: 0.0,
+        turn_max_detail: String::new(),
         exec_seq: 0,
         scrollback: VecDeque::new(),
         console_total: 0,
@@ -1669,9 +1680,11 @@ pub fn run() {
     let mut last_heartbeat = Instant::now();
 
     loop {
+        let t0 = Instant::now();
         for (key, req) in server.poll(MAX_BODY) {
             route(&mut app, &mut server, key, req);
         }
+        let t1 = Instant::now();
 
         // A subscriber that fell behind was starved rather than closed
         // (httpd.rs, SSE_SKIP_WBUF); the events it missed were dropped, not
@@ -1708,13 +1721,17 @@ pub fn run() {
             let idle = app.emu.as_ref().map_or(false, |e| e.get_cpu().is_idle());
             eprintln!(
                 "[risc-box] heartbeat: phase={phase} up={secs:.0}s instret={:.2}G mips={mips:.1} \
-                 guest_idle={idle} console={}KiB watchers={}/{}{}",
+                 guest_idle={idle} console={}KiB watchers={}/{}{} turn_max={:.0}ms [{}]",
                 app.instret as f64 / 1e9,
                 app.console_total / 1024,
                 server.sse_count("display"),
                 server.sse_count("video"),
                 app.error.as_deref().map(|e| format!(" error={e}")).unwrap_or_default(),
+                app.turn_max_ms,
+                app.turn_max_detail,
             );
+            app.turn_max_ms = 0.0;
+            app.turn_max_detail.clear();
         }
 
         // Get responses (the 202 for /start, errors, etc.) onto the wire
@@ -1739,6 +1756,7 @@ pub fn run() {
             do_start(&mut app, start);
         }
 
+        let t2 = Instant::now();
         let mut busy = false;
         if app.phase == Phase::Running {
             if let Some(emu) = app.emu.as_mut() {
@@ -2013,6 +2031,7 @@ pub fn run() {
             }
         }
 
+        let t3 = Instant::now();
         // Collect whatever the worker finished and put it on the wire. This is
         // out here, not inside the emulator block, because a client watching a
         // machine that just stopped should still receive the last frame the
@@ -2073,7 +2092,26 @@ pub fn run() {
             }
         }
 
+        let t4 = Instant::now();
         let flushed = server.flush();
+        {
+            let t5 = Instant::now();
+            let total = (t5 - t0).as_secs_f64() * 1000.0;
+            if total > app.turn_max_ms {
+                app.turn_max_ms = total;
+                app.turn_max_detail = format!(
+                    "poll={:.0} adm={:.0} run={:.0} collect={:.0} flush={:.0}",
+                    (t1 - t0).as_secs_f64() * 1000.0,
+                    (t2 - t1).as_secs_f64() * 1000.0,
+                    (t3 - t2).as_secs_f64() * 1000.0,
+                    (t4 - t3).as_secs_f64() * 1000.0,
+                    (t5 - t4).as_secs_f64() * 1000.0,
+                );
+            }
+            if total > 250.0 {
+                eprintln!("[risc-box] SLOW TURN {total:.0}ms: {}", app.turn_max_detail);
+            }
+        }
         // Running with real CPU work paces the loop; only sleep when idle or
         // when a running machine produced no output and moved no bytes.
         if app.phase != Phase::Running {
