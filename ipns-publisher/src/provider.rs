@@ -176,7 +176,12 @@ impl Provider {
     ) -> Result<Provider, String> {
         let peer_id = crate::ipns::Identity::from_seed(identity.to_bytes()).peer_id();
         let retrieval_addr = url_to_multiaddr_str(&gateway_url)?;
-        let pub_ma = url_to_multiaddr_str(publisher_url)?;
+        // The announce Addrs identify the PUBLISHER as a peer: cid.contact runs
+        // each one through go-libp2p peer.AddrInfoFromP2pAddr, which rejects any
+        // multiaddr without a trailing /p2p/<peerid> ("invalid p2p multiaddr").
+        // So the publisher address must carry our provider peer id — unlike the
+        // ad's retrieval Addresses, which stay a bare HTTP multiaddr.
+        let pub_ma = format!("{}/p2p/{}", url_to_multiaddr_str(publisher_url)?, peer_id);
         let pub_bin = multiaddr_encode(&pub_ma).ok_or("bad publisher multiaddr")?;
         let mut p = Provider {
             identity,
@@ -574,5 +579,36 @@ mod tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let (block, _) = ad.build(&key);
         assert_eq!(ad_entries_link(&block), Some(entry_cid));
+    }
+
+    #[test]
+    fn announce_addr_carries_p2p() {
+        // Regression: cid.contact runs each announce Addr through go-libp2p
+        // peer.AddrInfoFromP2pAddr, which rejects any multiaddr lacking a trailing
+        // /p2p/<peerid> ("invalid p2p multiaddr"). The publisher (announce) address
+        // MUST carry our provider peer id; the ad's retrieval address must NOT.
+        use crate::multiformats::multiaddr_encode;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let p = Provider::new(
+            key,
+            "https://ipfs.enclave.host".into(),
+            "https://d9798e4c.app.enclave.host",
+            vec!["https://cid.contact".into()],
+            false,
+        )
+        .unwrap();
+        // The encoded announce addr must end with our /p2p/<peerid> segment
+        // (segment encodings concatenate, so the p2p suffix is identical whether
+        // or not a transport precedes it) ...
+        let p2p_seg = multiaddr_encode(&format!("/p2p/{}", p.peer_id)).unwrap();
+        assert!(
+            p.publisher_addrs[0].ends_with(&p2p_seg),
+            "announce addr must end in /p2p/<our peer id>"
+        );
+        // ... and must not be the bare HTTP addr with no peer id (the bug).
+        let bare = multiaddr_encode("/dns4/d9798e4c.app.enclave.host/tcp/443/https").unwrap();
+        assert_ne!(p.publisher_addrs[0], bare);
+        // The ad's retrieval address stays a bare HTTP multiaddr (no /p2p).
+        assert!(!p.retrieval_addr.contains("/p2p/"));
     }
 }
