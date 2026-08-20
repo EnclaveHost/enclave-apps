@@ -79,6 +79,36 @@ const SCROLLBACK: usize = 256 * 1024; // console bytes retained for late joiners
 // network session never drops into the ~20x-slow idle clock mid-conversation.
 const NET_BOOST_TURNS: u64 = 250;
 
+/// Turns of full-batch running granted after real HID input lands.
+///
+/// While `input_boost` is non-zero the loop is never `parked`, so every turn
+/// runs a whole TICK_BATCH and the turn never sleeps. That is the right trade
+/// for one keystroke and a disaster when it is held down: the main loop then
+/// owns the tenant's CPU continuously and the display worker gets none, so
+/// video PRODUCTION collapses while every individual turn still looks healthy.
+///
+/// Measured on metal0 (0.25 CPU share, guest ~122 MIPS, DOOM running): with
+/// NET_BOOST_TURNS (250) used here, 10 accepted POST /hid per second drove
+/// videoFps 40 -> 0 and left 70% of the client's 100 ms windows empty, with
+/// turnMax still 8 ms. The same request REJECTED at parse (which never reaches
+/// this line) stayed at 40 fps, as did a 1-byte POST /input at the same 10/s —
+/// and that one is a 3-turn boost. What hurts is the duty cycle, not the
+/// request rate, so the boost only has to outlast the guest's IRQ-and-repaint,
+/// not a whole second of it.
+const INPUT_BOOST_TURNS: u64 = 32;
+
+/// Longest unbroken run of boosted turns, and the cooldown that follows it.
+///
+/// The cap is what makes the bound hold at ANY input rate rather than just the
+/// rates a well-behaved client happens to send: without it, input arriving
+/// faster than INPUT_BOOST_TURNS decays simply re-arms the boost forever.
+/// Measured: with the boost merely shortened, real cursor moves were clean to
+/// 20/s (the bridge's ceiling is ~20/s) but cost 23% of client frames again at
+/// 40/s. RUN_MAX above INPUT_BOOST_TURNS so an isolated event is never cut
+/// short; the hold is the window the display worker is guaranteed.
+const BOOST_RUN_MAX: u64 = 48;
+const BOOST_HOLD_TURNS: u64 = 48;
+
 // ---- config ---------------------------------------------------------------
 
 struct Config {
@@ -507,6 +537,11 @@ struct App {
     video_fps: f64,
     video_mark: u64,
     input_boost: u64, // turns to force full tick batches after POST /input
+    /// Consecutive turns the boost has been held, and the cooldown that follows
+    /// when it has been held too long. Input arriving faster than the boost
+    /// decays would otherwise re-arm it forever; see BOOST_RUN_MAX.
+    boost_run: u64,
+    boost_hold: u64,
     // Worst main-loop turn since the last /status read, with its per-phase
     // breakdown. The loop is the app: a slow turn is every client's stall at
     // once, and until this existed those stalls were misattributed to the
@@ -1153,8 +1188,11 @@ fn hid_inner(app: &mut App, server: &mut Server, key: usize, body: &[u8], respon
         }
     }
     // Run full CPU batches for a bit so the guest services the input IRQ and
-    // X repaints promptly instead of at the idle-throttle rate.
-    app.input_boost = app.input_boost.max(NET_BOOST_TURNS);
+    // X repaints promptly instead of at the idle-throttle rate — but only when
+    // something actually landed, and only briefly. See INPUT_BOOST_TURNS.
+    if n > 0 && app.boost_hold == 0 {
+        app.input_boost = app.input_boost.max(INPUT_BOOST_TURNS);
+    }
     if respond {
         server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
     }
@@ -1642,6 +1680,8 @@ pub fn run() {
         sent_at: Instant::now(),
         sent_mark: 0,
         input_boost: 0,
+        boost_run: 0,
+        boost_hold: 0,
         turn_max_ms: 0.0,
         turn_max_detail: String::new(),
         exec_seq: 0,
@@ -1773,6 +1813,26 @@ pub fn run() {
                 // by a millisecond every turn. At the ~6 ms a batch takes that
                 // is a quarter of the machine, given away for nothing.
                 busy = !parked;
+                // Cap how long the boost may run UNBROKEN. Each accepted input
+                // re-arms it, so a client sending faster than it decays pins
+                // the loop in full batches forever: the display worker then
+                // never gets the core and video production collapses even
+                // though every turn still looks healthy. Past the cap the boost
+                // is dropped and cannot re-arm for BOOST_HOLD_TURNS, which
+                // hands the worker a guaranteed window no input rate can take
+                // away. An isolated event never reaches the cap, so a keystroke
+                // keeps the full boost it was given.
+                if app.input_boost > 0 {
+                    app.boost_run += 1;
+                    if app.boost_run >= BOOST_RUN_MAX {
+                        app.input_boost = 0;
+                        app.boost_hold = BOOST_HOLD_TURNS;
+                        app.boost_run = 0;
+                    }
+                } else {
+                    app.boost_run = 0;
+                    app.boost_hold = app.boost_hold.saturating_sub(1);
+                }
                 app.input_boost = app.input_boost.saturating_sub(1);
                 // batched entry point: per-instruction loop overhead is
                 // amortized inside the emulator, and a WFI-parked guest
