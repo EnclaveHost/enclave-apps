@@ -50,19 +50,39 @@ reproduce the class — 9 / 361, worst 2.1 s, loop still 12 ms — so the base
 engine's socket layer is implicated too, but the SET patch drops the trigger
 threshold and raises the ceiling by an order of magnitude.
 
-## Where to look (engine repo)
+## The mechanism zone (engine repo, specific)
 
-- The CLI p2 socket/stream host path under `-S inherit-network`: what pumps
-  output-stream flushes and pollables when one writer streams continuously
-  and several keep-alive connections poll — a starved driver or a lock
-  convoy here freezes every socket of the instance while guest code runs on,
-  which is exactly the signature.
-- `wasmtime-set-threads.patch`: the per-thread fd-namespace layer sits on
-  that same path on every fd op; whatever it serializes, both the app thread
-  and the worker thread cross it. The 10x severity delta is the tell.
-- Reproduce anywhere: risc-box 0.7.17 (SET) vs 0.7.18-plain are published
-  side by side; stream `/video?codec=h264` and hammer `/status` at ~7/s on a
-  warm connection; stalls >500 ms appear within a minute on SET.
+The tenant's bytes move through wasmtime-wasi's tokio-readiness pattern:
+`crates/wasi/src/sockets/tcp.rs` (~lines 620-690) does `try_read`/`try_write`
+and, on WouldBlock, registers interest via `poll_read_ready`/`poll_write_ready`
+— tokio caches per-socket readiness, clears it on drain, and re-arms epoll on
+the ambient runtime's driver (`crates/wasi/src/runtime.rs`, the multi-thread
+`RUNTIME`). A SYNC guest (wasi:cli run) crosses into that world through
+`in_tokio` = `block_on` per host call — and `in_tokio`'s own comment admits
+this "sync mode" is fragile: a guest looping on pollables can starve the
+background work that makes sockets ready, band-aided with a `yield_now` for
+the always-ready case. Our app is exactly that shape (a nonblocking event
+loop polling every turn), and the SET build runs TWO such guest threads doing
+concurrent `block_on`s against the same runtime — every interleaving that can
+lose or delay a readiness edge becomes 10x more likely, which matches the
+measured 10x severity delta. When an edge is lost, the socket's kernel queue
+holds bytes the guest's next try_read never sees (readiness cache says
+not-ready), for every socket that hit the interleaving, until some unrelated
+event forces re-arming — the multi-second whole-tenant freeze.
+
+**The one-shot proof, from inside the CVM** (needs the access only the
+operator has): during a freeze, `ss -tin` on the app's loopback port. If
+Recv-Q/Send-Q are non-zero while the app's turn telemetry shows it polling
+(turnMaxMs stays ~10 ms through the freeze — measured), the kernel had the
+bytes and the engine's readiness layer did not lift them. Follow with
+`strace -e epoll_wait,epoll_ctl -p <wasmtime pid>` across a freeze, or
+tokio-console on a debug build.
+
+Reproduce anywhere: risc-box 0.7.17 (SET) vs 0.7.18-plain are published side
+by side (one build_upgrade flips a deployment between them); stream
+`/video?codec=h264` and hammer `/status` at ~7/s on a warm connection.
+Stalls >500 ms appear within a minute on SET; plain needs roughly double the
+load and tops out ~2 s.
 
 ## What this is NOT (also measured tonight, all fixed app/bridge-side)
 
