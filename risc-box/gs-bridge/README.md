@@ -98,11 +98,26 @@ cargo build --release
 ./target/release/gs-bridge --app https://<id>.app.enclave.host   # one on the fleet
 ```
 
-Options: `--app <url>` (host:port, `http://…` or `https://…`), `--api-key
-<token>` or `RISCBOX_API_KEY` (if the app config sets `api_key`), `--fb <WxH>`
+Options: `--app <url>` (host:port, `http://…`, `https://…`, or a path-prefixed
+`https://<enclave-host>/x/<deployment-id>` for an enclave's DIRECT endpoint),
+`--api-key <token>` or `RISCBOX_API_KEY` (if the app config sets `api_key`),
+`--app-cookie <token>` or `GS_APP_COOKIE` (the deployment-scoped app token a
+PRIVATE deployment's data path requires — minted by
+`POST /v1/deployments/<id>/app-token`, sent as the gateway's `enclave_app`
+cookie, the only owner proof that survives the relay), `--fb <WxH>`
 (framebuffer size, default 1024x768), `--codec <name>` (default `h264_nvenc`),
-`--state <dir>` (server identity and paired certs), `--frames auto|bands|raw`,
-`--probe`.
+`--state <dir>` (server identity and paired certs),
+`--frames auto|bands|pull|h264|raw`, `--probe`.
+
+**`--frames h264` is the mode that holds 30+ fps across a real network**: the
+APP encodes H.264 inside the enclave (minih264 on the SET worker; see
+`../docs/moonlight-30fps-handoff.md`) and this bridge only repacketizes into
+RTP — no NVENC, no re-encode, no mirror. Every frame on the wire is a distinct
+app frame, so the client's decode rate IS the app's frame rate, and the pixels
+cross the wire as ~3 Mbps of video instead of 6-10 MiB/s of lossless bands.
+Client IDR requests are forwarded to the app's `POST /video-key`. Measured
+against a fleet deployment on the enclave's direct endpoint: min 38 / median
+40 fps per second, 0 seconds below 30, under continuous gameplay input.
 
 **Check the connection first.** `--probe` fetches one frame, says whether it
 matches `--fb`, and reports whether anything is actually drawn on it; add
