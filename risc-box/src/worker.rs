@@ -203,7 +203,7 @@ fn serve() {
     // The encoder plus the params it was built with, so a watcher switching
     // codec or bitrate rebuilds it (and the rebuild's first frame is an IDR).
     let mut enc: Option<(u32, Box<dyn VideoEncoder + Send>)> = None;
-    let mut last_encode: Option<Instant> = None;
+    let mut next_encode: Option<Instant> = None;
 
     loop {
         let job = p.jobs.lock().unwrap().pop_front();
@@ -229,9 +229,19 @@ fn serve() {
             let params = packed_params();
             if enc.as_ref().map(|(p, _)| *p) != Some(params) {
                 enc = build_encoder();
-                last_encode = None;
+                next_encode = None;
             }
-            let due = last_encode.map_or(true, |t| t.elapsed() >= VIDEO_MIN_INTERVAL);
+            // An absolute schedule, not "interval since the last encode":
+            // jobs arrive on the capture clock (~16 ms), and gating each one
+            // on a 25 ms elapsed check quantizes the cadence to every other
+            // job — 32 ms, 31 fps, measured as 27-28 on the wire. Advancing a
+            // deadline by the interval instead absorbs the beat: encodes land
+            // on the first job past each deadline and average the true 40.
+            let now = Instant::now();
+            let due = match next_encode {
+                None => true,
+                Some(at) => now >= at,
+            };
             if due {
                 if let Some((_, e)) = enc.as_mut() {
                     if take_force_key() {
@@ -241,7 +251,12 @@ fn serve() {
                         let (rgb, w, h) = video::rgb_from_capture(&job.frame);
                         e.encode(&rgb, w, h)
                     });
-                    last_encode = Some(Instant::now());
+                    next_encode = Some(match next_encode {
+                        // Catch up at most one interval; a long stall must not
+                        // bank a burst of instantly-due encodes.
+                        Some(at) if now < at + VIDEO_MIN_INTERVAL => at + VIDEO_MIN_INTERVAL,
+                        _ => now + VIDEO_MIN_INTERVAL,
+                    });
                 }
             }
         } else if enc.is_some() {

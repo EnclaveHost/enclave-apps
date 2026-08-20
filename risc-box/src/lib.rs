@@ -1896,7 +1896,14 @@ pub fn run() {
                         t.elapsed() >= display::scan_interval_boosted(
                             app.fb_cost, scan_still, snap)
                     });
-                    if (watching_display || watching_video) && due && worker::inflight() == 0 {
+                    // Two jobs in flight, not one: the worker's encode (23 ms
+                    // measured on kryptos) otherwise serializes with the
+                    // capture handoff and the whole pipeline runs at
+                    // encode+turnaround instead of max(encode, capture) — a
+                    // 28 fps ceiling where the hardware supports 40. Depth 2
+                    // keeps the worker saturated and costs at most one frame
+                    // of staleness (~16 ms), which the stream happily pays.
+                    if (watching_display || watching_video) && due && worker::inflight() < 2 {
                         let began = Instant::now();
                         let mut buf = worker::take_buffer();
                         Display::capture(emu, &mut buf);

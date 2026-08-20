@@ -105,6 +105,9 @@ pub struct App {
     /// Hostname without the port — TLS needs it for SNI and cert validation,
     /// and it is what belongs in the Host header.
     host: String,
+    /// Path prefix prepended to every request ("" or "/x/<id>") — the direct
+    /// enclave endpoint serves tenants by path, not by subdomain.
+    base_path: String,
     tls: bool,
     /// Bearer token for a deployment whose config sets `api_key`.
     api_key: Option<String>,
@@ -143,12 +146,16 @@ impl App {
             .trim_start_matches("https://")
             .trim_start_matches("http://")
             .trim_end_matches('/');
+        let (rest, base_path) = match rest.find('/') {
+            Some(i) => (&rest[..i], rest[i..].trim_end_matches('/').to_string()),
+            None => (rest, String::new()),
+        };
         let host = rest.split(':').next().unwrap_or(rest).to_string();
         let addr = match rest.contains(':') {
             true => rest.to_string(),
             false => format!("{rest}:{}", if tls { 443 } else { 80 }),
         };
-        App { addr, host, tls, api_key: None, app_cookie: None, idle: std::sync::Mutex::new(Vec::new()) }
+        App { addr, host, base_path, tls, api_key: None, app_cookie: None, idle: std::sync::Mutex::new(Vec::new()) }
     }
 
     /// Set the bearer token sent with every request.
@@ -315,8 +322,9 @@ impl App {
 
     /// GET a path and return the response body.
     pub fn get(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        let bp = &self.base_path;
         let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Accept: */*\r\n\r\n",
+            "GET {bp}{path} HTTP/1.1\r\nHost: {}\r\n{}Accept: */*\r\n\r\n",
             self.host,
             self.auth_header()
         );
@@ -346,8 +354,9 @@ impl App {
         // queue empty. Reconnecting is the only way back, and a reader with no
         // timeout waits for a byte that never comes.
         s.set_read_timeout(Some(SSE_STALL))?;
+        let bp = &self.base_path;
         let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}\r\n{}Accept: text/event-stream\r\n\r\n",
+            "GET {bp}{path} HTTP/1.1\r\nHost: {}\r\n{}Accept: text/event-stream\r\n\r\n",
             self.host,
             self.auth_header()
         );
@@ -381,8 +390,9 @@ impl App {
     /// this is the input path, it runs on a kept connection, and a body left
     /// unread is the next caller's framing error.
     pub fn post_json(&self, path: &str, body: &str) -> std::io::Result<()> {
+        let bp = &self.base_path;
         let req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n\
+            "POST {bp}{path} HTTP/1.1\r\nHost: {}\r\n{}Content-Type: application/json\r\n\
              Content-Length: {}\r\n\r\n",
             self.host,
             self.auth_header(),
@@ -489,14 +499,15 @@ impl InputPipe {
 
     fn head(&self, method: &str, path: &str, body_len: usize) -> String {
         let auth = self.app.auth_header();
+        let bp = &self.app.base_path;
         if body_len == 0 {
             format!(
-                "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth}Accept: */*\r\n\r\n",
+                "{method} {bp}{path} HTTP/1.1\r\nHost: {}\r\n{auth}Accept: */*\r\n\r\n",
                 self.app.host
             )
         } else {
             format!(
-                "{method} {path} HTTP/1.1\r\nHost: {}\r\n{auth}Content-Type: application/json\r\n\
+                "{method} {bp}{path} HTTP/1.1\r\nHost: {}\r\n{auth}Content-Type: application/json\r\n\
                  Content-Length: {body_len}\r\n\r\n",
                 self.app.host
             )

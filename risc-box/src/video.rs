@@ -256,10 +256,22 @@ extern "C" {
     ) -> i32;
 }
 
-/// Keyframe period. Long on purpose: every joiner gets a fresh encoder (so an
-/// IDR leads its stream), and a client that loses packets asks for one via
-/// `force_keyframe`, so the periodic IDR is only a backstop.
-const H264_GOP: i32 = 300;
+/// Keyframe period: none. Every joiner gets a fresh encoder (so an IDR leads
+/// its stream) and a client that loses packets asks for one via
+/// `force_keyframe`, so a periodic IDR would only add bursts: an intra frame
+/// is ~4x a P frame even bounded, and unscheduled 100KB+ events are exactly
+/// what shoves the SSE write buffer over its pacing gate and stalls the
+/// stream (measured as periodic 0 fps seconds at the client).
+const H264_GOP: i32 = 0;
+
+/// Intra frames pay a higher quantizer floor and get a bigger byte budget
+/// than P frames. At qp_min 10 minih264 spends ~125 KB on a 1024x768 intra
+/// frame — nearly the whole 192 KB production gate in one SSE event. A
+/// bounded, softer keyframe recovers in a few P frames and never stalls the
+/// pipe.
+const H264_KEY_QP_MIN: i32 = 26;
+const H264_P_QP_MIN: i32 = 10;
+const H264_QP_MAX: i32 = 48;
 
 pub struct H264Encoder {
     persist: Vec<u64>, // u64-backed so the C state is 8-aligned
@@ -268,6 +280,7 @@ pub struct H264Encoder {
     h: usize,
     kbps: u32,
     force_key: bool,
+    encoded_any: bool,
 }
 
 impl H264Encoder {
@@ -290,7 +303,7 @@ impl H264Encoder {
         if rc != 0 {
             return None;
         }
-        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false })
+        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false, encoded_any: false })
     }
 }
 
@@ -332,6 +345,10 @@ impl H264Encoder {
         let mut coded: *const u8 = std::ptr::null();
         let mut coded_len: i32 = 0;
         let force = std::mem::take(&mut self.force_key);
+        // The first frame of a fresh encoder is a keyframe whether or not it
+        // was asked for; both kinds get the intra budget and floor.
+        let key = force || !self.encoded_any;
+        let p_budget = (self.kbps as i32) * 1000 / 8 / 40; // per-frame budget at the 40 fps cadence
         let rc = unsafe {
             rbx_h264_encode(
                 self.persist.as_mut_ptr() as *mut u8,
@@ -342,13 +359,14 @@ impl H264Encoder {
                 self.w as i32,
                 self.h as i32,
                 force as i32,
-                (self.kbps as i32) * 1000 / 8 / 30, // per-frame budget at 30 fps
-                10,
-                48,
+                if key { p_budget * 4 } else { p_budget },
+                if key { H264_KEY_QP_MIN } else { H264_P_QP_MIN },
+                H264_QP_MAX,
                 &mut coded,
                 &mut coded_len,
             )
         };
+        self.encoded_any = true;
         if rc != 0 || coded.is_null() || coded_len <= 0 {
             return vec![];
         }
