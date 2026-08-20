@@ -121,10 +121,17 @@ loses a readiness edge becomes an order of magnitude likelier.
 ## Access (private deployment on the direct endpoint)
 
 - Temp wallet (owner of the deployment AND publisher of `risc-box-doom`):
-  `REDACTED-WALLET-KEY-ROTATED`
-  (addr `0x3977E339f1935d1a31FbBeB945c9fB36fF537F2A`, USDC+ETH on Base).
-  Sign platform txs with `cast send <to> <data> --private-key 0x$PK
-  --rpc-url https://mainnet.base.org` from the MCP build_* tool outputs.
+  addr `0x3977E339f1935d1a31FbBeB945c9fB36fF537F2A`. **Its key was published
+  in this file and is now COMPROMISED — do not fund this address.** At
+  2026-08-20T11:52:55Z someone used the leaked key to install an EIP-7702
+  delegation (`0x347028d0a711db8afa3cb85fbe867036efcd5d88`) and swept the
+  balance in the same block. The delegation also breaks gasless funding for
+  good: USDC verifies EIP-3009 from a code-bearing address through ERC-1271,
+  the delegate has no `isValidSignature`, so every `fundWithAuthorization`
+  reverts `FiatTokenV2: invalid signature`. Ask the operator for a fresh
+  wallet and keep its key out of the repo. Sign platform txs with
+  `cast send <to> <data> --private-key 0x$PK --rpc-url
+  https://mainnet.base.org` from the MCP build_* tool outputs.
 - Session tokens are PER-ENCLAVE (each box honors only its own kid):
   `GET https://api.enclave.host/v1/auth/nonce?address=<addr>&enclave=kryptos`
   → `cast wallet sign` the message → `POST /v1/auth/login?enclave=kryptos`.
