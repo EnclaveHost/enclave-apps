@@ -500,6 +500,12 @@ struct App {
     sent_fps: f64,
     sent_at: Instant,
     sent_mark: u64,
+    // Encoded video frames actually broadcast (the Moonlight-facing rate) and
+    // the smoothed per-frame encode cost: together they say whether a 30 fps
+    // stream is limited by the encoder or by the guest's paint rate.
+    video_frames: u64,
+    video_fps: f64,
+    video_mark: u64,
     input_boost: u64, // turns to force full tick batches after POST /input
     exec_seq: u64,    // per-command nonce for /exec console markers
     scrollback: VecDeque<u8>,
@@ -524,7 +530,9 @@ struct App {
     fb_scanned: Option<Instant>, // last display scan (paced by its own cost)
     fb_cost: Duration,           // smoothed cost of one display scan
     fb_still: u32,               // consecutive scans that found nothing
-    av1: Option<video::Av1Encoder>, // the /video AV1 stream's encoder (stateful, inter-frame)
+    // The /video stream's encoder (stateful, inter-frame) plus the packed
+    // params it was built with; a codec/bitrate switch rebuilds it.
+    venc: Option<(u32, Box<dyn video::VideoEncoder + Send>)>,
     video_scanned: Option<Instant>, // last /video frame (paced)
     /// Smoothed wall time one AV1 frame costs. The stream is paced off this
     /// rather than a fixed rate, so encoding can never take most of the thread
@@ -614,7 +622,7 @@ impl App {
         format!(
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
-             \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
+             \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
              \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
@@ -631,6 +639,9 @@ impl App {
             self.mips(),
             self.fps(),
             self.sent_fps,
+            self.video_fps,
+            self.video_cost.as_secs_f64() * 1000.0,
+            self.fb_cost.as_secs_f64() * 1000.0,
             display::fb_w(),
             display::fb_h(),
             self.cfg.realtime,
@@ -871,7 +882,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             app.boot_at = None;
             app.display.reset();
             worker::reset();
-            app.av1 = None;
+            app.venc = None;
             server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
         }
         ("GET", "/display") => {
@@ -893,14 +904,40 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // watcher forces a new encoder (below), so the first frame it sees is a
         // keyframe. `event: codec` carries the WebCodecs codec string + size.
         ("GET", "/video") => {
-            use video::VideoEncoder;
-            let codec = video::Av1Encoder::new(display::fb_w(), display::fb_h(), 1, 10)
-                .map(|e| e.webcodec()).unwrap_or("");
+            // `?codec=h264` selects the Moonlight-native stream (Annex-B over
+            // the same base64 SSE), `av1` (the default) stays the browser's
+            // WebCodecs codec. One encoder exists at a time: the codec of the
+            // most recent joiner wins and the switch rebuilds it, so the new
+            // stream leads with a keyframe either way. `?kbps=` sets the VBV
+            // target (defaults: 3000 h264, 4000 av1).
+            let codec = match form_get(&req.query, "codec").as_deref() {
+                Some("h264") => worker::CODEC_H264,
+                _ => worker::CODEC_AV1,
+            };
+            let kbps = form_get(&req.query, "kbps")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            worker::set_video_params(codec, kbps);
+            app.venc = None; // rebuild inline too, so the joiner gets an IDR
+            worker::reset();
+            let codec_str = match codec {
+                worker::CODEC_H264 => "avc1.42E020",
+                _ => "av01.0.08M.08",
+            };
             let initial = format!(
                 "event: codec\ndata: {{\"codec\":\"{}\",\"w\":{},\"h\":{}}}\n\n",
-                codec, display::fb_w(), display::fb_h()
+                codec_str, display::fb_w(), display::fb_h()
             );
             server.upgrade_sse(key, "video", &initial);
+        }
+        // A stream consumer lost packets and needs a random-access point (the
+        // Moonlight bridge forwards the client's IDR requests here).
+        ("POST", "/video-key") => {
+            worker::force_key();
+            if let Some((_, enc)) = app.venc.as_mut() {
+                enc.force_keyframe();
+            }
+            server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
         }
         ("GET", "/fb.png") => match (app.phase, app.emu.as_ref()) {
             (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
@@ -1344,7 +1381,27 @@ fn exec_pump(app: &mut App, server: &mut Server, cap: &mut Vec<u8>, last_flush: 
 /// the command a beat early, and the marker wait absorbs that.
 fn tail_is_prompt(cap: &[u8]) -> bool {
     let start = cap.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
-    let line = &cap[start..];
+    // Strip ANSI escape sequences before testing: busybox ash with terminal
+    // line editing prints its prompt and then asks the terminal where the
+    // cursor is (ESC[6n) — nobody here answers, but the query must not hide
+    // the prompt character from this check ("~ # \x1b[6n" IS a prompt).
+    let mut line = Vec::with_capacity(cap.len() - start);
+    let mut i = start;
+    while i < cap.len() {
+        if cap[i] == 0x1b {
+            i += 1;
+            if i < cap.len() && cap[i] == b'[' {
+                i += 1;
+                while i < cap.len() && !cap[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                i += 1; // the final letter
+            }
+            continue;
+        }
+        line.push(cap[i]);
+        i += 1;
+    }
     match line.iter().rposition(|&b| b != b' ' && b != b'\r' && b != b'\t') {
         Some(i) => matches!(line[i], b'#' | b'$' | b'>'),
         None => false,
@@ -1475,7 +1532,7 @@ fn do_start(app: &mut App, start: Start) {
     app.error = None;
     app.display.reset(); // fresh machine, fresh screen: next watched scan ships a full frame
     worker::reset();
-    app.av1 = None; // fresh machine, fresh encoder (next watcher gets a keyframe)
+    app.venc = None; // fresh machine, fresh encoder (next watcher gets a keyframe)
     app.phase = Phase::Running;
     eprintln!("[risc-box] machine running: {}", app.cfg.title);
 }
@@ -1570,6 +1627,9 @@ pub fn run() {
         fps_at: Instant::now(),
         sent_frames: 0,
         sent_fps: 0.0,
+        video_frames: 0,
+        video_fps: 0.0,
+        video_mark: 0,
         sent_at: Instant::now(),
         sent_mark: 0,
         input_boost: 0,
@@ -1585,7 +1645,7 @@ pub fn run() {
         fb_scanned: None,
         fb_cost: Duration::from_millis(0),
         fb_still: 0,
-        av1: None,
+        venc: None,
         video_scanned: None,
         video_cost: Duration::from_millis(0),
         retry: 0,
@@ -1624,7 +1684,7 @@ pub fn run() {
             worker::want_full();
         }
         if server.sse_take_recovered("video") {
-            app.av1 = None;
+            app.venc = None;
             worker::reset();
         }
 
@@ -1717,6 +1777,8 @@ pub fn run() {
                         let sdt = now.duration_since(app.sent_at).as_secs_f64();
                         app.sent_fps = (app.sent_frames - app.sent_mark) as f64 / sdt;
                         app.sent_mark = app.sent_frames;
+                        app.video_fps = (app.video_frames - app.video_mark) as f64 / sdt;
+                        app.video_mark = app.video_frames;
                         app.sent_at = now;
                     }
                 }
@@ -1823,7 +1885,12 @@ pub fn run() {
                 // cycles the game needed. Boost from stillness, never from
                 // motion.
                 let snap = app.input_boost > 0 && app.fb_still > 0;
-                let scan_still = if snap { 0 } else { app.fb_still };
+                // A video watcher needs frames at the encoder's cadence even
+                // when the band diff has nothing to say: bands are not even
+                // computed for it, so "still" is structurally true and the
+                // backoff otherwise parks a live stream at the 100 ms ceiling
+                // (measured: a video-only watcher got exactly 10 fps).
+                let scan_still = if snap || watching_video { 0 } else { app.fb_still };
                 if worker::available() {
                     let due = app.fb_scanned.map_or(true, |t| {
                         t.elapsed() >= display::scan_interval_boosted(
@@ -1879,9 +1946,9 @@ pub fn run() {
                 // frame is a keyframe; when nobody watches, the encoder is
                 // dropped so the next session starts clean.
                 if watching_video && !worker::available() {
-                    use video::VideoEncoder;
-                    if app.av1.is_none() {
-                        app.av1 = video::Av1Encoder::new(display::fb_w(), display::fb_h(), 4_000_000, 10);
+                    let packed = worker::packed_params();
+                    if app.venc.as_ref().map(|(p, _)| *p) != Some(packed) {
+                        app.venc = worker::build_encoder();
                     }
                     // Pace the encoder by what it COSTS, not by the clock.
                     //
@@ -1901,18 +1968,30 @@ pub fn run() {
                     // majority of the thread either way.
                     const VIDEO_COST_RATIO: u32 = 4; // encode ≤ 1/(1+4) of the time
                     let due = app.video_scanned.map_or(true, |t| {
-                        let floor = std::time::Duration::from_millis(display::FB_SCAN_MS);
+                        let floor = std::time::Duration::from_millis(display::FB_SCAN_FLOOR_MS);
                         t.elapsed() >= floor.max(app.video_cost * VIDEO_COST_RATIO)
+                            && t.elapsed() >= worker::VIDEO_MIN_INTERVAL
                     });
                     if due {
                         let began = Instant::now();
-                        let (rgb, w, h) = video::capture_rgb(emu);
-                        if let Some(enc) = app.av1.as_mut() {
-                            for f in enc.encode(&rgb, w, h) {
+                        if worker::take_force_key() {
+                            if let Some((_, enc)) = app.venc.as_mut() {
+                                enc.force_keyframe();
+                            }
+                        }
+                        let mut fresh = vec![0u8; display::fb_bytes()];
+                        emu.read_physical_range(display::FB_BASE, &mut fresh);
+                        if let Some((_, enc)) = app.venc.as_mut() {
+                            let frames = enc.encode_capture(&fresh).unwrap_or_else(|| {
+                                let (rgb, w, h) = video::rgb_from_capture(&fresh);
+                                enc.encode(&rgb, w, h)
+                            });
+                            for f in frames {
                                 server.broadcast(
                                     "video",
                                     &format!("data: {{\"k\":{},\"d\":\"{}\"}}", f.keyframe as u8, b64(&f.data)),
                                 );
+                                app.video_frames += 1;
                                 busy = true;
                             }
                         }
@@ -1921,8 +2000,8 @@ pub fn run() {
                         app.video_cost = (app.video_cost + began.elapsed()) / 2;
                         app.video_scanned = Some(Instant::now());
                     }
-                } else if app.av1.is_some() && !worker::available() {
-                    app.av1 = None;
+                } else if app.venc.is_some() && !worker::available() {
+                    app.venc = None;
                 }
             }
         }
@@ -1953,6 +2032,7 @@ pub fn run() {
                     "video",
                     &format!("data: {{\"k\":{},\"d\":\"{}\"}}", f.keyframe as u8, b64(&f.data)),
                 );
+                app.video_frames += 1;
                 busy = true;
             }
             // Reported, not budgeted: with a worker this time is not the

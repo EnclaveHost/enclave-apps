@@ -48,11 +48,15 @@ struct Args {
     /// Fetch one frame, report what came back, and exit.
     probe: bool,
     frames: FrameSource,
+    app_cookie: Option<String>,
 }
 
 /// Where the encoder's pictures come from.
 #[derive(Clone, Copy, PartialEq)]
 enum FrameSource {
+    /// The app encodes H.264 inside the enclave (/video?codec=h264); the
+    /// bridge repacketizes without touching a pixel. No mirror, no NVENC.
+    AppH264,
     /// Bands for a remote (https) app, raw fetches for a local one.
     Auto,
     /// Mirror the /display band stream.
@@ -76,6 +80,7 @@ fn parse_args() -> Args {
     let mut api_key = std::env::var("RISCBOX_API_KEY").ok().filter(|k| !k.is_empty());
     let mut probe = false;
     let mut frames = FrameSource::Auto;
+    let mut app_cookie = std::env::var("GS_APP_COOKIE").ok().filter(|v| !v.is_empty());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -83,6 +88,10 @@ fn parse_args() -> Args {
         match argv[i].as_str() {
             "--app" if i + 1 < argv.len() => {
                 app_url = argv[i + 1].clone();
+                i += 2;
+            }
+            "--app-cookie" if i + 1 < argv.len() => {
+                app_cookie = Some(argv[i + 1].clone());
                 i += 2;
             }
             "--api-key" if i + 1 < argv.len() => {
@@ -111,11 +120,12 @@ fn parse_args() -> Args {
             "--frames" if i + 1 < argv.len() => {
                 frames = match argv[i + 1].as_str() {
                     "bands" => FrameSource::Bands,
+                    "h264" => FrameSource::AppH264,
                     "pull" => FrameSource::Pull,
                     "raw" => FrameSource::Raw,
                     "auto" => FrameSource::Auto,
                     other => {
-                        eprintln!("--frames expects auto, bands, pull or raw (got {other})");
+                        eprintln!("--frames expects auto, bands, pull, h264 or raw (got {other})");
                         std::process::exit(2);
                     }
                 };
@@ -152,7 +162,7 @@ fn parse_args() -> Args {
         }
     }
 
-    Args { app_url, codec, state_dir, fb, api_key, probe, frames }
+    Args { app_url, codec, state_dir, fb, api_key, app_cookie, probe, frames }
 }
 
 fn dirs_state() -> std::path::PathBuf {
@@ -172,6 +182,7 @@ fn start_session_workers(
     screen: Option<Arc<screen::Screen>>,
     codec: String,
     fb: (u32, u32),
+    app_h264: bool,
 ) {
     // Video and audio sockets are bound per session so a restart rebinds cleanly.
     let video_sock = match UdpSocket::bind(("0.0.0.0", PORT_VIDEO)) {
@@ -208,7 +219,11 @@ fn start_session_workers(
     {
         let (s, a, sock) = (session.clone(), app.clone(), video_sock.clone());
         let sc = screen.clone();
-        std::thread::spawn(move || video::run(s, a, sc, sock, codec, fb));
+        if app_h264 {
+            std::thread::spawn(move || video::run_app_h264(s, a, sock));
+        } else {
+            std::thread::spawn(move || video::run(s, a, sc, sock, codec, fb));
+        }
     }
 
     // The control channel owns the ENet host and runs until teardown.
@@ -219,7 +234,11 @@ fn start_session_workers(
 
 fn main() {
     let args = parse_args();
-    let app = Arc::new(app::App::new(&args.app_url).with_api_key(args.api_key.clone()));
+    let app = Arc::new(
+        app::App::new(&args.app_url)
+            .with_api_key(args.api_key.clone())
+            .with_app_cookie(args.app_cookie.clone()),
+    );
 
     eprintln!("[main] RISC Box app at {}", app.addr());
 
@@ -347,6 +366,10 @@ fn main() {
     // band stream instead: only changed rows cross the wire. --frames forces
     // either one.
     let screen = match args.frames {
+        FrameSource::AppH264 => {
+            eprintln!("[main] frames: app-encoded H.264 (/video?codec=h264), repacketized");
+            None
+        }
         FrameSource::Pull => {
             eprintln!("[main] frames: pull-pacing /fb.bands");
             Some(screen::Screen::start_pull(app.clone(), args.fb.0 as usize, args.fb.1 as usize))
@@ -391,11 +414,14 @@ fn main() {
         let codec = args.codec.clone();
         let fb = args.fb;
         let screen = screen.clone();
+        let app_h264 = args.frames == FrameSource::AppH264;
         std::thread::spawn(move || {
             rtsp::run(
                 move || launched.lock().unwrap().clone(),
                 move |session| {
-                    start_session_workers(session, app.clone(), screen.clone(), codec.clone(), fb)
+                    start_session_workers(
+                        session, app.clone(), screen.clone(), codec.clone(), fb, app_h264,
+                    )
                 },
             );
         });

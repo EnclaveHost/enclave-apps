@@ -659,47 +659,90 @@ pub fn run(
     });
 
     let mut splitter = AnnexBSplitter::new();
-    let mut frame_index: u32 = 0;
-    let mut lowseq: u16 = 0;
-    let epoch = Instant::now();
-    // One IV counter for the whole video stream; never reset, so no two
-    // shards are ever encrypted under the same key and nonce.
-    let video_iv_counter = std::sync::atomic::AtomicU64::new(0);
+    let mut sink = AuSink::new(session.clone(), sock);
 
-    let mut emit = |au: Vec<u8>, frame_index: &mut u32, lowseq: &mut u16| -> bool {
+    while !session.is_stopping() {
+        match chunk_rx.recv_timeout(FLUSH_SILENCE) {
+            Ok(chunk) => {
+                splitter.push(&chunk);
+                while let Some(au) = splitter.next_au() {
+                    if session.is_stopping() || !sink.emit(au) {
+                        break;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(au) = splitter.flush_pending() {
+                    sink.emit(au);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    eprintln!("[video] stream ended after {} frames", sink.frame_index);
+}
+
+/// The shared tail of both video paths: strip filler, stamp RTP time,
+/// packetize with FEC and put the access unit on the wire.
+struct AuSink {
+    session: Arc<Session>,
+    sock: Arc<UdpSocket>,
+    epoch: Instant,
+    /// One IV counter for the whole video stream; never reset, so no two
+    /// shards are ever encrypted under the same key and nonce.
+    iv_counter: std::sync::atomic::AtomicU64,
+    frame_index: u32,
+    lowseq: u16,
+}
+
+impl AuSink {
+    fn new(session: Arc<Session>, sock: Arc<UdpSocket>) -> AuSink {
+        AuSink {
+            session,
+            sock,
+            epoch: Instant::now(),
+            iv_counter: std::sync::atomic::AtomicU64::new(0),
+            frame_index: 0,
+            lowseq: 0,
+        }
+    }
+
+    fn emit(&mut self, au: Vec<u8>) -> bool {
         let au = strip_filler(&au);
-        let Some(peer) = *session.video_peer.lock().unwrap() else {
+        let Some(peer) = *self.session.video_peer.lock().unwrap() else {
             // No client ping yet — nothing to send to.
             return true;
         };
 
         // RTP video timestamps run on a 90 kHz clock.
-        let ts = (epoch.elapsed().as_secs_f64() * 90_000.0) as u32;
+        let ts = (self.epoch.elapsed().as_secs_f64() * 90_000.0) as u32;
         let is_idr = au_is_idr(&au);
         if is_idr {
-            session.idr_requested.store(false, Ordering::Release);
+            self.session.idr_requested.store(false, Ordering::Release);
         }
 
-        if is_idr || *frame_index % 60 == 0 {
+        if is_idr || self.frame_index % 60 == 0 {
             eprintln!(
-                "[video] frame {frame_index} {} {} bytes",
+                "[video] frame {} {} {} bytes",
+                self.frame_index,
                 if is_idr { "IDR" } else { "P" },
                 au.len()
             );
         }
 
-        let cfg = session.config.lock().unwrap().clone();
+        let cfg = self.session.config.lock().unwrap().clone();
         let cipher = if cfg.encryption_flags & crate::session::SS_ENC_VIDEO != 0 {
-            Some((session.key.as_slice(), &video_iv_counter))
+            Some((self.session.key.as_slice(), &self.iv_counter))
         } else {
             None
         };
         if let Err(e) = send_frame(
-            &sock,
+            &self.sock,
             peer,
             &au,
-            *frame_index,
-            lowseq,
+            self.frame_index,
+            &mut self.lowseq,
             ts,
             cfg.packet_size,
             cfg.min_required_fec_packets,
@@ -709,30 +752,95 @@ pub fn run(
             eprintln!("[video] send failed: {e}");
             return false;
         }
-        *frame_index = frame_index.wrapping_add(1);
+        self.frame_index = self.frame_index.wrapping_add(1);
         true
-    };
+    }
+}
+
+/// The passthrough path: the APP encodes H.264 (minih264, inside the enclave)
+/// and this bridge only repacketizes — no NVENC, no re-encode, and every
+/// frame on the wire is a distinct guest frame, so the client's decode rate
+/// IS the fresh-frame rate. `GET /video?codec=h264` is one SSE event per
+/// access unit (base64), which also means no Annex-B splitting here.
+pub fn run_app_h264(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>) {
+    use std::io::BufRead;
+
+    let cfg = session.config.lock().unwrap().clone();
+    // The client's negotiated bitrate, bounded to what the app's VBV model
+    // and the app->bridge link sensibly carry.
+    let kbps = cfg.bitrate_kbps.clamp(1000, 8000);
+    eprintln!(
+        "[video] app-encoded H.264: /video?codec=h264&kbps={kbps} -> RTP passthrough \
+         (client asked {}x{}@{}; the stream is the framebuffer's own size)",
+        cfg.width, cfg.height, cfg.fps
+    );
+
+    let mut sink = AuSink::new(session.clone(), sock);
+    let (mut fresh, mut reported) = (0u64, Instant::now());
+    // The app leads a fresh stream with an IDR, but until the client's first
+    // ping lands there is no peer to send to and that IDR is dropped on the
+    // floor — after which the client sits silent until the next periodic
+    // keyframe (GOP 300 ≈ 15 s; measured as a 24 s dead start). Ask the app
+    // for a new random-access point the moment the peer appears.
+    let mut peer_seen = false;
 
     while !session.is_stopping() {
-        match chunk_rx.recv_timeout(FLUSH_SILENCE) {
-            Ok(chunk) => {
-                splitter.push(&chunk);
-                while let Some(au) = splitter.next_au() {
-                    if session.is_stopping() || !emit(au, &mut frame_index, &mut lowseq) {
-                        break;
-                    }
+        let mut r = match app.get_stream(&format!("/video?codec=h264&kbps={kbps}")) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[video] /video connect failed: {e}; retrying");
+                if !session.wait(Duration::from_secs(1)) {
+                    break;
                 }
+                continue;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(au) = splitter.flush_pending() {
-                    emit(au, &mut frame_index, &mut lowseq);
-                }
+        };
+        let mut line = String::new();
+        loop {
+            if session.is_stopping() {
+                return;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            // A lost client needs a random-access point; the app owns the
+            // encoder, so forward the request as a keyframe order. Checked
+            // per event: at 30 fps that bounds the reaction to ~a frame.
+            if !peer_seen && session.video_peer.lock().unwrap().is_some() {
+                peer_seen = true;
+                session.request_idr();
+            }
+            if session.take_idr_request() {
+                let _ = app.post_json("/video-key", "{}");
+            }
+            line.clear();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // stream ended; redial
+                Ok(_) => {}
+            }
+            let Some(payload) = line.strip_prefix("data: ") else { continue };
+            let Some(d) = crate::screen::json_str(payload.trim_end(), "d") else { continue };
+            let Some(au) = crate::screen::b64_decode(d) else {
+                eprintln!("[video] frame with undecodable base64, skipped");
+                continue;
+            };
+            if au.is_empty() {
+                continue;
+            }
+            fresh += 1;
+            if reported.elapsed() >= Duration::from_secs(10) {
+                eprintln!(
+                    "[video] source: {:.1} app frames/s",
+                    fresh as f64 / reported.elapsed().as_secs_f64()
+                );
+                reported = Instant::now();
+                fresh = 0;
+            }
+            if !sink.emit(au) {
+                break;
+            }
         }
+        eprintln!("[video] /video stream ended; redialing");
     }
 
-    eprintln!("[video] stream ended after {frame_index} frames");
+    eprintln!("[video] stream ended after {} frames", sink.frame_index);
 }
 
 #[cfg(test)]

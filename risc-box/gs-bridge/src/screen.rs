@@ -249,7 +249,7 @@ impl Screen {
 }
 
 /// Pull a string field out of a flat JSON object without a JSON parser.
-fn json_str<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn json_str<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("\"{key}\":\"");
     let start = obj.find(&pat)? + pat.len();
     let rest = &obj[start..];
@@ -265,7 +265,7 @@ fn json_num(obj: &str, key: &str) -> Option<usize> {
     rest[..end].parse().ok()
 }
 
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => (c - b'A') as u32,

@@ -1,0 +1,49 @@
+//! Compile the vendored minih264 wrapper (vendor/minih264/) into a static
+//! library cargo bundles into this crate's artifacts. The H.264 encoder is C;
+//! everything else here is Rust — see src/video.rs for why it earns its place
+//! (the only permissively-licensed codec fast enough to encode the desktop in
+//! real time inside the wasm).
+//!
+//! Wasm targets are compiled freestanding against vendor/minih264/shim (no C
+//! sysroot exists at cargo time); the handful of libc symbols resolve at the
+//! final link against the wasi-libc the Rust side already carries. The SET
+//! build's target spec turns on atomics+bulk-memory; the object must carry
+//! the same flags or wasm-ld refuses to mix it into a shared-memory link —
+//! CARGO_CFG_TARGET_FEATURE is the signal.
+
+use std::env;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    println!("cargo:rerun-if-changed=vendor/minih264");
+
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let obj = out.join("minih264_wrapper.o");
+    let lib = out.join("libminih264wrap.a");
+
+    let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
+    cc.args(["-O2", "-DNDEBUG", "-c", "vendor/minih264/wrapper.c", "-o"]).arg(&obj);
+    if arch == "wasm32" {
+        cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/minih264/shim"]);
+        for f in ["atomics", "bulk-memory", "mutable-globals"] {
+            if features.split(',').any(|x| x == f) {
+                cc.arg(format!("-m{f}"));
+            }
+        }
+    }
+    let st = cc.status().expect("clang not found (set RBX_CLANG to a clang that targets wasm32)");
+    assert!(st.success(), "minih264 wrapper failed to compile");
+
+    let _ = std::fs::remove_file(&lib);
+    let st = Command::new(env::var("RBX_AR").unwrap_or_else(|_| "ar".into()))
+        .arg("rcs").arg(&lib).arg(&obj)
+        .status()
+        .expect("ar not found (set RBX_AR)");
+    assert!(st.success(), "ar failed");
+
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=minih264wrap");
+}

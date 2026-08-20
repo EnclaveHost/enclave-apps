@@ -108,6 +108,10 @@ pub struct App {
     tls: bool,
     /// Bearer token for a deployment whose config sets `api_key`.
     api_key: Option<String>,
+    /// Deployment-scoped app token for a PRIVATE deployment, sent as the
+    /// gateway's `enclave_app` cookie (the only owner proof that survives the
+    /// relay on the data path; Authorization is consumed by the gateway).
+    app_cookie: Option<String>,
     /// Warm connections for the one-shot calls (`get` / `post_json`).
     ///
     /// Dialling per request is free beside the app and ruinous across the
@@ -144,12 +148,18 @@ impl App {
             true => rest.to_string(),
             false => format!("{rest}:{}", if tls { 443 } else { 80 }),
         };
-        App { addr, host, tls, api_key: None, idle: std::sync::Mutex::new(Vec::new()) }
+        App { addr, host, tls, api_key: None, app_cookie: None, idle: std::sync::Mutex::new(Vec::new()) }
     }
 
     /// Set the bearer token sent with every request.
     pub fn with_api_key(mut self, key: Option<String>) -> App {
         self.api_key = key;
+        self
+    }
+
+    /// Set the private-deployment app token (rides as the enclave_app cookie).
+    pub fn with_app_cookie(mut self, tok: Option<String>) -> App {
+        self.app_cookie = tok;
         self
     }
 
@@ -163,10 +173,14 @@ impl App {
         // gateway's own auth channel for private deployments) and never
         // forwards it, so through the gateway only x-api-key reaches the
         // app. Bearer stays for direct/loopback use.
-        match &self.api_key {
+        let mut h = match &self.api_key {
             Some(k) => format!("Authorization: Bearer {k}\r\nx-api-key: {k}\r\n"),
             None => String::new(),
+        };
+        if let Some(t) = &self.app_cookie {
+            h.push_str(&format!("Cookie: enclave_app={t}\r\n"));
         }
+        h
     }
 
     fn connect(&self) -> std::io::Result<Conn> {

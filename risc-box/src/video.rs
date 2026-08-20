@@ -55,6 +55,18 @@ pub trait VideoEncoder {
     fn webcodec(&self) -> &'static str {
         ""
     }
+    /// Ask for the next frame to be a random-access point (a Moonlight client
+    /// that lost packets requests one). Default: no-op; codecs that cannot
+    /// force one mid-stream are handled by dropping and rebuilding the encoder.
+    fn force_keyframe(&mut self) {}
+    /// Encode straight from the captured BGRX framebuffer, skipping the packed
+    /// RGB intermediate — one pass over the pixels instead of three, which is
+    /// a real fraction of the per-frame budget at 1024x768 under wasm. `None`
+    /// means the backend has no fast path and the caller should convert and
+    /// call [`VideoEncoder::encode`].
+    fn encode_capture(&mut self, _fresh: &[u8]) -> Option<Vec<EncodedFrame>> {
+        None
+    }
 }
 
 /// Convert packed RGB to planar I420 (YUV 4:2:0, BT.601 limited range) — the
@@ -213,5 +225,163 @@ impl VideoEncoder for Av1Encoder {
     fn webcodec(&self) -> &'static str {
         // profile 0 (Main), level 4.0, Main tier, 8-bit
         "av01.0.08M.08"
+    }
+}
+
+/// H.264 via minih264 (vendor/minih264, CC0) — the codec a Moonlight client
+/// decodes natively, encoded fast enough to matter: measured 2.7 ms/frame at
+/// 1024x768 native (374 fps), which leaves real-time 30 fps intact even after
+/// the wasm and slower-fleet-core discounts. rav1e at the same size measured
+/// 2.9 fps on the fleet, so AV1 stays the browser/WebCodecs codec and this is
+/// the streaming one. The C side is two flat entry points over caller-owned
+/// buffers (no allocation in C); see vendor/minih264/wrapper.c.
+extern "C" {
+    fn rbx_h264_sizeof(w: i32, h: i32, gop: i32, kbps: i32, persist: *mut i32, scratch: *mut i32) -> i32;
+    fn rbx_h264_init(persist: *mut u8, w: i32, h: i32, gop: i32, kbps: i32) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rbx_h264_encode(
+        persist: *mut u8,
+        scratch: *mut u8,
+        y: *const u8,
+        u: *const u8,
+        v: *const u8,
+        w: i32,
+        h: i32,
+        force_key: i32,
+        desired_bytes: i32,
+        qp_min: i32,
+        qp_max: i32,
+        coded: *mut *const u8,
+        coded_len: *mut i32,
+    ) -> i32;
+}
+
+/// Keyframe period. Long on purpose: every joiner gets a fresh encoder (so an
+/// IDR leads its stream), and a client that loses packets asks for one via
+/// `force_keyframe`, so the periodic IDR is only a backstop.
+const H264_GOP: i32 = 300;
+
+pub struct H264Encoder {
+    persist: Vec<u64>, // u64-backed so the C state is 8-aligned
+    scratch: Vec<u64>,
+    w: usize,
+    h: usize,
+    kbps: u32,
+    force_key: bool,
+}
+
+impl H264Encoder {
+    /// `kbps` is the VBV-controlled target bitrate. Dimensions must be
+    /// macroblock-aligned (multiples of 16) — the framebuffer's 1024x768 is.
+    pub fn new(w: usize, h: usize, kbps: u32) -> Option<Self> {
+        if w == 0 || h == 0 || w % 16 != 0 || h % 16 != 0 {
+            return None;
+        }
+        let (mut p, mut s) = (0i32, 0i32);
+        let rc = unsafe { rbx_h264_sizeof(w as i32, h as i32, H264_GOP, kbps as i32, &mut p, &mut s) };
+        if rc != 0 || p <= 0 || s <= 0 {
+            return None;
+        }
+        let mut persist = vec![0u64; (p as usize).div_ceil(8)];
+        let scratch = vec![0u64; (s as usize).div_ceil(8)];
+        let rc = unsafe {
+            rbx_h264_init(persist.as_mut_ptr() as *mut u8, w as i32, h as i32, H264_GOP, kbps as i32)
+        };
+        if rc != 0 {
+            return None;
+        }
+        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false })
+    }
+}
+
+/// One-pass BGRX (the guest framebuffer's layout, `stride` bytes a row) to
+/// I420, BT.601 limited range — the same math as [`rgb_to_i420`] without the
+/// packed-RGB intermediate or its extra pass. Dimensions must be even.
+pub fn bgrx_to_i420(fresh: &[u8], w: usize, h: usize, stride: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let cw = w / 2;
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; cw * (h / 2)];
+    let mut v = vec![0u8; cw * (h / 2)];
+    for j in 0..h {
+        let row = &fresh[j * stride..j * stride + w * 4];
+        let yrow = &mut y[j * w..(j + 1) * w];
+        if j & 1 == 0 {
+            let urow = &mut u[(j / 2) * cw..(j / 2) * cw + cw];
+            let vrow = &mut v[(j / 2) * cw..(j / 2) * cw + cw];
+            for (i2, px) in row.chunks_exact(8).enumerate() {
+                let (b0, g0, r0) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                let (b1, g1, r1) = (px[4] as i32, px[5] as i32, px[6] as i32);
+                yrow[i2 * 2] = (((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8).clamp(0, 219) + 16) as u8;
+                yrow[i2 * 2 + 1] = (((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8).clamp(0, 219) + 16) as u8;
+                // chroma from the top-left pixel of each 2x2 block, as before
+                urow[i2] = ((((-38 * r0 - 74 * g0 + 112 * b0 + 128) >> 8) + 128).clamp(16, 240)) as u8;
+                vrow[i2] = ((((112 * r0 - 94 * g0 - 18 * b0 + 128) >> 8) + 128).clamp(16, 240)) as u8;
+            }
+        } else {
+            for (i, px) in row.chunks_exact(4).enumerate() {
+                let (b, g, r) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                yrow[i] = (((66 * r + 129 * g + 25 * b + 128) >> 8).clamp(0, 219) + 16) as u8;
+            }
+        }
+    }
+    (y, u, v)
+}
+
+impl H264Encoder {
+    fn encode_planes(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Vec<EncodedFrame> {
+        let mut coded: *const u8 = std::ptr::null();
+        let mut coded_len: i32 = 0;
+        let force = std::mem::take(&mut self.force_key);
+        let rc = unsafe {
+            rbx_h264_encode(
+                self.persist.as_mut_ptr() as *mut u8,
+                self.scratch.as_mut_ptr() as *mut u8,
+                y.as_ptr(),
+                u.as_ptr(),
+                v.as_ptr(),
+                self.w as i32,
+                self.h as i32,
+                force as i32,
+                (self.kbps as i32) * 1000 / 8 / 30, // per-frame budget at 30 fps
+                10,
+                48,
+                &mut coded,
+                &mut coded_len,
+            )
+        };
+        if rc != 0 || coded.is_null() || coded_len <= 0 {
+            return vec![];
+        }
+        let data = unsafe { std::slice::from_raw_parts(coded, coded_len as usize) }.to_vec();
+        // A random-access frame is recognizable by its access unit leading
+        // with an SPS NAL (type 7) — the same rule Moonlight applies.
+        let keyframe = data.len() > 4 && data[..4] == [0, 0, 0, 1] && data[4] & 0x1f == 7
+            || data.len() > 3 && data[..3] == [0, 0, 1] && data[3] & 0x1f == 7;
+        vec![EncodedFrame { data, keyframe }]
+    }
+}
+
+impl VideoEncoder for H264Encoder {
+    fn encode(&mut self, rgb: &[u8], _width: usize, _height: usize) -> Vec<EncodedFrame> {
+        let (y, u, v) = rgb_to_i420(rgb, self.w, self.h);
+        self.encode_planes(&y, &u, &v)
+    }
+    fn encode_capture(&mut self, fresh: &[u8]) -> Option<Vec<EncodedFrame>> {
+        if fresh.len() < fb_bytes() || (self.w, self.h) != (fb_w(), fb_h()) {
+            return None;
+        }
+        let (y, u, v) = bgrx_to_i420(fresh, self.w, self.h, fb_stride());
+        Some(self.encode_planes(&y, &u, &v))
+    }
+    fn mime(&self) -> &'static str {
+        "video/H264"
+    }
+    fn webcodec(&self) -> &'static str {
+        // Constrained Baseline, level 3.2 (Annex-B stream; a WebCodecs
+        // consumer must configure `avc: {format: "annexb"}`).
+        "avc1.42E020"
+    }
+    fn force_keyframe(&mut self) {
+        self.force_key = true;
     }
 }

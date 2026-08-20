@@ -47,6 +47,66 @@ use std::time::{Duration, Instant};
 use crate::display::{self, Display};
 use crate::video::{self, EncodedFrame, VideoEncoder};
 
+/// Which codec the video stream wants, set by the `/video` handler when a
+/// watcher joins and read wherever the encoder is (re)built — over here on the
+/// worker, or inline on the main thread when there is no worker. Packed as
+/// codec in the low byte (0 = AV1, 1 = H.264) and kbps above it, one atomic so
+/// a torn read cannot pair one codec with the other's bitrate.
+static VIDEO_PARAMS: AtomicU32 = AtomicU32::new(0);
+/// A client asked for a random-access point (Moonlight lost packets).
+static VIDEO_FORCE_KEY: AtomicBool = AtomicBool::new(false);
+
+pub const CODEC_AV1: u8 = 0;
+pub const CODEC_H264: u8 = 1;
+
+pub fn set_video_params(codec: u8, kbps: u32) {
+    VIDEO_PARAMS.store((kbps.min(50_000) << 8) | codec as u32, Ordering::Release);
+}
+
+pub fn video_params() -> (u8, u32) {
+    let v = VIDEO_PARAMS.load(Ordering::Acquire);
+    ((v & 0xff) as u8, v >> 8)
+}
+
+/// The raw packed value, for change detection against a built encoder.
+pub fn packed_params() -> u32 {
+    VIDEO_PARAMS.load(Ordering::Acquire)
+}
+
+pub fn force_key() {
+    VIDEO_FORCE_KEY.store(true, Ordering::Release);
+}
+
+pub fn take_force_key() -> bool {
+    VIDEO_FORCE_KEY.swap(false, Ordering::AcqRel)
+}
+
+/// Build the encoder the current params ask for. Shared by the worker loop and
+/// the inline fallback so both agree on defaults.
+pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
+    let (codec, kbps) = video_params();
+    let (w, h) = (display::fb_w(), display::fb_h());
+    let params = VIDEO_PARAMS.load(Ordering::Acquire);
+    match codec {
+        CODEC_H264 => {
+            let kbps = if kbps == 0 { 3000 } else { kbps };
+            video::H264Encoder::new(w, h, kbps)
+                .map(|e| (params, Box::new(e) as Box<dyn VideoEncoder + Send>))
+        }
+        _ => {
+            let kbps = if kbps == 0 { 4000 } else { kbps };
+            video::Av1Encoder::new(w, h, kbps as i32 * 1000, 10)
+                .map(|e| (params, Box::new(e) as Box<dyn VideoEncoder + Send>))
+        }
+    }
+}
+
+/// Ceiling on the encode cadence. The capture loop runs at the display scan
+/// floor (8–16 ms), but 60–120 encodes a second would just spread the bitrate
+/// thinner and burn the worker core; the target is a stable 30 fps stream, so
+/// cap a little above it and let per-frame quality keep the headroom.
+pub const VIDEO_MIN_INTERVAL: Duration = Duration::from_millis(25);
+
 /// One captured framebuffer, plus what the watchers currently want done to it.
 pub struct Job {
     pub frame: Vec<u8>,
@@ -140,7 +200,10 @@ pub fn reset() {
 fn serve() {
     let p = pipe();
     let mut display = Display::new();
-    let mut av1: Option<video::Av1Encoder> = None;
+    // The encoder plus the params it was built with, so a watcher switching
+    // codec or bitrate rebuilds it (and the rebuild's first frame is an IDR).
+    let mut enc: Option<(u32, Box<dyn VideoEncoder + Send>)> = None;
+    let mut last_encode: Option<Instant> = None;
 
     loop {
         let job = p.jobs.lock().unwrap().pop_front();
@@ -155,7 +218,7 @@ fn serve() {
         let began = Instant::now();
         if p.reset.swap(false, Ordering::AcqRel) {
             display.reset();
-            av1 = None;
+            enc = None;
         }
         if p.force_full.swap(false, Ordering::AcqRel) {
             display.want_full();
@@ -163,15 +226,26 @@ fn serve() {
 
         let mut video = Vec::new();
         if job.want_video {
-            if av1.is_none() {
-                av1 = video::Av1Encoder::new(display::fb_w(), display::fb_h(), 4_000_000, 10);
+            let params = packed_params();
+            if enc.as_ref().map(|(p, _)| *p) != Some(params) {
+                enc = build_encoder();
+                last_encode = None;
             }
-            let (rgb, w, h) = video::rgb_from_capture(&job.frame);
-            if let Some(enc) = av1.as_mut() {
-                video = enc.encode(&rgb, w, h);
+            let due = last_encode.map_or(true, |t| t.elapsed() >= VIDEO_MIN_INTERVAL);
+            if due {
+                if let Some((_, e)) = enc.as_mut() {
+                    if take_force_key() {
+                        e.force_keyframe();
+                    }
+                    video = e.encode_capture(&job.frame).unwrap_or_else(|| {
+                        let (rgb, w, h) = video::rgb_from_capture(&job.frame);
+                        e.encode(&rgb, w, h)
+                    });
+                    last_encode = Some(Instant::now());
+                }
             }
-        } else if av1.is_some() {
-            av1 = None;
+        } else if enc.is_some() {
+            enc = None;
         }
 
         // Bands last: it consumes the frame and hands back the buffer.
