@@ -334,8 +334,13 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     // responses at all. A modern app never answers it, so the moment the
     // peer says ANYTHING (an old app 404ing, a proxy erroring) this drops to
     // the pipelined per-request channel, which every app speaks.
-    let mut stream = Some(app.input_stream());
-    let mut pipe: Option<crate::app::InputPipe> = None;
+    let viable = app.input_stream_viable();
+    let mut stream = if viable { Some(app.input_stream()) } else { None };
+    let mut pipe: Option<crate::app::InputPipe> =
+        if viable { None } else { Some(app.input_pipe()) };
+    if !viable {
+        eprintln!("[control] input: pipelined /hid (streamed channel is loopback-only)");
+    }
     // A lost stream is a fallback, not a verdict: the platform kills long-held
     // request streams periodically (lease-slice churn), and against an OLD app
     // the answer arrives on every dial. So the pipe carries input while a
@@ -360,7 +365,7 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
                 } else {
                     candidate = Some((cand, since));
                 }
-            } else if retry_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            } else if viable && retry_at.is_some_and(|t| std::time::Instant::now() >= t) {
                 retry_at = None;
                 let mut cand = app.input_stream();
                 match cand.send(r#"{"events":[]}"#) {

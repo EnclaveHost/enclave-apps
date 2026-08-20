@@ -170,6 +170,19 @@ impl App {
         self
     }
 
+    /// Whether the streamed input channel (POST /hid-stream, a chunked body
+    /// dispatched line by line) can be TRUSTED on this path. It only works
+    /// where nothing buffers the request body: a proxy that streams bodies
+    /// silently — the enclave's direct endpoint does — accepts the channel,
+    /// never answers, and delivers NOTHING, so every input event vanishes
+    /// into its buffer while the picture keeps moving (measured: a /hid move
+    /// lands the cursor, the identical /hid-stream line does not). The
+    /// gateway at least 501s, which the fallback catches; a silent buffer is
+    /// undetectable from this side, so the channel is loopback-only.
+    pub fn input_stream_viable(&self) -> bool {
+        !self.tls && self.base_path.is_empty()
+    }
+
     pub fn addr(&self) -> &str {
         &self.addr
     }
