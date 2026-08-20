@@ -37,6 +37,7 @@ mod egress;
 mod httpd;
 mod imgcheck;
 mod ipfs;
+mod redirects;
 mod s3;
 mod upload;
 mod wasmscan;
@@ -432,6 +433,10 @@ struct App {
     /// snapshot WITHOUT it (its listing predates the object). Kept until a
     /// listing includes the key, unioned into every commit meanwhile.
     recent_uploads: Vec<FileEntry>,
+    /// Parsed `_redirects` per root CID digest, `None` = that root has none.
+    /// CIDs are immutable, so a parse is valid for that root forever — the
+    /// cache never needs invalidating across reindexes.
+    redirects_cache: HashMap<[u8; 32], Option<Rc<redirects::Redirects>>>,
 }
 
 impl App {
@@ -742,6 +747,7 @@ fn main() {
         },
         upload_shared: upload::Shared::new(),
         recent_uploads: Vec::new(),
+        redirects_cache: HashMap::new(),
     };
     let mut srv = Server::bind(APP, 8000);
     // Per-route buffered-body caps, enforced in the parser against
@@ -1072,30 +1078,9 @@ fn gateway(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
     let snap = app.snap.clone();
     let s3ctx = app.s3.as_ref().unwrap().clone();
 
-    // Walk the sub-path through UnixFS directories.
-    let mut cur = root_cid;
-    let mut walked: Vec<String> = Vec::new();
-    for seg in subpath.split('/').filter(|s| !s.is_empty()) {
-        if cur.codec != CODEC_DAG_PB {
-            return srv.respond(key, json(404, "Not Found", "{\"error\":\"path descends into a leaf\"}".into()));
-        }
-        let Some(block) = snap.nodes.get(&cur.digest) else {
-            return srv.respond(key, not_indexed(&cur));
-        };
-        let Some((links, data)) = ipfs::dagpb_decode(block) else {
-            return srv.respond(key, json(500, "Internal Server Error", "{\"error\":\"bad node\"}".into()));
-        };
-        if !ipfs::is_unixfs_dir(&data) {
-            return srv.respond(key, json(404, "Not Found", "{\"error\":\"not a directory\"}".into()));
-        }
-        let Some(link) = links.iter().find(|l| l.name == seg) else {
-            return srv.respond(key, json(404, "Not Found", "{\"error\":\"no such path\"}".into()));
-        };
-        cur = link.cid;
-        walked.push(seg.to_string());
-    }
-
-    // Format negotiation: explicit ?format= wins, then Accept.
+    // Format negotiation: explicit ?format= wins, then Accept. Computed before
+    // the walk so a miss can tell a web (UnixFS) request — which falls through
+    // to _redirects — from a trustless ?format=raw/car one, whose miss is a 404.
     let accept = req.header("accept").unwrap_or("");
     let format = match httpd::form_get(&req.query, "format").as_deref() {
         Some("raw") => Format::Raw,
@@ -1105,6 +1090,44 @@ fn gateway(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
         None if accept.contains("application/vnd.ipld.car") => Format::Car,
         None => Format::Unixfs,
     };
+
+    // Walk the sub-path through UnixFS directories.
+    let mut cur = root_cid;
+    let mut walked: Vec<String> = Vec::new();
+    let mut absent = false;
+    for seg in subpath.split('/').filter(|s| !s.is_empty()) {
+        if cur.codec != CODEC_DAG_PB {
+            absent = true; // the path tries to descend into a leaf
+            break;
+        }
+        let Some(block) = snap.nodes.get(&cur.digest) else {
+            return srv.respond(key, not_indexed(&cur));
+        };
+        let Some((links, data)) = ipfs::dagpb_decode(block) else {
+            return srv.respond(key, json(500, "Internal Server Error", "{\"error\":\"bad node\"}".into()));
+        };
+        if !ipfs::is_unixfs_dir(&data) {
+            absent = true; // a segment descends through a file
+            break;
+        }
+        let Some(link) = links.iter().find(|l| l.name == seg) else {
+            absent = true; // no such entry
+            break;
+        };
+        cur = link.cid;
+        walked.push(seg.to_string());
+    }
+
+    // A path absent from the DAG falls through to the site root's _redirects
+    // (pretty URLs, the branded 404) — but only for a web (UnixFS) request.
+    if absent {
+        if matches!(format, Format::Unixfs)
+            && try_redirects(app, &snap, &s3ctx, srv, key, req, &root_cid, subpath, head_only)
+        {
+            return;
+        }
+        return srv.respond(key, json(404, "Not Found", "{\"error\":\"no such path\"}".into()));
+    }
 
     let base = gateway_headers(&root_cid, &cur, req);
     match format {
@@ -1118,6 +1141,139 @@ fn gateway(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
             srv.respond_stream(key, resp, None, head_only, Box::new(src));
         }
         Format::Unixfs => serve_unixfs(&snap, &s3ctx, srv, key, req, &root_cid, &cur, &walked, head_only),
+    }
+}
+
+/// Consult the site root's `_redirects` for a path that missed the DAG. Returns
+/// true if it produced a response (a 200 rewrite, a non-200 page such as the
+/// branded 404, or a 3xx redirect); false if no rule matched, so the caller
+/// falls back to a plain 404.
+fn try_redirects(
+    app: &mut App,
+    snap: &Rc<Snapshot>,
+    s3ctx: &Rc<S3Ctx>,
+    srv: &mut Server,
+    key: usize,
+    req: &Request,
+    root_cid: &Cid,
+    subpath: &str,
+    head_only: bool,
+) -> bool {
+    let Some(rules) = redirects_for(app, snap, s3ctx, root_cid) else {
+        return false;
+    };
+    let Some(m) = rules.lookup(&format!("/{subpath}")) else {
+        return false;
+    };
+    // A 3xx rule is a redirect, not a content rewrite.
+    if (300..400).contains(&m.status) {
+        srv.respond(
+            key,
+            Response::new(m.status, status_reason(m.status))
+                .with("location", &m.to)
+                .with("cache-control", "no-store"),
+        );
+        return true;
+    }
+    // Resolve the target within the same root. If it too is absent, don't
+    // loop — let the caller emit a plain 404.
+    let to_sub = m.to.trim_start_matches('/');
+    let Some(target) = walk_to(snap, root_cid, to_sub) else {
+        return false;
+    };
+    if m.status == 200 {
+        // Serve it exactly as a direct request for the target would: streamed,
+        // right content-type, 200 + ETag.
+        let walked: Vec<String> =
+            to_sub.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
+        serve_unixfs(snap, s3ctx, srv, key, req, root_cid, &target, &walked, head_only);
+        return true;
+    }
+    // A non-200 rewrite (e.g. the `/* /404.html 404` catch-all): serve the
+    // target's bytes verbatim, but carrying the rule's status.
+    let Some(bytes) = read_small_file(snap, s3ctx, &target) else {
+        return false;
+    };
+    let mut resp = Response::new(m.status, status_reason(m.status))
+        .with("content-type", content_type_for(to_sub))
+        .with("cache-control", "no-store")
+        .with("x-content-type-options", "nosniff");
+    resp.body = bytes;
+    respond_sized(srv, key, resp, head_only);
+    true
+}
+
+/// Parsed `_redirects` for a root, from cache or a one-time DAG read. `None`
+/// (also cached) when the root has no readable/parseable/non-empty `_redirects`.
+/// Root CIDs are immutable, so a cached parse is valid for that root forever.
+fn redirects_for(
+    app: &mut App,
+    snap: &Rc<Snapshot>,
+    s3ctx: &Rc<S3Ctx>,
+    root_cid: &Cid,
+) -> Option<Rc<redirects::Redirects>> {
+    if let Some(hit) = app.redirects_cache.get(&root_cid.digest) {
+        return hit.clone();
+    }
+    let parsed = walk_to(snap, root_cid, "_redirects")
+        .and_then(|cid| read_small_file(snap, s3ctx, &cid))
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|text| Rc::new(redirects::parse(&text)))
+        .filter(|r| !r.is_empty());
+    app.redirects_cache.insert(root_cid.digest, parsed.clone());
+    parsed
+}
+
+/// Walk a sub-path to its CID without serving. `None` on any miss.
+fn walk_to(snap: &Snapshot, root_cid: &Cid, subpath: &str) -> Option<Cid> {
+    let mut cur = *root_cid;
+    for seg in subpath.split('/').filter(|s| !s.is_empty()) {
+        if cur.codec != CODEC_DAG_PB {
+            return None;
+        }
+        let block = snap.nodes.get(&cur.digest)?;
+        let (links, data) = ipfs::dagpb_decode(block)?;
+        if !ipfs::is_unixfs_dir(&data) {
+            return None;
+        }
+        cur = links.iter().find(|l| l.name == seg)?.cid;
+    }
+    Some(cur)
+}
+
+/// Read a small whole file (a single raw leaf, or a chunked file up to a few
+/// MiB) from the DAG — used only for `_redirects` and redirect targets, which
+/// are tiny HTML/text. Larger targets return `None` (caller 404s).
+fn read_small_file(snap: &Snapshot, s3ctx: &S3Ctx, cid: &Cid) -> Option<Vec<u8>> {
+    const CAP: u64 = 4 << 20;
+    if cid.codec == CODEC_RAW {
+        let &(fi, ci) = snap.leaf_of.get(&cid.digest)?;
+        return fetch_leaf(snap, s3ctx, fi, ci).ok();
+    }
+    let &fi = snap.file_root.get(&cid.digest)?;
+    let f = &snap.files[fi as usize];
+    if f.size > CAP {
+        return None;
+    }
+    let mut out = Vec::with_capacity(f.size as usize);
+    for ci in 0..f.leaves.len() as u32 {
+        out.extend(fetch_leaf(snap, s3ctx, fi, ci).ok()?);
+    }
+    Some(out)
+}
+
+/// A static reason phrase for the statuses `_redirects` can produce.
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        404 => "Not Found",
+        410 => "Gone",
+        451 => "Unavailable For Legal Reasons",
+        _ => "OK",
     }
 }
 
