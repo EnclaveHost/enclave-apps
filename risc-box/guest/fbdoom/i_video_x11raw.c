@@ -946,11 +946,17 @@ static int x_key_to_doom(int keycode)
         case 12:  return KEY_MINUS;
         case 42:
         case 54:  return KEY_RSHIFT;
+        // Ctrl is FIRE, and fbDOOM does not reach that through KEY_RCTRL:
+        // m_controls.c binds key_fire to its own KEY_FIRE (0xa3), so a Ctrl
+        // reported as KEY_RCTRL (0x9d) matches nothing and the gun never
+        // shoots. Same story for Space below. Every other default DOES use
+        // the vanilla constants (key_speed = KEY_RSHIFT, key_strafe =
+        // KEY_RALT, the arrows), which is why only these two were dead.
         case 29:
-        case 97:  return KEY_RCTRL;
+        case 97:  return KEY_FIRE;
         case 56:
         case 100: return KEY_RALT;
-        case 57:  return ' ';
+        case 57:  return KEY_USE;   // Space opens doors and hits switches
         case 2:   return '1';
         case 3:   return '2';
         case 4:   return '3';
