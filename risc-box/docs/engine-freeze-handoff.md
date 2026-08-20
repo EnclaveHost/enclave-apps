@@ -1,5 +1,14 @@
 # Handoff: finish the stable-30fps Moonlight chain by fixing the engine freeze
 
+> **SUPERSEDED 2026-08-20 — the freeze is root-caused and fixed in the
+> engine; see `engine-freeze-fix.md`.** The local repro this doc hoped for
+> works (under a CPU pin), the mechanism is proven with in-engine gauges
+> (tokio's edge-cached socket readiness lying about kernel state), and
+> `wasm/wasmtime-socket-level-check.patch` in the platform repo eliminates
+> it (59 stalls/10min → 0, both builds). Remaining: the operator ships the
+> toolchain rebuild, then the fleet 31-min re-cert. This doc stays as the
+> evidence ladder and access/rig reference.
+
 Paste everything below to the next agent. It is self-contained, but read
 `moonlight-30fps-handoff.md` (the working chain) and `tunnel-stall-handoff.md`
 (the defect, with the full evidence ladder) before touching anything — every
