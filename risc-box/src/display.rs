@@ -181,8 +181,21 @@ impl Display {
     /// as small as possible. Everything expensive (hashing, diffing,
     /// deflating) is in `bands` and can run anywhere.
     pub fn capture(emu: &Emulator, out: &mut Vec<u8>) {
+        // Track the guest's chosen mode BEFORE sizing the buffer: with
+        // virtio-gpu the resolution is the guest's to change at runtime, so
+        // the DTB's numbers are a starting point rather than the truth.
+        if let Some((w, h)) = emu.gpu_mode() {
+            if w as usize != fb_w() || h as usize != fb_h() {
+                // set_size refuses a mode that would not fit the reserved
+                // window; a refusal leaves the old geometry standing and
+                // read_display falls back rather than blitting a mismatch.
+                set_size(w as usize, h as usize);
+            }
+        }
         out.resize(fb_bytes(), 0);
-        emu.read_physical_range(FB_BASE, out);
+        // Prefers the virtio-gpu scanout, falls back to the
+        // simple-framebuffer; see Emulator::read_display.
+        emu.read_display(FB_BASE, out);
     }
 
     /// Turn a captured frame into bands. Takes the frame by value and hands
@@ -314,7 +327,7 @@ impl Display {
     /// watcher still sees live pixels).
     pub fn png(&mut self, emu: &Emulator) -> Vec<u8> {
         let mut fresh = vec![0u8; fb_bytes()];
-        emu.read_physical_range(FB_BASE, &mut fresh);
+        emu.read_display(FB_BASE, &mut fresh);
         // raw scanlines: filter byte 0 + RGB (drop X, reorder BGR -> RGB)
         let mut raw = Vec::with_capacity(fb_h() * (1 + fb_w() * 3));
         for y in 0..fb_h() {

@@ -33,3 +33,17 @@ CONFIG_VIRTIO_INPUT=y
 CONFIG_SOUND=y
 CONFIG_SND=y
 CONFIG_SND_VIRTIO=y
+# risc-box: the emulator's virtio-gpu device (0x10005000) — a real DRM/KMS
+# display controller alongside the simple-framebuffer above. DRM_VIRTIO_GPU is
+# what turns the mmio node into /dev/dri/card0, which is the device modern
+# userspace looks for: SDL's KMSDRM backend, Xorg's modesetting driver,
+# anything Wayland. FBDEV_EMULATION keeps /dev/fb0 working on top of it so the
+# console and the existing fbdev path do not regress, and DRM_FBDEV_OVERALLOC
+# is left at its default.
+#
+# Both display paths coexist deliberately: a kernel built WITHOUT these still
+# binds the simple-framebuffer and boots unchanged, so this fragment is
+# additive and an older image is never stranded.
+CONFIG_DRM=y
+CONFIG_DRM_VIRTIO_GPU=y
+CONFIG_DRM_FBDEV_EMULATION=y

@@ -414,6 +414,44 @@ impl Emulator {
 		self.cpu.get_mmu().read_physical_range(p_address, out);
 	}
 
+	/// risc-box patch: fill `out` with the current display contents, whichever
+	/// device is driving it.
+	///
+	/// Two display paths exist on purpose. A guest whose kernel has
+	/// CONFIG_DRM_VIRTIO_GPU binds the virtio-gpu at 0x10005000 and pushes its
+	/// pixels to us; one without it writes the simple-framebuffer at
+	/// `fallback_base` exactly as before. Hiding the choice behind one call
+	/// means the scan path has a single source of truth and an older image is
+	/// never stranded. Returns true when the pixels came from the GPU.
+	pub fn read_display(&self, fallback_base: u64, out: &mut [u8]) -> bool {
+		if let Some((w, h, pixels)) = self.cpu.get_mmu().get_gpu().scanout() {
+			// Only serve the GPU scanout when its geometry matches what the
+			// caller sized `out` for. A mode change the host has not caught up
+			// with yet must not be blitted through a buffer of the old size.
+			if (w as usize) * (h as usize) * 4 == out.len() {
+				out.copy_from_slice(pixels);
+				return true;
+			}
+		}
+		self.cpu.get_mmu().read_physical_range(fallback_base, out);
+		false
+	}
+
+	/// risc-box patch: the display controller's geometry, if the guest is
+	/// driving it. The mode is the guest's to choose at runtime, so the host
+	/// has to ask rather than assume the DTB's numbers.
+	pub fn gpu_mode(&self) -> Option<(u32, u32)> {
+		self.cpu.get_mmu().get_gpu().scanout().map(|(w, h, _)| (w, h))
+	}
+
+	/// risc-box patch: the region the guest has flushed since the last call.
+	/// This is the payoff over a simple-framebuffer: the guest NAMES what
+	/// changed, so the host need not diff a whole frame to find it.
+	pub fn gpu_take_dirty(&mut self) -> Option<(u32, u32, u32, u32)> {
+		self.cpu.get_mut_mmu().get_mut_gpu().take_dirty()
+			.map(|r| (r.x, r.y, r.width, r.height))
+	}
+
 	pub fn get_cpu(&self) -> &Cpu {
 		&self.cpu
 	}

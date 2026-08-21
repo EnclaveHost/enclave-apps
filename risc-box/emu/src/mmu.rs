@@ -25,6 +25,7 @@ use memory::Memory;
 use cpu::{PrivilegeMode, Trap, TrapType, Xlen, get_privilege_mode};
 use device::virtio_block_disk::VirtioBlockDisk;
 use device::virtio_input::VirtioInput; // risc-box patch
+use device::virtio_gpu::VirtioGpu; // risc-box patch
 use device::virtio_snd::VirtioSnd; // risc-box patch
 use device::virtio_net::VirtioNet; // risc-box patch
 use device::plic::Plic;
@@ -51,6 +52,7 @@ pub struct Mmu {
 	net: VirtioNet, // risc-box patch
 	input: VirtioInput, // risc-box patch
 	snd: VirtioSnd, // risc-box patch
+	gpu: VirtioGpu, // risc-box patch
 	plic: Plic,
 	clint: Clint,
 	uart: Uart,
@@ -155,6 +157,7 @@ impl Mmu {
 			net: VirtioNet::new(), // risc-box patch
 			input: VirtioInput::new(), // risc-box patch
 			snd: VirtioSnd::new(), // risc-box patch
+			gpu: VirtioGpu::new(1024, 768), // risc-box patch
 			plic: Plic::new(),
 			clint: Clint::new(),
 			uart: Uart::new(terminal),
@@ -417,10 +420,11 @@ impl Mmu {
 		self.input.tick(&mut self.memory); // risc-box patch
 		let mtime = self.clint.mtime(); // risc-box patch
 		self.snd.tick(mtime, &mut self.memory); // risc-box patch
+		self.gpu.tick(&mut self.memory); // risc-box patch
 		self.uart.tick(n);
 		self.plic.tick(n, self.disk.is_interrupting(), self.net.is_interrupting(),
 			self.input.is_interrupting(), self.snd.is_interrupting(),
-			self.uart.is_interrupting(), mip);
+			self.gpu.is_interrupting(), self.uart.is_interrupting(), mip);
 		self.clock = self.clock.wrapping_add(n);
 	}
 
@@ -750,6 +754,7 @@ impl Mmu {
 				0x10002000..=0x10002FFF => self.net.load(effective_address), // risc-box patch
 				0x10003000..=0x10003FFF => self.input.load(effective_address), // risc-box patch
 				0x10004000..=0x10004FFF => self.snd.load(effective_address), // risc-box patch
+				0x10005000..=0x10005FFF => self.gpu.load(effective_address), // risc-box patch
 				// risc-box patch: an access to an address no device backs must
 				// never panic the HOST process — a tenant guest could otherwise
 				// crash the whole enclave app. Read as zero, like an open bus.
@@ -841,6 +846,7 @@ impl Mmu {
 				0x10002000..=0x10002FFF => self.net.store(effective_address, value), // risc-box patch
 				0x10003000..=0x10003FFF => self.input.store(effective_address, value), // risc-box patch
 				0x10004000..=0x10004FFF => self.snd.store(effective_address, value), // risc-box patch
+				0x10005000..=0x10005FFF => self.gpu.store(effective_address, value), // risc-box patch
 				// risc-box patch: drop writes to unbacked addresses (open bus)
 				// rather than panic the host — see load_raw.
 				_ => note_unmapped(effective_address, true)
@@ -1209,6 +1215,16 @@ impl Mmu {
 
 	/// risc-box patch: mutable access to the virtio-snd device so the host can
 	/// take played audio out of it.
+	pub fn get_mut_gpu(&mut self) -> &mut VirtioGpu {
+		&mut self.gpu
+	}
+
+	/// risc-box patch: read-only view of the display controller, for the
+	/// scanout path.
+	pub fn get_gpu(&self) -> &VirtioGpu {
+		&self.gpu
+	}
+
 	pub fn get_mut_snd(&mut self) -> &mut VirtioSnd {
 		&mut self.snd
 	}

@@ -626,14 +626,28 @@ fn main() {
             emu.read_physical_range(0x87e0_0000 + (740 * 4096 + 1000 * 4) as u64, &mut br);
             let mut rm = [0u8; 4];
             emu.read_physical_range(0x87e0_0000 + (300 * 4096 + 900 * 4) as u64, &mut rm);
+            // risc-box patch: virtio-gpu state. "gpu=-" means the guest is
+            // not driving the display controller and the picture is still
+            // coming from the simple-framebuffer; "gpu=WxH+N" means it has
+            // bound a scanout and flushed N dirty regions since the last
+            // line. Without this the only evidence of the device working is
+            // that the driver probed, which says nothing about pixels.
+            let gpu = match emu.gpu_mode() {
+                Some((w, h)) => {
+                    let d = emu.gpu_take_dirty().is_some() as u32;
+                    format!("{}x{}+{}", w, h, d)
+                }
+                None => "-".to_string(),
+            };
             eprintln!(
-                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS{} guest{:>7.1}s fbw+{} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
+                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS{} guest{:>7.1}s fbw+{} gpu={} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
                 start.elapsed().as_secs_f64(),
                 done as f64 / 1e6,
                 mips,
                 fps,
                 emu.guest_mtime() as f64 / 1e7,
                 dfbw,
+                gpu,
                 px[2], px[1], px[0],
                 cx[2], cx[1], cx[0],
                 rm[2], rm[1], rm[0],
