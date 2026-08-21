@@ -37,6 +37,7 @@ mod egress;
 mod httpd;
 mod imgcheck;
 mod ipfs;
+mod leavescache;
 mod redirects;
 mod s3;
 mod upload;
@@ -62,6 +63,14 @@ const MAX_BODY: usize = 16 * 1024;
 const MAX_UPLOAD: usize = 32 * 1024 * 1024;
 /// Bytes fetched per indexing tick (whole chunks; 16 chunks).
 const INDEX_WINDOW: u64 = 4 * 1024 * 1024;
+/// Derived-state directory (under the configured prefix): the persisted
+/// leaves cache lives here, and everything under it is EXCLUDED from the
+/// index — it describes the bucket, it is not content.
+const CACHE_DIR_REL: &str = ".enclave-index/";
+const CACHE_REL: &str = ".enclave-index/leaves.bin";
+/// Read ceiling for the cache object (~600 KB at today's 1000-file bucket;
+/// a cache past this parses as truncated and degrades to a full re-hash).
+const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Bytes fetched per streaming pull (whole chunks; 8 chunks).
 const STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 /// Soft target for one CAR pull's output.
@@ -390,6 +399,9 @@ const MAX_ATTEMPTS: u32 = 5;
 
 enum Phase {
     Idle, // unconfigured
+    // One GET of the persisted leaves cache before the first LIST, so a
+    // restart re-hashes only what changed instead of the whole bucket.
+    LoadCache { attempts: u32 },
     List { cont: Option<String>, acc: Vec<s3::ObjMeta> },
     Hash {
         queue: VecDeque<(s3::ObjMeta, u32)>, // (object, failed attempts so far)
@@ -415,6 +427,7 @@ impl Indexer {
     fn state_name(&self) -> &'static str {
         match self.phase {
             Phase::Idle => "unconfigured",
+            Phase::LoadCache { .. } => "loading-cache",
             Phase::List { .. } => "listing",
             Phase::Hash { .. } => "hashing",
             Phase::Ready => "ready",
@@ -437,6 +450,13 @@ struct App {
     /// CIDs are immutable, so a parse is valid for that root forever — the
     /// cache never needs invalidating across reindexes.
     redirects_cache: HashMap<[u8; 32], Option<Rc<redirects::Redirects>>>,
+    /// Rows recovered from the persisted leaves cache, keyed by object key.
+    /// Consulted (behind the same (size, etag) binding as snapshot reuse)
+    /// only until the first commit; cleared after.
+    recovered: HashMap<String, leavescache::Row>,
+    /// sha256 of the cache bytes last written (or None): saves are skipped
+    /// while the committed rows would serialize to the same bytes.
+    cache_fp: Option<[u8; 32]>,
 }
 
 impl App {
@@ -467,10 +487,43 @@ impl App {
             Fail(String),
             StartHash,
             Commit(Vec<FileEntry>),
+            CacheLoaded(Vec<leavescache::Row>, [u8; 32]),
+            CacheAbsent,
+            CacheRetry(u32, String),
         }
         let prefix_len = self.cfg.prefix.len();
         let after = match &mut self.indexer.phase {
             Phase::Idle => After::Nothing,
+            Phase::LoadCache { attempts } => {
+                let tries = *attempts;
+                let key = format!("{}{}", self.cfg.prefix, CACHE_REL);
+                match s3::get_range(&s3ctx.ep, &s3ctx.bucket, &key, s3ctx.creds.as_ref(), 0, CACHE_MAX_BYTES) {
+                    Ok(data) => match leavescache::deserialize(&data) {
+                        // The loaded bytes' digest seeds the save fingerprint,
+                        // so a boot that changes nothing re-writes nothing.
+                        Ok(rows) => After::CacheLoaded(rows, Sha256::digest(&data).into()),
+                        Err(e) => {
+                            eprintln!("[s3-ipfs-adapter] leaves cache unusable ({e}); full re-hash");
+                            After::CacheAbsent
+                        }
+                    },
+                    Err(e) => {
+                        // A first run has no cache object: nothing to reuse,
+                        // not an error. Transient errors retry a few times —
+                        // giving up too eagerly costs an 80-minute re-hash —
+                        // but boot must never wedge on this: it is an
+                        // optimization, the LIST+hash path is the truth.
+                        if e.contains("404") || e.contains("NoSuchKey") {
+                            After::CacheAbsent
+                        } else if tries + 1 >= 3 {
+                            eprintln!("[s3-ipfs-adapter] leaves cache unreadable after {} tries ({e}); full re-hash", tries + 1);
+                            After::CacheAbsent
+                        } else {
+                            After::CacheRetry(tries + 1, format!("leaves cache: {e}"))
+                        }
+                    }
+                }
+            }
             Phase::Ready => {
                 if self.cfg.refresh_secs > 0
                     && self
@@ -504,6 +557,12 @@ impl App {
                                     );
                                 }
                                 continue; // directory marker
+                            }
+                            // Derived state, not content: indexing the leaves
+                            // cache would hash an object that changes on every
+                            // save of the index it feeds.
+                            if o.key[prefix_len.min(o.key.len())..].starts_with(CACHE_DIR_REL) {
+                                continue;
                             }
                             acc.push(o);
                         }
@@ -613,6 +672,22 @@ impl App {
                 self.fail(e);
                 true
             }
+            After::CacheLoaded(rows, fp) => {
+                eprintln!("[s3-ipfs-adapter] leaves cache: {} rows", rows.len());
+                self.recovered = rows.into_iter().map(|r| (r.key.clone(), r)).collect();
+                self.cache_fp = Some(fp);
+                self.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
+                true
+            }
+            After::CacheAbsent => {
+                self.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
+                true
+            }
+            After::CacheRetry(attempts, e) => {
+                self.indexer.phase = Phase::LoadCache { attempts };
+                self.fail(e);
+                true
+            }
             After::StartHash => {
                 self.start_hash();
                 true
@@ -642,6 +717,11 @@ impl App {
                     )
                 });
                 self.indexer.phase = Phase::Ready;
+                // From here reuse comes from the committed snapshot; holding
+                // recovered rows past it would let a stale cache shadow later
+                // listings if the two ever disagreed on an unchanged key.
+                self.recovered = HashMap::new();
+                self.save_leaves_cache();
                 true
             }
         }
@@ -659,6 +739,8 @@ impl App {
         let mut staged = Vec::new();
         let mut queue = VecDeque::new();
         let mut to_hash = 0u64;
+        let mut from_cache = 0usize;
+        let prefix_len = self.cfg.prefix.len();
         for meta in acc {
             let reuse = self
                 .snap
@@ -668,20 +750,67 @@ impl App {
                 .filter(|f| f.size == meta.size && f.etag == meta.etag);
             match reuse {
                 Some(f) => staged.push(f.clone()),
-                None => {
-                    to_hash += meta.size;
-                    queue.push_back((meta, 0));
-                }
+                // The persisted leaves cache answers exactly like snapshot
+                // reuse, behind the same (size, etag) binding — this is what
+                // turns a restart from a full re-hash into a LIST.
+                None => match self
+                    .recovered
+                    .get(&meta.key)
+                    .filter(|r| r.size == meta.size && r.etag == meta.etag)
+                {
+                    Some(r) => {
+                        from_cache += 1;
+                        staged.push(FileEntry {
+                            rel: meta.key[prefix_len..].to_string(),
+                            key: meta.key,
+                            size: r.size,
+                            etag: r.etag.clone(),
+                            leaves: Rc::new(r.leaves.clone()),
+                            root: Cid::raw([0; 32]), // filled by commit()
+                            dag_size: 0,
+                        });
+                    }
+                    None => {
+                        to_hash += meta.size;
+                        queue.push_back((meta, 0));
+                    }
+                },
             }
         }
         eprintln!(
-            "[s3-ipfs-adapter] listed: {} unchanged, {} to hash ({} bytes)",
+            "[s3-ipfs-adapter] listed: {} unchanged ({from_cache} via the leaves cache), {} to hash ({} bytes)",
             staged.len(),
             queue.len(),
             to_hash
         );
         self.indexer.skipped = 0;
         self.indexer.phase = Phase::Hash { queue, staged, cur: None, hashed: 0, to_hash };
+    }
+
+    /// Persist the committed rows so the NEXT boot reuses them (see
+    /// leavescache.rs). A failed save only costs that boot a re-hash: it
+    /// logs and serving continues, and an unchanged snapshot writes nothing.
+    fn save_leaves_cache(&mut self) {
+        let Some(s3ctx) = self.s3.clone() else { return };
+        let bytes = leavescache::serialize(
+            self.snap.files.iter().map(|f| (f.key.as_str(), f.size, f.etag.as_str(), f.leaves.as_slice())),
+        );
+        let fp: [u8; 32] = Sha256::digest(&bytes).into();
+        if self.cache_fp == Some(fp) {
+            return;
+        }
+        let key = format!("{}{}", self.cfg.prefix, CACHE_REL);
+        match s3::put_object(&s3ctx.ep, &s3ctx.bucket, &key, s3ctx.creds.as_ref(), &bytes) {
+            Ok(()) => {
+                self.cache_fp = Some(fp);
+                eprintln!(
+                    "[s3-ipfs-adapter] leaves cache saved: {} rows, {} bytes",
+                    self.snap.files.len(),
+                    bytes.len()
+                );
+            }
+            Err(e) => eprintln!("[s3-ipfs-adapter] leaves cache save failed ({e}); a restart will re-hash"),
+        }
     }
 }
 
@@ -718,7 +847,7 @@ fn main() {
         ),
     }
     let phase = if s3ctx.is_some() {
-        Phase::List { cont: None, acc: Vec::new() }
+        Phase::LoadCache { attempts: 0 }
     } else {
         Phase::Idle
     };
@@ -748,6 +877,8 @@ fn main() {
         upload_shared: upload::Shared::new(),
         recent_uploads: Vec::new(),
         redirects_cache: HashMap::new(),
+        recovered: HashMap::new(),
+        cache_fp: None,
     };
     let mut srv = Server::bind(APP, 8000);
     // Per-route buffered-body caps, enforced in the parser against
@@ -812,6 +943,9 @@ fn merge_commits(app: &mut App) {
     }
     if changed {
         app.snap = Rc::new(commit(entries));
+        // A pin followed by a restart must survive it: persist right away
+        // rather than waiting for the next scheduled LIST to confirm it.
+        app.save_leaves_cache();
     }
 }
 
