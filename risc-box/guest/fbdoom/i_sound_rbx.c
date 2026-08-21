@@ -26,6 +26,7 @@
 // game loop waiting on the card.
 
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,7 @@ static FILE *sink;
 static int sink_fd = -1;
 static boolean use_sfx_prefix_local;
 static struct timespec last_write;
+static int reopen_countdown;
 static short mixbuf[MAX_FRAMES * OUT_CHANNELS];
 
 static void SplitVolume(int vol, int sep, int *left, int *right)
@@ -73,23 +75,40 @@ static void SplitVolume(int vol, int sep, int *left, int *right)
     *right = (vol * sep) / 255;
 }
 
-static boolean RBX_Init(boolean use_sfx_prefix)
+/// (Re)start the player. Split out because it is also the recovery path: on a
+/// machine this slow aplay can lose its stream to an underrun and exit, and a
+/// game that then goes permanently silent is worse than one that skips a
+/// sound. Failing here is not fatal — the next Update tries again.
+static boolean OpenSink(void)
 {
-    use_sfx_prefix_local = use_sfx_prefix;
-    memset(channels, 0, sizeof(channels));
-
     // -q so aplay's chatter stays out of the game's console. Reading raw from
     // stdin means no header and no seeking, which is all a mixer can offer.
     sink = popen("aplay -q -f S16_LE -r 11025 -c 2 -t raw - 2>/dev/null", "w");
     if (sink == NULL)
     {
-        printf("I_Sound: could not start aplay; sound disabled\n");
         return false;
     }
     sink_fd = fileno(sink);
     // Non-blocking: the game loop must never wait on the card.
     fcntl(sink_fd, F_SETFL, fcntl(sink_fd, F_GETFL, 0) | O_NONBLOCK);
     clock_gettime(CLOCK_MONOTONIC, &last_write);
+    return true;
+}
+
+static boolean RBX_Init(boolean use_sfx_prefix)
+{
+    use_sfx_prefix_local = use_sfx_prefix;
+    memset(channels, 0, sizeof(channels));
+
+    // Without this a write to a dead aplay kills DOOM instead of returning
+    // EPIPE, turning "sound stopped" into "the game exited".
+    signal(SIGPIPE, SIG_IGN);
+
+    if (!OpenSink())
+    {
+        printf("I_Sound: could not start aplay; sound disabled\n");
+        return false;
+    }
     printf("I_Sound: RISC Box sound, %d Hz stereo via aplay\n", OUT_RATE);
     return true;
 }
@@ -246,7 +265,17 @@ static void RBX_Update(void)
 
     if (sink == NULL)
     {
-        return;
+        // Retry the player now and then rather than never. Cheap: one popen a
+        // second at worst, and only while sound is meant to be running.
+        if (++reopen_countdown < 64)
+        {
+            return;
+        }
+        reopen_countdown = 0;
+        if (!OpenSink())
+        {
+            return;
+        }
     }
     frames = FramesDue();
     if (frames <= 0)
@@ -276,8 +305,11 @@ static void RBX_Update(void)
             }
             // 8-bit unsigned centred on 128 -> signed 16-bit.
             sample = ((int)chan->data[index] - 128) * 256;
-            mixbuf[i * 2] += (short)((sample * chan->leftvol) / 127);
-            mixbuf[i * 2 + 1] += (short)((sample * chan->rightvol) / 127);
+            // >>7 rather than /127: a division per sample per channel is real
+            // money on a ~130 MIPS emulated core, and 128 vs 127 is under a
+            // percent of volume — inaudible, and not worth an emulated divide.
+            mixbuf[i * 2] += (short)((sample * chan->leftvol) >> 7);
+            mixbuf[i * 2 + 1] += (short)((sample * chan->rightvol) >> 7);
             chan->pos += chan->step;
         }
     }
@@ -288,10 +320,12 @@ static void RBX_Update(void)
     written = write(sink_fd, mixbuf, (size_t)frames * OUT_CHANNELS * sizeof(short));
     if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
     {
-        // The player quit aplay, or the card went away: stop trying.
+        // aplay exited (an underrun it could not recover, or the card went
+        // away). Drop the pipe and let the retry above bring sound back.
         pclose(sink);
         sink = NULL;
         sink_fd = -1;
+        reopen_countdown = 0;
     }
 }
 

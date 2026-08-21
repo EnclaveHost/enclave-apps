@@ -342,12 +342,13 @@ impl VirtioSnd {
 			if !self.running {
 				break;
 			}
-			let (data, writable, head) = {
-				let Some(head) = self.peek_avail(memory, TX_QUEUE) else { break };
-				let (d, w) = self.walk_chain(memory, TX_QUEUE, head);
-				(d, w, head)
-			};
-			let pcm_len = data.len().saturating_sub(4) as u64;
+			let Some(head) = self.peek_avail(memory, TX_QUEUE) else { break };
+			// PRICE the buffer before reading it. walk_chain copies the whole
+			// payload a byte at a time through the MMU, and until the credit is
+			// there the answer is "not yet" — so doing it first meant copying
+			// a ~5.5 KB period buffer on EVERY tick and discarding it. That
+			// alone took the emulator from ~130 MIPS to 46 with sound playing.
+			let pcm_len = self.readable_len(memory, TX_QUEUE, head).saturating_sub(4);
 			// Not yet played: leave it posted and come back when time has
 			// passed. This is the whole of the rate control.
 			if self.credit < pcm_len {
@@ -355,6 +356,7 @@ impl VirtioSnd {
 			}
 			self.credit -= pcm_len;
 			let _ = self.pop_avail(memory, TX_QUEUE);
+			let (data, writable) = self.walk_chain(memory, TX_QUEUE, head);
 			// readable = [le32 stream_id][pcm frames...]
 			let pcm = data.get(4..).unwrap_or(&[]);
 			// A full ring means nobody is taking the audio; drop the oldest so
@@ -525,6 +527,29 @@ impl VirtioSnd {
 		self.queues[qi].used_index = next;
 		memory.write_halfword(used.wrapping_add(2), next);
 		self.interrupt_status |= 0x1;
+	}
+
+	/// Total readable bytes in a chain, without copying any of them: the
+	/// descriptors are 16 bytes each and only their lengths are needed.
+	fn readable_len(&self, memory: &mut MemoryWrapper, qi: usize, head: u64) -> u64 {
+		let q = &self.queues[qi];
+		let queue_size = q.num as u64;
+		let mut total = 0u64;
+		let mut desc_index = head;
+		for _ in 0..queue_size {
+			let desc = q.desc + 16 * desc_index;
+			let len = memory.read_word(desc.wrapping_add(8));
+			let flags = memory.read_halfword(desc.wrapping_add(12));
+			let next = (memory.read_halfword(desc.wrapping_add(14)) as u64) % queue_size;
+			if (flags & VIRTQ_DESC_F_WRITE) == 0 {
+				total += len as u64;
+			}
+			if (flags & VIRTQ_DESC_F_NEXT) == 0 {
+				break;
+			}
+			desc_index = next;
+		}
+		total
 	}
 
 	fn walk_chain(&self, memory: &mut MemoryWrapper, qi: usize, head: u64)
