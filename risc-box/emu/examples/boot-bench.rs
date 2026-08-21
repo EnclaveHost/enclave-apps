@@ -512,13 +512,18 @@ fn main() {
             });
             for path in snaps {
                 // simplefb: XRGB8888 at 0x87e00000, stride = width * 4
-                let (w, h) = match fb_size {
+                // Snapshot whichever surface the guest is DRIVING. With
+                // virtio-gpu the picture lives in the scanout resource, not at
+                // 0x87e00000, and reading the old address just captures a
+                // black simple-framebuffer nobody is writing any more.
+                let gpu_mode = emu.gpu_mode();
+                let (w, h) = match gpu_mode.or(fb_size) {
                     Some((w, h)) => (w as usize, h as usize),
                     None => (1024usize, 768usize)
                 };
                 let stride = w * 4;
                 let mut fb = vec![0u8; stride * h];
-                emu.read_physical_range(0x87e0_0000, &mut fb);
+                let from_gpu = emu.read_display(0x87e0_0000, &mut fb, gpu_mode.is_some());
                 let mut ppm = format!("P6\n{} {}\n255\n", w, h).into_bytes();
                 for y in 0..h {
                     for x in 0..w {
@@ -529,7 +534,8 @@ fn main() {
                     }
                 }
                 std::fs::write(&path, &ppm).expect("snap write");
-                eprintln!("SNAPPED@{}s: {}", elapsed_s, path);
+                eprintln!("SNAPPED@{}s: {} ({})", elapsed_s, path,
+                          if from_gpu { "virtio-gpu scanout" } else { "simple-framebuffer" });
             }
             for txt in fired {
                 for ch in txt.chars() {

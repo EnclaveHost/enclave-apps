@@ -193,9 +193,37 @@ impl Display {
             }
         }
         out.resize(fb_bytes(), 0);
-        // Prefers the virtio-gpu scanout, falls back to the
-        // simple-framebuffer; see Emulator::read_display.
-        emu.read_display(FB_BASE, out);
+        emu.read_display(FB_BASE, out, Self::gpu_is_the_live_surface(emu));
+    }
+
+    /// Which display device is the guest actually DRAWING to?
+    ///
+    /// Existence is not use, and getting this wrong streams a blank screen.
+    /// The kernel's fbdev emulation binds a virtio-gpu scanout at boot and
+    /// flushes it once, so "a scanout is bound" is true from early boot even
+    /// while the whole desktop paints the simple-framebuffer. Both surfaces
+    /// carry a monotonic activity counter — framebuffer bytes written, scanout
+    /// flushes — so follow whichever MOVED since the last frame, and stay put
+    /// when neither did (a still screen must not flip the source).
+    fn gpu_is_the_live_surface(emu: &Emulator) -> bool {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        static LAST_FB: AtomicU64 = AtomicU64::new(0);
+        static LAST_FLUSHES: AtomicU64 = AtomicU64::new(0);
+        static USE_GPU: AtomicBool = AtomicBool::new(false);
+
+        let fb = emu.fb_bytes();
+        let flushes = emu.gpu_flushes();
+        let fb_moved = fb != LAST_FB.swap(fb, Ordering::Relaxed);
+        let gpu_moved = flushes != LAST_FLUSHES.swap(flushes, Ordering::Relaxed);
+        match (gpu_moved, fb_moved) {
+            (true, false) => USE_GPU.store(true, Ordering::Relaxed),
+            (false, true) => USE_GPU.store(false, Ordering::Relaxed),
+            // Both moving means a transition (X starting on card0 while fbcon
+            // still owns fb0); prefer the GPU, which is the one with a client.
+            (true, true) => USE_GPU.store(true, Ordering::Relaxed),
+            (false, false) => {}
+        }
+        USE_GPU.load(Ordering::Relaxed)
     }
 
     /// Turn a captured frame into bands. Takes the frame by value and hands
@@ -327,7 +355,8 @@ impl Display {
     /// watcher still sees live pixels).
     pub fn png(&mut self, emu: &Emulator) -> Vec<u8> {
         let mut fresh = vec![0u8; fb_bytes()];
-        emu.read_display(FB_BASE, &mut fresh);
+        let prefer = Self::gpu_is_the_live_surface(emu);
+        emu.read_display(FB_BASE, &mut fresh, prefer);
         // raw scanlines: filter byte 0 + RGB (drop X, reorder BGR -> RGB)
         let mut raw = Vec::with_capacity(fb_h() * (1 + fb_w() * 3));
         for y in 0..fb_h() {

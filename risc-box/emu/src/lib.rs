@@ -423,14 +423,17 @@ impl Emulator {
 	/// `fallback_base` exactly as before. Hiding the choice behind one call
 	/// means the scan path has a single source of truth and an older image is
 	/// never stranded. Returns true when the pixels came from the GPU.
-	pub fn read_display(&self, fallback_base: u64, out: &mut [u8]) -> bool {
-		if let Some((w, h, pixels)) = self.cpu.get_mmu().get_gpu().scanout() {
-			// Only serve the GPU scanout when its geometry matches what the
-			// caller sized `out` for. A mode change the host has not caught up
-			// with yet must not be blitted through a buffer of the old size.
-			if (w as usize) * (h as usize) * 4 == out.len() {
-				out.copy_from_slice(pixels);
-				return true;
+	pub fn read_display(&self, fallback_base: u64, out: &mut [u8], prefer_gpu: bool) -> bool {
+		if prefer_gpu {
+			if let Some((w, h, pixels)) = self.cpu.get_mmu().get_gpu().scanout() {
+				// Only serve the GPU scanout when its geometry matches what
+				// the caller sized `out` for. A mode change the host has not
+				// caught up with yet must not be blitted through a buffer of
+				// the old size.
+				if (w as usize) * (h as usize) * 4 == out.len() {
+					out.copy_from_slice(pixels);
+					return true;
+				}
 			}
 		}
 		self.cpu.get_mmu().read_physical_range(fallback_base, out);
@@ -440,6 +443,10 @@ impl Emulator {
 	/// risc-box patch: the display controller's geometry, if the guest is
 	/// driving it. The mode is the guest's to choose at runtime, so the host
 	/// has to ask rather than assume the DTB's numbers.
+	pub fn gpu_flushes(&self) -> u64 {
+		self.cpu.get_mmu().get_gpu().flushes()
+	}
+
 	pub fn gpu_mode(&self) -> Option<(u32, u32)> {
 		self.cpu.get_mmu().get_gpu().scanout().map(|(w, h, _)| (w, h))
 	}

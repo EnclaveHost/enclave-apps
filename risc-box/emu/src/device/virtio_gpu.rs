@@ -180,6 +180,10 @@ pub struct VirtioGpu {
     /// one bounding box: the display path wants "what do I re-encode", and a
     /// list of rects it would union anyway costs more to carry than it saves.
     dirty: Option<Rect>,
+    /// Monotonic count of flushes to the bound scanout. The host uses this to
+    /// tell which display device the guest is actually DRAWING to, which is
+    /// not the same question as which one exists — see `flushes()`.
+    flushes: u64,
     /// Display geometry reported to the guest via GET_DISPLAY_INFO.
     display_width: u32,
     display_height: u32,
@@ -201,6 +205,7 @@ impl VirtioGpu {
             scanout_resource: 0,
             scanout_rect: Rect::default(),
             dirty: None,
+            flushes: 0,
             display_width: width,
             display_height: height,
             virgl: None,
@@ -251,6 +256,18 @@ impl VirtioGpu {
     /// it, so a caller that skips a frame does not lose the region.
     pub fn take_dirty(&mut self) -> Option<Rect> {
         self.dirty.take()
+    }
+
+    /// How many times the guest has flushed the scanout, ever.
+    ///
+    /// Existence is not use. The kernel's fbdev emulation binds a scanout at
+    /// boot and flushes it once, so "a resource is bound" says nothing about
+    /// whether the desktop is painting HERE or into the simple-framebuffer.
+    /// Serving a bound-but-idle scanout means streaming a blank screen while
+    /// the real picture sits in the other buffer. A monotonic counter lets the
+    /// host compare the two surfaces and follow whichever is moving.
+    pub fn flushes(&self) -> u64 {
+        self.flushes
     }
 
     pub fn is_active(&self) -> bool {
@@ -433,6 +450,7 @@ impl VirtioGpu {
         }
         if resource_id == self.scanout_resource {
             self.mark_dirty(r);
+            self.flushes = self.flushes.wrapping_add(1);
         }
         Self::resp_hdr(req, RESP_OK_NODATA)
     }
@@ -647,6 +665,7 @@ impl VirtioGpu {
         self.resources.clear();
         self.scanout_resource = 0;
         self.dirty = None;
+        self.flushes = 0;
     }
 
     fn queue(&self) -> &Queue {
