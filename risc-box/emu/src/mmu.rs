@@ -25,6 +25,7 @@ use memory::Memory;
 use cpu::{PrivilegeMode, Trap, TrapType, Xlen, get_privilege_mode};
 use device::virtio_block_disk::VirtioBlockDisk;
 use device::virtio_input::VirtioInput; // risc-box patch
+use device::opl::Opl; // risc-box patch
 use device::virtio_gpu::VirtioGpu; // risc-box patch
 use device::virtio_snd::VirtioSnd; // risc-box patch
 use device::virtio_net::VirtioNet; // risc-box patch
@@ -53,6 +54,7 @@ pub struct Mmu {
 	input: VirtioInput, // risc-box patch
 	snd: VirtioSnd, // risc-box patch
 	gpu: VirtioGpu, // risc-box patch
+	opl: Opl, // risc-box patch
 	plic: Plic,
 	clint: Clint,
 	uart: Uart,
@@ -158,6 +160,7 @@ impl Mmu {
 			input: VirtioInput::new(), // risc-box patch
 			snd: VirtioSnd::new(), // risc-box patch
 			gpu: VirtioGpu::new(1024, 768), // risc-box patch
+			opl: Opl::new(), // risc-box patch
 			plic: Plic::new(),
 			clint: Clint::new(),
 			uart: Uart::new(terminal),
@@ -755,6 +758,7 @@ impl Mmu {
 				0x10003000..=0x10003FFF => self.input.load(effective_address), // risc-box patch
 				0x10004000..=0x10004FFF => self.snd.load(effective_address), // risc-box patch
 				0x10005000..=0x10005FFF => self.gpu.load(effective_address), // risc-box patch
+				0x10006000..=0x10006FFF => self.opl.load(effective_address), // risc-box patch
 				// risc-box patch: an access to an address no device backs must
 				// never panic the HOST process — a tenant guest could otherwise
 				// crash the whole enclave app. Read as zero, like an open bus.
@@ -847,6 +851,7 @@ impl Mmu {
 				0x10003000..=0x10003FFF => self.input.store(effective_address, value), // risc-box patch
 				0x10004000..=0x10004FFF => self.snd.store(effective_address, value), // risc-box patch
 				0x10005000..=0x10005FFF => self.gpu.store(effective_address, value), // risc-box patch
+				0x10006000..=0x10006FFF => self.opl.store(effective_address, value), // risc-box patch
 				// risc-box patch: drop writes to unbacked addresses (open bus)
 				// rather than panic the host — see load_raw.
 				_ => note_unmapped(effective_address, true)
@@ -1215,6 +1220,12 @@ impl Mmu {
 
 	/// risc-box patch: mutable access to the virtio-snd device so the host can
 	/// take played audio out of it.
+	/// risc-box patch: the OPL register mailbox (music; synthesis is the
+	/// host's job, see device/opl.rs).
+	pub fn get_mut_opl(&mut self) -> &mut Opl {
+		&mut self.opl
+	}
+
 	pub fn get_mut_gpu(&mut self) -> &mut VirtioGpu {
 		&mut self.gpu
 	}

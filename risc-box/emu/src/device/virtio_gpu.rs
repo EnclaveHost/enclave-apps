@@ -190,6 +190,8 @@ pub struct VirtioGpu {
 
     virgl: Option<Box<dyn Virgl3d>>,
     cursor: Option<Cursor>,
+    /// How many cursor commands have arrived, ever.
+    cursor_updates: u64,
 }
 
 /// The pointer, as its own plane.
@@ -229,6 +231,7 @@ impl VirtioGpu {
             display_height: height,
             virgl: None,
             cursor: None,
+            cursor_updates: 0,
         }
     }
 
@@ -421,8 +424,35 @@ impl VirtioGpu {
 
     fn resource_unref(&mut self, req: &[u8]) -> Vec<u8> {
         let id = le32(req, CTRL_HDR_LEN);
+        // THE CURSOR'S RESOURCE CAN BE THE ONE BEING FREED, and forgetting
+        // that is why the pointer "worked for a while and then died". X frees
+        // a cursor resource whenever the pointer SHAPE changes — crossing from
+        // the desktop into a window is enough. Once its resource is gone,
+        // cursor_rect() returns None: nothing composites the pointer any more,
+        // AND nothing reports damage for where it last was, so its final image
+        // stays burned into the picture, frozen, while the guest happily moves
+        // a cursor the host can no longer draw.
+        //
+        // So take the damage BEFORE the resource disappears (the rect needs
+        // the resource's dimensions), then let go of the cursor.
+        let cursor_area = match self.cursor.as_ref() {
+            Some(c) if c.resource_id == id => self.cursor_rect(),
+            _ => None,
+        };
         if self.resources.remove(&id).is_none() {
             return Self::resp_hdr(req, RESP_ERR_INVALID_RESOURCE_ID);
+        }
+        if let Some(r) = cursor_area {
+            self.mark_dirty(r);
+        }
+        if self.cursor.as_ref().is_some_and(|c| c.resource_id == id) {
+            // Keep the position: the very next UPDATE_CURSOR usually just
+            // hands over a new shape for the same pointer, and dropping the
+            // coordinates would teleport it to wherever that request happens
+            // to say.
+            if let Some(c) = self.cursor.as_mut() {
+                c.resource_id = 0;
+            }
         }
         if self.scanout_resource == id {
             self.scanout_resource = 0;
@@ -560,6 +590,7 @@ impl VirtioGpu {
     fn update_cursor(&mut self, req: &[u8], set_resource: bool) -> Vec<u8> {
         let x = le32(req, CTRL_HDR_LEN + 4) as i64;
         let y = le32(req, CTRL_HDR_LEN + 8) as i64;
+        self.cursor_updates = self.cursor_updates.wrapping_add(1);
         let old = self.cursor_rect();
         match self.cursor.as_mut() {
             Some(c) => {
@@ -596,6 +627,14 @@ impl VirtioGpu {
             self.mark_dirty(r);
         }
         Self::resp_hdr(req, RESP_OK_NODATA)
+    }
+
+    /// Cursor as the device currently holds it: (resource, x, y, commands).
+    /// Instrumentation, because "is the guest sending cursor commands at all,
+    /// and what positions do they carry" is not answerable from pixels — and
+    /// guessing at it from screenshots wasted two test runs.
+    pub fn cursor_state(&self) -> Option<(u32, i64, i64, u64)> {
+        self.cursor.as_ref().map(|c| (c.resource_id, c.x, c.y, self.cursor_updates))
     }
 
     /// Where the cursor currently covers the scanout, clipped to it.
@@ -944,6 +983,12 @@ fn set_byte64(reg: &mut u64, pos: u64, value: u8) {
 mod tests {
     use super::*;
 
+    /// resource_unref takes &mut self and a request; call it without a
+    /// MemoryWrapper, which the 2D unref path never touches.
+    fn Self_unref(gpu: &mut VirtioGpu, req: &[u8]) -> Vec<u8> {
+        gpu.resource_unref(req)
+    }
+
     /// A scatter-gather backing must read as one linear resource. The guest
     /// hands us its own pages in whatever order the allocator produced, and a
     /// row of pixels routinely straddles two of them.
@@ -982,6 +1027,38 @@ mod tests {
         assert_eq!((d.x, d.y), (10, 10));
         assert_eq!((d.x + d.width, d.y + d.height), (120, 70));
         assert!(gpu.take_dirty().is_none(), "taking the region must clear it");
+    }
+
+    /// Freeing the cursor's resource must repaint where it was and must not
+    /// leave the device pointing at a resource that no longer exists. X frees
+    /// the cursor resource on every pointer-SHAPE change, so this happens in
+    /// ordinary use within minutes — the pointer's last image froze on screen
+    /// and stopped tracking, because nothing reported damage for the region it
+    /// had been occupying.
+    #[test]
+    fn freeing_the_cursor_resource_repaints_and_releases_it() {
+        let mut gpu = VirtioGpu::new(1024, 768);
+        gpu.resources.insert(9, Resource {
+            width: 64, height: 64, backing: Vec::new(),
+            pixels: vec![0u8; 64 * 64 * BPP],
+        });
+        gpu.cursor = Some(Cursor { resource_id: 9, x: 300, y: 200, hot_x: 0, hot_y: 0 });
+        let _ = gpu.take_dirty(); // start clean
+
+        let mut req = vec![0u8; CTRL_HDR_LEN + 8];
+        req[..4].copy_from_slice(&CMD_RESOURCE_UNREF.to_le_bytes());
+        req[CTRL_HDR_LEN..CTRL_HDR_LEN + 4].copy_from_slice(&9u32.to_le_bytes());
+        let mut mem_unused = ();
+        let _ = &mut mem_unused;
+        let resp = Self_unref(&mut gpu, &req);
+        assert_eq!(le32(&resp, 0), RESP_OK_NODATA);
+
+        let d = gpu.take_dirty().expect("the vacated cursor area must be repainted");
+        assert!(d.x <= 300 && d.y <= 200 && d.width > 0 && d.height > 0,
+                "damage must cover where the cursor was: {:?}", (d.x, d.y, d.width, d.height));
+        assert_eq!(gpu.cursor.as_ref().map(|c| c.resource_id), Some(0),
+                   "the freed resource must be released, not left dangling");
+        assert!(gpu.cursor_rect().is_none(), "a released cursor covers nothing");
     }
 
     /// 3D must be refused, not silently accepted: a guest that submits a

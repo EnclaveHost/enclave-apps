@@ -451,6 +451,24 @@ impl Emulator {
 	/// risc-box patch: the display controller's geometry, if the guest is
 	/// driving it. The mode is the guest's to choose at runtime, so the host
 	/// has to ask rather than assume the DTB's numbers.
+	/// risc-box patch: OPL register writes the guest has made since the last
+	/// call. The host applies these to a native OPL3 chip and mixes the
+	/// result into the audio stream — the guest does the MIDI bookkeeping,
+	/// the host does the per-sample work.
+	pub fn opl_take_writes(&mut self) -> Vec<(u16, u8)> {
+		self.cpu.get_mut_mmu().get_mut_opl().drain()
+	}
+
+	/// Whether the guest has ever driven the OPL at all, so a host with no
+	/// music to mix can skip the synth entirely.
+	pub fn opl_active(&mut self) -> bool {
+		self.cpu.get_mut_mmu().get_mut_opl().active()
+	}
+
+	pub fn gpu_cursor(&self) -> Option<(u32, i64, i64, u64)> {
+		self.cpu.get_mmu().get_gpu().cursor_state()
+	}
+
 	pub fn gpu_flushes(&self) -> u64 {
 		self.cpu.get_mmu().get_gpu().flushes()
 	}

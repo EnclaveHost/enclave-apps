@@ -92,6 +92,10 @@ const IDLE_MAX: usize = 4;
 /// burst-start hitch the pool exists to prevent. Past this age the redial is
 /// cheaper than the gamble, so the connection is dropped on the floor instead
 /// of handed out.
+/// How long a connect (and its TLS handshake) may take before it is treated
+/// as a failure worth retrying. Short on purpose — see App::connect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
 const IDLE_FRESH: Duration = Duration::from_secs(20);
 
 /// How long an SSE stream may go completely silent before it is treated as
@@ -204,21 +208,52 @@ impl App {
     }
 
     fn connect(&self) -> std::io::Result<Conn> {
-        let s = TcpStream::connect(&self.addr)?;
+        // BOUND THE CONNECT. TcpStream::connect has no timeout, so against a
+        // host that is refusing connections it hangs for whatever the OS
+        // decides — and the audio and input paths dial at SESSION start, not
+        // bridge start. One hung attempt is therefore a dead mouse and a
+        // silent stream for its whole duration, while the video keeps playing
+        // on the connection the bridge opened earlier. Measured on kryptos:
+        // a single failed /audio connect cost 4368 silent Opus frames, 21
+        // seconds, before the 1 s retry succeeded. Failing fast and retrying
+        // is strictly better than waiting: the retry usually works.
+        let mut s = None;
+        let mut last: Option<std::io::Error> = None;
+        for sa in std::net::ToSocketAddrs::to_socket_addrs(&self.addr)? {
+            match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
+                Ok(c) => { s = Some(c); break; }
+                Err(e) => last = Some(e),
+            }
+        }
+        let s = match s {
+            Some(s) => s,
+            None => return Err(last.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "no address connected")
+            })),
+        };
         s.set_nodelay(true)?;
-        // Generous: a frame read crosses the internet on the remote path, and
-        // the app's event loop can be mid-instruction-batch when it arrives.
-        s.set_read_timeout(Some(Duration::from_secs(30)))?;
-        s.set_write_timeout(Some(Duration::from_secs(30)))?;
+        // The handshake gets the same short leash as the connect: a peer that
+        // accepts the socket and then stalls mid-handshake hangs just as long
+        // as one that never accepts. Restored to the generous timeout below,
+        // once there is a working session to be patient with.
+        s.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+        s.set_write_timeout(Some(CONNECT_TIMEOUT))?;
         if !self.tls {
+            s.set_read_timeout(Some(Duration::from_secs(30)))?;
+            s.set_write_timeout(Some(Duration::from_secs(30)))?;
             return Ok(Conn::Plain(s));
         }
+        let handshake_sock = s.try_clone()?;
+        // Generous: a frame read crosses the internet on the remote path, and
+        // the app's event loop can be mid-instruction-batch when it arrives.
         let connector = SslConnector::builder(SslMethod::tls_client())
             .map_err(|e| std::io::Error::other(format!("tls setup: {e}")))?
             .build();
         let stream = connector
             .connect(&self.host, s)
             .map_err(|e| std::io::Error::other(format!("tls handshake with {}: {e}", self.host)))?;
+        let _ = handshake_sock.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = handshake_sock.set_write_timeout(Some(Duration::from_secs(30)));
         Ok(Conn::Tls(Box::new(stream)))
     }
 

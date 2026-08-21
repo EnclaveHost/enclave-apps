@@ -51,4 +51,45 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=minih264wrap");
+
+    build_opl3(&out, &arch, &features);
+}
+
+/// Nuked OPL3, for the machine's music. Same freestanding-wasm recipe as
+/// minih264 above; see vendor/opl3/wrapper.c for why the synthesis is here
+/// and not in the guest.
+fn build_opl3(out: &PathBuf, arch: &str, features: &str) {
+    println!("cargo:rerun-if-changed=vendor/opl3/wrapper.c");
+    println!("cargo:rerun-if-changed=vendor/opl3/opl3.c");
+    println!("cargo:rerun-if-changed=vendor/opl3/opl3.h");
+    println!("cargo:rerun-if-changed=vendor/opl3/wf_rom.h");
+
+    let mut objs = Vec::new();
+    for src in ["vendor/opl3/opl3.c", "vendor/opl3/wrapper.c"] {
+        let obj = out.join(format!("{}.o", src.rsplit('/').next().unwrap()));
+        let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
+        cc.args(["-O2", "-DNDEBUG", "-c", src, "-o"]).arg(&obj);
+        if arch == "wasm32" {
+            cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/minih264/shim",
+                     "-Ivendor/opl3"]);
+            for f in ["atomics", "bulk-memory", "mutable-globals"] {
+                if features.split(',').any(|x| x == f) {
+                    cc.arg(format!("-m{f}"));
+                }
+            }
+        }
+        let st = cc.status().expect("clang not found (set RBX_CLANG)");
+        assert!(st.success(), "opl3 failed to compile: {src}");
+        objs.push(obj);
+    }
+
+    let lib = out.join("libopl3wrap.a");
+    let _ = std::fs::remove_file(&lib);
+    let mut ar = Command::new(env::var("RBX_AR").unwrap_or_else(|_| "ar".into()));
+    ar.arg("rcs").arg(&lib);
+    for o in &objs {
+        ar.arg(o);
+    }
+    assert!(ar.status().expect("ar not found (set RBX_AR)").success(), "ar failed for opl3");
+    println!("cargo:rustc-link-lib=static=opl3wrap");
 }

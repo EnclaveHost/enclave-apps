@@ -49,6 +49,7 @@ mod egress;
 mod gz;
 mod httpd;
 mod net;
+mod opl;
 mod s3;
 mod video;
 mod worker;
@@ -522,6 +523,8 @@ struct Start {
 struct App {
     cfg: Config,
     emu: Option<Emulator>,
+    /// The music synth. Host-side on purpose; see src/opl.rs.
+    opl: opl::Opl,
     phase: Phase,
     error: Option<String>,
     pending: Option<Start>,
@@ -677,7 +680,7 @@ impl App {
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
              \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
-             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{}{img}}}",
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
@@ -730,6 +733,18 @@ impl App {
                 })
                 .unwrap_or_else(|| "null".into()),
             self.cfg.ram_mib,
+            // The pointer as the DEVICE holds it: resource, position, and how
+            // many cursor commands have arrived. Screenshots cannot answer
+            // "is the guest still moving the cursor" — a frozen pointer looks
+            // identical whether the guest stopped sending, the host stopped
+            // compositing, or the resource was freed underneath it. Cost is a
+            // few bytes on a status poll.
+            self.emu
+                .as_ref()
+                .and_then(|e| e.gpu_cursor())
+                .map(|(res, x, y, n)| format!(
+                    "{{\"res\":{},\"x\":{},\"y\":{},\"updates\":{}}}", res, x, y, n))
+                .unwrap_or_else(|| "null".into()),
         )
     }
 }
@@ -995,7 +1010,8 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 .min(512 * 1024);
             let emu = app.emu.as_mut().expect("emu present (checked above)");
             let (rate, channels, playing, _pending, dropped) = emu.audio_state();
-            let pcm = emu.take_audio(max);
+            let mut pcm = emu.take_audio(max);
+            app.opl.mix(emu, &mut pcm, rate, channels);
             let body = format!(
                 "{{\"rate\":{},\"channels\":{},\"playing\":{},\"dropped\":{},\"bytes\":{},\"pcm\":\"{}\"}}",
                 rate, channels, playing, dropped, pcm.len(), b64(&pcm)
@@ -1710,6 +1726,7 @@ pub fn run() {
     let mut app = App {
         cfg,
         emu: None,
+        opl: opl::Opl::new(),
         phase: Phase::Idle,
         error: if unconfigured {
             Some(format!(
@@ -2004,7 +2021,13 @@ pub fn run() {
                         // and the device drops the audio instead, which is
                         // what the chopping was (7-11 kB/s of 38 thrown away
                         // with a listener attached the whole time).
-                        let pcm = emu.take_audio(AUDIO_MAX_CHUNK);
+                        let mut pcm = emu.take_audio(AUDIO_MAX_CHUNK);
+                        // Music is synthesised HERE, natively, and summed
+                        // into the card's PCM — see src/opl.rs. Generating
+                        // exactly as many frames as the card produced borrows
+                        // the card's real-time clock, so music and effects
+                        // stay in step without a second timer.
+                        app.opl.mix(emu, &mut pcm, rate, channels);
                         // Send unconditionally. An earlier cut skipped the
                         // broadcast whenever the listener's backlog passed a
                         // threshold, on the theory that a deep wbuf was

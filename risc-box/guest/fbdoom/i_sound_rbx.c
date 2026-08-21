@@ -65,6 +65,12 @@ static boolean use_sfx_prefix_local;
 static struct timespec last_write;
 static int reopen_countdown;
 static short mixbuf[MAX_FRAMES * OUT_CHANNELS];
+/* provided by music/opl_rbx.c; declared here to avoid dragging opl headers in.
+   The music itself is NOT mixed here: the host owns the OPL chip and sums it
+   into the card's PCM (see src/opl.rs). All the guest does is keep MIDI time,
+   which is what posts the register writes at the right moment. */
+extern void OPL_RBX_Tick(unsigned int frames);
+extern int OPL_RBX_Active(void);
 /// Audio mixed but not yet accepted by the pipe.
 ///
 /// A non-blocking write to a pipe routinely takes only PART of what it is
@@ -304,6 +310,14 @@ static void RBX_Update(void)
     }
 
     memset(mixbuf, 0, sizeof(short) * frames * OUT_CHANNELS);
+
+    // Advance the music clock by exactly the frames the card is about to
+    // play, so MIDI events post their register writes on time. Cheap: no
+    // samples are generated here.
+    if (OPL_RBX_Active())
+    {
+        OPL_RBX_Tick((unsigned int) frames);
+    }
 
     for (c = 0; c < NUM_CHANNELS; ++c)
     {

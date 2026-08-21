@@ -37,6 +37,7 @@
 #include "doomkeys.h"
 
 #include <stdbool.h>
+#include <stddef.h>   /* offsetof: not pulled in transitively by newer libc headers */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

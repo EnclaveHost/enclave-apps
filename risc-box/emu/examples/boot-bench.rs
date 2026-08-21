@@ -289,6 +289,9 @@ fn main() {
     let mut last_fbw: u64 = 0;
     let mut last_fbb: u64 = 0;
     let mut window = Instant::now();
+    let mut opl_writes: u64 = 0;
+    let mut audio_total: u64 = 0;
+    let mut audio_nonzero: u64 = 0;
     let mut window_insns: u64 = 0;
 
     // --trace-tf state
@@ -638,6 +641,37 @@ fn main() {
             // bound a scanout and flushed N dirty regions since the last
             // line. Without this the only evidence of the device working is
             // that the driver probed, which says nothing about pixels.
+            // risc-box patch: what the sound card actually produced this
+            // window, and how much of it was NOT silence. MIPS cannot answer
+            // "is music playing" or "what did the synth cost" — the guest
+            // spends the same instruction budget either way, it just spends
+            // more of it on audio. Non-zero bytes are the signal: SFX are
+            // sparse, music is continuous.
+            let aud = {
+                let pcm = emu.take_audio(64 * 1024);
+                let nz = pcm.chunks_exact(2)
+                    .filter(|c| i16::from_le_bytes([c[0], c[1]]) != 0)
+                    .count();
+                audio_total += pcm.len() as u64;
+                audio_nonzero += (nz * 2) as u64;
+                match pcm.is_empty() {
+                    true => "aud=-".to_string(),
+                    false => format!("aud={}B/{}%", pcm.len(), nz * 200 / pcm.len().max(1)),
+                }
+            };
+            // risc-box patch: OPL register traffic. The host does the actual
+            // synthesis (src/opl.rs), which boot-bench does not run — so the
+            // question this answers is narrower and still the important one:
+            // is the guest posting music to the mailbox at all?
+            let opl = {
+                let w = emu.opl_take_writes();
+                opl_writes += w.len() as u64;
+                format!("opl={}", opl_writes)
+            };
+            let cur = match emu.gpu_cursor() {
+                Some((r, x, y, n)) => format!("cur=res{}@{},{}#{}", r, x, y, n),
+                None => "cur=-".to_string(),
+            };
             let gpu = match emu.gpu_mode() {
                 Some((w, h)) => {
                     let d = emu.gpu_take_dirty().is_some() as u32;
@@ -646,7 +680,7 @@ fn main() {
                 None => "-".to_string(),
             };
             eprintln!(
-                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS{} guest{:>7.1}s fbw+{} gpu={} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
+                "  {:>6.1}s  {:>6.0}M insns  {:>7.1} MIPS{} guest{:>7.1}s fbw+{} gpu={} {} {} {} px={:02x}{:02x}{:02x} cx={:02x}{:02x}{:02x} rm={:02x}{:02x}{:02x} br={:02x}{:02x}{:02x}",
                 start.elapsed().as_secs_f64(),
                 done as f64 / 1e6,
                 mips,
@@ -654,6 +688,9 @@ fn main() {
                 emu.guest_mtime() as f64 / 1e7,
                 dfbw,
                 gpu,
+                cur,
+                aud,
+                opl,
                 px[2], px[1], px[0],
                 cx[2], cx[1], cx[0],
                 rm[2], rm[1], rm[0],
