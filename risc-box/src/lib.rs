@@ -79,6 +79,23 @@ const SCROLLBACK: usize = 256 * 1024; // console bytes retained for late joiners
 // network session never drops into the ~20x-slow idle clock mid-conversation.
 const NET_BOOST_TURNS: u64 = 250;
 
+/// Audio is pushed once this much has accumulated, and never more than the
+/// larger figure at a time. ~12 ms and ~93 ms at 11 kHz stereo. The minimum
+/// sets how lumpy delivery is, and the listener has to buffer for the lumps —
+/// so it is deliberately smaller than one turn's worth of audio, which puts
+/// the real cadence at the loop's own rate rather than at a threshold.
+const AUDIO_MIN_CHUNK: usize = 512;
+
+/// How far an audio listener may fall behind before events are skipped rather
+/// than queued. Deliberately small — a quarter second of base64 PCM — because
+/// audio that arrives late is not worth the delay it costs everything behind
+/// it.
+const AUDIO_BACKLOG_LIMIT: usize = 16 * 1024;
+/// Drain generously: the point is to leave the card's ring empty, so a
+/// backlog from a slow turn clears in one or two turns instead of lingering
+/// as delay (or overflowing into drops).
+const AUDIO_MAX_CHUNK: usize = 16384;
+
 /// Turns of full-batch running granted after real HID input lands.
 ///
 /// While `input_boost` is non-zero the loop is never `parked`, so every turn
@@ -960,6 +977,22 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         ("GET", "/audio") => {
             if app.phase != Phase::Running || app.emu.is_none() {
                 return server.respond(key, json(409, "Conflict", err("machine is not running")));
+            }
+            // `?stream=1` is how a player should take audio: an SSE stream the
+            // loop pushes into as the card plays, rather than a poll. Polling
+            // cost a request round trip per chunk — over the fleet's relay that
+            // is 100-400 ms of jitter on a stream consumed in 5 ms frames, so
+            // the listener alternately starved (a chop) and sat on a backlog
+            // (delay). Each event carries its own rate/channels because the
+            // guest can reopen the card with different ones.
+            if form_get(&req.query, "stream").is_some() {
+                let emu = app.emu.as_mut().expect("emu present (checked above)");
+                let (rate, channels, _playing, _pending, _dropped) = emu.audio_state();
+                let initial = format!(
+                    "event: format\ndata: {{\"rate\":{},\"channels\":{}}}\n\n",
+                    rate, channels
+                );
+                return server.upgrade_sse(key, "audio", &initial);
             }
             let max = form_get(&req.query, "max")
                 .and_then(|v| v.parse::<usize>().ok())
@@ -1964,6 +1997,37 @@ pub fn run() {
                 // the stream entirely. On a loopback this never triggers; over
                 // a relay, at 1024x768, it triggered within a second.
                 const SSE_BACKLOG_LIMIT: usize = 192 * 1024;
+                // Audio first, and in small bites. Every byte held back here
+                // is delay the player hears, and the sound card's own ring is
+                // deliberately shallow, so a listener that is kept fed never
+                // needs a deep buffer anywhere downstream.
+                if server.sse_count("audio") > 0 {
+                    let (rate, channels, _playing, pending, _dropped) = emu.audio_state();
+                    if pending >= AUDIO_MIN_CHUNK {
+                        // ALWAYS take, even when the listener is behind. The
+                        // card's ring is the guest's problem — leave it full
+                        // and the device drops the audio instead, which is
+                        // what the chopping was (7-11 kB/s of 38 thrown away
+                        // with a listener attached the whole time).
+                        let pcm = emu.take_audio(AUDIO_MAX_CHUNK);
+                        // ...but only SEND while the socket is keeping up.
+                        // Audio is worthless late, so a backed-up listener is
+                        // served by skipping ahead rather than by queueing: a
+                        // deep wbuf here also slows the loop that feeds it,
+                        // which is how a slow reader turned into dropped
+                        // sound at the card.
+                        if !pcm.is_empty()
+                            && server.sse_backlog("audio") < AUDIO_BACKLOG_LIMIT
+                        {
+                            server.broadcast(
+                                "audio",
+                                &format!("data: {{\"r\":{},\"c\":{},\"d\":\"{}\"}}",
+                                         rate, channels, b64(&pcm)),
+                            );
+                        }
+                    }
+                }
+
                 let display_backed_up = server.sse_backlog("display") > SSE_BACKLOG_LIMIT;
                 let video_backed_up = server.sse_backlog("video") > SSE_BACKLOG_LIMIT;
                 let pull_watching =

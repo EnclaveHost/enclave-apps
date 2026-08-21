@@ -59,6 +59,9 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
     let mut encoder = crate::opus::Encoder::new();
     let mut opus_buf = [0u8; 1275]; // the largest packet Opus will produce
     let mut heard = false;
+    // Real frames vs silence, reported now and then: silence while the guest
+    // is playing IS the chopping, so this is the number to watch.
+    let (mut real, mut filler, mut last_report) = (0u32, 0u32, std::time::Instant::now());
 
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
@@ -93,10 +96,24 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
                     heard = true;
                     eprintln!("[audio] first guest audio frame ({n} bytes opus)");
                 }
+                real += 1;
                 &opus_buf[..n]
             }
-            None => &SILENT_OPUS,
+            None => {
+                filler += 1;
+                &SILENT_OPUS
+            }
         };
+        if heard && last_report.elapsed() >= Duration::from_secs(10) {
+            let total = real + filler;
+            if total > 0 && real > 0 {
+                eprintln!("[audio] {}% carried sound ({real} frames, {filler} silence)",
+                          100 * real / total);
+            }
+            real = 0;
+            filler = 0;
+            last_report = std::time::Instant::now();
+        }
 
         // Encrypt if the client negotiated audio encryption: AES-128-CBC with
         // IV = BE32(rikeyid + sequenceNumber) in the first four bytes.

@@ -65,6 +65,16 @@ static boolean use_sfx_prefix_local;
 static struct timespec last_write;
 static int reopen_countdown;
 static short mixbuf[MAX_FRAMES * OUT_CHANNELS];
+/// Audio mixed but not yet accepted by the pipe.
+///
+/// A non-blocking write to a pipe routinely takes only PART of what it is
+/// offered, and the first cut checked `write()` only for errors — so every
+/// short write silently threw away the tail. Measured effect: the guest
+/// delivered 63% of real-time audio, and the missing third is exactly what a
+/// listener hears as chopping. No buffer downstream can fix a stream that was
+/// never produced.
+static short carry[MAX_FRAMES * OUT_CHANNELS];
+static int carry_len;
 
 static void SplitVolume(int vol, int sep, int *left, int *right)
 {
@@ -83,7 +93,11 @@ static boolean OpenSink(void)
 {
     // -q so aplay's chatter stays out of the game's console. Reading raw from
     // stdin means no header and no seeking, which is all a mixer can offer.
-    sink = popen("aplay -q -f S16_LE -r 11025 -c 2 -t raw - 2>/dev/null", "w");
+    // --buffer-time/--period-time, or aplay picks a 625 ms buffer and every
+    // sound arrives that late. 120 ms is still four periods of slack, which is
+    // enough for a guest this slow to keep the card fed.
+    sink = popen("aplay -q -f S16_LE -r 11025 -c 2 -t raw "
+                 "--buffer-time=120000 --period-time=30000 - 2>/dev/null", "w");
     if (sink == NULL)
     {
         return false;
@@ -91,6 +105,12 @@ static boolean OpenSink(void)
     sink_fd = fileno(sink);
     // Non-blocking: the game loop must never wait on the card.
     fcntl(sink_fd, F_SETFL, fcntl(sink_fd, F_GETFL, 0) | O_NONBLOCK);
+    // A roomier pipe so a scheduling gap on this slow guest does not turn into
+    // a short write in the first place. Best effort; the carry handles the rest.
+#ifdef F_SETPIPE_SZ
+    fcntl(sink_fd, F_SETPIPE_SZ, 256 * 1024);
+#endif
+    carry_len = 0;
     clock_gettime(CLOCK_MONOTONIC, &last_write);
     return true;
 }
@@ -314,17 +334,48 @@ static void RBX_Update(void)
         }
     }
 
-    // A short write is fine and a full pipe is fine: aplay drains at the card's
-    // real rate, so anything we cannot hand over now is audio we would have
-    // been late with anyway.
-    written = write(sink_fd, mixbuf, (size_t)frames * OUT_CHANNELS * sizeof(short));
-    if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+    // Queue this mix behind anything the pipe would not take last time. When
+    // the backlog is longer than the buffer can hold, the OLDEST goes: late
+    // audio is worth less than current audio.
+    {
+        int room = (int)(MAX_FRAMES * OUT_CHANNELS) - carry_len;
+        int want = frames * OUT_CHANNELS;
+
+        if (want > (int)(MAX_FRAMES * OUT_CHANNELS))
+        {
+            want = MAX_FRAMES * OUT_CHANNELS;
+        }
+        if (want > room)
+        {
+            int drop = want - room;
+            memmove(carry, carry + drop, (size_t)(carry_len - drop) * sizeof(short));
+            carry_len -= drop;
+        }
+        memcpy(carry + carry_len, mixbuf, (size_t)want * sizeof(short));
+        carry_len += want;
+    }
+
+    written = write(sink_fd, carry, (size_t)carry_len * sizeof(short));
+    if (written > 0)
+    {
+        int sent = (int)(written / (ssize_t)sizeof(short));
+
+        // THE BUG THIS EXISTS FOR: keep what the pipe did not take, rather
+        // than dropping it on the floor.
+        if (sent < carry_len)
+        {
+            memmove(carry, carry + sent, (size_t)(carry_len - sent) * sizeof(short));
+        }
+        carry_len -= sent;
+    }
+    else if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
     {
         // aplay exited (an underrun it could not recover, or the card went
         // away). Drop the pipe and let the retry above bring sound back.
         pclose(sink);
         sink = NULL;
         sink_fd = -1;
+        carry_len = 0;
         reopen_countdown = 0;
     }
 }

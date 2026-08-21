@@ -72,12 +72,18 @@ const RATE_22050: u32 = 4;
 const RATE_44100: u32 = 6;
 const RATE_48000: u32 = 7;
 
-/// Bytes of decoded audio held for the host before the guest is made to wait.
+/// Bytes of played audio held for the host.
 ///
-/// A quarter second at 48 kHz stereo 16-bit. Large enough that a normal period
-/// hands over without stalling, small enough that "stop the sound" is heard as
-/// stopping rather than as a quarter second of tail.
-const RING_CAP: usize = 48_000 * 2 * 2 / 4;
+/// ~500 ms at 11 kHz stereo, which is what the guest actually plays.
+///
+/// Depth here is NOT latency, as long as the host drains promptly: a listener
+/// that keeps up leaves this nearly empty and the audio is as live as the
+/// pushes are. What depth buys is tolerance for the app's occasional slow
+/// turn. Sized at 150 ms it could not absorb one, and measured 11 kB/s thrown
+/// away out of 38 kB/s produced — a third of the sound, heard as chopping —
+/// while a listener was attached the entire time. Overflow still drops the
+/// OLDEST, so a truly absent listener costs staleness, never the guest.
+const RING_CAP: usize = 22_050;
 
 /// The CLINT's tick rate, and the DTB's advertised timebase.
 const MTIME_HZ: u64 = 10_000_000;
@@ -120,8 +126,11 @@ pub struct VirtioSnd {
 	/// sending Opus silence and sending nothing at all.
 	running: bool,
 	/// Playback credit in bytes, accrued from mtime at the stream's byte
-	/// rate, and the mtime it was last accrued at.
+	/// rate, and the mtime it was last accrued at. `credit_frac` carries the
+	/// sub-byte remainder between calls; see accrue() for why that is not a
+	/// rounding nicety but the whole of the stream.
 	credit: u64,
+	credit_frac: u64,
 	last_mtime: u64,
 	/// Guest bytes dropped because the ring filled before the host took them.
 	/// Non-zero means nobody was listening (or was too slow), never that the
@@ -144,6 +153,7 @@ impl VirtioSnd {
 			channels: 2,
 			running: false,
 			credit: 0,
+			credit_frac: 0,
 			last_mtime: 0,
 			dropped: 0,
 		}
@@ -194,7 +204,19 @@ impl VirtioSnd {
 			return;
 		}
 		let bytes_per_sec = self.rate_hz as u64 * self.channels as u64 * 2;
-		self.credit += (mtime - last) * bytes_per_sec / MTIME_HZ;
+		// PAY THE REMAINDER, or pay almost nothing. tick() runs every 32
+		// retired instructions — around three million times a second — so
+		// mtime advances only about three of its 10 MHz ticks between calls,
+		// and `delta * 44100 / 10_000_000` truncates to ZERO nearly every
+		// time. Discarding that remainder threw away most of the stream: the
+		// card played at a fraction of real time, so ALSA's buffer sat
+		// permanently full (avail 0, 620 ms of delay) and the game's mixer
+		// dropped whatever no longer fit. Carrying the fraction makes the
+		// rate exact no matter how finely the device is serviced.
+		self.credit_frac += (mtime - last) * bytes_per_sec;
+		let paid = self.credit_frac / MTIME_HZ;
+		self.credit_frac -= paid * MTIME_HZ;
+		self.credit += paid;
 		// A pause (or a host that stopped servicing us) must not turn into a
 		// burst of instant completions afterwards.
 		let cap = bytes_per_sec / 4;
@@ -284,6 +306,7 @@ impl VirtioSnd {
 				// credit would be spent as an instant burst on the restart).
 				self.running = false;
 				self.credit = 0;
+				self.credit_frac = 0;
 				self.last_mtime = 0;
 				self.ring.clear();
 				write_out(memory, writable, &status_bytes(S_OK))
@@ -295,11 +318,13 @@ impl VirtioSnd {
 			R_PCM_STOP => {
 				self.running = false;
 				self.credit = 0;
+				self.credit_frac = 0;
 				write_out(memory, writable, &status_bytes(S_OK))
 			}
 			R_PCM_RELEASE => {
 				self.running = false;
 				self.credit = 0;
+				self.credit_frac = 0;
 				self.last_mtime = 0;
 				self.ring.clear();
 				// The spec requires every pending I/O buffer to come back on
@@ -621,4 +646,43 @@ fn set_byte32(reg: &mut u32, pos: u64, value: u32) {
 fn set_byte64(reg: &mut u64, pos: u64, value: u8) {
 	let sh = pos * 8;
 	*reg = (*reg & !(0xffu64 << sh)) | ((value as u64) << sh);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The card must play at exactly its byte rate however finely the device
+	/// is serviced. This is the regression that made DOOM chop: the emulator
+	/// services devices every 32 retired instructions, so `accrue` is called
+	/// with an mtime delta of about 3, and the old truncating division paid
+	/// out ZERO bytes on nearly every one of those three million calls a
+	/// second. A card that plays at a fraction of real time backs the whole
+	/// pipeline up behind it.
+	#[test]
+	fn pays_full_rate_when_serviced_finely() {
+		for delta in [1u64, 3, 7, 227, 1000] {
+			let mut snd = VirtioSnd::new();
+			snd.rate_hz = 11_025;
+			snd.channels = 2;
+			snd.running = true;
+			snd.last_mtime = 1;
+			let mut paid = 0u64;
+			let mut t = 1u64;
+			while t < 1 + MTIME_HZ {
+				t += delta;
+				snd.accrue(t);
+				// Spend as a playing stream would, so the pause cap (which
+				// exists for a stopped stream) never enters into it.
+				paid += snd.credit;
+				snd.credit = 0;
+			}
+			let want = 11_025u64 * 2 * 2;
+			assert!(
+				paid + delta >= want && paid <= want + delta,
+				"servicing every {} mtime ticks paid {} bytes for one second, want {}",
+				delta, paid, want
+			);
+		}
+	}
 }

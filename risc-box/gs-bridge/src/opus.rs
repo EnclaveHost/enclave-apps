@@ -7,11 +7,12 @@
 // vendored: it is the reference encoder, and the alternative is inventing a
 // codec Moonlight would not understand.
 //
-// The pump POLLS rather than streaming. /audio is a destructive take, so one
-// consumer owns it, and a poll every 40 ms costs 25 requests a second against
-// an endpoint that measured clean at 10/s and is a GET besides (it was POSTs
-// to /hid that used to hurt, and that is fixed). Latency is the poll interval
-// plus a frame, which is well under what a player notices on a gunshot.
+// The pump STREAMS, over the same SSE mechanism the video uses. It polled
+// once, and that was audibly wrong: a request round trip per chunk is 100-400
+// ms of relay jitter imposed on a stream consumed in 5 ms frames, so the
+// listener alternately starved (heard as chopping) and sat on a backlog (heard
+// as delay). Pushing means audio arrives as the card plays it, and every
+// buffer between here and the guest can then be shallow.
 
 use std::collections::VecDeque;
 use std::os::raw::{c_int, c_void};
@@ -38,9 +39,17 @@ pub const OUT_CHANNELS: usize = 2;
 /// 5 ms at 48 kHz, per channel — the packet duration audio.rs advertises.
 pub const FRAME_SAMPLES: usize = OUT_RATE / 1000 * 5;
 
-/// One second of 48 kHz stereo. Past this the host is not keeping up and the
-/// oldest audio is the least worth hearing.
-const RING_CAP: usize = OUT_RATE * OUT_CHANNELS;
+/// ~200 ms of 48 kHz stereo. This is a jitter buffer, not a store: anything
+/// held here is delay the player hears, and a deep one was most of why the
+/// first cut sounded late.
+const RING_CAP: usize = OUT_RATE * OUT_CHANNELS * 200 / 1000;
+
+/// Audio starts flowing once this much is banked. It MUST exceed the interval
+/// the app delivers on, or the buffer drains dry between chunks and every gap
+/// is heard as a chop: measured delivery is ~41 ms typical and 84 ms worst,
+/// so priming at 30 ms (as the first cut did) guaranteed the very problem the
+/// buffer exists to prevent. 100 ms clears the worst case with room over.
+const PRIME_SAMPLES: usize = OUT_RATE * OUT_CHANNELS * 100 / 1000;
 
 pub struct Encoder {
     st: *mut c_void,
@@ -90,65 +99,98 @@ impl Drop for Encoder {
 #[derive(Clone)]
 pub struct AudioSource {
     buf: Arc<Mutex<VecDeque<i16>>>,
+    /// Whether the buffer has primed since it last ran dry. Emitting the
+    /// instant the first samples land just moves the starvation one frame
+    /// later; waiting for PRIME_SAMPLES rides out the jitter instead.
+    primed: Arc<Mutex<bool>>,
 }
 
 impl AudioSource {
     pub fn new() -> AudioSource {
-        AudioSource { buf: Arc::new(Mutex::new(VecDeque::new())) }
+        AudioSource {
+            buf: Arc::new(Mutex::new(VecDeque::new())),
+            primed: Arc::new(Mutex::new(false)),
+        }
     }
 
     /// Take one frame's worth, or None if the guest has not produced that much
     /// yet — silence is the right filler and audio.rs already has it.
     pub fn take_frame(&self) -> Option<Vec<i16>> {
         let mut b = self.buf.lock().unwrap();
+        let mut primed = self.primed.lock().unwrap();
         let want = FRAME_SAMPLES * OUT_CHANNELS;
+        if !*primed {
+            if b.len() < PRIME_SAMPLES {
+                return None;
+            }
+            *primed = true;
+        }
         if b.len() < want {
+            // Ran dry: prime again before resuming, or every following frame
+            // is a coin toss between audio and silence.
+            *primed = false;
             return None;
         }
         Some(b.drain(..want).collect())
     }
 
-    /// Poll the app's /audio and keep the buffer fed. Runs until the session
-    /// stops.
+    /// Read the app's audio stream and keep the buffer fed. Runs until the
+    /// session stops.
     pub fn pump(self, session: Arc<Session>, app: Arc<App>) {
+        use std::io::BufRead;
+
         while !session.is_stopping() {
-            match app.get("/audio?max=65536") {
-                Ok(body) => {
-                    if let Some((rate, channels, pcm)) = parse_audio(&body) {
-                        if !pcm.is_empty() {
-                            let out = resample(&pcm, rate, channels);
-                            let mut b = self.buf.lock().unwrap();
-                            b.extend(out.iter().copied());
-                            while b.len() > RING_CAP {
-                                let over = b.len() - RING_CAP;
-                                b.drain(..over);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    // The app restarting is not fatal to the stream: the
-                    // client keeps hearing silence and picks the audio back up
-                    // when /audio answers again.
-                    if !session.wait(Duration::from_millis(500)) {
+            let mut r = match app.get_stream("/audio?stream=1") {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[audio] /audio connect failed: {e}; retrying");
+                    if !session.wait(Duration::from_secs(1)) {
                         return;
                     }
+                    continue;
+                }
+            };
+            let mut line = String::new();
+            loop {
+                if session.is_stopping() {
+                    return;
+                }
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) => break, // app closed the stream; redial
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let Some(payload) = line.strip_prefix("data: ") else { continue };
+                let Some((rate, channels, pcm)) = parse_event(payload.trim()) else {
+                    continue;
+                };
+                if pcm.is_empty() {
+                    continue;
+                }
+                let out = resample(&pcm, rate, channels);
+                let mut b = self.buf.lock().unwrap();
+                b.extend(out.iter().copied());
+                while b.len() > RING_CAP {
+                    let over = b.len() - RING_CAP;
+                    b.drain(..over);
                 }
             }
-            if !session.wait(Duration::from_millis(40)) {
+            // The app restarting is not fatal to the stream: the client keeps
+            // hearing silence and the audio comes back when /audio does.
+            if !session.wait(Duration::from_millis(500)) {
                 return;
             }
         }
     }
 }
 
-/// Pull {"rate":N,"channels":N,...,"pcm":"<base64>"} apart without a JSON
-/// parser — the shape is ours and fixed.
-fn parse_audio(body: &[u8]) -> Option<(usize, usize, Vec<i16>)> {
-    let text = std::str::from_utf8(body).ok()?;
-    let rate = number_after(text, "\"rate\":")?;
-    let channels = number_after(text, "\"channels\":")?;
-    let start = text.find("\"pcm\":\"")? + 7;
+/// Pull {"r":N,"c":N,"d":"<base64>"} apart without a JSON parser — the shape
+/// is ours and fixed.
+fn parse_event(text: &str) -> Option<(usize, usize, Vec<i16>)> {
+    let rate = number_after(text, "\"r\":")?;
+    let channels = number_after(text, "\"c\":")?;
+    let start = text.find("\"d\":\"")? + 5;
     let end = text[start..].find('"')? + start;
     let raw = b64_decode(&text[start..end]);
     let mut pcm = Vec::with_capacity(raw.len() / 2);
