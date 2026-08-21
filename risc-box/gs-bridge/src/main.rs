@@ -24,6 +24,7 @@ mod control;
 mod crypto;
 mod enet;
 mod fec;
+mod opus;
 mod httpx;
 mod pair;
 mod screen;
@@ -219,8 +220,8 @@ fn start_session_workers(
     }
 
     {
-        let (s, sock) = (session.clone(), audio_sock.clone());
-        std::thread::spawn(move || audio::run(s, sock));
+        let (s, a, sock) = (session.clone(), app.clone(), audio_sock.clone());
+        std::thread::spawn(move || audio::run(s, a, sock));
     }
     {
         let (s, a, sock) = (session.clone(), app.clone(), video_sock.clone());

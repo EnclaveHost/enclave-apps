@@ -1,11 +1,14 @@
 // The audio stream on :48000.
 //
-// The emulated machine has no sound device, so there is nothing to capture.
-// We still run the stream because the client brings up an Opus decoder and
-// pings this port during the handshake; sending well-formed silence keeps
-// that path healthy. (A missing audio stream is not fatal to the client —
-// AudioStream.c has no termination path for it — but a malformed one
-// produces a decode-error log on every packet.)
+// The machine has a sound card now (emu/src/device/virtio_snd.rs), so this
+// carries what the guest actually played: opus.rs pumps PCM out of the app's
+// /audio, resamples it to 48 kHz and encodes 5 ms frames, and this packetizes
+// them. When the guest is silent — or has not produced a whole frame yet —
+// the stream falls back to well-formed silence rather than stopping, because
+// the client brings up an Opus decoder and pings this port during the
+// handshake. (A missing audio stream is not fatal to the client —
+// AudioStream.c has no termination path for it — but a malformed one produces
+// a decode-error log on every packet.)
 //
 // Framing mirrors Sunshine's audioBroadcastThread: RTP payload type 97, 4
 // data shards per FEC block followed by 2 parity shards on payload type 127.
@@ -42,9 +45,20 @@ fn rtp_header(payload_type: u8, seq: u16, timestamp: u32) -> [u8; 12] {
     h
 }
 
-pub fn run(session: Arc<Session>, sock: Arc<UdpSocket>) {
+pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket>) {
     let cfg = session.config.lock().unwrap().clone();
     let encrypted = cfg.audio_encrypted;
+
+    // The pump owns /audio (taking from it is destructive), so exactly one
+    // runs, alongside this thread, for the life of the session.
+    let source = crate::opus::AudioSource::new();
+    {
+        let (s, a, src) = (session.clone(), app.clone(), source.clone());
+        std::thread::spawn(move || src.pump(s, a));
+    }
+    let mut encoder = crate::opus::Encoder::new();
+    let mut opus_buf = [0u8; 1275]; // the largest packet Opus will produce
+    let mut heard = false;
 
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
@@ -54,7 +68,12 @@ pub fn run(session: Arc<Session>, sock: Arc<UdpSocket>) {
     let mut base_seq: u16 = 0;
     let mut base_ts: u32 = 0;
 
-    eprintln!("[audio] streaming silence on :{} (encrypted={encrypted})", crate::session::PORT_AUDIO);
+    match encoder.is_some() {
+        true => eprintln!("[audio] streaming guest audio on :{} (encrypted={encrypted})",
+                          crate::session::PORT_AUDIO),
+        false => eprintln!("[audio] no opus encoder; streaming silence on :{}",
+                           crate::session::PORT_AUDIO),
+    }
 
     while !session.is_stopping() {
         let Some(peer) = *session.audio_peer.lock().unwrap() else {
@@ -64,15 +83,30 @@ pub fn run(session: Arc<Session>, sock: Arc<UdpSocket>) {
             continue;
         };
 
+        // A whole 5 ms frame or nothing: a partial frame would be a click,
+        // and silence is what the client expects between sounds anyway.
+        let frame: &[u8] = match encoder.as_mut().and_then(|e| {
+            source.take_frame().and_then(|pcm| e.encode(&pcm, &mut opus_buf))
+        }) {
+            Some(n) => {
+                if !heard {
+                    heard = true;
+                    eprintln!("[audio] first guest audio frame ({n} bytes opus)");
+                }
+                &opus_buf[..n]
+            }
+            None => &SILENT_OPUS,
+        };
+
         // Encrypt if the client negotiated audio encryption: AES-128-CBC with
         // IV = BE32(rikeyid + sequenceNumber) in the first four bytes.
         let payload = if encrypted {
             let mut iv = [0u8; 16];
             let iv_seq = session.riki_key_id.wrapping_add(seq as u32);
             iv[0..4].copy_from_slice(&iv_seq.to_be_bytes());
-            crypto::cbc_encrypt(&session.key, &iv, &SILENT_OPUS)
+            crypto::cbc_encrypt(&session.key, &iv, frame)
         } else {
-            SILENT_OPUS.to_vec()
+            frame.to_vec()
         };
 
         if seq as usize % RTPA_DATA_SHARDS == 0 {

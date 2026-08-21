@@ -28,5 +28,10 @@ fn main() {
 
     b.compile("enet");
 
+    // libopus encodes the GameStream audio channel (src/opus.rs). Linked from
+    // the system rather than vendored: it is the reference encoder, and the
+    // client will not decode anything else.
+    println!("cargo:rustc-link-lib=opus");
+
     println!("cargo:rerun-if-changed=vendor/enet");
 }
