@@ -276,6 +276,8 @@ impl VirtioSnd {
 				write_out(memory, writable, &status_bytes(S_OK))
 			}
 			R_PCM_PREPARE => {
+				// Belt and braces: a stream being prepared owns nothing yet.
+				self.flush_tx(memory);
 				// PREPARED, not RUNNING: START is what begins playback. Also
 				// the xrun recovery path — ALSA re-prepares after an underrun,
 				// so every scrap of old state has to go with it (a stale
@@ -300,12 +302,34 @@ impl VirtioSnd {
 				self.credit = 0;
 				self.last_mtime = 0;
 				self.ring.clear();
+				// The spec requires every pending I/O buffer to come back on
+				// release, and the driver reclaims its side regardless. Keep
+				// the ones we never paid credit for and the two sides disagree
+				// about how far into the avail ring they are — after which the
+				// NEXT open's control message goes unanswered and ALSA reports
+				// "audio open error: Operation timed out". One session worked,
+				// every session after it did not.
+				self.flush_tx(memory);
 				write_out(memory, writable, &status_bytes(S_OK))
 			}
 			// Anything else (jack remap, capture) is refused rather than
 			// ignored: a driver that gets S_OK for a request the device did
 			// not honour goes on to use a stream that does not exist.
 			_ => write_out(memory, writable, &status_bytes(S_NOT_SUPP)),
+		}
+	}
+
+	/// Hand every posted playback buffer back, completed. Used when a stream
+	/// is released or re-prepared, so the device and driver agree on where the
+	/// avail ring stands.
+	fn flush_tx(&mut self, memory: &mut MemoryWrapper) {
+		for _ in 0..MAX_QUEUE_SIZE {
+			let Some(head) = self.pop_avail(memory, TX_QUEUE) else { break };
+			let (_data, writable) = self.walk_chain(memory, TX_QUEUE, head);
+			let mut st = status_bytes(S_OK);
+			st.extend_from_slice(&0u32.to_le_bytes());
+			let written = write_out(memory, &writable, &st);
+			self.push_used(memory, TX_QUEUE, head, written);
 		}
 	}
 
