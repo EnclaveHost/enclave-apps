@@ -189,6 +189,25 @@ pub struct VirtioGpu {
     display_height: u32,
 
     virgl: Option<Box<dyn Virgl3d>>,
+    cursor: Option<Cursor>,
+}
+
+/// The pointer, as its own plane.
+///
+/// This is not decoration. With the fbdev driver X drew the pointer INTO the
+/// framebuffer, so every mouse move dirtied the picture under it and the host
+/// re-encoded that region. On DRM, modesetting hands the pointer to the
+/// hardware cursor plane instead — so if the device acknowledges the cursor
+/// commands and composites nothing, the mouse simply VANISHES, which is
+/// exactly what shipping the first cut did.
+struct Cursor {
+    /// 0 means hidden; otherwise a normal 2D resource (typically 64x64 ARGB)
+    /// the guest created and transferred like any other.
+    resource_id: u32,
+    x: i64,
+    y: i64,
+    hot_x: i64,
+    hot_y: i64,
 }
 
 impl VirtioGpu {
@@ -209,6 +228,7 @@ impl VirtioGpu {
             display_width: width,
             display_height: height,
             virgl: None,
+            cursor: None,
         }
     }
 
@@ -353,11 +373,8 @@ impl VirtioGpu {
                     false => Self::resp_hdr(req, RESP_ERR_UNSPEC),
                 }
             }
-            CMD_UPDATE_CURSOR | CMD_MOVE_CURSOR => {
-                // The cursor plane is composited by the host display path; the
-                // position rides in the request and needs no reply body.
-                Self::resp_hdr(req, RESP_OK_NODATA)
-            }
+            CMD_UPDATE_CURSOR => self.update_cursor(req, true),
+            CMD_MOVE_CURSOR => self.update_cursor(req, false),
             _ => Self::resp_hdr(req, RESP_ERR_UNSPEC),
         }
     }
@@ -537,6 +554,116 @@ impl VirtioGpu {
         }
     }
 
+    /// virtio_gpu_update_cursor: hdr, then cursor_pos {scanout_id, x, y, pad},
+    /// then resource_id, hot_x, hot_y, pad. MOVE_CURSOR carries the same
+    /// layout but only the position is meaningful.
+    fn update_cursor(&mut self, req: &[u8], set_resource: bool) -> Vec<u8> {
+        let x = le32(req, CTRL_HDR_LEN + 4) as i64;
+        let y = le32(req, CTRL_HDR_LEN + 8) as i64;
+        let old = self.cursor_rect();
+        match self.cursor.as_mut() {
+            Some(c) => {
+                c.x = x;
+                c.y = y;
+                if set_resource {
+                    c.resource_id = le32(req, CTRL_HDR_LEN + 16);
+                    c.hot_x = le32(req, CTRL_HDR_LEN + 20) as i64;
+                    c.hot_y = le32(req, CTRL_HDR_LEN + 24) as i64;
+                }
+            }
+            None => {
+                self.cursor = Some(Cursor {
+                    resource_id: match set_resource {
+                        true => le32(req, CTRL_HDR_LEN + 16),
+                        false => 0,
+                    },
+                    x,
+                    y,
+                    hot_x: le32(req, CTRL_HDR_LEN + 20) as i64,
+                    hot_y: le32(req, CTRL_HDR_LEN + 24) as i64,
+                });
+            }
+        }
+        // The guest does NOT flush the scanout when the pointer moves — that
+        // is the whole point of a cursor plane. So the device has to report
+        // the damage itself, over both the vacated and the newly covered
+        // rectangle, or a damage-guided host scanner never re-encodes either
+        // and the pointer leaves a trail (or never appears at all).
+        if let Some(r) = old {
+            self.mark_dirty(r);
+        }
+        if let Some(r) = self.cursor_rect() {
+            self.mark_dirty(r);
+        }
+        Self::resp_hdr(req, RESP_OK_NODATA)
+    }
+
+    /// Where the cursor currently covers the scanout, clipped to it.
+    fn cursor_rect(&self) -> Option<Rect> {
+        let c = self.cursor.as_ref()?;
+        if c.resource_id == 0 {
+            return None;
+        }
+        let res = self.resources.get(&c.resource_id)?;
+        let x0 = (c.x - c.hot_x).max(0) as u32;
+        let y0 = (c.y - c.hot_y).max(0) as u32;
+        if x0 >= self.display_width || y0 >= self.display_height {
+            return None;
+        }
+        Some(Rect {
+            x: x0,
+            y: y0,
+            width: res.width.min(self.display_width - x0),
+            height: res.height.min(self.display_height - y0),
+        })
+    }
+
+    /// Alpha-blend the cursor over a COPY of the scanout.
+    ///
+    /// Takes the caller's buffer rather than touching the resource, because
+    /// the scanout is the guest's own memory: painting a pointer into it
+    /// would corrupt what the guest believes it drew, and the next partial
+    /// update would leave the old pointer behind forever.
+    pub fn compose_cursor(&self, out: &mut [u8], w: usize, h: usize) {
+        let Some(c) = self.cursor.as_ref() else { return };
+        if c.resource_id == 0 {
+            return;
+        }
+        let Some(res) = self.resources.get(&c.resource_id) else { return };
+        let ox = c.x - c.hot_x;
+        let oy = c.y - c.hot_y;
+        for cy in 0..res.height as i64 {
+            let dy = oy + cy;
+            if dy < 0 || dy >= h as i64 {
+                continue;
+            }
+            for cx in 0..res.width as i64 {
+                let dx = ox + cx;
+                if dx < 0 || dx >= w as i64 {
+                    continue;
+                }
+                let si = (cy as usize * res.width as usize + cx as usize) * BPP;
+                let di = (dy as usize * w + dx as usize) * BPP;
+                if si + 4 > res.pixels.len() || di + 4 > out.len() {
+                    continue;
+                }
+                let a = res.pixels[si + 3] as u32;
+                if a == 0 {
+                    continue; // fully transparent: the common case by area
+                }
+                if a == 255 {
+                    out[di..di + 3].copy_from_slice(&res.pixels[si..si + 3]);
+                    continue;
+                }
+                for k in 0..3 {
+                    let src = res.pixels[si + k] as u32;
+                    let dst = out[di + k] as u32;
+                    out[di + k] = ((src * a + dst * (255 - a)) / 255) as u8;
+                }
+            }
+        }
+    }
+
     fn submit_3d(&mut self, req: &[u8]) -> Vec<u8> {
         let size = le32(req, CTRL_HDR_LEN) as usize;
         let ctx_id = le32(req, 16);
@@ -666,6 +793,7 @@ impl VirtioGpu {
         self.scanout_resource = 0;
         self.dirty = None;
         self.flushes = 0;
+        self.cursor = None;
     }
 
     fn queue(&self) -> &Queue {

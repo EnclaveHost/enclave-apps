@@ -425,15 +425,23 @@ impl Emulator {
 	/// never stranded. Returns true when the pixels came from the GPU.
 	pub fn read_display(&self, fallback_base: u64, out: &mut [u8], prefer_gpu: bool) -> bool {
 		if prefer_gpu {
-			if let Some((w, h, pixels)) = self.cpu.get_mmu().get_gpu().scanout() {
+			let dims = match self.cpu.get_mmu().get_gpu().scanout() {
 				// Only serve the GPU scanout when its geometry matches what
 				// the caller sized `out` for. A mode change the host has not
 				// caught up with yet must not be blitted through a buffer of
 				// the old size.
-				if (w as usize) * (h as usize) * 4 == out.len() {
+				Some((w, h, pixels)) if (w as usize) * (h as usize) * 4 == out.len() => {
 					out.copy_from_slice(pixels);
-					return true;
+					Some((w as usize, h as usize))
 				}
+				_ => None,
+			};
+			if let Some((w, h)) = dims {
+				// The pointer lives on its own plane, so it is NOT in the
+				// scanout the guest just handed us — compose it here or the
+				// mouse is invisible.
+				self.cpu.get_mmu().get_gpu().compose_cursor(out, w, h);
+				return true;
 			}
 		}
 		self.cpu.get_mmu().read_physical_range(fallback_base, out);

@@ -86,11 +86,6 @@ const NET_BOOST_TURNS: u64 = 250;
 /// the real cadence at the loop's own rate rather than at a threshold.
 const AUDIO_MIN_CHUNK: usize = 512;
 
-/// How far an audio listener may fall behind before events are skipped rather
-/// than queued. Deliberately small — a quarter second of base64 PCM — because
-/// audio that arrives late is not worth the delay it costs everything behind
-/// it.
-const AUDIO_BACKLOG_LIMIT: usize = 16 * 1024;
 /// Drain generously: the point is to leave the card's ring empty, so a
 /// backlog from a slow turn clears in one or two turns instead of lingering
 /// as delay (or overflowing into drops).
@@ -2010,15 +2005,21 @@ pub fn run() {
                         // what the chopping was (7-11 kB/s of 38 thrown away
                         // with a listener attached the whole time).
                         let pcm = emu.take_audio(AUDIO_MAX_CHUNK);
-                        // ...but only SEND while the socket is keeping up.
-                        // Audio is worthless late, so a backed-up listener is
-                        // served by skipping ahead rather than by queueing: a
-                        // deep wbuf here also slows the loop that feeds it,
-                        // which is how a slow reader turned into dropped
-                        // sound at the card.
-                        if !pcm.is_empty()
-                            && server.sse_backlog("audio") < AUDIO_BACKLOG_LIMIT
-                        {
+                        // Send unconditionally. An earlier cut skipped the
+                        // broadcast whenever the listener's backlog passed a
+                        // threshold, on the theory that a deep wbuf was
+                        // slowing the loop. It was not — the card's clock was
+                        // (see virtio_snd::accrue) — and the gate then caused
+                        // the very thing it was meant to prevent: measured
+                        // 77% carried sound, 428 silent frames out of 1868,
+                        // while the card itself dropped NOTHING. Two reasons
+                        // it has to go. The httpd already protects itself
+                        // (starve at SSE_SKIP_WBUF, close at MAX_WBUF), and
+                        // the player trims stale audio in its own ring, so
+                        // the gate was redundant. Worse, sse_backlog reports
+                        // the MAX across subscribers, so one slow listener
+                        // silenced every listener.
+                        if !pcm.is_empty() {
                             server.broadcast(
                                 "audio",
                                 &format!("data: {{\"r\":{},\"c\":{},\"d\":\"{}\"}}",
@@ -2075,11 +2076,12 @@ pub fn run() {
                     if (watching_display || watching_video) && due && worker::inflight() < 2 {
                         let began = Instant::now();
                         let mut buf = worker::take_buffer();
-                        Display::capture(emu, &mut buf);
+                        let damage = Display::capture_damage(emu, &mut buf);
                         worker::submit(worker::Job {
                             frame: buf,
                             want_bands: watching_display,
                             want_video: watching_video,
+                            damage,
                         });
                         // The capture is the whole of what the guest now pays.
                         app.fb_cost = (app.fb_cost + began.elapsed()) / 2;

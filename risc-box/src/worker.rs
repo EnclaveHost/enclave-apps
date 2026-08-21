@@ -112,6 +112,9 @@ pub struct Job {
     pub frame: Vec<u8>,
     pub want_bands: bool,
     pub want_video: bool,
+    /// The row range the guest said it changed, taken at capture time. None
+    /// means "no damage report" — scan the whole frame, as before.
+    pub damage: Option<(usize, usize)>,
 }
 
 /// What came back. `spare` is the buffer to capture into next.
@@ -265,7 +268,7 @@ fn serve() {
 
         // Bands last: it consumes the frame and hands back the buffer.
         let (bands, spare) = match job.want_bands {
-            true => display.bands(job.frame),
+            true => display.bands(job.frame, job.damage),
             false => (Vec::new(), job.frame),
         };
 

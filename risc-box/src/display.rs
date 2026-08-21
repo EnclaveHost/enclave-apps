@@ -135,7 +135,17 @@ pub struct Display {
     row_hash: Vec<u64>,    // FNV-1a per row of `frame`
     force_full: bool,      // a watcher joined: next scan ships the whole frame
     primed: bool,          // false until the first scan after boot
+    /// Scans since the last full hash. Guest-reported damage is a promise the
+    /// host cannot check cheaply, so a full scan runs periodically to repair
+    /// anything the promise missed.
+    since_full: u32,
 }
+
+/// How often a full-frame hash runs even when the guest reported damage.
+/// At the 100 ms scan floor this is a repair pass roughly every 6 seconds —
+/// often enough that a bad damage rect is a brief artifact, rare enough that
+/// the saving is real.
+const FULL_SCAN_EVERY: u32 = 60;
 
 impl Display {
     pub fn new() -> Self {
@@ -145,6 +155,7 @@ impl Display {
             row_hash: vec![0; fb_h()],
             force_full: true,
             primed: false,
+            since_full: 0,
         }
     }
 
@@ -164,13 +175,13 @@ impl Display {
 
     /// Scan the guest framebuffer and return the changed bands (possibly one
     /// full-frame band). Empty when nothing changed.
-    pub fn scan(&mut self, emu: &Emulator) -> Vec<Band> {
+    pub fn scan(&mut self, emu: &mut Emulator) -> Vec<Band> {
         // Read into the scratch buffer and swap it in, rather than allocating
         // a fresh frame each time: the row hashes carry everything needed to
         // find what changed, so the previous frame's bytes are not consulted.
         let mut buf = std::mem::take(&mut self.scratch);
-        Self::capture(emu, &mut buf);
-        let (bands, spare) = self.bands(buf);
+        let damage = Self::capture_damage(emu, &mut buf);
+        let (bands, spare) = self.bands(buf, damage);
         self.scratch = spare;
         bands
     }
@@ -226,12 +237,49 @@ impl Display {
         USE_GPU.load(Ordering::Relaxed)
     }
 
+    /// Capture, and take the guest's damage report with it. One call so the
+    /// two cannot drift: taking the region CLEARS it, so a caller that
+    /// captured without taking would scan a frame whose damage had already
+    /// been consumed by someone else.
+    pub fn capture_damage(emu: &mut Emulator, out: &mut Vec<u8>) -> Option<(usize, usize)> {
+        Self::capture(emu, out);
+        // Only the row range matters: the column range is recovered by
+        // comparing the rows we do hash, and that comparison is cheap next to
+        // the hashing this avoids.
+        emu.gpu_take_dirty().map(|(_, y, _, h)| {
+            let y0 = y as usize;
+            (y0.min(fb_h()), (y0 + h as usize).min(fb_h()))
+        })
+    }
+
     /// Turn a captured frame into bands. Takes the frame by value and hands
     /// back the frame it replaced, so a caller holding a buffer pool can keep
     /// recycling two buffers forever instead of allocating megabytes per scan.
-    pub fn bands(&mut self, mut frame: Vec<u8>) -> (Vec<Band>, Vec<u8>) {
+    /// `damage` is the row range the GUEST said it changed (virtio-gpu's
+    /// RESOURCE_FLUSH). Rows outside it are not hashed at all, which is the
+    /// entire point of having a display controller: finding what moved costs
+    /// a 3 MB hash of the whole frame otherwise, every scan, forever.
+    ///
+    /// Damage is TRUSTED BUT VERIFIED. A rectangle that is wrong or
+    /// incomplete would freeze part of the picture indefinitely, so every
+    /// FULL_SCAN_EVERY scans one full hash runs regardless and repairs
+    /// whatever the guest failed to mention. That bounds a bad rect to well
+    /// under a second instead of forever.
+    pub fn bands(&mut self, mut frame: Vec<u8>, damage: Option<(usize, usize)>)
+        -> (Vec<Band>, Vec<u8>) {
         let mut dirty = vec![false; fb_h()];
         let mut any = false;
+        self.since_full = self.since_full.wrapping_add(1);
+        let heal = self.since_full >= FULL_SCAN_EVERY;
+        if heal {
+            self.since_full = 0;
+        }
+        let (scan_y0, scan_y1) = match damage {
+            Some((y0, y1)) if self.primed && !heal && !self.force_full => {
+                (y0.min(fb_h()), y1.min(fb_h()))
+            }
+            _ => (0, fb_h()),
+        };
         // Columns that changed anywhere on the screen, in 8-byte units (two
         // pixels). Found while the OLD frame is still in place, because a
         // column range needs the two frames compared, not just their hashes —
@@ -241,7 +289,7 @@ impl Display {
         let stride = fb_stride();
         let mut lo = usize::MAX;
         let mut hi = 0usize;
-        for y in 0..fb_h() {
+        for y in scan_y0..scan_y1 {
             let row = &frame[y * stride..(y + 1) * stride];
             let h = fnv1a(row);
             if h == self.row_hash[y] && self.primed {
