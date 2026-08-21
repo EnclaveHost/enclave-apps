@@ -1078,12 +1078,29 @@ impl Session {
     }
 }
 
+/// mm31: the host refuses a speculative round while ANOTHER chat is
+/// generating on the same model, because a round takes the decode turn
+/// alone while plain steps merge into one pass over the weights. Not a
+/// failure - the turn finishes on the batched path and the next request
+/// speculates again if it has the model to itself.
+const SHARED_MARK: &str = "[mtp_shared]";
+const SHARED_MARK_MSG: &str =
+    "[mtp_shared] another chat is generating on this model; plain decode batches with it";
+
 /// candidates per row the host keeps when asked to reduce logits (the
 /// "topk" verb); 256 comfortably covers the sampler's top_k <= 256 bound
 const HOST_TOPK: i32 = 256;
 
 fn topk_input() -> (String, Tensor) {
     ("topk".to_string(), Tensor::new(&[1], TensorType::I32, &HOST_TOPK.to_le_bytes()))
+}
+
+/// mm31 opt-in: tells the host this caller will finish the turn on plain
+/// decode if a speculative round is refused because a second chat started.
+/// Without it the host never refuses - an app that treats the error as fatal
+/// must keep getting the old (slower, but working) behaviour.
+fn shared_ok_input() -> (String, Tensor) {
+    ("shared_ok".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes()))
 }
 
 // Per-request wasi-nn verb timing: every compute call asks the host for its
@@ -1570,6 +1587,8 @@ impl Session {
             sync_ms: if data.len() >= 36 { v(8) } else { -1 },
             sync_calls: if data.len() >= 40 { v(9) } else { -1 },
             mtp_round: data.len() >= 44 && v(10) != 0,
+            // v(11) is the engine's device-top-k K, which the app does not read
+            shared: data.len() >= 52 && v(12) != 0,
         })
     }
 
@@ -1637,6 +1656,7 @@ impl Session {
         bytes.extend_from_slice(&p_min_milli.to_le_bytes());
         let mut inputs = vec![
             ("mtp_draft".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
+            shared_ok_input(),
             timing_input(),
         ];
         if let Some((pos0, toks)) = obs {
@@ -1691,6 +1711,7 @@ impl Session {
             ("tokens".to_string(),
              Tensor::new(&[1, pending.len() as u32], TensorType::I32, &pbytes)),
             topk_input(),
+            shared_ok_input(),
             timing_input(),
         ];
         if let Some((pos0, toks)) = obs {
@@ -1941,6 +1962,13 @@ struct Caps {
     /// head's draft chain and the verify in ONE call under one arbiter
     /// grant (mm25+). false on older hosts: keep the two-call loop.
     mtp_round: bool,
+    /// mm31: another chat is generating on this model RIGHT NOW, so the
+    /// host's speculative verbs would refuse ([mtp_shared]). Speculation
+    /// takes the decode turn alone; plain decode merges with the other
+    /// chat into one pass over the weights, which is strictly faster while
+    /// shared. Read at rig-open so a turn starts on the right path instead
+    /// of downgrading a round later; the refusal remains the authority.
+    shared: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -1978,7 +2006,15 @@ fn open_spec(
 /// itself through the host's head context, so no draft model, no draft
 /// sessions, half the slot cost of a model-draft rig.
 struct MtpRig {
-    tscr: Session,
+    /// The scratch branch, opened ONLY for branch-commit (rewind_depth 0).
+    /// In rewind mode the verify runs on the real sequence and this is never
+    /// touched - and it is not free: a session is one of the host's
+    /// ENCLAVE_GGML_MAX_SESSIONS slots. A host-tokenizer turn already holds
+    /// one for the encoder plus one for the model, so opening a third put
+    /// four concurrent chats at 12 slots against a cap of 8 and sent them
+    /// into the busy-wait poll (measured: ~30 s added to a 4-chat burst,
+    /// intermittently, while the same burst on plain decode was clean).
+    tscr: Option<Session>,
     t_seq: i32,
     tscr_seq: i32,
 }
@@ -1991,6 +2027,12 @@ fn open_mtp(
     let caps = sess.caps()?; // also the host capability probe
     if !caps.mtp {
         return Err("this model volume carries no MTP head (use an *-mtp volume, or name a draft model)".into());
+    }
+    // mm31: a second chat is already generating. Speculation would take the
+    // decode turn alone and lose to the merged batch, so start plain rather
+    // than open a rig and downgrade one round in.
+    if caps.shared {
+        return Err(SHARED_MARK_MSG.into());
     }
     // DEPTH GUARD (2026-08-03, mm18): MTP under a recurrent-snapshot
     // context works (locally proven: depth 1 on CUDA, rewind-commit,
@@ -2018,9 +2060,13 @@ fn open_mtp(
         }
     }
     let t_seq = caps.seq;
+    // rewind-commit needs no branch: skip the slot entirely (see MtpRig)
+    if caps.rewind_depth > 0 {
+        return Ok(MtpRig { tscr: None, t_seq, tscr_seq: -1 });
+    }
     let mut tscr = Session::open(cfg, target)?;
     let tscr_seq = tscr.caps()?.seq;
-    Ok(MtpRig { tscr, t_seq, tscr_seq })
+    Ok(MtpRig { tscr: Some(tscr), t_seq, tscr_seq })
 }
 
 /// Prompt-lookup uses the same rig shape as MTP (target + one scratch
@@ -2031,10 +2077,14 @@ fn open_lookup(
     target: ExecutionTarget,
     sess: &mut Session,
 ) -> Result<MtpRig, String> {
-    let t_seq = sess.caps()?.seq; // also the host capability probe
+    let caps = sess.caps()?; // also the host capability probe
+    let t_seq = caps.seq;
+    if caps.rewind_depth > 0 {
+        return Ok(MtpRig { tscr: None, t_seq, tscr_seq: -1 });
+    }
     let mut tscr = Session::open(cfg, target)?;
     let tscr_seq = tscr.caps()?.seq;
-    Ok(MtpRig { tscr, t_seq, tscr_seq })
+    Ok(MtpRig { tscr: Some(tscr), t_seq, tscr_seq })
 }
 
 struct GenParams {
@@ -2922,7 +2972,11 @@ fn generate_mtp(
     emit: &dyn Fn(&str) -> bool,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
-    let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
+    let MtpRig { tscr: mut tscr_opt, t_seq, tscr_seq } = rig;
+    // present exactly when depth == 0 (branch-commit); every use below is on
+    // such a path, so the expect() documents the invariant rather than hoping
+    // present exactly when depth == 0; `scratch!()` documents that invariant
+    macro_rules! scratch { () => { tscr_opt.as_mut().expect("branch-commit without a scratch branch") } }
     // same two-strategy split as generate_lookup (see its doc): rewind-commit
     // when the host keeps recurrent snapshots deep enough for a whole round,
     // branch-commit otherwise. MTP drafts EVERY round (no n-gram luck), so
@@ -2943,6 +2997,13 @@ fn generate_mtp(
         && gcaps.as_ref().map(|c| c.mtp_round).unwrap_or(false)
         && cfg.draft_fused.unwrap_or(true);
     let mut pending_obs: Option<(usize, Vec<u32>)> = None;
+    // mm31: set when the host refuses a round because a second chat started.
+    // From then on this turn decodes plain, which is what lets its steps
+    // MERGE with that chat's instead of alternating exclusive turns against
+    // them. One-way for the rest of the request: the head stops harvesting
+    // once we leave the speculative verb, so resuming mid-answer would draft
+    // from stale state - the next request opens a fresh rig instead.
+    let mut spec_off = false;
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let p_min_milli = (cfg.draft_p_min.clamp(0.0, 0.95) * 1000.0) as i32;
     // -- prefill through the MTP-aware feed: every chunk's positions are
@@ -3021,8 +3082,8 @@ fn generate_mtp(
                 sess.mtp_accept(t_fed, &ids)?;
                 t_fed += ids.len();
             } else {
-                tscr.copy_from(t_seq, t_fed)?;
-                rows = tscr.feed_all_mtp(cfg, &ids, t_seq)?;
+                scratch!().copy_from(t_seq, t_fed)?;
+                rows = scratch!().feed_all_mtp(cfg, &ids, t_seq)?;
                 let tscr_fed = t_fed + ids.len();
                 sess.mtp_accept(t_fed, &ids)?;
                 sess.copy_from(tscr_seq, tscr_fed)?;
@@ -3041,7 +3102,18 @@ fn generate_mtp(
         let drafts: Vec<u32>;
         let feed: Vec<u32>;
         let mut rows: Vec<Row>;
-        if fused {
+        if spec_off {
+            // mm31: one plain step on the REAL sequence, through the host's
+            // MERGED decode queue - the whole point of the downgrade. The
+            // host tracks this sequence's position across every verb, so the
+            // switch needs no re-seek, and an empty draft is a shape the
+            // acceptance loop below already handles as a plain step.
+            let row = sess.feed(cfg, &[pending], true)?;
+            drafts = Vec::new();
+            feed = vec![pending];
+            rows = vec![row];
+            t_fed += 1;
+        } else if fused {
             // -- fused round (mm25): observe + draft + verify in ONE host
             //    call under one arbiter grant; rows come back for
             //    [pending, drafts..] exactly as the two-call path built them
@@ -3061,6 +3133,20 @@ fn generate_mtp(
                     }
                     sess.mtp_round(cfg, pending, k, p_min_milli, None, &[pending])?
                 }
+                Err(e) if e.contains(SHARED_MARK) => {
+                    // a second chat started. Land the deferred observe while
+                    // its harvest rows are still valid, then finish this turn
+                    // on the batched path.
+                    if let Some((op, ot)) = obs_now.as_ref() {
+                        let _ = sess.mtp_accept(*op, ot);
+                    }
+                    spec_off = true;
+                    let _ = status(
+                        "another chat is generating - this answer switches to batched decode, \
+                         which shares one pass over the model with it",
+                    );
+                    continue 'outer;
+                }
                 Err(e) => return Err(e),
             };
             drafts = d;
@@ -3071,10 +3157,25 @@ fn generate_mtp(
             rows = r;
             t_fed += feed.len();
         } else {
-            let mut d = sess.mtp_draft(
+            let mut d = match sess.mtp_draft(
                 pending, k, p_min_milli,
                 obs_now.as_ref().map(|(p, t)| (*p, t.as_slice())),
-            )?;
+            ) {
+                Ok(v) => v,
+                Err(e) if e.contains(SHARED_MARK) => {
+                    // mm31, two-call path: same trade as the fused arm
+                    if let Some((op, ot)) = obs_now.as_ref() {
+                        let _ = sess.mtp_accept(*op, ot);
+                    }
+                    spec_off = true;
+                    let _ = status(
+                        "another chat is generating - this answer switches to batched decode, \
+                         which shares one pass over the model with it",
+                    );
+                    continue 'outer;
+                }
+                Err(e) => return Err(e),
+            };
             if d.is_empty() {
                 if let Some((op, ot)) = obs_now {
                     // a folded call returning nothing is ambiguous: the observe
@@ -3096,8 +3197,8 @@ fn generate_mtp(
                 rows = sess.feed_all_mtp(cfg, &feed, t_seq)?;
                 t_fed += feed.len();
             } else {
-                tscr.copy_from(t_seq, t_fed)?;
-                rows = tscr.feed_all_mtp(cfg, &feed, t_seq)?;
+                scratch!().copy_from(t_seq, t_fed)?;
+                rows = scratch!().feed_all_mtp(cfg, &feed, t_seq)?;
                 tscr_fed = t_fed + feed.len();
             }
         }
@@ -3141,7 +3242,12 @@ fn generate_mtp(
         //    rejected proposal), then the target commits them. On fold-aware
         //    hosts the observe rides the NEXT round's draft call instead of
         //    paying its own trip (and arbiter grant) here.
-        if fold {
+        if spec_off {
+            // mm31: plain steps harvest no head rows, so there is nothing to
+            // fold INTO and nothing that would stay in sync if we tried. The
+            // head is left where the last speculative round put it and the
+            // next request opens a fresh rig.
+        } else if fold {
             pending_obs = Some((t_fed0, feed[..acc + 1].to_vec()));
         } else {
             sess.mtp_accept(t_fed0, &feed[..acc + 1])?;
@@ -3332,7 +3438,11 @@ fn generate_lookup(
     emit: &dyn Fn(&str) -> bool,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
-    let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
+    let MtpRig { tscr: mut tscr_opt, t_seq, tscr_seq } = rig;
+    // present exactly when depth == 0 (branch-commit); every use below is on
+    // such a path, so the expect() documents the invariant rather than hoping
+    // present exactly when depth == 0; `scratch!()` documents that invariant
+    macro_rules! scratch { () => { tscr_opt.as_mut().expect("branch-commit without a scratch branch") } }
     // one cheap caps probe decides the round-commit strategy for the whole
     // generation (see the function doc); 0 = branch-commit, unchanged
     let depth = sess.caps().map(|c| c.rewind_depth.max(0)).unwrap_or(0) as usize;
@@ -3445,8 +3555,8 @@ fn generate_lookup(
             rows = sess.feed_all(cfg, &feed)?;
             t_fed += feed.len();
         } else {
-            tscr.copy_from(t_seq, t_fed)?;
-            rows = tscr.feed_all(cfg, &feed)?;
+            scratch!().copy_from(t_seq, t_fed)?;
+            rows = scratch!().feed_all(cfg, &feed)?;
             tscr_fed = t_fed + feed.len();
         }
         // -- verify: accept while the target's own sample agrees
