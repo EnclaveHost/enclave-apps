@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+risc-box/guest/fbdoom/xdoom

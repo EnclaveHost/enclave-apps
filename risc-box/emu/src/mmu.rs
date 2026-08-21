@@ -25,6 +25,7 @@ use memory::Memory;
 use cpu::{PrivilegeMode, Trap, TrapType, Xlen, get_privilege_mode};
 use device::virtio_block_disk::VirtioBlockDisk;
 use device::virtio_input::VirtioInput; // risc-box patch
+use device::virtio_snd::VirtioSnd; // risc-box patch
 use device::virtio_net::VirtioNet; // risc-box patch
 use device::plic::Plic;
 use device::clint::Clint;
@@ -49,6 +50,7 @@ pub struct Mmu {
 	disk: VirtioBlockDisk,
 	net: VirtioNet, // risc-box patch
 	input: VirtioInput, // risc-box patch
+	snd: VirtioSnd, // risc-box patch
 	plic: Plic,
 	clint: Clint,
 	uart: Uart,
@@ -152,6 +154,7 @@ impl Mmu {
 			disk: VirtioBlockDisk::new(),
 			net: VirtioNet::new(), // risc-box patch
 			input: VirtioInput::new(), // risc-box patch
+			snd: VirtioSnd::new(), // risc-box patch
 			plic: Plic::new(),
 			clint: Clint::new(),
 			uart: Uart::new(terminal),
@@ -412,9 +415,12 @@ impl Mmu {
 		self.disk.tick(n, &mut self.memory);
 		self.net.tick(&mut self.memory); // risc-box patch
 		self.input.tick(&mut self.memory); // risc-box patch
+		let mtime = self.clint.mtime(); // risc-box patch
+		self.snd.tick(mtime, &mut self.memory); // risc-box patch
 		self.uart.tick(n);
 		self.plic.tick(n, self.disk.is_interrupting(), self.net.is_interrupting(),
-			self.input.is_interrupting(), self.uart.is_interrupting(), mip);
+			self.input.is_interrupting(), self.snd.is_interrupting(),
+			self.uart.is_interrupting(), mip);
 		self.clock = self.clock.wrapping_add(n);
 	}
 
@@ -743,6 +749,7 @@ impl Mmu {
 				0x10001000..=0x10001FFF => self.disk.load(effective_address),
 				0x10002000..=0x10002FFF => self.net.load(effective_address), // risc-box patch
 				0x10003000..=0x10003FFF => self.input.load(effective_address), // risc-box patch
+				0x10004000..=0x10004FFF => self.snd.load(effective_address), // risc-box patch
 				// risc-box patch: an access to an address no device backs must
 				// never panic the HOST process — a tenant guest could otherwise
 				// crash the whole enclave app. Read as zero, like an open bus.
@@ -833,6 +840,7 @@ impl Mmu {
 				0x10001000..=0x10001FFF => self.disk.store(effective_address, value),
 				0x10002000..=0x10002FFF => self.net.store(effective_address, value), // risc-box patch
 				0x10003000..=0x10003FFF => self.input.store(effective_address, value), // risc-box patch
+				0x10004000..=0x10004FFF => self.snd.store(effective_address, value), // risc-box patch
 				// risc-box patch: drop writes to unbacked addresses (open bus)
 				// rather than panic the host — see load_raw.
 				_ => note_unmapped(effective_address, true)
@@ -922,6 +930,7 @@ impl Mmu {
 				0x10001000..=0x10001FFF => true,
 				0x10002000..=0x10002FFF => true, // risc-box patch
 				0x10003000..=0x10003FFF => true, // risc-box patch
+				0x10004000..=0x10004FFF => true, // risc-box patch
 				_ => false
 			}
 		};
@@ -1196,6 +1205,12 @@ impl Mmu {
 	/// embedding application can inject pointer/keyboard events.
 	pub fn get_mut_input(&mut self) -> &mut VirtioInput {
 		&mut self.input
+	}
+
+	/// risc-box patch: mutable access to the virtio-snd device so the host can
+	/// take played audio out of it.
+	pub fn get_mut_snd(&mut self) -> &mut VirtioSnd {
+		&mut self.snd
 	}
 
 	pub fn get_disk(&self) -> &VirtioBlockDisk {

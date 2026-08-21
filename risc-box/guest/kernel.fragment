@@ -25,3 +25,11 @@ CONFIG_EXT4_FS=y
 CONFIG_INPUT=y
 CONFIG_INPUT_EVDEV=y
 CONFIG_VIRTIO_INPUT=y
+# risc-box: the emulator's virtio-sound device (0x10004000) — the machine's
+# sound card. The riscv defconfig leaves CONFIG_SOUND off entirely, so none of
+# sound/ is reachable without this: no /dev/snd, and ALSA userspace (already in
+# the image as libasound) has nothing to open. SND_VIRTIO selects SND_PCM and
+# SND_JACK itself; SOUND and SND are the gates above it.
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_VIRTIO=y

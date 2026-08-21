@@ -20,6 +20,7 @@ pub struct Plic {
 const VIRTIO_IRQ: u32 = 1;
 const NET_IRQ: u32 = 2; // risc-box patch: virtio-net at 0x10002000
 const INPUT_IRQ: u32 = 3; // risc-box patch: virtio-input at 0x10003000
+const SND_IRQ: u32 = 4; // risc-box patch: virtio-snd at 0x10004000
 const UART_IRQ: u32 = 10;
 
 impl Plic {
@@ -46,7 +47,7 @@ impl Plic {
 	/// * `uart_ip`
 	/// * `mip`
 	// risc-box patch: `n` = instructions retired since the last service.
-	pub fn tick(&mut self, n: u64, virtio_ip: bool, net_ip: bool, input_ip: bool, uart_ip: bool, mip: &mut u64) {
+	pub fn tick(&mut self, n: u64, virtio_ip: bool, net_ip: bool, input_ip: bool, snd_ip: bool, uart_ip: bool, mip: &mut u64) {
 		self.clock = self.clock.wrapping_add(n);
 
 		// risc-box patch: the virtio lines are LEVEL-triggered, and the PLIC
@@ -72,6 +73,9 @@ impl Plic {
 		if input_ip && !self.ip_bit(INPUT_IRQ) {
 			self.set_ip(INPUT_IRQ);
 		}
+		if snd_ip && !self.ip_bit(SND_IRQ) {
+			self.set_ip(SND_IRQ);
+		}
 
 		// Our Uart implements an interrupt as "Edge-triggered" and
 		// uart_ip is true only at the cycle when an interrupt happens
@@ -92,6 +96,7 @@ impl Plic {
 		let virtio_ip = ((self.ips[(VIRTIO_IRQ >> 3) as usize] >> (VIRTIO_IRQ & 7)) & 1) == 1;
 		let net_ip = ((self.ips[(NET_IRQ >> 3) as usize] >> (NET_IRQ & 7)) & 1) == 1; // risc-box patch
 		let input_ip = ((self.ips[(INPUT_IRQ >> 3) as usize] >> (INPUT_IRQ & 7)) & 1) == 1; // risc-box patch
+		let snd_ip = ((self.ips[(SND_IRQ >> 3) as usize] >> (SND_IRQ & 7)) & 1) == 1; // risc-box patch
 		let uart_ip = ((self.ips[(UART_IRQ >> 3) as usize] >> (UART_IRQ & 7)) & 1) == 1;
 
 		// Which should be prioritized, virtio or uart?
@@ -99,21 +104,28 @@ impl Plic {
 		let virtio_priority = self.priorities[VIRTIO_IRQ as usize];
 		let net_priority = self.priorities[NET_IRQ as usize]; // risc-box patch
 		let input_priority = self.priorities[INPUT_IRQ as usize]; // risc-box patch
+		let snd_priority = self.priorities[SND_IRQ as usize]; // risc-box patch
 		let uart_priority = self.priorities[UART_IRQ as usize];
 
 		let virtio_enabled = ((self.enabled >> VIRTIO_IRQ) & 1) == 1;
 		let net_enabled = ((self.enabled >> NET_IRQ) & 1) == 1; // risc-box patch
 		let input_enabled = ((self.enabled >> INPUT_IRQ) & 1) == 1; // risc-box patch
+		let snd_enabled = ((self.enabled >> SND_IRQ) & 1) == 1; // risc-box patch
 		let uart_enabled = ((self.enabled >> UART_IRQ) & 1) == 1;
 
-		let ips = [virtio_ip, net_ip, input_ip, uart_ip];
-		let enables = [virtio_enabled, net_enabled, input_enabled, uart_enabled];
-		let priorities = [virtio_priority, net_priority, input_priority, uart_priority];
-		let irqs = [VIRTIO_IRQ, NET_IRQ, INPUT_IRQ, UART_IRQ];
+		// risc-box patch: every line the PLIC can raise must appear HERE, not
+		// just in the set_ip path above. A device missing from this table has
+		// its pending bit set and never selected, so the guest driver waits on
+		// a completion that is sitting in the used ring — which is exactly how
+		// virtio-snd first presented ("control message timeout", probe -110).
+		let ips = [virtio_ip, net_ip, input_ip, snd_ip, uart_ip];
+		let enables = [virtio_enabled, net_enabled, input_enabled, snd_enabled, uart_enabled];
+		let priorities = [virtio_priority, net_priority, input_priority, snd_priority, uart_priority];
+		let irqs = [VIRTIO_IRQ, NET_IRQ, INPUT_IRQ, SND_IRQ, UART_IRQ];
 
 		let mut irq = 0;
 		let mut priority = 0;
-		for i in 0..4 {
+		for i in 0..irqs.len() {
 			if ips[i] && enables[i] &&
 				priorities[i] > self.threshold &&
 				priorities[i] > priority {

@@ -98,6 +98,16 @@
 		compatible = "virtio,mmio";
 	};
 
+	// risc-box patch: virtio-snd (device id 25) — the machine's sound card,
+	// one PCM output stream. Without this node the driver never probes, and
+	// the guest has no /dev/snd no matter what the kernel was built with.
+	virtio_mmio@10004000 {
+		interrupts = <0x04>;
+		interrupt-parent = <0x03>;
+		reg = <0x00 0x10004000 0x00 0x1000>;
+		compatible = "virtio,mmio";
+	};
+
 	cpus {
 		#address-cells = <0x01>;
 		#size-cells = <0x00>;

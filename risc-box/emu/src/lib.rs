@@ -352,6 +352,20 @@ impl Emulator {
 		self.cpu.get_mut_mmu().get_mut_input().push_event(kind, code, value);
 	}
 
+	/// risc-box patch: take up to `max` bytes of audio the guest has played.
+	/// Interleaved signed 16-bit little-endian; pair it with `audio_format`.
+	pub fn take_audio(&mut self, max: usize) -> Vec<u8> {
+		self.cpu.get_mut_mmu().get_mut_snd().take_pcm(max)
+	}
+
+	/// risc-box patch: (rate, channels, playing, pending bytes, dropped bytes)
+	/// of the virtio-snd stream.
+	pub fn audio_state(&mut self) -> (u32, u8, bool, usize, u64) {
+		let snd = self.cpu.get_mut_mmu().get_mut_snd();
+		let (rate, ch, playing) = snd.format();
+		(rate, ch, playing, snd.pending_bytes(), snd.dropped_bytes())
+	}
+
 	/// risc-box patch: the max value of the absolute coordinate space the
 	/// virtio-input pointer exposes (both axes are 0..=this).
 	pub fn input_abs_max() -> i32 {

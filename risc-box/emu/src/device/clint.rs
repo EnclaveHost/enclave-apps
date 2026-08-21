@@ -48,6 +48,13 @@ impl Clint {
 	/// real second: `sleep 1` takes a second, the kernel takes HZ timer
 	/// interrupts per real second rather than twelve times HZ, and a frame rate
 	/// measured in the guest means what it says.
+	/// risc-box patch: the machine's monotonic 10 MHz tick — the same clock
+	/// the guest reads. Devices that must run at real speed (the sound card's
+	/// playback rate) pace off this rather than off retired instructions.
+	pub fn mtime(&self) -> u64 {
+		self.mtime
+	}
+
 	pub fn set_wall_clock(&mut self, on: bool) {
 		self.wall = match on {
 			true => Some(Wall {

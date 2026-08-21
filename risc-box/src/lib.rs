@@ -947,6 +947,33 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // The browser decodes it with WebCodecs (see index.html). A fresh
         // watcher forces a new encoder (below), so the first frame it sees is a
         // keyframe. `event: codec` carries the WebCodecs codec string + size.
+        // GET /audio — take what the sound card has played since the last
+        // call: {"rate":48000,"channels":2,"playing":true,"dropped":0,
+        // "pcm":"<base64 s16le interleaved>"}. Taking is destructive, so one
+        // consumer at a time; `max` caps the bite (default 64 KiB).
+        //
+        // Deliberately a pull, not an SSE stream: the device paces the guest
+        // by NOT completing its playback buffers until the ring drains (see
+        // emu/src/device/virtio_snd.rs), so whoever pulls sets the clock. A
+        // consumer that stops pulling stalls the guest's writes rather than
+        // running ahead of real time, which is the behaviour a sound card has.
+        ("GET", "/audio") => {
+            if app.phase != Phase::Running || app.emu.is_none() {
+                return server.respond(key, json(409, "Conflict", err("machine is not running")));
+            }
+            let max = form_get(&req.query, "max")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64 * 1024)
+                .min(512 * 1024);
+            let emu = app.emu.as_mut().expect("emu present (checked above)");
+            let (rate, channels, playing, _pending, dropped) = emu.audio_state();
+            let pcm = emu.take_audio(max);
+            let body = format!(
+                "{{\"rate\":{},\"channels\":{},\"playing\":{},\"dropped\":{},\"bytes\":{},\"pcm\":\"{}\"}}",
+                rate, channels, playing, dropped, pcm.len(), b64(&pcm)
+            );
+            server.respond(key, json(200, "OK", body))
+        }
         ("GET", "/video") => {
             // `?codec=h264` selects the Moonlight-native stream (Annex-B over
             // the same base64 SSE), `av1` (the default) stays the browser's
