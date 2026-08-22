@@ -70,8 +70,11 @@ fn build_opl3(out: &PathBuf, arch: &str, features: &str) {
         let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
         cc.args(["-O2", "-DNDEBUG", "-c", src, "-o"]).arg(&obj);
         if arch == "wasm32" {
-            cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/minih264/shim",
-                     "-Ivendor/opl3"]);
+            // opl3.c's own shim first: it supplies the <stdlib.h> the
+            // freestanding wasm build has no sysroot for, and which opl3.c
+            // includes without using.
+            cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/opl3/shim",
+                     "-Ivendor/minih264/shim", "-Ivendor/opl3"]);
             for f in ["atomics", "bulk-memory", "mutable-globals"] {
                 if features.split(',').any(|x| x == f) {
                     cc.arg(format!("-m{f}"));

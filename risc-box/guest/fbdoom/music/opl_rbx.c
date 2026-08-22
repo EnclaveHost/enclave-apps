@@ -46,9 +46,16 @@
 static volatile uint8_t *mmio = NULL;
 static int mmio_tried = 0;
 
-// The mixer's rate. i_sound_rbx.c plays 11025 Hz stereo, and the chip is
-// resampled to whatever this is set to.
-static unsigned int mix_rate = 11025;
+// THE CARD'S rate, which is the only one that matters here.
+//
+// MIDI time is advanced by the frames the sound card is about to play
+// (OPL_RBX_Tick), so this must be the rate those frames are counted at:
+// i_sound_rbx.c's OUT_RATE, 11025. It is NOT snd_samplerate, which fbDOOM
+// leaves at 44100 and i_oplmusic dutifully passes to OPL_SetSampleRate —
+// believing that made the clock advance a quarter as fast as real time and
+// the music played at literally a quarter speed.
+#define CARD_RATE 11025
+static unsigned int mix_rate = CARD_RATE;
 
 static int chip_ready = 0;
 static int paused = 0;
@@ -129,9 +136,13 @@ void OPL_Shutdown(void)
 
 void OPL_SetSampleRate(unsigned int rate)
 {
-    // The host generates at the sound card's rate, which it already knows;
-    // nothing to do but remember it for the MIDI clock below.
-    mix_rate = rate;
+    // DELIBERATELY IGNORED. i_oplmusic passes snd_samplerate (44100 in
+    // fbDOOM), but the clock here counts frames the CARD plays, and the card
+    // runs at CARD_RATE. Honouring this argument ran the music at a quarter
+    // speed. The host synthesises at the card's rate too, so there is one
+    // rate in the system and this is not it.
+    (void) rate;
+    mix_rate = CARD_RATE;
 }
 
 void OPL_WriteRegister(int reg, int value)

@@ -162,7 +162,15 @@ impl VirtioSnd {
 	/// Host → app: take up to `max` bytes of played audio. Interleaved signed
 	/// 16-bit little-endian at `rate_hz` / `channels`.
 	pub fn take_pcm(&mut self, max: usize) -> Vec<u8> {
-		let n = max.min(self.ring.len());
+		// ALWAYS hand back whole frames. The ring holds a byte stream and a
+		// take used to cut it wherever the cap or the contents landed, so a
+		// chunk could begin mid-frame — after which every consumer that
+		// assumes frame alignment has left and right swapped for that chunk.
+		// Heard as a grainy, phasey edge on the sound, and it bit the music
+		// mixer (src/opl.rs) and the Opus encoder alike. Alignment belongs
+		// here, at the source, not in each consumer.
+		let frame = (self.channels.max(1) as usize) * 2;
+		let n = max.min(self.ring.len()) / frame * frame;
 		self.ring.drain(..n).collect()
 	}
 
@@ -651,6 +659,26 @@ fn set_byte64(reg: &mut u64, pos: u64, value: u8) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Every take is a whole number of frames. A chunk that starts mid-frame
+	/// swaps the channels for its whole length in any consumer that assumes
+	/// alignment — the music mixer and the Opus encoder both do.
+	#[test]
+	fn takes_are_frame_aligned() {
+		let mut snd = VirtioSnd::new();
+		snd.channels = 2; // 4 bytes per frame
+		for i in 0..30u8 {
+			snd.ring.push_back(i);
+		}
+		// An odd cap must still cut on a frame boundary.
+		let a = snd.take_pcm(7);
+		assert_eq!(a.len() % 4, 0, "cap 7 gave {} bytes", a.len());
+		assert_eq!(a.len(), 4);
+		// And a cap past the end takes only whole frames of what is there.
+		let b = snd.take_pcm(1000);
+		assert_eq!(b.len() % 4, 0, "drain gave {} bytes", b.len());
+		assert_eq!(b.len(), 24, "26 bytes left -> 6 whole frames");
+	}
 
 	/// The card must play at exactly its byte rate however finely the device
 	/// is serviced. This is the regression that made DOOM chop: the emulator
