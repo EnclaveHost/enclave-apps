@@ -1274,6 +1274,12 @@ impl Tier2 {
 		self.since_form >= self.form_interval
 	}
 
+	/// Consume the formation clock without forming (the AOT dispatcher's
+	/// heal sweep runs on this cadence and nothing else needs the pass).
+	pub fn reset_form_clock(&mut self) {
+		self.since_form = 0;
+	}
+
 	/// Advance the formation clock without recording heat or an edge — the
 	/// sampled-recording path (recording every dispatch costs half the
 	/// machine; a 1-in-8 window of true dispatch chains keeps the shape).

@@ -849,7 +849,7 @@ impl Cpu {
 								if compiled.is_some() {
 									t.covered += r;
 								}
-								let w = (t.total >> 22) & 7 == 0;
+								let w = !t.aot && (t.total >> 22) & 7 == 0;
 								if w && !t.window {
 									// fresh window: never chain an edge
 									// across the unrecorded gap
@@ -895,7 +895,7 @@ impl Cpu {
 								if t.t2.lookup(tag, g).is_some() {
 									t.covered += r;
 								}
-								let w = (t.total >> 22) & 7 == 0;
+								let w = !t.aot && (t.total >> 22) & 7 == 0;
 								if w && !t.window {
 									t.t2.note_break();
 								}
@@ -1239,12 +1239,23 @@ impl Cpu {
 		let Some(mut t) = self.tier2.take() else { return };
 		let gen = self.mmu.code_gen();
 		{
-			let Tier2State { ref mut t2, ref lay, .. } = *t;
+			let Tier2State { ref mut t2, ref lay, aot, .. } = *t;
+			let _ = aot;
 			#[cfg(feature = "aot")]
-			if t.aot {
+			if aot {
 				t2.prune_stale(gen);
 			}
-			t2.maybe_form(lay, gen, |pc| self.tier2_ops_of(pc));
+			// aot mode never records heat/edges, so forming would be a no-op
+			// walk over empty maps; note_retire still advances the clock that
+			// paces the heal sweep. Coverage/profiling mode forms as before.
+			#[cfg(feature = "aot")]
+			let skip_form = aot;
+			#[cfg(not(feature = "aot"))]
+			let skip_form = false;
+			match skip_form {
+				true => t2.reset_form_clock(),
+				false => t2.maybe_form(lay, gen, |pc| self.tier2_ops_of(pc)),
+			}
 		}
 		#[cfg(feature = "aot")]
 		if t.aot {
