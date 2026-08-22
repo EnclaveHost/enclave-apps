@@ -347,6 +347,12 @@ pub struct Cpu {
 	// heads[slot] tags a run of ops[slot*BLOCK_MAX ..][..count].
 	block_heads: Vec<BlockHead>,
 	block_ops: Vec<BlockOp>,
+	// risc-box patch (tier2 feature): the region dispatcher in coverage
+	// mode — forms regions from live heat/edges, "compiles" them into a
+	// recording backend, and the run loop below counts the retired
+	// instructions that would have executed as compiled code.
+	#[cfg(feature = "tier2")]
+	tier2: Option<Box<Tier2State>>,
 	// risc-box patch (blockstats feature): per-slot execution/retired
 	// counters plus a histogram of retired-instructions bucketed by how many
 	// times the retiring block had executed when replaced — the coverage
@@ -514,6 +520,41 @@ fn get_trap_cause(trap: &Trap, xlen: &Xlen) -> u64 {
 	}
 }
 
+#[cfg(feature = "aot")]
+include!(concat!(env!("OUT_DIR"), "/aot_regions.rs"));
+
+/// risc-box patch (aot): the baked-region backend. compile() is a hash
+/// lookup into the tables build.rs generated; the run-loop splice calls the
+/// baked function directly by handle, so call() here is never reached.
+#[cfg(feature = "aot")]
+pub struct AotBackend;
+
+#[cfg(feature = "aot")]
+impl ::jit::CodegenBackend for AotBackend {
+	fn compile(&mut self, module: &[u8], _entry_pcs: &[u64]) -> Option<u32> {
+		let h = ::jit::fnv64(module);
+		AOT_HASHES.iter().position(|&x| x == h).map(|i| i as u32)
+	}
+	fn call(&mut self, _h: u32, _fuel: u64, _entry: u32) -> u64 {
+		0
+	}
+	fn drop_region(&mut self, _h: u32) {}
+}
+
+#[cfg(feature = "tier2")]
+pub struct Tier2State {
+	pub t2: ::jit::Tier2,
+	pub lay: ::jit::Layout,
+	/// retired in blocks whose entry pc had a live compiled region
+	pub covered: u64,
+	/// all retired in block dispatches while tier2 was enabled
+	pub total: u64,
+	/// 1-in-8 service-interval recording window (see note_retire): heat and
+	/// edges are sampled, the formation clock and coverage counters are not
+	pub window: bool,
+	pub passes: u64,
+}
+
 impl Cpu {
 	/// Creates a new `Cpu`.
 	///
@@ -536,6 +577,8 @@ impl Cpu {
 			decode_cache: DecodeCache::new(),
 			// risc-box patch: block cache starts empty (tag 0 = invalid)
 			block_heads: vec![BlockHead::EMPTY; BLOCK_SLOTS],
+			#[cfg(feature = "tier2")]
+			tier2: None,
 			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
 			#[cfg(feature = "blockstats")]
 			stat_execs: vec![0; BLOCK_SLOTS],
@@ -672,12 +715,59 @@ impl Cpu {
 							Err(_) => false
 						};
 					if hit {
+						#[cfg(feature = "tier2")]
+						let compiled = {
+							let g = self.mmu.code_gen();
+							match self.tier2.as_mut() {
+								Some(t) => t.t2.lookup(h.tag, g),
+								None => None,
+							}
+						};
+						#[cfg(feature = "aot")]
+						if let Some((hh, idx)) = compiled {
+							let g = self.mmu.code_gen();
+							let fuel = burst - done;
+							let ran = AOT_FNS[hh as usize](self, fuel, idx, g);
+							if ran > 0 {
+								if let Some(t) = self.tier2.as_mut() {
+									t.total += ran;
+									t.covered += ran;
+									t.t2.note_break();
+								}
+								done += ran;
+								if self.check_interrupt {
+									self.check_interrupt = false;
+									self.handle_interrupt(self.pc);
+								}
+								continue;
+							}
+						}
 						let r = self.exec_block(slot);
 						#[cfg(feature = "blockstats")]
 						{
 							self.stat_execs[slot] += 1;
 							self.stat_retired[slot] += r;
 							self.stat_note_block(h.tag, r);
+						}
+						#[cfg(feature = "tier2")]
+						{
+							if let Some(t) = self.tier2.as_mut() {
+								t.total += r;
+								if compiled.is_some() {
+									t.covered += r;
+								}
+								let w = (t.total >> 22) & 7 == 0;
+								if w && !t.window {
+									// fresh window: never chain an edge
+									// across the unrecorded gap
+									t.t2.note_break();
+								}
+								t.window = w;
+								match w {
+									true => t.t2.note_block(h.tag, r),
+									false => t.t2.note_retire(r),
+								}
+							}
 						}
 						done += r;
 					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
@@ -688,6 +778,26 @@ impl Cpu {
 							self.stat_retired[slot] += r;
 							let tag = self.block_heads[slot].tag;
 							self.stat_note_block(tag, r);
+						}
+						#[cfg(feature = "tier2")]
+						{
+							let g = self.mmu.code_gen();
+							let tag = self.block_heads[slot].tag;
+							if let Some(t) = self.tier2.as_mut() {
+								t.total += r;
+								if t.t2.lookup(tag, g).is_some() {
+									t.covered += r;
+								}
+								let w = (t.total >> 22) & 7 == 0;
+								if w && !t.window {
+									t.t2.note_break();
+								}
+								t.window = w;
+								match w {
+									true => t.t2.note_block(tag, r),
+									false => t.t2.note_retire(r),
+								}
+							}
 						}
 						done += r;
 					} else {
@@ -700,6 +810,11 @@ impl Cpu {
 						{
 							self.stat_singlestep += 1;
 							self.stat_prev = 0; // region chain broken
+						}
+						#[cfg(feature = "tier2")]
+						if let Some(t) = self.tier2.as_mut() {
+							t.total += 1;
+							t.t2.note_break();
 						}
 						done += 1;
 					}
@@ -741,6 +856,10 @@ impl Cpu {
 				self.mmu.tick(served, &mut self.csr[CSR_MIP_ADDRESS as usize]);
 				self.check_interrupt = false;
 				self.handle_interrupt(self.pc);
+				#[cfg(feature = "tier2")]
+				if self.tier2.as_ref().map_or(false, |t| t.t2.due()) {
+					self.tier2_form_pass();
+				}
 			}
 		}
 	}
@@ -764,6 +883,112 @@ impl Cpu {
 			count: ops.len() as u32,
 			code_gen: self.mmu.code_gen()
 		};
+	}
+
+	/// risc-box patch (tier2): switch the dispatcher on, dumping every
+	/// formed region to `dump` when given (the AOT bake pipeline's input).
+	#[cfg(feature = "tier2")]
+	pub fn tier2_enable(&mut self, dump: Option<&std::path::Path>) {
+		let mut t2 = ::jit::Tier2::new(Box::new(::jit::RecordBackend::new(dump)));
+		Self::tier2_tune(&mut t2);
+		self.tier2 = Some(Box::new(Tier2State {
+			t2,
+			lay: Self::tier2_layout(),
+			covered: 0,
+			total: 0,
+			window: false,
+			passes: 0,
+		}));
+	}
+
+	/// One tuning for the profiling run AND the shipped dispatcher — the
+	/// baked-region hash match depends on both forming the same regions
+	/// from the same knobs and the same sampling.
+	#[cfg(feature = "tier2")]
+	fn tier2_tune(t2: &mut ::jit::Tier2) {
+		t2.greedy = true;
+		t2.max_blocks = 96;
+		// heat is sampled 1-in-8 service intervals, so thresholds are an
+		// eighth of their full-rate meaning: 20k sampled ~ 160k true
+		t2.min_heat = 20_000;
+	}
+
+	/// risc-box patch (aot): dispatcher over the BAKED region tables. A
+	/// formation that hashes to something unbaked just stays interpreted —
+	/// and is not blacklisted, so a later, differently-shaped formation of
+	/// the same code still gets its chance to match.
+	#[cfg(feature = "aot")]
+	pub fn aot_enable(&mut self) {
+		let mut t2 = ::jit::Tier2::new(Box::new(AotBackend));
+		Self::tier2_tune(&mut t2);
+		t2.blacklist_on_fail = false;
+		self.tier2 = Some(Box::new(Tier2State {
+			t2,
+			lay: Self::tier2_layout(),
+			covered: 0,
+			total: 0,
+			window: false,
+			passes: 0,
+		}));
+	}
+
+	#[cfg(feature = "aot")]
+	pub fn aot_baked(&self) -> usize {
+		AOT_FNS.len()
+	}
+
+	/// The production Layout the runtime dispatcher hands emit_region. For
+	/// coverage/bake runs only the DETERMINISM matters (the module hash is
+	/// the match key), so the values just have to be fixed and plausible.
+	#[cfg(feature = "tier2")]
+	fn tier2_layout() -> ::jit::Layout {
+		::jit::Layout {
+			x_base: 0,
+			f_base: 512,
+			tlb: None,
+			pc_addr: 256,
+			gen_addr: 264,
+			baked_gen: 0,
+			dram_base: 4096,
+			guest_dram_base: 0x8000_0000,
+			dram_len: 1 << 31,
+		}
+	}
+
+	/// (covered, total, compiled entry pcs, blacklisted pcs)
+	#[cfg(feature = "tier2")]
+	pub fn tier2_stats(&self) -> (u64, u64, usize, usize) {
+		match self.tier2.as_ref() {
+			Some(t) => {
+				let (c, b) = t.t2.sizes();
+				(t.covered, t.total, c, b)
+			}
+			None => (0, 0, 0, 0),
+		}
+	}
+
+	#[cfg(feature = "tier2")]
+	fn tier2_form_pass(&mut self) {
+		let Some(mut t) = self.tier2.take() else { return };
+		let gen = self.mmu.code_gen();
+		{
+			let Tier2State { ref mut t2, ref lay, .. } = *t;
+			t2.maybe_form(lay, gen, |pc| self.tier2_ops_of(pc));
+		}
+		self.tier2 = Some(t);
+	}
+
+	/// A block's cached ops, exactly as the interpreter runs them — the
+	/// region emitter's source of truth. None when the cache has moved on.
+	#[cfg(feature = "tier2")]
+	fn tier2_ops_of(&self, pc: u64) -> Option<(u64, Vec<BlockOp>)> {
+		let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+		let h = self.block_heads[slot];
+		if h.tag != pc || h.count == 0 {
+			return None;
+		}
+		let base = slot * BLOCK_MAX;
+		Some((pc, self.block_ops[base..base + h.count as usize].to_vec()))
 	}
 
 	pub(crate) fn exec_block(&mut self, slot: usize) -> u64 {

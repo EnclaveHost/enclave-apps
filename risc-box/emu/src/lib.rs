@@ -469,6 +469,27 @@ impl Emulator {
 		self.cpu.get_mmu().get_gpu().cursor_state()
 	}
 
+	/// risc-box patch (tier2 feature): coverage-mode region dispatcher.
+	#[cfg(feature = "tier2")]
+	pub fn tier2_enable(&mut self, dump: Option<&std::path::Path>) {
+		self.cpu.tier2_enable(dump);
+	}
+
+	#[cfg(feature = "tier2")]
+	pub fn tier2_stats(&self) -> (u64, u64, usize, usize) {
+		self.cpu.tier2_stats()
+	}
+
+	#[cfg(feature = "aot")]
+	pub fn aot_enable(&mut self) {
+		self.cpu.aot_enable();
+	}
+
+	#[cfg(feature = "aot")]
+	pub fn aot_baked(&self) -> usize {
+		self.cpu.aot_baked()
+	}
+
 	pub fn gpu_flushes(&self) -> u64 {
 		self.cpu.get_mmu().get_gpu().flushes()
 	}

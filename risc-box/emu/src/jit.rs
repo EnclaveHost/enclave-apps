@@ -29,6 +29,7 @@ use cpu::*;
 /// Where the machine's state lives inside the imported linear memory.
 /// In production these are the app's own object addresses; in tests they
 /// are a synthetic layout the harness serializes into.
+#[derive(Clone)]
 pub struct Layout {
 	pub x_base: u32,          // x[32] as i64
 	pub f_base: u32,          // f[32] as f64 (raw 8-byte cells)
@@ -48,6 +49,7 @@ pub struct Layout {
 /// Where the software TLB's READ and WRITE ways live, mirroring
 /// Mmu::translate_address's hit path: set = (vaddr >> 12) & (sets-1);
 /// hit iff tags[set] == (vaddr & !0xfff) | 1 && metas[set] == *meta_cache.
+#[derive(Clone)]
 pub struct TlbLayout {
 	pub sets: u32, // power of two (the emulator uses 512)
 	pub read_tags: u32,
@@ -954,6 +956,71 @@ fn assemble(body_expr: Vec<u8>) -> Vec<u8> {
 /// `max_blocks` by dropping its coldest members; singleton nodes without a
 /// self-loop are not regions (a lone block is the single-block emitter's
 /// job).
+/// Greedy trace-growing formation: seed at the hottest unclaimed block and
+/// grow along the heaviest observed edges — across calls and returns, not
+/// just function-local branches. Loop SCCs come out as loops anyway (their
+/// edges dominate), and call-shaped hot paths (renderer -> helpers) become
+/// one region instead of stopping at every JAL. A function shared by many
+/// callers still compiles: the hot caller's return edge is in-region, the
+/// cold callers' exits fall back to the interpreter.
+pub fn form_regions_greedy(
+	nodes: &[(u64, u64)],
+	edges: &[(u64, u64, u64)],
+	max_blocks: usize,
+	min_heat: u64,
+) -> Vec<Vec<u64>> {
+	use std::collections::{HashMap, HashSet};
+	let heat: HashMap<u64, u64> = nodes.iter().cloned().collect();
+	let mut adj: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+	for &(a, b, w) in edges {
+		adj.entry(a).or_default().push((b, w));
+		adj.entry(b).or_default().push((a, w));
+	}
+	let mut order: Vec<(u64, u64)> = nodes.to_vec();
+	order.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+	let mut claimed: HashSet<u64> = HashSet::new();
+	let mut out = Vec::new();
+	for &(seed, h) in &order {
+		if h < min_heat || claimed.contains(&seed) {
+			continue;
+		}
+		let mut members: Vec<u64> = vec![seed];
+		let mut inset: HashSet<u64> = members.iter().cloned().collect();
+		while members.len() < max_blocks {
+			let mut best: Option<(u64, u64)> = None; // (weight, pc)
+			for m in &members {
+				if let Some(nb) = adj.get(m) {
+					for &(pc, w) in nb {
+						if !inset.contains(&pc)
+							&& !claimed.contains(&pc)
+							&& heat.contains_key(&pc)
+							&& best.map(|(bw, _)| w > bw).unwrap_or(true)
+						{
+							best = Some((w, pc));
+						}
+					}
+				}
+			}
+			match best {
+				Some((_, pc)) => {
+					members.push(pc);
+					inset.insert(pc);
+				}
+				None => break,
+			}
+		}
+		if members.len() < 2 && !edges.iter().any(|&(a, b, _)| a == seed && b == seed) {
+			continue; // a lone block with no self-loop is not a region
+		}
+		members.sort();
+		for m in &members {
+			claimed.insert(*m);
+		}
+		out.push(members);
+	}
+	out
+}
+
 pub fn form_regions(
 	nodes: &[(u64, u64)],
 	edges: &[(u64, u64)],
@@ -1124,6 +1191,18 @@ pub trait CodegenBackend {
 	/// or None when compilation is unavailable/failed (the dispatcher then
 	/// blacklists the region and keeps interpreting).
 	fn compile(&mut self, module: &[u8], entry_pcs: &[u64]) -> Option<u32>;
+	/// Same, but with the source blocks in hand. The dispatcher calls THIS;
+	/// backends that only need the module bytes inherit the default. A
+	/// recording backend (AOT bake pipeline) overrides it to dump the ops,
+	/// which the module bytes alone cannot give back.
+	fn compile_src(
+		&mut self,
+		_blocks: &[(u64, Vec<::cpu::BlockOp>)],
+		module: &[u8],
+		entry_pcs: &[u64],
+	) -> Option<u32> {
+		self.compile(module, entry_pcs)
+	}
 	/// Execute: fuel-bounded, entry by region block index.
 	fn call(&mut self, handle: u32, fuel: u64, entry: u32) -> u64;
 	fn drop_region(&mut self, handle: u32);
@@ -1146,6 +1225,15 @@ pub struct Tier2 {
 	pub form_interval: u64,
 	pub max_blocks: usize,
 	pub min_heat: u64,
+	/// Greedy trace-growing formation (crosses calls) instead of
+	/// function-local loop SCCs. The AOT bake uses this: 43% of the DOOM
+	/// desktop's dynamic mass is call-shaped and invisible to loop SCCs.
+	pub greedy: bool,
+	/// When compilation fails, poison the pcs (true: the verb world, where a
+	/// failed compile stays failed) or leave them for a later formation pass
+	/// (false: the AOT-bake world, where a differently-shaped next formation
+	/// may hash-match a baked region).
+	pub blacklist_on_fail: bool,
 }
 
 impl Tier2 {
@@ -1161,6 +1249,8 @@ impl Tier2 {
 			form_interval: 50_000_000,
 			max_blocks: 64,
 			min_heat: 1_000_000,
+			greedy: false,
+			blacklist_on_fail: true,
 		}
 	}
 
@@ -1179,6 +1269,18 @@ impl Tier2 {
 		self.prev_pc = 0;
 	}
 
+	/// Enough has retired since the last formation pass?
+	pub fn due(&self) -> bool {
+		self.since_form >= self.form_interval
+	}
+
+	/// Advance the formation clock without recording heat or an edge — the
+	/// sampled-recording path (recording every dispatch costs half the
+	/// machine; a 1-in-8 window of true dispatch chains keeps the shape).
+	pub fn note_retire(&mut self, retired: u64) {
+		self.since_form += retired;
+	}
+
 	/// A compiled region for this pc, valid against the current write-snoop
 	/// generation? Returns (handle, entry index).
 	pub fn lookup(&mut self, pc: u64, current_gen: u32) -> Option<(u32, u32)> {
@@ -1194,6 +1296,12 @@ impl Tier2 {
 		}
 	}
 
+	/// How many entry pcs currently map to compiled regions, and how many
+	/// are blacklisted — the coverage report's denominator context.
+	pub fn sizes(&self) -> (usize, usize) {
+		(self.compiled.len(), self.blacklist.len())
+	}
+
 	/// Formation pass, driven by the caller once enough has retired. The
 	/// caller supplies a way to read a block's ops (from its cache) so the
 	/// region emitter sees exactly what the interpreter runs.
@@ -1206,8 +1314,18 @@ impl Tier2 {
 		}
 		self.since_form = 0;
 		let nodes: Vec<(u64, u64)> = self.heat.iter().map(|(&pc, &h)| (pc, h)).collect();
-		let edges: Vec<(u64, u64)> = self.edges.keys().cloned().collect();
-		for region_pcs in form_regions(&nodes, &edges, self.max_blocks, self.min_heat) {
+		let regions = match self.greedy {
+			true => {
+				let edges: Vec<(u64, u64, u64)> =
+					self.edges.iter().map(|(&(a, b), &w)| (a, b, w)).collect();
+				form_regions_greedy(&nodes, &edges, self.max_blocks, self.min_heat)
+			}
+			false => {
+				let edges: Vec<(u64, u64)> = self.edges.keys().cloned().collect();
+				form_regions(&nodes, &edges, self.max_blocks, self.min_heat)
+			}
+		};
+		for region_pcs in regions {
 			if region_pcs.iter().any(|pc| {
 				self.compiled.contains_key(pc) || self.blacklist.contains(pc)
 			}) {
@@ -1225,21 +1343,30 @@ impl Tier2 {
 				}
 			}
 			if !ok {
-				for pc in region_pcs {
-					self.blacklist.insert(pc);
+				// usually a direct-mapped cache slot that has moved on;
+				// the code is still hot, so let a later pass retry —
+				// unless failures are permanent in this backend's world
+				if self.blacklist_on_fail {
+					for pc in region_pcs {
+						self.blacklist.insert(pc);
+					}
 				}
 				continue;
 			}
 			let entry_pcs: Vec<u64> = blocks.iter().map(|&(pc, _)| pc).collect();
-			match emit_region(&blocks, lay).and_then(|m| self.backend.compile(&m, &entry_pcs)) {
+			match emit_region(&blocks, lay)
+				.and_then(|m| self.backend.compile_src(&blocks, &m, &entry_pcs))
+			{
 				Some(handle) => {
 					for (idx, &pc) in entry_pcs.iter().enumerate() {
 						self.compiled.insert(pc, (handle, idx as u32, current_gen));
 					}
 				}
 				None => {
-					for pc in region_pcs {
-						self.blacklist.insert(pc);
+					if self.blacklist_on_fail {
+						for pc in region_pcs {
+							self.blacklist.insert(pc);
+						}
 					}
 				}
 			}
@@ -1247,6 +1374,72 @@ impl Tier2 {
 		// heat decays fully between passes; edges persist (bounded)
 		self.heat.clear();
 	}
+}
+
+/// The AOT bake pipeline's profiling backend: "compiles" every region the
+/// dispatcher forms by appending it to a dump file — entry pcs, per-block
+/// ops, and the fnv-1a hash of the emitted module (the key the runtime AOT
+/// backend will match on). call() is never reached in coverage mode: the
+/// run-loop splice counts what WOULD have run compiled and interprets it.
+pub struct RecordBackend {
+	out: Option<std::io::BufWriter<std::fs::File>>,
+	next: u32,
+}
+
+impl RecordBackend {
+	pub fn new(dump: Option<&std::path::Path>) -> RecordBackend {
+		RecordBackend {
+			out: dump.and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new),
+			next: 0,
+		}
+	}
+}
+
+pub fn fnv64(bytes: &[u8]) -> u64 {
+	let mut h: u64 = 0xcbf29ce484222325;
+	for &b in bytes {
+		h ^= b as u64;
+		h = h.wrapping_mul(0x100000001b3);
+	}
+	h
+}
+
+impl CodegenBackend for RecordBackend {
+	fn compile(&mut self, _module: &[u8], _entry_pcs: &[u64]) -> Option<u32> {
+		self.next += 1;
+		Some(self.next - 1)
+	}
+
+	fn compile_src(
+		&mut self,
+		blocks: &[(u64, Vec<::cpu::BlockOp>)],
+		module: &[u8],
+		entry_pcs: &[u64],
+	) -> Option<u32> {
+		if let Some(w) = self.out.as_mut() {
+			use std::io::Write;
+			let _ = writeln!(w, "REGION {:016x} {}", fnv64(module), blocks.len());
+			for &(pc, ref ops) in blocks {
+				let _ = writeln!(w, "B {:x} {}", pc, ops.len());
+				for op in ops {
+					let _ = writeln!(
+						w,
+						"O {} {} {} {} {} {} {} {}",
+						op.imm, op.word, op.data, op.kind, op.rd, op.rs1, op.rs2, op.len
+					);
+				}
+			}
+			let _ = w.flush();
+		}
+		let _ = entry_pcs;
+		self.compile(module, entry_pcs)
+	}
+
+	fn call(&mut self, _h: u32, _fuel: u64, _entry: u32) -> u64 {
+		0
+	}
+
+	fn drop_region(&mut self, _h: u32) {}
 }
 
 #[cfg(test)]

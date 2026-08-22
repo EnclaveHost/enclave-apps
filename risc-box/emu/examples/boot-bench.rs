@@ -81,6 +81,8 @@ fn main() {
     let mut until: Option<String> = None;
     let mut echo = false;
     let mut fps_frame_bytes: Option<u64> = None;
+    let mut tier2_dump: Option<String> = None;
+    let mut aot = false;
     let mut realtime = false;
     let mut fb_size: Option<(u32, u32)> = None;
     // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
@@ -134,6 +136,13 @@ fn main() {
                 fps_frame_bytes = Some(
                     w.parse::<u64>().expect("width") * h.parse::<u64>().expect("height") * 4,
                 );
+            }
+            "--aot" => aot = true,
+            "--tier2" => {
+                // enable the coverage-mode region dispatcher; optional
+                // DUMPFILE records every formed region for the AOT bake.
+                i += 1;
+                tier2_dump = Some(args.get(i).cloned().unwrap_or_default());
             }
             "--until" => {
                 i += 1;
@@ -280,6 +289,32 @@ fn main() {
     emu.set_wall_clock(realtime);
     emu.setup_program(kernel);
     emu.setup_filesystem(fs);
+    #[cfg(feature = "aot")]
+    if aot {
+        emu.aot_enable();
+        eprintln!("aot dispatcher on: {} baked regions", emu.aot_baked());
+    }
+    #[cfg(not(feature = "aot"))]
+    if aot {
+        eprintln!("--aot needs a build with --features aot");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "tier2")]
+    if let Some(d) = tier2_dump.as_ref() {
+        emu.tier2_enable(match d.is_empty() {
+            true => None,
+            false => Some(std::path::Path::new(d)),
+        });
+        eprintln!("tier2 coverage on{}", match d.is_empty() {
+            true => String::new(),
+            false => format!(", dumping regions to {}", d),
+        });
+    }
+    #[cfg(not(feature = "tier2"))]
+    if tier2_dump.is_some() {
+        eprintln!("--tier2 needs a build with --features tier2");
+        std::process::exit(2);
+    }
 
     // Batch size matches the app's TICK_BATCH so the loop overhead outside
     // tick() is the same shape as production.
@@ -625,6 +660,17 @@ fn main() {
                     dfbb as f64 / per as f64 / window.elapsed().as_secs_f64()
                 ),
                 None => String::new(),
+            };
+            #[cfg(feature = "tier2")]
+            let fps = {
+                let (cov, tot, regions, black) = emu.tier2_stats();
+                format!(
+                    "{} t2 {:.1}% ({} entries, {} black)",
+                    fps,
+                    100.0 * cov as f64 / tot.max(1) as f64,
+                    regions,
+                    black
+                )
             };
             let mut px = [0u8; 4];
             emu.read_physical_range(0x87e0_0000, &mut px);

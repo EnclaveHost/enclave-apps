@@ -25,6 +25,16 @@ fnv = "1.0.7"
 blockstats = []
 # the PLATFORM-JIT.md translator (src/jit.rs); equivalence tests in cpu.rs
 jit = []
+# tier-2 dispatch wired into the run loop in COVERAGE mode: regions form and
+# "compile" into a recording backend, and the loop counts how much of the
+# retired stream would have flowed through compiled regions. The go/no-go
+# number for baking AOT regions into the app.
+tier2 = ["jit"]
+# tier-2 with BAKED native regions: build.rs turns aot/regions.dump (from a
+# --tier2 profiling run) into native functions keyed by region-module hash;
+# the dispatcher runs them in place of interpreting. All app-side — no
+# platform verb involved.
+aot = ["tier2"]
 
 # examples/jit-proto.rs only: executes runtime-emitted wasm natively to
 # measure the translator half of PLATFORM-JIT.md before the platform verb
