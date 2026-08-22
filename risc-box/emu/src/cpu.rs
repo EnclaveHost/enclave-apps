@@ -353,6 +353,14 @@ pub struct Cpu {
 	// instructions that would have executed as compiled code.
 	#[cfg(feature = "tier2")]
 	tier2: Option<Box<Tier2State>>,
+	// risc-box patch (aot): hash-free dispatch mirrors. aot_slots is
+	// direct-mapped by the SAME index as block_heads (one extra tag
+	// compare per dispatch); aot_vstate is indexed by baked handle.
+	// Synced from Tier2's maps once per formation pass.
+	#[cfg(feature = "aot")]
+	aot_slots: Vec<AotSlot>,
+	#[cfg(feature = "aot")]
+	aot_vstate: Vec<AotVerify>,
 	// risc-box patch (blockstats feature): per-slot execution/retired
 	// counters plus a histogram of retired-instructions bucketed by how many
 	// times the retiring block had executed when replaced — the coverage
@@ -531,14 +539,61 @@ pub struct AotBackend;
 
 #[cfg(feature = "aot")]
 impl ::jit::CodegenBackend for AotBackend {
-	fn compile(&mut self, module: &[u8], _entry_pcs: &[u64]) -> Option<u32> {
-		let h = ::jit::fnv64(module);
+	fn compile(&mut self, _module: &[u8], _entry_pcs: &[u64]) -> Option<u32> {
+		None // keying happens in compile_src, on the blocks
+	}
+	fn compile_src(
+		&mut self,
+		blocks: &[(u64, Vec<BlockOp>)],
+		_module: &[u8],
+		_entry_pcs: &[u64],
+	) -> Option<u32> {
+		let h = ::jit::hash_blocks(blocks);
 		AOT_HASHES.iter().position(|&x| x == h).map(|i| i as u32)
 	}
 	fn call(&mut self, _h: u32, _fuel: u64, _entry: u32) -> u64 {
 		0
 	}
 	fn drop_region(&mut self, _h: u32) {}
+}
+
+#[cfg(feature = "aot")]
+#[derive(Clone, Copy)]
+pub struct AotSlot {
+	tag: u64, // entry pc (0 = empty)
+	handle: u32,
+	entry: u32,
+	gen: u32, // code generation at install
+}
+
+#[cfg(feature = "aot")]
+impl AotSlot {
+	const EMPTY: AotSlot = AotSlot { tag: 0, handle: 0, entry: 0, gen: 0 };
+}
+
+#[cfg(feature = "aot")]
+#[derive(Clone)]
+pub struct AotVerify {
+	/// code generation the full content check last passed under (0 = never)
+	content_gen: u32,
+	/// address-space generation the mapping check last passed under
+	tlb_gen: u32,
+	/// the phys page of each member block, in AOT_MEMBERS order, as content-verified
+	phys: Vec<u64>,
+	/// every member vpc is kernel-half: the mapping is global, skip tlb_gen re-probes
+	kernel_only: bool,
+	ok: bool,
+}
+
+#[cfg(feature = "aot")]
+impl AotVerify {
+	const NEVER: AotVerify = AotVerify {
+		content_gen: 0,
+		tlb_gen: 0,
+		phys: Vec::new(),
+		kernel_only: false,
+		ok: false,
+	};
 }
 
 #[cfg(feature = "tier2")]
@@ -553,6 +608,13 @@ pub struct Tier2State {
 	/// edges are sampled, the formation clock and coverage counters are not
 	pub window: bool,
 	pub passes: u64,
+	/// This dispatcher's handles index the BAKED tables (aot_enable set it
+	/// up). The run loop must never treat a recording backend's handles as
+	/// baked-function indexes — same u32, entirely different meaning.
+	pub aot: bool,
+	/// Sampled heat of UNCOVERED dispatches — where the mass a bake is not
+	/// reaching actually lives (read via tier2_miss_top at run end).
+	pub miss: std::collections::HashMap<u64, u64>,
 }
 
 impl Cpu {
@@ -579,6 +641,10 @@ impl Cpu {
 			block_heads: vec![BlockHead::EMPTY; BLOCK_SLOTS],
 			#[cfg(feature = "tier2")]
 			tier2: None,
+			#[cfg(feature = "aot")]
+			aot_slots: vec![AotSlot::EMPTY; BLOCK_SLOTS],
+			#[cfg(feature = "aot")]
+			aot_vstate: Vec::new(),
 			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
 			#[cfg(feature = "blockstats")]
 			stat_execs: vec![0; BLOCK_SLOTS],
@@ -715,7 +781,10 @@ impl Cpu {
 							Err(_) => false
 						};
 					if hit {
-						#[cfg(feature = "tier2")]
+						// Coverage-only builds probe Tier2's map per
+						// dispatch; the AOT build's hot path must not touch
+						// a SipHash HashMap (65% of the first AOT profile).
+						#[cfg(all(feature = "tier2", not(feature = "aot")))]
 						let compiled = {
 							let g = self.mmu.code_gen();
 							match self.tier2.as_mut() {
@@ -724,15 +793,29 @@ impl Cpu {
 							}
 						};
 						#[cfg(feature = "aot")]
-						if let Some((hh, idx)) = compiled {
+						let compiled: Option<(u32, u32)> = {
+							let sl = self.aot_slots[slot];
+							match sl.tag == h.tag && sl.gen == self.mmu.code_gen() {
+								true => Some((sl.handle, sl.entry)),
+								false => None,
+							}
+						};
+						#[cfg(feature = "aot")]
+						if let Some((hh, idx)) = compiled.filter(|&(hh, _)| self.aot_verified(hh)) {
 							let g = self.mmu.code_gen();
-							let fuel = burst - done;
+							// Regions overshoot the service boundary the same
+							// way blocks do (device clocks advance by TRUE
+							// retired count); 256 keeps interrupt-delivery
+							// jitter close to the block-sized overshoot while
+							// letting a hot loop actually stay compiled.
+							let fuel = 256u64;
 							let ran = AOT_FNS[hh as usize](self, fuel, idx, g);
 							if ran > 0 {
 								if let Some(t) = self.tier2.as_mut() {
 									t.total += ran;
 									t.covered += ran;
 									t.t2.note_break();
+									t.t2.note_retire(ran);
 								}
 								done += ran;
 								if self.check_interrupt {
@@ -763,6 +846,9 @@ impl Cpu {
 									t.t2.note_break();
 								}
 								t.window = w;
+								if w && compiled.is_none() && t.miss.len() < 1 << 20 {
+									*t.miss.entry(h.tag).or_insert(0) += r;
+								}
 								match w {
 									true => t.t2.note_block(h.tag, r),
 									false => t.t2.note_retire(r),
@@ -891,6 +977,9 @@ impl Cpu {
 	pub fn tier2_enable(&mut self, dump: Option<&std::path::Path>) {
 		let mut t2 = ::jit::Tier2::new(Box::new(::jit::RecordBackend::new(dump)));
 		Self::tier2_tune(&mut t2);
+		// the bake pipeline wants maximal discovery: a formation that fails
+		// today (an evicted cache slot, an emit gap) may succeed next pass
+		t2.blacklist_on_fail = false;
 		self.tier2 = Some(Box::new(Tier2State {
 			t2,
 			lay: Self::tier2_layout(),
@@ -898,6 +987,8 @@ impl Cpu {
 			total: 0,
 			window: false,
 			passes: 0,
+			aot: false,
+			miss: std::collections::HashMap::new(),
 		}));
 	}
 
@@ -929,12 +1020,124 @@ impl Cpu {
 			total: 0,
 			window: false,
 			passes: 0,
+			aot: true,
+			miss: std::collections::HashMap::new(),
 		}));
+		self.aot_slots = vec![AotSlot::EMPTY; BLOCK_SLOTS];
+		self.aot_vstate = vec![AotVerify::NEVER; AOT_FNS.len()];
 	}
 
 	#[cfg(feature = "aot")]
 	pub fn aot_baked(&self) -> usize {
 		AOT_FNS.len()
+	}
+
+	/// May baked region `handle` run right now?
+	///
+	/// Two-level cache, because verification cadence was the first AOT
+	/// run's whole cost (42 of ~195 MIPS): a full content compare on every
+	/// context switch is 200x the work of re-probing the mappings.
+	/// - content (the dumped (word,len) streams really are in memory) is
+	///   proven once per code_gen; the check exec-marks every member page,
+	///   so any later write bumps code_gen and re-proves.
+	/// - mapping (member vpcs still hit those phys pages) is re-probed once
+	///   per tlb_gen — and not at all for kernel-half regions, whose
+	///   mapping is global across every address space.
+	#[cfg(feature = "aot")]
+	#[inline(always)]
+	fn aot_verified(&mut self, handle: u32) -> bool {
+		let tg = self.mmu.tlb_gen();
+		let cg = self.mmu.code_gen();
+		let v = &self.aot_vstate[handle as usize];
+		if v.content_gen == cg && (v.kernel_only || v.tlb_gen == tg) {
+			return v.ok;
+		}
+		self.aot_verify_slow(handle, tg, cg)
+	}
+
+	#[cfg(feature = "aot")]
+	fn aot_verify_slow(&mut self, handle: u32, tg: u32, cg: u32) -> bool {
+		let need_content = self.aot_vstate[handle as usize].content_gen != cg;
+		let ok = match need_content {
+			true => self.aot_verify_content(handle),
+			false => {
+				let ok = self.aot_verify_mapping(handle);
+				let v = &mut self.aot_vstate[handle as usize];
+				v.tlb_gen = tg;
+				v.ok = ok;
+				ok
+			}
+		};
+		ok
+	}
+
+	/// Full content check: every member's pc translates and the code there
+	/// decodes to exactly the dumped (word, len) stream — the same
+	/// uncompress build_block applies, so "verified" means the baked ops
+	/// are what the interpreter would decode from this memory. Marks every
+	/// member page executable so the SMC snoop guards it from now on, and
+	/// records the phys pages for the cheap per-tlb_gen mapping re-probe.
+	#[cfg(feature = "aot")]
+	fn aot_verify_content(&mut self, handle: u32) -> bool {
+		let cg = self.mmu.code_gen();
+		let members = AOT_MEMBERS[handle as usize];
+		let mut phys = Vec::with_capacity(members.len());
+		let mut kernel_only = true;
+		let mut ok = true;
+		'members: for &(start, words) in members {
+			if start < 0xffff_ffc0_0000_0000 {
+				kernel_only = false;
+			}
+			let p_start = match self.mmu.translate_fetch_probe(start) {
+				Ok(p) => p,
+				Err(_) => {
+					ok = false;
+					break 'members;
+				}
+			};
+			phys.push(p_start & !0xfff);
+			if !self.mmu.mark_exec_page(p_start) {
+				ok = false;
+				break 'members;
+			}
+			let mut off = start & 0xfff;
+			for &(word, len) in words {
+				let p = (p_start & !0xfff) | off;
+				let raw = self.mmu.load_word_raw(p);
+				let (w, l) = match (raw & 0x3) == 0x3 {
+					true => (raw, 4u8),
+					false => (self.uncompress(raw & 0xffff), 2u8),
+				};
+				if w != word || l != len {
+					ok = false;
+					break 'members;
+				}
+				off += len as u64;
+			}
+		}
+		let tg = self.mmu.tlb_gen();
+		self.aot_vstate[handle as usize] =
+			AotVerify { content_gen: cg, tlb_gen: tg, phys, kernel_only, ok };
+		ok
+	}
+
+	/// Mapping re-probe: the content is already proven for this code_gen;
+	/// just confirm each member vpc still translates to the phys page it
+	/// was proven on. One TLB probe per member block.
+	#[cfg(feature = "aot")]
+	fn aot_verify_mapping(&mut self, handle: u32) -> bool {
+		let members = AOT_MEMBERS[handle as usize];
+		let expect: Vec<u64> = self.aot_vstate[handle as usize].phys.clone();
+		if expect.len() != members.len() {
+			return false;
+		}
+		for (i, &(start, _)) in members.iter().enumerate() {
+			match self.mmu.translate_fetch_probe(start) {
+				Ok(p) if (p & !0xfff) == expect[i] => {}
+				_ => return false,
+			}
+		}
+		true
 	}
 
 	/// The production Layout the runtime dispatcher hands emit_region. For
@@ -952,6 +1155,21 @@ impl Cpu {
 			dram_base: 4096,
 			guest_dram_base: 0x8000_0000,
 			dram_len: 1 << 31,
+		}
+	}
+
+	/// The heaviest UNCOVERED pcs (sampled), heaviest first.
+	#[cfg(feature = "tier2")]
+	pub fn tier2_miss_top(&self, n: usize) -> Vec<(u64, u64)> {
+		match self.tier2.as_ref() {
+			Some(t) => {
+				let mut v: Vec<(u64, u64)> =
+					t.miss.iter().map(|(&pc, &h)| (pc, h)).collect();
+				v.sort_by(|a, b| b.1.cmp(&a.1));
+				v.truncate(n);
+				v
+			}
+			None => Vec::new(),
 		}
 	}
 
@@ -973,7 +1191,22 @@ impl Cpu {
 		let gen = self.mmu.code_gen();
 		{
 			let Tier2State { ref mut t2, ref lay, .. } = *t;
+			#[cfg(feature = "aot")]
+			if t.aot {
+				t2.prune_stale(gen);
+			}
 			t2.maybe_form(lay, gen, |pc| self.tier2_ops_of(pc));
+		}
+		#[cfg(feature = "aot")]
+		if t.aot {
+			// mirror the map into the hash-free dispatch slots
+			for s in self.aot_slots.iter_mut() {
+				*s = AotSlot::EMPTY;
+			}
+			for (pc, handle, entry, g) in t.t2.compiled_entries() {
+				let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+				self.aot_slots[slot] = AotSlot { tag: pc, handle, entry, gen: g };
+			}
 		}
 		self.tier2 = Some(t);
 	}
@@ -1351,11 +1584,26 @@ impl Cpu {
 	// through the table.
 	#[inline(always)]
 	pub(crate) fn exec_op(&mut self, e: &BlockOp, address: u64) -> Result<(), Trap> {
+		self.exec_op_impl(e.kind, e, address)
+	}
+
+	/// risc-box patch (aot): the same dispatch with the kind a compile-time
+	/// constant. Each monomorphization folds the match below to one arm, so
+	/// baked regions execute exactly the interpreter's op bodies — one
+	/// source of truth — without the runtime kind dispatch.
+	#[cfg(feature = "aot")]
+	#[inline(always)]
+	pub(crate) fn exec_op_const<const K: u8>(&mut self, e: &BlockOp, address: u64) -> Result<(), Trap> {
+		self.exec_op_impl(K, e, address)
+	}
+
+	#[inline(always)]
+	fn exec_op_impl(&mut self, kind: u8, e: &BlockOp, address: u64) -> Result<(), Trap> {
 		let rd = e.rd as usize;
 		let rs1 = e.rs1 as usize;
 		let rs2 = e.rs2 as usize;
 		let imm = e.imm as i64;
-		match e.kind {
+		match kind {
 			HOT_ADDI => {
 				self.x[rd] = self.sign_extend(self.x[rs1].wrapping_add(imm));
 			},

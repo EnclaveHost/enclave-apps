@@ -749,6 +749,17 @@ fn main() {
 
     #[cfg(feature = "blockstats")]
     emu.dump_block_stats();
+    #[cfg(feature = "tier2")]
+    if tier2_dump.is_some() || aot {
+        let (cov, tot, entries, black) = emu.tier2_stats();
+        println!(
+            "T2 covered {:.1}% ({} entries, {} black); heaviest uncovered pcs (sampled):",
+            100.0 * cov as f64 / tot.max(1) as f64, entries, black
+        );
+        for (pc, heat) in emu.tier2_miss_top(40) {
+            println!("  {:>16x} {:>12}", pc, heat);
+        }
+    }
     let secs = start.elapsed().as_secs_f64();
     println!(
         "TOTAL {:.0}M instructions in {:.2}s = {:.1} MIPS",

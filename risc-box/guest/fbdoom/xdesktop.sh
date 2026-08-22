@@ -13,6 +13,14 @@ exec >/var/log/xdesktop.log 2>&1
 # emulator now. Silence kernel printk so a stray dmesg line can't repaint either.
 echo 0 > /proc/sys/kernel/printk 2>/dev/null
 
+# Determinism for the baked-region JIT: with mmap ASLR off, Xorg and the
+# shared libraries land at the same virtual addresses every boot, so the
+# regions profiled at build time keep matching in production. The game
+# binary is ET_EXEC and never moved anyway. This machine runs one appliance
+# workload; address randomization defends nothing here.
+echo 0 > /proc/sys/kernel/randomize_va_space 2>/dev/null
+
+
 # NOTE: do NOT LD_PRELOAD the fbdev/shadow modules. On musl (no lazy binding)
 # the preload cannot resolve xf86*/Damage* against a /bin/sh wrapper, and it
 # also poisons every X client. Xorg's own loader resolves them fine. Also exec

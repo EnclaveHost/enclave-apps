@@ -74,3 +74,7 @@ panic = "abort"
 # default so the ordinary wasip2 component is byte-for-byte the app that ships.
 [features]
 set = []
+# baked-region JIT: profile-derived native regions compiled into the emulator
+# (see emu/build.rs + emu/aot/regions.dump). The app enables the dispatcher
+# at machine start when this is on.
+aot = ["riscv_emu_rust/aot"]

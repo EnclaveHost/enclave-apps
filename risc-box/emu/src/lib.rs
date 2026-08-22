@@ -480,6 +480,11 @@ impl Emulator {
 		self.cpu.tier2_stats()
 	}
 
+	#[cfg(feature = "tier2")]
+	pub fn tier2_miss_top(&self, n: usize) -> Vec<(u64, u64)> {
+		self.cpu.tier2_miss_top(n)
+	}
+
 	#[cfg(feature = "aot")]
 	pub fn aot_enable(&mut self) {
 		self.cpu.aot_enable();

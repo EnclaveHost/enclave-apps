@@ -71,7 +71,7 @@ if [ -f Cargo.lock ]; then
   trap "cp '$PWD/$WORK/Cargo.lock.orig' '$PWD/Cargo.lock'" EXIT INT TERM
 fi
 RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals -L $SYSROOT/lib/wasm32-wasip2" \
-  cargo +nightly build --release --lib --features set \
+  cargo +nightly build --release --lib --features "set ${EXTRA_FEATURES:-}" \
     --config "patch.crates-io.wasi.path='$PWD/set/wasi-p2-shim'" \
     --target "$PWD/$WORK/wasm32-wasip2-set.json" \
     -Zbuild-std=std,panic_abort -Zjson-target-spec

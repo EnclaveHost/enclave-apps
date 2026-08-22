@@ -1302,6 +1302,31 @@ impl Tier2 {
 		(self.compiled.len(), self.blacklist.len())
 	}
 
+	/// Every live compiled entry: (pc, handle, entry index, generation).
+	/// The AOT dispatcher mirrors these into its hash-free slot array once
+	/// per formation pass — per-dispatch HashMap probes with SipHash were
+	/// 65% of the first AOT run's whole profile.
+	pub fn compiled_entries(&self) -> Vec<(u64, u32, u32, u32)> {
+		self.compiled.iter().map(|(&pc, &(h, i, g))| (pc, h, i, g)).collect()
+	}
+
+	/// Drop entries whose write-snoop generation has moved on (the lazy
+	/// per-lookup drop only works when lookup runs per dispatch).
+	pub fn prune_stale(&mut self, current_gen: u32) {
+		let stale: Vec<u32> = self
+			.compiled
+			.values()
+			.filter(|&&(_, _, g)| g != current_gen)
+			.map(|&(h, _, _)| h)
+			.collect();
+		if !stale.is_empty() {
+			for h in &stale {
+				self.backend.drop_region(*h);
+			}
+			self.compiled.retain(|_, &mut (h, _, _)| !stale.contains(&h));
+		}
+	}
+
 	/// Formation pass, driven by the caller once enough has retired. The
 	/// caller supplies a way to read a block's ops (from its cache) so the
 	/// region emitter sees exactly what the interpreter runs.
@@ -1326,9 +1351,18 @@ impl Tier2 {
 			}
 		};
 		for region_pcs in regions {
-			if region_pcs.iter().any(|pc| {
+			// Skip only when the region adds NOTHING new. Skipping on ANY
+			// already-compiled member froze coverage at the first pass's
+			// shape: the hottest block in the guest sat uncompiled forever
+			// because every region formed around it also touched a compiled
+			// neighbor. Overlap is fine — newer entries overwrite per-pc,
+			// and a baked backend's handles are static indexes.
+			if region_pcs.iter().all(|pc| {
 				self.compiled.contains_key(pc) || self.blacklist.contains(pc)
 			}) {
+				continue;
+			}
+			if region_pcs.iter().any(|pc| self.blacklist.contains(pc)) {
 				continue;
 			}
 			let mut blocks = Vec::new();
@@ -1354,9 +1388,11 @@ impl Tier2 {
 				continue;
 			}
 			let entry_pcs: Vec<u64> = blocks.iter().map(|&(pc, _)| pc).collect();
-			match emit_region(&blocks, lay)
-				.and_then(|m| self.backend.compile_src(&blocks, &m, &entry_pcs))
-			{
+			// The module is advisory: a verb-style backend compiles it (and
+			// refuses an empty one); the record/AOT backends key on the
+			// blocks themselves, so emit_region coverage is not a gate.
+			let module = emit_region(&blocks, lay).unwrap_or_default();
+			match self.backend.compile_src(&blocks, &module, &entry_pcs) {
 				Some(handle) => {
 					for (idx, &pc) in entry_pcs.iter().enumerate() {
 						self.compiled.insert(pc, (handle, idx as u32, current_gen));
@@ -1395,6 +1431,32 @@ impl RecordBackend {
 	}
 }
 
+/// The AOT match key: a hash of the region's SOURCE — block pcs and their
+/// decoded ops — rather than of the emitted module. It exists so a region
+/// emit_region cannot express is still bakeable, and it must stay in exact
+/// agreement between the profiling dump and the runtime lookup (both call
+/// THIS function; build.rs copies the dump's hash verbatim).
+pub fn hash_blocks(blocks: &[(u64, Vec<::cpu::BlockOp>)]) -> u64 {
+	let mut h: u64 = 0xcbf29ce484222325;
+	let mut mix = |v: u64| {
+		for b in v.to_le_bytes() {
+			h ^= b as u64;
+			h = h.wrapping_mul(0x100000001b3);
+		}
+	};
+	for &(pc, ref ops) in blocks {
+		mix(pc);
+		mix(ops.len() as u64);
+		for op in ops {
+			mix(op.imm as u32 as u64);
+			mix(op.word as u64);
+			mix(op.data as u64 | (op.kind as u64) << 16 | (op.rd as u64) << 24
+				| (op.rs1 as u64) << 32 | (op.rs2 as u64) << 40 | (op.len as u64) << 48);
+		}
+	}
+	h
+}
+
 pub fn fnv64(bytes: &[u8]) -> u64 {
 	let mut h: u64 = 0xcbf29ce484222325;
 	for &b in bytes {
@@ -1418,7 +1480,7 @@ impl CodegenBackend for RecordBackend {
 	) -> Option<u32> {
 		if let Some(w) = self.out.as_mut() {
 			use std::io::Write;
-			let _ = writeln!(w, "REGION {:016x} {}", fnv64(module), blocks.len());
+			let _ = writeln!(w, "REGION {:016x} {}", hash_blocks(blocks), blocks.len());
 			for &(pc, ref ops) in blocks {
 				let _ = writeln!(w, "B {:x} {}", pc, ops.len());
 				for op in ops {

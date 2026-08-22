@@ -880,6 +880,11 @@ fn boot(images: &mut Images, cfg: &Config) -> Result<Emulator, String> {
     }
     emu.setup_program(images.kernel.clone());
     emu.setup_filesystem(images.take_disk()?);
+    #[cfg(feature = "aot")]
+    {
+        emu.aot_enable();
+        eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
+    }
     if let Some(dtb) = &images.dtb {
         emu.setup_dtb(dtb.clone());
     }

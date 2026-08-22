@@ -377,6 +377,14 @@ impl Mmu {
 	// never change what physical page a block was decoded from; the probe
 	// re-checks the mapping through the TLB separately).
 	#[inline(always)]
+	/// risc-box patch (aot): the address-space generation — satp writes and
+	/// SFENCE.VMA bump it (via clear_page_cache), so "same tlb_gen" means
+	/// no mapping has changed since a compiled region's members were
+	/// verified against their install-time physical pages.
+	pub fn tlb_gen(&self) -> u32 {
+		self.tlb_gen
+	}
+
 	pub fn code_gen(&self) -> u32 {
 		self.memory.code_gen()
 	}
