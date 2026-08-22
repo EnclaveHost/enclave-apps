@@ -71,7 +71,16 @@ if [ -f Cargo.lock ]; then
   trap "cp '$PWD/$WORK/Cargo.lock.orig' '$PWD/Cargo.lock'" EXIT INT TERM
 fi
 RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals -L $SYSROOT/lib/wasm32-wasip2" \
-  cargo +nightly build --release --lib --features "set ${EXTRA_FEATURES:-}" \
+  # `rustc --crate-type staticlib` (not `build --lib`): the [lib] declares
+  # BOTH rlib and staticlib, and when one rustc invocation emits both, fat
+  # LTO silently does not run — an rlib cannot be an LTO'd final artifact —
+  # so the staticlib shipped with cross-function inlining OFF while the
+  # plain bin got full LTO. Measured on the DOOM demo: 121.7 -> 127.8 guest
+  # MIPS (plain ~130, same rig/engine); the interpreter's fetch_word went
+  # from a standalone ~900-instruction call per emulated instruction to
+  # inlined, function count 3438 -> 2564. Compiling the staticlib ALONE
+  # re-arms LTO.
+  cargo +nightly rustc --release --lib --crate-type staticlib --features "set ${EXTRA_FEATURES:-}" \
     --config "patch.crates-io.wasi.path='$PWD/set/wasi-p2-shim'" \
     --target "$PWD/$WORK/wasm32-wasip2-set.json" \
     -Zbuild-std=std,panic_abort -Zjson-target-spec
