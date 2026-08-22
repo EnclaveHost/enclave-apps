@@ -322,7 +322,12 @@ impl Emulator {
 	/// `Mmu::set_dtb_framebuffer`). Call before boot; returns false if the size
 	/// was rejected, in which case the default 1024x768 still stands.
 	pub fn set_framebuffer_size(&mut self, width: u32, height: u32) -> bool {
-		self.cpu.get_mut_mmu().set_dtb_framebuffer(width, height)
+		let ok = self.cpu.get_mut_mmu().set_dtb_framebuffer(width, height);
+		if ok {
+			// keep the overlay rect math on the true stride
+			self.cpu.get_mut_mmu().set_fb_stride(width as u64 * 4);
+		}
+		ok
 	}
 
 	/// risc-box patch: run the guest's clock off the host's monotonic clock
@@ -412,6 +417,12 @@ impl Emulator {
 
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
 		self.cpu.get_mmu().read_physical_range(p_address, out);
+	}
+
+	/// risc-box patch (host-side game overlay): pixel rect of fb-window
+	/// stores since the last call (see MemoryWrapper::fb_take_rect).
+	pub fn fb_take_overlay_rect(&self) -> Option<(u32, u32, u32, u32)> {
+		self.cpu.get_mmu().fb_take_rect()
 	}
 
 	/// risc-box patch: fill `out` with the current display contents, whichever

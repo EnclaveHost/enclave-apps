@@ -100,7 +100,10 @@ xterm -fn fixed -geometry 60x18+660+430 -bg "#101020" -fg "#c8d0ff" \
   # 13 MB every 2 s of emulated memory traffic for a buffer nobody reads.
   # The frames reach the screen through X either way (verified by
   # snapshot: live game in the scanout), so dropping it RECLAIMS work.
-  DISPLAY=:0 /usr/bin/xdoom -uncapped -scaling 2 -iwad /usr/share/games/doom/freedoom1.wad \
+  # -overlay writes the game straight into the (invisible) simple-framebuffer;
+  # the APP composites that rectangle over the GPU scanout natively, so the
+  # whole X copy chain drops out of the guest's frame budget.
+  DISPLAY=:0 /usr/bin/xdoom -uncapped -overlay -scaling 2 -iwad /usr/share/games/doom/freedoom1.wad \
     >/var/log/xdoom.log 2>&1 ) &
 
 # On a ~25 MIPS core the WM can sit for minutes after startup without ever

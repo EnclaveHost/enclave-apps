@@ -281,6 +281,15 @@ impl Mmu {
 	pub fn fb_bytes(&self) -> u64 {
 		self.memory.fb_bytes()
 	}
+
+	// risc-box patch (host-side game overlay): see MemoryWrapper::fb_take_rect.
+	pub fn fb_take_rect(&self) -> Option<(u32, u32, u32, u32)> {
+		self.memory.fb_take_rect()
+	}
+
+	pub fn set_fb_stride(&mut self, stride: u64) {
+		self.memory.set_fb_stride(stride);
+	}
 	
 	/// Initializes Virtio block disk. This method is expected to be called only once.
 	///
@@ -1265,7 +1274,17 @@ pub struct MemoryWrapper {
 	exec_page_marks: Vec<u8>,
 	code_gen: u32,
 	fb_writes: u64,
-	fb_bytes: u64
+	fb_bytes: u64,
+	// risc-box patch (host-side game overlay): byte-offset extent of stores
+	// into the fb window since the last take. On the virtio-gpu image the
+	// simple-framebuffer is invisible dead memory — a game writing it via
+	// the old -overlay path costs ONE blit, and the app composites this
+	// rectangle over the GPU scanout at capture time, natively. The rect is
+	// exact for rectangular row-segment blits (min = first row's left edge,
+	// max = last row's right edge).
+	fb_off_min: std::sync::atomic::AtomicU64,
+	fb_off_max: std::sync::atomic::AtomicU64,
+	fb_stride: u64
 }
 
 impl MemoryWrapper {
@@ -1275,7 +1294,10 @@ impl MemoryWrapper {
 			exec_page_marks: vec![],
 			code_gen: 1,
 			fb_writes: 0,
-			fb_bytes: 0
+			fb_bytes: 0,
+			fb_off_min: std::sync::atomic::AtomicU64::new(u64::MAX),
+			fb_off_max: std::sync::atomic::AtomicU64::new(0),
+			fb_stride: 4096
 		}
 	}
 
@@ -1300,12 +1322,48 @@ impl MemoryWrapper {
 		self.fb_bytes
 	}
 
+	/// risc-box patch (host-side game overlay): the (x, y, w, h) pixel rect
+	/// covering every fb-window store since the last call, then reset. The
+	/// x-range degrades to full width when the offsets straddle rows in a
+	/// non-rectangular way — over-compositing is correct, just more copied.
+	pub fn fb_take_rect(&self) -> Option<(u32, u32, u32, u32)> {
+		use std::sync::atomic::Ordering;
+		let min = self.fb_off_min.swap(u64::MAX, Ordering::Relaxed);
+		let max = self.fb_off_max.swap(0, Ordering::Relaxed);
+		if min > max {
+			return None;
+		}
+		let stride = self.fb_stride.max(4);
+		let y0 = (min / stride) as u32;
+		let y1 = (max / stride) as u32;
+		let mut x0 = ((min % stride) / 4) as u32;
+		let mut x1 = ((max % stride) / 4) as u32;
+		if x1 < x0 {
+			x0 = 0;
+			x1 = (stride / 4 - 1) as u32;
+		}
+		Some((x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+	}
+
+	pub fn set_fb_stride(&mut self, stride: u64) {
+		self.fb_stride = stride.max(4);
+	}
+
 	// risc-box patch: bump code_gen if this write can touch a marked page.
 	#[inline(always)]
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
 		if p_address >= 0x87e0_0000 && p_address < 0x8810_0000 {
 			self.fb_writes = self.fb_writes.wrapping_add(1);
 			self.fb_bytes = self.fb_bytes.wrapping_add(width);
+			use std::sync::atomic::Ordering;
+			let off = p_address - 0x87e0_0000;
+			if off < self.fb_off_min.load(Ordering::Relaxed) {
+				self.fb_off_min.store(off, Ordering::Relaxed);
+			}
+			let end = off + width - 1;
+			if end > self.fb_off_max.load(Ordering::Relaxed) {
+				self.fb_off_max.store(end, Ordering::Relaxed);
+			}
 		}
 		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;

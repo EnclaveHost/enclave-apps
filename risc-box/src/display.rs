@@ -204,7 +204,63 @@ impl Display {
             }
         }
         out.resize(fb_bytes(), 0);
-        emu.read_display(FB_BASE, out, Self::gpu_is_the_live_surface(emu));
+        let from_gpu = emu.read_display(FB_BASE, out, Self::gpu_is_the_live_surface(emu));
+        if from_gpu {
+            Self::composite_overlay(emu, out);
+        }
+    }
+
+    /// Host-side game overlay: on the virtio-gpu image the simple-framebuffer
+    /// is invisible dead memory, so a game writing it via xdoom's -overlay
+    /// path pays ONE blit per frame and the desktop's whole X copy chain
+    /// (SHM -> shadow -> scanout buffer) disappears from the guest's budget.
+    /// The composition happens HERE, natively: whatever rectangle the guest
+    /// wrote into the fb window recently is copied over the GPU scanout at
+    /// capture time. Freshness rides the write stream — a game that stops
+    /// painting stops being composited after a second, and X's own (stale)
+    /// window contents show, which is the same frame the game last drew.
+    fn composite_overlay(emu: &Emulator, out: &mut [u8]) {
+        use std::sync::atomic::AtomicU64;
+        // packed x<<48|y<<32|w<<16|h, and the freshness stamp in millis
+        static RECT: AtomicU64 = AtomicU64::new(0);
+        static FRESH_MS: AtomicU64 = AtomicU64::new(0);
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        if let Some((x, y, w, h)) = emu.fb_take_overlay_rect() {
+            // ignore boot-console noise: the overlay is a WINDOW, not the
+            // whole screen; full-height rects are fbcon, not the game
+            if (h as usize) < fb_h() {
+                RECT.store(
+                    (x as u64) << 48 | (y as u64) << 32 | (w as u64) << 16 | h as u64,
+                    Ordering::Relaxed,
+                );
+                FRESH_MS.store(now_ms, Ordering::Relaxed);
+            }
+        }
+        let packed = RECT.load(Ordering::Relaxed);
+        if packed == 0 || now_ms.saturating_sub(FRESH_MS.load(Ordering::Relaxed)) > 1000 {
+            return;
+        }
+        let (x, y, w, h) = (
+            (packed >> 48 & 0xffff) as usize,
+            (packed >> 32 & 0xffff) as usize,
+            (packed >> 16 & 0xffff) as usize,
+            (packed & 0xffff) as usize,
+        );
+        let stride = fb_stride();
+        let (sw, sh) = (fb_w(), fb_h());
+        if x >= sw || y >= sh {
+            return;
+        }
+        let w = w.min(sw - x);
+        let h = h.min(sh - y);
+        let mut row = vec![0u8; w * 4];
+        for r in 0..h {
+            let off = (y + r) * stride + x * 4;
+            emu.read_physical_range(FB_BASE + off as u64, &mut row);
+            out[off..off + w * 4].copy_from_slice(&row);
+        }
     }
 
     /// Which display device is the guest actually DRAWING to?
