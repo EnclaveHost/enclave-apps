@@ -1,3 +1,18 @@
+# RESOLVED 2026-08-22 — premise did not survive verification. KEEP FOR THE RECORD.
+#
+# The verify-first step (below) was executed and the hypothesis is FALSE:
+# wasmtime 49 (the fleet pin) already elides bounds checks on shared
+# memories — Memory::can_elide_bounds_check never consults `shared`, and
+# disassembly of the production module shows direct guard-page accesses in
+# both builds. The "125 vs 65" that motivated this was two different code
+# generations (the SET artifact was built mid-edit and still carried
+# per-dispatch formation bookkeeping). Same-revision A/B truth: SET costs
+# ~16%, ~2/3 of it EPOCH INTERRUPTION (the SET patch forces
+# epoch_interruption(true) as its anti-DoS stop), ~1/3 the out-of-line
+# VMMemoryDefinition hop + atomics-enabled guest codegen. The only engine
+# lever left is leaf-function epoch-entry-check elision — safety-sensitive,
+# needs its own reviewed task if ever pursued.
+#
 # Handoff: guard-page bounds elision for SHARED wasm memories (fleet wasmtime)
 
 Copy-paste prompt for the session that does the engine work. Everything
