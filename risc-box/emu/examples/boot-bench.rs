@@ -664,12 +664,20 @@ fn main() {
             #[cfg(feature = "tier2")]
             let fps = {
                 let (cov, tot, regions, black) = emu.tier2_stats();
+                #[cfg(feature = "aot")]
+                let inst = {
+                    let (ok, fail) = emu.aot_install_stats();
+                    format!(" inst {}/{}", ok, ok + fail)
+                };
+                #[cfg(not(feature = "aot"))]
+                let inst = String::new();
                 format!(
-                    "{} t2 {:.1}% ({} entries, {} black)",
+                    "{} t2 {:.1}% ({} entries, {} black){}",
                     fps,
                     100.0 * cov as f64 / tot.max(1) as f64,
                     regions,
-                    black
+                    black,
+                    inst
                 )
             };
             let mut px = [0u8; 4];

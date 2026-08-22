@@ -85,33 +85,36 @@ fn main() {
         let _ = writeln!(members, "\t],");
         emit_region_fn(&mut s, i, blocks);
     }
-    // pc -> (handle, arm) for every member of every region, pc-sorted for
-    // binary search at block-build time. Overlapping regions: the pc goes to
-    // the region with the most members (the bigger compiled context).
+    // pc -> ALL candidate regions containing it, biggest first. One region
+    // per pc was a trap: greedy formation chains across ecall-terminated
+    // blocks, so a profile region can mix pcs from DIFFERENT user processes
+    // — unverifiable under any single address space — and "prefer the
+    // biggest" mapped the hottest game blocks to exactly those dead giants.
+    // The installer walks the list and takes the first region that verifies.
     {
-        let mut entries: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
+        let mut entries: std::collections::HashMap<u64, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
         for (h_idx, (_h, blocks)) in kept.iter().enumerate() {
             for (arm, &(pc, _)) in blocks.iter().enumerate() {
-                let better = match entries.get(&pc) {
-                    Some(&(old_h, _)) => blocks.len() > kept[old_h].1.len(),
-                    None => true,
-                };
-                if better {
-                    entries.insert(pc, (h_idx, arm));
-                }
+                entries.entry(pc).or_default().push((h_idx, arm));
             }
         }
-        let mut sorted: Vec<(u64, usize, usize)> =
-            entries.into_iter().map(|(pc, (h, a))| (pc, h, a)).collect();
-        sorted.sort();
-        let mut rows = String::new();
-        for (pc, h, a) in &sorted {
-            let _ = writeln!(rows, "\t({:#x}, {}, {}),", pc, h, a);
+        let mut sorted: Vec<(u64, Vec<(usize, usize)>)> = entries.into_iter().collect();
+        sorted.sort_by_key(|e| e.0);
+        let mut pcs = String::new();
+        let mut lists = String::new();
+        for (pc, mut cands) in sorted {
+            cands.sort_by_key(|&(h, _)| std::cmp::Reverse(kept[h].1.len()));
+            let _ = writeln!(pcs, "\t{:#x},", pc);
+            let row: Vec<String> =
+                cands.iter().map(|&(h, a)| format!("({}, {})", h, a)).collect();
+            let _ = writeln!(lists, "\t&[{}],", row.join(", "));
         }
+        let _ = writeln!(s, "pub(crate) static AOT_ENTRY_PCS: &[u64] = &[\n{}];", pcs);
         let _ = writeln!(
             s,
-            "pub(crate) static AOT_ENTRIES: &[(u64, u32, u32)] = &[\n{}];",
-            rows
+            "pub(crate) static AOT_ENTRY_LISTS: &[&[(u32, u32)]] = &[\n{}];",
+            lists
         );
     }
     let _ = writeln!(s, "pub(crate) static AOT_HASHES: &[u64] = &[\n{}];", hashes);

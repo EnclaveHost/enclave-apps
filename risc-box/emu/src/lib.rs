@@ -495,6 +495,11 @@ impl Emulator {
 		self.cpu.aot_baked()
 	}
 
+	#[cfg(feature = "aot")]
+	pub fn aot_install_stats(&self) -> (u64, u64) {
+		self.cpu.aot_install_stats()
+	}
+
 	pub fn gpu_flushes(&self) -> u64 {
 		self.cpu.get_mmu().get_gpu().flushes()
 	}

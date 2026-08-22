@@ -361,6 +361,12 @@ pub struct Cpu {
 	aot_slots: Vec<AotSlot>,
 	#[cfg(feature = "aot")]
 	aot_vstate: Vec<AotVerify>,
+	/// installs that verified / candidate lookups that found no verifiable
+	/// region — the two numbers that say whether the bake ENGAGES.
+	#[cfg(feature = "aot")]
+	aot_install_ok: u64,
+	#[cfg(feature = "aot")]
+	aot_install_fail: u64,
 	// risc-box patch (blockstats feature): per-slot execution/retired
 	// counters plus a histogram of retired-instructions bucketed by how many
 	// times the retiring block had executed when replaced — the coverage
@@ -645,6 +651,10 @@ impl Cpu {
 			aot_slots: vec![AotSlot::EMPTY; BLOCK_SLOTS],
 			#[cfg(feature = "aot")]
 			aot_vstate: Vec::new(),
+			#[cfg(feature = "aot")]
+			aot_install_ok: 0,
+			#[cfg(feature = "aot")]
+			aot_install_fail: 0,
 			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
 			#[cfg(feature = "blockstats")]
 			stat_execs: vec![0; BLOCK_SLOTS],
@@ -866,19 +876,7 @@ impl Cpu {
 						#[cfg(feature = "aot")]
 						if self.tier2.as_ref().map_or(false, |t| t.aot) {
 							let pc = self.block_heads[slot].tag;
-							if let Ok(i) =
-								AOT_ENTRIES.binary_search_by_key(&pc, |e| e.0)
-							{
-								let (_, handle, entry) = AOT_ENTRIES[i];
-								if self.aot_verified(handle) {
-									self.aot_slots[slot] = AotSlot {
-										tag: pc,
-										handle,
-										entry,
-										gen: self.mmu.code_gen(),
-									};
-								}
-							}
+							self.aot_try_install(slot, pc);
 						}
 						let r = self.exec_block(slot);
 						#[cfg(feature = "blockstats")]
@@ -1055,6 +1053,29 @@ impl Cpu {
 		AOT_FNS.len()
 	}
 
+	/// Install the dispatch slot for a block at `pc` if any baked region
+	/// lists it as an entry AND verifies against live memory. Candidates
+	/// come biggest-first; a region mixing another process's pages simply
+	/// fails verification here and the next (purer) candidate gets its
+	/// turn.
+	#[cfg(feature = "aot")]
+	fn aot_try_install(&mut self, slot: usize, pc: u64) {
+		let Ok(i) = AOT_ENTRY_PCS.binary_search(&pc) else { return };
+		for &(handle, entry) in AOT_ENTRY_LISTS[i] {
+			if self.aot_verified(handle) {
+				self.aot_slots[slot] = AotSlot {
+					tag: pc,
+					handle,
+					entry,
+					gen: self.mmu.code_gen(),
+				};
+				self.aot_install_ok += 1;
+				return;
+			}
+		}
+		self.aot_install_fail += 1;
+	}
+
 	/// May baked region `handle` run right now?
 	///
 	/// Two-level cache, because verification cadence was the first AOT
@@ -1196,6 +1217,11 @@ impl Cpu {
 		}
 	}
 
+	#[cfg(feature = "aot")]
+	pub fn aot_install_stats(&self) -> (u64, u64) {
+		(self.aot_install_ok, self.aot_install_fail)
+	}
+
 	/// (covered, total, compiled entry pcs, blacklisted pcs)
 	#[cfg(feature = "tier2")]
 	pub fn tier2_stats(&self) -> (u64, u64, usize, usize) {
@@ -1236,12 +1262,7 @@ impl Cpu {
 				if self.aot_slots[slot].tag == h.tag && self.aot_slots[slot].gen == gen {
 					continue;
 				}
-				if let Ok(i) = AOT_ENTRIES.binary_search_by_key(&h.tag, |e| e.0) {
-					let (_, handle, entry) = AOT_ENTRIES[i];
-					if self.aot_verified(handle) {
-						self.aot_slots[slot] = AotSlot { tag: h.tag, handle, entry, gen };
-					}
-				}
+				self.aot_try_install(slot, h.tag);
 			}
 		}
 		self.tier2 = Some(t);
