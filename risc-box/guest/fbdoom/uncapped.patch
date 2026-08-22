@@ -1,0 +1,446 @@
+diff -ru fbDOOM-master/fbdoom/d_loop.c fbDOOM-uncap/fbdoom/d_loop.c
+--- fbDOOM-master/fbdoom/d_loop.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/d_loop.c	2026-08-21 18:13:17.533679709 -0700
+@@ -23,6 +23,7 @@
+ 
+ #include "d_event.h"
+ #include "d_loop.h"
++#include "doomstat.h"
+ #include "d_ticcmd.h"
+ 
+ #include "i_system.h"
+@@ -114,6 +115,11 @@
+ static int player_class;
+ 
+ 
++// risc-box uncapped rendering state (see d_loop.h)
++int uncapped = 0;
++int fpsmax = 0;
++fixed_t fractionaltic = 0;
++
+ // 35 fps clock adjusted by offsetms milliseconds
+ 
+ static int GetAdjustedTime(void)
+@@ -773,6 +779,15 @@
+ 	if (lowtic < gametic/ticdup)
+ 	    I_Error ("TryRunTics: lowtic < gametic");
+ 
++        // risc-box: with uncapped rendering the caller renders BETWEEN tics;
++        // never sleep here waiting for the next one. Only in a level: menus,
++        // title pages and intermissions are static, and rendering them again
++        // buys nothing on an emulated core.
++        if (uncapped && gamestate == GS_LEVEL)
++        {
++            return;
++        }
++
+         // Don't stay in this loop forever.  The menu is still running,
+         // so return to update the screen
+ 
+diff -ru fbDOOM-master/fbdoom/d_loop.h fbDOOM-uncap/fbdoom/d_loop.h
+--- fbDOOM-master/fbdoom/d_loop.h	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/d_loop.h	2026-08-21 18:12:39.594021097 -0700
+@@ -20,6 +20,7 @@
+ #define __D_LOOP__
+ 
+ #include "net_defs.h"
++#include "m_fixed.h"
+ 
+ // Callback function invoked while waiting for the netgame to start.
+ // The callback is invoked when new players are ready. The callback
+@@ -77,5 +78,11 @@
+ extern boolean singletics;
+ extern int gametic, ticdup;
+ 
++// risc-box uncapped rendering: render between tics, interpolating world
++// state by fractionaltic (FRACUNIT = one whole tic since the last run tic).
++extern int uncapped;      // -uncapped: render between tics
++extern int fpsmax;        // -fpsmax N: pace presented frames to N per second
++extern fixed_t fractionaltic;
++
+ #endif
+ 
+diff -ru fbDOOM-master/fbdoom/d_main.c fbDOOM-uncap/fbdoom/d_main.c
+--- fbDOOM-master/fbdoom/d_main.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/d_main.c	2026-08-21 18:13:17.533861077 -0700
+@@ -22,6 +22,7 @@
+ 
+ #include <ctype.h>
+ #include <stdio.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -422,6 +423,16 @@
+ 
+     main_loop_started = true;
+ 
++    //!
++    // risc-box: render between tics with world-state interpolation, so the
++    // presented rate is bounded by the machine, not the 35 Hz tic clock.
++    uncapped = M_CheckParm("-uncapped") != 0;
++    {
++        int p = M_CheckParm("-fpsmax");
++        if (p && p < myargc - 1)
++            fpsmax = atoi(myargv[p + 1]);
++    }
++
+     TryRunTics();
+ 
+     I_SetWindowTitle(gamedescription);
+@@ -440,13 +451,35 @@
+         wipegamestate = gamestate;
+     }
+ 
++    {
++    // risc-box: absolute-deadline frame pacing for -fpsmax. A relative wait
++    // quantizes against the tic clock; a deadline schedule does not drift.
++    int64_t next_frame_ms = 0;
++
+     while (1)
+     {
+ 		// frame syncronous IO operations
+ 		I_StartFrame ();
+ 
++		if (uncapped && fpsmax > 0)
++		{
++			int64_t now = I_GetTimeMS();
++			if (next_frame_ms == 0)
++				next_frame_ms = now;
++			if (now < next_frame_ms)
++				I_Sleep((int)(next_frame_ms - now));
++			next_frame_ms += 1000 / fpsmax;
++			// after a stall, resume from now instead of racing the backlog
++			if (now > next_frame_ms + 250)
++				next_frame_ms = now;
++		}
++
+ 		TryRunTics (); // will run at least one tic
+ 
++		// sub-tic phase of the wall clock, for interpolated rendering
++		fractionaltic = (fixed_t)(((int64_t)I_GetTimeMS() * TICRATE % 1000)
++		                          * FRACUNIT / 1000);
++
+ 		S_UpdateSounds (players[consoleplayer].mo);// move positional sounds
+ 
+ 		// Update display, next frame, with current state.
+@@ -455,6 +488,7 @@
+ 			D_Display ();
+ 		}
+     }
++    }
+ }
+ 
+ 
+diff -ru fbDOOM-master/fbdoom/d_player.h fbDOOM-uncap/fbdoom/d_player.h
+--- fbDOOM-master/fbdoom/d_player.h	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/d_player.h	2026-08-21 18:14:13.458322758 -0700
+@@ -158,6 +158,9 @@
+     // True if secret level has been done.
+     boolean		didsecret;	
+ 
++    // risc-box uncapped rendering: viewz at the start of the last run tic
++    fixed_t		oldviewz;
++
+ } player_t;
+ 
+ 
+diff -ru fbDOOM-master/fbdoom/p_mobj.c fbDOOM-uncap/fbdoom/p_mobj.c
+--- fbDOOM-master/fbdoom/p_mobj.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/p_mobj.c	2026-08-21 18:13:55.480068592 -0700
+@@ -440,6 +440,14 @@
+ //
+ void P_MobjThinker (mobj_t* mobj)
+ {
++    // risc-box: snapshot for interpolated rendering (gametic increments
++    // after the tic runs, so the renderer matches interp == gametic-1)
++    mobj->oldx = mobj->x;
++    mobj->oldy = mobj->y;
++    mobj->oldz = mobj->z;
++    mobj->oldangle = mobj->angle;
++    mobj->interp = gametic;
++
+     // momentum movement
+     if (mobj->momx
+ 	|| mobj->momy
+@@ -522,6 +530,10 @@
+     mobj->x = x;
+     mobj->y = y;
+     mobj->radius = info->radius;
++    mobj->oldx = x;
++    mobj->oldy = y;
++    mobj->oldangle = mobj->angle;
++    mobj->interp = -1;
+     mobj->height = info->height;
+     mobj->flags = info->flags;
+     mobj->health = info->spawnhealth;
+@@ -552,6 +564,8 @@
+     else 
+ 	mobj->z = z;
+ 
++    mobj->oldz = mobj->z;
++
+     mobj->thinker.function.acp1 = (actionf_p1)P_MobjThinker;
+ 	
+     P_AddThinker (&mobj->thinker);
+diff -ru fbDOOM-master/fbdoom/p_mobj.h fbDOOM-uncap/fbdoom/p_mobj.h
+--- fbDOOM-master/fbdoom/p_mobj.h	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/p_mobj.h	2026-08-21 18:13:37.885343274 -0700
+@@ -277,6 +277,16 @@
+     // Thing being chased/attacked for tracers.
+     struct mobj_s*	tracer;	
+     
++    // risc-box uncapped rendering: position at the START of the last run
++    // tic, and the tic it belongs to. The renderer draws old->current
++    // blended by fractionaltic; a mobj whose snapshot is stale (spawned,
++    // teleported, or simply not thought this tic) is drawn where it is.
++    fixed_t		oldx;
++    fixed_t		oldy;
++    fixed_t		oldz;
++    angle_t		oldangle;
++    int			interp;
++
+ } mobj_t;
+ 
+ 
+diff -ru fbDOOM-master/fbdoom/p_pspr.c fbDOOM-uncap/fbdoom/p_pspr.c
+--- fbDOOM-master/fbdoom/p_pspr.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/p_pspr.c	2026-08-21 18:15:45.281904166 -0700
+@@ -866,6 +866,10 @@
+     psp = &player->psprites[0];
+     for (i=0 ; i<NUMPSPRITES ; i++, psp++)
+     {
++	// risc-box: snapshot for interpolated rendering
++	psp->oldsx = psp->sx;
++	psp->oldsy = psp->sy;
++
+ 	// a null state means not active
+ 	if ( (state = psp->state) )	
+ 	{
+diff -ru fbDOOM-master/fbdoom/p_pspr.h fbDOOM-uncap/fbdoom/p_pspr.h
+--- fbDOOM-master/fbdoom/p_pspr.h	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/p_pspr.h	2026-08-21 18:15:45.281801347 -0700
+@@ -66,6 +66,10 @@
+     fixed_t	sx;
+     fixed_t	sy;
+ 
++    // risc-box uncapped rendering: sway/bob at the start of the last run tic
++    fixed_t	oldsx;
++    fixed_t	oldsy;
++
+ } pspdef_t;
+ 
+ #endif
+diff -ru fbDOOM-master/fbdoom/p_telept.c fbDOOM-uncap/fbdoom/p_telept.c
+--- fbDOOM-master/fbdoom/p_telept.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/p_telept.c	2026-08-21 18:13:55.480168512 -0700
+@@ -124,6 +124,13 @@
+ 
+ 		thing->angle = m->angle;
+ 		thing->momx = thing->momy = thing->momz = 0;
++
++		// risc-box: never interpolate across a teleport
++		thing->oldx = thing->x;
++		thing->oldy = thing->y;
++		thing->oldz = thing->z;
++		thing->oldangle = thing->angle;
++		thing->interp = -1;
+ 		return 1;
+ 	    }	
+ 	}
+diff -ru fbDOOM-master/fbdoom/p_user.c fbDOOM-uncap/fbdoom/p_user.c
+--- fbDOOM-master/fbdoom/p_user.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/p_user.c	2026-08-21 18:14:13.458427107 -0700
+@@ -228,6 +228,9 @@
+ //
+ void P_PlayerThink (player_t* player)
+ {
++    // risc-box: snapshot for interpolated rendering
++    player->oldviewz = player->viewz;
++
+     ticcmd_t*		cmd;
+     weapontype_t	newweapon;
+ 	
+diff -ru fbDOOM-master/fbdoom/r_main.c fbDOOM-uncap/fbdoom/r_main.c
+--- fbDOOM-master/fbdoom/r_main.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/r_main.c	2026-08-21 18:14:47.372056558 -0700
+@@ -23,11 +23,13 @@
+ 
+ 
+ #include <stdlib.h>
++#include <stdint.h>
+ #include <math.h>
+ 
+ 
+ #include "doomdef.h"
+ #include "d_loop.h"
++#include "doomstat.h"
+ 
+ #include "m_bbox.h"
+ #include "m_menu.h"
+@@ -820,17 +822,46 @@
+ //
+ // R_SetupFrame
+ //
++// risc-box: shortest-path angular blend for interpolated rendering.
++// The unsigned difference cast to signed picks the short way around.
++angle_t R_InterpolateAngle (angle_t from, angle_t to, fixed_t frac)
++{
++    return from + (angle_t)((int64_t)(int32_t)(to - from) * frac / FRACUNIT);
++}
++
++// risc-box: whether this frame may be drawn between tics. Stale snapshots
++// (menu pause, spawn, teleport) fall back per-object in the guards below.
++boolean R_InterpolateThisFrame (void)
++{
++    return uncapped && !paused && gamestate == GS_LEVEL
++        && fractionaltic >= 0 && fractionaltic < FRACUNIT;
++}
++
+ void R_SetupFrame (player_t* player)
+ {		
+     int		i;
+     
+     viewplayer = player;
+-    viewx = player->mo->x;
+-    viewy = player->mo->y;
+-    viewangle = player->mo->angle + viewangleoffset;
+-    extralight = player->extralight;
+ 
+-    viewz = player->viewz;
++    if (R_InterpolateThisFrame() && player->mo->interp == gametic - 1)
++    {
++        mobj_t* mo = player->mo;
++        viewx = mo->oldx + FixedMul (fractionaltic, mo->x - mo->oldx);
++        viewy = mo->oldy + FixedMul (fractionaltic, mo->y - mo->oldy);
++        viewangle = R_InterpolateAngle (mo->oldangle, mo->angle,
++                                        fractionaltic) + viewangleoffset;
++        viewz = player->oldviewz
++              + FixedMul (fractionaltic, player->viewz - player->oldviewz);
++    }
++    else
++    {
++        viewx = player->mo->x;
++        viewy = player->mo->y;
++        viewangle = player->mo->angle + viewangleoffset;
++        viewz = player->viewz;
++    }
++
++    extralight = player->extralight;
+     
+     viewsin = finesine[viewangle>>ANGLETOFINESHIFT];
+     viewcos = finecosine[viewangle>>ANGLETOFINESHIFT];
+diff -ru fbDOOM-master/fbdoom/r_main.h fbDOOM-uncap/fbdoom/r_main.h
+--- fbDOOM-master/fbdoom/r_main.h	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/r_main.h	2026-08-21 18:15:17.332772861 -0700
+@@ -149,6 +149,10 @@
+ //
+ 
+ // Called by G_Drawer.
++// risc-box uncapped rendering helpers (r_main.c)
++angle_t R_InterpolateAngle (angle_t from, angle_t to, fixed_t frac);
++boolean R_InterpolateThisFrame (void);
++
+ void R_RenderPlayerView (player_t *player);
+ 
+ // Called by startup code.
+diff -ru fbDOOM-master/fbdoom/r_things.c fbDOOM-uncap/fbdoom/r_things.c
+--- fbDOOM-master/fbdoom/r_things.c	2026-04-10 07:10:55.000000000 -0700
++++ fbDOOM-uncap/fbdoom/r_things.c	2026-08-21 18:15:45.281992595 -0700
+@@ -34,6 +34,7 @@
+ #include "r_local.h"
+ 
+ #include "doomstat.h"
++#include "d_loop.h"
+ 
+ 
+ 
+@@ -471,9 +472,32 @@
+     angle_t		ang;
+     fixed_t		iscale;
+     
++    fixed_t		ix;
++    fixed_t		iy;
++    fixed_t		iz;
++    angle_t		iangle;
++
++    // risc-box: draw the thing between its last two tic positions when the
++    // frame is interpolated and this thing's snapshot is current.
++    if (R_InterpolateThisFrame() && thing->interp == gametic - 1)
++    {
++	ix = thing->oldx + FixedMul (fractionaltic, thing->x - thing->oldx);
++	iy = thing->oldy + FixedMul (fractionaltic, thing->y - thing->oldy);
++	iz = thing->oldz + FixedMul (fractionaltic, thing->z - thing->oldz);
++	iangle = R_InterpolateAngle (thing->oldangle, thing->angle,
++				     fractionaltic);
++    }
++    else
++    {
++	ix = thing->x;
++	iy = thing->y;
++	iz = thing->z;
++	iangle = thing->angle;
++    }
++
+     // transform the origin point
+-    tr_x = thing->x - viewx;
+-    tr_y = thing->y - viewy;
++    tr_x = ix - viewx;
++    tr_y = iy - viewy;
+ 	
+     gxt = FixedMul(tr_x,viewcos); 
+     gyt = -FixedMul(tr_y,viewsin);
+@@ -511,8 +535,8 @@
+     if (sprframe->rotate)
+     {
+ 	// choose a different rotation based on player view
+-	ang = R_PointToAngle (thing->x, thing->y);
+-	rot = (ang-thing->angle+(unsigned)(ANG45/2)*9)>>29;
++	ang = R_PointToAngle (ix, iy);
++	rot = (ang-iangle+(unsigned)(ANG45/2)*9)>>29;
+ 	lump = sprframe->lump[rot];
+ 	flip = (boolean)sprframe->flip[rot];
+     }
+@@ -542,10 +566,10 @@
+     vis = R_NewVisSprite ();
+     vis->mobjflags = thing->flags;
+     vis->scale = xscale<<detailshift;
+-    vis->gx = thing->x;
+-    vis->gy = thing->y;
+-    vis->gz = thing->z;
+-    vis->gzt = thing->z + spritetopoffset[lump];
++    vis->gx = ix;
++    vis->gy = iy;
++    vis->gz = iz;
++    vis->gzt = iz + spritetopoffset[lump];
+     vis->texturemid = vis->gzt - viewz;
+     vis->x1 = x1 < 0 ? 0 : x1;
+     vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;	
+@@ -665,7 +689,17 @@
+     flip = (boolean)sprframe->flip[0];
+     
+     // calculate edges of the shape
+-    tx = psp->sx-160*FRACUNIT;
++    fixed_t	psx = psp->sx;
++    fixed_t	psy = psp->sy;
++
++    // risc-box: smooth the weapon sway between tics
++    if (R_InterpolateThisFrame() && viewplayer->mo->interp == gametic - 1)
++    {
++	psx = psp->oldsx + FixedMul (fractionaltic, psp->sx - psp->oldsx);
++	psy = psp->oldsy + FixedMul (fractionaltic, psp->sy - psp->oldsy);
++    }
++
++    tx = psx-160*FRACUNIT;
+ 	
+     tx -= spriteoffset[lump];	
+     x1 = (centerxfrac + FixedMul (tx,pspritescale) ) >>FRACBITS;
+@@ -684,7 +718,7 @@
+     // store information in a vissprite
+     vis = &avis;
+     vis->mobjflags = 0;
+-    vis->texturemid = (BASEYCENTER<<FRACBITS)+FRACUNIT/2-(psp->sy-spritetopoffset[lump]);
++    vis->texturemid = (BASEYCENTER<<FRACBITS)+FRACUNIT/2-(psy-spritetopoffset[lump]);
+     vis->x1 = x1 < 0 ? 0 : x1;
+     vis->x2 = x2 >= viewwidth ? viewwidth-1 : x2;	
+     vis->scale = pspritescale<<detailshift;

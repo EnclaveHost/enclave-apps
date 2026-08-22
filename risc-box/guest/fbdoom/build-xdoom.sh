@@ -1,9 +1,13 @@
 set -e
-apt-get update -qq && apt-get install -y -qq gcc-riscv64-linux-gnu make git ca-certificates python3 > /dev/null
+apt-get update -qq && apt-get install -y -qq gcc-riscv64-linux-gnu make git ca-certificates python3 patch > /dev/null
 git clone -q --depth 1 https://github.com/maximevince/fbDOOM /fb
 cd /fb/fbdoom
 cp /src/i_video_x11raw.c .
 cp /src/i_sound_rbx.c .
+# uncapped rendering with world-state interpolation (-uncapped, -fpsmax N):
+# render between the 35 Hz tics, blending mobj/view/psprite state by the
+# wall-clock sub-tic phase, so the presented rate is bounded by the machine.
+patch -p2 < /src/uncapped.patch
 # MUSIC. fbDOOM keeps i_oplmusic.c but strips everything under it: no mus2mid,
 # no midifile, no memio, no opl/ at all. Those come from chocolate-doom
 # (same GPL2 lineage) in /src/music, together with opl_rbx.c — a synchronous

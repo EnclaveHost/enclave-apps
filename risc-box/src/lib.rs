@@ -634,6 +634,36 @@ impl App {
         self.fps_now
     }
 
+    /// Device-level display counters for chasing capture bugs: which surface
+    /// moved, what the scanout holds. Cheap (sums 4 KiB), debug-grade.
+    fn gpu_debug_json(&self) -> String {
+        match self.emu.as_ref() {
+            Some(emu) => {
+                let flushes = emu.gpu_flushes();
+                let fbb = emu.fb_bytes();
+                let mode = emu.gpu_mode();
+                // scanout, read directly with prefer_gpu (full-size buffer)
+                let mut buf = vec![0u8; display::fb_bytes()];
+                let from_gpu = emu.read_display(display::FB_BASE, &mut buf, true);
+                let scan_sum: u64 = buf.iter().map(|&b| b as u64).sum();
+                // the REAL capture path, arbitration included
+                display::Display::capture(emu, &mut buf);
+                let cap_sum: u64 = buf.iter().map(|&b| b as u64).sum();
+                let sum = if from_gpu { 1u64 } else { 0 };
+                format!(
+                    "{{\"flushes\":{},\"fbBytes\":{},\"mode\":\"{}\",\"fromGpu\":{},\"scanSum\":{},\"capSum\":{}}}",
+                    flushes,
+                    fbb,
+                    mode.map(|(w, h)| format!("{}x{}", w, h)).unwrap_or_default(),
+                    sum,
+                    scan_sum,
+                    cap_sum
+                )
+            }
+            None => "null".into(),
+        }
+    }
+
     fn mips(&self) -> f64 {
         match self.boot_at {
             Some(t) if self.instret > 0 => {
@@ -680,7 +710,7 @@ impl App {
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
              \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
-             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{}{img}}}",
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
@@ -745,6 +775,7 @@ impl App {
                 .map(|(res, x, y, n)| format!(
                     "{{\"res\":{},\"x\":{},\"y\":{},\"updates\":{}}}", res, x, y, n))
                 .unwrap_or_else(|| "null".into()),
+            self.gpu_debug_json(),
         )
     }
 }
@@ -1916,7 +1947,7 @@ pub fn run() {
                 // than behind a method because `emu` holds a borrow of app.emu
                 // for the rest of this block, and these are disjoint fields.
                 {
-                    let bytes = emu.fb_bytes();
+                    let bytes = emu.fb_bytes().wrapping_add(emu.gpu_flush_bytes());
                     let now = Instant::now();
                     let dt = now.duration_since(app.fps_at).as_secs_f64();
                     if dt >= 1.0 {
@@ -2181,7 +2212,7 @@ pub fn run() {
                             }
                         }
                         let mut fresh = vec![0u8; display::fb_bytes()];
-                        emu.read_physical_range(display::FB_BASE, &mut fresh);
+                        Display::capture(emu, &mut fresh);
                         if let Some((_, enc)) = app.venc.as_mut() {
                             let frames = enc.encode_capture(&fresh).unwrap_or_else(|| {
                                 let (rgb, w, h) = video::rgb_from_capture(&fresh);

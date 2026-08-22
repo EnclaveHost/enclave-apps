@@ -473,6 +473,12 @@ impl Emulator {
 		self.cpu.get_mmu().get_gpu().flushes()
 	}
 
+	/// risc-box patch: bytes named by scanout flush rects — the GPU path's
+	/// painted-bytes counter (see MemoryWrapper::fb_bytes for the simplefb's).
+	pub fn gpu_flush_bytes(&self) -> u64 {
+		self.cpu.get_mmu().get_gpu().flush_bytes()
+	}
+
 	pub fn gpu_mode(&self) -> Option<(u32, u32)> {
 		self.cpu.get_mmu().get_gpu().scanout().map(|(w, h, _)| (w, h))
 	}

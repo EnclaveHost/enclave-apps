@@ -85,7 +85,14 @@ xterm -fn fixed -geometry 60x18+660+430 -bg "#101020" -fg "#c8d0ff" \
 # screen. -scaling 2 is a 640x400 window, the size this image's own launcher
 # always used.
 ( sleep 5
-  DISPLAY=:0 /usr/bin/xdoom -overlay -scaling 2 -iwad /usr/share/games/doom/freedoom1.wad \
+  # NO -overlay on the virtio-gpu image. The overlay mmaps /dev/fb0 and
+  # paints DOOM straight into the simple-framebuffer, which was a 1.33x
+  # win while fb0 WAS the screen. With Xorg on /dev/dri/card0 nothing
+  # scans fb0 out any more, so those writes are invisible -- measured at
+  # 13 MB every 2 s of emulated memory traffic for a buffer nobody reads.
+  # The frames reach the screen through X either way (verified by
+  # snapshot: live game in the scanout), so dropping it RECLAIMS work.
+  DISPLAY=:0 /usr/bin/xdoom -uncapped -scaling 2 -iwad /usr/share/games/doom/freedoom1.wad \
     >/var/log/xdoom.log 2>&1 ) &
 
 # On a ~25 MIPS core the WM can sit for minutes after startup without ever

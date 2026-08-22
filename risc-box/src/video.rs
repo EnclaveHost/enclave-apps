@@ -102,7 +102,10 @@ pub fn rgb_to_i420(rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>
 /// swap. Returns `(rgb, w, h)`.
 pub fn capture_rgb(emu: &Emulator) -> (Vec<u8>, usize, usize) {
     let mut fresh = vec![0u8; fb_bytes()];
-    emu.read_physical_range(FB_BASE, &mut fresh);
+    // Through the display path, not a raw simple-framebuffer read: on a
+    // virtio-gpu image the desktop lives in the scanout resource and the
+    // simplefb stays black — every video consumer went dark with it.
+    crate::display::Display::capture(emu, &mut fresh);
     let (rgb, w, h) = rgb_from_capture(&fresh);
     (rgb, w, h)
 }

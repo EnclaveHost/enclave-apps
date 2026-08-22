@@ -53,6 +53,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/fb.h>
+#include <stddef.h>
 
 // globals the rest of the tree expects from a video/input backend
 byte *I_VideoBuffer = NULL;

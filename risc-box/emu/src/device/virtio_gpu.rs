@@ -180,6 +180,10 @@ pub struct VirtioGpu {
     /// one bounding box: the display path wants "what do I re-encode", and a
     /// list of rects it would union anyway costs more to carry than it saves.
     dirty: Option<Rect>,
+    /// Bytes named by scanout flush rectangles (w*h*4 per flush) — the GPU
+    /// path's equivalent of the simple-framebuffer's painted-bytes counter,
+    /// so an honest frame rate exists whichever device drives the screen.
+    flush_bytes: u64,
     /// Monotonic count of flushes to the bound scanout. The host uses this to
     /// tell which display device the guest is actually DRAWING to, which is
     /// not the same question as which one exists — see `flushes()`.
@@ -227,6 +231,7 @@ impl VirtioGpu {
             scanout_rect: Rect::default(),
             dirty: None,
             flushes: 0,
+            flush_bytes: 0,
             display_width: width,
             display_height: height,
             virgl: None,
@@ -291,6 +296,10 @@ impl VirtioGpu {
     /// host compare the two surfaces and follow whichever is moving.
     pub fn flushes(&self) -> u64 {
         self.flushes
+    }
+
+    pub fn flush_bytes(&self) -> u64 {
+        self.flush_bytes
     }
 
     pub fn is_active(&self) -> bool {
@@ -498,6 +507,9 @@ impl VirtioGpu {
         if resource_id == self.scanout_resource {
             self.mark_dirty(r);
             self.flushes = self.flushes.wrapping_add(1);
+            self.flush_bytes = self
+                .flush_bytes
+                .wrapping_add(r.width as u64 * r.height as u64 * BPP as u64);
         }
         Self::resp_hdr(req, RESP_OK_NODATA)
     }
@@ -832,6 +844,7 @@ impl VirtioGpu {
         self.scanout_resource = 0;
         self.dirty = None;
         self.flushes = 0;
+        self.flush_bytes = 0;
         self.cursor = None;
     }
 
