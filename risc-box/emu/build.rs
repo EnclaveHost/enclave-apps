@@ -85,6 +85,35 @@ fn main() {
         let _ = writeln!(members, "\t],");
         emit_region_fn(&mut s, i, blocks);
     }
+    // pc -> (handle, arm) for every member of every region, pc-sorted for
+    // binary search at block-build time. Overlapping regions: the pc goes to
+    // the region with the most members (the bigger compiled context).
+    {
+        let mut entries: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
+        for (h_idx, (_h, blocks)) in kept.iter().enumerate() {
+            for (arm, &(pc, _)) in blocks.iter().enumerate() {
+                let better = match entries.get(&pc) {
+                    Some(&(old_h, _)) => blocks.len() > kept[old_h].1.len(),
+                    None => true,
+                };
+                if better {
+                    entries.insert(pc, (h_idx, arm));
+                }
+            }
+        }
+        let mut sorted: Vec<(u64, usize, usize)> =
+            entries.into_iter().map(|(pc, (h, a))| (pc, h, a)).collect();
+        sorted.sort();
+        let mut rows = String::new();
+        for (pc, h, a) in &sorted {
+            let _ = writeln!(rows, "\t({:#x}, {}, {}),", pc, h, a);
+        }
+        let _ = writeln!(
+            s,
+            "pub(crate) static AOT_ENTRIES: &[(u64, u32, u32)] = &[\n{}];",
+            rows
+        );
+    }
     let _ = writeln!(s, "pub(crate) static AOT_HASHES: &[u64] = &[\n{}];", hashes);
     let _ = writeln!(s, "pub(crate) static AOT_FNS: &[AotFn] = &[\n{}];", fns);
     // per-region member blocks as (start pc, [(uncompressed word, len)]) — the

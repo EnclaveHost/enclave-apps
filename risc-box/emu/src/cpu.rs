@@ -857,6 +857,29 @@ impl Cpu {
 						}
 						done += r;
 					} else if (self.pc & 0xfff) <= 0xff8 && self.build_block(slot) {
+						// A freshly built block whose pc is a baked-region
+						// entry installs its dispatch slot HERE — matching by
+						// entry pc, not by re-forming the profiler's regions:
+						// live formation is sampled and never reproduces the
+						// same member sets (436 of 2681 entries matched), and
+						// content verification already carries the safety.
+						#[cfg(feature = "aot")]
+						if self.tier2.as_ref().map_or(false, |t| t.aot) {
+							let pc = self.block_heads[slot].tag;
+							if let Ok(i) =
+								AOT_ENTRIES.binary_search_by_key(&pc, |e| e.0)
+							{
+								let (_, handle, entry) = AOT_ENTRIES[i];
+								if self.aot_verified(handle) {
+									self.aot_slots[slot] = AotSlot {
+										tag: pc,
+										handle,
+										entry,
+										gen: self.mmu.code_gen(),
+									};
+								}
+							}
+						}
 						let r = self.exec_block(slot);
 						#[cfg(feature = "blockstats")]
 						{
@@ -1199,13 +1222,26 @@ impl Cpu {
 		}
 		#[cfg(feature = "aot")]
 		if t.aot {
-			// mirror the map into the hash-free dispatch slots
-			for s in self.aot_slots.iter_mut() {
-				*s = AotSlot::EMPTY;
-			}
-			for (pc, handle, entry, g) in t.t2.compiled_entries() {
-				let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
-				self.aot_slots[slot] = AotSlot { tag: pc, handle, entry, gen: g };
+			// Heal sweep: a block built while its region's members were not
+			// yet paged in failed verification once and would otherwise stay
+			// uninstalled until eviction. Walk the live block cache and
+			// (re)install every baked entry that verifies NOW. Also covers
+			// entries whose slot was clobbered by an aliasing install.
+			let gen = self.mmu.code_gen();
+			for slot in 0..BLOCK_SLOTS {
+				let h = self.block_heads[slot];
+				if h.tag == 0 || h.code_gen != gen {
+					continue;
+				}
+				if self.aot_slots[slot].tag == h.tag && self.aot_slots[slot].gen == gen {
+					continue;
+				}
+				if let Ok(i) = AOT_ENTRIES.binary_search_by_key(&h.tag, |e| e.0) {
+					let (_, handle, entry) = AOT_ENTRIES[i];
+					if self.aot_verified(handle) {
+						self.aot_slots[slot] = AotSlot { tag: h.tag, handle, entry, gen };
+					}
+				}
 			}
 		}
 		self.tier2 = Some(t);
