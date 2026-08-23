@@ -208,6 +208,21 @@ impl Server {
             .unwrap_or(0)
     }
 
+    /// Bytes queued for ANY connection, across every topic and plain response.
+    ///
+    /// The event loop needs this to know whether it owes the host runtime a
+    /// slice. A wasip2 output-stream is not the socket: bytes handed to
+    /// `write` sit in the engine's stream worker until the runtime runs it,
+    /// and `check_write` reports no permit (std: `WouldBlock`) while a flush
+    /// is still pending. That worker only runs when the guest yields — so an
+    /// app that never sleeps can queue a stream it will never deliver, with
+    /// the kernel socket sitting empty and writable the whole time (measured:
+    /// 200 KiB stuck, Send-Q 0, "nothing drained for 45s", and the watcher
+    /// reaped for a stall that was ours).
+    pub fn pending_bytes(&self) -> usize {
+        self.conns.iter().map(|c| c.wbuf.len()).sum()
+    }
+
     /// True when any subscriber of `topic` has just drained out of starvation
     /// (clears the flag). A skipped event is dropped, never delivered late, so
     /// the app owes recovered subscribers a complete picture: a whole-frame

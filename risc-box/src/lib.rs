@@ -2330,6 +2330,31 @@ pub fn run() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         } else if !busy && !flushed {
             std::thread::sleep(std::time::Duration::from_millis(1));
+        } else if !flushed && server.pending_bytes() > 0 {
+            // Queued output that would not go out this turn: yield a slice so
+            // the host runtime can run its stream worker.
+            //
+            // This is the difference between a stream that runs and one that
+            // dies. Handing bytes to a wasip2 output-stream does not put them
+            // on the socket; the engine's worker does, when the runtime gets
+            // to run, which on a busy guest is only when we sleep. The old
+            // condition slept just when the loop had nothing to do — so a
+            // watcher made the loop busy every turn, the loop stopped
+            // yielding, the worker never ran, `check_write` kept reporting no
+            // permit, and the queue grew until the watcher was reaped at
+            // WRITE_STALL. Measured with one reader on a fresh machine: 28 KiB
+            // delivered, ~200 KiB stuck, kernel Send-Q 0 (the socket was empty
+            // and writable the entire time), watcher dropped at 45s. Moonlight
+            // saw that as a black screen; the browser saw a stream that
+            // stopped a second after it started.
+            //
+            // Gated on the flush having moved NOTHING, so this costs the
+            // guest nothing while a stream keeps up (handing bytes to the
+            // stream counts as movement) and pays 1 ms only on the turns
+            // where the engine says it has no room — which is exactly the
+            // backpressure signal, and self-paces the stream to the rate the
+            // link and the runtime can actually carry.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 }
