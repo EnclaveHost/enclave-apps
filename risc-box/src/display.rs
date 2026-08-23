@@ -147,6 +147,34 @@ pub struct Display {
 /// the saving is real.
 const FULL_SCAN_EVERY: u32 = 60;
 
+/// The game's overlay rectangle (packed x<<48|y<<32|w<<16|h) and when it was
+/// last written, in millis since the first capture.
+///
+/// Module scope rather than function scope because TWO decisions need it: the
+/// composite that paints the rectangle, and the arbiter that decides which
+/// surface is the live one. The arbiter has to know that framebuffer traffic
+/// belongs to the overlay, or the overlay's own writes convince it the dead
+/// simple-framebuffer is the screen — which streams a black desktop with the
+/// game floating on it (measured: desktop pixels 0,0,0 where fluxbox paints
+/// #1a1a2e).
+static OVERLAY_RECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OVERLAY_FRESH_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OVERLAY_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn overlay_now_ms() -> u64 {
+    OVERLAY_EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Is a game overlay painting the framebuffer right now?
+///
+/// Same one-second window the composite uses, so the two agree by
+/// construction: while this is true the framebuffer's byte counter is the
+/// game's doing and says nothing about which surface the DESKTOP lives on.
+fn overlay_is_fresh() -> bool {
+    OVERLAY_RECT.load(Ordering::Relaxed) != 0
+        && overlay_now_ms().saturating_sub(OVERLAY_FRESH_MS.load(Ordering::Relaxed)) <= 1000
+}
+
 impl Display {
     pub fn new() -> Self {
         Display {
@@ -220,26 +248,20 @@ impl Display {
     /// painting stops being composited after a second, and X's own (stale)
     /// window contents show, which is the same frame the game last drew.
     fn composite_overlay(emu: &Emulator, out: &mut [u8]) {
-        use std::sync::atomic::AtomicU64;
-        // packed x<<48|y<<32|w<<16|h, and the freshness stamp in millis
-        static RECT: AtomicU64 = AtomicU64::new(0);
-        static FRESH_MS: AtomicU64 = AtomicU64::new(0);
-        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let epoch = *EPOCH.get_or_init(std::time::Instant::now);
-        let now_ms = epoch.elapsed().as_millis() as u64;
+        let now_ms = overlay_now_ms();
         if let Some((x, y, w, h)) = emu.fb_take_overlay_rect() {
             // ignore boot-console noise: the overlay is a WINDOW, not the
             // whole screen; full-height rects are fbcon, not the game
             if (h as usize) < fb_h() {
-                RECT.store(
+                OVERLAY_RECT.store(
                     (x as u64) << 48 | (y as u64) << 32 | (w as u64) << 16 | h as u64,
                     Ordering::Relaxed,
                 );
-                FRESH_MS.store(now_ms, Ordering::Relaxed);
+                OVERLAY_FRESH_MS.store(now_ms, Ordering::Relaxed);
             }
         }
-        let packed = RECT.load(Ordering::Relaxed);
-        if packed == 0 || now_ms.saturating_sub(FRESH_MS.load(Ordering::Relaxed)) > 1000 {
+        let packed = OVERLAY_RECT.load(Ordering::Relaxed);
+        if packed == 0 || now_ms.saturating_sub(OVERLAY_FRESH_MS.load(Ordering::Relaxed)) > 1000 {
             return;
         }
         let (x, y, w, h) = (
@@ -280,7 +302,13 @@ impl Display {
 
         let fb = emu.fb_bytes();
         let flushes = emu.gpu_flushes();
-        let fb_moved = fb != LAST_FB.swap(fb, Ordering::Relaxed);
+        // Movement the OVERLAY caused is not evidence about the desktop: the
+        // game paints the simple-framebuffer deliberately, into memory nothing
+        // scans out, precisely so the host can composite it. Counting it here
+        // is what dragged the source back to fb0 and streamed a black desktop
+        // with only the game rectangle on it — the optimization defeating the
+        // capture it exists to feed.
+        let fb_moved = fb != LAST_FB.swap(fb, Ordering::Relaxed) && !overlay_is_fresh();
         let gpu_moved = flushes != LAST_FLUSHES.swap(flushes, Ordering::Relaxed);
         match (gpu_moved, fb_moved) {
             (true, false) => USE_GPU.store(true, Ordering::Relaxed),

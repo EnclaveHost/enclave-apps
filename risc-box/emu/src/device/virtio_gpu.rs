@@ -363,7 +363,7 @@ impl VirtioGpu {
             CMD_GET_DISPLAY_INFO => self.get_display_info(req),
             CMD_RESOURCE_CREATE_2D => self.resource_create_2d(req),
             CMD_RESOURCE_UNREF => self.resource_unref(req),
-            CMD_SET_SCANOUT => self.set_scanout(req),
+            CMD_SET_SCANOUT => self.set_scanout(memory, req),
             CMD_RESOURCE_FLUSH => self.resource_flush(req),
             CMD_TRANSFER_TO_HOST_2D => self.transfer_to_host_2d(memory, req),
             CMD_RESOURCE_ATTACH_BACKING => self.attach_backing(req),
@@ -469,7 +469,7 @@ impl VirtioGpu {
         Self::resp_hdr(req, RESP_OK_NODATA)
     }
 
-    fn set_scanout(&mut self, req: &[u8]) -> Vec<u8> {
+    fn set_scanout(&mut self, memory: &mut MemoryWrapper, req: &[u8]) -> Vec<u8> {
         let r = rect_at(req, CTRL_HDR_LEN);
         let scanout_id = le32(req, CTRL_HDR_LEN + 16);
         let resource_id = le32(req, CTRL_HDR_LEN + 20);
@@ -486,6 +486,19 @@ impl VirtioGpu {
             return Self::resp_hdr(req, RESP_ERR_INVALID_RESOURCE_ID);
         }
         self.scanout_resource = resource_id;
+        // Pull the whole resource, once, right here.
+        //
+        // The host's copy is only ever written by TRANSFER_TO_HOST_2D, and the
+        // guest only transfers what it has just DAMAGED. Everything already on
+        // screen when this buffer became the scanout — the root window, an idle
+        // terminal, any window that is not animating — has no damage to report
+        // and would never arrive, so the stream showed a black desktop with
+        // only the moving parts painted on it (measured: desktop pixels 0,0,0
+        // until an xsetroot forced a repaint, after which the whole screen was
+        // correct). Reading the backing store directly costs one full-frame
+        // copy per mode set and makes the host's copy true from the first
+        // frame instead of eventually.
+        self.pull_whole_resource(memory, resource_id);
         self.scanout_rect = r;
         // The guest just told us the mode. This is the whole point of the
         // device over a simple-framebuffer: geometry comes from the guest at
@@ -512,6 +525,26 @@ impl VirtioGpu {
                 .wrapping_add(r.width as u64 * r.height as u64 * BPP as u64);
         }
         Self::resp_hdr(req, RESP_OK_NODATA)
+    }
+
+    /// Copy an entire resource out of the guest's backing pages.
+    ///
+    /// Same mechanics as `transfer_to_host_2d` with a full-surface rect and a
+    /// zero offset, minus the request parsing: the linear resource maps
+    /// row-for-row onto the scatter-gather backing, so one walk fills it.
+    fn pull_whole_resource(&mut self, memory: &mut MemoryWrapper, resource_id: u32) {
+        let Some(res) = self.resources.get(&resource_id) else { return };
+        if res.backing.is_empty() || res.pixels.is_empty() {
+            return;
+        }
+        let len = res.pixels.len();
+        let backing = res.backing.clone();
+        let mut buf = vec![0u8; len];
+        read_backing(memory, &backing, 0, &mut buf);
+        if let Some(res) = self.resources.get_mut(&resource_id) {
+            res.pixels.copy_from_slice(&buf);
+        }
+        self.mark_dirty(Rect { x: 0, y: 0, width: self.display_width, height: self.display_height });
     }
 
     /// Pull the guest's pixels into the host's copy of the resource.

@@ -105,7 +105,10 @@ pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
 /// floor (8–16 ms), but 60–120 encodes a second would just spread the bitrate
 /// thinner and burn the worker core; the target is a stable 30 fps stream, so
 /// cap a little above it and let per-frame quality keep the headroom.
-pub const VIDEO_MIN_INTERVAL: Duration = Duration::from_millis(25);
+// 60 fps is the target the stream is judged against, so the floor has to
+// admit it: at 25 ms the pacing itself capped a perfect machine at 40.
+// 16 ms leaves the guest's paint rate and the encoder as the only limits.
+pub const VIDEO_MIN_INTERVAL: Duration = Duration::from_millis(16);
 
 /// One captured framebuffer, plus what the watchers currently want done to it.
 pub struct Job {
