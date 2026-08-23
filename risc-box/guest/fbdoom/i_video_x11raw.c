@@ -745,6 +745,16 @@ void I_FinishUpdate(void)
         x_resolve_origin();
     int overlay = fbmem && visible && org_x >= 0 && org_y >= 0
         && org_x + win_w <= fb_w_px && org_y + win_h <= fb_h_px;
+    {
+        static int last_overlay = -1;
+        if (overlay != last_overlay) {
+            printf("overlay %s: visible=%d org=%d,%d win=%dx%d fb=%dx%d\n",
+                   overlay ? "ON" : "off", visible, org_x, org_y,
+                   win_w, win_h, fb_w_px, fb_h_px);
+            fflush(stdout);
+            last_overlay = overlay;
+        }
+    }
     uint8_t *dst_base = overlay
         ? fbmem + (size_t)org_y * fb_stride + (size_t)org_x * 4
         : (uint8_t *)img;
@@ -1072,13 +1082,40 @@ static void x_pump(int blocking)
                     org_x = *(int16_t *)(ev + 12);
                     org_y = *(int16_t *)(ev + 14);
                     tc_pending = 0;
+                    printf("origin resolved: %d,%d\n", org_x, org_y);
+                    fflush(stdout);
                 }
                 break;
             }
             case 15:     // VisibilityNotify
                 visible = (ev[8] == 0);
+                printf("VisibilityNotify state=%d\n", ev[8]);
+                fflush(stdout);
+                // Obscured means the overlay is dead until the stacking
+                // changes, and nothing else on this desktop will change it —
+                // the appliance launches its clients once and no one raises.
+                // So raise ourselves: one ConfigureWindow(stack-mode Above).
+                // The WM intercepts it (SubstructureRedirect) and fluxbox
+                // honors client restacks. Guarded to once per obscuring so
+                // two raising clients cannot fight.
+                if (ev[8] != 0) {
+                    struct {
+                        uint8_t op, pad;
+                        uint16_t len;
+                        uint32_t window;
+                        uint16_t mask, pad2;
+                        uint32_t value;
+                    } cw = { 12, 0, 4, win, 0x40, 0, 0 }; // stack-mode Above
+                    wr(&cw, sizeof(cw));
+                    printf("raised window over obscurer\n");
+                    fflush(stdout);
+                }
                 break;
             case 22:     // ConfigureNotify: the window moved or resized
+                printf("ConfigureNotify x=%d y=%d w=%u h=%u\n",
+                       *(int16_t *)(ev + 16), *(int16_t *)(ev + 18),
+                       *(uint16_t *)(ev + 20), *(uint16_t *)(ev + 22));
+                fflush(stdout);
                 org_x = org_y = -1;   // re-resolved before the next overlay frame
                 if (tc_pending)
                     tc_discard++;     // any answer in flight names the old spot
