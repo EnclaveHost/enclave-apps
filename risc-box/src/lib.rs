@@ -928,6 +928,168 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 .body("text/css; charset=utf-8", XTERM_CSS.as_bytes().to_vec()),
         ),
         ("GET", "/status") => server.respond(key, json(200, "OK", app.status_json())),
+        ("GET", "/console") => {
+            // hand the late joiner the retained scrollback as the first frame
+            let sb: Vec<u8> = app.scrollback.iter().copied().collect();
+            let initial = if sb.is_empty() {
+                String::new()
+            } else {
+                format!("data: {}\n\n", b64(&sb))
+            };
+            server.upgrade_sse(key, "console", &initial);
+        }
+        ("POST", "/start") => {
+            if app.phase == Phase::Running {
+                return server.respond(key, json(409, "Conflict", err("already running")));
+            }
+            let missing = app.cfg.missing();
+            if !missing.is_empty() {
+                return server.respond(key, json(400, "Bad Request", err(&format!(
+                    "configuration incomplete: {} not set — set the deployment's config/secrets and restart",
+                    missing.join(", ")
+                ))));
+            }
+            let v: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let creds = creds_from(&v);
+            let reset = v.get("reset").and_then(|x| x.as_bool()).unwrap_or(false);
+            app.pending = Some(Start { creds, reset });
+            app.retry = 0; // an operator start gets a fresh retry budget
+            app.retry_at = None;
+            app.retry_start = None;
+            server.respond(key, json(202, "Accepted", "{\"ok\":true,\"phase\":\"loading\"}".into()));
+        }
+        ("POST", "/input") => {
+            if let (Phase::Running, Some(emu)) = (app.phase, app.emu.as_mut()) {
+                let t = emu.get_mut_terminal();
+                for &b in &req.body {
+                    t.put_input(b);
+                }
+                // run full batches until the UART has had time to drain this
+                // input (it polls its terminal every ~230k ticks, one byte per
+                // poll), else the idle throttle would add ~100ms per keystroke
+                app.input_boost = app.input_boost.max(req.body.len() as u64 + 2);
+                server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
+            } else {
+                server.respond(key, json(409, "Conflict", err("machine is not running")));
+            }
+        }
+        ("POST", "/hid") => hid(app, server, key, &req.body),
+        // The streamed variant: this request never ends and is never answered;
+        // each newline-delimited body line arrives back through poll() as a
+        // synthesized /hid-stream-event and is injected with zero per-batch
+        // framing or response work (see httpd::upgrade_instream).
+        ("POST", "/hid-stream") => server.upgrade_instream(key, "/hid-stream-event"),
+        ("POST", "/hid-stream-event") => hid_inner(app, server, key, &req.body, false),
+        ("POST", "/exec") => exec(app, server, key, &req.body),
+        ("POST", "/save") => save(app, server, key),
+        ("POST", "/stop") => {
+            app.emu = None;
+            app.phase = Phase::Halted;
+            app.boot_at = None;
+            app.display.reset();
+            worker::reset();
+            app.venc = None;
+            server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
+        }
+        ("GET", "/display") => {
+            // the machine's screen: metadata first, then bands (display.rs).
+            // The joiner needs the WHOLE frame once — force it on the next
+            // scan (a broadcast reaches existing watchers too; a duplicate
+            // full band is idempotent on a canvas).
+            app.display.want_full();
+            worker::want_full();
+            let initial = format!(
+                "event: mode\ndata: {{\"w\":{},\"h\":{}}}\n\n",
+                display::fb_w(), display::fb_h()
+            );
+            server.upgrade_sse(key, "display", &initial);
+        }
+        // The efficient video stream: the guest desktop encoded as AV1 in the
+        // app (rav1e, inter-frame), each coded frame shipped base64 over SSE.
+        // The browser decodes it with WebCodecs (see index.html). A fresh
+        // watcher forces a new encoder (below), so the first frame it sees is a
+        // keyframe. `event: codec` carries the WebCodecs codec string + size.
+        // GET /audio — take what the sound card has played since the last
+        // call: {"rate":48000,"channels":2,"playing":true,"dropped":0,
+        // "pcm":"<base64 s16le interleaved>"}. Taking is destructive, so one
+        // consumer at a time; `max` caps the bite (default 64 KiB).
+        //
+        // Deliberately a pull, not an SSE stream: the device paces the guest
+        // by NOT completing its playback buffers until the ring drains (see
+        // emu/src/device/virtio_snd.rs), so whoever pulls sets the clock. A
+        // consumer that stops pulling stalls the guest's writes rather than
+        // running ahead of real time, which is the behaviour a sound card has.
+        ("GET", "/audio") => {
+            if app.phase != Phase::Running || app.emu.is_none() {
+                return server.respond(key, json(409, "Conflict", err("machine is not running")));
+            }
+            // `?stream=1` is how a player should take audio: an SSE stream the
+            // loop pushes into as the card plays, rather than a poll. Polling
+            // cost a request round trip per chunk — over the fleet's relay that
+            // is 100-400 ms of jitter on a stream consumed in 5 ms frames, so
+            // the listener alternately starved (a chop) and sat on a backlog
+            // (delay). Each event carries its own rate/channels because the
+            // guest can reopen the card with different ones.
+            if form_get(&req.query, "stream").is_some() {
+                let emu = app.emu.as_mut().expect("emu present (checked above)");
+                let (rate, channels, _playing, _pending, _dropped) = emu.audio_state();
+                let initial = format!(
+                    "event: format\ndata: {{\"rate\":{},\"channels\":{}}}\n\n",
+                    rate, channels
+                );
+                return server.upgrade_sse(key, "audio", &initial);
+            }
+            let max = form_get(&req.query, "max")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64 * 1024)
+                .min(512 * 1024);
+            let emu = app.emu.as_mut().expect("emu present (checked above)");
+            let (rate, channels, playing, _pending, dropped) = emu.audio_state();
+            let mut pcm = emu.take_audio(max);
+            app.opl.mix(emu, &mut pcm, rate, channels);
+            let body = format!(
+                "{{\"rate\":{},\"channels\":{},\"playing\":{},\"dropped\":{},\"bytes\":{},\"pcm\":\"{}\"}}",
+                rate, channels, playing, dropped, pcm.len(), b64(&pcm)
+            );
+            server.respond(key, json(200, "OK", body))
+        }
+        ("GET", "/video") => {
+            // `?codec=h264` selects the Moonlight-native stream (Annex-B over
+            // the same base64 SSE), `av1` (the default) stays the browser's
+            // WebCodecs codec. One encoder exists at a time: the codec of the
+            // most recent joiner wins and the switch rebuilds it, so the new
+            // stream leads with a keyframe either way. `?kbps=` sets the VBV
+            // target (defaults: 3000 h264, 4000 av1).
+            let codec = match form_get(&req.query, "codec").as_deref() {
+                Some("h264") => worker::CODEC_H264,
+                _ => worker::CODEC_AV1,
+            };
+            let kbps = form_get(&req.query, "kbps")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            worker::set_video_params(codec, kbps);
+            app.venc = None; // rebuild inline too, so the joiner gets an IDR
+            worker::reset();
+            let codec_str = match codec {
+                worker::CODEC_H264 => "avc1.42E020",
+                _ => "av01.0.08M.08",
+            };
+            let initial = format!(
+                "event: codec\ndata: {{\"codec\":\"{}\",\"w\":{},\"h\":{}}}\n\n",
+                codec_str, display::fb_w(), display::fb_h()
+            );
+            server.upgrade_sse(key, "video", &initial);
+        }
+        // A stream consumer lost packets and needs a random-access point (the
+        // Moonlight bridge forwards the client's IDR requests here).
+        ("POST", "/video-key") => {
+            worker::force_key();
+            if let Some((_, enc)) = app.venc.as_mut() {
+                enc.force_keyframe();
+            }
+            server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
+        }
         ("GET", "/fb.png") => match (app.phase, app.emu.as_ref()) {
             (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
                 let png = app.display.png(emu);
