@@ -538,11 +538,7 @@ impl VirtioGpu {
     /// row-for-row onto the scatter-gather backing, so one walk fills it.
     fn pull_whole_resource(&mut self, memory: &mut MemoryWrapper, resource_id: u32) {
         let Some(res) = self.resources.get(&resource_id) else { return };
-        // Once per resource. A guest that page-flips between two buffers sets
-        // the scanout every frame, and re-reading a whole surface at that rate
-        // would cost more than the black desktop this fixes; after the first
-        // pull the damage transfers keep the copy true.
-        if res.pulled || res.backing.is_empty() || res.pixels.is_empty() {
+        if res.backing.is_empty() || res.pixels.is_empty() {
             return;
         }
         let len = res.pixels.len();
