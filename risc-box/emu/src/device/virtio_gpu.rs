@@ -153,6 +153,10 @@ struct Resource {
     backing: Vec<(u64, u32)>,
     /// Host-side pixels, `width * height * BPP`, filled by TRANSFER_TO_HOST_2D.
     pixels: Vec<u8>,
+    /// Whether the host copy has been filled from the backing store once.
+    /// Damage transfers keep it current after that, so the full pull is a
+    /// one-time cost per resource rather than a per-flip one.
+    pulled: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -426,7 +430,7 @@ impl VirtioGpu {
         }
         self.resources.insert(
             id,
-            Resource { width, height, backing: Vec::new(), pixels: vec![0u8; bytes] },
+            Resource { width, height, backing: Vec::new(), pixels: vec![0u8; bytes], pulled: false },
         );
         Self::resp_hdr(req, RESP_OK_NODATA)
     }
@@ -534,7 +538,11 @@ impl VirtioGpu {
     /// row-for-row onto the scatter-gather backing, so one walk fills it.
     fn pull_whole_resource(&mut self, memory: &mut MemoryWrapper, resource_id: u32) {
         let Some(res) = self.resources.get(&resource_id) else { return };
-        if res.backing.is_empty() || res.pixels.is_empty() {
+        // Once per resource. A guest that page-flips between two buffers sets
+        // the scanout every frame, and re-reading a whole surface at that rate
+        // would cost more than the black desktop this fixes; after the first
+        // pull the damage transfers keep the copy true.
+        if res.pulled || res.backing.is_empty() || res.pixels.is_empty() {
             return;
         }
         let len = res.pixels.len();
@@ -543,6 +551,7 @@ impl VirtioGpu {
         read_backing(memory, &backing, 0, &mut buf);
         if let Some(res) = self.resources.get_mut(&resource_id) {
             res.pixels.copy_from_slice(&buf);
+            res.pulled = true;
         }
         self.mark_dirty(Rect { x: 0, y: 0, width: self.display_width, height: self.display_height });
     }
@@ -1087,6 +1096,7 @@ mod tests {
         gpu.resources.insert(9, Resource {
             width: 64, height: 64, backing: Vec::new(),
             pixels: vec![0u8; 64 * 64 * BPP],
+            pulled: false,
         });
         gpu.cursor = Some(Cursor { resource_id: 9, x: 300, y: 200, hot_x: 0, hot_y: 0 });
         let _ = gpu.take_dirty(); // start clean
