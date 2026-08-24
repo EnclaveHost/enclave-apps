@@ -252,9 +252,37 @@ impl Display {
         if let Some((x, y, w, h)) = emu.fb_take_overlay_rect() {
             // ignore boot-console noise: the overlay is a WINDOW, not the
             // whole screen; full-height rects are fbcon, not the game
-            if (h as usize) < fb_h() {
+            if (h as usize) < fb_h() && w > 0 && h > 0 {
+                // GROW the composited box to the union of every rect seen while
+                // the overlay is fresh — do NOT shrink it to this frame's
+                // damage. A frame's fb0 write is often a sub-region (a few
+                // changed scanlines), and compositing only that sub-region left
+                // the rest of the game window showing the stale GPU scanout
+                // underneath: the game froze in the stream while fb0 was still
+                // being written every frame. The window does not move, so the
+                // union settles on the whole window within a frame or two and
+                // the composite reads the WHOLE of it from live fb0 each time.
+                let stale = now_ms
+                    .saturating_sub(OVERLAY_FRESH_MS.load(Ordering::Relaxed))
+                    > 1000;
+                let prev = OVERLAY_RECT.load(Ordering::Relaxed);
+                let (nx, ny, nx2, ny2) = if prev == 0 || stale {
+                    (x as u32, y as u32, x as u32 + w as u32, y as u32 + h as u32)
+                } else {
+                    let px = (prev >> 48 & 0xffff) as u32;
+                    let py = (prev >> 32 & 0xffff) as u32;
+                    let px2 = px + (prev >> 16 & 0xffff) as u32;
+                    let py2 = py + (prev & 0xffff) as u32;
+                    (
+                        px.min(x as u32),
+                        py.min(y as u32),
+                        px2.max(x as u32 + w as u32),
+                        py2.max(y as u32 + h as u32),
+                    )
+                };
+                let (uw, uh) = (nx2 - nx, ny2 - ny);
                 OVERLAY_RECT.store(
-                    (x as u64) << 48 | (y as u64) << 32 | (w as u64) << 16 | h as u64,
+                    (nx as u64) << 48 | (ny as u64) << 32 | (uw as u64) << 16 | uh as u64,
                     Ordering::Relaxed,
                 );
                 OVERLAY_FRESH_MS.store(now_ms, Ordering::Relaxed);
@@ -295,30 +323,31 @@ impl Display {
     /// flushes — so follow whichever MOVED since the last frame, and stay put
     /// when neither did (a still screen must not flip the source).
     fn gpu_is_the_live_surface(emu: &Emulator) -> bool {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
-        static LAST_FB: AtomicU64 = AtomicU64::new(0);
-        static LAST_FLUSHES: AtomicU64 = AtomicU64::new(0);
-        static USE_GPU: AtomicBool = AtomicBool::new(false);
+        use std::sync::atomic::AtomicBool;
+        static GPU_SEEN: AtomicBool = AtomicBool::new(false);
 
-        let fb = emu.fb_bytes();
-        let flushes = emu.gpu_flushes();
-        // Movement the OVERLAY caused is not evidence about the desktop: the
-        // game paints the simple-framebuffer deliberately, into memory nothing
-        // scans out, precisely so the host can composite it. Counting it here
-        // is what dragged the source back to fb0 and streamed a black desktop
-        // with only the game rectangle on it — the optimization defeating the
-        // capture it exists to feed.
-        let fb_moved = fb != LAST_FB.swap(fb, Ordering::Relaxed) && !overlay_is_fresh();
-        let gpu_moved = flushes != LAST_FLUSHES.swap(flushes, Ordering::Relaxed);
-        match (gpu_moved, fb_moved) {
-            (true, false) => USE_GPU.store(true, Ordering::Relaxed),
-            (false, true) => USE_GPU.store(false, Ordering::Relaxed),
-            // Both moving means a transition (X starting on card0 while fbcon
-            // still owns fb0); prefer the GPU, which is the one with a client.
-            (true, true) => USE_GPU.store(true, Ordering::Relaxed),
-            (false, false) => {}
+        // Once a virtio-gpu scanout has ever been flushed, this machine has a
+        // GPU desktop, and the GPU scanout is the base FOR GOOD — the game is
+        // composited on top of it (composite_overlay), never shown instead of
+        // it. The previous "whichever surface moved most recently" arbiter
+        // flip-flopped on exactly the frames both moved, and each symptom is
+        // one side of that flip:
+        //
+        //   * A running game paints the simple-framebuffer every frame while a
+        //     still desktop paints nothing, so the arbiter read fb0 alone and
+        //     streamed the game on a black screen until an interaction forced a
+        //     GPU repaint. ("Desktop is black until I click.")
+        //   * During a menu transition both surfaces move, so it alternated
+        //     GPU-with-overlay / fb0-alone frame by frame — the desktop present
+        //     on one frame and gone the next. ("Flashes the frame from right
+        //     before, every other frame.")
+        //
+        // The fb-only DOOM machine has no virtio-gpu, never flushes one, so
+        // GPU_SEEN stays false and it keeps reading the simple-framebuffer.
+        if emu.gpu_flushes() > 0 {
+            GPU_SEEN.store(true, Ordering::Relaxed);
         }
-        USE_GPU.load(Ordering::Relaxed)
+        GPU_SEEN.load(Ordering::Relaxed)
     }
 
     /// Capture, and take the guest's damage report with it. One call so the
