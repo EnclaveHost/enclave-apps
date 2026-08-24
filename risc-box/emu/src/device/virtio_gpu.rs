@@ -284,6 +284,22 @@ impl VirtioGpu {
         }
     }
 
+    /// The scanout's geometry and the guest pages backing it.
+    ///
+    /// The backing IS the live framebuffer: X renders into those pages and
+    /// then asks us to transfer what it dirtied. Reading them directly gives
+    /// the screen as it stands right now, with no dependence on damage
+    /// bookkeeping or on when the guest last bound the scanout — which is
+    /// what the host-side `pixels` copy depends on, and why a desktop painted
+    /// before the bind could stay black forever.
+    pub fn scanout_backing(&self) -> Option<(u32, u32, Vec<(u64, u32)>)> {
+        let res = self.resources.get(&self.scanout_resource)?;
+        match res.backing.is_empty() {
+            true => None,
+            false => Some((res.width, res.height, res.backing.clone())),
+        }
+    }
+
     /// What changed since the last call, as one bounding box. Taking it clears
     /// it, so a caller that skips a frame does not lose the region.
     pub fn take_dirty(&mut self) -> Option<Rect> {

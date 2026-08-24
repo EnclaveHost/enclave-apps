@@ -107,8 +107,10 @@ pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
 /// cap a little above it and let per-frame quality keep the headroom.
 // 60 fps is the target the stream is judged against, so the floor has to
 // admit it: at 25 ms the pacing itself capped a perfect machine at 40.
-// 16 ms leaves the guest's paint rate and the encoder as the only limits.
-pub const VIDEO_MIN_INTERVAL: Duration = Duration::from_millis(16);
+// 14 ms leaves headroom for turn jitter so the delivered rate lands at or
+// above 60 rather than just under it; the capture cost and the encoder are
+// then the only real limits.
+pub const VIDEO_MIN_INTERVAL: Duration = Duration::from_millis(14);
 
 /// One captured framebuffer, plus what the watchers currently want done to it.
 pub struct Job {

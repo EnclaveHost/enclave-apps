@@ -2121,10 +2121,25 @@ pub fn run() {
                 // (measured: a video-only watcher got exactly 10 fps).
                 let scan_still = if snap || watching_video { 0 } else { app.fb_still };
                 if worker::available() {
-                    let due = app.fb_scanned.map_or(true, |t| {
-                        t.elapsed() >= display::scan_interval_boosted(
-                            app.fb_cost, scan_still, snap)
-                    });
+                    // A video watcher paces on the video interval, not on the
+                    // scan's cost-share backoff.
+                    //
+                    // That backoff exists because a scan is charged to the
+                    // guest's own thread, so it caps itself at 1/(1+RATIO) of
+                    // it. With a worker the EXPENSIVE half — the encode — is
+                    // not on this thread at all; the guest pays only the
+                    // capture. Charging the capture as if it still dragged the
+                    // encode behind it held the stream at 4x a ~4.4 ms capture,
+                    // a 17.6 ms cadence, and 55-57 fps measured on a machine
+                    // whose game was running at 78-190. The floor never got a
+                    // say. Pace video on its own interval and let the capture
+                    // cost and the encoder be the real limits.
+                    let interval = match watching_video {
+                        true => worker::VIDEO_MIN_INTERVAL,
+                        false => display::scan_interval_boosted(
+                            app.fb_cost, scan_still, snap),
+                    };
+                    let due = app.fb_scanned.map_or(true, |t| t.elapsed() >= interval);
                     // Two jobs in flight, not one: the worker's encode (23 ms
                     // measured on kryptos) otherwise serializes with the
                     // capture handoff and the whole pipeline runs at
