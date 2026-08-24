@@ -253,36 +253,44 @@ impl Display {
             // ignore boot-console noise: the overlay is a WINDOW, not the
             // whole screen; full-height rects are fbcon, not the game
             if (h as usize) < fb_h() && w > 0 && h > 0 {
-                // GROW the composited box to the union of every rect seen while
-                // the overlay is fresh — do NOT shrink it to this frame's
-                // damage. A frame's fb0 write is often a sub-region (a few
-                // changed scanlines), and compositing only that sub-region left
-                // the rest of the game window showing the stale GPU scanout
-                // underneath: the game froze in the stream while fb0 was still
-                // being written every frame. The window does not move, so the
-                // union settles on the whole window within a frame or two and
-                // the composite reads the WHOLE of it from live fb0 each time.
+                // Track the game window, and let it MOVE. A frame's fb0 write is
+                // often a sub-region (the HUD, a few changed rows), so shrinking
+                // the box to it would leave the rest of the window showing the
+                // stale GPU scanout underneath. But a plain grow-forever union
+                // was worse: dragging the window kept the OLD position in the
+                // box, so the game's stale pixels stayed painted there over the
+                // desktop — "pixels in front of the window" after a move.
+                //
+                // The out is that a move forces a full-window repaint (the WM's
+                // expose), so a BIG damage rect is the signal to snap the box to
+                // the current position; a small one just refreshes in place.
+                // Replace the box when this frame redrew most of it (a full
+                // redraw or a move), keep it for a sub-region update.
                 let stale = now_ms
                     .saturating_sub(OVERLAY_FRESH_MS.load(Ordering::Relaxed))
                     > 1000;
                 let prev = OVERLAY_RECT.load(Ordering::Relaxed);
-                let (nx, ny, nx2, ny2) = if prev == 0 || stale {
-                    (x as u32, y as u32, x as u32 + w as u32, y as u32 + h as u32)
+                let (dx, dy, dw, dh) = (x as u32, y as u32, w as u32, h as u32);
+                let (nx, ny, nw, nh) = if prev == 0 || stale {
+                    (dx, dy, dw, dh)
                 } else {
-                    let px = (prev >> 48 & 0xffff) as u32;
-                    let py = (prev >> 32 & 0xffff) as u32;
-                    let px2 = px + (prev >> 16 & 0xffff) as u32;
-                    let py2 = py + (prev & 0xffff) as u32;
-                    (
-                        px.min(x as u32),
-                        py.min(y as u32),
-                        px2.max(x as u32 + w as u32),
-                        py2.max(y as u32 + h as u32),
-                    )
+                    let pw = (prev >> 16 & 0xffff) as u32;
+                    let ph = (prev & 0xffff) as u32;
+                    let box_area = (pw as u64) * (ph as u64);
+                    let dmg_area = (dw as u64) * (dh as u64);
+                    // A repaint covering half the box or more is a full redraw
+                    // or a move: snap to it. Otherwise keep the box and refresh
+                    // its live pixels in place.
+                    if dmg_area * 2 >= box_area {
+                        (dx, dy, dw, dh)
+                    } else {
+                        let px = (prev >> 48 & 0xffff) as u32;
+                        let py = (prev >> 32 & 0xffff) as u32;
+                        (px, py, pw, ph)
+                    }
                 };
-                let (uw, uh) = (nx2 - nx, ny2 - ny);
                 OVERLAY_RECT.store(
-                    (nx as u64) << 48 | (ny as u64) << 32 | (uw as u64) << 16 | uh as u64,
+                    (nx as u64) << 48 | (ny as u64) << 32 | (nw as u64) << 16 | nh as u64,
                     Ordering::Relaxed,
                 );
                 OVERLAY_FRESH_MS.store(now_ms, Ordering::Relaxed);
