@@ -192,17 +192,25 @@ impl App {
     }
 
     fn auth_header(&self) -> String {
-        // Both forms of the same key: the app accepts either, but the
-        // app.enclave.host gateway CONSUMES Authorization (it is the
-        // gateway's own auth channel for private deployments) and never
-        // forwards it, so through the gateway only x-api-key reaches the
-        // app. Bearer stays for direct/loopback use.
-        let mut h = match &self.api_key {
-            Some(k) => format!("Authorization: Bearer {k}\r\nx-api-key: {k}\r\n"),
-            None => String::new(),
-        };
-        if let Some(t) = &self.app_cookie {
-            h.push_str(&format!("Cookie: enclave_app={t}\r\n"));
+        // A private deployment has TWO checks with DIFFERENT keys: the gateway
+        // authenticates the OWNER, and the app checks its OWN api_key. The
+        // owner token rides as Bearer (the /x/ gateway keeps Authorization)
+        // AND as the enclave_app cookie (the app.enclave.host gateway consumes
+        // Authorization, so the cookie is its channel). The app's key then has
+        // to go as x-api-key, since Authorization is spoken for. A public
+        // deployment has no owner token, so the api_key takes Bearer itself.
+        let mut h = String::new();
+        match (&self.app_cookie, &self.api_key) {
+            (Some(t), Some(k)) => h.push_str(&format!(
+                "Authorization: Bearer {t}\r\nCookie: enclave_app={t}\r\nx-api-key: {k}\r\n"
+            )),
+            (Some(t), None) => h.push_str(&format!(
+                "Authorization: Bearer {t}\r\nCookie: enclave_app={t}\r\n"
+            )),
+            (None, Some(k)) => h.push_str(&format!(
+                "Authorization: Bearer {k}\r\nx-api-key: {k}\r\n"
+            )),
+            (None, None) => {}
         }
         h
     }
