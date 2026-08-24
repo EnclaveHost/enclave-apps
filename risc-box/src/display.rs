@@ -253,19 +253,22 @@ impl Display {
             // ignore boot-console noise: the overlay is a WINDOW, not the
             // whole screen; full-height rects are fbcon, not the game
             if (h as usize) < fb_h() && w > 0 && h > 0 {
-                // Track the game window, and let it MOVE. A frame's fb0 write is
-                // often a sub-region (the HUD, a few changed rows), so shrinking
-                // the box to it would leave the rest of the window showing the
-                // stale GPU scanout underneath. But a plain grow-forever union
-                // was worse: dragging the window kept the OLD position in the
-                // box, so the game's stale pixels stayed painted there over the
-                // desktop — "pixels in front of the window" after a move.
+                // Track the game window: a STABLE size, and a position that
+                // MOVES with the window. Two failure modes bracket this.
                 //
-                // The out is that a move forces a full-window repaint (the WM's
-                // expose), so a BIG damage rect is the signal to snap the box to
-                // the current position; a small one just refreshes in place.
-                // Replace the box when this frame redrew most of it (a full
-                // redraw or a move), keep it for a sub-region update.
+                // A frame's fb0 write is often a sub-region (the HUD, a band of
+                // changed rows), so shrinking the box to each frame's damage
+                // flashed the rest of the window down to the changed sliver and
+                // back — stale-buffer flicker. A plain grow-forever union cured
+                // that but never let go of a vacated position, so dragging the
+                // window smeared the game across the drag path.
+                //
+                // Keep the SIZE stable (the largest extent seen; the window does
+                // not grow mid-play) so the composited box never flickers, and
+                // move the POSITION only on a near-full-window repaint — which is
+                // what a frame of motion draws and what the WM's expose draws
+                // after a move, but a sub-region update is not. So gameplay holds
+                // the box steady and a move snaps it to the new spot.
                 let stale = now_ms
                     .saturating_sub(OVERLAY_FRESH_MS.load(Ordering::Relaxed))
                     > 1000;
@@ -274,19 +277,21 @@ impl Display {
                 let (nx, ny, nw, nh) = if prev == 0 || stale {
                     (dx, dy, dw, dh)
                 } else {
+                    let px = (prev >> 48 & 0xffff) as u32;
+                    let py = (prev >> 32 & 0xffff) as u32;
                     let pw = (prev >> 16 & 0xffff) as u32;
                     let ph = (prev & 0xffff) as u32;
-                    let box_area = (pw as u64) * (ph as u64);
-                    let dmg_area = (dw as u64) * (dh as u64);
-                    // A repaint covering half the box or more is a full redraw
-                    // or a move: snap to it. Otherwise keep the box and refresh
-                    // its live pixels in place.
-                    if dmg_area * 2 >= box_area {
-                        (dx, dy, dw, dh)
+                    // Window size: largest extent seen, clamped so a capture that
+                    // happened to span a move cannot balloon it.
+                    let ww = pw.max(dw).min(fb_w() as u32 * 3 / 4);
+                    let wh = ph.max(dh).min(fb_h() as u32 * 3 / 4);
+                    // >=75% of the window in BOTH dimensions is a full redraw or a
+                    // move: take its position. Anything less keeps the position,
+                    // and the composite still reads the WHOLE box from live fb0.
+                    if dw * 4 >= ww * 3 && dh * 4 >= wh * 3 {
+                        (dx, dy, ww, wh)
                     } else {
-                        let px = (prev >> 48 & 0xffff) as u32;
-                        let py = (prev >> 32 & 0xffff) as u32;
-                        (px, py, pw, ph)
+                        (px, py, ww, wh)
                     }
                 };
                 OVERLAY_RECT.store(
