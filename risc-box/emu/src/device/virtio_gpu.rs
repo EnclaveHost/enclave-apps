@@ -179,6 +179,16 @@ pub struct VirtioGpu {
     resources: HashMap<u32, Resource>,
     /// Resource bound to scanout 0, and the region of it being displayed.
     scanout_resource: u32,
+    /// The screen, accumulated across buffers.
+    ///
+    /// X renders into a shadow and copies only what it dirtied into the
+    /// scanout, and it alternates between two of them — so either buffer on
+    /// its own is missing everything drawn while the other was bound, and
+    /// reading whichever happens to be current made the desktop a coin flip
+    /// (one boot correct, the next black, same build). Damage from whichever
+    /// buffer is live lands HERE instead, so the picture is whole no matter
+    /// how the guest flips.
+    screen: Vec<u8>,
     scanout_rect: Rect,
     /// What the guest has flushed since the host last looked. Coalesced into
     /// one bounding box: the display path wants "what do I re-encode", and a
@@ -232,6 +242,7 @@ impl VirtioGpu {
             queues: [Queue::new(), Queue::new()],
             resources: HashMap::new(),
             scanout_resource: 0,
+            screen: vec![0u8; width as usize * height as usize * BPP],
             scanout_rect: Rect::default(),
             dirty: None,
             flushes: 0,
@@ -278,9 +289,37 @@ impl VirtioGpu {
     /// simple-framebuffer.
     pub fn scanout(&self) -> Option<(u32, u32, &[u8])> {
         let res = self.resources.get(&self.scanout_resource)?;
-        match res.pixels.is_empty() {
-            true => None,
+        if res.pixels.is_empty() {
+            return None;
+        }
+        // The accumulated screen, not this buffer: see `screen`.
+        match self.screen.len() == res.width as usize * res.height as usize * BPP {
+            true => Some((res.width, res.height, &self.screen)),
             false => Some((res.width, res.height, &res.pixels)),
+        }
+    }
+
+    /// Copy a rectangle of the bound buffer into the accumulated screen.
+    fn blit_to_screen(&mut self, r: Rect) {
+        let Some(res) = self.resources.get(&self.scanout_resource) else { return };
+        let (w, h) = (res.width as usize, res.height as usize);
+        if self.screen.len() != w * h * BPP {
+            self.screen = vec![0u8; w * h * BPP];
+        }
+        let x0 = (r.x as usize).min(w);
+        let y0 = (r.y as usize).min(h);
+        let x1 = (x0 + r.width as usize).min(w);
+        let y1 = (y0 + r.height as usize).min(h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = w * BPP;
+        for y in y0..y1 {
+            let a = y * stride + x0 * BPP;
+            let b = y * stride + x1 * BPP;
+            if b <= res.pixels.len() && b <= self.screen.len() {
+                self.screen[a..b].copy_from_slice(&res.pixels[a..b]);
+            }
         }
     }
 
@@ -519,6 +558,8 @@ impl VirtioGpu {
         // copy per mode set and makes the host's copy true from the first
         // frame instead of eventually.
         self.pull_whole_resource(memory, resource_id);
+        let (fw, fh) = (self.display_width, self.display_height);
+        self.blit_to_screen(Rect { x: 0, y: 0, width: fw, height: fh });
         self.scanout_rect = r;
         // The guest just told us the mode. This is the whole point of the
         // device over a simple-framebuffer: geometry comes from the guest at
@@ -538,6 +579,7 @@ impl VirtioGpu {
             return Self::resp_hdr(req, RESP_ERR_INVALID_RESOURCE_ID);
         }
         if resource_id == self.scanout_resource {
+            self.blit_to_screen(r);
             self.mark_dirty(r);
             self.flushes = self.flushes.wrapping_add(1);
             self.flush_bytes = self

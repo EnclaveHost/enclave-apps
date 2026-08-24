@@ -436,30 +436,6 @@ impl Emulator {
 	/// never stranded. Returns true when the pixels came from the GPU.
 	pub fn read_display(&self, fallback_base: u64, out: &mut [u8], prefer_gpu: bool) -> bool {
 		if prefer_gpu {
-			// Prefer the guest's own pages over our copy of them. The copy is
-			// only as complete as the damage the guest has reported since it
-			// bound this scanout; the pages are the screen. Same cost either
-			// way — one full-frame read — so there is no reason to prefer the
-			// version that can be stale.
-			if let Some((w, h, backing)) = self.cpu.get_mmu().get_gpu().scanout_backing() {
-				if (w as usize) * (h as usize) * 4 == out.len() {
-					let mmu = self.cpu.get_mmu();
-					let mut written = 0usize;
-					for (addr, len) in backing {
-						if written >= out.len() {
-							break;
-						}
-						let n = (len as usize).min(out.len() - written);
-						mmu.read_physical_range(addr, &mut out[written..written + n]);
-						written += n;
-					}
-					if written == out.len() {
-						self.cpu.get_mmu().get_gpu().compose_cursor(
-							out, w as usize, h as usize);
-						return true;
-					}
-				}
-			}
 			let dims = match self.cpu.get_mmu().get_gpu().scanout() {
 				// Only serve the GPU scanout when its geometry matches what
 				// the caller sized `out` for. A mode change the host has not
