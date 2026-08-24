@@ -2,7 +2,7 @@
 # DOOM launcher for the RISC Box Alpine desktop (baked as /usr/bin/doom).
 #
 # Launches the SAME game the boot session does: xdoom, the raw-X build with the
-# uncapped renderer, the direct-to-framebuffer overlay, and sound. A relaunch
+# uncapped renderer and sound, rendered through X (no -overlay). A relaunch
 # from the fluxbox menu is then identical to the game that came up at boot,
 # audio included. The old wrapper ran `chocolate-doom -nosound` because the
 # guest had no audio device and SDL's probing wasted emulated time; the guest
@@ -18,7 +18,7 @@ export DISPLAY="${DISPLAY:-:0}" HOME="${HOME:-/root}" XDG_RUNTIME_DIR="${XDG_RUN
 n=0
 while :; do
     t0=$(date +%s)
-    xdoom -uncapped -overlay -scaling 2 "$@" && exit 0
+    xdoom -uncapped -scaling 2 "$@" && exit 0
     dt=$(( $(date +%s) - t0 ))
     [ "$dt" -ge 5 ] && exit 0
     n=$((n+1))
