@@ -78,6 +78,16 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
                            crate::session::PORT_AUDIO),
     }
 
+    // Pace on an ABSOLUTE deadline, not a fixed sleep after the work. The RTP
+    // timestamps promise a packet every 5 ms (48 kHz), but `wait(5ms)` slept 5
+    // ms ON TOP OF the encode/encrypt/FEC/send, so the true rate ran slower
+    // than 200/s. The resampled ring then filled faster than this drained it,
+    // overflowed its 200 ms cap, and dropped samples mid-stream — a click each
+    // time, i.e. the crackle. Advancing a deadline by exactly 5 ms and sleeping
+    // only the remainder locks the long-term rate at 48 kHz and lets the sleep
+    // absorb the work.
+    let mut deadline = std::time::Instant::now();
+
     while !session.is_stopping() {
         let Some(peer) = *session.audio_peer.lock().unwrap() else {
             if !session.wait(Duration::from_millis(100)) {
@@ -171,8 +181,20 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
         seq = seq.wrapping_add(1);
         timestamp = timestamp.wrapping_add(SAMPLES_PER_PACKET);
 
-        if !session.wait(Duration::from_millis(PACKET_DURATION_MS)) {
-            break;
+        deadline += Duration::from_millis(PACKET_DURATION_MS);
+        let now = std::time::Instant::now();
+        if deadline > now {
+            if !session.wait(deadline - now) {
+                break;
+            }
+        } else {
+            // Fell behind — work outran the 5 ms budget, or the scheduler
+            // hiccuped. Do NOT burst to catch up (that overflows the client's
+            // jitter buffer); resync the cadence to now and continue.
+            deadline = now;
+            if session.is_stopping() {
+                break;
+            }
         }
     }
 
