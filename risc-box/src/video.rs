@@ -267,6 +267,17 @@ extern "C" {
 /// stream (measured as periodic 0 fps seconds at the client).
 const H264_GOP: i32 = 0;
 
+/// Force a bounded keyframe this often even without a client request. GOP=0
+/// means P frames reference arbitrarily far back, so one lost packet corrupts
+/// the picture until an IDR — and over a lossy link the client's IDR request
+/// can itself be lost. A periodic bounded key (soft QP, ~4x a P frame, not the
+/// 125 KB the old note feared) caps any such corruption at this many frames
+/// (~2 s at 60 fps). The stall that once argued against this was the SSE write
+/// buffer overflowing, since fixed by the event loop yielding whenever bytes
+/// are still queued — a bounded key now flushes over a few turns instead of
+/// dropping the watcher.
+const H264_KEY_PERIOD: u32 = 120;
+
 /// Intra frames pay a higher quantizer floor and get a bigger byte budget
 /// than P frames. At qp_min 10 minih264 spends ~125 KB on a 1024x768 intra
 /// frame — nearly the whole 192 KB production gate in one SSE event. A
@@ -284,6 +295,7 @@ pub struct H264Encoder {
     kbps: u32,
     force_key: bool,
     encoded_any: bool,
+    since_key: u32,
 }
 
 impl H264Encoder {
@@ -306,7 +318,7 @@ impl H264Encoder {
         if rc != 0 {
             return None;
         }
-        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false, encoded_any: false })
+        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false, encoded_any: false, since_key: 0 })
     }
 }
 
@@ -347,9 +359,10 @@ impl H264Encoder {
     fn encode_planes(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Vec<EncodedFrame> {
         let mut coded: *const u8 = std::ptr::null();
         let mut coded_len: i32 = 0;
-        let force = std::mem::take(&mut self.force_key);
-        // The first frame of a fresh encoder is a keyframe whether or not it
-        // was asked for; both kinds get the intra budget and floor.
+        // A client request, the first frame, or the periodic safety net all
+        // demand an intra frame.
+        let periodic = self.since_key >= H264_KEY_PERIOD;
+        let force = std::mem::take(&mut self.force_key) || periodic;
         let key = force || !self.encoded_any;
         let p_budget = (self.kbps as i32) * 1000 / 8 / 40; // per-frame budget at the 40 fps cadence
         let rc = unsafe {
@@ -378,6 +391,7 @@ impl H264Encoder {
         // with an SPS NAL (type 7) — the same rule Moonlight applies.
         let keyframe = data.len() > 4 && data[..4] == [0, 0, 0, 1] && data[4] & 0x1f == 7
             || data.len() > 3 && data[..3] == [0, 0, 1] && data[3] & 0x1f == 7;
+        self.since_key = if keyframe { 0 } else { self.since_key + 1 };
         vec![EncodedFrame { data, keyframe }]
     }
 }

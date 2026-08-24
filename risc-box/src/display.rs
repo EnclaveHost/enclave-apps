@@ -517,7 +517,12 @@ impl Display {
     pub fn png(&mut self, emu: &Emulator) -> Vec<u8> {
         let mut fresh = vec![0u8; fb_bytes()];
         let prefer = Self::gpu_is_the_live_surface(emu);
-        emu.read_display(FB_BASE, &mut fresh, prefer);
+        // Composite the game overlay too, so a snapshot shows exactly what the
+        // video stream shows — otherwise /fb.png reads the GPU scanout without
+        // the live game on top and diverges from what a viewer sees.
+        if emu.read_display(FB_BASE, &mut fresh, prefer) {
+            Self::composite_overlay(emu, &mut fresh);
+        }
         // raw scanlines: filter byte 0 + RGB (drop X, reorder BGR -> RGB)
         let mut raw = Vec::with_capacity(fb_h() * (1 + fb_w() * 3));
         for y in 0..fb_h() {
