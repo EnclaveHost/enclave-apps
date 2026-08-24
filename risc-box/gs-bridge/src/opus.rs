@@ -151,6 +151,11 @@ impl AudioSource {
                 }
             };
             let mut line = String::new();
+            // One resampler per connection: it carries the fractional read
+            // position and the boundary sample across chunks, so consecutive
+            // /audio events join seamlessly. A fresh connection starts clean —
+            // the guest audio has a gap across a redial anyway.
+            let mut rs = Resampler::new();
             loop {
                 if session.is_stopping() {
                     return;
@@ -168,7 +173,7 @@ impl AudioSource {
                 if pcm.is_empty() {
                     continue;
                 }
-                let out = resample(&pcm, rate, channels);
+                let out = rs.feed(&pcm, rate, channels);
                 let mut b = self.buf.lock().unwrap();
                 b.extend(out.iter().copied());
                 while b.len() > RING_CAP {
@@ -230,32 +235,151 @@ fn b64_decode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Linear resample to 48 kHz stereo. Mono is duplicated across both channels,
-/// which is what the card's own mono mode means.
-fn resample(pcm: &[i16], rate: usize, channels: usize) -> Vec<i16> {
-    if rate == 0 || channels == 0 || pcm.is_empty() {
-        return Vec::new();
+/// Continuous linear resampler to 48 kHz stereo. Mono is duplicated across
+/// both channels, which is what the card's own mono mode means.
+///
+/// It is STATEFUL on purpose. Resampling each /audio chunk on its own restarts
+/// the fractional read position at zero and drops the chunk's final sample
+/// (there is nothing after it to interpolate toward), so every chunk boundary
+/// was a step discontinuity — a click. /audio delivers many chunks a second,
+/// so those clicks fused into a steady crackle on music and effects alike,
+/// since both ride this one PCM stream. Carrying the phase and the last input
+/// frame across chunks makes the boundaries seamless and holds the output rate
+/// exactly at rate/48000 with no per-chunk truncation drift.
+struct Resampler {
+    /// 16.16 fixed-point read position. Index 0 is `last` (the previous chunk's
+    /// final frame); index 1.. is the current chunk. Between chunks it holds the
+    /// sub-sample remainder so the next chunk resumes exactly where this stopped.
+    pos: u64,
+    last: [i16; 2],
+    primed: bool,
+}
+
+impl Resampler {
+    fn new() -> Resampler {
+        Resampler { pos: 0, last: [0, 0], primed: false }
     }
-    let in_frames = pcm.len() / channels;
-    if in_frames < 2 {
-        return Vec::new();
-    }
-    let out_frames = in_frames * OUT_RATE / rate;
-    let mut out = Vec::with_capacity(out_frames * OUT_CHANNELS);
-    for i in 0..out_frames {
-        // Position in the input, 16.16 fixed point.
-        let pos = ((i as u64) * (rate as u64) << 16) / OUT_RATE as u64;
-        let idx = (pos >> 16) as usize;
-        let frac = (pos & 0xffff) as i32;
-        if idx + 1 >= in_frames {
-            break;
+
+    fn feed(&mut self, pcm: &[i16], rate: usize, channels: usize) -> Vec<i16> {
+        if rate == 0 || channels == 0 || channels > 2 {
+            return Vec::new();
         }
-        for ch in 0..OUT_CHANNELS {
-            let c = ch.min(channels - 1);
-            let a = pcm[idx * channels + c] as i32;
-            let b = pcm[(idx + 1) * channels + c] as i32;
-            out.push((a + (((b - a) * frac) >> 16)) as i16);
+        let n = pcm.len() / channels;
+        if n == 0 {
+            return Vec::new();
         }
+        let frame = |i: usize| -> [i32; 2] {
+            let l = pcm[i * channels] as i32;
+            let r = if channels == 2 { pcm[i * channels + 1] as i32 } else { l };
+            [l, r]
+        };
+        // Working frames: `last` prepended to the chunk, so the first outputs
+        // interpolate across the boundary. The very first chunk has no `last`.
+        let base = if self.primed { 1usize } else { 0 };
+        let total = base + n;
+        let get = |e: usize| -> [i32; 2] {
+            if e < base {
+                [self.last[0] as i32, self.last[1] as i32]
+            } else {
+                frame(e - base)
+            }
+        };
+        let step = ((rate as u64) << 16) / OUT_RATE as u64;
+        let mut out = Vec::new();
+        loop {
+            let idx = (self.pos >> 16) as usize;
+            if idx + 1 >= total {
+                break;
+            }
+            let frac = (self.pos & 0xffff) as i32;
+            let a = get(idx);
+            let b = get(idx + 1);
+            out.push((a[0] + (((b[0] - a[0]) * frac) >> 16)) as i16);
+            out.push((a[1] + (((b[1] - a[1]) * frac) >> 16)) as i16);
+            self.pos += step;
+        }
+        // Carry state: the chunk's final frame becomes `last`, and pos is
+        // rebased so index 0 maps to it again, keeping the sub-sample remainder
+        // and any whole-frame overshoot past it (only possible when downsampling).
+        let consumed = (self.pos >> 16) as usize;
+        let overshoot = consumed.saturating_sub(total - 1) as u64;
+        self.last = [
+            pcm[(n - 1) * channels],
+            if channels == 2 { pcm[(n - 1) * channels + 1] } else { pcm[(n - 1) * channels] },
+        ];
+        self.primed = true;
+        self.pos = (overshoot << 16) | (self.pos & 0xffff);
+        out
     }
-    out
+}
+
+#[cfg(test)]
+mod resample_tests {
+    use super::*;
+
+    // A 300 Hz sine at 11025 Hz stereo, `n` frames from sample offset `off`.
+    fn sine(off: usize, n: usize) -> Vec<i16> {
+        let mut v = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = (off + i) as f64 / 11025.0;
+            let s = (2.0 * std::f64::consts::PI * 300.0 * t).sin() * 12000.0;
+            v.push(s as i16);
+            v.push(s as i16);
+        }
+        v
+    }
+
+    // Feeding the same signal in many small chunks must match feeding it whole,
+    // sample-for-sample — that is exactly the boundary continuity the crackle
+    // came from lacking.
+    #[test]
+    fn chunked_matches_whole() {
+        let total = 11025; // 1 second
+        let whole = {
+            let mut r = Resampler::new();
+            r.feed(&sine(0, total), 11025, 2)
+        };
+        let chunked = {
+            let mut r = Resampler::new();
+            let mut out = Vec::new();
+            let mut off = 0;
+            // irregular chunk sizes, like real /audio bursts
+            for &c in [441usize, 100, 512, 64, 900, 220, 1000].iter().cycle() {
+                if off >= total { break; }
+                let take = c.min(total - off);
+                out.extend(r.feed(&sine(off, take), 11025, 2));
+                off += take;
+            }
+            out
+        };
+        let common = whole.len().min(chunked.len());
+        assert!(common > 40000, "expected ~96k samples, got {common}");
+        // The chunk-vs-whole `last`-frame carry can differ by at most a quantization
+        // step at boundaries; require exact equality, which the design gives.
+        let mut maxdiff = 0i32;
+        for i in 0..common {
+            maxdiff = maxdiff.max((whole[i] as i32 - chunked[i] as i32).abs());
+        }
+        assert_eq!(maxdiff, 0, "chunked and whole diverged by {maxdiff}");
+    }
+
+    // No output sample should jump more than the input's own max slope between
+    // adjacent samples allows — a boundary click shows up as an outsized step.
+    #[test]
+    fn no_boundary_discontinuity() {
+        let mut r = Resampler::new();
+        let mut out = Vec::new();
+        let mut off = 0;
+        for _ in 0..50 {
+            out.extend(r.feed(&sine(off, 137), 11025, 2)); // odd chunk, exercises fractions
+            off += 137;
+        }
+        // 300 Hz at 48 kHz: max per-sample step ~ 12000*2*pi*300/48000 ~ 471.
+        // Allow generous headroom; a real click would be thousands.
+        let mut worst = 0i32;
+        for w in out.chunks_exact(2).collect::<Vec<_>>().windows(2) {
+            worst = worst.max((w[1][0] as i32 - w[0][0] as i32).abs());
+        }
+        assert!(worst < 800, "suspicious step {worst} (boundary click?)");
+    }
 }
