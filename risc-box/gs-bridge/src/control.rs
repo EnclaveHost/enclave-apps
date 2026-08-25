@@ -333,6 +333,21 @@ impl InputQueue {
 /// the relay cuts idle kept-alive connections, and without the ping the first
 /// event of every gesture pays a discovered-dead-socket plus a fresh TCP+TLS
 /// dial before it moves. Input latency is judged by exactly that first event.
+/// How often a pure pointer move is shipped to the app.
+///
+/// Every accepted POST /hid boosts the emulator loop, and the boost is what
+/// starves the display worker: the app's own measurement is that 10 accepted
+/// /hid a second took videoFps from 40 to 0 with turnMax still healthy. So this
+/// is not a smoothness knob, it is the throttle that decides whether the
+/// picture keeps moving while the pointer does. GSB_CURSOR_MS overrides it.
+fn cursor_pace() -> Duration {
+    std::env::var("GSB_CURSOR_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(100))
+}
+
 fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     const KEEPALIVE: Duration = Duration::from_secs(15);
     // The streamed channel first: one POST /hid-stream whose chunked body
@@ -393,7 +408,7 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
         if session.cursor_dirty.load(Ordering::Acquire) {
             let due = !batch.is_empty()
                 || last_cursor.map_or(true, |t: std::time::Instant| {
-                    t.elapsed() >= Duration::from_millis(100)
+                    t.elapsed() >= cursor_pace()
                 });
             if due {
                 session.cursor_dirty.store(false, Ordering::Release);

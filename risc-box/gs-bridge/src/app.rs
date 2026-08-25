@@ -7,7 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openssl::ssl::{SslConnector, SslMethod};
 
@@ -496,7 +496,8 @@ impl App {
     /// A dedicated connection for firing input POSTs without waiting on each
     /// response — see [`InputPipe`].
     pub fn input_pipe(self: &std::sync::Arc<Self>) -> InputPipe {
-        InputPipe { app: self.clone(), conn: None, buf: Vec::new(), pending: 0 }
+        InputPipe { app: self.clone(), conn: None, buf: Vec::new(), pending: 0,
+                    refused: 0, last_err_at: None }
     }
 
     /// The streamed input channel: one POST /hid-stream whose chunked body
@@ -579,6 +580,10 @@ pub struct InputPipe {
     buf: Vec<u8>,
     /// Requests written whose responses have not yet been drained.
     pending: u32,
+    /// Refused batches, and when we last said so (throttled: input is a
+    /// per-frame firehose and one line per event would be unreadable).
+    refused: u64,
+    last_err_at: Option<Instant>,
 }
 
 impl InputPipe {
@@ -610,7 +615,8 @@ impl InputPipe {
     /// this skip a full HTTP parser.
     fn consume_one(&mut self) -> bool {
         let Some(pos) = find(&self.buf, b"\r\n\r\n") else { return false };
-        let head = String::from_utf8_lossy(&self.buf[..pos]).to_ascii_lowercase();
+        let raw = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+        let head = raw.to_ascii_lowercase();
         let len = head
             .split("\r\n")
             .find_map(|l| l.strip_prefix("content-length:"))
@@ -619,6 +625,38 @@ impl InputPipe {
         let total = pos + 4 + len;
         if self.buf.len() < total {
             return false;
+        }
+        // CHECK THE STATUS. This used to drop every response on the floor, so
+        // input that the app was refusing -- an expired token (401), a machine
+        // that is not running (409), a malformed batch (400) -- looked exactly
+        // like input that worked: events left the bridge, nothing moved on
+        // screen, and not one line said why. Body included, since the app puts
+        // its reason there.
+        let status: u16 = raw
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&status) {
+            let body = String::from_utf8_lossy(&self.buf[pos + 4..total]).to_string();
+            let now = Instant::now();
+            let say = self
+                .last_err_at
+                .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(5));
+            if say {
+                self.last_err_at = Some(now);
+                let why = match status {
+                    401 | 403 => " (the app token is not accepted -- expired? re-mint it)",
+                    409 => " (the machine is not running)",
+                    _ => "",
+                };
+                eprintln!(
+                    "[control] input REFUSED: HTTP {status}{why}; {} event batch(es) refused so far: {}",
+                    self.refused + 1,
+                    body.trim()
+                );
+            }
+            self.refused += 1;
         }
         self.buf.drain(..total);
         self.pending = self.pending.saturating_sub(1);
