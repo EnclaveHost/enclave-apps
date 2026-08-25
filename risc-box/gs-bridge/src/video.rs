@@ -807,6 +807,11 @@ pub struct AppH264Source {
 /// stutter badly enough for the client to give up.
 const GRACE: Duration = Duration::from_secs(120);
 
+/// How long to wait between lines while holding a stream nobody is watching.
+/// Slow enough to push back on the app (it produces 40-110 frames/s), fast
+/// enough that bytes keep moving, so its 45s write-stall reaper never fires.
+const IDLE_DRAIN_PACE: Duration = Duration::from_millis(100);
+
 impl AppH264Source {
     /// Open the stream and keep it open. Returns immediately; the reader runs
     /// on its own thread for the life of the process.
@@ -822,6 +827,14 @@ impl AppH264Source {
     /// the client is told to expect a new stream).
     pub fn attach(&self, session: Arc<Session>, sock: Arc<UdpSocket>) {
         *self.sink.lock().unwrap() = Some(AuSink::new(session, sock));
+        // Clearing the idle mark is what tells the pump a session is WAITING.
+        // Leaving it set was the whole reconnect failure: the pump gates on
+        // `idle_since`, so a stale mark meant it slept through the session and
+        // then opened the stream on detach -- the stream was open exactly when
+        // nobody was watching, and closed exactly when someone was. It also
+        // let the grace timer keep running under a live session and release
+        // the stream mid-play at GRACE.
+        *self.idle_since.lock().unwrap() = None;
         eprintln!("[video] session attached to the persistent /video stream");
     }
 
@@ -861,22 +874,34 @@ impl AppH264Source {
         let mut peer_seen = false;
         let mut backoff = Duration::from_secs(1);
         let mut send_fails: u64 = 0;
+        // Edge detection for "a new session arrived", so the retry backoff is
+        // reset once per session rather than on every pass through the gate.
+        let mut was_attached = false;
 
         loop {
             // Do not hold a stream open for nobody: wait until a session wants
             // one (or is within its grace window) before dialling at all.
             loop {
                 let idle = *idle_since.lock().unwrap();
-                let wanted = match idle {
-                    None => true,                       // a session is attached
-                    Some(t) => t.elapsed() < GRACE,     // still in the grace window
-                };
+                let attached = sink.lock().unwrap().is_some();
+                let wanted = attached                   // someone is watching NOW
+                    || match idle {
+                        None => true,                   // a session is attached
+                        Some(t) => t.elapsed() < GRACE, // still in the grace window
+                    };
                 if wanted {
-                    if idle.is_none() {
-                        backoff = Duration::from_secs(1);   // a session is waiting; try now
+                    // Reset only on the EDGE of a new session. Resetting on
+                    // every pass turned the retry into a flat 1s hammer for as
+                    // long as a session waited, which is how the bridge pinned
+                    // an app that was trying to recover: the stall clears with
+                    // quiet, and a request every second is not quiet.
+                    if attached && !was_attached {
+                        backoff = Duration::from_secs(1);
                     }
+                    was_attached = attached;
                     break;
                 }
+                was_attached = attached;
                 std::thread::sleep(Duration::from_millis(200));
             }
             let opened = Instant::now();
@@ -889,7 +914,14 @@ impl AppH264Source {
                     // it holds it open. Back off to a quarter of that.
                     eprintln!("[video] /video unavailable: {e}; retrying in {}s", backoff.as_secs());
                     Self::nap(backoff, &sink);
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    // A session that is WAITING gets a tighter cap -- someone is
+                    // staring at a black screen, so keep probing for the app's
+                    // recovery; an idle bridge backs all the way off.
+                    let cap = match sink.lock().unwrap().is_some() {
+                        true => Duration::from_secs(5),
+                        false => Duration::from_secs(30),
+                    };
+                    backoff = (backoff * 2).min(cap);
                     continue;
                 }
             };
@@ -919,7 +951,9 @@ impl AppH264Source {
                 // Grace expired with nobody watching: let the stream go, so the
                 // app stops encoding for an audience that left.
                 if let Some(t) = *idle_since.lock().unwrap() {
-                    if t.elapsed() >= GRACE {
+                    // "no watcher" must mean exactly that: never release a
+                    // stream out from under an attached session.
+                    if t.elapsed() >= GRACE && sink.lock().unwrap().is_none() {
                         eprintln!("[video] no watcher for {}s; releasing the stream", GRACE.as_secs());
                         break;
                     }
@@ -932,7 +966,19 @@ impl AppH264Source {
                 let Some(payload) = line.strip_prefix("data: ") else { continue };
                 fresh += 1;
                 if sink.lock().unwrap().is_none() {
-                    continue;   // drain the line, do no work for nobody
+                    // Drain the line, do no work for nobody -- but do it SLOWLY.
+                    // Consuming at full speed means the app's writes always
+                    // succeed, so it keeps encoding flat out for an audience
+                    // that left. Measured: the app's own HTTP went from 110 ms
+                    // idle to a hard timeout during an unwatched hold, and that
+                    // stall is what breaks the next connect. Reading slowly
+                    // lets its send buffer fill, which is the signal it already
+                    // knows how to act on (SSE_SKIP_WBUF -> starved -> it stops
+                    // queueing frames). Re-attaching drains the backlog, which
+                    // the app reports as recovered and answers with a fresh
+                    // encoder and a keyframe.
+                    std::thread::sleep(IDLE_DRAIN_PACE);
+                    continue;
                 }
                 let Some(d) = crate::screen::json_str(payload.trim_end(), "d") else { continue };
                 let Some(au) = crate::screen::b64_decode(d) else {
