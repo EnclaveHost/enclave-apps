@@ -173,6 +173,26 @@ fn vk_to_linux_keycode(vk: u16) -> u16 {
     }
 }
 
+/// One line per distinct unhandled input magic, then silence for it.
+///
+/// Input is a per-frame firehose, so this must never log per event; but a magic
+/// that is never handled is a permanent hole and deserves to be said once, with
+/// the body length, because the usual cause is a length guard rather than a
+/// genuinely unknown event.
+fn report_unhandled(magic: u32, body_len: usize) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap();
+    let seen = g.get_or_insert_with(HashSet::new);
+    if seen.insert(magic) {
+        eprintln!(
+            "[control] UNHANDLED input magic 0x{magic:08x} (body {body_len} bytes) \
+             - these events are being dropped; the machine never sees them"
+        );
+    }
+}
+
 /// Build the /hid event object for one GameStream input event, or None if
 /// the emulated HID has no equivalent.
 ///
@@ -267,7 +287,17 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
         // Gamepad, touch, pen, UTF-8 text and haptics: the emulated HID has
         // no equivalent device, so these are accepted and dropped rather
         // than erroring.
-        _ => None,
+        // NOT silently dropped. A magic we do not handle -- or one we do whose
+        // body failed its length guard above and fell through to here -- means
+        // input the client sent and the machine never saw. That is invisible
+        // from both ends: the client believes it sent it, the app never hears
+        // it, and the user reports a frozen pointer with nothing in any log.
+        // Relative motion in particular is only exercised when the client
+        // CAPTURES the mouse, which windowed testing never does.
+        other => {
+            report_unhandled(other, body.len());
+            None
+        }
     }
 }
 
