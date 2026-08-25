@@ -2347,6 +2347,14 @@ pub fn run() {
         if let Some(gs) = app.gs.as_mut() {
             busy |= gs.poll();
         }
+        // Input the client sent over the control channel, injected straight
+        // into the machine -- no HTTP hop, which is the point of the host
+        // living in this module. Already translated to the app's own /hid
+        // shape by gamestream::control.
+        for ev in gamestream::control::take_input() {
+            hid_inner(&mut app, &mut server, 0, &ev, false);
+            busy = true;
+        }
 
         let t4 = Instant::now();
         let flushed = server.flush();

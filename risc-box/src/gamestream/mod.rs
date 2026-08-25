@@ -12,8 +12,10 @@
 //! (openssl is C and will not build for wasm32-wasip2), and the framebuffer
 //! source became a direct read instead of `GET /fb.rgb`.
 
+pub mod control;
 pub mod crypto;
 pub mod enet;
+pub mod enet_sys;
 pub mod fec;
 pub mod host;
 pub mod httpx;

@@ -53,6 +53,63 @@ fn main() {
     println!("cargo:rustc-link-lib=static=minih264wrap");
 
     build_opl3(&out, &arch, &features);
+    build_enet(&out, &arch, &features);
+}
+
+/// Moonlight's ENet fork, for the GameStream control channel.
+///
+/// Vendored verbatim and compiled here so the wire format matches
+/// moonlight-common-c by construction — the client is linked against this exact
+/// fork, and a reimplementation that is 99% right is a control channel that
+/// connects and then stalls. Only the PROTOCOL core is built: ENet's platform
+/// layer (unix.c) is BSD sockets and poll, and the guest reaches the network
+/// through wasi:sockets, so those thirteen symbols come from Rust instead
+/// (src/gamestream/enet_sys.rs). include/enet/wasi.h stands in for unix.h.
+fn build_enet(out: &PathBuf, arch: &str, features: &str) {
+    const SRCS: [&str; 7] = [
+        "protocol", "host", "peer", "list", "packet", "callbacks", "compress",
+    ];
+    for f in SRCS {
+        println!("cargo:rerun-if-changed=vendor/enet/{f}.c");
+    }
+    println!("cargo:rerun-if-changed=vendor/enet/include/enet");
+    println!("cargo:rerun-if-changed=vendor/enet/shim");
+
+    let mut objs = Vec::new();
+    for name in SRCS {
+        let src = format!("vendor/enet/{name}.c");
+        let obj = out.join(format!("enet_{name}.o"));
+        let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
+        cc.args(["-O2", "-DNDEBUG", "-c", &src, "-o"])
+            .arg(&obj)
+            .args(["-Ivendor/enet/include"]);
+        if arch == "wasm32" {
+            // No C sysroot at cargo time, so the handful of libc headers the
+            // core needs (memcpy/memset/malloc/free) come from the shim and
+            // resolve at the final link against wasi-libc.
+            cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/enet/shim"]);
+            for f in ["atomics", "bulk-memory", "mutable-globals"] {
+                if features.split(',').any(|x| x == f) {
+                    cc.arg(format!("-m{f}"));
+                }
+            }
+        }
+        let st = cc.status().expect("clang not found (set RBX_CLANG)");
+        assert!(st.success(), "enet/{name}.c failed to compile");
+        objs.push(obj);
+    }
+
+    let lib = out.join("libenet.a");
+    let _ = std::fs::remove_file(&lib);
+    let mut ar = Command::new(env::var("RBX_AR").unwrap_or_else(|_| "ar".into()));
+    ar.arg("rcs").arg(&lib);
+    for o in &objs {
+        ar.arg(o);
+    }
+    assert!(ar.status().expect("ar not found (set RBX_AR)").success(), "ar failed for enet");
+
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=enet");
 }
 
 /// Nuked OPL3, for the machine's music. Same freestanding-wasm recipe as

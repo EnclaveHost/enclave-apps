@@ -61,7 +61,9 @@ pub struct Host {
     https: TcpListener,
     rtsp: TcpListener,
     video: UdpSocket,
-    control: UdpSocket,
+    /// ENet owns udp/47999 itself -- it binds through the platform layer in
+    /// enet_sys, so the host must NOT also bind that port.
+    control: Option<crate::gamestream::enet::Host>,
     audio: UdpSocket,
     srv: Arc<httpx::Server>,
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -105,7 +107,7 @@ impl Host {
             https: bind_tcp(PORT_HTTPS)?,
             rtsp: bind_tcp(PORT_RTSP)?,
             video: bind_udp(PORT_VIDEO)?,
-            control: bind_udp(PORT_CONTROL)?,
+            control: crate::gamestream::enet::Host::bind(PORT_CONTROL),
             audio: bind_udp(PORT_AUDIO)?,
             srv,
             tls,
@@ -127,6 +129,7 @@ impl Host {
         busy |= self.accept();
         busy |= self.service();
         busy |= self.drain_udp();
+        busy |= self.drain_control();
         self.reap();
         busy
     }
@@ -234,14 +237,34 @@ impl Host {
             }
             let _ = n;
         }
-        // The control channel is ENet; hand whole datagrams to it.
-        while let Ok((n, peer)) = self.control.recv_from(&mut buf) {
-            busy = true;
-            if let Some(s) = &session {
-                crate::gamestream::enet::on_datagram(s, &self.control, peer, &buf[..n]);
+        busy
+    }
+
+    /// Pump the ENet control channel. Zero timeout inside: this is the turn
+    /// that steps the CPU.
+    fn drain_control(&mut self) -> bool {
+        use crate::gamestream::enet::Event;
+        let Some(control) = self.control.as_mut() else { return false };
+        let events = control.poll();
+        if events.is_empty() {
+            return false;
+        }
+        let session = self.srv.session.lock().unwrap().clone();
+        for ev in events {
+            match ev {
+                Event::Connected => eprintln!("[control] *** CLIENT CONNECTED ***"),
+                Event::Disconnected => {
+                    eprintln!("[control] client disconnected");
+                    self.sink = None;
+                }
+                Event::Message { channel, data } => {
+                    if let Some(s) = &session {
+                        crate::gamestream::control::on_message(s, channel, &data);
+                    }
+                }
             }
         }
-        busy
+        true
     }
 
     /// Hand one coded access unit to the client. Called with the same frames
@@ -266,6 +289,9 @@ impl Host {
     /// Drop the RTP sink when a session ends so the next one starts clean.
     pub fn end_session(&mut self) {
         self.sink = None;
+        if let Some(c) = self.control.as_mut() {
+            c.disconnect();
+        }
     }
 }
 
