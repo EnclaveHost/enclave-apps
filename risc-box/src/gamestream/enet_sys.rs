@@ -212,10 +212,17 @@ pub extern "C" fn enet_socket_destroy(socket: ENetSocket) {
 
 /// Gather-send. ENet hands an array of buffers; wasi:sockets takes one, so
 /// flatten. GameStream datagrams are one MTU, so this is a small copy.
+///
+/// FIVE parameters, not four: Moonlight's fork carries a LOCAL address
+/// alongside the peer (it binds per-interface), and the signature must match
+/// `enet.h` exactly or wasm-ld links a call that reads its arguments from the
+/// wrong stack slots. This host owns one socket bound to 0.0.0.0, so the local
+/// address is accepted and ignored -- but it has to be in the signature.
 #[no_mangle]
 pub extern "C" fn enet_socket_send(
     socket: ENetSocket,
     address: *const ENetAddress,
+    _local_address: *const ENetAddress,
     buffers: *const ENetBuffer,
     buffer_count: usize,
 ) -> c_int {
@@ -243,10 +250,15 @@ pub extern "C" fn enet_socket_send(
 
 /// Scatter-receive. One datagram into the first buffer; ENet sizes it to an
 /// MTU, and a datagram that does not fit is a datagram we could not have used.
+///
+/// FIVE parameters (see `enet_socket_send`): the fork wants the local address
+/// the datagram arrived on as well as the peer's. It is filled from the
+/// socket, because the protocol core stores it on the peer and compares it.
 #[no_mangle]
 pub extern "C" fn enet_socket_receive(
     socket: ENetSocket,
     address: *mut ENetAddress,
+    local_address: *mut ENetAddress,
     buffers: *mut ENetBuffer,
     buffer_count: usize,
 ) -> c_int {
@@ -264,6 +276,11 @@ pub extern "C" fn enet_socket_receive(
         Ok((n, peer)) => {
             if !address.is_null() {
                 from_socket_addr(peer, unsafe { &mut *address });
+            }
+            if !local_address.is_null() {
+                if let Ok(local) = s.local_addr() {
+                    from_socket_addr(local, unsafe { &mut *local_address });
+                }
             }
             n as c_int
         }
