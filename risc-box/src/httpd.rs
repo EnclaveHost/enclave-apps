@@ -510,6 +510,10 @@ impl Server {
     }
 
     pub fn respond(&mut self, key: usize, mut resp: Response) {
+        if self.conns.get(key).is_none() {
+            eprintln!("[{}] DROPPED a {} response: conn key {key} is stale ({} live)",
+                      self.app, resp.status, self.conns.len());
+        }
         let Some(conn) = self.conns.get_mut(key) else { return };
         let keep = conn.keep_alive && resp.status < 500;
         let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
@@ -546,7 +550,24 @@ impl Server {
     }
 
     pub fn upgrade_sse(&mut self, key: usize, topic: &str, initial: &str) {
-        let Some(conn) = self.conns.get_mut(key) else { return };
+        let (app, live) = (self.app, self.conns.len());
+        let Some(conn) = self.conns.get_mut(key) else {
+            // A DROPPED RESPONSE MUST NEVER BE SILENT. `key` is an index into
+            // `conns`, and the reaper compacts that Vec with retain_mut, so a
+            // connection removed between poll() handing out this key and the
+            // handler using it shifts every index after it. The old code
+            // returned here and sent nothing at all: the client then waits for
+            // response headers that never come, which reaches the caller as a
+            // read timeout (EAGAIN) and reads as "the app is stalled".
+            //
+            // That is precisely the shape of the /video failure being chased
+            // (2026-08-25): GET / answers in 106ms and /audio streams fine
+            // while /video alone withholds headers. If this line ever prints,
+            // that is the bug, confirmed.
+            eprintln!("[{app}] DROPPED a {topic} response: conn key {key} is stale \
+                       ({live} live) - the client will hang waiting for headers");
+            return;
+        };
         let head = format!(
             "HTTP/1.1 200 OK\r\nserver: {}\r\ncontent-type: text/event-stream\r\ncache-control: no-store\r\nx-accel-buffering: no\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n",
             self.app
