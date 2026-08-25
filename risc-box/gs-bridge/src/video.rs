@@ -791,6 +791,12 @@ impl AuSink {
 /// guest is healthy and accepting throughout -- it is the hop into the tenant
 /// that stalls). This removes the trigger, not the fault.
 pub struct AppH264Source {
+    /// Kept so `attach` can kick the app directly. The pump cannot do it: it
+    /// is parked in a blocking read, and after a long idle hold the app has
+    /// starved this stream and stopped queueing frames -- so it is waiting for
+    /// us to drain while we wait for it to send. Somebody outside the loop has
+    /// to break the tie.
+    app: Arc<App>,
     sink: Arc<std::sync::Mutex<Option<AuSink>>>,
     /// When the last session detached. The reader closes the stream once this
     /// is older than GRACE, and reopens on the next attach.
@@ -799,18 +805,44 @@ pub struct AppH264Source {
 
 /// How long the stream is held open with nobody watching.
 ///
-/// Long enough to cover quitting Moonlight and coming straight back -- which is
-/// the case that fails, because re-dialling /video is what stalls the app.
-/// Short enough that an idle bridge is not holding a stream open all night: the
-/// app keeps encoding for as long as a watcher exists, and an unconsumed stream
-/// over a long link fills, starves and bursts, which is what made the picture
-/// stutter badly enough for the client to give up.
-const GRACE: Duration = Duration::from_secs(120);
+/// This used to be 120s, kept short because an unwatched hold wrecked the app:
+/// draining it flat out for an audience that had left made the app encode at
+/// full rate for nobody, and its HTTP went from 110ms to a hard timeout. That
+/// is no longer true -- IDLE_DRAIN_PACE gives it backpressure instead, and the
+/// app measured 107ms during a hold that previously timed out.
+///
+/// With the hold made cheap, a LONG one is what the user actually wants: a
+/// reconnect that lands inside it attaches to a live stream and never dials, so
+/// it is instant and cannot fail. A short window left a hole -- release at 120s,
+/// then ~90s while the app recovered from the session, and a reconnect landing
+/// in between had to dial an app that was still saturated and got EAGAIN, which
+/// Moonlight shows as "No video received from host".
+///
+/// Still bounded, so a bridge left running overnight eventually goes quiet.
+/// GSB_GRACE_SECS overrides it.
+fn grace() -> Duration {
+    std::env::var("GSB_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(GRACE)
+}
+
+const GRACE: Duration = Duration::from_secs(30 * 60);
 
 /// How long to wait between lines while holding a stream nobody is watching.
 /// Slow enough to push back on the app (it produces 40-110 frames/s), fast
 /// enough that bytes keep moving, so its 45s write-stall reaper never fires.
 const IDLE_DRAIN_PACE: Duration = Duration::from_millis(100);
+
+/// An inter-frame gap this long means we are waiting on the app rather than
+/// reading something it queued earlier, i.e. the backlog is drained.
+const LIVE_GAP: Duration = Duration::from_millis(8);
+/// Hard bound on backlog discarding, so a producer faster than LIVE_GAP still
+/// starts promptly.
+const JOIN_DISCARD_MAX: Duration = Duration::from_millis(750);
+/// Hard bound on waiting for the joining keyframe.
+const JOIN_IDR_WAIT_MAX: Duration = Duration::from_millis(2000);
 
 impl AppH264Source {
     /// Open the stream and keep it open. Returns immediately; the reader runs
@@ -819,8 +851,9 @@ impl AppH264Source {
         let sink: Arc<std::sync::Mutex<Option<AuSink>>> = Arc::new(std::sync::Mutex::new(None));
         let idle_since = Arc::new(std::sync::Mutex::new(Some(Instant::now())));
         let (r_sink, r_idle) = (sink.clone(), idle_since.clone());
-        std::thread::spawn(move || Self::pump(app, kbps, r_sink, r_idle));
-        AppH264Source { sink, idle_since }
+        let p_app = app.clone();
+        std::thread::spawn(move || Self::pump(p_app, kbps, r_sink, r_idle));
+        AppH264Source { app, sink, idle_since }
     }
 
     /// A session starts: give it a fresh sink (frame numbering restarts, and
@@ -835,6 +868,20 @@ impl AppH264Source {
         // let the grace timer keep running under a live session and release
         // the stream mid-play at GRACE.
         *self.idle_since.lock().unwrap() = None;
+        // Ask for a keyframe from OUTSIDE the pump. Off-thread because the app
+        // can take seconds to answer while it is saturated, and the pump must
+        // not wait on it. Two requests, spaced: the first restarts a starved
+        // stream, the second covers the case where it arrived while the app was
+        // still rebuilding its encoder.
+        let app = self.app.clone();
+        std::thread::spawn(move || {
+            for i in 0..2 {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                let _ = app.post_json("/video-key", "{}");
+            }
+        });
         eprintln!("[video] session attached to the persistent /video stream");
     }
 
@@ -843,7 +890,7 @@ impl AppH264Source {
         let framed = self.sink.lock().unwrap().take().map(|s| s.frame_index).unwrap_or(0);
         *self.idle_since.lock().unwrap() = Some(Instant::now());
         eprintln!("[video] session detached after {framed} frames (stream held {}s for a quick reconnect)",
-                  GRACE.as_secs());
+                  grace().as_secs());
     }
 
 
@@ -877,6 +924,12 @@ impl AppH264Source {
         // Edge detection for "a new session arrived", so the retry backoff is
         // reset once per session rather than on every pass through the gate.
         let mut was_attached = false;
+        // Join state: drop the idle hold's backlog, then start on a keyframe.
+        let mut had_sink = false;
+        let mut discard_backlog = false;
+        let mut need_idr = false;
+        let mut join_at = Instant::now();
+        let mut last_au_at: Option<Instant> = None;
 
         loop {
             // Do not hold a stream open for nobody: wait until a session wants
@@ -887,7 +940,7 @@ impl AppH264Source {
                 let wanted = attached                   // someone is watching NOW
                     || match idle {
                         None => true,                   // a session is attached
-                        Some(t) => t.elapsed() < GRACE, // still in the grace window
+                        Some(t) => t.elapsed() < grace(), // still in the grace window
                     };
                 if wanted {
                     // Reset only on the EDGE of a new session. Resetting on
@@ -953,8 +1006,8 @@ impl AppH264Source {
                 if let Some(t) = *idle_since.lock().unwrap() {
                     // "no watcher" must mean exactly that: never release a
                     // stream out from under an attached session.
-                    if t.elapsed() >= GRACE && sink.lock().unwrap().is_none() {
-                        eprintln!("[video] no watcher for {}s; releasing the stream", GRACE.as_secs());
+                    if t.elapsed() >= grace() && sink.lock().unwrap().is_none() {
+                        eprintln!("[video] no watcher for {}s; releasing the stream", grace().as_secs());
                         break;
                     }
                 }
@@ -962,6 +1015,22 @@ impl AppH264Source {
                 match r.read_line(&mut line) {
                     Ok(0) | Err(_) => break, // the app closed it; redial
                     Ok(_) => {}
+                }
+                // Track attach/detach on every line, not just frames: an idle
+                // hold that the app has starved sends nothing but heartbeats,
+                // and the edge still has to be seen or the next join is missed.
+                let attached_now = sink.lock().unwrap().is_some();
+                if attached_now && !had_sink {
+                    // A session just joined. Whatever the idle hold left
+                    // buffered is old news -- emitting it is what makes the
+                    // first half second fast-forward past the viewer.
+                    had_sink = true;
+                    discard_backlog = true;
+                    need_idr = true;
+                    join_at = Instant::now();
+                    last_au_at = None;
+                } else if !attached_now {
+                    had_sink = false;
                 }
                 let Some(payload) = line.strip_prefix("data: ") else { continue };
                 fresh += 1;
@@ -1000,6 +1069,46 @@ impl AppH264Source {
                     reported = Instant::now();
                     fresh = 0;
                 }
+                // A session that just joined starts on live video, not on the
+                // hold's leftovers. Backlogged frames arrive back to back
+                // because they are already in the socket; a real gap means we
+                // have caught up to what the app is producing now.
+                if discard_backlog || need_idr {
+                    let now = Instant::now();
+                    let gap = last_au_at.map(|t| now.duration_since(t));
+                    last_au_at = Some(now);
+                    if discard_backlog {
+                        // Either a gap (we are current) or a bound, so a fast
+                        // producer cannot keep us discarding forever.
+                        // map_or(FALSE): with no previous frame there is no
+                        // measured gap yet, and "no evidence" is not evidence
+                        // of being current. Treating it as caught-up ended the
+                        // discard on the very first access unit, which let the
+                        // whole backlog through -- the fast-forward on join.
+                        if gap.map_or(false, |g| g >= LIVE_GAP)
+                            || join_at.elapsed() >= JOIN_DISCARD_MAX
+                        {
+                            discard_backlog = false;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if need_idr {
+                        // Start on a keyframe so the first thing decoded is a
+                        // complete picture. One was already requested when the
+                        // client appeared; the bound covers an app that does
+                        // not answer.
+                        if au_is_idr(&au) || join_at.elapsed() >= JOIN_IDR_WAIT_MAX {
+                            need_idr = false;
+                            eprintln!("[video] joined on {} after {} ms",
+                                      if au_is_idr(&au) { "a keyframe" } else { "timeout" },
+                                      join_at.elapsed().as_millis());
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+
                 // No session attached: the frame is simply dropped. The app
                 // keeps encoding either way, and holding the stream open is
                 // what keeps reconnecting instant.
