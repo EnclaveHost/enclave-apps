@@ -418,8 +418,43 @@ impl App {
         );
         s.write_all(req.as_bytes())?;
         let mut r = std::io::BufReader::new(s);
-        // Consume the status line and headers.
+        // Read the STATUS LINE and act on it. This used to be consumed and
+        // ignored, which meant every non-200 -- an expired token most of all --
+        // arrived as "a stream that ended after 0 frames". That reads as "the
+        // app is broken" when the truth is "we were refused", and it cost hours
+        // of chasing the wrong layer. Worse, the caller retried it a second
+        // later, forever, hammering an app that was answering correctly.
         let mut line = String::new();
+        if std::io::BufRead::read_line(&mut r, &mut line)? == 0 {
+            return Err(std::io::Error::other("stream closed before the status line"));
+        }
+        let status: u16 = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        if !(200..300).contains(&status) {
+            // Drain the headers so the socket is not left mid-message, then say
+            // exactly what happened.
+            loop {
+                line.clear();
+                match std::io::BufRead::read_line(&mut r, &mut line) {
+                    Ok(0) => break,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let why = match status {
+                401 | 403 => "the app token is not accepted (expired? re-mint it)",
+                404 => "no such deployment on this enclave (moved, or still reloading)",
+                409 => "the deployment is not running",
+                502 | 503 | 504 => "the enclave could not reach the app",
+                _ => "unexpected status",
+            };
+            return Err(std::io::Error::other(format!("HTTP {status}: {why}")));
+        }
+        // Consume the remaining headers.
         let mut chunked = false;
         loop {
             line.clear();
