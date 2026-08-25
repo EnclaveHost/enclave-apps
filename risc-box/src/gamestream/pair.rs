@@ -31,6 +31,7 @@ pub trait Store: Send + Sync {
     fn get(&self, key: &str) -> Option<Vec<u8>>;
     fn put(&self, key: &str, value: &[u8]);
     fn list(&self, prefix: &str) -> Vec<String>;
+    fn remove(&self, key: &str);
 }
 
 /// A store that forgets on restart. Correct for tests; for the real host it
@@ -47,6 +48,9 @@ impl Store for MemoryStore {
     }
     fn list(&self, prefix: &str) -> Vec<String> {
         self.0.lock().unwrap().keys().filter(|k| k.starts_with(prefix)).cloned().collect()
+    }
+    fn remove(&self, key: &str) {
+        self.0.lock().unwrap().remove(key);
     }
 }
 
@@ -263,6 +267,22 @@ impl PairState {
     /// Compared on DER bytes, so it is exact.
     pub fn is_paired_der(&self, der: &[u8]) -> bool {
         self.paired.lock().unwrap().values().any(|d| d == der)
+    }
+
+    /// Forget ONE client's pairing.
+    ///
+    /// Scoped deliberately. This endpoint is unauthenticated plain HTTP and
+    /// Moonlight calls it by itself whenever it cannot verify a host, so
+    /// wiping every pairing here would let one confused client log everyone
+    /// else out.
+    pub fn unpair(&self, id: &str) {
+        let key = safe_id(id);
+        self.store.remove(&format!("{PAIRED_PREFIX}{key}"));
+        self.sessions.lock().unwrap().remove(id);
+        match self.paired.lock().unwrap().remove(&key) {
+            Some(_) => eprintln!("[pair] unpaired {key}"),
+            None => eprintln!("[pair] /unpair for unknown client {key}; nothing to do"),
+        }
     }
 
     fn remember(&self, id: &str, cert_der: &[u8]) {

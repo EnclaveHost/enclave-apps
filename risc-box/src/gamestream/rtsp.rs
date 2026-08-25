@@ -410,3 +410,20 @@ mod tests {
         assert!(apply_announce(&s, body).is_err());
     }
 }
+
+/// Parse and answer one RTSP request from a raw buffer.
+///
+/// The bridge read the socket itself inside `serve_conn`; the guest's poll loop
+/// owns the socket and hands whole request heads here instead. The handler
+/// underneath is unchanged -- it is the part Moonlight sees.
+pub fn handle_raw(srv: &std::sync::Arc<crate::gamestream::httpx::Server>, raw: &str) -> String {
+    let Some(req) = parse_request(raw) else {
+        return response(400, "Bad Request", -1, &[], "");
+    };
+    let session = srv.session.lock().unwrap().clone();
+    let Some(session) = session else {
+        // RTSP before /launch: there is no stream to describe yet.
+        return response(455, "Method Not Valid In This State", req.cseq, &[], "");
+    };
+    handle(&session, &req, &|_s| {})
+}
