@@ -860,6 +860,7 @@ impl AppH264Source {
         let (mut fresh, mut reported) = (0u64, Instant::now());
         let mut peer_seen = false;
         let mut backoff = Duration::from_secs(1);
+        let mut send_fails: u64 = 0;
 
         loop {
             // Do not hold a stream open for nobody: wait until a session wants
@@ -958,10 +959,21 @@ impl AppH264Source {
                 // what keeps reconnecting instant.
                 let mut guard = sink.lock().unwrap();
                 if let Some(s) = guard.as_mut() {
+                    // A failed RTP send is ONE datagram, not the end of the
+                    // session. Dropping the sink here killed video after the
+                    // first frame: measured 44 fps arriving from the app and
+                    // exactly 1 frame reaching the client, twice in a row.
+                    // UDP send errors are transient by nature (a momentarily
+                    // full socket buffer is the common one) and the very next
+                    // frame usually goes out fine -- so count them, say so
+                    // occasionally, and keep streaming.
                     if !s.emit(au) {
-                        // The RTP send failed, not the source: drop this
-                        // session's sink and keep the stream.
-                        *guard = None;
+                        send_fails += 1;
+                        if send_fails == 1 || send_fails % 100 == 0 {
+                            eprintln!("[video] {send_fails} RTP send failure(s); still streaming");
+                        }
+                    } else {
+                        send_fails = 0;
                     }
                 }
             }
