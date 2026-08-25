@@ -62,6 +62,28 @@ jpeg-encoder = { version = "0.6", default-features = false }
 # bytes/frame vs ~20KB for Motion JPEG). default-features off drops the x86/arm
 # asm + threading the wasm target can't use. See docs/streaming.md.
 rav1e = { version = "0.7", default-features = false }
+# The GPU interface. PLATFORM.md §0: a tenant reaches the card ONLY through the
+# wasi-nn shims, so hardware encode arrives as a preload-only graph rather than
+# a subprocess. Bindings are generated at compile time from wit/ by the macro
+# (this crate is a plain cargo build, not cargo-component, so there is no
+# checked-in bindings.rs).
+wit-bindgen = { version = "0.41", default-features = false, features = ["macros", "realloc"] }
+# GameStream host crypto, all pure Rust so it builds for wasm32-wasip2 (the
+# native bridge used openssl, which is C and does not). AES-128 in three modes:
+# GCM for the control channel, CBC for audio, ECB for the pairing handshake.
+# RSA + SHA-256 sign the pairing challenge and the self-signed serving cert.
+aes = "0.8"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+cbc = { version = "0.1", features = ["alloc"] }
+ecb = { version = "0.1", features = ["alloc"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Reading the CLIENT's pairing certificate (its public key and signature). The
+# serving cert is assembled by hand in gamestream::pair -- rcgen would do it in
+# a tenth of the code but every one of its crypto backends is C (ring/aws-lc)
+# and will not cross-compile to wasm32-wasip2, which is the same wall openssl
+# hit and the reason this port exists.
+x509-parser = "0.16"
 
 [profile.release]
 opt-level = 3       # the CPU loop is hot; favor speed over size here

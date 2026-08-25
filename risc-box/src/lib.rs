@@ -46,9 +46,12 @@
 
 mod display;
 mod egress;
+mod gamestream;
 mod gz;
 mod httpd;
 mod net;
+// Hardware H.264 on the fleet GPU, reached through wasi-nn (PLATFORM.md).
+mod nvenc;
 mod opl;
 mod s3;
 mod video;

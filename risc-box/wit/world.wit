@@ -1,0 +1,18 @@
+// risc-box imports ONE host interface: wasi:nn, which is how a tenant reaches
+// the GPU (PLATFORM.md §0 — "the GPU is reachable only through the wasi-nn
+// shims"). The nvenc backend rides that interface as a preload-only graph
+// (`-S nn-graph=nvenc::<dir>`), so hardware H.264 encode is a `load_by_name`
+// away rather than a native subprocess the sandbox could never spawn.
+//
+// Import-only world: risc-box is a COMMAND component (it has a main and talks
+// std sockets), not a wasi:http reactor, so there is nothing to export here.
+// WIT vendored verbatim from wasmtime v45 (wasi:nn@0.2.0-rc-2024-10-28) so
+// guest and host always agree — same version the other GPU apps pin.
+package enclave:risc-box;
+
+world risc-box {
+  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+}

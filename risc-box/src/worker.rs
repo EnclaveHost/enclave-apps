@@ -81,6 +81,33 @@ pub fn take_force_key() -> bool {
     VIDEO_FORCE_KEY.swap(false, Ordering::AcqRel)
 }
 
+/// The frame rate the hardware encoder is configured for. The capture loop is
+/// paced separately (see the cadence ceiling below); this is what the card is
+/// told to expect so its rate control targets the right bitrate per frame.
+const TARGET_FPS: u32 = 60;
+
+/// Cached answer to "can this host encode H.264 on the GPU?".
+///
+/// `nvenc::caps()` loads a graph and opens an execution context, so it must not
+/// run per viewer. 0 = unknown, 1 = yes, 2 = no.
+static NVENC_OK: AtomicU32 = AtomicU32::new(0);
+
+fn nvenc_supported() -> bool {
+    match NVENC_OK.load(Ordering::Acquire) {
+        1 => true,
+        2 => false,
+        _ => {
+            let ok = crate::nvenc::available();
+            NVENC_OK.store(if ok { 1 } else { 2 }, Ordering::Release);
+            eprintln!(
+                "[nvenc] hardware H.264 {}",
+                if ok { "available - encoding on the GPU" } else { "unavailable - software encode" }
+            );
+            ok
+        }
+    }
+}
+
 /// Build the encoder the current params ask for. Shared by the worker loop and
 /// the inline fallback so both agree on defaults.
 pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
@@ -90,6 +117,25 @@ pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
     match codec {
         CODEC_H264 => {
             let kbps = if kbps == 0 { 3000 } else { kbps };
+            // Hardware first. A gpuShare deployment on a GPU enclave whose
+            // toolchain carries the nvenc backend encodes on the card's
+            // fixed-function block; everything else falls through to minih264
+            // in-wasm. Both produce Annex-B H.264, so the client never learns
+            // which one it got -- the only difference it can see is that the
+            // hardware path honours a mid-stream IDR request and holds 60 fps
+            // where software tops out around 43 (PLATFORM-ENCODE.md).
+            //
+            // The probe is cached: it opens a graph and a context, which is far
+            // too expensive to repeat every time a viewer joins.
+            if nvenc_supported() {
+                if let Some(e) = crate::nvenc::NvencEncoder::new(w, h, TARGET_FPS, kbps) {
+                    return Some((params, Box::new(e) as Box<dyn VideoEncoder + Send>));
+                }
+                // Opening a session can fail on a card that is out of NVENC
+                // slots even though the backend is present. Say so once and
+                // carry on in software rather than dropping the stream.
+                eprintln!("[nvenc] no session available; falling back to minih264");
+            }
             video::H264Encoder::new(w, h, kbps)
                 .map(|e| (params, Box::new(e) as Box<dyn VideoEncoder + Send>))
         }
