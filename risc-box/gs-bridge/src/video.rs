@@ -833,6 +833,23 @@ impl AppH264Source {
                   GRACE.as_secs());
     }
 
+
+    /// Sleep, but wake the moment a session attaches.
+    ///
+    /// A flat `sleep(backoff)` is why a client could connect, play and leave
+    /// inside one backoff window and never see a frame: the pump was asleep for
+    /// the entire session. Back-off protects the APP from churn; it must not
+    /// make the bridge deaf to the user.
+    fn nap(d: Duration, sink: &Arc<std::sync::Mutex<Option<AuSink>>>) {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            if sink.lock().unwrap().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn pump(
         app: Arc<App>,
         kbps: u32,
@@ -854,6 +871,9 @@ impl AppH264Source {
                     Some(t) => t.elapsed() < GRACE,     // still in the grace window
                 };
                 if wanted {
+                    if idle.is_none() {
+                        backoff = Duration::from_secs(1);   // a session is waiting; try now
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -867,7 +887,7 @@ impl AppH264Source {
                     // this works around lasts minutes, and re-dialling through
                     // it holds it open. Back off to a quarter of that.
                     eprintln!("[video] /video unavailable: {e}; retrying in {}s", backoff.as_secs());
-                    std::thread::sleep(backoff);
+                    Self::nap(backoff, &sink);
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                     continue;
                 }
@@ -950,7 +970,7 @@ impl AppH264Source {
                 // the status check did not catch. Treat it as a failure and
                 // back off, rather than spinning.
                 eprintln!("[video] /video closed immediately; backing off {}s", backoff.as_secs());
-                std::thread::sleep(backoff);
+                Self::nap(backoff, &sink);
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             } else {
                 backoff = Duration::from_secs(1);
