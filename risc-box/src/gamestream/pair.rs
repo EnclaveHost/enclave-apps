@@ -27,11 +27,15 @@ use crate::gamestream::x509gen;
 
 /// Where the server identity and the paired-client list live. Abstracted so
 /// the handshake can be tested without object storage in the loop.
+/// Durable storage for the host identity and the paired-client list.
+///
+/// Deliberately just get/put on whole values: the backing store is S3, which
+/// this app reaches through `crate::s3`, and that module has no list operation.
+/// So the paired set is ONE blob rather than a key per client -- fewer round
+/// trips, and no enumeration to emulate.
 pub trait Store: Send + Sync {
     fn get(&self, key: &str) -> Option<Vec<u8>>;
     fn put(&self, key: &str, value: &[u8]);
-    fn list(&self, prefix: &str) -> Vec<String>;
-    fn remove(&self, key: &str);
 }
 
 /// A store that forgets on restart. Correct for tests; for the real host it
@@ -46,17 +50,11 @@ impl Store for MemoryStore {
     fn put(&self, key: &str, value: &[u8]) {
         self.0.lock().unwrap().insert(key.to_string(), value.to_vec());
     }
-    fn list(&self, prefix: &str) -> Vec<String> {
-        self.0.lock().unwrap().keys().filter(|k| k.starts_with(prefix)).cloned().collect()
-    }
-    fn remove(&self, key: &str) {
-        self.0.lock().unwrap().remove(key);
-    }
 }
 
 const KEY_IDENTITY: &str = "gamestream/server-key.der";
 const KEY_CERT: &str = "gamestream/server-cert.der";
-const PAIRED_PREFIX: &str = "gamestream/paired/";
+const KEY_PAIRED: &str = "gamestream/paired.json";
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use rand_core::RngCore;
@@ -226,12 +224,10 @@ impl PairState {
             }
         };
 
-        let mut paired = HashMap::new();
-        for k in store.list(PAIRED_PREFIX) {
-            if let Some(der) = store.get(&k) {
-                paired.insert(k.trim_start_matches(PAIRED_PREFIX).to_string(), der);
-            }
-        }
+        let paired = store
+            .get(KEY_PAIRED)
+            .and_then(|b| decode_paired(&b))
+            .unwrap_or_default();
         if !paired.is_empty() {
             eprintln!("[pair] loaded {} paired client(s)", paired.len());
         }
@@ -277,19 +273,28 @@ impl PairState {
     /// else out.
     pub fn unpair(&self, id: &str) {
         let key = safe_id(id);
-        self.store.remove(&format!("{PAIRED_PREFIX}{key}"));
         self.sessions.lock().unwrap().remove(id);
-        match self.paired.lock().unwrap().remove(&key) {
-            Some(_) => eprintln!("[pair] unpaired {key}"),
-            None => eprintln!("[pair] /unpair for unknown client {key}; nothing to do"),
+        let gone = self.paired.lock().unwrap().remove(&key).is_some();
+        if gone {
+            self.flush_paired();
+            eprintln!("[pair] unpaired {key}");
+        } else {
+            eprintln!("[pair] /unpair for unknown client {key}; nothing to do");
         }
     }
 
     fn remember(&self, id: &str, cert_der: &[u8]) {
         let key = safe_id(id);
-        self.store.put(&format!("{PAIRED_PREFIX}{key}"), cert_der);
         self.paired.lock().unwrap().insert(key.clone(), cert_der.to_vec());
+        self.flush_paired();
         eprintln!("[pair] stored client certificate for {key}");
+    }
+
+    /// Write the whole paired set back. Small (one certificate per client we
+    /// have ever paired with) and rare (only on pair/unpair).
+    fn flush_paired(&self) {
+        let blob = encode_paired(&self.paired.lock().unwrap());
+        self.store.put(KEY_PAIRED, &blob);
     }
 
     /// One step of the handshake. Never blocks.
@@ -530,6 +535,28 @@ mod tests {
         assert_eq!(pem_to_der(&pem).as_deref(), Some(&cert[..]));
     }
 
+    /// Pairing must survive a restart, and it now rides in one blob -- so the
+    /// blob is the thing that has to round-trip. A silent failure here means
+    /// every client re-pairs after each restart, which is exactly the symptom
+    /// that makes a streaming host feel broken.
+    #[test]
+    fn the_paired_set_round_trips_through_storage() {
+        let (store, _) = seeded();
+        let store = Box::new(store);
+        let st = PairState::load(store, 1_787_529_600);
+        let cert = vec![0x30, 0x82, 0x01, 0x0a, 0xde, 0xad, 0xbe, 0xef];
+        st.remember("moonlight-client", &cert);
+        assert!(st.is_paired_der(&cert));
+
+        // Re-encode/decode the way a restart would.
+        let blob = encode_paired(&st.paired.lock().unwrap());
+        let back = decode_paired(&blob).expect("the blob must decode");
+        assert_eq!(back.get("moonlightclient"), Some(&cert), "got: {back:?}");
+
+        st.unpair("moonlight-client");
+        assert!(!st.is_paired_der(&cert), "unpair must actually forget");
+    }
+
     /// A client-supplied id becomes a storage key, so it must not be able to
     /// escape the prefix.
     #[test]
@@ -538,5 +565,93 @@ mod tests {
         assert_eq!(safe_id(""), "anon");
         assert_eq!(safe_id("a/b\\c").len(), 3);
         assert!(safe_id(&"x".repeat(500)).len() <= 64);
+    }
+}
+
+/// The paired set on the wire: a JSON object of uniqueid -> hex DER. JSON
+/// because the app already carries serde_json, hex because certificates are
+/// binary and this file is read by humans when pairing misbehaves.
+fn encode_paired(map: &HashMap<String, Vec<u8>>) -> Vec<u8> {
+    let obj: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(hex(v))))
+        .collect();
+    serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default()
+}
+
+fn decode_paired(blob: &[u8]) -> Option<HashMap<String, Vec<u8>>> {
+    let v: serde_json::Value = serde_json::from_slice(blob).ok()?;
+    let obj = v.as_object()?;
+    let mut out = HashMap::new();
+    for (k, val) in obj {
+        if let Some(h) = val.as_str() {
+            let der = from_hex(h);
+            if !der.is_empty() {
+                out.insert(k.clone(), der);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The shipping [`Store`]: pairing state in the same bucket the machine images
+/// come from.
+///
+/// The guest has no writable filesystem, and the identity is precisely what
+/// Moonlight pins at pairing time — so losing it on restart means every client
+/// has to pair again. This app restarts often enough that that is the
+/// difference between usable and not.
+pub struct S3Store {
+    ep: crate::s3::Endpoint,
+    bucket: String,
+    creds: Option<crate::s3::Creds>,
+    /// Read-through cache. A restart reloads from S3; within one run the
+    /// values never change underneath us, so a hit avoids a network round trip
+    /// on a path that would otherwise sit in the emulator's turn.
+    cache: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl S3Store {
+    pub fn new(
+        ep: crate::s3::Endpoint,
+        bucket: String,
+        creds: Option<crate::s3::Creds>,
+    ) -> S3Store {
+        S3Store { ep, bucket, creds, cache: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl Store for S3Store {
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        if let Some(v) = self.cache.lock().unwrap().get(key) {
+            return Some(v.clone());
+        }
+        let mut noop = |_: usize, _: usize| {};
+        match crate::s3::get_object(&self.ep, &self.bucket, key, self.creds.as_ref(), &mut noop) {
+            Ok(v) => {
+                self.cache.lock().unwrap().insert(key.to_string(), v.clone());
+                Some(v)
+            }
+            // A missing key is the ordinary first-run case, not an error worth
+            // shouting about; anything else is worth one line.
+            Err(e) => {
+                if !e.contains("404") && !e.contains("NoSuchKey") {
+                    eprintln!("[pair] store read {key}: {e}");
+                }
+                None
+            }
+        }
+    }
+
+    fn put(&self, key: &str, value: &[u8]) {
+        self.cache.lock().unwrap().insert(key.to_string(), value.to_vec());
+        if let Err(e) =
+            crate::s3::put_object(&self.ep, &self.bucket, key, self.creds.as_ref(), value)
+        {
+            // In-memory state stays correct for this run; say plainly that it
+            // will not survive a restart, because that is the failure the
+            // operator will otherwise meet as "I have to pair again".
+            eprintln!("[pair] WARNING could not persist {key}: {e} (pairing will not survive a restart)");
+        }
     }
 }

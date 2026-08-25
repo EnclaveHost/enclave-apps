@@ -20,6 +20,7 @@ use std::sync::Arc;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+#[derive(Clone)]
 pub struct Creds {
     pub access_key_id: String,
     pub secret_access_key: String,

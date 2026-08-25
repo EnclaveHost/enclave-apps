@@ -587,6 +587,13 @@ struct App {
     // instant it exists instead of on the client's next poll — over a real
     // link that is the whole poll round trip saved, every frame.
     pull_waiters: Vec<(u64, u64, Instant)>, // (hold ticket, since, deadline)
+    /// The in-guest GameStream host. Built once the machine is running (it
+    /// needs an RSA identity, which costs seconds, and there is nothing to
+    /// stream before then). `None` when the ports could not be bound -- the
+    /// app still serves its own HTTP surface in that case.
+    gs: Option<gamestream::host::Host>,
+    /// Set once so a failed bind is not retried every turn.
+    gs_tried: bool,
     fb_scanned: Option<Instant>, // last display scan (paced by its own cost)
     fb_cost: Duration,           // smoothed cost of one display scan
     fb_still: u32,               // consecutive scans that found nothing
@@ -1763,6 +1770,8 @@ pub fn run() {
     worker::start();
     let mut server = Server::bind("risc-box", DEFAULT_PORT);
     let mut app = App {
+        gs: None,
+        gs_tried: false,
         cfg,
         emu: None,
         opl: opl::Opl::new(),
@@ -2288,6 +2297,12 @@ pub fn run() {
                     "video",
                     &format!("data: {{\"k\":{},\"d\":\"{}\"}}", f.keyframe as u8, b64(&f.data)),
                 );
+                // The same coded frame goes to Moonlight as RTP. Encoding once
+                // and consuming twice is the whole reason the GameStream host
+                // lives in this module rather than beside it.
+                if let Some(gs) = app.gs.as_mut() {
+                    gs.feed_video(&f);
+                }
                 app.video_frames += 1;
                 busy = true;
             }
@@ -2320,6 +2335,17 @@ pub fn run() {
                     app.pull_waiters.push((ticket, since, deadline));
                 }
             }
+        }
+
+        // The GameStream host: built on the first turn after the machine is
+        // running, then polled like any other server. It must never block --
+        // this is the same turn that steps the CPU.
+        if app.gs.is_none() && !app.gs_tried && app.phase == Phase::Running {
+            app.gs_tried = true;
+            app.gs = gamestream::host::build(&app.cfg);
+        }
+        if let Some(gs) = app.gs.as_mut() {
+            busy |= gs.poll();
         }
 
         let t4 = Instant::now();

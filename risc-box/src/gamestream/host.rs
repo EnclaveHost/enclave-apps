@@ -338,6 +338,14 @@ fn pump(c: &mut Conn, srv: &Arc<httpx::Server>, local_ip: &str, _tls_on: bool) -
             }
             _ => {
                 let https = matches!(c.kind, Kind::Https(_));
+                // The client reached us on some address; the RTSP URL we hand
+                // back has to be that one, not whatever we guessed at bind.
+                let local_ip = c
+                    .stream
+                    .local_addr()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_else(|_| local_ip.to_string());
+                let local_ip = local_ip.as_str();
                 let path = head
                     .lines()
                     .next()
@@ -462,4 +470,37 @@ mod tests {
         assert!(text.contains("Content-Length: 7"), "got: {text}");
         assert!(text.ends_with("<root/>"));
     }
+}
+
+/// Assemble the host: identity from object storage, control surface, sockets.
+///
+/// Called once, on the first turn after the machine is running. Two reasons it
+/// is not built at boot: generating an RSA-2048 identity costs seconds on the
+/// first ever run, and there is nothing to stream before the machine exists.
+pub fn build(cfg: &crate::Config) -> Option<Host> {
+    let ep = match crate::s3::Endpoint::parse(&cfg.endpoint, &cfg.region) {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("[gs] no object storage ({e}); GameStream disabled");
+            return None;
+        }
+    };
+    let creds = cfg.config_creds.clone();
+    let store = crate::gamestream::pair::S3Store::new(ep, cfg.bucket.clone(), creds);
+
+    // The guest clock is the host's realtime source (see the boot log).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let pair = Arc::new(crate::gamestream::pair::PairState::load(Box::new(store), now));
+    let srv = Arc::new(httpx::Server {
+        pair,
+        session: std::sync::Mutex::new(None),
+        on_launch: Box::new(|_s| {}),
+        host_name: cfg.title.clone(),
+        unique_id: "0123456789ABCDEF".to_string(),
+    });
+    Host::bind(srv, "0.0.0.0".to_string())
 }
