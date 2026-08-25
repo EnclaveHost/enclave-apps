@@ -58,6 +58,11 @@ const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 // "non-empty this long" — a starved subscriber paying down a backlog is
 // non-empty for the whole paydown and very much alive.)
 const WRITE_STALL: Duration = Duration::from_secs(45);
+/// How often a persistent accept() failure may print. The accept loop runs
+/// every turn (milliseconds apart), so an unthrottled line would bury the log
+/// it is meant to make readable — but silence is worse, so the first one
+/// always prints and the count carries the rest.
+const ACCEPT_ERR_LOG_EVERY: Duration = Duration::from_secs(5);
 
 pub struct Request {
     pub method: String,
@@ -137,6 +142,8 @@ pub struct Server {
     app: &'static str,
     started: Instant,
     hold_seq: u64, // long-poll tickets (see hold/release)
+    accept_errs: u64,               // accept() failures since start (see poll)
+    accept_err_at: Option<Instant>, // last time one was printed; throttles the line
 }
 
 /// `ENCLAVE_PORTS=http:8080=18321,tcp:7777=18322` → the actual port to bind.
@@ -170,7 +177,8 @@ impl Server {
             .set_nonblocking(true)
             .expect("non-blocking listener");
         println!("[{app}] listening on 127.0.0.1:{port}");
-        Server { listener, conns: Vec::new(), app, started: Instant::now(), hold_seq: 0 }
+        Server { listener, conns: Vec::new(), app, started: Instant::now(), hold_seq: 0,
+                 accept_errs: 0, accept_err_at: None }
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -245,6 +253,7 @@ impl Server {
     /// (conn_key, Request); answer each with respond()/upgrade_sse() before
     /// the next poll (a key is only stable until then).
     pub fn poll(&mut self, max_body: usize) -> Vec<(usize, Request)> {
+        let app = self.app;
         // Accept.
         loop {
             match self.listener.accept() {
@@ -267,8 +276,30 @@ impl Server {
                         recovered: false,
                     });
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break, // backlog drained
+                // A PER-CONNECTION failure, not a listener failure: the pending
+                // peer went away before we got to it (ECONNABORTED), or a
+                // signal landed mid-call (EINTR). Neither says anything about
+                // the next connection, so skip it and keep draining.
+                Err(e) if e.kind() == ErrorKind::Interrupted
+                       || e.kind() == ErrorKind::ConnectionAborted => continue,
+                // Anything else is the LISTENER refusing to hand over work, and
+                // it is usually persistent (EMFILE/ENFILE clear only when
+                // something closes). This arm used to be a bare `break` with no
+                // log at all, which is the worst possible shape: the app keeps
+                // running, the heartbeat stays green, the guest keeps stepping
+                // at full speed, and NOTHING is ever served again — with not one
+                // line to say why. Retry next turn, but SAY SO.
+                Err(e) => {
+                    self.accept_errs += 1;
+                    if self.accept_err_at.map_or(true, |t| t.elapsed() >= ACCEPT_ERR_LOG_EVERY) {
+                        self.accept_err_at = Some(Instant::now());
+                        eprintln!("[{app}] accept failed: {e} ({:?}); {} since start \
+                                   - serving NO new connections this pass",
+                                  e.kind(), self.accept_errs);
+                    }
+                    break;
+                }
             }
         }
 
@@ -860,4 +891,89 @@ pub fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    /// A Server on an ephemeral port. Built field-by-field rather than through
+    /// `bind()` because `bind()` resolves its port from the environment and
+    /// exits the process on failure — neither of which belongs in a test.
+    fn server_on_ephemeral() -> (Server, u16) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+        listener.set_nonblocking(true).expect("non-blocking listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        (Server {
+            listener, conns: Vec::new(), app: "test", started: Instant::now(),
+            hold_seq: 0, accept_errs: 0, accept_err_at: None,
+        }, port)
+    }
+
+    /// Drives poll() until a request lands. The listener is non-blocking and
+    /// poll() is a single pass, so a test must spin the way the real loop does.
+    fn pump(s: &mut Server) -> (usize, Request) {
+        for _ in 0..3000 {
+            if let Some(hit) = s.poll(64 * 1024).into_iter().next() {
+                return hit;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the accept loop never handed over the request");
+    }
+
+    /// The accept loop's error arms must not cost it the ordinary path. The
+    /// arm this guards used to be a bare `break` that swallowed every non
+    /// WouldBlock error silently; splitting it into "retry this one",
+    /// "log and back off" and "backlog drained" must leave a plain request
+    /// arriving, being answered, and reaching the client exactly as before.
+    #[test]
+    fn the_accept_loop_still_serves_an_ordinary_request() {
+        let (mut s, port) = server_on_ephemeral();
+        let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        c.write_all(b"GET /hi?q=1 HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+
+        let (key, req) = pump(&mut s);
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/hi");
+        assert_eq!(req.query, "q=1");
+
+        s.respond(key, Response::new(200, "OK").body("text/plain", "pong"));
+        for _ in 0..500 {
+            s.flush();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        c.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
+        assert!(text.ends_with("pong"), "got: {text}");
+
+        // A healthy accept path must never look like a failing one: the
+        // counter is what a future stall gets diagnosed by.
+        assert_eq!(s.accept_errs, 0, "a clean accept must not be counted as an error");
+    }
+
+    /// A backlog with several peers waiting must drain in ONE pass — the loop
+    /// only stops on WouldBlock (or a real listener error), never after one.
+    #[test]
+    fn one_pass_drains_the_whole_backlog() {
+        let (mut s, port) = server_on_ephemeral();
+        let mut clients = Vec::new();
+        for i in 0..5 {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            write!(c, "GET /n/{i} HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+            clients.push(c);
+        }
+        // Give the kernel a moment to complete all five handshakes, then a
+        // single poll must pick up every one of them.
+        std::thread::sleep(Duration::from_millis(50));
+        let got = s.poll(64 * 1024);
+        assert_eq!(got.len(), 5, "one pass must drain the backlog, got {}", got.len());
+        assert_eq!(s.accept_errs, 0);
+    }
 }
