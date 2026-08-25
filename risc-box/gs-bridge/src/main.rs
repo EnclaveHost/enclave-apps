@@ -183,12 +183,7 @@ fn start_session_workers(
     screen: Option<Arc<screen::Screen>>,
     codec: String,
     fb: (u32, u32),
-    // h264_src: the persistent app-H.264 source, when that is the frame mode.
-    // Sessions ATTACH to it rather than opening their own /video stream --
-    // tearing that stream down on disconnect is what made the app stop
-    // answering, so it is opened once at boot and never closed. See
-    // video::AppH264Source.
-    h264_src: Option<Arc<video::AppH264Source>>,
+    app_h264: bool,
 ) {
     // Video and audio sockets are bound per session so a restart rebinds
     // cleanly. The PREVIOUS session's workers may still be releasing theirs
@@ -231,22 +226,10 @@ fn start_session_workers(
     {
         let (s, a, sock) = (session.clone(), app.clone(), video_sock.clone());
         let sc = screen.clone();
-        match &h264_src {
-            // Attach, then watch for the session to end and detach. The stream
-            // itself is untouched by either.
-            Some(src) => {
-                let src = src.clone();
-                src.attach(s.clone(), sock);
-                std::thread::spawn(move || {
-                    while !s.is_stopping() {
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                    }
-                    src.detach();
-                });
-            }
-            None => {
-                std::thread::spawn(move || video::run(s, a, sc, sock, codec, fb));
-            }
+        if app_h264 {
+            std::thread::spawn(move || video::run_app_h264(s, a, sock));
+        } else {
+            std::thread::spawn(move || video::run(s, a, sc, sock, codec, fb));
         }
     }
 
@@ -445,19 +428,13 @@ fn main() {
         let codec = args.codec.clone();
         let fb = args.fb;
         let screen = screen.clone();
-        // One stream for the whole process, opened now rather than per
-        // session. `kbps` is the publish-time default; a session that
-        // negotiates something else still rides this stream, because
-        // re-dialling to honour a bitrate change is exactly the teardown that
-        // breaks reconnecting.
-        let h264_src = (args.frames == FrameSource::AppH264)
-            .then(|| Arc::new(video::AppH264Source::start(app.clone(), 6400)));
+        let app_h264 = args.frames == FrameSource::AppH264;
         std::thread::spawn(move || {
             rtsp::run(
                 move || launched.lock().unwrap().clone(),
                 move |session| {
                     start_session_workers(
-                        session, app.clone(), screen.clone(), codec.clone(), fb, h264_src.clone(),
+                        session, app.clone(), screen.clone(), codec.clone(), fb, app_h264,
                     )
                 },
             );
