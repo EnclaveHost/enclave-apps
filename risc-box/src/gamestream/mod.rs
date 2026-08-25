@@ -15,6 +15,7 @@
 pub mod crypto;
 pub mod enet;
 pub mod fec;
+pub mod pair;
 pub mod ping;
 pub mod rtsp;
 pub mod session;
