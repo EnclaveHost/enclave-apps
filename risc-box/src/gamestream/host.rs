@@ -94,6 +94,31 @@ impl Host {
     /// just does not offer GameStream, which is better than half a host that
     /// Moonlight can discover but not stream from.
     pub fn bind(srv: Arc<httpx::Server>, local_ip: String) -> Option<Host> {
+        // STAND DOWN unless this node can encode in hardware.
+        //
+        // Serving GameStream from in here has exactly one advantage over the
+        // external gs-bridge: the frames never leave the enclave to be encoded.
+        // That advantage is bought with the card. Without it the guest would be
+        // encoding 1024x768 in software on an EMULATED RISC-V CPU (minih264,
+        // ~23 ms/frame) while a real NVENC sits idle on whatever machine runs
+        // the bridge -- strictly worse than the path we already had.
+        //
+        // So when there is no hardware encoder, this host does not bind at all:
+        // the app keeps serving /video, /fb.rgb and the band stream, and
+        // gs-bridge encodes on its own GPU exactly as it does today. Note this
+        // is a REAL case, not a theoretical one -- Hopper datacenter parts
+        // (H100/H200) ship NVDEC but no NVENC, so a GPU enclave can be
+        // hardware-accelerated for inference and still unable to encode video.
+        // Uses the WORKER's cached probe: load_by_name opens a graph and a
+        // context, and doing that twice at startup is pure waste.
+        if !crate::worker::nvenc_supported() {
+            eprintln!(
+                "[gs] no hardware encoder here - NOT serving GameStream in-guest; \
+                 gs-bridge keeps the stream and encodes on its own GPU \
+                 (the app's /video, /fb.rgb and band stream are unchanged)"
+            );
+            return None;
+        }
         let tls = match build_tls(&srv) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {

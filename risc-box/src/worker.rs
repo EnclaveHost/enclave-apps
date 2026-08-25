@@ -92,7 +92,7 @@ const TARGET_FPS: u32 = 60;
 /// run per viewer. 0 = unknown, 1 = yes, 2 = no.
 static NVENC_OK: AtomicU32 = AtomicU32::new(0);
 
-fn nvenc_supported() -> bool {
+pub fn nvenc_supported() -> bool {
     match NVENC_OK.load(Ordering::Acquire) {
         1 => true,
         2 => false,
