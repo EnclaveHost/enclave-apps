@@ -69,6 +69,7 @@ pub struct Host {
     tls: Option<Arc<rustls::ServerConfig>>,
     conns: Vec<Conn>,
     sink: Option<AuSink>,
+    audio_tx: crate::gamestream::audio::AudioSender,
     local_ip: String,
 }
 
@@ -113,6 +114,7 @@ impl Host {
             tls,
             conns: Vec::new(),
             sink: None,
+            audio_tx: Default::default(),
             local_ip,
         };
         eprintln!(
@@ -130,6 +132,14 @@ impl Host {
         busy |= self.service();
         busy |= self.drain_udp();
         busy |= self.drain_control();
+        // Audio paces itself on a 5 ms deadline it checks rather than sleeps
+        // on -- the turn is coarser than a packet, so it sends what is due.
+        {
+            let session = self.srv.session.lock().unwrap().clone();
+            if let Some(s) = session {
+                busy |= self.audio_tx.tick(&s, &self.audio);
+            }
+        }
         self.reap();
         busy
     }
@@ -289,6 +299,7 @@ impl Host {
     /// Drop the RTP sink when a session ends so the next one starts clean.
     pub fn end_session(&mut self) {
         self.sink = None;
+        self.audio_tx = Default::default();
         if let Some(c) = self.control.as_mut() {
             c.disconnect();
         }
