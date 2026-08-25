@@ -773,129 +773,85 @@ impl AuSink {
 /// frame on the wire is a distinct guest frame, so the client's decode rate
 /// IS the fresh-frame rate. `GET /video?codec=h264` is one SSE event per
 /// access unit (base64), which also means no Annex-B splitting here.
-/// The app-encoded H.264 source, held open for the BRIDGE'S WHOLE LIFE.
-///
-/// This used to be opened per session and torn down when the session ended.
-/// That teardown is what makes a RISC Box deployment stop answering: after an
-/// abandoned SSE stream the app's HTTP path stops responding to new requests
-/// for minutes, so reconnecting fails and every retry holds it open. Measured
-/// repeatedly -- connect, disconnect, reconnect was reliably the thing that
-/// broke it, and "wait four minutes" was the only workaround.
-///
-/// So the stream is opened ONCE and never closed between sessions. Sessions
-/// attach and detach a sink; frames arriving with no session attached are
-/// dropped on the floor, which costs one SSE stream of bandwidth from an app
-/// that is encoding anyway. Reconnecting now touches nothing on the app at all.
-///
-/// The upstream bug is still real and still worth fixing at the platform (the
-/// guest is healthy and accepting throughout -- it is the hop into the tenant
-/// that stalls). This removes the trigger, not the fault.
-pub struct AppH264Source {
-    sink: Arc<std::sync::Mutex<Option<AuSink>>>,
-}
+pub fn run_app_h264(session: Arc<Session>, app: Arc<App>, sock: Arc<UdpSocket>) {
+    use std::io::BufRead;
 
-impl AppH264Source {
-    /// Open the stream and keep it open. Returns immediately; the reader runs
-    /// on its own thread for the life of the process.
-    pub fn start(app: Arc<App>, kbps: u32) -> AppH264Source {
-        let sink: Arc<std::sync::Mutex<Option<AuSink>>> = Arc::new(std::sync::Mutex::new(None));
-        let reader = sink.clone();
-        std::thread::spawn(move || Self::pump(app, kbps, reader));
-        AppH264Source { sink }
-    }
+    let cfg = session.config.lock().unwrap().clone();
+    // The client's negotiated bitrate, bounded to what the app's VBV model
+    // and the app->bridge link sensibly carry.
+    let kbps = cfg.bitrate_kbps.clamp(1000, 8000);
+    eprintln!(
+        "[video] app-encoded H.264: /video?codec=h264&kbps={kbps} -> RTP passthrough \
+         (client asked {}x{}@{}; the stream is the framebuffer's own size)",
+        cfg.width, cfg.height, cfg.fps
+    );
 
-    /// A session starts: give it a fresh sink (frame numbering restarts, and
-    /// the client is told to expect a new stream).
-    pub fn attach(&self, session: Arc<Session>, sock: Arc<UdpSocket>) {
-        *self.sink.lock().unwrap() = Some(AuSink::new(session, sock));
-        eprintln!("[video] session attached to the persistent /video stream");
-    }
+    let mut sink = AuSink::new(session.clone(), sock);
+    let (mut fresh, mut reported) = (0u64, Instant::now());
+    // The app leads a fresh stream with an IDR, but until the client's first
+    // ping lands there is no peer to send to and that IDR is dropped on the
+    // floor — after which the client sits silent until the next periodic
+    // keyframe (GOP 300 ≈ 15 s; measured as a 24 s dead start). Ask the app
+    // for a new random-access point the moment the peer appears.
+    let mut peer_seen = false;
 
-    /// A session ends. The STREAM STAYS OPEN -- that is the entire point.
-    pub fn detach(&self) {
-        let framed = self.sink.lock().unwrap().take().map(|s| s.frame_index).unwrap_or(0);
-        eprintln!("[video] session detached after {framed} frames (stream stays open)");
-    }
-
-    fn pump(app: Arc<App>, kbps: u32, sink: Arc<std::sync::Mutex<Option<AuSink>>>) {
-        use std::io::BufRead;
-        let (mut fresh, mut reported) = (0u64, Instant::now());
-        let mut peer_seen = false;
-
-        loop {
-            let mut r = match app.get_stream(&format!("/video?codec=h264&kbps={kbps}")) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[video] /video connect failed: {e}; retrying");
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
+    while !session.is_stopping() {
+        let mut r = match app.get_stream(&format!("/video?codec=h264&kbps={kbps}")) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[video] /video connect failed: {e}; retrying");
+                if !session.wait(Duration::from_secs(1)) {
+                    break;
                 }
-            };
-            eprintln!("[video] persistent /video stream open (kbps={kbps})");
-            let mut line = String::new();
-            loop {
-                // Keyframe requests are per-session state, so they are read
-                // through whatever sink is currently attached.
-                {
-                    let mut guard = sink.lock().unwrap();
-                    if let Some(s) = guard.as_mut() {
-                        let has_peer = s.session.video_peer.lock().unwrap().is_some();
-                        if !peer_seen && has_peer {
-                            peer_seen = true;
-                            s.session.request_idr();
-                        }
-                        if !has_peer {
-                            peer_seen = false;
-                        }
-                        if s.session.take_idr_request() {
-                            drop(guard);
-                            let _ = app.post_json("/video-key", "{}");
-                        }
-                    }
-                }
-
-                line.clear();
-                match r.read_line(&mut line) {
-                    Ok(0) | Err(_) => break, // the app closed it; redial
-                    Ok(_) => {}
-                }
-                let Some(payload) = line.strip_prefix("data: ") else { continue };
-                let Some(d) = crate::screen::json_str(payload.trim_end(), "d") else { continue };
-                let Some(au) = crate::screen::b64_decode(d) else {
-                    eprintln!("[video] frame with undecodable base64, skipped");
-                    continue;
-                };
-                if au.is_empty() {
-                    continue;
-                }
-                fresh += 1;
-                if reported.elapsed() >= Duration::from_secs(10) {
-                    // Only worth saying while someone is watching; an idle
-                    // bridge would otherwise print this forever.
-                    if sink.lock().unwrap().is_some() {
-                        eprintln!(
-                            "[video] source: {:.1} app frames/s",
-                            fresh as f64 / reported.elapsed().as_secs_f64()
-                        );
-                    }
-                    reported = Instant::now();
-                    fresh = 0;
-                }
-                // No session attached: the frame is simply dropped. The app
-                // keeps encoding either way, and holding the stream open is
-                // what keeps reconnecting instant.
-                let mut guard = sink.lock().unwrap();
-                if let Some(s) = guard.as_mut() {
-                    if !s.emit(au) {
-                        // The RTP send failed, not the source: drop this
-                        // session's sink and keep the stream.
-                        *guard = None;
-                    }
-                }
+                continue;
             }
-            eprintln!("[video] persistent /video stream ended; redialing");
+        };
+        let mut line = String::new();
+        loop {
+            if session.is_stopping() {
+                return;
+            }
+            // A lost client needs a random-access point; the app owns the
+            // encoder, so forward the request as a keyframe order. Checked
+            // per event: at 30 fps that bounds the reaction to ~a frame.
+            if !peer_seen && session.video_peer.lock().unwrap().is_some() {
+                peer_seen = true;
+                session.request_idr();
+            }
+            if session.take_idr_request() {
+                let _ = app.post_json("/video-key", "{}");
+            }
+            line.clear();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // stream ended; redial
+                Ok(_) => {}
+            }
+            let Some(payload) = line.strip_prefix("data: ") else { continue };
+            let Some(d) = crate::screen::json_str(payload.trim_end(), "d") else { continue };
+            let Some(au) = crate::screen::b64_decode(d) else {
+                eprintln!("[video] frame with undecodable base64, skipped");
+                continue;
+            };
+            if au.is_empty() {
+                continue;
+            }
+            fresh += 1;
+            if reported.elapsed() >= Duration::from_secs(10) {
+                eprintln!(
+                    "[video] source: {:.1} app frames/s",
+                    fresh as f64 / reported.elapsed().as_secs_f64()
+                );
+                reported = Instant::now();
+                fresh = 0;
+            }
+            if !sink.emit(au) {
+                break;
+            }
         }
+        eprintln!("[video] /video stream ended; redialing");
     }
+
+    eprintln!("[video] stream ended after {} frames", sink.frame_index);
 }
 
 #[cfg(test)]
