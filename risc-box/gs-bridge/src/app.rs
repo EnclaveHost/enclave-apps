@@ -660,6 +660,18 @@ impl InputPipe {
         }
         self.buf.drain(..total);
         self.pending = self.pending.saturating_sub(1);
+        // A `Connection: close` response means the peer will accept nothing
+        // more on this socket. Pipelining assumes keep-alive, so the NEXT
+        // request would be written into a socket the peer has already closed
+        // and silently lost — and a lost key-up is a stuck key, a lost batch
+        // is dropped input. The enclave/relay proxy answers every request with
+        // `close` (only a keep-alive app avoids it), so drop the connection now
+        // and let the following send dial a fresh one — proven reliable, since
+        // one-request-per-connection delivers 100%. On a keep-alive peer this
+        // branch never fires and the socket is reused as before.
+        if head.contains("connection: close") {
+            self.reset();
+        }
         true
     }
 
