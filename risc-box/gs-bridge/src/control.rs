@@ -403,6 +403,22 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
     let mut retry_backoff = Duration::from_secs(5);
     let mut last_used = std::time::Instant::now();
     let mut last_cursor: Option<std::time::Instant> = None;
+    // Minimum key hold. A game reads HELD key state once per game tic; on a
+    // slow guest (this emulated desktop runs DOOM at ~8 fps, ~125 ms/tic) a
+    // quick tap's key-down and key-up can both land between two tics, so
+    // per-tic-sampled actions (fire on Ctrl, use on Space) never register even
+    // though every edge-triggered key — menu, automap, weapon numbers — does.
+    // Hold each key down for at least one tic by deferring its key-up until
+    // KEY_MIN_HOLD after the key-down. A real hold releases long after this, so
+    // it is untouched; only sub-tic taps are stretched. 0 disables it.
+    let key_min_hold = std::env::var("GSB_KEY_MIN_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(160));
+    let mut key_down_at: std::collections::HashMap<u16, std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut deferred_ups: Vec<(u16, std::time::Instant)> = Vec::new();
     while !session.is_stopping() {
         if stream.is_none() {
             if let Some((mut cand, since)) = candidate.take() {
@@ -446,6 +462,52 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
                 batch.insert(0, format!(r#"{{"t":"move","x":{:.6},"y":{:.6}}}"#, cur.0, cur.1));
                 last_cursor = Some(std::time::Instant::now());
             }
+        }
+        // Enforce the minimum key hold: record key-downs, hold back a key-up
+        // that arrives too soon after its down, and release any deferred ups
+        // whose hold has elapsed. The 50 ms drain keeps this loop turning even
+        // with no new input, so a deferred up flushes within ~50 ms of due.
+        if key_min_hold > Duration::ZERO {
+            let parse_key = |ev: &str| -> Option<(u16, bool)> {
+                if !ev.contains(r#""t":"key""#) {
+                    return None;
+                }
+                let code = ev
+                    .split(r#""code":"#)
+                    .nth(1)?
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse()
+                    .ok()?;
+                Some((code, ev.contains(r#""down":true"#)))
+            };
+            let now = std::time::Instant::now();
+            let mut kept: Vec<String> = Vec::with_capacity(batch.len());
+            for ev in batch.drain(..) {
+                match parse_key(&ev) {
+                    Some((code, true)) => {
+                        key_down_at.insert(code, now);
+                        kept.push(ev);
+                    }
+                    Some((code, false)) => match key_down_at.get(&code) {
+                        Some(&down) if now.duration_since(down) < key_min_hold => {
+                            deferred_ups.push((code, down + key_min_hold));
+                        }
+                        _ => kept.push(ev),
+                    },
+                    None => kept.push(ev),
+                }
+            }
+            batch = kept;
+            let now = std::time::Instant::now();
+            deferred_ups.retain(|&(code, release_at)| {
+                if now >= release_at {
+                    batch.push(format!(r#"{{"t":"key","code":{code},"down":false}}"#));
+                    false
+                } else {
+                    true
+                }
+            });
         }
         if batch.is_empty() {
             if let Some(p) = pipe.as_mut() {
