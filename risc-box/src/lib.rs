@@ -148,7 +148,7 @@ struct Config {
     // 2 GiB, and a machine under 128 MiB can't even finish X startup.
     ram_mib: u64,
     // Display size (`display: {width, height}`), default 1024x768. Must fit the
-    // DTB's 3 MiB framebuffer window; the emulator applies the same guard to
+    // DTB's 8 MiB framebuffer window; the emulator applies the same guard to
     // the device tree, so app and guest cannot disagree.
     fb_w: u64,
     fb_h: u64,
@@ -876,7 +876,7 @@ fn boot(images: &mut Images, cfg: &Config) -> Result<Emulator, String> {
         {
             true => eprintln!("[risc-box] display {}x{}", cfg.fb_w, cfg.fb_h),
             false => eprintln!(
-                "[risc-box] display {}x{} rejected (must be even and fit 3 MiB); staying at {}x{}",
+                "[risc-box] display {}x{} rejected (must be even and fit 8 MiB); staying at {}x{}",
                 cfg.fb_w,
                 cfg.fb_h,
                 display::fb_w(),

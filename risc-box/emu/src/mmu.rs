@@ -230,15 +230,15 @@ impl Mmu {
 	/// it, the host scans it out, and the encoder ships it — so a machine whose
 	/// job is a 320x200 game should not be made to run a 1024x768 desktop's
 	/// worth of framebuffer. The node's `reg` window is left alone: it is the
-	/// 3 MiB the reserved-memory node keeps the allocator off, and every size
+	/// 8 MiB the reserved-memory node keeps the allocator off, and every size
 	/// this accepts fits inside it.
 	///
 	/// Returns false (leaving the DTB untouched) if the size does not fit or
 	/// the node is not the one this emulator ships.
 	pub fn set_dtb_framebuffer(&mut self, width: u32, height: u32) -> bool {
-		const FB_WINDOW: u64 = 0x30_0000;
+		const FB_WINDOW: u64 = 0x80_0000;
 		if width == 0 || height == 0 || (width as u64) * (height as u64) * 4 > FB_WINDOW {
-			eprintln!("[emu] dtb: framebuffer {}x{} does not fit the 3 MiB window; keeping the default", width, height);
+			eprintln!("[emu] dtb: framebuffer {}x{} does not fit the 8 MiB window; keeping the default", width, height);
 			return false;
 		}
 		// width/height/stride sit consecutively in the struct block, each one
@@ -1352,7 +1352,7 @@ impl MemoryWrapper {
 	// risc-box patch: bump code_gen if this write can touch a marked page.
 	#[inline(always)]
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
-		if p_address >= 0x87e0_0000 && p_address < 0x8810_0000 {
+		if p_address >= 0x87e0_0000 && p_address < 0x8860_0000 {
 			self.fb_writes = self.fb_writes.wrapping_add(1);
 			self.fb_bytes = self.fb_bytes.wrapping_add(width);
 			use std::sync::atomic::Ordering;

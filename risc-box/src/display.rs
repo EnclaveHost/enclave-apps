@@ -1,7 +1,7 @@
 //! The machine's display, scanned out of guest RAM to the browser.
 //!
 //! The emulator's default device tree declares a `simple-framebuffer`:
-//! 1024x768, 32-bit XRGB, in a 4 MiB reserved window of the guest DRAM
+//! 1024x768, 32-bit XRGB, in an 8 MiB reserved window of the guest DRAM
 //! (0x87e00000). A guest kernel with CONFIG_FB_SIMPLE drives it as /dev/fb0
 //! (fbcon, fbdev Xorg, Wayland via wlroots' fbdev — anything); a kernel
 //! without it ignores the node and the serial console remains the only view.
@@ -29,9 +29,9 @@ use riscv_emu_rust::Emulator;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const FB_BASE: u64 = 0x87e0_0000;
-/// The DTB's simple-framebuffer window: 4 MiB reserved, of which a frame may
-/// use 3 MiB (1024x768x4, the largest mode).
-pub const FB_MAX_BYTES: usize = 0x30_0000;
+/// The DTB's simple-framebuffer window: 8 MiB reserved, of which a frame may
+/// use 8 MiB (up to 1920x1080, the largest mode).
+pub const FB_MAX_BYTES: usize = 0x80_0000;
 
 /// The display's size, fixed for the life of the process by `set_size` before
 /// the machine boots (it has to agree with the DTB node the guest kernel reads
@@ -393,6 +393,21 @@ impl Display {
     /// under a second instead of forever.
     pub fn bands(&mut self, mut frame: Vec<u8>, damage: Option<(usize, usize)>)
         -> (Vec<Band>, Vec<u8>) {
+        // set_size can GROW the framebuffer after this Display was built -- a
+        // `display` config larger than the 1024x768 startup default, or a
+        // runtime virtio-gpu mode change. `row_hash` is the one buffer a scan
+        // indexes by the live fb_h() while it was sized at new(), so a grown
+        // screen indexed past its end and PANICKED this worker -- freezing the
+        // band stream (the web monitor and the GameStream bridge ride it) while
+        // the raster /fb.png path, which reallocates per call, kept working.
+        // Reconcile to the current geometry and re-prime: the old hashes and
+        // previous frame describe a different shape.
+        if self.row_hash.len() != fb_h() {
+            self.row_hash.clear();
+            self.row_hash.resize(fb_h(), 0);
+            self.primed = false;
+            self.force_full = true;
+        }
         let mut dirty = vec![false; fb_h()];
         let mut any = false;
         self.since_full = self.since_full.wrapping_add(1);
