@@ -326,6 +326,12 @@ impl Emulator {
 		if ok {
 			// keep the overlay rect math on the true stride
 			self.cpu.get_mut_mmu().set_fb_stride(width as u64 * 4);
+			// ...and make the virtio-gpu advertise the SAME screen. Otherwise
+			// the guest gets two different answers for one display: the DTB's
+			// simple-framebuffer at the configured size and a GPU still
+			// claiming 1024x768, whose fbdev console then drives a scanout
+			// bigger than the host sized its display state for.
+			self.cpu.get_mut_mmu().get_mut_gpu().set_display_size(width, height);
 		}
 		ok
 	}

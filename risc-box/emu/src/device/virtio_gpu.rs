@@ -255,6 +255,28 @@ impl VirtioGpu {
         }
     }
 
+    /// risc-box patch: restate the geometry this GPU advertises, before the
+    /// guest boots. The DTB's simple-framebuffer already follows the
+    /// deployment's `display` config; this makes the virtio-gpu follow the SAME
+    /// size, which is not cosmetic — the two disagreeing is a real bug.
+    ///
+    /// The device used to advertise a hardcoded 1024x768 whatever `display`
+    /// said. The guest believed it: virtio-gpu's fbdev console (fb1) came up
+    /// 1024x768 while the simple-framebuffer (fb0) was the configured size, so
+    /// on a smaller screen the scanout GREW the host's framebuffer past the
+    /// geometry the display worker had sized its per-row state for, and the
+    /// worker died — taking the band stream (the web monitor and the
+    /// GameStream bridge) with it while /fb.png, which reallocates per call,
+    /// kept working and made the machine look healthy.
+    pub fn set_display_size(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.display_width = width;
+        self.display_height = height;
+        self.screen = vec![0u8; width as usize * height as usize * BPP];
+    }
+
     /// Attach a 3D backend. Until one exists this is never called, and the
     /// device correctly tells the guest it has no 3D.
     pub fn with_virgl(mut self, backend: Box<dyn Virgl3d>) -> Self {
