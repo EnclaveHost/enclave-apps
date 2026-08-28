@@ -206,6 +206,19 @@ fn input_event_json(session: &Session, payload: &[u8]) -> Option<String> {
     let magic = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let body = &payload[8..];
 
+    // GSB_INPUT_TRACE=1 dumps every input event's magic and leading body bytes.
+    // Relative (captured-mouse) motion is exercised only under a real capture,
+    // so this is the one reliable way to see what magic the client actually
+    // sends for it — a frozen pointer is otherwise invisible from both ends.
+    if std::env::var_os("GSB_INPUT_TRACE").is_some() {
+        let n = body.len().min(12);
+        eprintln!(
+            "[trace] input magic 0x{magic:08x} body {} bytes: {:02x?}",
+            body.len(),
+            &body[..n]
+        );
+    }
+
     match magic {
         MOUSE_MOVE_REL_MAGIC_GEN5 if body.len() >= 4 => {
             // The emulated pointer is absolute, so integrate the delta into
