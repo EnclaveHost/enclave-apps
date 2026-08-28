@@ -1838,6 +1838,10 @@ pub fn run() {
     // One line a minute is cheap enough to leave on always.
     const HEARTBEAT: Duration = Duration::from_secs(60);
     let mut last_heartbeat = Instant::now();
+    // Last time the loop yielded its OS thread to the host runtime. Used to
+    // guarantee the runtime periodically gets a slice to ACCEPT new
+    // connections even while a video watcher keeps the loop busy every turn.
+    let mut last_yield = Instant::now();
 
     loop {
         let t0 = Instant::now();
@@ -2380,8 +2384,10 @@ pub fn run() {
         // when a running machine produced no output and moved no bytes.
         if app.phase != Phase::Running {
             std::thread::sleep(std::time::Duration::from_millis(20));
+            last_yield = std::time::Instant::now();
         } else if !busy && !flushed {
             std::thread::sleep(std::time::Duration::from_millis(1));
+            last_yield = std::time::Instant::now();
         } else if !flushed && server.pending_bytes() > 0 {
             // Queued output that would not go out this turn: yield a slice so
             // the host runtime can run its stream worker.
@@ -2407,6 +2413,24 @@ pub fn run() {
             // backpressure signal, and self-paces the stream to the rate the
             // link and the runtime can actually carry.
             std::thread::sleep(std::time::Duration::from_millis(1));
+            last_yield = std::time::Instant::now();
+        } else if last_yield.elapsed() >= std::time::Duration::from_millis(16) {
+            // ACCEPT FAIRNESS. The backpressure yield above only fires when
+            // OUTPUT is stuck. But a busy loop whose output IS flowing still
+            // starves the host runtime of the slice it needs to ACCEPT new
+            // connections: send/recv readiness is made kernel-truthful by the
+            // socket-level-check patch, but the listener's accept is not on
+            // that path — it stays gated on the runtime's cooperative budget,
+            // which replenishes only when a fiber yields. A video watcher makes
+            // `busy` true every turn, so without this the loop never yields and
+            // new POST /hid connections are never accepted while the already-
+            // open /video stream keeps flowing: smooth video, dead input (the
+            // exact "cursor and keyboard don't work under Moonlight" bug).
+            // Yield the OS thread at most once per ~frame so the runtime can
+            // drain its accept queue; costs ~1 ms/16 ms and never touches the
+            // stream's own pacing above.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            last_yield = std::time::Instant::now();
         }
     }
 }
