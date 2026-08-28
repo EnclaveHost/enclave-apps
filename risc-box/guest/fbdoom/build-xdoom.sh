@@ -117,6 +117,47 @@ MUSEOF
 grep -n 'OBJS' Makefile | head -3
 # upstream hardcodes homedir=/mnt for its appliance; the desktop image wants $HOME
 sed -i 's|homedir = "/mnt"|homedir = getenv("HOME")|' m_config.c
+# Screen size: DOOM's own default screenblocks is 9, which draws the view inside
+# a decorative border. 10 is the first setting that fills the window's width
+# (status bar kept), which is what the desktop image ships. The config file is
+# NOT a way to set this -- the engine reads default.cfg but the value only takes
+# effect from the compiled default here (verified on the deployed build).
+# (the declaration is `int\t\t\tscreenblocks = 9;` -- match on the assignment
+# alone rather than anchoring, and fail loudly if upstream ever renames it,
+# because a silent no-op here just brings the border back.)
+sed -i 's/screenblocks = 9;/screenblocks = 10;/' m_menu.c
+grep -q "screenblocks = 10;" m_menu.c || { echo "screenblocks default not found -- upstream changed"; exit 1; }
+
+# I_Error has the SAME shape as I_Quit below, and worse: in the NOSDL build its
+# error path is `while (true) {}`, an infinite spin. So ANY fatal error left the
+# game pinned on its last frame at 100% CPU with input dead and no way out --
+# seen for real when FreeDoom's finale screen exhausted the (6 MiB default)
+# zone: "Z_Malloc: failed on allocation of 436784 bytes" and then a hang that
+# looked like the game had simply stopped responding. An error must EXIT, so the
+# desktop wrapper can restore the desktop.
+python3 - <<'ERREOF'
+s = open("i_system.c").read()
+old = """#if ORIGCODE
+    SDL_Quit();
+
+    exit(-1);
+#else
+    while (true)
+    {
+    }
+#endif
+}"""
+new = """#if ORIGCODE
+    SDL_Quit();
+#endif
+
+    exit(-1);
+}"""
+assert old in s, "I_Error tail not found -- upstream changed"
+s = s.replace(old, new, 1)
+open("i_system.c", "w").write(s)
+ERREOF
+grep -q "while (true)" i_system.c && { echo "I_Error still spins -- patch did not take"; exit 1; } || true
 # upstream's I_Quit only exits under ORIGCODE (the SDL build): in the NOSDL
 # build quit ran the exit funcs and RETURNED, so QUIT GAME played on. Move
 # the exit outside the guard.
