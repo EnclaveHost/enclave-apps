@@ -496,6 +496,42 @@ fn vram_budget() -> Option<u64> {
         .filter(|b| *b > 0)
 }
 
+fn env_bytes(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse::<u64>().ok().filter(|b| *b > 0)
+}
+
+/// What a MODEL must fit to be servable here, and whether that memory is a
+/// card's or the node's. These are different questions from `vram_budget`, and
+/// conflating them is what made a servable model unservable.
+///
+/// ENCLAVE_VRAM_BYTES means "your slice of a card". On a LOCAL GPU deployment
+/// that is also the serve budget - the weights are resident in VRAM and a CUDA
+/// OOM inside compute aborts the whole process, so the ceiling is hard. On a
+/// SHIELDED deployment it is only the offload RESERVATION: there is no local
+/// card, the weights are mmap'd in the CVM like any CPU tenant's, and the
+/// worker is reached per matmul over the masked-offload protocol - where a
+/// model bigger than the reservation is SLOW, not fatal (placement is a policy,
+/// a refused reservation computes in the enclave, and with no calibration every
+/// matmul stays inside anyway). Pricing against it there refused a 24 GB model
+/// over a 2.3 GB reservation while 58 GB of node RAM sat free (eyesoff-ai on
+/// metal0, 2026-08-31).
+///
+/// So the host now says which it means: ENCLAVE_NN_SERVE_BYTES is the budget a
+/// ggml graph may actually occupy and ENCLAVE_NN_SERVE_KIND is "VRAM" or "RAM".
+/// Falls back to ENCLAVE_VRAM_BYTES, so on an older manager this is exactly the
+/// previous behaviour.
+///
+/// Returns (bytes, is_vram); None when nothing is known (a dev box).
+fn serve_budget() -> Option<(u64, bool)> {
+    if let Some(b) = env_bytes("ENCLAVE_NN_SERVE_BYTES") {
+        let vram = std::env::var("ENCLAVE_NN_SERVE_KIND")
+            .map(|k| k.trim().eq_ignore_ascii_case("vram"))
+            .unwrap_or(true);
+        return Some((b, vram));
+    }
+    vram_budget().map(|b| (b, true))
+}
+
 /// Whether this deployment holds GPU resources at all - the fact the
 /// playground's CPU-mode notice is built on.
 ///
@@ -641,7 +677,16 @@ fn pooled_backend() -> bool {
 /// degrades to weights-only. Returns volume -> reason, unfit models only.
 fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    let Some(budget) = vram_budget() else { return out };
+    let Some((budget, is_vram)) = serve_budget() else { return out };
+    // What the operator can actually DO about it. More card is buyable; the
+    // node's RAM pool is not - it is the box, shared with whatever the other
+    // tenants hold resident - so telling someone to raise a share there sends
+    // them to spend money on the wrong axis.
+    let (mem, remedy) = if is_vram {
+        ("GPU memory", " - a larger GPU share unlocks this model")
+    } else {
+        ("memory", " - this node cannot hold it alongside what is already resident")
+    };
     let mut asc: Vec<&ModelEntry> = entries.iter().collect();
     asc.sort_by(|a, b| a.bytes.cmp(&b.bytes).then(a.volume.cmp(&b.volume)));
     let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -663,26 +708,28 @@ fn over_budget(entries: &[ModelEntry]) -> std::collections::HashMap<String, Stri
                 e.volume.clone(),
                 if kv > 0 {
                     format!(
-                        "needs ~{:.1} GB of GPU memory ({:.1} GB model + {:.1} GB working \
-                         memory) but only {:.1} GB of {:.1} GB is free - a larger GPU share \
-                         unlocks this model",
+                        "needs ~{:.1} GB of {} ({:.1} GB model + {:.1} GB working \
+                         memory) but only {:.1} GB of {:.1} GB is free{}",
                         gb(need),
+                        mem,
                         gb(e.bytes),
                         gb(kv),
                         gb(budget.saturating_sub(claimed)),
-                        gb(budget)
+                        gb(budget),
+                        remedy
                     )
                 } else {
                     format!(
-                        "this {:.1} GB model cannot fit in the server's {:.1} GB of GPU memory\
-                         {} - a larger GPU share unlocks this model",
+                        "this {:.1} GB model cannot fit in the server's {:.1} GB of {}{}{}",
                         gb(e.bytes),
                         gb(budget),
+                        mem,
                         if claimed > 0 {
                             format!(" ({:.1} GB already used by smaller models)", gb(claimed))
                         } else {
                             String::new()
-                        }
+                        },
+                        remedy
                     )
                 },
             );
@@ -7958,6 +8005,11 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
     let body = serde_json::json!({
         "default": entries.first().map(|e| e.cfg.name.clone()),
         "vram_budget": vram_budget(),
+        // what a model must actually FIT here, and whether that is a card or
+        // the node - on a shielded deployment those are different numbers, and
+        // reading only vram_budget is what made a servable model look unfit
+        "serve_budget": serve_budget().map(|(b, _)| b),
+        "serve_kind": serve_budget().map(|(_, v)| if v { "VRAM" } else { "RAM" }),
         // true / false / null (unknown) - the playground raises its CPU-mode
         // notice on an explicit false, never on a null
         "gpu": gpu_present(),
@@ -10022,5 +10074,74 @@ mod tests {
         assert!(folded.contains("VISION REPORT"));
         assert!(folded.trim_end().ends_with("Question: what is this"));
         assert!(folded.contains("A red barn beside a fence."));
+    }
+}
+
+/// Which memory a model must fit, and what to tell the operator about it.
+///
+/// The bug (2026-08-31, this deployment on metal0): ENCLAVE_VRAM_BYTES means
+/// "your slice of a card". On a LOCAL GPU deployment that is also the serve
+/// budget - weights are resident in VRAM and a CUDA OOM aborts the process, so
+/// the ceiling is hard. On a SHIELDED one it is only the offload RESERVATION:
+/// no local card exists, the weights are mmap'd in the CVM, and the worker is
+/// reached per matmul - too big is SLOW, not fatal. Pricing against it refused
+/// a 24 GB model over a 2.3 GB reservation while 58 GB of node RAM sat free.
+///
+/// One test, sequentially: these are process-global env vars.
+#[cfg(test)]
+mod tests_serve_budget {
+    use super::*;
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    fn entry(bytes: u64) -> ModelEntry {
+        let raw: serde_json::Value = serde_json::from_slice(config::APP_CONFIG_JSON).unwrap();
+        let cfg = config::resolve_entry(&raw, "qwen3.8-27b-mtp-gguf", serde_json::json!({}))
+            .expect("the embedded config describes a servable model");
+        ModelEntry { volume: "qwen3.8-27b-mtp-gguf".into(), bytes, cfg }
+    }
+
+    fn clear() {
+        for k in ["ENCLAVE_NN_SERVE_BYTES", "ENCLAVE_NN_SERVE_KIND", "ENCLAVE_VRAM_BYTES"] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn the_serve_budget_is_the_one_the_host_names() {
+        clear();
+        assert_eq!(serve_budget(), None, "a dev box knows nothing and refuses nothing");
+        assert!(over_budget(&[entry(24 * GB)]).is_empty());
+
+        // OLDER MANAGER: only ENCLAVE_VRAM_BYTES, and it means the serve budget
+        std::env::set_var("ENCLAVE_VRAM_BYTES", (50 * GB).to_string());
+        assert_eq!(serve_budget(), Some((50 * GB, true)), "back-compat: unchanged behaviour");
+
+        // LOCAL GPU: the hard ceiling still refuses, and says what to buy
+        std::env::set_var("ENCLAVE_NN_SERVE_BYTES", (2 * GB).to_string());
+        std::env::set_var("ENCLAVE_NN_SERVE_KIND", "VRAM");
+        assert_eq!(serve_budget(), Some((2 * GB, true)));
+        let why = over_budget(&[entry(24 * GB)]);
+        let msg = why.get("qwen3.8-27b-mtp-gguf").expect("24 GB cannot fit 2 GB of card");
+        assert!(msg.contains("GPU memory"), "names the memory that is short: {msg}");
+        assert!(msg.contains("a larger GPU share unlocks this model"), "{msg}");
+
+        // SHIELDED: the card share is unchanged, but the host says the model
+        // answers to the node - and the same model is servable
+        std::env::set_var("ENCLAVE_VRAM_BYTES", (2 * GB).to_string());
+        std::env::set_var("ENCLAVE_NN_SERVE_BYTES", (58 * GB).to_string());
+        std::env::set_var("ENCLAVE_NN_SERVE_KIND", "RAM");
+        assert_eq!(serve_budget(), Some((58 * GB, false)));
+        assert!(over_budget(&[entry(24 * GB)]).is_empty(),
+                "a 24 GB model fits 58 GB of node RAM - this is the whole bug");
+        assert_eq!(gpu_present(), Some(true),
+                   "and the deployment still HAS a card: offload is real for models that fit");
+
+        // ...but the node budget is a real budget, not a waived one
+        let why = over_budget(&[entry(80 * GB)]);
+        let msg = why.get("qwen3.8-27b-mtp-gguf").expect("80 GB does not fit 58 GB");
+        assert!(!msg.contains("GPU memory"), "do not blame the card for node RAM: {msg}");
+        assert!(msg.contains("already resident"),
+                "a bigger share cannot buy node RAM, so do not suggest it: {msg}");
+        clear();
     }
 }
