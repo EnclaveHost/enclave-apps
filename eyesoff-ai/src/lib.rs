@@ -839,6 +839,15 @@ const PREFILL_CHUNK: usize = 128;
 /// The chunk size prefill actually uses: the host's own ubatch cap when it
 /// exports one (caps value 5), the historical 128 otherwise. Costs one
 /// cheap caps probe per generation on ggml; onnx keeps the constant.
+/// The NEXT prefill chunk, given how long the last one took. Grows only on
+/// evidence: a chunk that returned quickly says this host can afford twice as
+/// much before it next speaks. Never shrinks - the first chunk is already the
+/// small one, and a host that slowed down mid-prompt still emitted recently.
+fn grown_chunk(chunk: usize, cap: usize, took_ms: u128) -> usize {
+    const GROW_UNDER_MS: u128 = 2_000;
+    if took_ms < GROW_UNDER_MS && chunk < cap { (chunk * 2).min(cap) } else { chunk }
+}
+
 fn prefill_chunk(sess: &mut Session) -> usize {
     match sess {
         Session::Ggml { .. } => sess
@@ -2624,20 +2633,29 @@ fn generate(
         return Err("client disconnected".into());
     }
 
-    let chunk = prefill_chunk(&mut sess);
-    // Prefill is chunked, and on a slow enough host each chunk is long enough
-    // that the WHOLE prefill can pass without the response emitting a byte.
-    // The proxy cuts a mid-response tenant idle for 180s (it is how a wedged
-    // one is caught), so a legitimately slow prefill has to say it is alive -
-    // the same rule the busy queue above already follows. It never fired on a
-    // card, where prefill is seconds; a 27B served on cores takes minutes, and
-    // the turn died at exactly 180s with the model working fine
+    // Prefill is chunked, and the response emits nothing while a chunk is in
+    // flight: a guest is single-threaded, so it cannot say anything until the
+    // host call returns. The proxy cuts a mid-response tenant idle for 180s
+    // (it is how a wedged one is caught), which makes the CHUNK the real unit
+    // of liveness - a keepalive between chunks is worth nothing if one chunk
+    // outlasts the budget on its own.
+    //
+    // It never mattered on a card, where prefill is seconds. On cores a token
+    // costs ~2*params FLOPs, and a 27B at the host's own n_batch of 512 took
+    // longer than 180s for ONE chunk: the turn died with the model working
+    // fine, mid-prefill, having emitted its opening line and nothing since
     // (2026-08-31, eyesoff-ai on metal0).
     //
-    // Throttled by TIME, not by chunk: a fast host would otherwise emit a tick
-    // per chunk for no reader's benefit, and the ticks are the user's only
-    // sign of progress on a slow one.
+    // So START small and GROW. The first chunk is the historical 128 - small
+    // enough that even a slow host returns inside the budget - and each chunk
+    // that comes back quickly doubles, up to the host's own cap. A fast host
+    // pays a handful of extra calls on the first prompt and is at the cap
+    // within microseconds of work; a slow one keeps emitting. Sizing this off
+    // a measurement beats guessing a rate, because the range is enormous: the
+    // same prompt is milliseconds on an H200 and minutes on a CPU share.
     const PREFILL_TICK_MS: u128 = 10_000;
+    let chunk_cap = prefill_chunk(&mut sess);
+    let mut chunk = PREFILL_CHUNK.min(chunk_cap);
     let mut last_tick = now_ms();
     let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
     let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
@@ -2657,12 +2675,15 @@ fn generate(
                     let end = (done + chunk).min(ids.len());
                     // only the very last token of the whole prompt needs logits
                     let last = i == last_part && end == ids.len();
+                    let t_chunk = now_ms();
                     let l = sess.feed(cfg, &ids[done..end], last)?;
+                    let took = now_ms() - t_chunk;
                     if last {
                         logits = l;
                     }
                     fed += end - done;
                     done = end;
+                    chunk = grown_chunk(chunk, chunk_cap, took);
                     if now_ms() - last_tick >= PREFILL_TICK_MS {
                         last_tick = now_ms();
                         // against the whole prompt, which is the number the
@@ -9641,6 +9662,34 @@ mod tests {
         let short: Vec<u32> = std::iter::repeat([7u32, 8]).take(5).flatten().collect();
         assert!(!g.tripped(&short));
         assert!(g.tripped(&std::iter::repeat([7u32, 8]).take(40).flatten().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn prefill_starts_small_and_grows_only_on_evidence() {
+        // The invariant that matters: the FIRST chunk is small whatever the
+        // host's cap, because nothing can be emitted while one is in flight.
+        // A 27B on cores took over 180s for a single 512-token chunk and the
+        // proxy cut the response mid-prefill, with the model working fine.
+        assert_eq!(PREFILL_CHUNK.min(2048), 128, "the opening chunk stays small");
+
+        // a fast host doubles to its cap and stays there
+        let cap = 512;
+        let mut c = PREFILL_CHUNK.min(cap);
+        for _ in 0..8 {
+            c = grown_chunk(c, cap, 5);
+        }
+        assert_eq!(c, cap, "a fast host reaches the cap and never exceeds it");
+
+        // a slow host never grows: every chunk stays inside the idle budget
+        let mut c = PREFILL_CHUNK.min(cap);
+        for _ in 0..8 {
+            c = grown_chunk(c, cap, 90_000);
+        }
+        assert_eq!(c, 128, "a slow host keeps emitting rather than batching bigger");
+
+        // and the cap is respected even when it is below the starting size
+        assert_eq!(grown_chunk(64, 64, 1), 64);
+        assert_eq!(PREFILL_CHUNK.min(32), 32, "a tiny host cap wins over the default");
     }
 
     #[test]
