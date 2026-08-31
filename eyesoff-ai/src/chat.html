@@ -1088,10 +1088,10 @@
     <nav id="chatList" aria-label="Chat history"></nav>
     <div class="side-foot">
       <button id="storeToggle" type="button" role="switch" aria-checked="false"
-              title="Store chat history and preferences in this browser">
+              title="Keep this browser's chat history between visits">
         <span class="st-txt">
           <span class="st-name">Remember on this device</span>
-          <span class="st-sub" id="storeSub">Nothing is stored in this browser</span>
+          <span class="st-sub" id="storeSub">Doesn't store chat history in this browser</span>
         </span>
         <span class="sw" aria-hidden="true"><span class="knob"></span></span>
       </button>
@@ -1257,7 +1257,7 @@
         your questions leaves this enclave at all.</p>
       </div>
       <button id="webStore" class="web-store" type="button" role="switch" aria-checked="false"
-              title="Store chat history and preferences in this browser">
+              title="Keep this browser's chat history between visits">
         <span class="st-txt">
           <span class="st-name">Remember on this device</span>
           <span class="st-sub" id="webStoreSub"></span>
@@ -2095,13 +2095,22 @@ const isMobile = () => matchMedia("(max-width: 768px)").matches;
 // if it is complete. It was not: think/web had been written for releases
 // without being listed, so switching storage off left them behind. Anything
 // added to pref() belongs here in the same commit.
-const PREF_KEYS = ["llmchat-store", "llmchat-theme", "llmchat-model", "llmchat-target",
+// The settings this app remembers. They are written unconditionally (see
+// pref) and survive the storage switch, which governs CHAT HISTORY alone -
+// so this list exists to name them, not to gate them. The sign-in is not
+// here either: SSO_KEY has its own lifecycle, cleared by signing out.
+const PREF_KEYS = ["llmchat-theme", "llmchat-model", "llmchat-target",
                    "llmchat-sidew", "llmchat-think", "llmchat-web", "llmchat-web-asked",
-                   "llmchat-tools", "llmchat-image", "llmchat-sso"];
+                   "llmchat-tools", "llmchat-image"];
 let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
+// Settings persist whatever the switch says. The switch is about CHAT HISTORY
+// - the thing with the privacy weight, and the only thing that carries what
+// was actually said. A theme, a model pick and a sidebar width are not a
+// record of anything, and losing them every visit was a cost with no matching
+// benefit. Same reasoning as the sign-in above.
 function pref(key, val) {
-  if (storeOK) try { localStorage.setItem(key, val); } catch (_) {}
+  try { localStorage.setItem(key, val); } catch (_) {}
 }
 
 // ------------------------------------------------- sign in with enclave --
@@ -2124,7 +2133,7 @@ function ssoClaims(t) {
 }
 let ssoToken = null;
 try { ssoToken = sessionStorage.getItem(SSO_KEY) || null; } catch (_) {}
-if (!ssoToken && storeOK) try { ssoToken = localStorage.getItem(SSO_KEY) || null; } catch (_) {}
+if (!ssoToken) try { ssoToken = localStorage.getItem(SSO_KEY) || null; } catch (_) {}
 // a remembered token past its exp would only bounce off the server's 401;
 // drop it now so the gate (or the "Sign in" link) is honest at first paint
 {
@@ -2155,7 +2164,13 @@ function ssoAccept(frag) {
     sessionStorage.setItem(SSO_KEY, ssoToken);
     sessionStorage.removeItem(SSO_STATE_KEY);
   } catch (_) {}
-  pref(SSO_KEY, ssoToken);
+  // UNCONDITIONAL, unlike every other stored value: signing in is a thing the
+  // visitor just did on purpose, and making it survive the tab is the whole
+  // point of having done it. Gating this on the history switch meant a signed-
+  // in visitor was asked again on every new tab. Sign-out still clears it
+  // (ssoDrop), and it is deliberately absent from PREF_KEYS so the storage
+  // wipe cannot take it either.
+  try { localStorage.setItem(SSO_KEY, ssoToken); } catch (_) {}
   return true;
 }
 (function () {
@@ -2207,9 +2222,11 @@ function ssoStart() {
     + "?aud=" + encodeURIComponent(state.auth.aud || "")
     + "&redirect_uri=" + encodeURIComponent(back)
     + "&state=" + s
-    // a token this browser will remember is worth the platform's maximum
-    // life (7 days); one that dies with the tab keeps the 24 h default
-    + (storeOK ? "&ttl=604800" : "")
+    // the browser keeps the token whatever the history switch says, so it is
+    // always worth the platform's maximum life (7 days) rather than the 24 h
+    // default - the shorter one only ever bought a re-prompt, never privacy,
+    // since expiry is the only revocation either way
+    + "&ttl=604800"
     + (popup ? "&display=popup" : "");
   // POPUP first: the chat stays exactly where it is, the sign-in floats
   // above it, and /sso-return (resolved against the app BASE, so a proxy
@@ -2255,8 +2272,10 @@ function openDb() {
   });
   return dbOpen;
 }
+// Turning the switch off (or booting with it off) drops the CHAT HISTORY and
+// nothing else. It used to clear every remembered key, which is why it could
+// never be told apart from "forget who I am and how I like this app set up".
 function wipeStorage() {
-  try { for (const k of PREF_KEYS) localStorage.removeItem(k); } catch (_) {}
   if (db) { try { db.close(); } catch (_) {} db = null; }
   dbOpen = null;
   try { indexedDB.deleteDatabase("llmchat"); } catch (_) {}
@@ -2264,17 +2283,21 @@ function wipeStorage() {
 
 function renderStoreToggle() {
   $("storeToggle").setAttribute("aria-checked", String(storeOK));
+  // Says what the switch actually governs. It used to claim "Nothing is
+  // stored", which stopped being true the moment settings and the sign-in
+  // were made to persist on their own - and a privacy switch that overstates
+  // itself is worse than no switch.
   $("storeSub").textContent = storeOK
-    ? "Chats & settings stored in this browser"
-    : "Nothing is stored in this browser";
+    ? "Chat history stored in this browser"
+    : "Doesn't store chat history in this browser";
   // the first-run dialog carries the same switch, so the two must never
   // disagree about what this browser is doing
   const w = $("webStore");
   if (w) {
     w.setAttribute("aria-checked", String(storeOK));
     $("webStoreSub").textContent = storeOK
-      ? "Your answer below is kept, so you will not be asked again."
-      : "Nothing is stored, so this choice lasts for this tab only and you will be asked again next visit.";
+      ? "Chat history is kept in this browser."
+      : "Doesn't store chat history in this browser.";
   }
 }
 async function setStoring(on) {
@@ -2282,15 +2305,15 @@ async function setStoring(on) {
   renderStoreToggle();
   if (on) {
     try { localStorage.setItem("llmchat-store", "1"); } catch (_) {}
-    // snapshot the session so far: current prefs + any chats already in memory
-    pref("llmchat-theme", document.documentElement.dataset.theme);
-    if (state.model) pref("llmchat-model", state.model);
-    pref("llmchat-target", state.target);
-    pref("llmchat-sidew", String(sideW));
-    if (ssoToken) pref(SSO_KEY, ssoToken);
+    // the settings snapshot that used to live here is gone: pref() writes them
+    // as they change now, so they are already on disk. What still needs
+    // catching up is the HISTORY - the chats made before the switch was on.
     await openDb();
     for (const c of state.chats) persist(c);
   } else {
+    // the switch's own state was previously cleared as part of PREF_KEYS;
+    // record it explicitly now that the wipe is scoped to history
+    try { localStorage.removeItem("llmchat-store"); } catch (_) {}
     wipeStorage();
   }
 }
@@ -2610,7 +2633,7 @@ function saveSideWidth() {
 }
 (function initSideWidth() {
   let w = NaN;
-  try { if (storeOK) w = parseInt(localStorage.getItem("llmchat-sidew"), 10); } catch (_) {}
+  try { w = parseInt(localStorage.getItem("llmchat-sidew"), 10); } catch (_) {}
   if (!isNaN(w)) setSideWidth(w);
 })();
 
@@ -4332,7 +4355,7 @@ function webNotice() {
   if (!state.search || !state.search.enabled) return;
   if (state.webMode !== "off") return;          // already on: nothing to ask
   let asked = null;
-  try { if (storeOK) asked = localStorage.getItem("llmchat-web-asked"); } catch (_) {}
+  try { asked = localStorage.getItem("llmchat-web-asked"); } catch (_) {}
   if (asked === "1") return;
   if (gpuOverlay.classList.contains("open")) return;   // retried on its close
   webAsked = true;
@@ -4619,14 +4642,12 @@ const modelsReady = (async () => {
   let storedModel = null, storedTarget = null, storedThink = null, storedWeb = null,
       storedTools = null, storedImage = null;
   try {
-    if (storeOK) {
-      storedModel = localStorage.getItem("llmchat-model");
-      storedTarget = localStorage.getItem("llmchat-target");
-      storedThink = localStorage.getItem("llmchat-think");
-      storedWeb = localStorage.getItem("llmchat-web");
-      storedTools = localStorage.getItem("llmchat-tools");
-      storedImage = localStorage.getItem("llmchat-image");
-    }
+    storedModel = localStorage.getItem("llmchat-model");
+    storedTarget = localStorage.getItem("llmchat-target");
+    storedThink = localStorage.getItem("llmchat-think");
+    storedWeb = localStorage.getItem("llmchat-web");
+    storedTools = localStorage.getItem("llmchat-tools");
+    storedImage = localStorage.getItem("llmchat-image");
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
   if (storedThink === "off") state.think = false;
