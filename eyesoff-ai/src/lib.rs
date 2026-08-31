@@ -872,6 +872,11 @@ const BUSY_WAIT_BUDGET_MS: u128 = 300_000; // stop queueing after 5 minutes
 /// prefix-matches it to tell the wait ticks from the load/ready lines
 /// around them.
 const BUSY_STATUS: &str = "busy with other chats";
+/// generate()'s PREFILL keepalive opens with this, and internal_status
+/// forwards it for the same reason it forwards the busy ticks: bytes are what
+/// keep the stream alive, and a prefill slow enough to matter is slow enough
+/// to trip the proxy's 180s idle cut on its own.
+const PREFILL_STATUS: &str = "prefilling ";
 /// Busy-queue allowance for the INTERNAL generations (the router verdict, the
 /// vision question, the chat title): long enough to ride out a normal turn
 /// finishing ahead, far short of the main leg's five minutes. An optional
@@ -898,6 +903,14 @@ fn internal_status<'a>(
 ) -> impl Fn(&str) -> bool + 'a {
     let t0 = now_ms();
     move |s: &str| {
+        // Prefill progress rides through under the leg's label, and NOT under
+        // the busy budget: queueing is optional work that may be abandoned,
+        // but a prefill already under way is the answer being computed. Cutting
+        // it off would abandon the very work the bytes are reporting.
+        if let Some(rest) = s.strip_prefix(PREFILL_STATUS) {
+            on_status(&format!("{label} (prefilling {rest})"));
+            return true;
+        }
         if !s.starts_with(BUSY_STATUS) {
             return true;
         }
@@ -2612,6 +2625,20 @@ fn generate(
     }
 
     let chunk = prefill_chunk(&mut sess);
+    // Prefill is chunked, and on a slow enough host each chunk is long enough
+    // that the WHOLE prefill can pass without the response emitting a byte.
+    // The proxy cuts a mid-response tenant idle for 180s (it is how a wedged
+    // one is caught), so a legitimately slow prefill has to say it is alive -
+    // the same rule the busy queue above already follows. It never fired on a
+    // card, where prefill is seconds; a 27B served on cores takes minutes, and
+    // the turn died at exactly 180s with the model working fine
+    // (2026-08-31, eyesoff-ai on metal0).
+    //
+    // Throttled by TIME, not by chunk: a fast host would otherwise emit a tick
+    // per chunk for no reader's benefit, and the ticks are the user's only
+    // sign of progress on a slow one.
+    const PREFILL_TICK_MS: u128 = 10_000;
+    let mut last_tick = now_ms();
     let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
     let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     // -- prefill. Text goes in chunks so no single logits tensor gets huge;
@@ -2620,6 +2647,7 @@ fn generate(
     let t1 = now_ms();
     let mut logits = Row::dense(Vec::new());
     let mut image_pos = 0usize;
+    let mut fed = 0usize;                    // text tokens prefilled so far, across parts
     let last_part = prompt.parts.len().saturating_sub(1);
     for (i, part) in prompt.parts.iter().enumerate() {
         match part {
@@ -2633,7 +2661,20 @@ fn generate(
                     if last {
                         logits = l;
                     }
+                    fed += end - done;
                     done = end;
+                    if now_ms() - last_tick >= PREFILL_TICK_MS {
+                        last_tick = now_ms();
+                        // against the whole prompt, which is the number the
+                        // opening line already gave the reader
+                        if !status(&format!(
+                            "{PREFILL_STATUS}{} of {} prompt tokens",
+                            fed,
+                            prompt_ids.len()
+                        )) {
+                            return Err("client disconnected".into());
+                        }
+                    }
                 }
             }
             PromptPart::Image(bytes) => {
@@ -9630,6 +9671,21 @@ mod tests {
         assert_eq!(seen.borrow().len(), n);
         // but even with no budget, non-queue lines still pass without aborting
         assert!(spent("loading the model on cpu - ..."));
+
+        // PREFILL ticks are forwarded too, and for the same reason: a prefill
+        // slow enough to matter trips the proxy's 180s idle cut on its own, and
+        // an internal leg that swallowed them would go silent for the whole of
+        // it. metal0 serving a 27B on cores died at exactly 180s that way.
+        let n = seen.borrow().len();
+        assert!(relay(&format!("{PREFILL_STATUS}1024 of 2036 prompt tokens")));
+        let got = seen.borrow().last().cloned().unwrap();
+        assert_eq!(seen.borrow().len(), n + 1, "the tick must produce a byte");
+        assert!(got.starts_with("deciding what this needs…"), "{got}");
+        assert!(got.contains("1024 of 2036"), "{got}");
+        // and NOT under the busy budget: queueing is optional work that may be
+        // abandoned, but a prefill under way IS the answer being computed
+        assert!(spent(&format!("{PREFILL_STATUS}2036 of 2036 prompt tokens")),
+                "a spent queue budget must not abort a prefill in progress");
     }
 
     #[test]
