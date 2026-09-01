@@ -8122,6 +8122,21 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 if let Some(pre) = &preloads {
                     m["preloaded"] = serde_json::json!(pre.iter().any(|p| p == &e.volume));
                 }
+                // Whether the CARD can hold this model's weights. `fits` above
+                // is the SERVE budget — RAM on a shielded box — so a model can
+                // be perfectly servable while only a fraction of it lives in
+                // VRAM: the partial-offload case, which answers at CPU-like
+                // speed. The playground raises its CPU-mode notice on
+                // `vram_fit: false` the same way it does on a missing share,
+                // because the user experiences the same thing; silence here
+                // read as "GPU speed" on a box that was decoding on 16 vCPUs.
+                // Weights-only on purpose: a shielded card holds nothing but
+                // encoded weights (KV stays in the enclave), and on a local-GPU
+                // deployment an over-VRAM model is already unfit above, so this
+                // is only ever false where serving continues anyway.
+                if let Some(vb) = vram_budget() {
+                    m["vram_fit"] = serde_json::json!(e.bytes <= vb);
+                }
             }
             m
         }).collect::<Vec<_>>(),

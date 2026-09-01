@@ -1292,7 +1292,7 @@
       </div>
       <div class="att-status warn">
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9.5 16.5h-19z"/><path d="M12 10v4.5M12 17.5v.1"/></svg>
-        <span>No GPU capacity right now, so this chat is answering on CPU.</span>
+        <span id="gpuBanner">No GPU capacity right now, so this chat is answering on CPU.</span>
       </div>
       <p class="gpu-lead">eyesoff.ai runs on hardware people rent to the fleet, and every GPU
       enclave is taken right now. A machine with a TEE-capable CPU and a confidential-computing GPU could
@@ -4285,10 +4285,40 @@ function closeGpu() {
   gpuOverlay.classList.remove("open");
   setTimeout(() => webNotice(), 200);   // the question it was standing in front of
 }
+// A GPU share whose card cannot hold the SELECTED model's weights: the graph
+// spills to the enclave's CPU and answers at CPU speed, which is the same
+// thing the visitor experiences with no share at all - so it gets the same
+// chip and the same dialog, with the banner saying which of the two is true.
+function partialModel() {
+  if (state.gpu !== true) return null;
+  const m = state.models.find((x) => (x.name || "") === state.model);
+  return m && m.vram_fit === false ? m : null;
+}
+// The chip and dialog copy follow the CURRENT cause; called at boot and on
+// every model switch, because switching between a fitting and a spilling
+// model changes the answer.
+function computeNotice() {
+  const part = partialModel();
+  if (state.gpu === false) {
+    if (state.target === "gpu") state.target = "auto";
+    cpuChip.classList.add("show");
+    gpuNotice();
+  } else if (part) {
+    const msg = (part.name || "This model") +
+      " is larger than this deployment’s GPU memory, so most of it is answering on CPU.";
+    cpuChip.title = msg;
+    cpuChip.setAttribute("aria-label", "Running mostly on CPU - model larger than GPU memory - details");
+    $("gpuBanner").textContent = msg;
+    cpuChip.classList.add("show");
+    gpuNotice();
+  } else {
+    cpuChip.classList.remove("show");
+  }
+}
 // Only once the boot overlay is gone: stacking the dialog behind a full-screen
 // loading screen would waste the one appearance it gets.
 function gpuNotice() {
-  if (gpuNoticeShown || !bootGone || state.gpu !== false) return;
+  if (gpuNoticeShown || !bootGone || (state.gpu !== false && !partialModel())) return;
   gpuNoticeShown = true;
   openGpu();
 }
@@ -4480,7 +4510,11 @@ function renderModelMenu() {
       // attach button appearing and disappearing is otherwise unexplained
       item.querySelector(".m-sub").textContent = m.sub !== undefined
         ? m.sub
-        : [fmtBytes(m.bytes), m.vision ? "vision" : null].filter(Boolean).join(" · ");
+        : [fmtBytes(m.bytes), m.vision ? "vision" : null,
+           // servable but spilling: the card holds a fraction of the weights,
+           // the rest answers on CPU - say so where the model is chosen
+           state.gpu === true && m.vram_fit === false ? "larger than GPU memory" : null,
+          ].filter(Boolean).join(" · ");
     }
     if ((m.name || "") === state.model) item.classList.add("sel");
     item.addEventListener("click", () => {
@@ -4498,6 +4532,7 @@ function renderModelMenu() {
       }
       updateAttachUI();
       updateComposer();
+      computeNotice();   // a switch can move between a fitting and a spilling model
       if (state.model !== was) warm();
     });
     modelMenu.appendChild(item);
@@ -4689,15 +4724,12 @@ const modelsReady = (async () => {
   ssoNotice();
   // no provider: the web switch governs nothing
   if (!state.search.enabled) state.webMode = "off";
-  if (state.gpu === false) {
-    if (state.target === "gpu") state.target = "auto";
-    cpuChip.classList.add("show");
-    gpuNotice();   // no-op while the boot overlay is still up; dismissBoot retries
-  }
   const def = models.find((m) => m.name === storedModel) ||
     models.find((m) => m.default) || models[0];
   state.model = def ? def.name : "";
   modelLabel.textContent = def ? def.name : "server default";
+  // after state.model: the partial-offload half of the notice is per-model
+  computeNotice();   // dialog is a no-op while the boot overlay is up; dismissBoot retries
   renderModelMenu();
   updateAttachUI();
   webNotice();
