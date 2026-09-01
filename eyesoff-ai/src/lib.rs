@@ -839,13 +839,41 @@ const PREFILL_CHUNK: usize = 128;
 /// The chunk size prefill actually uses: the host's own ubatch cap when it
 /// exports one (caps value 5), the historical 128 otherwise. Costs one
 /// cheap caps probe per generation on ggml; onnx keeps the constant.
-/// The NEXT prefill chunk, given how long the last one took. Grows only on
-/// evidence: a chunk that returned quickly says this host can afford twice as
-/// much before it next speaks. Never shrinks - the first chunk is already the
-/// small one, and a host that slowed down mid-prompt still emitted recently.
-fn grown_chunk(chunk: usize, cap: usize, took_ms: u128) -> usize {
-    const GROW_UNDER_MS: u128 = 2_000;
-    if took_ms < GROW_UNDER_MS && chunk < cap { (chunk * 2).min(cap) } else { chunk }
+/// How long a prefill chunk should aim to take. The constraint is the proxy's
+/// 180s idle cut: nothing can be emitted while a chunk is in flight, so a chunk
+/// must finish well inside that. Everything under it is free, so the target
+/// sits far enough below to absorb a chunk that runs long without gambling the
+/// turn on it.
+const PREFILL_TARGET_MS: u128 = 45_000;
+/// Floor for a host slow enough that even the opening chunk is a long wait.
+/// Below this the batches are too small to be worth running at all.
+const PREFILL_MIN_CHUNK: usize = 32;
+
+/// The NEXT prefill chunk, sized from how long the last one actually took.
+///
+/// The first cut only ever doubled, and only when a chunk returned in under two
+/// seconds - which on a CPU-served 27B never happens, so it pinned at the
+/// opening 128 for the whole prompt. That is the SAFE size, not the right one:
+/// small batches have worse arithmetic intensity, so it bought liveness with a
+/// slice of total throughput, on the one host where throughput was already the
+/// problem.
+///
+/// Aiming at a target TIME instead converges on the largest batch that still
+/// reports in: a fast host reaches the host's own cap within a few chunks and
+/// pays nothing for having been measured, a slow one settles wherever 45s lands
+/// and keeps talking. It can shrink as well as grow - a host that slows
+/// mid-prompt (a neighbour waking up on a shared box) matters more for the
+/// stream staying alive than for the batch staying big.
+///
+/// Damped to 4x per step in each direction: one anomalous measurement should
+/// not send the next chunk somewhere the following one has to walk back.
+fn next_chunk(chunk: usize, cap: usize, took_ms: u128) -> usize {
+    let floor = PREFILL_MIN_CHUNK.min(cap);
+    if took_ms == 0 { return (chunk * 4).min(cap); }        // too fast to measure
+    let c = chunk as u128;
+    let want = c.saturating_mul(PREFILL_TARGET_MS) / took_ms;
+    let want = want.min(c.saturating_mul(4)).max(c / 4);
+    (want as usize).clamp(floor, cap)
 }
 
 fn prefill_chunk(sess: &mut Session) -> usize {
@@ -2683,7 +2711,7 @@ fn generate(
                     }
                     fed += end - done;
                     done = end;
-                    chunk = grown_chunk(chunk, chunk_cap, took);
+                    chunk = next_chunk(chunk, chunk_cap, took);
                     if now_ms() - last_tick >= PREFILL_TICK_MS {
                         last_tick = now_ms();
                         // against the whole prompt, which is the number the
@@ -9665,31 +9693,44 @@ mod tests {
     }
 
     #[test]
-    fn prefill_starts_small_and_grows_only_on_evidence() {
+    fn prefill_chunk_converges_on_the_biggest_batch_that_still_reports_in() {
         // The invariant that matters: the FIRST chunk is small whatever the
         // host's cap, because nothing can be emitted while one is in flight.
         // A 27B on cores took over 180s for a single 512-token chunk and the
         // proxy cut the response mid-prefill, with the model working fine.
         assert_eq!(PREFILL_CHUNK.min(2048), 128, "the opening chunk stays small");
 
-        // a fast host doubles to its cap and stays there
         let cap = 512;
-        let mut c = PREFILL_CHUNK.min(cap);
-        for _ in 0..8 {
-            c = grown_chunk(c, cap, 5);
-        }
-        assert_eq!(c, cap, "a fast host reaches the cap and never exceeds it");
 
-        // a slow host never grows: every chunk stays inside the idle budget
+        // A FAST host climbs to the cap in a few chunks and stops there. The
+        // previous rule doubled only under 2s, which cost a fast host nothing
+        // but pinned a slow one at 128 forever - that is the case this fixes.
         let mut c = PREFILL_CHUNK.min(cap);
-        for _ in 0..8 {
-            c = grown_chunk(c, cap, 90_000);
-        }
-        assert_eq!(c, 128, "a slow host keeps emitting rather than batching bigger");
+        for _ in 0..4 { c = next_chunk(c, cap, 5); }
+        assert_eq!(c, cap, "reaches the cap and never exceeds it");
 
-        // and the cap is respected even when it is below the starting size
-        assert_eq!(grown_chunk(64, 64, 1), 64);
-        assert_eq!(PREFILL_CHUNK.min(32), 32, "a tiny host cap wins over the default");
+        // A SLOW host settles where the target lands rather than pinning at the
+        // floor: 128 tokens in 20s means ~288 fits in 45s, and bigger batches
+        // are the only throughput available on a box like that.
+        let settled = next_chunk(128, cap, 20_000);
+        assert!(settled > 128 && settled <= cap, "grew toward the target, got {settled}");
+        assert!((settled as i64 - 288).abs() <= 16, "≈45s worth of tokens, got {settled}");
+
+        // It SHRINKS too: a chunk that overran the target means the next one
+        // must come back sooner, or the stream stops reporting and is cut.
+        let shrunk = next_chunk(256, cap, 180_000);
+        assert!(shrunk < 256, "an overlong chunk shrinks the next, got {shrunk}");
+        assert!(shrunk >= PREFILL_MIN_CHUNK, "but never below the floor");
+
+        // Damping: one anomalous measurement cannot send the next chunk
+        // somewhere the following one has to walk back from.
+        assert_eq!(next_chunk(64, 4096, 1), 256, "at most 4x up in a step");
+        assert_eq!(next_chunk(2048, 4096, 10_000_000), 512, "at most 4x down");
+
+        // Degenerate inputs stay in range rather than dividing by zero.
+        assert_eq!(next_chunk(128, cap, 0), 512, "immeasurably fast is still capped");
+        assert_eq!(next_chunk(64, 64, 1), 64, "a cap below the default wins");
+        assert!(next_chunk(128, cap, 10_000_000) >= PREFILL_MIN_CHUNK);
     }
 
     #[test]
