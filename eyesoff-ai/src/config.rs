@@ -538,7 +538,24 @@ pub fn render_template(
         "chatml" => {
             p.push_str(&format!("<|im_start|>system\n{system}<|im_end|>\n"));
             for (role, content) in msgs {
-                p.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+                // Prefix-cache alignment (engine mm32): with thinking OFF the
+                // generation prompt seeds an empty pre-closed think block
+                // right after the assistant marker, so a REPLAYED assistant
+                // turn must reproduce that exact byte sequence — otherwise
+                // turn N's parked prompt state can never be a byte-prefix of
+                // turn N+1's prompt, and every continuation re-prefills the
+                // whole history. The model saw exactly this shape at
+                // generation time (and a pre-closed turn's output carries no
+                // think tags, so the replayed content is byte-identical to
+                // what it generated). Thinking-ON turns keep stripped history
+                // on purpose: reasoning is per-turn scratch, and replaying it
+                // would cost more tokens than the reuse saves.
+                let seed = if role == "assistant" && matches!(think, ThinkTurn::Closed) {
+                    "<think>\n\n</think>\n\n"
+                } else {
+                    ""
+                };
+                p.push_str(&format!("<|im_start|>{role}\n{seed}{content}<|im_end|>\n"));
             }
             p.push_str("<|im_start|>assistant\n");
             match think {

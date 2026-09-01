@@ -9410,6 +9410,38 @@ mod tests {
     }
 
     #[test]
+    fn nothink_prompts_are_byte_prefixes_of_their_continuations() {
+        // The engine's prefix cache (mm32) parks a request's prompt state and
+        // reuses it only when the NEXT prompt starts with the parked one,
+        // byte for byte. With thinking off the generation prompt ends in the
+        // seeded empty think block, so the replayed assistant turn has to
+        // reproduce that exact sequence — this is the invariant the chatml
+        // renderer now maintains, and losing it silently costs every
+        // multi-turn continuation a full history re-prefill.
+        let turn1 = config::render_template(
+            "chatml", "sys", &[("user".into(), "Q1".into())],
+            config::ThinkTurn::Closed).unwrap();
+        let reply = "A1"; // a pre-closed turn's output carries no think tags
+        let turn2 = config::render_template(
+            "chatml", "sys",
+            &[("user".into(), "Q1".into()),
+              ("assistant".into(), reply.into()),
+              ("user".into(), "Q2".into())],
+            config::ThinkTurn::Closed).unwrap();
+        assert!(
+            turn2.prompt.starts_with(&format!("{}{}", turn1.prompt, reply)),
+            "turn 2 must extend turn 1's prompt + its reply verbatim:\nT1: {:?}\nT2: {:?}",
+            turn1.prompt, turn2.prompt
+        );
+        // thinking-ON history stays stripped on purpose (reasoning is
+        // per-turn scratch); only the no-think form promises the prefix
+        let open = config::render_template(
+            "chatml", "sys", &[("user".into(), "Q1".into())],
+            config::ThinkTurn::Open).unwrap();
+        assert!(open.prompt.ends_with("<think>\n"), "{:?}", open.prompt);
+    }
+
+    #[test]
     fn loop_guard_catches_the_haiku_failure() {
         let g = LoopGuard::new(4);
         // the observed shape: one phrase repeating forever
