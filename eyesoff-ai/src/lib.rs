@@ -1163,6 +1163,17 @@ impl Session {
                 // ~2 KB. Unarmed engines behave identically either way.
                 inputs.push(topk_input());
                 inputs.push(timing_input());
+                // mm32 prefix cache: a non-final prefill chunk (the caller
+                // discards its row) says so, which is what licenses the host
+                // to defer the feed against a parked prompt and answer a
+                // zero row. The FINAL chunk stays unmarked - its row is what
+                // the first generation token is sampled from, so the host
+                // must resolve it for real. Engines predating mm32 ignore
+                // the input entirely.
+                if !want_logits {
+                    inputs.push(("more".to_string(),
+                        Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())));
+                }
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
                 note_timing(if ids.len() > 1 { "feed_batch" } else { "feed" }, &outs);
                 if !want_logits {
