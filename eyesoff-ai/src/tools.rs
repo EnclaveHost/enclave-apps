@@ -106,6 +106,27 @@ pub struct ToolsConfig {
     /// failures it already fixed.
     #[serde(default = "default_keep_results")]
     pub keep_results: usize,
+    /// SUBAGENTS: how many ONE answer may spawn in total, however they nest.
+    /// Zero (the default) means the `spawn_agent` tool does not exist. A
+    /// positive number is the deployer's consent and the only switch: the
+    /// tool is offered to every loop that could still spawn one, and
+    /// withdrawn from a loop that cannot (the count is spent, or it sits at
+    /// the depth limit). The count is per ANSWER, not per agent, because
+    /// what it bounds is cost - each child is a whole loop of generations
+    /// on the same share - and cost is the answer's.
+    #[serde(default)]
+    pub max_agents: u32,
+    /// how deep subagents may nest: 1 = the answer may spawn children that
+    /// cannot spawn; 2 = grandchildren; the default 3 allows one level more.
+    /// The count above is the real bound; this stops a runaway chain from
+    /// spending it one deep call at a time.
+    #[serde(default = "default_max_agent_depth")]
+    pub max_agent_depth: u32,
+    /// a subagent's OWN call budget (it runs its own loop). Absent = the
+    /// answer's max_calls. Its clock is never its own: a child gets what is
+    /// LEFT of the answer's max_seconds, so no tree outlives the answer.
+    #[serde(default)]
+    pub agent_max_calls: Option<usize>,
     /// Capabilities this deployment ALREADY has, handed to the model as tools
     /// instead of being decided for it by a pre-pass: `["web_search",
     /// "request", "generate_image", "view_image"]`. Each is backed by its own
@@ -184,7 +205,19 @@ pub struct Builtins<'a> {
     /// what is left of the answer's wall-clock budget, seconds, so a wait
     /// can tell the model how much room its loop has after this one
     pub turn_left_s: u64,
+    /// how many subagents THIS loop could spawn right now: the answer's
+    /// remaining count, or zero at the depth limit. Zero withdraws the
+    /// spawn_agent tool from the loop's registry.
+    pub agent_slots: u32,
+    /// the deployment's max_agents, so a loop with no slots left is told
+    /// apart from a deployment that never had the feature (the first is
+    /// silent, the second is a note if someone named the tool anyway)
+    pub agent_limit: u32,
 }
+
+/// The name of the subagent tool, which the answer loop runs itself: a
+/// child is a whole loop of generations, and only a leg can generate.
+pub const AGENT_TOOL: &str = "spawn_agent";
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Builtin {
@@ -197,6 +230,13 @@ pub enum Builtin {
     /// (no CPU) and ticks a status line every few seconds, because every hop
     /// between here and the browser cuts a stream that goes quiet for ~180s.
     Wait,
+    /// Spawn a subagent: a fresh loop with the same tools and an EMPTY
+    /// context, given one task, whose final message comes back as this
+    /// call's result. Executed by the answer loop (lib.rs, ToolLoop::
+    /// spawn_child), never by tools::call - it is a generation, not a
+    /// request. Children may spawn children; the per-answer count and the
+    /// depth limit (AgentTree) are what stop that being unbounded.
+    Agent,
 }
 
 impl Builtin {
@@ -208,6 +248,7 @@ impl Builtin {
             // names must keep resolving forever.
             "request" | "fetch_url" | "post_url" => Some(Builtin::Request),
             "wait" => Some(Builtin::Wait),
+            "spawn_agent" => Some(Builtin::Agent),
             _ => None,
         }
     }
@@ -217,6 +258,7 @@ impl Builtin {
             Builtin::WebSearch => "web_search",
             Builtin::Request => "request",
             Builtin::Wait => "wait",
+            Builtin::Agent => AGENT_TOOL,
         }
     }
 
@@ -250,6 +292,18 @@ impl Builtin {
                  length from what you know about the job - one wait of the right size beats \
                  many short polls - and read the result: it says how much of this answer's \
                  time budget is left. Nothing leaves the enclave; the user sees a countdown.",
+            Builtin::Agent =>
+                "Spawn a subagent: a fresh copy of yourself with the same tools and the same \
+                 machine but an EMPTY context, given ONE task, which works it to completion and \
+                 returns a written report as this call's result. Use it to keep your own context \
+                 clean on a big job - a long investigation, a separate part of the work, a check \
+                 you want done from scratch by fresh eyes. Write `task` as a brief to a capable \
+                 colleague who knows nothing of this conversation: the goal, the check that says \
+                 it is done, where the files are, what has been tried; put the details in \
+                 `context` and say in `expect` what the report must contain. Subagents run one \
+                 at a time, each with its own call budget inside this answer's remaining time; \
+                 an answer may spawn only so many in total, and each may spawn its own. Prefer \
+                 doing a few calls yourself over spawning an agent for them.",
         }
     }
 
@@ -302,6 +356,26 @@ impl Builtin {
                 },
                 "required": ["seconds"],
             }),
+            Builtin::Agent => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "the brief: the goal, the check that says it is done, \
+                                        where the files are, what has been tried",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "everything else the subagent needs to know - it \
+                                        cannot see this conversation",
+                    },
+                    "expect": {
+                        "type": "string",
+                        "description": "what the report must contain, in a sentence",
+                    }
+                },
+                "required": ["task"],
+            }),
         }
     }
 
@@ -310,6 +384,7 @@ impl Builtin {
         match self {
             Builtin::WebSearch | Builtin::Request => b.search.is_some(),
             Builtin::Wait => true,
+            Builtin::Agent => b.agent_slots > 0,
         }
     }
 
@@ -319,6 +394,9 @@ impl Builtin {
         match self {
             Builtin::WebSearch | Builtin::Request => b.web_withheld,
             Builtin::Wait => false,
+            // configured, but this loop may not spawn (count spent, or at
+            // the depth limit): a per-loop fact, not a misconfiguration
+            Builtin::Agent => b.agent_limit > 0,
         }
     }
 
@@ -327,6 +405,7 @@ impl Builtin {
         match self {
             Builtin::WebSearch | Builtin::Request => "`search`",
             Builtin::Wait => "nothing",
+            Builtin::Agent => "`max_agents` (a positive count in the `tools` block)",
         }
     }
 }
@@ -341,14 +420,23 @@ pub struct Budget {
     pub max_calls: usize,
     pub max_seconds: u64,
     pub persist: bool,
+    /// subagents the whole answer may spawn (see ToolsConfig::max_agents)
+    pub max_agents: u32,
+    pub max_agent_depth: u32,
 }
 
 impl Budget {
-    /// A budget of `n` calls and the default hour, not persisting: the tests'
-    /// way of saying "a call count and nothing else".
+    /// A budget of `n` calls and the default hour, not persisting, no
+    /// subagents: the tests' way of saying "a call count and nothing else".
     #[cfg(test)]
     pub fn calls(n: usize) -> Budget {
-        Budget { max_calls: n, max_seconds: default_max_seconds(), persist: false }
+        Budget {
+            max_calls: n,
+            max_seconds: default_max_seconds(),
+            persist: false,
+            max_agents: 0,
+            max_agent_depth: default_max_agent_depth(),
+        }
     }
 
     /// The wall-clock figure as the model should read it.
@@ -441,6 +529,9 @@ fn default_wait_max_s() -> u64 {
 fn default_keep_results() -> usize {
     3
 }
+fn default_max_agent_depth() -> u32 {
+    3
+}
 fn default_timeout_s() -> u64 {
     20
 }
@@ -471,6 +562,8 @@ impl ToolsConfig {
             max_calls: self.max_calls.max(1),
             max_seconds: self.max_seconds.max(1),
             persist: false,
+            max_agents: self.max_agents,
+            max_agent_depth: self.max_agent_depth.max(1),
         };
         match req {
             Some(serde_json::Value::Bool(p)) => b.persist = *p,
@@ -481,6 +574,14 @@ impl ToolsConfig {
                 }
                 if let Some(s) = o.get("max_seconds").and_then(|v| v.as_u64()) {
                     b.max_seconds = b.max_seconds.min(s).max(1);
+                }
+                // zero is allowed here: "no subagents for this answer" is a
+                // choice a client can make, unlike "no calls"
+                if let Some(a) = o.get("max_agents").and_then(|v| v.as_u64()) {
+                    b.max_agents = b.max_agents.min(a as u32);
+                }
+                if let Some(d) = o.get("max_agent_depth").and_then(|v| v.as_u64()) {
+                    b.max_agent_depth = b.max_agent_depth.min(d as u32).max(1);
                 }
             }
             _ => {}
@@ -503,6 +604,11 @@ impl ToolsConfig {
                     out.push(k.name().to_string());
                 }
             }
+        }
+        // spawn_agent needs no naming (see max_agents); it is what an answer
+        // would be offered, so it is advertised like the rest
+        if self.max_agents > 0 && !out.iter().any(|n| n == AGENT_TOOL) {
+            out.push(AGENT_TOOL.to_string());
         }
         for t in &self.http {
             if check_name(&t.name).is_ok() && !out.iter().any(|n| n == &t.name) {
@@ -823,6 +929,19 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             src: ToolSrc::Builtin(k),
         });
     }
+    // spawn_agent needs no naming: a positive max_agents IS the deployer's
+    // consent, and the tree says per loop whether one may still be spawned
+    // (none past the depth limit, none once the count is spent), so a loop
+    // that cannot spawn is never shown the tool at all
+    let k = Builtin::Agent;
+    if k.available(&b) && reg.find(k.name()).is_none() {
+        reg.tools.push(Tool {
+            name: k.name().to_string(),
+            description: k.description().to_string(),
+            parameters: k.schema(),
+            src: ToolSrc::Builtin(k),
+        });
+    }
     for (i, t) in cfg.http.iter().enumerate() {
         // a misconfigured route IS worth a note: the operator wrote a prompt
         // that can never fire
@@ -1024,6 +1143,7 @@ fn finish_rule(tools: &[Tool], b: Budget) -> String {
         return " When you have enough to answer, stop calling and write the answer.".into();
     }
     let has_wait = tools.iter().any(|t| t.name == "wait");
+    let has_agent = tools.iter().any(|t| t.name == AGENT_TOOL);
     format!(
         " WORKING TO A CHECK: the user wants the goal reached, not a first attempt. When the \
          goal comes with a way to verify it (tests, a harness, a build, a command that must \
@@ -1031,7 +1151,7 @@ fn finish_rule(tools: &[Tool], b: Budget) -> String {
          thing, run it again. Do not stop to ask permission or to report progress - nobody is \
          answering while you work, and the user reads only your final answer. Keep state in \
          files on the machine, never in your head, so a later step can pick up where an \
-         earlier one left off.{} Stop early only when the check passes, when you are certain \
+         earlier one left off.{}{} Stop early only when the check passes, when you are certain \
          it cannot pass with what you have, or when the budget is nearly spent - and then \
          report exactly what passes, what does not, and where the files are.",
         if has_wait {
@@ -1039,7 +1159,13 @@ fn finish_rule(tools: &[Tool], b: Budget) -> String {
              tight loop of commands."
         } else {
             ""
-        }
+        },
+        if has_agent {
+            " On a big job, keep your own context clean with spawn_agent: brief a subagent \
+             with one self-contained part of the work and read its report."
+        } else {
+            ""
+        },
     )
 }
 
@@ -1757,6 +1883,14 @@ fn call_builtin(
     on_status: &dyn Fn(&str),
 ) -> Result<String, String> {
     match k {
+        // reached only by the /tools probe: the answer loop intercepts the
+        // name before dispatch (ToolLoop::step), because a child is a whole
+        // loop of generations and only a leg can generate
+        Builtin::Agent => Err(
+            "spawn_agent is run by the answer loop, not by a probe: it starts a whole \
+             subagent loop, which only a chat turn can host"
+                .into(),
+        ),
         Builtin::Wait => {
             let (secs, reason, note) = wait_plan(args, b.wait_cap_s)?;
             // Sleep in ticks, each one a status line: the guest cannot say
@@ -1888,7 +2022,7 @@ fn request_payload(
     Ok((body, ctype))
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -3326,13 +3460,13 @@ mod tests {
         }))
         .unwrap();
         let b = cfg.budget(None);
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3 });
         assert!(cfg.budget(Some(&serde_json::json!(true))).persist);
         assert!(!cfg.budget(Some(&serde_json::json!(false))).persist);
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 8, "max_seconds": 600 })));
-        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true });
+        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3 });
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 999, "max_seconds": 99999, "persist": false })));
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3 });
         // zero is not a budget: the loop would refuse its first call
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 0, "max_seconds": 0 })));
         assert_eq!((b.max_calls, b.max_seconds), (1, 1));
@@ -3342,25 +3476,72 @@ mod tests {
         assert_eq!(human_secs(7200), "2 hours");
     }
 
+    /// spawn_agent exists exactly when the tree says a loop may spawn:
+    /// max_agents is the switch, slots are the per-loop fact, and a loop
+    /// with none left is silent about it rather than noted as misconfigured.
+    #[test]
+    fn the_spawn_tool_follows_the_slots() {
+        let off: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let reg = build(&off, Builtins::default(), &|_| {});
+        assert!(reg.find(AGENT_TOOL).is_none());
+        assert!(!off.http_names().iter().any(|n| n == AGENT_TOOL));
+        let on: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_agents": 4, "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        assert_eq!(on.max_agent_depth, 3);
+        // advertised, and offered to a loop with slots
+        assert!(on.http_names().iter().any(|n| n == AGENT_TOOL));
+        let b = Builtins { agent_slots: 4, agent_limit: 4, ..Default::default() };
+        let reg = build(&on, b, &|_| {});
+        assert!(reg.find(AGENT_TOOL).is_some(), "{:?}", reg.notes);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        // no slots (count spent, or at the depth limit): withdrawn, no note
+        let b = Builtins { agent_slots: 0, agent_limit: 4, ..Default::default() };
+        let reg = build(&on, b, &|_| {});
+        assert!(reg.find(AGENT_TOOL).is_none());
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        // named by hand at a deployment without the feature: that IS a note
+        let named: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "builtin": ["spawn_agent"], "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let reg = build(&named, Builtins::default(), &|_| {});
+        assert!(reg.find(AGENT_TOOL).is_none());
+        assert!(reg.notes.iter().any(|n| n.contains("max_agents")), "{:?}", reg.notes);
+        // the budget carries the limits, and a request may only lower them
+        let b = on.budget(Some(&serde_json::json!({ "max_agents": 1, "max_agent_depth": 9 })));
+        assert_eq!((b.max_agents, b.max_agent_depth), (1, 3));
+        let b = on.budget(Some(&serde_json::json!({ "max_agents": 0 })));
+        assert_eq!(b.max_agents, 0);
+        // the persisting rules point at it when it is there
+        let with = vec![tool("run_tests"), tool(AGENT_TOOL)];
+        let rules = system_block(&with, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3 });
+        assert!(rules.contains("spawn_agent"), "{rules}");
+    }
+
     /// The rules quote the budget and, only when asked to persist, tell the
     /// model to work to the check - naming wait only when it has one.
     #[test]
     fn the_rules_follow_the_budget() {
         let list = vec![tool("run_tests")];
-        let quick = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: false });
+        let quick = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3 });
         assert!(quick.contains("at most 32 calls"), "{quick}");
         assert!(quick.contains("30 minutes of wall-clock time"), "{quick}");
         assert!(quick.contains("stop calling and write the answer"), "{quick}");
         assert!(!quick.contains("WORKING TO A CHECK"), "{quick}");
-        let persist = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: true });
+        let persist = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3 });
         assert!(persist.contains("WORKING TO A CHECK"), "{persist}");
         assert!(persist.contains("keep going until the check passes"), "{persist}");
         assert!(!persist.contains("call wait"), "{persist}");
         let with_wait = vec![tool("run_tests"), tool("wait")];
-        let persist = system_block(&with_wait, Budget { max_calls: 32, max_seconds: 1800, persist: true });
+        let persist = system_block(&with_wait, Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3 });
         assert!(persist.contains("call wait rather than polling"), "{persist}");
         // the merged block (client tools beside ours) carries the same rule
-        let merged = merged_system_block(&with_wait, Budget { max_calls: 4, max_seconds: 120, persist: true }, None);
+        let merged = merged_system_block(&with_wait, Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3 }, None);
         assert!(merged.contains("at most 4 of them"), "{merged}");
         assert!(merged.contains("within 2 minutes"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");

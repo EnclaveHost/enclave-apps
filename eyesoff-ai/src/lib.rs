@@ -162,7 +162,14 @@
 //!                               check passes (tools.rs, Budget); the `wait`
 //!                               builtin sleeps in the enclave, ticking
 //!                               `status` every 5s; the done frame's `loop`
-//!                               block says what the loop spent. A call that
+//!                               block says what the loop spent. SUBAGENTS
+//!                               (config `tools.max_agents`, see AgentTree):
+//!                               `spawn_agent` runs a fresh loop on one task
+//!                               inside this request and returns its report;
+//!                               the child narrates as `{"agent":{...}}`,
+//!                               `{"agent_delta":{...}}`, `{"agent_note":..}`
+//!                               and `{"agent_done":{...}}`, and its calls
+//!                               carry an `agent` id. A call that
 //!                               was attempted but ran
 //!                               nothing (unparseable, or past the per-answer
 //!                               limit) arrives as `{"callnote":"<why>"}`: the
@@ -4709,6 +4716,343 @@ citing them as [1], [2].";
     }
 }
 
+// -------------------------------------------------------------- subagents --
+
+/// The subagents ONE answer has spawned, shared by every loop in the tree.
+/// The count is per answer, not per agent: a limit of eight is eight in
+/// total however they nest, because what it bounds is cost - each child is
+/// a whole loop of generations on the same share - and cost is the answer's.
+struct AgentTree {
+    spawned: u32,
+    limit: u32,
+    max_depth: u32,
+}
+
+impl AgentTree {
+    /// How many more a loop at `depth` could spawn right now: none past the
+    /// depth limit, else what is left of the count.
+    fn slots(&self, depth: u32) -> u32 {
+        if depth + 1 > self.max_depth {
+            0
+        } else {
+            self.limit.saturating_sub(self.spawned)
+        }
+    }
+
+    /// Claim the next id for a child of a loop at `parent_depth`, or the
+    /// reason there is none - worded for the model, since the refusal goes
+    /// back as the call's result.
+    fn try_spawn(&mut self, parent_depth: u32) -> Result<u32, String> {
+        if self.spawned >= self.limit {
+            return Err(format!(
+                "This call was NOT run: this answer's limit of {} subagent{} is reached, so no \
+                 more can be spawned. Do the task yourself with the calls you have.",
+                self.limit,
+                if self.limit == 1 { "" } else { "s" }
+            ));
+        }
+        if parent_depth + 1 > self.max_depth {
+            return Err(format!(
+                "This call was NOT run: subagents nest at most {} deep and you are at depth {}. \
+                 Do the task yourself with the calls you have.",
+                self.max_depth, parent_depth
+            ));
+        }
+        self.spawned += 1;
+        Ok(self.spawned)
+    }
+}
+
+/// What a loop hands its leg to run a child: the brief, the child's budget,
+/// and the tree it joins.
+struct AgentSpawn {
+    id: u32,
+    parent: u32,
+    depth: u32,
+    task: String,
+    context: String,
+    expect: String,
+    budget: tools::Budget,
+    tree: std::rc::Rc<std::cell::RefCell<AgentTree>>,
+}
+
+/// What comes back: the child's final message, or why there is none.
+struct AgentReport {
+    id: u32,
+    ok: bool,
+    text: String,
+    ms: u64,
+    calls: usize,
+    /// the child's own call log, for the parent's stats
+    log: Vec<serde_json::Value>,
+}
+
+/// How a leg runs a child. Recursive by construction: the closure a leg
+/// hands its root loop builds the same closure for every child it runs.
+type Spawn<'a> = &'a dyn Fn(AgentSpawn) -> AgentReport;
+
+/// Everything a child needs from the leg that spawned it, so it runs the
+/// same generation path as the answer it serves - the same model, sampling
+/// and narration - and only its conversation is its own.
+struct AgentEnv<'a> {
+    cfg: &'a AppConfig,
+    tok: &'a Tok,
+    creq: &'a ChatReq,
+    mode: &'a str,
+    draft: &'a DraftPlan,
+    builtins: tools::Builtins<'a>,
+    /// the answer's effective system prompt; a child's is built on it
+    system: String,
+    /// the leg's status line; false means the client is gone
+    status: &'a dyn Fn(&str) -> bool,
+    formatter: &'a dyn Fn(&str, &str) -> Option<String>,
+    /// one event to the client, by kind: the /chat leg sends `{kind: v}`,
+    /// streaming /v1 an `: enclave-<kind>` comment, buffered /v1 nothing.
+    /// A child's tool calls, live text and notes all reach the client this
+    /// way, each carrying the agent's id.
+    event: &'a dyn Fn(&str, serde_json::Value) -> bool,
+}
+
+/// `v` with the agent's id on it, so the client can file the event under
+/// the right card.
+fn with_agent(v: &serde_json::Value, id: u32) -> serde_json::Value {
+    let mut v = v.clone();
+    v["agent"] = serde_json::json!(id);
+    v
+}
+
+/// The answer's system prompt as the model sees it: the request's system
+/// message if it sent one, else the deployment's.
+fn system_of(cfg: &AppConfig, messages: &[ChatMsg]) -> String {
+    messages
+        .iter()
+        .find(|m| m.role == "system")
+        .map(|m| strip_marks(&m.content))
+        .unwrap_or_else(|| cfg.system_prompt.clone())
+}
+
+/// A child's system prompt: the answer's, plus who it is and what its final
+/// message is for. The report format is spelled out because the parent
+/// reads NOTHING but that message: a child that ends on "let me know if you
+/// want me to continue" has told its parent nothing.
+fn subagent_system(parent: &str, s: &AgentSpawn, max_chars: usize) -> String {
+    format!(
+        "{}\n\n# Subagent\n\nYou are subagent #{} (depth {}), spawned by another agent to carry \
+         out ONE task, given in the user turn. You share its tools and its machine, not its \
+         conversation: everything you need is in the task and its context, and everything it \
+         will learn from you is your FINAL message. Work the task to completion, then write a \
+         self-contained report: what you did, what you found, what passes and what does not, \
+         exact file paths and commands. Keep it under {} characters - the parent reads nothing \
+         past that.{} Do not ask questions; nobody answers - make a reasonable assumption and \
+         say which. Do not spawn a subagent for work you can do yourself in a few calls.",
+        parent.trim_end(),
+        s.id,
+        s.depth,
+        max_chars,
+        if s.expect.is_empty() {
+            String::new()
+        } else {
+            format!(" The parent asked to be told: {}.", s.expect.trim_end_matches('.'))
+        },
+    )
+}
+
+/// The child's opening user turn: the task, and the parent's context under it.
+fn task_turn(s: &AgentSpawn) -> String {
+    if s.context.is_empty() {
+        s.task.clone()
+    } else {
+        format!("{}\n\n## Context from the parent\n\n{}", s.task, s.context)
+    }
+}
+
+/// Run one subagent to completion: a fresh conversation, the same tool loop,
+/// its final message as the report. Recursive through the spawn closure it
+/// hands its own loop, which is how a child spawns a grandchild; the tree
+/// (count and depth) is what ends the recursion.
+fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
+    let t0 = now_ms();
+    let Some(tc) = env.cfg.tools.as_ref() else {
+        return AgentReport {
+            id: s.id,
+            ok: false,
+            text: "subagents need the deployment's tools block".into(),
+            ms: 0,
+            calls: 0,
+            log: Vec::new(),
+        };
+    };
+    let spawn = |s2: AgentSpawn| run_agent(env, s2);
+    let mut b = env.builtins;
+    // a child starts with no pictures: the answer's attachments are not in
+    // its conversation, so a tool that takes them would have nothing to see
+    b.images_present = false;
+    let on_status = |st: &str| {
+        let _ = (env.status)(st);
+    };
+    let mut tl = ToolLoop::open_child(
+        tc,
+        b,
+        s.budget,
+        s.tree.clone(),
+        s.depth,
+        s.id,
+        &on_status,
+        env.formatter,
+        Some(&spawn),
+    );
+    {
+        let tree = s.tree.borrow();
+        let _ = (env.event)(
+            "agent",
+            serde_json::json!({
+                "id": s.id, "parent": s.parent, "depth": s.depth, "task": s.task,
+                "n": tree.spawned, "of": tree.limit,
+                "max_calls": s.budget.max_calls, "max_seconds": s.budget.max_seconds,
+            }),
+        );
+    }
+    let mut messages = vec![
+        ChatMsg::text("system", subagent_system(&env.system, &s, tc.max_chars)),
+        ChatMsg::text("user", task_turn(&s)),
+    ];
+    let mut last_err = String::new();
+    let text = 'answer: loop {
+        let caps = if tl.armed() {
+            Capabilities::Tools(tl.tools(), tl.budget)
+        } else {
+            Capabilities::Note
+        };
+        let (prompt_ids, stops, think_open) =
+            match build_prompt(env.cfg, env.tok, &messages, env.creq.thinking(), caps) {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = e;
+                    break 'answer None;
+                }
+            };
+        let effort =
+            resolve_effort(env.cfg, env.tok, &messages, env.mode, think_open, None, &on_status);
+        let params = gen_params(env.cfg, env.creq, stops, think_open, effort);
+        let mut finished: Option<String> = None;
+        for (target, tname) in targets_for(env.cfg, env.mode).iter() {
+            if client_gone() {
+                last_err = "client disconnected".into();
+                break;
+            }
+            let opened = std::cell::Cell::new(!think_open);
+            let gate = std::cell::RefCell::new(CallGate::new(tl.armed(), think_open));
+            // the child's text streams as its own event, never as the
+            // answer's: the client shows it inside the agent's card, and the
+            // bytes keep the stream alive through a long child generation
+            let emit = |delta: &str| {
+                let Some(out) = gate.borrow_mut().push(delta) else { return true };
+                if !opened.replace(true)
+                    && !(env.event)("agent_delta", serde_json::json!({ "id": s.id, "delta": "<think>\n" }))
+                {
+                    return false;
+                }
+                (env.event)("agent_delta", serde_json::json!({ "id": s.id, "delta": out }))
+            };
+            let status = |st: &str| (env.status)(&format!("agent #{}: {st}", s.id));
+            match generate(env.cfg, env.tok, &prompt_ids, *target, tname, &params, env.draft, &emit, &status) {
+                Ok(g) => {
+                    let on_call = |c: &serde_json::Value| {
+                        let _ = (env.event)("tool", with_agent(c, s.id));
+                    };
+                    let on_result = |r: &serde_json::Value| {
+                        let _ = (env.event)("tool_result", with_agent(r, s.id));
+                        if let Some(src) = r.get("sources") {
+                            let _ = (env.event)(
+                                "search",
+                                serde_json::json!({
+                                    "provider": env.cfg.search_cfg()
+                                        .map(|c| c.provider.clone()).unwrap_or_default(),
+                                    "sources": src,
+                                    "ms": r.get("ms").cloned().unwrap_or(serde_json::json!(0)),
+                                    "agent": s.id,
+                                }),
+                            );
+                        }
+                    };
+                    let on_note = |n: &str| {
+                        let _ = (env.event)("agent_note", serde_json::json!({ "id": s.id, "text": n }));
+                    };
+                    if tl.step(&g.text, &mut messages, &on_call, &on_result, &on_note) {
+                        if let Some(img) = tl.image_out.take() {
+                            let _ = (env.event)(
+                                "image",
+                                serde_json::json!({
+                                    "data_uri": img.data_uri(), "prompt": img.prompt,
+                                    "model": img.model, "seed": img.seed, "ms": img.ms,
+                                    "agent": s.id,
+                                }),
+                            );
+                        }
+                        continue 'answer;
+                    }
+                    // the reply is final. A call that ran nothing is not a
+                    // report: it is cut, and the reason stands in its place
+                    let mut text = strip_think(&g.text).trim().to_string();
+                    if let Some(note) = tl.refused.take() {
+                        gate.borrow_mut().drop_call();
+                        if let Some(i) = text.find("<tool_call>") {
+                            text.truncate(i);
+                        }
+                        text = format!("{}\n({note})", text.trim_end()).trim().to_string();
+                    }
+                    if let Some(rest) = gate.borrow_mut().flush() {
+                        if !opened.replace(true) {
+                            let _ = (env.event)("agent_delta", serde_json::json!({ "id": s.id, "delta": "<think>\n" }));
+                        }
+                        let _ = (env.event)("agent_delta", serde_json::json!({ "id": s.id, "delta": rest }));
+                    }
+                    finished = Some(text);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    if client_gone() || last_err.contains("client disconnected") {
+                        break;
+                    }
+                    let _ = (env.event)(
+                        "agent_note",
+                        serde_json::json!({
+                            "id": s.id,
+                            "text": format!("{tname} failed ({}); retrying on the next target",
+                                            strip_code(&last_err)),
+                        }),
+                    );
+                }
+            }
+        }
+        break 'answer finished;
+    };
+    let calls = tl.calls;
+    let log = std::mem::take(&mut tl.log);
+    let ms = (now_ms().saturating_sub(t0)) as u64;
+    let rep = match text {
+        Some(text) => AgentReport { id: s.id, ok: true, text, ms, calls, log },
+        None => AgentReport {
+            id: s.id,
+            ok: false,
+            text: format!("the subagent could not finish: {}", strip_code(&last_err)),
+            ms,
+            calls,
+            log,
+        },
+    };
+    let _ = (env.event)(
+        "agent_done",
+        serde_json::json!({
+            "id": s.id, "ok": rep.ok, "ms": rep.ms, "calls": rep.calls,
+            "chars": rep.text.chars().count(),
+            "agents": s.tree.borrow().spawned,
+        }),
+    );
+    rep
+}
+
 // ------------------------------------------------------------- tool calls --
 
 /// The tool-calling loop, shared by the playground and both /v1 shapes.
@@ -4755,6 +5099,15 @@ struct ToolLoop<'a> {
     /// response turn, tool name, full text, condensed already) - so older
     /// ones can be condensed once the model has acted on them (compact)
     results: Vec<(usize, String, String, bool)>,
+    /// the subagent tree this loop belongs to, shared by every loop in the
+    /// answer, and this loop's place in it: id 0 at depth 0 for the answer
+    /// itself, else the child's
+    tree: std::rc::Rc<std::cell::RefCell<AgentTree>>,
+    id: u32,
+    depth: u32,
+    /// how the leg runs a child. None where no leg is attached (tests, the
+    /// /tools probe), and then no spawn_agent tool is offered at all.
+    spawn: Option<Spawn<'a>>,
     /// the model was already told it has run out of calls. Without this a model
     /// that keeps calling would loop forever: told, calls again, told again.
     limit_told: bool,
@@ -4815,8 +5168,40 @@ impl<'a> ToolLoop<'a> {
         budget: tools::Budget,
         on_status: &'a dyn Fn(&str),
         formatter: &'a dyn Fn(&str, &str) -> Option<String>,
+        spawn: Option<Spawn<'a>>,
+    ) -> ToolLoop<'a> {
+        // the tree is the answer's: a fresh count, the budget's limits, and
+        // no limit at all where nothing could run a child
+        let tree = std::rc::Rc::new(std::cell::RefCell::new(AgentTree {
+            spawned: 0,
+            limit: if spawn.is_some() { budget.max_agents } else { 0 },
+            max_depth: budget.max_agent_depth,
+        }));
+        Self::open_child(cfg, builtins, budget, tree, 0, 0, on_status, formatter, spawn)
+    }
+
+    /// A loop inside the tree: a child's, or the answer's own at depth 0.
+    /// The registry is built with the tree's say on spawning, so a loop
+    /// that cannot spawn is never shown the tool.
+    #[allow(clippy::too_many_arguments)]
+    fn open_child(
+        cfg: &'a tools::ToolsConfig,
+        builtins: tools::Builtins<'a>,
+        budget: tools::Budget,
+        tree: std::rc::Rc<std::cell::RefCell<AgentTree>>,
+        depth: u32,
+        id: u32,
+        on_status: &'a dyn Fn(&str),
+        formatter: &'a dyn Fn(&str, &str) -> Option<String>,
+        spawn: Option<Spawn<'a>>,
     ) -> ToolLoop<'a> {
         let t0 = now_ms();
+        let mut builtins = builtins;
+        {
+            let t = tree.borrow();
+            builtins.agent_limit = t.limit;
+            builtins.agent_slots = t.slots(depth);
+        }
         ToolLoop {
             cfg,
             builtins,
@@ -4830,6 +5215,10 @@ impl<'a> ToolLoop<'a> {
             calls: 0,
             time_told: false,
             results: Vec::new(),
+            tree,
+            id,
+            depth,
+            spawn,
             limit_told: false,
             malformed_tries: 0,
             stub_asked: Vec::new(),
@@ -4855,7 +5244,81 @@ impl<'a> ToolLoop<'a> {
             "max_calls": self.budget.max_calls,
             "elapsed_s": self.elapsed_s(),
             "max_seconds": self.budget.max_seconds,
+            "agents": self.tree.borrow().spawned,
+            "max_agents": self.tree.borrow().limit,
         })
+    }
+
+    /// Run a subagent for a `spawn_agent` call and hand its report back as
+    /// the call's result. The tree says whether one may be spawned at all
+    /// (the count is the answer's, the depth is this loop's); the child's
+    /// budget is its own call count, whatever is LEFT of this answer's
+    /// clock - a child never outlives the answer - and the answer's
+    /// persistence.
+    fn spawn_child(&mut self, args: &serde_json::Value) -> tools::ToolResult {
+        let t0 = now_ms() as u64;
+        let done = |text: String, is_error: bool| tools::ToolResult {
+            text,
+            is_error,
+            ms: (now_ms() as u64).saturating_sub(t0),
+            sources: Vec::new(),
+            image: None,
+        };
+        let Some(spawn) = self.spawn else {
+            return done("subagents are not available here".into(), true);
+        };
+        let arg = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let Some(task) = arg("task") else {
+            return done(
+                "spawn_agent needs a non-empty `task`: the brief the subagent works from".into(),
+                true,
+            );
+        };
+        let id = match self.tree.borrow_mut().try_spawn(self.depth) {
+            Ok(id) => id,
+            Err(why) => return done(why, true),
+        };
+        let budget = tools::Budget {
+            max_calls: self.cfg.agent_max_calls.unwrap_or(self.cfg.max_calls).max(1),
+            max_seconds: self.left_s().max(1),
+            ..self.budget
+        };
+        (self.status)(&format!("spawning subagent #{id}…"));
+        let rep = spawn(AgentSpawn {
+            id,
+            parent: self.id,
+            depth: self.depth + 1,
+            task,
+            context: arg("context").unwrap_or_default(),
+            expect: arg("expect").unwrap_or_default(),
+            budget,
+            tree: self.tree.clone(),
+        });
+        // the child's calls join this loop's log, marked as its own
+        for mut e in rep.log {
+            e["agent"] = serde_json::json!(rep.id);
+            self.log.push(e);
+        }
+        let calls = format!("{} call{}", rep.calls, if rep.calls == 1 { "" } else { "s" });
+        let took = tools::human_secs(rep.ms / 1000);
+        if rep.ok {
+            done(
+                format!(
+                    "Subagent #{} finished ({calls}, {took}). Its report:\n\n{}",
+                    rep.id,
+                    tools::truncate(&rep.text, self.cfg.max_chars)
+                ),
+                false,
+            )
+        } else {
+            done(format!("Subagent #{} failed after {calls} ({took}): {}", rep.id, rep.text), true)
+        }
     }
 
     /// Condense every result but the newest `keep_results`, once. A loop
@@ -5061,22 +5524,28 @@ impl<'a> ToolLoop<'a> {
             "of": self.budget.max_calls,
             "elapsed_s": self.elapsed_s(), "max_seconds": self.budget.max_seconds,
         }));
-        // a wait may sleep at most the config's cap, and never past the end
-        // of the answer's budget - the clock check above would only refuse
-        // the call AFTER it
-        let mut b = self.builtins;
-        b.turn_left_s = self.left_s();
-        b.wait_cap_s = self.cfg.wait_max_s.min(b.turn_left_s);
-        let mut r = tools::call(
-            &mut self.reg,
-            self.cfg,
-            b,
-            &c.name,
-            &c.args,
-            &self.images,
-            || now_ms() as u64,
-            self.status,
-        );
+        let mut r = if c.name == tools::AGENT_TOOL && self.reg.find(&c.name).is_some() {
+            // a child runs through the leg, not through tools::call: it is
+            // a whole answer loop of its own, and only the leg can generate
+            self.spawn_child(&c.args)
+        } else {
+            // a wait may sleep at most the config's cap, and never past the
+            // end of the answer's budget - the clock check above would only
+            // refuse the call AFTER it
+            let mut b = self.builtins;
+            b.turn_left_s = self.left_s();
+            b.wait_cap_s = self.cfg.wait_max_s.min(b.turn_left_s);
+            tools::call(
+                &mut self.reg,
+                self.cfg,
+                b,
+                &c.name,
+                &c.args,
+                &self.images,
+                || now_ms() as u64,
+                self.status,
+            )
+        };
         // the entry's config-supplied format prompt, applied before anything
         // downstream sees the result
         if !r.is_error {
@@ -5466,6 +5935,10 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         // per call from what is left of the answer
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
         turn_left_s: tc.map_or(0, |t| t.max_seconds),
+        // the probe lists spawn_agent when the deployment allows any; a loop
+        // sets its own slots from the tree at open
+        agent_slots: tc.map_or(0, |t| t.max_agents),
+        agent_limit: tc.map_or(0, |t| t.max_agents),
     }
 }
 
@@ -5487,6 +5960,8 @@ fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
         images_local: images_read_locally(cfg, creq.model.as_deref()),
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
         turn_left_s: tc.map_or(0, |t| t.max_seconds),
+        agent_slots: 0,
+        agent_limit: tc.map_or(0, |t| t.max_agents),
     }
 }
 
@@ -6782,11 +7257,7 @@ fn build_prompt(
     thinking: bool, // the request's switch; only cfg.thinking models act on it
     caps: Capabilities,
 ) -> Result<(Prompt, Vec<String>, bool), String> {
-    let system = messages
-        .iter()
-        .find(|m| m.role == "system")
-        .map(|m| strip_marks(&m.content))
-        .unwrap_or_else(|| cfg.system_prompt.clone());
+    let system = system_of(cfg, messages);
     let system = match caps {
         Capabilities::Internal => system,
         Capabilities::Note => with_capability_note(cfg, &system),
@@ -7401,8 +7872,31 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // must stop the router deciding about search, or the turn pays for a
     // provider round trip the model never asked for and then gets the tool too.
     let formatter = |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &status_cb);
+    let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
+    // Subagents run through this same leg: every event a child makes is one
+    // of this stream's own events, carrying the agent's id, so the client
+    // files it under the right card and the bytes keep the stream alive.
+    let event = |kind: &str, v: serde_json::Value| {
+        let mut m = serde_json::Map::new();
+        m.insert(kind.to_string(), v);
+        send(serde_json::Value::Object(m))
+    };
+    let agent_status = |s: &str| send(serde_json::json!({ "status": s }));
+    let agent_env = AgentEnv {
+        cfg,
+        tok: &tok,
+        creq: &creq,
+        mode,
+        draft: draft_cfg,
+        builtins: builtins_for(cfg, &creq),
+        system: system_of(cfg, &creq.messages),
+        status: &agent_status,
+        formatter: &formatter,
+        event: &event,
+    };
+    let spawn = |s: AgentSpawn| run_agent(&agent_env, s);
     let mut tl = tools_enabled(cfg, &creq)
-        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &status_cb, &formatter));
+        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &status_cb, &formatter, Some(&spawn)));
     if let Some(t) = &tl {
         for n in &t.reg.notes {
             let _ = send(serde_json::json!({ "notice": format!("tools: {n}") }));
@@ -7487,7 +7981,6 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             }
         }));
     }
-    let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
     if let Some(n) = &draft_note {
         let _ = send(serde_json::json!({ "status": format!("speculative decode off: {n}") }));
     }
@@ -7868,8 +8361,28 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
+        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        // subagents narrate as SSE comments like everything else on this
+        // leg: `: enclave-agent`, `: enclave-agent-delta`, `: enclave-agent-done`
+        let event = |kind: &str, v: serde_json::Value| {
+            send_raw(&format!(": enclave-{} {v}\n\n", kind.replace('_', "-")))
+        };
+        let agent_status = |s: &str| send_raw(&format!(": {s}\n\n"));
+        let agent_env = AgentEnv {
+            cfg,
+            tok: &tok,
+            creq: &creq,
+            mode,
+            draft: draft_cfg,
+            builtins: builtins_for(cfg, &creq),
+            system: system_of(cfg, &creq.messages),
+            status: &agent_status,
+            formatter: &formatter,
+            event: &event,
+        };
+        let spawn = |s: AgentSpawn| run_agent(&agent_env, s);
         let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &leg_status, &formatter));
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &leg_status, &formatter, Some(&spawn)));
         if let Some(t) = &tl {
             for n in &t.reg.notes {
                 let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
@@ -7978,7 +8491,6 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let mut last_err = String::new();
         let mut done_stats: Option<GenStats> = None;
         let mut client_calls: Vec<tools::ToolCall> = Vec::new();
-        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         'answer: loop {
         let caps = match (&client_block, &tl) {
             (Some(b), _) => Capabilities::Client(b),
@@ -8157,8 +8669,26 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
+        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        // a buffered reply has nothing to narrate to; children still run,
+        // and their calls reach the client on enclave.tools
+        let event = |_: &str, _: serde_json::Value| true;
+        let agent_status = |_: &str| true;
+        let agent_env = AgentEnv {
+            cfg,
+            tok: &tok,
+            creq: &creq,
+            mode,
+            draft: draft_cfg,
+            builtins: builtins_for(cfg, &creq),
+            system: system_of(cfg, &creq.messages),
+            status: &agent_status,
+            formatter: &formatter,
+            event: &event,
+        };
+        let spawn = |s: AgentSpawn| run_agent(&agent_env, s);
         let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &no_status, &formatter));
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &no_status, &formatter, Some(&spawn)));
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
@@ -8220,7 +8750,6 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let mut last_err = String::new();
         let mut result: Option<GenStats> = None;
         let (mut think_open, mut effort, mut params);
-        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
         'answer: loop {
         let caps = match (&client_block, &tl) {
             (Some(b), _) => Capabilities::Client(b),
@@ -8651,6 +9180,8 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "default_on": t.default_on,
                 "max_calls": t.max_calls,
                 "max_seconds": t.max_seconds,
+                "max_agents": t.max_agents,
+                "max_agent_depth": t.max_agent_depth,
                 // what a turn would really be offered, not what was typed: a
                 // duplicate or an unusable name is dropped at resolution, and
                 // naming it here would put a tool in the UI nothing can call
@@ -8871,6 +9402,8 @@ fn handle_tools_probe(
         "max_seconds": tcfg.max_seconds,
         "wait_max_s": tcfg.wait_max_s,
         "keep_results": tcfg.keep_results,
+        "max_agents": tcfg.max_agents,
+        "max_agent_depth": tcfg.max_agent_depth,
         "default_on": tcfg.default_on,
         "notes": reg.notes,
         "tools": reg.tools.iter().map(|t| serde_json::json!({
@@ -9628,6 +10161,89 @@ mod tests {
         assert!(tools::client_system_block(&list, Some("")).contains("MUST respond with"));
     }
 
+    /// The subagent tree, end to end through the loop with a stand-in leg:
+    /// a child gets its own call budget and what is LEFT of the clock, its
+    /// report comes back as the call's result and its calls join the log;
+    /// the count is the answer's however deep it nests, and a loop past the
+    /// count or at the depth limit is refused with a reason, not run.
+    #[test]
+    fn subagents_are_counted_across_the_tree_and_bounded() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "max_seconds": 600, "agent_max_calls": 5,
+            "max_agents": 2, "max_agent_depth": 2,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        // the stand-in leg: records what it was asked, spawns a grandchild
+        // itself through the same tree (the way run_agent's loop would), and
+        // reports
+        let seen = std::cell::RefCell::new(Vec::<(u32, u32, u32, String, tools::Budget)>::new());
+        let spawn = |s: AgentSpawn| {
+            seen.borrow_mut().push((s.id, s.parent, s.depth, s.task.clone(), s.budget));
+            // a grandchild from depth 1 is allowed once (count 2, depth 2)...
+            let grand = s.tree.borrow_mut().try_spawn(s.depth);
+            // ...and from depth 2 never
+            let great = s.tree.borrow_mut().try_spawn(s.depth + 1);
+            assert!(great.is_err(), "{great:?}");
+            AgentReport {
+                id: s.id,
+                ok: true,
+                text: format!("report of #{} (grandchild: {:?}); context was: {}", s.id, grand.is_ok(), s.context),
+                ms: 1500,
+                calls: 3,
+                log: vec![serde_json::json!({ "name": "t", "n": 1 })],
+            }
+        };
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, Some(&spawn));
+        assert!(tl.reg.find(tools::AGENT_TOOL).is_some(), "the root may spawn");
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        tl.t0 -= 100_000; // 100s in: the child gets the remaining 500s
+        let call = "<tool_call>{\"name\":\"spawn_agent\",\"arguments\":{\"task\":\"port the parser\",\"context\":\"files in /work\"}}</tool_call>";
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        {
+            let s = seen.borrow();
+            assert_eq!(s.len(), 1);
+            let (id, parent, depth, task, budget) = &s[0];
+            assert_eq!((*id, *parent, *depth, task.as_str()), (1, 0, 1, "port the parser"));
+            assert_eq!(budget.max_calls, 5);
+            assert!(budget.max_seconds <= 500 && budget.max_seconds >= 495, "{}", budget.max_seconds);
+            assert!(budget.persist);
+        }
+        // the report is the result, and the child's log rode in marked
+        let last = &msgs[msgs.len() - 1].content;
+        assert!(last.contains("Subagent #1 finished (3 calls"), "{last}");
+        assert!(last.contains("report of #1 (grandchild: true)"), "{last}");
+        assert!(last.contains("files in /work"), "{last}");
+        assert_eq!(tl.log.len(), 2, "{:?}", tl.log);
+        assert_eq!(tl.log[0]["agent"], 1);
+        assert_eq!(tl.log[1]["name"], "spawn_agent");
+        assert_eq!(tl.calls, 1);
+        // the grandchild used the second and last slot: the tree is full
+        assert_eq!(tl.tree.borrow().spawned, 2);
+        assert_eq!(tl.progress()["agents"], 2);
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        let last = &msgs[msgs.len() - 1].content;
+        assert!(last.contains("limit of 2 subagents is reached"), "{last}");
+        assert_eq!(seen.borrow().len(), 1, "a refused spawn must not run");
+        // a fresh loop at the depth limit is never shown the tool at all
+        let deep = ToolLoop::open_child(&tc, b, tc.budget(None), tl.tree.clone(), 2, 7, &nop, &nofmt, Some(&spawn));
+        assert!(deep.reg.find(tools::AGENT_TOOL).is_none());
+        assert!(deep.reg.notes.is_empty(), "{:?}", deep.reg.notes);
+        // and without a leg to run one, neither is the root
+        let none = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        assert!(none.reg.find(tools::AGENT_TOOL).is_none());
+        // a brief with no task is refused before anything is counted
+        let bare = "<tool_call>{\"name\":\"spawn_agent\",\"arguments\":{}}</tool_call>";
+        let mut fresh = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, Some(&spawn));
+        let mut m2 = vec![ChatMsg::text("user", "hi")];
+        assert!(fresh.step(bare, &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert!(m2[2].content.contains("non-empty `task`"), "{}", m2[2].content);
+        assert_eq!(fresh.tree.borrow().spawned, 0);
+    }
+
     /// The clock bounds the loop the way the call count does: told once,
     /// refused the second time. And a wait can never sleep past it - the cap
     /// handed to the call is what is LEFT, not the config's figure.
@@ -9641,7 +10257,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         let call = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
         // fresh: runs, and the client hears the budget beside the count
@@ -9683,7 +10299,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
         assert!(tl.budget.persist);
         let mut msgs = vec![ChatMsg::text("user", "make the tests pass")];
         // the "no such tool" result is short; pad it through the log so the
@@ -9712,7 +10328,7 @@ mod tests {
         assert!(msgs[2].content.contains("END run 0"), "{}", msgs[2].content);
         assert!(msgs[2].content.len() < 1200, "{}", msgs[2].content.len());
         // the progress line is not under a quick answer's results
-        let mut quick = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut quick = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut m2 = vec![ChatMsg::text("user", "hi")];
         assert!(quick.step(call, &mut m2, &|_| {}, &|_| {}, &|_| {}));
         assert!(!m2[2].content.contains("[loop:"), "{}", m2[2].content);
@@ -9732,7 +10348,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         assert!(tl.armed());
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // a name the registry does NOT have, so the loop is exercised without
@@ -9774,7 +10390,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut msgs = vec![ChatMsg::text("user", "write me a self-contained HTML file")];
         let stub =
             "<tool_call>{\"name\":\"generate_image\",\"arguments\":{\"prompt\":\"placeholder\"}}\
@@ -9807,7 +10423,7 @@ mod tests {
 
         // the answer loop has no bound of its own, so a model that stubs a
         // DIFFERENT argument every round has to hit one here
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         for v in ["placeholder", "TODO", "tbd"] {
             let c = format!(
@@ -9871,7 +10487,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // the live shape of 2026-08-05: no name anywhere, tag left unclosed
         let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";

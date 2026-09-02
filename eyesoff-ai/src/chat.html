@@ -427,6 +427,33 @@
   /* where a loop stands, above the calls it has made so far */
   .toolhead { color: var(--text-3); font-size: 12px; padding: 0 2px 2px; }
 
+  /* subagents: one card each, nested by depth, the agent's own calls and
+     live text inside. Its final message is what the parent read. */
+  .agents { margin: 2px 0 10px; display: flex; flex-direction: column; gap: 6px; }
+  details.agent {
+    border: 1px solid var(--border-soft); border-radius: 12px; background: var(--hover);
+    font-size: 13px;
+  }
+  details.agent > summary {
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer;
+    list-style: none;
+  }
+  details.agent > summary::-webkit-details-marker { display: none; }
+  details.agent[open] > summary .chev { transform: rotate(90deg); }
+  details.agent .aname {
+    white-space: nowrap;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  details.agent .atask {
+    color: var(--text-3); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  details.agent .astat { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
+  details.agent.err .aname { color: var(--err); }
+  details.agent .abody { padding: 0 10px 10px; }
+  details.agent .abody .md { font-size: 13.5px; }
+  details.agent .anote { font-size: 12px; color: var(--warn); margin: 4px 0; }
+
   /* a generated image sits above the reply that talks about it */
   .genimg { margin: 4px 0 10px; }
   .genimg img {
@@ -2578,6 +2605,13 @@ function transcriptMd(chat) {
       }
       out.push("");
     }
+    if (m.agents && m.agents.length) {
+      for (const a of m.agents) {
+        out.push("- subagent #" + a.id + (a.depth > 1 ? " (depth " + a.depth + ")" : "") + ": " + flat(a.task || "")
+          + (a.ok === false ? " (failed)" : ""));
+      }
+      out.push("");
+    }
     if (m.image && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(m.image.data_uri || ""))
       out.push("![" + flat(m.image.prompt || "generated image") + "](" + m.image.data_uri + ")", "");
     const body = stripThink(m.content);
@@ -2791,6 +2825,52 @@ function toolsBlock(calls, loop) {
   return wrap;
 }
 
+// Subagents, one card each, nested by depth. `live` is the streaming view:
+// a running agent's card starts open so its text can be watched; `openState`
+// carries the user's own toggles across the rebuild every delta causes.
+function agentsBlock(agents, live, openState) {
+  if (!agents || !agents.length) return null;
+  const wrap = node('<div class="agents"></div>');
+  for (const a of agents) {
+    const card = node('<details class="agent"><summary>' + ICONS.chev +
+      '<span class="aname"></span><span class="atask"></span><span class="astat"></span></summary>' +
+      '<div class="abody"></div></details>');
+    card.dataset.aid = a.id;
+    card.style.marginLeft = (Math.max(0, (a.depth || 1) - 1) * 16) + "px";
+    card.querySelector(".aname").textContent = "Subagent #" + a.id;
+    card.querySelector(".atask").textContent = a.task || "";
+    const st = card.querySelector(".astat");
+    if (!a.done) {
+      st.textContent = "running…";
+      card.classList.add("run");
+    } else {
+      st.textContent = (a.ok ? "" : "failed · ") + (a.calls || 0) + " call" + (a.calls === 1 ? "" : "s")
+        + " · " + humanSecs((a.ms || 0) / 1000);
+      if (!a.ok) card.classList.add("err");
+    }
+    card.open = openState && (a.id in openState) ? openState[a.id] : (live && !a.done);
+    const body = card.querySelector(".abody");
+    const tls = toolsBlock(a.tools);
+    if (tls) body.appendChild(tls);
+    for (const n of a.notes || []) {
+      const el = node('<div class="anote"></div>');
+      el.textContent = n;
+      body.appendChild(el);
+    }
+    if (a.text) {
+      const md = node('<div class="md"></div>');
+      md.innerHTML = assistantHtml(a.text, !a.done);
+      body.appendChild(md);
+    }
+    wrap.appendChild(card);
+  }
+  return wrap;
+}
+
+function agentById(agents, id) {
+  return (agents || []).find((a) => a.id === id);
+}
+
 function sourcesBlock(sources) {
   if (!sources || !sources.length) return null;
   const wrap = node('<details class="sources"><summary>' + ICONS.chev +
@@ -2923,8 +3003,9 @@ function metaLine(meta) {
     // a DELEGATED look is worth a word in the visible line: the answer above
     // rests on a second model's report, not on this model having seen anything
     + (meta.vision ? " · saw via " + (meta.vision.model || "vision service") : "")
-    // what a loop spent: its steps and its clock
+    // what a loop spent: its steps, its subagents and its clock
     + (meta.loop ? " · " + meta.loop.calls + " step" + (meta.loop.calls === 1 ? "" : "s")
+        + (meta.loop.agents ? " · " + meta.loop.agents + " subagent" + (meta.loop.agents === 1 ? "" : "s") : "")
         + " · " + humanSecs(meta.loop.elapsed_s) : "");
   span.title = "load " + meta.load_ms + " ms · prefill " + meta.prefill_ms + " ms · decode " + meta.decode_ms + " ms"
     // what the pictures cost the context window, straight from the model
@@ -2999,6 +3080,9 @@ function renderMessage(m, idx, isTail) {
   // the calls happened BEFORE the answer, so they read above it
   const tls = toolsBlock(m.tools);
   if (tls) md.insertBefore(tls, md.firstChild);
+  // ...and the subagents beside them, each with what it did and reported
+  const ags = agentsBlock(m.agents, false);
+  if (ags) md.insertBefore(ags, tls ? tls.nextSibling : md.firstChild);
   const src = sourcesBlock(m.sources);
   if (src) md.appendChild(src);
   const acts = row.querySelector(".actions");
@@ -3049,6 +3133,10 @@ function updateStreamDOM(chat) {
   // the sources disclosure is rebuilt fresh below; keep the user's choice
   const srcPrev = body.querySelector("details.sources");
   const srcWasOpen = !!(srcPrev && srcPrev.open);
+  // ...and the agent cards', by id: a running one starts open, but a user
+  // who closed it must not have it reopen at the next token
+  const agOpen = {};
+  for (const d of body.querySelectorAll("details.agent")) agOpen[d.dataset.aid] = d.open;
   if (s.reply) {
     // each delta rebuilds the html - carry the user's expand/collapse choices
     // across the rebuild (think blocks only ever get appended, so index-match)
@@ -3071,6 +3159,8 @@ function updateStreamDOM(chat) {
   if (fig) body.insertBefore(fig, body.firstChild);
   const tls = toolsBlock(s.tools, s.loop);
   if (tls) body.insertBefore(tls, body.firstChild);
+  const ags = agentsBlock(s.agents, true, agOpen);
+  if (ags) body.insertBefore(ags, tls ? tls.nextSibling : body.firstChild);
   // sources stay pinned under the reply for the whole stream, so the user can
   // start opening them while the model is still writing
   const src = sourcesBlock(s.sources);
@@ -3093,8 +3183,8 @@ function updateStreamDOM(chat) {
 // across the rebuild (think blocks only ever get appended, and the sources
 // disclosure sits after them). pointercancel means the browser claimed the
 // gesture (touch scroll); a mouse drag is distance-filtered.
-const TOGGLES = "details.think, details.sources";
-const TOGGLE_SUMMARIES = "details.think > summary, details.sources > summary";
+const TOGGLES = "details.think, details.sources, details.agent";
+const TOGGLE_SUMMARIES = "details.think > summary, details.sources > summary, details.agent > summary";
 let pressedThink = -1, pressedX = 0, pressedY = 0;
 log.addEventListener("pointerdown", (e) => {
   const s = e.button === 0 ? e.target.closest(TOGGLE_SUMMARIES) : null;
@@ -3848,7 +3938,8 @@ async function run(chat) {
   // held so a stop (or an error) can hand the question BACK complete: losing
   // the pictures on the way out would mean re-attaching them by hand
   const askedImages = askedMsg.images || [];
-  let reply = "", meta = null, sawDone = false, sources = null, genImage = null, visionMeta = null, toolCalls = null;
+  let reply = "", meta = null, sawDone = false, sources = null, genImage = null, visionMeta = null, toolCalls = null,
+      agents = null;
 
   // An instance that dies mid-generation leaves the proxied stream OPEN but
   // silent until an upstream idle timeout minutes later - without a watchdog
@@ -3942,6 +4033,37 @@ async function run(chat) {
             chat.streaming.image = genImage;
             chat.streaming.status = "Image ready; writing…";
             if (chat.id === state.currentId) renderChat();
+          } else if (d.tool && d.tool.agent) {
+            // a subagent's call: it files under that agent's card, and the
+            // agent's text restarts the way the answer's does after a call
+            const ag = agentById(agents, d.tool.agent);
+            if (ag) { ag.tools.push({ name: d.tool.name, arguments: d.tool.arguments }); ag.text = ""; }
+            const wa = d.tool.arguments || {};
+            chat.streaming.status = "Subagent #" + d.tool.agent + ": " + (d.tool.name === "wait"
+              ? "waiting " + humanSecs(+wa.seconds || 0) + (wa.reason ? ": " + wa.reason : "")
+              : "calling " + d.tool.name) + "…";
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.agent) {
+            // a subagent starts: its own card, nested under its parent
+            agents = agents || [];
+            agents.push({ id: d.agent.id, parent: d.agent.parent, depth: d.agent.depth, task: d.agent.task,
+                          text: "", tools: [], notes: [], done: false });
+            chat.streaming.agents = agents;
+            chat.streaming.status = "Subagent #" + d.agent.id + " of " + d.agent.of + " started…";
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.agent_delta) {
+            const ag = agentById(agents, d.agent_delta.id);
+            if (ag) { ag.text += d.agent_delta.delta; updateStreamDOM(chat); }
+          } else if (d.agent_note) {
+            // the agent regenerates after a note, like the answer after a notice
+            const ag = agentById(agents, d.agent_note.id);
+            if (ag) { ag.notes.push(d.agent_note.text); ag.text = ""; }
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.agent_done) {
+            const ag = agentById(agents, d.agent_done.id);
+            if (ag) { ag.done = true; ag.ok = d.agent_done.ok; ag.ms = d.agent_done.ms; ag.calls = d.agent_done.calls; }
+            chat.streaming.status = "Subagent #" + d.agent_done.id + (d.agent_done.ok ? " reported; " : " failed; ") + "continuing…";
+            if (chat.id === state.currentId) renderChat();
           } else if (d.tool) {
             // A call is starting. The answer is generated AGAIN once the
             // result comes back, so the reply buffer resets the way it does
@@ -3976,6 +4098,14 @@ async function run(chat) {
             chat.streaming.reply = reply;
             chat.streaming.status = null;
             if (chat.id === state.currentId) renderChat();
+          } else if (d.tool_result && d.tool_result.agent) {
+            const ag = agentById(agents, d.tool_result.agent);
+            const last = ag && ag.tools[ag.tools.length - 1];
+            if (last) { last.ok = d.tool_result.ok; last.ms = d.tool_result.ms; }
+            if (chat.id === state.currentId) renderChat();
+          } else if (d.search && d.search.agent) {
+            // a subagent's reading: its card shows the call; the answer's
+            // own source list is for what the answer itself cites
           } else if (d.tool_result) {
             const last = toolCalls && toolCalls[toolCalls.length - 1];
             if (last) { last.ok = d.tool_result.ok; last.ms = d.tool_result.ms; }
@@ -4013,12 +4143,12 @@ async function run(chat) {
     // instance died or restarted) - surface it instead of recording a
     // truncated reply as if it were complete
     if (!sawDone) throw new Error("The stream ended before the response finished. The instance likely restarted. Try again.");
-    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: toolCalls });
+    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: toolCalls, agents });
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
     if (err && err.userStop) {
       if (reply) {
-        chat.messages.push({ role: "assistant", content: reply, meta: { stopped: true } });
+        chat.messages.push({ role: "assistant", content: reply, meta: { stopped: true }, tools: toolCalls, agents });
       } else {
         // nothing generated yet: hand the question back to the composer
         stripTail();
@@ -4917,7 +5047,8 @@ function renderModelMenu() {
     // slow jobs, inside the deployment's step and time budget. Turning it on
     // turns Tools on - a loop with nothing to call is not one.
     const budget = (state.tools.max_calls || 0) + " steps"
-      + (state.tools.max_seconds ? " · " + humanSecs(state.tools.max_seconds) : "");
+      + (state.tools.max_seconds ? " · " + humanSecs(state.tools.max_seconds) : "")
+      + (state.tools.max_agents ? " · " + state.tools.max_agents + " subagents" : "");
     const lsg = node('<div class="seg-row"><span>Loop</span><div class="seg"></div></div>');
     for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");

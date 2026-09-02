@@ -459,6 +459,50 @@ stay in the prompt whole; older ones are condensed to their first and last
 line survives condensing; one that buries it in the middle should be told to
 print a summary.
 
+#### Subagents: `spawn_agent`
+
+A deployment whose `tools` block sets **`max_agents`** to a positive number
+gives every loop a `spawn_agent` tool. A call spawns a **subagent**: a fresh
+conversation on the same model, with the same tools and the same machine but
+an empty context, given one `task` (plus optional `context` and `expect`),
+that runs its own tool loop to completion. Its final message comes back as
+the call's result, prefixed `Subagent #2 finished (5 calls, 3 minutes). Its
+report:`. Nothing else crosses: the child never sees the parent's
+conversation, and the parent reads nothing of the child's but that report
+(truncated to `max_chars` like any result).
+
+Subagents run **one at a time**, inside the request that spawned them (a
+wasm component has no threads), and **may spawn their own**. Two limits bound
+the tree, both the deployment's:
+
+- **`max_agents`** is the total an answer may spawn, however they nest. A
+  loop that could not spawn another is never shown the tool (the count is
+  spent, or it sits at the depth limit); a call made after a sibling used the
+  last slot is refused with a result that says so, and the model is told to
+  do the task itself.
+- **`max_agent_depth`** (default 3) is how deep the nesting goes: the answer
+  is depth 0, its children 1, theirs 2.
+
+A child's budget is **`agent_max_calls`** (default: the answer's
+`max_calls`) of its own, and whatever is **left** of the answer's
+`max_seconds`: no tree outlives the answer. A child inherits the answer's
+persistence (`loop: true`), and the object form of `loop` may lower
+`max_agents` and `max_agent_depth` for one answer (to zero, if the client
+wants no subagents at all). `GET /models` reports both under `tools`.
+
+On the stream, a child narrates as its own events, each carrying the
+agent's id. `/chat` sends `{"agent": {id, parent, depth, task, n, of}}`
+when one starts, `{"agent_delta": {id, delta}}` for its text (never as the
+answer's own `delta`), `{"agent_note": {id, text}}` for a decision that
+restarts its generation, `{"tool": {..., "agent": id}}` /
+`{"tool_result": {..., "agent": id}}` for its calls, and
+`{"agent_done": {id, ok, ms, calls, chars}}` when it returns; the done
+frame's `loop` block counts `agents`. Streaming `/v1` carries the same as
+`: enclave-agent`, `: enclave-agent-delta`, `: enclave-agent-note`,
+`: enclave-agent-done` comments, and a child's calls appear in
+`enclave.tools` with an `agent` field. The playground shows each subagent as
+a card nested by depth, with its calls and its live text inside.
+
 **Running a harness longer than one call.** The deployment's command tool
 has a per-call timeout (60 s for the `run_vm_command` entry in the template).
 A model working to a check starts the long job in the background on the
