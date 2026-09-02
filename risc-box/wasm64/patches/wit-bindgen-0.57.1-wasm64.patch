@@ -1,0 +1,102 @@
+diff -ruN a/build.rs b/build.rs
+--- a/build.rs	2026-09-02 02:43:16.794356123 -0700
++++ b/build.rs	2026-09-02 02:43:16.795724930 -0700
+@@ -10,22 +10,64 @@
+         return;
+     }
+ 
+-    if target_arch != "wasm32" {
+-        panic!("only wasm32 supports cabi-realloc right now");
+-    }
+-
+-    let mut src = env::current_dir().unwrap();
+-    src.push("src");
+-    src.push("rt");
+-    src.push("libwit_bindgen_cabi.a");
+-
+     let dst_name = format!(
+         "wit_bindgen_cabi{}",
+         env!("CARGO_PKG_VERSION").replace(".", "_")
+     );
+     let dst = out_dir.join(format!("lib{dst_name}.a"));
+ 
+-    std::fs::copy(&src, &dst).unwrap();
++    if target_arch == "wasm32" {
++        let mut src = env::current_dir().unwrap();
++        src.push("src");
++        src.push("rt");
++        src.push("libwit_bindgen_cabi.a");
++        std::fs::copy(&src, &dst).unwrap();
++    } else if target_arch == "wasm64" {
++        // enclave patch: the shipped archive is wasm32 object code. For a
++        // memory64 target, build the same two runtime sources for wasm64 with
++        // clang (WASM64_CLANG, default `clang`) — they are freestanding C and
++        // need no libc; the one <stdlib.h> include only wanted NULL.
++        let clang = env::var("WASM64_CLANG").unwrap_or_else(|_| "clang".to_string());
++        let rt = env::current_dir().unwrap().join("src").join("rt");
++        let mut objs = Vec::new();
++        for name in ["wit_bindgen_cabi_realloc", "wit_bindgen_cabi_wasip3"] {
++            let src_text = std::fs::read_to_string(rt.join(format!("{name}.c"))).unwrap();
++            let src_text = format!(
++                "#include <stddef.h>\n{}",
++                src_text.replace("#include <stdlib.h>", "#include <stddef.h>")
++            );
++            let c = out_dir.join(format!("{name}.c"));
++            std::fs::write(&c, src_text).unwrap();
++            let o = out_dir.join(format!("{name}.o"));
++            let status = std::process::Command::new(&clang)
++                .args(["--target=wasm64-unknown-unknown", "-O2", "-ffreestanding", "-nostdlib", "-c"])
++                .arg(&c)
++                .arg("-o")
++                .arg(&o)
++                .status()
++                .expect("run clang for the wasm64 cabi runtime");
++            assert!(status.success(), "clang failed building {name}.c for wasm64");
++            objs.push(o);
++        }
++        let _ = std::fs::remove_file(&dst);
++        // llvm-ar if present, else the host's ar: it is only an archive.
++        let candidates: Vec<String> = match env::var("WASM64_AR") {
++            Ok(a) => vec![a],
++            Err(_) => vec!["llvm-ar".to_string(), "ar".to_string()],
++        };
++        let mut archived = false;
++        for ar in &candidates {
++            if let Ok(status) = std::process::Command::new(ar).arg("rcs").arg(&dst).args(&objs).status() {
++                if status.success() {
++                    archived = true;
++                    break;
++                }
++            }
++        }
++        assert!(archived, "no archiver could build the wasm64 cabi runtime (set WASM64_AR)");
++    } else {
++        panic!("only wasm32 and wasm64 support cabi-realloc right now");
++    }
+ 
+     println!("cargo:rustc-link-lib=static={dst_name}");
+     println!("cargo:rustc-link-search=native={}", out_dir.display());
+diff -ruN a/src/rt/mod.rs b/src/rt/mod.rs
+--- a/src/rt/mod.rs	2026-09-02 02:43:16.794758175 -0700
++++ b/src/rt/mod.rs	2026-09-02 02:43:16.796010922 -0700
+@@ -181,9 +181,9 @@
+         if cfg!(debug_assertions) {
+             handle_alloc_error(layout);
+         } else {
+-            #[cfg(target_arch = "wasm32")]
++            #[cfg(target_family = "wasm")]
+             core::arch::wasm32::unreachable();
+-            #[cfg(not(target_arch = "wasm32"))]
++            #[cfg(not(target_family = "wasm"))]
+             unreachable!();
+         }
+     }
+@@ -196,7 +196,7 @@
+ /// wit-bindgen-rust generates a call to this function at the start of all
+ /// component export functions. Importantly, it is not called as part of
+ /// `cabi_realloc`, which is a *core* export func, but should not execute ctors.
+-#[cfg(target_arch = "wasm32")]
++#[cfg(target_family = "wasm")]
+ pub fn run_ctors_once() {
+     static mut RUN: bool = false;
+     unsafe {

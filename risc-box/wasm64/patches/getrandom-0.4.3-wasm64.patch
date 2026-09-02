@@ -1,0 +1,36 @@
+diff -ruN a/src/backends.rs b/src/backends.rs
+--- a/src/backends.rs	2026-09-02 02:43:16.813731667 -0700
++++ b/src/backends.rs	2026-09-02 02:43:16.815027744 -0700
+@@ -136,7 +136,7 @@
+     ))] {
+         mod apple_other;
+         pub use apple_other::*;
+-    } else if #[cfg(all(target_arch = "wasm32", target_os = "wasi"))] {
++    } else if #[cfg(all(target_family = "wasm", target_os = "wasi"))] {
+         cfg_if! {
+             if #[cfg(target_env = "p1")] {
+                 mod wasi_p1;
+diff -ruN a/src/error.rs b/src/error.rs
+--- a/src/error.rs	2026-09-02 02:43:16.813743037 -0700
++++ b/src/error.rs	2026-09-02 02:43:16.815017874 -0700
+@@ -179,7 +179,7 @@
+             Error::WINDOWS_RTL_GEN_RANDOM => "RtlGenRandom: Windows system function failure",
+             #[cfg(all(
+                 feature = "wasm_js",
+-                target_arch = "wasm32",
++                target_family = "wasm",
+                 any(target_os = "unknown", target_os = "none")
+             ))]
+             Error::WEB_CRYPTO => "Web Crypto API is unavailable",
+diff -ruN a/tests/mod.rs b/tests/mod.rs
+--- a/tests/mod.rs	2026-09-02 02:43:16.813855558 -0700
++++ b/tests/mod.rs	2026-09-02 02:43:16.815049404 -0700
+@@ -182,7 +182,7 @@
+ 
+ #[test]
+ #[cfg_attr(
+-    target_arch = "wasm32",
++    target_family = "wasm",
+     ignore = "The thread API always fails/panics on WASM"
+ )]
+ fn test_multithreading() {

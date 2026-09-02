@@ -1,0 +1,142 @@
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-09-02 02:46:13.828625615 -0700
++++ b/Cargo.toml	2026-09-02 02:46:13.830030358 -0700
+@@ -100,16 +100,16 @@
+ optional = true
+ package = "rustc-std-workspace-core"
+ 
+-[target.'cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"), target_os = "unknown"))'.dependencies.js-sys]
++[target.'cfg(all(any(target_family = "wasm", target_arch = "wasm64"), target_os = "unknown"))'.dependencies.js-sys]
+ version = "0.3"
+ optional = true
+ 
+-[target.'cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"), target_os = "unknown"))'.dependencies.wasm-bindgen]
++[target.'cfg(all(any(target_family = "wasm", target_arch = "wasm64"), target_os = "unknown"))'.dependencies.wasm-bindgen]
+ version = "0.2.62"
+ optional = true
+ default-features = false
+ 
+-[target.'cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"), target_os = "unknown"))'.dev-dependencies.wasm-bindgen-test]
++[target.'cfg(all(any(target_family = "wasm", target_arch = "wasm64"), target_os = "unknown"))'.dev-dependencies.wasm-bindgen-test]
+ version = "0.3.18"
+ 
+ [target.'cfg(target_os = "wasi")'.dependencies.wasi]
+@@ -119,3 +119,8 @@
+ [target."cfg(unix)".dependencies.libc]
+ version = "0.2.154"
+ default-features = false
++
++# wasm64 wasip2: the wasi 0.2 random interface (see src/wasi.rs)
++[target.'cfg(all(target_os = "wasi", target_env = "p2", target_arch = "wasm64"))'.dependencies.wasip2]
++version = "1.0"
++default-features = false
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-09-02 02:46:13.828859626 -0700
++++ b/src/lib.rs	2026-09-02 02:46:13.829879888 -0700
+@@ -315,7 +315,7 @@
+         #[path = "fuchsia.rs"] mod imp;
+     } else if #[cfg(any(target_os = "ios", target_os = "visionos", target_os = "watchos", target_os = "tvos"))] {
+         #[path = "apple-other.rs"] mod imp;
+-    } else if #[cfg(all(target_arch = "wasm32", target_os = "wasi"))] {
++    } else if #[cfg(all(target_family = "wasm", target_os = "wasi"))] {
+         #[path = "wasi.rs"] mod imp;
+     } else if #[cfg(target_os = "hermit")] {
+         #[path = "hermit.rs"] mod imp;
+@@ -336,12 +336,12 @@
+         mod lazy;
+         #[path = "rdrand.rs"] mod imp;
+     } else if #[cfg(all(feature = "js",
+-                        any(target_arch = "wasm32", target_arch = "wasm64"),
++                        any(target_family = "wasm", target_arch = "wasm64"),
+                         target_os = "unknown"))] {
+         #[path = "js.rs"] mod imp;
+     } else if #[cfg(feature = "custom")] {
+         use custom as imp;
+-    } else if #[cfg(all(any(target_arch = "wasm32", target_arch = "wasm64"),
++    } else if #[cfg(all(any(target_family = "wasm", target_arch = "wasm64"),
+                         target_os = "unknown"))] {
+         compile_error!("the wasm*-unknown-unknown targets are not supported by \
+                         default, you may need to enable the \"js\" feature. \
+diff -ruN a/src/wasi.rs b/src/wasi.rs
+--- a/src/wasi.rs	2026-09-02 02:46:13.828977976 -0700
++++ b/src/wasi.rs	2026-09-02 02:46:13.829972178 -0700
+@@ -1,14 +1,30 @@
+-//! Implementation for WASI
++// Implementation for WASI.
++//
++// wasip1 (and wasm32-wasip2, where rustc's bundled adapter serves preview1
++// imports) goes through the `wasi` crate's preview1 `random_get`. A wasm64
++// wasip2 build has no adapter — the bundled one is a wasm32 module that
++// cannot address a 64-bit memory — so the p2 arm asks the wasi 0.2 `random`
++// interface directly, as getrandom 0.3+ does.
+ use crate::Error;
+-use core::{
+-    mem::MaybeUninit,
+-    num::{NonZeroU16, NonZeroU32},
+-};
+-use wasi::random_get;
++use core::mem::MaybeUninit;
+ 
++#[cfg(all(target_env = "p2", target_arch = "wasm64"))]
+ pub fn getrandom_inner(dest: &mut [MaybeUninit<u8>]) -> Result<(), Error> {
++    let bytes = wasip2::random::random::get_random_bytes(dest.len() as u64);
++    if bytes.len() != dest.len() {
++        return Err(Error::UNEXPECTED);
++    }
++    for (d, s) in dest.iter_mut().zip(bytes.iter()) {
++        d.write(*s);
++    }
++    Ok(())
++}
++
++#[cfg(not(all(target_env = "p2", target_arch = "wasm64")))]
++pub fn getrandom_inner(dest: &mut [MaybeUninit<u8>]) -> Result<(), Error> {
++    use core::num::{NonZeroU16, NonZeroU32};
++    use wasi::random_get;
+     unsafe { random_get(dest.as_mut_ptr() as *mut u8, dest.len()) }.map_err(|e| {
+-        // The WASI errno will always be non-zero, but we check just in case.
+         match NonZeroU16::new(e.raw()) {
+             Some(r) => Error::from(NonZeroU32::from(r)),
+             None => Error::ERRNO_NOT_POSITIVE,
+diff -ruN a/tests/common/mod.rs b/tests/common/mod.rs
+--- a/tests/common/mod.rs	2026-09-02 02:46:13.829016266 -0700
++++ b/tests/common/mod.rs	2026-09-02 02:46:13.829998858 -0700
+@@ -1,6 +1,6 @@
+ use super::getrandom_impl;
+ 
+-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+ use wasm_bindgen_test::wasm_bindgen_test as test;
+ 
+ #[cfg(feature = "test-in-browser")]
+@@ -70,7 +70,7 @@
+ }
+ 
+ // On WASM, the thread API always fails/panics
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(target_family = "wasm"))]
+ #[test]
+ fn test_multithreading() {
+     extern crate std;
+diff -ruN a/tests/custom.rs b/tests/custom.rs
+--- a/tests/custom.rs	2026-09-02 02:46:13.829024476 -0700
++++ b/tests/custom.rs	2026-09-02 02:46:13.830023968 -0700
+@@ -1,6 +1,6 @@
+ // Test that a custom handler works on wasm32-unknown-unknown
+ #![cfg(all(
+-    target_arch = "wasm32",
++    target_family = "wasm",
+     target_os = "unknown",
+     feature = "custom",
+     not(feature = "js")
+diff -ruN a/tests/normal.rs b/tests/normal.rs
+--- a/tests/normal.rs	2026-09-02 02:46:13.829040626 -0700
++++ b/tests/normal.rs	2026-09-02 02:46:13.830011738 -0700
+@@ -1,6 +1,6 @@
+ // Don't test on custom wasm32-unknown-unknown
+ #![cfg(not(all(
+-    target_arch = "wasm32",
++    target_family = "wasm",
+     target_os = "unknown",
+     feature = "custom",
+     not(feature = "js")

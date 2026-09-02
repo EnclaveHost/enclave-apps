@@ -4,3 +4,7 @@ images/
 # manifest.
 emu/Cargo.lock
 set/*.wasm
+
+# wasm64: the proxy is a cargo crate of its own; the raw (unproxied) component is an intermediate
+wasm64/wasiproxy/target/
+wasm64/*.wasm

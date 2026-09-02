@@ -443,6 +443,34 @@ NAT only), the display/video/audio streams, the GameStream host, `/save`. An
 instance's `/stop` drops its pages; `/start` is a fresh fork of the same
 origin, not a resume. An instance's `/snapshot` needs an explicit `key`.
 
+## Past 4 GiB: the wasm64 build
+
+A wasm32 component addresses 4 GiB of linear memory, and everything a box
+holds lives there: the guest's RAM, the disk image, the framebuffer, the
+fork roots. That caps a guest at roughly 1.9 GiB of RAM and a box at about
+3 GiB of instances. `wasm64/build.sh` produces `risc-box64.wasm`, the same
+app as a memory64 component: `ramMiB` may go to 65536, `instances.maxBytes`
+defaults to 32 GiB, and the platform's memory ceiling for a memory64
+component is the deployment's whole RAM slice.
+
+There is no wasm64-wasip2 target in rustc, no wasm64 wasi-libc release, and
+the engine's own host bindings still speak a 32-bit ABI, so the build is a
+toolchain of its own (`wasm64/prepare-toolchain.sh`, or the Dockerfile next
+to it) and the app runs on top of a wasm32 pass-through component that
+forwards every WASI call across the engine's 64-to-32 adapter. All of it,
+and why each piece exists, is in [docs/wasm64.md](docs/wasm64.md).
+
+The guest kernel must be able to map the memory: the Alpine kernel from
+`guest/` (Linux 5.15, Sv39) does; the sample image's 5.4 kernel stops at
+2 GiB by its own config. Nothing else changes for the box's users: same
+config, same routes, same snapshots (a snapshot's identity does not include the RAM size, so a
+wasm32-made snapshot resumes on the wasm64 build). Run it locally with
+
+    wasmtime run -W memory64,component-model-memory64 -W max-memory-size=$((12<<30)) \
+      -Sinherit-network -Sallow-ip-name-lookup --env RISCBOX_CONFIG=... wasm64/risc-box64.wasm
+
+and the lifecycle harness takes `--mem64` (see `scripts/snaptest.py`).
+
 ## Networking and SSH
 
 The guest gets a **virtio-net NIC** (eth0). There is no bridge to a real

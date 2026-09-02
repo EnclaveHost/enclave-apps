@@ -95,6 +95,13 @@ def main():
     ap.add_argument("--no-exec-check", dest="exec_check", action="store_false")
     ap.add_argument("--log", default="/tmp/snaptest-wasmtime.log")
     ap.add_argument("--keep-snapshot", action="store_true", help="do not delete the snapshot object first (resume from an existing one)")
+    ap.add_argument("--mem64", action="store_true", help="the wasm64 build: engine memory64 switches + a ceiling past 4 GiB")
+    ap.add_argument("--max-mem-gib", type=int, default=8, help="with --mem64: -W max-memory-size in GiB")
+    ap.add_argument("--engine-flags", default="", help="extra wasmtime flags, space-separated (e.g. the SET build's '-W threads,shared-everything-threads')")
+    ap.add_argument("--exec-after", action="append", default=[], metavar="CMD",
+                    help="after phase A is READY: run CMD in the guest (repeatable, in order; a single /exec is capped at 120s by the app). "
+                         "The form 'wait-for=SUBSTR|CMD' repeats CMD every 5s until its output contains SUBSTR (20 min max). Records outputs and host RSS.")
+    ap.add_argument("--exec-verify", default="", help="after the phase B resume: run this in the guest and record its output (proves state survived the round trip)")
     args = ap.parse_args()
 
     res = {"ok": False}
@@ -127,7 +134,8 @@ def main():
            "restoreExec": "date -s @{epoch} >/dev/null; echo {entropy} > /dev/urandom; echo RESTORE-HOOK-OK",
            "instances": {"max": args.instances_max},
            "credentials": {"accessKeyId": args.ak, "secretAccessKey": args.sk}}
-    cmd = [args.wasmtime, "run", "-Snn", "-Stcp", "-Sinherit-network", "-Sallow-ip-name-lookup",
+    mem_args = ["-W", "memory64,component-model-memory64", "-W", f"max-memory-size={args.max_mem_gib << 30}"] if args.mem64 else []
+    cmd = [args.wasmtime, "run", "-Snn", "-Stcp", "-Sinherit-network", "-Sallow-ip-name-lookup", *mem_args, *args.engine_flags.split(),
            "--env", f"ENCLAVE_PORTS=http:8000={args.port}", "--env", f"RISCBOX_CONFIG={json.dumps(cfg)}", args.wasm]
     logf = open(args.log, "ab")
     proc = None
@@ -207,6 +215,15 @@ def main():
             time.sleep(0.2)
         raise TimeoutError("never running")
 
+    def host_rss_mib():
+        try:
+            for line in open(f"/proc/{proc.pid}/status"):
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) >> 10
+        except OSError:
+            pass
+        return -1
+
     def iexec(prefix, cmd, timeout_s=60):
         st, d = bench.http_req(args.port, "POST", f"{prefix}/exec", body=json.dumps({"cmd": cmd, "timeout_s": timeout_s}).encode(), timeout=timeout_s + 30)
         assert st == 200, (prefix, st, d[:200])
@@ -229,6 +246,25 @@ def main():
             t0 = time.monotonic()
             st, d = bench.http_req(args.port, "POST", "/start", body=b"{}"); assert st == 202, (st, d)
             res["A_boot_wall_s"] = round(wait_ready(con, 0), 1)
+            res["A_host_rss_MiB"] = host_rss_mib()
+            if args.exec_after:
+                res["A_exec_after"] = []
+                for spec in args.exec_after:
+                    t1 = time.monotonic()
+                    if spec.startswith("wait-for="):
+                        until, cmd = spec[len("wait-for="):].split("|", 1)
+                        while True:
+                            j = iexec("", cmd, timeout_s=110)
+                            if j.get("ok") and until in j.get("output", ""):
+                                break
+                            assert time.monotonic() - t1 < 1200, f"wait-for {until!r} never came: {j}"
+                            time.sleep(5)
+                    else:
+                        j = iexec("", spec, timeout_s=110)
+                        assert j.get("ok"), f"--exec-after failed: {j}"
+                    res["A_exec_after"].append((spec[:60], j.get("output", "")[-300:], round(time.monotonic() - t1, 1)))
+                res["A_host_rss_after_MiB"] = host_rss_mib()
+                res["A_status_after"] = {k: bench.status(args.port).get(k) for k in ("ramMiB", "footprintBytes", "phase")}
             if args.settle: time.sleep(args.settle)
             s0 = bench.status(args.port)
             assert s0["snapshot"]["restored"] is False and s0["snapshot"]["cachedBytes"] == 0, s0["snapshot"]
@@ -252,6 +288,11 @@ def main():
             # proof of life: the guest is executing after the resume
             i0 = bench.status(args.port)["instret"]; time.sleep(2); i1 = bench.status(args.port)["instret"]
             res["B_insns_2s"] = i1 - i0; assert i1 > i0
+            if args.exec_verify:
+                j = iexec("", args.exec_verify, timeout_s=600)
+                res["B_exec_verify"] = (j.get("ok"), j.get("output", "")[-400:])
+                assert j.get("ok"), f"--exec-verify failed: {j}"
+                res["B_host_rss_MiB"] = host_rss_mib()
         if "C" in args.phases:
             kill(); launch(); con = bench.Console(args.port); time.sleep(0.3)
             t0 = time.monotonic()

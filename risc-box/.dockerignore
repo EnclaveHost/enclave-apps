@@ -1,0 +1,8 @@
+# wasm64/Dockerfile copies only wasm64/; keep the build context small
+target/
+emu/target/
+wasm64/wasiproxy/target/
+images/
+.git/
+guest/
+build-sndgpu/

@@ -171,3 +171,59 @@ snapshot) rather than the guest's boot. Roughly a quarter of the resident
 guest RAM is page cache of files that also sit in the rootfs; de-duplicating
 those pages against the disk (reference a block instead of storing the page)
 is the obvious next cut in snapshot size if it matters.
+
+## wasm64 (2026-09-02): more than 4 GiB
+
+What shipped (`wasm64/`): a memory64 build of the same app.
+
+* `build.sh` builds std from source for a custom `wasm64-wasip2` target,
+  encodes the component with a memory64-aware wit-component, and plugs the
+  result into `wasiproxy` (a generated wasm32 pass-through of every stable
+  wasi 0.2.12 interface) with `wac`. It refuses a composition in which any
+  app import bypassed the proxy, and leaves Cargo.lock untouched.
+* `prepare-toolchain.sh` (and `Dockerfile`) reproduce the toolchain into
+  `$W64`: wasi-sdk 34 rc.2, wasi-libc 6d8745c8 for wasm64-wasip2 with the
+  platform's memory64 patch, wasm-tools v1.256.0 and wac on the memory64
+  encoder patch, patched wit-bindgen 0.57.1 / wasip2 1.0.4 / getrandom, and
+  a widened copy of this nightly's std. `patches/` holds every diff.
+* Emulator: the device tree's memory node now carries both size cells and
+  the size sync no longer stops at 4 GiB (a 5 GiB guest used to keep the
+  embedded 512 MB node, OOM at 400 MB of tmpfs, and oops).
+* Platform (enclave repo, same day): the wasm manager classifies a memory64
+  component (`_component_mem64`), launches it with
+  `-W memory64,component-model-memory64`, lifts the 4096 MB ceiling to the
+  deployment's slice, and refuses readably on an engine without `cm64`;
+  gateway, CLI and site stamp `mem64` on the contract.
+
+Why the proxy: wasmtime 49's host-side typed canonical ABI is 32-bit
+(FIXME #4311); its component-to-component adapters are not. docs/wasm64.md
+has the full story, including the dead ends (no wasm64 preview1 adapter; a
+same-named `random_get` definition does not catch an import-module'd
+symbol; `wasm-tools compose` cannot remap resources).
+
+Deploying: publish `wasm64/risc-box64.wasm` as its own version (the CID
+classifies as mem64 at publish time); the deployment needs the platform
+commit that adds cm64 support live on the fleet first, and a RAM slice
+sized for the guests (the ceiling is the slice, not 4 GiB).
+
+### Numbers from the 5 GiB run (wasm64, Alpine kernel, headless rootfs, R2)
+
+`scripts/snaptest.py --mem64 --max-mem-gib 12 --ram 5120 --ready-exec`
+against `alpine/fw_payload-gpu.elf` + `alpine/rootfs-uncap5.ext2.gz`, an
+18-step tmpfs fill (250 MB per `/exec`, the app caps one at 120 s) plus a
+non-zero tail, then snapshot, stop, resume, verify:
+
+| step | measured |
+|---|---|
+| guest's own view | `free -m`: 4945 MB total; after the fill 4503 MB shared (tmpfs), 378 MB available |
+| boot to a working shell (215 MB rootfs fetch included) | 35.4 s |
+| tmpfs fill | 4,719,640,576 bytes at ~5 MB/s per chunk (the interpreter at ~52 MIPS) |
+| engine process RSS after the fill | 5443 MiB — the wasm64 linear memory holds more than 4 GiB |
+| `/snapshot` | 25.6 MB in 2.9 s (32,433 of 1,310,720 RAM pages non-zero; the zero fill costs nothing), 2.4 s upload |
+| `/stop` + `/start` resume | 0.79 s |
+| after the resume | same file size, same md5 of the last 1 MB and of a 1 MB slice at 4300 MB |
+
+The sample image's kernel cannot take part: Linux 5.4 with
+`CONFIG_MAXPHYSMEM_2GB` maps 2 GiB whatever the device tree says, and a
+5 GiB guest on it OOMs at 2 GiB (then oopses). The Alpine kernel (5.15,
+Sv39) is the one to use, and it is the one the fleet runs.

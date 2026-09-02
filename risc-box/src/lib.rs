@@ -160,6 +160,24 @@ const BOOST_HOLD_TURNS: u64 = 48;
 /// The one machine that is never an instance.
 const MAIN_ID: &str = "main";
 
+/// The largest guest RAM a machine may be configured with. On a 32-bit wasm
+/// build the whole process has a 4 GiB address space and everything else
+/// (the base disk, images, the other machines) lives in it too, so a single
+/// guest stops at 1920 MiB. On a memory64 build the process can address far
+/// more, and the deployment's RAM slice (`-W max-memory-size`) is the real
+/// limit; 64 GiB here is a sanity cap, not a promise.
+#[cfg(target_pointer_width = "64")]
+const RAM_MIB_MAX: u64 = 64 * 1024;
+/// Default host-memory budget for all machines together: 3 GiB inside a
+/// 4 GiB wasm32 process; 32 GiB on memory64, where the deployment's RAM
+/// slice is what actually bounds it (`instances.maxBytes` overrides).
+#[cfg(target_pointer_width = "64")]
+const INSTANCES_MAX_BYTES_DEFAULT: u64 = 32 << 30;
+#[cfg(not(target_pointer_width = "64"))]
+const INSTANCES_MAX_BYTES_DEFAULT: u64 = 3 << 30;
+#[cfg(not(target_pointer_width = "64"))]
+const RAM_MIB_MAX: u64 = 1920;
+
 // ---- config ---------------------------------------------------------------
 
 pub struct Config {
@@ -179,9 +197,10 @@ pub struct Config {
     forwards: Vec<ForwardCfg>,
     // Guest RAM in MiB (`ramMiB`) for the main machine. Default 512 keeps
     // existing deployments' footprint; the alpine/firefox image wants 1792.
-    // Clamped to [128, 1920]: a wasm32 address space is 4 GiB, and a machine
-    // under 128 MiB can't even finish X startup. Instances take theirs from
-    // the snapshot they fork from.
+    // Clamped to [128, RAM_MIB_MAX] (1920 on wasm32, where the address space
+    // is 4 GiB; far higher on a memory64 build), and a machine under 128 MiB
+    // can't even finish X startup. Instances take theirs from the snapshot
+    // they fork from.
     ram_mib: u64,
     // Display size (`display: {width, height}`), default 1024x768. Must fit the
     // DTB's 8 MiB framebuffer window; the emulator applies the same guard to
@@ -329,7 +348,7 @@ fn load_config() -> Config {
             .get("ramMiB")
             .and_then(|x| x.as_u64())
             .unwrap_or(512)
-            .clamp(128, 1920),
+            .clamp(128, RAM_MIB_MAX),
         fb_w: v
             .get("display")
             .and_then(|d| d.get("width"))
@@ -389,7 +408,7 @@ fn load_config() -> Config {
         instances_max_bytes: inst
             .and_then(|i| i.get("maxBytes"))
             .and_then(|x| x.as_u64())
-            .unwrap_or(3 << 30),
+            .unwrap_or(INSTANCES_MAX_BYTES_DEFAULT),
     }
 }
 

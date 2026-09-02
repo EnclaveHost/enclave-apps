@@ -21,7 +21,12 @@
 /// past what the app's wasm32 address space could hold beside the running
 /// machine anyway; it exists so a corrupt or hostile trailer asks for a
 /// refusal rather than a 4 GiB allocation.
+#[cfg(not(target_pointer_width = "64"))]
 const MAX_IMAGE: usize = 2 * 1024 * 1024 * 1024;
+/// A memory64 build can hold a bigger disk; 16 GiB is still a refusal
+/// threshold for a corrupt trailer, not a working size.
+#[cfg(target_pointer_width = "64")]
+const MAX_IMAGE: usize = 16 * 1024 * 1024 * 1024;
 
 /// Does this key name a gzip-compressed object? Suffix rather than sniffing
 /// the bytes: the config author says what the bucket holds, so a mislabelled

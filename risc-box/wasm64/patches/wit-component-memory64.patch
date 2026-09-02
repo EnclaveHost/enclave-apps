@@ -1,0 +1,106 @@
+diff --git a/crates/wit-component/src/encoding.rs b/crates/wit-component/src/encoding.rs
+index 5e29ced..b19ab94 100644
+--- a/crates/wit-component/src/encoding.rs
++++ b/crates/wit-component/src/encoding.rs
+@@ -105,14 +105,16 @@ pub(crate) use dedupe::ModuleImportMap;
+ use wasm_metadata::AddMetadataField;
+ 
+ fn to_val_type(ty: &WasmType) -> ValType {
++    // enclave patch (memory64): pointer-width types follow the main module's
++    // memory (see validation::PTR64).
+     match ty {
+         WasmType::I32 => ValType::I32,
+         WasmType::I64 => ValType::I64,
+         WasmType::F32 => ValType::F32,
+         WasmType::F64 => ValType::F64,
+-        WasmType::Pointer => ValType::I32,
++        WasmType::Pointer => if crate::validation::ptr64() { ValType::I64 } else { ValType::I32 },
+         WasmType::PointerOrI64 => ValType::I64,
+-        WasmType::Length => ValType::I32,
++        WasmType::Length => if crate::validation::ptr64() { ValType::I64 } else { ValType::I32 },
+     }
+ }
+ 
+diff --git a/crates/wit-component/src/validation.rs b/crates/wit-component/src/validation.rs
+index eeddc59..d236c8f 100644
+--- a/crates/wit-component/src/validation.rs
++++ b/crates/wit-component/src/validation.rs
+@@ -17,6 +17,22 @@ use wit_parser::{
+     abi::{AbiVariant, WasmSignature, WasmType},
+ };
+ 
++// enclave patch (memory64): the canonical ABI's pointer and length types are
++// `i64` when the module's memory is a 64-bit memory. wit-component learns
++// that from the main module's memory section (see `ValidatedModule::new`)
++// and every place that flattens a signature consults it. One flag for the
++// process: an encoder handles one main module, and its shims and adapters
++// must agree with it anyway.
++pub(crate) static PTR64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++pub(crate) fn ptr64() -> bool {
++    PTR64.load(std::sync::atomic::Ordering::Relaxed)
++}
++
++pub(crate) fn ptr_val_type() -> ValType {
++    if ptr64() { ValType::I64 } else { ValType::I32 }
++}
++
+ fn wasm_sig_to_func_type(signature: WasmSignature) -> FuncType {
+     fn from_wasm_type(ty: &WasmType) -> ValType {
+         match ty {
+@@ -24,9 +40,9 @@ fn wasm_sig_to_func_type(signature: WasmSignature) -> FuncType {
+             WasmType::I64 => ValType::I64,
+             WasmType::F32 => ValType::F32,
+             WasmType::F64 => ValType::F64,
+-            WasmType::Pointer => ValType::I32,
++            WasmType::Pointer => ptr_val_type(),
+             WasmType::PointerOrI64 => ValType::I64,
+-            WasmType::Length => ValType::I32,
++            WasmType::Length => ptr_val_type(),
+         }
+     }
+ 
+@@ -63,6 +79,32 @@ impl ValidatedModule {
+         let mut validator = Validator::new_with_features(WasmFeatures::all());
+         let mut ret = ValidatedModule::default();
+ 
++        // enclave patch (memory64): the import section precedes the memory
++        // section, and import signatures are checked as they are read, so
++        // the pointer width has to be known BEFORE the walk. Pre-scan for
++        // the first defined (or imported) memory and set PTR64 from it.
++        PTR64.store(false, std::sync::atomic::Ordering::Relaxed);
++        'scan: for payload in Parser::new(0).parse_all(bytes) {
++            match payload? {
++                Payload::ImportSection(s) => {
++                    for import in s.into_imports() {
++                        if let TypeRef::Memory(m) = import?.ty {
++                            PTR64.store(m.memory64, std::sync::atomic::Ordering::Relaxed);
++                            break 'scan;
++                        }
++                    }
++                }
++                Payload::MemorySection(s) => {
++                    for mem in s.into_iter() {
++                        PTR64.store(mem?.memory64, std::sync::atomic::Ordering::Relaxed);
++                        break 'scan;
++                    }
++                }
++                Payload::CodeSectionStart { .. } => break,
++                _ => {}
++            }
++        }
++
+         for payload in Parser::new(0).parse_all(bytes) {
+             let payload = payload?;
+             if let ValidPayload::End(_) = validator.payload(&payload)? {
+@@ -1244,7 +1286,9 @@ impl ExportMap {
+ 
+         // Handle a few special-cased names first.
+         if name == names.export_realloc() {
+-            let expected = FuncType::new([ValType::I32; 4], [ValType::I32]);
++            // enclave patch (memory64): `cabi_realloc(ptr, size, align, size) -> ptr`
++            // is all pointer-width.
++            let expected = FuncType::new([ptr_val_type(); 4], [ptr_val_type()]);
+             validate_func_sig(name, &expected, ty)?;
+             return Ok(Some(Export::GeneralPurposeRealloc));
+         } else if name == names.export_initialize() {

@@ -67,7 +67,6 @@ rav1e = { version = "0.7", default-features = false }
 # a subprocess. Bindings are generated at compile time from wit/ by the macro
 # (this crate is a plain cargo build, not cargo-component, so there is no
 # checked-in bindings.rs).
-wit-bindgen = { version = "0.41", default-features = false, features = ["macros", "realloc"] }
 # GameStream host crypto, all pure Rust so it builds for wasm32-wasip2 (the
 # native bridge used openssl, which is C and does not). AES-128 in three modes:
 # GCM for the control channel, CBC for audio, ECB for the pairing handshake.
@@ -100,3 +99,10 @@ set = []
 # (see emu/build.rs + emu/aot/regions.dump). The app enables the dispatcher
 # at machine start when this is on.
 aot = ["riscv_emu_rust/aot"]
+
+# wasi-nn bindings for the hardware encoder (nvenc.rs), wasm32 only: the
+# wasm64 build has no wasi-nn path and must not pull wit-bindgen-rt 0.41,
+# whose build script refuses to build cabi_realloc for anything but wasm32
+# (std's own wasip2 bindings export cabi_realloc on wasm64).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = { version = "0.41", default-features = false, features = ["macros", "realloc"] }

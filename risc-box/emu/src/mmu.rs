@@ -202,15 +202,17 @@ impl Mmu {
 		self.sync_dtb_memory_size();
 	}
 
-	/// risc-box patch: rewrites the size cell of the DTB's memory@80000000 reg
-	/// (<0x0 0x80000000 0x0 SIZE>, big-endian cells) to `ram_capacity`. Works on
+	/// risc-box patch: rewrites the size cells of the DTB's memory@80000000 reg
+	/// (<0x0 0x80000000 SIZE-HI SIZE-LO>, big-endian cells) to `ram_capacity`. Works on
 	/// the embedded DTB and any init_dtb() override; called from both paths.
 	/// A DTB without exactly one such reg is left alone (with a log line) —
 	/// better an honest mismatch than a corrupted tree.
 	fn sync_dtb_memory_size(&mut self) {
-		if self.ram_capacity == 0 || self.ram_capacity >= 0x1_0000_0000 {
-			return; // unset, or needs a 2-cell size (never: single-alloc cap is 2 GiB)
+		if self.ram_capacity == 0 {
+			return; // unset
 		}
+		// (a wasm64 host hands out 4 GiB and more: both size cells are written
+		// below, so there is no ceiling here any more)
 		let pat: [u8; 12] = [0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0]; // base-hi, base-lo=0x80000000, size-hi=0
 		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(16))
 			.filter(|&i| self.dtb[i..i + 12] == pat)
@@ -220,6 +222,9 @@ impl Mmu {
 			return;
 		}
 		let at = hits[0] + 12;
+		// both size cells: a wasm64 host can give the guest 4 GiB and more,
+		// and a size-lo-only write would hand a 5 GiB guest 1 GiB
+		self.dtb[at - 4..at].copy_from_slice(&((self.ram_capacity >> 32) as u32).to_be_bytes());
 		self.dtb[at..at + 4].copy_from_slice(&(self.ram_capacity as u32).to_be_bytes());
 	}
 

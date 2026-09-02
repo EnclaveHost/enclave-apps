@@ -31,8 +31,9 @@ fn main() {
 
     let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
     cc.args(["-O2", "-DNDEBUG", "-c", "vendor/minih264/wrapper.c", "-o"]).arg(&obj);
-    if arch == "wasm32" {
-        cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/minih264/shim"]);
+    if arch == "wasm32" || arch == "wasm64" {
+        cc.arg(format!("--target={arch}-wasip2"));
+        cc.args(["-nostdlibinc", "-Ivendor/minih264/shim"]);
         for f in ["atomics", "bulk-memory", "mutable-globals"] {
             if features.split(',').any(|x| x == f) {
                 cc.arg(format!("-m{f}"));
@@ -83,11 +84,12 @@ fn build_enet(out: &PathBuf, arch: &str, features: &str) {
         cc.args(["-O2", "-DNDEBUG", "-c", &src, "-o"])
             .arg(&obj)
             .args(["-Ivendor/enet/include"]);
-        if arch == "wasm32" {
+        if arch == "wasm32" || arch == "wasm64" {
             // No C sysroot at cargo time, so the handful of libc headers the
             // core needs (memcpy/memset/malloc/free) come from the shim and
             // resolve at the final link against wasi-libc.
-            cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/enet/shim"]);
+            cc.arg(format!("--target={arch}-wasip2"));
+        cc.args(["-nostdlibinc", "-Ivendor/enet/shim"]);
             for f in ["atomics", "bulk-memory", "mutable-globals"] {
                 if features.split(',').any(|x| x == f) {
                     cc.arg(format!("-m{f}"));
@@ -126,11 +128,12 @@ fn build_opl3(out: &PathBuf, arch: &str, features: &str) {
         let obj = out.join(format!("{}.o", src.rsplit('/').next().unwrap()));
         let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
         cc.args(["-O2", "-DNDEBUG", "-c", src, "-o"]).arg(&obj);
-        if arch == "wasm32" {
+        if arch == "wasm32" || arch == "wasm64" {
             // opl3.c's own shim first: it supplies the <stdlib.h> the
             // freestanding wasm build has no sysroot for, and which opl3.c
             // includes without using.
-            cc.args(["--target=wasm32-wasip2", "-nostdlibinc", "-Ivendor/opl3/shim",
+            cc.arg(format!("--target={arch}-wasip2"));
+        cc.args(["-nostdlibinc", "-Ivendor/opl3/shim",
                      "-Ivendor/minih264/shim", "-Ivendor/opl3"]);
             for f in ["atomics", "bulk-memory", "mutable-globals"] {
                 if features.split(',').any(|x| x == f) {
