@@ -2058,6 +2058,61 @@ fn check_images(
     Ok(n)
 }
 
+/// mm33: turn linked videos into bytes. The fetch happens HERE, inside the
+/// enclave over the deployment's egress, never in the browser: the linked
+/// host learns that some enclave fetched its file, nothing about who asked.
+/// Direct files only (mp4/mov, webm/mkv, avi by magic); a page that embeds
+/// a player is not a file and is refused with that sentence. Bounded by the
+/// same byte cap as an upload, so a link cannot buy more than an upload can.
+fn resolve_video_links(cfg: &AppConfig, messages: &mut [ChatMsg]) -> Result<(), String> {
+    if messages.iter().all(|m| m.video_links.is_empty()) {
+        return Ok(());
+    }
+    if !cfg.remote_media {
+        return Err("[remote_media_off] this deployment does not fetch linked videos - upload the file instead".into());
+    }
+    for m in messages.iter_mut() {
+        for link in std::mem::take(&mut m.video_links) {
+            let mut url = link.clone();
+            let mut resp = None;
+            for _ in 0..4 {
+                let r = http::request(
+                    http::HttpReq::get(&url).timeout(90).max_bytes(cfg.max_video_bytes + 1),
+                )
+                .map_err(|e| format!("[video_fetch_failed] could not fetch the linked video: {e}"))?;
+                if (301..=308).contains(&r.status) {
+                    if let Some(next) = r.location.clone() {
+                        let next = http::resolve_url(&url, &next);
+                        if !(next.starts_with("http://") || next.starts_with("https://")) {
+                            return Err("[video_fetch_failed] the link redirected somewhere that is not http(s)".into());
+                        }
+                        url = next;
+                        continue;
+                    }
+                }
+                resp = Some(r);
+                break;
+            }
+            let r = resp.ok_or("[video_fetch_failed] the link redirected too many times")?;
+            if r.status != 200 {
+                return Err(format!("[video_fetch_failed] the linked host answered HTTP {}", r.status));
+            }
+            if r.truncated || r.body.len() > cfg.max_video_bytes {
+                return Err(format!(
+                    "[video_too_large] the linked video is over this deployment's {} MB limit",
+                    cfg.max_video_bytes >> 20
+                ));
+            }
+            if video_kind(&r.body).is_none() {
+                return Err("[video_undecodable] the link did not return a video file (mp4, mov, webm, mkv or avi) - \
+                            a page with a player, a YouTube link or a playlist is not a file; link the file itself".into());
+            }
+            m.videos.push(r.body);
+        }
+    }
+    Ok(())
+}
+
 /// mm33: vet video attachments BEFORE the stream opens, like check_images:
 /// the serving model must accept video, one clip per turn, within the byte cap.
 fn check_videos(raw: &serde_json::Value, cfg: &AppConfig, messages: &[ChatMsg]) -> Result<usize, String> {
@@ -3780,6 +3835,9 @@ struct ChatMsg {
     /// the turn's images, each as one media mark, and handed to the host's
     /// "video" verb, which samples frames through the same projector.
     videos: Vec<Vec<u8>>,
+    /// mm33: http(s) video links on this turn, resolved into `videos` by
+    /// resolve_video_links (an in-enclave fetch) before the prompt is built
+    video_links: Vec<String>,
     /// OpenAI tool history (the /v1 passthrough): calls an assistant turn
     /// carried, as (id, name, arguments). Held here until fold_tool_history
     /// renders them into the trained text form - build_prompt itself never
@@ -3917,7 +3975,12 @@ impl<'de> Deserialize<'de> for ChatMsg {
                         None => None,
                     };
                     if let Some(vsrc) = vsrc {
-                        msg.videos.push(decode_video_src(&vsrc).map_err(serde::de::Error::custom)?);
+                        let t = vsrc.trim();
+                        if t.starts_with("http://") || t.starts_with("https://") {
+                            msg.video_links.push(t.to_string());
+                        } else {
+                            msg.videos.push(decode_video_src(&vsrc).map_err(serde::de::Error::custom)?);
+                        }
                     }
                     // A part this app cannot read is REFUSED, not dropped. Dropping
                     // it (what the shipped 1.0.48 did with a video_url part) left
@@ -7094,7 +7157,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let t0 = now_ms();
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
-    let creq = match parsed {
+    let mut creq = match parsed {
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
@@ -7108,6 +7171,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // the client can then keep the picture and let the user pick another model
     // rather than treating it as a failed turn.
     if let Err(e) = check_images(raw, cfg, &creq.messages) {
+        return json_err(out, 400, &e);
+    }
+    if let Err(e) = resolve_video_links(cfg, &mut creq.messages) {
         return json_err(out, 400, &e);
     }
     if let Err(e) = check_videos(raw, cfg, &creq.messages) {
@@ -7519,7 +7585,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     }
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
-    let creq = match parsed {
+    let mut creq = match parsed {
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
@@ -7537,6 +7603,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
     };
     if let Err(e) = check_images(raw, cfg, &creq.messages) {
+        return json_err(out, 400, &e);
+    }
+    if let Err(e) = resolve_video_links(cfg, &mut creq.messages) {
         return json_err(out, 400, &e);
     }
     if let Err(e) = check_videos(raw, cfg, &creq.messages) {
@@ -8439,6 +8508,8 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
         "enabled": video_any,
         "max_bytes": base_cfg.as_ref().map(|c| c.max_video_bytes).unwrap_or(0),
         "frames": base_cfg.as_ref().map(|c| c.video_frames).unwrap_or(0),
+        // links are fetched in-enclave when the deployment allows it
+        "remote_media": base_cfg.as_ref().map(|c| c.remote_media).unwrap_or(false),
     });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }
@@ -10356,6 +10427,19 @@ mod tests {
         let raw = r#"{"role":"user","content":[{"type":"text","text":"what is said?"},{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}"#;
         let err = serde_json::from_str::<ChatMsg>(raw).err().expect("refused").to_string();
         assert!(err.contains("unsupported content part") && err.contains("input_audio"), "{err}");
+    }
+
+    #[test]
+    fn linked_videos_are_kept_as_links_until_fetched() {
+        let raw = r#"{"role":"user","content":[{"type":"text","text":"what happens?"},{"type":"video_url","video_url":{"url":"https://example.com/clip.mp4"}}]}"#;
+        let msg: ChatMsg = serde_json::from_str(raw).unwrap();
+        assert_eq!(msg.video_links, vec!["https://example.com/clip.mp4".to_string()]);
+        assert!(msg.videos.is_empty());
+        // a deployment with remote_media off refuses before any fetch
+        let mut cfg = test_config(); cfg.video = true; cfg.vision = true; cfg.remote_media = false;
+        let mut msgs = vec![msg];
+        let err = resolve_video_links(&cfg, &mut msgs).err().expect("refused");
+        assert!(err.contains("remote_media_off"), "{err}");
     }
 
     #[test]

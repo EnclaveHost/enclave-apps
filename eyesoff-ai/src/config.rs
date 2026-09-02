@@ -325,6 +325,13 @@ pub struct AppConfig {
     pub video_frames: usize,
     #[serde(default = "default_max_video_bytes")]
     pub max_video_bytes: usize,
+    /// mm33: a `video_url` may be an http(s) LINK, fetched by this app from
+    /// inside the enclave over the deployment's own egress (never by the
+    /// browser). On by default for video-capable entries because the
+    /// playground offers "paste a link"; a deployment that must not reveal
+    /// what it watches to the linked host turns it off.
+    #[serde(default = "default_remote_media")]
+    pub remote_media: bool,
     #[serde(default = "default_max_images")]
     pub max_images: usize,
 }
@@ -429,6 +436,9 @@ fn default_max_image_bytes() -> usize {
 
 fn default_video_frames() -> usize {
     8
+}
+fn default_remote_media() -> bool {
+    true
 }
 fn default_max_video_bytes() -> usize {
     // base64 inflates a data: URI by 4/3 and the whole /chat body is capped at

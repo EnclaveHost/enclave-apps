@@ -3152,7 +3152,8 @@ function updateAttachUI() {
     const el = a.kind === "video"
       ? node('<div class="att att-video"><video muted playsinline preload="metadata"></video><span class="att-badge">VIDEO</span><button type="button" class="x" aria-label="Remove video">&times;</button></div>')
       : node('<div class="att"><img alt=""><button type="button" class="x" aria-label="Remove image">&times;</button></div>');
-    if (a.kind === "video") { el.querySelector("video").src = a.url; el.title = a.name + " \u00b7 " + Math.round(a.bytes / 1024) + " KB"; }
+    if (a.kind === "video" && a.link) { el.querySelector(".att-badge").textContent = "LINK"; el.title = a.name + " \u00b7 fetched by the enclave"; }
+    else if (a.kind === "video") { el.querySelector("video").src = a.url; el.title = a.name + " \u00b7 " + Math.round(a.bytes / 1024) + " KB"; }
     else el.querySelector("img").src = a.url;
     el.querySelector(".x").addEventListener("click", (e) => {
       e.preventDefault(); e.stopPropagation();
@@ -3262,24 +3263,47 @@ async function addVideo(file) {
     pill("fail", ICONS.alert, " " + (e.message || "could not attach that video"), 7000);
   }
 }
-// A link is fetched by THIS BROWSER, never by the deployment: fetching
-// server-side would tell a third-party host what this chat is watching, which
-// is the thing the app exists to avoid. So only hosts that allow cross-origin
-// reads work; for the rest the honest answer is download-then-upload.
+// A link is fetched by THIS BROWSER first, so the linked host sees the
+// reader and not the deployment. Most video hosts refuse cross-origin reads;
+// when the deployment allows it (/models video.remote_media) the link is then
+// handed to the server, which fetches the FILE from inside the enclave over
+// its own egress: the host learns that some enclave fetched it, nothing about
+// who asked. A deployment that must not reveal what it watches turns that off
+// and the honest answer stays download-then-upload.
 async function addVideoLink(url) {
   url = String(url || "").trim();
   if (!/^https?:\/\//i.test(url)) { pill("fail", ICONS.alert, " Paste an http(s) link to a video file", 5000); return; }
-  pill("ok", ICONS.check, " Fetching the video in your browser…", 4000);
-  let res;
-  try { res = await fetch(url, { mode: "cors" }); }
-  catch (_) {
-    pill("fail", ICONS.alert, " That site does not let the browser fetch the video directly - download it and use Upload a video", 9000);
+  if (!videoModel()) {
+    pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot watch video"
+      + (state.video.enabled ? " - pick a video-capable model from the menu" : ""), 6000);
     return;
   }
-  if (!res.ok) { pill("fail", ICONS.alert, " Could not fetch that link (HTTP " + res.status + ")", 6000); return; }
-  const blob = await res.blob();
-  const name = (url.split("?")[0].split("/").pop() || "video") + (VID_EXT.test(url) ? "" : ".mp4");
-  await addVideo(new File([blob], name, { type: blob.type || "video/mp4" }));
+  if (state.attachments.some((a) => a.kind === "video")) {
+    pill("fail", ICONS.alert, " One video per message - remove the attached clip first", 5000);
+    return;
+  }
+  pill("ok", ICONS.check, " Fetching the video in your browser\u2026", 4000);
+  let res = null;
+  try { res = await fetch(url, { mode: "cors" }); } catch (_) { res = null; }
+  if (res && res.ok) {
+    const blob = await res.blob();
+    const name = (url.split("?")[0].split("/").pop() || "video") + (VID_EXT.test(url) ? "" : ".mp4");
+    await addVideo(new File([blob], name, { type: blob.type || "video/mp4" }));
+    return;
+  }
+  if (!(state.video && state.video.remote_media)) {
+    pill("fail", ICONS.alert, res
+      ? " Could not fetch that link (HTTP " + res.status + ")"
+      : " That site does not let the browser fetch the video directly - download it and use Upload a video", 9000);
+    return;
+  }
+  // server-side fetch: the link rides as the video_url itself; the server
+  // downloads, sniffs and size-checks it before the stream opens
+  const name = url.split("?")[0].split("/").pop() || "linked video";
+  state.attachments.push({ kind: "video", url, name, bytes: 0, link: true });
+  updateAttachUI(); updateComposer();
+  pill("ok", ICONS.check, " Link attached - the enclave fetches the file when you send (up to "
+    + Math.round(videoCap() / 1048576) + " MB, " + (state.video.frames || 8) + " frames)", 7000);
 }
 
 async function addFiles(files) {
@@ -3330,7 +3354,8 @@ $("menuVideo").addEventListener("click", () => { closeAttachMenu(); $("videoInpu
 $("videoInput").addEventListener("change", async () => { const f = $("videoInput").files[0]; $("videoInput").value = ""; if (f) await addVideo(f); });
 $("menuVideoLink").addEventListener("click", async () => {
   closeAttachMenu();
-  const url = window.prompt("Link to a video file (mp4, webm, mov). It is fetched by your browser, not by the server.");
+  const url = window.prompt("Link to a video file (mp4, webm, mov). Your browser fetches it first"
+    + ((state.video && state.video.remote_media) ? "; if the site refuses, the enclave downloads the file itself." : "; it is never fetched by the server."));
   if (url) await addVideoLink(url);
 });
 $("menuRecord").addEventListener("click", () => { closeAttachMenu(); openCam(true); });
@@ -4886,7 +4911,7 @@ const modelsReady = (async () => {
   if (state.image.enabled && (storedImage === "on" || storedImage === "off"))
     state.imageOn = storedImage === "on";
   state.vision = info.vision || { enabled: false, service: false, max_images: 0, max_bytes: 0 };
-  state.video = info.video || { enabled: false, max_bytes: 0, frames: 0 };
+  state.video = info.video || { enabled: false, max_bytes: 0, frames: 0, remote_media: false };
   state.tools = info.tools || { enabled: false };
   // the deployment may start the switch on; a stored choice still wins, since
   // it is the more recent statement of what this person wants
