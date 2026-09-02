@@ -3856,6 +3856,7 @@ impl<'de> Deserialize<'de> for ChatMsg {
             Some(RawContent::Parts(parts)) => {
                 let mut text = String::new();
                 for p in parts {
+                    let had_text = p.text.is_some();
                     if let Some(t) = p.text {
                         if !text.is_empty() && !t.is_empty() {
                             text.push('\n');
@@ -3884,7 +3885,7 @@ impl<'de> Deserialize<'de> for ChatMsg {
                     // the model answering "what is in this video?" from nothing -
                     // a confident description of a clip it never saw. An audio
                     // part, a file part, a misspelled image part: same rule.
-                    if p.text.is_none() && p.image_url.is_none() && p.source.is_none() && p.video_url.is_none() {
+                    if !had_text && p.image_url.is_none() && p.source.is_none() && p.video_url.is_none() {
                         return Err(serde::de::Error::custom(format!(
                             "unsupported content part{}: this app reads text, image_url/input_image/image and video_url parts",
                             p.kind.as_deref().map(|k| format!(" \"{k}\"")).unwrap_or_default()
