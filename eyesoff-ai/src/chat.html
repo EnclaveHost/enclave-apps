@@ -1304,8 +1304,9 @@
         <span id="gpuBanner">No GPU capacity right now, so this chat is answering on CPU.</span>
       </div>
       <p class="gpu-lead">eyesoff.ai runs on hardware people rent to the fleet, and every GPU
-      enclave is taken right now. A machine with a TEE-capable CPU and a confidential-computing GPU could
-      be earning instead of sitting idle.</p>
+      enclave is taken right now. A machine with a TEE-capable CPU and a GPU could be earning instead
+      of sitting idle. Consumer cards count: a gaming GPU serves masked inference, where the card only
+      ever sees masked activations and never the conversation.</p>
       <div class="gpu-cta">
         <h3>What your box would earn</h3>
         <ul class="gpu-list">
@@ -4474,7 +4475,8 @@ attOverlay.addEventListener("click", (e) => { if (e.target === attOverlay) close
 // the deployment lands on CPU-only hardware and /models reports gpu:false.
 // Say that out loud ONCE per page load rather than letting users infer it from
 // slow replies and a picker full of disabled models - and use the moment to
-// ask for the thing that actually fixes it: more TEE GPUs in the fleet.
+// ask for the thing that actually fixes it: more GPUs in the fleet, consumer
+// cards included (they serve masked inference, so they need no TEE of their own).
 // gpu:null (local dev, a manager that predates the field) says nothing at all.
 // After dismissal the header chip stays for as long as the deployment is
 // CPU-only and reopens the dialog.
