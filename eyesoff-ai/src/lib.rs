@@ -1186,6 +1186,49 @@ impl Session {
     }
 }
 
+impl Session {
+    /// mm33: hand ONE video file to the host, which samples up to `frames`
+    /// frames through the projector and splices them in at the current
+    /// position. Returns the positions consumed, like feed_image.
+    fn feed_video(&mut self, bytes: &[u8], frames: usize) -> Result<usize, String> {
+        let Session::Ggml { ctx } = self else {
+            return Err("video needs the ggml backend".into());
+        };
+        let frames = (frames.max(1).min(64)) as i32;
+        let outs = ctx
+            .compute(vec![
+                ("video".to_string(), Tensor::new(&[bytes.len() as u32], TensorType::U8, bytes)),
+                ("video_max_frames".to_string(),
+                 Tensor::new(&[1], TensorType::I32, &frames.to_le_bytes())),
+            ])
+            .map_err(|e| {
+                let e = nn_err("video", e);
+                const KNOWN: &[&str] = &[
+                    "[video_undecodable]", "[video_unavailable]", "[video_too_large]",
+                    "[image_too_wide]", "[vision_unavailable]", "[kv_pool_full]",
+                ];
+                if KNOWN.iter().any(|m| e.contains(m)) {
+                    e
+                } else {
+                    format!(
+                        "[video_unsupported] this deployment's node cannot read video: its \
+                         engine predates the video verb, so the model never saw the clip \
+                         (host said: {e})"
+                    )
+                }
+            })?;
+        let pos = outs
+            .iter()
+            .find(|(n, _)| n == "video_pos")
+            .ok_or("host returned no video_pos")?;
+        let d = pos.1.data();
+        if d.len() < 4 {
+            return Err("host returned a malformed video_pos".into());
+        }
+        Ok(i32::from_le_bytes([d[0], d[1], d[2], d[3]]).max(0) as usize)
+    }
+}
+
 /// candidates per row the host keeps when asked to reduce logits (the
 /// "topk" verb); 256 comfortably covers the sampler's top_k <= 256 bound
 const HOST_TOPK: i32 = 256;
@@ -2746,6 +2789,15 @@ fn generate(
                 }
                 image_pos += sess.feed_image(bytes)?;
             }
+            PromptPart::Video(bytes) => {
+                if !status(&format!(
+                    "reading the video ({} KB) - up to {} frames through the vision encoder on the same share as the model",
+                    bytes.len() / 1024, cfg.video_frames
+                )) {
+                    return Err("client disconnected".into());
+                }
+                image_pos += sess.feed_video(bytes, cfg.video_frames)?;
+            }
         }
     }
     if logits.vals.is_empty() {
@@ -3685,6 +3737,10 @@ struct ChatMsg {
     /// which is how every VLM chat template puts them: picture first, then
     /// the question about it.
     images: Vec<Vec<u8>>,
+    /// mm33: video attachments on this turn (file bytes). Rendered ahead of
+    /// the turn's images, each as one media mark, and handed to the host's
+    /// "video" verb, which samples frames through the same projector.
+    videos: Vec<Vec<u8>>,
     /// OpenAI tool history (the /v1 passthrough): calls an assistant turn
     /// carried, as (id, name, arguments). Held here until fold_tool_history
     /// renders them into the trained text form - build_prompt itself never
@@ -3724,6 +3780,10 @@ struct ContentPart {
     image_url: Option<ImageRef>,
     #[serde(default)]
     source: Option<ImageSource>,
+    /// mm33: {"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}
+    /// (and the bare-string spelling), data: URIs only, like images
+    #[serde(default)]
+    video_url: Option<ImageRef>,
 }
 
 #[derive(Deserialize)]
@@ -3807,6 +3867,14 @@ impl<'de> Deserialize<'de> for ChatMsg {
                     if let Some(src) = src {
                         msg.images.push(decode_image_src(&src).map_err(serde::de::Error::custom)?);
                     }
+                    let vsrc = match &p.video_url {
+                        Some(ImageRef::Url(u)) => Some(u.clone()),
+                        Some(ImageRef::Obj { url }) => Some(url.clone()),
+                        None => None,
+                    };
+                    if let Some(vsrc) = vsrc {
+                        msg.videos.push(decode_video_src(&vsrc).map_err(serde::de::Error::custom)?);
+                    }
                 }
                 msg.content = text;
             }
@@ -3854,6 +3922,51 @@ fn decode_image_src(src: &str) -> Result<Vec<u8>, String> {
             "attachment is not a recognisable image (png, jpeg, webp, gif or bmp)".into(),
         ),
     }
+}
+
+/// mm33: one `video_url` into file bytes. Same rules as images: data: URIs
+/// (base64) only, never a fetch; sniffed by container magic so a mislabelled
+/// upload fails here with a sentence instead of inside ffprobe.
+fn decode_video_src(src: &str) -> Result<Vec<u8>, String> {
+    let s = src.trim();
+    let b64 = if let Some(rest) = s.strip_prefix("data:") {
+        let (meta, payload) = rest
+            .split_once(',')
+            .ok_or("malformed data: URI (no comma before the payload)")?;
+        if !meta.contains("base64") {
+            return Err("only base64 data: URIs are supported for videos".into());
+        }
+        payload
+    } else if s.starts_with("http://") || s.starts_with("https://") {
+        return Err("video_url must be a data: URI; this app never fetches remote URLs".into());
+    } else {
+        s
+    };
+    let bytes = b64_decode(b64)?;
+    match video_kind(&bytes) {
+        Some(_) => Ok(bytes),
+        None => Err("attachment is not a recognisable video (mp4, mov, webm, mkv or avi)".into()),
+    }
+}
+
+/// The video container, by magic bytes: ISO BMFF (mp4/mov/m4v) carries
+/// "ftyp" at offset 4, Matroska/WebM starts with the EBML header, AVI is a
+/// RIFF form. ffprobe decides what it can actually decode; this only keeps
+/// obvious non-videos out of the encoder's way.
+fn video_kind(b: &[u8]) -> Option<&'static str> {
+    if b.len() < 12 {
+        return None;
+    }
+    if &b[4..8] == b"ftyp" {
+        return Some("mp4");
+    }
+    if b.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("webm");
+    }
+    if b.starts_with(b"RIFF") && &b[8..12] == b"AVI " {
+        return Some("avi");
+    }
+    None
 }
 
 /// The image format, by magic bytes. Sniffing here rather than trusting the
@@ -6273,6 +6386,15 @@ enum PromptPart {
     Text(Vec<u32>),
     /// raw image file bytes, handed to the host's "image" verb verbatim
     Image(Vec<u8>),
+    /// mm33: raw video file bytes, handed to the host's "video" verb, which
+    /// samples frames through the projector
+    Video(Vec<u8>),
+}
+
+/// mm33: one attachment in the order it is rendered into the turn
+enum Media {
+    Image(Vec<u8>),
+    Video(Vec<u8>),
 }
 
 /// A prompt ready to feed: its parts in order, plus the flat token stream for
@@ -6390,7 +6512,20 @@ fn build_prompt(
     // claim an image slot.
     let mut msgs: Vec<(String, String)> = Vec::new();
     let mut turn_images: Vec<&[Vec<u8>]> = Vec::new();
+    let mut turn_videos: Vec<&[Vec<u8>]> = Vec::new();
     for m in messages.iter().filter(|m| m.role == "user" || m.role == "assistant") {
+        // mm33: video is opt-in per model (it is priced per frame)
+        if !m.videos.is_empty() && !cfg.video {
+            return Err("this deployment does not accept video attachments".into());
+        }
+        for v in &m.videos {
+            if v.len() > cfg.max_video_bytes {
+                return Err(format!(
+                    "video attachment is {} MB; this deployment accepts up to {} MB",
+                    v.len() >> 20, cfg.max_video_bytes >> 20
+                ));
+            }
+        }
         let content = if cfg.thinking && m.role == "assistant" {
             strip_think(&m.content)
         } else {
@@ -6401,16 +6536,19 @@ fn build_prompt(
         // turn still gets a sentence: a bare image with no instruction is
         // out of distribution for chat-tuned VLMs, and "describe it" is
         // what a user who typed nothing meant.
-        if !m.images.is_empty() {
-            let marks = config::MEDIA_MARK.repeat(m.images.len());
+        if !m.images.is_empty() || !m.videos.is_empty() {
+            // videos lead, then pictures, then the words about them
+            let marks = config::MEDIA_MARK.repeat(m.videos.len() + m.images.len());
             content = if content.trim().is_empty() {
-                format!("{marks}\nDescribe this image in detail.")
+                let what = if m.videos.is_empty() { "image" } else { "video" };
+                format!("{marks}\nDescribe this {what} in detail.")
             } else {
                 format!("{marks}\n{content}")
             };
         }
         msgs.push((m.role.clone(), content));
         turn_images.push(&m.images);
+        turn_videos.push(&m.videos);
     }
     if msgs.is_empty() {
         return Err("no user/assistant messages".into());
@@ -6428,7 +6566,10 @@ fn build_prompt(
         // fits: a trim round that is about to be thrown away has no business
         // copying several megabytes to find that out.
         let images: usize = turn_images.iter().map(|im| im.len()).sum();
-        let total = tokens_of(tok, &rendered.prompt)? + images * cfg.image_tokens;
+        let videos: usize = turn_videos.iter().map(|v| v.len()).sum();
+        let total = tokens_of(tok, &rendered.prompt)?
+            + images * cfg.image_tokens
+            + videos * cfg.video_frames * cfg.image_tokens;
         if total <= cfg.max_prompt_tokens || msgs.len() <= 1 {
             if total > cfg.max_prompt_tokens {
                 return Err(format!(
@@ -6442,9 +6583,12 @@ fn build_prompt(
                     }
                 ));
             }
-            let bytes: Vec<Vec<u8>> =
-                turn_images.iter().flat_map(|im| im.iter().cloned()).collect();
-            let prompt = split_rendered(tok, &rendered.prompt, bytes)?;
+            // media in render order: each turn's videos, then its images
+            let media: Vec<Media> = turn_videos.iter().zip(turn_images.iter())
+                .flat_map(|(vs, ims)| vs.iter().cloned().map(Media::Video)
+                    .chain(ims.iter().cloned().map(Media::Image)))
+                .collect();
+            let prompt = split_rendered(tok, &rendered.prompt, media)?;
             let mut stops = rendered.stop_strings;
             // A completed call is the end of the turn: stopping here saves the
             // model from narrating past its own call, and the parser accepts
@@ -6456,6 +6600,7 @@ fn build_prompt(
         }
         msgs.remove(0); // drop the oldest turn and retry
         turn_images.remove(0); // ...and the pictures that were part of it
+        turn_videos.remove(0);
     }
 }
 
@@ -6473,19 +6618,19 @@ fn tokens_of(tok: &Tok, rendered: &str) -> Result<usize, String> {
 fn split_rendered(
     tok: &Tok,
     rendered: &str,
-    images: Vec<Vec<u8>>,
+    media: Vec<Media>,
 ) -> Result<Prompt, String> {
     let chunks: Vec<&str> = rendered.split(config::MEDIA_MARK).collect();
-    if chunks.len() - 1 != images.len() {
+    if chunks.len() - 1 != media.len() {
         return Err(format!(
-            "prompt has {} image slots but {} images",
+            "prompt has {} media slots but {} attachments",
             chunks.len() - 1,
-            images.len()
+            media.len()
         ));
     }
-    let mut parts = Vec::with_capacity(chunks.len() + images.len());
+    let mut parts = Vec::with_capacity(chunks.len() + media.len());
     let mut text_ids = Vec::new();
-    let mut imgs = images.into_iter();
+    let mut imgs = media.into_iter();
     for (i, chunk) in chunks.iter().enumerate() {
         if !chunk.is_empty() {
             let ids = tok.encode_ids(*chunk, i == 0)?;
@@ -6494,11 +6639,16 @@ fn split_rendered(
                 parts.push(PromptPart::Text(ids));
             }
         }
-        if let Some(img) = imgs.next() {
-            parts.push(PromptPart::Image(img));
+        if let Some(m) = imgs.next() {
+            parts.push(match m {
+                Media::Image(b) => PromptPart::Image(b),
+                Media::Video(b) => PromptPart::Video(b),
+            });
         }
     }
-    let images = parts.iter().filter(|p| matches!(p, PromptPart::Image(_))).count();
+    // `images` is the MEDIA count: every path that asks text_only() cares
+    // whether anything non-text sits in the prompt, not which kind
+    let images = parts.iter().filter(|p| matches!(p, PromptPart::Image(_) | PromptPart::Video(_))).count();
     Ok(Prompt { parts, text_ids, images })
 }
 
@@ -8125,6 +8275,8 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 // model visibly takes the capability away instead of failing
                 // a turn the user has already typed.
                 "vision": e.cfg.vision && e.cfg.backend == "ggml",
+                // mm33: video rides the same projector; opt-in per entry
+                "video": e.cfg.video && e.cfg.vision && e.cfg.backend == "ggml",
             });
             if let Some(why) = unfit.get(&e.volume) {
                 m["why"] = serde_json::json!(why);
@@ -10106,7 +10258,7 @@ mod tests {
     fn rendered_prompt_splits_around_its_images() {
         let tok = test_tokenizer();
         let rendered = format!("before {} after", config::MEDIA_MARK);
-        let p = split_rendered(&tok, &rendered, vec![png_bytes()]).unwrap();
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect()).unwrap();
         assert_eq!(p.images, 1);
         assert_eq!(p.parts.len(), 3);
         assert!(matches!(p.parts[0], PromptPart::Text(_)));
@@ -10123,15 +10275,49 @@ mod tests {
         assert!(plain.text_only().is_some());
         assert!(p.text_only().is_none());
         // slot/image count mismatches are caught rather than silently misaligned
-        assert!(split_rendered(&tok, &rendered, vec![]).is_err());
-        assert!(split_rendered(&tok, "no slot", vec![png_bytes()]).is_err());
+        assert!(split_rendered(&tok, &rendered, vec![].into_iter().map(Media::Image).collect()).is_err());
+        assert!(split_rendered(&tok, "no slot", vec![Media::Image(png_bytes())]).is_err());
+    }
+
+    #[test]
+    fn video_parts_parse_and_gate() {
+        // container sniffing: ISO BMFF, Matroska/WebM, AVI - and nothing else
+        let mut mp4 = vec![0, 0, 0, 0x18]; mp4.extend_from_slice(b"ftypisom"); mp4.extend_from_slice(&[0; 8]);
+        assert_eq!(video_kind(&mp4), Some("mp4"));
+        let mut webm = vec![0x1a, 0x45, 0xdf, 0xa3]; webm.extend_from_slice(&[0; 12]);
+        assert_eq!(video_kind(&webm), Some("webm"));
+        let mut avi = b"RIFF\0\0\0\0AVI LIST".to_vec(); avi.extend_from_slice(&[0; 4]);
+        assert_eq!(video_kind(&avi), Some("avi"));
+        assert_eq!(video_kind(&png_bytes()), None, "a png is not a video");
+        // the OpenAI-style part lands in ChatMsg.videos, not images
+        let b64 = b64(&mp4);
+        let raw = format!(
+            r#"{{"role":"user","content":[{{"type":"text","text":"what happens?"}},{{"type":"video_url","video_url":{{"url":"data:video/mp4;base64,{b64}"}}}}]}}"#
+        );
+        let msg: ChatMsg = serde_json::from_str(&raw).unwrap();
+        assert_eq!(msg.videos.len(), 1);
+        assert!(msg.images.is_empty());
+        assert_eq!(msg.content, "what happens?");
+        // a video renders one media mark ahead of the text, and a deployment
+        // that did not opt in refuses it instead of silently dropping it
+        let tok = test_tokenizer();
+        let mut cfg = test_config();
+        cfg.video = false;
+        let err = build_prompt(&cfg, &tok, &[msg.clone()], false, Capabilities::Internal).err().expect("refused");
+        assert!(err.contains("does not accept video"), "{err}");
+        cfg.video = true; cfg.vision = true;
+        cfg.video_frames = 2; // the test config's 3072-token window cannot hold 8 frames at 1024 each
+        let (p, _, _) = build_prompt(&cfg, &tok, &[msg], false, Capabilities::Internal).unwrap();
+        assert!(p.parts.iter().any(|x| matches!(x, PromptPart::Video(_))));
+        assert_eq!(p.images, 1, "a video counts as media for the text_only() fallback");
+        assert!(p.text_only().is_none());
     }
 
     #[test]
     fn an_image_at_the_end_leaves_no_dangling_slot() {
         let tok = test_tokenizer();
         let rendered = format!("caption this {}", config::MEDIA_MARK);
-        let p = split_rendered(&tok, &rendered, vec![png_bytes()]).unwrap();
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect()).unwrap();
         // trailing empty chunk contributes no part
         assert_eq!(p.parts.len(), 2);
         assert!(matches!(p.parts[1], PromptPart::Image(_)));

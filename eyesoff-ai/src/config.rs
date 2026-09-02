@@ -312,6 +312,19 @@ pub struct AppConfig {
     /// costs image_tokens of the window and a vision-encoder pass, so a long
     /// chat that replays ten pictures is a very different request from the one
     /// the user thinks they are sending.
+    /// mm33: this model's volume can also take VIDEO (the host samples frames
+    /// through its projector). Off unless the catalog entry says so: a video
+    /// costs video_frames encoder passes and video_frames * image_tokens of
+    /// the window, which is a deployment-sized decision, not a default.
+    #[serde(default)]
+    pub video: bool,
+    /// frames the host may sample from ONE video (clamped by the node's own
+    /// ENCLAVE_GGML_VIDEO_MAX_FRAMES); what a video is budgeted at is
+    /// video_frames * image_tokens
+    #[serde(default = "default_video_frames")]
+    pub video_frames: usize,
+    #[serde(default = "default_max_video_bytes")]
+    pub max_video_bytes: usize,
     #[serde(default = "default_max_images")]
     pub max_images: usize,
 }
@@ -414,6 +427,12 @@ fn default_max_image_bytes() -> usize {
     6 * 1024 * 1024
 }
 
+fn default_video_frames() -> usize {
+    8
+}
+fn default_max_video_bytes() -> usize {
+    32 * 1024 * 1024
+}
 fn default_max_images() -> usize {
     4
 }
