@@ -158,6 +158,16 @@ done
 [ "$(req PUT "/api/notes/$(printf 'x%.0s' $(seq 1 201))" "${auth[@]}" -d 'x')" = 400 ] || fail "201-byte name must 400"
 pass "name filter"
 
+# eyesoff-ai's tool registry percent-encodes a URL placeholder WHOLE, so a
+# name like projects/enclave.md arrives as projects%2Fenclave.md; the app
+# must decode it to the same key the slash form names
+[ "$(req PUT /api/notes/projects%2Fencoded.md "${auth[@]}" -H 'content-type: application/json' -d '{"content":"via %2F"}')" = 200 ] || fail "write with %2F name"
+[ "$(req GET '/api/notes/projects/encoded.md?raw=1' "${auth[@]}")" = 200 ] && [ "$(cat $WORK/body)" = "via %2F" ] || fail "%2F and / must name the same note"
+[ "$(req POST /api/notes/projects%2Fencoded.md/append "${auth[@]}" -H 'content-type: application/json' -d '{"content":"more"}')" = 200 ] || fail "append with %2F name"
+[ "$(req DELETE /api/notes/projects%2Fencoded.md "${auth[@]}")" = 200 ] && [ "$(req GET /api/notes/projects/encoded.md "${auth[@]}")" = 404 ] || fail "delete with %2F name"
+[ "$(req GET '/api/notes?prefix=projects%2F' "${auth[@]}")" = 200 ] && [ "$(jq_ 'len(d["notes"])')" = 1 ] || fail "list prefix with %2F"
+pass "percent-encoded slashes in names (the eyesoff-ai tool path)"
+
 python3 -c 'import json; json.dump({"content":"x"*(1024*1024+1)}, open("'$WORK'/big.json","w"))'
 [ "$(req PUT /api/notes/big.md "${auth[@]}" -H 'content-type: application/json' --data-binary @"$WORK/big.json")" = 413 ] || fail "1 MiB + 1 must 413"
 pass "size cap"
