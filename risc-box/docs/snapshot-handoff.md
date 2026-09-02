@@ -77,6 +77,35 @@ If the config override path is preferred over a version config edit,
 `enclave config set e64f7cba` with the two keys works the same way — the app
 reads them from `ENCLAVE_CONFIG` at process start.
 
+## Instances (2026-09-02): many machines in one process
+
+Beyond resuming one machine, the app now hosts N of them, forked from a root
+snapshot — the "each chat gets its own VM from a root image" shape.
+
+- `emu/src/memory.rs`: guest RAM is 64 KiB chunks in three states (untouched
+  = reads zero and costs nothing; Shared = an `Arc` from an image, copied on
+  first write; Owned). Flat read/write pointer tables keep the hot path at
+  one pointer load + one unaligned load (measured ~3% slower than the old
+  contiguous Vec on the CPU-bound boot phase). `RamImage` is the shareable
+  page set a snapshot inflates to; `Memory::adopt` is O(chunks) refcount bumps.
+- `emu/src/device/virtio_block_disk.rs`: the disk is a shared `Arc<Vec<u8>>`
+  base plus a per-machine overlay of written 4 KiB blocks (the overlay IS the
+  snapshot delta).
+- `Emulator::load_image` (inflate once), `restore_image` (fork), `image()`
+  (publish a LIVE machine as a fork root in milliseconds, no bucket),
+  `setup_filesystem_shared`, `footprint()`.
+- app: `Machine` struct + `App.machines` (index 0 = `main`), `/i/<id>/…`
+  routes, `GET|POST /instances`, `DELETE /i/<id>`, config `instances.{max,
+  maxBytes}`, round-robin scheduler (busy machines split TICK_BATCH, floor
+  MIN_BATCH; parked ones take IDLE_BATCH), per-instance console topics
+  `console:<id>`, per-instance NetStack (outbound only), the restoreExec hook
+  on every fork. Streams/GameStream/forwards/`/save` stay on `main`.
+- Snapshot identity no longer includes `ram:` (an instance's RAM size is the
+  image's; the emulator checks it) — the `alpine/desktop.snap` object was
+  re-taken with the new identity string.
+
+Measured: INSTANCES-NUMBERS-TBD
+
 ## Caveats
 
 - A resumed guest's wall clock and random pool are the snapshot's; the
@@ -92,6 +121,15 @@ reads them from `ENCLAVE_CONFIG` at process start.
   only changed blocks, which keeps it small. A self-contained snapshot
   (full disk inside) would trade that for a larger object.
 - `readOnly: true` disables `/snapshot` as it disables `/save`.
+- Fixed on the way (2026-09-02): the UART receive interrupt was
+  EDGE-triggered (upstream), and the PLIC pending bit is cleared by the
+  guest's claim-complete while the CPU's SEIP is cleared on delivery — so a
+  byte landing between the serial ISR's last LSR read and its completion was
+  never signalled again: it sat in RBR, blocked every byte behind it, and a
+  guest parked in WFI slept forever. It hit whenever a pasted line's cadence
+  aligned with the ISR (2 of 6 native timings; every app resume that ran the
+  restoreExec hook). The line is level-triggered now, like the virtio ones
+  (`uart.rs` tick, `plic.rs` tick).
 - Fixed on the way: `/exec` answered by connection INDEX while its own
   console pumping flushed the server, and a flush that reaped any earlier
   connection compacted the list under it — the response was dropped as

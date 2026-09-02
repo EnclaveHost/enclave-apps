@@ -89,6 +89,10 @@ fn main() {
     let mut snapshot_on: Option<(String, String)> = None;
     let mut restore_from: Option<String> = None;
     let mut snap_level: u8 = 2;
+    let mut identity_override: Option<String> = None;
+    // --idle-batch N: mimic the app's loop, which steps a WFI-parked guest
+    // in small batches (and sleeps) instead of full ones.
+    let mut idle_batch: u64 = 0;
     let mut realtime = false;
     let mut fb_size: Option<(u32, u32)> = None;
     // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
@@ -160,6 +164,16 @@ fn main() {
             "--snap-level" => {
                 i += 1;
                 snap_level = args[i].parse().expect("--snap-level 1..9");
+            }
+            "--idle-batch" => {
+                i += 1;
+                idle_batch = args[i].replace('_', "").parse().expect("--idle-batch N");
+            }
+            "--identity" => {
+                // STR -- the identity string to write into / expect from a
+                // snapshot, so the app's snapshots can be exercised here.
+                i += 1;
+                identity_override = Some(args[i].clone());
             }
             "--tier2" => {
                 // enable the coverage-mode region dispatcher; optional
@@ -310,7 +324,8 @@ fn main() {
         emu.set_framebuffer_size(w, h);
     }
     emu.set_wall_clock(realtime);
-    let identity = format!("boot-bench kernel={} fs={}", kernel.len(), fs.len());
+    let identity = identity_override
+        .unwrap_or_else(|| format!("boot-bench kernel={} fs={}", kernel.len(), fs.len()));
     match restore_from.as_ref() {
         Some(path) => {
             let data = read_exact_file(path);
@@ -479,6 +494,13 @@ fn main() {
             _ => {
                 // batched entry point: same instruction count, loop overhead
                 // amortized inside the emulator (mirrors the app's loop)
+                if idle_batch > 0 && emu.get_cpu().is_idle() {
+                    emu.run_n(idle_batch);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    done += idle_batch;
+                    window_insns += idle_batch;
+                    continue;
+                }
                 emu.run_n(BATCH);
                 // A WFI-parked guest consumes its batch without executing, so
                 // an idle guest would otherwise burn the whole --insns budget

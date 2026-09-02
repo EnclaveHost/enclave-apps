@@ -29,6 +29,7 @@
 
 use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::decompress_slice_iter_to_slice;
+use memory::{Memory, RamImage};
 
 pub const FORMAT: u32 = 1;
 const MAGIC: &[u8; 8] = b"RBXSNAP\0";
@@ -251,6 +252,19 @@ pub fn sections(data: &[u8]) -> Result<Vec<([u8; 4], &[u8])>, String> {
 	Ok(out)
 }
 
+/// Split a bare section stream (no container header) into owned pairs.
+pub fn sections_unframed(data: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+	let mut r = De::new(data);
+	let mut out = Vec::new();
+	while r.remaining() >= 12 {
+		let t = r.take(4).expect("tag");
+		let tag = [t[0], t[1], t[2], t[3]];
+		let len = r.u64().expect("len") as usize;
+		out.push((tag, r.take(len).expect("payload").to_vec()));
+	}
+	out
+}
+
 // ---- chunked deflate --------------------------------------------------------
 
 /// Accumulates raw bytes and writes them as `[u32 raw_len][bytes deflated]`
@@ -402,12 +416,15 @@ pub struct RamStats {
 /// A page of guest DRAM that has never been touched (or has been freed and
 /// zeroed) is all zero, and on a booted machine that is most of them: the
 /// bitmap names the pages that are not, and only those go through deflate.
-pub fn encode_ram(ram: &[u8], level: u8, out: &mut Ser) -> RamStats {
-	let pages = (ram.len() + PAGE - 1) / PAGE;
+/// A chunk the machine never wrote is skipped without even being looked at.
+pub fn encode_ram(ram: &Memory, level: u8, out: &mut Ser) -> RamStats {
+	let len = ram.len();
+	let pages = (len + PAGE - 1) / PAGE;
 	let mut bitmap = vec![0u8; (pages + 7) / 8];
 	let mut kept = 0u64;
 	let mut w = ChunkWriter::new(level);
-	for (i, page) in ram.chunks(PAGE).enumerate() {
+	for i in 0..pages {
+		let Some(page) = ram.page(i) else { continue };
 		if page.iter().all(|&b| b == 0) {
 			continue;
 		}
@@ -415,45 +432,67 @@ pub fn encode_ram(ram: &[u8], level: u8, out: &mut Ser) -> RamStats {
 		kept += 1;
 		w.push(page);
 	}
-	out.u64(ram.len() as u64);
+	out.u64(len as u64);
 	out.u32(PAGE as u32);
 	out.bytes(&bitmap);
 	w.finish(out);
-	RamStats { bytes: ram.len() as u64, pages_kept: kept, pages_total: pages as u64 }
+	RamStats { bytes: len as u64, pages_kept: kept, pages_total: pages as u64 }
 }
 
-/// The inverse: `ram` must already be the right size and is zeroed by the
-/// caller (a fresh allocation is); only the pages the bitmap names are
-/// written.
-pub fn decode_ram(payload: &[u8], ram: &mut [u8]) -> Result<RamStats, String> {
+/// The parser both decoders share: hands every kept page to `sink`.
+fn decode_ram_with(payload: &[u8], mut sink: impl FnMut(usize, &[u8])) -> Result<RamStats, String> {
 	let mut de = De::new(payload);
-	let len = de.u64()?;
-	if len != ram.len() as u64 {
-		return Err(format!(
-			"snapshot: guest RAM is {} bytes but the machine was allocated {}",
-			len, ram.len()
-		));
-	}
+	let len = de.u64()? as usize;
 	let page = de.u32()? as usize;
 	if page != PAGE {
 		return Err(format!("snapshot: RAM page size {} unsupported", page));
 	}
-	let pages = (ram.len() + PAGE - 1) / PAGE;
+	let pages = (len + PAGE - 1) / PAGE;
 	let bitmap = de.bytes()?;
 	if bitmap.len() != (pages + 7) / 8 {
 		return Err("snapshot: RAM bitmap length does not match RAM size".into());
 	}
 	let mut r = ChunkReader::new(de)?;
 	let mut kept = 0u64;
-	for (i, page) in ram.chunks_mut(PAGE).enumerate() {
+	let mut buf = vec![0u8; PAGE];
+	for i in 0..pages {
 		if bitmap[i >> 3] & (1 << (i & 7)) == 0 {
 			continue;
 		}
-		r.read_exact(page)?;
+		r.read_exact(&mut buf)?;
+		sink(i, &buf);
 		kept += 1;
 	}
 	r.finish("RAM")?;
-	Ok(RamStats { bytes: len, pages_kept: kept, pages_total: pages as u64 })
+	Ok(RamStats { bytes: len as u64, pages_kept: kept, pages_total: pages as u64 })
+}
+
+/// The RAM's declared size, without inflating anything.
+pub fn ram_len(payload: &[u8]) -> Result<u64, String> {
+	De::new(payload).u64()
+}
+
+/// Inflate into a live machine's memory, which must already be the right
+/// size (a fresh `init` is all zero; only the pages the bitmap names are
+/// written).
+pub fn decode_ram_into(payload: &[u8], ram: &mut Memory) -> Result<RamStats, String> {
+	let len = ram_len(payload)?;
+	if len != ram.len() as u64 {
+		return Err(format!(
+			"snapshot: guest RAM is {} bytes but the machine was allocated {}",
+			len, ram.len()
+		));
+	}
+	decode_ram_with(payload, |i, page| ram.write_page(i, page))
+}
+
+/// Inflate into a shareable image: what any number of machines can then
+/// adopt (copy-on-write) without inflating again.
+pub fn decode_ram_image(payload: &[u8]) -> Result<(RamImage, RamStats), String> {
+	let len = ram_len(payload)? as usize;
+	let mut image = RamImage::new(len);
+	let stats = decode_ram_with(payload, |i, page| image.write_page(i, page))?;
+	Ok((image, stats))
 }
 
 // ---- disk delta -------------------------------------------------------------
@@ -581,20 +620,40 @@ mod tests {
 	#[test]
 	fn ram_round_trip_is_sparse() {
 		for n in [3 * PAGE, 7 * PAGE + 100, 3 * CHUNK + 5 * PAGE] {
-			let ram = diskish(n, 0x1234_5678_9abc_def1);
+			let data = diskish(n, 0x1234_5678_9abc_def1);
+			let mut ram = Memory::new();
+			ram.init(n as u64);
+			for (i, p) in data.chunks(PAGE).enumerate() {
+				if p.iter().any(|&b| b != 0) {
+					ram.write_page(i, p);
+				}
+			}
 			let mut s = Ser::new();
 			let st = encode_ram(&ram, 1, &mut s);
 			assert!(st.pages_kept < st.pages_total, "zero pages must be elided at n={}", n);
 			if n >= 7 * PAGE {
-				assert!(s.buf.len() < ram.len() / 2, "sparse RAM must compress at n={}", n);
+				assert!(s.buf.len() < n / 2, "sparse RAM must compress at n={}", n);
 			}
-			let mut back = vec![0u8; n];
-			let st2 = decode_ram(&s.buf, &mut back).unwrap();
+			// into a live machine
+			let mut back = Memory::new();
+			back.init(n as u64);
+			let st2 = decode_ram_into(&s.buf, &mut back).unwrap();
 			assert_eq!(st2.pages_kept, st.pages_kept);
-			assert_eq!(back, ram, "round trip at n={}", n);
+			let mut out = vec![0u8; n];
+			back.read_range(0, &mut out);
+			assert_eq!(out, data, "round trip at n={}", n);
+			// into an image, adopted by a fork
+			let (image, st3) = decode_ram_image(&s.buf).unwrap();
+			assert_eq!(st3.pages_kept, st.pages_kept);
+			let mut fork = Memory::new();
+			fork.init(n as u64);
+			fork.adopt(&image);
+			fork.read_range(0, &mut out);
+			assert_eq!(out, data, "image round trip at n={}", n);
 			// a machine allocated a different size must refuse
-			let mut wrong = vec![0u8; n + PAGE];
-			assert!(decode_ram(&s.buf, &mut wrong).is_err());
+			let mut wrong = Memory::new();
+			wrong.init((n + PAGE) as u64);
+			assert!(decode_ram_into(&s.buf, &mut wrong).is_err());
 		}
 	}
 

@@ -1,5 +1,5 @@
-//! risc-box — run a real machine on the enclave's CPU, booted from OS images in
-//! an S3 bucket, with its serial console bridged to your browser.
+//! risc-box — run real machines on the enclave's CPU, booted from OS images
+//! in an S3 bucket, with their serial consoles bridged to your browser.
 //!
 //! Unlike golem (which ships QEMU-wasm to the browser and emulates in the
 //! tab), risc-box emulates a full RISC-V machine **inside the enclave** — the
@@ -14,9 +14,20 @@
 //! saved back to the bucket with a single PUT.
 //!
 //! This is a run-mode SERVICE app: `wasmtime run` + wasi:sockets, one live
-//! process holding the machine in RAM, HTTP served on the loopback `http:`
+//! process holding the machines in RAM, HTTP served on the loopback `http:`
 //! port the enclave's TLS proxy forwards to (see network-test / the suite's
 //! httpd.rs). The single thread interleaves CPU batches with HTTP polling.
+//!
+//! One process, many machines. The `main` machine is the one the config
+//! describes (its images, its RAM, its port forwards, its streams). Beside it
+//! the app hosts INSTANCES: machines forked from a snapshot — the config's
+//! root snapshot, any snapshot object, or the live `main` machine itself —
+//! each with its own RAM, disk overlay, console and network. Guest RAM is
+//! chunked and copy-on-write and the base disk is shared, so N instances of
+//! one booted image cost one image plus what each has written since; that is
+//! what fits a room full of 512 MiB guests into one 4 GiB wasm32 process.
+//! A round-robin scheduler shares the core between whichever machines are
+//! not parked in WFI. Instances are addressed as `/i/<id>/<route>`.
 //!
 //! The guest also gets a virtio-net NIC terminated in user space by src/net.rs
 //! (smoltcp): a DHCP server leases 10.0.2.15, and raw `tcp:` deployment ports
@@ -25,26 +36,33 @@
 //! NATs guest flows onto real sockets slirp-style (TCP splices, per-flow UDP,
 //! a DNS proxy at 10.0.2.2, gateway-answered ICMP echo), so `ping 8.8.8.8`
 //! and `curl` work from the guest shell; `net.outbound: false` seals it.
+//! Instances get the same NAT; the inbound forwards belong to `main`.
 //!
-//! Routes:
+//! Routes (bare = the main machine; `/i/<id>/...` = an instance):
 //!   GET  /            console UI (self-contained HTML + embedded xterm)
 //!   GET  /a/<asset>   embedded xterm.js / xterm.css
 //!   GET  /status      JSON machine state (phase, image sizes, instret, MIPS)
-//!   POST /start       {accessKeyId?,secretAccessKey?,sessionToken?,reset?}
+//!   POST /start       {accessKeyId?,secretAccessKey?,sessionToken?,reset?,snapshot?}
 //!                     fetch images from S3 (creds: body > config > unsigned)
-//!                     and boot; reset:true re-fetches instead of using cache
+//!                     and boot — or resume from the snapshot when one is
+//!                     cached; reset:true re-fetches instead of using cache;
+//!                     snapshot:false forces a cold boot. On an instance:
+//!                     re-fork from its origin.
 //!   POST /input       raw bytes → the guest UART receive register
 //!   POST /exec        {cmd,timeout_s?,max_bytes?} run a shell command on the
 //!                     guest console and return its stdout + exit code (JSON)
 //!   GET  /console     Server-Sent Events: base64 console output, scrollback first
-//!   POST /save        dump the (guest-modified) disk and PUT it to saveKey
+//!   POST /save        dump the (guest-modified) disk and PUT it to saveKey (main)
 //!   POST /snapshot    {key?,level?} serialize the RUNNING machine (CPU,
 //!                     devices, RAM, disk delta) and PUT it to the snapshot
 //!                     key; later starts resume from it instead of booting
 //!   POST /stop        halt the machine and drop it from RAM
-//!   GET  /display     Server-Sent Events: the machine's screen as deflated
-//!                     dirty bands (see display.rs) — the browser's monitor
-//!   GET  /fb.png      the current frame as one PNG snapshot
+//!   GET  /instances   the machines this process hosts
+//!   POST /instances   {from?:"main"|<snapshot key>, id?} fork a new instance
+//!   DELETE /i/<id>    stop and forget an instance
+//!   GET  /display     Server-Sent Events: the main machine's screen as
+//!                     deflated dirty bands (see display.rs)
+//!   GET  /fb.png      the current frame as one PNG snapshot (any machine)
 //!   GET  /ping        liveness
 
 mod display;
@@ -60,14 +78,15 @@ mod s3;
 mod video;
 mod worker;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use display::Display;
 use httpd::{form_get, json, Request, Response, Server};
 use net::{ForwardCfg, HostNet, NetStack};
 use riscv_emu_rust::terminal::Terminal;
-use riscv_emu_rust::Emulator;
+use riscv_emu_rust::{Emulator, SnapshotImage, SnapshotInfo};
 use s3::{Creds, Endpoint};
 use sha2::{Digest, Sha256};
 
@@ -85,6 +104,11 @@ const TICK_BATCH: u64 = 400_000; // CPU instructions per event-loop turn
 const IDLE_BATCH: u64 = 4_000; // batch while the guest is parked in WFI: keeps
                                // timers/devices ticking at ~1% of the busy rate
                                // so an idle machine stops burning the host CPU
+/// With several machines busy at once the turn's instruction budget is split
+/// between them, so a turn stays about as long as it was with one; this is
+/// the floor one machine's share may sink to, so a crowded box still makes
+/// progress on every guest each turn.
+const MIN_BATCH: u64 = 50_000;
 const SCROLLBACK: usize = 256 * 1024; // console bytes retained for late joiners
 // Full-speed turns after network activity: ~100M instructions ≈ 1.25 guest
 // seconds, enough to span a whole ping/keepalive cadence so an interactive
@@ -133,27 +157,31 @@ const INPUT_BOOST_TURNS: u64 = 32;
 const BOOST_RUN_MAX: u64 = 48;
 const BOOST_HOLD_TURNS: u64 = 48;
 
+/// The one machine that is never an instance.
+const MAIN_ID: &str = "main";
+
 // ---- config ---------------------------------------------------------------
 
-struct Config {
-    title: String,
-    endpoint: String,
-    region: String,
-    bucket: String,
+pub struct Config {
+    pub title: String,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
     kernel: String,
     fs: String,
     dtb: Option<String>,
     save_key: Option<String>,
-    config_creds: Option<Creds>,
+    pub config_creds: Option<Creds>,
     autostart: bool,
     read_only: bool,
     net_enabled: bool,
     net_outbound: bool,
     forwards: Vec<ForwardCfg>,
-    // Guest RAM in MiB (`ramMiB`). Default 512 keeps existing deployments'
-    // footprint; the alpine/firefox image wants 1792. Clamped to [128, 1920]:
-    // the emulator's RAM is one contiguous Vec and a wasm32 allocation caps at
-    // 2 GiB, and a machine under 128 MiB can't even finish X startup.
+    // Guest RAM in MiB (`ramMiB`) for the main machine. Default 512 keeps
+    // existing deployments' footprint; the alpine/firefox image wants 1792.
+    // Clamped to [128, 1920]: a wasm32 address space is 4 GiB, and a machine
+    // under 128 MiB can't even finish X startup. Instances take theirs from
+    // the snapshot they fork from.
     ram_mib: u64,
     // Display size (`display: {width, height}`), default 1024x768. Must fit the
     // DTB's 8 MiB framebuffer window; the emulator applies the same guard to
@@ -182,17 +210,26 @@ struct Config {
     // POST /snapshot writes the object (to `snapshotSaveKey`, defaulting to
     // `snapshot`) so every start after that is instant. `snapshotLevel` is
     // the deflate level the RAM image is written at (1 fast .. 9 small).
+    // The same object is the default ROOT that instances fork from.
     snapshot: Option<String>,
     snapshot_save_key: Option<String>,
     snapshot_level: u8,
-    // A shell command run on the guest console right after a restore, via the
-    // /exec machinery. A resumed guest still believes it is the moment the
-    // snapshot was taken: its wall clock is stale and its random pool is the
-    // same one every other restore of this snapshot has. `{epoch}` expands to
-    // the host's UNIX time and `{entropy}` to 64 fresh random bytes as hex,
-    // so `date -s @{epoch}; echo {entropy} > /dev/urandom` fixes both.
+    // A shell command run on the guest console right after a restore or a
+    // fork, via the /exec machinery. A resumed guest still believes it is the
+    // moment the snapshot was taken: its wall clock is stale and its random
+    // pool is the same one every other resume of this snapshot has. `{epoch}`
+    // expands to the host's UNIX time and `{entropy}` to 64 fresh random
+    // bytes as hex, so `date -s @{epoch}; echo {entropy} > /dev/urandom`
+    // fixes both.
     restore_exec: Option<String>,
     restore_exec_timeout_s: u64,
+    // `instances: {max, maxBytes}`: how many machines this process may host
+    // (main included) and the host-memory budget they may add up to. The
+    // budget is the honest limit: it counts what machines have actually
+    // touched (owned RAM chunks, disk overlay) plus the shared images and
+    // the base disk, against a wasm32 address space that ends at 4 GiB.
+    instances_max: usize,
+    instances_max_bytes: u64,
 }
 
 fn creds_from(v: &serde_json::Value) -> Option<Creds> {
@@ -268,6 +305,7 @@ fn load_config() -> Config {
             .filter(|x| !x.is_empty())
             .map(str::to_string)
     };
+    let inst = v.get("instances");
     Config {
         title: s("title").unwrap_or_else(|| "RISC Box machine".to_string()),
         endpoint: s("endpoint").unwrap_or_default(),
@@ -343,6 +381,15 @@ fn load_config() -> Config {
             .and_then(|x| x.as_u64())
             .unwrap_or(EXEC_DEFAULT_TIMEOUT_S)
             .clamp(1, EXEC_MAX_TIMEOUT_S),
+        instances_max: inst
+            .and_then(|i| i.get("max"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(8)
+            .clamp(1, 64) as usize,
+        instances_max_bytes: inst
+            .and_then(|i| i.get("maxBytes"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(3 << 30),
     }
 }
 
@@ -520,6 +567,10 @@ impl Terminal for RiscBoxTerminal {
     }
 }
 
+fn new_terminal() -> Box<RiscBoxTerminal> {
+    Box::new(RiscBoxTerminal { input: VecDeque::new(), output: VecDeque::new() })
+}
+
 // ---- app state -------------------------------------------------------------
 
 #[derive(PartialEq, Clone, Copy)]
@@ -530,15 +581,25 @@ enum Phase {
     Error,
 }
 
+fn phase_name(p: Phase) -> &'static str {
+    match p {
+        Phase::Idle => "idle",
+        Phase::Running => "running",
+        Phase::Halted => "halted",
+        Phase::Error => "error",
+    }
+}
+
 struct Images {
     kernel: Vec<u8>,
-    /// The root filesystem exactly as the bucket serves it — still gzipped
-    /// when the key says so. Keeping the fetched form rather than the expanded
-    /// one is what makes caching it affordable: this is held for the lifetime
-    /// of the app so a restart need not re-download, and beside it the running
-    /// machine already holds a full expanded copy of the same disk plus its
-    /// DRAM. Cached compressed, a 320 MiB image costs 53 MiB here instead.
-    fs_stored: Vec<u8>,
+    /// The root filesystem, expanded, shared by every machine that boots
+    /// from it (each keeps its own overlay of the blocks it writes). Held for
+    /// the lifetime of the app: a restart or a new instance needs no
+    /// download and no inflate. The compressed form is not kept — the
+    /// expanded one is what every start needs, and the pair together were
+    /// more than a second machine's worth of address space.
+    disk: Arc<Vec<u8>>,
+    fs_bytes: usize, // as fetched (gzipped when the key says so)
     fs_gzipped: bool,
     dtb: Option<Vec<u8>>,
     /// sha256 (hex) of the kernel and fs objects exactly as the bucket served
@@ -555,31 +616,21 @@ struct Images {
 impl Images {
     /// What a snapshot is bound to. The delta inside a snapshot is relative
     /// to the base disk it was taken from, and the RAM inside it embodies the
-    /// kernel, the device tree and the machine's geometry — so a restore must
+    /// kernel, the device tree and the display geometry — so a restore must
     /// present exactly these, and refuses (cold-booting instead) otherwise.
+    /// RAM size is NOT here: it is carried by the snapshot itself and
+    /// checked by the emulator, so a 512 MiB root can serve instances beside
+    /// a 1792 MiB main machine.
     fn identity(&self, cfg: &Config) -> String {
         format!(
-            "kernel:{} fs:{} dtb:{} ram:{} fb:{}x{} realtime:{}",
+            "kernel:{} fs:{} dtb:{} fb:{}x{} realtime:{}",
             self.kernel_sha256,
             self.fs_sha256,
             self.dtb.as_ref().map(|d| sha256_hex(d)).unwrap_or_else(|| "-".into()),
-            cfg.ram_mib,
             cfg.fb_w,
             cfg.fb_h,
             cfg.realtime
         )
-    }
-
-    /// The disk to hand a fresh machine. Expanded per boot rather than held
-    /// expanded, so the cost is paid only while a machine is actually running.
-    /// The raw ext2 bytes to hand the emulator. Takes the stored image by
-    /// value when it is already raw: a clone of a half-gigabyte fs is real
-    /// wasm32 linear memory, and the cache is refilled on the next start.
-    fn take_disk(&mut self) -> Result<Vec<u8>, String> {
-        match self.fs_gzipped {
-            true => gz::gunzip(&self.fs_stored),
-            false => Ok(std::mem::take(&mut self.fs_stored)),
-        }
     }
 }
 
@@ -591,23 +642,190 @@ struct Start {
     snapshot: Option<bool>,
 }
 
-struct App {
-    cfg: Config,
+/// One machine: the emulator and everything the app keeps per guest. The
+/// streams (display, video, audio, GameStream) are the MAIN machine's and
+/// live on `App`; every machine has a console, a NIC, /exec and /hid.
+struct Machine {
+    id: String,
+    /// Where it came from: "config" (booted or restored from the config's
+    /// images), "main" (forked from the live main machine) or a snapshot key.
+    origin: String,
     emu: Option<Emulator>,
-    /// The music synth. Host-side on purpose; see src/opl.rs.
-    opl: opl::Opl,
+    /// The image an instance was forked from, kept so /start can re-fork it
+    /// and so its pages stay shared for as long as the instance lives.
+    image: Option<Arc<SnapshotImage>>,
+    image_key: Option<String>,
     phase: Phase,
     error: Option<String>,
-    pending: Option<Start>,
-    cache: Option<Images>,
-    live_creds: Option<Creds>, // remembered from the last successful start, for /save
-    instret: u64,
+    ram_mib: u64,
+    created: Instant,
     boot_at: Option<Instant>,
+    instret: u64,
     // Presented frames per real second, sampled from the framebuffer's byte
-    // counter (see `sample_fps`).
+    // counter (see the fps sampling in the loop).
     fps_now: f64,
     fps_bytes: u64,
     fps_at: Instant,
+    input_boost: u64, // turns to force full tick batches after POST /input
+    /// Consecutive turns the boost has been held, and the cooldown that follows
+    /// when it has been held too long. Input arriving faster than the boost
+    /// decays would otherwise re-arm it forever; see BOOST_RUN_MAX.
+    boost_run: u64,
+    boost_hold: u64,
+    exec_seq: u64, // per-command nonce for /exec console markers
+    scrollback: VecDeque<u8>,
+    console_total: u64,
+    net: Option<NetStack>, // this machine's user-mode network
+    // How the machine came up: resumed from a snapshot (and how long the
+    // restore took, and when that snapshot was taken) or booted cold.
+    restored: bool,
+    restore_ms: f64,
+    restore_taken_unix: u64,
+    last_snapshot: Option<String>,
+    last_save: Option<String>,
+}
+
+impl Machine {
+    fn new(id: &str, origin: &str) -> Self {
+        Machine {
+            id: id.to_string(),
+            origin: origin.to_string(),
+            emu: None,
+            image: None,
+            image_key: None,
+            phase: Phase::Idle,
+            error: None,
+            ram_mib: 0,
+            created: Instant::now(),
+            boot_at: None,
+            instret: 0,
+            fps_now: 0.0,
+            fps_bytes: 0,
+            fps_at: Instant::now(),
+            input_boost: 0,
+            boost_run: 0,
+            boost_hold: 0,
+            exec_seq: 0,
+            scrollback: VecDeque::new(),
+            console_total: 0,
+            net: None,
+            restored: false,
+            restore_ms: 0.0,
+            restore_taken_unix: 0,
+            last_snapshot: None,
+            last_save: None,
+        }
+    }
+
+    fn is_main(&self) -> bool {
+        self.id == MAIN_ID
+    }
+
+    /// The SSE topic this machine's console broadcasts on.
+    fn console_topic(&self) -> String {
+        match self.is_main() {
+            true => "console".to_string(),
+            false => format!("console:{}", self.id),
+        }
+    }
+
+    /// Frames the guest has presented per real second, over the last sampling
+    /// window. A frame is `width * height * 4` bytes painted into the
+    /// framebuffer, so this counts what the machine actually put on screen,
+    /// not what it claims: the guest's own timing is only as honest as the
+    /// guest's clock, and unless `realtime` is set that clock runs at
+    /// (MIPS / 10) times speed.
+    fn fps(&self) -> f64 {
+        self.fps_now
+    }
+
+    fn mips(&self) -> f64 {
+        match self.boot_at {
+            Some(t) if self.instret > 0 => {
+                let s = t.elapsed().as_secs_f64();
+                if s > 0.0 { self.instret as f64 / 1e6 / s } else { 0.0 }
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Push bytes into the guest's serial input, and keep the CPU on full
+    /// batches long enough for the UART to drain them (it polls one byte per
+    /// ~230k instructions). The same boost /input applies to a keystroke.
+    fn push_input(&mut self, bytes: &[u8]) {
+        if let Some(emu) = self.emu.as_mut() {
+            let t = emu.get_mut_terminal();
+            for &b in bytes {
+                t.put_input(b);
+            }
+        }
+        self.input_boost = self.input_boost.max(bytes.len() as u64 + 2);
+    }
+
+    /// Host bytes this machine holds itself: owned RAM chunks and disk
+    /// overlay. Shared pages are counted once, on the image they belong to.
+    fn footprint(&self) -> usize {
+        match self.emu.as_ref() {
+            Some(e) => {
+                let f = e.footprint();
+                f.ram_owned + f.disk_overlay
+            }
+            None => 0,
+        }
+    }
+
+    /// Halt: drop the emulator (and with it the owned pages). The record,
+    /// the console scrollback and the origin stay, so /start can bring it
+    /// back and /status can say what happened.
+    fn halt(&mut self) {
+        self.emu = None;
+        self.phase = Phase::Halted;
+        self.boot_at = None;
+        self.restored = false;
+    }
+
+    fn running(&self) -> bool {
+        self.phase == Phase::Running && self.emu.is_some()
+    }
+
+    fn summary_json(&self) -> String {
+        let js = |v: &Option<String>| {
+            v.as_ref()
+                .map(|s| format!("\"{}\"", httpd::json_escape(s)))
+                .unwrap_or_else(|| "null".into())
+        };
+        format!(
+            "{{\"id\":\"{}\",\"origin\":\"{}\",\"phase\":\"{}\",\"ramMiB\":{},\"ageSecs\":{},\"upSecs\":{},\"instret\":{},\"mips\":{:.1},\"restored\":{},\"consoleBytes\":{},\"footprintBytes\":{},\"error\":{}}}",
+            httpd::json_escape(&self.id),
+            httpd::json_escape(&self.origin),
+            phase_name(self.phase),
+            self.ram_mib,
+            self.created.elapsed().as_secs(),
+            self.boot_at.map_or(0, |t| t.elapsed().as_secs()),
+            self.instret,
+            self.mips(),
+            self.restored,
+            self.console_total,
+            self.footprint(),
+            js(&self.error),
+        )
+    }
+}
+
+struct App {
+    cfg: Config,
+    /// Index 0 is always the main machine.
+    machines: Vec<Machine>,
+    /// Snapshot images machines fork from, by key ("main@<unix>" for images
+    /// taken from the live main machine, the S3 key otherwise). A bucket root
+    /// stays resident once loaded — it IS the root every new instance wants;
+    /// an image taken from main is dropped with its last instance.
+    root_images: HashMap<String, Arc<SnapshotImage>>,
+    /// The music synth. Host-side on purpose; see src/opl.rs.
+    opl: opl::Opl,
+    pending: Option<Start>,
+    cache: Option<Images>,
+    live_creds: Option<Creds>, // remembered from the last successful start, for /save
     // Frames actually put on the wire for watchers (a scan that found any
     // change), and the rate derived from it. The guest's rate and this one are
     // different questions: the machine can draw faster than the scan is paced
@@ -622,12 +840,6 @@ struct App {
     video_frames: u64,
     video_fps: f64,
     video_mark: u64,
-    input_boost: u64, // turns to force full tick batches after POST /input
-    /// Consecutive turns the boost has been held, and the cooldown that follows
-    /// when it has been held too long. Input arriving faster than the boost
-    /// decays would otherwise re-arm it forever; see BOOST_RUN_MAX.
-    boost_run: u64,
-    boost_hold: u64,
     // Worst main-loop turn since the last /status read, with its per-phase
     // breakdown. The loop is the app: a slow turn is every client's stall at
     // once, and until this existed those stalls were misattributed to the
@@ -635,11 +847,6 @@ struct App {
     // separated the layers).
     turn_max_ms: f64,
     turn_max_detail: String,
-    exec_seq: u64,    // per-command nonce for /exec console markers
-    scrollback: VecDeque<u8>,
-    console_total: u64,
-    last_save: Option<String>,
-    net: Option<NetStack>, // listeners live for the whole process
     display: Display,      // scanout state (see display.rs)
     // Pull-paced frame delivery (GET /fb.bands): the ring retains the band
     // events the scan already produced, so a puller consumes at ITS OWN pace
@@ -681,12 +888,6 @@ struct App {
     retry: usize,
     retry_at: Option<Instant>,
     retry_start: Option<Start>,
-    // How the running machine came up: resumed from a snapshot (and how long
-    // the restore took, and when that snapshot was taken) or booted cold.
-    restored: bool,
-    restore_ms: f64,
-    restore_taken_unix: u64,
-    last_snapshot: Option<String>,
 }
 
 /// Backoff for the boot-fetch retries (seconds between attempts).
@@ -707,21 +908,35 @@ fn b64(data: &[u8]) -> String {
 }
 
 impl App {
-    /// Frames the guest has presented per real second, over the last sampling
-    /// window (see `sample_fps`).
-    ///
-    /// A frame is `width * height * 4` bytes painted into the framebuffer, so
-    /// this counts what the machine actually put on screen, not what it claims:
-    /// the guest's own timing is only as honest as the guest's clock, and
-    /// unless `realtime` is set that clock runs at (MIPS / 10) times speed.
-    fn fps(&self) -> f64 {
-        self.fps_now
+    fn main(&self) -> &Machine {
+        &self.machines[0]
+    }
+
+    fn main_mut(&mut self) -> &mut Machine {
+        &mut self.machines[0]
+    }
+
+    fn find(&self, id: &str) -> Option<usize> {
+        self.machines.iter().position(|m| m.id == id)
+    }
+
+    /// Host bytes in use: every machine's own pages, every resident image,
+    /// the shared base disk and the cached objects.
+    fn footprint(&self) -> usize {
+        let machines: usize = self.machines.iter().map(|m| m.footprint()).sum();
+        let images: usize = self.root_images.values().map(|i| i.footprint()).sum();
+        let cache = self
+            .cache
+            .as_ref()
+            .map(|c| c.disk.len() + c.kernel.len() + c.snap_stored.as_ref().map_or(0, |s| s.len()))
+            .unwrap_or(0);
+        machines + images + cache
     }
 
     /// Device-level display counters for chasing capture bugs: which surface
     /// moved, what the scanout holds. Cheap (sums 4 KiB), debug-grade.
-    fn gpu_debug_json(&self) -> String {
-        match self.emu.as_ref() {
+    fn gpu_debug_json(&self, mi: usize) -> String {
+        match self.machines[mi].emu.as_ref() {
             Some(emu) => {
                 let flushes = emu.gpu_flushes();
                 let fbb = emu.fb_bytes();
@@ -748,36 +963,8 @@ impl App {
         }
     }
 
-    fn mips(&self) -> f64 {
-        match self.boot_at {
-            Some(t) if self.instret > 0 => {
-                let s = t.elapsed().as_secs_f64();
-                if s > 0.0 { self.instret as f64 / 1e6 / s } else { 0.0 }
-            }
-            _ => 0.0,
-        }
-    }
-
-    /// Push bytes into the guest's serial input, and keep the CPU on full
-    /// batches long enough for the UART to drain them (it polls one byte per
-    /// ~230k instructions). The same boost /input applies to a keystroke.
-    fn push_input(&mut self, bytes: &[u8]) {
-        if let Some(emu) = self.emu.as_mut() {
-            let t = emu.get_mut_terminal();
-            for &b in bytes {
-                t.put_input(b);
-            }
-        }
-        self.input_boost = self.input_boost.max(bytes.len() as u64 + 2);
-    }
-
-    fn status_json(&self) -> String {
-        let phase = match self.phase {
-            Phase::Idle => "idle",
-            Phase::Running => "running",
-            Phase::Halted => "halted",
-            Phase::Error => "error",
-        };
+    fn status_json(&self, mi: usize) -> String {
+        let m = &self.machines[mi];
         let img = self
             .cache
             .as_ref()
@@ -785,30 +972,34 @@ impl App {
                 format!(
                     ",\"kernelBytes\":{},\"fsBytes\":{},\"fsGzipped\":{}",
                     i.kernel.len(),
-                    i.fs_stored.len(),
+                    i.fs_bytes,
                     i.fs_gzipped
                 )
             })
             .unwrap_or_default();
+        let js = |v: &Option<String>| {
+            v.as_ref()
+                .map(|s| format!("\"{}\"", httpd::json_escape(s)))
+                .unwrap_or_else(|| "null".into())
+        };
         format!(
-            "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
+            "{{\"phase\":\"{}\",\"id\":\"{}\",\"origin\":\"{}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
              \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
-             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{}{img}}}",
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{},\"instances\":{}{img}}}",
+            phase_name(m.phase),
+            httpd::json_escape(&m.id),
+            httpd::json_escape(&m.origin),
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
             httpd::json_escape(&self.cfg.kernel),
             httpd::json_escape(&self.cfg.fs),
-            self.cfg
-                .save_key
-                .as_ref()
-                .map(|s| format!("\"{}\"", httpd::json_escape(s)))
-                .unwrap_or_else(|| "null".into()),
+            js(&self.cfg.save_key),
             self.cfg.read_only,
-            self.instret,
-            self.mips(),
-            self.fps(),
+            m.instret,
+            m.mips(),
+            m.fps(),
             self.sent_fps,
             self.video_fps,
             self.video_cost.as_secs_f64() * 1000.0,
@@ -818,16 +1009,10 @@ impl App {
             display::fb_w(),
             display::fb_h(),
             self.cfg.realtime,
-            self.console_total,
-            self.last_save
-                .as_ref()
-                .map(|s| format!("\"{}\"", httpd::json_escape(s)))
-                .unwrap_or_else(|| "null".into()),
-            self.error
-                .as_ref()
-                .map(|s| format!("\"{}\"", httpd::json_escape(s)))
-                .unwrap_or_else(|| "null".into()),
-            self.net
+            m.console_total,
+            js(&m.last_save),
+            js(&m.error),
+            m.net
                 .as_ref()
                 .map(|n| {
                     let fw: Vec<String> = n
@@ -846,28 +1031,30 @@ impl App {
                     )
                 })
                 .unwrap_or_else(|| "null".into()),
-            self.cfg.ram_mib,
+            m.ram_mib,
             // The pointer as the DEVICE holds it: resource, position, and how
             // many cursor commands have arrived. Screenshots cannot answer
             // "is the guest still moving the cursor" — a frozen pointer looks
             // identical whether the guest stopped sending, the host stopped
             // compositing, or the resource was freed underneath it. Cost is a
             // few bytes on a status poll.
-            self.emu
+            m.emu
                 .as_ref()
                 .and_then(|e| e.gpu_cursor())
                 .map(|(res, x, y, n)| format!(
                     "{{\"res\":{},\"x\":{},\"y\":{},\"updates\":{}}}", res, x, y, n))
                 .unwrap_or_else(|| "null".into()),
-            self.gpu_debug_json(),
-            self.snapshot_json(),
+            self.gpu_debug_json(mi),
+            self.snapshot_json(mi),
+            self.instances_summary_json(),
         )
     }
 
-    /// The snapshot facts: which key, whether one is cached (and how big),
-    /// whether THIS machine was resumed from one, and what the last
-    /// /snapshot wrote.
-    fn snapshot_json(&self) -> String {
+    /// The snapshot facts for one machine: which key, whether one is cached
+    /// (and how big), whether the machine was resumed from one, and what the
+    /// last /snapshot wrote.
+    fn snapshot_json(&self, mi: usize) -> String {
+        let m = &self.machines[mi];
         let js = |v: &Option<String>| {
             v.as_ref()
                 .map(|s| format!("\"{}\"", httpd::json_escape(s)))
@@ -881,10 +1068,45 @@ impl App {
                 .and_then(|c| c.snap_stored.as_ref())
                 .map(|b| b.len())
                 .unwrap_or(0),
-            self.restored,
-            self.restore_ms,
-            self.restore_taken_unix,
-            js(&self.last_snapshot),
+            m.restored,
+            m.restore_ms,
+            m.restore_taken_unix,
+            js(&m.last_snapshot),
+        )
+    }
+
+    fn instances_summary_json(&self) -> String {
+        format!(
+            "{{\"count\":{},\"max\":{},\"footprintBytes\":{},\"maxBytes\":{},\"images\":{}}}",
+            self.machines.len(),
+            self.cfg.instances_max,
+            self.footprint(),
+            self.cfg.instances_max_bytes,
+            self.root_images.len()
+        )
+    }
+
+    fn instances_json(&self) -> String {
+        let list: Vec<String> = self.machines.iter().map(|m| m.summary_json()).collect();
+        let images: Vec<String> = self
+            .root_images
+            .iter()
+            .map(|(k, i)| {
+                format!(
+                    "{{\"key\":\"{}\",\"ramMiB\":{},\"takenUnix\":{},\"footprintBytes\":{},\"users\":{}}}",
+                    httpd::json_escape(k),
+                    i.meta.ram_bytes >> 20,
+                    i.meta.taken_unix,
+                    i.footprint(),
+                    Arc::strong_count(i) - 1
+                )
+            })
+            .collect();
+        format!(
+            "{{\"instances\":[{}],\"images\":[{}],\"summary\":{}}}",
+            list.join(","),
+            images.join(","),
+            self.instances_summary_json()
         )
     }
 }
@@ -933,22 +1155,29 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     // two carries up to 2x its size in dead capacity — real linear memory on
     // wasm32, where fs + guest RAM already crowd the budget. Return it.
     fs_stored.shrink_to_fit();
-    // A `.gz` key is fetched and cached compressed and expanded per boot; see
-    // Images::disk. Verify it inflates now rather than at boot, so a bad object
-    // fails the fetch (which retries) instead of the machine start.
+    let kernel_sha256 = sha256_hex(&kernel);
+    let fs_sha256 = sha256_hex(&fs_stored);
+    let fs_bytes = fs_stored.len();
+    // A `.gz` key is expanded here, once, and the expanded disk is what every
+    // machine shares from now on. A bad object fails the fetch (which
+    // retries) rather than the machine start.
     let fs_gzipped = gz::is_gzip_key(&cfg.fs);
-    match fs_gzipped {
+    let disk = match fs_gzipped {
         true => {
-            let n = gz::gunzip(&fs_stored)?.len();
+            let raw = gz::gunzip(&fs_stored)?;
             eprintln!(
                 "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x)",
-                fs_stored.len(),
-                n,
-                n as f64 / fs_stored.len().max(1) as f64
+                fs_bytes,
+                raw.len(),
+                raw.len() as f64 / fs_bytes.max(1) as f64
             );
+            raw
         }
-        false => eprintln!("[risc-box]   fs {} bytes", fs_stored.len()),
-    }
+        false => {
+            eprintln!("[risc-box]   fs {} bytes", fs_bytes);
+            fs_stored
+        }
+    };
     let dtb = match &cfg.dtb {
         Some(k) => Some(
             s3::get_object(&ep, &cfg.bucket, k, creds, &mut noop)
@@ -956,8 +1185,6 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
         ),
         None => None,
     };
-    let kernel_sha256 = sha256_hex(&kernel);
-    let fs_sha256 = sha256_hex(&fs_stored);
     // The snapshot rides the same fetch (and the same retry budget): a
     // transient egress blip at enclave cold boot must not silently turn an
     // instant start into a two-minute one. A missing object is not an error,
@@ -983,42 +1210,33 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
         }
         None => None,
     };
-    Ok(Images { kernel, fs_stored, fs_gzipped, dtb, kernel_sha256, fs_sha256, snap_stored })
+    Ok(Images {
+        kernel,
+        disk: Arc::new(disk),
+        fs_bytes,
+        fs_gzipped,
+        dtb,
+        kernel_sha256,
+        fs_sha256,
+        snap_stored,
+    })
 }
 
-/// A machine brought up, and how: resumed from a snapshot or booted cold.
-struct Booted {
-    emu: Emulator,
-    restored: Option<riscv_emu_rust::SnapshotInfo>,
-}
-
-/// Bring a machine up. With `want_snapshot` and a cached snapshot that
-/// matches these images and settings, the machine RESUMES: the base disk is
-/// loaded, the snapshot's RAM, devices and disk delta are laid over it, and
-/// the guest continues from wherever it was — seconds, not a boot. A snapshot
-/// that does not match is ignored with a log line and the machine boots cold,
-/// because a restore against the wrong base would mount a filesystem whose
-/// blocks are half from another image.
-///
-/// A restore that fails midway is an Err: by then the base disk has been
-/// handed to the emulator and partly rewritten, so the caller drops the
-/// snapshot and boots cold with a fresh disk (see `do_start`).
-fn boot(images: &mut Images, cfg: &Config, want_snapshot: bool) -> Result<Booted, String> {
-    let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
-        input: VecDeque::new(),
-        output: VecDeque::new(),
-    }));
-    // before setup_program: that's where the RAM Vec is allocated and the
-    // DTB memory node gets synced to it
-    let ram_bytes = cfg.ram_mib * 1024 * 1024;
-    emu.setup_ram_bytes(ram_bytes);
+/// A fresh emulator configured the way every machine here is: RAM size,
+/// display geometry, clock source. What comes next — a kernel, a snapshot,
+/// or an image — is the caller's.
+fn new_emulator(cfg: &Config, ram_mib: u64) -> Emulator {
+    let mut emu = Emulator::new(new_terminal());
+    // before setup_program: that's where the RAM is sized and the DTB memory
+    // node gets synced to it
+    emu.setup_ram_bytes(ram_mib * 1024 * 1024);
     // Display size and clock source, both of which the guest reads exactly once
     // at boot: the DTB node for the framebuffer, the timebase for the clock.
     if cfg.fb_w != 1024 || cfg.fb_h != 768 {
         match emu.set_framebuffer_size(cfg.fb_w as u32, cfg.fb_h as u32)
             && display::set_size(cfg.fb_w as usize, cfg.fb_h as usize)
         {
-            true => eprintln!("[risc-box] display {}x{}", cfg.fb_w, cfg.fb_h),
+            true => {}
             false => eprintln!(
                 "[risc-box] display {}x{} rejected (must be even and fit 8 MiB); staying at {}x{}",
                 cfg.fb_w,
@@ -1030,75 +1248,111 @@ fn boot(images: &mut Images, cfg: &Config, want_snapshot: bool) -> Result<Booted
     }
     if cfg.realtime {
         emu.set_wall_clock(true);
-        eprintln!("[risc-box] guest clock: host monotonic (realtime)");
     }
-    let disk = images.take_disk()?;
+    emu
+}
 
-    if want_snapshot {
-        if let Some(snap) = images.snap_stored.as_ref() {
-            let identity = images.identity(cfg);
-            // The cheap checks first, before the disk is committed to this
-            // emulator: a mismatch here costs nothing and falls back cleanly.
-            let verdict = match Emulator::snapshot_meta(snap) {
-                Ok(m) if m.identity != identity => Err(format!(
-                    "it was taken against different images or settings (its identity {:?}, this deployment's {:?})",
-                    m.identity, identity
-                )),
-                Ok(m) if m.ram_bytes != ram_bytes => Err(format!(
-                    "it holds {} MiB of guest RAM but this deployment is configured for {} MiB",
-                    m.ram_bytes >> 20,
-                    cfg.ram_mib
-                )),
-                Ok(m) if m.disk_len as usize != disk.len() => Err(format!(
-                    "it expects a {}-byte base disk but the fs object expands to {} bytes",
-                    m.disk_len,
-                    disk.len()
-                )),
-                Ok(m) => Ok(m),
-                Err(e) => Err(e),
-            };
-            match verdict {
-                Ok(meta) => {
-                    eprintln!(
-                        "[risc-box] resuming from snapshot ({} bytes, taken at unix {}, emulator {})",
-                        snap.len(),
-                        meta.taken_unix,
-                        meta.emu_version
-                    );
-                    emu.setup_filesystem(disk);
-                    let t = Instant::now();
-                    let info = emu
-                        .restore(snap, &identity)
-                        .map_err(|e| format!("snapshot restore failed: {e}"))?;
-                    eprintln!(
-                        "[risc-box] restored in {:.2}s: {}/{} RAM pages, {} disk blocks replayed",
-                        t.elapsed().as_secs_f64(),
-                        info.ram_pages_kept,
-                        info.ram_pages_total,
-                        info.delta_blocks
-                    );
-                    #[cfg(feature = "aot")]
-                    {
-                        emu.aot_enable();
-                        eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
-                    }
-                    if cfg.net_enabled {
-                        emu.setup_network(Box::new(HostNet::new()));
-                    }
-                    return Ok(Booted { emu, restored: Some(info) });
-                }
-                Err(why) => eprintln!("[risc-box] ignoring the snapshot: {why}; booting cold"),
-            }
-        }
-    }
-
-    emu.setup_program(images.kernel.clone());
-    emu.setup_filesystem(disk);
+/// The steps after the guest's memory is in place, shared by every path.
+fn finish_machine(emu: &mut Emulator, cfg: &Config) {
     #[cfg(feature = "aot")]
     {
         emu.aot_enable();
         eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
     }
+    if cfg.net_enabled {
+        emu.setup_network(Box::new(HostNet::new()));
+    }
+}
+
+/// A machine brought up, and how: resumed from a snapshot or booted cold.
+struct Booted {
+    emu: Emulator,
+    restored: Option<SnapshotInfo>,
+}
+
+/// Bring the MAIN machine up. With `want_snapshot` and a cached snapshot
+/// that matches these images and settings, the machine RESUMES: the base
+/// disk is shared in, the snapshot's RAM is adopted copy-on-write, its
+/// devices and disk delta are laid over it, and the guest continues from
+/// wherever it was — seconds, not a boot. A snapshot that does not match is
+/// ignored with a log line and the machine boots cold, because a restore
+/// against the wrong base would mount a filesystem whose blocks are half
+/// from another image. The inflated image stays resident under its key so
+/// instances can fork it without inflating again.
+fn boot(app: &mut App, want_snapshot: bool) -> Result<Booted, String> {
+    let cfg = &app.cfg;
+    let images = app.cache.as_mut().expect("images cached before boot");
+    let identity = images.identity(cfg);
+    if want_snapshot {
+        if let Some(key) = cfg.snapshot.clone() {
+            let cached = app.root_images.get(&key).cloned();
+            let image: Option<Arc<SnapshotImage>> = match (cached, images.snap_stored.as_ref()) {
+                (Some(img), _) => Some(img),
+                (None, Some(bytes)) => match Emulator::load_image(bytes) {
+                    Ok(img) => {
+                        let img = Arc::new(img);
+                        app.root_images.insert(key.clone(), img.clone());
+                        Some(img)
+                    }
+                    Err(e) => {
+                        eprintln!("[risc-box] ignoring the snapshot: {e}; booting cold");
+                        None
+                    }
+                },
+                (None, None) => None,
+            };
+            if let Some(img) = image {
+                let ram_mib = img.meta.ram_bytes >> 20;
+                let verdict = if img.meta.identity != identity {
+                    Err(format!(
+                        "it was taken against different images or settings (its identity {:?}, this deployment's {:?})",
+                        img.meta.identity, identity
+                    ))
+                } else if ram_mib != cfg.ram_mib {
+                    Err(format!(
+                        "it holds {} MiB of guest RAM but this deployment is configured for {} MiB",
+                        ram_mib, cfg.ram_mib
+                    ))
+                } else if img.meta.disk_len as usize != images.disk.len() {
+                    Err(format!(
+                        "it expects a {}-byte base disk but the fs object expands to {} bytes",
+                        img.meta.disk_len,
+                        images.disk.len()
+                    ))
+                } else {
+                    Ok(())
+                };
+                match verdict {
+                    Ok(()) => {
+                        eprintln!(
+                            "[risc-box] resuming from snapshot {key} (taken at unix {}, emulator {})",
+                            img.meta.taken_unix, img.meta.emu_version
+                        );
+                        let mut emu = new_emulator(cfg, ram_mib);
+                        emu.setup_filesystem_shared(images.disk.clone());
+                        let t = Instant::now();
+                        let info = emu
+                            .restore_image(&img, &identity)
+                            .map_err(|e| format!("snapshot restore failed: {e}"))?;
+                        eprintln!(
+                            "[risc-box] restored in {:.2}s: {}/{} RAM pages shared, {} disk blocks replayed",
+                            t.elapsed().as_secs_f64(),
+                            info.ram_pages_kept,
+                            info.ram_pages_total,
+                            info.delta_blocks
+                        );
+                        finish_machine(&mut emu, cfg);
+                        return Ok(Booted { emu, restored: Some(info) });
+                    }
+                    Err(why) => eprintln!("[risc-box] ignoring the snapshot: {why}; booting cold"),
+                }
+            }
+        }
+    }
+
+    let mut emu = new_emulator(cfg, cfg.ram_mib);
+    emu.setup_program(images.kernel.clone());
+    emu.setup_filesystem_shared(images.disk.clone());
     match &images.dtb {
         Some(dtb) => emu.setup_dtb(dtb.clone()),
         None => {
@@ -1114,18 +1368,109 @@ fn boot(images: &mut Images, cfg: &Config, want_snapshot: bool) -> Result<Booted
             }
         }
     }
-    if cfg.net_enabled {
-        emu.setup_network(Box::new(HostNet::new()));
-    }
+    finish_machine(&mut emu, cfg);
     Ok(Booted { emu, restored: None })
+}
+
+/// Resolve what an instance forks from into a resident image. "main" takes
+/// the live main machine as it is right now (its RAM becomes shared; the
+/// fork costs milliseconds and no bucket round trip); anything else is a
+/// snapshot key — the config's root, cached from the images fetch, or any
+/// other object, fetched now with the credentials the images used.
+fn root_image(app: &mut App, from: &str) -> Result<(String, Arc<SnapshotImage>), String> {
+    let identity = app
+        .cache
+        .as_ref()
+        .map(|c| c.identity(&app.cfg))
+        .ok_or("no images fetched yet: start the main machine first")?;
+    if from == MAIN_ID {
+        let m0 = app.main_mut();
+        let emu = m0.emu.as_mut().ok_or("main is not running")?;
+        let img = Arc::new(emu.image(&identity));
+        let key = format!("main@{}", img.meta.taken_unix);
+        app.root_images.insert(key.clone(), img.clone());
+        return Ok((key, img));
+    }
+    if let Some(img) = app.root_images.get(from) {
+        return Ok((from.to_string(), img.clone()));
+    }
+    let cfg = &app.cfg;
+    let cache = app.cache.as_ref().expect("checked above");
+    let bytes: Vec<u8> = match (cfg.snapshot.as_deref() == Some(from), cache.snap_stored.as_ref()) {
+        (true, Some(b)) => b.clone(),
+        _ => {
+            let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
+            eprintln!("[risc-box] fetching root snapshot s3://{}/{from}", cfg.bucket);
+            s3::get_object(&ep, &cfg.bucket, from, app.live_creds.as_ref(), &mut progress_logger("root"))
+                .map_err(|e| format!("fetch root snapshot {from}: {e}"))?
+        }
+    };
+    let img = Emulator::load_image(&bytes).map_err(|e| format!("root snapshot {from}: {e}"))?;
+    if img.meta.identity != identity {
+        return Err(format!(
+            "root snapshot {from} was taken against different images or settings (its identity {:?}, this deployment's {:?})",
+            img.meta.identity, identity
+        ));
+    }
+    if img.meta.disk_len as usize != cache.disk.len() {
+        return Err(format!(
+            "root snapshot {from} expects a {}-byte base disk, the fs object expands to {}",
+            img.meta.disk_len,
+            cache.disk.len()
+        ));
+    }
+    let img = Arc::new(img);
+    app.root_images.insert(from.to_string(), img.clone());
+    Ok((from.to_string(), img))
+}
+
+/// A fresh machine forked from an image: shares the base disk and the
+/// image's pages, gets its own console, NIC (outbound only) and overlay.
+fn fork_emulator(app: &App, img: &SnapshotImage) -> Result<(Emulator, SnapshotInfo), String> {
+    let cfg = &app.cfg;
+    let cache = app.cache.as_ref().ok_or("no images fetched yet")?;
+    let identity = cache.identity(cfg);
+    let mut emu = new_emulator(cfg, img.meta.ram_bytes >> 20);
+    emu.setup_filesystem_shared(cache.disk.clone());
+    let info = emu.restore_image(img, &identity).map_err(|e| format!("fork failed: {e}"))?;
+    finish_machine(&mut emu, cfg);
+    Ok((emu, info))
+}
+
+/// Drop an image nobody forks from any more. Bucket roots stay: they are the
+/// root every next instance wants. Images taken from the live main machine
+/// are transient — they hold main's pages as they were at that moment, and
+/// only their instances care.
+fn reap_images(app: &mut App) {
+    app.root_images.retain(|k, img| !k.starts_with("main@") || Arc::strong_count(img) > 1);
+}
+
+/// Instance ids are short, URL-safe and never "main".
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id != MAIN_ID
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn fresh_id(app: &App) -> String {
+    use rand_core::RngCore;
+    loop {
+        let mut b = [0u8; 4];
+        rand_core::OsRng.fill_bytes(&mut b);
+        let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        if app.find(&id).is_none() {
+            return id;
+        }
+    }
 }
 
 // ---- request routing -------------------------------------------------------
 
 fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
     // The static shell, its assets, and liveness stay open so the page can
-    // load and prompt for a key; everything that reveals or drives the machine
-    // is gated when api_key is set.
+    // load and prompt for a key; everything that reveals or drives a machine
+    // is gated when api_key is set — including whether an instance exists.
     let open = matches!(
         (req.method.as_str(), req.path.as_str()),
         ("GET", "/") | ("GET", "/ping") | ("GET", "/a/xterm.js") | ("GET", "/a/xterm.css")
@@ -1133,8 +1478,24 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
     if !open && !authorized(&req, &app.cfg) {
         return server.respond(key, json(401, "Unauthorized", err("api key required")));
     }
-    match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => server.respond(
+    // `/i/<id>/<route>` addresses an instance; a bare route is the main
+    // machine. `/i/<id>` alone is its status (GET) or its removal (DELETE).
+    let (mi, path): (usize, String) = match req.path.strip_prefix("/i/") {
+        Some(rest) => {
+            let (id, tail) = match rest.split_once('/') {
+                Some((id, tail)) => (id, format!("/{tail}")),
+                None => (rest, "/".to_string()),
+            };
+            match app.find(id) {
+                Some(mi) => (mi, tail),
+                None => return server.respond(key, json(404, "Not Found", err("no such instance"))),
+            }
+        }
+        None => (0, req.path.clone()),
+    };
+    let sub = mi != 0;
+    match (req.method.as_str(), path.as_str()) {
+        ("GET", "/") if !sub => server.respond(
             key,
             Response::new(200, "OK")
                 .with("cache-control", "no-store")
@@ -1153,19 +1514,24 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 .with("cache-control", "public, max-age=31536000, immutable")
                 .body("text/css; charset=utf-8", XTERM_CSS.as_bytes().to_vec()),
         ),
-        ("GET", "/status") => server.respond(key, json(200, "OK", app.status_json())),
+        ("GET", "/status") | ("GET", "/") => server.respond(key, json(200, "OK", app.status_json(mi))),
+        ("GET", "/instances") if !sub => server.respond(key, json(200, "OK", app.instances_json())),
+        ("POST", "/instances") if !sub => instances_create(app, server, key, &req.body),
+        ("DELETE", "/") | ("POST", "/delete") if sub => instance_delete(app, server, key, mi),
         ("GET", "/console") => {
             // hand the late joiner the retained scrollback as the first frame
-            let sb: Vec<u8> = app.scrollback.iter().copied().collect();
+            let m = &app.machines[mi];
+            let sb: Vec<u8> = m.scrollback.iter().copied().collect();
             let initial = if sb.is_empty() {
                 String::new()
             } else {
                 format!("data: {}\n\n", b64(&sb))
             };
-            server.upgrade_sse(key, "console", &initial);
+            let topic = m.console_topic();
+            server.upgrade_sse(key, &topic, &initial);
         }
-        ("POST", "/start") => {
-            if app.phase == Phase::Running {
+        ("POST", "/start") if !sub => {
+            if app.main().phase == Phase::Running {
                 return server.respond(key, json(409, "Conflict", err("already running")));
             }
             let missing = app.cfg.missing();
@@ -1186,42 +1552,43 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             app.retry_start = None;
             server.respond(key, json(202, "Accepted", "{\"ok\":true,\"phase\":\"loading\"}".into()));
         }
+        ("POST", "/start") => instance_start(app, server, key, mi),
         ("POST", "/input") => {
-            if let (Phase::Running, Some(emu)) = (app.phase, app.emu.as_mut()) {
-                let t = emu.get_mut_terminal();
-                for &b in &req.body {
-                    t.put_input(b);
-                }
+            let m = &mut app.machines[mi];
+            if m.running() {
                 // run full batches until the UART has had time to drain this
                 // input (it polls its terminal every ~230k ticks, one byte per
                 // poll), else the idle throttle would add ~100ms per keystroke
-                app.input_boost = app.input_boost.max(req.body.len() as u64 + 2);
+                m.push_input(&req.body);
                 server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
             } else {
                 server.respond(key, json(409, "Conflict", err("machine is not running")));
             }
         }
-        ("POST", "/hid") => hid(app, server, key, &req.body),
+        ("POST", "/hid") => hid_inner(&mut app.machines[mi], server, key, &req.body, true),
         // The streamed variant: this request never ends and is never answered;
         // each newline-delimited body line arrives back through poll() as a
         // synthesized /hid-stream-event and is injected with zero per-batch
-        // framing or response work (see httpd::upgrade_instream).
-        ("POST", "/hid-stream") => server.upgrade_instream(key, "/hid-stream-event"),
-        ("POST", "/hid-stream-event") => hid_inner(app, server, key, &req.body, false),
-        ("POST", "/exec") => exec(app, server, key, &req.body),
-        ("POST", "/save") => save(app, server, key),
-        ("POST", "/snapshot") => snapshot(app, server, key, &req.body),
+        // framing or response work (see httpd::upgrade_instream). Main only:
+        // the synthesized path has no instance in it.
+        ("POST", "/hid-stream") if !sub => server.upgrade_instream(key, "/hid-stream-event"),
+        ("POST", "/hid-stream-event") if !sub => hid_inner(&mut app.machines[0], server, key, &req.body, false),
+        ("POST", "/exec") => exec(app, server, key, &req.body, mi),
+        ("POST", "/save") if !sub => save(app, server, key),
+        ("POST", "/save") => server.respond(key, json(403, "Forbidden", err("save is for the main machine (its disk is the saveKey's); snapshot an instance instead"))),
+        ("POST", "/snapshot") => snapshot(app, server, key, &req.body, mi),
         ("POST", "/stop") => {
-            app.emu = None;
-            app.phase = Phase::Halted;
-            app.boot_at = None;
-            app.restored = false;
-            app.display.reset();
-            worker::reset();
-            app.venc = None;
+            let m = &mut app.machines[mi];
+            m.halt();
+            if mi == 0 {
+                app.display.reset();
+                worker::reset();
+                app.venc = None;
+            }
+            reap_images(app);
             server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
         }
-        ("GET", "/display") => {
+        ("GET", "/display") if !sub => {
             // the machine's screen: metadata first, then bands (display.rs).
             // The joiner needs the WHOLE frame once — force it on the next
             // scan (a broadcast reaches existing watchers too; a duplicate
@@ -1234,11 +1601,6 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             );
             server.upgrade_sse(key, "display", &initial);
         }
-        // The efficient video stream: the guest desktop encoded as AV1 in the
-        // app (rav1e, inter-frame), each coded frame shipped base64 over SSE.
-        // The browser decodes it with WebCodecs (see index.html). A fresh
-        // watcher forces a new encoder (below), so the first frame it sees is a
-        // keyframe. `event: codec` carries the WebCodecs codec string + size.
         // GET /audio — take what the sound card has played since the last
         // call: {"rate":48000,"channels":2,"playing":true,"dropped":0,
         // "pcm":"<base64 s16le interleaved>"}. Taking is destructive, so one
@@ -1249,8 +1611,8 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // emu/src/device/virtio_snd.rs), so whoever pulls sets the clock. A
         // consumer that stops pulling stalls the guest's writes rather than
         // running ahead of real time, which is the behaviour a sound card has.
-        ("GET", "/audio") => {
-            if app.phase != Phase::Running || app.emu.is_none() {
+        ("GET", "/audio") if !sub => {
+            if !app.main().running() {
                 return server.respond(key, json(409, "Conflict", err("machine is not running")));
             }
             // `?stream=1` is how a player should take audio: an SSE stream the
@@ -1261,7 +1623,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             // (delay). Each event carries its own rate/channels because the
             // guest can reopen the card with different ones.
             if form_get(&req.query, "stream").is_some() {
-                let emu = app.emu.as_mut().expect("emu present (checked above)");
+                let emu = app.main_mut().emu.as_mut().expect("emu present (checked above)");
                 let (rate, channels, _playing, _pending, _dropped) = emu.audio_state();
                 let initial = format!(
                     "event: format\ndata: {{\"rate\":{},\"channels\":{}}}\n\n",
@@ -1273,7 +1635,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(64 * 1024)
                 .min(512 * 1024);
-            let emu = app.emu.as_mut().expect("emu present (checked above)");
+            let emu = app.machines[0].emu.as_mut().expect("emu present (checked above)");
             let (rate, channels, playing, _pending, dropped) = emu.audio_state();
             let mut pcm = emu.take_audio(max);
             app.opl.mix(emu, &mut pcm, rate, channels);
@@ -1283,7 +1645,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             );
             server.respond(key, json(200, "OK", body))
         }
-        ("GET", "/video") => {
+        ("GET", "/video") if !sub => {
             // `?codec=h264` selects the Moonlight-native stream (Annex-B over
             // the same base64 SSE), `av1` (the default) stays the browser's
             // WebCodecs codec. One encoder exists at a time: the codec of the
@@ -1312,15 +1674,15 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         }
         // A stream consumer lost packets and needs a random-access point (the
         // Moonlight bridge forwards the client's IDR requests here).
-        ("POST", "/video-key") => {
+        ("POST", "/video-key") if !sub => {
             worker::force_key();
             if let Some((_, enc)) = app.venc.as_mut() {
                 enc.force_keyframe();
             }
             server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
         }
-        ("GET", "/fb.png") => match (app.phase, app.emu.as_ref()) {
-            (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
+        ("GET", "/fb.png") => match app.machines[mi].emu.as_ref() {
+            Some(emu) if app.machines[mi].phase != Phase::Idle => {
                 let png = app.display.png(emu);
                 server.respond(
                     key,
@@ -1335,8 +1697,8 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // desktop, encoded IN THIS APP (wasm-JIT speed), not the emulated
         // guest. Motion JPEG today; the VideoEncoder seam is where an
         // H.264/NVENC-on-H200 backend drops in. `?q=` sets JPEG quality.
-        ("GET", "/frame.jpg") => match (app.phase, app.emu.as_ref()) {
-            (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
+        ("GET", "/frame.jpg") => match app.machines[mi].emu.as_ref() {
+            Some(emu) if app.machines[mi].phase != Phase::Idle => {
                 use video::VideoEncoder;
                 let q = form_get(&req.query, "q").and_then(|v| v.parse::<u8>().ok()).unwrap_or(75);
                 let (rgb, w, h) = video::capture_rgb(emu);
@@ -1352,12 +1714,6 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             }
             _ => server.respond(key, json(409, "Conflict", err("machine is not running"))),
         },
-        // Raw framebuffer (packed RGB, FB_W x FB_H, no header) — the frame source
-        // for a HARDWARE encoder. The wasm app can't call NVENC, so the native
-        // GPU bridge (gs-bridge) pulls raw frames here and NVENC-encodes them
-        // on the GPU (the H200 on the fleet; a dev GPU locally). This is the
-        // "GPU compute for the RISC Box app runs on the H200" path — the encode
-        // is offloaded off the emulated CPU AND off this wasm app to the GPU.
         // Pull-paced frame delivery: the band events the scan already
         // produced, from `since` on, in one bounded response. The client's
         // in-flight window is one reply deep, so its latency is its own
@@ -1366,7 +1722,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         // a driven cursor sit seconds behind a smooth picture). `resync`
         // tells the client its `since` fell out of the ring; a full-frame
         // scan is already scheduled and a later poll re-bases it.
-        ("GET", "/fb.bands") => {
+        ("GET", "/fb.bands") if !sub => {
             app.pull_seen = Some(Instant::now());
             let since = form_get(&req.query, "since")
                 .and_then(|s| s.parse::<u64>().ok())
@@ -1393,8 +1749,12 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                     .body("application/json", body.into_bytes()),
             );
         }
-        ("GET", "/fb.rgb") => match (app.phase, app.emu.as_ref()) {
-            (Phase::Running, Some(emu)) | (Phase::Halted, Some(emu)) => {
+        // Raw framebuffer (packed RGB, FB_W x FB_H, no header) — the frame source
+        // for a HARDWARE encoder. The wasm app can't call NVENC, so the native
+        // GPU bridge (gs-bridge) pulls raw frames here and NVENC-encodes them
+        // on the GPU (the H200 on the fleet; a dev GPU locally).
+        ("GET", "/fb.rgb") => match app.machines[mi].emu.as_ref() {
+            Some(emu) if app.machines[mi].phase != Phase::Idle => {
                 let (rgb, _w, _h) = video::capture_rgb(emu);
                 server.respond(
                     key,
@@ -1412,6 +1772,148 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
 fn err(msg: &str) -> String {
     format!("{{\"error\":{{\"message\":\"{}\"}}}}", httpd::json_escape(msg))
 }
+
+// ---- instances -------------------------------------------------------------
+
+/// POST /instances — fork a new machine. Body: {"from"?: "main" | "<snapshot
+/// key>", "id"?: "<id>"}. `from` defaults to the config's `snapshot` key (the
+/// root). The instance is created RUNNING, resumed from the image, with the
+/// restoreExec hook applied. Answers the new machine's summary.
+fn instances_create(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let from = v
+        .get("from")
+        .and_then(|f| f.as_str())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .or_else(|| app.cfg.snapshot.clone());
+    let Some(from) = from else {
+        return server.respond(key, json(400, "Bad Request", err(
+            "nothing to fork from: pass {\"from\": \"main\" | \"<snapshot key>\"} or set `snapshot` in the config",
+        )));
+    };
+    let id = match v.get("id").and_then(|i| i.as_str()) {
+        Some(id) if valid_id(id) => id.to_string(),
+        Some(_) => return server.respond(key, json(400, "Bad Request", err("id must be 1-32 [A-Za-z0-9_-] characters and not \"main\""))),
+        None => fresh_id(app),
+    };
+    if app.find(&id).is_some() {
+        return server.respond(key, json(409, "Conflict", err("an instance with that id exists")));
+    }
+    if app.machines.len() >= app.cfg.instances_max {
+        return server.respond(key, json(409, "Conflict", err(&format!(
+            "instance limit reached ({} machines, instances.max = {})",
+            app.machines.len(),
+            app.cfg.instances_max
+        ))));
+    }
+    // By ticket: bringing a machine up runs the restoreExec hook inline,
+    // which flushes the server, which may compact the connection list under
+    // this request's index (see `exec`).
+    let Some(ticket) = server.hold(key) else { return };
+    match instance_bring_up(app, server, &id, &from) {
+        Ok(mi) => server.release(ticket, json(201, "Created", app.machines[mi].summary_json())),
+        Err(e) => {
+            reap_images(app);
+            server.release(ticket, json(500, "Error", err(&e)))
+        }
+    };
+}
+
+/// Fork `from` into a machine called `id` (a new record, or an existing
+/// halted one) and run the post-restore hook. The memory budget is checked
+/// against what the image and the base disk already cost plus a modest
+/// allowance for the pages the new guest will touch.
+fn instance_bring_up(app: &mut App, server: &mut Server, id: &str, from: &str) -> Result<usize, String> {
+    let (image_key, image) = root_image(app, from)?;
+    let budget = app.cfg.instances_max_bytes as usize;
+    let used = app.footprint();
+    const ALLOWANCE: usize = 64 << 20;
+    if used + ALLOWANCE > budget {
+        return Err(format!(
+            "memory budget exhausted: {} MiB in use of instances.maxBytes = {} MiB",
+            used >> 20,
+            budget >> 20
+        ));
+    }
+    let t = Instant::now();
+    let (emu, info) = fork_emulator(app, &image)?;
+    let restore_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let mi = match app.find(id) {
+        Some(mi) => mi,
+        None => {
+            app.machines.push(Machine::new(id, from));
+            app.machines.len() - 1
+        }
+    };
+    let cfg_net = (app.cfg.net_enabled, app.cfg.net_outbound);
+    let title = app.cfg.title.clone();
+    let m = &mut app.machines[mi];
+    m.origin = from.to_string();
+    m.emu = Some(emu);
+    m.image = Some(image);
+    m.image_key = Some(image_key);
+    m.phase = Phase::Running;
+    m.error = None;
+    m.ram_mib = info.ram_bytes >> 20;
+    m.boot_at = Some(Instant::now());
+    m.instret = 0;
+    m.scrollback.clear();
+    m.console_total = 0;
+    m.restored = true;
+    m.restore_ms = restore_ms;
+    m.restore_taken_unix = info.taken_unix;
+    if cfg_net.0 && m.net.is_none() {
+        // outbound NAT like main's, no inbound forwards: those are the
+        // deployment's ports and they belong to the main machine
+        m.net = Some(NetStack::new(&[], cfg_net.1));
+    }
+    eprintln!(
+        "[risc-box] instance {id} FORKED from {from} in {restore_ms:.0}ms: {} MiB, {}/{} pages shared, {} disk blocks — {title}",
+        info.ram_bytes >> 20,
+        info.ram_pages_kept,
+        info.ram_pages_total,
+        info.delta_blocks
+    );
+    run_restore_hook(app, server, mi);
+    Ok(mi)
+}
+
+/// POST /i/<id>/start — bring a halted instance back by re-forking its
+/// origin. It is a NEW fork of the same image, not a resume of what it was
+/// when it stopped (a stop drops the machine's pages by design).
+fn instance_start(app: &mut App, server: &mut Server, key: usize, mi: usize) {
+    if app.machines[mi].running() {
+        return server.respond(key, json(409, "Conflict", err("already running")));
+    }
+    let id = app.machines[mi].id.clone();
+    let from = app.machines[mi].image_key.clone().unwrap_or_else(|| app.machines[mi].origin.clone());
+    let Some(ticket) = server.hold(key) else { return };
+    match instance_bring_up(app, server, &id, &from) {
+        Ok(mi) => server.release(ticket, json(200, "OK", app.machines[mi].summary_json())),
+        Err(e) => {
+            let m = &mut app.machines[mi];
+            m.error = Some(e.clone());
+            m.phase = Phase::Error;
+            reap_images(app);
+            server.release(ticket, json(500, "Error", err(&e)))
+        }
+    };
+}
+
+/// DELETE /i/<id> — stop and forget an instance. Its pages, overlay and
+/// console go with it; an image only it forked from goes too.
+fn instance_delete(app: &mut App, server: &mut Server, key: usize, mi: usize) {
+    if mi == 0 {
+        return server.respond(key, json(403, "Forbidden", err("the main machine cannot be deleted; /stop it")));
+    }
+    let m = app.machines.remove(mi);
+    drop(m);
+    reap_images(app);
+    server.respond(key, json(200, "OK", "{\"ok\":true}".into()));
+}
+
+// ---- /hid ------------------------------------------------------------------
 
 // Linux input-event-codes the /hid endpoint speaks (mirror of the set the
 // emulator's virtio-input device advertises).
@@ -1437,12 +1939,8 @@ const BTN_MIDDLE: u16 = 0x112;
 /// Each event is committed to the guest with an EV_SYN report. This is the
 /// interface a remote/streaming client drives the desktop through; it is also
 /// the hook a GameStream host's input backend targets.
-fn hid(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
-    hid_inner(app, server, key, body, true)
-}
-
-fn hid_inner(app: &mut App, server: &mut Server, key: usize, body: &[u8], respond: bool) {
-    if app.phase != Phase::Running || app.emu.is_none() {
+fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], respond: bool) {
+    if !m.running() {
         if respond {
             server.respond(key, json(409, "Conflict", err("machine is not running")));
         }
@@ -1463,7 +1961,7 @@ fn hid_inner(app: &mut App, server: &mut Server, key: usize, body: &[u8], respon
         }
         return;
     };
-    let emu = app.emu.as_mut().expect("emu present (checked above)");
+    let emu = m.emu.as_mut().expect("emu present (checked above)");
     let abs_max = Emulator::input_abs_max() as f64;
     let mut n = 0u32;
     let syn = |emu: &mut Emulator| emu.push_input_event(EV_SYN, 0, 0);
@@ -1526,8 +2024,8 @@ fn hid_inner(app: &mut App, server: &mut Server, key: usize, body: &[u8], respon
     // Run full CPU batches for a bit so the guest services the input IRQ and
     // X repaints promptly instead of at the idle-throttle rate — but only when
     // something actually landed, and only briefly. See INPUT_BOOST_TURNS.
-    if n > 0 && app.boost_hold == 0 {
-        app.input_boost = app.input_boost.max(INPUT_BOOST_TURNS);
+    if n > 0 && m.boost_hold == 0 {
+        m.input_boost = m.input_boost.max(INPUT_BOOST_TURNS);
     }
     if respond {
         server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
@@ -1563,14 +2061,14 @@ const EXEC_DEFAULT_MAX_BYTES: usize = 64 * 1024;
 /// markers; the exit code rides the closing one.
 ///
 /// It blocks the event loop until the command finishes or the timeout fires,
-/// stepping the CPU inline and pumping the guest NIC so a networked command
-/// still works, broadcasting the same bytes to console watchers, and flushing
-/// periodically so SSE heartbeats keep going out.
-fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
+/// stepping this machine's CPU inline (the others pause) and pumping its NIC
+/// so a networked command still works, broadcasting the same bytes to
+/// console watchers, and flushing periodically so SSE heartbeats keep going.
+fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) {
     if !app.cfg.exec_enabled {
         return server.respond(key, json(403, "Forbidden", err("exec is disabled on this deployment")));
     }
-    if app.phase != Phase::Running || app.emu.is_none() {
+    if !app.machines[mi].running() {
         return server.respond(key, json(409, "Conflict", err("machine is not running")));
     }
     let v: serde_json::Value = match serde_json::from_slice(body) {
@@ -1600,7 +2098,7 @@ fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
     // same reason /fb.bands long-polls hold; a dropped response here read
     // as "exec hangs" from outside.
     let Some(ticket) = server.hold(key) else { return };
-    let out = exec_run(app, server, &cmd, timeout, max_out);
+    let out = exec_run(&app.cfg, &mut app.machines[mi], server, &cmd, timeout, max_out);
     let payload = match out.error {
         None => format!(
             "{{\"ok\":true,\"exitCode\":{},\"output\":\"{}\",\"truncated\":{},\"ms\":{}}}",
@@ -1633,9 +2131,9 @@ struct ExecOutcome {
 
 /// The console-driving core of /exec, shared with the post-restore hook.
 /// Blocks the event loop for up to `timeout` (login and command together).
-fn exec_run(app: &mut App, server: &mut Server, cmd: &str, timeout: Duration, max_out: usize) -> ExecOutcome {
-    let seq = app.exec_seq;
-    app.exec_seq = app.exec_seq.wrapping_add(1);
+fn exec_run(cfg: &Config, m: &mut Machine, server: &mut Server, cmd: &str, timeout: Duration, max_out: usize) -> ExecOutcome {
+    let seq = m.exec_seq;
+    m.exec_seq = m.exec_seq.wrapping_add(1);
     let tag = format!("RBX{seq}Z");
     let begin = format!("{tag}B");
     let end = format!("{tag}E:");
@@ -1647,8 +2145,8 @@ fn exec_run(app: &mut App, server: &mut Server, cmd: &str, timeout: Duration, ma
         b64(cmd.as_bytes())
     );
 
-    let user = app.cfg.exec_user.clone();
-    let pass = app.cfg.exec_password.clone().unwrap_or_default();
+    let user = cfg.exec_user.clone();
+    let pass = cfg.exec_password.clone().unwrap_or_default();
     let began = Instant::now();
     let mut cap: Vec<u8> = Vec::new();
     let mut last_flush = began;
@@ -1657,20 +2155,20 @@ fn exec_run(app: &mut App, server: &mut Server, cmd: &str, timeout: Duration, ma
     // open shell, or `login:` from a getty, which we answer from the configured
     // (passwordless-root by default) credentials. The command is only sent once
     // a prompt is in hand, so a login prompt can never consume it as a username.
-    app.push_input(b"\n");
+    m.push_input(b"\n");
     let ready_budget = (timeout / 2).min(Duration::from_secs(10));
     let (mut sent_user, mut sent_pass, mut ready) = (false, false, false);
     while began.elapsed() < ready_budget {
-        exec_pump(app, server, &mut cap, &mut last_flush);
+        exec_pump(m, server, &mut cap, &mut last_flush);
         if tail_is_prompt(&cap) {
             ready = true;
             break;
         }
         if !sent_user && contains(&cap, b"ogin:") {
-            app.push_input(format!("{user}\n").as_bytes());
+            m.push_input(format!("{user}\n").as_bytes());
             sent_user = true;
         } else if sent_user && !sent_pass && contains(&cap, b"assword:") {
-            app.push_input(format!("{pass}\n").as_bytes());
+            m.push_input(format!("{pass}\n").as_bytes());
             sent_pass = true;
         }
     }
@@ -1691,10 +2189,10 @@ fn exec_run(app: &mut App, server: &mut Server, cmd: &str, timeout: Duration, ma
     // Phase 2 — send the command and wait for the closing marker (with its
     // whole exit-code line, i.e. a newline after it).
     let cmd_off = cap.len();
-    app.push_input(line.as_bytes());
+    m.push_input(line.as_bytes());
     let mut end_at: Option<usize> = None;
     while began.elapsed() < timeout {
-        exec_pump(app, server, &mut cap, &mut last_flush);
+        exec_pump(m, server, &mut cap, &mut last_flush);
         if let Some(ei) = find_from(&cap, end.as_bytes(), cmd_off) {
             if find_from(&cap, b"\n", ei + end.len()).is_some() {
                 end_at = Some(ei);
@@ -1753,11 +2251,12 @@ fn exec_run(app: &mut App, server: &mut Server, cmd: &str, timeout: Duration, ma
 /// One event-loop turn's worth of guest work, for the inline /exec wait: step
 /// the CPU, drain the UART into the console (scrollback + SSE + the capture
 /// buffer), pump the NIC, and periodically flush so SSE heartbeats still fire.
-fn exec_pump(app: &mut App, server: &mut Server, cap: &mut Vec<u8>, last_flush: &mut Instant) {
+fn exec_pump(m: &mut Machine, server: &mut Server, cap: &mut Vec<u8>, last_flush: &mut Instant) {
+    let topic = m.console_topic();
     let mut chunk: Vec<u8> = Vec::new();
-    if let Some(emu) = app.emu.as_mut() {
+    if let Some(emu) = m.emu.as_mut() {
         emu.run_n(TICK_BATCH);
-        app.instret += TICK_BATCH;
+        m.instret += TICK_BATCH;
         let t = emu.get_mut_terminal();
         loop {
             let b = t.get_output();
@@ -1770,20 +2269,20 @@ fn exec_pump(app: &mut App, server: &mut Server, cap: &mut Vec<u8>, last_flush: 
             }
         }
         // keep forwarded/outbound guest connections alive across a networked cmd
-        if let Some(stack) = app.net.as_mut() {
+        if let Some(stack) = m.net.as_mut() {
             let backend = emu.get_mut_cpu().get_mut_mmu().get_mut_net().get_mut_backend();
             stack.pump(backend.as_mut());
         }
     }
     if !chunk.is_empty() {
-        app.console_total += chunk.len() as u64;
+        m.console_total += chunk.len() as u64;
         for &b in &chunk {
-            if app.scrollback.len() >= SCROLLBACK {
-                app.scrollback.pop_front();
+            if m.scrollback.len() >= SCROLLBACK {
+                m.scrollback.pop_front();
             }
-            app.scrollback.push_back(b);
+            m.scrollback.push_back(b);
         }
-        server.broadcast("console", &format!("data: {}", b64(&chunk)));
+        server.broadcast(&topic, &format!("data: {}", b64(&chunk)));
         cap.extend_from_slice(&chunk);
     }
     if last_flush.elapsed() >= Duration::from_millis(50) {
@@ -1841,19 +2340,23 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|i| i + from)
 }
 
-/// POST /snapshot — serialize the running machine and PUT it to the snapshot
-/// key, so the next /start (and every start after a restart) resumes from
-/// this moment instead of booting. Body: {"key"?: "<s3 key>", "level"?: 1..9}.
-/// Blocks the event loop for the serialize + upload, like /save does.
+// ---- /snapshot, /save ------------------------------------------------------
+
+/// POST /snapshot — serialize the running machine and PUT it to a snapshot
+/// key. For the main machine the key defaults to the config's; an instance
+/// must name one. When the main machine's snapshot goes to the config's key,
+/// it becomes the cached root — the next /start resumes from it and the next
+/// instance forks it. Body: {"key"?: "<s3 key>", "level"?: 1..9}. Blocks the
+/// event loop for the serialize + upload, like /save does.
 ///
 /// Take it when the machine is QUIET: a TCP connection the guest holds open
 /// at this moment (an ssh session, a download) is a real host socket that
 /// cannot be in the snapshot, so on resume the guest finds it dead.
-fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
+fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) {
     if app.cfg.read_only {
         return server.respond(key, json(403, "Forbidden", err("this machine is read-only")));
     }
-    if app.phase != Phase::Running || app.emu.is_none() {
+    if !app.machines[mi].running() {
         return server.respond(key, json(409, "Conflict", err("machine is not running")));
     }
     let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
@@ -1862,10 +2365,10 @@ fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
         .and_then(|k| k.as_str())
         .filter(|k| !k.is_empty())
         .map(str::to_string)
-        .or_else(|| app.cfg.snapshot_save_key.clone());
+        .or_else(|| if mi == 0 { app.cfg.snapshot_save_key.clone() } else { None });
     let Some(save_key) = save_key else {
         return server.respond(key, json(400, "Bad Request", err(
-            "no snapshot key: set `snapshot` (or `snapshotSaveKey`) in the config, or pass {\"key\": \"<s3 key>\"}",
+            "no snapshot key: pass {\"key\": \"<s3 key>\"} (the main machine defaults to the config's `snapshot`)",
         )));
     };
     let level = v
@@ -1880,13 +2383,13 @@ fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
         Ok(e) => e,
         Err(e) => return server.respond(key, json(500, "Error", err(&e))),
     };
-    let emu = app.emu.as_ref().expect("emu present (checked above)");
+    let emu = app.machines[mi].emu.as_ref().expect("emu present (checked above)");
     let t0 = Instant::now();
     let (data, info) = emu.snapshot(&identity, level);
     let snap_ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
-        "[risc-box] snapshot: {} bytes in {:.0}ms ({}/{} RAM pages kept, {} disk blocks changed); uploading to s3://{}/{save_key}",
-        data.len(), snap_ms, info.ram_pages_kept, info.ram_pages_total, info.delta_blocks, app.cfg.bucket
+        "[risc-box] snapshot of {}: {} bytes in {:.0}ms ({}/{} RAM pages kept, {} disk blocks changed); uploading to s3://{}/{save_key}",
+        app.machines[mi].id, data.len(), snap_ms, info.ram_pages_kept, info.ram_pages_total, info.delta_blocks, app.cfg.bucket
     );
     let t1 = Instant::now();
     match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &data) {
@@ -1894,11 +2397,18 @@ fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
             let upload_ms = t1.elapsed().as_secs_f64() * 1000.0;
             let bytes = data.len();
             eprintln!("[risc-box] snapshot uploaded in {upload_ms:.0}ms");
-            // The next start resumes from THIS, with no download.
-            if let Some(cache) = app.cache.as_mut() {
-                cache.snap_stored = Some(data);
+            // A snapshot written to the config's root key IS the new root:
+            // cache it for the next start, and retire the stale inflated
+            // image so the next fork inflates this one.
+            if app.cfg.snapshot.as_deref() == Some(save_key.as_str()) {
+                if let Some(cache) = app.cache.as_mut() {
+                    cache.snap_stored = Some(data);
+                }
+                app.root_images.remove(&save_key);
+            } else {
+                app.root_images.remove(&save_key);
             }
-            app.last_snapshot = Some(save_key.clone());
+            app.machines[mi].last_snapshot = Some(save_key.clone());
             server.respond(
                 key,
                 json(200, "OK", format!(
@@ -1919,7 +2429,7 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
     let Some(save_key) = app.cfg.save_key.clone() else {
         return server.respond(key, json(400, "Bad Request", err("no saveKey configured")));
     };
-    let Some(emu) = app.emu.as_mut() else {
+    let Some(emu) = app.machines[0].emu.as_mut() else {
         return server.respond(key, json(409, "Conflict", err("machine is not running")));
     };
     let disk = emu.get_mut_cpu().get_mut_mmu().get_disk().dump_contents();
@@ -1947,7 +2457,7 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
     }
     match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &disk) {
         Ok(()) => {
-            app.last_save = Some(save_key.clone());
+            app.machines[0].last_save = Some(save_key.clone());
             server.respond(
                 key,
                 json(200, "OK", format!("{{\"ok\":true,\"saved\":\"{}\",\"bytes\":{}}}",
@@ -1958,15 +2468,12 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
     }
 }
 
-/// Perform a queued /start: fetch (or reuse cached) images and boot — or,
-/// when a matching snapshot is cached, resume.
+// ---- start -----------------------------------------------------------------
+
+/// Perform a queued /start of the MAIN machine: fetch (or reuse cached)
+/// images and boot — or, when a matching snapshot is cached, resume.
 fn do_start(app: &mut App, server: &mut Server, start: Start) {
-    let need_fetch = start.reset
-        || app.cache.is_none()
-        // a raw (non-gz) image is MOVED into the machine at boot, so a second
-        // start has nothing left to hand it; refill (see Images::take_disk)
-        || app.cache.as_ref().map_or(false, |c| !c.fs_gzipped && c.fs_stored.is_empty());
-    let creds_for_retry = start.creds.as_ref().map(clone_creds);
+    let need_fetch = start.reset || app.cache.is_none();
     if need_fetch {
         // creds precedence: request body > config; borrow-safe clone of config creds
         let body = start.creds;
@@ -1979,6 +2486,9 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
                     None => app.cfg.config_creds.as_ref().map(clone_creds),
                 };
                 app.cache = Some(imgs);
+                // fresh objects: every resident image was inflated from the
+                // old ones (instances already forked keep theirs alive)
+                app.root_images.clear();
                 app.retry = 0;
                 app.retry_at = None;
                 app.retry_start = None;
@@ -1999,99 +2509,107 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
                         snapshot: start.snapshot,
                     });
                 }
-                app.error = Some(e);
-                app.phase = Phase::Error;
+                let m = app.main_mut();
+                m.error = Some(e);
+                m.phase = Phase::Error;
                 return;
             }
         }
     }
     let want_snapshot = start.snapshot.unwrap_or(true);
-    // Expanding a gzipped image can fail (corrupt object, or no room for the
-    // expanded disk beside everything else). Treat it exactly like a failed
-    // fetch: report it and leave the machine stopped, rather than unwrapping
-    // and taking the whole app down with it.
-    let first = {
-        let imgs = app.cache.as_mut().expect("cache present after fetch");
-        let tried_snapshot = want_snapshot && imgs.snap_stored.is_some();
-        (boot(imgs, &app.cfg, want_snapshot), tried_snapshot)
-    };
-    let booted = match first {
-        (Ok(b), _) => b,
-        (Err(e), true) => {
-            // A snapshot that failed mid-restore is dropped so the machine
-            // still comes up, cold. The base disk it consumed is re-expanded
-            // (gz) here, or re-fetched (raw) by queueing a fresh start.
+    let booted = match boot(app, want_snapshot) {
+        Ok(b) => b,
+        Err(e) if want_snapshot => {
+            // A snapshot that failed mid-restore is retired so the machine
+            // still comes up, cold, from the base images.
             eprintln!("[risc-box] {e}; dropping the snapshot and booting cold");
-            let disk_gone = {
-                let imgs = app.cache.as_mut().expect("cache present");
-                imgs.snap_stored = None;
-                !imgs.fs_gzipped && imgs.fs_stored.is_empty()
-            };
-            if disk_gone {
-                app.cache = None;
-                app.pending = Some(Start { creds: creds_for_retry, reset: false, snapshot: Some(false) });
-                return;
+            if let Some(k) = app.cfg.snapshot.clone() {
+                app.root_images.remove(&k);
             }
-            let imgs = app.cache.as_mut().expect("cache present");
-            match boot(imgs, &app.cfg, false) {
+            if let Some(c) = app.cache.as_mut() {
+                c.snap_stored = None;
+            }
+            match boot(app, false) {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[risc-box] start failed: {e}");
-                    app.error = Some(e);
-                    app.phase = Phase::Error;
+                    let m = app.main_mut();
+                    m.error = Some(e);
+                    m.phase = Phase::Error;
                     return;
                 }
             }
         }
-        (Err(e), false) => {
+        Err(e) => {
             eprintln!("[risc-box] start failed: {e}");
-            app.error = Some(e);
-            app.phase = Phase::Error;
+            let m = app.main_mut();
+            m.error = Some(e);
+            m.phase = Phase::Error;
             return;
         }
     };
     let restored = booted.restored;
-    app.emu = Some(booted.emu);
-    app.instret = 0;
-    app.boot_at = Some(Instant::now());
-    app.scrollback.clear();
-    app.console_total = 0;
-    app.error = None;
+    let ram_mib = app.cfg.ram_mib;
+    let title = app.cfg.title.clone();
+    let net = match app.cfg.net_enabled && app.main().net.is_none() {
+        // listeners live for the whole process: created on the first start
+        true => Some(NetStack::new(&app.cfg.forwards, app.cfg.net_outbound)),
+        false => None,
+    };
+    let m = app.main_mut();
+    m.emu = Some(booted.emu);
+    m.origin = "config".into();
+    m.ram_mib = ram_mib;
+    m.instret = 0;
+    m.boot_at = Some(Instant::now());
+    m.scrollback.clear();
+    m.console_total = 0;
+    m.error = None;
+    m.phase = Phase::Running;
+    m.restored = restored.is_some();
+    m.restore_taken_unix = restored.as_ref().map_or(0, |i| i.taken_unix);
+    m.restore_ms = 0.0;
+    if net.is_some() {
+        m.net = net;
+    }
     app.display.reset(); // fresh machine, fresh screen: next watched scan ships a full frame
     worker::reset();
     app.venc = None; // fresh machine, fresh encoder (next watcher gets a keyframe)
-    app.phase = Phase::Running;
-    app.restored = restored.is_some();
-    app.restore_taken_unix = restored.as_ref().map_or(0, |i| i.taken_unix);
-    app.restore_ms = 0.0;
     match &restored {
         Some(info) => eprintln!(
-            "[risc-box] machine RESUMED from snapshot: {} (taken at unix {})",
-            app.cfg.title, info.taken_unix
+            "[risc-box] machine RESUMED from snapshot: {title} (taken at unix {})",
+            info.taken_unix
         ),
-        None => eprintln!("[risc-box] machine running: {}", app.cfg.title),
+        None => eprintln!("[risc-box] machine running: {title}"),
     }
     // The resumed guest still thinks it is the moment the snapshot was
     // taken. The hook is the operator's chance to tell it otherwise.
     if restored.is_some() {
-        if let Some(cmd) = app.cfg.restore_exec.clone() {
-            if !app.cfg.exec_enabled {
-                eprintln!("[risc-box] restoreExec set but exec is disabled; skipping");
-            } else {
-                let cmd = fill_hook(&cmd);
-                let timeout = Duration::from_secs(app.cfg.restore_exec_timeout_s);
-                let t = Instant::now();
-                let out = exec_run(app, server, &cmd, timeout, EXEC_DEFAULT_MAX_BYTES);
-                match out.error {
-                    None => eprintln!(
-                        "[risc-box] restoreExec done in {:.1}s (exit {})",
-                        t.elapsed().as_secs_f64(),
-                        out.exit_code
-                    ),
-                    Some(e) => eprintln!("[risc-box] restoreExec failed: {e}"),
-                }
-            }
-        }
+        run_restore_hook(app, server, 0);
+    }
+}
+
+/// Run the configured `restoreExec` on a machine that was just resumed or
+/// forked. Blocks the loop for at most its timeout; failures are logged, never
+/// fatal — the machine is up either way.
+fn run_restore_hook(app: &mut App, server: &mut Server, mi: usize) {
+    let Some(cmd) = app.cfg.restore_exec.clone() else { return };
+    if !app.cfg.exec_enabled {
+        eprintln!("[risc-box] restoreExec set but exec is disabled; skipping");
+        return;
+    }
+    let cmd = fill_hook(&cmd);
+    let timeout = Duration::from_secs(app.cfg.restore_exec_timeout_s);
+    let t = Instant::now();
+    let id = app.machines[mi].id.clone();
+    let out = exec_run(&app.cfg, &mut app.machines[mi], server, &cmd, timeout, EXEC_DEFAULT_MAX_BYTES);
+    match out.error {
+        None => eprintln!(
+            "[risc-box] restoreExec on {id} done in {:.1}s (exit {})",
+            t.elapsed().as_secs_f64(),
+            out.exit_code
+        ),
+        Some(e) => eprintln!("[risc-box] restoreExec on {id} failed: {e}"),
     }
 }
 
@@ -2127,15 +2645,6 @@ pub extern "C" fn risc_box_main() -> i32 {
 }
 
 pub fn run() {
-    // What the platform actually handed us, by NAME only — never a value.
-    //
-    // A deployment whose $NAME placeholders come out unresolved has two very
-    // different causes that look identical from the config alone: the platform
-    // substituted nothing because it had no secrets, or it had them and the
-    // env never reached this process. One line here separates those, and
-    // without it the answer costs a day of tracing across three machines.
-    // Names are already public (they are in the app config); values are not,
-    // and never appear here.
     // Say which build this is, first line, before anything can go wrong.
     //
     // Nothing in the logs or /status identified the running build, so "which
@@ -2154,6 +2663,9 @@ pub fn run() {
         }
     );
 
+    // What the platform actually handed us, by NAME only — never a value.
+    // Names are already public (they are in the app config); values are not,
+    // and never appear here.
     let mut names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
     names.sort();
     eprintln!("[risc-box] guest env ({}): {}", names.len(), names.join(" "));
@@ -2177,50 +2689,36 @@ pub fn run() {
     // exactly the app that shipped before.
     worker::start();
     let mut server = Server::bind("risc-box", DEFAULT_PORT);
+    let mut main = Machine::new(MAIN_ID, "config");
+    if unconfigured {
+        main.error = Some(format!(
+            "configuration incomplete: {} not set — set the deployment's config/secrets and restart",
+            missing.join(", ")
+        ));
+    }
     let mut app = App {
-        gs: None,
-        gs_tried: false,
         cfg,
-        emu: None,
+        machines: vec![main],
+        root_images: HashMap::new(),
         opl: opl::Opl::new(),
-        phase: Phase::Idle,
-        error: if unconfigured {
-            Some(format!(
-                "configuration incomplete: {} not set — set the deployment's config/secrets and restart",
-                missing.join(", ")
-            ))
-        } else {
-            None
-        },
         pending: if autostart { Some(Start { creds: None, reset: false, snapshot: None }) } else { None },
         cache: None,
         live_creds: None,
-        instret: 0,
-        boot_at: None,
-        fps_now: 0.0,
-        fps_bytes: 0,
-        fps_at: Instant::now(),
         sent_frames: 0,
         sent_fps: 0.0,
+        sent_at: Instant::now(),
+        sent_mark: 0,
         video_frames: 0,
         video_fps: 0.0,
         video_mark: 0,
-        sent_at: Instant::now(),
-        sent_mark: 0,
-        input_boost: 0,
-        boost_run: 0,
-        boost_hold: 0,
         turn_max_ms: 0.0,
         turn_max_detail: String::new(),
-        exec_seq: 0,
-        scrollback: VecDeque::new(),
-        console_total: 0,
-        last_save: None,
-        net: None,
         display: Display::new(),
         pull: BandRing::new(),
         pull_seen: None,
         pull_waiters: Vec::new(),
+        gs: None,
+        gs_tried: false,
         fb_scanned: None,
         fb_cost: Duration::from_millis(0),
         fb_still: 0,
@@ -2230,18 +2728,21 @@ pub fn run() {
         retry: 0,
         retry_at: None,
         retry_start: None,
-        restored: false,
-        restore_ms: 0.0,
-        restore_taken_unix: 0,
-        last_snapshot: None,
     };
     if app.cfg.net_enabled {
-        app.net = Some(NetStack::new(&app.cfg.forwards, app.cfg.net_outbound));
+        // The main machine's user-mode network, listeners included, lives for
+        // the whole process so the deployment's ports answer from the start.
+        app.machines[0].net = Some(NetStack::new(&app.cfg.forwards, app.cfg.net_outbound));
         match app.cfg.net_outbound {
             true => eprintln!("[risc-box] net: outbound NAT enabled (tcp/udp/dns/icmp-echo); disable with net.outbound=false"),
             false => eprintln!("[risc-box] net: outbound disabled — inbound forwards only"),
         }
     }
+    eprintln!(
+        "[risc-box] instances: up to {} machines within {} MiB",
+        app.cfg.instances_max,
+        app.cfg.instances_max_bytes >> 20
+    );
 
     // Periodic health line. The HTTP surface already reports all of this, but
     // it is not always reachable: a PRIVATE deployment has no public data path,
@@ -2279,30 +2780,30 @@ pub fn run() {
 
         if last_heartbeat.elapsed() >= HEARTBEAT {
             last_heartbeat = Instant::now();
-            let phase = match app.phase {
-                Phase::Idle => "idle",
-                Phase::Running => "running",
-                Phase::Halted => "halted",
-                Phase::Error => "error",
-            };
             // Guest MIPS is the number worth watching over time: it moves with
             // what else the loop is doing (scanning the framebuffer, encoding
             // video), and a fall to zero on a "running" machine is the shape
             // of a wedged guest.
-            let secs = app.boot_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            let m = app.main();
+            let secs = m.boot_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
             let mips = match secs > 0.0 {
-                true => app.instret as f64 / 1e6 / secs,
+                true => m.instret as f64 / 1e6 / secs,
                 false => 0.0,
             };
-            let idle = app.emu.as_ref().map_or(false, |e| e.get_cpu().is_idle());
+            let idle = m.emu.as_ref().map_or(false, |e| e.get_cpu().is_idle());
+            let running = app.machines.iter().filter(|m| m.running()).count();
             eprintln!(
-                "[risc-box] heartbeat: phase={phase} up={secs:.0}s instret={:.2}G mips={mips:.1} \
-                 guest_idle={idle} console={}KiB watchers={}/{}{} turn_max={:.0}ms [{}]",
-                app.instret as f64 / 1e9,
-                app.console_total / 1024,
+                "[risc-box] heartbeat: phase={} up={secs:.0}s instret={:.2}G mips={mips:.1} \
+                 guest_idle={idle} console={}KiB watchers={}/{} machines={}/{} footprint={}MiB{} turn_max={:.0}ms [{}]",
+                phase_name(m.phase),
+                m.instret as f64 / 1e9,
+                m.console_total / 1024,
                 server.sse_count("display"),
                 server.sse_count("video"),
-                app.error.as_deref().map(|e| format!(" error={e}")).unwrap_or_default(),
+                running,
+                app.machines.len(),
+                app.footprint() >> 20,
+                m.error.as_deref().map(|e| format!(" error={e}")).unwrap_or_default(),
                 app.turn_max_ms,
                 app.turn_max_detail,
             );
@@ -2316,7 +2817,7 @@ pub fn run() {
         server.flush();
 
         // A failed boot fetch left a scheduled retry: re-queue it when due.
-        if app.phase == Phase::Error && app.pending.is_none() {
+        if app.main().phase == Phase::Error && app.pending.is_none() {
             if let Some(t) = app.retry_at {
                 if Instant::now() >= t {
                     app.retry_at = None;
@@ -2331,147 +2832,148 @@ pub fn run() {
         }
 
         if let Some(start) = app.pending.take() {
-            app.phase = Phase::Running; // optimistic; do_start flips to Error on failure
+            app.main_mut().phase = Phase::Running; // optimistic; do_start flips to Error on failure
             let t = Instant::now();
             do_start(&mut app, &mut server, start);
-            if app.restored {
-                app.restore_ms = t.elapsed().as_secs_f64() * 1000.0;
+            if app.main().restored {
+                app.main_mut().restore_ms = t.elapsed().as_secs_f64() * 1000.0;
             }
         }
 
         let t2 = Instant::now();
         let mut busy = false;
-        if app.phase == Phase::Running {
-            if let Some(emu) = app.emu.as_mut() {
-                let parked = app.input_boost == 0 && emu.get_cpu().is_idle();
-                let batch = match parked {
-                    true => IDLE_BATCH,
-                    false => TICK_BATCH,
-                };
-                // A guest that is RUNNING has already paced this turn: it just
-                // spent a full batch of real work, and the loop must not add a
-                // sleep on top. `busy` used to be set only by console bytes and
-                // encoded frames, so a compute-bound guest that prints nothing
-                // — a game, a build, a long boot phase — was silently throttled
-                // by a millisecond every turn. At the ~6 ms a batch takes that
-                // is a quarter of the machine, given away for nothing.
-                busy = !parked;
-                // Cap how long the boost may run UNBROKEN. Each accepted input
-                // re-arms it, so a client sending faster than it decays pins
-                // the loop in full batches forever: the display worker then
-                // never gets the core and video production collapses even
-                // though every turn still looks healthy. Past the cap the boost
-                // is dropped and cannot re-arm for BOOST_HOLD_TURNS, which
-                // hands the worker a guaranteed window no input rate can take
-                // away. An isolated event never reaches the cap, so a keystroke
-                // keeps the full boost it was given.
-                if app.input_boost > 0 {
-                    app.boost_run += 1;
-                    if app.boost_run >= BOOST_RUN_MAX {
-                        app.input_boost = 0;
-                        app.boost_hold = BOOST_HOLD_TURNS;
-                        app.boost_run = 0;
-                    }
-                } else {
-                    app.boost_run = 0;
-                    app.boost_hold = app.boost_hold.saturating_sub(1);
+
+        // ---- step every machine ------------------------------------------
+        //
+        // Round-robin, one batch each per turn. The turn's instruction budget
+        // is split between the machines that are actually running code, so a
+        // crowded box has turns about as long as a quiet one had and every
+        // guest advances on every turn; a machine parked in WFI takes an
+        // idle batch, which costs the host almost nothing (timers still
+        // tick). The main machine's streams are handled after this pass.
+        let n_busy = app
+            .machines
+            .iter()
+            .filter(|m| m.running() && (m.input_boost > 0 || !m.emu.as_ref().unwrap().get_cpu().is_idle()))
+            .count()
+            .max(1) as u64;
+        let share = (TICK_BATCH / n_busy).max(MIN_BATCH);
+        for m in app.machines.iter_mut() {
+            if !m.running() {
+                continue;
+            }
+            let topic = m.console_topic();
+            let emu = m.emu.as_mut().expect("running implies emu");
+            let parked = m.input_boost == 0 && emu.get_cpu().is_idle();
+            let batch = match parked {
+                true => IDLE_BATCH,
+                false => share,
+            };
+            // A guest that is RUNNING has already paced this turn: it just
+            // spent a batch of real work, and the loop must not add a sleep
+            // on top. `busy` used to be set only by console bytes and
+            // encoded frames, so a compute-bound guest that prints nothing —
+            // a game, a build, a long boot phase — was silently throttled by
+            // a millisecond every turn. At the ~6 ms a batch takes that is a
+            // quarter of the machine, given away for nothing.
+            busy |= !parked;
+            // Cap how long the boost may run UNBROKEN. Each accepted input
+            // re-arms it, so a client sending faster than it decays pins
+            // the loop in full batches forever: the display worker then
+            // never gets the core and video production collapses even
+            // though every turn still looks healthy. Past the cap the boost
+            // is dropped and cannot re-arm for BOOST_HOLD_TURNS, which
+            // hands the worker a guaranteed window no input rate can take
+            // away. An isolated event never reaches the cap, so a keystroke
+            // keeps the full boost it was given.
+            if m.input_boost > 0 {
+                m.boost_run += 1;
+                if m.boost_run >= BOOST_RUN_MAX {
+                    m.input_boost = 0;
+                    m.boost_hold = BOOST_HOLD_TURNS;
+                    m.boost_run = 0;
                 }
-                app.input_boost = app.input_boost.saturating_sub(1);
-                // batched entry point: per-instruction loop overhead is
-                // amortized inside the emulator, and a WFI-parked guest
-                // consumes the batch without spinning (idle turns cost the
-                // loop almost nothing, leaving the budget to scan/encode).
-                emu.run_n(batch);
-                app.instret += batch;
-                // Presented frames per real second. Written out here rather
-                // than behind a method because `emu` holds a borrow of app.emu
-                // for the rest of this block, and these are disjoint fields.
-                {
-                    let bytes = emu.fb_bytes().wrapping_add(emu.gpu_flush_bytes());
-                    let now = Instant::now();
-                    let dt = now.duration_since(app.fps_at).as_secs_f64();
-                    if dt >= 1.0 {
-                        let per = (display::fb_bytes() as f64).max(1.0);
-                        app.fps_now = bytes.wrapping_sub(app.fps_bytes) as f64 / per / dt;
-                        app.fps_bytes = bytes;
-                        app.fps_at = now;
-                        let sdt = now.duration_since(app.sent_at).as_secs_f64();
-                        app.sent_fps = (app.sent_frames - app.sent_mark) as f64 / sdt;
-                        app.sent_mark = app.sent_frames;
-                        app.video_fps = (app.video_frames - app.video_mark) as f64 / sdt;
-                        app.video_mark = app.video_frames;
-                        app.sent_at = now;
-                    }
+            } else {
+                m.boost_run = 0;
+                m.boost_hold = m.boost_hold.saturating_sub(1);
+            }
+            m.input_boost = m.input_boost.saturating_sub(1);
+            // batched entry point: per-instruction loop overhead is
+            // amortized inside the emulator, and a WFI-parked guest
+            // consumes the batch without spinning (idle turns cost the
+            // loop almost nothing, leaving the budget to scan/encode).
+            emu.run_n(batch);
+            m.instret += batch;
+            // Presented frames per real second.
+            {
+                let bytes = emu.fb_bytes().wrapping_add(emu.gpu_flush_bytes());
+                let now = Instant::now();
+                let dt = now.duration_since(m.fps_at).as_secs_f64();
+                if dt >= 1.0 {
+                    let per = (display::fb_bytes() as f64).max(1.0);
+                    m.fps_now = bytes.wrapping_sub(m.fps_bytes) as f64 / per / dt;
+                    m.fps_bytes = bytes;
+                    m.fps_at = now;
                 }
-                // drain the guest UART output into scrollback + SSE
-                let mut chunk: Vec<u8> = Vec::new();
-                let t = emu.get_mut_terminal();
-                loop {
-                    let b = t.get_output();
-                    if b == 0 {
-                        break;
-                    }
-                    chunk.push(b);
-                    if chunk.len() >= 64 * 1024 {
-                        break; // bound one drain; more comes next turn
-                    }
+            }
+            // drain the guest UART output into scrollback + SSE
+            let mut chunk: Vec<u8> = Vec::new();
+            let t = emu.get_mut_terminal();
+            loop {
+                let b = t.get_output();
+                if b == 0 {
+                    break;
                 }
-                if !chunk.is_empty() {
-                    app.console_total += chunk.len() as u64;
-                    for &b in &chunk {
-                        if app.scrollback.len() >= SCROLLBACK {
-                            app.scrollback.pop_front();
-                        }
-                        app.scrollback.push_back(b);
+                chunk.push(b);
+                if chunk.len() >= 64 * 1024 {
+                    break; // bound one drain; more comes next turn
+                }
+            }
+            if !chunk.is_empty() {
+                m.console_total += chunk.len() as u64;
+                for &b in &chunk {
+                    if m.scrollback.len() >= SCROLLBACK {
+                        m.scrollback.pop_front();
                     }
-                    server.broadcast("console", &format!("data: {}", b64(&chunk)));
+                    m.scrollback.push_back(b);
+                }
+                server.broadcast(&topic, &format!("data: {}", b64(&chunk)));
+                busy = true;
+            }
+            // exchange ethernet frames between the guest NIC and the
+            // user-mode network; traffic in flight lifts the WFI throttle
+            // so forwarded connections stay snappy. The boost outlives the
+            // frames by ~0.5s of guest CPU: interactive protocols (ping's
+            // 1s cadence, TCP handshakes) sleep between packets, and
+            // dropping straight back to the idle batch would stretch
+            // guest time ~7x mid-conversation.
+            if let Some(stack) = m.net.as_mut() {
+                let backend = emu.get_mut_cpu().get_mut_mmu().get_mut_net().get_mut_backend();
+                if stack.pump(backend.as_mut()) {
+                    m.input_boost = m.input_boost.max(NET_BOOST_TURNS);
                     busy = true;
                 }
-                // exchange ethernet frames between the guest NIC and the
-                // user-mode network; traffic in flight lifts the WFI throttle
-                // so forwarded connections stay snappy. The boost outlives the
-                // frames by ~0.5s of guest CPU: interactive protocols (ping's
-                // 1s cadence, TCP handshakes) sleep between packets, and
-                // dropping straight back to the idle batch would stretch
-                // guest time ~7x mid-conversation.
-                if let Some(stack) = app.net.as_mut() {
-                    let backend = emu.get_mut_cpu().get_mut_mmu().get_mut_net().get_mut_backend();
-                    if stack.pump(backend.as_mut()) {
-                        app.input_boost = app.input_boost.max(NET_BOOST_TURNS);
-                        busy = true;
-                    }
+            }
+        }
+
+        // ---- the main machine's streams: audio, display, video -------------
+        {
+            let sent_rate_due = {
+                let now = Instant::now();
+                let sdt = now.duration_since(app.sent_at).as_secs_f64();
+                if sdt >= 1.0 {
+                    app.sent_fps = (app.sent_frames - app.sent_mark) as f64 / sdt;
+                    app.sent_mark = app.sent_frames;
+                    app.video_fps = (app.video_frames - app.video_mark) as f64 / sdt;
+                    app.video_mark = app.video_frames;
+                    app.sent_at = now;
                 }
-                // display scanout: only while someone is actually watching
-                // (an unwatched machine costs zero scan work). Dirty bands go
-                // out as deflated SSE events; the browser blits them onto its
-                // canvas (see display.rs).
-                //
-                // Paced by what a scan COSTS rather than by a fixed clock, the
-                // same way the AV1 path below is. A flat 100 ms capped the
-                // picture at 10 fps whatever the machine was doing — which is
-                // both too slow for an idle guest, where a scan is a couple of
-                // milliseconds and the thread is free, and too eager for a
-                // busy one, where every scan is emulator time the desktop
-                // wanted. Spending at most 1/(1+ratio) of the thread lets the
-                // frame rate rise on a quiet machine and fall on a working
-                // one, which is the right way round for both.
-                // A cost budget alone would make a STILL screen more expensive
-                // than the old fixed clock did: finding nothing is cheap, so
-                // the budget would happily look for nothing sixty times a
-                // second. So back off toward the old cadence while the picture
-                // is not moving, and snap back to the floor the moment it is.
-                // A motion's first frame can then be up to FB_SCAN_MS late —
-                // exactly as late as it always was — and every frame after it
-                // arrives at the fast rate.
-                //
-                // With a WORKER (shared-everything-threads), none of the above
-                // applies to the expensive part: the guest's thread does one
-                // memcpy of the framebuffer and hands it over, and the
-                // hashing, diffing, deflating and AV1 all happen on another
-                // core. The pacing stays, but it is now pacing a memcpy rather
-                // than a compressor, so it barely bites — and one frame is
-                // kept in flight, because capturing faster than the worker can
-                // compress would only queue up stale screens.
+            };
+            let _ = sent_rate_due;
+            let input_boost = app.machines[0].input_boost;
+            let main_running = app.machines[0].running();
+            if main_running {
+                let emu = app.machines[0].emu.as_mut().expect("running implies emu");
                 // Pace to the SLOWEST watcher as well as to the cost of a
                 // scan. A frame is only worth producing if the last one has
                 // mostly reached someone: past this backlog the extra frames
@@ -2499,20 +3001,9 @@ pub fn run() {
                         // the card's real-time clock, so music and effects
                         // stay in step without a second timer.
                         app.opl.mix(emu, &mut pcm, rate, channels);
-                        // Send unconditionally. An earlier cut skipped the
-                        // broadcast whenever the listener's backlog passed a
-                        // threshold, on the theory that a deep wbuf was
-                        // slowing the loop. It was not — the card's clock was
-                        // (see virtio_snd::accrue) — and the gate then caused
-                        // the very thing it was meant to prevent: measured
-                        // 77% carried sound, 428 silent frames out of 1868,
-                        // while the card itself dropped NOTHING. Two reasons
-                        // it has to go. The httpd already protects itself
-                        // (starve at SSE_SKIP_WBUF, close at MAX_WBUF), and
-                        // the player trims stale audio in its own ring, so
-                        // the gate was redundant. Worse, sse_backlog reports
-                        // the MAX across subscribers, so one slow listener
-                        // silenced every listener.
+                        // Send unconditionally: the httpd already protects
+                        // itself (starve at SSE_SKIP_WBUF, close at MAX_WBUF)
+                        // and the player trims stale audio in its own ring.
                         if !pcm.is_empty() {
                             server.broadcast(
                                 "audio",
@@ -2531,57 +3022,34 @@ pub fn run() {
                     (server.sse_count("display") > 0 && !display_backed_up) || pull_watching;
                 let watching_video = server.sse_count("video") > 0 && !video_backed_up;
                 // Keep the display scan at its fast floor while input is recent
-                // (the same boost window the CPU uses). The stillness backoff
-                // stretches the scan interval toward 100 ms when the screen has
-                // been quiet, which is right for an idle machine but wrong right
-                // after a keystroke: the character lands during a backed-off
-                // interval and is not scanned out for up to a full one. Measured
-                // ~130 ms input->pixel after a pause vs ~30 ms during continuous
-                // input — and the reason typing felt laggier than the mouse,
-                // which keeps the scan awake simply by moving. Both the worker
-                // and inline scans below pace off this.
-                // …but only a QUIET screen needs snapping awake. When the
-                // frame is already animating (fb_still == 0 on its own), the
+                // (the same boost window the CPU uses) — but only when the
+                // screen was QUIET: when the frame is already animating the
                 // floor-paced scan carries every change anyway, and halving
                 // the floor just doubles scan+deflate work exactly while the
-                // player is providing input — measured as "DOOM lags out when
-                // I move the mouse or type", the encode stealing the emulator
-                // cycles the game needed. Boost from stillness, never from
+                // player is providing input. Boost from stillness, never from
                 // motion.
-                let snap = app.input_boost > 0 && app.fb_still > 0;
+                let snap = input_boost > 0 && app.fb_still > 0;
                 // A video watcher needs frames at the encoder's cadence even
                 // when the band diff has nothing to say: bands are not even
                 // computed for it, so "still" is structurally true and the
-                // backoff otherwise parks a live stream at the 100 ms ceiling
-                // (measured: a video-only watcher got exactly 10 fps).
+                // backoff otherwise parks a live stream at the 100 ms ceiling.
                 let scan_still = if snap || watching_video { 0 } else { app.fb_still };
                 if worker::available() {
                     // A video watcher paces on the video interval, not on the
-                    // scan's cost-share backoff.
-                    //
-                    // That backoff exists because a scan is charged to the
-                    // guest's own thread, so it caps itself at 1/(1+RATIO) of
-                    // it. With a worker the EXPENSIVE half — the encode — is
-                    // not on this thread at all; the guest pays only the
-                    // capture. Charging the capture as if it still dragged the
-                    // encode behind it held the stream at 4x a ~4.4 ms capture,
-                    // a 17.6 ms cadence, and 55-57 fps measured on a machine
-                    // whose game was running at 78-190. The floor never got a
-                    // say. Pace video on its own interval and let the capture
-                    // cost and the encoder be the real limits.
+                    // scan's cost-share backoff: with a worker the EXPENSIVE
+                    // half — the encode — is not on this thread at all; the
+                    // guest pays only the capture.
                     let interval = match watching_video {
                         true => worker::VIDEO_MIN_INTERVAL,
                         false => display::scan_interval_boosted(
                             app.fb_cost, scan_still, snap),
                     };
                     let due = app.fb_scanned.map_or(true, |t| t.elapsed() >= interval);
-                    // Two jobs in flight, not one: the worker's encode (23 ms
-                    // measured on kryptos) otherwise serializes with the
-                    // capture handoff and the whole pipeline runs at
-                    // encode+turnaround instead of max(encode, capture) — a
-                    // 28 fps ceiling where the hardware supports 40. Depth 2
-                    // keeps the worker saturated and costs at most one frame
-                    // of staleness (~16 ms), which the stream happily pays.
+                    // Two jobs in flight, not one: the worker's encode
+                    // otherwise serializes with the capture handoff and the
+                    // whole pipeline runs at encode+turnaround instead of
+                    // max(encode, capture). Depth 2 keeps the worker saturated
+                    // and costs at most one frame of staleness (~16 ms).
                     if (watching_display || watching_video) && due && worker::inflight() < 2 {
                         let began = Instant::now();
                         let mut buf = worker::take_buffer();
@@ -2637,22 +3105,10 @@ pub fn run() {
                     if app.venc.as_ref().map(|(p, _)| *p) != Some(packed) {
                         app.venc = worker::build_encoder();
                     }
-                    // Pace the encoder by what it COSTS, not by the clock.
-                    //
-                    // Encoding AV1 in here is not free work on an idle thread —
-                    // it is the same thread the guest runs on, so every frame
-                    // is emulator time the machine did not get. Measured on a
-                    // pinned workload, a fixed 10 fps cadence took 82% of the
-                    // guest's speed: 36 MIPS with nobody watching, 6.6 MIPS
-                    // with the AV1 stream attached. A desktop that starts in
-                    // four minutes takes twenty while you watch it start.
-                    //
-                    // So: after each frame, wait until at least
-                    // VIDEO_COST_RATIO times as long has been spent NOT
-                    // encoding. The stream slows down on a machine that is
-                    // working hard and speeds up on one that is idle, which is
-                    // the right way round — and the guest keeps the large
-                    // majority of the thread either way.
+                    // Pace the encoder by what it COSTS, not by the clock:
+                    // after each frame, wait until at least VIDEO_COST_RATIO
+                    // times as long has been spent NOT encoding, so the guest
+                    // keeps the large majority of the thread either way.
                     const VIDEO_COST_RATIO: u32 = 4; // encode ≤ 1/(1+4) of the time
                     let due = app.video_scanned.map_or(true, |t| {
                         let floor = std::time::Duration::from_millis(display::FB_SCAN_FLOOR_MS);
@@ -2760,10 +3216,10 @@ pub fn run() {
             }
         }
 
-        // The GameStream host: built on the first turn after the machine is
-        // running, then polled like any other server. It must never block --
-        // this is the same turn that steps the CPU.
-        if app.gs.is_none() && !app.gs_tried && app.phase == Phase::Running {
+        // The GameStream host: built on the first turn after the main machine
+        // is running, then polled like any other server. It must never block
+        // -- this is the same turn that steps the CPU.
+        if app.gs.is_none() && !app.gs_tried && app.main().running() {
             app.gs_tried = true;
             app.gs = gamestream::host::build(&app.cfg);
         }
@@ -2771,11 +3227,11 @@ pub fn run() {
             busy |= gs.poll();
         }
         // Input the client sent over the control channel, injected straight
-        // into the machine -- no HTTP hop, which is the point of the host
+        // into the main machine -- no HTTP hop, which is the point of the host
         // living in this module. Already translated to the app's own /hid
         // shape by gamestream::control.
         for ev in gamestream::control::take_input() {
-            hid_inner(&mut app, &mut server, 0, &ev, false);
+            hid_inner(&mut app.machines[0], &mut server, 0, &ev, false);
             busy = true;
         }
 
@@ -2800,8 +3256,9 @@ pub fn run() {
             }
         }
         // Running with real CPU work paces the loop; only sleep when idle or
-        // when a running machine produced no output and moved no bytes.
-        if app.phase != Phase::Running {
+        // when the running machines produced no output and moved no bytes.
+        let any_running = app.machines.iter().any(|m| m.running());
+        if !any_running {
             std::thread::sleep(std::time::Duration::from_millis(20));
             last_yield = std::time::Instant::now();
         } else if !busy && !flushed {
@@ -2809,45 +3266,23 @@ pub fn run() {
             last_yield = std::time::Instant::now();
         } else if !flushed && server.pending_bytes() > 0 {
             // Queued output that would not go out this turn: yield a slice so
-            // the host runtime can run its stream worker.
-            //
-            // This is the difference between a stream that runs and one that
-            // dies. Handing bytes to a wasip2 output-stream does not put them
-            // on the socket; the engine's worker does, when the runtime gets
-            // to run, which on a busy guest is only when we sleep. The old
-            // condition slept just when the loop had nothing to do — so a
-            // watcher made the loop busy every turn, the loop stopped
-            // yielding, the worker never ran, `check_write` kept reporting no
-            // permit, and the queue grew until the watcher was reaped at
-            // WRITE_STALL. Measured with one reader on a fresh machine: 28 KiB
-            // delivered, ~200 KiB stuck, kernel Send-Q 0 (the socket was empty
-            // and writable the entire time), watcher dropped at 45s. Moonlight
-            // saw that as a black screen; the browser saw a stream that
-            // stopped a second after it started.
-            //
-            // Gated on the flush having moved NOTHING, so this costs the
-            // guest nothing while a stream keeps up (handing bytes to the
-            // stream counts as movement) and pays 1 ms only on the turns
-            // where the engine says it has no room — which is exactly the
-            // backpressure signal, and self-paces the stream to the rate the
-            // link and the runtime can actually carry.
+            // the host runtime can run its stream worker. Handing bytes to a
+            // wasip2 output-stream does not put them on the socket; the
+            // engine's worker does, when the runtime gets to run, which on a
+            // busy guest is only when we sleep. Gated on the flush having
+            // moved NOTHING, so this costs the guest nothing while a stream
+            // keeps up and pays 1 ms only on the turns where the engine says
+            // it has no room — the backpressure signal.
             std::thread::sleep(std::time::Duration::from_millis(1));
             last_yield = std::time::Instant::now();
         } else if last_yield.elapsed() >= std::time::Duration::from_millis(16) {
             // ACCEPT FAIRNESS. The backpressure yield above only fires when
             // OUTPUT is stuck. But a busy loop whose output IS flowing still
             // starves the host runtime of the slice it needs to ACCEPT new
-            // connections: send/recv readiness is made kernel-truthful by the
-            // socket-level-check patch, but the listener's accept is not on
-            // that path — it stays gated on the runtime's cooperative budget,
-            // which replenishes only when a fiber yields. A video watcher makes
-            // `busy` true every turn, so without this the loop never yields and
-            // new POST /hid connections are never accepted while the already-
-            // open /video stream keeps flowing: smooth video, dead input (the
-            // exact "cursor and keyboard don't work under Moonlight" bug).
+            // connections: the listener's accept stays gated on the runtime's
+            // cooperative budget, which replenishes only when a fiber yields.
             // Yield the OS thread at most once per ~frame so the runtime can
-            // drain its accept queue; costs ~1 ms/16 ms and never touches the
-            // stream's own pacing above.
+            // drain its accept queue; costs ~1 ms/16 ms.
             std::thread::sleep(std::time::Duration::from_millis(1));
             last_yield = std::time::Instant::now();
         }

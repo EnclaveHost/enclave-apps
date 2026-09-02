@@ -2989,6 +2989,18 @@ impl Cpu {
 	/// Caches (decode, block, TLB, AOT slots) are not written: they are
 	/// rebuilt on demand and a fresh Cpu starts with them empty anyway.
 	pub fn snapshot_into(&self, s: &mut ::snapshot::Ser, level: u8) -> ::snapshot::SnapshotStats {
+		self.snapshot_cpu(s);
+		self.mmu.snapshot_into(s, level, true)
+	}
+
+	/// risc-box patch (fork): every section except RAM_ (the RAM is shared
+	/// as an image instead of serialized).
+	pub fn snapshot_into_no_ram(&self, s: &mut ::snapshot::Ser, level: u8) {
+		self.snapshot_cpu(s);
+		self.mmu.snapshot_into(s, level, false);
+	}
+
+	fn snapshot_cpu(&self, s: &mut ::snapshot::Ser) {
 		let at = s.begin_section(b"CPU_");
 		s.u64(self.clock);
 		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
@@ -3010,7 +3022,6 @@ impl Cpu {
 		s.u64(self.since_service);
 		s.bool(self.check_interrupt);
 		s.end_section(at);
-		self.mmu.snapshot_into(s, level)
 	}
 
 	/// risc-box patch (snapshot): Ok(false) = not a section this layer knows.

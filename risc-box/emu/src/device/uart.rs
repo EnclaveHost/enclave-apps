@@ -88,7 +88,23 @@ impl Uart {
 		// host-buffered, so THR is consumed at the store now (see store());
 		// this tick only delivers the pending THRE edge at service cadence.
 
-		if self.thre_ip || rx_ip {
+		// risc-box patch: the receive side is LEVEL-triggered, not an edge
+		// on the tick that pulled the byte. The PLIC pending bit is cleared
+		// by the guest's claim-complete, and the CPU's SEIP by delivery; a
+		// byte that lands after the serial ISR's last LSR read but before
+		// that completion used to raise its edge into an already-pending
+		// line and then have it wiped by the completion — after which the
+		// byte sat in RBR (blocking every byte behind it, since RBR must be
+		// empty to pull the next), no edge could ever come, and a guest
+		// parked in WFI slept forever with a full receive register. Seen
+		// as a resumed machine going silent 17 characters into a pasted
+		// line. Level semantics need no memory of edges: while data is
+		// unread and the RX interrupt is enabled, the line is high and the
+		// PLIC re-arms it whenever the guest has completed the previous
+		// one (see Plic::tick). THRE stays a one-shot.
+		let rx_level = (self.ier & IER_RXINT_BIT) != 0 && self.rbr != 0;
+		let _ = rx_ip;
+		if self.thre_ip || rx_level {
 			self.interrupting = true;
 			self.thre_ip = false;
 		} else {

@@ -21,7 +21,7 @@ extern crate fnv;
 
 use self::fnv::FnvHashMap;
 
-use memory::Memory;
+use memory::{Memory, RamImage};
 use cpu::{PrivilegeMode, Trap, TrapType, Xlen, get_privilege_mode};
 use device::virtio_block_disk::VirtioBlockDisk;
 use device::virtio_input::VirtioInput; // risc-box patch
@@ -318,6 +318,31 @@ impl Mmu {
 	/// * `data` Filesystem binary content
 	pub fn init_disk(&mut self, data: Vec<u8>) {
 		self.disk.init(data);
+	}
+
+	/// risc-box patch: attach a base disk image shared with other machines.
+	pub fn init_disk_shared(&mut self, base: std::sync::Arc<Vec<u8>>) {
+		self.disk.init_shared(base);
+	}
+
+	/// risc-box patch (fork): take a shared RAM image as this machine's
+	/// memory (copy-on-write from here on) and drop every derived cache.
+	pub fn adopt_ram(&mut self, image: &RamImage) {
+		self.memory.ram_mut().adopt(image);
+		self.memory.bump_code_gen();
+		self.clear_page_cache();
+		self.tlb_flush();
+	}
+
+	/// risc-box patch (fork): publish this machine's RAM as an image.
+	pub fn share_ram(&mut self) -> RamImage {
+		self.memory.ram_mut().share()
+	}
+
+	/// risc-box patch: (RAM owned, RAM shared, disk overlay) bytes.
+	pub fn footprint(&self) -> (usize, usize, usize) {
+		let (o, sh) = self.memory.ram().footprint();
+		(o, sh, self.disk.footprint())
 	}
 
 	/// Overrides defalut Device tree configuration.
@@ -1500,14 +1525,14 @@ impl MemoryWrapper {
 		self.memory.validate_address(address - DRAM_BASE)
 	}
 
-	// risc-box patch (snapshot): raw DRAM for the sparse codec. Writes made
-	// through `ram_mut` bypass the SMC snoop, so the caller bumps code_gen.
-	pub fn ram(&self) -> &[u8] {
-		self.memory.as_slice()
+	// risc-box patch (snapshot/fork): the pages themselves. Writes made
+	// through these bypass the SMC snoop, so the caller bumps code_gen.
+	pub fn ram(&self) -> &Memory {
+		&self.memory
 	}
 
-	pub fn ram_mut(&mut self) -> &mut [u8] {
-		self.memory.as_mut_slice()
+	pub fn ram_mut(&mut self) -> &mut Memory {
+		&mut self.memory
 	}
 }
 
@@ -1553,7 +1578,7 @@ pub(crate) fn privilege_from(v: u8) -> Result<PrivilegeMode, String> {
 }
 
 impl Mmu {
-	pub fn snapshot_into(&self, s: &mut Ser, level: u8) -> snapshot::SnapshotStats {
+	pub fn snapshot_into(&self, s: &mut Ser, level: u8, with_ram: bool) -> snapshot::SnapshotStats {
 		let at = s.begin_section(b"MMU_");
 		s.u64(self.clock);
 		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
@@ -1594,9 +1619,15 @@ impl Mmu {
 		self.opl.snapshot(s);
 		s.end_section(at);
 
-		let at = s.begin_section(b"RAM_");
-		let ram = snapshot::encode_ram(self.memory.ram(), level, s);
-		s.end_section(at);
+		let ram = match with_ram {
+			true => {
+				let at = s.begin_section(b"RAM_");
+				let ram = snapshot::encode_ram(self.memory.ram(), level, s);
+				s.end_section(at);
+				ram
+			},
+			false => snapshot::RamStats { bytes: self.memory.ram().len() as u64, pages_kept: 0, pages_total: 0 }
+		};
 
 		let at = s.begin_section(b"DDLT");
 		let blocks = self.disk.dirty_blocks();
@@ -1654,7 +1685,7 @@ impl Mmu {
 			b"VGPU" => self.gpu.restore(&mut r)?,
 			b"OPL_" => self.opl.restore(&mut r)?,
 			b"RAM_" => {
-				let st = snapshot::decode_ram(payload, self.memory.ram_mut())?;
+				let st = snapshot::decode_ram_into(payload, self.memory.ram_mut())?;
 				self.memory.bump_code_gen();
 				stats.ram_pages_kept = st.pages_kept;
 				stats.ram_pages_total = st.pages_total;

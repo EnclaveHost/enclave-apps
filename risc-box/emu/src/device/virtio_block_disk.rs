@@ -1,4 +1,5 @@
 use mmu::MemoryWrapper;
+use std::convert::TryInto; // edition-2015 crate
 
 // Based on Virtual I/O Device (VIRTIO) Version 1.1
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html
@@ -36,17 +37,25 @@ pub struct VirtioBlockDisk {
 	interrupt_status: u32, // read only
 	status: u32, // read and write
 	notify_clocks: Vec::<u64>,
-	contents: Vec<u64>,
-	contents_len: usize, // risc-box patch: original byte length, for dump_contents()
-	// risc-box patch (snapshot): one bit per DELTA_BLOCK bytes of disk,
-	// set by every guest write since init(). A snapshot carries only these
-	// blocks on top of the base image the app re-fetches, so it is a
-	// fraction of the image's size rather than a second copy of it.
-	dirty: Vec<u64>
+	// risc-box patch: the disk is a SHARED, read-only base image plus this
+	// machine's overlay of DELTA_BLOCK-sized blocks it has written. Every
+	// machine booted from one image holds the base once between them (an
+	// Arc), and a snapshot carries only the overlay — which is also exactly
+	// the delta a restore replays on top of a freshly fetched base.
+	base: Arc<Vec<u8>>,
+	overlay: Vec<Option<Box<Block>>>,
+	overlay_blocks: usize
 }
 
-/// Granularity of the write tracking (matches snapshot::PAGE).
+/// Granularity of the overlay (matches snapshot::PAGE).
 const DELTA_BLOCK: u64 = 4096;
+type Block = [u8; DELTA_BLOCK as usize];
+
+use std::sync::Arc;
+
+fn zero_block() -> Box<Block> {
+	unsafe { Box::<Block>::new_zeroed().assume_init() }
+}
 
 impl VirtioBlockDisk {
 	/// Creates a new `VirtioBlockDisk`.
@@ -67,9 +76,9 @@ impl VirtioBlockDisk {
 			status: 0,
 			interrupt_status: 0,
 			notify_clocks: Vec::new(),
-			contents: vec![],
-			contents_len: 0,
-			dirty: vec![]
+			base: Arc::new(Vec::new()),
+			overlay: Vec::new(),
+			overlay_blocks: 0
 		}
 	}
 
@@ -81,11 +90,13 @@ impl VirtioBlockDisk {
 	/// risc-box patch: copies the current disk contents (including every write
 	/// the guest has made) back out as plain bytes, for persisting the image.
 	pub fn dump_contents(&self) -> Vec<u8> {
-		let mut out = Vec::with_capacity(self.contents_len);
-		for i in 0..self.contents_len {
-			let index = i >> 3;
-			let pos = (i % 8) * 8;
-			out.push((self.contents[index] >> pos) as u8);
+		let mut out: Vec<u8> = (*self.base).clone();
+		for (i, b) in self.overlay.iter().enumerate() {
+			if let Some(b) = b {
+				let at = i * DELTA_BLOCK as usize;
+				let n = (out.len() - at).min(DELTA_BLOCK as usize);
+				out[at..at + n].copy_from_slice(&b[..n]);
+			}
 		}
 		out
 	}
@@ -96,26 +107,26 @@ impl VirtioBlockDisk {
 	/// # Arguments
 	/// * `contents` filesystem content binary
 	pub fn init(&mut self, contents: Vec<u8>) {
-		// risc-box patch: pack the image into u64 cells with ONE exactly-sized
-		// allocation. The original pushed a zero per cell, so the Vec doubled
-		// its way up and briefly held ~2x the image in dead capacity — a real
-		// cost on wasm32, where the disk and the guest RAM share one linear
-		// memory and a half-gigabyte image leaves little headroom.
-		self.contents_len = contents.len();
-		self.dirty = vec![0u64; ((contents.len() as u64 + DELTA_BLOCK - 1) / DELTA_BLOCK / 64 + 1) as usize];
-		let cells = (contents.len() + 7) / 8;
-		self.contents = Vec::with_capacity(cells);
-		let full = contents.len() / 8;
-		for i in 0..full {
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&contents[i * 8..i * 8 + 8]);
-			self.contents.push(u64::from_le_bytes(b));
-		}
-		if full < cells {
-			let mut b = [0u8; 8];
-			b[..contents.len() - full * 8].copy_from_slice(&contents[full * 8..]);
-			self.contents.push(u64::from_le_bytes(b));
-		}
+		self.init_shared(Arc::new(contents));
+	}
+
+	/// risc-box patch: attach a base image other machines share. Nothing is
+	/// copied; the overlay starts empty.
+	pub fn init_shared(&mut self, base: Arc<Vec<u8>>) {
+		let blocks = ((base.len() as u64 + DELTA_BLOCK - 1) / DELTA_BLOCK) as usize;
+		self.overlay = (0..blocks).map(|_| None).collect();
+		self.overlay_blocks = 0;
+		self.base = base;
+	}
+
+	/// The base image, to hand to another machine's `init_shared`.
+	pub fn base(&self) -> Arc<Vec<u8>> {
+		self.base.clone()
+	}
+
+	/// Bytes of overlay this machine holds itself.
+	pub fn footprint(&self) -> usize {
+		self.overlay_blocks * DELTA_BLOCK as usize
 	}
 
 	/// Runs one cycle. Data transfer between main memory and block device
@@ -197,7 +208,7 @@ impl VirtioBlockDisk {
 			// every rootfs at 100 MiB — a larger ext image then fails to mount
 			// with an EXT4 "bad geometry" panic. Round down to whole sectors.
 			0x10001100..=0x10001107 => {
-				let sectors = (self.contents_len / 512) as u64;
+				let sectors = (self.base.len() / 512) as u64;
 				(sectors >> ((address - 0x10001100) * 8)) as u8
 			},
 			_ => 0
@@ -356,8 +367,7 @@ impl VirtioBlockDisk {
 		debug_assert!((disk_address % 8) == 0, "Disk address should be eight-byte aligned. {:X}", disk_address);
 		debug_assert!((length % 8) == 0, "Length should be eight-byte aligned. {:X}", length);
 		for i in 0..(length / 8) {
-			let disk_index = ((disk_address + i * 8) >> 3) as usize;
-			memory.write_doubleword(mem_address + i * 8, self.contents[disk_index]);
+			memory.write_doubleword(mem_address + i * 8, self.read_u64(disk_address + i * 8));
 		}
 	}
 
@@ -372,21 +382,68 @@ impl VirtioBlockDisk {
 		debug_assert!((mem_address % 8) == 0, "Memory address should be eight-byte aligned. {:X}", mem_address);
 		debug_assert!((disk_address % 8) == 0, "Disk address should be eight-byte aligned. {:X}", disk_address);
 		debug_assert!((length % 8) == 0, "Length should be eight-byte aligned. {:X}", length);
-		self.mark_dirty(disk_address, length); // risc-box patch (snapshot)
 		for i in 0..(length / 8) {
-			let disk_index = ((disk_address + i * 8) >> 3) as usize;
-			self.contents[disk_index] = memory.read_doubleword(mem_address + i * 8);
+			let v = memory.read_doubleword(mem_address + i * 8);
+			let a = disk_address + i * 8;
+			let off = (a % DELTA_BLOCK) as usize;
+			if a + 8 <= self.base.len() as u64 && off + 8 <= DELTA_BLOCK as usize {
+				let b = self.overlay_block(a / DELTA_BLOCK);
+				b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+			} else {
+				for j in 0..8 {
+					self.write_to_disk(a + j, (v >> (j * 8)) as u8);
+				}
+			}
 		}
+	}
+
+	/// Eight bytes at `address`, zero past the end of the image.
+	fn read_u64(&self, address: u64) -> u64 {
+		let off = (address % DELTA_BLOCK) as usize;
+		if address + 8 <= self.base.len() as u64 && off + 8 <= DELTA_BLOCK as usize {
+			let a = address as usize;
+			let bytes: [u8; 8] = match &self.overlay[a / DELTA_BLOCK as usize] {
+				Some(b) => b[off..off + 8].try_into().unwrap(),
+				None => self.base[a..a + 8].try_into().unwrap()
+			};
+			return u64::from_le_bytes(bytes);
+		}
+		let mut v = 0u64;
+		for j in 0..8 {
+			v |= (self.read_from_disk(address + j) as u64) << (j * 8);
+		}
+		v
+	}
+
+	/// The overlay block for `block`, created from the base on first write.
+	fn overlay_block(&mut self, block: u64) -> &mut Block {
+		let slot = &mut self.overlay[block as usize];
+		if slot.is_none() {
+			let mut b = zero_block();
+			let at = (block * DELTA_BLOCK) as usize;
+			if at < self.base.len() {
+				let n = (self.base.len() - at).min(DELTA_BLOCK as usize);
+				b[..n].copy_from_slice(&self.base[at..at + n]);
+			}
+			*slot = Some(b);
+			self.overlay_blocks += 1;
+		}
+		slot.as_mut().unwrap()
 	}
 
 	/// Reads a byte from disk.
 	///
 	/// # Arguments
 	/// * `addresss` Address in disk
-	fn read_from_disk(&mut self, address: u64) -> u8 {
-		let index = (address >> 3) as usize;
-		let pos = (address % 8) * 8;
-		(self.contents[index] >> pos) as u8
+	fn read_from_disk(&self, address: u64) -> u8 {
+		let a = address as usize;
+		if a >= self.base.len() {
+			return 0;
+		}
+		match &self.overlay[a / DELTA_BLOCK as usize] {
+			Some(b) => b[a % DELTA_BLOCK as usize],
+			None => self.base[a]
+		}
 	}
 
 	/// Writes a byte to disk.
@@ -395,10 +452,11 @@ impl VirtioBlockDisk {
 	/// * `addresss` Address in disk
 	/// * `value` Data written to disk
 	fn write_to_disk(&mut self, address: u64, value: u8) {
-		self.mark_dirty(address, 1); // risc-box patch (snapshot)
-		let index = (address >> 3) as usize;
-		let pos = (address % 8) * 8;
-		self.contents[index] = (self.contents[index] & !(0xff << pos)) | ((value as u64) << pos);
+		if address >= self.base.len() as u64 {
+			return;
+		}
+		let off = (address % DELTA_BLOCK) as usize;
+		self.overlay_block(address / DELTA_BLOCK)[off] = value;
 	}
 
 	fn get_page_address(&self) -> u64 {
@@ -579,73 +637,39 @@ impl VirtioBlockDisk {
 use snapshot::{De, Ser};
 
 impl VirtioBlockDisk {
-	fn mark_dirty(&mut self, disk_address: u64, length: u64) {
-		if length == 0 {
-			return;
-		}
-		let first = disk_address / DELTA_BLOCK;
-		let last = (disk_address + length - 1) / DELTA_BLOCK;
-		for b in first..=last {
-			if let Some(word) = self.dirty.get_mut((b / 64) as usize) {
-				*word |= 1u64 << (b % 64);
-			}
-		}
-	}
-
 	/// Byte length of the loaded image (a snapshot's base must match it).
 	pub fn disk_len(&self) -> usize {
-		self.contents_len
+		self.base.len()
 	}
 
-	/// Every block index the guest has written, ascending.
+	/// Every block the guest has written, ascending — the overlay's keys.
 	pub fn dirty_blocks(&self) -> Vec<u32> {
-		let mut out = Vec::new();
-		for (wi, &word) in self.dirty.iter().enumerate() {
-			if word == 0 {
-				continue;
-			}
-			for bit in 0..64 {
-				if word & (1u64 << bit) != 0 {
-					out.push((wi * 64 + bit) as u32);
-				}
-			}
-		}
-		out
+		self.overlay
+			.iter()
+			.enumerate()
+			.filter(|(_, b)| b.is_some())
+			.map(|(i, _)| i as u32)
+			.collect()
 	}
 
 	/// One DELTA_BLOCK-sized block, zero-padded past the end of the image.
 	pub fn read_block(&self, block: u32, out: &mut [u8]) {
 		let base = block as u64 * DELTA_BLOCK;
 		for (i, b) in out.iter_mut().enumerate() {
-			let a = base + i as u64;
-			*b = match (a as usize) < self.contents_len {
-				true => self.read_from_disk_at(a),
-				false => 0
-			};
+			*b = self.read_from_disk(base + i as u64);
 		}
 	}
 
-	fn read_from_disk_at(&self, address: u64) -> u8 {
-		let index = (address >> 3) as usize;
-		let pos = (address % 8) * 8;
-		(self.contents[index] >> pos) as u8
-	}
-
-	/// Write one block back (a restore replaying the delta). Marks it
-	/// dirty, so a snapshot taken from a restored machine still carries
+	/// Write one block back (a restore replaying the delta). It lands in the
+	/// overlay, so a snapshot taken from a restored machine still carries
 	/// every change relative to the base image.
 	pub fn write_block(&mut self, block: u32, data: &[u8]) -> Result<(), String> {
 		let base = block as u64 * DELTA_BLOCK;
-		if base >= self.contents_len as u64 {
-			return Err(format!("snapshot: delta block {} lies past the {}-byte image", block, self.contents_len));
+		if base >= self.base.len() as u64 {
+			return Err(format!("snapshot: delta block {} lies past the {}-byte image", block, self.base.len()));
 		}
-		for (i, &b) in data.iter().enumerate() {
-			let a = base + i as u64;
-			if (a as usize) >= self.contents_len {
-				break;
-			}
-			self.write_to_disk(a, b);
-		}
+		let n = data.len().min(DELTA_BLOCK as usize);
+		self.overlay_block(block as u64)[..n].copy_from_slice(&data[..n]);
 		Ok(())
 	}
 

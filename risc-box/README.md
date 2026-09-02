@@ -133,6 +133,9 @@ JSON object:
 - `saveKey` is where **Save disk** PUTs the guest-modified image (defaults to
   `fs`; set it aside to keep the pristine image). `readOnly: true` disables
   saving (and snapshotting).
+- `instances` — `{"max": 8, "maxBytes": 3221225472}` bounds how many machines
+  this process hosts (`main` included) and the host memory they may add up to;
+  see *Many machines, one process*.
 - `snapshot` names the object a **snapshot of the booted machine** lives under.
   When it exists, `/start` resumes the machine from it in seconds instead of
   booting the OS; when it does not exist yet, the boot is a cold one and
@@ -195,6 +198,9 @@ JSON object:
 | `GET /console`    | Server-Sent Events: base64 console output, scrollback replayed first |
 | `POST /save`      | dump the guest disk and PUT it to `saveKey`                          |
 | `POST /snapshot`  | `{key?,level?}`: serialize the running machine and PUT it to the snapshot key; later starts resume from it |
+| `GET /instances`  | the machines this process hosts, the images they fork from, the memory in use |
+| `POST /instances` | `{from?: "main" \| "<snapshot key>", id?}`: fork a new machine (default: the config's root snapshot); created running |
+| `/i/<id>/…`       | an instance's `status`, `console`, `input`, `exec`, `hid`, `fb.png`, `frame.jpg`, `fb.rgb`, `snapshot`, `stop`, `start`; `DELETE /i/<id>` forgets it |
 | `POST /stop`      | halt the machine and drop it from RAM                                |
 | `GET /ping`       | liveness                                                             |
 
@@ -385,6 +391,57 @@ and how big, whether the running machine was restored and how long that took.
 The same machinery is in `boot-bench` for measuring without S3:
 `--snapshot-on MARKER:FILE` writes one when MARKER appears on the console,
 `--restore FILE` resumes from it.
+
+## Many machines, one process
+
+`main` is the machine the config describes. Beside it the app hosts
+**instances**: machines forked from a snapshot image, each with its own RAM,
+disk overlay, serial console, `/exec` and NIC. Think one root image and a
+machine per user, or per chat — created in milliseconds, thrown away when the
+conversation ends.
+
+```sh
+curl -s -XPOST -H "x-api-key: $KEY" .../instances -d '{}'            # fork the config's root snapshot
+# {"id":"3fa9c1e2","origin":"images/desktop.snap","phase":"running","ramMiB":512,...}
+curl -s -XPOST -H "x-api-key: $KEY" .../instances -d '{"from":"main","id":"scratch"}'
+curl -s -XPOST -H "x-api-key: $KEY" .../i/3fa9c1e2/exec -d '{"cmd":"hostname; uptime"}'
+curl -s -H "x-api-key: $KEY" .../i/3fa9c1e2/fb.png > screen.png
+curl -s -XDELETE -H "x-api-key: $KEY" .../i/3fa9c1e2
+curl -s -H "x-api-key: $KEY" .../instances | jq .summary
+# {"count":3,"max":8,"footprintBytes":412090368,"maxBytes":3221225472,"images":2}
+```
+
+What makes this affordable is how a machine's memory is held. Guest RAM is
+an array of 64 KiB chunks that start untouched (reads as zero, costs nothing),
+are **shared** with the image the machine forked from, and are copied only
+when the guest writes into them. The base disk is one shared object; each
+machine keeps an overlay of the 4 KiB blocks it has written. So N instances of
+one booted image cost one image plus what each has diverged since — a fresh
+fork of a 512 MiB desktop costs a few megabytes, and a 4 GiB wasm32 process
+can hold a room full of them. The footprint `/instances` reports is exactly
+that: owned chunks, overlays, resident images, the base disk.
+
+`from` names the image. The config's `snapshot` key is the default root
+(inflated once, then resident); any other snapshot object in the bucket works
+the same way; `"main"` takes the **live main machine as it is right now** —
+its RAM becomes shared, the fork is a few milliseconds and never touches the
+bucket — which is how to build an instance from a machine you have just set
+up by hand. An instance's RAM size is the image's; its display geometry and
+clock mode must match the deployment's, because those are part of the
+identity a snapshot is bound to. The `restoreExec` hook runs on every fork
+(a forked guest has the same stale clock and random pool a resumed one has).
+
+The scheduler is round-robin: each turn every running machine that is not
+parked in WFI gets an equal share of the turn's instruction budget, and an
+idle guest costs the host almost nothing, so a hundred sleeping instances are
+cheap and three busy ones each get a third of the core. `instances.max`
+(default 8, `main` included) and `instances.maxBytes` (default 3 GiB) bound
+the count and the memory; a fork past either is refused with a 409.
+
+What stays with `main`: the deployment's port forwards (instances get outbound
+NAT only), the display/video/audio streams, the GameStream host, `/save`. An
+instance's `/stop` drops its pages; `/start` is a fresh fork of the same
+origin, not a resume. An instance's `/snapshot` needs an explicit `key`.
 
 ## Networking and SSH
 

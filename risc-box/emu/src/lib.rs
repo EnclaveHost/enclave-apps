@@ -35,6 +35,36 @@ use cpu::{Cpu, Xlen};
 use elf_analyzer::{ElfAnalyzer};
 use terminal::Terminal;
 use snapshot::{De, Ser}; // risc-box patch
+pub use memory::RamImage;
+use std::sync::Arc;
+
+/// risc-box patch (fork): a snapshot inflated ONCE into shareable form —
+/// the RAM as a copy-on-write image, the device sections as bytes, the disk
+/// delta as bytes. Any number of machines resume from it; each adoption is
+/// O(chunks) reference bumps plus the device state, not an inflate. A
+/// running machine can publish itself the same way (`Emulator::image`), so
+/// forks need not go through a bucket at all.
+pub struct SnapshotImage {
+	pub meta: SnapshotMeta,
+	sections: Vec<([u8; 4], Vec<u8>)>,
+	ram: RamImage,
+	ram_pages_kept: u64,
+	ram_pages_total: u64,
+}
+
+impl SnapshotImage {
+	/// Bytes the image itself holds (its RAM chunks + device sections).
+	pub fn footprint(&self) -> usize {
+		self.ram.footprint() + self.sections.iter().map(|(_, p)| p.len()).sum::<usize>()
+	}
+}
+
+/// risc-box patch: what a machine costs the host right now, in bytes.
+pub struct Footprint {
+	pub ram_owned: usize,
+	pub ram_shared: usize,
+	pub disk_overlay: usize,
+}
 
 /// risc-box patch (snapshot): what a snapshot or restore reports back.
 pub struct SnapshotInfo {
@@ -637,7 +667,39 @@ impl Emulator {
 	/// boot) when the identity, RAM size or base disk differ from the
 	/// snapshot's, or when the format has drifted.
 	pub fn restore(&mut self, data: &[u8], identity: &str) -> Result<SnapshotInfo, String> {
+		let image = Self::load_image(data)?;
+		self.restore_image(&image, identity)
+	}
+
+	/// risc-box patch (fork): inflate a snapshot into a shareable image.
+	pub fn load_image(data: &[u8]) -> Result<SnapshotImage, String> {
 		let meta = Self::snapshot_meta(data)?;
+		let secs = snapshot::sections(data)?;
+		let mut sections = Vec::new();
+		let mut ram: Option<(RamImage, snapshot::RamStats)> = None;
+		for (tag, payload) in secs.iter().skip(1) {
+			match tag {
+				b"RAM_" => ram = Some(snapshot::decode_ram_image(payload)?),
+				_ => sections.push((*tag, payload.to_vec())),
+			}
+		}
+		let (ram, st) = ram.ok_or("snapshot: missing section \"RAM_\"")?;
+		if ram.len() as u64 != meta.ram_bytes {
+			return Err("snapshot: RAM section disagrees with META about the RAM size".into());
+		}
+		Ok(SnapshotImage {
+			meta,
+			sections,
+			ram,
+			ram_pages_kept: st.pages_kept,
+			ram_pages_total: st.pages_total,
+		})
+	}
+
+	/// risc-box patch (fork): resume from an image. Same preconditions as
+	/// `restore`; the RAM is adopted copy-on-write rather than copied.
+	pub fn restore_image(&mut self, image: &SnapshotImage, identity: &str) -> Result<SnapshotInfo, String> {
+		let meta = &image.meta;
 		if meta.identity != identity {
 			return Err(format!(
 				"snapshot was taken against different images (its identity {:?}, this machine's {:?})",
@@ -658,14 +720,14 @@ impl Emulator {
 				meta.disk_len, disk_len
 			));
 		}
-		let secs = snapshot::sections(data)?;
 		self.is_test = false;
 		self.tohost_addr = 0;
 		self.cpu.update_xlen(Xlen::Bit64);
 		self.cpu.get_mut_mmu().init_memory(ram);
-		let mut seen: Vec<[u8; 4]> = Vec::new();
+		self.cpu.get_mut_mmu().adopt_ram(&image.ram);
+		let mut seen: Vec<[u8; 4]> = vec![*b"RAM_"];
 		let mut stats = snapshot::RestoreStats::default();
-		for (tag, payload) in secs.iter().skip(1) {
+		for (tag, payload) in image.sections.iter() {
 			if !self.cpu.restore_section(tag, payload, &mut stats)? {
 				return Err(format!(
 					"snapshot: unknown section {:?} (written by a newer emulator?)",
@@ -680,15 +742,66 @@ impl Emulator {
 			}
 		}
 		Ok(SnapshotInfo {
-			bytes: data.len(),
+			bytes: image.footprint(),
 			ram_bytes: ram,
-			ram_pages_kept: stats.ram_pages_kept,
-			ram_pages_total: stats.ram_pages_total,
+			ram_pages_kept: image.ram_pages_kept,
+			ram_pages_total: image.ram_pages_total,
 			delta_blocks: stats.delta_blocks,
 			taken_unix: meta.taken_unix,
-			identity: meta.identity,
-			emu_version: meta.emu_version,
+			identity: meta.identity.clone(),
+			emu_version: meta.emu_version.clone(),
 		})
+	}
+
+	/// risc-box patch (fork): publish the RUNNING machine as an image others
+	/// can resume from, without a bucket round trip. Its RAM becomes shared
+	/// (this machine copies a chunk on its next write to it); the device
+	/// state is serialized as for a snapshot. Milliseconds, not seconds.
+	pub fn image(&mut self, identity: &str) -> SnapshotImage {
+		let taken = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let ram_bytes = self.ram_bytes.unwrap_or(PROGRAM_MEMORY_CAPACITY);
+		let disk_len = self.cpu.get_mmu().get_disk().disk_len() as u64;
+		// device sections only: level is irrelevant without RAM, and the
+		// delta is small
+		let mut s = Ser::new();
+		self.cpu.snapshot_into_no_ram(&mut s, 1);
+		let secs = snapshot::sections_unframed(&s.buf);
+		let ram = self.cpu.get_mut_mmu().share_ram();
+		let pages_total = (ram.len() + snapshot::PAGE - 1) / snapshot::PAGE;
+		let pages_kept = (0..pages_total).filter(|&i| ram.page(i).is_some()).count();
+		SnapshotImage {
+			meta: SnapshotMeta {
+				identity: identity.to_string(),
+				ram_bytes,
+				disk_len,
+				taken_unix: taken,
+				emu_version: env!("CARGO_PKG_VERSION").to_string(),
+			},
+			sections: secs,
+			ram,
+			ram_pages_kept: pages_kept as u64,
+			ram_pages_total: pages_total as u64,
+		}
+	}
+
+	/// risc-box patch: like `setup_filesystem`, with an image other machines
+	/// share. Nothing is copied.
+	pub fn setup_filesystem_shared(&mut self, base: Arc<Vec<u8>>) {
+		self.cpu.get_mut_mmu().init_disk_shared(base);
+	}
+
+	/// risc-box patch: the base disk this machine boots from, for sharing.
+	pub fn disk_base(&self) -> Arc<Vec<u8>> {
+		self.cpu.get_mmu().get_disk().base()
+	}
+
+	/// risc-box patch: what this machine costs the host right now.
+	pub fn footprint(&self) -> Footprint {
+		let (ram_owned, ram_shared, disk_overlay) = self.cpu.get_mmu().footprint();
+		Footprint { ram_owned, ram_shared, disk_overlay }
 	}
 
 	pub fn get_cpu(&self) -> &Cpu {

@@ -81,9 +81,12 @@ impl Plic {
 			self.set_ip(GPU_IRQ);
 		}
 
-		// Our Uart implements an interrupt as "Edge-triggered" and
-		// uart_ip is true only at the cycle when an interrupt happens
-		if uart_ip {
+		// risc-box patch: the UART line is level-triggered like the virtio
+		// ones (see uart.rs tick for the lost-byte failure this closes): a
+		// high line re-arms the pending bit once the guest has completed
+		// the previous claim. THRE is still delivered as the one tick the
+		// UART reports it, which this form carries exactly as before.
+		if uart_ip && !self.ip_bit(UART_IRQ) {
 			self.set_ip(UART_IRQ);
 		}
 
