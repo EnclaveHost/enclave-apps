@@ -410,6 +410,63 @@ The canonical entries live in `assets/deploy-config.template.json` under
 `_tools_comment`, url/body/result and all: the operator wires them, and a
 client only ever sees the resolved names and schemas.
 
+#### The loop: `loop`, `wait`, and budgets
+
+A turn with tools is a loop already: the model calls, the server runs the
+call, the answer regenerates from the result, up to `max_calls` times. What
+the `loop` field adds is **persistence**, and the `wait` builtin is what lets
+a loop work on a job that takes longer than one call.
+
+**`loop: true`** (Enclave extension; needs `tools` on) changes the rules the
+model is given. When the goal comes with a check (tests, a harness, a build, a
+command that must succeed) it is to keep going until the check passes: run
+it, read what failed, change one thing, run it again; not stop to ask or to
+report progress; keep state in files rather than in the conversation; stop
+early only when the check passes, cannot pass, or the budget is nearly spent,
+and then report exactly what passes and what does not. Every tool result in a
+persisting loop carries a trailer, `[loop: call 7 of 32; 6 minutes elapsed of
+1 hour]`, so the budget is a fact the model reads rather than a count it
+keeps. The object form **lowers** the deployment's budgets for one answer and
+never raises them: `"loop": {"max_calls": 8, "max_seconds": 600}` (add
+`"persist": false` to lower the budget without asking for persistence).
+
+**Budgets.** The config's `max_calls` bounds the calls in one answer and
+`max_seconds` (default 3600) its wall-clock time; calls, waits and the
+regenerations between them all count. Past either, the model is told once to
+finish from what it has; a second call is refused and the answer ends (the
+`: enclave-tool-note` comment, or the playground's notice, says which). `GET
+/models` reports both under `tools`, and each `: enclave-tool` comment
+carries `n`, `of`, `elapsed_s` and `max_seconds`.
+
+**`wait`** (builtin; name it in the config's `tools.builtin`) sleeps
+`seconds` inside the enclave and returns. Nothing leaves, nothing is
+computed, the request is parked. Its result says how much of the answer's
+time budget is left. One wait sleeps at most `wait_max_s` (default 600) and
+never past the end of the budget; a longer ask is clamped and told so, and
+the model calls again to keep waiting. While it sleeps the stream ticks a
+status line every 5 seconds (`waiting 2 minutes: build · 85s left`), which is
+what keeps every idle timeout between the enclave and the client from firing,
+**so a turn that can wait must stream**. A non-streaming request that waits
+past ~180 seconds is cut by the proxy before it answers. A client that
+disconnects mid-wait ends the wait: the next tick notices the dead stream and
+the turn stops there.
+
+**Long loops and the context window.** Every step re-prefills the whole
+conversation, so the results the model has already acted on are most of what
+a thirty-step loop pays for. The newest `keep_results` (default 3) results
+stay in the prompt whole; older ones are condensed to their first and last
+240 characters with a note saying so. A harness whose verdict is on its last
+line survives condensing; one that buries it in the middle should be told to
+print a summary.
+
+**Running a harness longer than one call.** The deployment's command tool
+has a per-call timeout (60 s for the `run_vm_command` entry in the template).
+A model working to a check starts the long job in the background on the
+machine with its output going to a file (`nohup ./run-tests.sh > /tmp/t.log
+2>&1 &`), calls `wait` for about as long as it expects the run to take, then
+reads the file. The playground shows the step counter and the countdown; the
+stop button ends the turn at any point, including mid-wait.
+
 ---
 
 ## Non-streaming responses

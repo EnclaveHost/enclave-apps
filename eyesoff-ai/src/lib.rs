@@ -152,11 +152,18 @@
 //!                               Same `web_search` switch; sources arrive as a
 //!                               `{"search":{...}}` event before the first
 //!                               token. Tool calls arrive as `{"tool":{...}}`
-//!                               (before the round trip) and
+//!                               (before the round trip, carrying `n`/`of`
+//!                               and the clock, `elapsed_s`/`max_seconds`) and
 //!                               `{"tool_result":{...}}` (after it); the reply
 //!                               regenerates from the result, so a `tool` event
 //!                               resets the client's buffer the way a `notice`
-//!                               does. A call that was attempted but ran
+//!                               does. `loop: true` on the request asks the
+//!                               model to keep at a verifiable goal until its
+//!                               check passes (tools.rs, Budget); the `wait`
+//!                               builtin sleeps in the enclave, ticking
+//!                               `status` every 5s; the done frame's `loop`
+//!                               block says what the loop spent. A call that
+//!                               was attempted but ran
 //!                               nothing (unparseable, or past the per-answer
 //!                               limit) arrives as `{"callnote":"<why>"}`: the
 //!                               client trims the raw block it streamed and
@@ -969,7 +976,7 @@ fn now_ms() -> u128 {
 
 /// Sleep on the monotonic clock's pollable — parks this request in the host's
 /// poll loop (a spin wait would burn the share's cpu slice for nothing).
-fn sleep_ms(ms: u64) {
+pub(crate) fn sleep_ms(ms: u64) {
     let p = bindings::wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000);
     bindings::wasi::io::poll::poll(&[&p]);
 }
@@ -1249,6 +1256,21 @@ thread_local! {
     /// pass), so the done-frame decomposition separates the classifier's
     /// verbs from the answer's
     static VERB_PHASE: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") };
+    /// set the moment a write to the client fails: the stream is dead. Work
+    /// that only exists to be streamed - a wait, above all - reads it and
+    /// stops, instead of running out its clock on nobody. The generation
+    /// legs already stop on the same signal through their status callback's
+    /// return value; this is the same fact for code that has no return path.
+    static CLIENT_GONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Has a write to this request's client failed? See CLIENT_GONE.
+pub(crate) fn client_gone() -> bool {
+    CLIENT_GONE.with(|c| c.get())
+}
+
+fn note_client_gone() {
+    CLIENT_GONE.with(|c| c.set(true));
 }
 
 /// The model's tokenizer, from whichever side has it cheapest. Local =
@@ -4196,6 +4218,14 @@ struct ChatReq {
     /// knows how.
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+    /// extension: the LOOP. `true` tells the model to keep working at a
+    /// verifiable goal - run the check, read the failure, fix, run again -
+    /// until it passes, instead of answering at its first opportunity; the
+    /// object form `{"max_calls", "max_seconds", "persist"}` also LOWERS the
+    /// deployment's budgets for this one answer (never raises them). Needs
+    /// config.tools and `tools` on; see tools::Budget.
+    #[serde(default, rename = "loop")]
+    loop_: Option<serde_json::Value>,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -4709,7 +4739,22 @@ struct ToolLoop<'a> {
     /// what a generate_image call produced, for the leg to deliver: the legs
     /// already know how to hand an image to their client
     image_out: Option<image::GeneratedImage>,
+    /// what this answer may spend: the config's ceilings after the request
+    /// lowered them, and whether the model was asked to PERSIST (the `loop`
+    /// field). The prompt's rules are written from it and every check in
+    /// `step` reads it, never the config directly.
+    budget: tools::Budget,
+    /// when the loop opened, for the wall-clock budget. Registry resolution
+    /// (MCP discovery) counts: it is time the user is waiting through.
+    t0: u128,
     calls: usize,
+    /// the model was already told the wall-clock budget is spent; the second
+    /// offence ends the turn, exactly as limit_told does for the call count
+    time_told: bool,
+    /// the results this loop put into the conversation - (index of the
+    /// response turn, tool name, full text, condensed already) - so older
+    /// ones can be condensed once the model has acted on them (compact)
+    results: Vec<(usize, String, String, bool)>,
     /// the model was already told it has run out of calls. Without this a model
     /// that keeps calling would loop forever: told, calls again, told again.
     limit_told: bool,
@@ -4745,6 +4790,12 @@ const REFUSED_MALFORMED: &str =
 const MALFORMED_RETRIES: usize = 3;
 const REFUSED_LIMIT: &str =
     "the model wrote another tool call after the per-answer limit, so it was not run";
+const REFUSED_TIME: &str =
+    "the model wrote another tool call after the per-answer time budget ran out, so it was not run";
+/// How much of a condensed result survives at each end. Enough to say what
+/// the call was and how it ended (a test run's summary line is at the tail),
+/// too little to be worth re-reading - the point of condensing.
+const CONDENSE_EDGE: usize = 240;
 const REFUSED_STUB: &str =
     "the model kept writing tool calls with arguments it had not filled in, so none were run";
 /// How many DISTINCT unfilled calls one answer may ask about. Each costs a
@@ -4761,9 +4812,11 @@ impl<'a> ToolLoop<'a> {
     fn open(
         cfg: &'a tools::ToolsConfig,
         builtins: tools::Builtins<'a>,
+        budget: tools::Budget,
         on_status: &'a dyn Fn(&str),
         formatter: &'a dyn Fn(&str, &str) -> Option<String>,
     ) -> ToolLoop<'a> {
+        let t0 = now_ms();
         ToolLoop {
             cfg,
             builtins,
@@ -4772,12 +4825,58 @@ impl<'a> ToolLoop<'a> {
             formatter,
             images: Vec::new(),
             image_out: None,
+            budget,
+            t0,
             calls: 0,
+            time_told: false,
+            results: Vec::new(),
             limit_told: false,
             malformed_tries: 0,
             stub_asked: Vec::new(),
             refused: None,
             log: Vec::new(),
+        }
+    }
+
+    /// Seconds since the loop opened.
+    fn elapsed_s(&self) -> u64 {
+        (now_ms().saturating_sub(self.t0) / 1000) as u64
+    }
+
+    /// Seconds of the wall-clock budget still unspent.
+    fn left_s(&self) -> u64 {
+        self.budget.max_seconds.saturating_sub(self.elapsed_s())
+    }
+
+    /// The loop's progress, for the stats and the client's step counter.
+    fn progress(&self) -> serde_json::Value {
+        serde_json::json!({
+            "calls": self.calls,
+            "max_calls": self.budget.max_calls,
+            "elapsed_s": self.elapsed_s(),
+            "max_seconds": self.budget.max_seconds,
+        })
+    }
+
+    /// Condense every result but the newest `keep_results`, once. A loop
+    /// re-prefills the whole conversation each step, so the results the
+    /// model has already acted on are the bulk of what it pays for and reads
+    /// past; what stays is the head (what was run) and the tail (how it
+    /// ended), which is what it would look back for.
+    fn compact(&mut self, messages: &mut [ChatMsg]) {
+        let keep = self.cfg.keep_results.max(1);
+        if self.results.len() <= keep {
+            return;
+        }
+        let cut = self.results.len() - keep;
+        for (idx, name, text, done) in &mut self.results[..cut] {
+            if *done {
+                continue;
+            }
+            *done = true;
+            if let (Some(m), Some(short)) = (messages.get_mut(*idx), condense(text)) {
+                m.content = tools::response_turn(name, &short);
+            }
         }
     }
 
@@ -4897,6 +4996,28 @@ impl<'a> ToolLoop<'a> {
             ));
             return true;
         }
+        // Out of time: the same once-then-refuse rule as the call count. The
+        // clock is what bounds a loop that waits - the call count alone would
+        // let thirty ten-minute waits through.
+        if self.elapsed_s() >= self.budget.max_seconds {
+            if self.time_told {
+                self.refused = Some(REFUSED_TIME);
+                return false;
+            }
+            self.time_told = true;
+            on_note("the time budget for one answer ran out; the model will finish with what it has");
+            messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+            messages.push(ChatMsg::text(
+                "user",
+                tools::response_turn(
+                    &c.name,
+                    "This call was NOT run: the wall-clock budget for one answer is spent. Do \
+                     not call anything else. Answer now from what you already have: say \
+                     exactly what passes, what does not, and where any files you made are.",
+                ),
+            ));
+            return true;
+        }
         // An argument the model never filled in. Running it is worse than not
         // running it: a stubbed `generate_image` costs half a minute of a GPU
         // deployment's time and puts a picture the user never asked for above
@@ -4937,11 +5058,19 @@ impl<'a> ToolLoop<'a> {
         self.calls += 1;
         on_call(&serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
+            "of": self.budget.max_calls,
+            "elapsed_s": self.elapsed_s(), "max_seconds": self.budget.max_seconds,
         }));
+        // a wait may sleep at most the config's cap, and never past the end
+        // of the answer's budget - the clock check above would only refuse
+        // the call AFTER it
+        let mut b = self.builtins;
+        b.turn_left_s = self.left_s();
+        b.wait_cap_s = self.cfg.wait_max_s.min(b.turn_left_s);
         let mut r = tools::call(
             &mut self.reg,
             self.cfg,
-            self.builtins,
+            b,
             &c.name,
             &c.args,
             &self.images,
@@ -4982,12 +5111,48 @@ impl<'a> ToolLoop<'a> {
         }
         on_result(&entry);
         self.log.push(entry);
+        // A persisting loop is told where it stands with every result, so
+        // "the budget is nearly spent" is a fact it can read rather than a
+        // count it has to keep. Outside the loop the rules already said the
+        // limit once, and a running tally would only invite calls.
+        let text = if self.budget.persist {
+            format!(
+                "{}\n\n[loop: call {} of {}; {} elapsed of {}]",
+                r.text,
+                self.calls,
+                self.budget.max_calls,
+                tools::human_secs(self.elapsed_s()),
+                self.budget.time(),
+            )
+        } else {
+            r.text.clone()
+        };
         // The model's own call goes back in as the assistant turn it was, so
         // the next pass sees what it asked for beside what came back.
         messages.push(ChatMsg::text("assistant", canonical_call(&c)));
-        messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &r.text)));
+        messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &text)));
+        self.results.push((messages.len() - 1, c.name.clone(), text, false));
+        self.compact(messages);
         true
     }
+}
+
+/// A result the model has already acted on, cut to its head and tail. None
+/// when it is short enough that cutting would save nothing.
+fn condense(text: &str) -> Option<String> {
+    let n = text.chars().count();
+    if n <= CONDENSE_EDGE * 3 {
+        return None;
+    }
+    let head: String = text.chars().take(CONDENSE_EDGE).collect();
+    let tail: String = text.chars().skip(n - CONDENSE_EDGE).collect();
+    Some(format!(
+        "{}\n[... {} characters of this earlier result elided: you already acted on it, and \
+         the newest results are shown in full ...]\n{}",
+        head.trim_end(),
+        n - 2 * CONDENSE_EDGE,
+        tail.trim_start(),
+    ))
 }
 
 /// Holds back the beginning of an answer just long enough to tell whether it
@@ -5289,6 +5454,7 @@ fn note_for_unrun(text: &str, note: &str) -> String {
 /// Everything the built-ins could be wired to. Used by the /tools probe, which
 /// answers "what does this deployment have", not "what may this turn use".
 fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
+    let tc = cfg.tools.as_ref();
     tools::Builtins {
         search: cfg.search_cfg(),
         web_withheld: false,
@@ -5296,6 +5462,10 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         // a picture is a per-turn fact, not a capability
         images_present: true,
         images_local: false,
+        // a probe wait sleeps the config's cap at most; the loop narrows it
+        // per call from what is left of the answer
+        wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
+        turn_left_s: tc.map_or(0, |t| t.max_seconds),
     }
 }
 
@@ -5309,11 +5479,14 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
 /// reads them itself, and those entries are not offered.
 fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
     let withheld = creq.web_mode(cfg.search_cfg().is_some_and(|sc| sc.default_on)) == WebMode::Off;
+    let tc = cfg.tools.as_ref();
     tools::Builtins {
         search: if withheld { None } else { cfg.search_cfg() },
         web_withheld: withheld,
         images_present: creq.messages.iter().any(|m| !m.images.is_empty()),
         images_local: images_read_locally(cfg, creq.model.as_deref()),
+        wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
+        turn_left_s: tc.map_or(0, |t| t.max_seconds),
     }
 }
 
@@ -5377,7 +5550,7 @@ fn merge_client_tools(
         // nothing else, while web_search sat in a registry it was never shown.
         Some(t) => {
             let all = tools::merge_registries(t.tools(), cl);
-            let block = tools::merged_system_block(&all, t.cfg.max_calls, must_call);
+            let block = tools::merged_system_block(&all, t.budget, must_call);
             (Some(all), Some(block))
         }
         // nothing of ours is armed this turn: the passthrough, unchanged
@@ -6572,9 +6745,10 @@ enum Capabilities<'a> {
     /// the answer at a deployment with no tools: the "you cannot call anything"
     /// note, which is what stops a model from writing a fake tool call
     Note,
-    /// the answer with a tool registry: the real signatures, and the stop
-    /// string that ends generation the moment a call is complete
-    Tools(&'a [tools::Tool], usize),
+    /// the answer with a tool registry: the real signatures, the budget the
+    /// rules quote, and the stop string that ends generation the moment a
+    /// call is complete
+    Tools(&'a [tools::Tool], tools::Budget),
     /// the answer with CLIENT-declared tools (the /v1 passthrough), and with
     /// this deployment's own merged in beside them when any are armed. The
     /// block is pre-rendered by the handler (client_system_block for the
@@ -6619,8 +6793,8 @@ fn build_prompt(
         // the tools block REPLACES the note rather than joining it: the note
         // says "you have no tools and cannot call one", which is a lie at a
         // deployment that just handed the model three of them
-        Capabilities::Tools(list, max) => {
-            format!("{}{}", system.trim_end(), tools::system_block(list, max))
+        Capabilities::Tools(list, budget) => {
+            format!("{}{}", system.trim_end(), tools::system_block(list, budget))
         }
         Capabilities::Client(block) => format!("{}{}", system.trim_end(), block),
     };
@@ -7201,6 +7375,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         let msg = format!("data: {v}\n\n");
         for chunk in msg.as_bytes().chunks(4000) {
             if stream.blocking_write_and_flush(chunk).is_err() {
+                note_client_gone();
                 return false;
             }
         }
@@ -7227,7 +7402,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // provider round trip the model never asked for and then gets the tool too.
     let formatter = |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &status_cb);
     let mut tl = tools_enabled(cfg, &creq)
-        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &status_cb, &formatter));
+        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &status_cb, &formatter));
     if let Some(t) = &tl {
         for n in &t.reg.notes {
             let _ = send(serde_json::json!({ "notice": format!("tools: {n}") }));
@@ -7333,7 +7508,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let mut ok = false;
     'answer: loop {
         let caps = match &tl {
-            Some(t) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            Some(t) => Capabilities::Tools(t.tools(), t.budget),
             None => Capabilities::Note,
         };
         let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
@@ -7505,6 +7680,11 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     if s.think_forced {
                         done["think_forced"] = serde_json::json!(true);
                     }
+                    // what the loop spent, when it ran at all: the client
+                    // shows it on the finished reply's meta line
+                    if let Some(t) = tl.as_ref().filter(|t| t.calls > 0) {
+                        done["loop"] = t.progress();
+                    }
                     let im = INIT_MS.with(|v| v.borrow().clone());
                     if !im.is_empty() {
                         let mut m = serde_json::Map::new();
@@ -7653,6 +7833,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let send_raw = |s: &str| -> bool {
             for chunk in s.as_bytes().chunks(4000) {
                 if stream.blocking_write_and_flush(chunk).is_err() {
+                    note_client_gone();
                     return false;
                 }
             }
@@ -7688,7 +7869,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
         let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &leg_status, &formatter));
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &leg_status, &formatter));
         if let Some(t) = &tl {
             for n in &t.reg.notes {
                 let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
@@ -7801,7 +7982,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         'answer: loop {
         let caps = match (&client_block, &tl) {
             (Some(b), _) => Capabilities::Client(b),
-            (None, Some(t)) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            (None, Some(t)) => Capabilities::Tools(t.tools(), t.budget),
             (None, None) => Capabilities::Note,
         };
         let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
@@ -7977,7 +8158,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
         let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), &no_status, &formatter));
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &no_status, &formatter));
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
@@ -8043,7 +8224,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         'answer: loop {
         let caps = match (&client_block, &tl) {
             (Some(b), _) => Capabilities::Client(b),
-            (None, Some(t)) => Capabilities::Tools(t.tools(), t.cfg.max_calls),
+            (None, Some(t)) => Capabilities::Tools(t.tools(), t.budget),
             (None, None) => Capabilities::Note,
         };
         let (prompt_ids, stops, opened) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
@@ -8469,6 +8650,7 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "enabled": true,
                 "default_on": t.default_on,
                 "max_calls": t.max_calls,
+                "max_seconds": t.max_seconds,
                 // what a turn would really be offered, not what was typed: a
                 // duplicate or an unusable name is dropped at resolution, and
                 // naming it here would put a tool in the UI nothing can call
@@ -8686,6 +8868,9 @@ fn handle_tools_probe(
     let body = serde_json::json!({
         "discover_ms": discover_ms,
         "max_calls": tcfg.max_calls,
+        "max_seconds": tcfg.max_seconds,
+        "wait_max_s": tcfg.wait_max_s,
+        "keep_results": tcfg.keep_results,
         "default_on": tcfg.default_on,
         "notes": reg.notes,
         "tools": reg.tools.iter().map(|t| serde_json::json!({
@@ -9443,6 +9628,98 @@ mod tests {
         assert!(tools::client_system_block(&list, Some("")).contains("MUST respond with"));
     }
 
+    /// The clock bounds the loop the way the call count does: told once,
+    /// refused the second time. And a wait can never sleep past it - the cap
+    /// handed to the call is what is LEFT, not the config's figure.
+    #[test]
+    fn the_tool_loop_stops_when_its_time_is_up() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "max_seconds": 60, "wait_max_s": 600,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        let call = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
+        // fresh: runs, and the client hears the budget beside the count
+        let seen = std::cell::RefCell::new(serde_json::Value::Null);
+        let on_call = |c: &serde_json::Value| *seen.borrow_mut() = c.clone();
+        assert!(tl.step(call, &mut msgs, &on_call, &|_| {}, &|_| {}));
+        assert_eq!(seen.borrow()["n"], 1);
+        assert_eq!(seen.borrow()["of"], 32);
+        assert_eq!(seen.borrow()["max_seconds"], 60);
+        assert_eq!(tl.left_s(), 60);
+        // the loop opened a while ago
+        tl.t0 -= 61_000;
+        assert_eq!(tl.left_s(), 0);
+        let notes = std::cell::RefCell::new(Vec::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.calls, 1, "a call past the clock must not run");
+        assert!(msgs.last().unwrap().content.contains("wall-clock budget"), "{}", msgs.last().unwrap().content);
+        assert!(notes.borrow()[0].contains("time budget"), "{:?}", notes.borrow());
+        // told once; the second offence ends the turn
+        assert!(!tl.step(call, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.refused, Some(REFUSED_TIME));
+        // a wait in a loop with 20s left may sleep 20s, whatever the config cap
+        tl.t0 = now_ms() - 40_000;
+        assert_eq!(tl.left_s(), 20);
+        assert_eq!(tc.wait_max_s.min(tl.left_s()), 20);
+    }
+
+    /// A long loop condenses the results it has already acted on: the newest
+    /// `keep_results` stay whole, older ones keep their head and tail, and a
+    /// persisting loop reads its own progress under every result.
+    #[test]
+    fn old_results_are_condensed_and_progress_is_stated() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "keep_results": 2,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt);
+        assert!(tl.budget.persist);
+        let mut msgs = vec![ChatMsg::text("user", "make the tests pass")];
+        // the "no such tool" result is short; pad it through the log so the
+        // condenser has something to cut
+        let call = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
+        for i in 0..4 {
+            assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            // the progress line rides under a persisting loop's results
+            assert!(tl.results[i].2.contains(&format!("[loop: call {} of 32;", i + 1)), "{}", tl.results[i].2);
+            // stand in for a long test log: the loop condenses what IT
+            // recorded, so lengthen the recorded copy and the turn together
+            let long = format!("run {i} BEGIN {} END run {i}", "log line\n".repeat(200));
+            let idx = msgs.len() - 1;
+            msgs[idx].content = tools::response_turn("nope", &long);
+            tl.results[i].2 = long;
+            tl.compact(&mut msgs);
+        }
+        assert_eq!(tl.calls, 4);
+        // results sit at msgs[2], [4], [6], [8]; the newest two are whole
+        assert!(!msgs[8].content.contains("elided"), "{}", msgs[8].content);
+        assert!(!msgs[6].content.contains("elided"), "{}", msgs[6].content);
+        assert!(msgs[4].content.contains("elided"), "{}", msgs[4].content);
+        assert!(msgs[2].content.contains("elided"), "{}", msgs[2].content);
+        // head and tail survive: what was run, and how it ended
+        assert!(msgs[2].content.contains("run 0 BEGIN"), "{}", msgs[2].content);
+        assert!(msgs[2].content.contains("END run 0"), "{}", msgs[2].content);
+        assert!(msgs[2].content.len() < 1200, "{}", msgs[2].content.len());
+        // the progress line is not under a quick answer's results
+        let mut quick = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
+        let mut m2 = vec![ChatMsg::text("user", "hi")];
+        assert!(quick.step(call, &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!m2[2].content.contains("[loop:"), "{}", m2[2].content);
+        // short results are left alone by the condenser
+        assert_eq!(condense("short"), None);
+    }
+
     /// The loop runs a call, feeds the result back, and stops when the budget
     /// is spent instead of calling forever.
     #[test]
@@ -9455,7 +9732,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
         assert!(tl.armed());
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // a name the registry does NOT have, so the loop is exercised without
@@ -9497,7 +9774,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
         let mut msgs = vec![ChatMsg::text("user", "write me a self-contained HTML file")];
         let stub =
             "<tool_call>{\"name\":\"generate_image\",\"arguments\":{\"prompt\":\"placeholder\"}}\
@@ -9530,7 +9807,7 @@ mod tests {
 
         // the answer loop has no bound of its own, so a model that stubs a
         // DIFFERENT argument every round has to hit one here
-        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         for v in ["placeholder", "TODO", "tbd"] {
             let c = format!(
@@ -9594,7 +9871,7 @@ mod tests {
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, &nop, &nofmt);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
         // the live shape of 2026-08-05: no name anywhere, tag left unclosed
         let bad = "<tool_call>\n{\"arguments\":{\"url\":\"https://enclave.host/\"}}";
@@ -9699,14 +9976,14 @@ mod tests {
         let msgs = vec![ChatMsg::text("user", "weather in Oslo?")];
         // the system prompt is rendered into the prompt string, so checking
         // the token count alone would prove nothing - render it directly
-        let system = format!("{}{}", cfg.system_prompt, tools::system_block(&list, 3));
+        let system = format!("{}{}", cfg.system_prompt, tools::system_block(&list, tools::Budget::calls(3)));
         let r = config::render_template("chatml", &system, &[("user".into(), "hi".into())],
                                         config::ThinkTurn::Plain).unwrap();
         assert!(r.prompt.contains("<tools>"), "{}", r.prompt);
         assert!(r.prompt.contains("get_weather"), "{}", r.prompt);
         // ...and the stop string that ends a turn the moment a call completes
         let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false,
-                                        Capabilities::Tools(&list, 3)).unwrap();
+                                        Capabilities::Tools(&list, tools::Budget::calls(3))).unwrap();
         assert!(stops.iter().any(|s| s == "</tool_call>"), "{stops:?}");
         // a deployment with no tools keeps the old stop set and the note
         let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false, Capabilities::Note).unwrap();

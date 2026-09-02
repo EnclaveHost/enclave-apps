@@ -83,6 +83,29 @@ pub struct ToolsConfig {
     /// act, never a default they inherit.
     #[serde(default)]
     pub default_on: bool,
+    /// wall-clock budget for ONE answer's tool loop, seconds. Calls, waits
+    /// and the regenerations between them all count against it, and once it
+    /// is spent the model is told to finish from what it has - the same
+    /// once-then-refuse rule max_calls uses. This is what bounds a loop that
+    /// waits: thirty calls that each sleep ten minutes would otherwise be a
+    /// five-hour answer. A request may lower it (`loop.max_seconds`), never
+    /// raise it.
+    #[serde(default = "default_max_seconds")]
+    pub max_seconds: u64,
+    /// the longest ONE `wait` call may sleep, seconds. A longer ask is
+    /// clamped and the result says so; the model calls again to keep
+    /// waiting, which is the point: each call is a moment the loop's
+    /// remaining budget is restated to it, and a stop reaches the turn.
+    #[serde(default = "default_wait_max_s")]
+    pub wait_max_s: u64,
+    /// how many of an answer's most recent tool results stay in the prompt
+    /// in full. Older ones are condensed to their head and tail once the
+    /// model has acted on them. Every step of the loop re-prefills the whole
+    /// conversation, so a thirty-step run whose every test log stayed whole
+    /// would spend most of its time (and its context window) re-reading
+    /// failures it already fixed.
+    #[serde(default = "default_keep_results")]
+    pub keep_results: usize,
     /// Capabilities this deployment ALREADY has, handed to the model as tools
     /// instead of being decided for it by a pre-pass: `["web_search",
     /// "request", "generate_image", "view_image"]`. Each is backed by its own
@@ -92,6 +115,9 @@ pub struct ToolsConfig {
     /// gate more than reading does), generate_image by `image`, view_image by
     /// `vision_service`. The legacy names fetch_url and post_url still parse -
     /// on-chain config CIDs are immutable - and both resolve to `request`.
+    /// `wait` is the exception that needs no block: it sleeps inside the
+    /// enclave (see Builtin::Wait) and nothing leaves, so naming it here is
+    /// the whole consent.
     ///
     /// The principle is one decider per capability. The router decides before
     /// the model has thought about the question, from four messages of
@@ -150,12 +176,27 @@ pub struct Builtins<'a> {
     /// prefer_local or named outright), so image-reading tools are silently
     /// stood down: there is nothing to delegate.
     pub images_local: bool,
+    /// the most ONE wait call may sleep right now, seconds: the config's
+    /// wait_max_s, clamped by what is left of the answer's time budget. Zero
+    /// means no wait is possible (the budget is spent), and the call says so
+    /// instead of sleeping.
+    pub wait_cap_s: u64,
+    /// what is left of the answer's wall-clock budget, seconds, so a wait
+    /// can tell the model how much room its loop has after this one
+    pub turn_left_s: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Builtin {
     WebSearch,
     Request,
+    /// Sleep, in the enclave, then carry on with the same answer. The tool
+    /// that makes a loop able to WAIT: a job put in the background on the
+    /// machine because it outlasts one command's timeout, a service coming
+    /// up, a rate limit. The sleep parks the request in the host's poll loop
+    /// (no CPU) and ticks a status line every few seconds, because every hop
+    /// between here and the browser cuts a stream that goes quiet for ~180s.
+    Wait,
 }
 
 impl Builtin {
@@ -166,6 +207,7 @@ impl Builtin {
             // request tool. Config CIDs are immutable on-chain, so the old
             // names must keep resolving forever.
             "request" | "fetch_url" | "post_url" => Some(Builtin::Request),
+            "wait" => Some(Builtin::Wait),
             _ => None,
         }
     }
@@ -174,6 +216,7 @@ impl Builtin {
         match self {
             Builtin::WebSearch => "web_search",
             Builtin::Request => "request",
+            Builtin::Wait => "wait",
         }
     }
 
@@ -199,6 +242,14 @@ impl Builtin {
                  user gave you, or a JSON endpoint. POST/PUT/PATCH/DELETE send `body` to an \
                  API or webhook the user pointed you at - tell the user what you sent and \
                  where.",
+            Builtin::Wait =>
+                "Pause for `seconds`, then continue this same answer. Use it when something \
+                 you started needs time before it is worth checking on: a job you put in the \
+                 background on the machine (nohup ... &) because it outlasts one command's \
+                 timeout, a service that is still coming up, a rate limit you hit. Choose the \
+                 length from what you know about the job - one wait of the right size beats \
+                 many short polls - and read the result: it says how much of this answer's \
+                 time budget is left. Nothing leaves the enclave; the user sees a countdown.",
         }
     }
 
@@ -235,6 +286,22 @@ impl Builtin {
                 },
                 "required": ["url"],
             }),
+            Builtin::Wait => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "how long to pause, in seconds",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "what you are waiting for, in a few words - shown \
+                                        to the user beside the countdown",
+                    }
+                },
+                "required": ["seconds"],
+            }),
         }
     }
 
@@ -242,6 +309,7 @@ impl Builtin {
     fn available(self, b: &Builtins) -> bool {
         match self {
             Builtin::WebSearch | Builtin::Request => b.search.is_some(),
+            Builtin::Wait => true,
         }
     }
 
@@ -250,6 +318,7 @@ impl Builtin {
     fn withheld(self, b: &Builtins) -> bool {
         match self {
             Builtin::WebSearch | Builtin::Request => b.web_withheld,
+            Builtin::Wait => false,
         }
     }
 
@@ -257,11 +326,119 @@ impl Builtin {
     fn missing(self) -> &'static str {
         match self {
             Builtin::WebSearch | Builtin::Request => "`search`",
+            Builtin::Wait => "nothing",
         }
     }
 }
 
+/// What ONE answer's loop may spend, after the request has had its say. The
+/// config is the ceiling: a request LOWERS a figure (a client that wants a
+/// quick answer, a playground turn that is not a task) and never raises one.
+/// `persist` is the `loop` request field: keep working at a verifiable goal
+/// until the check passes, rather than answering at the first opportunity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Budget {
+    pub max_calls: usize,
+    pub max_seconds: u64,
+    pub persist: bool,
+}
+
+impl Budget {
+    /// A budget of `n` calls and the default hour, not persisting: the tests'
+    /// way of saying "a call count and nothing else".
+    #[cfg(test)]
+    pub fn calls(n: usize) -> Budget {
+        Budget { max_calls: n, max_seconds: default_max_seconds(), persist: false }
+    }
+
+    /// The wall-clock figure as the model should read it.
+    pub fn time(&self) -> String {
+        human_secs(self.max_seconds)
+    }
+}
+
+/// "45 seconds", "12 minutes", "1 hour 30 minutes": a duration as words, for
+/// prompts and results. Seconds only show under two minutes; past that the
+/// model is planning in minutes anyway.
+pub fn human_secs(s: u64) -> String {
+    if s < 120 {
+        return format!("{s} second{}", if s == 1 { "" } else { "s" });
+    }
+    let (h, m) = (s / 3600, (s % 3600) / 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h} hour{}", if h == 1 { "" } else { "s" }));
+    }
+    if m > 0 {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("{m} minute{}", if m == 1 { "" } else { "s" }));
+    }
+    out
+}
+
+/// How often a sleeping wait ticks its status line, seconds. Well inside the
+/// 180s idle cut every proxy hop applies and the playground's own 300s stall
+/// watchdog; a tick is a few dozen bytes.
+pub const WAIT_TICK_S: u64 = 5;
+
+/// What a wait call will actually do: `(seconds to sleep, reason, note)`.
+/// The seconds are clamped to `cap_s` and the note, when the ask was longer,
+/// tells the model so and how to keep waiting. Pure, so it is testable
+/// without a clock.
+pub fn wait_plan(args: &serde_json::Value, cap_s: u64) -> Result<(u64, String, String), String> {
+    let secs = match args.get("seconds") {
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(|f| f.round().max(0.0) as u64),
+        // a model that writes "30s" or "30" meant thirty
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .trim_end_matches(['s', 'S'])
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|f| f.round().max(0.0) as u64),
+        _ => None,
+    }
+    .ok_or("wait needs `seconds`, a positive integer")?;
+    if secs == 0 {
+        return Err("wait needs `seconds` of at least 1".into());
+    }
+    if cap_s == 0 {
+        return Err("no waiting is possible now: this answer's time budget is spent. Do not \
+                    call anything else; finish from what you have."
+            .into());
+    }
+    let reason = args
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let note = if secs > cap_s {
+        format!(
+            " You asked for {}; the most one wait may sleep right now is {}, so it stopped \
+             there - call wait again to keep waiting.",
+            human_secs(secs),
+            human_secs(cap_s)
+        )
+    } else {
+        String::new()
+    };
+    Ok((secs.min(cap_s), reason, note))
+}
+
 fn default_max_calls() -> usize {
+    3
+}
+fn default_max_seconds() -> u64 {
+    3600
+}
+fn default_wait_max_s() -> u64 {
+    600
+}
+fn default_keep_results() -> usize {
     3
 }
 fn default_timeout_s() -> u64 {
@@ -280,6 +457,35 @@ fn default_true() -> bool {
 impl ToolsConfig {
     pub fn is_empty(&self) -> bool {
         self.http.is_empty() && self.mcp.is_empty() && self.builtin.is_empty()
+    }
+
+    /// What one answer may spend, given the request's `loop` field: absent
+    /// or a boolean keeps the config's figures and sets persistence; an
+    /// object lowers max_calls and max_seconds (never raises them - the
+    /// config is the deployment's ceiling, published on-chain) and persists
+    /// unless it says `"persist": false`. Nothing here ever reaches zero: a
+    /// loop with no calls would refuse its first one, which is a failed
+    /// answer dressed as a budget.
+    pub fn budget(&self, req: Option<&serde_json::Value>) -> Budget {
+        let mut b = Budget {
+            max_calls: self.max_calls.max(1),
+            max_seconds: self.max_seconds.max(1),
+            persist: false,
+        };
+        match req {
+            Some(serde_json::Value::Bool(p)) => b.persist = *p,
+            Some(serde_json::Value::Object(o)) => {
+                b.persist = o.get("persist").and_then(|v| v.as_bool()).unwrap_or(true);
+                if let Some(n) = o.get("max_calls").and_then(|v| v.as_u64()) {
+                    b.max_calls = b.max_calls.min(n as usize).max(1);
+                }
+                if let Some(s) = o.get("max_seconds").and_then(|v| v.as_u64()) {
+                    b.max_seconds = b.max_seconds.min(s).max(1);
+                }
+            }
+            _ => {}
+        }
+        b
     }
 
     /// The HTTP tool names a turn would actually be offered - the same name
@@ -588,7 +794,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         let Some(k) = Builtin::parse(want) else {
             reg.notes.push(format!(
                 "builtin '{want}' is not a tool this app has (known: web_search, request, \
-                 generate_image, view_image)"
+                 wait; pictures are http entries, see the config's tools comment)"
             ));
             continue;
         };
@@ -790,18 +996,51 @@ fn unresolved_in(s: &str) -> Option<String> {
 /// jinja template in a wasm component, and the format is a TRAINED property, so
 /// a family that was taught a different one needs its own arm here rather than
 /// a generic guess (see tools_supported).
-pub fn system_block(tools: &[Tool], max_calls: usize) -> String {
+pub fn system_block(tools: &[Tool], b: Budget) -> String {
     let mut s = signatures(tools);
     s.push_str(&format!(
         "Rules for this app: the call is executed by the server and its result comes back in a \
          <tool_response> block; wait for it rather than inventing one. Call ONLY the functions \
          listed above, by their exact names - nothing else exists, and a call to anything else \
-         is shown to the user as a failure. You may make at most {max_calls} call{} in one \
-         answer, so make each one count. When a call fails, say so plainly and answer from what \
-         you have. When you have enough to answer, stop calling and write the answer.",
-        if max_calls == 1 { "" } else { "s" }
+         is shown to the user as a failure. You may make at most {} call{} in one answer, and \
+         the whole answer has {} of wall-clock time, so make each one count. When a call fails, \
+         say so plainly and answer from what you have.",
+        b.max_calls,
+        if b.max_calls == 1 { "" } else { "s" },
+        b.time(),
     ));
+    s.push_str(&finish_rule(tools, b));
     s
+}
+
+/// The closing rule of every server-loop block: answer at the first
+/// opportunity, or - when the request asked for the LOOP - keep going until
+/// the check passes. The persistence text is what turns a model that reports
+/// its first failing test run into one that fixes it; without it every
+/// reasoning model this app serves stops to "check with the user" after one
+/// attempt, which in a loop nobody is watching is the same as giving up.
+fn finish_rule(tools: &[Tool], b: Budget) -> String {
+    if !b.persist {
+        return " When you have enough to answer, stop calling and write the answer.".into();
+    }
+    let has_wait = tools.iter().any(|t| t.name == "wait");
+    format!(
+        " WORKING TO A CHECK: the user wants the goal reached, not a first attempt. When the \
+         goal comes with a way to verify it (tests, a harness, a build, a command that must \
+         succeed), keep going until the check passes: run it, read what failed, change one \
+         thing, run it again. Do not stop to ask permission or to report progress - nobody is \
+         answering while you work, and the user reads only your final answer. Keep state in \
+         files on the machine, never in your head, so a later step can pick up where an \
+         earlier one left off.{} Stop early only when the check passes, when you are certain \
+         it cannot pass with what you have, or when the budget is nearly spent - and then \
+         report exactly what passes, what does not, and where the files are.",
+        if has_wait {
+            " When something you started needs time, call wait rather than polling it in a \
+             tight loop of commands."
+        } else {
+            ""
+        }
+    )
 }
 
 /// The block for CLIENT-declared tools (the /v1 passthrough). Same trained
@@ -871,17 +1110,19 @@ pub fn merge_registries(server: &[Tool], client: &[Tool]) -> Vec<Tool> {
 /// business, not something a model should be reasoning about mid-answer. The
 /// budget is the one place the split leaks, because it bounds only the server's
 /// half; the client owns its own loop and its own limit.
-pub fn merged_system_block(tools: &[Tool], max_calls: usize, require: Option<&str>) -> String {
+pub fn merged_system_block(tools: &[Tool], b: Budget, require: Option<&str>) -> String {
     let mut s = signatures(tools);
     s.push_str(&format!(
         "Rules for this app: after you write a call, STOP - it is executed for you and its \
          result comes back in a <tool_response> block; never invent one. Call ONLY the \
          functions listed above, by their exact names - nothing else exists, and a call to \
          anything else is shown to the user as a failure. One call at a time, and at most \
-         {max_calls} of them are run by this server in a single answer. When a call fails, \
-         say so plainly and answer from what you have. When you have enough to answer, stop \
-         calling and write the answer."
+         {} of them are run by this server in a single answer, within {} of wall-clock time. \
+         When a call fails, say so plainly and answer from what you have.",
+        b.max_calls,
+        b.time(),
     ));
+    s.push_str(&finish_rule(tools, b));
     push_forced(&mut s, require);
     s
 }
@@ -1448,7 +1689,7 @@ pub fn call(
     let mut sources = Vec::new();
     let mut image = None;
     let r = match src {
-        ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources),
+        ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources, on_status),
         ToolSrc::Http(i) => {
             call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status)
         }
@@ -1513,8 +1754,43 @@ fn call_builtin(
     b: &Builtins,
     args: &serde_json::Value,
     sources: &mut Vec<(String, String)>,
+    on_status: &dyn Fn(&str),
 ) -> Result<String, String> {
     match k {
+        Builtin::Wait => {
+            let (secs, reason, note) = wait_plan(args, b.wait_cap_s)?;
+            // Sleep in ticks, each one a status line: the guest cannot say
+            // anything while parked, so the tick IS the keepalive, and the
+            // countdown is what the user sees in place of a frozen screen.
+            let mut left = secs;
+            while left > 0 {
+                // the stop button, seen from here: a tick that could not be
+                // written means nobody is waiting, so neither does this
+                if crate::client_gone() {
+                    return Err(format!(
+                        "the client disconnected {} into the wait",
+                        human_secs(secs - left)
+                    ));
+                }
+                on_status(&format!(
+                    "waiting {}{} · {}s left",
+                    human_secs(secs),
+                    if reason.is_empty() { String::new() } else { format!(": {reason}") },
+                    left
+                ));
+                let slice = left.min(WAIT_TICK_S);
+                crate::sleep_ms(slice * 1000);
+                left -= slice;
+            }
+            let budget_left = b.turn_left_s.saturating_sub(secs);
+            Ok(format!(
+                "Waited {}{}.{} This answer has about {} of its time budget left.",
+                human_secs(secs),
+                if reason.is_empty() { String::new() } else { format!(" ({reason})") },
+                note,
+                human_secs(budget_left),
+            ))
+        }
         Builtin::WebSearch => {
             let scfg = b.search.ok_or("web search is not configured on this deployment")?;
             let q = args
@@ -2791,7 +3067,7 @@ mod tests {
         // the client's lead: they are the caller's own job, ours supplement it
         assert_eq!(names, ["read", "write", "web_search", "request"]);
         // and one block carries them all, in the trained format
-        let block = merged_system_block(&all, 32, None);
+        let block = merged_system_block(&all, Budget::calls(32), None);
         for n in names {
             assert!(block.contains(&format!("\"name\":\"{n}\"")), "{n} missing from {block}");
         }
@@ -2949,12 +3225,12 @@ mod tests {
 
     #[test]
     fn the_system_block_carries_the_signatures() {
-        let s = system_block(&[tool("get_weather")], 3);
+        let s = system_block(&[tool("get_weather")], Budget::calls(3));
         assert!(s.contains("<tools>"), "{s}");
         assert!(s.contains("\"name\":\"get_weather\""), "{s}");
         assert!(s.contains("at most 3 calls"), "{s}");
         // and the singular reads properly
-        assert!(system_block(&[tool("a")], 1).contains("at most 1 call in"));
+        assert!(system_block(&[tool("a")], Budget::calls(1)).contains("at most 1 call in"));
     }
 
     #[test]
@@ -2994,5 +3270,99 @@ mod tests {
         assert!(out.starts_with(&"x".repeat(10)));
         assert!(out.contains("truncated at 10"));
         assert_eq!(truncate("short", 10), "short");
+    }
+
+    /// `wait` is the one builtin no config block backs: named, it is offered
+    /// whatever else the deployment has, and it is never withheld by the web
+    /// switch because nothing about it leaves the enclave.
+    #[test]
+    fn wait_needs_no_block_and_no_web() {
+        let cfg: ToolsConfig =
+            serde_json::from_value(serde_json::json!({ "builtin": ["wait", "web_search"] }))
+                .unwrap();
+        let b = Builtins { search: None, web_withheld: true, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        assert!(reg.find("wait").is_some(), "{:?}", reg.notes);
+        assert!(reg.find("web_search").is_none());
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        assert_eq!(cfg.http_names(), vec!["wait".to_string(), "web_search".to_string()]);
+        // the budget fields have their defaults without being written
+        assert_eq!(cfg.max_seconds, 3600);
+        assert_eq!(cfg.wait_max_s, 600);
+        assert_eq!(cfg.keep_results, 3);
+    }
+
+    /// The plan is where a wait's arguments are judged: the number can arrive
+    /// as a string, a long ask is clamped and told so, and a spent budget is
+    /// an answer rather than a sleep.
+    #[test]
+    fn a_wait_is_clamped_and_told_so() {
+        let (s, reason, note) = wait_plan(&serde_json::json!({ "seconds": 30, "reason": "build" }), 600).unwrap();
+        assert_eq!((s, reason.as_str(), note.as_str()), (30, "build", ""));
+        let (s, _, note) = wait_plan(&serde_json::json!({ "seconds": "45s" }), 600).unwrap();
+        assert_eq!(s, 45);
+        assert!(note.is_empty());
+        // longer than the cap: sleeps the cap, says what it did not do
+        let (s, _, note) = wait_plan(&serde_json::json!({ "seconds": 900 }), 600).unwrap();
+        assert_eq!(s, 600);
+        assert!(note.contains("15 minutes"), "{note}");
+        assert!(note.contains("10 minutes"), "{note}");
+        assert!(note.contains("call wait again"), "{note}");
+        // nothing to wait with
+        let e = wait_plan(&serde_json::json!({ "seconds": 5 }), 0).unwrap_err();
+        assert!(e.contains("time budget is spent"), "{e}");
+        // and nothing to wait for
+        assert!(wait_plan(&serde_json::json!({}), 600).is_err());
+        assert!(wait_plan(&serde_json::json!({ "seconds": 0 }), 600).is_err());
+        assert!(wait_plan(&serde_json::json!({ "seconds": "soon" }), 600).is_err());
+    }
+
+    /// A request lowers the deployment's budget and never raises it, and the
+    /// two shapes of `loop` mean what they say.
+    #[test]
+    fn a_request_can_only_lower_the_budget() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "max_seconds": 1800
+        }))
+        .unwrap();
+        let b = cfg.budget(None);
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false });
+        assert!(cfg.budget(Some(&serde_json::json!(true))).persist);
+        assert!(!cfg.budget(Some(&serde_json::json!(false))).persist);
+        let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 8, "max_seconds": 600 })));
+        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true });
+        let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 999, "max_seconds": 99999, "persist": false })));
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false });
+        // zero is not a budget: the loop would refuse its first call
+        let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 0, "max_seconds": 0 })));
+        assert_eq!((b.max_calls, b.max_seconds), (1, 1));
+        assert_eq!(human_secs(45), "45 seconds");
+        assert_eq!(human_secs(600), "10 minutes");
+        assert_eq!(human_secs(5400), "1 hour 30 minutes");
+        assert_eq!(human_secs(7200), "2 hours");
+    }
+
+    /// The rules quote the budget and, only when asked to persist, tell the
+    /// model to work to the check - naming wait only when it has one.
+    #[test]
+    fn the_rules_follow_the_budget() {
+        let list = vec![tool("run_tests")];
+        let quick = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: false });
+        assert!(quick.contains("at most 32 calls"), "{quick}");
+        assert!(quick.contains("30 minutes of wall-clock time"), "{quick}");
+        assert!(quick.contains("stop calling and write the answer"), "{quick}");
+        assert!(!quick.contains("WORKING TO A CHECK"), "{quick}");
+        let persist = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: true });
+        assert!(persist.contains("WORKING TO A CHECK"), "{persist}");
+        assert!(persist.contains("keep going until the check passes"), "{persist}");
+        assert!(!persist.contains("call wait"), "{persist}");
+        let with_wait = vec![tool("run_tests"), tool("wait")];
+        let persist = system_block(&with_wait, Budget { max_calls: 32, max_seconds: 1800, persist: true });
+        assert!(persist.contains("call wait rather than polling"), "{persist}");
+        // the merged block (client tools beside ours) carries the same rule
+        let merged = merged_system_block(&with_wait, Budget { max_calls: 4, max_seconds: 120, persist: true }, None);
+        assert!(merged.contains("at most 4 of them"), "{merged}");
+        assert!(merged.contains("within 2 minutes"), "{merged}");
+        assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
     }
 }

@@ -424,6 +424,8 @@
   .toolcall .tms { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
   .toolcall.err .tname { color: var(--err); }
   .toolcall.run .tms { color: var(--text-3); opacity: .75; }
+  /* where a loop stands, above the calls it has made so far */
+  .toolhead { color: var(--text-3); font-size: 12px; padding: 0 2px 2px; }
 
   /* a generated image sits above the reply that talks about it */
   .genimg { margin: 4px 0 10px; }
@@ -2048,6 +2050,12 @@ const state = {
   // deployment set default_on.
   toolsOn: false,
   tools: { enabled: false },
+  // THE LOOP: keep working at a verifiable goal until its check passes - run
+  // it, read the failure, fix, run again - and wait when a job needs time,
+  // rather than answering at the first opportunity. Off by default: a
+  // question is not a task, and a persisting model spends the deployment's
+  // whole call budget on one that is.
+  loopOn: false,
   // SIGN IN WITH ENCLAVE: what /models reported about this deployment's
   // sign-in flow. `required` gates the two generation routes server-side;
   // everything here is just the UI knowing where to send people.
@@ -2125,7 +2133,7 @@ const isMobile = () => matchMedia("(max-width: 768px)").matches;
 // here either: SSO_KEY has its own lifecycle, cleared by signing out.
 const PREF_KEYS = ["llmchat-theme", "llmchat-model", "llmchat-target",
                    "llmchat-sidew", "llmchat-think", "llmchat-web", "llmchat-web-asked",
-                   "llmchat-tools", "llmchat-image"];
+                   "llmchat-tools", "llmchat-image", "llmchat-loop"];
 let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
 // Settings persist whatever the switch says. The switch is about CHAT HISTORY
@@ -2737,15 +2745,39 @@ function copyText(text, btn) {
 // What the model called, and with what. The arguments are shown in full
 // (elided by CSS, not by truncation) because they are the part that actually
 // left the enclave: a user is entitled to see what was sent on their behalf.
-function toolsBlock(calls) {
+// "45s", "12m 30s", "1h 05m": a duration for a status line or a step counter.
+function humanSecs(s) {
+  s = Math.max(0, Math.round(s || 0));
+  if (s < 60) return s + "s";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  if (h) return h + "h " + String(m).padStart(2, "0") + "m";
+  return m + "m" + (r ? " " + r + "s" : "");
+}
+
+// `loop`, while a reply streams: where the loop stands (step n of N and the
+// clock), read off the server's tool events. A finished reply carries it on
+// its meta line instead.
+function toolsBlock(calls, loop) {
   if (!calls || !calls.length) return null;
   const wrap = node('<div class="toolcalls"></div>');
+  if (loop && loop.max_calls > 1) {
+    const head = node('<div class="toolhead"></div>');
+    head.textContent = "Step " + loop.calls + " of " + loop.max_calls
+      + (loop.max_seconds ? " · " + humanSecs(loop.elapsed_s) + " of " + humanSecs(loop.max_seconds) : "");
+    wrap.appendChild(head);
+  }
   for (const c of calls) {
     const row = node('<div class="toolcall"><span class="tname"></span><span class="targs"></span><span class="tms"></span></div>');
     row.querySelector(".tname").textContent = c.name;
     let args = "";
     try { args = JSON.stringify(c.arguments || {}); } catch (_) { args = "{}"; }
-    row.querySelector(".targs").textContent = args === "{}" ? "" : args;
+    if (c.name === "wait") {
+      // a wait reads as what it is - how long, and what for - not as JSON
+      const a = c.arguments || {};
+      row.querySelector(".targs").textContent = humanSecs(+a.seconds || 0) + (a.reason ? " · " + a.reason : "");
+    } else {
+      row.querySelector(".targs").textContent = args === "{}" ? "" : args;
+    }
     if (c.ok === undefined) {
       row.classList.add("run");
       row.querySelector(".tms").textContent = "running…";
@@ -2890,7 +2922,10 @@ function metaLine(meta) {
   span.textContent = meta.target + " · " + meta.tokens + " tokens · " + meta.tok_per_s + " tok/s"
     // a DELEGATED look is worth a word in the visible line: the answer above
     // rests on a second model's report, not on this model having seen anything
-    + (meta.vision ? " · saw via " + (meta.vision.model || "vision service") : "");
+    + (meta.vision ? " · saw via " + (meta.vision.model || "vision service") : "")
+    // what a loop spent: its steps and its clock
+    + (meta.loop ? " · " + meta.loop.calls + " step" + (meta.loop.calls === 1 ? "" : "s")
+        + " · " + humanSecs(meta.loop.elapsed_s) : "");
   span.title = "load " + meta.load_ms + " ms · prefill " + meta.prefill_ms + " ms · decode " + meta.decode_ms + " ms"
     // what the pictures cost the context window, straight from the model
     + (meta.images ? " · " + meta.images + " image" + (meta.images === 1 ? "" : "s")
@@ -3034,7 +3069,7 @@ function updateStreamDOM(chat) {
   // show it immediately rather than making the user wait for the sentence
   const fig = imageBlock(s.image);
   if (fig) body.insertBefore(fig, body.firstChild);
-  const tls = toolsBlock(s.tools);
+  const tls = toolsBlock(s.tools, s.loop);
   if (tls) body.insertBefore(tls, body.firstChild);
   // sources stay pinned under the reply for the whole stream, so the user can
   // start opening them while the model is still writing
@@ -3855,6 +3890,8 @@ async function run(chat) {
         // the deployment's OWN tools, which it executes itself; this only says
         // whether the model is allowed to reach for them on this turn
         tools: state.tools.enabled && state.toolsOn ? true : undefined,
+        // the LOOP: keep at the goal until its check passes (see state)
+        loop: state.tools.enabled && state.toolsOn && state.loopOn ? true : undefined,
       }),
       signal: ctl.signal,
     });
@@ -3912,9 +3949,17 @@ async function run(chat) {
             toolCalls = toolCalls || [];
             toolCalls.push({ name: d.tool.name, arguments: d.tool.arguments });
             chat.streaming.tools = toolCalls;
+            // where the loop stands: the step counter and the clock
+            chat.streaming.loop = { calls: d.tool.n, max_calls: d.tool.of,
+                                    elapsed_s: d.tool.elapsed_s, max_seconds: d.tool.max_seconds };
             reply = "";
             chat.streaming.reply = "";
-            chat.streaming.status = "Calling " + d.tool.name + "…";
+            // a wait announces itself; the server's countdown ticks replace
+            // this line every few seconds while it sleeps
+            const wa = d.tool.arguments || {};
+            chat.streaming.status = d.tool.name === "wait"
+              ? "Waiting " + humanSecs(+wa.seconds || 0) + (wa.reason ? ": " + wa.reason : "") + "…"
+              : "Calling " + d.tool.name + "…";
             if (chat.id === state.currentId) renderChat();
           } else if (d.callnote) {
             // The model wrote a tool call nothing could run (unparseable, or
@@ -4867,6 +4912,34 @@ function renderModelMenu() {
       tsg.querySelector(".seg").appendChild(b);
     }
     modelMenu.appendChild(tsg);
+    // THE LOOP, beside Tools because it is a way of using them: on, the model
+    // is told to keep going until the goal's check passes and may wait for
+    // slow jobs, inside the deployment's step and time budget. Turning it on
+    // turns Tools on - a loop with nothing to call is not one.
+    const budget = (state.tools.max_calls || 0) + " steps"
+      + (state.tools.max_seconds ? " · " + humanSecs(state.tools.max_seconds) : "");
+    const lsg = node('<div class="seg-row"><span>Loop</span><div class="seg"></div></div>');
+    for (const t of ["on", "off"]) {
+      const b = node("<button type='button'></button>");
+      b.textContent = t;
+      if ((state.loopOn ? "on" : "off") === t) b.classList.add("on");
+      b.title = t === "on"
+        ? "keep working until the check passes: run it, read the failure, fix, run again, and wait for slow jobs. Budget " + budget + "; the stop button ends it at any point"
+        : "answer at the first opportunity: a tool is called when a question needs one, and the answer follows";
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.loopOn = t === "on";
+        pref("llmchat-loop", state.loopOn ? "on" : "off");
+        lsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+        if (state.loopOn && !state.toolsOn) {
+          state.toolsOn = true;
+          pref("llmchat-tools", "on");
+          tsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.textContent === "on"));
+        }
+      });
+      lsg.querySelector(".seg").appendChild(b);
+    }
+    modelMenu.appendChild(lsg);
   }
 }
 
@@ -4877,7 +4950,7 @@ function renderModelMenu() {
 // the same way.
 const modelsReady = (async () => {
   let storedModel = null, storedTarget = null, storedThink = null, storedWeb = null,
-      storedTools = null, storedImage = null;
+      storedTools = null, storedImage = null, storedLoop = null;
   try {
     storedModel = localStorage.getItem("llmchat-model");
     storedTarget = localStorage.getItem("llmchat-target");
@@ -4885,6 +4958,7 @@ const modelsReady = (async () => {
     storedWeb = localStorage.getItem("llmchat-web");
     storedTools = localStorage.getItem("llmchat-tools");
     storedImage = localStorage.getItem("llmchat-image");
+    storedLoop = localStorage.getItem("llmchat-loop");
   } catch (_) {}
   if (["auto", "gpu", "cpu"].includes(storedTarget)) state.target = storedTarget;
   if (storedThink === "off") state.think = false;
@@ -4920,6 +4994,9 @@ const modelsReady = (async () => {
   state.toolsOn = state.tools.enabled && state.tools.default_on === true;
   if (state.tools.enabled && (storedTools === "on" || storedTools === "off"))
     state.toolsOn = storedTools === "on";
+  // the loop never starts on by itself: it is a way of spending the budget
+  // that this person chose, and it only means anything with tools on
+  state.loopOn = state.tools.enabled && storedLoop === "on";
   state.auth = info.auth || { enabled: false };
   renderSsoUI();
   // the gate can rise UNDER the boot overlay right now - boot fades into it
