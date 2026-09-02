@@ -104,7 +104,21 @@ snapshot — the "each chat gets its own VM from a root image" shape.
   image's; the emulator checks it) — the `alpine/desktop.snap` object was
   re-taken with the new identity string.
 
-Measured: INSTANCES-NUMBERS-TBD
+Measured (wasm under wasmtime; `scripts/snaptest.py --phases ABCDE`):
+
+| | sample Buildroot (256 MiB) | Alpine DOOM desktop (1792 MiB, R2) |
+|---|---|---|
+| fork 3 instances from the root snapshot (each with its restoreExec hook) | 1.7 s | 4.0 s |
+| fork 1 instance from the LIVE main machine | 0.57 s | 1.13 s |
+| host memory per forked instance (owned chunks + overlay) | 11 MiB | 28 MiB |
+| 5 machines resident, total footprint (incl. base disk + images) | 253 MiB | 1152 MiB |
+| isolation (a file written in one instance is absent in the others and in main) | proven | proven |
+| instances.max enforced (409), DELETE, /stop + /start (fresh fork) | ok | ok |
+
+The headless image for per-chat roots: `alpine/rootfs-uncap5.ext2.gz` (2026-09-02)
+= rootfs-uncap4 with the desktop's inittab respawn removed, DOOM opt-in
+(`NO_DOOM`), and `/usr/bin/startx` bringing up Xorg + fluxbox on demand
+(`doom-fs` for the game). Root snapshot of it at 512 MiB: `alpine/headless-512.snap`.
 
 ## Caveats
 
