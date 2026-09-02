@@ -17,8 +17,13 @@ from __future__ import annotations
 
 import ast
 import datetime
+import functools
 import html.parser
+import json
 import operator
+import os
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from langchain_core.tools import tool
@@ -143,4 +148,144 @@ def utc_now() -> str:
         "%Y-%m-%d %H:%M:%S UTC (%A)")
 
 
-DEFAULT_TOOLS = [calculator, read_url, utc_now]
+# ---- the notebook (jot) ------------------------------------------------------
+# An Enclave `jot` deployment: the agent's notes as plain objects in the
+# deployer's own S3 bucket, behind a bearer key. These six tools are the
+# client side of its API (GET /api/tools on the deployment describes the same
+# verbs). They are only offered when ENCLAVE_AGENT_NOTES_URL is set, so an
+# agent without a notebook is not shown tools that would fail.
+#
+# What crosses the boundary: the note names and contents travel between this
+# machine and the jot enclave over TLS, and land as objects in the bucket the
+# deployer configured. That is the point (memory that outlives the process),
+# and it is also why the bucket is the deployer's own.
+
+_NOTES_TIMEOUT = 30
+_NOTES_MAX_CHARS = 20000
+
+
+class NotesClient:
+    """Thin HTTP client for a jot deployment. Stdlib only, like the rest."""
+
+    def __init__(self, base_url: str, api_key: str = "") -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    @staticmethod
+    def _path(name: str) -> str:
+        return "/".join(urllib.parse.quote(seg, safe="") for seg in name.split("/"))
+
+    def call(self, method: str, path: str, body: dict | None = None,
+             query: dict | None = None) -> dict:
+        url = self.base_url + path
+        if query:
+            url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v})
+        data = None
+        headers = {"accept": "application/json"}
+        if self.api_key:
+            headers["authorization"] = "Bearer " + self.api_key
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["content-type"] = "application/json"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=_NOTES_TIMEOUT) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read().decode())["error"]["message"]
+            except Exception:  # noqa: BLE001 - any shape of error body
+                msg = f"HTTP {e.code}"
+            raise RuntimeError(msg) from None
+        except OSError as e:
+            raise RuntimeError(f"notebook unreachable: {e}") from None
+
+
+def make_notes_tools(client: NotesClient) -> list:
+    """The six notebook tools, bound to one client."""
+
+    def guard(fn):
+        # functools.wraps keeps the signature @tool reads for the schema
+        @functools.wraps(fn)
+        def run(*a, **kw):
+            try:
+                return fn(*a, **kw)
+            except RuntimeError as e:
+                return f"error: {e}"
+        return run
+
+    @tool
+    @guard
+    def notes_list(prefix: str = "") -> str:
+        """List the notes in the notebook (name, size, last modified). Call this
+        first when unsure what has already been written down. `prefix` narrows
+        to names starting with it, e.g. 'projects/'."""
+        r = client.call("GET", "/api/notes", query={"prefix": prefix, "limit": "500"})
+        if not r["notes"]:
+            return "(no notes)" if not prefix else f"(no notes under {prefix})"
+        lines = [f"{n['name']}  ({n['size']} B, {n.get('modified', '')})" for n in r["notes"]]
+        if r.get("truncated"):
+            lines.append("[more notes not listed]")
+        return "\n".join(lines)
+
+    @tool
+    @guard
+    def notes_read(name: str) -> str:
+        """Read one note's full text by name (e.g. 'projects/enclave.md')."""
+        r = client.call("GET", "/api/notes/" + client._path(name))
+        text = r["content"]
+        if len(text) > _NOTES_MAX_CHARS:
+            text = text[:_NOTES_MAX_CHARS] + "\n[truncated]"
+        return text if text else "(empty note)"
+
+    @tool
+    @guard
+    def notes_write(name: str, content: str) -> str:
+        """Create or replace a note with the given full text. Prefer notes_append
+        to add to an existing note without rewriting it. Names are relative
+        paths of letters, digits, - _ . and spaces; markdown is a good default."""
+        r = client.call("PUT", "/api/notes/" + client._path(name), body={"content": content})
+        return f"saved {r['name']} ({r['size']} B)"
+
+    @tool
+    @guard
+    def notes_append(name: str, content: str) -> str:
+        """Append a paragraph to a note, creating it if it does not exist. The
+        right verb for logging something learned or a decision made."""
+        r = client.call("POST", "/api/notes/" + client._path(name) + "/append",
+                        body={"content": content})
+        return f"appended to {r['name']} (now {r['size']} B)"
+
+    @tool
+    @guard
+    def notes_search(query: str, prefix: str = "") -> str:
+        """Case-insensitive substring search across all note bodies. Returns
+        'name:line: text' for each matching line."""
+        r = client.call("GET", "/api/search", query={"q": query, "prefix": prefix, "limit": "50"})
+        if not r["hits"]:
+            return f"no matches for {query!r} in {r['scanned']} notes"
+        lines = [f"{h['name']}:{h['line']}: {h['text']}" for h in r["hits"]]
+        if r.get("truncated"):
+            lines.append("[more matches not listed]")
+        return "\n".join(lines)
+
+    @tool
+    @guard
+    def notes_delete(name: str) -> str:
+        """Delete a note by name."""
+        r = client.call("DELETE", "/api/notes/" + client._path(name))
+        return f"deleted {r['name']}"
+
+    return [notes_list, notes_read, notes_write, notes_append, notes_search, notes_delete]
+
+
+def notes_tools_from_env() -> list:
+    """The notebook tools when ENCLAVE_AGENT_NOTES_URL points at a jot
+    deployment (ENCLAVE_AGENT_NOTES_KEY is its api_key); otherwise none."""
+    url = os.environ.get("ENCLAVE_AGENT_NOTES_URL", "").strip()
+    if not url:
+        return []
+    return make_notes_tools(NotesClient(url, os.environ.get("ENCLAVE_AGENT_NOTES_KEY", "")))
+
+
+DEFAULT_TOOLS = [calculator, read_url, utc_now, *notes_tools_from_env()]

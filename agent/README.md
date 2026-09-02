@@ -43,17 +43,21 @@ output. Tool activity is narrated to stderr as it happens.
 | `ENCLAVE_AGENT_STREAMING` | `1` | keep on: the gateway cuts streams silent for ~180s and eyesoff-ai heartbeats only while streaming |
 | `ENCLAVE_AGENT_RECURSION_LIMIT` | `25` | LangGraph step cap; the passthrough yields ONE tool call per model turn, so N calls cost 2N+1 steps |
 | `ENCLAVE_AGENT_SYSTEM_PROMPT` | (see config.py) | the agent's standing instructions |
+| `ENCLAVE_AGENT_NOTES_URL` | (unset) | a [jot](../jot) deployment (`https://<id8>.app.enclave.host`); when set, the six notebook tools (`notes_list/read/write/append/search/delete`) join the belt |
+| `ENCLAVE_AGENT_NOTES_KEY` | (empty) | that deployment's `api_key`, sent as a bearer |
 
 ## Layout
 
     src/enclave_agent/
       agent.py    the graph: model -> (tool_calls? tools : END) -> model
-      tools.py    the client-side tool belt (calculator, read_url, utc_now)
+      tools.py    the client-side tool belt (calculator, read_url, utc_now,
+                  and the jot notebook tools when ENCLAVE_AGENT_NOTES_URL is set)
       model.py    ChatOpenAI factory aimed at the deployment
       config.py   env-driven settings
       cli.py      REPL / one-shot front end
-    tests/        stub OpenAI server faithful to the passthrough contract,
-                  plus tool unit tests: python -m unittest discover -s tests
+    tests/        stub OpenAI server faithful to the passthrough contract, a
+                  stub jot notebook, plus tool unit tests:
+                  python -m unittest discover -s tests
 
 The tool belt is stdlib-only on purpose. The intended follow-up is running
 this same package from CPython inside a RISC Box guest, so the entire agent

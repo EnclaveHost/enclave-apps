@@ -38,6 +38,7 @@ app's README (and `wasm/apps/README.md` in the
 | [tipline](tipline/) | Anonymous encrypted inbox: sources encrypt to your key in a page you can attest first. |
 | [keep](keep/) | A confidential notebook on an encrypted volume: notes decrypt only inside the enclave, sync re-encrypts to your bucket. |
 | [shoebox](shoebox/) | A private file locker/gallery on an encrypted volume: upload, browse, download; files decrypt only inside the enclave. |
+| [jot](jot/) | A notebook your agent keeps in your own bucket: a bearer-keyed JSON API (list, read, write, append, search, delete) with every note one SigV4-signed plain object in R2/S3, written from inside the enclave. `GET /api/tools` hands any agent its function schemas, and an eyesoff-ai `tools.http` block, ready to paste. |
 | [gavel](gavel/) | Sealed-bid auctions (Vickrey or first-price): bids sealed in enclave RAM the seller can't peek at, a blinded committed reserve, and losing bids scrubbed, never revealed. |
 | [yardstick](yardstick/) | Measure a group without anyone showing their number: only aggregates of ≥ k submissions leave the enclave; the numbers are scrubbed at close. |
 | [golem](golem/) | QEMU machines booted in your browser from a wallet-sealed S3 volume: the enclave is the attested image vault and cross-origin-isolated server; disk snapshots stream back in. |

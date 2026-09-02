@@ -1,0 +1,13 @@
+// jot: an agent's notebook kept as plain objects in the deployer's own
+// S3-compatible bucket (R2, S3, Wasabi, minio). Every note read or write is
+// one SigV4-signed request through wasi:http/outgoing-handler, which the
+// platform's transparent egress carries; the API is served through
+// wasi:http/incoming-handler. No filesystem, no sockets, no TLS stack in the
+// app: the host does the transport, the app does the signing.
+// WIT deps vendored verbatim from wasmtime v45 (same tree as keep).
+package enclave:jot;
+
+world jot {
+  import wasi:http/outgoing-handler@0.2.6;
+  export wasi:http/incoming-handler@0.2.6;
+}

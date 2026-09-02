@@ -13,10 +13,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from stub_notes import start as start_notes  # noqa: E402
 from stub_server import start  # noqa: E402
 
 from enclave_agent import Settings, build_agent, make_model, run_once  # noqa: E402
-from enclave_agent.tools import calculator, extract_text  # noqa: E402
+from enclave_agent.tools import (  # noqa: E402
+    NotesClient, calculator, extract_text, make_notes_tools)
 
 
 class CalculatorTests(unittest.TestCase):
@@ -75,6 +77,63 @@ class AgentLoopTests(unittest.TestCase):
         second = run_once(self.agent, "10-3", self.settings, history=first)
         self.assertEqual(len(second), 8)
         self.assertEqual(second[-2].content, "7")
+
+
+class NotebookToolTests(unittest.TestCase):
+    """The six jot tools against a stub deployment: names travel percent-
+    encoded, the key rides as a bearer, errors come back as text."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server, base_url, cls.notes = start_notes()
+        cls.tools = {t.name: t for t in make_notes_tools(NotesClient(base_url, "stub-key"))}
+        cls.bad = {t.name: t for t in make_notes_tools(NotesClient(base_url, "wrong"))}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        self.notes.clear()
+
+    def test_write_read_list_search_delete(self):
+        t = self.tools
+        self.assertEqual(t["notes_list"].invoke({}), "(no notes)")
+        self.assertEqual(t["notes_write"].invoke({"name": "projects/enclave.md",
+                                                  "content": "# Enclave\nneedle here\n"}),
+                         "saved projects/enclave.md (22 B)")
+        self.assertEqual(self.notes["projects/enclave.md"], "# Enclave\nneedle here\n")
+        self.assertEqual(t["notes_read"].invoke({"name": "projects/enclave.md"}),
+                         "# Enclave\nneedle here\n")
+        self.assertTrue(t["notes_list"].invoke({}).startswith("projects/enclave.md  (22 B"))
+        self.assertEqual(t["notes_list"].invoke({"prefix": "zzz"}), "(no notes under zzz)")
+        self.assertEqual(t["notes_search"].invoke({"query": "NEEDLE"}),
+                         "projects/enclave.md:2: needle here")
+        self.assertTrue(t["notes_search"].invoke({"query": "absent"}).startswith("no matches"))
+        self.assertEqual(t["notes_delete"].invoke({"name": "projects/enclave.md"}),
+                         "deleted projects/enclave.md")
+        self.assertEqual(t["notes_read"].invoke({"name": "projects/enclave.md"}),
+                         "error: no such note")
+
+    def test_append_creates_then_extends(self):
+        t = self.tools
+        self.assertEqual(t["notes_append"].invoke({"name": "log.md", "content": "one"}),
+                         "appended to log.md (now 4 B)")
+        t["notes_append"].invoke({"name": "log.md", "content": "two"})
+        self.assertEqual(self.notes["log.md"], "one\ntwo\n")
+
+    def test_names_with_spaces_survive_the_url(self):
+        t = self.tools
+        t["notes_write"].invoke({"name": "meeting notes/2026-09-01.md", "content": "x"})
+        self.assertIn("meeting notes/2026-09-01.md", self.notes)
+        self.assertEqual(t["notes_read"].invoke({"name": "meeting notes/2026-09-01.md"}), "x")
+
+    def test_wrong_key_is_an_error_string_not_an_exception(self):
+        self.assertEqual(self.bad["notes_list"].invoke({}), "error: unauthorized")
+
+    def test_unreachable_notebook_is_an_error_string(self):
+        dead = {t.name: t for t in make_notes_tools(NotesClient("http://127.0.0.1:9", "k"))}
+        self.assertTrue(dead["notes_list"].invoke({}).startswith("error: notebook unreachable"))
 
 
 if __name__ == "__main__":

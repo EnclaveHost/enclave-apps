@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jot - a notebook your agent keeps in your own bucket</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 96 96%27%3E%3Crect x=%2714%27 y=%2722%27 width=%2760%27 height=%2752%27 rx=%276%27 fill=%27%23f5c76a%27/%3E%3Crect x=%2714%27 y=%2722%27 width=%2760%27 height=%2712%27 rx=%276%27 fill=%27%23d9a63f%27/%3E%3Cg fill=%27%232a1d02%27%3E%3Crect x=%2724%27 y=%2744%27 width=%2734%27 height=%274%27 rx=%272%27/%3E%3Crect x=%2724%27 y=%2754%27 width=%2740%27 height=%274%27 rx=%272%27/%3E%3Crect x=%2724%27 y=%2764%27 width=%2722%27 height=%274%27 rx=%272%27/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131722; --panel2: #0f131c; --border: #232a3a;
+    --text: #e6e9f0; --dim: #8a93a6; --accent: #f5c76a; --accent-h: #ffd98a;
+    --err: #f2b8c0; --warn: #f5d58a; --danger: #f2748a; --ok: #7ee0b8;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 1040px; margin: 0 auto; padding: 0 16px 40px; }
+  header { padding: 18px 0 12px; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .wordmark { font: 600 20px/1 var(--mono); letter-spacing: .06em; color: var(--accent); }
+  .tagline { color: var(--dim); font-size: 12.5px; margin-top: 5px; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pill { font: 600 11px var(--mono); border-radius: 999px; padding: 2px 9px; background: #2a2f3e; color: var(--dim); }
+  .pill.on { background: #2a3a2e; color: var(--ok); }
+  .pill.warn { background: #3a3320; color: var(--warn); }
+  .pill.bad { background: #3a2530; color: var(--danger); }
+  .banner { background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 13px; margin-top: 14px; font-size: 12.5px; color: var(--dim); }
+  .banner b { color: var(--text); font-weight: 600; }
+  .banner.bad { border-left-color: var(--danger); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .card h2 { font-size: 13.5px; font-weight: 600; color: var(--accent); margin-bottom: 6px; }
+  .card p { font-size: 12.5px; color: var(--dim); }
+  .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); word-break: break-all; }
+  input, textarea { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px; font: 13px var(--mono); }
+  input::placeholder, textarea::placeholder { color: #59627a; }
+  button { background: var(--accent); color: #2a1d02; border: 0; border-radius: 7px; padding: 7px 14px; font: 600 13px system-ui, sans-serif; cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { background: var(--accent-h); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.ghost:hover:not(:disabled) { background: var(--panel2); color: var(--text); }
+  button.danger { color: var(--danger); border-color: #3a2530; }
+  button.danger.armed { background: var(--danger); color: #2a0d13; border-color: var(--danger); }
+  button.mini { padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .4; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .row input { flex: 1; min-width: 160px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; }
+  .nb { display: grid; grid-template-columns: 284px 1fr; gap: 14px; margin-top: 14px; align-items: start; }
+  .side { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .side-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+  .side-q { padding: 8px; border-bottom: 1px solid var(--border); }
+  .list { max-height: 56vh; overflow-y: auto; padding: 6px; }
+  .item { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline; padding: 7px 9px; border-radius: 7px; cursor: pointer; }
+  .item:hover { background: var(--panel2); }
+  .item.active { background: #33290f; }
+  .item .nm { font: 12.5px var(--mono); color: var(--text); word-break: break-all; }
+  .item.active .nm { color: var(--accent); }
+  .item .nz { font: 11px var(--mono); color: var(--dim); white-space: nowrap; }
+  .item .nv { grid-column: 1 / -1; font: 11px var(--mono); color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+  .empty { color: var(--dim); font-size: 12.5px; padding: 12px 10px; }
+  .main { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; min-height: 62vh; }
+  .ed-hd { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .ed-hd input { flex: 1; }
+  .state { font-size: 11.5px; font-weight: 600; white-space: nowrap; color: var(--dim); }
+  .state.ok { color: var(--ok); } .state.warn { color: var(--warn); }
+  .editor { flex: 1; min-height: 340px; resize: vertical; border: 0; border-radius: 0; padding: 14px; font: 13.5px/1.6 var(--mono); outline: none; }
+  .ed-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+  pre.code { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font: 12px/1.5 var(--mono); color: var(--text); margin-top: 8px; white-space: pre; }
+  pre.code .c { color: var(--dim); }
+  details > summary { cursor: pointer; font-size: 12.5px; color: var(--dim); user-select: none; margin-top: 8px; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--border); line-height: 1.6; }
+  footer b { color: var(--text); }
+  a { color: var(--accent); }
+  @media (max-width: 720px) { .nb { grid-template-columns: 1fr; } .list { max-height: 30vh; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="wordmark">[ jot ]</div>
+    <div class="tagline">a notebook your agent keeps in your own bucket</div>
+  </div>
+  <div class="pills" id="pills"></div>
+</header>
+
+<div class="banner" id="banner">Loading status…</div>
+
+<div class="card" id="keycard">
+  <h2>API key</h2>
+  <p>This deployment gates its API behind a key (the <code>api_key</code> secret). Paste it to browse and edit here; it is kept in this tab only.</p>
+  <div class="row">
+    <input id="key" type="password" placeholder="api key" autocomplete="off">
+    <button id="connect">Connect</button>
+    <button class="ghost" id="forget">Forget</button>
+  </div>
+  <div class="err" id="keyerr"></div>
+</div>
+
+<div class="nb" id="nb" hidden>
+  <div class="side">
+    <div class="side-hd"><span id="count">notes</span><button class="mini" id="new">New</button></div>
+    <div class="side-q"><input id="q" placeholder="search note text… (enter)"></div>
+    <div class="list" id="list"><div class="empty">loading…</div></div>
+  </div>
+  <div class="main">
+    <div class="ed-hd">
+      <input id="name" placeholder="note name, e.g. projects/enclave.md">
+      <span class="state" id="state"></span>
+    </div>
+    <textarea class="editor" id="editor" placeholder="Write here. Markdown is a good default; the note is stored exactly as typed." spellcheck="false"></textarea>
+    <div class="ed-foot">
+      <div class="acts">
+        <button id="save">Save</button>
+        <button class="ghost" id="reload">Reload</button>
+        <button class="ghost danger" id="del">Delete</button>
+      </div>
+      <span class="meta" id="emeta"></span>
+    </div>
+  </div>
+</div>
+<div class="err" id="err"></div>
+
+<div class="card">
+  <h2>For agents</h2>
+  <p>Every route is JSON with the key as <code>Authorization: Bearer</code>. <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the same six verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
+  <pre class="code" id="curl"></pre>
+  <details><summary>eyesoff-ai config block (paste into that deployment's App Config; set JOT_API_KEY as its secret)</summary><pre class="code" id="eyesoff">…</pre></details>
+</div>
+
+<footer>
+  jot stores each note as one plain object under a prefix in <b>your</b> S3-compatible bucket (R2, S3, Wasabi, minio), written with SigV4 from inside the enclave.
+  The App Config names the bucket; the S3 credentials and the API key are deployment secrets that exist only in the attested guest.
+  The bucket stays readable with ordinary S3 tools, so a notebook that must be unreadable at rest belongs on an encrypted volume instead (see <b>keep</b>).
+  <b>Verify the enclave before trusting it</b>: <a href="https://enclave.host" target="_blank" rel="noreferrer">enclave.host</a>.
+</footer>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = (n) => n >= 1048576 ? (n / 1048576).toFixed(1) + " MiB" : n >= 1024 ? (n / 1024).toFixed(1) + " KiB" : n + " B";
+const when = (s) => { const d = new Date(s); return isNaN(d) ? (s || "") : d.toLocaleString(); };
+
+let key = "";
+try { key = sessionStorage.getItem("jot_key") || ""; } catch (e) {}
+let status = null, notes = [], current = null, etag = null, dirty = false;
+
+async function api(method, path, body, headers) {
+  const h = Object.assign({ "accept": "application/json" }, headers || {});
+  if (key) h["authorization"] = "Bearer " + key;
+  if (body !== undefined) h["content-type"] = "application/json";
+  const r = await fetch(path, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body) });
+  let j = null;
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((j && j.error && j.error.message) || (r.status + " " + r.statusText));
+  return j;
+}
+
+function pills() {
+  if (!status) return;
+  const p = [];
+  p.push(`<span class="pill ${status.configured ? "on" : "bad"}">${status.configured ? "configured" : "unconfigured"}</span>`);
+  p.push(`<span class="pill ${status.auth ? "on" : "warn"}">${status.auth ? "key required" : "no api key"}</span>`);
+  if (status.readOnly) p.push(`<span class="pill warn">read-only</span>`);
+  if (status.signed !== undefined) p.push(`<span class="pill ${status.signed ? "on" : "warn"}">${status.signed ? "signed" : "unsigned"}</span>`);
+  $("#pills").innerHTML = p.join("");
+  const b = $("#banner");
+  if (!status.configured) {
+    b.className = "banner bad";
+    b.innerHTML = `<b>Not configured:</b> ${esc(status.missing.join(", "))} not set. Set the deployment's App Config (endpoint, bucket, prefix, credentials as <b>$VAR</b> secrets, api_key) and restart it.`;
+  } else if (status.bucket !== undefined) {
+    b.className = "banner";
+    b.innerHTML = `Notes are objects under <b>${esc(status.bucket)}/${esc(status.prefix)}</b> at <b>${esc(status.endpoint)}</b> (${status.signed ? "SigV4-signed" : "UNSIGNED: no credentials configured"}${status.readOnly ? ", read-only" : ""}).`;
+  } else {
+    b.className = "banner";
+    b.innerHTML = status.auth
+      ? `Configured. Connect with the API key to see the bucket and the notes.`
+      : `<b>No api_key is set:</b> anyone who can reach this deployment can read and write the notebook. Set the <b>api_key</b> to a <b>$VAR</b> secret before pointing an agent at it publicly.`;
+  }
+  $("#keycard").hidden = !status.auth;
+  $("#nb").hidden = !(status.configured && (!status.auth || key));
+}
+
+async function loadStatus() {
+  try { status = await api("GET", "/api/status"); } catch (e) { status = { configured: false, missing: ["status"], auth: false }; }
+  pills();
+  curl();
+}
+
+function curl() {
+  const base = location.origin;
+  const k = status && status.auth ? "-H 'Authorization: Bearer $JOT_API_KEY' " : "";
+  $("#curl").innerHTML =
+    `<span class="c"># list, read, write, append, search, delete</span>\n` +
+    `curl -s ${k}${esc(base)}/api/notes\n` +
+    `curl -s ${k}${esc(base)}/api/notes/projects/enclave.md\n` +
+    `curl -s ${k}-X PUT -H 'content-type: application/json' -d '{"content":"# Enclave\\n\\nnotes…"}' ${esc(base)}/api/notes/projects/enclave.md\n` +
+    `curl -s ${k}-X POST -H 'content-type: application/json' -d '{"content":"learned: …"}' ${esc(base)}/api/notes/log.md/append\n` +
+    `curl -s ${k}"${esc(base)}/api/search?q=needle"\n` +
+    `curl -s ${k}-X DELETE ${esc(base)}/api/notes/scratch.md`;
+  fetch("/api/tools").then((r) => r.json()).then((t) => { $("#eyesoff").textContent = JSON.stringify(t.eyesoff_ai, null, 2); }).catch(() => {});
+}
+
+function setState(text, cls) { const s = $("#state"); s.textContent = text; s.className = "state " + (cls || ""); }
+
+function renderList(items, mode) {
+  const el = $("#list");
+  if (!items.length) { el.innerHTML = `<div class="empty">${mode === "search" ? "no matches" : "no notes yet"}</div>`; return; }
+  el.innerHTML = items.map((n) => mode === "search"
+    ? `<div class="item" data-n="${esc(n.name)}"><span class="nm">${esc(n.name)}</span><span class="nz">line ${n.line}</span><span class="nv">${esc(n.text)}</span></div>`
+    : `<div class="item ${n.name === current ? "active" : ""}" data-n="${esc(n.name)}"><span class="nm">${esc(n.name)}</span><span class="nz">${fmt(n.size)}</span><span class="nv">${esc(when(n.modified))}</span></div>`
+  ).join("");
+  el.querySelectorAll(".item").forEach((it) => it.addEventListener("click", () => open(it.dataset.n)));
+}
+
+async function refresh() {
+  try {
+    const r = await api("GET", "/api/notes?limit=1000");
+    notes = r.notes;
+    $("#count").textContent = `${notes.length} note${notes.length === 1 ? "" : "s"}${r.truncated ? "+" : ""}`;
+    renderList(notes);
+    $("#err").textContent = "";
+  } catch (e) { $("#err").textContent = e.message; }
+}
+
+async function open(name) {
+  if (dirty && !confirm("Discard unsaved changes?")) return;
+  try {
+    const n = await api("GET", "/api/notes/" + name.split("/").map(encodeURIComponent).join("/"));
+    current = n.name; etag = n.etag; dirty = false;
+    $("#name").value = n.name; $("#editor").value = n.content;
+    $("#emeta").textContent = `${fmt(n.size)}${n.modified ? " · " + when(n.modified) : ""}${n.etag ? " · " + n.etag.slice(0, 12) : ""}`;
+    setState("saved", "ok");
+    renderList(notes);
+    $("#err").textContent = "";
+  } catch (e) { $("#err").textContent = e.message; }
+}
+
+function fresh() {
+  if (dirty && !confirm("Discard unsaved changes?")) return;
+  current = null; etag = null; dirty = false;
+  $("#name").value = ""; $("#editor").value = ""; $("#emeta").textContent = "";
+  setState("new note", "");
+  renderList(notes);
+  $("#name").focus();
+}
+
+async function save() {
+  const name = $("#name").value.trim();
+  if (!name) { $("#err").textContent = "give the note a name"; return; }
+  const body = { content: $("#editor").value };
+  if (current === name && etag) body.ifMatch = etag;
+  try {
+    setState("saving…", "warn");
+    const r = await api("PUT", "/api/notes/" + name.split("/").map(encodeURIComponent).join("/"), body);
+    current = name; etag = r.etag; dirty = false;
+    setState("saved", "ok");
+    $("#emeta").textContent = `${fmt(r.size)}${r.etag ? " · " + r.etag.slice(0, 12) : ""}`;
+    $("#err").textContent = "";
+    await refresh();
+  } catch (e) { setState("unsaved", "warn"); $("#err").textContent = e.message; }
+}
+
+let armed = null;
+async function del() {
+  if (!current) return;
+  const b = $("#del");
+  if (armed !== current) { armed = current; b.classList.add("armed"); b.textContent = "Really delete?"; setTimeout(() => { armed = null; b.classList.remove("armed"); b.textContent = "Delete"; }, 4000); return; }
+  try {
+    await api("DELETE", "/api/notes/" + current.split("/").map(encodeURIComponent).join("/"));
+    armed = null; b.classList.remove("armed"); b.textContent = "Delete";
+    dirty = false; fresh(); await refresh();
+  } catch (e) { $("#err").textContent = e.message; }
+}
+
+async function search() {
+  const q = $("#q").value.trim();
+  if (!q) { renderList(notes); return; }
+  try {
+    const r = await api("GET", "/api/search?q=" + encodeURIComponent(q) + "&limit=100");
+    renderList(r.hits, "search");
+    $("#count").textContent = `${r.hits.length} hit${r.hits.length === 1 ? "" : "s"} in ${r.scanned} notes`;
+  } catch (e) { $("#err").textContent = e.message; }
+}
+
+$("#connect").addEventListener("click", async () => {
+  key = $("#key").value.trim();
+  try { sessionStorage.setItem("jot_key", key); } catch (e) {}
+  $("#keyerr").textContent = "";
+  try { await api("GET", "/api/notes?limit=1"); } catch (e) { $("#keyerr").textContent = e.message; return; }
+  await loadStatus(); await refresh();
+});
+$("#forget").addEventListener("click", () => { key = ""; try { sessionStorage.removeItem("jot_key"); } catch (e) {} $("#key").value = ""; loadStatus(); });
+$("#key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#connect").click(); });
+$("#new").addEventListener("click", fresh);
+$("#save").addEventListener("click", save);
+$("#reload").addEventListener("click", () => { if (current) { dirty = false; open(current); } else fresh(); });
+$("#del").addEventListener("click", del);
+$("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+$("#q").addEventListener("input", () => { if (!$("#q").value.trim()) renderList(notes); });
+$("#editor").addEventListener("input", () => { dirty = true; setState("unsaved changes", "warn"); });
+$("#name").addEventListener("input", () => { if ($("#name").value.trim() !== current) { dirty = true; setState("unsaved (new name)", "warn"); } });
+document.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); save(); } });
+window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+(async () => {
+  if (key) $("#key").value = key;
+  await loadStatus();
+  if (status && status.configured && (!status.auth || key)) { await refresh(); fresh(); }
+})();
+</script>
+</body>
+</html>
