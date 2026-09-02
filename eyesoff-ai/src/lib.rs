@@ -3774,6 +3774,10 @@ enum RawContent {
 
 #[derive(Deserialize)]
 struct ContentPart {
+    /// the OpenAI part tag ("text", "image_url", "input_image", "video_url",
+    /// ...), kept only so an UNSUPPORTED part can be refused by name
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -3874,6 +3878,17 @@ impl<'de> Deserialize<'de> for ChatMsg {
                     };
                     if let Some(vsrc) = vsrc {
                         msg.videos.push(decode_video_src(&vsrc).map_err(serde::de::Error::custom)?);
+                    }
+                    // A part this app cannot read is REFUSED, not dropped. Dropping
+                    // it (what the shipped 1.0.48 did with a video_url part) left
+                    // the model answering "what is in this video?" from nothing -
+                    // a confident description of a clip it never saw. An audio
+                    // part, a file part, a misspelled image part: same rule.
+                    if p.text.is_none() && p.image_url.is_none() && p.source.is_none() && p.video_url.is_none() {
+                        return Err(serde::de::Error::custom(format!(
+                            "unsupported content part{}: this app reads text, image_url/input_image/image and video_url parts",
+                            p.kind.as_deref().map(|k| format!(" \"{k}\"")).unwrap_or_default()
+                        )));
                     }
                 }
                 msg.content = text;
@@ -10277,6 +10292,15 @@ mod tests {
         // slot/image count mismatches are caught rather than silently misaligned
         assert!(split_rendered(&tok, &rendered, vec![].into_iter().map(Media::Image).collect()).is_err());
         assert!(split_rendered(&tok, "no slot", vec![Media::Image(png_bytes())]).is_err());
+    }
+
+    #[test]
+    fn unsupported_content_parts_are_refused_not_dropped() {
+        // an audio part (or any part this app cannot read) must fail the
+        // request with its type named, never silently vanish from the prompt
+        let raw = r#"{"role":"user","content":[{"type":"text","text":"what is said?"},{"type":"input_audio","input_audio":{"data":"AAAA","format":"wav"}}]}"#;
+        let err = serde_json::from_str::<ChatMsg>(raw).err().expect("refused").to_string();
+        assert!(err.contains("unsupported content part") && err.contains("input_audio"), "{err}");
     }
 
     #[test]
