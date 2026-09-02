@@ -1156,6 +1156,27 @@ impl Session {
 
     /// Feed `ids`; with `want_logits`, return the LAST token's logits row.
     fn feed(&mut self, cfg: &AppConfig, ids: &[u32], want_logits: bool) -> Result<Row, String> {
+        self.feed_declared(cfg, ids, want_logits, None)
+    }
+
+    /// feed(), plus the mm34 prefix-cache declaration on a prompt's FIRST
+    /// chunk: `prompt` is the WHOLE prompt's token ids (text only - a picture
+    /// or a clip in the prompt has no ids to declare, and such prompts go
+    /// undeclared). The engine matches it against its parked prompts right
+    /// there and branches off the longest one that is a prefix, so every
+    /// later chunk costs at most its own tokens - the chunk stays the unit of
+    /// liveness. Engines predating mm34 ignore the input. (mm32/mm33 tried to
+    /// reach the same win from the {"more":1} marker alone by HOLDING chunks
+    /// and replaying them in one call on divergence; a new chat diverges at
+    /// its user message, the last chunk, so that call was the whole prompt -
+    /// 210 s on a CPU node, cut by the proxy at 180 s. 2026-09-02.)
+    fn feed_declared(
+        &mut self,
+        cfg: &AppConfig,
+        ids: &[u32],
+        want_logits: bool,
+        prompt: Option<&[u32]>,
+    ) -> Result<Row, String> {
         match self {
             Session::Onnx { ctx, past, total } => {
                 let ids64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
@@ -1187,6 +1208,11 @@ impl Session {
                 if !want_logits {
                     inputs.push(("more".to_string(),
                         Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())));
+                }
+                if let Some(all) = prompt {
+                    let pb: Vec<u8> = all.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
+                    inputs.push(("prompt".to_string(),
+                        Tensor::new(&[1, all.len() as u32], TensorType::I32, &pb)));
                 }
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
                 note_timing(if ids.len() > 1 { "feed_batch" } else { "feed" }, &outs);
@@ -2881,7 +2907,9 @@ fn generate(
                     // only the very last token of the whole prompt needs logits
                     let last = i == last_part && end == ids.len();
                     let t_chunk = now_ms();
-                    let l = sess.feed(cfg, &ids[done..end], last)?;
+                    // the whole prompt rides beside its first chunk (mm34)
+                    let declare = if fed == 0 && done == 0 { prompt.text_only() } else { None };
+                    let l = sess.feed_declared(cfg, &ids[done..end], last, declare)?;
                     let took = now_ms() - t_chunk;
                     if last {
                         logits = l;
@@ -3049,7 +3077,8 @@ fn generate_spec(
     while done < prompt_ids.len() {
         let end = (done + chunk).min(prompt_ids.len());
         let last = end == prompt_ids.len();
-        let l = sess.feed(cfg, &prompt_ids[done..end], last)?;
+        let declare = (done == 0).then_some(prompt_ids); // mm34, see feed_declared
+        let l = sess.feed_declared(cfg, &prompt_ids[done..end], last, declare)?;
         if last { t_logits = l; }
         done = end;
     }
@@ -3669,7 +3698,8 @@ fn generate_lookup(
     while done < prompt_ids.len() {
         let end = (done + chunk).min(prompt_ids.len());
         let last = end == prompt_ids.len();
-        let l = sess.feed(cfg, &prompt_ids[done..end], last)?;
+        let declare = (done == 0).then_some(prompt_ids); // mm34, see feed_declared
+        let l = sess.feed_declared(cfg, &prompt_ids[done..end], last, declare)?;
         if last {
             t_logits = l;
         }
