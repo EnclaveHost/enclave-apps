@@ -896,6 +896,14 @@
     overflow: hidden; background: var(--bubble); border: 1px solid var(--border-soft);
   }
   .att img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .att.att-video video { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; }
+  .att .att-badge {
+    position: absolute; left: 4px; bottom: 3px; font-size: 9px; font-weight: 700; letter-spacing: .06em;
+    color: #fff; background: rgba(0,0,0,.6); padding: 1px 4px; border-radius: 4px; pointer-events: none;
+  }
+  .msg-video { display: block; max-width: min(100%, 360px); border-radius: 12px; margin: 0 0 6px; background: #000; }
+  #camRecTimer { font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 13px; margin-left: 8px; }
+  #camRecord.recording { background: #c0392b; color: #fff; border-color: #c0392b; }
   .att .x {
     position: absolute; top: 2px; right: 2px; width: 18px; height: 18px;
     border-radius: 50%; background: rgba(0,0,0,.62); color: #fff;
@@ -1229,6 +1237,7 @@
       </div>
       <div class="cam-actions">
         <button class="web-btn" id="camSwitch" hidden>Switch camera</button>
+        <button class="web-btn" id="camRecord" hidden>Record a clip</button><span id="camRecTimer" hidden></span>
         <button class="web-btn primary" id="camShoot">Take photo</button>
       </div>
       <p class="web-foot">The photo is attached to your next message. Nothing is recorded, and
@@ -1349,6 +1358,18 @@
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="8.5" cy="10" r="1.7"/><path d="M4 17l4.7-4.5a2 2 0 0 1 2.7 0L16 17"/><path d="M14 14.5l1.6-1.5a2 2 0 0 1 2.7 0L21 15.4"/></svg>
               <span class="m-name" id="menuUploadTxt">Upload an image</span>
             </button>
+            <button class="m-item" type="button" id="menuVideo" role="menuitem" hidden>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10.5l5-3v9l-5-3z"/></svg>
+              <span class="m-name">Upload a video</span>
+            </button>
+            <button class="m-item" type="button" id="menuVideoLink" role="menuitem" hidden>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>
+              <span class="m-name">Paste a video link</span>
+            </button>
+            <button class="m-item" type="button" id="menuRecord" role="menuitem" hidden>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/></svg>
+              <span class="m-name">Record a clip</span>
+            </button>
             <button class="m-item" type="button" id="menuCamera" role="menuitem">
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8.5h3l1.4-2.2a1 1 0 0 1 .85-.47h5.5a1 1 0 0 1 .85.47L17 8.5h3a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.2"/></svg>
               <span class="m-name">Take a photo</span>
@@ -1372,6 +1393,7 @@
            camera UI still offers the switch. One at a time - a phone camera
            returns one shot per invocation, so `multiple` would be a lie. -->
       <input id="camInput" type="file" accept="image/*" capture="environment" hidden>
+      <input id="videoInput" type="file" accept="video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo,.mp4,.m4v,.mov,.webm,.mkv,.avi" hidden>
     </form>
     <p class="footnote">Answer quality tracks model size: small models are quick and frequently wrong. Chats stay in this browser.</p>
   </div>
@@ -2035,6 +2057,7 @@ const state = {
   // the deployment configured a vision SERVICE (`service`), which reads for
   // every model and makes the capability model-independent.
   vision: { enabled: false, service: false, max_images: 0, max_bytes: 0 },
+  video: { enabled: false, max_bytes: 0, frames: 0 },   // mm33: clips through the engine's video verb
   attachments: [],  // pending uploads for the next message: {url, w, h, bytes}
 };
 // ids must stay unique across sessions - chats persist to IndexedDB
@@ -2894,6 +2917,16 @@ function renderMessage(m, idx, isTail) {
     bubble.innerHTML = linkifyText(m.content);
     // pictures above the words, the way they were composed. A turn that was
     // only a picture shows no empty bubble.
+    if (m.videos && m.videos.length) {
+      for (const u of m.videos) {
+        if (!/^data:video\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/.test(u)) continue;
+        const v = document.createElement("video");
+        v.src = u; v.controls = true; v.muted = true; v.playsInline = true; v.preload = "metadata";
+        v.className = "msg-video";
+        row.insertBefore(v, bubble);
+      }
+      if (!m.content && !(m.images && m.images.length)) bubble.remove();
+    }
     if (m.images && m.images.length) {
       const strip = document.createElement("div");
       strip.className = "att-row";
@@ -3108,12 +3141,19 @@ function visionModel() {
 }
 
 function updateAttachUI() {
-  attachWrap.classList.toggle("show", visionModel() || state.attachments.length > 0);
+  attachWrap.classList.toggle("show", visionModel() || videoModel() || state.attachments.length > 0);
+  const vm = videoModel();
+  $("menuVideo").hidden = !vm;
+  $("menuVideoLink").hidden = !vm;
+  $("menuRecord").hidden = !(vm && CAN_GUM);
   form.classList.toggle("has-att", state.attachments.length > 0);
   attStrip.innerHTML = "";
   state.attachments.forEach((a, i) => {
-    const el = node('<div class="att"><img alt=""><button type="button" class="x" aria-label="Remove image">&times;</button></div>');
-    el.querySelector("img").src = a.url;
+    const el = a.kind === "video"
+      ? node('<div class="att att-video"><video muted playsinline preload="metadata"></video><span class="att-badge">VIDEO</span><button type="button" class="x" aria-label="Remove video">&times;</button></div>')
+      : node('<div class="att"><img alt=""><button type="button" class="x" aria-label="Remove image">&times;</button></div>');
+    if (a.kind === "video") { el.querySelector("video").src = a.url; el.title = a.name + " \u00b7 " + Math.round(a.bytes / 1024) + " KB"; }
+    else el.querySelector("img").src = a.url;
     el.querySelector(".x").addEventListener("click", (e) => {
       e.preventDefault(); e.stopPropagation();
       state.attachments.splice(i, 1);
@@ -3181,6 +3221,67 @@ function bytesOf(dataUrl) {
   return Math.floor((b64.length * 3) / 4) - pad;
 }
 
+// ---- video attachments (mm33): one clip per message, sent as a data: URI ----
+// No downscale here (a browser cannot cheaply re-encode video); the deployment
+// caps bytes, and the engine samples frames, so what matters is the byte cap.
+const VID_EXT = /\.(mp4|m4v|mov|webm|mkv|avi)$/i;
+function looksLikeVideo(f) { return /^video\//.test(f.type || "") || VID_EXT.test(f.name || ""); }
+function videoModel() {
+  const m = state.models.find((x) => (x.name || "") === state.model);
+  return m ? !!m.video : false;
+}
+function videoCap() { return (state.video && state.video.max_bytes) || 24 * 1024 * 1024; }
+function prepareVideo(file) {
+  return new Promise((resolve, reject) => {
+    if (!looksLikeVideo(file)) return reject(new Error("not a video (mp4, mov, webm, mkv or avi)"));
+    if (file.size > videoCap())
+      return reject(new Error("video is " + Math.round(file.size / 1048576) + " MB; this deployment accepts up to "
+        + Math.round(videoCap() / 1048576) + " MB - trim it or record a shorter clip"));
+    const r = new FileReader();
+    r.onload = () => resolve({ kind: "video", url: r.result, name: file.name || "clip", bytes: file.size });
+    r.onerror = () => reject(new Error("could not read that video"));
+    r.readAsDataURL(file);
+  });
+}
+async function addVideo(file) {
+  if (!videoModel()) {
+    pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot watch video"
+      + (state.video.enabled ? " - pick a video-capable model from the menu" : ""), 6000);
+    return;
+  }
+  if (state.attachments.some((a) => a.kind === "video")) {
+    pill("fail", ICONS.alert, " One video per message", 5000);
+    return;
+  }
+  try {
+    state.attachments.push(await prepareVideo(file));
+    updateAttachUI(); updateComposer();
+    pill("ok", ICONS.check, " Video attached - the model watches up to " + (state.video.frames || 8)
+      + " frames, so keep clips short", 6000);
+  } catch (e) {
+    pill("fail", ICONS.alert, " " + (e.message || "could not attach that video"), 7000);
+  }
+}
+// A link is fetched by THIS BROWSER, never by the deployment: fetching
+// server-side would tell a third-party host what this chat is watching, which
+// is the thing the app exists to avoid. So only hosts that allow cross-origin
+// reads work; for the rest the honest answer is download-then-upload.
+async function addVideoLink(url) {
+  url = String(url || "").trim();
+  if (!/^https?:\/\//i.test(url)) { pill("fail", ICONS.alert, " Paste an http(s) link to a video file", 5000); return; }
+  pill("ok", ICONS.check, " Fetching the video in your browser…", 4000);
+  let res;
+  try { res = await fetch(url, { mode: "cors" }); }
+  catch (_) {
+    pill("fail", ICONS.alert, " That site does not let the browser fetch the video directly - download it and use Upload a video", 9000);
+    return;
+  }
+  if (!res.ok) { pill("fail", ICONS.alert, " Could not fetch that link (HTTP " + res.status + ")", 6000); return; }
+  const blob = await res.blob();
+  const name = (url.split("?")[0].split("/").pop() || "video") + (VID_EXT.test(url) ? "" : ".mp4");
+  await addVideo(new File([blob], name, { type: blob.type || "video/mp4" }));
+}
+
 async function addFiles(files) {
   const list = [...files].filter(looksLikeImage);
   if (!list.length) return;
@@ -3225,6 +3326,19 @@ attachBtn.addEventListener("click", (e) => {
   else openAttachMenu();
 });
 $("menuUpload").addEventListener("click", () => { closeAttachMenu(); fileInput.click(); });
+$("menuVideo").addEventListener("click", () => { closeAttachMenu(); $("videoInput").click(); });
+$("videoInput").addEventListener("change", async () => { const f = $("videoInput").files[0]; $("videoInput").value = ""; if (f) await addVideo(f); });
+$("menuVideoLink").addEventListener("click", async () => {
+  closeAttachMenu();
+  const url = window.prompt("Link to a video file (mp4, webm, mov). It is fetched by your browser, not by the server.");
+  if (url) await addVideoLink(url);
+});
+$("menuRecord").addEventListener("click", () => { closeAttachMenu(); openCam(true); });
+// the paperclip is a plain picker when there is no menu to show; a video model
+// always has one (link + record), so it opens the menu even without a camera
+attachBtn.addEventListener("click", (e) => {
+  if (!HAS_CAMERA && videoModel()) { e.stopImmediatePropagation(); if (attachMenu.classList.contains("open")) closeAttachMenu(); else openAttachMenu(); }
+}, true);
 // the shot goes through the SAME path as an upload: same vision gate, same
 // per-message limit, same browser-side downscale - a 12 MP phone photo has no
 // business being uploaded whole
@@ -3254,6 +3368,7 @@ function stopCam() {
 
 function closeCam() {
   camOverlay.classList.remove("open");
+  if (camRec && camRec.state === "recording") stopRec(true);
   stopCam();
 }
 
@@ -3292,15 +3407,57 @@ async function startCam(deviceId) {
   $("camSwitch").hidden = camList.length < 2;
 }
 
-async function openCam() {
+let camRecMode = false, camRec = null, camRecChunks = [], camRecTimer = null, camRecT0 = 0;
+const CAM_REC_MAX_S = 20;   // the engine samples ~1 frame/s and budgets 8 frames; longer is wasted
+async function openCam(record) {
+  camRecMode = !!record;
+  $("camTitle").textContent = camRecMode ? "Record a clip" : "Take a photo";
+  $("camShoot").hidden = camRecMode;
+  $("camRecord").hidden = !camRecMode;
+  $("camRecTimer").hidden = true;
+  $("camRecord").textContent = "Start recording";
+  $("camRecord").classList.remove("recording");
   camOverlay.classList.add("open");
-  $("camShoot").focus();
+  (camRecMode ? $("camRecord") : $("camShoot")).focus();
   try {
     await startCam();
   } catch (e) {
     camError(e);
   }
 }
+function stopRec(discard) {
+  if (camRecTimer) { clearInterval(camRecTimer); camRecTimer = null; }
+  if (camRec && camRec.state !== "inactive") { if (discard) camRecChunks = []; camRec.stop(); }
+}
+async function toggleRec() {
+  if (camRec && camRec.state === "recording") { stopRec(false); return; }
+  if (!camStream) return camError(new Error("the camera has not started yet"));
+  if (typeof MediaRecorder === "undefined") return camError(new Error("this browser cannot record video"));
+  const mime = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
+  camRecChunks = [];
+  try { camRec = new MediaRecorder(camStream, { mimeType: mime || undefined, videoBitsPerSecond: 1500000 }); }
+  catch (e) { return camError(e); }
+  camRec.ondataavailable = (ev) => { if (ev.data && ev.data.size) camRecChunks.push(ev.data); };
+  camRec.onstop = async () => {
+    const chunks = camRecChunks; camRecChunks = []; camRec = null;
+    $("camRecord").textContent = "Start recording"; $("camRecord").classList.remove("recording"); $("camRecTimer").hidden = true;
+    if (!chunks.length) return;
+    const type = (mime || "video/webm").split(";")[0];
+    const blob = new Blob(chunks, { type });
+    closeCam();
+    await addVideo(new File([blob], "clip-" + Date.now() + (type === "video/mp4" ? ".mp4" : ".webm"), { type }));
+  };
+  camRec.start(250);
+  camRecT0 = Date.now();
+  $("camRecord").textContent = "Stop"; $("camRecord").classList.add("recording");
+  $("camRecTimer").hidden = false;
+  camRecTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - camRecT0) / 1000);
+    $("camRecTimer").textContent = s + "s / " + CAM_REC_MAX_S + "s";
+    if (s >= CAM_REC_MAX_S) stopRec(false);
+  }, 250);
+}
+$("camRecord").addEventListener("click", toggleRec);
 
 // The frame at the sensor's own size; the shared pipeline downscales it to the
 // same ~1.15 MP an upload gets, so this path has no size rules of its own.
@@ -3442,20 +3599,28 @@ document.querySelectorAll(".chip").forEach((chip) => {
 
 function sendCurrent() {
   const text = input.value.trim();
-  const images = state.attachments.map((a) => a.url);
-  if ((!text && !images.length) || state.busyChatId) return;
+  const images = state.attachments.filter((a) => a.kind !== "video").map((a) => a.url);
+  const videos = state.attachments.filter((a) => a.kind === "video").map((a) => a.url);
+  if ((!text && !images.length && !videos.length) || state.busyChatId) return;
   if (images.length && !visionModel()) {
     pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot read images", 6000);
     return;
   }
+  if (videos.length && !videoModel()) {
+    pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot watch video", 6000);
+    return;
+  }
   const chat = current() || newChat();
   chat.error = null;
-  chat.messages.push(images.length ? { role: "user", content: text, images } : { role: "user", content: text });
+  const umsg = { role: "user", content: text };
+  if (images.length) umsg.images = images;
+  if (videos.length) umsg.videos = videos;
+  chat.messages.push(umsg);
   state.attachments = [];
   updateAttachUI();
   if (!chat.title) {
     chat.title = text.slice(0, 64) ||
-      (images.length === 1 ? "Image" : images.length + " images");
+      (videos.length ? "Video" : images.length === 1 ? "Image" : images.length + " images");
   }
   // active chat bubbles to the top of the list, like every chat app
   const i = state.chats.indexOf(chat);
@@ -3580,11 +3745,20 @@ function buildPayload(chat) {
     const n = imagesOf(msgs[i]).length;
     if (n && n <= budget) { keep.add(i); budget -= n; }
   }
+  // A video is frames-worth of context every turn it is resent, so only the
+  // LATEST turn that carries one keeps it; earlier clips become a note.
+  let lastVid = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) if ((msgs[i].videos || []).length) { lastVid = i; break; }
   return msgs.map((m, i) => {
-    const text = m.role === "assistant" ? stripThink(m.content) : m.content;
+    let text = m.role === "assistant" ? stripThink(m.content) : m.content;
     const imgs = imagesOf(m);
-    if (!imgs.length) return { role: m.role, content: text };
-    if (!keep.has(i)) {
+    const vids = i === lastVid ? (m.videos || []) : [];
+    if (i !== lastVid && (m.videos || []).length) {
+      const vnote = "[video from an earlier turn, no longer in context]";
+      text = text ? vnote + "\n" + text : vnote;
+    }
+    if (!imgs.length && !vids.length) return { role: m.role, content: text };
+    if (imgs.length && !keep.has(i) && !vids.length) {
       const note = imgs.length === 1 ? "[image from an earlier turn, no longer in context]"
                                      : "[" + imgs.length + " images from an earlier turn, no longer in context]";
       return { role: m.role, content: text ? note + "\n" + text : note };
@@ -3592,7 +3766,8 @@ function buildPayload(chat) {
     return {
       role: m.role,
       content: [
-        ...imgs.map((u) => ({ type: "image_url", image_url: { url: u } })),
+        ...vids.map((u) => ({ type: "video_url", video_url: { url: u } })),
+        ...(keep.has(i) ? imgs : []).map((u) => ({ type: "image_url", image_url: { url: u } })),
         ...(text ? [{ type: "text", text }] : []),
       ],
     };
@@ -4711,6 +4886,7 @@ const modelsReady = (async () => {
   if (state.image.enabled && (storedImage === "on" || storedImage === "off"))
     state.imageOn = storedImage === "on";
   state.vision = info.vision || { enabled: false, service: false, max_images: 0, max_bytes: 0 };
+  state.video = info.video || { enabled: false, max_bytes: 0, frames: 0 };
   state.tools = info.tools || { enabled: false };
   // the deployment may start the switch on; a stored choice still wins, since
   // it is the more recent statement of what this person wants

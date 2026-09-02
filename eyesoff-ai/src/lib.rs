@@ -2058,6 +2058,45 @@ fn check_images(
     Ok(n)
 }
 
+/// mm33: vet video attachments BEFORE the stream opens, like check_images:
+/// the serving model must accept video, one clip per turn, within the byte cap.
+fn check_videos(raw: &serde_json::Value, cfg: &AppConfig, messages: &[ChatMsg]) -> Result<usize, String> {
+    let n: usize = messages.iter().map(|m| m.videos.len()).sum();
+    if n == 0 {
+        return Ok(0);
+    }
+    if !(cfg.video && cfg.vision && cfg.backend == "ggml") {
+        let others: Vec<String> = available_models(raw)
+            .iter()
+            .filter(|e| e.cfg.video && e.cfg.vision && e.cfg.backend == "ggml")
+            .map(|e| e.cfg.name.clone())
+            .collect();
+        return Err(format!(
+            "[no_video] {} cannot watch video{}",
+            cfg.name,
+            if others.is_empty() {
+                ". No model on this deployment can; a video-capable entry needs a vision \
+                 volume (weights plus mmproj) with \"video\": true in its catalog entry"
+                    .to_string()
+            } else {
+                format!(", but this deployment also serves {} - select it and resend", others.join(", "))
+            }
+        ));
+    }
+    if messages.iter().any(|m| m.videos.len() > 1) {
+        return Err("[too_many_videos] one video per message (each one costs video_frames encoder \
+                    passes and video_frames * image_tokens of the context window)".into());
+    }
+    if let Some(big) = messages.iter().flat_map(|m| m.videos.iter()).find(|b| b.len() > cfg.max_video_bytes) {
+        return Err(format!(
+            "[video_too_large] the video is {} MB; the limit is {} MB - trim or re-encode it before sending",
+            big.len() >> 20,
+            cfg.max_video_bytes >> 20
+        ));
+    }
+    Ok(n)
+}
+
 /// What the host says this session can do (see Session::caps).
 struct Caps {
     seq: i32,
@@ -7071,6 +7110,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     if let Err(e) = check_images(raw, cfg, &creq.messages) {
         return json_err(out, 400, &e);
     }
+    if let Err(e) = check_videos(raw, cfg, &creq.messages) {
+        return json_err(out, 400, &e);
+    }
     let tok = match make_tok(cfg, "auto", t1) {
         Ok(t) => t,
         Err(e) => return json_err(out, 500, &e),
@@ -7495,6 +7537,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Err(e) => return json_err(out, 500, &format!("configuration error: {e}")),
     };
     if let Err(e) = check_images(raw, cfg, &creq.messages) {
+        return json_err(out, 400, &e);
+    }
+    if let Err(e) = check_videos(raw, cfg, &creq.messages) {
         return json_err(out, 400, &e);
     }
     let tok = match make_tok(cfg, "auto", now_ms()) {
@@ -8385,6 +8430,15 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
         "service": service,
         "max_images": base_cfg.as_ref().map(|c| c.max_images).unwrap_or(0),
         "max_bytes": base_cfg.as_ref().map(|c| c.max_image_bytes).unwrap_or(0),
+    });
+    // mm33: the playground shows video attach controls only for models that
+    // opted in (per-entry `video` above); this block carries the byte cap
+    // and the frame budget it should size the picker and its copy to
+    let video_any = entries.iter().any(|e| e.cfg.video && e.cfg.vision && e.cfg.backend == "ggml");
+    body["video"] = serde_json::json!({
+        "enabled": video_any,
+        "max_bytes": base_cfg.as_ref().map(|c| c.max_video_bytes).unwrap_or(0),
+        "frames": base_cfg.as_ref().map(|c| c.video_frames).unwrap_or(0),
     });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
 }

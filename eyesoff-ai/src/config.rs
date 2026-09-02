@@ -431,7 +431,9 @@ fn default_video_frames() -> usize {
     8
 }
 fn default_max_video_bytes() -> usize {
-    32 * 1024 * 1024
+    // base64 inflates a data: URI by 4/3 and the whole /chat body is capped at
+    // 40 MiB, so 24 MiB raw is the largest clip that still fits beside text
+    24 * 1024 * 1024
 }
 fn default_max_images() -> usize {
     4
