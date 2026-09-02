@@ -849,6 +849,9 @@ fn resolve_draft(raw: &serde_json::Value, cfg: &AppConfig) -> (DraftPlan, Option
 }
 
 const PREFILL_CHUNK: usize = 128;
+/// How often a prefill reports progress between chunks: the bytes that keep
+/// the stream alive through a long prompt (see prefill_text).
+const PREFILL_TICK_MS: u128 = 10_000;
 
 /// The chunk size prefill actually uses: the host's own ubatch cap when it
 /// exports one (caps value 5), the historical 128 otherwise. Costs one
@@ -900,6 +903,53 @@ fn prefill_chunk(sess: &mut Session) -> usize {
             .unwrap_or(PREFILL_CHUNK),
         _ => PREFILL_CHUNK,
     }
+}
+
+/// Prefill a text-only prompt with the CHUNK as the unit of liveness, the
+/// way the plain loop in generate() does it (its comment has the reasoning):
+/// start small, size each chunk from how long the last one took
+/// (next_chunk), and put a status line on the wire every PREFILL_TICK_MS
+/// between chunks - the proxy cuts a stream silent for 180 s, and a guest can
+/// say nothing while a host call is in flight. `feed` is the verb (plain or
+/// MTP-aware) and gets the whole prompt beside the FIRST chunk (mm34, see
+/// feed_declared). Returns the final position's row.
+///
+/// Every speculative path shares this. Until 2026-09-02 they each fed FIXED
+/// n_batch (512) chunks with nothing between: on metal0's cores that is
+/// ~40 s a chunk, so a prompt past ~2,300 tokens was >180 s of silence and
+/// every such turn died at the cut, mid-prefill, with the model working fine
+/// (9eb4e600, after its config grew the fixed prompt to ~2,900 tokens).
+fn prefill_text(
+    sess: &mut Session,
+    ids: &[u32],
+    status: &dyn Fn(&str) -> bool,
+    mut feed: impl FnMut(&mut Session, &[u32], bool, Option<&[u32]>) -> Result<Row, String>,
+) -> Result<Row, String> {
+    let cap = prefill_chunk(sess);
+    let mut chunk = PREFILL_CHUNK.min(cap);
+    let mut last_tick = now_ms();
+    let mut done = 0usize;
+    let mut logits = Row::dense(Vec::new());
+    while done < ids.len() {
+        let end = (done + chunk).min(ids.len());
+        let last = end == ids.len();
+        let declare = (done == 0).then_some(ids);
+        let t_chunk = now_ms();
+        let l = feed(sess, &ids[done..end], last, declare)?;
+        let took = now_ms() - t_chunk;
+        if last {
+            logits = l;
+        }
+        done = end;
+        chunk = next_chunk(chunk, cap, took);
+        if !last && now_ms() - last_tick >= PREFILL_TICK_MS {
+            last_tick = now_ms();
+            if !status(&format!("{PREFILL_STATUS}{done} of {} prompt tokens", ids.len())) {
+                return Err("client disconnected".into());
+            }
+        }
+    }
+    Ok(logits)
 }
 /// Request-body ceiling. Generous because attachments arrive base64'd INSIDE
 /// the JSON (~1.35x the file), and a vision turn can legitimately carry
@@ -1783,18 +1833,33 @@ impl Session {
     /// all-positions pass, mirrors every position into the model's own MTP
     /// head, and returns only the LAST logits row. The speculative prefill.
     fn feed_mtp(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Row, String> {
+        self.feed_mtp_declared(cfg, ids, None)
+    }
+
+    /// feed_mtp(), plus the mm34 prompt declaration beside a prompt's first
+    /// chunk (see feed_declared).
+    fn feed_mtp_declared(
+        &mut self,
+        cfg: &AppConfig,
+        ids: &[u32],
+        prompt: Option<&[u32]>,
+    ) -> Result<Row, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
         let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let outs = ctx
-            .compute(vec![
-                ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
-                ("mtp".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
-                topk_input(),
-                timing_input(),
-            ])
-            .map_err(|e| nn_err("compute", e))?;
+        let mut inputs = vec![
+            ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
+            ("mtp".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+            topk_input(),
+            timing_input(),
+        ];
+        if let Some(all) = prompt {
+            let pb: Vec<u8> = all.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
+            inputs.push(("prompt".to_string(),
+                Tensor::new(&[1, all.len() as u32], TensorType::I32, &pb)));
+        }
+        let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
         note_timing("feed_mtp", &outs);
         let mut rows = rows_from_outs(&outs, 1, cfg.vocab)?;
         Ok(rows.pop().unwrap())
@@ -2884,7 +2949,6 @@ fn generate(
     // within microseconds of work; a slow one keeps emitting. Sizing this off
     // a measurement beats guessing a rate, because the range is enormous: the
     // same prompt is milliseconds on an H200 and minutes on a CPU share.
-    const PREFILL_TICK_MS: u128 = 10_000;
     let chunk_cap = prefill_chunk(&mut sess);
     let mut chunk = PREFILL_CHUNK.min(chunk_cap);
     let mut last_tick = now_ms();
@@ -3069,25 +3133,15 @@ fn generate_spec(
     let SpecRig { mut dsess, mut tscr, mut dscr, t_seq, d_seq, tscr_seq, dscr_seq } = rig;
     let k = dcfg.draft_tokens.clamp(1, 16).min(cfg.draft_tokens.clamp(1, 16));
     let t1 = now_ms();
-    // prefill BOTH models on the prompt; only the target's last row is needed
-    let chunk = prefill_chunk(&mut sess);
-    let d_chunk = prefill_chunk(&mut dsess);
-    let mut done = 0usize;
-    let mut t_logits = Row::dense(Vec::new());
-    while done < prompt_ids.len() {
-        let end = (done + chunk).min(prompt_ids.len());
-        let last = end == prompt_ids.len();
-        let declare = (done == 0).then_some(prompt_ids); // mm34, see feed_declared
-        let l = sess.feed_declared(cfg, &prompt_ids[done..end], last, declare)?;
-        if last { t_logits = l; }
-        done = end;
-    }
-    done = 0;
-    while done < prompt_ids.len() {
-        let end = (done + d_chunk).min(prompt_ids.len());
-        dsess.feed(dcfg, &prompt_ids[done..end], false)?;
-        done = end;
-    }
+    // prefill BOTH models on the prompt (chunked and narrated, see
+    // prefill_text); only the target's last row is needed
+    let mut t_logits = prefill_text(&mut sess, prompt_ids, status, |s, ids, last, declare| {
+        s.feed_declared(cfg, ids, last, declare)
+    })?;
+    let draft_status = |st: &str| status(&format!("draft model: {st}"));
+    prefill_text(&mut dsess, prompt_ids, &draft_status, |s, ids, _last, declare| {
+        s.feed_declared(dcfg, ids, false, declare)
+    })?;
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
@@ -3300,15 +3354,9 @@ fn generate_mtp(
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
     let t1 = now_ms();
-    let chunk = prefill_chunk(&mut sess);
-    let mut done = 0usize;
-    let mut t_logits = Row::dense(Vec::new());
-    while done < prompt_ids.len() {
-        let end = (done + chunk).min(prompt_ids.len());
-        let l = sess.feed_mtp(cfg, &prompt_ids[done..end])?;
-        if end == prompt_ids.len() { t_logits = l; }
-        done = end;
-    }
+    let mut t_logits = prefill_text(&mut sess, prompt_ids, status, |s, ids, _last, declare| {
+        s.feed_mtp_declared(cfg, ids, declare)
+    })?;
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
@@ -3692,19 +3740,9 @@ fn generate_lookup(
     let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let t1 = now_ms();
-    let chunk = prefill_chunk(&mut sess);
-    let mut done = 0usize;
-    let mut t_logits = Row::dense(Vec::new());
-    while done < prompt_ids.len() {
-        let end = (done + chunk).min(prompt_ids.len());
-        let last = end == prompt_ids.len();
-        let declare = (done == 0).then_some(prompt_ids); // mm34, see feed_declared
-        let l = sess.feed_declared(cfg, &prompt_ids[done..end], last, declare)?;
-        if last {
-            t_logits = l;
-        }
-        done = end;
-    }
+    let mut t_logits = prefill_text(&mut sess, prompt_ids, status, |s, ids, last, declare| {
+        s.feed_declared(cfg, ids, last, declare)
+    })?;
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
