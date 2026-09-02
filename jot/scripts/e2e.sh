@@ -39,7 +39,9 @@ req() {
   local m=$1 p=$2; shift 2
   curl -s -o "$WORK/body" -w '%{http_code}' -X "$m" "$@" "$BASE$p"
 }
-auth=(-H "authorization: Bearer $KEY")
+# X-Api-Key is the carriage that survives the platform gateway; a bearer is
+# also accepted by the app and is checked once below
+auth=(-H "x-api-key: $KEY")
 jq_() { python3 -c "import json,sys; d=json.load(open('$WORK/body')); print($1)"; }
 
 echo "== build =="
@@ -92,8 +94,8 @@ pass "status with key: bucket facts, signed"
 
 [ "$(req GET /api/notes)" = 401 ] || fail "list without key must 401"
 [ "$(req GET /api/notes -H 'authorization: Bearer nope')" = 401 ] || fail "wrong key must 401"
-[ "$(req GET /api/notes -H "x-api-key: $KEY")" = 200 ] || fail "x-api-key not accepted"
-pass "key gate: 401 without/wrong key, X-Api-Key accepted"
+[ "$(req GET /api/notes -H "authorization: Bearer $KEY")" = 200 ] || fail "bearer not accepted"
+pass "key gate: 401 without/wrong key, X-Api-Key and bearer accepted"
 
 NOTE=$'# Enclave\n\nfirst line with a Needle in it\nsecond line: "quotes" & <angles> and ünïcode\n'
 python3 - "$WORK/write.json" <<PY
@@ -161,7 +163,7 @@ python3 -c 'import json; json.dump({"content":"x"*(1024*1024+1)}, open("'$WORK'/
 pass "size cap"
 
 [ "$(req GET /api/tools)" = 200 ] || fail "tools"
-[ "$(jq_ 'len(d["openai"])==6 and len(d["eyesoff_ai"]["tools"]["http"])==6 and all(t["url"].startswith(d["base_url"]) for t in d["eyesoff_ai"]["tools"]["http"]) and d["eyesoff_ai"]["tools"]["http"][0]["headers"]["authorization"]=="Bearer $JOT_API_KEY"')" = True ] || fail "tools shape: $(cat $WORK/body)"
+[ "$(jq_ 'len(d["openai"])==6 and len(d["eyesoff_ai"]["tools"]["http"])==6 and all(t["url"].startswith(d["base_url"]) for t in d["eyesoff_ai"]["tools"]["http"]) and d["eyesoff_ai"]["tools"]["http"][0]["headers"]["x-api-key"]=="$JOT_API_KEY"')" = True ] || fail "tools shape: $(cat $WORK/body)"
 pass "tools: 6 OpenAI functions + 6 eyesoff-ai http entries"
 
 [ "$(req DELETE /api/notes/todo.txt "${auth[@]}")" = 200 ] || fail "delete"

@@ -44,7 +44,7 @@ output. Tool activity is narrated to stderr as it happens.
 | `ENCLAVE_AGENT_RECURSION_LIMIT` | `25` | LangGraph step cap; the passthrough yields ONE tool call per model turn, so N calls cost 2N+1 steps |
 | `ENCLAVE_AGENT_SYSTEM_PROMPT` | (see config.py) | the agent's standing instructions |
 | `ENCLAVE_AGENT_NOTES_URL` | (unset) | a [jot](../jot) deployment (`https://<id8>.app.enclave.host`); when set, the six notebook tools (`notes_list/read/write/append/search/delete`) join the belt |
-| `ENCLAVE_AGENT_NOTES_KEY` | (empty) | that deployment's `api_key`, sent as a bearer |
+| `ENCLAVE_AGENT_NOTES_KEY` | (empty) | that deployment's `api_key`, sent as `X-Api-Key` |
 
 ## Layout
 

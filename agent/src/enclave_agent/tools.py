@@ -183,7 +183,9 @@ class NotesClient:
         data = None
         headers = {"accept": "application/json"}
         if self.api_key:
-            headers["authorization"] = "Bearer " + self.api_key
+            # X-Api-Key, not a bearer: the platform's app gateway consumes
+            # Authorization (its own session carriage) and never forwards it
+            headers["x-api-key"] = self.api_key
         if body is not None:
             data = json.dumps(body).encode()
             headers["content-type"] = "application/json"

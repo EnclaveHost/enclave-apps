@@ -120,7 +120,7 @@
 
 <div class="card">
   <h2>For agents</h2>
-  <p>Every route is JSON with the key as <code>Authorization: Bearer</code>. <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the same six verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
+  <p>Every route is JSON with the key as <code>X-Api-Key</code> (the gateway consumes <code>Authorization</code>, so a bearer never reaches an app on enclave.host). <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the same six verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
   <pre class="code" id="curl"></pre>
   <details><summary>eyesoff-ai config block (paste into that deployment's App Config; set JOT_API_KEY as its secret)</summary><pre class="code" id="eyesoff">…</pre></details>
 </div>
@@ -144,7 +144,9 @@ let status = null, notes = [], current = null, etag = null, dirty = false;
 
 async function api(method, path, body, headers) {
   const h = Object.assign({ "accept": "application/json" }, headers || {});
-  if (key) h["authorization"] = "Bearer " + key;
+  // X-Api-Key, not Authorization: the platform gateway consumes Authorization
+  // (it carries the owner's session token) and never forwards it to an app
+  if (key) h["x-api-key"] = key;
   if (body !== undefined) h["content-type"] = "application/json";
   const r = await fetch(path, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body) });
   let j = null;
@@ -186,7 +188,7 @@ async function loadStatus() {
 
 function curl() {
   const base = location.origin;
-  const k = status && status.auth ? "-H 'Authorization: Bearer $JOT_API_KEY' " : "";
+  const k = status && status.auth ? "-H 'x-api-key: $JOT_API_KEY' " : "";
   $("#curl").innerHTML =
     `<span class="c"># list, read, write, append, search, delete</span>\n` +
     `curl -s ${k}${esc(base)}/api/notes\n` +

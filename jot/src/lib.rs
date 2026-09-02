@@ -20,7 +20,10 @@
 //! (see keep).
 //!
 //! Routes (JSON unless noted; `/api/*` except status and tools need the key
-//! when one is configured, as `Authorization: Bearer <key>` or `X-Api-Key`):
+//! when one is configured, as `X-Api-Key: <key>`. `Authorization: Bearer` is
+//! accepted too, but the platform's app gateway strips that header on the way
+//! in (it is the carriage for the owner's own session token), so on
+//! enclave.host only X-Api-Key ever arrives):
 //!   GET    /                          the notebook UI (self-contained HTML)
 //!   GET    /ping                      liveness
 //!   GET    /api/status                configured? auth? read-only? (+bucket facts with the key)
@@ -407,7 +410,7 @@ fn handle_tools(out: ResponseOutparam, origin: &str) {
     let h = |name: &str, desc: &str, method: &str, url: &str, params: serde_json::Value, required: &[&str], body: Option<serde_json::Value>| {
         let mut e = serde_json::json!({ "name": name, "description": desc, "method": method,
             "url": format!("{origin}{url}"),
-            "headers": { "authorization": "Bearer $JOT_API_KEY" },
+            "headers": { "x-api-key": "$JOT_API_KEY" },
             "parameters": { "type": "object", "properties": params, "required": required } });
         if let Some(b) = body { e["body"] = b; }
         e
@@ -422,7 +425,7 @@ fn handle_tools(out: ResponseOutparam, origin: &str) {
     ] } });
     json(out, 200, serde_json::json!({
         "base_url": origin,
-        "auth": "Authorization: Bearer <api_key> (or X-Api-Key)",
+        "auth": "X-Api-Key: <api_key> (Authorization: Bearer works only off-platform: the enclave.host gateway consumes that header)",
         "openai": openai,
         "eyesoff_ai": eyesoff,
     }));
@@ -598,7 +601,7 @@ impl Guest for Component {
             _ => {}
         }
         if !authed {
-            return json_err(out, 401, "unauthorized: send the API key as `Authorization: Bearer <key>` or `X-Api-Key: <key>`");
+            return json_err(out, 401, "unauthorized: send the API key as `X-Api-Key: <key>` (on enclave.host the gateway consumes `Authorization`, so a bearer never arrives here)");
         }
         let store = match Store::open(&cfg) {
             Ok(s) => s,

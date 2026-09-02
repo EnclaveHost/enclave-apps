@@ -39,7 +39,7 @@ def start(key: str = KEY):
             u = urllib.parse.urlsplit(self.path)
             q = dict(urllib.parse.parse_qsl(u.query))
             if u.path.startswith("/api/") and u.path not in ("/api/status", "/api/tools"):
-                if self.headers.get("authorization") != "Bearer " + key:
+                if self.headers.get("x-api-key") != key:
                     return self._err(401, "unauthorized")
             if u.path == "/api/notes" and self.command == "GET":
                 p = q.get("prefix", "")

@@ -71,9 +71,14 @@ The deployment's App Config (`ENCLAVE_CONFIG`; locally `JOT_CONFIG`):
   `enclave secrets set <id> JOT_ACCESS_KEY_ID=… JOT_SECRET_ACCESS_KEY=… JOT_API_KEY=… --restart`.
 - `api_key` is optional but **required on any deployment an agent reaches
   over the public URL**: without it, anyone who finds the URL can read and
-  write the notebook. Clients send `Authorization: Bearer <key>` or
-  `X-Api-Key: <key>`. With it set, only `/`, `/ping`, `/api/tools` and the
-  public half of `/api/status` answer without the key.
+  write the notebook. Clients send it as **`X-Api-Key: <key>`**. The app also
+  accepts `Authorization: Bearer <key>`, but that header never arrives on
+  enclave.host: the platform's app gateway consumes `Authorization` (it is
+  the carriage for the owner's own session token on private deployments) and
+  forwards every other header untouched, so a bearer only works when you
+  talk to the app directly (local `wasmtime serve`, your own proxy). With a
+  key set, only `/`, `/ping`, `/api/tools` and the public half of
+  `/api/status` answer without it.
 - The app **always starts**, even unconfigured: it serves the UI, reports
   the missing fields in `/api/status`, and answers 503 on every note route
   until the config and secrets are set and the deployment restarted.
@@ -88,7 +93,7 @@ error says so and names the host to `dig`).
 
 ## Routes
 
-Everything is JSON except where noted. Note names are relative paths of
+Everything is JSON except where noted; the key rides `X-Api-Key`. Note names are relative paths of
 letters, digits, `- _ . space`, joined by single slashes (`projects/enclave.md`,
 `meeting notes/2026-09-01.md`); no `.` or `..` segments, at most 200 bytes.
 A note caps at 1 MiB.
@@ -116,7 +121,8 @@ unreachable (the message quotes S3's own reason), 503 not configured.
 **Any OpenAI-style tool binding.** `GET /api/tools` returns `openai`, a list
 of six function schemas (`notes_list`, `notes_read`, `notes_write`,
 `notes_append`, `notes_search`, `notes_delete`) to hand to the model, plus
-`base_url` and the auth line. Execute each call as the matching route.
+`base_url` and the auth line. Execute each call as the matching route with
+the key in `X-Api-Key`.
 
 **The sibling [agent](../agent) (LangGraph).** Its tool belt already carries
 the six tools; they are offered when the environment names a notebook:
@@ -143,7 +149,7 @@ enclave and land in your bucket, and the conversation never leaves eyesoff-ai
     "description": "Append a paragraph to a note, creating it if needed.",
     "method": "POST",
     "url": "https://<id8>.app.enclave.host/api/notes/{name}/append",
-    "headers": { "authorization": "Bearer $JOT_API_KEY" },
+    "headers": { "x-api-key": "$JOT_API_KEY" },
     "parameters": { "type": "object",
       "properties": { "name": { "type": "string" }, "content": { "type": "string" } },
       "required": ["name", "content"] },
@@ -154,7 +160,7 @@ enclave and land in your bucket, and the conversation never leaves eyesoff-ai
 **curl**, for everything else:
 
 ```sh
-J=https://<id8>.app.enclave.host; K="authorization: Bearer $JOT_API_KEY"
+J=https://<id8>.app.enclave.host; K="x-api-key: $JOT_API_KEY"
 curl -s -H "$K" $J/api/notes
 curl -s -H "$K" -X PUT -H 'content-type: application/json' \
      -d '{"content":"# Enclave\n\nthe fleet egress is IPv6-only"}' $J/api/notes/infra/egress.md
@@ -188,7 +194,7 @@ PATH. The in-crate unit tests run under wasmtime too:
 ## Publish and deploy
 
 ```sh
-enclave publish target/wasm32-wasip2/release/jot.wasm --slug jot --version 0.1.0 \
+enclave publish target/wasm32-wasip2/release/jot.wasm --slug jot --version 1.0.1 \
   --name jot --desc "A notebook your agent keeps in your own bucket" \
   --mem 128 --cpu-gflops 1 \
   --config '{"endpoint":"https://<account>.r2.cloudflarestorage.com","region":"auto","bucket":"agent-notes","prefix":"notes/","credentials":{"accessKeyId":"$JOT_ACCESS_KEY_ID","secretAccessKey":"$JOT_SECRET_ACCESS_KEY"},"api_key":"$JOT_API_KEY"}'
