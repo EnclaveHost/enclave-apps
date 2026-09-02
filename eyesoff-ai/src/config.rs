@@ -569,22 +569,32 @@ pub fn render_template(
         "chatml" => {
             p.push_str(&format!("<|im_start|>system\n{system}<|im_end|>\n"));
             for (role, content) in msgs {
-                // Prefix-cache alignment (engine mm32): with thinking OFF the
-                // generation prompt seeds an empty pre-closed think block
-                // right after the assistant marker, so a REPLAYED assistant
-                // turn must reproduce that exact byte sequence — otherwise
-                // turn N's parked prompt state can never be a byte-prefix of
-                // turn N+1's prompt, and every continuation re-prefills the
-                // whole history. The model saw exactly this shape at
-                // generation time (and a pre-closed turn's output carries no
-                // think tags, so the replayed content is byte-identical to
-                // what it generated). Thinking-ON turns keep stripped history
-                // on purpose: reasoning is per-turn scratch, and replaying it
-                // would cost more tokens than the reuse saves.
-                let seed = if role == "assistant" && matches!(think, ThinkTurn::Closed) {
-                    "<think>\n\n</think>\n\n"
-                } else {
-                    ""
+                // Prefix-cache alignment (engine mm32/mm34): the generation
+                // prompt ends in whatever opens the assistant turn, and that
+                // ending is the last thing the engine PARKS, so a REPLAYED
+                // assistant turn must begin with those exact tokens - or turn
+                // N's parked state is never a byte-prefix of turn N+1's prompt
+                // and every continuation re-prefills the whole history.
+                //  - thinking OFF: the prompt seeds the pre-closed empty block,
+                //    and a pre-closed turn's output carries no think tags, so
+                //    seeding the same block here replays it byte-identical.
+                //  - thinking ON: the prompt force-opens with "<think>\n" and
+                //    the reasoning is per-turn scratch that history drops
+                //    (replaying it would cost more tokens than the reuse
+                //    saves). Dropped is fine; what matters is that the turn
+                //    still OPENS the way the park ends. "<think>\n</think>" is
+                //    the open tag, a lone newline, then the close tag - the
+                //    park's last two tokens exactly (specials split first, so
+                //    the newline stays single) - where the trained empty form
+                //    "<think>\n\n</think>" merges its newlines into one token
+                //    that differs from the opener's. Four tokens per turn buy
+                //    the tail-only prefill. (Live 2026-09-02: with the block
+                //    stripped, every thinking-on turn 2 re-read ~2,900 tokens
+                //    on metal0 while the cache stood ready.)
+                let seed = match (role.as_str(), think) {
+                    ("assistant", ThinkTurn::Closed) => "<think>\n\n</think>\n\n",
+                    ("assistant", ThinkTurn::Open) => "<think>\n</think>\n\n",
+                    _ => "",
                 };
                 p.push_str(&format!("<|im_start|>{role}\n{seed}{content}<|im_end|>\n"));
             }

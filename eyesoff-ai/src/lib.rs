@@ -10698,12 +10698,30 @@ mod tests {
             "turn 2 must extend turn 1's prompt + its reply verbatim:\nT1: {:?}\nT2: {:?}",
             turn1.prompt, turn2.prompt
         );
-        // thinking-ON history stays stripped on purpose (reasoning is
-        // per-turn scratch); only the no-think form promises the prefix
-        let open = config::render_template(
+        // thinking ON: the reasoning is dropped from history on purpose
+        // (per-turn scratch), but the replayed turn must still OPEN the way
+        // the parked prompt ends - "<think>\n" - or the park is never a
+        // prefix and every turn 2 re-reads the whole history (live
+        // 2026-09-02). The reply in history is what the client sends back:
+        // the visible answer, thoughts stripped.
+        let open1 = config::render_template(
             "chatml", "sys", &[("user".into(), "Q1".into())],
             config::ThinkTurn::Open).unwrap();
-        assert!(open.prompt.ends_with("<think>\n"), "{:?}", open.prompt);
+        assert!(open1.prompt.ends_with("<think>\n"), "{:?}", open1.prompt);
+        let open2 = config::render_template(
+            "chatml", "sys",
+            &[("user".into(), "Q1".into()),
+              ("assistant".into(), reply.into()),
+              ("user".into(), "Q2".into())],
+            config::ThinkTurn::Open).unwrap();
+        assert!(
+            open2.prompt.starts_with(&open1.prompt),
+            "a thinking-on turn 2 must extend turn 1's prompt verbatim:\nT1: {:?}\nT2: {:?}",
+            open1.prompt, open2.prompt
+        );
+        // and the seed is the SINGLE-newline form: "<think>\n\n</think>" would
+        // merge its newlines into one token that differs from the opener's
+        assert!(open2.prompt.contains(&format!("<think>\n</think>\n\n{reply}")), "{:?}", open2.prompt);
     }
 
     #[test]
