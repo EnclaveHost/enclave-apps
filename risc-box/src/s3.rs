@@ -292,12 +292,16 @@ fn request(
                         }
                     }
                 }
+                // Progress is for the object, not for an error page: a 404's
+                // few bytes of XML must not log as "100% of 127 bytes".
                 if let (Some(he), Some(cl)) = (head_end, content_length) {
-                    progress(rbuf.len() - he, cl);
+                    if status == 200 {
+                        progress(rbuf.len() - he, cl);
+                    }
                     if rbuf.len() >= he + cl {
                         break;
                     }
-                } else if head_end.is_some() {
+                } else if head_end.is_some() && status == 200 {
                     progress(rbuf.len() - head_end.unwrap(), 0);
                 }
             }
@@ -362,6 +366,24 @@ pub fn get_object(
         return Err(s3_error(status, &body));
     }
     Ok(body)
+}
+
+/// GET that treats a missing object as an answer rather than an error:
+/// `Ok(None)` on 404. A snapshot key is configured before any snapshot
+/// exists under it, and that first cold boot is not a failure.
+pub fn get_object_opt(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<Option<Vec<u8>>, String> {
+    let (status, body) = request("GET", ep, bucket, key, creds, &[], progress)?;
+    match status {
+        200 => Ok(Some(body)),
+        404 => Ok(None),
+        _ => Err(s3_error(status, &body)),
+    }
 }
 
 pub fn put_object(

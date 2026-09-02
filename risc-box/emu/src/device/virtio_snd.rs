@@ -714,3 +714,68 @@ mod tests {
 		}
 	}
 }
+
+// risc-box patch (snapshot): see src/snapshot.rs. Playback credit is
+// mtime-based, and mtime itself is restored, so the stream's clock carries
+// over without a discontinuity the listener would hear.
+use snapshot::{De, Ser};
+
+impl VirtioSnd {
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u32(self.device_features_sel);
+		w.u64(self.driver_features);
+		w.u32(self.driver_features_sel);
+		w.u32(self.queue_select);
+		w.u32(self.interrupt_status);
+		w.u32(self.status);
+		for q in &self.queues {
+			w.u32(q.num);
+			w.bool(q.ready);
+			w.u64(q.desc);
+			w.u64(q.driver);
+			w.u64(q.device);
+			w.u16(q.avail_cursor);
+			w.u16(q.used_index);
+		}
+		let ring: Vec<u8> = self.ring.iter().copied().collect();
+		w.bytes(&ring);
+		w.u32(self.rate_hz);
+		w.u8(self.channels);
+		w.bool(self.running);
+		w.u64(self.credit);
+		w.u64(self.credit_frac);
+		w.u64(self.last_mtime);
+		w.u64(self.dropped);
+	}
+
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.device_features_sel = r.u32()?;
+		self.driver_features = r.u64()?;
+		self.driver_features_sel = r.u32()?;
+		self.queue_select = r.u32()?;
+		self.interrupt_status = r.u32()?;
+		self.status = r.u32()?;
+		for q in self.queues.iter_mut() {
+			q.num = r.u32()?;
+			q.ready = r.bool()?;
+			q.desc = r.u64()?;
+			q.driver = r.u64()?;
+			q.device = r.u64()?;
+			q.avail_cursor = r.u16()?;
+			q.used_index = r.u16()?;
+		}
+		let ring = r.bytes()?;
+		if ring.len() > 4 * RING_CAP * 4 {
+			return Err("snapshot: virtio-snd ring too large".into());
+		}
+		self.ring = ring.iter().copied().collect();
+		self.rate_hz = r.u32()?;
+		self.channels = r.u8()?;
+		self.running = r.bool()?;
+		self.credit = r.u64()?;
+		self.credit_frac = r.u64()?;
+		self.last_mtime = r.u64()?;
+		self.dropped = r.u64()?;
+		Ok(())
+	}
+}

@@ -38,6 +38,9 @@
 //!                     guest console and return its stdout + exit code (JSON)
 //!   GET  /console     Server-Sent Events: base64 console output, scrollback first
 //!   POST /save        dump the (guest-modified) disk and PUT it to saveKey
+//!   POST /snapshot    {key?,level?} serialize the RUNNING machine (CPU,
+//!                     devices, RAM, disk delta) and PUT it to the snapshot
+//!                     key; later starts resume from it instead of booting
 //!   POST /stop        halt the machine and drop it from RAM
 //!   GET  /display     Server-Sent Events: the machine's screen as deflated
 //!                     dirty bands (see display.rs) — the browser's monitor
@@ -66,6 +69,11 @@ use net::{ForwardCfg, HostNet, NetStack};
 use riscv_emu_rust::terminal::Terminal;
 use riscv_emu_rust::Emulator;
 use s3::{Creds, Endpoint};
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
 
 static INDEX_HTML: &str = include_str!("index.html");
 static XTERM_JS: &str = include_str!("vendor/xterm.js");
@@ -167,6 +175,24 @@ struct Config {
     exec_enabled: bool,
     exec_user: String,
     exec_password: Option<String>,
+    // Instant boot. `snapshot` names the S3 key a snapshot of the booted
+    // machine lives under: when the object exists, /start resumes from it —
+    // seconds — instead of running the guest's own boot, which on an emulated
+    // core is minutes. When it does not exist yet the boot is a cold one and
+    // POST /snapshot writes the object (to `snapshotSaveKey`, defaulting to
+    // `snapshot`) so every start after that is instant. `snapshotLevel` is
+    // the deflate level the RAM image is written at (1 fast .. 9 small).
+    snapshot: Option<String>,
+    snapshot_save_key: Option<String>,
+    snapshot_level: u8,
+    // A shell command run on the guest console right after a restore, via the
+    // /exec machinery. A resumed guest still believes it is the moment the
+    // snapshot was taken: its wall clock is stale and its random pool is the
+    // same one every other restore of this snapshot has. `{epoch}` expands to
+    // the host's UNIX time and `{entropy}` to 64 fresh random bytes as hex,
+    // so `date -s @{epoch}; echo {entropy} > /dev/urandom` fixes both.
+    restore_exec: Option<String>,
+    restore_exec_timeout_s: u64,
 }
 
 fn creds_from(v: &serde_json::Value) -> Option<Creds> {
@@ -304,6 +330,19 @@ fn load_config() -> Config {
             .and_then(|e| e.get("password"))
             .and_then(|x| x.as_str())
             .map(str::to_string),
+        snapshot: s("snapshot"),
+        snapshot_save_key: s("snapshotSaveKey").or_else(|| s("snapshot")),
+        snapshot_level: v
+            .get("snapshotLevel")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(2)
+            .clamp(1, 9) as u8,
+        restore_exec: s("restoreExec"),
+        restore_exec_timeout_s: v
+            .get("restoreExecTimeoutS")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(EXEC_DEFAULT_TIMEOUT_S)
+            .clamp(1, EXEC_MAX_TIMEOUT_S),
     }
 }
 
@@ -502,9 +541,35 @@ struct Images {
     fs_stored: Vec<u8>,
     fs_gzipped: bool,
     dtb: Option<Vec<u8>>,
+    /// sha256 (hex) of the kernel and fs objects exactly as the bucket served
+    /// them: the part of a snapshot's identity that says which images it was
+    /// taken against (see `identity`).
+    kernel_sha256: String,
+    fs_sha256: String,
+    /// The machine snapshot under the configured `snapshot` key, when the
+    /// object existed at fetch time or /snapshot has written one since. Held
+    /// exactly like the images, so a restart resumes without a download.
+    snap_stored: Option<Vec<u8>>,
 }
 
 impl Images {
+    /// What a snapshot is bound to. The delta inside a snapshot is relative
+    /// to the base disk it was taken from, and the RAM inside it embodies the
+    /// kernel, the device tree and the machine's geometry — so a restore must
+    /// present exactly these, and refuses (cold-booting instead) otherwise.
+    fn identity(&self, cfg: &Config) -> String {
+        format!(
+            "kernel:{} fs:{} dtb:{} ram:{} fb:{}x{} realtime:{}",
+            self.kernel_sha256,
+            self.fs_sha256,
+            self.dtb.as_ref().map(|d| sha256_hex(d)).unwrap_or_else(|| "-".into()),
+            cfg.ram_mib,
+            cfg.fb_w,
+            cfg.fb_h,
+            cfg.realtime
+        )
+    }
+
     /// The disk to hand a fresh machine. Expanded per boot rather than held
     /// expanded, so the cost is paid only while a machine is actually running.
     /// The raw ext2 bytes to hand the emulator. Takes the stored image by
@@ -521,6 +586,9 @@ impl Images {
 struct Start {
     creds: Option<Creds>,
     reset: bool,
+    /// None = resume from the snapshot if one is cached; Some(false) forces a
+    /// cold boot of the base images; Some(true) is the same as None.
+    snapshot: Option<bool>,
 }
 
 struct App {
@@ -613,6 +681,12 @@ struct App {
     retry: usize,
     retry_at: Option<Instant>,
     retry_start: Option<Start>,
+    // How the running machine came up: resumed from a snapshot (and how long
+    // the restore took, and when that snapshot was taken) or booted cold.
+    restored: bool,
+    restore_ms: f64,
+    restore_taken_unix: u64,
+    last_snapshot: Option<String>,
 }
 
 /// Backoff for the boot-fetch retries (seconds between attempts).
@@ -720,7 +794,7 @@ impl App {
             "{{\"phase\":\"{phase}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
              \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
-             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{}{img}}}",
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{}{img}}}",
             httpd::json_escape(&self.cfg.title),
             httpd::json_escape(&self.cfg.endpoint),
             httpd::json_escape(&self.cfg.bucket),
@@ -786,6 +860,31 @@ impl App {
                     "{{\"res\":{},\"x\":{},\"y\":{},\"updates\":{}}}", res, x, y, n))
                 .unwrap_or_else(|| "null".into()),
             self.gpu_debug_json(),
+            self.snapshot_json(),
+        )
+    }
+
+    /// The snapshot facts: which key, whether one is cached (and how big),
+    /// whether THIS machine was resumed from one, and what the last
+    /// /snapshot wrote.
+    fn snapshot_json(&self) -> String {
+        let js = |v: &Option<String>| {
+            v.as_ref()
+                .map(|s| format!("\"{}\"", httpd::json_escape(s)))
+                .unwrap_or_else(|| "null".into())
+        };
+        format!(
+            "{{\"key\":{},\"cachedBytes\":{},\"restored\":{},\"restoreMs\":{:.0},\"takenUnix\":{},\"lastSnapshot\":{}}}",
+            js(&self.cfg.snapshot),
+            self.cache
+                .as_ref()
+                .and_then(|c| c.snap_stored.as_ref())
+                .map(|b| b.len())
+                .unwrap_or(0),
+            self.restored,
+            self.restore_ms,
+            self.restore_taken_unix,
+            js(&self.last_snapshot),
         )
     }
 }
@@ -857,17 +956,62 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
         ),
         None => None,
     };
-    Ok(Images { kernel, fs_stored, fs_gzipped, dtb })
+    let kernel_sha256 = sha256_hex(&kernel);
+    let fs_sha256 = sha256_hex(&fs_stored);
+    // The snapshot rides the same fetch (and the same retry budget): a
+    // transient egress blip at enclave cold boot must not silently turn an
+    // instant start into a two-minute one. A missing object is not an error,
+    // it is the state before the first /snapshot.
+    let snap_stored = match &cfg.snapshot {
+        Some(k) => {
+            eprintln!("[risc-box] fetching snapshot s3://{}/{k}", cfg.bucket);
+            match s3::get_object_opt(&ep, &cfg.bucket, k, creds, &mut progress_logger("snapshot"))
+                .map_err(|e| format!("fetch snapshot {k}: {e}"))?
+            {
+                Some(mut b) => {
+                    b.shrink_to_fit();
+                    eprintln!("[risc-box]   snapshot {} bytes", b.len());
+                    Some(b)
+                }
+                None => {
+                    eprintln!(
+                        "[risc-box]   no snapshot at {k} yet: this boot is a cold one (POST /snapshot once the machine is ready)"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    Ok(Images { kernel, fs_stored, fs_gzipped, dtb, kernel_sha256, fs_sha256, snap_stored })
 }
 
-fn boot(images: &mut Images, cfg: &Config) -> Result<Emulator, String> {
+/// A machine brought up, and how: resumed from a snapshot or booted cold.
+struct Booted {
+    emu: Emulator,
+    restored: Option<riscv_emu_rust::SnapshotInfo>,
+}
+
+/// Bring a machine up. With `want_snapshot` and a cached snapshot that
+/// matches these images and settings, the machine RESUMES: the base disk is
+/// loaded, the snapshot's RAM, devices and disk delta are laid over it, and
+/// the guest continues from wherever it was — seconds, not a boot. A snapshot
+/// that does not match is ignored with a log line and the machine boots cold,
+/// because a restore against the wrong base would mount a filesystem whose
+/// blocks are half from another image.
+///
+/// A restore that fails midway is an Err: by then the base disk has been
+/// handed to the emulator and partly rewritten, so the caller drops the
+/// snapshot and boots cold with a fresh disk (see `do_start`).
+fn boot(images: &mut Images, cfg: &Config, want_snapshot: bool) -> Result<Booted, String> {
     let mut emu = Emulator::new(Box::new(RiscBoxTerminal {
         input: VecDeque::new(),
         output: VecDeque::new(),
     }));
     // before setup_program: that's where the RAM Vec is allocated and the
     // DTB memory node gets synced to it
-    emu.setup_ram_bytes(cfg.ram_mib * 1024 * 1024);
+    let ram_bytes = cfg.ram_mib * 1024 * 1024;
+    emu.setup_ram_bytes(ram_bytes);
     // Display size and clock source, both of which the guest reads exactly once
     // at boot: the DTB node for the framebuffer, the timebase for the clock.
     if cfg.fb_w != 1024 || cfg.fb_h != 768 {
@@ -888,20 +1032,92 @@ fn boot(images: &mut Images, cfg: &Config) -> Result<Emulator, String> {
         emu.set_wall_clock(true);
         eprintln!("[risc-box] guest clock: host monotonic (realtime)");
     }
+    let disk = images.take_disk()?;
+
+    if want_snapshot {
+        if let Some(snap) = images.snap_stored.as_ref() {
+            let identity = images.identity(cfg);
+            // The cheap checks first, before the disk is committed to this
+            // emulator: a mismatch here costs nothing and falls back cleanly.
+            let verdict = match Emulator::snapshot_meta(snap) {
+                Ok(m) if m.identity != identity => Err(format!(
+                    "it was taken against different images or settings (its identity {:?}, this deployment's {:?})",
+                    m.identity, identity
+                )),
+                Ok(m) if m.ram_bytes != ram_bytes => Err(format!(
+                    "it holds {} MiB of guest RAM but this deployment is configured for {} MiB",
+                    m.ram_bytes >> 20,
+                    cfg.ram_mib
+                )),
+                Ok(m) if m.disk_len as usize != disk.len() => Err(format!(
+                    "it expects a {}-byte base disk but the fs object expands to {} bytes",
+                    m.disk_len,
+                    disk.len()
+                )),
+                Ok(m) => Ok(m),
+                Err(e) => Err(e),
+            };
+            match verdict {
+                Ok(meta) => {
+                    eprintln!(
+                        "[risc-box] resuming from snapshot ({} bytes, taken at unix {}, emulator {})",
+                        snap.len(),
+                        meta.taken_unix,
+                        meta.emu_version
+                    );
+                    emu.setup_filesystem(disk);
+                    let t = Instant::now();
+                    let info = emu
+                        .restore(snap, &identity)
+                        .map_err(|e| format!("snapshot restore failed: {e}"))?;
+                    eprintln!(
+                        "[risc-box] restored in {:.2}s: {}/{} RAM pages, {} disk blocks replayed",
+                        t.elapsed().as_secs_f64(),
+                        info.ram_pages_kept,
+                        info.ram_pages_total,
+                        info.delta_blocks
+                    );
+                    #[cfg(feature = "aot")]
+                    {
+                        emu.aot_enable();
+                        eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
+                    }
+                    if cfg.net_enabled {
+                        emu.setup_network(Box::new(HostNet::new()));
+                    }
+                    return Ok(Booted { emu, restored: Some(info) });
+                }
+                Err(why) => eprintln!("[risc-box] ignoring the snapshot: {why}; booting cold"),
+            }
+        }
+    }
+
     emu.setup_program(images.kernel.clone());
-    emu.setup_filesystem(images.take_disk()?);
+    emu.setup_filesystem(disk);
     #[cfg(feature = "aot")]
     {
         emu.aot_enable();
         eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
     }
-    if let Some(dtb) = &images.dtb {
-        emu.setup_dtb(dtb.clone());
+    match &images.dtb {
+        Some(dtb) => emu.setup_dtb(dtb.clone()),
+        None => {
+            // The built-in device tree seeds the kernel's random pool so the
+            // desktop does not wait ~160 s for entropy that never comes — but
+            // it shipped one FIXED seed, so every cold boot of every
+            // deployment started from the same pool. Fresh bytes per boot.
+            use rand_core::RngCore;
+            let mut seed = [0u8; 64];
+            rand_core::OsRng.fill_bytes(&mut seed);
+            if !emu.seed_rng(&seed) {
+                eprintln!("[risc-box] dtb: rng-seed not found; the guest boots with the built-in seed");
+            }
+        }
     }
     if cfg.net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
     }
-    Ok(emu)
+    Ok(Booted { emu, restored: None })
 }
 
 // ---- request routing -------------------------------------------------------
@@ -963,7 +1179,8 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             let creds = creds_from(&v);
             let reset = v.get("reset").and_then(|x| x.as_bool()).unwrap_or(false);
-            app.pending = Some(Start { creds, reset });
+            let snapshot = v.get("snapshot").and_then(|x| x.as_bool());
+            app.pending = Some(Start { creds, reset, snapshot });
             app.retry = 0; // an operator start gets a fresh retry budget
             app.retry_at = None;
             app.retry_start = None;
@@ -993,10 +1210,12 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         ("POST", "/hid-stream-event") => hid_inner(app, server, key, &req.body, false),
         ("POST", "/exec") => exec(app, server, key, &req.body),
         ("POST", "/save") => save(app, server, key),
+        ("POST", "/snapshot") => snapshot(app, server, key, &req.body),
         ("POST", "/stop") => {
             app.emu = None;
             app.phase = Phase::Halted;
             app.boot_at = None;
+            app.restored = false;
             app.display.reset();
             worker::reset();
             app.venc = None;
@@ -1373,7 +1592,48 @@ fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
         .map(|n| n as usize)
         .unwrap_or(EXEC_DEFAULT_MAX_BYTES)
         .clamp(1024, MAX_BODY);
+    let cmd = cmd.to_string();
+    // Park the request by TICKET, not by key: exec_run flushes the server
+    // while it blocks, and a flush reaps dead connections by compacting the
+    // list, so the index this request arrived under can point at another
+    // connection (or nothing) by the time the answer exists. That is the
+    // same reason /fb.bands long-polls hold; a dropped response here read
+    // as "exec hangs" from outside.
+    let Some(ticket) = server.hold(key) else { return };
+    let out = exec_run(app, server, &cmd, timeout, max_out);
+    let payload = match out.error {
+        None => format!(
+            "{{\"ok\":true,\"exitCode\":{},\"output\":\"{}\",\"truncated\":{},\"ms\":{}}}",
+            out.exit_code,
+            httpd::json_escape(&out.output),
+            out.truncated,
+            out.ms
+        ),
+        Some(e) => format!(
+            "{{\"ok\":false,\"error\":\"{}\",\"output\":\"{}\",\"truncated\":{},\"ms\":{}}}",
+            httpd::json_escape(&e),
+            httpd::json_escape(&out.output),
+            out.truncated,
+            out.ms
+        ),
+    };
+    server.release(ticket, json(200, "OK", payload));
+}
 
+/// What one console command came back with. `error` set means the command
+/// did not complete (no prompt, or timed out); `output` is whatever came
+/// back either way.
+struct ExecOutcome {
+    exit_code: i64,
+    output: String,
+    truncated: bool,
+    ms: u128,
+    error: Option<String>,
+}
+
+/// The console-driving core of /exec, shared with the post-restore hook.
+/// Blocks the event loop for up to `timeout` (login and command together).
+fn exec_run(app: &mut App, server: &mut Server, cmd: &str, timeout: Duration, max_out: usize) -> ExecOutcome {
     let seq = app.exec_seq;
     app.exec_seq = app.exec_seq.wrapping_add(1);
     let tag = format!("RBX{seq}Z");
@@ -1416,18 +1676,16 @@ fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
     }
     if !ready {
         let tail = &cap[cap.len().saturating_sub(800)..];
-        return server.respond(
-            key,
-            json(200, "OK", format!(
-                "{{\"ok\":false,\"error\":\"{}\",\"output\":\"{}\",\"ms\":{}}}",
-                httpd::json_escape(&format!(
-                    "guest shell not ready: no prompt appeared on the serial console within {}s (is a getty running on ttyS0, or is the guest still booting?)",
-                    ready_budget.as_secs()
-                )),
-                httpd::json_escape(&String::from_utf8_lossy(tail)),
-                began.elapsed().as_millis()
+        return ExecOutcome {
+            exit_code: -1,
+            output: String::from_utf8_lossy(tail).into_owned(),
+            truncated: false,
+            ms: began.elapsed().as_millis(),
+            error: Some(format!(
+                "guest shell not ready: no prompt appeared on the serial console within {}s (is a getty running on ttyS0, or is the guest still booting?)",
+                ready_budget.as_secs()
             )),
-        );
+        };
     }
 
     // Phase 2 — send the command and wait for the closing marker (with its
@@ -1480,21 +1738,16 @@ fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
         text.truncate(n);
     }
 
-    let payload = if ok {
-        format!(
-            "{{\"ok\":true,\"exitCode\":{exit_code},\"output\":\"{}\",\"truncated\":{truncated},\"ms\":{}}}",
-            httpd::json_escape(&text),
-            began.elapsed().as_millis()
-        )
-    } else {
-        format!(
-            "{{\"ok\":false,\"error\":\"{}\",\"output\":\"{}\",\"truncated\":{truncated},\"ms\":{}}}",
-            httpd::json_escape(&format!("exec timed out after {}s", timeout.as_secs())),
-            httpd::json_escape(&text),
-            began.elapsed().as_millis()
-        )
-    };
-    server.respond(key, json(200, "OK", payload));
+    ExecOutcome {
+        exit_code,
+        output: text,
+        truncated,
+        ms: began.elapsed().as_millis(),
+        error: match ok {
+            true => None,
+            false => Some(format!("exec timed out after {}s", timeout.as_secs())),
+        },
+    }
 }
 
 /// One event-loop turn's worth of guest work, for the inline /exec wait: step
@@ -1588,6 +1841,77 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|i| i + from)
 }
 
+/// POST /snapshot — serialize the running machine and PUT it to the snapshot
+/// key, so the next /start (and every start after a restart) resumes from
+/// this moment instead of booting. Body: {"key"?: "<s3 key>", "level"?: 1..9}.
+/// Blocks the event loop for the serialize + upload, like /save does.
+///
+/// Take it when the machine is QUIET: a TCP connection the guest holds open
+/// at this moment (an ssh session, a download) is a real host socket that
+/// cannot be in the snapshot, so on resume the guest finds it dead.
+fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8]) {
+    if app.cfg.read_only {
+        return server.respond(key, json(403, "Forbidden", err("this machine is read-only")));
+    }
+    if app.phase != Phase::Running || app.emu.is_none() {
+        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+    }
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let save_key = v
+        .get("key")
+        .and_then(|k| k.as_str())
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .or_else(|| app.cfg.snapshot_save_key.clone());
+    let Some(save_key) = save_key else {
+        return server.respond(key, json(400, "Bad Request", err(
+            "no snapshot key: set `snapshot` (or `snapshotSaveKey`) in the config, or pass {\"key\": \"<s3 key>\"}",
+        )));
+    };
+    let level = v
+        .get("level")
+        .and_then(|l| l.as_u64())
+        .map(|l| l.clamp(1, 9) as u8)
+        .unwrap_or(app.cfg.snapshot_level);
+    let Some(identity) = app.cache.as_ref().map(|c| c.identity(&app.cfg)) else {
+        return server.respond(key, json(409, "Conflict", err("no images cached to bind the snapshot to")));
+    };
+    let ep = match Endpoint::parse(&app.cfg.endpoint, &app.cfg.region) {
+        Ok(e) => e,
+        Err(e) => return server.respond(key, json(500, "Error", err(&e))),
+    };
+    let emu = app.emu.as_ref().expect("emu present (checked above)");
+    let t0 = Instant::now();
+    let (data, info) = emu.snapshot(&identity, level);
+    let snap_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[risc-box] snapshot: {} bytes in {:.0}ms ({}/{} RAM pages kept, {} disk blocks changed); uploading to s3://{}/{save_key}",
+        data.len(), snap_ms, info.ram_pages_kept, info.ram_pages_total, info.delta_blocks, app.cfg.bucket
+    );
+    let t1 = Instant::now();
+    match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &data) {
+        Ok(()) => {
+            let upload_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            let bytes = data.len();
+            eprintln!("[risc-box] snapshot uploaded in {upload_ms:.0}ms");
+            // The next start resumes from THIS, with no download.
+            if let Some(cache) = app.cache.as_mut() {
+                cache.snap_stored = Some(data);
+            }
+            app.last_snapshot = Some(save_key.clone());
+            server.respond(
+                key,
+                json(200, "OK", format!(
+                    "{{\"ok\":true,\"key\":\"{}\",\"bytes\":{},\"ramPagesKept\":{},\"ramPagesTotal\":{},\"deltaBlocks\":{},\"snapshotMs\":{:.0},\"uploadMs\":{:.0}}}",
+                    httpd::json_escape(&save_key), bytes, info.ram_pages_kept, info.ram_pages_total,
+                    info.delta_blocks, snap_ms, upload_ms
+                )),
+            )
+        }
+        Err(e) => server.respond(key, json(502, "Bad Gateway", err(&format!("snapshot upload: {e}")))),
+    }
+}
+
 fn save(app: &mut App, server: &mut Server, key: usize) {
     if app.cfg.read_only {
         return server.respond(key, json(403, "Forbidden", err("this machine is read-only")));
@@ -1634,9 +1958,15 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
     }
 }
 
-/// Perform a queued /start: fetch (or reuse cached) images and boot.
-fn do_start(app: &mut App, start: Start) {
-    let need_fetch = start.reset || app.cache.is_none();
+/// Perform a queued /start: fetch (or reuse cached) images and boot — or,
+/// when a matching snapshot is cached, resume.
+fn do_start(app: &mut App, server: &mut Server, start: Start) {
+    let need_fetch = start.reset
+        || app.cache.is_none()
+        // a raw (non-gz) image is MOVED into the machine at boot, so a second
+        // start has nothing left to hand it; refill (see Images::take_disk)
+        || app.cache.as_ref().map_or(false, |c| !c.fs_gzipped && c.fs_stored.is_empty());
+    let creds_for_retry = start.creds.as_ref().map(clone_creds);
     if need_fetch {
         // creds precedence: request body > config; borrow-safe clone of config creds
         let body = start.creds;
@@ -1666,6 +1996,7 @@ fn do_start(app: &mut App, start: Start) {
                     app.retry_start = Some(Start {
                         creds: body.as_ref().map(clone_creds),
                         reset: start.reset,
+                        snapshot: start.snapshot,
                     });
                 }
                 app.error = Some(e);
@@ -1674,21 +2005,53 @@ fn do_start(app: &mut App, start: Start) {
             }
         }
     }
-    let imgs = app.cache.as_mut().expect("cache present after fetch");
+    let want_snapshot = start.snapshot.unwrap_or(true);
     // Expanding a gzipped image can fail (corrupt object, or no room for the
     // expanded disk beside everything else). Treat it exactly like a failed
     // fetch: report it and leave the machine stopped, rather than unwrapping
     // and taking the whole app down with it.
-    let emu = match boot(imgs, &app.cfg) {
-        Ok(e) => e,
-        Err(e) => {
+    let first = {
+        let imgs = app.cache.as_mut().expect("cache present after fetch");
+        let tried_snapshot = want_snapshot && imgs.snap_stored.is_some();
+        (boot(imgs, &app.cfg, want_snapshot), tried_snapshot)
+    };
+    let booted = match first {
+        (Ok(b), _) => b,
+        (Err(e), true) => {
+            // A snapshot that failed mid-restore is dropped so the machine
+            // still comes up, cold. The base disk it consumed is re-expanded
+            // (gz) here, or re-fetched (raw) by queueing a fresh start.
+            eprintln!("[risc-box] {e}; dropping the snapshot and booting cold");
+            let disk_gone = {
+                let imgs = app.cache.as_mut().expect("cache present");
+                imgs.snap_stored = None;
+                !imgs.fs_gzipped && imgs.fs_stored.is_empty()
+            };
+            if disk_gone {
+                app.cache = None;
+                app.pending = Some(Start { creds: creds_for_retry, reset: false, snapshot: Some(false) });
+                return;
+            }
+            let imgs = app.cache.as_mut().expect("cache present");
+            match boot(imgs, &app.cfg, false) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[risc-box] start failed: {e}");
+                    app.error = Some(e);
+                    app.phase = Phase::Error;
+                    return;
+                }
+            }
+        }
+        (Err(e), false) => {
             eprintln!("[risc-box] start failed: {e}");
             app.error = Some(e);
             app.phase = Phase::Error;
             return;
         }
     };
-    app.emu = Some(emu);
+    let restored = booted.restored;
+    app.emu = Some(booted.emu);
     app.instret = 0;
     app.boot_at = Some(Instant::now());
     app.scrollback.clear();
@@ -1698,7 +2061,52 @@ fn do_start(app: &mut App, start: Start) {
     worker::reset();
     app.venc = None; // fresh machine, fresh encoder (next watcher gets a keyframe)
     app.phase = Phase::Running;
-    eprintln!("[risc-box] machine running: {}", app.cfg.title);
+    app.restored = restored.is_some();
+    app.restore_taken_unix = restored.as_ref().map_or(0, |i| i.taken_unix);
+    app.restore_ms = 0.0;
+    match &restored {
+        Some(info) => eprintln!(
+            "[risc-box] machine RESUMED from snapshot: {} (taken at unix {})",
+            app.cfg.title, info.taken_unix
+        ),
+        None => eprintln!("[risc-box] machine running: {}", app.cfg.title),
+    }
+    // The resumed guest still thinks it is the moment the snapshot was
+    // taken. The hook is the operator's chance to tell it otherwise.
+    if restored.is_some() {
+        if let Some(cmd) = app.cfg.restore_exec.clone() {
+            if !app.cfg.exec_enabled {
+                eprintln!("[risc-box] restoreExec set but exec is disabled; skipping");
+            } else {
+                let cmd = fill_hook(&cmd);
+                let timeout = Duration::from_secs(app.cfg.restore_exec_timeout_s);
+                let t = Instant::now();
+                let out = exec_run(app, server, &cmd, timeout, EXEC_DEFAULT_MAX_BYTES);
+                match out.error {
+                    None => eprintln!(
+                        "[risc-box] restoreExec done in {:.1}s (exit {})",
+                        t.elapsed().as_secs_f64(),
+                        out.exit_code
+                    ),
+                    Some(e) => eprintln!("[risc-box] restoreExec failed: {e}"),
+                }
+            }
+        }
+    }
+}
+
+/// Expand the placeholders a post-restore hook may use: `{epoch}` is the
+/// host's UNIX time in seconds, `{entropy}` 64 fresh random bytes as hex.
+fn fill_hook(cmd: &str) -> String {
+    use rand_core::RngCore;
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut bytes = [0u8; 64];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    cmd.replace("{epoch}", &epoch.to_string()).replace("{entropy}", &hex)
 }
 
 fn clone_creds(c: &Creds) -> Creds {
@@ -1784,7 +2192,7 @@ pub fn run() {
         } else {
             None
         },
-        pending: if autostart { Some(Start { creds: None, reset: false }) } else { None },
+        pending: if autostart { Some(Start { creds: None, reset: false, snapshot: None }) } else { None },
         cache: None,
         live_creds: None,
         instret: 0,
@@ -1822,6 +2230,10 @@ pub fn run() {
         retry: 0,
         retry_at: None,
         retry_start: None,
+        restored: false,
+        restore_ms: 0.0,
+        restore_taken_unix: 0,
+        last_snapshot: None,
     };
     if app.cfg.net_enabled {
         app.net = Some(NetStack::new(&app.cfg.forwards, app.cfg.net_outbound));
@@ -1909,15 +2321,22 @@ pub fn run() {
                 if Instant::now() >= t {
                     app.retry_at = None;
                     app.retry += 1;
-                    app.pending =
-                        Some(app.retry_start.take().unwrap_or(Start { creds: None, reset: false }));
+                    app.pending = Some(app.retry_start.take().unwrap_or(Start {
+                        creds: None,
+                        reset: false,
+                        snapshot: None,
+                    }));
                 }
             }
         }
 
         if let Some(start) = app.pending.take() {
             app.phase = Phase::Running; // optimistic; do_start flips to Error on failure
-            do_start(&mut app, start);
+            let t = Instant::now();
+            do_start(&mut app, &mut server, start);
+            if app.restored {
+                app.restore_ms = t.elapsed().as_secs_f64() * 1000.0;
+            }
         }
 
         let t2 = Instant::now();

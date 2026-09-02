@@ -121,7 +121,9 @@ JSON object:
   "display": { "width": 1024, "height": 768 },
   "realtime": false,
   "net": { "forwards": [ { "listen": 2222, "to": 22 } ] },
-  "api_key": "$RISCBOX_API_KEY"
+  "api_key": "$RISCBOX_API_KEY",
+  "snapshot": "images/desktop.snap",
+  "restoreExec": "date -s @{epoch} >/dev/null; echo {entropy} > /dev/urandom"
 }
 ```
 
@@ -130,7 +132,15 @@ JSON object:
   emulator ships a default device tree that boots the sample images.
 - `saveKey` is where **Save disk** PUTs the guest-modified image (defaults to
   `fs`; set it aside to keep the pristine image). `readOnly: true` disables
-  saving.
+  saving (and snapshotting).
+- `snapshot` names the object a **snapshot of the booted machine** lives under.
+  When it exists, `/start` resumes the machine from it in seconds instead of
+  booting the OS; when it does not exist yet, the boot is a cold one and
+  `POST /snapshot` writes it (to `snapshotSaveKey`, default `snapshot`) so every
+  start after that is instant. `snapshotLevel` (1-9, default 2) is the deflate
+  level. `restoreExec` is a shell command run on the guest console right after a
+  resume; `{epoch}` and `{entropy}` expand to the host's UNIX time and 64 fresh
+  random bytes (hex). See *Instant boot from a snapshot*.
 - Any string value in the config may be written as `$NAME` (or `${NAME}`):
   it is resolved from the app's **environment** at startup, which is where
   deployment secrets arrive. Whole-value references only. An unresolved
@@ -179,11 +189,12 @@ JSON object:
 | `GET /`           | console UI (self-contained HTML + embedded xterm)                    |
 | `GET /a/<asset>`  | embedded `xterm.js` / `xterm.css`                                    |
 | `GET /status`     | JSON: phase, image sizes, instructions retired, MIPS, frames presented (`fps`) and shipped (`sentFps`), display mode, console bytes |
-| `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?}`: fetch from S3 and boot; `reset:true` re-fetches instead of using the cached images |
+| `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?,snapshot?}`: fetch from S3 and boot — or resume from the snapshot when one is cached; `reset:true` re-fetches instead of using the cached images, `snapshot:false` forces a cold boot |
 | `POST /input`     | **raw bytes** in the body → the guest UART receive register          |
 | `POST /exec`      | `{cmd, timeout_s?, max_bytes?}`: run a shell command on the guest console and return its stdout + exit code as JSON (see below) |
 | `GET /console`    | Server-Sent Events: base64 console output, scrollback replayed first |
 | `POST /save`      | dump the guest disk and PUT it to `saveKey`                          |
+| `POST /snapshot`  | `{key?,level?}`: serialize the running machine and PUT it to the snapshot key; later starts resume from it |
 | `POST /stop`      | halt the machine and drop it from RAM                                |
 | `GET /ping`       | liveness                                                             |
 
@@ -311,6 +322,69 @@ booted from a `.gz` image writes its disk back as real gzip rather than raw
 bytes under a `.gz` name — which would boot exactly once more and then fail
 forever with "bad magic". The output is ordinary gzip, `gunzip -t`-clean CRC
 and all, so the bucket stays readable with normal tools.
+
+## Instant boot from a snapshot
+
+A desktop guest takes the emulated core a couple of minutes to bring up: OpenSBI,
+the kernel, init, Xorg, the session. None of that work depends on anything but
+the images, so it only has to be done once. `POST /snapshot` serializes the
+**running machine** — CPU registers and CSRs, every device's registers and
+rings, the device tree as the guest saw it, guest RAM, and the disk blocks the
+guest has changed — and PUTs it to the configured `snapshot` key. From then on
+every `/start`, including the one after a restart or a redeploy, **resumes** the
+machine from that moment: fetch, inflate, continue. Locally the sample image
+restores in well under a second; on the fleet the cost is the download.
+
+```sh
+# 1. deploy with "snapshot": "images/desktop.snap" in the config — the object
+#    does not exist yet, so the first start boots cold
+# 2. once the machine is where you want it (desktop up, logged in, quiet):
+curl -s -XPOST -H "x-api-key: $KEY" https://<id8>.app.enclave.host/snapshot
+# {"ok":true,"key":"images/desktop.snap","bytes":13924085,"ramPagesKept":7751,
+#  "ramPagesTotal":131072,"deltaBlocks":1,"snapshotMs":320,"uploadMs":1400}
+# 3. every start from now on resumes:
+curl -s -XPOST -H "x-api-key: $KEY" .../stop; curl -s -XPOST -H "x-api-key: $KEY" .../start -d '{}'
+curl -s -H "x-api-key: $KEY" .../status | jq .snapshot
+# {"key":"images/desktop.snap","cachedBytes":13924085,"restored":true,"restoreMs":812,...}
+```
+
+What is in it, and what is not. Guest RAM is written sparsely — zero pages are
+elided, the rest deflated — so a booted 512 MiB machine is a few tens of MB.
+The disk is **not** copied: the snapshot carries only the blocks the guest
+wrote since the base image was loaded, and a restore fetches the `fs` object
+exactly as a cold boot does and lays the delta over it. That is what keeps a
+snapshot small, and it is also why a snapshot is **bound to its images**: it
+records a sha256 of the kernel and fs objects as fetched (plus the RAM size,
+display geometry and clock mode), and a start whose images or settings differ
+ignores the snapshot with a log line and boots cold rather than mount a
+filesystem half from another image. Overwrite the base image, or change
+`ramMiB`, and you take a new snapshot. A snapshot is also bound to the
+emulator's own format (`emu/src/snapshot.rs`, `FORMAT`): a newer app that
+changed a device's layout refuses old snapshots the same way.
+
+What a resumed guest does not know. It believes it is the moment the snapshot
+was taken: its wall clock is stale, and its kernel random pool is the same one
+every other resume of this snapshot has. `restoreExec` runs a command on the
+console right after the resume, through the same machinery as `/exec`, and
+`{epoch}` / `{entropy}` expand to what the guest needs to fix both:
+
+```json
+"restoreExec": "date -s @{epoch} >/dev/null; echo {entropy} > /dev/urandom"
+```
+
+(It needs a shell on `ttyS0`, like `/exec`.) Any TCP connection the guest held
+open at snapshot time — an ssh session, a download — was a real host socket and
+is simply gone on resume; take the snapshot when the machine is quiet. The guest
+NIC, its DHCP lease and the port forwards all carry over, because the address
+plan is static.
+
+`POST /start` with `{"snapshot": false}` boots the base images cold while a
+snapshot exists (to build a new one, say); `{"reset": true}` re-fetches images
+and snapshot both. `/status` reports the snapshot key, whether one is cached
+and how big, whether the running machine was restored and how long that took.
+The same machinery is in `boot-bench` for measuring without S3:
+`--snapshot-on MARKER:FILE` writes one when MARKER appears on the console,
+`--restore FILE` resumes from it.
 
 ## Networking and SSH
 

@@ -14,6 +14,12 @@ pub struct Clint {
 /// risc-box patch: state for wall-clock mtime.
 struct Wall {
 	start: std::time::Instant,
+	// risc-box patch (snapshot): mtime at `start`. Zero on a cold boot; a
+	// restored machine resumes from the snapshot's mtime rather than from
+	// zero, because the guest's armed timer deadlines (mtimecmp) are
+	// absolute and a clock that jumped backwards would leave it waiting
+	// out the whole snapshot's uptime before its next tick.
+	base: u64,
 	since_sample: u64
 }
 
@@ -59,6 +65,7 @@ impl Clint {
 		self.wall = match on {
 			true => Some(Wall {
 				start: std::time::Instant::now(),
+				base: 0,
 				// sample on the very first tick so the guest never sees zero
 				since_sample: WALL_SAMPLE_INSNS
 			}),
@@ -85,7 +92,7 @@ impl Clint {
 				w.since_sample = w.since_sample.wrapping_add(n);
 				if w.since_sample >= WALL_SAMPLE_INSNS {
 					w.since_sample = 0;
-					self.mtime = (w.start.elapsed().as_nanos() as u64) / 100;
+					self.mtime = w.base.wrapping_add((w.start.elapsed().as_nanos() as u64) / 100);
 				}
 			},
 			None => self.mtime = self.mtime.wrapping_add(n)
@@ -247,5 +254,38 @@ impl Clint {
 	/// Writes to `mtime` register content
 	pub fn write_mtime(&mut self, value: u64) {
 		self.mtime = value;
+	}
+}
+
+// risc-box patch (snapshot): see src/snapshot.rs.
+use snapshot::{De, Ser};
+
+impl Clint {
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u64(self.clock);
+		w.u32(self.msip);
+		w.u64(self.mtimecmp);
+		w.u64(self.mtime);
+		w.bool(self.wall.is_some());
+	}
+
+	/// The clock source (instruction-driven or wall) stays whatever THIS
+	/// machine was configured with; only the count carries over. In wall
+	/// mode the host clock is re-based so mtime continues from the
+	/// snapshot's value on the next sample.
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.clock = r.u64()?;
+		self.msip = r.u32()?;
+		self.mtimecmp = r.u64()?;
+		self.mtime = r.u64()?;
+		let _was_wall = r.bool()?;
+		if self.wall.is_some() {
+			self.wall = Some(Wall {
+				start: std::time::Instant::now(),
+				base: self.mtime,
+				since_sample: WALL_SAMPLE_INSNS
+			});
+		}
+		Ok(())
 	}
 }

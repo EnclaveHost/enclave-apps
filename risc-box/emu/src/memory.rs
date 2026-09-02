@@ -158,6 +158,17 @@ impl Memory {
 		}
 	}
 
+	/// risc-box patch (snapshot): the whole of DRAM, for the sparse page
+	/// codec. Reads only; the write side goes through `as_mut_slice` so a
+	/// restore fills pages in place with no second allocation.
+	pub fn as_slice(&self) -> &[u8] {
+		&self.data
+	}
+
+	pub fn as_mut_slice(&mut self) -> &mut [u8] {
+		&mut self.data
+	}
+
 	/// Check if the address is valid memory address
 	///
 	/// # Arguments

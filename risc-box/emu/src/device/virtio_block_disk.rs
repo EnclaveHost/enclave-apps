@@ -37,8 +37,16 @@ pub struct VirtioBlockDisk {
 	status: u32, // read and write
 	notify_clocks: Vec::<u64>,
 	contents: Vec<u64>,
-	contents_len: usize // risc-box patch: original byte length, for dump_contents()
+	contents_len: usize, // risc-box patch: original byte length, for dump_contents()
+	// risc-box patch (snapshot): one bit per DELTA_BLOCK bytes of disk,
+	// set by every guest write since init(). A snapshot carries only these
+	// blocks on top of the base image the app re-fetches, so it is a
+	// fraction of the image's size rather than a second copy of it.
+	dirty: Vec<u64>
 }
+
+/// Granularity of the write tracking (matches snapshot::PAGE).
+const DELTA_BLOCK: u64 = 4096;
 
 impl VirtioBlockDisk {
 	/// Creates a new `VirtioBlockDisk`.
@@ -60,7 +68,8 @@ impl VirtioBlockDisk {
 			interrupt_status: 0,
 			notify_clocks: Vec::new(),
 			contents: vec![],
-			contents_len: 0
+			contents_len: 0,
+			dirty: vec![]
 		}
 	}
 
@@ -93,6 +102,7 @@ impl VirtioBlockDisk {
 		// cost on wasm32, where the disk and the guest RAM share one linear
 		// memory and a half-gigabyte image leaves little headroom.
 		self.contents_len = contents.len();
+		self.dirty = vec![0u64; ((contents.len() as u64 + DELTA_BLOCK - 1) / DELTA_BLOCK / 64 + 1) as usize];
 		let cells = (contents.len() + 7) / 8;
 		self.contents = Vec::with_capacity(cells);
 		let full = contents.len() / 8;
@@ -362,6 +372,7 @@ impl VirtioBlockDisk {
 		debug_assert!((mem_address % 8) == 0, "Memory address should be eight-byte aligned. {:X}", mem_address);
 		debug_assert!((disk_address % 8) == 0, "Disk address should be eight-byte aligned. {:X}", disk_address);
 		debug_assert!((length % 8) == 0, "Length should be eight-byte aligned. {:X}", length);
+		self.mark_dirty(disk_address, length); // risc-box patch (snapshot)
 		for i in 0..(length / 8) {
 			let disk_index = ((disk_address + i * 8) >> 3) as usize;
 			self.contents[disk_index] = memory.read_doubleword(mem_address + i * 8);
@@ -384,6 +395,7 @@ impl VirtioBlockDisk {
 	/// * `addresss` Address in disk
 	/// * `value` Data written to disk
 	fn write_to_disk(&mut self, address: u64, value: u8) {
+		self.mark_dirty(address, 1); // risc-box patch (snapshot)
 		let index = (address >> 3) as usize;
 		let pos = (address % 8) * 8;
 		self.contents[index] = (self.contents[index] & !(0xff << pos)) | ((value as u64) << pos);
@@ -559,5 +571,128 @@ impl VirtioBlockDisk {
 		self.used_ring_index = self.used_ring_index.wrapping_add(1);
 		memory.write_halfword(base_used_address.wrapping_add(2), self.used_ring_index);
 		}  // risc-box patch: end of the drain-all-available loop
+	}
+}
+
+// risc-box patch (snapshot): see src/snapshot.rs. The disk is the base
+// image plus the blocks the guest changed; only the latter are serialized.
+use snapshot::{De, Ser};
+
+impl VirtioBlockDisk {
+	fn mark_dirty(&mut self, disk_address: u64, length: u64) {
+		if length == 0 {
+			return;
+		}
+		let first = disk_address / DELTA_BLOCK;
+		let last = (disk_address + length - 1) / DELTA_BLOCK;
+		for b in first..=last {
+			if let Some(word) = self.dirty.get_mut((b / 64) as usize) {
+				*word |= 1u64 << (b % 64);
+			}
+		}
+	}
+
+	/// Byte length of the loaded image (a snapshot's base must match it).
+	pub fn disk_len(&self) -> usize {
+		self.contents_len
+	}
+
+	/// Every block index the guest has written, ascending.
+	pub fn dirty_blocks(&self) -> Vec<u32> {
+		let mut out = Vec::new();
+		for (wi, &word) in self.dirty.iter().enumerate() {
+			if word == 0 {
+				continue;
+			}
+			for bit in 0..64 {
+				if word & (1u64 << bit) != 0 {
+					out.push((wi * 64 + bit) as u32);
+				}
+			}
+		}
+		out
+	}
+
+	/// One DELTA_BLOCK-sized block, zero-padded past the end of the image.
+	pub fn read_block(&self, block: u32, out: &mut [u8]) {
+		let base = block as u64 * DELTA_BLOCK;
+		for (i, b) in out.iter_mut().enumerate() {
+			let a = base + i as u64;
+			*b = match (a as usize) < self.contents_len {
+				true => self.read_from_disk_at(a),
+				false => 0
+			};
+		}
+	}
+
+	fn read_from_disk_at(&self, address: u64) -> u8 {
+		let index = (address >> 3) as usize;
+		let pos = (address % 8) * 8;
+		(self.contents[index] >> pos) as u8
+	}
+
+	/// Write one block back (a restore replaying the delta). Marks it
+	/// dirty, so a snapshot taken from a restored machine still carries
+	/// every change relative to the base image.
+	pub fn write_block(&mut self, block: u32, data: &[u8]) -> Result<(), String> {
+		let base = block as u64 * DELTA_BLOCK;
+		if base >= self.contents_len as u64 {
+			return Err(format!("snapshot: delta block {} lies past the {}-byte image", block, self.contents_len));
+		}
+		for (i, &b) in data.iter().enumerate() {
+			let a = base + i as u64;
+			if (a as usize) >= self.contents_len {
+				break;
+			}
+			self.write_to_disk(a, b);
+		}
+		Ok(())
+	}
+
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u16(self.used_ring_index);
+		w.u64(self.clock);
+		w.u64(self.device_features);
+		w.u32(self.device_features_sel);
+		w.u32(self.driver_features);
+		w.u32(self._driver_features_sel);
+		w.u32(self.guest_page_size);
+		w.u32(self.queue_select);
+		w.u32(self.queue_size);
+		w.u32(self.queue_align);
+		w.u32(self.queue_pfn);
+		w.u32(self.queue_notify);
+		w.u32(self.interrupt_status);
+		w.u32(self.status);
+		w.u32(self.notify_clocks.len() as u32);
+		for c in &self.notify_clocks {
+			w.u64(*c);
+		}
+	}
+
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.used_ring_index = r.u16()?;
+		self.clock = r.u64()?;
+		self.device_features = r.u64()?;
+		self.device_features_sel = r.u32()?;
+		self.driver_features = r.u32()?;
+		self._driver_features_sel = r.u32()?;
+		self.guest_page_size = r.u32()?;
+		self.queue_select = r.u32()?;
+		self.queue_size = r.u32()?;
+		self.queue_align = r.u32()?;
+		self.queue_pfn = r.u32()?;
+		self.queue_notify = r.u32()?;
+		self.interrupt_status = r.u32()?;
+		self.status = r.u32()?;
+		let n = r.u32()? as usize;
+		if n > MAX_QUEUE_SIZE as usize {
+			return Err(format!("snapshot: virtio-blk has {} pending notifies", n));
+		}
+		self.notify_clocks.clear();
+		for _ in 0..n {
+			self.notify_clocks.push(r.u64()?);
+		}
+		Ok(())
 	}
 }

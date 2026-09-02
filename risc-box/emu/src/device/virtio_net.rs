@@ -396,3 +396,68 @@ impl VirtioNet {
 		self.push_used(memory, RX_QUEUE, head, written as u32);
 	}
 }
+
+// risc-box patch (snapshot): see src/snapshot.rs. The backend is the
+// host's cable and is not serialized; a frame in flight is lost, as it
+// would be on any NIC whose host rebooted.
+use snapshot::{De, Ser};
+
+impl VirtioNet {
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u64(self.device_features);
+		w.u32(self.device_features_sel);
+		w.u32(self.driver_features);
+		w.u32(self.guest_page_size);
+		w.u32(self.queue_select);
+		w.u32(self.queue_notify);
+		w.u32(self.interrupt_status);
+		w.u32(self.status);
+		for q in &self.queues {
+			w.u32(q.size);
+			w.u32(q.align);
+			w.u32(q.pfn);
+			w.u16(q.avail_cursor);
+			w.u16(q.used_index);
+		}
+		w.bool(self.tx_notified);
+		match &self.pending_rx {
+			Some(f) => {
+				w.bool(true);
+				w.bytes(f);
+			},
+			None => w.bool(false)
+		}
+		w.u32(self.rx_poll_countdown);
+	}
+
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.device_features = r.u64()?;
+		self.device_features_sel = r.u32()?;
+		self.driver_features = r.u32()?;
+		self.guest_page_size = r.u32()?;
+		self.queue_select = r.u32()?;
+		self.queue_notify = r.u32()?;
+		self.interrupt_status = r.u32()?;
+		self.status = r.u32()?;
+		for q in self.queues.iter_mut() {
+			q.size = r.u32()?;
+			q.align = r.u32()?;
+			q.pfn = r.u32()?;
+			q.avail_cursor = r.u16()?;
+			q.used_index = r.u16()?;
+		}
+		self.tx_notified = r.bool()?;
+		self.pending_rx = match r.bool()? {
+			true => {
+				let f = r.bytes()?;
+				if f.len() > 65536 {
+					return Err("snapshot: virtio-net pending frame too large".into());
+				}
+				Some(f.to_vec())
+			},
+			false => None
+		};
+		self.rx_poll_countdown = r.u32()?.max(1);
+		Ok(())
+	}
+}

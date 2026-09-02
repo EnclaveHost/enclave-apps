@@ -2985,6 +2985,78 @@ impl Cpu {
 		s
 	}
 
+	/// risc-box patch (snapshot): the architectural state, then the bus.
+	/// Caches (decode, block, TLB, AOT slots) are not written: they are
+	/// rebuilt on demand and a fresh Cpu starts with them empty anyway.
+	pub fn snapshot_into(&self, s: &mut ::snapshot::Ser, level: u8) -> ::snapshot::SnapshotStats {
+		let at = s.begin_section(b"CPU_");
+		s.u64(self.clock);
+		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
+		s.u8(::mmu::privilege_code(&self.privilege_mode));
+		s.bool(self.wfi);
+		for v in self.x.iter() {
+			s.i64(*v);
+		}
+		for v in self.f.iter() {
+			s.f64(*v);
+		}
+		s.u64(self.pc);
+		s.u32(CSR_CAPACITY as u32);
+		for v in self.csr.iter() {
+			s.u64(*v);
+		}
+		s.u64(self.reservation);
+		s.bool(self.is_reservation_set);
+		s.u64(self.since_service);
+		s.bool(self.check_interrupt);
+		s.end_section(at);
+		self.mmu.snapshot_into(s, level)
+	}
+
+	/// risc-box patch (snapshot): Ok(false) = not a section this layer knows.
+	pub fn restore_section(&mut self, tag: &[u8; 4], payload: &[u8], stats: &mut ::snapshot::RestoreStats) -> Result<bool, String> {
+		if tag != b"CPU_" {
+			return self.mmu.restore_section(tag, payload, stats);
+		}
+		let mut r = ::snapshot::De::new(payload);
+		self.clock = r.u64()?;
+		let xlen = match r.u8()? {
+			32 => Xlen::Bit32,
+			64 => Xlen::Bit64,
+			v => return Err(format!("snapshot: bad xlen {}", v))
+		};
+		self.privilege_mode = ::mmu::privilege_from(r.u8()?)?;
+		self.wfi = r.bool()?;
+		for i in 0..32 {
+			self.x[i] = r.i64()?;
+		}
+		for i in 0..32 {
+			self.f[i] = r.f64()?;
+		}
+		self.pc = r.u64()?;
+		let n = r.u32()? as usize;
+		if n != CSR_CAPACITY {
+			return Err(format!("snapshot: {} CSRs, expected {}", n, CSR_CAPACITY));
+		}
+		for i in 0..CSR_CAPACITY {
+			self.csr[i] = r.u64()?;
+		}
+		self.reservation = r.u64()?;
+		self.is_reservation_set = r.bool()?;
+		self.since_service = r.u64()?;
+		self.check_interrupt = r.bool()?;
+		r.finish("CPU_")?;
+		// derived state: mask + the MMU's copies of what translation depends on
+		self.update_xlen(xlen);
+		self.mmu.update_privilege_mode(self.privilege_mode.clone());
+		self.mmu.update_mstatus(self.read_csr_raw(CSR_MSTATUS_ADDRESS));
+		self.decode_cache = DecodeCache::new();
+		for h in self.block_heads.iter_mut() {
+			*h = BlockHead::EMPTY;
+		}
+		Ok(true)
+	}
+
 	/// Returns mutable `Mmu`
 	pub fn get_mut_mmu(&mut self) -> &mut Mmu {
 		&mut self.mmu

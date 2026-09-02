@@ -83,6 +83,12 @@ fn main() {
     let mut fps_frame_bytes: Option<u64> = None;
     let mut tier2_dump: Option<String> = None;
     let mut aot = false;
+    // --snapshot-on MARKER:FILE / --restore FILE: exercise the machine
+    // snapshot natively (see src/snapshot.rs). The identity binding the
+    // delta to its base is just the image sizes here; the app hashes them.
+    let mut snapshot_on: Option<(String, String)> = None;
+    let mut restore_from: Option<String> = None;
+    let mut snap_level: u8 = 2;
     let mut realtime = false;
     let mut fb_size: Option<(u32, u32)> = None;
     // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
@@ -138,6 +144,23 @@ fn main() {
                 );
             }
             "--aot" => aot = true,
+            "--snapshot-on" => {
+                // MARKER:FILE -- when MARKER appears on the console, write a
+                // whole-machine snapshot to FILE and keep running.
+                i += 1;
+                let (m, f) = args[i].split_once(':').expect("--snapshot-on MARKER:FILE");
+                snapshot_on = Some((m.to_string(), f.to_string()));
+            }
+            "--restore" => {
+                // FILE -- skip the boot: load the base images, then resume
+                // the machine from FILE. --type/--until/--xkey still apply.
+                i += 1;
+                restore_from = Some(args[i].clone());
+            }
+            "--snap-level" => {
+                i += 1;
+                snap_level = args[i].parse().expect("--snap-level 1..9");
+            }
             "--tier2" => {
                 // enable the coverage-mode region dispatcher; optional
                 // DUMPFILE records every formed region for the AOT bake.
@@ -287,8 +310,31 @@ fn main() {
         emu.set_framebuffer_size(w, h);
     }
     emu.set_wall_clock(realtime);
-    emu.setup_program(kernel);
-    emu.setup_filesystem(fs);
+    let identity = format!("boot-bench kernel={} fs={}", kernel.len(), fs.len());
+    match restore_from.as_ref() {
+        Some(path) => {
+            let data = read_exact_file(path);
+            let t = Instant::now();
+            emu.setup_filesystem(fs);
+            let info = emu.restore(&data, &identity).unwrap_or_else(|e| {
+                eprintln!("restore failed: {}", e);
+                std::process::exit(1);
+            });
+            println!(
+                "RESTORED {} bytes in {:.2}s: {}/{} RAM pages, {} delta blocks, taken {}",
+                info.bytes,
+                t.elapsed().as_secs_f64(),
+                info.ram_pages_kept,
+                info.ram_pages_total,
+                info.delta_blocks,
+                info.taken_unix
+            );
+        }
+        None => {
+            emu.setup_program(kernel);
+            emu.setup_filesystem(fs);
+        }
+    }
     #[cfg(feature = "aot")]
     if aot {
         emu.aot_enable();
@@ -463,6 +509,30 @@ fn main() {
         }
         done += BATCH;
         window_insns += BATCH;
+
+        if let Some((marker, path)) = snapshot_on.clone() {
+            let hit = console
+                .borrow()
+                .windows(marker.len())
+                .any(|w| w == marker.as_bytes());
+            if hit {
+                let t = Instant::now();
+                let (data, info) = emu.snapshot(&identity, snap_level);
+                let took = t.elapsed().as_secs_f64();
+                std::fs::write(&path, &data).expect("write snapshot");
+                println!(
+                    "SNAPSHOT {} bytes to {} in {:.2}s: {}/{} RAM pages kept, {} delta blocks, after {:.0}M insns",
+                    info.bytes,
+                    path,
+                    took,
+                    info.ram_pages_kept,
+                    info.ram_pages_total,
+                    info.delta_blocks,
+                    done as f64 / 1e6
+                );
+                snapshot_on = None;
+            }
+        }
 
         if let Some(marker) = &until {
             // The marker is ASCII, so a byte-window search finds it wherever

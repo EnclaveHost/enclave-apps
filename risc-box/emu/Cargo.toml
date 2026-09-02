@@ -17,6 +17,9 @@ publish = false
 
 [dependencies]
 fnv = "1.0.7"
+# risc-box patch: deflate for the machine snapshot (src/snapshot.rs). Pure
+# Rust, the same crate the app already uses for its band stream and gzip.
+miniz_oxide = "0.8"
 
 [features]
 # jit-proto sizing aid: per-block execution counters + a coverage histogram

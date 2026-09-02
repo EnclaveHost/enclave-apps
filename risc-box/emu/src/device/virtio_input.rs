@@ -530,3 +530,66 @@ mod tests {
 		assert_eq!(shift.len(), 2, "a held modifier must still get its release");
 	}
 }
+
+// risc-box patch (snapshot): see src/snapshot.rs.
+use snapshot::{De, Ser};
+
+impl VirtioInput {
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u32(self.device_features_sel);
+		w.u64(self.driver_features);
+		w.u32(self.driver_features_sel);
+		w.u32(self.queue_select);
+		w.u32(self.interrupt_status);
+		w.u32(self.status);
+		for q in &self.queues {
+			w.u32(q.num);
+			w.bool(q.ready);
+			w.u64(q.desc);
+			w.u64(q.driver);
+			w.u64(q.device);
+			w.u16(q.avail_cursor);
+			w.u16(q.used_index);
+		}
+		w.u8(self.cfg_select);
+		w.u8(self.cfg_subsel);
+		w.u32(self.pending.len() as u32);
+		for e in &self.pending {
+			w.u16(e.kind);
+			w.u16(e.code);
+			w.u32(e.value);
+		}
+	}
+
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.device_features_sel = r.u32()?;
+		self.driver_features = r.u64()?;
+		self.driver_features_sel = r.u32()?;
+		self.queue_select = r.u32()?;
+		self.interrupt_status = r.u32()?;
+		self.status = r.u32()?;
+		for q in self.queues.iter_mut() {
+			q.num = r.u32()?;
+			q.ready = r.bool()?;
+			q.desc = r.u64()?;
+			q.driver = r.u64()?;
+			q.device = r.u64()?;
+			q.avail_cursor = r.u16()?;
+			q.used_index = r.u16()?;
+		}
+		self.cfg_select = r.u8()?;
+		self.cfg_subsel = r.u8()?;
+		let n = r.u32()? as usize;
+		if n > 4096 {
+			return Err(format!("snapshot: virtio-input has {} pending events", n));
+		}
+		self.pending.clear();
+		for _ in 0..n {
+			let kind = r.u16()?;
+			let code = r.u16()?;
+			let value = r.u32()?;
+			self.pending.push_back(InputEvent { kind, code, value });
+		}
+		Ok(())
+	}
+}

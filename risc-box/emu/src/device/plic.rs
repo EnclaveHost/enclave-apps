@@ -269,3 +269,35 @@ impl Plic {
 		};
 	}
 }
+
+// risc-box patch (snapshot): see src/snapshot.rs.
+use snapshot::{De, Ser};
+
+impl Plic {
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u64(self.clock);
+		w.u32(self.irq);
+		w.u64(self.enabled);
+		w.u32(self.threshold);
+		w.raw(&self.ips);
+		for p in self.priorities.iter() {
+			w.u32(*p);
+		}
+		w.bool(self.needs_update_irq);
+	}
+
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.clock = r.u64()?;
+		self.irq = r.u32()?;
+		self.enabled = r.u64()?;
+		self.threshold = r.u32()?;
+		let n = self.ips.len();
+		let ips = r.take(n)?;
+		self.ips.copy_from_slice(ips);
+		for i in 0..self.priorities.len() {
+			self.priorities[i] = r.u32()?;
+		}
+		self.needs_update_irq = r.bool()?;
+		Ok(())
+	}
+}

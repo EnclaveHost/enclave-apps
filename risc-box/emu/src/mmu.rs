@@ -223,6 +223,27 @@ impl Mmu {
 		self.dtb[at..at + 4].copy_from_slice(&(self.ram_capacity as u32).to_be_bytes());
 	}
 
+	/// risc-box patch: replace the built-in device tree's `rng-seed` with
+	/// `seed` (64 bytes). The shipped blob carries one fixed seed — fine for a
+	/// deterministic benchmark, wrong for a fleet where every cold boot would
+	/// otherwise start the kernel's random pool from the same bytes. The
+	/// property is found by its first 16 bytes; returns false (blob untouched)
+	/// when a custom DTB without it has been installed.
+	pub fn seed_dtb_rng(&mut self, seed: &[u8; 64]) -> bool {
+		const HEAD: [u8; 16] = [
+			0x7a, 0xf3, 0x1c, 0x88, 0x4b, 0xe0, 0x92, 0xd5, 0x61, 0xac, 0x3f, 0x70, 0xc9, 0x12, 0x5e, 0xbb,
+		];
+		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(64))
+			.filter(|&i| self.dtb[i..i + 16] == HEAD)
+			.collect();
+		if hits.len() != 1 {
+			return false;
+		}
+		let at = hits[0];
+		self.dtb[at..at + 64].copy_from_slice(seed);
+		true
+	}
+
 	/// risc-box patch: rewrites the simple-framebuffer node's width/height/
 	/// stride so the display size is a deployment knob rather than a rebuild.
 	///
@@ -1477,5 +1498,177 @@ impl MemoryWrapper {
 
 	pub fn validate_address(&self, address: u64) -> bool {
 		self.memory.validate_address(address - DRAM_BASE)
+	}
+
+	// risc-box patch (snapshot): raw DRAM for the sparse codec. Writes made
+	// through `ram_mut` bypass the SMC snoop, so the caller bumps code_gen.
+	pub fn ram(&self) -> &[u8] {
+		self.memory.as_slice()
+	}
+
+	pub fn ram_mut(&mut self) -> &mut [u8] {
+		self.memory.as_mut_slice()
+	}
+}
+
+// risc-box patch (snapshot): the bus writes one section per device, plus
+// its own translation state, the DTB, RAM and the disk delta. See
+// src/snapshot.rs for the format and lib.rs for the META/identity checks
+// that gate a restore.
+use snapshot::{self, De, Ser};
+
+fn addressing_mode_code(m: &AddressingMode) -> u8 {
+	match m {
+		AddressingMode::None => 0,
+		AddressingMode::SV32 => 1,
+		AddressingMode::SV39 => 2,
+		AddressingMode::SV48 => 3
+	}
+}
+
+fn addressing_mode_from(v: u8) -> Result<AddressingMode, String> {
+	Ok(match v {
+		0 => AddressingMode::None,
+		1 => AddressingMode::SV32,
+		2 => AddressingMode::SV39,
+		3 => AddressingMode::SV48,
+		_ => return Err(format!("snapshot: bad addressing mode {}", v))
+	})
+}
+
+pub(crate) fn privilege_code(p: &PrivilegeMode) -> u8 {
+	match p {
+		PrivilegeMode::User => 0,
+		PrivilegeMode::Supervisor => 1,
+		PrivilegeMode::Reserved => 2,
+		PrivilegeMode::Machine => 3
+	}
+}
+
+pub(crate) fn privilege_from(v: u8) -> Result<PrivilegeMode, String> {
+	match v {
+		0..=3 => Ok(get_privilege_mode(v as u64)),
+		_ => Err(format!("snapshot: bad privilege mode {}", v))
+	}
+}
+
+impl Mmu {
+	pub fn snapshot_into(&self, s: &mut Ser, level: u8) -> snapshot::SnapshotStats {
+		let at = s.begin_section(b"MMU_");
+		s.u64(self.clock);
+		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
+		s.u64(self.ppn);
+		s.u8(addressing_mode_code(&self.addressing_mode));
+		s.u8(privilege_code(&self.privilege_mode));
+		s.u64(self.mstatus);
+		s.u64(self.ram_capacity);
+		s.end_section(at);
+
+		s.section(b"DTB_", &self.dtb);
+
+		let at = s.begin_section(b"CLNT");
+		self.clint.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"PLIC");
+		self.plic.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"UART");
+		self.uart.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"VBLK");
+		self.disk.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"VNET");
+		self.net.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"VINP");
+		self.input.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"VSND");
+		self.snd.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"VGPU");
+		self.gpu.snapshot(s);
+		s.end_section(at);
+		let at = s.begin_section(b"OPL_");
+		self.opl.snapshot(s);
+		s.end_section(at);
+
+		let at = s.begin_section(b"RAM_");
+		let ram = snapshot::encode_ram(self.memory.ram(), level, s);
+		s.end_section(at);
+
+		let at = s.begin_section(b"DDLT");
+		let blocks = self.disk.dirty_blocks();
+		let disk = &self.disk;
+		snapshot::encode_delta(&blocks, level, |b, out| disk.read_block(b, out), s);
+		s.end_section(at);
+
+		snapshot::SnapshotStats { ram, delta_blocks: blocks.len() }
+	}
+
+	/// Apply one section. Ok(false) = not a section this layer knows.
+	pub fn restore_section(&mut self, tag: &[u8; 4], payload: &[u8], stats: &mut snapshot::RestoreStats) -> Result<bool, String> {
+		let mut r = De::new(payload);
+		match tag {
+			b"MMU_" => {
+				self.clock = r.u64()?;
+				self.xlen = match r.u8()? {
+					32 => Xlen::Bit32,
+					64 => Xlen::Bit64,
+					v => return Err(format!("snapshot: bad xlen {}", v))
+				};
+				self.ppn = r.u64()?;
+				self.addressing_mode = addressing_mode_from(r.u8()?)?;
+				self.privilege_mode = privilege_from(r.u8()?)?;
+				self.mstatus = r.u64()?;
+				self.ram_capacity = r.u64()?;
+				if self.ram_capacity > self.memory.ram().len() as u64 {
+					return Err(format!(
+						"snapshot: MMU says {} bytes of RAM, {} allocated",
+						self.ram_capacity, self.memory.ram().len()
+					));
+				}
+				// every translation cache is derived state: start empty
+				self.clear_page_cache();
+				self.tlb_flush();
+				self.memory.bump_code_gen();
+			},
+			b"DTB_" => {
+				if payload.len() > self.dtb.len() {
+					return Err(format!("snapshot: DTB is {} bytes, window is {}", payload.len(), self.dtb.len()));
+				}
+				self.dtb[..payload.len()].copy_from_slice(payload);
+				for b in self.dtb[payload.len()..].iter_mut() {
+					*b = 0;
+				}
+				return Ok(true);
+			},
+			b"CLNT" => self.clint.restore(&mut r)?,
+			b"PLIC" => self.plic.restore(&mut r)?,
+			b"UART" => self.uart.restore(&mut r)?,
+			b"VBLK" => self.disk.restore(&mut r)?,
+			b"VNET" => self.net.restore(&mut r)?,
+			b"VINP" => self.input.restore(&mut r)?,
+			b"VSND" => self.snd.restore(&mut r)?,
+			b"VGPU" => self.gpu.restore(&mut r)?,
+			b"OPL_" => self.opl.restore(&mut r)?,
+			b"RAM_" => {
+				let st = snapshot::decode_ram(payload, self.memory.ram_mut())?;
+				self.memory.bump_code_gen();
+				stats.ram_pages_kept = st.pages_kept;
+				stats.ram_pages_total = st.pages_total;
+				return Ok(true);
+			},
+			b"DDLT" => {
+				let disk = &mut self.disk;
+				let n = snapshot::decode_delta(payload, |b, data| disk.write_block(b, data))?;
+				stats.delta_blocks = n as usize;
+				return Ok(true);
+			},
+			_ => return Ok(false)
+		}
+		r.finish(&String::from_utf8_lossy(tag))?;
+		Ok(true)
 	}
 }

@@ -15,6 +15,7 @@ const PROGRAM_MEMORY_CAPACITY: u64 = 1024 * 1024 * 512; // default; see setup_ra
 // wasmtime 49+ engine: 47 refuses growth past ~1.5 GiB total.
 
 extern crate fnv;
+extern crate miniz_oxide; // risc-box patch: snapshot deflate
 
 use self::fnv::FnvHashMap;
 
@@ -26,12 +27,41 @@ pub mod memory;
 pub mod mmu;
 pub mod elf_analyzer;
 pub mod device;
+pub mod snapshot; // risc-box patch: whole-machine snapshot/restore
 #[cfg(feature = "jit")]
 pub mod jit; // risc-box patch: PLATFORM-JIT.md translator (feature-gated)
 
 use cpu::{Cpu, Xlen};
 use elf_analyzer::{ElfAnalyzer};
 use terminal::Terminal;
+use snapshot::{De, Ser}; // risc-box patch
+
+/// risc-box patch (snapshot): what a snapshot or restore reports back.
+pub struct SnapshotInfo {
+	pub bytes: usize,
+	pub ram_bytes: u64,
+	pub ram_pages_kept: u64,
+	pub ram_pages_total: u64,
+	pub delta_blocks: usize,
+	pub taken_unix: u64,
+	pub identity: String,
+	pub emu_version: String,
+}
+
+/// risc-box patch (snapshot): the META section, readable without restoring.
+pub struct SnapshotMeta {
+	pub identity: String,
+	pub ram_bytes: u64,
+	pub disk_len: u64,
+	pub taken_unix: u64,
+	pub emu_version: String,
+}
+
+/// The sections a restore must see before it will hand the machine back.
+const REQUIRED_SECTIONS: [&[u8; 4]; 14] = [
+	b"CPU_", b"MMU_", b"DTB_", b"CLNT", b"PLIC", b"UART", b"VBLK", b"VNET",
+	b"VINP", b"VSND", b"VGPU", b"OPL_", b"RAM_", b"DDLT",
+];
 
 /// RISC-V emulator. It emulates RISC-V CPU and peripheral devices.
 ///
@@ -343,6 +373,12 @@ impl Emulator {
 		self.cpu.get_mut_mmu().get_mut_clint().set_wall_clock(on);
 	}
 
+	/// risc-box patch: give this boot its own kernel entropy seed (see
+	/// `Mmu::seed_dtb_rng`). Call after any `setup_dtb`, before the guest runs.
+	pub fn seed_rng(&mut self, seed: &[u8; 64]) -> bool {
+		self.cpu.get_mut_mmu().seed_dtb_rng(seed)
+	}
+
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
 		self.cpu.get_mut_mmu().init_dtb(content);
 	}
@@ -537,6 +573,122 @@ impl Emulator {
 	pub fn gpu_take_dirty(&mut self) -> Option<(u32, u32, u32, u32)> {
 		self.cpu.get_mut_mmu().get_mut_gpu().take_dirty()
 			.map(|r| (r.x, r.y, r.width, r.height))
+	}
+
+	/// risc-box patch (snapshot): serialize the whole machine. `identity`
+	/// is the caller's name for the images this machine was booted from (the
+	/// app hashes the objects it fetched); a restore must present the same
+	/// string, which is what binds the disk delta inside to the base image
+	/// it was taken against. `level` is the deflate level (1 fast .. 9 small).
+	pub fn snapshot(&self, identity: &str, level: u8) -> (Vec<u8>, SnapshotInfo) {
+		let taken = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let ram = self.ram_bytes.unwrap_or(PROGRAM_MEMORY_CAPACITY);
+		let disk_len = self.cpu.get_mmu().get_disk().disk_len() as u64;
+		let mut s = Ser::with_capacity(32 << 20);
+		s.header();
+		let at = s.begin_section(b"META");
+		s.str(identity);
+		s.u64(ram);
+		s.u64(disk_len);
+		s.u64(taken);
+		s.str(env!("CARGO_PKG_VERSION"));
+		s.end_section(at);
+		let stats = self.cpu.snapshot_into(&mut s, level);
+		let bytes = s.buf.len();
+		(s.buf, SnapshotInfo {
+			bytes,
+			ram_bytes: ram,
+			ram_pages_kept: stats.ram.pages_kept,
+			ram_pages_total: stats.ram.pages_total,
+			delta_blocks: stats.delta_blocks,
+			taken_unix: taken,
+			identity: identity.to_string(),
+			emu_version: env!("CARGO_PKG_VERSION").to_string(),
+		})
+	}
+
+	/// risc-box patch (snapshot): read a snapshot's META without restoring.
+	pub fn snapshot_meta(data: &[u8]) -> Result<SnapshotMeta, String> {
+		let secs = snapshot::sections(data)?;
+		let (tag, payload) = secs.first().ok_or("snapshot: no sections")?;
+		if tag != b"META" {
+			return Err("snapshot: first section is not META".into());
+		}
+		let mut r = De::new(payload);
+		let identity = r.str()?.to_string();
+		let ram_bytes = r.u64()?;
+		let disk_len = r.u64()?;
+		let taken_unix = r.u64()?;
+		let emu_version = r.str()?.to_string();
+		r.finish("META")?;
+		Ok(SnapshotMeta { identity, ram_bytes, disk_len, taken_unix, emu_version })
+	}
+
+	/// risc-box patch (snapshot): resume a machine from `snapshot()` output.
+	///
+	/// Call on a fresh emulator prepared exactly as for a cold boot up to but
+	/// NOT including `setup_program` — RAM size, framebuffer, clock source
+	/// and, crucially, `setup_filesystem` with the same base image — then
+	/// this instead of `setup_program`. The kernel image is not needed: the
+	/// guest's memory already holds it. Refuses (leaving the caller to cold
+	/// boot) when the identity, RAM size or base disk differ from the
+	/// snapshot's, or when the format has drifted.
+	pub fn restore(&mut self, data: &[u8], identity: &str) -> Result<SnapshotInfo, String> {
+		let meta = Self::snapshot_meta(data)?;
+		if meta.identity != identity {
+			return Err(format!(
+				"snapshot was taken against different images (its identity {:?}, this machine's {:?})",
+				meta.identity, identity
+			));
+		}
+		let ram = self.ram_bytes.unwrap_or(PROGRAM_MEMORY_CAPACITY);
+		if meta.ram_bytes != ram {
+			return Err(format!(
+				"snapshot has {} MiB of guest RAM but this machine is configured for {} MiB",
+				meta.ram_bytes >> 20, ram >> 20
+			));
+		}
+		let disk_len = self.cpu.get_mmu().get_disk().disk_len() as u64;
+		if meta.disk_len != disk_len {
+			return Err(format!(
+				"snapshot expects a {}-byte base disk but {} bytes are loaded",
+				meta.disk_len, disk_len
+			));
+		}
+		let secs = snapshot::sections(data)?;
+		self.is_test = false;
+		self.tohost_addr = 0;
+		self.cpu.update_xlen(Xlen::Bit64);
+		self.cpu.get_mut_mmu().init_memory(ram);
+		let mut seen: Vec<[u8; 4]> = Vec::new();
+		let mut stats = snapshot::RestoreStats::default();
+		for (tag, payload) in secs.iter().skip(1) {
+			if !self.cpu.restore_section(tag, payload, &mut stats)? {
+				return Err(format!(
+					"snapshot: unknown section {:?} (written by a newer emulator?)",
+					String::from_utf8_lossy(tag)
+				));
+			}
+			seen.push(*tag);
+		}
+		for req in REQUIRED_SECTIONS.iter() {
+			if !seen.contains(req) {
+				return Err(format!("snapshot: missing section {:?}", String::from_utf8_lossy(*req)));
+			}
+		}
+		Ok(SnapshotInfo {
+			bytes: data.len(),
+			ram_bytes: ram,
+			ram_pages_kept: stats.ram_pages_kept,
+			ram_pages_total: stats.ram_pages_total,
+			delta_blocks: stats.delta_blocks,
+			taken_unix: meta.taken_unix,
+			identity: meta.identity,
+			emu_version: meta.emu_version,
+		})
 	}
 
 	pub fn get_cpu(&self) -> &Cpu {

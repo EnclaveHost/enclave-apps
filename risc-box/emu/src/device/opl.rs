@@ -98,6 +98,39 @@ impl Opl {
     }
 }
 
+// risc-box patch (snapshot): see src/snapshot.rs.
+use snapshot::{De, Ser};
+
+impl Opl {
+    pub fn snapshot(&self, w: &mut Ser) {
+        w.u16(self.index);
+        w.u32(self.pending.len() as u32);
+        for &(i, v) in self.pending.iter() {
+            w.u16(i);
+            w.u8(v);
+        }
+        w.u64(self.writes);
+        w.u64(self.dropped);
+    }
+
+    pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+        self.index = r.u16()?;
+        let n = r.u32()? as usize;
+        if n > MAX_PENDING {
+            return Err(format!("snapshot: opl pending {} exceeds {}", n, MAX_PENDING));
+        }
+        self.pending.clear();
+        for _ in 0..n {
+            let i = r.u16()?;
+            let v = r.u8()?;
+            self.pending.push_back((i, v));
+        }
+        self.writes = r.u64()?;
+        self.dropped = r.u64()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

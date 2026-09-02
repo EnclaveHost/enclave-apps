@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "risc-box"
-version = "0.6.43"
+version = "0.6.46"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1442,6 +1442,7 @@ name = "riscv_emu_rust"
 version = "0.2.0"
 dependencies = [
  "fnv",
+ "miniz_oxide",
 ]
 
 [[package]]

@@ -1177,3 +1177,165 @@ mod tests {
                    "VIRGL must not be advertised without a renderer behind it");
     }
 }
+
+// risc-box patch (snapshot): see src/snapshot.rs. The host-side resource
+// copies and the accumulated screen ARE the picture — X only ever
+// transfers what it dirtied, so a restore that dropped them would show a
+// black desktop until every region happened to be repainted.
+use snapshot::{De, Ser};
+
+/// Largest resource edge the restore will allocate for (a hostile or
+/// corrupt object must not ask for gigabytes).
+const MAX_EDGE: u32 = 16384;
+
+impl VirtioGpu {
+    pub fn snapshot(&self, w: &mut Ser) {
+        w.u32(self.device_features_sel);
+        w.u64(self.driver_features);
+        w.u32(self.driver_features_sel);
+        w.u32(self.queue_select);
+        w.u32(self.interrupt_status);
+        w.u32(self.status);
+        for q in &self.queues {
+            w.u32(q.num);
+            w.bool(q.ready);
+            w.u64(q.desc);
+            w.u64(q.driver);
+            w.u64(q.device);
+            w.u16(q.avail_cursor);
+            w.u16(q.used_index);
+        }
+        let mut ids: Vec<&u32> = self.resources.keys().collect();
+        ids.sort();
+        w.u32(ids.len() as u32);
+        for id in ids {
+            let res = &self.resources[id];
+            w.u32(*id);
+            w.u32(res.width);
+            w.u32(res.height);
+            w.u32(res.backing.len() as u32);
+            for &(addr, len) in &res.backing {
+                w.u64(addr);
+                w.u32(len);
+            }
+            w.bytes(&res.pixels);
+            w.bool(res.pulled);
+        }
+        w.u32(self.scanout_resource);
+        w.bytes(&self.screen);
+        let rects = [Some(self.scanout_rect), self.dirty];
+        for r in rects {
+            match r {
+                Some(r) => {
+                    w.bool(true);
+                    w.u32(r.x);
+                    w.u32(r.y);
+                    w.u32(r.width);
+                    w.u32(r.height);
+                }
+                None => w.bool(false),
+            }
+        }
+        w.u64(self.flush_bytes);
+        w.u64(self.flushes);
+        w.u32(self.display_width);
+        w.u32(self.display_height);
+        match &self.cursor {
+            Some(c) => {
+                w.bool(true);
+                w.u32(c.resource_id);
+                w.i64(c.x);
+                w.i64(c.y);
+                w.i64(c.hot_x);
+                w.i64(c.hot_y);
+            }
+            None => w.bool(false),
+        }
+        w.u64(self.cursor_updates);
+    }
+
+    pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+        self.device_features_sel = r.u32()?;
+        self.driver_features = r.u64()?;
+        self.driver_features_sel = r.u32()?;
+        self.queue_select = r.u32()?;
+        self.interrupt_status = r.u32()?;
+        self.status = r.u32()?;
+        for q in self.queues.iter_mut() {
+            q.num = r.u32()?;
+            q.ready = r.bool()?;
+            q.desc = r.u64()?;
+            q.driver = r.u64()?;
+            q.device = r.u64()?;
+            q.avail_cursor = r.u16()?;
+            q.used_index = r.u16()?;
+        }
+        let n = r.u32()? as usize;
+        if n > 4096 {
+            return Err(format!("snapshot: virtio-gpu has {} resources", n));
+        }
+        self.resources.clear();
+        for _ in 0..n {
+            let id = r.u32()?;
+            let width = r.u32()?;
+            let height = r.u32()?;
+            if width > MAX_EDGE || height > MAX_EDGE {
+                return Err(format!("snapshot: gpu resource {} is {}x{}", id, width, height));
+            }
+            let nb = r.u32()? as usize;
+            if nb > 1 << 20 {
+                return Err(format!("snapshot: gpu resource {} has {} backing entries", id, nb));
+            }
+            let mut backing = Vec::with_capacity(nb);
+            for _ in 0..nb {
+                let addr = r.u64()?;
+                let len = r.u32()?;
+                backing.push((addr, len));
+            }
+            let pixels = r.bytes()?;
+            if !pixels.is_empty() && pixels.len() != width as usize * height as usize * BPP {
+                return Err(format!("snapshot: gpu resource {} pixel buffer is {} bytes for {}x{}", id, pixels.len(), width, height));
+            }
+            let pulled = r.bool()?;
+            self.resources.insert(id, Resource { width, height, backing, pixels: pixels.to_vec(), pulled });
+        }
+        self.scanout_resource = r.u32()?;
+        let screen = r.bytes()?;
+        if screen.len() > (MAX_EDGE as usize) * (MAX_EDGE as usize) * BPP {
+            return Err("snapshot: gpu screen too large".into());
+        }
+        self.screen = screen.to_vec();
+        let mut rects: [Option<Rect>; 2] = [None, None];
+        for slot in rects.iter_mut() {
+            *slot = match r.bool()? {
+                true => {
+                    let x = r.u32()?;
+                    let y = r.u32()?;
+                    let width = r.u32()?;
+                    let height = r.u32()?;
+                    Some(Rect { x, y, width, height })
+                }
+                false => None,
+            };
+        }
+        self.scanout_rect = rects[0].unwrap_or_default();
+        self.dirty = rects[1];
+        self.flush_bytes = r.u64()?;
+        self.flushes = r.u64()?;
+        self.display_width = r.u32()?;
+        self.display_height = r.u32()?;
+        self.cursor = match r.bool()? {
+            true => {
+                let resource_id = r.u32()?;
+                let x = r.i64()?;
+                let y = r.i64()?;
+                let hot_x = r.i64()?;
+                let hot_y = r.i64()?;
+                Some(Cursor { resource_id, x, y, hot_x, hot_y })
+            }
+            false => None,
+        };
+        self.cursor_updates = r.u64()?;
+        Ok(())
+    }
+}

@@ -210,3 +210,39 @@ impl Uart {
 		&mut self.terminal
 	}
 }
+
+// risc-box patch (snapshot): see src/snapshot.rs. The terminal is the
+// host's and is not part of the machine; a restored UART talks to whatever
+// terminal the fresh emulator was built with.
+use snapshot::{De, Ser};
+
+impl Uart {
+	pub fn snapshot(&self, w: &mut Ser) {
+		w.u64(self.clock);
+		w.u8(self.rbr);
+		w.u8(self.thr);
+		w.u8(self.ier);
+		w.u8(self.iir);
+		w.u8(self.lcr);
+		w.u8(self.mcr);
+		w.u8(self.lsr);
+		w.u8(self.scr);
+		w.bool(self.thre_ip);
+		w.bool(self.interrupting);
+	}
+
+	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		self.clock = r.u64()?;
+		self.rbr = r.u8()?;
+		self.thr = r.u8()?;
+		self.ier = r.u8()?;
+		self.iir = r.u8()?;
+		self.lcr = r.u8()?;
+		self.mcr = r.u8()?;
+		self.lsr = r.u8()?;
+		self.scr = r.u8()?;
+		self.thre_ip = r.bool()?;
+		self.interrupting = r.bool()?;
+		Ok(())
+	}
+}

@@ -716,6 +716,14 @@ impl Server {
                 ConnState::Closing => !conn.wbuf.is_empty(),
                 ConnState::Sse { .. } => true,
                 ConnState::Http { since, reading_body } => {
+                    // A held request is being answered by a handler that is
+                    // still running (a long /exec, a parked long-poll): the
+                    // socket is quiet by design, not abandoned. Reaping it as
+                    // idle would lose the response; a peer that really left
+                    // is caught by WRITE_STALL once the answer is queued.
+                    if conn.held.is_some() {
+                        return true;
+                    }
                     let idle = now.duration_since(conn.last_activity);
                     if conn.rbuf.is_empty() && !reading_body {
                         idle < IDLE_KEEPALIVE
