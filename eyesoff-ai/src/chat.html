@@ -4873,6 +4873,15 @@ function groupOn(name) { return state.on[name] === true; }
 // their own on the wire; these are what `tools` carries)
 function toolGroups() { return state.groups.filter((g) => g.kind === "http" || g.kind === "mcp"); }
 function anyToolsOn() { return toolGroups().some((g) => groupOn(g.name)); }
+// the switch fields a chat body carries, for the warm-up to park the prefix
+// THIS page's chats will match (see /warmup?switches=)
+function switchesForWarm() {
+  const o = { web_search: state.webMode === "off" ? "off" : "auto" };
+  if (state.image && state.image.enabled) o.image_gen = state.imageOn ? "auto" : "off";
+  const t = toolsField();
+  if (t !== undefined) o.tools = t;
+  return o;
+}
 function toolsField() {
   const gs = toolGroups();
   if (!gs.length) return undefined;
@@ -5198,6 +5207,7 @@ async function warm() {
   const q = [];
   if (model) q.push("model=" + encodeURIComponent(model));
   if (state.target === "cpu") q.push("target=cpu");
+  q.push("switches=" + encodeURIComponent(JSON.stringify(switchesForWarm())));
   try {
     const res = await fetch("warmup" + (q.length ? "?" + q.join("&") : ""),
       { signal: AbortSignal.timeout(180000) });
@@ -5271,7 +5281,8 @@ async function warmLadder() {
     rows[m.name] = li;
     bootList.appendChild(li);
   }
-  const q = state.target === "cpu" ? "&target=cpu" : "";
+  const q = (state.target === "cpu" ? "&target=cpu" : "")
+    + "&switches=" + encodeURIComponent(JSON.stringify(switchesForWarm()));
   const t0 = Date.now();
   let warmed = 0, unfitCount = 0, largestOk = null;
   const markPending = (m, li, why, sub) => {

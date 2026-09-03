@@ -9312,12 +9312,26 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 /// the parking itself never stops for a reader that left. An engine without
 /// boundary parks, or a prompt with no mark, is a no-op reported as such. A
 /// later call finds the parks standing and returns in milliseconds.
-fn warm_prefix(cfg: &AppConfig, mode: &str, tick: &dyn Fn(&str) -> bool) -> Result<serde_json::Value, String> {
+fn warm_prefix(
+    cfg: &AppConfig,
+    mode: &str,
+    switches: &serde_json::Value,
+    tick: &dyn Fn(&str) -> bool,
+) -> Result<serde_json::Value, String> {
     let t0 = now_ms();
     let tok = make_tok(cfg, "auto", t0)?;
-    let creq: ChatReq = serde_json::from_value(serde_json::json!({
-        "messages": [{ "role": "user", "content": "warm" }]
-    })).map_err(|e| e.to_string())?;
+    // the turn this warm-up stands in for: the caller's switches (the same
+    // fields a /chat body carries - web_search, image_gen, tools), so a page
+    // parks the prefix ITS chats will match, not only the deployment default
+    let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "warm" }] });
+    if let (Some(dst), Some(src)) = (req.as_object_mut(), switches.as_object()) {
+        for k in ["web_search", "image_gen", "tools", "tool_choice", "model"] {
+            if let Some(v) = src.get(k) {
+                dst.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    let creq: ChatReq = serde_json::from_value(req).map_err(|e| e.to_string())?;
     let off = creq.off_groups(cfg);
     let mut b = builtins_for(cfg, &creq, &off);
     // what a fresh answer is offered at depth 0 (AgentTree::slots)
@@ -9424,9 +9438,16 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     // by default a warmed model also gets its prefix parked, so the first
     // chat after a boot or a page load starts from it
     let prefix = query.split('&').find_map(|kv| kv.strip_prefix("prefix=")) != Some("0");
+    // ?switches=<url-encoded JSON of the chat body's switch fields>: park the
+    // prefix those settings render, so the page's warm-up serves the page
+    let switches: serde_json::Value = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("switches="))
+        .and_then(|v| serde_json::from_str(&percent_decode_query(v)).ok())
+        .unwrap_or(serde_json::Value::Null);
     let park = |cfg: &AppConfig, tick: &dyn Fn(&str) -> bool| -> serde_json::Value {
         if !prefix { return serde_json::Value::Null; }
-        match warm_prefix(cfg, mode, tick) {
+        match warm_prefix(cfg, mode, &switches, tick) {
             Ok(v) => v,
             Err(e) => serde_json::json!({ "parked": false, "error": e }),
         }
