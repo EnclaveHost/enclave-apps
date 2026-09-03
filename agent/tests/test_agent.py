@@ -80,7 +80,7 @@ class AgentLoopTests(unittest.TestCase):
 
 
 class NotebookToolTests(unittest.TestCase):
-    """The six jot tools against a stub deployment: names travel percent-
+    """The five jot tools against a stub deployment: names travel percent-
     encoded, the key rides as a bearer, errors come back as text."""
 
     @classmethod
@@ -102,17 +102,16 @@ class NotebookToolTests(unittest.TestCase):
     def notes(self):
         return self.spaces.setdefault("", {})
 
-    def test_write_read_list_search_delete(self):
+    def test_write_read_search_delete(self):
         t = self.tools
-        self.assertEqual(t["notes_list"].invoke({}), "(no notes)")
+        self.assertNotIn("notes_list", t, "listing is not a tool; search is the way in")
+        self.assertTrue(t["notes_search"].invoke({"query": "anything"}).startswith("no matches"))
         self.assertEqual(t["notes_write"].invoke({"name": "projects/enclave.md",
                                                   "content": "# Enclave\nneedle here\n"}),
                          "saved projects/enclave.md (22 B)")
         self.assertEqual(self.notes["projects/enclave.md"], "# Enclave\nneedle here\n")
         self.assertEqual(t["notes_read"].invoke({"name": "projects/enclave.md"}),
                          "# Enclave\nneedle here\n")
-        self.assertTrue(t["notes_list"].invoke({}).startswith("projects/enclave.md  (22 B"))
-        self.assertEqual(t["notes_list"].invoke({"prefix": "zzz"}), "(no notes under zzz)")
         self.assertEqual(t["notes_search"].invoke({"query": "NEEDLE"}),
                          "projects/enclave.md:2: needle here")
         self.assertTrue(t["notes_search"].invoke({"query": "absent"}).startswith("no matches"))
@@ -136,17 +135,17 @@ class NotebookToolTests(unittest.TestCase):
 
     def test_a_named_user_writes_into_their_own_space(self):
         self.alice["notes_write"].invoke({"name": "mine.md", "content": "alice"})
-        self.assertEqual(self.bob["notes_list"].invoke({}), "(no notes)")
+        self.assertTrue(self.bob["notes_search"].invoke({"query": "alice"}).startswith("no matches"))
         self.assertEqual(self.bob["notes_read"].invoke({"name": "mine.md"}), "error: no such note")
         self.assertEqual(self.alice["notes_read"].invoke({"name": "mine.md"}), "alice")
         self.assertEqual(set(self.spaces), {"0x" + "a" * 40, "acct_bob"})
 
     def test_wrong_key_is_an_error_string_not_an_exception(self):
-        self.assertEqual(self.bad["notes_list"].invoke({}), "error: unauthorized")
+        self.assertEqual(self.bad["notes_search"].invoke({"query": "x"}), "error: unauthorized")
 
     def test_unreachable_notebook_is_an_error_string(self):
         dead = {t.name: t for t in make_notes_tools(NotesClient("http://127.0.0.1:9", "k"))}
-        self.assertTrue(dead["notes_list"].invoke({}).startswith("error: notebook unreachable"))
+        self.assertTrue(dead["notes_search"].invoke({"query": "x"}).startswith("error: notebook unreachable"))
 
 
 if __name__ == "__main__":

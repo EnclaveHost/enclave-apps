@@ -52,11 +52,14 @@
 //!   PUT    /api/notes/<name>          write: {content, ifMatch?} or a text/* body (POST works too)
 //!   POST   /api/notes/<name>/append   {content}: append a paragraph (conditional on the read ETag)
 //!   DELETE /api/notes/<name>          delete (POST /api/notes/<name>/delete works too)
-//!   GET    /api/search?q=&prefix=&limit=  case-insensitive substring search over note bodies
+//!   GET    /api/search?q=&prefix=&limit=  hybrid search: BM25 + vectors, fused (see index.rs)
+//!   POST   /api/reindex               rebuild this notebook's search index from scratch
 #[allow(warnings)]
 mod bindings;
 mod crypt;
+mod embed;
 mod http;
+mod index;
 mod s3;
 mod sso;
 
@@ -77,10 +80,13 @@ const MAX_BODY: usize = 2 * MAX_NOTE + 64 * 1024;
 const MAX_NAME: usize = 200;
 const LIST_DEFAULT: usize = 200;
 const LIST_MAX: usize = 1000;
-const SEARCH_SCAN: usize = 200;
-const SEARCH_SKIP_OVER: u64 = 256 * 1024;
-const SEARCH_DEFAULT: usize = 20;
-const SEARCH_MAX: usize = 100;
+const SEARCH_DEFAULT: usize = 8;
+const SEARCH_MAX: usize = 50;
+/// notes (re)indexed per search when the listing disagrees with the index;
+/// the rest wait for the next search, and the response says so
+const REFRESH_PER_SEARCH: usize = 25;
+/// notes a full rebuild indexes in one request
+const REINDEX_MAX: usize = 400;
 
 // ---- config ----------------------------------------------------------------
 
@@ -320,12 +326,20 @@ fn valid_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_NAME || name.starts_with('/') || name.ends_with('/') {
         return false;
     }
+    if name == ".jot" || name.starts_with(".jot/") {
+        return false; // the app's own objects (the search index) live here
+    }
     name.split('/').all(|seg| {
         !seg.is_empty()
             && seg != "."
             && seg != ".."
             && seg.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
     })
+}
+
+/// Is this key, relative to the namespace, a note (not the app's own)?
+fn is_note_key(rel: &str) -> bool {
+    !rel.is_empty() && !rel.ends_with('/') && rel != ".jot" && !rel.starts_with(".jot/")
 }
 
 /// constant-time equality for the API key
@@ -492,6 +506,49 @@ impl<'a> Store<'a> {
         Ok(Some(Note { text, etag: f.etag, modified: f.modified }))
     }
 
+    /// The notebook's search index and the ETag it was read at (None = no
+    /// index yet).
+    fn load_index(&self, e: &embed::Embedder) -> Result<(index::Index, Option<String>), s3::S3Error> {
+        match self.fetch(&self.key(index::INDEX_NAME))? {
+            Some(n) => Ok((index::Index::parse(&n.text, embed::MODEL, e.dim()), Some(n.etag))),
+            None => Ok((index::Index::empty(embed::MODEL, e.dim()), None)),
+        }
+    }
+
+    /// Write the index back, conditional on the ETag it was read at, so two
+    /// requests updating it at once cannot silently drop each other's work:
+    /// the loser gets 412 and its notes are picked up by the next reconcile.
+    fn save_index(&self, idx: &index::Index, etag: Option<&str>) -> Result<(), s3::S3Error> {
+        let bytes = serde_json::to_vec(idx).map_err(|e| s3::S3Error::Transport(e.to_string()))?;
+        self.store(&self.key(index::INDEX_NAME), "index.json", &bytes, etag).map(|_| ())
+    }
+
+    /// Bring one note's index entry up to date with the text just written
+    /// (or drop it). Best effort: the note is already stored, and a failure
+    /// here is repaired by the next search's reconcile.
+    fn index_note(&self, name: &str, etag: &str, text: Option<&str>) {
+        let Ok(e) = embed::Embedder::new() else { return };
+        for _attempt in 0..2 {
+            let Ok((mut idx, idx_etag)) = self.load_index(&e) else { return };
+            match text {
+                Some(t) => idx.put_note(name, etag, t, &e),
+                None => {
+                    if !idx.remove(name) {
+                        return;
+                    }
+                }
+            }
+            match self.save_index(&idx, idx_etag.as_deref()) {
+                Ok(()) => return,
+                Err(s3::S3Error::Http(412, _)) => continue, // lost a race; reread and retry once
+                Err(e) => {
+                    eprintln!("[jot] index update for {name} failed: {}", e.message());
+                    return;
+                }
+            }
+        }
+    }
+
     /// Seal (when configured) and PUT one note.
     fn store(&self, key: &str, name: &str, text: &[u8], if_match: Option<&str>) -> Result<String, s3::S3Error> {
         match &self.cipher {
@@ -525,6 +582,7 @@ fn handle_status(out: ResponseOutparam, cfg: &Config, req: &IncomingRequest) {
         "readOnly": cfg.read_only,
         "users": cfg.sso.is_some(),
         "encrypted": cfg.master_key.is_some(),
+        "search": { "method": "hybrid: bm25 + vectors (rrf)", "model": embed::MODEL },
     });
     if let Some(e) = &cfg.error {
         v["error"] = serde_json::json!(e);
@@ -561,16 +619,15 @@ fn handle_tools(out: ResponseOutparam, origin: &str, users: bool) {
         serde_json::json!({ "type": "function", "function": { "name": name, "description": desc,
             "parameters": { "type": "object", "properties": props, "required": required } } })
     };
+    let search_desc = "Search the notebook by meaning and by keyword (hybrid: vector similarity plus BM25, fused). Returns the best-matching passage of each relevant note with its name and line; read the note for the rest. Call this first when the user refers to earlier work, a preference, a project, or asks what you remember.";
     let openai = vec![
-        f("notes_list", "List the notes in the notebook (name, size, last modified). Call this first when you are not sure what has been written down.",
-          serde_json::json!({ "prefix": prefix_p }), &[]),
         f("notes_read", "Read one note's full text by name.", serde_json::json!({ "name": name_p }), &["name"]),
         f("notes_write", "Create or replace a note. Use notes_append to add to an existing note without rewriting it.",
           serde_json::json!({ "name": name_p, "content": content_p }), &["name", "content"]),
         f("notes_append", "Append a paragraph to a note (creating it if needed). The right verb for logging something you learned.",
           serde_json::json!({ "name": name_p, "content": content_p }), &["name", "content"]),
-        f("notes_search", "Case-insensitive substring search across all note bodies; returns matching lines with their note names.",
-          serde_json::json!({ "query": { "type": "string", "description": "text to look for" }, "prefix": prefix_p }), &["query"]),
+        f("notes_search", search_desc,
+          serde_json::json!({ "query": { "type": "string", "description": "what to look for, as a question or a few words" }, "prefix": prefix_p }), &["query"]),
         f("notes_delete", "Delete a note by name.", serde_json::json!({ "name": name_p }), &["name"]),
     ];
     let h = |name: &str, desc: &str, method: &str, url: &str, params: serde_json::Value, required: &[&str], body: Option<serde_json::Value>| {
@@ -588,11 +645,10 @@ fn handle_tools(out: ResponseOutparam, origin: &str, users: bool) {
         e
     };
     let eyesoff = serde_json::json!({ "tools": { "http": [
-        h("notes_list", "List the notes in the notebook (name, size, last modified).", "GET", "/api/notes", serde_json::json!({ "prefix": prefix_p }), &[], None),
         h("notes_read", "Read one note's full text by name.", "GET", "/api/notes/{name}", serde_json::json!({ "name": name_p }), &["name"], None),
         h("notes_write", "Create or replace a note.", "PUT", "/api/notes/{name}", serde_json::json!({ "name": name_p, "content": content_p }), &["name", "content"], Some(serde_json::json!({ "content": "$content" }))),
         h("notes_append", "Append a paragraph to a note, creating it if needed.", "POST", "/api/notes/{name}/append", serde_json::json!({ "name": name_p, "content": content_p }), &["name", "content"], Some(serde_json::json!({ "content": "$content" }))),
-        h("notes_search", "Case-insensitive substring search across note bodies.", "GET", "/api/search", serde_json::json!({ "q": { "type": "string", "description": "text to look for" }, "prefix": prefix_p }), &["q"], None),
+        h("notes_search", search_desc, "GET", "/api/search", serde_json::json!({ "q": { "type": "string", "description": "what to look for, as a question or a few words" }, "prefix": prefix_p }), &["q"], None),
         h("notes_delete", "Delete a note by name.", "DELETE", "/api/notes/{name}", serde_json::json!({ "name": name_p }), &["name"], None),
     ] } });
     json(out, 200, serde_json::json!({
@@ -616,7 +672,7 @@ fn handle_list(out: ResponseOutparam, store: &Store, q: &[(String, String)]) {
         Ok((objects, truncated)) => {
             let notes: Vec<serde_json::Value> = objects
                 .iter()
-                .filter(|o| !o.key.ends_with('/'))
+                .filter(|o| is_note_key(store.name_of(&o.key)))
                 .map(|o| serde_json::json!({
                     "name": store.name_of(&o.key), "size": o.size,
                     "modified": o.modified, "etag": o.etag }))
@@ -661,7 +717,10 @@ fn handle_write(out: ResponseOutparam, store: &Store, name: &str, content: &str,
         return json_err(out, 413, "a note caps at 1 MiB");
     }
     match store.store(&store.key(name), name, content.as_bytes(), if_match) {
-        Ok(etag) => json(out, 200, serde_json::json!({ "ok": true, "name": name, "size": content.len(), "etag": etag })),
+        Ok(etag) => {
+            store.index_note(name, &etag, Some(content));
+            json(out, 200, serde_json::json!({ "ok": true, "name": name, "size": content.len(), "etag": etag }))
+        }
         Err(s3::S3Error::Http(412, _)) => json_err(out, 412, "the note changed since it was read (ETag mismatch); read it again and retry"),
         Err(e) => s3_err(out, e),
     }
@@ -688,7 +747,10 @@ fn handle_append(out: ResponseOutparam, store: &Store, name: &str, content: &str
     // lose nothing, one of them gets a 409 and retries
     let cond = etag.as_deref().filter(|e| !e.is_empty());
     match store.store(&key, name, text.as_bytes(), cond) {
-        Ok(new_etag) => json(out, 200, serde_json::json!({ "ok": true, "name": name, "size": text.len(), "etag": new_etag })),
+        Ok(new_etag) => {
+            store.index_note(name, &new_etag, Some(&text));
+            json(out, 200, serde_json::json!({ "ok": true, "name": name, "size": text.len(), "etag": new_etag }))
+        }
         Err(s3::S3Error::Http(412, _)) => json_err(out, 409, "the note changed while appending; retry"),
         Err(e) => s3_err(out, e),
     }
@@ -696,55 +758,140 @@ fn handle_append(out: ResponseOutparam, store: &Store, name: &str, content: &str
 
 fn handle_delete(out: ResponseOutparam, store: &Store, name: &str) {
     match store.client().delete(&store.key(name)) {
-        Ok(()) => json(out, 200, serde_json::json!({ "ok": true, "name": name })),
+        Ok(()) => {
+            store.index_note(name, "", None);
+            json(out, 200, serde_json::json!({ "ok": true, "name": name }))
+        }
         Err(e) => s3_err(out, e),
     }
 }
 
+/// Everything under the namespace that is a note, as (name, etag, size).
+fn live_notes(store: &Store, max: usize) -> Result<(Vec<(String, String, u64)>, bool), s3::S3Error> {
+    let (objects, truncated) = store.client().list(&store.ns, max)?;
+    let live = objects
+        .into_iter()
+        .filter(|o| is_note_key(store.name_of(&o.key)))
+        .map(|o| (store.name_of(&o.key).to_string(), o.etag, o.size))
+        .collect();
+    Ok((live, truncated))
+}
+
+/// (Re)index up to `budget` notes the listing says the index does not know,
+/// drop the ones that are gone, and save when anything changed. Returns
+/// (refreshed, pending, saved).
+fn reconcile_index(
+    store: &Store,
+    e: &embed::Embedder,
+    idx: &mut index::Index,
+    idx_etag: Option<&str>,
+    live: &[(String, String, u64)],
+    budget: usize,
+) -> Result<(usize, usize, bool), s3::S3Error> {
+    let (stale, gone) = idx.reconcile(live);
+    let mut changed = false;
+    for name in &gone {
+        idx.remove(name);
+        changed = true;
+    }
+    let mut refreshed = 0usize;
+    let room = index::MAX_CHUNKS.saturating_sub(idx.chunk_count());
+    for (name, etag, size) in stale.iter().take(budget) {
+        if *size > index::MAX_NOTE_BYTES || room == 0 {
+            idx.put_unindexed(name, etag);
+            changed = true;
+            continue;
+        }
+        match store.fetch(&store.key(name))? {
+            Some(n) => {
+                let text = String::from_utf8_lossy(&n.text);
+                idx.put_note(name, &n.etag, &text, e);
+                refreshed += 1;
+                changed = true;
+            }
+            None => {
+                idx.remove(name);
+                changed = true;
+            }
+        }
+    }
+    let pending = stale.len().saturating_sub(budget);
+    let mut saved = false;
+    if changed {
+        match store.save_index(idx, idx_etag) {
+            Ok(()) => saved = true,
+            Err(s3::S3Error::Http(412, _)) => {} // a concurrent update won; this search still uses the merged view
+            Err(e) => eprintln!("[jot] index save failed: {}", e.message()),
+        }
+    }
+    Ok((refreshed, pending, saved))
+}
+
+/// GET /api/search?q=&prefix=&limit=: BM25 and vector search over the
+/// notebook's index, fused; the index is reconciled with the bucket first.
 fn handle_search(out: ResponseOutparam, store: &Store, q: &[(String, String)]) {
-    let needle = query_get(q, "q").unwrap_or("").trim().to_lowercase();
-    if needle.is_empty() {
+    let query = query_get(q, "q").unwrap_or("").trim().to_string();
+    if query.is_empty() {
         return json_err(out, 400, "q is required");
     }
     let sub = query_get(q, "prefix").unwrap_or("").trim_start_matches('/');
     let limit = query_get(q, "limit").and_then(|l| l.parse().ok()).unwrap_or(SEARCH_DEFAULT).clamp(1, SEARCH_MAX);
-    let full = format!("{}{}", store.ns, sub);
-    let client = store.client();
-    let (objects, more) = match client.list(&full, SEARCH_SCAN) {
-        Ok(r) => r,
-        Err(e) => return s3_err(out, e),
+    let e = match embed::Embedder::new() {
+        Ok(e) => e,
+        Err(msg) => return json_err(out, 500, &format!("embedding model: {msg}")),
     };
-    let mut hits = Vec::new();
-    let mut scanned = 0usize;
-    let mut skipped = 0usize;
-    let mut truncated = more;
-    'notes: for o in &objects {
-        if o.key.ends_with('/') {
-            continue;
-        }
-        if o.size > SEARCH_SKIP_OVER {
-            skipped += 1;
-            continue;
-        }
-        let f = match store.fetch(&o.key) {
-            Ok(Some(f)) => f,
-            Ok(None) => continue,
-            Err(e) => return s3_err(out, e),
-        };
-        scanned += 1;
-        let text = String::from_utf8_lossy(&f.text);
-        for (i, line) in text.lines().enumerate() {
-            if line.to_lowercase().contains(&needle) {
-                let snippet: String = line.trim().chars().take(200).collect();
-                hits.push(serde_json::json!({ "name": store.name_of(&o.key), "line": i + 1, "text": snippet }));
-                if hits.len() >= limit {
-                    truncated = true;
-                    break 'notes;
-                }
-            }
-        }
-    }
-    json(out, 200, serde_json::json!({ "query": needle, "hits": hits, "scanned": scanned, "skipped": skipped, "truncated": truncated }));
+    let (live, truncated) = match live_notes(store, 1000) {
+        Ok(l) => l,
+        Err(err) => return s3_err(out, err),
+    };
+    let (mut idx, idx_etag) = match store.load_index(&e) {
+        Ok(i) => i,
+        Err(err) => return s3_err(out, err),
+    };
+    let (refreshed, pending, _) = match reconcile_index(store, &e, &mut idx, idx_etag.as_deref(), &live, REFRESH_PER_SEARCH) {
+        Ok(r) => r,
+        Err(err) => return s3_err(out, err),
+    };
+    let hits = idx.search(&query, sub, limit, &e);
+    let notes_in_scope = idx.notes.keys().filter(|n| n.starts_with(sub)).count();
+    json(out, 200, serde_json::json!({
+        "query": query,
+        "hits": hits,
+        "notes": notes_in_scope,
+        "chunks": idx.chunk_count(),
+        "refreshed": refreshed,
+        "pending": pending,
+        "truncated": truncated || pending > 0,
+        "method": "hybrid: bm25 + vectors (rrf)",
+        "model": embed::MODEL,
+    }));
+}
+
+/// POST /api/reindex: rebuild the index from the bucket in one request
+/// (bounded), for a notebook whose index was lost or written by an older
+/// model.
+fn handle_reindex(out: ResponseOutparam, store: &Store) {
+    let e = match embed::Embedder::new() {
+        Ok(e) => e,
+        Err(msg) => return json_err(out, 500, &format!("embedding model: {msg}")),
+    };
+    let (live, truncated) = match live_notes(store, REINDEX_MAX) {
+        Ok(l) => l,
+        Err(err) => return s3_err(out, err),
+    };
+    let (_, idx_etag) = match store.load_index(&e) {
+        Ok(i) => i,
+        Err(err) => return s3_err(out, err),
+    };
+    let mut idx = index::Index::empty(embed::MODEL, e.dim());
+    let (refreshed, pending, saved) = match reconcile_index(store, &e, &mut idx, idx_etag.as_deref(), &live, REINDEX_MAX) {
+        Ok(r) => r,
+        Err(err) => return s3_err(out, err),
+    };
+    json(out, 200, serde_json::json!({
+        "ok": saved, "indexed": refreshed, "pending": pending, "chunks": idx.chunk_count(),
+        "truncated": truncated, "model": embed::MODEL,
+    }));
 }
 
 struct Component;
@@ -766,7 +913,7 @@ impl Guest for Component {
             _ => {}
         }
         if !path.starts_with("/api/") {
-            return json_err(out, 404, "not found; routes: GET /, GET /ping, GET /sso-return, GET /api/status, GET /api/tools, GET /api/notes, GET|PUT|DELETE /api/notes/<name>, POST /api/notes/<name>/append, GET /api/search?q=");
+            return json_err(out, 404, "not found; routes: GET /, GET /ping, GET /sso-return, GET /api/status, GET /api/tools, GET /api/notes, GET|PUT|DELETE /api/notes/<name>, POST /api/notes/<name>/append, GET /api/search?q=, POST /api/reindex");
         }
 
         let cfg = load_config();
@@ -788,6 +935,12 @@ impl Guest for Component {
         match (&method, path.as_str()) {
             (Method::Get, "/api/notes") | (Method::Get, "/api/notes/") => return handle_list(out, &store, &q),
             (Method::Get, "/api/search") => return handle_search(out, &store, &q),
+            (Method::Post, "/api/reindex") => {
+                if cfg.read_only {
+                    return json_err(out, 403, "this deployment is read-only (readOnly in its config)");
+                }
+                return handle_reindex(out, &store);
+            }
             _ => {}
         }
 

@@ -45,6 +45,7 @@ auth=(-H "x-api-key: $KEY")
 jq_() { python3 -c "import json,sys; d=json.load(open('$WORK/body')); print($1)"; }
 
 echo "== build =="
+[ -f model/embeddings.i8 ] || ./scripts/fetch-model.sh
 cargo component build --release --target wasm32-wasip2 2>&1 | tail -1
 WASM=target/wasm32-wasip2/release/jot.wasm
 [ -f "$WASM" ] || fail "no $WASM"
@@ -139,12 +140,33 @@ pass "text/plain write + append"
 [ "$(req GET '/api/notes/log.md?raw=1' "${auth[@]}")" = 200 ] && [ "$(cat $WORK/body)" = "learned: appending creates" ] || fail "append-create content"
 pass "append creates a missing note"
 
-[ "$(req GET '/api/search?q=needle' "${auth[@]}")" = 200 ] || fail "search"
-[ "$(jq_ 'len(d["hits"])==1 and d["hits"][0]["name"]=="projects/enclave.md" and d["hits"][0]["line"]==3 and d["scanned"]==3')" = True ] || fail "search hits: $(cat $WORK/body)"
-pass "search (case-insensitive, line numbers, scanned count)"
+# hybrid search: BM25 carries the exact term, the vectors carry the meaning,
+# and the index under .jot/ is built on the first search and kept current
+[ "$(req PUT /api/notes/home/groceries.md "${auth[@]}" -H 'content-type: application/json' -d '{"content":"Grocery list: eggs, milk, bread, butter."}')" = 200 ] || fail "write groceries"
+[ "$(req PUT /api/notes/money/taxes.md "${auth[@]}" -H 'content-type: application/json' -d '{"content":"Meeting with the accountant about the quarterly tax filing."}')" = 200 ] || fail "write taxes"
+[ "$(req GET '/api/search?q=needle' "${auth[@]}")" = 200 ] || fail "search: $(cat $WORK/body)"
+[ "$(jq_ 'd["hits"][0]["name"]=="projects/enclave.md" and d["hits"][0]["line"]==1 and d["hits"][0]["bm25_rank"]==1 and "Needle" in d["hits"][0]["text"] and d["method"].startswith("hybrid") and d["notes"]==5')" = True ] || fail "keyword hit: $(cat $WORK/body)"
+pass "search by exact term (BM25 rank 1, chunk start line, snippet, hybrid method, 5 notes indexed)"
+[ "$(req GET '/api/search?q=what+do+I+owe+the+government' "${auth[@]}")" = 200 ] && [ "$(jq_ 'd["hits"][0]["name"]=="money/taxes.md" and d["hits"][0]["vector_rank"]==1')" = True ] || fail "semantic hit: $(cat $WORK/body)"
+[ "$(req GET '/api/search?q=something+to+eat' "${auth[@]}")" = 200 ] && [ "$(jq_ 'd["hits"][0]["name"]=="home/groceries.md" and d["hits"][0]["bm25_rank"] is None and d["hits"][0]["vector_rank"]==1')" = True ] || fail "pure-vector hit: $(cat $WORK/body)"
+pass "search by meaning (vector rank 1 for a paraphrase; a pure-vector hit with no shared term)"
 [ "$(req GET '/api/search' "${auth[@]}")" = 400 ] || fail "search without q must 400"
 [ "$(req GET '/api/search?q=needle&prefix=todo' "${auth[@]}")" = 200 ] && [ "$(jq_ 'len(d["hits"])')" = 0 ] || fail "search prefix"
 pass "search validation + prefix"
+curl -s -o "$WORK/idx" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$S3/$BUCKET/${PREFIX}.jot/index.v1"
+python3 -c "import json,sys; d=json.load(open('$WORK/idx')); assert d['v']==1 and d['model']=='potion-base-8M' and set(d['notes'])=={'projects/enclave.md','todo.txt','log.md','home/groceries.md','money/taxes.md'}, d.keys()" || fail "index object: $(head -c 300 $WORK/idx)"
+[ "$(req GET /api/notes "${auth[@]}")" = 200 ] && [ "$(jq_ 'all(not n["name"].startswith(".jot") for n in d["notes"])')" = True ] || fail "index must not list as a note"
+[ "$(req PUT /api/notes/.jot/index.v1 "${auth[@]}" -d 'x')" = 400 ] || fail ".jot/ must be refused as a note name"
+pass "index lives at <prefix>.jot/index.v1, hidden from listings, its name refused for notes"
+# a note dropped into the bucket behind the app's back is picked up by the next search
+printf 'Zebras graze on the savanna.' > "$WORK/z"
+curl -s -o /dev/null -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" -T "$WORK/z" "$S3/$BUCKET/${PREFIX}animals/zebra.md"
+[ "$(req GET '/api/search?q=zebras' "${auth[@]}")" = 200 ] && [ "$(jq_ 'd["hits"][0]["name"]=="animals/zebra.md" and d["refreshed"]==1')" = True ] || fail "reconcile: $(cat $WORK/body)"
+[ "$(req DELETE /api/notes/animals/zebra.md "${auth[@]}")" = 200 ] || fail "delete zebra"
+[ "$(req GET '/api/search?q=zebras' "${auth[@]}")" = 200 ] && [ "$(jq_ 'all(h["name"]!="animals/zebra.md" for h in d["hits"])')" = True ] || fail "deleted note must leave the index"
+pass "reconcile: an out-of-band note is indexed on the next search, a deleted one leaves"
+[ "$(req POST /api/reindex "${auth[@]}")" = 200 ] && [ "$(jq_ 'd["ok"] and d["indexed"]==5')" = True ] || fail "reindex: $(cat $WORK/body)"
+pass "reindex rebuilds from the bucket"
 
 code=$(req PUT /api/notes/projects/enclave.md "${auth[@]}" -H 'content-type: application/json' -d '{"content":"clobber","ifMatch":"deadbeef"}')
 if [ "$code" = 412 ]; then pass "conditional write refused on stale ETag (412)";
@@ -173,8 +195,8 @@ python3 -c 'import json; json.dump({"content":"x"*(1024*1024+1)}, open("'$WORK'/
 pass "size cap"
 
 [ "$(req GET /api/tools)" = 200 ] || fail "tools"
-[ "$(jq_ 'len(d["openai"])==6 and len(d["eyesoff_ai"]["tools"]["http"])==6 and all(t["url"].startswith(d["base_url"]) for t in d["eyesoff_ai"]["tools"]["http"]) and d["eyesoff_ai"]["tools"]["http"][0]["headers"]["x-api-key"]=="$JOT_API_KEY"')" = True ] || fail "tools shape: $(cat $WORK/body)"
-pass "tools: 6 OpenAI functions + 6 eyesoff-ai http entries"
+[ "$(jq_ 'len(d["openai"])==5 and len(d["eyesoff_ai"]["tools"]["http"])==5 and all(t["url"].startswith(d["base_url"]) for t in d["eyesoff_ai"]["tools"]["http"]) and d["eyesoff_ai"]["tools"]["http"][0]["headers"]["x-api-key"]=="$JOT_API_KEY" and "notes_list" not in [t["function"]["name"] for t in d["openai"]] and "hybrid" in [t for t in d["eyesoff_ai"]["tools"]["http"] if t["name"]=="notes_search"][0]["description"]')" = True ] || fail "tools shape: $(cat $WORK/body)"
+pass "tools: 5 OpenAI functions + 5 eyesoff-ai http entries, no notes_list, search described as hybrid"
 
 [ "$(req DELETE /api/notes/todo.txt "${auth[@]}")" = 200 ] || fail "delete"
 [ "$(req GET /api/notes/todo.txt "${auth[@]}")" = 404 ] || fail "deleted note must 404"
@@ -280,10 +302,13 @@ pass "user A (own audience, sso) writes, reads, lists; the service path (key + X
 [ "$(ureq GET /api/notes/a.md "${tb[@]}")" = 404 ] || fail "B must not read A's note"
 [ "$(ureq PUT /api/notes/b.md "${tb[@]}" -H 'content-type: application/json' -d '{"content":"B only"}')" = 200 ] || fail "B write"
 [ "$(ureq GET /api/notes/b.md "${ta[@]}")" = 404 ] || fail "A must not read B's note"
-[ "$(ureq GET '/api/search?q=needle' "${ta[@]}")" = 200 ] && [ "$(jq_ 'len(d["hits"])==1 and d["scanned"]==1')" = True ] || fail "A search scoped"
-[ "$(ureq GET '/api/search?q=needle' "${tb[@]}")" = 200 ] && [ "$(jq_ 'len(d["hits"])==0')" = True ] || fail "B search must not see A"
+[ "$(ureq GET '/api/search?q=needle' "${ta[@]}")" = 200 ] && [ "$(jq_ 'len(d["hits"])==1 and d["hits"][0]["name"]=="a.md" and d["notes"]==1')" = True ] || fail "A search scoped: $(cat $WORK/body)"
+[ "$(ureq GET '/api/search?q=needle' "${tb[@]}")" = 200 ] && [ "$(jq_ 'all(h["name"]!="a.md" for h in d["hits"]) and d["notes"]==1')" = True ] || fail "B search must not see A: $(cat $WORK/body)"
+curl -s -o "$WORK/obj" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$S3/$BUCKET/peruser/users/$SUB_A/.jot/index.v1"
+[ "$(head -c 4 $WORK/obj)" = "JOT1" ] || fail "per-user index must be sealed"
+grep -q "Needle" "$WORK/obj" && fail "index leaked plaintext" || true
 [ "$(ureq GET /api/notes "${auth[@]}" -H "x-user: $SUB_B")" = 200 ] && [ "$(jq_ '[n["name"] for n in d["notes"]]')" = "['b.md']" ] || fail "service path for B"
-pass "isolation: B (accepted eyesoff audience) cannot list, read or search A's notes, and vice versa"
+pass "isolation: B (accepted eyesoff audience) cannot list, read or search A's notes, and vice versa; A's index is sealed"
 
 curl -s -o "$WORK/obj" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$S3/$BUCKET/peruser/users/$SUB_A/a.md"
 [ "$(head -c 4 $WORK/obj)" = "JOT1" ] || fail "bucket object is not sealed"
@@ -313,6 +338,7 @@ NB2="http://127.0.0.1:$((U_PORT+1))"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "${ta[@]}" "$NB2/api/notes")" = 200 ] || fail "sign-in still works"
 pass "per-user mode without api_key: X-User is never trusted, tokens still work"
 
+# the tools block in per-user mode
 # a shared notebook with a master_key: sealed too
 serve $((U_PORT+2)) "${CONFIG/\"api_key\"/\"master_key\":\"\$JOT_MASTER_KEY\",\"prefix\":\"sealed\/\",\"api_key\"}" --env JOT_API_KEY="$KEY" --env JOT_ACCESS_KEY_ID=$AK --env JOT_SECRET_ACCESS_KEY=$SK --env JOT_MASTER_KEY=$MASTER
 SB="http://127.0.0.1:$((U_PORT+2))"

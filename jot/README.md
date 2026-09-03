@@ -1,9 +1,11 @@
 # jot: a notebook your agent keeps in your own bucket
 
-jot is a note store for programs. An agent with the key can **list, read,
-write, append, search and delete** notes through a small JSON API, and every
-note is one plain object in an S3-compatible bucket you own (Cloudflare R2,
-AWS S3, Wasabi, minio). Nothing to unlock, nothing that dies on a restart:
+jot is a note store for programs. An agent with the key can **search, read,
+write, append and delete** notes through a small JSON API, and every note is
+one object in an S3-compatible bucket you own (Cloudflare R2, AWS S3, Wasabi,
+minio). Search is hybrid: BM25 over exact terms and vector similarity over
+embeddings computed inside the enclave, fused, from an index that is itself
+one sealed object in the bucket. Nothing to unlock, nothing that dies on a restart:
 the durable copy is the object, and the app holds no state of its own.
 
 It is the storage shape of [risc-box](../risc-box) (the app signs its own
@@ -170,29 +172,75 @@ A note caps at 1 MiB.
 | `GET /sso-return` | the sign-in popup's landing pad (per-user mode) |
 | `GET /ping` | liveness |
 | `GET /api/status` | `{configured, missing, auth, readOnly, users, encrypted}`, plus `sso: {authorize_url, aud, accept}` in per-user mode; with the key also `{endpoint, region, bucket, prefix, signed}`; with an identity also `you: {sub, via}` |
-| `GET /api/tools` | the six verbs as OpenAI function schemas and as an eyesoff-ai `tools.http` block (see below) |
-| `GET /api/notes?prefix=&limit=` | `{notes: [{name, size, modified, etag}], truncated}` (limit 1..1000, default 200) |
+| `GET /api/tools` | the five agent verbs (search, read, write, append, delete) as OpenAI function schemas and as an eyesoff-ai `tools.http` block (see below). Listing is deliberately not a tool: search is how an agent finds its way in |
+| `GET /api/notes?prefix=&limit=` | `{notes: [{name, size, modified, etag}], truncated}` (limit 1..1000, default 200); the UI's listing, never offered to the model |
 | `GET /api/notes/<name>` | `{name, content, size, etag, modified}`; `?raw=1` (or `Accept: text/plain`) returns the bytes with a content type from the extension |
 | `PUT /api/notes/<name>` | write: JSON `{content, ifMatch?}`, or any non-JSON body as the note text (an `If-Match` header works too). `POST` is an alias. Answers `{ok, name, size, etag}`; a stale `ifMatch` is 412 |
 | `POST /api/notes/<name>/append` | `{content}`: append a paragraph (a newline is inserted between), creating the note if needed. Conditional on the ETag it just read: a concurrent change answers 409, retry |
 | `DELETE /api/notes/<name>` | delete (idempotent). `POST /api/notes/<name>/delete` is an alias for clients without DELETE |
-| `GET /api/search?q=&prefix=&limit=` | case-insensitive substring search over note bodies: `{hits: [{name, line, text}], scanned, skipped, truncated}`. Scans up to 200 notes of at most 256 KiB each |
+| `GET /api/search?q=&prefix=&limit=` | hybrid search (below): `{hits: [{name, line, text, score, bm25_rank, vector_rank}], notes, chunks, refreshed, pending, truncated, method, model}`; limit 1..50, default 8; one hit per note, the best chunk |
+| `POST /api/reindex` | rebuild this notebook's search index from the bucket (bounded to 400 notes per call) |
 
 Errors are `{"error": {"message": …}}` with the obvious statuses: 400 bad
 name or body, 401 no or wrong key, 403 read-only, 404 no such note, 409/412
 conditional write lost, 413 over 1 MiB, 502 the bucket refused or was
 unreachable (the message quotes S3's own reason), 503 not configured.
 
+## How search works
+
+There is no database anywhere but the bucket, and no inference service in
+the loop. Both halves of the search run inside the component:
+
+- **Embeddings** come from `minishlab/potion-base-8M` (MIT), a Model2Vec
+  distillation of bge-base-en-v1.5: a WordPiece vocabulary of 29,528 tokens,
+  one 256-dimensional vector each, and a text's embedding is the mean of its
+  tokens' vectors, normalised. No network runs at query time, so a chunk
+  embeds in microseconds and there is nothing to attach or warm up. The
+  table is compiled into the wasm as int8 rows (7.6 MB); `scripts/fetch-model.sh`
+  downloads it at a pinned revision, verifies the digest, and converts it,
+  so the wasm the catalog pins reproduces from source plus that script. The
+  tokenizer is BERT's, implemented in `src/embed.rs`.
+- **The index** is one JSON document per notebook at `<prefix>.jot/index.v1`
+  (under the user's own prefix in per-user mode, sealed like the notes when
+  there is a master key). It holds every note's chunks: start line, text,
+  and the quantised vector. Notes are chunked on paragraph and heading
+  boundaries to about 800 characters; a note is indexed by its first 48
+  chunks, a note over 256 KiB is not indexed, and a notebook is capped at
+  4,000 chunks (a few MB of index).
+- **A query** reads the index once, then scores every chunk two ways: BM25
+  (k1 1.2, b 0.75) over exact lowercase terms, with the note's name segments
+  counted as text, so "AAAA" finds the note that says AAAA; and cosine
+  between the query's embedding and each chunk's, so "network reachability"
+  finds the note about egress and IPv6. The two rankings are joined by
+  reciprocal rank fusion (k 60) and the best chunk of each note comes back
+  with a snippet around the first matching term, its score, and its rank in
+  each list (`null` when one side did not rank it).
+- **The index stays current** two ways. Every write, append and delete
+  updates it, conditionally on the ETag it was read at, so two writers
+  cannot drop each other's work. And every search first lists the namespace
+  and reconciles: a note whose ETag the index does not know is (re)indexed
+  (up to 25 per search; `pending` says how many remain), a note that is gone
+  is dropped. So a note written outside the app, or an index update that
+  lost a race, is picked up by the next search. `POST /api/reindex` rebuilds
+  from scratch when an index was lost or written by another model.
+
+Costs, stated plainly: a search is one LIST, one GET of the index, and one
+GET per note being (re)indexed on that call; the first search after a bulk
+import pays for up to 25 notes and later ones catch up. An 8M-parameter
+static model is not a cross-encoder: it recalls by topic well and by nuance
+less well, which is the right trade for a notebook an agent writes in its
+own words and reads back by subject.
+
 ## Using it from an agent
 
 **Any OpenAI-style tool binding.** `GET /api/tools` returns `openai`, a list
-of six function schemas (`notes_list`, `notes_read`, `notes_write`,
-`notes_append`, `notes_search`, `notes_delete`) to hand to the model, plus
-`base_url` and the auth line. Execute each call as the matching route with
-the key in `X-Api-Key`.
+of five function schemas (`notes_search`, `notes_read`, `notes_write`,
+`notes_append`, `notes_delete`) to hand to the model, plus `base_url` and
+the auth line. Execute each call as the matching route with the key in
+`X-Api-Key`.
 
 **The sibling [agent](../agent) (LangGraph).** Its tool belt already carries
-the six tools; they are offered when the environment names a notebook (and,
+the five tools; they are offered when the environment names a notebook (and,
 on a per-user jot, the account whose notebook it is):
 
 ```sh
@@ -246,6 +294,7 @@ curl -s -H "$K" -X DELETE $J/api/notes/scratch.md
 ## Try it locally
 
 ```sh
+scripts/fetch-model.sh          # once: the embedding table the build embeds
 cargo component build --release --target wasm32-wasip2
 # a bucket to talk to: minio, an R2 token, anything S3-compatible
 export JOT_ACCESS_KEY_ID=… JOT_SECRET_ACCESS_KEY=… JOT_API_KEY=devkey
@@ -268,7 +317,7 @@ object in the bucket, or unreadable there when sealed). Needs `minio`,
 ## Publish and deploy
 
 ```sh
-enclave publish target/wasm32-wasip2/release/jot.wasm --slug jot --version 1.1.0 \
+enclave publish target/wasm32-wasip2/release/jot.wasm --slug jot --version 1.2.0 \
   --name jot --desc "A notebook your agent keeps in your own bucket" \
   --mem 128 --cpu-gflops 1 \
   --config '{"endpoint":"https://<account>.r2.cloudflarestorage.com","region":"auto","bucket":"agent-notes","prefix":"notes/","credentials":{"accessKeyId":"$JOT_ACCESS_KEY_ID","secretAccessKey":"$JOT_SECRET_ACCESS_KEY"},"api_key":"$JOT_API_KEY"}'
@@ -293,9 +342,10 @@ it makes no request except to the configured endpoint.
   agents appending to the same note at once is safe (one gets a 409 and
   retries), two agents *writing* the same note race unless they pass
   `ifMatch`.
-- Search is a scan (up to 200 notes, 256 KiB each, one GET per note). It is
-  right for a notebook and wrong for an archive; keep the prefix small or
-  give the agent several deployments.
+- Search reads one index object per query and pays one GET per note that
+  changed since the last search. It is right for a notebook of thousands of
+  chunks and wrong for an archive of millions; the caps above are where it
+  stops, and the response says so rather than guessing.
 - Minio, R2 and AWS S3 all honour `If-Match` on PUT. A store that ignores it
   makes conditional writes unconditional; the e2e prints a WARN if yours does.
 - The bucket is part of your trust base: it can serve a different note than
@@ -306,3 +356,11 @@ it makes no request except to the configured endpoint.
   the API key can name any user and the master secret derives every key.
 
 Verify the enclave before trusting it: [enclave.host](https://enclave.host).
+
+## Third-party notice
+
+The embedding table compiled into the wasm is derived from
+[minishlab/potion-base-8M](https://huggingface.co/minishlab/potion-base-8M)
+(MIT License, copyright The Minish Lab), a Model2Vec distillation of
+BAAI/bge-base-en-v1.5 (MIT). `scripts/fetch-model.sh` records the exact
+revision and digests.

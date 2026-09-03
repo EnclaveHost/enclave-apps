@@ -50,18 +50,24 @@ def start(key: str = KEY):
                     {"name": n, "size": len(c.encode()), "modified": "2026-09-01T00:00:00Z"}
                     for n, c in sorted(notes.items()) if n.startswith(p)], "truncated": False})
             if u.path == "/api/search" and self.command == "GET":
+                # the real app fuses BM25 and vector ranks; the stub stands in
+                # with term overlap, which is all the CLIENT contract needs
                 needle = q.get("q", "").lower()
                 if not needle:
                     return self._err(400, "q is required")
+                terms = set(needle.split())
                 hits = []
                 for n, c in sorted(notes.items()):
                     if not n.startswith(q.get("prefix", "")):
                         continue
                     for i, line in enumerate(c.splitlines(), 1):
-                        if needle in line.lower():
-                            hits.append({"name": n, "line": i, "text": line.strip()[:200]})
-                return self._json(200, {"query": needle, "hits": hits, "scanned": len(notes),
-                                        "skipped": 0, "truncated": False})
+                        if terms & set(line.lower().split()):
+                            hits.append({"name": n, "line": i, "text": line.strip()[:400],
+                                         "score": 0.5, "bm25_rank": 1, "vector_rank": None})
+                            break
+                return self._json(200, {"query": needle, "hits": hits, "notes": len(notes),
+                                        "chunks": len(notes), "refreshed": 0, "pending": 0,
+                                        "truncated": False, "method": "stub"})
             if not u.path.startswith("/api/notes/"):
                 return self._err(404, "not found")
             rest = u.path[len("/api/notes/"):]

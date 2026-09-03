@@ -369,7 +369,7 @@ async function search() {
   try {
     const r = await api("GET", "/api/search?q=" + encodeURIComponent(q) + "&limit=100");
     renderList(r.hits, "search");
-    $("#count").textContent = `${r.hits.length} hit${r.hits.length === 1 ? "" : "s"} in ${r.scanned} notes`;
+    $("#count").textContent = `${r.hits.length} hit${r.hits.length === 1 ? "" : "s"} in ${r.notes} notes`;
   } catch (e) { $("#err").textContent = e.message; }
 }
 

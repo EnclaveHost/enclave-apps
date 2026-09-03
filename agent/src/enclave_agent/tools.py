@@ -150,7 +150,7 @@ def utc_now() -> str:
 
 # ---- the notebook (jot) ------------------------------------------------------
 # An Enclave `jot` deployment: the agent's notes as plain objects in the
-# deployer's own S3 bucket, behind a bearer key. These six tools are the
+# deployer's own S3 bucket, behind a key. These five tools are the
 # client side of its API (GET /api/tools on the deployment describes the same
 # verbs). They are only offered when ENCLAVE_AGENT_NOTES_URL is set, so an
 # agent without a notebook is not shown tools that would fail.
@@ -210,7 +210,7 @@ class NotesClient:
 
 
 def make_notes_tools(client: NotesClient) -> list:
-    """The six notebook tools, bound to one client."""
+    """The five notebook tools, bound to one client."""
 
     def guard(fn):
         # functools.wraps keeps the signature @tool reads for the schema
@@ -221,20 +221,6 @@ def make_notes_tools(client: NotesClient) -> list:
             except RuntimeError as e:
                 return f"error: {e}"
         return run
-
-    @tool
-    @guard
-    def notes_list(prefix: str = "") -> str:
-        """List the notes in the notebook (name, size, last modified). Call this
-        first when unsure what has already been written down. `prefix` narrows
-        to names starting with it, e.g. 'projects/'."""
-        r = client.call("GET", "/api/notes", query={"prefix": prefix, "limit": "500"})
-        if not r["notes"]:
-            return "(no notes)" if not prefix else f"(no notes under {prefix})"
-        lines = [f"{n['name']}  ({n['size']} B, {n.get('modified', '')})" for n in r["notes"]]
-        if r.get("truncated"):
-            lines.append("[more notes not listed]")
-        return "\n".join(lines)
 
     @tool
     @guard
@@ -267,14 +253,17 @@ def make_notes_tools(client: NotesClient) -> list:
     @tool
     @guard
     def notes_search(query: str, prefix: str = "") -> str:
-        """Case-insensitive substring search across all note bodies. Returns
-        'name:line: text' for each matching line."""
-        r = client.call("GET", "/api/search", query={"q": query, "prefix": prefix, "limit": "50"})
+        """Search the notebook by meaning and by keyword (hybrid: vector
+        similarity plus BM25, fused). Returns the best-matching passage of each
+        relevant note as 'name:line: passage'; read the note for the rest.
+        Call this first when the user refers to earlier work, a preference, a
+        project, or asks what you remember."""
+        r = client.call("GET", "/api/search", query={"q": query, "prefix": prefix, "limit": "8"})
         if not r["hits"]:
-            return f"no matches for {query!r} in {r['scanned']} notes"
+            return f"no matches for {query!r} in {r['notes']} notes"
         lines = [f"{h['name']}:{h['line']}: {h['text']}" for h in r["hits"]]
-        if r.get("truncated"):
-            lines.append("[more matches not listed]")
+        if r.get("pending"):
+            lines.append(f"[{r['pending']} notes not yet indexed; search again for a complete answer]")
         return "\n".join(lines)
 
     @tool
@@ -284,7 +273,7 @@ def make_notes_tools(client: NotesClient) -> list:
         r = client.call("DELETE", "/api/notes/" + client._path(name))
         return f"deleted {r['name']}"
 
-    return [notes_list, notes_read, notes_write, notes_append, notes_search, notes_delete]
+    return [notes_read, notes_write, notes_append, notes_search, notes_delete]
 
 
 def notes_tools_from_env() -> list:
