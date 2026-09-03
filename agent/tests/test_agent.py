@@ -85,16 +85,22 @@ class NotebookToolTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.server, base_url, cls.notes = start_notes()
+        cls.server, base_url, cls.spaces = start_notes()
         cls.tools = {t.name: t for t in make_notes_tools(NotesClient(base_url, "stub-key"))}
         cls.bad = {t.name: t for t in make_notes_tools(NotesClient(base_url, "wrong"))}
+        cls.alice = {t.name: t for t in make_notes_tools(NotesClient(base_url, "stub-key", "0x" + "a" * 40))}
+        cls.bob = {t.name: t for t in make_notes_tools(NotesClient(base_url, "stub-key", "acct_bob"))}
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
 
     def setUp(self):
-        self.notes.clear()
+        self.spaces.clear()
+
+    @property
+    def notes(self):
+        return self.spaces.setdefault("", {})
 
     def test_write_read_list_search_delete(self):
         t = self.tools
@@ -127,6 +133,13 @@ class NotebookToolTests(unittest.TestCase):
         t["notes_write"].invoke({"name": "meeting notes/2026-09-01.md", "content": "x"})
         self.assertIn("meeting notes/2026-09-01.md", self.notes)
         self.assertEqual(t["notes_read"].invoke({"name": "meeting notes/2026-09-01.md"}), "x")
+
+    def test_a_named_user_writes_into_their_own_space(self):
+        self.alice["notes_write"].invoke({"name": "mine.md", "content": "alice"})
+        self.assertEqual(self.bob["notes_list"].invoke({}), "(no notes)")
+        self.assertEqual(self.bob["notes_read"].invoke({"name": "mine.md"}), "error: no such note")
+        self.assertEqual(self.alice["notes_read"].invoke({"name": "mine.md"}), "alice")
+        self.assertEqual(set(self.spaces), {"0x" + "a" * 40, "acct_bob"})
 
     def test_wrong_key_is_an_error_string_not_an_exception(self):
         self.assertEqual(self.bad["notes_list"].invoke({}), "error: unauthorized")

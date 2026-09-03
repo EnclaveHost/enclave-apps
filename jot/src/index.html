@@ -83,6 +83,17 @@
 
 <div class="banner" id="banner">Loading status…</div>
 
+<div class="card" id="signin" hidden>
+  <h2>Sign in</h2>
+  <p>This is a per-user notebook: every account sees only its own notes. Sign in with your Enclave account to open yours.</p>
+  <div class="row">
+    <button id="sso">Sign in with Enclave</button>
+    <span class="meta" id="who"></span>
+    <button class="ghost" id="signout" hidden>Sign out</button>
+  </div>
+  <div class="err" id="ssoerr"></div>
+</div>
+
 <div class="card" id="keycard">
   <h2>API key</h2>
   <p>This deployment gates its API behind a key (the <code>api_key</code> secret). Paste it to browse and edit here; it is kept in this tab only.</p>
@@ -120,7 +131,7 @@
 
 <div class="card">
   <h2>For agents</h2>
-  <p>Every route is JSON with the key as <code>X-Api-Key</code> (the gateway consumes <code>Authorization</code>, so a bearer never reaches an app on enclave.host). <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the same six verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
+  <p>Every route is JSON with the key as <code>X-Api-Key</code> (the gateway consumes <code>Authorization</code>, so a bearer never reaches an app on enclave.host). <span id="usersnote" hidden>In per-user mode a request also names the user: <code>X-User</code> beside the key (what eyesoff-ai does, from the sign-in it verified), or <code>X-Sso-Token</code> carrying an Enclave sign-in token.</span> <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the same six verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
   <pre class="code" id="curl"></pre>
   <details><summary>eyesoff-ai config block (paste into that deployment's App Config; set JOT_API_KEY as its secret)</summary><pre class="code" id="eyesoff">…</pre></details>
 </div>
@@ -142,11 +153,76 @@ let key = "";
 try { key = sessionStorage.getItem("jot_key") || ""; } catch (e) {}
 let status = null, notes = [], current = null, etag = null, dirty = false;
 
+// ---- Sign in with Enclave (per-user mode) -----------------------------------
+// The same flow as eyesoff-ai's playground: a popup to enclave.host's
+// authorize endpoint with THIS deployment's id as the audience, the token
+// back in a URL fragment (never a query) via /sso-return and postMessage,
+// accepted only when the echoed state matches the one this tab minted. The
+// server re-verifies the token on every request; nothing here trusts what
+// the payload claims beyond showing it.
+const SSO_KEY = "jot-sso", SSO_STATE_KEY = "jot-sso-state";
+function ssoClaims(t) {
+  try { return JSON.parse(atob(t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))); } catch (e) { return null; }
+}
+let ssoToken = null;
+try { ssoToken = sessionStorage.getItem(SSO_KEY) || null; } catch (e) {}
+if (!ssoToken) try { ssoToken = localStorage.getItem(SSO_KEY) || null; } catch (e) {}
+{
+  const c = ssoToken && ssoClaims(ssoToken);
+  if (ssoToken && !(c && typeof c.exp === "number" && Date.now() / 1000 < c.exp)) ssoDrop();
+}
+function ssoAccept(frag) {
+  const m = /[#&]sso=([^&]+)/.exec(frag || "");
+  if (!m) return false;
+  const st = /[#&]state=([^&]+)/.exec(frag || "");
+  let expect = null;
+  try { expect = sessionStorage.getItem(SSO_STATE_KEY); } catch (e) {}
+  if (!(expect && st && decodeURIComponent(st[1]) === expect)) return false;
+  ssoToken = decodeURIComponent(m[1]);
+  try { sessionStorage.setItem(SSO_KEY, ssoToken); sessionStorage.removeItem(SSO_STATE_KEY); } catch (e) {}
+  try { localStorage.setItem(SSO_KEY, ssoToken); } catch (e) {}
+  return true;
+}
+(function () {
+  const h = location.hash || "";
+  if (!/[#&]sso=/.test(h)) return;
+  ssoAccept(h);
+  history.replaceState(null, "", location.pathname + location.search);
+})();
+addEventListener("message", async (e) => {
+  if (e.origin !== location.origin) return;
+  const d = e.data;
+  if (!d || typeof d.enclave_sso !== "string") return;
+  if (ssoAccept(d.enclave_sso)) { await loadStatus(); await refresh(); fresh(); }
+});
+function ssoStart() {
+  if (!(status && status.sso)) return;
+  let st = "";
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  b.forEach((x) => { st += x.toString(16).padStart(2, "0"); });
+  try { sessionStorage.setItem(SSO_STATE_KEY, st); } catch (e) {}
+  const authorize = (back, popup) => status.sso.authorize_url
+    + "?aud=" + encodeURIComponent(status.sso.aud)
+    + "&redirect_uri=" + encodeURIComponent(back)
+    + "&state=" + st + "&ttl=604800" + (popup ? "&display=popup" : "");
+  let w = null;
+  try { w = window.open(authorize(new URL("sso-return", document.baseURI).href, true), "enclave-signin", "popup,width=430,height=680"); } catch (e) {}
+  if (w) return;
+  location.href = authorize(location.origin + location.pathname + location.search, false);
+}
+function ssoDrop() {
+  ssoToken = null;
+  try { sessionStorage.removeItem(SSO_KEY); } catch (e) {}
+  try { localStorage.removeItem(SSO_KEY); } catch (e) {}
+}
+
 async function api(method, path, body, headers) {
   const h = Object.assign({ "accept": "application/json" }, headers || {});
   // X-Api-Key, not Authorization: the platform gateway consumes Authorization
   // (it carries the owner's session token) and never forwards it to an app
   if (key) h["x-api-key"] = key;
+  if (ssoToken) h["x-sso-token"] = ssoToken;
   if (body !== undefined) h["content-type"] = "application/json";
   const r = await fetch(path, { method, headers: h, body: body === undefined ? undefined : JSON.stringify(body) });
   let j = null;
@@ -161,23 +237,38 @@ function pills() {
   p.push(`<span class="pill ${status.configured ? "on" : "bad"}">${status.configured ? "configured" : "unconfigured"}</span>`);
   p.push(`<span class="pill ${status.auth ? "on" : "warn"}">${status.auth ? "key required" : "no api key"}</span>`);
   if (status.readOnly) p.push(`<span class="pill warn">read-only</span>`);
+  if (status.users) p.push(`<span class="pill on">per-user</span>`);
+  p.push(`<span class="pill ${status.encrypted ? "on" : "warn"}">${status.encrypted ? "encrypted at rest" : "plain objects"}</span>`);
   if (status.signed !== undefined) p.push(`<span class="pill ${status.signed ? "on" : "warn"}">${status.signed ? "signed" : "unsigned"}</span>`);
   $("#pills").innerHTML = p.join("");
   const b = $("#banner");
   if (!status.configured) {
     b.className = "banner bad";
-    b.innerHTML = `<b>Not configured:</b> ${esc(status.missing.join(", "))} not set. Set the deployment's App Config (endpoint, bucket, prefix, credentials as <b>$VAR</b> secrets, api_key) and restart it.`;
+    b.innerHTML = status.error
+      ? `<b>Configuration error:</b> ${esc(status.error)}`
+      : `<b>Not configured:</b> ${esc((status.missing || []).join(", "))} not set. Set the deployment's App Config (endpoint, bucket, prefix, credentials as <b>$VAR</b> secrets, api_key) and restart it.`;
   } else if (status.bucket !== undefined) {
     b.className = "banner";
-    b.innerHTML = `Notes are objects under <b>${esc(status.bucket)}/${esc(status.prefix)}</b> at <b>${esc(status.endpoint)}</b> (${status.signed ? "SigV4-signed" : "UNSIGNED: no credentials configured"}${status.readOnly ? ", read-only" : ""}).`;
+    b.innerHTML = `Notes are objects under <b>${esc(status.bucket)}/${esc(status.prefix)}${status.users ? "users/&lt;account&gt;/" : ""}</b> at <b>${esc(status.endpoint)}</b> (${status.signed ? "SigV4-signed" : "UNSIGNED: no credentials configured"}${status.encrypted ? ", sealed with AES-256-GCM" : ""}${status.readOnly ? ", read-only" : ""}).`;
+  } else if (status.users) {
+    b.className = "banner";
+    b.innerHTML = status.you
+      ? `Signed in as <b>${esc(status.you.sub)}</b>. Your notes live under your own prefix${status.encrypted ? ", sealed under a key derived for you" : ""}; no other account can list or read them.`
+      : `A per-user notebook: sign in with your Enclave account to open yours. Agents reach it through eyesoff-ai, which names the signed-in user on every call.`;
   } else {
     b.className = "banner";
     b.innerHTML = status.auth
       ? `Configured. Connect with the API key to see the bucket and the notes.`
       : `<b>No api_key is set:</b> anyone who can reach this deployment can read and write the notebook. Set the <b>api_key</b> to a <b>$VAR</b> secret before pointing an agent at it publicly.`;
   }
-  $("#keycard").hidden = !status.auth;
-  $("#nb").hidden = !(status.configured && (!status.auth || key));
+  const signedIn = !!(status.users && ssoToken && status.you);
+  $("#signin").hidden = !status.users;
+  $("#usersnote").hidden = !status.users;
+  $("#who").textContent = signedIn ? "signed in as " + status.you.sub : (ssoToken && status.users ? "sign-in not accepted; sign in again" : "");
+  $("#sso").hidden = signedIn;
+  $("#signout").hidden = !ssoToken;
+  $("#keycard").hidden = !(status.auth && !status.users);
+  $("#nb").hidden = !(status.configured && (status.users ? signedIn : (!status.auth || key)));
 }
 
 async function loadStatus() {
@@ -188,7 +279,7 @@ async function loadStatus() {
 
 function curl() {
   const base = location.origin;
-  const k = status && status.auth ? "-H 'x-api-key: $JOT_API_KEY' " : "";
+  const k = (status && status.auth ? "-H 'x-api-key: $JOT_API_KEY' " : "") + (status && status.users ? "-H 'x-user: 0x<the account>' " : "");
   $("#curl").innerHTML =
     `<span class="c"># list, read, write, append, search, delete</span>\n` +
     `curl -s ${k}${esc(base)}/api/notes\n` +
@@ -290,6 +381,8 @@ $("#connect").addEventListener("click", async () => {
   await loadStatus(); await refresh();
 });
 $("#forget").addEventListener("click", () => { key = ""; try { sessionStorage.removeItem("jot_key"); } catch (e) {} $("#key").value = ""; loadStatus(); });
+$("#sso").addEventListener("click", ssoStart);
+$("#signout").addEventListener("click", () => { ssoDrop(); current = null; dirty = false; loadStatus(); });
 $("#key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#connect").click(); });
 $("#new").addEventListener("click", fresh);
 $("#save").addEventListener("click", save);
@@ -305,7 +398,8 @@ window.addEventListener("beforeunload", (e) => { if (dirty) { e.preventDefault()
 (async () => {
   if (key) $("#key").value = key;
   await loadStatus();
-  if (status && status.configured && (!status.auth || key)) { await refresh(); fresh(); }
+  const open = status && status.configured && (status.users ? !!(ssoToken && status.you) : (!status.auth || key));
+  if (open) { await refresh(); fresh(); }
 })();
 </script>
 </body>

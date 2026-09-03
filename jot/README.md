@@ -9,9 +9,11 @@ the durable copy is the object, and the app holds no state of its own.
 It is the storage shape of [risc-box](../risc-box) (the app signs its own
 SigV4 requests to your bucket) applied to the problem [keep](../keep) solves
 for a person (a notebook in the enclave). keep is for you, in a browser, with
-your wallet as the key; jot is for the agent, over HTTP, with a bearer key as
-the key. Pick keep when the notes must be unreadable at rest; pick jot when a
-program must be able to write them unattended.
+your wallet as the key; jot is for the agent, over HTTP, with an API key as
+the key. With an `sso` block it becomes **one notebook per signed-in Enclave
+account**: an eyesoff-ai deployment names the user on every call, and each
+account can list, read and search only its own notes, sealed at rest under a
+key derived for that account.
 
 ```
 your agent                  the enclave (jot)                     your bucket
@@ -53,9 +55,18 @@ The deployment's App Config (`ENCLAVE_CONFIG`; locally `JOT_CONFIG`):
   "prefix": "notes/",
   "credentials": { "accessKeyId": "$JOT_ACCESS_KEY_ID", "secretAccessKey": "$JOT_SECRET_ACCESS_KEY" },
   "api_key": "$JOT_API_KEY",
+  "master_key": "$JOT_MASTER_KEY",
+  "sso": {
+    "signer": "0x3394b4d24250F1657cB547975e77117454b3Cc6D",
+    "audience": "0x<this jot deployment's id>",
+    "accept": ["0x<the eyesoff-ai deployment's id>"]
+  },
   "readOnly": false
 }
 ```
+
+The first block of keys is the shared notebook; `master_key` and `sso` are
+the two optional layers described under *Per-user notebooks* below.
 
 - `endpoint` is the S3 API origin, no path; requests are path-style
   (`/bucket/key`). `region` is what the endpoint signs for (`auto` for R2,
@@ -91,18 +102,74 @@ publishes AAAA records, which matters: a deployment's outbound egress is
 IPv6-only, so an endpoint with no AAAA record cannot be reached at all (the
 error says so and names the host to `dig`).
 
+## Per-user notebooks
+
+Two independent layers, each one config key:
+
+**`sso`: one notebook per signed-in Enclave account.** With this block
+present, every note request must name a user, and everything that user can
+reach lives under `<prefix>users/<sub>/`, where `sub` is the account the
+platform signed in: a lowercase `0x` wallet address or an `acct_` id. Two
+ways to name one:
+
+- **`X-Sso-Token: EST1…`**, the platform's sign-in token, verified inside
+  jot exactly as eyesoff-ai verifies it (EIP-191 signature by the pinned
+  `signer`, audience, expiry). `audience` is this jot deployment's own id,
+  what the notebook UI signs in against; `accept` lists the other deployment
+  ids whose tokens jot honours: the eyesoff-ai instances this notebook
+  serves. A token minted for any other deployment is refused, however valid
+  its signature.
+- **the API key plus `X-User: <sub>`**: the service asserting the identity.
+  This is how eyesoff-ai reaches the notebook: its tool registry fills
+  `X-User` from the sign-in it verified for the turn (`$user`), never from
+  anything the model wrote (tool headers come from that deployment's
+  on-chain config). Only a holder of the API key can assert a name; a
+  deployment with no `api_key` never trusts `X-User` at all.
+
+The isolation is a hard access control at the app: user B's token or name
+cannot list, read, search, append to or delete anything under user A's
+prefix, and the e2e proves it in both directions. Who can see everything:
+whoever holds the API key (they can name any user) and whoever holds the
+bucket credentials. That is the deployer, by construction; per-user mode
+isolates users from each other, not from the operator of the notebook.
+
+**`master_key`: sealed at rest.** With a master secret configured (32+ random
+characters, as a `$VAR` secret), every note is written as
+
+```
+"JOT1" || nonce[12] || AES-256-GCM(key_owner, nonce, text, aad = object key)
+```
+
+with `key_owner = HMAC-SHA256(SHA-256(master_key), "jot-key-v1:user:<sub>")`
+(or `…:shared` without `sso`). The bucket, its operator and anyone with the
+S3 credentials see names and ciphertext; the object key is authenticated,
+so a ciphertext copied to another name or another user's prefix refuses to
+open. Sizes in listings are ciphertext sizes (text + 32 bytes). A plaintext
+object placed in the bucket by other means still reads; a sealed object on a
+deployment whose master key is missing or wrong answers 502 and says so.
+Stated plainly: the deployer holds the master secret (and the relay stores
+deployment secrets, see the platform's secrets docs), so encryption here
+keeps the bucket from being the weak point; it is not operator-proof custody
+the way keep's wallet-derived volume key is.
+
+The two combine: `sso` without `master_key` is plain per-user objects, which
+the bucket owner can read with normal tools; both together is the shape for
+an eyesoff-ai deployment serving many accounts.
+
 ## Routes
 
-Everything is JSON except where noted; the key rides `X-Api-Key`. Note names are relative paths of
+Everything is JSON except where noted; the key rides `X-Api-Key`, and in
+per-user mode the user rides `X-Sso-Token` or `X-User` as above. Note names are relative paths of
 letters, digits, `- _ . space`, joined by single slashes (`projects/enclave.md`,
 `meeting notes/2026-09-01.md`); no `.` or `..` segments, at most 200 bytes.
 A note caps at 1 MiB.
 
 | route | what |
 |---|---|
-| `GET /` | the notebook UI (self-contained HTML; paste the key, browse, edit) |
+| `GET /` | the notebook UI (self-contained HTML; paste the key, or sign in with Enclave in per-user mode; browse, edit) |
+| `GET /sso-return` | the sign-in popup's landing pad (per-user mode) |
 | `GET /ping` | liveness |
-| `GET /api/status` | `{configured, missing, auth, readOnly}`; with the key also `{endpoint, region, bucket, prefix, signed}` |
+| `GET /api/status` | `{configured, missing, auth, readOnly, users, encrypted}`, plus `sso: {authorize_url, aud, accept}` in per-user mode; with the key also `{endpoint, region, bucket, prefix, signed}`; with an identity also `you: {sub, via}` |
 | `GET /api/tools` | the six verbs as OpenAI function schemas and as an eyesoff-ai `tools.http` block (see below) |
 | `GET /api/notes?prefix=&limit=` | `{notes: [{name, size, modified, etag}], truncated}` (limit 1..1000, default 200) |
 | `GET /api/notes/<name>` | `{name, content, size, etag, modified}`; `?raw=1` (or `Accept: text/plain`) returns the bytes with a content type from the extension |
@@ -125,11 +192,13 @@ of six function schemas (`notes_list`, `notes_read`, `notes_write`,
 the key in `X-Api-Key`.
 
 **The sibling [agent](../agent) (LangGraph).** Its tool belt already carries
-the six tools; they are offered when the environment names a notebook:
+the six tools; they are offered when the environment names a notebook (and,
+on a per-user jot, the account whose notebook it is):
 
 ```sh
 ENCLAVE_AGENT_NOTES_URL=https://<id8>.app.enclave.host \
 ENCLAVE_AGENT_NOTES_KEY=<the api_key> \
+ENCLAVE_AGENT_NOTES_USER=0x<your account> \
 .venv/bin/enclave-agent -p "Note down that the fleet's egress is IPv6-only, under infra/egress.md"
 ```
 
@@ -141,7 +210,10 @@ that you merge into the eyesoff-ai deployment's App Config, then set
 `JOT_API_KEY` as that deployment's secret. The model then reads and writes
 this notebook from inside its own enclave; the notes travel enclave to
 enclave and land in your bucket, and the conversation never leaves eyesoff-ai
-(only the arguments the model chose cross). One entry, for the shape:
+(only the arguments the model chose cross). On a per-user jot the block also
+carries `"x-user": "$user"`, which eyesoff-ai (0.56+) fills with the account
+behind the turn's sign-in token or derived API key; a turn with no signed-in
+caller cannot call the notebook at all. One entry, for the shape:
 
 ```json
 { "tools": { "http": [
@@ -149,7 +221,7 @@ enclave and land in your bucket, and the conversation never leaves eyesoff-ai
     "description": "Append a paragraph to a note, creating it if needed.",
     "method": "POST",
     "url": "https://<id8>.app.enclave.host/api/notes/{name}/append",
-    "headers": { "x-api-key": "$JOT_API_KEY" },
+    "headers": { "x-api-key": "$JOT_API_KEY", "x-user": "$user" },
     "parameters": { "type": "object",
       "properties": { "name": { "type": "string" }, "content": { "type": "string" } },
       "required": ["name", "content"] },
@@ -185,21 +257,28 @@ wasmtime serve -Scommon --addr 127.0.0.1:8080 \
 
 `scripts/e2e.sh` runs the whole contract against a local minio through the
 real `wasmtime serve`: every route, the key gate, the name filter, the size
-cap, conditional writes, read-only and unconfigured deployments, and the
+cap, conditional writes, read-only and unconfigured deployments, per-user
+isolation with sign-in tokens minted the way the platform mints them (the
+spec's throwaway key, via `cast wallet sign`), sealing at rest, and the
 claim that matters (a note written through the API is byte-for-byte the
-object in the bucket). Needs `minio`, `wasmtime`, `curl` and `python3` on
-PATH. The in-crate unit tests run under wasmtime too:
+object in the bucket, or unreadable there when sealed). Needs `minio`,
+`wasmtime`, `curl`, `python3` and `cast` on PATH. The in-crate unit tests run under wasmtime too:
 `CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime run -Shttp" cargo test --target wasm32-wasip2`.
 
 ## Publish and deploy
 
 ```sh
-enclave publish target/wasm32-wasip2/release/jot.wasm --slug jot --version 1.0.1 \
+enclave publish target/wasm32-wasip2/release/jot.wasm --slug jot --version 1.1.0 \
   --name jot --desc "A notebook your agent keeps in your own bucket" \
   --mem 128 --cpu-gflops 1 \
   --config '{"endpoint":"https://<account>.r2.cloudflarestorage.com","region":"auto","bucket":"agent-notes","prefix":"notes/","credentials":{"accessKeyId":"$JOT_ACCESS_KEY_ID","secretAccessKey":"$JOT_SECRET_ACCESS_KEY"},"api_key":"$JOT_API_KEY"}'
-enclave deploy jot --fund 5 --secrets JOT_ACCESS_KEY_ID=… --secrets JOT_SECRET_ACCESS_KEY=… --secrets JOT_API_KEY=…
+enclave deploy jot --fund 5 --secrets JOT_ACCESS_KEY_ID=… --secrets JOT_SECRET_ACCESS_KEY=… \
+  --secrets JOT_API_KEY=… --secrets JOT_MASTER_KEY=…
 ```
+
+For a per-user notebook, put the deployment's own id in `sso.audience` and
+the eyesoff-ai deployment's id in `sso.accept` through the config override
+once the ids exist (the console's Config panel or `enclave config set`).
 
 The version's config is a template: a deployer overrides `endpoint`,
 `bucket` and `prefix` per deployment (console Config panel or `enclave config
@@ -220,7 +299,10 @@ it makes no request except to the configured endpoint.
 - Minio, R2 and AWS S3 all honour `If-Match` on PUT. A store that ignores it
   makes conditional writes unconditional; the e2e prints a WARN if yours does.
 - The bucket is part of your trust base: it can serve a different note than
-  the one written. Prefer an `https` endpoint and a token scoped to the one
-  bucket and prefix.
+  the one written, or withhold one. Sealing makes a substituted note fail to
+  open rather than read wrong; it cannot make a withheld note appear. Prefer
+  an `https` endpoint and a token scoped to the one bucket and prefix.
+- Per-user mode isolates accounts from each other, not from the deployer:
+  the API key can name any user and the master secret derives every key.
 
 Verify the enclave before trusting it: [enclave.host](https://enclave.host).

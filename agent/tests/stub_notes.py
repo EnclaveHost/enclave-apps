@@ -14,7 +14,9 @@ KEY = "stub-key"
 
 
 def start(key: str = KEY):
-    notes: dict[str, str] = {}
+    # one dict per X-User (the empty string is the shared notebook), the way
+    # a per-user jot keeps one namespace per account
+    spaces: dict[str, dict[str, str]] = {}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
@@ -41,6 +43,7 @@ def start(key: str = KEY):
             if u.path.startswith("/api/") and u.path not in ("/api/status", "/api/tools"):
                 if self.headers.get("x-api-key") != key:
                     return self._err(401, "unauthorized")
+            notes = spaces.setdefault(self.headers.get("x-user", ""), {})
             if u.path == "/api/notes" and self.command == "GET":
                 p = q.get("prefix", "")
                 return self._json(200, {"notes": [
@@ -95,4 +98,4 @@ def start(key: str = KEY):
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, f"http://127.0.0.1:{server.server_port}", notes
+    return server, f"http://127.0.0.1:{server.server_port}", spaces

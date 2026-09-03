@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex" />
+<title>Signing you in…</title>
+<style>
+  html { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0e14; color: #8a93a6;
+         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<p id="msg">Signing you in…</p>
+<script>
+/* The popup sign-in's landing pad (the same shape as eyesoff-ai's). The
+   notebook page opened enclave.host in a popup; the console redirected the
+   popup back HERE with the token in the fragment. Being same-origin with the
+   opener again, this page hands the fragment over with postMessage and
+   closes. It only ferries: the notebook page checks the state echo before
+   trusting anything. No opener: carry the fragment to the notebook page,
+   whose boot parser runs the same acceptance. */
+(function () {
+  var frag = location.hash || "";
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  var handed = false;
+  if (window.opener && !window.opener.closed) {
+    try {
+      window.opener.postMessage({ enclave_sso: frag }, new URL(".", location.href).origin);
+      handed = true;
+    } catch (e) {}
+  }
+  if (handed) {
+    document.getElementById("msg").textContent = "Signed in. You can close this window.";
+    window.close();
+  } else {
+    location.replace("./" + frag);
+  }
+})();
+</script>
+</body>
+</html>

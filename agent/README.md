@@ -45,6 +45,7 @@ output. Tool activity is narrated to stderr as it happens.
 | `ENCLAVE_AGENT_SYSTEM_PROMPT` | (see config.py) | the agent's standing instructions |
 | `ENCLAVE_AGENT_NOTES_URL` | (unset) | a [jot](../jot) deployment (`https://<id8>.app.enclave.host`); when set, the six notebook tools (`notes_list/read/write/append/search/delete`) join the belt |
 | `ENCLAVE_AGENT_NOTES_KEY` | (empty) | that deployment's `api_key`, sent as `X-Api-Key` |
+| `ENCLAVE_AGENT_NOTES_USER` | (empty) | on a per-user jot, the Enclave account (0x address or acct_ id) whose notebook this agent writes, sent as `X-User` beside the key |
 
 ## Layout
 

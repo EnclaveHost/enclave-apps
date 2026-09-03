@@ -167,9 +167,13 @@ _NOTES_MAX_CHARS = 20000
 class NotesClient:
     """Thin HTTP client for a jot deployment. Stdlib only, like the rest."""
 
-    def __init__(self, base_url: str, api_key: str = "") -> None:
+    def __init__(self, base_url: str, api_key: str = "", user: str = "") -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        # a per-user jot deployment needs a name beside the key: the Enclave
+        # account (0x wallet address or acct_ id) whose notebook this agent
+        # writes. Trusted by jot only together with the api_key.
+        self.user = user
 
     @staticmethod
     def _path(name: str) -> str:
@@ -186,6 +190,8 @@ class NotesClient:
             # X-Api-Key, not a bearer: the platform's app gateway consumes
             # Authorization (its own session carriage) and never forwards it
             headers["x-api-key"] = self.api_key
+        if self.user:
+            headers["x-user"] = self.user
         if body is not None:
             data = json.dumps(body).encode()
             headers["content-type"] = "application/json"
@@ -283,11 +289,13 @@ def make_notes_tools(client: NotesClient) -> list:
 
 def notes_tools_from_env() -> list:
     """The notebook tools when ENCLAVE_AGENT_NOTES_URL points at a jot
-    deployment (ENCLAVE_AGENT_NOTES_KEY is its api_key); otherwise none."""
+    deployment (ENCLAVE_AGENT_NOTES_KEY is its api_key, ENCLAVE_AGENT_NOTES_USER
+    the account whose notebook it is, on a per-user deployment); otherwise none."""
     url = os.environ.get("ENCLAVE_AGENT_NOTES_URL", "").strip()
     if not url:
         return []
-    return make_notes_tools(NotesClient(url, os.environ.get("ENCLAVE_AGENT_NOTES_KEY", "")))
+    return make_notes_tools(NotesClient(url, os.environ.get("ENCLAVE_AGENT_NOTES_KEY", ""),
+                                        os.environ.get("ENCLAVE_AGENT_NOTES_USER", "")))
 
 
 DEFAULT_TOOLS = [calculator, read_url, utc_now, *notes_tools_from_env()]

@@ -1,6 +1,6 @@
 [package]
 name = "jot"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "An agent's notebook in your own S3 bucket: a bearer-keyed JSON API (list, read, write, append, search, delete) served from an attested enclave, every note one SigV4-signed object in R2/S3. Shaped for tool calls: GET /api/tools hands any agent its function schemas."
 license-file = "../LICENSE"
@@ -16,6 +16,17 @@ serde_json = "1"
 # signing chain. No aws-sdk, no chrono: the date math is a page of std.
 sha2 = "0.10"
 hmac = "0.12"
+# Per-user isolation (src/sso.rs): the platform's EST1 sign-in tokens are
+# EIP-191 secp256k1 signatures, verified here with the same pure-Rust stack
+# eyesoff-ai uses, so the component still builds for wasm32-wasip2.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+sha3 = { version = "0.10", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# Encryption at rest (src/crypt.rs): AES-256-GCM per object under a key
+# derived from the deployment's master secret and the note's owner. Pure
+# Rust; risc-box builds the same crate for this target.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+getrandom = "0.2"
 
 [profile.release]
 codegen-units = 1

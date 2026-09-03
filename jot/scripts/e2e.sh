@@ -208,6 +208,121 @@ curl -s -o "$WORK/body" "$OB/api/status"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$OB/api/notes")" = 200 ] || fail "open list"
 pass "no api_key: open, status says so"
 
+
+echo "== per-user mode: sso + master_key =="
+if ! command -v cast >/dev/null 2>&1; then
+  echo "WARN: cast (foundry) not on PATH; skipping the per-user section"
+else
+# Tokens are minted the way the platform mints them (PLATFORM-sso.md): claims
+# -> base64url -> EIP-191 personal_sign of "EST1.<b64>" by the signer key.
+# Key 0x42..42 is the spec's throwaway; its address is the pinned signer.
+SIGNER=0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025
+AUD_SELF=0x1111111111111111111111111111111111111111111111111111111111111111
+AUD_EYES=0x2222222222222222222222222222222222222222222222222222222222222222
+AUD_OTHER=0x3333333333333333333333333333333333333333333333333333333333333333
+SUB_A=0x00a329c0648769a73afac7f9381e08fb43dbea72
+SUB_B=acct_0e64d1897f10b32d3a1bc84e
+mint() { # sub aud iat exp [privkey]
+  python3 - "$@" <<'MINT'
+import base64, json, subprocess, sys
+sub, aud, iat, exp = sys.argv[1:5]
+pk = sys.argv[5] if len(sys.argv) > 5 else "0x" + "42" * 32
+payload = base64.urlsafe_b64encode(json.dumps({"v": 1, "sub": sub, "aud": aud, "iat": int(iat), "exp": int(exp)}, separators=(",", ":")).encode()).rstrip(b"=").decode()
+msg = "EST1." + payload
+sig = subprocess.check_output(["cast", "wallet", "sign", "--private-key", pk, msg]).decode().strip()
+print(msg + "." + base64.urlsafe_b64encode(bytes.fromhex(sig[2:])).rstrip(b"=").decode())
+MINT
+}
+NOW=$(date +%s)
+TA=$(mint $SUB_A $AUD_SELF $NOW $((NOW+3600)))
+TB=$(mint $SUB_B $AUD_EYES $NOW $((NOW+3600)))
+TOTHER=$(mint $SUB_A $AUD_OTHER $NOW $((NOW+3600)))
+TEXP=$(mint $SUB_A $AUD_SELF $((NOW-7200)) $((NOW-3600)))
+TBADSIG=$(mint $SUB_A $AUD_SELF $NOW $((NOW+3600)) 0x4343434343434343434343434343434343434343434343434343434343434343)
+MASTER=master-secret-for-the-e2e-only-0123456789
+U_PORT=$((NC_PORT+2))
+U_CONFIG=$(cat <<JSON
+{"endpoint":"$S3","region":"us-east-1","bucket":"$BUCKET","prefix":"peruser/",
+ "credentials":{"accessKeyId":"\$JOT_ACCESS_KEY_ID","secretAccessKey":"\$JOT_SECRET_ACCESS_KEY"},
+ "api_key":"\$JOT_API_KEY","master_key":"\$JOT_MASTER_KEY",
+ "sso":{"signer":"$SIGNER","audience":"$AUD_SELF","accept":["$AUD_EYES"]}}
+JSON
+)
+serve $U_PORT "$U_CONFIG" --env JOT_API_KEY="$KEY" --env JOT_ACCESS_KEY_ID=$AK --env JOT_SECRET_ACCESS_KEY=$SK --env JOT_MASTER_KEY=$MASTER
+UB="http://127.0.0.1:$U_PORT"
+ureq() { local m=$1 p=$2; shift 2; curl -s -o "$WORK/body" -w '%{http_code}' -X "$m" "$@" "$UB$p"; }
+ta=(-H "x-sso-token: $TA"); tb=(-H "x-sso-token: $TB")
+
+ureq GET /api/status >/dev/null
+[ "$(jq_ 'd["users"] and d["encrypted"] and d["sso"]["aud"]=="'$AUD_SELF'" and d["sso"]["accept"]==1 and "you" not in d')" = True ] || fail "per-user status: $(cat $WORK/body)"
+[ "$(ureq GET /api/status "${ta[@]}")" = 200 ] && [ "$(jq_ 'd["you"]["sub"]=="'$SUB_A'" and d["you"]["via"]=="sso"')" = True ] || fail "status with token must name the user"
+pass "per-user status: users, encrypted, sso facts, and who you are"
+[ "$(ureq GET /sso-return)" = 200 ] && grep -q "enclave_sso" "$WORK/body" && pass "sso-return page serves"
+
+[ "$(ureq GET /api/notes "${auth[@]}")" = 401 ] && grep -q "per-user" "$WORK/body" || fail "key alone must be refused in per-user mode"
+[ "$(ureq GET /api/notes)" = 401 ] || fail "nothing at all must be refused"
+[ "$(ureq GET /api/notes -H "x-user: $SUB_A")" = 401 ] || fail "x-user without the key must be refused"
+[ "$(ureq GET /api/notes "${auth[@]}" -H "x-user: bob")" = 400 ] || fail "malformed x-user must 400"
+[ "$(ureq GET /api/notes -H "x-sso-token: $TOTHER")" = 401 ] && grep -q "does not serve" "$WORK/body" || fail "foreign audience must be refused"
+[ "$(ureq GET /api/notes -H "x-sso-token: $TEXP")" = 401 ] && grep -q "expired" "$WORK/body" || fail "expired token must be refused"
+[ "$(ureq GET /api/notes -H "x-sso-token: $TBADSIG")" = 401 ] && grep -q "trusted signer" "$WORK/body" || fail "wrong signer must be refused"
+[ "$(ureq GET /api/notes -H "authorization: Bearer $TA")" = 200 ] || fail "an EST1 bearer works off-platform"
+pass "per-user gate: key alone, no identity, unkeyed x-user, bad x-user, foreign aud, expired, wrong signer all refused"
+
+SECRET_TEXT="user A's secret text about the Needle"
+[ "$(ureq PUT /api/notes/a.md "${ta[@]}" -H 'content-type: application/json' -d "{\"content\":\"$SECRET_TEXT\"}")" = 200 ] || fail "A write: $(cat $WORK/body)"
+[ "$(ureq GET /api/notes/a.md "${ta[@]}")" = 200 ] && [ "$(jq_ 'd["content"]')" = "$SECRET_TEXT" ] || fail "A read back"
+[ "$(ureq GET /api/notes "${ta[@]}")" = 200 ] && [ "$(jq_ '[n["name"] for n in d["notes"]]')" = "['a.md']" ] || fail "A list"
+[ "$(ureq GET /api/notes/a.md "${auth[@]}" -H "x-user: $SUB_A")" = 200 ] && [ "$(jq_ 'd["content"]')" = "$SECRET_TEXT" ] || fail "key + x-user reaches the same note"
+pass "user A (own audience, sso) writes, reads, lists; the service path (key + X-User) sees the same note"
+
+[ "$(ureq GET /api/notes "${tb[@]}")" = 200 ] && [ "$(jq_ 'len(d["notes"])')" = 0 ] || fail "B must see an empty notebook"
+[ "$(ureq GET /api/notes/a.md "${tb[@]}")" = 404 ] || fail "B must not read A's note"
+[ "$(ureq PUT /api/notes/b.md "${tb[@]}" -H 'content-type: application/json' -d '{"content":"B only"}')" = 200 ] || fail "B write"
+[ "$(ureq GET /api/notes/b.md "${ta[@]}")" = 404 ] || fail "A must not read B's note"
+[ "$(ureq GET '/api/search?q=needle' "${ta[@]}")" = 200 ] && [ "$(jq_ 'len(d["hits"])==1 and d["scanned"]==1')" = True ] || fail "A search scoped"
+[ "$(ureq GET '/api/search?q=needle' "${tb[@]}")" = 200 ] && [ "$(jq_ 'len(d["hits"])==0')" = True ] || fail "B search must not see A"
+[ "$(ureq GET /api/notes "${auth[@]}" -H "x-user: $SUB_B")" = 200 ] && [ "$(jq_ '[n["name"] for n in d["notes"]]')" = "['b.md']" ] || fail "service path for B"
+pass "isolation: B (accepted eyesoff audience) cannot list, read or search A's notes, and vice versa"
+
+curl -s -o "$WORK/obj" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$S3/$BUCKET/peruser/users/$SUB_A/a.md"
+[ "$(head -c 4 $WORK/obj)" = "JOT1" ] || fail "bucket object is not sealed"
+grep -q "Needle" "$WORK/obj" && fail "plaintext leaked into the bucket" || true
+[ "$(stat -c %s $WORK/obj)" = $(( ${#SECRET_TEXT} + 32 )) ] || fail "sealed size = text + 32"
+pass "bucket holds ciphertext at peruser/users/<sub>/a.md (JOT1 magic, no plaintext, +32 bytes)"
+
+printf 'plain legacy' > "$WORK/legacy"
+curl -s -o /dev/null -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" -T "$WORK/legacy" "$S3/$BUCKET/peruser/users/$SUB_A/legacy.md"
+[ "$(ureq GET '/api/notes/legacy.md?raw=1' "${ta[@]}")" = 200 ] && [ "$(cat $WORK/body)" = "plain legacy" ] || fail "legacy plaintext object must still read"
+pass "a plaintext object written outside the app still reads"
+
+[ "$(ureq POST /api/notes/a.md/append "${ta[@]}" -H 'content-type: application/json' -d '{"content":"appended"}')" = 200 ] || fail "sealed append"
+[ "$(ureq GET '/api/notes/a.md?raw=1' "${ta[@]}")" = 200 ] && [ "$(cat $WORK/body)" = "$SECRET_TEXT
+appended" ] || fail "sealed append content"
+[ "$(ureq DELETE /api/notes/a.md "${ta[@]}")" = 200 ] && [ "$(ureq GET /api/notes/b.md "${tb[@]}")" = 200 ] || fail "delete scoped"
+pass "sealed append and delete"
+
+[ "$(ureq GET /api/tools)" = 200 ] && [ "$(jq_ 'd["users"] and all(t["headers"]["x-user"]=="$user" for t in d["eyesoff_ai"]["tools"]["http"])')" = True ] || fail "tools block must carry x-user: \$user"
+pass "tools block names the user for eyesoff-ai"
+
+# per-user mode with NO api_key: only sign-in tokens name a user
+serve $((U_PORT+1)) "${U_CONFIG/\"api_key\":\"\$JOT_API_KEY\",/}" --env JOT_ACCESS_KEY_ID=$AK --env JOT_SECRET_ACCESS_KEY=$SK --env JOT_MASTER_KEY=$MASTER
+NB2="http://127.0.0.1:$((U_PORT+1))"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H "x-user: $SUB_A" "$NB2/api/notes")" = 401 ] || fail "x-user must be ignored without a key to trust"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -H "x-user: $SUB_A" "$NB2/api/notes")" = 401 ] || fail "a key nobody configured must not unlock x-user"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${ta[@]}" "$NB2/api/notes")" = 200 ] || fail "sign-in still works"
+pass "per-user mode without api_key: X-User is never trusted, tokens still work"
+
+# a shared notebook with a master_key: sealed too
+serve $((U_PORT+2)) "${CONFIG/\"api_key\"/\"master_key\":\"\$JOT_MASTER_KEY\",\"prefix\":\"sealed\/\",\"api_key\"}" --env JOT_API_KEY="$KEY" --env JOT_ACCESS_KEY_ID=$AK --env JOT_SECRET_ACCESS_KEY=$SK --env JOT_MASTER_KEY=$MASTER
+SB="http://127.0.0.1:$((U_PORT+2))"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X PUT -H 'content-type: application/json' -d '{"content":"shared sealed"}' "$SB/api/notes/s.md")" = 200 ] || fail "shared sealed write"
+curl -s -o "$WORK/obj" --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "$S3/$BUCKET/sealed/s.md"
+[ "$(head -c 4 $WORK/obj)" = "JOT1" ] || fail "shared object not sealed"
+[ "$(curl -s "${auth[@]}" "$SB/api/notes/s.md?raw=1")" = "shared sealed" ] || fail "shared sealed read"
+pass "master_key alone seals a shared notebook"
+fi
+
 grep -qi "panic" "$WORK"/app*.log && fail "a panic in the app logs" || true
 OK=1
 echo "ALL PASS"

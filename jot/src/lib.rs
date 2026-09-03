@@ -19,12 +19,31 @@
 //! a notebook that must be unreadable at rest belongs on an encrypted volume
 //! (see keep).
 //!
+//! PER-USER MODE (an `sso` block in the config) makes this one notebook per
+//! signed-in Enclave account: every request must name a user, and the notes
+//! it can reach live under `<prefix>users/<sub>/`. Two ways to name one:
+//!   - `X-Sso-Token: EST1…`, the platform's sign-in token, verified here
+//!     (src/sso.rs) against the pinned signer and this deployment's id OR the
+//!     ids in `sso.accept`: the eyesoff-ai instances this notebook serves,
+//!     which forward the token they verified;
+//!   - the deployment's API key plus `X-User: <sub>`: the SERVICE asserting
+//!     the identity. Only an eyesoff-ai holding the key can do this, and it
+//!     fills the header from the token it verified, never from anything the
+//!     model wrote (tool headers come from that deployment's config).
+//! Without the key, X-User is ignored; without an sso block, X-User and
+//! X-Sso-Token are ignored and the notebook is one shared space.
+//!
+//! ENCRYPTION AT REST (a `master_key` in the config, as a `$VAR` secret): every
+//! note is sealed with AES-256-GCM under a key derived from the master secret
+//! and its owner (src/crypt.rs). The bucket sees names and ciphertext.
+//!
 //! Routes (JSON unless noted; `/api/*` except status and tools need the key
 //! when one is configured, as `X-Api-Key: <key>`. `Authorization: Bearer` is
 //! accepted too, but the platform's app gateway strips that header on the way
 //! in (it is the carriage for the owner's own session token), so on
 //! enclave.host only X-Api-Key ever arrives):
 //!   GET    /                          the notebook UI (self-contained HTML)
+//!   GET    /sso-return                the sign-in popup's landing pad (per-user mode)
 //!   GET    /ping                      liveness
 //!   GET    /api/status                configured? auth? read-only? (+bucket facts with the key)
 //!   GET    /api/tools                 tool schemas for agents (OpenAI functions + an eyesoff-ai block)
@@ -36,8 +55,10 @@
 //!   GET    /api/search?q=&prefix=&limit=  case-insensitive substring search over note bodies
 #[allow(warnings)]
 mod bindings;
+mod crypt;
 mod http;
 mod s3;
+mod sso;
 
 use bindings::exports::wasi::http::incoming_handler::Guest;
 use bindings::wasi::http::types::{
@@ -46,6 +67,7 @@ use bindings::wasi::http::types::{
 use bindings::wasi::io::streams::StreamError;
 
 static INDEX_HTML: &str = include_str!("index.html");
+static SSO_RETURN_HTML: &str = include_str!("sso-return.html");
 const APP: &str = "jot";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// a note's content caps at 1 MiB
@@ -71,8 +93,15 @@ struct Config {
     creds: Option<s3::Creds>,
     api_key: Option<String>,
     read_only: bool,
+    /// per-user mode: who may use the notebook and how they prove it
+    sso: Option<sso::SsoConfig>,
+    /// encryption at rest, when set
+    master_key: Option<String>,
     /// required fields still empty, typically `$VAR` secrets not set yet
     missing: Vec<&'static str>,
+    /// a config block that parsed but is wrong (a malformed sso block):
+    /// the app serves and says so, but refuses every note route
+    error: Option<String>,
 }
 
 /// Resolve config string values of the exact form `$NAME` / `${NAME}` from
@@ -147,6 +176,16 @@ fn load_config() -> Config {
     if bucket.is_empty() {
         missing.push("bucket");
     }
+    let (sso, error) = match sso::SsoConfig::from_config(&v) {
+        Ok(c) => (c, None),
+        Err(e) => (None, Some(format!("configuration error: {e}"))),
+    };
+    let master_key = Some(s("master_key")).filter(|k| !k.is_empty());
+    if let Some(k) = &master_key {
+        if k.len() < 16 {
+            eprintln!("[jot] config: master_key is short ({} chars); use 32+ random characters", k.len());
+        }
+    }
     Config {
         title: { let t = s("title"); if t.is_empty() { "jot".to_string() } else { t } },
         endpoint,
@@ -156,7 +195,10 @@ fn load_config() -> Config {
         creds,
         api_key: Some(s("api_key")).filter(|k| !k.is_empty()),
         read_only: v.get("readOnly").and_then(|x| x.as_bool()).unwrap_or(false),
+        sso,
+        master_key,
         missing,
+        error,
     }
 }
 
@@ -312,6 +354,64 @@ fn authorized(cfg: &Config, req: &IncomingRequest) -> bool {
     false
 }
 
+/// Who a request acts as, once its credentials have been checked.
+enum Caller {
+    /// the API key, in a shared (non per-user) notebook
+    Service,
+    /// a named account; `via` says how the name was established
+    User { sub: String, via: &'static str },
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The sign-in token a request carries, if any: `X-Sso-Token` (the header
+/// that survives the platform gateway), or an EST1 bearer for direct use.
+fn sso_token_of(req: &IncomingRequest) -> Option<String> {
+    if let Some(t) = header(req, "x-sso-token").map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        return Some(t);
+    }
+    header(req, "authorization")
+        .and_then(|a| a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer ")).map(|t| t.trim().to_string()))
+        .filter(|t| t.starts_with("EST1."))
+}
+
+/// Establish the caller. Per-user mode needs a NAME, from a verified sign-in
+/// token or from the service (API key + X-User); a shared notebook needs the
+/// key alone. Errors are (status, message).
+fn identify(cfg: &Config, req: &IncomingRequest) -> Result<Caller, (u16, String)> {
+    let has_key = authorized(cfg, req);
+    let Some(sso_cfg) = &cfg.sso else {
+        return if has_key {
+            Ok(Caller::Service)
+        } else {
+            Err((401, "unauthorized: send the API key as `X-Api-Key: <key>` (on enclave.host the gateway consumes `Authorization`, so a bearer never arrives here)".into()))
+        };
+    };
+    if let Some(tok) = sso_token_of(req) {
+        return match sso::verify(sso_cfg, &tok, now_secs()) {
+            Ok(c) => Ok(Caller::User { sub: c.sub, via: "sso" }),
+            Err(e) => Err((401, format!("[sso_required] {e}"))),
+        };
+    }
+    // the service path: only a real key counts (an open deployment has no
+    // service to trust), and the name must be one of the platform's shapes
+    if has_key && cfg.api_key.is_some() {
+        return match header(req, "x-user").map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) {
+            Some(u) => match sso::canonical_sub(&u) {
+                Some(sub) => Ok(Caller::User { sub, via: "key" }),
+                None => Err((400, "X-User must be an Enclave identity: a 0x wallet address or an acct_ id".into())),
+            },
+            None => Err((401, "[sso_required] this is a per-user notebook: name the user with `X-Sso-Token: <Enclave sign-in token>`, or `X-User: <sub>` beside the API key".into())),
+        };
+    }
+    Err((401, "[sso_required] this is a per-user notebook: sign in with your Enclave account and send the token as `X-Sso-Token`".into()))
+}
+
 /// The deployment's own public origin, for the tool schemas: what the
 /// browser or agent dialled, as the gateway forwarded it.
 fn origin_of(req: &IncomingRequest) -> String {
@@ -331,10 +431,25 @@ fn origin_of(req: &IncomingRequest) -> String {
 struct Store<'a> {
     ep: s3::Endpoint,
     cfg: &'a Config,
+    /// every key this caller can reach starts with this: the configured
+    /// prefix, plus `users/<sub>/` in per-user mode
+    ns: String,
+    /// sealed notes, when the deployment has a master key
+    cipher: Option<crypt::Cipher>,
+}
+
+/// What a note looks like once fetched and, if sealed, opened.
+struct Note {
+    text: Vec<u8>,
+    etag: String,
+    modified: String,
 }
 
 impl<'a> Store<'a> {
-    fn open(cfg: &'a Config) -> Result<Store<'a>, String> {
+    fn open(cfg: &'a Config, caller: &Caller) -> Result<Store<'a>, String> {
+        if let Some(e) = &cfg.error {
+            return Err(e.clone());
+        }
         if !cfg.missing.is_empty() {
             return Err(format!(
                 "configuration incomplete: {} not set. Set the deployment's config/secrets and restart.",
@@ -342,13 +457,50 @@ impl<'a> Store<'a> {
             ));
         }
         let ep = s3::Endpoint::parse(&cfg.endpoint, &cfg.region)?;
-        Ok(Store { ep, cfg })
+        let (ns, scope) = match caller {
+            Caller::Service => (cfg.prefix.clone(), "shared".to_string()),
+            Caller::User { sub, .. } => (format!("{}users/{}/", cfg.prefix, sub), format!("user:{sub}")),
+        };
+        let cipher = cfg.master_key.as_deref().map(|m| crypt::Cipher::for_scope(m, &scope));
+        Ok(Store { ep, cfg, ns, cipher })
     }
     fn client(&self) -> s3::Client<'_> {
         s3::Client { ep: &self.ep, bucket: &self.cfg.bucket, creds: self.cfg.creds.as_ref() }
     }
     fn key(&self, name: &str) -> String {
-        format!("{}{}", self.cfg.prefix, name)
+        format!("{}{}", self.ns, name)
+    }
+    fn name_of<'k>(&self, key: &'k str) -> &'k str {
+        key.strip_prefix(self.ns.as_str()).unwrap_or(key)
+    }
+
+    /// GET and, when sealed, open one note. A plaintext object under an
+    /// encrypting deployment still reads (it was readable anyway); a sealed
+    /// object under a deployment with no master key does not.
+    fn fetch(&self, key: &str) -> Result<Option<Note>, s3::S3Error> {
+        let Some(f) = self.client().get(key)? else { return Ok(None) };
+        let text = if crypt::Cipher::is_sealed(&f.body) {
+            match &self.cipher {
+                Some(c) => c.open(key, &f.body).map_err(|e| s3::S3Error::Transport(e))?,
+                None => return Err(s3::S3Error::Transport(
+                    "this note is sealed but the deployment has no master_key: set the secret and restart".into(),
+                )),
+            }
+        } else {
+            f.body
+        };
+        Ok(Some(Note { text, etag: f.etag, modified: f.modified }))
+    }
+
+    /// Seal (when configured) and PUT one note.
+    fn store(&self, key: &str, name: &str, text: &[u8], if_match: Option<&str>) -> Result<String, s3::S3Error> {
+        match &self.cipher {
+            Some(c) => {
+                let sealed = c.seal(key, text).map_err(s3::S3Error::Transport)?;
+                self.client().put(key, &sealed, "application/octet-stream", if_match)
+            }
+            None => self.client().put(key, text, content_type_for(name), if_match),
+        }
     }
 }
 
@@ -364,15 +516,29 @@ fn content_type_for(name: &str) -> &'static str {
 
 // ---- handlers --------------------------------------------------------------
 
-fn handle_status(out: ResponseOutparam, cfg: &Config, with_key: bool) {
+fn handle_status(out: ResponseOutparam, cfg: &Config, req: &IncomingRequest) {
     let mut v = serde_json::json!({
         "app": APP, "version": VERSION, "title": cfg.title,
-        "configured": cfg.missing.is_empty(),
+        "configured": cfg.missing.is_empty() && cfg.error.is_none(),
         "missing": cfg.missing,
         "auth": cfg.api_key.is_some(),
         "readOnly": cfg.read_only,
+        "users": cfg.sso.is_some(),
+        "encrypted": cfg.master_key.is_some(),
     });
-    if with_key {
+    if let Some(e) = &cfg.error {
+        v["error"] = serde_json::json!(e);
+    }
+    if let Some(sc) = &cfg.sso {
+        // public facts the UI needs before anyone is signed in
+        v["sso"] = serde_json::json!({ "authorize_url": sc.authorize_url, "aud": sc.audience, "accept": sc.accept.len() });
+    }
+    // who the request already is, when it says: the UI's "signed in as"
+    let with_key = authorized(cfg, req) && cfg.api_key.is_some();
+    if let Ok(Caller::User { sub, via }) = identify(cfg, req) {
+        v["you"] = serde_json::json!({ "sub": sub, "via": via });
+    }
+    if with_key || (cfg.api_key.is_none() && cfg.sso.is_none()) {
         v["endpoint"] = serde_json::json!(cfg.endpoint);
         v["region"] = serde_json::json!(cfg.region);
         v["bucket"] = serde_json::json!(cfg.bucket);
@@ -387,7 +553,7 @@ fn handle_status(out: ResponseOutparam, cfg: &Config, with_key: bool) {
 /// tools that way) and a ready-to-paste `tools.http` block for an eyesoff-ai
 /// deployment, whose server-side registry calls plain HTTP endpoints with
 /// `{arg}` URL placeholders and `$SECRET` headers.
-fn handle_tools(out: ResponseOutparam, origin: &str) {
+fn handle_tools(out: ResponseOutparam, origin: &str, users: bool) {
     let name_p = serde_json::json!({ "type": "string", "description": "note name: a relative path like 'projects/enclave.md'; letters, digits, - _ . and spaces, slashes between segments" });
     let content_p = serde_json::json!({ "type": "string", "description": "the note's full text (markdown is a good default)" });
     let prefix_p = serde_json::json!({ "type": "string", "description": "only names starting with this, e.g. 'projects/'" });
@@ -412,6 +578,12 @@ fn handle_tools(out: ResponseOutparam, origin: &str) {
             "url": format!("{origin}{url}"),
             "headers": { "x-api-key": "$JOT_API_KEY" },
             "parameters": { "type": "object", "properties": params, "required": required } });
+        if users {
+            // eyesoff-ai fills $user from the sign-in it verified for the
+            // turn, never from the model; without a signed-in caller the
+            // tool call fails there instead of reaching here nameless
+            e["headers"]["x-user"] = serde_json::json!("$user");
+        }
         if let Some(b) = body { e["body"] = b; }
         e
     };
@@ -425,27 +597,28 @@ fn handle_tools(out: ResponseOutparam, origin: &str) {
     ] } });
     json(out, 200, serde_json::json!({
         "base_url": origin,
-        "auth": "X-Api-Key: <api_key> (Authorization: Bearer works only off-platform: the enclave.host gateway consumes that header)",
+        "auth": if users {
+            "X-Api-Key: <api_key> plus X-User: <sub> (a service naming the user), or X-Sso-Token: <Enclave sign-in token>"
+        } else {
+            "X-Api-Key: <api_key> (Authorization: Bearer works only off-platform: the enclave.host gateway consumes that header)"
+        },
+        "users": users,
         "openai": openai,
         "eyesoff_ai": eyesoff,
     }));
 }
 
-fn strip_prefix_name<'k>(store: &Store, key: &'k str) -> &'k str {
-    key.strip_prefix(store.cfg.prefix.as_str()).unwrap_or(key)
-}
-
 fn handle_list(out: ResponseOutparam, store: &Store, q: &[(String, String)]) {
     let sub = query_get(q, "prefix").unwrap_or("").trim_start_matches('/');
     let limit = query_get(q, "limit").and_then(|l| l.parse().ok()).unwrap_or(LIST_DEFAULT).clamp(1, LIST_MAX);
-    let full = format!("{}{}", store.cfg.prefix, sub);
+    let full = format!("{}{}", store.ns, sub);
     match store.client().list(&full, limit) {
         Ok((objects, truncated)) => {
             let notes: Vec<serde_json::Value> = objects
                 .iter()
                 .filter(|o| !o.key.ends_with('/'))
                 .map(|o| serde_json::json!({
-                    "name": strip_prefix_name(store, &o.key), "size": o.size,
+                    "name": store.name_of(&o.key), "size": o.size,
                     "modified": o.modified, "etag": o.etag }))
                 .collect();
             json(out, 200, serde_json::json!({ "notes": notes, "truncated": truncated, "prefix": sub }));
@@ -455,13 +628,13 @@ fn handle_list(out: ResponseOutparam, store: &Store, q: &[(String, String)]) {
 }
 
 fn handle_read(out: ResponseOutparam, store: &Store, name: &str, raw: bool) {
-    match store.client().get(&store.key(name)) {
+    match store.fetch(&store.key(name)) {
         Ok(Some(f)) => {
             if raw {
-                return respond(out, 200, content_type_for(name), &f.body);
+                return respond(out, 200, content_type_for(name), &f.text);
             }
-            let content = String::from_utf8_lossy(&f.body).into_owned();
-            json(out, 200, serde_json::json!({ "name": name, "content": content, "size": f.body.len(), "etag": f.etag, "modified": f.modified }));
+            let content = String::from_utf8_lossy(&f.text).into_owned();
+            json(out, 200, serde_json::json!({ "name": name, "content": content, "size": f.text.len(), "etag": f.etag, "modified": f.modified }));
         }
         Ok(None) => json_err(out, 404, "no such note"),
         Err(e) => s3_err(out, e),
@@ -487,7 +660,7 @@ fn handle_write(out: ResponseOutparam, store: &Store, name: &str, content: &str,
     if content.len() > MAX_NOTE {
         return json_err(out, 413, "a note caps at 1 MiB");
     }
-    match store.client().put(&store.key(name), content.as_bytes(), content_type_for(name), if_match) {
+    match store.store(&store.key(name), name, content.as_bytes(), if_match) {
         Ok(etag) => json(out, 200, serde_json::json!({ "ok": true, "name": name, "size": content.len(), "etag": etag })),
         Err(s3::S3Error::Http(412, _)) => json_err(out, 412, "the note changed since it was read (ETag mismatch); read it again and retry"),
         Err(e) => s3_err(out, e),
@@ -496,8 +669,8 @@ fn handle_write(out: ResponseOutparam, store: &Store, name: &str, content: &str,
 
 fn handle_append(out: ResponseOutparam, store: &Store, name: &str, content: &str) {
     let key = store.key(name);
-    let (mut text, etag) = match store.client().get(&key) {
-        Ok(Some(f)) => (String::from_utf8_lossy(&f.body).into_owned(), Some(f.etag)),
+    let (mut text, etag) = match store.fetch(&key) {
+        Ok(Some(f)) => (String::from_utf8_lossy(&f.text).into_owned(), Some(f.etag)),
         Ok(None) => (String::new(), None),
         Err(e) => return s3_err(out, e),
     };
@@ -514,7 +687,7 @@ fn handle_append(out: ResponseOutparam, store: &Store, name: &str, content: &str
     // conditional on what was just read: two writers appending at once
     // lose nothing, one of them gets a 409 and retries
     let cond = etag.as_deref().filter(|e| !e.is_empty());
-    match store.client().put(&key, text.as_bytes(), content_type_for(name), cond) {
+    match store.store(&key, name, text.as_bytes(), cond) {
         Ok(new_etag) => json(out, 200, serde_json::json!({ "ok": true, "name": name, "size": text.len(), "etag": new_etag })),
         Err(s3::S3Error::Http(412, _)) => json_err(out, 409, "the note changed while appending; retry"),
         Err(e) => s3_err(out, e),
@@ -535,7 +708,7 @@ fn handle_search(out: ResponseOutparam, store: &Store, q: &[(String, String)]) {
     }
     let sub = query_get(q, "prefix").unwrap_or("").trim_start_matches('/');
     let limit = query_get(q, "limit").and_then(|l| l.parse().ok()).unwrap_or(SEARCH_DEFAULT).clamp(1, SEARCH_MAX);
-    let full = format!("{}{}", store.cfg.prefix, sub);
+    let full = format!("{}{}", store.ns, sub);
     let client = store.client();
     let (objects, more) = match client.list(&full, SEARCH_SCAN) {
         Ok(r) => r,
@@ -553,17 +726,17 @@ fn handle_search(out: ResponseOutparam, store: &Store, q: &[(String, String)]) {
             skipped += 1;
             continue;
         }
-        let f = match client.get(&o.key) {
+        let f = match store.fetch(&o.key) {
             Ok(Some(f)) => f,
             Ok(None) => continue,
             Err(e) => return s3_err(out, e),
         };
         scanned += 1;
-        let text = String::from_utf8_lossy(&f.body);
+        let text = String::from_utf8_lossy(&f.text);
         for (i, line) in text.lines().enumerate() {
             if line.to_lowercase().contains(&needle) {
                 let snippet: String = line.trim().chars().take(200).collect();
-                hits.push(serde_json::json!({ "name": strip_prefix_name(store, &o.key), "line": i + 1, "text": snippet }));
+                hits.push(serde_json::json!({ "name": store.name_of(&o.key), "line": i + 1, "text": snippet }));
                 if hits.len() >= limit {
                     truncated = true;
                     break 'notes;
@@ -587,23 +760,26 @@ impl Guest for Component {
                 return respond(out, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes());
             }
             (Method::Get, "/ping") => return json(out, 200, serde_json::json!({ "ok": true, "pong": true })),
+            (Method::Get, "/sso-return") => {
+                return respond(out, 200, "text/html; charset=utf-8", SSO_RETURN_HTML.as_bytes());
+            }
             _ => {}
         }
         if !path.starts_with("/api/") {
-            return json_err(out, 404, "not found; routes: GET /, GET /ping, GET /api/status, GET /api/tools, GET /api/notes, GET|PUT|DELETE /api/notes/<name>, POST /api/notes/<name>/append, GET /api/search?q=");
+            return json_err(out, 404, "not found; routes: GET /, GET /ping, GET /sso-return, GET /api/status, GET /api/tools, GET /api/notes, GET|PUT|DELETE /api/notes/<name>, POST /api/notes/<name>/append, GET /api/search?q=");
         }
 
         let cfg = load_config();
-        let authed = authorized(&cfg, &req);
         match (&method, path.as_str()) {
-            (Method::Get, "/api/tools") => return handle_tools(out, &origin_of(&req)),
-            (Method::Get, "/api/status") => return handle_status(out, &cfg, authed),
+            (Method::Get, "/api/tools") => return handle_tools(out, &origin_of(&req), cfg.sso.is_some()),
+            (Method::Get, "/api/status") => return handle_status(out, &cfg, &req),
             _ => {}
         }
-        if !authed {
-            return json_err(out, 401, "unauthorized: send the API key as `X-Api-Key: <key>` (on enclave.host the gateway consumes `Authorization`, so a bearer never arrives here)");
-        }
-        let store = match Store::open(&cfg) {
+        let caller = match identify(&cfg, &req) {
+            Ok(c) => c,
+            Err((status, msg)) => return json_err(out, status, &msg),
+        };
+        let store = match Store::open(&cfg, &caller) {
             Ok(s) => s,
             Err(msg) => return json_err(out, 503, &msg),
         };
