@@ -252,7 +252,7 @@ use bindings::exports::wasi::http::incoming_handler::Guest;
 use bindings::wasi::http::types::{
     Fields, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
 };
-use bindings::wasi::io::streams::StreamError;
+use bindings::wasi::io::streams::{OutputStream, StreamError};
 use bindings::wasi::nn::graph::{load, load_by_name, ExecutionTarget, GraphEncoding};
 use bindings::wasi::nn::inference::GraphExecutionContext;
 use bindings::wasi::nn::tensor::{Tensor, TensorType};
@@ -7721,6 +7721,47 @@ fn respond_bytes(out: ResponseOutparam, status: u16, ctype: &str, body_bytes: &[
     respond_with_cache(out, status, ctype, body_bytes, None)
 }
 
+/// A JSON answer whose work outlasts the proxy's idle cut (180 s): the
+/// headers go out at once, a space is written while the work runs (JSON
+/// parsers skip leading whitespace, so the document that follows is read
+/// as if it had come alone), and the document closes the body. The status
+/// is 200 by construction - a caller that may still fail must say so in the
+/// document (`ok: false`), which is what /warmup's readers look at anyway.
+struct JsonStream {
+    body: OutgoingBody,
+    stream: OutputStream,
+}
+
+fn open_json(out: ResponseOutparam) -> JsonStream {
+    let headers = Fields::new();
+    let _ = headers.set(&"content-type".to_string(), &[b"application/json".to_vec()]);
+    let _ = headers.set(&"cache-control".to_string(), &[b"no-cache".to_vec()]);
+    let resp = OutgoingResponse::new(headers);
+    let _ = resp.set_status_code(200);
+    let body = resp.body().unwrap();
+    ResponseOutparam::set(out, Ok(resp));
+    let stream = body.write().unwrap();
+    JsonStream { body, stream }
+}
+
+impl JsonStream {
+    /// one byte of liveness; false once the reader is gone
+    fn tick(&self) -> bool {
+        self.stream.blocking_write_and_flush(b" ").is_ok()
+    }
+
+    fn finish(self, v: &serde_json::Value) {
+        let bytes = v.to_string();
+        for chunk in bytes.as_bytes().chunks(4000) {
+            if self.stream.blocking_write_and_flush(chunk).is_err() {
+                break;
+            }
+        }
+        drop(self.stream);
+        let _ = OutgoingBody::finish(self.body, None);
+    }
+}
+
 /// Static assets get a long immutable cache: the font never changes within a
 /// published version, and a redeploy serves from a new origin anyway.
 fn respond_asset(out: ResponseOutparam, ctype: &str, body_bytes: &[u8]) {
@@ -9110,25 +9151,31 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 
 /// Park the deployment's shared prompt prefix on the engine (mm35, see
 /// Prompt::marks) so the first chat on the default settings starts from it
-/// instead of reading ~3,000 tokens: render the prompt a default-settings
-/// turn would carry, feed it up to the last mark only (no user turn, no
-/// generation - nothing to park as a turn), declaring the marks. An engine
-/// without boundary parks, or a prompt with no mark, is a no-op reported as
-/// such. The cost is one prefill of the prefix, paid once at warm-up rather
-/// than by the first visitor; a later warm-up finds the parks standing and
-/// returns in milliseconds.
-fn warm_prefix(cfg: &AppConfig, mode: &str) -> Result<serde_json::Value, String> {
+/// instead of reading ~3,000 tokens: render the prompt a DEFAULT TEXT TURN
+/// would carry - the same request switches, the same registry, no picture
+/// attached (an image-reading tool in the block would make the boundary one
+/// no text chat can match) - feed it up to the last mark only (no user turn,
+/// no generation - nothing to park as a turn), declaring the marks. `tick`
+/// is called between prefill chunks so a caller can keep its response alive;
+/// the parking itself never stops for a reader that left. An engine without
+/// boundary parks, or a prompt with no mark, is a no-op reported as such. A
+/// later call finds the parks standing and returns in milliseconds.
+fn warm_prefix(cfg: &AppConfig, mode: &str, tick: &dyn Fn(&str) -> bool) -> Result<serde_json::Value, String> {
     let t0 = now_ms();
     let tok = make_tok(cfg, "auto", t0)?;
-    let tc = cfg.tools.as_ref();
-    let b = builtins_of(cfg);
-    let reg = tc.map(|t| tools::build(t, b, &|_| {}));
-    let caps = match (tc, reg.as_ref()) {
-        (Some(t), Some(r)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, t.budget(None)),
+    let creq: ChatReq = serde_json::from_value(serde_json::json!({
+        "messages": [{ "role": "user", "content": "warm" }]
+    })).map_err(|e| e.to_string())?;
+    let off = creq.off_groups(cfg);
+    let mut b = builtins_for(cfg, &creq, &off);
+    // what a fresh answer is offered at depth 0 (AgentTree::slots)
+    b.agent_slots = cfg.tools.as_ref().map_or(0, |t| if t.max_agent_depth >= 1 { t.max_agents } else { 0 });
+    let reg = tools_enabled(cfg, &creq).map(|tc| (tc, tools::build(tc, b, &|_| {})));
+    let caps = match reg.as_ref() {
+        Some((tc, r)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, tc.budget(None)),
         _ => Capabilities::Note,
     };
-    let msgs = vec![ChatMsg::text("user", "warm".to_string())];
-    let (prompt, _, _) = build_prompt(cfg, &tok, &msgs, cfg.thinking, caps)?;
+    let (prompt, _, _) = build_prompt(cfg, &tok, &creq.messages, cfg.thinking, caps)?;
     let Some(&end) = prompt.marks.last() else {
         return Ok(serde_json::json!({ "parked": false, "why": "no boundary to park" }));
     };
@@ -9143,7 +9190,8 @@ fn warm_prefix(cfg: &AppConfig, mode: &str) -> Result<serde_json::Value, String>
             return Ok(serde_json::json!({ "parked": false, "why": "engine predates boundary parks" }));
         }
         let t1 = now_ms();
-        prefill_text(&mut sess, ids, &prompt.marks, &|_| true, |s, ids, last, declare| {
+        let keep_going = |st: &str| { let _ = tick(st); true };
+        prefill_text(&mut sess, ids, &prompt.marks, &keep_going, |s, ids, last, declare| {
             s.feed_declared(cfg, ids, last, declare)
         })?;
         return Ok(serde_json::json!({
@@ -9224,9 +9272,9 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     // by default a warmed model also gets its prefix parked, so the first
     // chat after a boot or a page load starts from it
     let prefix = query.split('&').find_map(|kv| kv.strip_prefix("prefix=")) != Some("0");
-    let park = |cfg: &AppConfig| -> serde_json::Value {
+    let park = |cfg: &AppConfig, tick: &dyn Fn(&str) -> bool| -> serde_json::Value {
         if !prefix { return serde_json::Value::Null; }
-        match warm_prefix(cfg, mode) {
+        match warm_prefix(cfg, mode, tick) {
             Ok(v) => v,
             Err(e) => serde_json::json!({ "parked": false, "error": e }),
         }
@@ -9242,12 +9290,16 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
         };
         return match warm_one(cfg, mode) {
             Ok((target, load_ms, feed_ms)) => {
-                let body = serde_json::json!({
+                // the model is warm: answer 200 now and keep the body alive
+                // while the prefix parks (a prefill that outlasts the proxy's
+                // idle cut when the whole prefix has to be read)
+                let js = open_json(out);
+                let pre = park(cfg, &|_| js.tick());
+                js.finish(&serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
-                    "prefix": park(cfg),
-                });
-                respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
+                    "prefix": pre,
+                }))
             }
             // an ACTIVE session holding the slot is proof the model serves -
             // report warm, not failed (a 500 here would make the playground
@@ -9274,12 +9326,16 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
         };
         return match warm_one(cfg, mode) {
             Ok((target, load_ms, feed_ms)) => {
-                let body = serde_json::json!({
+                // the model is warm: answer 200 now and keep the body alive
+                // while the prefix parks (a prefill that outlasts the proxy's
+                // idle cut when the whole prefix has to be read)
+                let js = open_json(out);
+                let pre = park(cfg, &|_| js.tick());
+                js.finish(&serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
-                    "prefix": park(cfg),
-                });
-                respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
+                    "prefix": pre,
+                }))
             }
             Err(e) => json_err(out, 500, &e),
         };
@@ -9294,6 +9350,11 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     };
     let mut ladder = Vec::with_capacity(entries.len());
     let mut default: Option<String> = None; // largest warmed = last ok in ascending order
+    // the answer opens at the first model that warms (200 from then on) so
+    // the prefix parking that follows each can keep the body alive; a ladder
+    // where nothing warms still answers 500 below
+    let mut out = Some(out);
+    let mut js: Option<JsonStream> = None;
     for e in &entries {
         if let Some(why) = unfit.get(&e.volume) {
             ladder.push(serde_json::json!({
@@ -9305,10 +9366,12 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
         match warm_one(&e.cfg, mode) {
             Ok((target, load_ms, feed_ms)) => {
                 default = Some(e.cfg.name.clone());
+                let j = js.get_or_insert_with(|| open_json(out.take().unwrap()));
+                let pre = park(&e.cfg, &|_| j.tick());
                 ladder.push(serde_json::json!({
                     "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
                     "ok": true, "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
-                    "prefix": park(&e.cfg),
+                    "prefix": pre,
                 }));
             }
             // busy = an active chat holds the session slot, which NORMALLY
@@ -9331,12 +9394,16 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     }
     let ok = default.is_some();
     let body = serde_json::json!({ "ok": ok, "ladder": ladder, "default": default });
-    respond_bytes(
-        out,
-        if ok { 200 } else { 500 },
-        "application/json",
-        body.to_string().as_bytes(),
-    );
+    match (js, out) {
+        (Some(j), _) => j.finish(&body),
+        (None, Some(out)) => respond_bytes(
+            out,
+            if ok { 200 } else { 500 },
+            "application/json",
+            body.to_string().as_bytes(),
+        ),
+        (None, None) => {}
+    }
 }
 
 /// GET /models - the playground's dropdown source: servable models largest
