@@ -75,10 +75,20 @@ def group_of(entries, i, images_rule=True):
     return name
 
 
+def is_secret_name(name, braced):
+    """Mirrors engine.rs: a bare reference is a secret only when it is
+    UPPER_SNAKE (the convention every deployment secret follows), so OData's
+    `$top`/`$select`/`$filter` stay text. The braced form is always one."""
+    return braced or (
+        (name[:1].isupper() or name[:1] == "_")
+        and all(c.isupper() or c.isdigit() or c == "_" for c in name)
+    )
+
+
 def secrets_in(v, out):
     """every $NAME / ${NAME} reference in a config value. `$user` is the
     reserved identity slot, not a secret, and a `$` that starts no name (a
-    price, a shell literal) is text."""
+    price, a shell literal) or one not shaped like a secret is text."""
     if isinstance(v, str):
         i = 0
         while True:
@@ -86,7 +96,8 @@ def secrets_in(v, out):
             if i < 0:
                 return
             rest = v[i + 1:]
-            if rest.startswith("{"):
+            braced = rest.startswith("{")
+            if braced:
                 j = rest.find("}")
                 name = rest[1:j] if j > 0 else ""
                 i += 2 + len(name) + 1
@@ -96,7 +107,7 @@ def secrets_in(v, out):
                     k += 1
                 name = rest[:k]
                 i += 1 + k
-            if name and not name[0].isdigit() and name != "user":
+            if name and not name[0].isdigit() and name != "user" and is_secret_name(name, braced):
                 out.add(name)
     elif isinstance(v, list):
         for x in v:

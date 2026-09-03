@@ -317,19 +317,80 @@ fn is_user_slot(v: &str) -> bool {
     matches!(v.trim(), "$user" | "${user}")
 }
 
-/// `$user` is the WHOLE value of a header or it is nothing. A value that
-/// merely contains it ("Bearer $user") is a config mistake, and the honest
-/// answer is to say so: expand() deliberately leaves the reference alone so
-/// it is not misreported as a missing secret, which would otherwise let the
-/// literal string "$user" travel to an endpoint as if it were an identity.
+/// `$user` is the WHOLE value of a header or it is nothing. Anywhere else -
+/// mixed into a larger header value, in the url, in a body template - it is a
+/// config mistake, and the honest answer is to refuse.
+///
+/// This is not pedantry. In a BODY template `$user` is not a reserved slot at
+/// all: fill_template would resolve it against the CALLER'S ARGUMENTS, so an
+/// author who writes `{"actor": "$user"}` expecting the signed-in account gets
+/// whatever the model passed as a `user` argument - an identity the caller
+/// chose, wearing the name of one the enclave verified. Refusing is the only
+/// answer that cannot be misread.
 fn stray_user(v: &str) -> bool {
     !is_user_slot(v) && (v.contains("$user") || v.contains("${user}"))
+}
+
+/// Does any value in a body template reference `$user`? (See stray_user: in a
+/// template it would be filled from the caller's own arguments.)
+fn body_names_user(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => s.contains("$user") || s.contains("${user}"),
+        serde_json::Value::Array(a) => a.iter().any(body_names_user),
+        serde_json::Value::Object(o) => o.values().any(body_names_user),
+        _ => false,
+    }
+}
+
+/// The authority of an absolute URL: everything between `://` and the first
+/// `/`, `?` or `#`. The part a caller must never be able to choose.
+fn authority_of(url: &str) -> &str {
+    let rest = match url.split_once("://") {
+        Some((_, r)) => r,
+        None => url,
+    };
+    match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[..i],
+        None => rest,
+    }
+}
+
+/// Is this bare `$name` a SECRET reference, or is it text that happens to
+/// start with a dollar?
+///
+/// Deployment secrets are UPPER_SNAKE by convention - every example in the
+/// docs, the templates and the tests is (`$TOOL_KEY`, `$JOT_API_KEY`,
+/// `$IMAGE_ENDPOINT`) - and the distinction matters because `$` is ordinary
+/// text in a URL. OData spells its query options `$top`, `$select`,
+/// `$filter`, and Microsoft Graph, SharePoint, Dynamics and Azure Table all
+/// speak OData; an entry using them works verbatim in eyesoff-ai (which
+/// never scans a url for secrets at all), so treating `$top` as a missing
+/// secret would refuse a call no secret could ever fix.
+///
+/// The braced form `${name}` is always a reference: it is unambiguous, it is
+/// what someone writes when they mean one, and it cannot occur by accident
+/// in a URL.
+fn is_secret_name(name: &str, braced: bool) -> bool {
+    braced
+        || (name.starts_with(|c: char| c.is_ascii_uppercase() || c == '_')
+            && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+}
+
+/// Names this app will never read out of the environment, however a config
+/// spells them. Guest env carries the platform's own channels beside the
+/// deployment's secrets, and `$ENCLAVE_CONFIG` interpolated into an outbound
+/// URL would post this deployment's whole configuration - secrets included -
+/// to whatever host the entry names.
+fn is_reserved_env(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.starts_with("ENCLAVE") || matches!(n.as_str(), "PATH" | "HOME" | "PWD" | "HOSTNAME" | "USER" | "SHELL")
 }
 
 /// Every `$NAME` / `${NAME}` in `s` whose secret is set, substituted; the
 /// first name nothing resolves, reported. The reserved `user` is never a
 /// secret name and is left for the identity pass. A `$` that starts no name
-/// (a price, a shell literal) is text.
+/// (a price, a shell literal), and a bare `$name` that is not shaped like a
+/// secret (see is_secret_name), are text.
 pub fn expand(s: &str, secret: &dyn Fn(&str) -> Option<String>) -> (String, Option<String>) {
     let mut out = String::with_capacity(s.len());
     let mut missing = None;
@@ -349,13 +410,30 @@ pub fn expand(s: &str, secret: &dyn Fn(&str) -> Option<String>) -> (String, Opti
                 (&after[..end], &after[end..], &rest[i..i + 1 + end])
             }
         };
-        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
-            // not a reference: keep the `$` and carry on after it
+        let braced = after.starts_with('{');
+        if name.is_empty()
+            || name.starts_with(|c: char| c.is_ascii_digit())
+            || !is_secret_name(name, braced)
+        {
+            // not a reference: keep the `$` and carry on after it. For a bare
+            // lowercase name (`$top`) the whole run is text, so step past it
+            // rather than rescanning it character by character.
             out.push('$');
-            rest = after;
+            if name.is_empty() {
+                rest = after;
+            } else {
+                out.push_str(name);
+                rest = tail;
+            }
             continue;
         }
         if name == "user" {
+            out.push_str(literal);
+        } else if is_reserved_env(name) {
+            // a platform channel is not a secret and is never interpolated
+            if missing.is_none() {
+                missing = Some(name.to_string());
+            }
             out.push_str(literal);
         } else {
             match secret(name) {
@@ -385,9 +463,11 @@ pub fn resolve_headers(
     let mut out = Vec::new();
     for (k, v) in &t.headers {
         if stray_user(v) {
+            // the VALUE is not echoed: it is config text this caller never
+            // supplied and has no business reading back
             return Err(format!(
-                "the {} tool's '{k}' header mixes the caller's identity into a larger value \
-                 ({v:?}). The $user slot is the WHOLE value of a header or nothing - fix \
+                "the {} tool's '{k}' header mixes the caller's identity into a larger \
+                 value. The $user slot is the WHOLE value of a header or nothing - fix \
                  the deployment's config. The call was not made.",
                 t.name
             ));
@@ -449,20 +529,66 @@ pub fn plan(
             t.name
         ));
     }
+    if t.body.as_ref().is_some_and(body_names_user) {
+        return Err(format!(
+            "tool '{}' references $user in its body template, where it is NOT the \
+             identity slot: a template is filled from the caller's own arguments, so \
+             that value would be whatever the caller chose to send. Carry the identity \
+             in a header whose whole value is $user. The call was not made.",
+            t.name
+        ));
+    }
     let (base, missing) = expand(&t.url, secret);
     if let Some(name) = missing {
         return Err(format!(
             "the {} tool's url references ${name} but no such secret is set on this \
-             deployment - add {name} to the deployment's secrets and restart it to apply.",
+             deployment - add {name} to the deployment's secrets and restart it to apply. \
+             (If the url is meant to contain a literal \"${name}\", percent-encode the \
+             dollar as %24: an unresolved reference is refused rather than sent, so that a \
+             missing secret cannot leave as the literal text of its own name.)",
             t.name
         ));
     }
     if !base.starts_with("http://") && !base.starts_with("https://") {
-        return Err(format!("tool '{}' has a url that is not absolute http(s): {base}", t.name));
+        // the TEMPLATE, not the expansion: `base` has this deployment's
+        // secrets substituted into it, and a caller reading an error is not
+        // owed them
+        return Err(format!(
+            "tool '{}' has a url that is not absolute http(s): {}",
+            t.name, t.url
+        ));
+    }
+    // THE fetcher guard: a `{arg}` placeholder in the AUTHORITY would let a
+    // caller choose the host this deployment dials, with the entry's secrets
+    // attached - an open fetcher running on the enclave's egress identity,
+    // which is the one thing this app must never be. Placeholders belong in
+    // the path and the query, where percent-encoding keeps them inert. Run
+    // AFTER secret expansion: a `${BASE}` reference is the deployment's own
+    // choice of host and carries braces of its own.
+    if authority_of(&base).contains('{') {
+        return Err(format!(
+            "tool '{}' has a placeholder in its url's host ({}). The host is the \
+             deployment's choice, never the caller's - move the placeholder into the \
+             path or the query. The call was not made.",
+            t.name,
+            authority_of(&base)
+        ));
     }
     // {arg} in the URL is consumed by the path; whatever is left goes to the
     // query string (GET) or the body (POST)
     let (mut url, used) = substitute(&base, obj);
+    // belt and braces on the guard above: arguments are percent-encoded, so
+    // none of them can grow a new host, but the invariant is worth asserting
+    // where it would be violated rather than trusting the encoder forever
+    if authority_of(&url) != authority_of(&base) {
+        return Err(format!(
+            "tool '{}': the arguments changed the host this call would reach ({} -> {}). \
+             Refusing.",
+            t.name,
+            authority_of(&base),
+            authority_of(&url)
+        ));
+    }
     let leftover: Vec<(&String, &serde_json::Value)> = obj
         .iter()
         .filter(|(k, _)| !used.contains(&k.as_str()))
@@ -671,12 +797,23 @@ pub fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_j
 }
 
 /// (mime, base64) from a field that may be raw base64 or a full data URI.
+///
+/// The mime comes from whatever the ENDPOINT answered, and it is echoed back
+/// to clients (a data URI in the probe, an `image` content part over MCP), so
+/// it is filtered to the characters a media type is made of. A backend that
+/// answers `image/png" onerror="…` would otherwise be writing markup into
+/// whatever page renders the result.
 pub fn image_payload(raw: &str) -> (String, String) {
+    fn clean(mime: &str) -> String {
+        let ok = !mime.is_empty()
+            && mime.len() <= 128
+            && mime.contains('/')
+            && mime.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '+' | '-'));
+        if ok { mime.to_string() } else { "image/png".to_string() }
+    }
     if let Some(rest) = raw.strip_prefix("data:") {
         if let Some((meta, b64)) = rest.split_once(',') {
-            let mime = meta.split(';').next().unwrap_or("").trim();
-            let mime = if mime.is_empty() { "image/png" } else { mime };
-            return (mime.to_string(), b64.to_string());
+            return (clean(meta.split(';').next().unwrap_or("").trim()), b64.to_string());
         }
     }
     ("image/png".to_string(), raw.to_string())
@@ -853,6 +990,15 @@ mod tests {
         // an image-producing entry gets the image-sized response cap
         let t = tool(serde_json::json!({ "name": "g", "url": "https://h/x", "method": "POST", "result": { "image": "data.0.b64_json" } }));
         assert_eq!(plan(&t, Settings::default(), &serde_json::json!({}), None, &none).unwrap().max_bytes, IMAGE_MAX_BYTES);
+        // an entry's OWN budgets reach the request: an image generation's
+        // three minutes must not be cut by the server-wide twenty seconds
+        let slow = tool(serde_json::json!({ "name": "g", "url": "https://h/x", "timeout_s": 180, "max_bytes": 4096 }));
+        let p = plan(&slow, Settings::default(), &serde_json::json!({}), None, &none).unwrap();
+        assert_eq!((p.timeout_s, p.max_bytes), (180, 4096));
+        // ...and the deployment's figures apply when the entry names none
+        let plain = tool(serde_json::json!({ "name": "g", "url": "https://h/x" }));
+        let p = plan(&plain, Settings { timeout_s: 7, max_bytes: 99 }, &serde_json::json!({}), None, &none).unwrap();
+        assert_eq!((p.timeout_s, p.max_bytes), (7, 99));
     }
 
     /// Secrets resolve by name in headers and the URL; a missing one names
@@ -863,11 +1009,31 @@ mod tests {
         assert_eq!(expand("Bearer $TOOL_KEY", &s), ("Bearer k-123".to_string(), None));
         assert_eq!(expand("${BASE}/v1", &s), ("https://api.example/v1".to_string(), None));
         assert_eq!(expand("price $5 and $ sign", &s), ("price $5 and $ sign".to_string(), None));
+        // OData query options are TEXT, not missing secrets: an entry using
+        // them works verbatim in eyesoff-ai, so refusing it here would break
+        // a config no secret could ever fix
+        let odata = "https://graph.microsoft.com/v1.0/me/messages?$top=10&$select=subject,$filter=x";
+        assert_eq!(expand(odata, &s), (odata.to_string(), None));
+        // ...while the shapes a secret actually wears still resolve
+        assert!(is_secret_name("TOOL_KEY", false) && is_secret_name("_X", false));
+        assert!(!is_secret_name("top", false) && !is_secret_name("Select", false));
+        assert!(is_secret_name("anything", true), "the braced form is always a reference");
+        // a platform channel is never interpolated, however it is spelled:
+        // $ENCLAVE_CONFIG in a url would post this deployment's whole config
+        // - secrets and all - to whatever host the entry names
+        let leaky = |n: &str| -> Option<String> { Some(format!("SECRET-VALUE-OF-{n}")) };
+        let (out, missing) = expand("https://h/x?c=$ENCLAVE_CONFIG", &leaky);
+        assert!(!out.contains("SECRET-VALUE-OF"), "a reserved env name was interpolated: {out}");
+        assert_eq!(missing.as_deref(), Some("ENCLAVE_CONFIG"));
+        assert_eq!(expand("$PATH", &leaky).1.as_deref(), Some("PATH"));
+        assert!(expand("${ENCLAVE_CONFIG}", &leaky).1.is_some(), "the braced form too");
         assert_eq!(expand("$user", &s), ("$user".to_string(), None));
         assert_eq!(expand("x $NOPE y", &s).1.as_deref(), Some("NOPE"));
         let t = tool(serde_json::json!({
             "name": "a", "url": "${BASE}/v1/x", "headers": { "Authorization": "Bearer $TOOL_KEY" }
         }));
+        // a ${SECRET} host is the DEPLOYMENT's choice and carries braces of
+        // its own, so the fetcher guard must run after expansion, not before
         let p = plan(&t, Settings::default(), &serde_json::json!({}), None, &s).unwrap();
         assert_eq!(p.url, "https://api.example/v1/x");
         assert_eq!(p.headers, vec![("authorization".to_string(), "Bearer k-123".to_string())]);
@@ -898,6 +1064,8 @@ mod tests {
         let mixed = tool(serde_json::json!({ "name": "n", "url": "https://h", "headers": { "authorization": "Bearer $user" } }));
         let e = resolve_headers(&mixed, Some("0xabc"), &none).unwrap_err();
         assert!(e.contains("WHOLE value"), "{e}");
+        // ...without reading the deployment's config text back to a caller
+        assert!(!e.contains("Bearer"), "the header value was echoed: {e}");
         assert!(resolve_headers(&mixed, None, &none).is_err(), "and without a caller too");
         // an identity has no business in a URL either
         let in_url = tool(serde_json::json!({ "name": "n", "url": "https://h/u/$user" }));
@@ -907,6 +1075,60 @@ mod tests {
         // about the reference, not the noun
         let word = tool(serde_json::json!({ "name": "n", "url": "https://h", "headers": { "x-note": "for the user only" } }));
         assert!(resolve_headers(&word, None, &none).is_ok());
+    }
+
+    /// `$user` in a BODY template is not the identity slot - a template is
+    /// filled from the CALLER'S arguments, so it would carry an identity the
+    /// caller chose while looking like one the enclave verified.
+    #[test]
+    fn a_body_template_can_never_claim_an_identity() {
+        let none = secrets(&[]);
+        let t = tool(serde_json::json!({
+            "name": "n", "url": "https://h/x", "method": "POST",
+            "parameters": { "type": "object", "properties": { "user": { "type": "string" } } },
+            "body": { "actor": "$user", "note": "hi" }
+        }));
+        // before the guard this produced {"actor":"0xVICTIM"} for a caller
+        // the enclave had verified as 0xREAL
+        let e = plan(&t, Settings::default(), &serde_json::json!({ "user": "0xVICTIM" }), Some("0xREAL"), &none)
+            .unwrap_err();
+        assert!(e.contains("NOT the identity slot"), "{e}");
+        // nested, and with no caller at all
+        let nested = tool(serde_json::json!({
+            "name": "n", "url": "https://h/x", "method": "POST", "body": { "a": [{ "b": "${user}" }] }
+        }));
+        assert!(plan(&nested, Settings::default(), &serde_json::json!({}), None, &none).is_err());
+        // a template that merely says the word is fine
+        let ok = tool(serde_json::json!({
+            "name": "n", "url": "https://h/x", "method": "POST", "body": { "note": "for the user" }
+        }));
+        assert!(plan(&ok, Settings::default(), &serde_json::json!({}), None, &none).is_ok());
+    }
+
+    /// THE fetcher guard: a caller chooses arguments, never the host.
+    #[test]
+    fn the_host_is_never_the_callers_to_choose() {
+        let none = secrets(&[]);
+        let t = tool(serde_json::json!({
+            "name": "n", "url": "https://{host}/x",
+            "parameters": { "type": "object", "properties": { "host": { "type": "string" } } }
+        }));
+        // before the guard this dialled evil.example with the entry's secrets
+        let e = plan(&t, Settings::default(), &serde_json::json!({ "host": "evil.example" }), None, &none).unwrap_err();
+        assert!(e.contains("placeholder in its url's host"), "{e}");
+        // a port is part of the authority too
+        let p = tool(serde_json::json!({ "name": "n", "url": "https://h:{port}/x" }));
+        assert!(plan(&p, Settings::default(), &serde_json::json!({ "port": "1" }), None, &none).is_err());
+        // ...while the path and the query are fine, and an argument that
+        // looks like a host is percent-encoded into the path where it is inert
+        let ok = tool(serde_json::json!({ "name": "n", "url": "https://h/{name}?a=1" }));
+        let plan_ok = plan(&ok, Settings::default(), &serde_json::json!({ "name": "evil.example/x" }), None, &none).unwrap();
+        assert_eq!(plan_ok.url, "https://h/evil.example%2Fx?a=1");
+        assert_eq!(authority_of(&plan_ok.url), "h");
+        // the authority parser itself
+        assert_eq!(authority_of("https://a.example:8443/x?q=1"), "a.example:8443");
+        assert_eq!(authority_of("https://a.example?q=1"), "a.example");
+        assert_eq!(authority_of("https://a.example"), "a.example");
     }
 
     /// Results: an image path yields a picture for the client and a short
@@ -920,6 +1142,12 @@ mod tests {
         let img = o.image.unwrap();
         assert_eq!((img.mime.as_str(), img.b64.as_str()), ("image/png", "AAAA"));
         assert!(o.text.contains("a cat"));
+        // a mime the endpoint made up is filtered to a media type: a backend
+        // that answers `image/png" onerror="…` must not be writing markup
+        // into whatever page renders the result
+        assert_eq!(image_payload("data:image/png\" onerror=\"x;base64,AA").0, "image/png");
+        assert_eq!(image_payload("data:;base64,AA").0, "image/png");
+        assert_eq!(image_payload("data:image/svg+xml;base64,AA").0, "image/svg+xml");
         // a data URI carries its own mime
         let body = serde_json::json!({ "data": [{ "b64_json": "data:image/webp;base64,BBBB" }] }).to_string();
         let o = finish(&t, 200, body.as_bytes(), false, 1, &serde_json::json!({ "factor": 2, "image": "data:…" })).unwrap();

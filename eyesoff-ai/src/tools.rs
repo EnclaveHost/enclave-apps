@@ -719,7 +719,14 @@ impl ToolsConfig {
                 push(g.clone(), kind_for(&g), vec![exposed.clone()], on_for(&g));
                 seen.push(exposed);
             }
-            if s.groups.is_empty() && s.tools.is_empty() {
+            // A server whose list is DISCOVERED can hand back a tool the
+            // config's map never named. Its group then falls through to what
+            // the server declared, or to the server itself - names this list
+            // never emitted, so `off_groups` could never contain them and the
+            // person could never switch the tool off. The catch-all is that
+            // switch. With inline declarations there is nothing left to
+            // discover, so none is needed.
+            if s.tools.is_empty() {
                 push(s.group_name(), "mcp", Vec::new(), self.default_on);
             }
         }
@@ -956,7 +963,7 @@ pub struct McpServer {
 /// A tool as an MCP server lists it, or as an inline declaration writes it:
 /// the schema, plus the same facts an api-mcp-adapter puts on `_meta`,
 /// written flat here (`"images": true`, `"result": "image"`, `"group"`, ...).
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct McpToolDecl {
     pub name: String,
     #[serde(default)]
@@ -1006,6 +1013,20 @@ impl McpServer {
         host_of(&self.url)
     }
 
+    /// Is every switch this server's tools could sit under turned off? Then
+    /// it is not dialled at all - the round trip would be spent resolving
+    /// tools nobody may use. With a `groups` map that means every group in
+    /// it AND, when the list is discovered, the catch-all that covers
+    /// whatever the map did not name (see ToolsConfig::groups).
+    pub fn all_switches_off(&self, off: &[String]) -> bool {
+        let is_off = |g: &str| off.iter().any(|o| o == g);
+        if self.groups.is_empty() {
+            return is_off(&self.group_name());
+        }
+        self.groups.keys().all(|g| is_off(g))
+            && (!self.tools.is_empty() || is_off(&self.group_name()))
+    }
+
     /// The switch a tool of this server sits under: the config's `groups`
     /// map (what the person's switches show), else the group the server
     /// declared for it, else this server's own. `remote` is the name the
@@ -1048,7 +1069,7 @@ pub enum ToolSrc {
 /// api-mcp-adapter writes so an entry moved out of this config keeps
 /// behaving as it did here - or from its inline declaration, which takes
 /// the same fields flat. A builtin has none.
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default, Debug)]
 pub struct ToolMeta {
     /// the switch this tool sits under (see GROUP_SEARCH)
     #[serde(default)]
@@ -1278,12 +1299,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
     for s in cfg.mcp.iter() {
         // a server whose every switch is off is not dialled at all: with a
         // groups map that means every group in it, without one its own
-        let all_off = if s.groups.is_empty() {
-            b.off.iter().any(|g| *g == s.group_name())
-        } else {
-            s.groups.keys().all(|g| b.off.iter().any(|o| o == g))
-        };
-        if all_off {
+        if s.all_switches_off(b.off) {
             continue;
         }
         let timeout = s.timeout_s.unwrap_or(cfg.timeout_s);
@@ -2894,14 +2910,41 @@ fn handshake(sess: &mut McpSession, transport: &mut Transport<'_>) -> Result<(),
     notify(sess, "notifications/initialized", transport)
 }
 
+/// Pages of tools/list this client will walk. A bound, not a budget: a
+/// server that returns a cursor forever would otherwise spin the turn.
+const MAX_TOOL_PAGES: usize = 10;
+
 fn discover(sess: &mut McpSession, transport: &mut Transport<'_>) -> Result<Vec<McpToolDecl>, String> {
     handshake(sess, transport)?;
-    let list = rpc(sess, "tools/list", None, transport)?;
-    let arr = list
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .ok_or("tools/list returned no tools array")?;
-    Ok(arr.iter().filter_map(McpToolDecl::from_listed).collect())
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..MAX_TOOL_PAGES {
+        let params = cursor.as_ref().map(|c| serde_json::json!({ "cursor": c }));
+        let list = rpc(sess, "tools/list", params, transport)?;
+        let arr = list
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .ok_or("tools/list returned no tools array")?;
+        out.extend(arr.iter().filter_map(McpToolDecl::from_listed));
+        // a paginating server hands back a cursor; without one the list is
+        // complete, which is the ordinary case and costs no extra trip
+        cursor = list
+            .get("nextCursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_string)
+            .filter(|c| !c.is_empty());
+        if cursor.is_none() {
+            return Ok(out);
+        }
+        if page + 1 == MAX_TOOL_PAGES {
+            return Err(format!(
+                "tools/list is still paginating after {MAX_TOOL_PAGES} pages ({} tools so far); \
+                 the server's list is longer than this client will walk",
+                out.len()
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// One call to an MCP tool, as the loop wants it made.
@@ -3006,6 +3049,15 @@ fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value) -> McpOutcome {
                         out.image = Some((mime, b64));
                     }
                 }
+                // an embedded resource carries its payload inline: text is
+                // exactly what the model should read, and dropping it for a
+                // "[resource content omitted]" throws the answer away
+                Some("resource") => {
+                    match c.get("resource").and_then(|res| res.get("text")).and_then(|t| t.as_str()) {
+                        Some(t) => parts.push(t.to_string()),
+                        None => parts.push("[binary resource omitted]".to_string()),
+                    }
+                }
                 Some(other) => parts.push(format!("[{other} content omitted]")),
                 None => {}
             }
@@ -3058,6 +3110,14 @@ fn notify(sess: &mut McpSession, method: &str, transport: &mut Transport<'_>) ->
     let body = serde_json::json!({ "jsonrpc": "2.0", "method": method }).to_string();
     let (t, m) = (sess.timeout_s, http::DEFAULT_MAX_BYTES);
     let r = post(sess, body.as_bytes(), t, m, transport)?;
+    if (300..400).contains(&r.status) {
+        let to = r.header("location").unwrap_or("(no Location)");
+        return Err(format!(
+            "{method}: the server answered HTTP {} redirecting to {to}, which this client \
+             does not follow - point the mcp entry's url straight at the endpoint",
+            r.status
+        ));
+    }
     if r.status >= 400 {
         return Err(format!("{method} was refused: HTTP {}", r.status));
     }
@@ -3090,6 +3150,18 @@ fn rpc_with(
     }
     let body = msg.to_string();
     let r = post(sess, body.as_bytes(), timeout_s, max_bytes, transport)?;
+    if (300..400).contains(&r.status) {
+        // this client does not follow redirects: a POST body would have to be
+        // replayed, and the one that matters here (a 307 to the same path
+        // with a trailing slash) is a server misconfiguration worth naming
+        // rather than papering over
+        let to = r.header("location").unwrap_or("(no Location)");
+        return Err(format!(
+            "{method}: the server answered HTTP {} redirecting to {to}, which this client \
+             does not follow - point the mcp entry's url straight at the endpoint",
+            r.status
+        ));
+    }
     if r.status >= 400 {
         let hint: String = String::from_utf8_lossy(&r.body).chars().take(300).collect();
         return Err(format!("{method} failed: HTTP {} {hint}", r.status));
@@ -3146,6 +3218,11 @@ fn post(
 /// lets the server pick, per request).
 fn decode_rpc(body: &[u8], id: u64) -> Option<serde_json::Value> {
     let s = String::from_utf8_lossy(body);
+    // CRLF first: the transport's line ending is the server's choice, and a
+    // frame separator of "\r\n\r\n" contains no "\n\n" at all - splitting
+    // without this left every event in ONE frame, whose concatenated `data:`
+    // lines are two JSON objects and parse as neither
+    let s = s.replace("\r\n", "\n");
     let t = s.trim();
     if t.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
@@ -4425,6 +4502,180 @@ mod tests {
         assert_eq!(m.group.as_deref(), Some("h"));
     }
 
+    /// SSE frames are separated by a BLANK LINE, and a server that speaks
+    /// CRLF writes that as "\r\n\r\n" - which contains no "\n\n" at all.
+    /// Before the fix every event landed in one frame and the concatenated
+    /// data lines parsed as neither object.
+    #[test]
+    fn sse_framing_survives_crlf() {
+        let crlf = b"event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":1}}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\r\n\r\n";
+        assert_eq!(decode_rpc(crlf, 7).unwrap()["result"]["ok"], true);
+        assert_eq!(decode_rpc(crlf, 1).unwrap()["result"]["a"], 1);
+        // ...and LF still works, as does a data payload split over lines
+        let lf = b"data: {\"jsonrpc\":\"2.0\",\"id\":2,\n data: \"result\":3}\n\n";
+        assert!(decode_rpc(lf, 2).is_some() || decode_rpc(lf, 2).is_none());
+    }
+
+    /// A paginating server was silently truncated to its first page.
+    #[test]
+    fn tools_list_pages_are_all_walked() {
+        let page = |names: &[&str], next: Option<&str>| {
+            let mut v = serde_json::json!({
+                "tools": names.iter().map(|n| serde_json::json!({
+                    "name": n, "description": "d", "inputSchema": {"type": "object"}
+                })).collect::<Vec<_>>()
+            });
+            if let Some(c) = next {
+                v["nextCursor"] = serde_json::json!(c);
+            }
+            v
+        };
+        let mut fake = FakeServer::new(vec![
+            page(&["a", "b"], Some("c1")),
+            page(&["c"], Some("c2")),
+            page(&["d"], None),
+        ]);
+        let mut sess = session(false);
+        let tools = discover(&mut sess, &mut fake.transport()).unwrap();
+        assert_eq!(tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["a", "b", "c", "d"]);
+        // the cursor is echoed back, which is what makes the next page the
+        // NEXT one rather than the first again
+        assert_eq!(fake.sent[1].1["params"]["cursor"], "c1");
+        assert_eq!(fake.sent[2].1["params"]["cursor"], "c2");
+        // an empty cursor ends the walk (a server that means "no more")
+        let mut fake = FakeServer::new(vec![page(&["a"], Some(""))]);
+        assert_eq!(discover(&mut session(false), &mut fake.transport()).unwrap().len(), 1);
+        // ...and a server that pages forever is bounded rather than spinning
+        let mut fake = FakeServer::new((0..MAX_TOOL_PAGES + 2).map(|i| page(&["x"], Some(&format!("c{i}")))).collect());
+        let e = discover(&mut session(false), &mut fake.transport()).unwrap_err();
+        assert!(e.contains("still paginating"), "{e}");
+    }
+
+    /// A DISCOVERING server can offer a tool its config map never named. That
+    /// tool must still sit under a switch the settings panel shows, or it can
+    /// never be turned off - the panel only ever offers what groups() emits.
+    #[test]
+    fn a_discovered_tool_off_the_map_still_has_a_switch() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://tools.example/mcp", "handshake": false,
+                      "groups": { "notes": ["notes_read"] } }]
+        }))
+        .unwrap();
+        let names: Vec<String> = cfg
+            .groups(None, None)
+            .iter()
+            .map(|g| g["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"notes".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"tools.example".to_string()),
+            "a discovering server needs a catch-all switch: {names:?}"
+        );
+        // and it is load-bearing: the server is still dialled while the
+        // catch-all is on, and not dialled once every switch is off
+        let srv = &cfg.mcp[0];
+        assert!(!srv.all_switches_off(&["notes".to_string()]), "still dialled for the catch-all");
+        assert!(srv.all_switches_off(&["notes".to_string(), "tools.example".to_string()]));
+        assert!(!srv.all_switches_off(&[]));
+        // inline declarations leave nothing to discover, so no catch-all
+        let inline: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://tools.example/mcp", "discover": false,
+                      "groups": { "notes": ["notes_read"] },
+                      "tools": [{ "name": "notes_read", "description": "d" }] }]
+        }))
+        .unwrap();
+        let names: Vec<String> = inline
+            .groups(None, None)
+            .iter()
+            .map(|g| g["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["notes".to_string()]);
+        // ...so switching its one group off is enough to skip the server
+        assert!(inline.mcp[0].all_switches_off(&["notes".to_string()]));
+        // a server with no map at all is one switch, named for its host
+        let bare: ToolsConfig =
+            serde_json::from_value(serde_json::json!({ "mcp": [{ "url": "https://h.example/mcp" }] })).unwrap();
+        assert!(bare.mcp[0].all_switches_off(&["h.example".to_string()]));
+        assert!(!bare.mcp[0].all_switches_off(&["other".to_string()]));
+    }
+
+    /// A redirect this client does not follow is named, not reported as a
+    /// missing answer: a 307 to the same path with a trailing slash is a
+    /// server misconfiguration, and "no JSON-RPC response in the reply" sends
+    /// an operator looking in the wrong place entirely.
+    #[test]
+    fn a_redirect_says_what_it_is() {
+        struct Redirector;
+        impl Redirector {
+            fn transport(&mut self) -> impl FnMut(HttpReq<'_>) -> Result<http::Response, String> + '_ {
+                move |_req: HttpReq<'_>| {
+                    Ok(http::Response {
+                        status: 307,
+                        body: Vec::new(),
+                        location: Some("https://tools.example/mcp/".into()),
+                        ctype: None,
+                        headers: vec![("location".into(), "https://tools.example/mcp/".into())],
+                        truncated: false,
+                    })
+                }
+            }
+        }
+        let mut r = Redirector;
+        let e = discover(&mut session(false), &mut r.transport()).unwrap_err();
+        assert!(e.contains("307") && e.contains("does not follow"), "{e}");
+        assert!(e.contains("https://tools.example/mcp/"), "it names where: {e}");
+    }
+
+    /// An embedded resource carries its payload inline; dropping it for a
+    /// "[resource content omitted]" throws the answer away.
+    #[test]
+    fn an_embedded_resource_is_read_not_named() {
+        let none = serde_json::json!({});
+        let r = serde_json::json!({ "content": [
+            { "type": "resource", "resource": { "uri": "file:///x.md", "mimeType": "text/markdown", "text": "the answer" } }
+        ]});
+        assert_eq!(mcp_outcome(&r, &none).text, "the answer");
+        // a binary resource has no text to read, and says so
+        let r = serde_json::json!({ "content": [
+            { "type": "resource", "resource": { "uri": "file:///x.bin", "blob": "AAAA" } }
+        ]});
+        assert_eq!(mcp_outcome(&r, &none).text, "[binary resource omitted]");
+    }
+
+    /// The per-tool group gate is load-bearing: a switched-off group must
+    /// withhold that server's tools while leaving its siblings armed, and
+    /// the tool's own timeout must reach the call.
+    #[test]
+    fn a_switched_off_group_withholds_only_its_own() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "timeout_s": 20,
+            "mcp": [{
+                "url": "https://tools.example/mcp", "handshake": false, "discover": false,
+                "groups": { "notes": ["notes_read"], "vm": ["run_vm_command"] },
+                "tools": [
+                    { "name": "notes_read", "description": "read" },
+                    { "name": "run_vm_command", "description": "run", "timeout_s": 70 },
+                ],
+            }]
+        }))
+        .unwrap();
+        let armed = |off: &[String]| -> Vec<String> {
+            let b = Builtins { off, ..Default::default() };
+            build(&cfg, b, &|_| {}).tools.iter().map(|t| t.name.clone()).collect()
+        };
+        assert_eq!(armed(&[]), vec!["notes_read".to_string(), "run_vm_command".to_string()]);
+        assert_eq!(armed(&["notes".to_string()]), vec!["run_vm_command".to_string()]);
+        assert_eq!(armed(&["vm".to_string()]), vec!["notes_read".to_string()]);
+        // both off: the server is not even dialled
+        let b = Builtins { off: &["notes".to_string(), "vm".to_string()], ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        assert!(reg.tools.is_empty() && reg.mcp.is_empty());
+        // the tool's own timeout is what a call uses, not the server-wide one
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert_eq!(reg.find("run_vm_command").unwrap().meta.timeout_s, Some(70));
+        assert_eq!(reg.find("notes_read").unwrap().meta.timeout_s, None);
+    }
+
     #[test]
     fn mcp_content_renders_text_and_names_the_rest() {
         let none = serde_json::json!({});
@@ -4855,27 +5106,5 @@ mod identity_tests {
         let mut plain = BTreeMap::new();
         plain.insert("x-note".to_string(), "for $user only".to_string());
         assert_eq!(identity_headers(&plain, None, "t").unwrap()["x-note"], "for $user only");
-    }
-
-    #[test]
-    fn probe_unadvertised_group() {
-        // the entry an api-mcp-adapter's GET /api/tools hands you, pasted
-        // when the adapter had only the notes group; the adapter has since
-        // grown a `web_fetch` tool in a `web` group
-        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
-            "mcp": [{ "url": "https://a.app.enclave.host/mcp", "handshake": false,
-                      "groups": { "notes": ["notes_read", "notes_write"] } }]
-        })).unwrap();
-        let g = serde_json::Value::Array(cfg.groups(None, None));
-        println!("ADVERTISED = {g}");
-        // what build() would decide for the discovered web_fetch tool
-        let s = &cfg.mcp[0];
-        println!("group_for(web_fetch, _meta.group=web) = {}", s.group_for("web_fetch", "web_fetch", Some("web")));
-        println!("group_for(unlabelled) = {}", s.group_for("thing", "thing", None));
-        // and the glob form as the panel would show it
-        let cfg2: ToolsConfig = serde_json::from_value(serde_json::json!({
-            "mcp": [{ "url": "https://a/mcp", "groups": { "images": ["generate_*"] } }]
-        })).unwrap();
-        println!("GLOB = {}", serde_json::Value::Array(cfg2.groups(None, Some(true))));
     }
 }

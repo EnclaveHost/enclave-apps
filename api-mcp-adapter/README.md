@@ -45,6 +45,14 @@ one takes any HTTP API and speaks the protocol agents already know.
 - **The caller chooses arguments, never a URL or a header.** The adapter is
   not an open fetcher. Every request it makes is one the config describes,
   with the caller's arguments substituted into the places the entry names.
+  A `{arg}` placeholder in the URL's **host** is refused outright, and
+  arguments are percent-encoded into the path, so no argument can move the
+  call to a different server.
+- **`$user` is a header value and nothing else.** Mixed into a larger header,
+  put in the URL, or referenced from a `body` template, it is refused —
+  because in a template it would resolve against the *caller's own
+  arguments*, carrying an identity the caller chose while looking like one
+  the enclave verified.
 - **The secrets exist only in the attested guest**, referenced as `$VAR`
   deployment secrets and injected as guest env by the enclave holding the
   lease. They never sit on-chain and never reach a client. A header whose
@@ -99,10 +107,14 @@ The deployment's App Config (`ENCLAVE_CONFIG`; locally `MCP_ADAPTER_CONFIG`):
   **locked** (503 everywhere) rather than silently open. Omit it only for a
   deployment whose tools you would let anyone call.
 - `sso` (optional): lets a client name the caller with an `X-Sso-Token`
-  instead of the key plus `X-User`. `signer` is the platform SSO signer
-  address, `audience` this deployment's id, `accept` the ids of the
-  eyesoff-ai deployments whose tokens are also good here. Not needed for
-  the eyesoff-ai wiring below, which uses the key and `X-User`.
+  the app verifies itself, rather than the service asserting it with
+  `X-User`. `signer` is the platform SSO signer address, `audience` this
+  deployment's id, `accept` the ids of the eyesoff-ai deployments whose
+  tokens are also good here. **A token names a caller; it does not open the
+  key gate** — a deployment with an `api_key` still requires it, and
+  `accept` is a statement about whose identities mean something here, not
+  about who may call. Not needed for the eyesoff-ai wiring below, which
+  names the user with the key and `X-User`.
 - `timeout_s` (default 20) and `max_bytes` (default 256 KB) are the
   deployment-wide defaults an entry overrides.
 - `http`: the entries. A whole eyesoff-ai `tools` block pastes as-is too
@@ -121,7 +133,7 @@ comment is the long form):
 | `method` | yes | GET (default), POST, PUT, PATCH, DELETE |
 | `headers` | yes | `$SECRET` anywhere in a value; the whole value `$user` is the caller's identity |
 | `body` | yes | JSON template; a whole-string `"$arg"` is filled, an unfilled declared hole is pruned; `"$images"` / `"$image"` take the caller's attached pictures |
-| `query` | yes | send leftover arguments as a query string even on a POST (default: on GET and DELETE) |
+| `query` | yes | send leftover arguments as a query string even on a POST (default: on GET and DELETE). Arguments the schema does not declare ride along too, exactly as they do in eyesoff-ai — so a fixed query parameter in the `url` can be shadowed by one a caller sends. Put anything that must not move in the path, or in the `body` template |
 | `timeout_s`, `max_bytes` | yes | per call; an image-producing entry defaults to a 12 MB cap |
 | `result` | yes | `{"image": <path>}` returns MCP image content; `{"text": <path>}` extracts one field |
 | `sources` | yes | `{"list", "title", "url"}` dot paths; rows go to `structuredContent.sources` |
@@ -186,8 +198,12 @@ nameless and sees only the shared ones.
 | header | who | when |
 | --- | --- | --- |
 | `X-Api-Key: <key>` + `X-User: <sub>` | a service asserting the account | eyesoff-ai (its `"x-user": "$user"` slot), Claude Code with `--header` |
-| `X-Sso-Token: EST1…` | the signed-in person | needs the `sso` block; the token's audience must be this deployment or one in `accept` |
+| `X-Api-Key: <key>` + `X-Sso-Token: EST1…` | the signed-in person, verified here | needs the `sso` block; the token's audience must be this deployment or one in `accept` |
 | `Authorization: Bearer EST1…` | the same, off-platform | the enclave.host gateway consumes this header |
+
+The key is the gate in every row: a sign-in token establishes **who**, never
+**whether**. A deployment with no `api_key` has no gate, and a token there is
+simply a name.
 
 `sub` is a lowercase `0x` wallet address or an `acct_…` id; anything else is
 a 400. The identity reaches an endpoint only through a header the entry
@@ -318,8 +334,8 @@ is the check, and a refused connection says so in the tool's error.
 - The routed pre-pass (`route`) is eyesoff-ai's own and runs only its http
   entries; the fields are carried through for a client that wants them.
 - A tool a client discovers that its `groups` map does not name falls back to
-  the tool's own `_meta.group` and then to the server's group, which the
-  settings panel never showed and so cannot switch off. This adapter always
-  writes a complete map (`GET /api/tools`), so it only bites third-party
-  servers whose tool list changes; for those, give the eyesoff-ai entry a
-  single `group` instead and the whole server gets one switch.
+  the tool's own `_meta.group` and then to the server's own. eyesoff-ai gives
+  a discovering server a **catch-all switch** named for its host so such a
+  tool is still controllable; this adapter always writes a complete map
+  (`GET /api/tools`), so that switch normally governs nothing and exists for
+  the case where this server grows a tool the pasted entry predates.

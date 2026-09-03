@@ -194,8 +194,10 @@ ok(res["content"][0]["type"] == "image", "a slow endpoint inside its timeout sti
 
 if SSO:
     st, _, r = rpc("tools/list", headers={"x-sso-token": SSO}, key=None)
-    ok(st == 200 and "notes_read" in {t["name"] for t in r["result"]["tools"]}, "a verified sign-in token authorizes and names the caller (no key needed)")
-    res = call("notes_read", {"name": "t"}, headers={"x-sso-token": SSO}, key=None)
+    ok(st == 401, "a sign-in token NAMES the caller but does not open the key gate")
+    st, _, r = rpc("tools/list", headers={"x-sso-token": SSO})
+    ok(st == 200 and "notes_read" in {t["name"] for t in r["result"]["tools"]}, "with the key too, it names them and the per-user tool appears")
+    res = call("notes_read", {"name": "t"}, headers={"x-sso-token": SSO})
     ok(text_of(res).startswith("note t of 0x"), f"the token's subject reaches the endpoint: {text_of(res)}")
     st, _, r = rpc("tools/list", headers={"x-sso-token": "EST1.garbage.garbage"})
     ok(st == 401 and "sso_required" in r["error"]["message"], "a bad token is 401 even beside a valid key")

@@ -141,6 +141,11 @@ pub fn request_with_tick(
     let ns = r.timeout_s.clamp(1, 600) * 1_000_000_000;
     let _ = opts.set_connect_timeout(Some(ns));
     let _ = opts.set_first_byte_timeout(Some(ns));
+    // and the BODY: without this a stalled stream sits at the host default
+    // (minutes), long past the timeout the caller asked for. It bounds one
+    // gap between chunks; the deadline in the drain loop below bounds the
+    // whole read, which is what a keepalive-emitting stream needs.
+    let _ = opts.set_between_bytes_timeout(Some(ns));
 
     let out_body = req.body().map_err(|_| "request body unavailable")?;
     let fut = outgoing_handler::handle(req, Some(opts))
@@ -191,13 +196,27 @@ pub fn request_with_tick(
 
     let mut out = Vec::new();
     let mut truncated = false;
+    // the whole read, not just one gap in it: an SSE response is drained
+    // until the server closes the stream, and the transport spec only SAYS
+    // a server SHOULD close after answering. A stream held open with
+    // keepalives resets the between-bytes timer forever, so the total is
+    // bounded here and the failure says so instead of reporting a phantom
+    // "cut off at N bytes".
+    let deadline = monotonic_clock::now().saturating_add(ns);
+    let mut timed_out = false;
     if let Ok(rbody) = resp.consume() {
         if let Ok(stream) = rbody.stream() {
             loop {
+                if monotonic_clock::now() >= deadline {
+                    timed_out = true;
+                    break;
+                }
                 match stream.blocking_read(64 * 1024) {
                     Ok(chunk) => {
                         out.extend_from_slice(&chunk);
-                        if out.len() >= r.max_bytes {
+                        // one byte PAST the cap before calling it truncated:
+                        // a response of exactly max_bytes is whole
+                        if out.len() > r.max_bytes {
                             out.truncate(r.max_bytes);
                             truncated = true;
                             break;
@@ -208,6 +227,12 @@ pub fn request_with_tick(
                 }
             }
         }
+    }
+    if timed_out && out.is_empty() {
+        return Err(format!(
+            "the response body from {authority} did not finish within {}s",
+            r.timeout_s
+        ));
     }
     Ok(Response { status, body: out, location, ctype, headers, truncated })
 }

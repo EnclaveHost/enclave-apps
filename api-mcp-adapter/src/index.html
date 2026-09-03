@@ -222,9 +222,27 @@
       if (!r.ok) { $("callerr").textContent = (j.error && j.error.message) || ("HTTP " + r.status); return; }
       let h = '<div class="meta">' + (j.ok ? "ok" : "FAILED") + " · " + j.ms + " ms" + (j.user ? " · as " + esc(j.user) : "") + "</div>";
       h += '<pre class="code">' + esc(j.result || "") + "</pre>";
-      if (j.image) h += '<img alt="the picture the tool returned" src="' + j.image.data_uri + '">';
-      if (j.sources && j.sources.length) h += "<ol>" + j.sources.map((s) => "<li>" + esc(s.title || s.url) + (s.url ? ' <a href="' + esc(s.url) + '" rel="noopener" target="_blank">' + esc(s.url) + "</a>" : "") + "</li>").join("") + "</ol>";
+      // a citation url comes from the ENDPOINT, so the scheme is checked as
+      // well as the quoting: esc() would happily render a javascript: link
+      const safeUrl = (u) => /^https?:\/\//i.test(String(u || ""));
+      if (j.sources && j.sources.length) h += "<ol>" + j.sources.map((s) => "<li>" + esc(s.title || s.url) + (safeUrl(s.url) ? ' <a href="' + esc(s.url) + '" rel="noopener noreferrer" target="_blank">' + esc(s.url) + "</a>" : (s.url ? " " + esc(s.url) : "")) + "</li>").join("") + "</ol>";
       $("out").innerHTML = h;
+      // the picture goes in through the DOM, never through innerHTML: its
+      // data URI carries a mime type the BACKEND chose, and a mime with a
+      // quote in it would otherwise close the src attribute and inject
+      // markup into this page. Belt and braces with the mime filter the
+      // adapter applies server-side (engine::image_payload).
+      if (j.image && /^data:[\w.+-]+\/[\w.+-]+;base64,[A-Za-z0-9+/=]*$/.test(j.image.data_uri)) {
+        const img = document.createElement("img");
+        img.alt = "the picture the tool returned";
+        img.src = j.image.data_uri;
+        $("out").appendChild(img);
+      } else if (j.image) {
+        const p = document.createElement("div");
+        p.className = "meta";
+        p.textContent = "the tool returned a picture this page will not render: its data URI is malformed";
+        $("out").appendChild(p);
+      }
       if (!j.ok) $("callerr").textContent = j.result || "the call failed";
     } catch (e) {
       $("callerr").textContent = String(e);

@@ -73,6 +73,11 @@ pub const META_KEY: &str = "enclave.host/tool";
 const PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// a tools/call may carry the caller's attached pictures as data URIs
 const MAX_BODY: usize = 32 * 1024 * 1024;
+/// the most a deployment may set `max_bytes` to. A response is buffered whole
+/// in guest memory before it is looked at, so this is a memory bound, not a
+/// preference; the image default (12 MB) and the upscale example (64 MB) sit
+/// under it.
+const MAX_BYTES_CEILING: u64 = 128 * 1024 * 1024;
 
 // ---- config ----------------------------------------------------------------
 
@@ -165,7 +170,18 @@ fn load_config() -> Config {
         cfg.settings.timeout_s = t.max(1);
     }
     if let Some(b) = num("max_bytes") {
-        cfg.settings.max_bytes = (b as usize).max(1024);
+        // Clamp in u64 space and THEN narrow. `as usize` would wrap on this
+        // target (a wasm component is 32-bit), turning "8 GB" into a tiny cap
+        // that truncates every response; try_from alone would turn it into
+        // usize::MAX, which is an unbounded buffer wearing a clamp's clothes.
+        // A response is held whole in guest memory, so the ceiling is real.
+        let clamped = b.clamp(1024, MAX_BYTES_CEILING);
+        cfg.settings.max_bytes = usize::try_from(clamped).unwrap_or(usize::MAX);
+        if b > MAX_BYTES_CEILING {
+            cfg.notes.push(format!(
+                "max_bytes {b} is above this app's ceiling of {MAX_BYTES_CEILING}; using the ceiling"
+            ));
+        }
     }
     for (i, e) in entries.into_iter().flatten().enumerate() {
         let t: engine::HttpTool = match serde_json::from_value(e.clone()) {
@@ -427,11 +443,21 @@ struct Caller {
 
 fn identify(cfg: &Config, req: &IncomingRequest) -> Result<Caller, (u16, String)> {
     let has_key = keyed(cfg, req);
-    let mut caller = Caller { sub: None, via: "", authorized: cfg.api_key.is_none() || has_key };
+    // A locked or unusable deployment authorizes NOBODY. Every route checks
+    // usable() first, but seeding it here means a future caller that forgets
+    // cannot accidentally hand out an authorized caller.
+    let usable = cfg.usable().is_ok();
+    // THE GATE IS THE KEY. A sign-in token NAMES the caller, it does not open
+    // the door: a deployment that sets an api_key means it, and the `accept`
+    // list is a statement about whose identities are meaningful here, not
+    // about who may call. Without a key configured there is no door, and a
+    // token is simply a name.
+    let mut caller =
+        Caller { sub: None, via: "", authorized: usable && (cfg.api_key.is_none() || has_key) };
     if let Some(tok) = sso_token_of(req) {
         if let Some(sso_cfg) = &cfg.sso {
             return match sso::verify(sso_cfg, &tok, now_secs()) {
-                Ok(c) => Ok(Caller { sub: Some(c.sub), via: "sso", authorized: true }),
+                Ok(c) => Ok(Caller { sub: Some(c.sub), via: "sso", authorized: caller.authorized }),
                 Err(e) => Err((401, format!("[sso_required] {e}"))),
             };
         }
@@ -460,7 +486,14 @@ fn identify(cfg: &Config, req: &IncomingRequest) -> Result<Caller, (u16, String)
 /// gateway forwarded it.
 fn origin_of(req: &IncomingRequest) -> String {
     let authority = req.authority().unwrap_or_else(|| "localhost".to_string());
-    let host = authority.split(':').next().unwrap_or("");
+    // an IPv6 literal is bracketed and full of colons, so splitting on ':'
+    // mangles it into "[" and it stops looking like an address at all -
+    // which would advertise https://[::1] to a local client
+    let host = if authority.starts_with('[') {
+        authority.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
     let local = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok();
     let https = match req.scheme() {
         Some(Scheme::Https) => true,
@@ -612,7 +645,11 @@ fn handle_mcp_get(cfg: &Config, req: &IncomingRequest, out: ResponseOutparam) {
     // no server-initiated stream: SSE clients get the spec's 405, people
     // get directions
     if header(req, "accept").is_some_and(|a| a.contains("text/event-stream")) {
-        return respond(out, 405, "text/plain", b"POST JSON-RPC here; this server opens no event stream", &[("allow", "POST, OPTIONS")]);
+        // CORS on the refusal too: without it a browser client sees an
+        // opaque network error instead of "this server has no event stream"
+        let mut h: Vec<(&str, &str)> = vec![("allow", "POST, GET, DELETE, OPTIONS")];
+        h.extend_from_slice(&CORS);
+        return respond(out, 405, "text/plain", b"POST JSON-RPC here; this server opens no event stream", &h);
     }
     let origin = origin_of(req);
     mcp_json(out, 200, &serde_json::json!({
@@ -669,6 +706,9 @@ fn handle_status(cfg: &Config, req: &IncomingRequest, out: ResponseOutparam) {
         v["sso_config"] = serde_json::json!({ "authorize_url": sc.authorize_url, "aud": sc.audience, "accept": sc.accept.len() });
     }
     if let Ok(c) = identify(cfg, req) {
+        // a locked deployment refuses every route, so it must not tell a
+        // caller they are authorized: cfg.api_key is None while locked, and
+        // identify() reads that as "open"
         v["authorized"] = serde_json::json!(c.authorized);
         if let Some(sub) = c.sub {
             v["you"] = serde_json::json!({ "sub": sub, "via": c.via });
@@ -800,7 +840,9 @@ impl Guest for Component {
             (Method::Post, "/mcp") | (Method::Post, "/") => handle_mcp_post(&cfg, req, out),
             (Method::Get, "/mcp") => handle_mcp_get(&cfg, &req, out),
             (Method::Delete, "/mcp") => {
-                respond(out, 405, "text/plain", b"stateless: there is no session to end", &[("allow", "POST, GET, OPTIONS")])
+                let mut h: Vec<(&str, &str)> = vec![("allow", "POST, GET, DELETE, OPTIONS")];
+                h.extend_from_slice(&CORS);
+                respond(out, 405, "text/plain", b"stateless: there is no session to end", &h)
             }
             (Method::Get, "/api/status") => handle_status(&cfg, &req, out),
             (Method::Get, "/api/tools") => handle_tools(&cfg, &req, &q, out),

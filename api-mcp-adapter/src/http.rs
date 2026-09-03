@@ -61,7 +61,12 @@ pub fn request(r: HttpReq) -> Result<Response, String> {
 
     let fields = Fields::new();
     for (name, value) in &r.headers {
-        let _ = fields.set(name, std::slice::from_ref(value));
+        // NOT ignored: the host refuses forbidden and malformed headers, and
+        // dropping one silently sends the request without the credential it
+        // was supposed to carry - which arrives as an unexplainable 401
+        fields
+            .set(name, std::slice::from_ref(value))
+            .map_err(|e| format!("header '{name}' was refused by the host: {e:?}"))?;
     }
     if let Some(b) = r.body {
         // explicit content-length: without it wasi:http frames the body
@@ -116,7 +121,11 @@ pub fn request(r: HttpReq) -> Result<Response, String> {
                 match stream.blocking_read(64 * 1024) {
                     Ok(chunk) => {
                         out.extend_from_slice(&chunk);
-                        if out.len() >= r.max_bytes {
+                        // read ONE byte past the cap before calling it
+                        // truncated: a response of exactly max_bytes is
+                        // whole, and reporting it as cut off would make
+                        // every exactly-sized answer look damaged
+                        if out.len() > r.max_bytes {
                             out.truncate(r.max_bytes);
                             truncated = true;
                             break;
