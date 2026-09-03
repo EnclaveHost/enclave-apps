@@ -190,7 +190,9 @@ pub fn generate(
     // window: on_status reaches the client as an SSE status event (/chat) or
     // comment (/v1 streaming) every 15s until the first response byte.
     let r = http::request_with_tick(req, 15, &mut |s| {
-        on_status(&format!("still generating the image… ({s}s)"))
+        on_status(&format!("still generating the image… ({s}s)"));
+        // the reader left: the picture would be for nobody
+        !crate::client_gone()
     })?;
     if r.truncated {
         return Err(format!(

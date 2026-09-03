@@ -3645,6 +3645,10 @@ $("camSwitch").addEventListener("click", async () => {
 });
 // a tab that goes away must not leave the camera running
 window.addEventListener("pagehide", stopCam);
+// ...nor a turn it was streaming. The enclave ends a turn at its next
+// boundary once the stream closes; an explicit abort closes it now, rather
+// than whenever the browser gets round to tearing the connection down.
+window.addEventListener("pagehide", stopGeneration);
 
 // Paste is how a screenshot actually arrives. Only intercept when the
 // clipboard carries an image; pasted text must still paste as text.

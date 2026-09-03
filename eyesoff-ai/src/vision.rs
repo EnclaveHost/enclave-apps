@@ -226,7 +226,9 @@ pub fn describe(
     // hold the wire silent long enough for an idle-timeout in the middle to
     // kill the stream. Tick every 15s until the first response byte.
     let r = http::request_with_tick(req, 15, &mut |s| {
-        on_status(&format!("still reading the image… ({s}s)"))
+        on_status(&format!("still reading the image… ({s}s)"));
+        // the reader left: the answer would be for nobody
+        !crate::client_gone()
     })?;
     if r.truncated {
         return Err(format!(

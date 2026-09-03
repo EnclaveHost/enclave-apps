@@ -1005,6 +1005,11 @@ fn internal_status<'a>(
 ) -> impl Fn(&str) -> bool + 'a {
     let t0 = now_ms();
     move |s: &str| {
+        // a reader that left ends the leg: the answer it serves will never
+        // be written, and generate() takes false as "stop"
+        if client_gone() {
+            return false;
+        }
         // Prefill progress rides through under the leg's label, and NOT under
         // the busy budget: queueing is optional work that may be abandoned,
         // but a prefill already under way is the answer being computed. Cutting
@@ -1228,6 +1233,7 @@ impl Session {
         want_logits: bool,
         prompt: Option<(&[u32], &[usize])>,
     ) -> Result<Row, String> {
+        alive()?; // no forward pass for a reader that left
         match self {
             Session::Onnx { ctx, past, total } => {
                 let ids64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
@@ -1287,6 +1293,7 @@ impl Session {
     /// frames through the projector and splices them in at the current
     /// position. Returns the positions consumed, like feed_image.
     fn feed_video(&mut self, bytes: &[u8], frames: usize) -> Result<usize, String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("video needs the ggml backend".into());
         };
@@ -1345,17 +1352,56 @@ thread_local! {
     /// pass), so the done-frame decomposition separates the classifier's
     /// verbs from the answer's
     static VERB_PHASE: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("") };
-    /// set the moment a write to the client fails: the stream is dead. Work
-    /// that only exists to be streamed - a wait, above all - reads it and
-    /// stops, instead of running out its clock on nobody. The generation
-    /// legs already stop on the same signal through their status callback's
-    /// return value; this is the same fact for code that has no return path.
+    /// set the moment the client is known to be gone: a write failed, or
+    /// the probe below found the stream closed. Work that only exists to be
+    /// streamed - a wait, above all - reads it and stops, instead of running
+    /// out its clock on nobody. The generation legs stop on the same fact
+    /// through their status callback's return value and through the session
+    /// verbs (alive); this is the same fact for code that has no return path.
     static CLIENT_GONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// the handle of the response stream a chat answer is written to, so
+    /// liveness can be ASKED (check-write) instead of learned from a failed
+    /// write. Set by watch_client for the streaming answers only: /warmup
+    /// deliberately finishes its parking for a reader that left.
+    static CLIENT_STREAM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-/// Has a write to this request's client failed? See CLIENT_GONE.
+/// Watch this request's response stream: from here on client_gone() asks it.
+fn watch_client(stream: &OutputStream) {
+    CLIENT_STREAM.with(|c| c.set(Some(stream.handle())));
+}
+
+/// Is this request's client gone? True once a write has failed, or once the
+/// watched response stream reports itself closed - which wasmtime's outgoing
+/// body does the moment the connection behind it is torn down (the stop
+/// button, a closed tab, an aborted request), whether or not anything has
+/// been written since. The probe is one cheap host call, so it is asked
+/// before every forward pass and every tool call: the turn then ends at the
+/// next boundary instead of grinding on until its next status line fails.
 pub(crate) fn client_gone() -> bool {
-    CLIENT_GONE.with(|c| c.get())
+    if CLIENT_GONE.with(|c| c.get()) {
+        return true;
+    }
+    let Some(h) = CLIENT_STREAM.with(|c| c.get()) else {
+        return false;
+    };
+    // a second view of the handle the answer owns - never dropped here,
+    // since dropping it would drop the stream out from under the writer
+    let stream = std::mem::ManuallyDrop::new(unsafe { OutputStream::from_handle(h) });
+    if matches!(stream.check_write(), Err(StreamError::Closed)) {
+        note_client_gone();
+        return true;
+    }
+    false
+}
+
+/// client_gone(), as the error the generation legs already stop on.
+fn alive() -> Result<(), String> {
+    if client_gone() {
+        Err("client disconnected".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn note_client_gone() {
@@ -1671,6 +1717,7 @@ impl Session {
     /// vision encoder and the model's marker tokens all live behind the host's
     /// projector, so this app carries no image code at all.
     fn feed_image(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("vision needs the ggml backend".into());
         };
@@ -1719,6 +1766,7 @@ impl Session {
     /// (dims [n, vocab]) - the speculative verify pass: the target consumes
     /// the draft's proposals in ONE forward pass.
     fn feed_all(&mut self, cfg: &AppConfig, ids: &[u32]) -> Result<Vec<Row>, String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1851,6 +1899,7 @@ impl Session {
         ids: &[u32],
         prompt: Option<(&[u32], &[usize])>,
     ) -> Result<Row, String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1886,6 +1935,7 @@ impl Session {
         ids: &[u32],
         real_seq: i32,
     ) -> Result<Vec<Row>, String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1911,6 +1961,7 @@ impl Session {
     /// capability; older hosts ignore unknown inputs at best.
     fn mtp_draft(&mut self, id_last: u32, k: usize, p_min_milli: i32,
                  obs: Option<(usize, &[u32])>) -> Result<Vec<u32>, String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -1960,6 +2011,7 @@ impl Session {
     fn mtp_round(&mut self, cfg: &AppConfig, id_last: u32, k: usize,
                  p_min_milli: i32, obs: Option<(usize, &[u32])>,
                  pending: &[u32]) -> Result<(Vec<u32>, Vec<Row>), String> {
+        alive()?;
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
         };
@@ -5100,8 +5152,23 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
             // the child's text streams as its own event, never as the
             // answer's: the client shows it inside the agent's card, and the
             // bytes keep the stream alive through a long child generation
+            // when the child's last byte went out: a held call writes nothing
+            // while it is composed (see STREAM_TICK_MS)
+            let last_tx = std::cell::Cell::new(now_ms());
             let emit = |delta: &str| {
-                let Some(out) = gate.borrow_mut().push(delta) else { return true };
+                let Some(out) = gate.borrow_mut().push(delta) else {
+                    // a held call: nothing to show, but the reader may have
+                    // left, and the stream still has to stay alive
+                    if client_gone() {
+                        return false;
+                    }
+                    if now_ms().saturating_sub(last_tx.get()) < STREAM_TICK_MS {
+                        return true;
+                    }
+                    last_tx.set(now_ms());
+                    return (env.status)(&format!("agent #{}: writing a tool call…", s.id));
+                };
+                last_tx.set(now_ms());
                 if !opened.replace(true)
                     && !(env.event)("agent_delta", serde_json::json!({ "id": s.id, "delta": "<think>\n" }))
                 {
@@ -5112,6 +5179,11 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
             let status = |st: &str| (env.status)(&format!("agent #{}: {st}", s.id));
             match generate(env.cfg, env.tok, &prompt_ids, *target, tname, &params, env.draft, &emit, &status) {
                 Ok(g) => {
+                    // finished for nobody: the call it may hold does not run
+                    if client_gone() {
+                        last_err = "client disconnected".into();
+                        break;
+                    }
                     let on_call = |c: &serde_json::Value| {
                         let _ = (env.event)("tool", with_agent(c, s.id));
                     };
@@ -5306,6 +5378,8 @@ const REFUSED_TIME: &str =
 const CONDENSE_EDGE: usize = 240;
 const REFUSED_STUB: &str =
     "the model kept writing tool calls with arguments it had not filled in, so none were run";
+const REFUSED_GONE: &str =
+    "the client disconnected before the model's tool call could run, so it was not run";
 /// How many DISTINCT unfilled calls one answer may ask about. Each costs a
 /// re-prefill and a generation, and the answer loop has no bound of its own -
 /// without this a model that stubs a different argument every round spins it
@@ -5672,6 +5746,14 @@ impl<'a> ToolLoop<'a> {
                 ));
                 return true;
             }
+        }
+        // The stop button, seen from here: nothing runs for a reader that
+        // left - not a command on the machine, not a subagent, not a wait.
+        // The answer loops ask the same question before calling in, so this
+        // catches a client that left while the reply was being finished.
+        if client_gone() {
+            self.refused = Some(REFUSED_GONE);
+            return false;
         }
         self.calls += 1;
         on_call(&serde_json::json!({
@@ -8110,6 +8192,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let body = resp.body().unwrap();
     ResponseOutparam::set(out, Ok(resp));
     let stream = body.write().unwrap();
+    watch_client(&stream);
     let send = |v: serde_json::Value| -> bool {
         let msg = format!("data: {v}\n\n");
         for chunk in msg.as_bytes().chunks(4000) {
@@ -8304,16 +8387,39 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             let opened = std::cell::Cell::new(!think_open);
             // a call is held back rather than shown and then retracted
             let gate = std::cell::RefCell::new(CallGate::new(tl.is_some(), think_open));
+            // when the last byte reached the client: a held call writes
+            // nothing while the model composes it, and the proxy cuts a
+            // stream silent for 180 s (see STREAM_TICK_MS)
+            let last_tx = std::cell::Cell::new(now_ms());
             let emit = |delta: &str| {
-                let Some(out) = gate.borrow_mut().push(delta) else { return true };
+                let Some(out) = gate.borrow_mut().push(delta) else {
+                    // the gate is holding a call: nothing legible can go out
+                    // yet, but the reader may have left (the stop button),
+                    // and the connection still has to prove it is alive
+                    if client_gone() {
+                        return false;
+                    }
+                    if now_ms().saturating_sub(last_tx.get()) < STREAM_TICK_MS {
+                        return true;
+                    }
+                    last_tx.set(now_ms());
+                    return send(serde_json::json!({ "status": "writing a tool call…" }));
+                };
                 if !opened.replace(true) && !send(serde_json::json!({ "delta": "<think>\n" })) {
                     return false;
                 }
+                last_tx.set(now_ms());
                 send(serde_json::json!({ "delta": out }))
             };
             let status = |s: &str| send(serde_json::json!({ "status": s }));
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
                 Ok(s) => {
+                    // finished for nobody: the call it may hold does not run,
+                    // and the turn ends here
+                    if client_gone() {
+                        last_err = "client disconnected".into();
+                        break;
+                    }
                     // the model asked for a tool this deployment actually has:
                     // run it, put the result in the conversation, answer again
                     if let Some(t) = &mut tl {
@@ -8595,6 +8701,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let body = resp.body().unwrap();
         ResponseOutparam::set(out, Ok(resp));
         let stream = body.write().unwrap();
+        watch_client(&stream);
         let send_raw = |s: &str| -> bool {
             for chunk in s.as_bytes().chunks(4000) {
                 if stream.blocking_write_and_flush(chunk).is_err() {
@@ -8800,8 +8907,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             let emit = |delta: &str| {
                 let Some(out) = gate.borrow_mut().push(delta) else {
                     // the gate is holding a call: nothing legible can go out
-                    // yet, but the connection still has to prove it is alive.
-                    // A comment is invisible to every OpenAI SDK.
+                    // yet, but the reader may have left, and the connection
+                    // still has to prove it is alive. A comment is invisible
+                    // to every OpenAI SDK.
+                    if client_gone() {
+                        return false;
+                    }
                     if now_ms().saturating_sub(last_tx.get()) < STREAM_TICK_MS {
                         return true;
                     }
@@ -8821,6 +8932,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             let status = |s: &str| send_raw(&format!(": {s}\n\n"));
             match generate(cfg, &tok, &prompt_ids, *target, tname, &params, draft_cfg, &emit, &status) {
                 Ok(s) => {
+                    // finished for nobody: the call it may hold does not run,
+                    // and the turn ends here
+                    if client_gone() {
+                        last_err = "client disconnected".into();
+                        break;
+                    }
                     // Whose call is this? Read off the merged list's entries,
                     // never guessed from the name: a client's tool ends the
                     // turn and travels back as `tool_calls`, and anything else
@@ -10659,6 +10776,36 @@ mod tests {
         assert!(fresh.step(bare, &mut m2, &|_| {}, &|_| {}, &|_| {}));
         assert!(m2[2].content.contains("non-empty `task`"), "{}", m2[2].content);
         assert_eq!(fresh.tree.borrow().spawned, 0);
+    }
+
+    /// A call the model wrote for a reader that has left runs nothing: the
+    /// step refuses it with the reason, and the loop is over. (The flag is
+    /// per thread, and libtest gives every test its own.)
+    #[test]
+    fn a_call_written_for_a_reader_that_left_does_not_run() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "max_seconds": 60, "wait_max_s": 600,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        let call = "<tool_call>{\"name\":\"t\",\"arguments\":{}}</tool_call>";
+        assert!(!client_gone());
+        assert!(alive().is_ok());
+        note_client_gone();
+        assert!(client_gone());
+        assert_eq!(alive(), Err("client disconnected".to_string()));
+        let called = std::cell::Cell::new(false);
+        let on_call = |_: &serde_json::Value| called.set(true);
+        assert!(!tl.step(call, &mut msgs, &on_call, &|_| {}, &|_| {}));
+        assert!(!called.get(), "a call for nobody must not be announced, let alone run");
+        assert_eq!(tl.calls, 0);
+        assert_eq!(tl.refused, Some(REFUSED_GONE));
+        assert_eq!(msgs.len(), 1, "nothing was appended to the conversation");
     }
 
     /// The clock bounds the loop the way the call count does: told once,

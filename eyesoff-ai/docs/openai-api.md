@@ -458,7 +458,7 @@ what keeps every idle timeout between the enclave and the client from firing,
 **so a turn that can wait must stream**. A non-streaming request that waits
 past ~180 seconds is cut by the proxy before it answers. A client that
 disconnects mid-wait ends the wait: the next tick notices the dead stream and
-the turn stops there.
+the turn stops there (see "Ending a turn" below).
 
 **Long loops and the context window.** Every step re-prefills the whole
 conversation, so the results the model has already acted on are most of what
@@ -519,6 +519,20 @@ machine with its output going to a file (`nohup ./run-tests.sh > /tmp/t.log
 2>&1 &`), calls `wait` for about as long as it expects the run to take, then
 reads the file. The playground shows the step counter and the countdown; the
 stop button ends the turn at any point, including mid-wait.
+
+**Ending a turn.** Closing the response stream is how a turn is ended: the
+playground's stop button aborts its request, a closed tab or a crashed
+browser closes the connection, an API client cancels its request. The enclave
+asks the stream whether its reader is still there before every forward pass
+and every tool call, and stops at the next such boundary: the next prefill
+chunk or decoded token, the next tool call (which is then not run), the next
+5-second tick of a `wait`, the next 15-second tick of a slow outbound tool
+request (which is then abandoned), a subagent's next step. What cannot be
+interrupted is the one host call already in flight: milliseconds on a GPU
+node, one prefill chunk of up to about 45 seconds on a CPU node. Nothing
+outlives the stream - there is no way to detach a turn and collect it later,
+so a client that wants the answer stays connected for it. A non-streaming
+request has no stream to ask and runs to completion once it has started.
 
 ---
 

@@ -90,12 +90,14 @@ impl<'a> HttpReq<'a> {
 
 /// One outbound request.
 pub fn request(r: HttpReq) -> Result<Response, String> {
-    request_with_tick(r, 0, &mut |_| {})
+    request_with_tick(r, 0, &mut |_| true)
 }
 
 /// `request`, but with a heartbeat: while waiting for the response's FIRST
 /// byte, `tick(total_seconds_waited)` fires every `tick_s` seconds (0 = never
-/// tick, identical to `request`). The first-byte wait is where a slow leg
+/// tick, identical to `request`); a tick that returns false abandons the
+/// request - the reader left, nobody will read the answer - and the call
+/// returns "client disconnected". The first-byte wait is where a slow leg
 /// spends its whole life - an image generation queued behind other tenants
 /// answers with one JSON blob only when it is DONE - and callers that hold a
 /// client-facing stream open during that wait need something to write into
@@ -105,7 +107,7 @@ pub fn request(r: HttpReq) -> Result<Response, String> {
 pub fn request_with_tick(
     r: HttpReq,
     tick_s: u64,
-    tick: &mut dyn FnMut(u64),
+    tick: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Response, String> {
     let (scheme_s, authority, path) = split_url(r.url)?;
     let scheme = match scheme_s.as_str() {
@@ -166,7 +168,10 @@ pub fn request_with_tick(
                 break;
             }
             waited_s += tick_s;
-            tick(waited_s);
+            if !tick(waited_s) {
+                // dropping the future abandons the request host-side
+                return Err("client disconnected".into());
+            }
         }
     }
     let resp = fut

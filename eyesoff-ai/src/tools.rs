@@ -2297,6 +2297,8 @@ fn call_http(
     let name = t.name.clone();
     let r = http::request_with_tick(req, 15, &mut |secs| {
         on_status(&format!("waiting on {name}… {secs}s"));
+        // the stop button, mid-request: the wait ends and nothing is read
+        !crate::client_gone()
     })?;
     let text = String::from_utf8_lossy(&r.body).trim().to_string();
     if r.status >= 400 {
