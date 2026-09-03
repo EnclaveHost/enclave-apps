@@ -6073,11 +6073,19 @@ fn visible_before_call(text: &str) -> &str {
 /// A `<tool_call>` tag with an object after it in the reply BODY: a call was
 /// ATTEMPTED, whatever the parser made of it. The object requirement is what
 /// separates a failed call from an answer that merely mentions the tag.
+///
+/// The brace is looked for ANYWHERE after the tag rather than immediately
+/// after it. Requiring it to OPEN the block missed every call whose wrapper
+/// was junk - `<tool_call>\n<function": {"name": ...}}` from qwen3.8 on
+/// 2026-09-03 - and a miss here is the expensive kind: the rewrite below
+/// never runs, so `step` reports no call, the turn ENDS, and the gate flushes
+/// the raw block into the answer. A false positive costs one regeneration
+/// that the model is told to spend on prose; a false negative costs the turn.
 fn attempted_call(text: &str) -> bool {
     let body = text.rfind("</think>").map_or(0, |i| i + "</think>".len());
     text[body..]
         .find("<tool_call>")
-        .is_some_and(|i| text[body + i + "<tool_call>".len()..].trim_start().starts_with('{'))
+        .is_some_and(|i| text[body + i + "<tool_call>".len()..].contains('{'))
 }
 
 /// When the model holds an image-reading tool, the pictures must leave the
@@ -11102,6 +11110,38 @@ mod tests {
         // ...and a call discussed inside <think> was never attempted
         assert!(!attempted_call("<think>maybe <tool_call>{\"name\":\"a\"} would do</think>Done."));
         assert!(attempted_call("<think>plan</think>prose first\n<tool_call>\n{\"arguments\":{}}"));
+    }
+
+    /// A call whose WRAPPER is junk must not end the turn. The recoverable
+    /// shape runs outright (see tools::a_junk_wrapper_does_not_cost_the_call);
+    /// the unrecoverable one reaches the rewrite path, which is the whole
+    /// point - before 2026-09-03 `attempted_call` required the brace to open
+    /// the block, so this shape returned "no call", the answer was finalized,
+    /// and the raw JSON was flushed to the user.
+    #[test]
+    fn a_junk_wrapper_is_corrected_not_flushed() {
+        // no name anywhere and no arguments to infer one from: unrecoverable,
+        // so the loop has to ASK rather than give up
+        let bad = "<tool_call>\n<function\": {\"arguments\": {}}\"";
+        assert!(tools::parse_calls(bad).is_empty(), "nothing to run here");
+        assert!(attempted_call(bad), "a call was attempted, whatever it parsed to");
+
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl =
+            ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "remember my name")];
+        // true = regenerate: the turn CONTINUES with the correction in history
+        assert!(tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.refused, None);
+        assert_eq!(msgs.len(), 3);
+        assert!(msgs[2].content.contains("could not be parsed"), "{}", msgs[2].content);
+        // prose that mentions the tag and carries no brace is still an answer
+        assert!(!attempted_call("Write it inside <tool_call> tags."));
     }
 
     /// The route classifier's one line, parsed: a known service and its

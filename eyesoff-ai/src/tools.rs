@@ -1737,7 +1737,8 @@ fn strip_fence(t: &str) -> Option<&str> {
 /// "fetch_url"}}` - which then poisons the conversation: the raw call is
 /// delivered as assistant text and every retry copies it verbatim. A call that
 /// names nothing at all falls back to `infer_name` against the caller's own
-/// tools, which is the only evidence left.
+/// tools, which is the only evidence left. A wrapper that is simply junk -
+/// anything at all before the object - is stepped over rather than refused.
 fn one_call(chunk: &str, tools: &[Tool]) -> Option<ToolCall> {
     let t = chunk.trim();
     let t = strip_fence(t).unwrap_or(t);
@@ -1761,6 +1762,22 @@ fn one_call(chunk: &str, tools: &[Tool]) -> Option<ToolCall> {
             // `}` short, thrown away in full.
             let repaired = close_truncated(t)?;
             serde_json::from_str(&repaired).ok()
+        })
+        .or_else(|| {
+            // ...and a call whose WRAPPER is junk but whose object is intact:
+            // `<function": {"name": ..., "arguments": {...}}` - the functionary
+            // tag spelling welded onto the trained form, minus the `{"` that
+            // would have opened it. Observed live 2026-09-03 from qwen3.8 on
+            // the 27b. Every path above needs the chunk to START with `{`, so
+            // one stray leading character threw away a complete, valid call,
+            // and `attempted_call` missed it for the same reason - the block
+            // reached the user raw instead of being rewritten. Take the first
+            // balanced object in the chunk, closing it when the budget cut it
+            // off. Junk before the object cannot change what the object says.
+            let rest = &t[t.find('{')?..];
+            balanced_end(rest)
+                .and_then(|end| serde_json::from_str(&rest[..end]).ok())
+                .or_else(|| close_truncated(rest).and_then(|r| serde_json::from_str(&r).ok()))
         })?;
     // OpenAI's OWN nesting, `{"function": {"name": ..., "arguments": ...}}`,
     // carries both halves, so unwrap it before reading either.
@@ -2892,6 +2909,32 @@ mod tests {
         assert_eq!(c[0].args["url"], "https://enclave.host/develop#api");
         // the function name is not an argument
         assert!(c[0].args.get("name").is_none(), "{:?}", c[0].args);
+    }
+
+    /// The 2026-09-03 shape: the functionary tag spelling welded onto the
+    /// trained form, so the block opens with `<` instead of `{` and carries a
+    /// stray quote at the end. The object between them is COMPLETE, and every
+    /// path here used to need the chunk to start with `{`, so the whole call
+    /// was thrown away and delivered to the user as raw text.
+    #[test]
+    fn a_junk_wrapper_does_not_cost_the_call() {
+        let raw = "<tool_call>\n<function\": {\"name\": \"notes_write\", \"arguments\": \
+                   {\"name\": \"memory/preferences.md\", \"content\": \"- Name: Steven\"}}\"";
+        let c = parse_calls(raw);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].name, "notes_write");
+        // the note's own `name` argument survives: the top-level name was
+        // found first, so the misplaced-name rescue never ran
+        assert_eq!(c[0].args["name"], "memory/preferences.md");
+        assert_eq!(c[0].args["content"], "- Name: Steven");
+        // the same wrapper around a truncated object still lands the call
+        let cut = "<tool_call>\n<function\": {\"name\": \"notes_write\", \"arguments\": \
+                   {\"name\": \"a.md\", \"content\": \"half";
+        let c = parse_calls(cut);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].args["content"], "half");
+        // ...but junk with no object in it is still not a call
+        assert!(parse_calls("<tool_call>\n<function\": notes_write").is_empty());
     }
 
     fn client_tool(name: &str, props: &[&str], required: &[&str]) -> Tool {
