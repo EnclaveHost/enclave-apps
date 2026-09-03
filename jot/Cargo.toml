@@ -1,6 +1,6 @@
 [package]
 name = "jot"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "An agent's notebook in your own S3 bucket: a bearer-keyed JSON API (list, read, write, append, search, delete) served from an attested enclave, every note one SigV4-signed object in R2/S3. Shaped for tool calls: GET /api/tools hands any agent its function schemas."
 license-file = "../LICENSE"

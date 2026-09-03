@@ -89,6 +89,7 @@
   <div class="row">
     <button id="sso">Sign in with Enclave</button>
     <span class="meta" id="who"></span>
+    <button class="ghost" id="switch" hidden>Switch account</button>
     <button class="ghost" id="signout" hidden>Sign out</button>
   </div>
   <div class="err" id="ssoerr"></div>
@@ -195,7 +196,11 @@ addEventListener("message", async (e) => {
   if (!d || typeof d.enclave_sso !== "string") return;
   if (ssoAccept(d.enclave_sso)) { await loadStatus(); await refresh(); fresh(); }
 });
-function ssoStart() {
+// `choose` asks enclave.host to confirm WHICH account signs in
+// (prompt=select_account): the account session there is one per browser and
+// a wallet connection is a separate thing, so switching users needs the
+// platform to offer the choice, not just this page to forget its token
+function ssoStart(choose) {
   if (!(status && status.sso)) return;
   let st = "";
   const b = new Uint8Array(16);
@@ -205,7 +210,7 @@ function ssoStart() {
   const authorize = (back, popup) => status.sso.authorize_url
     + "?aud=" + encodeURIComponent(status.sso.aud)
     + "&redirect_uri=" + encodeURIComponent(back)
-    + "&state=" + st + "&ttl=604800" + (popup ? "&display=popup" : "");
+    + "&state=" + st + "&ttl=604800" + (choose === true ? "&prompt=select_account" : "") + (popup ? "&display=popup" : "");
   let w = null;
   try { w = window.open(authorize(new URL("sso-return", document.baseURI).href, true), "enclave-signin", "popup,width=430,height=680"); } catch (e) {}
   if (w) return;
@@ -266,6 +271,7 @@ function pills() {
   $("#usersnote").hidden = !status.users;
   $("#who").textContent = signedIn ? "signed in as " + status.you.sub : (ssoToken && status.users ? "sign-in not accepted; sign in again" : "");
   $("#sso").hidden = signedIn;
+  $("#switch").hidden = !signedIn;
   $("#signout").hidden = !ssoToken;
   $("#keycard").hidden = !(status.auth && !status.users);
   $("#nb").hidden = !(status.configured && (status.users ? signedIn : (!status.auth || key)));
@@ -383,7 +389,8 @@ $("#connect").addEventListener("click", async () => {
   await loadStatus(); await refresh();
 });
 $("#forget").addEventListener("click", () => { key = ""; try { sessionStorage.removeItem("jot_key"); } catch (e) {} $("#key").value = ""; loadStatus(); });
-$("#sso").addEventListener("click", ssoStart);
+$("#sso").addEventListener("click", () => ssoStart(false));
+$("#switch").addEventListener("click", () => { ssoDrop(); current = null; dirty = false; loadStatus(); ssoStart(true); });
 $("#signout").addEventListener("click", () => { ssoDrop(); current = null; dirty = false; loadStatus(); });
 $("#key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#connect").click(); });
 $("#new").addEventListener("click", fresh);

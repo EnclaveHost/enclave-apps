@@ -128,6 +128,13 @@ ways to name one:
   on-chain config). Only a holder of the API key can assert a name; a
   deployment with no `api_key` never trusts `X-User` at all.
 
+The notebook UI signs in with the same popup flow as the eyesoff-ai
+playground and keeps the token for up to 7 days. **Switch account** drops
+it and reopens the flow with `prompt=select_account`, which makes
+enclave.host offer a choice between the account it holds and a different
+one (a wallet connection is not an account session there, so connecting
+another wallet alone never changes who signs in).
+
 The isolation is a hard access control at the app: user B's token or name
 cannot list, read, search, append to or delete anything under user A's
 prefix, and the e2e proves it in both directions. Who can see everything:

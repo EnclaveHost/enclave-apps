@@ -32,6 +32,7 @@ GET https://enclave.host/sso/authorize
     &redirect_uri=<absolute https URL>
     &state=<opaque, 1..256 chars>
     [&ttl=<seconds>]
+    [&prompt=select_account]
 ```
 
 Behavior:
@@ -67,6 +68,18 @@ visitor into an attacker's account).
 
 `ttl` clamps to `[300, 604800]`, default `86400` (24 h). The default is a
 session length, not a security boundary; the security boundary is `aud`.
+
+`prompt=select_account` (2026-09-03; `login` is accepted as the same ask)
+is the one exception to step 3: a visitor with a live session is shown a
+two-button card, continue as the current account or use a different one.
+The second signs the account out of enclave.host in this browser and runs
+the normal sign-in. It exists because the account session is one per
+browser and a wallet connection is a separate state domain: connecting
+another wallet never changes the account, so without it an app could only
+switch users by sending them to sign out of enclave.host first. An app
+that wants a "switch account" button drops its own stored token and
+starts the flow with this parameter; absent the parameter, nothing
+changes.
 
 ## Token format (EST1)
 
