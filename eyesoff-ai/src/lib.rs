@@ -922,8 +922,9 @@ fn prefill_chunk(sess: &mut Session) -> usize {
 fn prefill_text(
     sess: &mut Session,
     ids: &[u32],
+    marks: &[usize],
     status: &dyn Fn(&str) -> bool,
-    mut feed: impl FnMut(&mut Session, &[u32], bool, Option<&[u32]>) -> Result<Row, String>,
+    mut feed: impl FnMut(&mut Session, &[u32], bool, Option<(&[u32], &[usize])>) -> Result<Row, String>,
 ) -> Result<Row, String> {
     let cap = prefill_chunk(sess);
     let mut chunk = PREFILL_CHUNK.min(cap);
@@ -933,7 +934,7 @@ fn prefill_text(
     while done < ids.len() {
         let end = (done + chunk).min(ids.len());
         let last = end == ids.len();
-        let declare = (done == 0).then_some(ids);
+        let declare = (done == 0).then_some((ids, marks));
         let t_chunk = now_ms();
         let l = feed(sess, &ids[done..end], last, declare)?;
         let took = now_ms() - t_chunk;
@@ -1225,7 +1226,7 @@ impl Session {
         cfg: &AppConfig,
         ids: &[u32],
         want_logits: bool,
-        prompt: Option<&[u32]>,
+        prompt: Option<(&[u32], &[usize])>,
     ) -> Result<Row, String> {
         match self {
             Session::Onnx { ctx, past, total } => {
@@ -1259,10 +1260,15 @@ impl Session {
                     inputs.push(("more".to_string(),
                         Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())));
                 }
-                if let Some(all) = prompt {
+                if let Some((all, marks)) = prompt {
                     let pb: Vec<u8> = all.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
                     inputs.push(("prompt".to_string(),
                         Tensor::new(&[1, all.len() as u32], TensorType::I32, &pb)));
+                    if !marks.is_empty() {
+                        let mb: Vec<u8> = marks.iter().flat_map(|&m| (m as i32).to_le_bytes()).collect();
+                        inputs.push(("marks".to_string(),
+                            Tensor::new(&[marks.len() as u32], TensorType::I32, &mb)));
+                    }
                 }
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
                 note_timing(if ids.len() > 1 { "feed_batch" } else { "feed" }, &outs);
@@ -1826,6 +1832,7 @@ impl Session {
             sync_ms: if data.len() >= 36 { v(8) } else { -1 },
             sync_calls: if data.len() >= 40 { v(9) } else { -1 },
             mtp_round: data.len() >= 44 && v(10) != 0,
+            prefix_parks: data.len() >= 56 && v(13) > 0,
         })
     }
 
@@ -1842,7 +1849,7 @@ impl Session {
         &mut self,
         cfg: &AppConfig,
         ids: &[u32],
-        prompt: Option<&[u32]>,
+        prompt: Option<(&[u32], &[usize])>,
     ) -> Result<Row, String> {
         let Session::Ggml { ctx } = self else {
             return Err("speculative decoding needs the ggml backend".into());
@@ -1854,10 +1861,15 @@ impl Session {
             topk_input(),
             timing_input(),
         ];
-        if let Some(all) = prompt {
+        if let Some((all, marks)) = prompt {
             let pb: Vec<u8> = all.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
             inputs.push(("prompt".to_string(),
                 Tensor::new(&[1, all.len() as u32], TensorType::I32, &pb)));
+            if !marks.is_empty() {
+                let mb: Vec<u8> = marks.iter().flat_map(|&m| (m as i32).to_le_bytes()).collect();
+                inputs.push(("marks".to_string(),
+                    Tensor::new(&[marks.len() as u32], TensorType::I32, &mb)));
+            }
         }
         let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
         note_timing("feed_mtp", &outs);
@@ -2306,6 +2318,10 @@ struct Caps {
     /// head's draft chain and the verify in ONE call under one arbiter
     /// grant (mm25+). false on older hosts: keep the two-call loop.
     mtp_round: bool,
+    /// mm35: the engine parks a declared prefix at the positions a guest
+    /// marks beside its prompt declaration (see Prompt::marks). false on
+    /// older hosts, where the marks are ignored.
+    prefix_parks: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -2884,7 +2900,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via {} - prefilling {} prompt tokens", dc.name, ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_spec(cfg, dc, tok, ids, tname, p, sess, rig, load_ms, emit, status);
+                return generate_spec(cfg, dc, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
             }
             Err(e) => {
                 let _ = status(&format!("draft model unavailable ({}); plain decode", strip_code(&e)));
@@ -2895,7 +2911,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via the model's MTP head - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_mtp(cfg, tok, ids, tname, p, sess, rig, load_ms, emit, status);
+                return generate_mtp(cfg, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
             }
             Err(e) => {
                 let _ = status(&format!("MTP drafting unavailable ({}); plain decode", strip_code(&e)));
@@ -2906,7 +2922,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via prompt lookup - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_lookup(cfg, tok, ids, tname, p, sess, rig, load_ms, emit, status);
+                return generate_lookup(cfg, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
             }
             Err(e) => {
                 let _ = status(&format!("prompt-lookup drafting unavailable ({}); plain decode", strip_code(&e)));
@@ -2972,7 +2988,9 @@ fn generate(
                     let last = i == last_part && end == ids.len();
                     let t_chunk = now_ms();
                     // the whole prompt rides beside its first chunk (mm34)
-                    let declare = if fed == 0 && done == 0 { prompt.text_only() } else { None };
+                    let declare = if fed == 0 && done == 0 {
+                        prompt.text_only().map(|t| (t, prompt.marks.as_slice()))
+                    } else { None };
                     let l = sess.feed_declared(cfg, &ids[done..end], last, declare)?;
                     let took = now_ms() - t_chunk;
                     if last {
@@ -3122,6 +3140,7 @@ fn generate_spec(
     dcfg: &AppConfig,
     tok: &Tok,
     prompt_ids: &[u32],
+    marks: &[usize],
     tname: &str,
     p: &GenParams,
     mut sess: Session,
@@ -3135,11 +3154,11 @@ fn generate_spec(
     let t1 = now_ms();
     // prefill BOTH models on the prompt (chunked and narrated, see
     // prefill_text); only the target's last row is needed
-    let mut t_logits = prefill_text(&mut sess, prompt_ids, status, |s, ids, last, declare| {
+    let mut t_logits = prefill_text(&mut sess, prompt_ids, marks, status, |s, ids, last, declare| {
         s.feed_declared(cfg, ids, last, declare)
     })?;
     let draft_status = |st: &str| status(&format!("draft model: {st}"));
-    prefill_text(&mut dsess, prompt_ids, &draft_status, |s, ids, _last, declare| {
+    prefill_text(&mut dsess, prompt_ids, marks, &draft_status, |s, ids, _last, declare| {
         s.feed_declared(dcfg, ids, false, declare)
     })?;
     let prefill_ms = now_ms() - t1;
@@ -3320,6 +3339,7 @@ fn generate_mtp(
     cfg: &AppConfig,
     tok: &Tok,
     prompt_ids: &[u32],
+    marks: &[usize],
     tname: &str,
     p: &GenParams,
     mut sess: Session,
@@ -3354,7 +3374,7 @@ fn generate_mtp(
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
     let t1 = now_ms();
-    let mut t_logits = prefill_text(&mut sess, prompt_ids, status, |s, ids, _last, declare| {
+    let mut t_logits = prefill_text(&mut sess, prompt_ids, marks, status, |s, ids, _last, declare| {
         s.feed_mtp_declared(cfg, ids, declare)
     })?;
     let prefill_ms = now_ms() - t1;
@@ -3724,6 +3744,7 @@ fn generate_lookup(
     cfg: &AppConfig,
     tok: &Tok,
     prompt_ids: &[u32],
+    marks: &[usize],
     tname: &str,
     p: &GenParams,
     mut sess: Session,
@@ -3740,7 +3761,7 @@ fn generate_lookup(
     let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let t1 = now_ms();
-    let mut t_logits = prefill_text(&mut sess, prompt_ids, status, |s, ids, last, declare| {
+    let mut t_logits = prefill_text(&mut sess, prompt_ids, marks, status, |s, ids, last, declare| {
         s.feed_declared(cfg, ids, last, declare)
     })?;
     let prefill_ms = now_ms() - t1;
@@ -7304,6 +7325,13 @@ struct Prompt {
     parts: Vec<PromptPart>,
     text_ids: Vec<u32>,
     images: usize,
+    /// mm35: token positions where a SHARED prefix of this prompt ends -
+    /// the system text, then the end of the system message (the tool block
+    /// included) - each verified to be a token-exact prefix of `text_ids`.
+    /// Declared to the engine beside the prompt, which parks the state there
+    /// as prefill crosses it, so every prompt that starts the same way (every
+    /// new chat at this deployment, on the same settings) branches off it.
+    marks: Vec<usize>,
 }
 
 impl Prompt {
@@ -7390,17 +7418,18 @@ fn build_prompt(
     thinking: bool, // the request's switch; only cfg.thinking models act on it
     caps: Capabilities,
 ) -> Result<(Prompt, Vec<String>, bool), String> {
-    let system = system_of(cfg, messages);
+    let base = system_of(cfg, messages);
+    let block_added = matches!(caps, Capabilities::Tools(..) | Capabilities::Client(_));
     let system = match caps {
-        Capabilities::Internal => system,
-        Capabilities::Note => with_capability_note(cfg, &system),
+        Capabilities::Internal => base.clone(),
+        Capabilities::Note => with_capability_note(cfg, &base),
         // the tools block REPLACES the note rather than joining it: the note
         // says "you have no tools and cannot call one", which is a lie at a
         // deployment that just handed the model three of them
         Capabilities::Tools(list, budget) => {
-            format!("{}{}", system.trim_end(), tools::system_block(list, budget))
+            format!("{}{}", base.trim_end(), tools::system_block(list, budget))
         }
-        Capabilities::Client(block) => format!("{}{}", system.trim_end(), block),
+        Capabilities::Client(block) => format!("{}{}", base.trim_end(), block),
     };
     // (role, text) per turn, with the turn's images kept alongside by INDEX.
     // Marks are stripped from incoming text FIRST: they are our own private
@@ -7484,7 +7513,22 @@ fn build_prompt(
                 .flat_map(|(vs, ims)| vs.iter().cloned().map(Media::Video)
                     .chain(ims.iter().cloned().map(Media::Image)))
                 .collect();
-            let prompt = split_rendered(tok, &rendered.prompt, media)?;
+            let mut prompt = split_rendered(tok, &rendered.prompt, media)?;
+            // the shared prefixes worth parking (mm35): the system text on
+            // its own when a tool block follows it (every settings
+            // combination shares that much), and the whole system message.
+            // chatml only - the boundaries below are its markers - and only
+            // for a prompt the engine can be told about whole (no media).
+            if cfg.template == "chatml" && prompt.images == 0 {
+                let mut cands = Vec::new();
+                if block_added {
+                    cands.push(tok.encode_ids(
+                        &format!("<|im_start|>system\n{}", base.trim_end()), true)?);
+                }
+                cands.push(tok.encode_ids(
+                    &format!("<|im_start|>system\n{system}<|im_end|>\n"), true)?);
+                prompt.marks = marks_from(&prompt.text_ids, &cands);
+            }
             let mut stops = rendered.stop_strings;
             // A completed call is the end of the turn: stopping here saves the
             // model from narrating past its own call, and the parser accepts
@@ -7545,8 +7589,26 @@ fn split_rendered(
     // `images` is the MEDIA count: every path that asks text_only() cares
     // whether anything non-text sits in the prompt, not which kind
     let images = parts.iter().filter(|p| matches!(p, PromptPart::Image(_) | PromptPart::Video(_))).count();
-    Ok(Prompt { parts, text_ids, images })
+    Ok(Prompt { parts, text_ids, images, marks: Vec::new() })
 }
+
+/// The boundary marks a prompt can declare (see Prompt::marks): each
+/// candidate prefix's own tokenization, kept only where it is a token-exact
+/// prefix of the whole prompt - a join that the tokenizer merges across
+/// (a newline that fused with what follows) disqualifies that mark rather
+/// than parking a state no later prompt could match. Ascending, deduped,
+/// nothing shorter than the engine's minimum worth a slot.
+fn marks_from(text_ids: &[u32], candidates: &[Vec<u32>]) -> Vec<usize> {
+    let mut out: Vec<usize> = candidates
+        .iter()
+        .filter(|c| c.len() >= 64 && text_ids.starts_with(c))
+        .map(|c| c.len())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 
 /// Remove media marks from text that came from outside.
 fn strip_marks(s: &str) -> String {
@@ -9046,6 +9108,52 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
     Err(last_err)
 }
 
+/// Park the deployment's shared prompt prefix on the engine (mm35, see
+/// Prompt::marks) so the first chat on the default settings starts from it
+/// instead of reading ~3,000 tokens: render the prompt a default-settings
+/// turn would carry, feed it up to the last mark only (no user turn, no
+/// generation - nothing to park as a turn), declaring the marks. An engine
+/// without boundary parks, or a prompt with no mark, is a no-op reported as
+/// such. The cost is one prefill of the prefix, paid once at warm-up rather
+/// than by the first visitor; a later warm-up finds the parks standing and
+/// returns in milliseconds.
+fn warm_prefix(cfg: &AppConfig, mode: &str) -> Result<serde_json::Value, String> {
+    let t0 = now_ms();
+    let tok = make_tok(cfg, "auto", t0)?;
+    let tc = cfg.tools.as_ref();
+    let b = builtins_of(cfg);
+    let reg = tc.map(|t| tools::build(t, b, &|_| {}));
+    let caps = match (tc, reg.as_ref()) {
+        (Some(t), Some(r)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, t.budget(None)),
+        _ => Capabilities::Note,
+    };
+    let msgs = vec![ChatMsg::text("user", "warm".to_string())];
+    let (prompt, _, _) = build_prompt(cfg, &tok, &msgs, cfg.thinking, caps)?;
+    let Some(&end) = prompt.marks.last() else {
+        return Ok(serde_json::json!({ "parked": false, "why": "no boundary to park" }));
+    };
+    let ids = &prompt.text_ids[..end];
+    let mut last_err = String::new();
+    for (target, tname) in targets_for(cfg, mode) {
+        let mut sess = match Session::open(cfg, target) {
+            Ok(s) => s,
+            Err(e) => { last_err = format!("{tname}: {e}"); continue; }
+        };
+        if !sess.caps().map(|c| c.prefix_parks).unwrap_or(false) {
+            return Ok(serde_json::json!({ "parked": false, "why": "engine predates boundary parks" }));
+        }
+        let t1 = now_ms();
+        prefill_text(&mut sess, ids, &prompt.marks, &|_| true, |s, ids, last, declare| {
+            s.feed_declared(cfg, ids, last, declare)
+        })?;
+        return Ok(serde_json::json!({
+            "parked": true, "target": tname, "tokens": end, "marks": prompt.marks,
+            "ms": now_ms() - t1,
+        }));
+    }
+    Err(last_err)
+}
+
 /// GET /warmup - put weights and kernels in device memory BEFORE the first
 /// real prompt.
 ///
@@ -9112,6 +9220,17 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
         .find_map(|kv| kv.strip_prefix("target="))
         .unwrap_or(if gpu_present() == Some(false) { "auto" } else { "gpu" });
     let model = query.split('&').find_map(|kv| kv.strip_prefix("model="));
+    // ?prefix=0 skips parking the shared prompt prefix (mm35, warm_prefix);
+    // by default a warmed model also gets its prefix parked, so the first
+    // chat after a boot or a page load starts from it
+    let prefix = query.split('&').find_map(|kv| kv.strip_prefix("prefix=")) != Some("0");
+    let park = |cfg: &AppConfig| -> serde_json::Value {
+        if !prefix { return serde_json::Value::Null; }
+        match warm_prefix(cfg, mode) {
+            Ok(v) => v,
+            Err(e) => serde_json::json!({ "parked": false, "error": e }),
+        }
+    };
 
     if model.is_some() {
         // single-model mode; unknown names fall back to the default model
@@ -9126,6 +9245,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                 let body = serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
+                    "prefix": park(cfg),
                 });
                 respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
             }
@@ -9157,6 +9277,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                 let body = serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
+                    "prefix": park(cfg),
                 });
                 respond_bytes(out, 200, "application/json", body.to_string().as_bytes())
             }
@@ -9187,6 +9308,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                 ladder.push(serde_json::json!({
                     "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
                     "ok": true, "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
+                    "prefix": park(&e.cfg),
                 }));
             }
             // busy = an active chat holds the session slot, which NORMALLY
@@ -10797,6 +10919,19 @@ mod tests {
         // a deployment with no tools keeps the old stop set and the note
         let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false, Capabilities::Note).unwrap();
         assert!(!stops.iter().any(|s| s == "</tool_call>"), "{stops:?}");
+    }
+
+    /// mm35 marks: a candidate prefix is a mark only when its own tokens are
+    /// exactly the prompt's first tokens - a merged join disqualifies it.
+    #[test]
+    fn marks_are_only_token_exact_prefixes() {
+        let text: Vec<u32> = (0..300).collect();
+        let good: Vec<u32> = (0..100).collect();
+        let short: Vec<u32> = (0..10).collect();          // below the engine minimum
+        let mut merged: Vec<u32> = (0..200).collect();
+        merged[199] = 9999;                               // a join the tokenizer fused
+        let whole: Vec<u32> = (0..300).collect();
+        assert_eq!(marks_from(&text, &[good.clone(), short, merged, whole, good]), vec![100, 300]);
     }
 
     #[test]
