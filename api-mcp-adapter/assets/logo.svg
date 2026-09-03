@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- api-mcp-adapter: two sockets joined by one bridge, an API on the left and the MCP plug on the right. -->
+  <rect x="8" y="28" width="32" height="40" rx="7" fill="#7fd9c9"/>
+  <rect x="56" y="28" width="32" height="40" rx="7" fill="#54b8a6"/>
+  <rect x="38" y="43" width="20" height="10" rx="2" fill="#e6e9f0"/>
+  <g fill="#062420">
+    <rect x="16" y="38" width="16" height="4" rx="2"/>
+    <rect x="16" y="46" width="12" height="4" rx="2"/>
+    <rect x="16" y="54" width="16" height="4" rx="2"/>
+    <circle cx="72" cy="42" r="4"/>
+    <circle cx="72" cy="54" r="4"/>
+  </g>
+</svg>

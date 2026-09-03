@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>api-mcp-adapter - any HTTP API as an MCP server, from an enclave</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 96 96%27%3E%3Crect x=%2710%27 y=%2730%27 width=%2730%27 height=%2736%27 rx=%276%27 fill=%27%237fd9c9%27/%3E%3Crect x=%2756%27 y=%2730%27 width=%2730%27 height=%2736%27 rx=%276%27 fill=%27%2754b8a6%27/%3E%3Crect x=%2738%27 y=%2744%27 width=%2720%27 height=%278%27 fill=%27%23e6e9f0%27/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #131722; --panel2: #0f131c; --border: #232a3a;
+    --text: #e6e9f0; --dim: #8a93a6; --accent: #7fd9c9; --accent-h: #a3ece0;
+    --err: #f2b8c0; --warn: #f5d58a; --danger: #f2748a; --ok: #7ee0b8;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 1040px; margin: 0 auto; padding: 0 16px 40px; }
+  header { padding: 18px 0 12px; border-bottom: 1px solid var(--border); display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .wordmark { font: 600 20px/1 var(--mono); letter-spacing: .06em; color: var(--accent); }
+  .tagline { color: var(--dim); font-size: 12.5px; margin-top: 5px; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pill { font: 600 11px var(--mono); border-radius: 999px; padding: 2px 9px; background: #2a2f3e; color: var(--dim); }
+  .pill.on { background: #1f3a35; color: var(--ok); }
+  .pill.warn { background: #3a3320; color: var(--warn); }
+  .pill.bad { background: #3a2530; color: var(--danger); }
+  .banner { background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 13px; margin-top: 14px; font-size: 12.5px; color: var(--dim); }
+  .banner b { color: var(--text); font-weight: 600; }
+  .banner.bad { border-left-color: var(--danger); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .card h2 { font-size: 13.5px; font-weight: 600; color: var(--accent); margin-bottom: 6px; }
+  .card p { font-size: 12.5px; color: var(--dim); }
+  .meta { color: var(--dim); font-size: 12px; font-family: var(--mono); word-break: break-all; }
+  input, textarea, select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 7px 10px; font: 13px var(--mono); }
+  input::placeholder, textarea::placeholder { color: #59627a; }
+  button { background: var(--accent); color: #062420; border: 0; border-radius: 7px; padding: 7px 14px; font: 600 13px system-ui, sans-serif; cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { background: var(--accent-h); }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  button.ghost:hover:not(:disabled) { background: var(--panel2); color: var(--text); }
+  button.mini { padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .4; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .row input { flex: 1; min-width: 160px; }
+  .err { color: var(--err); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; }
+  .tool { border-top: 1px solid var(--border); padding: 10px 0; }
+  .tool:first-child { border-top: 0; }
+  .tool .nm { font: 600 13px var(--mono); color: var(--text); }
+  .tool .ds { font-size: 12.5px; color: var(--dim); margin-top: 3px; }
+  .tool .tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+  .tag { font: 11px var(--mono); border-radius: 5px; padding: 1px 7px; background: #1c2230; color: var(--dim); }
+  .tag.g { color: var(--accent); }
+  .tag.u { color: var(--warn); }
+  .tag.i { color: #c9b5f5; }
+  pre.code { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font: 12px/1.5 var(--mono); color: var(--text); margin-top: 8px; white-space: pre; }
+  details > summary { cursor: pointer; font-size: 12.5px; color: var(--dim); user-select: none; margin-top: 8px; }
+  .tabs { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .tabs button { background: transparent; color: var(--dim); border: 1px solid var(--border); }
+  .tabs button.on { color: var(--accent); border-color: var(--accent); }
+  .out img { max-width: 100%; border-radius: 8px; border: 1px solid var(--border); margin-top: 8px; }
+  .out ol { font-size: 12.5px; color: var(--dim); margin: 8px 0 0 18px; }
+  footer { color: var(--dim); font-size: 12px; margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--border); line-height: 1.6; }
+  footer b { color: var(--text); }
+  a { color: var(--accent); }
+  code { font-family: var(--mono); font-size: 12px; color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="wordmark">[ api-mcp-adapter ]</div>
+    <div class="tagline">any HTTP API as an MCP server, from an attested enclave</div>
+  </div>
+  <div class="pills" id="pills"></div>
+</header>
+
+<div class="banner" id="banner">Loading status…</div>
+
+<div class="card" id="keycard">
+  <h2>API key</h2>
+  <p>This deployment gates its MCP endpoint and this page's tool list behind a key (the <code>api_key</code> secret). Paste it to see what a client sees; it is kept in this tab only. For per-user tools, also name the account.</p>
+  <div class="row">
+    <input id="key" type="password" placeholder="api key" autocomplete="off">
+    <input id="user" placeholder="X-User (optional): 0x… wallet or acct_… id" autocomplete="off">
+    <button id="connect">Connect</button>
+    <button class="ghost" id="forget">Forget</button>
+  </div>
+  <div class="err" id="keyerr"></div>
+</div>
+
+<div class="card" id="toolscard" hidden>
+  <h2>Tools <span class="meta" id="count"></span></h2>
+  <p>What <code>tools/list</code> answers for this caller. Hidden per-user tools appear once the request names an account.</p>
+  <div id="tools"></div>
+  <div class="meta" id="hidden"></div>
+  <div class="err" id="notes"></div>
+</div>
+
+<div class="card" id="connectcard" hidden>
+  <h2>Connect</h2>
+  <p>One endpoint, every client. The eyesoff-ai entry replaces its whole <code>tools.http</code> block; the groups keep the same switches the block would have had.</p>
+  <div class="tabs">
+    <button class="on" data-tab="eyesoff">eyesoff-ai</button>
+    <button data-tab="claude">Claude Code</button>
+    <button data-tab="curl">curl</button>
+  </div>
+  <pre class="code" id="snippet"></pre>
+</div>
+
+<div class="card" id="callcard" hidden>
+  <h2>Try a call</h2>
+  <p>Runs one tool through <code>GET /api/tools?call=</code>, exactly as a <code>tools/call</code> would, with this page's key and user.</p>
+  <div class="row">
+    <select id="callname" style="max-width: 320px"></select>
+    <input id="callargs" placeholder='arguments as JSON, e.g. {"name":"projects/enclave.md"}'>
+    <button id="run">Run</button>
+  </div>
+  <div class="out" id="out"></div>
+  <div class="err" id="callerr"></div>
+</div>
+
+<footer>
+  <b>What crosses:</b> a tool call sends the arguments to the configured endpoint from this deployment's egress IP, with the deployment's own secrets in the headers. The caller never chooses a URL or a header. Routes: <code>POST /mcp</code>, <code>GET /api/status</code>, <code>GET /api/tools[?call=&amp;args=]</code>. Source: <a href="https://github.com/EnclaveHost/enclave-apps/tree/main/api-mcp-adapter">enclave-apps/api-mcp-adapter</a>.
+</footer>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const state = { status: null, tools: null, tab: "eyesoff" };
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const keyOf = () => sessionStorage.getItem("mcp-adapter-key") || "";
+  const userOf = () => sessionStorage.getItem("mcp-adapter-user") || "";
+  function hdrs() {
+    const h = {};
+    if (keyOf()) h["x-api-key"] = keyOf();
+    if (userOf()) h["x-user"] = userOf();
+    return h;
+  }
+  function pill(text, cls) { const s = document.createElement("span"); s.className = "pill " + (cls || ""); s.textContent = text; return s; }
+
+  async function loadStatus() {
+    const r = await fetch("api/status", { headers: hdrs() });
+    const st = await r.json();
+    state.status = st;
+    const pills = $("pills"); pills.innerHTML = "";
+    pills.appendChild(pill("v" + st.version));
+    pills.appendChild(pill(st.tools + " tool" + (st.tools === 1 ? "" : "s"), st.tools ? "on" : "warn"));
+    pills.appendChild(pill(st.auth ? "keyed" : "open", st.auth ? "on" : "warn"));
+    if (st.users) pills.appendChild(pill("per-user tools", st.sso ? "on" : ""));
+    const b = $("banner");
+    if (st.error) { b.className = "banner bad"; b.innerHTML = "<b>Not serving:</b> " + esc(st.error); }
+    else if (!st.tools) { b.className = "banner bad"; b.innerHTML = "<b>No tools configured.</b> Add an <code>http</code> array to the App Config (an eyesoff-ai <code>tools</code> block pastes as-is)."; }
+    else {
+      b.className = "banner";
+      b.innerHTML = "<b>" + esc(st.title) + "</b> serves " + st.tools + " tool" + (st.tools === 1 ? "" : "s") + " over MCP at <code>" + esc(location.origin + "/mcp") + "</code>"
+        + (st.groups && st.groups.length ? " in " + st.groups.length + " group" + (st.groups.length === 1 ? "" : "s") + " (" + esc(st.groups.join(", ")) + ")" : "")
+        + (st.you ? ". You are <code>" + esc(st.you.sub) + "</code> (via " + esc(st.you.via) + ")" : "") + ".";
+    }
+    $("keycard").hidden = !st.auth && !st.users;
+    if (!st.auth || keyOf()) loadTools();
+  }
+
+  async function loadTools() {
+    $("keyerr").textContent = "";
+    const r = await fetch("api/tools", { headers: hdrs() });
+    if (!r.ok) {
+      let msg = "HTTP " + r.status;
+      try { msg = (await r.json()).error.message; } catch (_) {}
+      $("keyerr").textContent = msg;
+      return;
+    }
+    const t = await r.json();
+    state.tools = t;
+    $("toolscard").hidden = $("connectcard").hidden = $("callcard").hidden = false;
+    $("count").textContent = t.tools.length + " listed" + (t.hidden.length ? ", " + t.hidden.length + " hidden" : "");
+    const box = $("tools"); box.innerHTML = "";
+    const sel = $("callname"); sel.innerHTML = "";
+    for (const tool of t.tools) {
+      const m = (tool._meta && tool._meta["enclave.host/tool"]) || {};
+      const d = document.createElement("div"); d.className = "tool";
+      let tags = '<span class="tag g">' + esc(m.group || "") + "</span>";
+      const a = tool.annotations || {};
+      tags += '<span class="tag">' + (a.readOnlyHint ? "read-only" : a.destructiveHint ? "destructive" : "writes") + "</span>";
+      if (m.images) tags += '<span class="tag i">takes attached pictures</span>';
+      if (m.result === "image") tags += '<span class="tag i">returns a picture</span>';
+      if (m.user) tags += '<span class="tag u">per-user</span>';
+      if (m.timeout_s) tags += '<span class="tag">' + m.timeout_s + "s</span>";
+      if (m.format) tags += '<span class="tag">format prompt</span>';
+      const props = Object.keys((tool.inputSchema && tool.inputSchema.properties) || {});
+      const req = (tool.inputSchema && tool.inputSchema.required) || [];
+      d.innerHTML = '<div class="nm">' + esc(tool.name) + "(" + esc(props.map((p) => p + (req.includes(p) ? "" : "?")).join(", ")) + ")</div>"
+        + '<div class="ds">' + esc(tool.description || "(no description)") + "</div>"
+        + '<div class="tags">' + tags + "</div>";
+      box.appendChild(d);
+      const o = document.createElement("option"); o.value = tool.name; o.textContent = tool.name; sel.appendChild(o);
+    }
+    $("hidden").textContent = t.hidden.length ? "hidden for this caller (per-user): " + t.hidden.join(", ") : "";
+    $("notes").textContent = (t.notes || []).join("\n");
+    renderSnippet();
+  }
+
+  function renderSnippet() {
+    const t = state.tools; if (!t) return;
+    let s = "";
+    if (state.tab === "eyesoff") {
+      s = "// in the eyesoff-ai deployment's config: the `tools` block keeps its\n// budgets and builtins; this entry replaces the whole `http` array.\n// Secret MCP_ADAPTER_API_KEY on the eyesoff deployment = this adapter's api_key.\n"
+        + JSON.stringify(t.eyesoff_ai, null, 2);
+    } else if (state.tab === "claude") {
+      s = t.claude_code + (t.users ? '\n# per-user tools: add --header "X-User: <0x… or acct_…>"' : "");
+    } else {
+      s = t.curl;
+    }
+    $("snippet").textContent = s;
+  }
+
+  async function runCall() {
+    $("callerr").textContent = ""; $("out").innerHTML = "";
+    const name = $("callname").value;
+    const args = $("callargs").value.trim() || "{}";
+    try { JSON.parse(args); } catch (e) { $("callerr").textContent = "arguments are not valid JSON: " + e.message; return; }
+    $("run").disabled = true;
+    try {
+      const r = await fetch("api/tools?call=" + encodeURIComponent(name) + "&args=" + encodeURIComponent(args), { headers: hdrs() });
+      const j = await r.json();
+      if (!r.ok) { $("callerr").textContent = (j.error && j.error.message) || ("HTTP " + r.status); return; }
+      let h = '<div class="meta">' + (j.ok ? "ok" : "FAILED") + " · " + j.ms + " ms" + (j.user ? " · as " + esc(j.user) : "") + "</div>";
+      h += '<pre class="code">' + esc(j.result || "") + "</pre>";
+      if (j.image) h += '<img alt="the picture the tool returned" src="' + j.image.data_uri + '">';
+      if (j.sources && j.sources.length) h += "<ol>" + j.sources.map((s) => "<li>" + esc(s.title || s.url) + (s.url ? ' <a href="' + esc(s.url) + '" rel="noopener" target="_blank">' + esc(s.url) + "</a>" : "") + "</li>").join("") + "</ol>";
+      $("out").innerHTML = h;
+      if (!j.ok) $("callerr").textContent = j.result || "the call failed";
+    } catch (e) {
+      $("callerr").textContent = String(e);
+    } finally {
+      $("run").disabled = false;
+    }
+  }
+
+  $("connect").onclick = () => {
+    sessionStorage.setItem("mcp-adapter-key", $("key").value.trim());
+    sessionStorage.setItem("mcp-adapter-user", $("user").value.trim());
+    loadStatus();
+  };
+  $("forget").onclick = () => {
+    sessionStorage.removeItem("mcp-adapter-key"); sessionStorage.removeItem("mcp-adapter-user");
+    $("key").value = ""; $("user").value = "";
+    $("toolscard").hidden = $("connectcard").hidden = $("callcard").hidden = true;
+    loadStatus();
+  };
+  $("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("connect").click(); });
+  $("user").addEventListener("keydown", (e) => { if (e.key === "Enter") $("connect").click(); });
+  $("callargs").addEventListener("keydown", (e) => { if (e.key === "Enter") runCall(); });
+  $("run").onclick = runCall;
+  for (const b of document.querySelectorAll(".tabs button")) {
+    b.onclick = () => {
+      for (const o of document.querySelectorAll(".tabs button")) o.classList.toggle("on", o === b);
+      state.tab = b.dataset.tab; renderSnippet();
+    };
+  }
+  $("key").value = keyOf(); $("user").value = userOf();
+  loadStatus().catch((e) => { $("banner").className = "banner bad"; $("banner").textContent = "status failed: " + e; });
+})();
+</script>
+</body>
+</html>

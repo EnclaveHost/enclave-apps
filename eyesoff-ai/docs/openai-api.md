@@ -307,6 +307,17 @@ reported on `enclave.tools` (non-streaming) or `: enclave-tool` /
 Drawing, looking and upscaling live here, as ordinary registry entries rather
 than as built-ins: see [Picture tools](#picture-tools) below.
 
+An `mcp` entry in that block points at a Model Context Protocol server, whose
+tools join the same list and are called the same way. One shape worth knowing:
+the [api-mcp-adapter](https://github.com/EnclaveHost/enclave-apps/tree/main/api-mcp-adapter)
+app holds the `http` entries in ITS config and serves them as one MCP endpoint,
+so a chat deployment carries a single `mcp` entry, the backends' API keys live
+in that deployment rather than this one, and the same tools serve other agents
+(Claude Code, Cursor) from the same URL. Nothing is lost on the way across:
+pictures in and out, citations, the signed-in user, the settings switches and
+the per-entry budgets all travel, so a tool behaves here exactly as it did when
+its entry lived in this config.
+
 **2. Client passthrough — `tools: [...]` (array, OpenAI).**
 The client's own functions are offered to the model, and nothing here executes
 one: the model's call comes back structured and the **client** runs it, then

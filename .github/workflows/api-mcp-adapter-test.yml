@@ -1,0 +1,36 @@
+# api-mcp-adapter's test suite. Host-target `cargo test` - the templating,
+# the secret and identity rules, the MCP dispatch and the result shapes are
+# all pure, so they run anywhere with no wasm toolchain and no network.
+#
+# The two harnesses that need a runtime are NOT run here: scripts/e2e.sh
+# (the whole contract through a real `wasmtime serve`) and scripts/interop.sh
+# (eyesoff-ai's own MCP client over a socket against a live adapter). Run
+# those locally before publishing a version - they are what prove the pair
+# actually interoperate, which no unit test can.
+name: api-mcp-adapter tests
+
+on:
+  push:
+    branches: [main]
+    paths: ["api-mcp-adapter/**", ".github/workflows/api-mcp-adapter-test.yml"]
+  pull_request:
+    paths: ["api-mcp-adapter/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            api-mcp-adapter/target
+          key: api-mcp-adapter-test-${{ hashFiles('api-mcp-adapter/Cargo.lock') }}
+      - name: cargo test
+        working-directory: api-mcp-adapter
+        run: cargo test --locked

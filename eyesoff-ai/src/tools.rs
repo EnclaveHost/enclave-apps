@@ -44,8 +44,14 @@
 //! is nothing to run one in anyway. The component holds NO state between
 //! requests, so a server with `discover` on costs three round trips (initialize,
 //! notifications/initialized, tools/list) before the prompt can even be built,
-//! every turn. Declare `tools` inline on the entry to skip all three when the
-//! server's list is stable.
+//! every turn. Two ways out: declare `tools` inline on the entry to skip all
+//! three when the server's list is stable, or `handshake: false` for a
+//! stateless server that needs no initialize (an api-mcp-adapter), which
+//! makes discovery ONE trip and a call one trip. A tool's `_meta` under
+//! `enclave.host/tool` (ToolMeta) carries what this app needs beyond the
+//! schema - the switch it sits under, pictures in and out, a call's own
+//! timeout, the prompt-side settings - so an http entry moved out of this
+//! config into an adapter keeps behaving exactly as it did here.
 
 use std::collections::BTreeMap;
 
@@ -692,7 +698,30 @@ impl ToolsConfig {
             push(g, kind, vec![t.name.clone()], on);
         }
         for s in &self.mcp {
-            push(s.group_name(), "mcp", Vec::new(), self.default_on);
+            // a server's switches are known before any turn dials it only
+            // through its config: the groups map an adapter wrote, or the
+            // inline declarations; without either the server is one switch
+            let on_for = |g: &str| {
+                if g == GROUP_IMAGES { images.unwrap_or(self.default_on) } else { self.default_on }
+            };
+            let kind_for = |g: &str| if g == GROUP_IMAGES { "images" } else { "mcp" };
+            let mut seen: Vec<String> = Vec::new();
+            for (g, names) in &s.groups {
+                seen.extend(names.iter().cloned());
+                push(g.clone(), kind_for(g), names.clone(), on_for(g));
+            }
+            for d in &s.tools {
+                let exposed = format!("{}{}", s.prefix.as_deref().unwrap_or(""), d.name);
+                if check_name(&exposed).is_err() || seen.iter().any(|n| *n == exposed || *n == d.name) {
+                    continue;
+                }
+                let g = s.group_for(&d.name, &exposed, d.meta.group.as_deref());
+                push(g.clone(), kind_for(&g), vec![exposed.clone()], on_for(&g));
+                seen.push(exposed);
+            }
+            if s.groups.is_empty() && s.tools.is_empty() {
+                push(s.group_name(), "mcp", Vec::new(), self.default_on);
+            }
         }
         out
     }
@@ -907,8 +936,26 @@ pub struct McpServer {
     pub timeout_s: Option<u64>,
     #[serde(default)]
     pub protocol_version: Option<String>,
+    /// speak the protocol's handshake (initialize, then the initialized
+    /// notification) before tools/list and before the first call. Off, a
+    /// stateless server that needs none (api-mcp-adapter) costs ONE round
+    /// trip per turn for discovery and one per call instead of three; on
+    /// (the default) is what the protocol asks of a client.
+    #[serde(default = "default_true")]
+    pub handshake: bool,
+    /// the switches this server's tools sit under, for the settings panel
+    /// BEFORE any turn dials the server: {group: [tool names]}, a name
+    /// optionally ending in `*`. An api-mcp-adapter's GET /api/tools writes
+    /// this map by the same rule the http entries follow. At turn time it
+    /// wins over a discovered tool's own `_meta` group, because it is what
+    /// the person's switches show.
+    #[serde(default)]
+    pub groups: BTreeMap<String, Vec<String>>,
 }
 
+/// A tool as an MCP server lists it, or as an inline declaration writes it:
+/// the schema, plus the same facts an api-mcp-adapter puts on `_meta`,
+/// written flat here (`"images": true`, `"result": "image"`, `"group"`, ...).
 #[derive(Deserialize, Clone)]
 pub struct McpToolDecl {
     pub name: String,
@@ -916,6 +963,34 @@ pub struct McpToolDecl {
     pub description: String,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub meta: ToolMeta,
+}
+
+/// The `_meta` key under which a listed tool carries its facts for this
+/// app (see ToolMeta). Vendor-prefixed per the protocol's rule, so another
+/// server's metadata cannot collide with it.
+pub const META_KEY: &str = "enclave.host/tool";
+
+impl McpToolDecl {
+    /// One entry of a `tools/list` answer, read with its `_meta`.
+    fn from_listed(t: &serde_json::Value) -> Option<McpToolDecl> {
+        let meta = t
+            .get("_meta")
+            .and_then(|m| m.get(META_KEY))
+            .and_then(|m| serde_json::from_value::<ToolMeta>(m.clone()).ok())
+            .unwrap_or_default();
+        Some(McpToolDecl {
+            name: t.get("name")?.as_str()?.to_string(),
+            description: t
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string(),
+            parameters: t.get("inputSchema").cloned(),
+            meta,
+        })
+    }
 }
 
 impl McpServer {
@@ -929,6 +1004,26 @@ impl McpServer {
             return p.to_string();
         }
         host_of(&self.url)
+    }
+
+    /// The switch a tool of this server sits under: the config's `groups`
+    /// map (what the person's switches show), else the group the server
+    /// declared for it, else this server's own. `remote` is the name the
+    /// server knows, `exposed` the prefixed one; the map may use either.
+    pub fn group_for(&self, remote: &str, exposed: &str, declared: Option<&str>) -> String {
+        for (g, names) in &self.groups {
+            let hit = names.iter().any(|n| match n.strip_suffix('*') {
+                Some(p) => remote.starts_with(p) || exposed.starts_with(p),
+                None => n == remote || n == exposed,
+            });
+            if hit {
+                return g.clone();
+            }
+        }
+        if let Some(d) = declared.map(str::trim).filter(|d| !d.is_empty()) {
+            return d.to_string();
+        }
+        self.group_name()
     }
 }
 
@@ -947,6 +1042,63 @@ pub enum ToolSrc {
     Client,
 }
 
+/// What a tool IS beyond its schema: the facts the legs and the loop act
+/// on. An http entry's come from its own fields (ToolMeta::of_http); an MCP
+/// tool's come from the server's `_meta["enclave.host/tool"]` - the key an
+/// api-mcp-adapter writes so an entry moved out of this config keeps
+/// behaving as it did here - or from its inline declaration, which takes
+/// the same fields flat. A builtin has none.
+#[derive(Deserialize, Clone, Default)]
+pub struct ToolMeta {
+    /// the switch this tool sits under (see GROUP_SEARCH)
+    #[serde(default)]
+    pub group: Option<String>,
+    /// takes the turn's attached pictures: the call carries them as the
+    /// reserved arguments `images` (data URIs) and `image` (the first)
+    #[serde(default)]
+    pub images: bool,
+    /// "image": answers with a picture for the client
+    #[serde(default)]
+    pub result: Option<String>,
+    /// how long ONE call may take, when the tool knows better than the
+    /// server-wide figure (an image generation's minutes)
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+    #[serde(default)]
+    pub max_chars: Option<usize>,
+    /// the format prompt applied to the result before the model sees it
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub route_arg: Option<String>,
+    /// acts for the signed-in user (the server said so)
+    #[serde(default)]
+    pub user: bool,
+}
+
+impl ToolMeta {
+    pub fn makes_image(&self) -> bool {
+        self.result.as_deref() == Some("image")
+    }
+
+    /// An http entry's facts, as the registry carries them for every source.
+    pub fn of_http(t: &HttpTool, group: &str) -> ToolMeta {
+        ToolMeta {
+            group: Some(group.to_string()),
+            images: t.wants_images(),
+            result: t.makes_image().then(|| "image".to_string()),
+            timeout_s: t.timeout_s,
+            max_chars: t.max_chars,
+            format: t.format.clone(),
+            route: t.route.clone(),
+            route_arg: t.route_arg.clone(),
+            user: t.headers.values().any(|v| matches!(v.trim(), "$user" | "${user}")),
+        }
+    }
+}
+
 /// A tool as the model sees it.
 #[derive(Clone)]
 pub struct Tool {
@@ -954,6 +1106,7 @@ pub struct Tool {
     pub description: String,
     pub parameters: serde_json::Value,
     pub src: ToolSrc,
+    pub meta: ToolMeta,
 }
 
 /// One MCP connection for the life of ONE request. The component keeps nothing
@@ -965,6 +1118,14 @@ pub struct McpSession {
     version: String,
     timeout_s: u64,
     next_id: u64,
+    /// whether initialize is owed before anything else (McpServer::handshake)
+    handshake: bool,
+    /// the version is settled: every request from here on states it. True
+    /// from the start for a server we do not handshake with (there is no
+    /// negotiation to wait for), and set the moment initialize answers -
+    /// which is BEFORE the initialized notification, the first request the
+    /// revision requires the header on.
+    opened: bool,
 }
 
 /// Everything callable this turn, plus whatever went wrong assembling it.
@@ -990,11 +1151,8 @@ impl Registry {
 
     /// Some armed tool produces a picture for the client. The router's image
     /// verdict stands down when this is true: the model owns the decision.
-    pub fn makes_image(&self, cfg: &ToolsConfig) -> bool {
-        self.tools.iter().any(|t| match t.src {
-            ToolSrc::Http(i) => cfg.http[i].makes_image(),
-            _ => false,
-        })
+    pub fn makes_image(&self, _cfg: &ToolsConfig) -> bool {
+        self.tools.iter().any(|t| t.meta.makes_image())
     }
 
     /// The name of the first armed tool that reads the turn's pictures, if
@@ -1009,16 +1167,11 @@ impl Registry {
     /// takes one and produces another (upscale_image). The stash note names
     /// them for what they do - telling the model to "look" with a tool that
     /// only upscales earns a call that cannot answer the question.
-    pub fn image_tool_names<'a>(&'a self, cfg: &ToolsConfig) -> (Option<&'a str>, Option<&'a str>) {
+    pub fn image_tool_names<'a>(&'a self, _cfg: &ToolsConfig) -> (Option<&'a str>, Option<&'a str>) {
         let pick = |transform: bool| {
             self.tools
                 .iter()
-                .find(|t| match t.src {
-                    ToolSrc::Http(i) => {
-                        cfg.http[i].wants_images() && cfg.http[i].makes_image() == transform
-                    }
-                    _ => false,
-                })
+                .find(|t| t.meta.images && t.meta.makes_image() == transform)
                 .map(|t| t.name.as_str())
         };
         (pick(false), pick(true))
@@ -1066,6 +1219,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             description: k.description().to_string(),
             parameters: k.schema(),
             src: ToolSrc::Builtin(k),
+            meta: ToolMeta::default(),
         });
     }
     // spawn_agent needs no naming: a positive max_agents IS the deployer's
@@ -1079,6 +1233,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             description: k.description().to_string(),
             parameters: k.schema(),
             src: ToolSrc::Builtin(k),
+            meta: ToolMeta::default(),
         });
     }
     for (i, t) in cfg.http.iter().enumerate() {
@@ -1116,25 +1271,44 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
                 description: t.description.clone(),
                 parameters: object_schema(t.parameters.clone()),
                 src: ToolSrc::Http(i),
+                meta: ToolMeta::of_http(t, &cfg.group_of(i)),
             }),
         }
     }
-    for (i, s) in cfg.mcp.iter().enumerate() {
-        if b.off.iter().any(|g| *g == s.group_name()) {
+    for s in cfg.mcp.iter() {
+        // a server whose every switch is off is not dialled at all: with a
+        // groups map that means every group in it, without one its own
+        let all_off = if s.groups.is_empty() {
+            b.off.iter().any(|g| *g == s.group_name())
+        } else {
+            s.groups.keys().all(|g| b.off.iter().any(|o| o == g))
+        };
+        if all_off {
             continue;
         }
         let timeout = s.timeout_s.unwrap_or(cfg.timeout_s);
+        // the reserved $user slot, filled from this turn's caller. A turn
+        // with no caller sends the header NOT AT ALL rather than refusing
+        // the whole server: the server then lists no per-user tool (an
+        // api-mcp-adapter does exactly that), and the model is never shown
+        // one it cannot use. Reaching a per-user endpoint nameless is what
+        // the slot prevents, and an omitted header is nameless by
+        // construction - the endpoint sees an anonymous call, not a claim.
+        let headers = mcp_headers(&s.headers, b.user);
         let mut sess = McpSession {
             url: s.url.trim().to_string(),
-            headers: resolved_headers(&s.headers, &mut reg.notes, &s.url),
+            headers: resolved_headers(&headers, &mut reg.notes, &s.url),
             session_id: None,
             version: s.protocol_version.clone().unwrap_or_else(|| MCP_VERSION.into()),
             timeout_s: timeout,
             next_id: 1,
+            handshake: s.handshake,
+            // nothing to negotiate with a server we do not handshake with
+            opened: !s.handshake,
         };
         let declared: Vec<McpToolDecl> = if s.discover && s.tools.is_empty() {
             on_status(&format!("listing tools on {}…", host_of(&s.url)));
-            match discover(&mut sess) {
+            match discover(&mut sess, &mut |req| http::request(req)) {
                 Ok(list) => list,
                 Err(e) => {
                     reg.notes.push(format!("mcp {}: {e}", host_of(&s.url)));
@@ -1144,6 +1318,9 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         } else {
             s.tools.clone()
         };
+        // the index this session will have: a server switched off above
+        // is not pushed, so the config's index is not the registry's
+        let slot = reg.mcp.len();
         for d in declared {
             if !s.allow.is_empty() && !s.allow.iter().any(|a| a == &d.name) {
                 continue;
@@ -1152,6 +1329,18 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
                 continue;
             }
             let exposed = format!("{}{}", s.prefix.as_deref().unwrap_or(""), d.name);
+            let group = s.group_for(&d.name, &exposed, d.meta.group.as_deref());
+            // a group the person switched off: not offered, not a note
+            if b.off.iter().any(|g| *g == group) {
+                continue;
+            }
+            // the same per-turn gating an http entry gets: a tool that
+            // takes the turn's pictures only exists when there are
+            // pictures, and not when the serving model reads them itself
+            // (transformers excepted - local vision cannot upscale)
+            if d.meta.images && (!b.images_present || (b.images_local && !d.meta.makes_image())) {
+                continue;
+            }
             if let Err(e) = check_name(&exposed) {
                 reg.notes.push(format!("mcp tool '{exposed}' ignored: {e}"));
                 continue;
@@ -1161,11 +1350,14 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
                     .push(format!("mcp tool '{exposed}' ignored: the name is already taken"));
                 continue;
             }
+            let mut meta = d.meta.clone();
+            meta.group = Some(group);
             reg.tools.push(Tool {
                 name: exposed,
                 description: d.description.clone(),
                 parameters: object_schema(d.parameters.clone()),
-                src: ToolSrc::Mcp { server: i, remote: d.name.clone() },
+                src: ToolSrc::Mcp { server: slot, remote: d.name.clone() },
+                meta,
             });
         }
         reg.mcp.push(sess);
@@ -1237,6 +1429,24 @@ fn identity_headers(
         }
     }
     Ok(out)
+}
+
+/// An MCP server's headers for THIS turn: the reserved `$user` slot filled
+/// from the caller, or left out when there is none (see build).
+fn mcp_headers(h: &BTreeMap<String, String>, user: Option<&str>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in h {
+        match (matches!(v.trim(), "$user" | "${user}"), user) {
+            (true, Some(u)) => {
+                out.insert(k.clone(), u.to_string());
+            }
+            (true, None) => {}
+            (false, _) => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out
 }
 
 fn resolved_headers(
@@ -2007,8 +2217,8 @@ pub fn call(
     on_status: &dyn Fn(&str),
 ) -> ToolResult {
     let t0 = now_ms();
-    let src = match reg.find(name) {
-        Some(t) => t.src.clone(),
+    let (src, meta) = match reg.find(name) {
+        Some(t) => (t.src.clone(), t.meta.clone()),
         None => {
             // A CONFIGURED image-taking entry that was gated off this turn
             // deserves the real reason: "no tool named X" reads as a
@@ -2038,10 +2248,9 @@ pub fn call(
             };
         }
     };
-    let max_chars = match &src {
-        ToolSrc::Http(i) => cfg.http[*i].max_chars.unwrap_or(cfg.max_chars),
-        _ => cfg.max_chars,
-    };
+    // the tool's own figure wins over the deployment's, whichever source
+    // it came from: an http entry's field, or what an MCP server declared
+    let max_chars = meta.max_chars.unwrap_or(cfg.max_chars);
     let mut sources = Vec::new();
     let mut image = None;
     let r = match src {
@@ -2049,7 +2258,32 @@ pub fn call(
         ToolSrc::Http(i) => {
             call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status, b.user)
         }
-        ToolSrc::Mcp { server, remote } => call_mcp(&mut reg.mcp[server], &remote, args),
+        ToolSrc::Mcp { server, remote } => {
+            let sess = &mut reg.mcp[server];
+            // a picture arrives as megabytes of base64 inside the envelope
+            let max_bytes = if meta.makes_image() {
+                (12 * 1024 * 1024).max(cfg.max_bytes)
+            } else {
+                cfg.max_bytes.max(http::DEFAULT_MAX_BYTES)
+            };
+            let c = McpCall {
+                name,
+                remote: &remote,
+                meta: &meta,
+                images,
+                timeout_s: meta.timeout_s.unwrap_or(sess.timeout_s),
+                max_bytes,
+            };
+            // ticked like an http entry: a tool is allowed to be slow, and
+            // the client stream must see something inside every idle window
+            let mut transport = |req: HttpReq<'_>| {
+                http::request_with_tick(req, 15, &mut |secs| {
+                    on_status(&format!("waiting on {name}… {secs}s"));
+                    !crate::client_gone()
+                })
+            };
+            call_mcp(sess, &c, args, &mut sources, &mut image, &mut transport)
+        }
         // never built into a Registry - the passthrough renders client tools
         // into the prompt and hands the call back, so reaching this arm is a
         // wiring bug, and the failure must say which side executes
@@ -2442,26 +2676,7 @@ fn map_result(
                 )
             })?;
         let (mime, b64) = image_payload(raw);
-        let prompt = args
-            .get("prompt")
-            .and_then(|p| p.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                // no prompt argument (an upscale-style tool): echo the args
-                // minus any image payloads - kilobytes of base64 are not a
-                // "request" the model should read back
-                match args {
-                    serde_json::Value::Object(o) => {
-                        let slim: serde_json::Map<String, serde_json::Value> = o
-                            .iter()
-                            .filter(|(k, _)| k.as_str() != "image" && k.as_str() != "images")
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        truncate(&serde_json::Value::Object(slim).to_string(), 200)
-                    }
-                    other => truncate(&other.to_string(), 200),
-                }
-            });
+        let prompt = image_request_label(args);
         *image_out = Some(crate::image::GeneratedImage {
             b64,
             mime,
@@ -2470,13 +2685,7 @@ fn map_result(
             seed: None,
             ms: 0, // stamped by call(), which owns the clock
         });
-        return Ok(format!(
-            "The call succeeded: an image has been generated and is displayed to the user \
-             directly above your reply (request: \"{prompt}\"). You cannot see it. \
-             Acknowledge it briefly and naturally, and offer to adjust it; do not describe \
-             details you cannot verify, and do not call the tool again unless the user wants \
-             a different picture."
-        ));
+        return Ok(image_note(&prompt));
     }
     if let Some(path) = &rm.text {
         if let Some(v) = parsed.as_ref().and_then(|j| json_path(j, path)) {
@@ -2487,6 +2696,38 @@ fn map_result(
         }
     }
     Ok(text)
+}
+
+/// What a picture was made from: the `prompt` argument, or - for an
+/// upscale-style tool with none - the other arguments minus any image
+/// payloads, because kilobytes of base64 are not a "request" the model
+/// should read back.
+fn image_request_label(args: &serde_json::Value) -> String {
+    if let Some(p) = args.get("prompt").and_then(|p| p.as_str()) {
+        return p.to_string();
+    }
+    match args {
+        serde_json::Value::Object(o) => {
+            let slim: serde_json::Map<String, serde_json::Value> = o
+                .iter()
+                .filter(|(k, _)| k.as_str() != "image" && k.as_str() != "images")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            truncate(&serde_json::Value::Object(slim).to_string(), 200)
+        }
+        other => truncate(&other.to_string(), 200),
+    }
+}
+
+/// What the model is told when a tool made a picture it cannot see.
+fn image_note(prompt: &str) -> String {
+    format!(
+        "The call succeeded: an image has been generated and is displayed to the user \
+         directly above your reply (request: \"{prompt}\"). You cannot see it. \
+         Acknowledge it briefly and naturally, and offer to adjust it; do not describe \
+         details you cannot verify, and do not call the tool again unless the user wants \
+         a different picture."
+    )
 }
 
 /// Walk a dot path ("data.0.b64_json") through keys and array indexes.
@@ -2622,7 +2863,18 @@ fn pct(s: &str) -> String {
 
 // ------------------------------------------------------------------- MCP --
 
-fn discover(sess: &mut McpSession) -> Result<Vec<McpToolDecl>, String> {
+/// How an MCP request reaches the network: the real transport is
+/// http::request (with a tick, for a call the client is waiting on); a
+/// test's is a fake that records what was sent and answers from a script.
+type Transport<'t> = dyn FnMut(HttpReq<'_>) -> Result<http::Response, String> + 't;
+
+/// The protocol's opening: initialize, then the initialized notification.
+/// Owed once per session, and not at all to a server whose entry says
+/// `handshake: false`.
+fn handshake(sess: &mut McpSession, transport: &mut Transport<'_>) -> Result<(), String> {
+    if !sess.handshake || sess.opened {
+        return Ok(());
+    }
     let init = rpc(
         sess,
         "initialize",
@@ -2631,75 +2883,107 @@ fn discover(sess: &mut McpSession) -> Result<Vec<McpToolDecl>, String> {
             "capabilities": {},
             "clientInfo": { "name": "eyesoff-ai", "version": env!("CARGO_PKG_VERSION") },
         })),
+        transport,
     )?;
     // the server may answer with a revision of its own choosing; speak its
     // language from here on rather than insisting on ours
     if let Some(v) = init.get("protocolVersion").and_then(|v| v.as_str()) {
         sess.version = v.to_string();
     }
-    notify(sess, "notifications/initialized")?;
-    let list = rpc(sess, "tools/list", None)?;
+    sess.opened = true;
+    notify(sess, "notifications/initialized", transport)
+}
+
+fn discover(sess: &mut McpSession, transport: &mut Transport<'_>) -> Result<Vec<McpToolDecl>, String> {
+    handshake(sess, transport)?;
+    let list = rpc(sess, "tools/list", None, transport)?;
     let arr = list
         .get("tools")
         .and_then(|t| t.as_array())
         .ok_or("tools/list returned no tools array")?;
-    Ok(arr
-        .iter()
-        .filter_map(|t| {
-            Some(McpToolDecl {
-                name: t.get("name")?.as_str()?.to_string(),
-                description: t
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                parameters: t.get("inputSchema").cloned(),
-            })
-        })
-        .collect())
+    Ok(arr.iter().filter_map(McpToolDecl::from_listed).collect())
+}
+
+/// One call to an MCP tool, as the loop wants it made.
+struct McpCall<'a> {
+    /// the exposed name, for status lines
+    #[allow(dead_code)]
+    name: &'a str,
+    /// the name the server knows
+    remote: &'a str,
+    meta: &'a ToolMeta,
+    /// the turn's attached pictures, for a tool that takes them
+    images: &'a [Vec<u8>],
+    timeout_s: u64,
+    max_bytes: usize,
 }
 
 fn call_mcp(
     sess: &mut McpSession,
-    remote: &str,
+    c: &McpCall,
     args: &serde_json::Value,
+    sources: &mut Vec<(String, String)>,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    transport: &mut Transport<'_>,
 ) -> Result<String, String> {
     // a turn that skipped discovery (inline tools) never handshook
-    if sess.session_id.is_none() && sess.next_id == 1 {
-        let init = rpc(
-            sess,
-            "initialize",
-            Some(serde_json::json!({
-                "protocolVersion": sess.version,
-                "capabilities": {},
-                "clientInfo": { "name": "eyesoff-ai", "version": env!("CARGO_PKG_VERSION") },
-            })),
-        )?;
-        if let Some(v) = init.get("protocolVersion").and_then(|v| v.as_str()) {
-            sess.version = v.to_string();
-        }
-        notify(sess, "notifications/initialized")?;
-    }
-    let r = rpc(
+    handshake(sess, transport)?;
+    // the turn's pictures ride the call as the reserved arguments the
+    // server's template reads (`images`, `image`) - bytes the model could
+    // never put in its arguments itself, so they shadow anything it wrote
+    let args = if c.meta.images && !c.images.is_empty() {
+        let empty = serde_json::Map::new();
+        serde_json::Value::Object(with_images(args.as_object().unwrap_or(&empty), c.images))
+    } else {
+        args.clone()
+    };
+    let r = rpc_with(
         sess,
         "tools/call",
-        Some(serde_json::json!({ "name": remote, "arguments": args })),
+        Some(serde_json::json!({ "name": c.remote, "arguments": args })),
+        c.timeout_s,
+        c.max_bytes,
+        transport,
     )?;
-    let text = render_mcp_content(&r);
+    let out = mcp_outcome(&r, &args);
     if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
-        return Err(if text.is_empty() {
-            format!("mcp tool '{remote}' reported an error")
+        return Err(if out.text.is_empty() {
+            format!("mcp tool '{}' reported an error", c.remote)
         } else {
-            text
+            out.text
         });
     }
-    Ok(text)
+    *sources = out.sources;
+    if let Some((mime, b64)) = out.image {
+        *image_out = Some(crate::image::GeneratedImage {
+            b64,
+            mime,
+            prompt: image_request_label(&args),
+            model: None,
+            seed: None,
+            ms: 0, // stamped by call(), which owns the clock
+        });
+    }
+    Ok(out.text)
 }
 
-/// An MCP result as text. Text parts join; structured output falls back to its
-/// JSON; anything binary is named rather than dumped, because a base64 image in
-/// the prompt is thousands of tokens of nothing the model can read.
-fn render_mcp_content(r: &serde_json::Value) -> String {
+/// What a tools/call result carries for this app.
+#[derive(Default)]
+struct McpOutcome {
+    text: String,
+    sources: Vec<(String, String)>,
+    /// (mime, base64) of the first image part
+    image: Option<(String, String)>,
+}
+
+/// An MCP result, read: text parts join; the first image part is a picture
+/// for the client (the model gets the same note an http image entry earns,
+/// since it cannot see it either); `structuredContent.sources` rows are
+/// citations; any other binary part is named rather than dumped, because a
+/// base64 blob in the prompt is thousands of tokens of nothing the model
+/// can read; structured output alone falls back to its JSON.
+fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value) -> McpOutcome {
+    let mut out = McpOutcome::default();
     let mut parts = Vec::new();
     if let Some(a) = r.get("content").and_then(|c| c.as_array()) {
         for c in a {
@@ -2709,22 +2993,71 @@ fn render_mcp_content(r: &serde_json::Value) -> String {
                         parts.push(t.to_string());
                     }
                 }
+                Some("image") if out.image.is_none() => {
+                    let data = c.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    let mime = c.get("mimeType").and_then(|m| m.as_str()).unwrap_or("image/png");
+                    if !data.is_empty() {
+                        // a server may hand a data URI where the spec says bare base64
+                        let (mime, b64) = if data.starts_with("data:") {
+                            image_payload(data)
+                        } else {
+                            (mime.to_string(), data.to_string())
+                        };
+                        out.image = Some((mime, b64));
+                    }
+                }
                 Some(other) => parts.push(format!("[{other} content omitted]")),
                 None => {}
             }
         }
     }
-    if parts.is_empty() {
-        if let Some(s) = r.get("structuredContent") {
-            return s.to_string();
+    if let Some(src) = r
+        .get("structuredContent")
+        .and_then(|s| s.get("sources"))
+        .and_then(|s| s.as_array())
+    {
+        for hit in src {
+            let field = |k: &str| {
+                hit.get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            let (title, url) = (field("title"), field("url"));
+            if title.is_none() && url.is_none() {
+                continue;
+            }
+            let u = url.clone().unwrap_or_default();
+            out.sources.push((title.or(url).unwrap_or_default(), u));
         }
     }
-    parts.join("\n")
+    if out.image.is_some() {
+        // the picture goes to the client; the model is told what an http
+        // image entry tells it, with whatever the server said underneath
+        let mut text = image_note(&image_request_label(args));
+        let said = parts.join("\n");
+        if !said.trim().is_empty() {
+            text.push('\n');
+            text.push_str(said.trim());
+        }
+        out.text = text;
+        return out;
+    }
+    if parts.is_empty() {
+        if let Some(s) = r.get("structuredContent") {
+            out.text = s.to_string();
+            return out;
+        }
+    }
+    out.text = parts.join("\n");
+    out
 }
 
-fn notify(sess: &mut McpSession, method: &str) -> Result<(), String> {
+fn notify(sess: &mut McpSession, method: &str, transport: &mut Transport<'_>) -> Result<(), String> {
     let body = serde_json::json!({ "jsonrpc": "2.0", "method": method }).to_string();
-    let r = post(sess, body.as_bytes())?;
+    let (t, m) = (sess.timeout_s, http::DEFAULT_MAX_BYTES);
+    let r = post(sess, body.as_bytes(), t, m, transport)?;
     if r.status >= 400 {
         return Err(format!("{method} was refused: HTTP {}", r.status));
     }
@@ -2735,6 +3068,19 @@ fn rpc(
     sess: &mut McpSession,
     method: &str,
     params: Option<serde_json::Value>,
+    transport: &mut Transport<'_>,
+) -> Result<serde_json::Value, String> {
+    let (t, m) = (sess.timeout_s, http::DEFAULT_MAX_BYTES);
+    rpc_with(sess, method, params, t, m, transport)
+}
+
+fn rpc_with(
+    sess: &mut McpSession,
+    method: &str,
+    params: Option<serde_json::Value>,
+    timeout_s: u64,
+    max_bytes: usize,
+    transport: &mut Transport<'_>,
 ) -> Result<serde_json::Value, String> {
     let id = sess.next_id;
     sess.next_id += 1;
@@ -2743,10 +3089,13 @@ fn rpc(
         msg["params"] = p;
     }
     let body = msg.to_string();
-    let r = post(sess, body.as_bytes())?;
+    let r = post(sess, body.as_bytes(), timeout_s, max_bytes, transport)?;
     if r.status >= 400 {
         let hint: String = String::from_utf8_lossy(&r.body).chars().take(300).collect();
         return Err(format!("{method} failed: HTTP {} {hint}", r.status));
+    }
+    if r.truncated {
+        return Err(format!("{method}: the answer was cut off at {max_bytes} bytes"));
     }
     let v = decode_rpc(&r.body, id)
         .ok_or_else(|| format!("{method}: no JSON-RPC response in the reply"))?;
@@ -2757,25 +3106,33 @@ fn rpc(
     Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
 }
 
-fn post(sess: &mut McpSession, body: &[u8]) -> Result<http::Response, String> {
+fn post(
+    sess: &mut McpSession,
+    body: &[u8],
+    timeout_s: u64,
+    max_bytes: usize,
+    transport: &mut Transport<'_>,
+) -> Result<http::Response, String> {
     let url = sess.url.clone();
     let mut req = HttpReq::post(&url, body)
-        .timeout(sess.timeout_s)
+        .timeout(timeout_s)
+        .max_bytes(max_bytes)
         .header("content-type", b"application/json")
         .header("accept", b"application/json, text/event-stream");
     if let Some(s) = &sess.session_id {
         req = req.header("mcp-session-id", s.as_bytes());
     }
-    // the revision that introduced this transport requires the header on every
-    // request AFTER initialize - which includes the initialized NOTIFICATION,
-    // the first thing sent once the handshake has an answer
-    if sess.next_id >= 2 {
+    // the revision that introduced this transport requires the header on
+    // every request AFTER initialize - which includes the initialized
+    // NOTIFICATION, the first thing sent once the handshake has an answer.
+    // Not on initialize itself: there is no negotiated version to state yet.
+    if sess.opened {
         req = req.header("mcp-protocol-version", sess.version.as_bytes());
     }
     for (k, v) in &sess.headers {
         req = req.header(k, v.as_bytes());
     }
-    let r = http::request(req)?;
+    let r = transport(req)?;
     // the server assigns a session on initialize and expects it echoed on
     // everything after
     if let Some(s) = r.header("mcp-session-id") {
@@ -2838,6 +3195,7 @@ mod tests {
             description: "does a thing".into(),
             parameters: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
             src: ToolSrc::Http(0),
+            meta: ToolMeta::default(),
         }
     }
 
@@ -2980,6 +3338,7 @@ mod tests {
                 "required": required,
             }),
             src: ToolSrc::Client,
+            meta: ToolMeta::default(),
         }
     }
 
@@ -3707,13 +4066,377 @@ mod tests {
         assert_eq!(decode_rpc(mixed, 7).unwrap()["result"], 1);
     }
 
+    /// A scripted MCP server, for the transport tests: it records every
+    /// request it was handed and answers from a queue.
+    struct FakeServer {
+        sent: Vec<(String, serde_json::Value, Vec<(String, String)>)>,
+        replies: Vec<serde_json::Value>,
+        session: Option<String>,
+    }
+
+    impl FakeServer {
+        fn new(replies: Vec<serde_json::Value>) -> FakeServer {
+            FakeServer { sent: Vec::new(), replies, session: None }
+        }
+
+        /// The transport closure to hand call_mcp / discover.
+        fn transport<'a>(
+            &'a mut self,
+        ) -> impl FnMut(HttpReq<'_>) -> Result<http::Response, String> + 'a {
+            move |req: HttpReq<'_>| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body.unwrap_or(b"{}")).unwrap();
+                let method = body["method"].as_str().unwrap_or("").to_string();
+                let headers: Vec<(String, String)> = req
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+                    .collect();
+                self.sent.push((method.clone(), body.clone(), headers));
+                // a notification expects no JSON-RPC answer
+                if body.get("id").is_none() {
+                    return Ok(http::Response {
+                        status: 202,
+                        body: Vec::new(),
+                        location: None,
+                        ctype: None,
+                        headers: Vec::new(),
+                        truncated: false,
+                    });
+                }
+                let id = body["id"].clone();
+                let result = if self.replies.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    self.replies.remove(0)
+                };
+                let msg = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                let mut headers = Vec::new();
+                if let Some(s) = &self.session {
+                    headers.push(("mcp-session-id".to_string(), s.clone()));
+                }
+                Ok(http::Response {
+                    status: 200,
+                    body: msg.to_string().into_bytes(),
+                    location: None,
+                    ctype: None,
+                    headers,
+                    truncated: false,
+                })
+            }
+        }
+    }
+
+    fn session(handshake: bool) -> McpSession {
+        McpSession {
+            url: "https://tools.example/mcp".into(),
+            headers: Vec::new(),
+            session_id: None,
+            version: MCP_VERSION.into(),
+            timeout_s: 20,
+            next_id: 1,
+            handshake,
+            opened: !handshake,
+        }
+    }
+
+    /// `handshake: false` is what makes an adapter one round trip: discovery
+    /// sends tools/list ALONE, and a call sends tools/call alone - while the
+    /// default still opens with initialize and the initialized notification.
+    #[test]
+    fn the_handshake_can_be_skipped() {
+        let listed = serde_json::json!({ "tools": [
+            { "name": "notes_read", "description": "read", "inputSchema": {"type": "object"} }
+        ]});
+        let mut fake = FakeServer::new(vec![listed.clone()]);
+        let mut sess = session(false);
+        let tools = discover(&mut sess, &mut fake.transport()).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(fake.sent.iter().map(|(m, ..)| m.as_str()).collect::<Vec<_>>(), ["tools/list"]);
+        // ...and a client that skips it still states its revision from the start
+        assert!(fake.sent[0].2.iter().any(|(k, v)| k == "mcp-protocol-version" && v == MCP_VERSION));
+
+        let mut fake = FakeServer::new(vec![
+            serde_json::json!({ "protocolVersion": "2025-03-26" }),
+            listed,
+        ]);
+        let mut sess = session(true);
+        discover(&mut sess, &mut fake.transport()).unwrap();
+        assert_eq!(
+            fake.sent.iter().map(|(m, ..)| m.as_str()).collect::<Vec<_>>(),
+            ["initialize", "notifications/initialized", "tools/list"]
+        );
+        // the server's chosen revision is spoken from there on
+        assert_eq!(sess.version, "2025-03-26");
+        assert!(fake.sent[0].2.iter().all(|(k, _)| k != "mcp-protocol-version"));
+        assert!(fake.sent[1].2.iter().any(|(k, v)| k == "mcp-protocol-version" && v == "2025-03-26"));
+    }
+
+    /// A listed tool's `_meta` is what makes an adapter's entry behave like
+    /// the http entry it replaced: the switch, the pictures, the timeout,
+    /// the prompt-side settings.
+    #[test]
+    fn listed_meta_becomes_the_tools_facts() {
+        let listed = serde_json::json!({ "tools": [
+            { "name": "generate_image", "description": "draw", "inputSchema": {"type": "object"},
+              "_meta": { META_KEY: { "group": "images", "result": "image", "timeout_s": 180, "max_chars": 500, "format": "one line" } } },
+            { "name": "plain", "description": "no meta", "inputSchema": {"type": "object"} },
+        ]});
+        let mut fake = FakeServer::new(vec![listed]);
+        let mut sess = session(false);
+        let tools = discover(&mut sess, &mut fake.transport()).unwrap();
+        let img = &tools[0];
+        assert!(img.meta.makes_image());
+        assert_eq!(img.meta.group.as_deref(), Some("images"));
+        assert_eq!(img.meta.timeout_s, Some(180));
+        assert_eq!(img.meta.max_chars, Some(500));
+        assert_eq!(img.meta.format.as_deref(), Some("one line"));
+        // a server that says nothing gets the empty facts, not a guess
+        assert!(!tools[1].meta.makes_image() && tools[1].meta.group.is_none());
+        // an inline declaration writes the same fields flat
+        let d: McpToolDecl = serde_json::from_value(serde_json::json!({
+            "name": "upscale_image", "description": "up", "images": true, "result": "image", "group": "images"
+        }))
+        .unwrap();
+        assert!(d.meta.images && d.meta.makes_image());
+    }
+
+    /// An MCP image result is a picture for the CLIENT, not thousands of
+    /// tokens of base64 in the prompt; the model gets the same note an http
+    /// image entry earns, and citation rows come off structuredContent.
+    #[test]
+    fn an_image_result_reaches_the_client() {
+        let call = serde_json::json!({ "content": [
+            { "type": "image", "data": "AAAA", "mimeType": "image/webp" },
+            { "type": "text", "text": "done" },
+        ]});
+        let mut fake = FakeServer::new(vec![call]);
+        let mut sess = session(false);
+        let meta = ToolMeta { result: Some("image".into()), ..Default::default() };
+        let c = McpCall {
+            name: "generate_image",
+            remote: "generate_image",
+            meta: &meta,
+            images: &[],
+            timeout_s: 20,
+            max_bytes: 1024,
+        };
+        let mut sources = Vec::new();
+        let mut image = None;
+        let text = call_mcp(
+            &mut sess,
+            &c,
+            &serde_json::json!({ "prompt": "a cat" }),
+            &mut sources,
+            &mut image,
+            &mut fake.transport(),
+        )
+        .unwrap();
+        let img = image.expect("a picture for the client");
+        assert_eq!((img.mime.as_str(), img.b64.as_str()), ("image/webp", "AAAA"));
+        assert_eq!(img.prompt, "a cat");
+        assert!(text.contains("an image has been generated"), "{text}");
+        assert!(text.contains("done"), "{text}");
+        // the base64 never enters the prompt
+        assert!(!text.contains("AAAA"), "{text}");
+
+        // sources, and the plain text case
+        let mut fake = FakeServer::new(vec![serde_json::json!({
+            "content": [{ "type": "text", "text": "two hits" }],
+            "structuredContent": { "sources": [
+                { "title": "First", "url": "https://a" },
+                { "url": "https://b" },
+                { "title": "" },
+            ]},
+        })]);
+        let meta = ToolMeta::default();
+        let c = McpCall { name: "search", remote: "search", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024 };
+        let mut sources = Vec::new();
+        let mut image = None;
+        let text = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut sources, &mut image, &mut fake.transport()).unwrap();
+        assert_eq!(text, "two hits");
+        assert_eq!(
+            sources,
+            vec![("First".to_string(), "https://a".to_string()), ("https://b".to_string(), "https://b".to_string())]
+        );
+        assert!(image.is_none());
+    }
+
+    /// The turn's pictures ride a call to a tool that takes them - bytes the
+    /// model could never write into its own arguments - and shadow anything
+    /// it did write under those names.
+    #[test]
+    fn attached_pictures_ride_the_call() {
+        let mut fake = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
+        let mut sess = session(false);
+        let meta = ToolMeta { images: true, ..Default::default() };
+        // real PNG magic, so the data URI carries the mime the sniffer reads
+        let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2];
+        let c = McpCall {
+            name: "view_image",
+            remote: "view_image",
+            meta: &meta,
+            images: std::slice::from_ref(&png),
+            timeout_s: 20,
+            max_bytes: 1024,
+        };
+        let mut sources = Vec::new();
+        let mut image = None;
+        call_mcp(
+            &mut sess,
+            &c,
+            &serde_json::json!({ "question": "what is this?", "image": "the model's guess" }),
+            &mut sources,
+            &mut image,
+            &mut fake.transport(),
+        )
+        .unwrap();
+        let args = &fake.sent[0].1["params"]["arguments"];
+        assert_eq!(args["question"], "what is this?");
+        assert!(args["image"].as_str().unwrap().starts_with("data:image/"), "{args}");
+        assert_eq!(args["images"].as_array().unwrap().len(), 1);
+        // a tool that does NOT take pictures is not handed them
+        let mut fake = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
+        let meta = ToolMeta::default();
+        let c = McpCall { name: "n", remote: "n", meta: &meta, images: std::slice::from_ref(&png), timeout_s: 20, max_bytes: 1024 };
+        call_mcp(&mut sess, &c, &serde_json::json!({ "q": 1 }), &mut Vec::new(), &mut None, &mut fake.transport()).unwrap();
+        assert_eq!(fake.sent[0].1["params"]["arguments"], serde_json::json!({ "q": 1 }));
+    }
+
+    /// A server's error is the model's to read, and a session id it assigns
+    /// is echoed on everything after.
+    #[test]
+    fn errors_and_sessions() {
+        let mut fake = FakeServer::new(vec![serde_json::json!({
+            "content": [{ "type": "text", "text": "the endpoint said no" }], "isError": true
+        })]);
+        fake.session = Some("s-1".into());
+        let mut sess = session(false);
+        let meta = ToolMeta::default();
+        let c = McpCall { name: "a", remote: "a", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024 };
+        let e = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut fake.transport())
+            .unwrap_err();
+        assert_eq!(e, "the endpoint said no");
+        assert_eq!(sess.session_id.as_deref(), Some("s-1"));
+        let mut fake2 = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
+        call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut fake2.transport()).unwrap();
+        assert!(fake2.sent[0].2.iter().any(|(k, v)| k == "mcp-session-id" && v == "s-1"));
+    }
+
+    /// The registry's shape for MCP tools: the config's groups map decides
+    /// the switch, an off switch withholds the tool, a picture tool is
+    /// gated by the turn exactly as an http entry is, and $user is filled
+    /// or the header simply left off.
+    #[test]
+    fn mcp_tools_are_grouped_gated_and_named() {
+        let s: McpServer = serde_json::from_value(serde_json::json!({
+            "url": "https://tools.example/mcp",
+            "groups": { "notes": ["notes_read", "notes_write"], "images": ["generate_*"] },
+        }))
+        .unwrap();
+        assert_eq!(s.group_for("notes_read", "notes_read", None), "notes");
+        assert_eq!(s.group_for("generate_image", "generate_image", Some("elsewhere")), "images");
+        // no map entry: what the server declared, else the server itself
+        assert_eq!(s.group_for("other", "other", Some("declared")), "declared");
+        assert_eq!(s.group_for("other", "other", None), "tools.example");
+        // the prefix form is matched too
+        let p: McpServer = serde_json::from_value(serde_json::json!({
+            "url": "https://x/mcp", "prefix": "jot_", "groups": { "notes": ["notes_read"] }
+        }))
+        .unwrap();
+        assert_eq!(p.group_for("notes_read", "jot_notes_read", None), "notes");
+        assert!(p.handshake, "the protocol's handshake is the default");
+
+        // the switches the panel shows before any turn dials the server
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://tools.example/mcp",
+                      "groups": { "notes": ["notes_read"], "images": ["generate_image"] } }]
+        }))
+        .unwrap();
+        let groups = cfg.groups(None, Some(true));
+        let by = |n: &str| groups.iter().find(|g| g["name"] == n).cloned().unwrap();
+        assert_eq!(by("notes")["tools"], serde_json::json!(["notes_read"]));
+        assert_eq!(by("notes")["kind"], "mcp");
+        // the images group is the app's own switch, whatever supplies it
+        assert_eq!(by("images")["kind"], "images");
+        assert_eq!(by("images")["default_on"], true);
+
+        // inline declarations: no dialling, and the same per-turn gating
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{
+                "url": "https://tools.example/mcp", "handshake": false, "discover": false,
+                "headers": { "x-user": "$user" },
+                "groups": { "notes": ["notes_read"] },
+                "tools": [
+                    { "name": "notes_read", "description": "read" },
+                    { "name": "upscale_image", "description": "up", "images": true, "result": "image", "group": "images" },
+                    { "name": "view_image", "description": "look", "images": true, "group": "images" },
+                ],
+            }]
+        }))
+        .unwrap();
+        // no pictures this turn: neither picture tool is offered
+        let reg = build(&cfg, Builtins { user: Some("0xabc"), ..Default::default() }, &|_| {});
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read"]);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        assert_eq!(reg.mcp[0].headers, vec![("x-user".to_string(), "0xabc".to_string())]);
+        // with pictures, both; the reader and the transformer are told apart
+        let b = Builtins { user: Some("0xabc"), images_present: true, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        assert_eq!(reg.image_tool_names(&cfg), (Some("view_image"), Some("upscale_image")));
+        assert!(reg.makes_image(&cfg));
+        // a model that reads pictures itself keeps the transformer only
+        let b = Builtins { user: Some("0xabc"), images_present: true, images_local: true, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", "upscale_image"]);
+        // a switched-off group withholds its tools, and the whole server
+        // is not dialled when every group is off
+        let off = ["notes".to_string(), "images".to_string()];
+        let b = Builtins { user: Some("0xabc"), images_present: true, off: &off, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        assert!(reg.tools.is_empty() && reg.mcp.is_empty(), "{:?}", reg.notes);
+        // no signed-in caller: the $user header is not sent at all (the
+        // server then lists no per-user tool)
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.mcp[0].headers.is_empty());
+    }
+
+    /// A tool's own max_chars governs its result whatever source it came
+    /// from, so an entry moved into an adapter truncates as it did here.
+    #[test]
+    fn a_tools_own_max_chars_wins() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_chars": 10,
+            "mcp": [{ "url": "https://x/mcp", "discover": false, "handshake": false,
+                      "tools": [{ "name": "wide", "description": "d", "max_chars": 3 }] }]
+        }))
+        .unwrap();
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert_eq!(reg.find("wide").unwrap().meta.max_chars, Some(3));
+        // ...and an http entry's field lands in the same place
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "http": [{ "name": "h", "url": "https://x", "max_chars": 7, "format": "one line" }]
+        }))
+        .unwrap();
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        let m = &reg.find("h").unwrap().meta;
+        assert_eq!(m.max_chars, Some(7));
+        assert_eq!(m.format.as_deref(), Some("one line"));
+        assert_eq!(m.group.as_deref(), Some("h"));
+    }
+
     #[test]
     fn mcp_content_renders_text_and_names_the_rest() {
-        let r = serde_json::json!({"content":[{"type":"text","text":"hello"},{"type":"image","data":"…"}]});
-        assert_eq!(render_mcp_content(&r), "hello\n[image content omitted]");
+        let none = serde_json::json!({});
+        let r = serde_json::json!({"content":[{"type":"text","text":"hello"},{"type":"audio","data":"…"}]});
+        assert_eq!(mcp_outcome(&r, &none).text, "hello\n[audio content omitted]");
         let r = serde_json::json!({"content":[],"structuredContent":{"n":1}});
-        assert_eq!(render_mcp_content(&r), "{\"n\":1}");
+        assert_eq!(mcp_outcome(&r, &none).text, "{\"n\":1}");
+        // a server that hands a data URI where the spec says bare base64
+        let r = serde_json::json!({"content":[{"type":"image","data":"data:image/gif;base64,ZZ"}]});
+        assert_eq!(mcp_outcome(&r, &none).image, Some(("image/gif".to_string(), "ZZ".to_string())));
     }
+
 
     #[test]
     fn results_come_back_as_a_tool_response_turn() {
@@ -3873,6 +4596,245 @@ mod tests {
         assert!(merged.contains("within 2 minutes"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
     }
+
+    // ------------------------------------------------- interop, over TCP --
+    //
+    // The claim these tests cannot make on their own: that THIS client and a
+    // real MCP server agree. The transport is injectable precisely so the
+    // fake above can be swapped for a socket, and
+    // api-mcp-adapter/scripts/interop.sh runs a real adapter under `wasmtime
+    // serve` and points this at it. Without the env var it is skipped, so
+    // `cargo test` stays hermetic and offline.
+
+    /// A minimal HTTP/1.1 client over TCP: the real transport is wasi:http,
+    /// which a native test cannot reach. Enough of the protocol for one
+    /// buffered POST and its answer, chunked framing included.
+    #[cfg(test)]
+    fn tcp_request(req: HttpReq<'_>) -> Result<http::Response, String> {
+        use std::io::{Read, Write};
+        let (_, authority, path) = http::split_url(req.url)?;
+        let mut sock =
+            std::net::TcpStream::connect(&authority).map_err(|e| format!("connect: {e}"))?;
+        let body = req.body.unwrap_or(b"");
+        let mut head = format!(
+            "POST {path} HTTP/1.1\r\nhost: {authority}\r\nconnection: close\r\ncontent-length: {}\r\n",
+            body.len()
+        );
+        for (k, v) in &req.headers {
+            // content-length is ours to state; the caller's headers are the rest
+            if k.eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            head.push_str(&format!("{k}: {}\r\n", String::from_utf8_lossy(v)));
+        }
+        head.push_str("\r\n");
+        sock.write_all(head.as_bytes()).map_err(|e| format!("write head: {e}"))?;
+        sock.write_all(body).map_err(|e| format!("write body: {e}"))?;
+        let mut raw = Vec::new();
+        sock.read_to_end(&mut raw).map_err(|e| format!("read: {e}"))?;
+
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or("no header terminator in the reply")?;
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
+        let mut lines = head.split("\r\n");
+        let status: u16 = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .ok_or("no status line")?;
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        let mut out = raw[split + 4..].to_vec();
+        if headers
+            .iter()
+            .any(|(k, v)| k == "transfer-encoding" && v.contains("chunked"))
+        {
+            out = dechunk(&out)?;
+        }
+        Ok(http::Response {
+            status,
+            body: out,
+            location: None,
+            ctype: None,
+            headers,
+            truncated: false,
+        })
+    }
+
+    /// Undo chunked framing: `<hex size>\r\n<bytes>\r\n`, ending at size 0.
+    #[cfg(test)]
+    fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        loop {
+            let nl = b.windows(2).position(|w| w == b"\r\n").ok_or("chunk header")?;
+            let size_hex = String::from_utf8_lossy(&b[..nl]);
+            let size = usize::from_str_radix(size_hex.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|e| format!("chunk size {size_hex:?}: {e}"))?;
+            b = &b[nl + 2..];
+            if size == 0 {
+                return Ok(out);
+            }
+            if b.len() < size {
+                return Err("truncated chunk".into());
+            }
+            out.extend_from_slice(&b[..size]);
+            b = b.get(size + 2..).unwrap_or(&[]);
+        }
+    }
+
+    /// THE cross-app test: this client, unchanged, against a live
+    /// api-mcp-adapter. It proves the pair actually interoperate - the
+    /// handshake-free discovery, the `_meta` contract that carries an http
+    /// entry's facts across, a templated call, an attached picture going out
+    /// and a picture coming back, citations, and the per-user tool that is
+    /// only listed when the request names someone.
+    ///
+    /// Skipped unless ENCLAVE_MCP_INTEROP_URL points at one; run it with
+    /// api-mcp-adapter/scripts/interop.sh, which stands the server up.
+    #[test]
+    fn interop_with_a_live_adapter() {
+        let Ok(url) = std::env::var("ENCLAVE_MCP_INTEROP_URL") else {
+            eprintln!("skipped: set ENCLAVE_MCP_INTEROP_URL (see api-mcp-adapter/scripts/interop.sh)");
+            return;
+        };
+        let key = std::env::var("ENCLAVE_MCP_INTEROP_KEY").unwrap_or_default();
+        let user = std::env::var("ENCLAVE_MCP_INTEROP_USER").unwrap_or_default();
+        let server = |with_user: bool| -> McpServer {
+            let mut headers = BTreeMap::new();
+            if !key.is_empty() {
+                headers.insert("x-api-key".to_string(), key.clone());
+            }
+            if with_user && !user.is_empty() {
+                headers.insert("x-user".to_string(), user.clone());
+            }
+            serde_json::from_value(serde_json::json!({
+                "url": url, "handshake": false, "headers": headers,
+                "groups": { "images": ["generate_image", "upscale_image"] },
+            }))
+            .unwrap()
+        };
+        let open = |s: &McpServer| McpSession {
+            url: s.url.clone(),
+            headers: s.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            session_id: None,
+            version: MCP_VERSION.into(),
+            timeout_s: 30,
+            next_id: 1,
+            handshake: s.handshake,
+            opened: !s.handshake,
+        };
+
+        // ONE round trip, because the adapter needs no handshake
+        let s = server(true);
+        let mut sess = open(&s);
+        let tools = discover(&mut sess, &mut tcp_request).expect("tools/list");
+        assert_eq!(sess.next_id, 2, "discovery cost more than one request");
+        let by = |n: &str| tools.iter().find(|t| t.name == n);
+
+        // the `_meta` contract: an http entry's facts crossed intact
+        let gen = by("generate_image").expect("generate_image is listed");
+        assert!(gen.meta.makes_image(), "the picture fact crossed");
+        assert_eq!(gen.meta.timeout_s, Some(60), "the entry's own timeout crossed");
+        assert_eq!(
+            s.group_for("generate_image", "generate_image", gen.meta.group.as_deref()),
+            "images"
+        );
+        let up = by("upscale_image").expect("upscale_image is listed");
+        assert!(up.meta.images && up.meta.makes_image(), "takes a picture and returns one");
+        let notes = by("notes_read").expect("the per-user tool is listed for a named caller");
+        assert!(notes.meta.user, "and is flagged per-user");
+        assert!(by("echo_get").unwrap().parameters.is_some(), "schemas cross as inputSchema");
+
+        // ...and the same server lists no per-user tool for a nameless one,
+        // which is what makes the omitted $user header safe
+        let anon = server(false);
+        let mut anon_sess = open(&anon);
+        let anon_tools = discover(&mut anon_sess, &mut tcp_request).expect("anonymous tools/list");
+        assert!(
+            !anon_tools.iter().any(|t| t.name == "notes_read"),
+            "a nameless caller was offered a per-user tool"
+        );
+
+        let call = |sess: &mut McpSession, name: &str, decl: &McpToolDecl, args: serde_json::Value, images: &[Vec<u8>]| {
+            let c = McpCall {
+                name,
+                remote: name,
+                meta: &decl.meta,
+                images,
+                timeout_s: 30,
+                max_bytes: 12 * 1024 * 1024,
+            };
+            let mut sources = Vec::new();
+            let mut image = None;
+            let r = call_mcp(sess, &c, &args, &mut sources, &mut image, &mut tcp_request);
+            (r, sources, image)
+        };
+
+        // a templated call: {arg} in the path, the leftovers on the query
+        let echo = by("echo_get").unwrap();
+        let (r, ..) = call(&mut sess, "echo_get", echo, serde_json::json!({ "name": "a b/c", "x": "1" }), &[]);
+        let seen: serde_json::Value = serde_json::from_str(&r.expect("echo_get")).expect("echo json");
+        assert_eq!(seen["path"], "/echo/a%20b%2Fc", "the URL placeholder was substituted");
+        assert_eq!(seen["query"]["x"], "1", "the leftover argument rode the query");
+        assert_eq!(seen["headers"]["x-api-key"], "echokey", "the endpoint's own secret was added there");
+
+        // a picture comes BACK: to the client, never into the prompt
+        let (r, _, image) = call(&mut sess, "generate_image", gen, serde_json::json!({ "prompt": "a cat" }), &[]);
+        let text = r.expect("generate_image");
+        let img = image.expect("a picture for the client");
+        assert_eq!(img.mime, "image/png");
+        assert_eq!(img.prompt, "a cat");
+        assert!(text.contains("an image has been generated"), "{text}");
+        assert!(!text.contains(&img.b64), "the base64 leaked into the prompt");
+
+        // ...and a picture goes OUT: the turn's attachment, which the model
+        // could never have written into its own arguments
+        let png = base64_decode_for_test(&img.b64);
+        let (r, _, image) = call(&mut sess, "upscale_image", up, serde_json::json!({ "factor": 2 }), &[png]);
+        r.expect("upscale_image");
+        assert_eq!(image.expect("the upscaled picture").mime, "image/webp");
+
+        // citations
+        let search = by("search").unwrap();
+        let (r, sources, _) = call(&mut sess, "search", search, serde_json::json!({ "q": "enclave" }), &[]);
+        assert_eq!(r.expect("search"), "two hits about enclave", "result.text was extracted");
+        assert_eq!(sources.len(), 3, "citation rows crossed: {sources:?}");
+        assert_eq!(sources[0].1, "https://example.com/a");
+
+        // the per-user tool reaches the endpoint AS the caller
+        let (r, ..) = call(&mut sess, "notes_read", notes, serde_json::json!({ "name": "n.md" }), &[]);
+        assert_eq!(r.expect("notes_read"), format!("note n.md of {user}"));
+
+        // a failure is the model's to read, not an exception
+        let (r, ..) = call(&mut sess, "fail", by("fail").unwrap(), serde_json::json!({}), &[]);
+        let e = r.expect_err("a 500 is an error");
+        assert!(e.contains("HTTP 500"), "{e}");
+        eprintln!("interop: {} tools, every claim checked", tools.len());
+    }
+
+    /// base64 -> bytes, for the interop test's round trip. The app only ever
+    /// encodes (vision::to_data_uri), so there is no decoder to borrow.
+    #[cfg(test)]
+    fn base64_decode_for_test(s: &str) -> Vec<u8> {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        let mut out = Vec::new();
+        for c in s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
+            let v = A.iter().position(|a| *a == c).expect("base64 alphabet") as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -3893,5 +4855,27 @@ mod identity_tests {
         let mut plain = BTreeMap::new();
         plain.insert("x-note".to_string(), "for $user only".to_string());
         assert_eq!(identity_headers(&plain, None, "t").unwrap()["x-note"], "for $user only");
+    }
+
+    #[test]
+    fn probe_unadvertised_group() {
+        // the entry an api-mcp-adapter's GET /api/tools hands you, pasted
+        // when the adapter had only the notes group; the adapter has since
+        // grown a `web_fetch` tool in a `web` group
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://a.app.enclave.host/mcp", "handshake": false,
+                      "groups": { "notes": ["notes_read", "notes_write"] } }]
+        })).unwrap();
+        let g = serde_json::Value::Array(cfg.groups(None, None));
+        println!("ADVERTISED = {g}");
+        // what build() would decide for the discovered web_fetch tool
+        let s = &cfg.mcp[0];
+        println!("group_for(web_fetch, _meta.group=web) = {}", s.group_for("web_fetch", "web_fetch", Some("web")));
+        println!("group_for(unlabelled) = {}", s.group_for("thing", "thing", None));
+        // and the glob form as the panel would show it
+        let cfg2: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://a/mcp", "groups": { "images": ["generate_*"] } }]
+        })).unwrap();
+        println!("GLOB = {}", serde_json::Value::Array(cfg2.groups(None, Some(true))));
     }
 }

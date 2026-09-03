@@ -4525,6 +4525,9 @@ impl ChatReq {
                     f.get("parameters").or_else(|| f.get("input_schema")).cloned(),
                 ),
                 src: tools::ToolSrc::Client,
+                // a client's own tool carries no deployment facts: it is
+                // rendered into the prompt and run by the client
+                meta: tools::ToolMeta::default(),
             });
         }
         Ok(Some(out))
@@ -5787,16 +5790,14 @@ impl<'a> ToolLoop<'a> {
                 self.status,
             )
         };
-        // the entry's config-supplied format prompt, applied before anything
-        // downstream sees the result
+        // the tool's own format prompt, applied before anything downstream
+        // sees the result. It rides the tool's facts rather than the http
+        // array, so an entry moved into an api-mcp-adapter (which reports
+        // it on the tool's `_meta`) is still shaped the same way here.
         if !r.is_error {
-            if let Some(tools::ToolSrc::Http(i)) =
-                self.reg.find(&c.name).map(|t| t.src.clone())
-            {
-                if let Some(instr) = self.cfg.http[i].format.as_deref() {
-                    if let Some(f) = (self.formatter)(instr, &r.text) {
-                        r.text = f;
-                    }
+            if let Some(instr) = self.reg.find(&c.name).and_then(|t| t.meta.format.clone()) {
+                if let Some(f) = (self.formatter)(&instr, &r.text) {
+                    r.text = f;
                 }
             }
         }
@@ -9994,6 +9995,18 @@ fn handle_tools_probe(
                 tools::ToolSrc::Client => "client".to_string(),
             },
             "parameters": t.parameters,
+            // what the tool IS beyond its schema (tools::ToolMeta): the
+            // switch it sits under, pictures in and out, its own budgets.
+            // For an MCP tool these came from the server's `_meta`, which
+            // is the one thing a probe cannot show any other way.
+            "group": t.meta.group,
+            "images": t.meta.images,
+            "result": t.meta.result,
+            "timeout_s": t.meta.timeout_s,
+            "max_chars": t.meta.max_chars,
+            "user": t.meta.user,
+            "route": t.meta.route,
+            "route_arg": t.meta.route_arg,
         })).collect::<Vec<_>>(),
     });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
@@ -10623,6 +10636,7 @@ mod tests {
             description: String::new(),
             parameters: tools::object_schema(None),
             src,
+            meta: tools::ToolMeta::default(),
         };
         let all = vec![
             mk("read", tools::ToolSrc::Client),
@@ -10760,6 +10774,7 @@ mod tests {
             description: String::new(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
             src: tools::ToolSrc::Client,
+            meta: tools::ToolMeta::default(),
         }];
         let block = tools::client_system_block(&list, Some("get_weather"));
         assert!(block.contains("<tools>"));
@@ -11288,6 +11303,7 @@ mod tests {
             description: "Current weather for a city.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}}}),
             src: tools::ToolSrc::Http(0),
+            meta: tools::ToolMeta::default(),
         }];
         let msgs = vec![ChatMsg::text("user", "weather in Oslo?")];
         // the system prompt is rendered into the prompt string, so checking

@@ -1,0 +1,40 @@
+[package]
+name = "api-mcp-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Any HTTP API as an MCP server, from an attested enclave: describe endpoints in the app config (the same entries an eyesoff-ai tools.http block takes), keep the API keys as deployment secrets, and every MCP client gets one streamable-HTTP endpoint whose tools/call is a templated request the enclave makes on the caller's behalf."
+license-file = "../LICENSE"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.39.0", features = ["bitflags"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Caller identity (src/sso.rs): the platform's EST1 sign-in tokens are
+# EIP-191 secp256k1 signatures, verified with the same pure-Rust stack
+# eyesoff-ai and jot use, so the component still builds for wasm32-wasip2.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+sha3 = { version = "0.10", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+strip = true
+lto = true
+
+[package.metadata.component]
+package = "enclave:api-mcp-adapter"
+
+[package.metadata.component.target]
+path = "wit"
+world = "api-mcp-adapter"
+
+# WIT deps vendored from wasmtime v45 (see wit/world.wit)
+[package.metadata.component.target.dependencies]
+"wasi:http" = { path = "wit/deps/http" }
+"wasi:io" = { path = "wit/deps/io" }
+"wasi:clocks" = { path = "wit/deps/clocks" }

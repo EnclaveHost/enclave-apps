@@ -1,0 +1,13 @@
+// api-mcp-adapter: HTTP APIs described in the app config, served as one MCP
+// server (streamable HTTP, stateless JSON-RPC) from an attested enclave.
+// Every tool call is one outbound request through wasi:http/outgoing-handler,
+// which the platform's transparent egress carries; the MCP surface is served
+// through wasi:http/incoming-handler. No filesystem, no sockets, no TLS stack
+// in the app: the host does the transport, the app does the templating and
+// holds the secrets. WIT deps vendored verbatim from wasmtime v45 (jot's tree).
+package enclave:api-mcp-adapter;
+
+world api-mcp-adapter {
+  import wasi:http/outgoing-handler@0.2.6;
+  export wasi:http/incoming-handler@0.2.6;
+}

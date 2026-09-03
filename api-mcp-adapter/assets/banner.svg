@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#7fd9c9" stop-opacity=".12"/>
+    <stop offset="60%" stop-color="#7fd9c9" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+  <!-- two sockets and the bridge between them -->
+  <g transform="translate(1130,90)">
+    <rect x="0" y="40" width="130" height="150" rx="22" fill="#7fd9c9"/>
+    <rect x="200" y="40" width="130" height="150" rx="22" fill="#54b8a6"/>
+    <rect x="124" y="98" width="82" height="34" rx="6" fill="#e6e9f0"/>
+    <g fill="#062420">
+      <rect x="30" y="76" width="66" height="14" rx="7"/>
+      <rect x="30" y="108" width="50" height="14" rx="7"/>
+      <rect x="30" y="140" width="66" height="14" rx="7"/>
+      <circle cx="265" cy="92" r="14"/>
+      <circle cx="265" cy="138" r="14"/>
+    </g>
+  </g>
+  <text x="96" y="180" font-size="84" fill="#7fd9c9">[ <tspan fill="#d7dde8" font-weight="bold">api-mcp-adapter</tspan> ]</text>
+  <text x="100" y="252" font-size="34" fill="#8a93a6">any HTTP API as an MCP server, from an attested enclave</text>
+  <text x="100" y="310" font-size="24" fill="#5c6478">endpoints in the config · keys in the enclave · one endpoint for every agent</text>
+</svg>
