@@ -4335,10 +4335,68 @@ impl ChatReq {
         if self.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
             return false;
         }
-        match self.tools.as_ref().and_then(|v| v.as_bool()) {
-            Some(b) => b,
+        match self.tools.as_ref() {
+            Some(v) if v.is_boolean() => v.as_bool().unwrap_or(default_on),
+            // the GROUP form (see group_on): the loop is armed, and the
+            // registry is what is left after the groups switched off are
+            // withheld - an `on` list that names nothing arms nothing
+            Some(v) if v.is_object() => match v.get("on").and_then(|a| a.as_array()) {
+                Some(on) => !on.is_empty(),
+                None => true,
+            },
+            _ => default_on,
+        }
+    }
+
+    /// TOOL GROUPS: `tools` may be an object instead of a boolean -
+    /// `{"off": ["notebook"]}` withholds the named groups and leaves the rest
+    /// at the deployment's default; `{"on": ["search", "vm"]}` offers exactly
+    /// the named groups. Group names are what /models lists under `groups`
+    /// (tools::GROUP_SEARCH and friends). The two legacy switches keep their
+    /// meaning and WIN for their own group when present: `web_search` is the
+    /// "search" group, `image_gen` the "images" group, so an OpenAI-style
+    /// client that never learned the group form still turns them off.
+    fn group_on(&self, group: &str, default_on: bool) -> bool {
+        if group == tools::GROUP_SEARCH && self.web_search.is_some() {
+            return self.web_mode(default_on) != WebMode::Off;
+        }
+        if group == tools::GROUP_IMAGES && self.image_gen.is_some() {
+            return self.image_on(default_on);
+        }
+        if self.tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none") {
+            return false;
+        }
+        let Some(v) = self.tools.as_ref() else { return default_on };
+        if let Some(b) = v.as_bool() {
+            return b;
+        }
+        let Some(o) = v.as_object() else { return default_on };
+        let names = |k: &str| -> Option<Vec<&str>> {
+            o.get(k)?.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        };
+        if names("off").is_some_and(|off| off.iter().any(|g| *g == group)) {
+            return false;
+        }
+        match names("on") {
+            Some(on) => on.iter().any(|g| *g == group),
             None => default_on,
         }
+    }
+
+    /// The groups this deployment has that this request switched off, by
+    /// name - what the registry withholds this turn. "search" is carried by
+    /// web_withheld on the builtins instead (it also gates the search leg).
+    fn off_groups(&self, cfg: &AppConfig) -> Vec<String> {
+        let Some(tc) = cfg.tools.as_ref() else { return Vec::new() };
+        let image_default = cfg.image.as_ref().map(|i| i.default_on).unwrap_or(tc.default_on);
+        tc.groups(None, Some(image_default))
+            .into_iter()
+            .filter_map(|g| {
+                let name = g["name"].as_str()?.to_string();
+                let d = g["default_on"].as_bool().unwrap_or(tc.default_on);
+                (!self.group_on(&name, d)).then_some(name)
+            })
+            .collect()
     }
 
     /// The client-declared tool array (OpenAI `tools: [...]`), as a registry
@@ -4416,7 +4474,8 @@ impl ChatReq {
             Some(v) if v.as_bool() == Some(false) => false,
             Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("auto")) => true,
             Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("off")) => false,
-            _ => default_on,
+            // no legacy switch: the "images" group decides (see group_on)
+            _ => self.group_on(tools::GROUP_IMAGES, default_on),
         }
     }
 
@@ -4436,7 +4495,8 @@ impl ChatReq {
             Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("auto")) => WebMode::Auto,
             Some(v) if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("off")) => WebMode::Off,
             Some(_) => WebMode::Off,
-            None => if default_on { WebMode::Auto } else { WebMode::Off },
+            // no legacy switch: the "search" group decides (see group_on)
+            None => if self.group_on(tools::GROUP_SEARCH, default_on) { WebMode::Auto } else { WebMode::Off },
         }
     }
 }
@@ -5995,6 +6055,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
     tools::Builtins {
         search: cfg.search_cfg(),
         web_withheld: false,
+        off: &[],
         // the probe answers "what does this deployment have"; a turn without
         // a picture is a per-turn fact, not a capability
         images_present: true,
@@ -6018,12 +6079,15 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
 /// opposite of what either control says on the tin. The image facts gate the
 /// http tools that read pictures: none attached, or a serving model that
 /// reads them itself, and those entries are not offered.
-fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq) -> tools::Builtins<'a> {
+/// `off` is the request's off_groups(), computed once per turn by the caller
+/// (the registry is rebuilt per leg and the list must outlive every build).
+fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq, off: &'a [String]) -> tools::Builtins<'a> {
     let withheld = creq.web_mode(cfg.search_cfg().is_some_and(|sc| sc.default_on)) == WebMode::Off;
     let tc = cfg.tools.as_ref();
     tools::Builtins {
         search: if withheld { None } else { cfg.search_cfg() },
         web_withheld: withheld,
+        off,
         images_present: creq.messages.iter().any(|m| !m.images.is_empty()),
         images_local: images_read_locally(cfg, creq.model.as_deref()),
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
@@ -6950,7 +7014,8 @@ fn apply_tool_routes(
     if !creq.tools_on(tc.default_on) {
         return None;
     }
-    let b = builtins_for(cfg, creq);
+    let off = creq.off_groups(cfg);
+    let b = builtins_for(cfg, creq, &off);
     let routable: Vec<(usize, &tools::HttpTool)> = tc
         .http
         .iter()
@@ -7950,13 +8015,14 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         send(serde_json::Value::Object(m))
     };
     let agent_status = |s: &str| send(serde_json::json!({ "status": s }));
+    let off = creq.off_groups(cfg);
     let agent_env = AgentEnv {
         cfg,
         tok: &tok,
         creq: &creq,
         mode,
         draft: draft_cfg,
-        builtins: builtins_for(cfg, &creq),
+        builtins: builtins_for(cfg, &creq, &off),
         system: system_of(cfg, &creq.messages),
         status: &agent_status,
         formatter: &formatter,
@@ -7964,7 +8030,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     };
     let spawn = |s: AgentSpawn| run_agent(&agent_env, s);
     let mut tl = tools_enabled(cfg, &creq)
-        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &status_cb, &formatter, Some(&spawn)));
+        .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq, &off), tc.budget(creq.loop_.as_ref()), &status_cb, &formatter, Some(&spawn)));
     if let Some(t) = &tl {
         for n in &t.reg.notes {
             let _ = send(serde_json::json!({ "notice": format!("tools: {n}") }));
@@ -8436,13 +8502,14 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             send_raw(&format!(": enclave-{} {v}\n\n", kind.replace('_', "-")))
         };
         let agent_status = |s: &str| send_raw(&format!(": {s}\n\n"));
+        let off = creq.off_groups(cfg);
         let agent_env = AgentEnv {
             cfg,
             tok: &tok,
             creq: &creq,
             mode,
             draft: draft_cfg,
-            builtins: builtins_for(cfg, &creq),
+            builtins: builtins_for(cfg, &creq, &off),
             system: system_of(cfg, &creq.messages),
             status: &agent_status,
             formatter: &formatter,
@@ -8450,7 +8517,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         };
         let spawn = |s: AgentSpawn| run_agent(&agent_env, s);
         let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &leg_status, &formatter, Some(&spawn)));
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq, &off), tc.budget(creq.loop_.as_ref()), &leg_status, &formatter, Some(&spawn)));
         if let Some(t) = &tl {
             for n in &t.reg.notes {
                 let _ = send_raw(&format!(": enclave-tools {n}\n\n"));
@@ -8742,13 +8809,14 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // and their calls reach the client on enclave.tools
         let event = |_: &str, _: serde_json::Value| true;
         let agent_status = |_: &str| true;
+        let off = creq.off_groups(cfg);
         let agent_env = AgentEnv {
             cfg,
             tok: &tok,
             creq: &creq,
             mode,
             draft: draft_cfg,
-            builtins: builtins_for(cfg, &creq),
+            builtins: builtins_for(cfg, &creq, &off),
             system: system_of(cfg, &creq.messages),
             status: &agent_status,
             formatter: &formatter,
@@ -8756,7 +8824,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         };
         let spawn = |s: AgentSpawn| run_agent(&agent_env, s);
         let mut tl = tools_enabled(cfg, &creq)
-            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq), tc.budget(creq.loop_.as_ref()), &no_status, &formatter, Some(&spawn)));
+            .map(|tc| ToolLoop::open(tc, builtins_for(cfg, &creq, &off), tc.budget(creq.loop_.as_ref()), &no_status, &formatter, Some(&spawn)));
         if tl.as_ref().is_some_and(|t| !t.armed()) {
             tl = None;
         }
@@ -9260,6 +9328,32 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
             })
         }
         _ => serde_json::json!({ "enabled": false }),
+    };
+    // TOOL GROUPS: the switches the settings panel shows, one per tool as a
+    // person sees it (tools::GROUP_SEARCH). Search and images are groups like
+    // any other here, whether or not the deployment has a `tools` block: the
+    // page switches everything that leaves the enclave through one list.
+    body["groups"] = match base_cfg.as_ref() {
+        Some(c) => {
+            let search = c.search.as_ref().map(|s| s.default_on);
+            let images = c.image.as_ref().map(|i| i.default_on);
+            match c.tools.as_ref() {
+                Some(t) => serde_json::Value::Array(t.groups(search, images)),
+                None => {
+                    let mut g = Vec::new();
+                    if let Some(on) = search {
+                        g.push(serde_json::json!({ "name": tools::GROUP_SEARCH, "label": "Search",
+                                                   "kind": "search", "tools": ["web_search"], "default_on": on }));
+                    }
+                    if let Some(on) = images {
+                        g.push(serde_json::json!({ "name": tools::GROUP_IMAGES, "label": "Images",
+                                                   "kind": "images", "tools": [], "default_on": on }));
+                    }
+                    serde_json::Value::Array(g)
+                }
+            }
+        }
+        None => serde_json::json!([]),
     };
     // Sign-in: what the playground needs to START the flow - where to send
     // the visitor and which audience to ask for - plus whether the composer
@@ -10071,6 +10165,37 @@ mod tests {
         assert!(split.image_on(false));
         assert_eq!(split.web_mode(false), WebMode::Off);
         assert!(!req(serde_json::json!({ "messages": [], "image_gen": "off" })).image_on(true));
+    }
+
+    /// TOOL GROUPS: one `tools` object switches every group, search and
+    /// images included; the legacy switches still win for their own group.
+    #[test]
+    fn tool_groups_switch_through_one_field() {
+        let req = |v: serde_json::Value| chat_req(v);
+        // off-list: the named groups are withheld, the rest keep their default
+        let r = req(serde_json::json!({ "messages": [], "tools": { "off": ["notebook", "images"] } }));
+        assert!(!r.group_on("notebook", true));
+        assert!(r.group_on("vm", true));
+        assert!(!r.group_on("vm", false));
+        assert!(!r.image_on(true), "images rides the group form when image_gen is absent");
+        assert_eq!(r.web_mode(true), WebMode::Auto);
+        assert!(r.tools_on(false), "an off-list arms the loop for what is left");
+        // on-list: exactly the named groups, nothing else
+        let r = req(serde_json::json!({ "messages": [], "tools": { "on": ["search"] } }));
+        assert_eq!(r.web_mode(false), WebMode::Auto);
+        assert!(!r.group_on("notebook", true));
+        assert!(!r.image_on(true));
+        assert!(r.tools_on(false));
+        assert!(!req(serde_json::json!({ "messages": [], "tools": { "on": [] } })).tools_on(true));
+        // the legacy switch wins for its group, whatever the object says
+        let r = req(serde_json::json!({
+            "messages": [], "web_search": "off", "tools": { "on": ["search", "vm"] }
+        }));
+        assert_eq!(r.web_mode(true), WebMode::Off);
+        assert!(r.group_on("vm", false));
+        // tool_choice "none" withholds every group
+        let r = req(serde_json::json!({ "messages": [], "tool_choice": "none", "tools": { "on": ["vm"] } }));
+        assert!(!r.group_on("vm", true));
     }
 
     /// With both lists live, a call is routed by its SOURCE. The client's own

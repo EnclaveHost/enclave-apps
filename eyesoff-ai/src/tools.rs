@@ -189,6 +189,10 @@ pub struct Builtins<'a> {
     /// showing the model a tool is a stronger guarantee than asking it not to
     /// use one, and a user's choice is not a misconfiguration to report.
     pub web_withheld: bool,
+    /// the tool GROUPS the client switched off this turn (see GROUP_SEARCH):
+    /// every http entry and MCP server under one of them is skipped the same
+    /// silent way. "search" is expressed through web_withheld, not here.
+    pub off: &'a [String],
     /// the conversation carries at least one attached image. Without one, an
     /// http tool that asks for `$images` is silently not offered: a tool with
     /// nothing to look at is prompt noise, not a misconfiguration.
@@ -218,6 +222,26 @@ pub struct Builtins<'a> {
 /// The name of the subagent tool, which the answer loop runs itself: a
 /// child is a whole loop of generations, and only a leg can generate.
 pub const AGENT_TOOL: &str = "spawn_agent";
+
+/// TOOL GROUPS: what a person switches on and off. A group is one tool as the
+/// settings panel shows it, made of any number of endpoints (see
+/// HttpTool::group). Two groups are the app's own legs rather than config
+/// entries, and keep the names their switches always had on the wire:
+/// "search" is the search provider, the web_search/request builtins and the
+/// pre-turn search leg together; "images" is the image service, the pre-turn
+/// image leg and every picture-making or picture-reading endpoint together.
+pub const GROUP_SEARCH: &str = "search";
+pub const GROUP_IMAGES: &str = "images";
+
+/// A group's label for people: "notes_api" -> "Notes api".
+pub fn group_label(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        let c = if c == '_' || c == '-' { ' ' } else { c };
+        if i == 0 { out.extend(c.to_uppercase()); } else { out.push(c); }
+    }
+    out
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Builtin {
@@ -594,6 +618,78 @@ impl ToolsConfig {
     /// anything. /models advertises these, and advertising a name that
     /// resolution then drops would put a tool in the UI that cannot be called.
     /// MCP names are deliberately absent: knowing them means a round trip.
+    /// The switch http entry `i` sits under: its own `group` when it names
+    /// one, "images" when it is about pictures, else the family name its
+    /// function name shares with at least one sibling (`notes_list`,
+    /// `notes_write`, ... -> "notes": a family of endpoints is one tool, and
+    /// a config written before groups existed should not turn into six
+    /// switches), else the function name itself.
+    pub fn group_of(&self, i: usize) -> String {
+        let t = &self.http[i];
+        if let Some(g) = t.own_group() {
+            return g;
+        }
+        if let Some(fam) = t.name.split(['_', '-']).next().filter(|f| !f.is_empty() && *f != t.name) {
+            let siblings = self.http.iter().enumerate().filter(|(j, o)| {
+                *j != i && o.own_group().is_none()
+                    && o.name.split(['_', '-']).next() == Some(fam)
+            });
+            if siblings.count() > 0 {
+                return fam.to_string();
+            }
+        }
+        t.name.clone()
+    }
+
+    /// The switchable tools this config defines, in the order the settings
+    /// panel shows them (see GROUP_SEARCH): name, the functions under it, and
+    /// the switch's starting position. "search" and "images" are listed only
+    /// when the caller says the deployment has them (they are the app's own
+    /// legs, configured outside this block); every other group is the http
+    /// entries and MCP servers that share a name.
+    pub fn groups(&self, search: Option<bool>, images: Option<bool>) -> Vec<serde_json::Value> {
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let mut push = |name: String, kind: &str, tools: Vec<String>, default_on: bool| {
+            if let Some(g) = out.iter_mut().find(|g| g["name"] == name) {
+                for t in tools {
+                    g["tools"].as_array_mut().unwrap().push(serde_json::Value::String(t));
+                }
+                return;
+            }
+            out.push(serde_json::json!({
+                "name": name.clone(), "label": group_label(&name), "kind": kind,
+                "tools": tools, "default_on": default_on,
+            }));
+        };
+        if let Some(on) = search {
+            let mut names = Vec::new();
+            for b in &self.builtin {
+                if let Some(k @ (Builtin::WebSearch | Builtin::Request)) = Builtin::parse(b) {
+                    if !names.iter().any(|n| n == k.name()) {
+                        names.push(k.name().to_string());
+                    }
+                }
+            }
+            push(GROUP_SEARCH.into(), "search", names, on);
+        }
+        if let Some(on) = images {
+            push(GROUP_IMAGES.into(), "images", Vec::new(), on);
+        }
+        for (i, t) in self.http.iter().enumerate() {
+            if check_name(&t.name).is_err() {
+                continue;
+            }
+            let g = self.group_of(i);
+            let kind = if g == GROUP_IMAGES { "images" } else { "http" };
+            let on = if g == GROUP_IMAGES { images.unwrap_or(self.default_on) } else { self.default_on };
+            push(g, kind, vec![t.name.clone()], on);
+        }
+        for s in &self.mcp {
+            push(s.group_name(), "mcp", Vec::new(), self.default_on);
+        }
+        out
+    }
+
     pub fn http_names(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for b in &self.builtin {
@@ -632,6 +728,14 @@ pub struct HttpTool {
     /// vague description is why a model calls the wrong tool or none at all.
     #[serde(default)]
     pub description: String,
+    /// The TOOL this endpoint belongs to, as a person sees it: one notebook
+    /// is six endpoints (list, read, write, append, search, delete), and the
+    /// settings panel shows one switch for it, not six. Entries that share a
+    /// group share that switch. Absent: an endpoint that reads or makes a
+    /// picture belongs to "images" (beside the image service, if any), and
+    /// anything else is a tool of its own, named by its function name.
+    #[serde(default)]
+    pub group: Option<String>,
     /// JSON Schema for the arguments (an object schema). Absent = no arguments.
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
@@ -741,6 +845,16 @@ impl HttpTool {
         self.result.as_ref().is_some_and(|r| r.image.is_some())
     }
 
+    /// The switch this endpoint sits under when it says so, or when it is
+    /// about pictures; None = decided among its siblings (ToolsConfig::group_of).
+    fn own_group(&self) -> Option<String> {
+        match self.group.as_deref().map(str::trim) {
+            Some(g) if !g.is_empty() => Some(g.to_string()),
+            _ if self.makes_image() || self.wants_images() => Some(GROUP_IMAGES.to_string()),
+            _ => None,
+        }
+    }
+
     /// The parameter a routed line binds to: `route_arg`, or the entry's
     /// sole required parameter. None means `route` cannot be used.
     pub fn route_binding(&self) -> Option<String> {
@@ -760,6 +874,10 @@ impl HttpTool {
 pub struct McpServer {
     /// the MCP endpoint, e.g. "https://<id8>.app.enclave.host/mcp"
     pub url: String,
+    /// the switch this server's tools sit under (see HttpTool::group);
+    /// absent: the server's prefix, else its host
+    #[serde(default)]
+    pub group: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// keep only these tool names (empty = keep all the server offers)
@@ -791,6 +909,20 @@ pub struct McpToolDecl {
     pub description: String,
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+}
+
+impl McpServer {
+    /// The switch this server's tools sit under (see `group`).
+    pub fn group_name(&self) -> String {
+        if let Some(g) = self.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+            return g.to_string();
+        }
+        let p = self.prefix.as_deref().unwrap_or("").trim_end_matches(['_', '-']);
+        if !p.is_empty() {
+            return p.to_string();
+        }
+        host_of(&self.url)
+    }
 }
 
 /// Where a resolved tool actually goes.
@@ -943,6 +1075,10 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         });
     }
     for (i, t) in cfg.http.iter().enumerate() {
+        // a group the person switched off: not offered, not a note
+        if b.off.iter().any(|g| *g == cfg.group_of(i)) {
+            continue;
+        }
         // a misconfigured route IS worth a note: the operator wrote a prompt
         // that can never fire
         if t.route.is_some() && t.route_binding().is_none() {
@@ -977,6 +1113,9 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
         }
     }
     for (i, s) in cfg.mcp.iter().enumerate() {
+        if b.off.iter().any(|g| *g == s.group_name()) {
+            continue;
+        }
         let timeout = s.timeout_s.unwrap_or(cfg.timeout_s);
         let mut sess = McpSession {
             url: s.url.trim().to_string(),
@@ -2602,6 +2741,35 @@ mod tests {
             parameters: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
             src: ToolSrc::Http(0),
         }
+    }
+
+    #[test]
+    fn endpoints_group_into_one_switch_each() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "builtin": ["web_search", "request"],
+            "http": [
+                { "name": "notes_list", "url": "http://j/api/notes" },
+                { "name": "notes_write", "url": "http://j/api/notes/{name}", "method": "PUT" },
+                { "name": "run_vm_command", "url": "http://vm/exec", "method": "POST" },
+                { "name": "generate_image", "url": "http://img/v1", "method": "POST",
+                  "body": { "prompt": "$prompt" }, "result": { "image": "data.0.b64_json" } }
+            ]
+        })).unwrap();
+        let g = cfg.groups(Some(false), Some(true));
+        let names: Vec<&str> = g.iter().map(|x| x["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["search", "images", "notes", "run_vm_command"],
+                   "a family of endpoints is one switch; a lone one is its own");
+        assert_eq!(g[2]["tools"], serde_json::json!(["notes_list", "notes_write"]));
+        assert_eq!(g[2]["label"], "Notes");
+        assert_eq!(g[1]["tools"], serde_json::json!(["generate_image"]), "a picture-maker joins images");
+        assert_eq!(g[0]["tools"], serde_json::json!(["web_search", "request"]));
+        // a switched-off group is not in the registry, silently
+        let off = vec!["notes".to_string()];
+        let b = Builtins { search: None, web_withheld: true, off: &off, ..Default::default() };
+        let reg = build(&cfg, b, &|_| {});
+        let offered: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(offered, ["run_vm_command", "generate_image"]);
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
     }
 
     #[test]

@@ -2077,6 +2077,13 @@ const state = {
   // deployment set default_on.
   toolsOn: false,
   tools: { enabled: false },
+  // TOOL GROUPS: what /models lists under `groups` - one entry per tool as a
+  // person sees it (search, images, notebook, ...), each made of any number
+  // of endpoints - and which of them this person has on. Search and images
+  // are groups like the rest; webMode/imageOn/toolsOn below are kept in step
+  // with them (syncGroups) for the code that still reads them.
+  groups: [],
+  on: {},
   // THE LOOP: keep working at a verifiable goal until its check passes - run
   // it, read the failure, fix, run again - and wait when a job needs time,
   // rather than answering at the first opportunity. Off by default: a
@@ -2160,7 +2167,7 @@ const isMobile = () => matchMedia("(max-width: 768px)").matches;
 // here either: SSO_KEY has its own lifecycle, cleared by signing out.
 const PREF_KEYS = ["llmchat-theme", "llmchat-model", "llmchat-target",
                    "llmchat-sidew", "llmchat-think", "llmchat-web", "llmchat-web-asked",
-                   "llmchat-tools", "llmchat-image", "llmchat-loop"];
+                   "llmchat-tools", "llmchat-image", "llmchat-loop", "llmchat-groups"];
 let storeOK = false;
 try { storeOK = localStorage.getItem("llmchat-store") === "1"; } catch (_) {}
 // Settings persist whatever the switch says. The switch is about CHAT HISTORY
@@ -3978,11 +3985,12 @@ async function run(chat) {
         // off must say so or a default-on deployment would re-enable them
         web_search: state.webMode === "off" ? "off" : "auto",
         image_gen: state.image.enabled ? (state.imageOn ? "auto" : "off") : undefined,
-        // the deployment's OWN tools, which it executes itself; this only says
-        // whether the model is allowed to reach for them on this turn
-        tools: state.tools.enabled && state.toolsOn ? true : undefined,
+        // the deployment's OWN tools, which it executes itself, by GROUP: the
+        // ones switched off are named, the rest are offered; none on says so
+        // outright rather than leaving the server to its default
+        tools: toolsField(),
         // the LOOP: keep at the goal until its check passes (see state)
-        loop: state.tools.enabled && state.toolsOn && state.loopOn ? true : undefined,
+        loop: anyToolsOn() && state.loopOn ? true : undefined,
       }),
       signal: ctl.signal,
     });
@@ -4733,8 +4741,7 @@ function provName(p) {
   return known[p] || (p ? p : "a search provider");
 }
 function answerWeb(on) {
-  state.webMode = on ? "auto" : "off";
-  pref("llmchat-web", state.webMode);
+  setGroup("search", on);
   pref("llmchat-web-asked", "1");
   closeWeb();
   renderModelMenu();   // the switch reflects what they just chose
@@ -4856,6 +4863,62 @@ document.addEventListener("click", (e) => {
   if (!attachWrap.contains(e.target)) closeAttachMenu();
 });
 
+// ---- tool groups: one switch per tool, however many endpoints it has ----
+function groupOn(name) { return state.on[name] === true; }
+// the deployment's own tools (search and images are legs with switches of
+// their own on the wire; these are what `tools` carries)
+function toolGroups() { return state.groups.filter((g) => g.kind === "http" || g.kind === "mcp"); }
+function anyToolsOn() { return toolGroups().some((g) => groupOn(g.name)); }
+function toolsField() {
+  const gs = toolGroups();
+  if (!gs.length) return undefined;
+  const off = gs.filter((g) => !groupOn(g.name)).map((g) => g.name);
+  return off.length === gs.length ? false : { off };
+}
+// the three older fields the rest of the page still reads, derived
+function syncGroups() {
+  state.webMode = groupOn("search") ? "auto" : "off";
+  state.imageOn = groupOn("images");
+  state.toolsOn = anyToolsOn();
+}
+function setGroup(name, on) {
+  state.on[name] = !!on;
+  syncGroups();
+  const saved = {};
+  for (const g of state.groups) saved[g.name] = groupOn(g.name) ? "on" : "off";
+  pref("llmchat-groups", JSON.stringify(saved));
+}
+// starting positions: the deployment's default per group, then whatever this
+// person chose before - the older per-switch keys count as choices for the
+// groups they used to govern, the newer per-group record wins over both
+function initGroups(storedWeb, storedImage, storedTools) {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("llmchat-groups") || "{}") || {}; } catch (_) {}
+  for (const g of state.groups) {
+    let on = g.default_on === true;
+    if (g.name === "search" && ["auto", "off"].includes(storedWeb)) on = storedWeb === "auto";
+    else if (g.name === "images" && ["on", "off"].includes(storedImage)) on = storedImage === "on";
+    else if (g.kind !== "search" && g.kind !== "images" && ["on", "off"].includes(storedTools)) on = storedTools === "on";
+    if (saved[g.name] === "on" || saved[g.name] === "off") on = saved[g.name] === "on";
+    state.on[g.name] = on;
+  }
+  syncGroups();
+}
+function groupTitles(g) {
+  const names = (g.tools || []).join(", ");
+  if (g.kind === "search") {
+    const what = "search the web" + (state.search && state.search.provider ? " through " + provName(state.search.provider) : "");
+    return ["the model decides per message whether to " + what,
+            "never " + what + "; answer from the model alone, nothing leaves the enclave"];
+  }
+  if (g.kind === "images") {
+    return ["the model decides per message whether to generate a picture" + (names ? " (" + names + ")" : ""),
+            "never generate or edit a picture; answer in words"];
+  }
+  return ["let the model call " + g.label.toLowerCase() + " when a question needs it" + (names ? " (" + names + ")" : ""),
+          "never call " + g.label.toLowerCase() + "; nothing goes to it"];
+}
+
 function renderModelMenu() {
   modelMenu.innerHTML = "";
   modelMenu.appendChild(node('<div class="menu-label">Model</div>'));
@@ -4963,89 +5026,41 @@ function renderModelMenu() {
   // NOT sticky-on: with it on, the question leaves the enclave to a search
   // provider, so it is a choice the user makes per session rather than a
   // default they inherit.
-  // Images: their own switch, on by default. The picture is made by a
-  // deployment this operator runs, so there is no third party to disclose and
-  // nothing for the user to weigh - configuring the endpoint was the decision.
-  if (state.image && state.image.enabled) {
-    const iseg = node('<div class="seg-row"><span>Images</span><div class="seg"></div></div>');
+  // TOOLS: one switch per tool as a person sees it - search, images, the
+  // notebook, the machine - however many endpoints each has behind it (see
+  // state.groups). Everything that leaves the enclave is in this one list.
+  // Off by default unless the deployment said otherwise, because a call
+  // leaves the enclave and that is the user's choice per session, not a
+  // default they inherit; the tooltip names what is actually wired up.
+  for (const g of state.groups) {
+    const gsg = node('<div class="seg-row"><span></span><div class="seg"></div></div>');
+    gsg.querySelector("span").textContent = g.label || g.name;
+    const [onTitle, offTitle] = groupTitles(g);
     for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");
       b.textContent = t;
-      if ((state.imageOn ? "on" : "off") === t) b.classList.add("on");
-      b.title = t === "on"
-        ? "the model decides per message whether to generate a picture"
-        : "never generate a picture; answer in words";
+      if ((groupOn(g.name) ? "on" : "off") === t) b.classList.add("on");
+      b.title = t === "on" ? onTitle : offTitle;
       b.addEventListener("click", (e) => {
         e.stopPropagation();
-        state.imageOn = t === "on";
-        pref("llmchat-image", state.imageOn ? "on" : "off");
-        iseg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+        setGroup(g.name, t === "on");
+        gsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+        // a loop with nothing to call is not one
+        if (!anyToolsOn() && state.loopOn) {
+          state.loopOn = false;
+          pref("llmchat-loop", "off");
+          renderModelMenu();
+        }
       });
-      iseg.querySelector(".seg").appendChild(b);
+      gsg.querySelector(".seg").appendChild(b);
     }
-    modelMenu.appendChild(iseg);
+    modelMenu.appendChild(gsg);
   }
-  if (state.search && state.search.enabled) {
-    const what = "search the web";
-    const wseg = node('<div class="seg-row"><span>Web search</span><div class="seg"></div></div>');
-    // On/off, the same shape as Thinking. ON means the MODEL decides per
-    // message whether the turn needs it, which is what people expect from a
-    // chat app and what makes the control worth leaving on. There is no
-    // "every message" setting: it spent a provider round trip on "thanks, that
-    // helps", and once the router decides well the only thing it added was a
-    // way to get that wrong. API clients that really want it can still send
-    // web_search: true.
-    for (const t of ["on", "off"]) {
-      const b = node("<button type='button'></button>");
-      b.textContent = t;
-      if ((state.webMode === "off" ? "off" : "on") === t) b.classList.add("on");
-      b.title = t === "on"
-        ? "the model decides per message whether to " + what
-        : "never " + what + "; answer from the model alone, nothing leaves the enclave";
-      b.addEventListener("click", (e) => {
-        e.stopPropagation();
-        state.webMode = t === "on" ? "auto" : "off";
-        pref("llmchat-web", state.webMode);
-        wseg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-      });
-      wseg.querySelector(".seg").appendChild(b);
-    }
-    modelMenu.appendChild(wseg);
-  }
-  // Tools, only when the deployment configured some. Same stance as web
-  // search, for the same reason: a call reaches an endpoint outside the
-  // enclave, so it is a choice rather than an inheritance. The tooltip names
-  // what is actually wired up - a switch whose effect you cannot see is worse
-  // than no switch.
-  if (state.tools && state.tools.enabled) {
-    const names = (state.tools.http || []).slice();
-    if (state.tools.mcp) names.push(state.tools.mcp + " MCP server" + (state.tools.mcp === 1 ? "" : "s"));
-    const what = names.length ? names.join(", ") : "the configured tools";
-    // web_search is still web search: the Search switch above governs it, and a
-    // user who turns Tools on expecting it would otherwise be left guessing
-    const needsWeb = (state.tools.http || []).some((n) => n === "web_search" || n === "request" || n === "fetch_url" || n === "post_url");
-    const tsg = node('<div class="seg-row"><span>Tools</span><div class="seg"></div></div>');
-    for (const t of ["on", "off"]) {
-      const b = node("<button type='button'></button>");
-      b.textContent = t;
-      if ((state.toolsOn ? "on" : "off") === t) b.classList.add("on");
-      b.title = t === "on"
-        ? "let the model call this server's tools when a question needs one (" + what + ")"
-          + (needsWeb ? ". Web tools also need the search switch on" : "")
-        : "never call a tool; answer from the model alone, nothing leaves the enclave";
-      b.addEventListener("click", (e) => {
-        e.stopPropagation();
-        state.toolsOn = t === "on";
-        pref("llmchat-tools", state.toolsOn ? "on" : "off");
-        tsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-      });
-      tsg.querySelector(".seg").appendChild(b);
-    }
-    modelMenu.appendChild(tsg);
-    // THE LOOP, beside Tools because it is a way of using them: on, the model
-    // is told to keep going until the goal's check passes and may wait for
-    // slow jobs, inside the deployment's step and time budget. Turning it on
-    // turns Tools on - a loop with nothing to call is not one.
+  if (state.tools && state.tools.enabled && toolGroups().length) {
+    // THE LOOP, beside the tools because it is a way of using them: on, the
+    // model is told to keep going until the goal's check passes and may wait
+    // for slow jobs, inside the deployment's step and time budget. Turning it
+    // on turns the tools on - a loop with nothing to call is not one.
     const budget = (state.tools.max_calls || 0) + " steps"
       + (state.tools.max_seconds ? " · " + humanSecs(state.tools.max_seconds) : "")
       + (state.tools.max_agents ? " · " + state.tools.max_agents + " subagents" : "");
@@ -5062,10 +5077,9 @@ function renderModelMenu() {
         state.loopOn = t === "on";
         pref("llmchat-loop", state.loopOn ? "on" : "off");
         lsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-        if (state.loopOn && !state.toolsOn) {
-          state.toolsOn = true;
-          pref("llmchat-tools", "on");
-          tsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.textContent === "on"));
+        if (state.loopOn && !anyToolsOn()) {
+          for (const g of toolGroups()) setGroup(g.name, true);
+          renderModelMenu();
         }
       });
       lsg.querySelector(".seg").appendChild(b);
@@ -5128,6 +5142,12 @@ const modelsReady = (async () => {
   // the loop never starts on by itself: it is a way of spending the budget
   // that this person chose, and it only means anything with tools on
   state.loopOn = state.tools.enabled && storedLoop === "on";
+  // the switches themselves: one per group, from the deployment's defaults and
+  // this person's earlier choices (initGroups); webMode/imageOn/toolsOn above
+  // are then re-derived from them
+  state.groups = Array.isArray(info.groups) ? info.groups : [];
+  initGroups(storedWeb, storedImage, storedTools);
+  if (state.loopOn && !anyToolsOn()) state.loopOn = false;
   state.auth = info.auth || { enabled: false };
   renderSsoUI();
   // the gate can rise UNDER the boot overlay right now - boot fades into it

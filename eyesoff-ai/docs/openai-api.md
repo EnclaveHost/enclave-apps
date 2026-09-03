@@ -154,7 +154,7 @@ sampled the one way the server samples. The fields that exist:
 | `target` | string | extension: `"cpu"` \| `"gpu"` \| `"auto"` (default auto: GPU then CPU fallback). ggml deployments ignore it (offload is the node's call). |
 | `web_search` | bool \| string | extension, needs the deployment's search config. See [Web search](#web-search-image-generation-and-the-router). |
 | `image_gen` | bool \| string | extension, needs the deployment's `image` block. Same section. |
-| `tools` | bool \| array | **two modes told apart by shape** — see [Tools](#tools). |
+| `tools` | bool \| object \| array | **three modes told apart by shape**: a boolean arms or withholds the deployment's tools; an object switches them by **group** (`{"off": ["notes"]}` withholds the named groups, `{"on": ["search", "vm"]}` offers exactly those; names are what `GET /models` lists under `groups`, and `search`/`images` are groups too); an array is the client-tools passthrough — see [Tools](#tools). |
 | `tool_choice` | string \| object | OpenAI switch: `"none"`, `"auto"`, `"required"`, or `{"type":"function","function":{"name":...}}`. |
 
 Request body cap: **40 MB** (`MAX_BODY_BYTES`) — sized for base64 image
@@ -263,6 +263,15 @@ never draws, and never advertises either.
 - `image_gen: true`/`"auto"` lets the router decide the turn wants a
   picture; `false`/`"off"` withholds it; absent takes `image.default_on`
   (default **true** when the `image` block exists). There is no "always".
+- Both are also **tool groups**: `tools: {"off": ["search"]}` is
+  `web_search: "off"`, `tools: {"on": ["images"]}` is `image_gen: "auto"`
+  with everything else withheld. When a legacy switch and the group form
+  disagree about its own group, the legacy switch wins, so an older client
+  keeps its meaning. `GET /models` → `groups` lists every group with its
+  functions and starting position; an http entry's `group` config field
+  names its group, endpoints whose names share a family (`notes_list`,
+  `notes_write`, ...) fall into one group by default, and picture-making or
+  picture-reading entries join `images`.
 - A user message starting `/search ` forces a search; `/image ` forces a
   picture — regardless of the switches.
 - Search results are folded into the prompt before generation; the sources
