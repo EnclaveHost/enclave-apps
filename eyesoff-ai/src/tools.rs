@@ -4597,6 +4597,21 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "mcp": [{ "url": "https://h.example/mcp" }] })).unwrap();
         assert!(bare.mcp[0].all_switches_off(&["h.example".to_string()]));
         assert!(!bare.mcp[0].all_switches_off(&["other".to_string()]));
+        // ...and `group` names that catch-all, so a settings panel shows
+        // "Eyesoff tools" rather than "A1b2c3d4.app.enclave.host"
+        let named: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://a1b2c3d4.app.enclave.host/mcp", "group": "eyesoff-tools",
+                      "groups": { "notes": ["notes_read"] } }]
+        }))
+        .unwrap();
+        let names: Vec<String> = named
+            .groups(None, None)
+            .iter()
+            .map(|g| g["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"eyesoff-tools".to_string()), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("app.enclave.host")), "{names:?}");
+        assert_eq!(group_label("eyesoff-tools"), "Eyesoff tools");
     }
 
     /// A redirect this client does not follow is named, not reported as a

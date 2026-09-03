@@ -791,6 +791,11 @@ fn handle_tools(cfg: &Config, req: &IncomingRequest, q: &[(String, String)], out
         "handshake": false,
         "headers": headers,
         "groups": cfg.groups(),
+        // names the catch-all switch a discovering client keeps for tools
+        // this map does not cover. Without it that switch is named for the
+        // host, and "A1b2c3d4.app.enclave.host" is not a thing anyone wants
+        // to see in a settings panel.
+        "group": slug(&cfg.title),
     });
     json(out, 200, serde_json::json!({
         "base_url": origin,

@@ -162,10 +162,15 @@ def main():
     eyesoff = json.loads(json.dumps(cfg), object_pairs_hook=OrderedDict)
     et = eyesoff["tools"]
     del et["http"]
+    # `group` names the catch-all switch a discovering client keeps for any
+    # tool the map does not cover; without it that switch is named for the
+    # host, which is not a thing anyone wants in a settings panel
+    catch_all = "".join(c.lower() if c.isalnum() else "-" for c in adapter["title"]).strip("-") or "tools"
     et["mcp"] = [OrderedDict([
         ("url", url),
         ("handshake", False),
         ("headers", headers),
+        ("group", catch_all),
         ("groups", groups),
     ])]
 
