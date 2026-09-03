@@ -5637,7 +5637,11 @@ impl<'a> ToolLoop<'a> {
                     self.refused = Some(REFUSED_MALFORMED);
                 } else {
                     self.malformed_tries += 1;
-                    on_note("the model wrote a tool call this app could not parse; asking it to rewrite the call");
+                    on_note(&format!(
+                        "the model wrote a tool call this app could not parse; asking it \
+                         to rewrite the call. It wrote: {}",
+                        call_excerpt(text)
+                    ));
                     messages.push(ChatMsg::text("assistant", strip_think(text).trim().to_string()));
                     messages.push(ChatMsg::text(
                         "user",
@@ -6086,6 +6090,45 @@ fn attempted_call(text: &str) -> bool {
     text[body..]
         .find("<tool_call>")
         .is_some_and(|i| text[body + i + "<tool_call>".len()..].contains('{'))
+}
+
+/// How much of an unparseable call a note carries. Long enough to show the
+/// SHAPE of the mistake, which is always in the opening characters, and short
+/// enough that a `write` argument carrying 29 KB of HTML does not land in the
+/// transcript.
+const EXCERPT_CHARS: usize = 200;
+
+/// What the model actually wrote, for the note the user reads when a call
+/// could not be parsed.
+///
+/// Without this the note says only THAT parsing failed, which is unactionable:
+/// the block never reaches the transcript (the refusal replaces it) and the
+/// retries overwrite each other, so nobody - user or author - can see the
+/// shape that needs fixing. Reported unusable for exactly that reason on
+/// 2026-09-03. Whitespace is collapsed so a multi-line call stays one line,
+/// and the text is inert wherever it lands: the playground sets it with
+/// textContent, never innerHTML.
+fn call_excerpt(text: &str) -> String {
+    let body = text.rfind("</think>").map_or(0, |i| i + "</think>".len());
+    let from = text[body..].find("<tool_call>").map_or(body, |i| body + i);
+    let mut out = String::new();
+    let mut space = false;
+    for c in text[from..].trim().chars() {
+        if out.chars().count() >= EXCERPT_CHARS {
+            out.push('…');
+            break;
+        }
+        if c.is_whitespace() {
+            if !space && !out.is_empty() {
+                out.push(' ');
+            }
+            space = true;
+        } else {
+            out.push(c);
+            space = false;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// When the model holds an image-reading tool, the pictures must leave the
@@ -11142,6 +11185,38 @@ mod tests {
         assert!(msgs[2].content.contains("could not be parsed"), "{}", msgs[2].content);
         // prose that mentions the tag and carries no brace is still an answer
         assert!(!attempted_call("Write it inside <tool_call> tags."));
+    }
+
+    /// The note has to say WHAT the model wrote, not only that parsing failed.
+    /// The block itself never reaches the transcript - the refusal replaces it
+    /// - so without this there is nothing to debug from: reported unusable on
+    /// 2026-09-03 after four retries left no trace of the offending call.
+    #[test]
+    fn the_note_shows_what_the_model_wrote() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl =
+            ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "what is my name?")];
+        let bad = "<think>looking it up</think>\n<tool_call>\n{\"arguments\":\n  {\"q\": \"name\"}}";
+        let seen = std::cell::RefCell::new(String::new());
+        let note = |n: &str| seen.borrow_mut().push_str(n);
+        assert!(tl.step(bad, &mut msgs, &|_| {}, &|_| {}, &note));
+        let seen = seen.into_inner();
+        assert!(seen.contains("could not parse"), "{seen}");
+        assert!(seen.contains("{\"arguments\": {\"q\": \"name\"}}"), "{seen}");
+        // one line, and the reasoning is not part of the call
+        assert!(!seen.contains('\n'), "{seen}");
+        assert!(!seen.contains("looking it up"), "{seen}");
+
+        // a huge argument is cut rather than pasted into the transcript
+        let big = format!("<tool_call>\n{{\"arguments\":{{\"c\":\"{}\"}}}}", "x".repeat(9000));
+        assert!(call_excerpt(&big).chars().count() <= EXCERPT_CHARS + 1, "not truncated");
+        assert!(call_excerpt(&big).ends_with('…'));
     }
 
     /// The route classifier's one line, parsed: a known service and its
