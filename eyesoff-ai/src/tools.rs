@@ -1829,23 +1829,54 @@ fn one_call(chunk: &str, tools: &[Tool]) -> Option<ToolCall> {
     Some(ToolCall { name, args })
 }
 
-/// The `<function=name>` spelling: the functionary/Llama tool syntax, which
+/// The function name out of a `<function...>` tag's interior, in every
+/// spelling this family writes it: `=read`, `name = "web_search"`, `="x"`,
+/// `"x"`. None when the interior does not look like a tag's at all, which
+/// keeps a word that merely starts with "function" (`<functions>`) from
+/// becoming a call and leaves the object paths their turn.
+fn tag_name(part: &str) -> Option<&str> {
+    // an introducer is what proves this was a tag rather than a longer word
+    if !part.starts_with(['=', ' ', '\t', '"', '\'']) && !part.starts_with("name") {
+        return None;
+    }
+    let p = part.trim();
+    // `<functionname = "x">`: the attribute spelling. Strip `name` only when
+    // what follows introduces a VALUE, or a tool really called `named_thing`
+    // would lose its first four characters.
+    let p = match p.strip_prefix("name") {
+        Some(r) if r.trim_start().starts_with(['=', '"', '\'']) => r.trim_start(),
+        _ => p,
+    };
+    let p = p.strip_prefix('=').unwrap_or(p).trim();
+    let p = p.trim_matches(['"', '\'']).trim();
+    // a name is an identifier; anything else means this was not a tag
+    (!p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .then_some(p)
+}
+
+/// The `<function...>` opener family: the functionary/Llama tool syntax, which
 /// this family reaches for perhaps one turn in three even when the prompt only
 /// ever showed it the Hermes form.
 ///
-/// What follows the tag is not reliably the documented `{args}` either. Live on
-/// 2026-08-14 qwen3.8 wrote `<function=read>, "arguments": {"filePath": ...}}`
-/// - the tag welded onto a fragment of the trained form. Taking the name from
-/// the tag and the arguments from the first balanced object after it reads both
-/// spellings correctly, and a call with no object at all is still a call with
-/// no arguments rather than a dead block shown to the user as prose.
+/// Neither the tag NOR what follows it is reliably the documented
+/// `<function=name>{args}`. Live on 2026-08-14 qwen3.8 wrote `<function=read>,
+/// "arguments": {"filePath": ...}}`, and on 2026-09-03 `<functionname =
+/// "web_search"> "arguments": {"query": ...}}` - the tag welded onto a fragment
+/// of the trained form, with the call never wrapped in an object at all. That
+/// second shape is why the tag is read here rather than left to `one_call`'s
+/// object paths: the only balanced object in it is the ARGUMENTS value, so
+/// recovering an object recovers a call with no name and no arguments.
+///
+/// Taking the name from the tag in whatever spelling it wears, and the
+/// arguments from the first balanced object after it, reads all of them; a
+/// call with no object at all is still a call with no arguments rather than a
+/// dead block shown to the user as prose.
 fn function_tag_call(t: &str) -> Option<ToolCall> {
-    let rest = t.strip_prefix("<function=")?;
+    let rest = t.strip_prefix("<function")?;
     let (name, after) = rest.split_once('>')?;
-    let name = name.trim().trim_end_matches(['"', '\'']).trim();
-    if name.is_empty() {
+    let Some(name) = tag_name(name) else {
         return None;
-    }
+    };
     let args = after
         .find('{')
         .map(|i| &after[i..])
@@ -3400,6 +3431,41 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].name, "read");
         assert_eq!(c[0].args["filePath"], "/y");
+    }
+
+    /// The 2026-09-03 screenshot: `<functionname = "web_search">`, the tag
+    /// with its `name` attribute welded on, and the call never wrapped in an
+    /// object at all - so `"arguments"` sits outside every brace and the only
+    /// balanced object IS the arguments value. Recovering an object cannot
+    /// help here (it yields no name and no arguments), so the tag has to be
+    /// read in whatever spelling the model reached for.
+    #[test]
+    fn the_function_tag_is_read_in_every_spelling() {
+        let c = parse_calls(
+            "<tool_call>\n<functionname = \"web_search\"> \"arguments\": \
+             {\"query\": \"why do dogs have fur evolution biology purpose\"}}",
+        );
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].name, "web_search");
+        assert_eq!(c[0].args["query"], "why do dogs have fur evolution biology purpose");
+
+        for raw in [
+            "<tool_call><function name=\"read\">{\"p\": \"/a\"}</tool_call>",
+            "<tool_call><function=read>{\"p\": \"/a\"}</tool_call>",
+            "<tool_call><function \"read\">{\"p\": \"/a\"}</tool_call>",
+            "<tool_call><functionname=\"read\">{\"p\": \"/a\"}</tool_call>",
+        ] {
+            let c = parse_calls(raw);
+            assert_eq!(c.len(), 1, "{raw}");
+            assert_eq!(c[0].name, "read", "{raw}");
+            assert_eq!(c[0].args["p"], "/a", "{raw}");
+        }
+        // a tool whose name starts with "name" keeps all of it
+        let c = parse_calls("<tool_call><function=named_thing>{}</tool_call>");
+        assert_eq!(c[0].name, "named_thing");
+        // ...and a word that merely starts with "function" is not a tag, so
+        // nothing is invented from it
+        assert!(parse_calls("<tool_call><functions>{\"a\":1}</tool_call>").is_empty());
     }
 
     /// The rule the scan actually enforces: a call written INSIDE reasoning is
