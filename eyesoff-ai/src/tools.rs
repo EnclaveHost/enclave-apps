@@ -213,6 +213,13 @@ pub struct Builtins<'a> {
     /// remaining count, or zero at the depth limit. Zero withdraws the
     /// spawn_agent tool from the loop's registry.
     pub agent_slots: u32,
+    /// the account behind this turn's credential (a verified sign-in token or
+    /// a derived API key), or None on an anonymous turn. An http entry names
+    /// it with `"$user"` as a whole header value and this app fills it in,
+    /// which is how a per-user endpoint (a jot notebook) learns whose notes a
+    /// call is about without the model ever choosing. Filled from the request
+    /// headers before the body is read, never from the body or the model.
+    pub user: Option<&'a str>,
     /// the deployment's max_agents, so a loop with no slots left is told
     /// apart from a deployment that never had the feature (the first is
     /// silent, the second is a note if someone named the tool anyway)
@@ -1196,6 +1203,42 @@ fn host_of(url: &str) -> String {
 /// survived means the secret is not set, and posting the literal string
 /// "Bearer $TOOL_KEY" earns a 401 that sends an operator hunting for a bad key
 /// instead of a missing secret.
+/// The reserved `$user` slot: a header whose WHOLE value is `$user` (or
+/// `${user}`) carries the account behind this turn's sign-in or derived API
+/// key, filled by this app. It is resolved before the secrets pass so it is
+/// never mistaken for a missing secret, and a turn with no signed-in caller
+/// fails closed: the endpoint is per-user, and reaching it nameless would be
+/// exactly the confusion of identities the slot exists to prevent. Not a
+/// secret name that could collide: the platform's secret substitution keeps
+/// unknown `$names` literal, and `user` is not one the deployer sets.
+fn identity_headers(
+    h: &BTreeMap<String, String>,
+    user: Option<&str>,
+    tool: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in h {
+        let slot = matches!(v.trim(), "$user" | "${user}");
+        match (slot, user) {
+            (false, _) => {
+                out.insert(k.clone(), v.clone());
+            }
+            (true, Some(u)) => {
+                out.insert(k.clone(), u.to_string());
+            }
+            (true, None) => {
+                return Err(format!(
+                    "the {tool} tool acts on behalf of the signed-in user (its '{k}' header is \
+                     $user), and this turn has no signed-in caller. It cannot be used on this \
+                     turn; tell the user to sign in with Enclave (or call the API with a derived \
+                     key) to reach it. Do not retry."
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn resolved_headers(
     h: &BTreeMap<String, String>,
     notes: &mut Vec<String>,
@@ -1956,7 +1999,7 @@ pub fn call(
     let r = match src {
         ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources, on_status),
         ToolSrc::Http(i) => {
-            call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status)
+            call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status, b.user)
         }
         ToolSrc::Mcp { server, remote } => call_mcp(&mut reg.mcp[server], &remote, args),
         // never built into a Registry - the passthrough renders client tools
@@ -1982,7 +2025,10 @@ pub fn call_http_entry(
     let t = &cfg.http[i];
     let mut sources = Vec::new();
     let mut image = None;
-    let r = call_http(t, cfg, args, images, &mut sources, &mut image, on_status);
+    // the routed pre-pass carries no caller: an entry that asks for $user
+    // fails closed there, which is the right answer for a route with no one
+    // behind it
+    let r = call_http(t, cfg, args, images, &mut sources, &mut image, on_status, None);
     finish_call(r, t.max_chars.unwrap_or(cfg.max_chars), sources, image, t0, now_ms)
 }
 
@@ -2177,6 +2223,7 @@ fn call_http(
     sources: &mut Vec<(String, String)>,
     image_out: &mut Option<crate::image::GeneratedImage>,
     on_status: &dyn Fn(&str),
+    user: Option<&str>,
 ) -> Result<String, String> {
     let empty = serde_json::Map::new();
     let obj = args.as_object().unwrap_or(&empty);
@@ -2236,7 +2283,8 @@ fn call_http(
         req = req.header("content-type", b"application/json");
     }
     let mut notes = Vec::new();
-    for (k, v) in resolved_headers(&t.headers, &mut notes, &t.url) {
+    let headers = identity_headers(&t.headers, user, &t.name)?;
+    for (k, v) in resolved_headers(&headers, &mut notes, &t.url) {
         req = req.header(&k, v.as_bytes());
     }
     if let Some(n) = notes.first() {
@@ -3713,5 +3761,26 @@ mod tests {
         assert!(merged.contains("at most 4 of them"), "{merged}");
         assert!(merged.contains("within 2 minutes"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn user_slot_fills_or_fails_closed() {
+        let mut h = BTreeMap::new();
+        h.insert("x-api-key".to_string(), "$JOT_API_KEY".to_string());
+        h.insert("x-user".to_string(), "$user".to_string());
+        let out = identity_headers(&h, Some("0xabc"), "notes_list").unwrap();
+        assert_eq!(out["x-user"], "0xabc");
+        assert_eq!(out["x-api-key"], "$JOT_API_KEY", "secrets are the other pass's job");
+        let e = identity_headers(&h, None, "notes_list").unwrap_err();
+        assert!(e.contains("no signed-in caller") && e.contains("notes_list"), "{e}");
+        // a header that merely mentions the word is not the slot
+        let mut plain = BTreeMap::new();
+        plain.insert("x-note".to_string(), "for $user only".to_string());
+        assert_eq!(identity_headers(&plain, None, "t").unwrap()["x-note"], "for $user only");
     }
 }

@@ -4266,6 +4266,12 @@ fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 #[derive(Deserialize)]
 struct ChatReq {
     messages: Vec<ChatMsg>,
+    /// the account behind this request's credential (a verified sign-in
+    /// token or a derived API key), established from the HEADERS before the
+    /// body was read and handed to the tool registry as `$user`. Never part
+    /// of the body, so no client can claim an identity by writing one.
+    #[serde(skip)]
+    caller: Option<String>,
     #[serde(default)]
     model: Option<String>, // OpenAI field: a model name or volume from /models; absent (or unknown) = the largest
     #[serde(default)]
@@ -6089,6 +6095,8 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         // sets its own slots from the tree at open
         agent_slots: tc.map_or(0, |t| t.max_agents),
         agent_limit: tc.map_or(0, |t| t.max_agents),
+        // the probe answers for no one in particular
+        user: None,
     }
 }
 
@@ -6102,7 +6110,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
 /// reads them itself, and those entries are not offered.
 /// `off` is the request's off_groups(), computed once per turn by the caller
 /// (the registry is rebuilt per leg and the list must outlive every build).
-fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq, off: &'a [String]) -> tools::Builtins<'a> {
+fn builtins_for<'a>(cfg: &'a AppConfig, creq: &'a ChatReq, off: &'a [String]) -> tools::Builtins<'a> {
     let withheld = creq.web_mode(cfg.search_cfg().is_some_and(|sc| sc.default_on)) == WebMode::Off;
     let tc = cfg.tools.as_ref();
     tools::Builtins {
@@ -6115,6 +6123,7 @@ fn builtins_for<'a>(cfg: &'a AppConfig, creq: &ChatReq, off: &'a [String]) -> to
         turn_left_s: tc.map_or(0, |t| t.max_seconds),
         agent_slots: 0,
         agent_limit: tc.map_or(0, |t| t.max_agents),
+        user: creq.caller.as_deref(),
     }
 }
 
@@ -7909,6 +7918,26 @@ fn authorized(cfg: &AppConfig, req: &IncomingRequest) -> bool {
     cfg.api_key.is_none() && !cfg.sso.as_ref().map_or(false, |s| s.required)
 }
 
+/// The account behind a request's credential, when the credential names
+/// one: a sign-in token's `sub`, or the `sub` a derived API key was minted
+/// for. The deployment's static api_key names nobody. Read from the headers
+/// (so it must run before the body is consumed) and handed to the tool
+/// registry, where an http entry may ask for it as `$user`.
+fn caller_identity(cfg: &AppConfig, req: &IncomingRequest) -> Option<String> {
+    let tok = bearer_token(req)?;
+    if let Some(s) = &cfg.sso {
+        if let Ok(c) = sso::verify(s, &tok, (now_ms() / 1000) as u64) {
+            return Some(c.sub);
+        }
+    }
+    if let Some(seed) = cfg.key_seed() {
+        if let Ok(sub) = apikey::verify(seed, &tok) {
+            return Some(sub);
+        }
+    }
+    None
+}
+
 /// POST /v1/keys - hand a signed-in user their derived API key. The identity
 /// comes from a verified sign-in token, never from the request body: whoever
 /// can sign in as an account is exactly who may hold its key. Deterministic
@@ -8036,12 +8065,15 @@ fn handle_title(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutp
 
 fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutparam) {
     let t0 = now_ms();
+    // who is asking, from the headers, before the body is taken
+    let caller = config::from_value(raw.clone()).ok().and_then(|base| caller_identity(&base, &req));
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let mut creq = match parsed {
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
+    creq.caller = caller;
     let t1 = init_note("body", t0);
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
@@ -8493,12 +8525,15 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     if !authorized(&base, &req) {
         return json_err(out, 401, "missing or invalid API key");
     }
+    // who is asking, from the headers, before the body is taken
+    let caller = caller_identity(&base, &req);
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let mut creq = match parsed {
         Ok(c) => c,
         Err(e) => return json_err(out, 400, &e),
     };
+    creq.caller = caller;
     // A client-declared `tools` array is the PASSTHROUGH (see client_tools):
     // the model is offered the client's functions and its call goes back on
     // the reply as `tool_calls`, for the CLIENT to execute. The deployment's
