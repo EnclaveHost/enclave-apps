@@ -131,7 +131,7 @@
 
 <div class="card">
   <h2>For agents</h2>
-  <p>Every route is JSON with the key as <code>X-Api-Key</code> (the gateway consumes <code>Authorization</code>, so a bearer never reaches an app on enclave.host). <span id="usersnote" hidden>In per-user mode a request also names the user: <code>X-User</code> beside the key (what eyesoff-ai does, from the sign-in it verified), or <code>X-Sso-Token</code> carrying an Enclave sign-in token.</span> <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the same six verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
+  <p>Every route is JSON with the key as <code>X-Api-Key</code> (the gateway consumes <code>Authorization</code>, so a bearer never reaches an app on enclave.host). <span id="usersnote" hidden>In per-user mode a request also names the user: <code>X-User</code> beside the key (what eyesoff-ai does, from the sign-in it verified), or <code>X-Sso-Token</code> carrying an Enclave sign-in token.</span> <a href="/api/tools" target="_blank" rel="noreferrer">/api/tools</a> hands back the five agent verbs as OpenAI function schemas and as a ready <code>tools.http</code> block for an eyesoff-ai deployment.</p>
   <pre class="code" id="curl"></pre>
   <details><summary>eyesoff-ai config block (paste into that deployment's App Config; set JOT_API_KEY as its secret)</summary><pre class="code" id="eyesoff">…</pre></details>
 </div>
@@ -281,7 +281,7 @@ function curl() {
   const base = location.origin;
   const k = (status && status.auth ? "-H 'x-api-key: $JOT_API_KEY' " : "") + (status && status.users ? "-H 'x-user: 0x<the account>' " : "");
   $("#curl").innerHTML =
-    `<span class="c"># list, read, write, append, search, delete</span>\n` +
+    `<span class="c"># search, read, write, append, delete (and the UI's listing)</span>\n` +
     `curl -s ${k}${esc(base)}/api/notes\n` +
     `curl -s ${k}${esc(base)}/api/notes/projects/enclave.md\n` +
     `curl -s ${k}-X PUT -H 'content-type: application/json' -d '{"content":"# Enclave\\n\\nnotes…"}' ${esc(base)}/api/notes/projects/enclave.md\n` +
@@ -300,7 +300,7 @@ function renderList(items, mode) {
     ? `<div class="item" data-n="${esc(n.name)}"><span class="nm">${esc(n.name)}</span><span class="nz">line ${n.line}</span><span class="nv">${esc(n.text)}</span></div>`
     : `<div class="item ${n.name === current ? "active" : ""}" data-n="${esc(n.name)}"><span class="nm">${esc(n.name)}</span><span class="nz">${fmt(n.size)}</span><span class="nv">${esc(when(n.modified))}</span></div>`
   ).join("");
-  el.querySelectorAll(".item").forEach((it) => it.addEventListener("click", () => open(it.dataset.n)));
+  el.querySelectorAll(".item").forEach((it) => it.addEventListener("click", () => openNote(it.dataset.n)));
 }
 
 async function refresh() {
@@ -313,7 +313,9 @@ async function refresh() {
   } catch (e) { $("#err").textContent = e.message; }
 }
 
-async function open(name) {
+// named openNote, not open: a top-level `function open` in a classic script
+// REPLACES window.open, and the sign-in popup needs the real one
+async function openNote(name) {
   if (dirty && !confirm("Discard unsaved changes?")) return;
   try {
     const n = await api("GET", "/api/notes/" + name.split("/").map(encodeURIComponent).join("/"));
@@ -386,7 +388,7 @@ $("#signout").addEventListener("click", () => { ssoDrop(); current = null; dirty
 $("#key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#connect").click(); });
 $("#new").addEventListener("click", fresh);
 $("#save").addEventListener("click", save);
-$("#reload").addEventListener("click", () => { if (current) { dirty = false; open(current); } else fresh(); });
+$("#reload").addEventListener("click", () => { if (current) { dirty = false; openNote(current); } else fresh(); });
 $("#del").addEventListener("click", del);
 $("#q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
 $("#q").addEventListener("input", () => { if (!$("#q").value.trim()) renderList(notes); });
