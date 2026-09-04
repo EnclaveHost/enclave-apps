@@ -147,6 +147,22 @@ process reaches 5.4 GB resident, the snapshot (25.6 MB: 32k of 1.3M RAM
 pages non-zero) resumes in 0.79 s, and the file's size and two checksums
 are identical after the resume. docs/snapshot-handoff.md has the table.
 
+## The platform builds this now
+
+`wasm/Dockerfile.wasm64p2-build` in the enclave repo is the supported way to
+build a >4 GiB guest, for C and for Rust, and it is the same recipe as
+`wasm64/prepare-toolchain.sh` here plus compiler-rt builtins for wasm64 (a
+C link needs them; Rust brings its own). The scripts in this directory stay
+as the app's own development path — they are what the platform image was cut
+from — but a publisher who is not hacking on RISC Box should use the image:
+
+    docker run --rm -v "$PWD":/src --entrypoint enclave-wasm64-rust \
+      enclave-wasm64p2-build . -o risc-box64.wasm
+
+The older `Dockerfile.wasm64c-build`, which produced a portless
+wasm64-wasip1 core module, is gone: one >4 GiB class now, and it is a
+component.
+
 ## Reproducing the toolchain
 
 `wasm64/prepare-toolchain.sh` (or `docker build -f wasm64/Dockerfile .`)
