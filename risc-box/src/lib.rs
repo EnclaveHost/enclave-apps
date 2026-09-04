@@ -202,6 +202,15 @@ pub struct Config {
     // can't even finish X startup. Instances take theirs from the snapshot
     // they fork from.
     ram_mib: u64,
+    // `"ramMiB": "auto"`: size the guest to the deployment's whole memory
+    // slice instead of a number. Resolved once the images are in hand (the
+    // disk is the biggest thing sharing the address space), against the
+    // ceiling the platform hands the guest in ENCLAVE_MEM_MB. `ram_mib`
+    // above stays the fallback for a host that does not say.
+    ram_auto: bool,
+    // Was `instances.maxBytes` written down? An auto-sized machine derives
+    // the whole-box budget from the slice too, but an explicit number wins.
+    instances_max_bytes_set: bool,
     // Display size (`display: {width, height}`), default 1024x768. Must fit the
     // DTB's 8 MiB framebuffer window; the emulator applies the same guard to
     // the device tree, so app and guest cannot disagree.
@@ -349,6 +358,13 @@ fn load_config() -> Config {
             .and_then(|x| x.as_u64())
             .unwrap_or(512)
             .clamp(128, RAM_MIB_MAX),
+        // the string form, `"ramMiB": "auto"` (a number keeps its meaning)
+        ram_auto: v
+            .get("ramMiB")
+            .and_then(|x| x.as_str())
+            .map(|t| t.trim().eq_ignore_ascii_case("auto"))
+            .unwrap_or(false),
+        instances_max_bytes_set: inst.and_then(|i| i.get("maxBytes")).is_some(),
         fb_w: v
             .get("display")
             .and_then(|d| d.get("width"))
@@ -1244,6 +1260,47 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
 /// A fresh emulator configured the way every machine here is: RAM size,
 /// display geometry, clock source. What comes next — a kernel, a snapshot,
 /// or an image — is the caller's.
+/// What the platform will let this whole process address, in MiB, or None
+/// when it did not say (a local `wasmtime run`, or a fleet older than the
+/// hint). `-W max-memory-size` is enforced by the engine but invisible from
+/// inside: without this a guest can only find its ceiling by dying at it.
+fn slice_mib() -> Option<u64> {
+    std::env::var("ENCLAVE_MEM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+}
+
+/// Everything the box holds that is NOT guest RAM, plus room to work in.
+///
+/// The disk image dominates: it is held expanded and shared (640 MiB for the
+/// Alpine desktop), the kernel is tens of MiB, the framebuffer is
+/// width x height x 4. On top of those, `WORKING_RESERVE_MIB` covers what
+/// grows while the machine runs: each machine's overlay of written disk
+/// blocks, the video encoder, TLS and HTTP buffers, and the compressed
+/// snapshot a `/snapshot` builds in memory before it uploads.
+const WORKING_RESERVE_MIB: u64 = 512;
+
+fn auto_ram_mib(cfg: &Config, images: &Images) -> Option<u64> {
+    let ceiling = slice_mib()?;
+    let fixed = (images.kernel.len() + images.disk.len()) as u64 >> 20;
+    let fb = (cfg.fb_w * cfg.fb_h * 4) >> 20;
+    let overhead = fixed + fb + WORKING_RESERVE_MIB;
+    // saturating: a slice smaller than the overhead lands on the floor
+    // rather than wrapping into a giant guest
+    let ram = ceiling.saturating_sub(overhead).clamp(128, RAM_MIB_MAX);
+    eprintln!(
+        "[risc-box] ramMiB auto: slice {} MiB - (images {} + framebuffer {} + working {}) = {} MiB guest RAM",
+        ceiling, fixed, fb, WORKING_RESERVE_MIB, ram
+    );
+    if ceiling < overhead + 128 {
+        eprintln!(
+            "[risc-box]   the slice barely covers this app's own footprint; buy more cpuShare or use a smaller disk image"
+        );
+    }
+    Some(ram)
+}
+
 fn new_emulator(cfg: &Config, ram_mib: u64) -> Emulator {
     let mut emu = Emulator::new(new_terminal());
     // before setup_program: that's where the RAM is sized and the DTB memory
@@ -2505,6 +2562,31 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
                     None => app.cfg.config_creds.as_ref().map(clone_creds),
                 };
                 app.cache = Some(imgs);
+                // `"ramMiB": "auto"`: now that the images are in hand (the
+                // disk is the biggest thing sharing this address space with
+                // the guest), size the machine to what is left of the slice.
+                // Re-resolved on every fetch: a new disk image changes the
+                // arithmetic, and a machine only reads this at boot.
+                if app.cfg.ram_auto {
+                    if let Some(ram) = auto_ram_mib(&app.cfg, app.cache.as_ref().unwrap()) {
+                        app.cfg.ram_mib = ram;
+                        // the whole-box budget follows the same ceiling unless
+                        // the config named one: an auto-sized main machine
+                        // plus forks must not outrun the slice, and the app
+                        // refusing a fork beats the engine killing the process
+                        if !app.cfg.instances_max_bytes_set {
+                            if let Some(ceiling) = slice_mib() {
+                                app.cfg.instances_max_bytes =
+                                    (ceiling.saturating_sub(WORKING_RESERVE_MIB / 2)) << 20;
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "[risc-box] ramMiB auto: no ENCLAVE_MEM_MB from the host; keeping {} MiB",
+                            app.cfg.ram_mib
+                        );
+                    }
+                }
                 // fresh objects: every resident image was inflated from the
                 // old ones (instances already forked keep theirs alive)
                 app.root_images.clear();

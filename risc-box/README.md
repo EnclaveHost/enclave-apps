@@ -133,6 +133,17 @@ JSON object:
 - `saveKey` is where **Save disk** PUTs the guest-modified image (defaults to
   `fs`; set it aside to keep the pristine image). `readOnly: true` disables
   saving (and snapshotting).
+- `ramMiB` is the guest's RAM, default 512. Write **`"ramMiB": "auto"`** and
+  the box sizes the machine to the deployment itself: the platform tells a
+  guest its memory ceiling (`ENCLAVE_MEM_MB`, the `-W max-memory-size` the
+  engine enforces), and the app gives the guest what is left of it after the
+  expanded disk image, the framebuffer and 512 MiB of working room — the
+  overlay of written disk blocks, the video encoder, and the compressed
+  snapshot a `/snapshot` builds in memory before uploading. Resize the
+  deployment's cpuShare and the guest follows on the next start, with no
+  config edit. The arithmetic is logged at boot. On a host that does not
+  report a ceiling (a local `wasmtime run`), `auto` keeps the numeric
+  default. A number still means exactly that number.
 - `instances` — `{"max": 8, "maxBytes": 3221225472}` bounds how many machines
   this process hosts (`main` included) and the host memory they may add up to;
   see *Many machines, one process*.
@@ -449,7 +460,8 @@ A wasm32 component addresses 4 GiB of linear memory, and everything a box
 holds lives there: the guest's RAM, the disk image, the framebuffer, the
 fork roots. That caps a guest at roughly 1.9 GiB of RAM and a box at about
 3 GiB of instances. `wasm64/build.sh` produces `risc-box64.wasm`, the same
-app as a memory64 component: `ramMiB` may go to 65536, `instances.maxBytes`
+app as a memory64 component: `ramMiB` may go to 65536 (or `"auto"`),
+`instances.maxBytes`
 defaults to 32 GiB, and the platform's memory ceiling for a memory64
 component is the deployment's whole RAM slice.
 

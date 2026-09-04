@@ -81,7 +81,9 @@ def main():
     ap.add_argument("--mkbucket", action="store_true")
     ap.add_argument("--minio", action="store_true", help="start a local minio on :9100 if needed")
     ap.add_argument("--snapshot-key", default="images/sample.snap")
-    ap.add_argument("--ram", type=int, default=256)
+    ap.add_argument("--ram", default=256,
+                    help='guest RAM in MiB, or "auto" to size it from the slice the host reports '
+                         '(with --mem64 the harness passes ENCLAVE_MEM_MB just as the runner does)')
     ap.add_argument("--fb", default="1024x768")
     ap.add_argument("--realtime", action="store_true")
     ap.add_argument("--ready-marker", default="activate this console")
@@ -128,14 +130,22 @@ def main():
         s3("DELETE", args.endpoint, f"/{args.bucket}/{args.snapshot_key}", b"", args.ak, args.sk, args.region)
 
     w, h = args.fb.split("x")
+    ram = "auto" if str(args.ram).strip().lower() == "auto" else int(args.ram)
     cfg = {"title": "snaptest", "endpoint": args.endpoint, "region": args.region, "bucket": args.bucket,
-           "kernel": args.kernel, "fs": args.fs, "ramMiB": args.ram, "display": {"width": int(w), "height": int(h)},
+           "kernel": args.kernel, "fs": args.fs, "ramMiB": ram, "display": {"width": int(w), "height": int(h)},
            "realtime": args.realtime, "snapshot": args.snapshot_key,
            "restoreExec": "date -s @{epoch} >/dev/null; echo {entropy} > /dev/urandom; echo RESTORE-HOOK-OK",
            "instances": {"max": args.instances_max},
            "credentials": {"accessKeyId": args.ak, "secretAccessKey": args.sk}}
-    mem_args = ["-W", "memory64,component-model-memory64", "-W", f"max-memory-size={args.max_mem_gib << 30}"] if args.mem64 else []
-    cmd = [args.wasmtime, "run", "-Snn", "-Stcp", "-Sinherit-network", "-Sallow-ip-name-lookup", *mem_args, *args.engine_flags.split(),
+    mem_args, mem_env = [], []
+    if args.mem64:
+        mem_args = ["-W", "memory64,component-model-memory64",
+                    "-W", f"max-memory-size={args.max_mem_gib << 30}"]
+        # the runner hands every guest its ceiling; mirror that here or an
+        # auto-sized app has nothing to size itself from
+        mem_env = ["--env", f"ENCLAVE_MEM_MB={args.max_mem_gib * 1024}"]
+    cmd = [args.wasmtime, "run", "-Snn", "-Stcp", "-Sinherit-network", "-Sallow-ip-name-lookup",
+           *mem_args, *mem_env, *args.engine_flags.split(),
            "--env", f"ENCLAVE_PORTS=http:8000={args.port}", "--env", f"RISCBOX_CONFIG={json.dumps(cfg)}", args.wasm]
     logf = open(args.log, "ab")
     proc = None
