@@ -1,258 +1,42 @@
 {
-  "_comment": "Publish-console 'App config' template for api-mcp-adapter (deployment defaults, becomes ENCLAVE_CONFIG via configCid; locally MCP_ADAPTER_CONFIG). This app turns the endpoints listed in 'http' into ONE MCP server at POST /mcp, and every tools/call is one templated request the enclave makes with its own secrets. A caller chooses ARGUMENTS, never a URL and never a header: the adapter is the config's endpoints and nothing else, which is what keeps it from being an open fetcher running with this deployment's egress identity. Replace the 'http' array with your own; everything below is a worked example against the sibling apps (an image generator, a risc-box machine, a jot notebook), written in the EXACT shape an eyesoff-ai 'tools.http' entry takes - because that is the point: a block lifted out of a chat deployment's config pastes here unchanged, and the chat deployment then carries one 'mcp' entry instead. GET /api/tools (with the key) hands you that entry, ready to paste, including the 'groups' map that keeps the same settings switches.",
-  "_auth_comment": "api_key: the key clients present as 'X-Api-Key: <key>' (on enclave.host the app gateway consumes 'Authorization', so a bearer never arrives here; off-platform it works). Reference a SECRET, never a literal - this file goes on-chain by CID. If the named secret is not set the deployment LOCKS: every route answers 503 saying so, rather than quietly serving your tools to anyone who finds the URL. Omit api_key entirely only for a deployment whose tools you would let the whole internet call.",
-  "_sso_comment": "sso (OPTIONAL): lets a client name the caller with a sign-in token this app verifies itself, instead of the API key plus X-User. 'signer' is the platform SSO signer address (published at https://enclave.host/.well-known/sso-signer.json), 'audience' THIS deployment's id, 'accept' the ids of the eyesoff-ai deployments whose tokens are also good here. A TOKEN NAMES A CALLER; IT DOES NOT OPEN THE KEY GATE: a deployment with an api_key still requires it, and 'accept' says whose identities mean something here, not who may call. The eyesoff-ai wiring does NOT need this block - it names the user with the key and X-User - so add it only when you want the identity verified in-app rather than asserted by the service.",
-  "_user_comment": "PER-USER TOOLS: an entry whose header value is the whole string \"$user\" acts for a named account. It is never reached nameless - absent from tools/list and refused by tools/call - so a model is never shown a tool it cannot use. Two ways a request names someone, both alongside the key: 'X-User: <0x wallet or acct_ id>' (a SERVICE asserting it; eyesoff-ai fills this from the sign-in it verified for the turn, never from the model), or 'X-Sso-Token: EST1…' with an sso block above. $user IS A HEADER VALUE AND NOTHING ELSE. Mixed into a larger header value, placed in the url, or referenced from a body template, it is REFUSED - because a body template is filled from the CALLER'S ARGUMENTS, so \"$user\" there would carry an identity the caller chose while wearing the name of one the enclave verified.",
-  "_secrets_comment": "SECRETS: '$NAME' anywhere in a url or a header value is replaced by the deployment secret of that name (console or set_secrets, then restart). A reference nothing resolves is REFUSED BY NAME - the call is not made and the error says which secret is missing - rather than posting the literal 'Bearer $TOOL_KEY' and earning a baffling 401. '$5' and a bare '$' are text, not references.",
-  "_entry_comment": "ENTRY FIELDS, executed here: url (absolute; '{arg}' placeholders substituted percent-encoded - NEVER in the host, which is refused outright so no caller can move the call to another server - and whatever the URL did not consume becomes the query string on a GET/DELETE or the JSON body otherwise); method (GET default, POST/PUT/PATCH/DELETE); headers; body (a JSON template whose whole-string '$arg' values are filled from the arguments, with an unfilled DECLARED hole dropped rather than sent as the literal - which is how an optional argument costs the caller nothing to skip; the reserved '$images'/'$image' take the pictures the caller attached, as an array of data URIs or the first one); query (send leftovers as a query string even on a POST - note that arguments the schema does not declare ride along too, exactly as in eyesoff-ai, so a fixed query parameter in the url can be shadowed by one a caller sends; put what must not move in the path or the body); timeout_s and max_bytes (per call; an entry whose result is an image defaults to a 12 MB cap, because a picture arrives as megabytes of base64); result ({\"image\": \"<dot path>\"} returns MCP image content - the picture reaches the client, never the prompt - and {\"text\": \"<dot path>\"} extracts one field so a model is spared the envelope, falling back to the whole body when the path misses); sources ({\"list\", \"title\", \"url\"} dot paths, whose rows become structuredContent.sources, which is how a numbered citation list survives the trip). CARRIED THROUGH, not executed here: group, max_chars, format, route, route_arg - they need a model or a conversation, so they ride the tool's '_meta' under the key 'enclave.host/tool' and the client applies them. That is what makes a moved entry behave identically: eyesoff-ai reads that key and truncates, formats and switches the tool exactly as it did when the entry was its own.",
-  "_groups_comment": "GROUPS are the switches a person sees: one per tool as they think of it, not one per endpoint. An entry's own 'group' wins; absent, an entry that makes or takes pictures belongs to 'images', then a family name shared with a sibling ('notes_read' + 'notes_write' -> 'notes'), else the function name. The same rule eyesoff-ai uses, so the switches do not move when a block is lifted across. GET /api/tools reports the resulting map.",
-  "_reach_comment": "REACHABILITY: this deployment's outbound egress is IPv6-ONLY, so an endpoint whose host publishes no AAAA record cannot be dialled at all (check with `dig AAAA <host>`); every Enclave app URL has one. A refused connection says exactly this in the tool's error rather than leaving an operator hunting for a bad key. VERIFY A LIVE DEPLOYMENT: GET /api/tools lists what a client would be offered plus any 'notes' (a dropped duplicate, an invalid name, an entry that did not parse), and GET /api/tools?call=<name>&args=<json> runs ONE tool - which separates 'can the adapter see it' from 'does the endpoint work'. The page at / wraps both.",
-  "title": "eyesoff tools",
-  "api_key": "$MCP_ADAPTER_API_KEY",
-  "timeout_s": 20,
-  "max_bytes": 262144,
-  "http": [
-    {
-      "name": "generate_image",
-      "description": "Generate an image from a text prompt. It is shown to the user directly; you never see it, so acknowledge it briefly. Pick a size whose shape fits the request: wide for landscapes and banners, tall for portraits and posters, square when nothing argues otherwise.",
-      "group": "images",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "prompt": {
-            "type": "string"
-          },
-          "size": {
-            "type": "string",
-            "enum": [
-              "1024x1024",
-              "1024x768",
-              "768x1024",
-              "960x640",
-              "640x960",
-              "1024x576",
-              "576x1024"
-            ],
-            "description": "WxH pixels; omit for square"
-          }
-        },
-        "required": [
-          "prompt"
-        ]
-      },
-      "url": "${IMAGE_ENDPOINT}/v1/images/generations",
-      "method": "POST",
-      "headers": {
-        "authorization": "Bearer $IMAGE_API_KEY"
-      },
-      "body": {
-        "prompt": "$prompt",
-        "n": 1,
-        "size": "$size"
-      },
-      "timeout_s": 180,
-      "result": {
-        "image": "data.0.b64_json"
-      }
-    },
-    {
-      "name": "upscale_image",
-      "description": "Upscale the most recent image in the conversation to a higher resolution (Real-ESRGAN), whether the user attached it or you generated it. factor 4 quadruples each side (the default), 2 doubles it, 1 cleans the image up at the same size. Call it when the user asks to upscale, enlarge, enhance or sharpen a picture.",
-      "group": "images",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "factor": {
-            "type": "integer",
-            "enum": [
-              1,
-              2,
-              4
-            ]
-          }
-        }
-      },
-      "url": "${IMAGE_ENDPOINT}/v1/images/upscale",
-      "method": "POST",
-      "body": {
-        "image": "$image",
-        "factor": "$factor"
-      },
-      "timeout_s": 120,
-      "max_bytes": 67108864,
-      "result": {
-        "image": "data.0.b64_json"
-      }
-    },
-    {
-      "name": "run_vm_command",
-      "description": "Run a shell command on the Alpine Linux virtual machine you control and get back its stdout and exit code as JSON ({\"ok\":true,\"exitCode\":0,\"output\":\"...\"}). Use it to inspect and operate the machine: list and read files, tail logs, install packages with apk, edit files, run programs and scripts. Runs one independent command per call as root; each call is a fresh shell, so persist state on the machine in files rather than shell variables, and chain steps that must share state in one command (for example: cd /var/log && tail -n 50 messages). Keep output small with head, tail, or grep. Read the exitCode and output before deciding the next command.",
-      "group": "virtual_machine",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "cmd": {
-            "type": "string",
-            "description": "the shell command to run"
-          }
-        },
-        "required": [
-          "cmd"
-        ]
-      },
-      "url": "${RISCBOX_ENDPOINT}/exec",
-      "method": "POST",
-      "headers": {
-        "x-api-key": "$RISCBOX_API_KEY"
-      },
-      "body": {
-        "cmd": "$cmd",
-        "timeout_s": 60
-      },
-      "timeout_s": 70
-    },
-    {
-      "name": "notes_search",
-      "description": "Search the notebook by meaning and by keyword (hybrid: vector similarity plus BM25, fused). Returns the best-matching passage of each relevant note with its name and line; read the note for the rest. Call this first when the user refers to earlier work, a preference, a project, or asks what you remember.",
-      "group": "notebook",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "q": {
-            "type": "string",
-            "description": "what to look for, as a question or a few words"
-          },
-          "prefix": {
-            "type": "string",
-            "description": "only names starting with this, e.g. 'projects/'"
-          }
-        },
-        "required": [
-          "q"
-        ]
-      },
-      "url": "${JOT_ENDPOINT}/api/search",
-      "headers": {
-        "x-api-key": "$JOT_API_KEY",
-        "x-user": "$user"
-      },
-      "timeout_s": 20,
-      "max_chars": 24000
-    },
+  "_comment": "api-mcp-adapter App Config. This app serves the endpoints listed in 'http' as ONE MCP server at POST /mcp, and every tools/call is a templated request the enclave makes with its own secrets. There are no tools by default: add an 'http' array (or rename '_example_http' below) and redeploy. An eyesoff-ai 'tools.http' block pastes in unchanged, which is the point; scripts/from-eyesoff-config.py does the split for you. Full field reference: the app's README.",
+  "_auth_comment": "api_key is the key clients send as 'X-Api-Key: <key>' (the enclave.host gateway consumes 'Authorization', so a bearer never arrives). Reference a SECRET, never a literal: this file is public on-chain by CID. If the secret is not set the deployment LOCKS and says so, rather than serving your tools to whoever finds the URL.",
+  "_entry_comment": "Each entry: name, description and JSON-Schema 'parameters' are what a model sees; 'url' is absolute and may carry {arg} placeholders (never in the host, which is refused, so a caller can never move the call to another server); 'method', 'headers' and a 'body' template whose whole-string \"$arg\" values are filled from the arguments. '$NAME' in a url or header is a deployment secret. A header whose whole value is \"$user\" carries the signed-in account, and that tool is hidden and refused unless the request names one. 'result' pulls the answer out: {\"text\": \"<dot path>\"} for a field, {\"image\": \"<dot path>\"} to return a picture. 'sources' ({\"list\",\"title\",\"url\"}) becomes citations. 'group', 'max_chars' and 'format' are passed to the client, which applies them.",
+  "_example_http": [
     {
       "name": "notes_read",
       "description": "Read one note's full text by name.",
       "group": "notebook",
       "parameters": {
         "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "the note's name: a relative path of letters, digits, - _ . and slashes, e.g. projects/enclave.md"
-          }
-        },
-        "required": [
-          "name"
-        ]
+        "properties": { "name": { "type": "string", "description": "e.g. projects/enclave.md" } },
+        "required": ["name"]
       },
       "url": "${JOT_ENDPOINT}/api/notes/{name}",
-      "headers": {
-        "x-api-key": "$JOT_API_KEY",
-        "x-user": "$user"
-      },
-      "timeout_s": 20,
-      "max_chars": 24000,
-      "result": {
-        "text": "content"
-      }
+      "headers": { "x-api-key": "$JOT_API_KEY", "x-user": "$user" },
+      "result": { "text": "content" }
     },
     {
-      "name": "notes_write",
-      "description": "Create or replace a note. Use notes_append to add to an existing note without rewriting it.",
-      "group": "notebook",
+      "name": "generate_image",
+      "description": "Generate an image from a text prompt. It is shown to the user directly; you never see it, so acknowledge it briefly.",
+      "group": "images",
       "parameters": {
         "type": "object",
         "properties": {
-          "name": {
-            "type": "string",
-            "description": "the note's name, e.g. projects/enclave.md"
-          },
-          "content": {
-            "type": "string",
-            "description": "the note's full text (markdown is a good default)"
-          }
+          "prompt": { "type": "string" },
+          "size": { "type": "string", "enum": ["1024x1024", "1024x768", "768x1024"], "description": "WxH pixels; omit for square" }
         },
-        "required": [
-          "name",
-          "content"
-        ]
+        "required": ["prompt"]
       },
-      "url": "${JOT_ENDPOINT}/api/notes/{name}",
-      "method": "PUT",
-      "headers": {
-        "x-api-key": "$JOT_API_KEY",
-        "x-user": "$user"
-      },
-      "body": {
-        "content": "$content"
-      },
-      "timeout_s": 20
-    },
-    {
-      "name": "notes_append",
-      "description": "Append a paragraph to a note, creating it if needed. The right verb for logging something you learned.",
-      "group": "notebook",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "the note's name, e.g. projects/enclave.md"
-          },
-          "content": {
-            "type": "string",
-            "description": "the paragraph to add"
-          }
-        },
-        "required": [
-          "name",
-          "content"
-        ]
-      },
-      "url": "${JOT_ENDPOINT}/api/notes/{name}/append",
+      "url": "${IMAGE_ENDPOINT}/v1/images/generations",
       "method": "POST",
-      "headers": {
-        "x-api-key": "$JOT_API_KEY",
-        "x-user": "$user"
-      },
-      "body": {
-        "content": "$content"
-      },
-      "timeout_s": 20
-    },
-    {
-      "name": "notes_delete",
-      "description": "Delete a note by name.",
-      "group": "notebook",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "the note's name"
-          }
-        },
-        "required": [
-          "name"
-        ]
-      },
-      "url": "${JOT_ENDPOINT}/api/notes/{name}",
-      "method": "DELETE",
-      "headers": {
-        "x-api-key": "$JOT_API_KEY",
-        "x-user": "$user"
-      },
-      "timeout_s": 20
+      "headers": { "authorization": "Bearer $IMAGE_API_KEY" },
+      "body": { "prompt": "$prompt", "n": 1, "size": "$size" },
+      "timeout_s": 180,
+      "result": { "image": "data.0.b64_json" }
     }
-  ]
+  ],
+  "api_key": "$MCP_ADAPTER_API_KEY",
+  "timeout_s": 20,
+  "max_bytes": 262144
 }
