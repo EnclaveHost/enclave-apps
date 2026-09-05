@@ -580,14 +580,12 @@ impl AotSlot {
 #[cfg(feature = "aot")]
 #[derive(Clone)]
 pub struct AotVerify {
-	/// code generation the full content check last passed under (0 = never)
+	/// code generation of the last full content check (0 = never)
 	content_gen: u32,
 	/// address-space generation the mapping check last passed under
 	tlb_gen: u32,
-	/// the phys page of each member block, in AOT_MEMBERS order, as content-verified
+	/// pages visited by the content check; a proof only when `ok` is true
 	phys: Vec<u64>,
-	/// every member vpc is kernel-half: the mapping is global, skip tlb_gen re-probes
-	kernel_only: bool,
 	ok: bool,
 }
 
@@ -597,7 +595,6 @@ impl AotVerify {
 		content_gen: 0,
 		tlb_gen: 0,
 		phys: Vec::new(),
-		kernel_only: false,
 		ok: false,
 	};
 }
@@ -1085,15 +1082,14 @@ impl Cpu {
 	///   proven once per code_gen; the check exec-marks every member page,
 	///   so any later write bumps code_gen and re-proves.
 	/// - mapping (member vpcs still hit those phys pages) is re-probed once
-	///   per tlb_gen — and not at all for kernel-half regions, whose
-	///   mapping is global across every address space.
+	///   per tlb_gen, including kernel mappings which a guest may replace.
 	#[cfg(feature = "aot")]
 	#[inline(always)]
 	fn aot_verified(&mut self, handle: u32) -> bool {
 		let tg = self.mmu.tlb_gen();
 		let cg = self.mmu.code_gen();
 		let v = &self.aot_vstate[handle as usize];
-		if v.content_gen == cg && (v.kernel_only || v.tlb_gen == tg) {
+		if v.content_gen == cg && v.tlb_gen == tg {
 			return v.ok;
 		}
 		self.aot_verify_slow(handle, tg, cg)
@@ -1101,18 +1097,17 @@ impl Cpu {
 
 	#[cfg(feature = "aot")]
 	fn aot_verify_slow(&mut self, handle: u32, tg: u32, cg: u32) -> bool {
-		let need_content = self.aot_vstate[handle as usize].content_gen != cg;
-		let ok = match need_content {
-			true => self.aot_verify_content(handle),
-			false => {
-				let ok = self.aot_verify_mapping(handle);
-				let v = &mut self.aot_vstate[handle as usize];
-				v.tlb_gen = tg;
-				v.ok = ok;
-				ok
-			}
-		};
-		ok
+		let v = &self.aot_vstate[handle as usize];
+		// Mapping equality only preserves a SUCCESSFUL content proof. A
+		// failed check can still have recorded every physical page, so it
+		// must never become valid merely because those pages did not move.
+		// A changed mapping needs a fresh instruction check too: it may now
+		// point to either matching code or a different program.
+		if v.content_gen == cg && v.ok && self.aot_verify_mapping(handle) {
+			self.aot_vstate[handle as usize].tlb_gen = tg;
+			return true;
+		}
+		self.aot_verify_content(handle)
 	}
 
 	/// Full content check: every member's pc translates and the code there
@@ -1126,12 +1121,8 @@ impl Cpu {
 		let cg = self.mmu.code_gen();
 		let members = AOT_MEMBERS[handle as usize];
 		let mut phys = Vec::with_capacity(members.len());
-		let mut kernel_only = true;
 		let mut ok = true;
 		'members: for &(start, words) in members {
-			if start < 0xffff_ffc0_0000_0000 {
-				kernel_only = false;
-			}
 			let p_start = match self.mmu.translate_fetch_probe(start) {
 				Ok(p) => p,
 				Err(_) => {
@@ -1161,7 +1152,7 @@ impl Cpu {
 		}
 		let tg = self.mmu.tlb_gen();
 		self.aot_vstate[handle as usize] =
-			AotVerify { content_gen: cg, tlb_gen: tg, phys, kernel_only, ok };
+			AotVerify { content_gen: cg, tlb_gen: tg, phys, ok };
 		ok
 	}
 
@@ -1171,7 +1162,7 @@ impl Cpu {
 	#[cfg(feature = "aot")]
 	fn aot_verify_mapping(&mut self, handle: u32) -> bool {
 		let members = AOT_MEMBERS[handle as usize];
-		let expect: Vec<u64> = self.aot_vstate[handle as usize].phys.clone();
+		let expect = &self.aot_vstate[handle as usize].phys;
 		if expect.len() != members.len() {
 			return false;
 		}
