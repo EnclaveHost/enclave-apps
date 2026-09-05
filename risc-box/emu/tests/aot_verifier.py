@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='rbx-aot-verifier-') as scratch:
         'REGION 2 1\nB ffffffc000000000 1\nO 1 1048723 0 7 1 0 0 4\n'
     )
     cpu = crate / 'src/cpu.rs'
-    cpu.write_text(cpu.read_text() + '\n' + (source / 'tests/aot_verifier_probe.rs').read_text())
+    cpu.write_text(cpu.read_text() + '\n' + (source / 'tests/fixtures/aot_verifier_probe.rs').read_text())
     (crate / 'examples/aot-verifier-regression.rs').write_text(
         'extern crate riscv_emu_rust; fn main() { '
         'riscv_emu_rust::cpu::aot_verifier_regression_probe(); }\n'
