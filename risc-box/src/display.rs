@@ -214,6 +214,17 @@ impl Display {
         bands
     }
 
+    /// A completed layer covering the whole output cannot change until its
+    /// next publication. Partial overlays still need desktop damage scans.
+    pub fn completed_frame_id(emu: &Emulator) -> Option<u64> {
+        let (x, y, w, h, _) = emu.overlay_frame()?;
+        if x != 0 || y != 0 || w as usize != fb_w() || h as usize != fb_h()
+            || emu.gpu_mode().map_or(false, |mode| mode != (w, h)) {
+            return None;
+        }
+        emu.overlay_frame_id()
+    }
+
     /// The half of a scan that needs the emulator: copy the framebuffer out of
     /// guest RAM. This is a memcpy and nothing else, which is the point — it
     /// is the only part that cannot leave the emulator's thread, so it is kept
@@ -701,6 +712,10 @@ mod tests {
             mmu.store_raw(0x10007004, 1);
         };
         publish(&mut emu, [0, 0, 960, 600]);
+        let first_id = Display::completed_frame_id(&emu).unwrap();
+        set_size(1280, 800);
+        assert_eq!(Display::completed_frame_id(&emu), None);
+        set_size(960, 600);
         let mut pixels = vec![77; fb_bytes()];
         Display::composite_overlay(&emu, &mut pixels);
         assert_eq!(pixels[0], 11);
@@ -713,15 +728,18 @@ mod tests {
         // readers and lease renewals must keep the last complete one.
         emu.get_mut_cpu().get_mut_mmu().store_raw(FB_BASE, 99);
         emu.get_mut_cpu().get_mut_mmu().store_raw(0x10007004, 2);
+        assert_eq!(Display::completed_frame_id(&emu), Some(first_id));
         Display::capture(&emu, &mut captured);
         assert_eq!(captured[0], 11);
         emu.get_mut_cpu().get_mut_mmu().store_raw(0x10007004, 1);
+        assert_ne!(Display::completed_frame_id(&emu), Some(first_id));
         Display::capture(&emu, &mut captured);
         assert_eq!(captured[0], 99);
 
         // Guest-controlled extents clip at the actual screen without integer
         // overflow or writes into the underlying desktop outside the layer.
         publish(&mut emu, [959, 599, u32::MAX, u32::MAX]);
+        assert_eq!(Display::completed_frame_id(&emu), None);
         pixels.fill(77);
         Display::composite_overlay(&emu, &mut pixels);
         assert!(pixels[..last].iter().all(|b| *b == 77));
@@ -731,6 +749,7 @@ mod tests {
         Display::composite_overlay(&emu, &mut pixels);
         assert!(pixels.iter().all(|b| *b == 77));
         assert_eq!(emu.overlay_state(), State::Hidden);
+        assert_eq!(Display::completed_frame_id(&emu), None);
         assert_eq!(Emulator::new(Box::new(DummyTerminal::new())).overlay_state(), State::Legacy);
     }
 

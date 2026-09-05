@@ -505,6 +505,10 @@ impl Emulator {
 		self.cpu.get_mmu().overlay_frame()
 	}
 
+	pub fn overlay_frame_id(&self) -> Option<u64> {
+		self.cpu.get_mmu().overlay_frame_id()
+	}
+
 	/// risc-box patch: fill `out` with the current display contents, whichever
 	/// device is driving it.
 	///

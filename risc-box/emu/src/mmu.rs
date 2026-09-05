@@ -324,6 +324,10 @@ impl Mmu {
 		self.overlay.frame()
 	}
 
+	pub fn overlay_frame_id(&self) -> Option<u64> {
+		self.overlay.frame_id()
+	}
+
 	// A frame copy must not be inlined into the CPU's ordinary store path.
 	#[cold]
 	#[inline(never)]

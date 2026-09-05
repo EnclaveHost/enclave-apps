@@ -905,6 +905,7 @@ struct App {
     /// Set once so a failed bind is not retried every turn.
     gs_tried: bool,
     fb_scanned: Option<Instant>, // last display scan (paced by its own cost)
+    fb_overlay_frame: Option<u64>, // completed fullscreen frame last submitted
     fb_cost: Duration,           // smoothed cost of one display scan
     fb_still: u32,               // consecutive scans that found nothing
     // The /video stream's encoder (stateful, inter-frame) plus the packed
@@ -2821,6 +2822,7 @@ pub fn run() {
         gs: None,
         gs_tried: false,
         fb_scanned: None,
+        fb_overlay_frame: None,
         fb_cost: Duration::from_millis(0),
         fb_still: 0,
         venc: None,
@@ -3146,12 +3148,17 @@ pub fn run() {
                             app.fb_cost, scan_still, snap),
                     };
                     let due = app.fb_scanned.map_or(true, |t| t.elapsed() >= interval);
+                    let overlay_frame = Display::completed_frame_id(emu);
+                    let unchanged = overlay_frame.is_some()
+                        && overlay_frame == app.fb_overlay_frame
+                        && !worker::needs_frame();
                     // Two jobs in flight, not one: the worker's encode
                     // otherwise serializes with the capture handoff and the
                     // whole pipeline runs at encode+turnaround instead of
                     // max(encode, capture). Depth 2 keeps the worker saturated
                     // and costs at most one frame of staleness (~16 ms).
-                    if (watching_display || watching_video) && due && worker::inflight() < 2 {
+                    if (watching_display || watching_video) && due && worker::inflight() < 2
+                        && (watching_video || !unchanged) {
                         let began = Instant::now();
                         let mut buf = worker::take_buffer();
                         let damage = Display::capture_damage(emu, &mut buf);
@@ -3161,6 +3168,7 @@ pub fn run() {
                             want_video: watching_video,
                             damage,
                         });
+                        app.fb_overlay_frame = overlay_frame;
                         // The capture is the whole of what the guest now pays.
                         app.fb_cost = (app.fb_cost + began.elapsed()) / 2;
                         app.fb_scanned = Some(Instant::now());

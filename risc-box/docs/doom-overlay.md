@@ -29,6 +29,14 @@ every renewal, repaints fully when switching destinations, and hides the layer
 on visibility changes, movement, and orderly exit. An abrupt process exit is
 covered by the lease.
 
+Each captured image has an identity shared across all emulator instances.
+For a fully covered screen, the SET band-stream worker receives a new job only
+when that identity changes or a viewer requests a refresh. Static renewals
+retain the identity. This avoids copying and hashing duplicate images, and
+prevents those duplicate scans from triggering the still-screen backoff while
+the game is moving. Partial overlays and expired leases continue scanning the
+desktop normally. Video encoders retain their configured capture cadence.
+
 Hosts without the signature retain the previous overlay behavior. Those hosts
 cannot reliably composite fullscreen overlays; leave `-overlay` off there.
 
@@ -39,5 +47,7 @@ copy itself taking less than 0.1 ms in the measured wasm64 SET workload.
 Validation includes the display unit test for fullscreen edges, clipping,
 hidden layers, and preservation of completed pixels while the next frame is
 painted. The mailbox test checks publication, lease expiry, and renewal.
+Integration checks include a new viewer receiving a complete frozen frame,
+lease expiry revealing the underlying display, and resumed game presentation.
 Live performance should be judged by Doom's dynamic frame reports and distinct
 stream frames, with sound/music enabled, rather than the encoder's 60 FPS rate.

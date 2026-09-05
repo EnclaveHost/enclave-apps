@@ -246,6 +246,13 @@ pub fn reset() {
     pipe().reset.store(true, Ordering::Release);
 }
 
+/// Even an unchanged completed frame must reach a new viewer or re-prime
+/// the worker after a reset. The worker consumes these requests with a job.
+pub fn needs_frame() -> bool {
+    let p = pipe();
+    p.force_full.load(Ordering::Acquire) || p.reset.load(Ordering::Acquire)
+}
+
 /// The worker's own loop. Owns the diff state and the encoder, because both
 /// are per-stream state that only it touches. Runs for the life of the
 /// component: there is no stop path because there is nothing to stop for — a

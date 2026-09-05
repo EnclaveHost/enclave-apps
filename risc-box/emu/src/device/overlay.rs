@@ -7,9 +7,13 @@
 //! This is transient presentation state: a restored guest republishes it.
 
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const BASE: u64 = 0x10007000;
 const LEASE: Duration = Duration::from_secs(2);
+// Shared across emulator instances so a viewer switching machines cannot
+// confuse two machines' first completed frames.
+static NEXT_FRAME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -24,12 +28,13 @@ pub struct Overlay {
     renewed: Option<Instant>,
     pixels: Vec<u8>,
     pixels_rect: (u32, u32, u32, u32),
+    frame_id: u64,
 }
 
 impl Overlay {
     pub fn new() -> Self {
         Self { pending: [0; 16], state: State::Legacy, renewed: None,
-            pixels: Vec::new(), pixels_rect: (0, 0, 0, 0) }
+            pixels: Vec::new(), pixels_rect: (0, 0, 0, 0), frame_id: 0 }
     }
 
     pub fn load(&self, address: u64) -> u8 {
@@ -92,6 +97,13 @@ impl Overlay {
             }
         }
         self.pixels_rect = (x, y, w as u32, h as u32);
+        self.frame_id = NEXT_FRAME.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Static lease renewals preserve this identity. Hiding, expiry, and an
+    /// invalid rectangle expose no frame, so the desktop is scanned again.
+    pub fn frame_id(&self) -> Option<u64> {
+        self.frame().map(|_| self.frame_id)
     }
 
     pub fn frame(&self) -> Option<(u32, u32, u32, u32, &[u8])> {
@@ -149,5 +161,34 @@ mod tests {
         rect(&mut d, [0, 0, 0, 600]);
         d.store(BASE + 4, 1);
         assert_eq!(d.state(), State::Hidden);
+    }
+
+    #[test]
+    fn completed_frame_identity_tracks_pixels_and_machine_ownership() {
+        let mut d = Overlay::new();
+        assert_eq!(d.frame_id(), None);
+        rect(&mut d, [0, 0, 2, 2]);
+        assert!(d.store(BASE + 4, 1));
+        d.capture(8, |_, out| out.fill(7));
+        let first = d.frame_id().unwrap();
+        assert!(!d.store(BASE + 4, 2));
+        assert_eq!(d.frame_id(), Some(first));
+        assert!(d.store(BASE + 4, 1));
+        d.capture(8, |_, out| out.fill(8));
+        assert_ne!(d.frame_id(), Some(first));
+        let second = d.frame_id().unwrap();
+        let mut other = Overlay::new();
+        rect(&mut other, [0, 0, 2, 2]);
+        other.store(BASE + 4, 1);
+        other.capture(8, |_, out| out.fill(8));
+        assert_ne!(other.frame_id(), Some(second));
+        d.renewed = Some(Instant::now() - LEASE - Duration::from_millis(1));
+        assert_eq!(d.frame_id(), None);
+        d.store(BASE + 4, 0);
+        assert_eq!(d.frame_id(), None);
+        rect(&mut d, [u32::MAX, 0, 2, 2]);
+        d.store(BASE + 4, 1);
+        d.capture(8, |_, _| panic!("invalid geometry must not read pixels"));
+        assert_eq!(d.frame_id(), None);
     }
 }
