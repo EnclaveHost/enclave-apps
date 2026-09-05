@@ -47,6 +47,26 @@ pub fn aot_verifier_regression_probe() {
         assert!(cpu.aot_verified(handle), "a real code change to matching instructions must be rechecked");
         cpu.mmu.update_ppn(root >> 12);
         assert!(cpu.aot_verified(handle), "an unchanged successful proof remains valid");
+        // A dispatch slot can survive a mapping change. Its verifier must
+        // reject the new instructions, and executing the fallback must not
+        // inflate the reported amount of compiled work.
+        write_phys(&mut cpu, bad, &0x00100093u32.to_le_bytes());
+        write_phys(&mut cpu, bad + 4, &0xffdff06fu32.to_le_bytes()); // JAL x0,-4
+        write_phys(&mut cpu, good, &0x00700093u32.to_le_bytes()); // ADDI x1,x0,7
+        write_phys(&mut cpu, good + 4, &0xffdff06fu32.to_le_bytes());
+        cpu.aot_enable();
+        cpu.pc = virtual_pc;
+        cpu.run(256);
+        let slot = ((virtual_pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+        assert_eq!(cpu.aot_slots[slot].tag, virtual_pc);
+        let before = cpu.tier2_stats().0;
+        write_phys(&mut cpu, leaf_entry, &pte(good, 0xcf).to_le_bytes());
+        cpu.mmu.update_ppn(root >> 12);
+        cpu.pc = virtual_pc;
+        cpu.run(256);
+        assert_eq!(cpu.x[1], 7, "the fallback executes the remapped code");
+        assert_eq!(cpu.tier2_stats().0, before,
+                   "interpreted fallback instructions are not compiled coverage");
         println!("AOT verifier PASS for {virtual_pc:#x}");
     }
 }

@@ -843,7 +843,10 @@ impl Cpu {
 						{
 							if let Some(t) = self.tier2.as_mut() {
 								t.total += r;
-								if compiled.is_some() {
+								// Recording mode reports potential coverage. AOT
+								// counts only instructions actually run above;
+								// a stale slot can fail verification and fall back.
+								if !t.aot && compiled.is_some() {
 									t.covered += r;
 								}
 								let w = !t.aot && (t.total >> 22) & 7 == 0;
@@ -889,7 +892,7 @@ impl Cpu {
 							let tag = self.block_heads[slot].tag;
 							if let Some(t) = self.tier2.as_mut() {
 								t.total += r;
-								if t.t2.lookup(tag, g).is_some() {
+								if !t.aot && t.t2.lookup(tag, g).is_some() {
 									t.covered += r;
 								}
 								let w = !t.aot && (t.total >> 22) & 7 == 0;
