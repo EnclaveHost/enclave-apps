@@ -29,6 +29,8 @@ extern "C" {
     fn opus_encode(st: *mut c_void, pcm: *const i16, frame_size: c_int,
                    data: *mut u8, max_data_bytes: i32) -> i32;
     fn opus_encoder_destroy(st: *mut c_void);
+    fn opus_encoder_ctl(st: *mut c_void, request: c_int, ...) -> c_int;
+    fn opus_packet_pad(data: *mut u8, len: i32, new_len: i32) -> c_int;
 }
 
 /// Low delay matters more than the last decibel for a game.
@@ -38,6 +40,20 @@ pub const OUT_RATE: usize = 48_000;
 pub const OUT_CHANNELS: usize = 2;
 /// 5 ms at 48 kHz, per channel — the packet duration audio.rs advertises.
 pub const FRAME_SAMPLES: usize = OUT_RATE / 1000 * 5;
+/// 128 kbit/s stereo, 5 ms. Moonlight's audio FEC requires equal-size packets,
+/// including the transition between silence and music.
+pub const PACKET_BYTES: usize = 80;
+
+pub fn silence_packet() -> [u8; PACKET_BYTES] {
+    let mut packet = [0u8; PACKET_BYTES];
+    // CELT fullband config 29 is 5 ms; config 31 (0xFC) is 20 ms.
+    packet[..3].copy_from_slice(&[0xEC, 0xFF, 0xFE]);
+    // Opus padding is part of the packet syntax; appending zero bytes alone
+    // would change what the decoder hears.
+    let result = unsafe { opus_packet_pad(packet.as_mut_ptr(), 3, PACKET_BYTES as i32) };
+    assert_eq!(result, 0, "padding the fixed valid silence packet");
+    packet
+}
 
 /// ~200 ms of 48 kHz stereo. This is a jitter buffer, not a store: anything
 /// held here is delay the player hears, and a deep one was most of why the
@@ -70,7 +86,16 @@ impl Encoder {
             eprintln!("[audio] opus_encoder_create failed ({err})");
             return None;
         }
-        Some(Encoder { st })
+        let encoder = Encoder { st };
+        // opus_defines.h: OPUS_SET_BITRATE, OPUS_SET_VBR, OPUS_SET_DTX.
+        for (request, value) in [(4002, 128_000), (4006, 0), (4016, 0)] {
+            let result = unsafe { opus_encoder_ctl(st, request, value as c_int) };
+            if result != 0 {
+                eprintln!("[audio] configuring constant-size Opus failed ({result})");
+                return None;
+            }
+        }
+        Some(encoder)
     }
 
     /// Encode one 5 ms stereo frame (FRAME_SAMPLES per channel, interleaved).
@@ -316,6 +341,45 @@ impl Resampler {
 #[cfg(test)]
 mod resample_tests {
     use super::*;
+
+    #[test]
+    fn fec_packets_keep_size_and_decode_through_silence_transitions() {
+        extern "C" {
+            fn opus_decoder_create(fs: i32, channels: c_int, error: *mut c_int) -> *mut c_void;
+            fn opus_decode(st: *mut c_void, data: *const u8, len: i32,
+                           pcm: *mut i16, frame_size: c_int, fec: c_int) -> c_int;
+            fn opus_decoder_destroy(st: *mut c_void);
+        }
+        let mut err = 0;
+        let decoder = unsafe { opus_decoder_create(48_000, 2, &mut err) };
+        assert!(!decoder.is_null() && err == 0);
+        let mut encoder = Encoder::new().unwrap();
+        let mut encoded = [0u8; 1275];
+        let mut decoded = [0i16; FRAME_SAMPLES * OUT_CHANNELS];
+        let silence = silence_packet();
+        let mut nonzero = false;
+        for i in 0..200 {
+            let mut pcm = vec![0i16; FRAME_SAMPLES * OUT_CHANNELS];
+            if i % 50 >= 10 {
+                for (j, s) in pcm.iter_mut().enumerate() {
+                    let sample = (i * FRAME_SAMPLES + j / 2) as f64;
+                    *s = ((sample * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 12_000.0) as i16;
+                }
+            }
+            let n = encoder.encode(&pcm, &mut encoded).unwrap();
+            assert_eq!(n, PACKET_BYTES, "packet {i} changed length");
+            let packet = if i % 50 < 5 { &silence[..] } else { &encoded[..n] };
+            let samples = unsafe { opus_decode(decoder, packet.as_ptr(), packet.len() as i32,
+                                               decoded.as_mut_ptr(), FRAME_SAMPLES as c_int, 0) };
+            assert_eq!(samples, FRAME_SAMPLES as c_int);
+            nonzero |= decoded.iter().any(|&s| s.abs() > 1000);
+            // AES-CBC adds padding, but the FEC data size must still be stable.
+            let encrypted = crate::crypto::cbc_encrypt(&[0; 16], &[0; 16], packet);
+            assert_eq!(encrypted.len(), 96);
+        }
+        unsafe { opus_decoder_destroy(decoder) };
+        assert!(nonzero, "music frames decoded as silence");
+    }
 
     // A 300 Hz sine at 11025 Hz stereo, `n` frames from sample offset `off`.
     fn sine(off: usize, n: usize) -> Vec<i16> {

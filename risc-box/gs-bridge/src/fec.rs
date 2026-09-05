@@ -60,6 +60,27 @@ impl Gf {
 
 static GF: std::sync::LazyLock<Gf> = std::sync::LazyLock::new(Gf::new);
 
+/// GameStream audio uses a fixed OpenFEC matrix, distinct from video nanors.
+/// See moonlight-common-c/src/RtpAudioQueue.c, RtpaInitializeQueue().
+pub fn encode_audio(data: &[&[u8]]) -> Vec<Vec<u8>> {
+    const MATRIX: [[u8; 4]; 2] = [
+        [0x77, 0x40, 0x38, 0x0e],
+        [0xc7, 0xa7, 0x0d, 0x6c],
+    ];
+    assert_eq!(data.len(), 4);
+    let len = data[0].len();
+    assert!(data.iter().all(|s| s.len() == len));
+    MATRIX.iter().map(|row| {
+        let mut out = vec![0; len];
+        for (&coeff, shard) in row.iter().zip(data) {
+            for (o, &s) in out.iter_mut().zip(*shard) {
+                *o ^= GF.mul(coeff, s);
+            }
+        }
+        out
+    }).collect()
+}
+
 /// The most shards (data + parity) a single FEC block can hold. nanors caps
 /// this at 255 (DATA_SHARDS_MAX); Sunshine sizes its blocks to respect it.
 pub const DATA_SHARDS_MAX: usize = 255;

@@ -22,18 +22,9 @@ use crate::fec;
 use crate::session::Session;
 
 const RTPA_DATA_SHARDS: usize = 4;
-const RTPA_FEC_SHARDS: usize = 2;
-
-/// One 5 ms stereo Opus frame of silence.
-///
-/// TOC byte 0xFC selects config 31 (CELT fullband), stereo, 1 frame per
-/// packet; the two following bytes are a minimal empty CELT payload.
-const SILENT_OPUS: [u8; 3] = [0xFC, 0xFF, 0xFE];
 
 /// Packet duration in milliseconds, matching what we advertise.
 const PACKET_DURATION_MS: u64 = 5;
-/// 48 kHz Opus samples per packet.
-const SAMPLES_PER_PACKET: u32 = 48_000 / 1000 * PACKET_DURATION_MS as u32;
 
 fn rtp_header(payload_type: u8, seq: u16, timestamp: u32) -> [u8; 12] {
     let mut h = [0u8; 12];
@@ -58,6 +49,7 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
     }
     let mut encoder = crate::opus::Encoder::new();
     let mut opus_buf = [0u8; 1275]; // the largest packet Opus will produce
+    let silent_opus = crate::opus::silence_packet();
     let mut heard = false;
     // Real frames vs silence, reported now and then: silence while the guest
     // is playing IS the chopping, so this is the number to watch.
@@ -111,7 +103,7 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
             }
             None => {
                 filler += 1;
-                &SILENT_OPUS
+                &silent_opus
             }
         };
         if heard && last_report.elapsed() >= Duration::from_secs(10) {
@@ -151,17 +143,8 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
 
         // At the end of a block, emit the parity shards.
         if (seq as usize + 1) % RTPA_DATA_SHARDS == 0 && block.len() == RTPA_DATA_SHARDS {
-            let shard_len = block.iter().map(|s| s.len()).max().unwrap_or(0);
-            let padded: Vec<Vec<u8>> = block
-                .iter()
-                .map(|s| {
-                    let mut v = s.clone();
-                    v.resize(shard_len, 0);
-                    v
-                })
-                .collect();
-            let refs: Vec<&[u8]> = padded.iter().map(|s| s.as_slice()).collect();
-            let parity = fec::encode(&refs, RTPA_FEC_SHARDS);
+            let refs: Vec<&[u8]> = block.iter().map(|s| s.as_slice()).collect();
+            let parity = fec::encode_audio(&refs);
 
             for (x, shard) in parity.iter().enumerate() {
                 let mut pkt = Vec::with_capacity(24 + shard.len());
@@ -179,7 +162,9 @@ pub fn run(session: Arc<Session>, app: Arc<crate::app::App>, sock: Arc<UdpSocket
         }
 
         seq = seq.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(SAMPLES_PER_PACKET);
+        // GameStream's audio clock counts milliseconds, not PCM samples.
+        // Moonlight reconstructs missing timestamps using AudioPacketDuration.
+        timestamp = timestamp.wrapping_add(PACKET_DURATION_MS as u32);
 
         deadline += Duration::from_millis(PACKET_DURATION_MS);
         let now = std::time::Instant::now();

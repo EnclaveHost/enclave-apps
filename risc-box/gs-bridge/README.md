@@ -202,7 +202,7 @@ reimplementation.
   Moonlight client
         │  GameStream (pair/HTTPS/RTSP/RTP/ENet)
         ▼
-   gs-bridge  ──GET /fb.rgb──▶  RISC Box app (wasm32-wasip2)
+   gs-bridge  ──GET /fb.rgb──▶  RISC Box app (WebAssembly)
         │                              │
         │  NVENC encode on the GPU     │ emulated RISC-V machine
         └──POST /hid───────────────────▶ virtio-input HID
@@ -215,13 +215,30 @@ on the encrypted control channel and is translated into the app's `/hid` schema
 keycodes**, and integrating relative mouse motion into an absolute position,
 since the emulated pointer is absolute-only.
 
+Audio streams from the guest's virtio sound device through `/audio?stream=1`.
+The bridge resamples it to 48 kHz stereo and encodes 5 ms Opus packets at a
+constant 128 kbit/s. Silence uses the same packet size and duration. Audio RTP
+timestamps count milliseconds, and recovery uses the fixed GameStream audio
+matrix, which differs from the video parity matrix. Variable packet sizes
+cause Moonlight to disable audio recovery.
+
+`cargo test` checks codec duration, decoding, encrypted packet sizes, and
+resampler continuity. To verify loss recovery against the actual client, use a
+Moonlight common C checkout with its submodules:
+
+```sh
+python3 tests/audio_fec_interop.py /path/to/moonlight-common-c
+```
+
+This test drops every pair of data packets and checks the recovered bytes and
+timestamps, including sequence number wrap. It was verified against
+`moonlight-common-c` commit `874ac9548f1bd6f095ef2b435c42cdde460e7821`.
+
 ## What is not done
 
 - **Production H200 deploy.** The encode is GPU-agnostic NVENC, but placing this
   service on the fleet GPU node next to the RISC Box CVM is an operational step
   that needs access to that node.
-- **Audio is silence.** The emulated machine has no sound device; the stream
-  exists so the client's audio path stays healthy.
 - **HEVC/AV1.** DESCRIBE deliberately advertises H.264 only. The codec markers
   the client greps for are understood, so adding them is mostly encoder work.
 - **Gamepad, touch, and pen** input is parsed and dropped — the emulated HID has
