@@ -232,6 +232,14 @@ impl Display {
             }
         }
         out.resize(fb_bytes(), 0);
+        if let Some((0, 0, w, h, pixels)) = emu.overlay_frame() {
+            if w as usize == fb_w() && h as usize == fb_h() {
+                // A completed, fully owned screen needs no desktop copy.
+                emu.fb_take_overlay_rect();
+                out.copy_from_slice(pixels);
+                return;
+            }
+        }
         let from_gpu = emu.read_display(FB_BASE, out, Self::gpu_is_the_live_surface(emu));
         if from_gpu {
             Self::composite_overlay(emu, out);
@@ -248,6 +256,30 @@ impl Display {
     /// painting stops being composited after a second, and X's own (stale)
     /// window contents show, which is the same frame the game last drew.
     fn composite_overlay(emu: &Emulator, out: &mut [u8]) {
+        use riscv_emu_rust::device::overlay::State;
+        match emu.overlay_state() {
+            State::Active(..) => {
+                emu.fb_take_overlay_rect();
+                if let Some((x, y, w, h, pixels)) = emu.overlay_frame() {
+                    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+                    if x < fb_w() && y < fb_h() {
+                        let cols = w.min(fb_w() - x) * 4;
+                        for row in 0..h.min(fb_h() - y) {
+                            let off = (y + row) * fb_stride() + x * 4;
+                            out[off..off + cols].copy_from_slice(&pixels[row * w * 4..row * w * 4 + cols]);
+                        }
+                    }
+                }
+                return;
+            }
+            State::Hidden => {
+                // Explicitly hidden or expired must not resurrect a layer
+                // from its old framebuffer writes.
+                emu.fb_take_overlay_rect();
+                return;
+            }
+            State::Legacy => {}
+        }
         let now_ms = overlay_now_ms();
         if let Some((x, y, w, h)) = emu.fb_take_overlay_rect() {
             // ignore boot-console noise: the overlay is a WINDOW, not the
@@ -305,12 +337,15 @@ impl Display {
         if packed == 0 || now_ms.saturating_sub(OVERLAY_FRESH_MS.load(Ordering::Relaxed)) > 1000 {
             return;
         }
-        let (x, y, w, h) = (
-            (packed >> 48 & 0xffff) as usize,
-            (packed >> 32 & 0xffff) as usize,
-            (packed >> 16 & 0xffff) as usize,
-            (packed & 0xffff) as usize,
-        );
+        Self::copy_overlay_rect(emu, out,
+            (packed >> 48 & 0xffff) as u32,
+            (packed >> 32 & 0xffff) as u32,
+            (packed >> 16 & 0xffff) as u32,
+            (packed & 0xffff) as u32);
+    }
+
+    fn copy_overlay_rect(emu: &Emulator, out: &mut [u8], x: u32, y: u32, w: u32, h: u32) {
+        let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
         let stride = fb_stride();
         let (sw, sh) = (fb_w(), fb_h());
         if x >= sw || y >= sh {
@@ -318,11 +353,14 @@ impl Display {
         }
         let w = w.min(sw - x);
         let h = h.min(sh - y);
-        let mut row = vec![0u8; w * 4];
+        if x == 0 && w == sw {
+            let off = y * stride;
+            emu.read_physical_range(FB_BASE + off as u64, &mut out[off..off + h * stride]);
+            return;
+        }
         for r in 0..h {
             let off = (y + r) * stride + x * 4;
-            emu.read_physical_range(FB_BASE + off as u64, &mut row);
-            out[off..off + w * 4].copy_from_slice(&row);
+            emu.read_physical_range(FB_BASE + off as u64, &mut out[off..off + w * 4]);
         }
     }
 
@@ -369,10 +407,17 @@ impl Display {
     /// been consumed by someone else.
     pub fn capture_damage(emu: &mut Emulator, out: &mut Vec<u8>) -> Option<(usize, usize)> {
         Self::capture(emu, out);
+        let dirty = emu.gpu_take_dirty();
+        // GPU damage says nothing about the independently painted layer,
+        // including the old area that must disappear when it hides/expires.
+        if emu.overlay_state() != riscv_emu_rust::device::overlay::State::Legacy
+            || overlay_is_fresh() {
+            return None;
+        }
         // Only the row range matters: the column range is recovered by
         // comparing the rows we do hash, and that comparison is cheap next to
         // the hashing this avoids.
-        emu.gpu_take_dirty().map(|(_, y, _, h)| {
+        dirty.map(|(_, y, _, h)| {
             let y0 = y as usize;
             (y0.min(fb_h()), (y0 + h as usize).min(fb_h()))
         })
@@ -544,13 +589,7 @@ impl Display {
     /// watcher still sees live pixels).
     pub fn png(&mut self, emu: &Emulator) -> Vec<u8> {
         let mut fresh = vec![0u8; fb_bytes()];
-        let prefer = Self::gpu_is_the_live_surface(emu);
-        // Composite the game overlay too, so a snapshot shows exactly what the
-        // video stream shows — otherwise /fb.png reads the GPU scanout without
-        // the live game on top and diverges from what a viewer sees.
-        if emu.read_display(FB_BASE, &mut fresh, prefer) {
-            Self::composite_overlay(emu, &mut fresh);
-        }
+        Self::capture(emu, &mut fresh);
         // raw scanlines: filter byte 0 + RGB (drop X, reorder BGR -> RGB)
         let mut raw = Vec::with_capacity(fb_h() * (1 + fb_w() * 3));
         for y in 0..fb_h() {
@@ -640,6 +679,60 @@ impl Crc32 {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn explicit_overlay_preserves_fullscreen_edges_and_hides_without_ghosts() {
+        use riscv_emu_rust::{device::overlay::State, terminal::DummyTerminal};
+        set_size(960, 600);
+        let mut emu = Emulator::new(Box::new(DummyTerminal::new()));
+        emu.get_mut_cpu().get_mut_mmu().init_memory(136 * 1024 * 1024);
+        emu.set_framebuffer_size(960, 600);
+        let last = fb_bytes() - 4;
+        for (offset, value) in [(0, 11), (last, 29), (last + 1, 43), (last + 2, 71)] {
+            emu.get_mut_cpu().get_mut_mmu().store_raw(FB_BASE + offset as u64, value);
+        }
+        let publish = |emu: &mut Emulator, rect: [u32; 4]| {
+            let mmu = emu.get_mut_cpu().get_mut_mmu();
+            for (i, value) in rect.iter().enumerate() {
+                for (j, byte) in value.to_le_bytes().iter().enumerate() {
+                    mmu.store_raw(0x10007008 + (i * 4 + j) as u64, *byte);
+                }
+            }
+            mmu.store_raw(0x10007004, 1);
+        };
+        publish(&mut emu, [0, 0, 960, 600]);
+        let mut pixels = vec![77; fb_bytes()];
+        Display::composite_overlay(&emu, &mut pixels);
+        assert_eq!(pixels[0], 11);
+        assert_eq!(&pixels[last..last + 4], &[29, 43, 71, 0]);
+        let mut captured = Vec::new();
+        Display::capture(&emu, &mut captured);
+        assert_eq!(captured, pixels);
+
+        // The guest has started painting its NEXT image. Until it commits,
+        // readers and lease renewals must keep the last complete one.
+        emu.get_mut_cpu().get_mut_mmu().store_raw(FB_BASE, 99);
+        emu.get_mut_cpu().get_mut_mmu().store_raw(0x10007004, 2);
+        Display::capture(&emu, &mut captured);
+        assert_eq!(captured[0], 11);
+        emu.get_mut_cpu().get_mut_mmu().store_raw(0x10007004, 1);
+        Display::capture(&emu, &mut captured);
+        assert_eq!(captured[0], 99);
+
+        // Guest-controlled extents clip at the actual screen without integer
+        // overflow or writes into the underlying desktop outside the layer.
+        publish(&mut emu, [959, 599, u32::MAX, u32::MAX]);
+        pixels.fill(77);
+        Display::composite_overlay(&emu, &mut pixels);
+        assert!(pixels[..last].iter().all(|b| *b == 77));
+        assert_eq!(&pixels[last..], &[29, 43, 71, 0]);
+        emu.get_mut_cpu().get_mut_mmu().store_raw(0x10007004, 0);
+        pixels.fill(77);
+        Display::composite_overlay(&emu, &mut pixels);
+        assert!(pixels.iter().all(|b| *b == 77));
+        assert_eq!(emu.overlay_state(), State::Hidden);
+        assert_eq!(Emulator::new(Box::new(DummyTerminal::new())).overlay_state(), State::Legacy);
+    }
 
     /// The whole point of pacing by cost is that an expensive scan buys itself
     /// a longer gap. Pin the budget: a scan may never take more than a fifth

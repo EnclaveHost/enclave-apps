@@ -26,6 +26,7 @@ use cpu::{PrivilegeMode, Trap, TrapType, Xlen, get_privilege_mode};
 use device::virtio_block_disk::VirtioBlockDisk;
 use device::virtio_input::VirtioInput; // risc-box patch
 use device::opl::Opl; // risc-box patch
+use device::overlay::{Overlay, State as OverlayState};
 use device::virtio_gpu::VirtioGpu; // risc-box patch
 use device::virtio_snd::VirtioSnd; // risc-box patch
 use device::virtio_net::VirtioNet; // risc-box patch
@@ -55,6 +56,7 @@ pub struct Mmu {
 	snd: VirtioSnd, // risc-box patch
 	gpu: VirtioGpu, // risc-box patch
 	opl: Opl, // risc-box patch
+	overlay: Overlay,
 	plic: Plic,
 	clint: Clint,
 	uart: Uart,
@@ -161,6 +163,7 @@ impl Mmu {
 			snd: VirtioSnd::new(), // risc-box patch
 			gpu: VirtioGpu::new(1024, 768), // risc-box patch
 			opl: Opl::new(), // risc-box patch
+			overlay: Overlay::new(),
 			plic: Plic::new(),
 			clint: Clint::new(),
 			uart: Uart::new(terminal),
@@ -311,6 +314,25 @@ impl Mmu {
 	// risc-box patch (host-side game overlay): see MemoryWrapper::fb_take_rect.
 	pub fn fb_take_rect(&self) -> Option<(u32, u32, u32, u32)> {
 		self.memory.fb_take_rect()
+	}
+
+	pub fn overlay_state(&self) -> OverlayState {
+		self.overlay.state()
+	}
+
+	pub fn overlay_frame(&self) -> Option<(u32, u32, u32, u32, &[u8])> {
+		self.overlay.frame()
+	}
+
+	// A frame copy must not be inlined into the CPU's ordinary store path.
+	#[cold]
+	#[inline(never)]
+	fn overlay_store(&mut self, address: u64, value: u8) {
+		if self.overlay.store(address, value) {
+			let memory = &self.memory;
+			self.overlay.capture(memory.fb_stride, |offset, out|
+				memory.read_range(0x87e0_0000 + offset, out));
+		}
 	}
 
 	pub fn set_fb_stride(&mut self, stride: u64) {
@@ -827,6 +849,7 @@ impl Mmu {
 				0x10004000..=0x10004FFF => self.snd.load(effective_address), // risc-box patch
 				0x10005000..=0x10005FFF => self.gpu.load(effective_address), // risc-box patch
 				0x10006000..=0x10006FFF => self.opl.load(effective_address), // risc-box patch
+				0x10007000..=0x10007FFF => self.overlay.load(effective_address),
 				// risc-box patch: an access to an address no device backs must
 				// never panic the HOST process — a tenant guest could otherwise
 				// crash the whole enclave app. Read as zero, like an open bus.
@@ -920,6 +943,7 @@ impl Mmu {
 				0x10004000..=0x10004FFF => self.snd.store(effective_address, value), // risc-box patch
 				0x10005000..=0x10005FFF => self.gpu.store(effective_address, value), // risc-box patch
 				0x10006000..=0x10006FFF => self.opl.store(effective_address, value), // risc-box patch
+				0x10007000..=0x10007FFF => self.overlay_store(effective_address, value),
 				// risc-box patch: drop writes to unbacked addresses (open bus)
 				// rather than panic the host — see load_raw.
 				_ => note_unmapped(effective_address, true)
@@ -1648,6 +1672,7 @@ impl Mmu {
 		let mut r = De::new(payload);
 		match tag {
 			b"MMU_" => {
+				self.overlay = Overlay::new();
 				self.clock = r.u64()?;
 				self.xlen = match r.u8()? {
 					32 => Xlen::Bit32,

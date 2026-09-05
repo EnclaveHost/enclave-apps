@@ -497,6 +497,14 @@ impl Emulator {
 		self.cpu.get_mmu().fb_take_rect()
 	}
 
+	pub fn overlay_state(&self) -> device::overlay::State {
+		self.cpu.get_mmu().overlay_state()
+	}
+
+	pub fn overlay_frame(&self) -> Option<(u32, u32, u32, u32, &[u8])> {
+		self.cpu.get_mmu().overlay_frame()
+	}
+
 	/// risc-box patch: fill `out` with the current display contents, whichever
 	/// device is driving it.
 	///

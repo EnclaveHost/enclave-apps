@@ -92,8 +92,9 @@ static int cur_buf, pending;
 // The idea: with MIT-SHM the frame is written once by us and copied once by
 // the server, and the pixels are already in the same DRAM the framebuffer
 // lives in, so the scale could write THERE and the copy would stop happening.
-// It works — "100 direct / 0 via X" — and it is not faster, because the
-// server's copy was a smaller share of the frame than it appeared.
+// New hosts snapshot each completed frame and composite it over the desktop
+// natively. This avoids the X server's shadow/scanout copies in the guest,
+// while the explicit ownership protocol supports fullscreen and static menus.
 //
 // It is only safe while the window is fully visible and where it is, so the
 // window's origin is tracked with TranslateCoordinates and its visibility with
@@ -105,6 +106,23 @@ static int fb_stride, fb_w_px, fb_h_px;
 static int org_x = -1, org_y = -1;    // window origin in root coordinates
 static int visible;                   // VisibilityUnobscured
 static int overlay_frames, x_frames;  // how each frame got to the screen
+static volatile uint32_t *overlay_ctl;
+
+static void overlay_publish(int active)
+{
+    if (!overlay_ctl)
+        return;
+    if (active) {
+        overlay_ctl[2] = org_x;
+        overlay_ctl[3] = org_y;
+        overlay_ctl[4] = win_w;
+        overlay_ctl[5] = win_h;
+    }
+    __sync_synchronize();
+    *(volatile uint8_t *)((volatile uint8_t *)overlay_ctl + 4) = active;
+}
+
+static void overlay_hide(void) { overlay_publish(0); }
 
 static int frames;
 static struct timeval fps_t0;
@@ -503,6 +521,25 @@ static void fb_open(void)
     close(fd);
     if (fbmem == MAP_FAILED)
         fbmem = NULL;
+    if (fbmem) {
+        // New hosts accept explicit window ownership. Older hosts return
+        // zero for unbacked device space and retain the legacy overlay.
+        fd = open("/dev/mem", O_RDWR | O_SYNC);
+        if (fd >= 0) {
+            void *ctl = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x10007000);
+            close(fd);
+            if (ctl != MAP_FAILED) {
+                if (*(volatile uint32_t *)ctl == 0x4f584252u) {
+                    overlay_ctl = ctl;
+                    overlay_hide();
+                    atexit(overlay_hide);
+                    printf("I_InitGraphics: explicit host overlay ownership available\n");
+                } else {
+                    munmap(ctl, 4096);
+                }
+            }
+        }
+    }
 }
 
 // Where is this window on the root, right now? (The window manager reparents
@@ -670,6 +707,7 @@ void I_InitGraphics(void)
 
 void I_ShutdownGraphics(void)
 {
+    overlay_hide();
     if (xfd >= 0)
         close(xfd);
     xfd = -1;
@@ -726,6 +764,26 @@ void I_FinishUpdate(void)
     const uint8_t *src = (const uint8_t *)I_VideoBuffer;
     int y, x, rows_per_req, y0;
     int first = -1, last = -1;
+    static int last_overlay = -1, last_x = -1, last_y = -1;
+
+    if (fbmem && org_x < 0)
+        x_resolve_origin();
+    int overlay = fbmem && visible && org_x >= 0 && org_y >= 0
+        && org_x + win_w <= fb_w_px && org_y + win_h <= fb_h_px;
+    if (overlay != last_overlay || (overlay && (org_x != last_x || org_y != last_y))) {
+        // Each destination needs a complete first image, even when Doom's
+        // source pixels have not changed since the previous destination.
+        have_prev = 0;
+        printf("overlay %s: visible=%d org=%d,%d win=%dx%d fb=%dx%d\n",
+               overlay ? "ON" : "off", visible, org_x, org_y,
+               win_w, win_h, fb_w_px, fb_h_px);
+        fflush(stdout);
+        last_overlay = overlay;
+        last_x = org_x;
+        last_y = org_y;
+    }
+    if (!overlay)
+        overlay_hide();
 
     // Which source rows moved? (Everything, in a busy scene; the bottom 32 —
     // the status bar — almost never, and nothing at all while a menu sits
@@ -740,6 +798,9 @@ void I_FinishUpdate(void)
             }
         }
         if (first < 0) {
+            // Static menus still own their layer. A process that dies or
+            // stops presenting loses the lease instead.
+            overlay_publish(overlay ? 2 : 0);
             // Nothing changed at all: the frame is already on the screen.
             if (fps_report && ++frames >= 100) {
                 struct timeval now;
@@ -766,20 +827,6 @@ void I_FinishUpdate(void)
     // drops the doubled-pixel store to 32-bit halves rather than the whole
     // path to the server: two extra stores a pixel pair is nothing against
     // the copy through Xorg they replace.
-    if (fbmem && org_x < 0)
-        x_resolve_origin();
-    int overlay = fbmem && visible && org_x >= 0 && org_y >= 0
-        && org_x + win_w <= fb_w_px && org_y + win_h <= fb_h_px;
-    {
-        static int last_overlay = -1;
-        if (overlay != last_overlay) {
-            printf("overlay %s: visible=%d org=%d,%d win=%dx%d fb=%dx%d\n",
-                   overlay ? "ON" : "off", visible, org_x, org_y,
-                   win_w, win_h, fb_w_px, fb_h_px);
-            fflush(stdout);
-            last_overlay = overlay;
-        }
-    }
     uint8_t *dst_base = overlay
         ? fbmem + (size_t)org_y * fb_stride + (size_t)org_x * 4
         : (uint8_t *)img;
@@ -845,6 +892,7 @@ void I_FinishUpdate(void)
     // Only the window rows the changed source rows cover — and nothing at all
     // when the pixels were written to the screen directly.
     if (overlay) {
+        overlay_publish(1);
         overlay_frames++;
     } else {
         int wy0 = first * scale;
@@ -1117,6 +1165,10 @@ static void x_pump(int blocking)
             }
             case 15:     // VisibilityNotify
                 visible = (ev[8] == 0);
+                if (!visible) {
+                    overlay_hide();
+                    have_prev = 0;
+                }
                 printf("VisibilityNotify state=%d\n", ev[8]);
                 fflush(stdout);
                 // Obscured means the overlay is dead until the stacking
@@ -1140,6 +1192,7 @@ static void x_pump(int blocking)
                 }
                 break;
             case 22:     // ConfigureNotify: the window moved or resized
+                overlay_hide();
                 printf("ConfigureNotify x=%d y=%d w=%u h=%u\n",
                        *(int16_t *)(ev + 16), *(int16_t *)(ev + 18),
                        *(uint16_t *)(ev + 20), *(uint16_t *)(ev + 22));
