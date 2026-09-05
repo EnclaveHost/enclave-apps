@@ -1737,3 +1737,172 @@ impl Mmu {
 		Ok(true)
 	}
 }
+
+#[cfg(test)]
+mod queue_notification_tests {
+    use super::MemoryWrapper;
+    use device::virtio_gpu::VirtioGpu;
+    use device::virtio_snd::VirtioSnd;
+    use snapshot::{De, Ser};
+
+    const DESC: u64 = 0x80001000;
+    const AVAIL: u64 = 0x80002000;
+    const USED: u64 = 0x80003000;
+    const REQ: u64 = 0x80004000;
+    const RESP: u64 = 0x80005000;
+
+    fn memory() -> MemoryWrapper {
+        let mut m = MemoryWrapper::new();
+        m.init(0x10000);
+        m.write_doubleword(DESC, REQ);
+        m.write_word(DESC + 8, 24);
+        m.write_halfword(DESC + 12, 1); // NEXT
+        m.write_halfword(DESC + 14, 1);
+        m.write_doubleword(DESC + 16, RESP);
+        m.write_word(DESC + 24, 512);
+        m.write_halfword(DESC + 28, 2); // WRITE
+        m.write_word(REQ, 0x100); // GPU display info or sound PCM info
+        m.write_word(REQ + 8, 1); // PCM info: one stream
+        m.write_word(REQ + 12, 32); // sizeof virtio_snd_pcm_info
+        m
+    }
+
+    fn configure(mut store: impl FnMut(u64, u8), base: u64) {
+        for &(off, value) in &[(0x30, 0u32), (0x38, 8), (0x80, DESC as u32),
+                              (0x90, AVAIL as u32), (0xa0, USED as u32),
+                              (0x44, 1), (0x70, 4)] {
+            for (i, b) in value.to_le_bytes().iter().enumerate() {
+                store(base + off + i as u64, *b);
+            }
+        }
+    }
+
+    fn post(m: &mut MemoryWrapper, first: u16, end: u16) {
+        for i in first..end {
+            m.write_halfword(AVAIL + 4 + (i as u64 % 8) * 2, 0);
+        }
+        m.write_halfword(AVAIL + 2, end);
+        m.write_word(RESP, 0);
+    }
+
+    #[test]
+    fn gpu_notifications_drain_batches_and_restore_pending_work() {
+        let mut m = memory();
+        let mut gpu = VirtioGpu::new(960, 600);
+        configure(|a, v| gpu.store(a, v), 0x10005000);
+        gpu.tick(&mut m); // ring initially empty
+        post(&mut m, 0, 1);
+        gpu.store(0x10005050, 0);
+        gpu.tick(&mut m);
+        assert_eq!(m.read_halfword(USED + 2), 1);
+        assert_eq!(m.read_word(RESP), 0x1101);
+        for _ in 0..100 { gpu.tick(&mut m); }
+        assert_eq!(m.read_halfword(USED + 2), 1);
+        post(&mut m, 1, 3);
+        gpu.store(0x10005050, 0);
+        gpu.tick(&mut m);
+        assert_eq!(m.read_halfword(USED + 2), 3, "one kick must drain the whole batch");
+        post(&mut m, 3, 4);
+        let mut w = Ser::new(); gpu.snapshot(&mut w);
+        let mut restored = VirtioGpu::new(960, 600);
+        restored.restore(&mut De::new(&w.buf)).unwrap();
+        restored.tick(&mut m);
+        assert_eq!(m.read_halfword(USED + 2), 4, "restore must recheck posted rings");
+        assert_eq!(m.read_word(RESP), 0x1101);
+        restored.store(0x10005050, 0); // spurious kick must not repeat work
+        restored.tick(&mut m);
+        assert_eq!(m.read_halfword(USED + 2), 4);
+    }
+
+    #[test]
+    fn sound_control_notifications_and_restore_keep_responses() {
+        let mut m = memory();
+        let mut snd = VirtioSnd::new();
+        configure(|a, v| snd.store(a, v), 0x10004000);
+        snd.tick(1, &mut m);
+        post(&mut m, 0, 1);
+        snd.store(0x10004050, 0);
+        snd.tick(2, &mut m);
+        assert_eq!(m.read_halfword(USED + 2), 1);
+        assert_eq!(m.read_word(RESP), 0x8000);
+        for t in 3..100 { snd.tick(t, &mut m); }
+        assert_eq!(m.read_halfword(USED + 2), 1);
+        post(&mut m, 1, 3);
+        snd.store(0x10004050, 0);
+        snd.tick(100, &mut m);
+        assert_eq!(m.read_halfword(USED + 2), 3);
+        post(&mut m, 3, 4);
+        let mut w = Ser::new(); snd.snapshot(&mut w);
+        let mut restored = VirtioSnd::new();
+        restored.restore(&mut De::new(&w.buf)).unwrap();
+        restored.tick(101, &mut m);
+        assert_eq!(m.read_halfword(USED + 2), 4);
+        assert_eq!(m.read_word(RESP), 0x8000);
+        restored.store(0x10004050, 0);
+        restored.tick(102, &mut m);
+        assert_eq!(m.read_halfword(USED + 2), 4);
+    }
+
+    #[test]
+    fn cached_playback_price_preserves_timing_across_restore_and_buffer_sizes() {
+        let mut m = memory();
+        let mut snd = VirtioSnd::new();
+        configure(|a, v| snd.store(a, v), 0x10004000);
+        m.write_word(REQ, 0x104); // PCM_START, default 48 kHz stereo
+        post(&mut m, 0, 1);
+        snd.store(0x10004050, 0);
+        snd.tick(1, &mut m);
+        assert!(snd.format().2);
+
+        let desc = DESC + 0x5000;
+        let avail = AVAIL + 0x5000;
+        let used = USED + 0x5000;
+        let pcm = REQ + 0x5000;
+        let status = RESP + 0x5000;
+        for &(off, value) in &[(0x30, 2u32), (0x38, 8), (0x80, desc as u32),
+                              (0x90, avail as u32), (0xa0, used as u32), (0x44, 1)] {
+            for (i, b) in value.to_le_bytes().iter().enumerate() {
+                snd.store(0x10004000 + off + i as u64, *b);
+            }
+        }
+        m.write_doubleword(desc, pcm);
+        m.write_word(desc + 8, 1924); // stream id + 10 ms PCM
+        m.write_halfword(desc + 12, 1);
+        m.write_halfword(desc + 14, 1);
+        m.write_doubleword(desc + 16, status);
+        m.write_word(desc + 24, 8);
+        m.write_halfword(desc + 28, 2);
+        m.write_word(pcm, 0);
+        for i in 0..1920 { m.write_byte(pcm + 4 + i, (i % 251) as u8); }
+        m.write_halfword(avail + 4, 0);
+        m.write_halfword(avail + 2, 1);
+        snd.store(0x10004050, 2);
+        // Many fine-grained ticks must not complete a 10 ms buffer early.
+        for t in 2..50002 { snd.tick(t, &mut m); }
+        assert_eq!(m.read_halfword(used + 2), 0);
+        assert_eq!(snd.pending_bytes(), 0);
+        let mut w = Ser::new(); snd.snapshot(&mut w);
+        let mut restored = VirtioSnd::new();
+        restored.restore(&mut De::new(&w.buf)).unwrap();
+        restored.tick(100000, &mut m);
+        assert_eq!(m.read_halfword(used + 2), 0);
+        restored.tick(100001, &mut m);
+        assert_eq!(m.read_halfword(used + 2), 1);
+        assert_eq!(m.read_word(status), 0x8000);
+        let actual = restored.take_pcm(1920);
+        let expected: Vec<u8> = (0..1920).map(|i| (i % 251) as u8).collect();
+        assert_eq!(actual, expected);
+
+        // Reusing the completed descriptor for a shorter period must not
+        // retain the old price or delay this 5 ms buffer to 10 ms.
+        m.write_word(desc + 8, 964);
+        m.write_halfword(avail + 6, 0);
+        m.write_halfword(avail + 2, 2);
+        restored.store(0x10004050, 2);
+        restored.tick(150000, &mut m);
+        assert_eq!(m.read_halfword(used + 2), 1);
+        restored.tick(150001, &mut m);
+        assert_eq!(m.read_halfword(used + 2), 2);
+        assert_eq!(restored.take_pcm(960), expected[..960]);
+    }
+}

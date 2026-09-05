@@ -175,6 +175,10 @@ pub struct VirtioGpu {
     interrupt_status: u32,
     status: u32,
     queues: [Queue; NUM_QUEUES],
+    /// Both split rings are empty after a drain. Their used flags remain 0
+    /// and EVENT_IDX is not offered, so the driver must notify new work.
+    /// This is a derived cache; restore schedules a fresh drain.
+    queues_notified: bool,
 
     resources: HashMap<u32, Resource>,
     /// Resource bound to scanout 0, and the region of it being displayed.
@@ -240,6 +244,7 @@ impl VirtioGpu {
             interrupt_status: 0,
             status: 0,
             queues: [Queue::new(), Queue::new()],
+            queues_notified: false,
             resources: HashMap::new(),
             scanout_resource: 0,
             screen: vec![0u8; width as usize * height as usize * BPP],
@@ -403,9 +408,10 @@ impl VirtioGpu {
     // ---- queue service ---------------------------------------------------
 
     pub fn tick(&mut self, memory: &mut MemoryWrapper) {
-        if !self.driver_ready() {
+        if !self.driver_ready() || !self.queues_notified {
             return;
         }
+        self.queues_notified = false;
         self.drain_queue(memory, CONTROL_QUEUE);
         self.drain_queue(memory, CURSOR_QUEUE);
     }
@@ -902,9 +908,13 @@ impl VirtioGpu {
                 set_byte32(&mut n, off - 0x038, v);
                 self.queue_mut().num = n;
             }
-            0x044 => self.queue_mut().ready = (value & 1) == 1,
-            // QueueNotify: tick() drains whatever is posted.
-            0x050..=0x053 => {}
+            0x044 => {
+                self.queue_mut().ready = (value & 1) == 1;
+                self.queues_notified = true;
+            }
+            // Spurious notifications are harmless. Scan both queues once,
+            // avoiding partial-word QueueNotify assembly in byte MMIO.
+            0x050..=0x053 => self.queues_notified = true,
             0x064 => {
                 if (value & 0x1) == 1 {
                     self.interrupt_status &= !0x1;
@@ -930,6 +940,7 @@ impl VirtioGpu {
 
     fn reset(&mut self) {
         self.queues = [Queue::new(), Queue::new()];
+        self.queues_notified = false;
         self.interrupt_status = 0;
         self.driver_features = 0;
         self.resources.clear();
@@ -1255,6 +1266,9 @@ impl VirtioGpu {
     }
 
     pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+        // A snapshot can contain a posted ring whose notification happened
+        // before capture. Recheck it once without changing the snapshot format.
+        self.queues_notified = true;
         self.device_features_sel = r.u32()?;
         self.driver_features = r.u64()?;
         self.driver_features_sel = r.u32()?;

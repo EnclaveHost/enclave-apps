@@ -115,6 +115,13 @@ pub struct VirtioSnd {
 	interrupt_status: u32,
 	status: u32,
 	queues: [Queue; NUM_QUEUES],
+	/// Empty control rings need no polling until QueueNotify. PCM playback
+	/// still runs on every service tick to preserve its credit-based pacing.
+	control_notified: bool,
+	/// The posted front buffer belongs to the device until completion. Cache
+	/// its price while waiting for playback credit instead of walking the same
+	/// descriptor chain on every CPU service tick. Revalidated before use.
+	pending_tx: Option<(u64, u64)>,
 	/// PCM bytes the guest has written and the host has not taken yet.
 	ring: VecDeque<u8>,
 	/// Stream parameters the driver set, so the host knows how to interpret
@@ -148,6 +155,8 @@ impl VirtioSnd {
 			interrupt_status: 0,
 			status: 0,
 			queues: [Queue::new(), Queue::new(), Queue::new(), Queue::new()],
+			control_notified: false,
+			pending_tx: None,
 			ring: VecDeque::new(),
 			rate_hz: 48_000,
 			channels: 2,
@@ -198,7 +207,10 @@ impl VirtioSnd {
 			return;
 		}
 		self.accrue(mtime);
-		self.drain_control(memory);
+		if self.control_notified {
+			self.control_notified = false;
+			self.drain_control(memory);
+		}
 		self.drain_tx(memory);
 	}
 
@@ -356,6 +368,7 @@ impl VirtioSnd {
 	/// is released or re-prepared, so the device and driver agree on where the
 	/// avail ring stands.
 	fn flush_tx(&mut self, memory: &mut MemoryWrapper) {
+		self.pending_tx = None;
 		for _ in 0..MAX_QUEUE_SIZE {
 			let Some(head) = self.pop_avail(memory, TX_QUEUE) else { break };
 			let (_data, writable) = self.walk_chain(memory, TX_QUEUE, head);
@@ -375,17 +388,32 @@ impl VirtioSnd {
 			if !self.running {
 				break;
 			}
-			let Some(head) = self.peek_avail(memory, TX_QUEUE) else { break };
 			// PRICE the buffer before reading it. walk_chain copies the whole
 			// payload a byte at a time through the MMU, and until the credit is
 			// there the answer is "not yet" — so doing it first meant copying
 			// a ~5.5 KB period buffer on EVERY tick and discarding it. That
 			// alone took the emulator from ~130 MIPS to 46 with sound playing.
-			let pcm_len = self.readable_len(memory, TX_QUEUE, head).saturating_sub(4);
+			let (head, pcm_len) = match self.pending_tx {
+				Some(pending) => pending,
+				None => {
+					let Some(head) = self.peek_avail(memory, TX_QUEUE) else { break };
+					let len = self.readable_len(memory, TX_QUEUE, head).saturating_sub(4);
+					self.pending_tx = Some((head, len));
+					(head, len)
+				}
+			};
 			// Not yet played: leave it posted and come back when time has
 			// passed. This is the whole of the rate control.
 			if self.credit < pcm_len {
 				break;
+			}
+			self.pending_tx = None;
+			// A conforming driver leaves a posted descriptor unchanged. Still
+			// recheck at completion so changed guest rings cannot spend an old
+			// buffer's credit on a different payload.
+			if self.peek_avail(memory, TX_QUEUE) != Some(head)
+				|| self.readable_len(memory, TX_QUEUE, head).saturating_sub(4) != pcm_len {
+				continue;
 			}
 			self.credit -= pcm_len;
 			let _ = self.pop_avail(memory, TX_QUEUE);
@@ -460,6 +488,9 @@ impl VirtioSnd {
 
 	pub fn store(&mut self, address: u64, value: u8) {
 		let off = address - BASE;
+		if matches!(off, 0x038..=0x03b | 0x044 | 0x080..=0x0a7) {
+			self.pending_tx = None;
+		}
 		let v = value as u32;
 		match off {
 			0x014..=0x017 => set_byte32(&mut self.device_features_sel, off - 0x014, v),
@@ -475,10 +506,13 @@ impl VirtioSnd {
 				set_byte32(&mut n, off - 0x038, v);
 				self.queue_mut().num = n;
 			}
-			0x044 => self.queue_mut().ready = (value & 1) == 1,
-			// QueueNotify: tick() drains whatever is posted, so a notify needs
-			// no per-queue action beyond being accepted.
-			0x050..=0x053 => {}
+			0x044 => {
+				self.queue_mut().ready = (value & 1) == 1;
+				self.control_notified = true;
+			}
+			// No EVENT_IDX or notification suppression is offered. Any queue
+			// kick also rechecks control; spurious notifications are harmless.
+			0x050..=0x053 => self.control_notified = true,
 			0x064 => {
 				if (value & 0x1) == 1 {
 					self.interrupt_status &= !0x1;
@@ -504,6 +538,8 @@ impl VirtioSnd {
 
 	fn reset(&mut self) {
 		self.queues = [Queue::new(), Queue::new(), Queue::new(), Queue::new()];
+		self.control_notified = false;
+		self.pending_tx = None;
 		self.interrupt_status = 0;
 		self.driver_features = 0;
 		self.ring.clear();
@@ -749,6 +785,10 @@ impl VirtioSnd {
 	}
 
 	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
+		// Recheck pending control requests even if the notification preceded
+		// the snapshot. This cache adds no serialized fields.
+		self.control_notified = true;
+		self.pending_tx = None;
 		self.device_features_sel = r.u32()?;
 		self.driver_features = r.u64()?;
 		self.driver_features_sel = r.u32()?;
