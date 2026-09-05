@@ -299,10 +299,11 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    /// `kbps` is the VBV-controlled target bitrate. Dimensions must be
-    /// macroblock-aligned (multiples of 16) — the framebuffer's 1024x768 is.
+    /// `kbps` is the VBV-controlled target bitrate. I420 needs even dimensions.
+    /// The C wrapper sets const_input_flag, so minih264 pads edge macroblocks
+    /// internally and writes SPS crop offsets for sizes such as 960x600.
     pub fn new(w: usize, h: usize, kbps: u32) -> Option<Self> {
-        if w == 0 || h == 0 || w % 16 != 0 || h % 16 != 0 {
+        if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 {
             return None;
         }
         let (mut p, mut s) = (0i32, 0i32);

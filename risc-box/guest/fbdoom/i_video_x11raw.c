@@ -237,6 +237,7 @@ static int x_setup(void)
 }
 
 static void wm_delete_setup(void);
+static void wm_fullscreen_setup(void);
 
 static void x_create_window(void)
 {
@@ -284,6 +285,8 @@ static void x_create_window(void)
     // that arrives after MapWindow was never seen — the close button then
     // falls back to XKillClient.
     wm_delete_setup();
+    if (win_w == root_w && win_h == root_h)
+        wm_fullscreen_setup();
 
     mw.op = 8;
     mw.pad = 0;
@@ -338,6 +341,26 @@ static uint32_t intern_atom(const char *name)
         if (reply[0] == 1)
             return *(uint32_t *)(reply + 8);
     }
+}
+
+// A screen-sized client needs the WM's fullscreen state before MapWindow.
+// Otherwise fluxbox adds decorations and moves the client upward to fit,
+// clipping the game even though its framebuffer has the right dimensions.
+static void wm_fullscreen_setup(void)
+{
+    uint32_t state = intern_atom("_NET_WM_STATE");
+    uint32_t fullscreen = intern_atom("_NET_WM_STATE_FULLSCREEN");
+    if (!state || !fullscreen)
+        return;
+    struct {
+        uint8_t op, mode;
+        uint16_t len;
+        uint32_t win, prop, type;
+        uint8_t fmt, pad[3];
+        uint32_t n, atom;
+    } cp = { 18, 0, 7, win, state, 4, 32, {0, 0, 0}, 1, fullscreen };
+    wr(&cp, sizeof(cp));
+    printf("I_InitGraphics: requested fullscreen %dx%d\n", win_w, win_h);
 }
 
 static void wm_delete_setup(void)
@@ -695,6 +718,8 @@ static void put_rows(int y0, int rows)
 // row is nothing next to writing 2560 and having X copy them.
 static uint8_t prev[SCREENWIDTH * SCREENHEIGHT];
 
+#include "scale3.h"
+
 
 void I_FinishUpdate(void)
 {
@@ -797,6 +822,9 @@ void I_FinishUpdate(void)
                 o1[x * 2 + 1] = c;
             }
         }
+    } else if (scale == 3 && ((uintptr_t)dst_base % 8) == 0 && dst_stride % 8 == 0) {
+        rbx_scale3(dst_base, (size_t)dst_stride, src, palette,
+                   SCREENWIDTH, first, last);
     } else {
         int i, j;
         for (y = first; y <= last; y++) {
