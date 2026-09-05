@@ -982,6 +982,9 @@ void I_SetPalette(byte *doompalette)
         uint32_t b = gammatable[usegamma][*doompalette++];
         palette[i] = (r << 16) | (g << 8) | b;
     }
+    // Identical palette indices can now mean different output colors. Dirty
+    // rows and the static-frame shortcut must repaint after a palette change.
+    have_prev = 0;
 }
 
 int I_GetPaletteIndex(int r, int g, int b)
