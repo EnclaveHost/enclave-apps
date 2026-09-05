@@ -44,8 +44,8 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "[w64-prepare] missing: $1"; 
 for t in curl git tar cmake ninja python3 patch cargo rustup; do need "$t"; done
 rustup component list --installed --toolchain "$RUST_TC" 2>/dev/null | grep -q '^rust-src' \
   || { echo "[w64-prepare] nightly needs rust-src: rustup component add rust-src --toolchain $RUST_TC"; exit 2; }
-rustup target list --installed --toolchain "$RUST_TC" 2>/dev/null | grep -q '^wasm32-wasip2' \
-  || { echo "[w64-prepare] nightly needs wasm32-wasip2 (for the proxy): rustup target add wasm32-wasip2 --toolchain $RUST_TC"; exit 2; }
+rustup target list --installed --toolchain "$RUST_TC" 2>/dev/null | grep -q '^wasm32-unknown-unknown' \
+  || { echo "[w64-prepare] nightly needs wasm32-unknown-unknown (for the proxy): rustup target add wasm32-unknown-unknown --toolchain $RUST_TC"; exit 2; }
 if rustup run stable cargo --version >/dev/null 2>&1; then STABLE="+stable"; else STABLE="+$RUST_TC"; fi
 
 # crates.io sources, fetched as the published tarballs (no registry cache needed)
@@ -162,6 +162,10 @@ if [ ! -f "$W64/rustsrc/library/Cargo.toml" ] || ! grep -q "$W64/wasip2" "$W64/r
   log "copying std sources from $RUST_SRC"
   sh "$HERE/std-wasm64.sh" "$RUST_SRC" "$W64/rustsrc/library" "$W64"
 fi
+
+# Cache the locked dependencies for per-app offline proxy builds.
+( cd "$HERE/wasiproxy" && cargo "+$RUST_TC" build --release --locked \
+    --target wasm32-unknown-unknown --target-dir "$W64/wasiproxy-target" -q )
 
 log "toolchain ready at $W64"
 log "  clang:      $("$CLANG" --version | head -1)"

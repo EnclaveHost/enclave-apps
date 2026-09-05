@@ -17,8 +17,10 @@ src="$1"; out="$2"; w64="$3"
 [ -d "$src/std" ] || { echo "usage: std-wasm64.sh <rust-src/library> <out> <W64>"; exit 2; }
 [ -d "$w64/wasip2" ] && [ -d "$w64/wit-bindgen" ] || { echo "std-wasm64.sh: $w64/wasip2 and $w64/wit-bindgen must exist first"; exit 2; }
 rm -rf "$out" && mkdir -p "$out" && cp -r "$src"/. "$out"/
-for f in std/src/os/fd/owned.rs std/src/os/unix/io/mod.rs std/src/sys/thread/wasm.rs \
-         std/src/sys/alloc/mod.rs std/src/sys/sync/futex/wasm.rs std/src/os/fd/raw.rs; do
+# The futex and thread modules already select wasm32/wasm64 intrinsics
+# separately. Widening their wasm32 imports breaks atomic wasm64 builds.
+for f in std/src/os/fd/owned.rs std/src/os/unix/io/mod.rs \
+         std/src/sys/alloc/mod.rs std/src/os/fd/raw.rs; do
   sed -i 's/target_arch = "wasm32"/any(target_arch = "wasm32", target_arch = "wasm64")/g; s/any(any(target_arch = "wasm32", target_arch = "wasm64"), target_arch = "wasm64")/any(target_arch = "wasm32", target_arch = "wasm64")/g' "$out/$f"
 done
 # The library workspace already has a [patch.crates-io] table (the

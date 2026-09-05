@@ -17,7 +17,7 @@ RUN curl -fsSL -o /tmp/cmake.tgz "https://github.com/Kitware/CMake/releases/down
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 ARG RUST_NIGHTLY=nightly-2026-08-07
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain "${RUST_NIGHTLY}" --profile minimal \
-      -c rust-src -t wasm32-wasip2 \
+      -c rust-src -t wasm32-wasip2 -t wasm32-unknown-unknown \
  && rustup toolchain install stable --profile minimal
 COPY wasm64/ /opt/w64-src/wasm64/
 # the scripts take the toolchain name from RUST_TC (default "nightly"); pin it

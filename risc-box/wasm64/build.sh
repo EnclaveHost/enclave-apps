@@ -43,8 +43,7 @@
 # What the engine does implement completely is the component-to-component
 # adapter (FACT), which transcodes between a 64-bit caller and a 32-bit
 # callee. So the last step plugs the app into wasm64/wasiproxy: a wasm32
-# component exporting every stable wasi 0.2.12 interface by forwarding to
-# the identically-named import. The host only ever sees a 32-bit caller.
+# component forwarding exactly the app's own WASI interfaces and versions. The host only ever sees a 32-bit caller.
 # (`wac plug`, not `wasm-tools compose`: the latter cannot remap resource
 # types across the boundary.)
 #
@@ -66,7 +65,7 @@ SYSROOT="$(rustc "+$RUST_TC" --print sysroot)"
 SC="$SYSROOT/lib/rustlib/wasm64-wasip2/lib/self-contained"
 mkdir -p "$SC"
 for f in crt1-command.o crt1-reactor.o crt1.o libc.a; do
-  ln -sf "$W64/sysroot64/lib/wasm64-wasip2/$f" "$SC/$f"
+  [ "$(readlink "$SC/$f")" = "$W64/sysroot64/lib/wasm64-wasip2/$f" ] || ln -sf "$W64/sysroot64/lib/wasm64-wasip2/$f" "$SC/$f"
 done
 [ -f "$SC/libunwind.a" ] || "$W64/wasi-sdk/bin/llvm-ar" rcs "$SC/libunwind.a"
 
@@ -98,43 +97,5 @@ RAW="${OUT%.wasm}-raw.wasm"
 "$W64/wasm-tools" component new "$CORE" -o "$RAW"
 "$W64/wasm-tools" validate --features all "$RAW"
 
-echo "[w64] building the wasi pass-through proxy (wasm32)"
-# the proxy is its own crate; its target dir follows CARGO_TARGET_DIR when
-# set (a container build redirects everything), else lives next to it
-PROXY_TD="${CARGO_TARGET_DIR:-$PWD/wasm64/wasiproxy/target}"
-case "$PROXY_TD" in /*) ;; *) PROXY_TD="$PWD/$PROXY_TD";; esac
-( cd wasm64/wasiproxy
-  # regenerate the forwarding crate when the WIT moved (the checked-in
-  # src/lib.rs is that output; gen.py is deterministic)
-  if [ -x "$W64/wasm-tools" ]; then
-    "$W64/wasm-tools" component wit --json wit > "${TMPDIR:-/tmp}/wasiproxy.json"
-    python3 gen.py "${TMPDIR:-/tmp}/wasiproxy.json" > "${TMPDIR:-/tmp}/wasiproxy-lib.rs"
-    cmp -s "${TMPDIR:-/tmp}/wasiproxy-lib.rs" src/lib.rs || {
-      echo "[w64] wasiproxy/src/lib.rs regenerated from wit/"; cp "${TMPDIR:-/tmp}/wasiproxy-lib.rs" src/lib.rs; }
-  fi
-  cargo build --release --target wasm32-wasip2 --target-dir "$PROXY_TD" )
-PROXY="$PROXY_TD/wasm32-wasip2/release/wasiproxy.wasm"
-
-echo "[w64] plugging the app into the proxy"
-"$W64/wac" plug --plug "$PROXY" "$RAW" -o "$OUT"
-"$W64/wasm-tools" validate --features all "$OUT"
-
-# Every WASI import the app makes must now be answered by the proxy: the
-# composed component may import only what the proxy itself imports. An
-# app import the proxy does not export would stay a direct host import and
-# be misread at runtime, so this is fatal, not a warning.
-python3 - "$OUT" "$PROXY" "$RAW" "$W64/wasm-tools" <<'PY'
-import subprocess, sys, re
-def imports(p):
-    out = subprocess.run([sys.argv[4], "component", "wit", p], capture_output=True, text=True, check=True).stdout
-    return set(re.findall(r"^\s*import ([^;]+);", out, re.M))
-out, proxy, raw = map(imports, sys.argv[1:4])
-stray = out - proxy
-assert not stray, f"app imports bypass the proxy: {sorted(stray)}"
-print(f"[w64] app imported {len(raw)} interfaces; all plugged; composed imports = proxy's {len(out)}")
-b = open(sys.argv[1], "rb").read()
-assert b[:4] == b"\x00asm", "not wasm"
-layer = b[6] | (b[7] << 8)
-assert layer == 1, f"expected a component, got layer {layer}"
-print(f"[w64] {sys.argv[1]}: {len(b):,} bytes, component, memory64, proxied")
-PY
+echo "[w64] generating the app-specific WASI proxy"
+python3 wasm64/proxy-app.py "$RAW" -o "$OUT"

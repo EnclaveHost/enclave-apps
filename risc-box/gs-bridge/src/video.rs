@@ -82,7 +82,15 @@ impl Encoder {
         // worth aiming for: stream at the framebuffer's own size.
         let in_size = format!("{}x{}", source.0, source.1);
         let rescaling = (cfg.width, cfg.height) != (source.0, source.1);
-        let scale = format!("scale={}:{}:flags=bilinear", cfg.width, cfg.height);
+        // Exact integer enlargement preserves a game's original pixels. Doing
+        // it here lets a 320x200 renderer fill a 960x600 stream without making
+        // the emulated CPU paint nine copies of every pixel.
+        let integer_scale = cfg.width >= source.0 && cfg.height >= source.1
+            && source.0 != 0 && source.1 != 0
+            && cfg.width % source.0 == 0 && cfg.height % source.1 == 0
+            && cfg.width / source.0 == cfg.height / source.1;
+        let filter = if integer_scale { "neighbor" } else { "bilinear" };
+        let scale = format!("scale={}:{}:flags={filter}", cfg.width, cfg.height);
         let fps = cfg.fps.max(1).to_string();
         let bitrate = format!("{}k", cfg.bitrate_kbps.max(500));
         // One IDR per second by default. GSB_GOP overrides the interval (in
@@ -205,6 +213,14 @@ fn feeder(
             }
             None => match app.get("/fb.rgb") {
                 Ok(f) if !f.is_empty() => {
+                    // Raw pulls do not carry the mirror's generation counter.
+                    // Count changed pixels here too: a fixed-rate encoder can
+                    // report 60 FPS while repeatedly sending a slow guest's
+                    // last image. Comparing native byte slices is cheap and
+                    // usually stops at the first changed pixel.
+                    if last_frame.as_ref().map_or(true, |last| last != &f) {
+                        fresh += 1;
+                    }
                     last_frame = Some(f);
                     last_frame.as_ref().unwrap()
                 }
