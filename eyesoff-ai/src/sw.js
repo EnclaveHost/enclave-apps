@@ -95,30 +95,20 @@ self.addEventListener("fetch", function (e) {
   if (r === null) return;
 
   if (req.mode === "navigate" && isShellNav(r)) {
-    // Cache-first for an instant, offline-capable open; refresh the stored
-    // copy in the background. A version change lands via the rev-keyed
-    // cache swap, so serving the cached page here is never a downgrade the
-    // next load would not fix.
+    // An online navigation must see the platform's current access decision.
+    // In particular, a cached shell must not hide the sign-in response after
+    // a private app's session expires. Retain the shell for network failures.
     e.respondWith(
       (function () {
         var root = shellURL("");
         return caches.open(CACHE).then(function (c) {
-          return c.match(root).then(function (hit) {
-            var refresh = fetch(req)
-              .then(function (res) {
-                if (res && res.ok) c.put(root, res.clone());
-                return res;
-              })
-              .catch(function () {
-                return undefined;
-              });
-            e.waitUntil(refresh);
-            return (
-              hit ||
-              refresh.then(function (res) {
-                return res || Response.error();
-              })
-            );
+          return fetch(req).then(function (res) {
+            if (res && res.ok) e.waitUntil(c.put(root, res.clone()));
+            return res;
+          }).catch(function () {
+            return c.match(root).then(function (hit) {
+              return hit || Response.error();
+            });
           });
         });
       })()

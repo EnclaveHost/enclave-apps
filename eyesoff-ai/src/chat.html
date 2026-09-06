@@ -5192,6 +5192,45 @@ const modelsReady = (async () => {
 // status line. Typing meanwhile is fine: the host coalesces concurrent
 // loads onto one init.
 let pillTimer = null;
+// Read real prefix progress as it arrives. Older deployments and error
+// responses still return one JSON document, so keep that path compatible.
+async function readWarmupResponse(res, onStatus) {
+  if (!(res.headers.get("content-type") || "").includes("application/x-ndjson")) {
+    return res.json();
+  }
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = "", result;
+  const line = (s) => {
+    if (!s.trim()) return;
+    const d = JSON.parse(s);
+    if (typeof d.status === "string") onStatus(d.status);
+    if (d.result !== undefined) result = d.result;
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) { buf += dec.decode(); break; }
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      line(buf.slice(0, i));
+      buf = buf.slice(i + 1);
+    }
+  }
+  line(buf);
+  if (result === undefined) throw new Error("Warmup ended before its result arrived");
+  return result;
+}
+
+function warmupStatus(status) {
+  const m = /^prefilling (\d+) of (\d+) prompt tokens$/.exec(status);
+  if (m) return "Model loaded · preparing chat: " + m[1] + " / " + m[2] + " tokens";
+  // mm36: another tab, the boot warm-up or a chat is already preparing it;
+  // this request waits for that one instead of reading the prefix again
+  const w = /^prefilling (\d+) of (\d+) shared prefix tokens/.exec(status);
+  if (w) return "Model loaded · sharing a warm-up in progress: " + w[1] + " / " + w[2] + " tokens";
+  return status;
+}
+
 function pill(cls, html, text, hideAfter) {
   clearTimeout(pillTimer);
   warmPill.className = "show " + cls;
@@ -5204,14 +5243,16 @@ async function warm() {
   const model = state.model;
   pill("", '<span class="spin"></span>', "Loading " + (model || "model") + "…");
   const t0 = Date.now();
-  const q = [];
+  const q = ["progress=1"];
   if (model) q.push("model=" + encodeURIComponent(model));
   if (state.target === "cpu") q.push("target=cpu");
   q.push("switches=" + encodeURIComponent(JSON.stringify(switchesForWarm())));
   try {
     const res = await fetch("warmup" + (q.length ? "?" + q.join("&") : ""),
       { signal: AbortSignal.timeout(180000) });
-    const d = await res.json().catch(() => ({}));
+    const d = await readWarmupResponse(res, (s) => {
+      pill("", '<span class="spin"></span>', warmupStatus(s));
+    });
     if (res.ok && d.ok) {
       pill("ok", ICONS.tick, " Ready · " + d.target + " · " + ((Date.now() - t0) / 1000).toFixed(1) + "s", 5000);
     } else {
@@ -5281,7 +5322,7 @@ async function warmLadder() {
     rows[m.name] = li;
     bootList.appendChild(li);
   }
-  const q = (state.target === "cpu" ? "&target=cpu" : "")
+  const q = "&progress=1" + (state.target === "cpu" ? "&target=cpu" : "")
     + "&switches=" + encodeURIComponent(JSON.stringify(switchesForWarm()));
   const t0 = Date.now();
   let warmed = 0, unfitCount = 0, largestOk = null;
@@ -5344,7 +5385,12 @@ async function warmLadder() {
     try {
       const res = await fetch("warmup?model=" + encodeURIComponent(m.name) + q,
         { signal: AbortSignal.timeout(600000) });
-      const d = await res.json().catch(() => ({}));
+      const d = await readWarmupResponse(res, (s) => {
+        const label = warmupStatus(s);
+        bootMsg.textContent = label;
+        li.querySelector(".b-sub").textContent = "preparing chat…";
+        if (bootGone) pill("", '<span class="spin"></span>', label);
+      });
       ok = res.ok && !!d.ok;
       if (!ok) {
         unfit = true;
@@ -5372,7 +5418,7 @@ async function warmLadder() {
       state.unfit[m.name] = err;
       li.classList.add("unfit");
       li.querySelector(".st").innerHTML = ICONS.alert;
-      li.querySelector(".b-sub").textContent = "needs more resources";
+      li.querySelector(".b-sub").textContent = "warmup failed";
       li.title = err;
     } else {
       // no server verdict (network error / deployment mid-restart): keep it
@@ -5423,7 +5469,7 @@ async function warmLadder() {
     pill("fail", ICONS.alert, " The server never finished loading the model; redeploy or check the server logs", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed && unfitCount >= ladder.length) {
-    pill("fail", ICONS.alert, " No attached model fits this server; add resources or attach smaller models", 15000);
+    pill("fail", ICONS.alert, " Models could not finish warming; check the error details", 15000);
     warmPill.title = unfitTitle();
   } else if (!warmed) {
     pill("fail", ICONS.alert, " Warmup did not finish; the first reply will load the model", 10000);

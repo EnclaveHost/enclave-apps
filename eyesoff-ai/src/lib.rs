@@ -930,20 +930,21 @@ fn prefill_text(
     ids: &[u32],
     marks: &[usize],
     status: &dyn Fn(&str) -> bool,
-    mut feed: impl FnMut(&mut Session, &[u32], bool, Option<(&[u32], &[usize])>) -> Result<Row, String>,
+    mut feed: impl FnMut(&mut Session, &[u32], bool, Option<Declare<'_>>) -> Result<Row, String>,
 ) -> Result<Row, String> {
     let cap = prefill_chunk(sess, cfg);
     let mut chunk = PREFILL_CHUNK.min(cap);
     let mut last_tick = now_ms();
     let mut done = 0usize;
     let mut logits = Row::dense(Vec::new());
+    let t_wait0 = now_ms();
     while done < ids.len() {
         let end = (done + chunk).min(ids.len());
         let last = end == ids.len();
-        let declare = (done == 0).then_some((ids, marks));
-        let t_chunk = now_ms();
-        let l = feed(sess, &ids[done..end], last, declare)?;
-        let took = now_ms() - t_chunk;
+        let (l, took) = feed_waiting(|wait| {
+            let declare = (done == 0).then_some(Declare { prompt: ids, marks, wait });
+            feed(sess, &ids[done..end], last, declare)
+        }, status, t_wait0, ids.len())?;
         if last {
             logits = l;
         }
@@ -957,6 +958,83 @@ fn prefill_text(
         }
     }
     Ok(logits)
+}
+
+/// mm34/mm36: what a prompt's FIRST chunk declares beside itself.
+#[derive(Clone, Copy)]
+struct Declare<'a> {
+    /// the whole prompt's token ids (mm34: the host branches off the
+    /// longest park that is a prefix of it)
+    prompt: &'a [u32],
+    /// where its shared prefixes end (mm35: parked as prefill crosses them)
+    marks: &'a [usize],
+    /// mm36: wait for another request already preparing the same prefix
+    /// (PREFIX_WARMING_MARKER) instead of reading it concurrently
+    wait: bool,
+}
+
+/// mm36: one prompt chunk's feed, waiting out a PREFIX_WARMING_MARKER
+/// refusal. Another request is preparing this prompt's shared prefix: wait
+/// for it HERE, outside any host call (the status bytes keep the stream
+/// alive, and a reader that left ends the wait), then retry the SAME chunk
+/// - nothing of it was fed, and the retry re-plans and branches off the
+/// park once it stands. `feed(wait)` runs one attempt (`wait` = still
+/// inside the budget measured from `t_wait0`, so a leader that outlasts it
+/// is simply no longer waited for); `total` is the progress line's fallback
+/// denominator. Returns the row and how long the successful attempt took.
+fn feed_waiting(
+    mut feed: impl FnMut(bool) -> Result<Row, String>,
+    status: &dyn Fn(&str) -> bool,
+    t_wait0: u128,
+    total: usize,
+) -> Result<(Row, u128), String> {
+    loop {
+        let t = now_ms();
+        match feed(now_ms() - t_wait0 < PREFIX_WAIT_BUDGET_MS) {
+            Ok(l) => return Ok((l, now_ms() - t)),
+            Err(e) if e.contains(PREFIX_WARMING_MARKER) => {
+                let (got, of) = prefix_wait_progress(&e).unwrap_or((0, total));
+                if !status(&format!(
+                    "{PREFILL_STATUS}{got} of {of} shared prefix tokens (another request is preparing them)"
+                )) {
+                    return Err("client disconnected".into());
+                }
+                sleep_ms(PREFIX_WAIT_POLL_MS);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The "(N of M tokens)" a PREFIX_WARMING_MARKER refusal carries: the
+/// leader's progress toward the mark this request is waiting on.
+fn prefix_wait_progress(e: &str) -> Option<(usize, usize)> {
+    let at = e.find(PREFIX_WARMING_MARKER)?;
+    let rest = &e[at..];
+    let open = rest.find('(')?;
+    let close = rest[open..].find(')')? + open;
+    let (a, b) = rest[open + 1..close].split_once(" of ")?;
+    let n: usize = a.trim().parse().ok()?;
+    let m: usize = b.trim().strip_suffix("tokens")?.trim().parse().ok()?;
+    Some((n, m))
+}
+
+#[cfg(test)]
+mod prefix_wait_tests {
+    use super::*;
+
+    #[test]
+    fn the_refusal_is_recognised_and_its_progress_read() {
+        // the exact shape wasm/wasmtime-nn-ggml.patch's prefix_warming() builds,
+        // wrapped the way nn_err() wraps every host error
+        let e = "compute: RuntimeError: [prefix_warming] another request is preparing this \
+                 prompt's shared prefix (512 of 3340 tokens); retry the same chunk shortly";
+        assert!(e.contains(PREFIX_WARMING_MARKER));
+        assert_eq!(prefix_wait_progress(e), Some((512, 3340)));
+        assert_eq!(prefix_wait_progress("compute: something else (1 of 2 tokens)"), None);
+        assert_eq!(prefix_wait_progress("[prefix_warming] no numbers"), None);
+        assert_eq!(prefix_wait_progress("[prefix_warming] (x of y tokens)"), None);
+    }
 }
 /// Request-body ceiling. Generous because attachments arrive base64'd INSIDE
 /// the JSON (~1.35x the file), and a vision turn can legitimately carry
@@ -985,6 +1063,18 @@ const BUSY_STATUS: &str = "busy with other chats";
 /// keep the stream alive, and a prefill slow enough to matter is slow enough
 /// to trip the proxy's 180s idle cut on its own.
 const PREFILL_STATUS: &str = "prefilling ";
+/// mm36 shared warming: the host refuses a declared prompt's FIRST chunk with
+/// this marker while another request is preparing the same shared prefix (it
+/// carries "N of M tokens"); prefill_text waits OUTSIDE any host call and
+/// retries the same chunk, so one warm-up serves every caller that starts the
+/// same way - the page-load warm-up of every tab, the boot warm-up, a chat,
+/// an API run - instead of each reading ~3,000 tokens on its own.
+const PREFIX_WARMING_MARKER: &str = "[prefix_warming]";
+const PREFIX_WAIT_POLL_MS: u64 = 2000;
+/// Past this a waiter stops deferring and reads the prefix itself (the host
+/// drops a leader that reports no progress for 300 s on its own; this is the
+/// guest's outer bound against one that keeps reporting, slowly).
+const PREFIX_WAIT_BUDGET_MS: u128 = 900_000;
 /// Busy-queue allowance for the INTERNAL generations (the router verdict, the
 /// vision question, the chat title): long enough to ride out a normal turn
 /// finishing ahead, far short of the main leg's five minutes. An optional
@@ -1237,7 +1327,7 @@ impl Session {
         cfg: &AppConfig,
         ids: &[u32],
         want_logits: bool,
-        prompt: Option<(&[u32], &[usize])>,
+        prompt: Option<Declare<'_>>,
     ) -> Result<Row, String> {
         alive()?; // no forward pass for a reader that left
         match self {
@@ -1272,7 +1362,7 @@ impl Session {
                     inputs.push(("more".to_string(),
                         Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())));
                 }
-                if let Some((all, marks)) = prompt {
+                if let Some(Declare { prompt: all, marks, wait }) = prompt {
                     let pb: Vec<u8> = all.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
                     inputs.push(("prompt".to_string(),
                         Tensor::new(&[1, all.len() as u32], TensorType::I32, &pb)));
@@ -1280,6 +1370,12 @@ impl Session {
                         let mb: Vec<u8> = marks.iter().flat_map(|&m| (m as i32).to_le_bytes()).collect();
                         inputs.push(("marks".to_string(),
                             Tensor::new(&[marks.len() as u32], TensorType::I32, &mb)));
+                    }
+                    // mm36: rather wait for a warm-up of this prefix already under
+                    // way than read it concurrently (engines predating it ignore this)
+                    if wait {
+                        inputs.push(("prefix_wait".to_string(),
+                            Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())));
                     }
                 }
                 let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
@@ -1887,6 +1983,9 @@ impl Session {
             sync_calls: if data.len() >= 40 { v(9) } else { -1 },
             mtp_round: data.len() >= 44 && v(10) != 0,
             prefix_parks: data.len() >= 56 && v(13) > 0,
+            prefix_wait: data.len() >= 60 && v(14) > 0,
+            warming: if data.len() >= 64 { v(15).max(0) } else { 0 },
+            parks: if data.len() >= 68 { v(16).max(0) } else { 0 },
         })
     }
 
@@ -1903,7 +2002,7 @@ impl Session {
         &mut self,
         cfg: &AppConfig,
         ids: &[u32],
-        prompt: Option<(&[u32], &[usize])>,
+        prompt: Option<Declare<'_>>,
     ) -> Result<Row, String> {
         alive()?;
         let Session::Ggml { ctx } = self else {
@@ -1916,7 +2015,7 @@ impl Session {
             topk_input(),
             timing_input(),
         ];
-        if let Some((all, marks)) = prompt {
+        if let Some(Declare { prompt: all, marks, wait }) = prompt {
             let pb: Vec<u8> = all.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
             inputs.push(("prompt".to_string(),
                 Tensor::new(&[1, all.len() as u32], TensorType::I32, &pb)));
@@ -1924,6 +2023,12 @@ impl Session {
                 let mb: Vec<u8> = marks.iter().flat_map(|&m| (m as i32).to_le_bytes()).collect();
                 inputs.push(("marks".to_string(),
                     Tensor::new(&[marks.len() as u32], TensorType::I32, &mb)));
+            }
+            // mm36: rather wait for a warm-up of this prefix already under
+            // way than read it concurrently (engines predating it ignore this)
+            if wait {
+                inputs.push(("prefix_wait".to_string(),
+                    Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())));
             }
         }
         let outs = ctx.compute(inputs).map_err(|e| nn_err("compute", e))?;
@@ -2380,6 +2485,16 @@ struct Caps {
     /// marks beside its prompt declaration (see Prompt::marks). false on
     /// older hosts, where the marks are ignored.
     prefix_parks: bool,
+    /// mm36: the engine refuses a first chunk sent with "prefix_wait" while
+    /// another context prepares the same prefix (PREFIX_WARMING_MARKER).
+    /// Informational - the input is harmless on engines predating it.
+    #[allow(dead_code)]
+    prefix_wait: bool,
+    /// mm36: prefixes being prepared right now, and parks standing - both
+    /// are compute that already happened in this very process, the proof
+    /// warm_one's probe feed exists to obtain
+    warming: i32,
+    parks: i32,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -3044,13 +3159,14 @@ fn generate(
                     let end = (done + chunk).min(ids.len());
                     // only the very last token of the whole prompt needs logits
                     let last = i == last_part && end == ids.len();
-                    let t_chunk = now_ms();
-                    // the whole prompt rides beside its first chunk (mm34)
-                    let declare = if fed == 0 && done == 0 {
-                        prompt.text_only().map(|t| (t, prompt.marks.as_slice()))
-                    } else { None };
-                    let l = sess.feed_declared(cfg, &ids[done..end], last, declare)?;
-                    let took = now_ms() - t_chunk;
+                    // the whole prompt rides beside its first chunk (mm34),
+                    // waiting out a warm-up of its prefix already under way (mm36)
+                    let (l, took) = feed_waiting(|wait| {
+                        let declare = if fed == 0 && done == 0 {
+                            prompt.text_only().map(|t| Declare { prompt: t, marks: prompt.marks.as_slice(), wait })
+                        } else { None };
+                        sess.feed_declared(cfg, &ids[done..end], last, declare)
+                    }, status, t1, prompt_ids.len())?;
                     if last {
                         logits = l;
                     }
@@ -7879,11 +7995,13 @@ fn respond_bytes(out: ResponseOutparam, status: u16, ctype: &str, body_bytes: &[
 struct JsonStream {
     body: OutgoingBody,
     stream: OutputStream,
+    progress: bool,
 }
 
-fn open_json(out: ResponseOutparam) -> JsonStream {
+fn open_json(out: ResponseOutparam, progress: bool) -> JsonStream {
     let headers = Fields::new();
-    let _ = headers.set(&"content-type".to_string(), &[b"application/json".to_vec()]);
+    let ctype = if progress { "application/x-ndjson" } else { "application/json" };
+    let _ = headers.set(&"content-type".to_string(), &[ctype.as_bytes().to_vec()]);
     let _ = headers.set(&"cache-control".to_string(), &[b"no-cache".to_vec()]);
     let resp = OutgoingResponse::new(headers);
     let _ = resp.set_status_code(200);
@@ -7891,17 +8009,19 @@ fn open_json(out: ResponseOutparam) -> JsonStream {
     ResponseOutparam::set(out, Ok(resp));
     let stream = body.write().unwrap();
     watch_client(&stream);
-    JsonStream { body, stream }
+    JsonStream { body, stream, progress }
 }
 
 impl JsonStream {
-    /// one byte of liveness; false once the reader is gone
-    fn tick(&self) -> bool {
-        self.stream.blocking_write_and_flush(b" ").is_ok()
+    /// Opt-in progress for the GUI; legacy callers still receive plain JSON.
+    /// Both forms stop work once the reader is gone.
+    fn tick(&self, status: &str) -> bool {
+        let bytes = warmup_frame(self.progress, status, None);
+        self.stream.blocking_write_and_flush(bytes.as_bytes()).is_ok()
     }
 
     fn finish(self, v: &serde_json::Value) {
-        let bytes = v.to_string();
+        let bytes = warmup_frame(self.progress, "", Some(v));
         for chunk in bytes.as_bytes().chunks(4000) {
             if self.stream.blocking_write_and_flush(chunk).is_err() {
                 break;
@@ -7909,6 +8029,38 @@ impl JsonStream {
         }
         drop(self.stream);
         let _ = OutgoingBody::finish(self.body, None);
+    }
+}
+
+fn warmup_frame(progress: bool, status: &str, result: Option<&serde_json::Value>) -> String {
+    match (progress, result) {
+        (false, None) => " ".into(),
+        (false, Some(v)) => v.to_string(),
+        (true, None) => format!("{}\n", serde_json::json!({ "status": status })),
+        (true, Some(v)) => format!("{}\n", serde_json::json!({ "result": v })),
+    }
+}
+
+#[cfg(test)]
+mod warmup_stream_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_warmup_remains_one_json_document() {
+        let result = serde_json::json!({ "ok": true, "prefix": { "parked": false } });
+        let wire = warmup_frame(false, "preparing", None) + &warmup_frame(false, "", Some(&result));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&wire).unwrap(), result);
+    }
+
+    #[test]
+    fn progress_and_completion_are_independent_json_lines() {
+        let status = "prefilling 4 of 100 prompt tokens\n\"quoted\"";
+        let result = serde_json::json!({ "ok": true, "prefix": { "parked": true } });
+        let wire = warmup_frame(true, status, None) + &warmup_frame(true, "", Some(&result));
+        let lines: Vec<serde_json::Value> = wire.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["status"], status);
+        assert_eq!(lines[1]["result"], result);
     }
 }
 
@@ -9369,9 +9521,24 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
 /// forces the full compute path (workspace allocation, kernel warm) without
 /// generating anything a user could see. Returns (target, load_ms, feed_ms).
 /// Repeat calls are cheap (the load coalesces on the host's session cache /
-/// preloaded graph). An error here IS the fit signal the ladder consumes:
+/// preloaded graph, and the feed is skipped once the engine reports prefix
+/// work done or under way - see warm_probe). An error here IS the fit signal the ladder consumes:
 /// an absent host graph, a failed context/KV allocation and a failed first
 /// compute all mean this model does not serve under the current share.
+/// warm_one's probe feed - unless the engine already proves the model serves
+/// under this share: a prefix being prepared right now, or a park standing
+/// from an earlier one, is compute that happened in this very process (mm36
+/// caps). Every page load used to pay this feed again, and while a warm-up
+/// held the decode turn it waited a whole prefill chunk to get it.
+fn warm_probe(cfg: &AppConfig, sess: &mut Session, warm_tok: u32) -> Result<(), String> {
+    if let Ok(c) = sess.caps() {
+        if c.warming > 0 || c.parks > 0 {
+            return Ok(());
+        }
+    }
+    sess.feed(cfg, &[warm_tok], true).map(|_| ())
+}
+
 fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
     let warm_tok = cfg.eos.first().copied().unwrap_or(0);
     let mut last_err = String::new();
@@ -9380,7 +9547,7 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
         let opened = Session::open(cfg, target);
         let load_ms = now_ms() - t0;
         let t1 = now_ms();
-        match opened.and_then(|mut sess| sess.feed(cfg, &[warm_tok], true)) {
+        match opened.and_then(|mut sess| warm_probe(cfg, &mut sess, warm_tok)) {
             Ok(_) => return Ok((tname.to_string(), load_ms as u64, (now_ms() - t1) as u64)),
             Err(e) => last_err = format!("{tname}: {e}"),
         }
@@ -9435,6 +9602,9 @@ fn warm_prefix(
         return Ok(serde_json::json!({ "parked": false, "why": "no boundary to park" }));
     };
     let ids = &prompt.text_ids[..end];
+    if !tick(&format!("{PREFILL_STATUS}0 of {end} prompt tokens")) {
+        return Err("client disconnected".into());
+    }
     let mut last_err = String::new();
     for (target, tname) in targets_for(cfg, mode) {
         let mut sess = match Session::open(cfg, target) {
@@ -9526,6 +9696,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     // by default a warmed model also gets its prefix parked, so the first
     // chat after a boot or a page load starts from it
     let prefix = query.split('&').find_map(|kv| kv.strip_prefix("prefix=")) != Some("0");
+    let progress = query.split('&').any(|kv| kv == "progress=1");
     // ?switches=<url-encoded JSON of the chat body's switch fields>: park the
     // prefix those settings render, so the page's warm-up serves the page
     let switches: serde_json::Value = query
@@ -9554,8 +9725,8 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                 // the model is warm: answer 200 now and keep the body alive
                 // while the prefix parks (a prefill that outlasts the proxy's
                 // idle cut when the whole prefix has to be read)
-                let js = open_json(out);
-                let pre = park(cfg, &|_| js.tick());
+                let js = open_json(out, progress);
+                let pre = park(cfg, &|status| js.tick(status));
                 js.finish(&serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
@@ -9590,8 +9761,8 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
                 // the model is warm: answer 200 now and keep the body alive
                 // while the prefix parks (a prefill that outlasts the proxy's
                 // idle cut when the whole prefix has to be read)
-                let js = open_json(out);
-                let pre = park(cfg, &|_| js.tick());
+                let js = open_json(out, progress);
+                let pre = park(cfg, &|status| js.tick(status));
                 js.finish(&serde_json::json!({
                     "ok": true, "model": cfg.name, "volume": cfg.model_volume,
                     "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
@@ -9628,8 +9799,8 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
         match warm_one(&e.cfg, mode) {
             Ok((target, load_ms, feed_ms)) => {
                 default = Some(e.cfg.name.clone());
-                let j = js.get_or_insert_with(|| open_json(out.take().unwrap()));
-                let pre = park(&e.cfg, &|_| j.tick());
+                let j = js.get_or_insert_with(|| open_json(out.take().unwrap(), progress));
+                let pre = park(&e.cfg, &|status| j.tick(status));
                 ladder.push(serde_json::json!({
                     "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
                     "ok": true, "target": target, "load_ms": load_ms, "feed_ms": feed_ms,
