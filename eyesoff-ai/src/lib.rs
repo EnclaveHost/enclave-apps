@@ -862,8 +862,8 @@ const PREFILL_TICK_MS: u128 = 10_000;
 /// sits far enough below to absorb a chunk that runs long without gambling the
 /// turn on it.
 const PREFILL_TARGET_MS: u128 = 45_000;
-/// Floor for a host slow enough that even the opening chunk is a long wait.
-/// Below this the batches are too small to be worth running at all.
+/// Normal floor for a host slow enough that the opening chunk is a long wait.
+/// An explicit smaller ceiling takes precedence, including GPU batch limits.
 const PREFILL_MIN_CHUNK: usize = 32;
 
 /// The NEXT prefill chunk, sized from how long the last one actually took.
@@ -893,16 +893,21 @@ fn next_chunk(chunk: usize, cap: usize, took_ms: u128) -> usize {
     (want as usize).clamp(floor, cap)
 }
 
-fn prefill_chunk(sess: &mut Session) -> usize {
-    match sess {
+fn prefill_cap(host_batch: Option<usize>, configured: usize) -> usize {
+    let host = host_batch.filter(|&n| n > 0).unwrap_or(PREFILL_CHUNK).min(2048);
+    if configured == 0 { host } else { configured.min(host).max(1) }
+}
+
+fn prefill_chunk(sess: &mut Session, cfg: &AppConfig) -> usize {
+    let host_batch = match sess {
         Session::Ggml { .. } => sess
             .caps()
             .ok()
             .and_then(|c| c.n_batch)
-            .map(|n| (n as usize).clamp(PREFILL_CHUNK, 2048))
-            .unwrap_or(PREFILL_CHUNK),
-        _ => PREFILL_CHUNK,
-    }
+            .map(|n| n as usize),
+        _ => None,
+    };
+    prefill_cap(host_batch, cfg.prefill_chunk)
 }
 
 /// Prefill a text-only prompt with the CHUNK as the unit of liveness, the
@@ -921,12 +926,13 @@ fn prefill_chunk(sess: &mut Session) -> usize {
 /// (9eb4e600, after its config grew the fixed prompt to ~2,900 tokens).
 fn prefill_text(
     sess: &mut Session,
+    cfg: &AppConfig,
     ids: &[u32],
     marks: &[usize],
     status: &dyn Fn(&str) -> bool,
     mut feed: impl FnMut(&mut Session, &[u32], bool, Option<(&[u32], &[usize])>) -> Result<Row, String>,
 ) -> Result<Row, String> {
-    let cap = prefill_chunk(sess);
+    let cap = prefill_chunk(sess, cfg);
     let mut chunk = PREFILL_CHUNK.min(cap);
     let mut last_tick = now_ms();
     let mut done = 0usize;
@@ -1361,8 +1367,8 @@ thread_local! {
     static CLIENT_GONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// the handle of the response stream a chat answer is written to, so
     /// liveness can be ASKED (check-write) instead of learned from a failed
-    /// write. Set by watch_client for the streaming answers only: /warmup
-    /// deliberately finishes its parking for a reader that left.
+    /// write. Warm-up prefix work uses the same check so a closed/reloaded
+    /// page cannot leave a long prefill competing with its next request.
     static CLIENT_STREAM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
@@ -3017,7 +3023,7 @@ fn generate(
     // within microseconds of work; a slow one keeps emitting. Sizing this off
     // a measurement beats guessing a rate, because the range is enormous: the
     // same prompt is milliseconds on an H200 and minutes on a CPU share.
-    let chunk_cap = prefill_chunk(&mut sess);
+    let chunk_cap = prefill_chunk(&mut sess, cfg);
     let mut chunk = PREFILL_CHUNK.min(chunk_cap);
     let mut last_tick = now_ms();
     let sync0 = sync_note(&mut sess, None); // mm20: per-generation sync delta
@@ -3206,11 +3212,11 @@ fn generate_spec(
     let t1 = now_ms();
     // prefill BOTH models on the prompt (chunked and narrated, see
     // prefill_text); only the target's last row is needed
-    let mut t_logits = prefill_text(&mut sess, prompt_ids, marks, status, |s, ids, last, declare| {
+    let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, last, declare| {
         s.feed_declared(cfg, ids, last, declare)
     })?;
     let draft_status = |st: &str| status(&format!("draft model: {st}"));
-    prefill_text(&mut dsess, prompt_ids, marks, &draft_status, |s, ids, _last, declare| {
+    prefill_text(&mut dsess, dcfg, prompt_ids, marks, &draft_status, |s, ids, _last, declare| {
         s.feed_declared(dcfg, ids, false, declare)
     })?;
     let prefill_ms = now_ms() - t1;
@@ -3426,7 +3432,7 @@ fn generate_mtp(
     // -- prefill through the MTP-aware feed: every chunk's positions are
     //    mirrored into the head, only last-row logits cross to the guest
     let t1 = now_ms();
-    let mut t_logits = prefill_text(&mut sess, prompt_ids, marks, status, |s, ids, _last, declare| {
+    let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, _last, declare| {
         s.feed_mtp_declared(cfg, ids, declare)
     })?;
     let prefill_ms = now_ms() - t1;
@@ -3813,7 +3819,7 @@ fn generate_lookup(
     let gperf0 = gperf_note(&mut sess, None); // mm21: decode-stage deltas
     let k = cfg.draft_tokens.clamp(1, 16).min(if depth > 0 { depth } else { usize::MAX });
     let t1 = now_ms();
-    let mut t_logits = prefill_text(&mut sess, prompt_ids, marks, status, |s, ids, last, declare| {
+    let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, last, declare| {
         s.feed_declared(cfg, ids, last, declare)
     })?;
     let prefill_ms = now_ms() - t1;
@@ -7884,6 +7890,7 @@ fn open_json(out: ResponseOutparam) -> JsonStream {
     let body = resp.body().unwrap();
     ResponseOutparam::set(out, Ok(resp));
     let stream = body.write().unwrap();
+    watch_client(&stream);
     JsonStream { body, stream }
 }
 
@@ -9360,8 +9367,10 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 /// attached (an image-reading tool in the block would make the boundary one
 /// no text chat can match) - feed it up to the last mark only (no user turn,
 /// no generation - nothing to park as a turn), declaring the marks. `tick`
-/// is called between prefill chunks so a caller can keep its response alive;
-/// the parking itself never stops for a reader that left. An engine without
+/// is called between prefill chunks so a caller can keep its response alive.
+/// Stop when the caller leaves; repeated page loads must not stack abandoned
+/// long prefills in the inference queue. Completed parks remain reusable.
+/// An engine without
 /// boundary parks, or a prompt with no mark, is a no-op reported as such. A
 /// later call finds the parks standing and returns in milliseconds.
 fn warm_prefix(
@@ -9408,8 +9417,7 @@ fn warm_prefix(
             return Ok(serde_json::json!({ "parked": false, "why": "engine predates boundary parks" }));
         }
         let t1 = now_ms();
-        let keep_going = |st: &str| { let _ = tick(st); true };
-        prefill_text(&mut sess, ids, &prompt.marks, &keep_going, |s, ids, last, declare| {
+        prefill_text(&mut sess, cfg, ids, &prompt.marks, tick, |s, ids, last, declare| {
             s.feed_declared(cfg, ids, last, declare)
         })?;
         return Ok(serde_json::json!({
@@ -9581,6 +9589,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     let mut out = Some(out);
     let mut js: Option<JsonStream> = None;
     for e in &entries {
+        if client_gone() { break; }
         if let Some(why) = unfit.get(&e.volume) {
             ladder.push(serde_json::json!({
                 "model": e.cfg.name, "volume": e.volume, "bytes": e.bytes,
@@ -11681,6 +11690,24 @@ mod tests {
         let short: Vec<u32> = std::iter::repeat([7u32, 8]).take(5).flatten().collect();
         assert!(!g.tripped(&short));
         assert!(g.tripped(&std::iter::repeat([7u32, 8]).take(40).flatten().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn prefill_ceiling_keeps_small_gpu_batches_eligible() {
+        assert_eq!(test_config().prefill_chunk, 0, "existing configs stay automatic");
+        assert_eq!(prefill_cap(Some(512), 0), 512);
+        assert_eq!(prefill_cap(None, 0), PREFILL_CHUNK);
+        assert_eq!(prefill_cap(Some(0), 0), PREFILL_CHUNK);
+        assert_eq!(prefill_cap(Some(4), 0), 4, "respect small host limits too");
+        assert_eq!(prefill_cap(Some(512), 8), 8);
+        assert_eq!(prefill_cap(Some(4), 8), 4, "configuration cannot exceed the host");
+        assert_eq!(prefill_cap(Some(8192), usize::MAX), 2048);
+        for cap in [1, 4, 8, 16] {
+            for took_ms in [0, 1, 45_000, 180_000] {
+                assert_eq!(next_chunk(PREFILL_CHUNK.min(cap), cap, took_ms), cap,
+                    "adaptive sizing must honor an explicit GPU ceiling");
+            }
+        }
     }
 
     #[test]

@@ -85,6 +85,12 @@ pub struct AppConfig {
     pub effort: Option<EffortConfig>,
     pub system_prompt: String,
     pub max_prompt_tokens: usize,
+    /// Optional prefill batch ceiling, in tokens. Zero/absent uses the host's
+    /// batch limit. A shielded backend may only offload small batches to its
+    /// GPU workers; setting this to that limit keeps prompt matmuls eligible.
+    /// Does not change the context window or truncate the prompt.
+    #[serde(default)]
+    pub prefill_chunk: usize,
     pub default_max_new: usize,
     pub max_new_cap: usize,
     /// sampling temperature for requests that don't send one (0 = greedy,
