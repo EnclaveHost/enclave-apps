@@ -8233,10 +8233,6 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     if let Err(e) = check_videos(raw, cfg, &creq.messages) {
         return json_err(out, 400, &e);
     }
-    let tok = match make_tok(cfg, "auto", t1) {
-        Ok(t) => t,
-        Err(e) => return json_err(out, 500, &e),
-    };
     // The SSE stream opens BEFORE the search leg, because in auto mode that
     // leg can run a router generation and then a provider round trip - several
     // seconds in which a silent "Preparing…" is all the user would see. With
@@ -8261,6 +8257,24 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             }
         }
         true
+    };
+
+    // The host tokenizer opens the engine and may cold-load the model.
+    // Flush a response before that call so the relay's header timeout cannot
+    // turn a healthy, slow initialization into a 502 and a duplicate retry.
+    if !send(serde_json::json!({ "status": "preparing the model…" })) {
+        drop(stream);
+        let _ = OutgoingBody::finish(body, None);
+        return;
+    }
+    let tok = match make_tok(cfg, "auto", t1) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = send(serde_json::json!({ "error": strip_code(&e) }));
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
     };
 
     let mode = creq.target.as_deref().unwrap_or("auto");
@@ -8721,10 +8735,6 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     if let Err(e) = check_videos(raw, cfg, &creq.messages) {
         return json_err(out, 400, &e);
     }
-    let tok = match make_tok(cfg, "auto", now_ms()) {
-        Ok(t) => t,
-        Err(e) => return json_err(out, 500, &e),
-    };
     // `"web_search": true` is an Enclave extension to the OpenAI body, so API
     // clients get the same retrieval the built-in UI does. Sources come back
     // on the response's `enclave.search` field (streaming: an SSE comment
@@ -8790,6 +8800,20 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 "data: {}\n\n",
                 serde_json::json!({ "error": { "message": strip_code(e), "type": "server_error" } })
             ));
+        };
+        if !send_raw(": preparing the model\n\n") {
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
+        let tok = match make_tok(cfg, "auto", now_ms()) {
+            Ok(t) => t,
+            Err(e) => {
+                send_err(&e);
+                drop(stream);
+                let _ = OutgoingBody::finish(body, None);
+                return;
+            }
         };
         // Effort scaling, when the deployment configured it: the rating comes out
         // of the router pass below if that runs, and from its own short pass later
@@ -9109,6 +9133,10 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // standing advice: a request that can take minutes (image generation,
         // a big vision read) belongs on stream:true, because the buffered
         // path has a proxy-hop timeout budget it cannot influence.
+        let tok = match make_tok(cfg, "auto", now_ms()) {
+            Ok(t) => t,
+            Err(e) => return json_err(out, 500, &e),
+        };
         let no_status = |_: &str| {};
         // Effort scaling, when the deployment configured it: the rating comes out
         // of the router pass below if that runs, and from its own short pass later
