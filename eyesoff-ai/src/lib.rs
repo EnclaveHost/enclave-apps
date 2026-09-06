@@ -7287,6 +7287,42 @@ fn parse_routed(text: &str, names: &[&str]) -> Option<(String, String)> {
 /// always has been. The user's tools switch still governs it: the route
 /// prompt is the deployment's, consent is the client's. Failures fold a note
 /// and cost the turn nothing.
+/// The routing classifier's system text (apply_tool_routes): the fixed
+/// instructions plus one line per routable service. None when the turn has
+/// no routable service. Shared with warm_prefix, which parks this prompt's
+/// system prefix at boot: the classifier pass runs BEFORE the main prefill
+/// of every tools-on chat, and cold it read its ~250 tokens for ~20 s on
+/// metal0 (2026-09-06) - parked, the pass costs only the conversation tail.
+fn router_system(cfg: &AppConfig, creq: &ChatReq, b: &tools::Builtins<'_>) -> Option<String> {
+    let tc = cfg.tools.as_ref()?;
+    if !creq.tools_on(tc.default_on) {
+        return None;
+    }
+    let routable: Vec<&tools::HttpTool> = tc
+        .http
+        .iter()
+        .filter(|t| t.route.is_some() && t.route_binding().is_some())
+        .filter(|t| !t.wants_images() || (b.images_present && !b.images_local))
+        .collect();
+    if routable.is_empty() {
+        return None;
+    }
+    let mut system = String::from(
+        "You are a routing classifier reading a conversation transcript. You never answer \
+         the user's message or continue the conversation yourself - you only decide \
+         whether handling the last user message needs one of these services, and with \
+         what input:\n",
+    );
+    for t in &routable {
+        system.push_str(&format!("- {}: {}\n", t.name, t.route.as_deref().unwrap_or("")));
+    }
+    system.push_str(
+        "\nReply with EXACTLY ONE line and nothing else:\n\
+         <service name>: <the input to send it>\nor\nNO",
+    );
+    Some(system)
+}
+
 fn apply_tool_routes(
     cfg: &AppConfig,
     creq: &ChatReq,
@@ -7315,20 +7351,9 @@ fn apply_tool_routes(
     let last = messages.iter().rposition(|m| m.role == "user")?;
 
     // the same classifier shape route_web_search uses, with the offer list
-    // written by the config instead of by this file
-    let mut system = String::from(
-        "You are a routing classifier reading a conversation transcript. You never answer \
-         the user's message or continue the conversation yourself - you only decide \
-         whether handling the last user message needs one of these services, and with \
-         what input:\n",
-    );
-    for (_, t) in &routable {
-        system.push_str(&format!("- {}: {}\n", t.name, t.route.as_deref().unwrap_or("")));
-    }
-    system.push_str(
-        "\nReply with EXACTLY ONE line and nothing else:\n\
-         <service name>: <the input to send it>\nor\nNO",
-    );
+    // written by the config instead of by this file (router_system, shared
+    // with the warm-up so this prompt's prefix is parked at boot)
+    let system = router_system(cfg, creq, &b)?;
     let mut router_msgs: Vec<ChatMsg> = vec![ChatMsg::text("system", system)];
     let tail: Vec<&ChatMsg> = messages
         .iter()
@@ -9592,6 +9617,8 @@ fn warm_prefix(
     let mut b = builtins_for(cfg, &creq, &off);
     // what a fresh answer is offered at depth 0 (AgentTree::slots)
     b.agent_slots = cfg.tools.as_ref().map_or(0, |t| if t.max_agent_depth >= 1 { t.max_agents } else { 0 });
+    // the routing classifier's prefix, parked after the main one (below)
+    let router_sys = router_system(cfg, &creq, &b);
     let reg = tools_enabled(cfg, &creq).map(|tc| (tc, tools::build(tc, b, &|_| {})));
     let caps = match reg.as_ref() {
         Some((tc, r)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, tc.budget(None)),
@@ -9618,9 +9645,33 @@ fn warm_prefix(
         prefill_text(&mut sess, cfg, ids, &prompt.marks, tick, |s, ids, last, declare| {
             s.feed_declared(cfg, ids, last, declare)
         })?;
+        let main_ms = now_ms() - t1;
+        drop(sess); // its sequence is spent; the router prompt needs a fresh one
+        // the routing classifier's own prefix (router_system): a fresh
+        // sequence, the same declared-marks feed, no generation
+        let router = match router_sys.as_deref() {
+            None => serde_json::Value::Null,
+            Some(system) => {
+                let msgs = vec![ChatMsg::text("system", system.to_string()), ChatMsg::text("user", "warm")];
+                match build_prompt(cfg, &tok, &msgs, false, Capabilities::Internal) {
+                    Err(e) => serde_json::json!({ "parked": false, "error": e }),
+                    Ok((rp, _, _)) => match rp.marks.last() {
+                        None => serde_json::json!({ "parked": false, "why": "no boundary to park" }),
+                        Some(&rend) => {
+                            let t2 = now_ms();
+                            let mut rsess = Session::open(cfg, target)?;
+                            prefill_text(&mut rsess, cfg, &rp.text_ids[..rend], &rp.marks, tick, |s, ids, last, declare| {
+                                s.feed_declared(cfg, ids, last, declare)
+                            })?;
+                            serde_json::json!({ "parked": true, "tokens": rend, "marks": rp.marks, "ms": now_ms() - t2 })
+                        }
+                    },
+                }
+            }
+        };
         return Ok(serde_json::json!({
             "parked": true, "target": tname, "tokens": end, "marks": prompt.marks,
-            "ms": now_ms() - t1,
+            "ms": main_ms, "router": router,
         }));
     }
     Err(last_err)
