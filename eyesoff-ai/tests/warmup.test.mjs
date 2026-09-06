@@ -65,3 +65,19 @@ test('the displayed progress distinguishes a loaded model from prompt preparatio
     'Model loaded · preparing chat: 12 / 2400 tokens');
   assert.equal(ctx.warmupStatus('loading'), 'loading');
 });
+
+// mm36: the pill's label for a warm-up that is WAITING on another request's
+// warm-up of the same prefix (the server's "shared prefix tokens" status)
+const wsBegin = html.indexOf('function warmupStatus(');
+const wsEnd = html.indexOf('\nfunction pill(', wsBegin);
+const wsCtx = vm.createContext({});
+vm.runInContext(html.slice(wsBegin, wsEnd), wsCtx);
+const warmupStatus = wsCtx.warmupStatus;
+
+test('the shared-warm-up wait has its own label, and own progress keeps its label', () => {
+  assert.equal(warmupStatus('prefilling 512 of 2453 shared prefix tokens (another request is preparing them)'),
+    'Model loaded · sharing a warm-up in progress: 512 / 2453 tokens');
+  assert.equal(warmupStatus('prefilling 512 of 2453 prompt tokens'),
+    'Model loaded · preparing chat: 512 / 2453 tokens');
+  assert.equal(warmupStatus('loading'), 'loading');
+});
