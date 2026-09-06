@@ -4892,20 +4892,31 @@ decide what is needed to handle the last user message.
     let router_system = router_system.as_str();
 
     // Only the tail of the conversation matters for this decision, and a long
-    // history would dominate the router's own budget.
+    // history would dominate the router's own budget. The budget is PREFILL
+    // TIME: this prompt is prefilled from scratch every turn (its prefix is the
+    // parked router system prompt, and a sliding window of turns never extends
+    // the previous turn's sequence), on the enclave's cores, before the real
+    // answer's own prefill starts. Four turns at 1,500 characters each
+    // measured 1,781 router tokens and ~130 s of TTFT on the 27B (2026-09-06)
+    // - the classifier alone costing more than the answer. So: the message
+    // being routed in full (up to 1,500 characters), and just enough of the
+    // two turns before it to resolve a follow-up ("and for 2024?"), 400
+    // characters each. Worst case ~600 tokens instead of ~1,800.
     let mut router_msgs: Vec<ChatMsg> = vec![ChatMsg::text("system", router_system)];
     let tail: Vec<&ChatMsg> = messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .rev()
-        .take(4)
+        .take(3)
         .collect();
-    for m in tail.into_iter().rev() {
+    let n_tail = tail.len();
+    for (i, m) in tail.into_iter().rev().enumerate() {
         // TEXT ONLY, deliberately: the router is a cheap classifier and
         // re-encoding every attached picture for it would cost more than the
         // answer it is routing. An image turn with no words still says
         // something useful here, so it is announced rather than dropped.
-        let mut c = truncate_for_msg_n(&m.content, 1500);
+        let budget = if i + 1 == n_tail { 1500 } else { 400 };
+        let mut c = truncate_for_msg_n(&m.content, budget);
         if !m.images.is_empty() {
             let note = if m.images.len() == 1 {
                 "[the user attached an image]".to_string()
