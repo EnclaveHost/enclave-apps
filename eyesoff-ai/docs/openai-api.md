@@ -479,6 +479,42 @@ stay in the prompt whole; older ones are condensed to their first and last
 line survives condensing; one that buries it in the middle should be told to
 print a summary.
 
+**Ledger mode (0.58).** `"loop": {"ledger": true}` (or `ledger: true` in the
+config's `tools` block) changes what a step re-prefills. The conversation is
+NOT accumulated: the model writes its state under a `### LEDGER` heading at
+the top of each reply, before the call, and the next prompt is the original
+turns, that one call, its result, and the ledger shown back under it - never
+the calls and results before. Every step then re-prefills a fixed-size tail
+behind a prefix the engine keeps warm, which on a CPU node is the difference
+between a two-second step and a two-minute one thirty calls in. A reply
+without a block keeps the last ledger; a block past `ledger_chars` (default
+2400) is cut and the cap is quoted under every result. The rules tell the
+model what belongs in it (the goal, what is established, what failed and
+why, the state of files and commands, the next step) and to rewrite it whole
+each time. Only a persisting loop has a ledger; `keep_results` does nothing
+in this mode, since there is never an older result to condense.
+
+**The verify gate (0.58).** A config that names the tool that checks the
+goal - `"verify": "run_tests"`, optionally with `"verify_pass": "0 failed"`
+for what a passing result contains - turns "keep going until the check
+passes" from a sentence in the prompt into code. A persisting answer whose
+check has not passed is not accepted: it goes back once, as the assistant
+turn it was, with a result saying the check has not been run (or did not
+pass, or something ran after it), and the model works on. Told once, then
+accepted as it stands, so a check that cannot pass still ends the turn with
+the model saying what fails. The check must be the LAST thing run before
+the answer, waits aside: a call after a passing check is a change the check
+has not seen. A request's `loop` object may name a different tool or waive
+it with `"verify": false`; a name the registry does not offer gates nothing.
+`GET /models` reports both under `tools`.
+
+**Stuck calls (0.58).** One identical call that twice in a row returns the
+identical result gets a warning appended to that result; the same call a
+third time is refused unrun and the turn ends, with the reason in place of
+the call. A different call in between resets the count, so polling a log
+between waits is never mistaken for being stuck. Waits and subagents are
+never counted.
+
 #### Subagents: `spawn_agent`
 
 A deployment whose `tools` block sets **`max_agents`** to a positive number
@@ -490,6 +526,12 @@ the call's result, prefixed `Subagent #2 finished (5 calls, 3 minutes). Its
 report:`. Nothing else crosses: the child never sees the parent's
 conversation, and the parent reads nothing of the child's but that report
 (truncated to `max_chars` like any result).
+
+A child whose final reply hit its token limit is not a report: the parent
+reads `Subagent #2 was CUT OFF at its token limit (...)` followed by the
+attempt's head and tail, with the middle elided, and is told to brief a
+smaller task or a different approach rather than build on it (0.58; the
+done frame carries `cut: true`).
 
 Subagents run **one at a time**, inside the request that spawned them (a
 wasm component has no threads), and **may spawn their own**. Two limits bound

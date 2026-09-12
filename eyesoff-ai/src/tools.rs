@@ -133,6 +133,36 @@ pub struct ToolsConfig {
     /// LEFT of the answer's max_seconds, so no tree outlives the answer.
     #[serde(default)]
     pub agent_max_calls: Option<usize>,
+    /// LEDGER MODE for persisting loops (0.58): the conversation is NOT
+    /// accumulated. Each step the model rewrites one short state block
+    /// (`### LEDGER`, at the top of its reply, before the call) and the next
+    /// prompt is the original turns, the newest result and that block -
+    /// never the calls and results before it. Every step then re-prefills a
+    /// fixed-size tail behind a prefix the engine keeps warm, which on a CPU
+    /// node is the difference between a two-second step and a two-minute one
+    /// thirty calls in. It is the pattern the ledger-orchestration papers
+    /// use: fresh context every call, state on the page. A request's `loop`
+    /// object may set `ledger` either way; it only applies when persisting.
+    #[serde(default)]
+    pub ledger: bool,
+    /// the most characters of a ledger block kept (default 2400). What the
+    /// model writes past it is cut, and the rules tell it the cap.
+    #[serde(default = "default_ledger_chars")]
+    pub ledger_chars: usize,
+    /// VERIFY GATE for persisting loops: the name of the tool that checks
+    /// the goal (a `run_tests` command entry, say). A persisting answer is
+    /// not accepted while that tool's latest result has not passed: it is
+    /// bounced back ONCE with the reason, then accepted as it stands so a
+    /// check that cannot pass still ends the turn. The gate is code, not a
+    /// sentence in the prompt: a model that declares victory over a failing
+    /// run is sent back to the run. A request's `loop` object may name a
+    /// different tool or waive it with `"verify": false`.
+    #[serde(default)]
+    pub verify: Option<String>,
+    /// what a passing `verify` result contains, as a substring ("ALL
+    /// PASSED", "0 failed"). Absent: any non-error result passes.
+    #[serde(default)]
+    pub verify_pass: Option<String>,
     /// Capabilities this deployment ALREADY has, handed to the model as tools
     /// instead of being decided for it by a pre-pass: `["web_search",
     /// "request", "generate_image", "view_image"]`. Each is backed by its own
@@ -452,7 +482,7 @@ impl Builtin {
 /// quick answer, a playground turn that is not a task) and never raises one.
 /// `persist` is the `loop` request field: keep working at a verifiable goal
 /// until the check passes, rather than answering at the first opportunity.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Budget {
     pub max_calls: usize,
     pub max_seconds: u64,
@@ -460,6 +490,11 @@ pub struct Budget {
     /// subagents the whole answer may spawn (see ToolsConfig::max_agents)
     pub max_agents: u32,
     pub max_agent_depth: u32,
+    /// ledger mode (see ToolsConfig::ledger); never true unless persisting
+    pub ledger: bool,
+    /// the tool whose passing result a persisting answer needs (see
+    /// ToolsConfig::verify)
+    pub verify: Option<String>,
 }
 
 impl Budget {
@@ -473,6 +508,8 @@ impl Budget {
             persist: false,
             max_agents: 0,
             max_agent_depth: default_max_agent_depth(),
+            ledger: false,
+            verify: None,
         }
     }
 
@@ -566,6 +603,9 @@ fn default_wait_max_s() -> u64 {
 fn default_keep_results() -> usize {
     3
 }
+fn default_ledger_chars() -> usize {
+    2400
+}
 fn default_max_agent_depth() -> u32 {
     3
 }
@@ -601,11 +641,27 @@ impl ToolsConfig {
             persist: false,
             max_agents: self.max_agents,
             max_agent_depth: self.max_agent_depth.max(1),
+            ledger: self.ledger,
+            verify: self.verify.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string),
         };
         match req {
             Some(serde_json::Value::Bool(p)) => b.persist = *p,
             Some(serde_json::Value::Object(o)) => {
                 b.persist = o.get("persist").and_then(|v| v.as_bool()).unwrap_or(true);
+                // the ledger is a prompt shape, not a cost: a request may
+                // choose it either way
+                if let Some(l) = o.get("ledger").and_then(|v| v.as_bool()) {
+                    b.ledger = l;
+                }
+                // the check may be named (a client knows its own harness)
+                // or waived, the way persistence itself may be
+                match o.get("verify") {
+                    Some(serde_json::Value::String(n)) if !n.trim().is_empty() => {
+                        b.verify = Some(n.trim().to_string())
+                    }
+                    Some(serde_json::Value::Bool(false)) => b.verify = None,
+                    _ => {}
+                }
                 if let Some(n) = o.get("max_calls").and_then(|v| v.as_u64()) {
                     b.max_calls = b.max_calls.min(n as usize).max(1);
                 }
@@ -622,6 +678,11 @@ impl ToolsConfig {
                 }
             }
             _ => {}
+        }
+        // both only mean anything in a loop that persists
+        if !b.persist {
+            b.ledger = false;
+            b.verify = None;
         }
         b
     }
@@ -1523,7 +1584,7 @@ fn unresolved_in(s: &str) -> Option<String> {
 /// jinja template in a wasm component, and the format is a TRAINED property, so
 /// a family that was taught a different one needs its own arm here rather than
 /// a generic guess (see tools_supported).
-pub fn system_block(tools: &[Tool], b: Budget) -> String {
+pub fn system_block(tools: &[Tool], b: &Budget) -> String {
     let mut s = signatures(tools);
     s.push_str(&format!(
         "Rules for this app: the call is executed by the server and its result comes back in a \
@@ -1546,22 +1607,26 @@ pub fn system_block(tools: &[Tool], b: Budget) -> String {
 /// its first failing test run into one that fixes it; without it every
 /// reasoning model this app serves stops to "check with the user" after one
 /// attempt, which in a loop nobody is watching is the same as giving up.
-fn finish_rule(tools: &[Tool], b: Budget) -> String {
+fn finish_rule(tools: &[Tool], b: &Budget) -> String {
     if !b.persist {
         return " When you have enough to answer, stop calling and write the answer.".into();
     }
     let has_wait = tools.iter().any(|t| t.name == "wait");
     let has_agent = tools.iter().any(|t| t.name == AGENT_TOOL);
-    format!(
+    let verify = b.verify.as_deref().filter(|n| tools.iter().any(|t| t.name == *n));
+    let mut s = format!(
         " WORKING TO A CHECK: the user wants the goal reached, not a first attempt. When the \
          goal comes with a way to verify it (tests, a harness, a build, a command that must \
          succeed), keep going until the check passes: run it, read what failed, change one \
          thing, run it again. Do not stop to ask permission or to report progress - nobody is \
-         answering while you work, and the user reads only your final answer. Keep state in \
-         files on the machine, never in your head, so a later step can pick up where an \
-         earlier one left off.{}{} Stop early only when the check passes, when you are certain \
-         it cannot pass with what you have, or when the budget is nearly spent - and then \
-         report exactly what passes, what does not, and where the files are.",
+         answering while you work, and the user reads only your final answer. Before your first \
+         call, name two or three genuinely different ways to reach the goal in a few lines, \
+         pick one, and say what would make you switch; when a way keeps failing, switch to \
+         another rather than polishing it. Keep state in files on the machine, never in your \
+         head, so a later step can pick up where an earlier one left off.{}{}{} Stop early only \
+         when the check passes, when you are certain it cannot pass with what you have, or when \
+         the budget is nearly spent - and then report exactly what passes, what does not, and \
+         where the files are.",
         if has_wait {
             " When something you started needs time, call wait rather than polling it in a \
              tight loop of commands."
@@ -1570,11 +1635,34 @@ fn finish_rule(tools: &[Tool], b: Budget) -> String {
         },
         if has_agent {
             " On a big job, keep your own context clean with spawn_agent: brief a subagent \
-             with one self-contained part of the work and read its report."
+             with one self-contained part of the work and read its report; you are the \
+             manager, so keep your own steps short and let the children do the long work."
         } else {
             ""
         },
-    )
+        match verify {
+            Some(n) => format!(
+                " The goal is CHECKED by `{n}`: your answer is not accepted until its latest \
+                 result passes, so run it after every change and before you answer. If it \
+                 truly cannot pass, run it once more so its output is on record, then answer \
+                 and say exactly what fails."
+            ),
+            None => String::new(),
+        },
+    );
+    if b.ledger {
+        s.push_str(
+            " THE LEDGER: this loop keeps NO history. When a result comes back, everything you \
+             wrote before it is gone except one block: the ledger you write at the START of \
+             your next reply, under the heading line `### LEDGER`, before the tool call. Put \
+             in it the goal in one line, what you have established, what failed and why, the \
+             exact state of files and commands (paths, what was run, what it said), and the \
+             next step. Rewrite it WHOLE every time - it replaces the last one, and whatever \
+             you leave out is lost - and keep it under the size the results quote. It is shown \
+             back to you under every result, exactly as you wrote it.",
+        );
+    }
+    s
 }
 
 /// The block for CLIENT-declared tools (the /v1 passthrough). Same trained
@@ -1644,7 +1732,7 @@ pub fn merge_registries(server: &[Tool], client: &[Tool]) -> Vec<Tool> {
 /// business, not something a model should be reasoning about mid-answer. The
 /// budget is the one place the split leaks, because it bounds only the server's
 /// half; the client owns its own loop and its own limit.
-pub fn merged_system_block(tools: &[Tool], b: Budget, require: Option<&str>) -> String {
+pub fn merged_system_block(tools: &[Tool], b: &Budget, require: Option<&str>) -> String {
     let mut s = signatures(tools);
     s.push_str(&format!(
         "Rules for this app: after you write a call, STOP - it is executed for you and its \
@@ -3964,7 +4052,7 @@ mod tests {
         // the client's lead: they are the caller's own job, ours supplement it
         assert_eq!(names, ["read", "write", "web_search", "request"]);
         // and one block carries them all, in the trained format
-        let block = merged_system_block(&all, Budget::calls(32), None);
+        let block = merged_system_block(&all, &Budget::calls(32), None);
         for n in names {
             assert!(block.contains(&format!("\"name\":\"{n}\"")), "{n} missing from {block}");
         }
@@ -4122,12 +4210,12 @@ mod tests {
 
     #[test]
     fn the_system_block_carries_the_signatures() {
-        let s = system_block(&[tool("get_weather")], Budget::calls(3));
+        let s = system_block(&[tool("get_weather")], &Budget::calls(3));
         assert!(s.contains("<tools>"), "{s}");
         assert!(s.contains("\"name\":\"get_weather\""), "{s}");
         assert!(s.contains("at most 3 calls"), "{s}");
         // and the singular reads properly
-        assert!(system_block(&[tool("a")], Budget::calls(1)).contains("at most 1 call in"));
+        assert!(system_block(&[tool("a")], &Budget::calls(1)).contains("at most 1 call in"));
     }
 
     #[test]
@@ -4776,13 +4864,13 @@ mod tests {
         }))
         .unwrap();
         let b = cfg.budget(None);
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3 });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
         assert!(cfg.budget(Some(&serde_json::json!(true))).persist);
         assert!(!cfg.budget(Some(&serde_json::json!(false))).persist);
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 8, "max_seconds": 600 })));
-        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3 });
+        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 999, "max_seconds": 99999, "persist": false })));
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3 });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
         // zero is not a budget: the loop would refuse its first call
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 0, "max_seconds": 0 })));
         assert_eq!((b.max_calls, b.max_seconds), (1, 1));
@@ -4835,7 +4923,7 @@ mod tests {
         assert_eq!(b.max_agents, 0);
         // the persisting rules point at it when it is there
         let with = vec![tool("run_tests"), tool(AGENT_TOOL)];
-        let rules = system_block(&with, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3 });
+        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: false, verify: None });
         assert!(rules.contains("spawn_agent"), "{rules}");
     }
 
@@ -4844,23 +4932,65 @@ mod tests {
     #[test]
     fn the_rules_follow_the_budget() {
         let list = vec![tool("run_tests")];
-        let quick = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3 });
+        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
         assert!(quick.contains("at most 32 calls"), "{quick}");
         assert!(quick.contains("30 minutes of wall-clock time"), "{quick}");
         assert!(quick.contains("stop calling and write the answer"), "{quick}");
         assert!(!quick.contains("WORKING TO A CHECK"), "{quick}");
-        let persist = system_block(&list, Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3 });
+        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
         assert!(persist.contains("WORKING TO A CHECK"), "{persist}");
         assert!(persist.contains("keep going until the check passes"), "{persist}");
         assert!(!persist.contains("call wait"), "{persist}");
         let with_wait = vec![tool("run_tests"), tool("wait")];
-        let persist = system_block(&with_wait, Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3 });
+        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
         assert!(persist.contains("call wait rather than polling"), "{persist}");
         // the merged block (client tools beside ours) carries the same rule
-        let merged = merged_system_block(&with_wait, Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3 }, None);
+        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None }, None);
         assert!(merged.contains("at most 4 of them"), "{merged}");
         assert!(merged.contains("within 2 minutes"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
+    }
+
+    /// Ledger mode and the verify gate ride the budget: the config sets
+    /// them, a request may set the ledger either way and name or waive the
+    /// check, and neither survives a loop that does not persist.
+    #[test]
+    fn the_ledger_and_the_check_follow_the_budget() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "ledger": true, "verify": " run_tests ", "verify_pass": "0 failed",
+            "http": [{ "name": "run_tests", "url": "https://h/t" }]
+        }))
+        .unwrap();
+        assert_eq!(cfg.ledger_chars, 2400);
+        // not persisting: neither applies
+        let b = cfg.budget(None);
+        assert!(!b.ledger);
+        assert_eq!(b.verify, None);
+        let b = cfg.budget(Some(&serde_json::json!(true)));
+        assert!(b.ledger);
+        assert_eq!(b.verify.as_deref(), Some("run_tests"));
+        let b = cfg.budget(Some(&serde_json::json!({ "ledger": false, "verify": false })));
+        assert!(b.persist && !b.ledger && b.verify.is_none());
+        let b = cfg.budget(Some(&serde_json::json!({ "verify": "make_check" })));
+        assert_eq!(b.verify.as_deref(), Some("make_check"));
+        // a deployment without either may still be asked for the ledger
+        let plain: ToolsConfig = serde_json::from_value(serde_json::json!({ "max_calls": 4 })).unwrap();
+        assert!(plain.budget(Some(&serde_json::json!({ "ledger": true }))).ledger);
+        assert!(!plain.budget(Some(&serde_json::json!({ "ledger": true, "persist": false }))).ledger);
+        // the rules name the check only when the tool is really offered,
+        // and describe the ledger only in ledger mode
+        let list = vec![tool("run_tests")];
+        let rules = system_block(&list, &cfg.budget(Some(&serde_json::json!(true))));
+        assert!(rules.contains("CHECKED by `run_tests`"), "{rules}");
+        assert!(rules.contains("THE LEDGER"), "{rules}");
+        assert!(rules.contains("### LEDGER"), "{rules}");
+        assert!(rules.contains("genuinely different ways"), "{rules}");
+        let rules = system_block(&[tool("other")], &cfg.budget(Some(&serde_json::json!(true))));
+        assert!(!rules.contains("CHECKED by"), "{rules}");
+        let rules = system_block(&list, &cfg.budget(Some(&serde_json::json!({ "ledger": false }))));
+        assert!(!rules.contains("THE LEDGER"), "{rules}");
+        let quick = system_block(&list, &cfg.budget(None));
+        assert!(!quick.contains("THE LEDGER") && !quick.contains("CHECKED by"), "{quick}");
     }
 
     // ------------------------------------------------- interop, over TCP --

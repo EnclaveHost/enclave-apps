@@ -5126,6 +5126,9 @@ struct AgentReport {
     text: String,
     ms: u64,
     calls: usize,
+    /// the child's final reply hit its token limit: `text` is a marked
+    /// head-and-tail of the attempt, not a report (see cut_report)
+    cut: bool,
     /// the child's own call log, for the parent's stats
     log: Vec<serde_json::Value>,
 }
@@ -5222,6 +5225,7 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
             text: "subagents need the deployment's tools block".into(),
             ms: 0,
             calls: 0,
+            cut: false,
             log: Vec::new(),
         };
     };
@@ -5236,7 +5240,7 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
     let mut tl = ToolLoop::open_child(
         tc,
         b,
-        s.budget,
+        s.budget.clone(),
         s.tree.clone(),
         s.depth,
         s.id,
@@ -5260,9 +5264,10 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
         ChatMsg::text("user", task_turn(&s)),
     ];
     let mut last_err = String::new();
+    let mut cut = false;
     let text = 'answer: loop {
         let caps = if tl.armed() {
-            Capabilities::Tools(tl.tools(), tl.budget)
+            Capabilities::Tools(tl.tools(), &tl.budget)
         } else {
             Capabilities::Note
         };
@@ -5364,6 +5369,15 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
                         }
                         text = format!("{}\n({note})", text.trim_end()).trim().to_string();
                     }
+                    // a reply the token limit ended is not a report either:
+                    // the parent is told so, and reads the attempt's head
+                    // and tail rather than mistaking its last line for a
+                    // conclusion (the salvage step of the ledger papers,
+                    // without a second generation to pay for)
+                    if g.finish_reason == "length" {
+                        cut = true;
+                        text = cut_report(&text, tc.max_chars);
+                    }
                     if let Some(rest) = gate.borrow_mut().flush() {
                         if !opened.replace(true) {
                             let _ = (env.event)("agent_delta", serde_json::json!({ "id": s.id, "delta": "<think>\n" }));
@@ -5395,20 +5409,21 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
     let log = std::mem::take(&mut tl.log);
     let ms = (now_ms().saturating_sub(t0)) as u64;
     let rep = match text {
-        Some(text) => AgentReport { id: s.id, ok: true, text, ms, calls, log },
+        Some(text) => AgentReport { id: s.id, ok: true, text, ms, calls, cut, log },
         None => AgentReport {
             id: s.id,
             ok: false,
             text: format!("the subagent could not finish: {}", strip_code(&last_err)),
             ms,
             calls,
+            cut: false,
             log,
         },
     };
     let _ = (env.event)(
         "agent_done",
         serde_json::json!({
-            "id": s.id, "ok": rep.ok, "ms": rep.ms, "calls": rep.calls,
+            "id": s.id, "ok": rep.ok, "cut": rep.cut, "ms": rep.ms, "calls": rep.calls,
             "chars": rep.text.chars().count(),
             "agents": s.tree.borrow().spawned,
         }),
@@ -5494,6 +5509,27 @@ struct ToolLoop<'a> {
     refused: Option<&'static str>,
     /// what ran, for the reply's stats
     log: Vec<serde_json::Value>,
+    /// LEDGER MODE (Budget::ledger): how long the conversation was before
+    /// this loop appended anything - every step truncates back to it, so
+    /// the prompt is always the original turns plus ONE call and ONE result
+    base_len: Option<usize>,
+    /// the model's own state block, as it last wrote it under `### LEDGER`;
+    /// shown back under every result in ledger mode
+    ledger: String,
+    /// the newest call and a hash of its result, with how many times in a
+    /// row that exact pair has come back. Two identical outcomes get a
+    /// warning in the result; a third identical CALL is refused unrun. A
+    /// different call in between resets it, so polling a log between waits
+    /// is never mistaken for being stuck.
+    last_pair: Option<(String, u64)>,
+    same_runs: usize,
+    /// the verify gate (Budget::verify): whether the check has run in this
+    /// answer, whether its latest result passed, and whether an unverified
+    /// answer was already bounced once - told once, then accepted, exactly
+    /// as the limits do
+    verify_seen: bool,
+    verify_ok: bool,
+    verify_told: bool,
 }
 
 /// The reasons a call that WAS in the reply ran nothing. Shown to the user in
@@ -5516,6 +5552,19 @@ const REFUSED_STUB: &str =
     "the model kept writing tool calls with arguments it had not filled in, so none were run";
 const REFUSED_GONE: &str =
     "the client disconnected before the model's tool call could run, so it was not run";
+const REFUSED_STUCK: &str =
+    "the model kept repeating one identical tool call that kept returning the identical \
+     result, so it was not run again";
+/// How many identical (call, result) pairs in a row before the model is
+/// told, in the result itself, that repeating the call is pointless. The
+/// next identical call after that is refused. Two, because one repeat is
+/// how a model re-reads a file it is about to edit; two with nothing
+/// changed in between is a model that has stopped deciding.
+const STUCK_TELL: usize = 2;
+/// The heading a ledger-mode reply writes its state under (see
+/// tools::ToolsConfig::ledger). Matched case-insensitively, at any heading
+/// depth, so `## Ledger` counts too.
+const LEDGER_HEAD: &str = "ledger";
 /// How many DISTINCT unfilled calls one answer may ask about. Each costs a
 /// re-prefill and a generation, and the answer loop has no bound of its own -
 /// without this a model that stubs a different argument every round spins it
@@ -5589,6 +5638,13 @@ impl<'a> ToolLoop<'a> {
             stub_asked: Vec::new(),
             refused: None,
             log: Vec::new(),
+            base_len: None,
+            ledger: String::new(),
+            last_pair: None,
+            same_runs: 0,
+            verify_seen: false,
+            verify_ok: false,
+            verify_told: false,
         }
     }
 
@@ -5652,7 +5708,7 @@ impl<'a> ToolLoop<'a> {
         let budget = tools::Budget {
             max_calls: self.cfg.agent_max_calls.unwrap_or(self.cfg.max_calls).max(1),
             max_seconds: self.left_s().max(1),
-            ..self.budget
+            ..self.budget.clone()
         };
         (self.status)(&format!("spawning subagent #{id}…"));
         let rep = spawn(AgentSpawn {
@@ -5672,7 +5728,16 @@ impl<'a> ToolLoop<'a> {
         }
         let calls = format!("{} call{}", rep.calls, if rep.calls == 1 { "" } else { "s" });
         let took = tools::human_secs(rep.ms / 1000);
-        if rep.ok {
+        if rep.ok && rep.cut {
+            done(
+                format!(
+                    "Subagent #{} was CUT OFF at its token limit ({calls}, {took}). {}",
+                    rep.id,
+                    tools::truncate(&rep.text, self.cfg.max_chars)
+                ),
+                false,
+            )
+        } else if rep.ok {
             done(
                 format!(
                     "Subagent #{} finished ({calls}, {took}). Its report:\n\n{}",
@@ -5761,6 +5826,138 @@ impl<'a> ToolLoop<'a> {
         if !self.armed() {
             return false;
         }
+        // LEDGER MODE: the reply's state block replaces the last one, and
+        // the conversation goes back to where this loop found it before
+        // the step appends its one call and one result. A reply with no
+        // block keeps the previous ledger: losing state is the one thing
+        // this mode must never do by accident.
+        if self.budget.ledger {
+            if let Some(l) = ledger_of(text) {
+                self.ledger = tools::truncate(&l, self.cfg.ledger_chars.max(200));
+            }
+            let base = *self.base_len.get_or_insert(messages.len());
+            messages.truncate(base);
+        }
+        let again = self.step_inner(text, messages, on_call, on_result, on_note);
+        if again && self.budget.ledger {
+            if let Some(m) = messages.last_mut() {
+                m.content.push_str(&self.ledger_turn());
+            }
+        }
+        again
+    }
+
+    /// The ledger as the model reads it back: under every result, exactly
+    /// as it last wrote it, with the instruction to rewrite it whole.
+    fn ledger_turn(&self) -> String {
+        format!(
+            "\n\n### LEDGER (your state, exactly as you last wrote it. Rewrite it WHOLE under a \
+             `### LEDGER` heading at the top of your next reply, before any call; under {} \
+             characters; whatever you leave out is gone)\n{}",
+            self.cfg.ledger_chars.max(200),
+            if self.ledger.is_empty() {
+                "(none yet: write the first one now)"
+            } else {
+                self.ledger.as_str()
+            }
+        )
+    }
+
+    /// The check the verify gate waits on, when the deployment named one
+    /// AND this loop's registry really offers it; a name that resolves to
+    /// nothing gates nothing, since the model could never satisfy it.
+    fn verify_name(&self) -> Option<String> {
+        self.budget
+            .verify
+            .as_deref()
+            .filter(|n| self.reg.find(n).is_some())
+            .map(str::to_string)
+    }
+
+    /// A prose answer in a persisting loop whose check has not passed is
+    /// sent back once with the reason. Once: a check that cannot pass must
+    /// still let the turn end, and the rules already told the model to say
+    /// what fails. Returns true when the answer was bounced.
+    fn bounce_unverified(
+        &mut self,
+        text: &str,
+        messages: &mut Vec<ChatMsg>,
+        on_note: &dyn Fn(&str),
+    ) -> bool {
+        if !self.budget.persist || self.verify_ok || self.verify_told {
+            return false;
+        }
+        let Some(name) = self.verify_name() else {
+            return false;
+        };
+        if self.calls >= self.budget.max_calls || self.elapsed_s() >= self.budget.max_seconds {
+            return false;
+        }
+        self.verify_told = true;
+        let why = if self.verify_seen {
+            "its latest result did not pass, or something ran after it"
+        } else {
+            "it has not been run in this answer"
+        };
+        on_note(&format!(
+            "the answer was not accepted: the loop's check ({name}) has not passed; asking the \
+             model to run it"
+        ));
+        messages.push(ChatMsg::text("assistant", strip_think(text).trim().to_string()));
+        messages.push(ChatMsg::text(
+            "user",
+            tools::response_turn(
+                &name,
+                &format!(
+                    "This answer was NOT accepted: the goal is checked by `{name}`, and {why}. \
+                     Run `{name}` now, as the last thing before you answer, and keep working \
+                     until it passes. If it truly cannot pass, run it once more so its output \
+                     is on record, then answer and say exactly what fails."
+                ),
+            ),
+        ));
+        true
+    }
+
+    /// Track one (call, result) pair for the stuck detector; returns the
+    /// warning to append to the result, or nothing. Waits and subagents are
+    /// never tracked: a wait repeats by design, and a child's report is
+    /// never byte-identical twice for the same reason a test log is not.
+    fn note_repeat(&mut self, key: &str, tracked: bool, result: &str, on_note: &dyn Fn(&str)) -> String {
+        if !tracked {
+            self.last_pair = None;
+            self.same_runs = 0;
+            return String::new();
+        }
+        let h = fnv1a(result);
+        self.same_runs = match &self.last_pair {
+            Some((k, ph)) if k == key && *ph == h => self.same_runs + 1,
+            _ => 1,
+        };
+        self.last_pair = Some((key.to_string(), h));
+        if self.same_runs < STUCK_TELL {
+            return String::new();
+        }
+        on_note(
+            "the model repeated an identical tool call and got the identical result; telling it \
+             to change course",
+        );
+        format!(
+            "\n\n[This exact call has now returned the identical result {} times in a row. \
+             Calling it again unchanged will be refused: change the input, take a different \
+             approach, or answer with what you have.]",
+            self.same_runs
+        )
+    }
+
+    fn step_inner(
+        &mut self,
+        text: &str,
+        messages: &mut Vec<ChatMsg>,
+        on_call: &dyn Fn(&serde_json::Value),
+        on_result: &dyn Fn(&serde_json::Value),
+        on_note: &dyn Fn(&str),
+    ) -> bool {
         let Some(c) = tools::parse_calls(text).into_iter().next() else {
             // No call parsed - but was one ATTEMPTED? Left alone it reaches
             // the user as raw JSON, which the next turn then copies back out
@@ -5804,7 +6001,12 @@ impl<'a> ToolLoop<'a> {
                     return true;
                 }
             }
-            return false;
+            if self.refused.is_some() {
+                return false;
+            }
+            // the reply is the answer - unless the loop's check says it
+            // is not yet
+            return self.bounce_unverified(text, messages, on_note);
         };
         // Out of calls: say so once and let it write the answer. Saying it
         // twice is a loop, so the second offence ends the turn - refused, so
@@ -5895,6 +6097,19 @@ impl<'a> ToolLoop<'a> {
             self.refused = Some(REFUSED_GONE);
             return false;
         }
+        // Stuck: the same call, after the same call twice returned the same
+        // thing and the model was told so. It was warned in the result it
+        // read; running it a third time would only teach it that warnings
+        // are noise.
+        let key = canonical_call(&c);
+        let tracked = c.name != "wait" && c.name != tools::AGENT_TOOL;
+        if tracked
+            && self.same_runs >= STUCK_TELL
+            && self.last_pair.as_ref().is_some_and(|(k, _)| *k == key)
+        {
+            self.refused = Some(REFUSED_STUCK);
+            return false;
+        }
         self.calls += 1;
         on_call(&serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
@@ -5955,30 +6170,112 @@ impl<'a> ToolLoop<'a> {
         }
         on_result(&entry);
         self.log.push(entry);
+        // the verify gate reads the check's latest result - and only the
+        // latest thing run: a call after a passing check (a wait aside) is
+        // a change the check has not seen, so the answer needs it again
+        if self.budget.verify.as_deref() == Some(c.name.as_str()) {
+            self.verify_seen = true;
+            self.verify_ok = verify_passed(&r, self.cfg.verify_pass.as_deref());
+        } else if c.name != "wait" {
+            self.verify_ok = false;
+        }
+        let stuck = self.note_repeat(&key, tracked, &r.text, on_note);
         // A persisting loop is told where it stands with every result, so
         // "the budget is nearly spent" is a fact it can read rather than a
         // count it has to keep. Outside the loop the rules already said the
         // limit once, and a running tally would only invite calls.
         let text = if self.budget.persist {
             format!(
-                "{}\n\n[loop: call {} of {}; {} elapsed of {}]",
+                "{}{}\n\n[loop: call {} of {}; {} elapsed of {}]",
                 r.text,
+                stuck,
                 self.calls,
                 self.budget.max_calls,
                 tools::human_secs(self.elapsed_s()),
                 self.budget.time(),
             )
         } else {
-            r.text.clone()
+            format!("{}{stuck}", r.text)
         };
         // The model's own call goes back in as the assistant turn it was, so
         // the next pass sees what it asked for beside what came back.
         messages.push(ChatMsg::text("assistant", canonical_call(&c)));
         messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &text)));
-        self.results.push((messages.len() - 1, c.name.clone(), text, false));
-        self.compact(messages);
+        // in ledger mode there is never an older result to condense: the
+        // step wrapper drops it whole
+        if !self.budget.ledger {
+            self.results.push((messages.len() - 1, c.name.clone(), text, false));
+            self.compact(messages);
+        }
         true
     }
+}
+
+/// Did the check pass? A non-error result, containing the configured
+/// marker when there is one (tools::ToolsConfig::verify_pass).
+fn verify_passed(r: &tools::ToolResult, pass: Option<&str>) -> bool {
+    !r.is_error && pass.map_or(true, |p| r.text.contains(p))
+}
+
+/// The state block of a ledger-mode reply: what follows a heading line
+/// naming the ledger (`### LEDGER`, `## Ledger`, `LEDGER:`), up to the tool
+/// call or the end of the reply. None when the reply carries no block, so
+/// the last one stands.
+fn ledger_of(text: &str) -> Option<String> {
+    let body = strip_think(text);
+    let mut lines = body.lines();
+    let is_head = |l: &str| {
+        let t = l.trim().trim_start_matches('#').trim().trim_end_matches(':').trim();
+        t.eq_ignore_ascii_case(LEDGER_HEAD)
+            || t.to_ascii_lowercase().starts_with(&format!("{LEDGER_HEAD} ("))
+    };
+    lines.find(|l| is_head(l))?;
+    let mut out = String::new();
+    for l in lines {
+        if l.trim_start().starts_with("<tool_call>") || l.trim_start().starts_with("{\"name\"") {
+            break;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// FNV-1a over the text, for telling identical results apart cheaply.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// A subagent's final reply that its token limit ended, as the parent
+/// should read it: labelled as an attempt, not a result, with the head and
+/// tail kept (what it set out to do, and where it stopped) and the middle
+/// elided to fit the parent's result cap.
+fn cut_report(text: &str, max_chars: usize) -> String {
+    let edge = (max_chars / 2).saturating_sub(160).max(200);
+    let n = text.chars().count();
+    let body = if n <= 2 * edge {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(edge).collect();
+        let tail: String = text.chars().skip(n - edge).collect();
+        format!(
+            "{}\n[... {} characters of the cut-off attempt omitted ...]\n{}",
+            head.trim_end(),
+            n - 2 * edge,
+            tail.trim_start()
+        )
+    };
+    format!(
+        "Its reply hit the token limit before it finished, so nothing below is a complete \
+         result: brief a smaller task or a different approach rather than building on it. \
+         The attempt, head and tail:\n\n{body}"
+    )
 }
 
 /// A result the model has already acted on, cut to its head and tail. None
@@ -6454,7 +6751,7 @@ fn merge_client_tools(
         // nothing else, while web_search sat in a registry it was never shown.
         Some(t) => {
             let all = tools::merge_registries(t.tools(), cl);
-            let block = tools::merged_system_block(&all, t.budget, must_call);
+            let block = tools::merged_system_block(&all, &t.budget, must_call);
             (Some(all), Some(block))
         }
         // nothing of ours is armed this turn: the passthrough, unchanged
@@ -7685,7 +7982,7 @@ enum Capabilities<'a> {
     /// the answer with a tool registry: the real signatures, the budget the
     /// rules quote, and the stop string that ends generation the moment a
     /// call is complete
-    Tools(&'a [tools::Tool], tools::Budget),
+    Tools(&'a [tools::Tool], &'a tools::Budget),
     /// the answer with CLIENT-declared tools (the /v1 passthrough), and with
     /// this deployment's own merged in beside them when any are armed. The
     /// block is pre-rendered by the handler (client_system_block for the
@@ -8614,7 +8911,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let mut ok = false;
     'answer: loop {
         let caps = match &tl {
-            Some(t) => Capabilities::Tools(t.tools(), t.budget),
+            Some(t) => Capabilities::Tools(t.tools(), &t.budget),
             None => Capabilities::Note,
         };
         let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
@@ -9145,7 +9442,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         'answer: loop {
         let caps = match (&client_block, &tl) {
             (Some(b), _) => Capabilities::Client(b),
-            (None, Some(t)) => Capabilities::Tools(t.tools(), t.budget),
+            (None, Some(t)) => Capabilities::Tools(t.tools(), &t.budget),
             (None, None) => Capabilities::Note,
         };
         let (prompt_ids, stops, think_open) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
@@ -9419,7 +9716,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         'answer: loop {
         let caps = match (&client_block, &tl) {
             (Some(b), _) => Capabilities::Client(b),
-            (None, Some(t)) => Capabilities::Tools(t.tools(), t.budget),
+            (None, Some(t)) => Capabilities::Tools(t.tools(), &t.budget),
             (None, None) => Capabilities::Note,
         };
         let (prompt_ids, stops, opened) = match build_prompt(cfg, &tok, &messages, creq.thinking(), caps) {
@@ -9631,8 +9928,9 @@ fn warm_prefix(
     // the routing classifier's prefix, parked after the main one (below)
     let router_sys = router_system(cfg, &creq, &b);
     let reg = tools_enabled(cfg, &creq).map(|tc| (tc, tools::build(tc, b, &|_| {})));
-    let caps = match reg.as_ref() {
-        Some((tc, r)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, tc.budget(None)),
+    let park_budget = reg.as_ref().map(|(tc, _)| tc.budget(None));
+    let caps = match (reg.as_ref(), park_budget.as_ref()) {
+        (Some((_, r)), Some(b)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, b),
         _ => Capabilities::Note,
     };
     let (prompt, _, _) = build_prompt(cfg, &tok, &creq.messages, cfg.thinking, caps)?;
@@ -10002,6 +10300,8 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "max_seconds": t.max_seconds,
                 "max_agents": t.max_agents,
                 "max_agent_depth": t.max_agent_depth,
+                "ledger": t.ledger,
+                "verify": t.verify,
                 // what a turn would really be offered, not what was typed: a
                 // duplicate or an unusable name is dropped at resolution, and
                 // naming it here would put a tool in the UI nothing can call
@@ -10250,6 +10550,10 @@ fn handle_tools_probe(
         "keep_results": tcfg.keep_results,
         "max_agents": tcfg.max_agents,
         "max_agent_depth": tcfg.max_agent_depth,
+        "ledger": tcfg.ledger,
+        "ledger_chars": tcfg.ledger_chars,
+        "verify": tcfg.verify,
+        "verify_pass": tcfg.verify_pass,
         "default_on": tcfg.default_on,
         "notes": reg.notes,
         "tools": reg.tools.iter().map(|t| serde_json::json!({
@@ -11085,6 +11389,7 @@ mod tests {
                 text: format!("report of #{} (grandchild: {:?}); context was: {}", s.id, grand.is_ok(), s.context),
                 ms: 1500,
                 calls: 3,
+                cut: false,
                 log: vec![serde_json::json!({ "name": "t", "n": 1 })],
             }
         };
@@ -11225,9 +11530,11 @@ mod tests {
         let mut msgs = vec![ChatMsg::text("user", "make the tests pass")];
         // the "no such tool" result is short; pad it through the log so the
         // condenser has something to cut
-        let call = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
+        // distinct calls: an identical call with an identical result twice
+        // over is what the stuck detector refuses, and that is not this test
+        let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
         for i in 0..4 {
-            assert!(tl.step(call, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            assert!(tl.step(&call(i), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
             // the progress line rides under a persisting loop's results
             assert!(tl.results[i].2.contains(&format!("[loop: call {} of 32;", i + 1)), "{}", tl.results[i].2);
             // stand in for a long test log: the loop condenses what IT
@@ -11251,10 +11558,200 @@ mod tests {
         // the progress line is not under a quick answer's results
         let mut quick = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut m2 = vec![ChatMsg::text("user", "hi")];
-        assert!(quick.step(call, &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert!(quick.step(&call(0), &mut m2, &|_| {}, &|_| {}, &|_| {}));
         assert!(!m2[2].content.contains("[loop:"), "{}", m2[2].content);
         // short results are left alone by the condenser
         assert_eq!(condense("short"), None);
+    }
+
+    /// LEDGER MODE keeps the conversation flat: after every step the prompt
+    /// is the original turns, one call and one result, and the only state
+    /// that crosses is what the model wrote under `### LEDGER`.
+    #[test]
+    fn ledger_mode_rebuilds_the_conversation_from_the_ledger() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "ledger": true, "ledger_chars": 300,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        assert!(tl.budget.ledger);
+        let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "make it pass")];
+        let call = |i: usize| {
+            format!(
+                "<think>\nplanning\n</think>\n### LEDGER\nstate v{i}: tests fail on x\n- next: fix x\n\
+                 <tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>"
+            )
+        };
+        for i in 1..=3 {
+            assert!(tl.step(&call(i), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            assert_eq!(msgs.len(), 4, "the base plus one call and one result, always");
+            let last = &msgs[3].content;
+            assert!(last.contains(&format!("state v{i}: tests fail on x\n- next: fix x")), "{last}");
+            assert!(last.contains("### LEDGER (your state"), "{last}");
+            assert!(last.contains("[loop: call"), "{last}");
+            assert!(msgs[2].content.contains(&format!("\"i\":{i}")), "{}", msgs[2].content);
+        }
+        assert!(!msgs[3].content.contains("state v2"), "{}", msgs[3].content);
+        assert!(tl.results.is_empty(), "nothing to condense in ledger mode");
+        assert_eq!(tl.calls, 3);
+        assert_eq!(tl.base_len, Some(2));
+        // a reply without a block keeps the last ledger
+        let bare = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"i\":9}}</tool_call>";
+        assert!(tl.step(bare, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs[3].content.contains("state v3"), "{}", msgs[3].content);
+        // an oversized one is cut to the cap
+        let long = format!("## Ledger\n{}\n<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":10}}}}</tool_call>", "y".repeat(2000));
+        assert!(tl.step(&long, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.ledger.chars().count() < 400, "{}", tl.ledger.chars().count());
+        assert!(tl.ledger.starts_with("yyy"), "{}", tl.ledger);
+        // outside ledger mode the same replies accumulate as before
+        let mut plain = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!({ "ledger": false }))), &nop, &nofmt, None);
+        let mut m2 = vec![ChatMsg::text("user", "hi")];
+        assert!(plain.step(&call(1), &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert!(plain.step(&call(2), &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(m2.len(), 5);
+        assert!(!m2[4].content.contains("### LEDGER"), "{}", m2[4].content);
+        // the parser: heading spellings, the think block, the call boundary
+        assert_eq!(ledger_of("### LEDGER\na\nb\n<tool_call>{}</tool_call>").as_deref(), Some("a\nb"));
+        assert_eq!(ledger_of("<think>### LEDGER\nnot this</think>\nLedger:\nthis").as_deref(), Some("this"));
+        assert_eq!(ledger_of("### LEDGER (state)\nkept").as_deref(), Some("kept"));
+        assert_eq!(ledger_of("no block here\n<tool_call>{}</tool_call>"), None);
+        assert_eq!(ledger_of("### LEDGER\n\n<tool_call>{}</tool_call>"), None);
+        assert_eq!(ledger_of("### Ledgers\nno"), None);
+    }
+
+    /// The same call after the same call twice returned the same thing is
+    /// refused unrun; the second identical outcome is what warns the model.
+    /// A different call in between (a wait, a read of something else)
+    /// resets the count, because polling is not being stuck.
+    #[test]
+    fn an_identical_call_with_an_identical_result_is_refused_the_third_time() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        let a = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"q\":1}}</tool_call>";
+        let other = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"q\":2}}</tool_call>";
+        let notes = std::cell::RefCell::new(Vec::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(!msgs.last().unwrap().content.contains("identical result"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("identical result 2 times in a row"), "{}", msgs.last().unwrap().content);
+        assert_eq!(notes.borrow().len(), 1, "{:?}", notes.borrow());
+        assert!(!tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.refused, Some(REFUSED_STUCK));
+        assert_eq!(tl.calls, 2, "the third identical call must not run");
+        // a different call between two identical ones resets the count
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(other, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 4);
+        assert_eq!(tl.refused, None);
+        assert_eq!(fnv1a("a"), fnv1a("a"));
+        assert_ne!(fnv1a("a"), fnv1a("b"));
+    }
+
+    /// A persisting answer whose check has not passed is sent back once
+    /// with the reason, then accepted as it stands; a passing check unlocks
+    /// it at once, and anything run after the check (a wait aside) means
+    /// the check is needed again.
+    #[test]
+    fn a_persisting_answer_is_bounced_until_the_check_passes() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "verify": "t", "verify_pass": "0 failed",
+            "builtin": ["wait"],
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let persist = || tc.budget(Some(&serde_json::json!(true)));
+        let mut tl = ToolLoop::open(&tc, b, persist(), &nop, &nofmt, None);
+        assert!(tl.reg.find("t").is_some() && tl.reg.find("wait").is_some());
+        let mut msgs = vec![ChatMsg::text("user", "make it pass")];
+        let notes = std::cell::RefCell::new(Vec::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        // never run: bounced, with the answer kept as the assistant turn
+        assert!(tl.step("Done: the tests pass.", &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].content, "Done: the tests pass.");
+        assert!(msgs[2].content.contains("NOT accepted"), "{}", msgs[2].content);
+        assert!(msgs[2].content.contains("has not been run"), "{}", msgs[2].content);
+        assert!(notes.borrow()[0].contains("not accepted"), "{:?}", notes.borrow());
+        assert_eq!(tl.calls, 0);
+        // told once: the next answer stands
+        assert!(!tl.step("Done: I could not make them pass.", &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(tl.refused, None);
+        // a passing check unlocks the answer directly
+        let mut tl = ToolLoop::open(&tc, b, persist(), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "make it pass")];
+        tl.verify_ok = true;
+        assert!(!tl.step("Done.", &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 1);
+        // a call after the check needs it again; a wait does not
+        tl.verify_ok = true;
+        let wait = "<tool_call>{\"name\":\"wait\",\"arguments\":{\"seconds\":0}}</tool_call>";
+        assert!(tl.step(wait, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.verify_ok, "a wait changes nothing");
+        let other = "<tool_call>{\"name\":\"nope\",\"arguments\":{}}</tool_call>";
+        assert!(tl.step(other, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!tl.verify_ok, "the check has not seen what that call did");
+        assert!(tl.step("Done.", &mut msgs, &|_| {}, &|_| {}, &|_| {}), "bounced once more");
+        assert!(msgs.last().unwrap().content.contains("something ran after it") || msgs.last().unwrap().content.contains("has not been run"), "{}", msgs.last().unwrap().content);
+        // not persisting: never bounced
+        let mut quick = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut m2 = vec![ChatMsg::text("user", "hi")];
+        assert!(!quick.step("Done.", &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(m2.len(), 1);
+        // a check the registry does not offer gates nothing
+        let missing: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "verify": "make_check", "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let mut none = ToolLoop::open(&missing, b, missing.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut m3 = vec![ChatMsg::text("user", "hi")];
+        assert!(!none.step("Done.", &mut m3, &|_| {}, &|_| {}, &|_| {}));
+        // what passing means
+        let res = |text: &str, err: bool| tools::ToolResult {
+            text: text.into(), is_error: err, ms: 1, sources: Vec::new(), image: None,
+        };
+        assert!(verify_passed(&res("3 passed, 0 failed", false), Some("0 failed")));
+        assert!(!verify_passed(&res("2 passed, 1 failed", false), Some("0 failed")));
+        assert!(!verify_passed(&res("0 failed", true), Some("0 failed")));
+        assert!(verify_passed(&res("anything", false), None));
+        assert!(!verify_passed(&res("anything", true), None));
+    }
+
+    /// A subagent's reply that its token limit ended reaches the parent
+    /// labelled as an attempt, head and tail kept, never as a report.
+    #[test]
+    fn a_cut_off_subagent_reply_is_labelled_and_trimmed() {
+        let short = cut_report("started on the parser", 6000);
+        assert!(short.starts_with("Its reply hit the token limit"), "{short}");
+        assert!(short.ends_with("started on the parser"), "{short}");
+        assert!(!short.contains("omitted"));
+        let long = format!("HEAD {}TAIL", "middle ".repeat(3000));
+        let cut = cut_report(&long, 2000);
+        assert!(cut.contains("HEAD middle"), "{cut}");
+        assert!(cut.contains("middle TAIL"), "{cut}");
+        assert!(cut.contains("characters of the cut-off attempt omitted"), "{cut}");
+        assert!(cut.chars().count() < 2400, "{}", cut.chars().count());
     }
 
     /// The loop runs a call, feeds the result back, and stops when the budget
@@ -11578,14 +12075,14 @@ mod tests {
         let msgs = vec![ChatMsg::text("user", "weather in Oslo?")];
         // the system prompt is rendered into the prompt string, so checking
         // the token count alone would prove nothing - render it directly
-        let system = format!("{}{}", cfg.system_prompt, tools::system_block(&list, tools::Budget::calls(3)));
+        let system = format!("{}{}", cfg.system_prompt, tools::system_block(&list, &tools::Budget::calls(3)));
         let r = config::render_template("chatml", &system, &[("user".into(), "hi".into())],
                                         config::ThinkTurn::Plain).unwrap();
         assert!(r.prompt.contains("<tools>"), "{}", r.prompt);
         assert!(r.prompt.contains("get_weather"), "{}", r.prompt);
         // ...and the stop string that ends a turn the moment a call completes
         let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false,
-                                        Capabilities::Tools(&list, tools::Budget::calls(3))).unwrap();
+                                        Capabilities::Tools(&list, &tools::Budget::calls(3))).unwrap();
         assert!(stops.iter().any(|s| s == "</tool_call>"), "{stops:?}");
         // a deployment with no tools keeps the old stop set and the note
         let (_, stops, _) = build_prompt(&cfg, &tok, &msgs, false, Capabilities::Note).unwrap();
