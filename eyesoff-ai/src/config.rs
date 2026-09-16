@@ -14,7 +14,7 @@
 //! and model_volume pinned to the volume name. The embedded catalog ships
 //! the known models; ENCLAVE_CONFIG's `models` merges INTO it per volume key
 //! (and per field within an entry), so a deployment adds one model - e.g.
-//! {"models":{"qwen3.5-122b-a10b":{"name":"qwen3.5-122b","backend":"ggml"}}}
+//! {"models":{"qwen3.8-27b-mtp":{"name":"qwen3.8-27b-mtp","backend":"ggml"}}}
 //! - without restating anything. Which model serves a given request is
 //! decided in lib.rs (largest attached by weights size, unless the request
 //! names one).
@@ -32,7 +32,7 @@ pub struct AppConfig {
     pub head_dim: u32,
     /// layers that actually hold KV cache, for VRAM estimates: hybrid /
     /// linear-attention models keep KV only in their full-attention layers
-    /// (qwen3.5-9b: 8 of 32; qwen3.5-122b: 12 of 48). Defaults to n_layers -
+    /// (qwen3.5-9b: 8 of 32; qwen3.8-27b-mtp: 17 of 64). Defaults to n_layers -
     /// the classic all-attention transformer.
     #[serde(default)]
     pub kv_layers: Option<u32>,
