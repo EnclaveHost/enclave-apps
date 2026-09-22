@@ -636,7 +636,7 @@ fn main() {
                     for b in cmd.bytes() {
                         ser_in.borrow_mut().push_back(b);
                     }
-                    eprintln!("TYPED@{}s: {}", elapsed_s, cmd.trim_end());
+                    eprintln!("TYPED@{}s insns={}: {}", elapsed_s, done, cmd.trim_end());
                     false
                 } else {
                     true
@@ -943,6 +943,7 @@ fn linux_keycode(ch: char) -> Option<(u16, bool)> {
         ' ' => (57, false), '-' => (12, false), '=' => (13, false),
         '.' => (52, false), '/' => (53, false), ';' => (39, false),
         '$' => (28, false), // Enter
+        '~' => (1, false),  // Escape: DOOM's menu key, the cleanest visible key response
         '_' => (12, true), '&' => (8, true), '|' => (43, true),
         _ => return None,
     };

@@ -13,6 +13,18 @@ const LSR_THR_EMPTY: u8 = 0x20;
 // risc-box patch: did the clock cross a multiple of `period` when it advanced
 // from `previous` to `now`? Replaces `clock % period == 0`, which silently
 // stops firing once the clock advances in steps larger than one.
+/// How often, in retired instructions, an empty receive register takes the next typed byte.
+///
+/// Upstream used 0x38400 (230,400), with the comment "just an arbitary number @TODO: Fix me".
+/// Nothing depends on the value except typing speed: RBR must be EMPTY before a byte is taken, so
+/// the guest's own reads are the backpressure and no cadence can overrun it. At the ~100 MIPS of a
+/// native host 230,400 was 2 ms a byte and nobody noticed; inside a VBS enclave, where the
+/// emulator is Pulley bytecode and the guest runs ~0.55 MIPS, it is 0.42 s a byte - a 56-byte
+/// command took 23 s to reach the shell before it ran at all. Devices are serviced every 32
+/// instructions, so 1024 still costs one terminal poll per thousand instructions, and a byte now
+/// waits at most that long plus the guest's own interrupt handling.
+pub(crate) const RX_POLL_PERIOD: u64 = 0x400;
+
 fn crossed(previous: u64, now: u64, period: u64) -> bool {
 	(now / period) != (previous / period)
 }
@@ -66,8 +78,8 @@ impl Uart {
 		let mut rx_ip = false;
 
 		// Reads input.
-		// 0x38400 is just an arbitary number @TODO: Fix me
-		if crossed(previous_clock, self.clock, 0x38400) && self.rbr == 0 {
+		// risc-box patch: RX_POLL_PERIOD (was upstream's "arbitrary" 0x38400).
+		if crossed(previous_clock, self.clock, RX_POLL_PERIOD) && self.rbr == 0 {
 			let value = self.terminal.get_input();
 			if value != 0 {
 				self.rbr = value;
@@ -260,5 +272,59 @@ impl Uart {
 		self.thre_ip = r.bool()?;
 		self.interrupting = r.bool()?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod rx_cadence_tests {
+	use super::*;
+	use std::cell::RefCell;
+	use std::collections::VecDeque;
+	use std::rc::Rc;
+
+	/// A terminal whose typed input is a queue the test can inspect.
+	struct Queue(Rc<RefCell<VecDeque<u8>>>);
+	impl Terminal for Queue {
+		fn put_byte(&mut self, _value: u8) {}
+		fn get_output(&mut self) -> u8 { 0 }
+		fn put_input(&mut self, data: u8) { self.0.borrow_mut().push_back(data); }
+		fn get_input(&mut self) -> u8 { self.0.borrow_mut().pop_front().unwrap_or(0) }
+	}
+
+	fn uart_with(input: &[u8]) -> (Uart, Rc<RefCell<VecDeque<u8>>>) {
+		let q = Rc::new(RefCell::new(input.iter().copied().collect::<VecDeque<u8>>()));
+		(Uart::new(Box::new(Queue(q.clone()))), q)
+	}
+
+	/// Typed bytes reach a guest that is reading within one poll period each - the device is
+	/// serviced every 32 instructions, so that is the step here.
+	#[test]
+	fn typed_bytes_arrive_within_a_poll_period() {
+		let (mut uart, _) = uart_with(b"uname\n");
+		let (mut got, mut insns) = (Vec::new(), 0u64);
+		while got.len() < 6 && insns < 100 * RX_POLL_PERIOD {
+			uart.tick(32);
+			insns += 32;
+			if uart.load(0x10000005) & LSR_DATA_AVAILABLE != 0 {
+				got.push(uart.load(0x10000000));
+			}
+		}
+		assert_eq!(got, b"uname\n");
+		assert!(insns <= 6 * RX_POLL_PERIOD, "6 bytes took {insns} instructions");
+		// the old cadence, for the record: 6 x 230,400
+		assert!(insns * 100 < 6 * 0x38400, "no faster than before ({insns})");
+	}
+
+	/// A byte the guest has NOT read is never overwritten: the receive register is the only buffer,
+	/// and the queue behind it waits however fast the poll runs.
+	#[test]
+	fn an_unread_byte_is_never_overwritten() {
+		let (mut uart, q) = uart_with(b"ab");
+		for _ in 0..(10 * RX_POLL_PERIOD / 32) { uart.tick(32); }
+		assert_eq!(q.borrow().len(), 1, "exactly one byte taken while the guest was not reading");
+		assert_eq!(uart.load(0x10000000), b'a');
+		for _ in 0..(2 * RX_POLL_PERIOD / 32) { uart.tick(32); }
+		assert_eq!(uart.load(0x10000000), b'b');
+		assert!(q.borrow().is_empty());
 	}
 }
