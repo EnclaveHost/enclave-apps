@@ -255,6 +255,17 @@ impl Clint {
 	pub fn write_mtime(&mut self, value: u64) {
 		self.mtime = value;
 	}
+
+	/// risc-box patch (diagnosis): the armed deadline, and whether mtime is being
+	/// driven by the host clock or by retired instructions. A guest parked in WFI
+	/// wakes on `mtime >= mtimecmp` and on nothing else, so these two numbers are
+	/// the difference between "idle" and "never coming back".
+	pub fn read_mtimecmp(&self) -> u64 {
+		self.mtimecmp
+	}
+	pub fn is_wall(&self) -> bool {
+		self.wall.is_some()
+	}
 }
 
 // risc-box patch (snapshot): see src/snapshot.rs.

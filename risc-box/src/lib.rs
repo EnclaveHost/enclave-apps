@@ -695,6 +695,11 @@ struct Machine {
     ram_mib: u64,
     created: Instant,
     boot_at: Option<Instant>,
+    /// Dispatched step budget, NOT instructions retired: every turn adds its whole
+    /// batch whether the guest executed it or sat in WFI, where a burst is consumed
+    /// without running anything. It paces the loop and drives `mips`; it must not be
+    /// read as progress - `/status` reports the emulator's own retired count instead,
+    /// which is what tells you whether a guest is getting anywhere.
     instret: u64,
     // Presented frames per real second, sampled from the framebuffer's byte
     // counter (see the fps sampling in the loop).
@@ -1021,7 +1026,7 @@ impl App {
         format!(
             "{{\"phase\":\"{}\",\"id\":\"{}\",\"origin\":\"{}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
-             \"instret\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
+             \"instret\":{},\"guestIdle\":{},\"steps\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
              \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{},\"instances\":{}{img}}}",
             phase_name(m.phase),
             httpd::json_escape(&m.id),
@@ -1033,6 +1038,12 @@ impl App {
             httpd::json_escape(&self.cfg.fs),
             js(&self.cfg.save_key),
             self.cfg.read_only,
+            // The guest's OWN count, not the dispatched budget: a machine can burn
+            // budget for half an hour parked in WFI and look busy in `instret`.
+            m.emu.as_ref().map_or(m.instret, |e| e.get_cpu().retired()),
+            // Parked in WFI with nothing pending. Without this an inert guest and a
+            // busy one are indistinguishable from outside, which cost a long diagnosis.
+            m.emu.as_ref().map_or(false, |e| e.get_cpu().is_idle()),
             m.instret,
             m.mips(),
             m.fps(),

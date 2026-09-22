@@ -93,6 +93,18 @@ fn main() {
     // --idle-batch N: mimic the app's loop, which steps a WFI-parked guest
     // in small batches (and sleeps) instead of full ones.
     let mut idle_batch: u64 = 0;
+    // --wall-clock / --throttle: reproduce the DEPLOYED app's clock choice here.
+    // The app sets wall-clock mtime (`cfg.realtime`), where guest time is the HOST's
+    // monotonic clock; this bench has always run instruction-driven, where guest time is
+    // retired instructions. The two only agree while the guest runs near real speed, and
+    // in VTL1 it runs ~200x slower - so the pair of knobs is what lets that be tested.
+    let mut throttle_mips: f64 = 0.0;
+    // --diag N: supervisor state every N instructions. A machine that is executing but
+    // touching no device looks identical from outside to one that is wedged; this is what
+    // tells them apart, and it is the thing that was missing while a restored guest sat
+    // inert for half an hour.
+    let mut diag_every: u64 = 0;
+    let mut pc_hist: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     let mut realtime = false;
     let mut fb_size: Option<(u32, u32)> = None;
     // --trace-tf FILE: watch the console for a V8 --print-opt-code dump, parse
@@ -168,6 +180,16 @@ fn main() {
             "--idle-batch" => {
                 i += 1;
                 idle_batch = args[i].replace('_', "").parse().expect("--idle-batch N");
+            }
+            "--diag" => {
+                i += 1;
+                diag_every = args[i].replace('_', "").parse().expect("--diag N");
+            }
+            "--throttle" => {
+                // MIPS -- hold the guest to this rate by sleeping between batches, so
+                // real time runs away from guest time the way it does in the enclave.
+                i += 1;
+                throttle_mips = args[i].parse().expect("--throttle MIPS");
             }
             "--identity" => {
                 // STR -- the identity string to write into / expect from a
@@ -350,6 +372,10 @@ fn main() {
             emu.setup_filesystem(fs);
         }
     }
+    if throttle_mips > 0.0 {
+        eprintln!("throttled to {} MIPS", throttle_mips);
+    }
+    let throttle_start = Instant::now();
     #[cfg(feature = "aot")]
     if aot {
         emu.aot_enable();
@@ -380,6 +406,7 @@ fn main() {
     // Batch size matches the app's TICK_BATCH so the loop overhead outside
     // tick() is the same shape as production.
     const BATCH: u64 = 400_000;
+    let mut next_diag: u64 = 0;
     let start = Instant::now();
     let mut done: u64 = 0;
     let mut last_fbw: u64 = 0;
@@ -510,6 +537,32 @@ fn main() {
                 if emu.get_cpu().is_idle() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
+            }
+        }
+        if diag_every > 0 {
+            let c = emu.get_cpu();
+            *pc_hist.entry(c.read_pc()).or_insert(0) += 1;
+            if done >= next_diag {
+                next_diag = done + diag_every;
+                let (pc, mode, satp, scause, stval, sepc, stvec, sstatus, mip, mie) = c.diag();
+                let idle = c.is_idle();
+                let (mtime, mtimecmp, wall) = c.timer_diag();
+                eprintln!(
+                    "DIAG insns={done} retired={} pc={pc:#x} mode={mode} scause={scause:#x} \
+                     mip={mip:#x} mie={mie:#x} idle={idle} mtime={mtime} mtimecmp={mtimecmp} \
+                     due={} wall={wall} host={:.1}s",
+                    c.retired(),
+                    mtime >= mtimecmp,
+                    throttle_start.elapsed().as_secs_f64()
+                );
+            }
+        }
+        // Hold the guest to --throttle by letting real time catch up with it.
+        if throttle_mips > 0.0 {
+            let want = done as f64 / (throttle_mips * 1e6);
+            let have = throttle_start.elapsed().as_secs_f64();
+            if want > have {
+                std::thread::sleep(std::time::Duration::from_secs_f64(want - have));
             }
         }
         if trace_file.is_some() && trace_range.is_none() {
@@ -861,6 +914,7 @@ fn main() {
         }
     }
     let secs = start.elapsed().as_secs_f64();
+    report_pc_hist(&pc_hist);
     println!(
         "TOTAL {:.0}M instructions in {:.2}s = {:.1} MIPS",
         done as f64 / 1e6,
@@ -896,6 +950,19 @@ fn linux_keycode(ch: char) -> Option<(u16, bool)> {
 }
 
 // --trace-tf helpers -----------------------------------------------------
+
+/// The PCs a run spent its samples at. A handful of addresses taking nearly every
+/// sample is a loop; a long flat tail is a guest getting on with its work.
+fn report_pc_hist(h: &std::collections::HashMap<u64, u64>) {
+    if h.is_empty() { return; }
+    let total: u64 = h.values().sum();
+    let mut v: Vec<(u64, u64)> = h.iter().map(|(k, n)| (*k, *n)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("PC SAMPLES: {} distinct over {} samples", v.len(), total);
+    for (pc, n) in v.iter().take(12) {
+        eprintln!("   {pc:#018x}  {n:6}  {:5.1}%", 100.0 * *n as f64 / total as f64);
+    }
+}
 
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)

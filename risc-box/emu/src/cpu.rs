@@ -329,6 +329,12 @@ fn classify_hot(name: &str, word: u32) -> (u8, u8, u8, u8, i32) {
 /// Emulates a RISC-V CPU core
 pub struct Cpu {
 	clock: u64,
+	// risc-box patch: instructions actually EXECUTED. `clock` is guest TIME and
+	// deliberately charges a WFI burst as if it had run, which is what keeps the
+	// instruction-driven mtime advancing while the hart is parked. That makes it
+	// useless for "is this guest getting anywhere", so the honest count is kept
+	// separately - the app reports this one.
+	retired: u64,
 	xlen: Xlen,
 	privilege_mode: PrivilegeMode,
 	wfi: bool,
@@ -628,6 +634,7 @@ impl Cpu {
 	pub fn new(terminal: Box<dyn Terminal>) -> Self {
 		let mut cpu = Cpu {
 			clock: 0,
+			retired: 0,
 			xlen: Xlen::Bit64,
 			privilege_mode: PrivilegeMode::Machine,
 			wfi: false,
@@ -724,6 +731,39 @@ impl Cpu {
 		self.wfi && (self.read_csr_raw(CSR_MIE_ADDRESS) & self.read_csr_raw(CSR_MIP_ADDRESS)) == 0
 	}
 
+	// risc-box patch: instructions this hart has actually executed, idle time
+	// excluded. Not carried in a snapshot - it is a measure of this run.
+	pub fn retired(&self) -> u64 {
+		self.retired
+	}
+
+	/// risc-box patch (diagnosis): (mtime, mtimecmp, wall_clock).
+	pub fn timer_diag(&self) -> (u64, u64, bool) {
+		let c = self.mmu.get_clint();
+		(c.read_mtime(), c.read_mtimecmp(), c.is_wall())
+	}
+
+	/// risc-box patch (diagnosis): the supervisor state you need to tell a
+	/// working guest from one going round a trap. Everything here is already
+	/// in the CSR file; it is private, and without it an embedder can only
+	/// watch a machine be inert from the outside.
+	/// Returns (pc, mode, satp, scause, stval, sepc, stvec, sstatus, mip, mie).
+	pub fn diag(&self) -> (u64, u8, u64, u64, u64, u64, u64, u64, u64, u64) {
+		(
+			self.pc,
+			match self.privilege_mode { PrivilegeMode::User => 0, PrivilegeMode::Supervisor => 1,
+			                            PrivilegeMode::Reserved => 2, PrivilegeMode::Machine => 3 },
+			self.read_csr_raw(CSR_SATP_ADDRESS),
+			self.read_csr_raw(CSR_SCAUSE_ADDRESS),
+			self.read_csr_raw(CSR_STVAL_ADDRESS),
+			self.read_csr_raw(CSR_SEPC_ADDRESS),
+			self.read_csr_raw(CSR_STVEC_ADDRESS),
+			self.read_csr_raw(CSR_SSTATUS_ADDRESS),
+			self.read_csr_raw(CSR_MIP_ADDRESS),
+			self.read_csr_raw(CSR_MIE_ADDRESS),
+		)
+	}
+
 	/// Runs program one cycle. Fetch, decode, and execution are completed in a cycle so far.
 	// risc-box patch: tick() is now the single-instruction form of run() —
 	// kept for the tests and for callers that need per-instruction stepping
@@ -777,6 +817,8 @@ impl Cpu {
 					false => done = burst
 				}
 			}
+			// Whatever the WFI branch just charged is idle time, not execution.
+			let idle_charged = done;
 			while done < burst {
 				if allow_blocks {
 					let slot = ((self.pc >> 1) as usize) & (BLOCK_SLOTS - 1);
@@ -950,6 +992,7 @@ impl Cpu {
 			}
 			self.since_service += done;
 			self.clock = self.clock.wrapping_add(done);
+			self.retired = self.retired.wrapping_add(done - idle_charged);
 			remaining = remaining.saturating_sub(done);
 			// Device-service boundary, at the same stream position as the
 			// old per-tick countdown: the end of the interval's last
