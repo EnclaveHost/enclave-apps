@@ -99,6 +99,10 @@ fn main() {
     // retired instructions. The two only agree while the guest runs near real speed, and
     // in VTL1 it runs ~200x slower - so the pair of knobs is what lets that be tested.
     let mut throttle_mips: f64 = 0.0;
+    // --identity-out STR: the identity a --snapshot-on image is WRITTEN with, when it must differ
+    // from the one a --restore is checked against - re-keying a snapshot to settings its guest
+    // state is valid under (a realtime:true image resumed on the instruction clock, say).
+    let mut identity_out: Option<String> = None;
     // --diag N: supervisor state every N instructions. A machine that is executing but
     // touching no device looks identical from outside to one that is wedged; this is what
     // tells them apart, and it is the thing that was missing while a restored guest sat
@@ -180,6 +184,10 @@ fn main() {
             "--idle-batch" => {
                 i += 1;
                 idle_batch = args[i].replace('_', "").parse().expect("--idle-batch N");
+            }
+            "--identity-out" => {
+                i += 1;
+                identity_out = Some(args[i].clone());
             }
             "--diag" => {
                 i += 1;
@@ -592,7 +600,7 @@ fn main() {
                 .any(|w| w == marker.as_bytes());
             if hit {
                 let t = Instant::now();
-                let (data, info) = emu.snapshot(&identity, snap_level);
+                let (data, info) = emu.snapshot(identity_out.as_deref().unwrap_or(&identity), snap_level);
                 let took = t.elapsed().as_secs_f64();
                 std::fs::write(&path, &data).expect("write snapshot");
                 println!(
