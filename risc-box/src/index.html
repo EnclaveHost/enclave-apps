@@ -169,11 +169,27 @@ function authFetch(url, opts) {
 }
 function needKey() { $("authbar").style.display = ""; $("apikey").focus(); }
 
+// Keystrokes go out ONE REQUEST AT A TIME, in order, and whatever is typed while one is in flight
+// rides in the next. A POST per key, fired without waiting, put several requests in flight at once
+// over separate connections - and they can arrive in any order, so fast typing reached the shell
+// scrambled. On a slow host (a VBS enclave, where a POST takes 0.5-2 s) that was every burst of
+// typing. Coalescing also means a burst costs one request instead of one per character.
+let inq = "", insending = false;
 term.onData((d) => {
   if (!running) return;
-  // send raw bytes (UTF-8) as the request body
-  authFetch("/input", { method: "POST", body: new TextEncoder().encode(d) }).catch(() => {});
+  inq += d;
+  pumpInput();
 });
+async function pumpInput() {
+  if (insending || !inq) return;
+  insending = true;
+  const chunk = inq;
+  inq = "";
+  // send raw bytes (UTF-8) as the request body
+  try { await authFetch("/input", { method: "POST", body: new TextEncoder().encode(chunk) }); } catch (_) {}
+  insending = false;
+  if (inq) pumpInput();
+}
 
 function connectConsole() {
   if (evs) return;
