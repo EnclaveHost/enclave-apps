@@ -61,13 +61,16 @@ impl Slot {
 #[derive(Clone)]
 pub struct RamImage {
 	chunks: Vec<Option<Arc<Chunk>>>,
+	// Chunks that hold content, kept as they are created so `footprint` is O(1):
+	// see `Memory::owned_n`.
+	present: usize,
 	len: usize
 }
 
 impl RamImage {
 	pub fn new(len: usize) -> Self {
 		let n = (len + CHUNK - 1) / CHUNK;
-		RamImage { chunks: (0..n).map(|_| None).collect(), len }
+		RamImage { chunks: (0..n).map(|_| None).collect(), present: 0, len }
 	}
 
 	pub fn len(&self) -> usize {
@@ -80,6 +83,7 @@ impl RamImage {
 		let addr = page * PAGE;
 		let ci = addr >> CHUNK_SHIFT;
 		let off = addr & (CHUNK - 1);
+		self.present += self.chunks[ci].is_none() as usize;
 		let chunk = self.chunks[ci].get_or_insert_with(zero_arc);
 		let chunk = Arc::get_mut(chunk).expect("RamImage chunk is shared while being built");
 		chunk[off..off + data.len()].copy_from_slice(data);
@@ -94,6 +98,11 @@ impl RamImage {
 
 	/// Bytes actually allocated (chunks with content), for accounting.
 	pub fn footprint(&self) -> usize {
+		self.present * CHUNK
+	}
+
+	#[cfg(test)]
+	fn footprint_walk(&self) -> usize {
 		self.chunks.iter().filter(|c| c.is_some()).count() * CHUNK
 	}
 }
@@ -113,7 +122,28 @@ pub struct Memory {
 	// as long as the slot holds it.
 	rd: Vec<*const u8>,
 	wr: Vec<*mut u8>,
+	// Owned and Shared slot counts, kept by `set_slot` (and `share`, which
+	// empties slots in place) so `footprint` is O(1). Walking the slots was
+	// ~350k visits for a 21 GiB guest on every /status poll: cheap natively,
+	// a large share of a ~330 ms loop stall when the app runs interpreted.
+	owned_n: usize,
+	shared_n: usize,
 	len: usize
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+	Zero,
+	Shared,
+	Owned
+}
+
+fn kind(s: &Slot) -> Kind {
+	match s {
+		Slot::Zero => Kind::Zero,
+		Slot::Shared(_) => Kind::Shared,
+		Slot::Owned(_) => Kind::Owned
+	}
 }
 
 // The raw pointers only ever point into allocations this struct owns (or
@@ -125,11 +155,23 @@ unsafe impl Sync for Memory {}
 impl Memory {
 	/// Creates a new `Memory`
 	pub fn new() -> Self {
-		Memory { slots: vec![], rd: vec![], wr: vec![], len: 0 }
+		Memory { slots: vec![], rd: vec![], wr: vec![], owned_n: 0, shared_n: 0, len: 0 }
+	}
+
+	fn tally(&mut self, k: Kind, add: bool) {
+		let n = match k {
+			Kind::Zero => return,
+			Kind::Shared => &mut self.shared_n,
+			Kind::Owned => &mut self.owned_n
+		};
+		if add { *n += 1 } else { *n -= 1 }
 	}
 
 	/// Install a slot and refresh the pointer tables for it.
 	fn set_slot(&mut self, ci: usize, slot: Slot) {
+		let old = kind(&self.slots[ci]);
+		self.tally(old, false);
+		self.tally(kind(&slot), true);
 		let (rd, wr): (*const u8, *mut u8) = match &slot {
 			Slot::Zero => (ZERO_CHUNK.as_ptr(), std::ptr::null_mut()),
 			Slot::Shared(a) => (a.as_ptr(), std::ptr::null_mut()),
@@ -161,6 +203,8 @@ impl Memory {
 		self.slots = (0..n).map(|_| Slot::Zero).collect();
 		self.rd = vec![ZERO_CHUNK.as_ptr(); n];
 		self.wr = vec![std::ptr::null_mut(); n];
+		self.owned_n = 0;
+		self.shared_n = 0;
 		self.len = len;
 	}
 
@@ -187,8 +231,12 @@ impl Memory {
 	/// this machine keeps reading them as Shared until it writes.
 	pub fn share(&mut self) -> RamImage {
 		let mut chunks = Vec::with_capacity(self.slots.len());
+		let mut present = 0;
 		for i in 0..self.slots.len() {
-			let arc = match std::mem::replace(&mut self.slots[i], Slot::Zero) {
+			let taken = std::mem::replace(&mut self.slots[i], Slot::Zero);
+			// the slot is Zero now; set_slot below counts whatever replaces it
+			self.tally(kind(&taken), false);
+			let arc = match taken {
 				Slot::Zero => None,
 				Slot::Shared(a) => Some(a),
 				Slot::Owned(b) => {
@@ -202,13 +250,19 @@ impl Memory {
 				None => Slot::Zero
 			};
 			self.set_slot(i, slot);
+			present += arc.is_some() as usize;
 			chunks.push(arc);
 		}
-		RamImage { chunks, len: self.len }
+		RamImage { chunks, present, len: self.len }
 	}
 
 	/// Bytes this machine holds itself (owned chunks), and bytes it shares.
 	pub fn footprint(&self) -> (usize, usize) {
+		(self.owned_n * CHUNK, self.shared_n * CHUNK)
+	}
+
+	#[cfg(test)]
+	fn footprint_walk(&self) -> (usize, usize) {
 		let mut owned = 0;
 		let mut shared = 0;
 		for s in &self.slots {
@@ -510,5 +564,47 @@ mod tests {
 		m.write_page(3, &vec![9u8; PAGE]);
 		assert_eq!(m.read_byte(3 * PAGE as u64 + 7), 9);
 		assert_eq!(img.page(3).unwrap()[7], data[7], "the image is copy-on-write");
+	}
+
+	/// `footprint` is a pair of counters now, not a walk: pin them to the walk
+	/// through a long random mix of every operation that changes a slot —
+	/// first writes, copy-on-write, publishing, adopting (into fresh and into
+	/// live memory) and page restores — and the image's count likewise.
+	#[test]
+	fn footprint_counters_always_equal_the_walk() {
+		let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+		let mut rnd = move |n: u64| {
+			seed ^= seed << 13;
+			seed ^= seed >> 7;
+			seed ^= seed << 17;
+			seed % n
+		};
+		let size = 24 * CHUNK as u64;
+		let mut a = Memory::new();
+		a.init(size);
+		let mut b = Memory::new();
+		b.init(size);
+		let mut img = RamImage::new(size as usize);
+		for step in 0..4000 {
+			match rnd(9) {
+				0..=3 => a.write_word(rnd(size - 8) & !3, step as u32),
+				4 => b.write_doubleword(rnd(size - 8) & !7, step),
+				5 => img = a.share(),
+				6 => b.adopt(&img),
+				7 => a.write_page(rnd(size / PAGE as u64) as usize, &[step as u8; PAGE]),
+				_ => {
+					let mut fresh = RamImage::new(size as usize);
+					for _ in 0..rnd(6) {
+						fresh.write_page(rnd(size / PAGE as u64) as usize, &[1u8; PAGE]);
+					}
+					assert_eq!(fresh.footprint(), fresh.footprint_walk(), "built image at step {step}");
+					b.adopt(&fresh);
+				}
+			}
+			assert_eq!(a.footprint(), a.footprint_walk(), "a at step {step}");
+			assert_eq!(b.footprint(), b.footprint_walk(), "b at step {step}");
+			assert_eq!(img.footprint(), img.footprint_walk(), "image at step {step}");
+		}
+		assert!(a.footprint().0 > 0 && b.footprint().1 > 0, "the mix exercised both owned and shared");
 	}
 }

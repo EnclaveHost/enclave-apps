@@ -106,7 +106,14 @@ pub fn scan_interval_boosted(cost: std::time::Duration, still: u32, boosted: boo
     });
     let ceiling = Duration::from_millis(FB_SCAN_MS);
     let base = (cost * SCAN_COST_RATIO).clamp(floor, ceiling);
-    (base * (1u32 << still.min(SCAN_MAX_BACKOFF))).min(ceiling)
+    let paced = (base * (1u32 << still.min(SCAN_MAX_BACKOFF))).min(ceiling);
+    // The ceiling is a cadence for CHEAP scans and must never override the
+    // cost share. Natively a scan costs a few ms, cost*RATIO sits under
+    // FB_SCAN_MS and this max() changes nothing. Interpreted (Pulley in a VBS
+    // enclave, ~0.4 MIPS) one scan measured 258 ms: capped at 100 ms the gap
+    // handed ~72% of the emulator thread to scanning whenever a page was open,
+    // and every keystroke queued behind it.
+    paced.max(cost * SCAN_COST_RATIO)
 }
 
 pub struct Band {
@@ -762,13 +769,53 @@ mod tests {
         let dear = scan_interval(Duration::from_millis(15), 0);
         assert!(dear > cheap, "a costlier scan must wait longer, got {dear:?} vs {cheap:?}");
 
-        for ms in [1u64, 4, 6, 15, 40] {
+        // No exemption at the ceiling: that exemption is exactly where a slow
+        // host lost its thread (a 258 ms scan used to earn a 100 ms gap).
+        for ms in [1u64, 4, 6, 15, 40, 100, 258, 1_000] {
             let cost = Duration::from_millis(ms);
-            let gap = scan_interval(cost, 0);
-            // Unless we are pinned at the floor, the gap covers RATIO times
-            // the work, so scanning stays under 1/(1+RATIO) of the thread.
-            if gap > Duration::from_millis(FB_SCAN_FLOOR_MS) && gap < Duration::from_millis(FB_SCAN_MS) {
-                assert!(gap >= cost * 4, "cost {cost:?} only earned {gap:?}");
+            for still in [0u32, 1, 3, 9] {
+                for boosted in [false, true] {
+                    let gap = scan_interval_boosted(cost, still, boosted);
+                    assert!(gap >= cost * SCAN_COST_RATIO,
+                            "cost {cost:?} still {still} boosted {boosted} only earned {gap:?}");
+                }
+            }
+        }
+    }
+
+    /// The case that motivated the budget rule, with the numbers measured on
+    /// the enclave: a 258 ms scan may take at most a fifth of the thread,
+    /// whatever the stillness and even while input asks for fast scans.
+    #[test]
+    fn a_slow_hosts_scan_keeps_to_its_share() {
+        let cost = Duration::from_millis(258);
+        for still in [0u32, 2, 7] {
+            for boosted in [false, true] {
+                let gap = scan_interval_boosted(cost, still, boosted);
+                let share = cost.as_secs_f64() / (cost + gap).as_secs_f64();
+                assert!(share <= 1.0 / (1.0 + SCAN_COST_RATIO as f64) + 1e-9,
+                        "still {still} boosted {boosted}: scanning takes {:.0}% of the thread", share * 100.0);
+            }
+        }
+    }
+
+    /// Where the scan is cheap (every native host: a few ms) the cadence is
+    /// exactly what it was before the budget rule, for every input.
+    #[test]
+    fn a_cheap_scan_keeps_its_old_cadence() {
+        fn before(cost: Duration, still: u32, boosted: bool) -> Duration {
+            let floor = Duration::from_millis(if boosted { FB_SCAN_FLOOR_MS / 2 } else { FB_SCAN_FLOOR_MS });
+            let ceiling = Duration::from_millis(FB_SCAN_MS);
+            let base = (cost * SCAN_COST_RATIO).clamp(floor, ceiling);
+            (base * (1u32 << still.min(SCAN_MAX_BACKOFF))).min(ceiling)
+        }
+        for us in (0u64..=25_000).step_by(250) {
+            let cost = Duration::from_micros(us);
+            for still in [0u32, 1, 2, 3, 4, 10] {
+                for boosted in [false, true] {
+                    assert_eq!(scan_interval_boosted(cost, still, boosted), before(cost, still, boosted),
+                               "cost {cost:?} still {still} boosted {boosted}");
+                }
             }
         }
     }
@@ -805,14 +852,18 @@ mod tests {
     }
 
     /// The interval is always inside the declared bounds, whatever it is fed.
+    /// The upper bound is FB_SCAN_MS OR the cost share, whichever is longer:
+    /// this test used to cap every gap at FB_SCAN_MS, which is the rule that
+    /// let an interpreted 250 ms scan run every 100 ms.
     #[test]
     fn the_interval_stays_within_its_bounds() {
         for ms in [0u64, 1, 7, 50, 250, 5_000] {
+            let cost = Duration::from_millis(ms);
+            let upper = Duration::from_millis(FB_SCAN_MS).max(cost * SCAN_COST_RATIO);
             for still in [0u32, 1, 3, 7, u32::MAX] {
-                let gap = scan_interval(Duration::from_millis(ms), still);
+                let gap = scan_interval(cost, still);
                 assert!(
-                    gap >= Duration::from_millis(FB_SCAN_FLOOR_MS)
-                        && gap <= Duration::from_millis(FB_SCAN_MS),
+                    gap >= Duration::from_millis(FB_SCAN_FLOOR_MS) && gap <= upper,
                     "cost {ms}ms still {still} produced {gap:?}"
                 );
             }

@@ -1002,7 +1002,9 @@ impl App {
     }
 
     /// Device-level display counters for chasing capture bugs: which surface
-    /// moved, what the scanout holds. Cheap (sums 4 KiB), debug-grade.
+    /// moved, what the scanout holds. Debug-grade and NOT cheap: it reads and
+    /// sums the full scanout twice (2.3 MB each at 960x600), so /status only
+    /// includes it when asked with ?debug=1.
     fn gpu_debug_json(&self, mi: usize) -> String {
         match self.machines[mi].emu.as_ref() {
             Some(emu) => {
@@ -1031,7 +1033,7 @@ impl App {
         }
     }
 
-    fn status_json(&self, mi: usize) -> String {
+    fn status_json(&self, mi: usize, debug: bool) -> String {
         let m = &self.machines[mi];
         let img = self
             .cache
@@ -1118,7 +1120,12 @@ impl App {
                 .map(|(res, x, y, n)| format!(
                     "{{\"res\":{},\"x\":{},\"y\":{},\"updates\":{}}}", res, x, y, n))
                 .unwrap_or_else(|| "null".into()),
-            self.gpu_debug_json(mi),
+            // Only on request (?debug=1): it reads and sums the whole scanout
+            // twice. The page polls /status every 1.5 s and never reads this.
+            match debug {
+                true => self.gpu_debug_json(mi),
+                false => "null".into(),
+            },
             self.snapshot_json(mi),
             self.instances_summary_json(),
         )
@@ -1629,7 +1636,10 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 .with("cache-control", "public, max-age=31536000, immutable")
                 .body("text/css; charset=utf-8", XTERM_CSS.as_bytes().to_vec()),
         ),
-        ("GET", "/status") | ("GET", "/") => server.respond(key, json(200, "OK", app.status_json(mi))),
+        ("GET", "/status") | ("GET", "/") => {
+            let debug = form_get(&req.query, "debug").as_deref() == Some("1");
+            server.respond(key, json(200, "OK", app.status_json(mi, debug)))
+        }
         ("GET", "/instances") if !sub => server.respond(key, json(200, "OK", app.instances_json())),
         ("POST", "/instances") if !sub => instances_create(app, server, key, &req.body),
         ("DELETE", "/") | ("POST", "/delete") if sub => instance_delete(app, server, key, mi),
