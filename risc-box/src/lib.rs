@@ -109,6 +109,31 @@ const IDLE_BATCH: u64 = 4_000; // batch while the guest is parked in WFI: keeps
 /// the floor one machine's share may sink to, so a crowded box still makes
 /// progress on every guest each turn.
 const MIN_BATCH: u64 = 50_000;
+/// How long one event-loop turn should last, in milliseconds of the HOST's time.
+///
+/// A turn runs one batch of guest instructions and only then serves HTTP and flushes the console,
+/// so the batch sets the floor on every request's latency and on key-to-echo. TICK_BATCH was sized
+/// for a host running the emulator near 66 MIPS - the loop's own comment says "the ~6 ms a batch
+/// takes". Inside a VBS enclave the emulator is Pulley bytecode and runs ~0.5 MIPS, where the same
+/// 400,000 instructions take ~800 ms: measured there, a POST /input waited 0.5-0.75 s just to be
+/// read and a keystroke took 1.4-2.1 s to echo on loopback. Sizing the batch by TIME keeps a fast
+/// host exactly as it was (the target is capped at the old batch) and gives a slow one a turn
+/// every TURN_TARGET_MS.
+const TURN_TARGET_MS: f64 = 40.0;
+/// The least a timed batch may shrink to: below this the loop's own per-turn work stops being
+/// small beside the guest's.
+const TURN_FLOOR: u64 = 8_000;
+
+/// Instructions to run in a turn so that it lasts about TURN_TARGET_MS on THIS host, given the
+/// machine's measured rate (instructions per millisecond, 0 = not measured yet). Never more than
+/// `share`, the old fixed budget, so a host that already met the target is unchanged.
+fn turn_batch(share: u64, per_ms: f64) -> u64 {
+    if !(per_ms > 0.0) {
+        return share;
+    }
+    let want = (per_ms * TURN_TARGET_MS) as u64;
+    want.clamp(TURN_FLOOR.min(share), share)
+}
 const SCROLLBACK: usize = 256 * 1024; // console bytes retained for late joiners
 // Full-speed turns after network activity: ~100M instructions ≈ 1.25 guest
 // seconds, enough to span a whole ping/keepalive cadence so an interactive
@@ -707,6 +732,7 @@ struct Machine {
     fps_bytes: u64,
     fps_at: Instant,
     input_boost: u64, // turns to force full tick batches after POST /input
+    per_ms: f64,      // measured instructions per host millisecond (0 = not yet)
     /// Consecutive turns the boost has been held, and the cooldown that follows
     /// when it has been held too long. Input arriving faster than the boost
     /// decays would otherwise re-arm it forever; see BOOST_RUN_MAX.
@@ -743,6 +769,7 @@ impl Machine {
             fps_bytes: 0,
             fps_at: Instant::now(),
             input_boost: 0,
+            per_ms: 0.0,
             boost_run: 0,
             boost_hold: 0,
             exec_seq: 0,
@@ -2981,7 +3008,7 @@ pub fn run() {
             let parked = m.input_boost == 0 && emu.get_cpu().is_idle();
             let batch = match parked {
                 true => IDLE_BATCH,
-                false => share,
+                false => turn_batch(share, m.per_ms),
             };
             // A guest that is RUNNING has already paced this turn: it just
             // spent a batch of real work, and the loop must not add a sleep
@@ -3016,7 +3043,17 @@ pub fn run() {
             // amortized inside the emulator, and a WFI-parked guest
             // consumes the batch without spinning (idle turns cost the
             // loop almost nothing, leaving the budget to scan/encode).
+            let ran_at = Instant::now();
             emu.run_n(batch);
+            // The rate only means something for a batch that EXECUTED: a parked guest consumes
+            // its batch without running anything, which would read as an absurd rate.
+            if !parked {
+                let ms = ran_at.elapsed().as_secs_f64() * 1000.0;
+                if ms > 0.05 {
+                    let sample = batch as f64 / ms;
+                    m.per_ms = if m.per_ms > 0.0 { 0.8 * m.per_ms + 0.2 * sample } else { sample };
+                }
+            }
             m.instret += batch;
             // Presented frames per real second.
             {
@@ -3406,5 +3443,34 @@ pub fn run() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             last_yield = std::time::Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_batch_tests {
+    use super::*;
+
+    #[test]
+    fn a_fast_host_keeps_the_old_batch() {
+        // 100 MIPS = 100,000 per ms: 40 ms would be 4M, capped at the old 400k
+        assert_eq!(turn_batch(TICK_BATCH, 100_000.0), TICK_BATCH);
+        assert_eq!(turn_batch(TICK_BATCH, 0.0), TICK_BATCH, "unmeasured = unchanged");
+    }
+
+    #[test]
+    fn an_enclave_speed_host_gets_a_turn_every_target() {
+        // ~0.5 MIPS = 500 per ms, the measured VBS-enclave rate: 40 ms = 20,000 instructions
+        let b = turn_batch(TICK_BATCH, 500.0);
+        assert_eq!(b, 20_000);
+        assert!((b as f64 / 500.0) <= TURN_TARGET_MS + 0.5);
+        // the old batch at that rate was 800 ms a turn
+        assert!(TICK_BATCH as f64 / 500.0 >= 800.0);
+    }
+
+    #[test]
+    fn never_below_the_floor_nor_above_the_share() {
+        assert_eq!(turn_batch(TICK_BATCH, 1.0), TURN_FLOOR);
+        assert_eq!(turn_batch(MIN_BATCH, 100_000.0), MIN_BATCH);
+        assert_eq!(turn_batch(4_000, 1.0), 4_000, "a share already under the floor is kept");
     }
 }
