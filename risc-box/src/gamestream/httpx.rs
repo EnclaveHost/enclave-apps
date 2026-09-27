@@ -189,25 +189,10 @@ pub fn route(srv: &Server, path: &str, https: bool, local_ip: &str) -> Outcome {
     match route {
         "/serverinfo" => Outcome::Reply(serverinfo(srv, &args, https)),
         "/pair" => srv.pair.handle(&args),
-        "/pin" => {
-            // Headless-test convenience: deliver the PIN that a real
-            // deployment would show to the operator.
-            let id = args.get("uniqueid").cloned().unwrap_or_default();
-            let pin = args.get("pin").cloned().unwrap_or_default();
-            srv.pair.submit_pin(&id, &pin);
-            Outcome::Reply("<?xml version=\"1.0\"?><root status_code=\"200\"><pin>ok</pin></root>".into())
-        }
-        "/unpair" => {
-            // Only the caller's own pairing. This endpoint is unauthenticated
-            // plain HTTP, and Moonlight calls it by itself whenever it cannot
-            // verify a host — so wiping every pairing here means one confused
-            // client logs everyone out.
-            match args.get("uniqueid") {
-                Some(id) => srv.pair.unpair(id),
-                None => eprintln!("[pair] /unpair without a uniqueid; ignoring"),
-            }
-            Outcome::Reply(xml(&[("unpaired", "1".into())]))
-        }
+        // Pairing consent belongs to the app's authenticated control API.
+        // The public GameStream surface must not accept its own pairing PIN
+        // or allow an unauthenticated caller to revoke another client's key.
+        "/pin" | "/unpair" => Outcome::Reply(xml_error(403, "Use the app control API", &[])),
         "/applist" if https => Outcome::Reply(applist()),
         "/launch" if https => Outcome::Reply(launch(srv, &args, local_ip, false)),
         "/resume" if https => Outcome::Reply(launch(srv, &args, local_ip, true)),

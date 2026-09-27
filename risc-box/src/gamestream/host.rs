@@ -94,47 +94,26 @@ impl Host {
     /// just does not offer GameStream, which is better than half a host that
     /// Moonlight can discover but not stream from.
     pub fn bind(srv: Arc<httpx::Server>, local_ip: String) -> Option<Host> {
-        // STAND DOWN unless this node can encode in hardware.
-        //
-        // Serving GameStream from in here has exactly one advantage over the
-        // external gs-bridge: the frames never leave the enclave to be encoded.
-        // That advantage is bought with the card. Without it the guest would be
-        // encoding 1024x768 in software on an EMULATED RISC-V CPU (minih264,
-        // ~23 ms/frame) while a real NVENC sits idle on whatever machine runs
-        // the bridge -- strictly worse than the path we already had.
-        //
-        // So when there is no hardware encoder, this host does not bind at all:
-        // the app keeps serving /video, /fb.rgb and the band stream, and
-        // gs-bridge encodes on its own GPU exactly as it does today. Note this
-        // is a REAL case, not a theoretical one -- Hopper datacenter parts
-        // (H100/H200) ship NVDEC but no NVENC, so a GPU enclave can be
-        // hardware-accelerated for inference and still unable to encode video.
-        // Uses the WORKER's cached probe: load_by_name opens a graph and a
-        // context, and doing that twice at startup is pure waste.
-        if !crate::worker::nvenc_supported() {
-            eprintln!(
-                "[gs] no hardware encoder here - NOT serving GameStream in-guest; \
-                 gs-bridge keeps the stream and encodes on its own GPU \
-                 (the app's /video, /fb.rgb and band stream are unchanged)"
-            );
-            return None;
-        }
+        Self::bind_ports(srv, local_ip, [PORT_HTTP, PORT_HTTPS, PORT_RTSP, PORT_VIDEO, PORT_CONTROL, PORT_AUDIO])
+    }
+
+    fn bind_ports(srv: Arc<httpx::Server>, local_ip: String, ports: [u16; 6]) -> Option<Host> {
+        // H.264 encoding already runs in the app's worker. The CPU backend
+        // keeps pixels inside the isolated app and needs no GPU encoder.
         let tls = match build_tls(&srv) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
-                // Discovery and pairing still work over plain HTTP; launch does
-                // not. Say so rather than failing silently.
-                eprintln!("[gs] TLS unavailable ({e}); https surface disabled");
-                None
+                eprintln!("[gs] TLS unavailable ({e}); refusing incomplete host");
+                return None;
             }
         };
         let host = Host {
-            http: bind_tcp(PORT_HTTP)?,
-            https: bind_tcp(PORT_HTTPS)?,
-            rtsp: bind_tcp(PORT_RTSP)?,
-            video: bind_udp(PORT_VIDEO)?,
-            control: crate::gamestream::enet::Host::bind(PORT_CONTROL),
-            audio: bind_udp(PORT_AUDIO)?,
+            http: bind_tcp(ports[0])?,
+            https: bind_tcp(ports[1])?,
+            rtsp: bind_tcp(ports[2])?,
+            video: bind_udp(ports[3])?,
+            control: Some(crate::gamestream::enet::Host::bind(ports[4])?),
+            audio: bind_udp(ports[5])?,
             srv,
             tls,
             conns: Vec::new(),
@@ -302,6 +281,17 @@ impl Host {
         true
     }
 
+    /// A running stream drives capture without a browser SSE subscriber.
+    pub fn video_bitrate(&self) -> Option<u32> {
+        let session = self.srv.session.lock().unwrap().clone()?;
+        if session.is_stopping() || *session.state.lock().unwrap() != crate::gamestream::session::State::Running { return None; }
+        if session.idr_requested.swap(false, std::sync::atomic::Ordering::AcqRel) { crate::worker::force_key(); }
+        let bitrate = session.config.lock().unwrap().bitrate_kbps;
+        Some(bitrate.clamp(100, 50_000))
+    }
+
+    pub fn submit_pin(&self, id: &str, pin: &str) { self.srv.pair.submit_pin(id, pin); }
+
     /// Hand one coded access unit to the client. Called with the same frames
     /// the SSE watchers get, so the picture is encoded once and consumed twice.
     pub fn feed_video(&mut self, frame: &EncodedFrame) {
@@ -458,6 +448,30 @@ fn queue_http(c: &mut Conn, body: &str) {
     c.wbuf.extend_from_slice(resp.as_bytes());
 }
 
+/// Only completed pairing certificates may use the control surface. TLS
+/// CertificateVerify proves possession of the matching private key.
+struct PairedClientVerifier(Arc<crate::gamestream::pair::PairState>);
+impl std::fmt::Debug for PairedClientVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("PairedClientVerifier") }
+}
+impl rustls::server::danger::ClientCertVerifier for PairedClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] { &[] }
+    fn verify_client_cert(&self, cert: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: rustls::pki_types::UnixTime) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if self.0.is_paired_der(cert.as_ref()) {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else { Err(rustls::Error::General("client has not completed pairing".into())) }
+    }
+    fn verify_tls12_signature(&self, message: &[u8], cert: &rustls::pki_types::CertificateDer<'_>, dss: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls_rustcrypto::provider().signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, message: &[u8], cert: &rustls::pki_types::CertificateDer<'_>, dss: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls_rustcrypto::provider().signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls_rustcrypto::provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// End of the request head, CRLFCRLF or the bare-LF form some clients send.
 fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).or_else(|| {
@@ -467,7 +481,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 
 /// A rustls server config under the pairing identity.
 ///
-/// Client certificates are accepted at the TLS layer and checked ABOVE it:
+/// Client certificates are checked against completed pairings during TLS:
 /// Moonlight presents a self-signed certificate that no PKI can chain, and the
 /// question that matters is "is this the certificate we paired with", which
 /// only `PairState` can answer.
@@ -486,7 +500,7 @@ fn build_tls(srv: &httpx::Server) -> Result<rustls::ServerConfig, String> {
     rustls::ServerConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("tls versions: {e}"))?
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(PairedClientVerifier(srv.pair.clone())))
         .with_single_cert(vec![cert], key)
         .map_err(|e| format!("tls identity: {e}"))
 }
@@ -494,6 +508,54 @@ fn build_tls(srv: &httpx::Server) -> Result<rustls::ServerConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_server() -> Arc<httpx::Server> {
+        use crate::gamestream::pair::{MemoryStore, Store, PairState};
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 1024).unwrap();
+        let cert = crate::gamestream::x509gen::self_signed(&key, "test", 1_787_529_600, 3650, &[9;20]).unwrap();
+        let store = MemoryStore::default();
+        store.put("gamestream/server-key.der", key.to_pkcs1_der().unwrap().as_bytes());
+        store.put("gamestream/server-cert.der", &cert);
+        let hex: String = cert.iter().map(|b| format!("{b:02x}")).collect();
+        store.put("gamestream/paired.json", serde_json::json!({"paired":hex}).to_string().as_bytes());
+        Arc::new(httpx::Server {pair: Arc::new(PairState::load(Box::new(store),1_787_529_600)),session: std::sync::Mutex::new(None),on_launch: Box::new(|_|{}),host_name:"test".into(),unique_id:"test".into()})
+    }
+
+    #[test]
+    fn cpu_host_starts_and_streaming_does_not_need_browser_watchers() {
+        let srv = test_server();
+        let host = Host::bind_ports(srv.clone(), "127.0.0.1".into(), [0;6]).expect("CPU host binds without NVENC");
+        assert!(host.video_bitrate().is_none());
+        let session = Arc::new(crate::gamestream::session::Session::new(1, vec![0;16], 0, "ping".into(), 0, 1));
+        *srv.session.lock().unwrap()=Some(session.clone());
+        assert!(host.video_bitrate().is_none());
+        *session.state.lock().unwrap()=crate::gamestream::session::State::Running;
+        assert_eq!(host.video_bitrate(),Some(10_000));
+        session.stop();
+        assert!(host.video_bitrate().is_none());
+        let mut enc=crate::video::H264Encoder::new(32,32,1000).unwrap();
+        use crate::video::VideoEncoder;
+        let frames=enc.encode(&vec![127;32*32*3],32,32);
+        assert!(!frames.is_empty());
+        assert!(frames[0].keyframe);
+        assert!(frames[0].data.starts_with(&[0,0,0,1]) || frames[0].data.starts_with(&[0,0,1]));
+    }
+
+    #[test]
+    fn paired_certificates_are_required_and_public_pin_cannot_approve_pairing() {
+        use rustls::server::danger::ClientCertVerifier;
+        let srv=test_server();
+        let verifier=PairedClientVerifier(srv.pair.clone());
+        assert!(verifier.client_auth_mandatory());
+        let now=rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_787_529_600));
+        assert!(verifier.verify_client_cert(&srv.pair.cert_der().into(),&[],now).is_ok());
+        assert!(verifier.verify_client_cert(&vec![1,2,3].into(),&[],now).is_err());
+        for path in ["/pin?uniqueid=attacker&pin=1234", "/unpair?uniqueid=paired", "/launch?appid=1"] {
+            match httpx::route(&srv,path,false,"127.0.0.1") { Outcome::Reply(v)=>assert!(!v.contains("status_code=\"200\"")), _=>panic!("unexpected deferred response") }
+        }
+        assert!(srv.pair.is_paired_der(srv.pair.cert_der()));
+    }
 
     /// Both header terminators must be recognised: a client that sends bare
     /// LFs would otherwise hang until the header timeout and look like a

@@ -1623,6 +1623,23 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 .with("cache-control", "no-store")
                 .body("text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec()),
         ),
+        ("POST", "/gamestream/pin") if !sub => {
+            if app.cfg.api_key.is_none() {
+                return server.respond(key, json(403, "Forbidden", err("configure an app API key before pairing")));
+            }
+            let v: serde_json::Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v, Err(_) => return server.respond(key, json(400, "Bad Request", err("invalid JSON"))),
+            };
+            let id = v.get("uniqueid").and_then(|v| v.as_str()).unwrap_or("");
+            let pin = v.get("pin").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() || id.len() > 128 || pin.len() != 4 || !pin.bytes().all(|b| b.is_ascii_digit()) {
+                return server.respond(key, json(400, "Bad Request", err("uniqueid and four-digit pin required")));
+            }
+            match app.gs.as_ref() {
+                Some(gs) => { gs.submit_pin(id, pin); server.respond(key, json(200, "OK", "{\"ok\":true}".into())) },
+                None => server.respond(key, json(409, "Conflict", err("GameStream is not ready"))),
+            }
+        }
         ("GET", "/ping") => server.respond(key, json(200, "OK", "{\"ok\":true}".into())),
         ("GET", "/a/xterm.js") => server.respond(
             key,
@@ -1781,6 +1798,9 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
                 Some("h264") => worker::CODEC_H264,
                 _ => worker::CODEC_AV1,
             };
+            if codec != worker::CODEC_H264 && app.gs.as_ref().and_then(|gs| gs.video_bitrate()).is_some() {
+                return server.respond(key, json(409, "Conflict", err("GameStream is using H.264; select H.264 for this viewer")));
+            }
             let kbps = form_get(&req.query, "kbps")
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
@@ -3181,7 +3201,11 @@ pub fn run() {
                     app.pull_seen.map_or(false, |t| t.elapsed() < Duration::from_secs(3));
                 let watching_display =
                     (server.sse_count("display") > 0 && !display_backed_up) || pull_watching;
-                let watching_video = server.sse_count("video") > 0 && !video_backed_up;
+                let gs_bitrate = app.gs.as_ref().and_then(|gs| gs.video_bitrate());
+                if let Some(kbps) = gs_bitrate {
+                    worker::set_video_params(worker::CODEC_H264, kbps);
+                }
+                let watching_video = (server.sse_count("video") > 0 && !video_backed_up) || gs_bitrate.is_some();
                 // Keep the display scan at its fast floor while input is recent
                 // (the same boost window the CPU uses) — but only when the
                 // screen was QUIET: when the frame is already animating the
@@ -3301,6 +3325,7 @@ pub fn run() {
                                     "video",
                                     &format!("data: {{\"k\":{},\"d\":\"{}\"}}", f.keyframe as u8, b64(&f.data)),
                                 );
+                                if let Some(gs) = app.gs.as_mut() { gs.feed_video(&f); }
                                 app.video_frames += 1;
                                 busy = true;
                             }
