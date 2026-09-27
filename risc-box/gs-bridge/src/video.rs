@@ -946,6 +946,8 @@ impl AppH264Source {
         let mut need_idr = false;
         let mut join_at = Instant::now();
         let mut last_au_at: Option<Instant> = None;
+        let mut arrival_gaps: Vec<f64> = Vec::new();
+        let mut last_frame_at: Option<Instant> = None;
 
         loop {
             // Do not hold a stream open for nobody: wait until a session wants
@@ -1073,17 +1075,28 @@ impl AppH264Source {
                 if au.is_empty() {
                     continue;
                 }
+                let arrived = Instant::now();
+                if let Some(previous) = last_frame_at.replace(arrived) {
+                    arrival_gaps.push(arrived.duration_since(previous).as_secs_f64() * 1000.0);
+                }
                 if reported.elapsed() >= Duration::from_secs(10) {
                     // Only worth saying while someone is watching; an idle
                     // bridge would otherwise print this forever.
                     if sink.lock().unwrap().is_some() {
+                        arrival_gaps.sort_by(f64::total_cmp);
+                        let quantile = |q: f64| arrival_gaps.get(
+                            ((arrival_gaps.len().saturating_sub(1)) as f64 * q) as usize
+                        ).copied().unwrap_or(0.0);
                         eprintln!(
-                            "[video] source: {:.1} app frames/s",
-                            fresh as f64 / reported.elapsed().as_secs_f64()
+                            "[video] source: {:.1} app frames/s; arrival gap p50={:.1} p95={:.1} max={:.1} ms; gaps>50ms={}",
+                            fresh as f64 / reported.elapsed().as_secs_f64(),
+                            quantile(0.5), quantile(0.95), quantile(1.0),
+                            arrival_gaps.iter().filter(|&&ms| ms > 50.0).count()
                         );
                     }
                     reported = Instant::now();
                     fresh = 0;
+                    arrival_gaps.clear();
                 }
                 // A session that just joined starts on live video, not on the
                 // hold's leftovers. Backlogged frames arrive back to back

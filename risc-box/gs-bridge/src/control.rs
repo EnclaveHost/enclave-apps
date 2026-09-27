@@ -458,7 +458,7 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
                 }
             }
         }
-        let mut batch = queue.drain(Duration::from_millis(50));
+        let mut batch = queue.drain(Duration::from_millis(5));
         // The coalesced pointer: at most one position update per cycle, the
         // latest, ahead of any queued clicks so they land where the cursor
         // is. Pure motion (nothing else queued) ships at half cadence — the
@@ -478,8 +478,8 @@ fn input_drainer(session: Arc<Session>, app: Arc<App>, queue: Arc<InputQueue>) {
         }
         // Enforce the minimum key hold: record key-downs, hold back a key-up
         // that arrives too soon after its down, and release any deferred ups
-        // whose hold has elapsed. The 50 ms drain keeps this loop turning even
-        // with no new input, so a deferred up flushes within ~50 ms of due.
+        // whose hold has elapsed. The 5 ms drain keeps this loop turning even
+        // with no new input, so a deferred up flushes within ~5 ms of due.
         if key_min_hold > Duration::ZERO {
             let parse_key = |ev: &str| -> Option<(u16, bool)> {
                 if !ev.contains(r#""t":"key""#) {

@@ -459,8 +459,14 @@ fn main() {
         // negotiates something else still rides this stream, because
         // re-dialling to honour a bitrate change is exactly the teardown that
         // breaks reconnecting.
-        let h264_src = (args.frames == FrameSource::AppH264)
-            .then(|| Arc::new(video::AppH264Source::start(app.clone(), 6400)));
+        let h264_src = (args.frames == FrameSource::AppH264).then(|| {
+            let kbps = std::env::var("GSB_APP_KBPS")
+                .ok()
+                .map(|v| v.parse::<u32>().expect("GSB_APP_KBPS must be an integer"))
+                .unwrap_or(6400)
+                .clamp(250, 50_000);
+            Arc::new(video::AppH264Source::start(app.clone(), kbps))
+        });
         std::thread::spawn(move || {
             rtsp::run(
                 move || launched.lock().unwrap().clone(),

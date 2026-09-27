@@ -7,11 +7,12 @@ video with Reed-Solomon FEC, and the encrypted ENet control channel — and wire
 those to the app's two endpoints: `GET /fb.rgb` for frames and `POST /hid` for
 input, which lands on the emulated virtio-input device.
 
-Why native (not in the wasm app): GameStream needs plain-HTTP + HTTPS control
-surfaces, UDP RTP/ENet transports, and hardware video encode. That belongs in a
-native process running where a GPU is reachable — the same place the H200 NVENC
-path lives (see `../docs/encode-path-handoff.md`) — not inside the
-`wasm32-wasip2` sandbox.
+The native adapter provides GameStream's TCP/UDP endpoints. It can either
+repacketize H.264 encoded inside the isolated app (`--frames h264`), or encode
+authenticated framebuffer updates on the **authorized viewing computer**
+(`--frames bands` or `pull`). The latter receives plaintext pixels after TLS
+verification, just as the browser viewer does. It must not run on an untrusted
+provider machine: ordinary GPU encoding there would expose the desktop.
 
 ## Status: streaming works end to end
 
@@ -55,9 +56,9 @@ by the app's `/hid` (`{"ok":true,"events":1}`).
 **GPU encode**: the video is hardware-encoded on the GPU's NVENC engine
 (`h264_nvenc` errors out rather than falling back to CPU, so a running stream is
 itself proof), with the encoder engine measurably active during a session
-(`nvidia-smi` encoder utilization non-zero throughout). Verified on an RTX 3070,
-the local test GPU; production encode is the fleet's **H200**, where the NVENC
-API is identical.
+(`nvidia-smi` encoder utilization non-zero throughout). Verified on the viewing
+computer's RTX 3070. This is client-side encoding, not Enclave Shield GPU
+offload and not evidence that a provider GPU can safely see plaintext.
 
 ## What it implements
 
@@ -68,7 +69,7 @@ API is identical.
 | 48010 | TCP | RTSP: OPTIONS, DESCRIBE, SETUP x3, ANNOUNCE, PLAY |
 | 47998 | UDP | RTP video: NV_VIDEO_PACKET framing + Reed-Solomon FEC |
 | 47999 | UDP | ENet control, AES-128-GCM both directions; input, IDR requests |
-| 48000 | UDP | RTP audio (silent Opus; the guest has no sound device) |
+| 48000 | UDP | guest stereo audio, Opus with GameStream FEC |
 
 The wire formats mirror Sunshine and moonlight-common-c exactly. Notable points
 the protocol is unforgiving about, all learned the hard way:
@@ -109,15 +110,17 @@ cookie, the only owner proof that survives the relay), `--fb <WxH>`
 `--state <dir>` (server identity and paired certs),
 `--frames auto|bands|pull|h264|raw`, `--probe`.
 
-**`--frames h264` is the mode that holds 30+ fps across a real network**: the
+**`--frames h264` avoids sending lossless pixels across a remote network**: the
 APP encodes H.264 inside the enclave (minih264 on the SET worker; see
 `../docs/moonlight-30fps-handoff.md`) and this bridge only repacketizes into
-RTP — no NVENC, no re-encode, no mirror. Every frame on the wire is a distinct
-app frame, so the client's decode rate IS the app's frame rate, and the pixels
+RTP — no NVENC, no re-encode, no mirror. Encoded frames may repeat an unchanged
+game image, so the client's decode rate is not the game's render rate. Pixels
 cross the wire as ~3 Mbps of video instead of 6-10 MiB/s of lossless bands.
 Client IDR requests are forwarded to the app's `POST /video-key`. Measured
-against a fleet deployment on the enclave's direct endpoint: min 38 / median
-40 fps per second, 0 seconds below 30, under continuous gameplay input.
+in an earlier fleet test: min 38 / median 40 encoded fps, 0 seconds below 30,
+under continuous gameplay input. That is a transport measurement, not a
+guarantee for a single-vCPU isolated deployment. `GSB_APP_KBPS` controls the app
+encoder's bitrate (default 6400, bounded to 250–50000 kbit/s).
 
 **Check the connection first.** `--probe` fetches one frame, says whether it
 matches `--fb`, and reports whether anything is actually drawn on it; add
@@ -151,12 +154,11 @@ what moved rather than to frame rate:
 
 `--frames` defaults to `auto`: bands for an `https://` app, raw for a local one.
 
-One thing this does NOT fix: raw frames still leave the enclave. The bands are
-the guest's own pixels, just compressed. Encoding *inside* the enclave — the
-`nvenc` verb specced in `../PLATFORM.md` — is what would keep pixels in and emit
-H.264 directly, and it has a second argument in its favour now: the app is
-single-threaded (wasip2 cannot spawn one, on p2 or p3), so anything encoded in
-there competes with the emulator for the only core it has.
+Bands contain the guest's pixels, compressed rather than protected from the
+recipient. Send them only over authenticated, attested TLS to an authorized
+viewer. Encoding inside the isolated CPU keeps that work within its boundary;
+the SET build has a worker thread, but on a one-vCPU guest the worker still
+competes with emulation and audio for the same core.
 
 #### A ceiling worth knowing about before you tune anything
 
@@ -236,9 +238,8 @@ timestamps, including sequence number wrap. It was verified against
 
 ## What is not done
 
-- **Production H200 deploy.** The encode is GPU-agnostic NVENC, but placing this
-  service on the fleet GPU node next to the RISC Box CVM is an operational step
-  that needs access to that node.
+- **Provider GPU encoding.** This bridge does not implement protected GPU
+  offload. Keep a framebuffer-encoding bridge on the authorized viewer.
 - **HEVC/AV1.** DESCRIBE deliberately advertises H.264 only. The codec markers
   the client greps for are understood, so adding them is mostly encoder work.
 - **Gamepad, touch, and pen** input is parsed and dropped — the emulated HID has
@@ -252,3 +253,30 @@ startup. Without this setting the historical LAN binding is retained.
 For a remote app that already encodes H.264, use `--frames h264`; this
 repacketizes the app stream without local re-encoding. Supply app credentials
 through `RISCBOX_API_KEY`, rather than command-line arguments.
+
+For a local ciphertext splice to the guest, `GS_APP_CONNECT_ADDR=127.0.0.1:PORT`
+changes only the TCP destination. It requires an HTTPS app URL and
+`GS_APP_SPKI_SHA256` set to the transport key hash verified by the enclave
+attestation client. TLS still validates the original URL's hostname and CA
+chain; the bridge also checks the pinned SPKI on every connection before
+sending credentials. A replaced guest/key requires fresh attestation and a
+new pin; there is no unverified fallback.
+
+The video source log includes 10-second arrival-gap statistics, separate from
+game render FPS. Client-side `--no-vsync --no-frame-pacing --fps 60` avoids
+intentional presentation buffering. Input pointer cadence and minimum key
+hold are tunable with `GSB_CURSOR_MS` and `GSB_KEY_MIN_HOLD_MS` respectively;
+the latter should stay long enough for the guest game to register short taps.
+
+`GSB_AUDIO_BUFFER_MS` sets audio priming between 20 and 200 ms (default 100).
+The audio log reports chunk gaps, queued duration, discarded backlog, and
+sound/silence counts. Reduce buffering only after measuring the actual path;
+a buffer shorter than delivery gaps introduces underruns instead of lower
+usable latency. Startup and underrun recovery discard old handshake backlog
+and prime from the newest audio window before playback resumes.
+
+Run `python3 tests/attested_route.py /path/to/gs-bridge` to exercise the pinned
+route against a local TLS peer. It checks that wrong keys, wrong hostnames,
+untrusted certificates, missing pins, and plaintext overrides send no HTTP
+request or credentials. This complements attestation verification; it does
+not itself verify an AMD report.

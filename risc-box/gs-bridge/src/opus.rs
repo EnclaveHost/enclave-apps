@@ -65,7 +65,7 @@ const RING_CAP: usize = OUT_RATE * OUT_CHANNELS * 200 / 1000;
 /// is heard as a chop: measured delivery is ~41 ms typical and 84 ms worst,
 /// so priming at 30 ms (as the first cut did) guaranteed the very problem the
 /// buffer exists to prevent. 100 ms clears the worst case with room over.
-const PRIME_SAMPLES: usize = OUT_RATE * OUT_CHANNELS * 100 / 1000;
+const DEFAULT_PRIME_MS: usize = 100;
 
 pub struct Encoder {
     st: *mut c_void,
@@ -128,13 +128,27 @@ pub struct AudioSource {
     /// instant the first samples land just moves the starvation one frame
     /// later; waiting for PRIME_SAMPLES rides out the jitter instead.
     primed: Arc<Mutex<bool>>,
+    prime_samples: usize,
 }
 
 impl AudioSource {
     pub fn new() -> AudioSource {
+        // Keep the conservative network default. A measured direct path can
+        // opt into a smaller buffer without changing every client's audio.
+        let prime_ms = std::env::var("GSB_AUDIO_BUFFER_MS")
+            .ok()
+            .map(|v| v.parse::<usize>().expect("GSB_AUDIO_BUFFER_MS must be an integer"))
+            .unwrap_or(DEFAULT_PRIME_MS)
+            .clamp(20, 200);
+        eprintln!("[audio] jitter buffer priming: {prime_ms} ms");
+        Self::with_prime_ms(prime_ms)
+    }
+
+    fn with_prime_ms(prime_ms: usize) -> AudioSource {
         AudioSource {
             buf: Arc::new(Mutex::new(VecDeque::new())),
             primed: Arc::new(Mutex::new(false)),
+            prime_samples: OUT_RATE * OUT_CHANNELS * prime_ms.clamp(20, 200) / 1000,
         }
     }
 
@@ -145,8 +159,16 @@ impl AudioSource {
         let mut primed = self.primed.lock().unwrap();
         let want = FRAME_SAMPLES * OUT_CHANNELS;
         if !*primed {
-            if b.len() < PRIME_SAMPLES {
+            if b.len() < self.prime_samples {
                 return None;
+            }
+            // The pump can fill while GameStream is still negotiating its
+            // audio peer. Starting at the oldest sample then preserves up to
+            // RING_CAP of handshake backlog for the whole session. Prime
+            // from the newest window, just as we do after an underrun.
+            let stale = b.len() - self.prime_samples;
+            if stale > 0 {
+                b.drain(..stale);
             }
             *primed = true;
         }
@@ -181,6 +203,10 @@ impl AudioSource {
             // /audio events join seamlessly. A fresh connection starts clean —
             // the guest audio has a gap across a redial anyway.
             let mut rs = Resampler::new();
+            let mut reported = std::time::Instant::now();
+            let mut last_chunk = None;
+            let mut gaps = Vec::new();
+            let mut trimmed = 0;
             loop {
                 if session.is_stopping() {
                     return;
@@ -198,12 +224,31 @@ impl AudioSource {
                 if pcm.is_empty() {
                     continue;
                 }
+                let now = std::time::Instant::now();
+                if let Some(last) = last_chunk.replace(now) {
+                    gaps.push(now.duration_since(last).as_secs_f64() * 1000.0);
+                }
                 let out = rs.feed(&pcm, rate, channels);
                 let mut b = self.buf.lock().unwrap();
                 b.extend(out.iter().copied());
                 while b.len() > RING_CAP {
                     let over = b.len() - RING_CAP;
                     b.drain(..over);
+                    trimmed += over;
+                }
+                if reported.elapsed() >= Duration::from_secs(10) {
+                    gaps.sort_by(f64::total_cmp);
+                    let p95 = gaps.get(gaps.len().saturating_sub(1) * 95 / 100)
+                        .copied().unwrap_or(0.0);
+                    eprintln!(
+                        "[audio] chunk gap p95={p95:.1} max={:.1} ms; queued={:.1} ms; trimmed={:.1} ms",
+                        gaps.last().copied().unwrap_or(0.0),
+                        b.len() as f64 * 1000.0 / (OUT_RATE * OUT_CHANNELS) as f64,
+                        trimmed as f64 * 1000.0 / (OUT_RATE * OUT_CHANNELS) as f64,
+                    );
+                    gaps.clear();
+                    trimmed = 0;
+                    reported = now;
                 }
             }
             // The app restarting is not fatal to the stream: the client keeps
@@ -341,6 +386,36 @@ impl Resampler {
 #[cfg(test)]
 mod resample_tests {
     use super::*;
+
+    #[test]
+    fn short_jitter_buffer_primes_and_recovers_after_underrun() {
+        let source = AudioSource::with_prime_ms(60);
+        let frame = FRAME_SAMPLES * OUT_CHANNELS;
+        let prime = OUT_RATE * OUT_CHANNELS * 60 / 1000;
+        source.buf.lock().unwrap().extend(vec![123; prime - frame]);
+        assert!(source.take_frame().is_none());
+        source.buf.lock().unwrap().extend(vec![123; frame]);
+        for _ in 0..prime / frame {
+            assert_eq!(source.take_frame().unwrap(), vec![123; frame]);
+        }
+        assert!(source.take_frame().is_none());
+        // An underrun must re-prime instead of alternating tiny bursts and
+        // silence every time one packet arrives.
+        source.buf.lock().unwrap().extend(vec![456; frame]);
+        assert!(source.take_frame().is_none());
+        source.buf.lock().unwrap().extend(vec![456; prime - frame]);
+        assert_eq!(source.take_frame().unwrap(), vec![456; frame]);
+    }
+
+    #[test]
+    fn priming_discards_audio_accumulated_during_handshake() {
+        let source = AudioSource::with_prime_ms(60);
+        let prime = OUT_RATE * OUT_CHANNELS * 60 / 1000;
+        source.buf.lock().unwrap().extend(vec![1; prime]);
+        source.buf.lock().unwrap().extend(vec![2; prime]);
+        assert_eq!(source.take_frame().unwrap(), vec![2; FRAME_SAMPLES * OUT_CHANNELS]);
+        assert_eq!(source.buf.lock().unwrap().len(), prime - FRAME_SAMPLES * OUT_CHANNELS);
+    }
 
     #[test]
     fn fec_packets_keep_size_and_decode_through_silence_transitions() {
