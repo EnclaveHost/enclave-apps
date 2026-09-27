@@ -38,6 +38,15 @@ use std::sync::{Arc, Mutex};
 
 use session::{Session, PORT_AUDIO, PORT_VIDEO};
 
+/// Defaults to the historical LAN listener; local client bridges can restrict
+/// every GameStream socket with GS_BIND_ADDR=127.0.0.1.
+fn bind_addr() -> std::net::Ipv4Addr {
+    static ADDR: std::sync::OnceLock<std::net::Ipv4Addr> = std::sync::OnceLock::new();
+    *ADDR.get_or_init(|| std::env::var("GS_BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0".into())
+        .parse().expect("GS_BIND_ADDR must be an IPv4 address"))
+}
+
 struct Args {
     app_url: String,
     codec: String,
@@ -197,7 +206,7 @@ fn start_session_workers(
     // whole session on a race it always wins a moment later.
     let bind_patiently = |port: u16, what: &str| -> Option<Arc<UdpSocket>> {
         for _ in 0..25 {
-            match UdpSocket::bind(("0.0.0.0", port)) {
+            match UdpSocket::bind((crate::bind_addr(), port)) {
                 Ok(s) => return Some(Arc::new(s)),
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
             }

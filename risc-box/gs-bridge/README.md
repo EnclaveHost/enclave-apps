@@ -243,3 +243,12 @@ timestamps, including sequence number wrap. It was verified against
   the client greps for are understood, so adding them is mostly encoder work.
 - **Gamepad, touch, and pen** input is parsed and dropped — the emulated HID has
   no equivalent device.
+
+### Local Moonlight endpoint
+
+Set `GS_BIND_ADDR=127.0.0.1` to bind every HTTP, HTTPS, RTSP, video,
+audio, and ENet control socket to loopback. Invalid IPv4 values fail at
+startup. Without this setting the historical LAN binding is retained.
+For a remote app that already encodes H.264, use `--frames h264`; this
+repacketizes the app stream without local re-encoding. Supply app credentials
+through `RISCBOX_API_KEY`, rather than command-line arguments.

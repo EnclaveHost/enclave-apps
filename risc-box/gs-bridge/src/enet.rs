@@ -40,13 +40,13 @@ impl Default for ENetAddress {
 }
 
 impl ENetAddress {
-    /// An IPv4 `sockaddr_in` for 0.0.0.0:port — what a server binds to.
+    /// An IPv4 `sockaddr_in` using the configured GameStream bind address.
     pub fn any_v4(port: u16) -> ENetAddress {
         let mut a = ENetAddress::default();
         a.address_length = 16; // sizeof(struct sockaddr_in)
         a.address[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
         a.address[2..4].copy_from_slice(&port.to_be_bytes()); // sin_port, network order
-        // sin_addr stays 0.0.0.0, sin_zero stays zero.
+        a.address[4..8].copy_from_slice(&crate::bind_addr().octets());
         a
     }
 }
