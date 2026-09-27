@@ -1,0 +1,15 @@
+[package]
+name = "enclave-shield-video"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+[dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde_json = "1"
+
+[features]
+codec-tests = []
+
+[[example]]
+name = "codec_probe"
+required-features = ["codec-tests"]

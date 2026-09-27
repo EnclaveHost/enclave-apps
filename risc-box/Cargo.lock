@@ -547,6 +547,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclave-shield-video"
+version = "0.1.0"
+dependencies = [
+ "rand_core",
+ "serde_json",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1420,6 +1428,7 @@ dependencies = [
  "aes-gcm",
  "cbc",
  "ecb",
+ "enclave-shield-video",
  "hmac",
  "jpeg-encoder",
  "miniz_oxide",

@@ -32,6 +32,7 @@ path = "src/main.rs"
 # SigV4 hash primitives. serde_json parses the app config. The suite's httpd.rs
 # and the S3 client are hand-rolled std (src/httpd.rs, src/s3.rs).
 [dependencies]
+enclave-shield-video = { path = "shield-video", optional = true }
 riscv_emu_rust = { path = "emu" }
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
@@ -94,6 +95,7 @@ panic = "abort"
 # The shared-everything-threads build turns this on; see src/worker.rs. Off by
 # default so the ordinary wasip2 component is byte-for-byte the app that ships.
 [features]
+masked-video = ["dep:enclave-shield-video"]
 set = []
 # baked-region JIT: profile-derived native regions compiled into the emulator
 # (see emu/build.rs + emu/aot/regions.dump). The app enables the dispatcher

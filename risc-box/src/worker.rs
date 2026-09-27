@@ -93,6 +93,7 @@ const TARGET_FPS: u32 = 60;
 static NVENC_OK: AtomicU32 = AtomicU32::new(0);
 
 pub fn nvenc_supported() -> bool {
+    if video::shield_requested() { return false; }
     match NVENC_OK.load(Ordering::Acquire) {
         1 => true,
         2 => false,
@@ -112,6 +113,10 @@ pub fn nvenc_supported() -> bool {
 /// the inline fallback so both agree on defaults.
 pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
     let (codec, kbps) = video_params();
+    if video::shield_requested() && codec != CODEC_H264 {
+        eprintln!("[shield-video] H.264 required; requested codec refused");
+        return None;
+    }
     let (w, h) = (display::fb_w(), display::fb_h());
     let params = VIDEO_PARAMS.load(Ordering::Acquire);
     match codec {
@@ -127,7 +132,7 @@ pub fn build_encoder() -> Option<(u32, Box<dyn VideoEncoder + Send>)> {
             //
             // The probe is cached: it opens a graph and a context, which is far
             // too expensive to repeat every time a viewer joins.
-            if nvenc_supported() {
+            if !video::shield_requested() && nvenc_supported() {
                 if let Some(e) = crate::nvenc::NvencEncoder::new(w, h, TARGET_FPS, kbps) {
                     return Some((params, Box::new(e) as Box<dyn VideoEncoder + Send>));
                 }

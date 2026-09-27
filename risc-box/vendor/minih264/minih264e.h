@@ -337,12 +337,14 @@ void H264E_set_vbv_state(
 #define MAX_LONG_TERM_FRAMES 8 // Max long-term frames count
 #endif
 
-#if !defined(MINIH264_ONLY_SIMD) && (defined(_M_X64) || defined(_M_ARM64) || defined(__x86_64__) || defined(__aarch64__))
+#if !defined(MINIH264_FORCE_PLAIN) && !defined(MINIH264_ONLY_SIMD) && (defined(_M_X64) || defined(_M_ARM64) || defined(__x86_64__) || defined(__aarch64__))
 /* x64 always have SSE2, arm64 always have neon, no need for generic code */
 #define MINIH264_ONLY_SIMD
 #endif /* SIMD checks... */
 
-#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))) || ((defined(__i386__) || defined(__x86_64__)) && defined(__SSE2__))
+#if defined(MINIH264_FORCE_PLAIN)
+/* Enclave Shield transform hook uses the exact portable transform. */
+#elif (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))) || ((defined(__i386__) || defined(__x86_64__)) && defined(__SSE2__))
 #define H264E_ENABLE_SSE2 1
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -6930,6 +6932,11 @@ static const uint8_t g_idx2quant[16] =
 static void FwdTransformResidual4x42(const uint8_t *inp, const uint8_t *pred,
     uint32_t inp_stride, int16_t *out)
 {
+#ifdef H264E_SHIELD_TRANSFORM
+    /* Fixed-frame masked precompute is already verified inside this guest.
+     * The hook never makes a network request. A local cache miss uses C. */
+    if (H264E_SHIELD_TRANSFORM(inp, pred, inp_stride, out, TRANSPOSE_BLOCK)) return;
+#endif
     int i;
     int16_t tmp[16];
 

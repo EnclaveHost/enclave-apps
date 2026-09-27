@@ -6,9 +6,15 @@
  * wasi-libc the final link already carries.
  *
  * minih264e.h is vendored verbatim from github.com/lieff/minih264 (CC0)
- * plus one marked one-line patch: wasm added to the little-endian branch of
- * its platform probe, which otherwise ends at #error.
+ * with marked patches: wasm in the little-endian platform probe, and an
+ * opt-in portable-C Enclave Shield transform hook. Without RBX_SHIELD_VIDEO
+ * the original transform and SIMD selection remain unchanged.
  */
+#ifdef RBX_SHIELD_VIDEO
+#define MINIH264_FORCE_PLAIN
+extern int rbx_shield_transform(const unsigned char *, const unsigned char *, unsigned, short *, int);
+#define H264E_SHIELD_TRANSFORM rbx_shield_transform
+#endif
 #define MINIH264_IMPLEMENTATION
 #define H264E_MAX_THREADS 0
 #include "minih264e.h"

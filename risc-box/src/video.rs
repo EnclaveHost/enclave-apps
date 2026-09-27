@@ -287,6 +287,23 @@ const H264_KEY_QP_MIN: i32 = 26;
 const H264_P_QP_MIN: i32 = 10;
 const H264_QP_MAX: i32 = 48;
 
+/// Explicit opt-in. A malformed or unsupported request must never select NVENC.
+pub fn shield_requested() -> bool {
+    std::env::var_os("ENCLAVE_SHIELD_VIDEO_WORKER").is_some()
+        || std::env::var("ENCLAVE_CONFIG").ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .is_some_and(|c| c.get("shield_video").is_some())
+}
+#[cfg(feature = "masked-video")]
+fn shield_worker() -> Result<String, &'static str> {
+    let endpoint = std::env::var("ENCLAVE_SHIELD_VIDEO_WORKER").ok().or_else(|| {
+        let c: serde_json::Value = serde_json::from_str(&std::env::var("ENCLAVE_CONFIG").ok()?).ok()?;
+        c.get("shield_video")?.get("worker")?.as_str().map(str::to_owned)
+    }).ok_or("shield_video.worker must name a host:port")?;
+    if endpoint.is_empty() || endpoint.len() > 253 { return Err("invalid Shield video worker endpoint"); }
+    Ok(endpoint)
+}
+
 pub struct H264Encoder {
     persist: Vec<u64>, // u64-backed so the C state is 8-aligned
     scratch: Vec<u64>,
@@ -296,6 +313,10 @@ pub struct H264Encoder {
     force_key: bool,
     encoded_any: bool,
     since_key: u32,
+    #[cfg(feature = "masked-video")]
+    shield: Option<enclave_shield_video::Client>,
+    #[cfg(feature = "masked-video")]
+    shield_failed: bool,
 }
 
 impl H264Encoder {
@@ -319,7 +340,21 @@ impl H264Encoder {
         if rc != 0 {
             return None;
         }
-        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false, encoded_any: false, since_key: 0 })
+        #[cfg(not(feature = "masked-video"))]
+        if shield_requested() {
+            eprintln!("[shield-video] requested but this build lacks masked-video; encoder refused");
+            return None;
+        }
+        #[cfg(feature = "masked-video")]
+        let shield = if shield_requested() {
+            let endpoint = shield_worker().map_err(|e| eprintln!("[shield-video] {e}")).ok()?;
+            Some(enclave_shield_video::Client::connect(&endpoint)
+                .map_err(|_| eprintln!("[shield-video] worker setup failed; encoder refused")).ok()?)
+        } else { None };
+        Some(H264Encoder { persist, scratch, w, h, kbps, force_key: false, encoded_any: false, since_key: 0,
+            #[cfg(feature = "masked-video")] shield,
+            #[cfg(feature = "masked-video")] shield_failed: false,
+        })
     }
 }
 
@@ -363,10 +398,20 @@ impl H264Encoder {
         // A client request, the first frame, or the periodic safety net all
         // demand an intra frame.
         let periodic = self.since_key >= H264_KEY_PERIOD;
+        let p_budget = (self.kbps as i32) * 1000 / 8 / 40; // per-frame budget at the 40 fps cadence
+        #[cfg(feature = "masked-video")]
+        if self.shield_failed { return vec![]; }
+        #[cfg(feature = "masked-video")]
+        let frame = match self.shield.as_mut() {
+            Some(client) => match client.frame(y, u, v, self.w, self.h) {
+                Ok(frame) => Some(frame),
+                Err(_) => { self.shield_failed = true; eprintln!("[shield-video] masked transform failed; encoder stopped"); return vec![]; }
+            },
+            None => None,
+        };
         let force = std::mem::take(&mut self.force_key) || periodic;
         let key = force || !self.encoded_any;
-        let p_budget = (self.kbps as i32) * 1000 / 8 / 40; // per-frame budget at the 40 fps cadence
-        let rc = unsafe {
+        let mut encode = || unsafe {
             rbx_h264_encode(
                 self.persist.as_mut_ptr() as *mut u8,
                 self.scratch.as_mut_ptr() as *mut u8,
@@ -383,6 +428,16 @@ impl H264Encoder {
                 &mut coded_len,
             )
         };
+        #[cfg(feature = "masked-video")]
+        let rc = match frame {
+            Some(frame) => match enclave_shield_video::with_frame(frame, encode) {
+                Ok((rc, _, _)) => rc,
+                Err(_) => { self.shield_failed = true; eprintln!("[shield-video] frame context failed; encoder stopped"); return vec![]; }
+            },
+            None => encode(),
+        };
+        #[cfg(not(feature = "masked-video"))]
+        let rc = encode();
         self.encoded_any = true;
         if rc != 0 || coded.is_null() || coded_len <= 0 {
             return vec![];

@@ -94,7 +94,10 @@ impl Host {
     /// just does not offer GameStream, which is better than half a host that
     /// Moonlight can discover but not stream from.
     pub fn bind(srv: Arc<httpx::Server>, local_ip: String) -> Option<Host> {
-        // STAND DOWN unless this node can encode in hardware.
+        // An explicitly configured Enclave Shield encoder uses the shared
+        // H.264 worker path. It does not need or probe NVENC. The first masked
+        // implementation is slower than real-time; see shield-video/README.md.
+        // Otherwise STAND DOWN unless this node can encode in hardware.
         //
         // Serving GameStream from in here has exactly one advantage over the
         // external gs-bridge: the frames never leave the enclave to be encoded.
@@ -111,7 +114,7 @@ impl Host {
         // hardware-accelerated for inference and still unable to encode video.
         // Uses the WORKER's cached probe: load_by_name opens a graph and a
         // context, and doing that twice at startup is pure waste.
-        if !crate::worker::nvenc_supported() {
+        if !crate::video::shield_requested() && !crate::worker::nvenc_supported() {
             eprintln!(
                 "[gs] no hardware encoder here - NOT serving GameStream in-guest; \
                  gs-bridge keeps the stream and encodes on its own GPU \
