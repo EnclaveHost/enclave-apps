@@ -254,6 +254,34 @@ wins; an absent field takes the deployment's default** (`default_on` in the
 respective config block). A deployment without the block never searches,
 never draws, and never advertises either.
 
+On per-app isolated hosts, declare the search endpoint in the owner config,
+even when the provider has a built-in default. For example, merge this into
+`tools.search` (or the supported legacy top-level `search` block):
+
+```json
+{
+  "provider": "exa",
+  "endpoint": "https://api.exa.ai/search",
+  "api_key": "$EXA_API_KEY",
+  "max_results": 5,
+  "fetch_pages": 2
+}
+```
+
+Store the credential in sealed Secrets; the config contains only its name.
+The guest derives its HTTPS allowlist from URLs in the authenticated config.
+A provider name alone does not authorize its default hostname. If the config
+has a top-level `egress` list, include `https://api.exa.ai` there as well: that
+explicit list replaces URL derivation. Apply the owner-signed config and
+restart the app to rebuild its egress policy.
+
+Use authenticated `GET /search?q=confidential%20computing` to check the search
+provider without running inference. `DnsError` with `address not available`
+can mean a missing allowed origin, even when public DNS resolves correctly.
+Exa returns page text inline; fetching a result URL separately with
+`GET /search?url=...` still requires that URL's origin to be allowed. Neither
+search results nor redirects extend the owner's allowlist.
+
 - `web_search: true` — search **every** turn. `"auto"` — a cheap router
   generation decides per turn whether the question needs the web (and what
   to ask). `false`/`"off"` — never. Absent — the deployment's
