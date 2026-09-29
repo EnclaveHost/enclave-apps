@@ -4880,6 +4880,7 @@ function switchesForWarm() {
   if (state.image && state.image.enabled) o.image_gen = state.imageOn ? "auto" : "off";
   const t = toolsField();
   if (t !== undefined) o.tools = t;
+  if (anyToolsOn() && state.loopOn) o.loop = true;
   return o;
 }
 function toolsField() {

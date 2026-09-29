@@ -81,3 +81,19 @@ test('the shared-warm-up wait has its own label, and own progress keeps its labe
     'Model loaded · preparing chat: 512 / 2453 tokens');
   assert.equal(warmupStatus('loading'), 'loading');
 });
+
+
+test('warmup mirrors the chat Loop switch only when tools are enabled', () => {
+  const start = html.indexOf('function switchesForWarm()');
+  const stop = html.indexOf('function toolsField()', start);
+  const state = {webMode:'auto', loopOn:true};
+  let toolsOn = true;
+  const scope = vm.createContext({state, toolsField:()=>({off:[]}), anyToolsOn:()=>toolsOn});
+  vm.runInContext(html.slice(start, stop), scope);
+  assert.equal(scope.switchesForWarm().loop, true);
+  state.loopOn = false;
+  assert.equal(scope.switchesForWarm().loop, undefined);
+  state.loopOn = true;
+  toolsOn = false;
+  assert.equal(scope.switchesForWarm().loop, undefined);
+});

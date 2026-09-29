@@ -1585,6 +1585,13 @@ fn unresolved_in(s: &str) -> Option<String> {
 /// a family that was taught a different one needs its own arm here rather than
 /// a generic guess (see tools_supported).
 pub fn system_block(tools: &[Tool], b: &Budget) -> String {
+    let mut s = system_block_prefix(tools, b);
+    s.push_str(&finish_rule(tools, b));
+    s
+}
+
+/// Stable tool definitions and call budget, before the optional Loop instructions.
+pub fn system_block_prefix(tools: &[Tool], b: &Budget) -> String {
     let mut s = signatures(tools);
     s.push_str(&format!(
         "Rules for this app: the call is executed by the server and its result comes back in a \
@@ -1597,7 +1604,6 @@ pub fn system_block(tools: &[Tool], b: &Budget) -> String {
         if b.max_calls == 1 { "" } else { "s" },
         b.time(),
     ));
-    s.push_str(&finish_rule(tools, b));
     s
 }
 

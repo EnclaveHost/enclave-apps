@@ -8123,6 +8123,10 @@ fn build_prompt(
                     cands.push(tok.encode_ids(
                         &format!("<|im_start|>system\n{}", base.trim_end()), true)?);
                 }
+                if let Capabilities::Tools(list, budget) = caps {
+                    cands.push(tok.encode_ids(&format!("<|im_start|>system\n{}{}",
+                        base.trim_end(), tools::system_block_prefix(list, budget)), true)?);
+                }
                 cands.push(tok.encode_ids(
                     &format!("<|im_start|>system\n{system}<|im_end|>\n"), true)?);
                 prompt.marks = marks_from(&prompt.text_ids, &cands);
@@ -9901,26 +9905,77 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 /// An engine without
 /// boundary parks, or a prompt with no mark, is a no-op reported as such. A
 /// later call finds the parks standing and returns in milliseconds.
+// Only settings that change the chat prompt are accepted. In particular, a
+// caller cannot inject conversation messages into a shared startup prefix.
+fn warm_request(switches: &serde_json::Value) -> Result<ChatReq, String> {
+    let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "warm" }] });
+    if let (Some(dst), Some(src)) = (req.as_object_mut(), switches.as_object()) {
+        for k in ["web_search", "image_gen", "tools", "tool_choice", "model", "loop"] {
+            if let Some(v) = src.get(k) { dst.insert(k.to_string(), v.clone()); }
+        }
+    }
+    serde_json::from_value(req).map_err(|e| e.to_string())
+}
+
+// This is deliberately bounded, not the power set of configured tools. Each
+// branch keeps the exact preceding tokens, so the engine can reuse the common
+// base without pretending later KV blocks are independent of earlier features.
+fn startup_prefix_variants() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("default", serde_json::json!({})),
+        ("loop", serde_json::json!({"loop": true})),
+        ("search-off", serde_json::json!({"web_search": "off"})),
+        ("search-off-loop", serde_json::json!({"web_search": "off", "loop": true})),
+        ("chat-only", serde_json::json!({"web_search": "off", "image_gen": "off", "tools": false})),
+    ]
+}
+
+fn warm_prefix_plan(cfg: &AppConfig, mode: &str, switches: Option<&serde_json::Value>,
+                    tick: &dyn Fn(&str) -> bool) -> serde_json::Value {
+    let start = now_ms();
+    let plan = switches.map_or_else(startup_prefix_variants, |v| vec![("selected", v.clone())]);
+    let planned = plan.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut variants = Vec::new();
+    let mut primary = serde_json::Value::Null;
+    for (name, settings) in plan {
+        // The guest's boot hook has a 15-minute deadline. Leave headroom for
+        // the last branch; a cold default always gets its first attempt.
+        if !variants.is_empty() && now_ms() - start >= 540_000 { break; }
+        let result = match warm_prefix(cfg, mode, &settings, tick, &mut seen) {
+            Ok(v) => v,
+            Err(e) => serde_json::json!({"parked": false, "error": e}),
+        };
+        if primary.is_null() { primary = result.clone(); }
+        let failed = result.get("parked").and_then(|v| v.as_bool()) != Some(true);
+        variants.push(serde_json::json!({"name":name,"prefix":result}));
+        // Busy/failed startup preparation is retryable. Do not contend with
+        // real chats by opening four more sessions after a refusal.
+        if failed { break; }
+    }
+    if let Some(obj) = primary.as_object_mut() {
+        obj.insert("complete".into(), serde_json::json!(variants.len() == planned && variants.iter().all(|v| v["prefix"]["parked"] == true)));
+        obj.insert("planned_variants".into(), serde_json::json!(planned));
+        obj.insert("variants".into(), serde_json::json!(variants));
+        obj.insert("unique_prefixes".into(), serde_json::json!(seen.len()));
+        obj.insert("plan_ms".into(), serde_json::json!(now_ms()-start));
+    }
+    primary
+}
+
 fn warm_prefix(
     cfg: &AppConfig,
     mode: &str,
     switches: &serde_json::Value,
     tick: &dyn Fn(&str) -> bool,
+    seen: &mut std::collections::HashSet<Vec<u32>>,
 ) -> Result<serde_json::Value, String> {
     let t0 = now_ms();
     let tok = make_tok(cfg, "auto", t0)?;
     // the turn this warm-up stands in for: the caller's switches (the same
     // fields a /chat body carries - web_search, image_gen, tools), so a page
     // parks the prefix ITS chats will match, not only the deployment default
-    let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "warm" }] });
-    if let (Some(dst), Some(src)) = (req.as_object_mut(), switches.as_object()) {
-        for k in ["web_search", "image_gen", "tools", "tool_choice", "model"] {
-            if let Some(v) = src.get(k) {
-                dst.insert(k.to_string(), v.clone());
-            }
-        }
-    }
-    let creq: ChatReq = serde_json::from_value(req).map_err(|e| e.to_string())?;
+    let creq = warm_request(switches)?;
     let off = creq.off_groups(cfg);
     let mut b = builtins_for(cfg, &creq, &off);
     // what a fresh answer is offered at depth 0 (AgentTree::slots)
@@ -9928,7 +9983,7 @@ fn warm_prefix(
     // the routing classifier's prefix, parked after the main one (below)
     let router_sys = router_system(cfg, &creq, &b);
     let reg = tools_enabled(cfg, &creq).map(|tc| (tc, tools::build(tc, b, &|_| {})));
-    let park_budget = reg.as_ref().map(|(tc, _)| tc.budget(None));
+    let park_budget = reg.as_ref().map(|(tc, _)| tc.budget(creq.loop_.as_ref()));
     let caps = match (reg.as_ref(), park_budget.as_ref()) {
         (Some((_, r)), Some(b)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, b),
         _ => Capabilities::Note,
@@ -9938,6 +9993,16 @@ fn warm_prefix(
         return Ok(serde_json::json!({ "parked": false, "why": "no boundary to park" }));
     };
     let ids = &prompt.text_ids[..end];
+    if seen.contains(ids) {
+        return Ok(serde_json::json!({ "parked": true, "deduplicated": true, "tokens": end }));
+    }
+    // Include intermediate marks: base, tool definitions and final system
+    // branches all consume the same bounded prefix-cache budget.
+    let new_marks: Vec<_> = prompt.marks.iter().map(|&m| &prompt.text_ids[..m])
+        .filter(|ids| !seen.contains(*ids)).collect();
+    if seen.len() + new_marks.len() > 8 {
+        return Ok(serde_json::json!({ "parked": false, "why": "startup prefix slot budget" }));
+    }
     if !tick(&format!("{PREFILL_STATUS}0 of {end} prompt tokens")) {
         return Err("client disconnected".into());
     }
@@ -9955,6 +10020,7 @@ fn warm_prefix(
             s.feed_declared(cfg, ids, last, declare)
         })?;
         let main_ms = now_ms() - t1;
+        for &m in &prompt.marks { seen.insert(prompt.text_ids[..m].to_vec()); }
         drop(sess); // its sequence is spent; the router prompt needs a fresh one
         // the routing classifier's own prefix (router_system): a fresh
         // sequence, the same declared-marks feed, no generation
@@ -9966,12 +10032,17 @@ fn warm_prefix(
                     Err(e) => serde_json::json!({ "parked": false, "error": e }),
                     Ok((rp, _, _)) => match rp.marks.last() {
                         None => serde_json::json!({ "parked": false, "why": "no boundary to park" }),
+                        Some(&rend) if seen.contains(&rp.text_ids[..rend]) =>
+                            serde_json::json!({ "parked": true, "deduplicated": true, "tokens": rend }),
+                        Some(_) if seen.len() >= 8 =>
+                            serde_json::json!({ "parked": false, "why": "startup prefix slot budget" }),
                         Some(&rend) => {
                             let t2 = now_ms();
                             let mut rsess = Session::open(cfg, target)?;
                             prefill_text(&mut rsess, cfg, &rp.text_ids[..rend], &rp.marks, tick, |s, ids, last, declare| {
                                 s.feed_declared(cfg, ids, last, declare)
                             })?;
+                            seen.insert(rp.text_ids[..rend].to_vec());
                             serde_json::json!({ "parked": true, "tokens": rend, "marks": rp.marks, "ms": now_ms() - t2 })
                         }
                     },
@@ -10059,17 +10130,17 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     let progress = query.split('&').any(|kv| kv == "progress=1");
     // ?switches=<url-encoded JSON of the chat body's switch fields>: park the
     // prefix those settings render, so the page's warm-up serves the page
-    let switches: serde_json::Value = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("switches="))
-        .and_then(|v| serde_json::from_str(&percent_decode_query(v)).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let switches = query.split('&').find_map(|kv| kv.strip_prefix("switches="));
+    let switches: Option<serde_json::Value> = match switches {
+        Some(v) => match serde_json::from_str::<serde_json::Value>(&percent_decode_query(v)) {
+            Ok(v) if v.is_object() => Some(v),
+            _ => return json_err(out, 400, "switches must be a JSON object"),
+        },
+        None => None,
+    };
     let park = |cfg: &AppConfig, tick: &dyn Fn(&str) -> bool| -> serde_json::Value {
         if !prefix { return serde_json::Value::Null; }
-        match warm_prefix(cfg, mode, &switches, tick) {
-            Ok(v) => v,
-            Err(e) => serde_json::json!({ "parked": false, "error": e }),
-        }
+        warm_prefix_plan(cfg, mode, switches.as_ref(), tick)
     };
 
     if model.is_some() {
@@ -10888,6 +10959,33 @@ mod tests_2026_08_01 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_warmup_preserves_loop_budget_without_private_messages() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({"max_calls": 32, "max_agents": 8})).unwrap();
+        for setting in [serde_json::json!(true), serde_json::json!(false), serde_json::json!({"max_calls": 4, "persist": true})] {
+            let req = warm_request(&serde_json::json!({"loop": setting, "messages": [{"role":"user","content":"private"}], "caller":"spoof"})).unwrap();
+            assert_eq!(tc.budget(req.loop_.as_ref()), tc.budget(Some(&setting)));
+            assert_eq!(req.messages.len(), 1);
+            assert_eq!(req.messages[0].content, "warm");
+            assert!(req.caller.is_none());
+        }
+    }
+
+    #[test]
+    fn startup_warmup_keeps_defaults_and_bounds_feature_branches() {
+        let plan = startup_prefix_variants();
+        assert_eq!(plan.len(), 5);
+        assert_eq!(plan[0].1, serde_json::json!({}));
+        let requests: Vec<_> = plan.iter().map(|(_, v)| warm_request(v).unwrap()).collect();
+        assert!(requests[0].tools.is_none());
+        assert_eq!(requests[1].loop_, Some(serde_json::json!(true)));
+        assert_eq!(requests[2].web_search, Some(serde_json::json!("off")));
+        assert_eq!(requests[3].loop_, Some(serde_json::json!(true)));
+        assert_eq!(requests[4].tools, Some(serde_json::json!(false)));
+        assert_eq!(requests[4].image_gen, Some(serde_json::json!("off")));
+    }
+
 
     #[test]
     fn stash_notes_name_tools_for_what_they_do() {
