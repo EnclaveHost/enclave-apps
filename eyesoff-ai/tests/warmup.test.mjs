@@ -97,3 +97,25 @@ test('warmup mirrors the chat Loop switch only when tools are enabled', () => {
   toolsOn = false;
   assert.equal(scope.switchesForWarm().loop, undefined);
 });
+
+test('selected warmup uses current credentials without putting them in the URL', async () => {
+  const start = html.indexOf('async function warm()');
+  const stop = html.indexOf('// ------------------------------------------------------------ boot screen', start);
+  let captured;
+  let signedIn = true;
+  const scope = vm.createContext({
+    state: {model:'test-model', target:'auto'}, Date, AbortSignal,
+    pill:()=>{}, ICONS:{tick:'', alert:''}, warmPill:{},
+    switchesForWarm:()=>({loop:true}),
+    ssoHeaders:()=>signedIn ? {'x-api-key':'synthetic-test-token'} : {},
+    fetch:async(url, options)=>{captured={url,options};return {ok:true};},
+    readWarmupResponse:async()=>({ok:true,target:'gpu'}),
+  });
+  vm.runInContext(html.slice(start, stop), scope);
+  await scope.warm();
+  assert.equal(captured.options.headers['x-api-key'], 'synthetic-test-token');
+  assert.equal(captured.url.includes('synthetic-test-token'), false);
+  signedIn = false;
+  await scope.warm();
+  assert.equal(Object.keys(captured.options.headers).length, 0);
+});

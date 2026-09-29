@@ -9907,14 +9907,18 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 /// later call finds the parks standing and returns in milliseconds.
 // Only settings that change the chat prompt are accepted. In particular, a
 // caller cannot inject conversation messages into a shared startup prefix.
-fn warm_request(switches: &serde_json::Value) -> Result<ChatReq, String> {
+fn warm_request(switches: &serde_json::Value, caller: Option<&str>) -> Result<ChatReq, String> {
     let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "warm" }] });
     if let (Some(dst), Some(src)) = (req.as_object_mut(), switches.as_object()) {
         for k in ["web_search", "image_gen", "tools", "tool_choice", "model", "loop"] {
             if let Some(v) = src.get(k) { dst.insert(k.to_string(), v.clone()); }
         }
     }
-    serde_json::from_value(req).map_err(|e| e.to_string())
+    let mut req: ChatReq = serde_json::from_value(req).map_err(|e| e.to_string())?;
+    // The caller comes only from a verified request credential. Switches may
+    // choose capabilities but can never supply an identity or private text.
+    req.caller = caller.map(str::to_owned);
+    Ok(req)
 }
 
 // This is deliberately bounded, not the power set of configured tools. Each
@@ -9930,7 +9934,7 @@ fn startup_prefix_variants() -> Vec<(&'static str, serde_json::Value)> {
     ]
 }
 
-fn warm_prefix_plan(cfg: &AppConfig, mode: &str, switches: Option<&serde_json::Value>,
+fn warm_prefix_plan(cfg: &AppConfig, mode: &str, switches: Option<&serde_json::Value>, caller: Option<&str>,
                     tick: &dyn Fn(&str) -> bool) -> serde_json::Value {
     let start = now_ms();
     let plan = switches.map_or_else(startup_prefix_variants, |v| vec![("selected", v.clone())]);
@@ -9942,7 +9946,7 @@ fn warm_prefix_plan(cfg: &AppConfig, mode: &str, switches: Option<&serde_json::V
         // The guest's boot hook has a 15-minute deadline. Leave headroom for
         // the last branch; a cold default always gets its first attempt.
         if !variants.is_empty() && now_ms() - start >= 540_000 { break; }
-        let result = match warm_prefix(cfg, mode, &settings, tick, &mut seen) {
+        let result = match warm_prefix(cfg, mode, &settings, caller, tick, &mut seen) {
             Ok(v) => v,
             Err(e) => serde_json::json!({"parked": false, "error": e}),
         };
@@ -9967,6 +9971,7 @@ fn warm_prefix(
     cfg: &AppConfig,
     mode: &str,
     switches: &serde_json::Value,
+    caller: Option<&str>,
     tick: &dyn Fn(&str) -> bool,
     seen: &mut std::collections::HashSet<Vec<u32>>,
 ) -> Result<serde_json::Value, String> {
@@ -9975,7 +9980,7 @@ fn warm_prefix(
     // the turn this warm-up stands in for: the caller's switches (the same
     // fields a /chat body carries - web_search, image_gen, tools), so a page
     // parks the prefix ITS chats will match, not only the deployment default
-    let creq = warm_request(switches)?;
+    let creq = warm_request(switches, caller)?;
     let off = creq.off_groups(cfg);
     let mut b = builtins_for(cfg, &creq, &off);
     // what a fresh answer is offered at depth 0 (AgentTree::slots)
@@ -10112,7 +10117,10 @@ fn handle_d2h(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     }
 }
 
-fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
+fn handle_warmup(raw: &serde_json::Value, query: &str, req: &IncomingRequest, out: ResponseOutparam) {
+    // Boot probes remain anonymous. A signed-in browser warms the same tool
+    // set its chat will see, including identity-dependent MCP capabilities.
+    let caller = config::from_value(raw.clone()).ok().and_then(|cfg| caller_identity(&cfg, req));
     // GPU by default - but on a deployment the platform gave NO GPU share,
     // "gpu" is a guaranteed failure for the onnx path, and reporting every
     // model broken hides the real story (the fleet had no GPU enclave free).
@@ -10140,7 +10148,7 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     };
     let park = |cfg: &AppConfig, tick: &dyn Fn(&str) -> bool| -> serde_json::Value {
         if !prefix { return serde_json::Value::Null; }
-        warm_prefix_plan(cfg, mode, switches.as_ref(), tick)
+        warm_prefix_plan(cfg, mode, switches.as_ref(), caller.as_deref(), tick)
     };
 
     if model.is_some() {
@@ -10818,7 +10826,7 @@ impl Guest for Component {
             (Method::Get, "/attestation") => handle_attestation(req, out),
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/tools") => handle_tools_probe(&raw, req, query, out),
-            (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
+            (Method::Get, "/warmup") => handle_warmup(&raw, query, &req, out),
             // the popup sign-in's landing pad: same-origin with the opener
             // again, so it may hand the return fragment over and close (see
             // src/sso-return.html). Open like the page that carries the
@@ -10964,7 +10972,7 @@ mod tests {
     fn startup_warmup_preserves_loop_budget_without_private_messages() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({"max_calls": 32, "max_agents": 8})).unwrap();
         for setting in [serde_json::json!(true), serde_json::json!(false), serde_json::json!({"max_calls": 4, "persist": true})] {
-            let req = warm_request(&serde_json::json!({"loop": setting, "messages": [{"role":"user","content":"private"}], "caller":"spoof"})).unwrap();
+            let req = warm_request(&serde_json::json!({"loop": setting, "messages": [{"role":"user","content":"private"}], "caller":"spoof"}), None).unwrap();
             assert_eq!(tc.budget(req.loop_.as_ref()), tc.budget(Some(&setting)));
             assert_eq!(req.messages.len(), 1);
             assert_eq!(req.messages[0].content, "warm");
@@ -10977,13 +10985,25 @@ mod tests {
         let plan = startup_prefix_variants();
         assert_eq!(plan.len(), 5);
         assert_eq!(plan[0].1, serde_json::json!({}));
-        let requests: Vec<_> = plan.iter().map(|(_, v)| warm_request(v).unwrap()).collect();
+        let requests: Vec<_> = plan.iter().map(|(_, v)| warm_request(v, None).unwrap()).collect();
         assert!(requests[0].tools.is_none());
         assert_eq!(requests[1].loop_, Some(serde_json::json!(true)));
         assert_eq!(requests[2].web_search, Some(serde_json::json!("off")));
         assert_eq!(requests[3].loop_, Some(serde_json::json!(true)));
         assert_eq!(requests[4].tools, Some(serde_json::json!(false)));
         assert_eq!(requests[4].image_gen, Some(serde_json::json!("off")));
+    }
+
+    #[test]
+    fn warmup_identity_comes_only_from_verified_credentials() {
+        let switches = serde_json::json!({"caller":"attacker", "user":"attacker",
+            "messages":[{"role":"user","content":"private text"}], "loop":true});
+        let anonymous = warm_request(&switches, None).unwrap();
+        assert!(anonymous.caller.is_none());
+        let signed_in = warm_request(&switches, Some("acct_verified")).unwrap();
+        assert_eq!(signed_in.caller.as_deref(), Some("acct_verified"));
+        assert_eq!(signed_in.messages[0].content, "warm");
+        assert_eq!(signed_in.loop_, Some(serde_json::json!(true)));
     }
 
 
