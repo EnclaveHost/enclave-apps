@@ -795,6 +795,22 @@ enum DraftPlan {
     Lookup,
 }
 
+/// A caller can opt out of the configured draft path for this request. It
+/// cannot enable an unconfigured head/model or change other requests. Keeping
+/// this decision outside resolve_draft also avoids opening a draft model just
+/// to run a plain-decode comparison.
+fn resolve_request_draft(
+    raw: &serde_json::Value,
+    cfg: &AppConfig,
+    req: &ChatReq,
+) -> (DraftPlan, Option<String>) {
+    if req.speculative == Some(false) {
+        (DraftPlan::Plain, Some("disabled for this request".into()))
+    } else {
+        resolve_draft(raw, cfg)
+    }
+}
+
 /// The draft plan for speculative decoding, when `cfg` names one and it is
 /// usable - else Plain plus the reason for a status line. "mtp" = the
 /// model's own head (existence verified against the host at session open).
@@ -4466,6 +4482,11 @@ struct ChatReq {
     stop: Option<serde_json::Value>, // string or [string]
     #[serde(default)]
     enable_thinking: Option<bool>, // extension: false turns off <think> reasoning (thinking models only)
+    /// Extension for controlled decode comparisons: false bypasses the
+    /// deployment's draft path for this request and its answer/tool loop.
+    /// True or absent retains the deployment's choice and capability checks.
+    #[serde(default)]
+    speculative: Option<bool>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>, // vLLM/SGLang spelling of the same switch
     /// extension (needs config.search): `true` searches every turn, `"auto"`
@@ -8785,7 +8806,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // must stop the router deciding about search, or the turn pays for a
     // provider round trip the model never asked for and then gets the tool too.
     let formatter = |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &status_cb);
-    let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
+    let (ref draft_cfg, draft_note) = resolve_request_draft(raw, cfg, &creq);
     // Subagents run through this same leg: every event a child makes is one
     // of this stream's own events, carrying the agent's id, so the client
     // files it under the right card and the bytes keep the stream alive.
@@ -9312,7 +9333,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
-        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        let (ref draft_cfg, _) = resolve_request_draft(raw, cfg, &creq);
         // subagents narrate as SSE comments like everything else on this
         // leg: `: enclave-agent`, `: enclave-agent-delta`, `: enclave-agent-done`
         let event = |kind: &str, v: serde_json::Value| {
@@ -9635,7 +9656,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
-        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        let (ref draft_cfg, _) = resolve_request_draft(raw, cfg, &creq);
         // a buffered reply has nothing to narrate to; children still run,
         // and their calls reach the client on enclave.tools
         let event = |_: &str, _: serde_json::Value| true;
@@ -11164,6 +11185,42 @@ mod tests {
 
     fn chat_req(body: serde_json::Value) -> ChatReq {
         serde_json::from_value(body).expect("request parses")
+    }
+
+    #[test]
+    fn request_can_disable_drafts_without_changing_the_deployment() {
+        let raw = serde_json::json!({});
+        let mut cfg = test_config();
+        cfg.backend = "ggml".into();
+        let disabled = chat_req(serde_json::json!({"messages":[],"speculative":false}));
+        let ordinary = chat_req(serde_json::json!({"messages":[]}));
+        for name in ["mtp", "lookup", "unavailable-draft-model"] {
+            cfg.draft = Some(name.into());
+            let (plan, note) = resolve_request_draft(&raw, &cfg, &disabled);
+            assert!(matches!(plan, DraftPlan::Plain));
+            assert_eq!(note.as_deref(), Some("disabled for this request"));
+            assert_eq!(cfg.draft.as_deref(), Some(name));
+        }
+        // The next request still selects the configured MTP path.
+        cfg.draft = Some("mtp".into());
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &ordinary).0, DraftPlan::Mtp));
+    }
+
+    #[test]
+    fn request_cannot_enable_an_unconfigured_or_unsupported_draft() {
+        let raw = serde_json::json!({});
+        let mut cfg = test_config();
+        let enabled = chat_req(serde_json::json!({"messages":[],"speculative":true}));
+        cfg.backend = "ggml".into();
+        cfg.draft = None;
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &enabled).0, DraftPlan::Plain));
+        cfg.draft = Some("mtp".into());
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &enabled).0, DraftPlan::Mtp));
+        cfg.backend = "onnx".into();
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &enabled).0, DraftPlan::Plain));
+        assert!(serde_json::from_value::<ChatReq>(serde_json::json!({
+            "messages":[],"speculative":"false"
+        })).is_err());
     }
 
     /// The gate's whole job: a call never reaches the client, an answer is not

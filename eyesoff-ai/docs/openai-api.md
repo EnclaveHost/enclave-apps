@@ -150,6 +150,7 @@ sampled the one way the server samples. The fields that exist:
 | `top_k` | int | extension (common in OSS servers). Default = config; `0` = off. |
 | `stop` | string \| [string] | extra stop strings; the first **4** of an array are honoured, on top of the chat template's own stops. |
 | `enable_thinking` | bool | extension: `false` disables `<think>` reasoning on thinking models. See [Thinking](#thinking). |
+| `speculative` | bool | unreleased extension: `false` uses plain decode for this request's answer/tool loop; `true` or absent retains the deployment's configured draft path. Does not enable an unconfigured head or alter other requests. Also accepted by `/chat`. See [decode qualification](decode-tuning-20260930.md). |
 | `chat_template_kwargs` | object | vLLM/SGLang spelling: `{"enable_thinking": false}`. Top-level wins when both present. |
 | `target` | string | extension: `"cpu"` \| `"gpu"` \| `"auto"` (default auto: GPU then CPU fallback). ggml deployments ignore it (offload is the node's call). |
 | `web_search` | bool \| string | extension, needs the deployment's search config. See [Web search](#web-search-image-generation-and-the-router). |
