@@ -8,7 +8,7 @@
 //! process for the whole deployment, so state can live in memory.
 //!
 //! The one platform rule (see network-test): **read `ENCLAVE_PORTS` and bind
-//! the actual port, never hardcode.** Entries look like `http:8080=18321`;
+//! the actual port, never hardcode.** Entries look like `http:8000=18321`;
 //! we prefer the first `http:` entry, fall back to the first entry, and only
 //! default to 8080 when the variable is absent (local development).
 //!
@@ -120,7 +120,7 @@ pub struct Server {
     started: Instant,
 }
 
-/// `ENCLAVE_PORTS=http:8080=18321,tcp:7777=18322` → the actual port to bind.
+/// `ENCLAVE_PORTS=http:8000=18321,tcp:7777=18322` → the actual port to bind.
 pub fn resolve_port(default: u16) -> u16 {
     let Ok(ports) = std::env::var("ENCLAVE_PORTS") else {
         return default;

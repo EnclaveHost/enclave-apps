@@ -192,15 +192,17 @@ credential or model request there. Native debugging: `cargo build
 Local launch:
 
 ```sh
-ENCLAVE_CONFIG="$(cat my-private-config.json)" ENCLAVE_PORTS=http:8080=8080 \
+ENCLAVE_CONFIG="$(cat my-private-config.json)" ENCLAVE_PORTS=http:8000=8000 \
   wasmtime run -S inherit-network=y -S allow-ip-name-lookup=y \
   --env ENCLAVE_CONFIG --env ENCLAVE_PORTS \
   cron/target/wasm32-wasip2/release/enclave-cron.wasm
 ```
 
-Publish as a CPU service with port `http:8080`, transparent egress, and at least
-128 MiB app memory. Use the platform's normal catalog approval and owner-signed
-deployment flow. The template intentionally contains placeholders, not live
+Publish as a CPU service with port `http:8000`, transparent egress, and at least
+128 MiB app memory. Port `8080` is reserved for platform infrastructure; do not
+add it to the firewall. Cron binds the actual HTTP port provided through
+`ENCLAVE_PORTS`, so the existing binary also works with `http:8000`. Use the
+platform's normal catalog approval and owner-signed deployment flow. The template intentionally contains placeholders, not live
 credentials. Publishing the build alone does not connect Eyesoff: provision
 the secrets, storage, personal callback identity and MCP config above.
 

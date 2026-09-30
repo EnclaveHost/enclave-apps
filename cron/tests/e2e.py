@@ -86,7 +86,7 @@ def main():
     mock=ThreadingHTTPServer(('127.0.0.1',0),Mock);threading.Thread(target=mock.serve_forever,daemon=True).start();mp=mock.server_port;p=port();origin=f'http://127.0.0.1:{p}'
     config={'api_key':KEY,'storage':{'endpoint':f'http://127.0.0.1:{mp}','bucket':'bucket','key':'cron/state','region':'auto','access_key':ACCESS,'secret_key':SECRET,'master_key':MASTER},'local_test':True,'concurrency':2,'targets':{'ai':{'kind':'eyesoff','url':f'http://127.0.0.1:{mp}/chat','api_keys':{USER:'personal-synthetic-key'},'model':'test','timeout_s':30},'hook':{'kind':'http','url':f'http://127.0.0.1:{mp}/hook','users':[USER],'timeout_s':30}}}
     if args.https_check:config['targets']['tls']={'kind':'http','url':'https://eyesoff.ai/ping','method':'GET','users':[USER],'timeout_s':30}
-    env={**os.environ,'ENCLAVE_CONFIG':json.dumps(config),'ENCLAVE_PORTS':f'http:8080={p}'};env.pop('ENCLAVE_EGRESS',None)
+    env={**os.environ,'ENCLAVE_CONFIG':json.dumps(config),'ENCLAVE_PORTS':f'http:8000={p}'};env.pop('ENCLAVE_EGRESS',None)
     native=ROOT/'target/debug/enclave-cron';wasm=ROOT/'target/wasm32-wasip2/release/enclave-cron.wasm'
     cmd=[str(native)] if args.native else ['wasmtime','run','-S','inherit-network=y','-S','allow-ip-name-lookup=y','--env','ENCLAVE_CONFIG','--env','ENCLAVE_PORTS',str(wasm)]
     procs=[]
