@@ -7824,7 +7824,7 @@ fn finish_search(
     let question = messages[last].content.trim().to_string();
     messages[last].content = format!(
         "{}\nQuestion: {question}",
-        search::render_context(&query, &hits)
+        search::render_context(scfg, &query, &hits)
     );
     Ok(Some(SearchMeta {
         provider: scfg.provider.clone(),

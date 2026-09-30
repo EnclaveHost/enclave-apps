@@ -2517,7 +2517,7 @@ fn call_builtin(
                 return Ok(format!("No web results for '{q}'."));
             }
             *sources = hits.iter().map(|h| (h.title.clone(), h.url.clone())).collect();
-            Ok(crate::search::render_context(q, &hits))
+            Ok(crate::search::render_context(scfg, q, &hits))
         }
         Builtin::Request => {
             let scfg = b.search.ok_or("outbound requests are not configured on this deployment")?;

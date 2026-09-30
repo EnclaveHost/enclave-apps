@@ -1,0 +1,39 @@
+{
+  "scope": "Eyesoff-AI search context rendering; no inference runtime or isolation changes",
+  "candidate_version": "1.0.70",
+  "artifact": {
+    "cid": "bafybeie77xp5djpkg7wjdsikppyzeqykawqq6v4ojlwrjiwxa535inkulu",
+    "sha256": "c1bd531eb264f8b66585d5ad6933452099506905a6e5c49fbaa7537bbed071a2",
+    "bytes": 6779724
+  },
+  "environment": "Local CPU 0.5B end-to-end Wasm; fixed synthetic search provider, two threads. Not production 27B timing.",
+  "baseline_version": "1.0.69",
+  "results": [
+    {
+      "variant": "baseline",
+      "prompt_tokens": 3728,
+      "prefill_ms": 41645,
+      "first_delta_ms": 42354.6,
+      "answer": "The Moon has phases, and its synodic cycle is approximately 29.5 days long. Phases are caused by the changing visible fraction of the sunlit hemisphere on Earth, not by Earth's shadow."
+    },
+    {
+      "variant": "candidate",
+      "prompt_tokens": 1702,
+      "prefill_ms": 14172,
+      "first_delta_ms": 14728.1,
+      "answer": "The Moon has phases, and its synodic cycle is approximately 29.5 days long. Phases are caused by the changing visible fraction of the sunlit hemisphere on Earth, not by Earth's shadow."
+    }
+  ],
+  "answer_match": true,
+  "checks": {
+    "rust_tests_passed": 224,
+    "browser_tests_passed": 19,
+    "wasm_release_build": "nightly-2026-07-25 wasm32-wasip2"
+  },
+  "limitations": [
+    "One controlled synthetic corpus and query; not a broad relevance evaluation.",
+    "Local CPU 0.5B timings are not production 27B measurements.",
+    "Verbatim excerpt selection may omit relevant content. Full retrieval is configurable.",
+    "Production 27B baseline search reached kv_pool_full; not a completed latency baseline."
+  ]
+}
