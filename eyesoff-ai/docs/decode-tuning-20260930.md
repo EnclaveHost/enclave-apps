@@ -1,10 +1,10 @@
 # Decode investigation, 2026-09-30
 
-Status: **no production change and no validated throughput gain yet**.
-Production remains app 1.0.69 on compact64 runtime `4bb9f020`.
-Published app 1.0.70 is still inactive; its previously prepared activation was
-deferred at the owner's request. The new request control described below is
-not in either published artifact. Publish it under a new version if selected.
+Status: **no validated application throughput gain from this investigation yet**.
+The measurements below used app 1.0.69 on compact64 runtime `4bb9f020`.
+App 1.0.70 was subsequently activated on September 30 for its search-context
+fix, with that same runtime. The new request control described below is not
+in either published artifact. Publish it under a new version if selected.
 
 ## Current application baseline
 
