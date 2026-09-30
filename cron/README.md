@@ -1,5 +1,7 @@
 # Enclave Cron
 
+![Enclave Cron banner](assets/banner.svg)
+
 A durable scheduler for Eyesoff-AI agent turns and configured HTTP callbacks.
 It runs as an Enclave `wasm32-wasip2` **service app**, keeps its own clock loop,
 and needs no open browser, external cron, or periodic HTTP tick.
@@ -201,3 +203,19 @@ Publish as a CPU service with port `http:8080`, transparent egress, and at least
 deployment flow. The template intentionally contains placeholders, not live
 credentials. Publishing the build alone does not connect Eyesoff: provision
 the secrets, storage, personal callback identity and MCP config above.
+
+## Catalog artwork
+
+- [Logo SVG](assets/logo.svg): transparent, scalable 96 × 96 view box.
+- [Logo PNG](assets/logo.png): transparent 512 × 512 export.
+- [Banner SVG](assets/banner.svg): editable 1600 × 400 catalog artwork.
+- [Banner PNG](assets/banner.png): 1600 × 400 export.
+
+The mint clock-and-arrow mark and navy timeline follow the catalog's existing
+SVG format. Sources are hand-authored vectors, with no external image or font
+dependencies. To regenerate PNG exports with librsvg:
+
+```sh
+rsvg-convert -w 512 -h 512 -o cron/assets/logo.png cron/assets/logo.svg
+rsvg-convert -w 1600 -h 400 -o cron/assets/banner.png cron/assets/banner.svg
+```

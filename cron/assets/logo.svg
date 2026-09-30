@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Enclave Cron</title>
+  <desc id="desc">A mint clock with an open circular arrow, representing scheduled runs.</desc>
+  <path d="M75 31 A32 32 0 1 0 79 57" fill="none" stroke="#54d9bc" stroke-width="8" stroke-linecap="round"/>
+  <path d="M78 14 L82 38 L59 31 Z" fill="#54d9bc"/>
+  <path d="M48 29 V48 L61 56" fill="none" stroke="#d8fff3" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="48" cy="48" r="5" fill="#54d9bc"/>
+</svg>
