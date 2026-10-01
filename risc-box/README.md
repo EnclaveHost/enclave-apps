@@ -7,6 +7,12 @@ not in your browser. The enclave pulls a kernel and root filesystem from an
 browser; your keystrokes go back into the guest, and disk writes can be saved
 back to the bucket.
 
+The browser display starts **off** on every page load. Use **Start web stream**
+to view the desktop and **Stop web stream** to cancel its frame requests and
+close any AV1 decoder. The terminal remains available while the display is off.
+Leave the web stream off when playing through Moonlight to avoid a second
+display consumer. The AV1 option is available only while the web stream is on.
+
 This is the counterpart to [golem](../golem). golem ships QEMU-wasm to the
 browser and emulates in the tab (the enclave is just the sealed image vault).
 RISC Box is the opposite split, the one the request asked for: **the machine

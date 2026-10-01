@@ -119,11 +119,13 @@
 <div class="card" id="dispcard" style="display:none">
   <div class="row">
     <h2>display</h2>
+    <button id="webstreamtoggle" aria-pressed="false">Start web stream</button>
+    <span class="stat" id="webstreamstatus">Off — use Moonlight without an extra web stream.</span>
     <span class="stat">simple-framebuffer <span id="dispgeom">—</span> — lights up when the guest kernel drives /dev/fb0 (fbcon, Xorg). Mouse and keyboard drive the desktop through the virtio-input HID. <b id="ptrhint">click the screen to capture the pointer</b></span>
-    <label style="margin-left:auto;font-size:12px;white-space:nowrap"><input type="checkbox" id="av1toggle" title="Encodes AV1 inside the enclave, on the same thread that runs the machine. Saves bandwidth, costs the guest a lot of CPU."> AV1 stream (saves bandwidth, slows the machine)</label>
+    <label style="margin-left:auto;font-size:12px;white-space:nowrap"><input type="checkbox" id="av1toggle" disabled title="Encodes AV1 inside the enclave. Saves bandwidth, costs the guest CPU."> AV1 stream (saves bandwidth, slows the machine)</label>
   </div>
   <canvas id="fb" width="800" height="600"
-    style="display:block;width:100%;max-width:800px;margin-top:14px;background:#000;border-radius:8px;image-rendering:pixelated"></canvas>
+    style="display:none;width:100%;max-width:800px;margin-top:14px;background:#000;border-radius:8px;image-rendering:pixelated"></canvas>
 </div>
 
 <footer>
@@ -212,7 +214,7 @@ function dropConsole() { if (evs) { evs.close(); evs = null; } }
 // guest moved to 1024x768: ImageData throws unless its buffer is exactly
 // w*h*4, and the catch below swallowed that on every single band, so the
 // screen stayed blank with no error anywhere.
-let dispRun = null, dispW = 800;
+let dispRun = null, dispW = 800, webStreamEnabled = false;
 // How many bands may be waiting to paint before we start dropping them.
 //
 // Painting one costs an inflate plus a pass over every pixel of the rectangle,
@@ -251,8 +253,8 @@ async function inflateRaw(u8) {
   return new Uint8Array(await r.arrayBuffer());
 }
 function connectDisplay() {
-  if (dispRun) return;
-  dispRun = { on: true };
+  if (dispRun || !running || !webStreamEnabled) return;
+  dispRun = { on: true, abort: new AbortController() };
   pullLoop(dispRun);
 }
 // The picture is PULLED, not pushed: one parked /fb.bands long-poll at a
@@ -289,33 +291,37 @@ async function pullLoop(run) {
   let drawQ = Promise.resolve(), behind = 0;
   while (run.on) {
     while (behind >= 3 && run.on) await drawQ;
+    if (!run.on) break;
     let j;
     try {
-      const r = await authFetch("/fb.bands?since=" + gen + "&wait=1");
+      const r = await authFetch("/fb.bands?since=" + gen + "&wait=1", { signal: run.abort.signal });
       if (!r.ok) throw new Error(r.status);
       j = await r.json();
       failures = 0;
     } catch (e) {
+      if (!run.on) break;
       failures++;
       await new Promise((res) => setTimeout(res, Math.min(300 * failures, 3000)));
       continue;
     }
+    if (!run.on) break;
     if (j.w && j.h && (j.w !== dispW || fbCanvas.height !== j.h)) setGeometry(j.w, j.h);
     gen = j.gen;
     if (!j.events.length) continue;
     const evs = j.events;
     behind++;
     drawQ = drawQ.then(async () => {
+      if (!run.on) return;
       // bands of one response are disjoint rectangles: inflate them all in
       // parallel, paint in order
       const decoded = await Promise.all(
         evs.map((m) => inflateRaw(b64dec(m.b)).then((bgrx) => ({ m, bgrx })).catch(() => null)));
-      for (const d of decoded) { if (d) paintBand(d.m, d.bgrx); }
+      for (const d of decoded) { if (run.on && d) paintBand(d.m, d.bgrx); }
     }).catch(() => {}).finally(() => { behind--; });
   }
 }
 function dropDisplay() {
-  if (dispRun) { dispRun.on = false; dispRun = null; }
+  if (dispRun) { dispRun.on = false; dispRun.abort.abort(); dispRun = null; }
 }
 
 // ---- video: the desktop as an efficient AV1 stream, decoded with WebCodecs. -
@@ -323,26 +329,29 @@ function dropDisplay() {
 // frame base64 over SSE ({k:keyframe, d:base64}); here a WebCodecs VideoDecoder
 // turns them back into frames drawn on the same canvas. Falls back silently if
 // the browser lacks AV1 WebCodecs support (use the /display stream then).
-let vvs = null, vdec = null, vconfigured = false;
+let vvs = null, vdec = null, vconfigured = false, videoRun = null;
 function connectVideo() {
-  if (vvs) return;
-  if (!("VideoDecoder" in window)) { console.warn("no WebCodecs; use the /display stream"); return; }
+  if (vvs || !running || !webStreamEnabled) return;
+  if (!("VideoDecoder" in window)) { $("av1toggle").checked = false; connectDisplay(); return; }
   vvs = new EventSource("/video" + (apiKey ? "?key=" + encodeURIComponent(apiKey) : ""));
+  const run = videoRun = {};
   vvs.addEventListener("codec", (e) => {
+    if (videoRun !== run) return;
     const m = JSON.parse(e.data);
     // Same geometry announcement as the display stream. drawImage paints at
     // the frame's natural size, so a canvas left at the markup's guess shows
     // the top-left corner of the desktop rather than the whole of it.
     setGeometry(m.w, m.h);
+    if (vdec) { try { vdec.close(); } catch {} }
     vdec = new VideoDecoder({
-      output: (frame) => { fbctx.drawImage(frame, 0, 0); frame.close(); },
+      output: (frame) => { if (videoRun === run) fbctx.drawImage(frame, 0, 0); frame.close(); },
       error: (err) => console.warn("decoder", err),
     });
     vdec.configure({ codec: m.codec, codedWidth: m.w, codedHeight: m.h, optimizeForLatency: true });
     vconfigured = true;
   });
   vvs.onmessage = (e) => {
-    if (!e.data || !vconfigured) return;
+    if (videoRun !== run || !e.data || !vconfigured) return;
     const m = JSON.parse(e.data);
     if (!("d" in m)) return;
     const data = b64dec(m.d);
@@ -356,16 +365,31 @@ function connectVideo() {
   };
   vvs.onerror = () => {};
 }
-function dropVideo() { if (vvs) { vvs.close(); vvs = null; } if (vdec) { try { vdec.close(); } catch {} vdec = null; } vconfigured = false; }
+function dropVideo() { videoRun = null; if (vvs) { vvs.close(); vvs = null; } if (vdec) { try { vdec.close(); } catch {} vdec = null; } vconfigured = false; }
 // live switch between the deflate-band /display stream and the AV1 /video
 // stream while the machine runs
-document.addEventListener("DOMContentLoaded", () => {
-  const t = $("av1toggle");
-  if (t) t.onchange = () => {
-    if (!running) return;
-    if (t.checked) { dropDisplay(); connectVideo(); } else { dropVideo(); connectDisplay(); }
-  };
-});
+function syncWebStream() {
+  const on = running && webStreamEnabled;
+  $("webstreamtoggle").textContent = on ? "Stop web stream" : "Start web stream";
+  $("webstreamtoggle").setAttribute("aria-pressed", String(on));
+  $("webstreamstatus").textContent = on ? "Web stream on" : "Off — use Moonlight without an extra web stream.";
+  $("av1toggle").disabled = !on;
+  fbCanvas.style.display = on ? "block" : "none";
+  if (!on) { dropDisplay(); dropVideo(); return; }
+  if ($("av1toggle").checked) { dropDisplay(); connectVideo(); }
+  else { dropVideo(); connectDisplay(); }
+}
+$("webstreamtoggle").onclick = () => {
+  if (webStreamEnabled) {
+    releaseAllKeys();
+    clearTimeout(trailing);
+    if (document.pointerLockElement === fbCanvas) document.exitPointerLock();
+    fbCanvas.blur();
+  }
+  webStreamEnabled = !webStreamEnabled;
+  syncWebStream();
+};
+$("av1toggle").onchange = syncWebStream;
 
 // ---- input: drive the desktop's pointer + keyboard over /hid. --------------
 // The machine has a virtio-input HID (an absolute pointer + keyboard); this
@@ -534,6 +558,7 @@ function hidKey(e) {
 // because the keyup is delivered to whatever took focus instead. Modifiers
 // are the worst of these: a stuck Ctrl makes every later keystroke a shortcut.
 function releaseAllKeys() {
+  if (!webStreamEnabled) return;
   const evs = [...heldKeys].map((code) => ({ t: "key", code, down: false }));
   heldKeys.clear();
   for (const b of ["left", "middle", "right"]) evs.push({ t: "button", b, down: false });
@@ -631,11 +656,10 @@ async function refresh() {
   if (running) {
     $("stats").innerHTML = `<b>${(s.instret / 1e9).toFixed(2)}B</b> instr · <b>${s.mips.toFixed(1)}</b> MIPS · <b>${fmt(s.consoleBytes)}</b> console`;
     connectConsole();
-    if ($("av1toggle").checked) connectVideo(); else connectDisplay();
   } else {
     $("stats").textContent = "";
-    dropDisplay(); dropVideo();
   }
+  syncWebStream();
   if (s.error) showErr(s.error); else if (s.phase !== "error") $("err").style.display = "none";
 }
 
