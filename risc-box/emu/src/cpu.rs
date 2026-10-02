@@ -686,8 +686,14 @@ pub struct JitParams {
 	/// sampled heat a block needs to seed a region
 	pub seed_heat: u64,
 	/// sampled region heat that justifies a compile (escalated by the verb
-	/// policy as the budget is spent)
+	/// policy as the budget is spent)...
 	pub compile_heat: u64,
+	/// ...and at least this much per guest op in the region: compile time is
+	/// linear in size (~0.07 ms per op measured in the app), so a large,
+	/// lukewarm region must show proportionally more heat to pay back
+	pub compile_heat_per_op: u64,
+	/// members colder than this (sampled) are dropped before emission
+	pub prune_heat: u64,
 	pub max_blocks: usize,
 	pub max_compiles_per_pass: u32,
 	/// log2 of the sampling window (retired instructions) and the duty
@@ -717,6 +723,8 @@ impl Default for JitParams {
 			// (seed ~0.25%, compile ~0.8% of the pass, before escalation)
 			seed_heat: 2_000,
 			compile_heat: 6_000,
+			compile_heat_per_op: 20,
+			prune_heat: 256,
 			max_blocks: 64,
 			max_compiles_per_pass: 4,
 			sample_shift: 18,
@@ -1884,8 +1892,10 @@ impl Cpu {
 				continue;
 			}
 			// a block whose first op the emitter cannot translate is never an
-			// entry worth having: every call there would return at once
-			blocks.retain(|b| ::jit::translatable(&b.2[0]));
+			// entry worth having: every call there would return at once; a
+			// near-cold member costs compile time and buys nothing
+			let prune = j.params.prune_heat;
+			blocks.retain(|b| ::jit::translatable(&b.2[0]) && b.1 >= prune);
 			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].0, &blocks[0].2)) {
 				continue;
 			}
@@ -1897,6 +1907,8 @@ impl Cpu {
 					blocks.iter().map(|b| (b.0 - bias, b.2.clone())).collect();
 				let key = ::jit::source_key(&rel, j.lay_hash);
 				let heat: u64 = blocks.iter().map(|b| b.1).sum();
+				let ops: u64 = blocks.iter().map(|b| b.2.len() as u64).sum();
+				let need = j.params.compile_heat.max(j.params.compile_heat_per_op * ops);
 				let may = compiles < j.params.max_compiles_per_pass && {
 					let spent_ms = ::jit::verb::stats().compile_us / 1000;
 					let wall_ms = j.since.elapsed().as_millis() as u64;
@@ -1905,7 +1917,7 @@ impl Cpu {
 				let lay = &j.lay;
 				let mut size = 0usize;
 				let t0 = std::time::Instant::now();
-				let r = ::jit::verb::lookup(key, heat, j.params.compile_heat, may, || {
+				let r = ::jit::verb::lookup(key, heat, need, may, || {
 					let m = ::jit::emit_region(&rel, lay);
 					size = m.as_ref().map_or(0, |m| m.len());
 					m

@@ -1412,6 +1412,12 @@ fn jit_enable(emu: &mut Emulator) {
     if let Some(v) = num("RISC_JIT_HEAT") {
         p.compile_heat = v;
     }
+    if let Some(v) = num("RISC_JIT_PER_OP") {
+        p.compile_heat_per_op = v;
+    }
+    if let Some(v) = num("RISC_JIT_PRUNE") {
+        p.prune_heat = v;
+    }
     if let Some(v) = num("RISC_JIT_COMPILE_PCT") {
         p.compile_pct = v.min(100) as u32;
     }
