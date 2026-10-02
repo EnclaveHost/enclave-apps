@@ -7546,10 +7546,9 @@ mod test_jit_equivalence {
 			let mem = self.mem;
 			wasmtime::Instance::new(&mut self.store, &module, &[mem.into()]).expect("instantiates")
 		}
+		/// emit_block modules: the region shape, run once (fuel 1)
 		fn call_block(&mut self, engine: &wasmtime::Engine, bytes: &[u8]) -> u64 {
-			let inst = self.instance(engine, bytes);
-			let run = inst.get_typed_func::<(), i64>(&mut self.store, "run").unwrap();
-			run.call(&mut self.store, ()).unwrap() as u64
+			self.call_region(engine, bytes, 1, 0)
 		}
 		fn call_region(&mut self, engine: &wasmtime::Engine, bytes: &[u8], fuel: u64, entry: u32) -> u64 {
 			let inst = self.instance(engine, bytes);

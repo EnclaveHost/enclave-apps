@@ -172,60 +172,70 @@ const I64_SHR_U: u8 = 0x88;
 const I32_WRAP_I64: u8 = 0xa7;
 const I64_EXTEND_I32_U: u8 = 0xad;
 
-/// Local indices. Region functions take (fuel: i64, entry: i32); block
-/// functions take nothing. The address-typed locals (base and the chunk
-/// tables) are i64 under memory64, i32 otherwise.
+/// Local indices. Every generated function has the region shape
+/// (fuel: i64, entry: i32) -> i64. Address-typed locals (base, the chunk
+/// tables, addr) are i64 under memory64, i32 otherwise. The guest
+/// registers a region touches live in locals from FIRST_REG_LOCAL on: loaded
+/// once at entry, written back (the ones it wrote) at the single exit.
 #[derive(Clone, Copy)]
 struct Locals {
+	fuel: u32,
+	entry: u32,
 	scratch: u32,
+	cur: u32,
+	retired: u32,
 	scratch2: u32,
 	bias: u32,
+	tpc: u32,
+	pcv: u32,
 	base: u32,
 	rdt: u32,
 	wrt: u32,
 	marks: u32,
 	addr: u32,
-	fuel: u32,
-	entry: u32,
-	cur: u32,
-	retired: u32,
-	tpc: u32,
+	meta: u32,
 }
 
-const NONE: u32 = u32::MAX;
-// i64 scratch, scratch2, bias | addr base, rdt, wrt, marks, addr
-const BLOCK_LOCALS: Locals = Locals {
-	scratch: 0, scratch2: 1, bias: 2, base: 3, rdt: 4, wrt: 5, marks: 6, addr: 7,
-	fuel: NONE, entry: NONE, cur: NONE, retired: NONE, tpc: NONE,
-};
 // params fuel, entry | i64 scratch | i32 cur | i64 retired, scratch2, bias,
-// tpc | addr base, rdt, wrt, marks, addr
-const REGION_LOCALS: Locals = Locals {
-	fuel: 0, entry: 1, scratch: 2, cur: 3, retired: 4, scratch2: 5, bias: 6, tpc: 7,
-	base: 8, rdt: 9, wrt: 10, marks: 11, addr: 12,
+// tpc, pcv | addr base, rdt, wrt, marks, addr | i32 meta | i64 registers
+const LOCALS: Locals = Locals {
+	fuel: 0, entry: 1, scratch: 2, cur: 3, retired: 4, scratch2: 5, bias: 6, tpc: 7, pcv: 8,
+	base: 9, rdt: 10, wrt: 11, marks: 12, addr: 13, meta: 14,
 };
+const FIRST_REG_LOCAL: u32 = 15;
+const NONE: u32 = u32::MAX;
 
 struct Emit<'a> {
 	code: Vec<u8>,
 	lay: &'a Layout,
 	l: Locals,
-	// how many `if` labels currently enclose the emission point — a region
-	// transfer's br to the dispatch loop must add this to its depth
+	// how many labels opened inside the current block's code enclose the
+	// emission point — a br to the dispatch loop (or the exit, one further
+	// out) must add this to its depth
 	if_depth: u32,
-	// region mode: guest block start pc (module-relative) -> block index
-	in_region: bool,
+	// guest block start pc (module-relative) -> block index
 	targets: HashMap<u64, u32>,
 	// br depth from the current block's code to the dispatch loop head
 	loop_depth: u32,
 	// label index of the indirect-jump dispatcher, when the region has one
 	dispatch: Option<u32>,
+	// the local caching x[r] / the bits of f[r] (NONE: not cached)
+	xl: [u32; 32],
+	fl: [u32; 32],
+	// registers written somewhere in the region (written back at exit)
+	xdirty: u32,
+	fdirty: u32,
+	reg_locals: u32,
+	// emit_block: an untranslatable first op aborts emission
+	strict: bool,
 }
 
 impl<'a> Emit<'a> {
-	fn new(lay: &'a Layout, l: Locals) -> Emit<'a> {
+	fn new(lay: &'a Layout) -> Emit<'a> {
 		Emit {
-			code: Vec::new(), lay, l, if_depth: 0, in_region: false,
-			targets: HashMap::new(), loop_depth: 0, dispatch: None,
+			code: Vec::new(), lay, l: LOCALS, if_depth: 0, targets: HashMap::new(),
+			loop_depth: 0, dispatch: None, xl: [NONE; 32], fl: [NONE; 32], xdirty: 0,
+			fdirty: 0, reg_locals: 0, strict: false,
 		}
 	}
 	fn op(&mut self, b: u8) {
@@ -292,7 +302,37 @@ impl<'a> Emit<'a> {
 		matches!(self.lay.ram, Ram::Chunked { .. })
 	}
 
-	/// Read the context block into locals.
+	/// Give every register the region's ops can touch a local.
+	fn plan_registers(&mut self, blocks: &[(u64, Vec<BlockOp>)]) {
+		let (mut xm, mut fm) = (0u32, 0u32);
+		for &(_, ref ops) in blocks {
+			for op in ops.iter().filter(|o| translatable(o)) {
+				let m = 1u32 << op.rd | 1u32 << op.rs1 | 1u32 << op.rs2;
+				xm |= m;
+				if matches!(op.kind, HOT_FLD | HOT_FLW | HOT_FSD | HOT_FSW | HOT_FADD_D | HOT_FSUB_D
+					| HOT_FMUL_D | HOT_FSGNJ_D | HOT_FMV_X_D | HOT_FMV_D_X | HOT_FCVT_D_W)
+				{
+					fm |= m;
+				}
+			}
+		}
+		let mut next = FIRST_REG_LOCAL;
+		for r in 1..32 {
+			if xm & (1 << r) != 0 {
+				self.xl[r] = next;
+				next += 1;
+			}
+		}
+		for r in 0..32 {
+			if fm & (1 << r) != 0 {
+				self.fl[r] = next;
+				next += 1;
+			}
+		}
+		self.reg_locals = next - FIRST_REG_LOCAL;
+	}
+
+	/// Read the context block (and the cached registers) into locals.
 	fn prologue(&mut self) {
 		let ctx = self.lay.ctx;
 		let (base, bias) = (self.l.base, self.l.bias);
@@ -314,6 +354,56 @@ impl<'a> Emit<'a> {
 				self.lset(local);
 			}
 		}
+		if let Some(t) = self.lay.tlb.clone() {
+			// the interpreter alone changes the meta; it cannot move mid-call
+			self.lget(base);
+			self.op(I32_LOAD);
+			self.memarg(2, t.meta_cache);
+			self.lset(self.l.meta);
+		}
+		for r in 1..32 {
+			if self.xl[r] != NONE {
+				self.lget(base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+				self.lset(self.xl[r]);
+			}
+		}
+		for r in 0..32 {
+			if self.fl[r] != NONE {
+				self.lget(base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+				self.lset(self.fl[r]);
+			}
+		}
+	}
+
+	/// The single exit (after the $exit block): write back the registers
+	/// the region wrote and pc, return retired.
+	fn epilogue(&mut self) {
+		let base = self.l.base;
+		for r in 1..32 {
+			if self.xdirty & (1 << r) != 0 {
+				self.lget(base);
+				self.lget(self.xl[r]);
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+			}
+		}
+		for r in 0..32 {
+			if self.fdirty & (1 << r) != 0 {
+				self.lget(base);
+				self.lget(self.fl[r]);
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+			}
+		}
+		self.lget(base);
+		self.lget(self.l.pcv);
+		self.op(I64_STORE);
+		self.memarg(3, self.lay.pc_addr);
+		self.lget(self.l.retired);
 	}
 
 	/// push x[r]
@@ -322,14 +412,19 @@ impl<'a> Emit<'a> {
 			self.i64c(0);
 			return;
 		}
-		self.lget(self.l.base);
-		self.op(I64_LOAD);
-		self.memarg(3, self.lay.x_base + r as u64 * 8);
+		match self.xl[r as usize] {
+			NONE => {
+				self.lget(self.l.base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+			}
+			l => self.lget(l),
+		}
 	}
-	/// x[rd] <- value: set_x_pre pushes the address, the value follows, then
-	/// set_x_post stores (or drops a write to x0)
+	/// x[rd] <- value: set_x_pre before the value, set_x_post after (a write
+	/// to x0 is dropped)
 	fn set_x_pre(&mut self, r: u8) {
-		if r != 0 {
+		if r != 0 && self.xl[r as usize] == NONE {
 			self.lget(self.l.base);
 		}
 	}
@@ -338,31 +433,53 @@ impl<'a> Emit<'a> {
 			self.op(0x1a); // drop
 			return;
 		}
-		self.op(I64_STORE);
-		self.memarg(3, self.lay.x_base + r as u64 * 8);
+		match self.xl[r as usize] {
+			NONE => {
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+			}
+			l => {
+				self.lset(l);
+				self.xdirty |= 1 << r;
+			}
+		}
 	}
 	/// push f[r] bit pattern as i64
 	fn get_f_bits(&mut self, r: u8) {
-		self.lget(self.l.base);
-		self.op(I64_LOAD);
-		self.memarg(3, self.lay.f_base + r as u64 * 8);
+		match self.fl[r as usize] {
+			NONE => {
+				self.lget(self.l.base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+			}
+			l => self.lget(l),
+		}
 	}
-	fn set_f_pre(&mut self) {
-		self.lget(self.l.base);
+	fn set_f_pre(&mut self, r: u8) {
+		if self.fl[r as usize] == NONE {
+			self.lget(self.l.base);
+		}
 	}
 	fn set_f_bits_post(&mut self, r: u8) {
-		self.op(I64_STORE);
-		self.memarg(3, self.lay.f_base + r as u64 * 8);
+		match self.fl[r as usize] {
+			NONE => {
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+			}
+			l => {
+				self.lset(l);
+				self.fdirty |= 1 << r;
+			}
+		}
 	}
 	/// push f[r] as f64
 	fn get_f(&mut self, r: u8) {
-		self.lget(self.l.base);
-		self.op(F64_LOAD);
-		self.memarg(3, self.lay.f_base + r as u64 * 8);
+		self.get_f_bits(r);
+		self.op(0xbf); // f64.reinterpret_i64 (bit-exact)
 	}
 	fn set_f_post(&mut self, r: u8) {
-		self.op(F64_STORE);
-		self.memarg(3, self.lay.f_base + r as u64 * 8);
+		self.op(0xbd); // i64.reinterpret_f64 (bit-exact)
+		self.set_f_bits_post(r);
 	}
 
 	/// push the runtime pc for module pc `rel`
@@ -371,30 +488,30 @@ impl<'a> Emit<'a> {
 		self.lget(self.l.bias);
 		self.op(I64_ADD);
 	}
-	/// pc <- runtime pc for module pc `rel`
-	fn store_pc(&mut self, rel: u64) {
-		self.lget(self.l.base);
-		self.push_pc(rel);
-		self.op(I64_STORE);
-		self.memarg(3, self.lay.pc_addr);
+
+	fn add_retired(&mut self, n: u64) {
+		if n != 0 {
+			let r = self.l.retired;
+			self.lget(r);
+			self.i64c(n as i64);
+			self.op(I64_ADD);
+			self.lset(r);
+		}
 	}
 
-	/// pc <- `pc`, then leave. Single-block mode returns the constant
-	/// retired count. Region mode: if pc names another region block, add
-	/// this block's retired-so-far and branch back to the dispatch loop;
-	/// otherwise return retired_local + the constant.
+	/// pc <- runtime pc for `rel`, then branch to the single exit.
+	fn to_exit(&mut self, rel: u64) {
+		self.push_pc(rel);
+		self.lset(self.l.pcv);
+		self.op(BR);
+		let d = self.loop_depth + self.if_depth + 1;
+		self.idx(d as u64);
+	}
+
+	/// pc <- `pc`, `retired` more retired: if pc names a region block, branch
+	/// back to the dispatch loop (which checks fuel first); else leave.
 	fn exit(&mut self, pc: u64, retired: u64) {
-		if !self.in_region {
-			self.store_pc(pc);
-			self.i64c(retired as i64);
-			self.op(RETURN);
-			return;
-		}
-		let r = self.l.retired;
-		self.lget(r);
-		self.i64c(retired as i64);
-		self.op(I64_ADD);
-		self.lset(r);
+		self.add_retired(retired);
 		match self.targets.get(&pc).copied() {
 			Some(idx) => {
 				self.i32c(idx as i32);
@@ -403,35 +520,26 @@ impl<'a> Emit<'a> {
 				let d = self.loop_depth + self.if_depth;
 				self.idx(d as u64);
 			}
-			None => {
-				self.store_pc(pc);
-				self.lget(r);
-				self.op(RETURN);
-			}
+			None => self.to_exit(pc),
 		}
 	}
 
-	/// A bail: pc <- `pc`, return retired. Bails NEVER transfer within a
-	/// region — a bail pc that happens to be a block start must still hand
-	/// control back (a memory bail at a block's first op would otherwise
-	/// loop forever re-entering it).
+	/// A bail: pc <- `pc`, leave. Bails NEVER transfer within a region — a
+	/// bail pc that happens to be a block start must still hand control
+	/// back (a memory bail at a block's first op would otherwise loop
+	/// forever re-entering it).
 	fn bail(&mut self, pc: u64, retired: u64) {
-		self.store_pc(pc);
-		if self.in_region {
-			self.lget(self.l.retired);
-			self.i64c(retired as i64);
-			self.op(I64_ADD);
-		} else {
-			self.i64c(retired as i64);
-		}
-		self.op(RETURN);
+		self.add_retired(retired);
+		self.to_exit(pc);
 	}
 
 	/// consume an i32 condition: if nonzero, bail
 	fn bail_if(&mut self, pc: u64, retired: u64) {
 		self.op(IF);
 		self.op(VOID);
+		self.if_depth += 1;
 		self.bail(pc, retired);
+		self.if_depth -= 1;
 		self.op(END);
 	}
 
@@ -528,7 +636,9 @@ impl<'a> Emit<'a> {
 		self.op(BR);
 		self.idx(1); // $done
 		self.op(END); // $fail
+		self.if_depth += 1; // inside $done
 		self.bail(op_addr, retired);
+		self.if_depth -= 1;
 		self.op(END); // $done
 		self.lget(addr);
 	}
@@ -581,9 +691,7 @@ impl<'a> Emit<'a> {
 		self.addr_add();
 		self.op(I32_LOAD);
 		self.memarg(2, metas);
-		self.lget(base);
-		self.op(I32_LOAD);
-		self.memarg(2, t.meta_cache);
+		self.lget(self.l.meta);
 		self.op(I32_NE);
 		self.br_if(0);
 		// phys = ppns[set] | (vaddr & 0xfff)
@@ -613,20 +721,6 @@ impl<'a> Emit<'a> {
 		self.op(I32_NE);
 		self.bail_if(next_pc, retired);
 	}
-}
-
-/// Emit ops[..] starting at module pc `start` as a `() -> i64` function.
-/// Returns None if the first op is outside the supported subset.
-pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
-	if lay.shared && lay.max_pages.is_none() {
-		return None;
-	}
-	let mut e = Emit::new(lay, BLOCK_LOCALS);
-	e.prologue();
-	if !emit_seq(&mut e, ops, start) {
-		return None;
-	}
-	Some(assemble(e.code, false, lay))
 }
 
 /// Whether emit_seq translates `op` (anything else becomes a bail to the
@@ -970,7 +1064,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			HOT_JALR => jalr(e, rd, rs1, imm, next, ret_after),
 			HOT_FLD => {
 				// f[rd] = f64::from_bits(load_doubleword)
-				e.set_f_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
@@ -981,7 +1075,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			}
 			HOT_FLW => {
 				// f[rd] = f64::from_bits(load_word as i32 as i64 as u64)
-				e.set_f_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
@@ -1015,7 +1109,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			HOT_FMUL_D => fp_bin(e, rd, rs1, rs2, 0xa2),
 			HOT_FSGNJ_D => {
 				// f[rd] = (bits(rs2) & SIGN) | (bits(rs1) & !SIGN)
-				e.set_f_pre();
+				e.set_f_pre(rd);
 				e.get_f_bits(rs2);
 				e.i64c(i64::MIN); // 0x8000...0
 				e.op(0x83); // and
@@ -1031,13 +1125,13 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.set_x_post(rd);
 			}
 			HOT_FMV_D_X => {
-				e.set_f_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.set_f_bits_post(rd);
 			}
 			HOT_FCVT_D_W => {
 				// f[rd] = x[rs1] as i32 as f64 (exact conversion)
-				e.set_f_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.op(0xa7); // i32.wrap_i64
 				e.op(0xb7); // f64.convert_i32_s
@@ -1051,7 +1145,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				// compile (single-block mode) or a bail stub (region mode);
 				// mid-block, emit a bail so the interpreter takes over at
 				// exactly this op, and stop emitting.
-				if i == 0 && !e.in_region {
+				if i == 0 && e.strict {
 					return false;
 				}
 				e.bail(addr, ret_before);
@@ -1067,9 +1161,9 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 
 /// JALR: tmp = next; pc = x[rs1] + imm; x[rd] = tmp (the target uses the
 /// OLD rs1 when rd == rs1). Exits only when the target differs from next,
-/// like exec_block. In a region the runtime target goes to the indirect
-/// dispatcher, which continues in-region when it is a member block start
-/// (returns and computed jumps stay compiled) and leaves otherwise.
+/// like exec_block. The runtime target goes to the indirect dispatcher,
+/// which continues in-region when it is a member block start (returns and
+/// computed jumps stay compiled) and leaves otherwise.
 fn jalr(e: &mut Emit, rd: u8, rs1: u8, imm: i64, next: u64, ret_after: u64) {
 	let sc = e.l.scratch;
 	e.get_x(rs1);
@@ -1085,39 +1179,18 @@ fn jalr(e: &mut Emit, rd: u8, rs1: u8, imm: i64, next: u64, ret_after: u64) {
 	e.op(IF);
 	e.op(VOID);
 	e.if_depth += 1;
-	match (e.in_region, e.dispatch) {
-		(true, Some(d)) => {
-			let r = e.l.retired;
-			e.lget(r);
-			e.i64c(ret_after as i64);
-			e.op(I64_ADD);
-			e.lset(r);
-			// tpc = target - bias (module-relative)
-			e.lget(sc);
-			e.lget(e.l.bias);
-			e.op(I64_SUB);
-			e.lset(e.l.tpc);
-			e.i32c(d as i32);
-			e.lset(e.l.cur);
-			e.op(BR);
-			let depth = e.loop_depth + e.if_depth;
-			e.idx(depth as u64);
-		}
-		_ => {
-			e.lget(e.l.base);
-			e.lget(sc);
-			e.op(I64_STORE);
-			e.memarg(3, e.lay.pc_addr);
-			if e.in_region {
-				e.lget(e.l.retired);
-				e.i64c(ret_after as i64);
-				e.op(I64_ADD);
-			} else {
-				e.i64c(ret_after as i64);
-			}
-			e.op(RETURN);
-		}
-	}
+	e.add_retired(ret_after);
+	// tpc = target - bias (module-relative)
+	e.lget(sc);
+	e.lget(e.l.bias);
+	e.op(I64_SUB);
+	e.lset(e.l.tpc);
+	let d = e.dispatch.expect("a region with a JALR has a dispatcher");
+	e.i32c(d as i32);
+	e.lset(e.l.cur);
+	e.op(BR);
+	let depth = e.loop_depth + e.if_depth;
+	e.idx(depth as u64);
 	e.if_depth -= 1;
 	e.op(END); // fall through when target == next
 }
@@ -1168,17 +1241,31 @@ fn emit_search(e: &mut Emit, pcs: &[(u64, u32)]) {
 /// before retrying. Block pcs are module pcs: the caller rebases them and
 /// supplies the difference as the context block's bias.
 pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u8>> {
+	emit_region_impl(blocks, lay, false)
+}
+
+/// One block as a region module (tests): None when its first op is not
+/// translated. Called with fuel 1 it runs the block exactly once, as
+/// exec_block does (a jump to its own start re-enters, meets the spent
+/// fuel and leaves with pc there).
+pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
+	emit_region_impl(&[(start, ops.to_vec())], lay, true)
+}
+
+fn emit_region_impl(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout, strict: bool) -> Option<Vec<u8>> {
 	if blocks.is_empty() || blocks.len() > 512 || (lay.shared && lay.max_pages.is_none()) {
 		return None;
 	}
 	let n = blocks.len();
-	let mut e = Emit::new(lay, REGION_LOCALS);
+	let mut e = Emit::new(lay);
+	e.strict = strict;
 	for (i, &(start, _)) in blocks.iter().enumerate() {
 		e.targets.entry(start).or_insert(i as u32);
 	}
 	let has_jalr = blocks.iter().any(|(_, ops)| ops.iter().any(|o| o.kind == HOT_JALR));
 	let labels = n + has_jalr as usize;
 	e.dispatch = if has_jalr { Some(n as u32) } else { None };
+	e.plan_registers(blocks);
 	let l = e.l;
 	// entry guard: an index the module does not have runs nothing
 	e.lget(l.entry);
@@ -1192,6 +1279,8 @@ pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u
 	e.prologue();
 	e.lget(l.entry);
 	e.lset(l.cur);
+	e.op(BLOCK); // $exit
+	e.op(VOID);
 	// dispatch loop: br_table on cur into one label per block (+ the
 	// indirect dispatcher)
 	e.op(LOOP);
@@ -1207,22 +1296,22 @@ pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u
 		e.idx(i as u64);
 	}
 	e.idx(0); // default: block 0 (unreachable: entry is guarded)
-	e.in_region = true;
 	for (i, &(start, ref ops)) in blocks.iter().enumerate() {
 		e.op(END); // end of label B_i; code for block i follows
-		// fuel check: retired >= fuel -> pc = start, return retired
+		e.loop_depth = (labels - 1 - i) as u32;
+		// fuel check: retired >= fuel -> leave with pc = start
 		e.lget(l.retired);
 		e.lget(l.fuel);
 		e.op(I64_GE_U);
 		e.op(IF);
 		e.op(VOID);
-		e.store_pc(start);
-		e.lget(l.retired);
-		e.op(RETURN);
+		e.if_depth += 1;
+		e.to_exit(start);
+		e.if_depth -= 1;
 		e.op(END);
-		e.loop_depth = (labels - 1 - i) as u32;
-		let ok = emit_seq(&mut e, ops, start);
-		debug_assert!(ok);
+		if !emit_seq(&mut e, ops, start) {
+			return None;
+		}
 	}
 	if has_jalr {
 		e.op(END); // label n: the indirect dispatcher, directly in the loop
@@ -1231,18 +1320,19 @@ pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u
 		sorted.sort();
 		emit_search(&mut e, &sorted);
 		// no member starts at the target: leave with pc exact
-		e.lget(l.base);
 		e.lget(l.tpc);
 		e.lget(l.bias);
 		e.op(I64_ADD);
-		e.op(I64_STORE);
-		e.memarg(3, lay.pc_addr);
-		e.lget(l.retired);
-		e.op(RETURN);
+		e.lset(l.pcv);
+		e.op(BR);
+		e.idx(1); // $exit
 	}
 	e.op(END); // end loop
 	e.op(UNREACHABLE); // the loop never falls through
-	Some(assemble(e.code, true, lay))
+	e.op(END); // $exit
+	e.epilogue();
+	let regs = e.reg_locals;
+	Some(assemble(e.code, regs, lay))
 }
 
 /// ... as i32 as i64 (wrap then sign-extend)
@@ -1252,7 +1342,7 @@ fn wrap32(e: &mut Emit) {
 }
 
 fn fp_bin(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, fop: u8) {
-	e.set_f_pre();
+	e.set_f_pre(rd);
 	e.get_f(rs1);
 	e.get_f(rs2);
 	e.op(fop);
@@ -1367,14 +1457,11 @@ fn name(out: &mut Vec<u8>, s: &str) {
 /// One function, importing exactly `env.memory` and exporting `run` — the
 /// shape enclave:codegen accepts (no start, tables, globals, data or
 /// element segments).
-fn assemble(body_expr: Vec<u8>, region: bool, lay: &Layout) -> Vec<u8> {
+fn assemble(body_expr: Vec<u8>, reg_locals: u32, lay: &Layout) -> Vec<u8> {
 	let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
 	let mut s = Vec::new();
 	uleb(&mut s, 1);
-	match region {
-		true => s.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]), // (i64, i32) -> i64
-		false => s.extend_from_slice(&[0x60, 0, 1, 0x7e]), // () -> i64
-	}
+	s.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]); // (i64, i32) -> i64
 	section(&mut m, 1, &s);
 	let mut s = Vec::new();
 	uleb(&mut s, 1);
@@ -1398,19 +1485,15 @@ fn assemble(body_expr: Vec<u8>, region: bool, lay: &Layout) -> Vec<u8> {
 	section(&mut m, 7, &s);
 	let addr = if lay.memory64 { 0x7e } else { 0x7f };
 	let mut body = Vec::new();
-	match region {
-		true => {
-			uleb(&mut body, 4);
-			body.extend_from_slice(&[1, 0x7e]); // 2 scratch
-			body.extend_from_slice(&[1, 0x7f]); // 3 cur
-			body.extend_from_slice(&[4, 0x7e]); // 4 retired, 5 scratch2, 6 bias, 7 tpc
-			body.extend_from_slice(&[5, addr]); // 8 base, 9 rdt, 10 wrt, 11 marks, 12 addr
-		}
-		false => {
-			uleb(&mut body, 2);
-			body.extend_from_slice(&[3, 0x7e]); // 0 scratch, 1 scratch2, 2 bias
-			body.extend_from_slice(&[5, addr]); // 3 base, 4 rdt, 5 wrt, 6 marks, 7 addr
-		}
+	uleb(&mut body, if reg_locals > 0 { 6 } else { 5 });
+	body.extend_from_slice(&[1, 0x7e]); // 2 scratch
+	body.extend_from_slice(&[1, 0x7f]); // 3 cur
+	body.extend_from_slice(&[5, 0x7e]); // 4 retired, 5 scratch2, 6 bias, 7 tpc, 8 pcv
+	body.extend_from_slice(&[5, addr]); // 9 base, 10 rdt, 11 wrt, 12 marks, 13 addr
+	body.extend_from_slice(&[1, 0x7f]); // 14 meta
+	if reg_locals > 0 {
+		uleb(&mut body, reg_locals as u64); // 15.. cached guest registers
+		body.push(0x7e);
 	}
 	body.extend_from_slice(&body_expr);
 	body.push(END);
