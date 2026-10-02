@@ -475,6 +475,53 @@ impl Mmu {
 		self.memory.code_gen()
 	}
 
+	/// risc-box patch (codegen JIT): the current translation meta — every
+	/// input a TLB hit depends on (generation, privilege, MPRV/MPP).
+	#[inline(always)]
+	pub(crate) fn tlb_meta_value(&self) -> u32 {
+		self.tlb_meta_cache
+	}
+
+	/// risc-box patch (codegen JIT): addresses of the software TLB's READ and
+	/// WRITE ways and of the meta cache cell, in the order jit::TlbLayout
+	/// names them (tags, metas, ppns for read, then write, then meta).
+	pub(crate) fn jit_tlb(&self) -> ([u64; 7], u32) {
+		let a = |p: *const u8| p as usize as u64;
+		([
+			a(self.tlb_tags[TLB_READ].as_ptr() as *const u8),
+			a(self.tlb_metas[TLB_READ].as_ptr() as *const u8),
+			a(self.tlb_ppns[TLB_READ].as_ptr() as *const u8),
+			a(self.tlb_tags[TLB_WRITE].as_ptr() as *const u8),
+			a(self.tlb_metas[TLB_WRITE].as_ptr() as *const u8),
+			a(self.tlb_ppns[TLB_WRITE].as_ptr() as *const u8),
+			a(&self.tlb_meta_cache as *const u32 as *const u8),
+		], TLB_SETS as u32)
+	}
+
+	/// risc-box patch (codegen JIT): (read table, write table, exec-page
+	/// marks, DRAM length) — what the chunked-RAM tier reads. The tables move
+	/// only when the memory is re-initialized.
+	pub(crate) fn jit_ram(&self) -> (u64, u64, u64, u64) {
+		let (rd, wr) = self.memory.memory.jit_tables();
+		(
+			rd as usize as u64,
+			wr as usize as u64,
+			self.memory.exec_page_marks.as_ptr() as usize as u64,
+			self.memory.memory.len() as u64,
+		)
+	}
+
+	/// Tests: physical doubleword access with the real side effects.
+	#[cfg(test)]
+	pub(crate) fn load_doubleword_phys(&mut self, p_address: u64) -> u64 {
+		self.load_doubleword_raw(p_address)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn store_doubleword_phys(&mut self, p_address: u64, value: u64) {
+		self.store_doubleword_raw(p_address, value)
+	}
+
 	// risc-box patch: SFENCE.VMA entry point (cpu.rs calls this; upstream
 	// treated the instruction as a no-op).
 	pub fn sfence_vma(&mut self) {
@@ -1341,6 +1388,11 @@ impl Mmu {
 	}
 }
 
+/// risc-box patch: the physical window whose stores feed the framebuffer
+/// counters and overlay rectangle (snoop_exec). The codegen JIT bails on
+/// stores here so the interpreter keeps that bookkeeping.
+pub const FB_STORE_WINDOW: (u64, u64) = (0x87e0_0000, 0x8860_0000);
+
 /// [`Memory`](../memory/struct.Memory.html) wrapper. Converts physical address to the one in memory
 /// using [`DRAM_BASE`](constant.DRAM_BASE.html) and accesses [`Memory`](../memory/struct.Memory.html).
 pub struct MemoryWrapper {
@@ -1431,7 +1483,7 @@ impl MemoryWrapper {
 	// risc-box patch: bump code_gen if this write can touch a marked page.
 	#[inline(always)]
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
-		if p_address >= 0x87e0_0000 && p_address < 0x8860_0000 {
+		if p_address >= FB_STORE_WINDOW.0 && p_address < FB_STORE_WINDOW.1 {
 			self.fb_writes = self.fb_writes.wrapping_add(1);
 			self.fb_bytes = self.fb_bytes.wrapping_add(width);
 			use std::sync::atomic::Ordering;

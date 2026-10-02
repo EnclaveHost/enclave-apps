@@ -30,6 +30,8 @@ pub mod device;
 pub mod snapshot; // risc-box patch: whole-machine snapshot/restore
 #[cfg(feature = "jit")]
 pub mod jit; // risc-box patch: PLATFORM-JIT.md translator (feature-gated)
+#[cfg(feature = "codegen")]
+pub use cpu::jit_selftest; // risc-box patch: the live JIT vs the interpreter
 
 use cpu::{Cpu, Xlen};
 use elf_analyzer::{ElfAnalyzer};
@@ -593,6 +595,19 @@ impl Emulator {
 	#[cfg(feature = "aot")]
 	pub fn aot_install_stats(&self) -> (u64, u64) {
 		self.cpu.aot_install_stats()
+	}
+
+	/// risc-box patch (codegen): the live region JIT over the platform's
+	/// enclave:codegen verb. False when the verb is absent or its budget is
+	/// spent — the machine then interprets exactly as before.
+	#[cfg(feature = "codegen")]
+	pub fn jit_enable(&mut self, params: cpu::JitParams) -> bool {
+		self.cpu.jit_enable(params)
+	}
+
+	#[cfg(feature = "codegen")]
+	pub fn jit_stats(&self) -> Option<cpu::JitStats> {
+		self.cpu.jit_stats()
 	}
 
 	pub fn gpu_flushes(&self) -> u64 {

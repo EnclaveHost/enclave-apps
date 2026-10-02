@@ -212,6 +212,13 @@ impl Memory {
 		self.len
 	}
 
+	/// risc-box patch (codegen JIT): the chunk pointer tables generated code
+	/// reads — `rd[i]`/`wr[i]` for chunk i, exactly as `rd_at`/`wr_at` use
+	/// them. Valid until the next `init` (which reallocates both).
+	pub(crate) fn jit_tables(&self) -> (*const *const u8, *const *mut u8) {
+		(self.rd.as_ptr(), self.wr.as_ptr())
+	}
+
 	/// risc-box patch: take a shared image as this machine's memory. Every
 	/// chunk the image holds becomes Shared (copied on first write); the
 	/// rest stay Zero. The image's length must match `init`'s.

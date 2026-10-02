@@ -38,9 +38,17 @@ tier2 = ["jit"]
 # the dispatcher runs them in place of interpreting. All app-side — no
 # platform verb involved.
 aot = ["tier2"]
+# the LIVE region JIT over the platform's enclave:codegen verb: regions form
+# from sampled heat, compile through set/codegen.c's binding and run from the
+# run loop (src/jit.rs verb + cpu.rs JitState). Only the SET wasm64 build
+# links the binding; elsewhere the verb reports itself unavailable.
+codegen = ["tier2"]
 
 # examples/jit-proto.rs only: executes runtime-emitted wasm natively to
 # measure the translator half of PLATFORM-JIT.md before the platform verb
 # exists. Never linked into the library or the shipped app.
 [dev-dependencies]
+# the translator's equivalence tests (cpu.rs test_jit_equivalence) execute
+# the emitted modules; never linked into the library or the app
+wasmtime = { version = "24", default-features = false, features = ["cranelift", "runtime", "threads"] }
 

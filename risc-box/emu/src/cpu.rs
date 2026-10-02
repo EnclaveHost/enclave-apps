@@ -373,6 +373,10 @@ pub struct Cpu {
 	aot_install_ok: u64,
 	#[cfg(feature = "aot")]
 	aot_install_fail: u64,
+	// risc-box patch (codegen): the live region JIT over the platform's
+	// enclave:codegen verb (see JitState).
+	#[cfg(feature = "codegen")]
+	jit: Option<Box<JitState>>,
 	// risc-box patch (blockstats feature): per-slot execution/retired
 	// counters plus a histogram of retired-instructions bucketed by how many
 	// times the retiring block had executed when replaced — the coverage
@@ -626,6 +630,234 @@ pub struct Tier2State {
 	pub miss: std::collections::HashMap<u64, u64>,
 }
 
+/// risc-box patch (codegen): the live region JIT. Hot regions are formed
+/// from sampled block heat (the same greedy formation the AOT bake uses),
+/// emitted by jit::emit_region against the machine's real layout, compiled
+/// through the platform verb (jit::verb owns the process-wide budget), and
+/// dispatched from the run loop exactly where the AOT splice runs baked
+/// regions: same fuel-bounded call, same interrupt/device-service cadence.
+///
+/// Validity is the AOT's two-level proof, kept per installed instance:
+/// content (each member's (word, len) stream really is in memory) is proven
+/// once per write-snoop generation, and the proof marks every member page
+/// executable — so any later store to them bumps the generation and forces
+/// a re-proof; mapping (each member pc still fetches from the page the proof
+/// saw) is re-probed once per TLB meta (address-space generation, privilege,
+/// MPRV/MPP). A region therefore survives generation bumps elsewhere in the
+/// machine without recompiling, and a region whose code changed or whose
+/// pages are not mapped here simply does not run.
+#[cfg(feature = "codegen")]
+pub struct JitState {
+	t2: ::jit::Tier2,
+	lay: ::jit::Layout,
+	/// direct-mapped by the same index as block_heads
+	slots: Vec<JitSlot>,
+	regions: Vec<JitRegion>,
+	free: Vec<u32>,
+	/// (table index, pc bias) -> installed instance
+	instances: ::fnv::FnvHashMap<(u64, u64), u32>,
+	/// block pcs whose code changed under a proven region (self-modifying
+	/// or JIT-generated guest code): never formed into a region again, so
+	/// the compile budget is not spent chasing code that keeps changing
+	volatile: ::fnv::FnvHashSet<u64>,
+	/// the execution view whose table holds our indices
+	owner: usize,
+	/// this run() may dispatch: owner thread, RV64
+	live: bool,
+	/// sampling window over interpreted retirement (see record)
+	total: u64,
+	window: bool,
+	pub params: JitParams,
+	pub stats: JitStats,
+}
+
+/// Tuning, defaulted for the desktop/browser workloads.
+#[cfg(feature = "codegen")]
+#[derive(Clone, Debug)]
+pub struct JitParams {
+	/// instructions a region call may run before returning at a block
+	/// boundary (the AOT splice's 256: interrupt jitter near a block's)
+	pub fuel: u64,
+	/// retired instructions between formation passes
+	pub form_interval: u64,
+	/// sampled heat a block needs to seed a region
+	pub seed_heat: u64,
+	/// sampled region heat that justifies a compile (escalated by the verb
+	/// policy as the budget is spent)
+	pub compile_heat: u64,
+	pub max_blocks: usize,
+	pub max_compiles_per_pass: u32,
+	/// log2 of the sampling window (retired instructions) and the duty
+	/// cycle: one window in `1 << sample_period` is recorded
+	pub sample_shift: u32,
+	pub sample_period: u32,
+	/// largest module submitted
+	pub max_module_bytes: usize,
+	/// the app memory's declared maximum, in 64 KiB pages
+	pub max_pages: u64,
+}
+
+#[cfg(feature = "codegen")]
+impl Default for JitParams {
+	fn default() -> JitParams {
+		JitParams {
+			fuel: 256,
+			form_interval: 50_000_000,
+			seed_heat: 8_000,
+			compile_heat: 24_000,
+			max_blocks: 64,
+			max_compiles_per_pass: 4,
+			sample_shift: 18,
+			sample_period: 4,
+			max_module_bytes: 128 * 1024,
+			max_pages: 1 << 18, // --max-memory=17179869184
+		}
+	}
+}
+
+#[cfg(feature = "codegen")]
+#[derive(Clone, Debug, Default)]
+pub struct JitStats {
+	/// region calls that ran, instructions they retired, calls that ran nothing
+	pub calls: u64,
+	pub retired: u64,
+	pub empty_calls: u64,
+	/// interpreted block retirement seen while the JIT was on
+	pub interpreted: u64,
+	pub content_checks: u64,
+	pub map_checks: u64,
+	pub verify_failures: u64,
+	pub passes: u64,
+	pub formed: u64,
+	pub installs: u64,
+	pub refused: u64,
+	pub oversize: u64,
+	pub live_regions: u64,
+	pub resets: u64,
+	/// blocks excluded from formation because their code changed
+	pub volatile: u64,
+}
+
+#[cfg(feature = "codegen")]
+#[derive(Clone, Copy)]
+struct JitSlot {
+	tag: u64, // entry pc (0 = empty)
+	region: u32,
+	entry: u32,
+}
+
+#[cfg(feature = "codegen")]
+impl JitSlot {
+	const EMPTY: JitSlot = JitSlot { tag: 0, region: 0, entry: 0 };
+}
+
+/// One compiled module placed at a page-aligned pc bias.
+#[cfg(feature = "codegen")]
+struct JitRegion {
+	index: u64,
+	bias: u64,
+	/// runtime start pc of each member block, in module block order, with
+	/// the (uncompressed word, length) stream the module was built from
+	members: Vec<(u64, Vec<(u32, u8)>)>,
+	/// physical page of each member, from the last content proof
+	phys: Vec<u64>,
+	/// write-snoop generation of the last successful content proof (0: none)
+	proof_gen: u32,
+	/// (generation, TLB meta) of the last check, and its verdict — a failed
+	/// check is cached too, so a region that cannot run here costs one
+	/// compare per dispatch, not a proof
+	checked: (u32, u32),
+	ok: bool,
+	refs: u32, // slots pointing here
+}
+
+#[cfg(feature = "codegen")]
+impl JitState {
+	/// Sampled recording of one interpreted block: heat and successor edges
+	/// in one window of `1 << sample_period`, the formation clock always.
+	#[inline(always)]
+	fn record(&mut self, tag: u64, r: u64) {
+		self.total += r;
+		self.stats.interpreted += r;
+		let w = (self.total >> self.params.sample_shift) & ((1 << self.params.sample_period) - 1) == 0;
+		if w != self.window {
+			if w {
+				// never chain an edge across the unrecorded gap
+				self.t2.note_break();
+			}
+			self.window = w;
+		}
+		match w {
+			true => self.t2.note_block(tag, r),
+			false => self.t2.note_retire(r),
+		}
+	}
+
+	/// Point `slot` at region `rid`, releasing whatever it held.
+	fn install(&mut self, slot: usize, tag: u64, rid: u32, entry: u32) {
+		let old = self.slots[slot];
+		// referenced before the old slot is released: re-pointing a slot
+		// within one region must never free that region
+		self.regions[rid as usize].refs += 1;
+		if old.tag != 0 {
+			self.release(old.region);
+		}
+		self.slots[slot] = JitSlot { tag, region: rid, entry };
+	}
+
+	fn release(&mut self, rid: u32) {
+		let r = &mut self.regions[rid as usize];
+		r.refs -= 1;
+		if r.refs == 0 {
+			self.instances.remove(&(r.index, r.bias));
+			r.members = Vec::new();
+			r.phys = Vec::new();
+			r.ok = false;
+			r.proof_gen = 0;
+			r.checked = (0, 0);
+			self.free.push(rid);
+			self.stats.live_regions -= 1;
+		}
+	}
+
+	/// An instance of compiled `index` at `bias` (shared with an identical
+	/// one already installed).
+	fn instance(&mut self, index: u64, bias: u64, members: Vec<(u64, Vec<(u32, u8)>)>) -> u32 {
+		if let Some(&rid) = self.instances.get(&(index, bias)) {
+			return rid;
+		}
+		let r = JitRegion {
+			index, bias, members, phys: Vec::new(), proof_gen: 0, checked: (0, 0), ok: false, refs: 0,
+		};
+		let rid = match self.free.pop() {
+			Some(rid) => {
+				self.regions[rid as usize] = r;
+				rid
+			}
+			None => {
+				self.regions.push(r);
+				(self.regions.len() - 1) as u32
+			}
+		};
+		self.instances.insert((index, bias), rid);
+		self.stats.live_regions += 1;
+		rid
+	}
+
+	/// Drop every installed instance (the layout they were placed under no
+	/// longer holds). Compiled modules stay cached in jit::verb.
+	fn clear(&mut self) {
+		for s in self.slots.iter_mut() {
+			*s = JitSlot::EMPTY;
+		}
+		self.regions.clear();
+		self.free.clear();
+		self.instances.clear();
+		self.stats.live_regions = 0;
+		self.stats.resets += 1;
+	}
+}
+
 impl Cpu {
 	/// Creates a new `Cpu`.
 	///
@@ -659,6 +891,8 @@ impl Cpu {
 			aot_install_ok: 0,
 			#[cfg(feature = "aot")]
 			aot_install_fail: 0,
+			#[cfg(feature = "codegen")]
+			jit: None,
 			block_ops: vec![BlockOp::EMPTY; BLOCK_SLOTS * BLOCK_MAX],
 			#[cfg(feature = "blockstats")]
 			stat_execs: vec![0; BLOCK_SLOTS],
@@ -792,6 +1026,8 @@ impl Cpu {
 	/// - CSR_CYCLE is materialized lazily in read_csr_raw() (same pattern as
 	///   CSR_TIME) instead of being written every tick.
 	pub fn run(&mut self, n: u64) {
+		#[cfg(feature = "codegen")]
+		self.jit_prepare();
 		let mut remaining = n;
 		// Superblocks retire several instructions per dispatch, so a call
 		// stepping fewer instructions than a block might hold has to stay on
@@ -874,7 +1110,35 @@ impl Cpu {
 								continue;
 							}
 						}
+						// The live JIT: a verified compiled region entered at
+						// this block, under the same fuel/cadence contract.
+						#[cfg(feature = "codegen")]
+						{
+							let ran = self.jit_run(slot, h.tag);
+							if ran > 0 {
+								#[cfg(feature = "tier2")]
+								if let Some(t) = self.tier2.as_mut() {
+									t.total += ran;
+									t.t2.note_break();
+									t.t2.note_retire(ran);
+								}
+								if let Some(j) = self.jit.as_deref_mut() {
+									j.t2.note_break();
+									j.t2.note_retire(ran);
+								}
+								done += ran;
+								if self.check_interrupt {
+									self.check_interrupt = false;
+									self.handle_interrupt(self.pc);
+								}
+								continue;
+							}
+						}
 						let r = self.exec_block(slot);
+						#[cfg(feature = "codegen")]
+						if let Some(j) = self.jit.as_deref_mut() {
+							j.record(h.tag, r);
+						}
 						#[cfg(feature = "blockstats")]
 						{
 							self.stat_execs[slot] += 1;
@@ -921,6 +1185,13 @@ impl Cpu {
 							self.aot_try_install(slot, pc);
 						}
 						let r = self.exec_block(slot);
+						#[cfg(feature = "codegen")]
+						{
+							let tag = self.block_heads[slot].tag;
+							if let Some(j) = self.jit.as_deref_mut() {
+								j.record(tag, r);
+							}
+						}
 						#[cfg(feature = "blockstats")]
 						{
 							self.stat_execs[slot] += 1;
@@ -964,6 +1235,10 @@ impl Cpu {
 						if let Some(t) = self.tier2.as_mut() {
 							t.total += 1;
 							t.t2.note_break();
+						}
+						#[cfg(feature = "codegen")]
+						if let Some(j) = self.jit.as_deref_mut() {
+							j.t2.note_break();
 						}
 						done += 1;
 					}
@@ -1009,6 +1284,10 @@ impl Cpu {
 				#[cfg(feature = "tier2")]
 				if self.tier2.as_ref().map_or(false, |t| t.t2.due()) {
 					self.tier2_form_pass();
+				}
+				#[cfg(feature = "codegen")]
+				if self.jit.as_ref().map_or(false, |j| j.t2.due()) {
+					self.jit_form_pass();
 				}
 			}
 		}
@@ -1221,22 +1500,407 @@ impl Cpu {
 		true
 	}
 
-	/// The production Layout the runtime dispatcher hands emit_region. For
-	/// coverage/bake runs only the DETERMINISM matters (the module hash is
-	/// the match key), so the values just have to be fixed and plausible.
+	/// The Layout coverage/bake runs hand emit_region. Only DETERMINISM
+	/// matters there (the AOT keys on hash_blocks, the module is advisory),
+	/// so the values just have to be fixed and plausible. The live JIT builds
+	/// the machine's real layout in jit_layout.
 	#[cfg(feature = "tier2")]
 	fn tier2_layout() -> ::jit::Layout {
 		::jit::Layout {
+			memory64: false,
+			shared: false,
+			max_pages: None,
+			ctx: 2048,
 			x_base: 0,
 			f_base: 512,
-			tlb: None,
 			pc_addr: 256,
 			gen_addr: 264,
 			baked_gen: 0,
-			dram_base: 4096,
+			tlb: None,
 			guest_dram_base: 0x8000_0000,
 			dram_len: 1 << 31,
+			ram: ::jit::Ram::Flat { dram_base: 4096 },
 		}
+	}
+
+	/// risc-box patch (codegen): switch the live JIT on. False when the
+	/// platform verb is absent or its budget already spent: the machine
+	/// interprets exactly as before.
+	#[cfg(feature = "codegen")]
+	pub fn jit_enable(&mut self, params: JitParams) -> bool {
+		let policy = ::jit::verb::Policy {
+			max_module_bytes: params.max_module_bytes,
+			..Default::default()
+		};
+		if !::jit::verb::enable(policy) {
+			return false;
+		}
+		let mut t2 = ::jit::Tier2::new(Box::new(::jit::RecordBackend::new(None)));
+		t2.greedy = true;
+		t2.max_blocks = params.max_blocks;
+		t2.min_heat = params.seed_heat;
+		t2.form_interval = params.form_interval;
+		let lay = self.jit_layout(params.max_pages);
+		self.jit = Some(Box::new(JitState {
+			t2,
+			lay,
+			slots: vec![JitSlot::EMPTY; BLOCK_SLOTS],
+			regions: Vec::new(),
+			free: Vec::new(),
+			instances: Default::default(),
+			volatile: Default::default(),
+			owner: ::jit::verb::thread_id(),
+			live: false,
+			total: 0,
+			window: false,
+			params,
+			stats: JitStats::default(),
+		}));
+		true
+	}
+
+	/// risc-box patch (codegen): this machine's JIT counters, None when off.
+	#[cfg(feature = "codegen")]
+	pub fn jit_stats(&self) -> Option<JitStats> {
+		self.jit.as_ref().map(|j| j.stats.clone())
+	}
+
+	/// The machine's real layout, as offsets from the Cpu itself (the
+	/// context block carries the Cpu's address, so a moved Cpu needs no new
+	/// code) plus the RAM geometry.
+	#[cfg(feature = "codegen")]
+	fn jit_layout(&self, max_pages: u64) -> ::jit::Layout {
+		let base = self as *const Cpu as usize as u64;
+		let (tlb, sets) = self.mmu.jit_tlb();
+		let (_, _, _, len) = self.mmu.jit_ram();
+		let off = |a: u64| a - base;
+		::jit::Layout {
+			memory64: cfg!(target_pointer_width = "64"),
+			shared: cfg!(target_feature = "atomics"),
+			max_pages: Some(max_pages),
+			ctx: ::jit::verb::CTX.addr(),
+			x_base: off(self.x.as_ptr() as usize as u64),
+			f_base: off(self.f.as_ptr() as usize as u64),
+			pc_addr: off(&self.pc as *const u64 as usize as u64),
+			gen_addr: 0,
+			baked_gen: 0,
+			tlb: Some(::jit::TlbLayout {
+				sets,
+				read_tags: off(tlb[0]),
+				read_metas: off(tlb[1]),
+				read_ppns: off(tlb[2]),
+				write_tags: off(tlb[3]),
+				write_metas: off(tlb[4]),
+				write_ppns: off(tlb[5]),
+				meta_cache: off(tlb[6]),
+			}),
+			guest_dram_base: ::mmu::DRAM_BASE,
+			dram_len: len,
+			ram: ::jit::Ram::Chunked {
+				store_bail: vec![(
+					::mmu::FB_STORE_WINDOW.0 - ::mmu::DRAM_BASE,
+					::mmu::FB_STORE_WINDOW.1 - ::mmu::DRAM_BASE,
+				)],
+			},
+		}
+	}
+
+	/// Per run(): may this call dispatch, and point the context block at
+	/// this machine's RAM tables (they move only when RAM is re-initialized;
+	/// a new RAM size invalidates every installed region).
+	#[cfg(feature = "codegen")]
+	fn jit_prepare(&mut self) {
+		let (rd, wr, marks, len) = self.mmu.jit_ram();
+		let rv64 = matches!(self.xlen, Xlen::Bit64);
+		let j = match self.jit.as_deref_mut() {
+			Some(j) => j,
+			None => return,
+		};
+		j.live = rv64 && ::jit::verb::thread_id() == j.owner;
+		if !j.live {
+			return;
+		}
+		if len != j.lay.dram_len {
+			j.clear();
+			j.lay.dram_len = len;
+		}
+		let ctx = &::jit::verb::CTX;
+		ctx.set(::jit::CTX_RD, rd);
+		ctx.set(::jit::CTX_WR, wr);
+		ctx.set(::jit::CTX_MARKS, marks);
+	}
+
+	/// Run the compiled region entered at block `slot` (tag already matched
+	/// by the block probe), if one is installed and proven for the current
+	/// generation and translation. Returns instructions retired; 0 = not
+	/// run (the caller interprets the block).
+	#[cfg(feature = "codegen")]
+	#[inline(always)]
+	fn jit_run(&mut self, slot: usize, tag: u64) -> u64 {
+		let (rid, entry, fresh, ok) = match self.jit.as_deref() {
+			Some(j) if j.live => {
+				let s = j.slots[slot];
+				if s.tag != tag {
+					return 0;
+				}
+				let r = &j.regions[s.region as usize];
+				let now = (self.mmu.code_gen(), self.mmu.tlb_meta_value());
+				(s.region, s.entry, r.checked == now, r.ok)
+			}
+			_ => return 0,
+		};
+		let ok = match fresh {
+			true => ok,
+			false => self.jit_verify(rid),
+		};
+		if !ok {
+			return 0;
+		}
+		let (index, bias, fuel) = {
+			let j = self.jit.as_deref().unwrap();
+			let r = &j.regions[rid as usize];
+			(r.index, r.bias, j.params.fuel)
+		};
+		// The generated code reaches this Cpu through the context block: its
+		// address is taken here, next to the call that uses it.
+		let ctx = &::jit::verb::CTX;
+		ctx.set(::jit::CTX_BASE, self as *mut Cpu as usize as u64);
+		ctx.set(::jit::CTX_BIAS, bias);
+		let ran = unsafe { ::jit::verb::call(index, fuel, entry) };
+		let j = self.jit.as_deref_mut().unwrap();
+		j.stats.calls += 1;
+		j.stats.retired += ran;
+		if ran == 0 {
+			j.stats.empty_calls += 1;
+		}
+		ran
+	}
+
+	/// Prove region `rid` for the current generation and translation (the
+	/// AOT verifier's two levels; see JitState). False: do not run it now.
+	#[cfg(feature = "codegen")]
+	fn jit_verify(&mut self, rid: u32) -> bool {
+		let mut j = match self.jit.take() {
+			Some(j) => j,
+			None => return false,
+		};
+		let cg = self.mmu.code_gen();
+		let ok = {
+			let r = &mut j.regions[rid as usize];
+			let mut ok = false;
+			if r.proof_gen == cg && r.phys.len() == r.members.len() {
+				// content proven this generation: re-probe the mapping only
+				j.stats.map_checks += 1;
+				ok = true;
+				for (&(pc, _), &page) in r.members.iter().zip(r.phys.iter()) {
+					match self.mmu.translate_fetch_probe(pc) {
+						Ok(p) if (p & !0xfff) == page => {}
+						_ => {
+							ok = false;
+							break;
+						}
+					}
+				}
+			}
+			if !ok {
+				// Full proof: every member translates, its page is marked
+				// executable (so a later store bumps the generation), and the
+				// code there is the (word, len) stream the module was built
+				// from — the same uncompress build_block applies.
+				j.stats.content_checks += 1;
+				ok = true;
+				r.phys.clear();
+				let mut changed: Option<u64> = None;
+				'members: for (start, words) in r.members.iter() {
+					let p = match self.mmu.translate_fetch_probe(*start) {
+						Ok(p) => p,
+						Err(_) => {
+							ok = false;
+							break;
+						}
+					};
+					if !self.mmu.mark_exec_page(p) {
+						ok = false;
+						break;
+					}
+					let mut off = start & 0xfff;
+					for &(word, len) in words.iter() {
+						let raw = self.mmu.load_word_raw((p & !0xfff) | off);
+						let (w, l) = match (raw & 0x3) == 0x3 {
+							true => (raw, 4u8),
+							false => (self.uncompress(raw & 0xffff), 2u8),
+						};
+						if w != word || l != len {
+							ok = false;
+							changed = Some(*start);
+							break 'members;
+						}
+						off += len as u64;
+					}
+					r.phys.push(p & !0xfff);
+				}
+				// A page-table walk above may have stored an A bit into a
+				// marked page, bumping the generation (and clearing every
+				// mark): then the proof's marks are gone and it must not stand.
+				if self.mmu.code_gen() != cg {
+					ok = false;
+				}
+				r.proof_gen = if ok { cg } else { 0 };
+				if !ok {
+					r.phys.clear();
+				}
+				if let Some(pc) = changed {
+					if j.volatile.len() >= 1 << 16 {
+						j.volatile.clear();
+					}
+					if j.volatile.insert(pc) {
+						j.stats.volatile += 1;
+					}
+				}
+			}
+			r.ok = ok;
+			r.checked = (self.mmu.code_gen(), self.mmu.tlb_meta_value());
+			if !ok {
+				j.stats.verify_failures += 1;
+			}
+			ok
+		};
+		self.jit = Some(j);
+		ok
+	}
+
+	/// A cached block's ops, if the cache holds `pc` for this generation.
+	#[cfg(feature = "codegen")]
+	fn jit_block_ops(&self, pc: u64, cg: u32) -> Option<Vec<BlockOp>> {
+		let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+		let h = self.block_heads[slot];
+		if h.tag != pc || h.count == 0 || h.code_gen != cg {
+			return None;
+		}
+		let base = slot * BLOCK_MAX;
+		Some(self.block_ops[base..base + h.count as usize].to_vec())
+	}
+
+	/// A lone block is worth a region only when it loops on itself.
+	#[cfg(feature = "codegen")]
+	fn jit_self_loop(start: u64, ops: &[BlockOp]) -> bool {
+		let mut pc = start;
+		for o in ops {
+			let target = pc.wrapping_add(o.imm as i64 as u64);
+			match o.kind {
+				HOT_BEQ..=HOT_BGEU | HOT_JAL if target == start => return true,
+				_ => {}
+			}
+			pc = pc.wrapping_add(o.len as u64);
+		}
+		false
+	}
+
+	/// Formation pass: form regions from sampled heat (blocks already
+	/// covered by an installed region excluded, so compiles never overlap),
+	/// emit each against the real layout at a page-aligned bias, and install
+	/// it — from the verb's cache when these exact bytes were compiled
+	/// before (any machine, any address), else compiled if the budget
+	/// policy admits it (at most max_compiles_per_pass per pass).
+	#[cfg(feature = "codegen")]
+	fn jit_form_pass(&mut self) {
+		let mut j = match self.jit.take() {
+			Some(j) => j,
+			None => return,
+		};
+		j.stats.passes += 1;
+		if !j.live {
+			j.t2.reset_form_clock();
+			self.jit = Some(j);
+			return;
+		}
+		// covered: installed AND runnable at its last check. A region that
+		// cannot run here (another address space's code at the same pcs)
+		// must not hide this context's hot blocks from formation.
+		let regions = {
+			let JitState { ref mut t2, ref slots, ref regions, ref volatile, .. } = *j;
+			t2.form_now(|pc| {
+				let s = slots[((pc >> 1) as usize) & (BLOCK_SLOTS - 1)];
+				(s.tag == pc && regions[s.region as usize].ok) || volatile.contains(&pc)
+			})
+		};
+		let cg = self.mmu.code_gen();
+		let mut compiles = 0u32;
+		for (members, _) in regions {
+			j.stats.formed += 1;
+			// One address space, one privilege side: members must be cached
+			// for this generation, fetch from the page their block was built
+			// from under the CURRENT translation, and sit on the hottest
+			// member's side of the address space (sampled edges cross traps
+			// and context switches; a region mixing them could never verify).
+			let side = members.iter().max_by_key(|m| m.1).map_or(0, |m| m.0 >> 63);
+			let mut blocks: Vec<(u64, u64, Vec<BlockOp>)> = Vec::with_capacity(members.len());
+			for &(pc, h) in members.iter() {
+				if pc >> 63 != side {
+					continue;
+				}
+				let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+				let page = self.block_heads[slot].phys_page;
+				match self.mmu.translate_fetch_probe(pc) {
+					Ok(p) if (p & !0xfff) == page => {}
+					_ => continue,
+				}
+				if let Some(ops) = self.jit_block_ops(pc, cg) {
+					blocks.push((pc, h, ops));
+				}
+			}
+			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].0, &blocks[0].2)) {
+				continue;
+			}
+			let mut got = None;
+			for attempt in 0..2 {
+				blocks.sort_by_key(|b| b.0);
+				let bias = blocks[0].0 & !0xfff;
+				let rel: Vec<(u64, Vec<BlockOp>)> =
+					blocks.iter().map(|b| (b.0 - bias, b.2.clone())).collect();
+				let module = match ::jit::emit_region(&rel, &j.lay) {
+					Some(m) => m,
+					None => break,
+				};
+				if module.len() > j.params.max_module_bytes {
+					j.stats.oversize += 1;
+					if attempt == 0 && blocks.len() > 1 {
+						// keep the hotter half
+						blocks.sort_by(|a, b| b.1.cmp(&a.1));
+						blocks.truncate((blocks.len() + 1) / 2);
+						continue;
+					}
+					break;
+				}
+				let heat: u64 = blocks.iter().map(|b| b.1).sum();
+				let may = compiles < j.params.max_compiles_per_pass;
+				let r = ::jit::verb::lookup(&module, heat, j.params.compile_heat, may);
+				if let ::jit::verb::Got::Compiled(_) | ::jit::verb::Got::Failed = r {
+					compiles += 1;
+				}
+				got = r.index().map(|i| (i, bias));
+				break;
+			}
+			let (index, bias) = match got {
+				Some(g) => g,
+				None => {
+					j.stats.refused += 1;
+					continue;
+				}
+			};
+			// blocks are in pc order here: the module's block order
+			let words: Vec<(u64, Vec<(u32, u8)>)> = blocks
+				.iter()
+				.map(|b| (b.0, b.2.iter().map(|o| (o.word, o.len)).collect()))
+				.collect();
+			let rid = j.instance(index, bias, words);
+			for (i, b) in blocks.iter().enumerate() {
+				let slot = ((b.0 >> 1) as usize) & (BLOCK_SLOTS - 1);
+				j.install(slot, b.0, rid, i as u32);
+			}
+			j.stats.installs += 1;
+		}
+		self.jit = Some(j);
 	}
 
 	/// The heaviest UNCOVERED pcs (sampled), heaviest first.
@@ -6136,10 +6800,628 @@ mod test_decode_cache {
 	}
 }
 
+// ---- codegen JIT self-test / benchmark ------------------------------------
+
+/// risc-box patch (codegen): the live JIT against the interpreter on a
+/// generated guest, inside whatever process runs it — in the SET component
+/// that means the real enclave:codegen verb over the real shared memory64.
+///
+/// The guest (S-mode, SV39, 32 MiB of copy-on-write RAM shared at start)
+/// loops over kernels shaped like the work a desktop does: register ALU
+/// loops, strided memory walks (loads, stores, misaligned and page-crossing
+/// accesses, first stores into shared chunks), calls and returns, a
+/// bytecode interpreter's jump-table dispatch (indirect jumps), FP loops,
+/// self-modifying code (it rewrites one of its own functions every
+/// iteration), M-extension ops the translator does not cover, and a
+/// delegated page fault the trap handler skips. Machine A interprets,
+/// machine B runs with the JIT; both run until the guest parks on its final
+/// spin loop, then registers, pc, privilege and a hash of all RAM must
+/// match. Returns (report, ok); ok also requires that B actually ran
+/// compiled code.
+#[cfg(feature = "codegen")]
+pub fn jit_selftest(seed: u64, steps: u64) -> (String, bool) {
+	use std::time::Instant;
+	let mut out = String::new();
+	// calibrate: instructions per outer iteration, interpreted
+	let per_iter = {
+		let (mut m, spin) = selftest::machine(seed, 64);
+		let (n, _) = selftest::run_to_spin(&mut m, spin, 1 << 30);
+		(n / 64).max(1)
+	};
+	let iters = (steps / per_iter).max(4);
+	out.push_str(&format!(
+		"jit selftest: seed {} — {} outer iterations x ~{} instructions\n",
+		seed, iters, per_iter
+	));
+
+	let (mut a, spin) = selftest::machine(seed, iters);
+	let t = Instant::now();
+	let (na, done_a) = selftest::run_to_spin(&mut a, spin, steps * 4);
+	let ta = t.elapsed().as_secs_f64();
+
+	let (mut b, _) = selftest::machine(seed, iters);
+	let mut params = JitParams::default();
+	params.form_interval = 5_000_000;
+	let on = b.jit_enable(params);
+	let t = Instant::now();
+	// in slices, to see the steady state after compilation settles
+	let mut nb = 0u64;
+	let mut marks: Vec<(u64, f64)> = Vec::new();
+	let mut done_b = false;
+	while nb < steps * 4 {
+		let (n, d) = selftest::run_to_spin(&mut b, spin, 10_000_000);
+		nb += n;
+		marks.push((nb, t.elapsed().as_secs_f64()));
+		if d {
+			done_b = true;
+			break;
+		}
+	}
+	let tb = t.elapsed().as_secs_f64();
+
+	let ha = selftest::state_hash(&a);
+	let hb = selftest::state_hash(&b);
+	let same = done_a && done_b && ha == hb && a.x == b.x && a.pc == b.pc
+		&& (0..32).all(|i| a.f[i].to_bits() == b.f[i].to_bits());
+	let mips = |n: u64, s: f64| n as f64 / 1e6 / s.max(1e-9);
+	// steady state: the second half of B's run
+	let half = marks.iter().find(|m| m.0 >= nb / 2).copied().unwrap_or((0, 0.0));
+	let steady = mips(nb - half.0, tb - half.1);
+	let js = b.jit_stats().unwrap_or_default();
+	let vs = ::jit::verb::stats();
+	out.push_str(&format!(
+		"interpreter: {} instructions in {:.3} s = {:.1} MIPS (done={})\n",
+		na, ta, mips(na, ta), done_a
+	));
+	out.push_str(&format!(
+		"jit:         {} instructions in {:.3} s = {:.1} MIPS overall, {:.1} MIPS second half (done={}, enabled={})\n",
+		nb, tb, mips(nb, tb), steady, done_b, on
+	));
+	out.push_str(&format!(
+		"jit coverage: {:.1}% of retired ran compiled ({} calls, {} empty; {} regions live, {} installs, {} formed, {} passes)\n",
+		100.0 * js.retired as f64 / nb.max(1) as f64, js.calls, js.empty_calls,
+		js.live_regions, js.installs, js.formed, js.passes
+	));
+	out.push_str(&format!(
+		"jit proofs: {} content, {} mapping, {} failed; verb: {} compiled, {} failed, {} bytes, {} reused, {} refused (heat) {} refused (budget), {:.1} ms compiling (max {:.1}), last status {}, disabled {:?}\n",
+		js.content_checks, js.map_checks, js.verify_failures, vs.compiled, vs.failed, vs.bytes,
+		vs.reused, vs.refused_heat, vs.refused_budget, vs.compile_us as f64 / 1000.0,
+		vs.max_compile_us as f64 / 1000.0, vs.last_status, vs.disabled
+	));
+	out.push_str(&format!(
+		"state: interpreter {:016x}, jit {:016x} -> {}\n",
+		ha, hb, if same { "IDENTICAL" } else { "MISMATCH" }
+	));
+	if !same {
+		for i in 0..32 {
+			if a.x[i] != b.x[i] {
+				out.push_str(&format!("  x{} {:#x} vs {:#x}\n", i, a.x[i], b.x[i]));
+			}
+		}
+		out.push_str(&format!("  pc {:#x} vs {:#x}\n", a.pc, b.pc));
+	}
+	let ok = same && js.retired > 0;
+	out.push_str(if ok { "PASS" } else { "FAIL" });
+	(out, ok)
+}
+
+#[cfg(feature = "codegen")]
+mod selftest {
+	use super::*;
+	use mmu::DRAM_BASE;
+	use terminal::DummyTerminal;
+
+	pub const RAM: u64 = 32 << 20;
+	const PT_POOL: u64 = DRAM_BASE + 0x1_0000; // page tables, bump-allocated
+	const CODE_PA: u64 = DRAM_BASE + 0x10_0000;
+	const CODE_VA: u64 = 0x10_0000_0000;
+	const DATA_PA: u64 = DRAM_BASE + 0x40_0000;
+	const DATA_VA: u64 = 0x20_0000_0000;
+	const DATA_LEN: u64 = 8 << 20;
+	const UNMAPPED_VA: u64 = 0x30_0000_0000;
+	// data layout (offsets from DATA_VA)
+	const ARRAY: u64 = 0x1_0000; // memory kernel walks 0x1_0000..0x9_0000
+	const FPA: u64 = 0x10_0000; // FP kernel array
+	const BYTECODE: u64 = 0x20_0000;
+	const TABLE: u64 = 0x20_8000;
+	const RESULT: u64 = 0x30_0000;
+
+	struct Rng(u64);
+	impl Rng {
+		fn next(&mut self) -> u64 {
+			self.0 ^= self.0 << 13;
+			self.0 ^= self.0 >> 7;
+			self.0 ^= self.0 << 17;
+			self.0
+		}
+	}
+
+	// registers
+	const ZERO: u32 = 0;
+	const RA: u32 = 1;
+	const SP: u32 = 2;
+	const T0: u32 = 5;
+	const T1: u32 = 6;
+	const T2: u32 = 7;
+	const S0: u32 = 8; // DATA_VA
+	const S1: u32 = 9; // outer iterations left
+	const A0: u32 = 10;
+	const A1: u32 = 11;
+	const A2: u32 = 12;
+	const S3: u32 = 19; // TABLE
+	const S4: u32 = 20; // BYTECODE
+	const S5: u32 = 21; // smc function
+	const S6: u32 = 22; // unmapped
+	const S7: u32 = 23; // FP array
+	const S8: u32 = 24; // DATA_VA + ARRAY
+	const S9: u32 = 25; // memory walk offset, kept across iterations
+	const S11: u32 = 27; // checksum
+	const T3: u32 = 28;
+	const T4: u32 = 29;
+	const T5: u32 = 30;
+	const T6: u32 = 31;
+	// registers the random ALU bodies may write
+	const SCRATCH: [u32; 11] = [5, 6, 7, 28, 29, 30, 31, 13, 14, 15, 16];
+
+	fn r(f7: u32, rs2: u32, rs1: u32, f3: u32, rd: u32, op: u32) -> u32 {
+		f7 << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
+	}
+	fn i(imm: i32, rs1: u32, f3: u32, rd: u32, op: u32) -> u32 {
+		((imm as u32) & 0xfff) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op
+	}
+	fn s(imm: i32, rs2: u32, rs1: u32, f3: u32, op: u32) -> u32 {
+		let u = imm as u32;
+		((u >> 5) & 0x7f) << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | (u & 0x1f) << 7 | op
+	}
+
+	/// A tiny assembler: 4-byte instructions, labels, branch/jump fixups.
+	struct Asm {
+		code: Vec<u32>,
+		labels: std::collections::HashMap<&'static str, usize>,
+		fix: Vec<(usize, &'static str, bool)>, // (at, label, is_jal)
+	}
+
+	impl Asm {
+		fn here(&self) -> usize {
+			self.code.len()
+		}
+		fn va(&self, at: usize) -> u64 {
+			CODE_VA + at as u64 * 4
+		}
+		fn label(&mut self, l: &'static str) {
+			self.labels.insert(l, self.code.len());
+		}
+		fn w(&mut self, word: u32) {
+			self.code.push(word);
+		}
+		fn op(&mut self, f7: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) {
+			self.w(r(f7, rs2, rs1, f3, rd, 0x33));
+		}
+		fn opw(&mut self, f7: u32, f3: u32, rd: u32, rs1: u32, rs2: u32) {
+			self.w(r(f7, rs2, rs1, f3, rd, 0x3b));
+		}
+		fn addi(&mut self, rd: u32, rs1: u32, imm: i32) {
+			self.w(i(imm, rs1, 0, rd, 0x13));
+		}
+		fn li(&mut self, rd: u32, v: i32) {
+			// v fits 32 bits: lui + addi
+			let lo = (v << 20) >> 20;
+			let hi = v.wrapping_sub(lo) as u32;
+			if hi != 0 {
+				self.w((hi & 0xfffff000) | rd << 7 | 0x37);
+				self.addi(rd, rd, lo);
+			} else {
+				self.addi(rd, ZERO, lo);
+			}
+		}
+		fn ld(&mut self, f3: u32, rd: u32, rs1: u32, imm: i32) {
+			self.w(i(imm, rs1, f3, rd, 0x03));
+		}
+		fn st(&mut self, f3: u32, rs2: u32, rs1: u32, imm: i32) {
+			self.w(s(imm, rs2, rs1, f3, 0x23));
+		}
+		fn br(&mut self, f3: u32, rs1: u32, rs2: u32, l: &'static str) {
+			self.fix.push((self.code.len(), l, false));
+			self.w(r(0, rs2, rs1, f3, 0, 0x63));
+		}
+		fn jal(&mut self, rd: u32, l: &'static str) {
+			self.fix.push((self.code.len(), l, true));
+			self.w(rd << 7 | 0x6f);
+		}
+		fn jalr(&mut self, rd: u32, rs1: u32, imm: i32) {
+			self.w(i(imm, rs1, 0, rd, 0x67));
+		}
+		fn ret(&mut self) {
+			self.jalr(ZERO, RA, 0);
+		}
+		fn finish(mut self) -> (Vec<u32>, std::collections::HashMap<&'static str, usize>) {
+			for &(at, l, is_jal) in &self.fix {
+				let off = (self.labels[l] as i64 - at as i64) * 4;
+				let u = off as u32;
+				let w = self.code[at];
+				self.code[at] = match is_jal {
+					true => w | ((u >> 20) & 1) << 31 | ((u >> 1) & 0x3ff) << 21
+						| ((u >> 11) & 1) << 20 | ((u >> 12) & 0xff) << 12,
+					false => w | ((u >> 12) & 1) << 31 | ((u >> 5) & 0x3f) << 25
+						| ((u >> 1) & 0xf) << 8 | ((u >> 11) & 1) << 7,
+				};
+			}
+			(self.code, self.labels)
+		}
+	}
+
+	/// A random straight-line ALU body over the scratch registers.
+	fn alu_body(a: &mut Asm, rng: &mut Rng, n: usize) {
+		for _ in 0..n {
+			let pick = |rng: &mut Rng| SCRATCH[(rng.next() % SCRATCH.len() as u64) as usize];
+			let (rd, x, y) = (pick(rng), pick(rng), pick(rng));
+			let imm = (rng.next() % 4096) as i32 - 2048;
+			match rng.next() % 16 {
+				0 => a.op(0, 0, rd, x, y),          // add
+				1 => a.op(0x20, 0, rd, x, y),       // sub
+				2 => a.op(0, 4, rd, x, y),          // xor
+				3 => a.op(0, 6, rd, x, y),          // or
+				4 => a.op(0, 7, rd, x, y),          // and
+				5 => a.op(1, 0, rd, x, y),          // mul
+				6 => a.op(0, 1, rd, x, y),          // sll
+				7 => a.op(0x20, 5, rd, x, y),       // sra
+				8 => a.op(0, 3, rd, x, y),          // sltu
+				9 => a.opw(0, 0, rd, x, y),         // addw
+				10 => a.opw(0x20, 0, rd, x, y),     // subw
+				11 => a.addi(rd, x, imm),
+				12 => a.w(i(imm, x, 4, rd, 0x13)),  // xori
+				13 => a.w(i((rng.next() % 64) as i32, x, 5, rd, 0x13)), // srli
+				14 => a.w(i(imm, x, 0, rd, 0x1b)),  // addiw
+				_ => a.w(i(0x400 | (rng.next() % 32) as i32, x, 5, rd, 0x1b)), // sraiw
+			}
+		}
+	}
+
+	/// The guest program; returns (code words, labels).
+	fn program(seed: u64, iters: u64) -> (Vec<u32>, std::collections::HashMap<&'static str, usize>) {
+		let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+		let mut a = Asm { code: Vec::new(), labels: Default::default(), fix: Vec::new() };
+		// main
+		a.li(S1, iters as i32);
+		a.label("outer");
+		a.li(A0, 40);
+		a.jal(RA, "k_alu");
+		a.li(A0, 96);
+		a.addi(A1, S9, 0);
+		a.jal(RA, "k_mem");
+		a.addi(S9, A1, 0);
+		a.li(A0, 24);
+		a.jal(RA, "k_call");
+		a.addi(A1, S4, 0);
+		a.jal(RA, "k_interp");
+		a.li(A0, 32);
+		a.addi(A1, S7, 0);
+		a.jal(RA, "k_fp");
+		// self-modifying code, every 16th iteration: smc_f (on its own page)
+		// gets a new first word, addi a0, a0, (s1 & 0x7ff)
+		a.w(i(15, S1, 7, T0, 0x13)); // andi t0, s1, 15
+		a.br(1, T0, ZERO, "no_smc");
+		a.w(i(0x7ff, S1, 7, T0, 0x13)); // andi t0, s1, 0x7ff
+		a.w(i(20, T0, 1, T0, 0x13)); // slli t0, t0, 20
+		a.li(T1, i(0, A0, 0, A0, 0x13) as i32); // addi a0, a0, 0
+		a.op(0, 6, T0, T0, T1); // or
+		a.st(2, T0, S5, 0); // sw t0, 0(s5)
+		a.label("no_smc");
+		a.addi(A0, S1, 0);
+		a.jalr(RA, S5, 0);
+		a.op(0, 0, S11, S11, A0);
+		a.li(A0, 12);
+		a.jal(RA, "k_mext");
+		a.ld(3, T0, S6, 0); // faults: the handler skips it
+		a.addi(S1, S1, -1);
+		a.br(1, S1, ZERO, "outer");
+		a.li(T0, RESULT as i32);
+		a.op(0, 0, T0, S0, T0);
+		a.st(3, S11, T0, 0);
+		a.label("spin");
+		a.jal(ZERO, "spin");
+
+		// k_alu(a0): a random ALU loop folded into the checksum
+		a.label("k_alu");
+		a.label("k_alu_loop");
+		alu_body(&mut a, &mut rng, 14);
+		a.op(0, 0, S11, S11, T0);
+		a.op(0, 4, S11, S11, T3);
+		a.addi(A0, A0, -1);
+		a.br(1, A0, ZERO, "k_alu_loop");
+		a.ret();
+
+		// k_mem(a0 count, a1 offset): strided walk over a 512 KiB window
+		// (S8) with stores, misaligned and page-crossing accesses; the odd
+		// stride walks the offsets through every alignment
+		a.label("k_mem");
+		a.label("k_mem_loop");
+		a.op(0, 0, T6, S8, A1);
+		a.ld(3, T0, T6, 0);
+		a.ld(3, T1, T6, 8);
+		a.op(0, 0, T0, T0, T1);
+		a.op(0, 4, T0, T0, S11);
+		a.st(3, T0, T6, 16);
+		a.ld(2, T2, T6, 4); // lw
+		a.st(2, T2, T6, 24); // sw
+		a.ld(4, T3, T6, 3); // lbu
+		a.st(0, T3, T6, 31); // sb
+		a.ld(5, T4, T6, 6); // lhu
+		a.st(1, T4, T6, 38); // sh
+		a.ld(3, T5, T6, 43); // ld, any alignment
+		a.op(0, 0, S11, S11, T5);
+		a.op(0, 0, S11, S11, T0);
+		a.li(T5, 4093);
+		a.op(0, 0, A1, A1, T5);
+		a.li(T5, 0x7ffff);
+		a.op(0, 7, A1, A1, T5);
+		a.addi(A0, A0, -1);
+		a.br(1, A0, ZERO, "k_mem_loop");
+		a.ret();
+
+		// k_call(a0): calls through JAL and through a function pointer
+		a.label("k_call");
+		a.addi(SP, SP, -16);
+		a.st(3, RA, SP, 0);
+		a.label("k_call_loop");
+		a.addi(T0, A0, 0);
+		a.jal(RA, "helper");
+		a.op(0, 0, S11, S11, T0);
+		a.ld(3, T1, S3, 64); // a function pointer: table[8] = helper2
+		a.jalr(RA, T1, 0);
+		a.op(0, 0, S11, S11, T0);
+		a.addi(A0, A0, -1);
+		a.br(1, A0, ZERO, "k_call_loop");
+		a.ld(3, RA, SP, 0);
+		a.addi(SP, SP, 16);
+		a.ret();
+		a.label("helper2");
+		a.op(1, 0, T0, T0, T0);
+		a.addi(T0, T0, 7);
+		a.ret();
+		a.label("helper");
+		a.op(0, 0, T2, T0, T0);
+		a.op(0, 0, T0, T2, T0);
+		a.addi(T0, T0, 1);
+		a.ret();
+
+		// k_interp(a1 = bytecode): jump-table dispatch, LLInt-shaped
+		a.label("k_interp");
+		a.label("dispatch");
+		a.ld(4, T0, A1, 0); // lbu op
+		a.addi(A1, A1, 1);
+		a.w(i(3, T0, 1, T0, 0x13)); // slli t0, t0, 3
+		a.op(0, 0, T0, T0, S3);
+		a.ld(3, T0, T0, 0);
+		a.jalr(ZERO, T0, 0);
+		for h in 0..7 {
+			let name: &'static str = ["h0", "h1", "h2", "h3", "h4", "h5", "h6"][h];
+			a.label(name);
+			alu_body(&mut a, &mut rng, 2 + h);
+			a.op(0, 0, S11, S11, T3);
+			a.jal(ZERO, "dispatch");
+		}
+		a.label("h7");
+		a.ret();
+
+		// k_fp(a0, a1): FP multiply-accumulate
+		a.label("k_fp");
+		a.label("k_fp_loop");
+		a.w(i(0, A1, 3, 0, 0x07)); // fld f0, 0(a1)
+		a.w(i(8, A1, 3, 1, 0x07)); // fld f1, 8(a1)
+		a.w(r(0x09, 1, 0, 0, 2, 0x53)); // fmul.d f2, f0, f1
+		a.w(r(0x01, 2, 3, 0, 3, 0x53)); // fadd.d f3, f3, f2
+		a.w(r(0x05, 1, 3, 0, 4, 0x53)); // fsub.d f4, f3, f1
+		a.w(s(16, 4, A1, 3, 0x27)); // fsd f4, 16(a1)
+		a.w(r(0x71, 0, 3, 0, T0, 0x53)); // fmv.x.d t0, f3
+		a.op(0, 4, S11, S11, T0);
+		a.w(r(0x69, 0, A0, 0, 5, 0x53)); // fcvt.d.w f5, a0
+		a.w(r(0x01, 5, 3, 0, 3, 0x53)); // fadd.d f3, f3, f5
+		a.addi(A1, A1, 24);
+		a.addi(A0, A0, -1);
+		a.br(1, A0, ZERO, "k_fp_loop");
+		a.ret();
+
+		// k_mext(a0): M-extension ops the translator leaves to the interpreter
+		a.label("k_mext");
+		a.label("k_mext_loop");
+		a.op(1, 4, T0, S11, A0); // div
+		a.op(1, 6, T1, S11, A0); // rem
+		a.op(1, 3, T2, S11, A0); // mulhu
+		a.opw(1, 5, T3, S11, A0); // divuw
+		a.op(0, 0, S11, S11, T0);
+		a.op(0, 4, S11, S11, T1);
+		a.op(0, 0, S11, S11, T2);
+		a.op(0, 0, S11, S11, T3);
+		a.addi(A0, A0, -1);
+		a.br(1, A0, ZERO, "k_mext_loop");
+		a.ret();
+
+		// trap handler (stvec): skip the faulting instruction
+		a.label("trap");
+		a.w(i(0x141, 0, 2, T6, 0x73)); // csrr t6, sepc
+		a.addi(T6, T6, 4);
+		a.w(i(0x141, T6, 1, 0, 0x73)); // csrw sepc, t6
+		a.w(0x1020_0073); // sret
+		// the self-modified function, alone on the next page
+		while a.here() % 1024 != 0 {
+			a.w(0x0000_0013); // nop padding
+		}
+		a.label("smc_f");
+		a.addi(A0, A0, 0);
+		a.addi(A0, A0, 3);
+		a.ret();
+		a.finish()
+	}
+
+	/// Build the machine: program, page tables, data, registers; then share
+	/// its RAM so every chunk starts copy-on-write.
+	pub fn machine(seed: u64, iters: u64) -> (Cpu, u64) {
+		let mut rng = Rng(seed ^ 0x5eed_5eed_5eed_5eed | 1);
+		let mut cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		cpu.get_mut_mmu().init_memory(RAM);
+		let (code, labels) = program(seed, iters);
+		for (k, &w) in code.iter().enumerate() {
+			let _ = cpu.mmu.store_word(CODE_PA + k as u64 * 4, w);
+		}
+		// page tables
+		let root = PT_POOL;
+		let mut next = PT_POOL + 0x1000;
+		let mut map = |cpu: &mut Cpu, va: u64, pa: u64, flags: u64| {
+			let vpn = [(va >> 12) & 0x1ff, (va >> 21) & 0x1ff, (va >> 30) & 0x1ff];
+			let mut table = root;
+			for level in (1..3).rev() {
+				let at = table + vpn[level] * 8;
+				let pte = cpu.mmu.load_doubleword(at).unwrap_or(0);
+				table = match pte & 1 {
+					1 => (pte >> 10) << 12,
+					_ => {
+						let t = next;
+						next += 0x1000;
+						let _ = cpu.mmu.store_doubleword(at, ((t >> 12) << 10) | 1);
+						t
+					}
+				};
+			}
+			let _ = cpu.mmu.store_doubleword(table + vpn[0] * 8, ((pa >> 12) << 10) | flags | 0xc1);
+		};
+		let code_pages = (code.len() as u64 * 4 + 0xfff) / 0x1000;
+		for p in 0..code_pages {
+			map(&mut cpu, CODE_VA + p * 0x1000, CODE_PA + p * 0x1000, 0x0e); // R W X
+		}
+		for p in 0..DATA_LEN / 0x1000 {
+			map(&mut cpu, DATA_VA + p * 0x1000, DATA_PA + p * 0x1000, 0x06); // R W
+		}
+		// data: random words in the walk window, finite doubles for FP,
+		// a bytecode program ending in op 7, the handler table
+		for o in (ARRAY..ARRAY + 0x8_0100).step_by(8) {
+			let v = rng.next();
+			let _ = cpu.mmu.store_doubleword(DATA_PA + o, v);
+		}
+		for k in 0..(32 * 3 + 3) as u64 {
+			let v = ((rng.next() % 2_000_000) as f64 / 1000.0 - 1000.0).to_bits();
+			let _ = cpu.mmu.store_doubleword(DATA_PA + FPA + k * 8, v);
+		}
+		for k in 0..200u64 {
+			let op = if k == 199 { 7 } else { (rng.next() % 7) as u8 };
+			cpu.mmu.store_raw(DATA_PA + BYTECODE + k, op);
+		}
+		for h in 0..9u64 {
+			let name = ["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7", "helper2"][h as usize];
+			let _ = cpu.mmu.store_doubleword(DATA_PA + TABLE + h * 8, CODE_VA + labels[name] as u64 * 4);
+		}
+		// S-mode, SV39, page faults delegated to the S handler, no interrupts
+		cpu.write_csr_raw(CSR_MEDELEG_ADDRESS, 0xb000);
+		cpu.write_csr_raw(CSR_STVEC_ADDRESS, CODE_VA + labels["trap"] as u64 * 4);
+		cpu.write_csr_raw(CSR_MIE_ADDRESS, 0);
+		cpu.update_addressing_mode((8 << 60) | (root >> 12));
+		cpu.privilege_mode = PrivilegeMode::Supervisor;
+		cpu.mmu.update_privilege_mode(PrivilegeMode::Supervisor);
+		for k in 1..32 {
+			cpu.x[k] = rng.next() as i64;
+		}
+		cpu.x[SP as usize] = (DATA_VA + 0x38_0000) as i64;
+		cpu.x[S0 as usize] = DATA_VA as i64;
+		cpu.x[S3 as usize] = (DATA_VA + TABLE) as i64;
+		cpu.x[S4 as usize] = (DATA_VA + BYTECODE) as i64;
+		cpu.x[S5 as usize] = (CODE_VA + labels["smc_f"] as u64 * 4) as i64;
+		cpu.x[S6 as usize] = UNMAPPED_VA as i64;
+		cpu.x[S7 as usize] = (DATA_VA + FPA) as i64;
+		cpu.x[S8 as usize] = (DATA_VA + ARRAY) as i64;
+		cpu.x[S9 as usize] = 0;
+		cpu.x[S11 as usize] = 0;
+		for k in 0..32 {
+			cpu.f[k] = 0.0;
+		}
+		cpu.update_pc(CODE_VA);
+		// every chunk copy-on-write from here: first stores take the slow path
+		let _ = cpu.mmu.share_ram();
+		let spin = CODE_VA + labels["spin"] as u64 * 4;
+		(cpu, spin)
+	}
+
+	/// Run until the guest parks on its spin loop or `budget` retires.
+	/// Returns (instructions retired, parked).
+	pub fn run_to_spin(cpu: &mut Cpu, spin: u64, budget: u64) -> (u64, bool) {
+		let start = cpu.retired();
+		while cpu.retired() - start < budget {
+			cpu.run(100_000);
+			if cpu.pc == spin {
+				return (cpu.retired() - start, true);
+			}
+		}
+		(cpu.retired() - start, cpu.pc == spin)
+	}
+
+	/// FNV over every RAM page plus privilege and the S-mode trap CSRs.
+	pub fn state_hash(cpu: &Cpu) -> u64 {
+		let mut h: u64 = 0xcbf29ce484222325;
+		let mut mix = |b: &[u8]| {
+			for &x in b {
+				h ^= x as u64;
+				h = h.wrapping_mul(0x100000001b3);
+			}
+		};
+		let mut page = vec![0u8; 4096];
+		for p in 0..RAM / 4096 {
+			cpu.mmu.read_physical_range(DRAM_BASE + p * 4096, &mut page);
+			mix(&page);
+		}
+		for c in [CSR_SEPC_ADDRESS, CSR_SCAUSE_ADDRESS, CSR_STVAL_ADDRESS] {
+			mix(&cpu.read_csr_raw(c).to_le_bytes());
+		}
+		mix(&[get_privilege_encoding(&cpu.privilege_mode)]);
+		h
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		/// The generated guest itself, interpreted: it must reach its spin
+		/// loop, take its page faults through the handler, rewrite its own
+		/// code, and be deterministic.
+		#[test]
+		fn guest_program_runs_to_completion_deterministically() {
+			let (mut a, spin) = machine(3, 18);
+			let (n, done) = run_to_spin(&mut a, spin, 1 << 28);
+			assert!(done, "parked after {} instructions", n);
+			assert!(n > 50_000, "a real workload: {}", n);
+			assert_eq!(a.read_csr_raw(CSR_SCAUSE_ADDRESS), 13, "the load page fault was taken");
+			let result = a.mmu.load_word_raw(DATA_PA + RESULT) as u64
+				| (a.mmu.load_word_raw(DATA_PA + RESULT + 4) as u64) << 32;
+			assert_eq!(result as i64, a.x[S11 as usize], "checksum stored");
+			// smc_f's first word was rewritten at s1 = 16 (iterations run 18..1)
+			let (_, labels) = program(3, 18);
+			assert_eq!(labels["smc_f"] % 1024, 0, "own page");
+			let w = a.mmu.load_word_raw(CODE_PA + labels["smc_f"] as u64 * 4);
+			assert_eq!(w, i(16, A0, 0, A0, 0x13), "self-modified");
+			let (mut b, _) = machine(3, 18);
+			let (m, _) = run_to_spin(&mut b, spin, 1 << 28);
+			assert_eq!((state_hash(&a), a.x, a.pc), (state_hash(&b), b.x, b.pc));
+			assert_eq!(n, m);
+		}
+
+		/// Natively there is no verb: the JIT reports itself unavailable and
+		/// the self-test fails closed rather than passing on zero coverage.
+		#[test]
+		fn selftest_fails_closed_without_the_verb() {
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			::jit::verb::reset_for_test(None, ::jit::verb::Policy::default());
+			let (report, ok) = super::super::jit_selftest(5, 2_000_000);
+			assert!(!ok, "{}", report);
+			assert!(report.contains("IDENTICAL"), "{}", report);
+		}
+	}
+}
+
 // risc-box patch (jit feature): equivalence between the translator
-// (src/jit.rs) and the REAL exec_block, on randomized op sequences over
-// the supported integer subset. This lives here because it compares
-// private machine state.
+// (src/jit.rs) and the REAL interpreter (exec_block / exec_op), on
+// randomized op sequences over the supported subset — flat memory32 for the
+// translator's op semantics, and the production shape (memory64 addresses
+// above 4 GiB, chunked copy-on-write RAM, SV39 paging through the machine's
+// real software TLB, a nonzero pc bias, in-region indirect jumps) for the
+// codegen JIT. This lives here because it compares private machine state.
 #[cfg(all(test, feature = "jit"))]
 mod test_jit_equivalence {
 	extern crate wasmtime;
@@ -6148,11 +7430,13 @@ mod test_jit_equivalence {
 	use mmu::DRAM_BASE;
 	use terminal::DummyTerminal;
 
-	const XB: u32 = 0; // x[32] at 0
-	const PCA: u32 = 256;
-	const GENA: u32 = 264;
-	const FB: u32 = 512; // f[32] as raw 8-byte cells
-	const DB: u32 = 4096; // linear offset of guest DRAM window
+	// ---- flat memory32 layout (translator op semantics) -----------------
+	const XB: u64 = 0; // x[32] at 0
+	const PCA: u64 = 256;
+	const GENA: u64 = 264;
+	const FB: u64 = 512; // f[32] as raw 8-byte cells
+	const CTXA: u64 = 2048; // context block (base 0, bias 0)
+	const DB: u64 = 4096; // linear offset of guest DRAM window
 	const WIN: u64 = 64 * 1024; // mirrored DRAM window size
 
 	struct Rng(u64);
@@ -6165,11 +7449,68 @@ mod test_jit_equivalence {
 		}
 	}
 
+	fn engine() -> wasmtime::Engine {
+		let mut c = wasmtime::Config::new();
+		c.wasm_memory64(true);
+		c.wasm_threads(true);
+		wasmtime::Engine::new(&c).unwrap()
+	}
+
+	/// A test memory and helpers to fill and read it.
+	struct Mem {
+		store: wasmtime::Store<()>,
+		mem: wasmtime::Memory,
+	}
+
+	impl Mem {
+		fn new(engine: &wasmtime::Engine, memory64: bool, pages: u64) -> Mem {
+			let mut store = wasmtime::Store::new(engine, ());
+			let ty = match memory64 {
+				true => wasmtime::MemoryType::new64(pages, None),
+				false => wasmtime::MemoryType::new(pages as u32, None),
+			};
+			let mem = wasmtime::Memory::new(&mut store, ty).unwrap();
+			Mem { store, mem }
+		}
+		fn put(&mut self, at: u64, bytes: &[u8]) {
+			let d = self.mem.data_mut(&mut self.store);
+			d[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+		}
+		fn put64(&mut self, at: u64, v: u64) {
+			self.put(at, &v.to_le_bytes());
+		}
+		fn get(&self, at: u64, n: usize) -> Vec<u8> {
+			self.mem.data(&self.store)[at as usize..at as usize + n].to_vec()
+		}
+		fn get64(&self, at: u64) -> u64 {
+			let mut b = [0u8; 8];
+			b.copy_from_slice(&self.get(at, 8));
+			u64::from_le_bytes(b)
+		}
+		fn instance(&mut self, engine: &wasmtime::Engine, bytes: &[u8]) -> wasmtime::Instance {
+			let module = wasmtime::Module::new(engine, bytes).expect("valid module");
+			let mem = self.mem;
+			wasmtime::Instance::new(&mut self.store, &module, &[mem.into()]).expect("instantiates")
+		}
+		fn call_block(&mut self, engine: &wasmtime::Engine, bytes: &[u8]) -> u64 {
+			let inst = self.instance(engine, bytes);
+			let run = inst.get_typed_func::<(), i64>(&mut self.store, "run").unwrap();
+			run.call(&mut self.store, ()).unwrap() as u64
+		}
+		fn call_region(&mut self, engine: &wasmtime::Engine, bytes: &[u8], fuel: u64, entry: u32) -> u64 {
+			let inst = self.instance(engine, bytes);
+			let run = inst.get_typed_func::<(i64, i32), i64>(&mut self.store, "run").unwrap();
+			run.call(&mut self.store, (fuel as i64, entry as i32)).unwrap() as u64
+		}
+	}
+
 	fn rand_ops(r: &mut Rng, len: usize) -> Vec<BlockOp> {
 		let mut ops = Vec::new();
 		for _ in 0..len {
 			let rd = match (r.next() % 32) as u8 {
+				// keep pointer regs (x10..x13) and jump-target regs (x5..x7)
 				v @ 10..=13 => v + 10,
+				v @ 5..=7 => v + 20,
 				v => v,
 			};
 			let ra = (r.next() % 32) as u8;
@@ -6285,53 +7626,54 @@ mod test_jit_equivalence {
 		cpu
 	}
 
-	fn run_wasm(bytes: &[u8], cpu_pre: &Cpu, start: u64) -> (u64, [i64; 32], u64, Vec<u8>, [u64; 32]) {
-		let engine = wasmtime::Engine::default();
-		let module = wasmtime::Module::new(&engine, bytes).expect("valid module");
-		let mut store = wasmtime::Store::new(&engine, ());
-		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
-		{
-			let d = mem.data_mut(&mut store);
-			for i in 0..32 {
-				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
-					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
-			}
-			d[PCA as usize..PCA as usize + 8].copy_from_slice(&start.to_le_bytes());
-			for i in 0..32 {
-				d[FB as usize + i * 8..FB as usize + i * 8 + 8]
-					.copy_from_slice(&cpu_pre.f[i].to_bits().to_le_bytes());
-			}
-			d[GENA as usize..GENA as usize + 4]
-				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
-			let mut win = vec![0u8; WIN as usize];
-			cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
-			d[DB as usize..DB as usize + WIN as usize].copy_from_slice(&win);
+	fn flat_layout(cpu: &Cpu) -> jit::Layout {
+		jit::Layout {
+			memory64: false,
+			shared: false,
+			max_pages: None,
+			ctx: CTXA,
+			x_base: XB,
+			f_base: FB,
+			pc_addr: PCA,
+			gen_addr: GENA,
+			baked_gen: cpu.mmu.code_gen(),
+			tlb: None,
+			guest_dram_base: DRAM_BASE,
+			dram_len: WIN,
+			ram: jit::Ram::Flat { dram_base: DB },
 		}
-		let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
-		let run = instance.get_typed_func::<(), i64>(&mut store, "run").unwrap();
-		let retired = run.call(&mut store, ()).unwrap() as u64;
-		let d = mem.data(&store);
-		let mut x = [0i64; 32];
+	}
+
+	/// Serialize the flat state (x, f, pc, gen, DRAM window, context block).
+	fn flat_mem(engine: &wasmtime::Engine, cpu_pre: &Cpu, start: u64) -> Mem {
+		let mut m = Mem::new(engine, false, 2);
 		for i in 0..32 {
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&d[XB as usize + i * 8..XB as usize + i * 8 + 8]);
-			x[i] = i64::from_le_bytes(b);
+			m.put64(XB + i as u64 * 8, cpu_pre.x[i] as u64);
+			m.put64(FB + i as u64 * 8, cpu_pre.f[i].to_bits());
 		}
-		let mut b = [0u8; 8];
-		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
-		let pc = u64::from_le_bytes(b);
-		let dram = d[DB as usize..DB as usize + WIN as usize].to_vec();
+		m.put64(PCA, start);
+		m.put(GENA, &cpu_pre.mmu.code_gen().to_le_bytes());
+		m.put64(CTXA + jit::CTX_BASE, 0);
+		m.put64(CTXA + jit::CTX_BIAS, 0);
+		let mut win = vec![0u8; WIN as usize];
+		cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
+		m.put(DB, &win);
+		m
+	}
+
+	fn flat_state(m: &Mem) -> ([i64; 32], u64, Vec<u8>, [u64; 32]) {
+		let mut x = [0i64; 32];
 		let mut f = [0u64; 32];
 		for i in 0..32 {
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&d[FB as usize + i * 8..FB as usize + i * 8 + 8]);
-			f[i] = u64::from_le_bytes(b);
+			x[i] = m.get64(XB + i as u64 * 8) as i64;
+			f[i] = m.get64(FB + i as u64 * 8);
 		}
-		(retired, x, pc, dram, f)
+		(x, m.get64(PCA), m.get(DB, WIN as usize), f)
 	}
 
 	#[test]
 	fn translator_matches_exec_block() {
+		let engine = engine();
 		let mut checked = 0;
 		for seed in 1..400u64 {
 			let mut r = Rng(seed * 2654435761 | 1);
@@ -6339,23 +7681,15 @@ mod test_jit_equivalence {
 			let ops = rand_ops(&mut r, len);
 			let start = DRAM_BASE; // block's pc; DRAM phys tag irrelevant here
 			let mut cpu = fresh_cpu(&mut Rng(seed * 40503 | 1));
-			let lay = jit::Layout {
-				x_base: XB,
-				f_base: FB,
-				tlb: None,
-				pc_addr: PCA,
-				gen_addr: GENA,
-				baked_gen: cpu.mmu.code_gen(),
-				dram_base: DB,
-				guest_dram_base: DRAM_BASE,
-				dram_len: WIN,
-			};
+			let lay = flat_layout(&cpu);
 			let bytes = match jit::emit_block(&ops, start, &lay) {
 				Some(b) => b,
 				None => continue,
 			};
 			// wasm first (from the pristine state), then the real engine
-			let (rw, xw, pcw, dramw, fw) = run_wasm(&bytes, &cpu, start);
+			let mut m = flat_mem(&engine, &cpu, start);
+			let rw = m.call_block(&engine, &bytes);
+			let (xw, pcw, dramw, fw) = flat_state(&m);
 			cpu.update_pc(start);
 			cpu.install_block_for_test(0, start, 0, &ops);
 			let ri = cpu.exec_block(0);
@@ -6377,70 +7711,52 @@ mod test_jit_equivalence {
 		BlockOp { imm: imm, word: 0, data: 0, kind: kind, rd: rd, rs1: rs1, rs2: rs2, len: 4, _pad: 0 }
 	}
 
-	/// Reference: interpreter-dispatch the region until pc leaves it or the
-	/// fuel bound is met at a block entry. Mirrors the compiled contract.
-	fn dispatch_ref(cpu: &mut Cpu, blocks: &[(u64, Vec<BlockOp>)], fuel: u64) -> u64 {
+	/// Reference for a region: interpreter-dispatch its blocks (at their
+	/// RUNTIME pcs) op by op, exactly as exec_block runs them, until pc
+	/// leaves the region, the fuel bound is met at a block entry, or — when
+	/// `limit` is given — exactly `limit` ops have retired (the point at
+	/// which a compiled region bailed: the op there must NOT run).
+	fn region_ref(cpu: &mut Cpu, blocks: &[(u64, Vec<BlockOp>)], fuel: u64, limit: Option<u64>) -> u64 {
 		let mut retired = 0u64;
 		loop {
 			let at = cpu.pc;
-			let Some((slot, _)) = blocks.iter().enumerate().find(|(_, b)| b.0 == at) else {
-				return retired;
+			let ops = match blocks.iter().find(|b| b.0 == at) {
+				Some(b) => b.1.clone(),
+				None => return retired,
 			};
 			if retired >= fuel {
 				return retired;
 			}
-			retired += cpu.exec_block(slot);
-			// slots were installed 1:1 with block order
-		}
-	}
-
-	fn region_layout(cpu: &Cpu) -> jit::Layout {
-		jit::Layout {
-			x_base: XB, f_base: FB, tlb: None, pc_addr: PCA, gen_addr: GENA,
-			baked_gen: cpu.mmu.code_gen(),
-			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
-		}
-	}
-
-	fn run_region(bytes: &[u8], cpu_pre: &Cpu, entry: u32, fuel: u64) -> (u64, [i64; 32], u64) {
-		let engine = wasmtime::Engine::default();
-		let module = wasmtime::Module::new(&engine, bytes).expect("valid region module");
-		let mut store = wasmtime::Store::new(&engine, ());
-		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
-		{
-			let d = mem.data_mut(&mut store);
-			for i in 0..32 {
-				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
-					.copy_from_slice(&cpu_pre.x[i].to_le_bytes());
+			let gen = cpu.mmu.code_gen();
+			for op in ops.iter() {
+				if Some(retired) == limit {
+					return retired;
+				}
+				let address = cpu.pc;
+				let next = address.wrapping_add(op.len as u64);
+				cpu.pc = next;
+				let result = cpu.exec_op(op, address);
+				cpu.x[0] = 0;
+				retired += 1;
+				if let Err(e) = result {
+					cpu.handle_exception(e, address);
+					return retired;
+				}
+				if cpu.pc != next {
+					break; // taken branch/jump: dispatch again
+				}
+				if op.kind <= HOT_STORE_MAX && cpu.mmu.code_gen() != gen {
+					return retired; // exec_block stops; pc mid-block
+				}
 			}
-			d[GENA as usize..GENA as usize + 4]
-				.copy_from_slice(&cpu_pre.mmu.code_gen().to_le_bytes());
-			let mut win = vec![0u8; WIN as usize];
-			cpu_pre.mmu.read_physical_range(DRAM_BASE, &mut win);
-			d[DB as usize..DB as usize + WIN as usize].copy_from_slice(&win);
 		}
-		let instance = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
-		let run = instance
-			.get_typed_func::<(i64, i32), i64>(&mut store, "run")
-			.unwrap();
-		let retired = run.call(&mut store, (fuel as i64, entry as i32)).unwrap() as u64;
-		let d = mem.data(&store);
-		let mut x = [0i64; 32];
-		for i in 0..32 {
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&d[XB as usize + i * 8..XB as usize + i * 8 + 8]);
-			x[i] = i64::from_le_bytes(b);
-		}
-		let mut b = [0u8; 8];
-		b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
-		(retired, x, u64::from_le_bytes(b))
 	}
 
 	/// two-block counted loop: A does work and loops on itself via BNE,
 	/// falls through to B, which stores the result and leaves the region
-	fn loop_region() -> Vec<(u64, Vec<BlockOp>)> {
-		let a = DRAM_BASE;
-		let b = DRAM_BASE + 12;
+	fn loop_region(base: u64) -> Vec<(u64, Vec<BlockOp>)> {
+		let a = base;
+		let b = base + 12;
 		vec![
 			(a, vec![
 				op(HOT_ADD, 5, 5, 7, 0),      // x5 += x7
@@ -6456,25 +7772,38 @@ mod test_jit_equivalence {
 
 	#[test]
 	fn region_loop_matches_dispatch() {
+		let engine = engine();
 		for &(iters, fuel) in
 			&[(1u64, 1u64 << 40), (7, 1 << 40), (1000, 1 << 40), (1000, 7), (1000, 1700), (5, 0)]
 		{
-			let blocks = loop_region();
+			let blocks = loop_region(DRAM_BASE);
 			let mut cpu = fresh_cpu(&mut Rng(31337));
 			cpu.x[6] = iters as i64;
 			cpu.x[10] = (DRAM_BASE + 9000 & !7) as i64;
-			let lay = region_layout(&cpu);
+			let lay = flat_layout(&cpu);
 			let bytes = jit::emit_region(&blocks, &lay).expect("region emits");
-			let (rw, xw, pcw) = run_region(&bytes, &cpu, 0, fuel);
+			let mut m = flat_mem(&engine, &cpu, 0);
+			let rw = m.call_region(&engine, &bytes, fuel, 0);
+			let (xw, pcw, dramw, _) = flat_state(&m);
 			cpu.update_pc(blocks[0].0);
-			for (slot, (start, ops)) in blocks.iter().enumerate() {
-				cpu.install_block_for_test(slot, *start, 0, ops);
-			}
-			let ri = dispatch_ref(&mut cpu, &blocks, fuel);
+			let ri = region_ref(&mut cpu, &blocks, fuel, None);
 			assert_eq!(ri, rw, "retired mismatch iters={} fuel={}", iters, fuel);
 			assert_eq!(cpu.pc, pcw, "pc mismatch iters={} fuel={}", iters, fuel);
 			assert_eq!(cpu.x, xw, "registers mismatch iters={} fuel={}", iters, fuel);
+			let mut dram_i = vec![0u8; WIN as usize];
+			cpu.mmu.read_physical_range(DRAM_BASE, &mut dram_i);
+			assert_eq!(dram_i, dramw, "dram mismatch iters={} fuel={}", iters, fuel);
 		}
+	}
+
+	#[test]
+	fn region_entry_out_of_range_runs_nothing() {
+		let engine = engine();
+		let cpu = fresh_cpu(&mut Rng(5));
+		let bytes = jit::emit_region(&loop_region(DRAM_BASE), &flat_layout(&cpu)).unwrap();
+		let mut m = flat_mem(&engine, &cpu, 0x1234);
+		assert_eq!(m.call_region(&engine, &bytes, 1000, 2), 0);
+		assert_eq!(m.get64(PCA), 0x1234, "state untouched");
 	}
 
 	#[test]
@@ -6482,142 +7811,533 @@ mod test_jit_equivalence {
 		// synthetic single-page TLB: virtual page V maps to physical page P
 		// inside the DRAM window; everything else must bail.
 		const SETS: u32 = 512;
-		const T_RT: u32 = 8192; // read tags (512 * 8)
-		const T_RM: u32 = 8192 + 4096; // read metas (512 * 4)
-		const T_RP: u32 = 8192 + 4096 + 2048; // read ppns
-		const T_MC: u32 = 8192 + 4096 + 2048 + 4096; // meta cache cell
+		const T_RT: u64 = 0x2_0000; // read tags (512 * 8), clear of the window
+		const T_RM: u64 = T_RT + 4096; // read metas (512 * 4)
+		const T_RP: u64 = T_RM + 2048; // read ppns
+		const T_MC: u64 = T_RP + 4096; // meta cache cell
 		let vpage: u64 = 0x4000_2000; // arbitrary virtual page
 		let ppage: u64 = DRAM_BASE + 0x3000; // physical page in DRAM
 		let meta: u32 = 0xabcd_1234;
+		let engine = engine();
 
 		let mut cpu = fresh_cpu(&mut Rng(4242));
 		cpu.x[10] = (vpage + 0x40) as i64; // pointer into the mapped page
 		cpu.x[11] = 0x5000_0000; // pointer with NO mapping
 		let ops_hit = vec![op(HOT_LD, 5, 10, 0, 8), op(HOT_SD, 0, 10, 6, 16)];
 		let ops_miss = vec![op(HOT_ADDI, 5, 5, 0, 1), op(HOT_LD, 7, 11, 0, 0)];
-		let lay = jit::Layout {
-			x_base: XB, f_base: FB,
-			tlb: Some(jit::TlbLayout {
-				sets: SETS,
-				read_tags: T_RT, read_metas: T_RM, read_ppns: T_RP,
-				// write set shares the arrays in this synthetic setup
-				write_tags: T_RT, write_metas: T_RM, write_ppns: T_RP,
-				meta_cache: T_MC,
-			}),
-			pc_addr: PCA, gen_addr: GENA,
-			baked_gen: cpu.mmu.code_gen(),
-			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
+		let mut lay = flat_layout(&cpu);
+		lay.tlb = Some(jit::TlbLayout {
+			sets: SETS,
+			read_tags: T_RT, read_metas: T_RM, read_ppns: T_RP,
+			// write set shares the arrays in this synthetic setup
+			write_tags: T_RT, write_metas: T_RM, write_ppns: T_RP,
+			meta_cache: T_MC,
+		});
+		let fill_tlb = |m: &mut Mem, cache: u32| {
+			let set = ((vpage >> 12) & (SETS as u64 - 1)) as u64;
+			m.put64(T_RT + set * 8, (vpage & !0xfff) | 1);
+			m.put(T_RM + set * 4, &meta.to_le_bytes());
+			m.put64(T_RP + set * 8, ppage & !0xfff);
+			m.put(T_MC, &cache.to_le_bytes());
 		};
-		let fill_tlb = |d: &mut [u8]| {
-			let set = ((vpage >> 12) & (SETS as u64 - 1)) as usize;
-			let tag = (vpage & !0xfff) | 1;
-			d[T_RT as usize + set * 8..T_RT as usize + set * 8 + 8]
-				.copy_from_slice(&tag.to_le_bytes());
-			d[T_RM as usize + set * 4..T_RM as usize + set * 4 + 4]
-				.copy_from_slice(&meta.to_le_bytes());
-			d[T_RP as usize + set * 8..T_RP as usize + set * 8 + 8]
-				.copy_from_slice(&(ppage & !0xfff).to_le_bytes());
-			d[T_MC as usize..T_MC as usize + 4].copy_from_slice(&meta.to_le_bytes());
+		let mem = |cpu: &Cpu| {
+			let mut m = Mem::new(&engine, false, 3);
+			for i in 0..32 {
+				m.put64(XB + i as u64 * 8, cpu.x[i] as u64);
+			}
+			m.put(GENA, &cpu.mmu.code_gen().to_le_bytes());
+			m
 		};
 
 		// hit case: LD then SD through the mapping run to completion
 		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
-		let engine = wasmtime::Engine::default();
-		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
-		let mut store = wasmtime::Store::new(&engine, ());
-		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
-		{
-			let d = mem.data_mut(&mut store);
-			for i in 0..32 {
-				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
-					.copy_from_slice(&cpu.x[i].to_le_bytes());
-			}
-			d[GENA as usize..GENA as usize + 4]
-				.copy_from_slice(&cpu.mmu.code_gen().to_le_bytes());
-			fill_tlb(d);
-			// plant a known value at the translated load address
-			let lin = DB as u64 + (ppage - DRAM_BASE) + 0x40 + 8;
-			d[lin as usize..lin as usize + 8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
-		}
-		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
-		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
-		let retired = run.call(&mut store, ()).unwrap();
-		assert_eq!(retired, 2, "hit case must complete");
-		{
-			let d = mem.data(&store);
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&d[XB as usize + 5 * 8..XB as usize + 5 * 8 + 8]);
-			assert_eq!(u64::from_le_bytes(b), 0x1122_3344_5566_7788, "loaded through mapping");
-			// the SD wrote x6 at translated +0x40+16
-			let lin = DB as u64 + (ppage - DRAM_BASE) + 0x40 + 16;
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&d[lin as usize..lin as usize + 8]);
-			assert_eq!(i64::from_le_bytes(b), cpu.x[6], "stored through mapping");
-		}
+		let mut m = mem(&cpu);
+		fill_tlb(&mut m, meta);
+		let lin = DB + (ppage - DRAM_BASE) + 0x40;
+		m.put64(lin + 8, 0x1122_3344_5566_7788);
+		assert_eq!(m.call_block(&engine, &bytes), 2, "hit case must complete");
+		assert_eq!(m.get64(XB + 5 * 8), 0x1122_3344_5566_7788, "loaded through mapping");
+		assert_eq!(m.get64(lin + 16) as i64, cpu.x[6], "stored through mapping");
 
 		// miss case: first op runs, the unmapped LD bails with pc at it
 		let bytes = jit::emit_block(&ops_miss, DRAM_BASE, &lay).unwrap();
-		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
-		let mut store = wasmtime::Store::new(&engine, ());
-		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
-		{
-			let d = mem.data_mut(&mut store);
-			for i in 0..32 {
-				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
-					.copy_from_slice(&cpu.x[i].to_le_bytes());
-			}
-			fill_tlb(d);
-		}
-		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
-		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
-		let retired = run.call(&mut store, ()).unwrap();
-		assert_eq!(retired, 1, "miss bails before the load");
-		{
-			let d = mem.data(&store);
-			let mut b = [0u8; 8];
-			b.copy_from_slice(&d[PCA as usize..PCA as usize + 8]);
-			assert_eq!(u64::from_le_bytes(b), DRAM_BASE + 4, "pc at the bailing op");
-		}
+		let mut m = mem(&cpu);
+		fill_tlb(&mut m, meta);
+		assert_eq!(m.call_block(&engine, &bytes), 1, "miss bails before the load");
+		assert_eq!(m.get64(PCA), DRAM_BASE + 4, "pc at the bailing op");
 
 		// stale meta: flip the cache cell; the mapped LD must now bail at op 0
 		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
-		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
-		let mut store = wasmtime::Store::new(&engine, ());
-		let mem = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).unwrap();
-		{
-			let d = mem.data_mut(&mut store);
-			for i in 0..32 {
-				d[XB as usize + i * 8..XB as usize + i * 8 + 8]
-					.copy_from_slice(&cpu.x[i].to_le_bytes());
-			}
-			fill_tlb(d);
-			d[T_MC as usize..T_MC as usize + 4].copy_from_slice(&meta.wrapping_add(1).to_le_bytes());
-		}
-		let inst = wasmtime::Instance::new(&mut store, &module, &[mem.into()]).unwrap();
-		let run = inst.get_typed_func::<(), i64>(&mut store, "run").unwrap();
-		let retired = run.call(&mut store, ()).unwrap();
-		assert_eq!(retired, 0, "stale meta bails immediately");
+		let mut m = mem(&cpu);
+		fill_tlb(&mut m, meta.wrapping_add(1));
+		assert_eq!(m.call_block(&engine, &bytes), 0, "stale meta bails immediately");
+
+		// cross-page access: an LD at page offset 0xffc bails, never splits
+		cpu.x[10] = (vpage + 0xffc - 8) as i64;
+		let mut m = mem(&cpu);
+		fill_tlb(&mut m, meta);
+		let bytes = jit::emit_block(&ops_hit, DRAM_BASE, &lay).unwrap();
+		assert_eq!(m.call_block(&engine, &bytes), 0, "cross-page access bails");
 	}
 
 	#[test]
 	fn store_bails_on_stale_generation() {
+		let engine = engine();
 		let mut r = Rng(97);
 		let cpu = fresh_cpu(&mut r);
 		let ops = vec![
-			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 5, rs1: 6, rs2: 0, len: 4, _pad: 0 },
-			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_SD, rd: 0, rs1: 10, rs2: 7, len: 4, _pad: 0 },
-			BlockOp { imm: 0, word: 0, data: 0, kind: HOT_ADDI, rd: 8, rs1: 9, rs2: 0, len: 4, _pad: 0 },
+			op(HOT_ADDI, 5, 6, 0, 0),
+			op(HOT_SD, 0, 10, 7, 0),
+			op(HOT_ADDI, 8, 9, 0, 0),
 		];
-		let lay = jit::Layout {
-			x_base: XB, f_base: FB, tlb: None, pc_addr: PCA, gen_addr: GENA,
-			baked_gen: cpu.mmu.code_gen().wrapping_add(1), // stale on purpose
-			dram_base: DB, guest_dram_base: DRAM_BASE, dram_len: WIN,
-		};
+		let mut lay = flat_layout(&cpu);
+		lay.baked_gen = cpu.mmu.code_gen().wrapping_add(1); // stale on purpose
 		let bytes = jit::emit_block(&ops, DRAM_BASE, &lay).unwrap();
-		let (retired, _x, pc, _d, _f) = run_wasm(&bytes, &cpu, DRAM_BASE);
+		let mut m = flat_mem(&engine, &cpu, DRAM_BASE);
 		// the store executes, the gen check fires after it: 2 retired,
 		// pc at the third op
-		assert_eq!(retired, 2);
-		assert_eq!(pc, DRAM_BASE + 8);
+		assert_eq!(m.call_block(&engine, &bytes), 2);
+		assert_eq!(m.get64(PCA), DRAM_BASE + 8);
+	}
+
+	// ---- the production shape: memory64, chunked RAM, SV39, bias -------
+
+	const RAM: u64 = 4 << 16; // 4 chunks
+	const VBASE: u64 = 0x4000_0000; // mapped virtual window
+	const VPAGES: u64 = 40;
+	const PT_ROOT: u64 = DRAM_BASE + 0x3_0000; // page tables live in chunk 3
+	const STORE_BAIL: (u64, u64) = (0x2_8000, 0x2_9000); // DRAM offsets
+	// synthetic linear layout, all above 4 GiB except the context block
+	const CTX64: u64 = 0x100;
+	const HI: u64 = 0x1_0000_0000;
+	const STATE: u64 = HI + 0x1_0000; // x +0, pc +0x100, f +0x200, TLB +0x1000..
+	const RDT: u64 = HI + 0x2_0000;
+	const WRT: u64 = HI + 0x2_1000;
+	const MARKS: u64 = HI + 0x2_2000;
+	const CHUNKS: u64 = HI + 0x10_0000; // chunk i at CHUNKS + i * 64 KiB
+	const PAGES64: u64 = (CHUNKS + 8 * 0x1_0000) / 0x1_0000;
+
+	fn s_x(i: usize) -> u64 { STATE + i as u64 * 8 }
+	fn s_f(i: usize) -> u64 { STATE + 0x200 + i as u64 * 8 }
+	const S_PC: u64 = 0x100;
+
+	fn chunked_layout(memory64: bool) -> jit::Layout {
+		jit::Layout {
+			memory64,
+			shared: false,
+			max_pages: None,
+			ctx: CTX64,
+			x_base: 0,
+			f_base: 0x200,
+			pc_addr: S_PC,
+			gen_addr: 0,
+			baked_gen: 0,
+			tlb: Some(jit::TlbLayout {
+				sets: 512,
+				read_tags: 0x1000,
+				read_metas: 0x2000,
+				read_ppns: 0x3000,
+				write_tags: 0x4000,
+				write_metas: 0x5000,
+				write_ppns: 0x6000,
+				meta_cache: 0x7000,
+			}),
+			guest_dram_base: DRAM_BASE,
+			dram_len: RAM,
+			ram: jit::Ram::Chunked { store_bail: vec![STORE_BAIL] },
+		}
+	}
+
+	/// A machine with SV39 paging on in S-mode: VPAGES virtual pages at
+	/// VBASE map to shuffled physical pages of chunks 0..2 (some read-only,
+	/// some unmapped), the TLB warmed for most of them (read and/or write),
+	/// RAM part owned and part shared (copy-on-write), a few data pages
+	/// marked executable. Deterministic per seed.
+	fn paged_cpu(seed: u64) -> Cpu {
+		let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+		let mut cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		cpu.get_mut_mmu().init_memory(RAM);
+		for a in (0..RAM).step_by(8) {
+			let v = r.next();
+			let _ = cpu.mmu.store_doubleword(DRAM_BASE + a, v);
+		}
+		// page tables: root -> L1 -> L0, VBASE has vpn2 = 1, vpn1 = 0
+		let (l1, l0) = (PT_ROOT + 0x1000, PT_ROOT + 0x2000);
+		for i in 0..512 * 3 {
+			let _ = cpu.mmu.store_doubleword(PT_ROOT + i * 8, 0);
+		}
+		let _ = cpu.mmu.store_doubleword(PT_ROOT + 8, ((l1 >> 12) << 10) | 1);
+		let _ = cpu.mmu.store_doubleword(l1, ((l0 >> 12) << 10) | 1);
+		let mut phys: Vec<u64> = (0..48).collect(); // pages of chunks 0..2
+		for i in (1..phys.len()).rev() {
+			let j = (r.next() % (i as u64 + 1)) as usize;
+			phys.swap(i, j);
+		}
+		let mut writable = vec![false; VPAGES as usize];
+		for i in 0..VPAGES as usize {
+			let pa = DRAM_BASE + phys[i] * 0x1000;
+			let pte = match r.next() % 8 {
+				0 => 0, // unmapped
+				1 => ((pa >> 12) << 10) | 0x43, // V R A: read-only
+				_ => {
+					writable[i] = true;
+					((pa >> 12) << 10) | 0xc7 // V R W A D
+				}
+			};
+			let _ = cpu.mmu.store_doubleword(l0 + i as u64 * 8, pte);
+		}
+		cpu.update_addressing_mode((8 << 60) | (PT_ROOT >> 12));
+		cpu.privilege_mode = PrivilegeMode::Supervisor;
+		cpu.mmu.update_privilege_mode(PrivilegeMode::Supervisor);
+		// pointer registers: mostly well inside a mapped page, sometimes at
+		// an unaligned offset near its end (accesses straddle the page)
+		let mut ptr_pages = [0u64; 4];
+		for p in 10..14 {
+			let page = r.next() % VPAGES;
+			let off = match r.next() % 6 {
+				0 => 0xff0,
+				1 => 0xffb,
+				2 => r.next() % 0x700,
+				_ => r.next() % 0x700 & !7,
+			};
+			ptr_pages[p - 10] = page;
+			cpu.x[p] = (VBASE + page * 0x1000 + off) as i64;
+		}
+		// warm the TLB: reads for most pages, writes for some writable ones
+		let warm = |cpu: &mut Cpu, r: &mut Rng, skip: Option<u64>| {
+			for i in 0..VPAGES {
+				let va = VBASE + i * 0x1000;
+				if Some(i) == skip {
+					continue;
+				}
+				if r.next() % 6 != 0 {
+					let _ = cpu.mmu.load_doubleword(va);
+				}
+				if writable[i as usize] && r.next() % 3 != 0 {
+					if let Ok(v) = cpu.mmu.load_doubleword(va + 8) {
+						let _ = cpu.mmu.store_doubleword(va + 8, v);
+					}
+				}
+			}
+		};
+		warm(&mut cpu, &mut r, None);
+		if seed % 2 == 0 {
+			// A stale translation: remap x10's page to another frame after
+			// its TLB entries were filled, SFENCE (new meta), and re-warm
+			// everything else. The old entries keep a matching tag and the
+			// OLD frame; only the meta says they are dead.
+			let page = ptr_pages[0];
+			let pte_at = l0 + page * 8;
+			let pte = cpu.mmu.load_doubleword_phys(pte_at);
+			if pte & 1 != 0 {
+				let frame = DRAM_BASE + phys[VPAGES as usize + (r.next() % 8) as usize] * 0x1000;
+				cpu.mmu.store_doubleword_phys(pte_at, ((frame >> 12) << 10) | (pte & 0x3ff));
+				cpu.mmu.sfence_vma();
+				warm(&mut cpu, &mut r, Some(page));
+			}
+		}
+		// copy-on-write: share everything, then re-own two chunks
+		let _image = cpu.mmu.share_ram();
+		for c in 0..4u64 {
+			if r.next() % 2 == 0 {
+				let p = DRAM_BASE + c * 0x1_0000 + 0x10;
+				let b = cpu.mmu.load_word_raw(p);
+				cpu.mmu.store_raw(p, b as u8);
+			}
+		}
+		// executable marks on a few data pages
+		for _ in 0..3 {
+			let _ = cpu.mmu.mark_exec_page(DRAM_BASE + phys[(r.next() % VPAGES) as usize] * 0x1000);
+		}
+		for i in 1..32 {
+			if !(10..14).contains(&i) {
+				cpu.x[i] = r.next() as i64;
+			}
+		}
+		for i in 0..32 {
+			cpu.f[i] = (r.next() % 2000000) as f64 / 1000.0 - 1000.0;
+		}
+		cpu
+	}
+
+	/// Serialize a paged, chunked machine into the synthetic memory64
+	/// layout: registers and pc, the machine's REAL TLB ways and meta, its
+	/// chunk tables (write pointers only where the machine owns the chunk)
+	/// and exec-page marks, and the context block.
+	fn chunked_mem(engine: &wasmtime::Engine, cpu: &Cpu, bias: u64) -> Mem {
+		let mut m = Mem::new(engine, true, PAGES64);
+		for i in 0..32 {
+			m.put64(s_x(i), cpu.x[i] as u64);
+			m.put64(s_f(i), cpu.f[i].to_bits());
+		}
+		m.put64(STATE + S_PC, cpu.pc);
+		let (tlb, _) = cpu.mmu.jit_tlb();
+		let raw = |a: u64, n: usize| unsafe { std::slice::from_raw_parts(a as usize as *const u8, n) }.to_vec();
+		for (i, &(off, n)) in [(0x1000u64, 4096usize), (0x2000, 2048), (0x3000, 4096),
+			(0x4000, 4096), (0x5000, 2048), (0x6000, 4096), (0x7000, 4)].iter().enumerate() {
+			m.put(STATE + off, &raw(tlb[i], n));
+		}
+		let (rd, wr, marks, len) = cpu.mmu.jit_ram();
+		assert_eq!(len, RAM);
+		for c in 0..(RAM >> 16) {
+			let mut data = vec![0u8; 0x1_0000];
+			cpu.mmu.read_physical_range(DRAM_BASE + (c << 16), &mut data);
+			let at = CHUNKS + c * 0x1_0000;
+			m.put(at, &data);
+			let owned = unsafe { !(*(wr as usize as *const *mut u8).add(c as usize)).is_null() };
+			let _ = rd;
+			m.put64(RDT + c * 8, at);
+			m.put64(WRT + c * 8, if owned { at } else { 0 });
+		}
+		m.put(MARKS, &raw(marks, (RAM >> 12) as usize));
+		m.put64(CTX64 + jit::CTX_BASE, STATE);
+		m.put64(CTX64 + jit::CTX_RD, RDT);
+		m.put64(CTX64 + jit::CTX_WR, WRT);
+		m.put64(CTX64 + jit::CTX_MARKS, MARKS);
+		m.put64(CTX64 + jit::CTX_BIAS, bias);
+		m
+	}
+
+	/// The compiled side's architectural state vs a reference machine.
+	fn assert_same(m: &Mem, cpu: &Cpu, what: &str) {
+		for i in 0..32 {
+			assert_eq!(m.get64(s_x(i)) as i64, cpu.x[i], "x{} {}", i, what);
+			assert_eq!(m.get64(s_f(i)), cpu.f[i].to_bits(), "f{} {}", i, what);
+		}
+		assert_eq!(m.get64(STATE + S_PC), cpu.pc, "pc {}", what);
+		for c in 0..(RAM >> 16) {
+			let mut data = vec![0u8; 0x1_0000];
+			cpu.mmu.read_physical_range(DRAM_BASE + (c << 16), &mut data);
+			assert!(m.get(CHUNKS + c * 0x1_0000, 0x1_0000) == data, "chunk {} {}", c, what);
+		}
+	}
+
+	/// Run `blocks` (module pcs) compiled at `bias` from entry 0 and check
+	/// it against the reference — fully when the module ran to a region
+	/// exit, else at the exact op it bailed before. Returns (retired by the
+	/// module, whether it bailed early).
+	fn check_region(engine: &wasmtime::Engine, seed: u64, blocks: &[(u64, Vec<BlockOp>)], bias: u64,
+		fuel: u64, setup: &dyn Fn(&mut Cpu)) -> (u64, bool)
+	{
+		let lay = chunked_layout(true);
+		let bytes = jit::emit_region(blocks, &lay).expect("region emits");
+		let rt: Vec<(u64, Vec<BlockOp>)> = blocks.iter().map(|b| (b.0.wrapping_add(bias), b.1.clone())).collect();
+		let fresh = || {
+			let mut c = paged_cpu(seed);
+			setup(&mut c);
+			c.update_pc(rt[0].0);
+			c
+		};
+		let cpu = fresh();
+		let mut m = chunked_mem(engine, &cpu, bias);
+		let rw = m.call_region(engine, &bytes, fuel, 0);
+		let mut full = fresh();
+		let ri = region_ref(&mut full, &rt, fuel, None);
+		if ri == rw && full.pc == m.get64(STATE + S_PC) {
+			assert_same(&m, &full, &format!("seed {} (completed, {} retired)", seed, rw));
+			return (rw, false);
+		}
+		assert!(rw < ri, "seed {}: module retired {} past the reference's {}", seed, rw, ri);
+		let mut part = fresh();
+		let rp = region_ref(&mut part, &rt, fuel, Some(rw));
+		assert_eq!(rp, rw, "seed {}", seed);
+		assert_same(&m, &part, &format!("seed {} (bailed after {} of {})", seed, rw, ri));
+		(rw, true)
+	}
+
+	#[test]
+	fn chunked_paged_blocks_match_interpreter() {
+		let engine = engine();
+		let (mut completed, mut bailed, mut ops_run) = (0, 0, 0u64);
+		for seed in 1..300u64 {
+			let mut r = Rng(seed * 7919 | 1);
+			let len = 2 + (r.next() % 14) as usize;
+			let mut ops = rand_ops(&mut r, len);
+			// small, unaligned displacements: with the pointers' near-end
+			// offsets these straddle pages
+			for o in ops.iter_mut() {
+				let mem = matches!(o.kind, HOT_SB..=HOT_FSD | HOT_LD | HOT_LW | HOT_LWU | HOT_LH
+					| HOT_LHU | HOT_LB | HOT_LBU | HOT_FLD | HOT_FLW);
+				if mem && r.next() % 3 == 0 {
+					o.imm = (r.next() % 8) as i32;
+				}
+			}
+			let bias = match seed % 3 {
+				0 => 0,
+				_ => (r.next() & 0x3f_ffff) << 12,
+			};
+			let rel = 0x2000 + (r.next() % 0x300) * 4;
+			// fuel-bounded: a block branching to its own start loops in-region
+			let (rw, b) = check_region(&engine, seed, &[(rel, ops)], bias, 500, &|_| {});
+			ops_run += rw;
+			if b { bailed += 1 } else { completed += 1 }
+		}
+		eprintln!("chunked blocks: {} completed, {} bailed, {} ops compiled-run", completed, bailed, ops_run);
+		assert!(completed > 120 && bailed > 20, "coverage of both paths: {} / {}", completed, bailed);
+	}
+
+	/// Random regions of 2..6 member blocks at a nonzero bias, each ending
+	/// in a branch, JAL or JALR to another member (or out), with x5..x7
+	/// holding RUNTIME member pcs for the JALRs: in-region transfers,
+	/// indirect dispatch and fuel exits against the reference.
+	#[test]
+	fn chunked_regions_with_bias_and_indirect_jumps_match() {
+		let engine = engine();
+		let (mut transfers, mut cases) = (0, 0);
+		for seed in 1..200u64 {
+			let mut r = Rng(seed * 104729 | 1);
+			let n = 2 + (r.next() % 5) as usize;
+			let starts: Vec<u64> = (0..n as u64).map(|i| 0x1000 + i * 0x100 + (r.next() % 8) * 4).collect();
+			let bias = (1 + (r.next() & 0xffff)) << 12;
+			let mut blocks = Vec::new();
+			let mut body_len = 0;
+			for (i, &s) in starts.iter().enumerate() {
+				let len = 1 + (r.next() % 6) as usize;
+				let mut ops = rand_ops(&mut r, len);
+				// keep control flow for the terminator
+				ops.retain(|o| !matches!(o.kind, HOT_BEQ..=HOT_BGEU | HOT_JAL | HOT_JALR));
+				if ops.is_empty() {
+					ops.push(op(HOT_ADDI, 28, 28, 0, 1));
+				}
+				body_len += ops.len();
+				let here = s + ops.len() as u64 * 4;
+				let to = starts[(r.next() as usize) % n];
+				let rel = (to.wrapping_sub(here)) as i32;
+				let term = match r.next() % 5 {
+					0 => op(HOT_BNE, 0, 28, 0, rel),
+					1 => op(HOT_BEQ, 0, 0, 0, rel), // always taken
+					2 => op(HOT_JAL, if r.next() % 2 == 0 { 1 } else { 0 }, 0, 0, rel),
+					3 => op(HOT_JALR, 1, 5 + (r.next() % 3) as u8, 0, 0),
+					_ => op(HOT_ADDI, 29, 29, 0, i as i32), // fall out
+				};
+				ops.push(term);
+				blocks.push((s, ops));
+			}
+			let targets: Vec<u64> = (0..3).map(|_| match r.next() % 4 {
+				0 => bias + 0x1000 + 0x8000, // not a member
+				_ => bias + starts[(r.next() as usize) % n],
+			}).collect();
+			let fuel = 20 + r.next() % 400;
+			let setup = move |c: &mut Cpu| {
+				for k in 0..3 {
+					c.x[5 + k] = targets[k] as i64;
+				}
+			};
+			let (rw, _) = check_region(&engine, seed, &blocks, bias, fuel, &setup);
+			if rw > body_len as u64 {
+				transfers += 1;
+			}
+			cases += 1;
+		}
+		assert!(transfers > cases / 4, "in-region transfers exercised: {} of {}", transfers, cases);
+	}
+
+	/// A call and return inside one region: JAL into a helper block, JALR
+	/// back through the indirect dispatcher to the continuation block, a
+	/// loop around both — the whole thing must stay compiled.
+	#[test]
+	fn call_and_return_stay_in_region() {
+		let engine = engine();
+		let base = 0x3000u64;
+		// a: x6 -= 1; call helper | cont (= the return address): loop to a
+		let (a, cont, helper) = (base, base + 8, base + 0x40);
+		let blocks = vec![
+			(a, vec![op(HOT_ADDI, 6, 6, 0, -1), op(HOT_JAL, 1, 0, 0, (helper - (a + 4)) as i32)]),
+			(cont, vec![op(HOT_BNE, 0, 6, 0, (a as i64 - cont as i64) as i32)]),
+			(helper, vec![op(HOT_ADD, 28, 28, 6, 0), op(HOT_JALR, 0, 1, 0, 0)]),
+		];
+		let bias = 0x7f00_0000;
+		let (rw, bailed) = check_region(&engine, 11, &blocks, bias, 1 << 30, &|c| {
+			c.x[6] = 50;
+			c.x[28] = 0;
+		});
+		assert!(!bailed);
+		assert_eq!(rw, 50 * 5, "every iteration ran compiled");
+	}
+
+	/// The production import shape: shared memory64 with a declared
+	/// maximum. Instantiates against a shared memory and runs.
+	#[test]
+	fn shared_memory64_import_instantiates_and_runs() {
+		let engine = engine();
+		let mut lay = chunked_layout(true);
+		lay.shared = true;
+		lay.max_pages = Some(1 << 10);
+		lay.tlb = None;
+		lay.ram = jit::Ram::Flat { dram_base: 0x8_0000 };
+		lay.ctx = 0x100;
+		lay.dram_len = 0x1000;
+		// state base 0x1000 (x at +0, pc at +0x100)
+		let ops = vec![op(HOT_ADDI, 5, 5, 0, 7), op(HOT_LD, 6, 10, 0, 8)];
+		let bytes = jit::emit_region(&[(0, ops)], &lay).unwrap();
+		let ty = wasmtime::MemoryTypeBuilder::default().memory64(true).shared(true).min(16).max(Some(1 << 10)).build().unwrap();
+		let shm = wasmtime::SharedMemory::new(&engine, ty).unwrap();
+		let mut store = wasmtime::Store::new(&engine, ());
+		let module = wasmtime::Module::new(&engine, &bytes).unwrap();
+		let put = |at: u64, v: u64| {
+			for (i, b) in v.to_le_bytes().iter().enumerate() {
+				unsafe { *shm.data()[at as usize + i].get() = *b };
+			}
+		};
+		put(0x100 + jit::CTX_BASE, 0x1000);
+		put(0x100 + jit::CTX_BIAS, DRAM_BASE);
+		put(0x1000 + 5 * 8, 35);
+		put(0x1000 + 10 * 8, DRAM_BASE + 0x10);
+		put(0x8_0000 + 0x18, 0xfeed);
+		let inst = wasmtime::Instance::new(&mut store, &module, &[shm.clone().into()]).unwrap();
+		let run = inst.get_typed_func::<(i64, i32), i64>(&mut store, "run").unwrap();
+		assert_eq!(run.call(&mut store, (100, 0)).unwrap(), 2);
+		let get = |at: u64| {
+			let mut b = [0u8; 8];
+			for i in 0..8 {
+				b[i] = unsafe { *shm.data()[at as usize + i].get() };
+			}
+			u64::from_le_bytes(b)
+		};
+		assert_eq!(get(0x1000 + 5 * 8), 42);
+		assert_eq!(get(0x1000 + 6 * 8), 0xfeed);
+		assert_eq!(get(0x1000 + 0x100), DRAM_BASE + 8, "pc = bias + fallthrough");
+	}
+
+	/// Store-side bails under chunked RAM, one cause at a time: the module
+	/// stops BEFORE the store (pc exact, nothing written) when the chunk is
+	/// not owned, the page is marked executable, or the store lands in a
+	/// bookkeeping window; and runs it when none applies.
+	#[test]
+	fn chunked_store_bails_are_exact() {
+		let engine = engine();
+		let mut cpu = Cpu::new(Box::new(DummyTerminal::new()));
+		cpu.get_mut_mmu().init_memory(RAM);
+		cpu.x[10] = (DRAM_BASE + 0x1_0100) as i64; // chunk 1
+		cpu.x[11] = 0x5555;
+		cpu.update_pc(DRAM_BASE);
+		let ops = vec![op(HOT_ADDI, 12, 12, 0, 1), op(HOT_SD, 0, 10, 11, 0), op(HOT_ADDI, 13, 13, 0, 1)];
+		let mut lay = chunked_layout(true);
+		lay.tlb = None; // bare: physical addresses
+		let bytes = jit::emit_region(&[(0, ops)], &lay).unwrap();
+		let run = |cpu: &Cpu| {
+			let mut m = chunked_mem(&engine, cpu, DRAM_BASE);
+			let rw = m.call_region(&engine, &bytes, 100, 0);
+			(rw, m.get64(STATE + S_PC), m.get64(CHUNKS + 0x1_0100))
+		};
+		// chunk 1 never written: Zero, no write pointer
+		assert_eq!(run(&cpu), (1, DRAM_BASE + 4, 0), "zero chunk: bail before the store");
+		cpu.mmu.store_raw(DRAM_BASE + 0x1_0000, 1); // owned now
+		assert_eq!(run(&cpu), (3, DRAM_BASE + 12, 0x5555), "owned chunk: the store runs");
+		let _ = cpu.mmu.share_ram();
+		assert_eq!(run(&cpu).0, 1, "shared chunk: bail (copy-on-write is the interpreter's)");
+		cpu.mmu.store_raw(DRAM_BASE + 0x1_0000, 1);
+		assert!(cpu.mmu.mark_exec_page(DRAM_BASE + 0x1_0100));
+		assert_eq!(run(&cpu).0, 1, "executable page: bail");
+		cpu.mmu.store_raw(DRAM_BASE + 0x2_0000, 1); // a store to an unmarked page...
+		let _ = cpu.mmu.store_doubleword(DRAM_BASE + 0x1_0000, 0); // ...and one to the marked page bumps the generation
+		cpu.x[10] = (DRAM_BASE + STORE_BAIL.0 + 0x10) as i64;
+		cpu.mmu.store_raw(DRAM_BASE + STORE_BAIL.0, 1);
+		assert_eq!(run(&cpu).0, 1, "bookkeeping window: bail");
+		cpu.x[10] = (DRAM_BASE + STORE_BAIL.1) as i64;
+		cpu.mmu.store_raw(DRAM_BASE + STORE_BAIL.1, 1);
+		assert_eq!(run(&cpu).0, 3, "just past the window: runs");
+		cpu.x[10] = (DRAM_BASE + RAM) as i64;
+		assert_eq!(run(&cpu).0, 1, "past the end of DRAM: bail");
 	}
 }
