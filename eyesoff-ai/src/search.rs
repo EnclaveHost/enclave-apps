@@ -3,8 +3,8 @@
 //! The whole point of running the model in an enclave is that the
 //! conversation does not leave it. So the search leg is server-side: the
 //! browser posts a question to this app and nothing else, and the app dials
-//! the search provider itself, from the deployment's own dedicated egress
-//! identity. A browser-side fetch would have leaked the query straight from
+//! the search provider itself, from the deployment's configured egress
+//! route. A browser-side fetch would have leaked the query straight from
 //! the user's IP to a third party and made the enclave pointless for exactly
 //! the requests that most need it.
 //!
@@ -14,34 +14,13 @@
 //! or the rest of the conversation. A deployment that cannot accept even that
 //! leaves `search` unset and the feature is simply off.
 //!
-//! READ THIS BEFORE PICKING A PROVIDER. A deployment's outbound egress leaves
-//! from its own dedicated IPv6 and is IPv6-ONLY: a host that publishes no AAAA
-//! record cannot be dialled from here at all, and the failure looks like a
-//! bare ErrorCode::ConnectionRefused. Measured against a live deployment
-//! (2026-07-29): example.com, en.wikipedia.org, api.exa.ai and serpapi.com
-//! connected; api.search.brave.com, google.serper.dev and html.duckduckgo.com
-//! were refused. Check any candidate with `dig AAAA <host>` FIRST.
+//! Providers are selected in configuration: Exa, SearXNG, Brave, Serper and
+//! DuckDuckGo use the deployment's outbound route. Reachability depends on
+//! the current route and destination; no provider is rejected merely for
+//! lacking an AAAA record. DuckDuckGo scraping remains best effort.
 //!
-//! Providers are config-selected so a deployment picks its own trust anchor:
-//!
-//!   exa     - api.exa.ai, `x-api-key`. DUAL-STACK, so it works here, and it
-//!             returns page text inline, which also solves the fetch_pages
-//!             problem below. The recommended provider on this platform.
-//!   searxng - any SearXNG `endpoint` with `format=json`. Works if the
-//!             instance has IPv6. The private option: point it at one you run
-//!             and no commercial provider is in the path at all.
-//!   serpapi - not implemented, but dual-stack if you want to add it.
-//!   brave   - api.search.brave.com, `X-Subscription-Token`. IPv4-ONLY:
-//!             UNREACHABLE from a deployment as the fleet stands.
-//!   serper  - google.serper.dev, `X-API-KEY`. IPv4-only, same story.
-//!   ddg     - html.duckduckgo.com scraped, no key. IPv4-only, so it is
-//!             unreachable here too - it survives only for local dev, where
-//!             it is also best-effort scraping that DuckDuckGo rate-limits.
-//!
-//! The same IPv6 constraint applies to `fetch_pages`, which dials each RESULT
-//! site directly: most of the web is IPv4-only, so those fetches fail
-//! individually and quietly (the hit keeps its snippet). Prefer a provider
-//! that returns text inline.
+//! Exa can return page text inline. Other providers can fetch result pages
+//! separately; an unavailable page keeps its search snippet.
 
 use serde::Deserialize;
 
@@ -371,14 +350,8 @@ fn search_serper(cfg: &SearchConfig, query: &str) -> Result<Vec<Hit>, String> {
         .unwrap_or_default())
 }
 
-/// Exa (api.exa.ai) - the provider that actually works from an enclave.
-///
-/// Dual-stack, so it is reachable over the IPv6-only egress, and it returns
-/// page TEXT inline with the results. That second property matters more than
-/// it looks: `fetch_pages` dials each result site directly, and most of the
-/// web is IPv4-only, so on this platform those fetches fail one by one and
-/// the model is left with snippets. Asking Exa for the text moves that work
-/// to a host that CAN reach them, and costs one round trip instead of N.
+/// Exa can include page text in the search response, avoiding separate
+/// requests to individual result sites.
 fn search_exa(cfg: &SearchConfig, query: &str) -> Result<Vec<Hit>, String> {
     let key = cfg.key().ok_or_else(|| missing_key_err(cfg, "exa", "x-api-key"))?;
     let url = cfg.endpoint.as_deref().unwrap_or("https://api.exa.ai/search");
