@@ -1412,6 +1412,7 @@ fn jit_enable(emu: &mut Emulator) {
     if let Some(v) = num("RISC_JIT_HEAT") {
         p.compile_heat = v;
     }
+    p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
     let fuel = p.fuel;
     match emu.jit_enable(p) {
         true => eprintln!("[risc-box] jit on: hot regions compile through enclave:codegen (fuel {fuel})"),
@@ -1430,10 +1431,12 @@ fn jit_json(emu: Option<&Emulator>) -> String {
     format!(
         ",\"jit\":{{\"calls\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
          \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
+         \"volatile\":{},\"formMs\":{:.1},\
          \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
          \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{}}}",
         s.calls, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
         s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
+        s.volatile, s.form_us as f64 / 1000.0,
         v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
         v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
         v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),

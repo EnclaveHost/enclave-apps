@@ -650,6 +650,7 @@ pub struct Tier2State {
 pub struct JitState {
 	t2: ::jit::Tier2,
 	lay: ::jit::Layout,
+	lay_hash: u64,
 	/// direct-mapped by the same index as block_heads
 	slots: Vec<JitSlot>,
 	regions: Vec<JitRegion>,
@@ -695,6 +696,8 @@ pub struct JitParams {
 	pub max_module_bytes: usize,
 	/// the app memory's declared maximum, in 64 KiB pages
 	pub max_pages: u64,
+	/// one stderr line per formation pass
+	pub trace: bool,
 }
 
 #[cfg(feature = "codegen")]
@@ -703,14 +706,18 @@ impl Default for JitParams {
 		JitParams {
 			fuel: 256,
 			form_interval: 50_000_000,
-			seed_heat: 8_000,
-			compile_heat: 24_000,
+			// sampled heat: 1 window of 2^18 retired in 2^6 is recorded, so
+			// these are 1/64 of the true counts per 50M-instruction pass
+			// (seed ~0.25%, compile ~0.8% of the pass, before escalation)
+			seed_heat: 2_000,
+			compile_heat: 6_000,
 			max_blocks: 64,
 			max_compiles_per_pass: 4,
 			sample_shift: 18,
-			sample_period: 4,
+			sample_period: 6,
 			max_module_bytes: 128 * 1024,
 			max_pages: 1 << 18, // --max-memory=17179869184
+			trace: false,
 		}
 	}
 }
@@ -736,6 +743,8 @@ pub struct JitStats {
 	pub resets: u64,
 	/// blocks excluded from formation because their code changed
 	pub volatile: u64,
+	/// time spent forming (and emitting/compiling) regions, microseconds
+	pub form_us: u64,
 }
 
 #[cfg(feature = "codegen")]
@@ -759,8 +768,9 @@ struct JitRegion {
 	/// runtime start pc of each member block, in module block order, with
 	/// the (uncompressed word, length) stream the module was built from
 	members: Vec<(u64, Vec<(u32, u8)>)>,
-	/// physical page of each member, from the last content proof
-	phys: Vec<u64>,
+	/// (virtual page, physical page) of every page the members start on,
+	/// from the last content proof: what the mapping re-probe checks
+	pages: Vec<(u64, u64)>,
 	/// write-snoop generation of the last successful content proof (0: none)
 	proof_gen: u32,
 	/// (generation, TLB meta) of the last check, and its verdict — a failed
@@ -811,7 +821,7 @@ impl JitState {
 		if r.refs == 0 {
 			self.instances.remove(&(r.index, r.bias));
 			r.members = Vec::new();
-			r.phys = Vec::new();
+			r.pages = Vec::new();
 			r.ok = false;
 			r.proof_gen = 0;
 			r.checked = (0, 0);
@@ -827,7 +837,7 @@ impl JitState {
 			return rid;
 		}
 		let r = JitRegion {
-			index, bias, members, phys: Vec::new(), proof_gen: 0, checked: (0, 0), ok: false, refs: 0,
+			index, bias, members, pages: Vec::new(), proof_gen: 0, checked: (0, 0), ok: false, refs: 0,
 		};
 		let rid = match self.free.pop() {
 			Some(rid) => {
@@ -1541,9 +1551,11 @@ impl Cpu {
 		t2.min_heat = params.seed_heat;
 		t2.form_interval = params.form_interval;
 		let lay = self.jit_layout(params.max_pages);
+		let lay_hash = ::jit::layout_hash(&lay);
 		self.jit = Some(Box::new(JitState {
 			t2,
 			lay,
+			lay_hash,
 			slots: vec![JitSlot::EMPTY; BLOCK_SLOTS],
 			regions: Vec::new(),
 			free: Vec::new(),
@@ -1623,6 +1635,7 @@ impl Cpu {
 		if len != j.lay.dram_len {
 			j.clear();
 			j.lay.dram_len = len;
+			j.lay_hash = ::jit::layout_hash(&j.lay);
 		}
 		let ctx = &::jit::verb::CTX;
 		ctx.set(::jit::CTX_RD, rd);
@@ -1688,12 +1701,13 @@ impl Cpu {
 		let ok = {
 			let r = &mut j.regions[rid as usize];
 			let mut ok = false;
-			if r.proof_gen == cg && r.phys.len() == r.members.len() {
-				// content proven this generation: re-probe the mapping only
+			if r.proof_gen == cg && !r.pages.is_empty() {
+				// content proven this generation: re-probe the mapping only,
+				// once per page the members start on
 				j.stats.map_checks += 1;
 				ok = true;
-				for (&(pc, _), &page) in r.members.iter().zip(r.phys.iter()) {
-					match self.mmu.translate_fetch_probe(pc) {
+				for &(vpage, page) in r.pages.iter() {
+					match self.mmu.translate_fetch_probe(vpage) {
 						Ok(p) if (p & !0xfff) == page => {}
 						_ => {
 							ok = false;
@@ -1709,20 +1723,28 @@ impl Cpu {
 				// from — the same uncompress build_block applies.
 				j.stats.content_checks += 1;
 				ok = true;
-				r.phys.clear();
+				r.pages.clear();
 				let mut changed: Option<u64> = None;
 				'members: for (start, words) in r.members.iter() {
-					let p = match self.mmu.translate_fetch_probe(*start) {
-						Ok(p) => p,
-						Err(_) => {
-							ok = false;
-							break;
+					let vpage = start & !0xfff;
+					let p = match r.pages.iter().find(|pg| pg.0 == vpage) {
+						Some(&(_, page)) => page | (start & 0xfff),
+						None => {
+							let p = match self.mmu.translate_fetch_probe(vpage) {
+								Ok(p) => p,
+								Err(_) => {
+									ok = false;
+									break;
+								}
+							};
+							if !self.mmu.mark_exec_page(p) {
+								ok = false;
+								break;
+							}
+							r.pages.push((vpage, p & !0xfff));
+							(p & !0xfff) | (start & 0xfff)
 						}
 					};
-					if !self.mmu.mark_exec_page(p) {
-						ok = false;
-						break;
-					}
 					let mut off = start & 0xfff;
 					for &(word, len) in words.iter() {
 						let raw = self.mmu.load_word_raw((p & !0xfff) | off);
@@ -1737,7 +1759,6 @@ impl Cpu {
 						}
 						off += len as u64;
 					}
-					r.phys.push(p & !0xfff);
 				}
 				// A page-table walk above may have stored an A bit into a
 				// marked page, bumping the generation (and clearing every
@@ -1747,7 +1768,7 @@ impl Cpu {
 				}
 				r.proof_gen = if ok { cg } else { 0 };
 				if !ok {
-					r.phys.clear();
+					r.pages.clear();
 				}
 				if let Some(pc) = changed {
 					if j.volatile.len() >= 1 << 16 {
@@ -1826,6 +1847,8 @@ impl Cpu {
 		};
 		let cg = self.mmu.code_gen();
 		let mut compiles = 0u32;
+		let began = std::time::Instant::now();
+		let installs_before = j.stats.installs;
 		for (members, _) in regions {
 			j.stats.formed += 1;
 			// One address space, one privilege side: members must be cached
@@ -1852,31 +1875,35 @@ impl Cpu {
 			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].0, &blocks[0].2)) {
 				continue;
 			}
+			// a block whose first op the emitter cannot translate is never an
+			// entry worth having: every call there would return at once
+			blocks.retain(|b| ::jit::translatable(&b.2[0]));
+			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].0, &blocks[0].2)) {
+				continue;
+			}
 			let mut got = None;
 			for attempt in 0..2 {
 				blocks.sort_by_key(|b| b.0);
 				let bias = blocks[0].0 & !0xfff;
 				let rel: Vec<(u64, Vec<BlockOp>)> =
 					blocks.iter().map(|b| (b.0 - bias, b.2.clone())).collect();
-				let module = match ::jit::emit_region(&rel, &j.lay) {
-					Some(m) => m,
-					None => break,
-				};
-				if module.len() > j.params.max_module_bytes {
-					j.stats.oversize += 1;
-					if attempt == 0 && blocks.len() > 1 {
-						// keep the hotter half
-						blocks.sort_by(|a, b| b.1.cmp(&a.1));
-						blocks.truncate((blocks.len() + 1) / 2);
-						continue;
-					}
-					break;
-				}
+				let key = ::jit::source_key(&rel, j.lay_hash);
 				let heat: u64 = blocks.iter().map(|b| b.1).sum();
 				let may = compiles < j.params.max_compiles_per_pass;
-				let r = ::jit::verb::lookup(&module, heat, j.params.compile_heat, may);
-				if let ::jit::verb::Got::Compiled(_) | ::jit::verb::Got::Failed = r {
-					compiles += 1;
+				let lay = &j.lay;
+				let r = ::jit::verb::lookup(key, heat, j.params.compile_heat, may, || ::jit::emit_region(&rel, lay));
+				match r {
+					::jit::verb::Got::Compiled(_) | ::jit::verb::Got::Failed => compiles += 1,
+					::jit::verb::Got::TooLarge => {
+						j.stats.oversize += 1;
+						if attempt == 0 && blocks.len() > 1 {
+							// keep the hotter half
+							blocks.sort_by(|a, b| b.1.cmp(&a.1));
+							blocks.truncate((blocks.len() + 1) / 2);
+							continue;
+						}
+					}
+					_ => {}
 				}
 				got = r.index().map(|i| (i, bias));
 				break;
@@ -1899,6 +1926,18 @@ impl Cpu {
 				j.install(slot, b.0, rid, i as u32);
 			}
 			j.stats.installs += 1;
+		}
+		let us = began.elapsed().as_micros() as u64;
+		j.stats.form_us += us;
+		if j.params.trace {
+			let v = ::jit::verb::stats();
+			eprintln!(
+				"[jit] pass {} retired {}M: +{} installs, {} compiled ({} failed, {:.0} ms total), {} live, coverage {:.1}%, pass {:.1} ms",
+				j.stats.passes, self.retired / 1_000_000, j.stats.installs - installs_before, v.compiled, v.failed,
+				v.compile_us as f64 / 1000.0, j.stats.live_regions,
+				100.0 * j.stats.retired as f64 / (j.stats.retired + j.stats.interpreted).max(1) as f64,
+				us as f64 / 1000.0
+			);
 		}
 		self.jit = Some(j);
 	}
@@ -6268,6 +6307,21 @@ const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // risc-box patch: was 0x1000
 // INSTRUCTIONS-index field of a predecoded BlockOp.
 const ICACHE_LEN4: u16 = 0x8000;
 
+/// risc-box patch (jit): the INSTRUCTIONS entry a non-hot (kind 0) op runs —
+/// exactly the closure exec_op dispatches to, so the translator keys on the
+/// interpreter's own decode.
+pub(crate) fn op_name(op: &BlockOp) -> &'static str {
+	INSTRUCTIONS.get((op.data & !ICACHE_LEN4) as usize).map_or("", |i| i.name)
+}
+
+/// Tests: the BlockOp the predecoder would build for `word` (any kind).
+#[cfg(test)]
+pub(crate) fn decode_op_for_test(cpu: &Cpu, word: u32) -> BlockOp {
+	let index = cpu.decode_and_get_instruction_index(word).expect("decodes");
+	let (kind, rd, rs1, rs2, imm) = classify_hot(INSTRUCTIONS[index].name, word);
+	BlockOp { imm, word, data: index as u16 | ICACHE_LEN4, kind, rd, rs1, rs2, len: 4, _pad: 0 }
+}
+
 // risc-box patch: tag layout for the direct-mapped cache below — the decoded
 // word plus a valid bit above bit 31, so no 32-bit word value (0, all-ones)
 // can false-hit against an empty slot.
@@ -7796,6 +7850,85 @@ mod test_jit_equivalence {
 		}
 	}
 
+	/// jit::translatable must say exactly what emit_seq translates: the
+	/// formation trusts it to keep entries that can never run out. Hot kinds
+	/// by kind; kind 0 by every INSTRUCTIONS entry.
+	#[test]
+	fn translatable_matches_the_emitter() {
+		let cpu = fresh_cpu(&mut Rng(9));
+		let lay = flat_layout(&cpu);
+		for kind in 1..=80u8 {
+			let o = op(kind, 5, 6, 7, 8);
+			let emits = jit::emit_block(&[o], DRAM_BASE, &lay).is_some();
+			assert_eq!(jit::translatable(&o), emits, "kind {}", kind);
+		}
+		let mut names = Vec::new();
+		for index in 0..INSTRUCTION_NUM {
+			let mut o = op(0, 5, 6, 7, 8);
+			o.data = index as u16 | ICACHE_LEN4;
+			let emits = jit::emit_block(&[o], DRAM_BASE, &lay).is_some();
+			assert_eq!(jit::translatable(&o), emits, "{}", INSTRUCTIONS[index].name);
+			if emits {
+				names.push(INSTRUCTIONS[index].name);
+			}
+		}
+		assert_eq!(names.len(), 11, "{:?}", names);
+	}
+
+	/// The M-extension ops and fences the translator takes over from the
+	/// table path, against exec_op on edge-heavy operands (zero divisors,
+	/// MIN / -1, 32-bit truncation and sign extension).
+	#[test]
+	fn m_extension_and_fences_match_the_interpreter() {
+		let engine = engine();
+		let words: Vec<u32> = [
+			(0x02004033u32, "DIV"), (0x02005033, "DIVU"), (0x02006033, "REM"), (0x02007033, "REMU"),
+			(0x0200003b, "MULW"), (0x0200403b, "DIVW"), (0x0200503b, "DIVUW"), (0x0200603b, "REMW"),
+			(0x0200703b, "REMUW"),
+		].iter().map(|&(base, _)| base | 5 << 7 | 6 << 15 | 7 << 20).collect();
+		let edge: [i64; 10] = [0, 1, -1, 2, -7, i64::MIN, i64::MAX, i32::MIN as i64,
+			0x1_0000_0000, -0x1_0000_0001];
+		let mut r = Rng(77);
+		let mut checked = 0;
+		for &w in &words {
+			for k in 0..60 {
+				let mut cpu = fresh_cpu(&mut Rng(k + 1));
+				let pick = |r: &mut Rng| match r.next() % 3 {
+					0 => edge[(r.next() % 10) as usize],
+					_ => r.next() as i64,
+				};
+				cpu.x[6] = pick(&mut r);
+				cpu.x[7] = if k % 4 == 0 { 0 } else { pick(&mut r) };
+				if k % 7 == 0 {
+					cpu.x[6] = i64::MIN;
+					cpu.x[7] = -1;
+				}
+				if k % 11 == 0 {
+					cpu.x[6] = i32::MIN as i64;
+					cpu.x[7] = -1;
+				}
+				let ops = vec![
+					decode_op_for_test(&cpu, w),
+					decode_op_for_test(&cpu, 0x0ff0000f), // fence
+					decode_op_for_test(&cpu, 0x0000100f), // fence.i
+					op(HOT_ADDI, 28, 5, 0, 1),
+				];
+				assert!(ops[..3].iter().all(|o| o.kind == 0 && jit::translatable(o)));
+				let lay = flat_layout(&cpu);
+				let bytes = jit::emit_block(&ops, DRAM_BASE, &lay).expect("emits");
+				let mut m = flat_mem(&engine, &cpu, DRAM_BASE);
+				let rw = m.call_block(&engine, &bytes);
+				let (xw, pcw, _, _) = flat_state(&m);
+				cpu.update_pc(DRAM_BASE);
+				let ri = region_ref(&mut cpu, &[(DRAM_BASE, ops.clone())], 1 << 20, None);
+				assert_eq!((rw, xw, pcw), (ri, cpu.x, cpu.pc), "{} x6={:#x} x7={:#x}",
+					op_name(&ops[0]), cpu.x[6], cpu.x[7]);
+				checked += 1;
+			}
+		}
+		assert_eq!(checked, 540);
+	}
+
 	#[test]
 	fn region_entry_out_of_range_runs_nothing() {
 		let engine = engine();
@@ -7986,6 +8119,9 @@ mod test_jit_equivalence {
 			};
 			let _ = cpu.mmu.store_doubleword(l0 + i as u64 * 8, pte);
 		}
+		// one more page maps device space (the UART): reachable through
+		// the TLB, but never DRAM
+		let _ = cpu.mmu.store_doubleword(l0 + VPAGES * 8, ((0x1000_0000u64 >> 12) << 10) | 0xc7);
 		cpu.update_addressing_mode((8 << 60) | (PT_ROOT >> 12));
 		cpu.privilege_mode = PrivilegeMode::Supervisor;
 		cpu.mmu.update_privilege_mode(PrivilegeMode::Supervisor);
@@ -8002,6 +8138,13 @@ mod test_jit_equivalence {
 			};
 			ptr_pages[p - 10] = page;
 			cpu.x[p] = (VBASE + page * 0x1000 + off) as i64;
+			// sometimes: the device page, or an UNMAPPED page 2 MiB up whose
+			// TLB set holds this page's (fresh) entry — only the tag says no
+			match (p, r.next() % 5) {
+				(12, 0) => cpu.x[p] = (VBASE + VPAGES * 0x1000 + off) as i64,
+				(13, 0) | (13, 1) => cpu.x[p] += 512 * 0x1000,
+				_ => {}
+			}
 		}
 		// warm the TLB: reads for most pages, writes for some writable ones
 		let warm = |cpu: &mut Cpu, r: &mut Rng, skip: Option<u64>| {
@@ -8021,6 +8164,7 @@ mod test_jit_equivalence {
 			}
 		};
 		warm(&mut cpu, &mut r, None);
+		let _ = cpu.mmu.load_doubleword(VBASE + VPAGES * 0x1000);
 		if seed % 2 == 0 {
 			// A stale translation: remap x10's page to another frame after
 			// its TLB entries were filled, SFENCE (new meta), and re-warm
@@ -8229,7 +8373,9 @@ mod test_jit_equivalence {
 			}
 			cases += 1;
 		}
-		assert!(transfers > cases / 4, "in-region transfers exercised: {} of {}", transfers, cases);
+		// a coverage floor, not a correctness check: the hostile pointers
+		// (device page, aliasing sets) make many cases bail early by design
+		assert!(transfers > cases / 6, "in-region transfers exercised: {} of {}", transfers, cases);
 	}
 
 	/// A call and return inside one region: JAL into a helper block, JALR
@@ -8339,5 +8485,10 @@ mod test_jit_equivalence {
 		assert_eq!(run(&cpu).0, 3, "just past the window: runs");
 		cpu.x[10] = (DRAM_BASE + RAM) as i64;
 		assert_eq!(run(&cpu).0, 1, "past the end of DRAM: bail");
+		// and a LOAD there (its read pointer would be past the table)
+		let lb = jit::emit_region(&[(0, vec![op(HOT_ADDI, 12, 12, 0, 1), op(HOT_LD, 5, 10, 0, 0)])], &lay).unwrap();
+		let mut m = chunked_mem(&engine, &cpu, DRAM_BASE);
+		m.put64(RDT + (RAM >> 16) * 8, CHUNKS); // a plausible pointer past the table
+		assert_eq!(m.call_region(&engine, &lb, 100, 0), 1, "load past the end of DRAM: bail");
 	}
 }

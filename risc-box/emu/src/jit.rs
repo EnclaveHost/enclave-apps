@@ -184,6 +184,7 @@ struct Locals {
 	rdt: u32,
 	wrt: u32,
 	marks: u32,
+	addr: u32,
 	fuel: u32,
 	entry: u32,
 	cur: u32,
@@ -192,16 +193,16 @@ struct Locals {
 }
 
 const NONE: u32 = u32::MAX;
-// i64 scratch, scratch2, bias | addr base, rdt, wrt, marks
+// i64 scratch, scratch2, bias | addr base, rdt, wrt, marks, addr
 const BLOCK_LOCALS: Locals = Locals {
-	scratch: 0, scratch2: 1, bias: 2, base: 3, rdt: 4, wrt: 5, marks: 6,
+	scratch: 0, scratch2: 1, bias: 2, base: 3, rdt: 4, wrt: 5, marks: 6, addr: 7,
 	fuel: NONE, entry: NONE, cur: NONE, retired: NONE, tpc: NONE,
 };
 // params fuel, entry | i64 scratch | i32 cur | i64 retired, scratch2, bias,
-// tpc | addr base, rdt, wrt, marks
+// tpc | addr base, rdt, wrt, marks, addr
 const REGION_LOCALS: Locals = Locals {
 	fuel: 0, entry: 1, scratch: 2, cur: 3, retired: 4, scratch2: 5, bias: 6, tpc: 7,
-	base: 8, rdt: 9, wrt: 10, marks: 11,
+	base: 8, rdt: 9, wrt: 10, marks: 11, addr: 12,
 };
 
 struct Emit<'a> {
@@ -436,19 +437,26 @@ impl<'a> Emit<'a> {
 
 	/// stack: guest VIRTUAL address (i64). Leaves the LINEAR address of the
 	/// access (index type) on the stack, or bails with pc at `op_addr`.
+	/// Every check branches to ONE bail per access (block $fail), so a
+	/// memory op carries a single exit sequence, not one per check.
 	fn dram_addr(&mut self, width: u64, op_addr: u64, retired: u64, write: bool) {
-		let sc = self.l.scratch;
+		let (sc, sc2, addr) = (self.l.scratch, self.l.scratch2, self.l.addr);
+		self.lset(sc);
+		self.op(BLOCK); // $done
+		self.op(VOID);
+		self.op(BLOCK); // $fail
+		self.op(VOID);
 		// The interpreter's fast path: the whole access inside one 4 KiB
 		// page. Anything else (cross-page) takes its byte-wise path there.
-		self.ltee(sc);
+		self.lget(sc);
 		self.i64c(0xfff);
 		self.op(I64_AND);
 		self.i64c((0x1000 - width) as i64);
 		self.op(I64_GT_U);
-		self.bail_if(op_addr, retired);
+		self.br_if(0);
 		self.lget(sc);
 		if self.lay.tlb.is_some() {
-			self.tlb_translate(op_addr, retired, write);
+			self.tlb_translate(write);
 		}
 		// off = phys - guest_dram_base; bail unless [off, off+width) is DRAM
 		self.i64c(self.lay.guest_dram_base as i64);
@@ -456,7 +464,7 @@ impl<'a> Emit<'a> {
 		self.ltee(sc);
 		self.i64c(self.lay.dram_len.wrapping_sub(width) as i64);
 		self.op(I64_GT_U);
-		self.bail_if(op_addr, retired);
+		self.br_if(0);
 		match self.lay.ram.clone() {
 			Ram::Flat { dram_base } => {
 				self.lget(sc);
@@ -465,7 +473,6 @@ impl<'a> Emit<'a> {
 				self.addr_add();
 			}
 			Ram::Chunked { store_bail } => {
-				let sc2 = self.l.scratch2;
 				if write {
 					// an executable page: the interpreter's store bumps the
 					// write-snoop generation (and so stops stale code)
@@ -477,14 +484,14 @@ impl<'a> Emit<'a> {
 					self.addr_add();
 					self.op(I32_LOAD8_U);
 					self.memarg(0, 0);
-					self.bail_if(op_addr, retired);
+					self.br_if(0);
 					for (lo, hi) in store_bail {
 						self.lget(sc);
 						self.i64c(lo as i64);
 						self.op(I64_SUB);
 						self.i64c(hi.wrapping_sub(lo) as i64);
 						self.op(I64_LT_U);
-						self.bail_if(op_addr, retired);
+						self.br_if(0);
 					}
 				}
 				// the chunk's pointer from the read or write table
@@ -506,7 +513,7 @@ impl<'a> Emit<'a> {
 					}
 					self.ltee(sc2);
 					self.op(I64_EQZ);
-					self.bail_if(op_addr, retired);
+					self.br_if(0);
 					self.lget(sc2);
 					self.to_addr();
 				}
@@ -517,11 +524,24 @@ impl<'a> Emit<'a> {
 				self.addr_add();
 			}
 		}
+		self.lset(addr);
+		self.op(BR);
+		self.idx(1); // $done
+		self.op(END); // $fail
+		self.bail(op_addr, retired);
+		self.op(END); // $done
+		self.lget(addr);
 	}
 
-	/// stack: guest virtual address -> stack: guest PHYSICAL address, or
-	/// bail on TLB miss / stale meta. scratch: vaddr; scratch2: set*8.
-	fn tlb_translate(&mut self, op_addr: u64, retired: u64, write: bool) {
+	fn br_if(&mut self, depth: u32) {
+		self.op(0x0d);
+		self.idx(depth as u64);
+	}
+
+	/// Inside dram_addr's $fail block. stack: guest virtual address ->
+	/// stack: guest PHYSICAL address; a TLB miss or stale meta branches to
+	/// the bail. scratch: vaddr; scratch2: set*8.
+	fn tlb_translate(&mut self, write: bool) {
 		let t = self.lay.tlb.clone().unwrap();
 		let (tags, metas, ppns) = match write {
 			false => (t.read_tags, t.read_metas, t.read_ppns),
@@ -551,7 +571,7 @@ impl<'a> Emit<'a> {
 		self.i64c(1);
 		self.op(I64_OR);
 		self.op(I64_NE);
-		self.bail_if(op_addr, retired);
+		self.br_if(0);
 		// meta fresh? metas are u32 per set: offset = scratch2 / 2
 		self.lget(base);
 		self.lget(sc2);
@@ -565,7 +585,7 @@ impl<'a> Emit<'a> {
 		self.op(I32_LOAD);
 		self.memarg(2, t.meta_cache);
 		self.op(I32_NE);
-		self.bail_if(op_addr, retired);
+		self.br_if(0);
 		// phys = ppns[set] | (vaddr & 0xfff)
 		self.lget(base);
 		self.lget(sc2);
@@ -607,6 +627,201 @@ pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> 
 		return None;
 	}
 	Some(assemble(e.code, false, lay))
+}
+
+/// Whether emit_seq translates `op` (anything else becomes a bail to the
+/// interpreter). Kept beside emit_seq; a test pins the two together.
+pub fn translatable(op: &BlockOp) -> bool {
+	if op.kind == 0 {
+		return table_op(op).is_some();
+	}
+	matches!(op.kind,
+		HOT_ADDI | HOT_ADD | HOT_SUB | HOT_AND | HOT_OR | HOT_XOR | HOT_ANDI | HOT_ORI
+		| HOT_XORI | HOT_MUL | HOT_SLL | HOT_SRL | HOT_SRA | HOT_SLLI | HOT_SRLI | HOT_SRAI
+		| HOT_LUI | HOT_AUIPC | HOT_ADDIW | HOT_ADDW | HOT_SUBW | HOT_SLLIW | HOT_SRLIW
+		| HOT_SRAIW | HOT_SLLW | HOT_SRLW | HOT_SRAW | HOT_SLT | HOT_SLTU | HOT_SLTI
+		| HOT_SLTIU | HOT_LD | HOT_LW | HOT_LWU | HOT_LH | HOT_LHU | HOT_LB | HOT_LBU
+		| HOT_SD | HOT_SW | HOT_SH | HOT_SB | HOT_BEQ | HOT_BNE | HOT_BLT | HOT_BGE
+		| HOT_BLTU | HOT_BGEU | HOT_JAL | HOT_JALR | HOT_FLD | HOT_FLW | HOT_FSD | HOT_FSW
+		| HOT_FADD_D | HOT_FSUB_D | HOT_FMUL_D | HOT_FSGNJ_D | HOT_FMV_X_D | HOT_FMV_D_X
+		| HOT_FCVT_D_W)
+}
+
+/// The non-hot ops the translator takes over from the table path, by the
+/// INSTRUCTIONS entry the interpreter decoded them to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableOp {
+	Div,
+	Divu,
+	Rem,
+	Remu,
+	Mulw,
+	Divw,
+	Divuw,
+	Remw,
+	Remuw,
+	Fence,
+}
+
+fn table_op(op: &BlockOp) -> Option<TableOp> {
+	Some(match ::cpu::op_name(op) {
+		"DIV" => TableOp::Div,
+		"DIVU" => TableOp::Divu,
+		"REM" => TableOp::Rem,
+		"REMU" => TableOp::Remu,
+		"MULW" => TableOp::Mulw,
+		"DIVW" => TableOp::Divw,
+		"DIVUW" => TableOp::Divuw,
+		"REMW" => TableOp::Remw,
+		"REMUW" => TableOp::Remuw,
+		// the interpreter's FENCE and FENCE.I do nothing (one hart; the
+		// write snoop already keeps cached code coherent)
+		"FENCE" | "FENCE.I" => TableOp::Fence,
+		_ => return None,
+	})
+}
+
+/// The INSTRUCTIONS closures for table ops, in wasm (RV64): rd = f(x[rs1],
+/// x[rs2]) with RISC-V's division rules — x/0 = -1 (all ones), x%0 = x,
+/// MIN/-1 = MIN, MIN%-1 = 0 — guarded before wasm's trapping div/rem.
+fn emit_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
+	const I32_EQZ: u8 = 0x45;
+	const I32_EQ: u8 = 0x46;
+	const I32_AND: u8 = 0x71;
+	const IF_I64: u8 = 0x7e;
+	if t == TableOp::Fence {
+		return;
+	}
+	e.set_x_pre(rd);
+	match t {
+		TableOp::Mulw => {
+			e.get_x(rs1);
+			e.get_x(rs2);
+			e.op(0x7e); // i64.mul: the low 32 bits are the 32-bit product
+			wrap32(e);
+		}
+		TableOp::Div | TableOp::Rem | TableOp::Divu | TableOp::Remu => {
+			let signed = matches!(t, TableOp::Div | TableOp::Rem);
+			let rem = matches!(t, TableOp::Rem | TableOp::Remu);
+			e.get_x(rs2);
+			e.op(I64_EQZ);
+			e.op(IF);
+			e.op(IF_I64);
+			match rem {
+				true => e.get_x(rs1),
+				false => e.i64c(-1),
+			}
+			e.op(ELSE);
+			if signed {
+				e.get_x(rs1);
+				e.i64c(i64::MIN);
+				e.op(I64_EQ);
+				e.get_x(rs2);
+				e.i64c(-1);
+				e.op(I64_EQ);
+				e.op(I32_AND);
+				e.op(IF);
+				e.op(IF_I64);
+				match rem {
+					true => e.i64c(0),
+					false => e.i64c(i64::MIN),
+				}
+				e.op(ELSE);
+			}
+			e.get_x(rs1);
+			e.get_x(rs2);
+			e.op(match (signed, rem) {
+				(true, false) => 0x7f, // i64.div_s
+				(false, false) => 0x80, // i64.div_u
+				(true, true) => 0x81, // i64.rem_s
+				(false, true) => 0x82, // i64.rem_u
+			});
+			if signed {
+				e.op(END);
+			}
+			e.op(END);
+		}
+		TableOp::Divw | TableOp::Remw | TableOp::Divuw | TableOp::Remuw => {
+			let signed = matches!(t, TableOp::Divw | TableOp::Remw);
+			let rem = matches!(t, TableOp::Remw | TableOp::Remuw);
+			e.get_x(rs2);
+			e.op(I32_WRAP_I64);
+			e.op(I32_EQZ);
+			e.op(IF);
+			e.op(IF_I64);
+			match rem {
+				true => {
+					// x % 0 = the 32-bit dividend, sign-extended
+					e.get_x(rs1);
+					wrap32(e);
+				}
+				false => e.i64c(-1),
+			}
+			e.op(ELSE);
+			if signed {
+				e.get_x(rs1);
+				e.op(I32_WRAP_I64);
+				e.i32c(i32::MIN);
+				e.op(I32_EQ);
+				e.get_x(rs2);
+				e.op(I32_WRAP_I64);
+				e.i32c(-1);
+				e.op(I32_EQ);
+				e.op(I32_AND);
+				e.op(IF);
+				e.op(IF_I64);
+				match rem {
+					true => e.i64c(0),
+					false => e.i64c(i32::MIN as i64),
+				}
+				e.op(ELSE);
+			}
+			e.get_x(rs1);
+			e.op(I32_WRAP_I64);
+			e.get_x(rs2);
+			e.op(I32_WRAP_I64);
+			e.op(match (signed, rem) {
+				(true, false) => 0x6d, // i32.div_s
+				(false, false) => 0x6e, // i32.div_u
+				(true, true) => 0x6f, // i32.rem_s
+				(false, true) => 0x70, // i32.rem_u
+			});
+			e.op(0xac); // i64.extend_i32_s
+			if signed {
+				e.op(END);
+			}
+			e.op(END);
+		}
+		TableOp::Fence => unreachable!(),
+	}
+	e.set_x_post(rd);
+}
+
+/// The cache key of a region's module, computed from its SOURCE (module
+/// pcs and ops) and the layout's hash without emitting it: two hashes of
+/// the same bytes the emitter is a pure function of.
+pub fn source_key(blocks: &[(u64, Vec<BlockOp>)], layout_hash: u64) -> (u64, u64, u64) {
+	use std::hash::Hasher;
+	let mut sip = std::collections::hash_map::DefaultHasher::new();
+	for &(pc, ref ops) in blocks {
+		sip.write_u64(pc);
+		sip.write_usize(ops.len());
+		for op in ops {
+			sip.write_i32(op.imm);
+			sip.write_u32(op.word);
+			sip.write_u16(op.data);
+			sip.write(&[op.kind, op.rd, op.rs1, op.rs2, op.len]);
+		}
+	}
+	(layout_hash, hash_blocks(blocks), sip.finish())
+}
+
+/// A stable hash of everything in a Layout the emitted code depends on.
+pub fn layout_hash(lay: &Layout) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut h = std::collections::hash_map::DefaultHasher::new();
+	lay.hash(&mut h);
+	h.finish()
 }
 
 /// The shared per-op emission: the whole sequence plus its fallthrough
@@ -827,6 +1042,9 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.op(0xa7); // i32.wrap_i64
 				e.op(0xb7); // f64.convert_i32_s
 				e.set_f_post(rd);
+			}
+			0 if table_op(op).is_some() => {
+				emit_table_op(e, table_op(op).unwrap(), rd, rs1, rs2);
 			}
 			_ => {
 				// outside the subset. A first-op miss means nothing to
@@ -1186,12 +1404,12 @@ fn assemble(body_expr: Vec<u8>, region: bool, lay: &Layout) -> Vec<u8> {
 			body.extend_from_slice(&[1, 0x7e]); // 2 scratch
 			body.extend_from_slice(&[1, 0x7f]); // 3 cur
 			body.extend_from_slice(&[4, 0x7e]); // 4 retired, 5 scratch2, 6 bias, 7 tpc
-			body.extend_from_slice(&[4, addr]); // 8 base, 9 rdt, 10 wrt, 11 marks
+			body.extend_from_slice(&[5, addr]); // 8 base, 9 rdt, 10 wrt, 11 marks, 12 addr
 		}
 		false => {
 			uleb(&mut body, 2);
 			body.extend_from_slice(&[3, 0x7e]); // 0 scratch, 1 scratch2, 2 bias
-			body.extend_from_slice(&[4, addr]); // 3 base, 4 rdt, 5 wrt, 6 marks
+			body.extend_from_slice(&[5, addr]); // 3 base, 4 rdt, 5 wrt, 6 marks, 7 addr
 		}
 	}
 	body.extend_from_slice(&body_expr);
@@ -1229,47 +1447,61 @@ pub fn form_regions_greedy(
 	max_blocks: usize,
 	min_heat: u64,
 ) -> Vec<Vec<u64>> {
-	use std::collections::{HashMap, HashSet};
-	let heat: HashMap<u64, u64> = nodes.iter().cloned().collect();
-	let mut adj: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+	use std::collections::BinaryHeap;
+	let heat: ::fnv::FnvHashMap<u64, u64> = nodes.iter().cloned().collect();
+	// Only edges between blocks that have heat this pass can join a region;
+	// self-loops are a set (a lone block is a region only if it loops).
+	let mut adj: ::fnv::FnvHashMap<u64, Vec<(u64, u64)>> = Default::default();
+	let mut self_loop: ::fnv::FnvHashSet<u64> = Default::default();
 	for &(a, b, w) in edges {
+		if a == b {
+			self_loop.insert(a);
+			continue;
+		}
+		if !heat.contains_key(&a) || !heat.contains_key(&b) {
+			continue;
+		}
 		adj.entry(a).or_default().push((b, w));
 		adj.entry(b).or_default().push((a, w));
 	}
 	let mut order: Vec<(u64, u64)> = nodes.to_vec();
 	order.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-	let mut claimed: HashSet<u64> = HashSet::new();
+	let mut claimed: ::fnv::FnvHashSet<u64> = Default::default();
 	let mut out = Vec::new();
 	for &(seed, h) in &order {
 		if h < min_heat || claimed.contains(&seed) {
 			continue;
 		}
+		// grow along the heaviest edge from any member (a max-heap frontier
+		// with lazy deletion: O(E log E), not O(members^2 * degree))
 		let mut members: Vec<u64> = vec![seed];
-		let mut inset: HashSet<u64> = members.iter().cloned().collect();
-		while members.len() < max_blocks {
-			let mut best: Option<(u64, u64)> = None; // (weight, pc)
-			for m in &members {
-				if let Some(nb) = adj.get(m) {
-					for &(pc, w) in nb {
-						if !inset.contains(&pc)
-							&& !claimed.contains(&pc)
-							&& heat.contains_key(&pc)
-							&& best.map(|(bw, _)| w > bw).unwrap_or(true)
-						{
-							best = Some((w, pc));
-						}
+		let mut inset: ::fnv::FnvHashSet<u64> = Default::default();
+		inset.insert(seed);
+		let mut frontier: BinaryHeap<(u64, u64)> = BinaryHeap::new();
+		let push = |frontier: &mut BinaryHeap<(u64, u64)>, at: u64, inset: &::fnv::FnvHashSet<u64>,
+			claimed: &::fnv::FnvHashSet<u64>| {
+			if let Some(nb) = adj.get(&at) {
+				for &(pc, w) in nb {
+					if !inset.contains(&pc) && !claimed.contains(&pc) {
+						frontier.push((w, pc));
 					}
 				}
 			}
-			match best {
-				Some((_, pc)) => {
-					members.push(pc);
-					inset.insert(pc);
-				}
+		};
+		push(&mut frontier, seed, &inset, &claimed);
+		while members.len() < max_blocks {
+			let pc = match frontier.pop() {
+				Some((_, pc)) => pc,
 				None => break,
+			};
+			if inset.contains(&pc) || claimed.contains(&pc) {
+				continue;
 			}
+			members.push(pc);
+			inset.insert(pc);
+			push(&mut frontier, pc, &inset, &claimed);
 		}
-		if members.len() < 2 && !edges.iter().any(|&(a, b, _)| a == seed && b == seed) {
+		if members.len() < 2 && !self_loop.contains(&seed) {
 			continue; // a lone block with no self-loop is not a region
 		}
 		members.sort();
@@ -1630,6 +1862,11 @@ impl Tier2 {
 			})
 			.collect();
 		self.heat.clear();
+		// edges age too: halve every pass, forget the ones that reach zero
+		self.edges.retain(|_, w| {
+			*w >>= 1;
+			*w > 0
+		});
 		out
 	}
 
@@ -1976,6 +2213,7 @@ pub mod verb {
 		pub reused: u64,
 		pub refused_heat: u64,
 		pub refused_budget: u64,
+		pub too_large: u64,
 		pub compile_us: u64,
 		pub max_compile_us: u64,
 		pub last_status: i64,
@@ -1985,21 +2223,23 @@ pub mod verb {
 	struct State {
 		policy: Policy,
 		stats: Stats,
-		// (len, fnv-1a, second fnv basis) -> Some(table index) | None (failed)
-		cache: ::fnv::FnvHashMap<(usize, u64, u64), Option<u64>>,
+		// source key (see super::source_key) -> Some(table index) | None
+		// (failed, or too large: either way, never resubmitted)
+		cache: ::fnv::FnvHashMap<(u64, u64, u64), Option<u64>>,
 		consecutive_failures: u32,
 		owner: usize,
 	}
 
 	static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-	fn key(module: &[u8]) -> (usize, u64, u64) {
+	/// A key for callers that hold module bytes (tests, tools).
+	pub fn bytes_key(module: &[u8]) -> (u64, u64, u64) {
 		let mut h2: u64 = 0x84222325cbf29ce4;
 		for &b in module {
 			h2 ^= b as u64;
 			h2 = h2.wrapping_mul(0x100000001b3);
 		}
-		(module.len(), super::fnv64(module), h2)
+		(module.len() as u64, super::fnv64(module), h2)
 	}
 
 	/// Arm the verb for this process (idempotent; the first caller's policy
@@ -2044,6 +2284,8 @@ pub mod verb {
 		Compiled(u64),
 		/// Not compiled: policy, budget, a past failure, or `may_compile`.
 		Refused,
+		/// The emitted module exceeds the size cap (remembered as refused).
+		TooLarge,
 		/// Submitted and refused by the host.
 		Failed,
 	}
@@ -2057,17 +2299,23 @@ pub mod verb {
 		}
 	}
 
-	/// The table index running `module`: cached when these exact bytes were
-	/// compiled before; otherwise, when `may_compile`, compiled if `heat`
+	/// The table index running the module with source key `k`: cached when
+	/// it was compiled before; otherwise, when `may_compile`, emitted (only
+	/// now: refused regions never pay for emission) and compiled if `heat`
 	/// clears `min_heat` scaled by how much budget is already spent and the
 	/// budget allows. Anything else: the caller keeps interpreting.
-	pub fn lookup(module: &[u8], heat: u64, min_heat: u64, may_compile: bool) -> Got {
+	pub fn lookup<F: FnOnce() -> Option<Vec<u8>>>(
+		k: (u64, u64, u64),
+		heat: u64,
+		min_heat: u64,
+		may_compile: bool,
+		emit: F,
+	) -> Got {
 		let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
 		let s = match g.as_mut() {
 			Some(s) => s,
 			None => return Got::Refused,
 		};
-		let k = key(module);
 		if let Some(&hit) = s.cache.get(&k) {
 			return match hit {
 				Some(i) => {
@@ -2087,9 +2335,23 @@ pub mod verb {
 			return Got::Refused;
 		}
 		let modules = s.stats.compiled + s.stats.failed;
-		if module.is_empty()
-			|| module.len() > p.max_module_bytes.min(HOST_MAX_MODULE_BYTES)
-			|| modules >= p.module_budget.min(HOST_MAX_MODULES)
+		if modules >= p.module_budget.min(HOST_MAX_MODULES)
+			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
+		{
+			s.stats.refused_budget += 1;
+			return Got::Refused;
+		}
+		let module = match emit() {
+			Some(m) if !m.is_empty() => m,
+			_ => return Got::Refused,
+		};
+		let p = &s.policy;
+		if module.len() > p.max_module_bytes.min(HOST_MAX_MODULE_BYTES) {
+			s.stats.too_large += 1;
+			s.cache.insert(k, None);
+			return Got::TooLarge;
+		}
+		if modules >= p.module_budget.min(HOST_MAX_MODULES)
 			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
 			|| s.stats.bytes + module.len() as u64 > p.byte_budget.min(HOST_MAX_INPUT_BYTES)
 		{
@@ -2099,7 +2361,7 @@ pub mod verb {
 		s.stats.attempts += 1;
 		s.stats.bytes += module.len() as u64;
 		let t0 = std::time::Instant::now();
-		let status = sys::compile(module);
+		let status = sys::compile(&module);
 		let us = t0.elapsed().as_micros() as u64;
 		s.stats.compile_us += us;
 		s.stats.max_compile_us = s.stats.max_compile_us.max(us);
@@ -2128,9 +2390,10 @@ pub mod verb {
 		Got::Failed
 	}
 
-	/// lookup() for callers that only want the index.
+	/// lookup() for callers holding module bytes that only want the index.
 	pub fn get(module: &[u8], heat: u64, min_heat: u64) -> Option<u64> {
-		lookup(module, heat, min_heat, true).index()
+		let m = module.to_vec();
+		lookup(bytes_key(module), heat, min_heat, true, move || Some(m)).index()
 	}
 
 	/// The calling execution view's identity (a SET pthread).
@@ -2288,7 +2551,22 @@ pub mod verb {
 			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 			reset_for_test(Some(ok), Policy { max_module_bytes: 4, ..Policy::default() });
 			assert!(get(b"too-large", 1, 1).is_none());
-			assert_eq!((stats().attempts, stats().refused_budget), (0, 1));
+			assert_eq!((stats().attempts, stats().too_large), (0, 1));
+		}
+
+		#[test]
+		fn refused_regions_are_never_emitted() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset_for_test(Some(ok), Policy::default());
+			let k = (1, 2, 3);
+			let r = lookup(k, 5, 10, true, || panic!("emitted below the heat threshold"));
+			assert_eq!(r, Got::Refused);
+			let r = lookup(k, 50, 10, false, || panic!("emitted while compiles are capped"));
+			assert_eq!(r, Got::Refused);
+			let r = lookup(k, 50, 10, true, || Some(b"m".to_vec()));
+			assert!(matches!(r, Got::Compiled(_)));
+			let again = lookup(k, 0, 10, false, || panic!("re-emitted a cached module"));
+			assert_eq!(again.index(), r.index());
 		}
 	}
 }
