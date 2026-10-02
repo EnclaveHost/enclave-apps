@@ -665,6 +665,8 @@ pub struct JitState {
 	owner: usize,
 	/// this run() may dispatch: owner thread, RV64
 	live: bool,
+	/// when the JIT was enabled (compile-time share cap)
+	since: std::time::Instant,
 	/// sampling window over interpreted retirement (see record)
 	total: u64,
 	window: bool,
@@ -698,6 +700,10 @@ pub struct JitParams {
 	pub max_pages: u64,
 	/// one stderr line per formation pass
 	pub trace: bool,
+	/// compile only while cumulative compile time stays under this share of
+	/// the wall time since the JIT was enabled (percent, plus a 250 ms
+	/// allowance); 100 = no cap. Compiles stall the machine's own thread.
+	pub compile_pct: u32,
 }
 
 #[cfg(feature = "codegen")]
@@ -718,6 +724,7 @@ impl Default for JitParams {
 			max_module_bytes: 128 * 1024,
 			max_pages: 1 << 18, // --max-memory=17179869184
 			trace: false,
+			compile_pct: 100,
 		}
 	}
 }
@@ -1563,6 +1570,7 @@ impl Cpu {
 			volatile: Default::default(),
 			owner: ::jit::verb::thread_id(),
 			live: false,
+			since: std::time::Instant::now(),
 			total: 0,
 			window: false,
 			params,
@@ -1889,9 +1897,26 @@ impl Cpu {
 					blocks.iter().map(|b| (b.0 - bias, b.2.clone())).collect();
 				let key = ::jit::source_key(&rel, j.lay_hash);
 				let heat: u64 = blocks.iter().map(|b| b.1).sum();
-				let may = compiles < j.params.max_compiles_per_pass;
+				let may = compiles < j.params.max_compiles_per_pass && {
+					let spent_ms = ::jit::verb::stats().compile_us / 1000;
+					let wall_ms = j.since.elapsed().as_millis() as u64;
+					spent_ms <= 250 + wall_ms * j.params.compile_pct as u64 / 100
+				};
 				let lay = &j.lay;
-				let r = ::jit::verb::lookup(key, heat, j.params.compile_heat, may, || ::jit::emit_region(&rel, lay));
+				let mut size = 0usize;
+				let t0 = std::time::Instant::now();
+				let r = ::jit::verb::lookup(key, heat, j.params.compile_heat, may, || {
+					let m = ::jit::emit_region(&rel, lay);
+					size = m.as_ref().map_or(0, |m| m.len());
+					m
+				});
+				if j.params.trace && size > 0 {
+					eprintln!(
+						"[jit] compile {:?}: {} blocks, {} ops, {} bytes, heat {}, {:.1} ms",
+						r, rel.len(), rel.iter().map(|b| b.1.len()).sum::<usize>(), size, heat,
+						t0.elapsed().as_secs_f64() * 1000.0
+					);
+				}
 				match r {
 					::jit::verb::Got::Compiled(_) | ::jit::verb::Got::Failed => compiles += 1,
 					::jit::verb::Got::TooLarge => {

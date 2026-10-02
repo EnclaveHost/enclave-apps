@@ -1412,6 +1412,12 @@ fn jit_enable(emu: &mut Emulator) {
     if let Some(v) = num("RISC_JIT_HEAT") {
         p.compile_heat = v;
     }
+    if let Some(v) = num("RISC_JIT_COMPILE_PCT") {
+        p.compile_pct = v.min(100) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_BLOCKS") {
+        p.max_blocks = (v as usize).clamp(1, 512);
+    }
     p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
     let fuel = p.fuel;
     match emu.jit_enable(p) {
