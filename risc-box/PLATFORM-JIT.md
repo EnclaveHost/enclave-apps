@@ -178,7 +178,107 @@ without copying whole DRAM per call), which is one more way of
 saying the verb is the right platform boundary: instantiate over the
 caller's memory, and the entire tier works with zero marshalling.
 
-## 5. Fallback
+## 5. The live tier (2026-10-02)
+
+The verb exists (`enclave:codegen/compiler@0.1.0`, see
+`work/wasmtime-codegen/docs/enclave-codegen.md`) and the tier is
+connected behind the `codegen` cargo feature (SET wasm64 build with
+`set/codegen.c` linked and codegen-componentize wiring the import). What
+runs, all in `emu/src/jit.rs` and `emu/src/cpu.rs` (`JitState`):
+
+- **Formation.** Interpreted block dispatches are sampled (one window of
+  2^18 retired in 64) into heat and successor edges; every 50M retired the
+  AOT's greedy formation grows regions (<= 64 blocks) from the hottest
+  uncovered blocks. Excluded: blocks already in a runnable region, blocks
+  whose code changed under a proof (self-modifying or guest-JIT code),
+  blocks not mapped in the current address space, the other privilege
+  side, untranslatable first ops, near-cold members.
+- **Emission.** Regions are rebased to a page-aligned bias, so a module is
+  position-independent: the same code at another address, in another
+  process or another machine is the same module. Nothing about the
+  machine's address is baked in — a context block read at entry carries
+  the Cpu's address, the chunk read/write pointer tables, the exec-page
+  marks and the bias. The import is `env.memory` as memory64, shared, with
+  the app's declared maximum. Guest registers live in wasm locals for the
+  call (loaded at entry, written back at one exit). Every load/store keeps
+  the interpreter's fast-path contract: within one 4 KiB page, a TLB hit
+  with a fresh meta, inside DRAM; stores additionally bail (pc exact,
+  nothing written) when the chunk is not owned (copy-on-write is the
+  interpreter's), the page is marked executable (the interpreter's store
+  bumps the write-snoop generation), or the store lands in the
+  framebuffer bookkeeping window. Indirect jumps to member blocks
+  (returns, jump tables) stay in the region through a compare tree.
+  Translated: the whole hot set plus DIV/DIVU/REM/REMU (and W forms),
+  MULW, FENCE/FENCE.I.
+- **Dispatch.** Exactly where the AOT splice runs baked regions: a
+  verified region entered at a block-cache hit runs with fuel 256, then
+  note_retire / check_interrupt as before; zero retired falls back to
+  exec_block. Validity is the AOT verifier's two levels per installed
+  instance — a content proof per write-snoop generation (marking member
+  pages executable) and a mapping re-probe per TLB meta — with failures
+  cached.
+- **Budget.** The host's limits are per execution view and cumulative
+  (256 modules, 1024 attempts, 16 MiB submitted, 256 KiB per module;
+  drop never refunds). `jit::verb` owns one process-wide policy under
+  them: 240 modules, 960 attempts, 15 MiB, 128 KiB per module; a module is
+  compiled at most once (cache keyed by region source + layout) and a
+  failure is never retried; a region must show sampled heat of
+  max(6000, 20 x ops) — compile time measured linear in size, ~0.07 ms per
+  guest op — doubled every 48 compiles; at most 4 compiles per pass; a
+  missing verb, a host quota/binding failure or 6 failures in a row turn
+  compilation off for the process. Compiled regions keep running; the
+  rest interprets.
+- **Controls.** `RISC_JIT=0` disables it at machine start; `/status` gains
+  a `jit` object; `RISC_JIT_SELFTEST=<seed>[,<n>]` runs the generated-guest
+  interpreter-vs-JIT comparison inside the component; `RISC_JIT_TRACE=1`
+  logs formation and compiles.
+
+Measured (production runtime 9caac5e6, one pinned core, warden-host):
+
+    generated guest (RISC_JIT_SELFTEST, 3 seeds, ~166M instructions:
+    ALU / memory over COW chunks / calls / jump-table dispatch / FP /
+    self-modifying code / M-ext / page faults), state identical every seed
+      interpreter                        79-83 MIPS
+      JIT, whole run incl. compiles     369-470 MIPS   (4.5-5.9x)
+      JIT, second half                  417-577 MIPS   (5.0-7.3x)
+
+    browser workload (frozen Badwolf snapshot; the page's own JS and
+    layout timers; checksum 863400 verified every run), 4 interleaved
+    runs per variant, median [min-max] ms
+                         js                    layout
+      0.6.58             11738 [10933-17230]   15259 [15046-21983]
+      JIT build, off     12341 [11172-12538]   15182 [15148-15382]
+      JIT build, on       5944 [ 5699-12115]   16023 [15801-16306]
+
+JS runs 2.0x faster at the median. Layout is ~5% slower: 44-47% of
+the guest's instructions ran compiled, but this is a ~20-second
+workload from a cold JIT, and the compiles (1.0-1.7 s per run,
+synchronous on the machine's thread) land largely in the layout phase;
+with compiles disabled (before the slot-presence bitmap) the bookkeeping
+alone left JS unchanged and layout 1-7% slower, so it is part of the gap
+too. One JIT run in four here (one of 26 across all builds measured)
+showed no JS speedup (12115 ms); formation is sampled and the cause was
+not caught in a trace. The 0.6.58 maxima are one run slow across the board (host
+interference).
+
+    guest CPU work over /exec on the restored desktop, 2 runs x 3 reps,
+    median [min-max] ms, outputs identical across variants
+                          0.6.58             JIT off            JIT on
+      sha256sum 4 MiB     4313 [4246-4492]   4323 [4263-4519]    754 [662-999]     5.7x
+      gzip 4 MiB          3885 [3811-4112]   3866 [3826-4070]    837 [807-1538]    4.6x
+      busybox awk loop    7335 [7061-7478]   7339 [7123-7563]   3038 [2392-3872]   2.4x
+      sh while loop       3944 [3869-4155]   3978 [3919-4237]   1958 [1785-2596]   2.0x
+
+What limits it now: compiles are synchronous on the machine's own
+thread (a SET worker cannot compile for it: table indices belong to the
+view that compiled them), so warm-up stalls land in whatever the guest
+is doing; regions still exit at untranslated ops (MULH*, AMO/LR/SC,
+single-precision FP, CSR access) and at every region boundary (no
+region-to-region chaining yet); and any store to any marked code page
+re-proves every region (a per-page write record would keep unrelated
+regions proven).
+
+## 6. Fallback
 
 Absent the verb, RISC Box stays as shipped: the interpreter is at its
 local optimum and every path in this document degrades gracefully to it.
