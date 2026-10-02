@@ -1052,11 +1052,12 @@ impl App {
                 .map(|s| format!("\"{}\"", httpd::json_escape(s)))
                 .unwrap_or_else(|| "null".into())
         };
+        let jit = jit_json(m.emu.as_ref());
         format!(
             "{{\"phase\":\"{}\",\"id\":\"{}\",\"origin\":\"{}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
              \"instret\":{},\"guestIdle\":{},\"steps\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
-             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{},\"instances\":{}{img}}}",
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{},\"instances\":{}{img}{jit}}}",
             phase_name(m.phase),
             httpd::json_escape(&m.id),
             httpd::json_escape(&m.origin),
@@ -1381,9 +1382,67 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
         emu.aot_enable();
         eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
     }
+    #[cfg(feature = "codegen")]
+    jit_enable(emu);
     if cfg.net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
     }
+}
+
+/// The live region JIT (PLATFORM-JIT.md): hot guest regions compile to wasm
+/// through the platform's enclave:codegen verb and run in place of the
+/// interpreter. On wherever the build has it; RISC_JIT=0 is the off switch
+/// (and the benchmark's A/B), RISC_JIT_FUEL / RISC_JIT_INTERVAL /
+/// RISC_JIT_HEAT tune it. Without the verb, or once its process-wide budget
+/// is spent, the machine simply keeps interpreting.
+#[cfg(feature = "codegen")]
+fn jit_enable(emu: &mut Emulator) {
+    if std::env::var("RISC_JIT").map_or(false, |v| v == "0") {
+        eprintln!("[risc-box] jit off (RISC_JIT=0)");
+        return;
+    }
+    let mut p = riscv_emu_rust::cpu::JitParams::default();
+    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+    if let Some(v) = num("RISC_JIT_FUEL") {
+        p.fuel = v.clamp(32, 1 << 20);
+    }
+    if let Some(v) = num("RISC_JIT_INTERVAL") {
+        p.form_interval = v.max(1_000_000);
+    }
+    if let Some(v) = num("RISC_JIT_HEAT") {
+        p.compile_heat = v;
+    }
+    let fuel = p.fuel;
+    match emu.jit_enable(p) {
+        true => eprintln!("[risc-box] jit on: hot regions compile through enclave:codegen (fuel {fuel})"),
+        false => eprintln!("[risc-box] jit unavailable: interpreting"),
+    }
+}
+
+/// The machine's JIT counters for /status (nothing when the build or the
+/// machine has no JIT).
+#[cfg(feature = "codegen")]
+fn jit_json(emu: Option<&Emulator>) -> String {
+    let Some(s) = emu.and_then(|e| e.jit_stats()) else {
+        return String::new();
+    };
+    let v = riscv_emu_rust::jit::verb::stats();
+    format!(
+        ",\"jit\":{{\"calls\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
+         \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
+         \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
+         \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{}}}",
+        s.calls, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
+        s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
+        v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
+        v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
+        v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),
+    )
+}
+
+#[cfg(not(feature = "codegen"))]
+fn jit_json(_emu: Option<&Emulator>) -> String {
+    String::new()
 }
 
 /// A machine brought up, and how: resumed from a snapshot or booted cold.
@@ -2812,6 +2871,20 @@ pub fn run() {
             false => "single-threaded wasip2",
         }
     );
+
+    // RISC_JIT_SELFTEST=<seed>[,<instructions>]: run the codegen JIT against
+    // the interpreter on a generated paged guest (riscv_emu_rust::jit_selftest)
+    // inside this very component — the real verb, the real memory — print the
+    // comparison and timings, and exit. Normal startup never does this.
+    #[cfg(feature = "codegen")]
+    if let Ok(arg) = std::env::var("RISC_JIT_SELFTEST") {
+        let mut it = arg.split(',').map(|v| v.trim().parse::<u64>().ok());
+        let seed = it.next().flatten().unwrap_or(1);
+        let steps = it.next().flatten().unwrap_or(200_000_000);
+        let report = riscv_emu_rust::jit_selftest(seed, steps);
+        println!("{}", report.0);
+        std::process::exit(if report.1 { 0 } else { 1 });
+    }
 
     // What the platform actually handed us, by NAME only — never a value.
     // Names are already public (they are in the app config); values are not,

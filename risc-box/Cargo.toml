@@ -99,6 +99,12 @@ set = []
 # (see emu/build.rs + emu/aot/regions.dump). The app enables the dispatcher
 # at machine start when this is on.
 aot = ["riscv_emu_rust/aot"]
+# the live region JIT over the platform's enclave:codegen verb (PLATFORM-JIT.md;
+# emu/src/jit.rs). Needs the SET wasm64 link with set/codegen.c (-DRISC_CODEGEN)
+# and the codegen-componentize step that wires the binding to the host import.
+# On at machine start unless RISC_JIT=0; degrades to the interpreter whenever
+# the verb is missing or its budget is spent.
+codegen = ["riscv_emu_rust/codegen"]
 
 # wasi-nn bindings for the hardware encoder (nvenc.rs), wasm32 only: the
 # wasm64 build has no wasi-nn path and must not pull wit-bindgen-rt 0.41,

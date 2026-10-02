@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <pthread.h>
 
-static int64_t unavailable(uint64_t ptr, uint64_t len) { (void)ptr; (void)len; return -1; }
+/* -64: no host verb behind the import (the stub was never rewired). Distinct
+ * from every host status (-1..-5) so the JIT can tell "absent" from "refused". */
+static int64_t unavailable(uint64_t ptr, uint64_t len) { (void)ptr; (void)len; return -64; }
 static int32_t unavailable_drop(uint64_t slot) { (void)slot; return 0; }
 static int64_t (*volatile compile_fn)(uint64_t, uint64_t) = unavailable;
 static int32_t (*volatile drop_fn)(uint64_t) = unavailable_drop;
@@ -20,6 +22,9 @@ int64_t risc_codegen_compile(const uint8_t *bytes, size_t len) {
     return compile_fn((uintptr_t)bytes, len);
 }
 int32_t risc_codegen_drop(uint64_t slot) { return drop_fn(slot); }
+/* Table indices belong to the execution view (SET thread) that compiled them;
+ * the JIT records its owner with this and never calls from another thread. */
+uintptr_t risc_codegen_thread(void) { return (uintptr_t)pthread_self(); }
 
 /* A runtime-generated module, including the address of a real C stack cell.
  * This is exercised only with RISC_CODEGEN_SELFTEST=1; normal app startup does
