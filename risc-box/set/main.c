@@ -11,6 +11,9 @@
 #include <stdlib.h>
 
 int risc_box_main(void);
+#ifdef RISC_CODEGEN
+int risc_codegen_selftest(void);
+#endif
 
 int main(void) {
   /* Populate libc's `environ` before Rust looks at it.
@@ -30,5 +33,8 @@ int main(void) {
    * case — without it the SET build cannot start at all. */
   (void)getenv("PATH");
 
+#ifdef RISC_CODEGEN
+  if (getenv("RISC_CODEGEN_SELFTEST")) return risc_codegen_selftest();
+#endif
   return risc_box_main();
 }
