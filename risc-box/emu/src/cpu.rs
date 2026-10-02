@@ -4108,8 +4108,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.S.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// Is this implementation correct?
-			cpu.f[f.rd] = cpu.f[f.rs1] as f32 as f64;
+			// The register holds raw FP bits. Widening the rounded value back
+			// to f64 makes FSW/FCVT.D.S read the low half of a double instead
+			// of the single (1.0 became 0.0). Store a NaN-boxed single.
+			let bits = (cpu.f[f.rs1] as f32).to_bits() as u64;
+			cpu.f[f.rd] = f64::from_bits(0xffff_ffff_0000_0000 | bits);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5692,6 +5695,21 @@ mod test_cpu {
 
 	fn create_cpu() -> Cpu {
 		Cpu::new(Box::new(DummyTerminal::new()))
+	}
+
+	#[test]
+	fn double_to_single_preserves_single_bits_and_round_trip() {
+		let mut cpu = create_cpu();
+		let narrow = INSTRUCTIONS.iter().find(|i| i.name == "FCVT.S.D").unwrap();
+		let widen = INSTRUCTIONS.iter().find(|i| i.name == "FCVT.D.S").unwrap();
+		for input in [1.0_f64, -1.0, 0.0, -0.0, 1.5, 100.0, f64::INFINITY, f64::NEG_INFINITY, 1e-40] {
+			cpu.f[10] = input;
+			assert!((narrow.operation)(&mut cpu, 0x4015_05d3, 0).is_ok()); // fcvt.s.d fa1,fa0
+			let single = input as f32;
+			assert_eq!(cpu.f[11].to_bits(), 0xffff_ffff_0000_0000 | single.to_bits() as u64);
+			assert!((widen.operation)(&mut cpu, 0x4205_8653, 0).is_ok()); // fcvt.d.s fa2,fa1
+			assert_eq!(cpu.f[12].to_bits(), (single as f64).to_bits());
+		}
 	}
 
 	#[test]
