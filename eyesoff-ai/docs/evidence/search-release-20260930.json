@@ -1,0 +1,99 @@
+{
+  "status": "Eyesoff-AI 1.0.70 live and verified: both attested addresses, public HTTPS 200, startup warmup complete, cited production search answer completed. Concurrent KV capacity failure remains open.",
+  "app_source_commit": "b699f6c",
+  "artifact": {
+    "cid": "bafybeie77xp5djpkg7wjdsikppyzeqykawqq6v4ojlwrjiwxa535inkulu",
+    "sha256": "c1bd531eb264f8b66585d5ad6933452099506905a6e5c49fbaa7537bbed071a2",
+    "bytes": 6779724
+  },
+  "prediction": {
+    "release": "4bb9f020d0d3c0760c60f7e3a28e32e4429139c82023785d5415f83bcb054170",
+    "app_id": "4a9188f0fb55b6ce56ac98bd1aae9fada17df6639bf594aa9c60e43473506b45",
+    "runtime_id": "297b6c2c0aee68c38ed612972afd11b12865e21ee39c01f4336e8721b3ef02f8",
+    "runtime_identity_json": "{\"name\":\"wasmtime\",\"version\":\"49.0.0\",\"execution\":\"jit\",\"targetIsa\":\"x86_64\",\"hostIsa\":\"x86_64\",\"cpuFeatures\":\"host-detected\",\"wx\":\"enforced\",\"cache\":\"none\"}",
+    "measurement": "f89271b101c6817396dddea56b180fd6234451e4b2cf92f7cac03247e6fd01140d32eb64ff18059e2eb3c9510be25099"
+  },
+  "activation": {
+    "hash": "0x6a05cd0cf1ea60e61118488a81e653f32fffa49c27fc16fcbaeeec44443f9630",
+    "status": "success",
+    "blockNumber": "51996920",
+    "gasUsed": "43438"
+  },
+  "instance": "gde77e3ac6",
+  "validation": {
+    "app_rust_tests": 224,
+    "browser_tests": 19,
+    "relay_tests": 84,
+    "public_ipfs_sha256_matches": true,
+    "nan_kubo_sha256_matches": true,
+    "live_app_attestation": {
+      "at": "2026-09-30T15:55:27.927Z",
+      "id": "0x9eb4e60063aa079cebed355f96b2d049457ae77bdbcd49086040282e1e4b871c",
+      "short": "9eb4e600",
+      "hostname": "9eb4e600.app.enclave.host",
+      "attested": true,
+      "measurement": "f89271b101c6817396dddea56b180fd6234451e4b2cf92f7cac03247e6fd01140d32eb64ff18059e2eb3c9510be25099",
+      "appId": "4a9188f0fb55b6ce56ac98bd1aae9fada17df6639bf594aa9c60e43473506b45",
+      "release": "4bb9f020d0d3c0760c60f7e3a28e32e4429139c82023785d5415f83bcb054170",
+      "spkiSha256": "5c072b2d31d0746c4371ba466e367720cbafde796c0d7d028ec7a3520b03872c",
+      "healthPath": "/",
+      "healthStatus": 200
+    },
+    "live_domain_attestation": {
+      "at": "2026-09-30T15:55:47.653Z",
+      "id": "0x9eb4e60063aa079cebed355f96b2d049457ae77bdbcd49086040282e1e4b871c",
+      "short": "9eb4e600",
+      "hostname": "eyesoff.ai",
+      "attested": true,
+      "measurement": "f89271b101c6817396dddea56b180fd6234451e4b2cf92f7cac03247e6fd01140d32eb64ff18059e2eb3c9510be25099",
+      "appId": "4a9188f0fb55b6ce56ac98bd1aae9fada17df6639bf594aa9c60e43473506b45",
+      "release": "4bb9f020d0d3c0760c60f7e3a28e32e4429139c82023785d5415f83bcb054170",
+      "spkiSha256": "5c072b2d31d0746c4371ba466e367720cbafde796c0d7d028ec7a3520b03872c",
+      "healthPath": "/",
+      "healthStatus": 200
+    },
+    "ordinary_public_tls_http_status": 200,
+    "production_search_timing_caveat": "User confirmed submitting a concurrent request during the synthetic probe. Timing is functional-release evidence, not an isolated benchmark or A/B speedup.",
+    "production_search_success": {
+      "requested_at": "2026-09-30T16:07:36.262Z",
+      "http_status": 200,
+      "answer_completed": true,
+      "finish_reason": "stop",
+      "search_ms": 2050,
+      "source_count": 6,
+      "prompt_tokens": 3362,
+      "prefill_ms": 241696,
+      "first_delta_ms": 244449,
+      "decode_ms": 5684,
+      "tokens": 89,
+      "tok_per_s": 15.7,
+      "target": "gpu",
+      "draft_accepted": 36,
+      "draft_tokens": 53,
+      "total_ms": 250007,
+      "tools": false,
+      "web_search": true,
+      "answer": "NASA explains that the Moon is always half-lit by the Sun, and the phases we see are simply the changing perspective of that half-lit side as the Moon orbits Earth over the course of a month [1][2]. The Moon does not produce its own light; \"moonlight\" is reflected sunlight, and the division between the bright day side and dark night side shifts as Earth and the Moon move through space [1][2].",
+      "cited_sources": [
+        "https://science.nasa.gov/moon/moon-phases/",
+        "https://science.nasa.gov/moon/top-moon-questions/"
+      ],
+      "timing_caveat": "Functional test during concurrent user activity, not an isolated benchmark or before/after comparison."
+    },
+    "production_search_concurrent_failure": {
+      "requested_at": "2026-09-30T16:01:40.345Z",
+      "http_status": 200,
+      "search_ms": 2384,
+      "source_count": 6,
+      "prompt_tokens": 4347,
+      "total_ms": 296880,
+      "answer_completed": false,
+      "error": "kv_pool_full",
+      "last_prefill_progress": 4275,
+      "concurrent_user_request": true,
+      "interpretation": "Search retrieval passed; generation failed under concurrent KV pressure. Not a valid latency benchmark. No user sessions evicted."
+    }
+  },
+  "startup_recovery": "Initial create refused by unchanged 16384 MiB host memory floor. Closed owned review/test tabs and reset our CUA worker, freeing about 1.7 GiB; next scheduled retry admitted guest. No other app or host service restarted.",
+  "remaining_issue": "Larger 4347-token test hit kv_pool_full during concurrent user request; no active sessions evicted and no capacity/runtime changes made."
+}

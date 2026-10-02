@@ -81,3 +81,41 @@ test('the shared-warm-up wait has its own label, and own progress keeps its labe
     'Model loaded · preparing chat: 512 / 2453 tokens');
   assert.equal(warmupStatus('loading'), 'loading');
 });
+
+
+test('warmup mirrors the chat Loop switch only when tools are enabled', () => {
+  const start = html.indexOf('function switchesForWarm()');
+  const stop = html.indexOf('function toolsField()', start);
+  const state = {webMode:'auto', loopOn:true};
+  let toolsOn = true;
+  const scope = vm.createContext({state, toolsField:()=>({off:[]}), anyToolsOn:()=>toolsOn});
+  vm.runInContext(html.slice(start, stop), scope);
+  assert.equal(scope.switchesForWarm().loop, true);
+  state.loopOn = false;
+  assert.equal(scope.switchesForWarm().loop, undefined);
+  state.loopOn = true;
+  toolsOn = false;
+  assert.equal(scope.switchesForWarm().loop, undefined);
+});
+
+test('selected warmup uses current credentials without putting them in the URL', async () => {
+  const start = html.indexOf('async function warm()');
+  const stop = html.indexOf('// ------------------------------------------------------------ boot screen', start);
+  let captured;
+  let signedIn = true;
+  const scope = vm.createContext({
+    state: {model:'test-model', target:'auto'}, Date, AbortSignal,
+    pill:()=>{}, ICONS:{tick:'', alert:''}, warmPill:{},
+    switchesForWarm:()=>({loop:true}),
+    ssoHeaders:()=>signedIn ? {'x-api-key':'synthetic-test-token'} : {},
+    fetch:async(url, options)=>{captured={url,options};return {ok:true};},
+    readWarmupResponse:async()=>({ok:true,target:'gpu'}),
+  });
+  vm.runInContext(html.slice(start, stop), scope);
+  await scope.warm();
+  assert.equal(captured.options.headers['x-api-key'], 'synthetic-test-token');
+  assert.equal(captured.url.includes('synthetic-test-token'), false);
+  signedIn = false;
+  await scope.warm();
+  assert.equal(Object.keys(captured.options.headers).length, 0);
+});

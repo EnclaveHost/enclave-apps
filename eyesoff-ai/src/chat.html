@@ -2255,6 +2255,9 @@ addEventListener("message", (e) => {
   if (ssoAccept(d.enclave_sso)) {
     renderSsoUI();
     closeSso();
+    // Anonymous boot preparation cannot include the signed-in user's tools.
+    // Prepare that exact prefix as soon as the identity becomes available.
+    if (state.model) void warm();
     // a sign-in that started from the API dialog's "Sign in to reveal"
     // finishes what it was for: the dialog is still open, so the click's
     // intent is unambiguous
@@ -4880,6 +4883,7 @@ function switchesForWarm() {
   if (state.image && state.image.enabled) o.image_gen = state.imageOn ? "auto" : "off";
   const t = toolsField();
   if (t !== undefined) o.tools = t;
+  if (anyToolsOn() && state.loopOn) o.loop = true;
   return o;
 }
 function toolsField() {
@@ -5249,7 +5253,7 @@ async function warm() {
   q.push("switches=" + encodeURIComponent(JSON.stringify(switchesForWarm())));
   try {
     const res = await fetch("warmup" + (q.length ? "?" + q.join("&") : ""),
-      { signal: AbortSignal.timeout(180000) });
+      { headers: ssoHeaders(), signal: AbortSignal.timeout(180000) });
     const d = await readWarmupResponse(res, (s) => {
       pill("", '<span class="spin"></span>', warmupStatus(s));
     });
@@ -5384,7 +5388,7 @@ async function warmLadder() {
     let ok = false, unfit = false, code = null, err = "";
     try {
       const res = await fetch("warmup?model=" + encodeURIComponent(m.name) + q,
-        { signal: AbortSignal.timeout(600000) });
+        { headers: ssoHeaders(), signal: AbortSignal.timeout(600000) });
       const d = await readWarmupResponse(res, (s) => {
         const label = warmupStatus(s);
         bootMsg.textContent = label;

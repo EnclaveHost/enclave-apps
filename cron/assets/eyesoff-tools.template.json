@@ -1,0 +1,17 @@
+{
+  "tools": {
+    "mcp": [
+      {
+        "group": "scheduler",
+        "url": "https://SCHEDULER_ID.app.enclave.host/mcp",
+        "headers": {
+          "x-api-key": "$CRON_API_KEY",
+          "x-user": "$user"
+        },
+        "handshake": false,
+        "timeout_s": 30,
+        "groups": { "scheduler": ["schedule_*"] }
+      }
+    ]
+  }
+}

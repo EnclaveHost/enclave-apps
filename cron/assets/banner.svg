@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" role="img" aria-labelledby="title desc">
+  <title id="title">Enclave Cron — Give your agent a schedule.</title>
+  <desc id="desc">A dark navy banner with mint typography, a clock and a flowing timeline of scheduled runs.</desc>
+  <defs>
+    <radialGradient id="ambient" cx="80%" cy="50%" r="65%">
+      <stop offset="0" stop-color="#153c3c"/>
+      <stop offset="1" stop-color="#0b111a"/>
+    </radialGradient>
+    <linearGradient id="track" x1="770" x2="1600" y1="0" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#54d9bc" stop-opacity="0"/>
+      <stop offset=".4" stop-color="#54d9bc" stop-opacity=".6"/>
+      <stop offset="1" stop-color="#54d9bc" stop-opacity=".15"/>
+    </linearGradient>
+    <linearGradient id="face" x1="1100" y1="60" x2="1400" y2="340" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#162c34"/>
+      <stop offset="1" stop-color="#0b1822"/>
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0 H0 V48" fill="none" stroke="#7bc1b5" stroke-opacity=".035"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="400" fill="url(#ambient)"/>
+  <rect width="1600" height="400" fill="url(#grid)"/>
+  <g fill="none" stroke="#54d9bc">
+    <circle cx="1240" cy="200" r="188" stroke-opacity=".10"/>
+    <circle cx="1240" cy="200" r="230" stroke-opacity=".07"/>
+    <circle cx="1240" cy="200" r="280" stroke-opacity=".04"/>
+  </g>
+  <g fill="none" stroke="url(#track)" stroke-width="2">
+    <path d="M770 200 H1000 Q1034 200 1058 176 L1095 139 H1600"/>
+    <path d="M820 277 H1020 Q1050 277 1074 253 L1110 217 H1600"/>
+    <path d="M860 91 H1000 Q1030 91 1054 115 L1095 156"/>
+  </g>
+  <g fill="#54d9bc">
+    <circle cx="972" cy="200" r="5"/>
+    <circle cx="1040" cy="273" r="4"/>
+    <circle cx="1463" cy="139" r="5"/>
+    <circle cx="1518" cy="217" r="4"/>
+  </g>
+  <circle cx="1240" cy="200" r="139" fill="url(#face)" stroke="#335751"/>
+  <g transform="translate(1110 70) scale(2.7083333)">
+    <path d="M75 31 A32 32 0 1 0 79 57" fill="none" stroke="#54d9bc" stroke-width="5" stroke-linecap="round"/>
+    <path d="M78 14 L82 38 L59 31 Z" fill="#54d9bc"/>
+    <path d="M48 29 V48 L61 56" fill="none" stroke="#d8fff3" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="48" cy="48" r="3.5" fill="#54d9bc"/>
+  </g>
+  <g font-family="ui-monospace, 'DejaVu Sans Mono', monospace">
+    <text x="88" y="74" font-size="16" letter-spacing="4" fill="#54d9bc">ENCLAVE / APPS</text>
+    <text x="82" y="180" font-size="88" font-weight="700" letter-spacing="-5" fill="#eefaf7">cron<tspan fill="#54d9bc">.</tspan></text>
+  </g>
+  <g font-family="Inter, 'DejaVu Sans', sans-serif">
+    <text x="88" y="243" font-size="32" fill="#d1e4e1">Give your agent a schedule.</text>
+    <text x="88" y="288" font-size="20" fill="#91aaa9">Agent runs and webhooks, right on time.</text>
+  </g>
+  <g font-family="ui-monospace, 'DejaVu Sans Mono', monospace" font-size="13" letter-spacing="1.5" fill="#a1c2ba">
+    <text x="89" y="347">ONE-TIME</text>
+    <circle cx="197" cy="342" r="2" fill="#54d9bc"/>
+    <text x="222" y="347">RECURRING</text>
+    <circle cx="340" cy="342" r="2" fill="#54d9bc"/>
+    <text x="365" y="347">MCP READY</text>
+  </g>
+</svg>
