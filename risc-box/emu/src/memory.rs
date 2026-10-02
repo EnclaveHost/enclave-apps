@@ -212,6 +212,7 @@ impl Memory {
 		self.len
 	}
 
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
 	/// risc-box patch (codegen JIT): the chunk pointer tables generated code
 	/// reads — `rd[i]`/`wr[i]` for chunk i, exactly as `rd_at`/`wr_at` use
 	/// them. Valid until the next `init` (which reallocates both).

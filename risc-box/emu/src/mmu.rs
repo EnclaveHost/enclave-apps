@@ -475,6 +475,7 @@ impl Mmu {
 		self.memory.code_gen()
 	}
 
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
 	/// risc-box patch (codegen JIT): the current translation meta — every
 	/// input a TLB hit depends on (generation, privilege, MPRV/MPP).
 	#[inline(always)]
@@ -482,6 +483,7 @@ impl Mmu {
 		self.tlb_meta_cache
 	}
 
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
 	/// risc-box patch (codegen JIT): addresses of the software TLB's READ and
 	/// WRITE ways and of the meta cache cell, in the order jit::TlbLayout
 	/// names them (tags, metas, ppns for read, then write, then meta).
@@ -498,6 +500,7 @@ impl Mmu {
 		], TLB_SETS as u32)
 	}
 
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
 	/// risc-box patch (codegen JIT): (read table, write table, exec-page
 	/// marks, DRAM length) — what the chunked-RAM tier reads. The tables move
 	/// only when the memory is re-initialized.

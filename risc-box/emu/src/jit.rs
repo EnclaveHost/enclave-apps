@@ -148,10 +148,8 @@ const LOCAL_SET: u8 = 0x21;
 const LOCAL_TEE: u8 = 0x22;
 const I32_LOAD: u8 = 0x28;
 const I64_LOAD: u8 = 0x29;
-const F64_LOAD: u8 = 0x2b;
 const I32_LOAD8_U: u8 = 0x2d;
 const I64_STORE: u8 = 0x37;
-const F64_STORE: u8 = 0x39;
 const I32_CONST: u8 = 0x41;
 const I64_CONST: u8 = 0x42;
 const I32_GE_U: u8 = 0x4f;
@@ -725,7 +723,7 @@ impl<'a> Emit<'a> {
 
 /// Whether emit_seq translates `op` (anything else becomes a bail to the
 /// interpreter). Kept beside emit_seq; a test pins the two together.
-pub fn translatable(op: &BlockOp) -> bool {
+pub(crate) fn translatable(op: &BlockOp) -> bool {
 	if op.kind == 0 {
 		return table_op(op).is_some();
 	}
@@ -891,10 +889,11 @@ fn emit_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
 	e.set_x_post(rd);
 }
 
+#[cfg(feature = "codegen")]
 /// The cache key of a region's module, computed from its SOURCE (module
 /// pcs and ops) and the layout's hash without emitting it: two hashes of
 /// the same bytes the emitter is a pure function of.
-pub fn source_key(blocks: &[(u64, Vec<BlockOp>)], layout_hash: u64) -> (u64, u64, u64) {
+pub(crate) fn source_key(blocks: &[(u64, Vec<BlockOp>)], layout_hash: u64) -> (u64, u64, u64) {
 	use std::hash::Hasher;
 	let mut sip = std::collections::hash_map::DefaultHasher::new();
 	for &(pc, ref ops) in blocks {
@@ -910,6 +909,7 @@ pub fn source_key(blocks: &[(u64, Vec<BlockOp>)], layout_hash: u64) -> (u64, u64
 	(layout_hash, hash_blocks(blocks), sip.finish())
 }
 
+#[cfg(feature = "codegen")]
 /// A stable hash of everything in a Layout the emitted code depends on.
 pub fn layout_hash(lay: &Layout) -> u64 {
 	use std::hash::{Hash, Hasher};

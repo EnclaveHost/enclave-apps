@@ -6355,6 +6355,7 @@ const DECODE_CACHE_ENTRY_NUM: usize = 0x4000; // risc-box patch: was 0x1000
 // INSTRUCTIONS-index field of a predecoded BlockOp.
 const ICACHE_LEN4: u16 = 0x8000;
 
+#[cfg(feature = "jit")]
 /// risc-box patch (jit): the INSTRUCTIONS entry a non-hot (kind 0) op runs —
 /// exactly the closure exec_op dispatches to, so the translator keys on the
 /// interpreter's own decode.
