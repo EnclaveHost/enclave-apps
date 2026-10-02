@@ -653,6 +653,9 @@ pub struct JitState {
 	lay_hash: u64,
 	/// direct-mapped by the same index as block_heads
 	slots: Vec<JitSlot>,
+	/// one bit per slot ever installed: the dispatch path tests this 4 KiB
+	/// (L1-resident) map before touching the 512 KiB slot array
+	present: Vec<u64>,
 	regions: Vec<JitRegion>,
 	free: Vec<u32>,
 	/// (table index, pc bias) -> installed instance
@@ -828,6 +831,7 @@ impl JitState {
 			self.release(old.region);
 		}
 		self.slots[slot] = JitSlot { tag, region: rid, entry };
+		self.present[slot >> 6] |= 1 << (slot & 63);
 	}
 
 	fn release(&mut self, rid: u32) {
@@ -874,6 +878,9 @@ impl JitState {
 	fn clear(&mut self) {
 		for s in self.slots.iter_mut() {
 			*s = JitSlot::EMPTY;
+		}
+		for w in self.present.iter_mut() {
+			*w = 0;
 		}
 		self.regions.clear();
 		self.free.clear();
@@ -1572,6 +1579,7 @@ impl Cpu {
 			lay,
 			lay_hash,
 			slots: vec![JitSlot::EMPTY; BLOCK_SLOTS],
+			present: vec![0; BLOCK_SLOTS / 64],
 			regions: Vec::new(),
 			free: Vec::new(),
 			instances: Default::default(),
@@ -1668,6 +1676,9 @@ impl Cpu {
 	fn jit_run(&mut self, slot: usize, tag: u64) -> u64 {
 		let (rid, entry, fresh, ok) = match self.jit.as_deref() {
 			Some(j) if j.live => {
+				if (j.present[slot >> 6] >> (slot & 63)) & 1 == 0 {
+					return 0;
+				}
 				let s = j.slots[slot];
 				if s.tag != tag {
 					return 0;
