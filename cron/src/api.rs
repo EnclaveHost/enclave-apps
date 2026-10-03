@@ -144,6 +144,23 @@ pub fn command(
         _ => Err("Unknown scheduler command".into()),
     }
 }
+/// Reject stale reads and new work while durable ownership is unavailable.
+/// The listener stays alive so recovery does not destroy the partition's TLS key.
+pub fn unavailable(_r: &Request) -> Response {
+    response(
+        503,
+        "Service Unavailable",
+        json!({
+            "ok":false,"ready":false,"service":"enclave-cron",
+            "version":env!("CARGO_PKG_VERSION"),
+            "error":"Scheduler storage unavailable; recovering safely"
+        })
+        .to_string(),
+    )
+    .with("retry-after", "5")
+    .with("cache-control", "no-store")
+}
+
 pub fn route(c: &Config, s: &mut State, r: &Request, now: u64, slots: usize) -> Outcome {
     let simple = |response| Outcome {
         response,

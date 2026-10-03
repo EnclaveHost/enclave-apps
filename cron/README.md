@@ -147,9 +147,13 @@ secret can decrypt it; this is not protection from that secret's holder.
 A 120-second lease, renewed every 30 seconds, and ETag compare-and-swap writes
 fence concurrent scheduler instances. Mutations and a run's `running` record
 are committed **before** acknowledgement or outbound effects. Missing ETags,
-CAS conflicts, invalid ciphertext, and failed/ambiguous writes stop execution.
-A replacement starts only after the lease expires. No partial/missing storage
-response is interpreted as an empty database except an explicit 404.
+CAS conflicts, invalid ciphertext, and failed/ambiguous writes stop dispatch and
+return HTTP 503 with `Retry-After`. The process and listener stay alive, preserving
+the runtime's TLS key instead of forcing a new certificate issuance. Recovery
+retries with backoff (1–30 seconds), discards in-memory state and ETags, and reloads
+durable state. Dispatch resumes only after the existing lease expires and a new
+CAS lease is acquired. No partial/missing storage response is interpreted as an
+empty database except an explicit 404.
 
 This is **not exactly-once delivery**. A crash or timeout after an endpoint
 accepts a request has an unknown outcome. Interrupted runs are recorded as

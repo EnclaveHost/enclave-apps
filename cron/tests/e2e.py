@@ -12,7 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 KEY='test-service-key-'+('a'*40);MASTER='test-encryption-key-'+('b'*40)
 USER='acct_'+('a'*32);OTHER='acct_'+('b'*32)
 ACCESS='synthetic-access';SECRET='synthetic-storage-secret'
-blob=None;etag=None;calls=[];lock=threading.Lock();fail_put=False
+blob=None;etag=None;calls=[];lock=threading.Lock();fail_put=False;lose_put_reply=False
 
 def seal_state(state):
     k=hmac.new(hashlib.sha256(MASTER.encode()).digest(),b'enclave-cron-v1:state',hashlib.sha256).digest()
@@ -51,14 +51,21 @@ class Mock(BaseHTTPRequestHandler):
             with lock:self.send(200,blob,{'ETag':etag}) if blob is not None else self.send(404)
         else:self.send(404)
     def do_PUT(self):
-        global blob,etag
+        global blob,etag,lose_put_reply
         b=self.rfile.read(int(self.headers.get('Content-Length','0')))
         if not self.signature_ok(b):self.send(403);return
         with lock:
             if fail_put:self.send(503);return
             good=self.headers.get('If-Match')==etag if blob is not None else self.headers.get('If-None-Match')=='*'
             if not good:self.send(412);return
-            blob=b;etag='"'+hashlib.sha256(b).hexdigest()+'"';self.send(200,b'',{'ETag':etag})
+            blob=b;etag='"'+hashlib.sha256(b).hexdigest()+'"'
+            if lose_put_reply:
+                lose_put_reply=False
+                self.close_connection=True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            self.send(200,b'',{'ETag':etag})
     def do_POST(self):
         b=self.rfile.read(int(self.headers.get('Content-Length','0')))
         with lock:calls.append({'path':self.path,'body':json.loads(b),'idempotency':self.headers.get('Idempotency-Key'),'user':self.headers.get('X-User'),'api_key':self.headers.get('X-Api-Key')})
@@ -81,7 +88,7 @@ def wait_for(fn,seconds=25):
         time.sleep(.1)
     raise AssertionError('Timed out waiting for condition')
 def main():
-    global fail_put,blob,etag
+    global fail_put,blob,etag,lose_put_reply
     ap=argparse.ArgumentParser();ap.add_argument('--native',action='store_true');ap.add_argument('--https-check',action='store_true');args=ap.parse_args()
     mock=ThreadingHTTPServer(('127.0.0.1',0),Mock);threading.Thread(target=mock.serve_forever,daemon=True).start();mp=mock.server_port;p=port();origin=f'http://127.0.0.1:{p}'
     config={'api_key':KEY,'storage':{'endpoint':f'http://127.0.0.1:{mp}','bucket':'bucket','key':'cron/state','region':'auto','access_key':ACCESS,'secret_key':SECRET,'master_key':MASTER},'local_test':True,'concurrency':2,'targets':{'ai':{'kind':'eyesoff','url':f'http://127.0.0.1:{mp}/chat','api_keys':{USER:'personal-synthetic-key'},'model':'test','timeout_s':30},'hook':{'kind':'http','url':f'http://127.0.0.1:{mp}/hook','users':[USER],'timeout_s':30}}}
@@ -126,7 +133,7 @@ def main():
             code,m=req('/mcp',{'jsonrpc':'2.0','id':2,'method':'tools/call','params':{'name':'schedule_list','arguments':{}}});assert code==200 and not m['result']['isError']
             if args.https_check:
                 tls=spec('tls-check',3600);tls['action']={'kind':'http','target':'tls','body':{}};tj=call('schedule_create',tls)['job'];tr=call('schedule_run_now',{'id':tj['id'],'request_key':'tls'})['run'];wait_for(lambda:any(r['id']==tr['id'] and r['status']=='succeeded' for r in call('schedule_get',{'id':tj['id']})['runs']),40)
-            # Another process cannot acquire an unexpired lease (and must not bind).
+            # Another process cannot bind the same listener.
             second=launch();assert second.wait(timeout=15)!=0
             # Crash before a due time, skip the missed one-time occurrence after recovery.
             missed=call('schedule_create',spec('missed',2))['job'];pr.kill();pr.wait();time.sleep(3);expire_lease();pr=launch();wait_for(lambda:req('/ping')[0]==200)
@@ -136,21 +143,52 @@ def main():
             # An in-flight callback is never automatically replayed after a crash.
             ir=call('schedule_run_now',{'id':j['id'],'request_key':'interrupt'})['run'];wait_for(lambda:len(calls)==4);pr.kill();pr.wait();expire_lease();pr=launch();wait_for(lambda:req('/ping')[0]==200)
             assert next(r for r in call('schedule_get',{'id':j['id']})['runs'] if r['id']==ir['id'])['status']=='interrupted';assert len(calls)==4
-            # A conditional-write conflict fences before an effect, not just startup.
+            # A competing writer fences the current ownership session but keeps
+            # the SAME process/listener alive. Nothing is sent until CAS reacquisition.
             with lock:etag='"changed-by-competing-writer"'
-            try:call('schedule_run_now',{'id':j['id'],'request_key':'conflict-must-not-send'})
-            except Exception:pass
-            assert pr.wait(timeout=20)!=0;assert len(calls)==4
-            expire_lease();pr=launch();wait_for(lambda:req('/ping')[0]==200)
-            # Failed durability must not acknowledge or dispatch an effect.
+            assert req('/api/schedule_run_now',{'id':j['id'],'request_key':'conflict-must-not-send'})[0]==503
+            assert pr.poll() is None and len(calls)==4
+            assert req('/ping')[0]==503 and req('/api/schedule_list',{})[0]==503
+            time.sleep(2);assert req('/ping')[0]==503 and len(calls)==4
+            expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
+            assert pr.poll() is None and len(calls)==4
+            assert not any(r['id']==hashlib.sha256((j['id']+':manual:conflict-must-not-send').encode()).hexdigest() for r in opened()['runs'])
+            # A transient storage failure does not acknowledge or dispatch, destroy
+            # the serving process, or require a new certificate after recovery.
             fail_put=True
-            try:call('schedule_run_now',{'id':j['id'],'request_key':'must-not-send'})
-            except Exception:pass
-            assert pr.wait(timeout=20)!=0;assert len(calls)==4
-            fail_put=False
-            with lock:blob=blob[:-1]+bytes([blob[-1]^1])
-            corrupt=launch();assert corrupt.wait(timeout=20)!=0;assert len(calls)==4
-            print(json.dumps({'mode':'native' if args.native else 'wasm32-wasip2','passed':['SigV4 storage signing','encrypted durable writes','HTTP webhook dispatch','CAS lease exclusivity','per-user API/target isolation','autonomous one-time dispatch','authenticated Eyesoff callback','MCP tools','same-second idempotent manual run','restart preserves jobs/results','skip missed after crash','storage failure fences effects','interrupted delivery is not replayed','live CAS conflict fences effects','corrupt state fails closed'],'callbacks':len(calls)}))
+            assert req('/api/schedule_run_now',{'id':j['id'],'request_key':'must-not-send'})[0]==503
+            assert pr.poll() is None and len(calls)==4 and req('/ping')[0]==503
+            fail_put=False;expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
+            assert pr.poll() is None and len(calls)==4
+            # Idle lease renewal takes the same safe recovery path, without any
+            # API mutation being necessary to trigger a storage failure.
+            fail_put=True
+            wait_for(lambda:req('/ping')[0]==503,40)
+            assert pr.poll() is None and len(calls)==4
+            fail_put=False;expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
+            assert pr.poll() is None and len(calls)==4
+            # The storage accepted a run claim but the reply was lost. Recover from
+            # durable state without replaying an effect whose outcome is unknown.
+            lose_put_reply=True
+            assert req('/api/schedule_run_now',{'id':j['id'],'request_key':'lost-reply'})[0]==503
+            assert pr.poll() is None and len(calls)==4
+            claimed=opened()['runs'][-1]['id']
+            expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
+            recovered=next(r for r in call('schedule_get',{'id':j['id']})['runs'] if r['id']==claimed)
+            assert recovered['status']=='interrupted' and len(calls)==4
+            assert call('schedule_run_now',{'id':j['id'],'request_key':'lost-reply'})['run']['id']==claimed
+            assert len(calls)==4
+            # A recovered ownership session can dispatch new work exactly once.
+            rr=call('schedule_run_now',{'id':j['id'],'request_key':'after-recovery'})['run']
+            wait_for(lambda:any(r['id']==rr['id'] and r['status']=='succeeded' for r in call('schedule_get',{'id':j['id']})['runs']))
+            assert len(calls)==5
+            # Corrupt durable state stays unavailable and is never replaced.
+            pr.kill();pr.wait()
+            with lock:blob=blob[:-1]+bytes([blob[-1]^1]);corrupted=blob
+            corrupt=launch();wait_for(lambda:req('/ping')[0]==503)
+            time.sleep(2)
+            assert corrupt.poll() is None and blob==corrupted and len(calls)==5
+            print(json.dumps({'mode':'native' if args.native else 'wasm32-wasip2','passed':['SigV4 storage signing','encrypted durable writes','HTTP webhook dispatch','CAS lease exclusivity','per-user API/target isolation','autonomous one-time dispatch','authenticated Eyesoff callback','MCP tools','same-second idempotent manual run','restart preserves jobs/results','skip missed after crash','storage failure fences effects','interrupted delivery is not replayed','live CAS conflict fences effects','corrupt state fails closed','storage recovery preserves process/listener','ambiguous accepted write never replays','new work succeeds after reacquisition'],'callbacks':len(calls)}))
         finally:
             for pr in procs:
                 if pr.poll() is None:pr.kill();pr.wait()
