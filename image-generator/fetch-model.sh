@@ -51,7 +51,7 @@
 # PRESENCE is what marks a volume as an upscaler volume, so it must never
 # appear inside a generation volume.
 #
-# Usage: ./fetch-model.sh [z-image-turbo|qwen-image-2512|realesrgan-x4plus|all]   (default: all)
+# Usage: ./fetch-model.sh [z-image-turbo|qwen-image-2512|qwen-image-2.1|realesrgan-x4plus|all]   (default: all)
 set -euo pipefail
 cd "$(dirname "$0")"
 want="${1:-all}"
@@ -84,6 +84,21 @@ if [ "$want" = qwen-image-2512 ] || [ "$want" = all ]; then
     fetch $REPO $REV diffusion.gguf 86aafc37f65dfb4da7be8436ff6a3d91b12203ab9b855448d3d452398fb99ff2 $DEST
     fetch $REPO $REV llm.gguf ee770c700d7429cc6f0c74d6c7ab3c063bf521312fc36e80776d1d79bc9fa4ad $DEST
     fetch $REPO $REV vae.safetensors a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f $DEST
+fi
+
+# Requires a Qwen Image 2.1 engine; commercial use needs a separate license.
+if [ "$want" = qwen-image-2.1 ] || [ "$want" = all ]; then
+    REPO=EnclaveHost/qwen-image-2.1-sd
+    REV=8cea12a545e45bb3651011b1b760163a426e3c83
+    DEST=model-volume/qwen-image-2.1-sd
+    fetch $REPO $REV diffusion.gguf f8b244b00937f0e444a40dbf7866460871b89b30142594973b6012d1b471dc0a $DEST
+    fetch $REPO $REV llm.gguf 0d264b3941185d00a74f75c4245521dae088ff1efc90ab8d1754e83f5844adb0 $DEST
+    fetch $REPO $REV vae.safetensors bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9 $DEST
+    fetch $REPO $REV LICENSE 8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d $DEST
+    fetch $REPO $REV README.md d0f181743a677b1c5700b0ea57e421f526c113f3038749838e4cf10c36d0e331 $DEST
+    fetch $REPO $REV Notice 700ac149f5fce531c02eb7c0e85ce64bce6702fbacfec4db015c77ed69d0229a $DEST
+    fetch $REPO $REV LICENSE.text-encoder cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 $DEST
+    fetch $REPO $REV provenance.json 210a3396ce3d80e261edb635f9af52f280a27d415316e5d02504cd7bfc3fa96e $DEST
 fi
 
 if [ "$want" = realesrgan-x4plus ] || [ "$want" = all ]; then

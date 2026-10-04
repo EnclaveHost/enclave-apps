@@ -11,6 +11,16 @@ web playground at `/`. The stock catalog:
 |---|---|---|---|
 | `qwen-image-2512` | Qwen-Image-2512 (20B MMDiT, Apache-2.0) + lightx2v Lightning 8-step merge; the flagship: SOTA open-weights quality, legible text rendering | 8 | ~34 GB @1024px (tiled VAE) |
 | `z-image-turbo` | Tongyi-MAI Z-Image-Turbo (6B, Apache-2.0); the fast one | 4–8 | ~13 GB @1024px (tiled VAE) |
+| `qwen-image-2.1` | Qwen-Image-2.1 Q8_0 with Qwen3-VL-8B Q8_0 and its own BF16 VAE; Qwen Research License | 40 | Not measured |
+
+`qwen-image-2.1` uses volume `qwen-image-2.1-sd`, CFG 6.0 and the Euler
+sampler. It requires an engine that supports Qwen Image 2.1; the historical
+`b5d81200` fleet engine cannot load it. Its research license requires a
+separate license for commercial use. The catalog entry alone does not make
+the model available on a host: the compatible runtime and model volume must
+both be installed. Download the pinned bundle with
+`./fetch-model.sh qwen-image-2.1`; upstream provenance and license notices
+are included in the [EnclaveHost bundle](https://huggingface.co/EnclaveHost/qwen-image-2.1-sd/tree/8cea12a545e45bb3651011b1b760163a426e3c83).
 
 Plus an **upscale option** over the same interface: Real-ESRGAN x4plus
 (official BSD-3 weights, 4x) as its own tiny upscaler volume, run by
@@ -49,7 +59,7 @@ shape, the error and timing rules) is [docs/api.md](docs/api.md).
 `model` names an entry from the config's `models` catalog (matched by
 display `name` **or** volume name); absent/empty means the deployment's
 default: the **largest attached model** (by `max_size`, later catalog
-entries win ties, so the flagship when both are attached). Sizes snap to
+entries win ties). Sizes snap to
 sd.cpp's multiple of 64 inside each model's min/max; the playground offers
 512 / 1024 / 2048 as the long edge plus an aspect picker (1:1, 4:3, 3:4,
 3:2, 2:3, 16:9, 9:16; each option shows the exact WxH it produces, and
@@ -57,8 +67,9 @@ ratios whose short edge would fall below the model's min are disabled).
 Same seed + params → same image (per sd.cpp build; seeds are not
 torch-compatible).
 
-Both stock models are step-distilled: `cfg` defaults to 1.0 and the
-useful step counts are 4–8. `negative_prompt` needs `cfg > 1` to have any
+Qwen-Image-2512 Lightning and Z-Image-Turbo are step-distilled: their `cfg`
+defaults to 1.0 and useful step counts are 4–8. Qwen-Image-2.1 uses CFG 6
+and 40 steps. `negative_prompt` needs `cfg > 1` to have any
 effect (that's how CFG works), which costs a second denoise pass per step
 and is off-recipe for distilled checkpoints.
 
