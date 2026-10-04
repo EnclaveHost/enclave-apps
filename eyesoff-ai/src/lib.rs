@@ -5807,20 +5807,22 @@ impl<'a> ToolLoop<'a> {
         self.reg.makes_image(self.cfg)
     }
 
-    /// The model owns the looking this turn (some armed tool takes $images):
-    /// the delegated-vision pre-pass stands down, and the leg stashes the
-    /// pictures here (stash_images).
-    fn owns_vision(&self) -> bool {
-        self.reg.image_reader(self.cfg).is_some()
-    }
-
-    /// Take the attached pictures out of the conversation and hold them for
-    /// the image-taking tools. Called by the legs exactly when owns_vision().
-    fn stash_images(&mut self, messages: &mut [ChatMsg]) {
+    /// Keep image-tool inputs available without taking pictures away from a
+    /// local VLM or a configured vision service. Return whether a tool owns
+    /// image reading and the delegated pre-pass should stand down.
+    fn prepare_images(
+        &mut self,
+        cfg: &AppConfig,
+        requested: Option<&str>,
+        messages: &mut [ChatMsg],
+    ) -> bool {
         let (reader, transformer) = self.reg.image_tool_names(self.cfg);
-        let (reader, transformer) =
-            (reader.map(str::to_string), transformer.map(str::to_string));
-        self.images = stash_images_for_tool(messages, reader.as_deref(), transformer.as_deref());
+        let (images, tool_vision) = prepare_tool_images(
+            messages, reader, transformer,
+            images_read_locally(cfg, requested), cfg.vision_service.is_some(),
+        );
+        self.images = images;
+        tool_vision
     }
 
     fn armed(&self) -> bool {
@@ -6581,6 +6583,27 @@ fn call_excerpt(text: &str) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+/// A transformer needs the same bytes as vision, but cannot replace it.
+/// Copy the latest attachment for tools when another path reads the image;
+/// only remove image parts when the tool loop is responsible for them.
+fn prepare_tool_images(
+    messages: &mut [ChatMsg],
+    reader: Option<&str>,
+    transformer: Option<&str>,
+    local_vision: bool,
+    delegated_vision: bool,
+) -> (Vec<Vec<u8>>, bool) {
+    if reader.is_none() && transformer.is_none() {
+        return (Vec::new(), false);
+    }
+    if local_vision || (reader.is_none() && delegated_vision) {
+        let images = messages.iter().rev().find(|m| !m.images.is_empty())
+            .map(|m| m.images.clone()).unwrap_or_default();
+        return (images, false);
+    }
+    (stash_images_for_tool(messages, reader, transformer), true)
 }
 
 /// When the model holds an image-reading tool, the pictures must leave the
@@ -8873,10 +8896,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // it; the report is prepended to whatever that leg left behind. When the
     // MODEL holds view_image the pre-pass stands down: the pictures leave the
     // prompt and wait for the tool instead.
-    let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
-        if let Some(t) = &mut tl {
-            t.stash_images(&mut messages);
-        }
+    let vision_meta = if tl.as_mut().is_some_and(|t| {
+            t.prepare_images(cfg, creq.model.as_deref(), &mut messages)
+        }) {
         None
     } else {
         match apply_vision(cfg, &creq, &mut messages, &tok, mode, &status_cb) {
@@ -9408,10 +9430,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // vision_service, or a serving model reading the picture itself,
         // no-ops here. When the MODEL holds view_image the pre-pass stands
         // down and the pictures wait for the tool.
-        let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
-            if let Some(t) = &mut tl {
-                t.stash_images(&mut messages);
-            }
+        let vision_meta = if tl.as_mut().is_some_and(|t| {
+            t.prepare_images(cfg, creq.model.as_deref(), &mut messages)
+        }) {
             None
         } else {
             match apply_vision(cfg, &creq, &mut messages, &tok, mode, &leg_status) {
@@ -9715,10 +9736,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(m) => m,
             Err(e) => return json_err(out, 502, &e),
         };
-        let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
-            if let Some(t) = &mut tl {
-                t.stash_images(&mut messages);
-            }
+        let vision_meta = if tl.as_mut().is_some_and(|t| {
+            t.prepare_images(cfg, creq.model.as_deref(), &mut messages)
+        }) {
             None
         } else {
             match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
@@ -11057,6 +11077,55 @@ mod tests {
         let _ = stash_images_for_tool(&mut msgs, Some("view_image"), None);
         assert!(msgs[0].content.contains("generated earlier"), "{}", msgs[0].content);
         assert!(msgs[0].images.is_empty());
+    }
+
+    #[test]
+    fn image_transformer_preserves_local_and_delegated_vision() {
+        for (local, delegated) in [(true, false), (true, true), (false, true)] {
+            let mut older = ChatMsg::text("user", "first image");
+            older.images = vec![vec![1, 2]];
+            let mut latest = ChatMsg::text("user", "describe this image");
+            latest.images = vec![vec![3, 4], vec![5, 6]];
+            let mut messages = vec![older, latest];
+            let (tool_images, tool_vision) = prepare_tool_images(
+                &mut messages, None, Some("upscale_image"), local, delegated,
+            );
+            assert!(!tool_vision, "the upscaler must not bypass vision");
+            assert_eq!(tool_images, vec![vec![3, 4], vec![5, 6]]);
+            assert_eq!(messages[0].images, vec![vec![1, 2]]);
+            assert_eq!(messages[1].images, tool_images);
+            assert_eq!(messages[1].content, "describe this image");
+        }
+    }
+
+    #[test]
+    fn image_reader_owns_only_nonlocal_vision() {
+        for (local, delegated) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut message = ChatMsg::text("user", "describe this image");
+            message.images = vec![vec![1, 2, 3]];
+            let mut messages = vec![message];
+            let (images, tool_vision) = prepare_tool_images(
+                &mut messages, Some("view_image"), Some("upscale_image"), local, delegated,
+            );
+            assert_eq!(images, vec![vec![1, 2, 3]]);
+            assert_eq!(tool_vision, !local);
+            assert_eq!(messages[0].images.is_empty(), !local);
+            assert_eq!(messages[0].content.contains("call view_image"), !local);
+        }
+    }
+
+    #[test]
+    fn transformer_only_blind_model_keeps_honest_tool_note() {
+        let mut message = ChatMsg::text("user", "upscale this");
+        message.images = vec![vec![1, 2, 3]];
+        let mut messages = vec![message];
+        let (images, tool_vision) = prepare_tool_images(
+            &mut messages, None, Some("upscale_image"), false, false,
+        );
+        assert!(tool_vision);
+        assert_eq!(images, vec![vec![1, 2, 3]]);
+        assert!(messages[0].images.is_empty());
+        assert!(messages[0].content.contains("no tool to view"));
     }
 
     /// Routes the router serves statics from, spelled scope-relative the way

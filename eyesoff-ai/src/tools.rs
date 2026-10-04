@@ -1237,13 +1237,6 @@ impl Registry {
         self.tools.iter().any(|t| t.meta.makes_image())
     }
 
-    /// The name of the first armed tool that reads the turn's pictures, if
-    /// any. The legs use it to stand the vision pre-pass down, stash the
-    /// pictures for the tool, and tell the model what to call.
-    pub fn image_reader<'a>(&'a self, cfg: &ToolsConfig) -> Option<&'a str> {
-        self.image_tool_names(cfg).0.or(self.image_tool_names(cfg).1)
-    }
-
     /// The armed image-taking tools by NATURE: (reader, transformer). A
     /// reader takes pictures and answers in text (view_image); a transformer
     /// takes one and produces another (upscale_image). The stash note names
@@ -3729,13 +3722,13 @@ mod tests {
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["draw", "look"]);
         assert!(reg.makes_image(&cfg));
-        assert_eq!(reg.image_reader(&cfg), Some("look"));
+        assert_eq!(reg.image_tool_names(&cfg).0, Some("look"));
         // no picture this turn: the reader vanishes silently
         let reg = build(&cfg, Builtins::default(), &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["draw"]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        assert_eq!(reg.image_reader(&cfg), None);
+        assert_eq!(reg.image_tool_names(&cfg).0, None);
         // the serving model reads pictures itself: same silent stand-down
         let b = Builtins { images_present: true, images_local: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
