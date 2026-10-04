@@ -424,6 +424,11 @@
   .toolcall .tms { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
   .toolcall.err .tname { color: var(--err); }
   .toolcall.run .tms { color: var(--text-3); opacity: .75; }
+  /* what a call showed the MODEL (a screenshot of the machine it drives) */
+  .toolpic {
+    display: block; width: min(420px, 100%); height: auto; margin: 0 0 2px 10px;
+    border-radius: 8px; border: 1px solid var(--border-soft);
+  }
   /* where a loop stands, above the calls it has made so far */
   .toolhead { color: var(--text-3); font-size: 12px; padding: 0 2px 2px; }
 
@@ -2831,8 +2836,30 @@ function toolsBlock(calls, loop) {
         (c.ok ? "" : "failed · ") + Math.round((c.ms || 0) / 100) / 10 + "s";
     }
     wrap.appendChild(row);
+    // the picture the call showed the model, so the person sees what it saw.
+    // Only an inline image URI is ever put in src: it came from the server,
+    // but a src is not where anything else belongs.
+    if (typeof c.picture === "string" && /^data:image\/(png|jpeg|gif|bmp);base64,/.test(c.picture)) {
+      const img = document.createElement("img");
+      img.className = "toolpic";
+      img.alt = "What " + c.name + " showed the model";
+      img.loading = "lazy";
+      img.src = c.picture;
+      wrap.appendChild(img);
+    }
   }
   return wrap;
+}
+
+// A finished reply keeps only its LAST picture: history lives in this
+// browser's storage, and a run of screenshots is megabytes. The last one is
+// where the machine was left, which is the one worth seeing later.
+function keepLastPicture(calls) {
+  if (!calls) return calls;
+  let last = -1;
+  calls.forEach((c, i) => { if (c.picture) last = i; });
+  calls.forEach((c, i) => { if (i !== last) delete c.picture; });
+  return calls;
 }
 
 // Subagents, one card each, nested by depth. `live` is the streaming view:
@@ -4116,14 +4143,20 @@ async function run(chat) {
           } else if (d.tool_result && d.tool_result.agent) {
             const ag = agentById(agents, d.tool_result.agent);
             const last = ag && ag.tools[ag.tools.length - 1];
-            if (last) { last.ok = d.tool_result.ok; last.ms = d.tool_result.ms; }
+            if (last) {
+              last.ok = d.tool_result.ok; last.ms = d.tool_result.ms;
+              if (d.tool_result.picture) last.picture = d.tool_result.picture;
+            }
             if (chat.id === state.currentId) renderChat();
           } else if (d.search && d.search.agent) {
             // a subagent's reading: its card shows the call; the answer's
             // own source list is for what the answer itself cites
           } else if (d.tool_result) {
             const last = toolCalls && toolCalls[toolCalls.length - 1];
-            if (last) { last.ok = d.tool_result.ok; last.ms = d.tool_result.ms; }
+            if (last) {
+              last.ok = d.tool_result.ok; last.ms = d.tool_result.ms;
+              if (d.tool_result.picture) last.picture = d.tool_result.picture;
+            }
             chat.streaming.status = d.tool_result.ok
               ? "Read the result; answering…"
               : d.tool_result.name + " failed; answering anyway…";
@@ -4158,12 +4191,14 @@ async function run(chat) {
     // instance died or restarted) - surface it instead of recording a
     // truncated reply as if it were complete
     if (!sawDone) throw new Error("The stream ended before the response finished. The instance likely restarted. Try again.");
-    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: toolCalls, agents });
+    for (const a of agents || []) keepLastPicture(a.tools);
+    chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: keepLastPicture(toolCalls), agents });
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
     if (err && err.userStop) {
       if (reply) {
-        chat.messages.push({ role: "assistant", content: reply, meta: { stopped: true }, tools: toolCalls, agents });
+        for (const a of agents || []) keepLastPicture(a.tools);
+        chat.messages.push({ role: "assistant", content: reply, meta: { stopped: true }, tools: keepLastPicture(toolCalls), agents });
       } else {
         // nothing generated yet: hand the question back to the composer
         stripTail();

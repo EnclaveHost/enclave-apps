@@ -112,6 +112,14 @@ pub struct ToolsConfig {
     /// failures it already fixed.
     #[serde(default = "default_keep_results")]
     pub keep_results: usize,
+    /// how many PICTURES tool results may keep in the prompt at once (a
+    /// `result.see` entry's screenshots). The newest stay; an older one is
+    /// replaced by a line saying it was there. A picture is a vision-encoder
+    /// pass and ~1-2k tokens of prefill every step it stays, and a model
+    /// driving a screen acts on what it shows NOW, so the default is 1. The
+    /// request's own attachments count against the model's max_images first.
+    #[serde(default = "default_keep_images")]
+    pub keep_images: usize,
     /// SUBAGENTS: how many ONE answer may spawn in total, however they nest.
     /// Zero (the default) means the `spawn_agent` tool does not exist. A
     /// positive number is the deployer's consent and the only switch: the
@@ -237,6 +245,10 @@ pub struct Builtins<'a> {
     /// prefer_local or named outright), so image-reading tools are silently
     /// stood down: there is nothing to delegate.
     pub images_local: bool,
+    /// how many pictures this turn's prompt may carry in all (the serving
+    /// model's max_images when it reads pictures itself, else 0): the
+    /// ceiling a tool result's picture (`result.see`) is attached under
+    pub image_slots: usize,
     /// the most ONE wait call may sleep right now, seconds: the config's
     /// wait_max_s, clamped by what is left of the answer's time budget. Zero
     /// means no wait is possible (the budget is spent), and the call says so
@@ -603,6 +615,9 @@ fn default_wait_max_s() -> u64 {
 fn default_keep_results() -> usize {
     3
 }
+fn default_keep_images() -> usize {
+    1
+}
 fn default_ledger_chars() -> usize {
     2400
 }
@@ -923,6 +938,18 @@ pub struct ResultMap {
     /// to the full body: a readable result beats an error.
     #[serde(default)]
     pub text: Option<String>,
+    /// the field holding a picture for the MODEL to look at - the opposite
+    /// destination from `image`. A screenshot from a machine the model is
+    /// driving is the case this exists for: the model has to see the result
+    /// of its click before it can decide the next one. The bytes ride the
+    /// result's turn into the prompt (only when the serving model reads
+    /// pictures itself; a blind one is told what it missed), the field is
+    /// cut out of the text it reads (megabytes of base64 are not something a
+    /// model can read), and `text` still picks a field if one is named.
+    /// `"$body"` takes the whole response as the picture, for an endpoint
+    /// that answers with image bytes rather than JSON.
+    #[serde(default)]
+    pub see: Option<String>,
 }
 
 impl HttpTool {
@@ -947,6 +974,11 @@ impl HttpTool {
     /// The response carries a picture for the client (see ResultMap).
     pub fn makes_image(&self) -> bool {
         self.result.as_ref().is_some_and(|r| r.image.is_some())
+    }
+
+    /// The response carries a picture for the MODEL (ResultMap::see).
+    pub fn sees(&self) -> bool {
+        self.result.as_ref().is_some_and(|r| r.see.is_some())
     }
 
     /// The switch this endpoint sits under when it says so, or when it is
@@ -1139,7 +1171,12 @@ pub struct ToolMeta {
     /// reserved arguments `images` (data URIs) and `image` (the first)
     #[serde(default)]
     pub images: bool,
-    /// "image": answers with a picture for the client
+    /// "image": answers with a picture for the client; "see": answers with
+    /// a picture for the model to look at (ResultMap::see). An MCP tool that
+    /// says neither and returns an image part is read as "see" when the
+    /// serving model can look, which is what the MCP spec means by a tool
+    /// result, and as "image" otherwise, so a blind model's user still gets
+    /// the picture.
     #[serde(default)]
     pub result: Option<String>,
     /// how long ONE call may take, when the tool knows better than the
@@ -1165,12 +1202,22 @@ impl ToolMeta {
         self.result.as_deref() == Some("image")
     }
 
+    pub fn sees(&self) -> bool {
+        self.result.as_deref() == Some("see")
+    }
+
     /// An http entry's facts, as the registry carries them for every source.
     pub fn of_http(t: &HttpTool, group: &str) -> ToolMeta {
         ToolMeta {
             group: Some(group.to_string()),
             images: t.wants_images(),
-            result: t.makes_image().then(|| "image".to_string()),
+            result: if t.makes_image() {
+                Some("image".to_string())
+            } else if t.sees() {
+                Some("see".to_string())
+            } else {
+                None
+            },
             timeout_s: t.timeout_s,
             max_chars: t.max_chars,
             format: t.format.clone(),
@@ -2299,7 +2346,16 @@ pub struct ToolResult {
     /// text beside it; the bytes ride out to the client through the leg's
     /// existing image delivery.
     pub image: Option<crate::image::GeneratedImage>,
+    /// a picture for the MODEL (ResultMap::see, or an MCP image part read
+    /// as one): the loop attaches it to this result's turn when the serving
+    /// model reads pictures, and says so in the text when it cannot
+    pub seen: Option<Vec<u8>>,
 }
+
+/// The longest a picture the model is shown may be, decoded. A screenshot is
+/// tens of kilobytes; this only stops a runaway endpoint from putting a
+/// poster-sized file through the vision encoder on every step of a loop.
+pub const MAX_SEEN_BYTES: usize = 6 * 1024 * 1024;
 
 /// Run one call. Never returns Err: a failure IS a result, handed back to the
 /// model so it can try something else or tell the user plainly. A tool that is
@@ -2348,6 +2404,7 @@ pub fn call(
                 ms: now_ms().saturating_sub(t0),
                 sources: Vec::new(),
                 image: None,
+                seen: None,
             };
         }
     };
@@ -2356,15 +2413,16 @@ pub fn call(
     let max_chars = meta.max_chars.unwrap_or(cfg.max_chars);
     let mut sources = Vec::new();
     let mut image = None;
+    let mut seen = None;
     let r = match src {
         ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources, on_status),
-        ToolSrc::Http(i) => {
-            call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status, b.user)
-        }
+        ToolSrc::Http(i) => call_http(
+            &cfg.http[i], cfg, args, images, &mut sources, &mut image, &mut seen, on_status, b.user,
+        ),
         ToolSrc::Mcp { server, remote } => {
             let sess = &mut reg.mcp[server];
             // a picture arrives as megabytes of base64 inside the envelope
-            let max_bytes = if meta.makes_image() {
+            let max_bytes = if meta.makes_image() || meta.sees() {
                 (12 * 1024 * 1024).max(cfg.max_bytes)
             } else {
                 cfg.max_bytes.max(http::DEFAULT_MAX_BYTES)
@@ -2376,6 +2434,9 @@ pub fn call(
                 images,
                 timeout_s: meta.timeout_s.unwrap_or(sess.timeout_s),
                 max_bytes,
+                // an image part is for the model when the tool says so, or
+                // when it says nothing and the model can look (ToolMeta::result)
+                see: meta.sees() || (!meta.makes_image() && b.images_local),
             };
             // ticked like an http entry: a tool is allowed to be slow, and
             // the client stream must see something inside every idle window
@@ -2385,14 +2446,14 @@ pub fn call(
                     !crate::client_gone()
                 })
             };
-            call_mcp(sess, &c, args, &mut sources, &mut image, &mut transport)
+            call_mcp(sess, &c, args, &mut sources, &mut image, &mut seen, &mut transport)
         }
         // never built into a Registry - the passthrough renders client tools
         // into the prompt and hands the call back, so reaching this arm is a
         // wiring bug, and the failure must say which side executes
         ToolSrc::Client => Err("client-declared tools are executed by the client, not here".into()),
     };
-    finish_call(r, max_chars, sources, image, t0, now_ms)
+    finish_call(r, max_chars, sources, image, seen, t0, now_ms)
 }
 
 /// Run ONE http entry outside a registry: the routed pre-pass path, which
@@ -2410,11 +2471,12 @@ pub fn call_http_entry(
     let t = &cfg.http[i];
     let mut sources = Vec::new();
     let mut image = None;
+    let mut seen = None;
     // the routed pre-pass carries no caller: an entry that asks for $user
     // fails closed there, which is the right answer for a route with no one
     // behind it
-    let r = call_http(t, cfg, args, images, &mut sources, &mut image, on_status, None);
-    finish_call(r, t.max_chars.unwrap_or(cfg.max_chars), sources, image, t0, now_ms)
+    let r = call_http(t, cfg, args, images, &mut sources, &mut image, &mut seen, on_status, None);
+    finish_call(r, t.max_chars.unwrap_or(cfg.max_chars), sources, image, seen, t0, now_ms)
 }
 
 /// The shared tail of a call: truncation, error hygiene, the clock.
@@ -2423,6 +2485,7 @@ fn finish_call(
     max_chars: usize,
     mut sources: Vec<(String, String)>,
     mut image: Option<crate::image::GeneratedImage>,
+    mut seen: Option<Vec<u8>>,
     t0: u64,
     now_ms: impl Fn() -> u64,
 ) -> ToolResult {
@@ -2433,11 +2496,12 @@ fn finish_call(
     if is_error {
         sources.clear();
         image = None;
+        seen = None;
     }
     if let Some(img) = &mut image {
         img.ms = now_ms().saturating_sub(t0);
     }
-    ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources, image }
+    ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources, image, seen }
 }
 
 /// The app's own capabilities, called the way any other tool is.
@@ -2607,6 +2671,7 @@ fn call_http(
     images: &[Vec<u8>],
     sources: &mut Vec<(String, String)>,
     image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
     on_status: &dyn Fn(&str),
     user: Option<&str>,
 ) -> Result<String, String> {
@@ -2685,16 +2750,59 @@ fn call_http(
         // the stop button, mid-request: the wait ends and nothing is read
         !crate::client_gone()
     })?;
+    let see_body = t.result.as_ref().and_then(|m| m.see.as_deref()).map(str::trim) == Some("$body");
+    if r.status < 400 && see_body {
+        // the whole response IS the picture: never through a UTF-8 lossy
+        // pass, which would mangle every byte that matters
+        if r.truncated {
+            return Err(cut_picture(t, cfg));
+        }
+        let n = r.body.len();
+        *seen = Some(seen_bytes(r.body)?);
+        return Ok(format!("{} returned a picture ({} KB).", t.name, n.div_ceil(1024)));
+    }
     let text = String::from_utf8_lossy(&r.body).trim().to_string();
     if r.status >= 400 {
         let hint: String = text.chars().take(400).collect();
         return Err(format!("tool '{}' returned HTTP {}: {hint}", t.name, r.status));
     }
     if r.truncated {
+        // half a picture is no picture, and its base64 is no use as text
+        if t.sees() {
+            return Err(cut_picture(t, cfg));
+        }
         return Ok(format!("{text}\n[response was cut off at {} bytes]", req_max(t, cfg)));
     }
     extract_sources(t, &text, sources);
-    map_result(t, text, args, image_out)
+    map_result(t, text, args, image_out, seen)
+}
+
+fn cut_picture(t: &HttpTool, cfg: &ToolsConfig) -> String {
+    format!(
+        "tool '{}' answered with more than {} bytes, so its picture was cut off and dropped \
+         - raise the entry's max_bytes",
+        t.name,
+        req_max(t, cfg)
+    )
+}
+
+/// Bytes a model will be shown: a real image (png, jpeg, gif, bmp; a webp is
+/// transcoded, since the vision encoder has no VP8) of a sane size. Anything
+/// else fails the call with the reason, rather than reaching the encoder and
+/// failing the whole answer there.
+fn seen_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.len() > MAX_SEEN_BYTES {
+        return Err(format!(
+            "the picture is {} KB; a picture for the model may be at most {} KB",
+            bytes.len() / 1024,
+            MAX_SEEN_BYTES / 1024
+        ));
+    }
+    match crate::image_kind(&bytes) {
+        Some("webp") => crate::webp::to_jpeg(&bytes),
+        Some(_) => Ok(bytes),
+        None => Err("the tool's picture is not a recognisable image (png, jpeg, webp, gif or bmp)".into()),
+    }
 }
 
 /// The hits a sources map names, as (title, url) rows for the citation list.
@@ -2728,7 +2836,7 @@ fn extract_sources(t: &HttpTool, text: &str, sources: &mut Vec<(String, String)>
 fn req_max(t: &HttpTool, cfg: &ToolsConfig) -> usize {
     match t.max_bytes {
         Some(n) => n,
-        None if t.makes_image() => (12 * 1024 * 1024).max(cfg.max_bytes),
+        None if t.makes_image() || t.sees() => (12 * 1024 * 1024).max(cfg.max_bytes),
         None => cfg.max_bytes,
     }
 }
@@ -2763,9 +2871,29 @@ fn map_result(
     text: String,
     args: &serde_json::Value,
     image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
 ) -> Result<String, String> {
     let Some(rm) = &t.result else { return Ok(text) };
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+    let mut parsed: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+    if let Some(path) = rm.see.as_deref().map(str::trim).filter(|p| *p != "$body") {
+        let missing = || {
+            let hint: String = text.chars().take(200).collect();
+            format!("tool '{}' answered without a picture at result.see path '{path}': {hint}", t.name)
+        };
+        let j = parsed.as_mut().ok_or_else(missing)?;
+        let raw = json_path(j, path).and_then(|v| v.as_str()).ok_or_else(missing)?;
+        let bytes = crate::decode_image_src(raw)
+            .map_err(|e| format!("tool '{}' answered with a picture this app cannot read: {e}", t.name))?;
+        *seen = Some(seen_bytes(bytes)?);
+        // the model reads everything BUT the picture: its base64 is
+        // thousands of tokens of nothing, and the picture itself is attached
+        json_remove(j, path);
+    }
+    if rm.see.is_some() && rm.text.is_none() {
+        if let Some(j) = &parsed {
+            return Ok(j.to_string());
+        }
+    }
     if let Some(path) = &rm.image {
         let raw = parsed
             .as_ref()
@@ -2843,6 +2971,41 @@ fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
         };
     }
     Some(cur)
+}
+
+/// Remove what a dot path names (an object key; an array slot becomes null,
+/// so later indexes keep their meaning). A path that misses removes nothing.
+fn json_remove(v: &mut serde_json::Value, path: &str) {
+    let (parent, last) = match path.rsplit_once('.') {
+        Some((p, l)) => {
+            let mut cur = &mut *v;
+            for seg in p.split('.') {
+                cur = match seg.parse::<usize>() {
+                    Ok(i) => match cur.get_mut(i) {
+                        Some(c) => c,
+                        None => return,
+                    },
+                    Err(_) => match cur.get_mut(seg) {
+                        Some(c) => c,
+                        None => return,
+                    },
+                };
+            }
+            (cur, l)
+        }
+        None => (v, path),
+    };
+    match parent {
+        serde_json::Value::Object(o) => {
+            o.remove(last);
+        }
+        serde_json::Value::Array(a) => {
+            if let Some(slot) = last.parse::<usize>().ok().and_then(|i| a.get_mut(i)) {
+                *slot = serde_json::Value::Null;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// (mime, base64) from a field that may be raw base64 or a full data URI.
@@ -3046,6 +3209,8 @@ struct McpCall<'a> {
     images: &'a [Vec<u8>],
     timeout_s: u64,
     max_bytes: usize,
+    /// an image part in the result is for the model, not the client
+    see: bool,
 }
 
 fn call_mcp(
@@ -3054,6 +3219,7 @@ fn call_mcp(
     args: &serde_json::Value,
     sources: &mut Vec<(String, String)>,
     image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
     transport: &mut Transport<'_>,
 ) -> Result<String, String> {
     // a turn that skipped discovery (inline tools) never handshook
@@ -3075,7 +3241,7 @@ fn call_mcp(
         c.max_bytes,
         transport,
     )?;
-    let out = mcp_outcome(&r, &args);
+    let out = mcp_outcome(&r, &args, c.see);
     if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
         return Err(if out.text.is_empty() {
             format!("mcp tool '{}' reported an error", c.remote)
@@ -3084,6 +3250,9 @@ fn call_mcp(
         });
     }
     *sources = out.sources;
+    if let Some(b) = out.seen {
+        *seen = Some(seen_bytes(b)?);
+    }
     if let Some((mime, b64)) = out.image {
         *image_out = Some(crate::image::GeneratedImage {
             b64,
@@ -3104,6 +3273,8 @@ struct McpOutcome {
     sources: Vec<(String, String)>,
     /// (mime, base64) of the first image part
     image: Option<(String, String)>,
+    /// the first image part's bytes, when it is for the model (`see`)
+    seen: Option<Vec<u8>>,
 }
 
 /// An MCP result, read: text parts join; the first image part is a picture
@@ -3112,7 +3283,7 @@ struct McpOutcome {
 /// citations; any other binary part is named rather than dumped, because a
 /// base64 blob in the prompt is thousands of tokens of nothing the model
 /// can read; structured output alone falls back to its JSON.
-fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value) -> McpOutcome {
+fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value, see: bool) -> McpOutcome {
     let mut out = McpOutcome::default();
     let mut parts = Vec::new();
     if let Some(a) = r.get("content").and_then(|c| c.as_array()) {
@@ -3121,6 +3292,18 @@ fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value) -> McpOutcome {
                 Some("text") => {
                     if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
                         parts.push(t.to_string());
+                    }
+                }
+                // a picture for the MODEL: decoded here, attached to the
+                // result's turn by the loop; the text says only that it came
+                Some("image") if see => {
+                    let data = c.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    if out.seen.is_some() || data.is_empty() {
+                        continue;
+                    }
+                    match crate::decode_image_src(data) {
+                        Ok(b) => out.seen = Some(b),
+                        Err(e) => parts.push(format!("[an image part could not be read: {e}]")),
                     }
                 }
                 Some("image") if out.image.is_none() => {
@@ -3752,6 +3935,7 @@ mod tests {
             serde_json::json!({"data": [{"b64_json": "QUJD"}]}).to_string(),
             &serde_json::json!({"prompt": "a fox"}),
             &mut img,
+            &mut None,
         )
         .unwrap();
         assert!(out.contains("a fox"), "{out}");
@@ -3765,13 +3949,14 @@ mod tests {
             serde_json::json!({"data": [{"b64_json": "data:image/webp;base64,QUJD"}]}).to_string(),
             &serde_json::json!({}),
             &mut img,
+            &mut None,
         )
         .unwrap();
         let g = img.expect("image extracted");
         assert_eq!((g.mime.as_str(), g.b64.as_str()), ("image/webp", "QUJD"));
         // a response with no image at the path is an error naming the path
         let mut img = None;
-        let e = map_result(&draw, "{\"error\": \"busy\"}".into(), &serde_json::json!({}), &mut img)
+        let e = map_result(&draw, "{\"error\": \"busy\"}".into(), &serde_json::json!({}), &mut img, &mut None)
             .unwrap_err();
         assert!(e.contains("data.0.b64_json"), "{e}");
         assert!(img.is_none());
@@ -3787,11 +3972,12 @@ mod tests {
             serde_json::json!({"answer": "a receipt", "tokens": 512}).to_string(),
             &serde_json::json!({}),
             &mut img,
+            &mut None,
         )
         .unwrap();
         assert_eq!(out, "a receipt");
         let whole = serde_json::json!({"other": 1}).to_string();
-        let out = map_result(&look, whole.clone(), &serde_json::json!({}), &mut img).unwrap();
+        let out = map_result(&look, whole.clone(), &serde_json::json!({}), &mut img, &mut None).unwrap();
         assert_eq!(out, whole);
     }
 
@@ -4368,6 +4554,80 @@ mod tests {
     /// An MCP image result is a picture for the CLIENT, not thousands of
     /// tokens of base64 in the prompt; the model gets the same note an http
     /// image entry earns, and citation rows come off structuredContent.
+    /// result.see: the picture is decoded for the MODEL, cut out of the text
+    /// it reads, and validated; result.image stays the client's.
+    #[test]
+    fn a_see_result_is_a_picture_for_the_model_not_text() {
+        let png_b64 = "iVBORw0KGgoAAAABAgM="; // \x89PNG\r\n\x1a\n + 3 bytes
+        let pc: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "computer", "url": "https://rb/computer", "method": "POST",
+            "result": { "see": "image" }
+        }))
+        .unwrap();
+        assert!(pc.sees() && !pc.makes_image());
+        assert_eq!(ToolMeta::of_http(&pc, "virtual_machine").result.as_deref(), Some("see"));
+        let body = serde_json::json!({ "ok": true, "did": "clicked", "image": png_b64, "screen": {"width": 960} });
+        let (mut img, mut seen) = (None, None);
+        let text = map_result(&pc, body.to_string(), &serde_json::json!({}), &mut img, &mut seen).unwrap();
+        assert!(img.is_none(), "nothing goes to the client");
+        assert_eq!(&seen.as_ref().unwrap()[..4], &[0x89, b'P', b'N', b'G']);
+        let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(j.get("image").is_none(), "the base64 is cut out of what the model reads: {text}");
+        assert_eq!(j["did"], "clicked");
+        assert_eq!(j["screen"]["width"], 960);
+        // a data URI works too, and a nested path is cut where it was
+        let nested: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "n", "url": "https://rb/x", "result": { "see": "shot.data" }
+        }))
+        .unwrap();
+        let body = serde_json::json!({ "shot": { "data": format!("data:image/png;base64,{png_b64}"), "w": 3 } });
+        let mut seen = None;
+        let text = map_result(&nested, body.to_string(), &serde_json::json!({}), &mut None, &mut seen).unwrap();
+        assert!(seen.is_some());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), serde_json::json!({ "shot": { "w": 3 } }));
+        // a text path still picks the field
+        let picked: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "p", "url": "https://rb/x", "result": { "see": "image", "text": "did" }
+        }))
+        .unwrap();
+        let body = serde_json::json!({ "did": "typed 5 characters", "image": png_b64 });
+        let text = map_result(&picked, body.to_string(), &serde_json::json!({}), &mut None, &mut None).unwrap();
+        assert_eq!(text, "typed 5 characters");
+        // no picture where the map says, or one that is not an image: an
+        // error naming the problem, never base64 handed to the model
+        let e = map_result(&pc, "{\"ok\":true}".into(), &serde_json::json!({}), &mut None, &mut None).unwrap_err();
+        assert!(e.contains("result.see path 'image'"), "{e}");
+        let e = map_result(&pc, "{\"image\":\"aGVsbG8=\"}".into(), &serde_json::json!({}), &mut None, &mut None)
+            .unwrap_err();
+        assert!(e.contains("cannot read"), "{e}");
+        // raw image bytes are checked the same way
+        assert!(seen_bytes([&[0xff, 0xd8, 0xff, 0xe0][..], &[0u8; 12]].concat()).is_ok());
+        assert!(seen_bytes(b"<html>".to_vec()).is_err());
+        assert!(seen_bytes(vec![0u8; MAX_SEEN_BYTES + 1]).is_err());
+    }
+
+    /// An MCP image part: the model's when the tool says "see" (or says
+    /// nothing and the model can look), the client's otherwise.
+    #[test]
+    fn an_mcp_image_part_goes_where_the_tool_says() {
+        let r = serde_json::json!({ "content": [
+            { "type": "text", "text": "clicked" },
+            { "type": "image", "data": "iVBORw0KGgoAAAABAgM=", "mimeType": "image/png" },
+        ]});
+        let none = serde_json::json!({});
+        let to_model = mcp_outcome(&r, &none, true);
+        assert!(to_model.image.is_none());
+        assert_eq!(&to_model.seen.as_ref().unwrap()[..4], &[0x89, b'P', b'N', b'G']);
+        assert_eq!(to_model.text, "clicked");
+        let to_client = mcp_outcome(&r, &none, false);
+        assert!(to_client.seen.is_none() && to_client.image.is_some());
+        assert!(to_client.text.contains("an image has been generated"), "{}", to_client.text);
+        // a part that is not an image is named, not fed to the encoder
+        let bad = serde_json::json!({ "content": [{ "type": "image", "data": "aGVsbG8=" }]});
+        let o = mcp_outcome(&bad, &none, true);
+        assert!(o.seen.is_none() && o.text.contains("could not be read"), "{}", o.text);
+    }
+
     #[test]
     fn an_image_result_reaches_the_client() {
         let call = serde_json::json!({ "content": [
@@ -4384,6 +4644,7 @@ mod tests {
             images: &[],
             timeout_s: 20,
             max_bytes: 1024,
+            see: false,
         };
         let mut sources = Vec::new();
         let mut image = None;
@@ -4393,6 +4654,7 @@ mod tests {
             &serde_json::json!({ "prompt": "a cat" }),
             &mut sources,
             &mut image,
+            &mut None,
             &mut fake.transport(),
         )
         .unwrap();
@@ -4414,10 +4676,10 @@ mod tests {
             ]},
         })]);
         let meta = ToolMeta::default();
-        let c = McpCall { name: "search", remote: "search", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024 };
+        let c = McpCall { name: "search", remote: "search", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024, see: false };
         let mut sources = Vec::new();
         let mut image = None;
-        let text = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut sources, &mut image, &mut fake.transport()).unwrap();
+        let text = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut sources, &mut image, &mut None, &mut fake.transport()).unwrap();
         assert_eq!(text, "two hits");
         assert_eq!(
             sources,
@@ -4443,6 +4705,7 @@ mod tests {
             images: std::slice::from_ref(&png),
             timeout_s: 20,
             max_bytes: 1024,
+            see: false,
         };
         let mut sources = Vec::new();
         let mut image = None;
@@ -4452,6 +4715,7 @@ mod tests {
             &serde_json::json!({ "question": "what is this?", "image": "the model's guess" }),
             &mut sources,
             &mut image,
+            &mut None,
             &mut fake.transport(),
         )
         .unwrap();
@@ -4462,8 +4726,8 @@ mod tests {
         // a tool that does NOT take pictures is not handed them
         let mut fake = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
         let meta = ToolMeta::default();
-        let c = McpCall { name: "n", remote: "n", meta: &meta, images: std::slice::from_ref(&png), timeout_s: 20, max_bytes: 1024 };
-        call_mcp(&mut sess, &c, &serde_json::json!({ "q": 1 }), &mut Vec::new(), &mut None, &mut fake.transport()).unwrap();
+        let c = McpCall { name: "n", remote: "n", meta: &meta, images: std::slice::from_ref(&png), timeout_s: 20, max_bytes: 1024, see: false };
+        call_mcp(&mut sess, &c, &serde_json::json!({ "q": 1 }), &mut Vec::new(), &mut None, &mut None, &mut fake.transport()).unwrap();
         assert_eq!(fake.sent[0].1["params"]["arguments"], serde_json::json!({ "q": 1 }));
     }
 
@@ -4477,13 +4741,13 @@ mod tests {
         fake.session = Some("s-1".into());
         let mut sess = session(false);
         let meta = ToolMeta::default();
-        let c = McpCall { name: "a", remote: "a", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024 };
-        let e = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut fake.transport())
+        let c = McpCall { name: "a", remote: "a", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024, see: false };
+        let e = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut None, &mut fake.transport())
             .unwrap_err();
         assert_eq!(e, "the endpoint said no");
         assert_eq!(sess.session_id.as_deref(), Some("s-1"));
         let mut fake2 = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
-        call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut fake2.transport()).unwrap();
+        call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut None, &mut fake2.transport()).unwrap();
         assert!(fake2.sent[0].2.iter().any(|(k, v)| k == "mcp-session-id" && v == "s-1"));
     }
 
@@ -4736,12 +5000,12 @@ mod tests {
         let r = serde_json::json!({ "content": [
             { "type": "resource", "resource": { "uri": "file:///x.md", "mimeType": "text/markdown", "text": "the answer" } }
         ]});
-        assert_eq!(mcp_outcome(&r, &none).text, "the answer");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "the answer");
         // a binary resource has no text to read, and says so
         let r = serde_json::json!({ "content": [
             { "type": "resource", "resource": { "uri": "file:///x.bin", "blob": "AAAA" } }
         ]});
-        assert_eq!(mcp_outcome(&r, &none).text, "[binary resource omitted]");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "[binary resource omitted]");
     }
 
     /// The per-tool group gate is load-bearing: a switched-off group must
@@ -4782,12 +5046,12 @@ mod tests {
     fn mcp_content_renders_text_and_names_the_rest() {
         let none = serde_json::json!({});
         let r = serde_json::json!({"content":[{"type":"text","text":"hello"},{"type":"audio","data":"…"}]});
-        assert_eq!(mcp_outcome(&r, &none).text, "hello\n[audio content omitted]");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "hello\n[audio content omitted]");
         let r = serde_json::json!({"content":[],"structuredContent":{"n":1}});
-        assert_eq!(mcp_outcome(&r, &none).text, "{\"n\":1}");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "{\"n\":1}");
         // a server that hands a data URI where the spec says bare base64
         let r = serde_json::json!({"content":[{"type":"image","data":"data:image/gif;base64,ZZ"}]});
-        assert_eq!(mcp_outcome(&r, &none).image, Some(("image/gif".to_string(), "ZZ".to_string())));
+        assert_eq!(mcp_outcome(&r, &none, false).image, Some(("image/gif".to_string(), "ZZ".to_string())));
     }
 
 
@@ -5162,10 +5426,11 @@ mod tests {
                 images,
                 timeout_s: 30,
                 max_bytes: 12 * 1024 * 1024,
+                see: false,
             };
             let mut sources = Vec::new();
             let mut image = None;
-            let r = call_mcp(sess, &c, &args, &mut sources, &mut image, &mut tcp_request);
+            let r = call_mcp(sess, &c, &args, &mut sources, &mut image, &mut None, &mut tcp_request);
             (r, sources, image)
         };
 

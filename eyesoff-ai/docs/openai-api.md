@@ -508,6 +508,30 @@ stay in the prompt whole; older ones are condensed to their first and last
 line survives condensing; one that buries it in the middle should be told to
 print a summary.
 
+**Pictures the model is shown: `result.see`.** A tool can answer with a
+picture for the MODEL rather than the client - a screenshot of a machine the
+model is driving (the RISC Box's `POST /computer`) is what this exists for:
+the model has to see what its click did before it decides the next one. An
+http entry names the field with `"result": {"see": "<dot path>"}` (base64 or a
+data URI; `"$body"` when the endpoint answers with image bytes), and an MCP
+tool returns an `image` content part with `_meta` `result: "see"` - or with no
+`result` at all, which is read as "see" when the serving model can look and as
+a picture for the client otherwise. The picture is cut out of the text the
+model reads, checked to be a real image, and attached to that result's turn,
+so the next generation sees it through the model's own vision projector; a
+model that cannot see is told the picture was left out. Only the newest
+`keep_images` (default 1) stay in the prompt - an older one is replaced by a
+line saying it was there - and never more than the model's `max_images` with
+the request's own attachments counted first. Each picture is a vision-encoder
+pass and ~1-2k tokens of prefill on every step it stays, and a model working a
+screen acts on what it shows now. The live `tool_result` event carries the
+picture as `picture` (a data URI) so the person watching sees the same
+screen; the playground shows it under the call, and keeps only an answer's
+last one in its history. A step whose prompt carries a picture still branches
+off the engine's parked system prompt (it declares the text before its first
+picture), so a long run pays for its new turns and its picture, not a fresh
+system prompt each step.
+
 **Ledger mode (0.58).** `"loop": {"ledger": true}` (or `ledger: true` in the
 config's `tools` block) changes what a step re-prefills. The conversation is
 NOT accumulated: the model writes its state under a `### LEDGER` heading at

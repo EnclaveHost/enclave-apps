@@ -3179,7 +3179,7 @@ fn generate(
                     // waiting out a warm-up of its prefix already under way (mm36)
                     let (l, took) = feed_waiting(|wait| {
                         let declare = if fed == 0 && done == 0 {
-                            prompt.text_only().map(|t| Declare { prompt: t, marks: prompt.marks.as_slice(), wait })
+                            prompt.declared().map(|(t, marks)| Declare { prompt: t, marks, wait })
                         } else { None };
                         sess.feed_declared(cfg, &ids[done..end], last, declare)
                     }, status, t1, prompt_ids.len())?;
@@ -5498,6 +5498,11 @@ struct ToolLoop<'a> {
     /// response turn, tool name, full text, condensed already) - so older
     /// ones can be condensed once the model has acted on them (compact)
     results: Vec<(usize, String, String, bool)>,
+    /// the response turns carrying a picture this loop attached for the model
+    /// (a `result.see` screenshot), oldest first: past ToolsConfig::
+    /// keep_images, or past the model's image ceiling, the oldest are taken
+    /// back out (trim_pictures)
+    pictures: Vec<usize>,
     /// the subagent tree this loop belongs to, shared by every loop in the
     /// answer, and this loop's place in it: id 0 at depth 0 for the answer
     /// itself, else the child's
@@ -5569,6 +5574,18 @@ const REFUSED_TIME: &str =
 /// the call was and how it ended (a test run's summary line is at the tail),
 /// too little to be worth re-reading - the point of condensing.
 const CONDENSE_EDGE: usize = 240;
+/// What a result carrying a picture for the model says about it: attached,
+/// not shown because this model cannot see, or taken back out of the prompt
+/// since (ToolLoop::trim_pictures swaps the first for the third).
+const PICTURE_ATTACHED: &str =
+    "\n[The picture this call returned is attached to this result; you can see it.]";
+const PICTURE_BLIND: &str =
+    "\n[This call returned a picture, but the model answering cannot see images, so it was left out.]";
+const PICTURE_NO_ROOM: &str =
+    "\n[This call returned a picture, but this request already carries as many pictures as the model \
+     takes, so it was left out.]";
+const PICTURE_GONE: &str =
+    "\n[The picture was shown to you at the time; it has been removed since. Take a new one to look again.]";
 const REFUSED_STUB: &str =
     "the model kept writing tool calls with arguments it had not filled in, so none were run";
 const REFUSED_GONE: &str =
@@ -5650,6 +5667,7 @@ impl<'a> ToolLoop<'a> {
             calls: 0,
             time_told: false,
             results: Vec::new(),
+            pictures: Vec::new(),
             tree,
             id,
             depth,
@@ -5705,6 +5723,7 @@ impl<'a> ToolLoop<'a> {
             ms: (now_ms() as u64).saturating_sub(t0),
             sources: Vec::new(),
             image: None,
+            seen: None,
         };
         let Some(spawn) = self.spawn else {
             return done("subagents are not available here".into(), true);
@@ -5860,6 +5879,7 @@ impl<'a> ToolLoop<'a> {
             }
             let base = *self.base_len.get_or_insert(messages.len());
             messages.truncate(base);
+            self.pictures.retain(|&i| i < base);
         }
         let again = self.step_inner(text, messages, on_call, on_result, on_note);
         if again && self.budget.ledger {
@@ -6139,7 +6159,7 @@ impl<'a> ToolLoop<'a> {
             "of": self.budget.max_calls,
             "elapsed_s": self.elapsed_s(), "max_seconds": self.budget.max_seconds,
         }));
-        let mut r = if c.name == tools::AGENT_TOOL && self.reg.find(&c.name).is_some() {
+        let r = if c.name == tools::AGENT_TOOL && self.reg.find(&c.name).is_some() {
             // a child runs through the leg, not through tools::call: it is
             // a whole answer loop of its own, and only the leg can generate
             self.spawn_child(&c.args)
@@ -6161,6 +6181,24 @@ impl<'a> ToolLoop<'a> {
                 self.status,
             )
         };
+        self.take_result(&c, &key, tracked, r, messages, on_result, on_note)
+    }
+
+    /// Everything a call's RESULT does to the loop, once the call has run:
+    /// the format pass, the picture, the events, the verify gate, the stuck
+    /// detector, and the two turns appended to the conversation. Split from
+    /// step_inner so a test can hand it a result without a network.
+    #[allow(clippy::too_many_arguments)]
+    fn take_result(
+        &mut self,
+        c: &tools::ToolCall,
+        key: &str,
+        tracked: bool,
+        mut r: tools::ToolResult,
+        messages: &mut Vec<ChatMsg>,
+        on_result: &dyn Fn(&serde_json::Value),
+        on_note: &dyn Fn(&str),
+    ) -> bool {
         // the tool's own format prompt, applied before anything downstream
         // sees the result. It rides the tool's facts rather than the http
         // array, so an entry moved into an api-mcp-adapter (which reports
@@ -6174,6 +6212,19 @@ impl<'a> ToolLoop<'a> {
         }
         if let Some(img) = r.image.take() {
             self.image_out = Some(img);
+        }
+        // A picture for the MODEL (result.see): it rides this result's turn
+        // into the next prompt when the serving model reads pictures itself,
+        // and a blind one is told what it missed rather than left to guess
+        // why the result talks about a screenshot it cannot find.
+        let picture = r.seen.take();
+        let shown = picture.is_some() && self.picture_room(messages) > 0;
+        if picture.is_some() {
+            r.text.push_str(match (shown, self.builtins.image_slots > 0) {
+                (true, _) => PICTURE_ATTACHED,
+                (false, true) => PICTURE_NO_ROOM,
+                (false, false) => PICTURE_BLIND,
+            });
         }
         let mut entry = serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
@@ -6191,7 +6242,17 @@ impl<'a> ToolLoop<'a> {
                 .map(|(t, u)| serde_json::json!({ "title": t, "url": u }))
                 .collect::<Vec<_>>());
         }
-        on_result(&entry);
+        // the live event carries what the model was shown, so the person
+        // watching sees the same screen; the answer's stats do not, since
+        // they persist with the chat and a run of screenshots is megabytes
+        match picture.as_ref().filter(|_| shown) {
+            Some(b) => {
+                let mut live = entry.clone();
+                live["picture"] = serde_json::json!(vision::to_data_uri(b));
+                on_result(&live);
+            }
+            None => on_result(&entry),
+        }
         self.log.push(entry);
         // the verify gate reads the check's latest result - and only the
         // latest thing run: a call after a passing check (a wait aside) is
@@ -6202,7 +6263,7 @@ impl<'a> ToolLoop<'a> {
         } else if c.name != "wait" {
             self.verify_ok = false;
         }
-        let stuck = self.note_repeat(&key, tracked, &r.text, on_note);
+        let stuck = self.note_repeat(key, tracked, &r.text, on_note);
         // A persisting loop is told where it stands with every result, so
         // "the budget is nearly spent" is a fact it can read rather than a
         // count it has to keep. Outside the loop the rules already said the
@@ -6223,14 +6284,63 @@ impl<'a> ToolLoop<'a> {
         // The model's own call goes back in as the assistant turn it was, so
         // the next pass sees what it asked for beside what came back.
         messages.push(ChatMsg::text("assistant", canonical_call(&c)));
-        messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &text)));
+        let mut turn = ChatMsg::text("user", tools::response_turn(&c.name, &text));
+        if let Some(b) = picture.filter(|_| shown) {
+            turn.images.push(b);
+        }
+        let pictured = !turn.images.is_empty();
+        messages.push(turn);
         // in ledger mode there is never an older result to condense: the
         // step wrapper drops it whole
         if !self.budget.ledger {
             self.results.push((messages.len() - 1, c.name.clone(), text, false));
             self.compact(messages);
         }
+        if pictured {
+            self.pictures.push(messages.len() - 1);
+            self.trim_pictures(messages);
+        }
         true
+    }
+
+    /// How many of this loop's pictures the prompt can hold: keep_images,
+    /// within what the model takes once the request's own media are counted.
+    fn picture_room(&self, messages: &[ChatMsg]) -> usize {
+        let theirs: usize = messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.pictures.contains(i))
+            .map(|(_, m)| m.images.len() + m.videos.len())
+            .sum();
+        self.builtins.image_slots.saturating_sub(theirs).min(self.cfg.keep_images)
+    }
+
+    /// Keep the prompt's pictures within bounds: the newest keep_images of
+    /// this loop's own, and never more in all than the model takes (the
+    /// request's attachments are counted first - they are the user's, and
+    /// a screenshot is the one that can be taken again). An older picture
+    /// leaves the prompt with a line saying it was there, so the result
+    /// still reads as what it was.
+    fn trim_pictures(&mut self, messages: &mut [ChatMsg]) {
+        let room = self.picture_room(messages);
+        while self.pictures.len() > room {
+            let idx = self.pictures.remove(0);
+            let Some(m) = messages.get_mut(idx) else { continue };
+            m.images.clear();
+            match self.results.iter_mut().find(|r| r.0 == idx) {
+                Some(r) => {
+                    r.2 = r.2.replace(PICTURE_ATTACHED, PICTURE_GONE);
+                    let shown = if r.3 { condense(&r.2).unwrap_or_else(|| r.2.clone()) } else { r.2.clone() };
+                    m.content = tools::response_turn(&r.1, &shown);
+                }
+                // ledger mode keeps no results list; the turn's text is its
+                // own record, the note in it JSON-escaped like the rest
+                None => {
+                    let esc = |t: &str| t.replace('\n', "\\n");
+                    m.content = m.content.replace(&esc(PICTURE_ATTACHED), &esc(PICTURE_GONE));
+                }
+            }
+        }
     }
 }
 
@@ -6695,6 +6805,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         // a picture is a per-turn fact, not a capability
         images_present: true,
         images_local: false,
+        image_slots: 0,
         // a probe wait sleeps the config's cap at most; the loop narrows it
         // per call from what is left of the answer
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
@@ -6727,6 +6838,7 @@ fn builtins_for<'a>(cfg: &'a AppConfig, creq: &'a ChatReq, off: &'a [String]) ->
         off,
         images_present: creq.messages.iter().any(|m| !m.images.is_empty()),
         images_local: images_read_locally(cfg, creq.model.as_deref()),
+        image_slots: if images_read_locally(cfg, creq.model.as_deref()) { cfg.max_images } else { 0 },
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
         turn_left_s: tc.map_or(0, |t| t.max_seconds),
         agent_slots: 0,
@@ -7985,6 +8097,26 @@ impl Prompt {
         (self.images == 0).then_some(self.text_ids.as_slice())
     }
 
+    /// What the engine is told this prompt is (mm34), and the marks inside
+    /// it: the whole token stream when it is all text; with a picture in it,
+    /// the text BEFORE the first picture. That run is plain text - the system
+    /// message and tool block, the turns before - so the engine can branch
+    /// it off a standing park and park the system marks as prefill crosses
+    /// them, and its plan simply ends where the declaration does: the engine
+    /// treats a guest that feeds past it as served, and the picture and what
+    /// follows go in as they always did. Without this, every step of a loop
+    /// that is looking at a screenshot re-prefilled the whole system prompt
+    /// (~1.6k tokens, about a minute on a CPU node) before the picture.
+    fn declared(&self) -> Option<(&[u32], &[usize])> {
+        if self.images == 0 {
+            return Some((self.text_ids.as_slice(), self.marks.as_slice()));
+        }
+        let Some(PromptPart::Text(head)) = self.parts.first() else { return None };
+        // marks are ascending (marks_from); keep those inside the head
+        let n = self.marks.iter().take_while(|&&m| m <= head.len()).count();
+        (head.len() >= 2).then_some((head.as_slice(), &self.marks[..n]))
+    }
+
 }
 
 /// Render + tokenize the conversation; drops oldest turns until it fits.
@@ -8159,9 +8291,11 @@ fn build_prompt(
             // the shared prefixes worth parking (mm35): the system text on
             // its own when a tool block follows it (every settings
             // combination shares that much), and the whole system message.
-            // chatml only - the boundaries below are its markers - and only
-            // for a prompt the engine can be told about whole (no media).
-            if cfg.template == "chatml" && prompt.images == 0 {
+            // chatml only - the boundaries below are its markers. A prompt
+            // with media gets them too: what the engine is told about it is
+            // the text before its first picture (Prompt::declared), and the
+            // system message is always in that text.
+            if cfg.template == "chatml" {
                 let mut cands = Vec::new();
                 if block_added {
                     cands.push(tok.encode_ids(
@@ -11811,6 +11945,120 @@ mod tests {
     /// LEDGER MODE keeps the conversation flat: after every step the prompt
     /// is the original turns, one call and one result, and the only state
     /// that crosses is what the model wrote under `### LEDGER`.
+    /// A tool result's picture for the MODEL (result.see): attached to the
+    /// result's turn, the newest keep_images kept, older ones taken back out
+    /// with a line saying so, the request's own attachments counted first,
+    /// and a blind model told what it missed.
+    #[test]
+    fn a_result_picture_reaches_the_model_and_only_the_newest_stays() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "http": [{ "name": "computer", "url": "https://h/computer" }]
+        }))
+        .unwrap();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1];
+        let result = |n: u8| tools::ToolResult {
+            text: format!("{{\"ok\":true,\"step\":{n}}}"),
+            is_error: false, ms: 5, sources: Vec::new(), image: None,
+            seen: Some([png.clone(), vec![n]].concat()),
+        };
+        let call = |n: u8| tools::ToolCall {
+            name: "computer".into(),
+            args: serde_json::json!({ "action": "click", "n": n }),
+        };
+        let sees = tools::Builtins { images_local: true, image_slots: 4, ..Default::default() };
+        let mut tl = ToolLoop::open(&tc, sees, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "open the browser")];
+        let seen_live = std::cell::RefCell::new(Vec::new());
+        let on_result = |e: &serde_json::Value| {
+            seen_live.borrow_mut().push(e.get("picture").and_then(|p| p.as_str()).map(str::to_string));
+        };
+        for n in 1..=3u8 {
+            assert!(tl.take_result(&call(n), &format!("k{n}"), true, result(n), &mut msgs, &on_result, &|_| {}));
+        }
+        let with: Vec<usize> = (0..msgs.len()).filter(|&i| !msgs[i].images.is_empty()).collect();
+        assert_eq!(with, vec![6], "only the newest result keeps its picture (keep_images = 1)");
+        assert_eq!(msgs[6].images[0].last(), Some(&3));
+        assert!(msgs[6].content.contains("attached to this result; you can see it"), "{}", msgs[6].content);
+        for i in [2, 4] {
+            assert!(msgs[i].content.contains("removed since. Take a new one"), "{}", msgs[i].content);
+            assert!(!msgs[i].content.contains("you can see it"), "{}", msgs[i].content);
+        }
+        // the person watching got each picture on the live event, as a data URI
+        let live = seen_live.borrow();
+        assert_eq!(live.len(), 3);
+        assert!(live.iter().all(|p| p.as_deref().is_some_and(|p| p.starts_with("data:image/png;base64,"))));
+        // ...and the answer's stats did not
+        assert!(tl.log.iter().all(|e| e.get("picture").is_none()));
+
+        // the request's own attachments are counted first: 4 slots, 4 taken
+        let mut tl = ToolLoop::open(&tc, sees, tc.budget(None), &nop, &nofmt, None);
+        let mut full = ChatMsg::text("user", "compare these");
+        full.images = vec![png.clone(); 4];
+        let mut msgs = vec![full];
+        assert!(tl.take_result(&call(1), "k", true, result(1), &mut msgs, &|_| {}, &|_| {}));
+        assert!(msgs[2].images.is_empty());
+        assert!(msgs[2].content.contains("already carries as many pictures"), "{}", msgs[2].content);
+        assert_eq!(msgs[0].images.len(), 4, "the user's pictures are never the ones dropped");
+
+        // a model that cannot see is told so, and gets no bytes
+        let blind = tools::Builtins::default();
+        let mut tl = ToolLoop::open(&tc, blind, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "look")];
+        assert!(tl.take_result(&call(1), "k", true, result(1), &mut msgs, &|_| {}, &|_| {}));
+        assert!(msgs[2].images.is_empty());
+        assert!(msgs[2].content.contains("cannot see images"), "{}", msgs[2].content);
+
+        // ledger mode: the step wrapper drops old turns whole, and the newest
+        // picture survives the truncation and the ledger tail
+        let lc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "ledger": true, "keep_images": 2,
+            "http": [{ "name": "computer", "url": "https://h/computer" }]
+        }))
+        .unwrap();
+        let mut tl = ToolLoop::open(&lc, sees, lc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        tl.base_len = Some(1);
+        for n in 1..=2u8 {
+            msgs.truncate(1);
+            tl.pictures.retain(|&i| i < 1);
+            assert!(tl.take_result(&call(n), "k", true, result(n), &mut msgs, &|_| {}, &|_| {}));
+        }
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].images.len(), 1);
+        assert_eq!(tl.pictures, vec![2]);
+    }
+
+    /// A prompt with a picture in it is declared to the engine up to its
+    /// first picture, with the marks inside that text; an all-text prompt is
+    /// declared whole, as before.
+    #[test]
+    fn a_prompt_with_a_picture_declares_the_text_before_it() {
+        let text = Prompt {
+            parts: vec![PromptPart::Text((0..300).collect())],
+            text_ids: (0..300).collect(),
+            images: 0,
+            marks: vec![100, 200],
+        };
+        let (ids, marks) = text.declared().unwrap();
+        assert_eq!((ids.len(), marks), (300, &[100usize, 200][..]));
+        let pic = Prompt {
+            parts: vec![
+                PromptPart::Text((0..150).collect()),
+                PromptPart::Image(vec![1, 2, 3]),
+                PromptPart::Text((150..300).collect()),
+            ],
+            text_ids: (0..300).collect(),
+            images: 1,
+            marks: vec![100, 150, 200],
+        };
+        let (ids, marks) = pic.declared().unwrap();
+        assert_eq!(ids, &(0..150).collect::<Vec<u32>>()[..]);
+        assert_eq!(marks, &[100usize, 150][..], "a mark at the head's end is inside it; past it is not");
+        assert!(pic.text_only().is_none(), "speculative paths still see a picture prompt as one");
+    }
+
     #[test]
     fn ledger_mode_rebuilds_the_conversation_from_the_ledger() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
@@ -11973,7 +12221,7 @@ mod tests {
         assert!(!none.step("Done.", &mut m3, &|_| {}, &|_| {}, &|_| {}));
         // what passing means
         let res = |text: &str, err: bool| tools::ToolResult {
-            text: text.into(), is_error: err, ms: 1, sources: Vec::new(), image: None,
+            text: text.into(), is_error: err, ms: 1, sources: Vec::new(), image: None, seen: None,
         };
         assert!(verify_passed(&res("3 passed, 0 failed", false), Some("0 failed")));
         assert!(!verify_passed(&res("2 passed, 1 failed", false), Some("0 failed")));
