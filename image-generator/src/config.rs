@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn map_catalog_maps_volume_to_name() {
         let cat = catalog_from(embedded()).unwrap();
-        assert_eq!(cat.models.len(), 2);
+        assert_eq!(cat.models.len(), 3);
         // the whole point: volume key -> display name, explicitly
         let zi = cat.get(Some("z-image-turbo")).unwrap();
         assert_eq!(zi.model_volume, "z-image-turbo-sd");
@@ -392,6 +392,12 @@ mod tests {
         assert_eq!(qi.default_steps, 8); // entry override
         assert_eq!(qi.min_size, 512); // entry override
         assert_eq!(qi.max_size, 1024); // inherited from template
+        let qi21 = cat.get(Some("qwen-image-2.1")).unwrap();
+        assert_eq!(qi21.model_volume, "qwen-image-2.1-sd");
+        assert_eq!((qi21.default_steps, qi21.max_steps), (40, 50));
+        assert_eq!(qi21.cfg_scale, 6.0);
+        assert_eq!(qi21.sample_method, "euler");
+        assert_eq!(cat.get(Some("qwen-image-2.1-sd")).unwrap().name, qi21.name);
     }
 
     #[test]
@@ -409,12 +415,12 @@ mod tests {
 
     #[test]
     fn enclave_config_adds_one_model() {
-        // a deployment adds a third model without restating the others
+        // a deployment adds a model without restating the others
         let over = serde_json::json!({
             "models": { "flux2-klein-sd": { "name": "flux2-klein", "default_steps": 4, "min_size": 512 } }
         });
         let cat = catalog_from(merge(embedded(), over)).unwrap();
-        assert_eq!(cat.models.len(), 3);
+        assert_eq!(cat.models.len(), 4);
         let fk = cat.get(Some("flux2-klein")).unwrap();
         assert_eq!(fk.model_volume, "flux2-klein-sd");
         assert_eq!(fk.max_size, 1024); // still inherits the template
@@ -426,7 +432,7 @@ mod tests {
     fn enclave_config_tweaks_one_field() {
         let over = serde_json::json!({ "models": { "qwen-image-2512-sd": { "default_steps": 6 } } });
         let cat = catalog_from(merge(embedded(), over)).unwrap();
-        assert_eq!(cat.models.len(), 2); // no new model
+        assert_eq!(cat.models.len(), 3); // no new model
         assert_eq!(cat.get(Some("qwen-image-2512")).unwrap().default_steps, 6);
         assert_eq!(cat.get(Some("qwen-image-2512")).unwrap().min_size, 512); // untouched
     }
@@ -435,7 +441,7 @@ mod tests {
     fn realistic_deploy_config_resolves() {
         // the App Config a deployment actually sets: a `volumes` list (read by
         // the platform, ignored by the app) plus a `models` map identical to
-        // the embedded catalog. Must resolve to exactly the two models.
+        // the embedded catalog. Other catalog entries remain configured.
         let over = serde_json::json!({
             "volumes": ["qwen-image-2512-sd", "z-image-turbo-sd"],
             "models": {
@@ -444,7 +450,7 @@ mod tests {
             }
         });
         let cat = catalog_from(merge(embedded(), over)).unwrap();
-        assert_eq!(cat.models.len(), 2);
+        assert_eq!(cat.models.len(), 3);
         let zi = cat.get(Some("z-image-turbo")).unwrap();
         assert_eq!(zi.model_volume, "z-image-turbo-sd");
         assert_eq!((zi.default_steps, zi.max_size), (4, 1024));

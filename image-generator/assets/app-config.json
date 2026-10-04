@@ -10,6 +10,7 @@
   "max_images": 4,
   "models": {
     "z-image-turbo-sd": { "name": "z-image-turbo" },
+    "qwen-image-2.1-sd": { "name": "qwen-image-2.1", "default_steps": 40, "max_steps": 50, "min_size": 512, "cfg_scale": 6.0, "sample_method": "euler" },
     "qwen-image-2512-sd": { "name": "qwen-image-2512", "default_steps": 8, "min_size": 512 }
   },
   "upscalers": {
