@@ -445,6 +445,12 @@ impl Emulator {
 		(rate, ch, playing, snd.pending_bytes(), snd.dropped_bytes())
 	}
 
+	/// risc-box patch: input events queued on the host side, not yet in the
+	/// guest's buffers (see VirtioInput::pending_len).
+	pub fn input_pending(&self) -> usize {
+		self.cpu.get_mmu().get_input().pending_len()
+	}
+
 	/// risc-box patch: the max value of the absolute coordinate space the
 	/// virtio-input pointer exposes (both axes are 0..=this).
 	pub fn input_abs_max() -> i32 {

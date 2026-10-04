@@ -212,12 +212,13 @@ JSON object:
 | `POST /start`     | `{accessKeyId?,secretAccessKey?,sessionToken?,reset?,snapshot?}`: fetch from S3 and boot — or resume from the snapshot when one is cached; `reset:true` re-fetches instead of using the cached images, `snapshot:false` forces a cold boot |
 | `POST /input`     | **raw bytes** in the body → the guest UART receive register          |
 | `POST /exec`      | `{cmd, timeout_s?, max_bytes?}`: run a shell command on the guest console and return its stdout + exit code as JSON (see below) |
+| `POST /computer`  | `{action, …}`: one mouse/keyboard action in screenshot coordinates (click, type, key chord, scroll, drag), answered with a JPEG of the screen once it settles — the desktop as a tool for a vision model (see below) |
 | `GET /console`    | Server-Sent Events: base64 console output, scrollback replayed first |
 | `POST /save`      | dump the guest disk and PUT it to `saveKey`                          |
 | `POST /snapshot`  | `{key?,level?}`: serialize the running machine and PUT it to the snapshot key; later starts resume from it |
 | `GET /instances`  | the machines this process hosts, the images they fork from, the memory in use |
 | `POST /instances` | `{from?: "main" \| "<snapshot key>", id?}`: fork a new machine (default: the config's root snapshot); created running |
-| `/i/<id>/…`       | an instance's `status`, `console`, `input`, `exec`, `hid`, `fb.png`, `frame.jpg`, `fb.rgb`, `snapshot`, `stop`, `start`; `DELETE /i/<id>` forgets it |
+| `/i/<id>/…`       | an instance's `status`, `console`, `input`, `exec`, `computer`, `hid`, `fb.png`, `frame.jpg`, `fb.rgb`, `snapshot`, `stop`, `start`; `DELETE /i/<id>` forgets it |
 | `POST /stop`      | halt the machine and drop it from RAM                                |
 | `GET /ping`       | liveness                                                             |
 
@@ -303,6 +304,103 @@ tool loop's `max_calls` bounds a run-look-run sequence. Deployment notes:
 - Outbound egress is IPv6-only, but `*.app.enclave.host` publishes an AAAA, so
   app-to-app works. Set eyesoff's per-tool `timeout_s` above risc-box's so the
   model sees a real error rather than a truncated connection.
+
+## Driving the desktop: `POST /computer`
+
+`/hid` forwards what a mouse and keyboard already produced (normalized pointer
+positions, Linux keycodes) and answers nothing about the screen. A vision model
+has neither a mouse nor a keyboard: it looks at a screenshot, names a point in
+it, wants to say "type this" or "ctrl+l", and has to SEE what its action did
+before deciding the next one. `POST /computer` is that interface. One call is
+one action and its outcome:
+
+```sh
+curl -sX POST "$RB/computer" -H "x-api-key: $KEY" \
+  -d '{"action":"click","x":452,"y":558,"grid":1000}'
+# {"ok":true,"action":"click","did":"clicked the left button at (452, 558)",
+#  "screen":{"width":960,"height":600},"coordinates":"0..1000 on each axis, from the top-left",
+#  "cursor":{"x":452,"y":558},"settled":true,"changed":true,"waited_ms":2940,
+#  "mime":"image/jpeg","image":"<base64 JPEG of the screen after the click>"}
+```
+
+| action | fields |
+|---|---|
+| `screenshot` | look only (answers at once unless given `wait_ms`) |
+| `click` | `x`, `y` (optional: click where the pointer is), `button` left\|right\|middle, `count` 1–3 |
+| `double_click`, `right_click`, `middle_click` | `x`, `y` |
+| `move` | `x`, `y` |
+| `mouse_down`, `mouse_up` | `x`?, `y`?, `button` |
+| `drag` | `x`, `y` → `to_x`, `to_y` (with intermediate motion while held) |
+| `scroll` | `direction` up\|down\|left\|right, `amount` notches (default 3), `x`/`y` to scroll over a spot |
+| `type` | `text` — US keyboard, printable ASCII plus newline and tab, up to 800 characters; anything else fails the call with nothing typed |
+| `key` | `keys` — a key or chord, xdotool-style names: `Return`, `Escape`, `Tab`, `ctrl+l`, `ctrl+shift+t`, `alt+F4`, `Page_Down`; several separated by spaces (`ctrl+a Delete`) |
+| `wait` | `ms` (or `wait_ms`) — let time pass, then look |
+
+Coordinates are **pixels of the screenshot** unless the body names a `grid`, in
+which case they run 0..grid across each axis. Pass `"grid": 1000` for models
+trained on normalized coordinates — Qwen's vision models answer "where is X" on
+a 0–1000 scale whatever the image size (measured: eyesoff-ai's qwen3.8 located
+three buttons on a 960×600 screenshot within 1% on that scale, and nowhere near
+their pixel positions). The answer reports `cursor` in the same space.
+
+**When it answers.** The input goes through the same virtio-input path as
+`/hid`, and the request is held (never answered from inside the event loop's
+turn) while the guest runs. It is answered once the picture AND the guest's CPU
+have both been quiet for 500 ms, after at least 600 ms of reaction time, or at
+`wait_ms` (default 8000, max 20000) — `settled:false` then means it was still
+changing. Watching the CPU as well as the pixels is what tells "the menu closed,
+the terminal is still starting" (a quiet screen over a busy guest) from "done":
+launching xterm from the menu answers with xterm drawn (~3 s), Badwolf with the
+browser up (~18 s). `changed:false` means the action left the screen as it was —
+usually a click that missed. The defaults are patient on purpose: the caller is a
+model whose every step is a generation of a minute or more, so a second spent
+waiting for a repaint is cheap next to a step wasted on a half-drawn screen.
+
+**Long input is paced.** A typed sentence is several hundred input events, and
+delivered in one burst they overflow the guest's evdev buffer (~128 events): the
+kernel reports `SYN_DROPPED` and the input stack discards the lot — measured, 14
+characters typed and 45 typed nothing. `/computer` feeds 16 reports at a time,
+each part once the device has handed the last to the guest plus 40 ms, so the
+reader never falls behind; the settle clock starts after the last part. Scroll
+notches go one per report for a related reason: a single wheel report carrying
+-5 moved nothing in WebKit, five reports of -1 scrolled the page.
+
+It adds no authority over `/hid` (same `api_key` gate, same device) and works on
+instances as `/i/<id>/computer`.
+
+### eyesoff-ai as the operator
+
+eyesoff-ai (since its tool results can carry a picture for the model,
+`result.see`) drives this with one `tools.http` entry — the model calls it,
+sees the screenshot in its next step, and calls again:
+
+```json
+{
+  "name": "computer",
+  "group": "virtual_machine",
+  "description": "Operate the RISC Box desktop by looking at its screen and using its mouse and keyboard. Every call does ONE action and returns a screenshot taken after it, which you can see. Coordinates: x and y on a 0-1000 scale across the screenshot (0,0 top-left, 1000,1000 bottom-right). …",
+  "parameters": { "type": "object", "required": ["action"], "properties": {
+    "action": { "type": "string", "enum": ["screenshot","click","double_click","right_click","move","drag","scroll","type","key","wait"] },
+    "x": { "type": "number" }, "y": { "type": "number" },
+    "to_x": { "type": "number" }, "to_y": { "type": "number" },
+    "text": { "type": "string" }, "keys": { "type": "string" },
+    "direction": { "type": "string", "enum": ["up","down","left","right"] },
+    "amount": { "type": "integer" }, "wait_ms": { "type": "integer" } } },
+  "url": "${RISCBOX_ENDPOINT}/computer",
+  "method": "POST",
+  "headers": { "x-api-key": "$RISCBOX_API_KEY" },
+  "body": { "action": "$action", "x": "$x", "y": "$y", "to_x": "$to_x", "to_y": "$to_y",
+            "text": "$text", "keys": "$keys", "direction": "$direction",
+            "amount": "$amount", "wait_ms": "$wait_ms", "grid": 1000 },
+  "timeout_s": 60,
+  "result": { "see": "image" }
+}
+```
+
+`result.see` names the field holding the picture: eyesoff-ai cuts it out of the
+text the model reads and attaches the bytes to that result's turn, so the
+serving VLM looks at it; holes the model leaves unfilled are dropped from the
+body, and `grid: 1000` rides every call.
 
 ## Seeding a bucket
 

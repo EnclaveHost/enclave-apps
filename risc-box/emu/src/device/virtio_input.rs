@@ -131,6 +131,13 @@ impl VirtioInput {
 	/// Host → device: queue one input event. Callers push a burst of
 	/// (type,code,value) events and terminate it with EV_SYN/SYN_REPORT so the
 	/// guest input core dispatches the group atomically.
+	/// risc-box patch: host events not yet handed to the guest. A caller
+	/// pacing a long burst (typing a sentence) waits for this to reach zero
+	/// before the next part, so the guest's evdev reader is never flooded.
+	pub fn pending_len(&self) -> usize {
+		self.pending.len()
+	}
+
 	pub fn push_event(&mut self, kind: u16, code: u16, value: u32) {
 		const CAP: usize = 4096;
 		// risc-box patch: when this overflowed it used to drop the OLDEST

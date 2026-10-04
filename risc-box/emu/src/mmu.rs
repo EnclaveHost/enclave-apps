@@ -1358,6 +1358,11 @@ impl Mmu {
 		&mut self.net
 	}
 
+	/// risc-box patch: read-only view of the input device (its queue depth)
+	pub fn get_input(&self) -> &VirtioInput {
+		&self.input
+	}
+
 	/// risc-box patch: mutable access to the virtio-input device so the
 	/// embedding application can inject pointer/keyboard events.
 	pub fn get_mut_input(&mut self) -> &mut VirtioInput {

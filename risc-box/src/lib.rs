@@ -63,8 +63,12 @@
 //!   GET  /display     Server-Sent Events: the main machine's screen as
 //!                     deflated dirty bands (see display.rs)
 //!   GET  /fb.png      the current frame as one PNG snapshot (any machine)
+//!   POST /computer    one model-driven action (click at a pixel, type text,
+//!                     a key chord, scroll, drag) answered with the screen it
+//!                     left behind, once the picture settles (computer.rs)
 //!   GET  /ping        liveness
 
+mod computer;
 mod display;
 mod egress;
 mod gamestream;
@@ -82,6 +86,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use computer::{Ev, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use display::Display;
 use httpd::{form_get, json, Request, Response, Server};
 use net::{ForwardCfg, HostNet, NetStack};
@@ -732,6 +737,10 @@ struct Machine {
     fps_bytes: u64,
     fps_at: Instant,
     input_boost: u64, // turns to force full tick batches after POST /input
+    /// where the pointer was last put (raw axis units), for reporting it back
+    /// exactly: the display's cursor plane sits at the pointer minus the
+    /// cursor image's hotspot, which is a few pixels off for an I-beam
+    pointer: Option<(u32, u32)>,
     per_ms: f64,      // measured instructions per host millisecond (0 = not yet)
     /// Consecutive turns the boost has been held, and the cooldown that follows
     /// when it has been held too long. Input arriving faster than the boost
@@ -769,6 +778,7 @@ impl Machine {
             fps_bytes: 0,
             fps_at: Instant::now(),
             input_boost: 0,
+            pointer: None,
             per_ms: 0.0,
             boost_run: 0,
             boost_hold: 0,
@@ -929,6 +939,9 @@ struct App {
     // instant it exists instead of on the client's next poll — over a real
     // link that is the whole poll round trip saved, every frame.
     pull_waiters: Vec<(u64, u64, Instant)>, // (hold ticket, since, deadline)
+    /// POST /computer calls held while their action plays out on the guest,
+    /// each answered once its screen settles or its deadline passes.
+    computer_waiters: Vec<ComputerWait>,
     /// The in-guest GameStream host. Built once the machine is running (it
     /// needs an RSA identity, which costs seconds, and there is nothing to
     /// stream before then). `None` when the ports could not be bound -- the
@@ -1773,6 +1786,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         ("POST", "/hid-stream") if !sub => server.upgrade_instream(key, "/hid-stream-event"),
         ("POST", "/hid-stream-event") if !sub => hid_inner(&mut app.machines[0], server, key, &req.body, false),
         ("POST", "/exec") => exec(app, server, key, &req.body, mi),
+        ("POST", "/computer") => computer_call(app, server, key, &req.body, mi),
         ("POST", "/save") if !sub => save(app, server, key),
         ("POST", "/save") => server.respond(key, json(403, "Forbidden", err("save is for the main machine (its disk is the saveKey's); snapshot an instance instead"))),
         ("POST", "/snapshot") => snapshot(app, server, key, &req.body, mi),
@@ -2124,9 +2138,6 @@ const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
-const BTN_LEFT: u16 = 0x110;
-const BTN_RIGHT: u16 = 0x111;
-const BTN_MIDDLE: u16 = 0x112;
 
 /// POST /hid — inject pointer/keyboard input into the machine's virtio-input
 /// device. Body: {"events":[ … ]} where each event is one of
@@ -2160,28 +2171,20 @@ fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], resp
         }
         return;
     };
-    let emu = m.emu.as_mut().expect("emu present (checked above)");
     let abs_max = Emulator::input_abs_max() as f64;
-    let mut n = 0u32;
-    let syn = |emu: &mut Emulator| emu.push_input_event(EV_SYN, 0, 0);
+    let mut evs = Vec::with_capacity(events.len());
     for ev in events {
         let kind = ev.get("t").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
             "move" => {
                 let x = ev.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
                 let y = ev.get("y").and_then(|y| y.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
-                emu.push_input_event(EV_ABS, ABS_X, (x * abs_max).round() as u32);
-                emu.push_input_event(EV_ABS, ABS_Y, (y * abs_max).round() as u32);
-                syn(emu);
-                n += 1;
+                evs.push(Ev::Abs((x * abs_max).round() as u32, (y * abs_max).round() as u32));
             }
             "moveabs" => {
                 let ax = ev.get("ax").and_then(|x| x.as_i64()).unwrap_or(0).clamp(0, abs_max as i64);
                 let ay = ev.get("ay").and_then(|y| y.as_i64()).unwrap_or(0).clamp(0, abs_max as i64);
-                emu.push_input_event(EV_ABS, ABS_X, ax as u32);
-                emu.push_input_event(EV_ABS, ABS_Y, ay as u32);
-                syn(emu);
-                n += 1;
+                evs.push(Ev::Abs(ax as u32, ay as u32));
             }
             "button" => {
                 let code = match ev.get("b").and_then(|b| b.as_str()).unwrap_or("left") {
@@ -2190,35 +2193,60 @@ fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], resp
                     _ => BTN_LEFT,
                 };
                 let down = ev.get("down").and_then(|d| d.as_bool()).unwrap_or(true);
-                emu.push_input_event(EV_KEY, code, down as u32);
-                syn(emu);
-                n += 1;
+                evs.push(Ev::Key(code, down));
             }
             "key" => {
                 let code = ev.get("code").and_then(|c| c.as_u64()).unwrap_or(0) as u16;
                 let down = ev.get("down").and_then(|d| d.as_bool()).unwrap_or(true);
                 if code != 0 {
-                    emu.push_input_event(EV_KEY, code, down as u32);
-                    syn(emu);
-                    n += 1;
+                    evs.push(Ev::Key(code, down));
                 }
             }
             "scroll" => {
                 let dy = ev.get("dy").and_then(|d| d.as_i64()).unwrap_or(0);
                 let dx = ev.get("dx").and_then(|d| d.as_i64()).unwrap_or(0);
-                if dy != 0 {
-                    emu.push_input_event(EV_REL, REL_WHEEL, dy as i32 as u32);
-                }
-                if dx != 0 {
-                    emu.push_input_event(EV_REL, REL_HWHEEL, dx as i32 as u32);
-                }
                 if dy != 0 || dx != 0 {
-                    syn(emu);
-                    n += 1;
+                    evs.push(Ev::Wheel(dy as i32, dx as i32));
                 }
             }
             _ => {}
         }
+    }
+    let n = inject(m, &evs);
+    if respond {
+        server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
+    }
+}
+
+/// Push input into a running machine's virtio-input device, each event
+/// committed with its own EV_SYN report, and boost the CPU so the guest
+/// services it promptly. The one injection path: /hid's JSON events and
+/// /computer's planned actions both arrive here. Returns how many landed.
+fn inject(m: &mut Machine, evs: &[Ev]) -> u32 {
+    let Some(emu) = m.emu.as_mut() else { return 0 };
+    let mut n = 0u32;
+    for ev in evs {
+        match *ev {
+            Ev::Abs(ax, ay) => {
+                emu.push_input_event(EV_ABS, ABS_X, ax);
+                emu.push_input_event(EV_ABS, ABS_Y, ay);
+                m.pointer = Some((ax, ay));
+            }
+            Ev::Key(code, down) => emu.push_input_event(EV_KEY, code, down as u32),
+            Ev::Wheel(dy, dx) => {
+                if dy != 0 {
+                    emu.push_input_event(EV_REL, REL_WHEEL, dy as u32);
+                }
+                if dx != 0 {
+                    emu.push_input_event(EV_REL, REL_HWHEEL, dx as u32);
+                }
+                if dy == 0 && dx == 0 {
+                    continue;
+                }
+            }
+        }
+        emu.push_input_event(EV_SYN, 0, 0);
+        n += 1;
     }
     // Run full CPU batches for a bit so the guest services the input IRQ and
     // X repaints promptly instead of at the idle-throttle rate — but only when
@@ -2226,9 +2254,235 @@ fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], resp
     if n > 0 && m.boost_hold == 0 {
         m.input_boost = m.input_boost.max(INPUT_BOOST_TURNS);
     }
-    if respond {
-        server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
+    n
+}
+
+// ---- POST /computer: one model-driven action, answered with the screen ------
+
+/// A /computer call parked while its action plays out (see computer.rs).
+struct ComputerWait {
+    ticket: u64,
+    /// by ID, not index: an instance can be deleted while a call waits, and
+    /// deleting compacts `machines`
+    machine: String,
+    plan: computer::Plan,
+    /// events not yet injected: a long burst goes in COMPUTER_CHUNK at a
+    /// time (see computer_feed)
+    queue: VecDeque<Ev>,
+    next_feed: Instant,
+    started: Instant,
+    /// when the LAST event went in: the settle clock (min, max) runs from here
+    t0: Instant,
+    next_sample: Instant,
+    /// the screen before the action, and as last sampled
+    before: u64,
+    last: u64,
+    /// the last moment the screen changed OR the guest was busy: "settled"
+    /// is this far in the past. Watching the CPU as well as the pixels is
+    /// what tells "the menu closed and the terminal is still starting" (a
+    /// quiet screen over a busy guest) from "done".
+    last_change: Instant,
+    changed: bool,
+    /// the guest's retired instruction count at the last sample
+    retired: u64,
+}
+
+/// Above this many guest instructions per second, the machine is doing
+/// something (an app starting, a page loading) and the screen it shows is not
+/// its last word. An idle Alpine desktop retires ~40 thousand a second; any
+/// real work is tens of millions.
+const COMPUTER_BUSY_IPS: u64 = 5_000_000;
+
+/// The most events (each one a report: event + SYN) injected at once, and
+/// the pause before the next part. The guest's evdev buffer for this device
+/// holds ~128 events; a typed sentence is several hundred, and delivered in
+/// one burst the reader overflows, the kernel reports SYN_DROPPED, and the
+/// input stack discards the lot - measured: 14 characters typed, 45 typed
+/// NOTHING. Parts of 16 reports, each sent once the device has handed the
+/// last part to the guest and the guest has had a moment to read it, never
+/// come close.
+const COMPUTER_CHUNK: usize = 16;
+const COMPUTER_CHUNK_GAP_MS: u64 = 40;
+/// A burst the guest stops taking (the device never drains) is cut off here.
+const COMPUTER_FEED_GIVE_UP_S: u64 = 60;
+
+/// Inject the next part of a held call's input, if the device is ready for it.
+fn computer_feed(m: &mut Machine, w: &mut ComputerWait, now: Instant) {
+    if w.queue.is_empty() || now < w.next_feed {
+        return;
     }
+    if m.emu.as_ref().is_some_and(|e| e.input_pending() > 0)
+        && now - w.started < Duration::from_secs(COMPUTER_FEED_GIVE_UP_S)
+    {
+        return;
+    }
+    if now - w.started >= Duration::from_secs(COMPUTER_FEED_GIVE_UP_S) {
+        w.queue.clear();
+        w.plan.did.push_str(" (cut short: the machine stopped taking input)");
+    } else {
+        let n = w.queue.len().min(COMPUTER_CHUNK);
+        let part: Vec<Ev> = w.queue.drain(..n).collect();
+        inject(m, &part);
+    }
+    w.next_feed = now + Duration::from_millis(COMPUTER_CHUNK_GAP_MS);
+    if w.queue.is_empty() {
+        // the action is complete only now: the guest gets its reaction time
+        // and the settle window from the last event, not the first
+        w.t0 = now;
+        w.last_change = now;
+        w.next_sample = now + Duration::from_millis(computer::SAMPLE_MS);
+    }
+}
+
+/// How long a call whose action changed NOTHING on screen waits before it
+/// says so. Longer than the reaction floor: a slow guest that has not
+/// repainted yet must not be reported as an action with no effect.
+const COMPUTER_NO_CHANGE_MS: u64 = 1500;
+
+/// A cheap fingerprint of the screen (the composed scanout, cursor included),
+/// to tell "still changing" from "settled" without encoding anything.
+fn screen_hash(emu: &Emulator, buf: &mut Vec<u8>) -> u64 {
+    buf.resize(display::fb_bytes(), 0);
+    Display::capture(emu, buf);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for c in buf.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// POST /computer — plan the action, inject it, and answer with the screen
+/// once it settles. A screenshot answers at once; anything else is held and
+/// released by computer_tick from the main loop, so the guest keeps running
+/// (and repainting) while the call waits. Nothing is injected when the plan
+/// is refused.
+fn computer_call(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) {
+    let m = &mut app.machines[mi];
+    if !m.running() {
+        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+    }
+    let screen = computer::Screen {
+        w: display::fb_w(),
+        h: display::fb_h(),
+        abs_max: Emulator::input_abs_max().max(1) as u32,
+    };
+    let plan = match computer::plan(body, screen) {
+        Ok(p) => p,
+        Err(e) => return server.respond(key, json(400, "Bad Request", err(&e))),
+    };
+    if plan.events.is_empty() && plan.max.is_zero() {
+        let body = computer_answer(m, &plan, true, false, 0);
+        return server.respond(key, json(200, "OK", body));
+    }
+    let mut buf = Vec::new();
+    let before = screen_hash(m.emu.as_ref().expect("running"), &mut buf);
+    let retired = m.emu.as_ref().expect("running").get_cpu().retired();
+    let Some(ticket) = server.hold(key) else { return };
+    let now = Instant::now();
+    let mut w = ComputerWait {
+        ticket,
+        machine: m.id.clone(),
+        queue: plan.events.iter().cloned().collect(),
+        plan,
+        next_feed: now,
+        started: now,
+        t0: now,
+        next_sample: now + Duration::from_millis(computer::SAMPLE_MS),
+        before,
+        last: before,
+        last_change: now,
+        changed: false,
+        retired,
+    };
+    computer_feed(m, &mut w, now);
+    app.computer_waiters.push(w);
+}
+
+/// One pass over the held /computer calls. Returns true if any was answered.
+fn computer_tick(app: &mut App, server: &mut Server) -> bool {
+    let now = Instant::now();
+    let mut answered = false;
+    let mut buf = Vec::new();
+    for mut w in std::mem::take(&mut app.computer_waiters) {
+        let Some(mi) = app.find(&w.machine) else {
+            answered |= server.release(w.ticket, json(409, "Conflict", err("the machine went away")));
+            continue;
+        };
+        let m = &mut app.machines[mi];
+        if !m.running() {
+            answered |= server.release(w.ticket, json(409, "Conflict", err("machine stopped")));
+            continue;
+        }
+        if !w.queue.is_empty() {
+            computer_feed(m, &mut w, now);
+            app.computer_waiters.push(w);
+            continue;
+        }
+        let elapsed = now - w.t0;
+        if !w.plan.fixed && now >= w.next_sample {
+            let emu = m.emu.as_ref().expect("running");
+            let h = screen_hash(emu, &mut buf);
+            if h != w.last {
+                w.last = h;
+                w.last_change = now;
+            }
+            w.changed |= h != w.before;
+            let retired = emu.get_cpu().retired();
+            let period = now - (w.next_sample - Duration::from_millis(computer::SAMPLE_MS));
+            let ips = retired.saturating_sub(w.retired) as f64 / period.as_secs_f64().max(0.001);
+            if ips > COMPUTER_BUSY_IPS as f64 {
+                w.last_change = now;
+            }
+            w.retired = retired;
+            w.next_sample = now + Duration::from_millis(computer::SAMPLE_MS);
+        }
+        let quiet = now - w.last_change >= Duration::from_millis(computer::SETTLE_MS);
+        let done = if elapsed >= w.plan.max {
+            Some(w.plan.fixed || quiet)
+        } else if w.plan.fixed || elapsed < w.plan.min {
+            None
+        } else if w.changed && quiet {
+            Some(true)
+        } else if !w.changed && elapsed >= Duration::from_millis(COMPUTER_NO_CHANGE_MS) {
+            Some(true)
+        } else {
+            None
+        };
+        match done {
+            Some(settled) => {
+                let waited = (now - w.started).as_millis() as u64;
+                let body = computer_answer(m, &w.plan, settled, w.changed, waited);
+                answered |= server.release(w.ticket, json(200, "OK", body));
+            }
+            None => app.computer_waiters.push(w),
+        }
+    }
+    answered
+}
+
+/// The answer: what was done, the screen as JPEG, where the pointer is.
+fn computer_answer(m: &Machine, plan: &computer::Plan, settled: bool, changed: bool, waited_ms: u64) -> String {
+    use video::VideoEncoder;
+    let emu = m.emu.as_ref().expect("running");
+    let (rgb, w, h) = video::capture_rgb(emu);
+    let mut enc = video::MjpegEncoder::new(plan.quality);
+    let jpeg = enc.encode(&rgb, w, h).pop().map(|f| f.data).unwrap_or_default();
+    // the pointer where it was put, in pixels; the cursor plane as a fallback
+    // for a pointer nobody here has moved yet
+    let abs = Emulator::input_abs_max().max(1) as f64;
+    let cursor = m
+        .pointer
+        .map(|(ax, ay)| {
+            let px = |a: u32, size: usize| (a as f64 * (size.max(2) - 1) as f64 / abs).round() as i64;
+            (px(ax, w), px(ay, h))
+        })
+        .or_else(|| emu.gpu_cursor().map(|(_, x, y, _)| (x, y)));
+    // "changed" only means something for an action: whether the screen
+    // differs from the one the action was injected into
+    let changed = (!plan.events.is_empty()).then_some(changed);
+    computer::answer(plan, w, h, cursor, settled, changed, waited_ms, &jpeg)
 }
 
 // ---- POST /exec: run a shell command on the guest serial console -----------
@@ -2955,6 +3209,7 @@ pub fn run() {
         pull: BandRing::new(),
         pull_seen: None,
         pull_waiters: Vec::new(),
+        computer_waiters: Vec::new(),
         gs: None,
         gs_tried: false,
         fb_scanned: None,
@@ -3469,6 +3724,12 @@ pub fn run() {
                     app.pull_waiters.push((ticket, since, deadline));
                 }
             }
+        }
+
+        // Held /computer calls: sample each one's screen, answer it once the
+        // picture has settled (or its deadline passes). See computer_tick.
+        if !app.computer_waiters.is_empty() {
+            busy |= computer_tick(&mut app, &mut server);
         }
 
         // The GameStream host: built on the first turn after the main machine
