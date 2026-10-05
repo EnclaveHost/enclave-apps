@@ -1022,6 +1022,153 @@ fn feed_waiting(
     }
 }
 
+/// Is this host error a refusal for ROOM - the shared pool or the MTP
+/// head's context - that generate() steps aside for and resumes after?
+fn pool_refused(e: &str) -> bool {
+    e.contains(POOL_FULL_MARKER) || e.contains(MTP_HEAD_FULL)
+}
+
+/// What generate() narrates while it waits for pool room. Opens with
+/// BUSY_STATUS, so internal_status holds an internal pass (router verdict,
+/// title, vision question) to its own busy allowance here exactly as in the
+/// session queue.
+fn pool_status(waited_ms: u128) -> String {
+    format!(
+        "{BUSY_STATUS} ({}s) - the model's memory is full, waiting for room to continue",
+        waited_ms / 1000
+    )
+}
+
+/// How an answer ends when the pool never drained.
+fn pool_full_gave_up(waited_ms: u128) -> String {
+    format!(
+        "the model's memory stayed full for {}s: this deployment is holding more (or longer) \
+         conversations than its context pool fits right now. Try again in a little while, \
+         or continue in a new chat",
+        waited_ms / 1000
+    )
+}
+
+/// The pause before generate()'s `n`th reopen (0-based) since the answer
+/// last made progress: POOL_REOPEN_MIN_MS doubling up to POOL_REOPEN_MAX_MS.
+/// generate() adds up to half again (pool_jitter).
+fn pool_reopen_delay(n: u32) -> u128 {
+    POOL_REOPEN_MIN_MS
+        .saturating_mul(1u128 << n.min(16))
+        .min(POOL_REOPEN_MAX_MS)
+}
+
+/// 0..span ms, drawn from the wall clock's sub-second part: enough to pull
+/// apart chats that were refused in the same instant, so they do not reopen
+/// into each other again. Nothing here needs to be unpredictable.
+fn pool_jitter(span: u128) -> u128 {
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    ((ns.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u128) % span.max(1)
+}
+
+/// A refused GENERATION step (POOL_FULL_MARKER) waits a moment drawn per
+/// call and tries once more before generate() steps the answer aside. An MTP
+/// round takes the decode turn alone, so a pool that runs out refuses every
+/// generating chat within milliseconds of each other; drawn apart, the first
+/// to retry finds no room and steps aside, and the cells it hands back let
+/// the others' retries through - one chat pauses instead of all of them.
+/// `step(retry)`: the refused call changed nothing (llama.cpp leaves the
+/// pool as it was, the engine advances no position), except that a fused
+/// round's folded observe ran before its verify - so it has landed, and the
+/// retry must not send it again. Never for a prompt chunk: the engine books
+/// a chunk before decoding it, and the same chunk sent twice is refused or
+/// desyncs its token shadow.
+fn pool_retry<T>(step: impl FnMut(bool) -> Result<T, String>) -> Result<T, String> {
+    pool_retry_with(step, &|ms| sleep_ms(ms))
+}
+
+fn pool_retry_with<T>(
+    mut step: impl FnMut(bool) -> Result<T, String>,
+    sleep: &dyn Fn(u64),
+) -> Result<T, String> {
+    match step(false) {
+        Err(e) if e.contains(POOL_FULL_MARKER) => {
+            sleep((POOL_RETRY_MIN_MS + pool_jitter(POOL_RETRY_SPAN_MS)) as u64);
+            step(true)
+        }
+        r => r,
+    }
+}
+
+/// A resumed answer's tokens so far (see Answer), fed behind its prompt;
+/// returns the row the last of them leaves, which the next token is sampled
+/// from. Fed as GENERATION - "all"-shaped passes in prefill-sized chunks -
+/// and never as more prompt: the engine parks a prompt when its first
+/// generation step arrives, and prompt-plus-half-an-answer is a park no later
+/// turn branches off (the next prompt renders the answer through the
+/// template) that would hold its cells for the park's whole TTL - the very
+/// room the resume waited for. Measured 2026-10-05 on a 1024-token pool: two
+/// resumed answers parked that way kept a third chat out for five minutes.
+fn feed_answer(
+    sess: &mut Session,
+    cfg: &AppConfig,
+    ids: &[u32],
+    status: &dyn Fn(&str) -> bool,
+) -> Result<Row, String> {
+    if let Session::Onnx { .. } = sess {
+        return sess.feed(cfg, ids, true); // no shared pool, no parks
+    }
+    feed_answer_chunks(sess, cfg, ids, status, |s, c, _| {
+        s.feed_all(cfg, c).map(|mut rows| rows.pop().unwrap_or_else(|| Row::dense(Vec::new())))
+    })
+}
+
+/// feed_answer for the MTP loop: each chunk's hidden rows are harvested for
+/// the real sequence `t_seq` and its tokens observed into the head from
+/// position `t_fed` on - exactly how a round's accepted tokens reach it - so
+/// the head drafts from the answer as it stands.
+fn feed_answer_mtp(
+    sess: &mut Session,
+    cfg: &AppConfig,
+    ids: &[u32],
+    t_seq: i32,
+    t_fed: usize,
+    status: &dyn Fn(&str) -> bool,
+) -> Result<Row, String> {
+    feed_answer_chunks(sess, cfg, ids, status, |s, c, done| {
+        let mut rows = s.feed_all_mtp(cfg, c, t_seq)?;
+        s.mtp_accept(t_fed + done, c)?;
+        Ok(rows.pop().unwrap_or_else(|| Row::dense(Vec::new())))
+    })
+}
+
+fn feed_answer_chunks(
+    sess: &mut Session,
+    cfg: &AppConfig,
+    ids: &[u32],
+    status: &dyn Fn(&str) -> bool,
+    mut feed: impl FnMut(&mut Session, &[u32], usize) -> Result<Row, String>,
+) -> Result<Row, String> {
+    let chunk = prefill_chunk(sess, cfg);
+    let (mut done, mut last_tick) = (0usize, now_ms());
+    let mut row = Row::dense(Vec::new());
+    for c in ids.chunks(chunk) {
+        row = feed(sess, c, done)?;
+        done += c.len();
+        if done < ids.len() && now_ms() - last_tick >= PREFILL_TICK_MS {
+            last_tick = now_ms();
+            if !status(&format!(
+                "{PREFILL_STATUS}the answer so far again: {done} of {} tokens",
+                ids.len()
+            )) {
+                return Err("client disconnected".into());
+            }
+        }
+    }
+    if row.vals.is_empty() {
+        return Err("the engine returned no row for the answer so far".into());
+    }
+    Ok(row)
+}
+
 /// The "(N of M tokens)" a PREFIX_WARMING_MARKER refusal carries: the
 /// leader's progress toward the mark this request is waiting on.
 fn prefix_wait_progress(e: &str) -> Option<(usize, usize)> {
@@ -1050,6 +1197,106 @@ mod prefix_wait_tests {
         assert_eq!(prefix_wait_progress("compute: something else (1 of 2 tokens)"), None);
         assert_eq!(prefix_wait_progress("[prefix_warming] no numbers"), None);
         assert_eq!(prefix_wait_progress("[prefix_warming] (x of y tokens)"), None);
+    }
+}
+
+#[cfg(test)]
+mod pool_wait_tests {
+    use super::*;
+
+    #[test]
+    fn an_internal_pass_waits_only_its_own_busy_allowance() {
+        // the wait narrates as a busy tick, so internal_status's budget
+        // applies: spent at once here, and generate() is told to stop
+        let relay = internal_status("naming the chat", &|_: &str| {}, 0);
+        assert!(!relay(&pool_status(0)));
+        let relay = internal_status("naming the chat", &|_: &str| {}, 60_000);
+        assert!(relay(&pool_status(0)));
+    }
+
+    // the exact text wasm/wasmtime-nn-ggml.patch's decode_err(1) builds,
+    // wrapped the way nn_err() wraps it (the 2026-10-04 eyesoff.ai report)
+    const REFUSED: &str = "mtp_round: ErrorCode::RuntimeError: Failed while accessing backend: \
+        [kv_pool_full] the shared KV pool cannot hold this step right now — too many (or too \
+        long) concurrent chats; retry shortly, or redeploy with a larger share";
+
+    #[test]
+    fn a_refused_step_is_retried_once_after_a_drawn_pause_without_its_observe() {
+        let slept = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u64| slept.borrow_mut().push(ms);
+        // what mtp_round sends: the folded observe on the first try only
+        let mut sent_obs = Vec::new();
+        let r = pool_retry_with(|retry| {
+            sent_obs.push(!retry);
+            if retry { Ok(7) } else { Err(REFUSED.to_string()) }
+        }, &sleep);
+        assert_eq!(r, Ok(7));
+        assert_eq!(sent_obs, vec![true, false]);
+        let slept = slept.borrow();
+        assert_eq!(slept.len(), 1);
+        let lo = POOL_RETRY_MIN_MS as u64;
+        assert!((lo..lo + POOL_RETRY_SPAN_MS as u64).contains(&slept[0]), "{slept:?}");
+    }
+
+    #[test]
+    fn a_step_refused_twice_goes_up_to_generate_and_other_errors_pass_straight_through() {
+        let calls = std::cell::Cell::new(0);
+        let r: Result<(), String> = pool_retry_with(|_| {
+            calls.set(calls.get() + 1);
+            Err(REFUSED.to_string())
+        }, &|_| {});
+        assert!(r.unwrap_err().contains(POOL_FULL_MARKER), "generate() must see the refusal");
+        assert_eq!(calls.get(), 2);
+        let slept = std::cell::Cell::new(false);
+        let r: Result<(), String> =
+            pool_retry_with(|_| Err("mtp observe failed (rc 1)".into()), &|_| slept.set(true));
+        assert_eq!(r.unwrap_err(), "mtp observe failed (rc 1)");
+        assert!(!slept.get(), "no pause for an error that is not pool room");
+    }
+
+    #[test]
+    fn a_full_mtp_head_is_room_too_but_a_stale_observe_is_a_fault() {
+        assert!(pool_refused(REFUSED));
+        // the 2026-10-05 run's exact error, and the fused round's own
+        assert!(pool_refused("mtp_accept: ErrorCode::RuntimeError: Failed while accessing backend: \
+            mtp observe failed (rc 1; harvested rows stale?)"));
+        assert!(pool_refused("[mtp_obs_failed] fused observe failed (rc 1; harvested rows stale?)"));
+        assert!(!pool_refused("mtp observe failed (rc -1; harvested rows stale?)"));
+        assert!(!pool_refused("mtp observe failed (rc 12; harvested rows stale?)"));
+        // the in-place retry stays pool-only: a failed observe did not land,
+        // and retrying without it would desync the head
+        let calls = std::cell::Cell::new(0);
+        let _ = pool_retry_with(|_| -> Result<(), String> {
+            calls.set(calls.get() + 1);
+            Err("[mtp_obs_failed] fused observe failed (rc 1; harvested rows stale?)".into())
+        }, &|_| {});
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn the_sentence_an_answer_ends_with_is_not_a_refusal() {
+        let e = pool_full_gave_up(301_000);
+        assert!(!e.contains(POOL_FULL_MARKER), "{e}");
+        assert!(e.contains("301s"), "{e}");
+    }
+
+    #[test]
+    fn reopens_back_off_and_are_drawn_apart() {
+        let d: Vec<u128> = (0..6).map(pool_reopen_delay).collect();
+        assert_eq!(d, vec![4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
+        assert_eq!(pool_reopen_delay(u32::MAX), POOL_REOPEN_MAX_MS);
+        for _ in 0..1000 {
+            assert!(pool_jitter(2_000) < 2_000);
+        }
+        assert_eq!(pool_jitter(0), 0);
+        // the clock's sub-second part spreads the draws, not one value
+        let draws: std::collections::HashSet<u128> = (0..64)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_micros(37));
+                pool_jitter(15_000)
+            })
+            .collect();
+        assert!(draws.len() > 8, "{draws:?}");
     }
 }
 /// Request-body ceiling. Generous because attachments arrive base64'd INSIDE
@@ -1097,6 +1344,38 @@ const PREFIX_WAIT_BUDGET_MS: u128 = 900_000;
 /// pass that cannot start is dropped, so the queue allowance stays with the
 /// answer the user is actually waiting for.
 const INTERNAL_BUSY_BUDGET_MS: u128 = 30_000;
+/// The host's shared KV pool (one per model: ENCLAVE_GGML_N_CTX tokens that
+/// every concurrent chat, internal pass and parked prompt prefix draws from)
+/// refuses a decode it cannot place with this marker. Until 2026-10-04 it
+/// ended the answer - "gpu: mtp_round: ... [kv_pool_full] ..." mid-reply on
+/// eyesoff.ai, behind a Retry button that read the whole prompt again into
+/// the same full pool. generate() now steps aside and resumes instead.
+///
+/// Stepping aside, not waiting in place, because a pool with no room
+/// refuses EVERY generating chat at once (each step needs a cell): chats
+/// that each held their cells and waited would only wait on each other.
+const POOL_FULL_MARKER: &str = "[kv_pool_full]";
+/// The MTP head runs its own llama context, sized like the pool (n_ctx,
+/// unified) and holding every sequence's mirrored positions, so it runs out
+/// of room alongside it - and says so only as llama's no-slot code from an
+/// observe: "[mtp_obs_failed] fused observe failed (rc 1; ...)" or
+/// "mtp observe failed (rc 1; ...)". Seen 2026-10-05 on a 640-token pool, in
+/// the answer that got through once its neighbour stepped aside. Other rc
+/// values are real faults (stale rows), not room.
+const MTP_HEAD_FULL: &str = "observe failed (rc 1;";
+const POOL_POLL_MS: u64 = 2000;
+/// The session queue's allowance, counted from the answer's last progress.
+/// A pool that has not drained by then is not going to (one long chat, or
+/// parked prefixes, fill it), and the answer ends with a sentence instead.
+const POOL_WAIT_BUDGET_MS: u128 = 300_000;
+/// Each reopen reads the prompt again from the longest park it still
+/// matches, so reopens back off instead of polling: 4 s, 8 s, 16 s, then
+/// every 30 s, each plus up to half again.
+const POOL_REOPEN_MIN_MS: u128 = 4_000;
+const POOL_REOPEN_MAX_MS: u128 = 30_000;
+/// pool_retry's pause before its one retry in place: 0.5 s plus up to 2 s.
+const POOL_RETRY_MIN_MS: u128 = 500;
+const POOL_RETRY_SPAN_MS: u128 = 2_000;
 
 /// Status relay for an internal generation (router verdict, vision question,
 /// chat title). generate() narrates its busy queue through the status
@@ -1323,8 +1602,10 @@ impl Session {
     }
 
     /// Feed `ids`; with `want_logits`, return the LAST token's logits row.
+    /// Generation steps only - a refused feed gets pool_retry's one retry,
+    /// which a prompt chunk must not (prefill goes through feed_declared).
     fn feed(&mut self, cfg: &AppConfig, ids: &[u32], want_logits: bool) -> Result<Row, String> {
-        self.feed_declared(cfg, ids, want_logits, None)
+        pool_retry(|_| self.feed_declared(cfg, ids, want_logits, None))
     }
 
     /// feed(), plus the mm34 prefix-cache declaration on a prompt's FIRST
@@ -1889,14 +2170,15 @@ impl Session {
             return Err("speculative decoding needs the ggml backend".into());
         };
         let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let outs = ctx
-            .compute(vec![
+        let outs = pool_retry(|_| {
+            ctx.compute(vec![
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 topk_input(),
                 timing_input(),
             ])
-            .map_err(|e| nn_err("compute", e))?;
+            .map_err(|e| nn_err("compute", e))
+        })?;
         note_timing("feed_all", &outs);
         rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
@@ -2067,15 +2349,16 @@ impl Session {
             return Err("speculative decoding needs the ggml backend".into());
         };
         let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let outs = ctx
-            .compute(vec![
+        let outs = pool_retry(|_| {
+            ctx.compute(vec![
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 ("mtp_for".to_string(), Tensor::new(&[1], TensorType::I32, &real_seq.to_le_bytes())),
                 topk_input(),
                 timing_input(),
             ])
-            .map_err(|e| nn_err("compute", e))?;
+            .map_err(|e| nn_err("compute", e))
+        })?;
         note_timing("feed_all_mtp", &outs);
         rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
@@ -2148,25 +2431,29 @@ impl Session {
         bytes.extend_from_slice(&p_min_milli.to_le_bytes());
         let pbytes: Vec<u8> =
             pending.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let mut inputs = vec![
-            ("mtp_round".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
-            ("tokens".to_string(),
-             Tensor::new(&[1, pending.len() as u32], TensorType::I32, &pbytes)),
-            topk_input(),
-            timing_input(),
-        ];
-        if let Some((pos0, toks)) = obs {
-            let mut ob = Vec::with_capacity((toks.len() + 1) * 4);
-            ob.extend_from_slice(&(pos0 as i32).to_le_bytes());
-            for t in toks {
-                ob.extend_from_slice(&(*t as i32).to_le_bytes());
+        let outs = pool_retry(|retry| {
+            let mut inputs = vec![
+                ("mtp_round".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
+                ("tokens".to_string(),
+                 Tensor::new(&[1, pending.len() as u32], TensorType::I32, &pbytes)),
+                topk_input(),
+                timing_input(),
+            ];
+            // a round refused for pool room ran its observe before the
+            // verify: it has landed, and must not be sent twice (pool_retry)
+            if let (Some((pos0, toks)), false) = (obs, retry) {
+                let mut ob = Vec::with_capacity((toks.len() + 1) * 4);
+                ob.extend_from_slice(&(pos0 as i32).to_le_bytes());
+                for t in toks {
+                    ob.extend_from_slice(&(*t as i32).to_le_bytes());
+                }
+                inputs.push((
+                    "mtp_obs".to_string(),
+                    Tensor::new(&[(toks.len() + 1) as u32], TensorType::I32, &ob),
+                ));
             }
-            inputs.push((
-                "mtp_obs".to_string(),
-                Tensor::new(&[(toks.len() + 1) as u32], TensorType::I32, &ob),
-            ));
-        }
-        let outs = ctx.compute(inputs).map_err(|e| nn_err("mtp_round", e))?;
+            ctx.compute(inputs).map_err(|e| nn_err("mtp_round", e))
+        })?;
         note_timing("mtp_round", &outs);
         let drafts: Vec<u32> = outs
             .iter()
@@ -3007,6 +3294,15 @@ impl ThinkGuard {
 /// proposes draft_tokens ahead, the target verifies them in one pass, and
 /// every accepted token skips a full target step; any draft-side failure
 /// falls back to plain decode with a status note.
+///
+/// A full KV pool (pool_refused) does not end the answer. A refused
+/// step first gets one short retry in place (pool_retry); still refused, the
+/// attempt steps aside - its session goes with it, handing every cell it
+/// held back to the pool - and once there may be room again a fresh attempt
+/// picks the answer up where it stopped: the prompt is prefilled (branched
+/// off the turn's own park when it still stands), the tokens already
+/// generated are fed behind it (feed_answer), and decoding continues through
+/// the same Answer, so the reader sees one unbroken reply.
 fn generate(
     cfg: &AppConfig,
     tok: &Tok,
@@ -3016,6 +3312,85 @@ fn generate(
     p: &GenParams,
     draft: &DraftPlan,
     emit: &dyn Fn(&str) -> bool,
+    status: &dyn Fn(&str) -> bool,
+) -> Result<GenStats, String> {
+    let mut ans = Answer {
+        out: TextOut::new(tok, emit, &p.stop_strings),
+        think: ThinkGuard::new(p.think_budget, p.think_open, tok),
+        guard_from: 0,
+        drafted: 0,
+        accepted: 0,
+    };
+    // the wait is counted from the first refusal since the answer last grew:
+    // a long answer that steps aside more than once is not cut off for the
+    // time it spent making progress in between
+    let (mut since, mut reopens, mut grown) = (None::<u128>, 0u32, 0usize);
+    loop {
+        match generate_attempt(cfg, prompt, target, tname, p, draft, &mut ans, status) {
+            Ok(s) => return Ok(s),
+            Err(e) if pool_refused(&e) => {
+                if ans.out.generated.len() > grown {
+                    grown = ans.out.generated.len();
+                    (since, reopens) = (None, 0);
+                }
+                let t0 = *since.get_or_insert_with(now_ms);
+                let pause = pool_reopen_delay(reopens);
+                let reopen_at = now_ms() + pause + pool_jitter(pause / 2);
+                reopens += 1;
+                loop {
+                    let waited = now_ms().saturating_sub(t0);
+                    if waited >= POOL_WAIT_BUDGET_MS {
+                        return Err(pool_full_gave_up(waited));
+                    }
+                    if !status(&pool_status(waited)) {
+                        return Err("client disconnected".into());
+                    }
+                    let left = reopen_at.saturating_sub(now_ms());
+                    if left == 0 {
+                        break;
+                    }
+                    sleep_ms((left as u64).min(POOL_POLL_MS));
+                }
+                if !ans.out.generated.is_empty() && !status(&format!(
+                    "picking the answer up again where it stopped ({} tokens in)",
+                    ans.out.generated.len()
+                )) {
+                    return Err("client disconnected".into());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// What an answer has produced so far. generate() owns it and lends it to
+/// each attempt, so an attempt that steps aside for pool room leaves it
+/// exactly where the reader's view of the answer is, and the next attempt
+/// decodes on through it: nothing sent twice, nothing in the stop-string
+/// holdback lost, the think budget and the repetition check where they were.
+struct Answer<'a> {
+    out: TextOut<'a>,
+    think: ThinkGuard,
+    /// where the repetition check starts: moved past a force-closed
+    /// reasoning block so the answer is not condemned for the loop that
+    /// preceded it
+    guard_from: usize,
+    drafted: usize,
+    accepted: usize,
+}
+
+/// One generate() attempt on a fresh session: prefill `prompt`, feed the
+/// answer so far behind it when resuming (feed_answer), and decode on
+/// through `ans`.
+#[allow(clippy::too_many_arguments)]
+fn generate_attempt(
+    cfg: &AppConfig,
+    prompt: &Prompt,
+    target: ExecutionTarget,
+    tname: &str,
+    p: &GenParams,
+    draft: &DraftPlan,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     // The repetition window and the RNG seed read the text side of the
@@ -3089,7 +3464,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via {} - prefilling {} prompt tokens", dc.name, ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_spec(cfg, dc, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
+                return generate_spec(cfg, dc, ids, &prompt.marks, tname, p, sess, rig, load_ms, ans, status);
             }
             Err(e) => {
                 let _ = status(&format!("draft model unavailable ({}); plain decode", strip_code(&e)));
@@ -3100,7 +3475,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via the model's MTP head - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_mtp(cfg, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
+                return generate_mtp(cfg, ids, &prompt.marks, tname, p, sess, rig, load_ms, ans, status);
             }
             Err(e) => {
                 let _ = status(&format!("MTP drafting unavailable ({}); plain decode", strip_code(&e)));
@@ -3111,7 +3486,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via prompt lookup - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_lookup(cfg, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
+                return generate_lookup(cfg, ids, &prompt.marks, tname, p, sess, rig, load_ms, ans, status);
             }
             Err(e) => {
                 let _ = status(&format!("prompt-lookup drafting unavailable ({}); plain decode", strip_code(&e)));
@@ -3229,17 +3604,17 @@ fn generate(
         // means the render went wrong rather than the model.
         return Err("prompt ended without a text turn to answer from".into());
     }
+    // a resumed answer: its tokens so far go in behind the prompt
+    if !ans.out.generated.is_empty() {
+        logits = feed_answer(&mut sess, cfg, &ans.out.generated, status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     // -- decode
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    // where the repetition check starts: moved past a force-closed reasoning
-    // block so the answer is not condemned for the loop that preceded it
-    let mut guard_from = 0usize;
     let mut finish: &'static str = "stop";
     loop {
         let recent = out.recent(prompt_ids, p.sample.rep_window);
@@ -3258,7 +3633,7 @@ fn generate(
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted: 0, accepted: 0,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: prompt.images, image_pos,
                 });
             }
@@ -3269,7 +3644,7 @@ fn generate(
         // the think budget below never sees. Inside the reasoning block it is
         // the BLOCK that ends instead of the reply (take_loop), because a reply
         // that stops there has nothing in it the user asked for.
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break;
         }
@@ -3283,7 +3658,7 @@ fn generate(
             // the answer is judged for repetition on ITS OWN tokens: the loop
             // that just ended is still in `generated` and would trip the guard
             // again on the next token
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             let mut ids = vec![next];
             ids.extend_from_slice(&think.close);
             logits = sess.feed(cfg, &ids, true)?;
@@ -3298,7 +3673,7 @@ fn generate(
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted: 0, accepted: 0,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: prompt.images, image_pos,
     })
 }
@@ -3328,7 +3703,6 @@ fn generate(
 fn generate_spec(
     cfg: &AppConfig,
     dcfg: &AppConfig,
-    tok: &Tok,
     prompt_ids: &[u32],
     marks: &[usize],
     tname: &str,
@@ -3336,7 +3710,7 @@ fn generate_spec(
     mut sess: Session,
     rig: SpecRig,
     load_ms: u128,
-    emit: &dyn Fn(&str) -> bool,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let SpecRig { mut dsess, mut tscr, mut dscr, t_seq, d_seq, tscr_seq, dscr_seq } = rig;
@@ -3351,19 +3725,22 @@ fn generate_spec(
     prefill_text(&mut dsess, dcfg, prompt_ids, marks, &draft_status, |s, ids, _last, declare| {
         s.feed_declared(dcfg, ids, false, declare)
     })?;
+    // a resumed answer: its tokens so far go in behind the prompt, on both
+    if !ans.out.generated.is_empty() {
+        t_logits = feed_answer(&mut sess, cfg, &ans.out.generated, status)?;
+        feed_answer(&mut dsess, dcfg, &ans.out.generated, &draft_status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
-    let (mut drafted, mut accepted) = (0usize, 0usize);
-    // fed-token cursors, so rewinds land on absolute positions
-    let mut t_fed = prompt_ids.len();
-    let mut d_fed = prompt_ids.len();
+    // fed-token cursors, so rewinds land on absolute positions (a resumed
+    // answer's tokens so far are fed already)
+    let mut t_fed = prompt_ids.len() + out.generated.len();
+    let mut d_fed = t_fed;
     let mut d_behind: Vec<u32> = Vec::new(); // target-fed tokens the draft hasn't seen yet
 
     // the first token comes straight off the target's prefill row
@@ -3379,7 +3756,7 @@ fn generate_spec(
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
@@ -3390,7 +3767,7 @@ fn generate_spec(
         //    the plain loop). Speculative decode makes this MORE likely to run
         //    long, not less - a looping target accepts its own drafts almost
         //    perfectly, so the repetition arrives faster.
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -3403,7 +3780,7 @@ fn generate_spec(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             let mut row = sess.feed(cfg, &ids, true)?;
@@ -3434,7 +3811,7 @@ fn generate_spec(
                 dscr_fed += 1;
             }
         }
-        drafted += drafts.len();
+        *drafted += drafts.len();
         // -- ONE verify pass over [pending, d1..dk] on the target BRANCH:
         //    k+1 rows, the real sequence untouched
         tscr.copy_from(t_seq, t_fed)?;
@@ -3458,12 +3835,12 @@ fn generate_spec(
             // the draft predicted the target's sample exactly - it is the
             // target's token in every sense; run it through the same gates
             if cfg.eos.contains(&d) {
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             match out.push(d) {
@@ -3473,15 +3850,15 @@ fn generate_spec(
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; break 'outer; }
             }
             acc += 1;
         }
-        accepted += acc;
+        *accepted += acc;
         if let Some(r) = replacement {
             // partial round: commit ONLY the accepted tokens to the real
             // target (one batched pass, logits unread) and abandon both
@@ -3511,7 +3888,7 @@ fn generate_spec(
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted, accepted,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
@@ -3527,7 +3904,6 @@ fn generate_spec(
 #[allow(clippy::too_many_arguments)]
 fn generate_mtp(
     cfg: &AppConfig,
-    tok: &Tok,
     prompt_ids: &[u32],
     marks: &[usize],
     tname: &str,
@@ -3535,7 +3911,7 @@ fn generate_mtp(
     mut sess: Session,
     rig: MtpRig,
     load_ms: u128,
-    emit: &dyn Fn(&str) -> bool,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
@@ -3567,17 +3943,19 @@ fn generate_mtp(
     let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, _last, declare| {
         s.feed_mtp_declared(cfg, ids, declare)
     })?;
+    // a resumed answer: its tokens so far go in behind the prompt, mirrored
+    // into the head like any accepted round
+    if !ans.out.generated.is_empty() {
+        t_logits = feed_answer_mtp(&mut sess, cfg, &ans.out.generated, t_seq, prompt_ids.len(), status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
-    let (mut drafted, mut accepted) = (0usize, 0usize);
-    let mut t_fed = prompt_ids.len();
+    let mut t_fed = prompt_ids.len() + out.generated.len(); // resumed: fed already
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
     let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
@@ -3591,7 +3969,7 @@ fn generate_mtp(
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
@@ -3601,7 +3979,7 @@ fn generate_mtp(
         //    what is stuck (see the plain loop; the MTP head predicts a
         //    repeating tail near-perfectly, so this path reaches the cap
         //    fastest of the three)
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -3615,7 +3993,7 @@ fn generate_mtp(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             // a deferred observe must land BEFORE the forced pass below
             // overwrites the harvest rows it pairs with
             if let Some((op, ot)) = pending_obs.take() {
@@ -3711,7 +4089,7 @@ fn generate_mtp(
                 tscr_fed = t_fed + feed.len();
             }
         }
-        drafted += drafts.len();
+        *drafted += drafts.len();
         // -- verify: accept while the target's own sample agrees
         let mut acc = 0usize;
         let mut replacement: Option<u32> = None;
@@ -3723,12 +4101,12 @@ fn generate_mtp(
                 break;
             }
             if cfg.eos.contains(&d) {
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             match out.push(d) {
@@ -3738,15 +4116,15 @@ fn generate_mtp(
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; break 'outer; }
             }
             acc += 1;
         }
-        accepted += acc;
+        *accepted += acc;
         // -- the head learns ONLY the accepted tokens (its KV never holds a
         //    rejected proposal), then the target commits them. On fold-aware
         //    hosts the observe rides the NEXT round's draft call instead of
@@ -3785,7 +4163,7 @@ fn generate_mtp(
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted, accepted,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
@@ -3932,7 +4310,6 @@ impl LookupGate {
 #[allow(clippy::too_many_arguments)]
 fn generate_lookup(
     cfg: &AppConfig,
-    tok: &Tok,
     prompt_ids: &[u32],
     marks: &[usize],
     tname: &str,
@@ -3940,7 +4317,7 @@ fn generate_lookup(
     mut sess: Session,
     rig: MtpRig,
     load_ms: u128,
-    emit: &dyn Fn(&str) -> bool,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
@@ -3954,17 +4331,18 @@ fn generate_lookup(
     let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, last, declare| {
         s.feed_declared(cfg, ids, last, declare)
     })?;
+    // a resumed answer: its tokens so far go in behind the prompt
+    if !ans.out.generated.is_empty() {
+        t_logits = feed_answer(&mut sess, cfg, &ans.out.generated, status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
-    let (mut drafted, mut accepted) = (0usize, 0usize);
-    let mut t_fed = prompt_ids.len();
+    let mut t_fed = prompt_ids.len() + out.generated.len(); // resumed: fed already
     let mut gate = LookupGate::with(
         cfg.draft_min_ngram.unwrap_or(LOOKUP_NGRAM),
         cfg.draft_gate.unwrap_or(true),
@@ -3982,7 +4360,7 @@ fn generate_lookup(
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                     tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
@@ -3991,7 +4369,7 @@ fn generate_lookup(
         // -- degenerate loop: same policy as the other loops; lookup makes a
         //    stuck repetition ACCELERATE (its own tail matches perfectly), so
         //    this guard earns its keep here
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -4002,7 +4380,7 @@ fn generate_lookup(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             let mut row = sess.feed(cfg, &ids, true)?;
@@ -4032,7 +4410,7 @@ fn generate_lookup(
             pending = pick_row(&mut row, &recent, &p.sample, &mut rng);
             continue 'outer;
         }
-        drafted += drafts.len();
+        *drafted += drafts.len();
         let m = drafts.len();
         let mut feed: Vec<u32> = Vec::with_capacity(m + 1);
         feed.push(pending);
@@ -4062,12 +4440,12 @@ fn generate_lookup(
                 break;
             }
             if cfg.eos.contains(&d) {
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             match out.push(d) {
@@ -4077,15 +4455,15 @@ fn generate_lookup(
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
                         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; break 'outer; }
             }
             acc += 1;
         }
-        accepted += acc;
+        *accepted += acc;
         gate.observe(acc, m);
         if let Some(r) = replacement {
             if depth > 0 {
@@ -4123,7 +4501,7 @@ fn generate_lookup(
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
         tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted, accepted,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
