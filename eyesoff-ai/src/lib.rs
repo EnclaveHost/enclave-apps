@@ -6181,7 +6181,9 @@ impl<'a> ToolLoop<'a> {
         }
         let cut = self.results.len() - keep;
         for (idx, name, text, done) in &mut self.results[..cut] {
-            if *done {
+            // loaded signatures are what later calls are written from: a
+            // schema cut to its head and tail is one the model cannot follow
+            if *done || name.as_str() == tools::LOAD_TOOLS {
                 continue;
             }
             *done = true;
@@ -11213,6 +11215,7 @@ fn handle_tools_probe(
             "user": t.meta.user,
             "route": t.meta.route,
             "route_arg": t.meta.route_arg,
+            "defer": t.meta.defer,
         })).collect::<Vec<_>>(),
     });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());

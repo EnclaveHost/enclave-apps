@@ -52,6 +52,18 @@
 //! schema - the switch it sits under, pictures in and out, a call's own
 //! timeout, the prompt-side settings - so an http entry moved out of this
 //! config into an adapter keeps behaving exactly as it did here.
+//!
+//! DEFERRED SCHEMAS: every signature in the `<tools>` block is prompt the
+//! engine prefills before the first token of an answer, on every new chat.
+//! A big server is most of that bill - mcp.enclave.host's 36 tools are 28k
+//! characters, ~8k tokens, two thirds of the whole prompt - for tools most
+//! answers never touch. A server marked `defer` (or a tool whose `_meta`
+//! says so) is shown as ONE line per tool instead, and the `load_tools`
+//! builtin hands the model the full signatures of the ones it picks, as a
+//! tool result. The result lands in the conversation, never in the system
+//! text, so the parked system prefix stays the same whatever was loaded.
+//! A deferred tool stays in the registry and callable all along: loading is
+//! how the model learns the arguments, not a permission.
 
 use std::collections::BTreeMap;
 
@@ -316,7 +328,24 @@ pub enum Builtin {
     /// request. Children may spawn children; the per-answer count and the
     /// depth limit (AgentTree) are what stop that being unbounded.
     Agent,
+    /// Hand the model the full signatures of deferred tools (see DEFERRED
+    /// SCHEMAS above). Never named in config: the registry adds it whenever
+    /// something is deferred, and tools::call answers it from the registry,
+    /// because the signatures are already there - nothing leaves.
+    LoadTools,
 }
+
+/// The name of the builtin that loads deferred signatures.
+pub const LOAD_TOOLS: &str = "load_tools";
+
+/// The longest one-line summary a deferred tool gets in the prompt: its
+/// description's first sentence, cut here. Enough to choose by.
+const DEFER_SUMMARY_CHARS: usize = 90;
+
+/// What one load_tools result may carry. Larger than a tool's max_chars on
+/// purpose: a signature cut in half is worse than none, so the result stops
+/// at the last WHOLE signature that fits and names the ones left over.
+const LOAD_MAX_CHARS: usize = 24_000;
 
 impl Builtin {
     fn parse(name: &str) -> Option<Builtin> {
@@ -338,6 +367,7 @@ impl Builtin {
             Builtin::Request => "request",
             Builtin::Wait => "wait",
             Builtin::Agent => AGENT_TOOL,
+            Builtin::LoadTools => LOAD_TOOLS,
         }
     }
 
@@ -383,6 +413,11 @@ impl Builtin {
                  at a time, each with its own call budget inside this answer's remaining time; \
                  an answer may spawn only so many in total, and each may spawn its own. Prefer \
                  doing a few calls yourself over spawning an agent for them.",
+            Builtin::LoadTools =>
+                "Get the full signatures of functions listed by name only (under \"More \
+                 functions\"). Call it with the names you are about to use, before the first \
+                 call to any of them; the result shows each one exactly as <tools> does. Load \
+                 only what you need - every signature is text you then read past.",
         }
     }
 
@@ -455,6 +490,17 @@ impl Builtin {
                 },
                 "required": ["task"],
             }),
+            Builtin::LoadTools => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "the function names to load, as listed",
+                    }
+                },
+                "required": ["names"],
+            }),
         }
     }
 
@@ -464,6 +510,8 @@ impl Builtin {
             Builtin::WebSearch | Builtin::Request => b.search.is_some(),
             Builtin::Wait => true,
             Builtin::Agent => b.agent_slots > 0,
+            // added by build() when something is deferred, never from config
+            Builtin::LoadTools => false,
         }
     }
 
@@ -476,6 +524,7 @@ impl Builtin {
             // configured, but this loop may not spawn (count spent, or at
             // the depth limit): a per-loop fact, not a misconfiguration
             Builtin::Agent => b.agent_limit > 0,
+            Builtin::LoadTools => false,
         }
     }
 
@@ -485,6 +534,7 @@ impl Builtin {
             Builtin::WebSearch | Builtin::Request => "`search`",
             Builtin::Wait => "nothing",
             Builtin::Agent => "`max_agents` (a positive count in the `tools` block)",
+            Builtin::LoadTools => "a deferred tool (`defer` on an mcp entry)",
         }
     }
 }
@@ -1051,6 +1101,11 @@ pub struct McpServer {
     /// the person's switches show.
     #[serde(default)]
     pub groups: BTreeMap<String, Vec<String>>,
+    /// show this server's tools by name and one line only, and let the
+    /// model load the signatures it needs (see DEFERRED SCHEMAS). For a big
+    /// server most answers never call: its schemas stop being prefill.
+    #[serde(default)]
+    pub defer: bool,
 }
 
 /// A tool as an MCP server lists it, or as an inline declaration writes it:
@@ -1195,6 +1250,11 @@ pub struct ToolMeta {
     /// acts for the signed-in user (the server said so)
     #[serde(default)]
     pub user: bool,
+    /// shown by name and one line until load_tools fetches its signature
+    /// (see DEFERRED SCHEMAS): the server's own say for one tool, or the
+    /// whole server's (McpServer::defer)
+    #[serde(default)]
+    pub defer: bool,
 }
 
 impl ToolMeta {
@@ -1224,6 +1284,9 @@ impl ToolMeta {
             route: t.route.clone(),
             route_arg: t.route_arg.clone(),
             user: t.headers.values().any(|v| matches!(v.trim(), "$user" | "${user}")),
+            // an http entry is written out in this config, a few at a time;
+            // deferring is for servers whose lists arrive by the dozen
+            defer: false,
         }
     }
 }
@@ -1469,6 +1532,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             }
             let mut meta = d.meta.clone();
             meta.group = Some(group);
+            meta.defer |= s.defer;
             reg.tools.push(Tool {
                 name: exposed,
                 description: d.description.clone(),
@@ -1478,6 +1542,30 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             });
         }
         reg.mcp.push(sess);
+    }
+    // Deferred tools need load_tools to be usable. Added last because only
+    // now is it known whether anything was deferred; if a configured tool
+    // already took the name, nothing can be loaded, so everything is shown
+    // in full instead - costly, never broken.
+    if reg.tools.iter().any(|t| t.meta.defer) {
+        if reg.find(LOAD_TOOLS).is_none() {
+            let k = Builtin::LoadTools;
+            reg.tools.push(Tool {
+                name: k.name().to_string(),
+                description: k.description().to_string(),
+                parameters: k.schema(),
+                src: ToolSrc::Builtin(k),
+                meta: ToolMeta::default(),
+            });
+        } else {
+            reg.notes.push(format!(
+                "a tool named '{LOAD_TOOLS}' is configured, so deferred tools cannot be loaded \
+                 and are shown in full"
+            ));
+            for t in &mut reg.tools {
+                t.meta.defer = false;
+            }
+        }
     }
     reg
 }
@@ -1796,22 +1884,14 @@ pub fn merged_system_block(tools: &[Tool], b: &Budget, require: Option<&str>) ->
 }
 
 /// The part both modes share: the signature list, in the format the model was
-/// trained on.
+/// trained on, and after it the one-line index of any deferred tools.
 fn signatures(tools: &[Tool]) -> String {
     let mut s = String::from(
         "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
          You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
     );
-    for t in tools {
-        let sig = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-            }
-        });
-        s.push_str(&sig.to_string());
+    for t in tools.iter().filter(|t| !t.meta.defer) {
+        s.push_str(&signature(t));
         s.push('\n');
     }
     s.push_str(
@@ -1819,7 +1899,117 @@ fn signatures(tools: &[Tool]) -> String {
          arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
          {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n",
     );
+    let deferred: Vec<&Tool> = tools.iter().filter(|t| t.meta.defer).collect();
+    if !deferred.is_empty() {
+        s.push_str(&format!(
+            "More functions, listed by name only. They are called the same way, but their \
+             arguments are not shown: call {LOAD_TOOLS} with the names you need first and \
+             their signatures come back in its result. Never guess their arguments.\n",
+        ));
+        for t in deferred {
+            s.push_str(&format!("- {}: {}\n", t.name, summary(&t.description)));
+        }
+        s.push('\n');
+    }
     s
+}
+
+/// One tool as a `<tools>` line: the JSON function signature.
+fn signature(t: &Tool) -> String {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.parameters,
+        }
+    })
+    .to_string()
+}
+
+/// A deferred tool's line in the index: its description's first sentence,
+/// on one line, cut at DEFER_SUMMARY_CHARS.
+fn summary(description: &str) -> String {
+    let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    // a sentence ends at a stop followed by a space, so "v1.2" and "e.g."
+    // mid-word do not end it early
+    let first = flat
+        .char_indices()
+        .find(|&(i, c)| matches!(c, '.' | '!' | '?') && flat[i + 1..].starts_with(' '))
+        .map(|(i, _)| &flat[..=i])
+        .unwrap_or(&flat);
+    if first.chars().count() <= DEFER_SUMMARY_CHARS {
+        return first.to_string();
+    }
+    let cut: String = first.chars().take(DEFER_SUMMARY_CHARS - 3).collect();
+    format!("{}...", cut.trim_end())
+}
+
+/// The load_tools call: the full signatures of the named deferred tools, in
+/// the `<tools>` form. Whole signatures only - one that would cross
+/// LOAD_MAX_CHARS is left out and named, for a second call.
+fn load_tools(reg: &Registry, args: &serde_json::Value) -> Result<String, String> {
+    let names: Vec<String> = match args.get("names") {
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|n| n.as_str()).map(|n| n.trim().to_string()).collect()
+        }
+        // a model that writes one name as a string meant that one
+        Some(serde_json::Value::String(n)) => vec![n.trim().to_string()],
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        return Err(format!("{LOAD_TOOLS} needs `names`, a list of function names"));
+    }
+    let mut sigs = String::new();
+    let (mut shown, mut missing, mut over) = (Vec::new(), Vec::new(), Vec::new());
+    for n in &names {
+        match reg.find(n) {
+            // a tool already in <tools> has nothing more to load: say so
+            // rather than repeat it
+            Some(t) if !t.meta.defer => shown.push(n.as_str()),
+            Some(t) => {
+                let sig = signature(t);
+                if sigs.len() + sig.len() + 1 > LOAD_MAX_CHARS {
+                    over.push(n.as_str());
+                } else {
+                    sigs.push_str(&sig);
+                    sigs.push('\n');
+                }
+            }
+            None => missing.push(n.as_str()),
+        }
+    }
+    if sigs.is_empty() && over.is_empty() && shown.is_empty() {
+        let known: Vec<&str> =
+            reg.tools.iter().filter(|t| t.meta.defer).map(|t| t.name.as_str()).collect();
+        return Err(format!(
+            "no function named {} is listed. The ones that can be loaded: {}",
+            missing.join(", "),
+            known.join(", ")
+        ));
+    }
+    let mut out = String::new();
+    if !sigs.is_empty() {
+        out.push_str(&format!(
+            "<tools>\n{sigs}</tools>\nCall these exactly like the functions in <tools> above."
+        ));
+    }
+    let mut note = |s: String| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&s);
+    };
+    if !shown.is_empty() {
+        note(format!("Already in <tools> above: {}.", shown.join(", ")));
+    }
+    if !over.is_empty() {
+        note(format!("Not loaded, this result is full: {} - load them in a second call.", over.join(", ")));
+    }
+    if !missing.is_empty() {
+        note(format!("No function by these names: {}.", missing.join(", ")));
+    }
+    Ok(out)
 }
 
 /// Tool calling is a trained format, not a prompt trick: only the templates
@@ -2409,12 +2599,19 @@ pub fn call(
         }
     };
     // the tool's own figure wins over the deployment's, whichever source
-    // it came from: an http entry's field, or what an MCP server declared
-    let max_chars = meta.max_chars.unwrap_or(cfg.max_chars);
+    // it came from: an http entry's field, or what an MCP server declared.
+    // load_tools sizes its own result in whole signatures (LOAD_MAX_CHARS),
+    // plus room for the notes after them.
+    let max_chars = match src {
+        ToolSrc::Builtin(Builtin::LoadTools) => LOAD_MAX_CHARS + 2_000,
+        _ => meta.max_chars.unwrap_or(cfg.max_chars),
+    };
     let mut sources = Vec::new();
     let mut image = None;
     let mut seen = None;
     let r = match src {
+        // answered from the registry: the signatures are already here
+        ToolSrc::Builtin(Builtin::LoadTools) => load_tools(reg, args),
         ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources, on_status),
         ToolSrc::Http(i) => call_http(
             &cfg.http[i], cfg, args, images, &mut sources, &mut image, &mut seen, on_status, b.user,
@@ -2525,6 +2722,8 @@ fn call_builtin(
              subagent loop, which only a chat turn can host"
                 .into(),
         ),
+        // tools::call answers it from the registry before reaching here
+        Builtin::LoadTools => Err(format!("{LOAD_TOOLS} is answered from the tool registry")),
         Builtin::Wait => {
             let (secs, reason, note) = wait_plan(args, b.wait_cap_s)?;
             // Sleep in ticks, each one a status line: the guest cannot say
@@ -4256,6 +4455,149 @@ mod tests {
         let all = merge_registries(&server, &client);
         assert_eq!(all.len(), 1);
         assert!(matches!(all[0].src, ToolSrc::Client));
+    }
+
+    /// A deferred server's schema text, measured. Big enough that the
+    /// test fails if it leaks into the prompt.
+    fn deferred_cfg(extra: serde_json::Value) -> ToolsConfig {
+        let big = |n: &str| serde_json::json!({
+            "name": n,
+            "description": format!("{n} does the {n} thing. It has a long story after that."),
+            "parameters": { "type": "object", "properties": {
+                "wallet": { "type": "string", "description": "x".repeat(2000) } },
+                "required": ["wallet"] },
+        });
+        let mut v = serde_json::json!({
+            "builtin": ["wait"],
+            "mcp": [{ "url": "https://mcp.example", "discover": false, "handshake": false,
+                      "group": "enclave", "defer": true,
+                      "tools": [big("plan_deploy"), big("build_fund")] }]
+        });
+        if let Some(o) = extra.as_object() {
+            for (k, x) in o {
+                v[k] = x.clone();
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The point of `defer`: a big server costs one line per tool in the
+    /// prompt, and its signatures arrive only when the model asks.
+    #[test]
+    fn a_deferred_server_is_one_line_per_tool_until_loaded() {
+        let cfg = deferred_cfg(serde_json::json!({}));
+        let mut reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["wait", "plan_deploy", "build_fund", LOAD_TOOLS]);
+        let block = system_block(&reg.tools, &Budget::calls(8));
+        // listed by name and first sentence, never by schema
+        assert!(block.contains("- plan_deploy: plan_deploy does the plan_deploy thing.\n"), "{block}");
+        assert!(!block.contains("xxxxxxxx"), "a deferred schema leaked into the prompt");
+        assert!(!block.contains("\"name\":\"plan_deploy\""), "{block}");
+        // the loader and the undeferred tools are in <tools> as ever
+        assert!(block.contains(&format!("\"name\":\"{LOAD_TOOLS}\"")), "{block}");
+        assert!(block.contains("\"name\":\"wait\""), "{block}");
+        assert!(block.len() < 4000, "the block is {} chars", block.len());
+
+        let call = |reg: &mut Registry, args: serde_json::Value| {
+            super::call(reg, &cfg, Builtins::default(), LOAD_TOOLS, &args, &[], || 0, &|_| {})
+        };
+        let r = call(&mut reg, serde_json::json!({"names": ["plan_deploy", "wait", "nope"]}));
+        assert!(!r.is_error, "{}", r.text);
+        // whole, in the <tools> form, not cut to the deployment's max_chars
+        assert!(r.text.starts_with("<tools>\n{"), "{}", r.text);
+        assert!(r.text.contains(&"x".repeat(2000)), "the schema arrived whole");
+        assert!(!r.text.contains("\"name\":\"build_fund\""), "only what was asked for");
+        assert!(r.text.contains("Already in <tools> above: wait."), "{}", r.text);
+        assert!(r.text.contains("No function by these names: nope."), "{}", r.text);
+        // one name as a bare string is the model meaning that one
+        let r = call(&mut reg, serde_json::json!({"names": "build_fund"}));
+        assert!(r.text.contains("\"name\":\"build_fund\""), "{}", r.text);
+        // nothing loadable: an error that says what can be loaded
+        let r = call(&mut reg, serde_json::json!({"names": ["nope"]}));
+        assert!(r.is_error);
+        assert!(r.text.contains("plan_deploy, build_fund"), "{}", r.text);
+        let r = call(&mut reg, serde_json::json!({}));
+        assert!(r.is_error && r.text.contains("needs `names`"), "{}", r.text);
+        // and a deferred tool was callable all along: loading is not a gate
+        assert!(matches!(reg.find("plan_deploy").unwrap().src, ToolSrc::Mcp { .. }));
+    }
+
+    /// A result stops at the last WHOLE signature that fits; the rest are
+    /// named for a second call rather than cut mid-schema.
+    #[test]
+    fn a_full_load_names_what_it_left_out() {
+        let many: Vec<serde_json::Value> = (0..20).map(|i| serde_json::json!({
+            "name": format!("t{i}"), "description": "d",
+            "parameters": { "type": "object", "properties": {
+                "a": { "type": "string", "description": "y".repeat(3000) } } },
+        })).collect();
+        let cfg = deferred_cfg(serde_json::json!({
+            "mcp": [{ "url": "https://mcp.example", "discover": false, "defer": true, "tools": many }]
+        }));
+        let mut reg = build(&cfg, Builtins::default(), &|_| {});
+        let names: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        let r = super::call(&mut reg, &cfg, Builtins::default(), LOAD_TOOLS,
+                            &serde_json::json!({ "names": names }), &[], || 0, &|_| {});
+        assert!(!r.is_error, "{}", r.text);
+        assert!(r.text.contains("\"name\":\"t0\""), "{}", r.text);
+        assert!(r.text.contains("Not loaded, this result is full: "), "{}", r.text);
+        assert!(r.text.contains("t19"), "the last is named for a second call");
+        // every loaded signature is valid JSON on its own line
+        let body = r.text.split("</tools>").next().unwrap().trim_start_matches("<tools>\n");
+        for line in body.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("a whole signature");
+        }
+    }
+
+    /// One tool can defer itself through its declaration (or a server's
+    /// `_meta`) without the whole server deferring; with nothing deferred
+    /// there is no loader to read past.
+    #[test]
+    fn defer_is_per_tool_and_the_loader_only_exists_when_needed() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://mcp.example", "discover": false, "tools": [
+                { "name": "small", "description": "s" },
+                { "name": "huge", "description": "h", "defer": true },
+            ] }]
+        }))
+        .unwrap();
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(!reg.find("small").unwrap().meta.defer);
+        assert!(reg.find("huge").unwrap().meta.defer);
+        assert!(reg.find(LOAD_TOOLS).is_some());
+        let plain: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://mcp.example", "discover": false,
+                      "tools": [{ "name": "small", "description": "s" }] }]
+        }))
+        .unwrap();
+        let reg = build(&plain, Builtins::default(), &|_| {});
+        assert!(reg.find(LOAD_TOOLS).is_none());
+        assert!(!system_block(&reg.tools, &Budget::calls(3)).contains("More functions"));
+    }
+
+    /// A configured tool that already owns the name leaves nothing to load
+    /// with, so the deferred tools are shown in full: costly, never broken.
+    #[test]
+    fn a_taken_loader_name_shows_everything_in_full() {
+        let cfg = deferred_cfg(serde_json::json!({
+            "http": [{ "name": LOAD_TOOLS, "description": "mine", "url": "https://x.example/" }]
+        }));
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.tools.iter().all(|t| !t.meta.defer));
+        assert!(reg.notes.iter().any(|n| n.contains("shown in full")), "{:?}", reg.notes);
+        assert!(system_block(&reg.tools, &Budget::calls(3)).contains("\"name\":\"plan_deploy\""));
+    }
+
+    #[test]
+    fn a_summary_is_the_first_sentence_on_one_line() {
+        assert_eq!(summary("Lists apps.\nThen more."), "Lists apps.");
+        // a stop with no space after it is not a sentence end
+        assert_eq!(summary("Uses ledger v1.2 today. More."), "Uses ledger v1.2 today.");
+        assert_eq!(summary("no stop at all"), "no stop at all");
+        let long = summary(&"word ".repeat(40));
+        assert!(long.ends_with("...") && long.chars().count() <= DEFER_SUMMARY_CHARS, "{long}");
     }
 
     /// The detector's whole job is to be narrow: an unfilled slot is caught,
