@@ -2650,7 +2650,27 @@ pub fn call(
         // wiring bug, and the failure must say which side executes
         ToolSrc::Client => Err("client-declared tools are executed by the client, not here".into()),
     };
-    finish_call(r, max_chars, sources, image, seen, t0, now_ms)
+    let out = finish_call(r, max_chars, sources, image, seen, t0, now_ms);
+    match reg.find(name) {
+        Some(t) if meta.defer => with_signature(out, t),
+        _ => out,
+    }
+}
+
+/// A deferred tool's refusal carries its signature. Models call a listed
+/// name straight away rather than load it first (seen with qwen3.5-9b: a
+/// guessed `slug` where the server wants `app`), and the server's complaint
+/// names one argument at best; with the signature in hand the next call is
+/// right, one step instead of a load and a retry.
+fn with_signature(mut r: ToolResult, t: &Tool) -> ToolResult {
+    if r.is_error {
+        r.text.push_str(&format!(
+            "\n\nThe signature of {}, to call it correctly:\n<tools>\n{}\n</tools>",
+            t.name,
+            signature(t)
+        ));
+    }
+    r
 }
 
 /// Run ONE http entry outside a registry: the routed pre-pass path, which
@@ -4588,6 +4608,27 @@ mod tests {
         assert!(reg.tools.iter().all(|t| !t.meta.defer));
         assert!(reg.notes.iter().any(|n| n.contains("shown in full")), "{:?}", reg.notes);
         assert!(system_block(&reg.tools, &Budget::calls(3)).contains("\"name\":\"plan_deploy\""));
+    }
+
+    /// A deferred tool called unloaded and refused gets its signature in
+    /// the refusal; a success is left alone.
+    #[test]
+    fn a_refused_deferred_call_carries_its_signature() {
+        let cfg = deferred_cfg(serde_json::json!({}));
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        let t = reg.find("plan_deploy").unwrap();
+        let res = |is_error: bool| ToolResult {
+            text: "missing required argument: app".into(),
+            is_error,
+            ms: 0,
+            sources: Vec::new(),
+            image: None,
+            seen: None,
+        };
+        let r = with_signature(res(true), t);
+        assert!(r.text.starts_with("missing required argument: app\n\nThe signature of plan_deploy"));
+        assert!(r.text.contains("\"required\":[\"wallet\"]"), "{}", r.text);
+        assert_eq!(with_signature(res(false), t).text, "missing required argument: app");
     }
 
     #[test]
