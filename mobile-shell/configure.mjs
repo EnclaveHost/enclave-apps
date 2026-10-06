@@ -41,6 +41,10 @@ const capacitor = {
     // list holds only origins the platform serves.
     allowNavigation: allowNav,
   },
+  // Lets the wrapped page know it runs in the shell: Sign in with Enclave
+  // then returns through the /sso-app app link instead of a popup (the page
+  // cannot see the native bridge on its remote origin, but it sees this).
+  appendUserAgent: "EnclaveShell/1",
 };
 writeFileSync(new URL("./capacitor.config.json", import.meta.url), JSON.stringify(capacitor, null, 2) + "\n");
 
@@ -80,7 +84,9 @@ const stamp = (rel, fn) => {
 const xml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 stamp("./android/app/build.gradle", (s) =>
-  s.replace(/applicationId "[^"]+"/, `applicationId "${app.appId}"`));
+  s.replace(/applicationId "[^"]+"/, `applicationId "${app.appId}"`)
+   // the verified app link the sign-in returns through: https://<app host>/sso-app
+   .replace(/appLinkHost: "[^"]*"/, `appLinkHost: "${new URL(app.url).host}"`));
 
 stamp("./android/app/src/main/res/values/strings.xml", () =>
   `<?xml version='1.0' encoding='utf-8'?>\n<resources>\n` +

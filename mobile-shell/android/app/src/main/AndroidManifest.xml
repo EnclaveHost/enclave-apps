@@ -33,6 +33,19 @@
                 <data android:scheme="@string/custom_url_scheme" />
             </intent-filter>
 
+            <!-- Sign in with Enclave comes back here: enclave.host returns the
+                 token to https://<app host>/sso-app#sso=…&state=…, a path
+                 this app claims as a VERIFIED app link (the deployment serves
+                 /.well-known/assetlinks.json naming this signing key), so the
+                 browser hands it to the app and no other app can take it.
+                 MainActivity loads the fragment into the open page. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${appLinkHost}" android:pathPrefix="/sso-app" />
+            </intent-filter>
+
         </activity>
 
         <provider

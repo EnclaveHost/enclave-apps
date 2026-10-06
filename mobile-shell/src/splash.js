@@ -101,8 +101,21 @@ function show(state) {
 function stage(text) {
   $("status").textContent = text;
 }
+// A sign-in coming back through the /sso-app app link on a COLD start (the app
+// was not running, or Android had killed it while the browser tab was open):
+// the launch URL carries the token fragment, and the page needs it after the
+// verify gate, on the same origin only. A running app gets it in MainActivity.
+let signinFrag = "";
+async function readSignin(target) {
+  if (!Capacitor.isNativePlatform() || !target) return;
+  try {
+    const u = new URL((await App.getLaunchUrl())?.url || "");
+    if (u.protocol === "https:" && u.origin === target.url && /^\/sso-app(\/|$)/.test(u.pathname) && /^#(.*&)?sso=/.test(u.hash))
+      signinFrag = u.hash;
+  } catch (_) {}
+}
 function enter(target) {
-  window.location.replace(target.url + "/");
+  window.location.replace(target.url + "/" + signinFrag);
 }
 function showFail(result) {
   show("failed");
@@ -133,6 +146,7 @@ let current = null;
 
 async function run(target) {
   current = target;
+  await readSignin(target);
   show("verifying");
   $("app-name").textContent = target.name || cfg.displayName;
 
