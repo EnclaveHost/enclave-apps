@@ -2279,6 +2279,14 @@ function pref(key, val) {
 // platform for its maximum ttl (7 days); an unremembered one keeps the
 // default (24 h), which outlives any tab that will ever hold it.
 const SSO_KEY = "llmchat-sso", SSO_STATE_KEY = "llmchat-sso-state";
+// Inside Enclave's mobile shell (its webview appends "EnclaveShell/<n>" to the
+// user agent), sign-in cannot use a popup: the shell sends enclave.host to a
+// browser tab, and the browser has to hand the token back to the APP, not land
+// on this page in the browser. So the flow returns to /sso-app, a path the
+// shell claims as a verified Android app link (assetlinks.json, below the
+// deployment's well_known config): the browser gives the URL to the app, and
+// the shell loads it here, where the usual state check accepts it.
+const IN_SHELL = /\bEnclaveShell\//.test(navigator.userAgent);
 // claims are segment 1 of EST1.<claims>.<sig>; parsed for display and the
 // boot-time expiry triage only - the server re-verifies every request
 function ssoClaims(t) {
@@ -2312,12 +2320,16 @@ function ssoAccept(frag) {
   const st = /[#&]state=([^&]+)/.exec(frag || "");
   let expect = null;
   try { expect = sessionStorage.getItem(SSO_STATE_KEY); } catch (_) {}
+  // the shell may have been killed while the browser tab was open: it then
+  // comes back as a fresh page, so its flow also left the state in localStorage
+  if (!expect && IN_SHELL) try { expect = localStorage.getItem(SSO_STATE_KEY); } catch (_) {}
   if (!(expect && st && decodeURIComponent(st[1]) === expect)) return false;
   ssoToken = decodeURIComponent(m[1]);
   try {
     sessionStorage.setItem(SSO_KEY, ssoToken);
     sessionStorage.removeItem(SSO_STATE_KEY);
   } catch (_) {}
+  try { localStorage.removeItem(SSO_STATE_KEY); } catch (_) {}
   // UNCONDITIONAL, unlike every other stored value: signing in is a thing the
   // visitor just did on purpose, and making it survive the tab is the whole
   // point of having done it. Gating this on the history switch meant a signed-
@@ -2334,23 +2346,34 @@ function ssoAccept(frag) {
   // accepted or refused, the fragment leaves the address bar
   history.replaceState(null, "", location.pathname + location.search);
 })();
+// what a sign-in that just landed changes on the page
+function ssoLanded() {
+  renderSsoUI();
+  closeSso();
+  // Anonymous boot preparation cannot include the signed-in user's tools.
+  // Prepare that exact prefix as soon as the identity becomes available.
+  if (state.model) void warm();
+  // a sign-in that started from the API dialog's "Sign in to reveal"
+  // finishes what it was for: the dialog is still open, so the click's
+  // intent is unambiguous
+  if (apiOverlay.classList.contains("open") && !apiKey) revealApiKey();
+}
 // the popup flow's return leg: /sso-return is THIS origin, nothing else is
 // listened to, and the ferried fragment still faces the state check above
 addEventListener("message", (e) => {
   if (e.origin !== location.origin) return;
   const d = e.data;
   if (!d || typeof d.enclave_sso !== "string") return;
-  if (ssoAccept(d.enclave_sso)) {
-    renderSsoUI();
-    closeSso();
-    // Anonymous boot preparation cannot include the signed-in user's tools.
-    // Prepare that exact prefix as soon as the identity becomes available.
-    if (state.model) void warm();
-    // a sign-in that started from the API dialog's "Sign in to reveal"
-    // finishes what it was for: the dialog is still open, so the click's
-    // intent is unambiguous
-    if (apiOverlay.classList.contains("open") && !apiKey) revealApiKey();
-  }
+  if (ssoAccept(d.enclave_sso)) ssoLanded();
+});
+// the mobile shell's return leg: it hands the app link's fragment to the page
+// that is already open, which only changes the hash - same acceptance
+addEventListener("hashchange", () => {
+  const h = location.hash || "";
+  if (!/[#&]sso=/.test(h)) return;
+  const ok = ssoAccept(h);
+  history.replaceState(null, "", location.pathname + location.search);
+  if (ok) ssoLanded();
 });
 // Both spellings, same value: the fleet's inbound TLS proxy has been seen
 // eating Authorization (Bearer 401 while X-Api-Key 200, e64f7cba,
@@ -2375,6 +2398,7 @@ function ssoStart() {
   crypto.getRandomValues(b);
   b.forEach((x) => { s += x.toString(16).padStart(2, "0"); });
   try { sessionStorage.setItem(SSO_STATE_KEY, s); } catch (_) {}
+  if (IN_SHELL) try { localStorage.setItem(SSO_STATE_KEY, s); } catch (_) {}
   const authorize = (back, popup) => state.auth.authorize_url
     + "?aud=" + encodeURIComponent(state.auth.aud || "")
     + "&redirect_uri=" + encodeURIComponent(back)
@@ -2391,6 +2415,11 @@ function ssoStart() {
   // signed-in visitor sees the window flash and close. Blocked popup =
   // the full-page flow, returning to this very page so the boot parser
   // picks the fragment up on the way back in.
+  if (IN_SHELL) {
+    // a full-page navigation the shell opens in a browser tab (see IN_SHELL)
+    location.href = authorize(new URL("sso-app", document.baseURI).href, false);
+    return;
+  }
   let w = null;
   try {
     w = window.open(authorize(new URL("sso-return", document.baseURI).href, true),

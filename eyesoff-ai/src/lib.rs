@@ -263,6 +263,10 @@ use sampling::{pick_row, Rng, Row, SampleParams};
 static CHAT_HTML: &str = include_str!("chat.html");
 static LEGAL_HTML: &str = include_str!("legal.html");
 static SSO_RETURN_HTML: &str = include_str!("sso-return.html");
+/// The mobile shell's sign-in return (/sso-app, /sso-app/return): a path the
+/// shell claims as a verified Android app link, shown in the browser only when
+/// the hand-off to the app needs a tap (src/sso-app.html).
+static SSO_APP_HTML: &str = include_str!("sso-app.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
 /// The brand mark, for the consumers that ask the SERVER for an icon rather
 /// than reading the page's <link>: browsers hitting a non-HTML route, crawlers,
@@ -11587,6 +11591,9 @@ impl Guest for Component {
             // again, so it may hand the return fragment over and close (see
             // src/sso-return.html). Open like the page that carries the
             // sign-in button, for the same reason.
+            (Method::Get, "/sso-app") | (Method::Get, "/sso-app/return") => {
+                respond_bytes(out, 200, "text/html; charset=utf-8", SSO_APP_HTML.as_bytes())
+            }
             (Method::Get, "/sso-return") => {
                 respond_bytes(out, 200, "text/html; charset=utf-8", SSO_RETURN_HTML.as_bytes())
             }
@@ -11606,7 +11613,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /v1/keys, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /sso-app, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /v1/keys, POST /chat, POST /title",
             ),
         }
     }
