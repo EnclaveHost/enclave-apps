@@ -2133,8 +2133,9 @@ addEventListener("fullscreenchange", () => {
 const state = {
   chats: [],        // {id, title, messages:[{role,content,meta?,sources?,image?}], streaming:null|{reply,status,sources?,image?}, error:null|{text,message,partial}}
   currentId: null,
-  busyChatId: null, // one generation at a time, tab-wide
-  abort: null,
+  // A chat is busy while chat.streaming is set; each holds its own
+  // AbortController (chat.abort), so several chats can be answering at once
+  // and stopping one never touches another.
   models: [],
   model: "",
   unfit: {},        // model name -> error, from the warmup ladder: attached but does not fit this deployment's share
@@ -2563,7 +2564,7 @@ function renderSidebar() {
   for (const c of state.chats) {
     const item = node('<div class="chat-item" role="button" tabindex="0"></div>');
     if (c.id === state.currentId) item.classList.add("active");
-    if (c.id === state.busyChatId) item.appendChild(node('<span class="live"></span>'));
+    if (busy(c)) item.appendChild(node('<span class="live"></span>'));
     const t = node('<span class="ct"></span>');
     t.textContent = c.title || "New chat";
     item.appendChild(t);
@@ -2624,13 +2625,33 @@ function setUrlChat(id, push) {
 // their request - the landing chat at boot, or the one that replaces a deleted
 // last chat. Pushing there would leave a Back entry pointing at a URL that
 // resolves to nothing (a stale or just-deleted id).
+const busy = (chat) => !!(chat && chat.streaming);
+
+// The composer belongs to the chat on screen: what you were typing (and
+// attaching) stays with that chat when you switch, and comes back when you
+// return. Kept in memory only, like the composer always was.
+function stashDraft() {
+  const cur = current();
+  if (!cur) return;
+  cur.draft = input.value;
+  cur.draftAtt = state.attachments;
+}
+function loadDraft() {
+  const cur = current();
+  input.value = (cur && cur.draft) || "";
+  state.attachments = (cur && cur.draftAtt) || [];
+  autosize(); updateAttachUI();
+}
+
 function newChat(replaceUrl) {
   // reuse the current chat if it is still pristine, instead of piling up blanks
   const cur = current();
   if (cur && !cur.messages.length && !cur.streaming && !cur.error) { input.focus(); return cur; }
   const chat = { id: chatId(), title: "", messages: [], streaming: null, error: null };
+  stashDraft();
   state.chats.unshift(chat);
   state.currentId = chat.id;
+  loadDraft();
   setUrlChat(chat.id, !replaceUrl);
   renderSidebar(); renderChat(); updateComposer();
   input.focus();
@@ -2639,7 +2660,9 @@ function newChat(replaceUrl) {
 
 function switchChat(id, fromHistory) {
   if (id === state.currentId) return;
+  stashDraft();
   state.currentId = id;
+  loadDraft();
   // a switch that CAME from Back/Forward must not push another entry, or the
   // history grows a duplicate for every step backwards
   if (!fromHistory) setUrlChat(id, true);
@@ -2648,11 +2671,13 @@ function switchChat(id, fromHistory) {
 }
 
 function deleteChat(id) {
-  if (id === state.busyChatId) stopGeneration();
+  const gone = state.chats.find((c) => c.id === id);
+  if (busy(gone)) stopGeneration(gone);
   unpersist(id);
   state.chats = state.chats.filter((c) => c.id !== id);
   if (state.currentId === id) {
     state.currentId = state.chats.length ? state.chats[0].id : null;
+    loadDraft();
     if (!state.currentId) { newChat(true); return; }
     setUrlChat(state.currentId, false);
     pinned = true;
@@ -3180,7 +3205,7 @@ function renderMessage(m, idx, isTail) {
     const acts = row.querySelector(".actions");
     acts.appendChild(
       node('<button class="act" data-copy-msg="' + idx + '" aria-label="Copy" title="Copy">' + ICONS.copy + "</button>"));
-    if (!state.busyChatId)
+    if (!busy(current()))
       acts.appendChild(
         node('<button class="act" data-edit-msg="' + idx + '" aria-label="Edit message" title="Edit message">' + ICONS.edit + "</button>"));
     return row;
@@ -3206,7 +3231,7 @@ function renderMessage(m, idx, isTail) {
   if (src) md.appendChild(src);
   const acts = row.querySelector(".actions");
   acts.appendChild(node('<button class="act" data-copy-msg="' + idx + '" aria-label="Copy" title="Copy">' + ICONS.copy + "</button>"));
-  if (isTail && !state.busyChatId)
+  if (isTail && !busy(current()))
     acts.appendChild(node('<button class="act" data-regen aria-label="Regenerate" title="Regenerate">' + ICONS.regen + "</button>"));
   const meta = metaLine(m.meta);
   if (meta) acts.appendChild(meta);
@@ -3760,7 +3785,7 @@ window.addEventListener("pagehide", stopCam);
 // ...nor a turn it was streaming. The enclave ends a turn at its next
 // boundary once the stream closes; an explicit abort closes it now, rather
 // than whenever the browser gets round to tearing the connection down.
-window.addEventListener("pagehide", stopGeneration);
+window.addEventListener("pagehide", () => { for (const c of state.chats) stopGeneration(c); });
 
 // Paste is how a screenshot actually arrives. Only intercept when the
 // clipboard carries an image; pasted text must still paste as text.
@@ -3813,16 +3838,13 @@ function autosize() {
 }
 
 function updateComposer() {
-  const busyHere = state.busyChatId && state.busyChatId === state.currentId;
+  const busyHere = busy(current());
   iconSend.style.display = busyHere ? "none" : "";
   iconStop.style.display = busyHere ? "" : "none";
   if (busyHere) {
     sendBtn.disabled = false;
     sendBtn.title = "Stop generating";
     sendBtn.setAttribute("aria-label", "Stop generating");
-  } else if (state.busyChatId) {
-    sendBtn.disabled = true;
-    sendBtn.title = "A response is still streaming in another chat";
   } else {
     // an attached picture is a message on its own: the server asks the model
     // to describe it when no words came with it
@@ -3836,7 +3858,7 @@ input.addEventListener("input", () => { autosize(); updateComposer(); });
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    if (!state.busyChatId) form.requestSubmit();
+    if (!busy(current())) form.requestSubmit();
   }
 });
 window.addEventListener("keydown", (e) => {
@@ -3848,13 +3870,13 @@ window.addEventListener("keydown", (e) => {
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (padOverlay.classList.contains("open")) { closePad(); return; }
     if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
-    if (state.busyChatId) stopGeneration();
+    if (busy(current())) stopGeneration(current());
     closeModelMenu();
   }
 });
 form.addEventListener("submit", (e) => {
   e.preventDefault();
-  if (state.busyChatId === state.currentId && state.busyChatId) { stopGeneration(); return; }
+  if (busy(current())) { stopGeneration(current()); return; }
   sendCurrent();
 });
 // The textarea is one line tall inside a much taller pill - clicking the
@@ -3876,7 +3898,7 @@ function sendCurrent() {
   const text = input.value.trim();
   const images = state.attachments.filter((a) => a.kind !== "video").map((a) => a.url);
   const videos = state.attachments.filter((a) => a.kind === "video").map((a) => a.url);
-  if ((!text && !images.length && !videos.length) || state.busyChatId) return;
+  if ((!text && !images.length && !videos.length) || busy(current())) return;
   if (images.length && !visionModel()) {
     pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot read images", 6000);
     return;
@@ -3910,7 +3932,7 @@ function sendCurrent() {
 
 function retry() {
   const chat = current();
-  if (!chat || !chat.error || state.busyChatId) return;
+  if (!chat || !chat.error || busy(chat)) return;
   const text = chat.error.text;
   const images = chat.error.images || [];
   chat.error = null;
@@ -3923,7 +3945,7 @@ function retry() {
 
 function regenerate() {
   const chat = current();
-  if (!chat || state.busyChatId || !chat.messages.length) return;
+  if (!chat || busy(chat) || !chat.messages.length) return;
   if (chat.messages[chat.messages.length - 1].role !== "assistant") return;
   chat.messages.pop();
   pinned = true;
@@ -3936,7 +3958,7 @@ function regenerate() {
 // and any error state are dropped, and generation re-runs with the new text.
 function startEdit(idx) {
   const chat = current();
-  if (!chat || state.busyChatId) return;
+  if (!chat || busy(chat)) return;
   const m = chat.messages[idx];
   if (!m || m.role !== "user") return;
   if (log.querySelector(".row.editing")) renderChat(); // one edit at a time
@@ -3966,7 +3988,7 @@ function startEdit(idx) {
 function commitEdit(idx, text) {
   const chat = current();
   text = text.trim();
-  if (!chat || !text || state.busyChatId) { renderChat(); return; }
+  if (!chat || !text || busy(chat)) { renderChat(); return; }
   chat.error = null;
   // an edit rewords the QUESTION; whatever was attached to it still is
   const images = (chat.messages[idx] && chat.messages[idx].images) || [];
@@ -3982,11 +4004,11 @@ function commitEdit(idx, text) {
   run(chat);
 }
 
-function stopGeneration() {
-  if (!state.abort) return;
+function stopGeneration(chat) {
+  if (!chat || !chat.abort) return;
   const e = new Error("stopped");
   e.userStop = true;
-  state.abort.abort(e);
+  chat.abort.abort(e);
 }
 
 // The messages for one request. Text turns are what they always were; a turn
@@ -4058,10 +4080,9 @@ function buildPayload(chat) {
 
 // ------------------------------------------------------------- generation --
 async function run(chat) {
-  state.busyChatId = chat.id;
   chat.streaming = { reply: "", status: "Preparing…" };
   const ctl = new AbortController();
-  state.abort = ctl;
+  chat.abort = ctl;
   renderSidebar(); renderChat(); updateComposer();
 
   const askedMsg = chat.messages[chat.messages.length - 1];
@@ -4299,6 +4320,10 @@ async function run(chat) {
             updateAttachUI();
           }
           autosize();
+        } else {
+          // answered from another chat's screen: it waits in its own draft
+          chat.draft = asked;
+          if (askedImages.length && !(chat.draftAtt || []).length) chat.draftAtt = askedImages.map((u) => ({ url: u }));
         }
       }
     } else {
@@ -4313,8 +4338,7 @@ async function run(chat) {
   }
   clearTimeout(stallTimer);
   chat.streaming = null;
-  state.busyChatId = null;
-  state.abort = null;
+  chat.abort = null;
   persist(chat);
   renderSidebar(); updateComposer();
   if (chat.id === state.currentId) { renderChat(); input.focus(); }
