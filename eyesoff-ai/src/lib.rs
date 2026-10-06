@@ -9126,6 +9126,26 @@ fn warmup_frame(progress: bool, status: &str, result: Option<&serde_json::Value>
 }
 
 #[cfg(test)]
+mod warm_caller_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_warmup_lists_as_signed_in_only_where_sign_in_is_required() {
+        let required = serde_json::json!({ "sso": { "signer": "0x3394b4d24250F1657cB547975e77117454b3Cc6D",
+            "audience": "0x9eb4e60063aa079cebed355f96b2d049457ae77bdbcd49086040282e1e4b871c", "required": true } });
+        let optional = serde_json::json!({ "sso": { "signer": "0x3394b4d24250F1657cB547975e77117454b3Cc6D",
+            "audience": "0x9eb4e60063aa079cebed355f96b2d049457ae77bdbcd49086040282e1e4b871c", "required": false } });
+        assert_eq!(warm_caller(&required, None).as_deref(), Some(WARM_LISTING_CALLER));
+        assert_eq!(warm_caller(&optional, None), None, "an open deployment's boot warm-up stays anonymous");
+        assert_eq!(warm_caller(&serde_json::json!({}), None), None, "no sso at all: anonymous");
+        assert_eq!(warm_caller(&required, Some("acct_real".into())).as_deref(), Some("acct_real"),
+            "a verified caller is never replaced");
+        // the stand-in passes the adapters' identity check (api-mcp-adapter / enclave-cron canonical_sub)
+        assert!(WARM_LISTING_CALLER.len() == 42 && WARM_LISTING_CALLER[2..].chars().all(|c| c == '0'));
+    }
+}
+
+#[cfg(test)]
 mod warmup_stream_tests {
     use super::*;
 
@@ -10876,10 +10896,29 @@ fn handle_d2h(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     }
 }
 
+/// Whom an UNSIGNED warm-up (the guest's boot probe) renders the prompt as, on
+/// a deployment that requires sign-in: no chat there is anonymous, and every
+/// signed-in chat renders the same prompt - per-user MCP servers list their
+/// per-user tools for ANY named caller, with definitions that do not depend
+/// on who (api-mcp-adapter, enclave-cron) - so the boot parks exactly the
+/// prefix the first real chat uses, instead of an anonymous one nobody can
+/// reach (which left every signed-in page re-reading ~6k tokens after a boot).
+/// The zero address is no one's account and only ever reaches a tools/list:
+/// a warm-up generates nothing and calls no tool.
+const WARM_LISTING_CALLER: &str = "0x0000000000000000000000000000000000000000";
+
+fn warm_caller(raw: &serde_json::Value, verified: Option<String>) -> Option<String> {
+    verified.or_else(|| {
+        sso::SsoConfig::from_raw(raw).filter(|s| s.required).map(|_| WARM_LISTING_CALLER.to_string())
+    })
+}
+
 fn handle_warmup(raw: &serde_json::Value, query: &str, req: &IncomingRequest, out: ResponseOutparam) {
-    // Boot probes remain anonymous. A signed-in browser warms the same tool
-    // set its chat will see, including identity-dependent MCP capabilities.
-    let caller = config::from_value(raw.clone()).ok().and_then(|cfg| caller_identity(&cfg, req));
+    // A signed-in browser warms the same tool set its chat will see,
+    // including identity-dependent MCP capabilities; an unsigned boot probe on
+    // a sign-in-required deployment warms that same signed-in set (warm_caller).
+    let verified = config::from_value(raw.clone()).ok().and_then(|cfg| caller_identity(&cfg, req));
+    let caller = warm_caller(raw, verified);
     // GPU by default - but on a deployment the platform gave NO GPU share,
     // "gpu" is a guaranteed failure for the onnx path, and reporting every
     // model broken hides the real story (the fleet had no GPU enclave free).
