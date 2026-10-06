@@ -4032,7 +4032,14 @@ function buildPayload(chat) {
       const vnote = "[video from an earlier turn, no longer in context]";
       text = text ? vnote + "\n" + text : vnote;
     }
-    if (!imgs.length && !vids.length) return { role: m.role, content: text };
+    if (!imgs.length && !vids.length) {
+      // the answer's exact token ids, when the server handed them back
+      // (meta.tok): it replays the turn as them, think block and all, so the
+      // next prompt continues the engine's cache of this answer instead of
+      // re-reading it. The text still goes along for any server that cannot.
+      const tok = m.role === "assistant" && m.meta && typeof m.meta.tok === "string" ? m.meta.tok : null;
+      return tok ? { role: m.role, content: text, tok } : { role: m.role, content: text };
+    }
     if (imgs.length && !keep.has(i) && !vids.length) {
       const note = imgs.length === 1 ? "[image from an earlier turn, no longer in context]"
                                      : "[" + imgs.length + " images from an earlier turn, no longer in context]";

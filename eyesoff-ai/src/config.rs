@@ -539,6 +539,14 @@ fn merge(mut base: serde_json::Value, over: serde_json::Value) -> serde_json::Va
 /// so a crafted message cannot forge an image slot it did not attach.
 pub const MEDIA_MARK: &str = "\u{E000}\u{E001}";
 
+/// A replayed assistant turn whose exact token ids the client kept (engine
+/// mm37 end parks): the template writes this mark as the WHOLE turn body -
+/// no seed, no text - and build_prompt splices the ids there: the opener the
+/// turn was generated behind (its think block's first tokens) and every token
+/// it generated, exactly as the engine parked them. Private-use like
+/// MEDIA_MARK, and stripped from incoming text the same way.
+pub const TOK_MARK: &str = "\u{E002}\u{E003}";
+
 /// A rendered prompt plus the strings that should terminate generation for
 /// this template (in addition to the tokenizer-level EOS ids).
 pub struct Rendered {
@@ -597,7 +605,13 @@ pub fn render_template(
                 //    the tail-only prefill. (Live 2026-09-02: with the block
                 //    stripped, every thinking-on turn 2 re-read ~2,900 tokens
                 //    on metal0 while the cache stood ready.)
+                //  - a turn replayed AS ITS IDS (TOK_MARK, engine mm37): the
+                //    ids already begin with the opener it was generated behind
+                //    and carry its reasoning, so it gets no seed - the engine
+                //    parked that whole turn, think block and all, and the next
+                //    prompt branches off its end instead of re-reading it.
                 let seed = match (role.as_str(), think) {
+                    _ if content == TOK_MARK => "",
                     ("assistant", ThinkTurn::Closed) => "<think>\n\n</think>\n\n",
                     ("assistant", ThinkTurn::Open) => "<think>\n</think>\n\n",
                     _ => "",

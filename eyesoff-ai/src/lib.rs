@@ -2284,6 +2284,9 @@ impl Session {
             prefix_wait: data.len() >= 60 && v(14) > 0,
             warming: if data.len() >= 64 { v(15).max(0) } else { 0 },
             parks: if data.len() >= 68 { v(16).max(0) } else { 0 },
+            // the engine's array (ggml.rs "caps"): 16 protocol, 17 claims,
+            // 18 parks, 19 end parks
+            park_end: data.len() >= 80 && v(19) != 0,
         })
     }
 
@@ -2555,6 +2558,21 @@ impl Session {
     /// until this branch decodes. The speculative primitive that replaces
     /// rewind: verify draft tokens on a branch, adopt the branch on full
     /// accept, re-feed only the accepted tokens on partial accept.
+    /// ggml only (mm37): ask the engine to park this sequence whole when the
+    /// session ends - prompt plus answer - so the conversation's next turn,
+    /// which replays the answer as its ids, branches off its end. Best
+    /// effort: an engine without it (caps[17] = 0) is simply not asked.
+    fn request_end_park(&mut self) {
+        if !self.caps().map(|c| c.park_end).unwrap_or(false) {
+            return;
+        }
+        let Session::Ggml { ctx } = self else { return };
+        let _ = ctx.compute(vec![
+            ("park_end".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+            timing_input(),
+        ]);
+    }
+
     fn copy_from(&mut self, src_seq: i32, src_fed: usize) -> Result<(), String> {
         let Session::Ggml { ctx } = self else {
             return Err("copy_from needs the ggml backend".into());
@@ -2798,6 +2816,9 @@ struct Caps {
     /// warm_one's probe feed exists to obtain
     warming: i32,
     parks: i32,
+    /// mm37: the engine parks a finished sequence whole when asked
+    /// ({"park_end": [1]}), so the next turn branches off the answer's end
+    park_end: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -2909,12 +2930,17 @@ struct GenParams {
     /// identical consecutive token blocks that end a degenerate reply
     /// (0 = off). Unlike think_budget this applies to the whole reply.
     loop_reps: usize,
+    /// mm37: this generation is a chat turn whose answer the client keeps as
+    /// ids - ask the engine to park the finished sequence (request_end_park)
+    park_end: bool,
 }
 
 struct GenStats {
     target: String,
     prompt_tokens: usize,
     tokens: usize,
+    /// mm37: the generated token ids themselves (`tokens` of them)
+    ids: Vec<u32>,
     load_ms: u128,
     prefill_ms: u128,
     decode_ms: u128,
@@ -3429,6 +3455,9 @@ fn generate_attempt(
         }
     };
     let load_ms = now_ms() - t0;
+    if p.park_end {
+        sess.request_end_park();
+    }
 
     // speculative path: the rig opening non-retrying - busy slots, an unfit
     // share, a headless volume, or a host predating the speculative verbs
@@ -3632,7 +3661,7 @@ fn generate_attempt(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: prompt.images, image_pos,
                 });
@@ -3672,7 +3701,7 @@ fn generate_attempt(
     gperf_note(&mut sess, gperf0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: prompt.images, image_pos,
     })
@@ -3755,7 +3784,7 @@ fn generate_spec(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
@@ -3849,7 +3878,7 @@ fn generate_spec(
                     let decode_ms = now_ms() - t2;
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
@@ -3887,7 +3916,7 @@ fn generate_spec(
     let decode_ms = now_ms() - t2;
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
@@ -3968,7 +3997,7 @@ fn generate_mtp(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
@@ -4090,6 +4119,16 @@ fn generate_mtp(
             }
         }
         *drafted += drafts.len();
+        // mm37: every exit from the verify below ends the generation
+        // mid-round. In rewind mode the real sequence still holds this
+        // round's unchecked drafts: drop them exactly as a partial accept
+        // does (within the snapshot depth), so the engine's end park is the
+        // answer's own prefix and the next turn can branch off it.
+        let settle = |sess: &mut Session, acc: usize| {
+            if depth > 0 {
+                let _ = sess.rewind_to(t_fed0 + acc + 1);
+            }
+        };
         // -- verify: accept while the target's own sample agrees
         let mut acc = 0usize;
         let mut replacement: Option<u32> = None;
@@ -4102,25 +4141,28 @@ fn generate_mtp(
             }
             if cfg.eos.contains(&d) {
                 *accepted += acc;
+                settle(&mut sess, acc);
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
                 *accepted += acc;
+                settle(&mut sess, acc);
                 break 'outer;
             }
             match out.push(d) {
                 Pushed::More => {}
                 Pushed::Stopped => {
+                    settle(&mut sess, acc);
                     let decode_ms = now_ms() - t2;
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { *accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; settle(&mut sess, acc); break 'outer; }
             }
             acc += 1;
         }
@@ -4162,7 +4204,7 @@ fn generate_mtp(
     let decode_ms = now_ms() - t2;
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
@@ -4359,7 +4401,7 @@ fn generate_lookup(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                     finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
@@ -4454,7 +4496,7 @@ fn generate_lookup(
                     let decode_ms = now_ms() - t2;
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+                        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
                         finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
@@ -4500,7 +4542,7 @@ fn generate_lookup(
     gperf_note(&mut sess, gperf0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
         finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
@@ -4533,6 +4575,12 @@ struct ChatMsg {
     /// OpenAI's schema but still widely sent) the function's own name
     tool_call_id: Option<String>,
     tool_name: Option<String>,
+    /// mm37: an assistant turn's exact token ids, as this server returned
+    /// them ("tok" on the finished reply): the opener it was generated
+    /// behind and every token it generated. build_prompt replays the turn AS
+    /// these ids when they pass valid_turn_ids, so the prompt extends the
+    /// engine's end park of that turn token for token; otherwise the text.
+    tok: Option<Vec<u32>>,
 }
 
 impl ChatMsg {
@@ -4604,6 +4652,9 @@ impl<'de> Deserialize<'de> for ChatMsg {
             tool_call_id: Option<String>,
             #[serde(default)]
             name: Option<String>,
+            // mm37: base64 of the turn's u32 LE token ids
+            #[serde(default)]
+            tok: Option<String>,
         }
         #[derive(Deserialize)]
         struct WireToolCall {
@@ -4623,6 +4674,9 @@ impl<'de> Deserialize<'de> for ChatMsg {
         let mut msg = ChatMsg { role: w.role, ..Default::default() };
         msg.tool_call_id = w.tool_call_id;
         msg.tool_name = w.name;
+        // an unreadable "tok" is ignored, never an error: the turn's text is
+        // always there to replay instead
+        msg.tok = w.tok.as_deref().filter(|_| msg.role == "assistant").and_then(turn_ids_from_b64);
         for c in w.tool_calls {
             let args = match c.function.arguments {
                 Some(serde_json::Value::String(s)) => {
@@ -4796,6 +4850,76 @@ fn image_kind(b: &[u8]) -> Option<&'static str> {
         return Some("bmp");
     }
     None
+}
+
+/// mm37: a turn's token ids for the client to keep (u32 LE, standard base64).
+fn turn_ids_b64(ids: &[u32]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// mm37: the ids a client sent back for a turn - well-formed only; what they
+/// may contain is valid_turn_ids' call (it needs the config).
+fn turn_ids_from_b64(s: &str) -> Option<Vec<u32>> {
+    let b = b64_decode(s).ok()?;
+    if b.len() % 4 != 0 || b.len() / 4 > MAX_TURN_IDS {
+        return None;
+    }
+    Some(b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// The longest turn replayed as ids (a whole 64K window of one turn).
+const MAX_TURN_IDS: usize = 65536;
+
+/// mm37: client-kept ids for a replayed answer may say no more than its text
+/// could: ordinary vocabulary plus the think block's own two markers - no
+/// turn boundary, tool response or image pad rides in on them. Qwen-family
+/// vocabularies hold every added token at and above the lowest end-of-turn
+/// id (248044.. on the 0.8B and the 27B alike), so that id is the floor.
+fn valid_turn_ids(cfg: &AppConfig, tok: &Tok, ids: &[u32]) -> bool {
+    let Some(&floor) = cfg.eos.iter().min() else { return false };
+    if ids.is_empty() || ids.len() > MAX_TURN_IDS {
+        return false;
+    }
+    let one = |t: &str| match tok.encode_ids(t, false) {
+        Ok(v) if v.len() == 1 => Some(v[0]),
+        _ => None,
+    };
+    let (open, close) = (one("<think>"), one("</think>"));
+    ids.iter().all(|&t| t < floor || Some(t) == open || Some(t) == close)
+}
+
+/// mm37: a finished turn's ids as the engine holds them: the opener its prompt
+/// ended in (everything after the last "<|im_start|>assistant\n") and every
+/// token generated, without the stop token the template writes back itself.
+fn turn_ids_for(tok: &Tok, prompt: &[u32], generated: &[u32], eos: &[u32]) -> Option<Vec<u32>> {
+    let open = tok.encode_ids("<|im_start|>assistant\n", false).ok()?;
+    if open.is_empty() || prompt.len() < open.len() {
+        return None;
+    }
+    let at = (0..=prompt.len() - open.len()).rev().find(|&i| prompt[i..i + open.len()] == open[..])?;
+    let mut gen = generated;
+    while let Some((last, rest)) = gen.split_last() {
+        if !eos.contains(last) {
+            break;
+        }
+        gen = rest;
+    }
+    if gen.is_empty() {
+        return None;
+    }
+    let mut ids = prompt[at + open.len()..].to_vec();
+    ids.extend_from_slice(gen);
+    Some(ids)
 }
 
 /// Standard base64, tolerating whitespace and missing padding (both are
@@ -5349,6 +5473,7 @@ decide what is needed to handle the last user message.
         think_open: false,
         // the router emits one short line; a loop there is still a loop
         loop_reps: 4,
+        park_end: false,
     };
     let Some(&(target, tname)) = targets_for(cfg, mode).first() else {
         return RouterOut::default();
@@ -7365,6 +7490,7 @@ Reply with EXACTLY ONE line: the title and nothing else.";
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
@@ -7745,6 +7871,7 @@ ASK: <the question>";
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
@@ -8097,6 +8224,7 @@ fn format_tool_result(
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let &(target, tname) = targets_for(cfg, mode).first()?;
     let status = internal_status("formatting the result…", on_status, INTERNAL_BUSY_BUDGET_MS);
@@ -8235,6 +8363,7 @@ fn apply_tool_routes(
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let &(target, tname) = targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
@@ -8592,6 +8721,8 @@ fn build_prompt(
     let mut msgs: Vec<(String, String)> = Vec::new();
     let mut turn_images: Vec<&[Vec<u8>]> = Vec::new();
     let mut turn_videos: Vec<&[Vec<u8>]> = Vec::new();
+    // mm37: per turn, the ids it is replayed as (Some) or None for its text
+    let mut turn_toks: Vec<Option<&[u32]>> = Vec::new();
     for m in messages.iter().filter(|m| m.role == "user" || m.role == "assistant") {
         // mm33: video is opt-in per model (it is priced per frame)
         if !m.videos.is_empty() && !cfg.video {
@@ -8604,6 +8735,20 @@ fn build_prompt(
                     v.len() >> 20, cfg.max_video_bytes >> 20
                 ));
             }
+        }
+        // mm37: an answer whose exact ids the client kept is replayed AS them
+        // (think block and all): the engine parked that whole turn, so the
+        // prompt then extends the park instead of re-reading the answer
+        let ids = m.tok.as_deref().filter(|ids| {
+            m.role == "assistant" && cfg.template == "chatml" && m.images.is_empty()
+                && m.videos.is_empty() && valid_turn_ids(cfg, tok, ids)
+        });
+        if ids.is_some() {
+            msgs.push((m.role.clone(), config::TOK_MARK.to_string()));
+            turn_images.push(&m.images);
+            turn_videos.push(&m.videos);
+            turn_toks.push(ids);
+            continue;
         }
         let content = if cfg.thinking && m.role == "assistant" {
             strip_think(&m.content)
@@ -8628,6 +8773,7 @@ fn build_prompt(
         msgs.push((m.role.clone(), content));
         turn_images.push(&m.images);
         turn_videos.push(&m.videos);
+        turn_toks.push(None);
     }
     if msgs.is_empty() {
         return Err("no user/assistant messages".into());
@@ -8646,7 +8792,9 @@ fn build_prompt(
         // copying several megabytes to find that out.
         let images: usize = turn_images.iter().map(|im| im.len()).sum();
         let videos: usize = turn_videos.iter().map(|v| v.len()).sum();
+        let spliced: Vec<&[u32]> = turn_toks.iter().flatten().copied().collect();
         let total = tokens_of(tok, &rendered.prompt)?
+            + spliced.iter().map(|ids| ids.len()).sum::<usize>()
             + images * cfg.image_tokens
             + videos * cfg.video_frames * cfg.image_tokens;
         if total <= cfg.max_prompt_tokens || msgs.len() <= 1 {
@@ -8667,7 +8815,7 @@ fn build_prompt(
                 .flat_map(|(vs, ims)| vs.iter().cloned().map(Media::Video)
                     .chain(ims.iter().cloned().map(Media::Image)))
                 .collect();
-            let mut prompt = split_rendered(tok, &rendered.prompt, media)?;
+            let mut prompt = split_rendered(tok, &rendered.prompt, media, &spliced)?;
             // the shared prefixes worth parking (mm35): the system text on
             // its own when a tool block follows it (every settings
             // combination shares that much), and the whole system message.
@@ -8701,13 +8849,14 @@ fn build_prompt(
         msgs.remove(0); // drop the oldest turn and retry
         turn_images.remove(0); // ...and the pictures that were part of it
         turn_videos.remove(0);
+        turn_toks.remove(0);
     }
 }
 
 /// How many tokens a rendered prompt costs, media marks excluded (they are
 /// punctuation for the splitter, not text for the model).
 fn tokens_of(tok: &Tok, rendered: &str) -> Result<usize, String> {
-    let text = rendered.replace(config::MEDIA_MARK, "");
+    let text = rendered.replace(config::MEDIA_MARK, "").replace(config::TOK_MARK, "");
     Ok(tok.encode_ids(text.as_str(), true)?.len())
 }
 
@@ -8715,36 +8864,71 @@ fn tokens_of(tok: &Tok, rendered: &str) -> Result<usize, String> {
 /// them. Only the FIRST run gets the tokenizer's special-token treatment, the
 /// same as a whole prompt would: later runs continue a sequence that already
 /// began, so re-adding a BOS at each image would corrupt it.
+/// mm37: a TOK_MARK is a replayed turn's ids, spliced in verbatim. The text
+/// either side is cut at "<|im_start|>assistant\n" / "<|im_end|>", where the
+/// tokenizer splits anyway, so the runs tokenize exactly as the whole prompt
+/// of the turn that generated those ids did.
 fn split_rendered(
     tok: &Tok,
     rendered: &str,
     media: Vec<Media>,
+    spliced: &[&[u32]],
 ) -> Result<Prompt, String> {
-    let chunks: Vec<&str> = rendered.split(config::MEDIA_MARK).collect();
-    if chunks.len() - 1 != media.len() {
-        return Err(format!(
-            "prompt has {} media slots but {} attachments",
-            chunks.len() - 1,
-            media.len()
-        ));
+    let marks = rendered.matches(config::MEDIA_MARK).count();
+    if marks != media.len() {
+        return Err(format!("prompt has {marks} media slots but {} attachments", media.len()));
     }
-    let mut parts = Vec::with_capacity(chunks.len() + media.len());
+    if rendered.matches(config::TOK_MARK).count() != spliced.len() {
+        return Err("prompt has a replayed-turn slot without its ids".into());
+    }
+    let mut parts: Vec<PromptPart> = Vec::with_capacity(2 * (marks + spliced.len()) + 1);
     let mut text_ids = Vec::new();
     let mut imgs = media.into_iter();
-    for (i, chunk) in chunks.iter().enumerate() {
+    let mut turns = spliced.iter();
+    let text = |parts: &mut Vec<PromptPart>, text_ids: &mut Vec<u32>, ids: &[u32]| {
+        if ids.is_empty() {
+            return;
+        }
+        text_ids.extend_from_slice(ids);
+        // adjacent text runs (a spliced turn between two) feed as one
+        if let Some(PromptPart::Text(prev)) = parts.last_mut() {
+            prev.extend_from_slice(ids);
+        } else {
+            parts.push(PromptPart::Text(ids.to_vec()));
+        }
+    };
+    let mut rest = rendered;
+    let mut run = 0usize;
+    loop {
+        let next = [config::MEDIA_MARK, config::TOK_MARK]
+            .iter()
+            .filter_map(|m| rest.find(m).map(|i| (i, *m)))
+            .min_by_key(|(i, _)| *i);
+        let (cut, mark) = match next {
+            Some((i, m)) => (i, Some(m)),
+            None => (rest.len(), None),
+        };
+        let chunk = &rest[..cut];
         if !chunk.is_empty() {
-            let ids = tok.encode_ids(*chunk, i == 0)?;
-            if !ids.is_empty() {
-                text_ids.extend_from_slice(&ids);
-                parts.push(PromptPart::Text(ids));
+            let ids = tok.encode_ids(chunk, run == 0)?;
+            text(&mut parts, &mut text_ids, &ids);
+        }
+        run += 1;
+        match mark {
+            None => break,
+            Some(m) if m == config::MEDIA_MARK => {
+                parts.push(match imgs.next() {
+                    Some(Media::Image(b)) => PromptPart::Image(b),
+                    Some(Media::Video(b)) => PromptPart::Video(b),
+                    None => return Err("media slot without an attachment".into()),
+                });
+            }
+            Some(_) => {
+                let ids = turns.next().ok_or("replayed-turn slot without its ids")?;
+                text(&mut parts, &mut text_ids, ids);
             }
         }
-        if let Some(m) = imgs.next() {
-            parts.push(match m {
-                Media::Image(b) => PromptPart::Image(b),
-                Media::Video(b) => PromptPart::Video(b),
-            });
-        }
+        rest = &rest[cut + mark.map_or(0, |m| m.len())..];
     }
     // `images` is the MEDIA count: every path that asks text_only() cares
     // whether anything non-text sits in the prompt, not which kind
@@ -8772,8 +8956,8 @@ fn marks_from(text_ids: &[u32], candidates: &[Vec<u32>]) -> Vec<usize> {
 
 /// Remove media marks from text that came from outside.
 fn strip_marks(s: &str) -> String {
-    if s.contains(config::MEDIA_MARK) {
-        return s.replace(config::MEDIA_MARK, "");
+    if s.contains(config::MEDIA_MARK) || s.contains(config::TOK_MARK) {
+        return s.replace(config::MEDIA_MARK, "").replace(config::TOK_MARK, "");
     }
     s.to_string()
 }
@@ -8855,6 +9039,7 @@ fn gen_params(
         },
         think_open,
         loop_reps: cfg.repeat_guard,
+        park_end: false,
     }
 }
 
@@ -9470,7 +9655,11 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let last_user = messages.iter().rposition(|m| m.role == "user");
     let mut last_err = String::new();
     let mut ok = false;
+    // mm37: generation legs this turn took (a tool step or a search rerun
+    // adds one); only a one-leg answer is handed back as its ids
+    let mut legs = 0usize;
     'answer: loop {
+        legs += 1;
         let caps = match &tl {
             Some(t) => Capabilities::Tools(t.tools(), &t.budget),
             None => Capabilities::Note,
@@ -9485,7 +9674,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             }
         };
         let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
-        let params = gen_params(cfg, &creq, stops, think_open, effort);
+        let mut params = gen_params(cfg, &creq, stops, think_open, effort);
+        // the page keeps this turn's answer as ids (mm37): park its end
+        params.park_end = true;
         // free the encode slot ONLY when nothing can re-enter this loop: a
         // tool call (or the tools-less search remedy) appends messages and
         // rebuilds the prompt, which must re-encode - a dropped host-tokenizer
@@ -9666,6 +9857,15 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     }
                     if s.think_forced {
                         done["think_forced"] = serde_json::json!(true);
+                    }
+                    // mm37: the answer as the exact ids the engine parked, for
+                    // the page to replay next turn - only a one-leg answer:
+                    // a tool step or a search rerun rebuilt this turn from
+                    // messages the page never sends back
+                    if legs == 1 && tl.as_ref().map_or(true, |t| t.calls == 0) && !tool_searched && !tool_nudged {
+                        if let Some(ids) = turn_ids_for(&tok, &prompt_ids.text_ids, &s.ids, &cfg.eos) {
+                            done["tok"] = serde_json::json!(turn_ids_b64(&ids));
+                        }
                     }
                     // what the loop spent, when it ran at all: the client
                     // shows it on the finished reply's meta line
@@ -13697,7 +13897,7 @@ mod tests {
     fn rendered_prompt_splits_around_its_images() {
         let tok = test_tokenizer();
         let rendered = format!("before {} after", config::MEDIA_MARK);
-        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect()).unwrap();
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect(), &[]).unwrap();
         assert_eq!(p.images, 1);
         assert_eq!(p.parts.len(), 3);
         assert!(matches!(p.parts[0], PromptPart::Text(_)));
@@ -13710,12 +13910,12 @@ mod tests {
         }).flatten().collect();
         assert_eq!(joined, p.text_ids);
         // text-only prompts stay exactly what they were
-        let plain = split_rendered(&tok, "no pictures here", vec![]).unwrap();
+        let plain = split_rendered(&tok, "no pictures here", vec![], &[]).unwrap();
         assert!(plain.text_only().is_some());
         assert!(p.text_only().is_none());
         // slot/image count mismatches are caught rather than silently misaligned
-        assert!(split_rendered(&tok, &rendered, vec![].into_iter().map(Media::Image).collect()).is_err());
-        assert!(split_rendered(&tok, "no slot", vec![Media::Image(png_bytes())]).is_err());
+        assert!(split_rendered(&tok, &rendered, vec![].into_iter().map(Media::Image).collect(), &[]).is_err());
+        assert!(split_rendered(&tok, "no slot", vec![Media::Image(png_bytes())], &[]).is_err());
     }
 
     #[test]
@@ -13778,7 +13978,7 @@ mod tests {
     fn an_image_at_the_end_leaves_no_dangling_slot() {
         let tok = test_tokenizer();
         let rendered = format!("caption this {}", config::MEDIA_MARK);
-        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect()).unwrap();
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect(), &[]).unwrap();
         // trailing empty chunk contributes no part
         assert_eq!(p.parts.len(), 2);
         assert!(matches!(p.parts[1], PromptPart::Image(_)));
@@ -13925,6 +14125,142 @@ mod tests {
         assert!(folded.contains("VISION REPORT"));
         assert!(folded.trim_end().ends_with("Question: what is this"));
         assert!(folded.contains("A red barn beside a fence."));
+    }
+}
+
+#[cfg(test)]
+mod tests_end_parks {
+    //! mm37: a turn replayed as its ids makes the next prompt extend the
+    //! engine's end park of that turn token for token. The real Qwen
+    //! tokenizer decides whether the chunked tokenization agrees with the
+    //! whole-prompt one, so these run against it when
+    //! EYESOFF_TEST_QWEN_TOKENIZER names a tokenizer.json (skipped otherwise).
+    use super::*;
+
+    fn qwen() -> Option<Tok> {
+        let path = std::env::var("EYESOFF_TEST_QWEN_TOKENIZER").ok()?;
+        Some(Tok::Local(Tokenizer::from_file(path).expect("qwen tokenizer")))
+    }
+
+    fn cfg() -> AppConfig {
+        let v: serde_json::Value =
+            serde_json::from_slice(config::APP_CONFIG_JSON).expect("embedded config is JSON");
+        let mut c = config::from_value(v).expect("embedded config parses");
+        c.template = "chatml".into();
+        c.thinking = true;
+        c.eos = vec![248046, 248044];
+        c.max_prompt_tokens = 1 << 20;
+        c
+    }
+
+    fn user(t: &str) -> ChatMsg {
+        ChatMsg::text("user", t)
+    }
+
+    #[test]
+    fn ids_round_trip_through_base64() {
+        for ids in [vec![1u32], vec![0, 248068, 7, 248069], (0..1000).collect::<Vec<u32>>()] {
+            assert_eq!(turn_ids_from_b64(&turn_ids_b64(&ids)), Some(ids));
+        }
+        assert_eq!(turn_ids_from_b64("AAA"), None, "not a whole number of ids");
+    }
+
+    #[test]
+    fn the_next_prompt_extends_the_end_park_token_for_token() {
+        let Some(tok) = qwen() else {
+            eprintln!("EYESOFF_TEST_QWEN_TOKENIZER unset: skipped");
+            return;
+        };
+        let cfg = cfg();
+        // turn 1: thinking on, so the prompt opens the think block
+        let m1 = vec![user("Write a haiku about the sea.")];
+        let (p1, _, think_open) = build_prompt(&cfg, &tok, &m1, true, Capabilities::Note).unwrap();
+        assert!(think_open);
+        // what the model generated, including a NON-canonical split ("sea" as
+        // "se"+"a"): re-tokenizing the text could never reproduce it
+        let enc = |t: &str| tok.encode_ids(t, false).unwrap();
+        let mut gen = enc("Waves and salt.\n");
+        gen.extend(enc("</think>\n\nWaves fold on the "));
+        gen.extend(enc("se"));
+        gen.extend(enc("a"));
+        gen.extend(enc(" shore,\nthe tide keeps its time."));
+        assert_ne!(enc("se").iter().chain(enc("a").iter()).copied().collect::<Vec<_>>(), enc("sea"),
+                   "the split must really be non-canonical for this test to mean anything");
+        let mut with_stop = gen.clone();
+        with_stop.push(248046); // <|im_end|>, the stop token
+        let ids = turn_ids_for(&tok, &p1.text_ids, &with_stop, &cfg.eos).unwrap();
+        assert!(valid_turn_ids(&cfg, &tok, &ids));
+        // the engine's end park: turn 1's prompt and everything generated
+        let park: Vec<u32> = p1.text_ids.iter().chain(gen.iter()).copied().collect();
+        // turn 2 replays the answer as those ids
+        let text = "Waves fold on the sea shore,\nthe tide keeps its time.";
+        let mut a = ChatMsg::text("assistant", text);
+        a.tok = turn_ids_from_b64(&turn_ids_b64(&ids));
+        let m2 = vec![user("Write a haiku about the sea."), a.clone(), user("Now one about mountains.")];
+        let (p2, _, _) = build_prompt(&cfg, &tok, &m2, true, Capabilities::Note).unwrap();
+        assert!(p2.text_ids.starts_with(&park), "turn 2 must begin with the whole end park");
+        assert_eq!(p2.text_ids[park.len()], 248046, "then the turn's <|im_end|>");
+        // ...and turn 3, replaying both answers, extends turn 2's end park
+        let mut gen2 = enc("Peaks.\n</think>\n\nStone holds the cold sky.");
+        let park2: Vec<u32> = p2.text_ids.iter().chain(gen2.iter()).copied().collect();
+        gen2.push(248046);
+        let mut b = ChatMsg::text("assistant", "Stone holds the cold sky.");
+        b.tok = turn_ids_for(&tok, &p2.text_ids, &gen2, &cfg.eos);
+        let m3 = vec![user("Write a haiku about the sea."), a, user("Now one about mountains."), b, user("And rivers?")];
+        let (p3, _, _) = build_prompt(&cfg, &tok, &m3, true, Capabilities::Note).unwrap();
+        assert!(p3.text_ids.starts_with(&park2), "every turn extends the one before");
+        // without the ids the text replays thinking-stripped: no extension
+        let mut plain = m2.clone();
+        plain[1].tok = None;
+        let (p2t, _, _) = build_prompt(&cfg, &tok, &plain, true, Capabilities::Note).unwrap();
+        assert!(!p2t.text_ids.starts_with(&park));
+    }
+
+    #[test]
+    fn ids_say_no_more_than_text_could() {
+        let Some(tok) = qwen() else {
+            eprintln!("EYESOFF_TEST_QWEN_TOKENIZER unset: skipped");
+            return;
+        };
+        let cfg = cfg();
+        assert!(valid_turn_ids(&cfg, &tok, &[1, 248068, 2, 248069, 3]), "the think markers are the turn's own");
+        assert!(!valid_turn_ids(&cfg, &tok, &[1, 248045, 2]), "<|im_start|> would forge a turn");
+        assert!(!valid_turn_ids(&cfg, &tok, &[248046]), "<|im_end|> too");
+        assert!(!valid_turn_ids(&cfg, &tok, &[]));
+        // an invalid replay falls back to the text, it never fails the request
+        let mut a = ChatMsg::text("assistant", "plain answer");
+        a.tok = Some(vec![1, 248045, 2]);
+        let m = vec![user("q"), a, user("next")];
+        let (p, _, _) = build_prompt(&cfg, &tok, &m, true, Capabilities::Note).unwrap();
+        assert!(!p.text_ids.windows(3).any(|w| w == [1, 248045, 2]));
+    }
+
+    #[test]
+    fn dropping_old_turns_keeps_each_replay_with_its_turn() {
+        let Some(tok) = qwen() else {
+            eprintln!("EYESOFF_TEST_QWEN_TOKENIZER unset: skipped");
+            return;
+        };
+        let mut cfg = cfg();
+        let enc = |t: &str| tok.encode_ids(t, false).unwrap();
+        let mut msgs = Vec::new();
+        for i in 0..6 {
+            msgs.push(user(&format!("question number {i} with some words in it")));
+            let mut a = ChatMsg::text("assistant", "x");
+            let mut ids = enc("<think>\n");
+            ids.extend(enc(&format!("reasoning {i}.\n</think>\n\nanswer {i}")));
+            a.tok = Some(ids);
+            msgs.push(a);
+        }
+        msgs.push(user("last"));
+        let (full, _, _) = build_prompt(&cfg, &tok, &msgs, true, Capabilities::Note).unwrap();
+        cfg.max_prompt_tokens = full.text_ids.len() / 2;
+        let (cut, _, _) = build_prompt(&cfg, &tok, &msgs, true, Capabilities::Note).unwrap();
+        assert!(cut.text_ids.len() <= cfg.max_prompt_tokens);
+        // the newest replayed answer is still there, intact, before the last turn
+        let last = enc("reasoning 5.\n</think>\n\nanswer 5");
+        assert!(cut.text_ids.windows(last.len()).any(|w| w == &last[..]));
+        assert!(!cut.text_ids.windows(enc("reasoning 0.").len()).any(|w| w == &enc("reasoning 0.")[..]));
     }
 }
 
