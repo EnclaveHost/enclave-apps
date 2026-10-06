@@ -654,13 +654,13 @@
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
   /* ------------------------------ API + attestation + CPU-mode dialogs -- */
-  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay {
+  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #padOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
   #apiOverlay.open, #attOverlay.open, #gpuOverlay.open, #webOverlay.open,
-  #camOverlay.open { display: flex; }
+  #camOverlay.open, #padOverlay.open { display: flex; }
   /* The sign-in gate is NOT a dialog: full-screen, opaque, nothing to
      dismiss - a required deployment is signed-in-or-nothing, the way the
      big chat apps gate. Sits UNDER the boot overlay (z 100), so the boot
@@ -880,6 +880,59 @@
   }
   #cpuChip.show { display: inline-flex; }
   #cpuChip:hover { background: var(--active); }
+  /* header chip: the Shield pad bank - single-use masks the enclave mints
+     ahead of time so a prompt does not wait for them. Shown only where the
+     runtime reports a bank. */
+  #padChip {
+    display: none; align-items: center; gap: 6px; margin-left: 6px;
+    padding: 5px 11px; border-radius: 999px; font-size: 12.5px;
+    background: var(--hover); color: var(--text-2); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  #padChip.show { display: inline-flex; }
+  #padChip:hover { background: var(--active); }
+  #padChip.off { color: var(--warn); }
+  .pad-cell {
+    position: relative; width: 20px; height: 10px; flex: none; margin-right: 3px;
+    border: 1.5px solid currentColor; border-radius: 3px;
+  }
+  .pad-cell::after {
+    content: ""; position: absolute; right: -4.5px; top: 1.5px; width: 2px; height: 4px;
+    background: currentColor; border-radius: 0 1px 1px 0;
+  }
+  .pad-cell i {
+    position: absolute; left: 1px; top: 1px; bottom: 1px; width: 0;
+    border-radius: 1px; background: var(--accent); transition: width .6s ease;
+  }
+  #padChip.low .pad-cell i, .pad-meter.low i { background: var(--warn); }
+  #padChip.fill .pad-cell i { animation: padfill 1.6s ease-in-out infinite; }
+  @keyframes padfill { 50% { opacity: .45; } }
+  .pad-dir { font-size: 11px; line-height: 1; }
+  #padChip.fill .pad-dir { color: var(--ok); }
+  #padChip.draw .pad-dir { color: var(--warn); }
+  #padOverlay .api-card { max-width: 480px; font-size: 14px; line-height: 1.6; }
+  .pad-top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .pad-top b { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pad-top span { color: var(--text-2); }
+  .pad-meter {
+    height: 10px; border-radius: 999px; background: var(--hover);
+    overflow: hidden; margin: 0 0 14px;
+  }
+  .pad-meter i {
+    display: block; height: 100%; width: 0; border-radius: 999px;
+    background: var(--accent); transition: width .6s ease;
+  }
+  .pad-facts {
+    display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 0 0 14px;
+    font-variant-numeric: tabular-nums;
+  }
+  .pad-facts dt { color: var(--text-3); }
+  .pad-facts dd { margin: 0; }
+  .pad-note { color: var(--text-2); font-size: 13px; }
+  @media (prefers-reduced-motion: reduce) {
+    #padChip.fill .pad-cell i { animation: none; }
+    .pad-cell i, .pad-meter i { transition: none; }
+  }
 
   #jump {
     position: absolute; left: 50%; transform: translateX(-50%); bottom: 128px;
@@ -1021,7 +1074,8 @@
       padding: calc(16px + env(safe-area-inset-top, 0px)) 12px 8px;
     }
     header .spacer { display: none; }        /* wrapping does the pushing now */
-    #menuBtn, #cpuChip { order: 1; }
+    #menuBtn, #cpuChip, #padChip { order: 1; }
+    #padChip { padding: 5px 9px; }
     /* `auto` basis, not 100%: the model shares row 1 with the toggle and
        grows into whatever is left, rather than forcing itself onto its own
        line. min-width 0 lets it shrink instead of overflowing. */
@@ -1177,6 +1231,10 @@
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 3v4M14 3v4M10 17v4M14 17v4M3 10h4M3 14h4M17 10h4M17 14h4"/></svg>
       <span class="lbl">CPU mode</span>
     </button>
+    <button id="padChip" aria-label="Pad bank - details" title="Pad bank">
+      <span class="pad-cell" aria-hidden="true"><i></i></span>
+      <span class="lbl"></span><span class="pad-dir" aria-hidden="true"></span>
+    </button>
     <span class="spacer"></span>
     <div class="header-actions">
     <button class="icon-btn" id="attBtn" aria-label="Enclave attestation" title="Enclave attestation">
@@ -1325,6 +1383,30 @@
       <button class="web-btn primary" id="ssoGo">Sign in with Enclave</button>
     </div>
   </div>
+  <div id="padOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="padTitle">
+      <div class="api-head">
+        <h2 id="padTitle">Pad bank</h2>
+        <button class="icon-btn" id="padClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <div class="pad-top"><b id="padPct">&#8211;</b><span id="padState"></span></div>
+      <div class="pad-meter" id="padMeter"><i></i></div>
+      <dl class="pad-facts">
+        <dt>Ready</dt><dd id="padReady">&#8211;</dd>
+        <dt>Size</dt><dd id="padSize">&#8211;</dd>
+        <dt>Now</dt><dd id="padRate">&#8211;</dd>
+        <dt>Since start</dt><dd id="padTotals">&#8211;</dd>
+      </dl>
+      <p class="pad-note">The GPU only ever sees masked numbers. Every prompt token needs a
+      fresh set of single-use masks (pads), and minting them is slow work for the enclave's CPU.
+      So the enclave mints them ahead of time while it is idle and keeps them sealed on the
+      host's disk, under keys only it holds. A prompt then reads its pads instead of waiting
+      for them; on an empty bank, a long prompt prefills more slowly.</p>
+    </div>
+  </div>
+
   <div id="gpuOverlay">
     <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="gpuTitle">
       <div class="api-head">
@@ -3764,6 +3846,7 @@ window.addEventListener("keydown", (e) => {
     if (camOverlay.classList.contains("open")) { closeCam(); return; }
     if (webOverlay.classList.contains("open")) { answerWeb(false); return; }
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
+    if (padOverlay.classList.contains("open")) { closePad(); return; }
     if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
     if (state.busyChatId) stopGeneration();
     closeModelMenu();
@@ -4888,6 +4971,124 @@ $("ssoLink").addEventListener("click", (e) => {
 cpuChip.addEventListener("click", openGpu);
 $("gpuClose").addEventListener("click", closeGpu);
 gpuOverlay.addEventListener("click", (e) => { if (e.target === gpuOverlay) closeGpu(); });
+
+// ---------------------------------------------------------------- pad bank --
+// Shield (masked GPU offload) takes a set of one-time pads per prompt token.
+// The engine mints them while idle into a sealed bank on the host's disk, and
+// the measured runtime reports that bank on any request asking for it with
+// x-enclave-performance: 1 - 24 integers, layout tag 1346454594 ("PADB"); see
+// wasm/ggml-shielded/PAD-SPILL.md in the platform repo. Counters only, never
+// anything of a conversation. A deployment whose runtime reports no bank (no
+// Shield, no disk, an older runtime) never shows the chip. Polled off /ping,
+// and only while the page is visible.
+const padChip = $("padChip"), padOverlay = $("padOverlay");
+const PAD_TAG = 1346454594;
+const pad = { last: null, win: [], misses: 0, timer: 0, busy: false };
+function padParse(h) {
+  if (!h) return null;
+  const v = h.split(",").map(Number);
+  if (v.length < 18 || v[0] !== 1 || v[1] !== PAD_TAG || v[2] !== 1 ||
+      v.some((x) => !Number.isFinite(x) || x < 0)) return null;
+  return { t: performance.now(), links: v[3], attached: v[4], capacity: v[5], ready: v[6],
+    room: v[7], tokens: v[8], written: v[9], drawn: v[10] + v[11], failed: v[12],
+    minters: v[13], quietMs: v[14], idleMs: v[15], tokenBytes: v[16] };
+}
+function padBytes(b) {
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return (i ? b.toFixed(b < 10 ? 1 : 0) : Math.round(b)) + " " + u[i];
+}
+function padDur(sec) {
+  if (sec < 90) return Math.max(1, Math.round(sec)) + " s";
+  if (sec < 5400) return Math.round(sec / 60) + " min";
+  return (sec / 3600).toFixed(1) + " h";
+}
+const padNum = (n) => Math.round(n).toLocaleString();
+function padRender(s) {
+  if (!s) { padChip.classList.remove("show"); pad.last = null; pad.win = []; return; }
+  const prev = pad.last;
+  // a restarted engine starts its counters over: so does the rate window
+  if (prev && (s.written < prev.written || s.drawn < prev.drawn)) pad.win = [];
+  pad.last = s;
+  pad.win.push(s);
+  while (pad.win.length > 2 && s.t - pad.win[0].t > 15000) pad.win.shift();
+  const on = s.attached > 0 && s.capacity > 0 && s.room > 0;
+  const per = on ? s.capacity / s.room : 1;           // pads one prompt token takes
+  let pct = on ? Math.min(100, (s.ready / s.capacity) * 100) : 0;
+  const w0 = pad.win[0], span = (s.t - w0.t) / 1000;
+  const fill = span > 0 ? (s.written - w0.written) / per / span : 0;   // tokens a second
+  const draw = span > 0 ? (s.drawn - w0.drawn) / per / span : 0;
+  const drawing = prev && s.drawn > prev.drawn;
+  const minting = s.minters > 0 || (prev && s.written > prev.written);
+  // minting stops a batch short of each group's room: within one batch is full
+  const full = on && s.capacity - s.ready <= per * 64;
+  if (full) pct = 100;
+  let state, cls = "";
+  if (!on) {
+    state = !s.links ? "starting with the model" : s.failed ? "off after a disk error; pads are minted as prompts need them" : "off";
+    cls = s.links ? "off" : "";
+  } else if (drawing) { state = "in use by a prompt"; cls = "draw"; }
+  else if (full) state = "full";              // even while the last batches land
+  else if (minting) { state = "refilling"; cls = "fill"; }
+  else if (s.quietMs < s.idleMs) state = "refills once the current request ends";
+  else state = "idle";
+  const label = on ? Math.floor(pct) + "%" : s.links ? "off" : "\u2013";
+  padChip.className = "show " + cls + (on && pct < 15 ? " low" : "");
+  padChip.querySelector(".pad-cell i").style.width = "calc((100% - 2px) * " + (pct / 100).toFixed(3) + ")";
+  padChip.querySelector(".lbl").textContent = label;
+  padChip.querySelector(".pad-dir").textContent = cls === "fill" ? "\u2191" : cls === "draw" ? "\u2193" : "";
+  const sentence = on
+    ? "Pad bank " + Math.floor(pct) + "% full, about " + padNum(s.tokens) + " prompt tokens ready, " + state
+    : "Pad bank " + state;
+  padChip.title = sentence;
+  padChip.setAttribute("aria-label", sentence + " - details");
+  $("padPct").textContent = on ? Math.floor(pct) + "%" : label;
+  $("padState").textContent = state;
+  const meter = $("padMeter");
+  meter.className = "pad-meter" + (on && pct < 15 ? " low" : "");
+  meter.firstElementChild.style.width = pct.toFixed(1) + "%";
+  $("padReady").textContent = on ? padNum(s.tokens) + " of " + padNum(s.room) + " prompt tokens" : "\u2013";
+  $("padSize").textContent = on
+    ? padBytes(s.tokens * s.tokenBytes) + " of " + padBytes(s.room * s.tokenBytes) + " \u00b7 " + padBytes(s.tokenBytes) + " a token"
+    : "\u2013";
+  let now = "\u2013";
+  if (on && cls === "draw") now = "a prompt is using " + padNum(draw) + " tokens' worth a second";
+  else if (on && cls === "fill") {
+    const left = (s.capacity - s.ready) / per;
+    now = (fill > 0.5 ? "minting " + padNum(fill) + " tokens' worth a second" : "minting") +
+      (fill > 0.5 && !full ? " \u00b7 full in about " + padDur(left / fill) : "");
+  } else if (on && full) now = "nothing to mint";
+  $("padRate").textContent = now;
+  $("padTotals").textContent = on || s.written
+    ? "minted " + padBytes((s.written / per) * s.tokenBytes) + ", prompts used " + padBytes((s.drawn / per) * s.tokenBytes)
+    : "\u2013";
+}
+async function padPoll() {
+  clearTimeout(pad.timer);
+  if (document.hidden || pad.busy) return;   // visibilitychange starts it again
+  pad.busy = true;
+  let s = null;
+  try {
+    const res = await fetch("ping", { cache: "no-store", headers: { "x-enclave-performance": "1" } });
+    s = padParse(res.headers.get("x-enclave-shield-performance"));
+  } catch (_) { /* offline or restarting: counts as a miss */ }
+  pad.busy = false;
+  pad.misses = s ? 0 : pad.misses + 1;
+  // one lost reading keeps the last; three mean this runtime reports no bank
+  if (s || pad.misses >= 3) padRender(s);
+  pad.timer = setTimeout(padPoll, pad.misses >= 3 ? 60000 : padOverlay.classList.contains("open") ? 1500 : 3000);
+}
+function closePad() { padOverlay.classList.remove("open"); padChip.focus(); }
+padChip.addEventListener("click", () => { padOverlay.classList.add("open"); $("padClose").focus(); padPoll(); });
+$("padClose").addEventListener("click", closePad);
+padOverlay.addEventListener("click", (e) => { if (e.target === padOverlay) closePad(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  pad.win = []; pad.last = null;   // a rate across the hidden gap would mean nothing
+  padPoll();
+});
+padPoll();
 
 // ------------------------------------------------------------ model picker --
 function closeModelMenu() {
