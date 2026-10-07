@@ -963,16 +963,26 @@ struct App {
     video_cost: Duration,
     // Boot-fetch retry: an image fetch can fail transiently — the platform's
     // egress front may reject the app's very first connect while the
-    // deployment record is still mid-provision, S3 can blip — so a failed
-    // start re-queues itself a few times before staying in Error. A fresh
-    // operator /start resets the budget.
+    // deployment record is still mid-provision, S3 can blip, an egress
+    // circuit can drop mid-download — so a failed start re-queues itself,
+    // backing off to boot_retry_delay's ceiling, and never gives up. A
+    // fresh operator /start resets the backoff.
     retry: usize,
     retry_at: Option<Instant>,
     retry_start: Option<Start>,
 }
 
-/// Backoff for the boot-fetch retries (seconds between attempts).
-const BOOT_RETRY_DELAYS: [u64; 4] = [5, 15, 30, 60];
+/// Backoff for the boot-fetch retries (seconds between attempts). The last
+/// step repeats for as long as the fetch keeps failing: a fixed budget (it
+/// was 5+15+30+60 s) left e64f7cba in Error for good after one egress drop
+/// outlasted it, and every caller — the desktop, run_vm_command, /computer —
+/// got 409 "machine is not running" until someone sent /start by hand.
+const BOOT_RETRY_DELAYS: [u64; 6] = [5, 15, 30, 60, 120, 300];
+
+/// Seconds to wait before boot-fetch retry number `attempt` (0-based).
+fn boot_retry_delay(attempt: usize) -> u64 {
+    BOOT_RETRY_DELAYS[attempt.min(BOOT_RETRY_DELAYS.len() - 1)]
+}
 
 fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1986,6 +1996,24 @@ fn err(msg: &str) -> String {
     format!("{{\"error\":{{\"message\":\"{}\"}}}}", httpd::json_escape(msg))
 }
 
+/// The 409 body for a call that needs a running machine: why it is down and,
+/// for a failed boot, when it next retries. A bare "machine is not running"
+/// sent eyesoff's model round the same call until its step limit.
+fn not_running(app: &App, mi: usize) -> String {
+    let m = &app.machines[mi];
+    let mut msg = String::from("machine is not running");
+    if m.phase == Phase::Error {
+        if let Some(e) = &m.error {
+            msg.push_str(&format!(": it failed to start: {e}"));
+        }
+        if let (0, Some(t)) = (mi, app.retry_at) {
+            let s = t.saturating_duration_since(Instant::now()).as_secs();
+            msg.push_str(&format!("; the start is retried automatically in {s}s"));
+        }
+    }
+    err(&msg)
+}
+
 // ---- instances -------------------------------------------------------------
 
 /// POST /instances — fork a new machine. Body: {"from"?: "main" | "<snapshot
@@ -2359,10 +2387,10 @@ fn screen_hash(emu: &Emulator, buf: &mut Vec<u8>) -> u64 {
 /// (and repainting) while the call waits. Nothing is injected when the plan
 /// is refused.
 fn computer_call(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) {
-    let m = &mut app.machines[mi];
-    if !m.running() {
-        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+    if !app.machines[mi].running() {
+        return server.respond(key, json(409, "Conflict", not_running(app, mi)));
     }
+    let m = &mut app.machines[mi];
     let screen = computer::Screen {
         w: display::fb_w(),
         h: display::fb_h(),
@@ -2522,7 +2550,7 @@ fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) 
         return server.respond(key, json(403, "Forbidden", err("exec is disabled on this deployment")));
     }
     if !app.machines[mi].running() {
-        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+        return server.respond(key, json(409, "Conflict", not_running(app, mi)));
     }
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -2973,20 +3001,14 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
             }
             Err(e) => {
                 eprintln!("[risc-box] start failed: {e}");
-                if app.retry < BOOT_RETRY_DELAYS.len() {
-                    let delay = BOOT_RETRY_DELAYS[app.retry];
-                    eprintln!(
-                        "[risc-box] retrying fetch in {delay}s (attempt {}/{})",
-                        app.retry + 1,
-                        BOOT_RETRY_DELAYS.len()
-                    );
-                    app.retry_at = Some(Instant::now() + Duration::from_secs(delay));
-                    app.retry_start = Some(Start {
-                        creds: body.as_ref().map(clone_creds),
-                        reset: start.reset,
-                        snapshot: start.snapshot,
-                    });
-                }
+                let delay = boot_retry_delay(app.retry);
+                eprintln!("[risc-box] retrying fetch in {delay}s (attempt {})", app.retry + 1);
+                app.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+                app.retry_start = Some(Start {
+                    creds: body.as_ref().map(clone_creds),
+                    reset: start.reset,
+                    snapshot: start.snapshot,
+                });
                 let m = app.main_mut();
                 m.error = Some(e);
                 m.phase = Phase::Error;
@@ -3831,5 +3853,20 @@ mod turn_batch_tests {
         assert_eq!(turn_batch(TICK_BATCH, 1.0), TURN_FLOOR);
         assert_eq!(turn_batch(MIN_BATCH, 100_000.0), MIN_BATCH);
         assert_eq!(turn_batch(4_000, 1.0), 4_000, "a share already under the floor is kept");
+    }
+}
+
+#[cfg(test)]
+mod boot_retry_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_boot_fetch_backs_off_then_keeps_retrying() {
+        let first: Vec<u64> = (0..6).map(boot_retry_delay).collect();
+        assert_eq!(first, [5, 15, 30, 60, 120, 300]);
+        // no budget to run out of: every later attempt waits the ceiling
+        assert_eq!(boot_retry_delay(6), 300);
+        assert_eq!(boot_retry_delay(10_000), 300);
+        assert_eq!(boot_retry_delay(usize::MAX), 300);
     }
 }
