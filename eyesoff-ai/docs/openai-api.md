@@ -547,6 +547,25 @@ why, the state of files and commands, the next step) and to rewrite it whole
 each time. Only a persisting loop has a ledger; `keep_results` does nothing
 in this mode, since there is never an older result to condense.
 
+**When the ledger switches on.** It suits a test loop - run the check, fix,
+run it again - where the newest result is all the next step needs, and it is
+wrong for work that reads first: a guide read at step two is gone at step
+three unless the model copied it out. So `true` means **checks**: the loop
+keeps its whole history (older results condensed, as usual) until it re-runs
+a check, and only then switches to the ledger. A check is re-run at the third
+good run of the same call (same tool, same arguments) where something other
+than a wait ran since the previous run and the answer changed - run, change,
+run, change, run. A guide read again answers the same, polling has only waits
+in between, and a call that failed outright (the machine down, an HTTP 409)
+is not a run, so none of those switch it on. The result that switches it on
+tells the model what the ledger is and asks for the first one; nothing is
+dropped until the model has written it. The playground shows a note when it
+happens. Until then the rules and the parked system prompt are exactly the
+plain loop's. `"ledger": "always"` is the ledger from the first step, as 0.58
+shipped it (rules in the system prompt); `false` or `"off"` never. The config
+and a request's `loop` object take the same spellings; `/models` and `/tools`
+report `false`, `"checks"` or `"always"`.
+
 **The verify gate (0.58).** A config that names the tool that checks the
 goal - `"verify": "run_tests"`, optionally with `"verify_pass": "0 failed"`
 for what a passing result contains - turns "keep going until the check

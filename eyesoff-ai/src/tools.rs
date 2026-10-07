@@ -161,10 +161,20 @@ pub struct ToolsConfig {
     /// fixed-size tail behind a prefix the engine keeps warm, which on a CPU
     /// node is the difference between a two-second step and a two-minute one
     /// thirty calls in. It is the pattern the ledger-orchestration papers
-    /// use: fresh context every call, state on the page. A request's `loop`
-    /// object may set `ledger` either way; it only applies when persisting.
+    /// use: fresh context every call, state on the page.
+    ///
+    /// It suits a TEST LOOP - run the check, fix, run it again - where the
+    /// newest result is all the next step needs. It is wrong for work that
+    /// reads first: a guide read at step two is gone at step three unless
+    /// the model copied it out, and a model that did not reads it again,
+    /// and again (seen live 2026-10-07: seventeen guide calls in one answer,
+    /// four topics). So `true` means Ledger::Checks - full history until the
+    /// loop starts re-running a check, the ledger from then on - and the old
+    /// from-the-first-step behaviour is `"always"`. A request's `loop`
+    /// object may set `ledger` any of those ways; it only applies when
+    /// persisting.
     #[serde(default)]
-    pub ledger: bool,
+    pub ledger: Ledger,
     /// the most characters of a ledger block kept (default 2400). What the
     /// model writes past it is cut, and the rules tell it the cap.
     #[serde(default = "default_ledger_chars")]
@@ -547,6 +557,59 @@ impl Builtin {
     }
 }
 
+/// When a persisting loop drops its history for the ledger (see
+/// ToolsConfig::ledger). Written `true` / `false` / `"checks"` /
+/// `"always"` / `"off"` in a config or a request's `loop` object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ledger {
+    /// never: results accumulate, the older ones condensed (keep_results)
+    #[default]
+    Off,
+    /// once the loop RE-RUNS A CHECK (see ToolLoop::reruns_a_check): the
+    /// steps before that keep everything they read, and the history is only
+    /// dropped once the model has written a ledger to carry it
+    Checks,
+    /// from the first step, as 0.58 shipped it
+    Always,
+}
+
+impl Ledger {
+    /// The written forms; None for anything else.
+    pub fn parse(v: &serde_json::Value) -> Option<Ledger> {
+        match v {
+            serde_json::Value::Bool(true) => Some(Ledger::Checks),
+            serde_json::Value::Bool(false) => Some(Ledger::Off),
+            serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "checks" => Some(Ledger::Checks),
+                "always" => Some(Ledger::Always),
+                "off" => Some(Ledger::Off),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// How /models and /tools report it.
+    pub fn json(self) -> serde_json::Value {
+        match self {
+            Ledger::Off => serde_json::json!(false),
+            Ledger::Checks => serde_json::json!("checks"),
+            Ledger::Always => serde_json::json!("always"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Ledger {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ledger::parse(&v).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "ledger must be true, false, \"checks\", \"always\" or \"off\", not {v}"
+            ))
+        })
+    }
+}
+
 /// What ONE answer's loop may spend, after the request has had its say. The
 /// config is the ceiling: a request LOWERS a figure (a client that wants a
 /// quick answer, a playground turn that is not a task) and never raises one.
@@ -560,8 +623,8 @@ pub struct Budget {
     /// subagents the whole answer may spawn (see ToolsConfig::max_agents)
     pub max_agents: u32,
     pub max_agent_depth: u32,
-    /// ledger mode (see ToolsConfig::ledger); never true unless persisting
-    pub ledger: bool,
+    /// ledger mode (see ToolsConfig::ledger); always Off unless persisting
+    pub ledger: Ledger,
     /// the tool whose passing result a persisting answer needs (see
     /// ToolsConfig::verify)
     pub verify: Option<String>,
@@ -578,7 +641,7 @@ impl Budget {
             persist: false,
             max_agents: 0,
             max_agent_depth: default_max_agent_depth(),
-            ledger: false,
+            ledger: Ledger::Off,
             verify: None,
         }
     }
@@ -722,8 +785,8 @@ impl ToolsConfig {
             Some(serde_json::Value::Object(o)) => {
                 b.persist = o.get("persist").and_then(|v| v.as_bool()).unwrap_or(true);
                 // the ledger is a prompt shape, not a cost: a request may
-                // choose it either way
-                if let Some(l) = o.get("ledger").and_then(|v| v.as_bool()) {
+                // choose it any way
+                if let Some(l) = o.get("ledger").and_then(Ledger::parse) {
                     b.ledger = l;
                 }
                 // the check may be named (a client knows its own harness)
@@ -754,7 +817,7 @@ impl ToolsConfig {
         }
         // both only mean anything in a loop that persists
         if !b.persist {
-            b.ledger = false;
+            b.ledger = Ledger::Off;
             b.verify = None;
         }
         b
@@ -1819,7 +1882,10 @@ fn finish_rule(tools: &[Tool], b: &Budget) -> String {
             None => String::new(),
         },
     );
-    if b.ledger {
+    // Checks says nothing here: the ledger is introduced by the result that
+    // switches it on (ToolLoop::ledger_turn), and until then the rules - and
+    // the parked prefix - are the plain loop's
+    if b.ledger == Ledger::Always {
         s.push_str(
             " THE LEDGER: this loop keeps NO history. When a result comes back, everything you \
              wrote before it is gone except one block: the ledger you write at the START of \
@@ -5651,13 +5717,13 @@ mod tests {
         }))
         .unwrap();
         let b = cfg.budget(None);
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         assert!(cfg.budget(Some(&serde_json::json!(true))).persist);
         assert!(!cfg.budget(Some(&serde_json::json!(false))).persist);
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 8, "max_seconds": 600 })));
-        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 999, "max_seconds": 99999, "persist": false })));
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         // zero is not a budget: the loop would refuse its first call
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 0, "max_seconds": 0 })));
         assert_eq!((b.max_calls, b.max_seconds), (1, 1));
@@ -5710,7 +5776,7 @@ mod tests {
         assert_eq!(b.max_agents, 0);
         // the persisting rules point at it when it is there
         let with = vec![tool("run_tests"), tool(AGENT_TOOL)];
-        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: false, verify: None });
+        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         assert!(rules.contains("spawn_agent"), "{rules}");
     }
 
@@ -5719,28 +5785,29 @@ mod tests {
     #[test]
     fn the_rules_follow_the_budget() {
         let list = vec![tool("run_tests")];
-        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         assert!(quick.contains("at most 32 calls"), "{quick}");
         assert!(quick.contains("30 minutes of wall-clock time"), "{quick}");
         assert!(quick.contains("stop calling and write the answer"), "{quick}");
         assert!(!quick.contains("WORKING TO A CHECK"), "{quick}");
-        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         assert!(persist.contains("WORKING TO A CHECK"), "{persist}");
         assert!(persist.contains("keep going until the check passes"), "{persist}");
         assert!(!persist.contains("call wait"), "{persist}");
         let with_wait = vec![tool("run_tests"), tool("wait")];
-        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
         assert!(persist.contains("call wait rather than polling"), "{persist}");
         // the merged block (client tools beside ours) carries the same rule
-        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None }, None);
+        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None }, None);
         assert!(merged.contains("at most 4 of them"), "{merged}");
         assert!(merged.contains("within 2 minutes"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
     }
 
     /// Ledger mode and the verify gate ride the budget: the config sets
-    /// them, a request may set the ledger either way and name or waive the
-    /// check, and neither survives a loop that does not persist.
+    /// them, a request may set the ledger any way and name or waive the
+    /// check, and neither survives a loop that does not persist. `true` is
+    /// the check-triggered ledger; `"always"` is the 0.58 one.
     #[test]
     fn the_ledger_and_the_check_follow_the_budget() {
         let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
@@ -5749,26 +5816,53 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.ledger_chars, 2400);
+        assert_eq!(cfg.ledger, Ledger::Checks);
         // not persisting: neither applies
         let b = cfg.budget(None);
-        assert!(!b.ledger);
+        assert_eq!(b.ledger, Ledger::Off);
         assert_eq!(b.verify, None);
         let b = cfg.budget(Some(&serde_json::json!(true)));
-        assert!(b.ledger);
+        assert_eq!(b.ledger, Ledger::Checks);
         assert_eq!(b.verify.as_deref(), Some("run_tests"));
         let b = cfg.budget(Some(&serde_json::json!({ "ledger": false, "verify": false })));
-        assert!(b.persist && !b.ledger && b.verify.is_none());
+        assert!(b.persist && b.ledger == Ledger::Off && b.verify.is_none());
+        let b = cfg.budget(Some(&serde_json::json!({ "ledger": "always" })));
+        assert_eq!(b.ledger, Ledger::Always);
+        // an unreadable request value leaves the deployment's choice alone
+        let b = cfg.budget(Some(&serde_json::json!({ "ledger": "sometimes" })));
+        assert_eq!(b.ledger, Ledger::Checks);
         let b = cfg.budget(Some(&serde_json::json!({ "verify": "make_check" })));
         assert_eq!(b.verify.as_deref(), Some("make_check"));
         // a deployment without either may still be asked for the ledger
         let plain: ToolsConfig = serde_json::from_value(serde_json::json!({ "max_calls": 4 })).unwrap();
-        assert!(plain.budget(Some(&serde_json::json!({ "ledger": true }))).ledger);
-        assert!(!plain.budget(Some(&serde_json::json!({ "ledger": true, "persist": false }))).ledger);
+        assert_eq!(plain.ledger, Ledger::Off);
+        assert_eq!(plain.budget(Some(&serde_json::json!({ "ledger": true }))).ledger, Ledger::Checks);
+        assert_eq!(plain.budget(Some(&serde_json::json!({ "ledger": true, "persist": false }))).ledger, Ledger::Off);
+        // every written form in a config, and a typo refused rather than guessed
+        for (v, want) in [
+            (serde_json::json!(false), Ledger::Off),
+            (serde_json::json!("off"), Ledger::Off),
+            (serde_json::json!("Checks"), Ledger::Checks),
+            (serde_json::json!(" always "), Ledger::Always),
+        ] {
+            let c: ToolsConfig = serde_json::from_value(serde_json::json!({ "ledger": v })).unwrap();
+            assert_eq!(c.ledger, want, "{v}");
+        }
+        assert!(serde_json::from_value::<ToolsConfig>(serde_json::json!({ "ledger": "alway" })).is_err());
+        assert!(serde_json::from_value::<ToolsConfig>(serde_json::json!({ "ledger": 1 })).is_err());
+        assert_eq!(Ledger::Off.json(), serde_json::json!(false));
+        assert_eq!(Ledger::Checks.json(), serde_json::json!("checks"));
+        assert_eq!(Ledger::Always.json(), serde_json::json!("always"));
         // the rules name the check only when the tool is really offered,
-        // and describe the ledger only in ledger mode
+        // and describe the ledger up front only when it runs from the first
+        // step: the check-triggered one is introduced when it switches on,
+        // so until then the rules are the plain loop's, byte for byte
         let list = vec![tool("run_tests")];
         let rules = system_block(&list, &cfg.budget(Some(&serde_json::json!(true))));
         assert!(rules.contains("CHECKED by `run_tests`"), "{rules}");
+        assert!(!rules.contains("THE LEDGER"), "{rules}");
+        assert_eq!(rules, system_block(&list, &cfg.budget(Some(&serde_json::json!({ "ledger": false })))));
+        let rules = system_block(&list, &cfg.budget(Some(&serde_json::json!({ "ledger": "always" }))));
         assert!(rules.contains("THE LEDGER"), "{rules}");
         assert!(rules.contains("### LEDGER"), "{rules}");
         assert!(rules.contains("genuinely different ways"), "{rules}");

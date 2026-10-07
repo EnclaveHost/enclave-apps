@@ -6057,6 +6057,14 @@ struct ToolLoop<'a> {
     /// the model's own state block, as it last wrote it under `### LEDGER`;
     /// shown back under every result in ledger mode
     ledger: String,
+    /// the ledger is in force: from the start under Ledger::Always, from
+    /// the result that re-ran a check under Ledger::Checks, never under Off
+    ledger_on: bool,
+    /// Ledger::Checks' evidence, until it switches on: every call that ran
+    /// that was not a wait or a load_tools, counted, and per call (canonical
+    /// form) its latest good run (see reruns_a_check)
+    acts: usize,
+    checks: std::collections::HashMap<String, CheckRuns>,
     /// the newest call and a hash of its result, with how many times in a
     /// row that exact pair has come back. Two identical outcomes get a
     /// warning in the result; a third identical CALL is refused unrun. A
@@ -6114,6 +6122,24 @@ const REFUSED_STUCK: &str =
 /// how a model re-reads a file it is about to edit; two with nothing
 /// changed in between is a model that has stopped deciding.
 const STUCK_TELL: usize = 2;
+/// Ledger::Checks switches on at the call's THIRD good run with other calls
+/// before it and a different answer from the run before - two passes of
+/// run, change, run again. Two runs would be one re-read of a file after
+/// editing it, which is not a test loop and would cost the model what it
+/// read before; three is a loop, and in one of thirty passes, one more
+/// step with the whole history is nothing.
+const CHECK_RUNS: usize = 3;
+
+/// One call's record for Ledger::Checks (ToolLoop::reruns_a_check): the hash
+/// of its latest good result, `acts` when it ran, and how many of its runs
+/// so far count (the first, then each one that came back changed after
+/// something else ran).
+struct CheckRuns {
+    hash: u64,
+    at: usize,
+    runs: usize,
+}
+
 /// The heading a ledger-mode reply writes its state under (see
 /// tools::ToolsConfig::ledger). Matched case-insensitively, at any heading
 /// depth, so `## Ledger` counts too.
@@ -6168,6 +6194,7 @@ impl<'a> ToolLoop<'a> {
         spawn: Option<Spawn<'a>>,
     ) -> ToolLoop<'a> {
         let t0 = now_ms();
+        let ledger_on = budget.ledger == tools::Ledger::Always;
         let mut builtins = builtins;
         {
             let t = tree.borrow();
@@ -6199,6 +6226,9 @@ impl<'a> ToolLoop<'a> {
             log: Vec::new(),
             base_len: None,
             ledger: String::new(),
+            ledger_on,
+            acts: 0,
+            checks: std::collections::HashMap::new(),
             last_pair: None,
             same_runs: 0,
             verify_seen: false,
@@ -6394,17 +6424,22 @@ impl<'a> ToolLoop<'a> {
         // the conversation goes back to where this loop found it before
         // the step appends its one call and one result. A reply with no
         // block keeps the previous ledger: losing state is the one thing
-        // this mode must never do by accident.
-        if self.budget.ledger {
+        // this mode must never do by accident - which is also why a ledger
+        // that switched on mid-answer drops nothing until the model has
+        // written one.
+        let base = *self.base_len.get_or_insert(messages.len());
+        if self.ledger_on {
             if let Some(l) = ledger_of(text) {
                 self.ledger = tools::truncate(&l, self.cfg.ledger_chars.max(200));
             }
-            let base = *self.base_len.get_or_insert(messages.len());
-            messages.truncate(base);
-            self.pictures.retain(|&i| i < base);
+            if self.dropping() {
+                messages.truncate(base);
+                self.pictures.retain(|&i| i < base);
+                self.results.retain(|r| r.0 < base);
+            }
         }
         let again = self.step_inner(text, messages, on_call, on_result, on_note);
-        if again && self.budget.ledger {
+        if again && self.ledger_on {
             if let Some(m) = messages.last_mut() {
                 m.content.push_str(&self.ledger_turn());
             }
@@ -6412,9 +6447,65 @@ impl<'a> ToolLoop<'a> {
         again
     }
 
+    /// Whether a step drops the history: from the first under
+    /// Ledger::Always, and under Checks once the model has a ledger for the
+    /// history to be dropped INTO.
+    fn dropping(&self) -> bool {
+        self.ledger_on && (self.budget.ledger == tools::Ledger::Always || !self.ledger.is_empty())
+    }
+
+    /// Ledger::Checks: does this result come from RE-RUNNING A CHECK? That
+    /// is the shape of a test loop - run it, change something, run it
+    /// again - and the call's CHECK_RUNS-th run of that shape is the one
+    /// that says so. A run only counts when something other than a wait
+    /// ran since the last one and it answered differently: re-reading what
+    /// has not changed answers the same, and polling has only waits in
+    /// between. A call that failed outright (the machine down, a 409) is
+    /// not a check that ran, so it never counts, though it is still
+    /// something that ran in between. Every call is recorded until the
+    /// ledger switches on; nothing is after.
+    fn reruns_a_check(&mut self, name: &str, key: &str, r: &tools::ToolResult) -> bool {
+        if name == "wait" || name == tools::LOAD_TOOLS {
+            return false;
+        }
+        self.acts += 1;
+        // a child's report is never the same twice, and spawning one is
+        // handing work off, not checking it
+        if r.is_error || name == tools::AGENT_TOOL {
+            return false;
+        }
+        let h = fnv1a(&r.text);
+        let acts = self.acts;
+        let c = self.checks.entry(key.to_string()).or_insert(CheckRuns { hash: h, at: acts, runs: 0 });
+        if c.runs == 0 || (c.at + 1 < acts && c.hash != h) {
+            c.runs += 1;
+        }
+        c.hash = h;
+        c.at = acts;
+        c.runs >= CHECK_RUNS
+    }
+
     /// The ledger as the model reads it back: under every result, exactly
-    /// as it last wrote it, with the instruction to rewrite it whole.
+    /// as it last wrote it, with the instruction to rewrite it whole. A
+    /// ledger that switched on mid-answer has no rules in the system
+    /// prompt, so until the model has written one, this is where it learns
+    /// what the ledger is and that the history goes once it exists.
     fn ledger_turn(&self) -> String {
+        if self.budget.ledger == tools::Ledger::Checks && self.ledger.is_empty() {
+            return format!(
+                "\n\n### LEDGER (none yet - write it now)\nThis loop is re-running a check after \
+                 each change, so from here on it keeps NO history: once you have written a \
+                 ledger, everything before the newest result is gone except that block. Start \
+                 your next reply with a `### LEDGER` heading line, before any call, and put \
+                 under it: the goal in one line, what you have established (copy out any fact \
+                 from earlier results you will still need - those results will be gone), what \
+                 failed and why, the exact state of files and commands (paths, what was run, \
+                 what it said), and the next step. Keep it under {} characters. It is shown \
+                 back to you under every result; rewrite it WHOLE each time, since whatever \
+                 you leave out is lost.",
+                self.cfg.ledger_chars.max(200),
+            );
+        }
         format!(
             "\n\n### LEDGER (your state, exactly as you last wrote it. Rewrite it WHOLE under a \
              `### LEDGER` heading at the top of your next reply, before any call; under {} \
@@ -6787,6 +6878,16 @@ impl<'a> ToolLoop<'a> {
             self.verify_ok = false;
         }
         let stuck = self.note_repeat(key, tracked, &r.text, on_note);
+        if self.budget.ledger == tools::Ledger::Checks && !self.ledger_on {
+            self.ledger_on = self.reruns_a_check(&c.name, key, &r);
+            if self.ledger_on {
+                on_note(&format!(
+                    "the loop is re-running a check ({}) after each change; from here on it keeps \
+                     the model's ledger instead of the whole history",
+                    c.name
+                ));
+            }
+        }
         // A persisting loop is told where it stands with every result, so
         // "the budget is nearly spent" is a fact it can read rather than a
         // count it has to keep. Outside the loop the rules already said the
@@ -6815,7 +6916,7 @@ impl<'a> ToolLoop<'a> {
         messages.push(turn);
         // in ledger mode there is never an older result to condense: the
         // step wrapper drops it whole
-        if !self.budget.ledger {
+        if !self.dropping() {
             self.results.push((messages.len() - 1, c.name.clone(), text, false));
             self.compact(messages);
         }
@@ -11215,7 +11316,7 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "max_seconds": t.max_seconds,
                 "max_agents": t.max_agents,
                 "max_agent_depth": t.max_agent_depth,
-                "ledger": t.ledger,
+                "ledger": t.ledger.json(),
                 "verify": t.verify,
                 // what a turn would really be offered, not what was typed: a
                 // duplicate or an unusable name is dropped at resolution, and
@@ -11465,7 +11566,7 @@ fn handle_tools_probe(
         "keep_results": tcfg.keep_results,
         "max_agents": tcfg.max_agents,
         "max_agent_depth": tcfg.max_agent_depth,
-        "ledger": tcfg.ledger,
+        "ledger": tcfg.ledger.json(),
         "ledger_chars": tcfg.ledger_chars,
         "verify": tcfg.verify,
         "verify_pass": tcfg.verify_pass,
@@ -12715,7 +12816,7 @@ mod tests {
         // ledger mode: the step wrapper drops old turns whole, and the newest
         // picture survives the truncation and the ledger tail
         let lc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
-            "max_calls": 32, "ledger": true, "keep_images": 2,
+            "max_calls": 32, "ledger": "always", "keep_images": 2,
             "http": [{ "name": "computer", "url": "https://h/computer" }]
         }))
         .unwrap();
@@ -12764,7 +12865,7 @@ mod tests {
     #[test]
     fn ledger_mode_rebuilds_the_conversation_from_the_ledger() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
-            "max_calls": 32, "ledger": true, "ledger_chars": 300,
+            "max_calls": 32, "ledger": "always", "ledger_chars": 300,
             "http": [{ "name": "t", "url": "https://h/x" }]
         }))
         .unwrap();
@@ -12772,7 +12873,7 @@ mod tests {
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
         let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
-        assert!(tl.budget.ledger);
+        assert_eq!(tl.budget.ledger, tools::Ledger::Always);
         let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "make it pass")];
         let call = |i: usize| {
             format!(
@@ -12817,6 +12918,178 @@ mod tests {
         assert_eq!(ledger_of("no block here\n<tool_call>{}</tool_call>"), None);
         assert_eq!(ledger_of("### LEDGER\n\n<tool_call>{}</tool_call>"), None);
         assert_eq!(ledger_of("### Ledgers\nno"), None);
+    }
+
+    /// `ledger: true` is Ledger::Checks: a loop keeps its whole history
+    /// until it re-runs a check - the same call, its third good run with
+    /// something else run before it and a different answer each time. A
+    /// guide read again, a check re-run back to back, a check polled
+    /// between waits and a machine that keeps answering 409 never switch it
+    /// on; nothing does under Off, and Always is on from the start.
+    #[test]
+    fn a_checks_ledger_switches_on_when_a_check_is_rerun() {
+        fn run(
+            tl: &mut ToolLoop,
+            msgs: &mut Vec<ChatMsg>,
+            name: &str,
+            n: u32,
+            text: &str,
+            is_error: bool,
+            on_note: &dyn Fn(&str),
+        ) {
+            let c = tools::ToolCall { name: name.into(), args: serde_json::json!({ "n": n }) };
+            let key = canonical_call(&c);
+            let r = tools::ToolResult {
+                text: text.into(), is_error, ms: 1, sources: Vec::new(), image: None, seen: None,
+            };
+            assert!(tl.take_result(&c, &key, name != "wait", r, msgs, &|_| {}, on_note));
+        }
+        let cfg = |ledger: serde_json::Value| -> tools::ToolsConfig {
+            serde_json::from_value(serde_json::json!({
+                "max_calls": 32, "ledger": ledger, "builtin": ["wait"],
+                "http": [{ "name": "t", "url": "https://h/x" }]
+            }))
+            .unwrap()
+        };
+        let tc = cfg(serde_json::json!(true));
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let persist = serde_json::json!(true);
+        let notes = std::cell::RefCell::new(Vec::<String>::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        let open = |tc| ToolLoop::open(tc, b, tc.budget(Some(&persist)), &nop, &nofmt, None);
+
+        // reading first: a guide read three times between other calls
+        // answers the same each time, so the loop stays whole
+        let mut tl = open(&tc);
+        assert_eq!(tl.budget.ledger, tools::Ledger::Checks);
+        assert!(!tl.ledger_on);
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        for i in 0..3 {
+            run(&mut tl, &mut msgs, "guide", 0, "Publishing: build a component...", false, &on_note);
+            run(&mut tl, &mut msgs, "edit", i, "written", false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        assert_eq!(tl.results.len(), 6, "every result is kept, the older ones condensed");
+        // then a test loop: run, fix, run, fix, run - the third run is the switch
+        run(&mut tl, &mut msgs, "check", 0, "3 failed", false, &on_note);
+        run(&mut tl, &mut msgs, "edit", 10, "written", false, &on_note);
+        run(&mut tl, &mut msgs, "check", 0, "2 failed", false, &on_note);
+        assert!(!tl.ledger_on, "one re-run is a re-read, not a loop");
+        run(&mut tl, &mut msgs, "edit", 11, "written", false, &on_note);
+        assert!(notes.borrow().is_empty(), "{:?}", notes.borrow());
+        run(&mut tl, &mut msgs, "check", 0, "1 failed", false, &on_note);
+        assert!(tl.ledger_on);
+        assert_eq!(notes.borrow().len(), 1);
+        assert!(notes.borrow()[0].contains("re-running a check (check)"), "{:?}", notes.borrow());
+        // nothing is dropped until the model has written a ledger
+        assert!(!tl.dropping());
+        assert_eq!(tl.results.len(), 11);
+
+        // the same check back to back: nothing changed in between
+        let mut tl = open(&tc);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        for t in ["a", "b", "c", "d"] {
+            run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        // polling: only waits in between
+        let mut tl = open(&tc);
+        for (i, t) in ["starting", "pulling", "booting", "running"].iter().enumerate() {
+            run(&mut tl, &mut msgs, "get_deployment", 0, t, false, &on_note);
+            run(&mut tl, &mut msgs, "wait", i as u32, "waited 30 seconds", false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        // a machine that is down: the failures differ, but none is a run
+        let mut tl = open(&tc);
+        run(&mut tl, &mut msgs, "run_vm_command", 0, "Linux riscv64", false, &on_note);
+        for i in 0..4 {
+            run(&mut tl, &mut msgs, "computer", i, "HTTP 409", true, &on_note);
+            let err = format!("HTTP 409: machine is not running; next retry in {}s", 60 - i);
+            run(&mut tl, &mut msgs, "run_vm_command", 0, &err, true, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        // an identical answer after a change leaves the count where it was;
+        // the next changed one still counts
+        let mut tl = open(&tc);
+        for (i, t) in ["3 failed", "3 failed", "2 failed", "1 failed"].iter().enumerate() {
+            assert!(!tl.ledger_on, "switched on before run {i}");
+            run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+            run(&mut tl, &mut msgs, "edit", i as u32, "written", false, &on_note);
+        }
+        assert!(tl.ledger_on);
+
+        // Off never switches on; Always is on before anything ran
+        for (ledger, on) in [(serde_json::json!(false), false), (serde_json::json!("always"), true)] {
+            let tc = cfg(ledger);
+            let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&persist)), &nop, &nofmt, None);
+            assert_eq!(tl.ledger_on, on);
+            for (i, t) in ["3 failed", "2 failed", "1 failed", "0 failed"].iter().enumerate() {
+                run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+                run(&mut tl, &mut msgs, "edit", i as u32, "written", false, &on_note);
+            }
+            assert_eq!(tl.ledger_on, on);
+        }
+        // and a loop that does not persist has no ledger to switch on
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        assert_eq!(tl.budget.ledger, tools::Ledger::Off);
+        for (i, t) in ["3 failed", "2 failed", "1 failed", "0 failed"].iter().enumerate() {
+            run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+            run(&mut tl, &mut msgs, "edit", i as u32, "written", false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+    }
+
+    /// Once a Checks ledger is on, the history stays until the model has
+    /// written a ledger - the result says what the ledger is, since the
+    /// system prompt never did - and from the first ledger on, every step
+    /// is the original turns, one call, one result and the ledger.
+    #[test]
+    fn a_checks_ledger_drops_the_history_only_once_it_is_written() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "ledger": true, "ledger_chars": 900,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "make it pass")];
+        let bare = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        // off: a plain loop, accumulating, no ledger in sight
+        assert!(tl.step(&bare(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bare(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 6);
+        assert!(!msgs[5].content.contains("LEDGER"), "{}", msgs[5].content);
+        assert_eq!(tl.results.len(), 2);
+        // switched on (take_result does this when a check is re-run)
+        tl.ledger_on = true;
+        // a reply without a ledger loses nothing, and is told what to write
+        assert!(tl.step(&bare(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 8, "no ledger yet, so nothing is dropped");
+        let last = &msgs[7].content;
+        assert!(last.contains("### LEDGER (none yet - write it now)"), "{last}");
+        assert!(last.contains("keeps NO history"), "{last}");
+        assert!(last.contains("under 900 characters"), "{last}");
+        assert_eq!(tl.results.len(), 3);
+        // the first ledger: the history goes, the ledger rides the result
+        let with = "### LEDGER\ngoal: tests pass\n- x fails in parse()\n- next: fix parse\n\
+                    <tool_call>{\"name\":\"nope\",\"arguments\":{\"i\":4}}</tool_call>";
+        assert!(tl.step(with, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 4, "the base plus one call and one result");
+        assert!(msgs[2].content.contains("\"i\":4"), "{}", msgs[2].content);
+        let last = &msgs[3].content;
+        assert!(last.contains("### LEDGER (your state"), "{last}");
+        assert!(last.contains("- x fails in parse()\n- next: fix parse"), "{last}");
+        assert!(!last.contains("none yet"), "{last}");
+        assert!(tl.results.is_empty(), "nothing to condense once the history is dropped");
+        // and a reply without a block keeps it, still dropping
+        assert!(tl.step(&bare(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs[3].content.contains("- next: fix parse"), "{}", msgs[3].content);
+        assert_eq!(tl.calls, 5);
     }
 
     /// The same call after the same call twice returned the same thing is
