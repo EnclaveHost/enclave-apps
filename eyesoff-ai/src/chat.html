@@ -654,13 +654,13 @@
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
   /* ------------------------------ API + attestation + CPU-mode dialogs -- */
-  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #padOverlay {
+  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #padOverlay, #sessOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
   #apiOverlay.open, #attOverlay.open, #gpuOverlay.open, #webOverlay.open,
-  #camOverlay.open, #padOverlay.open { display: flex; }
+  #camOverlay.open, #padOverlay.open, #sessOverlay.open { display: flex; }
   /* The sign-in gate is NOT a dialog: full-screen, opaque, nothing to
      dismiss - a required deployment is signed-in-or-nothing, the way the
      big chat apps gate. Sits UNDER the boot overlay (z 100), so the boot
@@ -934,6 +934,70 @@
     .pad-cell i, .pad-meter i { transition: none; }
   }
 
+  /* ---- Enclave session: a key this chat holds, approved once with the wallet
+     on enclave.host, that the model's Enclave tools act through. The chip is
+     the chat on screen's session (waiting / budget left / ended); with none,
+     the key button in the header offers one. Same chip shape as the pad bank. */
+  #sessChip {
+    display: none; align-items: center; gap: 6px; margin-left: 6px; min-width: 0;
+    padding: 5px 11px; border-radius: 999px; font-size: 12.5px;
+    background: var(--hover); color: var(--text-2); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  #sessChip.show { display: inline-flex; }
+  #sessChip:hover { background: var(--active); }
+  #sessChip svg { color: var(--accent); }
+  #sessChip.off, #sessChip.low { color: var(--warn); }
+  #sessChip.off svg, #sessChip.low svg { color: currentColor; }
+  #sessChip .spin { width: 11px; height: 11px; }
+  #sessChip.wait svg, #sessChip:not(.wait) .spin { display: none; }
+  #sessChip .lbl { overflow: hidden; text-overflow: ellipsis; }
+  /* .icon-btn's own display outranks [hidden] */
+  #sessBtn[hidden] { display: none; }
+  #sessOverlay .api-card { max-width: 480px; font-size: 14px; line-height: 1.6; }
+  #sessOverlay [hidden] { display: none !important; }
+  .sess-lead { color: var(--text-2); margin-bottom: 14px; }
+  .sess-ended {
+    margin: 0 0 12px; padding: 9px 12px; border-radius: 10px; font-size: 13px;
+    background: var(--hover); color: var(--text-2);
+  }
+  .sess-fields {
+    display: grid; grid-template-columns: auto 1fr; align-items: center;
+    gap: 12px 16px; margin: 0 0 12px;
+  }
+  .sess-k { color: var(--text-3); font-size: 13px; font-weight: 500; }
+  .sess-money { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); }
+  .sess-money .sess-note { margin-top: 0; }
+  .sess-in {
+    width: 110px; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--code-bg); color: var(--text); font: inherit;
+    font-variant-numeric: tabular-nums;
+  }
+  .sess-in:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .sess-fields .seg { margin-left: 0; justify-self: start; }
+  .sess-note { color: var(--text-3); font-size: 12.5px; margin-top: 6px; }
+  .sess-warn { color: var(--warn); font-size: 12.5px; margin-top: 8px; }
+  .sess-err { color: var(--err); font-size: 13px; margin-top: 12px; overflow-wrap: anywhere; }
+  .sess-code {
+    margin: 2px 0 10px; font: 600 22px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .14em; color: var(--text);
+  }
+  .sess-hint {
+    margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+    background: var(--hover); border: 1px solid var(--border-soft); color: var(--text-2);
+  }
+  .sess-hint a { color: var(--accent); }
+  #sessName { overflow-wrap: anywhere; }
+  a.web-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    text-decoration: none; text-align: center;
+  }
+  .web-btn:disabled { opacity: .55; cursor: default; }
+  .web-btn .spin { display: inline-block; vertical-align: -2px; margin-right: 8px; }
+  .web-btn.primary .spin { border-color: rgba(255,255,255,.35); border-top-color: #fff; }
+  .web-btn.danger { color: var(--err); border-color: var(--err-border); }
+  .web-btn.danger:hover { background: var(--err-bg); }
+
   #jump {
     position: absolute; left: 50%; transform: translateX(-50%); bottom: 128px;
     width: 34px; height: 34px; border-radius: 50%; display: none;
@@ -1074,8 +1138,12 @@
       padding: calc(16px + env(safe-area-inset-top, 0px)) 12px 8px;
     }
     header .spacer { display: none; }        /* wrapping does the pushing now */
-    #menuBtn, #cpuChip, #padChip { order: 1; }
-    #padChip { padding: 5px 9px; }
+    #menuBtn, #cpuChip, #padChip, #sessChip { order: 1; }
+    #padChip, #sessChip { padding: 5px 9px; }
+    /* the key icon and the money left: "Session" and the expiry are in the
+       chip's label and in the dialog it opens */
+    #sessChip .s-pre, #sessChip .s-tail { display: none; }
+    .sess-in { font-size: 16px; } /* prevent iOS zoom-on-focus */
     /* `auto` basis, not 100%: the model shares row 1 with the toggle and
        grows into whatever is left, rather than forcing itself onto its own
        line. min-width 0 lets it shrink instead of overflowing. */
@@ -1235,8 +1303,19 @@
       <span class="pad-cell" aria-hidden="true"><i></i></span>
       <span class="lbl"></span><span class="pad-dir" aria-hidden="true"></span>
     </button>
+    <!-- the open chat's Enclave session, when it has one (see "enclave
+         sessions" in the script) -->
+    <button id="sessChip" aria-haspopup="dialog" aria-label="Enclave session - details" title="Enclave session">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15.5" r="4.5"/><path d="M11.3 12.2L20 3.5M16.5 7l3 3M14 9.5l2.2 2.2"/></svg>
+      <span class="spin" aria-hidden="true"></span>
+      <span class="lbl"><span class="s-pre"></span><span class="s-main"></span><span class="s-tail"></span></span>
+    </button>
     <span class="spacer"></span>
     <div class="header-actions">
+    <button class="icon-btn" id="sessBtn" aria-haspopup="dialog" hidden
+            aria-label="Give this chat an Enclave session" title="Give this chat an Enclave session">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15.5" r="4.5"/><path d="M11.3 12.2L20 3.5M16.5 7l3 3M14 9.5l2.2 2.2"/></svg>
+    </button>
     <button class="icon-btn" id="attBtn" aria-label="Enclave attestation" title="Enclave attestation">
       <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.6-3 8.2-7 10-4-1.8-7-5.4-7-10V6z"/><path d="M9.2 12l2 2 3.6-4.2"/></svg>
     </button>
@@ -1404,6 +1483,93 @@
       So the enclave mints them ahead of time while it is idle and keeps them sealed on the
       host's disk, under keys only it holds. A prompt then reads its pads instead of waiting
       for them; on an empty bank, a long prompt prefills more slowly.</p>
+    </div>
+  </div>
+
+  <!-- One dialog, four faces, for the chat it was opened on: give it a session
+       (none, or after one ended), wait for the wallet on enclave.host, the
+       live session, and the question a delete asks of a chat holding one. -->
+  <div id="sessOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="sessTitle">
+      <div class="api-head">
+        <h2 id="sessTitle">Enclave session</h2>
+        <button class="icon-btn" id="sessClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+
+      <form id="sessNew" novalidate>
+        <p class="sess-ended" id="sessEnded" role="status" hidden></p>
+        <p class="sess-lead">This chat can deploy, fund, stop and resume your apps without asking
+        your wallet each time, spending at most this budget. You approve it once on enclave.host.</p>
+        <div class="sess-fields">
+          <label class="sess-k" for="sessBudget">Budget</label>
+          <span class="sess-money"><span aria-hidden="true">$</span><input id="sessBudget" class="sess-in"
+            type="number" min="0" max="250" step="1" value="5" inputmode="decimal"
+            aria-describedby="sessBudgetNote"><span class="sess-note" id="sessBudgetNote">USDC, up to 250</span></span>
+          <span class="sess-k" id="sessDurLbl">Lasts</span>
+          <div class="seg" id="sessDur" role="radiogroup" aria-labelledby="sessDurLbl">
+            <button type="button" role="radio" data-h="1">1 hour</button>
+            <button type="button" role="radio" data-h="24">24 hours</button>
+            <button type="button" role="radio" data-h="168">7 days</button>
+          </div>
+        </div>
+        <p class="sess-note" id="sessZero" hidden>Changing an app costs a small network fee, paid from
+        this budget, so with $0 the chat can look at your apps but not act on them.</p>
+        <p class="sess-note">It can't transfer apps or change what a production app runs. What it
+        doesn't spend goes back to your vault when the session ends.</p>
+        <p class="sess-warn" id="sessMemWarn" hidden>This chat isn't remembered on this device, so the
+        session key lives only in this tab. End the session before you close it, or later at
+        enclave.host &rarr; Sessions.</p>
+        <div class="web-actions">
+          <button type="submit" class="web-btn primary" id="sessGo">Approve on enclave.host</button>
+          <button type="button" class="web-btn" data-sess-close>Not now</button>
+        </div>
+      </form>
+
+      <div id="sessWait" hidden>
+        <div class="att-status wait" role="status"><span class="spin" id="sessWaitSpin"></span><span id="sessWaitMsg"></span></div>
+        <p class="sess-k">Check code</p>
+        <p class="sess-code" id="sessCode"></p>
+        <p class="sess-lead">enclave.host shows the same code. Approve there only if it matches.</p>
+        <div class="web-actions">
+          <a class="web-btn" id="sessOpen" href="https://enclave.host/" target="_blank" rel="noopener noreferrer">Open enclave.host</a>
+          <button type="button" class="web-btn" id="sessRecheck" hidden>Check again</button>
+          <button type="button" class="web-btn" id="sessCancel">Cancel</button>
+        </div>
+      </div>
+
+      <div id="sessLive" hidden>
+        <p class="sess-ended" id="sessLiveNote" role="status" hidden></p>
+        <div class="pad-top"><b id="sessBal">&#8211;</b><span>left to spend</span></div>
+        <dl class="pad-facts">
+          <dt>Until</dt><dd id="sessUntil">&#8211;</dd>
+          <dt>Spent</dt><dd id="sessSpent">&#8211;</dd>
+          <dt>Name</dt><dd id="sessName">&#8211;</dd>
+        </dl>
+        <p class="sess-hint" id="sessDeleg" hidden>To let chat sessions manage apps your wallet already
+        owns, grant it once at <a href="https://enclave.host/sessions" target="_blank"
+        rel="noopener noreferrer">enclave.host &rarr; Sessions</a>.</p>
+        <p class="sess-note">The model's Enclave tools in this chat act through this session, without
+        wallet prompts. It can't transfer apps or change what a production app runs. Ending it
+        returns what's left to your vault; running apps keep running. Topping up and withdrawing
+        stay on enclave.host.</p>
+        <div class="web-actions">
+          <button type="button" class="web-btn danger" id="sessEndBtn">End session</button>
+          <button type="button" class="web-btn" data-sess-close>Close</button>
+        </div>
+      </div>
+
+      <div id="sessDel" hidden>
+        <p class="sess-lead" id="sessDelMsg"></p>
+        <div class="web-actions">
+          <button type="button" class="web-btn primary" id="sessDelEnd">End session and delete</button>
+          <button type="button" class="web-btn" id="sessDelKeep">Delete, keep session</button>
+          <button type="button" class="web-btn" data-sess-close>Cancel</button>
+        </div>
+      </div>
+
+      <p class="sess-err" id="sessErr" role="alert" hidden></p>
     </div>
   </div>
 
@@ -2509,7 +2675,9 @@ renderStoreToggle();
 function persist(chat) {
   if (!db || !storeOK) return;
   try {
-    if (!chat.messages.length && !chat.error) {
+    // a chat given an Enclave session before its first message is not a
+    // blank: the record is the only copy of the session's key
+    if (!chat.messages.length && !chat.error && !sessKeeps(chat.session)) {
       // emptied out (e.g. stop-before-first-token popped the question):
       // drop any stale record rather than saving a blank
       db.transaction("chats", "readwrite").objectStore("chats").delete(chat.id);
@@ -2517,7 +2685,7 @@ function persist(chat) {
     }
     db.transaction("chats", "readwrite").objectStore("chats").put({
       id: chat.id, title: chat.title, messages: chat.messages,
-      error: chat.error, t: Date.now(),
+      error: chat.error, session: chat.session || null, t: Date.now(),
     });
   } catch (_) {}
 }
@@ -2697,10 +2865,15 @@ function switchChat(id, fromHistory) {
   if (!fromHistory) setUrlChat(id, true);
   pinned = true;
   renderSidebar(); renderChat(); updateComposer();
+  sessRefresh(current());   // its session's balance, at most 30 s old
 }
 
-function deleteChat(id) {
+// `confirmed` skips the question a chat holding a live Enclave session asks
+// first: deleting the chat deletes the only copy of that session's key.
+function deleteChat(id, confirmed) {
   const gone = state.chats.find((c) => c.id === id);
+  if (!confirmed && gone && sessState(gone.session) === "live") { sessOpen(gone, "del"); return; }
+  if (gone) sessForget(gone);
   if (busy(gone)) stopGeneration(gone);
   unpersist(id);
   state.chats = state.chats.filter((c) => c.id !== id);
@@ -3296,6 +3469,7 @@ function renderChat() {
     updateStreamDOM(chat);
   }
   scrollBottom(); // callers that mean "jump to the bottom" set pinned first
+  renderSess();   // the header's session chip belongs to the chat on screen
 }
 
 function updateStreamDOM(chat) {
@@ -3898,6 +4072,7 @@ window.addEventListener("keydown", (e) => {
     if (webOverlay.classList.contains("open")) { answerWeb(false); return; }
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (padOverlay.classList.contains("open")) { closePad(); return; }
+    if (sessOverlay.classList.contains("open")) { sessClose(); return; }
     if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
     if (busy(current())) stopGeneration(current());
     closeModelMenu();
@@ -4149,7 +4324,10 @@ async function run(chat) {
     const payload = buildPayload(chat);
     const res = await fetch("chat", {
       method: "POST",
-      headers: { "content-type": "application/json", ...ssoHeaders() },
+      // the chat's Enclave session key rides along only here, to this app's
+      // own origin, only while the session is live (sessHeaders), and only
+      // signed in - the enclave takes a session from no one else
+      headers: { "content-type": "application/json", ...ssoHeaders(), ...(ssoToken ? sessHeaders(chat) : {}) },
       body: JSON.stringify({
         messages: payload, target: state.target, model: state.model || undefined,
         enable_thinking: state.think ? undefined : false, // undefined keys are dropped
@@ -4372,6 +4550,9 @@ async function run(chat) {
   renderSidebar(); updateComposer();
   if (chat.id === state.currentId) { renderChat(); input.focus(); }
   nameChat(chat);
+  // what the answer spent: a fresh reading when it called tools, which is
+  // when a session pays for anything
+  sessRefresh(chat, !!(toolCalls && toolCalls.length));
 }
 
 // ---- the sidebar entry's name. The first message truncated at 64 characters
@@ -5017,6 +5198,7 @@ function renderSsoUI() {
     link.textContent = "Sign in";
     link.title = "Sign in with your Enclave account";
   }
+  renderSess();   // a session is only offered to someone signed in
 }
 $("ssoLink").addEventListener("click", (e) => {
   e.preventDefault();
@@ -5149,6 +5331,656 @@ document.addEventListener("visibilitychange", () => {
   padPoll();
 });
 padPoll();
+
+// ------------------------------------------------------- enclave sessions --
+// A chat can hold its own Enclave session: a P-256 key made in this browser,
+// approved ONCE by the owner's wallet on enclave.host, with a USDC budget and
+// an expiry. From then on that chat's requests carry the key, and the model's
+// Enclave tools (deploy, fund, stop/resume, resize, refund...) sign their calls
+// with it inside the enclave instead of asking for the wallet. This page has
+// no wallet code and gets none: the one wallet step happens on enclave.host.
+//
+// All of it goes through the Enclave MCP server (permissive CORS, stateless
+// JSON-RPC): session_request {publicKey} answers with a link to enclave.host's
+// grant page and a check code; the owner approves there; session_status
+// {publicKey} finds the session once it is open, and session_status {owner}
+// says whether it is live and what it has left. session_end hands out a digest
+// for the key to sign, and the session ends itself, sending what it did not
+// spend back to the owner's vault. Running apps are not touched by any of it.
+//
+// Where the PRIVATE key goes, exhaustively: the chat's record (IndexedDB, only
+// with "Remember on this device" on - otherwise this tab's memory, exactly as
+// long as the chat itself lives), and the x-enclave-session header of that
+// chat's POST to this app's own /chat. The MCP server only ever sees the public
+// point and the end signature. The service worker lets every POST through
+// untouched, so the header is neither cached nor seen there.
+//
+// The session's label is NOT the chat's title: it is recorded publicly on Base
+// with the session, and a title is the user's own words. It names the app and
+// the moment instead, which is enough to tell sessions apart on enclave.host.
+//
+// Everything from here to "session UI" is pure, and tests/session.test.mjs runs
+// it under node's WebCrypto.
+const MCP_URL = "https://mcp.enclave.host";
+const SESS_POLL_MS = 3000, SESS_WAIT_MS = 30 * 60 * 1000, SESS_CACHE_MS = 30000;
+
+// base64url without padding (a JWK's own encoding, and the header's)
+function sessB64u(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function sessUnb64u(str) {
+  const s = String(str).replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(s + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
+}
+const sessHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+function sessUnhex(h) {
+  const s = String(h).replace(/^0x/i, "");
+  if (!/^(?:[0-9a-f]{2})*$/i.test(s)) throw new Error("not a hex string");
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(2 * i, 2 * i + 2), 16);
+  return out;
+}
+// the public point the way the MCP tools take it: 0x-hex, which their parser
+// cannot mistake for one of the other encodings it accepts
+const sessPub = (k) => ({ x: "0x" + sessHex(sessUnb64u(k.x)), y: "0x" + sessHex(sessUnb64u(k.y)) });
+
+// A stored session (chat.session) is one of
+//   {v:1, state:"wait", x, y, d, keyHash, checkCode, link, owner, vault, sid, budget, label, at}
+//   {v:1, state:"live", ...the same, plus expiresAt (ms), balance, spent, deleg}
+//   {v:1, state:"ended", why, refunded, vault, sid, label}   - no key left in it
+// and a live one past its expiry has ended, whatever the last reading said.
+function sessState(s, now) {
+  if (!s) return "none";
+  if (s.state === "live" && !(typeof s.expiresAt === "number" && s.expiresAt > (now ?? Date.now()))) return "ended";
+  return s.state === "wait" || s.state === "live" || s.state === "ended" ? s.state : "none";
+}
+// a session whose chat record must be kept even with no messages in it
+function sessKeeps(s) { return !!s && (s.state === "wait" || s.state === "live"); }
+// approved, inside its lifetime (with a few seconds' slack, so a request does
+// not leave with a key that expires on the way), and still holding the key
+function sessUsable(s, now) {
+  return !!(s && s.state === "live" && s.vault && s.sid && s.x && s.y && s.d &&
+            sessState(s, (now ?? Date.now()) + 5000) === "live");
+}
+function sessHeaderValue(s) {
+  const json = JSON.stringify({ v: 1, vault: s.vault, sid: s.sid, x: s.x, y: s.y, d: s.d });
+  return sessB64u(new TextEncoder().encode(json));
+}
+// The ONE place the key leaves this page. run() spreads it into the headers of
+// its POST to "chat" - base-relative, so it can only reach this app's origin.
+function sessHeaders(chat, now) {
+  const s = chat && chat.session;
+  return sessUsable(s, now) ? { "x-enclave-session": sessHeaderValue(s) } : {};
+}
+
+// A tools/call answer: the tool's object (structuredContent, or the same as
+// JSON text), or an Error in the tool's own words. Streamable HTTP may answer
+// as an event stream, in which case the last JSON-RPC message is the answer.
+function mcpResult(text, status) {
+  let msg = null;
+  try { msg = JSON.parse(text); } catch (_) {
+    for (const line of String(text || "").split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      try { const m = JSON.parse(line.slice(5)); if (m && (m.result || m.error)) msg = m; } catch (_) {}
+    }
+  }
+  if (!msg || typeof msg !== "object")
+    throw new Error("Enclave did not answer" + (status ? " (HTTP " + status + ")" : ""));
+  if (msg.error) throw new Error(msg.error.message || "Enclave refused the request");
+  const r = msg.result || {};
+  const c = Array.isArray(r.content) ? r.content[0] : null;
+  const txt = c && typeof c.text === "string" ? c.text : "";
+  if (r.isError) throw new Error(txt.replace(/^Error:\s*/, "") || "Enclave refused the request");
+  if (r.structuredContent && typeof r.structuredContent === "object") return r.structuredContent;
+  try { const o = JSON.parse(txt); if (o && typeof o === "object") return o; } catch (_) {}
+  throw new Error("Enclave sent an answer this page cannot read");
+}
+let mcpSeq = 0;
+async function mcpCall(name, args, timeoutMs) {
+  const res = await fetch(MCP_URL, {
+    method: "POST", credentials: "omit", referrerPolicy: "no-referrer", cache: "no-store",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpSeq, method: "tools/call", params: { name, arguments: args } }),
+    signal: AbortSignal.timeout(timeoutMs || 20000),
+  });
+  return mcpResult(await res.text(), res.status);
+}
+
+function sessLabel(when) {
+  return ("eyesoff · chat of " + (when || new Date()).toLocaleString(undefined,
+    { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })).slice(0, 60);
+}
+function sessRequestArgs(pub, label, budgetUsd, hours, sub) {
+  const a = { publicKey: pub, label: String(label).slice(0, 60), preset: "agent",
+              budgetUsd, expiresInHours: hours };
+  // the signed-in wallet, when the account IS one: then only it can approve.
+  // A passkey account (acct_...) has no address to name; the grant page asks.
+  if (/^0x[0-9a-fA-F]{40}$/.test(sub || "")) a.owner = sub;
+  return a;
+}
+// the budget field: dollars and cents, 0 to 250 (the vaults' beta cap)
+function sessBudget(v) {
+  const s = String(v ?? "").trim();
+  if (!/^(\d{1,3}(\.\d{0,2})?|\.\d{1,2})$/.test(s)) return null;
+  const n = Number(s);
+  return n >= 0 && n <= 250 ? n : null;
+}
+// the approval link opens in a new tab, so it must be what it says it is
+function sessLink(u) {
+  try {
+    const url = new URL(String(u));
+    if (url.protocol === "https:" && (url.hostname === "enclave.host" || url.hostname.endsWith(".enclave.host")))
+      return url.href;
+  } catch (_) {}
+  return null;
+}
+// "$3.00", "$4.80 to the owner's vault" or a number -> 3, 4.8; anything else null
+function sessMoney(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  const m = /^\s*\$?\s*(\d+(?:\.\d+)?)/.exec(String(v ?? ""));
+  return m ? Number(m[1]) : null;
+}
+const sessUsd = (n) => "$" + n.toFixed(2);
+function sessUntil(ms, now) {
+  const d = new Date(ms);
+  const t = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date(now ?? Date.now()).toDateString()
+    ? t : d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + ", " + t;
+}
+function sessIn(ms, now) {
+  const m = (ms - (now ?? Date.now())) / 60000;
+  if (m < 1) return "less than a minute";
+  if (m < 90) return Math.round(m) + " min";
+  if (m < 48 * 60) return Math.round(m / 60) + " h";
+  return Math.round(m / 1440) + " days";
+}
+// Fold an owner's status (session_status {owner}) into a session: money,
+// expiry, name, delegation. Answers what the status says it IS: "live",
+// "revoked" (signed out), "ended" (the chain says not live), or null when it
+// does not say - not listed yet, or the relay could not read the chain, which
+// it reports as live: null.
+function sessApply(s, d) {
+  if (d && d.delegation && d.delegation.supported) s.deleg = d.delegation.granted === true;
+  const sid = String(s.sid || "").toLowerCase();
+  const row = sid && d && Array.isArray(d.sessions)
+    ? d.sessions.find((r) => r && String(r.sid).toLowerCase() === sid) : null;
+  if (!row) return null;
+  const bal = sessMoney(row.balance), spent = sessMoney(row.spent), exp = Date.parse(row.expiresAt || "");
+  if (bal !== null) s.balance = bal;
+  if (spent !== null) s.spent = spent;
+  if (Number.isFinite(exp)) s.expiresAt = exp;
+  if (typeof row.label === "string" && row.label) s.label = row.label;
+  if (row.revoked === true) return "revoked";
+  return row.live === true ? "live" : row.live === false ? "ended" : null;
+}
+// what is kept of a session that is over: enough to say so, nothing to sign with
+function sessEndedRecord(s, why, refunded) {
+  return { v: 1, state: "ended", why: why || "ended", refunded: sessMoney(refunded),
+           vault: (s && s.vault) || null, sid: (s && s.sid) || null, label: (s && s.label) || null };
+}
+async function sessNewKey() {
+  const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const j = await crypto.subtle.exportKey("jwk", kp.privateKey);
+  return { x: j.x, y: j.y, d: j.d };
+}
+// A digest from session_end, signed the way the vault checks it: P-256 over
+// SHA-256 of the 32 digest bytes. WebCrypto's ECDSA output is already the
+// 64-byte r||s the vault's precompile takes; no low-s rule applies to P-256.
+async function sessSign(s, digestHex) {
+  const bytes = sessUnhex(digestHex);
+  if (bytes.length !== 32) throw new Error("the digest to sign is not 32 bytes");
+  const key = await crypto.subtle.importKey("jwk", { kty: "EC", crv: "P-256", x: s.x, y: s.y, d: s.d, ext: true },
+    { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, bytes));
+  if (sig.length !== 64) throw new Error("unexpected signature length " + sig.length);
+  return "0x" + sessHex(sig);
+}
+
+// ---- session UI ---------------------------------------------------------------
+const sessChip = $("sessChip"), sessBtn = $("sessBtn"), sessOverlay = $("sessOverlay");
+// per chat and never stored: its approval poll, whether this page got
+// enclave.host opened for it, and whether the poll ran out of time
+const sessT = new Map();
+function sessTmp(id) {
+  let t = sessT.get(id);
+  if (!t) sessT.set(id, (t = { timer: 0, opened: false, timedOut: false, inflight: false }));
+  return t;
+}
+// owner -> the last session_status {owner} for 30 s: chats of one owner, and a
+// chip refreshed after every answer, share one reading
+const sessCache = new Map();
+// the dialog: which chat it is about, which face, which chat it is busy for
+const sessUi = { chat: null, mode: "", busy: null, err: "", note: "" };
+const SESS_HOURS = [1, 24, 168];
+let sessHours = 24, sessExpTimer = 0;
+const chatById = (id) => state.chats.find((c) => c.id === id) || null;
+// offered to someone signed in, on a deployment with sign-in: the session is
+// that account's, and enclave.host asks the same wallet to approve it
+const sessOffered = () => !!(state.auth.enabled && ssoToken);
+
+function sessOwnerStatus(owner, fresh) {
+  const k = String(owner).toLowerCase();
+  const c = sessCache.get(k);
+  if (!fresh && c && Date.now() - c.at < SESS_CACHE_MS) return c.p;
+  const p = mcpCall("session_status", { owner });
+  sessCache.set(k, { at: Date.now(), p });
+  p.catch(() => { if (sessCache.get(k) && sessCache.get(k).p === p) sessCache.delete(k); });
+  return p;
+}
+function sessSaved(chat) {
+  if (state.chats.includes(chat)) persist(chat);   // a chat deleted meanwhile stays deleted
+  renderSess();
+  renderSessDialog();
+}
+function sessStopPoll(id) {
+  const t = sessT.get(id);
+  if (t) { clearTimeout(t.timer); t.timer = 0; }
+}
+function sessMarkEnded(chat, why, refunded) {
+  sessStopPoll(chat.id);
+  chat.session = sessEndedRecord(chat.session, why, refunded);
+  sessSaved(chat);
+}
+const sessWhy = (s) => (sessState(s) === "ended" && s.state === "live" ? "expired" : "ended");
+
+// the balance and the liveness, read on opening the chat and after each answer
+async function sessRefresh(chat, fresh) {
+  const s = chat && chat.session;
+  if (!s || s.state !== "live") return;
+  if (sessState(s) === "ended") { sessMarkEnded(chat, "expired"); return; }
+  if (!s.owner) return;
+  let d;
+  try { d = await sessOwnerStatus(s.owner, fresh); } catch (_) { return; }   // offline: the last reading stands
+  if (chat.session !== s || !state.chats.includes(chat)) return;
+  const st = sessApply(s, d);
+  if (st === "ended" || st === "revoked") sessMarkEnded(chat, sessWhy(s));
+  else sessSaved(chat);
+}
+
+// One look for the approval. By key first - the only handle a passkey account
+// has before the session exists - then the owner's status, for the money and
+// for whether the chain already calls it live.
+async function sessCheck(chat, s) {
+  const r = await mcpCall("session_status", { publicKey: sessPub(s) });
+  if (chat.session !== s || s.state !== "wait") return false;
+  const hits = (Array.isArray(r.sessions) ? r.sessions : []).filter((x) => x && x.sid && x.vault);
+  const want = String(s.sid || "").toLowerCase();
+  const hit = hits.find((x) => want && String(x.sid).toLowerCase() === want) || hits.find((x) => !x.ended) || hits[0];
+  if (!hit) return false;
+  const next = { ...s, state: "live", sid: hit.sid, vault: hit.vault, owner: hit.owner || s.owner, link: null };
+  if (typeof hit.expiresAt === "number") next.expiresAt = hit.expiresAt * 1000;
+  if (hit.ended) {                    // opened, and ended before this tab saw it
+    chat.session = next;
+    sessMarkEnded(chat, "ended");
+    return false;
+  }
+  if (!next.owner) return false;
+  const d = await sessOwnerStatus(next.owner, true);
+  if (chat.session !== s || s.state !== "wait") return false;
+  const st = sessApply(next, d);
+  if (st === "revoked") { chat.session = next; sessMarkEnded(chat, "ended"); return false; }
+  // anything short of live is the chain catching up with the relay: next tick.
+  // So is a live reading without an expiry, which would read as already over.
+  if (st !== "live" || sessState(next) !== "live") return false;
+  sessStopPoll(chat.id);
+  chat.session = next;
+  sessSaved(chat);
+  return true;
+}
+// Watch for the approval every 3 s for 30 minutes; after that the dialog offers
+// to look again (the grant link itself stays good for a day).
+function sessPoll(chat) {
+  const s = chat.session;
+  if (!s || s.state !== "wait") return;
+  const t = sessTmp(chat.id);
+  clearTimeout(t.timer);
+  t.timer = 0;
+  const tick = async () => {
+    t.timer = 0;
+    if (chat.session !== s || s.state !== "wait" || !state.chats.includes(chat)) return;
+    if (Date.now() - s.at > SESS_WAIT_MS) { t.timedOut = true; renderSessDialog(); return; }
+    t.timedOut = false;
+    if (!t.inflight) {
+      t.inflight = true;
+      try { await sessCheck(chat, s); } catch (_) {}
+      t.inflight = false;
+    }
+    if (chat.session === s && s.state === "wait" && !t.timer) t.timer = setTimeout(tick, SESS_POLL_MS);
+  };
+  tick();
+}
+
+async function sessGrant(chat) {
+  const budget = sessBudget($("sessBudget").value);
+  if (budget === null) {
+    sessUi.err = "The budget is a dollar amount from 0 to 250.";
+    renderSessDialog();
+    $("sessBudget").focus();
+    return;
+  }
+  if (!sessOffered()) { ssoStart(); return; }      // signed out since the dialog opened
+  if (sessKeeps(chat.session)) return;
+  const hours = sessHours;
+  // The tab opens NOW, inside the click, so no popup blocker stands between the
+  // approval and the wallet; it gets its address once the request is made. It
+  // is cut loose from this page first (no opener), so enclave.host gets no
+  // handle on the chat - which also means this page cannot close it later. The
+  // mobile shell instead hands enclave.host to the browser, as sign-in does.
+  let win = null;
+  if (!IN_SHELL) {
+    try { win = window.open("", "_blank"); } catch (_) {}
+    if (win) try {
+      win.opener = null;
+      win.document.title = "enclave.host";
+      win.document.body.textContent = "Opening enclave.host…";
+    } catch (_) {}
+  }
+  sessUi.busy = chat.id;
+  sessUi.err = "";
+  sessUi.note = "";
+  renderSessDialog();
+  try {
+    const k = await sessNewKey();
+    const label = sessLabel();
+    const sub = ssoAddress();
+    const r = await mcpCall("session_request", sessRequestArgs(sessPub(k), label, budget, hours, sub));
+    const link = sessLink(r && r.link);
+    if (!link) throw new Error("the approval link is not an enclave.host address");
+    if (!state.chats.includes(chat) || sessKeeps(chat.session)) throw new Error("this chat changed meanwhile");
+    chat.session = { v: 1, state: "wait", x: k.x, y: k.y, d: k.d, keyHash: r.keyHash || null,
+      checkCode: String(r.checkCode || ""), link, owner: /^0x[0-9a-fA-F]{40}$/.test(sub || "") ? sub : null,
+      vault: r.vault || null, sid: r.sid || null, budget, label, at: Date.now() };
+    const t = sessTmp(chat.id);
+    t.opened = false; t.timedOut = false;
+    if (IN_SHELL) { location.href = link; t.opened = true; }
+    else if (win && !win.closed) {
+      try { win.location.replace(link); t.opened = true; } catch (_) {}
+    }
+    sessUi.busy = null;
+    sessSaved(chat);
+    sessPoll(chat);
+  } catch (e) {
+    if (win) try { win.close(); } catch (_) {}
+    sessUi.busy = null;
+    sessUi.err = "Couldn't start the session: " + ((e && e.message) || String(e));
+    renderSessDialog();
+  }
+}
+
+async function sessCancel(chat) {
+  const s = chat.session;
+  if (!s || s.state !== "wait" || sessUi.busy) return;
+  sessUi.busy = chat.id;
+  sessUi.err = "";
+  renderSessDialog();
+  sessStopPoll(chat.id);
+  // one last look: an approval that landed while Cancel was being pressed must
+  // not be thrown away along with the only copy of its key
+  let approved = false;
+  try { approved = await sessCheck(chat, s); } catch (_) {}
+  sessUi.busy = null;
+  if (approved) {
+    sessUi.note = "It was approved just now, so it is active. End it here if you don't want it.";
+    renderSessDialog();
+    return;
+  }
+  if (chat.session !== s) { renderSessDialog(); return; }
+  // the tab is not this page's to close (see sessGrant), so say what to do with it
+  const t = sessT.get(chat.id);
+  sessUi.note = t && t.opened
+    ? "Request cancelled. If enclave.host is still open, close it there without approving." : "";
+  chat.session = null;
+  sessSaved(chat);
+  $("sessClose").focus();   // the button that was pressed is gone with its face
+}
+
+// End: ask for the digest, sign it here, send the signature. Answers whether
+// the session is over now (including "it already was").
+async function sessEndNow(chat) {
+  const s = chat.session;
+  if (sessState(s) !== "live" || sessUi.busy) return false;
+  sessUi.busy = chat.id;
+  sessUi.err = "";
+  renderSessDialog();
+  try {
+    const a = await mcpCall("session_end", { vault: s.vault, sid: s.sid });
+    const signature = await sessSign(s, a.digest);
+    const b = await mcpCall("session_end", { vault: s.vault, sid: s.sid, publicKey: sessPub(s),
+                                             deadline: String(a.deadline), signature }, 60000);
+    if (s.owner) sessCache.delete(String(s.owner).toLowerCase());
+    sessUi.busy = null;
+    if (chat.session === s) sessMarkEnded(chat, "you", b && b.refunded);
+    return true;
+  } catch (e) {
+    // already over (expired, or ended on enclave.host)? then nothing is left to end
+    let st = null;
+    try { if (s.owner) st = sessApply(s, await sessOwnerStatus(s.owner, true)); } catch (_) {}
+    sessUi.busy = null;
+    if (st === "ended" || st === "revoked") {
+      if (chat.session === s) sessMarkEnded(chat, sessWhy(s));
+      return true;
+    }
+    sessUi.err = "Couldn't end the session: " + ((e && e.message) || String(e));
+    renderSessDialog();
+    return false;
+  }
+}
+
+// a chat going away: its approval poll stops, and the dialog about it closes
+function sessForget(chat) {
+  sessStopPoll(chat.id);
+  sessT.delete(chat.id);
+  if (sessUi.chat === chat.id) {
+    sessOverlay.classList.remove("open");
+    sessUi.chat = null; sessUi.mode = ""; sessUi.err = ""; sessUi.note = "";
+  }
+}
+
+// the header: the chip for the chat on screen's session, or the key button
+// that offers one
+function renderSess() {
+  clearTimeout(sessExpTimer);
+  const chat = current();
+  const s = chat && chat.session;
+  const st = sessState(s);
+  if (st === "ended" && s.state === "live") { sessMarkEnded(chat, "expired"); return; }   // re-renders
+  sessBtn.hidden = !(st === "none" && sessOffered());
+  if (st === "none") { sessChip.className = ""; return; }
+  let pre = "Session · ", main, tail = "", cls = "show", say;
+  if (st === "wait") {
+    main = "waiting"; tail = " for approval"; cls += " wait";
+    say = "Enclave session waiting for your approval on enclave.host";
+  } else if (st === "live") {
+    main = typeof s.balance === "number" ? sessUsd(s.balance) + " left" : "active";
+    tail = " · until " + sessUntil(s.expiresAt);
+    if (s.balance === 0) cls += " low";
+    say = "Enclave session: " + main + ", until " + sessUntil(s.expiresAt);
+    const left = s.expiresAt - Date.now();
+    if (left < 2147483000) sessExpTimer = setTimeout(renderSess, left + 500);
+  } else {
+    pre = "Session "; main = "ended"; cls += " off";
+    say = "This chat's Enclave session has ended";
+  }
+  sessChip.className = cls;
+  sessChip.querySelector(".s-pre").textContent = pre;
+  sessChip.querySelector(".s-main").textContent = main;
+  sessChip.querySelector(".s-tail").textContent = tail;
+  sessChip.title = say;
+  sessChip.setAttribute("aria-label", say + " - details");
+}
+
+function sessEndedText(s) {
+  if (s.why === "you")
+    return "Session ended. " + (typeof s.refunded === "number"
+      ? sessUsd(s.refunded) + " went back to your vault." : "What it didn't spend went back to your vault.");
+  return s.why === "expired"
+    ? "This chat's session has expired. You can give it a new one."
+    : "This chat's session was ended (on enclave.host or in another tab). You can give it a new one.";
+}
+const spinLabel = (el, busy, idle, working) => {
+  el.disabled = busy;
+  if (busy) { el.innerHTML = '<span class="spin"></span>'; el.appendChild(document.createTextNode(working)); }
+  else el.textContent = idle;
+};
+
+function renderSessDialog() {
+  if (!sessOverlay.classList.contains("open")) return;
+  const chat = chatById(sessUi.chat);
+  if (!chat) { sessClose(); return; }
+  const s = chat.session, st = sessState(s), busy = sessUi.busy === chat.id;
+  const face = sessUi.mode === "del" ? "del" : st === "live" ? "live" : st === "wait" ? "wait" : "new";
+  $("sessNew").hidden = face !== "new";
+  $("sessWait").hidden = face !== "wait";
+  $("sessLive").hidden = face !== "live";
+  $("sessDel").hidden = face !== "del";
+  $("sessTitle").textContent = face === "new" ? "Give this chat an Enclave session"
+    : face === "wait" ? "Approve on enclave.host" : face === "del" ? "Delete this chat?" : "Enclave session";
+  const err = $("sessErr");
+  err.textContent = sessUi.err;
+  err.hidden = !sessUi.err;
+  if (face === "new") {
+    const ended = $("sessEnded"), msg = st === "ended" ? sessEndedText(s) : sessUi.note;
+    ended.textContent = msg;
+    ended.hidden = !msg;
+    $("sessMemWarn").hidden = storeOK;
+    for (const b of $("sessDur").querySelectorAll("button")) {
+      const on = +b.dataset.h === sessHours;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", String(on));
+      b.tabIndex = on ? 0 : -1;
+      b.disabled = busy;
+    }
+    $("sessBudget").disabled = busy;
+    $("sessZero").hidden = sessBudget($("sessBudget").value) !== 0;
+    spinLabel($("sessGo"), busy, "Approve on enclave.host", "Preparing…");
+  } else if (face === "wait") {
+    const t = sessT.get(chat.id) || {};
+    $("sessWaitSpin").hidden = !!t.timedOut;
+    $("sessWaitMsg").textContent = t.timedOut ? "No approval seen in 30 minutes."
+      : "Waiting for your approval on enclave.host…";
+    $("sessCode").textContent = s.checkCode || "–";
+    const open = $("sessOpen");
+    if (s.link) open.href = s.link;
+    // the main way there when no tab could be opened for it
+    open.classList.toggle("primary", !t.opened);
+    $("sessRecheck").hidden = !t.timedOut;
+    spinLabel($("sessCancel"), busy, "Cancel", "Checking…");
+  } else if (face === "live") {
+    const note = $("sessLiveNote");
+    note.textContent = sessUi.note;
+    note.hidden = !sessUi.note;
+    $("sessBal").textContent = typeof s.balance === "number" ? sessUsd(s.balance) : "–";
+    $("sessUntil").textContent = sessUntil(s.expiresAt) + " (in " + sessIn(s.expiresAt) + ")";
+    $("sessSpent").textContent = typeof s.spent === "number" ? sessUsd(s.spent) : "–";
+    $("sessName").textContent = s.label || "–";
+    $("sessDeleg").hidden = s.deleg !== false;
+    spinLabel($("sessEndBtn"), busy, "End session", "Ending…");
+  } else {
+    const live = st === "live";
+    $("sessDelMsg").textContent = live
+      ? "This chat has an Enclave session" + (typeof s.balance === "number" ? " with " + sessUsd(s.balance) + " left" : "")
+        + ". End it first? What it hasn't spent goes back to your vault, and running apps keep running. "
+        + "If you keep it, it stays open until " + sessUntil(s.expiresAt)
+        + " and only enclave.host → Sessions can end it."
+      : "This chat will be deleted from this browser.";
+    $("sessDelEnd").hidden = !live;
+    spinLabel($("sessDelEnd"), busy, "End session and delete", "Ending…");
+    $("sessDelKeep").textContent = live ? "Delete, keep session" : "Delete";
+    $("sessDelKeep").disabled = busy;
+  }
+}
+
+function sessOpen(chat, mode) {
+  if (!chat) return;
+  sessUi.chat = chat.id;
+  sessUi.mode = mode || "";
+  sessUi.err = "";
+  sessUi.note = "";
+  sessOverlay.classList.add("open");
+  renderSessDialog();
+  $("sessClose").focus();
+  if (sessState(chat.session) === "live") sessRefresh(chat);
+}
+function sessClose() {
+  const chat = chatById(sessUi.chat);
+  const wasDel = sessUi.mode === "del";
+  sessOverlay.classList.remove("open");
+  sessUi.chat = null; sessUi.mode = ""; sessUi.err = ""; sessUi.note = "";
+  // an ended session has been seen now: the chat goes back to having none
+  if (chat && !wasDel && chat.session && chat.session.state === "ended") {
+    chat.session = null;
+    persist(chat);
+  }
+  renderSess();
+  const back = sessChip.classList.contains("show") ? sessChip : !sessBtn.hidden ? sessBtn : null;
+  if (back) back.focus();
+}
+
+// chats restored with a session: waiting ones keep watching, the open one reads its balance
+function sessBoot() {
+  for (const c of state.chats) if (c.session && c.session.state === "wait") sessPoll(c);
+  sessRefresh(current());
+  renderSess();
+}
+
+sessChip.addEventListener("click", () => sessOpen(current()));
+sessBtn.addEventListener("click", () => sessOpen(current()));
+$("sessClose").addEventListener("click", sessClose);
+sessOverlay.addEventListener("click", (e) => {
+  if (e.target === sessOverlay || e.target.closest("[data-sess-close]")) sessClose();
+});
+$("sessNew").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const c = chatById(sessUi.chat);
+  if (c && !sessUi.busy) sessGrant(c);
+});
+$("sessBudget").addEventListener("input", () => { sessUi.err = ""; renderSessDialog(); });
+$("sessDur").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-h]");
+  if (!b) return;
+  sessHours = +b.dataset.h;
+  renderSessDialog();
+});
+// a radio group moves with the arrow keys
+$("sessDur").addEventListener("keydown", (e) => {
+  const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
+  if (!step) return;
+  e.preventDefault();
+  const i = SESS_HOURS.indexOf(sessHours);
+  sessHours = SESS_HOURS[(i + step + SESS_HOURS.length) % SESS_HOURS.length];
+  renderSessDialog();
+  $("sessDur").querySelector('[data-h="' + sessHours + '"]').focus();
+});
+$("sessCancel").addEventListener("click", () => { const c = chatById(sessUi.chat); if (c) sessCancel(c); });
+$("sessRecheck").addEventListener("click", () => {
+  const c = chatById(sessUi.chat);
+  if (!c || !c.session || c.session.state !== "wait") return;
+  c.session.at = Date.now();        // a fresh 30 minutes
+  persist(c);
+  sessPoll(c);
+  renderSessDialog();
+});
+$("sessEndBtn").addEventListener("click", () => { const c = chatById(sessUi.chat); if (c) sessEndNow(c); });
+$("sessDelEnd").addEventListener("click", async () => {
+  const c = chatById(sessUi.chat);
+  if (!c || !(await sessEndNow(c))) return;
+  sessClose();
+  deleteChat(c.id, true);
+});
+$("sessDelKeep").addEventListener("click", () => {
+  const c = chatById(sessUi.chat);
+  sessClose();
+  if (c) deleteChat(c.id, true);
+});
+// back from enclave.host: look for the approval now, not at the next tick
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  for (const c of state.chats)
+    if (c.session && c.session.state === "wait" && !(sessT.get(c.id) || {}).timedOut) sessPoll(c);
+  sessRefresh(current());
+});
 
 // ------------------------------------------------------------ model picker --
 function closeModelMenu() {
@@ -5798,7 +6630,7 @@ async function warmLadder() {
       if (state.chats.some((c) => c.id === s.id)) continue;
       state.chats.push({
         id: s.id, title: s.title || "", messages: s.messages || [],
-        streaming: null, error: s.error || null,
+        streaming: null, error: s.error || null, session: s.session || null,
       });
     }
   } else {
@@ -5816,6 +6648,7 @@ async function warmLadder() {
     // from here resumes what the user is about to type
     newChat(true);
   }
+  sessBoot();
 })();
 if (!isMobile()) document.body.classList.remove("collapsed");
 (async () => { await modelsReady; warmLadder(); })();
