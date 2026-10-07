@@ -280,6 +280,14 @@ pub struct Builtins<'a> {
     /// call is about without the model ever choosing. Filled from the request
     /// headers before the body is read, never from the body or the model.
     pub user: Option<&'a str>,
+    /// this chat's Enclave session (session.rs): read from the request's
+    /// x-enclave-session header on a signed-in turn, never from the body or
+    /// the model. A session-capable builder on a server with sessions on
+    /// gets `session: {vault, sid}` added to its arguments, and the calls it
+    /// answers with are signed with this key and executed (call_mcp_session).
+    /// Never rendered into the prompt: the parked prefix is shared by every
+    /// chat, so nothing per chat may enter it.
+    pub session: Option<&'a crate::session::ChatSession>,
     /// the deployment's max_agents, so a loop with no slots left is told
     /// apart from a deployment that never had the feature (the first is
     /// silent, the second is a note if someone named the tool anyway)
@@ -1106,6 +1114,13 @@ pub struct McpServer {
     /// server most answers never call: its schemas stop being prefill.
     #[serde(default)]
     pub defer: bool,
+    /// this server's session-capable builders (session::SESSION_TOOLS) act
+    /// through the chat's Enclave session when the turn has one: the
+    /// session is added to their arguments and the calls they answer with
+    /// are signed and sent with the server's session_execute. Absent: on for
+    /// https://mcp.enclave.host, off for every other server.
+    #[serde(default)]
+    pub sessions: Option<bool>,
 }
 
 /// A tool as an MCP server lists it, or as an inline declaration writes it:
@@ -1149,6 +1164,12 @@ impl McpToolDecl {
 }
 
 impl McpServer {
+    /// Whether this server's builders act through a chat's session (see
+    /// `sessions`).
+    pub fn sessions_on(&self) -> bool {
+        self.sessions.unwrap_or_else(|| crate::session::default_on(&self.url))
+    }
+
     /// The switch this server's tools sit under (see `group`).
     pub fn group_name(&self) -> String {
         if let Some(g) = self.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
@@ -1318,6 +1339,19 @@ pub struct McpSession {
     /// which is BEFORE the initialized notification, the first request the
     /// revision requires the header on.
     opened: bool,
+    /// the server's builders act through the chat's session
+    /// (McpServer::sessions_on)
+    sessions: bool,
+}
+
+impl McpSession {
+    /// Does a call to the server tool `remote` go through the chat's session
+    /// path (call_mcp_session)? A session-capable builder on a server with
+    /// sessions on - on that path a turn WITHOUT a session still gets the
+    /// note saying why nothing was sent.
+    fn acts_through_sessions(&self, remote: &str) -> bool {
+        self.sessions && crate::session::is_session_tool(remote)
+    }
 }
 
 /// Everything callable this turn, plus whatever went wrong assembling it.
@@ -1485,6 +1519,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             handshake: s.handshake,
             // nothing to negotiate with a server we do not handshake with
             opened: !s.handshake,
+            sessions: s.sessions_on(),
         };
         let declared: Vec<McpToolDecl> = if s.discover && s.tools.is_empty() {
             on_status(&format!("listing tools on {}…", host_of(&s.url)));
@@ -2643,7 +2678,11 @@ pub fn call(
                     !crate::client_gone()
                 })
             };
-            call_mcp(sess, &c, args, &mut sources, &mut image, &mut seen, &mut transport)
+            if sess.acts_through_sessions(&remote) {
+                call_mcp_session(sess, &c, args, b.session, &mut sources, &mut image, &mut seen, &mut transport)
+            } else {
+                call_mcp(sess, &c, args, &mut sources, &mut image, &mut seen, &mut transport)
+            }
         }
         // never built into a Registry - the passthrough renders client tools
         // into the prompt and hands the call back, so reaching this arm is a
@@ -3441,6 +3480,17 @@ fn call_mcp(
     seen: &mut Option<Vec<u8>>,
     transport: &mut Transport<'_>,
 ) -> Result<String, String> {
+    let (r, args) = mcp_tools_call(sess, c, args, transport)?;
+    mcp_read(&r, &args, c, sources, image_out, seen)
+}
+
+/// The tools/call round trip: the raw result, and the arguments as sent.
+fn mcp_tools_call(
+    sess: &mut McpSession,
+    c: &McpCall,
+    args: &serde_json::Value,
+    transport: &mut Transport<'_>,
+) -> Result<(serde_json::Value, serde_json::Value), String> {
     // a turn that skipped discovery (inline tools) never handshook
     handshake(sess, transport)?;
     // the turn's pictures ride the call as the reserved arguments the
@@ -3460,7 +3510,20 @@ fn call_mcp(
         c.max_bytes,
         transport,
     )?;
-    let out = mcp_outcome(&r, &args, c.see);
+    Ok((r, args))
+}
+
+/// A tools/call result, read for the model: the text (or the server's error
+/// as an Err), with citations and pictures put where they go.
+fn mcp_read(
+    r: &serde_json::Value,
+    args: &serde_json::Value,
+    c: &McpCall,
+    sources: &mut Vec<(String, String)>,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
+) -> Result<String, String> {
+    let out = mcp_outcome(r, args, c.see);
     if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
         return Err(if out.text.is_empty() {
             format!("mcp tool '{}' reported an error", c.remote)
@@ -3476,13 +3539,90 @@ fn call_mcp(
         *image_out = Some(crate::image::GeneratedImage {
             b64,
             mime,
-            prompt: image_request_label(&args),
+            prompt: image_request_label(args),
             model: None,
             seed: None,
             ms: 0, // stamped by call(), which owns the clock
         });
     }
     Ok(out.text)
+}
+
+/// The least session_execute is given to answer, whatever the server's own
+/// timeout: it sends every call on chain and waits for each receipt, which
+/// is several blocks for a deploy. The client stream ticks meanwhile.
+const SESSION_EXECUTE_TIMEOUT_S: u64 = 120;
+
+/// A session-capable builder on a server with sessions on (see
+/// crate::session). With this chat's session, the builder is asked for
+/// session calls, every call is signed with the chat's key, and the same
+/// server's session_execute sends them: the model gets ONE result, the
+/// builder's facts plus what was executed. Without one, the builder's own
+/// answer (wallet transactions) comes back with a note saying why nothing
+/// was sent. An error - the builder's, a call that cannot be signed, or
+/// session_execute's (which names the call that failed) - is the result.
+#[allow(clippy::too_many_arguments)]
+fn call_mcp_session(
+    sess: &mut McpSession,
+    c: &McpCall,
+    args: &serde_json::Value,
+    session: Option<&crate::session::ChatSession>,
+    sources: &mut Vec<(String, String)>,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
+    transport: &mut Transport<'_>,
+) -> Result<String, String> {
+    use crate::session::{self, Plan};
+    let Some(s) = session else {
+        let (r, sent) = mcp_tools_call(sess, c, args, transport)?;
+        let text = mcp_read(&r, &sent, c, sources, image_out, seen)?;
+        // "nothing to do" (no transactions) needs no session to say so
+        if session::answer_object(&r).is_some_and(|a| !session::has_work(&a)) {
+            return Ok(text);
+        }
+        return Ok(format!("{}\n\n{}", text.trim_end(), session::NO_SESSION_NOTE));
+    };
+    let sent = session::with_session_arg(args, s);
+    let (r, sent) = mcp_tools_call(sess, c, sent.as_ref().unwrap_or(args), transport)?;
+    let text = mcp_read(&r, &sent, c, sources, image_out, seen)?;
+    let Some(answer) = session::answer_object(&r) else { return Ok(text) };
+    let exec_args = match session::plan(&answer, s)? {
+        Plan::Keep => return Ok(text),
+        Plan::Foreign(note) => return Ok(format!("{}\n\n{note}", text.trim_end())),
+        Plan::Execute(a) => a,
+    };
+    let n = exec_args["calls"].as_array().map_or(0, |c| c.len());
+    let r = rpc_with(
+        sess,
+        "tools/call",
+        Some(serde_json::json!({ "name": session::EXECUTE_TOOL, "arguments": exec_args })),
+        c.timeout_s.max(SESSION_EXECUTE_TIMEOUT_S),
+        http::DEFAULT_MAX_BYTES,
+        transport,
+    )
+    .map_err(|e| {
+        // the calls may be on chain already: a retry of the builder quotes
+        // FRESH nonces, so it could do the same thing twice
+        format!(
+            "{} signed {n} session call(s) with this chat's Enclave session, but {} did not \
+             answer ({e}). They may still have been sent: check the result (get_deployment, \
+             session_status) before calling {} again.",
+            c.remote,
+            session::EXECUTE_TOOL,
+            c.remote
+        )
+    })?;
+    let out = mcp_outcome(&r, &serde_json::Value::Null, false);
+    if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
+        return Err(format!(
+            "{} prepared {n} session call(s) and this chat's Enclave session signed them, but {} \
+             refused them: {}",
+            c.remote,
+            session::EXECUTE_TOOL,
+            if out.text.trim().is_empty() { "(no reason given)" } else { out.text.trim() }
+        ));
+    }
+    Ok(session::executed_result(&answer, session::answer_object(&r), &out.text))
 }
 
 /// What a tools/call result carries for this app.
@@ -4870,6 +5010,7 @@ mod tests {
             next_id: 1,
             handshake,
             opened: !handshake,
+            sessions: false,
         }
     }
 
@@ -5768,6 +5909,7 @@ mod tests {
             next_id: 1,
             handshake: s.handshake,
             opened: !s.handshake,
+            sessions: s.sessions_on(),
         };
 
         // ONE round trip, because the adapter needs no handshake
@@ -5898,5 +6040,264 @@ mod identity_tests {
         let mut plain = BTreeMap::new();
         plain.insert("x-note".to_string(), "for $user only".to_string());
         assert_eq!(identity_headers(&plain, None, "t").unwrap()["x-note"], "for $user only");
+    }
+}
+
+/// A chat's Enclave session on the MCP call path (see crate::session):
+/// which calls take it, what is sent, what the model gets back.
+#[cfg(test)]
+mod chat_session_tests {
+    use super::*;
+    use crate::session::tests::{test_session, unhex, D, DIGEST, SID, VAULT};
+    use crate::session::{EXECUTED_NOTE, NO_SESSION_NOTE};
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+
+    /// A scripted server: each request is recorded and answered from the
+    /// queue, `Err` standing for a transport failure.
+    struct Script {
+        sent: Vec<serde_json::Value>,
+        replies: Vec<Result<serde_json::Value, String>>,
+    }
+
+    impl Script {
+        fn new(replies: Vec<Result<serde_json::Value, String>>) -> Script {
+            Script { sent: Vec::new(), replies }
+        }
+
+        fn transport<'a>(&'a mut self) -> impl FnMut(HttpReq<'_>) -> Result<http::Response, String> + 'a {
+            move |req: HttpReq<'_>| {
+                let body: serde_json::Value = serde_json::from_slice(req.body.unwrap_or(b"{}")).unwrap();
+                self.sent.push(body.clone());
+                let result = self.replies.remove(0)?;
+                let msg = serde_json::json!({ "jsonrpc": "2.0", "id": body["id"], "result": result });
+                Ok(http::Response {
+                    status: 200,
+                    body: msg.to_string().into_bytes(),
+                    location: None,
+                    ctype: None,
+                    headers: Vec::new(),
+                    truncated: false,
+                })
+            }
+        }
+
+        /// (tool name, arguments) of the nth request
+        fn call(&self, n: usize) -> (&str, &serde_json::Value) {
+            let p = &self.sent[n]["params"];
+            (p["name"].as_str().unwrap(), &p["arguments"])
+        }
+    }
+
+    /// A tools/call result the way mcp.enclave.host writes one: the JSON as
+    /// text AND as structuredContent.
+    fn mcp_json(o: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "content": [{ "type": "text", "text": o.to_string() }], "structuredContent": o })
+    }
+
+    fn mcp_error(text: &str) -> serde_json::Value {
+        serde_json::json!({ "content": [{ "type": "text", "text": text }], "isError": true })
+    }
+
+    fn digest2() -> String {
+        format!("0x{}", "11".repeat(32))
+    }
+
+    fn session_answer(vault: &str) -> serde_json::Value {
+        mcp_json(serde_json::json!({
+            "via": "session", "vault": vault, "sid": SID, "owner": "0x0b2d009c0c9af05b12100d77f3c815fea822ee61",
+            "app": "hello-world", "environment": "prod",
+            "calls": [
+                { "action": 0, "actionName": "deploy.create", "describe": "create", "nonce": "7", "fee": "12500",
+                  "deadline": "1791000000", "args": "0xc0ffee", "digest": DIGEST, "digestSha256": "0xaa" },
+                { "action": 1, "actionName": "deploy.fund", "describe": "fund", "nonce": "8", "fee": "12500",
+                  "deadline": "1791000000", "args": "0xbeef", "digest": digest2(), "digestSha256": "0xbb" },
+            ],
+            "sign": "For each call: ECDSA P-256 ...", "next": "session_execute { ... }",
+        }))
+    }
+
+    fn plan_deploy() -> (ToolMeta, McpSession) {
+        let sess = McpSession {
+            url: "https://mcp.enclave.host".into(),
+            headers: Vec::new(),
+            session_id: None,
+            version: MCP_VERSION.into(),
+            timeout_s: 30,
+            next_id: 1,
+            handshake: false,
+            opened: true,
+            sessions: true,
+        };
+        (ToolMeta::default(), sess)
+    }
+
+    fn call<'a>(meta: &'a ToolMeta, remote: &'a str) -> McpCall<'a> {
+        McpCall { name: remote, remote, meta, images: &[], timeout_s: 30, max_bytes: 1 << 20, see: false }
+    }
+
+    fn run(
+        sess: &mut McpSession,
+        c: &McpCall,
+        args: serde_json::Value,
+        session: Option<&crate::session::ChatSession>,
+        script: &mut Script,
+    ) -> Result<String, String> {
+        call_mcp_session(sess, c, &args, session, &mut Vec::new(), &mut None, &mut None, &mut script.transport())
+    }
+
+    #[test]
+    fn a_builder_is_signed_and_executed_through_the_chats_session() {
+        let s = test_session();
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "plan_deploy");
+        let mut script = Script::new(vec![
+            Ok(session_answer("0xB794C4DD00000000000000000000000000000345")),
+            Ok(mcp_json(serde_json::json!({
+                "executed": [
+                    { "call": 0, "action": "deploy.create", "txHash": "0xt1", "block": "5", "result": "0x9eb4" },
+                    { "call": 1, "action": "deploy.fund", "txHash": "0xt2", "block": "6", "result": "0x" },
+                ],
+                "createdId": "0x9eb4", "next": "claim_hint { id: createdId }, then get_deployment until running",
+            }))),
+        ]);
+        let text = run(&mut sess, &c, serde_json::json!({ "app": "hello-world", "fundUsd": 2 }), Some(&s), &mut script)
+            .unwrap();
+
+        // 1: the builder, with the session added beside the model's arguments
+        let (name, args) = script.call(0);
+        assert_eq!(name, "plan_deploy");
+        assert_eq!(args["app"], "hello-world");
+        assert_eq!(args["fundUsd"], 2);
+        assert_eq!(args["session"], serde_json::json!({ "vault": VAULT.to_ascii_lowercase(), "sid": SID }));
+
+        // 2: session_execute on the same server, every call signed
+        let (name, x) = script.call(1);
+        assert_eq!(name, "session_execute");
+        assert_eq!(x["vault"], VAULT.to_ascii_lowercase());
+        assert_eq!(x["sid"], SID);
+        let pk = &x["publicKey"];
+        let point = [&[4u8][..], &unhex(pk["x"].as_str().unwrap()), &unhex(pk["y"].as_str().unwrap())].concat();
+        let vk = VerifyingKey::from_sec1_bytes(&point).unwrap();
+        let calls = x["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (c, digest, nonce, args) in [(&calls[0], DIGEST.to_string(), "7", "0xc0ffee"), (&calls[1], digest2(), "8", "0xbeef")] {
+            // each call goes back exactly as received, plus its signature
+            assert_eq!((c["nonce"].as_str(), c["args"].as_str(), c["fee"].as_str()), (Some(nonce), Some(args), Some("12500")));
+            let sig = unhex(c["signature"].as_str().unwrap());
+            assert_eq!(sig.len(), 64, "r || s");
+            vk.verify(&unhex(&digest), &Signature::from_slice(&sig).unwrap()).expect("the vault's P256VERIFY accepts it");
+        }
+        assert_eq!(script.sent.len(), 2);
+        // the private key went nowhere
+        for b in &script.sent {
+            assert!(!b.to_string().contains(D), "{b}");
+        }
+
+        // ONE result: the builder's facts and what was executed
+        let (first, rest) = text.split_once('\n').unwrap();
+        assert_eq!(first, EXECUTED_NOTE);
+        let j: serde_json::Value = serde_json::from_str(rest).unwrap();
+        assert_eq!(j["app"], "hello-world");
+        assert_eq!(j["createdId"], "0x9eb4");
+        assert_eq!(j["executed"][1]["txHash"], "0xt2");
+        assert!(j.get("calls").is_none() && j.get("sign").is_none(), "{j}");
+        assert!(!text.contains(DIGEST) && !text.contains(D), "{text}");
+    }
+
+    #[test]
+    fn the_models_own_session_is_never_replaced_or_signed_for() {
+        let s = test_session();
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "build_stop");
+        let theirs = serde_json::json!({ "vault": "0x0000000000000000000000000000000000000001", "sid": SID });
+        let mut script = Script::new(vec![Ok(session_answer("0x0000000000000000000000000000000000000001"))]);
+        let text = run(&mut sess, &c, serde_json::json!({ "id": "0x9e", "session": theirs }), Some(&s), &mut script).unwrap();
+        assert_eq!(script.call(0).1["session"], theirs);
+        assert_eq!(script.sent.len(), 1, "nothing signed, nothing executed");
+        assert!(text.contains("not this chat's Enclave session"), "{text}");
+    }
+
+    #[test]
+    fn without_a_session_the_result_says_why_nothing_was_sent() {
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "build_fund");
+        let wallet = mcp_json(serde_json::json!({ "id": "0x9e", "transactions": [{ "to": "0x1", "data": "0x" }] }));
+        let mut script = Script::new(vec![Ok(wallet)]);
+        let text = run(&mut sess, &c, serde_json::json!({ "id": "0x9e", "usd": 1 }), None, &mut script).unwrap();
+        assert!(script.call(0).1.get("session").is_none());
+        assert!(text.contains("\"transactions\"") && text.ends_with(NO_SESSION_NOTE), "{text}");
+        // a builder with nothing to do needs no session to say so
+        let idle = mcp_json(serde_json::json!({ "id": "0x9e", "note": "nothing to do", "transactions": [] }));
+        let mut script = Script::new(vec![Ok(idle)]);
+        let text = run(&mut sess, &c, serde_json::json!({ "id": "0x9e" }), None, &mut script).unwrap();
+        assert!(!text.contains(NO_SESSION_NOTE), "{text}");
+        // and the builder's own error is the result, unchanged
+        let mut script = Script::new(vec![Ok(mcp_error("Error: no such deployment"))]);
+        let e = run(&mut sess, &c, serde_json::json!({}), None, &mut script).unwrap_err();
+        assert_eq!(e, "Error: no such deployment");
+    }
+
+    #[test]
+    fn a_failed_execute_is_the_result_and_says_what_happened() {
+        let s = test_session();
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "plan_deploy");
+        // the server refused one call: its words reach the model
+        let mut script = Script::new(vec![
+            Ok(session_answer(VAULT)),
+            Ok(mcp_error("Error: call 1 (deploy.fund) failed: over budget - 1 earlier call(s) went through: 0xt1")),
+        ]);
+        let e = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap_err();
+        assert!(e.contains("call 1 (deploy.fund) failed: over budget") && e.contains("0xt1"), "{e}");
+        // no answer at all: the calls may have gone through, so no blind retry
+        let mut script = Script::new(vec![Ok(session_answer(VAULT)), Err("timed out after 120s".into())]);
+        let e = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap_err();
+        assert!(e.contains("timed out after 120s") && e.contains("may still have been sent"), "{e}");
+        // the builder's own error: nothing signed, nothing sent after it
+        let mut script = Script::new(vec![Ok(mcp_error("Error: this session is not live"))]);
+        let e = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap_err();
+        assert_eq!(e, "Error: this session is not live");
+        assert_eq!(script.sent.len(), 1);
+        // "nothing to sign": the builder's answer as it is, no execute
+        let none = mcp_json(serde_json::json!({ "via": "session", "calls": [], "note": "nothing to sign" }));
+        let mut script = Script::new(vec![Ok(none)]);
+        let text = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap();
+        assert!(text.contains("nothing to sign") && script.sent.len() == 1, "{text}");
+    }
+
+    /// Which servers and which tools take the path at all: mcp.enclave.host
+    /// by default, another server only when its entry says `sessions: true`,
+    /// and only the session-capable builders on either.
+    #[test]
+    fn only_the_builders_of_a_sessions_server_take_the_path() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({ "mcp": [
+            { "url": "https://mcp.enclave.host", "discover": false, "handshake": false,
+              "tools": [{ "name": "plan_deploy" }, { "name": "get_deployment" }] },
+            { "url": "https://tools.example/mcp", "discover": false, "prefix": "x_", "tools": [{ "name": "plan_deploy" }] },
+            { "url": "https://tools.example/mcp", "discover": false, "sessions": true, "prefix": "y_",
+              "tools": [{ "name": "build_stop" }] },
+            { "url": "https://mcp.enclave.host/", "discover": false, "sessions": false, "prefix": "z_",
+              "tools": [{ "name": "build_fund" }] },
+        ]}))
+        .unwrap();
+        let s = test_session();
+        let reg = build(&cfg, Builtins { user: Some("0xabc"), session: Some(&s), ..Default::default() }, &|_| {});
+        let on: Vec<bool> = reg.mcp.iter().map(|m| m.sessions).collect();
+        assert_eq!(on, [true, false, true, false]);
+        let route = |name: &str| match &reg.find(name).unwrap().src {
+            ToolSrc::Mcp { server, remote } => reg.mcp[*server].acts_through_sessions(remote),
+            _ => unreachable!(),
+        };
+        assert!(route("plan_deploy"));
+        assert!(!route("get_deployment"), "not a builder");
+        assert!(!route("x_plan_deploy"), "another server, not opted in");
+        assert!(route("y_build_stop"), "another server that opted in");
+        assert!(!route("z_build_fund"), "mcp.enclave.host opted out");
+        // and nothing about the session reaches the prompt: the same block
+        // with or without one, so every chat shares the parked prefix
+        let without = build(&cfg, Builtins { user: Some("0xabc"), ..Default::default() }, &|_| {});
+        let b = Budget::calls(8);
+        assert_eq!(system_block(&reg.tools, &b), system_block(&without.tools, &b));
     }
 }

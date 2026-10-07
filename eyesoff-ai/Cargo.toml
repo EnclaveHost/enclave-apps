@@ -21,6 +21,10 @@ jpeg-encoder = "0.7"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 sha3 = { version = "0.10", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# a chat's Enclave session (session.rs): the browser's per-chat P-256 key signs
+# the session calls a builder tool prepares - ECDSA over SHA-256, RFC6979, on
+# the same elliptic-curve 0.13 / ecdsa 0.16 stack k256 already brings in
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 [profile.release]
 codegen-units = 1

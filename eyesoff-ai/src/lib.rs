@@ -237,6 +237,7 @@ mod http;
 mod image;
 mod sampling;
 mod search;
+mod session;
 mod sso;
 mod tools;
 mod vision;
@@ -4968,6 +4969,11 @@ struct ChatReq {
     /// of the body, so no client can claim an identity by writing one.
     #[serde(skip)]
     caller: Option<String>,
+    /// this chat's Enclave session (session.rs), from the x-enclave-session
+    /// HEADER of a signed-in request - never the body. Handed to the tool
+    /// registry only (Builtins::session), never to the prompt.
+    #[serde(skip)]
+    session: Option<session::ChatSession>,
     #[serde(default)]
     model: Option<String>, // OpenAI field: a model name or volume from /models; absent (or unknown) = the largest
     #[serde(default)]
@@ -7325,6 +7331,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         agent_limit: tc.map_or(0, |t| t.max_agents),
         // the probe answers for no one in particular
         user: None,
+        session: None,
     }
 }
 
@@ -7353,6 +7360,7 @@ fn builtins_for<'a>(cfg: &'a AppConfig, creq: &'a ChatReq, off: &'a [String]) ->
         agent_slots: 0,
         agent_limit: tc.map_or(0, |t| t.max_agents),
         user: creq.caller.as_deref(),
+        session: creq.session.as_ref(),
     }
 }
 
@@ -9335,6 +9343,24 @@ fn caller_identity(cfg: &AppConfig, req: &IncomingRequest) -> Option<String> {
     None
 }
 
+/// The chat's Enclave session, from the x-enclave-session header (see
+/// session.rs). Read from the headers like the caller, so before the body.
+/// Only a SIGNED-IN request may bring one: the session acts for a wallet,
+/// and an anonymous turn is nobody's to act for. A header that is refused
+/// or malformed is treated as no session at all, and the log line says why
+/// in words - never the value, which carries the private key.
+fn chat_session(req: &IncomingRequest, caller: Option<&str>) -> Option<session::ChatSession> {
+    let raw = req
+        .headers()
+        .get(&session::HEADER.to_string())
+        .into_iter()
+        .find_map(|v| String::from_utf8(v).ok().filter(|s| !s.trim().is_empty()));
+    session::accept(raw.as_deref(), caller.is_some()).unwrap_or_else(|e| {
+        eprintln!("[eyesoff-ai] {} ignored: {e}", session::HEADER);
+        None
+    })
+}
+
 /// POST /v1/keys - hand a signed-in user their derived API key. The identity
 /// comes from a verified sign-in token, never from the request body: whoever
 /// can sign in as an account is exactly who may hold its key. Deterministic
@@ -9464,6 +9490,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let t0 = now_ms();
     // who is asking, from the headers, before the body is taken
     let caller = config::from_value(raw.clone()).ok().and_then(|base| caller_identity(&base, &req));
+    let session = chat_session(&req, caller.as_deref());
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let mut creq = match parsed {
@@ -9471,6 +9498,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Err(e) => return json_err(out, 400, &e),
     };
     creq.caller = caller;
+    creq.session = session;
     let t1 = init_note("body", t0);
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
@@ -9976,6 +10004,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     }
     // who is asking, from the headers, before the body is taken
     let caller = caller_identity(&base, &req);
+    let session = chat_session(&req, caller.as_deref());
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let mut creq = match parsed {
@@ -9983,6 +10012,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Err(e) => return json_err(out, 400, &e),
     };
     creq.caller = caller;
+    creq.session = session;
     // A client-declared `tools` array is the PASSTHROUGH (see client_tools):
     // the model is offered the client's functions and its call goes back on
     // the reply as `tool_calls`, for the CLIENT to execute. The deployment's
