@@ -154,7 +154,9 @@
 //!                               token. Tool calls arrive as `{"tool":{...}}`
 //!                               (before the round trip, carrying `n`/`of`
 //!                               and the clock, `elapsed_s`/`max_seconds`) and
-//!                               `{"tool_result":{...}}` (after it); the reply
+//!                               `{"tool_result":{...}}` (after it, with the
+//!                               text the model read back as `result`, error
+//!                               or not); the reply
 //!                               regenerates from the result, so a `tool` event
 //!                               resets the client's buffer the way a `notice`
 //!                               does. `loop: true` on the request asks the
@@ -6123,6 +6125,11 @@ const LEDGER_HEAD: &str = "ledger";
 /// reason: one bad draft is a slip, three is a model that is not going to
 /// author the value.
 const STUB_RETRIES: usize = 3;
+/// The most of a call's result text its live event carries, so the person
+/// can open the call and read it. A result is already cut to its tool's
+/// max_chars (load_tools' 24k is the largest built in), but an error is not,
+/// and neither is a tool that raised its own max_chars.
+const RESULT_EVENT_CHARS: usize = 32_000;
 
 impl<'a> ToolLoop<'a> {
     /// Resolve the registry for this turn. MCP discovery happens HERE, before
@@ -6759,15 +6766,16 @@ impl<'a> ToolLoop<'a> {
         }
         // the live event carries what the model was shown, so the person
         // watching sees the same screen; the answer's stats do not, since
-        // they persist with the chat and a run of screenshots is megabytes
-        match picture.as_ref().filter(|_| shown) {
-            Some(b) => {
-                let mut live = entry.clone();
-                live["picture"] = serde_json::json!(vision::to_data_uri(b));
-                on_result(&live);
-            }
-            None => on_result(&entry),
+        // they persist with the chat and a run of screenshots is megabytes.
+        // The same goes for the result's TEXT, error or not: the person can
+        // open the call and read what came back, which is the only way to
+        // see why a call failed.
+        let mut live = entry.clone();
+        live["result"] = serde_json::json!(tools::truncate(&r.text, RESULT_EVENT_CHARS));
+        if let Some(b) = picture.as_ref().filter(|_| shown) {
+            live["picture"] = serde_json::json!(vision::to_data_uri(b));
         }
+        on_result(&live);
         self.log.push(entry);
         // the verify gate reads the check's latest result - and only the
         // latest thing run: a call after a passing check (a wait aside) is
@@ -12597,6 +12605,43 @@ mod tests {
         assert!(!m2[2].content.contains("[loop:"), "{}", m2[2].content);
         // short results are left alone by the condenser
         assert_eq!(condense("short"), None);
+    }
+
+    /// What a call returned reaches the person on its live event - a failure's
+    /// error text above all, since nothing else says why it failed - cut at
+    /// RESULT_EVENT_CHARS, and stays out of the answer's stats.
+    #[test]
+    fn a_results_text_rides_its_live_event_and_not_the_stats() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 8, "http": [{ "name": "run_vm_command", "url": "https://h/run" }]
+        }))
+        .unwrap();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let result = |text: String, is_error: bool| tools::ToolResult {
+            text, is_error, ms: 7, sources: Vec::new(), image: None, seen: None,
+        };
+        let call = |n: u8| tools::ToolCall {
+            name: "run_vm_command".into(),
+            args: serde_json::json!({ "cmd": "uname -a", "n": n }),
+        };
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "is the vm up?")];
+        let live = std::cell::RefCell::new(Vec::new());
+        let on_result = |e: &serde_json::Value| live.borrow_mut().push(e.clone());
+        let err = "tool 'run_vm_command' answered HTTP 502: no VM is attached to this session".to_string();
+        assert!(tl.take_result(&call(1), "k1", true, result(err.clone(), true), &mut msgs, &on_result, &|_| {}));
+        let long = "x".repeat(RESULT_EVENT_CHARS + 50);
+        assert!(tl.take_result(&call(2), "k2", true, result(long, false), &mut msgs, &on_result, &|_| {}));
+        let live = live.borrow();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0]["ok"], false);
+        assert_eq!(live[0]["result"], err.as_str());
+        assert!(msgs[2].content.contains(&err), "the model read the same text: {}", msgs[2].content);
+        let cut = live[1]["result"].as_str().unwrap();
+        assert!(cut.starts_with(&"x".repeat(RESULT_EVENT_CHARS)));
+        assert!(cut.ends_with(&format!("[truncated at {RESULT_EVENT_CHARS} characters]")), "{}", &cut[cut.len() - 60..]);
+        assert!(tl.log.iter().all(|e| e.get("result").is_none()), "{:?}", tl.log);
     }
 
     /// LEDGER MODE keeps the conversation flat: after every step the prompt

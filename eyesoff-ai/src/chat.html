@@ -407,11 +407,20 @@
   /* what the model called, above the answer it wrote from the results. The
      arguments are shown because they are what actually left the enclave */
   .toolcalls { margin: 2px 0 10px; display: flex; flex-direction: column; gap: 4px; }
-  .toolcall {
-    display: flex; align-items: baseline; gap: 8px; font-size: 12.5px;
-    padding: 6px 10px; border-radius: 10px; background: var(--hover);
+  details.toolcall {
+    font-size: 12.5px; border-radius: 10px; background: var(--hover);
     border: 1px solid var(--border-soft);
   }
+  details.toolcall > summary {
+    display: flex; align-items: baseline; gap: 8px; padding: 6px 10px;
+    cursor: pointer; list-style: none;
+  }
+  details.toolcall > summary::-webkit-details-marker { display: none; }
+  details.toolcall > summary:hover { background: var(--hover); border-radius: 9px; }
+  details.toolcall > summary .chev {
+    flex: none; align-self: center; color: var(--text-3); transition: transform .15s;
+  }
+  details.toolcall[open] > summary .chev { transform: rotate(90deg); }
   .toolcall .tname {
     color: var(--text); white-space: nowrap;
     font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -424,6 +433,22 @@
   .toolcall .tms { color: var(--text-3); font-size: 11.5px; white-space: nowrap; }
   .toolcall.err .tname { color: var(--err); }
   .toolcall.run .tms { color: var(--text-3); opacity: .75; }
+  /* an opened call: what it was sent in full, and what came back - the text
+     the model read next, which for a failure is the only account of why */
+  .toolcall .tbody { padding: 0 10px 9px; display: flex; flex-direction: column; gap: 3px; }
+  .toolcall .tlbl { color: var(--text-3); font-size: 11.5px; margin-top: 4px; }
+  .toolcall.err .tlbl.tres { color: var(--err); }
+  .toolcall pre.tpre {
+    margin: 0; padding: 8px 10px; max-height: 340px; overflow: auto;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    background: var(--code-bg); border: 1px solid var(--border-soft); border-radius: 8px;
+    color: var(--text-2); font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .toolcall .tnone { color: var(--text-3); font-size: 12px; font-style: italic; }
+  /* what the model wrote before a call, kept above the call it led to */
+  .toolcalls .tlead { margin: 4px 0 6px; }
+  .toolcalls .tlead:first-child { margin-top: 0; }
+  .tlead > * + * { margin-top: 12px; }
   /* what a call showed the MODEL (a screenshot of the machine it drives) */
   .toolpic {
     display: block; width: min(420px, 100%); height: auto; margin: 0 0 2px 10px;
@@ -1968,7 +1993,9 @@ function stripThink(src) {
   return splitThink(src).map((p) => p.text || "").join("").trim();
 }
 
-function assistantHtml(src, streaming) {
+// `leadIn`: src is what the model wrote BEFORE a tool call (toolsBlock), not
+// an answer - reasoning with no words after it is normal there.
+function assistantHtml(src, streaming, leadIn) {
   let html = "";
   for (const p of splitThink(src)) {
     if (p.think === undefined) { html += md(p.text); continue; }
@@ -1984,7 +2011,7 @@ function assistantHtml(src, streaming) {
   // but nothing can make a model that stopped say something - and a bubble
   // holding one collapsed "Thoughts" disclosure and no words reads as the app
   // having lost the reply. Name what happened instead.
-  if (!streaming && html && !stripThink(src).trim())
+  if (!streaming && !leadIn && html && !stripThink(src).trim())
     html += '<p class="think-empty">The model stopped while still reasoning and never wrote an ' +
       "answer. Its thinking is above; asking again usually gets one.</p>";
   return html;
@@ -3112,6 +3139,61 @@ function humanSecs(s) {
   return m + "m" + (r ? " " + r + "s" : "");
 }
 
+// Which calls this person has opened, kept by the call itself: a streaming
+// reply rebuilds every row at each token, so the open state cannot live in
+// the DOM. callOfRow takes a row back to its call for the toggle handlers.
+const callOpen = new WeakSet();
+const callOfRow = new WeakMap();
+// ...and the same for the Thoughts in the text that led up to a call
+const leadOpen = new WeakSet();
+const callOfLead = new WeakMap();
+
+// What the model wrote before a call: its reasoning, and often a sentence on
+// what it is about to check. It stays on screen above the call it led to -
+// the answer after the result is a NEW generation, not this text again, so
+// dropping it (as the reply buffer's reset used to) loses it for good.
+// Nothing but tags and whitespace = nothing to keep.
+function leadIn(text) {
+  if (!text) return undefined;
+  const i = text.lastIndexOf("<tool_call>");
+  if (i >= 0) text = text.slice(0, i);
+  return text.replace(/<\/?think>/g, "").trim() ? text.trimEnd() : undefined;
+}
+
+// An opened call's body: everything it was sent, then what came back - the
+// text the model read next, which for a failure is the only account of why.
+// Built when the row opens rather than with every row at every token, since
+// a result can run to tens of thousands of characters. Text only, always: a
+// result is whatever the tool answered, and none of it is markup.
+function fillCall(row, c) {
+  const body = row.querySelector(".tbody");
+  if (!body || body.firstChild) return;
+  const add = (tag, cls, text) => {
+    const el = document.createElement(tag);
+    el.className = cls;
+    el.textContent = text;
+    body.appendChild(el);
+  };
+  let args = "{}";
+  try { args = JSON.stringify(c.arguments || {}, null, 2); } catch (_) {}
+  add("div", "tlbl", "Arguments");
+  add("pre", "tpre", args);
+  if (c.ok === undefined) {
+    add("div", "tnone", "Still running: no result yet.");
+  } else if (typeof c.result === "string") {
+    add("div", "tlbl tres", c.ok ? "Result" : "Error");
+    // JSON (most MCP and API answers) is laid out to be read; anything that
+    // does not parse - a result cut at its limit, plain text - stays as it came
+    let text = c.result;
+    if (/^\s*[[{]/.test(text)) {
+      try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    }
+    add("pre", "tpre", text || "(empty)");
+  } else {
+    add("div", "tnone", "This call's result wasn't kept: it ran before eyesoff recorded results.");
+  }
+}
+
 // `loop`, while a reply streams: where the loop stands (step n of N and the
 // clock), read off the server's tool events. A finished reply carries it on
 // its meta line instead.
@@ -3125,7 +3207,19 @@ function toolsBlock(calls, loop) {
     wrap.appendChild(head);
   }
   for (const c of calls) {
-    const row = node('<div class="toolcall"><span class="tname"></span><span class="targs"></span><span class="tms"></span></div>');
+    if (typeof c.before === "string" && c.before) {
+      const lead = node('<div class="tlead"></div>');
+      lead.innerHTML = assistantHtml(c.before, false, true);
+      for (const d of lead.querySelectorAll("details.think")) {
+        callOfLead.set(d, c);
+        if (leadOpen.has(c)) d.open = true;
+      }
+      wrap.appendChild(lead);
+    }
+    const row = node('<details class="toolcall"><summary>' + ICONS.chev +
+      '<span class="tname"></span><span class="targs"></span><span class="tms"></span></summary>' +
+      '<div class="tbody"></div></details>');
+    callOfRow.set(row, c);
     row.querySelector(".tname").textContent = c.name;
     let args = "";
     try { args = JSON.stringify(c.arguments || {}); } catch (_) { args = "{}"; }
@@ -3143,6 +3237,10 @@ function toolsBlock(calls, loop) {
       if (!c.ok) row.classList.add("err");
       row.querySelector(".tms").textContent =
         (c.ok ? "" : "failed · ") + Math.round((c.ms || 0) / 100) / 10 + "s";
+    }
+    if (callOpen.has(c)) {
+      fillCall(row, c);
+      row.open = true;
     }
     wrap.appendChild(row);
     // the picture the call showed the model, so the person sees what it saw.
@@ -3486,10 +3584,12 @@ function updateStreamDOM(chat) {
   for (const d of body.querySelectorAll("details.agent")) agOpen[d.dataset.aid] = d.open;
   if (s.reply) {
     // each delta rebuilds the html - carry the user's expand/collapse choices
-    // across the rebuild (think blocks only ever get appended, so index-match)
-    const open = [...body.querySelectorAll("details.think")].map((d) => d.open);
+    // across the rebuild (think blocks only ever get appended, so index-match).
+    // The reply's own blocks only: the text before each call keeps its
+    // Thoughts' state by call (leadOpen), under .toolcalls
+    const open = [...body.querySelectorAll(":scope > details.think")].map((d) => d.open);
     body.innerHTML = assistantHtml(s.reply, true);
-    [...body.querySelectorAll("details.think")].forEach((d, i) => { if (open[i]) d.open = true; });
+    [...body.querySelectorAll(":scope > details.think")].forEach((d, i) => { if (open[i]) d.open = true; });
     hydrateHtml(body, true);
     // the markers link up as they stream in; a half-written "[1" waits for
     // its bracket, and the sources list is not in the body yet
@@ -3532,27 +3632,52 @@ function updateStreamDOM(chat) {
 // gesture (touch scroll); a mouse drag is distance-filtered.
 const TOGGLES = "details.think, details.sources, details.agent";
 const TOGGLE_SUMMARIES = "details.think > summary, details.sources > summary, details.agent > summary";
-let pressedThink = -1, pressedX = 0, pressedY = 0;
+// A tool call's row is found again by its CALL rather than by index: a new
+// call can land between the press and the release, and a subagent's calls
+// sit among the parent's.
+const CALL_SUMMARY = "details.toolcall > summary";
+let pressedThink = -1, pressedCall = null, pressedX = 0, pressedY = 0;
 log.addEventListener("pointerdown", (e) => {
   const s = e.button === 0 ? e.target.closest(TOGGLE_SUMMARIES) : null;
   pressedThink = s ? [...log.querySelectorAll(TOGGLES)].indexOf(s.parentElement) : -1;
+  const cs = e.button === 0 ? e.target.closest(CALL_SUMMARY) : null;
+  pressedCall = cs ? callOfRow.get(cs.parentElement) || null : null;
   pressedX = e.clientX; pressedY = e.clientY;
 });
-log.addEventListener("pointercancel", () => { pressedThink = -1; });
+log.addEventListener("pointercancel", () => { pressedThink = -1; pressedCall = null; });
 log.addEventListener("pointerup", (e) => {
-  const i = pressedThink;
-  pressedThink = -1;
-  if (i < 0 || Math.hypot(e.clientX - pressedX, e.clientY - pressedY) > 8) return;
+  const i = pressedThink, c = pressedCall;
+  pressedThink = -1; pressedCall = null;
+  if (Math.hypot(e.clientX - pressedX, e.clientY - pressedY) > 8) return;
+  if (c) { setCallOpen(c, !callOpen.has(c)); return; }
+  if (i < 0) return;
   const d = log.querySelectorAll(TOGGLES)[i];
   if (d) d.open = !d.open;
 });
+function setCallOpen(c, open) {
+  if (open) callOpen.add(c); else callOpen.delete(c);
+  for (const row of log.querySelectorAll("details.toolcall")) {
+    if (callOfRow.get(row) !== c) continue;
+    if (open) fillCall(row, c);
+    row.open = open;
+  }
+}
+// keyboard activation stays native (see the click handler); the call's
+// remembered state follows whatever the row did. toggle does not bubble.
+log.addEventListener("toggle", (e) => {
+  const lc = callOfLead.get(e.target);
+  if (lc) { if (e.target.open) leadOpen.add(lc); else leadOpen.delete(lc); return; }
+  const c = callOfRow.get(e.target);
+  if (!c) return;
+  if (e.target.open) { callOpen.add(c); fillCall(e.target, c); } else callOpen.delete(c);
+}, true);
 
 // message actions (copy / regenerate / retry / code copy) via delegation,
 // so re-rendered nodes keep working
 log.addEventListener("click", (e) => {
   // pointer toggles are handled on pointerup above - cancel the native summary
   // toggle so it can't double-fire; keyboard activation (detail 0) stays native
-  if (e.detail && e.target.closest(TOGGLE_SUMMARIES)) { e.preventDefault(); return; }
+  if (e.detail && e.target.closest(TOGGLE_SUMMARIES + ", " + CALL_SUMMARY)) { e.preventDefault(); return; }
   const cc = e.target.closest("[data-copy-code]");
   if (cc) {
     const code = cc.closest(".code").querySelector("pre code");
@@ -4397,7 +4522,10 @@ async function run(chat) {
             // a subagent's call: it files under that agent's card, and the
             // agent's text restarts the way the answer's does after a call
             const ag = agentById(agents, d.tool.agent);
-            if (ag) { ag.tools.push({ name: d.tool.name, arguments: d.tool.arguments }); ag.text = ""; }
+            if (ag) {
+              ag.tools.push({ name: d.tool.name, arguments: d.tool.arguments, before: leadIn(ag.text) });
+              ag.text = "";
+            }
             const wa = d.tool.arguments || {};
             chat.streaming.status = "Subagent #" + d.tool.agent + ": " + (d.tool.name === "wait"
               ? "waiting " + humanSecs(+wa.seconds || 0) + (wa.reason ? ": " + wa.reason : "")
@@ -4425,11 +4553,16 @@ async function run(chat) {
             chat.streaming.status = "Subagent #" + d.agent_done.id + (d.agent_done.ok ? " reported; " : " failed; ") + "continuing…";
             if (chat.id === state.currentId) renderChat();
           } else if (d.tool) {
-            // A call is starting. The answer is generated AGAIN once the
-            // result comes back, so the reply buffer resets the way it does
-            // after a notice - what is on screen is about to be superseded.
+            // A call is starting. What the model wrote up to here led to it:
+            // that text moves onto the call (leadIn) and stays on screen
+            // above its row, a Thoughts block the person had open staying
+            // open, and the reply buffer starts over for the answer the
+            // model writes from the result.
             toolCalls = toolCalls || [];
-            toolCalls.push({ name: d.tool.name, arguments: d.tool.arguments });
+            const call = { name: d.tool.name, arguments: d.tool.arguments, before: leadIn(reply) };
+            if (call.before && chat.id === state.currentId
+                && document.querySelector("#streambody > details.think[open]")) leadOpen.add(call);
+            toolCalls.push(call);
             chat.streaming.tools = toolCalls;
             // where the loop stands: the step counter and the clock
             chat.streaming.loop = { calls: d.tool.n, max_calls: d.tool.of,
@@ -4463,6 +4596,7 @@ async function run(chat) {
             const last = ag && ag.tools[ag.tools.length - 1];
             if (last) {
               last.ok = d.tool_result.ok; last.ms = d.tool_result.ms;
+              if (typeof d.tool_result.result === "string") last.result = d.tool_result.result;
               if (d.tool_result.picture) last.picture = d.tool_result.picture;
             }
             if (chat.id === state.currentId) renderChat();
@@ -4473,6 +4607,7 @@ async function run(chat) {
             const last = toolCalls && toolCalls[toolCalls.length - 1];
             if (last) {
               last.ok = d.tool_result.ok; last.ms = d.tool_result.ms;
+              if (typeof d.tool_result.result === "string") last.result = d.tool_result.result;
               if (d.tool_result.picture) last.picture = d.tool_result.picture;
             }
             chat.streaming.status = d.tool_result.ok
