@@ -69,6 +69,13 @@ pub struct Layout {
 	pub pc_addr: u64, // u64
 	pub gen_addr: u64, // u32 write-snoop generation cell (flat RAM only)
 	pub baked_gen: u32, // generation a flat-RAM module was built against
+	/// u64: the fcsr CSR (fflags bits 0-4, frm bits 5-7). FDIV's divide-by-
+	/// zero flag and the float-CSR ops reach it here.
+	pub fcsr_addr: u64,
+	/// LR/SC: the reservation flag (one byte, 0/1) and the virtual address
+	/// it holds (u64) - Cpu::is_reservation_set / Cpu::reservation.
+	pub res_flag_addr: u64,
+	pub res_addr_addr: u64,
 	/// Some(_) when the guest runs under paging: memory ops probe the
 	/// emulator's software TLB (hit -> translated physical; miss/meta-stale
 	/// -> bail). None for bare/physical addressing.
@@ -192,15 +199,21 @@ struct Locals {
 	marks: u32,
 	addr: u32,
 	meta: u32,
+	// i64 temporaries for the ops that need values twice (MULH's 128-bit
+	// product, an AMO's old value, LR/SC's address)
+	t0: u32,
+	t1: u32,
+	t2: u32,
 }
 
 // params fuel, entry | i64 scratch | i32 cur | i64 retired, scratch2, bias,
-// tpc, pcv | addr base, rdt, wrt, marks, addr | i32 meta | i64 registers
+// tpc, pcv | addr base, rdt, wrt, marks, addr | i32 meta | i64 t0, t1, t2 |
+// i64 registers
 const LOCALS: Locals = Locals {
 	fuel: 0, entry: 1, scratch: 2, cur: 3, retired: 4, scratch2: 5, bias: 6, tpc: 7, pcv: 8,
-	base: 9, rdt: 10, wrt: 11, marks: 12, addr: 13, meta: 14,
+	base: 9, rdt: 10, wrt: 11, marks: 12, addr: 13, meta: 14, t0: 15, t1: 16, t2: 17,
 };
-const FIRST_REG_LOCAL: u32 = 15;
+const FIRST_REG_LOCAL: u32 = 18;
 const NONE: u32 = u32::MAX;
 
 struct Emit<'a> {
@@ -308,9 +321,17 @@ impl<'a> Emit<'a> {
 				let m = 1u32 << op.rd | 1u32 << op.rs1 | 1u32 << op.rs2;
 				xm |= m;
 				if matches!(op.kind, HOT_FLD | HOT_FLW | HOT_FSD | HOT_FSW | HOT_FADD_D | HOT_FSUB_D
-					| HOT_FMUL_D | HOT_FSGNJ_D | HOT_FMV_X_D | HOT_FMV_D_X | HOT_FCVT_D_W)
+					| HOT_FMUL_D | HOT_FDIV_D | HOT_FSGNJ_D | HOT_FMV_X_D | HOT_FMV_D_X | HOT_FCVT_D_W)
 				{
 					fm |= m;
+				}
+				// the float table ops: an over-approximation (FEQ's rd is an x
+				// register) costs one unused local, never a wrong value
+				if matches!(table_op(op), Some(TableOp::Fs(_)) | Some(TableOp::Fd(_))
+					| Some(TableOp::CvtDS) | Some(TableOp::CvtSD) | Some(TableOp::MvXW)
+					| Some(TableOp::MvWX))
+				{
+					fm |= m | 1u32 << ((op.word >> 27) & 0x1f);
 				}
 			}
 		}
@@ -478,6 +499,37 @@ impl<'a> Emit<'a> {
 	fn set_f_post(&mut self, r: u8) {
 		self.op(0xbd); // i64.reinterpret_f64 (bit-exact)
 		self.set_f_bits_post(r);
+	}
+	/// push f[r] as the single it holds: the interpreter keeps a single in
+	/// the LOW 32 bits of the register (f32::from_bits(bits as u32))
+	fn get_f32(&mut self, r: u8) {
+		self.get_f_bits(r);
+		self.op(I32_WRAP_I64);
+		self.op(0xbe); // f32.reinterpret_i32
+	}
+	/// f32 on the stack -> f[r] = its bits, ZERO-extended (the interpreter's
+	/// f64::from_bits(x.to_bits() as u64))
+	fn set_f32_post(&mut self, r: u8) {
+		self.op(0xbc); // i32.reinterpret_f32
+		self.op(I64_EXTEND_I32_U);
+		self.set_f_bits_post(r);
+	}
+	/// fcsr |= bits (Cpu::set_fcsr_dz and friends)
+	fn fcsr_or(&mut self, bits: i64) {
+		let (base, a) = (self.l.base, self.lay.fcsr_addr);
+		self.lget(base);
+		self.lget(base);
+		self.op(I64_LOAD);
+		self.memarg(3, a);
+		self.i64c(bits);
+		self.op(I64_OR);
+		self.op(I64_STORE);
+		self.memarg(3, a);
+	}
+	/// a 0xfc-prefixed opcode (the saturating float->int conversions)
+	fn fc(&mut self, sub: u64) {
+		self.op(0xfc);
+		uleb(&mut self.code, sub);
 	}
 
 	/// push the runtime pc for module pc `rel`
@@ -735,12 +787,15 @@ pub(crate) fn translatable(op: &BlockOp) -> bool {
 		| HOT_SLTIU | HOT_LD | HOT_LW | HOT_LWU | HOT_LH | HOT_LHU | HOT_LB | HOT_LBU
 		| HOT_SD | HOT_SW | HOT_SH | HOT_SB | HOT_BEQ | HOT_BNE | HOT_BLT | HOT_BGE
 		| HOT_BLTU | HOT_BGEU | HOT_JAL | HOT_JALR | HOT_FLD | HOT_FLW | HOT_FSD | HOT_FSW
-		| HOT_FADD_D | HOT_FSUB_D | HOT_FMUL_D | HOT_FSGNJ_D | HOT_FMV_X_D | HOT_FMV_D_X
-		| HOT_FCVT_D_W)
+		| HOT_FADD_D | HOT_FSUB_D | HOT_FMUL_D | HOT_FDIV_D | HOT_FSGNJ_D | HOT_FMV_X_D
+		| HOT_FMV_D_X | HOT_FCVT_D_W)
 }
 
 /// The non-hot ops the translator takes over from the table path, by the
-/// INSTRUCTIONS entry the interpreter decoded them to.
+/// INSTRUCTIONS entry the interpreter decoded them to. Every one of them is
+/// the LAST op of its block (build_block ends a block at any non-hot op), so
+/// translating one is what lets a region run on into the next block instead
+/// of handing back to the interpreter there.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TableOp {
 	Div,
@@ -753,9 +808,80 @@ enum TableOp {
 	Remw,
 	Remuw,
 	Fence,
+	/// the high 64 bits of the 128-bit product: (rs1 signed, rs2 signed)
+	Mulh(bool, bool),
+	/// AMO*: the operation, and whether it is the .W form
+	Amo(AmoOp, bool),
+	/// LR / SC: whether it is the .W form
+	Lr(bool),
+	Sc(bool),
+	/// a single-precision op (the low 32 bits of the f registers)
+	Fs(FOp),
+	/// a double-precision op the hot set leaves to the table
+	Fd(FOp),
+	CvtDS,
+	CvtSD,
+	MvXW,
+	MvWX,
+	/// CSRRW/S/C and their I forms on fflags (1), frm (2) or fcsr (3) only:
+	/// pure state, no privilege check that can fail, no interrupt to re-arm
+	Csr(CsrOp, bool, u16),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AmoOp {
+	Add,
+	Swap,
+	Xor,
+	Or,
+	And,
+	Min,
+	Max,
+	MinU,
+	MaxU,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FOp {
+	Add,
+	Sub,
+	Mul,
+	Div,
+	Sqrt,
+	Sgnj,
+	Sgnjn,
+	Sgnjx,
+	Eq,
+	Lt,
+	Le,
+	/// float -> int (FCVT.W/WU/L/LU.x)
+	ToW,
+	ToWu,
+	ToL,
+	ToLu,
+	/// int -> float (FCVT.x.W/WU/L/LU)
+	FromW,
+	FromWu,
+	FromL,
+	FromLu,
+	Madd,
+	Msub,
+	Nmsub,
+	Nmadd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CsrOp {
+	W,
+	S,
+	C,
 }
 
 fn table_op(op: &BlockOp) -> Option<TableOp> {
+	use self::AmoOp as A;
+	use self::FOp as F;
+	let csr = ((op.word >> 20) & 0xfff) as u16;
+	let fcsr_family = (1..=3).contains(&csr);
 	Some(match ::cpu::op_name(op) {
 		"DIV" => TableOp::Div,
 		"DIVU" => TableOp::Divu,
@@ -769,14 +895,709 @@ fn table_op(op: &BlockOp) -> Option<TableOp> {
 		// the interpreter's FENCE and FENCE.I do nothing (one hart; the
 		// write snoop already keeps cached code coherent)
 		"FENCE" | "FENCE.I" => TableOp::Fence,
+		"MULH" => TableOp::Mulh(true, true),
+		"MULHSU" => TableOp::Mulh(true, false),
+		"MULHU" => TableOp::Mulh(false, false),
+		"AMOADD.W" => TableOp::Amo(A::Add, true),
+		"AMOADD.D" => TableOp::Amo(A::Add, false),
+		"AMOSWAP.W" => TableOp::Amo(A::Swap, true),
+		"AMOSWAP.D" => TableOp::Amo(A::Swap, false),
+		"AMOXOR.W" => TableOp::Amo(A::Xor, true),
+		"AMOXOR.D" => TableOp::Amo(A::Xor, false),
+		"AMOOR.W" => TableOp::Amo(A::Or, true),
+		"AMOOR.D" => TableOp::Amo(A::Or, false),
+		"AMOAND.W" => TableOp::Amo(A::And, true),
+		"AMOAND.D" => TableOp::Amo(A::And, false),
+		"AMOMIN.W" => TableOp::Amo(A::Min, true),
+		"AMOMIN.D" => TableOp::Amo(A::Min, false),
+		"AMOMAX.W" => TableOp::Amo(A::Max, true),
+		"AMOMAX.D" => TableOp::Amo(A::Max, false),
+		"AMOMINU.W" => TableOp::Amo(A::MinU, true),
+		"AMOMINU.D" => TableOp::Amo(A::MinU, false),
+		"AMOMAXU.W" => TableOp::Amo(A::MaxU, true),
+		"AMOMAXU.D" => TableOp::Amo(A::MaxU, false),
+		"LR.W" => TableOp::Lr(true),
+		"LR.D" => TableOp::Lr(false),
+		"SC.W" => TableOp::Sc(true),
+		"SC.D" => TableOp::Sc(false),
+		"FADD.S" => TableOp::Fs(F::Add),
+		"FSUB.S" => TableOp::Fs(F::Sub),
+		"FMUL.S" => TableOp::Fs(F::Mul),
+		"FDIV.S" => TableOp::Fs(F::Div),
+		"FSQRT.S" => TableOp::Fs(F::Sqrt),
+		"FSGNJ.S" => TableOp::Fs(F::Sgnj),
+		"FSGNJN.S" => TableOp::Fs(F::Sgnjn),
+		"FSGNJX.S" => TableOp::Fs(F::Sgnjx),
+		"FEQ.S" => TableOp::Fs(F::Eq),
+		"FLT.S" => TableOp::Fs(F::Lt),
+		"FLE.S" => TableOp::Fs(F::Le),
+		"FCVT.W.S" => TableOp::Fs(F::ToW),
+		"FCVT.WU.S" => TableOp::Fs(F::ToWu),
+		"FCVT.L.S" => TableOp::Fs(F::ToL),
+		"FCVT.LU.S" => TableOp::Fs(F::ToLu),
+		"FCVT.S.W" => TableOp::Fs(F::FromW),
+		"FCVT.S.WU" => TableOp::Fs(F::FromWu),
+		"FCVT.S.L" => TableOp::Fs(F::FromL),
+		"FCVT.S.LU" => TableOp::Fs(F::FromLu),
+		"FMADD.S" => TableOp::Fs(F::Madd),
+		"FMSUB.S" => TableOp::Fs(F::Msub),
+		"FNMSUB.S" => TableOp::Fs(F::Nmsub),
+		"FNMADD.S" => TableOp::Fs(F::Nmadd),
+		"FSQRT.D" => TableOp::Fd(F::Sqrt),
+		"FSGNJN.D" => TableOp::Fd(F::Sgnjn),
+		"FSGNJX.D" => TableOp::Fd(F::Sgnjx),
+		"FEQ.D" => TableOp::Fd(F::Eq),
+		"FLT.D" => TableOp::Fd(F::Lt),
+		"FLE.D" => TableOp::Fd(F::Le),
+		"FCVT.W.D" => TableOp::Fd(F::ToW),
+		"FCVT.WU.D" => TableOp::Fd(F::ToWu),
+		"FCVT.L.D" => TableOp::Fd(F::ToL),
+		"FCVT.LU.D" => TableOp::Fd(F::ToLu),
+		"FCVT.D.WU" => TableOp::Fd(F::FromWu),
+		"FCVT.D.L" => TableOp::Fd(F::FromL),
+		"FCVT.D.LU" => TableOp::Fd(F::FromLu),
+		"FMADD.D" => TableOp::Fd(F::Madd),
+		"FMSUB.D" => TableOp::Fd(F::Msub),
+		"FNMSUB.D" => TableOp::Fd(F::Nmsub),
+		"FNMADD.D" => TableOp::Fd(F::Nmadd),
+		"FCVT.D.S" => TableOp::CvtDS,
+		"FCVT.S.D" => TableOp::CvtSD,
+		"FMV.X.W" => TableOp::MvXW,
+		"FMV.W.X" => TableOp::MvWX,
+		"CSRRW" if fcsr_family => TableOp::Csr(CsrOp::W, false, csr),
+		"CSRRS" if fcsr_family => TableOp::Csr(CsrOp::S, false, csr),
+		"CSRRC" if fcsr_family => TableOp::Csr(CsrOp::C, false, csr),
+		"CSRRWI" if fcsr_family => TableOp::Csr(CsrOp::W, true, csr),
+		"CSRRSI" if fcsr_family => TableOp::Csr(CsrOp::S, true, csr),
+		"CSRRCI" if fcsr_family => TableOp::Csr(CsrOp::C, true, csr),
 		_ => return None,
 	})
 }
 
-/// The INSTRUCTIONS closures for table ops, in wasm (RV64): rd = f(x[rs1],
-/// x[rs2]) with RISC-V's division rules — x/0 = -1 (all ones), x%0 = x,
-/// MIN/-1 = MIN, MIN%-1 = 0 — guarded before wasm's trapping div/rem.
-fn emit_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
+/// One table op, translated: each arm reproduces its INSTRUCTIONS closure
+/// exactly - including the interpreter's own quirks, which are what the
+/// guest has been running all along. `addr` is the op's module pc, `next`
+/// the one after it; a memory op that cannot take the fast path bails at
+/// `addr` having retired `ret_before`, before any of its effects.
+fn emit_table_op(e: &mut Emit, t: TableOp, op: &BlockOp, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	let (rd, rs1, rs2) = (op.rd, op.rs1, op.rs2);
+	match t {
+		TableOp::Mulh(s1, s2) => mulh(e, rd, rs1, rs2, s1, s2),
+		TableOp::Amo(a, w) => amo(e, a, w, rd, rs1, rs2, addr, next, ret_before, ret_after),
+		TableOp::Lr(w) => lr(e, w, rd, rs1, addr, ret_before),
+		TableOp::Sc(w) => sc(e, w, rd, rs1, rs2, addr, next, ret_before, ret_after),
+		TableOp::Fs(f) => fp_single(e, f, rd, rs1, rs2, ((op.word >> 27) & 0x1f) as u8),
+		TableOp::Fd(f) => fp_double(e, f, rd, rs1, rs2, ((op.word >> 27) & 0x1f) as u8),
+		TableOp::CvtDS => {
+			// f32::from_bits(low half) as f64
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.op(0xbb); // f64.promote_f32
+			e.set_f_post(rd);
+		}
+		TableOp::CvtSD => {
+			// the interpreter NaN-boxes this one (and only this one):
+			// 0xffff_ffff_0000_0000 | (f as f32).to_bits()
+			e.set_f_pre(rd);
+			e.get_f(rs1);
+			e.op(0xb6); // f32.demote_f64
+			e.op(0xbc); // i32.reinterpret_f32
+			e.op(I64_EXTEND_I32_U);
+			e.i64c(0xffff_ffff_0000_0000u64 as i64);
+			e.op(I64_OR);
+			e.set_f_bits_post(rd);
+		}
+		TableOp::MvXW => {
+			// x = bits as i32 as i64
+			e.set_x_pre(rd);
+			e.get_f_bits(rs1);
+			wrap32(e);
+			e.set_x_post(rd);
+		}
+		TableOp::MvWX => {
+			// f = x as u32 as u64
+			e.set_f_pre(rd);
+			e.get_x(rs1);
+			e.i64c(0xffff_ffff);
+			e.op(I64_AND);
+			e.set_f_bits_post(rd);
+		}
+		TableOp::Csr(kind, imm, csr) => csr_op(e, kind, imm, csr, rd, rs1),
+		_ => emit_int_table_op(e, t, rd, rs1, rs2),
+	}
+}
+
+const I64_XOR: u8 = 0x85;
+const I64_MUL: u8 = 0x7e;
+const I64_SHR_S: u8 = 0x87;
+const SELECT: u8 = 0x1b;
+const DROP: u8 = 0x1a;
+
+/// MULH / MULHSU / MULHU: the high half of the 128-bit product, which wasm
+/// has no instruction for. From 32-bit limbs (each partial product fits in
+/// 64 bits): with a = ah:al, b = bh:bl,
+///   carry = ((al*bl >> 32) + lo(al*bh) + lo(ah*bl)) >> 32
+///   hi_u  = ah*bh + (al*bh >> 32) + (ah*bl >> 32) + carry
+/// then two's complement turns the unsigned high half into the signed one:
+/// hi_s = hi_u - (a < 0 ? b : 0) - (b < 0 ? a : 0), each term only for an
+/// operand that is signed.
+fn mulh(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, s1: bool, s2: bool) {
+	let (a, b, c) = (e.l.t0, e.l.t1, e.l.t2);
+	let lo = |e: &mut Emit, l: u32| {
+		e.lget(l);
+		e.i64c(0xffff_ffff);
+		e.op(I64_AND);
+	};
+	let hi = |e: &mut Emit, l: u32| {
+		e.lget(l);
+		e.i64c(32);
+		e.op(I64_SHR_U);
+	};
+	e.get_x(rs1);
+	e.lset(a);
+	e.get_x(rs2);
+	e.lset(b);
+	// c = al*bl >> 32
+	lo(e, a);
+	lo(e, b);
+	e.op(I64_MUL);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	// + lo(al*bh) + lo(ah*bl), then >> 32: the carry into the high half
+	lo(e, a);
+	hi(e, b);
+	e.op(I64_MUL);
+	e.i64c(0xffff_ffff);
+	e.op(I64_AND);
+	e.op(I64_ADD);
+	hi(e, a);
+	lo(e, b);
+	e.op(I64_MUL);
+	e.i64c(0xffff_ffff);
+	e.op(I64_AND);
+	e.op(I64_ADD);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	e.lset(c);
+	e.set_x_pre(rd);
+	hi(e, a);
+	hi(e, b);
+	e.op(I64_MUL);
+	lo(e, a);
+	hi(e, b);
+	e.op(I64_MUL);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	e.op(I64_ADD);
+	hi(e, a);
+	lo(e, b);
+	e.op(I64_MUL);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	e.op(I64_ADD);
+	e.lget(c);
+	e.op(I64_ADD);
+	if s1 {
+		// - (a < 0 ? b : 0)
+		e.lget(a);
+		e.i64c(63);
+		e.op(I64_SHR_S);
+		e.lget(b);
+		e.op(I64_AND);
+		e.op(I64_SUB);
+	}
+	if s2 {
+		e.lget(b);
+		e.i64c(63);
+		e.op(I64_SHR_S);
+		e.lget(a);
+		e.op(I64_AND);
+		e.op(I64_SUB);
+	}
+	e.set_x_post(rd);
+}
+
+/// AMO*.W/.D at x[rs1] (no offset): old = load; store f(x[rs2], old);
+/// x[rd] = old (a .W value sign-extended). The address goes through the
+/// WRITE path - TLB write way, an owned chunk, an unmarked page, outside
+/// the bookkeeping windows - so a bail happens before the load and the
+/// interpreter redoes the whole op; a write-way hit implies the page reads
+/// too (RISC-V has no write-only pages), and an owned chunk's read and
+/// write pointers are one buffer.
+#[allow(clippy::too_many_arguments)]
+fn amo(e: &mut Emit, a: AmoOp, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	let (old, src, lin) = (e.l.t0, e.l.t1, e.l.addr);
+	let width = if w { 4 } else { 8 };
+	e.get_x(rs1);
+	e.dram_addr(width, addr, ret_before, true);
+	e.op(DROP); // also in `addr`
+	e.lget(lin);
+	match w {
+		true => {
+			e.op(0x34); // i64.load32_s
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_LOAD);
+			e.memarg(3, 0);
+		}
+	}
+	e.lset(old);
+	// x[rs2] before rd is written (rd may be rs2)
+	e.get_x(rs2);
+	e.lset(src);
+	e.lget(lin);
+	// the value stored: f(src, old)
+	let pick = |e: &mut Emit, cmp32: u8, cmp64: u8| {
+		e.lget(src);
+		e.lget(old);
+		e.lget(src);
+		if w {
+			e.op(I32_WRAP_I64);
+		}
+		e.lget(old);
+		if w {
+			e.op(I32_WRAP_I64);
+		}
+		e.op(if w { cmp32 } else { cmp64 });
+		e.op(SELECT); // cond ? src : old
+	};
+	match a {
+		AmoOp::Add => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_ADD);
+		}
+		AmoOp::Swap => e.lget(src),
+		AmoOp::Xor => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_XOR);
+		}
+		AmoOp::Or => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_OR);
+		}
+		AmoOp::And => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_AND);
+		}
+		AmoOp::Min => pick(e, 0x48, 0x53), // lt_s
+		AmoOp::Max => pick(e, 0x4a, 0x55), // gt_s
+		AmoOp::MinU => pick(e, 0x49, 0x54), // lt_u
+		AmoOp::MaxU => pick(e, 0x4b, 0x56), // gt_u
+	}
+	match w {
+		true => {
+			e.op(0x3e); // i64.store32: the low half
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_STORE);
+			e.memarg(3, 0);
+		}
+	}
+	e.set_x_pre(rd);
+	e.lget(old);
+	e.set_x_post(rd);
+	// the op is complete (rd written) before the flat-RAM generation check
+	e.gen_check(next, ret_after);
+}
+
+/// LR.W/.D: x[rd] = load(x[rs1]) (.W sign-extended), and the reservation is
+/// set to that (old) x[rs1].
+fn lr(e: &mut Emit, w: bool, rd: u8, rs1: u8, addr: u64, ret_before: u64) {
+	let (va, base) = (e.l.t0, e.l.base);
+	let (flag, held) = (e.lay.res_flag_addr, e.lay.res_addr_addr);
+	e.get_x(rs1);
+	e.lset(va);
+	e.set_x_pre(rd);
+	e.lget(va);
+	e.dram_addr(if w { 4 } else { 8 }, addr, ret_before, false);
+	match w {
+		true => {
+			e.op(0x34);
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_LOAD);
+			e.memarg(3, 0);
+		}
+	}
+	e.set_x_post(rd);
+	e.lget(base);
+	e.i32c(1);
+	e.op(0x3a); // i32.store8
+	e.memarg(0, flag);
+	e.lget(base);
+	e.lget(va);
+	e.op(I64_STORE);
+	e.memarg(3, held);
+}
+
+/// SC.W/.D: when the reservation is held for exactly x[rs1], store x[rs2]
+/// there, drop the reservation, x[rd] = 0; otherwise drop it, x[rd] = 1. A
+/// store that cannot take the fast path bails BEFORE the reservation is
+/// touched, so the interpreter's retry still sees it held.
+#[allow(clippy::too_many_arguments)]
+fn sc(e: &mut Emit, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	const I32_AND: u8 = 0x71;
+	let (va, base) = (e.l.t0, e.l.base);
+	let (flag, held) = (e.lay.res_flag_addr, e.lay.res_addr_addr);
+	let clear = |e: &mut Emit| {
+		e.lget(base);
+		e.i32c(0);
+		e.op(0x3a); // i32.store8
+		e.memarg(0, flag);
+	};
+	e.get_x(rs1);
+	e.lset(va);
+	e.lget(base);
+	e.op(I32_LOAD8_U);
+	e.memarg(0, flag);
+	e.lget(base);
+	e.op(I64_LOAD);
+	e.memarg(3, held);
+	e.lget(va);
+	e.op(I64_EQ);
+	e.op(I32_AND);
+	e.op(IF);
+	e.op(VOID);
+	e.if_depth += 1;
+	e.lget(va);
+	e.dram_addr(if w { 4 } else { 8 }, addr, ret_before, true);
+	e.get_x(rs2);
+	match w {
+		true => {
+			e.op(0x3e);
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_STORE);
+			e.memarg(3, 0);
+		}
+	}
+	clear(e);
+	e.set_x_pre(rd);
+	e.i64c(0);
+	e.set_x_post(rd);
+	e.gen_check(next, ret_after);
+	e.op(ELSE);
+	clear(e);
+	e.set_x_pre(rd);
+	e.i64c(1);
+	e.set_x_post(rd);
+	e.if_depth -= 1;
+	e.op(END);
+}
+
+/// An f32 constant.
+fn f32c(e: &mut Emit, v: f32) {
+	e.op(0x43);
+	e.code.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+/// An f64 constant.
+fn f64c(e: &mut Emit, v: f64) {
+	e.op(0x44);
+	e.code.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+/// The single-precision table ops. Each reads its operands as the low 32
+/// bits of the f registers and writes its result zero-extended, the way
+/// every .S closure does; conversions to integers use Rust's `as` (NaN -> 0,
+/// saturating, toward zero), which is wasm's trunc_sat exactly.
+fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
+	match f {
+		FOp::Add | FOp::Sub | FOp::Mul | FOp::Div => {
+			if f == FOp::Div {
+				// if b == 0.0 { set_fcsr_dz() } (either zero: -0.0 == 0.0)
+				e.get_f32(rs2);
+				f32c(e, 0.0);
+				e.op(0x5b); // f32.eq
+				e.op(IF);
+				e.op(VOID);
+				e.fcsr_or(0x8);
+				e.op(END);
+			}
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.get_f32(rs2);
+			e.op(match f {
+				FOp::Add => 0x92,
+				FOp::Sub => 0x93,
+				FOp::Mul => 0x94,
+				_ => 0x95, // div
+			});
+			e.set_f32_post(rd);
+		}
+		FOp::Sqrt => {
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.op(0x91); // f32.sqrt
+			e.set_f32_post(rd);
+		}
+		FOp::Sgnj | FOp::Sgnjn | FOp::Sgnjx => {
+			// the sign from rs2 (inverted, or xored with rs1's), the rest of
+			// rs1, all within the low 32 bits
+			e.set_f_pre(rd);
+			e.get_f_bits(rs2);
+			if f == FOp::Sgnjx {
+				e.get_f_bits(rs1);
+				e.op(I64_XOR);
+			}
+			e.i64c(0x8000_0000);
+			e.op(I64_AND);
+			if f == FOp::Sgnjn {
+				e.i64c(0x8000_0000);
+				e.op(I64_XOR);
+			}
+			e.get_f_bits(rs1);
+			e.i64c(0x7fff_ffff);
+			e.op(I64_AND);
+			e.op(I64_OR);
+			e.set_f_bits_post(rd);
+		}
+		FOp::Eq | FOp::Lt | FOp::Le => {
+			e.set_x_pre(rd);
+			e.get_f32(rs1);
+			e.get_f32(rs2);
+			e.op(match f {
+				FOp::Eq => 0x5b,
+				FOp::Lt => 0x5d,
+				_ => 0x5f, // le
+			});
+			e.op(I64_EXTEND_I32_U);
+			e.set_x_post(rd);
+		}
+		FOp::ToW | FOp::ToWu => {
+			// a as i32 / a as u32, then as i32 as i64 (sign-extended)
+			e.set_x_pre(rd);
+			e.get_f32(rs1);
+			e.fc(if f == FOp::ToW { 0 } else { 1 }); // i32.trunc_sat_f32_s/u
+			e.op(0xac); // i64.extend_i32_s
+			e.set_x_post(rd);
+		}
+		FOp::ToL | FOp::ToLu => {
+			e.set_x_pre(rd);
+			e.get_f32(rs1);
+			e.fc(if f == FOp::ToL { 4 } else { 5 }); // i64.trunc_sat_f32_s/u
+			e.set_x_post(rd);
+		}
+		FOp::FromW | FOp::FromWu | FOp::FromL | FOp::FromLu => {
+			e.set_f_pre(rd);
+			e.get_x(rs1);
+			match f {
+				FOp::FromW => {
+					e.op(I32_WRAP_I64);
+					e.op(0xb2); // f32.convert_i32_s
+				}
+				FOp::FromWu => {
+					e.op(I32_WRAP_I64);
+					e.op(0xb3); // f32.convert_i32_u
+				}
+				FOp::FromL => e.op(0xb4), // f32.convert_i64_s
+				_ => e.op(0xb5), // f32.convert_i64_u
+			}
+			e.set_f32_post(rd);
+		}
+		FOp::Madd | FOp::Msub | FOp::Nmsub | FOp::Nmadd => {
+			// unfused, as the closures compute it: a*b+c, a*b-c, -(a*b)+c,
+			// -(a*b)-c
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.get_f32(rs2);
+			e.op(0x94); // f32.mul
+			if matches!(f, FOp::Nmsub | FOp::Nmadd) {
+				e.op(0x8c); // f32.neg
+			}
+			e.get_f32(rs3);
+			e.op(if matches!(f, FOp::Madd | FOp::Nmsub) { 0x92 } else { 0x93 });
+			e.set_f32_post(rd);
+		}
+	}
+}
+
+/// The double-precision ops the hot set leaves to the table. Conversions
+/// to integers follow the risc-box patches: saturating `as`, but NaN gives
+/// the type's MAX (signed) or all ones (unsigned) - wasm's trunc_sat gives
+/// 0 there, so NaN is selected separately.
+fn fp_double(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
+	match f {
+		FOp::Sqrt => {
+			e.set_f_pre(rd);
+			e.get_f(rs1);
+			e.op(0x9f); // f64.sqrt
+			e.set_f_post(rd);
+		}
+		FOp::Sgnjn | FOp::Sgnjx => {
+			e.set_f_pre(rd);
+			e.get_f_bits(rs2);
+			if f == FOp::Sgnjx {
+				e.get_f_bits(rs1);
+				e.op(I64_XOR);
+			}
+			e.i64c(i64::MIN);
+			e.op(I64_AND);
+			if f == FOp::Sgnjn {
+				e.i64c(i64::MIN);
+				e.op(I64_XOR);
+			}
+			e.get_f_bits(rs1);
+			e.i64c(i64::MAX);
+			e.op(I64_AND);
+			e.op(I64_OR);
+			e.set_f_bits_post(rd);
+		}
+		FOp::Eq | FOp::Lt | FOp::Le => {
+			e.set_x_pre(rd);
+			e.get_f(rs1);
+			e.get_f(rs2);
+			e.op(match f {
+				FOp::Eq => 0x61,
+				FOp::Lt => 0x63,
+				_ => 0x65, // le
+			});
+			e.op(I64_EXTEND_I32_U);
+			e.set_x_post(rd);
+		}
+		FOp::ToW | FOp::ToWu | FOp::ToL | FOp::ToLu => {
+			// select(nan_value, converted, a != a)
+			e.set_x_pre(rd);
+			e.i64c(match f {
+				FOp::ToW => i32::MAX as i64,
+				FOp::ToWu => -1, // u32::MAX as i32 as i64
+				FOp::ToL => i64::MAX,
+				_ => -1, // u64::MAX as i64
+			});
+			e.get_f(rs1);
+			match f {
+				FOp::ToW => {
+					e.fc(2); // i32.trunc_sat_f64_s
+					e.op(0xac);
+				}
+				FOp::ToWu => {
+					e.fc(3); // i32.trunc_sat_f64_u
+					e.op(0xac);
+				}
+				FOp::ToL => e.fc(6), // i64.trunc_sat_f64_s
+				_ => e.fc(7), // i64.trunc_sat_f64_u
+			}
+			e.get_f(rs1);
+			e.get_f(rs1);
+			e.op(0x62); // f64.ne: NaN
+			e.op(SELECT);
+			e.set_x_post(rd);
+		}
+		FOp::FromWu | FOp::FromL | FOp::FromLu => {
+			e.set_f_pre(rd);
+			e.get_x(rs1);
+			match f {
+				FOp::FromWu => {
+					e.op(I32_WRAP_I64);
+					e.op(0xb8); // f64.convert_i32_u
+				}
+				FOp::FromL => e.op(0xb9), // f64.convert_i64_s
+				_ => e.op(0xba), // f64.convert_i64_u
+			}
+			e.set_f_post(rd);
+		}
+		FOp::Madd | FOp::Msub | FOp::Nmsub | FOp::Nmadd => {
+			e.set_f_pre(rd);
+			e.get_f(rs1);
+			e.get_f(rs2);
+			e.op(0xa2); // f64.mul
+			if matches!(f, FOp::Nmsub | FOp::Nmadd) {
+				e.op(0x9a); // f64.neg
+			}
+			e.get_f(rs3);
+			e.op(if matches!(f, FOp::Madd | FOp::Nmsub) { 0xa0 } else { 0xa1 });
+			e.set_f_post(rd);
+		}
+		// the hot set's (FADD/FSUB/FMUL/FDIV.D) and FCVT.D.W never reach here
+		_ => unreachable!("not a table double op"),
+	}
+}
+
+/// CSRRW/S/C (and I forms) on fflags, frm, fcsr, as the closures run them:
+/// data = read; src = x[rs1] (taken before rd is written) or the 5-bit
+/// zimm; x[rd] = data; write(src | data|src | data&!src). read_csr_raw
+/// gives fflags = fcsr & 0x1f and frm = (fcsr >> 5) & 7; write_csr_raw
+/// merges fflags and frm into fcsr and stores fcsr itself raw.
+fn csr_op(e: &mut Emit, kind: CsrOp, imm: bool, csr: u16, rd: u8, rs1: u8) {
+	let (data, src, val, base, at) = (e.l.t0, e.l.t1, e.l.t2, e.l.base, e.lay.fcsr_addr);
+	let fcsr = |e: &mut Emit| {
+		e.lget(base);
+		e.op(I64_LOAD);
+		e.memarg(3, at);
+	};
+	fcsr(e);
+	match csr {
+		1 => {
+			e.i64c(0x1f);
+			e.op(I64_AND);
+		}
+		2 => {
+			e.i64c(5);
+			e.op(I64_SHR_U);
+			e.i64c(7);
+			e.op(I64_AND);
+		}
+		_ => {}
+	}
+	e.lset(data);
+	match imm {
+		true => e.i64c(rs1 as i64),
+		false => e.get_x(rs1),
+	}
+	e.lset(src);
+	e.set_x_pre(rd);
+	e.lget(data);
+	e.set_x_post(rd);
+	match kind {
+		CsrOp::W => e.lget(src),
+		CsrOp::S => {
+			e.lget(data);
+			e.lget(src);
+			e.op(I64_OR);
+		}
+		CsrOp::C => {
+			e.lget(data);
+			e.lget(src);
+			e.i64c(-1);
+			e.op(I64_XOR);
+			e.op(I64_AND);
+		}
+	}
+	e.lset(val);
+	e.lget(base);
+	match csr {
+		1 | 2 => {
+			let (keep, shift, mask) = if csr == 1 { (!0x1fi64, 0, 0x1f) } else { (!0xe0i64, 5, 0xe0) };
+			fcsr(e);
+			e.i64c(keep);
+			e.op(I64_AND);
+			e.lget(val);
+			if shift != 0 {
+				e.i64c(shift);
+				e.op(I64_SHL);
+			}
+			e.i64c(mask);
+			e.op(I64_AND);
+			e.op(I64_OR);
+		}
+		_ => e.lget(val),
+	}
+	e.op(I64_STORE);
+	e.memarg(3, at);
+}
+
+/// The integer table ops, in wasm (RV64): rd = f(x[rs1], x[rs2]) with
+/// RISC-V's division rules — x/0 = -1 (all ones), x%0 = x, MIN/-1 = MIN,
+/// MIN%-1 = 0 — guarded before wasm's trapping div/rem.
+fn emit_int_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
 	const I32_EQZ: u8 = 0x45;
 	const I32_EQ: u8 = 0x46;
 	const I32_AND: u8 = 0x71;
@@ -884,7 +1705,7 @@ fn emit_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
 			}
 			e.op(END);
 		}
-		TableOp::Fence => unreachable!(),
+		_ => unreachable!(),
 	}
 	e.set_x_post(rd);
 }
@@ -1107,6 +1928,25 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			HOT_FADD_D => fp_bin(e, rd, rs1, rs2, 0xa0),
 			HOT_FSUB_D => fp_bin(e, rd, rs1, rs2, 0xa1),
 			HOT_FMUL_D => fp_bin(e, rd, rs1, rs2, 0xa2),
+			HOT_FDIV_D => {
+				// verbatim from the interpreter: ANY zero divisor (-0.0 ==
+				// 0.0, so the -0.0 arm there never runs) gives +inf and
+				// raises DZ; otherwise IEEE division
+				e.set_f_pre(rd);
+				e.get_f(rs2);
+				f64c(e, 0.0);
+				e.op(0x61); // f64.eq
+				e.op(IF);
+				e.op(0x7c); // -> f64
+				e.fcsr_or(0x8);
+				f64c(e, f64::INFINITY);
+				e.op(ELSE);
+				e.get_f(rs1);
+				e.get_f(rs2);
+				e.op(0xa3); // f64.div
+				e.op(END);
+				e.set_f_post(rd);
+			}
 			HOT_FSGNJ_D => {
 				// f[rd] = (bits(rs2) & SIGN) | (bits(rs1) & !SIGN)
 				e.set_f_pre(rd);
@@ -1138,7 +1978,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.set_f_post(rd);
 			}
 			0 if table_op(op).is_some() => {
-				emit_table_op(e, table_op(op).unwrap(), rd, rs1, rs2);
+				emit_table_op(e, table_op(op).unwrap(), op, addr, next, ret_before, ret_after);
 			}
 			_ => {
 				// outside the subset. A first-op miss means nothing to
@@ -1485,12 +2325,13 @@ fn assemble(body_expr: Vec<u8>, reg_locals: u32, lay: &Layout) -> Vec<u8> {
 	section(&mut m, 7, &s);
 	let addr = if lay.memory64 { 0x7e } else { 0x7f };
 	let mut body = Vec::new();
-	uleb(&mut body, if reg_locals > 0 { 6 } else { 5 });
+	uleb(&mut body, if reg_locals > 0 { 7 } else { 6 });
 	body.extend_from_slice(&[1, 0x7e]); // 2 scratch
 	body.extend_from_slice(&[1, 0x7f]); // 3 cur
 	body.extend_from_slice(&[5, 0x7e]); // 4 retired, 5 scratch2, 6 bias, 7 tpc, 8 pcv
 	body.extend_from_slice(&[5, addr]); // 9 base, 10 rdt, 11 wrt, 12 marks, 13 addr
 	body.extend_from_slice(&[1, 0x7f]); // 14 meta
+	body.extend_from_slice(&[3, 0x7e]); // 15 t0, 16 t1, 17 t2
 	if reg_locals > 0 {
 		uleb(&mut body, reg_locals as u64); // 15.. cached guest registers
 		body.push(0x7e);
@@ -2163,6 +3004,7 @@ mod test_tier2 {
 			memory64: false, shared: false, max_pages: None, ctx: 2048,
 			x_base: 0, f_base: 512, tlb: None, pc_addr: 256, gen_addr: 264,
 			baked_gen: 1, guest_dram_base: 0x8000_0000, dram_len: 65536,
+			fcsr_addr: 272, res_flag_addr: 280, res_addr_addr: 288,
 			ram: Ram::Flat { dram_base: 4096 },
 		}
 	}

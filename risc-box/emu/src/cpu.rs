@@ -1548,6 +1548,9 @@ impl Cpu {
 			pc_addr: 256,
 			gen_addr: 264,
 			baked_gen: 0,
+			fcsr_addr: 272,
+			res_flag_addr: 280,
+			res_addr_addr: 288,
 			tlb: None,
 			guest_dram_base: 0x8000_0000,
 			dram_len: 1 << 31,
@@ -1620,6 +1623,9 @@ impl Cpu {
 			pc_addr: off(&self.pc as *const u64 as usize as u64),
 			gen_addr: 0,
 			baked_gen: 0,
+			fcsr_addr: off(&self.csr[CSR_FCSR_ADDRESS as usize] as *const u64 as usize as u64),
+			res_flag_addr: off(&self.is_reservation_set as *const bool as usize as u64),
+			res_addr_addr: off(&self.reservation as *const u64 as usize as u64),
 			tlb: Some(::jit::TlbLayout {
 				sets,
 				read_tags: off(tlb[0]),
@@ -4210,7 +4216,10 @@ fn get_register_name(num: usize) -> &'static str {
 	}
 }
 
-const INSTRUCTION_NUM: usize = 153;
+// risc-box patch: 161 = upstream's table + the AMOs it never had, appended
+// at the END so every existing entry keeps its index (a BlockOp carries the
+// index in `data`, and the baked AOT regions are keyed by a hash over it).
+const INSTRUCTION_NUM: usize = 161;
 
 // @TODO: Reorder in often used order as 
 const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
@@ -6342,6 +6351,180 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			Ok(())
 		},
 		disassemble: dump_format_i
+	},	// risc-box patch: the AMOs upstream never implemented. Without them the
+	// guest SIGILLs on the first one: Rust's AtomicX::fetch_xor/fetch_min/
+	// fetch_max compile straight to these, and tokio's task state machine
+	// uses fetch_xor, so every tokio program died with "Illegal
+	// instruction" (rustup's default downloader among them). Same shape as
+	// the AMOs above: load, compute from x[rs2] and the old value, store,
+	// rd = old (a W result sign-extended). One hart, so no atomicity to keep.
+	Instruction {
+		mask: 0xf800707f,
+		data: 0x2000302f,
+		name: "AMOXOR.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i64 = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i64,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i64;
+			let new: i64 = src ^ tmp;
+			match cpu.mmu.store_doubleword(cpu.x[f.rs1] as u64, new as u64) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0x2000202f,
+		name: "AMOXOR.W",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i32 = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i32,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i32;
+			let new: i32 = src ^ tmp;
+			match cpu.mmu.store_word(cpu.x[f.rs1] as u64, new as u32) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0x8000302f,
+		name: "AMOMIN.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i64 = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i64,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i64;
+			let new: i64 = src.min(tmp);
+			match cpu.mmu.store_doubleword(cpu.x[f.rs1] as u64, new as u64) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0x8000202f,
+		name: "AMOMIN.W",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i32 = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i32,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i32;
+			let new: i32 = src.min(tmp);
+			match cpu.mmu.store_word(cpu.x[f.rs1] as u64, new as u32) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0xa000302f,
+		name: "AMOMAX.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i64 = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i64,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i64;
+			let new: i64 = src.max(tmp);
+			match cpu.mmu.store_doubleword(cpu.x[f.rs1] as u64, new as u64) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0xa000202f,
+		name: "AMOMAX.W",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i32 = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i32,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i32;
+			let new: i32 = src.max(tmp);
+			match cpu.mmu.store_word(cpu.x[f.rs1] as u64, new as u32) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0xc000302f,
+		name: "AMOMINU.D",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i64 = match cpu.mmu.load_doubleword(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i64,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i64;
+			let new: i64 = (src as u64).min(tmp as u64) as i64;
+			match cpu.mmu.store_doubleword(cpu.x[f.rs1] as u64, new as u64) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp;
+			Ok(())
+		},
+		disassemble: dump_format_r
+	},
+	Instruction {
+		mask: 0xf800707f,
+		data: 0xc000202f,
+		name: "AMOMINU.W",
+		operation: |cpu, word, _address| {
+			let f = parse_format_r(word);
+			let tmp: i32 = match cpu.mmu.load_word(cpu.x[f.rs1] as u64) {
+				Ok(data) => data as i32,
+				Err(e) => return Err(e)
+			};
+			let src = cpu.x[f.rs2] as i32;
+			let new: i32 = (src as u32).min(tmp as u32) as i32;
+			match cpu.mmu.store_word(cpu.x[f.rs1] as u64, new as u32) {
+				Ok(()) => {},
+				Err(e) => return Err(e)
+			};
+			cpu.x[f.rd] = tmp as i64;
+			Ok(())
+		},
+		disassemble: dump_format_r
 	},
 ];
 
@@ -6462,6 +6645,47 @@ mod test_cpu {
 
 	fn create_cpu() -> Cpu {
 		Cpu::new(Box::new(DummyTerminal::new()))
+	}
+
+	/// The AMOs upstream never had decode (no more SIGILL) and do what the
+	/// spec says: memory gets f(rs2, old), rd gets old (a .W old value
+	/// sign-extended), signed vs unsigned comparisons where it matters.
+	/// Hand-computed expectations, independent of the JIT tests (which
+	/// only compare the translator against these closures).
+	#[test]
+	fn the_added_amos_decode_and_follow_the_spec() {
+		let mut cpu = create_cpu();
+		cpu.get_mut_mmu().init_memory(65536);
+		let at = DRAM_BASE + 0x100;
+		// (name, funct5, .W?, old in memory, x[rs2], stored, rd)
+		let cases: &[(&str, u32, bool, u64, i64, u64, i64)] = &[
+			("AMOXOR.D", 0b00100, false, 0xff00, 0x0ff0, 0xf0f0, 0xff00),
+			("AMOXOR.W", 0b00100, true, 0x8000_0001, 3, 0x8000_0002, 0xffff_ffff_8000_0001u64 as i64),
+			("AMOMIN.D", 0b10000, false, 5, -3, -3i64 as u64, 5),
+			("AMOMIN.W", 0b10000, true, 0xffff_ffff, 1, 0xffff_ffff, -1),
+			("AMOMAX.D", 0b10100, false, (-9i64) as u64, -2, (-2i64) as u64, -9),
+			("AMOMAX.W", 0b10100, true, 0xffff_fffe, 0x1_0000_0001, 1, -2),
+			("AMOMINU.D", 0b11000, false, 7, -1, 7, 7),
+			("AMOMINU.W", 0b11000, true, 0xffff_fff0, 0x5, 5, 0xffff_fff0u32 as i32 as i64),
+		];
+		for &(name, funct5, w, old, src, stored, rd) in cases {
+			let word = funct5 << 27 | if w { 0x2000 } else { 0x3000 } | 0x2f | 5 << 7 | 6 << 15 | 7 << 20;
+			let index = cpu.decode_and_get_instruction_index(word).unwrap_or_else(|_| panic!("{} decodes", name));
+			assert_eq!(INSTRUCTIONS[index].name, name);
+			let _ = cpu.get_mut_mmu().store_doubleword(at, 0);
+			let _ = match w {
+				true => cpu.get_mut_mmu().store_word(at, old as u32),
+				false => cpu.get_mut_mmu().store_doubleword(at, old),
+			};
+			cpu.x[6] = at as i64;
+			cpu.x[7] = src;
+			assert!((INSTRUCTIONS[index].operation)(&mut cpu, word, 0).is_ok(), "{}", name);
+			let mem = match w {
+				true => cpu.get_mut_mmu().load_word(at).ok().unwrap() as u64,
+				false => cpu.get_mut_mmu().load_doubleword(at).ok().unwrap(),
+			};
+			assert_eq!((mem, cpu.x[5]), (stored, rd), "{}", name);
+		}
 	}
 
 	#[test]
@@ -7537,6 +7761,9 @@ mod test_jit_equivalence {
 	const XB: u64 = 0; // x[32] at 0
 	const PCA: u64 = 256;
 	const GENA: u64 = 264;
+	const FCSRA: u64 = 272; // fcsr (u64)
+	const RESF: u64 = 280; // reservation flag (u8)
+	const RESA: u64 = 288; // reservation address (u64)
 	const FB: u64 = 512; // f[32] as raw 8-byte cells
 	const CTXA: u64 = 2048; // context block (base 0, bias 0)
 	const DB: u64 = 4096; // linear offset of guest DRAM window
@@ -7739,6 +7966,9 @@ mod test_jit_equivalence {
 			pc_addr: PCA,
 			gen_addr: GENA,
 			baked_gen: cpu.mmu.code_gen(),
+			fcsr_addr: FCSRA,
+			res_flag_addr: RESF,
+			res_addr_addr: RESA,
 			tlb: None,
 			guest_dram_base: DRAM_BASE,
 			dram_len: WIN,
@@ -7755,6 +7985,9 @@ mod test_jit_equivalence {
 		}
 		m.put64(PCA, start);
 		m.put(GENA, &cpu_pre.mmu.code_gen().to_le_bytes());
+		m.put64(FCSRA, cpu_pre.csr[CSR_FCSR_ADDRESS as usize]);
+		m.put(RESF, &[cpu_pre.is_reservation_set as u8]);
+		m.put64(RESA, cpu_pre.reservation);
 		m.put64(CTXA + jit::CTX_BASE, 0);
 		m.put64(CTXA + jit::CTX_BIAS, 0);
 		let mut win = vec![0u8; WIN as usize];
@@ -7920,7 +8153,21 @@ mod test_jit_equivalence {
 				names.push(INSTRUCTIONS[index].name);
 			}
 		}
-		assert_eq!(names.len(), 11, "{:?}", names);
+		// 11 integer/fence ops + MULH x3, 18 AMOs, LR/SC x4, 23 single and
+		// 17 double float ops, FCVT.D.S/S.D, FMV.X.W/W.X; the CSR ops only
+		// count for fflags/frm/fcsr, and `op` builds a word whose csr is 0
+		assert_eq!(names.len(), 80, "{:?}", names);
+		for (base, name) in [(0x1073u32, "CSRRW"), (0x2073, "CSRRS"), (0x3073, "CSRRC"),
+			(0x5073, "CSRRWI"), (0x6073, "CSRRSI"), (0x7073, "CSRRCI")]
+		{
+			for csr in [1u32, 2, 3, 0x300, 0xc01, 0x180] {
+				let o = decode_op_for_test(&cpu, base | 5 << 7 | 6 << 15 | csr << 20);
+				assert_eq!(op_name(&o), name);
+				let emits = jit::emit_block(&[o], DRAM_BASE, &lay).is_some();
+				assert_eq!(jit::translatable(&o), emits, "{} csr {:#x}", name, csr);
+				assert_eq!(emits, csr <= 3, "{} csr {:#x}", name, csr);
+			}
+		}
 	}
 
 	/// The M-extension ops and fences the translator takes over from the
@@ -7975,6 +8222,244 @@ mod test_jit_equivalence {
 			}
 		}
 		assert_eq!(checked, 540);
+	}
+
+	/// The fcsr cell and the LR/SC reservation, as a flat module left them.
+	fn flat_extra(m: &Mem) -> (u64, u8, u64) {
+		(m.get64(FCSRA), m.get(RESF, 1)[0], m.get64(RESA))
+	}
+
+	/// The word of INSTRUCTIONS entry `name` with register fields filled in
+	/// wherever its mask leaves them free (rd, rs1, rs2, rs3).
+	fn word_of(name: &str, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> u32 {
+		let i = INSTRUCTIONS.iter().find(|i| i.name == name).unwrap_or_else(|| panic!("{}", name));
+		let fields = rd << 7 | rs1 << 15 | rs2 << 20 | rs3 << 27;
+		i.data | (fields & !i.mask)
+	}
+
+	/// Floats worth comparing: zeros, ones, fractions, large and tiny,
+	/// infinities - and, when `nan`, NaNs (only for ops whose results are
+	/// not NaN floats: a NaN result's payload can differ between the native
+	/// interpreter here and wasm, while production runs both under wasm).
+	fn f64_pick(r: &mut Rng, nan: bool) -> f64 {
+		let v = [0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 3.75, 1e300, -1e-300, 2147483648.0,
+			-2147483649.0, 9.3e18, -9.3e18, 1.8e19, 4294967295.5, f64::INFINITY, f64::NEG_INFINITY];
+		match r.next() % 4 {
+			0 if nan => f64::NAN,
+			1 => v[(r.next() % v.len() as u64) as usize],
+			_ => ((r.next() % 4_000_000) as f64 - 2_000_000.0) / 1000.0,
+		}
+	}
+	fn f32_bits_pick(r: &mut Rng, nan: bool) -> u64 {
+		let v = [0.0f32, -0.0, 1.0, -1.0, 0.5, -2.5, 3.75, 3e38, -1e-38, 2147483648.0,
+			-2147483904.0, 9.3e18, -9.3e18, 1.8e19, 16777217.0, f32::INFINITY, f32::NEG_INFINITY];
+		let f = match r.next() % 4 {
+			0 if nan => f32::NAN,
+			1 => v[(r.next() % v.len() as u64) as usize],
+			_ => ((r.next() % 4_000_000) as f32 - 2_000_000.0) / 1000.0,
+		};
+		// garbage in the upper half: the single ops must ignore it
+		(r.next() & 0xffff_ffff_0000_0000) | f.to_bits() as u64
+	}
+
+	/// Run `ops` (one block at DRAM_BASE) compiled and interpreted from the
+	/// same state; compare everything either side can touch.
+	fn same_as_interpreter(engine: &wasmtime::Engine, cpu: &mut Cpu, ops: &[BlockOp], what: &str) {
+		let lay = flat_layout(cpu);
+		let bytes = jit::emit_block(ops, DRAM_BASE, &lay).unwrap_or_else(|| panic!("{} emits", what));
+		let mut m = flat_mem(engine, cpu, DRAM_BASE);
+		let rw = m.call_region(engine, &bytes, 1 << 20, 0);
+		let (xw, pcw, dramw, fw) = flat_state(&m);
+		let extra_w = flat_extra(&m);
+		cpu.update_pc(DRAM_BASE);
+		let ri = region_ref(cpu, &[(DRAM_BASE, ops.to_vec())], 1 << 20, None);
+		let mut dram_i = vec![0u8; WIN as usize];
+		cpu.mmu.read_physical_range(DRAM_BASE, &mut dram_i);
+		let mut fi = [0u64; 32];
+		for i in 0..32 {
+			fi[i] = cpu.f[i].to_bits();
+		}
+		let extra_i = (cpu.csr[CSR_FCSR_ADDRESS as usize], cpu.is_reservation_set as u8, cpu.reservation);
+		assert_eq!((rw, pcw), (ri, cpu.pc), "{}: retired/pc", what);
+		assert_eq!(xw, cpu.x, "{}: x", what);
+		assert_eq!(fw, fi, "{}: f", what);
+		assert_eq!(extra_w, extra_i, "{}: fcsr/reservation", what);
+		assert!(dramw == dram_i, "{}: dram", what);
+	}
+
+	/// MULH/MULHSU/MULHU and every AMO (including the four this change
+	/// adds to the interpreter), on edge-heavy operands, rd aliasing the
+	/// sources included.
+	#[test]
+	fn mulh_and_amos_match_the_interpreter() {
+		let engine = engine();
+		let edge: [i64; 12] = [0, 1, -1, 2, -7, i64::MIN, i64::MAX, i32::MIN as i64, i32::MAX as i64,
+			0x1_0000_0000, -0x1_0000_0001, 0x7fff_ffff_ffff_fff0];
+		let mut r = Rng(1234);
+		let names = ["MULH", "MULHSU", "MULHU", "AMOADD.W", "AMOADD.D", "AMOSWAP.W", "AMOSWAP.D",
+			"AMOXOR.W", "AMOXOR.D", "AMOOR.W", "AMOOR.D", "AMOAND.W", "AMOAND.D", "AMOMIN.W", "AMOMIN.D",
+			"AMOMAX.W", "AMOMAX.D", "AMOMINU.W", "AMOMINU.D", "AMOMAXU.W", "AMOMAXU.D"];
+		let mut checked = 0;
+		for name in names.iter() {
+			let amo = name.starts_with("AMO");
+			for k in 0..80u64 {
+				let mut cpu = fresh_cpu(&mut Rng(k * 7 + 3));
+				let pick = |r: &mut Rng| match r.next() % 3 {
+					0 => edge[(r.next() % edge.len() as u64) as usize],
+					_ => r.next() as i64,
+				};
+				// rd: a fresh register, or one of the sources
+				let (rd, rs1, rs2) = match k % 4 {
+					0 => (6, 6, 7),
+					1 => (7, 6, 7),
+					_ => (5, 6, 7),
+				};
+				cpu.x[7] = pick(&mut r);
+				match amo {
+					true => {
+						let at = DRAM_BASE + 8192 + (r.next() % 4096 & !7);
+						cpu.x[6] = at as i64;
+						let v = pick(&mut r) as u64;
+						let _ = cpu.mmu.store_doubleword(at, v);
+					}
+					false => cpu.x[6] = pick(&mut r),
+				}
+				let w = word_of(name, rd, rs1, rs2, 0);
+				let ops = vec![decode_op_for_test(&cpu, w), op(HOT_ADDI, 28, rd as u8, 0, 1)];
+				assert!(ops[0].kind == 0 && jit::translatable(&ops[0]), "{}", name);
+				same_as_interpreter(&engine, &mut cpu, &ops, &format!("{} case {}", name, k));
+				checked += 1;
+			}
+		}
+		assert_eq!(checked, 21 * 80);
+	}
+
+	/// LR/SC: a reservation taken and used in one block, an SC with no
+	/// reservation, an SC for another address, an LR after an SC; the
+	/// reservation's flag and address are compared as well as the memory.
+	#[test]
+	fn lr_sc_match_the_interpreter() {
+		let engine = engine();
+		let mut r = Rng(99);
+		let mut checked = 0;
+		for &wide in &[true, false] {
+			let (lr, sc) = if wide { ("LR.D", "SC.D") } else { ("LR.W", "SC.W") };
+			for k in 0..120u64 {
+				let mut cpu = fresh_cpu(&mut Rng(k + 11));
+				let at = DRAM_BASE + 8192 + (r.next() % 2048 & !7);
+				let other = at + 64;
+				cpu.x[6] = at as i64;
+				cpu.x[9] = other as i64;
+				cpu.is_reservation_set = r.next() % 2 == 0;
+				cpu.reservation = match r.next() % 3 {
+					0 => at,
+					1 => other,
+					_ => r.next(),
+				};
+				let addi = |rd: u8, rs: u8, imm: i32| op(HOT_ADDI, rd, rs, 0, imm);
+				let ops = match k % 5 {
+					// lr; add; sc - the CAS loop body
+					0 => vec![decode_op_for_test(&cpu, word_of(lr, 5, 6, 0, 0)), addi(5, 5, 3),
+						decode_op_for_test(&cpu, word_of(sc, 8, 6, 5, 0)), addi(28, 8, 1)],
+					// sc alone: whatever reservation the state holds
+					1 => vec![decode_op_for_test(&cpu, word_of(sc, 8, 6, 7, 0)), addi(28, 8, 1)],
+					// sc to the other address
+					2 => vec![decode_op_for_test(&cpu, word_of(sc, 8, 9, 7, 0)), addi(28, 8, 1)],
+					// lr, then sc elsewhere (fails, drops it), then sc here (fails)
+					3 => vec![decode_op_for_test(&cpu, word_of(lr, 5, 6, 0, 0)),
+						decode_op_for_test(&cpu, word_of(sc, 8, 9, 7, 0)),
+						decode_op_for_test(&cpu, word_of(sc, 10, 6, 7, 0)), addi(28, 10, 1)],
+					// lr with rd == rs1: the reservation keeps the OLD address
+					_ => vec![decode_op_for_test(&cpu, word_of(lr, 6, 6, 0, 0)), addi(28, 6, 1)],
+				};
+				same_as_interpreter(&engine, &mut cpu, &ops, &format!("{} case {}", lr, k));
+				checked += 1;
+			}
+		}
+		assert_eq!(checked, 240);
+	}
+
+	/// Every float op the translator takes from the table, single and
+	/// double, plus FDIV.D (hot) and the float CSRs: operand values from
+	/// f64_pick / f32_bits_pick, NaN only where the result is not a NaN
+	/// float, fcsr starting from random bits.
+	#[test]
+	fn float_ops_and_float_csrs_match_the_interpreter() {
+		let engine = engine();
+		let mut r = Rng(4242);
+		// (name, NaN operands allowed, single precision)
+		let fops: &[(&str, bool, bool)] = &[
+			("FADD.S", false, true), ("FSUB.S", false, true), ("FMUL.S", false, true),
+			("FDIV.S", false, true), ("FSQRT.S", false, true), ("FSGNJ.S", true, true),
+			("FSGNJN.S", true, true), ("FSGNJX.S", true, true), ("FEQ.S", true, true),
+			("FLT.S", true, true), ("FLE.S", true, true), ("FCVT.W.S", true, true),
+			("FCVT.WU.S", true, true), ("FCVT.L.S", true, true), ("FCVT.LU.S", true, true),
+			("FCVT.S.W", false, true), ("FCVT.S.WU", false, true), ("FCVT.S.L", false, true),
+			("FCVT.S.LU", false, true), ("FMADD.S", false, true), ("FMSUB.S", false, true),
+			("FNMSUB.S", false, true), ("FNMADD.S", false, true), ("FMV.X.W", true, true),
+			("FMV.W.X", false, true), ("FCVT.D.S", false, true),
+			("FSQRT.D", false, false), ("FSGNJN.D", true, false), ("FSGNJX.D", true, false),
+			("FEQ.D", true, false), ("FLT.D", true, false), ("FLE.D", true, false),
+			("FCVT.W.D", true, false), ("FCVT.WU.D", true, false), ("FCVT.L.D", true, false),
+			("FCVT.LU.D", true, false), ("FCVT.D.WU", false, false), ("FCVT.D.L", false, false),
+			("FCVT.D.LU", false, false), ("FMADD.D", false, false), ("FMSUB.D", false, false),
+			("FNMADD.D", false, false), ("FNMSUB.D", false, false), ("FCVT.S.D", false, false),
+			("FDIV.D", false, false),
+		];
+		let mut checked = 0;
+		for &(name, nan, single) in fops.iter() {
+			for k in 0..60u64 {
+				let mut cpu = fresh_cpu(&mut Rng(k * 13 + 1));
+				for i in 0..32 {
+					cpu.f[i] = match single {
+						true => f64::from_bits(f32_bits_pick(&mut r, nan)),
+						false => f64_pick(&mut r, nan),
+					};
+				}
+				if k % 6 == 0 {
+					// a zero divisor (and FDIV.D's -0.0 case)
+					cpu.f[7] = match (single, k % 12 == 0) {
+						(true, _) => f64::from_bits(r.next() & 0xffff_ffff_0000_0000 | (k % 12 == 0) as u64 * 0x8000_0000),
+						(false, true) => -0.0,
+						(false, false) => 0.0,
+					};
+				}
+				// integers for the int -> float conversions
+				cpu.x[6] = match r.next() % 3 {
+					0 => [0, -1, 1, i64::MIN, i64::MAX, u32::MAX as i64, i32::MIN as i64][(r.next() % 7) as usize],
+					_ => r.next() as i64,
+				};
+				cpu.csr[CSR_FCSR_ADDRESS as usize] = r.next() & 0xff;
+				let rd = if k % 5 == 0 { 6 } else { 5 };
+				let w = word_of(name, rd, 6, 7, 28);
+				let first = decode_op_for_test(&cpu, w);
+				assert!(jit::translatable(&first), "{}", name);
+				let ops = vec![first, op(HOT_ADDI, 29, 5, 0, 1)];
+				same_as_interpreter(&engine, &mut cpu, &ops, &format!("{} case {}", name, k));
+				checked += 1;
+			}
+		}
+		// the float CSRs: every op and form, on fflags/frm/fcsr, from
+		// random fcsr bits (including bits above frm, which fcsr keeps raw)
+		for (base, imm) in [(0x1073u32, false), (0x2073, false), (0x3073, false),
+			(0x5073, true), (0x6073, true), (0x7073, true)]
+		{
+			for csr in 1u32..=3 {
+				for k in 0..20u64 {
+					let mut cpu = fresh_cpu(&mut Rng(k + 500));
+					cpu.csr[CSR_FCSR_ADDRESS as usize] = r.next() & if k % 2 == 0 { 0xff } else { 0xffff };
+					let rd = [5u32, 6, 0][(k % 3) as usize];
+					let src = if imm { (r.next() % 32) as u32 } else { 6 };
+					let w = base | rd << 7 | src << 15 | csr << 20;
+					let first = decode_op_for_test(&cpu, w);
+					assert!(jit::translatable(&first));
+					let ops = vec![first, op(HOT_ADDI, 29, 5, 0, 1)];
+					same_as_interpreter(&engine, &mut cpu, &ops, &format!("{} csr {} case {}", op_name(&first), csr, k));
+					checked += 1;
+				}
+			}
+		}
+		assert_eq!(checked, fops.len() * 60 + 6 * 3 * 20);
 	}
 
 	#[test]
@@ -8113,6 +8598,9 @@ mod test_jit_equivalence {
 			pc_addr: S_PC,
 			gen_addr: 0,
 			baked_gen: 0,
+			fcsr_addr: 0x108,
+			res_flag_addr: 0x110,
+			res_addr_addr: 0x118,
 			tlb: Some(jit::TlbLayout {
 				sets: 512,
 				read_tags: 0x1000,
