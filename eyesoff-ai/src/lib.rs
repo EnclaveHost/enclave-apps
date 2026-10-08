@@ -6112,6 +6112,9 @@ struct ToolLoop<'a> {
     /// full: the model is told to compact even below the tell mark, while
     /// its conversation holds a real share of the pool
     pool_pressed: bool,
+    /// the call the force mark held back, which the compaction drops along
+    /// with everything else: its result names it, so the model can make it
+    held: Option<String>,
     /// how many times this loop compacted, and the newest summary - the
     /// page keeps it, so the next request does not resend what it replaced
     compactions: usize,
@@ -6307,6 +6310,7 @@ impl<'a> ToolLoop<'a> {
             compact_floor: None,
             compact_pending: false,
             pool_pressed: false,
+            held: None,
             compactions: 0,
             summary: None,
             ledger_on,
@@ -6480,13 +6484,19 @@ impl<'a> ToolLoop<'a> {
                     name: c.name.clone(),
                     args: serde_json::json!({ "summary": "(in the result below)" }),
                 });
-                let head = |gone: usize| format!(
-                    "Compacted. The conversation was {was} tokens; {gone} earlier messages are gone \
-                     and this summary, which you wrote, stands in for them. Carry on from it.\n\n"
-                );
+                let held = self.held.take();
                 // the count is only known once the messages are gone
                 let gone = self.replace_history(messages, call, "");
-                let t = format!("{}{summary}", head(gone));
+                let t = format!(
+                    "Compacted. The conversation was {was} tokens; {gone} earlier messages are gone, \
+                     and this summary, which you wrote, is now the only record of them:\n\n{summary}\n\n\
+                     [Carry on from the summary. What it lists as done IS done - do not repeat any of \
+                     it; go on with its next step.{}]",
+                    held.map_or(String::new(), |h| format!(
+                        " The call you were stopped from making until you compacted was {h} - make it \
+                         now if it is still the next step."
+                    )),
+                );
                 if let Some(m) = messages.last_mut() {
                     m.content = tools::response_turn(&c.name, &t);
                 }
@@ -6527,6 +6537,7 @@ impl<'a> ToolLoop<'a> {
             return None;
         }
         self.compact_told = true;
+        self.held = Some(serde_json::json!({ "name": c.name, "arguments": c.args }).to_string());
         on_note("the context is nearly full; the model was asked to compact it before calling anything else");
         messages.push(ChatMsg::text("assistant", canonical_call(c)));
         messages.push(ChatMsg::text(
@@ -13632,6 +13643,18 @@ mod tests {
         assert!(tl.step(&call(3), &mut msgs, &|_| *ran.borrow_mut() += 1, &|_| {}, &|_| {}));
         assert_eq!(*ran.borrow(), 0);
         assert!(msgs.last().unwrap().content.contains("This call was NOT run") && msgs.last().unwrap().content.contains("Call compact now"));
+        // a model that compacts when held is told which call it was held from
+        {
+            let mut t2 = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+            let mut m = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "go")];
+            t2.note_prompt(71_000, 100_000, 100_000);
+            assert!(t2.step(&call(5), &mut m, &|_| {}, &|_| {}, &|_| {}));
+            let c = "<tool_call>{\"name\":\"compact\",\"arguments\":{\"summary\":\"pages 1-4 read\"}}</tool_call>";
+            assert!(t2.step(c, &mut m, &|_| {}, &|_| {}, &|_| {}));
+            let r = &m.last().unwrap().content;
+            assert!(r.contains("pages 1-4 read") && r.contains("do not repeat") && r.contains("i\\\":5"), "{r}");
+            assert!(t2.held.is_none());
+        }
         // asked again for something else: the app compacts, then the call runs
         let notes = std::cell::RefCell::new(Vec::new());
         assert!(tl.step(&call(4), &mut msgs, &|_| *ran.borrow_mut() += 1, &|_| {}, &|n| notes.borrow_mut().push(n.to_string())));
