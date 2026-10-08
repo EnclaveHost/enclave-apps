@@ -1468,13 +1468,17 @@ fn jit_json(emu: Option<&Emulator>) -> String {
          \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
          \"volatile\":{},\"formMs\":{:.1},\
          \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
-         \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{}}}",
+         \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{},\
+         \"codeGen\":{}}}",
         s.calls, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
         s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
         s.volatile, s.form_us as f64 / 1000.0,
         v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
         v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
         v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),
+        // the write-snoop generation: each bump (a store to any page holding
+        // cached code) drops every predecoded block and every region proof
+        emu.map_or(0, |e| e.get_cpu().get_mmu().code_gen()),
     )
 }
 
