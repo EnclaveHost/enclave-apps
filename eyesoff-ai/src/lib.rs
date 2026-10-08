@@ -1362,6 +1362,18 @@ const INTERNAL_BUSY_BUDGET_MS: u128 = 30_000;
 /// refuses EVERY generating chat at once (each step needs a cell): chats
 /// that each held their cells and waited would only wait on each other.
 const POOL_FULL_MARKER: &str = "[kv_pool_full]";
+
+thread_local! {
+    /// how many times a generation stepped aside for pool room since the
+    /// answer loop last looked (take_pool_step_asides): the one reading of
+    /// the pool's REAL state the guest gets - its own prompt is only part of
+    /// what fills it (other chats, parked prefixes)
+    static POOL_STEP_ASIDES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn take_pool_step_asides() -> u32 {
+    POOL_STEP_ASIDES.with(|c| c.replace(0))
+}
 /// The MTP head runs its own llama context, sized like the pool (n_ctx,
 /// unified) and holding every sequence's mirrored positions, so it runs out
 /// of room alongside it - and says so only as llama's no-slot code from an
@@ -3381,6 +3393,7 @@ fn generate(
         match generate_attempt(cfg, prompt, target, tname, p, draft, &mut ans, status) {
             Ok(s) => return Ok(s),
             Err(e) if pool_refused(&e) => {
+                POOL_STEP_ASIDES.with(|c| c.set(c.get() + 1));
                 if ans.out.generated.len() > grown {
                     grown = ans.out.generated.len();
                     (since, reopens) = (None, 0);
@@ -6095,6 +6108,10 @@ struct ToolLoop<'a> {
     /// the tell mark on top of it
     compact_floor: Option<usize>,
     compact_pending: bool,
+    /// a generation in this loop stepped aside because the shared pool was
+    /// full: the model is told to compact even below the tell mark, while
+    /// its conversation holds a real share of the pool
+    pool_pressed: bool,
     /// how many times this loop compacted, and the newest summary - the
     /// page keeps it, so the next request does not resend what it replaced
     compactions: usize,
@@ -6289,6 +6306,7 @@ impl<'a> ToolLoop<'a> {
             compact_told: false,
             compact_floor: None,
             compact_pending: false,
+            pool_pressed: false,
             compactions: 0,
             summary: None,
             ledger_on,
@@ -6360,6 +6378,21 @@ impl<'a> ToolLoop<'a> {
     /// mark: a fact the model reads, with what to do about it.
     fn compact_note(&self) -> String {
         if !self.over(self.compact_tell) {
+            // the pool ran out under it: the window's arithmetic says there
+            // is room, the engine says there is not, and the engine is right
+            if self.pool_pressed && self.compact_window > 0
+                && self.over(self.compact_window / 8)
+            {
+                return format!(
+                    "\n\n[context: the memory this model shares with other chats ran out during \
+                     your last step, and this conversation holds {} of its {} tokens. Call {} \
+                     now, before anything else, with a summary that lets you carry on without \
+                     the rest.]",
+                    self.prompt_tokens,
+                    self.compact_window,
+                    tools::COMPACT_TOOL,
+                );
+            }
             return String::new();
         }
         format!(
@@ -6398,6 +6431,7 @@ impl<'a> ToolLoop<'a> {
         self.compactions += 1;
         self.compact_told = false;
         self.compact_pending = true;
+        self.pool_pressed = false;
         gone
     }
 
@@ -6750,6 +6784,9 @@ impl<'a> ToolLoop<'a> {
     ) -> bool {
         if !self.armed() {
             return false;
+        }
+        if take_pool_step_asides() > 0 {
+            self.pool_pressed = true;
         }
         // LEDGER MODE: the reply's state block replaces the last one, and
         // the conversation goes back to where this loop found it before
@@ -13615,6 +13652,18 @@ mod tests {
         tl.note_prompt(87_000, 100_000, 100_000);
         assert!(tl.step(&call(6), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
         assert!(msgs.last().unwrap().content.contains("This call was NOT run"), "{}", msgs.last().unwrap().content);
+        // the pool itself ran out (a generation stepped aside): told to
+        // compact below the tell mark, once the chat holds an eighth of it
+        let mut pressed = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(None), &nop, &nofmt, None);
+        let mut m3 = vec![ChatMsg::text("user", "go")];
+        pressed.note_prompt(20_000, 100_000, 100_000);
+        POOL_STEP_ASIDES.with(|c| c.set(2));
+        assert!(pressed.step(&call(1), &mut m3, &|_| {}, &|_| {}, &|_| {}));
+        assert!(m3.last().unwrap().content.contains("shares with other chats ran out"), "{}", m3.last().unwrap().content);
+        assert_eq!(take_pool_step_asides(), 0, "read once");
+        pressed.note_prompt(10_000, 100_000, 100_000);
+        assert!(pressed.step(&call(2), &mut m3, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!m3.last().unwrap().content.contains("[context:"), "a small chat is not what filled it");
         // compaction off: none of it
         let mut off = compacting_loop();
         off.compact_at = 0.0;

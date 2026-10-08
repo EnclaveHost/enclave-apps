@@ -528,7 +528,11 @@ model shares - `/models` reports it as `tools.kv_pool`), not the prompt cap:
 once a loop's prompt fills `compact_at` of it (default 0.6) each result ends
 with a `[context: N% full ...]` line telling the model to compact, and past
 `compact_force_at` (default 0.7) the next other call is not run until it has.
-A model that calls something else again is compacted for it, from the
+The pool is shared - other chats and parked prefixes fill it too - so the
+one reading of its real state, a generation stepping aside because the pool
+refused it (`kv_pool_full`), also tells the model to compact below the mark,
+while its conversation holds at least an eighth of the pool. A model that
+calls something else again is compacted for it, from the
 conversation's turns cut short and the calls with their results condensed,
 and that call then runs. Neither mark is ever placed past 85% / 95% of
 `max_prompt_tokens`, because beyond that cap the oldest turns are dropped
