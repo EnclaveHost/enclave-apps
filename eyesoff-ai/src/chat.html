@@ -2952,7 +2952,7 @@ function transcriptMd(chat) {
         let args = "";
         try { args = JSON.stringify(c.arguments || {}); } catch (_) { args = "{}"; }
         out.push("- called `" + c.name + (args === "{}" ? "" : " " + args) + "`"
-          + (c.ok === false ? " (failed)" : ""));
+          + (c.stopped ? " (stopped)" : c.ok === false ? " (failed)" : ""));
       }
       out.push("");
     }
@@ -3160,6 +3160,47 @@ function leadIn(text) {
   return text.replace(/<\/?think>/g, "").trim() ? text.trimEnd() : undefined;
 }
 
+// A stopped turn keeps what it did. The reply buffer starts over at every
+// call (its text moves onto the call), so mid-loop it is usually empty, and
+// an empty reply used to read as "nothing happened": the question went back
+// to the composer and every call and result was thrown away. Anything at all
+// - a call, a subagent, sources, a picture, words - is a turn worth keeping.
+// A call or subagent cut off mid-run is marked stopped, not left "running".
+// null = truly nothing happened (the question goes back to the composer).
+function stoppedTurn(t) {
+  const calls = t.toolCalls || [], agents = t.agents || [];
+  const kept = !!((t.reply && t.reply.replace(/<\/?think>/g, "").trim()) || calls.length || agents.length
+    || (t.sources && t.sources.length) || t.genImage);
+  if (!kept) return null;
+  const halt = (c) => { if (c.ok === undefined) { c.ok = false; c.stopped = true; } };
+  calls.forEach(halt);
+  for (const a of agents) { (a.tools || []).forEach(halt); if (!a.done) { a.done = true; a.ok = false; a.stopped = true; } }
+  return { role: "assistant", content: t.reply || "", meta: { stopped: true }, sources: t.sources || null,
+           image: t.genImage || null, tools: calls.length ? calls : null, agents: agents.length ? agents : null };
+}
+
+// What a stopped turn tells the model next time. A finished turn's answer
+// already says what its calls found; a stopped one never got to, so its calls
+// and their results go back in brief - otherwise "continue" starts over.
+function stoppedAccount(m) {
+  const cut = (v, n) => { const s = typeof v === "string" ? v : JSON.stringify(v ?? {}); return s.length > n ? s.slice(0, n) + "…" : s; };
+  const plain = (t) => (t || "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
+  const lines = [];
+  for (const c of m.tools || []) {
+    const before = plain(c.before);
+    if (before) lines.push(cut(before, 400));
+    lines.push("- " + c.name + " " + cut(c.arguments, 300) + " -> "
+      + (c.stopped ? "stopped before it returned" : (c.ok ? "ok" : "failed") + (typeof c.result === "string" ? ": " + cut(c.result, 600) : "")));
+  }
+  for (const a of m.agents || [])
+    lines.push("- subagent #" + a.id + " (" + cut(a.task || "", 200) + ") -> " + (a.stopped ? "stopped" : a.ok ? "reported" : "failed")
+      + (plain(a.text) ? ": " + cut(plain(a.text), 400) : ""));
+  const said = plain(m.content);
+  let out = (said ? said + "\n\n" : "") + "[Stopped by the user before this turn finished."
+    + (lines.length ? " What it did:\n" + lines.join("\n") : "") + "]";
+  return out.length > 6000 ? out.slice(0, 6000) + "…]" : out;
+}
+
 // An opened call's body: everything it was sent, then what came back - the
 // text the model read next, which for a failure is the only account of why.
 // Built when the row opens rather than with every row at every token, since
@@ -3178,7 +3219,9 @@ function fillCall(row, c) {
   try { args = JSON.stringify(c.arguments || {}, null, 2); } catch (_) {}
   add("div", "tlbl", "Arguments");
   add("pre", "tpre", args);
-  if (c.ok === undefined) {
+  if (c.stopped) {
+    add("div", "tnone", "Stopped before it returned.");
+  } else if (c.ok === undefined) {
     add("div", "tnone", "Still running: no result yet.");
   } else if (typeof c.result === "string") {
     add("div", "tlbl tres", c.ok ? "Result" : "Error");
@@ -3235,6 +3278,9 @@ function toolsBlock(calls, loop) {
     if (c.ok === undefined) {
       row.classList.add("run");
       row.querySelector(".tms").textContent = "running…";
+    } else if (c.stopped) {
+      row.classList.add("err");
+      row.querySelector(".tms").textContent = "stopped";
     } else {
       if (!c.ok) row.classList.add("err");
       row.querySelector(".tms").textContent =
@@ -3290,7 +3336,7 @@ function agentsBlock(agents, live, openState) {
       st.textContent = "running…";
       card.classList.add("run");
     } else {
-      st.textContent = (a.ok ? "" : "failed · ") + (a.calls || 0) + " call" + (a.calls === 1 ? "" : "s")
+      st.textContent = (a.stopped ? "stopped · " : a.ok ? "" : "failed · ") + (a.calls || (a.tools || []).length || 0) + " call" + ((a.calls || (a.tools || []).length) === 1 ? "" : "s")
         + " · " + humanSecs((a.ms || 0) / 1000);
       if (!a.ok) card.classList.add("err");
     }
@@ -4378,7 +4424,7 @@ function buildPayload(chat) {
   let lastVid = -1;
   for (let i = msgs.length - 1; i >= 0; i--) if ((msgs[i].videos || []).length) { lastVid = i; break; }
   return msgs.map((m, i) => {
-    let text = m.role === "assistant" ? stripThink(m.content) : m.content;
+    let text = m.role === "assistant" ? (m.meta && m.meta.stopped ? stoppedAccount(m) : stripThink(m.content)) : m.content;
     const imgs = imagesOf(m);
     const vids = i === lastVid ? (m.videos || []) : [];
     if (i !== lastVid && (m.videos || []).length) {
@@ -4650,10 +4696,12 @@ async function run(chat) {
     chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: keepLastPicture(toolCalls), agents });
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
+    const kept = err && err.userStop ? stoppedTurn({ reply, toolCalls, agents, sources, genImage }) : null;
     if (err && err.userStop) {
-      if (reply) {
-        for (const a of agents || []) keepLastPicture(a.tools);
-        chat.messages.push({ role: "assistant", content: reply, meta: { stopped: true }, tools: keepLastPicture(toolCalls), agents });
+      if (kept) {
+        for (const a of kept.agents || []) keepLastPicture(a.tools);
+        kept.tools = keepLastPicture(kept.tools);
+        chat.messages.push(kept);
       } else {
         // nothing generated yet: hand the question back to the composer
         stripTail();
