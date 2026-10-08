@@ -81,9 +81,48 @@ pub struct ToolsConfig {
     /// how many tool calls ONE answer may make before the model is told to
     /// answer from what it has. Each call is a round trip AND a full re-prefill
     /// of the conversation, so this is the main cost knob: a 5-hop turn is five
-    /// prefills of a share other tenants are waiting for.
+    /// prefills of a share other tenants are waiting for. 0 means NO fixed
+    /// count: the answer is bounded by max_seconds and by the two limits on
+    /// calls that do no work (max_failed_calls, max_repeat_calls), which is
+    /// what a long job wants - a count stops thirty good steps exactly as it
+    /// stops thirty wasted ones. With limit_cooldown_s set, the count is of
+    /// calls with no break of that long between them: a pause that long (a
+    /// wait, a slow step) starts it again, so it stops a burst, not a job.
     #[serde(default = "default_max_calls")]
     pub max_calls: usize,
+    /// how many calls IN A ROW may fail before the model is told to stop
+    /// calling and answer (0 = no limit; default 5). A call fails when the
+    /// tool says so, or when its result reports a failure in its body - a
+    /// command that exited non-zero, `"ok": false` (see reports_failure),
+    /// because a command runner answers HTTP 200 for a command that exited
+    /// 1. In a row, because any call that succeeds resets it: a test loop
+    /// fails its check on every pass and changes a file in between, and
+    /// that is work; five failures with nothing working in between is not.
+    /// Waits neither fail nor reset it.
+    #[serde(default = "default_max_failed_calls")]
+    pub max_failed_calls: usize,
+    /// how many times IN A ROW one call may run - the same tool with the
+    /// same arguments as the call just before it, whatever it returned -
+    /// before a further run is refused (0 = no limit; default 3). Any
+    /// different call resets it, a wait or a subagent included, so a test
+    /// re-run after an edit, or a log polled between waits, never counts;
+    /// waits themselves are never counted. The run past the limit is
+    /// answered "not run: do something different"; asking for that same
+    /// call once more ends the answer.
+    #[serde(default = "default_max_repeat_calls")]
+    pub max_repeat_calls: usize,
+    /// COOLDOWN for the three limits above, seconds (default 60; 0 = never):
+    /// a count that has not gone up for this long starts again from zero,
+    /// the "answer now" it may have earned included - for max_calls, this
+    /// long since the last call ended. A burst of failures
+    /// ends the burst; calls spread over minutes (a slow build that failed,
+    /// retried after a wait) are judged afresh. It runs from the call that
+    /// last raised the count, so a step slower than the cooldown - the
+    /// model's generation counts - resets it too: on a model whose steps
+    /// take a minute, a 60-second cooldown leaves the limits catching only
+    /// quick retries.
+    #[serde(default = "default_limit_cooldown_s")]
+    pub limit_cooldown_s: u64,
     /// per-call timeout, seconds (connect and first byte). Overridable per tool.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
@@ -617,8 +656,16 @@ impl<'de> Deserialize<'de> for Ledger {
 /// until the check passes, rather than answering at the first opportunity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Budget {
+    /// 0 = no fixed count (see ToolsConfig::max_calls)
     pub max_calls: usize,
     pub max_seconds: u64,
+    /// failed calls in a row before the answer stops calling, and runs of
+    /// one call in a row before a further one is refused
+    /// (ToolsConfig::max_failed_calls / max_repeat_calls); 0 = no limit
+    pub max_failed: usize,
+    pub max_repeats: usize,
+    /// ToolsConfig::limit_cooldown_s; 0 = the counts never start again
+    pub cooldown_s: u64,
     pub persist: bool,
     /// subagents the whole answer may spawn (see ToolsConfig::max_agents)
     pub max_agents: u32,
@@ -638,6 +685,9 @@ impl Budget {
         Budget {
             max_calls: n,
             max_seconds: default_max_seconds(),
+            max_failed: default_max_failed_calls(),
+            max_repeats: default_max_repeat_calls(),
+            cooldown_s: 0,
             persist: false,
             max_agents: 0,
             max_agent_depth: default_max_agent_depth(),
@@ -649,6 +699,55 @@ impl Budget {
     /// The wall-clock figure as the model should read it.
     pub fn time(&self) -> String {
         human_secs(self.max_seconds)
+    }
+
+    /// Whether the call count is spent (never, when there is none). The
+    /// count is of calls since the last cooldown-long break, when there is
+    /// a cooldown (ToolLoop::counted).
+    pub fn calls_spent(&self, calls: usize) -> bool {
+        self.max_calls != 0 && calls >= self.max_calls
+    }
+
+    /// The budget sentence of the rules: the count when there is one, the
+    /// clock always, and the two limits on calls that do no work - stated,
+    /// because a model that knows a second identical failure counts against
+    /// it changes something before retrying.
+    pub fn rule(&self) -> String {
+        let mut s = if self.max_calls == 0 {
+            format!("There is no fixed number of calls, but the whole answer has {} of wall-clock time", self.time())
+        } else if self.cooldown_s != 0 {
+            format!(
+                "You may make at most {} call{} with no break of {} between them (a break that \
+                 long starts the count again), and the whole answer has {} of wall-clock time",
+                self.max_calls,
+                if self.max_calls == 1 { "" } else { "s" },
+                human_secs(self.cooldown_s),
+                self.time(),
+            )
+        } else {
+            format!(
+                "You may make at most {} call{} in one answer, and the whole answer has {} of wall-clock time",
+                self.max_calls,
+                if self.max_calls == 1 { "" } else { "s" },
+                self.time(),
+            )
+        };
+        if self.max_failed != 0 {
+            s.push_str(&format!(
+                ". After {} failed calls in a row the answer stops calling tools, so when a call \
+                 fails, change the approach before trying again",
+                self.max_failed
+            ));
+        }
+        if self.max_repeats != 0 {
+            s.push_str(&format!(
+                ". The same call (same function, same arguments) is run at most {} times in a \
+                 row; do something different in between, or use the result you already have",
+                self.max_repeats
+            ));
+        }
+        s.push_str(". Make each call count.");
+        s
     }
 }
 
@@ -727,6 +826,15 @@ pub fn wait_plan(args: &serde_json::Value, cap_s: u64) -> Result<(u64, String, S
 fn default_max_calls() -> usize {
     3
 }
+fn default_max_failed_calls() -> usize {
+    5
+}
+fn default_max_repeat_calls() -> usize {
+    3
+}
+fn default_limit_cooldown_s() -> u64 {
+    60
+}
 fn default_max_seconds() -> u64 {
     3600
 }
@@ -772,8 +880,11 @@ impl ToolsConfig {
     /// answer dressed as a budget.
     pub fn budget(&self, req: Option<&serde_json::Value>) -> Budget {
         let mut b = Budget {
-            max_calls: self.max_calls.max(1),
+            max_calls: self.max_calls,
             max_seconds: self.max_seconds.max(1),
+            max_failed: self.max_failed_calls,
+            max_repeats: self.max_repeat_calls,
+            cooldown_s: self.limit_cooldown_s,
             persist: false,
             max_agents: self.max_agents,
             max_agent_depth: self.max_agent_depth.max(1),
@@ -798,8 +909,20 @@ impl ToolsConfig {
                     Some(serde_json::Value::Bool(false)) => b.verify = None,
                     _ => {}
                 }
+                // a request lowers a figure, never raises one, and no fixed
+                // count is the highest of all; it cannot ask for "none"
+                let lower = |cur: usize, n: u64| match cur {
+                    0 => (n as usize).max(1),
+                    c => c.min(n as usize).max(1),
+                };
                 if let Some(n) = o.get("max_calls").and_then(|v| v.as_u64()) {
-                    b.max_calls = b.max_calls.min(n as usize).max(1);
+                    b.max_calls = lower(b.max_calls, n);
+                }
+                if let Some(n) = o.get("max_failed_calls").and_then(|v| v.as_u64()) {
+                    b.max_failed = lower(b.max_failed, n);
+                }
+                if let Some(n) = o.get("max_repeat_calls").and_then(|v| v.as_u64()) {
+                    b.max_repeats = lower(b.max_repeats, n);
                 }
                 if let Some(s) = o.get("max_seconds").and_then(|v| v.as_u64()) {
                     b.max_seconds = b.max_seconds.min(s).max(1);
@@ -1823,12 +1946,9 @@ pub fn system_block_prefix(tools: &[Tool], b: &Budget) -> String {
         "Rules for this app: the call is executed by the server and its result comes back in a \
          <tool_response> block; wait for it rather than inventing one. Call ONLY the functions \
          listed above, by their exact names - nothing else exists, and a call to anything else \
-         is shown to the user as a failure. You may make at most {} call{} in one answer, and \
-         the whole answer has {} of wall-clock time, so make each one count. When a call fails, \
-         say so plainly and answer from what you have.",
-        b.max_calls,
-        if b.max_calls == 1 { "" } else { "s" },
-        b.time(),
+         is shown to the user as a failure. {} When a call fails, say so plainly and answer \
+         from what you have.",
+        b.rule(),
     ));
     s
 }
@@ -1973,11 +2093,9 @@ pub fn merged_system_block(tools: &[Tool], b: &Budget, require: Option<&str>) ->
         "Rules for this app: after you write a call, STOP - it is executed for you and its \
          result comes back in a <tool_response> block; never invent one. Call ONLY the \
          functions listed above, by their exact names - nothing else exists, and a call to \
-         anything else is shown to the user as a failure. One call at a time, and at most \
-         {} of them are run by this server in a single answer, within {} of wall-clock time. \
-         When a call fails, say so plainly and answer from what you have.",
-        b.max_calls,
-        b.time(),
+         anything else is shown to the user as a failure. One call at a time. For the calls \
+         this server runs: {} When a call fails, say so plainly and answer from what you have.",
+        b.rule(),
     ));
     s.push_str(&finish_rule(tools, b));
     push_forced(&mut s, require);
@@ -2978,6 +3096,53 @@ fn request_payload(
         .unwrap_or("application/json")
         .to_string();
     Ok((body, ctype))
+}
+
+/// Does a result report a FAILURE in its body? A command runner answers
+/// HTTP 200 for a command that exited 1 - risc-box's /exec says
+/// `{"ok":true,"exitCode":1,"output":...}`, and `{"ok":false,"error":...}`
+/// when the command timed out - so is_error alone misses every failing
+/// command. Read: a top-level `"ok": false`, or a non-zero `exitCode` /
+/// `exit_code` / `exit`. Top-level only, so a command that printed JSON
+/// with those keys in its OUTPUT does not count. A result cut at max_chars
+/// no longer parses; the fields this reads come first in such a body, so it
+/// falls back to the text before the first string-valued field.
+pub fn reports_failure(text: &str) -> bool {
+    let t = text.trim_start();
+    if !t.starts_with('{') {
+        return false;
+    }
+    let failed = |o: &serde_json::Map<String, serde_json::Value>| {
+        o.get("ok").and_then(|v| v.as_bool()) == Some(false)
+            || ["exitCode", "exit_code", "exit"]
+                .iter()
+                .any(|k| o.get(*k).and_then(|v| v.as_i64()).is_some_and(|c| c != 0))
+    };
+    if let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(t) {
+        return failed(&o);
+    }
+    // cut short: the head up to the first string value, closed off - only
+    // numbers, booleans and nulls before it, which is all this reads
+    let mut head = String::new();
+    for (i, ch) in t.char_indices() {
+        if ch == '"' {
+            // a key is followed by ':'; a string VALUE follows one
+            let before = t[..i].trim_end();
+            if before.ends_with(':') {
+                break;
+            }
+        }
+        head.push(ch);
+        if i > 512 {
+            return false;
+        }
+    }
+    let head = head.trim_end().trim_end_matches(',').trim_end_matches(|c: char| c != ',' && c != '{');
+    let head = head.trim_end().trim_end_matches(',');
+    match serde_json::from_str::<serde_json::Value>(&format!("{head}}}")) {
+        Ok(serde_json::Value::Object(o)) => failed(&o),
+        _ => false,
+    }
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -5717,13 +5882,13 @@ mod tests {
         }))
         .unwrap();
         let b = cfg.budget(None);
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 60 });
         assert!(cfg.budget(Some(&serde_json::json!(true))).persist);
         assert!(!cfg.budget(Some(&serde_json::json!(false))).persist);
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 8, "max_seconds": 600 })));
-        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 60 });
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 999, "max_seconds": 99999, "persist": false })));
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 60 });
         // zero is not a budget: the loop would refuse its first call
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 0, "max_seconds": 0 })));
         assert_eq!((b.max_calls, b.max_seconds), (1, 1));
@@ -5776,7 +5941,7 @@ mod tests {
         assert_eq!(b.max_agents, 0);
         // the persisting rules point at it when it is there
         let with = vec![tool("run_tests"), tool(AGENT_TOOL)];
-        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(rules.contains("spawn_agent"), "{rules}");
     }
 
@@ -5785,23 +5950,49 @@ mod tests {
     #[test]
     fn the_rules_follow_the_budget() {
         let list = vec![tool("run_tests")];
-        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(quick.contains("at most 32 calls"), "{quick}");
         assert!(quick.contains("30 minutes of wall-clock time"), "{quick}");
         assert!(quick.contains("stop calling and write the answer"), "{quick}");
         assert!(!quick.contains("WORKING TO A CHECK"), "{quick}");
-        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(persist.contains("WORKING TO A CHECK"), "{persist}");
         assert!(persist.contains("keep going until the check passes"), "{persist}");
         assert!(!persist.contains("call wait"), "{persist}");
         let with_wait = vec![tool("run_tests"), tool("wait")];
-        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None });
+        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(persist.contains("call wait rather than polling"), "{persist}");
         // the merged block (client tools beside ours) carries the same rule
-        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None }, None);
-        assert!(merged.contains("at most 4 of them"), "{merged}");
-        assert!(merged.contains("within 2 minutes"), "{merged}");
+        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 }, None);
+        assert!(merged.contains("this server runs: You may make at most 4 calls"), "{merged}");
+        assert!(merged.contains("has 2 minutes of wall-clock time"), "{merged}");
+        assert!(merged.contains("After 5 failed calls in a row"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
+    }
+
+    /// A command runner answers HTTP 200 for a command that failed, so the
+    /// body is what says it: a non-zero exit code or `"ok": false`, at the
+    /// top level only, and still read when the result was cut short.
+    #[test]
+    fn a_failing_command_is_read_from_its_body() {
+        assert!(!reports_failure(r#"{"ok":true,"exitCode":0,"output":"x"}"#));
+        assert!(reports_failure(r#"{"ok":true,"exitCode":132,"output":"Illegal instruction"}"#));
+        assert!(reports_failure(r#"{"ok":false,"error":"timed out after 30 s","output":""}"#));
+        assert!(reports_failure(r#"{"exit_code": 2, "stdout": ""}"#));
+        assert!(reports_failure(r#" {"exit": -1}"#));
+        // a command that printed such JSON did not itself fail
+        assert!(!reports_failure(r#"{"ok":true,"exitCode":0,"output":"{\"exitCode\":1,\"ok\":false}"}"#));
+        // cut at max_chars: still read from the head
+        let cut = |code: i32| format!("{{\"ok\":true,\"exitCode\":{code},\"output\":\"{}\n[truncated at 6000 characters]", "x".repeat(50));
+        assert!(reports_failure(&cut(1)));
+        assert!(!reports_failure(&cut(0)));
+        assert!(reports_failure("{\"ok\":false,\"error\":\"tim\n[truncated at 6000 characters]"));
+        // not JSON, or JSON without the fields: not a failure
+        assert!(!reports_failure("Linux riscv64 6.1"));
+        assert!(!reports_failure(r#"{"error":"something"#));
+        assert!(!reports_failure(r#"{"status":"running"}"#));
+        assert!(!reports_failure("[1, 2]"));
+        assert!(!reports_failure(""));
     }
 
     /// Ledger mode and the verify gate ride the budget: the config sets

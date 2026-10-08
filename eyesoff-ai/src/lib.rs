@@ -6065,13 +6065,30 @@ struct ToolLoop<'a> {
     /// form) its latest good run (see reruns_a_check)
     acts: usize,
     checks: std::collections::HashMap<String, CheckRuns>,
-    /// the newest call and a hash of its result, with how many times in a
-    /// row that exact pair has come back. Two identical outcomes get a
-    /// warning in the result; a third identical CALL is refused unrun. A
-    /// different call in between resets it, so polling a log between waits
-    /// is never mistaken for being stuck.
-    last_pair: Option<(String, u64)>,
-    same_runs: usize,
+    /// ToolsConfig::max_repeat_calls: the newest call (canonical form) and
+    /// how many times in a row it has run (1 for a call new here). Any
+    /// different call resets it - a wait or a subagent too, so polling a log
+    /// between waits is never a repeat. `repeat_told` is the call whose
+    /// over-the-limit repeat was already answered "not run": asking for it
+    /// once more ends the answer.
+    last_call: Option<String>,
+    repeats: usize,
+    repeat_told: Option<String>,
+    /// ToolsConfig::max_failed_calls: calls in a row that failed. Any call
+    /// that succeeds resets it; waits neither count nor reset it. At the
+    /// limit the model is told once to answer, then refused, exactly as the
+    /// call count does.
+    failed_run: usize,
+    failed_told: bool,
+    /// when each count last went up (now_ms), for the cooldown
+    /// (ToolsConfig::limit_cooldown_s, see cool_down)
+    failed_at: u128,
+    repeat_at: u128,
+    /// ToolsConfig::max_calls under a cooldown: the calls since the last
+    /// break of limit_cooldown_s between two calls, and when the last call
+    /// ended. Without a cooldown it is every call of the answer, as `calls`.
+    counted: usize,
+    call_at: u128,
     /// the verify gate (Budget::verify): whether the check has run in this
     /// answer, whether its latest result passed, and whether an unverified
     /// answer was already bounced once - told once, then accepted, exactly
@@ -6113,15 +6130,12 @@ const REFUSED_STUB: &str =
     "the model kept writing tool calls with arguments it had not filled in, so none were run";
 const REFUSED_GONE: &str =
     "the client disconnected before the model's tool call could run, so it was not run";
-const REFUSED_STUCK: &str =
-    "the model kept repeating one identical tool call that kept returning the identical \
-     result, so it was not run again";
-/// How many identical (call, result) pairs in a row before the model is
-/// told, in the result itself, that repeating the call is pointless. The
-/// next identical call after that is refused. Two, because one repeat is
-/// how a model re-reads a file it is about to edit; two with nothing
-/// changed in between is a model that has stopped deciding.
-const STUCK_TELL: usize = 2;
+const REFUSED_REPEAT: &str =
+    "the model kept asking for the same tool call after it had been repeated too many times \
+     in a row, so it was not run again";
+const REFUSED_FAILING: &str =
+    "the model wrote another tool call after too many calls in a row had failed, so it was \
+     not run";
 /// Ledger::Checks switches on at the call's THIRD good run with other calls
 /// before it and a different answer from the run before - two passes of
 /// run, change, run again. Two runs would be one re-read of a file after
@@ -6229,8 +6243,15 @@ impl<'a> ToolLoop<'a> {
             ledger_on,
             acts: 0,
             checks: std::collections::HashMap::new(),
-            last_pair: None,
-            same_runs: 0,
+            last_call: None,
+            repeats: 0,
+            repeat_told: None,
+            failed_run: 0,
+            failed_told: false,
+            failed_at: 0,
+            repeat_at: 0,
+            counted: 0,
+            call_at: 0,
             verify_seen: false,
             verify_ok: false,
             verify_told: false,
@@ -6296,7 +6317,7 @@ impl<'a> ToolLoop<'a> {
             Err(why) => return done(why, true),
         };
         let budget = tools::Budget {
-            max_calls: self.cfg.agent_max_calls.unwrap_or(self.cfg.max_calls).max(1),
+            max_calls: self.cfg.agent_max_calls.unwrap_or(self.cfg.max_calls),
             max_seconds: self.left_s().max(1),
             ..self.budget.clone()
         };
@@ -6546,7 +6567,7 @@ impl<'a> ToolLoop<'a> {
         let Some(name) = self.verify_name() else {
             return false;
         };
-        if self.calls >= self.budget.max_calls || self.elapsed_s() >= self.budget.max_seconds {
+        if self.budget.calls_spent(self.counted) || self.elapsed_s() >= self.budget.max_seconds {
             return false;
         }
         self.verify_told = true;
@@ -6575,35 +6596,83 @@ impl<'a> ToolLoop<'a> {
         true
     }
 
-    /// Track one (call, result) pair for the stuck detector; returns the
-    /// warning to append to the result, or nothing. Waits and subagents are
-    /// never tracked: a wait repeats by design, and a child's report is
-    /// never byte-identical twice for the same reason a test log is not.
-    fn note_repeat(&mut self, key: &str, tracked: bool, result: &str, on_note: &dyn Fn(&str)) -> String {
+    /// Count one call that ran against the two limits on calls that do no
+    /// work, and return what the result should say about them: the failure
+    /// streak from its second failure on, and a repeat from the first. The
+    /// model reads where it stands while it can still change course; the
+    /// limits themselves are enforced in step_inner, before a call runs.
+    fn note_waste(&mut self, name: &str, key: &str, tracked: bool, failed: bool) -> String {
+        self.cool_down();
+        let now = now_ms();
+        let mut out = String::new();
+        if name != "wait" {
+            self.failed_run = if failed { self.failed_run + 1 } else { 0 };
+            if failed {
+                self.failed_at = now;
+            }
+            let max = self.budget.max_failed;
+            if failed && max != 0 && self.failed_run >= 2 {
+                out.push_str(&if self.failed_run >= max {
+                    format!(
+                        "\n\n[That is {max} failed calls in a row, the limit for one answer: do not \
+                         call anything else. Answer now - say what you tried, what failed and why, \
+                         and what would unblock it.]"
+                    )
+                } else {
+                    format!(
+                        "\n\n[{} calls in a row have failed; after {max} this answer stops calling \
+                         tools. Change the approach, not just the command.]",
+                        self.failed_run
+                    )
+                });
+            }
+        }
         if !tracked {
-            self.last_pair = None;
-            self.same_runs = 0;
-            return String::new();
+            self.last_call = None;
+            self.repeats = 0;
+            return out;
         }
-        let h = fnv1a(result);
-        self.same_runs = match &self.last_pair {
-            Some((k, ph)) if k == key && *ph == h => self.same_runs + 1,
-            _ => 1,
-        };
-        self.last_pair = Some((key.to_string(), h));
-        if self.same_runs < STUCK_TELL {
-            return String::new();
+        if self.last_call.as_deref() == Some(key) {
+            self.repeats += 1;
+        } else {
+            self.last_call = Some(key.to_string());
+            self.repeats = 1;
         }
-        on_note(
-            "the model repeated an identical tool call and got the identical result; telling it \
-             to change course",
-        );
-        format!(
-            "\n\n[This exact call has now returned the identical result {} times in a row. \
-             Calling it again unchanged will be refused: change the input, take a different \
-             approach, or answer with what you have.]",
-            self.same_runs
-        )
+        self.repeat_at = now;
+        let max = self.budget.max_repeats;
+        if self.repeats > 1 && max != 0 {
+            out.push_str(&format!(
+                "\n\n[This is the same call as the one before it, {} times in a row now; one call \
+                 runs at most {max} times in a row. Do something different, or use the result you \
+                 have.]",
+                self.repeats,
+            ));
+        }
+        out
+    }
+
+    /// THE COOLDOWN (ToolsConfig::limit_cooldown_s): a count that has not
+    /// gone up for that long starts again from zero, and the "answer now"
+    /// or "not run" it earned goes with it - a burst of failures ends the
+    /// burst, not the answer, once things have been quiet that long.
+    fn cool_down(&mut self) {
+        let cd = u128::from(self.budget.cooldown_s) * 1000;
+        if cd == 0 {
+            return;
+        }
+        let now = now_ms();
+        if self.counted > 0 && now.saturating_sub(self.call_at) >= cd {
+            self.counted = 0;
+            self.limit_told = false;
+        }
+        if self.failed_run > 0 && now.saturating_sub(self.failed_at) >= cd {
+            self.failed_run = 0;
+            self.failed_told = false;
+        }
+        if self.repeats > 0 && now.saturating_sub(self.repeat_at) >= cd {
+            self.repeats = 0;
+            self.repeat_told = None;
+        }
     }
 
     fn step_inner(
@@ -6666,8 +6735,11 @@ impl<'a> ToolLoop<'a> {
         };
         // Out of calls: say so once and let it write the answer. Saying it
         // twice is a loop, so the second offence ends the turn - refused, so
-        // the legs deliver the reason rather than a visible fake call.
-        if self.calls >= self.cfg.max_calls {
+        // the legs deliver the reason rather than a visible fake call. Under
+        // a cooldown the count is of calls with no break that long between
+        // them, so a break first starts it - and the three others - again.
+        self.cool_down();
+        if self.budget.calls_spent(self.counted) {
             if self.limit_told {
                 self.refused = Some(REFUSED_LIMIT);
                 return false;
@@ -6753,20 +6825,70 @@ impl<'a> ToolLoop<'a> {
             self.refused = Some(REFUSED_GONE);
             return false;
         }
-        // Stuck: the same call, after the same call twice returned the same
-        // thing and the model was told so. It was warned in the result it
-        // read; running it a third time would only teach it that warnings
-        // are noise.
+        // Failing: the last max_failed calls all failed, and the result of
+        // the last one said this was the limit. Out of budget the way the
+        // count and the clock are: told once, then refused - unless the
+        // cooldown has passed since, which starts both counts again.
+        self.cool_down();
+        let max = self.budget.max_failed;
+        if max != 0 && self.failed_run >= max {
+            if self.failed_told {
+                self.refused = Some(REFUSED_FAILING);
+                return false;
+            }
+            self.failed_told = true;
+            on_note(&format!(
+                "{max} tool calls in a row failed; the model will finish with what it has"
+            ));
+            messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+            messages.push(ChatMsg::text(
+                "user",
+                tools::response_turn(
+                    &c.name,
+                    &format!(
+                        "This call was NOT run: the last {max} calls all failed, which is the limit \
+                         for one answer. Do not call anything else. Answer now: say what you tried, \
+                         what failed and why, and what would unblock it."
+                    ),
+                ),
+            ));
+            return true;
+        }
+        // Repeating: the same call as the one before it, already run as
+        // many times in a row as it may be. Not run, and told so; a
+        // different call is the way on, and resets the count. Asking for
+        // this one yet again ends the answer.
         let key = canonical_call(&c);
         let tracked = c.name != "wait" && c.name != tools::AGENT_TOOL;
-        if tracked
-            && self.same_runs >= STUCK_TELL
-            && self.last_pair.as_ref().is_some_and(|(k, _)| *k == key)
-        {
-            self.refused = Some(REFUSED_STUCK);
-            return false;
+        let max = self.budget.max_repeats;
+        if tracked && max != 0 && self.repeats >= max && self.last_call.as_deref() == Some(key.as_str()) {
+            if self.repeat_told.as_deref() == Some(key.as_str()) {
+                self.refused = Some(REFUSED_REPEAT);
+                return false;
+            }
+            self.repeat_told = Some(key.clone());
+            on_note(&format!(
+                "the model asked for the same tool call a {} time in a row; it was not run",
+                ordinal(max + 1)
+            ));
+            messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+            messages.push(ChatMsg::text(
+                "user",
+                tools::response_turn(
+                    &c.name,
+                    &format!(
+                        "This call was NOT run: it is the same call (same function, same \
+                         arguments) as the last {max} calls, and one call runs at most {max} times \
+                         in a row. Running it again would only return what you already have. Do \
+                         something different, or answer with what you have; asking for this same \
+                         call again ends this answer."
+                    ),
+                ),
+            ));
+            return true;
         }
         self.calls += 1;
+        self.counted += 1;
         on_call(&serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
             "of": self.budget.max_calls,
@@ -6812,6 +6934,10 @@ impl<'a> ToolLoop<'a> {
         on_result: &dyn Fn(&serde_json::Value),
         on_note: &dyn Fn(&str),
     ) -> bool {
+        // the break before the next call runs from here, the call's end
+        self.call_at = now_ms();
+        // judged on what the tool said, before a format pass rewrites it
+        let failed = r.is_error || tools::reports_failure(&r.text);
         // the tool's own format prompt, applied before anything downstream
         // sees the result. It rides the tool's facts rather than the http
         // array, so an entry moved into an api-mcp-adapter (which reports
@@ -6877,7 +7003,7 @@ impl<'a> ToolLoop<'a> {
         } else if c.name != "wait" {
             self.verify_ok = false;
         }
-        let stuck = self.note_repeat(key, tracked, &r.text, on_note);
+        let stuck = self.note_waste(&c.name, key, tracked, failed);
         if self.budget.ledger == tools::Ledger::Checks && !self.ledger_on {
             self.ledger_on = self.reruns_a_check(&c.name, key, &r);
             if self.ledger_on {
@@ -6894,11 +7020,19 @@ impl<'a> ToolLoop<'a> {
         // limit once, and a running tally would only invite calls.
         let text = if self.budget.persist {
             format!(
-                "{}{}\n\n[loop: call {} of {}; {} elapsed of {}]",
+                "{}{}\n\n[loop: call {}{}; {} elapsed of {}]",
                 r.text,
                 stuck,
                 self.calls,
-                self.budget.max_calls,
+                match (self.budget.max_calls, self.budget.cooldown_s) {
+                    (0, _) => String::new(),
+                    (n, 0) => format!(" of {n}"),
+                    (n, cd) => format!(
+                        "; {} of {n} with no break of {} between them",
+                        self.counted,
+                        tools::human_secs(cd)
+                    ),
+                },
                 tools::human_secs(self.elapsed_s()),
                 self.budget.time(),
             )
@@ -7000,6 +7134,18 @@ fn ledger_of(text: &str) -> Option<String> {
 }
 
 /// FNV-1a over the text, for telling identical results apart cheaply.
+/// "3rd", "4th": how a note counts.
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -11313,6 +11459,9 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "enabled": true,
                 "default_on": t.default_on,
                 "max_calls": t.max_calls,
+                "max_failed_calls": t.max_failed_calls,
+                "max_repeat_calls": t.max_repeat_calls,
+                "limit_cooldown_s": t.limit_cooldown_s,
                 "max_seconds": t.max_seconds,
                 "max_agents": t.max_agents,
                 "max_agent_depth": t.max_agent_depth,
@@ -11561,6 +11710,9 @@ fn handle_tools_probe(
     let body = serde_json::json!({
         "discover_ms": discover_ms,
         "max_calls": tcfg.max_calls,
+        "max_failed_calls": tcfg.max_failed_calls,
+        "max_repeat_calls": tcfg.max_repeat_calls,
+        "limit_cooldown_s": tcfg.limit_cooldown_s,
         "max_seconds": tcfg.max_seconds,
         "wait_max_s": tcfg.wait_max_s,
         "keep_results": tcfg.keep_results,
@@ -12674,13 +12826,15 @@ mod tests {
         let mut msgs = vec![ChatMsg::text("user", "make the tests pass")];
         // the "no such tool" result is short; pad it through the log so the
         // condenser has something to cut
-        // distinct calls: an identical call with an identical result twice
-        // over is what the stuck detector refuses, and that is not this test
+        // distinct calls: the same call in a row counts toward
+        // max_repeat_calls, and that is not this test
         let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
         for i in 0..4 {
             assert!(tl.step(&call(i), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
             // the progress line rides under a persisting loop's results
-            assert!(tl.results[i].2.contains(&format!("[loop: call {} of 32;", i + 1)), "{}", tl.results[i].2);
+            // (the default cooldown makes the count one of calls with no
+            // break of a minute between them)
+            assert!(tl.results[i].2.contains(&format!("[loop: call {}; {} of 32 with no break of 60 seconds", i + 1, i + 1)), "{}", tl.results[i].2);
             // stand in for a long test log: the loop condenses what IT
             // recorded, so lengthen the recorded copy and the turn together
             let long = format!("run {i} BEGIN {} END run {i}", "log line\n".repeat(200));
@@ -13092,44 +13246,303 @@ mod tests {
         assert_eq!(tl.calls, 5);
     }
 
-    /// The same call after the same call twice returned the same thing is
-    /// refused unrun; the second identical outcome is what warns the model.
-    /// A different call in between (a wait, a read of something else)
-    /// resets the count, because polling is not being stuck.
+    /// max_repeat_calls: one call runs at most that many times in a row,
+    /// whatever it returns. The run past it is not run and the model is told
+    /// to do something different; asking for it once more ends the answer.
+    /// Any different call resets the count - a wait too, so polling between
+    /// waits is never a repeat - and waits are never counted themselves.
     #[test]
-    fn an_identical_call_with_an_identical_result_is_refused_the_third_time() {
+    fn the_same_call_runs_at_most_max_repeat_calls_times_in_a_row() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
-            "max_calls": 32, "http": [{ "name": "t", "url": "https://h/x" }]
+            "max_calls": 0, "max_repeat_calls": 3, "max_failed_calls": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
         }))
         .unwrap();
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
-        let mut msgs = vec![ChatMsg::text("user", "hi")];
         let a = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"q\":1}}</tool_call>";
         let other = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"q\":2}}</tool_call>";
-        let notes = std::cell::RefCell::new(Vec::new());
+        let notes = std::cell::RefCell::new(Vec::<String>::new());
         let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
-        assert!(!msgs.last().unwrap().content.contains("identical result"), "{}", msgs.last().unwrap().content);
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
-        assert!(msgs.last().unwrap().content.contains("identical result 2 times in a row"), "{}", msgs.last().unwrap().content);
-        assert_eq!(notes.borrow().len(), 1, "{:?}", notes.borrow());
-        assert!(!tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
-        assert_eq!(tl.refused, Some(REFUSED_STUCK));
-        assert_eq!(tl.calls, 2, "the third identical call must not run");
-        // a different call between two identical ones resets the count
         let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert!(tl.step(other, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert_eq!(tl.calls, 4);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(!msgs.last().unwrap().content.contains("same call"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("2 times in a row now"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("3 times in a row now"), "{}", msgs.last().unwrap().content);
+        assert_eq!(tl.calls, 3);
+        assert!(notes.borrow().is_empty(), "{:?}", notes.borrow());
+        // the 4th is not run, and the model is told why
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.calls, 3, "the 4th identical call in a row must not run");
+        assert!(msgs.last().unwrap().content.contains("NOT run"), "{}", msgs.last().unwrap().content);
+        assert!(msgs.last().unwrap().content.contains("at most 3 times"), "{}", msgs.last().unwrap().content);
+        assert!(notes.borrow()[0].contains("a 4th time in a row"), "{:?}", notes.borrow());
         assert_eq!(tl.refused, None);
+        // asking for it yet again ends the answer
+        assert!(!tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.refused, Some(REFUSED_REPEAT));
+        assert_eq!(tl.calls, 3);
+
+        // ...but a different call is the way on, and resets the count
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        for _ in 0..3 {
+            assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}), "told, not ended");
+        assert!(tl.step(other, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        for _ in 0..3 {
+            assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert_eq!(tl.calls, 7);
+        assert_eq!(tl.refused, None);
+        // a wait in between resets it too, and waits are never counted
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        for name in ["t", "t", "wait", "t", "t", "wait", "wait", "wait", "wait"] {
+            tl.note_waste(name, &format!("{name}{{}}"), name != "wait", false);
+        }
+        assert_eq!(tl.repeats, 0);
+        tl.note_waste("t", "t{}", true, false);
+        tl.note_waste("t", "t{}", true, false);
+        assert_eq!(tl.repeats, 2);
+        // no limit at all: nothing is ever refused
+        let off: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_repeat_calls": 0, "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let mut tl = ToolLoop::open(&off, b, off.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        for _ in 0..4 {
+            tl.failed_run = 0; // the unknown tool fails; this is about repeats
+            assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            assert!(!msgs.last().unwrap().content.contains("same call"), "{}", msgs.last().unwrap().content);
+        }
+        assert_eq!(tl.calls, 4);
         assert_eq!(fnv1a("a"), fnv1a("a"));
         assert_ne!(fnv1a("a"), fnv1a("b"));
+        assert_eq!((ordinal(1), ordinal(2), ordinal(3), ordinal(4), ordinal(11), ordinal(22)),
+                   ("1st".into(), "2nd".into(), "3rd".into(), "4th".into(), "11th".into(), "22nd".into()));
+    }
+
+    /// max_failed_calls: at that many failed calls in a row the result says
+    /// it is the limit, the next call is not run and the model is told to
+    /// answer, and a call after that is refused. A command that exited
+    /// non-zero is a failure though the tool answered fine; any call that
+    /// succeeds resets the run, and a wait neither counts nor resets it.
+    #[test]
+    fn calls_that_keep_failing_end_the_answer() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_failed_calls": 3, "max_repeat_calls": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let bad = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        let notes = std::cell::RefCell::new(Vec::<String>::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(!msgs.last().unwrap().content.contains("in a row"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("2 calls in a row have failed; after 3"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("That is 3 failed calls in a row"), "{}", msgs.last().unwrap().content);
+        assert_eq!((tl.calls, tl.failed_run), (3, 3));
+        assert!(notes.borrow().is_empty(), "{:?}", notes.borrow());
+        assert!(tl.step(&bad(4), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.calls, 3, "the call after the limit must not run");
+        assert!(msgs.last().unwrap().content.contains("last 3 calls all failed"), "{}", msgs.last().unwrap().content);
+        assert!(notes.borrow()[0].contains("3 tool calls in a row failed"), "{:?}", notes.borrow());
+        assert!(!tl.step(&bad(5), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.refused, Some(REFUSED_FAILING));
+
+        // what counts: the tool's error, and a command that exited non-zero;
+        // a success resets the run, a wait leaves it where it was
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        let run = |tl: &mut ToolLoop, msgs: &mut Vec<ChatMsg>, name: &str, i: u32, text: &str, is_error: bool| {
+            let c = tools::ToolCall { name: name.into(), args: serde_json::json!({ "i": i }) };
+            let key = canonical_call(&c);
+            let r = tools::ToolResult { text: text.into(), is_error, ms: 1, sources: Vec::new(), image: None, seen: None };
+            assert!(tl.take_result(&c, &key, name != "wait", r, msgs, &|_| {}, &|_| {}));
+        };
+        run(&mut tl, &mut msgs, "run_vm_command", 1, r#"{"ok":true,"exitCode":132,"output":"Illegal instruction"}"#, false);
+        run(&mut tl, &mut msgs, "computer", 2, "HTTP 409: machine is not running", true);
+        assert_eq!(tl.failed_run, 2);
+        run(&mut tl, &mut msgs, "wait", 3, "waited 30 seconds", false);
+        assert_eq!(tl.failed_run, 2, "a wait is not a success");
+        run(&mut tl, &mut msgs, "run_vm_command", 4, r#"{"ok":false,"error":"timed out","output":""}"#, false);
+        assert_eq!(tl.failed_run, 3);
+        run(&mut tl, &mut msgs, "run_vm_command", 5, r#"{"ok":true,"exitCode":0,"output":"ok"}"#, false);
+        assert_eq!(tl.failed_run, 0, "a success resets the run");
+        // a test loop: the check fails every pass, the edit between succeeds
+        for i in 0..10 {
+            run(&mut tl, &mut msgs, "run_vm_command", 100, &format!(r#"{{"ok":true,"exitCode":1,"output":"{i} failed"}}"#), false);
+            run(&mut tl, &mut msgs, "run_vm_command", 200 + i, r#"{"ok":true,"exitCode":0,"output":""}"#, false);
+        }
+        assert_eq!(tl.failed_run, 0);
+        assert!(!tl.failed_told);
+    }
+
+    /// THE COOLDOWN: a count that has not gone up for limit_cooldown_s
+    /// starts again - after the limit was hit too, so the call it stopped
+    /// runs once things have been quiet that long. Measured from the last
+    /// failure, and from the last run of the repeated call; 0 = never.
+    #[test]
+    fn the_limits_cool_down_after_a_quiet_spell() {
+        let cfg = |cd: u64| -> tools::ToolsConfig {
+            serde_json::from_value(serde_json::json!({
+                "max_calls": 0, "max_failed_calls": 2, "max_repeat_calls": 2, "limit_cooldown_s": cd,
+                "http": [{ "name": "t", "url": "https://h/x" }]
+            }))
+            .unwrap()
+        };
+        let tc = cfg(60);
+        assert_eq!(cfg(0).limit_cooldown_s, 0);
+        let dflt: tools::ToolsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((dflt.max_failed_calls, dflt.max_repeat_calls, dflt.limit_cooldown_s), (5, 3, 60));
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let bad = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        let ago = |s: u128| now_ms() - s * 1000;
+        // failures: at the limit, then a minute of quiet, then it runs
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.failed_told), (2, true), "the limit stopped the 3rd");
+        tl.failed_at = ago(59);
+        assert!(!tl.step(&bad(4), &mut msgs, &|_| {}, &|_| {}, &|_| {}), "59 s is not quiet enough");
+        tl.refused = None;
+        tl.failed_at = ago(61);
+        assert!(tl.step(&bad(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.failed_run, tl.failed_told), (3, 1, false));
+        // a failure after a quiet spell starts the run at one
+        tl.failed_at = ago(61);
+        assert!(tl.step(&bad(6), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.failed_run, 1);
+        assert!(!msgs.last().unwrap().content.contains("in a row have failed"), "{}", msgs.last().unwrap().content);
+
+        // repeats: the over-the-limit run waits out the cooldown
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        let same = bad(9);
+        for _ in 0..3 {
+            tl.failed_run = 0;
+            assert!(tl.step(&same, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert_eq!(tl.calls, 2, "the 3rd in a row was not run");
+        tl.failed_run = 0;
+        tl.repeat_at = ago(61);
+        assert!(tl.step(&same, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.repeats, tl.repeat_told.is_none()), (3, 1, true));
+
+        // max_calls: a count of calls with no cooldown-long break between
+        // them, so a break starts it again
+        let mc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 2, "max_failed_calls": 0, "max_repeat_calls": 0, "limit_cooldown_s": 60,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let persist = serde_json::json!(true);
+        let bm = mc.budget(Some(&persist));
+        assert!(bm.rule().contains("at most 2 calls with no break of 60 seconds between them"), "{}", bm.rule());
+        let mut tl = ToolLoop::open(&mc, b, bm, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(msgs.last().unwrap().content.contains("[loop: call 2; 2 of 2 with no break of 60 seconds"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.limit_told), (2, true), "the 3rd within the minute is not run");
+        assert!(msgs.last().unwrap().content.contains("limit on tool calls"), "{}", msgs.last().unwrap().content);
+        tl.call_at = ago(59);
+        assert!(!tl.step(&bad(4), &mut msgs, &|_| {}, &|_| {}, &|_| {}), "59 s is no break");
+        tl.refused = None;
+        tl.call_at = ago(61);
+        assert!(tl.step(&bad(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.counted, tl.limit_told), (3, 1, false));
+        assert!(msgs.last().unwrap().content.contains("[loop: call 3; 1 of 2 with no break"), "{}", msgs.last().unwrap().content);
+        // without a cooldown the count is the answer's, as it always was
+        let m0: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 2, "max_failed_calls": 0, "limit_cooldown_s": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b0 = m0.budget(Some(&persist));
+        assert!(b0.rule().contains("at most 2 calls in one answer"), "{}", b0.rule());
+        let mut tl = ToolLoop::open(&m0, b, b0, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(msgs.last().unwrap().content.contains("[loop: call 2 of 2;"), "{}", msgs.last().unwrap().content);
+        tl.call_at = ago(3600);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 2);
+
+        // cooldown 0: never
+        let tc = cfg(0);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        tl.failed_at = ago(3600);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 2);
+    }
+
+    /// max_calls 0 is no fixed count: the rules say so, a call far past any
+    /// old count runs, the loop line drops its "of", and a request may
+    /// still lower it (and the two other limits) but never ask for none.
+    #[test]
+    fn max_calls_zero_is_no_fixed_count() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_failed_calls": 8, "max_repeat_calls": 8,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tc.budget(Some(&serde_json::json!(true)));
+        assert_eq!((b.max_calls, b.max_failed, b.max_repeats), (0, 8, 8));
+        assert!(!b.calls_spent(10_000));
+        let rule = b.rule();
+        assert!(rule.contains("no fixed number of calls"), "{rule}");
+        assert!(rule.contains("After 8 failed calls in a row"), "{rule}");
+        assert!(rule.contains("at most 8 times in a row"), "{rule}");
+        let low = tc.budget(Some(&serde_json::json!({ "max_calls": 5, "max_failed_calls": 2, "max_repeat_calls": 99 })));
+        assert_eq!((low.max_calls, low.max_failed, low.max_repeats), (5, 2, 8));
+        assert!(low.calls_spent(5) && !low.calls_spent(4));
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), b, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        tl.calls = 500;
+        let c = format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":1}}}}</tool_call>");
+        assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 501);
+        let last = &msgs.last().unwrap().content;
+        assert!(last.contains("[loop: call 501;"), "{last}");
+        // a counted budget still counts, and the request's lowered figure
+        // is the one enforced
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), low, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        for i in 0..5 {
+            tl.failed_run = 0;
+            let c = format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+            assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert!(msgs.last().unwrap().content.contains("[loop: call 5; 5 of 5 with no break of 60 seconds"), "{}", msgs.last().unwrap().content);
+        tl.failed_run = 0;
+        assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 5);
+        assert!(msgs.last().unwrap().content.contains("limit on tool calls"), "{}", msgs.last().unwrap().content);
     }
 
     /// A persisting answer whose check has not passed is sent back once

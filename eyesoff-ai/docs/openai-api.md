@@ -474,7 +474,7 @@ report progress; keep state in files rather than in the conversation; stop
 early only when the check passes, cannot pass, or the budget is nearly spent,
 and then report exactly what passes and what does not. Every tool result in a
 persisting loop carries a trailer, `[loop: call 7 of 32; 6 minutes elapsed of
-1 hour]`, so the budget is a fact the model reads rather than a count it
+1 hour]` (`[loop: call 7; ...]` with no fixed count), so the budget is a fact the model reads rather than a count it
 keeps. The object form **lowers** the deployment's budgets for one answer and
 never raises them: `"loop": {"max_calls": 8, "max_seconds": 600}` (add
 `"persist": false` to lower the budget without asking for persistence).
@@ -486,6 +486,37 @@ finish from what it has; a second call is refused and the answer ends (the
 `: enclave-tool-note` comment, or the playground's notice, says which). `GET
 /models` reports both under `tools`, and each `: enclave-tool` comment
 carries `n`, `of`, `elapsed_s` and `max_seconds`.
+
+**Calls that do no work.** `max_calls: 0` means no fixed count: a count
+stops thirty good steps exactly as it stops thirty wasted ones, so the
+answer is bounded instead by the clock and by two limits on waste.
+`max_failed_calls` (default 5) is how many calls **in a row** may fail; any
+call that succeeds resets it, so a test loop that fails its check on every
+pass and edits a file in between is never stopped by it. A call fails when
+the tool says so or when its result says so in its body - a top-level
+non-zero `exitCode` / `exit_code` / `exit`, or `"ok": false` - because a
+command runner answers HTTP 200 for a command that exited 1. At the limit
+the result says so, the next call is not run and the model is told to answer
+with what failed and what would unblock it; a call after that is refused and
+the answer ends. `max_repeat_calls` (default 3) is how many times **in a
+row** one call (same function, same arguments, whatever it returned) may
+run; any different call resets it, a wait included, so a log polled between
+waits never counts, and waits are never counted themselves. The run past the
+limit is answered "not run: do something different"; asking for that same
+call once more ends the answer. All three counts come with a **cooldown**,
+`limit_cooldown_s` (default 60, 0 = never): a count that has not gone up for
+that long - since the last failure, since the last run of the repeated call,
+since the last call ended - starts again from zero, the "answer now" it
+earned included. So with a cooldown, `max_calls: 32` stops 32 calls with no
+break of 60 seconds between them, not 32 calls per answer; the rules and the
+`[loop: call 40; 12 of 32 with no break of 60 seconds between them; ...]`
+trailer say so. It runs on
+wall-clock time and the model's generation counts, so on a model whose steps
+take a minute a 60-second cooldown leaves the limits catching only quick
+retries. A request's `loop` object may lower `max_failed_calls` and
+`max_repeat_calls` like the other figures; `/models` and `/tools` report all
+three. These replace 0.58's stuck-call rule (an identical call with an
+identical result, refused the third time), which the repeat limit covers.
 
 **`wait`** (builtin; name it in the config's `tools.builtin`) sleeps
 `seconds` inside the enclave and returns. Nothing leaves, nothing is

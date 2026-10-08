@@ -3200,9 +3200,11 @@ function fillCall(row, c) {
 function toolsBlock(calls, loop) {
   if (!calls || !calls.length) return null;
   const wrap = node('<div class="toolcalls"></div>');
-  if (loop && loop.max_calls > 1) {
+  // max_calls 0 is no fixed count: the step still shows, without an "of"
+  if (loop && (loop.max_calls > 1 || loop.max_calls === 0)) {
     const head = node('<div class="toolhead"></div>');
-    head.textContent = "Step " + loop.calls + " of " + loop.max_calls
+    // under a cooldown the count restarts after a break, so a step may pass it
+    head.textContent = "Step " + loop.calls + (loop.max_calls && loop.calls <= loop.max_calls ? " of " + loop.max_calls : "")
       + (loop.max_seconds ? " · " + humanSecs(loop.elapsed_s) + " of " + humanSecs(loop.max_seconds) : "");
     wrap.appendChild(head);
   }
@@ -6341,9 +6343,16 @@ function renderModelMenu() {
     // model is told to keep going until the goal's check passes and may wait
     // for slow jobs, inside the deployment's step and time budget. Turning it
     // on turns the tools on - a loop with nothing to call is not one.
-    const budget = (state.tools.max_calls || 0) + " steps"
-      + (state.tools.max_seconds ? " · " + humanSecs(state.tools.max_seconds) : "")
-      + (state.tools.max_agents ? " · " + state.tools.max_agents + " subagents" : "");
+    const tl = state.tools;
+    const stops = [];
+    if (tl.max_failed_calls) stops.push(tl.max_failed_calls + " failed calls in a row");
+    if (tl.max_repeat_calls) stops.push("the same call " + tl.max_repeat_calls + " times in a row");
+    const budget = (tl.max_calls ? tl.max_calls + " steps"
+        + (tl.limit_cooldown_s ? " without a " + humanSecs(tl.limit_cooldown_s) + " break" : "") : "no step limit")
+      + (tl.max_seconds ? " · " + humanSecs(tl.max_seconds) : "")
+      + (tl.max_agents ? " · " + tl.max_agents + " subagents" : "")
+      + (stops.length ? ", stopping after " + stops.join(" or ")
+          + (tl.limit_cooldown_s ? " (a count starts again after " + humanSecs(tl.limit_cooldown_s) + " without growing)" : "") : "");
     const lsg = node('<div class="seg-row"><span>Loop</span><div class="seg"></div></div>');
     for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");
