@@ -85,6 +85,11 @@ pub struct AppConfig {
     pub effort: Option<EffortConfig>,
     pub system_prompt: String,
     pub max_prompt_tokens: usize,
+    /// the most tokens of text ONE message from the user may take; 0 (the
+    /// default) = no limit beyond max_prompt_tokens. Only the newest message
+    /// is checked, so a chat already holding a longer one carries on.
+    #[serde(default)]
+    pub max_message_tokens: usize,
     /// Optional prefill batch ceiling, in tokens. Zero/absent uses the host's
     /// batch limit. A shielded backend may only offload small batches to its
     /// GPU workers; setting this to that limit keeps prompt matmuls eligible.

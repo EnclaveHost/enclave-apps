@@ -518,6 +518,30 @@ retries. A request's `loop` object may lower `max_failed_calls` and
 three. These replace 0.58's stuck-call rule (an identical call with an
 identical result, refused the third time), which the repeat limit covers.
 
+**Compaction.** Every armed loop is also offered `compact` (never named in
+config; `compact_at: 0` removes it). Its one argument is `summary`, and the
+summary replaces the whole conversation except the system prompt and the
+user's latest message, which stays word for word; the call's result is the
+summary, so the next step reads it as text. The trigger is the **KV pool**,
+the node's context window (`ENCLAVE_GGML_N_CTX`, which every chat on the
+model shares - `/models` reports it as `tools.kv_pool`), not the prompt cap:
+once a loop's prompt fills `compact_at` of it (default 0.6) each result ends
+with a `[context: N% full ...]` line telling the model to compact, and past
+`compact_force_at` (default 0.7) the next other call is not run until it has.
+A model that calls something else again is compacted for it, from the
+conversation's turns cut short and the calls with their results condensed,
+and that call then runs. Neither mark is ever placed past 85% / 95% of
+`max_prompt_tokens`, because beyond that cap the oldest turns are dropped
+unread - the user's request first - which is the loss compaction exists to
+prevent. A summary over `compact_max_chars` (default 16000) is handed back to
+be shortened, not cut. On eyesoff (pool 180,224, cap 131,072) the model is
+told at 108,134 tokens and held at 124,450. The finished answer's `done`
+event carries `compact: {summary}`, and the playground then sends that
+summary in front of the compacted answer's question instead of the turns it
+replaced. A per-model `max_message_tokens` (default 0 = none) caps ONE
+message from the user; only the newest is checked, and an over-long one is
+refused with `message_too_long` before anything runs.
+
 **`wait`** (builtin; name it in the config's `tools.builtin`) sleeps
 `seconds` inside the enclave and returns. Nothing leaves, nothing is
 computed, the request is parked. Its result says how much of the answer's

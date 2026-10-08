@@ -171,6 +171,28 @@ pub struct ToolsConfig {
     /// request's own attachments count against the model's max_images first.
     #[serde(default = "default_keep_images")]
     pub keep_images: usize,
+    /// COMPACTION: once a loop's prompt fills this share of the KV POOL -
+    /// the node's context window (ENCLAVE_GGML_N_CTX), which every chat on
+    /// the model shares, so it is what actually runs out - each tool result
+    /// tells the model to call `compact`: it writes a summary of everything
+    /// so far, and the summary replaces it all except the system prompt and
+    /// the user's latest message. 0 = no `compact` tool. Default 0.6. Never
+    /// later than the prompt cap allows (see ToolLoop::compact_marks):
+    /// past max_prompt_tokens the oldest turns are dropped unread, which is
+    /// the loss this exists to prevent.
+    #[serde(default = "default_compact_at")]
+    pub compact_at: f64,
+    /// past this share of the pool (default 0.7), a call other than
+    /// `compact` is not run until the model has compacted - told once; a
+    /// model that still calls something else is compacted for it, from its
+    /// calls and their condensed results.
+    #[serde(default = "default_compact_force_at")]
+    pub compact_force_at: f64,
+    /// the longest summary `compact` takes, characters (default 16000). A
+    /// longer one is handed back to be shortened rather than cut: the end of
+    /// a summary is where the next steps are.
+    #[serde(default = "default_compact_max_chars")]
+    pub compact_max_chars: usize,
     /// SUBAGENTS: how many ONE answer may spawn in total, however they nest.
     /// Zero (the default) means the `spawn_agent` tool does not exist. A
     /// positive number is the deployer's consent and the only switch: the
@@ -347,6 +369,10 @@ pub struct Builtins<'a> {
 /// child is a whole loop of generations, and only a leg can generate.
 pub const AGENT_TOOL: &str = "spawn_agent";
 
+/// The name of the compaction tool, which the answer loop runs itself: it
+/// rewrites the loop's own conversation, which no request can reach.
+pub const COMPACT_TOOL: &str = "compact";
+
 /// TOOL GROUPS: what a person switches on and off. A group is one tool as the
 /// settings panel shows it, made of any number of endpoints (see
 /// HttpTool::group). Two groups are the app's own legs rather than config
@@ -390,6 +416,11 @@ pub enum Builtin {
     /// something is deferred, and tools::call answers it from the registry,
     /// because the signatures are already there - nothing leaves.
     LoadTools,
+    /// Replace the conversation so far with the model's own summary of it
+    /// (ToolsConfig::compact_at). Never named in config: build() adds it to
+    /// every armed registry while compaction is on, and the answer loop runs
+    /// it (ToolLoop::compact_with), since it rewrites the loop's messages.
+    Compact,
 }
 
 /// The name of the builtin that loads deferred signatures.
@@ -425,6 +456,7 @@ impl Builtin {
             Builtin::Wait => "wait",
             Builtin::Agent => AGENT_TOOL,
             Builtin::LoadTools => LOAD_TOOLS,
+            Builtin::Compact => COMPACT_TOOL,
         }
     }
 
@@ -475,6 +507,16 @@ impl Builtin {
                  functions\"). Call it with the names you are about to use, before the first \
                  call to any of them; the result shows each one exactly as <tools> does. Load \
                  only what you need - every signature is text you then read past.",
+            Builtin::Compact =>
+                "Free up context: replace this whole conversation with your own summary of \
+                 it. Afterwards you see only the system prompt, the user's latest message and \
+                 your summary - every earlier message, call and result is gone. Call it when a \
+                 result tells you the context is filling up. Write the summary as notes to \
+                 yourself that are enough to carry on without anything else: the user's goal \
+                 and every requirement or preference they stated, in their words; what is \
+                 done and how you know; the exact current state (file paths, commands and \
+                 what they printed, ids, URLs, versions, errors); what failed and why; and \
+                 the next steps. Copy out any fact from a result you will still need.",
         }
     }
 
@@ -558,6 +600,16 @@ impl Builtin {
                 },
                 "required": ["names"],
             }),
+            Builtin::Compact => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "everything needed to carry on, as notes to yourself",
+                    }
+                },
+                "required": ["summary"],
+            }),
         }
     }
 
@@ -569,6 +621,8 @@ impl Builtin {
             Builtin::Agent => b.agent_slots > 0,
             // added by build() when something is deferred, never from config
             Builtin::LoadTools => false,
+            // added by build() while compaction is on, never from config
+            Builtin::Compact => false,
         }
     }
 
@@ -582,6 +636,7 @@ impl Builtin {
             // the depth limit): a per-loop fact, not a misconfiguration
             Builtin::Agent => b.agent_limit > 0,
             Builtin::LoadTools => false,
+            Builtin::Compact => false,
         }
     }
 
@@ -592,6 +647,7 @@ impl Builtin {
             Builtin::Wait => "nothing",
             Builtin::Agent => "`max_agents` (a positive count in the `tools` block)",
             Builtin::LoadTools => "a deferred tool (`defer` on an mcp entry)",
+            Builtin::Compact => "a positive `compact_at` in the `tools` block",
         }
     }
 }
@@ -847,6 +903,15 @@ fn default_keep_results() -> usize {
 fn default_keep_images() -> usize {
     1
 }
+fn default_compact_at() -> f64 {
+    0.6
+}
+fn default_compact_force_at() -> f64 {
+    0.7
+}
+fn default_compact_max_chars() -> usize {
+    16_000
+}
 fn default_ledger_chars() -> usize {
     2400
 }
@@ -1073,6 +1138,13 @@ impl ToolsConfig {
             if check_name(&t.name).is_ok() && !out.iter().any(|n| n == &t.name) {
                 out.push(t.name.clone());
             }
+        }
+        // compact joins any registry that offers something else (an MCP
+        // server's tools included), last
+        if self.compact_at > 0.0 && (!out.is_empty() || !self.mcp.is_empty())
+            && !out.iter().any(|n| n == COMPACT_TOOL)
+        {
+            out.push(COMPACT_TOOL.to_string());
         }
         out
     }
@@ -1508,6 +1580,13 @@ pub struct Tool {
     pub meta: ToolMeta,
 }
 
+impl Tool {
+    /// This app's own builtin `k`, not a configured tool that took its name.
+    pub fn is_builtin(&self, k: Builtin) -> bool {
+        matches!(self.src, ToolSrc::Builtin(b) if b == k)
+    }
+}
+
 /// One MCP connection for the life of ONE request. The component keeps nothing
 /// between requests, so this is opened, used and dropped within a single turn.
 pub struct McpSession {
@@ -1786,6 +1865,26 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             for t in &mut reg.tools {
                 t.meta.defer = false;
             }
+        }
+    }
+    // compact goes to any registry that offers something else - a loop of
+    // calls is what fills a window - and is last, so it never reorders the
+    // tools a parked prefix already holds
+    if cfg.compact_at > 0.0 && !reg.tools.is_empty() {
+        if reg.find(COMPACT_TOOL).is_none() {
+            let k = Builtin::Compact;
+            reg.tools.push(Tool {
+                name: k.name().to_string(),
+                description: k.description().to_string(),
+                parameters: k.schema(),
+                src: ToolSrc::Builtin(k),
+                meta: ToolMeta::default(),
+            });
+        } else {
+            reg.notes.push(format!(
+                "a tool named '{COMPACT_TOOL}' is configured, so the model cannot compact its \
+                 context; set compact_at to 0 to silence this"
+            ));
         }
     }
     reg
@@ -2967,6 +3066,12 @@ fn call_builtin(
         ),
         // tools::call answers it from the registry before reaching here
         Builtin::LoadTools => Err(format!("{LOAD_TOOLS} is answered from the tool registry")),
+        // like spawn_agent: intercepted by the answer loop, whose messages it
+        // rewrites; only the /tools probe gets this far
+        Builtin::Compact => Err(format!(
+            "{COMPACT_TOOL} is run by the answer loop: it replaces that loop's conversation, \
+             which a probe does not have"
+        )),
         Builtin::Wait => {
             let (secs, reason, note) = wait_plan(args, b.wait_cap_s)?;
             // Sleep in ticks, each one a status line: the guest cannot say
@@ -4161,7 +4266,7 @@ mod tests {
         let b = Builtins { search: None, web_withheld: true, off: &off, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let offered: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(offered, ["run_vm_command", "generate_image"]);
+        assert_eq!(offered, ["run_vm_command", "generate_image", COMPACT_TOOL]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
     }
 
@@ -4410,7 +4515,7 @@ mod tests {
         }))
         .unwrap();
         let reg = build(&cfg, Builtins::default(), &|_| {});
-        assert_eq!(reg.tools.len(), 1);
+        assert_eq!(reg.tools.len(), 2, "a, then compact");
         assert_eq!(reg.notes.len(), 2);
     }
 
@@ -4430,7 +4535,7 @@ mod tests {
         let reg = build(&cfg, Builtins::default(), &|_| {});
         let resolved: Vec<String> = reg.tools.iter().map(|t| t.name.clone()).collect();
         assert_eq!(cfg.http_names(), resolved);
-        assert_eq!(resolved, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(resolved, vec!["a".to_string(), "b".to_string(), COMPACT_TOOL.to_string()]);
     }
 
     /// Built-ins only appear when the capability behind them is configured.
@@ -4457,10 +4562,10 @@ mod tests {
         let b = Builtins { search: Some(&scfg), ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["web_search", "request"]);
+        assert_eq!(names, vec!["web_search", "request", COMPACT_TOOL]);
         assert_eq!(reg.notes.len(), 1);
         // and /models advertises exactly those
-        assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "request".to_string()]);
+        assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "request".to_string(), COMPACT_TOOL.to_string()]);
     }
 
     /// The generic powers that let ANY API be an image or vision tool: a
@@ -4493,20 +4598,20 @@ mod tests {
         let b = Builtins { images_present: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["draw", "look"]);
+        assert_eq!(names, vec!["draw", "look", COMPACT_TOOL]);
         assert!(reg.makes_image(&cfg));
         assert_eq!(reg.image_tool_names(&cfg).0, Some("look"));
         // no picture this turn: the reader vanishes silently
         let reg = build(&cfg, Builtins::default(), &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["draw"]);
+        assert_eq!(names, vec!["draw", COMPACT_TOOL]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
         assert_eq!(reg.image_tool_names(&cfg).0, None);
         // the serving model reads pictures itself: same silent stand-down
         let b = Builtins { images_present: true, images_local: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["draw"]);
+        assert_eq!(names, vec!["draw", COMPACT_TOOL]);
     }
 
     /// The response side of the generic entries: extraction by dot path, an
@@ -4880,7 +4985,7 @@ mod tests {
         let mut reg = build(&cfg, Builtins::default(), &|_| {});
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["wait", "plan_deploy", "build_fund", LOAD_TOOLS]);
+        assert_eq!(names, ["wait", "plan_deploy", "build_fund", LOAD_TOOLS, COMPACT_TOOL]);
         let block = system_block(&reg.tools, &Budget::calls(8));
         // listed by name and first sentence, never by schema
         assert!(block.contains("- plan_deploy: plan_deploy does the plan_deploy thing.\n"), "{block}");
@@ -5142,8 +5247,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "provider": "exa" })).unwrap();
         let b = Builtins { search: Some(&scfg), ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
-        assert_eq!(reg.tools.len(), 1);
-        assert!(matches!(reg.tools[0].src, ToolSrc::Builtin(_)));
+        assert_eq!(reg.tools.len(), 2, "web_search, then compact");
+        assert!(matches!(reg.tools[0].src, ToolSrc::Builtin(Builtin::WebSearch)));
         assert_eq!(reg.notes.len(), 1);
     }
 
@@ -5560,7 +5665,7 @@ mod tests {
         .unwrap();
         // no pictures this turn: neither picture tool is offered
         let reg = build(&cfg, Builtins { user: Some("0xabc"), ..Default::default() }, &|_| {});
-        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read"]);
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", COMPACT_TOOL]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
         assert_eq!(reg.mcp[0].headers, vec![("x-user".to_string(), "0xabc".to_string())]);
         // with pictures, both; the reader and the transformer are told apart
@@ -5571,7 +5676,7 @@ mod tests {
         // a model that reads pictures itself keeps the transformer only
         let b = Builtins { user: Some("0xabc"), images_present: true, images_local: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
-        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", "upscale_image"]);
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", "upscale_image", COMPACT_TOOL]);
         // a switched-off group withholds its tools, and the whole server
         // is not dialled when every group is off
         let off = ["notes".to_string(), "images".to_string()];
@@ -5782,7 +5887,8 @@ mod tests {
         .unwrap();
         let armed = |off: &[String]| -> Vec<String> {
             let b = Builtins { off, ..Default::default() };
-            build(&cfg, b, &|_| {}).tools.iter().map(|t| t.name.clone()).collect()
+            build(&cfg, b, &|_| {}).tools.iter().map(|t| t.name.clone())
+                .filter(|n| n != COMPACT_TOOL).collect()
         };
         assert_eq!(armed(&[]), vec!["notes_read".to_string(), "run_vm_command".to_string()]);
         assert_eq!(armed(&["notes".to_string()]), vec!["run_vm_command".to_string()]);
@@ -5841,7 +5947,7 @@ mod tests {
         assert!(reg.find("wait").is_some(), "{:?}", reg.notes);
         assert!(reg.find("web_search").is_none());
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        assert_eq!(cfg.http_names(), vec!["wait".to_string(), "web_search".to_string()]);
+        assert_eq!(cfg.http_names(), vec!["wait".to_string(), "web_search".to_string(), COMPACT_TOOL.to_string()]);
         // the budget fields have their defaults without being written
         assert_eq!(cfg.max_seconds, 3600);
         assert_eq!(cfg.wait_max_s, 600);

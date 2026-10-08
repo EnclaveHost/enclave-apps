@@ -2627,6 +2627,25 @@ impl Session {
 /// every one of these is a mistake someone can only fix if they know which of
 /// four different reasons stopped them: this model cannot see, this backend
 /// cannot see, too many pictures, or one picture too large.
+/// The newest message, when the request ends with one from the user, may
+/// take at most max_message_tokens of text. Older ones got in under whatever
+/// limit stood then, and refusing them now would end the chat for good.
+fn check_message_tokens(cfg: &AppConfig, tok: &Tok, messages: &[ChatMsg]) -> Result<(), String> {
+    let max = cfg.max_message_tokens;
+    let Some(m) = messages.last().filter(|m| max > 0 && m.role == "user") else {
+        return Ok(());
+    };
+    let n = tok.encode_ids(&m.content, false)?.len();
+    if n > max {
+        return Err(format!(
+            "[message_too_long] this message is {n} tokens, and one message may be at most {max} \
+             (about {} words). Shorten it, or send it in parts.",
+            max * 3 / 4
+        ));
+    }
+    Ok(())
+}
+
 fn check_images(
     raw: &serde_json::Value,
     cfg: &AppConfig,
@@ -5815,6 +5834,7 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
                     break 'answer None;
                 }
             };
+        tl.note_prompt(prompt_cost(&prompt_ids, env.cfg), kv_pool(), env.cfg.max_prompt_tokens);
         let effort =
             resolve_effort(env.cfg, env.tok, &messages, env.mode, think_open, None, &on_status);
         let params = gen_params(env.cfg, env.creq, stops, think_open, effort);
@@ -6057,6 +6077,28 @@ struct ToolLoop<'a> {
     /// the model's own state block, as it last wrote it under `### LEDGER`;
     /// shown back under every result in ledger mode
     ledger: String,
+    /// COMPACTION (ToolsConfig::compact_at): how many tokens the newest
+    /// prompt took, as the leg built it (note_prompt)...
+    prompt_tokens: usize,
+    /// ...what it is measured against (the KV pool, else the prompt cap),
+    /// and where the model is told to compact and where nothing else runs
+    /// until it has, in tokens (compact_marks; zeros = off)
+    compact_window: usize,
+    compact_tell: usize,
+    compact_force: usize,
+    /// the model was refused a call for not compacting; a second one is
+    /// compacted for it (compact_auto)
+    compact_told: bool,
+    /// the first prompt after a compaction, once measured: a prompt still
+    /// over the marks then (a huge system prompt or request, which nothing
+    /// can drop) is not nagged again until the loop has added a quarter of
+    /// the tell mark on top of it
+    compact_floor: Option<usize>,
+    compact_pending: bool,
+    /// how many times this loop compacted, and the newest summary - the
+    /// page keeps it, so the next request does not resend what it replaced
+    compactions: usize,
+    summary: Option<String>,
     /// the ledger is in force: from the start under Ledger::Always, from
     /// the result that re-ran a check under Ledger::Checks, never under Off
     ledger_on: bool,
@@ -6240,6 +6282,15 @@ impl<'a> ToolLoop<'a> {
             log: Vec::new(),
             base_len: None,
             ledger: String::new(),
+            prompt_tokens: 0,
+            compact_window: 0,
+            compact_tell: 0,
+            compact_force: 0,
+            compact_told: false,
+            compact_floor: None,
+            compact_pending: false,
+            compactions: 0,
+            summary: None,
             ledger_on,
             acts: 0,
             checks: std::collections::HashMap::new(),
@@ -6277,7 +6328,266 @@ impl<'a> ToolLoop<'a> {
             "max_seconds": self.budget.max_seconds,
             "agents": self.tree.borrow().spawned,
             "max_agents": self.tree.borrow().limit,
+            "compactions": self.compactions,
         })
+    }
+
+    /// The leg reports every prompt it built: its size in tokens (pictures
+    /// at their budgeted cost), the KV pool (ENCLAVE_GGML_N_CTX, 0 when the
+    /// host does not say) and the prompt cap. The next result reads it.
+    fn note_prompt(&mut self, tokens: usize, pool: usize, cap: usize) {
+        self.prompt_tokens = tokens;
+        let (window, tell, force) = compact_marks(self.cfg, pool, cap);
+        self.compact_window = window;
+        self.compact_tell = tell;
+        self.compact_force = force;
+        if std::mem::take(&mut self.compact_pending) {
+            self.compact_floor = Some(tokens);
+        }
+    }
+
+    /// The prompt is past `mark` and compacting could still bring it down:
+    /// right after a compaction the prompt is what it cannot drop, so it
+    /// has to grow a quarter of the tell mark past that first.
+    fn over(&self, mark: usize) -> bool {
+        self.reg.find(tools::COMPACT_TOOL).is_some_and(|t| t.is_builtin(tools::Builtin::Compact))
+            && mark > 0
+            && self.prompt_tokens >= mark
+            && self.compact_floor.is_none_or(|f| self.prompt_tokens >= f + self.compact_tell / 4)
+    }
+
+    /// Where the context stands, under a result once it is past the tell
+    /// mark: a fact the model reads, with what to do about it.
+    fn compact_note(&self) -> String {
+        if !self.over(self.compact_tell) {
+            return String::new();
+        }
+        format!(
+            "\n\n[context: {}% full - this conversation takes {} of the {} tokens the model's \
+             memory holds. Call {} now, before anything else, with a summary that lets you carry \
+             on without the rest; at {} tokens nothing else runs until you have.]",
+            self.prompt_tokens * 100 / self.compact_window.max(1),
+            self.prompt_tokens,
+            self.compact_window,
+            tools::COMPACT_TOOL,
+            self.compact_force,
+        )
+    }
+
+    /// Replace everything but the system prompt and the user's latest
+    /// message with the compact call and its result. Returns how many
+    /// messages went. Every index the loop holds into the conversation
+    /// points past the new end, so they go too, and the ledger's base moves
+    /// to just after the request.
+    fn replace_history(&mut self, messages: &mut Vec<ChatMsg>, call: String, result: &str) -> usize {
+        let base = (*self.base_len.get_or_insert(messages.len())).min(messages.len());
+        let req = messages[..base].iter().rposition(|m| m.role == "user");
+        let before = messages.len();
+        let mut i = 0;
+        messages.retain(|m| {
+            let keep = m.role == "system" || Some(i) == req;
+            i += 1;
+            keep
+        });
+        let gone = before - messages.len();
+        self.base_len = Some(messages.len());
+        self.results.clear();
+        self.pictures.clear();
+        messages.push(ChatMsg::text("assistant", call));
+        messages.push(ChatMsg::text("user", tools::response_turn(tools::COMPACT_TOOL, result)));
+        self.compactions += 1;
+        self.compact_told = false;
+        self.compact_pending = true;
+        gone
+    }
+
+    /// A `compact` call: the model's summary replaces the conversation. An
+    /// empty or overlong summary changes nothing and says why.
+    fn compact_with(
+        &mut self,
+        c: &tools::ToolCall,
+        messages: &mut Vec<ChatMsg>,
+        on_call: &dyn Fn(&serde_json::Value),
+        on_result: &dyn Fn(&serde_json::Value),
+        on_note: &dyn Fn(&str),
+    ) -> bool {
+        self.calls += 1;
+        on_call(&serde_json::json!({
+            "name": c.name, "arguments": c.args, "n": self.calls,
+            "of": self.budget.max_calls,
+            "elapsed_s": self.elapsed_s(), "max_seconds": self.budget.max_seconds,
+        }));
+        let summary = c.args.get("summary").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let max = self.cfg.compact_max_chars.max(1000);
+        let chars = summary.chars().count();
+        let refused = if summary.is_empty() {
+            Some("Not compacted: `summary` was empty. Call compact again with the summary written \
+                  out in full.".to_string())
+        } else if chars > max {
+            Some(format!(
+                "Not compacted: the summary is {chars} characters and compact takes at most {max}. \
+                 Shorten it - keep the goal, the exact current state and the next steps - and call \
+                 compact again."
+            ))
+        } else {
+            None
+        };
+        let (ok, text) = match refused {
+            Some(t) => {
+                messages.push(ChatMsg::text("assistant", canonical_call(c)));
+                messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &t)));
+                (false, t)
+            }
+            None => {
+                let was = self.prompt_tokens;
+                // the summary is the result, so it reads as text rather than
+                // as one escaped JSON string inside the call
+                let call = canonical_call(&tools::ToolCall {
+                    name: c.name.clone(),
+                    args: serde_json::json!({ "summary": "(in the result below)" }),
+                });
+                let head = |gone: usize| format!(
+                    "Compacted. The conversation was {was} tokens; {gone} earlier messages are gone \
+                     and this summary, which you wrote, stands in for them. Carry on from it.\n\n"
+                );
+                // the count is only known once the messages are gone
+                let gone = self.replace_history(messages, call, "");
+                let t = format!("{}{summary}", head(gone));
+                if let Some(m) = messages.last_mut() {
+                    m.content = tools::response_turn(&c.name, &t);
+                }
+                on_note(&format!(
+                    "the model compacted its context: {gone} earlier messages replaced by its summary"
+                ));
+                self.summary = Some(summary);
+                (true, t)
+            }
+        };
+        let entry = serde_json::json!({
+            "name": c.name, "arguments": c.args, "n": self.calls,
+            "ok": ok, "ms": 0, "chars": text.chars().count(),
+        });
+        let mut live = entry.clone();
+        live["result"] = serde_json::json!(tools::truncate(&text, RESULT_EVENT_CHARS));
+        on_result(&live);
+        self.log.push(entry);
+        self.call_at = now_ms();
+        true
+    }
+
+    /// Past the force mark, the model's next call is not run until it has
+    /// compacted - asked once; asked and still calling something else, it
+    /// is compacted for it (compact_auto) and the call goes ahead. Returns
+    /// Some(regenerate) when the call was answered here.
+    fn hold_for_compaction(
+        &mut self,
+        c: &tools::ToolCall,
+        messages: &mut Vec<ChatMsg>,
+        on_note: &dyn Fn(&str),
+    ) -> Option<bool> {
+        if !self.over(self.compact_force) {
+            return None;
+        }
+        if self.compact_told {
+            self.compact_auto(messages, on_note);
+            return None;
+        }
+        self.compact_told = true;
+        on_note("the context is nearly full; the model was asked to compact it before calling anything else");
+        messages.push(ChatMsg::text("assistant", canonical_call(c)));
+        messages.push(ChatMsg::text(
+            "user",
+            tools::response_turn(
+                &c.name,
+                &format!(
+                    "This call was NOT run: the conversation takes {} of the {} tokens the model's \
+                     memory holds, so the context must be compacted first. Call {} now with your \
+                     summary, then make this call again. Calling anything else compacts the \
+                     context without your summary.",
+                    self.prompt_tokens,
+                    self.compact_window,
+                    tools::COMPACT_TOOL,
+                ),
+            ),
+        ));
+        Some(true)
+    }
+
+    /// The model would not summarize, so the loop does it from what it
+    /// has: the conversation's turns, each cut short, the calls with their
+    /// results condensed. Worse than the model's own summary - it cannot
+    /// say what mattered - but it keeps the request and the trail, where
+    /// the prompt cap would drop the oldest turns, the request first.
+    fn compact_auto(&mut self, messages: &mut Vec<ChatMsg>, on_note: &dyn Fn(&str)) {
+        let base = (*self.base_len.get_or_insert(messages.len())).min(messages.len());
+        let req = messages[..base].iter().rposition(|m| m.role == "user");
+        let max = self.cfg.compact_max_chars.max(1000);
+        let mut lines: Vec<String> = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == "system" || Some(i) == req {
+                continue;
+            }
+            let text = strip_think(&m.content);
+            // the app's own nudges to compact are not part of the record
+            // (inside a result it is JSON-escaped: its newlines are "\\n")
+            let text = match text.find("[context: ") {
+                Some(at) => format!(
+                    "{}{}",
+                    text[..at].trim_end_matches("\\n").trim_end_matches('\n'),
+                    text[at..].find(".]").map_or("", |e| &text[at + e + 2..])
+                ),
+                None => text,
+            };
+            let text = text.trim();
+            if text.contains("so the context must be compacted first") {
+                lines.push("  -> not run: the context had to be compacted first".into());
+                continue;
+            }
+            let line = if i >= base && m.role == "assistant" {
+                format!("- {}", tools::truncate(text, 400))
+            } else if i >= base {
+                format!("  -> {}", condense(text).unwrap_or_else(|| text.to_string()))
+            } else {
+                format!("{}: {}", m.role, tools::truncate(text, 600))
+            };
+            lines.push(line);
+        }
+        // the newest lines matter most: keep the tail that fits
+        let mut kept: Vec<String> = Vec::new();
+        let mut used = 0;
+        for l in lines.into_iter().rev() {
+            used += l.chars().count() + 1;
+            if used > max {
+                break;
+            }
+            kept.push(l);
+        }
+        kept.reverse();
+        let summary = format!(
+            "[Compacted automatically: you did not summarize when asked, so this is the \
+             conversation so far, each part cut short, oldest first.]\n{}",
+            kept.join("\n")
+        );
+        let was = self.prompt_tokens;
+        let gone = self.replace_history(
+            messages,
+            canonical_call(&tools::ToolCall {
+                name: tools::COMPACT_TOOL.to_string(),
+                args: serde_json::json!({ "summary": "(written by the app, in the result below)" }),
+            }),
+            "",
+        );
+        if let Some(m) = messages.last_mut() {
+            m.content = tools::response_turn(
+                tools::COMPACT_TOOL,
+                &format!("The conversation was {was} tokens; {gone} earlier messages are gone.\n\n{summary}"),
+            );
+        }
+        on_note(&format!(
+            "the model did not compact a nearly full context, so the app did: {gone} earlier \
+             messages replaced by a cut-down record of them"
+        ));
+        self.summary = Some(summary);
     }
 
     /// Run a subagent for a `spawn_agent` call and hand its report back as
@@ -6825,6 +7135,17 @@ impl<'a> ToolLoop<'a> {
             self.refused = Some(REFUSED_GONE);
             return false;
         }
+        // COMPACTION: the model's own call to compact is bookkeeping, never
+        // a failure or a repeat; past the force mark, any other call waits
+        // for it
+        if c.name == tools::COMPACT_TOOL
+            && self.reg.find(&c.name).is_some_and(|t| t.is_builtin(tools::Builtin::Compact))
+        {
+            return self.compact_with(&c, messages, on_call, on_result, on_note);
+        }
+        if let Some(again) = self.hold_for_compaction(&c, messages, on_note) {
+            return again;
+        }
         // Failing: the last max_failed calls all failed, and the result of
         // the last one said this was the limit. Out of budget the way the
         // count and the clock are: told once, then refused - unless the
@@ -7039,6 +7360,7 @@ impl<'a> ToolLoop<'a> {
         } else {
             format!("{}{stuck}", r.text)
         };
+        let text = format!("{text}{}", self.compact_note());
         // The model's own call goes back in as the assistant turn it was, so
         // the next pass sees what it asked for beside what came back.
         messages.push(ChatMsg::text("assistant", canonical_call(&c)));
@@ -7183,6 +7505,38 @@ fn cut_report(text: &str, max_chars: usize) -> String {
 
 /// A result the model has already acted on, cut to its head and tail. None
 /// when it is short enough that cutting would save nothing.
+/// The KV pool every chat on this model shares, in tokens: the node's
+/// context window, forwarded as ENCLAVE_GGML_N_CTX. 0 when the host does
+/// not say.
+fn kv_pool() -> usize {
+    std::env::var("ENCLAVE_GGML_N_CTX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// What a built prompt costs the KV pool: its text, and each picture at the
+/// cost it was budgeted at when the prompt was fitted.
+fn prompt_cost(p: &Prompt, cfg: &AppConfig) -> usize {
+    p.text_ids.len() + p.images * cfg.image_tokens
+}
+
+/// Compaction's marks, in tokens: (window, tell, force). The shares are of
+/// the KV POOL - what runs out - falling back to the prompt cap where the
+/// host does not say; neither mark may sit past the cap's own edge, since
+/// beyond max_prompt_tokens build_prompt drops the oldest turns unread and
+/// compacting after that is too late. Zeros when compaction is off.
+fn compact_marks(tc: &tools::ToolsConfig, pool: usize, cap: usize) -> (usize, usize, usize) {
+    if !(tc.compact_at > 0.0) {
+        return (0, 0, 0);
+    }
+    let window = if pool > 0 { pool } else { cap };
+    let share = |f: f64| (window as f64 * f.clamp(0.05, 1.0)) as usize;
+    let tell = share(tc.compact_at).min(cap / 100 * 85);
+    let force = share(tc.compact_force_at.max(tc.compact_at)).min(cap / 100 * 95).max(tell);
+    (window, tell, force)
+}
+
 fn condense(text: &str) -> Option<String> {
     let n = text.chars().count();
     if n <= CONDENSE_EDGE * 3 {
@@ -9498,6 +9852,8 @@ const ERR_CODES: &[&str] = &[
     "vision_unavailable", "image_undecodable", "image_too_wide",
     // sign-in gate: the playground opens its sign-in dialog on this one
     "sso_required",
+    // one message over max_message_tokens: the user's to shorten
+    "message_too_long",
 ];
 
 /// Drop the "[code] " marker from a message bound for a payload without a
@@ -9815,6 +10171,12 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             return;
         }
     };
+    if let Err(e) = check_message_tokens(cfg, &tok, &creq.messages) {
+        let _ = send(serde_json::json!({ "error": strip_code(&e) }));
+        drop(stream);
+        let _ = OutgoingBody::finish(body, None);
+        return;
+    }
 
     let mode = creq.target.as_deref().unwrap_or("auto");
 
@@ -9980,6 +10342,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                 return;
             }
         };
+        if let Some(t) = tl.as_mut() {
+            t.note_prompt(prompt_cost(&prompt_ids, cfg), kv_pool(), cfg.max_prompt_tokens);
+        }
         let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
         let mut params = gen_params(cfg, &creq, stops, think_open, effort);
         // the page keeps this turn's answer as ids (mm37): park its end
@@ -10179,6 +10544,11 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     if let Some(t) = tl.as_ref().filter(|t| t.calls > 0) {
                         done["loop"] = t.progress();
                     }
+                    // a compacted answer: the page sends this summary in
+                    // place of the turns before its question from now on
+                    if let Some(sm) = tl.as_ref().and_then(|t| t.summary.as_ref()) {
+                        done["compact"] = serde_json::json!({ "summary": sm });
+                    }
                     let im = INIT_MS.with(|v| v.borrow().clone());
                     if !im.is_empty() {
                         let mut m = serde_json::Map::new();
@@ -10370,6 +10740,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 return;
             }
         };
+        if let Err(e) = check_message_tokens(cfg, &tok, &creq.messages) {
+            send_err(&e);
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
         // Effort scaling, when the deployment configured it: the rating comes out
         // of the router pass below if that runs, and from its own short pass later
         // if it does not. `want_effort` gates BOTH, so a deployment without the
@@ -10523,6 +10899,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 return;
             }
         };
+        if let Some(t) = tl.as_mut() {
+            t.note_prompt(prompt_cost(&prompt_ids, cfg), kv_pool(), cfg.max_prompt_tokens);
+        }
         let effort =
             resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
         let params = gen_params(cfg, &creq, stops, think_open, effort);
@@ -10691,6 +11070,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(t) => t,
             Err(e) => return json_err(out, 500, &e),
         };
+        if let Err(e) = check_message_tokens(cfg, &tok, &creq.messages) {
+            return json_err(out, 400, &e);
+        }
         let no_status = |_: &str| {};
         // Effort scaling, when the deployment configured it: the rating comes out
         // of the router pass below if that runs, and from its own short pass later
@@ -10791,6 +11173,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(v) => v,
             Err(e) => return json_err(out, 400, &e),
         };
+        if let Some(t) = tl.as_mut() {
+            t.note_prompt(prompt_cost(&prompt_ids, cfg), kv_pool(), cfg.max_prompt_tokens);
+        }
         think_open = opened;
         effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
         params = gen_params(cfg, &creq, stops, think_open, effort);
@@ -11462,6 +11847,11 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "max_failed_calls": t.max_failed_calls,
                 "max_repeat_calls": t.max_repeat_calls,
                 "limit_cooldown_s": t.limit_cooldown_s,
+                // compaction: shares of the KV pool, which is named so the
+                // marks can be read as tokens
+                "compact_at": t.compact_at,
+                "compact_force_at": t.compact_force_at,
+                "kv_pool": kv_pool(),
                 "max_seconds": t.max_seconds,
                 "max_agents": t.max_agents,
                 "max_agent_depth": t.max_agent_depth,
@@ -11713,6 +12103,8 @@ fn handle_tools_probe(
         "max_failed_calls": tcfg.max_failed_calls,
         "max_repeat_calls": tcfg.max_repeat_calls,
         "limit_cooldown_s": tcfg.limit_cooldown_s,
+        "compact_at": tcfg.compact_at,
+        "compact_force_at": tcfg.compact_force_at,
         "max_seconds": tcfg.max_seconds,
         "wait_max_s": tcfg.wait_max_s,
         "keep_results": tcfg.keep_results,
@@ -13072,6 +13464,184 @@ mod tests {
         assert_eq!(ledger_of("no block here\n<tool_call>{}</tool_call>"), None);
         assert_eq!(ledger_of("### LEDGER\n\n<tool_call>{}</tool_call>"), None);
         assert_eq!(ledger_of("### Ledgers\nno"), None);
+    }
+
+    /// COMPACTION's marks are shares of the KV pool, never past the prompt
+    /// cap's edge, and the prompt cap stands in where the host gives no pool.
+    #[test]
+    fn compaction_marks_follow_the_kv_pool_inside_the_prompt_cap() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((tc.compact_at, tc.compact_force_at), (0.6, 0.7));
+        // eyesoff's 27b: nnCtx 180224, max_prompt_tokens 131072
+        assert_eq!(compact_marks(&tc, 180_224, 131_072), (180_224, 108_134, 124_450));
+        // a pool far bigger than the cap: the cap's edge wins
+        assert_eq!(compact_marks(&tc, 1 << 20, 131_072), (1 << 20, 111_350, 124_450));
+        // no pool reported: the cap is the window
+        assert_eq!(compact_marks(&tc, 0, 100_000), (100_000, 60_000, 70_000));
+        let off: tools::ToolsConfig = serde_json::from_value(serde_json::json!({ "compact_at": 0 })).unwrap();
+        assert_eq!(compact_marks(&off, 180_224, 131_072), (0, 0, 0));
+        // a force share below the tell share is the tell share
+        let odd: tools::ToolsConfig =
+            serde_json::from_value(serde_json::json!({ "compact_at": 0.5, "compact_force_at": 0.2 })).unwrap();
+        let (_, tell, force) = compact_marks(&odd, 100_000, 100_000);
+        assert_eq!((tell, force), (50_000, 50_000));
+    }
+
+    fn compacting_loop() -> tools::ToolsConfig {
+        serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_failed_calls": 0, "max_repeat_calls": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_is_offered_beside_other_tools_only() {
+        let on = compacting_loop();
+        let reg = tools::build(&on, tools::Builtins::default(), &|_| {});
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.last(), Some(&tools::COMPACT_TOOL), "{names:?}");
+        assert!(reg.find(tools::COMPACT_TOOL).unwrap().is_builtin(tools::Builtin::Compact));
+        let mut off = compacting_loop();
+        off.compact_at = 0.0;
+        assert!(tools::build(&off, tools::Builtins::default(), &|_| {}).find(tools::COMPACT_TOOL).is_none());
+        let mut bare = compacting_loop();
+        bare.http.clear();
+        assert!(tools::build(&bare, tools::Builtins::default(), &|_| {}).tools.is_empty(),
+            "a loop with nothing else to call has nothing to compact");
+        // a configured tool that took the name is left alone, with a note
+        let mut taken = compacting_loop();
+        taken.http[0].name = "compact".into();
+        let reg = tools::build(&taken, tools::Builtins::default(), &|_| {});
+        assert!(!reg.find(tools::COMPACT_TOOL).unwrap().is_builtin(tools::Builtin::Compact));
+        assert!(reg.notes.iter().any(|n| n.contains("cannot compact")), "{:?}", reg.notes);
+    }
+
+    /// The model's summary replaces everything but the system prompt and
+    /// the request, and the loop's own bookkeeping moves with it.
+    #[test]
+    fn compact_replaces_the_conversation_with_the_models_summary() {
+        let tc = compacting_loop();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![
+            ChatMsg::text("system", "you are eyesoff"),
+            ChatMsg::text("user", "earlier question"),
+            ChatMsg::text("assistant", "earlier answer"),
+            ChatMsg::text("user", "build the app"),
+        ];
+        let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        for i in 0..4 {
+            assert!(tl.step(&call(i), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert_eq!(msgs.len(), 12);
+        let (calls, results, notes) = (std::cell::RefCell::new(0), std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let summary = "Goal: build the app. Done: scaffold in /work/app. Next: run the tests.";
+        let c = format!("<tool_call>{{\"name\":\"compact\",\"arguments\":{{\"summary\":\"{summary}\"}}}}</tool_call>");
+        tl.prompt_tokens = 50_000;
+        assert!(tl.step(&c, &mut msgs, &|_| *calls.borrow_mut() += 1,
+            &|r| results.borrow_mut().push(r.clone()), &|n| notes.borrow_mut().push(n.to_string())));
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(msgs[1].content, "build the app", "the request stays, word for word");
+        assert!(!msgs[2].content.contains("scaffold"), "the summary is not repeated in the call: {}", msgs[2].content);
+        let res = &msgs[3].content;
+        assert!(res.contains(summary) && res.contains("50000 tokens") && res.contains("10 earlier messages"), "{res}");
+        assert_eq!(tl.base_len, Some(2));
+        assert!(tl.results.is_empty() && tl.pictures.is_empty());
+        assert_eq!((tl.compactions, tl.summary.as_deref()), (1, Some(summary)));
+        assert_eq!(tl.counted, 4, "compacting is not a call the burst limit counts");
+        assert_eq!(*calls.borrow(), 1, "the page shows the call");
+        assert_eq!(results.borrow()[0]["ok"], true);
+        assert!(notes.borrow()[0].contains("compacted"), "{:?}", notes.borrow());
+        // the loop carries on from the new base
+        assert!(tl.step(&call(9), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(tl.progress()["compactions"], 1);
+        // an empty summary or an overlong one changes nothing
+        for bad in ["", &"x".repeat(16_001)] {
+            let before = msgs.len();
+            let c = format!("<tool_call>{{\"name\":\"compact\",\"arguments\":{{\"summary\":\"{bad}\"}}}}</tool_call>");
+            assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            assert_eq!(msgs.len(), before + 2);
+            assert!(msgs.last().unwrap().content.contains("Not compacted"), "{}", msgs.last().unwrap().content);
+            assert_eq!(tl.compactions, 1);
+        }
+    }
+
+    /// Past the tell mark each result says how full the context is; past the
+    /// force mark the next other call waits for a compaction, and a model
+    /// that calls something else again is compacted for it.
+    #[test]
+    fn a_filling_context_is_told_then_held_then_compacted_for_the_model() {
+        let tc = compacting_loop();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "go")];
+        let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        // pool 100k, cap 100k: tell at 60k, force at 70k
+        tl.note_prompt(59_999, 100_000, 100_000);
+        assert!(tl.step(&call(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!msgs.last().unwrap().content.contains("[context:"));
+        tl.note_prompt(65_000, 100_000, 100_000);
+        assert!(tl.step(&call(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        let told = &msgs.last().unwrap().content;
+        assert!(told.contains("[context: 65% full") && told.contains("Call compact now") && told.contains("at 70000 tokens"), "{told}");
+        // past the force mark: not run, asked to compact
+        tl.note_prompt(71_000, 100_000, 100_000);
+        let ran = std::cell::RefCell::new(0);
+        assert!(tl.step(&call(3), &mut msgs, &|_| *ran.borrow_mut() += 1, &|_| {}, &|_| {}));
+        assert_eq!(*ran.borrow(), 0);
+        assert!(msgs.last().unwrap().content.contains("This call was NOT run") && msgs.last().unwrap().content.contains("Call compact now"));
+        // asked again for something else: the app compacts, then the call runs
+        let notes = std::cell::RefCell::new(Vec::new());
+        assert!(tl.step(&call(4), &mut msgs, &|_| *ran.borrow_mut() += 1, &|_| {}, &|n| notes.borrow_mut().push(n.to_string())));
+        assert_eq!(*ran.borrow(), 1);
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user", "assistant", "user"]);
+        let rec = &msgs[3].content;
+        assert!(rec.contains("Compacted automatically") && rec.matches("- <tool_call>").count() == 3, "{rec}");
+        assert!(!rec.contains("[context:") && rec.contains("not run: the context had to be compacted first"), "{rec}");
+        assert!(msgs[4].content.contains("\"i\":4"));
+        assert!(notes.borrow().iter().any(|n| n.contains("did not compact")), "{:?}", notes.borrow());
+        assert!(tl.summary.as_deref().is_some_and(|s| s.contains("Compacted automatically")));
+        // right after: a prompt still over the marks (what nothing can drop)
+        // is not nagged until the loop has added a quarter of the tell mark
+        tl.note_prompt(72_000, 100_000, 100_000);
+        assert!(tl.step(&call(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!msgs.last().unwrap().content.contains("[context:"), "{}", msgs.last().unwrap().content);
+        tl.note_prompt(87_000, 100_000, 100_000);
+        assert!(tl.step(&call(6), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(msgs.last().unwrap().content.contains("This call was NOT run"), "{}", msgs.last().unwrap().content);
+        // compaction off: none of it
+        let mut off = compacting_loop();
+        off.compact_at = 0.0;
+        let mut quiet = ToolLoop::open(&off, tools::Builtins::default(), off.budget(None), &nop, &nofmt, None);
+        let mut m2 = vec![ChatMsg::text("user", "go")];
+        quiet.note_prompt(99_000, 100_000, 100_000);
+        assert!(quiet.step(&call(1), &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!m2.last().unwrap().content.contains("[context:"));
+    }
+
+    /// One message may take at most max_message_tokens; only the newest is
+    /// judged, and only when it is the user's.
+    #[test]
+    fn one_message_is_capped_and_only_the_newest() {
+        let tok = test_tokenizer();
+        let mut cfg = test_config();
+        cfg.max_message_tokens = 3;
+        let long = ChatMsg::text("user", "this no pictures here");
+        let e = check_message_tokens(&cfg, &tok, &[long.clone()]).unwrap_err();
+        assert!(e.starts_with("[message_too_long] this message is 4 tokens") && e.contains("at most 3"), "{e}");
+        assert!(check_message_tokens(&cfg, &tok, &[ChatMsg::text("user", "no pictures here")]).is_ok());
+        assert!(check_message_tokens(&cfg, &tok, &[long.clone(), ChatMsg::text("assistant", "ok"), ChatMsg::text("user", "here")]).is_ok(),
+            "an older long message is not judged again");
+        assert!(check_message_tokens(&cfg, &tok, &[long.clone(), ChatMsg::text("tool", "x")]).is_ok());
+        cfg.max_message_tokens = 0;
+        assert!(check_message_tokens(&cfg, &tok, &[long]).is_ok(), "0 = no cap");
+        assert!(ERR_CODES.contains(&"message_too_long"));
     }
 
     /// `ledger: true` is Ledger::Checks: a loop keeps its whole history

@@ -3206,6 +3206,35 @@ function stoppedTurn(t) {
 // What a stopped turn tells the model next time. A finished turn's answer
 // already says what its calls found; a stopped one never got to, so its calls
 // and their results go back in brief - otherwise "continue" starts over.
+// The summary an answer compacted its context into (the server's `compact`
+// tool): the model's own, from the call, or the one the app wrote when the
+// model would not (meta.compact, on a finished answer only).
+function compactSummary(m) {
+  if (!m || m.role !== "assistant") return null;
+  const calls = (m.tools || []).filter((c) => c.name === "compact" && c.ok
+    && c.arguments && typeof c.arguments.summary === "string" && c.arguments.summary.trim());
+  const own = calls.length ? calls[calls.length - 1].arguments.summary : null;
+  const app = m.meta && m.meta.compact && typeof m.meta.compact.summary === "string" ? m.meta.compact.summary : null;
+  // the app's is written AFTER any of the model's in the same answer
+  return app || own;
+}
+
+// Once an answer compacted, what came before its question is gone from the
+// model's side for good: the next request starts at that question, the
+// summary in front of it, rather than resending everything the summary
+// replaced (and filling the context straight back up).
+function sinceCompaction(msgs) {
+  let k = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) if (compactSummary(msgs[i])) { k = i; break; }
+  if (k < 0) return msgs;
+  let q = k - 1;
+  while (q >= 0 && msgs[q].role !== "user") q--;
+  if (q < 0) return msgs;
+  const head = "[Earlier in this conversation - your own summary, written when the context filled "
+    + "up while you answered the message below:]\n" + compactSummary(msgs[k]) + "\n\n[The message you were answering:]\n";
+  return [{ ...msgs[q], content: head + (msgs[q].content || "") }, ...msgs.slice(q + 1)];
+}
+
 function stoppedAccount(m) {
   const cut = (v, n) => { const s = typeof v === "string" ? v : JSON.stringify(v ?? {}); return s.length > n ? s.slice(0, n) + "…" : s; };
   const plain = (t) => (t || "").replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trim();
@@ -4545,7 +4574,7 @@ function stopGeneration(chat) {
 // The dropped ones leave a note behind, so the model knows the turn HAD a
 // picture rather than silently reading a question about nothing.
 function buildPayload(chat) {
-  const msgs = chat.messages.filter((m) => m.role === "user" || m.role === "assistant");
+  const msgs = sinceCompaction(chat.messages.filter((m) => m.role === "user" || m.role === "assistant"));
   // fall back to the server's own default rather than 0: if /models never
   // answered, dropping every picture silently is the worse failure
   const cap = (state.vision && state.vision.max_images) || 4;
@@ -4871,6 +4900,17 @@ async function run(chat) {
           chat.draft = asked;
           if (askedImages.length && !(chat.draftAtt || []).length) chat.draftAtt = askedImages.map((u) => ({ url: u }));
         }
+      }
+    } else if (/one message may be at most/.test((err && err.message) || "")) {
+      // over the deployment's per-message cap: retrying the same words can
+      // only fail again, so they go back to the composer to be cut down
+      stripTail();
+      if (chat.id === state.currentId) {
+        input.value = asked;
+        autosize();
+        pill("fail", ICONS.alert, " " + err.message, 9000);
+      } else {
+        chat.draft = asked;
       }
     } else {
       stripTail();
