@@ -371,6 +371,15 @@
     opacity: 0; transition: opacity .12s;
   }
   .row:hover .actions, .row.tail .actions { opacity: 1; }
+  /* a message sent while an answer runs: it waits under that answer */
+  .row.user.queued .bubble { background: transparent; border: 1px dashed var(--border); color: var(--text-2); }
+  .row.user.queued .att-row { opacity: .7; }
+  .qbar {
+    display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px;
+    margin-top: 6px; font-size: 12px; color: var(--text-3);
+  }
+  .qbar .qlbl { margin-right: 4px; }
+  .qbar .ebtn { padding: 4px 10px; font-size: 12px; }
   .act {
     padding: 6px; border-radius: 8px; color: var(--text-3); display: flex;
   }
@@ -1058,6 +1067,13 @@
   }
   #sendBtn:not(:disabled):active { transform: scale(.92); }
   #sendBtn:disabled { opacity: .25; }
+  #stopBtn {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--hover); color: var(--text); transition: transform .08s;
+  }
+  #stopBtn[hidden] { display: none; }
+  #stopBtn:active { transform: scale(.92); }
 
   /* ---- attachments. The composer becomes a column when something is
      attached: a thumbnail strip on top, the usual row underneath. */
@@ -1685,6 +1701,11 @@
           </div>
         </div>
         <textarea id="input" rows="1" placeholder="Ask anything" autofocus></textarea>
+        <!-- while an answer runs, typed words are QUEUED by the send button;
+             stopping then needs a button of its own -->
+        <button id="stopBtn" type="button" aria-label="Stop generating" title="Stop generating" hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+        </button>
         <button id="sendBtn" type="submit" aria-label="Send" disabled>
           <svg id="iconSend" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
           <svg id="iconStop" width="18" height="18" viewBox="0 0 24 24" style="display:none"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
@@ -2390,7 +2411,7 @@ const chatId = () => "c" + Date.now().toString(36) + Math.random().toString(36).
 const $ = (id) => document.getElementById(id);
 const scroller = $("scroller"), log = $("log"), emptyEl = $("empty");
 const input = $("input"), form = $("composer"), sendBtn = $("sendBtn");
-const iconSend = $("iconSend"), iconStop = $("iconStop");
+const iconSend = $("iconSend"), iconStop = $("iconStop"), stopBtn = $("stopBtn");
 const chatList = $("chatList"), jump = $("jump");
 const modelBtn = $("modelBtn"), modelMenu = $("modelMenu"), modelLabel = $("modelLabel");
 const warmPill = $("warmPill");
@@ -2704,7 +2725,7 @@ function persist(chat) {
   try {
     // a chat given an Enclave session before its first message is not a
     // blank: the record is the only copy of the session's key
-    if (!chat.messages.length && !chat.error && !sessKeeps(chat.session)) {
+    if (!chat.messages.length && !chat.error && !queued(chat) && !sessKeeps(chat.session)) {
       // emptied out (e.g. stop-before-first-token popped the question):
       // drop any stale record rather than saving a blank
       db.transaction("chats", "readwrite").objectStore("chats").delete(chat.id);
@@ -2713,6 +2734,7 @@ function persist(chat) {
     db.transaction("chats", "readwrite").objectStore("chats").put({
       id: chat.id, title: chat.title, messages: chat.messages,
       error: chat.error, session: chat.session || null, t: Date.now(),
+      queue: queued(chat) ? chat.queue : undefined,
     });
   } catch (_) {}
 }
@@ -2850,6 +2872,8 @@ function setUrlChat(id, push) {
 // last chat. Pushing there would leave a Back entry pointing at a URL that
 // resolves to nothing (a stale or just-deleted id).
 const busy = (chat) => !!(chat && chat.streaming);
+// messages sent while the chat was busy, waiting for its answer to finish
+const queued = (chat) => !!(chat && chat.queue && chat.queue.length);
 
 // The composer belongs to the chat on screen: what you were typing (and
 // attaching) stays with that chat when you switch, and comes back when you
@@ -2870,7 +2894,7 @@ function loadDraft() {
 function newChat(replaceUrl) {
   // reuse the current chat if it is still pristine, instead of piling up blanks
   const cur = current();
-  if (cur && !cur.messages.length && !cur.streaming && !cur.error) { input.focus(); return cur; }
+  if (cur && !cur.messages.length && !cur.streaming && !cur.error && !queued(cur)) { input.focus(); return cur; }
   const chat = { id: chatId(), title: "", messages: [], streaming: null, error: null };
   stashDraft();
   state.chats.unshift(chat);
@@ -3586,10 +3610,43 @@ function renderMessage(m, idx, isTail) {
   return row;
 }
 
+// A queued message, under the answer it waits for. All of them go to the
+// model together, as one message, the moment that answer finishes; "Send now"
+// stops the answer first (Stop keeps its work) and sends them straight away.
+function queuedRow(chat, q, i) {
+  const row = node('<div class="row user queued"><div class="bubble"></div><div class="qbar">' +
+    '<span class="qlbl"></span>' +
+    '<button type="button" class="ebtn primary" data-q-send>Send now</button>' +
+    '<button type="button" class="ebtn" data-q-edit="' + i + '">Edit</button>' +
+    '<button type="button" class="ebtn" data-q-del="' + i + '">Remove</button></div></div>');
+  const bubble = row.querySelector(".bubble");
+  bubble.innerHTML = linkifyText(q.text || "");
+  const pics = (q.images || []).filter((u) => /^data:image\/(png|jpeg|webp|gif|bmp);base64,[A-Za-z0-9+/=]+$/.test(u));
+  if (pics.length || (q.videos || []).length) {
+    const strip = node('<div class="att-row"></div>');
+    for (const u of pics) {
+      const im = document.createElement("img");
+      im.src = u; im.alt = "attached image"; im.loading = "lazy";
+      strip.appendChild(im);
+    }
+    for (const _ of q.videos || []) strip.appendChild(node('<span class="meta">video</span>'));
+    row.insertBefore(strip, bubble);
+    if (!q.text) bubble.remove();
+  }
+  // only the last row carries the buttons that act on the whole queue
+  const last = i === chat.queue.length - 1;
+  const lbl = row.querySelector(".qlbl");
+  if (!last) row.querySelector("[data-q-send]").remove();
+  lbl.textContent = !last ? "Queued"
+    : busy(chat) ? "Queued \u00b7 sent when this answer finishes"
+    : "Not sent yet";
+  return row;
+}
+
 function renderChat() {
   const chat = current();
   log.innerHTML = "";
-  const has = chat && (chat.messages.length || chat.streaming || chat.error);
+  const has = chat && (chat.messages.length || chat.streaming || chat.error || queued(chat));
   emptyEl.style.display = has ? "none" : "";
   if (!chat) return;
   const lastIdx = chat.messages.length - 1;
@@ -3614,6 +3671,7 @@ function renderChat() {
     log.appendChild(node('<div class="row assistant streaming" id="streamrow"><div class="md" id="streambody"></div></div>'));
     updateStreamDOM(chat);
   }
+  (chat.queue || []).forEach((q, i) => log.appendChild(queuedRow(chat, q, i)));
   scrollBottom(); // callers that mean "jump to the bottom" set pinned first
   renderSess();   // the header's session chip belongs to the chat on screen
 }
@@ -3763,6 +3821,11 @@ log.addEventListener("click", (e) => {
   if (em) { startEdit(+em.dataset.editMsg); return; }
   if (e.target.closest("[data-regen]")) regenerate();
   if (e.target.closest("[data-retry]")) retry();
+  if (e.target.closest("[data-q-send]")) sendQueueNow(current());
+  const qe = e.target.closest("[data-q-edit]");
+  if (qe) { unqueue(current(), +qe.dataset.qEdit, true); return; }
+  const qd = e.target.closest("[data-q-del]");
+  if (qd) unqueue(current(), +qd.dataset.qDel, false);
 });
 
 // ------------------------------------------------------------ attachments --
@@ -4213,20 +4276,27 @@ function autosize() {
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
 }
 
+// an attached picture is a message on its own: the server asks the model to
+// describe it when no words came with it
+const composed = () => !!(input.value.trim() || state.attachments.length);
+
+// While an answer runs, the button is Stop until something is typed; then it
+// QUEUES what was typed, and Stop moves to a button of its own beside it.
 function updateComposer() {
   const busyHere = busy(current());
-  iconSend.style.display = busyHere ? "none" : "";
-  iconStop.style.display = busyHere ? "" : "none";
-  if (busyHere) {
+  const stops = busyHere && !composed();
+  iconSend.style.display = stops ? "none" : "";
+  iconStop.style.display = stops ? "" : "none";
+  stopBtn.hidden = !busyHere || stops;
+  if (stops) {
     sendBtn.disabled = false;
     sendBtn.title = "Stop generating";
     sendBtn.setAttribute("aria-label", "Stop generating");
   } else {
-    // an attached picture is a message on its own: the server asks the model
-    // to describe it when no words came with it
-    sendBtn.disabled = !input.value.trim() && !state.attachments.length;
-    sendBtn.title = "Send";
-    sendBtn.setAttribute("aria-label", "Send");
+    sendBtn.disabled = !composed();
+    const label = busyHere ? "Queue - sent when this answer finishes" : "Send";
+    sendBtn.title = label;
+    sendBtn.setAttribute("aria-label", label);
   }
 }
 
@@ -4234,7 +4304,8 @@ input.addEventListener("input", () => { autosize(); updateComposer(); });
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    if (!busy(current())) form.requestSubmit();
+    // Enter never stops an answer: with nothing typed it does nothing
+    if (!busy(current()) || composed()) form.requestSubmit();
   }
 });
 window.addEventListener("keydown", (e) => {
@@ -4253,14 +4324,15 @@ window.addEventListener("keydown", (e) => {
 });
 form.addEventListener("submit", (e) => {
   e.preventDefault();
-  if (busy(current())) { stopGeneration(current()); return; }
+  if (busy(current()) && !composed()) { stopGeneration(current()); return; }
   sendCurrent();
 });
+stopBtn.addEventListener("click", () => { stopGeneration(current()); input.focus(); });
 // The textarea is one line tall inside a much taller pill - clicking the
 // pill's padding must focus the input too, or the composer looks focused
 // (caret from autofocus) while keystrokes go to <body>.
 form.addEventListener("click", (e) => {
-  if (!e.target.closest("#sendBtn")) input.focus();
+  if (!e.target.closest("#sendBtn, #stopBtn")) input.focus();
 });
 
 document.querySelectorAll(".chip").forEach((chip) => {
@@ -4275,7 +4347,7 @@ function sendCurrent() {
   const text = input.value.trim();
   const images = state.attachments.filter((a) => a.kind !== "video").map((a) => a.url);
   const videos = state.attachments.filter((a) => a.kind === "video").map((a) => a.url);
-  if ((!text && !images.length && !videos.length) || busy(current())) return;
+  if (!text && !images.length && !videos.length) return;
   if (images.length && !visionModel()) {
     pill("fail", ICONS.alert, " " + (state.model || "This model") + " cannot read images", 6000);
     return;
@@ -4285,11 +4357,22 @@ function sendCurrent() {
     return;
   }
   const chat = current() || newChat();
+  if (busy(chat) || queued(chat)) {
+    // sent while the answer runs: it waits under it. One left unsent by a
+    // stop or an error goes out now, together with this one.
+    chat.queue = chat.queue || [];
+    chat.queue.push(queuedItem(text, images, videos));
+    input.value = "";
+    autosize();
+    state.attachments = [];
+    updateAttachUI();
+    pinned = true;
+    if (busy(chat)) { persist(chat); renderChat(); updateComposer(); }
+    else flushQueue(chat);
+    return;
+  }
   chat.error = null;
-  const umsg = { role: "user", content: text };
-  if (images.length) umsg.images = images;
-  if (videos.length) umsg.videos = videos;
-  chat.messages.push(umsg);
+  chat.messages.push(userTurn(text, images, videos));
   state.attachments = [];
   updateAttachUI();
   if (!chat.title) {
@@ -4305,6 +4388,70 @@ function sendCurrent() {
   pinned = true;
   renderSidebar(); renderChat();
   run(chat);
+}
+
+function userTurn(text, images, videos) {
+  const m = { role: "user", content: text };
+  if (images && images.length) m.images = images;
+  if (videos && videos.length) m.videos = videos;
+  return m;
+}
+function queuedItem(text, images, videos) {
+  const q = { text };
+  if (images && images.length) q.images = images;
+  if (videos && videos.length) q.videos = videos;
+  return q;
+}
+
+// The queue goes to the model as ONE user turn: everything the person wrote
+// while it worked, in order. One turn, not several in a row, keeps every path
+// that treats the last message as the question (retry, a stop that hands it
+// back, an edit) working unchanged.
+function queueTurn(queue) {
+  return userTurn(queue.map((q) => q.text).filter(Boolean).join("\n\n"),
+    queue.flatMap((q) => q.images || []), queue.flatMap((q) => q.videos || []));
+}
+
+function flushQueue(chat) {
+  if (!queued(chat) || busy(chat)) return;
+  const m = queueTurn(chat.queue);
+  chat.queue = [];
+  chat.error = null;
+  chat.messages.push(m);
+  if (!chat.title) chat.title = m.content.slice(0, 64) || "Image";
+  const i = state.chats.indexOf(chat);
+  if (i > 0) { state.chats.splice(i, 1); state.chats.unshift(chat); }
+  persist(chat);
+  if (chat.id === state.currentId) pinned = true;
+  renderSidebar(); renderChat();
+  run(chat);
+}
+
+// "Send now": stop the answer (Stop keeps what it did, and the next request
+// tells the model) and send the queue the moment the stop has landed
+function sendQueueNow(chat) {
+  if (!queued(chat)) return;
+  if (!busy(chat)) { flushQueue(chat); return; }
+  chat.sendNow = true;
+  stopGeneration(chat);
+}
+
+// Edit takes a queued message back into the composer (after anything already
+// typed there); Remove drops it
+function unqueue(chat, i, edit) {
+  if (!chat || !queued(chat) || !chat.queue[i]) return;
+  const [q] = chat.queue.splice(i, 1);
+  if (edit) {
+    input.value = [input.value.trim(), q.text].filter(Boolean).join("\n\n");
+    state.attachments = state.attachments.concat(
+      (q.images || []).map((url) => ({ url })), (q.videos || []).map((url) => ({ url, kind: "video", name: "clip",
+        bytes: Math.floor(url.length * 3 / 4), link: !url.startsWith("data:") })));
+    updateAttachUI();
+    autosize();
+    input.focus();
+  }
+  persist(chat);
+  renderChat(); updateComposer();
 }
 
 function retry() {
@@ -4467,6 +4614,7 @@ async function run(chat) {
   // held so a stop (or an error) can hand the question BACK complete: losing
   // the pictures on the way out would mean re-attaching them by hand
   const askedImages = askedMsg.images || [];
+  let finished = false;
   let reply = "", meta = null, sawDone = false, sources = null, genImage = null, visionMeta = null, toolCalls = null,
       agents = null;
 
@@ -4694,6 +4842,7 @@ async function run(chat) {
     if (!sawDone) throw new Error("The stream ended before the response finished. The instance likely restarted. Try again.");
     for (const a of agents || []) keepLastPicture(a.tools);
     chat.messages.push({ role: "assistant", content: reply, meta, sources, image: genImage, tools: keepLastPicture(toolCalls), agents });
+    finished = true;
   } catch (e) {
     const err = (ctl.signal.aborted && ctl.signal.reason) || e;
     const kept = err && err.userStop ? stoppedTurn({ reply, toolCalls, agents, sources, genImage }) : null;
@@ -4702,6 +4851,11 @@ async function run(chat) {
         for (const a of kept.agents || []) keepLastPicture(a.tools);
         kept.tools = keepLastPicture(kept.tools);
         chat.messages.push(kept);
+      } else if (chat.sendNow) {
+        // "Send now" before a word came back: the question goes out again,
+        // ahead of what was queued behind it, instead of back to the composer
+        stripTail();
+        chat.queue.unshift(queuedItem(asked, askedImages, askedMsg.videos));
       } else {
         // nothing generated yet: hand the question back to the composer
         stripTail();
@@ -4738,6 +4892,12 @@ async function run(chat) {
   // what the answer spent: a fresh reading when it called tools, which is
   // when a session pays for anything
   sessRefresh(chat, !!(toolCalls && toolCalls.length));
+  // what was queued while it worked goes now: after an answer that finished,
+  // or after the stop "Send now" asked for. A plain stop or an error leaves
+  // it waiting ("Not sent yet") for the person to send or edit.
+  const now = chat.sendNow;
+  chat.sendNow = false;
+  if ((finished || now) && state.chats.includes(chat)) flushQueue(chat);
 }
 
 // ---- the sidebar entry's name. The first message truncated at 64 characters
@@ -6823,6 +6983,7 @@ async function warmLadder() {
       state.chats.push({
         id: s.id, title: s.title || "", messages: s.messages || [],
         streaming: null, error: s.error || null, session: s.session || null,
+        queue: s.queue || [],
       });
     }
   } else {
