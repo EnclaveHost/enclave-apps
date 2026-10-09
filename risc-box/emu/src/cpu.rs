@@ -66,6 +66,10 @@ const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
 // cost more than the instructions did. 64 keeps timer granularity far finer
 // than the guest's 100 Hz tick while removing 63/64 of the overhead.
 const DEVICE_TICK_INTERVAL: u64 = 32;
+// risc-box patch: a page whose code generation reached this (rewritten 3+ times while holding code) is treated as
+// a guest JIT's code pool by region formation (see jit_form_pass)
+#[cfg(feature = "codegen")]
+const JIT_REWRITTEN_PAGE_GEN: u32 = 4;
 
 const MIP_MEIP: u64 = 0x800;
 pub const MIP_MTIP: u64 = 0x080;
@@ -128,11 +132,13 @@ struct BlockHead {
 	tag: u64, // start pc (0 = never valid: DRAM starts at 0x80000000)
 	phys_page: u64, // physical page the ops were decoded from
 	count: u32,
-	code_gen: u32 // mmu.code_gen() at build time
+	code_gen: u32, // mmu.code_gen() when last known valid (the cheap check)
+	page_gen: u32, // mmu.page_gen(phys_page) at build time: still equal = the page was not written since
+	glob_gen: u32 // mmu.glob_gen() at build time
 }
 
 impl BlockHead {
-	const EMPTY: BlockHead = BlockHead { tag: 0, phys_page: 0, count: 0, code_gen: 0 };
+	const EMPTY: BlockHead = BlockHead { tag: 0, phys_page: 0, count: 0, code_gen: 0, page_gen: 0, glob_gen: 0 };
 }
 
 const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1); 32k x (24B + 32x16B) = 17 MiB
@@ -404,6 +410,9 @@ pub struct Cpu {
 	// is what device clocks advance by), and whether an interrupt check is
 	// owed before the next instruction (see run).
 	since_service: u64,
+	// risc-box patch: instructions between device services (DEVICE_TICK_INTERVAL unless the app sets it). Device
+	// clocks advance by the true retired count either way; this only bounds how often they are serviced.
+	tick_interval: u64,
 	check_interrupt: bool
 }
 
@@ -596,6 +605,10 @@ pub struct AotVerify {
 	tlb_gen: u32,
 	/// pages visited by the content check; a proof only when `ok` is true
 	phys: Vec<u64>,
+	/// risc-box patch: each visited page's code generation at that check, and the whole-memory generation:
+	/// while they all still match, the content proof stands through epoch bumps from stores to other pages
+	pgens: Vec<u32>,
+	glob: u32,
 	ok: bool,
 }
 
@@ -605,6 +618,8 @@ impl AotVerify {
 		content_gen: 0,
 		tlb_gen: 0,
 		phys: Vec::new(),
+		pgens: Vec::new(),
+		glob: 0,
 		ok: false,
 	};
 }
@@ -713,6 +728,9 @@ pub struct JitParams {
 	/// the wall time since the JIT was enabled (percent, plus a 250 ms
 	/// allowance); 100 = no cap. Compiles stall the machine's own thread.
 	pub compile_pct: u32,
+	/// risc-box patch: when a region returns at a pc that starts another proven region, call that one directly
+	/// (within the same fuel) instead of going back through the block cache probe
+	pub chain: bool,
 }
 
 #[cfg(feature = "codegen")]
@@ -736,6 +754,7 @@ impl Default for JitParams {
 			max_pages: 1 << 18, // --max-memory=17179869184
 			trace: false,
 			compile_pct: 100,
+			chain: true,
 		}
 	}
 }
@@ -747,6 +766,10 @@ pub struct JitStats {
 	pub calls: u64,
 	pub retired: u64,
 	pub empty_calls: u64,
+	/// region calls made straight from a previous region's exit (no dispatcher round trip in between)
+	pub chained: u64,
+	/// formation members left out because their page keeps being rewritten (guest JIT code)
+	pub skipped_rewritten: u64,
 	/// interpreted block retirement seen while the JIT was on
 	pub interpreted: u64,
 	pub content_checks: u64,
@@ -791,6 +814,13 @@ struct JitRegion {
 	pages: Vec<(u64, u64)>,
 	/// write-snoop generation of the last successful content proof (0: none)
 	proof_gen: u32,
+	/// per-page code generation of each `pages` entry at that proof, and the whole-memory generation: while
+	/// they all still match, the content proof stands through epoch bumps caused by stores to OTHER pages
+	page_gens: Vec<u32>,
+	proof_glob: u32,
+	/// a second proven (pages, page_gens, glob): the same code proven in another address space, so switching
+	/// between two processes re-probes mappings instead of re-reading every member word each time
+	alt: Option<(Vec<(u64, u64)>, Vec<u32>, u32)>,
 	/// (generation, TLB meta) of the last check, and its verdict — a failed
 	/// check is cached too, so a region that cannot run here costs one
 	/// compare per dispatch, not a proof
@@ -841,6 +871,9 @@ impl JitState {
 			self.instances.remove(&(r.index, r.bias));
 			r.members = Vec::new();
 			r.pages = Vec::new();
+			r.page_gens = Vec::new();
+			r.proof_glob = 0;
+			r.alt = None;
 			r.ok = false;
 			r.proof_gen = 0;
 			r.checked = (0, 0);
@@ -856,7 +889,8 @@ impl JitState {
 			return rid;
 		}
 		let r = JitRegion {
-			index, bias, members, pages: Vec::new(), proof_gen: 0, checked: (0, 0), ok: false, refs: 0,
+			index, bias, members, pages: Vec::new(), proof_gen: 0, page_gens: Vec::new(), proof_glob: 0, alt: None,
+			checked: (0, 0), ok: false, refs: 0,
 		};
 		let rid = match self.free.pop() {
 			Some(rid) => {
@@ -945,6 +979,7 @@ impl Cpu {
 			// a machine that traps immediately still sees its clint before
 			// running far.
 			since_service: DEVICE_TICK_INTERVAL - 1,
+			tick_interval: DEVICE_TICK_INTERVAL,
 			check_interrupt: true
 		};
 		cpu.x[0xb] = 0x1020; // I don't know why but Linux boot seems to require this initialization
@@ -1057,6 +1092,33 @@ impl Cpu {
 	///   the same clint/plic boundaries as before.
 	/// - CSR_CYCLE is materialized lazily in read_csr_raw() (same pattern as
 	///   CSR_TIME) instead of being written every tick.
+	/// risc-box patch: instructions between device services (default DEVICE_TICK_INTERVAL = 32). Larger values
+	/// cut the per-instruction share of servicing the clint/plic/virtio devices; device clocks still advance by
+	/// the true retired count, so only interrupt-delivery latency changes (by at most the interval).
+	pub fn set_device_tick_interval(&mut self, n: u64) {
+		self.tick_interval = n.clamp(8, 4096);
+	}
+
+	/// risc-box patch (per-page code generations): the code epoch moved since block `slot` was last known valid;
+	/// it still is if its own page was not written (and memory was not wholesale invalidated) since it was built.
+	/// Valid: re-stamp it with the current epoch so the cheap check passes again.
+	#[inline(always)]
+	fn head_revalidate(&mut self, slot: usize) -> bool {
+		let h = self.block_heads[slot];
+		if h.tag != 0 && h.glob_gen == self.mmu.glob_gen() && h.page_gen == self.mmu.page_gen(h.phys_page) {
+			self.block_heads[slot].code_gen = self.mmu.code_gen();
+			return true;
+		}
+		false
+	}
+
+	/// The same test without re-stamping, for read-only callers.
+	#[inline(always)]
+	fn head_valid(&self, h: &BlockHead) -> bool {
+		h.code_gen == self.mmu.code_gen()
+			|| (h.tag != 0 && h.glob_gen == self.mmu.glob_gen() && h.page_gen == self.mmu.page_gen(h.phys_page))
+	}
+
 	pub fn run(&mut self, n: u64) {
 		#[cfg(feature = "codegen")]
 		self.jit_prepare();
@@ -1069,7 +1131,7 @@ impl Cpu {
 		while remaining > 0 {
 			// since_service < DEVICE_TICK_INTERVAL here (the service block
 			// below resets it), so every burst makes progress.
-			let until_service = DEVICE_TICK_INTERVAL - self.since_service;
+			let until_service = self.tick_interval.saturating_sub(self.since_service).max(1);
 			let burst = match remaining < until_service {
 				true => remaining,
 				false => until_service
@@ -1092,7 +1154,7 @@ impl Cpu {
 					let slot = ((self.pc >> 1) as usize) & (BLOCK_SLOTS - 1);
 					let h = self.block_heads[slot];
 					let hit = h.tag == self.pc
-						&& h.code_gen == self.mmu.code_gen()
+						&& (h.code_gen == self.mmu.code_gen() || self.head_revalidate(slot))
 						&& match self.mmu.translate_fetch_probe(self.pc) {
 							Ok(p) => (p & !0xfff) == h.phys_page,
 							Err(_) => false
@@ -1111,6 +1173,12 @@ impl Cpu {
 						};
 						#[cfg(feature = "aot")]
 						let compiled: Option<(u32, u32)> = {
+							let sl = self.aot_slots[slot];
+							// risc-box patch: an epoch bump from a store to some OTHER page keeps the slot (its
+							// proof's pages are checked by generation, cheaply); re-stamp it when it still holds
+							if sl.tag == h.tag && sl.gen != self.mmu.code_gen() && self.aot_verified(sl.handle) {
+								self.aot_slots[slot].gen = self.mmu.code_gen();
+							}
 							let sl = self.aot_slots[slot];
 							match sl.tag == h.tag && sl.gen == self.mmu.code_gen() {
 								true => Some((sl.handle, sl.entry)),
@@ -1307,7 +1375,7 @@ impl Cpu {
 			// overshoot the boundary by up to BLOCK_MAX-1 instructions; the
 			// device clocks advance by the true retired count either way,
 			// so guest time stays tied to instructions retired.
-			if self.since_service >= DEVICE_TICK_INTERVAL {
+			if self.since_service >= self.tick_interval {
 				let served = self.since_service;
 				self.since_service = 0;
 				self.mmu.tick(served, &mut self.csr[CSR_MIP_ADDRESS as usize]);
@@ -1342,7 +1410,9 @@ impl Cpu {
 			tag: tag,
 			phys_page: phys_page,
 			count: ops.len() as u32,
-			code_gen: self.mmu.code_gen()
+			code_gen: self.mmu.code_gen(),
+			page_gen: self.mmu.page_gen(phys_page),
+			glob_gen: self.mmu.glob_gen()
 		};
 	}
 
@@ -1460,6 +1530,14 @@ impl Cpu {
 		// must never become valid merely because those pages did not move.
 		// A changed mapping needs a fresh instruction check too: it may now
 		// point to either matching code or a different program.
+		// risc-box patch (per-page generations): the epoch moving does not void a SUCCESSFUL proof whose pages were
+		// none of them written since (and memory was not wholesale invalidated).
+		if v.ok && v.content_gen != 0 && v.content_gen != cg && v.glob == self.mmu.glob_gen()
+			&& v.pgens.len() == v.phys.len()
+			&& v.phys.iter().zip(v.pgens.iter()).all(|(&pp, &g)| self.mmu.page_gen(pp) == g) {
+			self.aot_vstate[handle as usize].content_gen = cg;
+		}
+		let v = &self.aot_vstate[handle as usize];
 		if v.content_gen == cg && v.ok && self.aot_verify_mapping(handle) {
 			self.aot_vstate[handle as usize].tlb_gen = tg;
 			return true;
@@ -1509,7 +1587,11 @@ impl Cpu {
 		}
 		let tg = self.mmu.tlb_gen();
 		self.aot_vstate[handle as usize] =
-			AotVerify { content_gen: cg, tlb_gen: tg, phys, ok };
+			{
+				let pgens: Vec<u32> = phys.iter().map(|&pp| self.mmu.page_gen(pp)).collect();
+				let glob = self.mmu.glob_gen();
+				AotVerify { content_gen: cg, tlb_gen: tg, phys, pgens, glob, ok }
+			};
 		ok
 	}
 
@@ -1680,6 +1762,33 @@ impl Cpu {
 	#[cfg(feature = "codegen")]
 	#[inline(always)]
 	fn jit_run(&mut self, slot: usize, tag: u64) -> u64 {
+		// risc-box patch (chaining): a region exits to the dispatcher at any pc outside it; when that pc starts
+		// another region proven for the current (generation, translation), run it straight away, inside the
+		// same fuel, instead of paying the block-cache probe and run-loop bookkeeping between them. Stops on a
+		// pending interrupt check, an empty call, or spent fuel, exactly where a lone call would have returned.
+		let (fuel, chain) = match self.jit.as_deref() {
+			Some(j) if j.live => (j.params.fuel, j.params.chain),
+			_ => return 0,
+		};
+		let (mut slot, mut tag) = (slot, tag);
+		let mut total = 0u64;
+		loop {
+			let ran = self.jit_run_one(slot, tag, fuel - total);
+			total += ran;
+			if ran == 0 || !chain || self.check_interrupt || total + 16 > fuel {
+				return total;
+			}
+			tag = self.pc;
+			slot = ((tag >> 1) as usize) & (BLOCK_SLOTS - 1);
+			if let Some(j) = self.jit.as_deref_mut() {
+				j.stats.chained += 1;
+			}
+		}
+	}
+
+	#[cfg(feature = "codegen")]
+	#[inline(always)]
+	fn jit_run_one(&mut self, slot: usize, tag: u64, fuel: u64) -> u64 {
 		let (rid, entry, fresh, ok) = match self.jit.as_deref() {
 			Some(j) if j.live => {
 				if (j.present[slot >> 6] >> (slot & 63)) & 1 == 0 {
@@ -1702,10 +1811,10 @@ impl Cpu {
 		if !ok {
 			return 0;
 		}
-		let (index, bias, fuel) = {
+		let (index, bias) = {
 			let j = self.jit.as_deref().unwrap();
 			let r = &j.regions[rid as usize];
-			(r.index, r.bias, j.params.fuel)
+			(r.index, r.bias)
 		};
 		// The generated code reaches this Cpu through the context block: its
 		// address is taken here, next to the call that uses it.
@@ -1724,6 +1833,13 @@ impl Cpu {
 
 	/// Prove region `rid` for the current generation and translation (the
 	/// AOT verifier's two levels; see JitState). False: do not run it now.
+	///
+	/// risc-box patch (per-page generations, two address spaces): a content proof stands while every page it
+	/// read keeps its page generation, so stores elsewhere (a guest JIT writing its code) cost a few compares,
+	/// not a re-read; a second proof kept per region means a process switch between two address spaces with
+	/// the same code re-probes mappings only; and a failed proof here leaves the other proofs alone. A pc turns
+	/// volatile only when code changed on a physical page this region was proven on, never because another
+	/// process maps different code at the same virtual address.
 	#[cfg(feature = "codegen")]
 	fn jit_verify(&mut self, rid: u32) -> bool {
 		let mut j = match self.jit.take() {
@@ -1731,36 +1847,49 @@ impl Cpu {
 			None => return false,
 		};
 		let cg = self.mmu.code_gen();
+		let gg = self.mmu.glob_gen();
 		let ok = {
 			let r = &mut j.regions[rid as usize];
 			let mut ok = false;
-			if r.proof_gen == cg && !r.pages.is_empty() {
-				// content proven this generation: re-probe the mapping only,
-				// once per page the members start on
+			// level 1: the primary proof's pages unwritten and still mapped here
+			if r.proof_gen != 0 && !r.pages.is_empty()
+				&& (r.proof_gen == cg || self.jit_pages_unwritten(&r.pages, &r.page_gens, r.proof_glob, gg)) {
+				r.proof_gen = cg;
 				j.stats.map_checks += 1;
-				ok = true;
-				for &(vpage, page) in r.pages.iter() {
-					match self.mmu.translate_fetch_probe(vpage) {
-						Ok(p) if (p & !0xfff) == page => {}
-						_ => {
-							ok = false;
-							break;
-						}
+				ok = self.jit_pages_mapped(&r.pages);
+			}
+			// level 1b: the other address space's proof
+			if !ok {
+				let alt_ok = match &r.alt {
+					Some((pages, gens, glob)) => {
+						self.jit_pages_unwritten(pages, gens, *glob, gg) && self.jit_pages_mapped(pages)
 					}
+					None => false,
+				};
+				if alt_ok {
+					let (pages, gens, glob) = r.alt.take().unwrap();
+					if r.proof_gen != 0 && !r.pages.is_empty() {
+						r.alt = Some((std::mem::take(&mut r.pages), std::mem::take(&mut r.page_gens), r.proof_glob));
+					}
+					r.pages = pages;
+					r.page_gens = gens;
+					r.proof_glob = glob;
+					r.proof_gen = cg;
+					j.stats.map_checks += 1;
+					ok = true;
 				}
 			}
 			if !ok {
-				// Full proof: every member translates, its page is marked
-				// executable (so a later store bumps the generation), and the
-				// code there is the (word, len) stream the module was built
-				// from — the same uncompress build_block applies.
+				// level 2, full proof against the CURRENT mapping: every member translates, its page is marked
+				// executable (so a later store moves that page's generation), and the code there is the
+				// (word, len) stream the module was built from — the same uncompress build_block applies.
 				j.stats.content_checks += 1;
 				ok = true;
-				r.pages.clear();
-				let mut changed: Option<u64> = None;
+				let mut np: Vec<(u64, u64)> = Vec::new();
+				let mut changed: Option<(u64, u64)> = None; // (member start, physical page) that differed
 				'members: for (start, words) in r.members.iter() {
 					let vpage = start & !0xfff;
-					let p = match r.pages.iter().find(|pg| pg.0 == vpage) {
+					let p = match np.iter().find(|pg| pg.0 == vpage) {
 						Some(&(_, page)) => page | (start & 0xfff),
 						None => {
 							let p = match self.mmu.translate_fetch_probe(vpage) {
@@ -1774,7 +1903,7 @@ impl Cpu {
 								ok = false;
 								break;
 							}
-							r.pages.push((vpage, p & !0xfff));
+							np.push((vpage, p & !0xfff));
 							(p & !0xfff) | (start & 0xfff)
 						}
 					};
@@ -1787,28 +1916,45 @@ impl Cpu {
 						};
 						if w != word || l != len {
 							ok = false;
-							changed = Some(*start);
+							changed = Some((*start, p & !0xfff));
 							break 'members;
 						}
 						off += len as u64;
 					}
 				}
-				// A page-table walk above may have stored an A bit into a
-				// marked page, bumping the generation (and clearing every
-				// mark): then the proof's marks are gone and it must not stand.
+				// A page-table walk above may have stored an A bit into a marked page (moving the epoch and, if it
+				// hit one of OUR pages, that page's generation): such a proof must not stand.
 				if self.mmu.code_gen() != cg {
 					ok = false;
 				}
-				r.proof_gen = if ok { cg } else { 0 };
-				if !ok {
-					r.pages.clear();
-				}
-				if let Some(pc) = changed {
-					if j.volatile.len() >= 1 << 16 {
-						j.volatile.clear();
+				if ok {
+					let ng: Vec<u32> = np.iter().map(|&(_, pp)| self.mmu.page_gen(pp)).collect();
+					if r.proof_gen != 0 && !r.pages.is_empty() && r.pages != np {
+						r.alt = Some((std::mem::take(&mut r.pages), std::mem::take(&mut r.page_gens), r.proof_glob));
 					}
-					if j.volatile.insert(pc) {
-						j.stats.volatile += 1;
+					r.pages = np;
+					r.page_gens = ng;
+					r.proof_glob = gg;
+					r.proof_gen = self.mmu.code_gen();
+				} else if let Some((pc, ppage)) = changed {
+					// Different code on a page we were proven on = the code really changed: those proofs are dead
+					// and the pc is volatile. Different code on some other physical page = another address space
+					// that does not hold this code: leave the proofs and the pc alone.
+					let ours = r.pages.iter().any(|&(_, pp)| pp == ppage)
+						|| r.alt.as_ref().map_or(false, |(pages, _, _)| pages.iter().any(|&(_, pp)| pp == ppage));
+					if ours {
+						r.pages.clear();
+						r.page_gens.clear();
+						r.proof_gen = 0;
+						if r.alt.as_ref().map_or(false, |(pages, _, _)| pages.iter().any(|&(_, pp)| pp == ppage)) {
+							r.alt = None;
+						}
+						if j.volatile.len() >= 1 << 16 {
+							j.volatile.clear();
+						}
+						if j.volatile.insert(pc) {
+							j.stats.volatile += 1;
+						}
 					}
 				}
 			}
@@ -1823,12 +1969,33 @@ impl Cpu {
 		ok
 	}
 
+	/// Every page of a proof still carries the generation it was proven at (and memory was not wholesale
+	/// invalidated since): no store reached any of them.
+	#[cfg(feature = "codegen")]
+	#[inline(always)]
+	fn jit_pages_unwritten(&self, pages: &[(u64, u64)], gens: &[u32], glob: u32, gg: u32) -> bool {
+		glob == gg && pages.len() == gens.len()
+			&& pages.iter().zip(gens.iter()).all(|(&(_, pp), &g)| self.mmu.page_gen(pp) == g)
+	}
+
+	/// Every (virtual, physical) page of a proof still translates the same way here.
+	#[cfg(feature = "codegen")]
+	fn jit_pages_mapped(&mut self, pages: &[(u64, u64)]) -> bool {
+		for &(vpage, page) in pages.iter() {
+			match self.mmu.translate_fetch_probe(vpage) {
+				Ok(p) if (p & !0xfff) == page => {}
+				_ => return false,
+			}
+		}
+		true
+	}
+
 	/// A cached block's ops, if the cache holds `pc` for this generation.
 	#[cfg(feature = "codegen")]
 	fn jit_block_ops(&self, pc: u64, cg: u32) -> Option<Vec<BlockOp>> {
 		let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
 		let h = self.block_heads[slot];
-		if h.tag != pc || h.count == 0 || h.code_gen != cg {
+		if h.tag != pc || h.count == 0 || (h.code_gen != cg && !self.head_valid(&h)) {
 			return None;
 		}
 		let base = slot * BLOCK_MAX;
@@ -1900,6 +2067,13 @@ impl Cpu {
 				match self.mmu.translate_fetch_probe(pc) {
 					Ok(p) if (p & !0xfff) == page => {}
 					_ => continue,
+				}
+				// Code on a page that keeps being rewritten while it holds code (a guest JIT's code pool) would
+				// spend the process-lifetime module budget on code that is gone again soon: leave it to the
+				// interpreter. A recycled page is rewritten once or twice; a JIT pool far more.
+				if self.mmu.page_gen(page) >= JIT_REWRITTEN_PAGE_GEN {
+					j.stats.skipped_rewritten += 1;
+					continue;
 				}
 				if let Some(ops) = self.jit_block_ops(pc, cg) {
 					blocks.push((pc, h, ops));
@@ -2061,7 +2235,7 @@ impl Cpu {
 			let gen = self.mmu.code_gen();
 			for slot in 0..BLOCK_SLOTS {
 				let h = self.block_heads[slot];
-				if h.tag == 0 || h.code_gen != gen {
+				if h.tag == 0 || (h.code_gen != gen && !self.head_valid(&h)) {
 					continue;
 				}
 				if self.aot_slots[slot].tag == h.tag && self.aot_slots[slot].gen == gen {
@@ -2111,7 +2285,8 @@ impl Cpu {
 			}
 			// hot stores (kind 1..=4) can overwrite this very block; the
 			// write snoop bumps the code generation, which this meta embeds
-			if op.kind <= HOT_STORE_MAX && self.mmu.code_gen() != head.code_gen {
+			if op.kind <= HOT_STORE_MAX && self.mmu.code_gen() != head.code_gen
+				&& !(self.mmu.glob_gen() == head.glob_gen && self.mmu.page_gen(head.phys_page) == head.page_gen) {
 				return retired;
 			}
 		}
@@ -2373,7 +2548,9 @@ impl Cpu {
 			tag: start,
 			phys_page: p_start & !0xfff,
 			count: count as u32,
-			code_gen: self.mmu.code_gen()
+			code_gen: self.mmu.code_gen(),
+			page_gen: self.mmu.page_gen(p_start & !0xfff),
+			glob_gen: self.mmu.glob_gen()
 		};
 		true
 	}
@@ -6686,6 +6863,48 @@ mod test_cpu {
 			};
 			assert_eq!((mem, cpu.x[5]), (stored, rd), "{}", name);
 		}
+	}
+
+	/// risc-box patch (per-page code generations): a store into one code page retires only the blocks decoded
+	/// from THAT page. Pages A and B hold code that jumps between them (both decoded, both marked); a store into
+	/// B moves the epoch and B's generation, A's cached block stays valid; a store into A then retires A's too.
+	#[test]
+	fn a_store_into_one_code_page_keeps_the_other_pages_blocks() {
+		let mut cpu = create_cpu();
+		cpu.get_mut_mmu().init_memory(65536);
+		let (a, b) = (DRAM_BASE, DRAM_BASE + 0x1000);
+		for (at, w) in [(a, 0x0012_8293u32), (a + 4, 0x0012_8293), (a + 8, 0x7f90_006f), // addi t0,t0,1 x2; j B
+		                (b, 0x0013_0313), (b + 4, 0x0013_0313), (b + 8, 0xff9f_e06f), // addi t1,t1,1 x2; j A
+		                (b + 0x800, 0)] {
+			cpu.get_mut_mmu().store_word(at, w).ok().unwrap();
+		}
+		cpu.pc = a;
+		cpu.run(3000);
+		assert!(cpu.x[5] > 100 && cpu.x[6] > 100, "the loop ran ({} {})", cpu.x[5], cpu.x[6]);
+		let slot_of = |pc: u64| ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+		let (ha, hb) = (cpu.block_heads[slot_of(a)], cpu.block_heads[slot_of(b)]);
+		assert_eq!((ha.tag, hb.tag), (a, b), "both blocks cached");
+		assert!(cpu.head_valid(&ha) && cpu.head_valid(&hb));
+		// data store into code page B (not into its instructions): the epoch and B's generation move
+		let epoch = cpu.mmu.code_gen();
+		cpu.get_mut_mmu().store_word(b + 0x800, 7).ok().unwrap();
+		assert_ne!(cpu.mmu.code_gen(), epoch, "a store into a marked page moves the epoch");
+		assert!(cpu.head_valid(&cpu.block_heads[slot_of(a)]), "page A's block survives a store into page B");
+		assert!(!cpu.head_valid(&cpu.block_heads[slot_of(b)]), "page B's block is retired");
+		// the dispatcher re-stamps A instead of rebuilding it, and the program still runs correctly
+		let (x5, x6) = (cpu.x[5], cpu.x[6]);
+		cpu.run(3000);
+		assert!(cpu.x[5] > x5 && cpu.x[6] > x6, "still loops after the store");
+		assert_eq!(cpu.block_heads[slot_of(a)].page_gen, ha.page_gen, "A was kept, not rebuilt");
+		// a store into page A retires A's block (code that really changed is never run stale)
+		cpu.get_mut_mmu().store_word(a + 0x900, 1).ok().unwrap();
+		assert!(!cpu.head_valid(&cpu.block_heads[slot_of(a)]), "page A's block is retired by a store into page A");
+		// and a changed instruction is executed as changed: turn A's first addi into addi t0,t0,100
+		cpu.get_mut_mmu().store_word(a, 0x0642_8293).ok().unwrap();
+		let x5 = cpu.x[5];
+		cpu.pc = a;
+		cpu.run(40);
+		assert!(cpu.x[5] - x5 >= 100, "the rewritten instruction ran ({} -> {})", x5, cpu.x[5]);
 	}
 
 	#[test]

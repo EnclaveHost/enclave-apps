@@ -475,6 +475,18 @@ impl Mmu {
 		self.memory.code_gen()
 	}
 
+	// risc-box patch: per-page code generation of the page holding p_address (see MemoryWrapper::page_gen)
+	#[inline(always)]
+	pub fn page_gen(&self, p_address: u64) -> u32 {
+		self.memory.page_gen(p_address)
+	}
+
+	// risc-box patch: the whole-memory invalidation generation (see MemoryWrapper::glob_gen)
+	#[inline(always)]
+	pub fn glob_gen(&self) -> u32 {
+		self.memory.glob_gen()
+	}
+
 	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
 	/// risc-box patch (codegen JIT): the current translation meta — every
 	/// input a TLB hit depends on (generation, privilege, MPRV/MPP).
@@ -1412,6 +1424,15 @@ pub struct MemoryWrapper {
 	// cached entry's meta embeds, killing them all at once.
 	exec_page_marks: Vec<u8>,
 	code_gen: u32,
+	// risc-box patch (per-page code generations, 2026-10-09): a store into a marked page bumps THAT page's
+	// generation and the epoch (`code_gen`) only. Caches keep `code_gen` as the cheap "nothing changed" test and,
+	// when the epoch moved, revalidate against their own pages' generations instead of dropping everything. A
+	// guest JIT (SpiderMonkey) patches code all the time; the old whole-memory bump threw away every decoded
+	// block and compiled region, and cleared ~458k page marks, on each of those stores.
+	page_gens: Vec<u32>,
+	// bumped by whole-memory invalidations (snapshot restore, TLB-generation wrap, fork): no page generation
+	// recorded before one of those may ever validate after it
+	glob_gen: u32,
 	fb_writes: u64,
 	fb_bytes: u64,
 	// risc-box patch (host-side game overlay): byte-offset extent of stores
@@ -1432,6 +1453,8 @@ impl MemoryWrapper {
 			memory: Memory::new(),
 			exec_page_marks: vec![],
 			code_gen: 1,
+			page_gens: vec![],
+			glob_gen: 1,
 			fb_writes: 0,
 			fb_bytes: 0,
 			fb_off_min: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -1443,6 +1466,7 @@ impl MemoryWrapper {
 	fn init(&mut self, capacity: u64) {
 		self.memory.init(capacity);
 		self.exec_page_marks = vec![0; ((capacity + 0xfff) >> 12) as usize]; // risc-box patch
+		self.page_gens = vec![1; ((capacity + 0xfff) >> 12) as usize]; // risc-box patch
 	}
 
 	// risc-box patch (debug aid): count stores landing in the framebuffer's
@@ -1506,16 +1530,53 @@ impl MemoryWrapper {
 		}
 		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;
-		let hit = match self.exec_page_marks.get(first) {
+		let hit_first = match self.exec_page_marks.get(first) {
 			Some(&m) => m != 0,
 			None => false
-		} || (last != first && match self.exec_page_marks.get(last) {
+		};
+		let hit_last = last != first && match self.exec_page_marks.get(last) {
 			Some(&m) => m != 0,
 			None => false
-		});
-		if hit {
-			self.bump_code_gen();
+		};
+		if hit_first || hit_last {
+			if hit_first {
+				self.code_write_page(first);
+			}
+			if hit_last {
+				self.code_write_page(last);
+			}
+			self.code_gen = self.code_gen.wrapping_add(1);
 		}
+	}
+
+	// risc-box patch: a store reached marked page `page`: retire what was decoded from it (its generation moves)
+	// and unmark it; re-decoding re-marks it.
+	#[inline(always)]
+	fn code_write_page(&mut self, page: usize) {
+		if let Some(g) = self.page_gens.get_mut(page) {
+			*g = g.wrapping_add(1);
+		}
+		if let Some(m) = self.exec_page_marks.get_mut(page) {
+			*m = 0;
+		}
+	}
+
+	// risc-box patch: the code generation of the page holding p_address (0 when it is not DRAM)
+	#[inline(always)]
+	pub fn page_gen(&self, p_address: u64) -> u32 {
+		if p_address < DRAM_BASE {
+			return 0;
+		}
+		match self.page_gens.get(((p_address - DRAM_BASE) >> 12) as usize) {
+			Some(&g) => g,
+			None => 0
+		}
+	}
+
+	// risc-box patch
+	#[inline(always)]
+	pub fn glob_gen(&self) -> u32 {
+		self.glob_gen
 	}
 
 	// risc-box patch: remember that the page holding p_address backs cached
@@ -1544,6 +1605,7 @@ impl MemoryWrapper {
 	// re-mark what is still live.
 	pub fn bump_code_gen(&mut self) {
 		self.code_gen = self.code_gen.wrapping_add(1);
+		self.glob_gen = self.glob_gen.wrapping_add(1);
 		for m in self.exec_page_marks.iter_mut() {
 			*m = 0;
 		}

@@ -1422,6 +1422,11 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
     }
     #[cfg(feature = "codegen")]
     jit_enable(emu);
+    // RISC_TICK: instructions between device services (the emulator's default is 32)
+    if let Some(v) = std::env::var("RISC_TICK").ok().and_then(|v| v.parse::<u64>().ok()) {
+        emu.get_mut_cpu().set_device_tick_interval(v);
+        eprintln!("[risc-box] device service every {v} instructions (RISC_TICK)");
+    }
     if cfg.net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
     }
@@ -1463,6 +1468,7 @@ fn jit_enable(emu: &mut Emulator) {
         p.max_blocks = (v as usize).clamp(1, 512);
     }
     p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
+    p.chain = !std::env::var("RISC_JIT_CHAIN").map_or(false, |v| v == "0");
     let fuel = p.fuel;
     match emu.jit_enable(p) {
         true => eprintln!("[risc-box] jit on: hot regions compile through enclave:codegen (fuel {fuel})"),
@@ -1479,13 +1485,13 @@ fn jit_json(emu: Option<&Emulator>) -> String {
     };
     let v = riscv_emu_rust::jit::verb::stats();
     format!(
-        ",\"jit\":{{\"calls\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
+        ",\"jit\":{{\"calls\":{},\"chained\":{},\"skippedRewritten\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
          \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
          \"volatile\":{},\"formMs\":{:.1},\
          \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
          \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{},\
          \"codeGen\":{}}}",
-        s.calls, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
+        s.calls, s.chained, s.skipped_rewritten, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
         s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
         s.volatile, s.form_us as f64 / 1000.0,
         v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
