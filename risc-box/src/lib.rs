@@ -2787,6 +2787,11 @@ fn exec_pump(m: &mut Machine, server: &mut Server, cap: &mut Vec<u8>, last_flush
     }
     if last_flush.elapsed() >= Duration::from_millis(50) {
         server.flush();
+        // An /exec holds the main loop for up to EXEC_MAX_TIMEOUT_S: keep accepting meanwhile (answered after it
+        // returns) and give the runtime a slice to run its accept and stream workers, or a NucBox reads the app as
+        // dead and retires it after three missed checks.
+        server.keep_accepting();
+        std::thread::sleep(Duration::from_millis(1));
         *last_flush = Instant::now();
     }
 }

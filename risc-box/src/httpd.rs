@@ -252,9 +252,9 @@ impl Server {
     /// One pass: accept, read, parse. Returns complete requests as
     /// (conn_key, Request); answer each with respond()/upgrade_sse() before
     /// the next poll (a key is only stable until then).
-    pub fn poll(&mut self, max_body: usize) -> Vec<(usize, Request)> {
+    /// Take every pending connection off the listener (the accept half of poll()).
+    fn accept_pending(&mut self) {
         let app = self.app;
-        // Accept.
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -302,6 +302,29 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// For a handler that holds the main loop for seconds (a long /exec): keep taking new connections off the
+    /// listener, so the backlog never fills and the platform's readiness probe (which only dials the app) keeps
+    /// seeing an app that accepts, and keep quiet keep-alive and not-yet-read connections from being reaped as
+    /// idle meanwhile. Nothing is read or answered here: the main loop does that when the handler returns,
+    /// exactly as it did before, so no request key handed out by poll() can shift under its handler.
+    /// (2026-10-09: a 2-minute /exec left the RISC Box accepting nothing, and the NucBox retired it.)
+    pub fn keep_accepting(&mut self) {
+        self.accept_pending();
+        let now = Instant::now();
+        for c in &mut self.conns {
+            if let ConnState::Http { reading_body: false, .. } = c.state {
+                if c.rbuf.is_empty() && c.held.is_none() {
+                    c.last_activity = now;
+                }
+            }
+        }
+    }
+
+    pub fn poll(&mut self, max_body: usize) -> Vec<(usize, Request)> {
+        let app = self.app;
+        self.accept_pending();
 
         // Read and parse.
         let mut out = Vec::new();
