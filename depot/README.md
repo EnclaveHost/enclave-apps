@@ -128,7 +128,10 @@ egress path and exits, which diagnoses a bucket that cannot be reached.
 
 ## Configuration
 
-`ENCLAVE_CONFIG` (JSON). Values written `$NAME` come from deployment secrets.
+`ENCLAVE_CONFIG` (JSON; the platform also delivers it as the file named by
+`ENCLAVE_CONFIG_FILE`, which is read first). Values written `$NAME` are
+deployment secrets: the platform substitutes them before the app starts, and
+a reference left unsubstituted is read from the environment.
 
 | Key | Default | |
 | --- | --- | --- |
@@ -142,9 +145,9 @@ egress path and exits, which diagnoses a bucket that cannot be reached.
 | `public` | `[]` | repository patterns anyone may clone and browse (also settable per repository) |
 | `protected` | `[]` | ref patterns that only fast-forward and cannot be deleted, e.g. `refs/heads/main`, `refs/tags/v*` |
 | `default_branch` | `main` | HEAD of a new repository |
-| `max_push_mb` | 1024 | largest pack one push may send (held in memory while indexed) |
+| `max_push_mb` | 1024, or less on a smaller guest | largest pack one push may send (held in memory while indexed); defaults to what fits under `ENCLAVE_MEM_MB` |
 | `max_object_mb` | 512 | largest single object |
-| `cache_mb` | 256 | decrypted pack chunks kept in memory; resolved objects get a quarter of that |
+| `cache_mb` | 256, or an eighth of a smaller guest | decrypted pack chunks kept in memory; resolved objects get a quarter of that |
 | `hooks` | `[]` | `{url, secret: "$SECRET", repos: [patterns]}` (https; up to 16) |
 | `sso` | none | Sign in with Enclave for the web view: `{signer, audience: <this deployment's id>}`; a user with a matching `account` (`acct_…` or a wallet address) signs in as that user |
 | `title` | `depot` | the web view's title |
@@ -167,8 +170,9 @@ egress path and exits, which diagnoses a bucket that cannot be reached.
   the chunk's position, so chunks cannot be swapped, truncated or moved.
 - **Names.** Object keys carry only random ids. Repository names, refs and
   token metadata are inside sealed objects.
-- **Consistency.** Packs are immutable. The manifest is the only object that
-  is rewritten, always conditionally on the ETag the writer read. Two servers
+- **Consistency.** Packs are immutable. Only the registry, the token book and
+  the manifests are ever rewritten, always conditionally on the ETag the
+  writer read. Two servers
   sharing a bucket cannot lose each other's pushes, and each sees the other's
   within two seconds.
 - **Integrity, not freshness.** Authentication detects any alteration. A
@@ -219,6 +223,7 @@ cargo build --release --target wasm32-wasip2          # target/wasm32-wasip2/rel
 python3 tests/e2e.py                                  # real git + wasmtime + MinIO, 43 checks
 python3 tests/e2e.py --platform                       # through a Node gateway like the platform's, storage via a SOCKS5 egress front
 python3 tests/e2e.py --mirror ~/src/big-repo          # also mirror a real repository and clone it back
+python3 tests/fuzz.py --rounds 800 --seed 2           # malformed requests at every endpoint; the server must survive
 python3 tests/dev.py                                  # a local server with sample repositories, to look at
 ```
 
