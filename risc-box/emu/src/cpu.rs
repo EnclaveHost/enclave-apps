@@ -2958,33 +2958,29 @@ impl Cpu {
 				};
 			},
 			HOT_FLW => {
+				// risc-box patch (fp spec): NaN-boxed, as the table's FLW
 				self.f[rd] = match self.mmu.load_word(self.x[rs1].wrapping_add(imm) as u64) {
-					Ok(data) => f64::from_bits(data as i32 as i64 as u64),
+					Ok(data) => f64::from_bits(FP_BOX | data as u64),
 					Err(e) => return Err(e)
 				};
 			},
+			// risc-box patch (fp spec): the table entries' helpers (canonical
+			// NaN results, NV, FDIV's IEEE zero-divisor rules)
 			HOT_FADD_D => {
-				self.f[rd] = self.f[rs1] + self.f[rs2];
+				let (a, b) = (self.f[rs1], self.f[rs2]);
+				self.f[rd] = self.fp_res_d(a + b, &[a, b]);
 			},
 			HOT_FSUB_D => {
-				self.f[rd] = self.f[rs1] - self.f[rs2];
+				let (a, b) = (self.f[rs1], self.f[rs2]);
+				self.f[rd] = self.fp_res_d(a - b, &[a, b]);
 			},
 			HOT_FMUL_D => {
-				self.f[rd] = self.f[rs1] * self.f[rs2];
+				let (a, b) = (self.f[rs1], self.f[rs2]);
+				self.f[rd] = self.fp_res_d(a * b, &[a, b]);
 			},
 			HOT_FDIV_D => {
-				let dividend = self.f[rs1];
-				let divisor = self.f[rs2];
-				// Is this implementation correct? (verbatim from the table)
-				if divisor == 0.0 {
-					self.f[rd] = std::f64::INFINITY;
-					self.set_fcsr_dz();
-				} else if divisor == -0.0 {
-					self.f[rd] = std::f64::NEG_INFINITY;
-					self.set_fcsr_dz();
-				} else {
-					self.f[rd] = dividend / divisor;
-				}
+				let (a, b) = (self.f[rs1], self.f[rs2]);
+				self.f[rd] = self.fp_div_d(a, b);
 			},
 			HOT_FSGNJ_D => {
 				let rs1_bits = self.f[rs1].to_bits();
@@ -3472,12 +3468,12 @@ impl Cpu {
 		};
 	}
 
-	fn _set_fcsr_nv(&mut self) {
-		self.csr[CSR_FCSR_ADDRESS as usize] |= 0x10;
+	fn set_fcsr_nv(&mut self) {
+		self.csr[CSR_FCSR_ADDRESS as usize] |= FFLAG_NV;
 	}
 
 	fn set_fcsr_dz(&mut self) {
-		self.csr[CSR_FCSR_ADDRESS as usize] |= 0x8;
+		self.csr[CSR_FCSR_ADDRESS as usize] |= FFLAG_DZ;
 	}
 
 	fn _set_fcsr_of(&mut self) {
@@ -3488,8 +3484,8 @@ impl Cpu {
 		self.csr[CSR_FCSR_ADDRESS as usize] |= 0x2;
 	}
 
-	fn _set_fcsr_nx(&mut self) {
-		self.csr[CSR_FCSR_ADDRESS as usize] |= 0x1;
+	fn set_fcsr_nx(&mut self) {
+		self.csr[CSR_FCSR_ADDRESS as usize] |= FFLAG_NX;
 	}
 
 	fn update_addressing_mode(&mut self, value: u64) {
@@ -4475,6 +4471,277 @@ fn get_register_name(num: usize) -> &'static str {
 	}
 }
 
+// ===== risc-box patch: RISC-V floating-point semantics =====
+// Upstream computed every float op with host Rust arithmetic and stored
+// whatever the host produced. RISC-V differs from that in ways the guest's
+// JS engines (SpiderMonkey, V8) depend on:
+// - an arithmetic op whose result is a NaN produces the CANONICAL NaN
+//   (0x7ff8000000000000 / 0x7fc00000). Host and wasm NaNs carry other
+//   signs and payloads (x86 makes 0xfff8...), and NaN-boxing engines read
+//   a stray payload as a tagged value.
+// - a single lives NaN-BOXED in the 64-bit register (upper 32 bits all
+//   ones), and a single input that is not properly boxed reads as the
+//   canonical NaN. Loads and moves (FLW, FMV.W.X) box; stores and moves out
+//   (FSW, FMV.X.W) take the low 32 bits raw.
+// - float->int conversions round per the instruction's rm (Math.floor/
+//   ceil/round compile to fcvt with RDN/RUP/RMM), saturate (NaN -> the
+//   type's maximum), and report NV (NaN or out of range) and NX (inexact):
+//   V8's and SpiderMonkey's RISC-V backends read exactly those flags to
+//   decide whether a double held an int32.
+// Flags kept: NV (signaling-NaN inputs, invalid operations, invalid
+// conversions, comparisons), DZ (finite nonzero / zero), NX for float->int
+// conversions only. OF/UF and arithmetic NX are not tracked; arithmetic and
+// int->float conversions ignore rm and round to nearest-even (no JS engine
+// changes frm). jit.rs reproduces every rule here bit for bit or leaves the
+// op to the interpreter; mod test_jit_equivalence holds the two together.
+pub(crate) const FP_CANON_D: u64 = 0x7ff8_0000_0000_0000;
+pub(crate) const FP_CANON_S: u32 = 0x7fc0_0000;
+pub(crate) const FP_BOX: u64 = 0xffff_ffff_0000_0000;
+pub(crate) const FFLAG_NV: u64 = 0x10;
+pub(crate) const FFLAG_DZ: u64 = 0x8;
+pub(crate) const FFLAG_NX: u64 = 0x1;
+
+fn snan_d(v: f64) -> bool {
+	v.is_nan() && v.to_bits() & 0x0008_0000_0000_0000 == 0
+}
+
+fn snan_s(v: f32) -> bool {
+	v.is_nan() && v.to_bits() & 0x0040_0000 == 0
+}
+
+/// The single a register holds: its low 32 bits when NaN-boxed, else the
+/// canonical NaN.
+fn s_unbox(reg: f64) -> f32 {
+	let bits = reg.to_bits();
+	match bits >= FP_BOX {
+		true => f32::from_bits(bits as u32),
+		false => f32::from_bits(FP_CANON_S)
+	}
+}
+
+/// A single as the register value: NaN-boxed.
+fn s_box(v: f32) -> f64 {
+	f64::from_bits(FP_BOX | v.to_bits() as u64)
+}
+
+/// The integer type of a float->int conversion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FpInt {
+	W,
+	Wu,
+	L,
+	Lu
+}
+
+impl FpInt {
+	/// A rounded value r converts without saturating iff lo <= r < hi (both
+	/// bounds exact doubles; false for NaN).
+	pub(crate) fn bounds(self) -> (f64, f64) {
+		match self {
+			FpInt::W => (-2147483648.0, 2147483648.0),
+			FpInt::Wu => (0.0, 4294967296.0),
+			FpInt::L => (-9223372036854775808.0, 9223372036854775808.0),
+			FpInt::Lu => (0.0, 18446744073709551616.0)
+		}
+	}
+}
+
+/// Round to an integral value per a RISC-V rounding mode (0 RNE, 1 RTZ,
+/// 2 RDN, 3 RUP, 4 RMM).
+pub(crate) fn fp_round(v: f64, rm: u8) -> f64 {
+	match rm {
+		0 => v.round_ties_even(),
+		1 => v.trunc(),
+		2 => v.floor(),
+		3 => v.ceil(),
+		_ => v.round() // RMM: ties away from zero
+	}
+}
+
+impl Cpu {
+	/// The rounding mode a conversion uses: the word's rm field, DYN (7)
+	/// reading frm. None for the reserved encodings (5, 6, or a frm of 5-7),
+	/// which make the instruction illegal.
+	fn fp_rm(&self, word: u32) -> Option<u8> {
+		let rm = match (word >> 12) & 7 {
+			7 => (self.csr[CSR_FCSR_ADDRESS as usize] >> 5) & 7,
+			rm => rm as u64
+		};
+		match rm <= 4 {
+			true => Some(rm as u8),
+			false => None
+		}
+	}
+
+	/// FCVT.{W,WU,L,LU}.{S,D}: round `v` per rm, then saturate (NaN and
+	/// positive overflow -> the maximum, negative overflow -> the minimum,
+	/// for unsigned 0) raising NV, or convert exactly raising NX if rounding
+	/// changed the value. 32-bit results are sign-extended.
+	fn fp_to_int(&mut self, v: f64, word: u32, kind: FpInt) -> Result<i64, Trap> {
+		let rm = match self.fp_rm(word) {
+			Some(rm) => rm,
+			None => return Err(Trap {
+				trap_type: TrapType::IllegalInstruction,
+				value: word as u64
+			})
+		};
+		let r = fp_round(v, rm);
+		let (lo, hi) = kind.bounds();
+		let value = match r >= lo && r < hi {
+			true => {
+				if r != v {
+					self.set_fcsr_nx();
+				}
+				match kind {
+					FpInt::Lu => r as u64 as i64,
+					_ => r as i64
+				}
+			},
+			false => {
+				self.set_fcsr_nv();
+				let high = v.is_nan() || r >= hi;
+				match kind {
+					FpInt::W => if high { i32::MAX as i64 } else { i32::MIN as i64 },
+					FpInt::Wu => if high { u32::MAX as i64 } else { 0 },
+					FpInt::L => if high { i64::MAX } else { i64::MIN },
+					FpInt::Lu => if high { -1 } else { 0 }
+				}
+			}
+		};
+		Ok(match kind {
+			FpInt::W | FpInt::Wu => value as i32 as i64,
+			_ => value
+		})
+	}
+
+	/// A double arithmetic result: a NaN becomes the canonical NaN, raising
+	/// NV when an input was a signaling NaN or none was a NaN at all (an
+	/// invalid operation: 0/0, inf-inf, 0*inf, sqrt of a negative).
+	fn fp_res_d(&mut self, r: f64, ins: &[f64]) -> f64 {
+		if !r.is_nan() {
+			return r;
+		}
+		if ins.iter().any(|&x| snan_d(x)) || !ins.iter().any(|x| x.is_nan()) {
+			self.set_fcsr_nv();
+		}
+		f64::from_bits(FP_CANON_D)
+	}
+
+	/// fp_res_d for a single result, which it returns NaN-boxed.
+	fn fp_res_s(&mut self, r: f32, ins: &[f32]) -> f64 {
+		if !r.is_nan() {
+			return s_box(r);
+		}
+		if ins.iter().any(|&x| snan_s(x)) || !ins.iter().any(|x| x.is_nan()) {
+			self.set_fcsr_nv();
+		}
+		s_box(f32::from_bits(FP_CANON_S))
+	}
+
+	/// IEEE division (a / ±0 is a correctly signed infinity, 0/0 a NaN);
+	/// DZ only for a finite nonzero dividend.
+	fn fp_div_d(&mut self, a: f64, b: f64) -> f64 {
+		if b == 0.0 && a.is_finite() && a != 0.0 {
+			self.set_fcsr_dz();
+		}
+		self.fp_res_d(a / b, &[a, b])
+	}
+
+	fn fp_div_s(&mut self, a: f32, b: f32) -> f64 {
+		if b == 0.0 && a.is_finite() && a != 0.0 {
+			self.set_fcsr_dz();
+		}
+		self.fp_res_s(a / b, &[a, b])
+	}
+
+	/// The fused multiply-adds, one rounding: (±a)*b + (±c) — FMSUB is
+	/// a*b-c, FNMSUB -(a*b)+c, FNMADD -(a*b)-c. inf*0 is invalid even when
+	/// the addend is a quiet NaN.
+	fn fp_fma_d(&mut self, a: f64, b: f64, c: f64, neg_prod: bool, neg_add: bool) -> f64 {
+		let r = (if neg_prod { -a } else { a }).mul_add(b, if neg_add { -c } else { c });
+		if (a.is_infinite() && b == 0.0) || (a == 0.0 && b.is_infinite()) {
+			self.set_fcsr_nv();
+		}
+		self.fp_res_d(r, &[a, b, c])
+	}
+
+	fn fp_fma_s(&mut self, a: f32, b: f32, c: f32, neg_prod: bool, neg_add: bool) -> f64 {
+		let r = (if neg_prod { -a } else { a }).mul_add(b, if neg_add { -c } else { c });
+		if (a.is_infinite() && b == 0.0) || (a == 0.0 && b.is_infinite()) {
+			self.set_fcsr_nv();
+		}
+		self.fp_res_s(r, &[a, b, c])
+	}
+
+	/// FMIN/FMAX (spec 2.2): both NaN -> the canonical NaN, one NaN -> the
+	/// other operand, -0.0 below +0.0; NV for a signaling NaN input.
+	fn fp_minmax_d(&mut self, a: f64, b: f64, max: bool) -> f64 {
+		if snan_d(a) || snan_d(b) {
+			self.set_fcsr_nv();
+		}
+		match (a.is_nan(), b.is_nan()) {
+			(true, true) => f64::from_bits(FP_CANON_D),
+			(true, false) => b,
+			(false, true) => a,
+			// equal: only ±0 differ, and the sign picks
+			_ if a == b => if a.is_sign_negative() != max { a } else { b },
+			_ => if (a < b) != max { a } else { b }
+		}
+	}
+
+	fn fp_minmax_s(&mut self, a: f32, b: f32, max: bool) -> f64 {
+		if snan_s(a) || snan_s(b) {
+			self.set_fcsr_nv();
+		}
+		s_box(match (a.is_nan(), b.is_nan()) {
+			(true, true) => f32::from_bits(FP_CANON_S),
+			(true, false) => b,
+			(false, true) => a,
+			_ if a == b => if a.is_sign_negative() != max { a } else { b },
+			_ => if (a < b) != max { a } else { b }
+		})
+	}
+
+	/// FEQ (quiet: NV for signaling NaNs only) or FLT/FLE (signaling: NV for
+	/// any NaN); a NaN operand compares false.
+	fn fp_cmp_d(&mut self, a: f64, b: f64, signaling: bool) {
+		if (signaling && (a.is_nan() || b.is_nan())) || snan_d(a) || snan_d(b) {
+			self.set_fcsr_nv();
+		}
+	}
+
+	fn fp_cmp_s(&mut self, a: f32, b: f32, signaling: bool) {
+		if (signaling && (a.is_nan() || b.is_nan())) || snan_s(a) || snan_s(b) {
+			self.set_fcsr_nv();
+		}
+	}
+
+	/// FCVT.D.S: exact widening; a NaN becomes the canonical NaN (NV when
+	/// it was signaling).
+	fn fp_d_of_s(&mut self, a: f32) -> f64 {
+		if !a.is_nan() {
+			return a as f64;
+		}
+		if snan_s(a) {
+			self.set_fcsr_nv();
+		}
+		f64::from_bits(FP_CANON_D)
+	}
+
+	/// FCVT.S.D: round to nearest-even, NaN-boxed; a NaN becomes the
+	/// canonical NaN (NV when it was signaling).
+	fn fp_s_of_d(&mut self, a: f64) -> f64 {
+		if !a.is_nan() {
+			return s_box(a as f32);
+		}
+		if snan_d(a) {
+			self.set_fcsr_nv();
+		}
+		s_box(f32::from_bits(FP_CANON_S))
+	}
+}
+// ===== end floating-point semantics =====
+
 // risc-box patch: 161 = upstream's table + the AMOs it never had, appended
 // at the END so every existing entry keeps its index (a BlockOp carries the
 // index in `data`, and the baked AOT regions are keyed by a hash over it).
@@ -5058,7 +5325,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FADD.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.f[f.rd] = cpu.f[f.rs1] + cpu.f[f.rs2];
+			// risc-box patch (fp spec): canonical NaN, NV (fp_res_d)
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.f[f.rd] = cpu.fp_res_d(a + b, &[a, b]);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5093,8 +5362,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.D.S",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// Is this implementation correct?
-			cpu.f[f.rd] = f32::from_bits(cpu.f[f.rs1].to_bits() as u32) as f64;
+			// risc-box patch (fp spec): the input unboxed, a NaN canonical
+			let a = s_unbox(cpu.f[f.rs1]);
+			cpu.f[f.rd] = cpu.fp_d_of_s(a);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5130,8 +5400,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			// The register holds raw FP bits. Widening the rounded value back
 			// to f64 makes FSW/FCVT.D.S read the low half of a double instead
 			// of the single (1.0 became 0.0). Store a NaN-boxed single.
-			let bits = (cpu.f[f.rs1] as f32).to_bits() as u64;
-			cpu.f[f.rd] = f64::from_bits(0xffff_ffff_0000_0000 | bits);
+			// risc-box patch (fp spec): ... and a NaN as the canonical one.
+			let a = cpu.f[f.rs1];
+			cpu.f[f.rd] = cpu.fp_s_of_d(a);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5149,11 +5420,11 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			// lowering (DoubleToInt32(-1.0)) turned -1 graph constants into 0 and
 			// silently miscompiled JS. Signed saturating truncation, NaN -> MAX
 			// per the RISC-V spec (Rust `as` gives NaN -> 0).
+			// risc-box patch (fp spec): and it always truncated: rm decides
+			// the rounding (SpiderMonkey's Math.floor is fcvt.w.d RDN), and
+			// NV/NX report invalid and inexact (fp_to_int).
 			let a = cpu.f[f.rs1];
-			cpu.x[f.rd] = match a.is_nan() {
-				true => i32::MAX as i64,
-				false => a as i32 as i64
-			};
+			cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::W)?;
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5167,12 +5438,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.WU.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// risc-box patch: NaN -> u32::MAX per spec (result sign-extended)
+			// risc-box patch: NaN -> u32::MAX per spec (result sign-extended);
+			// rounding per rm, NV/NX (fp_to_int)
 			let a = cpu.f[f.rs1];
-			cpu.x[f.rd] = match a.is_nan() {
-				true => u32::MAX as i32 as i64,
-				false => a as u32 as i32 as i64
-			};
+			cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::Wu)?;
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5183,12 +5452,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.L.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// risc-box patch: NaN -> i64::MAX per spec
+			// risc-box patch: NaN -> i64::MAX per spec; rounding per rm, NV/NX
 			let a = cpu.f[f.rs1];
-			cpu.x[f.rd] = match a.is_nan() {
-				true => i64::MAX,
-				false => a as i64
-			};
+			cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::L)?;
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5199,12 +5465,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FCVT.LU.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// risc-box patch: NaN -> u64::MAX per spec
+			// risc-box patch: NaN -> u64::MAX per spec; rounding per rm, NV/NX
 			let a = cpu.f[f.rs1];
-			cpu.x[f.rd] = match a.is_nan() {
-				true => u64::MAX as i64,
-				false => a as u64 as i64
-			};
+			cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::Lu)?;
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5215,18 +5478,12 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FDIV.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			let dividend = cpu.f[f.rs1];
-			let divisor = cpu.f[f.rs2];
-			// Is this implementation correct?
-			if divisor == 0.0 {
-				cpu.f[f.rd] = std::f64::INFINITY;
-				cpu.set_fcsr_dz();
-			} else if divisor == -0.0 {
-				cpu.f[f.rd] = std::f64::NEG_INFINITY;
-				cpu.set_fcsr_dz();
-			} else {
-				cpu.f[f.rd] = dividend / divisor;
-			}
+			// risc-box patch (fp spec): upstream returned +inf for ANY zero
+			// divisor (-0.0 == 0.0, so its -0.0 arm never ran): 0/0 must be
+			// the canonical NaN (NV), -1/0 -inf; DZ only for a finite
+			// nonzero dividend (fp_div_d)
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.f[f.rd] = cpu.fp_div_d(a, b);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5257,7 +5514,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FEQ.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = match cpu.f[f.rs1] == cpu.f[f.rs2] {
+			// risc-box patch (fp spec): NV for a signaling NaN
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.fp_cmp_d(a, b, false);
+			cpu.x[f.rd] = match a == b {
 				true => 1,
 				false => 0
 			};
@@ -5285,7 +5545,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FLE.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = match cpu.f[f.rs1] <= cpu.f[f.rs2] {
+			// risc-box patch (fp spec): NV for any NaN
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.fp_cmp_d(a, b, true);
+			cpu.x[f.rd] = match a <= b {
 				true => 1,
 				false => 0
 			};
@@ -5299,7 +5562,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FLT.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.x[f.rd] = match cpu.f[f.rs1] < cpu.f[f.rs2] {
+			// risc-box patch (fp spec): NV for any NaN
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.fp_cmp_d(a, b, true);
+			cpu.x[f.rd] = match a < b {
 				true => 1,
 				false => 0
 			};
@@ -5313,8 +5579,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FLW",
 		operation: |cpu, word, _address| {
 			let f = parse_format_i(word);
+			// risc-box patch (fp spec): NaN-boxed (upstream sign-extended,
+			// which left a positive single unboxed)
 			cpu.f[f.rd] = match cpu.mmu.load_word(cpu.x[f.rs1].wrapping_add(f.imm) as u64) {
-				Ok(data) => f64::from_bits(data as i32 as i64 as u64),
+				Ok(data) => f64::from_bits(FP_BOX | data as u64),
 				Err(e) => return Err(e)
 			};
 			Ok(())
@@ -5326,9 +5594,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		data: 0x02000043,
 		name: "FMADD.D",
 		operation: |cpu, word, _address| {
-			// @TODO: Update fcsr if needed?
 			let f = parse_format_r2(word);
-			cpu.f[f.rd] = cpu.f[f.rs1] * cpu.f[f.rs2] + cpu.f[f.rs3];
+			// risc-box patch (fp spec): FUSED (one rounding), canonical NaN
+			let (a, b, c) = (cpu.f[f.rs1], cpu.f[f.rs2], cpu.f[f.rs3]);
+			cpu.f[f.rd] = cpu.fp_fma_d(a, b, c, false, false);
 			Ok(())
 		},
 		disassemble: dump_format_r2
@@ -5341,7 +5610,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FMSUB.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r2(word);
-			cpu.f[f.rd] = cpu.f[f.rs1] * cpu.f[f.rs2] - cpu.f[f.rs3];
+			// risc-box patch (fp spec): fused a*b-c
+			let (a, b, c) = (cpu.f[f.rs1], cpu.f[f.rs2], cpu.f[f.rs3]);
+			cpu.f[f.rd] = cpu.fp_fma_d(a, b, c, false, true);
 			Ok(())
 		},
 		disassemble: dump_format_r2
@@ -5352,7 +5623,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FNMADD.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r2(word);
-			cpu.f[f.rd] = -(cpu.f[f.rs1] * cpu.f[f.rs2]) - cpu.f[f.rs3];
+			// risc-box patch (fp spec): fused -(a*b)-c
+			let (a, b, c) = (cpu.f[f.rs1], cpu.f[f.rs2], cpu.f[f.rs3]);
+			cpu.f[f.rd] = cpu.fp_fma_d(a, b, c, true, true);
 			Ok(())
 		},
 		disassemble: dump_format_r2
@@ -5363,7 +5636,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FMIN.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.f[f.rd] = cpu.f[f.rs1].min(cpu.f[f.rs2]);
+			// risc-box patch (fp spec): Rust's min leaves ±0 unordered
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.f[f.rd] = cpu.fp_minmax_d(a, b, false);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5374,7 +5649,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FMAX.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.f[f.rd] = cpu.f[f.rs1].max(cpu.f[f.rs2]);
+			// risc-box patch (fp spec): spec min/max (fp_minmax_d)
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.f[f.rd] = cpu.fp_minmax_d(a, b, true);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5385,7 +5662,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FSQRT.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.f[f.rd] = cpu.f[f.rs1].sqrt();
+			// risc-box patch (fp spec): canonical NaN, NV
+			let a = cpu.f[f.rs1];
+			cpu.f[f.rd] = cpu.fp_res_d(a.sqrt(), &[a]);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5395,9 +5674,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		data: 0x12000053,
 		name: "FMUL.D",
 		operation: |cpu, word, _address| {
-			// @TODO: Update fcsr if needed?
 			let f = parse_format_r(word);
-			cpu.f[f.rd] = cpu.f[f.rs1] * cpu.f[f.rs2];
+			// risc-box patch (fp spec): canonical NaN, NV
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.f[f.rd] = cpu.fp_res_d(a * b, &[a, b]);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5441,7 +5721,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FMV.W.X",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			cpu.f[f.rd] = f64::from_bits(cpu.x[f.rs1] as u32 as u64);
+			// risc-box patch (fp spec): NaN-boxed
+			cpu.f[f.rd] = f64::from_bits(FP_BOX | cpu.x[f.rs1] as u32 as u64);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5452,7 +5733,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FNMSUB.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r2(word);
-			cpu.f[f.rd] = -(cpu.f[f.rs1] * cpu.f[f.rs2]) + cpu.f[f.rs3];
+			// risc-box patch (fp spec): fused -(a*b)+c
+			let (a, b, c) = (cpu.f[f.rs1], cpu.f[f.rs2], cpu.f[f.rs3]);
+			cpu.f[f.rd] = cpu.fp_fma_d(a, b, c, true, false);
 			Ok(())
 		},
 		disassemble: dump_format_r2
@@ -5517,8 +5800,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		name: "FSUB.D",
 		operation: |cpu, word, _address| {
 			let f = parse_format_r(word);
-			// @TODO: Update fcsr if needed?
-			cpu.f[f.rd] = cpu.f[f.rs1] - cpu.f[f.rs2];
+			// risc-box patch (fp spec): canonical NaN, NV
+			let (a, b) = (cpu.f[f.rs1], cpu.f[f.rs2]);
+			cpu.f[f.rd] = cpu.fp_res_d(a - b, &[a, b]);
 			Ok(())
 		},
 		disassemble: dump_format_r
@@ -5528,17 +5812,19 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 		// SINGLE (.S) one — only FCVT.D.S/FCVT.S.D + the FMV.{X.W,W.X} moves. Xorg
 		// and glibc use single-precision floats constantly (window coordinates,
 		// libm float paths), so the very first X screen setup SIGILL'd on FSGNJ.S
-		// (word 0x20e705d3). Singles live in the low 32 bits of the f64 register
-		// (the FMV.W.X convention): read f32::from_bits(bits as u32), write back
-		// f64::from_bits(result.to_bits() as u64). fmt bits [26:25]=00 keep these
-		// distinct from the .D encodings (fmt=01) that share the low opcode.
+		// (word 0x20e705d3). fmt bits [26:25]=00 keep these distinct from the .D
+		// encodings (fmt=01) that share the low opcode.
+		// risc-box patch (fp spec): a single lives NaN-boxed in the register.
+		// Every op here reads its inputs with s_unbox (an improperly boxed
+		// register is the canonical NaN) and writes its result with s_box /
+		// fp_res_s (boxed; arithmetic NaNs canonical, NV per IEEE).
 		Instruction {
 			mask: 0xfe00007f, data: 0x00000053, name: "FADD.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((a + b).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.f[f.rd] = cpu.fp_res_s(a + b, &[a, b]);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5546,9 +5832,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00007f, data: 0x08000053, name: "FSUB.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((a - b).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.f[f.rd] = cpu.fp_res_s(a - b, &[a, b]);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5556,9 +5842,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00007f, data: 0x10000053, name: "FMUL.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((a * b).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.f[f.rd] = cpu.fp_res_s(a * b, &[a, b]);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5566,10 +5852,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00007f, data: 0x18000053, name: "FDIV.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				if b == 0.0 { cpu.set_fcsr_dz(); }
-				cpu.f[f.rd] = f64::from_bits((a / b).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.f[f.rd] = cpu.fp_div_s(a, b);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5577,18 +5862,20 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0x58000053, name: "FSQRT.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits(a.sqrt().to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				cpu.f[f.rd] = cpu.fp_res_s(a.sqrt(), &[a]);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
+		// sign injection is bit-exact (no canonicalization) on the unboxed
+		// singles
 		Instruction {
 			mask: 0xfe00707f, data: 0x20000053, name: "FSGNJ.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let r1 = cpu.f[f.rs1].to_bits() as u32;
-				let r2 = cpu.f[f.rs2].to_bits() as u32;
-				cpu.f[f.rd] = f64::from_bits(((r2 & 0x80000000) | (r1 & 0x7fffffff)) as u64);
+				let r1 = s_unbox(cpu.f[f.rs1]).to_bits();
+				let r2 = s_unbox(cpu.f[f.rs2]).to_bits();
+				cpu.f[f.rd] = s_box(f32::from_bits((r2 & 0x80000000) | (r1 & 0x7fffffff)));
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5596,9 +5883,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0x20001053, name: "FSGNJN.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let r1 = cpu.f[f.rs1].to_bits() as u32;
-				let r2 = cpu.f[f.rs2].to_bits() as u32;
-				cpu.f[f.rd] = f64::from_bits(((!r2 & 0x80000000) | (r1 & 0x7fffffff)) as u64);
+				let r1 = s_unbox(cpu.f[f.rs1]).to_bits();
+				let r2 = s_unbox(cpu.f[f.rs2]).to_bits();
+				cpu.f[f.rd] = s_box(f32::from_bits((!r2 & 0x80000000) | (r1 & 0x7fffffff)));
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5606,9 +5893,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0x20002053, name: "FSGNJX.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let r1 = cpu.f[f.rs1].to_bits() as u32;
-				let r2 = cpu.f[f.rs2].to_bits() as u32;
-				cpu.f[f.rd] = f64::from_bits(((( r1 ^ r2) & 0x80000000) | (r1 & 0x7fffffff)) as u64);
+				let r1 = s_unbox(cpu.f[f.rs1]).to_bits();
+				let r2 = s_unbox(cpu.f[f.rs2]).to_bits();
+				cpu.f[f.rd] = s_box(f32::from_bits(((r1 ^ r2) & 0x80000000) | (r1 & 0x7fffffff)));
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5616,9 +5903,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0x28000053, name: "FMIN.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits(a.min(b).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.f[f.rd] = cpu.fp_minmax_s(a, b, false);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5626,9 +5913,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0x28001053, name: "FMAX.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits(a.max(b).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.f[f.rd] = cpu.fp_minmax_s(a, b, true);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5636,8 +5923,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0xa0002053, name: "FEQ.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.fp_cmp_s(a, b, false);
 				cpu.x[f.rd] = (a == b) as i64;
 				Ok(())
 			}, disassemble: dump_empty
@@ -5646,8 +5934,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0xa0001053, name: "FLT.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.fp_cmp_s(a, b, true);
 				cpu.x[f.rd] = (a < b) as i64;
 				Ok(())
 			}, disassemble: dump_empty
@@ -5656,8 +5945,9 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfe00707f, data: 0xa0000053, name: "FLE.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				cpu.fp_cmp_s(a, b, true);
 				cpu.x[f.rd] = (a <= b) as i64;
 				Ok(())
 			}, disassemble: dump_empty
@@ -5666,7 +5956,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0707f, data: 0xe0001053, name: "FCLASS.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let bits = cpu.f[f.rs1].to_bits() as u32;
+				let bits = s_unbox(cpu.f[f.rs1]).to_bits();
 				let sign = bits >> 31; let exp = (bits >> 23) & 0xff; let frac = bits & 0x7fffff;
 				let c: u64 = if exp == 0xff && frac != 0 { if (frac >> 22) & 1 == 1 { 1 << 9 } else { 1 << 8 } }
 					else if exp == 0xff { if sign == 1 { 1 << 0 } else { 1 << 7 } }
@@ -5698,12 +5988,15 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 				Ok(())
 			}, disassemble: dump_format_r
 		},
+		// float -> int: the single widened exactly to a double, then
+		// fp_to_int's rounding (rm), saturation and flags. Upstream's `as`
+		// truncated always and mapped NaN to 0.
 		Instruction {
 			mask: 0xfff0007f, data: 0xc0000053, name: "FCVT.W.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				cpu.x[f.rd] = a as i32 as i64;
+				let a = s_unbox(cpu.f[f.rs1]) as f64;
+				cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::W)?;
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5711,8 +6004,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xc0100053, name: "FCVT.WU.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				cpu.x[f.rd] = a as u32 as i32 as i64;
+				let a = s_unbox(cpu.f[f.rs1]) as f64;
+				cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::Wu)?;
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5720,8 +6013,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xc0200053, name: "FCVT.L.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				cpu.x[f.rd] = a as i64;
+				let a = s_unbox(cpu.f[f.rs1]) as f64;
+				cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::L)?;
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5729,8 +6022,8 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xc0300053, name: "FCVT.LU.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				cpu.x[f.rd] = a as u64 as i64;
+				let a = s_unbox(cpu.f[f.rs1]) as f64;
+				cpu.x[f.rd] = cpu.fp_to_int(a, word, FpInt::Lu)?;
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5738,7 +6031,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xd0000053, name: "FCVT.S.W",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				cpu.f[f.rd] = f64::from_bits((cpu.x[f.rs1] as i32 as f32).to_bits() as u64);
+				cpu.f[f.rd] = s_box(cpu.x[f.rs1] as i32 as f32);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5746,7 +6039,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xd0100053, name: "FCVT.S.WU",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				cpu.f[f.rd] = f64::from_bits((cpu.x[f.rs1] as u32 as f32).to_bits() as u64);
+				cpu.f[f.rd] = s_box(cpu.x[f.rs1] as u32 as f32);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5754,7 +6047,7 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xd0200053, name: "FCVT.S.L",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				cpu.f[f.rd] = f64::from_bits((cpu.x[f.rs1] as i64 as f32).to_bits() as u64);
+				cpu.f[f.rd] = s_box(cpu.x[f.rs1] as i64 as f32);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
@@ -5762,18 +6055,20 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0xfff0007f, data: 0xd0300053, name: "FCVT.S.LU",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r(word);
-				cpu.f[f.rd] = f64::from_bits((cpu.x[f.rs1] as u64 as f32).to_bits() as u64);
+				cpu.f[f.rd] = s_box(cpu.x[f.rs1] as u64 as f32);
 				Ok(())
 			}, disassemble: dump_format_r
 		},
+		// fused (one rounding), as the spec defines them: FMSUB a*b-c,
+		// FNMSUB -(a*b)+c, FNMADD -(a*b)-c
 		Instruction {
 			mask: 0x0600007f, data: 0x00000043, name: "FMADD.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r2(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				let c = f32::from_bits(cpu.f[f.rs3].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((a * b + c).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				let c = s_unbox(cpu.f[f.rs3]);
+				cpu.f[f.rd] = cpu.fp_fma_s(a, b, c, false, false);
 				Ok(())
 			}, disassemble: dump_format_r2
 		},
@@ -5781,10 +6076,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0x0600007f, data: 0x00000047, name: "FMSUB.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r2(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				let c = f32::from_bits(cpu.f[f.rs3].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((a * b - c).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				let c = s_unbox(cpu.f[f.rs3]);
+				cpu.f[f.rd] = cpu.fp_fma_s(a, b, c, false, true);
 				Ok(())
 			}, disassemble: dump_format_r2
 		},
@@ -5792,10 +6087,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0x0600007f, data: 0x0000004b, name: "FNMSUB.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r2(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				let c = f32::from_bits(cpu.f[f.rs3].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((-(a * b) + c).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				let c = s_unbox(cpu.f[f.rs3]);
+				cpu.f[f.rd] = cpu.fp_fma_s(a, b, c, true, false);
 				Ok(())
 			}, disassemble: dump_format_r2
 		},
@@ -5803,10 +6098,10 @@ const INSTRUCTIONS: [Instruction; INSTRUCTION_NUM] = [
 			mask: 0x0600007f, data: 0x0000004f, name: "FNMADD.S",
 			operation: |cpu, word, _address| {
 				let f = parse_format_r2(word);
-				let a = f32::from_bits(cpu.f[f.rs1].to_bits() as u32);
-				let b = f32::from_bits(cpu.f[f.rs2].to_bits() as u32);
-				let c = f32::from_bits(cpu.f[f.rs3].to_bits() as u32);
-				cpu.f[f.rd] = f64::from_bits((-(a * b) - c).to_bits() as u64);
+				let a = s_unbox(cpu.f[f.rs1]);
+				let b = s_unbox(cpu.f[f.rs2]);
+				let c = s_unbox(cpu.f[f.rs3]);
+				cpu.f[f.rd] = cpu.fp_fma_s(a, b, c, true, true);
 				Ok(())
 			}, disassemble: dump_format_r2
 		},
@@ -6945,6 +7240,319 @@ mod test_cpu {
 			};
 			assert_eq!((mem, cpu.x[5]), (stored, rd), "{}", name);
 		}
+	}
+
+	/// The word of INSTRUCTIONS entry `name`, with rd/rm/rs1/rs2/rs3 filled
+	/// in wherever its mask leaves them free.
+	fn fp_word(name: &str, rd: u32, rs1: u32, rs2: u32, rs3: u32, rm: u32) -> u32 {
+		let i = INSTRUCTIONS.iter().find(|i| i.name == name).unwrap_or_else(|| panic!("{}", name));
+		let fields = rd << 7 | rm << 12 | rs1 << 15 | rs2 << 20 | rs3 << 27;
+		i.data | (fields & !i.mask)
+	}
+
+	/// Run float op `name` (rd 5, rs1 6, rs2 7, rs3 8) from f6/f7/f8 = the
+	/// given bits, x6 = `x6`, frm = `frm`, fflags clear — through its table
+	/// closure AND through exec_op (the hot arm, for the hot ones), which
+	/// must agree. Returns (f5 bits, x5, fflags), or None on a trap.
+	fn fp_run(name: &str, rm: u32, f: [u64; 3], x6: i64, frm: u64) -> Option<(u64, i64, u64)> {
+		let word = fp_word(name, 5, 6, 7, 8, rm);
+		let mut out = Vec::new();
+		for hot in [false, true] {
+			let mut cpu = create_cpu();
+			for i in 0..3 {
+				cpu.f[6 + i] = f64::from_bits(f[i]);
+			}
+			cpu.x[6] = x6;
+			cpu.csr[CSR_FCSR_ADDRESS as usize] = frm << 5;
+			let index = cpu.decode_and_get_instruction_index(word).unwrap_or_else(|_| panic!("{} decodes", name));
+			assert_eq!(INSTRUCTIONS[index].name, name);
+			let result = match hot {
+				false => (INSTRUCTIONS[index].operation)(&mut cpu, word, 0),
+				true => {
+					let op = decode_op_for_test(&cpu, word);
+					cpu.exec_op(&op, 0)
+				}
+			};
+			out.push(match result {
+				Ok(()) => Some((cpu.f[5].to_bits(), cpu.x[5], cpu.csr[CSR_FCSR_ADDRESS as usize] & 0x1f)),
+				Err(Trap { trap_type: TrapType::IllegalInstruction, value }) => {
+					assert_eq!(value, word as u64, "{}: tval is the word", name);
+					None
+				},
+				Err(_) => panic!("{}: unexpected trap", name),
+			});
+		}
+		assert_eq!(out[0], out[1], "{}: table closure vs exec_op", name);
+		out[0]
+	}
+
+	const NV: u64 = FFLAG_NV;
+	const DZ: u64 = FFLAG_DZ;
+	const NX: u64 = FFLAG_NX;
+	fn d(v: f64) -> u64 {
+		v.to_bits()
+	}
+	fn s(v: f32) -> u64 {
+		FP_BOX | v.to_bits() as u64
+	}
+
+	/// risc-box patch (fp spec): FDIV, NaN canonicalization and the
+	/// exception flags, hand-computed from the spec (the JIT tests only
+	/// compare the translator against the interpreter).
+	#[test]
+	fn float_arithmetic_follows_the_spec() {
+		let canon_d = FP_CANON_D;
+		let canon_s = FP_BOX | FP_CANON_S as u64;
+		let snan_d = 0x7ff0_0000_0000_0001u64;
+		let neg_qnan_d = 0xfff8_0000_0000_0123u64;
+		// (op, rs1, rs2, f5, fflags)
+		let cases: &[(&str, u64, u64, u64, u64)] = &[
+			// FDIV.D: upstream gave +inf for every zero divisor
+			("FDIV.D", d(0.0), d(0.0), canon_d, NV),
+			("FDIV.D", d(-1.0), d(0.0), d(f64::NEG_INFINITY), DZ),
+			("FDIV.D", d(1.0), d(-0.0), d(f64::NEG_INFINITY), DZ),
+			("FDIV.D", d(-1.0), d(-0.0), d(f64::INFINITY), DZ),
+			("FDIV.D", d(f64::INFINITY), d(0.0), d(f64::INFINITY), 0),
+			("FDIV.D", d(f64::INFINITY), d(f64::INFINITY), canon_d, NV),
+			("FDIV.D", d(1.0), d(4.0), d(0.25), 0),
+			("FDIV.D", neg_qnan_d, d(0.0), canon_d, 0),
+			("FDIV.S", s(0.0), s(-0.0), canon_s, NV),
+			("FDIV.S", s(-3.0), s(0.0), s(f32::NEG_INFINITY), DZ),
+			// NaN results are canonical; NV only for invalid ops and sNaNs
+			("FADD.D", d(f64::INFINITY), d(f64::NEG_INFINITY), canon_d, NV),
+			("FADD.D", neg_qnan_d, d(1.0), canon_d, 0),
+			("FADD.D", snan_d, d(1.0), canon_d, NV),
+			("FSUB.D", d(f64::INFINITY), d(f64::INFINITY), canon_d, NV),
+			("FMUL.D", d(0.0), d(f64::NEG_INFINITY), canon_d, NV),
+			("FMUL.D", d(-2.0), d(3.0), d(-6.0), 0),
+			("FSQRT.D", d(-1.0), 0, canon_d, NV),
+			("FSQRT.D", d(-0.0), 0, d(-0.0), 0),
+			("FADD.S", s(f32::INFINITY), s(f32::NEG_INFINITY), canon_s, NV),
+			("FMUL.S", FP_BOX | 0xffc0_0001, s(2.0), canon_s, 0),
+			("FADD.S", FP_BOX | 0x7f80_0001, s(2.0), canon_s, NV),
+			// an improperly boxed single input is the canonical NaN (quiet)
+			("FADD.S", 0x0000_0000_3f80_0000, s(1.0), canon_s, 0),
+			("FSQRT.S", s(4.0), 0, s(2.0), 0),
+			// single results are NaN-boxed
+			("FADD.S", s(1.0), s(2.0), s(3.0), 0),
+			// sign injection is bit-exact: no canonicalization, payloads kept
+			("FSGNJ.D", neg_qnan_d, d(1.0), 0x7ff8_0000_0000_0123, 0),
+			("FSGNJN.D", snan_d, d(1.0), 0x8000_0000_0000_0000 | snan_d, 0),
+			("FSGNJ.S", FP_BOX | 0x7f80_0001, s(-1.0), FP_BOX | 0xff80_0001, 0),
+			("FSGNJ.S", 0x0000_0000_3f80_0000, s(-1.0), FP_BOX | 0xffc0_0000, 0),
+			// FMIN/FMAX: -0.0 < +0.0; one NaN gives the other operand
+			("FMIN.D", d(-0.0), d(0.0), d(-0.0), 0),
+			("FMIN.D", d(0.0), d(-0.0), d(-0.0), 0),
+			("FMAX.D", d(-0.0), d(0.0), d(0.0), 0),
+			("FMAX.D", d(0.0), d(-0.0), d(0.0), 0),
+			("FMIN.D", neg_qnan_d, d(2.0), d(2.0), 0),
+			("FMAX.D", d(-3.0), neg_qnan_d, d(-3.0), 0),
+			("FMIN.D", neg_qnan_d, neg_qnan_d, canon_d, 0),
+			("FMIN.D", snan_d, d(5.0), d(5.0), NV),
+			("FMIN.D", d(1.0), d(2.0), d(1.0), 0),
+			("FMAX.D", d(1.0), d(2.0), d(2.0), 0),
+			("FMIN.S", s(-0.0), s(0.0), s(-0.0), 0),
+			("FMAX.S", s(0.0), s(-0.0), s(0.0), 0),
+			("FMAX.S", 0x0000_0000_3f80_0000, s(7.0), s(7.0), 0),
+			// widening/narrowing: NaNs canonical, NV for signaling
+			("FCVT.D.S", FP_BOX | 0xffc0_0001, 0, canon_d, 0),
+			("FCVT.D.S", FP_BOX | 0x7f80_0001, 0, canon_d, NV),
+			("FCVT.D.S", s(1.5), 0, d(1.5), 0),
+			("FCVT.D.S", 0x0000_0000_3fc0_0000, 0, canon_d, 0),
+			("FCVT.S.D", neg_qnan_d, 0, canon_s, 0),
+			("FCVT.S.D", snan_d, 0, canon_s, NV),
+			("FCVT.S.D", d(-2.5), 0, s(-2.5), 0),
+		];
+		for &(name, a, b, want, flags) in cases {
+			let got = fp_run(name, 0, [a, b, 0], 0, 0);
+			assert_eq!(got.map(|g| (g.0, g.2)), Some((want, flags)), "{} {:#x} {:#x}", name, a, b);
+		}
+		// comparisons: false on NaN; FEQ is quiet (NV for sNaN only), FLT/FLE
+		// signal on any NaN
+		let cmps: &[(&str, u64, u64, i64, u64)] = &[
+			("FEQ.D", neg_qnan_d, d(1.0), 0, 0),
+			("FEQ.D", snan_d, d(1.0), 0, NV),
+			("FEQ.D", d(-0.0), d(0.0), 1, 0),
+			("FLT.D", neg_qnan_d, d(1.0), 0, NV),
+			("FLE.D", d(1.0), d(1.0), 1, 0),
+			("FLT.D", d(-0.0), d(0.0), 0, 0),
+			("FEQ.S", s(1.0), 0x0000_0000_3f80_0000, 0, 0),
+			("FLE.S", s(1.0), 0x0000_0000_3f80_0000, 0, NV),
+			("FLT.S", s(1.0), s(2.0), 1, 0),
+		];
+		for &(name, a, b, want, flags) in cmps {
+			let got = fp_run(name, 0, [a, b, 0], 0, 0);
+			assert_eq!(got.map(|g| (g.1, g.2)), Some((want, flags)), "{} {:#x} {:#x}", name, a, b);
+		}
+		// FCLASS.S of an improperly boxed register: the canonical (quiet) NaN
+		assert_eq!(fp_run("FCLASS.S", 0, [0x0000_0000_3f80_0000, 0, 0], 0, 0).map(|g| g.1), Some(1 << 9));
+		assert_eq!(fp_run("FCLASS.S", 0, [s(-0.0), 0, 0], 0, 0).map(|g| g.1), Some(1 << 3));
+		// FMV.X.W takes the low 32 bits raw (sign-extended), boxed or not;
+		// FMV.W.X boxes
+		assert_eq!(fp_run("FMV.X.W", 0, [0x0000_0000_bf80_0000, 0, 0], 0, 0).map(|g| g.1),
+			Some(0xffff_ffff_bf80_0000u64 as i64));
+		assert_eq!(fp_run("FMV.W.X", 0, [0, 0, 0], 0x1234_5678_3f80_0000, 0).map(|g| g.0),
+			Some(0xffff_ffff_3f80_0000));
+		// int -> single results are boxed
+		assert_eq!(fp_run("FCVT.S.W", 0, [0, 0, 0], 3, 0).map(|g| g.0), Some(s(3.0)));
+	}
+
+	/// risc-box patch (fp spec): FLW boxes the single it loads (upstream
+	/// sign-extended it: 1.0f became 0x000000003f800000, which every single
+	/// op now reads as NaN), through the table closure and the hot arm.
+	#[test]
+	fn flw_nan_boxes_its_single() {
+		for &(bits, want) in &[(0x3f80_0000u32, 0xffff_ffff_3f80_0000u64), (0xbf80_0000, 0xffff_ffff_bf80_0000),
+			(0x7f80_0001, 0xffff_ffff_7f80_0001)]
+		{
+			for hot in [false, true] {
+				let mut cpu = create_cpu();
+				cpu.get_mut_mmu().init_memory(65536);
+				let at = DRAM_BASE + 0x100;
+				cpu.get_mut_mmu().store_word(at, bits).ok().unwrap();
+				cpu.x[6] = at as i64;
+				let word = fp_word("FLW", 5, 6, 0, 0, 2); // flw f5, 0(x6)
+				let index = cpu.decode_and_get_instruction_index(word).ok().unwrap();
+				assert_eq!(INSTRUCTIONS[index].name, "FLW");
+				let ok = match hot {
+					false => (INSTRUCTIONS[index].operation)(&mut cpu, word, 0).is_ok(),
+					true => {
+						let op = decode_op_for_test(&cpu, word);
+						assert_eq!(op.kind, HOT_FLW);
+						cpu.exec_op(&op, 0).is_ok()
+					}
+				};
+				assert!(ok);
+				assert_eq!(cpu.f[5].to_bits(), want, "{:#x} hot {}", bits, hot);
+			}
+		}
+	}
+
+	/// risc-box patch (fp spec): float -> int conversions round per rm
+	/// (DYN reads frm), saturate, set NV/NX; reserved rounding modes are
+	/// illegal. SpiderMonkey's Math.floor/ceil/round are fcvt.w.d with
+	/// RDN/RUP/RMM and test NV|NX to see whether the double was an int32.
+	#[test]
+	fn float_to_int_conversions_follow_the_spec() {
+		const RNE: u32 = 0;
+		const RTZ: u32 = 1;
+		const RDN: u32 = 2;
+		const RUP: u32 = 3;
+		const RMM: u32 = 4;
+		const DYN: u32 = 7;
+		let nan = 0x7ff8_0000_0000_0000u64;
+		// (op, rm, input bits, x5, fflags)
+		let cases: &[(&str, u32, u64, i64, u64)] = &[
+			("FCVT.W.D", RDN, d(-1.5), -2, NX),
+			("FCVT.W.D", RUP, d(-1.5), -1, NX),
+			("FCVT.W.D", RNE, d(-1.5), -2, NX),
+			("FCVT.W.D", RTZ, d(-1.5), -1, NX),
+			("FCVT.W.D", RMM, d(-1.5), -2, NX),
+			("FCVT.W.D", RNE, d(2.5), 2, NX),
+			("FCVT.W.D", RMM, d(2.5), 3, NX),
+			("FCVT.W.D", RNE, d(3.5), 4, NX),
+			("FCVT.W.D", RMM, d(0.49999999999999994), 0, NX),
+			("FCVT.W.D", RMM, d(-0.5), -1, NX),
+			("FCVT.W.D", RDN, d(7.0), 7, 0),
+			("FCVT.W.D", RTZ, d(-0.0), 0, 0),
+			("FCVT.W.D", RNE, nan, 0x7fff_ffff, NV),
+			("FCVT.W.D", RNE, 0xfff8_0000_0000_0000, 0x7fff_ffff, NV),
+			("FCVT.W.D", RTZ, d(f64::NEG_INFINITY), i32::MIN as i64, NV),
+			("FCVT.W.D", RTZ, d(2147483647.9), 2147483647, NX),
+			("FCVT.W.D", RNE, d(2147483647.5), 0x7fff_ffff, NV),
+			("FCVT.W.D", RNE, d(-2147483648.5), i32::MIN as i64, NX),
+			("FCVT.W.D", RMM, d(-2147483648.5), i32::MIN as i64, NV),
+			("FCVT.WU.D", RTZ, d(-0.5), 0, NX),
+			("FCVT.WU.D", RTZ, d(-1.0), 0, NV),
+			("FCVT.WU.D", RNE, d(4294967295.0), -1, 0),
+			("FCVT.WU.D", RNE, d(4294967296.0), -1, NV),
+			("FCVT.WU.D", RNE, nan, -1, NV),
+			("FCVT.WU.D", RUP, d(2147483647.5), 0xffff_ffff_8000_0000u64 as i64, NX),
+			("FCVT.L.D", RNE, d(9223372036854775808.0), i64::MAX, NV),
+			("FCVT.L.D", RNE, d(-9223372036854775808.0), i64::MIN, 0),
+			("FCVT.L.D", RDN, d(-0.25), -1, NX),
+			("FCVT.L.D", RNE, nan, i64::MAX, NV),
+			("FCVT.LU.D", RNE, d(18446744073709549568.0), -2048, 0),
+			("FCVT.LU.D", RNE, d(f64::INFINITY), -1, NV),
+			("FCVT.LU.D", RUP, d(-0.5), 0, NX),
+			("FCVT.LU.D", RDN, d(-0.5), 0, NV),
+			("FCVT.W.S", RDN, s(-1.5), -2, NX),
+			("FCVT.W.S", RUP, s(-1.5), -1, NX),
+			("FCVT.W.S", RMM, s(2.5), 3, NX),
+			// upstream mapped a NaN single to 0
+			("FCVT.W.S", RTZ, FP_BOX | 0x7fc0_0000, 0x7fff_ffff, NV),
+			// an improperly boxed single is the canonical NaN
+			("FCVT.W.S", RTZ, 0x0000_0000_3f80_0000, 0x7fff_ffff, NV),
+			("FCVT.WU.S", RTZ, s(-3.0), 0, NV),
+			("FCVT.L.S", RUP, s(-0.5), 0, NX),
+			("FCVT.LU.S", RNE, s(1e10), 10000000000, 0),
+		];
+		for &(name, rm, a, want, flags) in cases {
+			let got = fp_run(name, rm, [a, 0, 0], 0, 0);
+			assert_eq!(got.map(|g| (g.1, g.2)), Some((want, flags)), "{} rm {} {:#x}", name, rm, a);
+		}
+		// DYN reads frm
+		for &(frm, want) in &[(RNE as u64, -2i64), (RTZ as u64, -1), (RDN as u64, -2), (RUP as u64, -1), (RMM as u64, -2)] {
+			let got = fp_run("FCVT.W.D", DYN, [d(-1.5), 0, 0], 0, frm);
+			assert_eq!(got.map(|g| g.1), Some(want), "DYN frm {}", frm);
+		}
+		// the reserved rounding modes: rm 5/6, or DYN with frm 5-7, trap
+		for &(rm, frm) in &[(5u32, 0u64), (6, 0), (DYN, 5), (DYN, 6), (DYN, 7)] {
+			assert_eq!(fp_run("FCVT.W.D", rm, [d(1.0), 0, 0], 0, frm), None, "rm {} frm {}", rm, frm);
+			assert_eq!(fp_run("FCVT.LU.S", rm, [s(1.0), 0, 0], 0, frm), None, "rm {} frm {}", rm, frm);
+		}
+	}
+
+	/// risc-box patch (fp spec): the multiply-adds are FUSED - one rounding.
+	/// a = 1 + 2^-30, b = 1 - 2^-30: a*b = 1 - 2^-60 exactly, which rounds
+	/// to 1.0 on its own, so unfused a*b - 1 is 0 while fused is -2^-60.
+	/// (GCC and Clang contract a*b+c into fmadd on riscv64: libm's pow()
+	/// came out wrong unfused, 2**53+1 printed 9007199254740996 in node.)
+	#[test]
+	fn multiply_adds_are_fused() {
+		let a = 1.0 + 2f64.powi(-30);
+		let b = 1.0 - 2f64.powi(-30);
+		let e = 2f64.powi(-60);
+		assert_eq!(a * b - 1.0, 0.0, "the unfused reference really differs");
+		// (op, rs3, result): FMADD a*b+c, FMSUB a*b-c, FNMSUB -(a*b)+c,
+		// FNMADD -(a*b)-c
+		for &(name, c, want) in &[("FMADD.D", -1.0, -e), ("FMSUB.D", 1.0, -e), ("FNMSUB.D", 1.0, e),
+			("FNMADD.D", -1.0, e)]
+		{
+			let got = fp_run(name, 0, [d(a), d(b), d(c)], 0, 0);
+			assert_eq!(got.map(|g| (g.0, g.2)), Some((d(want), 0)), "{}", name);
+		}
+		let a = 1.0f32 + 2f32.powi(-13);
+		let b = 1.0f32 - 2f32.powi(-13);
+		let e = 2f32.powi(-26);
+		assert_eq!(a * b - 1.0, 0.0);
+		for &(name, c, want) in &[("FMADD.S", -1.0f32, -e), ("FMSUB.S", 1.0, -e), ("FNMSUB.S", 1.0, e),
+			("FNMADD.S", -1.0, e)]
+		{
+			let got = fp_run(name, 0, [s(a), s(b), s(c)], 0, 0);
+			assert_eq!(got.map(|g| (g.0, g.2)), Some((s(want), 0)), "{}", name);
+		}
+		// more fused-only results: (1+2^-27)^2 - 1 = 2^-26 + 2^-54, and an
+		// exact x*x - x*x residual (the TwoProduct error term)
+		let x = 1.0 + 2f64.powi(-27);
+		let got = fp_run("FMADD.D", 0, [d(x), d(x), d(-1.0)], 0, 0);
+		assert_eq!(got.map(|g| g.0), Some(d(2f64.powi(-26) + 2f64.powi(-54))));
+		let p = x * x;
+		let got = fp_run("FMSUB.D", 0, [d(x), d(x), d(p)], 0, 0);
+		assert_eq!(got.map(|g| g.0), Some(d(2f64.powi(-54))));
+		// NaNs: canonical; inf*0 is invalid even with a quiet NaN addend
+		let canon = FP_CANON_D;
+		assert_eq!(fp_run("FMADD.D", 0, [d(f64::INFINITY), d(0.0), 0xfff8_0000_0000_0001], 0, 0),
+			Some((canon, 0, NV)));
+		assert_eq!(fp_run("FMADD.D", 0, [d(2.0), d(3.0), 0xfff8_0000_0000_0001], 0, 0),
+			Some((canon, 0, 0)));
+		assert_eq!(fp_run("FMADD.D", 0, [d(f64::INFINITY), d(1.0), d(f64::NEG_INFINITY)], 0, 0),
+			Some((canon, 0, NV)));
+		assert_eq!(fp_run("FNMSUB.S", 0, [s(f32::INFINITY), s(0.0), s(1.0)], 0, 0),
+			Some((FP_BOX | FP_CANON_S as u64, 0, NV)));
+		// FNMADD/FNMSUB negate the product, not the result: zero signs
+		assert_eq!(fp_run("FNMADD.D", 0, [d(0.0), d(1.0), d(0.0)], 0, 0).map(|g| g.0), Some(d(-0.0)));
+		assert_eq!(fp_run("FNMSUB.D", 0, [d(0.0), d(1.0), d(0.0)], 0, 0).map(|g| g.0), Some(d(0.0)));
 	}
 
 	/// risc-box patch (per-page code generations): a store into one code page retires only the blocks decoded
@@ -8207,7 +8815,10 @@ mod test_jit_equivalence {
 				45 => (HOT_FSD, 0, p, rb, mem_imm, 0),
 				46 => (HOT_FADD_D, rd, ra, rb, 0, 0),
 				47 => (HOT_FSUB_D, rd, ra, rb, 0, 0),
-				48 => (HOT_FMUL_D, rd, ra, rb, 0, 0),
+				// FDIV.D shares FMUL.D's slot (picked by a bit already drawn), so
+				// the random stream - and the other tests' coverage counts - stay
+				// as they were
+				48 => (if imm12 & 1 == 0 { HOT_FMUL_D } else { HOT_FDIV_D }, rd, ra, rb, 0, 0),
 				49 => (HOT_FSGNJ_D, rd, ra, rb, 0, 0),
 				50 => (HOT_FMV_X_D, rd, ra, 0, 0, 0),
 				51 => (HOT_FMV_D_X, rd, ra, 0, 0, 0),
@@ -8242,12 +8853,16 @@ mod test_jit_equivalence {
 		}
 		cpu.x[0] = 0;
 		for i in 0..32 {
-			// finite doubles only: NaN payload propagation differs between
-			// the native interpreter (host FPU) and engine-canonicalized
-			// wasm in some configurations; production runs BOTH sides under
-			// the same engine, so finite inputs are the honest test domain
+			// mostly finite doubles; one register in six holds a value the
+			// float rules single out (SPECIAL_D: zeros, infinities, quiet and
+			// signaling NaNs of either sign with payloads, a subnormal, ...).
+			// Host and wasm NaN results differ in sign and payload, but both
+			// sides canonicalize them now, so NaNs compare bit-exactly too.
 			let m = (r.next() % 2000000) as f64 / 1000.0 - 1000.0;
-			cpu.f[i] = m;
+			cpu.f[i] = match r.next() % 6 {
+				0 => f64::from_bits(SPECIAL_D[(r.next() % SPECIAL_D.len() as u64) as usize]),
+				_ => m,
+			};
 		}
 		for a in (0..WIN).step_by(8) {
 			let v = r.next();
@@ -8326,10 +8941,12 @@ mod test_jit_equivalence {
 			let mut m = flat_mem(&engine, &cpu, start);
 			let rw = m.call_block(&engine, &bytes);
 			let (xw, pcw, dramw, fw) = flat_state(&m);
+			let fcsr_w = flat_extra(&m).0;
 			cpu.update_pc(start);
 			cpu.install_block_for_test(0, start, 0, &ops);
 			let ri = cpu.exec_block(0);
 			assert_eq!(ri, rw, "retired mismatch seed {}", seed);
+			assert_eq!(cpu.csr[CSR_FCSR_ADDRESS as usize], fcsr_w, "fcsr mismatch seed {}", seed);
 			assert_eq!(cpu.x, xw, "registers mismatch seed {}", seed);
 			assert_eq!(cpu.pc, pcw, "pc mismatch seed {}", seed);
 			let mut dram_i = vec![0u8; WIN as usize];
@@ -8454,10 +9071,30 @@ mod test_jit_equivalence {
 				names.push(INSTRUCTIONS[index].name);
 			}
 		}
-		// 11 integer/fence ops + MULH x3, 18 AMOs, LR/SC x4, 23 single and
-		// 17 double float ops, FCVT.D.S/S.D, FMV.X.W/W.X; the CSR ops only
+		// 11 integer/fence ops + MULH x3, 18 AMOs, LR/SC x4, 19 single and
+		// 13 double float ops, FCVT.D.S/S.D, FMV.X.W/W.X; the CSR ops only
 		// count for fflags/frm/fcsr, and `op` builds a word whose csr is 0
-		assert_eq!(names.len(), 80, "{:?}", names);
+		// (and whose rm is 0, RNE). Not the fused multiply-adds (wasm has no
+		// fused multiply-add), FMIN/FMAX or FCLASS.
+		assert_eq!(names.len(), 72, "{:?}", names);
+		for name in ["FMADD.S", "FMSUB.S", "FNMSUB.S", "FNMADD.S", "FMADD.D", "FMSUB.D", "FNMSUB.D",
+			"FNMADD.D", "FMIN.S", "FMAX.S", "FMIN.D", "FMAX.D", "FCLASS.S", "FCLASS.D"]
+		{
+			assert!(!names.contains(&name), "{}", name);
+		}
+		// float -> int conversions: a static rm 0-4 (RNE RTZ RDN RUP RMM) is
+		// translated; DYN (frm at run time) and the reserved 5/6 are not
+		for name in ["FCVT.W.S", "FCVT.WU.S", "FCVT.L.S", "FCVT.LU.S", "FCVT.W.D", "FCVT.WU.D",
+			"FCVT.L.D", "FCVT.LU.D"]
+		{
+			for rm in 0..8u32 {
+				let o = decode_op_for_test(&cpu, word_of(name, 5, 6, 0, 0) | rm << 12);
+				assert_eq!(op_name(&o), name);
+				let emits = jit::emit_block(&[o], DRAM_BASE, &lay).is_some();
+				assert_eq!(jit::translatable(&o), emits, "{} rm {}", name, rm);
+				assert_eq!(emits, rm <= 4, "{} rm {}", name, rm);
+			}
+		}
 		for (base, name) in [(0x1073u32, "CSRRW"), (0x2073, "CSRRS"), (0x3073, "CSRRC"),
 			(0x5073, "CSRRWI"), (0x6073, "CSRRSI"), (0x7073, "CSRRCI")]
 		{
@@ -8538,29 +9175,66 @@ mod test_jit_equivalence {
 		i.data | (fields & !i.mask)
 	}
 
+	/// Doubles the float rules single out, as bits: ±0, ±1, ±inf, the
+	/// canonical NaN, x86's negative default NaN, a quiet NaN with a
+	/// payload, signaling NaNs of either sign, the smallest subnormal, the
+	/// largest finite, 2.5 and -1.5 (rounding ties), 0.49999999999999994.
+	const SPECIAL_D: [u64; 16] = [
+		0x0000_0000_0000_0000, 0x8000_0000_0000_0000, 0x3ff0_0000_0000_0000, 0xbff0_0000_0000_0000,
+		0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000, 0x7ff8_0000_0000_0000, 0xfff8_0000_0000_0000,
+		0x7ff8_0000_dead_beef, 0x7ff0_0000_0000_0001, 0xfff4_0000_0000_0000, 0x0000_0000_0000_0001,
+		0x7fef_ffff_ffff_ffff, 0x4004_0000_0000_0000, 0xbff8_0000_0000_0000, 0x3fdf_ffff_ffff_ffff,
+	];
+	/// The same for singles (the single's bits, before boxing).
+	const SPECIAL_S: [u32; 16] = [
+		0x0000_0000, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000,
+		0xffc0_0000, 0x7fc0_1234, 0x7f80_0001, 0xffa0_0000, 0x0000_0001, 0x7f7f_ffff, 0x4020_0000,
+		0xbfc0_0000, 0x3eff_ffff,
+	];
+	/// Registers that do NOT hold a properly boxed single (a single op reads
+	/// each as the canonical NaN): a bare single, a double NaN, one bit
+	/// short of a box, a double.
+	const UNBOXED: [u64; 4] = [0x0000_0000_3f80_0000, 0x7ff8_0000_0000_0000, 0xffff_fffe_4020_0000,
+		0x4000_0000_0000_0000];
+	/// Float -> int inputs: halves and near-halves for every rounding mode,
+	/// both sides of every integer range's edges.
+	const CONV_D: [f64; 30] = [0.5, -0.5, 1.5, -2.5, 3.5, -0.3, 0.49999999999999994,
+		-0.49999999999999994, 4503599627370495.5, -4503599627370495.5, 9007199254740991.0,
+		2147483647.0, 2147483647.5, 2147483648.0, -2147483648.0, -2147483648.5, -2147483649.0,
+		4294967295.0, 4294967295.5, 4294967296.0, 9223372036854775808.0, -9223372036854775808.0,
+		9223372036854774784.0, -9223372036854777856.0, 18446744073709549568.0,
+		18446744073709551616.0, -1.0, 1e-310, -1e-310, 1e300];
+	const CONV_S: [f32; 24] = [0.5, -0.5, 1.5, -2.5, 3.5, -0.3, 0.49999997, 8388607.5, -8388607.5,
+		2147483520.0, 2147483648.0, -2147483648.0, -2147483904.0, 4294967040.0, 4294967296.0,
+		9223371487098961920.0, 9223372036854775808.0, -9223372036854775808.0,
+		-9223373136366403584.0, 18446742974197923840.0, 18446744073709551616.0, -1.0, 1e-40, 3e38];
+
 	/// Floats worth comparing: zeros, ones, fractions, large and tiny,
-	/// infinities - and, when `nan`, NaNs (only for ops whose results are
-	/// not NaN floats: a NaN result's payload can differ between the native
-	/// interpreter here and wasm, while production runs both under wasm).
-	fn f64_pick(r: &mut Rng, nan: bool) -> f64 {
+	/// infinities - and NaNs, quiet and signaling (SPECIAL_D): both sides
+	/// canonicalize NaN results, so their payloads no longer differ.
+	fn f64_pick(r: &mut Rng) -> f64 {
 		let v = [0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 3.75, 1e300, -1e-300, 2147483648.0,
 			-2147483649.0, 9.3e18, -9.3e18, 1.8e19, 4294967295.5, f64::INFINITY, f64::NEG_INFINITY];
 		match r.next() % 4 {
-			0 if nan => f64::NAN,
+			0 => f64::from_bits(SPECIAL_D[(r.next() % SPECIAL_D.len() as u64) as usize]),
 			1 => v[(r.next() % v.len() as u64) as usize],
 			_ => ((r.next() % 4_000_000) as f64 - 2_000_000.0) / 1000.0,
 		}
 	}
-	fn f32_bits_pick(r: &mut Rng, nan: bool) -> u64 {
+	/// A register holding a single: NaN-boxed, except one time in eight a
+	/// garbage upper half (the single ops must read the canonical NaN then).
+	fn f32_bits_pick(r: &mut Rng) -> u64 {
 		let v = [0.0f32, -0.0, 1.0, -1.0, 0.5, -2.5, 3.75, 3e38, -1e-38, 2147483648.0,
 			-2147483904.0, 9.3e18, -9.3e18, 1.8e19, 16777217.0, f32::INFINITY, f32::NEG_INFINITY];
-		let f = match r.next() % 4 {
-			0 if nan => f32::NAN,
-			1 => v[(r.next() % v.len() as u64) as usize],
-			_ => ((r.next() % 4_000_000) as f32 - 2_000_000.0) / 1000.0,
+		let bits = match r.next() % 4 {
+			0 => SPECIAL_S[(r.next() % SPECIAL_S.len() as u64) as usize],
+			1 => v[(r.next() % v.len() as u64) as usize].to_bits(),
+			_ => (((r.next() % 4_000_000) as f32 - 2_000_000.0) / 1000.0).to_bits(),
 		};
-		// garbage in the upper half: the single ops must ignore it
-		(r.next() & 0xffff_ffff_0000_0000) | f.to_bits() as u64
+		match r.next() % 8 {
+			0 => (r.next() & 0xffff_fffe_0000_0000) | bits as u64,
+			_ => FP_BOX | bits as u64,
+		}
 	}
 
 	/// Run `ops` (one block at DRAM_BASE) compiled and interpreted from the
@@ -8682,45 +9356,41 @@ mod test_jit_equivalence {
 
 	/// Every float op the translator takes from the table, single and
 	/// double, plus FDIV.D (hot) and the float CSRs: operand values from
-	/// f64_pick / f32_bits_pick, NaN only where the result is not a NaN
-	/// float, fcsr starting from random bits.
+	/// f64_pick / f32_bits_pick (NaNs and improperly boxed singles
+	/// included), fcsr starting from random bits; the conversions' rm is the
+	/// word's 0 (RNE) here - float_special_values_match_the_interpreter
+	/// takes every rm.
 	#[test]
 	fn float_ops_and_float_csrs_match_the_interpreter() {
 		let engine = engine();
 		let mut r = Rng(4242);
-		// (name, NaN operands allowed, single precision)
-		let fops: &[(&str, bool, bool)] = &[
-			("FADD.S", false, true), ("FSUB.S", false, true), ("FMUL.S", false, true),
-			("FDIV.S", false, true), ("FSQRT.S", false, true), ("FSGNJ.S", true, true),
-			("FSGNJN.S", true, true), ("FSGNJX.S", true, true), ("FEQ.S", true, true),
-			("FLT.S", true, true), ("FLE.S", true, true), ("FCVT.W.S", true, true),
-			("FCVT.WU.S", true, true), ("FCVT.L.S", true, true), ("FCVT.LU.S", true, true),
-			("FCVT.S.W", false, true), ("FCVT.S.WU", false, true), ("FCVT.S.L", false, true),
-			("FCVT.S.LU", false, true), ("FMADD.S", false, true), ("FMSUB.S", false, true),
-			("FNMSUB.S", false, true), ("FNMADD.S", false, true), ("FMV.X.W", true, true),
-			("FMV.W.X", false, true), ("FCVT.D.S", false, true),
-			("FSQRT.D", false, false), ("FSGNJN.D", true, false), ("FSGNJX.D", true, false),
-			("FEQ.D", true, false), ("FLT.D", true, false), ("FLE.D", true, false),
-			("FCVT.W.D", true, false), ("FCVT.WU.D", true, false), ("FCVT.L.D", true, false),
-			("FCVT.LU.D", true, false), ("FCVT.D.WU", false, false), ("FCVT.D.L", false, false),
-			("FCVT.D.LU", false, false), ("FMADD.D", false, false), ("FMSUB.D", false, false),
-			("FNMADD.D", false, false), ("FNMSUB.D", false, false), ("FCVT.S.D", false, false),
-			("FDIV.D", false, false),
+		// (name, single precision)
+		let fops: &[(&str, bool)] = &[
+			("FADD.S", true), ("FSUB.S", true), ("FMUL.S", true), ("FDIV.S", true),
+			("FSQRT.S", true), ("FSGNJ.S", true), ("FSGNJN.S", true), ("FSGNJX.S", true),
+			("FEQ.S", true), ("FLT.S", true), ("FLE.S", true), ("FCVT.W.S", true),
+			("FCVT.WU.S", true), ("FCVT.L.S", true), ("FCVT.LU.S", true), ("FCVT.S.W", true),
+			("FCVT.S.WU", true), ("FCVT.S.L", true), ("FCVT.S.LU", true), ("FMV.X.W", true),
+			("FMV.W.X", true), ("FCVT.D.S", true),
+			("FSQRT.D", false), ("FSGNJN.D", false), ("FSGNJX.D", false), ("FEQ.D", false),
+			("FLT.D", false), ("FLE.D", false), ("FCVT.W.D", false), ("FCVT.WU.D", false),
+			("FCVT.L.D", false), ("FCVT.LU.D", false), ("FCVT.D.WU", false), ("FCVT.D.L", false),
+			("FCVT.D.LU", false), ("FCVT.S.D", false), ("FDIV.D", false),
 		];
 		let mut checked = 0;
-		for &(name, nan, single) in fops.iter() {
+		for &(name, single) in fops.iter() {
 			for k in 0..60u64 {
 				let mut cpu = fresh_cpu(&mut Rng(k * 13 + 1));
 				for i in 0..32 {
 					cpu.f[i] = match single {
-						true => f64::from_bits(f32_bits_pick(&mut r, nan)),
-						false => f64_pick(&mut r, nan),
+						true => f64::from_bits(f32_bits_pick(&mut r)),
+						false => f64_pick(&mut r),
 					};
 				}
 				if k % 6 == 0 {
 					// a zero divisor (and FDIV.D's -0.0 case)
 					cpu.f[7] = match (single, k % 12 == 0) {
-						(true, _) => f64::from_bits(r.next() & 0xffff_ffff_0000_0000 | (k % 12 == 0) as u64 * 0x8000_0000),
+						(true, _) => f64::from_bits(FP_BOX | (k % 12 == 0) as u64 * 0x8000_0000),
 						(false, true) => -0.0,
 						(false, false) => 0.0,
 					};
@@ -8761,6 +9431,98 @@ mod test_jit_equivalence {
 			}
 		}
 		assert_eq!(checked, fops.len() * 60 + 6 * 3 * 20);
+	}
+
+	/// The float rules at their edges, translator against interpreter bit
+	/// for bit, fcsr included (fflags start clear, so every flag an op
+	/// raises shows): SPECIAL_D / SPECIAL_S (+ UNBOXED registers) pairwise
+	/// through every translated binary op, rd aliasing rs1 in some cases;
+	/// the unary ops over all of them; the float -> int conversions over
+	/// CONV_D / CONV_S in every static rounding mode; the int -> float
+	/// conversions and FMV over integer edges; FLW/FSW of NaN patterns.
+	#[test]
+	fn float_special_values_match_the_interpreter() {
+		let engine = engine();
+		let mut checked = 0u64;
+		let mut case = |w: u32, setup: &dyn Fn(&mut Cpu), fcsr: u64, what: String| {
+			let mut cpu = fresh_cpu(&mut Rng(checked + 1));
+			setup(&mut cpu);
+			cpu.csr[CSR_FCSR_ADDRESS as usize] = fcsr;
+			let first = decode_op_for_test(&cpu, w);
+			assert!(jit::translatable(&first), "{}", what);
+			let ops = vec![first, op(HOT_ADDI, 29, 5, 0, 1)];
+			same_as_interpreter(&engine, &mut cpu, &ops, &what);
+			checked += 1;
+		};
+		let s_regs: Vec<u64> = SPECIAL_S.iter().map(|&b| FP_BOX | b as u64).chain(UNBOXED.iter().cloned()).collect();
+		let pairs: [(&[&str], &[u64]); 2] = [
+			(&["FADD.D", "FSUB.D", "FMUL.D", "FDIV.D", "FSGNJ.D", "FSGNJN.D", "FSGNJX.D", "FEQ.D",
+				"FLT.D", "FLE.D"], &SPECIAL_D),
+			(&["FADD.S", "FSUB.S", "FMUL.S", "FDIV.S", "FSGNJ.S", "FSGNJN.S", "FSGNJX.S", "FEQ.S",
+				"FLT.S", "FLE.S"], &s_regs),
+		];
+		for &(names, vals) in pairs.iter() {
+			for name in names.iter() {
+				for (i, &a) in vals.iter().enumerate() {
+					for (j, &b) in vals.iter().enumerate() {
+						let rd = if (i + j) % 5 == 0 { 6 } else { 5 };
+						case(word_of(name, rd, 6, 7, 0), &|c: &mut Cpu| {
+							c.f[6] = f64::from_bits(a);
+							c.f[7] = f64::from_bits(b);
+						}, ((i + j) as u64 % 8) << 5, format!("{} {:#x} {:#x}", name, a, b));
+					}
+				}
+			}
+		}
+		// unary ops and float -> int in rounding modes 0-4 (RNE RTZ RDN RUP
+		// RMM; DYN and 5/6 stay with the interpreter, see
+		// translatable_matches_the_emitter)
+		let d_all: Vec<u64> = SPECIAL_D.iter().cloned().chain(CONV_D.iter().map(|v| v.to_bits())).collect();
+		let s_all: Vec<u64> = s_regs.iter().cloned().chain(CONV_S.iter().map(|v| FP_BOX | v.to_bits() as u64)).collect();
+		let unary: [(&[&str], &[&str], &[u64]); 2] = [
+			(&["FSQRT.D", "FCVT.S.D"], &["FCVT.W.D", "FCVT.WU.D", "FCVT.L.D", "FCVT.LU.D"], &d_all),
+			(&["FSQRT.S", "FCVT.D.S", "FMV.X.W"], &["FCVT.W.S", "FCVT.WU.S", "FCVT.L.S", "FCVT.LU.S"], &s_all),
+		];
+		for &(plain, to_int, vals) in unary.iter() {
+			for (i, &a) in vals.iter().enumerate() {
+				let set = |c: &mut Cpu| c.f[6] = f64::from_bits(a);
+				for name in plain.iter() {
+					let rd = if i % 3 == 0 { 6 } else { 5 };
+					case(word_of(name, rd, 6, 0, 0), &set, 0, format!("{} {:#x}", name, a));
+				}
+				for name in to_int.iter() {
+					for rm in 0..5u32 {
+						case(word_of(name, 5, 6, 0, 0) | rm << 12, &set, (i as u64 % 8) << 5,
+							format!("{} rm {} {:#x}", name, rm, a));
+					}
+				}
+			}
+		}
+		// int -> float and the moves in, over integer edges
+		let ints: [i64; 12] = [0, 1, -1, i32::MIN as i64, i32::MAX as i64, u32::MAX as i64, i64::MIN,
+			i64::MAX, (1 << 53) + 1, (1 << 24) + 1, 0x1_0000_0001, 0x7fc0_0001];
+		for name in ["FCVT.S.W", "FCVT.S.WU", "FCVT.S.L", "FCVT.S.LU", "FCVT.D.W", "FCVT.D.WU",
+			"FCVT.D.L", "FCVT.D.LU", "FMV.W.X", "FMV.D.X"].iter()
+		{
+			for &v in ints.iter() {
+				case(word_of(name, 5, 6, 0, 0), &|c: &mut Cpu| c.x[6] = v, 0, format!("{} {:#x}", name, v));
+			}
+		}
+		// FLW boxes whatever single it loads; FSW stores the low 32 bits
+		// raw (no unboxing)
+		for &bits in SPECIAL_S.iter() {
+			case(word_of("FLW", 5, 10, 0, 0), &|c: &mut Cpu| {
+				let at = c.x[10] as u64;
+				c.mmu.store_word(at, bits).ok().unwrap();
+			}, 0, format!("FLW {:#x}", bits));
+		}
+		for &reg in s_regs.iter() {
+			case(word_of("FSW", 0, 10, 7, 0), &|c: &mut Cpu| c.f[7] = f64::from_bits(reg), 0,
+				format!("FSW {:#x}", reg));
+		}
+		let n = 2 * 10 * 400 - 10 * (400 - 256) // the double pairs are 16 x 16
+			+ (2 + 4 * 5) * 46 + (3 + 4 * 5) * 44 + 10 * 12 + 16 + 20;
+		assert_eq!(checked, n as u64);
 	}
 
 	#[test]
