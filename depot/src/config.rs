@@ -140,10 +140,18 @@ fn secret(s: &str) -> Result<String, String> {
     match s.strip_prefix('$') {
         Some(n) => {
             let n = n.trim_start_matches('{').trim_end_matches('}');
-            std::env::var(n).map_err(|_| format!("deployment secret {n} is not set"))
+            std::env::var(n).map_err(|_| format!("{MISSING_SECRET} {n} is not set"))
         }
         None => Ok(s.to_string()),
     }
+}
+
+/// How a config error that names an absent deployment secret begins.
+pub const MISSING_SECRET: &str = "deployment secret";
+
+/// Did loading fail only because a deployment secret has not arrived?
+pub fn missing_secret(e: &str) -> bool {
+    e.starts_with(MISSING_SECRET) && e.ends_with("is not set")
 }
 
 pub fn sha256(b: &[u8]) -> [u8; 32] {

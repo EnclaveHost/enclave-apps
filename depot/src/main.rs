@@ -20,7 +20,53 @@ mod store;
 mod tokens;
 mod witness;
 
+use std::io::{Read, Write};
 use std::time::Duration;
+
+/// A platform host may launch a deployment once without its secrets: the
+/// relay releases them only to the host holding the lease, and the host takes
+/// the lease once the app serves, then relaunches it with them. Serve that
+/// wait and nothing else (storage is not touched): /ping answers, every other
+/// request is told to come back.
+fn wait_for_secrets(why: &str) -> ! {
+    let port = serve::resolve_port(8080);
+    let host = std::env::var("DEPOT_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let listener = match std::net::TcpListener::bind((host.as_str(), port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[depot] bind {host}:{port}: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("[depot] {why}: waiting for this deployment's secrets (storage untouched)");
+    println!(
+        "[depot] {} waiting for its secrets on port {port}",
+        env!("CARGO_PKG_VERSION")
+    );
+    for conn in listener.incoming() {
+        let Ok(mut s) = conn else { continue };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = [0u8; 1024];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let head = &buf[..n];
+        let (status, ctype, body) = if head.starts_with(b"GET /ping ") || head.starts_with(b"HEAD /ping ") {
+            ("200 OK", "text/plain", "ok\n")
+        } else {
+            (
+                "503 Service Unavailable",
+                "application/json",
+                "{\"error\":\"this deployment is waiting for its secrets; try again shortly\"}",
+            )
+        };
+        let resp = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nretry-after: 30\r\ncache-control: no-store\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            if head.starts_with(b"HEAD ") { "" } else { body }
+        );
+        let _ = s.write_all(resp.as_bytes());
+    }
+    std::process::exit(1)
+}
 
 fn main() {
     // DEPOT_PROBE=https://host: one GET over this build's TLS and egress path, for diagnosing storage reachability
@@ -43,6 +89,7 @@ fn main() {
     }
     let cfg = match config::Config::load() {
         Ok(c) => c,
+        Err(e) if config::missing_secret(&e) => wait_for_secrets(&e),
         Err(e) => {
             eprintln!("[depot] configuration: {e}");
             std::process::exit(1);
