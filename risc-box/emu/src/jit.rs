@@ -3429,9 +3429,12 @@ mod test_tier2 {
 ///   address, in another process or another machine, is the same module)
 ///   reuse the cached table index; a module that failed is never retried;
 /// - our budget sits under the host's (modules, attempts, bytes), and the
-///   heat a region must show to be compiled doubles every `heat_doubling`
-///   compiles, so the budget goes to the hottest code first and is never
-///   spent all at once on whatever was warm early;
+///   heat a module must show to be compiled doubles every `escalation_bytes`
+///   of module bytes spent, so the budget goes to the hottest code first and
+///   is never spent all at once on whatever was warm early. It escalates by
+///   BYTES, not modules: a module may hold several regions (packs), and many
+///   small modules must not raise the bar faster than the same code in one;
+///   the module count is only a hard cap;
 /// - a missing verb, an exhausted host quota, a binding failure or a run of
 ///   failed compiles turns compilation off for the life of the process;
 ///   regions already compiled keep running, everything else interprets.
@@ -3460,8 +3463,8 @@ pub mod verb {
 		pub module_budget: u32,
 		pub attempt_budget: u32,
 		pub byte_budget: u64,
-		/// Required heat doubles every this many compiles.
-		pub heat_doubling: u32,
+		/// Required heat doubles every this many module bytes submitted.
+		pub escalation_bytes: u64,
 		/// Consecutive failed compiles that turn compilation off.
 		pub max_consecutive_failures: u32,
 	}
@@ -3475,7 +3478,8 @@ pub mod verb {
 				module_budget: 240,
 				attempt_budget: 960,
 				byte_budget: 15 * 1024 * 1024,
-				heat_doubling: 48,
+				// eight doublings over the byte budget (~1.9 MB each)
+				escalation_bytes: 15 * 1024 * 1024 / 8,
 				max_consecutive_failures: 6,
 			}
 		}
@@ -3515,6 +3519,14 @@ pub mod verb {
 	}
 
 	static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+	impl State {
+		/// What min_heat is multiplied by now: doubled per escalation_bytes
+		/// of module bytes submitted so far.
+		fn heat_mult(&self) -> u64 {
+			1u64 << (self.stats.bytes / self.policy.escalation_bytes.max(1)).min(30)
+		}
+	}
 
 	/// A key for callers that hold module bytes (tests, tools).
 	pub fn bytes_key(module: &[u8]) -> (u64, u64, u64) {
@@ -3614,8 +3626,7 @@ pub mod verb {
 			return Got::Refused;
 		}
 		let p = &s.policy;
-		let shift = (s.stats.compiled / p.heat_doubling.max(1)).min(30);
-		if heat < min_heat.saturating_mul(1u64 << shift) {
+		if heat < min_heat.saturating_mul(s.heat_mult()) {
 			s.stats.refused_heat += 1;
 			return Got::Refused;
 		}
@@ -3707,9 +3718,8 @@ pub mod verb {
 		{
 			return None;
 		}
-		let shift = (s.stats.compiled / p.heat_doubling.max(1)).min(30);
 		Some(Bar {
-			heat_mult: 1u64 << shift,
+			heat_mult: s.heat_mult(),
 			bytes_left: p.byte_budget.min(HOST_MAX_INPUT_BYTES).saturating_sub(s.stats.bytes),
 			max_module_bytes: p.max_module_bytes.min(HOST_MAX_MODULE_BYTES),
 		})
@@ -3866,21 +3876,47 @@ pub mod verb {
 		#[test]
 		fn caches_identical_modules_and_escalates_heat() {
 			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-			reset_for_test(Some(ok), Policy { heat_doubling: 2, ..Policy::default() });
+			reset_for_test(Some(ok), Policy { escalation_bytes: 16, ..Policy::default() });
 			let a = get(b"module-a", 10, 10).expect("compiles at threshold");
 			assert_eq!(get(b"module-a", 0, 10), Some(a), "same bytes reuse, heat irrelevant");
 			assert!(get(b"module-b", 10, 10).is_some());
-			// two compiles spent: the threshold doubled
+			// 16 bytes spent: the threshold doubled
 			assert!(get(b"module-c", 10, 10).is_none(), "below the doubled threshold");
 			assert!(get(b"module-c", 20, 10).is_some());
 			let s = stats();
 			assert_eq!((s.compiled, s.reused, s.refused_heat), (3, 1, 1));
 		}
 
+		/// The bar follows BYTES: eight 100-byte modules raise it exactly as
+		/// far as one 800-byte module, and the module count never raises it.
+		#[test]
+		fn escalation_follows_bytes_not_modules() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			let policy = Policy { escalation_bytes: 300, ..Policy::default() };
+			let mult = |modules: &[Vec<u8>]| {
+				reset_for_test(Some(ok), policy.clone());
+				let mut seen = Vec::new();
+				for m in modules {
+					seen.push(bar().unwrap().heat_mult);
+					assert!(get(m, 1 << 20, 1).is_some());
+				}
+				seen.push(bar().unwrap().heat_mult);
+				seen
+			};
+			let small: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 100]).collect();
+			let one = vec![vec![9u8; 800]];
+			// before each module, and after the last: 0, 100, ..., 800 bytes spent
+			assert_eq!(mult(&small), vec![1, 1, 1, 2, 2, 2, 4, 4, 4]);
+			assert_eq!(mult(&one), vec![1, 4]);
+			// lookup applies the same bar: 800 bytes in, a module needs 4x its min_heat
+			assert!(get(b"next", 39, 10).is_none());
+			assert!(get(b"next", 40, 10).is_some());
+		}
+
 		#[test]
 		fn budget_is_cumulative_and_failures_are_not_retried() {
 			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-			reset_for_test(Some(ok), Policy { module_budget: 2, heat_doubling: 1000, ..Policy::default() });
+			reset_for_test(Some(ok), Policy { module_budget: 2, ..Policy::default() });
 			assert!(get(b"x1", 1, 1).is_some());
 			assert!(get(b"x2", 1, 1).is_some());
 			assert!(get(b"x3", 1, 1).is_none(), "module budget spent");

@@ -1436,7 +1436,7 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
 /// through the platform's enclave:codegen verb and run in place of the
 /// interpreter. On wherever the build has it; RISC_JIT=0 is the off switch
 /// (and the benchmark's A/B), RISC_JIT_FUEL / RISC_JIT_INTERVAL /
-/// RISC_JIT_HEAT tune it. Without the verb, or once its process-wide budget
+/// RISC_JIT_HEAT / RISC_JIT_PACK_* tune it. Without the verb, or once its process-wide budget
 /// is spent, the machine simply keeps interpreting.
 #[cfg(feature = "codegen")]
 fn jit_enable(emu: &mut Emulator) {
@@ -1467,6 +1467,19 @@ fn jit_enable(emu: &mut Emulator) {
     if let Some(v) = num("RISC_JIT_BLOCKS") {
         p.max_blocks = (v as usize).clamp(1, 512);
     }
+    // packed modules: queue target (bytes), deadline (formation passes), hot factor, bytes per pass
+    if let Some(v) = num("RISC_JIT_PACK_TARGET") {
+        p.pack_target_bytes = v as usize;
+    }
+    if let Some(v) = num("RISC_JIT_PACK_WAIT") {
+        p.pack_max_wait = v;
+    }
+    if let Some(v) = num("RISC_JIT_PACK_HOT") {
+        p.pack_hot_factor = v.max(1);
+    }
+    if let Some(v) = num("RISC_JIT_PASS_BYTES") {
+        p.max_pass_bytes = (v as usize).max(4096);
+    }
     p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
     p.chain = !std::env::var("RISC_JIT_CHAIN").map_or(false, |v| v == "0");
     let fuel = p.fuel;
@@ -1488,12 +1501,14 @@ fn jit_json(emu: Option<&Emulator>) -> String {
         ",\"jit\":{{\"calls\":{},\"chained\":{},\"skippedRewritten\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
          \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
          \"volatile\":{},\"formMs\":{:.1},\"packs\":{},\"packedRegions\":{},\"packReused\":{},\
+         \"queued\":{},\"queuedBytes\":{},\"packsFull\":{},\"packsAged\":{},\"packsHot\":{},\"queueStale\":{},\"queueExpired\":{},\
          \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
          \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{},\
          \"codeGen\":{}}}",
         s.calls, s.chained, s.skipped_rewritten, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
         s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
         s.volatile, s.form_us as f64 / 1000.0, s.packs, s.packed_regions, s.pack_reused,
+        s.queued, s.queued_bytes, s.packs_full, s.packs_aged, s.packs_hot, s.queue_stale, s.queue_expired,
         v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
         v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
         v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),
