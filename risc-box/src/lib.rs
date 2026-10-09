@@ -1500,7 +1500,16 @@ fn jit_json(emu: Option<&Emulator>) -> String {
         // the write-snoop generation: each bump (a store to any page holding
         // cached code) drops every predecoded block and every region proof
         emu.map_or(0, |e| e.get_cpu().get_mmu().code_gen()),
-    )
+    ) + &jit_diag_json(emu)
+}
+
+/// RISC_JIT_DIAG=1: the hottest regions and where region calls end (sampled), appended to /status as "jitDiag".
+#[cfg(feature = "codegen")]
+fn jit_diag_json(emu: Option<&Emulator>) -> String {
+    match std::env::var("RISC_JIT_DIAG").map_or(false, |v| v == "1") {
+        true => emu.and_then(|e| e.jit_diag()).map_or(String::new(), |d| format!(",\"jitDiag\":{d}")),
+        false => String::new(),
+    }
 }
 
 #[cfg(not(feature = "codegen"))]

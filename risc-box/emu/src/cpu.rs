@@ -690,6 +690,7 @@ pub struct JitState {
 	window: bool,
 	pub params: JitParams,
 	pub stats: JitStats,
+	diag: JitDiag,
 }
 
 /// Tuning, defaulted for the desktop/browser workloads.
@@ -827,6 +828,21 @@ struct JitRegion {
 	checked: (u32, u32),
 	ok: bool,
 	refs: u32, // slots pointing here
+	/// risc-box patch (diag): calls into this instance, instructions they retired, calls that ran nothing
+	calls: u64,
+	retired: u64,
+	empty: u64,
+}
+
+/// risc-box patch (diag): where region calls end, sampled one call in 64. `kinds`: [at a member block's start (fuel or a
+/// bail at the block's first op), inside a member block (a bail mid-block: TLB miss, MMIO, untranslated op),
+/// outside every member (control left the region)]; `outside`/`bails` count those pcs.
+#[cfg(feature = "codegen")]
+#[derive(Default)]
+struct JitDiag {
+	kinds: [u64; 3],
+	outside: ::fnv::FnvHashMap<u64, u64>,
+	bails: ::fnv::FnvHashMap<u64, u64>,
 }
 
 #[cfg(feature = "codegen")]
@@ -890,7 +906,7 @@ impl JitState {
 		}
 		let r = JitRegion {
 			index, bias, members, pages: Vec::new(), proof_gen: 0, page_gens: Vec::new(), proof_glob: 0, alt: None,
-			checked: (0, 0), ok: false, refs: 0,
+			checked: (0, 0), ok: false, refs: 0, calls: 0, retired: 0, empty: 0,
 		};
 		let rid = match self.free.pop() {
 			Some(rid) => {
@@ -905,6 +921,55 @@ impl JitState {
 		self.instances.insert((index, bias), rid);
 		self.stats.live_regions += 1;
 		rid
+	}
+
+	/// risc-box patch (diag): classify one sampled region exit (see JitDiag).
+	fn diag_exit(&mut self, rid: u32, pc: u64) {
+		let mut kind = 2;
+		for (start, words) in self.regions[rid as usize].members.iter() {
+			let len: u64 = words.iter().map(|w| w.1 as u64).sum();
+			if pc == *start {
+				kind = 0;
+				break;
+			}
+			if pc > *start && pc < start + len {
+				kind = 1;
+				break;
+			}
+		}
+		let d = &mut self.diag;
+		d.kinds[kind] += 1;
+		let map = match kind {
+			2 => &mut d.outside,
+			1 => &mut d.bails,
+			_ => return,
+		};
+		if map.len() < 1 << 14 || map.contains_key(&pc) {
+			*map.entry(pc).or_insert(0) += 1;
+		}
+	}
+
+	/// risc-box patch (diag): the hottest instances by calls, the exit classes and the commonest exit pcs, as JSON.
+	fn diag_json(&self) -> String {
+		let mut regs: Vec<&JitRegion> = self.regions.iter().filter(|r| r.calls > 0).collect();
+		regs.sort_by(|a, b| b.calls.cmp(&a.calls));
+		let top: Vec<String> = regs.iter().take(24).map(|r| {
+			let ops: usize = r.members.iter().map(|m| m.1.len()).sum();
+			format!("[\"{:#x}\",{},{},{},{},{}]", r.members.first().map_or(0, |m| m.0), r.members.len(), ops, r.calls, r.retired, r.empty)
+		}).collect();
+		let hist = |m: &::fnv::FnvHashMap<u64, u64>| {
+			let mut v: Vec<(u64, u64)> = m.iter().map(|(&k, &n)| (k, n)).collect();
+			v.sort_by(|a, b| b.1.cmp(&a.1));
+			let tot: u64 = v.iter().map(|e| e.1).sum();
+			let s: Vec<String> = v.iter().take(30).map(|&(pc, n)| {
+				let slot = ((pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+				let entry = self.slots[slot].tag == pc;
+				format!("[\"{:#x}\",{},{}]", pc, n, entry as u8)
+			}).collect();
+			format!("{{\"distinct\":{},\"total\":{},\"top\":[{}]}}", v.len(), tot, s.join(","))
+		};
+		format!("{{\"kinds\":[{},{},{}],\"regions\":[{}],\"outside\":{},\"bails\":{}}}",
+			self.diag.kinds[0], self.diag.kinds[1], self.diag.kinds[2], top.join(","), hist(&self.diag.outside), hist(&self.diag.bails))
 	}
 
 	/// Drop every installed instance (the layout they were placed under no
@@ -1676,6 +1741,7 @@ impl Cpu {
 			window: false,
 			params,
 			stats: JitStats::default(),
+			diag: JitDiag::default(),
 		}));
 		true
 	}
@@ -1684,6 +1750,12 @@ impl Cpu {
 	#[cfg(feature = "codegen")]
 	pub fn jit_stats(&self) -> Option<JitStats> {
 		self.jit.as_ref().map(|j| j.stats.clone())
+	}
+
+	/// risc-box patch (diag): hottest regions and sampled exit classes/pcs, as JSON (None when the JIT is off).
+	#[cfg(feature = "codegen")]
+	pub fn jit_diag(&self) -> Option<String> {
+		self.jit.as_ref().map(|j| j.diag_json())
 	}
 
 	/// The machine's real layout, as offsets from the Cpu itself (the
@@ -1822,11 +1894,21 @@ impl Cpu {
 		ctx.set(::jit::CTX_BASE, self as *mut Cpu as usize as u64);
 		ctx.set(::jit::CTX_BIAS, bias);
 		let ran = unsafe { ::jit::verb::call(index, fuel, entry) };
+		let pc = self.pc;
 		let j = self.jit.as_deref_mut().unwrap();
 		j.stats.calls += 1;
 		j.stats.retired += ran;
 		if ran == 0 {
 			j.stats.empty_calls += 1;
+		}
+		{
+			let r = &mut j.regions[rid as usize];
+			r.calls += 1;
+			r.retired += ran;
+			r.empty += (ran == 0) as u64;
+		}
+		if j.stats.calls & 63 == 0 {
+			j.diag_exit(rid, pc);
 		}
 		ran
 	}

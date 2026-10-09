@@ -612,6 +612,11 @@ impl Emulator {
 	}
 
 	#[cfg(feature = "codegen")]
+	pub fn jit_diag(&self) -> Option<String> {
+		self.cpu.jit_diag()
+	}
+
+	#[cfg(feature = "codegen")]
 	pub fn jit_stats(&self) -> Option<cpu::JitStats> {
 		self.cpu.jit_stats()
 	}
