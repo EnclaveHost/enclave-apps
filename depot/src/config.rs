@@ -80,6 +80,21 @@ struct Raw {
     witness: Option<Storage>,
 }
 
+/// Config keys the platform owns: the catalog's routing manifest (what a
+/// runner reads before it launches anything) and anything `_`-prefixed, such
+/// as `_media`, the store's tile art. The platform delivers the whole version
+/// config, so these reach the app too.
+const PLATFORM_KEYS: &[&str] = &[
+    "wasi",
+    "threads",
+    "set",
+    "mem64",
+    "gpuOptional",
+    "cpuFallback",
+    "volumes",
+    "egress",
+];
+
 fn keep_days() -> u64 {
     30
 }
@@ -200,7 +215,14 @@ impl Config {
     }
 
     pub fn parse(raw: &str) -> Result<Config, String> {
-        let r: Raw = serde_json::from_str(raw).map_err(|e| format!("config: {e}"))?;
+        let mut v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("config: {e}"))?;
+        // keys the platform stamps into a version's config for its own use
+        // (routing, store art) arrive with it; they are not ours to refuse
+        if let Some(o) = v.as_object_mut() {
+            o.retain(|k, _| !PLATFORM_KEYS.contains(&k.as_str()) && !k.starts_with('_'));
+        }
+        let r: Raw = serde_json::from_value(v).map_err(|e| format!("config: {e}"))?;
         let storage = check_storage(r.storage, r.local_test, "storage")?;
         let witness = match r.witness {
             Some(w) => {
@@ -497,6 +519,21 @@ mod tests {
         assert!(c.is_protected("refs/tags/v1.2.3") && c.is_protected("refs/heads/main"));
         assert_eq!(c.storage.prefix, "depot/");
         assert!(c.witness.is_some() && c.keep == 30 * 86_400);
+    }
+
+    #[test]
+    fn platform_keys_are_ignored_but_typos_are_not() {
+        std::env::set_var("PK_K", "k".repeat(30));
+        let base = format!(
+            r#""storage":{{"endpoint":"https://a.example","bucket":"b","access_key":"$PK_K","secret_key":"$PK_K"}},"master_key":"{}""#,
+            "m".repeat(40)
+        );
+        let with = format!(
+            r#"{{{base},"wasi":"0.2","mem64":false,"_media":{{"thumbnail":"bafy","banner":"bafy2"}},"egress":"public-web"}}"#
+        );
+        assert!(Config::parse(&with).is_ok(), "platform keys ride along");
+        let typo = format!(r#"{{{base},"protcted":["refs/heads/main"]}}"#);
+        assert!(Config::parse(&typo).err().is_some_and(|e| e.contains("protcted")));
     }
 
     #[test]
