@@ -266,6 +266,13 @@ impl App {
 
 impl Handler for App {
     fn plan(&mut self, head: &Head) -> Plan<App> {
+        if !self.ready {
+            return Plan::Respond(
+                Response::text(503, "depot is starting: storage is not reachable yet")
+                    .with("retry-after", "10")
+                    .with("cache-control", "no-store"),
+            );
+        }
         if let Some((repo, op)) = git_route(&head.path) {
             return match (op, head.method.as_str()) {
                 (GitOp::InfoRefs, "GET") => Plan::Respond(self.info_refs(head, &repo)),

@@ -11,7 +11,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-const IO_TIMEOUT: Duration = Duration::from_secs(60);
+pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_HEAD: usize = 64 * 1024;
 
 pub struct Response {

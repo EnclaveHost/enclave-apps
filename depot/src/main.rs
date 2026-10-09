@@ -23,6 +23,56 @@ mod witness;
 use std::io::{Read, Write};
 use std::time::Duration;
 
+/// One attempt to open the bucket: the registry and the token book, which
+/// also proves the master key. A key that cannot open what is stored, or a
+/// format from a newer server, ends the process (it would never get better);
+/// anything else (storage or its route not there yet) is retried with backoff.
+fn open_storage(app: &mut app::App, attempt: &mut u32, next_try: &mut std::time::Instant) {
+    let quick = |app: &mut app::App, q: bool| {
+        app.store.s3.set_quick(q);
+        if let Some(w) = &mut app.store.witness {
+            w.s3.set_quick(q);
+        }
+    };
+    quick(app, true);
+    let r = app
+        .refresh_registry(true)
+        .and_then(|_| app.tokens.refresh(&mut app.store, true));
+    quick(app, false);
+    match r {
+        Ok(()) => {
+            app.ready = true;
+            println!(
+                "[depot] storage open: {} repositories",
+                app.reg.repos.len()
+            );
+        }
+        // storage is older than the witness: serve, refusing what is
+        // affected, so an admin can look and decide (POST /api/witness)
+        Err(e) if app.store.witness.as_ref().is_some_and(|w| !w.rolled.is_empty()) => {
+            eprintln!("[depot] ROLLBACK DETECTED: {e}");
+            app.ready = true;
+        }
+        Err(e)
+            if e.contains("cannot open a stored object")
+                || e.contains("does not parse")
+                || e.contains("newer than this server") =>
+        {
+            eprintln!("[depot] cannot open the registry: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            *attempt += 1;
+            let wait = Duration::from_secs((1u64 << (*attempt).min(4)).min(15));
+            eprintln!(
+                "[depot] storage not ready ({e}); retrying in {}s",
+                wait.as_secs()
+            );
+            *next_try = std::time::Instant::now() + wait;
+        }
+    }
+}
+
 /// A platform host may launch a deployment once without its secrets: the
 /// relay releases them only to the host holding the lease, and the host takes
 /// the lease once the app serves, then relaunches it with them. Serve that
@@ -120,29 +170,10 @@ fn main() {
         }
     }
     let mut app = app::App::new(cfg, store);
-    // storage must answer (and the master key must open the registry) before we serve
-    for attempt in 0.. {
-        match app
-            .refresh_registry(true)
-            .and_then(|_| app.tokens.refresh(&mut app.store, true))
-        {
-            Ok(()) => break,
-            // storage is older than the witness: serve, refusing what is
-            // affected, so an admin can look and decide (POST /api/witness)
-            Err(e) if app.store.witness.as_ref().is_some_and(|w| !w.rolled.is_empty()) => {
-                eprintln!("[depot] ROLLBACK DETECTED: {e}");
-                break;
-            }
-            Err(e) if attempt < 5 => {
-                eprintln!("[depot] storage not ready ({e}); retrying");
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            Err(e) => {
-                eprintln!("[depot] cannot open the registry: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
+    // The port opens first and storage is reached from the loop: a platform
+    // host waits only so long for the port, and a host may only route this
+    // deployment's egress (its way to storage) once it serves. Until storage
+    // answers, every request is told to come back (see routes.rs).
     let mut server: serve::Server<app::App> =
         match serve::Server::bind(concat!("depot/", env!("CARGO_PKG_VERSION")), 8080) {
             Ok(s) => s,
@@ -152,16 +183,20 @@ fn main() {
             }
         };
     println!(
-        "[depot] {} listening on port {} ({} repositories, bucket {})",
+        "[depot] {} listening on port {}, opening bucket {}",
         env!("CARGO_PKG_VERSION"),
         server.port,
-        app.reg.repos.len(),
         app.cfg.storage.bucket
     );
+    let mut attempt = 0u32;
+    let mut next_try = std::time::Instant::now();
     loop {
+        if !app.ready && std::time::Instant::now() >= next_try {
+            open_storage(&mut app, &mut attempt, &mut next_try);
+        }
         let busy = server.step(&mut app);
         // maintenance only in the gaps between requests
-        let worked = !busy && (hooks::tick(&mut app) || maint::tick(&mut app));
+        let worked = !busy && app.ready && (hooks::tick(&mut app) || maint::tick(&mut app));
         if !busy && !worked {
             std::thread::sleep(Duration::from_millis(if server.connections() > 0 {
                 2

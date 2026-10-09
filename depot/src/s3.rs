@@ -18,6 +18,9 @@ pub struct S3 {
     pub calls: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// one try per call, on a short timeout: while the server is starting it
+    /// must get back to answering requests between attempts
+    quick: bool,
 }
 
 pub enum Cond<'a> {
@@ -126,7 +129,18 @@ impl S3 {
             calls: 0,
             bytes_in: 0,
             bytes_out: 0,
+            quick: false,
         })
+    }
+
+    /// Single, short attempts (startup) or the normal retrying ones.
+    pub fn set_quick(&mut self, quick: bool) {
+        self.quick = quick;
+        self.client.timeout = if quick {
+            Duration::from_secs(8)
+        } else {
+            crate::client::IO_TIMEOUT
+        };
     }
 
     pub fn connects(&self) -> u64 {
@@ -233,7 +247,7 @@ impl S3 {
         };
         let payload = hex(&Sha256::digest(body));
         let mut last = String::new();
-        let attempts = if idempotent { 5u32 } else { 1 };
+        let attempts = if idempotent && !self.quick { 5u32 } else { 1 };
         for attempt in 0..attempts {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(250 * (1 << attempt.min(4)) as u64));

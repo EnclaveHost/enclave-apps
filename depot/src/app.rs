@@ -142,6 +142,9 @@ impl ObjCache {
 }
 
 pub struct App {
+    /// storage is open (the registry read, the key proven); until then
+    /// requests are refused with 503
+    pub ready: bool,
     pub cfg: Config,
     pub store: Store,
     pub reg: Registry,
@@ -182,6 +185,7 @@ impl App {
     pub fn new(cfg: Config, store: Store) -> App {
         let budget = (cfg.cache_mb / 4).max(16) << 20;
         App {
+            ready: false,
             cfg,
             store,
             reg: Registry::default(),
