@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" role="img" aria-labelledby="title desc">
+  <title id="title">Depot — Your source, sealed.</title>
+  <desc id="desc">A dark navy banner with periwinkle typography; a commit graph of branches and merges runs into a padlock.</desc>
+  <defs>
+    <radialGradient id="ambient" cx="78%" cy="50%" r="65%">
+      <stop offset="0" stop-color="#172846"/>
+      <stop offset="1" stop-color="#080d14"/>
+    </radialGradient>
+    <linearGradient id="track" x1="800" x2="1600" y1="0" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8fb4ff" stop-opacity="0"/>
+      <stop offset=".45" stop-color="#8fb4ff" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#8fb4ff" stop-opacity=".12"/>
+    </linearGradient>
+    <linearGradient id="face" x1="1100" y1="60" x2="1400" y2="340" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#16243a"/>
+      <stop offset="1" stop-color="#0b1320"/>
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0 H0 V48" fill="none" stroke="#8fb4ff" stroke-opacity=".035"/>
+    </pattern>
+  </defs>
+  <rect width="1600" height="400" fill="url(#ambient)"/>
+  <rect width="1600" height="400" fill="url(#grid)"/>
+  <g fill="none" stroke="#8fb4ff">
+    <circle cx="1240" cy="200" r="188" stroke-opacity=".10"/>
+    <circle cx="1240" cy="200" r="232" stroke-opacity=".07"/>
+    <circle cx="1240" cy="200" r="282" stroke-opacity=".04"/>
+  </g>
+  <g fill="none" stroke="url(#track)" stroke-width="2.5">
+    <path d="M800 200 H1600"/>
+    <path d="M860 200 C900 200 905 120 950 120 H1010 C1050 120 1055 200 1095 200"/>
+    <path d="M900 200 C935 200 940 282 980 282 H1040 C1072 282 1080 200 1110 200"/>
+    <path d="M1380 200 C1410 200 1416 132 1450 132 H1600"/>
+  </g>
+  <g fill="#8fb4ff">
+    <circle cx="842" cy="200" r="5"/>
+    <circle cx="960" cy="120" r="5"/>
+    <circle cx="1000" cy="120" r="5"/>
+    <circle cx="1010" cy="282" r="4"/>
+    <circle cx="1470" cy="132" r="5"/>
+    <circle cx="1530" cy="200" r="4"/>
+  </g>
+  <circle cx="1240" cy="200" r="139" fill="url(#face)" stroke="#2c4166"/>
+  <g transform="translate(1110 70) scale(2.7083333)">
+    <path d="M31 40 V29 A17 17 0 0 1 65 29 V40" fill="none" stroke="#8fb4ff" stroke-width="5" stroke-linecap="round"/>
+    <rect x="17" y="38" width="62" height="48" rx="11" fill="#0f1a2b" stroke="#8fb4ff" stroke-width="3.5"/>
+    <path d="M37 50 V76" stroke="#dbe6ff" stroke-width="3.2" stroke-linecap="round"/>
+    <path d="M60 55 C60 67 37 62 37 72" fill="none" stroke="#8fb4ff" stroke-width="3.2" stroke-linecap="round"/>
+    <circle cx="37" cy="50" r="4" fill="#dbe6ff"/>
+    <circle cx="60" cy="52" r="4" fill="#8fb4ff"/>
+    <circle cx="37" cy="77" r="4" fill="#dbe6ff"/>
+  </g>
+  <g font-family="ui-monospace, 'DejaVu Sans Mono', monospace">
+    <text x="96" y="118" fill="#8fb4ff" font-size="22" letter-spacing="6">ENCLAVE / DEPOT</text>
+  </g>
+  <g font-family="system-ui, 'DejaVu Sans', sans-serif">
+    <text x="92" y="214" fill="#e3eaf2" font-size="64" font-weight="700" letter-spacing="-1.5">Your source, sealed.</text>
+    <text x="96" y="272" fill="#93a4b6" font-size="26">A git server in an attested enclave. Packs, refs and</text>
+    <text x="96" y="308" fill="#93a4b6" font-size="26">names are encrypted before they reach your bucket.</text>
+  </g>
+</svg>

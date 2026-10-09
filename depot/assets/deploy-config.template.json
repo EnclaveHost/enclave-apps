@@ -1,0 +1,19 @@
+{
+  "title": "Enclave source",
+  "storage": {
+    "endpoint": "https://ACCOUNT_ID.r2.cloudflarestorage.com",
+    "region": "auto",
+    "bucket": "enclave-depot",
+    "prefix": "depot/",
+    "access_key": "$DEPOT_R2_ACCESS_KEY",
+    "secret_key": "$DEPOT_R2_SECRET_KEY"
+  },
+  "master_key": "$DEPOT_MASTER_KEY",
+  "users": {
+    "admin": { "token": "$DEPOT_ADMIN_TOKEN", "admin": true }
+  },
+  "protected": ["refs/heads/main", "refs/tags/v*"],
+  "default_branch": "main",
+  "max_push_mb": 1024,
+  "cache_mb": 256
+}
