@@ -124,6 +124,15 @@ class Env:
         else:
             die("minio did not come up")
         self.s3curl("PUT", f"/{BUCKET}")
+        self.depot_s3 = self.s3
+        if self.args.flaky_storage:
+            port = free_port()
+            self.flaky_log = os.path.join(self.work, "flaky.log")
+            self.procs.append(subprocess.Popen(
+                [sys.executable, os.path.join(ROOT, "tests/flaky_s3.py"), str(port), f"127.0.0.1:{self.s3_port}", "3"],
+                stdout=open(self.flaky_log, "w")))
+            time.sleep(0.4)
+            self.depot_s3 = f"http://127.0.0.1:{port}"
 
     def s3curl(self, method, path, out=None):
         cmd = ["curl", "-s", "-X", method, "--aws-sigv4", "aws:amz:us-east-1:s3", "--user", f"{AK}:{SK}",
@@ -163,7 +172,7 @@ class Env:
     # ---- depot -----------------------------------------------------------
     def config(self, extra=None):
         c = {
-            "storage": {"endpoint": self.s3, "region": "us-east-1", "bucket": BUCKET, "prefix": "depot/",
+            "storage": {"endpoint": self.depot_s3, "region": "us-east-1", "bucket": BUCKET, "prefix": "depot/",
                         "access_key": "$E2E_AK", "secret_key": "$E2E_SK"},
             "master_key": "$E2E_MASTER",
             "local_test": True,
@@ -349,6 +358,8 @@ def main():
     ap.add_argument("--mirror", help="also push and clone this repository's refs")
     ap.add_argument("--mem", type=int, default=2048, help="guest memory MiB")
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--flaky-storage", action="store_true",
+                    help="every third conditional write commits but its reply is lost (dropped or 500)")
     ap.add_argument("--platform", action="store_true",
                     help="storage through a SOCKS5 egress front, git through a Node gateway like the platform's")
     args = ap.parse_args()
@@ -506,9 +517,26 @@ def run(env, args):
     env.git("checkout", "-q", "-b", "scratch", cwd=src)
     env.git("commit", "-q", "--allow-empty", "-m", "scratch", cwd=src)
     env.git("push", "-q", env.url("w/repo", "writer"), "scratch", cwd=src)
+    gone = env.git("rev-parse", "HEAD", cwd=src).stdout.strip()
     env.git("reset", "-q", "--hard", "HEAD~2", cwd=src)
     env.git("push", "-q", "-f", env.url("w/repo", "writer"), "scratch", cwd=src)
     ok("force push to an unprotected branch")
+    # what the force push left behind is stored but no longer servable
+    probe = os.path.join(W, "probe-gone")
+    env.git("init", "-q", probe)
+    for proto in ["2", "0"]:
+        r = env.git("-c", f"protocol.version={proto}", "fetch", env.url("w/repo", "reader"), gone, cwd=probe, check=False)
+        if r.returncode == 0:
+            die(f"v{proto}: a commit no ref reaches was fetchable")
+    st, _ = env.api(f"/api/commit?repo=w/repo&id={gone}", "reader")
+    st2, _ = env.api(f"/api/tree?repo=w/repo&ref={gone}", "reader")
+    if st != 404 or st2 != 404:
+        die(f"the web API served an unreachable commit ({st}, {st2})")
+    ok("objects only a deleted history reaches are refused (v2, v0, web API)")
+    r = env.git("push", env.url("w/repo", "writer"), "HEAD:refs/heads/main/sub", cwd=src, check=False)
+    if r.returncode == 0 or "coexist" not in r.stderr:
+        die(f"a ref beneath an existing ref was accepted: {r.stderr}")
+    ok("a ref beneath an existing branch is refused (directory/file conflict)")
     r = env.git("push", "-f", env.url("w/repo", "writer"), "scratch:main", cwd=src, check=False)
     if r.returncode == 0 or "protected" not in r.stderr:
         die(f"force push to protected main was not refused: {r.stderr}")
@@ -863,6 +891,12 @@ def run(env, args):
         if relayed < 2:
             die("storage traffic did not go through the egress front")
         ok(f"storage reached through the SOCKS5 egress front ({relayed} connections)")
+
+    if args.flaky_storage:
+        lost = open(env.flaky_log).read().count("lost")
+        if lost < 5:
+            die(f"the flaky store lost only {lost} replies; the run did not exercise read-back")
+        ok(f"{lost} committed writes lost their replies; nothing was lost or applied twice")
 
     if args.mirror:
         mirror(env, args.mirror)

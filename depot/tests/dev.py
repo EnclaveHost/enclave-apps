@@ -17,7 +17,7 @@ ap.add_argument("--wasm", default=os.path.join(e2e.ROOT, "target/wasm32-wasip2/r
 ap.add_argument("--workdir", default=None)
 ap.add_argument("--port", type=int, default=0)
 a = ap.parse_args()
-a.native = a.keep = a.platform = False
+a.native = a.keep = a.platform = a.flaky_storage = False
 a.mirror = None
 a.mem = 2048
 env = e2e.Env(a)

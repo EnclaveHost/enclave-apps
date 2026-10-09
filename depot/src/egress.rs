@@ -14,12 +14,14 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-/// Connect to `host:port` — through the SOCKS front when one is configured.
-/// `host` may be a name (S3 endpoint) or an IP in text form (guest NAT).
-pub fn dial(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream, String> {
+/// Connect to `host:port`, through the SOCKS front when one is configured.
+/// `host` may be a name (S3 endpoint) or an IP in text form. The egress
+/// handshake (and, through the front, the upstream connect) is bounded by
+/// `handshake`; a direct connect is left to the platform.
+pub fn dial_bounded(host: &str, port: u16, handshake: Duration) -> Result<TcpStream, String> {
     match std::env::var("ENCLAVE_EGRESS") {
-        Ok(url) if !url.is_empty() => socks_connect(&url, host, port, timeout),
-        _ => direct(host, port, timeout),
+        Ok(url) if !url.is_empty() => socks_connect(&url, host, port, Some(handshake)),
+        _ => direct(host, port, None),
     }
 }
 

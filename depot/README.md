@@ -26,7 +26,8 @@ zlib and the AEAD as the only dependencies.
 | Negotiation | full have/ACK/ready, so an incremental fetch sends only what is new; thin packs; `include-tag`; `ofs-delta` |
 | Shallow | `--depth`, `--deepen`, `--unshallow`, `--shallow-since`, `--shallow-exclude` |
 | Push | `report-status`, `side-band-64k` progress, `atomic`, `delete-refs`, `quiet`, `push-options` (accepted, ignored) |
-| Checks on push | pack checksum, SHA-1 with collision detection (SHAttered-style objects refused), full connectivity with type checks, branch tips are commits, protected refs only fast-forward and are never deleted, every command's old value re-checked when it commits |
+| Checks on push | pack checksum, SHA-1 with collision detection (SHAttered-style objects refused), no object twice in one pack, full connectivity with type checks, branch tips are commits, no ref beneath another (`a` and `a/b`), protected refs only fast-forward and are never deleted, every command's old value re-checked when it commits |
+| Reading | only objects some ref reaches: history a force push or a deleted branch left behind stays in the stored packs (repacking copies packs whole; there is no garbage collection yet), but no fetch, shallow request or web view serves it |
 | Not supported | partial-clone filters (`--filter`), Git LFS, SHA-256 repositories, signed pushes, the dumb HTTP protocol |
 
 Measured on the platform's wasm build against a local MinIO: the full
@@ -63,7 +64,9 @@ segments (`enclave`, `team/tool`); the URL is `https://<host>/<name>.git`.
 `POST /api/tokens {"user","read":[patterns],"write":[patterns],"admin",
 "note","expires_days"}`. The token (`dpt_…`) is shown once; only its SHA-256
 is stored, sealed in the bucket. Revoke with `DELETE /api/tokens?id=…`;
-revocation is immediate. Users listed in the app config work alongside.
+revocation takes effect at once on this server and within seconds on any
+other sharing the bucket (see *Integrity, not freshness* for the one caveat).
+Users listed in the app config work alongside.
 
 **Patterns** in `read`, `write` and `public` are globs where `*` matches
 anything, `/` included: `*`, `enclave`, `team/*`.
@@ -176,8 +179,19 @@ a reference left unsubstituted is read from the environment.
   sharing a bucket cannot lose each other's pushes, and each sees the other's
   within two seconds.
 - **Integrity, not freshness.** Authentication detects any alteration. A
-  storage operator replaying an *older* valid manifest is caught only while
-  the server remembers a newer revision (within one process lifetime).
+  storage operator replaying an *older* valid manifest, registry or token
+  book is caught only while the server remembers a newer revision (within one
+  process lifetime). After a restart, such a replay could roll refs back,
+  re-publish a repository made private, or bring back a revoked token. If the
+  bucket's operator is not trusted with that, rotate the token too
+  (`DELETE` it, and replace any secret it guarded).
+- **Writes that may or may not have landed.** The registry, the token book and
+  every manifest carry a fresh writer nonce. A conditional write is sent
+  exactly once. When its reply is lost or refused, the server reads the
+  object back, and its own nonce there means success. A pack is deleted only
+  when a fresh manifest provably does not list it; anything uncertain is left
+  to the orphan sweep. `tests/e2e.py --flaky-storage` runs the whole suite
+  through a store that drops the reply to every third committed write.
 - **Who can read it.** Whoever holds the master key. On enclave.host that is
   the deployment's secret store (operator-readable by design; see the
   platform's secrets documentation) and the running enclave. The bucket
@@ -202,6 +216,15 @@ a reference left unsubstituted is read from the environment.
   flight.
 - **Status.** `GET /api/status` (admin) reports loaded repositories, cache hit
   rates, storage calls and bytes, traffic, maintenance and webhooks.
+- **Limits that protect the server.** An upload-pack request body is at most
+  8 MiB, and is read only after the caller is known to have read access;
+  every buffered request body together is capped at 96 MiB. A push carries at
+  most 10 million objects, and no implausible swarm of tiny ones, and its
+  bookkeeping counts against the push budget. The web view serves a single
+  file up to 32 MiB, streamed, under a 256 MiB budget for all files in flight;
+  clone the repository for anything larger. Wants, haves and shallow lines
+  are at most 200,000 per request, and each is checked in constant time
+  against a reachability set computed once per repository revision.
 - **Memory.** Each repository's object index and graph stay in memory (the
   enclave repository, 73,784 objects: about 65 MB). A push holds its pack in
   8 MiB segments plus a delta-resolution cache of up to 256 MiB while it is
@@ -220,8 +243,9 @@ a reference left unsubstituted is read from the environment.
 ```sh
 cargo test                                            # unit tests (native)
 cargo build --release --target wasm32-wasip2          # target/wasm32-wasip2/release/depot.wasm
-python3 tests/e2e.py                                  # real git + wasmtime + MinIO, 43 checks
+python3 tests/e2e.py                                  # real git + wasmtime + MinIO, 46 checks
 python3 tests/e2e.py --platform                       # through a Node gateway like the platform's, storage via a SOCKS5 egress front
+python3 tests/e2e.py --flaky-storage                  # every third committed write loses its reply (dropped or 500)
 python3 tests/e2e.py --mirror ~/src/big-repo          # also mirror a real repository and clone it back
 python3 tests/fuzz.py --rounds 800 --seed 2           # malformed requests at every endpoint; the server must survive
 python3 tests/dev.py                                  # a local server with sample repositories, to look at

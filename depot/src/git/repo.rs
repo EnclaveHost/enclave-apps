@@ -120,6 +120,9 @@ impl Index {
                     .ok_or("index names a delta base it does not hold")?,
                 None => NONE,
             };
+            if base == i as u32 {
+                return Err(format!("index stores {} as a delta on itself", e.oid));
+            }
             let start = self.arena.len() as u32;
             for (_, c) in &e.children {
                 match self.lookup(c) {

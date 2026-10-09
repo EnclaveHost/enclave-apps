@@ -27,6 +27,10 @@ pub fn now() -> u64 {
 }
 
 pub struct Repo {
+    /// the index may not match the manifest (a re-index failed): rebuild it
+    pub stale: bool,
+    /// what readers may fetch, for one (revision, index size)
+    pub reach_cache: Option<((u64, usize), Rc<crate::git::walk::Bits>)>,
     pub name: String,
     pub m: Manifest,
     pub etag: Option<String>,
@@ -36,12 +40,31 @@ pub struct Repo {
 }
 
 impl Repo {
-    pub fn view(&self) -> crate::git::upload::View<'_> {
+    pub fn view<'a>(&'a self, reach: &'a crate::git::walk::Bits) -> crate::git::upload::View<'a> {
         crate::git::upload::View {
             ix: &self.ix,
             refs: &self.refs,
             head: &self.m.head,
+            reach,
         }
+    }
+
+    /// Every object reachable from the refs, computed once per revision.
+    pub fn reach(&mut self) -> Rc<crate::git::walk::Bits> {
+        let key = (self.m.rev, self.ix.len());
+        if let Some((k, b)) = &self.reach_cache {
+            if *k == key {
+                return b.clone();
+            }
+        }
+        let tips: Vec<u32> = self
+            .refs
+            .values()
+            .filter_map(|o| self.ix.lookup(o))
+            .collect();
+        let b = Rc::new(crate::git::walk::closure(&self.ix, &tips));
+        self.reach_cache = Some((key, b.clone()));
+        b
     }
     pub fn bytes(&self) -> u64 {
         self.m.packs.iter().map(|p| p.len).sum()
@@ -124,6 +147,8 @@ pub struct App {
     pub maint: crate::maint::State,
     pub tokens: crate::tokens::Tokens,
     pub push_budget: crate::push::Budget,
+    pub raw_budget: crate::push::Budget,
+    held: HashMap<String, std::rc::Weak<PackInfo>>,
     pub hooks: crate::hooks::Queue,
 }
 
@@ -162,6 +187,8 @@ impl App {
             maint: Default::default(),
             tokens: crate::tokens::Tokens::new(),
             push_budget: Default::default(),
+            raw_budget: Default::default(),
+            held: HashMap::new(),
             hooks: Default::default(),
         }
     }
@@ -262,6 +289,8 @@ impl App {
         self.repos.insert(
             id.to_string(),
             Repo {
+                stale: false,
+                reach_cache: None,
                 name: name.to_string(),
                 m,
                 etag,
@@ -273,11 +302,26 @@ impl App {
         Ok(())
     }
 
+    /// The index no longer matches what storage holds: rebuild it on the
+    /// next look (the manifest is read whole, not conditionally).
+    pub fn mark_stale(&mut self, id: &str) {
+        if let Some(r) = self.repos.get_mut(id) {
+            r.stale = true;
+            r.etag = None;
+        }
+    }
+
+    /// Is this pack still read by a fetch in flight (it holds the record)?
+    pub fn held(&mut self, pack: &str) -> bool {
+        self.held.retain(|_, w| w.strong_count() > 0);
+        self.held.contains_key(pack)
+    }
+
     pub fn revalidate(&mut self, id: &str, force: bool) -> Result<(), String> {
         let Some(r) = self.repos.get(id) else {
             return Err("repository not loaded".into());
         };
-        if !force && r.checked.elapsed() < REVALIDATE {
+        if !force && !r.stale && r.checked.elapsed() < REVALIDATE {
             return Ok(());
         }
         let etag = r.etag.clone();
@@ -309,19 +353,30 @@ impl App {
         let prefix_kept =
             m.packs.len() >= old.len() && m.packs.iter().zip(&old).all(|(a, b)| a.id == *b);
         let refs = parse_refs(&m)?;
-        if prefix_kept {
-            let add: Vec<crate::store::PackMeta> = m.packs[old.len()..].to_vec();
-            for p in add {
-                let entries = self.store.get_idx(id, &p.id)?;
-                self.repos
-                    .get_mut(id)
-                    .unwrap()
-                    .ix
-                    .add_pack(pack_info(&p), &entries)?;
+        if prefix_kept && !r.stale {
+            // read every new index first: a storage failure changes nothing
+            let mut add = Vec::new();
+            for p in &m.packs[old.len()..] {
+                add.push((pack_info(p), self.store.get_idx(id, &p.id)?));
+            }
+            let r = self.repos.get_mut(id).unwrap();
+            for (info, entries) in add {
+                if let Err(e) = r.ix.add_pack(info, &entries) {
+                    r.stale = true;
+                    return Err(e);
+                }
             }
         } else {
             let ix = self.build_index(id, &m)?;
-            self.repos.get_mut(id).unwrap().ix = ix;
+            let r = self.repos.get_mut(id).unwrap();
+            // packs leaving the index may still be read by fetches in flight
+            for p in &r.ix.packs {
+                if !m.packs.iter().any(|x| x.id == p.id) {
+                    self.held.insert(p.id.clone(), Rc::downgrade(p));
+                }
+            }
+            r.ix = ix;
+            r.stale = false;
         }
         let r = self.repos.get_mut(id).unwrap();
         r.m = m;

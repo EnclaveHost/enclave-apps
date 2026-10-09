@@ -116,8 +116,10 @@ pub fn plan(ix: &Index, spec: &Spec) -> Result<Plan, String> {
 
     // --- shallow boundary ---------------------------------------------------
     let mut graft = Bits::new(n); // commits whose parents the walk must not cross
+    let mut cshallow = Bits::new(n);
     for &s in &spec.client_shallow {
         graft.set(s);
+        cshallow.set(s);
     }
     let mut shallow_out = Vec::new();
     let mut unshallow = Vec::new();
@@ -158,7 +160,7 @@ pub fn plan(ix: &Index, spec: &Spec) -> Result<Plan, String> {
         for c in boundary {
             if !not_shallow.get(c) {
                 graft.set(c);
-                if !spec.client_shallow.contains(&c) {
+                if !cshallow.get(c) {
                     shallow_out.push(c);
                 }
             }
@@ -194,7 +196,7 @@ pub fn plan(ix: &Index, spec: &Spec) -> Result<Plan, String> {
             if parents(ix, c).any(|p| p == NONE || !inc.get(p)) && parents(ix, c).next().is_some() {
                 not_shallow.clear(c);
                 graft.set(c);
-                if !spec.client_shallow.contains(&c) {
+                if !cshallow.get(c) {
                     shallow_out.push(c);
                 }
             }
@@ -354,6 +356,21 @@ pub fn plan(ix: &Index, spec: &Spec) -> Result<Plan, String> {
     })
 }
 
+/// Every object reachable from `tips` (the refs): exactly what a reader may
+/// fetch. Unreachable objects (a force-pushed-away commit, a deleted branch)
+/// stay stored until a repack drops them, and must not be served.
+pub fn closure(ix: &Index, tips: &[u32]) -> Bits {
+    let mut b = Bits::new(ix.len());
+    let mut st: Vec<u32> = tips.iter().copied().filter(|&t| t != NONE).collect();
+    while let Some(x) = st.pop() {
+        if !b.set(x) {
+            continue;
+        }
+        st.extend(ix.kids(x).iter().copied().filter(|&k| k != NONE));
+    }
+    b
+}
+
 /// Negotiation's "ready": every wanted commit reaches a common commit (or a
 /// parent of one), so a pack can be cut. Memoized over the whole walk.
 pub fn ready(ix: &Index, wants: &[u32], common: &[u32]) -> bool {
@@ -439,7 +456,8 @@ pub fn is_ancestor(ix: &Index, old: u32, new: u32) -> bool {
     false
 }
 
-/// Is `x` reachable from any of `tips`? (wants of unadvertised objects)
+/// Is `x` reachable from any of `tips`?
+#[cfg(test)]
 pub fn reachable(ix: &Index, tips: &[u32], x: u32) -> bool {
     let target_commit = ix.obj(x).kind == Kind::Commit;
     let mut seen = Bits::new(ix.len());

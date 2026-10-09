@@ -27,7 +27,7 @@ ap.add_argument("--rounds", type=int, default=400)
 ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--workdir", default=None)
 a = ap.parse_args()
-a.native = a.keep = a.platform = False
+a.native = a.keep = a.platform = a.flaky_storage = False
 a.mirror = None
 a.mem = 2048
 a.wasm = os.path.join(e2e.ROOT, "target/wasm32-wasip2/release/depot.wasm")

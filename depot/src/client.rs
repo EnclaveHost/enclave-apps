@@ -147,7 +147,7 @@ impl Client {
 
     fn connect(&mut self) -> Result<Wire, String> {
         self.connects += 1;
-        let sock = crate::egress::dial(&self.host, self.port, None)?;
+        let sock = crate::egress::dial_bounded(&self.host, self.port, self.timeout)?;
         let _ = sock.set_read_timeout(Some(self.timeout));
         let _ = sock.set_write_timeout(Some(self.timeout));
         let _ = sock.set_nodelay(true);
@@ -167,12 +167,26 @@ impl Client {
         self.wire = None;
     }
 
+    /// Send one request. A request that is not idempotent (a conditional
+    /// write) is never sent twice: when its outcome is unknown the error says
+    /// so, and the caller reads back what the store holds.
     pub fn send(
         &mut self,
         method: &str,
         target: &str,
         headers: &[(String, String)],
         body: &[u8],
+    ) -> Result<Response, String> {
+        self.send_once(method, target, headers, body, true)
+    }
+
+    pub fn send_once(
+        &mut self,
+        method: &str,
+        target: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        resend_on_stale: bool,
     ) -> Result<Response, String> {
         self.requests += 1;
         let mut head = format!(
@@ -203,7 +217,7 @@ impl Client {
                     return Ok(resp);
                 }
                 Err((e, got_bytes)) => {
-                    if reused && !got_bytes && attempt == 0 {
+                    if resend_on_stale && reused && !got_bytes && attempt == 0 {
                         continue; // the idle connection was gone: once more, fresh
                     }
                     return Err(e);
@@ -366,10 +380,14 @@ fn read_chunked(
                 fill(&mut buf, w)?;
             }
         }
-        if out.len() + n > max {
+        if n > max || out.len() > max - n {
             return Err(("storage response too large".into(), true));
         }
-        while buf.len() < pos + n + 2 {
+        let need = pos
+            .checked_add(n)
+            .and_then(|x| x.checked_add(2))
+            .ok_or_else(|| ("bad chunk size from storage".to_string(), true))?;
+        while buf.len() < need {
             fill(&mut buf, w)?;
         }
         out.extend_from_slice(&buf[pos..pos + n]);

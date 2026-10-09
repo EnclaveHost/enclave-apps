@@ -18,6 +18,9 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 const MAX_HEAD: usize = 32 * 1024;
+/// Request bodies held whole (git fetch requests, API JSON) across every
+/// connection at once; past it a request is refused, not buffered.
+const BUFFER_BUDGET: usize = 96 << 20;
 const MAX_CONNS: usize = 256;
 const HIGH_WATER: usize = 1 << 20;
 const READ_SLICE: usize = 1 << 20;
@@ -228,6 +231,19 @@ enum Phase<A> {
     },
     Done,
     Close,
+}
+
+impl<A> Conn<A> {
+    /// Bytes this connection holds of a buffered request body.
+    fn buffered(&self) -> usize {
+        match &self.phase {
+            Phase::Body {
+                target: Target::Buffer { buf, .. },
+                ..
+            } => buf.len(),
+            _ => 0,
+        }
+    }
 }
 
 struct Conn<A> {
@@ -489,8 +505,9 @@ impl<A: Handler> Server<A> {
             }
         }
         let mut conns = std::mem::take(&mut self.conns);
+        let mut buffered: usize = conns.iter().map(|c| c.buffered()).sum();
         for c in conns.iter_mut() {
-            busy |= self.service(c, app);
+            busy |= self.service(c, app, &mut buffered);
         }
         let now = Instant::now();
         conns.retain(|c| {
@@ -510,11 +527,11 @@ impl<A: Handler> Server<A> {
         busy
     }
 
-    fn read_some(c: &mut Conn<A>) -> bool {
+    fn read_some(c: &mut Conn<A>, limit: usize) -> bool {
         let mut moved = false;
         let mut buf = [0u8; 64 * 1024];
         let mut total = 0;
-        while total < READ_SLICE && !c.peer_eof {
+        while total < limit && !c.peer_eof {
             match c.stream.read(&mut buf) {
                 Ok(0) => {
                     c.peer_eof = true;
@@ -573,11 +590,15 @@ impl<A: Handler> Server<A> {
         moved
     }
 
-    fn service(&self, c: &mut Conn<A>, app: &mut A) -> bool {
+    fn service(&self, c: &mut Conn<A>, app: &mut A, buffered: &mut usize) -> bool {
         let mut busy = false;
-        let reading = matches!(c.phase, Phase::Head | Phase::Body { .. });
-        if reading && c.rbuf.len() < READ_SLICE * 2 {
-            busy |= Self::read_some(c);
+        // until its head is parsed a connection may hold little more than a head
+        match c.phase {
+            Phase::Head if c.rbuf.len() <= MAX_HEAD => busy |= Self::read_some(c, MAX_HEAD + 1),
+            Phase::Body { .. } if c.rbuf.len() < READ_SLICE * 2 => {
+                busy |= Self::read_some(c, READ_SLICE)
+            }
+            _ => {}
         }
         loop {
             let phase = std::mem::replace(&mut c.phase, Phase::Close);
@@ -723,6 +744,15 @@ impl<A: Handler> Server<A> {
                     }
                     match &mut target {
                         Target::Buffer { buf, max } => {
+                            if *buffered + out.len() > BUFFER_BUDGET {
+                                c.keep_alive = false;
+                                self.start_response(
+                                    c,
+                                    Response::text(503, "server busy; try again"),
+                                );
+                                continue;
+                            }
+                            *buffered += out.len();
                             buf.extend_from_slice(&out);
                             if buf.len() > max.saturating_mul(2) {
                                 c.keep_alive = false;

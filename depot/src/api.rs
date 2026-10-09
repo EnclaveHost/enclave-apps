@@ -18,7 +18,9 @@ use serde_json::{json, Value};
 
 const UI: &str = include_str!("ui.html");
 const SSO_RETURN: &str = include_str!("sso-return.html");
-const CSP: &str = "default-src 'self'; script-src 'unsafe-inline' 'self'; style-src 'unsafe-inline' 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'";
+const UI_JS: &str = include_str!("ui.js");
+const SSO_RETURN_JS: &str = include_str!("sso-return.js");
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'unsafe-inline' 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'";
 
 fn bad(msg: &str) -> Response<App> {
     Response::json(400, &json!({ "error": msg }))
@@ -114,6 +116,19 @@ fn get(app: &mut App, head: &Head) -> Response<App> {
                 .with("referrer-policy", "no-referrer")
                 .bytes("text/html; charset=utf-8", SSO_RETURN);
         }
+        "/app.js" | "/sso-return.js" => {
+            return Response::new(200)
+                .with("cache-control", "no-cache")
+                .with("x-content-type-options", "nosniff")
+                .bytes(
+                    "application/javascript; charset=utf-8",
+                    if head.path == "/app.js" {
+                        UI_JS
+                    } else {
+                        SSO_RETURN_JS
+                    },
+                );
+        }
         "/ping" => return Response::text(200, "ok"),
         "/favicon.ico" => return Response::new(204),
         _ => {}
@@ -154,18 +169,14 @@ fn get(app: &mut App, head: &Head) -> Response<App> {
             let Some(repo) = head.param("repo") else {
                 return bad("repo required");
             };
+            if let Err(r) = app.may_read(&who, &repo) {
+                return r;
+            }
             let id = match app.open(&repo) {
                 Ok(Some(id)) => id,
                 Ok(None) => return not_found(),
                 Err(e) => return fail(&e),
             };
-            if !can_read(&app.cfg, &who, &repo, app.is_public(&repo)) {
-                return if who == Who::Anonymous {
-                    unauthorized("authentication required")
-                } else {
-                    not_found()
-                };
-            }
             match head.path.as_str() {
                 "/api/repo" => info(app, &id),
                 "/api/log" => log(app, &id, head),
@@ -376,7 +387,10 @@ fn patch(app: &mut App, who: &Who, head: &Head, v: &Value) -> Response<App> {
                     return fail(&e);
                 }
             }
-            let r = &app.repos[&id];
+            // (a registry refresh above may have dropped a repository deleted elsewhere)
+            let Some(r) = app.repos.get(&id) else {
+                return not_found();
+            };
             if !r.refs.contains_key(&target) {
                 return bad("head must name an existing branch");
             }
@@ -385,9 +399,10 @@ fn patch(app: &mut App, who: &Who, head: &Head, v: &Value) -> Response<App> {
             let etag = r.etag.clone();
             match app.store.save_manifest(&id, &mut m, etag.as_deref(), now()) {
                 Ok(Saved::Ok(t)) => {
-                    let r = app.repos.get_mut(&id).unwrap();
-                    r.m = m;
-                    r.etag = Some(t);
+                    if let Some(r) = app.repos.get_mut(&id) {
+                        r.m = m;
+                        r.etag = Some(t);
+                    }
                     break;
                 }
                 Ok(Saved::Conflict) => continue,
@@ -440,7 +455,9 @@ fn delete(app: &mut App, who: &Who, head: &Head) -> Response<App> {
 }
 
 fn info(app: &App, id: &str) -> Response<App> {
-    let r = &app.repos[id];
+    let Some(r) = app.repos.get(id) else {
+        return not_found();
+    };
     let refs: serde_json::Map<String, Value> = r
         .refs
         .iter()
@@ -460,6 +477,20 @@ fn info(app: &App, id: &str) -> Response<App> {
             "public": app.is_public(&r.name),
         }),
     )
+}
+
+/// The commit `rev` names, if a reader may see it: a ref (or the commit a
+/// tag peels to), or an object id that some ref reaches. Ids of objects no
+/// ref reaches (force-pushed away, deleted branches) are not served.
+fn start_commit(app: &mut App, id: &str, rev: &str) -> Option<Oid> {
+    let r = app.repos.get_mut(id)?;
+    let c = resolve(r, rev).and_then(|o| to_commit(r, o))?;
+    readable(r, &c).then_some(c)
+}
+
+fn readable(r: &mut Repo, o: &Oid) -> bool {
+    let reach = r.reach();
+    r.ix.lookup(o).is_some_and(|i| reach.get(i))
 }
 
 fn resolve(r: &Repo, rev: &str) -> Option<Oid> {
@@ -499,10 +530,10 @@ fn log(app: &mut App, id: &str, head: &Head) -> Response<App> {
         .unwrap_or(0)
         .min(100_000);
     let rev = head.param("ref").unwrap_or_default();
-    let r = &app.repos[id];
-    let Some(start) = resolve(r, &rev).and_then(|o| to_commit(r, o)) else {
+    let Some(start) = start_commit(app, id, &rev) else {
         return not_found();
     };
+    let r = &app.repos[id];
     // newest-first over the commit graph (committer time)
     let ix = &r.ix;
     let mut heap = std::collections::BinaryHeap::new();
@@ -555,10 +586,10 @@ fn lookup_path(
     rev: &str,
     path: &str,
 ) -> Result<Option<(Oid, u32, Oid)>, String> {
-    let r = &app.repos[id];
-    let Some(c) = resolve(r, rev).and_then(|o| to_commit(r, o)) else {
+    let Some(c) = start_commit(app, id, rev) else {
         return Ok(None);
     };
+    let r = &app.repos[id];
     let ci = r.ix.lookup(&c).unwrap();
     let Some(&t) =
         r.ix.kids(ci)
@@ -643,6 +674,25 @@ fn raw(app: &mut App, id: &str, head: &Head) -> Response<App> {
         Ok(_) => return not_found(),
         Err(e) => return fail(&e),
     };
+    // a file goes out from memory whole; past this size, clone the repository
+    let size = app.repos[id]
+        .ix
+        .lookup(&oid)
+        .map(|i| app.repos[id].ix.obj(i).size)
+        .unwrap_or(0);
+    if size > RAW_MAX {
+        return Response::json(
+            413,
+            &json!({ "error": format!("{} MiB is too large to serve here; clone the repository", size >> 20) }),
+        );
+    }
+    let mut charge = app.raw_budget.charge();
+    if charge.set(size, RAW_BUDGET).is_err() {
+        return Response::json(
+            503,
+            &json!({ "error": "busy serving other files; try again" }),
+        );
+    }
     let data = match app.read_object(id, &oid) {
         Ok(Some((_, d))) => d,
         Ok(None) => return not_found(),
@@ -667,20 +717,48 @@ fn raw(app: &mut App, id: &str, head: &Head) -> Response<App> {
             "content-disposition",
             &format!("{disp}; filename=\"{name}\""),
         )
-        .bytes(
+        .stream(
             if text {
                 "text/plain; charset=utf-8"
             } else {
                 "application/octet-stream"
             },
-            data.as_ref().clone(),
+            Box::new(RawSource {
+                data,
+                pos: 0,
+                _charge: charge,
+            }),
         )
+}
+
+const RAW_MAX: u64 = 32 << 20;
+const RAW_BUDGET: u64 = 256 << 20;
+
+/// A file's bytes, drained into the connection as it can take them (no
+/// copy of the whole into the write buffer); its charge on the shared raw
+/// budget ends when the response does.
+struct RawSource {
+    data: std::rc::Rc<Vec<u8>>,
+    pos: usize,
+    _charge: crate::push::Charge,
+}
+
+impl crate::serve::Source<App> for RawSource {
+    fn pull(&mut self, _app: &mut App, out: &mut Vec<u8>) -> Result<bool, String> {
+        let end = (self.pos + (256 << 10)).min(self.data.len());
+        out.extend_from_slice(&self.data[self.pos..end]);
+        self.pos = end;
+        Ok(self.pos == self.data.len())
+    }
 }
 
 fn commit(app: &mut App, id: &str, head: &Head) -> Response<App> {
     let Some(o) = head.param("id").and_then(|s| Oid::from_hex(&s)) else {
         return bad("id required");
     };
+    if !app.repos.get_mut(id).is_some_and(|r| readable(r, &o)) {
+        return not_found();
+    }
     let data = match app.read_object(id, &o) {
         Ok(Some((Kind::Commit, d))) => d,
         Ok(_) => return not_found(),

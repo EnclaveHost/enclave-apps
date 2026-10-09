@@ -193,7 +193,6 @@ impl S3 {
         v.join("&")
     }
 
-    /// One signed request with retries for transient failures.
     fn call(
         &mut self,
         method: &str,
@@ -201,6 +200,21 @@ impl S3 {
         q: &[(&str, &str)],
         extra: &[(String, String)],
         body: &[u8],
+    ) -> Result<Response, String> {
+        self.call_with(method, key, q, extra, body, true)
+    }
+
+    /// One signed request. Idempotent requests are retried with backoff on
+    /// transient failures; a conditional write is sent exactly once, and an
+    /// error then means "outcome unknown" (the caller reads back).
+    fn call_with(
+        &mut self,
+        method: &str,
+        key: &str,
+        q: &[(&str, &str)],
+        extra: &[(String, String)],
+        body: &[u8],
+        idempotent: bool,
     ) -> Result<Response, String> {
         let uri = if key.is_empty() {
             format!("/{}", uri_encode(&self.bucket, false))
@@ -219,13 +233,17 @@ impl S3 {
         };
         let payload = hex(&Sha256::digest(body));
         let mut last = String::new();
-        for attempt in 0..5u32 {
+        let attempts = if idempotent { 5u32 } else { 1 };
+        for attempt in 0..attempts {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(250 * (1 << attempt.min(4)) as u64));
             }
             let headers = self.sign(method, &uri, &query, &payload, extra);
             self.calls += 1;
-            match self.client.send(method, &target, &headers, body) {
+            match self
+                .client
+                .send_once(method, &target, &headers, body, idempotent)
+            {
                 Ok(r) if transient(r.status) => {
                     last = format!("storage answered HTTP {}", r.status);
                     self.client.drop_connection();
@@ -241,7 +259,11 @@ impl S3 {
                 }
             }
         }
-        Err(format!("storage unavailable after retries: {last}"))
+        if idempotent {
+            Err(format!("storage unavailable after retries: {last}"))
+        } else {
+            Err(format!("storage write outcome unknown: {last}"))
+        }
     }
 
     fn etag(r: &Response) -> Option<String> {
@@ -308,12 +330,13 @@ impl S3 {
             "content-type".to_string(),
             "application/octet-stream".to_string(),
         )];
+        let idempotent = matches!(cond, Cond::None);
         match cond {
             Cond::None => {}
             Cond::IfMatch(t) => extra.push(("if-match".into(), t.to_string())),
             Cond::IfNoneMatch => extra.push(("if-none-match".into(), "*".into())),
         }
-        let r = self.call("PUT", key, &[], &extra, body)?;
+        let r = self.call_with("PUT", key, &[], &extra, body, idempotent)?;
         match r.status {
             200 | 201 | 204 => Ok(Ok(Self::etag(&r))),
             412 | 409 => Ok(Err(r.status)),

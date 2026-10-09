@@ -81,6 +81,11 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Is this pack part of the repository (live, or retired awaiting deletion)?
+    pub fn lists(&self, pack: &str) -> bool {
+        self.packs.iter().any(|p| p.id == pack) || self.retired.iter().any(|r| r.id == pack)
+    }
+
     pub fn new(head: &str) -> Manifest {
         Manifest {
             v: 1,
@@ -239,22 +244,46 @@ impl Store {
         }
     }
 
+    /// A conditional write of one of the mutable documents (registry, token
+    /// book, manifest), whose JSON carries `writer: nonce`, fresh per write.
+    /// The PUT goes out once. When it is refused or its outcome is unknown,
+    /// the stored document is read back: our nonce there means our write
+    /// landed (a retried request answered 412 to itself, or the reply was
+    /// lost), anything else is a real conflict. Only an unreadable store is
+    /// an error, and then nothing may be assumed either way.
     fn put_sealed(
         &mut self,
         key: &str,
         scope: &str,
         plain: &[u8],
         etag: Option<&str>,
+        nonce: &str,
     ) -> Result<Saved, String> {
         let body = seal::seal(&self.keys.derive(scope), key.as_bytes(), &compress(plain));
         let cond = match etag {
             Some(t) => Cond::IfMatch(t),
             None => Cond::IfNoneMatch,
         };
-        match self.s3.put(key, &body, cond)? {
-            Ok(Some(t)) => Ok(Saved::Ok(t)),
-            Ok(None) => Err("storage omitted the ETag of a committed write".into()),
-            Err(_) => Ok(Saved::Conflict),
+        let first = self.s3.put(key, &body, cond);
+        if let Ok(Ok(Some(t))) = &first {
+            return Ok(Saved::Ok(t.clone()));
+        }
+        match self.get_sealed(key, scope, None) {
+            Ok(Loaded::Found(b, t)) => {
+                let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+                if v.get("writer").and_then(|w| w.as_str()) == Some(nonce) {
+                    Ok(Saved::Ok(t))
+                } else {
+                    Ok(Saved::Conflict)
+                }
+            }
+            Ok(_) => match first {
+                Ok(Err(_)) => Ok(Saved::Conflict),
+                Ok(Ok(None)) => Err("storage omitted the ETag of a committed write".into()),
+                Err(e) => Err(e),
+                Ok(Ok(Some(_))) => unreachable!(),
+            },
+            Err(e) => Err(format!("storage write outcome unknown and unreadable: {e}")),
         }
     }
 
@@ -280,10 +309,11 @@ impl Store {
     pub fn save_registry(&mut self, r: &mut Registry, etag: Option<&str>) -> Result<Saved, String> {
         r.v = 1;
         r.rev += 1;
-        r.writer = self.writer.clone();
+        r.writer = format!("{}:{}", self.writer, seal::random_id());
         let key = self.k_registry();
         let b = serde_json::to_vec(r).unwrap();
-        self.put_sealed(&key, "registry", &b, etag)
+        let nonce = r.writer.clone();
+        self.put_sealed(&key, "registry", &b, etag, &nonce)
     }
 
     pub fn load_manifest(
@@ -324,7 +354,8 @@ impl Store {
         m.updated = now;
         let key = self.k_manifest(repo);
         let b = serde_json::to_vec(m).unwrap();
-        self.put_sealed(&key, &format!("repo:{repo}"), &b, etag)
+        let nonce = m.writer.clone();
+        self.put_sealed(&key, &format!("repo:{repo}"), &b, etag, &nonce)
     }
 
     pub fn put_idx(&mut self, repo: &str, pack: &str, entries: &[IdxEntry]) -> Result<(), String> {
@@ -473,11 +504,12 @@ impl Store {
         Ok(out)
     }
 
+    /// Abandon an unfinished multipart upload. A finished object is left
+    /// alone: whether it may be deleted is the caller's decision.
     pub fn upload_abort(&mut self, up: &Upload) {
-        if let Some(id) = &up.upload_id {
+        if let (Some(id), false) = (&up.upload_id, up.next == up.chunked.chunks()) {
             self.s3.abort_multipart(&up.key, id);
         }
-        let _ = self.s3.delete(&up.key);
     }
 
     /// Plaintext bytes [start, end) of a stored pack, through the chunk cache.
@@ -605,9 +637,15 @@ impl Store {
         scope: &str,
         plain: &[u8],
         etag: Option<&str>,
+        nonce: &str,
     ) -> Result<Saved, String> {
         let key = self.k_object(name);
-        self.put_sealed(&key, scope, plain, etag)
+        self.put_sealed(&key, scope, plain, etag, nonce)
+    }
+
+    /// A fresh writer nonce for a mutable document.
+    pub fn nonce(&self) -> String {
+        format!("{}:{}", self.writer, seal::random_id())
     }
 }
 

@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 /// One object of the received pack, as the store's index records it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IdxEntry {
     pub oid: Oid,
     pub offset: u64,
@@ -157,6 +157,12 @@ impl Cache {
 }
 
 const SCRATCH: usize = 64 * 1024;
+/// The most objects one push may carry (the enclave repository's whole
+/// history is about 74,000).
+pub const MAX_OBJECTS: u64 = 10_000_000;
+/// Bytes of bookkeeping one parsed object costs while a push is held (its
+/// entry, links and index record), charged against the push budget.
+pub const OBJECT_COST: u64 = 192;
 
 impl Ingest {
     pub fn new(limits: Limits) -> Ingest {
@@ -176,6 +182,10 @@ impl Ingest {
             resolved_deltas: 0,
             total_deltas: 0,
         }
+    }
+
+    pub fn parsed(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn objects(&self) -> u32 {
@@ -208,7 +218,7 @@ impl Ingest {
                 return Err(format!("unsupported pack version {v}"));
             }
             let n = u32::from_be_bytes(head[8..12].try_into().unwrap());
-            if n as u64 > self.limits.max_pack / 8 + 16 {
+            if n as u64 > MAX_OBJECTS {
                 return Err("pack claims more objects than its size allows".into());
             }
             self.count = Some(n);
@@ -319,6 +329,11 @@ impl Ingest {
             }
             self.entries.push(e);
             self.next = p.inpos;
+            // a real pack's entries average hundreds of bytes; millions of
+            // near-empty ones are only a way to spend the server's memory
+            if self.entries.len() > 4096 + self.next / 20 {
+                return Err("pack has implausibly many tiny objects".into());
+            }
         }
         // Everything before the next unparsed entry is pack body, never trailer.
         if self.next > self.hashed {
@@ -620,9 +635,17 @@ impl Ingest {
                 children,
             });
         }
+        // one object, one entry: a pack naming an object twice could keep a
+        // copy that is a delta on itself (git index-pack --strict refuses too)
+        let mut seen: std::collections::HashSet<Oid> =
+            std::collections::HashSet::with_capacity(out.len());
+        for e in &out {
+            if !seen.insert(e.oid) {
+                return Err(format!("pack contains object {} twice", e.oid));
+            }
+        }
         let mut buf = std::mem::take(&mut self.buf);
         buf.truncate(self.next); // drop the old trailer
-        let mut seen: std::collections::HashSet<Oid> = out.iter().map(|e| e.oid).collect();
         for (oid, kind, data) in &self.ext {
             if !seen.insert(*oid) {
                 continue;
@@ -861,6 +884,27 @@ pub mod tests {
             max_object: 10,
         });
         assert!(small.feed(&pack).is_err());
+    }
+
+    #[test]
+    fn duplicates_and_floods_are_refused() {
+        let y = b"the same content".to_vec();
+        let oy = object_id(Kind::Blob, &y).unwrap();
+        // the review's shape: Y as a REF delta on itself, then Y whole
+        let pack = build_pack(&[T::Ref(oy, naive_delta(&y, &y)), T::Whole(Kind::Blob, &y)]);
+        assert!(run(&pack, 1 << 20, &mut NoBases)
+            .unwrap_err()
+            .contains("twice"));
+        let pack = build_pack(&[T::Whole(Kind::Blob, &y), T::Whole(Kind::Blob, &y)]);
+        assert!(run(&pack, 1 << 20, &mut NoBases)
+            .unwrap_err()
+            .contains("twice"));
+        // a hundred thousand empty entries in under a megabyte
+        let items: Vec<T> = (0..100_000).map(|_| T::Whole(Kind::Blob, b"")).collect();
+        let pack = build_pack(&items);
+        assert!(run(&pack, 1 << 20, &mut NoBases)
+            .unwrap_err()
+            .contains("tiny"));
     }
 
     #[test]

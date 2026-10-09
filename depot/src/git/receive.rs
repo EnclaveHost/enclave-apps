@@ -11,6 +11,7 @@ use super::pkt::{self, Pkt};
 use super::repo::{Index, OidMap, NONE};
 use super::upload::{advertise_refs, View, AGENT};
 use super::{valid_refname, Kind, Oid};
+use std::collections::BTreeMap;
 
 pub fn advertise(v: &View) -> Vec<u8> {
     let caps = format!(
@@ -303,6 +304,11 @@ pub fn check(
     }
     let cur = current.copied().unwrap_or_default();
     if cur != cmd.old {
+        // the ref already holds what this command asks for (a retried push,
+        // or the same update arriving twice): nothing left to do
+        if cur == cmd.new && !(cmd.new.is_zero() && cmd.old.is_zero()) {
+            return Ok(());
+        }
         return Err("stale info".into());
     }
     if cmd.new.is_zero() {
@@ -327,6 +333,60 @@ pub fn check(
         }
     }
     Ok(())
+}
+
+/// Judge every command of a push: each against its ref's current value
+/// (`check`), then the survivors together, since git cannot store a ref and
+/// another ref beneath it (`refs/heads/a` and `refs/heads/a/b`): a push that
+/// would leave both makes the repository unclonable.
+pub fn judge(
+    cmds: &[Command],
+    refs: &BTreeMap<String, Oid>,
+    inc: &Incoming,
+    ix: &Index,
+    protected: impl Fn(&str) -> bool,
+) -> Vec<(String, Result<(), String>)> {
+    let mut out: Vec<(String, Result<(), String>)> = cmds
+        .iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                check(c, refs.get(&c.name), inc, ix, protected(&c.name)),
+            )
+        })
+        .collect();
+    let mut after = refs.clone();
+    for (c, (_, r)) in cmds.iter().zip(&out) {
+        if r.is_ok() {
+            if c.new.is_zero() {
+                after.remove(&c.name);
+            } else {
+                after.insert(c.name.clone(), c.new);
+            }
+        }
+    }
+    for (c, (_, r)) in cmds.iter().zip(out.iter_mut()) {
+        if r.is_ok() && !c.new.is_zero() {
+            if let Some(other) = df_conflict(&c.name, &after) {
+                *r = Err(format!("cannot coexist with {other}"));
+            }
+        }
+    }
+    out
+}
+
+/// A ref that would clash with `name` as directory and file.
+pub fn df_conflict(name: &str, refs: &BTreeMap<String, Oid>) -> Option<String> {
+    for (i, _) in name.match_indices('/') {
+        if refs.contains_key(&name[..i]) {
+            return Some(name[..i].to_string());
+        }
+    }
+    let dir = format!("{name}/");
+    refs.range(dir.clone()..)
+        .next()
+        .filter(|(k, _)| k.starts_with(&dir))
+        .map(|(k, _)| k.clone())
 }
 
 /// report-status: `unpack ok|<err>`, then `ok <ref>` / `ng <ref> <why>`, flush.
@@ -394,6 +454,42 @@ mod tests {
         probe.feed(b"0000").unwrap();
         probe.finish().unwrap();
         assert!(probe.cmds.is_empty());
+    }
+
+    #[test]
+    fn directory_file_conflicts() {
+        let ix = linear(5);
+        let inc = Incoming::new(&[]);
+        let mut refs = BTreeMap::new();
+        refs.insert("refs/heads/a".to_string(), Oid([5; 20]));
+        let cmd = |n: &str| Command {
+            old: crate::git::ZERO,
+            new: Oid([5; 20]),
+            name: n.into(),
+        };
+        let j = judge(&[cmd("refs/heads/a/b")], &refs, &inc, &ix, |_| false);
+        assert!(j[0].1.as_ref().unwrap_err().contains("refs/heads/a"));
+        let j = judge(
+            &[cmd("refs/heads/x"), cmd("refs/heads/x/y")],
+            &BTreeMap::new(),
+            &inc,
+            &ix,
+            |_| false,
+        );
+        assert!(
+            j[0].1.is_err() && j[1].1.is_err(),
+            "both sides of a clash in one push"
+        );
+        let j = judge(&[cmd("refs/heads/ab")], &refs, &inc, &ix, |_| false);
+        assert!(j[0].1.is_ok(), "a shared prefix is not a directory");
+        // deleting the file makes room for the directory
+        let del = Command {
+            old: Oid([5; 20]),
+            new: crate::git::ZERO,
+            name: "refs/heads/a".into(),
+        };
+        let j = judge(&[del, cmd("refs/heads/a/b")], &refs, &inc, &ix, |_| false);
+        assert!(j[0].1.is_ok() && j[1].1.is_ok());
     }
 
     #[test]

@@ -1,0 +1,13 @@
+/* Sign in with Enclave's landing pad (jot's shape): enclave.host redirected
+   this popup back here with the token in the fragment; same-origin with the
+   opener again, it hands the fragment over and closes. The opener checks the
+   state echo before trusting anything. Without an opener, carry the
+   fragment to the app page, which runs the same check. */
+(function () {
+  var frag = location.hash || "";
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  if (window.opener && !window.opener.closed) {
+    try { window.opener.postMessage({ enclave_sso: frag }, location.origin); document.getElementById("msg").textContent = "Signed in. You can close this window."; window.close(); return; } catch (e) {}
+  }
+  location.replace("/" + frag);
+})();

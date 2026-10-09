@@ -147,7 +147,16 @@ pub fn tick(app: &mut App) -> bool {
             Err(e) => {
                 eprintln!("[depot] repack abandoned: {e}");
                 app.store.upload_abort(&job.upload);
-                let _ = app.store.delete_pack(&job.repo, &job.new_id);
+                // the merged pack goes only if a fresh manifest provably does
+                // not list it; unknown means it stays for the orphan sweep
+                let listed = app
+                    .revalidate(&job.repo, true)
+                    .ok()
+                    .and_then(|_| app.repos.get(&job.repo))
+                    .map(|r| r.m.lists(&job.new_id));
+                if listed == Some(false) {
+                    let _ = app.store.delete_pack(&job.repo, &job.new_id);
+                }
                 app.maint.last = Some(format!("abandoned: {e}"));
             }
         }
@@ -303,6 +312,9 @@ fn commit(app: &mut App, j: &Repack) -> Result<(), String> {
             app.revalidate(&j.repo, true)?;
         }
         let r = app.repos.get(&j.repo).ok_or("repository unloaded")?;
+        if r.m.lists(&j.new_id) {
+            return Ok(()); // an earlier attempt landed
+        }
         let pos =
             r.m.packs
                 .iter()
@@ -336,7 +348,12 @@ fn commit(app: &mut App, j: &Repack) -> Result<(), String> {
             .save_manifest(&j.repo, &mut m, etag.as_deref(), at)?
         {
             Saved::Ok(t) => {
-                app.apply(&j.repo, m, t)?;
+                // committed: a failure to re-index now is repaired by the next
+                // revalidation, never by undoing the merge
+                if let Err(e) = app.apply(&j.repo, m, t) {
+                    eprintln!("[depot] repack committed; re-indexing deferred: {e}");
+                    app.mark_stale(&j.repo);
+                }
                 return Ok(());
             }
             Saved::Conflict => continue,
@@ -348,6 +365,7 @@ fn commit(app: &mut App, j: &Repack) -> Result<(), String> {
 /// Delete pack objects no manifest lists (live or retired) that are older
 /// than `orphan_age()`: the uploads of pushes and repacks that never committed.
 fn orphans(app: &mut App, id: &str) -> Result<(), String> {
+    app.revalidate(id, true)?;
     let Some(r) = app.repos.get(id) else {
         return Ok(());
     };
@@ -381,16 +399,23 @@ fn orphans(app: &mut App, id: &str) -> Result<(), String> {
 
 /// Delete packs retired more than an hour ago, then drop them from the list.
 fn sweep(app: &mut App, id: &str) -> Result<(), String> {
+    if !app.repos.get(id).is_some_and(|r| !r.m.retired.is_empty()) {
+        return Ok(());
+    }
+    app.revalidate(id, true)?;
     let Some(r) = app.repos.get(id) else {
         return Ok(());
     };
     let cutoff = now().saturating_sub(grace());
-    let old: Vec<String> =
+    let candidates: Vec<String> =
         r.m.retired
             .iter()
-            .filter(|x| x.at <= cutoff)
+            .filter(|x| x.at <= cutoff && !r.m.packs.iter().any(|p| p.id == x.id))
             .map(|x| x.id.clone())
             .collect();
+    // never a pack the manifest still serves, nor one a fetch in flight here
+    // still reads (it holds the pack's record)
+    let old: Vec<String> = candidates.into_iter().filter(|p| !app.held(p)).collect();
     if old.is_empty() {
         return Ok(());
     }

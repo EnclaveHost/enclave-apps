@@ -38,6 +38,8 @@ pub struct Book {
     pub v: u32,
     pub rev: u64,
     pub tokens: Vec<Token>,
+    #[serde(default)]
+    pub writer: String,
 }
 
 pub struct Tokens {
@@ -106,8 +108,9 @@ impl Tokens {
     fn save(&mut self, store: &mut Store, mut book: Book) -> Result<bool, String> {
         book.v = 1;
         book.rev += 1;
+        book.writer = store.nonce();
         let b = serde_json::to_vec(&book).unwrap();
-        match store.put_raw_sealed(NAME, NAME, &b, self.etag.as_deref())? {
+        match store.put_raw_sealed(NAME, NAME, &b, self.etag.as_deref(), &book.writer)? {
             Saved::Ok(t) => {
                 self.book = book;
                 self.etag = Some(t);
@@ -125,6 +128,10 @@ impl Tokens {
         rec.created = now();
         for _ in 0..8 {
             self.refresh(store, true)?;
+            // a write that landed and was then built upon still counts
+            if self.book.tokens.iter().any(|t| t.hash == rec.hash) {
+                return Ok((secret, rec));
+            }
             if self.book.tokens.len() >= 1000 {
                 return Err("token book is full (1000)".into());
             }
@@ -138,10 +145,10 @@ impl Tokens {
     }
 
     pub fn revoke(&mut self, store: &mut Store, id: &str) -> Result<bool, String> {
-        for _ in 0..8 {
+        for attempt in 0..8 {
             self.refresh(store, true)?;
             if !self.book.tokens.iter().any(|t| t.id == id) {
-                return Ok(false);
+                return Ok(attempt > 0);
             }
             let mut b = self.book.clone();
             b.tokens.retain(|t| t.id != id);

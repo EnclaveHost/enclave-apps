@@ -9,6 +9,10 @@ use super::walk::{self, Spec};
 use super::{Kind, Oid};
 use std::collections::BTreeMap;
 
+/// The most want/have/shallow lines one request may carry: a mirror of
+/// thousands of refs fits many times over; a want flood does not.
+const MAX_LINES: usize = 200_000;
+
 pub const AGENT: &str = concat!("depot/", env!("CARGO_PKG_VERSION"));
 
 /// What the protocol needs of a repository: its index, refs and HEAD.
@@ -17,6 +21,8 @@ pub struct View<'a> {
     pub refs: &'a BTreeMap<String, Oid>,
     /// HEAD's symref target, e.g. refs/heads/main
     pub head: &'a str,
+    /// every object reachable from the refs (walk::closure)
+    pub reach: &'a walk::Bits,
 }
 
 impl View<'_> {
@@ -30,12 +36,6 @@ impl View<'_> {
         }
         self.ix.peel(i).map(|p| self.ix.oid(p))
     }
-    fn tip_indices(&self) -> Vec<u32> {
-        self.refs
-            .values()
-            .filter_map(|o| self.ix.lookup(o))
-            .collect()
-    }
     fn ref_tags(&self) -> Vec<u32> {
         self.refs
             .values()
@@ -45,20 +45,15 @@ impl View<'_> {
     }
     /// Wants are refused unless they are reachable from a ref: a deleted
     /// branch's objects stay unfetchable.
-    fn check_want(&self, oid: &Oid, tips: &mut Option<Vec<u32>>) -> Result<u32, String> {
-        let i = self
-            .ix
-            .lookup(oid)
-            .ok_or_else(|| format!("upload-pack: not our ref {oid}"))?;
-        if self.refs.values().any(|r| r == oid) {
-            return Ok(i);
+    fn check_want(&self, oid: &Oid) -> Result<u32, String> {
+        match self.ix.lookup(oid) {
+            Some(i) if self.reach.get(i) => Ok(i),
+            _ => Err(format!("upload-pack: not our ref {oid}")),
         }
-        let t = tips.get_or_insert_with(|| self.tip_indices());
-        if walk::reachable(self.ix, t, i) {
-            Ok(i)
-        } else {
-            Err(format!("upload-pack: not our ref {oid}"))
-        }
+    }
+    /// An object the client may name (shallow, have): one a reader could fetch.
+    fn known(&self, oid: &Oid) -> Option<u32> {
+        self.ix.lookup(oid).filter(|&i| self.reach.get(i))
     }
     fn resolve_ref(&self, name: &str) -> Option<Oid> {
         for cand in [
@@ -279,22 +274,28 @@ fn oid_arg(s: &str) -> Result<Oid, String> {
 pub fn fetch_v2(v: &View, args: &[String]) -> Result<Fetch, String> {
     let ix = v.ix;
     let mut spec = Spec::default();
-    let mut tips = None;
     let (mut done, mut thin, mut ofs, mut progress, mut seen_haves) =
         (false, false, false, true, false);
     let mut shallow_requested = false;
     let mut common: Vec<u32> = Vec::new();
+    let mut seen = walk::Bits::new(ix.len());
+    let mut seen_common = walk::Bits::new(ix.len());
+    if args.len() > MAX_LINES {
+        return Err(format!("request too long (more than {MAX_LINES} lines)"));
+    }
     for a in args {
         let (k, val) = a.split_once(' ').unwrap_or((a.as_str(), ""));
         match k {
             "want" => {
-                let o = oid_arg(val)?;
-                spec.wants.push(v.check_want(&o, &mut tips)?);
+                let i = v.check_want(&oid_arg(val)?)?;
+                if seen.set(i) {
+                    spec.wants.push(i);
+                }
             }
             "have" => {
                 seen_haves = true;
-                if let Some(i) = ix.lookup(&oid_arg(val)?) {
-                    if !common.contains(&i) {
+                if let Some(i) = v.known(&oid_arg(val)?) {
+                    if seen_common.set(i) {
                         common.push(i);
                     }
                 }
@@ -306,7 +307,7 @@ pub fn fetch_v2(v: &View, args: &[String]) -> Result<Fetch, String> {
             "include-tag" => spec.include_tag = true,
             "shallow" => {
                 shallow_requested = true;
-                if let Some(i) = ix.lookup(&oid_arg(val)?) {
+                if let Some(i) = v.known(&oid_arg(val)?) {
                     spec.client_shallow.push(i);
                 }
             }
@@ -325,7 +326,7 @@ pub fn fetch_v2(v: &View, args: &[String]) -> Result<Fetch, String> {
                 let o = v
                     .resolve_ref(val.trim())
                     .ok_or_else(|| format!("deepen-not: no such ref {val}"))?;
-                if let Some(i) = ix.lookup(&o) {
+                if let Some(i) = v.known(&o) {
                     spec.not.push(i);
                 }
             }
@@ -444,10 +445,15 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
     let mut r = Reader::new(body);
     let mut spec = Spec::default();
     let mut caps: Vec<String> = Vec::new();
-    let mut tips = None;
     let mut first = true;
+    let mut seen = walk::Bits::new(ix.len());
+    let mut lines = 0usize;
     // the want section
     loop {
+        lines += 1;
+        if lines > MAX_LINES {
+            return Err(format!("request too long (more than {MAX_LINES} lines)"));
+        }
         match r.next()? {
             None => return Err("truncated upload-pack request".into()),
             Some(Pkt::Flush) => break,
@@ -463,12 +469,12 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
                             .collect();
                         first = false;
                     }
-                    let i = v.check_want(&oid_arg(o)?, &mut tips)?;
-                    if !spec.wants.contains(&i) {
+                    let i = v.check_want(&oid_arg(o)?)?;
+                    if seen.set(i) {
                         spec.wants.push(i);
                     }
                 } else if let Some(o) = t.strip_prefix("shallow ") {
-                    if let Some(i) = ix.lookup(&oid_arg(o)?) {
+                    if let Some(i) = v.known(&oid_arg(o)?) {
                         spec.client_shallow.push(i);
                     }
                 } else if let Some(d) = t.strip_prefix("deepen-since ") {
@@ -477,7 +483,7 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
                     let o = v
                         .resolve_ref(n.trim())
                         .ok_or_else(|| format!("deepen-not: no such ref {n}"))?;
-                    if let Some(i) = ix.lookup(&o) {
+                    if let Some(i) = v.known(&o) {
                         spec.not.push(i);
                     }
                 } else if let Some(d) = t.strip_prefix("deepen ") {
@@ -542,8 +548,13 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
         ready_cache = Some((common.len(), r));
         r
     };
+    let mut seen_common = walk::Bits::new(ix.len());
     let send_pack;
     loop {
+        lines += 1;
+        if lines > MAX_LINES {
+            return Err(format!("request too long (more than {MAX_LINES} lines)"));
+        }
         match r.next()? {
             None => {
                 if deepen && common.is_empty() && !got_other {
@@ -553,7 +564,10 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
                 return Err("upload-pack request ended without flush or done".into());
             }
             Some(Pkt::Flush) => {
-                if detailed && got_common && !got_other && ready(&common) {
+                // "ready" is judged once per round, here (git also answers it
+                // per unknown have; a walk per have is a CPU sink for long
+                // have lists, and the client treats either the same)
+                if detailed && got_common && ready(&common) {
                     sent_ready = true;
                     pkt::line(&mut head, &format!("ACK {} ready\n", last.unwrap()));
                 }
@@ -572,10 +586,10 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
                 let t = p.text().ok_or("bad request line")?;
                 if let Some(o) = t.strip_prefix("have ") {
                     let o = oid_arg(o)?;
-                    match ix.lookup(&o) {
+                    match v.known(&o) {
                         Some(i) => {
                             got_common = true;
-                            if !common.contains(&i) {
+                            if seen_common.set(i) {
                                 common.push(i);
                             }
                             last = Some(o);
@@ -587,17 +601,7 @@ pub fn upload_v0(v: &View, body: &[u8]) -> Result<Fetch, String> {
                                 pkt::line(&mut head, &format!("ACK {o}\n"));
                             }
                         }
-                        None => {
-                            got_other = true;
-                            if multi && ready(&common) {
-                                if detailed {
-                                    sent_ready = true;
-                                    pkt::line(&mut head, &format!("ACK {o} ready\n"));
-                                } else {
-                                    pkt::line(&mut head, &format!("ACK {o} continue\n"));
-                                }
-                            }
-                        }
+                        None => got_other = true,
                     }
                 } else if t == "done" {
                     match last {
@@ -664,10 +668,13 @@ mod tests {
     fn v2_ls_refs_and_negotiation() {
         let ix = linear(5);
         let (refs, head) = view(&ix);
+        let tips: Vec<u32> = refs.values().filter_map(|o| ix.lookup(o)).collect();
+        let reach = walk::closure(&ix, &tips);
         let v = View {
             ix: &ix,
             refs: &refs,
             head: &head,
+            reach: &reach,
         };
         let l = text_lines(&ls_refs(
             &v,
@@ -711,16 +718,57 @@ mod tests {
         assert!(fetch_v2(&v, &[format!("want {}", Oid([99; 20]))]).is_err());
         // a non-tip but reachable commit is fetchable
         assert!(fetch_v2(&v, &[format!("want {}", Oid([2; 20])), "done".into()]).is_ok());
+        // an object no ref reaches is not: not as a want, not through a
+        // shallow line, not even acknowledged as a have
+        let mut refs3 = BTreeMap::new();
+        refs3.insert("refs/heads/main".to_string(), Oid([3; 20]));
+        let tips: Vec<u32> = refs3.values().filter_map(|o| ix.lookup(o)).collect();
+        let reach3 = walk::closure(&ix, &tips);
+        let v3 = View {
+            ix: &ix,
+            refs: &refs3,
+            head: &head,
+            reach: &reach3,
+        };
+        assert!(fetch_v2(&v3, &[format!("want {}", Oid([4; 20])), "done".into()]).is_err());
+        let f = fetch_v2(
+            &v3,
+            &[
+                format!("want {}", Oid([3; 20])),
+                format!("shallow {}", Oid([5; 20])),
+                "deepen 2".into(),
+                "deepen-relative".into(),
+                "done".into(),
+            ],
+        )
+        .unwrap();
+        // c1..c3 with their trees and blobs plus the shared blob: c4/c5 stay out
+        assert_eq!(f.objects(), 10);
+        let f = fetch_v2(
+            &v3,
+            &[
+                format!("want {}", Oid([3; 20])),
+                format!("have {}", Oid([5; 20])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            text_lines(&f.head)[..2],
+            ["acknowledgments".to_string(), "NAK".into()]
+        );
     }
 
     #[test]
     fn v0_stateless_rounds() {
         let ix = linear(5);
         let (refs, head) = view(&ix);
+        let tips: Vec<u32> = refs.values().filter_map(|o| ix.lookup(o)).collect();
+        let reach = walk::closure(&ix, &tips);
         let v = View {
             ix: &ix,
             refs: &refs,
             head: &head,
+            reach: &reach,
         };
         let adv = text_lines(&advertise_v0_upload(&v));
         assert!(adv[0].contains("HEAD NUL multi_ack"));
@@ -734,34 +782,34 @@ mod tests {
             ),
         );
         pkt::flush(&mut body);
-        // a round with an unknown have first: nothing to be ready on yet
+        // readiness is judged once per round, at its flush, whatever the
+        // order of known and unknown haves; with no-done the pack follows in
+        // the same response
+        for order in [[9u8, 4], [4, 9]] {
+            let mut round = body.clone();
+            for o in order {
+                pkt::line(&mut round, &format!("have {}\n", Oid([o; 20])));
+            }
+            pkt::flush(&mut round);
+            let f = upload_v0(&v, &round).unwrap();
+            assert_eq!(
+                text_lines(&f.head),
+                vec![
+                    format!("ACK {} common", Oid([4; 20])),
+                    format!("ACK {} ready", Oid([4; 20])),
+                    "NAK".into(),
+                    format!("ACK {}", Oid([4; 20])),
+                ]
+            );
+            assert_eq!(f.objects(), 3);
+        }
+        // nothing common: just NAK, no pack yet
         let mut round = body.clone();
         pkt::line(&mut round, &format!("have {}\n", Oid([9; 20])));
-        pkt::line(&mut round, &format!("have {}\n", Oid([4; 20])));
         pkt::flush(&mut round);
         let f = upload_v0(&v, &round).unwrap();
-        assert_eq!(
-            text_lines(&f.head),
-            vec![format!("ACK {} common", Oid([4; 20])), "NAK".into()]
-        );
+        assert_eq!(text_lines(&f.head), vec!["NAK".to_string()]);
         assert!(f.gen.is_none());
-        // common first: the unknown have after it is answered ready, and with
-        // no-done the pack follows in the same response
-        let mut round = body.clone();
-        pkt::line(&mut round, &format!("have {}\n", Oid([4; 20])));
-        pkt::line(&mut round, &format!("have {}\n", Oid([9; 20])));
-        pkt::flush(&mut round);
-        let f = upload_v0(&v, &round).unwrap();
-        assert_eq!(
-            text_lines(&f.head),
-            vec![
-                format!("ACK {} common", Oid([4; 20])),
-                format!("ACK {} ready", Oid([9; 20])),
-                "NAK".into(),
-                format!("ACK {}", Oid([4; 20])),
-            ]
-        );
-        assert_eq!(f.objects(), 3);
         let mut done = body.clone();
         pkt::line(&mut done, "done\n");
         let f = upload_v0(&v, &done).unwrap();

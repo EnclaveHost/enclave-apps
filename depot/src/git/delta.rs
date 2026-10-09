@@ -36,7 +36,12 @@ pub fn apply(base: &[u8], d: &[u8], max_result: u64) -> Result<Vec<u8>, String> 
     if rsize > max_result {
         return Err("delta result exceeds the object size limit".into());
     }
-    let mut out = Vec::with_capacity(rsize as usize);
+    // the declared size is not yet proven: reserve what the delta can plausibly produce
+    let mut out = Vec::with_capacity(
+        (rsize as usize)
+            .min(base.len() + d.len() * 16)
+            .min(64 << 20),
+    );
     while p < d.len() {
         let op = d[p];
         p += 1;

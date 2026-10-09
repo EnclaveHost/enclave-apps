@@ -116,21 +116,34 @@ impl App {
     }
 
     /// Readable repository id, or the response that refuses it.
-    fn readable(&mut self, head: &Head, repo: &str) -> Result<(Who, String), Response<App>> {
+    /// Readable repository id, or the response that refuses it. Access is
+    /// judged from the registry alone, before anything is loaded: a caller
+    /// who may not read learns nothing (anonymous: 401 whether or not the
+    /// name exists; signed in: 404) and costs no index load.
+    pub fn readable(&mut self, head: &Head, repo: &str) -> Result<(Who, String), Response<App>> {
         let who = self
             .who(head)
             .map_err(|_| unauthorized("bad credentials"))?;
-        let id = self.open(repo).map_err(|e| server_error(&e))?;
-        if !can_read(&self.cfg, &who, repo, self.is_public(repo)) {
+        self.may_read(&who, repo)?;
+        match self.open(repo).map_err(|e| server_error(&e))? {
+            Some(id) => Ok((who, id)),
+            None => Err(Response::text(404, "repository not found")),
+        }
+    }
+
+    pub fn may_read(&mut self, who: &Who, repo: &str) -> Result<(), Response<App>> {
+        let meta = self.meta(repo).map_err(|e| server_error(&e))?;
+        let public = meta.as_ref().is_some_and(|m| m.public) || self.cfg.public_by_config(repo);
+        if !can_read(&self.cfg, who, repo, public) {
             return Err(match who {
                 Who::Anonymous => unauthorized("authentication required"),
                 _ => Response::text(404, "repository not found"),
             });
         }
-        match id {
-            Some(id) => Ok((who, id)),
-            None => Err(Response::text(404, "repository not found")),
+        if meta.is_none() {
+            return Err(Response::text(404, "repository not found"));
         }
+        Ok(())
     }
 
     fn info_refs(&mut self, head: &Head, repo: &str) -> Response<App> {
@@ -141,6 +154,7 @@ impl App {
                     Ok(x) => x,
                     Err(r) => return r,
                 };
+                let reach = self.repos.get_mut(&id).unwrap().reach();
                 let r = &self.repos[&id];
                 let v2 = head
                     .header("git-protocol")
@@ -151,7 +165,7 @@ impl App {
                     let mut b = Vec::new();
                     pkt::line(&mut b, "# service=git-upload-pack\n");
                     pkt::flush(&mut b);
-                    b.extend_from_slice(&upload::advertise_v0_upload(&r.view()));
+                    b.extend_from_slice(&upload::advertise_v0_upload(&r.view(&reach)));
                     b
                 };
                 no_cache(
@@ -177,7 +191,9 @@ impl App {
                 pkt::line(&mut b, "# service=git-receive-pack\n");
                 pkt::flush(&mut b);
                 match id.and_then(|i| self.repos.get(&i)) {
-                    Some(r) => b.extend_from_slice(&receive::advertise(&r.view())),
+                    Some(r) => b.extend_from_slice(&receive::advertise(
+                        &r.view(&crate::git::walk::Bits::new(0)),
+                    )),
                     None => {
                         let (ix, refs) = (Index::default(), BTreeMap::new());
                         let head_name = format!("refs/heads/{}", self.cfg.default_branch);
@@ -185,6 +201,7 @@ impl App {
                             ix: &ix,
                             refs: &refs,
                             head: &head_name,
+                            reach: &crate::git::walk::Bits::new(0),
                         }));
                     }
                 }
@@ -204,8 +221,9 @@ impl App {
             Ok(x) => x,
             Err(r) => return r,
         };
+        let reach = self.repos.get_mut(&id).unwrap().reach();
         let r = &self.repos[&id];
-        let view = r.view();
+        let view = r.view(&reach);
         let v2 = head
             .header("git-protocol")
             .is_some_and(|v| v.split(':').any(|p| p.trim() == "version=2"));
@@ -251,7 +269,11 @@ impl Handler for App {
         if let Some((repo, op)) = git_route(&head.path) {
             return match (op, head.method.as_str()) {
                 (GitOp::InfoRefs, "GET") => Plan::Respond(self.info_refs(head, &repo)),
-                (GitOp::UploadPack, "POST") => Plan::Buffer(64 << 20),
+                // who may read is settled before a byte of the body is held
+                (GitOp::UploadPack, "POST") => match self.readable(head, &repo) {
+                    Ok(_) => Plan::Buffer(8 << 20),
+                    Err(r) => Plan::Respond(r),
+                },
                 (GitOp::ReceivePack, "POST") => {
                     let who = match self.who(head) {
                         Ok(w) => w,

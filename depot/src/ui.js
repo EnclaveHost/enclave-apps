@@ -1,0 +1,367 @@
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) e.append(k.nodeType ? k : String(k));
+  return e;
+}
+function tell(msg, err) {
+  const s = $("#status");
+  s.textContent = msg instanceof Error ? msg.message : msg;
+  s.className = err || msg instanceof Error ? "err" : "";
+  s.style.display = "block";
+  clearTimeout(tell.t);
+  tell.t = setTimeout(() => (s.style.display = "none"), 5000);
+}
+const enc = encodeURIComponent;
+
+// ---- credentials: a pasted token (X-Api-Key) or an Enclave sign-in -------
+let token = null, sso = null, me = null;
+try { token = sessionStorage.getItem("depot-token"); sso = sessionStorage.getItem("depot-sso"); } catch (e) {}
+const SSO_STATE = "depot-sso-state";
+function ssoAccept(frag) {
+  const m = /[#&]sso=([^&]+)/.exec(frag || ""), st = /[#&]state=([^&]+)/.exec(frag || "");
+  let expect = null;
+  try { expect = sessionStorage.getItem(SSO_STATE); } catch (e) {}
+  if (!m || !(expect && st && decodeURIComponent(st[1]) === expect)) return false;
+  sso = decodeURIComponent(m[1]);
+  try { sessionStorage.setItem("depot-sso", sso); sessionStorage.removeItem(SSO_STATE); } catch (e) {}
+  return true;
+}
+if (/[#&]sso=/.test(location.hash)) { ssoAccept(location.hash); history.replaceState(null, "", location.pathname); }
+addEventListener("message", (e) => {
+  if (e.origin !== location.origin || !e.data || typeof e.data.enclave_sso !== "string") return;
+  if (ssoAccept(e.data.enclave_sso)) boot();
+});
+function ssoStart() {
+  if (!me || !me.sso) return;
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  const st = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  try { sessionStorage.setItem(SSO_STATE, st); } catch (e) {}
+  const url = (back, popup) => me.sso.authorize_url + "?aud=" + enc(me.sso.audience) + "&redirect_uri=" + enc(back) +
+    "&state=" + st + "&ttl=604800" + (popup ? "&display=popup" : "");
+  let w = null;
+  try { w = window.open(url(location.origin + "/sso-return", true), "enclave-signin", "popup,width=430,height=680"); } catch (e) {}
+  if (!w) location.href = url(location.origin + "/", false);
+}
+
+async function api(path, opt = {}) {
+  const headers = { accept: "application/json" };
+  if (token) headers["x-api-key"] = token;
+  if (sso) headers["x-sso-token"] = sso;
+  if (opt.body !== undefined) headers["content-type"] = "application/json";
+  const r = await fetch(path, { method: opt.method || "GET", headers, body: opt.body === undefined ? undefined : JSON.stringify(opt.body) });
+  if (opt.raw) return r;
+  let v = null;
+  try { v = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((v && v.error) || (r.status === 401 ? "authentication required: use an access token" : "HTTP " + r.status));
+  return v;
+}
+
+// ---- formatting ----------------------------------------------------------
+function ago(t) {
+  if (!t) return "";
+  const s = Math.max(1, Date.now() / 1000 - t);
+  for (const [n, u] of [[31536000, "year"], [2592000, "month"], [86400, "day"], [3600, "hour"], [60, "minute"]])
+    if (s >= n) { const k = Math.floor(s / n); return k + " " + u + (k > 1 ? "s" : "") + " ago"; }
+  return "just now";
+}
+function size(n) {
+  if (n === null || n === undefined) return "";
+  if (n < 1024) return n + " B";
+  for (const [d, u] of [[1 << 30, "GiB"], [1 << 20, "MiB"], [1 << 10, "KiB"]]) if (n >= d) return (n / d).toFixed(n >= 10 * d ? 0 : 1) + " " + u;
+}
+function person(ident) { const m = /^(.*?)\s*<[^>]*>/.exec(ident || ""); return m ? m[1] : ident || ""; }
+function short(id) { return (id || "").slice(0, 8); }
+function shortRef(r) { return (r || "").replace(/^refs\/(heads|tags)\//, ""); }
+
+// ---- routing: #/r/<repo>/<view>/<ref>/<path…> (segments URI-encoded) -----
+function route() {
+  const p = location.hash.replace(/^#\/?/, "").split("/").map(decodeURIComponent);
+  return p;
+}
+function go(...segs) { location.hash = "#/" + segs.map(enc).join("/"); }
+function link(text, ...segs) { return h("a", { href: "#/" + segs.map(enc).join("/") }, text); }
+
+let repos = [], cur = null;
+
+async function boot() {
+  try { me = await api("/api/whoami"); } catch (e) { me = { user: "anonymous", signed_in: false }; if (token || sso) tell(e); }
+  $("#who").textContent = me.signed_in ? me.user + (me.admin ? " · admin" : "") : "anonymous";
+  $("#who").className = "who" + (me.admin ? " admin" : "");
+  $("#ssobtn").hidden = !(me.sso && !me.signed_in);
+  $("#outbtn").hidden = !(token || sso);
+  $("#tokbtn").hidden = !!me.signed_in;
+  render();
+}
+
+async function render() {
+  const p = route();
+  const v = $("#view");
+  try {
+    if (p[0] === "r" && p[1]) await repoView(v, p[1], p[2] || "tree", p[3] || "", p.slice(4).join("/"));
+    else if (p[0] === "tokens") await tokensView(v);
+    else if (p[0] === "status") await statusView(v);
+    else await homeView(v);
+  } catch (e) {
+    v.replaceChildren(h("div", { class: "panel" }, h("div", { class: "empty" }, e.message, me && !me.signed_in ? h("p", {}, "Private repositories need an access token.") : null)));
+  }
+  window.scrollTo(0, 0);
+}
+addEventListener("hashchange", render);
+
+// ---- home ------------------------------------------------------------------
+async function homeView(v) {
+  const { repos: list } = await api("/api/repos");
+  repos = list;
+  const grid = h("div", { class: "repos" }, list.map((r) => h("a", { class: "card", href: "#/r/" + enc(r.name) },
+    h("div", {}, h("span", { class: "name" }, r.name), " ", h("span", { class: "badge " + (r.public ? "pub" : "priv") }, r.public ? "public" : "private")),
+    h("p", {}, r.description || ""),
+    h("div", { class: "meta" }, r.refs !== null ? h("span", {}, r.refs + " refs") : null, r.bytes !== null ? h("span", {}, size(r.bytes)) : null,
+      r.updated ? h("span", {}, "updated " + ago(r.updated)) : h("span", {}, "created " + ago(r.created))))));
+  const kids = [h("h1", {}, "Repositories"), h("p", { class: "muted" }, list.length + " visible to " + (me.signed_in ? me.user : "anonymous visitors") +
+    ". Every object is encrypted before it reaches storage.")];
+  if (me.admin) kids.push(h("p", {}, h("button", { onclick: newRepo }, "New repository"), " ", h("a", { class: "btn", href: "#/tokens" }, "Access tokens"), " ", h("a", { class: "btn", href: "#/status" }, "Server status")));
+  kids.push(list.length ? grid : h("div", { class: "panel" }, h("div", { class: "empty" }, me.signed_in ? "No repositories yet. Push one: it is created on first push." : "No public repositories. Use an access token to see private ones.")));
+  v.replaceChildren(...kids);
+}
+
+function newRepo() {
+  const name = h("input", { placeholder: "name or team/name" }), desc = h("input", { placeholder: "optional" }), pub = h("input", { type: "checkbox", style: "width:auto" });
+  const d = h("dialog", {}, h("h2", {}, "New repository"), h("label", {}, "Name"), name, h("label", {}, "Description"), desc,
+    h("label", {}, pub, " public (anyone may clone and browse)"),
+    h("p", {}, h("button", { class: "primary", onclick: async () => {
+      try { await api("/api/repos", { method: "POST", body: { name: name.value.trim(), description: desc.value, public: pub.checked } }); d.close(); go("r", name.value.trim()); }
+      catch (e) { tell(e); }
+    } }, "Create"), " ", h("button", { onclick: () => d.close() }, "Cancel")));
+  document.body.append(d);
+  d.showModal();
+}
+
+// ---- a repository ------------------------------------------------------------
+async function repoView(v, name, view, ref, path) {
+  if (!cur || cur.name !== name || view === "tree" && !path) cur = await api("/api/repo?repo=" + enc(name));
+  const head = shortRef(cur.head);
+  ref = ref || head;
+  const empty = Object.keys(cur.refs).length === 0;
+  const branches = Object.keys(cur.refs).filter((r) => r.startsWith("refs/heads/")).map(shortRef);
+  const tags = Object.keys(cur.refs).filter((r) => r.startsWith("refs/tags/")).map(shortRef);
+  const sel = h("select", { style: "width:auto;min-width:160px", onchange: (e) => go("r", name, view === "commits" ? "commits" : "tree", e.target.value) },
+    h("optgroup", { label: "Branches" }, branches.map((b) => h("option", { value: b, selected: b === ref }, b))),
+    tags.length ? h("optgroup", { label: "Tags" }, tags.slice(-300).reverse().map((t) => h("option", { value: t, selected: t === ref }, t))) : null);
+  const tab = (id, label, target) => h("a", { href: target, class: view === id ? "on" : "" }, label);
+  const top = h("div", {},
+    h("h1", {}, link("Repositories"), h("span", { class: "faint" }, " / "), name, " ", h("span", { class: "badge " + (cur.public ? "pub" : "priv") }, cur.public ? "public" : "private")),
+    h("div", { class: "muted" }, size(cur.bytes) + " · " + cur.objects + " objects · " + branches.length + " branches · " + tags.length + " tags" + (cur.updated ? " · updated " + ago(cur.updated) : "")),
+    h("div", { class: "tabs" }, tab("tree", "Code", "#/r/" + enc(name) + "/tree/" + enc(ref)), tab("commits", "History", "#/r/" + enc(name) + "/commits/" + enc(ref)),
+      tab("clone", "Clone", "#/r/" + enc(name) + "/clone"), me.admin ? tab("settings", "Settings", "#/r/" + enc(name) + "/settings") : null));
+  const body = h("div", {});
+  v.replaceChildren(top, body);
+  if (view === "clone" || empty && view !== "settings") return cloneView(body, name, empty);
+  if (view === "settings") return settingsView(body, name);
+  if (view === "commits") return commitsView(body, name, ref, sel, 0);
+  if (view === "commit") return commitView(body, name, ref);
+  if (view === "blob") return blobView(body, name, ref, path, sel);
+  return treeView(body, name, ref, path, sel);
+}
+
+function crumbs(name, ref, path, last) {
+  const parts = path ? path.split("/") : [];
+  const out = [link(name.split("/").pop(), "r", name, "tree", ref)];
+  parts.forEach((p, i) => {
+    out.push(h("span", {}, "/"));
+    out.push(i === parts.length - 1 && last ? h("strong", {}, p) : link(p, "r", name, "tree", ref, ...parts.slice(0, i + 1)));
+  });
+  return h("div", { class: "crumbs" }, out);
+}
+
+async function treeView(body, name, ref, path, sel) {
+  const t = await api("/api/tree?repo=" + enc(name) + "&ref=" + enc(ref) + "&path=" + enc(path));
+  if (t.type === "blob") return go("r", name, "blob", ref, ...path.split("/"));
+  const log = await api("/api/log?repo=" + enc(name) + "&ref=" + enc(ref) + "&n=1").catch(() => null);
+  const last = log && log.commits[0];
+  const ico = { tree: "▸", blob: "·", symlink: "↪", commit: "⊙" };
+  const rows = t.entries.map((e) => {
+    const segs = (path ? path.split("/") : []).concat(e.name);
+    const nameCell = e.type === "tree" ? link(e.name + "/", "r", name, "tree", ref, ...segs)
+      : e.type === "commit" ? h("span", { class: "muted", title: "submodule at " + e.id }, e.name + " @ " + short(e.id))
+      : link(e.name, "r", name, "blob", ref, ...segs);
+    return h("tr", { class: "row" }, h("td", {}, h("span", { class: "ico" }, ico[e.type] || "·"), nameCell), h("td", { class: "size" }, e.type === "blob" ? size(e.size) : ""));
+  });
+  const panel = h("div", { class: "panel" },
+    h("div", { class: "head" }, sel, crumbs(name, ref, path), h("div", { class: "spacer" }),
+      last ? h("span", { class: "muted" }, link(short(last.id), "r", name, "commit", last.id), " ", last.subject.slice(0, 80), " · ", ago(last.time)) : null),
+    h("table", {}, h("tbody", {}, rows)));
+  body.replaceChildren(panel);
+  const readme = t.entries.find((e) => e.type === "blob" && /^readme(\.(md|txt|markdown|rst))?$/i.test(e.name));
+  if (readme && readme.size < 512 * 1024) {
+    const r = await api("/api/raw?repo=" + enc(name) + "&ref=" + enc(ref) + "&path=" + enc((path ? path + "/" : "") + readme.name), { raw: true });
+    if (r.ok) body.append(h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, readme.name)), h("pre", { class: "readme" }, await r.text())));
+  }
+}
+
+async function blobView(body, name, ref, path, sel) {
+  const url = "/api/raw?repo=" + enc(name) + "&ref=" + enc(ref) + "&path=" + enc(path);
+  const r = await api(url, { raw: true });
+  if (!r.ok) throw new Error(r.status === 404 ? "no such file" : "HTTP " + r.status);
+  const blob = await r.blob();
+  const isText = (r.headers.get("content-type") || "").startsWith("text/");
+  const dl = h("button", { onclick: () => { const a = h("a", { href: URL.createObjectURL(blob), download: path.split("/").pop() }); a.click(); } }, "Download");
+  const head = h("div", { class: "head" }, sel, crumbs(name, ref, path, true), h("div", { class: "spacer" }), h("span", { class: "faint mono" }, size(blob.size)), dl);
+  let content;
+  // raster formats only: an SVG is a document that can carry script, so it
+  // is shown as the text it is
+  if (/\.(png|jpe?g|gif|webp|ico|bmp)$/i.test(path)) {
+    const typed = new Blob([blob], { type: "image/" + path.split(".").pop().toLowerCase().replace("jpg", "jpeg") });
+    content = h("img", { class: "preview", src: URL.createObjectURL(typed), alt: path });
+  } else if (!isText) {
+    content = h("div", { class: "empty" }, "Binary file (" + size(blob.size) + ").");
+  } else if (blob.size > 2 << 20) {
+    content = h("div", { class: "empty" }, "Large file (" + size(blob.size) + "): download it to read.");
+  } else {
+    const text = await blob.text();
+    const pre = h("pre", { class: "code" });
+    const lines = text.split("\n");
+    if (lines.length && lines[lines.length - 1] === "") lines.pop();
+    for (const l of lines) pre.append(h("span", { class: "l" }, l + "\n"));
+    content = h("div", { style: "padding:12px 0;overflow:auto" }, pre);
+  }
+  body.replaceChildren(h("div", { class: "panel" }, head, content));
+}
+
+async function commitsView(body, name, ref, sel, skip) {
+  const n = 50;
+  const log = await api("/api/log?repo=" + enc(name) + "&ref=" + enc(ref) + "&n=" + n + "&skip=" + skip);
+  const list = h("div", {}, log.commits.map((c) => h("div", { class: "commit" },
+    h("div", { class: "s" }, link(c.subject || "(no message)", "r", name, "commit", c.id), h("div", { class: "by" }, person(c.author), " committed ", ago(c.time))),
+    link(h("span", { class: "sha" }, short(c.id)), "r", name, "commit", c.id))));
+  const more = log.commits.length === n ? h("button", { onclick: async () => commitsView(body, name, ref, sel, skip + n) }, "Older") : null;
+  const newer = skip > 0 ? h("button", { onclick: async () => commitsView(body, name, ref, sel, Math.max(0, skip - n)) }, "Newer") : null;
+  body.replaceChildren(h("div", { class: "panel" }, h("div", { class: "head" }, sel, h("span", { class: "muted" }, "History of " + ref), h("div", { class: "spacer" }), newer, more), list));
+}
+
+async function commitView(body, name, id) {
+  const c = await api("/api/commit?repo=" + enc(name) + "&id=" + enc(id));
+  const [subject, ...rest] = c.message.split("\n");
+  const changes = h("table", {}, h("tbody", {}, c.changes.map((x) => h("tr", { class: "row" },
+    h("td", { style: "width:90px" }, h("span", { class: "badge" }, x.change)),
+    h("td", { class: "mono" }, x.change === "deleted" ? x.path : link(x.path, "r", name, "blob", c.id, ...x.path.split("/")))))));
+  body.replaceChildren(
+    h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, subject)),
+      h("div", { class: "body" }, rest.join("\n").trim() ? h("pre", { class: "readme", style: "padding:0 0 12px" }, rest.join("\n").trim()) : null,
+        h("div", { class: "muted" }, person(c.author), " authored · ", person(c.committer), " committed ", ago(Number((c.committer.match(/ (\d+) [+-]\d{4}$/) || [])[1]))),
+        h("div", { class: "mono faint", style: "margin-top:8px" }, "commit ", c.id, c.parents.map((p) => h("div", {}, "parent ", link(p, "r", name, "commit", p)))),
+        h("p", {}, link("Browse files at this commit", "r", name, "tree", c.id)))),
+    h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, c.changes.length + " paths changed"), h("span", { class: "faint" }, c.parents.length ? "against the first parent" : "root commit")), changes));
+}
+
+function copyBox(text) {
+  const inp = h("input", { value: text, readonly: true, onfocus: (e) => e.target.select() });
+  return h("div", { class: "clone" }, inp, h("button", { onclick: async () => { try { await navigator.clipboard.writeText(text); tell("Copied"); } catch (e) { inp.select(); } } }, "Copy"));
+}
+
+function cloneView(body, name, empty) {
+  const url = location.origin + "/" + name + ".git";
+  const kids = [];
+  if (empty) kids.push(h("div", { class: "notice" }, "This repository is empty. Push to it to begin."));
+  if (cur.public) kids.push(h("label", {}, "Anyone can clone"), copyBox("git clone " + url));
+  kids.push(
+    h("label", {}, "With an access token (the Enclave gateway removes Authorization, so git sends the token as X-Api-Key)"),
+    copyBox('git -c http.extraHeader="X-Api-Key: $DEPOT_TOKEN" clone ' + url),
+    h("label", {}, "Or once, for every repository on this server"),
+    copyBox('git config --global http.' + location.origin + '/.extraHeader "X-Api-Key: $DEPOT_TOKEN"'),
+    h("label", {}, "Push an existing repository here"),
+    copyBox("git remote add depot " + url + " && git push depot --all && git push depot --tags"),
+    h("p", { class: "faint" }, "Protocol v2 and v0 fetch, shallow clones (--depth, --shallow-since), thin packs and atomic pushes are supported. Partial clone filters and Git LFS are not."));
+  body.replaceChildren(h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, "Clone")), h("div", { class: "body" }, kids)));
+}
+
+async function settingsView(body, name) {
+  const desc = h("input", { value: (repos.find((r) => r.name === name) || {}).description || "" });
+  const pub = h("input", { type: "checkbox", style: "width:auto", checked: cur.public });
+  const branches = Object.keys(cur.refs).filter((r) => r.startsWith("refs/heads/"));
+  const head = h("select", {}, branches.map((b) => h("option", { value: b, selected: b === cur.head }, shortRef(b))));
+  const confirmName = h("input", { placeholder: name });
+  body.replaceChildren(
+    h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, "Settings")), h("div", { class: "body" },
+      h("label", {}, "Description"), desc, h("label", {}, pub, " public: anyone may clone and browse"),
+      h("label", {}, "Default branch (HEAD)"), head,
+      h("p", {}, h("button", { class: "primary", onclick: async () => {
+        try {
+          cur = await api("/api/repo?repo=" + enc(name), { method: "PATCH", body: { description: desc.value, public: pub.checked, head: head.value || undefined } });
+          tell("Saved");
+        } catch (e) { tell(e); }
+      } }, "Save"), " ", h("button", { onclick: async () => { try { const v = await api("/api/maintenance?repo=" + enc(name), { method: "POST", body: {} }); tell("Packs: " + v.packs + (v.would_merge ? ", merging " + v.would_merge : ", nothing to merge")); } catch (e) { tell(e); } } }, "Repack now")))),
+    h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, "Delete")), h("div", { class: "body" },
+      h("p", { class: "muted" }, "Deletes the repository and every object of it from storage. Type its name to confirm."), confirmName,
+      h("p", {}, h("button", { class: "danger", onclick: async () => {
+        if (confirmName.value !== name) return tell("Type the repository name to confirm", true);
+        try { await api("/api/repo?repo=" + enc(name) + "&confirm=" + enc(name), { method: "DELETE" }); cur = null; go(""); tell("Deleted " + name); } catch (e) { tell(e); }
+      } }, "Delete " + name)))));
+}
+
+// ---- admin -------------------------------------------------------------------
+async function tokensView(v) {
+  const { tokens } = await api("/api/tokens");
+  const user = h("input", { placeholder: "ci, alice, deploy-bot…" }), read = h("input", { placeholder: "* or repo, team/*" }), write = h("input", { placeholder: "repo patterns (comma separated)" });
+  const note = h("input", { placeholder: "what it is for" }), days = h("input", { type: "number", placeholder: "never", min: 1, max: 3650 }), admin = h("input", { type: "checkbox", style: "width:auto" });
+  const out = h("div", {});
+  const list = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
+  v.replaceChildren(
+    h("h1", {}, "Access tokens"), h("p", { class: "muted" }, "Tokens are stored as hashes, sealed in storage. A token is shown once, when it is made."),
+    h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, "New token")), h("div", { class: "body" },
+      h("div", { class: "row2" }, h("div", {}, h("label", {}, "User"), user), h("div", {}, h("label", {}, "Note"), note)),
+      h("div", { class: "row2" }, h("div", {}, h("label", {}, "Read"), read), h("div", {}, h("label", {}, "Write"), write), h("div", {}, h("label", {}, "Expires in days"), days)),
+      h("label", {}, admin, " admin (every repository, tokens, settings)"),
+      h("p", {}, h("button", { class: "primary", onclick: async () => {
+        try {
+          const r = await api("/api/tokens", { method: "POST", body: { user: user.value.trim(), note: note.value, read: list(read.value), write: list(write.value), admin: admin.checked, expires_days: days.value ? Number(days.value) : undefined } });
+          out.replaceChildren(h("div", { class: "notice" }, "Copy this token now; it will not be shown again:"), h("div", { class: "secret" }, r.token),
+            h("label", {}, "git setup"), copyBox('git config --global http.' + location.origin + '/.extraHeader "X-Api-Key: ' + r.token + '"'));
+          tokensList();
+        } catch (e) { tell(e); }
+      } }, "Make token")), out)),
+    h("div", { class: "panel", id: "toklist" }));
+  const tokensList = async () => {
+    const { tokens } = await api("/api/tokens");
+    $("#toklist").replaceChildren(h("div", { class: "head" }, h("h2", {}, tokens.length + " tokens")),
+      tokens.length ? h("table", {}, h("thead", {}, h("tr", {}, ["User", "Access", "Note", "Created", "Expires", ""].map((x) => h("th", {}, x)))),
+        h("tbody", {}, tokens.map((t) => h("tr", { class: "row" }, h("td", {}, t.user, h("div", { class: "faint mono" }, t.id)),
+          h("td", { class: "mono" }, t.admin ? "admin" : [t.write.length ? "write " + t.write.join(", ") : "", t.read.length ? "read " + t.read.join(", ") : ""].filter(Boolean).join(" · ")),
+          h("td", { class: "muted" }, t.note, t.by ? h("div", { class: "faint" }, "by " + t.by) : null), h("td", { class: "when" }, ago(t.created)),
+          h("td", { class: "when" }, t.expires ? new Date(t.expires * 1000).toISOString().slice(0, 10) : "never"),
+          h("td", {}, h("button", { class: "danger", onclick: async () => { if (!confirm("Revoke this token? Anything using it stops working.")) return; try { await api("/api/tokens?id=" + enc(t.id), { method: "DELETE" }); tokensList(); } catch (e) { tell(e); } } }, "Revoke"))))))
+        : h("div", { class: "empty" }, "No minted tokens. Users from the app config still work."));
+  };
+  tokensList();
+}
+
+async function statusView(v) {
+  const s = await api("/api/status");
+  v.replaceChildren(h("h1", {}, "Server status"), h("div", { class: "panel" }, h("pre", { class: "readme" }, JSON.stringify(s, null, 2))));
+}
+
+// ---- wiring ------------------------------------------------------------------
+$("#tokbtn").onclick = () => { $("#tokin").value = ""; $("#tokdlg").showModal(); };
+$("#tokcancel").onclick = () => $("#tokdlg").close();
+$("#toksave").onclick = () => {
+  token = $("#tokin").value.trim() || null;
+  try { token ? sessionStorage.setItem("depot-token", token) : sessionStorage.removeItem("depot-token"); } catch (e) {}
+  $("#tokdlg").close();
+  cur = null;
+  boot();
+};
+$("#ssobtn").onclick = ssoStart;
+$("#outbtn").onclick = () => {
+  token = sso = null;
+  try { sessionStorage.removeItem("depot-token"); sessionStorage.removeItem("depot-sso"); } catch (e) {}
+  cur = null;
+  boot();
+};
+boot();

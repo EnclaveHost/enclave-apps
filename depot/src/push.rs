@@ -33,6 +33,14 @@ impl Budget {
     pub fn held(&self) -> u64 {
         self.0.get()
     }
+
+    /// A new, empty charge against this budget.
+    pub fn charge(&self) -> Charge {
+        Charge {
+            budget: self.clone(),
+            n: 0,
+        }
+    }
 }
 
 pub struct Charge {
@@ -41,15 +49,25 @@ pub struct Charge {
 }
 
 impl Charge {
-    fn add(&mut self, k: u64, cap: u64) -> Result<(), String> {
+    /// Raise this push's charge to `total` bytes (never lowers it).
+    pub fn set(&mut self, total: u64, cap: u64) -> Result<(), String> {
+        if total <= self.n {
+            return Ok(());
+        }
+        let k = total - self.n;
         if self.budget.0.get() + k > cap {
-            return Err(format!(
-                "the server is holding other pushes ({} MiB); try again shortly",
-                (self.budget.0.get() - self.n) >> 20
-            ));
+            let others = self.budget.0.get() - self.n;
+            return Err(if others > 0 {
+                format!(
+                    "the server is holding other pushes ({} MiB); try again shortly",
+                    others >> 20
+                )
+            } else {
+                format!("this push needs more than the server's {} MiB push allowance; push history in smaller pieces", cap >> 20)
+            });
         }
         self.budget.0.set(self.budget.0.get() + k);
-        self.n += k;
+        self.n = total;
         Ok(())
     }
 }
@@ -74,7 +92,8 @@ pub struct PushSink {
 
 impl PushSink {
     pub fn new(repo: &str, who: Who, limits: Limits, budget: Budget) -> PushSink {
-        let cap = limits.max_pack + (64 << 20);
+        // the pack (capped at max_pack on its own) plus room for its objects' bookkeeping
+        let cap = limits.max_pack + limits.max_pack / 4 + (64 << 20);
         PushSink {
             repo: repo.to_string(),
             who,
@@ -124,11 +143,11 @@ impl Sink<App> for PushSink {
             }
             return Ok(());
         }
-        if let Err(e) = self
-            .charge
-            .add(d.len() as u64, self.cap)
-            .and_then(|_| self.rx.feed(d))
-        {
+        // bytes held plus each parsed object's bookkeeping
+        let fed = self.rx.feed(d);
+        let parsed = self.rx.ingest.as_ref().map_or(0, |i| i.parsed()) as u64;
+        let total = self.rx.bytes + parsed * crate::git::ingest::OBJECT_COST;
+        if let Err(e) = fed.and_then(|_| self.charge.set(total, self.cap)) {
             self.failed = Some(e);
         }
         Ok(())
@@ -191,6 +210,8 @@ impl Sink<App> for PushSink {
             started: Instant::now(),
             last_progress: None,
             _charge: charge,
+            commit_attempted: false,
+            created: false,
         };
         Response::new(200)
             .with("cache-control", "no-cache")
@@ -235,6 +256,10 @@ pub struct PushJob {
     started: Instant,
     last_progress: Option<Instant>,
     _charge: Charge,
+    /// a manifest write was sent (so the pack may be committed)
+    commit_attempted: bool,
+    /// this push creates the repository
+    created: bool,
 }
 
 impl PushJob {
@@ -325,22 +350,7 @@ impl PushJob {
                 inc.connected(ix)?;
                 // a first judgement against the refs as they are now; the
                 // commit judges again against the refs it replaces
-                let pre: Vec<(String, Result<(), String>)> = self
-                    .cmds
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.name.clone(),
-                            receive::check(
-                                c,
-                                refs.get(&c.name),
-                                &inc,
-                                ix,
-                                app.cfg.is_protected(&c.name),
-                            ),
-                        )
-                    })
-                    .collect();
+                let pre = receive::judge(&self.cmds, refs, &inc, ix, |n| app.cfg.is_protected(n));
                 let any_ok = pre.iter().any(|(_, r)| r.is_ok());
                 let all_ok = pre.iter().all(|(_, r)| r.is_ok());
                 if !any_ok || (self.caps.atomic && !all_ok) {
@@ -352,6 +362,7 @@ impl PushJob {
                     return Err("repository does not exist".into());
                 }
                 if self.repo_id.is_none() {
+                    self.created = true;
                     self.repo_id = Some(crate::seal::random_id());
                 }
                 let objects = self.done.as_ref().map(|d| d.1.len()).unwrap_or(0);
@@ -466,18 +477,39 @@ impl PushJob {
         Ok(())
     }
 
+    /// Remove this push's pack after a failure, but only when it provably
+    /// did not commit. Once a manifest write was attempted, the pack may be
+    /// listed (our write landed, perhaps under a later writer's manifest):
+    /// it is deleted only if a fresh read of the manifest lists it neither
+    /// live nor retired. When that cannot be read, it stays for the orphan
+    /// sweep, which never removes a listed pack.
     fn cleanup(&mut self, app: &mut App) {
-        if let (Some(id), Some(up)) = (&self.repo_id, &self.upload) {
-            app.store.upload_abort(up);
-            let _ = app.store.delete_pack(id, &self.pack_id);
+        let (Some(id), Some(up)) = (self.repo_id.clone(), self.upload.as_ref()) else {
+            return;
+        };
+        app.store.upload_abort(up);
+        if self.commit_attempted {
+            let listed = app
+                .revalidate(&id, true)
+                .ok()
+                .and_then(|_| app.repos.get(&id))
+                .map(|r| r.m.lists(&self.pack_id));
+            if listed != Some(false) {
+                return;
+            }
         }
+        let _ = app.store.delete_pack(&id, &self.pack_id);
     }
 
     /// Judge every command against the manifest it replaces and swap it in.
     fn commit(&mut self, app: &mut App) -> Result<(), String> {
         let id = self.repo_id.clone().unwrap();
-        // a repository's first push registers it
+        // a repository's first push registers it; an existing one that left
+        // memory was deleted while this push ran, and stays deleted
         if !app.repos.contains_key(&id) {
+            if !self.created {
+                return Err("the repository was deleted during the push".into());
+            }
             register(app, &self.repo, &id)?;
             app.open(&self.repo)?
                 .filter(|x| *x == id)
@@ -495,6 +527,7 @@ impl PushJob {
                 objects: d.1.len() as u32,
                 chunk: crate::seal::CHUNK,
             });
+        let mut written: Option<Vec<(String, Result<(), String>)>> = None;
         for attempt in 0..8 {
             if attempt > 0 {
                 app.revalidate(&id, true)?;
@@ -503,22 +536,20 @@ impl PushJob {
                 .repos
                 .get(&id)
                 .ok_or("repository vanished during the push")?;
-            let judged: Vec<(String, Result<(), String>)> = self
-                .cmds
-                .iter()
-                .map(|c| {
-                    (
-                        c.name.clone(),
-                        receive::check(
-                            c,
-                            r.refs.get(&c.name),
-                            &inc,
-                            &r.ix,
-                            app.cfg.is_protected(&c.name),
-                        ),
-                    )
-                })
-                .collect();
+            // a write of ours that landed and was then built upon: the
+            // manifest lists our pack, so the push committed
+            if let (Some(p), Some(j)) = (&pack, &written) {
+                if r.m.lists(&p.id) {
+                    let j = j.clone();
+                    self.notify(app, &j);
+                    self.results = j;
+                    crate::maint::after_push(app, &id);
+                    return Ok(());
+                }
+            }
+            let judged = receive::judge(&self.cmds, &r.refs, &inc, &r.ix, |n| {
+                app.cfg.is_protected(n)
+            });
             let all_ok = judged.iter().all(|(_, x)| x.is_ok());
             let any_ok = judged.iter().any(|(_, x)| x.is_ok());
             if !any_ok || (self.caps.atomic && !all_ok) {
@@ -542,6 +573,8 @@ impl PushJob {
             }
             fix_head(&mut m, &app.cfg.default_branch);
             let etag = r.etag.clone();
+            self.commit_attempted = true;
+            written = Some(judged.clone());
             match app.store.save_manifest(&id, &mut m, etag.as_deref(), now()) {
                 Ok(Saved::Ok(t)) => {
                     let r = app.repos.get_mut(&id).unwrap();
@@ -557,37 +590,35 @@ impl PushJob {
                     r.m = m;
                     r.etag = Some(t);
                     r.checked = Instant::now();
-                    let updates: Vec<crate::hooks::Update> = self
-                        .cmds
-                        .iter()
-                        .zip(&judged)
-                        .filter(|(_, (_, r))| r.is_ok())
-                        .map(|(c, _)| crate::hooks::Update {
-                            name: &c.name,
-                            old: c.old.hex(),
-                            new: c.new.hex(),
-                        })
-                        .collect();
-                    crate::hooks::push_event(app, &self.repo, self.who.name(), &updates);
+                    self.notify(app, &judged);
                     self.results = judged;
                     crate::maint::after_push(app, &id);
                     return Ok(());
                 }
                 Ok(Saved::Conflict) => continue,
-                Err(e) => {
-                    // ambiguous: did it land?
-                    let writer = m.writer.clone();
-                    app.revalidate(&id, true)?;
-                    let r = app.repos.get(&id).unwrap();
-                    if r.m.writer == writer {
-                        self.results = judged;
-                        return Ok(());
-                    }
-                    return Err(format!("could not commit the push: {e}"));
-                }
+                // the store could not tell us whether the write landed; the
+                // pack stays (cleanup deletes only what is provably unlisted)
+                Err(e) => return Err(format!("could not commit the push: {e}")),
             }
         }
         Err("too many concurrent updates to this repository; push again".into())
+    }
+}
+
+impl PushJob {
+    fn notify(&self, app: &mut App, judged: &[(String, Result<(), String>)]) {
+        let updates: Vec<crate::hooks::Update> = self
+            .cmds
+            .iter()
+            .zip(judged)
+            .filter(|(_, (_, r))| r.is_ok())
+            .map(|(c, _)| crate::hooks::Update {
+                name: &c.name,
+                old: c.old.hex(),
+                new: c.new.hex(),
+            })
+            .collect();
+        crate::hooks::push_event(app, &self.repo, self.who.name(), &updates);
     }
 }
 
