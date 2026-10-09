@@ -10,10 +10,25 @@
   },
   "master_key": "$DEPOT_MASTER_KEY",
   "users": {
-    "admin": { "token": "$DEPOT_ADMIN_TOKEN", "admin": true }
+    "admin": {
+      "token": "$DEPOT_ADMIN_TOKEN",
+      "admin": true
+    }
   },
-  "protected": ["refs/heads/main", "refs/tags/v*"],
+  "protected": [
+    "refs/heads/main",
+    "refs/tags/v*"
+  ],
   "default_branch": "main",
   "max_push_mb": 1024,
-  "cache_mb": 256
+  "cache_mb": 256,
+  "witness": {
+    "endpoint": "https://s3.us-east-1.amazonaws.com",
+    "region": "us-east-1",
+    "bucket": "enclave-depot-witness",
+    "prefix": "depot/",
+    "access_key": "$DEPOT_WITNESS_ACCESS_KEY",
+    "secret_key": "$DEPOT_WITNESS_SECRET_KEY"
+  },
+  "keep_days": 30
 }

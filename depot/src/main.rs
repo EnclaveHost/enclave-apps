@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod egress;
 mod fetch;
+mod gc;
 mod git;
 mod hooks;
 mod maint;
@@ -17,6 +18,7 @@ mod serve;
 mod sso;
 mod store;
 mod tokens;
+mod witness;
 
 use std::time::Duration;
 
@@ -60,7 +62,16 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let store = store::Store::new(s3, &cfg.master_key, &st.prefix, cfg.cache_mb);
+    let mut store = store::Store::new(s3, &cfg.master_key, &st.prefix, cfg.cache_mb);
+    if let Some(w) = &cfg.witness {
+        match s3::S3::new(&w.endpoint, &w.region, &w.bucket, &w.access_key, &w.secret_key) {
+            Ok(s) => store.set_witness(s, &w.prefix),
+            Err(e) => {
+                eprintln!("[depot] witness: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut app = app::App::new(cfg, store);
     // storage must answer (and the master key must open the registry) before we serve
     for attempt in 0.. {
@@ -69,6 +80,12 @@ fn main() {
             .and_then(|_| app.tokens.refresh(&mut app.store, true))
         {
             Ok(()) => break,
+            // storage is older than the witness: serve, refusing what is
+            // affected, so an admin can look and decide (POST /api/witness)
+            Err(e) if app.store.witness.as_ref().is_some_and(|w| !w.rolled.is_empty()) => {
+                eprintln!("[depot] ROLLBACK DETECTED: {e}");
+                break;
+            }
             Err(e) if attempt < 5 => {
                 eprintln!("[depot] storage not ready ({e}); retrying");
                 std::thread::sleep(Duration::from_secs(2));

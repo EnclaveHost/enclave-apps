@@ -153,8 +153,11 @@ def main():
                 req = http("POST", "/w/fz.git/git-upload-pack", zlib.compress(v0)[:-rng.randint(0, 6)] if rng.random() < .5 else os.urandom(50),
                            {"content-encoding": "gzip"})
             elif kind == 6:
-                path = rng.choice(["/api/tokens", "/api/repos", "/api/repo?repo=w/fz", "/api/maintenance?repo=w/fz"])
-                req = http(rng.choice(["POST", "PATCH", "DELETE"]), path, mutate(b'{"name":"x","user":"u","read":["*"],"head":"main"}'))
+                path = rng.choice(["/api/tokens", "/api/repos", "/api/repo?repo=w/fz", "/api/maintenance?repo=w/fz",
+                                   "/api/maintenance?repo=w/fz&gc=1", "/api/maintenance?repo=w/fz&purge=1",
+                                   "/api/restore?repo=w/fz", "/api/witness"])
+                body = b'{"name":"x","user":"u","read":["*"],"head":"main","ref":"r","id":"' + head.encode() + b'"}'
+                req = http(rng.choice(["POST", "PATCH", "DELETE"]), path, mutate(body))
             elif kind == 7:
                 q = rng.choice(["/api/tree?repo=w/fz&path=", "/api/raw?repo=w/fz&path=", "/api/log?repo=w/fz&n=", "/api/commit?repo=w/fz&id="])
                 req = http("GET", q + "".join(rng.choice("abc/%.._~0123456789ffzz\\x00") for _ in range(rng.randint(0, 60))))

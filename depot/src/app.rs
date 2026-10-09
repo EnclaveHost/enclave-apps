@@ -29,8 +29,15 @@ pub fn now() -> u64 {
 pub struct Repo {
     /// the index may not match the manifest (a re-index failed): rebuild it
     pub stale: bool,
+    /// bumped whenever the index is rebuilt rather than extended: objects
+    /// may have left it (a collection), so checks made against an earlier
+    /// generation must be made again
+    pub gen: u64,
     /// what readers may fetch, for one (revision, index size)
     pub reach_cache: Option<((u64, usize), Rc<crate::git::walk::Bits>)>,
+    /// what a collection would keep (objects, bytes), for one (revision,
+    /// index size, dropped values still kept)
+    pub gc_cache: Option<((u64, usize, usize), (usize, u64))>,
     pub name: String,
     pub m: Manifest,
     pub etag: Option<String>,
@@ -290,7 +297,9 @@ impl App {
             id.to_string(),
             Repo {
                 stale: false,
+                gen: 0,
                 reach_cache: None,
+                gc_cache: None,
                 name: name.to_string(),
                 m,
                 etag,
@@ -309,6 +318,18 @@ impl App {
             r.stale = true;
             r.etag = None;
         }
+    }
+
+    /// Forget everything loaded, so the next request reads storage afresh
+    /// (after an admin accepted storage's copy over the witness's).
+    pub fn reset_from_storage(&mut self) {
+        self.repos.clear();
+        self.reg = Registry::default();
+        self.reg_etag = None;
+        self.reg_checked = None;
+        self.tokens = crate::tokens::Tokens::new();
+        let _ = self.refresh_registry(true);
+        let _ = self.tokens.refresh(&mut self.store, true);
     }
 
     /// Is this pack still read by a fetch in flight (it holds the record)?
@@ -376,6 +397,7 @@ impl App {
                 }
             }
             r.ix = ix;
+            r.gen += 1;
             r.stale = false;
         }
         let r = self.repos.get_mut(id).unwrap();

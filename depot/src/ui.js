@@ -298,12 +298,40 @@ async function settingsView(body, name) {
           tell("Saved");
         } catch (e) { tell(e); }
       } }, "Save"), " ", h("button", { onclick: async () => { try { const v = await api("/api/maintenance?repo=" + enc(name), { method: "POST", body: {} }); tell("Packs: " + v.packs + (v.would_merge ? ", merging " + v.would_merge : ", nothing to merge")); } catch (e) { tell(e); } } }, "Repack now")))),
+    droppedPanel(name),
     h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, "Delete")), h("div", { class: "body" },
       h("p", { class: "muted" }, "Deletes the repository and every object of it from storage. Type its name to confirm."), confirmName,
       h("p", {}, h("button", { class: "danger", onclick: async () => {
         if (confirmName.value !== name) return tell("Type the repository name to confirm", true);
         try { await api("/api/repo?repo=" + enc(name) + "&confirm=" + enc(name), { method: "DELETE" }); cur = null; go(""); tell("Deleted " + name); } catch (e) { tell(e); }
       } }, "Delete " + name)))));
+}
+
+// History force pushes and deletes left behind: kept (never served) until it
+// expires, restorable as a new branch, collectable now.
+function droppedPanel(name) {
+  const dropped = cur.dropped || [];
+  const reload = async () => { cur = await api("/api/repo?repo=" + enc(name)); render(); };
+  const maint = async (q, what) => {
+    try {
+      const v = await api("/api/maintenance?repo=" + enc(name) + "&" + q, { method: "POST", body: {} });
+      tell(what + " queued: " + v.garbage.objects + " objects (" + size(v.garbage.bytes) + ") to collect");
+    } catch (e) { tell(e); }
+  };
+  const rows = dropped.map((d) => h("div", { class: "drop" },
+    h("code", {}, short(d.id)), " ", shortRef(d.ref), h("span", { class: "faint" }, " · " + (d.by || "?") + " · " + ago(d.at) + " · kept until " + new Date(d.until * 1000).toISOString().slice(0, 10)), " ",
+    h("button", { onclick: async () => {
+      const b = prompt("Restore " + short(d.id) + " as a new branch named", shortRef(d.ref) + "-restored");
+      if (!b) return;
+      try { await api("/api/restore?repo=" + enc(name), { method: "POST", body: { ref: b, id: d.id } }); tell("Restored " + b); await reload(); } catch (e) { tell(e); }
+    } }, "Restore")));
+  return h("div", { class: "panel" }, h("div", { class: "head" }, h("h2", {}, "Dropped history")), h("div", { class: "body" },
+    h("p", { class: "muted" }, "Commits a force push or a branch delete left behind. Nobody can fetch them; they are kept so they can be restored, then garbage-collected."),
+    rows.length ? rows : h("p", { class: "faint" }, "None."),
+    h("p", {}, h("button", { onclick: () => maint("gc=1", "Collection") }, "Collect garbage now"), " ",
+      h("button", { class: "danger", onclick: () => {
+        if (confirm("Delete all dropped history of " + name + " from storage now? This cannot be undone.")) maint("purge=1", "Purge");
+      } }, "Purge dropped history"))));
 }
 
 // ---- admin -------------------------------------------------------------------

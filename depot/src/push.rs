@@ -13,7 +13,7 @@ use crate::git::receive::{self, Caps, Command, Incoming, Receiver};
 use crate::git::repo::Index;
 use crate::git::segbuf::SegBuf;
 use crate::serve::{Response, Sink, Source};
-use crate::store::{Manifest, PackMeta, RepoMeta, Saved, Upload};
+use crate::store::{Dropped, Manifest, PackMeta, RepoMeta, Saved, Upload};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -212,6 +212,7 @@ impl Sink<App> for PushSink {
             _charge: charge,
             commit_attempted: false,
             created: false,
+            checked_gen: None,
         };
         Response::new(200)
             .with("cache-control", "no-cache")
@@ -260,6 +261,8 @@ pub struct PushJob {
     commit_attempted: bool,
     /// this push creates the repository
     created: bool,
+    /// the index generation connectivity was checked against
+    checked_gen: Option<u64>,
 }
 
 impl PushJob {
@@ -344,7 +347,10 @@ impl PushJob {
                 let empty_ix = Index::default();
                 let empty_refs = Default::default();
                 let (ix, refs) = match self.repo_id.as_deref().and_then(|id| app.repos.get(id)) {
-                    Some(r) => (&r.ix, &r.refs),
+                    Some(r) => {
+                        self.checked_gen = Some(r.gen);
+                        (&r.ix, &r.refs)
+                    }
                     None => (&empty_ix, &empty_refs),
                 };
                 inc.connected(ix)?;
@@ -368,11 +374,10 @@ impl PushJob {
                 let objects = self.done.as_ref().map(|d| d.1.len()).unwrap_or(0);
                 if objects > 0 {
                     let len = self.done.as_ref().unwrap().0.len() as u64;
-                    self.upload = Some(app.store.upload_begin(
-                        self.repo_id.as_ref().unwrap(),
-                        &self.pack_id,
-                        len,
-                    )?);
+                    self.upload = Some(
+                        app.store
+                            .upload_begin(self.repo_id.as_ref().unwrap(), &self.pack_id),
+                    );
                     self.progress(
                         out,
                         &format!(
@@ -389,12 +394,24 @@ impl PushJob {
             Stage::Upload => {
                 let up = self.upload.as_mut().unwrap();
                 let (bytes, entries) = self.done.as_ref().unwrap();
-                let (a, b) = app.store.next_part(up);
-                let finished = app
-                    .store
-                    .upload_part(up, &bytes.slice(a as usize, b as usize))?;
-                let (sent, total) = (up.sent, bytes.len() as u64);
-                if finished {
+                let total = bytes.len() as u64;
+                let at = up.written();
+                if at < total {
+                    let end = (at + crate::store::PART_BYTES).min(total);
+                    up.write(&bytes.slice(at as usize, end as usize));
+                    app.store.upload_step(up)?;
+                    let sent = up.sent;
+                    let msg = format!(
+                        "Storing: {:3}% ({:.1}/{:.1} MiB)\r",
+                        sent * 100 / total.max(1),
+                        sent as f64 / 1048576.0,
+                        total as f64 / 1048576.0
+                    );
+                    self.progress(out, &msg, false);
+                } else {
+                    if app.store.upload_finish(up)? != total {
+                        return Err("internal: stored pack length differs".into());
+                    }
                     app.store
                         .put_idx(self.repo_id.as_ref().unwrap(), &self.pack_id, entries)?;
                     self.progress(
@@ -407,14 +424,6 @@ impl PushJob {
                         true,
                     );
                     self.stage = Stage::Commit;
-                } else {
-                    let msg = format!(
-                        "Storing: {:3}% ({:.1}/{:.1} MiB)\r",
-                        sent * 100 / total.max(1),
-                        sent as f64 / 1048576.0,
-                        total as f64 / 1048576.0
-                    );
-                    self.progress(out, &msg, false);
                 }
             }
             Stage::Commit => {
@@ -547,6 +556,12 @@ impl PushJob {
                     return Ok(());
                 }
             }
+            // a collection since the check may have dropped objects this
+            // push builds on (ones no ref reached when it planned)
+            if self.checked_gen.is_some_and(|g| g != r.gen) {
+                inc.connected(&r.ix)?;
+                self.checked_gen = Some(r.gen);
+            }
             let judged = receive::judge(&self.cmds, &r.refs, &inc, &r.ix, |n| {
                 app.cfg.is_protected(n)
             });
@@ -557,14 +572,28 @@ impl PushJob {
                 return Ok(());
             }
             let mut m: Manifest = r.m.clone();
+            let at = now();
             for (c, (_, res)) in self.cmds.iter().zip(&judged) {
-                if res.is_ok() {
-                    if c.new.is_zero() {
-                        m.refs.remove(&c.name);
-                    } else {
-                        m.refs.insert(c.name.clone(), c.new.hex());
-                    }
+                if res.is_err() || r.refs.get(&c.name).copied().unwrap_or_default() != c.old {
+                    continue; // refused, or already applied
                 }
+                if dropped(&inc, &r.ix, c) {
+                    m.dropped.push(Dropped {
+                        id: c.old.hex(),
+                        name: c.name.clone(),
+                        at,
+                        by: self.who.name().to_string(),
+                    });
+                }
+                if c.new.is_zero() {
+                    m.refs.remove(&c.name);
+                } else {
+                    m.refs.insert(c.name.clone(), c.new.hex());
+                }
+            }
+            if m.dropped.len() > MAX_DROPPED {
+                let n = m.dropped.len() - MAX_DROPPED;
+                m.dropped.drain(..n); // the oldest go early
             }
             if let Some(p) = &pack {
                 if !m.packs.iter().any(|x| x.id == p.id) {
@@ -620,6 +649,23 @@ impl PushJob {
             .collect();
         crate::hooks::push_event(app, &self.repo, self.who.name(), &updates);
     }
+}
+
+/// The most dropped ref values a manifest remembers.
+const MAX_DROPPED: usize = 20_000;
+
+/// Does this update leave the ref's old value behind (a delete, or a move
+/// that is not a fast-forward)? Its history is then only kept for a while.
+fn dropped(inc: &Incoming, ix: &Index, c: &Command) -> bool {
+    if c.old.is_zero() {
+        return false;
+    }
+    if c.new.is_zero() {
+        return true;
+    }
+    let commits = inc.kind(ix, &c.old) == Some(crate::git::Kind::Commit)
+        && inc.kind(ix, &c.new) == Some(crate::git::Kind::Commit);
+    !(commits && inc.is_ancestor(ix, &c.old, &c.new))
 }
 
 fn atomic_results(

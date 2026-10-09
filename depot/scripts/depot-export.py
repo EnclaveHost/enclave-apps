@@ -9,7 +9,7 @@ key, nothing else (Python 3 with `cryptography`, and git).
         --bucket <bucket> [--prefix depot/] [--region auto] --out ./export [--repo NAME …]
 
 Each pack is decrypted chunk by chunk (ChaCha20-Poly1305, every chunk
-authenticated against its object key, position and the pack's length) into
+authenticated against its object key, position, and whether it is the last) into
 objects/pack/, indexed with `git index-pack`, and the refs and HEAD from the
 manifest are written; `git fsck` runs on the result. The format is the one
 src/seal.rs and src/store.rs document.
@@ -108,7 +108,7 @@ def export_pack(s3, keys, prefix, repo_id, pack, dest):
             plen = min(chunk, total - k * chunk)
             ct = raw[off:off + plen + TAG]
             off += plen + TAG
-            aad = b"DEPK1" + struct.pack(">I", len(okey)) + okey.encode() + struct.pack(">QIQ", total, chunk, k)
+            aad = b"DEPK2" + struct.pack(">I", len(okey)) + okey.encode() + struct.pack(">IQB", chunk, k, k == n - 1)
             out.write(aead.decrypt(b"\0\0\0\0" + struct.pack(">Q", k), ct, aad))
         i = j
     out.close()

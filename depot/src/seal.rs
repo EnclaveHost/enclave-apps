@@ -7,16 +7,18 @@
 //! - packs are sealed in fixed-size chunks so a fetch can range-read the
 //!   part it needs. Chunk `i` is `ciphertext+tag` at `i * (CHUNK + 16)`,
 //!   nonce = the chunk index, and the associated data binds the object key,
-//!   the pack's total length, the chunk size and the index, so chunks
-//!   cannot be reordered, truncated or moved to another pack. Each pack has
-//!   its own key (derived from its random id), which is what makes a
-//!   counter nonce safe.
+//!   the chunk size, the index and whether the chunk is the last one (the
+//!   STREAM construction), so chunks cannot be reordered, dropped, moved to
+//!   another pack, nor the pack cut short. Marking the last chunk instead of
+//!   binding the total length lets a pack be sealed as it is produced,
+//!   before its length is known. Each pack has its own key (derived from its
+//!   random id), which is what makes a counter nonce safe.
 //!
 //! Whoever holds the master secret can decrypt everything; the bucket's
 //! operator sees object sizes and counts, never names, refs or content.
 //! Authentication detects alteration, not rollback to an older valid
-//! object (the manifest's revision counter catches that within a process
-//! lifetime only).
+//! object: revision counters catch that within a process lifetime, and a
+//! witness store (src/witness.rs) across restarts.
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
@@ -95,7 +97,9 @@ pub fn open(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String
     Ok(buf)
 }
 
-/// The chunked form of one pack object.
+/// The chunked form of one pack object. `total` is the plaintext length
+/// when it is known (always, for reading); a pack sealed as it streams only
+/// needs to know, for each chunk, whether it is the last.
 pub struct Chunked {
     cipher: ChaCha20Poly1305,
     object_key: String,
@@ -121,17 +125,14 @@ impl Chunked {
     pub fn cipher_offset(&self, i: u64) -> u64 {
         i * (self.chunk as u64 + TAG as u64)
     }
-    pub fn cipher_total(&self) -> u64 {
-        self.total + self.chunks() * TAG as u64
-    }
-    fn aad(&self, i: u64) -> Vec<u8> {
-        let mut a = Vec::with_capacity(self.object_key.len() + 40);
-        a.extend_from_slice(b"DEPK1");
+    fn aad(&self, i: u64, last: bool) -> Vec<u8> {
+        let mut a = Vec::with_capacity(self.object_key.len() + 32);
+        a.extend_from_slice(b"DEPK2");
         a.extend_from_slice(&(self.object_key.len() as u32).to_be_bytes());
         a.extend_from_slice(self.object_key.as_bytes());
-        a.extend_from_slice(&self.total.to_be_bytes());
         a.extend_from_slice(&self.chunk.to_be_bytes());
         a.extend_from_slice(&i.to_be_bytes());
+        a.push(last as u8);
         a
     }
     fn nonce(i: u64) -> [u8; 12] {
@@ -139,12 +140,15 @@ impl Chunked {
         n[4..].copy_from_slice(&i.to_be_bytes());
         n
     }
-    /// Encrypt chunk `i` (exactly `plain_len(i)` bytes) in place; appends the tag.
-    pub fn seal_chunk(&self, i: u64, buf: &mut Vec<u8>) {
-        debug_assert_eq!(buf.len() as u64, self.plain_len(i));
+    /// Encrypt chunk `i` in place and append its tag. Every chunk but the
+    /// last holds exactly `chunk` bytes; the last holds 1..=`chunk` (or 0,
+    /// for an empty object).
+    pub fn seal_chunk(&self, i: u64, buf: &mut Vec<u8>, last: bool) {
+        debug_assert!(buf.len() <= self.chunk as usize);
+        debug_assert!(last || buf.len() == self.chunk as usize);
         let tag = self
             .cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&Self::nonce(i)), &self.aad(i), buf)
+            .encrypt_in_place_detached(Nonce::from_slice(&Self::nonce(i)), &self.aad(i, last), buf)
             .expect("chunk seals");
         buf.extend_from_slice(&tag);
     }
@@ -156,8 +160,14 @@ impl Chunked {
         let t = buf.len() - TAG;
         let tag = *Tag::from_slice(&buf[t..]);
         buf.truncate(t);
+        let last = i + 1 == self.chunks();
         self.cipher
-            .decrypt_in_place_detached(Nonce::from_slice(&Self::nonce(i)), &self.aad(i), buf, &tag)
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&Self::nonce(i)),
+                &self.aad(i, last),
+                buf,
+                &tag,
+            )
             .map_err(|_| {
                 "a stored pack chunk failed authentication (altered, moved, or wrong key)"
                     .to_string()
@@ -195,20 +205,29 @@ mod tests {
         for i in 0..c.chunks() {
             let s = (i * 300) as usize;
             let mut b = data[s..s + c.plain_len(i) as usize].to_vec();
-            c.seal_chunk(i, &mut b);
+            c.seal_chunk(i, &mut b, i + 1 == c.chunks());
             assert_eq!(c.cipher_offset(i), sealed.len() as u64);
             sealed.extend_from_slice(&b);
         }
-        assert_eq!(sealed.len() as u64, c.cipher_total());
+        assert_eq!(sealed.len() as u64, 1000 + 4 * TAG as u64);
         let mut c1 = sealed[316..632].to_vec();
         c.open_chunk(1, &mut c1).unwrap();
         assert_eq!(c1, &data[300..600]);
         let mut c1 = sealed[316..632].to_vec();
         assert!(c.open_chunk(2, &mut c1).is_err(), "moved chunk");
-        let other = Chunked::new(&key, "r/1/p.pack", 1300, 300);
-        let mut c0 = sealed[..316].to_vec();
-        assert!(other.open_chunk(0, &mut c0).is_err(), "length is bound");
         let mut last = sealed[948..].to_vec();
         c.open_chunk(3, &mut last).unwrap();
+        // cut short at a chunk boundary: the new last chunk was not sealed as last
+        let cut = Chunked::new(&key, "r/1/p.pack", 900, 300);
+        let mut c2 = sealed[632..948].to_vec();
+        assert!(cut.open_chunk(2, &mut c2).is_err(), "truncation is detected");
+        // extended: a full last chunk read as a middle one
+        let full = Chunked::new(&key, "r/1/q.pack", 900, 300);
+        let mut f2 = data[600..900].to_vec();
+        full.seal_chunk(2, &mut f2, true);
+        let longer = Chunked::new(&key, "r/1/q.pack", 1200, 300);
+        let mut g2 = f2.clone();
+        assert!(longer.open_chunk(2, &mut g2).is_err(), "extension is detected");
+        full.open_chunk(2, &mut f2).unwrap();
     }
 }

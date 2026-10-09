@@ -6,6 +6,10 @@
 //! (thin), and resolved into a whole object only when neither holds.
 //! Stored bytes are read in windows of nearby entries, and an entry larger
 //! than a window streams through without being held whole.
+//!
+//! The same generator rewrites a repository during garbage collection: the
+//! send set is everything to keep, and `placed` records where each object
+//! went, from which the new pack's index is built.
 
 use super::pack::{self, OFS_DELTA, REF_DELTA};
 use super::repo::{Index, PackInfo, NONE};
@@ -38,6 +42,17 @@ struct Item {
     base_oid: Oid,
 }
 
+/// Where one object went in the generated pack.
+#[derive(Clone, Copy, Debug)]
+pub struct Placed {
+    pub idx: u32,
+    pub offset: u64,
+    /// as written: a whole object's type, OFS_DELTA or REF_DELTA
+    pub stored: u8,
+    /// the delta base (an index into the source index), or NONE
+    pub base: u32,
+}
+
 enum Stage {
     Header,
     Items,
@@ -66,6 +81,8 @@ pub struct Gen {
     stage: Stage,
     pub resolved: usize,
     pub bytes_read: u64,
+    /// filled when recording (`record`)
+    pub placed: Option<Vec<Placed>>,
 }
 
 impl Gen {
@@ -110,7 +127,19 @@ impl Gen {
             stage: Stage::Header,
             resolved: 0,
             bytes_read: 0,
+            placed: None,
         }
+    }
+
+    /// Record where every object goes (see `placed`).
+    pub fn record(mut self) -> Gen {
+        self.placed = Some(Vec::with_capacity(self.items.len()));
+        self
+    }
+
+    /// Bytes produced so far.
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     pub fn total(&self) -> usize {
@@ -246,13 +275,21 @@ impl Gen {
         let here = self.written;
         let mut head = Vec::with_capacity(32);
         let mut resolve = false;
+        let mut placed = Placed {
+            idx,
+            offset: here,
+            stored,
+            base: NONE,
+        };
         if stored == OFS_DELTA || stored == REF_DELTA {
             if let Some(&at) = self.emitted.get(&base).filter(|_| self.ofs) {
                 pack::encode_header(OFS_DELTA, h.size, &mut head);
                 pack::encode_ofs(here - at, &mut head);
+                (placed.stored, placed.base) = (OFS_DELTA, base);
             } else if self.in_send.get(base) || (self.thin && self.has.get(base)) {
                 pack::encode_header(REF_DELTA, h.size, &mut head);
                 head.extend_from_slice(&base_oid.0);
+                (placed.stored, placed.base) = (REF_DELTA, base);
             } else {
                 resolve = true;
             }
@@ -262,6 +299,10 @@ impl Gen {
         self.emitted.insert(idx, here);
         if resolve {
             let (kind, data) = io.object(&oid)?;
+            placed.stored = kind as u8;
+            if let Some(p) = &mut self.placed {
+                p.push(placed);
+            }
             let mut b = Vec::with_capacity(data.len() / 2 + 32);
             pack::encode_header(kind as u8, data.len() as u64, &mut b);
             b.extend_from_slice(&pack::deflate(&data));
@@ -269,6 +310,9 @@ impl Gen {
             self.resolved += 1;
             self.pos += 1;
             return Ok(());
+        }
+        if let Some(p) = &mut self.placed {
+            p.push(placed);
         }
         self.emit(out, &head);
         let data_start = offset + h.header_len as u64;

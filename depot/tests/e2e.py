@@ -26,6 +26,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AK, SK = "depotaccesskey01", "depotsecretkey0123456789"
 BUCKET = "depot-e2e"
+WITNESS = "depot-witness"
 TOKENS = {
     "admin": "adm-" + "a1" * 16,
     "reader": "rdr-" + "b2" * 16,
@@ -124,6 +125,7 @@ class Env:
         else:
             die("minio did not come up")
         self.s3curl("PUT", f"/{BUCKET}")
+        self.s3curl("PUT", f"/{WITNESS}")
         self.depot_s3 = self.s3
         if self.args.flaky_storage:
             port = free_port()
@@ -138,6 +140,25 @@ class Env:
         cmd = ["curl", "-s", "-X", method, "--aws-sigv4", "aws:amz:us-east-1:s3", "--user", f"{AK}:{SK}",
                "-o", out or "/dev/null", "-w", "%{http_code}", f"{self.s3}{path}"]
         return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+    def get_object(self, key, bucket=BUCKET):
+        out = os.path.join(self.work, "obj.bin")
+        if self.s3curl("GET", f"/{bucket}/{key}", out) != "200":
+            return None
+        return open(out, "rb").read()
+
+    def put_object(self, key, data, bucket=BUCKET):
+        f = os.path.join(self.work, "put.bin")
+        open(f, "wb").write(data)
+        subprocess.run(["curl", "-s", "-o", "/dev/null", "-X", "PUT", "--aws-sigv4", "aws:amz:us-east-1:s3", "--user",
+                        f"{AK}:{SK}", "-T", f, f"{self.s3}/{bucket}/{key}"], check=True)
+
+    def opened(self, key):
+        """A sealed document's plaintext, decrypted as scripts/depot-export.py does."""
+        ex = export_module()
+        k = key.split("/", 1)[1]
+        scope = "registry" if k == "registry" else "tokens" if k == "tokens" else "repo:" + k.split("/")[1]
+        return json.loads(ex.open_sealed(ex.Keys("m" * 40).derive(scope), key.encode(), self.get_object(key)))
 
     def bucket_objects(self):
         out = os.path.join(self.work, "list.xml")
@@ -189,12 +210,14 @@ class Env:
             "cache_mb": 64,
             "title": "depot e2e",
             "hooks": [{"url": f"http://127.0.0.1:{self.hook_port}/hook", "secret": "$E2E_HOOK", "repos": ["w/*"]}],
+            "witness": {"endpoint": self.depot_s3, "region": "us-east-1", "bucket": WITNESS, "prefix": "w/",
+                        "access_key": "$E2E_AK", "secret_key": "$E2E_SK"},
         }
         if extra:
             c.update(extra)
-        return json.dumps(c)
+        return json.dumps({k: v for k, v in c.items() if v is not None})
 
-    def start_depot(self, extra=None):
+    def start_depot(self, extra=None, env_extra=None):
         self.port = free_port()
         env = dict(
             os.environ,
@@ -209,7 +232,13 @@ class Env:
             DEPOT_RETIRE_GRACE="2",
             DEPOT_SWEEP_EVERY="1",
             DEPOT_ORPHAN_AGE="5",
+            DEPOT_COLLECT_HOLD="2",
         )
+        tunables = ["DEPOT_RETIRE_GRACE", "DEPOT_SWEEP_EVERY", "DEPOT_ORPHAN_AGE", "DEPOT_COLLECT_HOLD"]
+        for k, v in (env_extra or {}).items():
+            env[k] = v
+            if k not in tunables:
+                tunables.append(k)
         if self.args.platform:
             if not getattr(self, "socks_port", None):
                 self.socks_port = free_port()
@@ -240,7 +269,7 @@ class Env:
             cmd = [os.path.join(ROOT, "target/release/depot")]
         else:
             envs = ["--env", "ENCLAVE_EGRESS"] if self.args.platform else []
-            for k in ["ENCLAVE_CONFIG", "ENCLAVE_PORTS", *secret_envs, "DEPOT_RETIRE_GRACE", "DEPOT_SWEEP_EVERY", "DEPOT_ORPHAN_AGE"]:
+            for k in ["ENCLAVE_CONFIG", "ENCLAVE_PORTS", *secret_envs, *tunables]:
                 envs += ["--env", k]
             cmd = ["wasmtime", "run", "-S", "inherit-network=y", "-S", "allow-ip-name-lookup=y", "-W",
                    f"max-memory-size={self.args.mem << 20}", *dirs, *envs, self.args.wasm]
@@ -305,6 +334,33 @@ class Env:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
+
+
+_export = None
+
+
+def export_module():
+    global _export
+    if _export is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("depot_export", os.path.join(ROOT, "scripts/depot-export.py"))
+        _export = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_export)
+    return _export
+
+
+def pkt(s):
+    b = s if isinstance(s, bytes) else s.encode()
+    return b"%04x" % (len(b) + 4) + b
+
+
+def wait_for(what, cond, tries=150, delay=0.1):
+    for _ in range(tries):
+        v = cond()
+        if v:
+            return v
+        time.sleep(delay)
+    die(f"timed out waiting for {what}")
 
 
 def refs_of(env, path):
@@ -802,6 +858,133 @@ def run(env, args):
         die("the orphan sweep removed a listed pack")
     ok("orphaned uploads are swept; listed packs are untouched")
 
+    print("== garbage collection: dropped history is kept, restorable by an admin, then collected")
+    gcd = os.path.join(W, "gcsrc")
+    env.git("init", "-q", "-b", "main", gcd)
+    for i in range(3):
+        open(os.path.join(gcd, f"g{i}.txt"), "w").write(f"gc {i}\n" * 50)
+        env.git("add", "-A", cwd=gcd)
+        env.git("commit", "-qm", f"g{i}", cwd=gcd)
+    env.git("push", "-q", env.url("w/gc", "writer"), "main", cwd=gcd)
+    secret = "LEAKED-SECRET-" + os.urandom(8).hex()
+    env.git("checkout", "-q", "-b", "leak", cwd=gcd)
+    open(os.path.join(gcd, "leak.txt"), "w").write(secret + "\n")
+    env.git("add", "-A", cwd=gcd)
+    env.git("commit", "-qm", "oops", cwd=gcd)
+    leak_tip = env.git("rev-parse", "HEAD", cwd=gcd).stdout.strip()
+    leak_blob = env.git("rev-parse", "HEAD:leak.txt", cwd=gcd).stdout.strip()
+    env.git("push", "-q", env.url("w/gc", "writer"), "leak", cwd=gcd)
+    env.git("checkout", "-q", "-b", "old", "main", cwd=gcd)
+    open(os.path.join(gcd, "old.txt"), "w").write("old branch " + os.urandom(8).hex())
+    env.git("add", "-A", cwd=gcd)
+    env.git("commit", "-qm", "old", cwd=gcd)
+    old_tip = env.git("rev-parse", "HEAD", cwd=gcd).stdout.strip()
+    env.git("push", "-q", env.url("w/gc", "writer"), "old", cwd=gcd)
+    env.git("checkout", "-q", "leak", cwd=gcd)
+    env.git("reset", "-q", "--hard", "HEAD~1", cwd=gcd)
+    env.git("push", "-q", "-f", env.url("w/gc", "writer"), "leak", cwd=gcd)
+    env.git("push", "-q", env.url("w/gc", "writer"), ":old", cwd=gcd)
+    info = lambda who="admin": json.loads(env.api("/api/repo?repo=w/gc", who)[1])
+    dropped = {d["id"]: d for d in info()["dropped"]}
+    if not {leak_tip, old_tip} <= set(dropped) or dropped[leak_tip]["by"] != "writer":
+        die(f"dropped history not recorded: {dropped}")
+    if info("reader")["dropped"] is not None:
+        die("a reader sees dropped history")
+    ok("force pushes and deletes are recorded as dropped history, visible to admins only")
+    st, _ = env.api("/api/restore?repo=w/gc", "writer", "POST", {"ref": "rescued", "id": leak_tip})
+    if st != 403:
+        die(f"a non-admin restored history ({st})")
+    st, body = env.api("/api/restore?repo=w/gc", "admin", "POST", {"ref": "rescued", "id": leak_tip})
+    if st != 200:
+        die(f"restore: {st} {body}")
+    st, _ = env.api("/api/restore?repo=w/gc", "admin", "POST", {"ref": "rescued", "id": old_tip})
+    if st != 409:
+        die(f"restore over an existing ref was not refused ({st})")
+    resc = os.path.join(W, "rescued")
+    env.git("clone", "-q", "-b", "rescued", env.url("w/gc", "reader"), resc)
+    if open(os.path.join(resc, "leak.txt")).read().strip() != secret:
+        die("restored branch lacks its content")
+    env.git("push", "-q", env.url("w/gc", "admin"), ":rescued", cwd=gcd)
+    ok("an admin restores a dropped tip as a new branch; it clones complete")
+
+    def collections():
+        return json.loads(env.api("/api/status", "admin")[1])["maintenance"]["collections"]
+
+    def collect(params):
+        n0 = collections()
+        st, body = env.api(f"/api/maintenance?repo=w/gc&{params}", "admin", "POST", {})
+        if st != 200:
+            die(f"maintenance: {st} {body}")
+        wait_for("the collection", lambda: collections() > n0, tries=300)
+
+    before = info()
+    collect("gc=1")
+    after = info()
+    if after["packs"] != 1 or after["objects"] != before["objects"]:
+        die(f"collection inside the window: {before['objects']} -> {after['objects']} objects, {after['packs']} packs")
+    st, _ = env.api("/api/restore?repo=w/gc", "admin", "POST", {"ref": "rescued2", "id": old_tip})
+    if st != 200:
+        die("dropped history did not survive a collection inside its window")
+    env.git("push", "-q", env.url("w/gc", "admin"), ":rescued2", cwd=gcd)
+    ok(f"a collection inside the retention window keeps dropped history; {before['packs']} packs -> 1")
+    collect("purge=1")
+    after = info()
+    if after["dropped"] or after["objects"] > before["objects"] - 6:
+        die(f"purge kept dropped history: {after['dropped']}, {before['objects']} -> {after['objects']} objects")
+    st, _ = env.api("/api/restore?repo=w/gc", "admin", "POST", {"ref": "rescued3", "id": leak_tip})
+    if st != 404:
+        die(f"a purged commit could still be restored ({st})")
+    gcc = os.path.join(W, "gc-clone")
+    env.git("clone", "-q", "--mirror", env.url("w/gc", "reader"), gcc)
+    env.git("fsck", "--full", "--strict", cwd=gcc)
+    if env.git("cat-file", "-e", leak_blob, cwd=gcc, check=False).returncode == 0:
+        die("the purged blob came back in a clone")
+    env.git("checkout", "-q", "main", cwd=gcd)
+    open(os.path.join(gcd, "post.txt"), "w").write("after collection\n")
+    env.git("add", "-A", cwd=gcd)
+    env.git("commit", "-qm", "post", cwd=gcd)
+    env.git("push", "-q", env.url("w/gc", "writer"), "main", cwd=gcd)
+    env.git("fetch", "-q", cwd=gcc)
+    env.git("fsck", "--full", cwd=gcc)
+    ok(f"purge collects dropped history ({before['objects']} -> {after['objects']} objects); clone, push and fetch work after")
+    # a push during a collection that builds on what the collection drops:
+    # the collection must not commit (or the push's tip would be incomplete)
+    env.git("checkout", "-q", "-b", "racy", "main", cwd=gcd)
+    open(os.path.join(gcd, "racy.txt"), "w").write("racy " + os.urandom(8).hex())
+    env.git("add", "-A", cwd=gcd)
+    env.git("commit", "-qm", "racy", cwd=gcd)
+    racy = env.git("rev-parse", "HEAD", cwd=gcd).stdout.strip()
+    env.git("push", "-q", env.url("w/gc", "writer"), "racy", cwd=gcd)
+    env.git("push", "-q", "-f", env.url("w/gc", "writer"), "main:racy", cwd=gcd)
+    y = env.git("commit-tree", "-p", racy, "-m", "revive", racy + "^{tree}", cwd=gcd).stdout.strip()
+    one = subprocess.run(["git", "pack-objects", "--stdout"], cwd=gcd, input=(y + "\n").encode(), capture_output=True,
+                         env=env.git_env, check=True).stdout
+    body = pkt(f"{'0' * 40} {y} refs/heads/revive\0report-status\n") + b"0000" + one
+    n0 = collections()
+    env.api("/api/maintenance?repo=w/gc&purge=1", "admin", "POST", {})
+    wait_for("the collection to start", lambda: (json.loads(env.api("/api/status", "admin")[1])["maintenance"]["running"]
+                                                 or {}).get("kind") == "collect")
+    req = urllib.request.Request(f"{env.base}/w/gc.git/git-receive-pack", data=body, method="POST",
+                                 headers={"X-Api-Key": TOKENS["writer"],
+                                          "Content-Type": "application/x-git-receive-pack-request"})
+    rep = urllib.request.urlopen(req, timeout=30).read()
+    if b"ok refs/heads/revive" not in rep:
+        die(f"the push naming a dropped commit was refused: {rep[:300]}")
+    last = wait_for("the collection to finish", lambda: (lambda m: m["last"] if m["running"] is None else None)(
+        json.loads(env.api("/api/status", "admin")[1])["maintenance"]), tries=300)
+    if collections() != n0 or "abandoned" not in last:
+        die(f"a collection committed over a push that needs what it drops: {last}")
+    rc = os.path.join(W, "revive-clone")
+    env.git("clone", "-q", "--mirror", env.url("w/gc", "reader"), rc)
+    env.git("fsck", "--full", cwd=rc)
+    if env.git("rev-parse", "refs/heads/revive", cwd=rc).stdout.strip() != y:
+        die("revive is missing")
+    collect("gc=1")
+    rc2 = os.path.join(W, "revive-clone2")
+    env.git("clone", "-q", "--mirror", env.url("w/gc", "reader"), rc2)
+    env.git("fsck", "--full", cwd=rc2)
+    ok("a push landing mid-collection on dropped history stops that collection; the next keeps it")
+
     print("== restart: everything comes back from the bucket")
     env.stop_depot()
     env.start_depot()
@@ -837,7 +1020,7 @@ def run(env, args):
                     f"{AK}:{SK}", "-T", ctl, f"{env.s3}/control/plain"], check=True)
     if len({n for n, _ in scan(os.path.join(env.minio_dir, "control"))}) != len(needles):
         die("the plaintext scanner misses a plaintext object; this check would prove nothing")
-    hits = scan(os.path.join(env.minio_dir, BUCKET))
+    hits = scan(os.path.join(env.minio_dir, BUCKET)) + scan(os.path.join(env.minio_dir, WITNESS))
     if hits:
         die(f"plaintext found in the bucket: {hits[:5]}")
     ok(f"{len(keys)} objects, none readable: no names, refs, packs or content")
@@ -874,6 +1057,93 @@ def run(env, args):
         die(f"wrong key did not stop startup: {p.stderr[-500:]}")
     ok("a server with the wrong master key refuses to start")
     env.start_depot()
+
+    print("== rollback witness: storage serving an older copy is caught after a restart")
+    rid = env.opened("depot/registry")["repos"]["w/repo"]["id"]
+    mk, tk = f"depot/r/{rid}/manifest", "depot/tokens"
+    old_manifest = env.get_object(mk)
+    st, body = env.api("/api/tokens", "admin", "POST", {"user": "temp", "read": ["w/*"]})
+    t2 = json.loads(body)["token"]
+    t2id = json.loads(body)["id"]
+    old_tokens = env.get_object(tk)
+    env.api(f"/api/tokens?id={t2id}", "admin", "DELETE")
+    with open(os.path.join(src, "rollback.txt"), "w") as f:
+        f.write("after the snapshot\n")
+    env.git("add", "-A", cwd=src)
+    env.git("commit", "-qm", "after the snapshot", cwd=src)
+    env.git("push", "-q", env.url("w/repo", "writer"), "main", cwd=src)
+    newest_refs = remote_refs(env, env.url("w/repo", "reader"))
+    t2hdr = ["-c", f"http.extraHeader=X-Api-Key: {t2}"]
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode == 0:
+        die("revoked token works")
+    env.stop_depot()
+    new_manifest, new_tokens = env.get_object(mk), env.get_object(tk)
+    env.put_object(mk, old_manifest)
+    env.put_object(tk, old_tokens)
+    quiet = {"DEPOT_ORPHAN_AGE": "86400"}  # an old manifest must not get the newer pack swept
+    env.start_depot({"witness": None}, quiet)
+    if remote_refs(env, env.url("w/repo", "reader")) == newest_refs:
+        die("the rollback did not take; this check would prove nothing")
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode != 0:
+        die("the rolled-back token book did not bring the revoked token back; this check would prove nothing")
+    ok("control: without a witness, the old manifest serves and the revoked token works again")
+    env.stop_depot()
+    env.start_depot(None, quiet)
+    r = env.git("ls-remote", env.url("w/repo", "reader"), check=False)
+    if r.returncode == 0:
+        die("a rolled-back manifest was served")
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode == 0:
+        die("a rolled-back token book was used")
+    env.git("ls-remote", env.url("w/big", "reader"))
+    rolled = json.loads(env.api("/api/status", "admin")[1])["witness"]["rolled_back"]
+    if {x["key"] for x in rolled} != {mk, tk}:
+        die(f"witness status: {rolled}")
+    if "rollback" not in open(os.path.join(W, "depot.log")).read():
+        die("the log does not say rollback")
+    ok("with the witness: the rolled-back manifest and token book are refused, other repositories serve")
+    env.put_object(mk, new_manifest)
+    env.put_object(tk, new_tokens)
+    if remote_refs(env, env.url("w/repo", "reader")) != newest_refs:
+        die("the repaired manifest did not load")
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode == 0:
+        die("revoked token works after the repair")
+    ok("storage repaired: the newest copies load again, no restart")
+    env.stop_depot()
+    env.put_object(tk, old_tokens)
+    env.start_depot(None, quiet)
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode == 0:
+        die("a rolled-back token book was used")
+    st, body = env.api("/api/witness", "reader", "POST", {})
+    if st != 403:
+        die(f"a non-admin accepted a rollback ({st})")
+    st, body = env.api("/api/witness", "admin", "POST", {})
+    if st != 200 or json.loads(body)["accepted"] != [tk]:
+        die(f"accept: {st} {body}")
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode != 0:
+        die("the accepted token book is not in use")
+    env.api(f"/api/tokens?id={t2id}", "admin", "DELETE")
+    if env.git(*t2hdr, "ls-remote", env.url("w/repo"), check=False).returncode == 0:
+        die("revoking again did not take")
+    env.stop_depot()
+    env.start_depot()
+    if json.loads(env.api("/api/status", "admin")[1])["witness"]["rolled_back"]:
+        die("an accepted copy is still flagged after a restart")
+    ok("an admin accepts storage's older copy when the loss is real; the witness follows it")
+
+    print("== expired dropped history is collected automatically")
+    env.stop_depot()
+    env.start_depot(None, {"DEPOT_KEEP_SECONDS": "0"})
+    wait_for("w/repo's dropped history to expire",
+             lambda: not json.loads(env.api("/api/repo?repo=w/repo", "admin")[1])["dropped"], tries=600)
+    st, _ = env.api("/api/restore?repo=w/repo", "admin", "POST", {"ref": "gone-again", "id": gone})
+    if st != 404:
+        die(f"expired history is still stored ({st})")
+    ac = os.path.join(W, "auto-collected")
+    env.git("clone", "-q", "--mirror", env.url("w/repo", "reader"), ac)
+    env.git("fsck", "--full", cwd=ac)
+    if remote_refs(env, env.url("w/repo", "reader")) != newest_refs:
+        die("refs changed in an automatic collection")
+    ok("past the retention window, dropped history is collected; the repository is intact")
 
     if args.platform:
         print("== platform: a gateway that strips Authorization, storage via the egress front")
@@ -920,6 +1190,46 @@ def mirror(env, path):
     if a != b:
         die("mirror refs differ")
     ok("mirror refs identical, fsck clean")
+
+    def rss():
+        try:
+            for l in open(f"/proc/{env.server.pid}/status"):
+                if l.startswith("VmRSS:"):
+                    return int(l.split()[1]) >> 10
+        except OSError:
+            pass
+        return 0
+
+    status = lambda: json.loads(env.api("/api/status", "admin")[1])["maintenance"]
+    # garbage to collect: a branch pushed (a second pack), then deleted
+    junk = os.path.join(W, "mirror-junk")
+    env.git("clone", "-q", "--depth", "1", "--no-local", "file://" + bare, junk)
+    open(os.path.join(junk, "junk.bin"), "wb").write(os.urandom(4 << 20))
+    env.git("add", "-A", cwd=junk)
+    env.git("commit", "-qm", "junk", cwd=junk)
+    env.git("push", "-q", env.url("w/mirror", "writer"), "HEAD:refs/heads/gc-probe", cwd=junk)
+    env.git("push", "-q", env.url("w/mirror", "writer"), ":refs/heads/gc-probe", cwd=junk)
+    n0 = status()["collections"]
+    base_rss, peak = rss(), 0
+    t0 = time.time()
+    st, body = env.api("/api/maintenance?repo=w/mirror&purge=1", "admin", "POST", {})
+    if st != 200 or not json.loads(body)["garbage"]["objects"]:
+        die(f"nothing to collect in the mirror: {st} {body}")
+    while status()["collections"] == n0:
+        peak = max(peak, rss())
+        if status()["running"] is None and "abandoned" in (status()["last"] or ""):
+            die(f"mirror collection failed: {status()['last']}")
+        if time.time() - t0 > 900:
+            die("mirror collection took over 15 minutes")
+        time.sleep(0.2)
+    ok(f"collected the mirror in {time.time() - t0:.1f}s ({status()['last']}); RSS {base_rss} -> peak {peak} MiB")
+    dst2 = os.path.join(W, "mirror-clone2.git")
+    t0 = time.time()
+    env.git("clone", "-q", "--mirror", env.url("w/mirror", "reader"), dst2)
+    env.git("fsck", "--full", cwd=dst2)
+    if env.git("for-each-ref", cwd=dst2).stdout != a:
+        die("mirror refs differ after collection")
+    ok(f"clone of the collected mirror {time.time() - t0:.1f}s, refs identical, fsck clean")
 
 
 if __name__ == "__main__":

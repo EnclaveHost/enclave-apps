@@ -74,6 +74,14 @@ struct Raw {
     sso: Option<serde_json::Value>,
     #[serde(default)]
     hooks: Vec<crate::hooks::Hook>,
+    #[serde(default = "keep_days")]
+    keep_days: u64,
+    #[serde(default)]
+    witness: Option<Storage>,
+}
+
+fn keep_days() -> u64 {
+    30
 }
 
 fn main() -> String {
@@ -106,6 +114,11 @@ pub struct Config {
     pub title: String,
     pub sso: Option<crate::sso::SsoConfig>,
     pub hooks: Vec<crate::hooks::Hook>,
+    /// seconds a dropped ref value's history is kept before collection
+    pub keep: u64,
+    /// a second store that remembers the newest revision of every mutable
+    /// document, so storage serving an older copy is caught after a restart
+    pub witness: Option<Storage>,
 }
 
 fn secret(s: &str) -> Result<String, String> {
@@ -144,6 +157,32 @@ pub fn valid_repo(s: &str) -> bool {
         })
 }
 
+fn check_storage(mut st: Storage, local_test: bool, what: &str) -> Result<Storage, String> {
+    st.access_key = secret(&st.access_key)?;
+    st.secret_key = secret(&st.secret_key)?;
+    crate::client::parse_origin(&st.endpoint)?;
+    if !st.endpoint.starts_with("https://") && !local_test {
+        return Err(format!("{what}.endpoint must be https (local_test permits http)"));
+    }
+    if st.bucket.is_empty()
+        || !st
+            .bucket
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(format!("{what}.bucket is invalid"));
+    }
+    if !st.prefix.is_empty()
+        && (!st.prefix.ends_with('/') || st.prefix.starts_with('/') || st.prefix.contains(".."))
+    {
+        return Err(format!("{what}.prefix must be empty or like \"depot/\""));
+    }
+    if !local_test && (st.access_key.is_empty() || st.secret_key.is_empty()) {
+        return Err(format!("{what} credentials are required"));
+    }
+    Ok(st)
+}
+
 impl Config {
     /// The platform delivers the config twice: the file (always, and the
     /// only channel past the env-size ceiling) and ENCLAVE_CONFIG. Both carry
@@ -162,30 +201,22 @@ impl Config {
 
     pub fn parse(raw: &str) -> Result<Config, String> {
         let r: Raw = serde_json::from_str(raw).map_err(|e| format!("config: {e}"))?;
-        let mut storage = r.storage;
-        storage.access_key = secret(&storage.access_key)?;
-        storage.secret_key = secret(&storage.secret_key)?;
-        crate::client::parse_origin(&storage.endpoint)?;
-        if !storage.endpoint.starts_with("https://") && !r.local_test {
-            return Err("storage.endpoint must be https (local_test permits http)".into());
-        }
-        if storage.bucket.is_empty()
-            || !storage
-                .bucket
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        {
-            return Err("storage.bucket is invalid".into());
-        }
-        if !storage.prefix.is_empty()
-            && (!storage.prefix.ends_with('/')
-                || storage.prefix.starts_with('/')
-                || storage.prefix.contains(".."))
-        {
-            return Err("storage.prefix must be empty or like \"depot/\"".into());
-        }
-        if !r.local_test && (storage.access_key.is_empty() || storage.secret_key.is_empty()) {
-            return Err("storage credentials are required".into());
+        let storage = check_storage(r.storage, r.local_test, "storage")?;
+        let witness = match r.witness {
+            Some(w) => {
+                let w = check_storage(w, r.local_test, "witness")?;
+                if w.endpoint == storage.endpoint
+                    && w.bucket == storage.bucket
+                    && w.access_key == storage.access_key
+                {
+                    return Err("witness must be a different store from storage (ideally another provider)".into());
+                }
+                Some(w)
+            }
+            None => None,
+        };
+        if r.keep_days > 3650 {
+            return Err("keep_days 0..3650".into());
         }
         let master_key = secret(&r.master_key)?;
         if master_key.len() < 32 {
@@ -296,6 +327,12 @@ impl Config {
             title: r.title.unwrap_or_else(|| "depot".into()),
             sso,
             hooks,
+            // DEPOT_KEEP_SECONDS overrides, for tests
+            keep: std::env::var("DEPOT_KEEP_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(r.keep_days * 86_400),
+            witness,
         })
     }
 
@@ -450,6 +487,8 @@ mod tests {
             "DEPOT_R2_ACCESS_KEY",
             "DEPOT_R2_SECRET_KEY",
             "DEPOT_ADMIN_TOKEN",
+            "DEPOT_WITNESS_ACCESS_KEY",
+            "DEPOT_WITNESS_SECRET_KEY",
         ] {
             std::env::set_var(k, "x".repeat(40));
         }
@@ -457,6 +496,25 @@ mod tests {
         let c = Config::parse(include_str!("../assets/deploy-config.template.json")).unwrap();
         assert!(c.is_protected("refs/tags/v1.2.3") && c.is_protected("refs/heads/main"));
         assert_eq!(c.storage.prefix, "depot/");
+        assert!(c.witness.is_some() && c.keep == 30 * 86_400);
+    }
+
+    #[test]
+    fn witness_must_be_another_store() {
+        std::env::set_var("WT_K", "k".repeat(30));
+        let cfg = |w: &str| {
+            format!(
+                r#"{{"storage":{{"endpoint":"https://a.example","bucket":"b","access_key":"$WT_K","secret_key":"$WT_K"}},
+                   "master_key":"{}","witness":{w}}}"#,
+                "m".repeat(40)
+            )
+        };
+        let same = r#"{"endpoint":"https://a.example","bucket":"b","access_key":"$WT_K","secret_key":"$WT_K","prefix":"w/"}"#;
+        assert!(Config::parse(&cfg(same)).is_err(), "same bucket, same key");
+        let other = r#"{"endpoint":"https://s3.other.example","bucket":"w","access_key":"$WT_K","secret_key":"$WT_K"}"#;
+        assert!(Config::parse(&cfg(other)).unwrap().witness.is_some());
+        let plain = r#"{"endpoint":"http://s3.other.example","bucket":"w","access_key":"$WT_K","secret_key":"$WT_K"}"#;
+        assert!(Config::parse(&cfg(plain)).is_err(), "https only");
     }
 
     #[test]

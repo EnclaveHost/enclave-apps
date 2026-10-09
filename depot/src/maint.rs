@@ -51,17 +51,30 @@ fn sweep_every() -> Duration {
     )
 }
 const READ: u64 = 4 << 20;
+/// An automatic collection that failed is not retried sooner than this
+/// (a push racing it, most likely; an admin can still ask for one).
+const COLLECT_BACKOFF: Duration = Duration::from_secs(3600);
 const MIN_PACKS: usize = 4;
 const SLICE: Duration = Duration::from_millis(30);
+
+enum Job {
+    Repack(Repack),
+    Collect(crate::gc::Collect),
+}
 
 #[derive(Default)]
 pub struct State {
     queue: VecDeque<String>,
-    job: Option<Repack>,
+    /// collections asked for: (repository id, purge dropped history)
+    collect: VecDeque<(String, bool)>,
+    job: Option<Job>,
     last_sweep: Option<Instant>,
     orphan_scans: std::collections::HashMap<String, Instant>,
+    /// automatic collections wait this long after one failed
+    collect_failed: std::collections::HashMap<String, Instant>,
     pub orphans_deleted: u64,
     pub done: u64,
+    pub collections: u64,
     pub last: Option<String>,
 }
 
@@ -73,7 +86,6 @@ struct Repack {
     upload: Upload,
     src: usize,
     off: u64,
-    buf: Vec<u8>,
     produced: u64,
     hasher: sha1::Sha1,
     entries: Vec<IdxEntry>,
@@ -101,6 +113,9 @@ pub fn pick(packs: &[PackMeta]) -> Option<usize> {
 }
 
 pub fn after_push(app: &mut App, repo_id: &str) {
+    if app.maint.collect.iter().any(|(x, _)| x == repo_id) {
+        return; // the collection rewrites everything anyway
+    }
     if let Some(r) = app.repos.get(repo_id) {
         if pick(&r.m.packs).is_some() && !app.maint.queue.iter().any(|x| x == repo_id) {
             app.maint.queue.push_back(repo_id.to_string());
@@ -108,63 +123,128 @@ pub fn after_push(app: &mut App, repo_id: &str) {
     }
 }
 
-pub fn request(app: &mut App, repo: &str) -> Result<Value, String> {
+fn queue_collect(app: &mut App, id: &str, purge: bool) {
+    match app.maint.collect.iter_mut().find(|(x, _)| x == id) {
+        Some(e) => e.1 |= purge,
+        None => app.maint.collect.push_back((id.to_string(), purge)),
+    }
+}
+
+/// An admin's request: a geometric repack if one is due, or (`gc`) a
+/// collection, purging dropped history now when `purge`.
+pub fn request(app: &mut App, repo: &str, gc: bool, purge: bool) -> Result<Value, String> {
     let id = app.open(repo)?.ok_or("no such repository")?;
-    let r = &app.repos[&id];
+    let cut = if purge {
+        now()
+    } else {
+        now().saturating_sub(app.cfg.keep)
+    };
+    let r = app.repos.get_mut(&id).unwrap();
+    let g = crate::gc::assess(r, cut);
     let would = pick(&r.m.packs).map(|s| r.m.packs.len() - s);
-    if would.is_some() && !app.maint.queue.iter().any(|x| *x == id) {
+    let (packs, retired) = (r.m.packs.len(), r.m.retired.len());
+    if gc || purge {
+        queue_collect(app, &id, purge);
+    } else if would.is_some() && !app.maint.queue.iter().any(|x| *x == id) {
         app.maint.queue.push_back(id.clone());
     }
-    Ok(
-        json!({ "packs": r.m.packs.len(), "would_merge": would, "retired": r.m.retired.len(), "queued": app.maint.queue.len() }),
-    )
+    Ok(json!({ "packs": packs, "would_merge": would, "retired": retired,
+               "garbage": { "objects": g.objects, "bytes": g.bytes, "expired_drops": g.expired, "kept_drops": g.kept_drops },
+               "collect": gc || purge, "purge": purge,
+               "queued": app.maint.queue.len() + app.maint.collect.len() }))
 }
 
 pub fn status(app: &App) -> Value {
-    let job = app.maint.job.as_ref().map(|j| {
-        json!({ "sources": j.sources.len(), "bytes": j.total, "copied": j.produced, "seconds": j.started.elapsed().as_secs() })
+    let job = app.maint.job.as_ref().map(|j| match j {
+        Job::Repack(j) => json!({ "kind": "repack", "sources": j.sources.len(), "bytes": j.total, "copied": j.produced,
+                                  "seconds": j.started.elapsed().as_secs() }),
+        Job::Collect(c) => {
+            let (written, before) = c.progress();
+            json!({ "kind": "collect", "keeping": c.kept, "dropping": c.dropped, "purge": c.purge,
+                    "bytes_before": before, "written": written, "seconds": c.started.elapsed().as_secs() })
+        }
     });
-    json!({ "queued": app.maint.queue.len(), "running": job, "repacks": app.maint.done, "last": app.maint.last,
-            "orphans_deleted": app.maint.orphans_deleted })
+    json!({ "queued": app.maint.queue.len() + app.maint.collect.len(), "running": job, "repacks": app.maint.done,
+            "collections": app.maint.collections, "last": app.maint.last, "orphans_deleted": app.maint.orphans_deleted,
+            "keep_days": app.cfg.keep / 86_400 })
 }
 
 /// One slice of background work; true when it did anything.
 pub fn tick(app: &mut App) -> bool {
-    if app.maint.job.is_some() {
-        let mut job = app.maint.job.take().unwrap();
-        match step(app, &mut job) {
-            Ok(true) => {
-                app.maint.done += 1;
-                app.maint.last = Some(format!(
-                    "merged {} packs ({:.1} MiB) in {:.0}s",
-                    job.sources.len(),
-                    job.total as f64 / 1048576.0,
-                    job.started.elapsed().as_secs_f64()
-                ));
-                eprintln!("[depot] repack: {}", app.maint.last.as_ref().unwrap());
-            }
-            Ok(false) => app.maint.job = Some(job),
-            Err(e) => {
-                eprintln!("[depot] repack abandoned: {e}");
-                app.store.upload_abort(&job.upload);
-                // the merged pack goes only if a fresh manifest provably does
-                // not list it; unknown means it stays for the orphan sweep
-                let listed = app
-                    .revalidate(&job.repo, true)
-                    .ok()
-                    .and_then(|_| app.repos.get(&job.repo))
-                    .map(|r| r.m.lists(&job.new_id));
-                if listed == Some(false) {
-                    let _ = app.store.delete_pack(&job.repo, &job.new_id);
+    match app.maint.job.take() {
+        Some(Job::Repack(mut job)) => {
+            match step(app, &mut job) {
+                Ok(true) => {
+                    app.maint.done += 1;
+                    app.maint.last = Some(format!(
+                        "merged {} packs ({:.1} MiB) in {:.0}s",
+                        job.sources.len(),
+                        job.total as f64 / 1048576.0,
+                        job.started.elapsed().as_secs_f64()
+                    ));
+                    eprintln!("[depot] repack: {}", app.maint.last.as_ref().unwrap());
                 }
-                app.maint.last = Some(format!("abandoned: {e}"));
+                Ok(false) => app.maint.job = Some(Job::Repack(job)),
+                Err(e) => {
+                    eprintln!("[depot] repack abandoned: {e}");
+                    app.store.upload_abort(&job.upload);
+                    abandon(app, &job.repo, &job.new_id);
+                    app.maint.last = Some(format!("repack abandoned: {e}"));
+                }
+            }
+            return true;
+        }
+        Some(Job::Collect(mut c)) => {
+            match crate::gc::step(app, &mut c) {
+                Ok(true) => {
+                    app.maint.collections += 1;
+                    let after = app.repos.get(&c.repo).map_or(0, |r| r.bytes());
+                    app.maint.last = Some(format!(
+                        "collected {} objects ({:.1} -> {:.1} MiB) in {:.0}s",
+                        c.dropped,
+                        c.before as f64 / 1048576.0,
+                        after as f64 / 1048576.0,
+                        c.started.elapsed().as_secs_f64()
+                    ));
+                    eprintln!("[depot] collect: {}", app.maint.last.as_ref().unwrap());
+                }
+                Ok(false) => app.maint.job = Some(Job::Collect(c)),
+                Err(e) => {
+                    eprintln!("[depot] collection abandoned: {e}");
+                    app.maint.collect_failed.insert(c.repo.clone(), Instant::now());
+                    app.store.upload_abort(&c.upload);
+                    abandon(app, &c.repo, &c.new_id);
+                    app.maint.last = Some(format!("collection abandoned: {e}"));
+                }
+            }
+            return true;
+        }
+        None => {}
+    }
+    if app.store.witness_retry() {
+        return true;
+    }
+    if let Some((id, purge)) = app.maint.collect.pop_front() {
+        match crate::gc::start(app, &id, purge) {
+            Ok(Some(c)) => app.maint.job = Some(Job::Collect(c)),
+            Ok(None) => {
+                // nothing to rewrite; expired dropped values may still go
+                if let Err(e) = crate::gc::prune(app, &id) {
+                    eprintln!("[depot] dropped-history prune: {e}");
+                }
+                let name = app.repos.get(&id).map_or("?", |r| r.name.as_str());
+                app.maint.last = Some(format!("nothing to collect in {name}"));
+            }
+            Err(e) => {
+                eprintln!("[depot] collection not started: {e}");
+                app.maint.collect_failed.insert(id, Instant::now());
             }
         }
         return true;
     }
     if let Some(id) = app.maint.queue.pop_front() {
         match start(app, &id) {
-            Ok(Some(j)) => app.maint.job = Some(j),
+            Ok(Some(j)) => app.maint.job = Some(Job::Repack(j)),
             Ok(None) => {}
             Err(e) => eprintln!("[depot] repack not started: {e}"),
         }
@@ -191,12 +271,49 @@ pub fn tick(app: &mut App) -> bool {
                     eprintln!("[depot] orphan sweep: {e}");
                 }
             }
-            // repositories loaded since the last push get their merge too
-            after_push(app, &id);
+            consider(app, &id);
         }
         return true;
     }
     false
+}
+
+/// After a failed repack or collection: its pack goes only if a fresh
+/// manifest provably does not list it; unknown means it stays for the
+/// orphan sweep.
+fn abandon(app: &mut App, repo: &str, pack: &str) {
+    let listed = app
+        .revalidate(repo, true)
+        .ok()
+        .and_then(|_| app.repos.get(repo))
+        .map(|r| r.m.lists(pack));
+    if listed == Some(false) {
+        let _ = app.store.delete_pack(repo, pack);
+    }
+}
+
+/// The periodic look at one repository: collect what has expired or
+/// piled up, else merge packs geometrically.
+fn consider(app: &mut App, id: &str) {
+    let cut = now().saturating_sub(app.cfg.keep);
+    let backoff = app
+        .maint
+        .collect_failed
+        .get(id)
+        .is_some_and(|t| t.elapsed() < COLLECT_BACKOFF);
+    if let Some(r) = app.repos.get_mut(id) {
+        let g = crate::gc::assess(r, cut);
+        if crate::gc::due(&g, r.bytes()) && !backoff {
+            queue_collect(app, id, false);
+            return;
+        }
+        if g.expired > 0 {
+            if let Err(e) = crate::gc::prune(app, id) {
+                eprintln!("[depot] dropped-history prune: {e}");
+            }
+        }
+    }
+    after_push(app, id);
 }
 
 fn start(app: &mut App, id: &str) -> Result<Option<Repack>, String> {
@@ -222,13 +339,14 @@ fn start(app: &mut App, id: &str) -> Result<Option<Repack>, String> {
         return Err("too many objects to merge".into());
     }
     let new_id = crate::seal::random_id();
-    let upload = app.store.upload_begin(id, &new_id, total)?;
-    let mut buf = Vec::with_capacity(12);
-    buf.extend_from_slice(b"PACK");
-    buf.extend_from_slice(&2u32.to_be_bytes());
-    buf.extend_from_slice(&(count as u32).to_be_bytes());
+    let mut upload = app.store.upload_begin(id, &new_id);
+    let mut head = Vec::with_capacity(12);
+    head.extend_from_slice(b"PACK");
+    head.extend_from_slice(&2u32.to_be_bytes());
+    head.extend_from_slice(&(count as u32).to_be_bytes());
     let mut hasher = sha1::Sha1::new();
-    hasher.update(&buf);
+    hasher.update(&head);
+    upload.write(&head);
     eprintln!(
         "[depot] repack {}: merging {} packs ({:.1} MiB)",
         r.name,
@@ -244,7 +362,6 @@ fn start(app: &mut App, id: &str) -> Result<Option<Repack>, String> {
         src: 0,
         off: 12,
         produced: 12,
-        buf,
         hasher,
         entries,
         started: Instant::now(),
@@ -254,53 +371,46 @@ fn start(app: &mut App, id: &str) -> Result<Option<Repack>, String> {
 fn step(app: &mut App, j: &mut Repack) -> Result<bool, String> {
     let t0 = Instant::now();
     while t0.elapsed() < SLICE {
-        let (a, b) = app.store.next_part(&j.upload);
-        // fill the buffer up to the next part's end
-        if j.produced < b {
-            if j.src < j.sources.len() {
-                let p = &j.sources[j.src];
-                let end = p.len - 20;
-                let take = (end - j.off).min(READ).min(b - j.produced);
-                if take > 0 {
-                    let info = PackInfo {
-                        id: p.id.clone(),
-                        len: p.len,
-                        chunk: p.chunk,
-                    };
-                    let data = app
-                        .store
-                        .read_pack_uncached(&j.repo, &info, j.off, j.off + take)?;
-                    j.hasher.update(&data);
-                    j.buf.extend_from_slice(&data);
-                    j.produced += take;
-                    j.off += take;
-                }
-                if j.off == end {
-                    j.src += 1;
-                    j.off = 12;
-                }
-                continue;
+        if app.store.upload_step(&mut j.upload)? {
+            continue;
+        }
+        if j.src < j.sources.len() {
+            let p = &j.sources[j.src];
+            let end = p.len - 20;
+            let take = (end - j.off).min(READ);
+            if take > 0 {
+                let info = PackInfo {
+                    id: p.id.clone(),
+                    len: p.len,
+                    chunk: p.chunk,
+                };
+                let data = app
+                    .store
+                    .read_pack_uncached(&j.repo, &info, j.off, j.off + take)?;
+                j.hasher.update(&data);
+                j.upload.write(&data);
+                j.produced += take;
+                j.off += take;
             }
-            // all entries copied: the trailer
-            let d: [u8; 20] = std::mem::take(&mut j.hasher).finalize().into();
-            j.buf.extend_from_slice(&d);
-            j.produced += 20;
-            if j.produced != j.total {
-                return Err(format!(
-                    "merged length {} != planned {}",
-                    j.produced, j.total
-                ));
+            if j.off == end {
+                j.src += 1;
+                j.off = 12;
             }
             continue;
         }
-        // a full part is buffered (buf starts at `a`)
-        let n = (b - a) as usize;
-        let part: Vec<u8> = j.buf.drain(..n).collect();
-        if app.store.upload_part(&mut j.upload, &part)? {
-            app.store.put_idx(&j.repo, &j.new_id, &j.entries)?;
-            commit(app, j)?;
-            return Ok(true);
+        // all entries copied: the trailer, then the rest of the upload
+        let d: [u8; 20] = std::mem::take(&mut j.hasher).finalize().into();
+        j.upload.write(&d);
+        j.produced += 20;
+        if j.produced != j.total || app.store.upload_finish(&mut j.upload)? != j.total {
+            return Err(format!(
+                "merged length {} != planned {}",
+                j.produced, j.total
+            ));
         }
+        app.store.put_idx(&j.repo, &j.new_id, &j.entries)?;
+        commit(app, j)?;
+        return Ok(true);
     }
     Ok(false)
 }
@@ -372,8 +482,14 @@ fn orphans(app: &mut App, id: &str) -> Result<(), String> {
     let mut known: std::collections::HashSet<String> =
         r.m.packs.iter().map(|p| p.id.clone()).collect();
     known.extend(r.m.retired.iter().map(|x| x.id.clone()));
-    if let Some(j) = &app.maint.job {
-        known.insert(j.new_id.clone());
+    match &app.maint.job {
+        Some(Job::Repack(j)) => {
+            known.insert(j.new_id.clone());
+        }
+        Some(Job::Collect(c)) => {
+            known.insert(c.new_id.clone());
+        }
+        None => {}
     }
     let cutoff = now().saturating_sub(orphan_age());
     let mut gone = 0;

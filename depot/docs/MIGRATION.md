@@ -101,8 +101,10 @@ All cheap to change:
 ## A sequence that never breaks verification
 
 1. **Deploy depot** (see the README) at a stable name, for example
-   `git.enclave.host` as a custom domain. Mint an admin token, a personal
-   token, and a read-only token for any mirroring job.
+   `git.enclave.host` as a custom domain, with a rollback witness at a
+   second provider (README, *Rollback*): as the source of truth it must not
+   accept R2 quietly serving an old manifest. Mint an admin token, a
+   personal token, and a read-only token for any mirroring job.
 2. **Mirror** both repositories into depot (`scripts/mirror.sh`), and keep
    them in sync. Make every developer push update both remotes:
    `git remote set-url --add --push origin https://git.enclave.host/enclave.git`.

@@ -67,10 +67,12 @@ impl Tokens {
         {
             return Ok(());
         }
+        let key = store.k_object(NAME);
         match store.get_raw_sealed(NAME, NAME)? {
             Some((b, t)) => {
                 let book: Book =
                     serde_json::from_slice(&b).map_err(|e| format!("token book: {e}"))?;
+                store.check_witness(&key, Some((book.rev, &book.writer)))?;
                 if book.rev < self.book.rev {
                     return Err("storage served an older token book (rollback?)".into());
                 }
@@ -78,6 +80,7 @@ impl Tokens {
                 self.etag = Some(t);
             }
             None => {
+                store.check_witness(&key, None)?;
                 if self.etag.is_some() {
                     return Err("the token book disappeared from storage".into());
                 }
@@ -110,7 +113,7 @@ impl Tokens {
         book.rev += 1;
         book.writer = store.nonce();
         let b = serde_json::to_vec(&book).unwrap();
-        match store.put_raw_sealed(NAME, NAME, &b, self.etag.as_deref(), &book.writer)? {
+        match store.put_raw_sealed(NAME, NAME, &b, self.etag.as_deref(), &book.writer, book.rev)? {
             Saved::Ok(t) => {
                 self.book = book;
                 self.etag = Some(t);

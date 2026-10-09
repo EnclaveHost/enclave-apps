@@ -89,8 +89,26 @@ pub fn handle(app: &mut App, head: &Head, body: Vec<u8>) -> Response<App> {
             let Some(repo) = head.param("repo") else {
                 return bad("repo required");
             };
-            match crate::maint::request(app, &repo) {
+            let flag = |k: &str| v[k].as_bool().unwrap_or(false) || head.param(k).as_deref() == Some("1");
+            match crate::maint::request(app, &repo, flag("gc"), flag("purge")) {
                 Ok(v) => Response::json(200, &v),
+                Err(e) => fail(&e),
+            }
+        }
+        ("POST", "/api/restore") => restore(app, &who, head, &v),
+        ("POST", "/api/witness") => {
+            if !is_admin(&app.cfg, &who) {
+                return Response::json(403, &json!({ "error": "admin only" }));
+            }
+            let Some(w) = app.store.witness.as_mut() else {
+                return bad("no witness is configured");
+            };
+            match w.accept() {
+                Ok(keys) => {
+                    // reload everything from storage as it now stands
+                    app.reset_from_storage();
+                    Response::json(200, &json!({ "accepted": keys }))
+                }
                 Err(e) => fail(&e),
             }
         }
@@ -178,7 +196,10 @@ fn get(app: &mut App, head: &Head) -> Response<App> {
                 Err(e) => return fail(&e),
             };
             match head.path.as_str() {
-                "/api/repo" => info(app, &id),
+                "/api/repo" => {
+                    let admin = is_admin(&app.cfg, &who);
+                    info(app, &id, admin)
+                }
                 "/api/log" => log(app, &id, head),
                 "/api/tree" => tree(app, &id, head),
                 "/api/raw" => raw(app, &id, head),
@@ -215,7 +236,9 @@ fn status(app: &App, who: &Who) -> Response<App> {
         v["traffic"] = json!({"fetches": app.stats.fetches, "pushes": app.stats.pushes, "push_bytes": app.stats.push_bytes, "sent_bytes": app.stats.sent_bytes, "failures": app.stats.failures, "push_bytes_held": app.push_budget.held()});
         v["maintenance"] = crate::maint::status(app);
         v["webhooks"] = crate::hooks::status(app);
+        v["witness"] = app.store.witness.as_ref().map(|w| w.status()).unwrap_or(Value::Null);
     }
+    v["rollback_protection"] = json!(if app.store.witness.is_some() { "witness" } else { "in-process" });
     Response::json(200, &v)
 }
 
@@ -410,7 +433,94 @@ fn patch(app: &mut App, who: &Who, head: &Head, v: &Value) -> Response<App> {
             }
         }
     }
-    info(app, &id)
+    info(app, &id, true)
+}
+
+/// Point a new ref at a stored object: how an admin brings back history a
+/// force push or a delete dropped (`dropped` in the repository info lists
+/// those values while they are kept).
+fn restore(app: &mut App, who: &Who, head: &Head, v: &Value) -> Response<App> {
+    use crate::git::receive::{judge, Command, Incoming};
+    if !is_admin(&app.cfg, who) {
+        return Response::json(403, &json!({ "error": "admin only" }));
+    }
+    let Some(repo) = head.param("repo") else {
+        return bad("repo required");
+    };
+    let Some(name) = v["ref"].as_str() else {
+        return bad("ref required (a new ref name)");
+    };
+    let name = if name.starts_with("refs/") {
+        name.to_string()
+    } else {
+        format!("refs/heads/{name}")
+    };
+    let Some(oid) = v["id"].as_str().and_then(Oid::from_hex) else {
+        return bad("id required (an object id)");
+    };
+    let id = match app.open(&repo) {
+        Ok(Some(id)) => id,
+        Ok(None) => return not_found(),
+        Err(e) => return fail(&e),
+    };
+    for attempt in 0..8 {
+        if attempt > 0 {
+            if let Err(e) = app.revalidate(&id, true) {
+                return fail(&e);
+            }
+        }
+        let Some(r) = app.repos.get(&id) else {
+            return not_found();
+        };
+        let Some(i) = r.ix.lookup(&oid) else {
+            return Response::json(404, &json!({ "error": "no such object is stored (collected already?)" }));
+        };
+        // everything it links to must be stored too
+        let all = crate::git::walk::closure(&r.ix, &[i]);
+        if (0..r.ix.len() as u32).any(|x| all.get(x) && r.ix.kids(x).contains(&crate::git::repo::NONE)) {
+            return Response::json(409, &json!({ "error": "that object's history is incomplete in storage" }));
+        }
+        let cmd = Command {
+            old: Oid::default(),
+            new: oid,
+            name: name.clone(),
+        };
+        let inc = Incoming::new(&[]);
+        let judged = judge(std::slice::from_ref(&cmd), &r.refs, &inc, &r.ix, |n| {
+            app.cfg.is_protected(n)
+        });
+        if let Err(e) = &judged[0].1 {
+            let e = if e == "stale info" { "that ref exists" } else { e.as_str() };
+            return Response::json(409, &json!({ "error": e }));
+        }
+        let mut m = r.m.clone();
+        m.refs.insert(name.clone(), oid.hex());
+        crate::push::fix_head(&mut m, &app.cfg.default_branch);
+        let etag = r.etag.clone();
+        match app.store.save_manifest(&id, &mut m, etag.as_deref(), now()) {
+            Ok(Saved::Ok(t)) => {
+                let refs = match crate::app::parse_refs(&m) {
+                    Ok(x) => x,
+                    Err(e) => return fail(&e),
+                };
+                let r = app.repos.get_mut(&id).unwrap();
+                r.refs = refs;
+                r.m = m;
+                r.etag = Some(t);
+                let up = [crate::hooks::Update {
+                    name: &name,
+                    old: Oid::default().hex(),
+                    new: oid.hex(),
+                }];
+                crate::hooks::push_event(app, &repo, who.name(), &up);
+                eprintln!("[depot] {} restored {name} -> {} in {repo}", who.name(), oid.hex());
+                return Response::json(200, &json!({ "restored": name, "id": oid.hex() }));
+            }
+            Ok(Saved::Conflict) => continue,
+            Err(e) => return fail(&e),
+        }
+    }
+    fail("manifest busy; try again")
 }
 
 fn delete(app: &mut App, who: &Who, head: &Head) -> Response<App> {
@@ -454,10 +564,21 @@ fn delete(app: &mut App, who: &Who, head: &Head) -> Response<App> {
     }
 }
 
-fn info(app: &App, id: &str) -> Response<App> {
+fn info(app: &App, id: &str, admin: bool) -> Response<App> {
     let Some(r) = app.repos.get(id) else {
         return not_found();
     };
+    // what force pushes and deletes left behind: ids of history readers
+    // may no longer fetch, so only admins see them
+    let dropped: Option<Vec<Value>> = admin.then(|| {
+        r.m.dropped
+            .iter()
+            .rev()
+            .take(500)
+            .map(|d| json!({ "ref": d.name, "id": d.id, "at": d.at, "by": d.by,
+                             "until": d.at + app.cfg.keep }))
+            .collect()
+    });
     let refs: serde_json::Map<String, Value> = r
         .refs
         .iter()
@@ -475,6 +596,7 @@ fn info(app: &App, id: &str) -> Response<App> {
             "updated": r.m.updated,
             "revision": r.m.rev,
             "public": app.is_public(&r.name),
+            "dropped": dropped,
         }),
     )
 }

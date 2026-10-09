@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! <prefix>registry               sealed: repository names -> random ids, settings
-//! <prefix>r/<id>/manifest        sealed: HEAD, refs, the pack list (CAS on ETag)
+//! <prefix>r/<id>/manifest        sealed: HEAD, refs, the pack list, dropped
+//!                                ref values awaiting collection (CAS on ETag)
 //! <prefix>r/<id>/<pack>.pack     a git pack, sealed in 256 KiB chunks
 //! <prefix>r/<id>/<pack>.idx      sealed: that pack's object index and links
 //! ```
@@ -24,6 +25,8 @@ use std::rc::Rc;
 /// Chunks per multipart part: 8 MiB of plaintext, every part the same size
 /// (R2 requires that of all but the last).
 const PART_CHUNKS: u64 = 32;
+/// Plaintext bytes in one multipart part.
+pub const PART_BYTES: u64 = PART_CHUNKS * CHUNK as u64;
 /// The most chunks one range GET fetches.
 const FETCH_CHUNKS: u64 = 64;
 
@@ -65,6 +68,19 @@ pub struct Retired {
     pub at: u64,
 }
 
+/// A ref value a push replaced without fast-forwarding, or deleted: what it
+/// reaches is kept (but not served) for the retention window, so an admin
+/// can restore it, then collected.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Dropped {
+    pub id: String,
+    #[serde(rename = "ref")]
+    pub name: String,
+    pub at: u64,
+    #[serde(default)]
+    pub by: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Manifest {
     pub v: u32,
@@ -74,6 +90,8 @@ pub struct Manifest {
     pub packs: Vec<PackMeta>,
     #[serde(default)]
     pub retired: Vec<Retired>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<Dropped>,
     #[serde(default)]
     pub writer: String,
     #[serde(default)]
@@ -94,6 +112,7 @@ impl Manifest {
             refs: BTreeMap::new(),
             packs: Vec::new(),
             retired: Vec::new(),
+            dropped: Vec::new(),
             writer: String::new(),
             updated: 0,
         }
@@ -161,16 +180,38 @@ pub struct Store {
     prefix: String,
     cache: ChunkCache,
     writer: String,
+    pub witness: Option<crate::witness::Witness>,
 }
 
-/// An in-flight pack upload; `Store::upload_step` sends one part per call.
+/// A pack upload, sealed as it is written: `write` appends plaintext,
+/// `Store::upload_step` sends one full part once more data follows it (so
+/// the last chunk is known when it is sealed), `Store::upload_finish` sends
+/// the rest. The length need not be known in advance.
 pub struct Upload {
     key: String,
     chunked: Chunked,
     upload_id: Option<String>,
-    next: u64,
     parts: Vec<String>,
+    pending: Vec<u8>,
+    chunks: u64,
+    /// plaintext bytes stored so far
     pub sent: u64,
+    /// the plaintext length, once finished
+    pub total: Option<u64>,
+}
+
+impl Upload {
+    pub fn write(&mut self, data: &[u8]) {
+        self.pending.extend_from_slice(data);
+    }
+    /// Plaintext accepted so far (stored or pending).
+    pub fn written(&self) -> u64 {
+        self.sent + self.pending.len() as u64
+    }
+    /// Plaintext waiting to be sealed and sent.
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 fn compress(b: &[u8]) -> Vec<u8> {
@@ -202,7 +243,32 @@ impl Store {
                 misses: 0,
             },
             writer: seal::random_id(),
+            witness: None,
         }
+    }
+
+    /// Keep a rollback witness in `s3` (see src/witness.rs).
+    pub fn set_witness(&mut self, s3: S3, prefix: &str) {
+        self.witness = Some(crate::witness::Witness::new(
+            s3,
+            &self.keys,
+            &self.prefix,
+            prefix,
+        ));
+    }
+
+    /// The first load of a mutable document must not be older than the
+    /// witness has seen (a no-op without a witness).
+    pub fn check_witness(&mut self, key: &str, got: Option<(u64, &str)>) -> Result<(), String> {
+        match &mut self.witness {
+            Some(w) => w.check(key, got),
+            None => Ok(()),
+        }
+    }
+
+    /// One queued witness record retried; true when one was.
+    pub fn witness_retry(&mut self) -> bool {
+        self.witness.as_mut().is_some_and(|w| w.retry())
     }
 
     pub fn cache_stats(&self) -> (u64, u64, usize) {
@@ -258,6 +324,22 @@ impl Store {
         plain: &[u8],
         etag: Option<&str>,
         nonce: &str,
+        rev: u64,
+    ) -> Result<Saved, String> {
+        let r = self.put_sealed_once(key, scope, plain, etag, nonce)?;
+        if let (Saved::Ok(_), Some(w)) = (&r, &mut self.witness) {
+            w.note(key, rev, nonce);
+        }
+        Ok(r)
+    }
+
+    fn put_sealed_once(
+        &mut self,
+        key: &str,
+        scope: &str,
+        plain: &[u8],
+        etag: Option<&str>,
+        nonce: &str,
     ) -> Result<Saved, String> {
         let body = seal::seal(&self.keys.derive(scope), key.as_bytes(), &compress(plain));
         let cond = match etag {
@@ -299,9 +381,13 @@ impl Store {
                         r.v
                     ));
                 }
+                self.check_witness(&key, Some((r.rev, &r.writer)))?;
                 Loaded::Found(r, t)
             }
-            Loaded::Missing => Loaded::Missing,
+            Loaded::Missing => {
+                self.check_witness(&key, None)?;
+                Loaded::Missing
+            }
             Loaded::NotModified => Loaded::NotModified,
         })
     }
@@ -313,7 +399,7 @@ impl Store {
         let key = self.k_registry();
         let b = serde_json::to_vec(r).unwrap();
         let nonce = r.writer.clone();
-        self.put_sealed(&key, "registry", &b, etag, &nonce)
+        self.put_sealed(&key, "registry", &b, etag, &nonce, r.rev)
     }
 
     pub fn load_manifest(
@@ -333,9 +419,13 @@ impl Store {
                             m.v
                         ));
                     }
+                    self.check_witness(&key, Some((m.rev, &m.writer)))?;
                     Loaded::Found(m, t)
                 }
-                Loaded::Missing => Loaded::Missing,
+                Loaded::Missing => {
+                    self.check_witness(&key, None)?;
+                    Loaded::Missing
+                }
                 Loaded::NotModified => Loaded::NotModified,
             },
         )
@@ -355,7 +445,7 @@ impl Store {
         let key = self.k_manifest(repo);
         let b = serde_json::to_vec(m).unwrap();
         let nonce = m.writer.clone();
-        self.put_sealed(&key, &format!("repo:{repo}"), &b, etag, &nonce)
+        self.put_sealed(&key, &format!("repo:{repo}"), &b, etag, &nonce, m.rev)
     }
 
     pub fn put_idx(&mut self, repo: &str, pack: &str, entries: &[IdxEntry]) -> Result<(), String> {
@@ -389,87 +479,91 @@ impl Store {
         )
     }
 
-    pub fn upload_begin(&mut self, repo: &str, pack: &str, len: u64) -> Result<Upload, String> {
-        let chunked = self.chunked(repo, pack, len, CHUNK);
-        let key = self.k_pack(repo, pack);
-        let upload_id = if chunked.chunks() > PART_CHUNKS {
-            Some(self.s3.create_multipart(&key)?)
-        } else {
-            None
-        };
-        Ok(Upload {
-            key,
-            chunked,
-            upload_id,
-            next: 0,
+    pub fn upload_begin(&mut self, repo: &str, pack: &str) -> Upload {
+        Upload {
+            key: self.k_pack(repo, pack),
+            chunked: self.chunked(repo, pack, 0, CHUNK),
+            upload_id: None,
             parts: Vec::new(),
+            pending: Vec::new(),
+            chunks: 0,
             sent: 0,
-        })
-    }
-
-    /// The plaintext range the next call to `upload_part` must carry.
-    pub fn next_part(&self, up: &Upload) -> (u64, u64) {
-        let c = &up.chunked;
-        let n = c.chunks();
-        let last = if up.upload_id.is_none() {
-            n
-        } else {
-            (up.next + PART_CHUNKS).min(n)
-        };
-        (
-            up.next * c.chunk as u64,
-            (last * c.chunk as u64).min(c.total),
-        )
-    }
-
-    /// Seal and send the next part, `plain` being exactly the range
-    /// `next_part` names. Ok(true) once the object is complete.
-    pub fn upload_part(&mut self, up: &mut Upload, plain: &[u8]) -> Result<bool, String> {
-        let (a, b) = self.next_part(up);
-        if plain.len() as u64 != b - a {
-            return Err("internal: upload part has the wrong length".into());
+            total: None,
         }
-        let c = &up.chunked;
-        let n = c.chunks();
-        let first = up.next;
-        let last = first + (b - a).div_ceil(c.chunk as u64);
-        let mut body =
-            Vec::with_capacity(((last - first) * (c.chunk as u64 + TAG as u64)) as usize);
-        for i in first..last {
-            let s = ((i - first) * c.chunk as u64) as usize;
-            let mut x = plain[s..s + c.plain_len(i) as usize].to_vec();
-            c.seal_chunk(i, &mut x);
+    }
+
+    /// Seal the first `n` pending bytes as chunks, the final one marked last
+    /// when `last`.
+    fn seal_pending(up: &mut Upload, n: usize, last: bool) -> Vec<u8> {
+        let cs = up.chunked.chunk as usize;
+        let k = n.div_ceil(cs).max(1);
+        let mut body = Vec::with_capacity(n + k * TAG);
+        for c in 0..k {
+            let mut x = up.pending[c * cs..((c + 1) * cs).min(n)].to_vec();
+            up.chunked.seal_chunk(up.chunks + c as u64, &mut x, last && c + 1 == k);
             body.extend_from_slice(&x);
         }
+        up.pending.drain(..n);
+        up.chunks += k as u64;
+        up.sent += n as u64;
+        body
+    }
+
+    /// Send one full part if more data is pending beyond it; Ok(true) when
+    /// a part went out.
+    pub fn upload_step(&mut self, up: &mut Upload) -> Result<bool, String> {
+        if up.total.is_some() || up.pending.len() as u64 <= PART_BYTES {
+            return Ok(false);
+        }
+        if up.upload_id.is_none() {
+            up.upload_id = Some(self.s3.create_multipart(&up.key)?);
+        }
+        let body = Self::seal_pending(up, PART_BYTES as usize, false);
+        let id = up.upload_id.clone().unwrap();
+        let etag = self
+            .s3
+            .upload_part(&up.key, &id, up.parts.len() as u32 + 1, &body)?;
+        up.parts.push(etag);
+        Ok(true)
+    }
+
+    /// Send everything still pending and complete the object; returns its
+    /// plaintext length, verified against the size storage reports.
+    pub fn upload_finish(&mut self, up: &mut Upload) -> Result<u64, String> {
+        if let Some(t) = up.total {
+            return Ok(t);
+        }
+        while self.upload_step(up)? {}
+        let n = up.pending.len();
+        if n == 0 && up.chunks > 0 {
+            // upload_step always leaves data behind for the last chunk
+            return Err("internal: an upload ended on a sealed chunk".into());
+        }
+        let body = Self::seal_pending(up, n, true);
+        let total = up.sent;
         match up.upload_id.clone() {
-            None => {
-                match self.s3.put(&up.key, &body, Cond::None)? {
-                    Ok(_) => {}
-                    Err(s) => return Err(format!("storage refused the pack (HTTP {s})")),
-                }
-                up.next = n;
-                up.sent = c.total;
-                Ok(true)
-            }
+            None => match self.s3.put(&up.key, &body, Cond::None)? {
+                Ok(_) => {}
+                Err(s) => return Err(format!("storage refused the pack (HTTP {s})")),
+            },
             Some(id) => {
                 let etag = self
                     .s3
                     .upload_part(&up.key, &id, up.parts.len() as u32 + 1, &body)?;
                 up.parts.push(etag);
-                up.next = last;
-                up.sent = b;
-                if last < n {
-                    return Ok(false);
-                }
                 self.s3.complete_multipart(&up.key, &id, &up.parts)?;
                 // the store must now hold exactly the sealed length
-                let want = up.chunked.cipher_total();
+                let want = total + up.chunks * TAG as u64;
                 match self.s3.head_size(&up.key)? {
-                    Some(sz) if sz == want => Ok(true),
-                    other => Err(format!("stored pack has size {other:?}, expected {want}")),
+                    Some(sz) if sz == want => {}
+                    other => {
+                        return Err(format!("stored pack has size {other:?}, expected {want}"))
+                    }
                 }
             }
         }
+        up.total = Some(total);
+        Ok(total)
     }
 
     /// Plaintext of a stored pack without going through (or filling) the
@@ -507,7 +601,7 @@ impl Store {
     /// Abandon an unfinished multipart upload. A finished object is left
     /// alone: whether it may be deleted is the caller's decision.
     pub fn upload_abort(&mut self, up: &Upload) {
-        if let (Some(id), false) = (&up.upload_id, up.next == up.chunked.chunks()) {
+        if let (Some(id), None) = (&up.upload_id, up.total) {
             self.s3.abort_multipart(&up.key, id);
         }
     }
@@ -587,6 +681,10 @@ impl Store {
 
     /// Every object under a repository's prefix (for deletion).
     pub fn delete_repo_objects(&mut self, repo: &str) -> Result<usize, String> {
+        let mk = self.k_manifest(repo);
+        if let Some(w) = &mut self.witness {
+            w.forget(&mk);
+        }
         let prefix = format!("{}r/{repo}/", self.prefix);
         let mut n = 0;
         loop {
@@ -638,9 +736,10 @@ impl Store {
         plain: &[u8],
         etag: Option<&str>,
         nonce: &str,
+        rev: u64,
     ) -> Result<Saved, String> {
         let key = self.k_object(name);
-        self.put_sealed(&key, scope, plain, etag, nonce)
+        self.put_sealed(&key, scope, plain, etag, nonce, rev)
     }
 
     /// A fresh writer nonce for a mutable document.
