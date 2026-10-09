@@ -68,6 +68,24 @@ fn amz_dates() -> (String, String) {
     (date, stamp)
 }
 
+/// `2026-10-09T13:33:10.000Z` -> unix seconds (0 when it does not parse).
+pub fn iso_seconds(t: &str) -> u64 {
+    let n = |a: usize, b: usize| t.get(a..b).and_then(|s| s.parse::<i64>().ok());
+    let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) =
+        (n(0, 4), n(5, 7), n(8, 10), n(11, 13), n(14, 16), n(17, 19))
+    else {
+        return 0;
+    };
+    // days from civil (Howard Hinnant)
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    (days * 86400 + h * 3600 + mi * 60 + s).max(0) as u64
+}
+
 pub fn civil(days: i64) -> (i64, i64, i64) {
     let z = days + 719468;
     let era = z.div_euclid(146097);
@@ -316,7 +334,7 @@ impl S3 {
         &mut self,
         prefix: &str,
         token: Option<&str>,
-    ) -> Result<(Vec<(String, u64)>, Option<String>), String> {
+    ) -> Result<(Vec<(String, u64, u64)>, Option<String>), String> {
         let mut q = vec![("list-type", "2"), ("max-keys", "1000"), ("prefix", prefix)];
         if let Some(t) = token {
             q.push(("continuation-token", t));
@@ -332,7 +350,10 @@ impl S3 {
                 let size = xml_field(block, "Size")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
-                out.push((xml_unescape(&k), size));
+                let modified = xml_field(block, "LastModified")
+                    .map(|t| iso_seconds(&t))
+                    .unwrap_or(0);
+                out.push((xml_unescape(&k), size, modified));
             }
         }
         let next = if xml_field(&xml, "IsTruncated").as_deref() == Some("true") {
@@ -450,6 +471,13 @@ mod tests {
     fn dates_and_encoding() {
         assert_eq!(civil(0), (1970, 1, 1));
         assert_eq!(civil(20_735), (2026, 10, 9));
+        assert_eq!(iso_seconds("1970-01-01T00:00:00.000Z"), 0);
+        assert_eq!(
+            iso_seconds("2026-10-09T13:33:10.000Z"),
+            20_735 * 86400 + 13 * 3600 + 33 * 60 + 10
+        );
+        assert_eq!(iso_seconds("2024-02-29T00:00:01Z"), 1_709_164_801);
+        assert_eq!(iso_seconds("garbage"), 0);
         assert_eq!(uri_encode("a b/c~", true), "a%20b/c~");
         assert_eq!(uri_encode("a/b", false), "a%2Fb");
         assert_eq!(

@@ -542,6 +542,11 @@ impl Store {
         Ok(out)
     }
 
+    pub fn delete_object(&mut self, name: &str) -> Result<(), String> {
+        let key = self.k_object(name);
+        self.s3.delete(&key)
+    }
+
     pub fn delete_pack(&mut self, repo: &str, pack: &str) -> Result<(), String> {
         let (a, b) = (self.k_pack(repo, pack), self.k_idx(repo, pack));
         self.s3.delete(&a)?;
@@ -557,9 +562,27 @@ impl Store {
             if keys.is_empty() {
                 return Ok(n);
             }
-            for (k, _) in keys {
+            for (k, _, _) in keys {
                 self.s3.delete(&k)?;
                 n += 1;
+            }
+        }
+    }
+
+    /// Every object of a repository: (name under `r/<id>/`, last modified).
+    pub fn list_repo(&mut self, repo: &str) -> Result<Vec<(String, u64)>, String> {
+        let prefix = format!("{}r/{repo}/", self.prefix);
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let (keys, next) = self.s3.list(&prefix, token.as_deref())?;
+            out.extend(
+                keys.into_iter()
+                    .filter_map(|(k, _, m)| k.strip_prefix(&prefix).map(|n| (n.to_string(), m))),
+            );
+            match next {
+                Some(t) => token = Some(t),
+                None => return Ok(out),
             }
         }
     }

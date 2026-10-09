@@ -32,6 +32,16 @@ fn grace() -> u64 {
         .unwrap_or(3600)
 }
 
+/// Seconds an unlisted pack must have existed before it counts as an orphan
+/// (an upload whose push or repack never committed). A day: far longer than
+/// any push in flight. DEPOT_ORPHAN_AGE overrides, for tests.
+fn orphan_age() -> u64 {
+    std::env::var("DEPOT_ORPHAN_AGE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(86_400)
+}
+
 fn sweep_every() -> Duration {
     Duration::from_secs(
         std::env::var("DEPOT_SWEEP_EVERY")
@@ -49,6 +59,8 @@ pub struct State {
     queue: VecDeque<String>,
     job: Option<Repack>,
     last_sweep: Option<Instant>,
+    orphan_scans: std::collections::HashMap<String, Instant>,
+    pub orphans_deleted: u64,
     pub done: u64,
     pub last: Option<String>,
 }
@@ -112,7 +124,8 @@ pub fn status(app: &App) -> Value {
     let job = app.maint.job.as_ref().map(|j| {
         json!({ "sources": j.sources.len(), "bytes": j.total, "copied": j.produced, "seconds": j.started.elapsed().as_secs() })
     });
-    json!({ "queued": app.maint.queue.len(), "running": job, "repacks": app.maint.done, "last": app.maint.last })
+    json!({ "queued": app.maint.queue.len(), "running": job, "repacks": app.maint.done, "last": app.maint.last,
+            "orphans_deleted": app.maint.orphans_deleted })
 }
 
 /// One slice of background work; true when it did anything.
@@ -158,6 +171,16 @@ pub fn tick(app: &mut App) -> bool {
         for id in ids {
             if let Err(e) = sweep(app, &id) {
                 eprintln!("[depot] retired-pack sweep: {e}");
+            }
+            let due =
+                app.maint.orphan_scans.get(&id).is_none_or(|t| {
+                    t.elapsed() > Duration::from_secs(orphan_age().clamp(1, 86_400))
+                });
+            if due {
+                app.maint.orphan_scans.insert(id.clone(), Instant::now());
+                if let Err(e) = orphans(app, &id) {
+                    eprintln!("[depot] orphan sweep: {e}");
+                }
             }
             // repositories loaded since the last push get their merge too
             after_push(app, &id);
@@ -320,6 +343,40 @@ fn commit(app: &mut App, j: &Repack) -> Result<(), String> {
         }
     }
     Err("manifest busy".into())
+}
+
+/// Delete pack objects no manifest lists (live or retired) that are older
+/// than `orphan_age()`: the uploads of pushes and repacks that never committed.
+fn orphans(app: &mut App, id: &str) -> Result<(), String> {
+    let Some(r) = app.repos.get(id) else {
+        return Ok(());
+    };
+    let mut known: std::collections::HashSet<String> =
+        r.m.packs.iter().map(|p| p.id.clone()).collect();
+    known.extend(r.m.retired.iter().map(|x| x.id.clone()));
+    if let Some(j) = &app.maint.job {
+        known.insert(j.new_id.clone());
+    }
+    let cutoff = now().saturating_sub(orphan_age());
+    let mut gone = 0;
+    for (name, modified) in app.store.list_repo(id)? {
+        let Some(pack) = name
+            .strip_suffix(".pack")
+            .or_else(|| name.strip_suffix(".idx"))
+        else {
+            continue;
+        };
+        if known.contains(pack) || modified > cutoff || modified == 0 {
+            continue;
+        }
+        app.store.delete_object(&format!("r/{id}/{name}"))?;
+        gone += 1;
+    }
+    if gone > 0 {
+        app.maint.orphans_deleted += gone;
+        eprintln!("[depot] deleted {gone} orphaned pack objects");
+    }
+    Ok(())
 }
 
 /// Delete packs retired more than an hour ago, then drop them from the list.

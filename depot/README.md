@@ -22,7 +22,7 @@ zlib and the AEAD as the only dependencies.
 
 | | |
 | --- | --- |
-| Fetch | protocol v2 (`ls-refs`, `fetch`) and v0/v1 stateless RPC with `multi_ack_detailed` + `no-done` (libgit2, go-git, cargo) |
+| Fetch | protocol v2 (`ls-refs`, `fetch`) and v0/v1 stateless RPC with `multi_ack_detailed` + `no-done`, for clients that speak only v0 (libgit2, so cargo's git dependencies: verified) |
 | Negotiation | full have/ACK/ready, so an incremental fetch sends only what is new; thin packs; `include-tag`; `ofs-delta` |
 | Shallow | `--depth`, `--deepen`, `--unshallow`, `--shallow-since`, `--shallow-exclude` |
 | Push | `report-status`, `side-band-64k` progress, `atomic`, `delete-refs`, `quiet`, `push-options` (accepted, ignored) |
@@ -97,8 +97,7 @@ is new. During a transition, `git remote set-url --add --push origin
    everything in the bucket: lose it and the data is unreadable; nothing can
    recover it.
    ```sh
-   echo "DEPOT_MASTER_KEY=$(openssl rand -hex 32)"
-   echo "DEPOT_ADMIN_TOKEN=$(openssl rand -hex 24)"
+   scripts/new-secrets.sh depot-secrets.env   # asks for the R2 key pair, writes all four (0600)
    ```
 3. **Publish** the build (`target/wasm32-wasip2/release/depot.wasm`) as a CPU
    service app: slug `depot`, port `http:8000`, memory 2048 MiB (a push is
@@ -193,6 +192,10 @@ egress path and exits, which diagnoses a bucket that cannot be reached.
   packs it replaced are deleted an hour later, after any fetch planned
   against them has finished. An admin can trigger it from a repository's
   settings or with `POST /api/maintenance?repo=`.
+- **Orphans.** A push or repack that dies after uploading but before
+  committing leaves a pack that no manifest lists. A daily sweep deletes such
+  objects once they are a day old, which is far longer than any upload in
+  flight.
 - **Status.** `GET /api/status` (admin) reports loaded repositories, cache hit
   rates, storage calls and bytes, traffic, maintenance and webhooks.
 - **Memory.** Each repository's object index and graph stay in memory (the
@@ -213,7 +216,7 @@ egress path and exits, which diagnoses a bucket that cannot be reached.
 ```sh
 cargo test                                            # unit tests (native)
 cargo build --release --target wasm32-wasip2          # target/wasm32-wasip2/release/depot.wasm
-python3 tests/e2e.py                                  # real git + wasmtime + MinIO, 40 checks
+python3 tests/e2e.py                                  # real git + wasmtime + MinIO, 43 checks
 python3 tests/e2e.py --platform                       # through a Node gateway like the platform's, storage via a SOCKS5 egress front
 python3 tests/e2e.py --mirror ~/src/big-repo          # also mirror a real repository and clone it back
 python3 tests/dev.py                                  # a local server with sample repositories, to look at
@@ -223,7 +226,8 @@ The end-to-end suite needs `git`, `wasmtime`, `minio`, `curl`, `node` and
 Python's `cryptography`. It covers both protocol versions; thin, shallow,
 deepen and unshallow fetches; protected refs and atomic pushes; a 24 MiB blob
 through multipart upload; concurrent clones and contended pushes; minted
-tokens over `X-Api-Key`; repack and the retired-pack sweep; restart from the
+tokens over `X-Api-Key`; cargo's libgit2 cloning and updating a git
+dependency; repack, the retired-pack and orphan sweeps; restart from the
 bucket; export to plain git; and a scan of every stored byte for plaintext.
 The scan has a control that must find a planted plaintext object.
 

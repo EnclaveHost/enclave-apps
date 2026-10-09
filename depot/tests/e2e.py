@@ -32,7 +32,19 @@ TOKENS = {
     "writer": "wtr-" + "c3" * 16,
 }
 MARK = "PLAINTEXT-MARKER-7f3a9c"
-HOOK_SECRET = "hook-secret-0123456789abcdef"  # must never appear in the bucket
+HOOK_SECRET = "hook-secret-0123456789abcdef"
+# Sign in with Enclave: the platform spec's throwaway signer key 0x42..42 and its address
+SSO_SIGNER = "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025"
+SSO_AUD = "0x" + "11" * 32
+SSO_SUB = "0x00a329c0648769a73afac7f9381e08fb43dbea72"
+
+
+def mint_est1(sub, aud, iat, exp, key="0x" + "42" * 32):
+    """An EST1 sign-in token, minted as the platform mints them (cast signs)."""
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    msg = "EST1." + b64(json.dumps({"v": 1, "sub": sub, "aud": aud, "iat": iat, "exp": exp}, separators=(",", ":")).encode())
+    sig = subprocess.check_output(["cast", "wallet", "sign", "--private-key", key, msg]).decode().strip()
+    return msg + "." + b64(bytes.fromhex(sig[2:]))  # must never appear in the bucket
 
 passed = 0
 
@@ -159,7 +171,9 @@ class Env:
                 "admin": {"token": "$E2E_TOK_ADMIN", "admin": True},
                 "reader": {"token_sha256": hashlib.sha256(TOKENS["reader"].encode()).hexdigest(), "read": ["*"]},
                 "writer": {"token": "$E2E_TOK_WRITER", "write": ["w/*", "shared"]},
+                "signed": {"account": SSO_SUB, "read": ["w/*"]},
             },
+            "sso": {"signer": SSO_SIGNER, "audience": SSO_AUD},
             "public": ["pub/*"],
             "protected": ["refs/heads/main", "refs/tags/*"],
             "max_push_mb": 512,
@@ -185,6 +199,7 @@ class Env:
             E2E_HOOK=HOOK_SECRET,
             DEPOT_RETIRE_GRACE="2",
             DEPOT_SWEEP_EVERY="1",
+            DEPOT_ORPHAN_AGE="5",
         )
         if self.args.platform:
             if not getattr(self, "socks_port", None):
@@ -216,7 +231,7 @@ class Env:
             cmd = [os.path.join(ROOT, "target/release/depot")]
         else:
             envs = ["--env", "ENCLAVE_EGRESS"] if self.args.platform else []
-            for k in ["ENCLAVE_CONFIG", "ENCLAVE_PORTS", *secret_envs, "DEPOT_RETIRE_GRACE", "DEPOT_SWEEP_EVERY"]:
+            for k in ["ENCLAVE_CONFIG", "ENCLAVE_PORTS", *secret_envs, "DEPOT_RETIRE_GRACE", "DEPOT_SWEEP_EVERY", "DEPOT_ORPHAN_AGE"]:
                 envs += ["--env", k]
             cmd = ["wasmtime", "run", "-S", "inherit-network=y", "-S", "allow-ip-name-lookup=y", "-W",
                    f"max-memory-size={self.args.mem << 20}", *dirs, *envs, self.args.wasm]
@@ -678,6 +693,26 @@ def run(env, args):
         die("a concurrent branch push was lost")
     ok(f"4 clones + 4 pushes concurrently: clones fsck clean, both branches land, contended ref {contend}")
 
+    if shutil.which("cast"):
+        print("== Sign in with Enclave (EST1 tokens)")
+        now = int(time.time())
+        good = mint_est1(SSO_SUB, SSO_AUD, now, now + 3600)
+        hdr = lambda t: ["-c", f"http.extraHeader=X-Sso-Token: {t}"]
+        req = urllib.request.Request(f"{env.base}/api/whoami", headers={"X-Sso-Token": good})
+        me = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        if me["user"] != "signed" or not me["signed_in"]:
+            die(f"sign-in did not map to the configured user: {me}")
+        env.git(*hdr(good), "ls-remote", env.url("w/repo"))
+        r = env.git(*hdr(good), "push", env.url("w/repo"), "main:refs/heads/sso-try", cwd=src, check=False)
+        if r.returncode == 0:
+            die("a read-only signed-in user pushed")
+        for label, bad in [("another deployment", mint_est1(SSO_SUB, "0x" + "22" * 32, now, now + 3600)),
+                           ("expired", mint_est1(SSO_SUB, SSO_AUD, now - 7200, now - 3600)),
+                           ("wrong signer", mint_est1(SSO_SUB, SSO_AUD, now, now + 3600, "0x" + "43" * 32))]:
+            if env.git(*hdr(bad), "ls-remote", env.url("w/repo"), check=False).returncode == 0:
+                die(f"a sign-in token for {label} was accepted")
+        ok("EST1 sign-in maps to its configured user; wrong audience, expired and forged tokens refused")
+
     print("== repack: many pushes merge into few packs")
     many = os.path.join(W, "many")
     env.git("init", "-q", "-b", "main", many)
@@ -722,6 +757,22 @@ def run(env, args):
     if stored != total_packs:
         die(f"bucket holds {stored} packs, manifests list {total_packs}: retired packs were not swept")
     ok(f"retired packs swept: bucket holds exactly the {stored} listed packs")
+    # an upload that never committed (a push killed mid-way) is swept after its age
+    rid = next(k for k in env.bucket_objects() if k.endswith("/manifest")).split("/")[2]
+    junk = os.path.join(W, "junk.bin")
+    open(junk, "wb").write(os.urandom(1000))
+    orphan = f"/{BUCKET}/depot/r/{rid}/0123456789abcdef0123456789abcdef.pack"
+    subprocess.run(["curl", "-s", "-o", "/dev/null", "-X", "PUT", "--aws-sigv4", "aws:amz:us-east-1:s3", "--user",
+                    f"{AK}:{SK}", "-T", junk, env.s3 + orphan], check=True)
+    for _ in range(150):
+        if not any(k.endswith("0123456789abcdef0123456789abcdef.pack") for k in env.bucket_objects()):
+            break
+        time.sleep(0.1)
+    else:
+        die("an orphaned pack object was never swept")
+    if len([k for k in env.bucket_objects() if k.endswith(".pack")]) != total_packs:
+        die("the orphan sweep removed a listed pack")
+    ok("orphaned uploads are swept; listed packs are untouched")
 
     print("== restart: everything comes back from the bucket")
     env.stop_depot()
