@@ -4399,7 +4399,10 @@ function parseSnp(r) {
 }
 
 const SIG_ALGO = { 0: "none", 1: "ECDSA P-384 with SHA-384" };
-const TEE_NAME = { "amd-sev-snp": "AMD SEV-SNP", "intel-tdx": "Intel TDX", "nvidia-cc": "NVIDIA confidential computing" };
+// enclave-shield-masked: the card is on the operator's untrusted host, outside the CVM, reached by masked offload; it has no
+// hardware report of its own, and the platform's note (gpu.verify) says so under the row.
+const TEE_NAME = { "amd-sev-snp": "AMD SEV-SNP", "intel-tdx": "Intel TDX", "nvidia-cc": "NVIDIA confidential computing",
+  "enclave-shield-masked": "Enclave Shield masked offload" };
 const tcbStr = (t) => t ? `bootloader ${t.boot} · tee ${t.tee} · snp ${t.snp} · microcode ${t.ucode}` : null;
 
 function attSection(title, source, rows, extra) {
