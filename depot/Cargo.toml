@@ -1,0 +1,48 @@
+[package]
+name = "depot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license-file = "../LICENSE"
+description = "A private git server in an attested enclave: smart HTTP (protocol v2 and v0, push, shallow, thin packs), every pack, index and ref encrypted before it reaches your R2/S3 bucket."
+
+# A run-mode service app (one wasm32-wasip2 command component), the shape of
+# cron and s3-ipfs-adapter: std maps to wasi:sockets/clocks, one cooperative
+# event loop serves every connection. The git object model, pack codec, delta
+# engine, both upload-pack protocols, receive-pack, the HTTP server, the S3
+# client and the storage format are hand-rolled std. Dependencies are the
+# primitives: the pure-Rust TLS stack, hashes (SHA-1 with collision
+# detection for object ids, SHA-256/HMAC for SigV4 and key derivation),
+# zlib, and the AEAD.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+sha1-checked = { version = "0.10", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+sha2 = "0.10"
+hmac = "0.12"
+miniz_oxide = "0.8"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+getrandom = "0.2"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+subtle = "2"
+# Sign in with Enclave (src/sso.rs): EST1 tokens are EIP-191 secp256k1
+# signatures, verified with the pure-Rust stack jot and cron use.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+sha3 = { version = "0.10", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2
