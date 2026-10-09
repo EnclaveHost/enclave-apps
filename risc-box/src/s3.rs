@@ -332,6 +332,9 @@ fn fetch_raw(
                                     .and_then(|n| n.trim().parse().ok());
                             }
                         }
+                        if let Some(cl) = content_length {
+                            rbuf.reserve_exact((pos + 4 + cl).saturating_sub(rbuf.len()));
+                        }
                     }
                 }
                 // Progress is for the object, not for an error page: a 404's
@@ -363,9 +366,14 @@ fn fetch_raw(
         }
     }
     let he = head_end.ok_or("response ended before headers completed")?;
-    let raw = &rbuf[he..];
-    let body = if chunked { dechunk(raw)? } else { raw.to_vec() };
-    drop(rbuf);
+    // The body IS the buffer past the headers: trim them off in place rather than copying the body out (for a
+    // disk image that copy was a second gigabyte alive at once).
+    let body = if chunked {
+        dechunk(&rbuf[he..])?
+    } else {
+        rbuf.drain(..he);
+        rbuf
+    };
     if let Some(cl) = content_length {
         if body.len() < cl && cut.is_none() {
             cut = Some(format!("short body: {} of {cl} bytes", body.len()));
@@ -421,6 +429,9 @@ fn get_resumable(
                     "resume of {key} at byte {from}: S3 answered {} (range start {:?}); not splicing it",
                     raw.status, raw.range_start
                 ));
+            }
+            if let Some(t) = total {
+                have.reserve_exact(t.saturating_sub(have.len()));
             }
             have.extend_from_slice(&raw.body);
         }
