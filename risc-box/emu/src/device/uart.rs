@@ -9,6 +9,12 @@ const IIR_NO_INTERRUPT: u8 = 0x7;
 
 const LSR_DATA_AVAILABLE: u8 = 0x1;
 const LSR_THR_EMPTY: u8 = 0x20;
+// risc-box patch: TEMT, "transmitter empty" (THR and the shift register both idle). A byte written to THR is handed to
+// the host terminal at once (see store()), so the transmitter is ALWAYS empty and LSR always reads both bits, as a real
+// 16550 does when idle (0x60). Without TEMT, Linux's 8250 console write ends with wait_for_xmitr(UART_LSR_BOTH_EMPTY):
+// 10,000 rounds of udelay(1) + touch_nmi_watchdog per printk, which measured as most of the instructions the guest
+// retired from boot to a running Firefox (one region, wq_watchdog_touch <-> udelay, 1.5G of 1.65G region calls).
+const LSR_TX_IDLE: u8 = LSR_THR_EMPTY | 0x40;
 
 // risc-box patch: did the clock cross a multiple of `period` when it advanced
 // from `previous` to `now`? Replaces `clock % period == 0`, which silently
@@ -57,7 +63,7 @@ impl Uart {
 			iir: 0,
 			lcr: 0,
 			mcr: 0,
-			lsr: LSR_THR_EMPTY,
+			lsr: LSR_TX_IDLE,
 			scr: 0,
 			thre_ip: false,
 			interrupting: false,
@@ -198,7 +204,7 @@ impl Uart {
 				true => {
 					self.terminal.put_byte(value);
 					self.thr = 0;
-					self.lsr |= LSR_THR_EMPTY;
+					self.lsr |= LSR_TX_IDLE;
 					self.update_iir();
 					if (self.ier & IER_THREINT_BIT) != 0 {
 						self.thre_ip = true;
@@ -267,7 +273,8 @@ impl Uart {
 		self.iir = r.u8()?;
 		self.lcr = r.u8()?;
 		self.mcr = r.u8()?;
-		self.lsr = r.u8()?;
+		// snapshots taken before TEMT was reported hold THRE alone; the transmitter is idle either way
+		self.lsr = r.u8()? | LSR_TX_IDLE;
 		self.scr = r.u8()?;
 		self.thre_ip = r.bool()?;
 		self.interrupting = r.bool()?;
@@ -326,5 +333,24 @@ mod rx_cadence_tests {
 		for _ in 0..(2 * RX_POLL_PERIOD / 32) { uart.tick(32); }
 		assert_eq!(uart.load(0x10000000), b'b');
 		assert!(q.borrow().is_empty());
+	}
+
+	/// The transmitter reads idle - THRE AND TEMT - at reset, after every byte, and after restoring a snapshot taken
+	/// when only THRE was reported: Linux's console write waits for both bits (wait_for_xmitr(UART_LSR_BOTH_EMPTY))
+	/// and spins 10,000 udelay(1)s per printk when TEMT never comes.
+	#[test]
+	fn the_transmitter_always_reads_empty() {
+		const BOTH_EMPTY: u8 = 0x60;
+		let (mut uart, _) = uart_with(b"");
+		assert_eq!(uart.load(0x10000005) & BOTH_EMPTY, BOTH_EMPTY, "at reset");
+		uart.store(0x10000000, b'x');
+		assert_eq!(uart.load(0x10000005) & BOTH_EMPTY, BOTH_EMPTY, "after a byte");
+		uart.lsr = LSR_THR_EMPTY;
+		let mut w = Ser::new();
+		uart.snapshot(&mut w);
+		let bytes = w.buf;
+		let (mut back, _) = uart_with(b"");
+		back.restore(&mut De::new(&bytes)).unwrap();
+		assert_eq!(back.load(0x10000005) & BOTH_EMPTY, BOTH_EMPTY, "after restoring an old snapshot");
 	}
 }
