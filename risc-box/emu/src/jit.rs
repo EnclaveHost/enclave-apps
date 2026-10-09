@@ -69,8 +69,9 @@ pub struct Layout {
 	pub pc_addr: u64, // u64
 	pub gen_addr: u64, // u32 write-snoop generation cell (flat RAM only)
 	pub baked_gen: u32, // generation a flat-RAM module was built against
-	/// u64: the fcsr CSR (fflags bits 0-4, frm bits 5-7). FDIV's divide-by-
-	/// zero flag and the float-CSR ops reach it here.
+	/// u64: the fcsr CSR (fflags bits 0-4, frm bits 5-7). The float ops'
+	/// exception flags (NV, DZ, NX: cpu.rs's floating-point semantics) and
+	/// the float-CSR ops reach it here.
 	pub fcsr_addr: u64,
 	/// LR/SC: the reservation flag (one byte, 0/1) and the virtual address
 	/// it holds (u64) - Cpu::is_reservation_set / Cpu::reservation.
@@ -176,6 +177,13 @@ const I64_SHL: u8 = 0x86;
 const I64_SHR_U: u8 = 0x88;
 const I32_WRAP_I64: u8 = 0xa7;
 const I64_EXTEND_I32_U: u8 = 0xad;
+// the float rules (Emit::get_s_bits and friends, fp_single/fp_double)
+const I32_EQZ: u8 = 0x45;
+const I32_LT_U: u8 = 0x49;
+const I32_GT_U: u8 = 0x4b;
+const I32_SUB: u8 = 0x6b;
+const I32_AND: u8 = 0x71;
+const I32_OR: u8 = 0x72;
 
 /// Local indices. Every generated function has the region shape
 /// (fuel: i64, entry: i32) -> i64. Address-typed locals (base, the chunk
@@ -500,18 +508,136 @@ impl<'a> Emit<'a> {
 		self.op(0xbd); // i64.reinterpret_f64 (bit-exact)
 		self.set_f_bits_post(r);
 	}
-	/// push f[r] as the single it holds: the interpreter keeps a single in
-	/// the LOW 32 bits of the register (f32::from_bits(bits as u32))
-	fn get_f32(&mut self, r: u8) {
+	/// push the bits (i32) of the single f[r] holds, as cpu.rs's s_unbox
+	/// reads it: the low 32 bits when NaN-boxed (upper 32 bits all ones),
+	/// else the canonical NaN
+	fn get_s_bits(&mut self, r: u8) {
 		self.get_f_bits(r);
 		self.op(I32_WRAP_I64);
+		self.i32c(FP_CANON_S as i32);
+		self.get_f_bits(r);
+		self.i64c(FP_BOX as i64);
+		self.op(I64_GE_U);
+		self.op(SELECT);
+	}
+	/// push the single f[r] holds (s_unbox) as f32
+	fn get_f32(&mut self, r: u8) {
+		self.get_s_bits(r);
 		self.op(0xbe); // f32.reinterpret_i32
 	}
-	/// f32 on the stack -> f[r] = its bits, ZERO-extended (the interpreter's
-	/// f64::from_bits(x.to_bits() as u64))
+	/// single bits (i32) on the stack -> f[r], NaN-boxed (s_box)
+	fn set_s_bits_post(&mut self, r: u8) {
+		self.op(I64_EXTEND_I32_U);
+		self.i64c(FP_BOX as i64);
+		self.op(I64_OR);
+		self.set_f_bits_post(r);
+	}
+	/// f32 on the stack -> f[r], NaN-boxed, bit-exact (a result that cannot
+	/// be a NaN, or a bit move)
 	fn set_f32_post(&mut self, r: u8) {
 		self.op(0xbc); // i32.reinterpret_f32
-		self.op(I64_EXTEND_I32_U);
+		self.set_s_bits_post(r);
+	}
+	/// push i32: the f register (unboxed when `single`) is a NaN
+	fn is_nan(&mut self, r: u8, single: bool) {
+		match single {
+			true => {
+				self.get_s_bits(r);
+				self.i32c(0x7fff_ffff);
+				self.op(I32_AND);
+				self.i32c(0x7f80_0000);
+				self.op(I32_GT_U);
+			}
+			false => {
+				self.get_f_bits(r);
+				self.i64c(i64::MAX);
+				self.op(I64_AND);
+				self.i64c(0x7ff0_0000_0000_0000);
+				self.op(I64_GT_U);
+			}
+		}
+	}
+	/// push i32: the f register (unboxed when `single`) is a SIGNALING NaN
+	/// (exponent all ones, quiet bit clear, fraction nonzero)
+	fn is_snan(&mut self, r: u8, single: bool) {
+		match single {
+			true => {
+				self.get_s_bits(r);
+				self.i32c(0x7fff_ffff);
+				self.op(I32_AND);
+				self.i32c(0x7f80_0001);
+				self.op(I32_SUB);
+				self.i32c(0x003f_ffff);
+				self.op(I32_LT_U);
+			}
+			false => {
+				self.get_f_bits(r);
+				self.i64c(i64::MAX);
+				self.op(I64_AND);
+				self.i64c(0x7ff0_0000_0000_0001);
+				self.op(I64_SUB);
+				self.i64c(0x0007_ffff_ffff_ffff);
+				self.op(I64_LT_U);
+			}
+		}
+	}
+	/// push i32: Cpu::fp_res_d's NV rule for a NaN result over the input
+	/// registers - one of them is a signaling NaN, or none is a NaN
+	fn nv_rule(&mut self, ins: &[(u8, bool)]) {
+		for (i, &(r, single)) in ins.iter().enumerate() {
+			self.is_snan(r, single);
+			if i > 0 {
+				self.op(I32_OR);
+			}
+		}
+		for (i, &(r, single)) in ins.iter().enumerate() {
+			self.is_nan(r, single);
+			if i > 0 {
+				self.op(I32_OR);
+			}
+		}
+		self.op(I32_EQZ);
+		self.op(I32_OR);
+	}
+	/// consume an i32 condition: if nonzero, fcsr |= bits
+	fn fcsr_or_if(&mut self, bits: i64) {
+		self.op(IF);
+		self.op(VOID);
+		self.fcsr_or(bits);
+		self.op(END);
+	}
+	/// An arithmetic result on the stack (f64, or f32 when `single`) -> f[r]
+	/// (set_f_pre(r) first) as Cpu::fp_res_d / fp_res_s write it: a NaN
+	/// becomes the canonical NaN, raising NV per nv_rule over `ins` (read
+	/// before f[r] is written, so r may alias an input); a single is
+	/// NaN-boxed.
+	fn set_canon_post(&mut self, r: u8, single: bool, ins: &[(u8, bool)]) {
+		let t = self.l.t0;
+		match single {
+			true => {
+				self.op(0xbc); // i32.reinterpret_f32
+				self.op(I64_EXTEND_I32_U);
+			}
+			false => self.op(0xbd), // i64.reinterpret_f64
+		}
+		self.lset(t);
+		self.lget(t);
+		self.i64c(if single { 0x7fff_ffff } else { i64::MAX });
+		self.op(I64_AND);
+		self.i64c(if single { 0x7f80_0000 } else { 0x7ff0_0000_0000_0000 });
+		self.op(I64_GT_U);
+		self.op(IF);
+		self.op(0x7e); // -> i64
+		self.nv_rule(ins);
+		self.fcsr_or_if(FFLAG_NV as i64);
+		self.i64c(if single { FP_CANON_S as i64 } else { FP_CANON_D as i64 });
+		self.op(ELSE);
+		self.lget(t);
+		self.op(END);
+		if single {
+			self.i64c(FP_BOX as i64);
+			self.op(I64_OR);
+		}
 		self.set_f_bits_post(r);
 	}
 	/// fcsr |= bits (Cpu::set_fcsr_dz and friends)
@@ -864,10 +990,6 @@ enum FOp {
 	FromWu,
 	FromL,
 	FromLu,
-	Madd,
-	Msub,
-	Nmsub,
-	Nmadd,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -882,6 +1004,10 @@ fn table_op(op: &BlockOp) -> Option<TableOp> {
 	use self::FOp as F;
 	let csr = ((op.word >> 20) & 0xfff) as u16;
 	let fcsr_family = (1..=3).contains(&csr);
+	// float -> int conversions round per the word's rm: a static 0-4 is
+	// translated (to_int); DYN (frm, known only at run time) and the
+	// reserved 5/6 (an illegal-instruction trap) stay with the interpreter
+	let static_rm = (op.word >> 12) & 7 <= 4;
 	Some(match ::cpu::op_name(op) {
 		"DIV" => TableOp::Div,
 		"DIVU" => TableOp::Divu,
@@ -931,35 +1057,30 @@ fn table_op(op: &BlockOp) -> Option<TableOp> {
 		"FEQ.S" => TableOp::Fs(F::Eq),
 		"FLT.S" => TableOp::Fs(F::Lt),
 		"FLE.S" => TableOp::Fs(F::Le),
-		"FCVT.W.S" => TableOp::Fs(F::ToW),
-		"FCVT.WU.S" => TableOp::Fs(F::ToWu),
-		"FCVT.L.S" => TableOp::Fs(F::ToL),
-		"FCVT.LU.S" => TableOp::Fs(F::ToLu),
+		"FCVT.W.S" if static_rm => TableOp::Fs(F::ToW),
+		"FCVT.WU.S" if static_rm => TableOp::Fs(F::ToWu),
+		"FCVT.L.S" if static_rm => TableOp::Fs(F::ToL),
+		"FCVT.LU.S" if static_rm => TableOp::Fs(F::ToLu),
 		"FCVT.S.W" => TableOp::Fs(F::FromW),
 		"FCVT.S.WU" => TableOp::Fs(F::FromWu),
 		"FCVT.S.L" => TableOp::Fs(F::FromL),
 		"FCVT.S.LU" => TableOp::Fs(F::FromLu),
-		"FMADD.S" => TableOp::Fs(F::Madd),
-		"FMSUB.S" => TableOp::Fs(F::Msub),
-		"FNMSUB.S" => TableOp::Fs(F::Nmsub),
-		"FNMADD.S" => TableOp::Fs(F::Nmadd),
+		// not FMADD/FMSUB/FNMSUB/FNMADD (.S or .D): the interpreter FUSES
+		// them (one rounding, mul_add), and wasm has no fused multiply-add
+		// to match it with; and not FMIN/FMAX, FCLASS
 		"FSQRT.D" => TableOp::Fd(F::Sqrt),
 		"FSGNJN.D" => TableOp::Fd(F::Sgnjn),
 		"FSGNJX.D" => TableOp::Fd(F::Sgnjx),
 		"FEQ.D" => TableOp::Fd(F::Eq),
 		"FLT.D" => TableOp::Fd(F::Lt),
 		"FLE.D" => TableOp::Fd(F::Le),
-		"FCVT.W.D" => TableOp::Fd(F::ToW),
-		"FCVT.WU.D" => TableOp::Fd(F::ToWu),
-		"FCVT.L.D" => TableOp::Fd(F::ToL),
-		"FCVT.LU.D" => TableOp::Fd(F::ToLu),
+		"FCVT.W.D" if static_rm => TableOp::Fd(F::ToW),
+		"FCVT.WU.D" if static_rm => TableOp::Fd(F::ToWu),
+		"FCVT.L.D" if static_rm => TableOp::Fd(F::ToL),
+		"FCVT.LU.D" if static_rm => TableOp::Fd(F::ToLu),
 		"FCVT.D.WU" => TableOp::Fd(F::FromWu),
 		"FCVT.D.L" => TableOp::Fd(F::FromL),
 		"FCVT.D.LU" => TableOp::Fd(F::FromLu),
-		"FMADD.D" => TableOp::Fd(F::Madd),
-		"FMSUB.D" => TableOp::Fd(F::Msub),
-		"FNMSUB.D" => TableOp::Fd(F::Nmsub),
-		"FNMADD.D" => TableOp::Fd(F::Nmadd),
 		"FCVT.D.S" => TableOp::CvtDS,
 		"FCVT.S.D" => TableOp::CvtSD,
 		"FMV.X.W" => TableOp::MvXW,
@@ -986,26 +1107,23 @@ fn emit_table_op(e: &mut Emit, t: TableOp, op: &BlockOp, addr: u64, next: u64, r
 		TableOp::Amo(a, w) => amo(e, a, w, rd, rs1, rs2, addr, next, ret_before, ret_after),
 		TableOp::Lr(w) => lr(e, w, rd, rs1, addr, ret_before),
 		TableOp::Sc(w) => sc(e, w, rd, rs1, rs2, addr, next, ret_before, ret_after),
-		TableOp::Fs(f) => fp_single(e, f, rd, rs1, rs2, ((op.word >> 27) & 0x1f) as u8),
-		TableOp::Fd(f) => fp_double(e, f, rd, rs1, rs2, ((op.word >> 27) & 0x1f) as u8),
+		TableOp::Fs(f) => fp_single(e, f, rd, rs1, rs2, ((op.word >> 12) & 7) as u8),
+		TableOp::Fd(f) => fp_double(e, f, rd, rs1, rs2, ((op.word >> 12) & 7) as u8),
 		TableOp::CvtDS => {
-			// f32::from_bits(low half) as f64
+			// Cpu::fp_d_of_s: the unboxed single widened (exact); a NaN
+			// canonical, NV when it was signaling
 			e.set_f_pre(rd);
 			e.get_f32(rs1);
 			e.op(0xbb); // f64.promote_f32
-			e.set_f_post(rd);
+			e.set_canon_post(rd, false, &[(rs1, true)]);
 		}
 		TableOp::CvtSD => {
-			// the interpreter NaN-boxes this one (and only this one):
-			// 0xffff_ffff_0000_0000 | (f as f32).to_bits()
+			// Cpu::fp_s_of_d: round to nearest-even (f32.demote_f64), boxed;
+			// a NaN canonical, NV when it was signaling
 			e.set_f_pre(rd);
 			e.get_f(rs1);
 			e.op(0xb6); // f32.demote_f64
-			e.op(0xbc); // i32.reinterpret_f32
-			e.op(I64_EXTEND_I32_U);
-			e.i64c(0xffff_ffff_0000_0000u64 as i64);
-			e.op(I64_OR);
-			e.set_f_bits_post(rd);
+			e.set_canon_post(rd, true, &[(rs1, false)]);
 		}
 		TableOp::MvXW => {
 			// x = bits as i32 as i64
@@ -1015,11 +1133,11 @@ fn emit_table_op(e: &mut Emit, t: TableOp, op: &BlockOp, addr: u64, next: u64, r
 			e.set_x_post(rd);
 		}
 		TableOp::MvWX => {
-			// f = x as u32 as u64
+			// f = the low 32 bits of x, NaN-boxed
 			e.set_f_pre(rd);
 			e.get_x(rs1);
-			e.i64c(0xffff_ffff);
-			e.op(I64_AND);
+			e.i64c(FP_BOX as i64);
+			e.op(I64_OR);
 			e.set_f_bits_post(rd);
 		}
 		TableOp::Csr(kind, imm, csr) => csr_op(e, kind, imm, csr, rd, rs1),
@@ -1305,22 +1423,18 @@ fn f64c(e: &mut Emit, v: f64) {
 	e.code.extend_from_slice(&v.to_bits().to_le_bytes());
 }
 
-/// The single-precision table ops. Each reads its operands as the low 32
-/// bits of the f registers and writes its result zero-extended, the way
-/// every .S closure does; conversions to integers use Rust's `as` (NaN -> 0,
-/// saturating, toward zero), which is wasm's trunc_sat exactly.
-fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
+/// The single-precision table ops, as their INSTRUCTIONS closures run them
+/// (cpu.rs, "floating-point semantics"): operands unboxed (get_f32: an
+/// improperly boxed register reads as the canonical NaN), results NaN-boxed,
+/// arithmetic NaNs canonical with NV per Cpu::fp_res_s, sign injection
+/// bit-exact. wasm's f32 arithmetic is IEEE single with round-to-nearest-
+/// even, as the interpreter's; only NaN results differ (sign, payload),
+/// and set_canon_post replaces those.
+fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rm: u8) {
 	match f {
 		FOp::Add | FOp::Sub | FOp::Mul | FOp::Div => {
 			if f == FOp::Div {
-				// if b == 0.0 { set_fcsr_dz() } (either zero: -0.0 == 0.0)
-				e.get_f32(rs2);
-				f32c(e, 0.0);
-				e.op(0x5b); // f32.eq
-				e.op(IF);
-				e.op(VOID);
-				e.fcsr_or(0x8);
-				e.op(END);
+				div_zero_flag(e, rs1, rs2, true);
 			}
 			e.set_f_pre(rd);
 			e.get_f32(rs1);
@@ -1331,34 +1445,34 @@ fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
 				FOp::Mul => 0x94,
 				_ => 0x95, // div
 			});
-			e.set_f32_post(rd);
+			e.set_canon_post(rd, true, &[(rs1, true), (rs2, true)]);
 		}
 		FOp::Sqrt => {
 			e.set_f_pre(rd);
 			e.get_f32(rs1);
 			e.op(0x91); // f32.sqrt
-			e.set_f32_post(rd);
+			e.set_canon_post(rd, true, &[(rs1, true)]);
 		}
 		FOp::Sgnj | FOp::Sgnjn | FOp::Sgnjx => {
 			// the sign from rs2 (inverted, or xored with rs1's), the rest of
-			// rs1, all within the low 32 bits
+			// rs1, on the unboxed bits
 			e.set_f_pre(rd);
-			e.get_f_bits(rs2);
+			e.get_s_bits(rs2);
 			if f == FOp::Sgnjx {
-				e.get_f_bits(rs1);
-				e.op(I64_XOR);
+				e.get_s_bits(rs1);
+				e.op(0x73); // i32.xor
 			}
-			e.i64c(0x8000_0000);
-			e.op(I64_AND);
+			e.i32c(i32::MIN); // 0x8000_0000
+			e.op(I32_AND);
 			if f == FOp::Sgnjn {
-				e.i64c(0x8000_0000);
-				e.op(I64_XOR);
+				e.i32c(i32::MIN);
+				e.op(0x73); // i32.xor
 			}
-			e.get_f_bits(rs1);
-			e.i64c(0x7fff_ffff);
-			e.op(I64_AND);
-			e.op(I64_OR);
-			e.set_f_bits_post(rd);
+			e.get_s_bits(rs1);
+			e.i32c(0x7fff_ffff);
+			e.op(I32_AND);
+			e.op(I32_OR);
+			e.set_s_bits_post(rd);
 		}
 		FOp::Eq | FOp::Lt | FOp::Le => {
 			e.set_x_pre(rd);
@@ -1371,22 +1485,16 @@ fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
 			});
 			e.op(I64_EXTEND_I32_U);
 			e.set_x_post(rd);
+			cmp_flags(e, f, rs1, rs2, true);
 		}
-		FOp::ToW | FOp::ToWu => {
-			// a as i32 / a as u32, then as i32 as i64 (sign-extended)
-			e.set_x_pre(rd);
+		FOp::ToW | FOp::ToWu | FOp::ToL | FOp::ToLu => {
+			// exactly widened, then the double conversion (as fp_to_int)
 			e.get_f32(rs1);
-			e.fc(if f == FOp::ToW { 0 } else { 1 }); // i32.trunc_sat_f32_s/u
-			e.op(0xac); // i64.extend_i32_s
-			e.set_x_post(rd);
-		}
-		FOp::ToL | FOp::ToLu => {
-			e.set_x_pre(rd);
-			e.get_f32(rs1);
-			e.fc(if f == FOp::ToL { 4 } else { 5 }); // i64.trunc_sat_f32_s/u
-			e.set_x_post(rd);
+			e.op(0xbb); // f64.promote_f32
+			to_int(e, f, rd, rm);
 		}
 		FOp::FromW | FOp::FromWu | FOp::FromL | FOp::FromLu => {
+			// never a NaN: boxed bit-exact
 			e.set_f_pre(rd);
 			e.get_x(rs1);
 			match f {
@@ -1403,34 +1511,18 @@ fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
 			}
 			e.set_f32_post(rd);
 		}
-		FOp::Madd | FOp::Msub | FOp::Nmsub | FOp::Nmadd => {
-			// unfused, as the closures compute it: a*b+c, a*b-c, -(a*b)+c,
-			// -(a*b)-c
-			e.set_f_pre(rd);
-			e.get_f32(rs1);
-			e.get_f32(rs2);
-			e.op(0x94); // f32.mul
-			if matches!(f, FOp::Nmsub | FOp::Nmadd) {
-				e.op(0x8c); // f32.neg
-			}
-			e.get_f32(rs3);
-			e.op(if matches!(f, FOp::Madd | FOp::Nmsub) { 0x92 } else { 0x93 });
-			e.set_f32_post(rd);
-		}
 	}
 }
 
-/// The double-precision ops the hot set leaves to the table. Conversions
-/// to integers follow the risc-box patches: saturating `as`, but NaN gives
-/// the type's MAX (signed) or all ones (unsigned) - wasm's trunc_sat gives
-/// 0 there, so NaN is selected separately.
-fn fp_double(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
+/// The double-precision ops the hot set leaves to the table, as their
+/// closures run them.
+fn fp_double(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rm: u8) {
 	match f {
 		FOp::Sqrt => {
 			e.set_f_pre(rd);
 			e.get_f(rs1);
 			e.op(0x9f); // f64.sqrt
-			e.set_f_post(rd);
+			e.set_canon_post(rd, false, &[(rs1, false)]);
 		}
 		FOp::Sgnjn | FOp::Sgnjx => {
 			e.set_f_pre(rd);
@@ -1462,34 +1554,11 @@ fn fp_double(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
 			});
 			e.op(I64_EXTEND_I32_U);
 			e.set_x_post(rd);
+			cmp_flags(e, f, rs1, rs2, false);
 		}
 		FOp::ToW | FOp::ToWu | FOp::ToL | FOp::ToLu => {
-			// select(nan_value, converted, a != a)
-			e.set_x_pre(rd);
-			e.i64c(match f {
-				FOp::ToW => i32::MAX as i64,
-				FOp::ToWu => -1, // u32::MAX as i32 as i64
-				FOp::ToL => i64::MAX,
-				_ => -1, // u64::MAX as i64
-			});
 			e.get_f(rs1);
-			match f {
-				FOp::ToW => {
-					e.fc(2); // i32.trunc_sat_f64_s
-					e.op(0xac);
-				}
-				FOp::ToWu => {
-					e.fc(3); // i32.trunc_sat_f64_u
-					e.op(0xac);
-				}
-				FOp::ToL => e.fc(6), // i64.trunc_sat_f64_s
-				_ => e.fc(7), // i64.trunc_sat_f64_u
-			}
-			e.get_f(rs1);
-			e.get_f(rs1);
-			e.op(0x62); // f64.ne: NaN
-			e.op(SELECT);
-			e.set_x_post(rd);
+			to_int(e, f, rd, rm);
 		}
 		FOp::FromWu | FOp::FromL | FOp::FromLu => {
 			e.set_f_pre(rd);
@@ -1504,21 +1573,161 @@ fn fp_double(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rs3: u8) {
 			}
 			e.set_f_post(rd);
 		}
-		FOp::Madd | FOp::Msub | FOp::Nmsub | FOp::Nmadd => {
-			e.set_f_pre(rd);
-			e.get_f(rs1);
-			e.get_f(rs2);
-			e.op(0xa2); // f64.mul
-			if matches!(f, FOp::Nmsub | FOp::Nmadd) {
-				e.op(0x9a); // f64.neg
-			}
-			e.get_f(rs3);
-			e.op(if matches!(f, FOp::Madd | FOp::Nmsub) { 0xa0 } else { 0xa1 });
-			e.set_f_post(rd);
-		}
 		// the hot set's (FADD/FSUB/FMUL/FDIV.D) and FCVT.D.W never reach here
 		_ => unreachable!("not a table double op"),
 	}
+}
+
+/// FEQ/FLT/FLE's flags after the compare, as Cpu::fp_cmp_d/_s: NV for a
+/// signaling NaN (FEQ, quiet) or for any NaN (FLT/FLE, signaling).
+fn cmp_flags(e: &mut Emit, f: FOp, rs1: u8, rs2: u8, single: bool) {
+	match f {
+		FOp::Eq => {
+			e.is_snan(rs1, single);
+			e.is_snan(rs2, single);
+		}
+		_ => {
+			e.is_nan(rs1, single);
+			e.is_nan(rs2, single);
+		}
+	}
+	e.op(I32_OR);
+	e.fcsr_or_if(FFLAG_NV as i64);
+}
+
+/// FDIV's DZ (Cpu::fp_div_d/_s): a zero divisor (either sign) and a finite
+/// nonzero dividend. Emitted before the division writes rd.
+fn div_zero_flag(e: &mut Emit, rs1: u8, rs2: u8, single: bool) {
+	match single {
+		true => {
+			e.get_f32(rs2);
+			f32c(e, 0.0);
+			e.op(0x5b); // f32.eq
+			e.get_f32(rs1);
+			e.op(0x8b); // f32.abs
+			f32c(e, f32::INFINITY);
+			e.op(0x5d); // f32.lt: finite (false for NaN)
+			e.op(I32_AND);
+			e.get_f32(rs1);
+			f32c(e, 0.0);
+			e.op(0x5c); // f32.ne
+		}
+		false => {
+			e.get_f(rs2);
+			f64c(e, 0.0);
+			e.op(0x61); // f64.eq
+			e.get_f(rs1);
+			e.op(0x99); // f64.abs
+			f64c(e, f64::INFINITY);
+			e.op(0x63); // f64.lt: finite (false for NaN)
+			e.op(I32_AND);
+			e.get_f(rs1);
+			f64c(e, 0.0);
+			e.op(0x62); // f64.ne
+		}
+	}
+	e.op(I32_AND);
+	e.fcsr_or_if(FFLAG_DZ as i64);
+}
+
+/// FCVT.{W,WU,L,LU}.x with a static rounding mode 0-4 (table_op leaves DYN
+/// and the reserved encodings to the interpreter), from the input double on
+/// the stack - Cpu::fp_to_int exactly: r = round(v) per rm; r inside
+/// [lo, hi) converts exactly (trunc_sat of an integral value) and raises NX
+/// when r != v; otherwise NV, and the result saturates - trunc_sat's
+/// saturation is fp_to_int's, except NaN (the type's maximum there, 0 in
+/// wasm), selected separately. 32-bit results sign-extended.
+fn to_int(e: &mut Emit, f: FOp, rd: u8, rm: u8) {
+	let (v, r, t) = (e.l.t0, e.l.t1, e.l.t2);
+	let kind = match f {
+		FOp::ToW => FpInt::W,
+		FOp::ToWu => FpInt::Wu,
+		FOp::ToL => FpInt::L,
+		_ => FpInt::Lu,
+	};
+	let getf = |e: &mut Emit, l: u32| {
+		e.lget(l);
+		e.op(0xbf); // f64.reinterpret_i64
+	};
+	e.op(0xbd); // i64.reinterpret_f64
+	e.lset(v);
+	getf(e, v);
+	match rm {
+		0 => e.op(0x9e), // f64.nearest: ties to even
+		1 => e.op(0x9d), // f64.trunc
+		2 => e.op(0x9c), // f64.floor
+		3 => e.op(0x9b), // f64.ceil
+		_ => {
+			// RMM, Rust's round(): t = trunc(v); t + (|v - t| >= 0.5 ?
+			// copysign(1, v) : 0), the sign of v kept (a -0.4 rounds to
+			// -0.0). v - t is exact (Sterbenz; t = v once |v| >= 2^52), and
+			// so is t ± 1; v = ±inf gives v - t = NaN, so t.
+			e.op(0x9d); // f64.trunc
+			e.op(0xbd);
+			e.lset(t);
+			getf(e, t);
+			f64c(e, 1.0);
+			getf(e, v);
+			e.op(0xa6); // f64.copysign
+			f64c(e, 0.0);
+			getf(e, v);
+			getf(e, t);
+			e.op(0xa1); // f64.sub
+			e.op(0x99); // f64.abs
+			f64c(e, 0.5);
+			e.op(0x66); // f64.ge
+			e.op(SELECT);
+			e.op(0xa0); // f64.add
+			getf(e, v);
+			e.op(0xa6); // f64.copysign
+		}
+	}
+	e.op(0xbd);
+	e.lset(r);
+	// x[rd] = select(the NaN value, trunc_sat(r), v != v)
+	e.set_x_pre(rd);
+	e.i64c(match kind {
+		FpInt::W => i32::MAX as i64,
+		FpInt::Wu => -1, // u32::MAX as i32 as i64
+		FpInt::L => i64::MAX,
+		FpInt::Lu => -1, // u64::MAX as i64
+	});
+	getf(e, r);
+	match kind {
+		FpInt::W => {
+			e.fc(2); // i32.trunc_sat_f64_s
+			e.op(0xac); // i64.extend_i32_s
+		}
+		FpInt::Wu => {
+			e.fc(3); // i32.trunc_sat_f64_u
+			e.op(0xac);
+		}
+		FpInt::L => e.fc(6), // i64.trunc_sat_f64_s
+		FpInt::Lu => e.fc(7), // i64.trunc_sat_f64_u
+	}
+	getf(e, v);
+	getf(e, v);
+	e.op(0x62); // f64.ne: NaN
+	e.op(SELECT);
+	e.set_x_post(rd);
+	// flags: lo <= r < hi ? (r != v ? NX : 0) : NV
+	let (lo, hi) = kind.bounds();
+	getf(e, r);
+	f64c(e, lo);
+	e.op(0x66); // f64.ge
+	getf(e, r);
+	f64c(e, hi);
+	e.op(0x63); // f64.lt
+	e.op(I32_AND);
+	e.op(IF);
+	e.op(VOID);
+	getf(e, r);
+	getf(e, v);
+	e.op(0x62); // f64.ne
+	e.fcsr_or_if(FFLAG_NX as i64);
+	e.op(ELSE);
+	e.fcsr_or(FFLAG_NV as i64);
+	e.op(END);
 }
 
 /// CSRRW/S/C (and I forms) on fflags, frm, fcsr, as the closures run them:
@@ -1895,14 +2104,16 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.set_f_bits_post(rd);
 			}
 			HOT_FLW => {
-				// f[rd] = f64::from_bits(load_word as i32 as i64 as u64)
+				// f[rd] = f64::from_bits(FP_BOX | load_word as u64): NaN-boxed
 				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
 				e.dram_addr(4, addr, ret_before, false);
-				e.op(0x34); // i64.load32_s
+				e.op(0x35); // i64.load32_u
 				e.memarg(2, 0);
+				e.i64c(FP_BOX as i64);
+				e.op(I64_OR);
 				e.set_f_bits_post(rd);
 			}
 			HOT_FSD => {
@@ -1929,23 +2140,11 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			HOT_FSUB_D => fp_bin(e, rd, rs1, rs2, 0xa1),
 			HOT_FMUL_D => fp_bin(e, rd, rs1, rs2, 0xa2),
 			HOT_FDIV_D => {
-				// verbatim from the interpreter: ANY zero divisor (-0.0 ==
-				// 0.0, so the -0.0 arm there never runs) gives +inf and
-				// raises DZ; otherwise IEEE division
-				e.set_f_pre(rd);
-				e.get_f(rs2);
-				f64c(e, 0.0);
-				e.op(0x61); // f64.eq
-				e.op(IF);
-				e.op(0x7c); // -> f64
-				e.fcsr_or(0x8);
-				f64c(e, f64::INFINITY);
-				e.op(ELSE);
-				e.get_f(rs1);
-				e.get_f(rs2);
-				e.op(0xa3); // f64.div
-				e.op(END);
-				e.set_f_post(rd);
+				// Cpu::fp_div_d: IEEE division (x/±0 a signed infinity, 0/0
+				// NaN), DZ for a finite nonzero dividend over a zero, the
+				// result canonical
+				div_zero_flag(e, rs1, rs2, false);
+				fp_bin(e, rd, rs1, rs2, 0xa3);
 			}
 			HOT_FSGNJ_D => {
 				// f[rd] = (bits(rs2) & SIGN) | (bits(rs1) & !SIGN)
@@ -2181,12 +2380,14 @@ fn wrap32(e: &mut Emit) {
 	e.op(0xac); // i64.extend_i32_s
 }
 
+/// FADD/FSUB/FMUL/FDIV.D: the IEEE result, a NaN canonical with NV per
+/// Cpu::fp_res_d
 fn fp_bin(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, fop: u8) {
 	e.set_f_pre(rd);
 	e.get_f(rs1);
 	e.get_f(rs2);
 	e.op(fop);
-	e.set_f_post(rd);
+	e.set_canon_post(rd, false, &[(rs1, false), (rs2, false)]);
 }
 
 fn bin_reg(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, wop: u8) {
