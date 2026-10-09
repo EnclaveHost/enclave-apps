@@ -1239,9 +1239,14 @@ fn progress_logger(what: &str) -> impl FnMut(usize, usize) + '_ {
     }
 }
 
-fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
+/// `pump` is called as bytes arrive (and around the inflate) with what is being fetched and how far it got: the
+/// caller keeps answering and accepting through it, because nothing else runs until this returns.
+fn fetch_images(
+    cfg: &Config,
+    creds: Option<&Creds>,
+    pump: &mut dyn FnMut(&str, usize, usize),
+) -> Result<Images, String> {
     let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
-    let mut noop = |_: usize, _: usize| {};
     // Make the credential state explicit in the logs: a private bucket needs
     // signed requests, so "UNSIGNED" here next to an S3 4xx means the creds
     // never resolved (unset/misnamed secret), while a 401 on a SIGNED request
@@ -1251,10 +1256,14 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
         false => eprintln!("[risc-box] S3 requests will be UNSIGNED (no credentials resolved; set config credentials, or use a public bucket)"),
     }
     eprintln!("[risc-box] fetching s3://{}/{}", cfg.bucket, cfg.kernel);
-    let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
+    let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut |g, t| pump("kernel", g, t))
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
-    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
+    let mut fs_log = progress_logger("fs");
+    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut |g, t| {
+        fs_log(g, t);
+        pump("fs", g, t)
+    })
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
     // The download Vec doubles as it grows, so an image just past a power of
     // two carries up to 2x its size in dead capacity — real linear memory on
@@ -1269,7 +1278,9 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let fs_gzipped = gz::is_gzip_key(&cfg.fs);
     let disk = match fs_gzipped {
         true => {
+            pump("inflate", 0, fs_bytes);
             let raw = gz::gunzip(&fs_stored)?;
+            pump("inflate", fs_bytes, fs_bytes);
             eprintln!(
                 "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x)",
                 fs_bytes,
@@ -1285,7 +1296,7 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     };
     let dtb = match &cfg.dtb {
         Some(k) => Some(
-            s3::get_object(&ep, &cfg.bucket, k, creds, &mut noop)
+            s3::get_object(&ep, &cfg.bucket, k, creds, &mut |g, t| pump("dtb", g, t))
                 .map_err(|e| format!("fetch dtb {k}: {e}"))?,
         ),
         None => None,
@@ -1297,7 +1308,11 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let snap_stored = match &cfg.snapshot {
         Some(k) => {
             eprintln!("[risc-box] fetching snapshot s3://{}/{k}", cfg.bucket);
-            match s3::get_object_opt(&ep, &cfg.bucket, k, creds, &mut progress_logger("snapshot"))
+            let mut snap_log = progress_logger("snapshot");
+            match s3::get_object_opt(&ep, &cfg.bucket, k, creds, &mut |g, t| {
+                snap_log(g, t);
+                pump("snapshot", g, t)
+            })
                 .map_err(|e| format!("fetch snapshot {k}: {e}"))?
             {
                 Some(mut b) => {
@@ -2963,8 +2978,34 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
         // creds precedence: request body > config; borrow-safe clone of config creds
         let body = start.creds;
         let chosen = body.as_ref().or(app.cfg.config_creds.as_ref());
+        // The main loop does not run until the fetch returns, so without this nothing accepts or answers for the
+        // whole download: the domain's front reads an app that accepts no connections as not ready, and a host
+        // that asks every 30 s retires it after three misses (the NucBox, 2026-10-08: a 957 MB image over its
+        // privacy circuit took minutes, and the RISC Box was retired mid-download four times). So accept and
+        // answer what arrives with where the fetch is, and yield the thread so the runtime gets to accept.
+        let mut last_pump = Instant::now();
+        let mut pump = |what: &str, got: usize, total: usize| {
+            if last_pump.elapsed() < Duration::from_millis(100) {
+                return;
+            }
+            for (key, _req) in server.poll(MAX_BODY) {
+                let mut resp = json(
+                    503,
+                    "Service Unavailable",
+                    format!(
+                        "{{\"phase\":\"fetching\",\"object\":\"{}\",\"bytes\":{got},\"of\":{total},\"error\":\"the machine images are still downloading\"}}",
+                        httpd::json_escape(what)
+                    ),
+                );
+                resp.headers.push(("Retry-After".into(), "5".into()));
+                server.respond(key, resp);
+            }
+            server.flush();
+            std::thread::sleep(Duration::from_millis(1));
+            last_pump = Instant::now();
+        };
         // stash which creds we used so /save can reuse them
-        match fetch_images(&app.cfg, chosen) {
+        match fetch_images(&app.cfg, chosen, &mut pump) {
             Ok(imgs) => {
                 app.live_creds = match &body {
                     Some(c) => Some(clone_creds(c)),

@@ -211,6 +211,17 @@ fn connect(ep: &Endpoint) -> Result<Wire, String> {
     Ok(Wire::Tls(Box::new(rustls::StreamOwned::new(conn, sock))))
 }
 
+/// What one request got. `cut` names why the body stopped short (a read error or EOF before Content-Length);
+/// `body` then holds the bytes that did arrive, so a GET can ask for the rest.
+struct Raw {
+    status: u16,
+    body: Vec<u8>,
+    content_length: Option<usize>,
+    /// the first byte this body starts at, from a 206's Content-Range
+    range_start: Option<usize>,
+    cut: Option<String>,
+}
+
 /// One S3 request. Returns (status, body). `progress` is called with
 /// (bytes_so_far, content_length_if_known) while the body streams in.
 fn request(
@@ -222,6 +233,25 @@ fn request(
     body: &[u8],
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<(u16, Vec<u8>), String> {
+    let raw = fetch_raw(method, ep, bucket, key, creds, body, 0, progress)?;
+    match raw.cut {
+        Some(why) => Err(why),
+        None => Ok((raw.status, raw.body)),
+    }
+}
+
+/// `request` that can start the body at `range_from` (`Range: bytes=N-`, unsigned: SigV4 does not need it) and
+/// hands back a body cut short instead of discarding it.
+fn fetch_raw(
+    method: &str,
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    body: &[u8],
+    range_from: usize,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<Raw, String> {
     let canonical_uri = format!("/{}/{}", encode_key(bucket), encode_key(key));
     let payload_hash = match method {
         "PUT" => hex(&Sha256::digest(body)),
@@ -247,6 +277,9 @@ fn request(
             }
         }
     }
+    if range_from > 0 {
+        head.push_str(&format!("range: bytes={range_from}-\r\n"));
+    }
     head.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", body.len()));
 
     let mut wire = connect(ep)?;
@@ -264,6 +297,8 @@ fn request(
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut status: u16 = 0;
+    let mut range_start: Option<usize> = None;
+    let mut cut: Option<String> = None;
     loop {
         match wire.read(&mut tmp) {
             Ok(0) => break,
@@ -289,19 +324,26 @@ fn request(
                             if k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked") {
                                 chunked = true;
                             }
+                            // "bytes 1000-1999/5000": where a 206's body starts
+                            if k == "content-range" {
+                                range_start = v
+                                    .strip_prefix("bytes ")
+                                    .and_then(|r| r.split('-').next())
+                                    .and_then(|n| n.trim().parse().ok());
+                            }
                         }
                     }
                 }
                 // Progress is for the object, not for an error page: a 404's
                 // few bytes of XML must not log as "100% of 127 bytes".
                 if let (Some(he), Some(cl)) = (head_end, content_length) {
-                    if status == 200 {
+                    if status == 200 || status == 206 {
                         progress(rbuf.len() - he, cl);
                     }
                     if rbuf.len() >= he + cl {
                         break;
                     }
-                } else if head_end.is_some() && status == 200 {
+                } else if head_end.is_some() && (status == 200 || status == 206) {
                     progress(rbuf.len() - head_end.unwrap(), 0);
                 }
             }
@@ -312,18 +354,99 @@ fn request(
                 let _ = e;
                 break;
             }
+            // A known-length body cut mid-way is kept, not thrown away: get_resumable asks for the rest.
+            Err(e) if head_end.is_some() && content_length.is_some() && !chunked => {
+                cut = Some(format!("read: {e}"));
+                break;
+            }
             Err(e) => return Err(format!("read: {e}")),
         }
     }
     let he = head_end.ok_or("response ended before headers completed")?;
     let raw = &rbuf[he..];
     let body = if chunked { dechunk(raw)? } else { raw.to_vec() };
+    drop(rbuf);
     if let Some(cl) = content_length {
-        if body.len() < cl {
-            return Err(format!("short body: {} of {cl} bytes", body.len()));
+        if body.len() < cl && cut.is_none() {
+            cut = Some(format!("short body: {} of {cl} bytes", body.len()));
         }
     }
-    Ok((status, body))
+    Ok(Raw { status, body, content_length, range_start, cut })
+}
+
+/// GET that survives a connection cut mid-body. NucBox apps reach R2 through a privacy circuit that drops long
+/// downloads (2026-10-08: the RISC Box image failed with "peer closed connection" again and again); starting over each
+/// time never finishes a big object. So a cut is resumed with `Range: bytes=<have>-` and appended, as long as attempts
+/// keep bringing bytes. Returns (status, body) like `request`: a non-200 first answer is the caller's to judge.
+fn get_resumable(
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    creds: Option<&Creds>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<(u16, Vec<u8>), String> {
+    const FRUITLESS_LIMIT: u32 = 3;
+    let mut have: Vec<u8> = Vec::new();
+    let mut total: Option<usize> = None;
+    let mut fruitless = 0u32;
+    loop {
+        let from = have.len();
+        let attempt = {
+            let known = total;
+            let mut p = |got: usize, cl: usize| progress(from + got, known.unwrap_or(if cl > 0 { from + cl } else { 0 }));
+            fetch_raw("GET", ep, bucket, key, creds, &[], from, &mut p)
+        };
+        let raw = match attempt {
+            Ok(r) => r,
+            // a resume that cannot even connect counts against the limit; a first attempt fails as before
+            Err(e) if from > 0 && fruitless + 1 < FRUITLESS_LIMIT => {
+                fruitless += 1;
+                eprintln!("[risc-box] s3 {key}: resume at {from} failed ({e}); trying again");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if from == 0 {
+            if raw.status != 200 {
+                return match raw.cut {
+                    Some(why) => Err(why),
+                    None => Ok((raw.status, raw.body)),
+                };
+            }
+            total = raw.content_length;
+            have = raw.body;
+        } else {
+            if raw.status != 206 || raw.range_start != Some(from) {
+                return Err(format!(
+                    "resume of {key} at byte {from}: S3 answered {} (range start {:?}); not splicing it",
+                    raw.status, raw.range_start
+                ));
+            }
+            have.extend_from_slice(&raw.body);
+        }
+        // an attempt that brought nothing (first or resumed) counts toward giving up; one that brought bytes resets it
+        if have.len() > from {
+            fruitless = 0;
+        } else {
+            fruitless += 1;
+        }
+        if let Some(t) = total {
+            if have.len() > t {
+                return Err(format!("{key}: got {} bytes of a {t}-byte object", have.len()));
+            }
+        }
+        match raw.cut {
+            None => return Ok((200, have)),
+            Some(why) if fruitless < FRUITLESS_LIMIT => {
+                eprintln!(
+                    "[risc-box] s3 {key}: connection cut after {} of {} bytes ({why}); resuming from there",
+                    have.len(),
+                    total.map_or("?".to_string(), |t| t.to_string())
+                );
+            }
+            Some(why) => return Err(format!("{why} (resumes brought nothing {FRUITLESS_LIMIT} times; {} bytes in hand)", have.len())),
+        }
+    }
 }
 
 /// Minimal HTTP/1.1 chunked-body decoder.
@@ -361,7 +484,7 @@ pub fn get_object(
     creds: Option<&Creds>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Vec<u8>, String> {
-    let (status, body) = request("GET", ep, bucket, key, creds, &[], progress)?;
+    let (status, body) = get_resumable(ep, bucket, key, creds, progress)?;
     if status != 200 {
         return Err(s3_error(status, &body));
     }
@@ -378,7 +501,7 @@ pub fn get_object_opt(
     creds: Option<&Creds>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Option<Vec<u8>>, String> {
-    let (status, body) = request("GET", ep, bucket, key, creds, &[], progress)?;
+    let (status, body) = get_resumable(ep, bucket, key, creds, progress)?;
     match status {
         200 => Ok(Some(body)),
         404 => Ok(None),
