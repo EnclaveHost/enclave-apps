@@ -141,7 +141,9 @@ impl BlockHead {
 	const EMPTY: BlockHead = BlockHead { tag: 0, phys_page: 0, count: 0, code_gen: 0, page_gen: 0, glob_gen: 0 };
 }
 
-const BLOCK_SLOTS: usize = 0x8000; // direct-mapped by (pc >> 1); 32k x (24B + 32x16B) = 17 MiB
+// risc-box patch: 128k slots (was 32k). Direct-mapped by (pc >> 1), 32k slots alias every 64 KiB of code, and a browser's
+// hot code spans megabytes: blocks evicted by aliasing are re-fetched and re-decoded on the next visit.
+const BLOCK_SLOTS: usize = 0x20000; // 128k x (24B + 32x16B) = 67 MiB
 const BLOCK_MAX: usize = 32; // ops per block
 
 // risc-box patch: hot-op ids. SB/SH/SW/SD are 1..=4 so "is this a store"
@@ -359,6 +361,8 @@ pub struct Cpu {
 	// heads[slot] tags a run of ops[slot*BLOCK_MAX ..][..count].
 	block_heads: Vec<BlockHead>,
 	block_ops: Vec<BlockOp>,
+	/// risc-box patch: blocks decoded into the cache (a miss each), for /status
+	block_builds: u64,
 	// risc-box patch (tier2 feature): the region dispatcher in coverage
 	// mode — forms regions from live heat/edges, "compiles" them into a
 	// recording backend, and the run loop below counts the retired
@@ -1012,6 +1016,7 @@ impl Cpu {
 			decode_cache: DecodeCache::new(),
 			// risc-box patch: block cache starts empty (tag 0 = invalid)
 			block_heads: vec![BlockHead::EMPTY; BLOCK_SLOTS],
+			block_builds: 0,
 			#[cfg(feature = "tier2")]
 			tier2: None,
 			#[cfg(feature = "aot")]
@@ -2566,6 +2571,7 @@ impl Cpu {
 	/// start, fetch fault, executing outside DRAM, or an undecodable first
 	/// word) — the caller falls back to single-stepping.
 	fn build_block(&mut self, slot: usize) -> bool {
+		self.block_builds += 1;
 		let start = self.pc;
 		let p_start = match self.mmu.translate_fetch(start) {
 			Ok(p) => p,
@@ -4124,6 +4130,11 @@ impl Cpu {
 
 	/// Returns `Mmu` (risc-box patch: the immutable side of the pair — the
 	/// host's framebuffer scanout reads DRAM without touching CPU state)
+	/// risc-box patch: blocks decoded into the block cache since boot.
+	pub fn block_builds(&self) -> u64 {
+		self.block_builds
+	}
+
 	pub fn get_mmu(&self) -> &Mmu {
 		&self.mmu
 	}
