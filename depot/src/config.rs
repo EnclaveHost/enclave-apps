@@ -60,12 +60,12 @@ struct Raw {
     protected: Vec<String>,
     #[serde(default = "main")]
     default_branch: String,
-    #[serde(default = "push_mb")]
-    max_push_mb: u64,
+    #[serde(default)]
+    max_push_mb: Option<u64>,
     #[serde(default = "object_mb")]
     max_object_mb: u64,
-    #[serde(default = "cache_mb")]
-    cache_mb: usize,
+    #[serde(default)]
+    cache_mb: Option<usize>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -79,14 +79,18 @@ struct Raw {
 fn main() -> String {
     "main".into()
 }
-fn push_mb() -> u64 {
-    1024
-}
 fn object_mb() -> u64 {
     512
 }
-fn cache_mb() -> usize {
-    256
+
+/// The guest's memory ceiling as the platform reports it (ENCLAVE_MEM_MB):
+/// the defaults for the push limit and the cache are sized under it, so a
+/// deployment given less memory refuses an oversized push instead of dying.
+fn mem_mb() -> Option<u64> {
+    std::env::var("ENCLAVE_MEM_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&m| m > 0)
 }
 
 pub struct Config {
@@ -141,7 +145,15 @@ pub fn valid_repo(s: &str) -> bool {
 }
 
 impl Config {
+    /// The platform delivers the config twice: the file (always, and the
+    /// only channel past the env-size ceiling) and ENCLAVE_CONFIG. Both carry
+    /// the text after `$NAME` secret substitution.
     pub fn load() -> Result<Config, String> {
+        if let Ok(path) = std::env::var("ENCLAVE_CONFIG_FILE") {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                return Self::parse(&raw);
+            }
+        }
         let raw = std::env::var("ENCLAVE_CONFIG")
             .or_else(|_| std::env::var("DEPOT_CONFIG"))
             .map_err(|_| "set ENCLAVE_CONFIG")?;
@@ -188,10 +200,10 @@ impl Config {
             }
             let hash = match (&u.token, &u.token_sha256) {
                 (None, None) if u.account.is_some() => [0u8; 32], // sign-in only
+                // `token` must be a `$NAME` secret reference in the published
+                // config; the platform substitutes the value before we see it,
+                // so the text here cannot tell the two apart
                 (Some(t), None) => {
-                    if !t.starts_with('$') && !r.local_test {
-                        return Err(format!("user {name}: tokens must be deployment secrets ($NAME); publish token_sha256 instead"));
-                    }
                     let t = secret(t)?;
                     if t.len() < 24 {
                         return Err(format!("user {name}: token must be at least 24 characters"));
@@ -232,11 +244,25 @@ impl Config {
         if !crate::git::valid_refname(&format!("refs/heads/{}", r.default_branch)) {
             return Err("default_branch is not a valid branch name".into());
         }
-        if !(1..=3072).contains(&r.max_push_mb)
+        let mem = mem_mb();
+        let cache_mb = r
+            .cache_mb
+            .unwrap_or_else(|| mem.map_or(256, |m| (m / 8).clamp(32, 256) as usize));
+        let max_push_mb = r.max_push_mb.unwrap_or_else(|| {
+            mem.map_or(1024, |m| {
+                m.saturating_sub(cache_mb as u64 * 2 + 512).clamp(64, 1024)
+            })
+        });
+        if !(1..=3072).contains(&max_push_mb)
             || !(1..=2048).contains(&r.max_object_mb)
-            || !(16..=3072).contains(&r.cache_mb)
+            || !(16..=3072).contains(&cache_mb)
         {
             return Err("max_push_mb 1..3072, max_object_mb 1..2048, cache_mb 16..3072".into());
+        }
+        if let Some(m) = mem {
+            if max_push_mb + cache_mb as u64 * 2 + 256 > m {
+                eprintln!("[depot] warning: max_push_mb {max_push_mb} + cache_mb {cache_mb} may not fit the {m} MiB guest; a push that large can exhaust memory");
+            }
         }
         let mut hooks = r.hooks;
         if hooks.len() > 16 {
@@ -247,9 +273,6 @@ impl Config {
                 h.url.starts_with("https://") || (r.local_test && h.url.starts_with("http://"));
             if !ok || h.url.contains(['\r', '\n', ' ']) {
                 return Err(format!("hook url must be https: {}", h.url));
-            }
-            if !h.secret.starts_with('$') && !r.local_test {
-                return Err("hook secrets must be deployment secrets ($NAME)".into());
             }
             h.secret = secret(&h.secret)?;
             if h.secret.len() < 16 {
@@ -267,9 +290,9 @@ impl Config {
             public: r.public,
             protected: r.protected,
             default_branch: r.default_branch,
-            max_push: r.max_push_mb << 20,
+            max_push: max_push_mb << 20,
             max_object: r.max_object_mb << 20,
-            cache_mb: r.cache_mb,
+            cache_mb,
             title: r.title.unwrap_or_else(|| "depot".into()),
             sso,
             hooks,
@@ -402,8 +425,13 @@ mod tests {
     fn refuses_bad_configs() {
         let base = r#""storage":{"endpoint":"https://x.r2.cloudflarestorage.com","bucket":"b","access_key":"a","secret_key":"s"}"#;
         assert!(Config::parse(&format!(r#"{{{base},"master_key":"short"}}"#)).is_err());
+        // a substituted secret arrives as plain text
         assert!(Config::parse(&format!(
-            r#"{{{base},"master_key":"0123456789abcdef0123456789abcdef","users":{{"u":{{"token":"plain-token-in-public-config-xx"}}}}}}"#
+            r#"{{{base},"master_key":"0123456789abcdef0123456789abcdef","users":{{"u":{{"token":"substituted-token-value-xxxxx"}}}}}}"#
+        ))
+        .is_ok());
+        assert!(Config::parse(&format!(
+            r#"{{{base},"master_key":"0123456789abcdef0123456789abcdef","users":{{"u":{{"token":"short"}}}}}}"#
         ))
         .is_err());
         assert!(Config::parse(&format!(

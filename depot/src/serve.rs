@@ -241,6 +241,8 @@ struct Conn<A> {
     last_read: Instant,
     last_write: Instant,
     peer_eof: bool,
+    /// the request being answered is HEAD: headers only
+    head_only: bool,
 }
 
 pub struct Server<A> {
@@ -445,9 +447,13 @@ impl<A: Handler> Server<A> {
         self.write_head(c, &mut resp);
         match resp.body {
             Body::Full(b) => {
-                c.wbuf.extend_from_slice(&b);
+                if !c.head_only {
+                    c.wbuf.extend_from_slice(&b);
+                }
                 c.phase = Phase::Done;
             }
+            // a HEAD answer carries no body at all, not even a chunk terminator
+            Body::Stream(_) if c.head_only => c.phase = Phase::Done,
             Body::Stream(src) => c.phase = Phase::Out { src },
         }
     }
@@ -474,6 +480,7 @@ impl<A: Handler> Server<A> {
                         last_read: now,
                         last_write: now,
                         peer_eof: false,
+                        head_only: false,
                     });
                     busy = true;
                 }
@@ -603,6 +610,7 @@ impl<A: Handler> Server<A> {
                         }
                     };
                     busy = true;
+                    c.head_only = head.method == "HEAD";
                     if head
                         .header("connection")
                         .is_some_and(|v| v.eq_ignore_ascii_case("close"))

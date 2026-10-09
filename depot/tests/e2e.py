@@ -195,15 +195,31 @@ class Env:
                      self.socks_count]))
                 time.sleep(0.3)
             env["ENCLAVE_EGRESS"] = f"socks5://dep-id:egress-token@127.0.0.1:{self.socks_port}"
+        secret_envs = ["E2E_AK", "E2E_SK", "E2E_MASTER", "E2E_TOK_ADMIN", "E2E_TOK_WRITER", "E2E_HOOK"]
+        dirs = []
+        if self.args.platform and not self.args.native:
+            # as the platform's manager does it: secrets substituted into the
+            # config text, which arrives as ENCLAVE_CONFIG and as a read-only
+            # file at /config; the guest sees no secret variables at all
+            text = env["ENCLAVE_CONFIG"]
+            for k in secret_envs:
+                text = text.replace("$" + k, env[k])
+            env["ENCLAVE_CONFIG"] = text
+            cfgdir = os.path.join(self.work, "cfg")
+            os.makedirs(cfgdir, exist_ok=True)
+            open(os.path.join(cfgdir, "config.json"), "w").write(text)
+            env["ENCLAVE_CONFIG_FILE"] = "/config/config.json"
+            env["ENCLAVE_MEM_MB"] = str(self.args.mem)
+            dirs = ["--dir", f"{cfgdir}::/config"]
+            secret_envs = ["ENCLAVE_CONFIG_FILE", "ENCLAVE_MEM_MB"]
         if self.args.native:
             cmd = [os.path.join(ROOT, "target/release/depot")]
         else:
             envs = ["--env", "ENCLAVE_EGRESS"] if self.args.platform else []
-            for k in ["ENCLAVE_CONFIG", "ENCLAVE_PORTS", "E2E_AK", "E2E_SK", "E2E_MASTER", "E2E_TOK_ADMIN", "E2E_TOK_WRITER",
-                      "E2E_HOOK", "DEPOT_RETIRE_GRACE", "DEPOT_SWEEP_EVERY"]:
+            for k in ["ENCLAVE_CONFIG", "ENCLAVE_PORTS", *secret_envs, "DEPOT_RETIRE_GRACE", "DEPOT_SWEEP_EVERY"]:
                 envs += ["--env", k]
             cmd = ["wasmtime", "run", "-S", "inherit-network=y", "-S", "allow-ip-name-lookup=y", "-W",
-                   f"max-memory-size={self.args.mem << 20}", *envs, self.args.wasm]
+                   f"max-memory-size={self.args.mem << 20}", *dirs, *envs, self.args.wasm]
         self.log = open(os.path.join(self.work, "depot.log"), "a")
         self.server = subprocess.Popen(cmd, env=env, stdout=self.log, stderr=self.log)
         self.direct = f"http://127.0.0.1:{self.port}"
@@ -338,6 +354,19 @@ def run(env, args):
     W = env.work
     src = os.path.join(W, "src")
     make_repo(env, src)
+
+    print("== HTTP: HEAD then GET on one keep-alive connection")
+    import http.client
+    hc = http.client.HTTPConnection("127.0.0.1", env.port, timeout=10)
+    hc.request("HEAD", "/")
+    r1 = hc.getresponse()
+    r1.read()
+    hc.request("GET", "/ping")
+    r2 = hc.getresponse()
+    if r1.status != 200 or r2.status != 200 or r2.read() != b"ok\n":
+        die(f"HEAD/GET pipeline: {r1.status} {r2.status}")
+    hc.close()
+    ok("HEAD has no body; the connection stays usable")
 
     print("== auth")
     r = env.git("ls-remote", env.url("w/repo"), check=False)
@@ -527,13 +556,44 @@ def run(env, args):
         die(f"empty clone: {r.stderr}")
     ok("empty repository clones with git's warning")
 
+    if shutil.which("cargo"):
+        print("== libgit2 (cargo git dependencies): clone, then an incremental update")
+        crate = os.path.join(W, "mini")
+        env.git("init", "-q", "-b", "main", crate)
+        os.makedirs(os.path.join(crate, "src"))
+        open(os.path.join(crate, "Cargo.toml"), "w").write('[package]\nname = "mini"\nversion = "0.1.0"\nedition = "2021"\n')
+        open(os.path.join(crate, "src/lib.rs"), "w").write("pub fn one() -> u32 { 1 }\n")
+        env.git("add", "-A", cwd=crate)
+        env.git("commit", "-qm", "mini", cwd=crate)
+        env.git("push", "-q", env.url("pub/mini", "admin"), "main", cwd=crate)
+        cons = os.path.join(W, "consumer")
+        os.makedirs(os.path.join(cons, "src"))
+        open(os.path.join(cons, "src/main.rs"), "w").write("fn main() { println!(\"{}\", mini::one()); }\n")
+        open(os.path.join(cons, "Cargo.toml"), "w").write(
+            f'[package]\nname = "consumer"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\nmini = {{ git = "{env.url("pub/mini")}" }}\n')
+        cenv = dict(os.environ, CARGO_NET_GIT_FETCH_WITH_CLI="false", CARGO_HOME=os.path.join(W, "cargo-home"))
+        for step in ("fetch", "update"):
+            if step == "update":
+                with open(os.path.join(crate, "src/lib.rs"), "a") as f:
+                    f.write("pub fn two() -> u32 { 2 }\n")
+                env.git("commit", "-qam", "two", cwd=crate)
+                env.git("push", "-q", env.url("pub/mini", "admin"), "main", cwd=crate)
+            r = subprocess.run(["cargo", step], cwd=cons, env=cenv, capture_output=True, text=True, timeout=300)
+            if r.returncode:
+                die(f"cargo {step} (libgit2) failed: {r.stderr[-1500:]}")
+        head = env.git("rev-parse", "HEAD", cwd=crate).stdout.strip()
+        if head not in open(os.path.join(cons, "Cargo.lock")).read():
+            die("cargo update did not pick up the new commit")
+        ok("cargo's libgit2 clones and incrementally updates a git dependency (protocol v0)")
+
     print("== web API")
     st, body = env.api("/api/repos", "reader")
     names = [x["name"] for x in json.loads(body)["repos"]]
     if not {"w/repo", "w/big", "pub/open", "empty"} <= set(names):
         die(f"repo list: {names}")
     st, body = env.api("/api/repos")
-    if [x["name"] for x in json.loads(body)["repos"]] != ["pub/open"]:
+    anon = [x["name"] for x in json.loads(body)["repos"]]
+    if "pub/open" not in anon or any(not n.startswith("pub/") for n in anon):
         die(f"anonymous repo list: {body}")
     ok("repo listing filtered by access")
     st, body = env.api("/api/log?repo=w/repo&n=5", "reader")
@@ -652,8 +712,8 @@ def run(env, args):
     ok("clone, thin push and fetch across the merged pack")
     # retired packs disappear after the (test) grace
     time.sleep(3)
-    total_packs = sum(json.loads(env.api(f"/api/repo?repo={n}", "admin")[1])["packs"]
-                      for n in ["w/repo", "w/big", "pub/open", "w/many"])
+    names = [x["name"] for x in json.loads(env.api("/api/repos", "admin")[1])["repos"]]
+    total_packs = sum(json.loads(env.api(f"/api/repo?repo={n}", "admin")[1])["packs"] for n in names)
     for _ in range(50):
         stored = len([k for k in env.bucket_objects() if k.endswith(".pack")])
         if stored == total_packs:
