@@ -1487,13 +1487,13 @@ fn jit_json(emu: Option<&Emulator>) -> String {
     format!(
         ",\"jit\":{{\"calls\":{},\"chained\":{},\"skippedRewritten\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
          \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
-         \"volatile\":{},\"formMs\":{:.1},\
+         \"volatile\":{},\"formMs\":{:.1},\"packs\":{},\"packedRegions\":{},\"packReused\":{},\
          \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
          \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{},\
          \"codeGen\":{}}}",
         s.calls, s.chained, s.skipped_rewritten, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
         s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
-        s.volatile, s.form_us as f64 / 1000.0,
+        s.volatile, s.form_us as f64 / 1000.0, s.packs, s.packed_regions, s.pack_reused,
         v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
         v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
         v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),
