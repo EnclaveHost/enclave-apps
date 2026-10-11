@@ -28,6 +28,7 @@ pub mod mmu;
 pub mod elf_analyzer;
 pub mod device;
 pub mod snapshot; // risc-box patch: whole-machine snapshot/restore
+pub mod disk_image; // risc-box patch: the disk base image, held compressed
 #[cfg(feature = "jit")]
 pub mod jit; // risc-box patch: PLATFORM-JIT.md translator (feature-gated)
 #[cfg(feature = "codegen")]
@@ -827,12 +828,12 @@ impl Emulator {
 
 	/// risc-box patch: like `setup_filesystem`, with an image other machines
 	/// share. Nothing is copied.
-	pub fn setup_filesystem_shared(&mut self, base: Arc<Vec<u8>>) {
+	pub fn setup_filesystem_shared(&mut self, base: Arc<disk_image::DiskImage>) {
 		self.cpu.get_mut_mmu().init_disk_shared(base);
 	}
 
 	/// risc-box patch: the base disk this machine boots from, for sharing.
-	pub fn disk_base(&self) -> Arc<Vec<u8>> {
+	pub fn disk_base(&self) -> Arc<disk_image::DiskImage> {
 		self.cpu.get_mmu().get_disk().base()
 	}
 
