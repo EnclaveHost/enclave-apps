@@ -1448,6 +1448,22 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
     }
 }
 
+/// Local profiling (RISC_PC_SAMPLE=1): the guest's (pc, privilege, satp) after each executed batch, drained by
+/// GET /debug/pcs. Off unless the runtime environment sets it, which no deployment does.
+static PC_SAMPLES: std::sync::Mutex<Vec<(u64, u8, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn pc_sampling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RISC_PC_SAMPLE").map_or(false, |v| v == "1"))
+}
+
+fn pc_sample(s: (u64, u8, u64)) {
+    let mut g = PC_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() < 4 << 20 {
+        g.push(s);
+    }
+}
+
 /// The live region JIT (PLATFORM-JIT.md): hot guest regions compile to wasm
 /// through the platform's enclave:codegen verb and run in place of the
 /// interpreter. On wherever the build has it; RISC_JIT=0 is the off switch
@@ -1495,6 +1511,13 @@ fn jit_enable(emu: &mut Emulator) {
     }
     if let Some(v) = num("RISC_JIT_PASS_BYTES") {
         p.max_pass_bytes = (v as usize).max(4096);
+    }
+    // the verb's lifetime budget (modules, MiB submitted); defaults fit the production host's limits
+    if let Some(v) = num("RISC_JIT_BUDGET_MODULES") {
+        p.budget_modules = v.min(u32::MAX as u64) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_BUDGET_MB") {
+        p.budget_bytes = v.saturating_mul(1024 * 1024);
     }
     p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
     p.chain = !std::env::var("RISC_JIT_CHAIN").map_or(false, |v| v == "0");
@@ -1816,6 +1839,22 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             };
             let topic = m.console_topic();
             server.upgrade_sse(key, &topic, &initial);
+        }
+        // Local profiling only: the guest pc samples (RISC_PC_SAMPLE=1), one "pc priv satp" hex line each; ?reset clears.
+        ("GET", "/debug/pcs") if !sub && pc_sampling() => {
+            let mut g = PC_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+            let mut body = String::with_capacity(g.len() * 36);
+            for (pc, p, satp) in g.iter() {
+                body.push_str(&format!("{pc:x} {p} {satp:x}\n"));
+            }
+            g.clear();
+            return server.respond(key, Response::new(200, "OK").with("cache-control", "no-store").body("text/plain", body));
+        }
+        // Local profiling only: ends the process so `wasmtime run --profile=guest` writes its profile. Absent unless
+        // the runtime environment sets RISC_DEBUG_EXIT=1, which no deployment does.
+        ("POST", "/debug/exit") if !sub && std::env::var("RISC_DEBUG_EXIT").map_or(false, |v| v == "1") => {
+            eprintln!("[risc-box] /debug/exit: exiting (RISC_DEBUG_EXIT=1)");
+            std::process::exit(0);
         }
         ("POST", "/start") if !sub => {
             if app.main().phase == Phase::Running {
@@ -3516,6 +3555,9 @@ pub fn run() {
             // loop almost nothing, leaving the budget to scan/encode).
             let ran_at = Instant::now();
             emu.run_n(batch);
+            if !parked && pc_sampling() {
+                pc_sample(emu.get_cpu().sample_state());
+            }
             // The rate only means something for a batch that EXECUTED: a parked guest consumes
             // its batch without running anything, which would read as an absurd rate.
             if !parked {

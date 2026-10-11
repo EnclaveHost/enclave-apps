@@ -748,6 +748,10 @@ pub struct JitParams {
 	pub pack_hot_factor: u64,
 	/// module bytes compiled per formation pass, at most (compiles stall the machine's own thread)
 	pub max_pass_bytes: usize,
+	/// the verb policy's lifetime budget: modules and submitted bytes (0 = the policy's default, sized for the
+	/// production host's 256 modules / 16 MiB per execution view). Heat escalation spreads over the byte budget.
+	pub budget_modules: u32,
+	pub budget_bytes: u64,
 }
 
 #[cfg(feature = "codegen")]
@@ -776,6 +780,8 @@ impl Default for JitParams {
 			pack_max_wait: 4,
 			pack_hot_factor: 8,
 			max_pass_bytes: 128 * 1024,
+			budget_modules: 0,
+			budget_bytes: 0,
 		}
 	}
 }
@@ -1520,6 +1526,18 @@ impl Cpu {
 		self.pc
 	}
 
+	/// risc-box patch (profiling): pc, privilege (0 user, 1 supervisor, 3 machine) and satp, for a host-side
+	/// sampler that attributes guest time to guest code.
+	pub fn sample_state(&self) -> (u64, u8, u64) {
+		let p = match self.privilege_mode {
+			PrivilegeMode::User => 0,
+			PrivilegeMode::Supervisor => 1,
+			PrivilegeMode::Reserved => 2,
+			PrivilegeMode::Machine => 3,
+		};
+		(self.pc, p, self.read_csr_raw(CSR_SATP_ADDRESS))
+	}
+
 	// risc-box patch: true while the hart is parked in WFI with no enabled
 	// interrupt pending (the same condition tick_operate uses to leave WFI).
 	// Lets an embedder throttle ticking when the guest is idle.
@@ -2140,10 +2158,18 @@ impl Cpu {
 	/// interprets exactly as before.
 	#[cfg(feature = "codegen")]
 	pub fn jit_enable(&mut self, params: JitParams) -> bool {
-		let policy = ::jit::verb::Policy {
+		let mut policy = ::jit::verb::Policy {
 			max_module_bytes: params.max_module_bytes,
 			..Default::default()
 		};
+		if params.budget_modules > 0 {
+			policy.module_budget = params.budget_modules;
+			policy.attempt_budget = params.budget_modules.saturating_mul(4);
+		}
+		if params.budget_bytes > 0 {
+			policy.byte_budget = params.budget_bytes;
+			policy.escalation_bytes = (params.budget_bytes / 8).max(1);
+		}
 		if !::jit::verb::enable(policy) {
 			return false;
 		}
