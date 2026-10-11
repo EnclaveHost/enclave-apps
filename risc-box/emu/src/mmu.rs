@@ -352,7 +352,7 @@ impl Mmu {
 	}
 
 	/// risc-box patch: attach a base disk image shared with other machines.
-	pub fn init_disk_shared(&mut self, base: std::sync::Arc<Vec<u8>>) {
+	pub fn init_disk_shared(&mut self, base: std::sync::Arc<::disk_image::DiskImage>) {
 		self.disk.init_shared(base);
 	}
 

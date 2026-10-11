@@ -663,7 +663,8 @@ struct Images {
     /// download and no inflate. The compressed form is not kept — the
     /// expanded one is what every start needs, and the pair together were
     /// more than a second machine's worth of address space.
-    disk: Arc<Vec<u8>>,
+    /// held compressed (riscv_emu_rust::disk_image): `len()` is the guest's view, `stored_bytes()` the memory
+    disk: Arc<riscv_emu_rust::disk_image::DiskImage>,
     fs_bytes: usize, // as fetched (gzipped when the key says so)
     fs_gzipped: bool,
     dtb: Option<Vec<u8>>,
@@ -1019,7 +1020,7 @@ impl App {
         let cache = self
             .cache
             .as_ref()
-            .map(|c| c.disk.len() + c.kernel.len() + c.snap_stored.as_ref().map_or(0, |s| s.len()))
+            .map(|c| c.disk.stored_bytes() + c.kernel.len() + c.snap_stored.as_ref().map_or(0, |s| s.len()))
             .unwrap_or(0);
         machines + images + cache
     }
@@ -1276,22 +1277,37 @@ fn fetch_images(
     // machine shares from now on. A bad object fails the fetch (which
     // retries) rather than the machine start.
     let fs_gzipped = gz::is_gzip_key(&cfg.fs);
+    // Packed as it inflates (riscv_emu_rust::disk_image): the expanded image never exists in memory, and what is
+    // kept is ~1/3 of it. The platform's partition runtime gives a shared memory no reservation beyond wasmtime's
+    // 4 GiB default, and the expanded 3 GiB disk left the guest too little of that.
     let disk = match fs_gzipped {
         true => {
             pump("inflate", 0, fs_bytes);
-            let raw = gz::gunzip(&fs_stored)?;
+            let mut b = riscv_emu_rust::disk_image::Builder::new();
+            let mut next = 64usize << 20;
+            gz::gunzip_stream(&fs_stored, &mut |piece, consumed| {
+                b.push(piece);
+                if b.len() >= next {
+                    next += 64 << 20;
+                    pump("inflate", consumed, fs_bytes);
+                }
+            })?;
             pump("inflate", fs_bytes, fs_bytes);
+            // the 1 GB download is done with: give it back before the snapshot and the machine need the room
+            drop(fs_stored);
+            let d = b.finish();
             eprintln!(
-                "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x)",
+                "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x), held as {} bytes",
                 fs_bytes,
-                raw.len(),
-                raw.len() as f64 / fs_bytes.max(1) as f64
+                d.len(),
+                d.len() as f64 / fs_bytes.max(1) as f64,
+                d.stored_bytes()
             );
-            raw
+            d
         }
         false => {
             eprintln!("[risc-box]   fs {} bytes", fs_bytes);
-            fs_stored
+            riscv_emu_rust::disk_image::DiskImage::from_vec(fs_stored)
         }
     };
     let dtb = match &cfg.dtb {
@@ -1368,7 +1384,7 @@ const WORKING_RESERVE_MIB: u64 = 512;
 
 fn auto_ram_mib(cfg: &Config, images: &Images) -> Option<u64> {
     let ceiling = slice_mib()?;
-    let fixed = (images.kernel.len() + images.disk.len()) as u64 >> 20;
+    let fixed = (images.kernel.len() + images.disk.stored_bytes()) as u64 >> 20;
     let fb = (cfg.fb_w * cfg.fb_h * 4) >> 20;
     let overhead = fixed + fb + WORKING_RESERVE_MIB;
     // saturating: a slice smaller than the overhead lands on the floor

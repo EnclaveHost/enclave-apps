@@ -20,6 +20,9 @@ fnv = "1.0.7"
 # risc-box patch: deflate for the machine snapshot (src/snapshot.rs). Pure
 # Rust, the same crate the app already uses for its band stream and gzip.
 miniz_oxide = "0.8"
+# risc-box patch: the disk base image is held as LZ4-compressed 64 KiB chunks (src/disk_image.rs): the
+# expanded 3 GiB image left the guest ~1 GiB under the 4 GiB a shared memory can grow to without a reservation.
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 
 [features]
 # jit-proto sizing aid: per-block execution counters + a coverage histogram
