@@ -68,6 +68,7 @@
 //!                     left behind, once the picture settles (computer.rs)
 //!   GET  /ping        liveness
 
+mod blob;
 mod computer;
 mod display;
 mod egress;
@@ -217,6 +218,8 @@ pub struct Config {
     pub bucket: String,
     kernel: String,
     fs: String,
+    // `blobs`: S3 key -> its public, pinned copy (blob.rs): asked of the host's cache before S3
+    blobs: Vec<(String, blob::Pin)>,
     dtb: Option<String>,
     save_key: Option<String>,
     pub config_creds: Option<Creds>,
@@ -370,6 +373,11 @@ fn load_config() -> Config {
         region: s("region").unwrap_or_else(|| "us-east-1".to_string()),
         bucket: s("bucket").unwrap_or_default(),
         kernel: s("kernel").unwrap_or_default(),
+        blobs: v
+            .get("blobs")
+            .and_then(|b| b.as_object())
+            .map(|m| m.iter().filter_map(|(k, p)| blob::Pin::parse(p).map(|pin| (k.clone(), pin))).collect())
+            .unwrap_or_default(),
         fs: s("fs").unwrap_or_default(),
         dtb: s("dtb"),
         save_key: s("saveKey").or_else(|| s("fs")),
@@ -1242,6 +1250,24 @@ fn progress_logger(what: &str) -> impl FnMut(usize, usize) + '_ {
 
 /// `pump` is called as bytes arrive (and around the inflate) with what is being fetched and how far it got: the
 /// caller keeps answering and accepting through it, because nothing else runs until this returns.
+/// An image by its S3 key: from the host's cache when the config pins a public copy of it (blob.rs), else - or if that
+/// fails for any reason - from S3 as always. `Ok(None)` only from S3's 404 (a snapshot not taken yet).
+fn get_image(
+    cfg: &Config,
+    ep: &Endpoint,
+    key: &str,
+    creds: Option<&Creds>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<Option<Vec<u8>>, String> {
+    if let Some((_, pin)) = cfg.blobs.iter().find(|(k, _)| k == key) {
+        match blob::fetch(pin, &mut *progress) {
+            Ok(b) => return Ok(Some(b)),
+            Err(e) => eprintln!("[risc-box] {key}: not from the host cache ({e}); fetching it from S3"),
+        }
+    }
+    s3::get_object_opt(ep, &cfg.bucket, key, creds, progress)
+}
+
 fn fetch_images(
     cfg: &Config,
     creds: Option<&Creds>,
@@ -1257,14 +1283,16 @@ fn fetch_images(
         false => eprintln!("[risc-box] S3 requests will be UNSIGNED (no credentials resolved; set config credentials, or use a public bucket)"),
     }
     eprintln!("[risc-box] fetching s3://{}/{}", cfg.bucket, cfg.kernel);
-    let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut |g, t| pump("kernel", g, t))
+    let kernel = get_image(cfg, &ep, &cfg.kernel, creds, &mut |g, t| pump("kernel", g, t))
+        .and_then(|b| b.ok_or_else(|| "no such object".to_string()))
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
     let mut fs_log = progress_logger("fs");
-    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut |g, t| {
+    let mut fs_stored = get_image(cfg, &ep, &cfg.fs, creds, &mut |g, t| {
         fs_log(g, t);
         pump("fs", g, t)
     })
+        .and_then(|b| b.ok_or_else(|| "no such object".to_string()))
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
     // The download Vec doubles as it grows, so an image just past a power of
     // two carries up to 2x its size in dead capacity — real linear memory on
@@ -1325,7 +1353,7 @@ fn fetch_images(
         Some(k) => {
             eprintln!("[risc-box] fetching snapshot s3://{}/{k}", cfg.bucket);
             let mut snap_log = progress_logger("snapshot");
-            match s3::get_object_opt(&ep, &cfg.bucket, k, creds, &mut |g, t| {
+            match get_image(cfg, &ep, k, creds, &mut |g, t| {
                 snap_log(g, t);
                 pump("snapshot", g, t)
             })
