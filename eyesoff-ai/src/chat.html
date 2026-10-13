@@ -6656,7 +6656,9 @@ function renderModelMenu() {
       + (tl.max_agents ? " · " + tl.max_agents + " subagents" : "")
       + (stops.length ? ", stopping after " + stops.join(" or ")
           + (tl.limit_cooldown_s ? " (a count starts again after " + humanSecs(tl.limit_cooldown_s) + " without growing)" : "") : "");
-    const lsg = node('<div class="seg-row"><span>Loop</span><div class="seg"></div></div>');
+    // shown as "Agentic"; the wire field, the stored pref and the API docs
+    // keep the name `loop`
+    const lsg = node('<div class="seg-row"><span>Agentic</span><div class="seg"></div></div>');
     for (const t of ["on", "off"]) {
       const b = node("<button type='button'></button>");
       b.textContent = t;
