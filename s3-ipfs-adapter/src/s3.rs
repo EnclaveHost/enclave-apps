@@ -457,11 +457,11 @@ fn s3_error(status: u16, body: &[u8]) -> String {
     format!("S3 answered {status}: {text}")
 }
 
-/// GET `len` bytes of an object starting at `start`. The store may clamp the
-/// range at EOF, so the result can be shorter than asked; never longer.
 /// How many times get_range asks again for the rest of a range answer that ended early.
 const RESUME_TRIES: usize = 4;
 
+/// GET `len` bytes of an object starting at `start`. The store may clamp the
+/// range at EOF, so the result can be shorter than asked; never longer.
 pub fn get_range(
     ep: &Endpoint,
     bucket: &str,
@@ -483,8 +483,12 @@ pub fn get_range(
         206 => {
             let etag = headers.iter().find(|(k, _)| k == "etag").map(|(_, v)| v.clone());
             let Some(etag) = etag else { return Err(format!("short body: {} of {len} bytes (no ETag to resume against)", body.len())) };
+            // the bytes this answer promised: its own content-length (the store clamps a range at EOF, so in an object's
+            // last window it can be less than `len`; resuming toward `len` would ask past EOF and fail with 416)
+            let want = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.trim().parse::<u64>().ok())
+                .map_or(len, |cl| cl.min(len));
             for _ in 0..RESUME_TRIES {
-                if body.len() as u64 >= len {
+                if body.len() as u64 >= want {
                     break;
                 }
                 let from = start + body.len() as u64;
@@ -497,14 +501,14 @@ pub fn get_range(
                     break;   // no progress: stop rather than spin
                 }
                 body.extend_from_slice(&more);
-                if done && body.len() as u64 >= len {
+                if done && body.len() as u64 >= want {
                     break;
                 }
             }
-            if (body.len() as u64) < len {
-                return Err(format!("short body: {} of {len} bytes after {RESUME_TRIES} resumes", body.len()));
+            if (body.len() as u64) < want {
+                return Err(format!("short body: {} of {want} bytes after {RESUME_TRIES} resumes", body.len()));
             }
-            body.truncate(len as usize);
+            body.truncate(want as usize);
             Ok(body)
         }
         // A store that ignores Range answers 200 with the whole object.
@@ -866,7 +870,7 @@ mod tests {
                     continue;
                 }
                 let (a, b) = range.split_once('-').unwrap();
-                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse::<usize>().unwrap().min(data.len() - 1));   // clamped at EOF
                 let part = &data[a..=b];
                 let send = if n == 0 { &part[..cut] } else { part };
                 let _ = c.write_all(format!("HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\netag: \"v1\"\r\nconnection: close\r\n\r\n", part.len()).as_bytes());
@@ -889,6 +893,19 @@ mod tests {
         assert_eq!(m0, None);
         assert_eq!(r1, format!("{}-{}", 100 + 3_276_800, 100 + 4 * 1024 * 1024 - 1), "only the missing bytes");
         assert_eq!(m1.as_deref(), Some("\"v1\""), "from the same object version");
+    }
+
+    #[test]
+    fn a_cut_in_the_last_window_resumes_to_eof_not_past_it() {
+        // the object ends 1 MiB into the asked window: the store clamps the range, and the cut lands inside it
+        let data: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (ep, seen) = range_server(data.clone(), 300_000, false);
+        let got = get_range(&ep, "ipfs", "pins/x", None, 4 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
+        assert!(got == data[4 * 1024 * 1024..], "exactly the object's tail");
+        let _ = seen.recv().unwrap();
+        let (r1, _) = seen.recv().unwrap();
+        assert_eq!(r1, format!("{}-{}", 4 * 1024 * 1024 + 300_000, 8 * 1024 * 1024 - 1));
+        assert!(seen.try_recv().is_err(), "no third request past EOF");
     }
 
     #[test]
