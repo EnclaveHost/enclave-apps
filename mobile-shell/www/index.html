@@ -37,11 +37,12 @@
   .pair-h { font-size: 1.05rem; margin: 1rem 0 0.5rem; }
   .pair-p { color: #a8a8a8; font-size: 0.9rem; }
   .pair-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 0.75rem; }
-  #pair-in {
+  #pair-in, #ref-in {
     flex: 1 1 auto; min-width: 0; max-width: 20rem; font: inherit; color: inherit;
     background: #101318; border: 1px solid #2a2f36; border-radius: 10px; padding: 0.55rem 0.8rem;
   }
-  #pair-in:focus { outline: none; border-color: #2dd4bf; }
+  #pair-in:focus, #ref-in:focus { outline: none; border-color: #2dd4bf; }
+  .ref-label { flex-basis: 100%; font-size: 0.85rem; opacity: 0.75; }
   #pair-err { color: #ff8a80; font-size: 0.85rem; min-height: 1.4em; margin-top: 0.5rem; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   .fineprint { color: #6f6f6f; font-size: 0.75rem; margin-top: 2rem; }
@@ -78,6 +79,11 @@
       <input id="pair-in" type="text" inputmode="url" spellcheck="false" autocomplete="off"
              placeholder="cc1f4f3f.app.enclave.host">
       <button id="pair-go">Open</button>
+    </div>
+    <div class="pair-row">
+      <label class="ref-label" for="ref-in">Referral code (optional)</label>
+      <input id="ref-in" type="text" spellcheck="false" autocomplete="off" autocapitalize="off" maxlength="64"
+             placeholder="if someone sent you here">
     </div>
     <div id="pair-err" role="alert"></div>
   </div>

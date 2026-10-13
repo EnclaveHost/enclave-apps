@@ -12,6 +12,7 @@
 import { Capacitor, CapacitorHttp } from "@capacitor/core";
 import { App } from "@capacitor/app";
 import { verifyApp } from "./verify.mjs";
+import { referralFrom, referralCode, saveReferral, reportReferral } from "./referral.mjs";
 import cfg from "./config.gen.js";
 
 const $ = (id) => document.getElementById(id);
@@ -92,6 +93,29 @@ async function resolveTarget() {
   } catch (_) {}
   // 3. a branded build wraps its own app; the generic shell asks
   return cfg.generic ? null : { url: cfg.url, id: null, name: cfg.displayName };
+}
+
+// ---- referral code (src/referral.mjs): attribution only, never in the way --------
+const randomHex = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+async function postText(url, body) {
+  if (Capacitor.isNativePlatform()) {
+    const r = await CapacitorHttp.post({ url, headers: { "content-type": "text/plain" }, data: body });
+    return { status: r.status };
+  }
+  const r = await fetch(url, { method: "POST", headers: { "content-type": "text/plain" }, body });
+  return { status: r.status };
+}
+function reportSoon() {
+  reportReferral({ storage: localStorage, post: postText, apiBase: cfg.apiBase, platform: Capacitor.getPlatform(),
+                   app: cfg.appId || "", randomHex }).catch(() => {});
+}
+async function referralFromLaunch() {
+  let code = referralFrom(window.location.href);
+  if (!code && Capacitor.isNativePlatform()) {
+    try { code = referralFrom((await App.getLaunchUrl())?.url); } catch (_) {}
+  }
+  if (code) saveReferral(localStorage, code);
+  reportSoon();
 }
 
 // ---- ui states -------------------------------------------------------------
@@ -185,6 +209,7 @@ async function run(target) {
 }
 
 function boot() {
+  referralFromLaunch().catch(() => {});
   resolveTarget()
     .then((t) => (t ? run(t) : show("pairing")))
     .catch((e) => showFail({ error: String(e && e.message ? e.message : e), steps: {} }));
@@ -211,6 +236,12 @@ if (cfg.generic) {
 }
 
 $("pair-go").addEventListener("click", () => {
+  const ref = $("ref-in").value.trim();
+  if (ref && !referralCode(ref)) {
+    $("pair-err").textContent = "a referral code is 1 to 64 letters, digits, '.', '_' or '-'";
+    return;
+  }
+  if (ref) { saveReferral(localStorage, ref); reportSoon(); }
   const raw = $("pair-in").value.trim();
   const t = sanitizeTarget(/^https:\/\//i.test(raw) ? raw : "https://" + raw);
   if (!t) {
