@@ -261,6 +261,7 @@
   .m-item .tick { color: var(--text); visibility: hidden; }
   .m-item.sel .tick { visibility: visible; }
   .menu-sep { height: 1px; background: var(--border-soft); margin: 6px 4px; }
+  .m-item .m-go { color: var(--text-3); flex: none; display: flex; }
   .seg-row { display: flex; align-items: center; gap: 10px; padding: 6px 12px 8px; }
   .seg-row > span { font-size: 12px; color: var(--text-3); font-weight: 500; }
   .seg { display: flex; background: var(--hover); border-radius: 9px; padding: 3px; margin-left: auto; }
@@ -688,13 +689,13 @@
   @keyframes shim { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 
   /* ------------------------------ API + attestation + CPU-mode dialogs -- */
-  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #padOverlay, #sessOverlay {
+  #apiOverlay, #attOverlay, #gpuOverlay, #webOverlay, #camOverlay, #padOverlay, #sessOverlay, #mcpOverlay {
     display: none; position: fixed; inset: 0; z-index: 60;
     background: rgba(0,0,0,.5); align-items: center; justify-content: center;
     padding: 20px;
   }
   #apiOverlay.open, #attOverlay.open, #gpuOverlay.open, #webOverlay.open,
-  #camOverlay.open, #padOverlay.open, #sessOverlay.open { display: flex; }
+  #camOverlay.open, #padOverlay.open, #sessOverlay.open, #mcpOverlay.open { display: flex; }
   /* The sign-in gate is NOT a dialog: full-screen, opaque, nothing to
      dismiss - a required deployment is signed-in-or-nothing, the way the
      big chat apps gate. Sits UNDER the boot overlay (z 100), so the boot
@@ -989,6 +990,15 @@
   /* .icon-btn's own display outranks [hidden] */
   #sessBtn[hidden] { display: none; }
   #sessOverlay .api-card { max-width: 480px; font-size: 14px; line-height: 1.6; }
+  /* MCP servers: the deployment's MCP tool groups, one switch each, opened
+     from the model menu so the menu stays a model picker */
+  #mcpOverlay .api-card { max-width: 480px; font-size: 14px; line-height: 1.6; }
+  #mcpList .web-store { margin-top: 8px; }
+  #mcpList .web-store:first-child { margin-top: 0; }
+  #mcpList .st-sub { overflow-wrap: anywhere; }
+  .mcp-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .mcp-actions .web-btn { flex: 0 1 auto; padding: 7px 14px; font-size: 13px; }
+  .mcp-actions .web-btn:disabled { opacity: .45; cursor: default; background: transparent; }
   #sessOverlay [hidden] { display: none !important; }
   .sess-lead { color: var(--text-2); margin-bottom: 14px; }
   .sess-ended {
@@ -1524,6 +1534,25 @@
       So the enclave mints them ahead of time while it is idle and keeps them sealed on the
       host's disk, under keys only it holds. A prompt then reads its pads instead of waiting
       for them; on an empty bank, a long prompt prefills more slowly.</p>
+    </div>
+  </div>
+
+  <div id="mcpOverlay">
+    <div class="api-card" role="dialog" aria-modal="true" aria-labelledby="mcpTitle">
+      <div class="api-head">
+        <h2 id="mcpTitle">MCP servers</h2>
+        <button class="icon-btn" id="mcpClose" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 5l14 14M19 5L5 19"/></svg>
+        </button>
+      </div>
+      <p class="sess-lead">The tool servers this deployment connects the model to. With a server on, the
+      model may call it when a question needs it; the call, and what the model sends with it, leave this
+      enclave. Off, nothing goes to that server.</p>
+      <div id="mcpList"></div>
+      <div class="mcp-actions">
+        <button type="button" class="web-btn" id="mcpAllOn">All on</button>
+        <button type="button" class="web-btn" id="mcpAllOff">All off</button>
+      </div>
     </div>
   </div>
 
@@ -4346,6 +4375,7 @@ window.addEventListener("keydown", (e) => {
     if (gpuOverlay.classList.contains("open")) { closeGpu(); return; }
     if (padOverlay.classList.contains("open")) { closePad(); return; }
     if (sessOverlay.classList.contains("open")) { sessClose(); return; }
+    if (mcpOverlay.classList.contains("open")) { closeMcp(); return; }
     if (attachMenu.classList.contains("open")) { closeAttachMenu(); attachBtn.focus(); return; }
     if (busy(current())) stopGeneration(current());
     closeModelMenu();
@@ -6392,6 +6422,16 @@ function groupOn(name) { return state.on[name] === true; }
 // their own on the wire; these are what `tools` carries)
 function toolGroups() { return state.groups.filter((g) => g.kind === "http" || g.kind === "mcp"); }
 function anyToolsOn() { return toolGroups().some((g) => groupOn(g.name)); }
+// the MCP servers among them: their switches live in their own dialog
+// (#mcpOverlay), the model menu carries one row that opens it
+function mcpGroups() { return state.groups.filter((g) => g.kind === "mcp"); }
+// a loop with nothing to call is not one: true when this turned it off
+function loopNeedsTools() {
+  if (anyToolsOn() || !state.loopOn) return false;
+  state.loopOn = false;
+  pref("llmchat-loop", "off");
+  return true;
+}
 // the switch fields a chat body carries, for the warm-up to park the prefix
 // THIS page's chats will match (see /warmup?switches=)
 function switchesForWarm() {
@@ -6566,6 +6606,7 @@ function renderModelMenu() {
   // leaves the enclave and that is the user's choice per session, not a
   // default they inherit; the tooltip names what is actually wired up.
   for (const g of state.groups) {
+    if (g.kind === "mcp") continue;   // the MCP servers row below
     const gsg = node('<div class="seg-row"><span></span><div class="seg"></div></div>');
     gsg.querySelector("span").textContent = g.label || g.name;
     const [onTitle, offTitle] = groupTitles(g);
@@ -6578,16 +6619,27 @@ function renderModelMenu() {
         e.stopPropagation();
         setGroup(g.name, t === "on");
         gsg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
-        // a loop with nothing to call is not one
-        if (!anyToolsOn() && state.loopOn) {
-          state.loopOn = false;
-          pref("llmchat-loop", "off");
-          renderModelMenu();
-        }
+        if (loopNeedsTools()) renderModelMenu();
       });
       gsg.querySelector(".seg").appendChild(b);
     }
     modelMenu.appendChild(gsg);
+  }
+  const ms = mcpGroups();
+  if (ms.length) {
+    const on = ms.filter((g) => groupOn(g.name));
+    const mi = node('<button type="button" class="m-item" role="menuitem" aria-haspopup="dialog">' +
+      '<span class="m-txt"><span class="m-name">MCP servers</span><span class="m-sub"></span></span>' +
+      '<span class="m-go">' + ICONS.chev + "</span></button>");
+    mi.querySelector(".m-sub").textContent = !on.length ? "all off"
+      : on.length === ms.length ? (ms.length === 1 ? "on" : "all " + ms.length + " on")
+      : on.length + " of " + ms.length + " on: " + on.map((g) => g.label || g.name).join(", ");
+    mi.addEventListener("click", (e) => {
+      e.stopPropagation();
+      closeModelMenu();
+      openMcp();
+    });
+    modelMenu.appendChild(mi);
   }
   if (state.tools && state.tools.enabled && toolGroups().length) {
     // THE LOOP, beside the tools because it is a way of using them: on, the
@@ -6627,6 +6679,54 @@ function renderModelMenu() {
     modelMenu.appendChild(lsg);
   }
 }
+
+// ------------------------------------------------------ MCP servers dialog --
+// One switch per MCP server group, the same state.on the chat body's `tools`
+// field is built from (toolsField); the model menu's row says how many are on.
+const mcpOverlay = $("mcpOverlay");
+function renderMcp() {
+  const list = $("mcpList");
+  list.innerHTML = "";
+  const ms = mcpGroups();
+  for (const g of ms) {
+    const on = groupOn(g.name);
+    const b = node('<button type="button" class="web-store" role="switch">' +
+      '<span class="st-txt"><span class="st-name"></span><span class="st-sub"></span></span>' +
+      '<span class="sw" aria-hidden="true"><span class="knob"></span></span></button>');
+    b.setAttribute("aria-checked", String(on));
+    b.dataset.group = g.name;
+    b.querySelector(".st-name").textContent = g.label || g.name;
+    const names = (g.tools || []).join(", ");
+    b.querySelector(".st-sub").textContent = names || "the server lists its own tools when a chat starts";
+    b.title = groupTitles(g)[on ? 0 : 1];
+    b.addEventListener("click", () => setMcp([g.name], !groupOn(g.name)));
+    list.appendChild(b);
+  }
+  $("mcpAllOn").disabled = ms.every((g) => groupOn(g.name));
+  $("mcpAllOff").disabled = !ms.some((g) => groupOn(g.name));
+}
+function setMcp(names, on) {
+  for (const n of names) setGroup(n, on);
+  loopNeedsTools();
+  const focused = document.activeElement && document.activeElement.dataset
+    ? document.activeElement.dataset.group : undefined;
+  renderMcp();
+  renderModelMenu();
+  // the list is rebuilt: keep keyboard focus on the switch that was pressed
+  if (focused) { const f = $("mcpList").querySelector('[data-group="' + CSS.escape(focused) + '"]'); if (f) f.focus(); }
+}
+function openMcp() {
+  renderMcp();
+  mcpOverlay.classList.add("open");
+  const first = $("mcpList").querySelector("button");
+  (first || $("mcpClose")).focus();
+}
+function closeMcp() { mcpOverlay.classList.remove("open"); modelBtn.focus(); }
+$("mcpClose").addEventListener("click", closeMcp);
+mcpOverlay.addEventListener("click", (e) => { if (e.target === mcpOverlay) closeMcp(); });
+// the pressed button disables itself, so focus moves to its opposite
+$("mcpAllOn").addEventListener("click", () => { setMcp(mcpGroups().map((g) => g.name), true); $("mcpAllOff").focus(); });
+$("mcpAllOff").addEventListener("click", () => { setMcp(mcpGroups().map((g) => g.name), false); $("mcpAllOn").focus(); });
 
 // Model discovery: the deployment lists its servable models largest-first
 // and the largest is the server-side default, so it arrives preselected -
