@@ -567,6 +567,13 @@ impl App {
                             acc.push(o);
                         }
                         self.indexer.errors = 0;
+                        // A listing that failed before this one succeeded is
+                        // over: at boot the first page often goes out before
+                        // the egress is admitted, and its error used to stay
+                        // in /api/status until the whole re-hash finished.
+                        if self.indexer.last_error.as_deref().is_some_and(|e| e.starts_with("list: ")) {
+                            self.indexer.last_error = None;
+                        }
                         if acc.len() >= self.cfg.max_keys {
                             acc.truncate(self.cfg.max_keys);
                             self.indexer.truncated = true;
@@ -1993,5 +2000,59 @@ impl Body for CarBody {
             return Ok(Some(out));
         }
         Ok(Some(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bucket whose first connection is dropped unanswered (the boot-time
+    /// "list: send" failure) and whose later ones list zero objects.
+    fn flaky_list_server() -> s3::Endpoint {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (n, conn) in l.incoming().enumerate() {
+                let mut c = conn.unwrap();
+                if n == 0 {
+                    drop(c);
+                    continue;
+                }
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                }
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>b</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>";
+                let _ = c.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        s3::Endpoint { https: false, host: "127.0.0.1".into(), port, region: "auto".into() }
+    }
+
+    #[test]
+    fn a_listing_that_succeeds_clears_the_listing_error_before_it() {
+        let ep = flaky_list_server();
+        let mut app = App {
+            cfg: Config { title: String::new(), endpoint: String::new(), region: "auto".into(), bucket: "b".into(),
+                          prefix: String::new(), creds: None, refresh_secs: 300, max_keys: 1000, api_key: None, upload: None },
+            s3: Some(Rc::new(S3Ctx { ep, bucket: "b".into(), creds: None })),
+            snap: Rc::new(Snapshot::empty()),
+            indexer: Indexer { phase: Phase::List { cont: None, acc: Vec::new() }, last_list: None, truncated: false,
+                               errors: 0, last_error: None, retry_at: None, skipped: 0 },
+            upload_shared: upload::Shared::new(),
+            recent_uploads: Vec::new(),
+            redirects_cache: HashMap::new(),
+            recovered: HashMap::new(),
+            cache_fp: None,
+        };
+        app.tick();
+        assert!(app.indexer.last_error.as_deref().is_some_and(|e| e.starts_with("list: ")), "{:?}", app.indexer.last_error);
+        app.indexer.retry_at = None;   // skip the backoff
+        app.tick();
+        assert_eq!(app.indexer.last_error, None, "the failure before a listing that worked no longer shows");
+        assert_eq!(app.indexer.errors, 0);
     }
 }
