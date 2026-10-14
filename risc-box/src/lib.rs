@@ -251,6 +251,9 @@ pub struct Config {
     // a video player, a benchmark inside the guest — needs this to be true or
     // it runs at (emulated MIPS / 10) times speed.
     realtime: bool,
+    // `harts`: guest CPUs (1, 2 or 4). Harts 1.. run on their own SET threads, so more than one is worth it
+    // only on a host that gives this app more than one core. RISC_HARTS overrides it (experiments).
+    harts: usize,
     api_key: Option<String>,
     // POST /exec: run a shell command on the guest's serial console and hand
     // back its stdout and exit code (see `exec`). It is the app-to-app control
@@ -409,6 +412,15 @@ fn load_config() -> Config {
             .get("realtime")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        harts: std::env::var("RISC_HARTS")
+            .ok()
+            .and_then(|x| x.parse::<u64>().ok())
+            .or_else(|| v.get("harts").and_then(|x| x.as_u64()))
+            .map(|n| match n {
+                2 | 4 => n as usize,
+                _ => 1,
+            })
+            .unwrap_or(1),
         // Optional shared secret. When set (directly or via a $VAR secret), the
         // control + observation endpoints require it; see `authorized`. Unset
         // means the deployment is open, which is only safe when it is private.
@@ -689,13 +701,18 @@ impl Images {
     /// a 1792 MiB main machine.
     fn identity(&self, cfg: &Config) -> String {
         format!(
-            "kernel:{} fs:{} dtb:{} fb:{}x{} realtime:{}",
+            "kernel:{} fs:{} dtb:{} fb:{}x{} realtime:{}{}",
             self.kernel_sha256,
             self.fs_sha256,
             self.dtb.as_ref().map(|d| sha256_hex(d)).unwrap_or_else(|| "-".into()),
             cfg.fb_w,
             cfg.fb_h,
-            cfg.realtime
+            cfg.realtime,
+            // a one-hart machine keeps the identity every existing snapshot carries
+            match cfg.harts {
+                1 => String::new(),
+                n => format!(" harts:{n}"),
+            }
         )
     }
 }
@@ -1407,6 +1424,10 @@ fn new_emulator(cfg: &Config, ram_mib: u64) -> Emulator {
     // before setup_program: that's where the RAM is sized and the DTB memory
     // node gets synced to it
     emu.setup_ram_bytes(ram_mib * 1024 * 1024);
+    // the built-in DTB for that many cpus, and the per-hart device state; before setup_program and restore
+    if cfg.harts > 1 {
+        emu.set_harts(cfg.harts);
+    }
     // Display size and clock source, both of which the guest reads exactly once
     // at boot: the DTB node for the framebuffer, the timebase for the clock.
     if cfg.fb_w != 1024 || cfg.fb_h != 768 {
@@ -1445,6 +1466,11 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
     }
     if cfg.net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
+    }
+    // last: from here on harts 1.. run on their own threads (SET builds; elsewhere they stay interleaved)
+    if emu.harts() > 1 {
+        let n = emu.start_threads(&mut |f| worker::spawn_boxed(f));
+        eprintln!("[risc-box] {} harts, {} on their own threads", emu.harts(), n);
     }
 }
 
@@ -3878,10 +3904,10 @@ pub fn run() {
         // when the running machines produced no output and moved no bytes.
         let any_running = app.machines.iter().any(|m| m.running());
         if !any_running {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            loop_sleep(&app, 20);
             last_yield = std::time::Instant::now();
         } else if !busy && !flushed {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            loop_sleep(&app, 1);
             last_yield = std::time::Instant::now();
         } else if !flushed && server.pending_bytes() > 0 {
             // Queued output that would not go out this turn: yield a slice so
@@ -3892,7 +3918,7 @@ pub fn run() {
             // moved NOTHING, so this costs the guest nothing while a stream
             // keeps up and pays 1 ms only on the turns where the engine says
             // it has no room — the backpressure signal.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            loop_sleep(&app, 1);
             last_yield = std::time::Instant::now();
         } else if last_yield.elapsed() >= std::time::Duration::from_millis(16) {
             // ACCEPT FAIRNESS. The backpressure yield above only fires when
@@ -3902,8 +3928,24 @@ pub fn run() {
             // cooperative budget, which replenishes only when a fiber yields.
             // Yield the OS thread at most once per ~frame so the runtime can
             // drain its accept queue; costs ~1 ms/16 ms.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            loop_sleep(&app, 1);
             last_yield = std::time::Instant::now();
+        }
+    }
+}
+
+/// The main loop's idle sleep. A machine whose harts run on threads gets its devices released for the
+/// duration, so those harts' device accesses (IPIs, interrupt claims, virtio kicks) do not wait it out.
+fn loop_sleep(app: &App, ms: u64) {
+    for m in app.machines.iter() {
+        if let Some(e) = m.emu.as_ref() {
+            e.release_devices();
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    for m in app.machines.iter() {
+        if let Some(e) = m.emu.as_ref() {
+            e.acquire_devices();
         }
     }
 }

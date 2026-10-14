@@ -121,6 +121,9 @@ pub struct Emulator {
 	// harts 1.. run on their own threads (start_threads); hart 0 stays with the caller
 	threaded: bool,
 	ctl: Arc<HartCtl>,
+	// run by each hart thread on itself when it starts (its JIT must be enabled on its own thread: compiled
+	// code belongs to the execution view that compiled it)
+	hart_init: Option<Arc<dyn Fn(&mut Cpu) + Send + Sync>>,
 
 	// risc-box patch: per-machine RAM override (bytes); None = PROGRAM_MEMORY_CAPACITY.
 	ram_bytes: Option<u64>,
@@ -154,9 +157,12 @@ unsafe impl Send for HartPtr {}
 
 /// The body of a hart thread: slices of guest time until told to stop; parked while paused; a hart parked in
 /// WFI with nothing pending sleeps briefly instead of spinning a host core.
-fn hart_loop(cpu: HartPtr, ctl: Arc<HartCtl>) {
+fn hart_loop(cpu: HartPtr, ctl: Arc<HartCtl>, init: Option<Arc<dyn Fn(&mut Cpu) + Send + Sync>>) {
 	use std::sync::atomic::Ordering::*;
 	let cpu = unsafe { &mut *cpu.0 };
+	if let Some(f) = init {
+		f(cpu);
+	}
 	loop {
 		if ctl.stop.load(Acquire) {
 			break;
@@ -200,6 +206,7 @@ impl Emulator {
 			dtb_given: false,
 			threaded: false,
 			ctl: Arc::new(HartCtl::default()),
+			hart_init: None,
 
 			ram_bytes: None,
 
@@ -343,8 +350,9 @@ impl Emulator {
 		for h in self.harts.iter_mut() {
 			let cpu = HartPtr(h as *mut Cpu);
 			let ctl = self.ctl.clone();
+			let init = self.hart_init.clone();
 			ctl.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-			if !spawn(Box::new(move || hart_loop(cpu, ctl))) {
+			if !spawn(Box::new(move || hart_loop(cpu, ctl, init))) {
 				self.ctl.running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
 				break;
 			}
@@ -358,6 +366,20 @@ impl Emulator {
 		}
 		self.threaded = true;
 		started
+	}
+
+	/// risc-box patch (SMP): let the hart threads at the devices while this thread sleeps (outside run_n it
+	/// otherwise holds the device lock). Pair with acquire_devices before touching the machine again.
+	pub fn release_devices(&self) {
+		if self.threaded {
+			self.cpu.get_mmu().dev_unlock();
+		}
+	}
+
+	pub fn acquire_devices(&self) {
+		if self.threaded {
+			self.cpu.get_mmu().dev_lock();
+		}
 	}
 
 	/// Park every hart thread between slices (and keep it parked) so the caller may touch their state.
@@ -797,6 +819,11 @@ impl Emulator {
 	/// spent — the machine then interprets exactly as before.
 	#[cfg(feature = "codegen")]
 	pub fn jit_enable(&mut self, params: cpu::JitParams) -> bool {
+		// harts 1.. enable theirs on their own threads (start_threads); interleaved, they interpret
+		let p = params.clone();
+		self.hart_init = Some(Arc::new(move |c: &mut Cpu| {
+			c.jit_enable(p.clone());
+		}));
 		self.cpu.jit_enable(params)
 	}
 

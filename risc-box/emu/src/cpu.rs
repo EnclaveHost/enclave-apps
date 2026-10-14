@@ -699,6 +699,8 @@ pub struct JitState {
 	pub params: JitParams,
 	pub stats: JitStats,
 	diag: JitDiag,
+	/// risc-box patch (SMP): this hart's context block (lay.ctx points here)
+	ctx: Box<::jit::verb::Ctx>,
 }
 
 /// Tuning, defaulted for the desktop/browser workloads.
@@ -1881,7 +1883,9 @@ impl Cpu {
 		t2.max_blocks = params.max_blocks;
 		t2.min_heat = params.seed_heat;
 		t2.form_interval = params.form_interval;
-		let lay = self.jit_layout(params.max_pages);
+		let ctx = Box::new(::jit::verb::Ctx::new());
+		let mut lay = self.jit_layout(params.max_pages);
+		lay.ctx = ctx.addr();
 		let lay_hash = ::jit::layout_hash(&lay);
 		self.jit = Some(Box::new(JitState {
 			t2,
@@ -1901,6 +1905,7 @@ impl Cpu {
 			params,
 			stats: JitStats::default(),
 			diag: JitDiag::default(),
+			ctx,
 		}));
 		true
 	}
@@ -1980,10 +1985,9 @@ impl Cpu {
 			j.lay.dram_len = len;
 			j.lay_hash = ::jit::layout_hash(&j.lay);
 		}
-		let ctx = &::jit::verb::CTX;
-		ctx.set(::jit::CTX_RD, rd);
-		ctx.set(::jit::CTX_WR, wr);
-		ctx.set(::jit::CTX_MARKS, marks);
+		j.ctx.set(::jit::CTX_RD, rd);
+		j.ctx.set(::jit::CTX_WR, wr);
+		j.ctx.set(::jit::CTX_MARKS, marks);
 	}
 
 	/// Run the compiled region entered at block `slot` (tag already matched
@@ -2049,7 +2053,8 @@ impl Cpu {
 		};
 		// The generated code reaches this Cpu through the context block: its
 		// address is taken here, next to the call that uses it.
-		let ctx = &::jit::verb::CTX;
+		let ctx: *const ::jit::verb::Ctx = &*self.jit.as_deref().unwrap().ctx;
+		let ctx = unsafe { &*ctx };
 		ctx.set(::jit::CTX_BASE, self as *mut Cpu as usize as u64);
 		ctx.set(::jit::CTX_BIAS, bias);
 		let ran = unsafe { ::jit::verb::call(index, fuel, entry) };

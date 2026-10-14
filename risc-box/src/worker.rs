@@ -361,6 +361,23 @@ mod spawn {
         let rc = unsafe { pthread_create(&mut tid, std::ptr::null(), entry, std::ptr::null_mut()) };
         rc == 0
     }
+
+    extern "C" fn boxed_entry(arg: *mut c_void) -> *mut c_void {
+        let f = unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send + 'static>) };
+        f();
+        std::ptr::null_mut()
+    }
+
+    /// Run `f` on a new SET thread (the emulator's hart threads).
+    pub fn boxed(f: Box<dyn FnOnce() + Send + 'static>) -> bool {
+        let arg = Box::into_raw(Box::new(f)) as *mut c_void;
+        let mut tid: usize = 0;
+        let rc = unsafe { pthread_create(&mut tid, std::ptr::null(), boxed_entry, arg) };
+        if rc != 0 {
+            drop(unsafe { Box::from_raw(arg as *mut Box<dyn FnOnce() + Send + 'static>) });
+        }
+        rc == 0
+    }
 }
 
 #[cfg(not(feature = "set"))]
@@ -370,6 +387,15 @@ mod spawn {
     pub fn worker() -> bool {
         false
     }
+
+    pub fn boxed(_f: Box<dyn FnOnce() + Send + 'static>) -> bool {
+        false
+    }
+}
+
+/// Run `f` on a thread of its own: true when it started (SET builds only).
+pub fn spawn_boxed(f: Box<dyn FnOnce() + Send + 'static>) -> bool {
+    spawn::boxed(f)
 }
 
 /// Try to bring a worker up. False means every caller should keep doing the

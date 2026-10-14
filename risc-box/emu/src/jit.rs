@@ -3364,7 +3364,21 @@ pub mod verb {
 		owner: usize,
 	}
 
-	static STATE: Mutex<Option<State>> = Mutex::new(None);
+	// risc-box patch (SMP): one State per execution view (SET thread). Table indices, the cache that maps
+	// sources to them and the host's budget all belong to the view that compiled them, so each hart thread
+	// compiles, caches and spends for itself. The outer lock is held only to find a thread's own state.
+	static STATES: Mutex<Vec<(usize, std::sync::Arc<Mutex<State>>)>> = Mutex::new(Vec::new());
+
+	fn mine() -> Option<std::sync::Arc<Mutex<State>>> {
+		let me = sys::thread();
+		let g = STATES.lock().unwrap_or_else(|e| e.into_inner());
+		g.iter().find(|(owner, _)| *owner == me).map(|(_, st)| st.clone())
+	}
+
+	/// This thread's state, else the first enabled one (the embedder's thread reading hart 0's counters).
+	fn mine_or_first() -> Option<std::sync::Arc<Mutex<State>>> {
+		mine().or_else(|| STATES.lock().unwrap_or_else(|e| e.into_inner()).first().map(|(_, st)| st.clone()))
+	}
 
 	/// A key for callers that hold module bytes (tests, tools).
 	pub fn bytes_key(module: &[u8]) -> (u64, u64, u64) {
@@ -3379,35 +3393,36 @@ pub mod verb {
 	/// Arm the verb for this process (idempotent; the first caller's policy
 	/// and thread win). Returns whether compilation is still possible.
 	pub fn enable(policy: Policy) -> bool {
-		let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-		let s = g.get_or_insert_with(|| State {
-			policy,
-			stats: Stats::default(),
-			cache: Default::default(),
-			consecutive_failures: 0,
-			owner: sys::thread(),
-		});
+		let st = match mine() {
+			Some(st) => st,
+			None => {
+				let st = std::sync::Arc::new(Mutex::new(State {
+					policy,
+					stats: Stats::default(),
+					cache: Default::default(),
+					consecutive_failures: 0,
+					owner: sys::thread(),
+				}));
+				STATES.lock().unwrap_or_else(|e| e.into_inner()).push((sys::thread(), st.clone()));
+				st
+			}
+		};
+		let s = st.lock().unwrap_or_else(|e| e.into_inner());
 		s.stats.disabled.is_none()
 	}
 
 	/// Table indices belong to the execution view (SET thread) that compiled
 	/// them: only the enabling thread may call or compile.
 	pub fn on_owner_thread() -> bool {
-		let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-		match g.as_ref() {
-			Some(s) => s.owner == sys::thread(),
-			None => false,
-		}
+		mine().is_some()
 	}
 
 	pub fn stats() -> Stats {
-		let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-		g.as_ref().map(|s| s.stats.clone()).unwrap_or_default()
+		mine_or_first().map(|st| st.lock().unwrap_or_else(|e| e.into_inner()).stats.clone()).unwrap_or_default()
 	}
 
 	pub fn policy() -> Policy {
-		let g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-		g.as_ref().map(|s| s.policy.clone()).unwrap_or_default()
+		mine_or_first().map(|st| st.lock().unwrap_or_else(|e| e.into_inner()).policy.clone()).unwrap_or_default()
 	}
 
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3445,11 +3460,12 @@ pub mod verb {
 		may_compile: bool,
 		emit: F,
 	) -> Got {
-		let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
-		let s = match g.as_mut() {
-			Some(s) => s,
+		let st = match mine() {
+			Some(st) => st,
 			None => return Got::Refused,
 		};
+		let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+		let s = &mut *g;
 		if let Some(&hit) = s.cache.get(&k) {
 			return match hit {
 				Some(i) => {
@@ -3543,6 +3559,11 @@ pub mod verb {
 	unsafe impl Sync for Ctx {}
 	pub static CTX: Ctx = Ctx(std::cell::UnsafeCell::new([0; super::CTX_CELLS]));
 	impl Ctx {
+		/// risc-box patch (SMP): a hart's own block (each hart's modules bake its address in).
+		pub fn new() -> Ctx {
+			Ctx(std::cell::UnsafeCell::new([0; super::CTX_CELLS]))
+		}
+
 		pub fn addr(&self) -> u64 {
 			self.0.get() as usize as u64
 		}
@@ -3608,7 +3629,7 @@ pub mod verb {
 	#[cfg(not(target_family = "wasm"))]
 	pub fn reset_for_test(compiler: Option<fn(&[u8]) -> i64>, policy: Policy) {
 		*sys::TEST_COMPILER.lock().unwrap() = compiler;
-		*STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		STATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		enable(policy);
 	}
 
