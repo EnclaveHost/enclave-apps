@@ -140,7 +140,13 @@ impl Client {
         let (tx, outcome) = watch::channel(None);
         let task = tokio::spawn(async move {
             let result = async {
-                let mux = timeout(Duration::from_secs(10), Self::new_conn(&host))
+                // wasip2 dials go through the enclave's SOCKS front and a WireGuard
+                // circuit (guard + exit, DoH for names): 10 s is too tight there
+                let secs = std::env::var("SIA_DIAL_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if cfg!(target_os = "wasi") { 30 } else { 10 });
+                let mux = timeout(Duration::from_secs(secs), Self::new_conn(&host))
                     .await
                     .inspect_err(|e| {
                         debug!("siamux connection to {} timed out: {e}", host.public_key);

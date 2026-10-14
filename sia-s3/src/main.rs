@@ -9,6 +9,7 @@
 //! The one platform rule: read `ENCLAVE_PORTS` and bind the actual port.
 
 mod config;
+mod diag;
 mod http;
 mod import;
 mod s3;
@@ -34,6 +35,22 @@ const META: AppMetadata = AppMetadata {
     logo_url: None,
     callback_url: None,
 };
+
+
+/// stderr logger for the SDK's `log` output: warnings and errors always,
+/// everything from sia_* crates at debug when SIAS3_LOG=debug.
+struct Logger { debug: bool }
+impl log::Log for Logger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn || (self.debug && m.target().starts_with("sia"))
+    }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{}] {} {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
 
 /// `ENCLAVE_PORTS=http:8000=18321,...` → the actual port for `http:8000`.
 fn port() -> u16 {
@@ -121,6 +138,10 @@ async fn conn(app: Rc<App>, mut s: tokio::net::TcpStream, max_body: usize) {
 }
 
 fn main() {
+    let debug = std::env::var("SIAS3_LOG").is_ok_and(|v| v == "debug");
+    if log::set_boxed_logger(Box::new(Logger { debug })).is_ok() {
+        log::set_max_level(if debug { log::LevelFilter::Debug } else { log::LevelFilter::Warn });
+    }
     let cfg = match config::load() {
         Ok(c) => c,
         Err(e) => {

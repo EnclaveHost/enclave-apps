@@ -137,6 +137,15 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
     let qv = |k: &str| q.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
     let has = |k: &str| q.iter().any(|(a, _)| a == k);
 
+    // signed diagnostics: can this deployment reach the Sia hosts it would upload to?
+    if req.path == "/" && has("sia-diag") && req.method == "GET" {
+        let limit = qv("limit").and_then(|v| v.parse().ok()).unwrap_or(60);
+        let secs = qv("timeout").and_then(|v| v.parse().ok()).unwrap_or(30);
+        let body = crate::diag::run(&store, limit, secs).await;
+        let r = Resp { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: body.into_bytes() };
+        return send(w, r, ka).await;
+    }
+
     let path = req.path.trim_start_matches('/');
     let (bucket_raw, key_raw) = path.split_once('/').unwrap_or((path, ""));
     let bucket = percent_decode(bucket_raw);
