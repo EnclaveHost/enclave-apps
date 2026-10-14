@@ -114,7 +114,42 @@ pub struct Bus {
 	uart: Uart,
 	// interrupt-pending bits devices raised for harts other than 0 (hart 0's go straight into its mip, as they
 	// always have); each hart folds its own word into mip at its next device-service boundary
-	raised: Vec<std::sync::atomic::AtomicU64>
+	raised: Vec<std::sync::atomic::AtomicU64>,
+	dev: DevLock
+}
+
+/// risc-box patch (SMP): mutual exclusion for the devices. Every device register access and hart 0's device
+/// service take it, so harts on other threads see each register access whole. A plain spin lock that yields:
+/// critical sections are a register access or one service pass.
+pub struct DevLock {
+	held: std::sync::atomic::AtomicBool
+}
+
+impl DevLock {
+	fn new() -> Self {
+		DevLock { held: std::sync::atomic::AtomicBool::new(false) }
+	}
+
+	#[inline(always)]
+	pub fn lock(&self) {
+		use std::sync::atomic::Ordering::{Acquire, Relaxed};
+		if self.held.compare_exchange(false, true, Acquire, Relaxed).is_ok() {
+			return;
+		}
+		let mut spins = 0u32;
+		while self.held.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+			spins += 1;
+			match spins < 64 {
+				true => std::hint::spin_loop(),
+				false => std::thread::yield_now()
+			}
+		}
+	}
+
+	#[inline(always)]
+	pub fn unlock(&self) {
+		self.held.store(false, std::sync::atomic::Ordering::Release);
+	}
 }
 
 /// A hart's handle on the shared `Bus`. Harts run one at a time on a thread (interleaved SMP), so handing out
@@ -210,7 +245,8 @@ impl Mmu {
 				plic: Plic::new(),
 				clint: Clint::new(),
 				uart: Uart::new(terminal),
-				raised: vec![std::sync::atomic::AtomicU64::new(0)]
+				raised: vec![std::sync::atomic::AtomicU64::new(0)],
+				dev: DevLock::new()
 			}),
 			hart: 0,
 			mstatus: 0,
@@ -282,6 +318,20 @@ impl Mmu {
 		};
 		mmu.refresh_tlb_meta();
 		mmu
+	}
+
+	/// risc-box patch (SMP): host address of guest word `v_address` (`width` 4 or 8, naturally aligned) for an
+	/// atomic read-modify-write, translated as a store. Ok(None) = not RAM (a device): the caller falls back to
+	/// an ordinary load and store.
+	pub fn atomic_ptr(&mut self, v_address: u64, width: u64) -> Result<Option<*mut u8>, Trap> {
+		if v_address & (width - 1) != 0 {
+			return Err(Trap { trap_type: TrapType::StoreAddressMisaligned, value: v_address });
+		}
+		let p_address = match self.translate_address(v_address, &MemoryAccessType::Write) {
+			Ok(p) => self.get_effective_address(p),
+			Err(()) => return Err(Trap { trap_type: TrapType::StorePageFault, value: v_address })
+		};
+		Ok(self.bus.memory.rmw_ptr(p_address, width))
 	}
 
 	/// risc-box patch (SMP): the pending bits devices raised for this hart since the last call.
@@ -686,6 +736,7 @@ impl Mmu {
 	// much rather than by one, so guest time runs at the same rate it always
 	// did; devices that only poll queues simply get polled less often.
 	pub fn tick(&mut self, n: u64, mip: &mut u64) {
+		self.bus.dev.lock();
 		let bus = &mut *self.bus;
 		bus.clint.tick(n, mip, &bus.raised);
 		bus.disk.tick(n, &mut bus.memory);
@@ -698,6 +749,7 @@ impl Mmu {
 		bus.plic.tick(n, bus.disk.is_interrupting(), bus.net.is_interrupting(),
 			bus.input.is_interrupting(), bus.snd.is_interrupting(),
 			bus.gpu.is_interrupting(), bus.uart.is_interrupting(), mip, &bus.raised);
+		self.bus.dev.unlock();
 		self.clock = self.clock.wrapping_add(n);
 	}
 
@@ -1015,7 +1067,45 @@ impl Mmu {
 		// @TODO: Mapping should be configurable with dtb
 		match effective_address >= DRAM_BASE {
 			true => self.bus.memory.read_byte(effective_address),
-			false => match effective_address {
+			false => {
+				self.dev_lock();
+				let v = self.load_dev(effective_address);
+				self.dev_unlock();
+				v
+			}
+		}
+	}
+
+	/// risc-box patch (SMP): the device lock (see DevLock).
+	#[inline(always)]
+	pub fn dev_lock(&self) {
+		self.bus.dev.lock();
+	}
+
+	#[inline(always)]
+	pub fn dev_unlock(&self) {
+		self.bus.dev.unlock();
+	}
+
+	/// A byte of a multi-byte access that is not all RAM (it may straddle DRAM_BASE); device lock held.
+	fn load_dev_or_ram(&mut self, a: u64) -> u8 {
+		match a >= DRAM_BASE {
+			true => self.bus.memory.read_byte(a),
+			false => self.load_dev(a)
+		}
+	}
+
+	fn store_dev_or_ram(&mut self, a: u64, value: u8) {
+		match a >= DRAM_BASE {
+			true => self.bus.memory.write_byte(a, value),
+			false => self.store_dev(a, value)
+		}
+	}
+
+	/// risc-box patch (SMP): a device (non-RAM) byte; the caller holds the device lock.
+	fn load_dev(&mut self, effective_address: u64) -> u8 {
+		{
+			match effective_address {
 				// I don't know why but dtb data seems to be stored from 0x1020 on Linux.
 				// It might be from self.x[0xb] initialization?
 				// And DTB size is arbitray.
@@ -1051,9 +1141,11 @@ impl Mmu {
 			true => self.bus.memory.read_halfword(effective_address),
 			false => {
 				let mut data = 0 as u16;
+				self.dev_lock();
 				for i in 0..2 {
-					data |= (self.load_raw(effective_address.wrapping_add(i)) as u16) << (i * 8)
+					data |= (self.load_dev_or_ram(effective_address.wrapping_add(i)) as u16) << (i * 8)
 				}
+				self.dev_unlock();
 				data
 			}
 		}
@@ -1072,9 +1164,11 @@ impl Mmu {
 			true => self.bus.memory.read_word(effective_address),
 			false => {
 				let mut data = 0 as u32;
+				self.dev_lock();
 				for i in 0..4 {
-					data |= (self.load_raw(effective_address.wrapping_add(i)) as u32) << (i * 8)
+					data |= (self.load_dev_or_ram(effective_address.wrapping_add(i)) as u32) << (i * 8)
 				}
+				self.dev_unlock();
 				data
 			}
 		}
@@ -1093,9 +1187,11 @@ impl Mmu {
 			true => self.bus.memory.read_doubleword(effective_address),
 			false => {
 				let mut data = 0 as u64;
+				self.dev_lock();
 				for i in 0..8 {
-					data |= (self.load_raw(effective_address.wrapping_add(i)) as u64) << (i * 8)
+					data |= (self.load_dev_or_ram(effective_address.wrapping_add(i)) as u64) << (i * 8)
 				}
+				self.dev_unlock();
 				data
 			}
 		}
@@ -1113,7 +1209,18 @@ impl Mmu {
 		// @TODO: Mapping should be configurable with dtb
 		match effective_address >= DRAM_BASE {
 			true => self.bus.memory.write_byte(effective_address, value),
-			false => match effective_address {
+			false => {
+				self.dev_lock();
+				self.store_dev(effective_address, value);
+				self.dev_unlock();
+			}
+		}
+	}
+
+	/// risc-box patch (SMP): a device (non-RAM) byte store; the caller holds the device lock.
+	fn store_dev(&mut self, effective_address: u64, value: u8) {
+		{
+			match effective_address {
 				0x02000000..=0x0200ffff => self.bus.clint.store(effective_address, value),
 				0x0c000000..=0x0fffffff => self.bus.plic.store(effective_address, value),
 				0x10000000..=0x100000ff => self.bus.uart.store(effective_address, value),
@@ -1144,9 +1251,11 @@ impl Mmu {
 			// Fast path. Directly store to main memory at a time.
 			true => self.bus.memory.write_halfword(effective_address, value),
 			false => {
+				self.dev_lock();
 				for i in 0..2 {
-					self.store_raw(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
+					self.store_dev_or_ram(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
 				}
+				self.dev_unlock();
 			}
 		}
 	}
@@ -1164,9 +1273,11 @@ impl Mmu {
 			// Fast path. Directly store to main memory at a time.
 			true => self.bus.memory.write_word(effective_address, value),
 			false => {
+				self.dev_lock();
 				for i in 0..4 {
-					self.store_raw(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
+					self.store_dev_or_ram(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
 				}
+				self.dev_unlock();
 			}
 		}
 	}
@@ -1184,9 +1295,11 @@ impl Mmu {
 			// Fast path. Directly store to main memory at a time.
 			true => self.bus.memory.write_doubleword(effective_address, value),
 			false => {
+				self.dev_lock();
 				for i in 0..8 {
-					self.store_raw(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
+					self.store_dev_or_ram(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
 				}
+				self.dev_unlock();
 			}
 		}
 	}
@@ -1792,6 +1905,16 @@ impl MemoryWrapper {
 
 	pub fn validate_address(&self, address: u64) -> bool {
 		self.memory.validate_address(address - DRAM_BASE)
+	}
+
+	/// risc-box patch (SMP): host address for an atomic read-modify-write of `width` bytes at `p_address`, after
+	/// the same SMC snoop a store gets. None when the range is not all RAM.
+	pub fn rmw_ptr(&mut self, p_address: u64, width: u64) -> Option<*mut u8> {
+		if p_address < DRAM_BASE || !self.validate_address(p_address) || !self.validate_address(p_address + width - 1) {
+			return None;
+		}
+		self.snoop_exec(p_address, width);
+		Some(self.memory.rmw_ptr((p_address - DRAM_BASE) as usize))
 	}
 
 	// risc-box patch (snapshot/fork): the pages themselves. Writes made

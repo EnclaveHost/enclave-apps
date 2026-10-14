@@ -118,6 +118,9 @@ pub struct Emulator {
 	slice: u64,
 	// setup_dtb was called: set_harts leaves the DTB alone (the caller's describes the cpus)
 	dtb_given: bool,
+	// harts 1.. run on their own threads (start_threads); hart 0 stays with the caller
+	threaded: bool,
+	ctl: Arc<HartCtl>,
 
 	// risc-box patch: per-machine RAM override (bytes); None = PROGRAM_MEMORY_CAPACITY.
 	ram_bytes: Option<u64>,
@@ -135,6 +138,54 @@ pub struct Emulator {
 	tohost_addr: u64
 }
 
+/// risc-box patch (SMP): what the hart threads and the embedder's thread share.
+#[derive(Default)]
+pub struct HartCtl {
+	stop: std::sync::atomic::AtomicBool,
+	pause: std::sync::atomic::AtomicBool,
+	parked: std::sync::atomic::AtomicUsize,
+	running: std::sync::atomic::AtomicUsize,
+	slice: std::sync::atomic::AtomicU64
+}
+
+/// A hart owned by the Emulator's `harts` (which never reallocates once set), run by exactly one thread.
+struct HartPtr(*mut Cpu);
+unsafe impl Send for HartPtr {}
+
+/// The body of a hart thread: slices of guest time until told to stop; parked while paused; a hart parked in
+/// WFI with nothing pending sleeps briefly instead of spinning a host core.
+fn hart_loop(cpu: HartPtr, ctl: Arc<HartCtl>) {
+	use std::sync::atomic::Ordering::*;
+	let cpu = unsafe { &mut *cpu.0 };
+	loop {
+		if ctl.stop.load(Acquire) {
+			break;
+		}
+		if ctl.pause.load(Acquire) {
+			ctl.parked.fetch_add(1, AcqRel);
+			while ctl.pause.load(Acquire) && !ctl.stop.load(Acquire) {
+				std::thread::sleep(std::time::Duration::from_micros(50));
+			}
+			ctl.parked.fetch_sub(1, AcqRel);
+			continue;
+		}
+		cpu.drop_reservation_if_stale();
+		cpu.run(ctl.slice.load(Relaxed));
+		if cpu.is_parked() {
+			std::thread::sleep(std::time::Duration::from_micros(100));
+		}
+	}
+	ctl.running.fetch_sub(1, AcqRel);
+}
+
+impl Drop for Emulator {
+	fn drop(&mut self) {
+		if self.threaded {
+			self.stop_threads();
+		}
+	}
+}
+
 impl Emulator {
 	/// Creates a new `Emulator`. [`Terminal`](terminal/trait.Terminal.html)
 	/// is internally used for transferring input/output data to/from `Emulator`.
@@ -147,6 +198,8 @@ impl Emulator {
 			harts: Vec::new(),
 			slice: 4096,
 			dtb_given: false,
+			threaded: false,
+			ctl: Arc::new(HartCtl::default()),
 
 			ram_bytes: None,
 
@@ -235,6 +288,14 @@ impl Emulator {
 			self.cpu.run(n);
 			return;
 		}
+		if self.threaded {
+			// the other harts are running on their own threads; outside run_n this thread holds the device
+			// lock (so the embedder's own device calls are safe), inside it hart 0 takes it per access
+			self.cpu.get_mmu().dev_unlock();
+			self.cpu.run(n);
+			self.cpu.get_mmu().dev_lock();
+			return;
+		}
 		// Interleaved SMP: each hart runs a slice in turn; `n` is hart 0's share, the device clock's driver.
 		// A hart's LR reservation does not survive another hart running (that hart may have stored to the
 		// reserved address), so it is dropped at the start of each slice: an SC across a switch fails, which
@@ -260,11 +321,74 @@ impl Emulator {
 			eprintln!("[emu] no built-in DTB for {} harts; the guest will see one cpu", n);
 		}
 		self.cpu.get_mut_mmu().set_harts(n);
+		self.cpu.set_smp(n > 1);
 		self.harts = (1..n).map(|h| self.cpu.new_hart(h)).collect();
 	}
 
 	pub fn harts(&self) -> usize {
 		1 + self.harts.len()
+	}
+
+	/// risc-box patch (SMP): run harts 1.. on their own threads from now on, each started with `spawn`
+	/// (std::thread natively; the SET build's pthreads in the app). Hart 0 keeps running in `run_n` on the
+	/// caller's thread. Returns how many threads started; harts whose spawn failed... none may: false from
+	/// `spawn` stops the machine from going parallel at all (they all stay interleaved).
+	pub fn start_threads(&mut self, spawn: &mut dyn FnMut(Box<dyn FnOnce() + Send + 'static>) -> bool) -> usize {
+		if self.threaded || self.harts.is_empty() {
+			return 0;
+		}
+		self.cpu.get_mmu().dev_lock();
+		self.ctl.slice.store(self.slice, std::sync::atomic::Ordering::Relaxed);
+		let mut started = 0;
+		for h in self.harts.iter_mut() {
+			let cpu = HartPtr(h as *mut Cpu);
+			let ctl = self.ctl.clone();
+			ctl.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			if !spawn(Box::new(move || hart_loop(cpu, ctl))) {
+				self.ctl.running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+				break;
+			}
+			started += 1;
+		}
+		if started < self.harts.len() {
+			// the ones that did start: stop them; this machine stays interleaved
+			self.stop_threads();
+			self.cpu.get_mmu().dev_unlock();
+			return 0;
+		}
+		self.threaded = true;
+		started
+	}
+
+	/// Park every hart thread between slices (and keep it parked) so the caller may touch their state.
+	fn pause_harts(&self) {
+		use std::sync::atomic::Ordering::*;
+		if !self.threaded {
+			return;
+		}
+		self.ctl.pause.store(true, SeqCst);
+		// a hart may be waiting for the device lock this thread holds
+		self.cpu.get_mmu().dev_unlock();
+		while self.ctl.parked.load(Acquire) < self.ctl.running.load(Acquire) {
+			std::thread::yield_now();
+		}
+		self.cpu.get_mmu().dev_lock();
+	}
+
+	fn resume_harts(&self) {
+		self.ctl.pause.store(false, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	fn stop_threads(&mut self) {
+		use std::sync::atomic::Ordering::*;
+		self.ctl.stop.store(true, SeqCst);
+		self.cpu.get_mmu().dev_unlock();
+		while self.ctl.running.load(Acquire) > 0 {
+			std::thread::yield_now();
+		}
+		self.cpu.get_mmu().dev_lock();
+		self.ctl.stop.store(false, SeqCst);
+		self.threaded = false;
 	}
 
 	/// risc-box patch (SMP): instructions per hart per turn on the shared thread.
@@ -729,10 +853,12 @@ impl Emulator {
 		s.u64(taken);
 		s.str(env!("CARGO_PKG_VERSION"));
 		s.end_section(at);
+		self.pause_harts();
 		let stats = self.cpu.snapshot_into(&mut s, level);
 		for h in self.harts.iter() {
 			h.snapshot_hart(&mut s);
 		}
+		self.resume_harts();
 		let bytes = s.buf.len();
 		(s.buf, SnapshotInfo {
 			bytes,
@@ -805,6 +931,13 @@ impl Emulator {
 	/// risc-box patch (fork): resume from an image. Same preconditions as
 	/// `restore`; the RAM is adopted copy-on-write rather than copied.
 	pub fn restore_image(&mut self, image: &SnapshotImage, identity: &str) -> Result<SnapshotInfo, String> {
+		self.pause_harts();
+		let r = self.restore_image_paused(image, identity);
+		self.resume_harts();
+		r
+	}
+
+	fn restore_image_paused(&mut self, image: &SnapshotImage, identity: &str) -> Result<SnapshotInfo, String> {
 		let meta = &image.meta;
 		if meta.identity != identity {
 			return Err(format!(
@@ -887,12 +1020,14 @@ impl Emulator {
 		// device sections only: level is irrelevant without RAM, and the
 		// delta is small
 		let mut s = Ser::new();
+		self.pause_harts();
 		self.cpu.snapshot_into_no_ram(&mut s, 1);
 		for h in self.harts.iter() {
 			h.snapshot_hart(&mut s);
 		}
 		let secs = snapshot::sections_unframed(&s.buf);
 		let ram = self.cpu.get_mut_mmu().share_ram();
+		self.resume_harts();
 		let pages_total = (ram.len() + snapshot::PAGE - 1) / snapshot::PAGE;
 		let pages_kept = (0..pages_total).filter(|&i| ram.page(i).is_some()).count();
 		SnapshotImage {

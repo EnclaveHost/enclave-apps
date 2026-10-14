@@ -355,6 +355,10 @@ pub struct Cpu {
 	mmu: Mmu,
 	reservation: u64, // @TODO: Should support multiple address reservations
 	is_reservation_set: bool,
+	// risc-box patch (SMP): the value LR read (SC succeeds only if memory still holds it), and whether this
+	// machine has other harts - then AMO/LR/SC run as host atomics (exec_atomic)
+	reservation_val: u64,
+	smp: bool,
 	_dump_flag: bool,
 	decode_cache: DecodeCache,
 	// risc-box patch: superblock cache (see BlockOp/BlockHead above).
@@ -1011,11 +1015,124 @@ impl Cpu {
 		cpu.tick_interval = self.tick_interval;
 		cpu.x[0xa] = hart as i64;
 		cpu.csr[CSR_MHARTID_ADDRESS as usize] = hart as u64;
+		cpu.smp = true;
 		cpu
 	}
 
 	pub fn hart(&self) -> usize {
 		self.mmu.hart()
+	}
+
+	/// risc-box patch (SMP): this machine has other harts (AMO/LR/SC become host atomics).
+	pub fn set_smp(&mut self, on: bool) {
+		self.smp = on;
+		#[cfg(feature = "jit")]
+		if on {
+			::jit::SMP_ATOMICS.store(true, std::sync::atomic::Ordering::Relaxed);
+		}
+	}
+
+	/// risc-box patch (SMP): AMO*, LR and SC (major opcode 0x2f) as host atomics on the guest's RAM, so they
+	/// stay atomic while other harts run on other threads. SC succeeds when the reserved address still holds
+	/// the value LR read (a compare-and-swap; ABA passes, as on other emulators). A device address falls back
+	/// to the instruction table's plain load and store.
+	#[cold]
+	#[inline(never)]
+	fn exec_atomic(&mut self, word: u32, address: u64, index: usize) -> Result<(), Trap> {
+		use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering::SeqCst};
+		let f = parse_format_r(word);
+		let funct5 = word >> 27;
+		let dw = (word >> 12) & 7 == 3;
+		let width = if dw { 8 } else { 4 };
+		let addr = self.x[f.rs1] as u64;
+		let src = self.x[f.rs2] as u64;
+		match funct5 {
+			0b00010 => {
+				// LR: an ordinary (load-faulting) load that also remembers what it saw
+				let v = match dw {
+					true => self.mmu.load_doubleword(addr)?,
+					false => self.mmu.load_word(addr)? as u64
+				};
+				self.reservation = addr;
+				self.reservation_val = v;
+				self.is_reservation_set = true;
+				self.x[f.rd] = if dw { v as i64 } else { v as u32 as i32 as i64 };
+			},
+			0b00011 => {
+				let held = self.is_reservation_set && self.reservation == addr;
+				self.is_reservation_set = false;
+				let ok = match held {
+					false => false,
+					true => match self.mmu.atomic_ptr(addr, width)? {
+						Some(p) if (p as usize) & (width as usize - 1) == 0 => unsafe {
+							match dw {
+								true => (*(p as *const AtomicU64)).compare_exchange(self.reservation_val, src, SeqCst, SeqCst).is_ok(),
+								false => (*(p as *const AtomicU32)).compare_exchange(self.reservation_val as u32, src as u32, SeqCst, SeqCst).is_ok()
+							}
+						},
+						_ => return (INSTRUCTIONS[index].operation)(self, word, address).map(|_| self.x[0] = 0)
+					}
+				};
+				self.x[f.rd] = (!ok) as i64;
+			},
+			_ => {
+				let p = match self.mmu.atomic_ptr(addr, width)? {
+					Some(p) if (p as usize) & (width as usize - 1) == 0 => p,
+					_ => return (INSTRUCTIONS[index].operation)(self, word, address).map(|_| self.x[0] = 0)
+				};
+				let old: i64 = unsafe {
+					match dw {
+						true => {
+							let (a, s) = (&*(p as *const AtomicU64), src);
+							let (ai, si) = (&*(p as *const AtomicI64), src as i64);
+							let r: u64 = match funct5 {
+								0b00001 => a.swap(s, SeqCst),
+								0b00000 => a.fetch_add(s, SeqCst),
+								0b00100 => a.fetch_xor(s, SeqCst),
+								0b01100 => a.fetch_and(s, SeqCst),
+								0b01000 => a.fetch_or(s, SeqCst),
+								0b10000 => ai.fetch_min(si, SeqCst) as u64,
+								0b10100 => ai.fetch_max(si, SeqCst) as u64,
+								0b11000 => a.fetch_min(s, SeqCst),
+								0b11100 => a.fetch_max(s, SeqCst),
+								_ => return Err(Trap { trap_type: TrapType::IllegalInstruction, value: word as u64 })
+							};
+							r as i64
+						},
+						false => {
+							let (a, s) = (&*(p as *const AtomicU32), src as u32);
+							let (ai, si) = (&*(p as *const AtomicI32), src as i32);
+							let r: u32 = match funct5 {
+								0b00001 => a.swap(s, SeqCst),
+								0b00000 => a.fetch_add(s, SeqCst),
+								0b00100 => a.fetch_xor(s, SeqCst),
+								0b01100 => a.fetch_and(s, SeqCst),
+								0b01000 => a.fetch_or(s, SeqCst),
+								0b10000 => ai.fetch_min(si, SeqCst) as u32,
+								0b10100 => ai.fetch_max(si, SeqCst) as u32,
+								0b11000 => a.fetch_min(s, SeqCst),
+								0b11100 => a.fetch_max(s, SeqCst),
+								_ => return Err(Trap { trap_type: TrapType::IllegalInstruction, value: word as u64 })
+							};
+							r as i32 as i64
+						}
+					}
+				};
+				self.x[f.rd] = old;
+			}
+		}
+		self.x[0] = 0;
+		Ok(())
+	}
+
+	/// risc-box patch (SMP): on its own thread a hart keeps its reservation across slices - SC checks the
+	/// value itself (exec_atomic), so nothing is stale.
+	#[inline(always)]
+	pub fn drop_reservation_if_stale(&mut self) {}
+
+	/// risc-box patch (SMP): parked in WFI with nothing enabled pending.
+	pub fn is_parked(&self) -> bool {
+		self.wfi && (self.read_csr_raw(CSR_MIE_ADDRESS) & self.read_csr_raw(CSR_MIP_ADDRESS)) == 0
 	}
 
 	/// risc-box patch (SMP): forget the LR reservation (another hart is about to run, or just ran).
@@ -1042,6 +1159,8 @@ impl Cpu {
 			mmu: mmu,
 			reservation: 0,
 			is_reservation_set: false,
+			reservation_val: 0,
+			smp: false,
 			_dump_flag: false,
 			decode_cache: DecodeCache::new(),
 			// risc-box patch: block cache starts empty (tag 0 = invalid)
@@ -2731,6 +2850,12 @@ impl Cpu {
 			}
 		};
 
+		if self.smp && (word & 0x7f) == 0x2f {
+			return self.exec_atomic(word, instruction_address, index);
+		}
+		if self.smp && (word & 0x7f) == 0x0f {
+			std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+		}
 		let result = (INSTRUCTIONS[index].operation)(self, word, instruction_address);
 		self.x[0] = 0; // hardwired zero
 		result
@@ -3042,6 +3167,12 @@ impl Cpu {
 			// the table dispatch (not a panic — a guest must never crash the
 			// host) keeps it safe anyway.
 			_ => {
+				if self.smp && (e.word & 0x7f) == 0x2f {
+					return self.exec_atomic(e.word, address, (e.data & !ICACHE_LEN4) as usize);
+				}
+				if self.smp && (e.word & 0x7f) == 0x0f {
+					std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+				}
 				return (INSTRUCTIONS[(e.data & !ICACHE_LEN4) as usize].operation)(
 					self, e.word, address);
 			}

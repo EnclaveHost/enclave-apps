@@ -87,6 +87,7 @@ fn main() {
     let mut harts: usize = 1;
     let mut dtb_file: Option<String> = None;
     let mut hart_slice: u64 = 0;
+    let mut threads = false;
     // --snapshot-on MARKER:FILE / --restore FILE: exercise the machine
     // snapshot natively (see src/snapshot.rs). The identity binding the
     // delta to its base is just the image sizes here; the app hashes them.
@@ -156,6 +157,7 @@ fn main() {
                 i += 1;
                 hart_slice = args[i].replace('_', "").parse().expect("--hart-slice N");
             }
+            "--threads" => threads = true,
             "--dtb" => {
                 i += 1;
                 dtb_file = Some(args[i].clone());
@@ -419,6 +421,10 @@ fn main() {
     if aot {
         eprintln!("--aot needs a build with --features aot");
         std::process::exit(2);
+    }
+    if threads && harts > 1 {
+        let n = emu.start_threads(&mut |f| std::thread::Builder::new().spawn(f).is_ok());
+        eprintln!("SMP: {} hart threads", n);
     }
     #[cfg(feature = "tier2")]
     if let Some(d) = tier2_dump.as_ref() {
@@ -929,6 +935,12 @@ fn main() {
                 rm[2], rm[1], rm[0],
                 br[2], br[1], br[0]
             );
+            if emu.harts() > 1 {
+                let hs: Vec<String> = emu.hart_states().iter().enumerate()
+                    .map(|(h, (pc, mode, wfi, r))| format!("h{}:{:x}/{}{} {}M", h, pc, mode, if *wfi { "w" } else { "" }, r / 1_000_000))
+                    .collect();
+                eprintln!("          harts {}", hs.join("  "));
+            }
             window = Instant::now();
             window_insns = 0;
         }

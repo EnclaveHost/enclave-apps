@@ -122,12 +122,13 @@ impl Uart {
 		// one (see Plic::tick). THRE stays a one-shot.
 		let rx_level = (self.ier & IER_RXINT_BIT) != 0 && self.rbr != 0;
 		let _ = rx_ip;
-		if self.thre_ip || rx_level {
-			self.interrupting = true;
-			self.thre_ip = false;
-		} else {
-			self.interrupting = false;
-		}
+		// risc-box patch (SMP): THRE is level-triggered too, as on a 16550: pending from the moment THR empties
+		// (or THRI is enabled while it is empty) until the guest reads IIR reporting it or writes THR. Delivered
+		// as a one-service pulse it was lost whenever the PLIC still held the line from a claim not yet
+		// completed, and the driver's transmit then waited for the next receive interrupt to restart - rare on
+		// one hart, routine with harts on threads (output stuck until the next keystroke).
+		let thre_level = self.thre_ip && (self.ier & IER_THREINT_BIT) != 0;
+		self.interrupting = thre_level || rx_level;
 	}
 
 	/// Indicates whether an interrupt happens in the current cycle.
@@ -145,7 +146,7 @@ impl Uart {
 
 	fn update_iir(&mut self) {
 		let rx_ip = (self.ier & IER_RXINT_BIT) != 0 && self.rbr != 0;
-		let thre_ip = (self.ier & IER_THREINT_BIT) != 0 && self.thr == 0;
+		let thre_ip = (self.ier & IER_THREINT_BIT) != 0 && self.thr == 0 && self.thre_ip;
 
 		// Which should be prioritized RX interrupt or THRE interrupt?
 		if rx_ip {
@@ -178,7 +179,15 @@ impl Uart {
 				true => self.ier,
 				false => 0 // @TODO: Implement properly
 			},
-			0x10000002 => self.iir,
+			0x10000002 => {
+				// reading IIR while it reports THRE clears that interrupt (16550)
+				let iir = self.iir;
+				if iir == IIR_THR_EMPTY {
+					self.thre_ip = false;
+					self.update_iir();
+				}
+				iir
+			},
 			0x10000003 => self.lcr,
 			0x10000004 => self.mcr,
 			0x10000005 => self.lsr,
@@ -205,10 +214,9 @@ impl Uart {
 					self.terminal.put_byte(value);
 					self.thr = 0;
 					self.lsr |= LSR_TX_IDLE;
+					// THR is empty again at once: THRE pending (an interrupt only while THRI is enabled)
+					self.thre_ip = true;
 					self.update_iir();
-					if (self.ier & IER_THREINT_BIT) != 0 {
-						self.thre_ip = true;
-					}
 				},
 				false => {} // @TODO: Implement properly
 			},
@@ -220,6 +228,10 @@ impl Uart {
 						(value & IER_THREINT_BIT) != 0 &&
 						self.thr == 0 {
 						self.thre_ip = true;
+					}
+					if (value & IER_THREINT_BIT) == 0 {
+						// a pending THRE does not outlive THRI being turned off
+						self.thre_ip = false;
 					}
 					self.ier = value;
 					self.update_iir();

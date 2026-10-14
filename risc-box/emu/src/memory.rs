@@ -316,6 +316,14 @@ impl Memory {
 	/// owned chunk. Out of line so the write fast paths stay small.
 	#[inline(never)]
 	fn materialize(&mut self, ci: usize) {
+		// risc-box patch (SMP): harts on other threads may take a chunk's first write at once; one of them
+		// copies it, the rest find it owned. The pointer tables are published before the unlock (a release),
+		// so the write that follows, and any other hart's later read, go to the owned chunk.
+		static MATERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+		let _held = MATERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
+		if !unsafe { std::ptr::read_volatile(&self.wr[ci]) }.is_null() {
+			return;
+		}
 		let mut fresh = zero_box();
 		if let Slot::Shared(a) = &self.slots[ci] {
 			fresh.copy_from_slice(&a[..]);
@@ -336,6 +344,17 @@ impl Memory {
 		// SAFETY: p points at a live CHUNK-byte allocation (see `rd`) and
 		// the caller checked (a & (CHUNK-1)) + N <= CHUNK.
 		unsafe { std::ptr::read_unaligned(p.add(a & (CHUNK - 1)) as *const [u8; N]) }
+	}
+
+	/// risc-box patch (SMP): host address of byte `a` for an atomic read-modify-write, its chunk made owned
+	/// (writable) first. The caller keeps the access inside the chunk (an aligned AMO always is).
+	pub fn rmw_ptr(&mut self, a: usize) -> *mut u8 {
+		let ci = a >> CHUNK_SHIFT;
+		if self.wr[ci].is_null() {
+			self.materialize(ci);
+		}
+		// SAFETY: wr[ci] is this machine's own live CHUNK-byte allocation and a & (CHUNK-1) < CHUNK
+		unsafe { self.wr[ci].add(a & (CHUNK - 1)) }
 	}
 
 	/// Write `N` bytes at `a` (must not cross a chunk) into an owned chunk.

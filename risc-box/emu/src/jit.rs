@@ -999,7 +999,15 @@ enum CsrOp {
 	C,
 }
 
+/// risc-box patch (SMP): set when the machine has more than one hart. AMO*, LR/SC and FENCE then stay with the
+/// interpreter, which runs them as host atomics and fences (Cpu::exec_atomic); compiled code would run them
+/// as plain loads and stores.
+pub static SMP_ATOMICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn table_op(op: &BlockOp) -> Option<TableOp> {
+	if SMP_ATOMICS.load(std::sync::atomic::Ordering::Relaxed) && matches!(op.word & 0x7f, 0x2f | 0x0f) {
+		return None;
+	}
 	use self::AmoOp as A;
 	use self::FOp as F;
 	let csr = ((op.word >> 20) & 0xfff) as u16;
