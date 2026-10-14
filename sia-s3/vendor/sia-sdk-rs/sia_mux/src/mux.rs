@@ -179,7 +179,26 @@ pub struct Mux {
     tasks: Option<TaskHandles>,
 }
 
+/// A Mux dropped without `close()` must not keep its connection: the read and write loops own the transport halves, so
+/// without this they ran on and held the TCP connection (and, inside an Enclave Shield partition, one of the egress
+/// front's 64 slots) for as long as the peer kept it open - Sia hosts keep idle connections indefinitely. sia-s3's
+/// `?sia-diag` leaked one per host per run and starved its own egress (2026-10-14).
+impl Drop for Mux {
+    fn drop(&mut self) {
+        if let Some(t) = self.tasks.take() {
+            set_fatal_error(&self.state, MuxError::ClosedConn);
+            t.write_handle.abort();
+            t.read_handle.abort();
+        }
+    }
+}
+
 impl Mux {
+    /// Streams currently open on this connection (a pool may close it only when there are none).
+    pub fn open_streams(&self) -> usize {
+        self.state.lock().unwrap().streams.len()
+    }
+
     /// Wait for and return the next peer-initiated stream.
     pub async fn accept_stream(&self) -> Result<Stream, MuxError> {
         // Clone the Arc once so we can call notified() without holding the lock.

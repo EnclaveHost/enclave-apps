@@ -53,13 +53,14 @@ struct Dial {
 }
 
 enum ConnEntry {
-    Open(Arc<Mux>),
+    Open(Arc<Mux>, Instant),
     Dialing(Weak<Dial>),
 }
 
 #[derive(Clone)]
 pub struct Client {
     conns: Arc<Mutex<HashMap<PublicKey, ConnEntry>>>,
+    sweeping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for Client {
@@ -72,6 +73,7 @@ impl Client {
     pub fn new() -> Self {
         Self {
             conns: Arc::new(Mutex::new(HashMap::new())),
+            sweeping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -137,6 +139,7 @@ impl Client {
             addresses: host.addresses.clone(),
         };
         let conns = self.conns.clone();
+        self.start_sweeper();
         let (tx, outcome) = watch::channel(None);
         let task = tokio::spawn(async move {
             let result = async {
@@ -159,7 +162,7 @@ impl Client {
                 conns
                     .lock()
                     .unwrap()
-                    .insert(host.public_key, ConnEntry::Open(mux.clone()));
+                    .insert(host.public_key, ConnEntry::Open(mux.clone(), Instant::now()));
             }
             let _ = tx.send(Some(result.map_err(|e| e.to_string())));
         });
@@ -169,14 +172,51 @@ impl Client {
         })
     }
 
+    /// Runs `evict_idle` every 15 s while this pool exists, so idle connections are released even when nothing new is
+    /// dialed (an indexer call needs a free egress slot too). Started from the first dial, which runs on the runtime.
+    fn start_sweeper(&self) {
+        if self.sweeping.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.conns);
+        tokio::spawn(async move {
+            loop {
+                crate::time::sleep(Duration::from_secs(15)).await;
+                let Some(conns) = weak.upgrade() else { break };
+                Self::evict_idle(&mut conns.lock().unwrap());
+            }
+        });
+    }
+
+    /// Closes pooled connections that carry no stream and have not been used for `SIA_CONN_IDLE_SECS` (60 s on wasi,
+    /// 0 = never elsewhere). Inside an Enclave Shield partition every open connection holds one of the egress front's
+    /// 64 slots, and a pool that kept one per host for ever (Sia hosts never close idle connections) left nothing for
+    /// the indexer or the next upload.
+    fn evict_idle(conns: &mut HashMap<PublicKey, ConnEntry>) {
+        let secs: u64 = std::env::var("SIA_CONN_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(if cfg!(target_os = "wasi") { 60 } else { 0 });
+        if secs == 0 {
+            return;
+        }
+        let limit = Duration::from_secs(secs);
+        conns.retain(|_, e| match e {
+            ConnEntry::Open(mux, used) => used.elapsed() < limit || mux.open_streams() > 0,
+            ConnEntry::Dialing(_) => true,
+        });
+    }
+
     /// Opens a stream on the host's connection, dialing one if none is open.
     /// Concurrent callers share one dial, which runs until it completes or
     /// none of them waits on it any more.
     async fn host_stream(&self, host: &HostEndpoint) -> Result<Stream, TransportError> {
         let dial = {
             let mut conns = self.conns.lock().unwrap();
-            match conns.get(&host.public_key) {
-                Some(ConnEntry::Open(mux)) => {
+            Self::evict_idle(&mut conns);
+            match conns.get_mut(&host.public_key) {
+                Some(ConnEntry::Open(mux, used)) => {
+                    *used = Instant::now();
                     return mux.dial_stream().map_err(|e| {
                         conns.remove(&host.public_key);
                         TransportError::Transport(ConnectError::from(e).to_string())
