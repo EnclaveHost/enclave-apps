@@ -40,10 +40,11 @@ No blocker on the inbound side: on the NucBox the SigV4 headers arrive intact (s
 - Hosts (`/enclaves`): **nucbox-k11-4** (hyperv-partition-per-app, secrets true, cpuShareFree 0.35, RAM free 39 GB,
   slots 0 free); **metal0** (cpuShareFree 0, `secrets: false`: cannot run either app); **pixel10-pvm-cpu** (maxAppMemMb 512,
   ~1 GFLOPS: excluded by memMb ≥ 1024).
-- Artifact: `target/wasm32-wasip2/release/sia-s3.wasm`, 3,224,380 B, sha256 `ea30e8bb6a9b542a…90e6aa6d`, a `wasi:cli/run`
-  component (port mode, own listener). No source file is newer than it. Offline CID
-  (`ipfs add -Q --only-hash --cid-version=1 --chunker=size-262144`) = **`bafybeic5rstbmkah5lw5dglsyk7ujvb2g7km4uvo55ckil3izaxyzs3yda`**
-  (not yet on ipfs.enclave.host: 404). A rebuild changes it; recompute if you rebuild.
+- Artifact: `target/wasm32-wasip2/release/sia-s3.wasm`, a `wasi:cli/run` component (port mode, own listener). **The branch
+  is still moving** (06636a7 landed while this was written and the wasm was rebuilt: 3,228,646 B, sha256 `9dbc5f11…689e0f`,
+  CID `bafybeie6bbi7rlgwez7fdpndx5lhlqqfpxxlyyc5lvbnt4umrwo2b5g65e`). Publish from a clean commit and recompute right
+  before step 1: `CID=$(ipfs add -Q --only-hash --cid-version=1 --chunker=size-262144 <wasm>)` (the gateway recomputes the
+  same CID; memory enclave-catalog-wasm-unpinned). Commands below use `$WASM` and `$CID`.
 - Indexer: `https://sia.enclave.host` (nan Caddy → indexd 127.0.0.1:9982). App key seed `nan:/etc/indexd/apps/sia-s3.seed`
   (root 0600, 64 hex chars + newline), already registered on indexd.
 - `UPLOAD_KEY` lives in `nan:/etc/nan-relay/api-relay.env` (one `UPLOAD_KEY=` line), consumed by `enclave-api-relay.service`.
@@ -72,10 +73,11 @@ const up = await fetch("https://ipfs.enclave.host/add-wasm", { method: "POST", b
   "content-type": "application/wasm", "x-upload-address": t.address, "x-upload-expiry": String(expiry), "x-upload-token": t.token } });
 console.log(up.status, await up.text());
 EOF
-cp /tmp/pin-sia-s3.mjs ./pin-sia-s3.mjs && node pin-sia-s3.mjs \
-  /home/steven/Projects/enclave-apps-wt/sia-s3/sia-s3/target/wasm32-wasip2/release/sia-s3.wasm && rm pin-sia-s3.mjs
-# expect 200 {"cid":"bafybeic5rstbmkah5lw5dglsyk7ujvb2g7km4uvo55ckil3izaxyzs3yda"}; then:
-curl -s -o /dev/null -w '%{http_code}\n' -r 0-99 https://ipfs.enclave.host/ipfs/bafybeic5rstbmkah5lw5dglsyk7ujvb2g7km4uvo55ckil3izaxyzs3yda  # 206
+WASM=/home/steven/Projects/enclave-apps-wt/sia-s3/sia-s3/target/wasm32-wasip2/release/sia-s3.wasm
+CID=$(ipfs add -Q --only-hash --cid-version=1 --chunker=size-262144 "$WASM")
+cp /tmp/pin-sia-s3.mjs ./pin-sia-s3.mjs && node pin-sia-s3.mjs "$WASM" && rm pin-sia-s3.mjs
+# expect 200 {"cid":"<$CID>"}; then:
+curl -s -o /dev/null -w '%{http_code}\n' -r 0-99 https://ipfs.enclave.host/ipfs/$CID  # 206
 ```
 
 The pin lands in the R2 bucket via the live adapter. Once the version is approved, nan's hourly
@@ -112,7 +114,7 @@ Build and simulate (simulation from 0x0b2d **passed** on 2026-10-14 with an equi
 CFG='{"indexer":"https://sia.enclave.host","appKey":"$SIA_APP_KEY","region":"auto","buckets":["ipfs","s3check"],"credentials":[{"accessKeyId":"$S3_ACCESS_KEY_ID","secretAccessKey":"$S3_SECRET_ACCESS_KEY"}],"egress":"public-web","wasi":"0.2"}'
 DATA=$(cast calldata "publishVersion(string,string,string,string,string,uint32[4],string,string,uint256)" \
   sia-s3 "Sia S3" "S3 endpoint backed by Sia: objects are encrypted and erasure-coded inside the enclave" 0.1.0 \
-  bafybeic5rstbmkah5lw5dglsyk7ujvb2g7km4uvo55ckil3izaxyzs3yda "[0,0,2048,62]" "http:8000" "$CFG" 0)
+  "$CID" "[0,0,2048,62]" "http:8000" "$CFG" 0)
 cast call --from 0x0b2d009c0c9Af05b12100D77F3c815fea822eE61 0x18419CA2b502D423A8de6269AEeE171a378626e3 "$DATA" --rpc-url https://base-rpc.publicnode.com
 ```
 
