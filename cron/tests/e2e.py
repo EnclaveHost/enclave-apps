@@ -167,28 +167,30 @@ def main():
             assert pr.poll() is None and len(calls)==4
             fail_put=False;expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
             assert pr.poll() is None and len(calls)==4
-            # The storage accepted a run claim but the reply was lost. Recover from
-            # durable state without replaying an effect whose outcome is unknown.
+            # The storage accepted a run claim but the reply was lost. The scheduler
+            # repeats the same conditional write, meets the conflict its own write
+            # caused, reads the object back, finds exactly its claim, and carries on:
+            # no fence, and the effect is dispatched once (it was never dispatched
+            # before), not replayed.
             lose_put_reply=True
-            assert req('/api/schedule_run_now',{'id':j['id'],'request_key':'lost-reply'})[0]==503
-            assert pr.poll() is None and len(calls)==4
+            st,body=req('/api/schedule_run_now',{'id':j['id'],'request_key':'lost-reply'})
+            assert st==200 and pr.poll() is None,(st,body)
             claimed=opened()['runs'][-1]['id']
-            expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
-            recovered=next(r for r in call('schedule_get',{'id':j['id']})['runs'] if r['id']==claimed)
-            assert recovered['status']=='interrupted' and len(calls)==4
+            wait_for(lambda:any(r['id']==claimed and r['status']=='succeeded' for r in call('schedule_get',{'id':j['id']})['runs']))
+            assert len(calls)==5 and req('/ping')[0]==200
             assert call('schedule_run_now',{'id':j['id'],'request_key':'lost-reply'})['run']['id']==claimed
-            assert len(calls)==4
-            # A recovered ownership session can dispatch new work exactly once.
+            assert len(calls)==5
+            # New work still dispatches exactly once.
             rr=call('schedule_run_now',{'id':j['id'],'request_key':'after-recovery'})['run']
             wait_for(lambda:any(r['id']==rr['id'] and r['status']=='succeeded' for r in call('schedule_get',{'id':j['id']})['runs']))
-            assert len(calls)==5
+            assert len(calls)==6
             # Corrupt durable state stays unavailable and is never replaced.
             pr.kill();pr.wait()
             with lock:blob=blob[:-1]+bytes([blob[-1]^1]);corrupted=blob
             corrupt=launch();wait_for(lambda:req('/ping')[0]==503)
             time.sleep(2)
-            assert corrupt.poll() is None and blob==corrupted and len(calls)==5
-            print(json.dumps({'mode':'native' if args.native else 'wasm32-wasip2','passed':['SigV4 storage signing','encrypted durable writes','HTTP webhook dispatch','CAS lease exclusivity','per-user API/target isolation','autonomous one-time dispatch','authenticated Eyesoff callback','MCP tools','same-second idempotent manual run','restart preserves jobs/results','skip missed after crash','storage failure fences effects','interrupted delivery is not replayed','live CAS conflict fences effects','corrupt state fails closed','storage recovery preserves process/listener','ambiguous accepted write never replays','new work succeeds after reacquisition'],'callbacks':len(calls)}))
+            assert corrupt.poll() is None and blob==corrupted and len(calls)==6
+            print(json.dumps({'mode':'native' if args.native else 'wasm32-wasip2','passed':['SigV4 storage signing','encrypted durable writes','HTTP webhook dispatch','CAS lease exclusivity','per-user API/target isolation','autonomous one-time dispatch','authenticated Eyesoff callback','MCP tools','same-second idempotent manual run','restart preserves jobs/results','skip missed after crash','storage failure fences effects','interrupted delivery is not replayed','live CAS conflict fences effects','corrupt state fails closed','storage recovery preserves process/listener','ambiguous accepted write is confirmed by read-back, never replayed','new work succeeds after reacquisition'],'callbacks':len(calls)}))
         finally:
             for pr in procs:
                 if pr.poll() is None:pr.kill();pr.wait()
