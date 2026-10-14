@@ -290,7 +290,7 @@ pub fn run(
     current_session: impl Fn() -> Option<Arc<Session>> + Send + Sync + 'static,
     on_announce: impl Fn(Arc<Session>) + Send + Sync + 'static,
 ) {
-    let listener = match TcpListener::bind(("0.0.0.0", crate::session::PORT_RTSP)) {
+    let listener = match TcpListener::bind((crate::bind_addr(), crate::session::PORT_RTSP)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[rtsp] failed to bind :{}: {e}", crate::session::PORT_RTSP);

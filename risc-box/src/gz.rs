@@ -68,8 +68,8 @@ pub fn gzip(src: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Inflate a gzip member, returning the original bytes.
-pub fn gunzip(src: &[u8]) -> Result<Vec<u8>, String> {
+/// The raw deflate stream inside a gzip member, and the trailer's uncompressed length.
+fn member(src: &[u8]) -> Result<(&[u8], usize), String> {
     if src.len() < 18 {
         return Err(format!("gzip: too short ({} bytes)", src.len()));
     }
@@ -128,7 +128,12 @@ pub fn gunzip(src: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let deflate = &src[p..t];
+    Ok((&src[p..t], isize_field))
+}
+
+/// Inflate a gzip member, returning the original bytes.
+pub fn gunzip(src: &[u8]) -> Result<Vec<u8>, String> {
+    let (deflate, isize_field) = member(src)?;
     let mut out = vec![0u8; isize_field];
     let written = miniz_oxide::inflate::decompress_slice_iter_to_slice(
         &mut out,
@@ -150,6 +155,48 @@ pub fn gunzip(src: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Inflate a gzip member piece by piece: `sink` gets each run of output as it is produced, with how much of the
+/// compressed input has been consumed so far. Nothing the size of the whole image is ever allocated, which is
+/// what lets the disk be packed (riscv_emu_rust::disk_image) while it inflates. Returns the bytes produced.
+pub fn gunzip_stream(src: &[u8], sink: &mut dyn FnMut(&[u8], usize)) -> Result<usize, String> {
+    use miniz_oxide::inflate::stream::{inflate, InflateState};
+    use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
+    let (deflate, isize_field) = member(src)?;
+    let mut state = InflateState::new_boxed(DataFormat::Raw);
+    let mut out = vec![0u8; 256 * 1024];
+    let mut input = deflate;
+    let mut total = 0usize;
+    loop {
+        let r = inflate(&mut state, input, &mut out, MZFlush::None);
+        input = &input[r.bytes_consumed..];
+        if r.bytes_written > 0 {
+            total += r.bytes_written;
+            if total > isize_field {
+                return Err(format!("gzip: inflated past the trailer's {isize_field} bytes"));
+            }
+            sink(&out[..r.bytes_written], deflate.len() - input.len());
+        }
+        match r.status {
+            Ok(MZStatus::StreamEnd) => break,
+            Ok(_) if r.bytes_consumed == 0 && r.bytes_written == 0 => {
+                return Err("gzip: inflate made no progress (truncated download?)".into());
+            }
+            Ok(_) => {}
+            Err(MZError::Buf) if r.bytes_written == 0 => {
+                return Err(format!("gzip: deflate stream ended early at {total} bytes (truncated download?)"));
+            }
+            Err(MZError::Buf) => {}
+            Err(e) => return Err(format!("gzip: inflate failed ({e:?})")),
+        }
+    }
+    if total != isize_field {
+        return Err(format!(
+            "gzip: inflated {total} bytes, trailer promised {isize_field} (truncated download?)"
+        ));
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +213,23 @@ mod tests {
             v[i] = x as u8;
         }
         v
+    }
+
+    #[test]
+    fn stream_matches_one_shot() {
+        for n in [0usize, 1, 4096, 1 << 20, 3 << 20] {
+            let src = diskish(n);
+            let gz = gzip(&src);
+            let mut back = Vec::new();
+            let got = gunzip_stream(&gz, &mut |piece, _| back.extend_from_slice(piece)).expect("stream own output");
+            assert_eq!(got, n);
+            assert_eq!(back, src);
+        }
+        let gz = gzip(&diskish(1 << 20));
+        let cut = &gz[..gz.len() / 2];
+        let mut bad = cut.to_vec();
+        bad.extend_from_slice(&gz[gz.len() - 8..]); // a truncated body behind a valid trailer
+        assert!(gunzip_stream(&bad, &mut |_, _| {}).is_err());
     }
 
     #[test]

@@ -231,7 +231,7 @@ fn read_request_path(stream: &mut impl Read) -> Option<String> {
 
 /// The plain-HTTP listener: discovery and pairing only.
 pub fn run_http(srv: Arc<Server>) {
-    let listener = match TcpListener::bind(("0.0.0.0", PORT_HTTP)) {
+    let listener = match TcpListener::bind((crate::bind_addr(), PORT_HTTP)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[http] failed to bind :{PORT_HTTP}: {e}");
@@ -279,7 +279,7 @@ pub fn run_https(srv: Arc<Server>) {
     );
     let acceptor = Arc::new(builder.build());
 
-    let listener = match TcpListener::bind(("0.0.0.0", PORT_HTTPS)) {
+    let listener = match TcpListener::bind((crate::bind_addr(), PORT_HTTPS)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[https] failed to bind :{PORT_HTTPS}: {e}");

@@ -63,8 +63,12 @@
 //!   GET  /display     Server-Sent Events: the main machine's screen as
 //!                     deflated dirty bands (see display.rs)
 //!   GET  /fb.png      the current frame as one PNG snapshot (any machine)
+//!   POST /computer    one model-driven action (click at a pixel, type text,
+//!                     a key chord, scroll, drag) answered with the screen it
+//!                     left behind, once the picture settles (computer.rs)
 //!   GET  /ping        liveness
 
+mod computer;
 mod display;
 mod egress;
 mod gamestream;
@@ -82,6 +86,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use computer::{Ev, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use display::Display;
 use httpd::{form_get, json, Request, Response, Server};
 use net::{ForwardCfg, HostNet, NetStack};
@@ -246,6 +251,9 @@ pub struct Config {
     // a video player, a benchmark inside the guest — needs this to be true or
     // it runs at (emulated MIPS / 10) times speed.
     realtime: bool,
+    // `harts`: guest CPUs (1, 2 or 4). Harts 1.. run on their own SET threads, so more than one is worth it
+    // only on a host that gives this app more than one core. RISC_HARTS overrides it (experiments).
+    harts: usize,
     api_key: Option<String>,
     // POST /exec: run a shell command on the guest's serial console and hand
     // back its stdout and exit code (see `exec`). It is the app-to-app control
@@ -404,6 +412,15 @@ fn load_config() -> Config {
             .get("realtime")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        harts: std::env::var("RISC_HARTS")
+            .ok()
+            .and_then(|x| x.parse::<u64>().ok())
+            .or_else(|| v.get("harts").and_then(|x| x.as_u64()))
+            .map(|n| match n {
+                2 | 4 => n as usize,
+                _ => 1,
+            })
+            .unwrap_or(1),
         // Optional shared secret. When set (directly or via a $VAR secret), the
         // control + observation endpoints require it; see `authorized`. Unset
         // means the deployment is open, which is only safe when it is private.
@@ -658,7 +675,8 @@ struct Images {
     /// download and no inflate. The compressed form is not kept — the
     /// expanded one is what every start needs, and the pair together were
     /// more than a second machine's worth of address space.
-    disk: Arc<Vec<u8>>,
+    /// held compressed (riscv_emu_rust::disk_image): `len()` is the guest's view, `stored_bytes()` the memory
+    disk: Arc<riscv_emu_rust::disk_image::DiskImage>,
     fs_bytes: usize, // as fetched (gzipped when the key says so)
     fs_gzipped: bool,
     dtb: Option<Vec<u8>>,
@@ -683,13 +701,18 @@ impl Images {
     /// a 1792 MiB main machine.
     fn identity(&self, cfg: &Config) -> String {
         format!(
-            "kernel:{} fs:{} dtb:{} fb:{}x{} realtime:{}",
+            "kernel:{} fs:{} dtb:{} fb:{}x{} realtime:{}{}",
             self.kernel_sha256,
             self.fs_sha256,
             self.dtb.as_ref().map(|d| sha256_hex(d)).unwrap_or_else(|| "-".into()),
             cfg.fb_w,
             cfg.fb_h,
-            cfg.realtime
+            cfg.realtime,
+            // a one-hart machine keeps the identity every existing snapshot carries
+            match cfg.harts {
+                1 => String::new(),
+                n => format!(" harts:{n}"),
+            }
         )
     }
 }
@@ -732,6 +755,10 @@ struct Machine {
     fps_bytes: u64,
     fps_at: Instant,
     input_boost: u64, // turns to force full tick batches after POST /input
+    /// where the pointer was last put (raw axis units), for reporting it back
+    /// exactly: the display's cursor plane sits at the pointer minus the
+    /// cursor image's hotspot, which is a few pixels off for an I-beam
+    pointer: Option<(u32, u32)>,
     per_ms: f64,      // measured instructions per host millisecond (0 = not yet)
     /// Consecutive turns the boost has been held, and the cooldown that follows
     /// when it has been held too long. Input arriving faster than the boost
@@ -769,6 +796,7 @@ impl Machine {
             fps_bytes: 0,
             fps_at: Instant::now(),
             input_boost: 0,
+            pointer: None,
             per_ms: 0.0,
             boost_run: 0,
             boost_hold: 0,
@@ -929,6 +957,9 @@ struct App {
     // instant it exists instead of on the client's next poll — over a real
     // link that is the whole poll round trip saved, every frame.
     pull_waiters: Vec<(u64, u64, Instant)>, // (hold ticket, since, deadline)
+    /// POST /computer calls held while their action plays out on the guest,
+    /// each answered once its screen settles or its deadline passes.
+    computer_waiters: Vec<ComputerWait>,
     /// The in-guest GameStream host. Built once the machine is running (it
     /// needs an RSA identity, which costs seconds, and there is nothing to
     /// stream before then). `None` when the ports could not be bound -- the
@@ -950,16 +981,26 @@ struct App {
     video_cost: Duration,
     // Boot-fetch retry: an image fetch can fail transiently — the platform's
     // egress front may reject the app's very first connect while the
-    // deployment record is still mid-provision, S3 can blip — so a failed
-    // start re-queues itself a few times before staying in Error. A fresh
-    // operator /start resets the budget.
+    // deployment record is still mid-provision, S3 can blip, an egress
+    // circuit can drop mid-download — so a failed start re-queues itself,
+    // backing off to boot_retry_delay's ceiling, and never gives up. A
+    // fresh operator /start resets the backoff.
     retry: usize,
     retry_at: Option<Instant>,
     retry_start: Option<Start>,
 }
 
-/// Backoff for the boot-fetch retries (seconds between attempts).
-const BOOT_RETRY_DELAYS: [u64; 4] = [5, 15, 30, 60];
+/// Backoff for the boot-fetch retries (seconds between attempts). The last
+/// step repeats for as long as the fetch keeps failing: a fixed budget (it
+/// was 5+15+30+60 s) left e64f7cba in Error for good after one egress drop
+/// outlasted it, and every caller — the desktop, run_vm_command, /computer —
+/// got 409 "machine is not running" until someone sent /start by hand.
+const BOOT_RETRY_DELAYS: [u64; 6] = [5, 15, 30, 60, 120, 300];
+
+/// Seconds to wait before boot-fetch retry number `attempt` (0-based).
+fn boot_retry_delay(attempt: usize) -> u64 {
+    BOOT_RETRY_DELAYS[attempt.min(BOOT_RETRY_DELAYS.len() - 1)]
+}
 
 fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -996,7 +1037,7 @@ impl App {
         let cache = self
             .cache
             .as_ref()
-            .map(|c| c.disk.len() + c.kernel.len() + c.snap_stored.as_ref().map_or(0, |s| s.len()))
+            .map(|c| c.disk.stored_bytes() + c.kernel.len() + c.snap_stored.as_ref().map_or(0, |s| s.len()))
             .unwrap_or(0);
         machines + images + cache
     }
@@ -1052,11 +1093,12 @@ impl App {
                 .map(|s| format!("\"{}\"", httpd::json_escape(s)))
                 .unwrap_or_else(|| "null".into())
         };
+        let jit = jit_json(m.emu.as_ref());
         format!(
             "{{\"phase\":\"{}\",\"id\":\"{}\",\"origin\":\"{}\",\"title\":\"{}\",\"endpoint\":\"{}\",\"bucket\":\"{}\",\
              \"kernel\":\"{}\",\"fs\":\"{}\",\"saveKey\":{},\"readOnly\":{},\
              \"instret\":{},\"guestIdle\":{},\"steps\":{},\"mips\":{:.1},\"fps\":{:.1},\"sentFps\":{:.1},\"videoFps\":{:.1},\"videoMs\":{:.1},\"capMs\":{:.2},\"turnMaxMs\":{:.0},\"turnMax\":\"{}\",\"display\":{{\"width\":{},\"height\":{},\"realtime\":{}}},\
-             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{},\"instances\":{}{img}}}",
+             \"consoleBytes\":{},\"lastSave\":{},\"error\":{},\"net\":{},\"ramMiB\":{},\"cursor\":{},\"gpuDebug\":{},\"snapshot\":{},\"instances\":{}{img}{jit}}}",
             phase_name(m.phase),
             httpd::json_escape(&m.id),
             httpd::json_escape(&m.origin),
@@ -1215,9 +1257,14 @@ fn progress_logger(what: &str) -> impl FnMut(usize, usize) + '_ {
     }
 }
 
-fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
+/// `pump` is called as bytes arrive (and around the inflate) with what is being fetched and how far it got: the
+/// caller keeps answering and accepting through it, because nothing else runs until this returns.
+fn fetch_images(
+    cfg: &Config,
+    creds: Option<&Creds>,
+    pump: &mut dyn FnMut(&str, usize, usize),
+) -> Result<Images, String> {
     let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
-    let mut noop = |_: usize, _: usize| {};
     // Make the credential state explicit in the logs: a private bucket needs
     // signed requests, so "UNSIGNED" here next to an S3 4xx means the creds
     // never resolved (unset/misnamed secret), while a 401 on a SIGNED request
@@ -1227,10 +1274,14 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
         false => eprintln!("[risc-box] S3 requests will be UNSIGNED (no credentials resolved; set config credentials, or use a public bucket)"),
     }
     eprintln!("[risc-box] fetching s3://{}/{}", cfg.bucket, cfg.kernel);
-    let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut noop)
+    let kernel = s3::get_object(&ep, &cfg.bucket, &cfg.kernel, creds, &mut |g, t| pump("kernel", g, t))
         .map_err(|e| format!("fetch kernel {}: {e}", cfg.kernel))?;
     eprintln!("[risc-box]   kernel {} bytes; fetching {}", kernel.len(), cfg.fs);
-    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut progress_logger("fs"))
+    let mut fs_log = progress_logger("fs");
+    let mut fs_stored = s3::get_object(&ep, &cfg.bucket, &cfg.fs, creds, &mut |g, t| {
+        fs_log(g, t);
+        pump("fs", g, t)
+    })
         .map_err(|e| format!("fetch fs {}: {e}", cfg.fs))?;
     // The download Vec doubles as it grows, so an image just past a power of
     // two carries up to 2x its size in dead capacity — real linear memory on
@@ -1243,25 +1294,42 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     // machine shares from now on. A bad object fails the fetch (which
     // retries) rather than the machine start.
     let fs_gzipped = gz::is_gzip_key(&cfg.fs);
+    // Packed as it inflates (riscv_emu_rust::disk_image): the expanded image never exists in memory, and what is
+    // kept is ~1/3 of it. The platform's partition runtime gives a shared memory no reservation beyond wasmtime's
+    // 4 GiB default, and the expanded 3 GiB disk left the guest too little of that.
     let disk = match fs_gzipped {
         true => {
-            let raw = gz::gunzip(&fs_stored)?;
+            pump("inflate", 0, fs_bytes);
+            let mut b = riscv_emu_rust::disk_image::Builder::new();
+            let mut next = 64usize << 20;
+            gz::gunzip_stream(&fs_stored, &mut |piece, consumed| {
+                b.push(piece);
+                if b.len() >= next {
+                    next += 64 << 20;
+                    pump("inflate", consumed, fs_bytes);
+                }
+            })?;
+            pump("inflate", fs_bytes, fs_bytes);
+            // the 1 GB download is done with: give it back before the snapshot and the machine need the room
+            drop(fs_stored);
+            let d = b.finish();
             eprintln!(
-                "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x)",
+                "[risc-box]   fs {} bytes gzipped -> {} bytes ({:.1}x), held as {} bytes",
                 fs_bytes,
-                raw.len(),
-                raw.len() as f64 / fs_bytes.max(1) as f64
+                d.len(),
+                d.len() as f64 / fs_bytes.max(1) as f64,
+                d.stored_bytes()
             );
-            raw
+            d
         }
         false => {
             eprintln!("[risc-box]   fs {} bytes", fs_bytes);
-            fs_stored
+            riscv_emu_rust::disk_image::DiskImage::from_vec(fs_stored)
         }
     };
     let dtb = match &cfg.dtb {
         Some(k) => Some(
-            s3::get_object(&ep, &cfg.bucket, k, creds, &mut noop)
+            s3::get_object(&ep, &cfg.bucket, k, creds, &mut |g, t| pump("dtb", g, t))
                 .map_err(|e| format!("fetch dtb {k}: {e}"))?,
         ),
         None => None,
@@ -1273,7 +1341,11 @@ fn fetch_images(cfg: &Config, creds: Option<&Creds>) -> Result<Images, String> {
     let snap_stored = match &cfg.snapshot {
         Some(k) => {
             eprintln!("[risc-box] fetching snapshot s3://{}/{k}", cfg.bucket);
-            match s3::get_object_opt(&ep, &cfg.bucket, k, creds, &mut progress_logger("snapshot"))
+            let mut snap_log = progress_logger("snapshot");
+            match s3::get_object_opt(&ep, &cfg.bucket, k, creds, &mut |g, t| {
+                snap_log(g, t);
+                pump("snapshot", g, t)
+            })
                 .map_err(|e| format!("fetch snapshot {k}: {e}"))?
             {
                 Some(mut b) => {
@@ -1329,7 +1401,7 @@ const WORKING_RESERVE_MIB: u64 = 512;
 
 fn auto_ram_mib(cfg: &Config, images: &Images) -> Option<u64> {
     let ceiling = slice_mib()?;
-    let fixed = (images.kernel.len() + images.disk.len()) as u64 >> 20;
+    let fixed = (images.kernel.len() + images.disk.stored_bytes()) as u64 >> 20;
     let fb = (cfg.fb_w * cfg.fb_h * 4) >> 20;
     let overhead = fixed + fb + WORKING_RESERVE_MIB;
     // saturating: a slice smaller than the overhead lands on the floor
@@ -1352,6 +1424,10 @@ fn new_emulator(cfg: &Config, ram_mib: u64) -> Emulator {
     // before setup_program: that's where the RAM is sized and the DTB memory
     // node gets synced to it
     emu.setup_ram_bytes(ram_mib * 1024 * 1024);
+    // the built-in DTB for that many cpus, and the per-hart device state; before setup_program and restore
+    if cfg.harts > 1 {
+        emu.set_harts(cfg.harts);
+    }
     // Display size and clock source, both of which the guest reads exactly once
     // at boot: the DTB node for the framebuffer, the timebase for the clock.
     if cfg.fb_w != 1024 || cfg.fb_h != 768 {
@@ -1381,9 +1457,106 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
         emu.aot_enable();
         eprintln!("[risc-box] aot dispatcher on: {} baked regions", emu.aot_baked());
     }
+    #[cfg(feature = "codegen")]
+    jit_enable(emu);
+    // RISC_TICK: instructions between device services (the emulator's default is 32)
+    if let Some(v) = std::env::var("RISC_TICK").ok().and_then(|v| v.parse::<u64>().ok()) {
+        emu.get_mut_cpu().set_device_tick_interval(v);
+        eprintln!("[risc-box] device service every {v} instructions (RISC_TICK)");
+    }
     if cfg.net_enabled {
         emu.setup_network(Box::new(HostNet::new()));
     }
+    // last: from here on harts 1.. run on their own threads (SET builds; elsewhere they stay interleaved)
+    if emu.harts() > 1 {
+        let n = emu.start_threads(&mut |f| worker::spawn_boxed(f));
+        eprintln!("[risc-box] {} harts, {} on their own threads", emu.harts(), n);
+    }
+}
+
+/// The live region JIT (PLATFORM-JIT.md): hot guest regions compile to wasm
+/// through the platform's enclave:codegen verb and run in place of the
+/// interpreter. On wherever the build has it; RISC_JIT=0 is the off switch
+/// (and the benchmark's A/B), RISC_JIT_FUEL / RISC_JIT_INTERVAL /
+/// RISC_JIT_HEAT tune it. Without the verb, or once its process-wide budget
+/// is spent, the machine simply keeps interpreting.
+#[cfg(feature = "codegen")]
+fn jit_enable(emu: &mut Emulator) {
+    if std::env::var("RISC_JIT").map_or(false, |v| v == "0") {
+        eprintln!("[risc-box] jit off (RISC_JIT=0)");
+        return;
+    }
+    let mut p = riscv_emu_rust::cpu::JitParams::default();
+    let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+    if let Some(v) = num("RISC_JIT_FUEL") {
+        p.fuel = v.clamp(32, 1 << 20);
+    }
+    if let Some(v) = num("RISC_JIT_INTERVAL") {
+        p.form_interval = v.max(1_000_000);
+    }
+    if let Some(v) = num("RISC_JIT_HEAT") {
+        p.compile_heat = v;
+    }
+    if let Some(v) = num("RISC_JIT_PER_OP") {
+        p.compile_heat_per_op = v;
+    }
+    if let Some(v) = num("RISC_JIT_PRUNE") {
+        p.prune_heat = v;
+    }
+    if let Some(v) = num("RISC_JIT_COMPILE_PCT") {
+        p.compile_pct = v.min(100) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_BLOCKS") {
+        p.max_blocks = (v as usize).clamp(1, 512);
+    }
+    p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
+    p.chain = !std::env::var("RISC_JIT_CHAIN").map_or(false, |v| v == "0");
+    let fuel = p.fuel;
+    match emu.jit_enable(p) {
+        true => eprintln!("[risc-box] jit on: hot regions compile through enclave:codegen (fuel {fuel})"),
+        false => eprintln!("[risc-box] jit unavailable: interpreting"),
+    }
+}
+
+/// The machine's JIT counters for /status (nothing when the build or the
+/// machine has no JIT).
+#[cfg(feature = "codegen")]
+fn jit_json(emu: Option<&Emulator>) -> String {
+    let Some(s) = emu.and_then(|e| e.jit_stats()) else {
+        return String::new();
+    };
+    let v = riscv_emu_rust::jit::verb::stats();
+    format!(
+        ",\"jit\":{{\"calls\":{},\"chained\":{},\"skippedRewritten\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
+         \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
+         \"volatile\":{},\"formMs\":{:.1},\
+         \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
+         \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{},\
+         \"codeGen\":{}}}",
+        s.calls, s.chained, s.skipped_rewritten, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
+        s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
+        s.volatile, s.form_us as f64 / 1000.0,
+        v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
+        v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
+        v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),
+        // the write-snoop generation: each bump (a store to any page holding
+        // cached code) drops every predecoded block and every region proof
+        emu.map_or(0, |e| e.get_cpu().get_mmu().code_gen()),
+    ) + &format!(",\"blockBuilds\":{}", emu.map_or(0, |e| e.get_cpu().block_builds())) + &jit_diag_json(emu)
+}
+
+/// RISC_JIT_DIAG=1: the hottest regions and where region calls end (sampled), appended to /status as "jitDiag".
+#[cfg(feature = "codegen")]
+fn jit_diag_json(emu: Option<&Emulator>) -> String {
+    match std::env::var("RISC_JIT_DIAG").map_or(false, |v| v == "1") {
+        true => emu.and_then(|e| e.jit_diag()).map_or(String::new(), |d| format!(",\"jitDiag\":{d}")),
+        false => String::new(),
+    }
+}
+
+#[cfg(not(feature = "codegen"))]
+fn jit_json(_emu: Option<&Emulator>) -> String {
+    String::new()
 }
 
 /// A machine brought up, and how: resumed from a snapshot or booted cold.
@@ -1699,6 +1872,7 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
         ("POST", "/hid-stream") if !sub => server.upgrade_instream(key, "/hid-stream-event"),
         ("POST", "/hid-stream-event") if !sub => hid_inner(&mut app.machines[0], server, key, &req.body, false),
         ("POST", "/exec") => exec(app, server, key, &req.body, mi),
+        ("POST", "/computer") => computer_call(app, server, key, &req.body, mi),
         ("POST", "/save") if !sub => save(app, server, key),
         ("POST", "/save") => server.respond(key, json(403, "Forbidden", err("save is for the main machine (its disk is the saveKey's); snapshot an instance instead"))),
         ("POST", "/snapshot") => snapshot(app, server, key, &req.body, mi),
@@ -1898,6 +2072,24 @@ fn err(msg: &str) -> String {
     format!("{{\"error\":{{\"message\":\"{}\"}}}}", httpd::json_escape(msg))
 }
 
+/// The 409 body for a call that needs a running machine: why it is down and,
+/// for a failed boot, when it next retries. A bare "machine is not running"
+/// sent eyesoff's model round the same call until its step limit.
+fn not_running(app: &App, mi: usize) -> String {
+    let m = &app.machines[mi];
+    let mut msg = String::from("machine is not running");
+    if m.phase == Phase::Error {
+        if let Some(e) = &m.error {
+            msg.push_str(&format!(": it failed to start: {e}"));
+        }
+        if let (0, Some(t)) = (mi, app.retry_at) {
+            let s = t.saturating_duration_since(Instant::now()).as_secs();
+            msg.push_str(&format!("; the start is retried automatically in {s}s"));
+        }
+    }
+    err(&msg)
+}
+
 // ---- instances -------------------------------------------------------------
 
 /// POST /instances — fork a new machine. Body: {"from"?: "main" | "<snapshot
@@ -2050,9 +2242,6 @@ const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
-const BTN_LEFT: u16 = 0x110;
-const BTN_RIGHT: u16 = 0x111;
-const BTN_MIDDLE: u16 = 0x112;
 
 /// POST /hid — inject pointer/keyboard input into the machine's virtio-input
 /// device. Body: {"events":[ … ]} where each event is one of
@@ -2086,28 +2275,20 @@ fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], resp
         }
         return;
     };
-    let emu = m.emu.as_mut().expect("emu present (checked above)");
     let abs_max = Emulator::input_abs_max() as f64;
-    let mut n = 0u32;
-    let syn = |emu: &mut Emulator| emu.push_input_event(EV_SYN, 0, 0);
+    let mut evs = Vec::with_capacity(events.len());
     for ev in events {
         let kind = ev.get("t").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
             "move" => {
                 let x = ev.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
                 let y = ev.get("y").and_then(|y| y.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
-                emu.push_input_event(EV_ABS, ABS_X, (x * abs_max).round() as u32);
-                emu.push_input_event(EV_ABS, ABS_Y, (y * abs_max).round() as u32);
-                syn(emu);
-                n += 1;
+                evs.push(Ev::Abs((x * abs_max).round() as u32, (y * abs_max).round() as u32));
             }
             "moveabs" => {
                 let ax = ev.get("ax").and_then(|x| x.as_i64()).unwrap_or(0).clamp(0, abs_max as i64);
                 let ay = ev.get("ay").and_then(|y| y.as_i64()).unwrap_or(0).clamp(0, abs_max as i64);
-                emu.push_input_event(EV_ABS, ABS_X, ax as u32);
-                emu.push_input_event(EV_ABS, ABS_Y, ay as u32);
-                syn(emu);
-                n += 1;
+                evs.push(Ev::Abs(ax as u32, ay as u32));
             }
             "button" => {
                 let code = match ev.get("b").and_then(|b| b.as_str()).unwrap_or("left") {
@@ -2116,35 +2297,60 @@ fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], resp
                     _ => BTN_LEFT,
                 };
                 let down = ev.get("down").and_then(|d| d.as_bool()).unwrap_or(true);
-                emu.push_input_event(EV_KEY, code, down as u32);
-                syn(emu);
-                n += 1;
+                evs.push(Ev::Key(code, down));
             }
             "key" => {
                 let code = ev.get("code").and_then(|c| c.as_u64()).unwrap_or(0) as u16;
                 let down = ev.get("down").and_then(|d| d.as_bool()).unwrap_or(true);
                 if code != 0 {
-                    emu.push_input_event(EV_KEY, code, down as u32);
-                    syn(emu);
-                    n += 1;
+                    evs.push(Ev::Key(code, down));
                 }
             }
             "scroll" => {
                 let dy = ev.get("dy").and_then(|d| d.as_i64()).unwrap_or(0);
                 let dx = ev.get("dx").and_then(|d| d.as_i64()).unwrap_or(0);
-                if dy != 0 {
-                    emu.push_input_event(EV_REL, REL_WHEEL, dy as i32 as u32);
-                }
-                if dx != 0 {
-                    emu.push_input_event(EV_REL, REL_HWHEEL, dx as i32 as u32);
-                }
                 if dy != 0 || dx != 0 {
-                    syn(emu);
-                    n += 1;
+                    evs.push(Ev::Wheel(dy as i32, dx as i32));
                 }
             }
             _ => {}
         }
+    }
+    let n = inject(m, &evs);
+    if respond {
+        server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
+    }
+}
+
+/// Push input into a running machine's virtio-input device, each event
+/// committed with its own EV_SYN report, and boost the CPU so the guest
+/// services it promptly. The one injection path: /hid's JSON events and
+/// /computer's planned actions both arrive here. Returns how many landed.
+fn inject(m: &mut Machine, evs: &[Ev]) -> u32 {
+    let Some(emu) = m.emu.as_mut() else { return 0 };
+    let mut n = 0u32;
+    for ev in evs {
+        match *ev {
+            Ev::Abs(ax, ay) => {
+                emu.push_input_event(EV_ABS, ABS_X, ax);
+                emu.push_input_event(EV_ABS, ABS_Y, ay);
+                m.pointer = Some((ax, ay));
+            }
+            Ev::Key(code, down) => emu.push_input_event(EV_KEY, code, down as u32),
+            Ev::Wheel(dy, dx) => {
+                if dy != 0 {
+                    emu.push_input_event(EV_REL, REL_WHEEL, dy as u32);
+                }
+                if dx != 0 {
+                    emu.push_input_event(EV_REL, REL_HWHEEL, dx as u32);
+                }
+                if dy == 0 && dx == 0 {
+                    continue;
+                }
+            }
+        }
+        emu.push_input_event(EV_SYN, 0, 0);
+        n += 1;
     }
     // Run full CPU batches for a bit so the guest services the input IRQ and
     // X repaints promptly instead of at the idle-throttle rate — but only when
@@ -2152,9 +2358,235 @@ fn hid_inner(m: &mut Machine, server: &mut Server, key: usize, body: &[u8], resp
     if n > 0 && m.boost_hold == 0 {
         m.input_boost = m.input_boost.max(INPUT_BOOST_TURNS);
     }
-    if respond {
-        server.respond(key, json(200, "OK", format!("{{\"ok\":true,\"events\":{n}}}")));
+    n
+}
+
+// ---- POST /computer: one model-driven action, answered with the screen ------
+
+/// A /computer call parked while its action plays out (see computer.rs).
+struct ComputerWait {
+    ticket: u64,
+    /// by ID, not index: an instance can be deleted while a call waits, and
+    /// deleting compacts `machines`
+    machine: String,
+    plan: computer::Plan,
+    /// events not yet injected: a long burst goes in COMPUTER_CHUNK at a
+    /// time (see computer_feed)
+    queue: VecDeque<Ev>,
+    next_feed: Instant,
+    started: Instant,
+    /// when the LAST event went in: the settle clock (min, max) runs from here
+    t0: Instant,
+    next_sample: Instant,
+    /// the screen before the action, and as last sampled
+    before: u64,
+    last: u64,
+    /// the last moment the screen changed OR the guest was busy: "settled"
+    /// is this far in the past. Watching the CPU as well as the pixels is
+    /// what tells "the menu closed and the terminal is still starting" (a
+    /// quiet screen over a busy guest) from "done".
+    last_change: Instant,
+    changed: bool,
+    /// the guest's retired instruction count at the last sample
+    retired: u64,
+}
+
+/// Above this many guest instructions per second, the machine is doing
+/// something (an app starting, a page loading) and the screen it shows is not
+/// its last word. An idle Alpine desktop retires ~40 thousand a second; any
+/// real work is tens of millions.
+const COMPUTER_BUSY_IPS: u64 = 5_000_000;
+
+/// The most events (each one a report: event + SYN) injected at once, and
+/// the pause before the next part. The guest's evdev buffer for this device
+/// holds ~128 events; a typed sentence is several hundred, and delivered in
+/// one burst the reader overflows, the kernel reports SYN_DROPPED, and the
+/// input stack discards the lot - measured: 14 characters typed, 45 typed
+/// NOTHING. Parts of 16 reports, each sent once the device has handed the
+/// last part to the guest and the guest has had a moment to read it, never
+/// come close.
+const COMPUTER_CHUNK: usize = 16;
+const COMPUTER_CHUNK_GAP_MS: u64 = 40;
+/// A burst the guest stops taking (the device never drains) is cut off here.
+const COMPUTER_FEED_GIVE_UP_S: u64 = 60;
+
+/// Inject the next part of a held call's input, if the device is ready for it.
+fn computer_feed(m: &mut Machine, w: &mut ComputerWait, now: Instant) {
+    if w.queue.is_empty() || now < w.next_feed {
+        return;
     }
+    if m.emu.as_ref().is_some_and(|e| e.input_pending() > 0)
+        && now - w.started < Duration::from_secs(COMPUTER_FEED_GIVE_UP_S)
+    {
+        return;
+    }
+    if now - w.started >= Duration::from_secs(COMPUTER_FEED_GIVE_UP_S) {
+        w.queue.clear();
+        w.plan.did.push_str(" (cut short: the machine stopped taking input)");
+    } else {
+        let n = w.queue.len().min(COMPUTER_CHUNK);
+        let part: Vec<Ev> = w.queue.drain(..n).collect();
+        inject(m, &part);
+    }
+    w.next_feed = now + Duration::from_millis(COMPUTER_CHUNK_GAP_MS);
+    if w.queue.is_empty() {
+        // the action is complete only now: the guest gets its reaction time
+        // and the settle window from the last event, not the first
+        w.t0 = now;
+        w.last_change = now;
+        w.next_sample = now + Duration::from_millis(computer::SAMPLE_MS);
+    }
+}
+
+/// How long a call whose action changed NOTHING on screen waits before it
+/// says so. Longer than the reaction floor: a slow guest that has not
+/// repainted yet must not be reported as an action with no effect.
+const COMPUTER_NO_CHANGE_MS: u64 = 1500;
+
+/// A cheap fingerprint of the screen (the composed scanout, cursor included),
+/// to tell "still changing" from "settled" without encoding anything.
+fn screen_hash(emu: &Emulator, buf: &mut Vec<u8>) -> u64 {
+    buf.resize(display::fb_bytes(), 0);
+    Display::capture(emu, buf);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for c in buf.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..c.len()].copy_from_slice(c);
+        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// POST /computer — plan the action, inject it, and answer with the screen
+/// once it settles. A screenshot answers at once; anything else is held and
+/// released by computer_tick from the main loop, so the guest keeps running
+/// (and repainting) while the call waits. Nothing is injected when the plan
+/// is refused.
+fn computer_call(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) {
+    if !app.machines[mi].running() {
+        return server.respond(key, json(409, "Conflict", not_running(app, mi)));
+    }
+    let m = &mut app.machines[mi];
+    let screen = computer::Screen {
+        w: display::fb_w(),
+        h: display::fb_h(),
+        abs_max: Emulator::input_abs_max().max(1) as u32,
+    };
+    let plan = match computer::plan(body, screen) {
+        Ok(p) => p,
+        Err(e) => return server.respond(key, json(400, "Bad Request", err(&e))),
+    };
+    if plan.events.is_empty() && plan.max.is_zero() {
+        let body = computer_answer(m, &plan, true, false, 0);
+        return server.respond(key, json(200, "OK", body));
+    }
+    let mut buf = Vec::new();
+    let before = screen_hash(m.emu.as_ref().expect("running"), &mut buf);
+    let retired = m.emu.as_ref().expect("running").get_cpu().retired();
+    let Some(ticket) = server.hold(key) else { return };
+    let now = Instant::now();
+    let mut w = ComputerWait {
+        ticket,
+        machine: m.id.clone(),
+        queue: plan.events.iter().cloned().collect(),
+        plan,
+        next_feed: now,
+        started: now,
+        t0: now,
+        next_sample: now + Duration::from_millis(computer::SAMPLE_MS),
+        before,
+        last: before,
+        last_change: now,
+        changed: false,
+        retired,
+    };
+    computer_feed(m, &mut w, now);
+    app.computer_waiters.push(w);
+}
+
+/// One pass over the held /computer calls. Returns true if any was answered.
+fn computer_tick(app: &mut App, server: &mut Server) -> bool {
+    let now = Instant::now();
+    let mut answered = false;
+    let mut buf = Vec::new();
+    for mut w in std::mem::take(&mut app.computer_waiters) {
+        let Some(mi) = app.find(&w.machine) else {
+            answered |= server.release(w.ticket, json(409, "Conflict", err("the machine went away")));
+            continue;
+        };
+        let m = &mut app.machines[mi];
+        if !m.running() {
+            answered |= server.release(w.ticket, json(409, "Conflict", err("machine stopped")));
+            continue;
+        }
+        if !w.queue.is_empty() {
+            computer_feed(m, &mut w, now);
+            app.computer_waiters.push(w);
+            continue;
+        }
+        let elapsed = now - w.t0;
+        if !w.plan.fixed && now >= w.next_sample {
+            let emu = m.emu.as_ref().expect("running");
+            let h = screen_hash(emu, &mut buf);
+            if h != w.last {
+                w.last = h;
+                w.last_change = now;
+            }
+            w.changed |= h != w.before;
+            let retired = emu.get_cpu().retired();
+            let period = now - (w.next_sample - Duration::from_millis(computer::SAMPLE_MS));
+            let ips = retired.saturating_sub(w.retired) as f64 / period.as_secs_f64().max(0.001);
+            if ips > COMPUTER_BUSY_IPS as f64 {
+                w.last_change = now;
+            }
+            w.retired = retired;
+            w.next_sample = now + Duration::from_millis(computer::SAMPLE_MS);
+        }
+        let quiet = now - w.last_change >= Duration::from_millis(computer::SETTLE_MS);
+        let done = if elapsed >= w.plan.max {
+            Some(w.plan.fixed || quiet)
+        } else if w.plan.fixed || elapsed < w.plan.min {
+            None
+        } else if w.changed && quiet {
+            Some(true)
+        } else if !w.changed && elapsed >= Duration::from_millis(COMPUTER_NO_CHANGE_MS) {
+            Some(true)
+        } else {
+            None
+        };
+        match done {
+            Some(settled) => {
+                let waited = (now - w.started).as_millis() as u64;
+                let body = computer_answer(m, &w.plan, settled, w.changed, waited);
+                answered |= server.release(w.ticket, json(200, "OK", body));
+            }
+            None => app.computer_waiters.push(w),
+        }
+    }
+    answered
+}
+
+/// The answer: what was done, the screen as JPEG, where the pointer is.
+fn computer_answer(m: &Machine, plan: &computer::Plan, settled: bool, changed: bool, waited_ms: u64) -> String {
+    use video::VideoEncoder;
+    let emu = m.emu.as_ref().expect("running");
+    let (rgb, w, h) = video::capture_rgb(emu);
+    let mut enc = video::MjpegEncoder::new(plan.quality);
+    let jpeg = enc.encode(&rgb, w, h).pop().map(|f| f.data).unwrap_or_default();
+    // the pointer where it was put, in pixels; the cursor plane as a fallback
+    // for a pointer nobody here has moved yet
+    let abs = Emulator::input_abs_max().max(1) as f64;
+    let cursor = m
+        .pointer
+        .map(|(ax, ay)| {
+            let px = |a: u32, size: usize| (a as f64 * (size.max(2) - 1) as f64 / abs).round() as i64;
+            (px(ax, w), px(ay, h))
+        })
+        .or_else(|| emu.gpu_cursor().map(|(_, x, y, _)| (x, y)));
+    // "changed" only means something for an action: whether the screen
+    // differs from the one the action was injected into
+    let changed = (!plan.events.is_empty()).then_some(changed);
+    computer::answer(plan, w, h, cursor, settled, changed, waited_ms, &jpeg)
 }
 
 // ---- POST /exec: run a shell command on the guest serial console -----------
@@ -2194,7 +2626,7 @@ fn exec(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usize) 
         return server.respond(key, json(403, "Forbidden", err("exec is disabled on this deployment")));
     }
     if !app.machines[mi].running() {
-        return server.respond(key, json(409, "Conflict", err("machine is not running")));
+        return server.respond(key, json(409, "Conflict", not_running(app, mi)));
     }
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -2412,6 +2844,11 @@ fn exec_pump(m: &mut Machine, server: &mut Server, cap: &mut Vec<u8>, last_flush
     }
     if last_flush.elapsed() >= Duration::from_millis(50) {
         server.flush();
+        // An /exec holds the main loop for up to EXEC_MAX_TIMEOUT_S: keep accepting meanwhile (answered after it
+        // returns) and give the runtime a slice to run its accept and stream workers, or a NucBox reads the app as
+        // dead and retires it after three missed checks.
+        server.keep_accepting();
+        std::thread::sleep(Duration::from_millis(1));
         *last_flush = Instant::now();
     }
 }
@@ -2603,8 +3040,34 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
         // creds precedence: request body > config; borrow-safe clone of config creds
         let body = start.creds;
         let chosen = body.as_ref().or(app.cfg.config_creds.as_ref());
+        // The main loop does not run until the fetch returns, so without this nothing accepts or answers for the
+        // whole download: the domain's front reads an app that accepts no connections as not ready, and a host
+        // that asks every 30 s retires it after three misses (the NucBox, 2026-10-08: a 957 MB image over its
+        // privacy circuit took minutes, and the RISC Box was retired mid-download four times). So accept and
+        // answer what arrives with where the fetch is, and yield the thread so the runtime gets to accept.
+        let mut last_pump = Instant::now();
+        let mut pump = |what: &str, got: usize, total: usize| {
+            if last_pump.elapsed() < Duration::from_millis(100) {
+                return;
+            }
+            for (key, _req) in server.poll(MAX_BODY) {
+                let mut resp = json(
+                    503,
+                    "Service Unavailable",
+                    format!(
+                        "{{\"phase\":\"fetching\",\"object\":\"{}\",\"bytes\":{got},\"of\":{total},\"error\":\"the machine images are still downloading\"}}",
+                        httpd::json_escape(what)
+                    ),
+                );
+                resp.headers.push(("Retry-After".into(), "5".into()));
+                server.respond(key, resp);
+            }
+            server.flush();
+            std::thread::sleep(Duration::from_millis(1));
+            last_pump = Instant::now();
+        };
         // stash which creds we used so /save can reuse them
-        match fetch_images(&app.cfg, chosen) {
+        match fetch_images(&app.cfg, chosen, &mut pump) {
             Ok(imgs) => {
                 app.live_creds = match &body {
                     Some(c) => Some(clone_creds(c)),
@@ -2645,20 +3108,14 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
             }
             Err(e) => {
                 eprintln!("[risc-box] start failed: {e}");
-                if app.retry < BOOT_RETRY_DELAYS.len() {
-                    let delay = BOOT_RETRY_DELAYS[app.retry];
-                    eprintln!(
-                        "[risc-box] retrying fetch in {delay}s (attempt {}/{})",
-                        app.retry + 1,
-                        BOOT_RETRY_DELAYS.len()
-                    );
-                    app.retry_at = Some(Instant::now() + Duration::from_secs(delay));
-                    app.retry_start = Some(Start {
-                        creds: body.as_ref().map(clone_creds),
-                        reset: start.reset,
-                        snapshot: start.snapshot,
-                    });
-                }
+                let delay = boot_retry_delay(app.retry);
+                eprintln!("[risc-box] retrying fetch in {delay}s (attempt {})", app.retry + 1);
+                app.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+                app.retry_start = Some(Start {
+                    creds: body.as_ref().map(clone_creds),
+                    reset: start.reset,
+                    snapshot: start.snapshot,
+                });
                 let m = app.main_mut();
                 m.error = Some(e);
                 m.phase = Phase::Error;
@@ -2813,6 +3270,20 @@ pub fn run() {
         }
     );
 
+    // RISC_JIT_SELFTEST=<seed>[,<instructions>]: run the codegen JIT against
+    // the interpreter on a generated paged guest (riscv_emu_rust::jit_selftest)
+    // inside this very component — the real verb, the real memory — print the
+    // comparison and timings, and exit. Normal startup never does this.
+    #[cfg(feature = "codegen")]
+    if let Ok(arg) = std::env::var("RISC_JIT_SELFTEST") {
+        let mut it = arg.split(',').map(|v| v.trim().parse::<u64>().ok());
+        let seed = it.next().flatten().unwrap_or(1);
+        let steps = it.next().flatten().unwrap_or(200_000_000);
+        let report = riscv_emu_rust::jit_selftest(seed, steps);
+        println!("{}", report.0);
+        std::process::exit(if report.1 { 0 } else { 1 });
+    }
+
     // What the platform actually handed us, by NAME only — never a value.
     // Names are already public (they are in the app config); values are not,
     // and never appear here.
@@ -2867,6 +3338,7 @@ pub fn run() {
         pull: BandRing::new(),
         pull_seen: None,
         pull_waiters: Vec::new(),
+        computer_waiters: Vec::new(),
         gs: None,
         gs_tried: false,
         fb_scanned: None,
@@ -3383,6 +3855,12 @@ pub fn run() {
             }
         }
 
+        // Held /computer calls: sample each one's screen, answer it once the
+        // picture has settled (or its deadline passes). See computer_tick.
+        if !app.computer_waiters.is_empty() {
+            busy |= computer_tick(&mut app, &mut server);
+        }
+
         // The GameStream host: built on the first turn after the main machine
         // is running, then polled like any other server. It must never block
         // -- this is the same turn that steps the CPU.
@@ -3426,10 +3904,10 @@ pub fn run() {
         // when the running machines produced no output and moved no bytes.
         let any_running = app.machines.iter().any(|m| m.running());
         if !any_running {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            loop_sleep(&app, 20);
             last_yield = std::time::Instant::now();
         } else if !busy && !flushed {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            loop_sleep(&app, 1);
             last_yield = std::time::Instant::now();
         } else if !flushed && server.pending_bytes() > 0 {
             // Queued output that would not go out this turn: yield a slice so
@@ -3440,7 +3918,7 @@ pub fn run() {
             // moved NOTHING, so this costs the guest nothing while a stream
             // keeps up and pays 1 ms only on the turns where the engine says
             // it has no room — the backpressure signal.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            loop_sleep(&app, 1);
             last_yield = std::time::Instant::now();
         } else if last_yield.elapsed() >= std::time::Duration::from_millis(16) {
             // ACCEPT FAIRNESS. The backpressure yield above only fires when
@@ -3450,8 +3928,24 @@ pub fn run() {
             // cooperative budget, which replenishes only when a fiber yields.
             // Yield the OS thread at most once per ~frame so the runtime can
             // drain its accept queue; costs ~1 ms/16 ms.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            loop_sleep(&app, 1);
             last_yield = std::time::Instant::now();
+        }
+    }
+}
+
+/// The main loop's idle sleep. A machine whose harts run on threads gets its devices released for the
+/// duration, so those harts' device accesses (IPIs, interrupt claims, virtio kicks) do not wait it out.
+fn loop_sleep(app: &App, ms: u64) {
+    for m in app.machines.iter() {
+        if let Some(e) = m.emu.as_ref() {
+            e.release_devices();
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    for m in app.machines.iter() {
+        if let Some(e) = m.emu.as_ref() {
+            e.acquire_devices();
         }
     }
 }
@@ -3482,5 +3976,20 @@ mod turn_batch_tests {
         assert_eq!(turn_batch(TICK_BATCH, 1.0), TURN_FLOOR);
         assert_eq!(turn_batch(MIN_BATCH, 100_000.0), MIN_BATCH);
         assert_eq!(turn_batch(4_000, 1.0), 4_000, "a share already under the floor is kept");
+    }
+}
+
+#[cfg(test)]
+mod boot_retry_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_boot_fetch_backs_off_then_keeps_retrying() {
+        let first: Vec<u64> = (0..6).map(boot_retry_delay).collect();
+        assert_eq!(first, [5, 15, 30, 60, 120, 300]);
+        // no budget to run out of: every later attempt waits the ceiling
+        assert_eq!(boot_retry_delay(6), 300);
+        assert_eq!(boot_retry_delay(10_000), 300);
+        assert_eq!(boot_retry_delay(usize::MAX), 300);
     }
 }

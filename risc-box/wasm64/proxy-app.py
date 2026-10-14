@@ -10,6 +10,9 @@ import sys
 import tempfile
 
 HERE = Path(__file__).resolve().parent
+# Scalar u64/s64 ABI, explicitly implemented for memory64 by the host. This
+# interface must retain the app's canonical memory, not the WASI proxy memory.
+NATIVE_IMPORTS = {'enclave:codegen/compiler@0.1.0'}
 
 
 def run(*args, **kwargs):
@@ -21,7 +24,7 @@ def interfaces(tool, component, direction):
     names = re.findall(r'^\s*' + direction + r' ([^;]+);', wit, re.M)
     # Reject inline functions/types and unknown host ABIs rather than letting
     # an unproxied 64-bit canonical pointer reach a 32-bit host binding.
-    if any(not re.fullmatch(r'wasi:[\w-]+/[\w-]+@[\d.]+', n) for n in names):
+    if any(n not in NATIVE_IMPORTS and not re.fullmatch(r'wasi:[\w-]+/[\w-]+@[\d.]+', n) for n in names):
         raise ValueError(f'unsupported {direction} surface: {names}')
     return set(names)
 
@@ -29,7 +32,9 @@ def interfaces(tool, component, direction):
 def compose(app, output, w64):
     tool = w64 / 'wasm-tools'
     run(tool, 'validate', '--features', 'all', app)
-    wanted = interfaces(tool, app, 'import')
+    all_imports = interfaces(tool, app, 'import')
+    native = all_imports & NATIVE_IMPORTS
+    wanted = all_imports - native
     supported = set(re.findall(r'^\s*export ([^;]+);',
                               (HERE / 'wasiproxy/wit/world.wit').read_text(), re.M))
     supported = {n.split('@')[0] for n in supported}
@@ -72,7 +77,7 @@ def compose(app, output, w64):
                              f'missing={sorted(wanted - actual)}, unhandled={sorted(wanted - exported)}')
         composed = root / 'composed.wasm'
         run(w64 / 'wac', 'plug', '--plug', proxy, app, '-o', composed)
-        if interfaces(tool, composed, 'import') != wanted:
+        if interfaces(tool, composed, 'import') != wanted | native:
             raise ValueError('composition changed the app import surface')
         run(tool, 'validate', '--features', 'all', composed)
         shutil.copyfile(composed, output)

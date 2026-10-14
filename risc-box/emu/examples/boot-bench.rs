@@ -83,6 +83,11 @@ fn main() {
     let mut fps_frame_bytes: Option<u64> = None;
     let mut tier2_dump: Option<String> = None;
     let mut aot = false;
+    // --harts N / --dtb FILE: an SMP machine; the DTB must describe N cpus
+    let mut harts: usize = 1;
+    let mut dtb_file: Option<String> = None;
+    let mut hart_slice: u64 = 0;
+    let mut threads = false;
     // --snapshot-on MARKER:FILE / --restore FILE: exercise the machine
     // snapshot natively (see src/snapshot.rs). The identity binding the
     // delta to its base is just the image sizes here; the app hashes them.
@@ -144,6 +149,19 @@ fn main() {
                 ram_mib = args[i].parse().expect("--ram-mib takes MiB");
             }
             "--realtime" => realtime = true,
+            "--harts" => {
+                i += 1;
+                harts = args[i].parse().expect("--harts N");
+            }
+            "--hart-slice" => {
+                i += 1;
+                hart_slice = args[i].replace('_', "").parse().expect("--hart-slice N");
+            }
+            "--threads" => threads = true,
+            "--dtb" => {
+                i += 1;
+                dtb_file = Some(args[i].clone());
+            }
             "--fb" => {
                 // W:H -- the simple-framebuffer's resolution, as the app's
                 // display config sets it on the fleet.
@@ -347,8 +365,18 @@ fn main() {
             false => None,
         },
     }));
+    if let Some(f) = dtb_file.as_ref() {
+        emu.setup_dtb(read_exact_file(f));
+    }
     if ram_mib > 0 {
         emu.setup_ram_bytes(ram_mib * 1024 * 1024);
+    }
+    if harts > 1 {
+        emu.set_harts(harts);
+        if hart_slice > 0 {
+            emu.set_hart_slice(hart_slice);
+        }
+        eprintln!("SMP: {} harts", emu.harts());
     }
     if let Some((w, h)) = fb_size {
         emu.set_framebuffer_size(w, h);
@@ -393,6 +421,10 @@ fn main() {
     if aot {
         eprintln!("--aot needs a build with --features aot");
         std::process::exit(2);
+    }
+    if threads && harts > 1 {
+        let n = emu.start_threads(&mut |f| std::thread::Builder::new().spawn(f).is_ok());
+        eprintln!("SMP: {} hart threads", n);
     }
     #[cfg(feature = "tier2")]
     if let Some(d) = tier2_dump.as_ref() {
@@ -903,6 +935,12 @@ fn main() {
                 rm[2], rm[1], rm[0],
                 br[2], br[1], br[0]
             );
+            if emu.harts() > 1 {
+                let hs: Vec<String> = emu.hart_states().iter().enumerate()
+                    .map(|(h, (pc, mode, wfi, r))| format!("h{}:{:x}/{}{} {}M", h, pc, mode, if *wfi { "w" } else { "" }, r / 1_000_000))
+                    .collect();
+                eprintln!("          harts {}", hs.join("  "));
+            }
             window = Instant::now();
             window_insns = 0;
         }
@@ -923,6 +961,9 @@ fn main() {
     }
     let secs = start.elapsed().as_secs_f64();
     report_pc_hist(&pc_hist);
+    for (h, (pc, mode, wfi, retired)) in emu.hart_states().into_iter().enumerate() {
+        println!("HART {} pc={:#x} mode={} wfi={} retired={}M", h, pc, mode, wfi, retired / 1_000_000);
+    }
     println!(
         "TOTAL {:.0}M instructions in {:.2}s = {:.1} MIPS",
         done as f64 / 1e6,

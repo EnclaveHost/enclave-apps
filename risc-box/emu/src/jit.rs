@@ -1,64 +1,123 @@
 //! risc-box patch (jit feature): the app-side translator half of
 //! PLATFORM-JIT.md — real superblock ops (cpu::BlockOp) emitted as a wasm
-//! module. This is the production-shaped successor to
-//! examples/jit-proto.rs's synthetic emitter: same hand-encoded binary
-//! format, but over the emulator's own IR, with the interpreter-bail
-//! contract exec_block already keeps:
+//! module, keeping the interpreter-bail contract exec_block already keeps:
 //!
-//! - every exit leaves pc EXACT: a bail (unsupported op, non-DRAM address,
-//!   invalidated code generation after a store) sets pc to the op that did
-//!   not run and returns how many ops did; a taken branch/jump sets its
-//!   target; falling off the end sets the fallthrough. Exits return
-//!   compile-time constants, so the body carries no retired counter and no
-//!   per-op pc stores — the dispatcher re-enters wherever pc says.
-//! - loads/stores address guest PHYSICAL DRAM through a flat window
-//!   (linear = dram_base + (addr - guest_dram_base)); anything outside
-//!   (MMIO, faults) bails before any side effect. Address translation is a
-//!   later tier (measured separately in jit-proto at 5.6x with inline TLB
-//!   probes); this tier is exact for bare/physical addressing and is the
-//!   op-semantics core every later tier reuses.
-//! - RV64 only: Bit32 guests are refused at emit time.
+//! - every exit leaves pc EXACT: a bail (unsupported op, TLB miss, a store
+//!   the interpreter must perform itself) sets pc to the op that did not run
+//!   and returns how many ops did; a taken branch/jump sets its target;
+//!   falling off the end sets the fallthrough. Exits return compile-time
+//!   constants, so the body carries no per-op retired counter or pc store.
+//! - loads/stores reach guest RAM the way the interpreter's fast path does:
+//!   the access must stay inside one 4 KiB page, translate through the
+//!   software TLB (hit only: miss or stale meta bails, the interpreter walks
+//!   and fills so the retry hits), and land inside DRAM. RAM is either a
+//!   flat window (tests, the prototype) or risc-box's chunked copy-on-write
+//!   RAM (memory.rs): reads go through the chunk read-pointer table, stores
+//!   through the write-pointer table and bail when it is null (a Zero or
+//!   Shared chunk — the interpreter materializes it), when the target page
+//!   is marked executable (the interpreter's store bumps the write-snoop
+//!   generation), or when it lands in a window with store-side bookkeeping
+//!   (the framebuffer's overlay rectangle). Generated code therefore never
+//!   changes the code generation, and never writes memory the interpreter
+//!   would have written differently.
+//! - nothing about the machine's ADDRESS is baked in. The code reads a
+//!   small context block at entry (state base, chunk tables, a pc bias), so
+//!   one compiled module serves a Cpu wherever it lives in linear memory and
+//!   the same code mapped at another page-aligned address (ASLR, another
+//!   process, another machine): every guest pc in the module is relative,
+//!   and runtime pc = module pc + bias.
+//! - RV64 only: the caller never forms regions for a Bit32 guest.
 //!
 //! The equivalence tests live in cpu.rs (same module as the private state
 //! they compare) and run each generated module under wasmtime — a
-//! dev-dependency; nothing here links into the shipped app.
+//! dev-dependency; nothing here links wasmtime into the shipped app.
 
 use cpu::BlockOp;
 use cpu::*;
+use std::collections::HashMap;
 
-/// Where the machine's state lives inside the imported linear memory.
-/// In production these are the app's own object addresses; in tests they
-/// are a synthetic layout the harness serializes into.
-#[derive(Clone)]
+/// The context block: u64 cells at `Layout::ctx` the generated code reads
+/// at entry. In production these are refreshed by the dispatcher before a
+/// call (base/tables once per run(), bias per call).
+pub const CTX_BASE: u64 = 0; // address every state offset is relative to
+pub const CTX_RD: u64 = 8; // chunked RAM: read pointer per 64 KiB chunk
+pub const CTX_WR: u64 = 16; // chunked RAM: write pointer per chunk (null = not owned)
+pub const CTX_MARKS: u64 = 24; // chunked RAM: one byte per 4 KiB page, nonzero = executable
+pub const CTX_BIAS: u64 = 32; // runtime guest pc = module pc + bias
+pub const CTX_CELLS: usize = 5;
+
+const CHUNK_SHIFT: u64 = ::memory::CHUNK_SHIFT as u64;
+const CHUNK_MASK: u64 = (1u64 << CHUNK_SHIFT) - 1;
+
+/// Where the machine's state lives inside the imported linear memory, and
+/// what that memory is. State offsets (x/f/pc/gen and the TLB) are relative
+/// to the state base read from the context block; tests point the base at
+/// 0 and use absolute addresses.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Layout {
-	pub x_base: u32,          // x[32] as i64
-	pub f_base: u32,          // f[32] as f64 (raw 8-byte cells)
-	// Some(_) when the guest runs under paging: memory ops probe the
-	// emulator's software TLB (hit -> translated physical -> flat DRAM
-	// window; miss/meta-stale -> bail, the interpreter walks and fills so
-	// the retry hits). None for bare/physical addressing.
+	/// The imported memory: i64 addresses (wasm64) or i32.
+	pub memory64: bool,
+	/// The imported memory is shared (SET builds); requires max_pages.
+	pub shared: bool,
+	/// Declared maximum of the import, in 64 KiB pages. An import matches a
+	/// memory whose maximum is at most this.
+	pub max_pages: Option<u64>,
+	/// Absolute address of the context block.
+	pub ctx: u64,
+	pub x_base: u64, // x[32] as i64
+	pub f_base: u64, // f[32] as raw 8-byte cells
+	pub pc_addr: u64, // u64
+	pub gen_addr: u64, // u32 write-snoop generation cell (flat RAM only)
+	pub baked_gen: u32, // generation a flat-RAM module was built against
+	/// u64: the fcsr CSR (fflags bits 0-4, frm bits 5-7). The float ops'
+	/// exception flags (NV, DZ, NX: cpu.rs's floating-point semantics) and
+	/// the float-CSR ops reach it here.
+	pub fcsr_addr: u64,
+	/// LR/SC: the reservation flag (one byte, 0/1) and the virtual address
+	/// it holds (u64) - Cpu::is_reservation_set / Cpu::reservation.
+	pub res_flag_addr: u64,
+	pub res_addr_addr: u64,
+	/// risc-box patch (SMP): the value LR read (Cpu::reservation_val); SC is a compare-and-swap from it
+	pub res_val_addr: u64,
+	/// risc-box patch (SMP): the machine has other harts: AMO*, LR/SC and FENCE are emitted as wasm atomics
+	/// on the shared memory, the operations Cpu::exec_atomic performs in the interpreter
+	pub smp: bool,
+	/// Some(_) when the guest runs under paging: memory ops probe the
+	/// emulator's software TLB (hit -> translated physical; miss/meta-stale
+	/// -> bail). None for bare/physical addressing.
 	pub tlb: Option<TlbLayout>,
-	pub pc_addr: u32,         // u64
-	pub gen_addr: u32,        // u32 write-snoop generation cell
-	pub baked_gen: u32,       // generation this block was built against
-	pub dram_base: u32,       // linear offset of guest DRAM byte 0
 	pub guest_dram_base: u64, // 0x8000_0000
 	pub dram_len: u64,
+	pub ram: Ram,
 }
 
-/// Where the software TLB's READ and WRITE ways live, mirroring
-/// Mmu::translate_address's hit path: set = (vaddr >> 12) & (sets-1);
-/// hit iff tags[set] == (vaddr & !0xfff) | 1 && metas[set] == *meta_cache.
-#[derive(Clone)]
+/// How guest DRAM is laid out in linear memory.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Ram {
+	/// One flat window: linear = dram_base + (phys - guest_dram_base). Every
+	/// store re-checks the write-snoop generation (gen_addr) afterwards.
+	Flat { dram_base: u64 },
+	/// memory.rs: 64 KiB chunks reached through the context block's
+	/// read/write pointer tables, with the executable-page marks beside them.
+	/// `store_bail` lists DRAM-offset windows [lo, hi) whose stores carry
+	/// interpreter-side bookkeeping and so always bail.
+	Chunked { store_bail: Vec<(u64, u64)> },
+}
+
+/// Where the software TLB's READ and WRITE ways live (offsets from the state
+/// base), mirroring Mmu::translate_address's hit path: set = (vaddr >> 12)
+/// & (sets-1); hit iff tags[set] == (vaddr & !0xfff) | 1 && metas[set] ==
+/// *meta_cache.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TlbLayout {
 	pub sets: u32, // power of two (the emulator uses 512)
-	pub read_tags: u32,
-	pub read_metas: u32,
-	pub read_ppns: u32,
-	pub write_tags: u32,
-	pub write_metas: u32,
-	pub write_ppns: u32,
-	pub meta_cache: u32, // u32 cell holding tlb_meta_cache
+	pub read_tags: u64,
+	pub read_metas: u64,
+	pub read_ppns: u64,
+	pub write_tags: u64,
+	pub write_metas: u64,
+	pub write_ppns: u64,
+	pub meta_cache: u64, // u32 cell holding tlb_meta_cache
 }
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -86,42 +145,126 @@ fn sleb(out: &mut Vec<u8>, mut v: i64) {
 	}
 }
 
+// opcode bytes used below
+const UNREACHABLE: u8 = 0x00;
+const BLOCK: u8 = 0x02;
+const LOOP: u8 = 0x03;
+const IF: u8 = 0x04;
+const ELSE: u8 = 0x05;
+const END: u8 = 0x0b;
+const BR: u8 = 0x0c;
+const BR_TABLE: u8 = 0x0e;
+const RETURN: u8 = 0x0f;
+const VOID: u8 = 0x40;
+const LOCAL_GET: u8 = 0x20;
+const LOCAL_SET: u8 = 0x21;
+const LOCAL_TEE: u8 = 0x22;
+const I32_LOAD: u8 = 0x28;
+const I64_LOAD: u8 = 0x29;
+const I32_LOAD8_U: u8 = 0x2d;
+const I64_STORE: u8 = 0x37;
+const I32_CONST: u8 = 0x41;
+const I64_CONST: u8 = 0x42;
+const I32_GE_U: u8 = 0x4f;
+const I32_NE: u8 = 0x47;
+const I64_EQZ: u8 = 0x50;
+const I64_EQ: u8 = 0x51;
+const I64_NE: u8 = 0x52;
+const I64_LT_U: u8 = 0x54;
+const I64_GT_U: u8 = 0x56;
+const I64_GE_U: u8 = 0x5a;
+const I32_ADD: u8 = 0x6a;
+const I64_ADD: u8 = 0x7c;
+const I64_SUB: u8 = 0x7d;
+const I64_AND: u8 = 0x83;
+const I64_OR: u8 = 0x84;
+const I64_SHL: u8 = 0x86;
+const I64_SHR_U: u8 = 0x88;
+const I32_WRAP_I64: u8 = 0xa7;
+const I64_EXTEND_I32_U: u8 = 0xad;
+// the float rules (Emit::get_s_bits and friends, fp_single/fp_double)
+const I32_EQZ: u8 = 0x45;
+const I32_LT_U: u8 = 0x49;
+const I32_GT_U: u8 = 0x4b;
+const I32_SUB: u8 = 0x6b;
+const I32_AND: u8 = 0x71;
+const I32_OR: u8 = 0x72;
+
+/// Local indices. Every generated function has the region shape
+/// (fuel: i64, entry: i32) -> i64. Address-typed locals (base, the chunk
+/// tables, addr) are i64 under memory64, i32 otherwise. The guest
+/// registers a region touches live in locals from FIRST_REG_LOCAL on: loaded
+/// once at entry, written back (the ones it wrote) at the single exit.
+#[derive(Clone, Copy)]
+struct Locals {
+	fuel: u32,
+	entry: u32,
+	scratch: u32,
+	cur: u32,
+	retired: u32,
+	scratch2: u32,
+	bias: u32,
+	tpc: u32,
+	pcv: u32,
+	base: u32,
+	rdt: u32,
+	wrt: u32,
+	marks: u32,
+	addr: u32,
+	meta: u32,
+	// i64 temporaries for the ops that need values twice (MULH's 128-bit
+	// product, an AMO's old value, LR/SC's address)
+	t0: u32,
+	t1: u32,
+	t2: u32,
+}
+
+// params fuel, entry | i64 scratch | i32 cur | i64 retired, scratch2, bias,
+// tpc, pcv | addr base, rdt, wrt, marks, addr | i32 meta | i64 t0, t1, t2 |
+// i64 registers
+const LOCALS: Locals = Locals {
+	fuel: 0, entry: 1, scratch: 2, cur: 3, retired: 4, scratch2: 5, bias: 6, tpc: 7, pcv: 8,
+	base: 9, rdt: 10, wrt: 11, marks: 12, addr: 13, meta: 14, t0: 15, t1: 16, t2: 17,
+};
+const FIRST_REG_LOCAL: u32 = 18;
+const NONE: u32 = u32::MAX;
+
 struct Emit<'a> {
 	code: Vec<u8>,
 	lay: &'a Layout,
-	// index of the i64 scratch local (0 in single-block mode; shifted in
-	// region mode where params occupy the low indices)
-	scratch: u32,
-	// second i64 scratch (TLB probes need vaddr and the entry offset live
-	// at once)
-	scratch2: u32,
-	// how many `if` labels currently enclose the emission point — a region
-	// transfer's br to the dispatch loop must add this to its depth
+	l: Locals,
+	// how many labels opened inside the current block's code enclose the
+	// emission point — a br to the dispatch loop (or the exit, one further
+	// out) must add this to its depth
 	if_depth: u32,
-	// region mode: map from guest block start pc -> region block index,
-	// plus the local indices for the dispatch loop
-	region: Option<RegionEmit>,
-}
-
-#[derive(Clone)]
-struct RegionEmit {
-	targets: std::collections::HashMap<u64, u32>,
-	cur_local: u32,     // i32: which region block to run next
-	retired_local: u32, // i64: ops retired so far
-	fuel_param: u32,    // i64 param: stop once retired >= fuel
-	// br depth from the CURRENT emission point to the dispatch loop head;
-	// set per-block during region emission
+	// guest block start pc (module-relative) -> block index
+	targets: HashMap<u64, u32>,
+	// br depth from the current block's code to the dispatch loop head
 	loop_depth: u32,
+	// label index of the indirect-jump dispatcher, when the region has one
+	dispatch: Option<u32>,
+	// the local caching x[r] / the bits of f[r] (NONE: not cached)
+	xl: [u32; 32],
+	fl: [u32; 32],
+	// registers written somewhere in the region (written back at exit)
+	xdirty: u32,
+	fdirty: u32,
+	reg_locals: u32,
+	// emit_block: an untranslatable first op aborts emission
+	strict: bool,
 }
-
-// opcode bytes used below
-const I32_CONST: u8 = 0x41;
-const I64_CONST: u8 = 0x42;
-const I64_LOAD: u8 = 0x29;
-const I64_STORE: u8 = 0x37;
-const RETURN: u8 = 0x0f;
 
 impl<'a> Emit<'a> {
+	fn new(lay: &'a Layout) -> Emit<'a> {
+		Emit {
+			code: Vec::new(), lay, l: LOCALS, if_depth: 0, targets: HashMap::new(),
+			loop_depth: 0, dispatch: None, xl: [NONE; 32], fl: [NONE; 32], xdirty: 0,
+			fdirty: 0, reg_locals: 0, strict: false,
+		}
+	}
+	fn op(&mut self, b: u8) {
+		self.code.push(b);
+	}
 	fn i32c(&mut self, v: i32) {
 		self.code.push(I32_CONST);
 		sleb(&mut self.code, v as i64);
@@ -130,27 +273,191 @@ impl<'a> Emit<'a> {
 		self.code.push(I64_CONST);
 		sleb(&mut self.code, v);
 	}
-	fn op(&mut self, b: u8) {
-		self.code.push(b);
+	fn idx(&mut self, v: u64) {
+		uleb(&mut self.code, v);
+	}
+	fn lget(&mut self, i: u32) {
+		self.op(LOCAL_GET);
+		self.idx(i as u64);
+	}
+	fn lset(&mut self, i: u32) {
+		self.op(LOCAL_SET);
+		self.idx(i as u64);
+	}
+	fn ltee(&mut self, i: u32) {
+		self.op(LOCAL_TEE);
+		self.idx(i as u64);
 	}
 	fn memarg(&mut self, align: u8, off: u64) {
 		self.code.push(align);
 		uleb(&mut self.code, off);
 	}
+	fn m64(&self) -> bool {
+		self.lay.memory64
+	}
+	/// i64 on the stack -> an address of the memory's index type
+	fn to_addr(&mut self) {
+		if !self.m64() {
+			self.op(I32_WRAP_I64);
+		}
+	}
+	fn addr_add(&mut self) {
+		let o = if self.m64() { I64_ADD } else { I32_ADD };
+		self.op(o);
+	}
+	fn addr_const(&mut self, v: u64) {
+		if self.m64() {
+			self.i64c(v as i64)
+		} else {
+			self.i32c(v as u32 as i32)
+		}
+	}
+	/// stack: address -> the pointer-width value stored there (index type)
+	fn load_ptr(&mut self) {
+		if self.m64() {
+			self.op(I64_LOAD);
+			self.memarg(3, 0);
+		} else {
+			self.op(I32_LOAD);
+			self.memarg(2, 0);
+		}
+	}
+	fn chunked(&self) -> bool {
+		matches!(self.lay.ram, Ram::Chunked { .. })
+	}
+
+	/// Give every register the region's ops can touch a local.
+	fn plan_registers(&mut self, blocks: &[(u64, Vec<BlockOp>)]) {
+		let (mut xm, mut fm) = (0u32, 0u32);
+		for &(_, ref ops) in blocks {
+			for op in ops.iter().filter(|o| translatable(o)) {
+				let m = 1u32 << op.rd | 1u32 << op.rs1 | 1u32 << op.rs2;
+				xm |= m;
+				if matches!(op.kind, HOT_FLD | HOT_FLW | HOT_FSD | HOT_FSW | HOT_FADD_D | HOT_FSUB_D
+					| HOT_FMUL_D | HOT_FDIV_D | HOT_FSGNJ_D | HOT_FMV_X_D | HOT_FMV_D_X | HOT_FCVT_D_W)
+				{
+					fm |= m;
+				}
+				// the float table ops: an over-approximation (FEQ's rd is an x
+				// register) costs one unused local, never a wrong value
+				if matches!(table_op(op), Some(TableOp::Fs(_)) | Some(TableOp::Fd(_))
+					| Some(TableOp::CvtDS) | Some(TableOp::CvtSD) | Some(TableOp::MvXW)
+					| Some(TableOp::MvWX))
+				{
+					fm |= m | 1u32 << ((op.word >> 27) & 0x1f);
+				}
+			}
+		}
+		let mut next = FIRST_REG_LOCAL;
+		for r in 1..32 {
+			if xm & (1 << r) != 0 {
+				self.xl[r] = next;
+				next += 1;
+			}
+		}
+		for r in 0..32 {
+			if fm & (1 << r) != 0 {
+				self.fl[r] = next;
+				next += 1;
+			}
+		}
+		self.reg_locals = next - FIRST_REG_LOCAL;
+	}
+
+	/// Read the context block (and the cached registers) into locals.
+	fn prologue(&mut self) {
+		let ctx = self.lay.ctx;
+		let (base, bias) = (self.l.base, self.l.bias);
+		self.addr_const(ctx);
+		self.op(I64_LOAD);
+		self.memarg(3, CTX_BASE);
+		self.to_addr();
+		self.lset(base);
+		self.addr_const(ctx);
+		self.op(I64_LOAD);
+		self.memarg(3, CTX_BIAS);
+		self.lset(bias);
+		if self.chunked() {
+			for (cell, local) in [(CTX_RD, self.l.rdt), (CTX_WR, self.l.wrt), (CTX_MARKS, self.l.marks)] {
+				self.addr_const(ctx);
+				self.op(I64_LOAD);
+				self.memarg(3, cell);
+				self.to_addr();
+				self.lset(local);
+			}
+		}
+		if let Some(t) = self.lay.tlb.clone() {
+			// the interpreter alone changes the meta; it cannot move mid-call
+			self.lget(base);
+			self.op(I32_LOAD);
+			self.memarg(2, t.meta_cache);
+			self.lset(self.l.meta);
+		}
+		for r in 1..32 {
+			if self.xl[r] != NONE {
+				self.lget(base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+				self.lset(self.xl[r]);
+			}
+		}
+		for r in 0..32 {
+			if self.fl[r] != NONE {
+				self.lget(base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+				self.lset(self.fl[r]);
+			}
+		}
+	}
+
+	/// The single exit (after the $exit block): write back the registers
+	/// the region wrote and pc, return retired.
+	fn epilogue(&mut self) {
+		let base = self.l.base;
+		for r in 1..32 {
+			if self.xdirty & (1 << r) != 0 {
+				self.lget(base);
+				self.lget(self.xl[r]);
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+			}
+		}
+		for r in 0..32 {
+			if self.fdirty & (1 << r) != 0 {
+				self.lget(base);
+				self.lget(self.fl[r]);
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+			}
+		}
+		self.lget(base);
+		self.lget(self.l.pcv);
+		self.op(I64_STORE);
+		self.memarg(3, self.lay.pc_addr);
+		self.lget(self.l.retired);
+	}
+
 	/// push x[r]
 	fn get_x(&mut self, r: u8) {
 		if r == 0 {
 			self.i64c(0);
 			return;
 		}
-		self.i32c(0);
-		self.op(I64_LOAD);
-		self.memarg(3, self.lay.x_base as u64 + r as u64 * 8);
+		match self.xl[r as usize] {
+			NONE => {
+				self.lget(self.l.base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+			}
+			l => self.lget(l),
+		}
 	}
-	/// x[rd] <- stack top, via address-first pattern
+	/// x[rd] <- value: set_x_pre before the value, set_x_post after (a write
+	/// to x0 is dropped)
 	fn set_x_pre(&mut self, r: u8) {
-		if r != 0 {
-			self.i32c(0);
+		if r != 0 && self.xl[r as usize] == NONE {
+			self.lget(self.l.base);
 		}
 	}
 	fn set_x_post(&mut self, r: u8) {
@@ -158,239 +465,1693 @@ impl<'a> Emit<'a> {
 			self.op(0x1a); // drop
 			return;
 		}
-		self.op(I64_STORE);
-		self.memarg(3, self.lay.x_base as u64 + r as u64 * 8);
+		match self.xl[r as usize] {
+			NONE => {
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.x_base + r as u64 * 8);
+			}
+			l => {
+				self.lset(l);
+				self.xdirty |= 1 << r;
+			}
+		}
 	}
 	/// push f[r] bit pattern as i64
 	fn get_f_bits(&mut self, r: u8) {
-		self.i32c(0);
-		self.op(I64_LOAD);
-		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+		match self.fl[r as usize] {
+			NONE => {
+				self.lget(self.l.base);
+				self.op(I64_LOAD);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+			}
+			l => self.lget(l),
+		}
 	}
-	fn set_f_bits_pre(&mut self) {
-		self.i32c(0);
+	fn set_f_pre(&mut self, r: u8) {
+		if self.fl[r as usize] == NONE {
+			self.lget(self.l.base);
+		}
 	}
 	fn set_f_bits_post(&mut self, r: u8) {
-		self.op(I64_STORE);
-		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+		match self.fl[r as usize] {
+			NONE => {
+				self.op(I64_STORE);
+				self.memarg(3, self.lay.f_base + r as u64 * 8);
+			}
+			l => {
+				self.lset(l);
+				self.fdirty |= 1 << r;
+			}
+		}
 	}
 	/// push f[r] as f64
 	fn get_f(&mut self, r: u8) {
-		self.i32c(0);
-		self.op(0x2b); // f64.load
-		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+		self.get_f_bits(r);
+		self.op(0xbf); // f64.reinterpret_i64 (bit-exact)
 	}
 	fn set_f_post(&mut self, r: u8) {
-		self.op(0x39); // f64.store
-		self.memarg(3, self.lay.f_base as u64 + r as u64 * 8);
+		self.op(0xbd); // i64.reinterpret_f64 (bit-exact)
+		self.set_f_bits_post(r);
+	}
+	/// push the bits (i32) of the single f[r] holds, as cpu.rs's s_unbox
+	/// reads it: the low 32 bits when NaN-boxed (upper 32 bits all ones),
+	/// else the canonical NaN
+	fn get_s_bits(&mut self, r: u8) {
+		self.get_f_bits(r);
+		self.op(I32_WRAP_I64);
+		self.i32c(FP_CANON_S as i32);
+		self.get_f_bits(r);
+		self.i64c(FP_BOX as i64);
+		self.op(I64_GE_U);
+		self.op(SELECT);
+	}
+	/// push the single f[r] holds (s_unbox) as f32
+	fn get_f32(&mut self, r: u8) {
+		self.get_s_bits(r);
+		self.op(0xbe); // f32.reinterpret_i32
+	}
+	/// single bits (i32) on the stack -> f[r], NaN-boxed (s_box)
+	fn set_s_bits_post(&mut self, r: u8) {
+		self.op(I64_EXTEND_I32_U);
+		self.i64c(FP_BOX as i64);
+		self.op(I64_OR);
+		self.set_f_bits_post(r);
+	}
+	/// f32 on the stack -> f[r], NaN-boxed, bit-exact (a result that cannot
+	/// be a NaN, or a bit move)
+	fn set_f32_post(&mut self, r: u8) {
+		self.op(0xbc); // i32.reinterpret_f32
+		self.set_s_bits_post(r);
+	}
+	/// push i32: the f register (unboxed when `single`) is a NaN
+	fn is_nan(&mut self, r: u8, single: bool) {
+		match single {
+			true => {
+				self.get_s_bits(r);
+				self.i32c(0x7fff_ffff);
+				self.op(I32_AND);
+				self.i32c(0x7f80_0000);
+				self.op(I32_GT_U);
+			}
+			false => {
+				self.get_f_bits(r);
+				self.i64c(i64::MAX);
+				self.op(I64_AND);
+				self.i64c(0x7ff0_0000_0000_0000);
+				self.op(I64_GT_U);
+			}
+		}
+	}
+	/// push i32: the f register (unboxed when `single`) is a SIGNALING NaN
+	/// (exponent all ones, quiet bit clear, fraction nonzero)
+	fn is_snan(&mut self, r: u8, single: bool) {
+		match single {
+			true => {
+				self.get_s_bits(r);
+				self.i32c(0x7fff_ffff);
+				self.op(I32_AND);
+				self.i32c(0x7f80_0001);
+				self.op(I32_SUB);
+				self.i32c(0x003f_ffff);
+				self.op(I32_LT_U);
+			}
+			false => {
+				self.get_f_bits(r);
+				self.i64c(i64::MAX);
+				self.op(I64_AND);
+				self.i64c(0x7ff0_0000_0000_0001);
+				self.op(I64_SUB);
+				self.i64c(0x0007_ffff_ffff_ffff);
+				self.op(I64_LT_U);
+			}
+		}
+	}
+	/// push i32: Cpu::fp_res_d's NV rule for a NaN result over the input
+	/// registers - one of them is a signaling NaN, or none is a NaN
+	fn nv_rule(&mut self, ins: &[(u8, bool)]) {
+		for (i, &(r, single)) in ins.iter().enumerate() {
+			self.is_snan(r, single);
+			if i > 0 {
+				self.op(I32_OR);
+			}
+		}
+		for (i, &(r, single)) in ins.iter().enumerate() {
+			self.is_nan(r, single);
+			if i > 0 {
+				self.op(I32_OR);
+			}
+		}
+		self.op(I32_EQZ);
+		self.op(I32_OR);
+	}
+	/// consume an i32 condition: if nonzero, fcsr |= bits
+	fn fcsr_or_if(&mut self, bits: i64) {
+		self.op(IF);
+		self.op(VOID);
+		self.fcsr_or(bits);
+		self.op(END);
+	}
+	/// An arithmetic result on the stack (f64, or f32 when `single`) -> f[r]
+	/// (set_f_pre(r) first) as Cpu::fp_res_d / fp_res_s write it: a NaN
+	/// becomes the canonical NaN, raising NV per nv_rule over `ins` (read
+	/// before f[r] is written, so r may alias an input); a single is
+	/// NaN-boxed.
+	fn set_canon_post(&mut self, r: u8, single: bool, ins: &[(u8, bool)]) {
+		let t = self.l.t0;
+		match single {
+			true => {
+				self.op(0xbc); // i32.reinterpret_f32
+				self.op(I64_EXTEND_I32_U);
+			}
+			false => self.op(0xbd), // i64.reinterpret_f64
+		}
+		self.lset(t);
+		self.lget(t);
+		self.i64c(if single { 0x7fff_ffff } else { i64::MAX });
+		self.op(I64_AND);
+		self.i64c(if single { 0x7f80_0000 } else { 0x7ff0_0000_0000_0000 });
+		self.op(I64_GT_U);
+		self.op(IF);
+		self.op(0x7e); // -> i64
+		self.nv_rule(ins);
+		self.fcsr_or_if(FFLAG_NV as i64);
+		self.i64c(if single { FP_CANON_S as i64 } else { FP_CANON_D as i64 });
+		self.op(ELSE);
+		self.lget(t);
+		self.op(END);
+		if single {
+			self.i64c(FP_BOX as i64);
+			self.op(I64_OR);
+		}
+		self.set_f_bits_post(r);
+	}
+	/// fcsr |= bits (Cpu::set_fcsr_dz and friends)
+	fn fcsr_or(&mut self, bits: i64) {
+		let (base, a) = (self.l.base, self.lay.fcsr_addr);
+		self.lget(base);
+		self.lget(base);
+		self.op(I64_LOAD);
+		self.memarg(3, a);
+		self.i64c(bits);
+		self.op(I64_OR);
+		self.op(I64_STORE);
+		self.memarg(3, a);
+	}
+	/// a 0xfc-prefixed opcode (the saturating float->int conversions)
+	fn fc(&mut self, sub: u64) {
+		self.op(0xfc);
+		uleb(&mut self.code, sub);
 	}
 
-	/// pc <- const, then leave. Single-block mode returns the constant
-	/// retired count. Region mode: if pc names another region block, add
-	/// this block's retired-so-far and branch back to the dispatch loop;
-	/// otherwise return retired_local + the constant.
+	/// push the runtime pc for module pc `rel`
+	fn push_pc(&mut self, rel: u64) {
+		self.i64c(rel as i64);
+		self.lget(self.l.bias);
+		self.op(I64_ADD);
+	}
+
+	fn add_retired(&mut self, n: u64) {
+		if n != 0 {
+			let r = self.l.retired;
+			self.lget(r);
+			self.i64c(n as i64);
+			self.op(I64_ADD);
+			self.lset(r);
+		}
+	}
+
+	/// pc <- runtime pc for `rel`, then branch to the single exit.
+	fn to_exit(&mut self, rel: u64) {
+		self.push_pc(rel);
+		self.lset(self.l.pcv);
+		self.op(BR);
+		let d = self.loop_depth + self.if_depth + 1;
+		self.idx(d as u64);
+	}
+
+	/// pc <- `pc`, `retired` more retired: if pc names a region block, branch
+	/// back to the dispatch loop (which checks fuel first); else leave.
 	fn exit(&mut self, pc: u64, retired: u64) {
-		match self.region.clone() {
-			None => {
-				self.i32c(0);
-				self.i64c(pc as i64);
-				self.op(I64_STORE);
-				self.memarg(3, self.lay.pc_addr as u64);
-				self.i64c(retired as i64);
-				self.op(RETURN);
+		self.add_retired(retired);
+		match self.targets.get(&pc).copied() {
+			Some(idx) => {
+				self.i32c(idx as i32);
+				self.lset(self.l.cur);
+				self.op(BR);
+				let d = self.loop_depth + self.if_depth;
+				self.idx(d as u64);
 			}
-			Some(r) => {
-				self.op(0x20);
-				uleb(&mut self.code, r.retired_local as u64);
-				self.i64c(retired as i64);
-				self.op(0x7c);
-				self.op(0x21);
-				uleb(&mut self.code, r.retired_local as u64);
-				match r.targets.get(&pc) {
-					Some(&idx) => {
-						self.i32c(idx as i32);
-						self.op(0x21);
-						uleb(&mut self.code, r.cur_local as u64);
-						self.op(0x0c); // br to dispatch loop
-						uleb(&mut self.code, (r.loop_depth + self.if_depth) as u64);
-					}
-					None => {
-						self.i32c(0);
-						self.i64c(pc as i64);
-						self.op(I64_STORE);
-						self.memarg(3, self.lay.pc_addr as u64);
-						self.op(0x20);
-						uleb(&mut self.code, r.retired_local as u64);
-						self.op(RETURN);
+			None => self.to_exit(pc),
+		}
+	}
+
+	/// A bail: pc <- `pc`, leave. Bails NEVER transfer within a region — a
+	/// bail pc that happens to be a block start must still hand control
+	/// back (a memory bail at a block's first op would otherwise loop
+	/// forever re-entering it).
+	fn bail(&mut self, pc: u64, retired: u64) {
+		self.add_retired(retired);
+		self.to_exit(pc);
+	}
+
+	/// consume an i32 condition: if nonzero, bail
+	fn bail_if(&mut self, pc: u64, retired: u64) {
+		self.op(IF);
+		self.op(VOID);
+		self.if_depth += 1;
+		self.bail(pc, retired);
+		self.if_depth -= 1;
+		self.op(END);
+	}
+
+	/// stack: guest VIRTUAL address (i64). Leaves the LINEAR address of the
+	/// access (index type) on the stack, or bails with pc at `op_addr`.
+	/// Every check branches to ONE bail per access (block $fail), so a
+	/// memory op carries a single exit sequence, not one per check.
+	fn dram_addr(&mut self, width: u64, op_addr: u64, retired: u64, write: bool) {
+		let (sc, sc2, addr) = (self.l.scratch, self.l.scratch2, self.l.addr);
+		self.lset(sc);
+		self.op(BLOCK); // $done
+		self.op(VOID);
+		self.op(BLOCK); // $fail
+		self.op(VOID);
+		// The interpreter's fast path: the whole access inside one 4 KiB
+		// page. Anything else (cross-page) takes its byte-wise path there.
+		self.lget(sc);
+		self.i64c(0xfff);
+		self.op(I64_AND);
+		self.i64c((0x1000 - width) as i64);
+		self.op(I64_GT_U);
+		self.br_if(0);
+		self.lget(sc);
+		if self.lay.tlb.is_some() {
+			self.tlb_translate(write);
+		}
+		// off = phys - guest_dram_base; bail unless [off, off+width) is DRAM
+		self.i64c(self.lay.guest_dram_base as i64);
+		self.op(I64_SUB);
+		self.ltee(sc);
+		self.i64c(self.lay.dram_len.wrapping_sub(width) as i64);
+		self.op(I64_GT_U);
+		self.br_if(0);
+		match self.lay.ram.clone() {
+			Ram::Flat { dram_base } => {
+				self.lget(sc);
+				self.to_addr();
+				self.addr_const(dram_base);
+				self.addr_add();
+			}
+			Ram::Chunked { store_bail } => {
+				if write {
+					// an executable page: the interpreter's store bumps the
+					// write-snoop generation (and so stops stale code)
+					self.lget(self.l.marks);
+					self.lget(sc);
+					self.i64c(12);
+					self.op(I64_SHR_U);
+					self.to_addr();
+					self.addr_add();
+					self.op(I32_LOAD8_U);
+					self.memarg(0, 0);
+					self.br_if(0);
+					for (lo, hi) in store_bail {
+						self.lget(sc);
+						self.i64c(lo as i64);
+						self.op(I64_SUB);
+						self.i64c(hi.wrapping_sub(lo) as i64);
+						self.op(I64_LT_U);
+						self.br_if(0);
 					}
 				}
+				// the chunk's pointer from the read or write table
+				let table = if write { self.l.wrt } else { self.l.rdt };
+				self.lget(table);
+				self.lget(sc);
+				self.i64c(CHUNK_SHIFT as i64);
+				self.op(I64_SHR_U);
+				self.i64c(if self.m64() { 3 } else { 2 });
+				self.op(I64_SHL);
+				self.to_addr();
+				self.addr_add();
+				self.load_ptr();
+				if write {
+					// null: a Zero or Shared chunk. The interpreter's store
+					// materializes (copy-on-write) it; the retry runs here.
+					if !self.m64() {
+						self.op(I64_EXTEND_I32_U);
+					}
+					self.ltee(sc2);
+					self.op(I64_EQZ);
+					self.br_if(0);
+					self.lget(sc2);
+					self.to_addr();
+				}
+				self.lget(sc);
+				self.i64c(CHUNK_MASK as i64);
+				self.op(I64_AND);
+				self.to_addr();
+				self.addr_add();
 			}
 		}
+		self.lset(addr);
+		self.op(BR);
+		self.idx(1); // $done
+		self.op(END); // $fail
+		self.if_depth += 1; // inside $done
+		self.bail(op_addr, retired);
+		self.if_depth -= 1;
+		self.op(END); // $done
+		self.lget(addr);
 	}
 
-	/// A bail: pc <- const, return retired. Bails NEVER transfer within a
-	/// region — a bail pc that happens to be a block start must still hand
-	/// control back (a gen bail means this module is stale; a memory bail
-	/// at a block's first op would otherwise loop forever re-entering it).
-	fn bail(&mut self, pc: u64, retired: u64) {
-		match self.region.clone() {
-			None => self.exit(pc, retired),
-			Some(r) => {
-				self.i32c(0);
-				self.i64c(pc as i64);
-				self.op(I64_STORE);
-				self.memarg(3, self.lay.pc_addr as u64);
-				self.op(0x20);
-				uleb(&mut self.code, r.retired_local as u64);
-				self.i64c(retired as i64);
-				self.op(0x7c);
-				self.op(RETURN);
-			}
+	/// dram_addr for a store, plus natural alignment of the LINEAR address (a wasm atomic traps on a
+	/// misaligned one; the interpreter handles it instead).
+	fn dram_addr_aligned(&mut self, width: u64, op_addr: u64, retired: u64) {
+		self.dram_addr(width, op_addr, retired, true);
+		self.op(DROP);
+		self.lget(self.l.addr);
+		if !self.m64() {
+			self.op(I64_EXTEND_I32_U);
 		}
+		self.i64c(width as i64 - 1);
+		self.op(I64_AND);
+		self.op(0x50); // i64.eqz
+		self.op(0x45); // i32.eqz: misaligned
+		self.bail_if(op_addr, retired);
+		self.lget(self.l.addr);
 	}
 
-	/// JALR's exit tail after the pc store (target already stored): the
-	/// runtime target cannot be an in-region transfer in v1, so it always
-	/// returns.
-	fn jalr_ret(&mut self, retired: u64) {
-		match self.region.clone() {
-			None => {
-				self.i64c(retired as i64);
-				self.op(RETURN);
-			}
-			Some(r) => {
-				self.op(0x20);
-				uleb(&mut self.code, r.retired_local as u64);
-				self.i64c(retired as i64);
-				self.op(0x7c);
-				self.op(RETURN);
-			}
-		}
-	}
-	/// stack: guest VIRTUAL address (i64). Leaves LINEAR i32 address on the
-	/// stack, translating through the software TLB when the layout has one
-	/// (bailing on miss) and bounds-checking the DRAM window either way.
-	fn dram_addr(&mut self, width: u64, op_addr: u64, retired: u64, write: bool) {
-		if self.lay.tlb.is_some() {
-			self.tlb_translate(op_addr, retired, write);
-		}
-		self.dram_addr_flat(width, op_addr, retired);
+	fn br_if(&mut self, depth: u32) {
+		self.op(0x0d);
+		self.idx(depth as u64);
 	}
 
-	/// stack: guest virtual address -> stack: guest PHYSICAL address, or
-	/// bail on TLB miss / stale meta. Scratch: vaddr; scratch2: entry off.
-	fn tlb_translate(&mut self, op_addr: u64, retired: u64, write: bool) {
-		let t = match &self.lay.tlb {
-			Some(t) => TlbLayout { ..TlbLayout {
-				sets: t.sets,
-				read_tags: t.read_tags, read_metas: t.read_metas, read_ppns: t.read_ppns,
-				write_tags: t.write_tags, write_metas: t.write_metas, write_ppns: t.write_ppns,
-				meta_cache: t.meta_cache,
-			} },
-			None => unreachable!(),
-		};
+	/// Inside dram_addr's $fail block. stack: guest virtual address ->
+	/// stack: guest PHYSICAL address; a TLB miss or stale meta branches to
+	/// the bail. scratch: vaddr; scratch2: set*8.
+	fn tlb_translate(&mut self, write: bool) {
+		let t = self.lay.tlb.clone().unwrap();
 		let (tags, metas, ppns) = match write {
 			false => (t.read_tags, t.read_metas, t.read_ppns),
 			true => (t.write_tags, t.write_metas, t.write_ppns),
 		};
-		let sc = self.scratch as u64;
-		let sc2 = self.scratch2 as u64;
-		// scratch = vaddr
-		self.op(0x21); uleb(&mut self.code, sc);
+		let (sc, sc2, base) = (self.l.scratch, self.l.scratch2, self.l.base);
+		self.lset(sc);
 		// scratch2 = ((vaddr >> 12) & (sets-1)) * 8   (tag/ppn entry offset)
-		self.op(0x20); uleb(&mut self.code, sc);
+		self.lget(sc);
 		self.i64c(12);
-		self.op(0x88); // shr_u
+		self.op(I64_SHR_U);
 		self.i64c((t.sets - 1) as i64);
-		self.op(0x83); // and
-		self.i64c(8);
-		self.op(0x7e); // mul
-		self.op(0x21); uleb(&mut self.code, sc2);
-		// tag hit? mem[tags + scratch2] == (vaddr & !0xfff) | 1
-		self.op(0x20); uleb(&mut self.code, sc2);
-		self.op(0xa7); // wrap
+		self.op(I64_AND);
+		self.i64c(3);
+		self.op(I64_SHL);
+		self.lset(sc2);
+		// tag hit? tags[set] == (vaddr & !0xfff) | 1
+		self.lget(base);
+		self.lget(sc2);
+		self.to_addr();
+		self.addr_add();
 		self.op(I64_LOAD);
-		self.memarg(3, tags as u64);
-		self.op(0x20); uleb(&mut self.code, sc);
+		self.memarg(3, tags);
+		self.lget(sc);
 		self.i64c(!0xfffi64);
-		self.op(0x83);
+		self.op(I64_AND);
 		self.i64c(1);
-		self.op(0x84); // or
-		self.op(0x52); // i64.ne
-		self.op(0x04); self.op(0x40);
-		self.bail(op_addr, retired);
-		self.op(0x0b);
-		// meta fresh? metas is u32-per-set: offset = scratch2/2
-		self.op(0x20); uleb(&mut self.code, sc2);
+		self.op(I64_OR);
+		self.op(I64_NE);
+		self.br_if(0);
+		// meta fresh? metas are u32 per set: offset = scratch2 / 2
+		self.lget(base);
+		self.lget(sc2);
 		self.i64c(1);
-		self.op(0x88); // shr_u -> *4 scale
-		self.op(0xa7);
-		self.op(0x28); // i32.load
-		self.memarg(2, metas as u64);
-		self.i32c(0);
-		self.op(0x28);
-		self.memarg(2, t.meta_cache as u64);
-		self.op(0x47); // i32.ne
-		self.op(0x04); self.op(0x40);
-		self.bail(op_addr, retired);
-		self.op(0x0b);
+		self.op(I64_SHR_U);
+		self.to_addr();
+		self.addr_add();
+		self.op(I32_LOAD);
+		self.memarg(2, metas);
+		self.lget(self.l.meta);
+		self.op(I32_NE);
+		self.br_if(0);
 		// phys = ppns[set] | (vaddr & 0xfff)
-		self.op(0x20); uleb(&mut self.code, sc2);
-		self.op(0xa7);
+		self.lget(base);
+		self.lget(sc2);
+		self.to_addr();
+		self.addr_add();
 		self.op(I64_LOAD);
-		self.memarg(3, ppns as u64);
-		self.op(0x20); uleb(&mut self.code, sc);
+		self.memarg(3, ppns);
+		self.lget(sc);
 		self.i64c(0xfff);
-		self.op(0x83);
-		self.op(0x84); // or
+		self.op(I64_AND);
+		self.op(I64_OR);
 	}
 
-	/// stack: guest PHYSICAL address. Leaves LINEAR i32 address on the
-	/// stack. Bails unless the whole `width` fits in the DRAM window.
-	fn dram_addr_flat(&mut self, width: u64, op_addr: u64, retired: u64) {
-		// scratch = guest_addr - guest_dram_base
-		self.i64c(self.lay.guest_dram_base as i64);
-		self.op(0x7d); // i64.sub
-		self.op(0x21); // local.set scratch
-		uleb(&mut self.code, self.scratch as u64);
-		// if scratch > dram_len - width (unsigned): bail
-		self.op(0x20); // local.get scratch
-		uleb(&mut self.code, self.scratch as u64);
-		self.i64c((self.lay.dram_len - width) as i64);
-		self.op(0x56); // i64.gt_u
-		self.op(0x04); // if (empty)
-		self.op(0x40);
-		self.bail(op_addr, retired);
-		self.op(0x0b); // end if
-		// linear = dram_base + scratch (wrapped to i32)
-		self.op(0x20);
-		uleb(&mut self.code, self.scratch as u64);
-		self.op(0xa7); // i32.wrap_i64
-		self.i32c(self.lay.dram_base as i32);
-		self.op(0x6a); // i32.add
-	}
-	/// after a store: if gen cell != baked, exit with pc=next, retired incl.
+	/// Flat RAM only: after a store, if the generation cell moved, exit with
+	/// pc = next and the store counted. Chunked stores never reach a marked
+	/// page (they bail first), so they cannot move the generation.
 	fn gen_check(&mut self, next_pc: u64, retired: u64) {
-		self.i32c(0);
-		self.op(0x28); // i32.load
-		self.memarg(2, self.lay.gen_addr as u64);
+		if self.chunked() {
+			return;
+		}
+		self.lget(self.l.base);
+		self.op(I32_LOAD);
+		self.memarg(2, self.lay.gen_addr);
 		self.i32c(self.lay.baked_gen as i32);
-		self.op(0x47); // i32.ne
-		self.op(0x04);
-		self.op(0x40);
-		self.bail(next_pc, retired);
-		self.op(0x0b);
+		self.op(I32_NE);
+		self.bail_if(next_pc, retired);
 	}
 }
 
-/// Emit ops[..] starting at guest pc `start`. Returns None if any op is
-/// outside the supported subset (caller keeps interpreting that block).
-pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
-	let mut e = Emit { code: Vec::new(), lay, scratch: 0, scratch2: 1, if_depth: 0, region: None };
-	if !emit_seq(&mut e, ops, start) {
-		return None;
+/// Whether emit_seq translates `op` (anything else becomes a bail to the
+/// interpreter). Kept beside emit_seq; a test pins the two together.
+pub(crate) fn translatable(op: &BlockOp) -> bool {
+	if op.kind == 0 {
+		return table_op(op).is_some();
 	}
-	Some(assemble(e.code))
+	matches!(op.kind,
+		HOT_ADDI | HOT_ADD | HOT_SUB | HOT_AND | HOT_OR | HOT_XOR | HOT_ANDI | HOT_ORI
+		| HOT_XORI | HOT_MUL | HOT_SLL | HOT_SRL | HOT_SRA | HOT_SLLI | HOT_SRLI | HOT_SRAI
+		| HOT_LUI | HOT_AUIPC | HOT_ADDIW | HOT_ADDW | HOT_SUBW | HOT_SLLIW | HOT_SRLIW
+		| HOT_SRAIW | HOT_SLLW | HOT_SRLW | HOT_SRAW | HOT_SLT | HOT_SLTU | HOT_SLTI
+		| HOT_SLTIU | HOT_LD | HOT_LW | HOT_LWU | HOT_LH | HOT_LHU | HOT_LB | HOT_LBU
+		| HOT_SD | HOT_SW | HOT_SH | HOT_SB | HOT_BEQ | HOT_BNE | HOT_BLT | HOT_BGE
+		| HOT_BLTU | HOT_BGEU | HOT_JAL | HOT_JALR | HOT_FLD | HOT_FLW | HOT_FSD | HOT_FSW
+		| HOT_FADD_D | HOT_FSUB_D | HOT_FMUL_D | HOT_FDIV_D | HOT_FSGNJ_D | HOT_FMV_X_D
+		| HOT_FMV_D_X | HOT_FCVT_D_W)
+}
+
+/// The non-hot ops the translator takes over from the table path, by the
+/// INSTRUCTIONS entry the interpreter decoded them to. Every one of them is
+/// the LAST op of its block (build_block ends a block at any non-hot op), so
+/// translating one is what lets a region run on into the next block instead
+/// of handing back to the interpreter there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableOp {
+	Div,
+	Divu,
+	Rem,
+	Remu,
+	Mulw,
+	Divw,
+	Divuw,
+	Remw,
+	Remuw,
+	Fence,
+	/// the high 64 bits of the 128-bit product: (rs1 signed, rs2 signed)
+	Mulh(bool, bool),
+	/// AMO*: the operation, and whether it is the .W form
+	Amo(AmoOp, bool),
+	/// LR / SC: whether it is the .W form
+	Lr(bool),
+	Sc(bool),
+	/// a single-precision op (the low 32 bits of the f registers)
+	Fs(FOp),
+	/// a double-precision op the hot set leaves to the table
+	Fd(FOp),
+	CvtDS,
+	CvtSD,
+	MvXW,
+	MvWX,
+	/// CSRRW/S/C and their I forms on fflags (1), frm (2) or fcsr (3) only:
+	/// pure state, no privilege check that can fail, no interrupt to re-arm
+	Csr(CsrOp, bool, u16),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AmoOp {
+	Add,
+	Swap,
+	Xor,
+	Or,
+	And,
+	Min,
+	Max,
+	MinU,
+	MaxU,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FOp {
+	Add,
+	Sub,
+	Mul,
+	Div,
+	Sqrt,
+	Sgnj,
+	Sgnjn,
+	Sgnjx,
+	Eq,
+	Lt,
+	Le,
+	/// float -> int (FCVT.W/WU/L/LU.x)
+	ToW,
+	ToWu,
+	ToL,
+	ToLu,
+	/// int -> float (FCVT.x.W/WU/L/LU)
+	FromW,
+	FromWu,
+	FromL,
+	FromLu,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CsrOp {
+	W,
+	S,
+	C,
+}
+
+
+fn table_op(op: &BlockOp) -> Option<TableOp> {
+	use self::AmoOp as A;
+	use self::FOp as F;
+	let csr = ((op.word >> 20) & 0xfff) as u16;
+	let fcsr_family = (1..=3).contains(&csr);
+	// float -> int conversions round per the word's rm: a static 0-4 is
+	// translated (to_int); DYN (frm, known only at run time) and the
+	// reserved 5/6 (an illegal-instruction trap) stay with the interpreter
+	let static_rm = (op.word >> 12) & 7 <= 4;
+	Some(match ::cpu::op_name(op) {
+		"DIV" => TableOp::Div,
+		"DIVU" => TableOp::Divu,
+		"REM" => TableOp::Rem,
+		"REMU" => TableOp::Remu,
+		"MULW" => TableOp::Mulw,
+		"DIVW" => TableOp::Divw,
+		"DIVUW" => TableOp::Divuw,
+		"REMW" => TableOp::Remw,
+		"REMUW" => TableOp::Remuw,
+		// the interpreter's FENCE and FENCE.I do nothing (one hart; the
+		// write snoop already keeps cached code coherent)
+		"FENCE" | "FENCE.I" => TableOp::Fence,
+		"MULH" => TableOp::Mulh(true, true),
+		"MULHSU" => TableOp::Mulh(true, false),
+		"MULHU" => TableOp::Mulh(false, false),
+		"AMOADD.W" => TableOp::Amo(A::Add, true),
+		"AMOADD.D" => TableOp::Amo(A::Add, false),
+		"AMOSWAP.W" => TableOp::Amo(A::Swap, true),
+		"AMOSWAP.D" => TableOp::Amo(A::Swap, false),
+		"AMOXOR.W" => TableOp::Amo(A::Xor, true),
+		"AMOXOR.D" => TableOp::Amo(A::Xor, false),
+		"AMOOR.W" => TableOp::Amo(A::Or, true),
+		"AMOOR.D" => TableOp::Amo(A::Or, false),
+		"AMOAND.W" => TableOp::Amo(A::And, true),
+		"AMOAND.D" => TableOp::Amo(A::And, false),
+		"AMOMIN.W" => TableOp::Amo(A::Min, true),
+		"AMOMIN.D" => TableOp::Amo(A::Min, false),
+		"AMOMAX.W" => TableOp::Amo(A::Max, true),
+		"AMOMAX.D" => TableOp::Amo(A::Max, false),
+		"AMOMINU.W" => TableOp::Amo(A::MinU, true),
+		"AMOMINU.D" => TableOp::Amo(A::MinU, false),
+		"AMOMAXU.W" => TableOp::Amo(A::MaxU, true),
+		"AMOMAXU.D" => TableOp::Amo(A::MaxU, false),
+		"LR.W" => TableOp::Lr(true),
+		"LR.D" => TableOp::Lr(false),
+		"SC.W" => TableOp::Sc(true),
+		"SC.D" => TableOp::Sc(false),
+		"FADD.S" => TableOp::Fs(F::Add),
+		"FSUB.S" => TableOp::Fs(F::Sub),
+		"FMUL.S" => TableOp::Fs(F::Mul),
+		"FDIV.S" => TableOp::Fs(F::Div),
+		"FSQRT.S" => TableOp::Fs(F::Sqrt),
+		"FSGNJ.S" => TableOp::Fs(F::Sgnj),
+		"FSGNJN.S" => TableOp::Fs(F::Sgnjn),
+		"FSGNJX.S" => TableOp::Fs(F::Sgnjx),
+		"FEQ.S" => TableOp::Fs(F::Eq),
+		"FLT.S" => TableOp::Fs(F::Lt),
+		"FLE.S" => TableOp::Fs(F::Le),
+		"FCVT.W.S" if static_rm => TableOp::Fs(F::ToW),
+		"FCVT.WU.S" if static_rm => TableOp::Fs(F::ToWu),
+		"FCVT.L.S" if static_rm => TableOp::Fs(F::ToL),
+		"FCVT.LU.S" if static_rm => TableOp::Fs(F::ToLu),
+		"FCVT.S.W" => TableOp::Fs(F::FromW),
+		"FCVT.S.WU" => TableOp::Fs(F::FromWu),
+		"FCVT.S.L" => TableOp::Fs(F::FromL),
+		"FCVT.S.LU" => TableOp::Fs(F::FromLu),
+		// not FMADD/FMSUB/FNMSUB/FNMADD (.S or .D): the interpreter FUSES
+		// them (one rounding, mul_add), and wasm has no fused multiply-add
+		// to match it with; and not FMIN/FMAX, FCLASS
+		"FSQRT.D" => TableOp::Fd(F::Sqrt),
+		"FSGNJN.D" => TableOp::Fd(F::Sgnjn),
+		"FSGNJX.D" => TableOp::Fd(F::Sgnjx),
+		"FEQ.D" => TableOp::Fd(F::Eq),
+		"FLT.D" => TableOp::Fd(F::Lt),
+		"FLE.D" => TableOp::Fd(F::Le),
+		"FCVT.W.D" if static_rm => TableOp::Fd(F::ToW),
+		"FCVT.WU.D" if static_rm => TableOp::Fd(F::ToWu),
+		"FCVT.L.D" if static_rm => TableOp::Fd(F::ToL),
+		"FCVT.LU.D" if static_rm => TableOp::Fd(F::ToLu),
+		"FCVT.D.WU" => TableOp::Fd(F::FromWu),
+		"FCVT.D.L" => TableOp::Fd(F::FromL),
+		"FCVT.D.LU" => TableOp::Fd(F::FromLu),
+		"FCVT.D.S" => TableOp::CvtDS,
+		"FCVT.S.D" => TableOp::CvtSD,
+		"FMV.X.W" => TableOp::MvXW,
+		"FMV.W.X" => TableOp::MvWX,
+		"CSRRW" if fcsr_family => TableOp::Csr(CsrOp::W, false, csr),
+		"CSRRS" if fcsr_family => TableOp::Csr(CsrOp::S, false, csr),
+		"CSRRC" if fcsr_family => TableOp::Csr(CsrOp::C, false, csr),
+		"CSRRWI" if fcsr_family => TableOp::Csr(CsrOp::W, true, csr),
+		"CSRRSI" if fcsr_family => TableOp::Csr(CsrOp::S, true, csr),
+		"CSRRCI" if fcsr_family => TableOp::Csr(CsrOp::C, true, csr),
+		_ => return None,
+	})
+}
+
+/// One table op, translated: each arm reproduces its INSTRUCTIONS closure
+/// exactly - including the interpreter's own quirks, which are what the
+/// guest has been running all along. `addr` is the op's module pc, `next`
+/// the one after it; a memory op that cannot take the fast path bails at
+/// `addr` having retired `ret_before`, before any of its effects.
+fn emit_table_op(e: &mut Emit, t: TableOp, op: &BlockOp, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	let (rd, rs1, rs2) = (op.rd, op.rs1, op.rs2);
+	match t {
+		TableOp::Mulh(s1, s2) => mulh(e, rd, rs1, rs2, s1, s2),
+		TableOp::Amo(a, w) => amo(e, a, w, rd, rs1, rs2, addr, next, ret_before, ret_after),
+		TableOp::Lr(w) => lr(e, w, rd, rs1, addr, ret_before),
+		TableOp::Sc(w) => sc(e, w, rd, rs1, rs2, addr, next, ret_before, ret_after),
+		TableOp::Fs(f) => fp_single(e, f, rd, rs1, rs2, ((op.word >> 12) & 7) as u8),
+		TableOp::Fd(f) => fp_double(e, f, rd, rs1, rs2, ((op.word >> 12) & 7) as u8),
+		TableOp::CvtDS => {
+			// Cpu::fp_d_of_s: the unboxed single widened (exact); a NaN
+			// canonical, NV when it was signaling
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.op(0xbb); // f64.promote_f32
+			e.set_canon_post(rd, false, &[(rs1, true)]);
+		}
+		TableOp::CvtSD => {
+			// Cpu::fp_s_of_d: round to nearest-even (f32.demote_f64), boxed;
+			// a NaN canonical, NV when it was signaling
+			e.set_f_pre(rd);
+			e.get_f(rs1);
+			e.op(0xb6); // f32.demote_f64
+			e.set_canon_post(rd, true, &[(rs1, false)]);
+		}
+		TableOp::MvXW => {
+			// x = bits as i32 as i64
+			e.set_x_pre(rd);
+			e.get_f_bits(rs1);
+			wrap32(e);
+			e.set_x_post(rd);
+		}
+		TableOp::MvWX => {
+			// f = the low 32 bits of x, NaN-boxed
+			e.set_f_pre(rd);
+			e.get_x(rs1);
+			e.i64c(FP_BOX as i64);
+			e.op(I64_OR);
+			e.set_f_bits_post(rd);
+		}
+		TableOp::Csr(kind, imm, csr) => csr_op(e, kind, imm, csr, rd, rs1),
+		_ => emit_int_table_op(e, t, rd, rs1, rs2),
+	}
+}
+
+const I64_XOR: u8 = 0x85;
+const I64_MUL: u8 = 0x7e;
+const I64_SHR_S: u8 = 0x87;
+const SELECT: u8 = 0x1b;
+const DROP: u8 = 0x1a;
+
+/// MULH / MULHSU / MULHU: the high half of the 128-bit product, which wasm
+/// has no instruction for. From 32-bit limbs (each partial product fits in
+/// 64 bits): with a = ah:al, b = bh:bl,
+///   carry = ((al*bl >> 32) + lo(al*bh) + lo(ah*bl)) >> 32
+///   hi_u  = ah*bh + (al*bh >> 32) + (ah*bl >> 32) + carry
+/// then two's complement turns the unsigned high half into the signed one:
+/// hi_s = hi_u - (a < 0 ? b : 0) - (b < 0 ? a : 0), each term only for an
+/// operand that is signed.
+fn mulh(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, s1: bool, s2: bool) {
+	let (a, b, c) = (e.l.t0, e.l.t1, e.l.t2);
+	let lo = |e: &mut Emit, l: u32| {
+		e.lget(l);
+		e.i64c(0xffff_ffff);
+		e.op(I64_AND);
+	};
+	let hi = |e: &mut Emit, l: u32| {
+		e.lget(l);
+		e.i64c(32);
+		e.op(I64_SHR_U);
+	};
+	e.get_x(rs1);
+	e.lset(a);
+	e.get_x(rs2);
+	e.lset(b);
+	// c = al*bl >> 32
+	lo(e, a);
+	lo(e, b);
+	e.op(I64_MUL);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	// + lo(al*bh) + lo(ah*bl), then >> 32: the carry into the high half
+	lo(e, a);
+	hi(e, b);
+	e.op(I64_MUL);
+	e.i64c(0xffff_ffff);
+	e.op(I64_AND);
+	e.op(I64_ADD);
+	hi(e, a);
+	lo(e, b);
+	e.op(I64_MUL);
+	e.i64c(0xffff_ffff);
+	e.op(I64_AND);
+	e.op(I64_ADD);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	e.lset(c);
+	e.set_x_pre(rd);
+	hi(e, a);
+	hi(e, b);
+	e.op(I64_MUL);
+	lo(e, a);
+	hi(e, b);
+	e.op(I64_MUL);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	e.op(I64_ADD);
+	hi(e, a);
+	lo(e, b);
+	e.op(I64_MUL);
+	e.i64c(32);
+	e.op(I64_SHR_U);
+	e.op(I64_ADD);
+	e.lget(c);
+	e.op(I64_ADD);
+	if s1 {
+		// - (a < 0 ? b : 0)
+		e.lget(a);
+		e.i64c(63);
+		e.op(I64_SHR_S);
+		e.lget(b);
+		e.op(I64_AND);
+		e.op(I64_SUB);
+	}
+	if s2 {
+		e.lget(b);
+		e.i64c(63);
+		e.op(I64_SHR_S);
+		e.lget(a);
+		e.op(I64_AND);
+		e.op(I64_SUB);
+	}
+	e.set_x_post(rd);
+}
+
+/// AMO*.W/.D at x[rs1] (no offset): old = load; store f(x[rs2], old);
+/// x[rd] = old (a .W value sign-extended). The address goes through the
+/// WRITE path - TLB write way, an owned chunk, an unmarked page, outside
+/// the bookkeeping windows - so a bail happens before the load and the
+/// interpreter redoes the whole op; a write-way hit implies the page reads
+/// too (RISC-V has no write-only pages), and an owned chunk's read and
+/// write pointers are one buffer.
+#[allow(clippy::too_many_arguments)]
+/// wasm threads opcodes (0xfe prefix) with their natural-alignment memarg
+fn atomic(e: &mut Emit, code: u64, align: u8) {
+	e.op(0xfe);
+	e.idx(code);
+	e.memarg(align, 0);
+}
+
+const I64_EXTEND32_S: u8 = 0xc4;
+
+/// SMP: an AMO as one wasm atomic read-modify-write (min/max: a compare-exchange loop). The address must be
+/// naturally aligned in linear memory too (wasm traps otherwise); anything else bails to the interpreter,
+/// which has its own fallback.
+#[allow(clippy::too_many_arguments)]
+fn amo_smp(e: &mut Emit, a: AmoOp, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	let (old, src, lin) = (e.l.t0, e.l.t1, e.l.addr);
+	let width = if w { 4 } else { 8 };
+	e.get_x(rs1);
+	e.dram_addr_aligned(width, addr, ret_before);
+	e.op(DROP); // also in `addr`
+	e.get_x(rs2);
+	e.lset(src);
+	// rmw opcode bases (i32 .rmw); +1 = i64.rmw, +6 = i64.rmw32 (zero-extending)
+	let rmw = |a: &AmoOp| match a {
+		AmoOp::Add => Some(0x1e),
+		AmoOp::And => Some(0x2c),
+		AmoOp::Or => Some(0x33),
+		AmoOp::Xor => Some(0x3a),
+		AmoOp::Swap => Some(0x41),
+		_ => None,
+	};
+	match rmw(&a) {
+		Some(base) => {
+			e.lget(lin);
+			e.lget(src);
+			atomic(e, if w { base + 6 } else { base + 1 }, if w { 2 } else { 3 });
+			e.lset(old);
+		}
+		None => {
+			// loop { old = load; new = pick(src, old); if cmpxchg(lin, old, new) == old: break }
+			e.op(LOOP);
+			e.op(VOID);
+			e.lget(lin);
+			atomic(e, if w { 0x16 } else { 0x11 }, if w { 2 } else { 3 }); // i64.atomic.load32_u / load
+			e.lset(old);
+			e.lget(lin);
+			e.lget(old);
+			// the replacement: pick(src, old) compared as the instruction's width and signedness
+			e.lget(src);
+			e.lget(old);
+			e.lget(src);
+			if w {
+				e.op(I32_WRAP_I64);
+			}
+			e.lget(old);
+			if w {
+				e.op(I32_WRAP_I64);
+			}
+			let (c32, c64) = match a {
+				AmoOp::Min => (0x48, 0x53),
+				AmoOp::Max => (0x4a, 0x55),
+				AmoOp::MinU => (0x49, 0x54),
+				_ => (0x4b, 0x56),
+			};
+			e.op(if w { c32 } else { c64 });
+			e.op(SELECT);
+			atomic(e, if w { 0x4e } else { 0x49 }, if w { 2 } else { 3 }); // i64.atomic.rmw32.cmpxchg_u / rmw.cmpxchg
+			e.lget(old);
+			e.op(I64_NE);
+			e.br_if(0);
+			e.op(END);
+		}
+	}
+	if w {
+		e.lget(old);
+		e.op(I64_EXTEND32_S);
+		e.lset(old);
+	}
+	e.set_x_pre(rd);
+	e.lget(old);
+	e.set_x_post(rd);
+	e.gen_check(next, ret_after);
+}
+
+/// SMP LR: an atomic load that also records the value it saw (SC compares against it).
+fn lr_smp(e: &mut Emit, w: bool, rd: u8, rs1: u8, addr: u64, ret_before: u64) {
+	let (va, base, v) = (e.l.t0, e.l.base, e.l.t1);
+	let (flag, held, seen) = (e.lay.res_flag_addr, e.lay.res_addr_addr, e.lay.res_val_addr);
+	e.get_x(rs1);
+	e.lset(va);
+	e.lget(va);
+	e.dram_addr_aligned(if w { 4 } else { 8 }, addr, ret_before);
+	atomic(e, if w { 0x16 } else { 0x11 }, if w { 2 } else { 3 });
+	e.lset(v);
+	e.lget(base);
+	e.lget(v);
+	e.op(I64_STORE);
+	e.memarg(3, seen);
+	e.set_x_pre(rd);
+	e.lget(v);
+	if w {
+		e.op(I64_EXTEND32_S);
+	}
+	e.set_x_post(rd);
+	e.lget(base);
+	e.i32c(1);
+	e.op(0x3a); // i32.store8
+	e.memarg(0, flag);
+	e.lget(base);
+	e.lget(va);
+	e.op(I64_STORE);
+	e.memarg(3, held);
+}
+
+/// SMP SC: when the reservation is held for exactly x[rs1], compare-and-swap x[rs2] in for the value LR saw:
+/// x[rd] = 0 when memory still held it, else 1. The reservation is dropped either way.
+#[allow(clippy::too_many_arguments)]
+fn sc_smp(e: &mut Emit, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	const I32_AND: u8 = 0x71;
+	let (va, base, seen_v) = (e.l.t0, e.l.base, e.l.t1);
+	let (flag, held, seen) = (e.lay.res_flag_addr, e.lay.res_addr_addr, e.lay.res_val_addr);
+	let clear = |e: &mut Emit| {
+		e.lget(base);
+		e.i32c(0);
+		e.op(0x3a); // i32.store8
+		e.memarg(0, flag);
+	};
+	e.get_x(rs1);
+	e.lset(va);
+	e.lget(base);
+	e.op(I32_LOAD8_U);
+	e.memarg(0, flag);
+	e.lget(base);
+	e.op(I64_LOAD);
+	e.memarg(3, held);
+	e.lget(va);
+	e.op(I64_EQ);
+	e.op(I32_AND);
+	e.op(IF);
+	e.op(VOID);
+	e.if_depth += 1;
+	e.lget(va);
+	e.dram_addr_aligned(if w { 4 } else { 8 }, addr, ret_before);
+	e.lget(base);
+	e.op(I64_LOAD);
+	e.memarg(3, seen);
+	e.ltee(seen_v);
+	e.get_x(rs2);
+	atomic(e, if w { 0x4e } else { 0x49 }, if w { 2 } else { 3 }); // cmpxchg: returns what was there
+	e.lget(seen_v);
+	if w {
+		// rmw32.cmpxchg returns the old word zero-extended; LR recorded it the same way
+	}
+	e.op(I64_NE); // 1 = failed
+	e.op(0xad); // i64.extend_i32_u
+	e.lset(seen_v);
+	clear(e);
+	e.set_x_pre(rd);
+	e.lget(seen_v);
+	e.set_x_post(rd);
+	e.gen_check(next, ret_after);
+	e.op(ELSE);
+	clear(e);
+	e.set_x_pre(rd);
+	e.i64c(1);
+	e.set_x_post(rd);
+	e.if_depth -= 1;
+	e.op(END);
+}
+
+fn amo(e: &mut Emit, a: AmoOp, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	if e.lay.smp {
+		return amo_smp(e, a, w, rd, rs1, rs2, addr, next, ret_before, ret_after);
+	}
+	let (old, src, lin) = (e.l.t0, e.l.t1, e.l.addr);
+	let width = if w { 4 } else { 8 };
+	e.get_x(rs1);
+	e.dram_addr(width, addr, ret_before, true);
+	e.op(DROP); // also in `addr`
+	e.lget(lin);
+	match w {
+		true => {
+			e.op(0x34); // i64.load32_s
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_LOAD);
+			e.memarg(3, 0);
+		}
+	}
+	e.lset(old);
+	// x[rs2] before rd is written (rd may be rs2)
+	e.get_x(rs2);
+	e.lset(src);
+	e.lget(lin);
+	// the value stored: f(src, old)
+	let pick = |e: &mut Emit, cmp32: u8, cmp64: u8| {
+		e.lget(src);
+		e.lget(old);
+		e.lget(src);
+		if w {
+			e.op(I32_WRAP_I64);
+		}
+		e.lget(old);
+		if w {
+			e.op(I32_WRAP_I64);
+		}
+		e.op(if w { cmp32 } else { cmp64 });
+		e.op(SELECT); // cond ? src : old
+	};
+	match a {
+		AmoOp::Add => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_ADD);
+		}
+		AmoOp::Swap => e.lget(src),
+		AmoOp::Xor => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_XOR);
+		}
+		AmoOp::Or => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_OR);
+		}
+		AmoOp::And => {
+			e.lget(src);
+			e.lget(old);
+			e.op(I64_AND);
+		}
+		AmoOp::Min => pick(e, 0x48, 0x53), // lt_s
+		AmoOp::Max => pick(e, 0x4a, 0x55), // gt_s
+		AmoOp::MinU => pick(e, 0x49, 0x54), // lt_u
+		AmoOp::MaxU => pick(e, 0x4b, 0x56), // gt_u
+	}
+	match w {
+		true => {
+			e.op(0x3e); // i64.store32: the low half
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_STORE);
+			e.memarg(3, 0);
+		}
+	}
+	e.set_x_pre(rd);
+	e.lget(old);
+	e.set_x_post(rd);
+	// the op is complete (rd written) before the flat-RAM generation check
+	e.gen_check(next, ret_after);
+}
+
+/// LR.W/.D: x[rd] = load(x[rs1]) (.W sign-extended), and the reservation is
+/// set to that (old) x[rs1].
+fn lr(e: &mut Emit, w: bool, rd: u8, rs1: u8, addr: u64, ret_before: u64) {
+	if e.lay.smp {
+		return lr_smp(e, w, rd, rs1, addr, ret_before);
+	}
+	let (va, base) = (e.l.t0, e.l.base);
+	let (flag, held) = (e.lay.res_flag_addr, e.lay.res_addr_addr);
+	e.get_x(rs1);
+	e.lset(va);
+	e.set_x_pre(rd);
+	e.lget(va);
+	e.dram_addr(if w { 4 } else { 8 }, addr, ret_before, false);
+	match w {
+		true => {
+			e.op(0x34);
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_LOAD);
+			e.memarg(3, 0);
+		}
+	}
+	e.set_x_post(rd);
+	e.lget(base);
+	e.i32c(1);
+	e.op(0x3a); // i32.store8
+	e.memarg(0, flag);
+	e.lget(base);
+	e.lget(va);
+	e.op(I64_STORE);
+	e.memarg(3, held);
+}
+
+/// SC.W/.D: when the reservation is held for exactly x[rs1], store x[rs2]
+/// there, drop the reservation, x[rd] = 0; otherwise drop it, x[rd] = 1. A
+/// store that cannot take the fast path bails BEFORE the reservation is
+/// touched, so the interpreter's retry still sees it held.
+#[allow(clippy::too_many_arguments)]
+fn sc(e: &mut Emit, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	if e.lay.smp {
+		return sc_smp(e, w, rd, rs1, rs2, addr, next, ret_before, ret_after);
+	}
+	const I32_AND: u8 = 0x71;
+	let (va, base) = (e.l.t0, e.l.base);
+	let (flag, held) = (e.lay.res_flag_addr, e.lay.res_addr_addr);
+	let clear = |e: &mut Emit| {
+		e.lget(base);
+		e.i32c(0);
+		e.op(0x3a); // i32.store8
+		e.memarg(0, flag);
+	};
+	e.get_x(rs1);
+	e.lset(va);
+	e.lget(base);
+	e.op(I32_LOAD8_U);
+	e.memarg(0, flag);
+	e.lget(base);
+	e.op(I64_LOAD);
+	e.memarg(3, held);
+	e.lget(va);
+	e.op(I64_EQ);
+	e.op(I32_AND);
+	e.op(IF);
+	e.op(VOID);
+	e.if_depth += 1;
+	e.lget(va);
+	e.dram_addr(if w { 4 } else { 8 }, addr, ret_before, true);
+	e.get_x(rs2);
+	match w {
+		true => {
+			e.op(0x3e);
+			e.memarg(2, 0);
+		}
+		false => {
+			e.op(I64_STORE);
+			e.memarg(3, 0);
+		}
+	}
+	clear(e);
+	e.set_x_pre(rd);
+	e.i64c(0);
+	e.set_x_post(rd);
+	e.gen_check(next, ret_after);
+	e.op(ELSE);
+	clear(e);
+	e.set_x_pre(rd);
+	e.i64c(1);
+	e.set_x_post(rd);
+	e.if_depth -= 1;
+	e.op(END);
+}
+
+/// An f32 constant.
+fn f32c(e: &mut Emit, v: f32) {
+	e.op(0x43);
+	e.code.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+/// An f64 constant.
+fn f64c(e: &mut Emit, v: f64) {
+	e.op(0x44);
+	e.code.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+/// The single-precision table ops, as their INSTRUCTIONS closures run them
+/// (cpu.rs, "floating-point semantics"): operands unboxed (get_f32: an
+/// improperly boxed register reads as the canonical NaN), results NaN-boxed,
+/// arithmetic NaNs canonical with NV per Cpu::fp_res_s, sign injection
+/// bit-exact. wasm's f32 arithmetic is IEEE single with round-to-nearest-
+/// even, as the interpreter's; only NaN results differ (sign, payload),
+/// and set_canon_post replaces those.
+fn fp_single(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rm: u8) {
+	match f {
+		FOp::Add | FOp::Sub | FOp::Mul | FOp::Div => {
+			if f == FOp::Div {
+				div_zero_flag(e, rs1, rs2, true);
+			}
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.get_f32(rs2);
+			e.op(match f {
+				FOp::Add => 0x92,
+				FOp::Sub => 0x93,
+				FOp::Mul => 0x94,
+				_ => 0x95, // div
+			});
+			e.set_canon_post(rd, true, &[(rs1, true), (rs2, true)]);
+		}
+		FOp::Sqrt => {
+			e.set_f_pre(rd);
+			e.get_f32(rs1);
+			e.op(0x91); // f32.sqrt
+			e.set_canon_post(rd, true, &[(rs1, true)]);
+		}
+		FOp::Sgnj | FOp::Sgnjn | FOp::Sgnjx => {
+			// the sign from rs2 (inverted, or xored with rs1's), the rest of
+			// rs1, on the unboxed bits
+			e.set_f_pre(rd);
+			e.get_s_bits(rs2);
+			if f == FOp::Sgnjx {
+				e.get_s_bits(rs1);
+				e.op(0x73); // i32.xor
+			}
+			e.i32c(i32::MIN); // 0x8000_0000
+			e.op(I32_AND);
+			if f == FOp::Sgnjn {
+				e.i32c(i32::MIN);
+				e.op(0x73); // i32.xor
+			}
+			e.get_s_bits(rs1);
+			e.i32c(0x7fff_ffff);
+			e.op(I32_AND);
+			e.op(I32_OR);
+			e.set_s_bits_post(rd);
+		}
+		FOp::Eq | FOp::Lt | FOp::Le => {
+			e.set_x_pre(rd);
+			e.get_f32(rs1);
+			e.get_f32(rs2);
+			e.op(match f {
+				FOp::Eq => 0x5b,
+				FOp::Lt => 0x5d,
+				_ => 0x5f, // le
+			});
+			e.op(I64_EXTEND_I32_U);
+			e.set_x_post(rd);
+			cmp_flags(e, f, rs1, rs2, true);
+		}
+		FOp::ToW | FOp::ToWu | FOp::ToL | FOp::ToLu => {
+			// exactly widened, then the double conversion (as fp_to_int)
+			e.get_f32(rs1);
+			e.op(0xbb); // f64.promote_f32
+			to_int(e, f, rd, rm);
+		}
+		FOp::FromW | FOp::FromWu | FOp::FromL | FOp::FromLu => {
+			// never a NaN: boxed bit-exact
+			e.set_f_pre(rd);
+			e.get_x(rs1);
+			match f {
+				FOp::FromW => {
+					e.op(I32_WRAP_I64);
+					e.op(0xb2); // f32.convert_i32_s
+				}
+				FOp::FromWu => {
+					e.op(I32_WRAP_I64);
+					e.op(0xb3); // f32.convert_i32_u
+				}
+				FOp::FromL => e.op(0xb4), // f32.convert_i64_s
+				_ => e.op(0xb5), // f32.convert_i64_u
+			}
+			e.set_f32_post(rd);
+		}
+	}
+}
+
+/// The double-precision ops the hot set leaves to the table, as their
+/// closures run them.
+fn fp_double(e: &mut Emit, f: FOp, rd: u8, rs1: u8, rs2: u8, rm: u8) {
+	match f {
+		FOp::Sqrt => {
+			e.set_f_pre(rd);
+			e.get_f(rs1);
+			e.op(0x9f); // f64.sqrt
+			e.set_canon_post(rd, false, &[(rs1, false)]);
+		}
+		FOp::Sgnjn | FOp::Sgnjx => {
+			e.set_f_pre(rd);
+			e.get_f_bits(rs2);
+			if f == FOp::Sgnjx {
+				e.get_f_bits(rs1);
+				e.op(I64_XOR);
+			}
+			e.i64c(i64::MIN);
+			e.op(I64_AND);
+			if f == FOp::Sgnjn {
+				e.i64c(i64::MIN);
+				e.op(I64_XOR);
+			}
+			e.get_f_bits(rs1);
+			e.i64c(i64::MAX);
+			e.op(I64_AND);
+			e.op(I64_OR);
+			e.set_f_bits_post(rd);
+		}
+		FOp::Eq | FOp::Lt | FOp::Le => {
+			e.set_x_pre(rd);
+			e.get_f(rs1);
+			e.get_f(rs2);
+			e.op(match f {
+				FOp::Eq => 0x61,
+				FOp::Lt => 0x63,
+				_ => 0x65, // le
+			});
+			e.op(I64_EXTEND_I32_U);
+			e.set_x_post(rd);
+			cmp_flags(e, f, rs1, rs2, false);
+		}
+		FOp::ToW | FOp::ToWu | FOp::ToL | FOp::ToLu => {
+			e.get_f(rs1);
+			to_int(e, f, rd, rm);
+		}
+		FOp::FromWu | FOp::FromL | FOp::FromLu => {
+			e.set_f_pre(rd);
+			e.get_x(rs1);
+			match f {
+				FOp::FromWu => {
+					e.op(I32_WRAP_I64);
+					e.op(0xb8); // f64.convert_i32_u
+				}
+				FOp::FromL => e.op(0xb9), // f64.convert_i64_s
+				_ => e.op(0xba), // f64.convert_i64_u
+			}
+			e.set_f_post(rd);
+		}
+		// the hot set's (FADD/FSUB/FMUL/FDIV.D) and FCVT.D.W never reach here
+		_ => unreachable!("not a table double op"),
+	}
+}
+
+/// FEQ/FLT/FLE's flags after the compare, as Cpu::fp_cmp_d/_s: NV for a
+/// signaling NaN (FEQ, quiet) or for any NaN (FLT/FLE, signaling).
+fn cmp_flags(e: &mut Emit, f: FOp, rs1: u8, rs2: u8, single: bool) {
+	match f {
+		FOp::Eq => {
+			e.is_snan(rs1, single);
+			e.is_snan(rs2, single);
+		}
+		_ => {
+			e.is_nan(rs1, single);
+			e.is_nan(rs2, single);
+		}
+	}
+	e.op(I32_OR);
+	e.fcsr_or_if(FFLAG_NV as i64);
+}
+
+/// FDIV's DZ (Cpu::fp_div_d/_s): a zero divisor (either sign) and a finite
+/// nonzero dividend. Emitted before the division writes rd.
+fn div_zero_flag(e: &mut Emit, rs1: u8, rs2: u8, single: bool) {
+	match single {
+		true => {
+			e.get_f32(rs2);
+			f32c(e, 0.0);
+			e.op(0x5b); // f32.eq
+			e.get_f32(rs1);
+			e.op(0x8b); // f32.abs
+			f32c(e, f32::INFINITY);
+			e.op(0x5d); // f32.lt: finite (false for NaN)
+			e.op(I32_AND);
+			e.get_f32(rs1);
+			f32c(e, 0.0);
+			e.op(0x5c); // f32.ne
+		}
+		false => {
+			e.get_f(rs2);
+			f64c(e, 0.0);
+			e.op(0x61); // f64.eq
+			e.get_f(rs1);
+			e.op(0x99); // f64.abs
+			f64c(e, f64::INFINITY);
+			e.op(0x63); // f64.lt: finite (false for NaN)
+			e.op(I32_AND);
+			e.get_f(rs1);
+			f64c(e, 0.0);
+			e.op(0x62); // f64.ne
+		}
+	}
+	e.op(I32_AND);
+	e.fcsr_or_if(FFLAG_DZ as i64);
+}
+
+/// FCVT.{W,WU,L,LU}.x with a static rounding mode 0-4 (table_op leaves DYN
+/// and the reserved encodings to the interpreter), from the input double on
+/// the stack - Cpu::fp_to_int exactly: r = round(v) per rm; r inside
+/// [lo, hi) converts exactly (trunc_sat of an integral value) and raises NX
+/// when r != v; otherwise NV, and the result saturates - trunc_sat's
+/// saturation is fp_to_int's, except NaN (the type's maximum there, 0 in
+/// wasm), selected separately. 32-bit results sign-extended.
+fn to_int(e: &mut Emit, f: FOp, rd: u8, rm: u8) {
+	let (v, r, t) = (e.l.t0, e.l.t1, e.l.t2);
+	let kind = match f {
+		FOp::ToW => FpInt::W,
+		FOp::ToWu => FpInt::Wu,
+		FOp::ToL => FpInt::L,
+		_ => FpInt::Lu,
+	};
+	let getf = |e: &mut Emit, l: u32| {
+		e.lget(l);
+		e.op(0xbf); // f64.reinterpret_i64
+	};
+	e.op(0xbd); // i64.reinterpret_f64
+	e.lset(v);
+	getf(e, v);
+	match rm {
+		0 => e.op(0x9e), // f64.nearest: ties to even
+		1 => e.op(0x9d), // f64.trunc
+		2 => e.op(0x9c), // f64.floor
+		3 => e.op(0x9b), // f64.ceil
+		_ => {
+			// RMM, Rust's round(): t = trunc(v); t + (|v - t| >= 0.5 ?
+			// copysign(1, v) : 0), the sign of v kept (a -0.4 rounds to
+			// -0.0). v - t is exact (Sterbenz; t = v once |v| >= 2^52), and
+			// so is t ± 1; v = ±inf gives v - t = NaN, so t.
+			e.op(0x9d); // f64.trunc
+			e.op(0xbd);
+			e.lset(t);
+			getf(e, t);
+			f64c(e, 1.0);
+			getf(e, v);
+			e.op(0xa6); // f64.copysign
+			f64c(e, 0.0);
+			getf(e, v);
+			getf(e, t);
+			e.op(0xa1); // f64.sub
+			e.op(0x99); // f64.abs
+			f64c(e, 0.5);
+			e.op(0x66); // f64.ge
+			e.op(SELECT);
+			e.op(0xa0); // f64.add
+			getf(e, v);
+			e.op(0xa6); // f64.copysign
+		}
+	}
+	e.op(0xbd);
+	e.lset(r);
+	// x[rd] = select(the NaN value, trunc_sat(r), v != v)
+	e.set_x_pre(rd);
+	e.i64c(match kind {
+		FpInt::W => i32::MAX as i64,
+		FpInt::Wu => -1, // u32::MAX as i32 as i64
+		FpInt::L => i64::MAX,
+		FpInt::Lu => -1, // u64::MAX as i64
+	});
+	getf(e, r);
+	match kind {
+		FpInt::W => {
+			e.fc(2); // i32.trunc_sat_f64_s
+			e.op(0xac); // i64.extend_i32_s
+		}
+		FpInt::Wu => {
+			e.fc(3); // i32.trunc_sat_f64_u
+			e.op(0xac);
+		}
+		FpInt::L => e.fc(6), // i64.trunc_sat_f64_s
+		FpInt::Lu => e.fc(7), // i64.trunc_sat_f64_u
+	}
+	getf(e, v);
+	getf(e, v);
+	e.op(0x62); // f64.ne: NaN
+	e.op(SELECT);
+	e.set_x_post(rd);
+	// flags: lo <= r < hi ? (r != v ? NX : 0) : NV
+	let (lo, hi) = kind.bounds();
+	getf(e, r);
+	f64c(e, lo);
+	e.op(0x66); // f64.ge
+	getf(e, r);
+	f64c(e, hi);
+	e.op(0x63); // f64.lt
+	e.op(I32_AND);
+	e.op(IF);
+	e.op(VOID);
+	getf(e, r);
+	getf(e, v);
+	e.op(0x62); // f64.ne
+	e.fcsr_or_if(FFLAG_NX as i64);
+	e.op(ELSE);
+	e.fcsr_or(FFLAG_NV as i64);
+	e.op(END);
+}
+
+/// CSRRW/S/C (and I forms) on fflags, frm, fcsr, as the closures run them:
+/// data = read; src = x[rs1] (taken before rd is written) or the 5-bit
+/// zimm; x[rd] = data; write(src | data|src | data&!src). read_csr_raw
+/// gives fflags = fcsr & 0x1f and frm = (fcsr >> 5) & 7; write_csr_raw
+/// merges fflags and frm into fcsr and stores fcsr itself raw.
+fn csr_op(e: &mut Emit, kind: CsrOp, imm: bool, csr: u16, rd: u8, rs1: u8) {
+	let (data, src, val, base, at) = (e.l.t0, e.l.t1, e.l.t2, e.l.base, e.lay.fcsr_addr);
+	let fcsr = |e: &mut Emit| {
+		e.lget(base);
+		e.op(I64_LOAD);
+		e.memarg(3, at);
+	};
+	fcsr(e);
+	match csr {
+		1 => {
+			e.i64c(0x1f);
+			e.op(I64_AND);
+		}
+		2 => {
+			e.i64c(5);
+			e.op(I64_SHR_U);
+			e.i64c(7);
+			e.op(I64_AND);
+		}
+		_ => {}
+	}
+	e.lset(data);
+	match imm {
+		true => e.i64c(rs1 as i64),
+		false => e.get_x(rs1),
+	}
+	e.lset(src);
+	e.set_x_pre(rd);
+	e.lget(data);
+	e.set_x_post(rd);
+	match kind {
+		CsrOp::W => e.lget(src),
+		CsrOp::S => {
+			e.lget(data);
+			e.lget(src);
+			e.op(I64_OR);
+		}
+		CsrOp::C => {
+			e.lget(data);
+			e.lget(src);
+			e.i64c(-1);
+			e.op(I64_XOR);
+			e.op(I64_AND);
+		}
+	}
+	e.lset(val);
+	e.lget(base);
+	match csr {
+		1 | 2 => {
+			let (keep, shift, mask) = if csr == 1 { (!0x1fi64, 0, 0x1f) } else { (!0xe0i64, 5, 0xe0) };
+			fcsr(e);
+			e.i64c(keep);
+			e.op(I64_AND);
+			e.lget(val);
+			if shift != 0 {
+				e.i64c(shift);
+				e.op(I64_SHL);
+			}
+			e.i64c(mask);
+			e.op(I64_AND);
+			e.op(I64_OR);
+		}
+		_ => e.lget(val),
+	}
+	e.op(I64_STORE);
+	e.memarg(3, at);
+}
+
+/// The integer table ops, in wasm (RV64): rd = f(x[rs1], x[rs2]) with
+/// RISC-V's division rules — x/0 = -1 (all ones), x%0 = x, MIN/-1 = MIN,
+/// MIN%-1 = 0 — guarded before wasm's trapping div/rem.
+fn emit_int_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
+	const I32_EQZ: u8 = 0x45;
+	const I32_EQ: u8 = 0x46;
+	const I32_AND: u8 = 0x71;
+	const IF_I64: u8 = 0x7e;
+	if t == TableOp::Fence {
+		if e.lay.smp {
+			e.op(0xfe); // atomic.fence
+			e.op(0x03);
+			e.op(0x00);
+		}
+		return;
+	}
+	e.set_x_pre(rd);
+	match t {
+		TableOp::Mulw => {
+			e.get_x(rs1);
+			e.get_x(rs2);
+			e.op(0x7e); // i64.mul: the low 32 bits are the 32-bit product
+			wrap32(e);
+		}
+		TableOp::Div | TableOp::Rem | TableOp::Divu | TableOp::Remu => {
+			let signed = matches!(t, TableOp::Div | TableOp::Rem);
+			let rem = matches!(t, TableOp::Rem | TableOp::Remu);
+			e.get_x(rs2);
+			e.op(I64_EQZ);
+			e.op(IF);
+			e.op(IF_I64);
+			match rem {
+				true => e.get_x(rs1),
+				false => e.i64c(-1),
+			}
+			e.op(ELSE);
+			if signed {
+				e.get_x(rs1);
+				e.i64c(i64::MIN);
+				e.op(I64_EQ);
+				e.get_x(rs2);
+				e.i64c(-1);
+				e.op(I64_EQ);
+				e.op(I32_AND);
+				e.op(IF);
+				e.op(IF_I64);
+				match rem {
+					true => e.i64c(0),
+					false => e.i64c(i64::MIN),
+				}
+				e.op(ELSE);
+			}
+			e.get_x(rs1);
+			e.get_x(rs2);
+			e.op(match (signed, rem) {
+				(true, false) => 0x7f, // i64.div_s
+				(false, false) => 0x80, // i64.div_u
+				(true, true) => 0x81, // i64.rem_s
+				(false, true) => 0x82, // i64.rem_u
+			});
+			if signed {
+				e.op(END);
+			}
+			e.op(END);
+		}
+		TableOp::Divw | TableOp::Remw | TableOp::Divuw | TableOp::Remuw => {
+			let signed = matches!(t, TableOp::Divw | TableOp::Remw);
+			let rem = matches!(t, TableOp::Remw | TableOp::Remuw);
+			e.get_x(rs2);
+			e.op(I32_WRAP_I64);
+			e.op(I32_EQZ);
+			e.op(IF);
+			e.op(IF_I64);
+			match rem {
+				true => {
+					// x % 0 = the 32-bit dividend, sign-extended
+					e.get_x(rs1);
+					wrap32(e);
+				}
+				false => e.i64c(-1),
+			}
+			e.op(ELSE);
+			if signed {
+				e.get_x(rs1);
+				e.op(I32_WRAP_I64);
+				e.i32c(i32::MIN);
+				e.op(I32_EQ);
+				e.get_x(rs2);
+				e.op(I32_WRAP_I64);
+				e.i32c(-1);
+				e.op(I32_EQ);
+				e.op(I32_AND);
+				e.op(IF);
+				e.op(IF_I64);
+				match rem {
+					true => e.i64c(0),
+					false => e.i64c(i32::MIN as i64),
+				}
+				e.op(ELSE);
+			}
+			e.get_x(rs1);
+			e.op(I32_WRAP_I64);
+			e.get_x(rs2);
+			e.op(I32_WRAP_I64);
+			e.op(match (signed, rem) {
+				(true, false) => 0x6d, // i32.div_s
+				(false, false) => 0x6e, // i32.div_u
+				(true, true) => 0x6f, // i32.rem_s
+				(false, true) => 0x70, // i32.rem_u
+			});
+			e.op(0xac); // i64.extend_i32_s
+			if signed {
+				e.op(END);
+			}
+			e.op(END);
+		}
+		_ => unreachable!(),
+	}
+	e.set_x_post(rd);
+}
+
+#[cfg(feature = "codegen")]
+/// The cache key of a region's module, computed from its SOURCE (module
+/// pcs and ops) and the layout's hash without emitting it: two hashes of
+/// the same bytes the emitter is a pure function of.
+pub(crate) fn source_key(blocks: &[(u64, Vec<BlockOp>)], layout_hash: u64) -> (u64, u64, u64) {
+	use std::hash::Hasher;
+	let mut sip = std::collections::hash_map::DefaultHasher::new();
+	for &(pc, ref ops) in blocks {
+		sip.write_u64(pc);
+		sip.write_usize(ops.len());
+		for op in ops {
+			sip.write_i32(op.imm);
+			sip.write_u32(op.word);
+			sip.write_u16(op.data);
+			sip.write(&[op.kind, op.rd, op.rs1, op.rs2, op.len]);
+		}
+	}
+	(layout_hash, hash_blocks(blocks), sip.finish())
+}
+
+#[cfg(feature = "codegen")]
+/// A stable hash of everything in a Layout the emitted code depends on.
+pub fn layout_hash(lay: &Layout) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut h = std::collections::hash_map::DefaultHasher::new();
+	lay.hash(&mut h);
+	h.finish()
 }
 
 /// The shared per-op emission: the whole sequence plus its fallthrough
@@ -432,7 +2193,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			}
 			HOT_AUIPC => {
 				e.set_x_pre(rd);
-				e.i64c(addr.wrapping_add(imm as u64) as i64);
+				e.push_pc(addr.wrapping_add(imm as u64));
 				e.set_x_post(rd);
 			}
 			HOT_ADDIW => {
@@ -527,7 +2288,7 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			HOT_BGEU => branch(e, rs1, rs2, 0x5a, addr, imm, next, ret_after),
 			HOT_JAL => {
 				e.set_x_pre(rd);
-				e.i64c(next as i64);
+				e.push_pc(next);
 				e.set_x_post(rd);
 				let target = addr.wrapping_add(imm as u64);
 				// exec_block exits only when pc != next; a jump to the very
@@ -536,35 +2297,10 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 					e.exit(target, ret_after);
 				}
 			}
-			HOT_JALR => {
-				// tmp = next; pc = x[rs1] + imm; x[rd] = tmp (order matters
-				// when rd == rs1: target uses the OLD rs1). Runtime target:
-				// exit only if it differs from next, like exec_block.
-				e.get_x(rs1);
-				e.i64c(imm);
-				e.op(0x7c);
-				e.op(0x21); // local.set scratch (target)
-				uleb(&mut e.code, e.scratch as u64);
-				e.set_x_pre(rd);
-				e.i64c(next as i64);
-				e.set_x_post(rd);
-				e.op(0x20); // local.get scratch
-				uleb(&mut e.code, e.scratch as u64);
-				e.i64c(next as i64);
-				e.op(0x52); // i64.ne
-				e.op(0x04); // if
-				e.op(0x40);
-				e.i32c(0);
-				e.op(0x20);
-				uleb(&mut e.code, e.scratch as u64);
-				e.op(I64_STORE);
-				e.memarg(3, e.lay.pc_addr as u64);
-				e.jalr_ret(ret_after);
-				e.op(0x0b); // end if; fall through when target == next
-			}
+			HOT_JALR => jalr(e, rd, rs1, imm, next, ret_after),
 			HOT_FLD => {
 				// f[rd] = f64::from_bits(load_doubleword)
-				e.set_f_bits_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
@@ -574,14 +2310,16 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.set_f_bits_post(rd);
 			}
 			HOT_FLW => {
-				// f[rd] = f64::from_bits(load_word as i32 as i64 as u64)
-				e.set_f_bits_pre();
+				// f[rd] = f64::from_bits(FP_BOX | load_word as u64): NaN-boxed
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.i64c(imm);
 				e.op(0x7c);
 				e.dram_addr(4, addr, ret_before, false);
-				e.op(0x34); // i64.load32_s
+				e.op(0x35); // i64.load32_u
 				e.memarg(2, 0);
+				e.i64c(FP_BOX as i64);
+				e.op(I64_OR);
 				e.set_f_bits_post(rd);
 			}
 			HOT_FSD => {
@@ -607,9 +2345,16 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 			HOT_FADD_D => fp_bin(e, rd, rs1, rs2, 0xa0),
 			HOT_FSUB_D => fp_bin(e, rd, rs1, rs2, 0xa1),
 			HOT_FMUL_D => fp_bin(e, rd, rs1, rs2, 0xa2),
+			HOT_FDIV_D => {
+				// Cpu::fp_div_d: IEEE division (x/±0 a signed infinity, 0/0
+				// NaN), DZ for a finite nonzero dividend over a zero, the
+				// result canonical
+				div_zero_flag(e, rs1, rs2, false);
+				fp_bin(e, rd, rs1, rs2, 0xa3);
+			}
 			HOT_FSGNJ_D => {
 				// f[rd] = (bits(rs2) & SIGN) | (bits(rs1) & !SIGN)
-				e.set_f_bits_pre();
+				e.set_f_pre(rd);
 				e.get_f_bits(rs2);
 				e.i64c(i64::MIN); // 0x8000...0
 				e.op(0x83); // and
@@ -625,24 +2370,27 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 				e.set_x_post(rd);
 			}
 			HOT_FMV_D_X => {
-				e.set_f_bits_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.set_f_bits_post(rd);
 			}
 			HOT_FCVT_D_W => {
 				// f[rd] = x[rs1] as i32 as f64 (exact conversion)
-				e.set_f_bits_pre();
+				e.set_f_pre(rd);
 				e.get_x(rs1);
 				e.op(0xa7); // i32.wrap_i64
 				e.op(0xb7); // f64.convert_i32_s
 				e.set_f_post(rd);
+			}
+			0 if table_op(op).is_some() => {
+				emit_table_op(e, table_op(op).unwrap(), op, addr, next, ret_before, ret_after);
 			}
 			_ => {
 				// outside the subset. A first-op miss means nothing to
 				// compile (single-block mode) or a bail stub (region mode);
 				// mid-block, emit a bail so the interpreter takes over at
 				// exactly this op, and stop emitting.
-				if i == 0 && e.region.is_none() {
+				if i == 0 && e.strict {
 					return false;
 				}
 				e.bail(addr, ret_before);
@@ -656,84 +2404,180 @@ fn emit_seq(e: &mut Emit, ops: &[BlockOp], start: u64) -> bool {
 	true
 }
 
+/// JALR: tmp = next; pc = x[rs1] + imm; x[rd] = tmp (the target uses the
+/// OLD rs1 when rd == rs1). Exits only when the target differs from next,
+/// like exec_block. The runtime target goes to the indirect dispatcher,
+/// which continues in-region when it is a member block start (returns and
+/// computed jumps stay compiled) and leaves otherwise.
+fn jalr(e: &mut Emit, rd: u8, rs1: u8, imm: i64, next: u64, ret_after: u64) {
+	let sc = e.l.scratch;
+	e.get_x(rs1);
+	e.i64c(imm);
+	e.op(I64_ADD);
+	e.lset(sc);
+	e.set_x_pre(rd);
+	e.push_pc(next);
+	e.set_x_post(rd);
+	e.lget(sc);
+	e.push_pc(next);
+	e.op(I64_NE);
+	e.op(IF);
+	e.op(VOID);
+	e.if_depth += 1;
+	e.add_retired(ret_after);
+	// tpc = target - bias (module-relative)
+	e.lget(sc);
+	e.lget(e.l.bias);
+	e.op(I64_SUB);
+	e.lset(e.l.tpc);
+	let d = e.dispatch.expect("a region with a JALR has a dispatcher");
+	e.i32c(d as i32);
+	e.lset(e.l.cur);
+	e.op(BR);
+	let depth = e.loop_depth + e.if_depth;
+	e.idx(depth as u64);
+	e.if_depth -= 1;
+	e.op(END); // fall through when target == next
+}
+
+/// The indirect dispatcher's search: tpc against the sorted member starts.
+/// A balanced compare tree, linear at the leaves; a match sets cur and
+/// re-enters the dispatch loop (whose br_table runs that block, fuel check
+/// first).
+fn emit_search(e: &mut Emit, pcs: &[(u64, u32)]) {
+	if pcs.len() <= 4 {
+		for &(p, idx) in pcs {
+			e.lget(e.l.tpc);
+			e.i64c(p as i64);
+			e.op(I64_EQ);
+			e.op(IF);
+			e.op(VOID);
+			e.i32c(idx as i32);
+			e.lset(e.l.cur);
+			e.op(BR);
+			let depth = e.loop_depth + e.if_depth + 1;
+			e.idx(depth as u64);
+			e.op(END);
+		}
+		return;
+	}
+	let mid = pcs.len() / 2;
+	e.lget(e.l.tpc);
+	e.i64c(pcs[mid].0 as i64);
+	e.op(I64_LT_U);
+	e.op(IF);
+	e.op(VOID);
+	e.if_depth += 1;
+	emit_search(e, &pcs[..mid]);
+	e.op(ELSE);
+	emit_search(e, &pcs[mid..]);
+	e.if_depth -= 1;
+	e.op(END);
+}
+
 /// Emit a REGION: several blocks in one module, in-region control
 /// transfers compiled as branches back through a dispatch loop, exits
 /// leaving pc exact like everything else. Signature:
 /// run(fuel: i64, entry: i32) -> retired: i64 — the function stops at a
 /// block boundary once `retired >= fuel` (device servicing keeps its
-/// cadence), and `entry` picks the starting block. A call can retire 0
-/// (fuel exhausted at entry, or an unsupported first op): the dispatcher
-/// must make progress another way before retrying.
+/// cadence), and `entry` picks the starting block (out of range: returns 0
+/// untouched). A call can retire 0 (fuel exhausted at entry, or an
+/// unsupported first op): the dispatcher must make progress another way
+/// before retrying. Block pcs are module pcs: the caller rebases them and
+/// supplies the difference as the context block's bias.
 pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u8>> {
-	if blocks.is_empty() || blocks.len() > 512 {
+	emit_region_impl(blocks, lay, false)
+}
+
+/// One block as a region module (tests): None when its first op is not
+/// translated. Called with fuel 1 it runs the block exactly once, as
+/// exec_block does (a jump to its own start re-enters, meets the spent
+/// fuel and leaves with pc there).
+pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
+	emit_region_impl(&[(start, ops.to_vec())], lay, true)
+}
+
+fn emit_region_impl(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout, strict: bool) -> Option<Vec<u8>> {
+	if blocks.is_empty() || blocks.len() > 512 || (lay.shared && lay.max_pages.is_none()) {
 		return None;
 	}
 	let n = blocks.len();
-	let mut targets = std::collections::HashMap::new();
+	let mut e = Emit::new(lay);
+	e.strict = strict;
 	for (i, &(start, _)) in blocks.iter().enumerate() {
-		targets.insert(start, i as u32);
+		e.targets.entry(start).or_insert(i as u32);
 	}
-	let mut e = Emit {
-		code: Vec::new(),
-		lay,
-		scratch: 2, // params fuel=0, entry=1; locals scratch=2, cur=3, retired=4, scratch2=5
-		scratch2: 5,
-		if_depth: 0,
-		region: None,
-	};
-	// cur = entry
-	e.op(0x20);
-	uleb(&mut e.code, 1);
-	e.op(0x21);
-	uleb(&mut e.code, 3);
-	// dispatch loop
-	e.op(0x03); // loop
-	e.op(0x40);
-	for _ in 0..n {
-		e.op(0x02); // block
-		e.op(0x40);
+	let has_jalr = blocks.iter().any(|(_, ops)| ops.iter().any(|o| o.kind == HOT_JALR));
+	let labels = n + has_jalr as usize;
+	e.dispatch = if has_jalr { Some(n as u32) } else { None };
+	e.plan_registers(blocks);
+	let l = e.l;
+	// entry guard: an index the module does not have runs nothing
+	e.lget(l.entry);
+	e.i32c(n as i32);
+	e.op(I32_GE_U);
+	e.op(IF);
+	e.op(VOID);
+	e.i64c(0);
+	e.op(RETURN);
+	e.op(END);
+	e.prologue();
+	e.lget(l.entry);
+	e.lset(l.cur);
+	e.op(BLOCK); // $exit
+	e.op(VOID);
+	// dispatch loop: br_table on cur into one label per block (+ the
+	// indirect dispatcher)
+	e.op(LOOP);
+	e.op(VOID);
+	for _ in 0..labels {
+		e.op(BLOCK);
+		e.op(VOID);
 	}
-	// br_table on cur
-	e.op(0x20);
-	uleb(&mut e.code, 3);
-	e.op(0x0e); // br_table
-	uleb(&mut e.code, n as u64);
-	for i in 0..n {
-		uleb(&mut e.code, i as u64);
+	e.lget(l.cur);
+	e.op(BR_TABLE);
+	e.idx(labels as u64);
+	for i in 0..labels {
+		e.idx(i as u64);
 	}
-	uleb(&mut e.code, 0); // default: block 0
+	e.idx(0); // default: block 0 (unreachable: entry is guarded)
 	for (i, &(start, ref ops)) in blocks.iter().enumerate() {
-		e.op(0x0b); // end of label B_i; code for block i follows
-		// fuel check: retired >= fuel -> pc = start, return retired
-		e.op(0x20);
-		uleb(&mut e.code, 4);
-		e.op(0x20);
-		uleb(&mut e.code, 0);
-		e.op(0x59); // i64.ge_s
-		e.op(0x04); // if
-		e.op(0x40);
-		e.i32c(0);
-		e.i64c(start as i64);
-		e.op(I64_STORE);
-		e.memarg(3, e.lay.pc_addr as u64);
-		e.op(0x20);
-		uleb(&mut e.code, 4);
-		e.op(RETURN);
-		e.op(0x0b);
-		// per-op emission with region transfers armed
-		e.region = Some(RegionEmit {
-			targets: targets.clone(),
-			cur_local: 3,
-			retired_local: 4,
-			fuel_param: 0,
-			loop_depth: (n - 1 - i) as u32,
-		});
-		let ok = emit_seq(&mut e, ops, start);
-		debug_assert!(ok);
+		e.op(END); // end of label B_i; code for block i follows
+		e.loop_depth = (labels - 1 - i) as u32;
+		// fuel check: retired >= fuel -> leave with pc = start
+		e.lget(l.retired);
+		e.lget(l.fuel);
+		e.op(I64_GE_U);
+		e.op(IF);
+		e.op(VOID);
+		e.if_depth += 1;
+		e.to_exit(start);
+		e.if_depth -= 1;
+		e.op(END);
+		if !emit_seq(&mut e, ops, start) {
+			return None;
+		}
 	}
-	e.op(0x0b); // end loop
-	e.op(0x00); // unreachable (loop never falls through)
-	Some(assemble_region(e.code))
+	if has_jalr {
+		e.op(END); // label n: the indirect dispatcher, directly in the loop
+		e.loop_depth = 0;
+		let mut sorted: Vec<(u64, u32)> = e.targets.iter().map(|(&p, &i)| (p, i)).collect();
+		sorted.sort();
+		emit_search(&mut e, &sorted);
+		// no member starts at the target: leave with pc exact
+		e.lget(l.tpc);
+		e.lget(l.bias);
+		e.op(I64_ADD);
+		e.lset(l.pcv);
+		e.op(BR);
+		e.idx(1); // $exit
+	}
+	e.op(END); // end loop
+	e.op(UNREACHABLE); // the loop never falls through
+	e.op(END); // $exit
+	e.epilogue();
+	let regs = e.reg_locals;
+	Some(assemble(e.code, regs, lay))
 }
 
 /// ... as i32 as i64 (wrap then sign-extend)
@@ -742,12 +2586,14 @@ fn wrap32(e: &mut Emit) {
 	e.op(0xac); // i64.extend_i32_s
 }
 
+/// FADD/FSUB/FMUL/FDIV.D: the IEEE result, a NaN canonical with NV per
+/// Cpu::fp_res_d
 fn fp_bin(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, fop: u8) {
-	e.set_f_bits_pre();
+	e.set_f_pre(rd);
 	e.get_f(rs1);
 	e.get_f(rs2);
 	e.op(fop);
-	e.set_f_post(rd);
+	e.set_canon_post(rd, false, &[(rs1, false), (rs2, false)]);
 }
 
 fn bin_reg(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, wop: u8) {
@@ -836,111 +2682,74 @@ fn branch(e: &mut Emit, rs1: u8, rs2: u8, cmp: u8, addr: u64, imm: i64, next: u6
 	e.get_x(rs1);
 	e.get_x(rs2);
 	e.op(cmp);
-	e.op(0x04); // if
-	e.op(0x40);
+	e.op(IF);
+	e.op(VOID);
 	e.if_depth += 1;
 	e.exit(target, ret);
 	e.if_depth -= 1;
-	e.op(0x0b);
+	e.op(END);
 }
 
-fn assemble_region(body_expr: Vec<u8>) -> Vec<u8> {
-	let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
-	// type: (i64, i32) -> i64
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	sec.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]);
-	m.push(1);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	// import env.mem
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	uleb(&mut sec, 3);
-	sec.extend_from_slice(b"env");
-	uleb(&mut sec, 3);
-	sec.extend_from_slice(b"mem");
-	sec.extend_from_slice(&[0x02, 0x00, 1]);
-	m.push(2);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	m.extend_from_slice(&[3, 2, 1, 0]);
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	uleb(&mut sec, 3);
-	sec.extend_from_slice(b"run");
-	sec.extend_from_slice(&[0x00, 0]);
-	m.push(7);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	// locals: i64 scratch, i32 cur, i64 retired, i64 scratch2
-	let mut body = Vec::new();
-	uleb(&mut body, 4);
-	uleb(&mut body, 1);
-	body.push(0x7e);
-	uleb(&mut body, 1);
-	body.push(0x7f);
-	uleb(&mut body, 1);
-	body.push(0x7e);
-	uleb(&mut body, 1);
-	body.push(0x7e);
-	body.extend_from_slice(&body_expr);
-	body.push(0x0b);
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	uleb(&mut sec, body.len() as u64);
-	sec.extend_from_slice(&body);
-	m.push(10);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	m
+fn section(m: &mut Vec<u8>, id: u8, body: &[u8]) {
+	m.push(id);
+	uleb(m, body.len() as u64);
+	m.extend_from_slice(body);
 }
 
-fn assemble(body_expr: Vec<u8>) -> Vec<u8> {
+fn name(out: &mut Vec<u8>, s: &str) {
+	uleb(out, s.len() as u64);
+	out.extend_from_slice(s.as_bytes());
+}
+
+/// One function, importing exactly `env.memory` and exporting `run` — the
+/// shape enclave:codegen accepts (no start, tables, globals, data or
+/// element segments).
+fn assemble(body_expr: Vec<u8>, reg_locals: u32, lay: &Layout) -> Vec<u8> {
 	let mut m = vec![0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
-	// type: () -> i64
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	sec.extend_from_slice(&[0x60, 0, 1, 0x7e]);
-	m.push(1);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	// import env.mem memory {min 1}
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	uleb(&mut sec, 3);
-	sec.extend_from_slice(b"env");
-	uleb(&mut sec, 3);
-	sec.extend_from_slice(b"mem");
-	sec.extend_from_slice(&[0x02, 0x00, 1]);
-	m.push(2);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	// one func, type 0
-	m.extend_from_slice(&[3, 2, 1, 0]);
-	// export "run"
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	uleb(&mut sec, 3);
-	sec.extend_from_slice(b"run");
-	sec.extend_from_slice(&[0x00, 0]);
-	m.push(7);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
-	// code: one body, two i64 locals (scratch, scratch2)
+	let mut s = Vec::new();
+	uleb(&mut s, 1);
+	s.extend_from_slice(&[0x60, 2, 0x7e, 0x7f, 1, 0x7e]); // (i64, i32) -> i64
+	section(&mut m, 1, &s);
+	let mut s = Vec::new();
+	uleb(&mut s, 1);
+	name(&mut s, "env");
+	name(&mut s, "memory");
+	s.push(0x02);
+	let flags = lay.max_pages.is_some() as u8
+		| if lay.shared { 2 } else { 0 }
+		| if lay.memory64 { 4 } else { 0 };
+	s.push(flags);
+	uleb(&mut s, 0);
+	if let Some(max) = lay.max_pages {
+		uleb(&mut s, max);
+	}
+	section(&mut m, 2, &s);
+	section(&mut m, 3, &[1, 0]);
+	let mut s = Vec::new();
+	uleb(&mut s, 1);
+	name(&mut s, "run");
+	s.extend_from_slice(&[0x00, 0]);
+	section(&mut m, 7, &s);
+	let addr = if lay.memory64 { 0x7e } else { 0x7f };
 	let mut body = Vec::new();
-	uleb(&mut body, 1);
-	uleb(&mut body, 2);
-	body.push(0x7e);
+	uleb(&mut body, if reg_locals > 0 { 7 } else { 6 });
+	body.extend_from_slice(&[1, 0x7e]); // 2 scratch
+	body.extend_from_slice(&[1, 0x7f]); // 3 cur
+	body.extend_from_slice(&[5, 0x7e]); // 4 retired, 5 scratch2, 6 bias, 7 tpc, 8 pcv
+	body.extend_from_slice(&[5, addr]); // 9 base, 10 rdt, 11 wrt, 12 marks, 13 addr
+	body.extend_from_slice(&[1, 0x7f]); // 14 meta
+	body.extend_from_slice(&[3, 0x7e]); // 15 t0, 16 t1, 17 t2
+	if reg_locals > 0 {
+		uleb(&mut body, reg_locals as u64); // 15.. cached guest registers
+		body.push(0x7e);
+	}
 	body.extend_from_slice(&body_expr);
-	body.push(0x0b); // end
-	let mut sec = Vec::new();
-	uleb(&mut sec, 1);
-	uleb(&mut sec, body.len() as u64);
-	sec.extend_from_slice(&body);
-	m.push(10);
-	uleb(&mut m, sec.len() as u64);
-	m.extend_from_slice(&sec);
+	body.push(END);
+	let mut s = Vec::new();
+	uleb(&mut s, 1);
+	uleb(&mut s, body.len() as u64);
+	s.extend_from_slice(&body);
+	section(&mut m, 10, &s);
 	m
 }
 
@@ -969,47 +2778,61 @@ pub fn form_regions_greedy(
 	max_blocks: usize,
 	min_heat: u64,
 ) -> Vec<Vec<u64>> {
-	use std::collections::{HashMap, HashSet};
-	let heat: HashMap<u64, u64> = nodes.iter().cloned().collect();
-	let mut adj: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+	use std::collections::BinaryHeap;
+	let heat: ::fnv::FnvHashMap<u64, u64> = nodes.iter().cloned().collect();
+	// Only edges between blocks that have heat this pass can join a region;
+	// self-loops are a set (a lone block is a region only if it loops).
+	let mut adj: ::fnv::FnvHashMap<u64, Vec<(u64, u64)>> = Default::default();
+	let mut self_loop: ::fnv::FnvHashSet<u64> = Default::default();
 	for &(a, b, w) in edges {
+		if a == b {
+			self_loop.insert(a);
+			continue;
+		}
+		if !heat.contains_key(&a) || !heat.contains_key(&b) {
+			continue;
+		}
 		adj.entry(a).or_default().push((b, w));
 		adj.entry(b).or_default().push((a, w));
 	}
 	let mut order: Vec<(u64, u64)> = nodes.to_vec();
 	order.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-	let mut claimed: HashSet<u64> = HashSet::new();
+	let mut claimed: ::fnv::FnvHashSet<u64> = Default::default();
 	let mut out = Vec::new();
 	for &(seed, h) in &order {
 		if h < min_heat || claimed.contains(&seed) {
 			continue;
 		}
+		// grow along the heaviest edge from any member (a max-heap frontier
+		// with lazy deletion: O(E log E), not O(members^2 * degree))
 		let mut members: Vec<u64> = vec![seed];
-		let mut inset: HashSet<u64> = members.iter().cloned().collect();
-		while members.len() < max_blocks {
-			let mut best: Option<(u64, u64)> = None; // (weight, pc)
-			for m in &members {
-				if let Some(nb) = adj.get(m) {
-					for &(pc, w) in nb {
-						if !inset.contains(&pc)
-							&& !claimed.contains(&pc)
-							&& heat.contains_key(&pc)
-							&& best.map(|(bw, _)| w > bw).unwrap_or(true)
-						{
-							best = Some((w, pc));
-						}
+		let mut inset: ::fnv::FnvHashSet<u64> = Default::default();
+		inset.insert(seed);
+		let mut frontier: BinaryHeap<(u64, u64)> = BinaryHeap::new();
+		let push = |frontier: &mut BinaryHeap<(u64, u64)>, at: u64, inset: &::fnv::FnvHashSet<u64>,
+			claimed: &::fnv::FnvHashSet<u64>| {
+			if let Some(nb) = adj.get(&at) {
+				for &(pc, w) in nb {
+					if !inset.contains(&pc) && !claimed.contains(&pc) {
+						frontier.push((w, pc));
 					}
 				}
 			}
-			match best {
-				Some((_, pc)) => {
-					members.push(pc);
-					inset.insert(pc);
-				}
+		};
+		push(&mut frontier, seed, &inset, &claimed);
+		while members.len() < max_blocks {
+			let pc = match frontier.pop() {
+				Some((_, pc)) => pc,
 				None => break,
+			};
+			if inset.contains(&pc) || claimed.contains(&pc) {
+				continue;
 			}
+			members.push(pc);
+			inset.insert(pc);
+			push(&mut frontier, pc, &inset, &claimed);
 		}
-		if members.len() < 2 && !edges.iter().any(|&(a, b, _)| a == seed && b == seed) {
+		if members.len() < 2 && !self_loop.contains(&seed) {
 			continue; // a lone block with no self-loop is not a region
 		}
 		members.sort();
@@ -1211,10 +3034,11 @@ pub trait CodegenBackend {
 /// Dispatcher state: block heat, formed-region cache, blacklists.
 pub struct Tier2 {
 	pub backend: Box<dyn CodegenBackend>,
-	// per-pc heat since the last formation pass (pc -> retired)
-	heat: std::collections::HashMap<u64, u64>,
+	// per-pc heat since the last formation pass (pc -> retired). FNV, not
+	// SipHash: the live JIT records into these on the dispatch path.
+	heat: ::fnv::FnvHashMap<u64, u64>,
 	// observed block successions for formation
-	edges: std::collections::HashMap<(u64, u64), u64>,
+	edges: ::fnv::FnvHashMap<(u64, u64), u64>,
 	prev_pc: u64,
 	// compiled: entry pc -> (handle, entry index, generation at compile)
 	compiled: std::collections::HashMap<u64, (u32, u32, u32)>,
@@ -1240,8 +3064,8 @@ impl Tier2 {
 	pub fn new(backend: Box<dyn CodegenBackend>) -> Self {
 		Tier2 {
 			backend,
-			heat: std::collections::HashMap::new(),
-			edges: std::collections::HashMap::new(),
+			heat: ::fnv::FnvHashMap::default(),
+			edges: ::fnv::FnvHashMap::default(),
 			prev_pc: 0,
 			compiled: std::collections::HashMap::new(),
 			blacklist: std::collections::HashSet::new(),
@@ -1331,6 +3155,50 @@ impl Tier2 {
 			}
 			self.compiled.retain(|_, &mut (h, _, _)| !stale.contains(&h));
 		}
+	}
+
+	/// Formation for a dispatcher that installs regions itself (the live
+	/// codegen JIT): consume the clock, form regions from the sampled heat
+	/// of blocks `covered` does not exclude, and return each with its heat
+	/// (sampled retired instructions) per member and in total, hottest seed
+	/// first. Heat decays fully between passes; edges persist (bounded).
+	pub fn form_now<F: Fn(u64) -> bool>(&mut self, covered: F) -> Vec<(Vec<(u64, u64)>, u64)> {
+		self.since_form = 0;
+		let nodes: Vec<(u64, u64)> = self
+			.heat
+			.iter()
+			.filter(|&(&pc, _)| !covered(pc))
+			.map(|(&pc, &h)| (pc, h))
+			.collect();
+		let regions = match self.greedy {
+			true => {
+				let edges: Vec<(u64, u64, u64)> =
+					self.edges.iter().map(|(&(a, b), &w)| (a, b, w)).collect();
+				form_regions_greedy(&nodes, &edges, self.max_blocks, self.min_heat)
+			}
+			false => {
+				let edges: Vec<(u64, u64)> = self.edges.keys().cloned().collect();
+				form_regions(&nodes, &edges, self.max_blocks, self.min_heat)
+			}
+		};
+		let out = regions
+			.into_iter()
+			.map(|pcs| {
+				let members: Vec<(u64, u64)> = pcs
+					.iter()
+					.map(|&pc| (pc, self.heat.get(&pc).copied().unwrap_or(0)))
+					.collect();
+				let h = members.iter().map(|&(_, h)| h).sum();
+				(members, h)
+			})
+			.collect();
+		self.heat.clear();
+		// edges age too: halve every pass, forget the ones that reach zero
+		self.edges.retain(|_, w| {
+			*w >>= 1;
+			*w > 0
+		});
+		out
 	}
 
 	/// Formation pass, driven by the caller once enough has retired. The
@@ -1540,9 +3408,11 @@ mod test_tier2 {
 
 	fn lay() -> Layout {
 		Layout {
+			memory64: false, shared: false, max_pages: None, ctx: 2048,
 			x_base: 0, f_base: 512, tlb: None, pc_addr: 256, gen_addr: 264,
-			baked_gen: 1, dram_base: 4096, guest_dram_base: 0x8000_0000,
-			dram_len: 65536,
+			baked_gen: 1, guest_dram_base: 0x8000_0000, dram_len: 65536,
+			fcsr_addr: 272, res_flag_addr: 280, res_addr_addr: 288, res_val_addr: 0, smp: false,
+			ram: Ram::Flat { dram_base: 4096 },
 		}
 	}
 
@@ -1591,5 +3461,465 @@ mod test_tier2 {
 		hot_loop(&mut t2, a, b, 100);
 		t2.maybe_form(&lay(), 1, simple_ops);
 		assert!(t2.lookup(a, 1).is_none());
+	}
+}
+
+// ---- the platform codegen verb -------------------------------------------
+
+/// risc-box patch (codegen feature): the production backend over
+/// `enclave:codegen/compiler@0.1.0` (set/codegen.c binds it): `compile`
+/// copies a module out of this app's own memory, compiles it with the
+/// engine's cranelift, instantiates it over this memory and installs its
+/// `run` in this execution view's function table; the returned index IS a
+/// function pointer, so a call is an ordinary `call_indirect` — no host
+/// crossing, no marshalling.
+///
+/// The host's limits are per execution view and CUMULATIVE — drop revokes a
+/// slot but never returns budget — so this module owns the one policy every
+/// machine in the process shares:
+///
+/// - a module is compiled at most once: identical bytes (the emitter makes
+///   modules position-independent, so the same code at another page-aligned
+///   address, in another process or another machine, is the same module)
+///   reuse the cached table index; a module that failed is never retried;
+/// - our budget sits under the host's (modules, attempts, bytes), and the
+///   heat a region must show to be compiled doubles every `heat_doubling`
+///   compiles, so the budget goes to the hottest code first and is never
+///   spent all at once on whatever was warm early;
+/// - a missing verb, an exhausted host quota, a binding failure or a run of
+///   failed compiles turns compilation off for the life of the process;
+///   regions already compiled keep running, everything else interprets.
+///
+/// Compiled code is never dropped: the host keeps the instance until the
+/// store dies anyway, and a kept index is what lets the same code come back
+/// (a respawned process, a re-forked machine) without spending budget.
+#[cfg(feature = "codegen")]
+pub mod verb {
+	use std::sync::Mutex;
+
+	/// Host limits per execution view (runtime/component/codegen.rs).
+	pub const HOST_MAX_MODULE_BYTES: usize = 256 * 1024;
+	pub const HOST_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+	pub const HOST_MAX_ATTEMPTS: u32 = 1024;
+	pub const HOST_MAX_MODULES: u32 = 256;
+	/// set/codegen.c's unwired stub: no host verb behind the import.
+	pub const UNAVAILABLE: i64 = -64;
+
+	#[derive(Clone, Debug)]
+	pub struct Policy {
+		/// Largest module we submit (the host takes 256 KiB).
+		pub max_module_bytes: usize,
+		/// Modules we may ever compile (successes and failed compiles: the
+		/// host reserves a module before compiling and keeps it on failure).
+		pub module_budget: u32,
+		pub attempt_budget: u32,
+		pub byte_budget: u64,
+		/// Required heat doubles every this many compiles.
+		pub heat_doubling: u32,
+		/// Consecutive failed compiles that turn compilation off.
+		pub max_consecutive_failures: u32,
+	}
+
+	impl Default for Policy {
+		fn default() -> Policy {
+			Policy {
+				max_module_bytes: 128 * 1024,
+				// headroom under 256/1024/16 MiB for anything else in the
+				// view that might compile (the codegen self-test does)
+				module_budget: 240,
+				attempt_budget: 960,
+				byte_budget: 15 * 1024 * 1024,
+				heat_doubling: 48,
+				max_consecutive_failures: 6,
+			}
+		}
+	}
+
+	#[derive(Clone, Debug, Default)]
+	pub struct Stats {
+		pub compiled: u32,
+		pub failed: u32,
+		pub attempts: u32,
+		pub bytes: u64,
+		/// Lookups answered from the cache (no compile).
+		pub reused: u64,
+		pub refused_heat: u64,
+		pub refused_budget: u64,
+		pub too_large: u64,
+		pub compile_us: u64,
+		pub max_compile_us: u64,
+		pub last_status: i64,
+		pub disabled: Option<&'static str>,
+	}
+
+	struct State {
+		policy: Policy,
+		stats: Stats,
+		// source key (see super::source_key) -> Some(table index) | None
+		// (failed, or too large: either way, never resubmitted)
+		cache: ::fnv::FnvHashMap<(u64, u64, u64), Option<u64>>,
+		consecutive_failures: u32,
+		owner: usize,
+	}
+
+	// risc-box patch (SMP): one State per execution view (SET thread). Table indices, the cache that maps
+	// sources to them and the host's budget all belong to the view that compiled them, so each hart thread
+	// compiles, caches and spends for itself. The outer lock is held only to find a thread's own state.
+	static STATES: Mutex<Vec<(usize, std::sync::Arc<Mutex<State>>)>> = Mutex::new(Vec::new());
+
+	fn mine() -> Option<std::sync::Arc<Mutex<State>>> {
+		let me = sys::thread();
+		let g = STATES.lock().unwrap_or_else(|e| e.into_inner());
+		g.iter().find(|(owner, _)| *owner == me).map(|(_, st)| st.clone())
+	}
+
+	/// This thread's state, else the first enabled one (the embedder's thread reading hart 0's counters).
+	fn mine_or_first() -> Option<std::sync::Arc<Mutex<State>>> {
+		mine().or_else(|| STATES.lock().unwrap_or_else(|e| e.into_inner()).first().map(|(_, st)| st.clone()))
+	}
+
+	/// A key for callers that hold module bytes (tests, tools).
+	pub fn bytes_key(module: &[u8]) -> (u64, u64, u64) {
+		let mut h2: u64 = 0x84222325cbf29ce4;
+		for &b in module {
+			h2 ^= b as u64;
+			h2 = h2.wrapping_mul(0x100000001b3);
+		}
+		(module.len() as u64, super::fnv64(module), h2)
+	}
+
+	/// Arm the verb for this process (idempotent; the first caller's policy
+	/// and thread win). Returns whether compilation is still possible.
+	pub fn enable(policy: Policy) -> bool {
+		let st = match mine() {
+			Some(st) => st,
+			None => {
+				let st = std::sync::Arc::new(Mutex::new(State {
+					policy,
+					stats: Stats::default(),
+					cache: Default::default(),
+					consecutive_failures: 0,
+					owner: sys::thread(),
+				}));
+				STATES.lock().unwrap_or_else(|e| e.into_inner()).push((sys::thread(), st.clone()));
+				st
+			}
+		};
+		let s = st.lock().unwrap_or_else(|e| e.into_inner());
+		s.stats.disabled.is_none()
+	}
+
+	/// Table indices belong to the execution view (SET thread) that compiled
+	/// them: only the enabling thread may call or compile.
+	pub fn on_owner_thread() -> bool {
+		mine().is_some()
+	}
+
+	pub fn stats() -> Stats {
+		mine_or_first().map(|st| st.lock().unwrap_or_else(|e| e.into_inner()).stats.clone()).unwrap_or_default()
+	}
+
+	pub fn policy() -> Policy {
+		mine_or_first().map(|st| st.lock().unwrap_or_else(|e| e.into_inner()).policy.clone()).unwrap_or_default()
+	}
+
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub enum Got {
+		/// These exact bytes were compiled before.
+		Cached(u64),
+		/// Compiled now (spent budget).
+		Compiled(u64),
+		/// Not compiled: policy, budget, a past failure, or `may_compile`.
+		Refused,
+		/// The emitted module exceeds the size cap (remembered as refused).
+		TooLarge,
+		/// Submitted and refused by the host.
+		Failed,
+	}
+
+	impl Got {
+		pub fn index(self) -> Option<u64> {
+			match self {
+				Got::Cached(i) | Got::Compiled(i) => Some(i),
+				_ => None,
+			}
+		}
+	}
+
+	/// The table index running the module with source key `k`: cached when
+	/// it was compiled before; otherwise, when `may_compile`, emitted (only
+	/// now: refused regions never pay for emission) and compiled if `heat`
+	/// clears `min_heat` scaled by how much budget is already spent and the
+	/// budget allows. Anything else: the caller keeps interpreting.
+	pub fn lookup<F: FnOnce() -> Option<Vec<u8>>>(
+		k: (u64, u64, u64),
+		heat: u64,
+		min_heat: u64,
+		may_compile: bool,
+		emit: F,
+	) -> Got {
+		let st = match mine() {
+			Some(st) => st,
+			None => return Got::Refused,
+		};
+		let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
+		let s = &mut *g;
+		if let Some(&hit) = s.cache.get(&k) {
+			return match hit {
+				Some(i) => {
+					s.stats.reused += 1;
+					Got::Cached(i)
+				}
+				None => Got::Refused,
+			};
+		}
+		if s.stats.disabled.is_some() || !may_compile {
+			return Got::Refused;
+		}
+		let p = &s.policy;
+		let shift = (s.stats.compiled / p.heat_doubling.max(1)).min(30);
+		if heat < min_heat.saturating_mul(1u64 << shift) {
+			s.stats.refused_heat += 1;
+			return Got::Refused;
+		}
+		let modules = s.stats.compiled + s.stats.failed;
+		if modules >= p.module_budget.min(HOST_MAX_MODULES)
+			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
+		{
+			s.stats.refused_budget += 1;
+			return Got::Refused;
+		}
+		let module = match emit() {
+			Some(m) if !m.is_empty() => m,
+			_ => return Got::Refused,
+		};
+		let p = &s.policy;
+		if module.len() > p.max_module_bytes.min(HOST_MAX_MODULE_BYTES) {
+			s.stats.too_large += 1;
+			s.cache.insert(k, None);
+			return Got::TooLarge;
+		}
+		if modules >= p.module_budget.min(HOST_MAX_MODULES)
+			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
+			|| s.stats.bytes + module.len() as u64 > p.byte_budget.min(HOST_MAX_INPUT_BYTES)
+		{
+			s.stats.refused_budget += 1;
+			return Got::Refused;
+		}
+		s.stats.attempts += 1;
+		s.stats.bytes += module.len() as u64;
+		let t0 = std::time::Instant::now();
+		let status = sys::compile(&module);
+		let us = t0.elapsed().as_micros() as u64;
+		s.stats.compile_us += us;
+		s.stats.max_compile_us = s.stats.max_compile_us.max(us);
+		s.stats.last_status = status;
+		if status >= 0 {
+			s.stats.compiled += 1;
+			s.consecutive_failures = 0;
+			s.cache.insert(k, Some(status as u64));
+			return Got::Compiled(status as u64);
+		}
+		s.stats.failed += 1;
+		s.consecutive_failures += 1;
+		s.cache.insert(k, None);
+		s.stats.disabled = match status {
+			UNAVAILABLE => Some("verb unavailable"),
+			-4 => Some("host binding or table"),
+			-5 => Some("host quota"),
+			_ if s.consecutive_failures >= s.policy.max_consecutive_failures => {
+				Some("repeated compile failures")
+			}
+			_ => None,
+		};
+		if let Some(why) = s.stats.disabled {
+			eprintln!("[jit] codegen off: {} (status {})", why, status);
+		}
+		Got::Failed
+	}
+
+	/// lookup() for callers holding module bytes that only want the index.
+	pub fn get(module: &[u8], heat: u64, min_heat: u64) -> Option<u64> {
+		let m = module.to_vec();
+		lookup(bytes_key(module), heat, min_heat, true, move || Some(m)).index()
+	}
+
+	/// The calling execution view's identity (a SET pthread).
+	pub fn thread_id() -> usize {
+		sys::thread()
+	}
+
+	/// The context block every generated module reads at entry.
+	#[repr(C, align(8))]
+	pub struct Ctx(std::cell::UnsafeCell<[u64; super::CTX_CELLS]>);
+	// Written by the owner thread right before its own calls; generated code
+	// reads it. Never shared across execution views in practice.
+	unsafe impl Sync for Ctx {}
+	pub static CTX: Ctx = Ctx(std::cell::UnsafeCell::new([0; super::CTX_CELLS]));
+	impl Ctx {
+		/// risc-box patch (SMP): a hart's own block (each hart's modules bake its address in).
+		pub fn new() -> Ctx {
+			Ctx(std::cell::UnsafeCell::new([0; super::CTX_CELLS]))
+		}
+
+		pub fn addr(&self) -> u64 {
+			self.0.get() as usize as u64
+		}
+		/// cell = super::CTX_* (a byte offset)
+		#[inline(always)]
+		pub fn set(&self, cell: u64, v: u64) {
+			unsafe {
+				let p = (self.0.get() as *mut u64).add((cell / 8) as usize);
+				std::ptr::write_volatile(p, v);
+			}
+		}
+	}
+
+	/// Run compiled region `index`: fuel-bounded, entry by block index.
+	/// Callers keep the context block current and stay on the owner thread.
+	#[inline(always)]
+	pub unsafe fn call(index: u64, fuel: u64, entry: u32) -> u64 {
+		sys::call(index, fuel, entry)
+	}
+
+	#[cfg(target_family = "wasm")]
+	mod sys {
+		extern "C" {
+			fn risc_codegen_compile(bytes: *const u8, len: usize) -> i64;
+			fn risc_codegen_thread() -> usize;
+		}
+		pub fn compile(module: &[u8]) -> i64 {
+			unsafe { risc_codegen_compile(module.as_ptr(), module.len()) }
+		}
+		pub fn thread() -> usize {
+			unsafe { risc_codegen_thread() }
+		}
+		/// A table index is a function pointer: this is a call_indirect of
+		/// type (i64, i32) -> i64, the signature the host checked.
+		#[inline(always)]
+		pub unsafe fn call(index: u64, fuel: u64, entry: u32) -> u64 {
+			let f: extern "C" fn(i64, i32) -> i64 = std::mem::transmute(index as usize);
+			f(fuel as i64, entry as i32) as u64
+		}
+	}
+
+	/// Native builds (tests, examples) have no verb: compile reports it
+	/// unavailable unless a test installs a stand-in.
+	#[cfg(not(target_family = "wasm"))]
+	mod sys {
+		use std::sync::Mutex;
+		pub static TEST_COMPILER: Mutex<Option<fn(&[u8]) -> i64>> = Mutex::new(None);
+		pub fn compile(module: &[u8]) -> i64 {
+			match *TEST_COMPILER.lock().unwrap() {
+				Some(f) => f(module),
+				None => super::UNAVAILABLE,
+			}
+		}
+		pub fn thread() -> usize {
+			1
+		}
+		pub unsafe fn call(_index: u64, _fuel: u64, _entry: u32) -> u64 {
+			0
+		}
+	}
+
+	/// Tests: reset the process-wide state and install a stand-in compiler.
+	#[cfg(not(target_family = "wasm"))]
+	pub fn reset_for_test(compiler: Option<fn(&[u8]) -> i64>, policy: Policy) {
+		*sys::TEST_COMPILER.lock().unwrap() = compiler;
+		STATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+		enable(policy);
+	}
+
+	/// Tests that touch the process-wide verb state take this first.
+	#[cfg(test)]
+	pub static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+		use super::TEST_SERIAL as SERIAL;
+
+		fn ok(_m: &[u8]) -> i64 {
+			use std::sync::atomic::{AtomicI64, Ordering};
+			static NEXT: AtomicI64 = AtomicI64::new(100);
+			NEXT.fetch_add(1, Ordering::Relaxed)
+		}
+		fn bad(_m: &[u8]) -> i64 {
+			-3
+		}
+		fn quota(_m: &[u8]) -> i64 {
+			-5
+		}
+
+		#[test]
+		fn caches_identical_modules_and_escalates_heat() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset_for_test(Some(ok), Policy { heat_doubling: 2, ..Policy::default() });
+			let a = get(b"module-a", 10, 10).expect("compiles at threshold");
+			assert_eq!(get(b"module-a", 0, 10), Some(a), "same bytes reuse, heat irrelevant");
+			assert!(get(b"module-b", 10, 10).is_some());
+			// two compiles spent: the threshold doubled
+			assert!(get(b"module-c", 10, 10).is_none(), "below the doubled threshold");
+			assert!(get(b"module-c", 20, 10).is_some());
+			let s = stats();
+			assert_eq!((s.compiled, s.reused, s.refused_heat), (3, 1, 1));
+		}
+
+		#[test]
+		fn budget_is_cumulative_and_failures_are_not_retried() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset_for_test(Some(ok), Policy { module_budget: 2, heat_doubling: 1000, ..Policy::default() });
+			assert!(get(b"x1", 1, 1).is_some());
+			assert!(get(b"x2", 1, 1).is_some());
+			assert!(get(b"x3", 1, 1).is_none(), "module budget spent");
+			assert!(get(b"x1", 1, 1).is_some(), "but cached code still runs");
+			assert_eq!(stats().refused_budget, 1);
+
+			reset_for_test(Some(bad), Policy { max_consecutive_failures: 3, ..Policy::default() });
+			assert!(get(b"y1", 1, 1).is_none());
+			assert!(get(b"y1", 1, 1).is_none());
+			assert_eq!(stats().attempts, 1, "a failed module is never resubmitted");
+			assert!(get(b"y2", 1, 1).is_none());
+			assert!(stats().disabled.is_none());
+			assert!(get(b"y3", 1, 1).is_none());
+			assert_eq!(stats().disabled, Some("repeated compile failures"));
+			assert!(get(b"y4", 1, 1).is_none());
+			assert_eq!(stats().attempts, 3, "off means off");
+		}
+
+		#[test]
+		fn missing_verb_and_host_quota_turn_compilation_off() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset_for_test(None, Policy::default());
+			assert!(get(b"z", 1, 1).is_none());
+			assert_eq!(stats().disabled, Some("verb unavailable"));
+			reset_for_test(Some(quota), Policy::default());
+			assert!(get(b"z", 1, 1).is_none());
+			assert_eq!(stats().disabled, Some("host quota"));
+		}
+
+		#[test]
+		fn oversized_modules_are_refused_without_an_attempt() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset_for_test(Some(ok), Policy { max_module_bytes: 4, ..Policy::default() });
+			assert!(get(b"too-large", 1, 1).is_none());
+			assert_eq!((stats().attempts, stats().too_large), (0, 1));
+		}
+
+		#[test]
+		fn refused_regions_are_never_emitted() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset_for_test(Some(ok), Policy::default());
+			let k = (1, 2, 3);
+			let r = lookup(k, 5, 10, true, || panic!("emitted below the heat threshold"));
+			assert_eq!(r, Got::Refused);
+			let r = lookup(k, 50, 10, false, || panic!("emitted while compiles are capped"));
+			assert_eq!(r, Got::Refused);
+			let r = lookup(k, 50, 10, true, || Some(b"m".to_vec()));
+			assert!(matches!(r, Got::Compiled(_)));
+			let again = lookup(k, 0, 10, false, || panic!("re-emitted a cached module"));
+			assert_eq!(again.index(), r.index());
+		}
 	}
 }

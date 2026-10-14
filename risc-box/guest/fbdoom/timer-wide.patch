@@ -1,0 +1,10 @@
+--- d_loop.c
++++ d_loop.c
+@@ -140,1 +140,1 @@
+-    return (time_ms * TICRATE) / 1000;
++    return ((int64_t) time_ms * TICRATE) / 1000;
+--- i_timer.c
++++ i_timer.c
+@@ -62,1 +62,1 @@
+-    return (ticks * TICRATE) / 1000;
++    return ((uint64_t) ticks * TICRATE) / 1000;

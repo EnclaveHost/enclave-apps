@@ -28,8 +28,11 @@ pub mod mmu;
 pub mod elf_analyzer;
 pub mod device;
 pub mod snapshot; // risc-box patch: whole-machine snapshot/restore
+pub mod disk_image; // risc-box patch: the disk base image, held compressed
 #[cfg(feature = "jit")]
 pub mod jit; // risc-box patch: PLATFORM-JIT.md translator (feature-gated)
+#[cfg(feature = "codegen")]
+pub use cpu::jit_selftest; // risc-box patch: the live JIT vs the interpreter
 
 use cpu::{Cpu, Xlen};
 use elf_analyzer::{ElfAnalyzer};
@@ -109,6 +112,19 @@ const REQUIRED_SECTIONS: [&[u8; 4]; 14] = [
 pub struct Emulator {
 	cpu: Cpu,
 
+	// risc-box patch (SMP): harts 1.. (hart 0 is `cpu`), sharing its bus; empty on a one-hart machine
+	harts: Vec<Cpu>,
+	// instructions each hart runs before the next takes the thread (interleaved SMP)
+	slice: u64,
+	// setup_dtb was called: set_harts leaves the DTB alone (the caller's describes the cpus)
+	dtb_given: bool,
+	// harts 1.. run on their own threads (start_threads); hart 0 stays with the caller
+	threaded: bool,
+	ctl: Arc<HartCtl>,
+	// run by each hart thread on itself when it starts (its JIT must be enabled on its own thread: compiled
+	// code belongs to the execution view that compiled it)
+	hart_init: Option<Arc<dyn Fn(&mut Cpu) + Send + Sync>>,
+
 	// risc-box patch: per-machine RAM override (bytes); None = PROGRAM_MEMORY_CAPACITY.
 	ram_bytes: Option<u64>,
 
@@ -125,6 +141,57 @@ pub struct Emulator {
 	tohost_addr: u64
 }
 
+/// risc-box patch (SMP): what the hart threads and the embedder's thread share.
+#[derive(Default)]
+pub struct HartCtl {
+	stop: std::sync::atomic::AtomicBool,
+	pause: std::sync::atomic::AtomicBool,
+	parked: std::sync::atomic::AtomicUsize,
+	running: std::sync::atomic::AtomicUsize,
+	slice: std::sync::atomic::AtomicU64
+}
+
+/// A hart owned by the Emulator's `harts` (which never reallocates once set), run by exactly one thread.
+struct HartPtr(*mut Cpu);
+unsafe impl Send for HartPtr {}
+
+/// The body of a hart thread: slices of guest time until told to stop; parked while paused; a hart parked in
+/// WFI with nothing pending sleeps briefly instead of spinning a host core.
+fn hart_loop(cpu: HartPtr, ctl: Arc<HartCtl>, init: Option<Arc<dyn Fn(&mut Cpu) + Send + Sync>>) {
+	use std::sync::atomic::Ordering::*;
+	let cpu = unsafe { &mut *cpu.0 };
+	if let Some(f) = init {
+		f(cpu);
+	}
+	loop {
+		if ctl.stop.load(Acquire) {
+			break;
+		}
+		if ctl.pause.load(Acquire) {
+			ctl.parked.fetch_add(1, AcqRel);
+			while ctl.pause.load(Acquire) && !ctl.stop.load(Acquire) {
+				std::thread::sleep(std::time::Duration::from_micros(50));
+			}
+			ctl.parked.fetch_sub(1, AcqRel);
+			continue;
+		}
+		cpu.drop_reservation_if_stale();
+		cpu.run(ctl.slice.load(Relaxed));
+		if cpu.is_parked() {
+			std::thread::sleep(std::time::Duration::from_micros(100));
+		}
+	}
+	ctl.running.fetch_sub(1, AcqRel);
+}
+
+impl Drop for Emulator {
+	fn drop(&mut self) {
+		if self.threaded {
+			self.stop_threads();
+		}
+	}
+}
+
 impl Emulator {
 	/// Creates a new `Emulator`. [`Terminal`](terminal/trait.Terminal.html)
 	/// is internally used for transferring input/output data to/from `Emulator`.
@@ -134,6 +201,12 @@ impl Emulator {
 	pub fn new(terminal: Box<dyn Terminal>) -> Self {
 		Emulator {
 			cpu: Cpu::new(terminal),
+			harts: Vec::new(),
+			slice: 4096,
+			dtb_given: false,
+			threaded: false,
+			ctl: Arc::new(HartCtl::default()),
+			hart_init: None,
 
 			ram_bytes: None,
 
@@ -218,7 +291,136 @@ impl Emulator {
 	/// WFI-parked guest consumes the batch without spinning. Embedders'
 	/// tick-batches should call this instead of tick() in a loop.
 	pub fn run_n(&mut self, n: u64) {
-		self.cpu.run(n);
+		if self.harts.is_empty() {
+			self.cpu.run(n);
+			return;
+		}
+		if self.threaded {
+			// the other harts are running on their own threads; outside run_n this thread holds the device
+			// lock (so the embedder's own device calls are safe), inside it hart 0 takes it per access
+			self.cpu.get_mmu().dev_unlock();
+			self.cpu.run(n);
+			self.cpu.get_mmu().dev_lock();
+			return;
+		}
+		// Interleaved SMP: each hart runs a slice in turn; `n` is hart 0's share, the device clock's driver.
+		// A hart's LR reservation does not survive another hart running (that hart may have stored to the
+		// reserved address), so it is dropped at the start of each slice: an SC across a switch fails, which
+		// the ISA allows and every LR/SC loop retries.
+		let mut left = n;
+		while left > 0 {
+			let s = left.min(self.slice);
+			self.cpu.drop_reservation();
+			self.cpu.run(s);
+			for h in self.harts.iter_mut() {
+				h.drop_reservation();
+				h.run(s);
+			}
+			left -= s;
+		}
+	}
+
+	/// risc-box patch (SMP): make this a machine of `n` harts. Call before `setup_program` (or `restore`): the
+	/// DTB must describe the same number of cpus.
+	pub fn set_harts(&mut self, n: usize) {
+		let n = n.max(1);
+		if n > 1 && !self.dtb_given && !self.cpu.get_mut_mmu().use_smp_dtb(n) {
+			eprintln!("[emu] no built-in DTB for {} harts; the guest will see one cpu", n);
+		}
+		self.cpu.get_mut_mmu().set_harts(n);
+		self.cpu.set_smp(n > 1);
+		self.harts = (1..n).map(|h| self.cpu.new_hart(h)).collect();
+	}
+
+	pub fn harts(&self) -> usize {
+		1 + self.harts.len()
+	}
+
+	/// risc-box patch (SMP): run harts 1.. on their own threads from now on, each started with `spawn`
+	/// (std::thread natively; the SET build's pthreads in the app). Hart 0 keeps running in `run_n` on the
+	/// caller's thread. Returns how many threads started; harts whose spawn failed... none may: false from
+	/// `spawn` stops the machine from going parallel at all (they all stay interleaved).
+	pub fn start_threads(&mut self, spawn: &mut dyn FnMut(Box<dyn FnOnce() + Send + 'static>) -> bool) -> usize {
+		if self.threaded || self.harts.is_empty() {
+			return 0;
+		}
+		self.cpu.get_mmu().dev_lock();
+		self.ctl.slice.store(self.slice, std::sync::atomic::Ordering::Relaxed);
+		let mut started = 0;
+		for h in self.harts.iter_mut() {
+			let cpu = HartPtr(h as *mut Cpu);
+			let ctl = self.ctl.clone();
+			let init = self.hart_init.clone();
+			ctl.running.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			if !spawn(Box::new(move || hart_loop(cpu, ctl, init))) {
+				self.ctl.running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+				break;
+			}
+			started += 1;
+		}
+		if started < self.harts.len() {
+			// the ones that did start: stop them; this machine stays interleaved
+			self.stop_threads();
+			self.cpu.get_mmu().dev_unlock();
+			return 0;
+		}
+		self.threaded = true;
+		started
+	}
+
+	/// risc-box patch (SMP): let the hart threads at the devices while this thread sleeps (outside run_n it
+	/// otherwise holds the device lock). Pair with acquire_devices before touching the machine again.
+	pub fn release_devices(&self) {
+		if self.threaded {
+			self.cpu.get_mmu().dev_unlock();
+		}
+	}
+
+	pub fn acquire_devices(&self) {
+		if self.threaded {
+			self.cpu.get_mmu().dev_lock();
+		}
+	}
+
+	/// Park every hart thread between slices (and keep it parked) so the caller may touch their state.
+	fn pause_harts(&self) {
+		use std::sync::atomic::Ordering::*;
+		if !self.threaded {
+			return;
+		}
+		self.ctl.pause.store(true, SeqCst);
+		// a hart may be waiting for the device lock this thread holds
+		self.cpu.get_mmu().dev_unlock();
+		while self.ctl.parked.load(Acquire) < self.ctl.running.load(Acquire) {
+			std::thread::yield_now();
+		}
+		self.cpu.get_mmu().dev_lock();
+	}
+
+	fn resume_harts(&self) {
+		self.ctl.pause.store(false, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	fn stop_threads(&mut self) {
+		use std::sync::atomic::Ordering::*;
+		self.ctl.stop.store(true, SeqCst);
+		self.cpu.get_mmu().dev_unlock();
+		while self.ctl.running.load(Acquire) > 0 {
+			std::thread::yield_now();
+		}
+		self.cpu.get_mmu().dev_lock();
+		self.ctl.stop.store(false, SeqCst);
+		self.threaded = false;
+	}
+
+	/// risc-box patch (SMP): instructions per hart per turn on the shared thread.
+	pub fn set_hart_slice(&mut self, n: u64) {
+		self.slice = n.max(64);
+	}
+
+	/// risc-box patch (SMP): (pc, privilege, wfi, retired) of each hart, for diagnosis.
+	pub fn hart_states(&self) -> Vec<(u64, u8, bool, u64)> {
+		std::iter::once(&self.cpu).chain(self.harts.iter()).map(|c| c.hart_state()).collect()
 	}
 
 	/// risc-box patch (blockstats feature): coverage histogram dump.
@@ -308,6 +510,13 @@ impl Emulator {
 		}
 
 		self.cpu.update_pc(header.e_entry);
+		for h in self.harts.iter_mut() {
+			h.update_xlen(match header.e_width {
+				32 => Xlen::Bit32,
+				_ => Xlen::Bit64
+			});
+			h.update_pc(header.e_entry);
+		}
 	}
 
 	/// Loads symbols of program and adds them to `symbol_map`.
@@ -410,6 +619,7 @@ impl Emulator {
 	}
 
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
+		self.dtb_given = true;
 		self.cpu.get_mut_mmu().init_dtb(content);
 	}
 
@@ -441,6 +651,12 @@ impl Emulator {
 		let snd = self.cpu.get_mut_mmu().get_mut_snd();
 		let (rate, ch, playing) = snd.format();
 		(rate, ch, playing, snd.pending_bytes(), snd.dropped_bytes())
+	}
+
+	/// risc-box patch: input events queued on the host side, not yet in the
+	/// guest's buffers (see VirtioInput::pending_len).
+	pub fn input_pending(&self) -> usize {
+		self.cpu.get_mmu().get_input().pending_len()
 	}
 
 	/// risc-box patch: the max value of the absolute coordinate space the
@@ -583,6 +799,9 @@ impl Emulator {
 	#[cfg(feature = "aot")]
 	pub fn aot_enable(&mut self) {
 		self.cpu.aot_enable();
+		for h in self.harts.iter_mut() {
+			h.aot_enable();
+		}
 	}
 
 	#[cfg(feature = "aot")]
@@ -593,6 +812,29 @@ impl Emulator {
 	#[cfg(feature = "aot")]
 	pub fn aot_install_stats(&self) -> (u64, u64) {
 		self.cpu.aot_install_stats()
+	}
+
+	/// risc-box patch (codegen): the live region JIT over the platform's
+	/// enclave:codegen verb. False when the verb is absent or its budget is
+	/// spent — the machine then interprets exactly as before.
+	#[cfg(feature = "codegen")]
+	pub fn jit_enable(&mut self, params: cpu::JitParams) -> bool {
+		// harts 1.. enable theirs on their own threads (start_threads); interleaved, they interpret
+		let p = params.clone();
+		self.hart_init = Some(Arc::new(move |c: &mut Cpu| {
+			c.jit_enable(p.clone());
+		}));
+		self.cpu.jit_enable(params)
+	}
+
+	#[cfg(feature = "codegen")]
+	pub fn jit_diag(&self) -> Option<String> {
+		self.cpu.jit_diag()
+	}
+
+	#[cfg(feature = "codegen")]
+	pub fn jit_stats(&self) -> Option<cpu::JitStats> {
+		self.cpu.jit_stats()
 	}
 
 	pub fn gpu_flushes(&self) -> u64 {
@@ -638,7 +880,12 @@ impl Emulator {
 		s.u64(taken);
 		s.str(env!("CARGO_PKG_VERSION"));
 		s.end_section(at);
+		self.pause_harts();
 		let stats = self.cpu.snapshot_into(&mut s, level);
+		for h in self.harts.iter() {
+			h.snapshot_hart(&mut s);
+		}
+		self.resume_harts();
 		let bytes = s.buf.len();
 		(s.buf, SnapshotInfo {
 			bytes,
@@ -711,6 +958,13 @@ impl Emulator {
 	/// risc-box patch (fork): resume from an image. Same preconditions as
 	/// `restore`; the RAM is adopted copy-on-write rather than copied.
 	pub fn restore_image(&mut self, image: &SnapshotImage, identity: &str) -> Result<SnapshotInfo, String> {
+		self.pause_harts();
+		let r = self.restore_image_paused(image, identity);
+		self.resume_harts();
+		r
+	}
+
+	fn restore_image_paused(&mut self, image: &SnapshotImage, identity: &str) -> Result<SnapshotInfo, String> {
 		let meta = &image.meta;
 		if meta.identity != identity {
 			return Err(format!(
@@ -739,7 +993,18 @@ impl Emulator {
 		self.cpu.get_mut_mmu().adopt_ram(&image.ram);
 		let mut seen: Vec<[u8; 4]> = vec![*b"RAM_"];
 		let mut stats = snapshot::RestoreStats::default();
+		let mut harts_seen = 0;
 		for (tag, payload) in image.sections.iter() {
+			if tag[..3] == *b"HRT" {
+				let h = (tag[3].wrapping_sub(b'0')) as usize;
+				match self.harts.get_mut(h.wrapping_sub(1)) {
+					Some(c) => c.restore_hart(payload)?,
+					None => return Err(format!("snapshot has hart {} but this machine has {} hart(s)", h, 1 + self.harts.len()))
+				}
+				harts_seen += 1;
+				seen.push(*tag);
+				continue;
+			}
 			if !self.cpu.restore_section(tag, payload, &mut stats)? {
 				return Err(format!(
 					"snapshot: unknown section {:?} (written by a newer emulator?)",
@@ -747,6 +1012,9 @@ impl Emulator {
 				));
 			}
 			seen.push(*tag);
+		}
+		if harts_seen != self.harts.len() {
+			return Err(format!("snapshot has {} hart(s) but this machine has {}", 1 + harts_seen, 1 + self.harts.len()));
 		}
 		for req in REQUIRED_SECTIONS.iter() {
 			if !seen.contains(req) {
@@ -779,9 +1047,14 @@ impl Emulator {
 		// device sections only: level is irrelevant without RAM, and the
 		// delta is small
 		let mut s = Ser::new();
+		self.pause_harts();
 		self.cpu.snapshot_into_no_ram(&mut s, 1);
+		for h in self.harts.iter() {
+			h.snapshot_hart(&mut s);
+		}
 		let secs = snapshot::sections_unframed(&s.buf);
 		let ram = self.cpu.get_mut_mmu().share_ram();
+		self.resume_harts();
 		let pages_total = (ram.len() + snapshot::PAGE - 1) / snapshot::PAGE;
 		let pages_kept = (0..pages_total).filter(|&i| ram.page(i).is_some()).count();
 		SnapshotImage {
@@ -801,12 +1074,12 @@ impl Emulator {
 
 	/// risc-box patch: like `setup_filesystem`, with an image other machines
 	/// share. Nothing is copied.
-	pub fn setup_filesystem_shared(&mut self, base: Arc<Vec<u8>>) {
+	pub fn setup_filesystem_shared(&mut self, base: Arc<disk_image::DiskImage>) {
 		self.cpu.get_mut_mmu().init_disk_shared(base);
 	}
 
 	/// risc-box patch: the base disk this machine boots from, for sharing.
-	pub fn disk_base(&self) -> Arc<Vec<u8>> {
+	pub fn disk_base(&self) -> Arc<disk_image::DiskImage> {
 		self.cpu.get_mmu().get_disk().base()
 	}
 

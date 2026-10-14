@@ -113,6 +113,8 @@ pub struct App {
     /// enclave endpoint serves tenants by path, not by subdomain.
     base_path: String,
     tls: bool,
+    connect_addr: Option<String>,
+    spki_pin: Option<[u8; 32]>,
     /// Bearer token for a deployment whose config sets `api_key`.
     api_key: Option<String>,
     /// Deployment-scoped app token for a PRIVATE deployment, sent as the
@@ -159,7 +161,20 @@ impl App {
             true => rest.to_string(),
             false => format!("{rest}:{}", if tls { 443 } else { 80 }),
         };
-        App { addr, host, base_path, tls, api_key: None, app_cookie: None, idle: std::sync::Mutex::new(Vec::new()) }
+        let connect_addr = std::env::var("GS_APP_CONNECT_ADDR").ok();
+        let spki_pin = std::env::var("GS_APP_SPKI_SHA256").ok().map(|v| {
+            assert!(v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "GS_APP_SPKI_SHA256 must be 64 hexadecimal characters");
+            let mut pin = [0; 32];
+            for (i, byte) in pin.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&v[i * 2..i * 2 + 2], 16).unwrap();
+            }
+            pin
+        });
+        assert!(connect_addr.is_none() || (tls && spki_pin.is_some()),
+                "GS_APP_CONNECT_ADDR requires HTTPS and an attested GS_APP_SPKI_SHA256");
+        assert!(spki_pin.is_none() || tls, "SPKI pin requires HTTPS");
+        App { addr, host, base_path, tls, connect_addr, spki_pin, api_key: None, app_cookie: None, idle: std::sync::Mutex::new(Vec::new()) }
     }
 
     /// Set the bearer token sent with every request.
@@ -227,7 +242,7 @@ impl App {
         // is strictly better than waiting: the retry usually works.
         let mut s = None;
         let mut last: Option<std::io::Error> = None;
-        for sa in std::net::ToSocketAddrs::to_socket_addrs(&self.addr)? {
+        for sa in std::net::ToSocketAddrs::to_socket_addrs(self.connect_addr.as_deref().unwrap_or(&self.addr))? {
             match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
                 Ok(c) => { s = Some(c); break; }
                 Err(e) => last = Some(e),
@@ -260,6 +275,19 @@ impl App {
         let stream = connector
             .connect(&self.host, s)
             .map_err(|e| std::io::Error::other(format!("tls handshake with {}: {e}", self.host)))?;
+        // Check before any HTTP headers or credentials are written. Routing to
+        // a nearby splice never changes SNI, CA/hostname validation, or the
+        // expected enclave transport identity.
+        if let Some(expected) = self.spki_pin {
+            let actual = stream.ssl().peer_certificate()
+                .and_then(|c| c.public_key().ok())
+                .and_then(|k| k.public_key_to_der().ok())
+                .map(|der| openssl::sha::sha256(&der));
+            if actual != Some(expected) {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                                              "attested app transport key mismatch"));
+            }
+        }
         let _ = handshake_sock.set_read_timeout(Some(Duration::from_secs(30)));
         let _ = handshake_sock.set_write_timeout(Some(Duration::from_secs(30)));
         Ok(Conn::Tls(Box::new(stream)))

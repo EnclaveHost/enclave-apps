@@ -46,20 +46,10 @@ pub struct Mmu {
 	ppn: u64,
 	addressing_mode: AddressingMode,
 	privilege_mode: PrivilegeMode,
-	memory: MemoryWrapper,
-	// risc-box patch: configured RAM size (bytes); mirrored into the DTB memory node.
-	ram_capacity: u64,
-	dtb: Vec<u8>,
-	disk: VirtioBlockDisk,
-	net: VirtioNet, // risc-box patch
-	input: VirtioInput, // risc-box patch
-	snd: VirtioSnd, // risc-box patch
-	gpu: VirtioGpu, // risc-box patch
-	opl: Opl, // risc-box patch
-	overlay: Overlay,
-	plic: Plic,
-	clint: Clint,
-	uart: Uart,
+	// risc-box patch (SMP): RAM and every device live on the bus, which all harts' MMUs share
+	bus: BusRef,
+	// which hart this MMU translates for (its index into the CLINT/PLIC/raised arrays)
+	hart: usize,
 
 	/// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
 	/// then `Mmu` has copy of it.
@@ -102,6 +92,93 @@ pub struct Mmu {
 	// changes when the generation, privilege mode or mstatus does, so it is
 	// materialized here at those points instead.
 	tlb_meta_cache: u32
+}
+
+/// risc-box patch (SMP): what every hart shares - RAM and the devices. One hart's `Mmu` was the whole machine;
+/// with several harts each keeps its own translation state (TLB, satp, privilege, mstatus copy) and reaches
+/// these through a `BusRef`.
+pub struct Bus {
+	memory: MemoryWrapper,
+	// configured RAM size (bytes); mirrored into the DTB memory node.
+	ram_capacity: u64,
+	dtb: Vec<u8>,
+	disk: VirtioBlockDisk,
+	net: VirtioNet,
+	input: VirtioInput,
+	snd: VirtioSnd,
+	gpu: VirtioGpu,
+	opl: Opl,
+	overlay: Overlay,
+	plic: Plic,
+	clint: Clint,
+	uart: Uart,
+	// interrupt-pending bits devices raised for harts other than 0 (hart 0's go straight into its mip, as they
+	// always have); each hart folds its own word into mip at its next device-service boundary
+	raised: Vec<std::sync::atomic::AtomicU64>,
+	dev: DevLock
+}
+
+/// risc-box patch (SMP): mutual exclusion for the devices. Every device register access and hart 0's device
+/// service take it, so harts on other threads see each register access whole. A plain spin lock that yields:
+/// critical sections are a register access or one service pass.
+pub struct DevLock {
+	held: std::sync::atomic::AtomicBool
+}
+
+impl DevLock {
+	fn new() -> Self {
+		DevLock { held: std::sync::atomic::AtomicBool::new(false) }
+	}
+
+	#[inline(always)]
+	pub fn lock(&self) {
+		use std::sync::atomic::Ordering::{Acquire, Relaxed};
+		if self.held.compare_exchange(false, true, Acquire, Relaxed).is_ok() {
+			return;
+		}
+		let mut spins = 0u32;
+		while self.held.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+			spins += 1;
+			match spins < 64 {
+				true => std::hint::spin_loop(),
+				false => std::thread::yield_now()
+			}
+		}
+	}
+
+	#[inline(always)]
+	pub fn unlock(&self) {
+		self.held.store(false, std::sync::atomic::Ordering::Release);
+	}
+}
+
+/// A hart's handle on the shared `Bus`. Harts run one at a time on a thread (interleaved SMP), so handing out
+/// `&mut Bus` from a shared cell is never two live mutable borrows; parallel harts guard the devices themselves.
+#[derive(Clone)]
+pub struct BusRef(std::sync::Arc<BusCell>);
+pub struct BusCell(std::cell::UnsafeCell<Bus>);
+unsafe impl Send for BusCell {}
+unsafe impl Sync for BusCell {}
+
+impl BusRef {
+	fn new(bus: Bus) -> Self {
+		BusRef(std::sync::Arc::new(BusCell(std::cell::UnsafeCell::new(bus))))
+	}
+}
+
+impl std::ops::Deref for BusRef {
+	type Target = Bus;
+	#[inline(always)]
+	fn deref(&self) -> &Bus {
+		unsafe { &*self.0 .0.get() }
+	}
+}
+
+impl std::ops::DerefMut for BusRef {
+	#[inline(always)]
+	fn deref_mut(&mut self) -> &mut Bus {
+		unsafe { &mut *self.0 .0.get() }
+	}
 }
 
 // risc-box patch: TLB geometry/type indices
@@ -154,19 +231,24 @@ impl Mmu {
 			ppn: 0,
 			addressing_mode: AddressingMode::None,
 			privilege_mode: PrivilegeMode::Machine,
-			memory: MemoryWrapper::new(),
-			ram_capacity: 0,
-			dtb: dtb,
-			disk: VirtioBlockDisk::new(),
-			net: VirtioNet::new(), // risc-box patch
-			input: VirtioInput::new(), // risc-box patch
-			snd: VirtioSnd::new(), // risc-box patch
-			gpu: VirtioGpu::new(1024, 768), // risc-box patch
-			opl: Opl::new(), // risc-box patch
-			overlay: Overlay::new(),
-			plic: Plic::new(),
-			clint: Clint::new(),
-			uart: Uart::new(terminal),
+			bus: BusRef::new(Bus {
+				memory: MemoryWrapper::new(),
+				ram_capacity: 0,
+				dtb: dtb,
+				disk: VirtioBlockDisk::new(),
+				net: VirtioNet::new(),
+				input: VirtioInput::new(),
+				snd: VirtioSnd::new(),
+				gpu: VirtioGpu::new(1024, 768),
+				opl: Opl::new(),
+				overlay: Overlay::new(),
+				plic: Plic::new(),
+				clint: Clint::new(),
+				uart: Uart::new(terminal),
+				raised: vec![std::sync::atomic::AtomicU64::new(0)],
+				dev: DevLock::new()
+			}),
+			hart: 0,
 			mstatus: 0,
 			page_cache_enabled: false,
 			fetch_page_cache: FnvHashMap::default(),
@@ -181,6 +263,85 @@ impl Mmu {
 		};
 		mmu.refresh_tlb_meta();
 		mmu
+	}
+
+	/// risc-box patch (SMP): size the per-hart device state for `n` harts. Call before boot.
+	pub fn set_harts(&mut self, n: usize) {
+		let n = n.max(1);
+		let bus = &mut *self.bus;
+		bus.clint.set_harts(n);
+		bus.plic.set_harts(n);
+		bus.raised = (0..n).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+	}
+
+	pub fn harts(&self) -> usize {
+		self.bus.raised.len()
+	}
+
+	/// risc-box patch (SMP): replace the embedded one-hart DTB with the embedded `n`-hart one
+	/// (device/mkdtb-smp.py). False when there is none for `n`.
+	pub fn use_smp_dtb(&mut self, n: usize) -> bool {
+		let content: &[u8] = match n {
+			2 => include_bytes!("./device/dtb-smp2.dtb"),
+			4 => include_bytes!("./device/dtb-smp4.dtb"),
+			_ => return false
+		};
+		self.init_dtb(content.to_vec());
+		true
+	}
+
+	pub fn hart(&self) -> usize {
+		self.hart
+	}
+
+	/// risc-box patch (SMP): an MMU for hart `hart` on the same bus - its own translation state, starting the
+	/// way a fresh one does (bare addressing, machine mode).
+	pub fn new_hart(&self, hart: usize) -> Self {
+		let mut mmu = Mmu {
+			clock: 0,
+			xlen: self.xlen.clone(),
+			ppn: 0,
+			addressing_mode: AddressingMode::None,
+			privilege_mode: PrivilegeMode::Machine,
+			bus: self.bus.clone(),
+			hart: hart,
+			mstatus: 0,
+			page_cache_enabled: false,
+			fetch_page_cache: FnvHashMap::default(),
+			load_page_cache: FnvHashMap::default(),
+			store_page_cache: FnvHashMap::default(),
+			tlb_gen: 1,
+			tlb_tags: [[0; TLB_SETS]; 3],
+			tlb_metas: [[0; TLB_SETS]; 3],
+			tlb_ppns: [[0; TLB_SETS]; 3],
+			tlb_meta_cache: 0
+		};
+		mmu.refresh_tlb_meta();
+		mmu
+	}
+
+	/// risc-box patch (SMP): host address of guest word `v_address` (`width` 4 or 8, naturally aligned) for an
+	/// atomic read-modify-write, translated as a store. Ok(None) = not RAM (a device): the caller falls back to
+	/// an ordinary load and store.
+	pub fn atomic_ptr(&mut self, v_address: u64, width: u64) -> Result<Option<*mut u8>, Trap> {
+		if v_address & (width - 1) != 0 {
+			return Err(Trap { trap_type: TrapType::StoreAddressMisaligned, value: v_address });
+		}
+		let p_address = match self.translate_address(v_address, &MemoryAccessType::Write) {
+			Ok(p) => self.get_effective_address(p),
+			Err(()) => return Err(Trap { trap_type: TrapType::StorePageFault, value: v_address })
+		};
+		Ok(self.bus.memory.rmw_ptr(p_address, width))
+	}
+
+	/// risc-box patch (SMP): the pending bits devices raised for this hart since the last call.
+	#[inline(always)]
+	pub fn take_raised(&self) -> u64 {
+		match self.bus.raised.get(self.hart) {
+			Some(w) if w.load(std::sync::atomic::Ordering::Relaxed) != 0 =>
+				w.swap(0, std::sync::atomic::Ordering::AcqRel),
+			_ => 0
+		}
 	}
 
 	/// Updates XLEN, 32-bit or 64-bit
@@ -198,10 +359,10 @@ impl Mmu {
 	/// # Arguments
 	/// * `capacity`
 	pub fn init_memory(&mut self, capacity: u64) {
-		self.memory.init(capacity);
+		self.bus.memory.init(capacity);
 		// risc-box patch: keep the DTB's memory@80000000 size in step with the
 		// actual allocation, so a configured RAM size needs no hand-edited DTB.
-		self.ram_capacity = capacity;
+		self.bus.ram_capacity = capacity;
 		self.sync_dtb_memory_size();
 	}
 
@@ -211,14 +372,14 @@ impl Mmu {
 	/// A DTB without exactly one such reg is left alone (with a log line) —
 	/// better an honest mismatch than a corrupted tree.
 	fn sync_dtb_memory_size(&mut self) {
-		if self.ram_capacity == 0 {
+		if self.bus.ram_capacity == 0 {
 			return; // unset
 		}
 		// (a wasm64 host hands out 4 GiB and more: both size cells are written
 		// below, so there is no ceiling here any more)
 		let pat: [u8; 12] = [0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0]; // base-hi, base-lo=0x80000000, size-hi=0
-		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(16))
-			.filter(|&i| self.dtb[i..i + 12] == pat)
+		let hits: Vec<usize> = (0..self.bus.dtb.len().saturating_sub(16))
+			.filter(|&i| self.bus.dtb[i..i + 12] == pat)
 			.collect();
 		if hits.len() != 1 {
 			eprintln!("[emu] dtb: expected exactly one memory@80000000 reg, found {}; leaving DTB as is", hits.len());
@@ -227,8 +388,9 @@ impl Mmu {
 		let at = hits[0] + 12;
 		// both size cells: a wasm64 host can give the guest 4 GiB and more,
 		// and a size-lo-only write would hand a 5 GiB guest 1 GiB
-		self.dtb[at - 4..at].copy_from_slice(&((self.ram_capacity >> 32) as u32).to_be_bytes());
-		self.dtb[at..at + 4].copy_from_slice(&(self.ram_capacity as u32).to_be_bytes());
+		let bus = &mut *self.bus;
+		bus.dtb[at - 4..at].copy_from_slice(&((bus.ram_capacity >> 32) as u32).to_be_bytes());
+		bus.dtb[at..at + 4].copy_from_slice(&(bus.ram_capacity as u32).to_be_bytes());
 	}
 
 	/// risc-box patch: replace the built-in device tree's `rng-seed` with
@@ -241,14 +403,14 @@ impl Mmu {
 		const HEAD: [u8; 16] = [
 			0x7a, 0xf3, 0x1c, 0x88, 0x4b, 0xe0, 0x92, 0xd5, 0x61, 0xac, 0x3f, 0x70, 0xc9, 0x12, 0x5e, 0xbb,
 		];
-		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(64))
-			.filter(|&i| self.dtb[i..i + 16] == HEAD)
+		let hits: Vec<usize> = (0..self.bus.dtb.len().saturating_sub(64))
+			.filter(|&i| self.bus.dtb[i..i + 16] == HEAD)
 			.collect();
 		if hits.len() != 1 {
 			return false;
 		}
 		let at = hits[0];
-		self.dtb[at..at + 64].copy_from_slice(seed);
+		self.bus.dtb[at..at + 64].copy_from_slice(seed);
 		true
 	}
 
@@ -277,20 +439,20 @@ impl Mmu {
 		// without a full FDT walk and refuses to guess if the tree changes
 		// shape (verified unique against the shipped blob).
 		let (w0, h0, s0) = (1024u32.to_be_bytes(), 768u32.to_be_bytes(), 4096u32.to_be_bytes());
-		let hits: Vec<usize> = (0..self.dtb.len().saturating_sub(36))
+		let hits: Vec<usize> = (0..self.bus.dtb.len().saturating_sub(36))
 			.step_by(4)
-			.filter(|&i| self.dtb[i..i + 4] == w0
-				&& self.dtb[i + 16..i + 20] == h0
-				&& self.dtb[i + 32..i + 36] == s0)
+			.filter(|&i| self.bus.dtb[i..i + 4] == w0
+				&& self.bus.dtb[i + 16..i + 20] == h0
+				&& self.bus.dtb[i + 32..i + 36] == s0)
 			.collect();
 		if hits.len() != 1 {
 			eprintln!("[emu] dtb: expected exactly one simple-framebuffer size triple, found {}; leaving DTB as is", hits.len());
 			return false;
 		}
 		let at = hits[0];
-		self.dtb[at..at + 4].copy_from_slice(&width.to_be_bytes());
-		self.dtb[at + 16..at + 20].copy_from_slice(&height.to_be_bytes());
-		self.dtb[at + 32..at + 36].copy_from_slice(&(width * 4).to_be_bytes());
+		self.bus.dtb[at..at + 4].copy_from_slice(&width.to_be_bytes());
+		self.bus.dtb[at + 16..at + 20].copy_from_slice(&height.to_be_bytes());
+		self.bus.dtb[at + 32..at + 36].copy_from_slice(&(width * 4).to_be_bytes());
 		true
 	}
 
@@ -298,49 +460,50 @@ impl Mmu {
 	// dispatch, no side effects) — the host's framebuffer scanout. The caller
 	// owns the address contract: the range must sit inside main memory.
 	pub fn read_physical_range(&self, p_address: u64, out: &mut [u8]) {
-		self.memory.read_range(p_address, out);
+		self.bus.memory.read_range(p_address, out);
 	}
 
 	// risc-box patch (debug aid): see MemoryWrapper::fb_writes.
 	pub fn fb_writes(&self) -> u64 {
-		self.memory.fb_writes()
+		self.bus.memory.fb_writes()
 	}
 
 	// risc-box patch (measurement): see MemoryWrapper::fb_bytes.
 	pub fn fb_bytes(&self) -> u64 {
-		self.memory.fb_bytes()
+		self.bus.memory.fb_bytes()
 	}
 
 	// risc-box patch (host-side game overlay): see MemoryWrapper::fb_take_rect.
 	pub fn fb_take_rect(&self) -> Option<(u32, u32, u32, u32)> {
-		self.memory.fb_take_rect()
+		self.bus.memory.fb_take_rect()
 	}
 
 	pub fn overlay_state(&self) -> OverlayState {
-		self.overlay.state()
+		self.bus.overlay.state()
 	}
 
 	pub fn overlay_frame(&self) -> Option<(u32, u32, u32, u32, &[u8])> {
-		self.overlay.frame()
+		self.bus.overlay.frame()
 	}
 
 	pub fn overlay_frame_id(&self) -> Option<u64> {
-		self.overlay.frame_id()
+		self.bus.overlay.frame_id()
 	}
 
 	// A frame copy must not be inlined into the CPU's ordinary store path.
 	#[cold]
 	#[inline(never)]
 	fn overlay_store(&mut self, address: u64, value: u8) {
-		if self.overlay.store(address, value) {
-			let memory = &self.memory;
-			self.overlay.capture(memory.fb_stride, |offset, out|
+		let bus = &mut *self.bus;
+		if bus.overlay.store(address, value) {
+			let memory = &bus.memory;
+			bus.overlay.capture(memory.fb_stride, |offset, out|
 				memory.read_range(0x87e0_0000 + offset, out));
 		}
 	}
 
 	pub fn set_fb_stride(&mut self, stride: u64) {
-		self.memory.set_fb_stride(stride);
+		self.bus.memory.set_fb_stride(stride);
 	}
 	
 	/// Initializes Virtio block disk. This method is expected to be called only once.
@@ -348,32 +511,32 @@ impl Mmu {
 	/// # Arguments
 	/// * `data` Filesystem binary content
 	pub fn init_disk(&mut self, data: Vec<u8>) {
-		self.disk.init(data);
+		self.bus.disk.init(data);
 	}
 
 	/// risc-box patch: attach a base disk image shared with other machines.
-	pub fn init_disk_shared(&mut self, base: std::sync::Arc<Vec<u8>>) {
-		self.disk.init_shared(base);
+	pub fn init_disk_shared(&mut self, base: std::sync::Arc<::disk_image::DiskImage>) {
+		self.bus.disk.init_shared(base);
 	}
 
 	/// risc-box patch (fork): take a shared RAM image as this machine's
 	/// memory (copy-on-write from here on) and drop every derived cache.
 	pub fn adopt_ram(&mut self, image: &RamImage) {
-		self.memory.ram_mut().adopt(image);
-		self.memory.bump_code_gen();
+		self.bus.memory.ram_mut().adopt(image);
+		self.bus.memory.bump_code_gen();
 		self.clear_page_cache();
 		self.tlb_flush();
 	}
 
 	/// risc-box patch (fork): publish this machine's RAM as an image.
 	pub fn share_ram(&mut self) -> RamImage {
-		self.memory.ram_mut().share()
+		self.bus.memory.ram_mut().share()
 	}
 
 	/// risc-box patch: (RAM owned, RAM shared, disk overlay) bytes.
 	pub fn footprint(&self) -> (usize, usize, usize) {
-		let (o, sh) = self.memory.ram().footprint();
-		(o, sh, self.disk.footprint())
+		let (o, sh) = self.bus.memory.ram().footprint();
+		(o, sh, self.bus.disk.footprint())
 	}
 
 	/// Overrides defalut Device tree configuration.
@@ -382,10 +545,10 @@ impl Mmu {
 	/// * `data` DTB binary content
 	pub fn init_dtb(&mut self, data: Vec<u8>) {
 		for i in 0..data.len() {
-			self.dtb[i] = data[i];
+			self.bus.dtb[i] = data[i];
 		}
-		for i in data.len()..self.dtb.len() {
-			self.dtb[i] = 0;
+		for i in data.len()..self.bus.dtb.len() {
+			self.bus.dtb[i] = 0;
 		}
 		// risc-box patch: a custom DTB gets the same memory-node sync
 		self.sync_dtb_memory_size();
@@ -415,7 +578,7 @@ impl Mmu {
 			self.tlb_tags = [[0; TLB_SETS]; 3];
 			self.tlb_gen = 1;
 			// generation reuse must not revive stale predecoded instructions
-			self.memory.bump_code_gen();
+			self.bus.memory.bump_code_gen();
 		}
 		self.refresh_tlb_meta(); // risc-box patch: meta embeds the generation
 	}
@@ -450,12 +613,12 @@ impl Mmu {
 	// the TLB meta (all translation inputs) plus the code generation
 	// (bumped when any marked executable page is written).
 	pub fn exec_meta(&self) -> u64 {
-		(self.tlb_meta() as u64) | ((self.memory.code_gen() as u64) << 32)
+		(self.tlb_meta() as u64) | ((self.bus.memory.code_gen() as u64) << 32)
 	}
 
 	// risc-box patch: see MemoryWrapper::mark_exec_page.
 	pub fn mark_exec_page(&mut self, p_address: u64) -> bool {
-		self.memory.mark_exec_page(p_address)
+		self.bus.memory.mark_exec_page(p_address)
 	}
 
 	// risc-box patch: the write-snoop generation alone — what a superblock's
@@ -472,7 +635,69 @@ impl Mmu {
 	}
 
 	pub fn code_gen(&self) -> u32 {
-		self.memory.code_gen()
+		self.bus.memory.code_gen()
+	}
+
+	// risc-box patch: per-page code generation of the page holding p_address (see MemoryWrapper::page_gen)
+	#[inline(always)]
+	pub fn page_gen(&self, p_address: u64) -> u32 {
+		self.bus.memory.page_gen(p_address)
+	}
+
+	// risc-box patch: the whole-memory invalidation generation (see MemoryWrapper::glob_gen)
+	#[inline(always)]
+	pub fn glob_gen(&self) -> u32 {
+		self.bus.memory.glob_gen()
+	}
+
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
+	/// risc-box patch (codegen JIT): the current translation meta — every
+	/// input a TLB hit depends on (generation, privilege, MPRV/MPP).
+	#[inline(always)]
+	pub(crate) fn tlb_meta_value(&self) -> u32 {
+		self.tlb_meta_cache
+	}
+
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
+	/// risc-box patch (codegen JIT): addresses of the software TLB's READ and
+	/// WRITE ways and of the meta cache cell, in the order jit::TlbLayout
+	/// names them (tags, metas, ppns for read, then write, then meta).
+	pub(crate) fn jit_tlb(&self) -> ([u64; 7], u32) {
+		let a = |p: *const u8| p as usize as u64;
+		([
+			a(self.tlb_tags[TLB_READ].as_ptr() as *const u8),
+			a(self.tlb_metas[TLB_READ].as_ptr() as *const u8),
+			a(self.tlb_ppns[TLB_READ].as_ptr() as *const u8),
+			a(self.tlb_tags[TLB_WRITE].as_ptr() as *const u8),
+			a(self.tlb_metas[TLB_WRITE].as_ptr() as *const u8),
+			a(self.tlb_ppns[TLB_WRITE].as_ptr() as *const u8),
+			a(&self.tlb_meta_cache as *const u32 as *const u8),
+		], TLB_SETS as u32)
+	}
+
+	#[cfg(any(feature = "codegen", all(test, feature = "jit")))]
+	/// risc-box patch (codegen JIT): (read table, write table, exec-page
+	/// marks, DRAM length) — what the chunked-RAM tier reads. The tables move
+	/// only when the memory is re-initialized.
+	pub(crate) fn jit_ram(&self) -> (u64, u64, u64, u64) {
+		let (rd, wr) = self.bus.memory.memory.jit_tables();
+		(
+			rd as usize as u64,
+			wr as usize as u64,
+			self.bus.memory.exec_page_marks.as_ptr() as usize as u64,
+			self.bus.memory.memory.len() as u64,
+		)
+	}
+
+	/// Tests: physical doubleword access with the real side effects.
+	#[cfg(test)]
+	pub(crate) fn load_doubleword_phys(&mut self, p_address: u64) -> u64 {
+		self.load_doubleword_raw(p_address)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn store_doubleword_phys(&mut self, p_address: u64, value: u64) {
+		self.store_doubleword_raw(p_address, value)
 	}
 
 	// risc-box patch: SFENCE.VMA entry point (cpu.rs calls this; upstream
@@ -511,17 +736,20 @@ impl Mmu {
 	// much rather than by one, so guest time runs at the same rate it always
 	// did; devices that only poll queues simply get polled less often.
 	pub fn tick(&mut self, n: u64, mip: &mut u64) {
-		self.clint.tick(n, mip);
-		self.disk.tick(n, &mut self.memory);
-		self.net.tick(&mut self.memory); // risc-box patch
-		self.input.tick(&mut self.memory); // risc-box patch
-		let mtime = self.clint.mtime(); // risc-box patch
-		self.snd.tick(mtime, &mut self.memory); // risc-box patch
-		self.gpu.tick(&mut self.memory); // risc-box patch
-		self.uart.tick(n);
-		self.plic.tick(n, self.disk.is_interrupting(), self.net.is_interrupting(),
-			self.input.is_interrupting(), self.snd.is_interrupting(),
-			self.gpu.is_interrupting(), self.uart.is_interrupting(), mip);
+		self.bus.dev.lock();
+		let bus = &mut *self.bus;
+		bus.clint.tick(n, mip, &bus.raised);
+		bus.disk.tick(n, &mut bus.memory);
+		bus.net.tick(&mut bus.memory); // risc-box patch
+		bus.input.tick(&mut bus.memory); // risc-box patch
+		let mtime = bus.clint.mtime(); // risc-box patch
+		bus.snd.tick(mtime, &mut bus.memory); // risc-box patch
+		bus.gpu.tick(&mut bus.memory); // risc-box patch
+		bus.uart.tick(n);
+		bus.plic.tick(n, bus.disk.is_interrupting(), bus.net.is_interrupting(),
+			bus.input.is_interrupting(), bus.snd.is_interrupting(),
+			bus.gpu.is_interrupting(), bus.uart.is_interrupting(), mip, &bus.raised);
+		self.bus.dev.unlock();
 		self.clock = self.clock.wrapping_add(n);
 	}
 
@@ -838,22 +1066,60 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		// @TODO: Mapping should be configurable with dtb
 		match effective_address >= DRAM_BASE {
-			true => self.memory.read_byte(effective_address),
-			false => match effective_address {
+			true => self.bus.memory.read_byte(effective_address),
+			false => {
+				self.dev_lock();
+				let v = self.load_dev(effective_address);
+				self.dev_unlock();
+				v
+			}
+		}
+	}
+
+	/// risc-box patch (SMP): the device lock (see DevLock).
+	#[inline(always)]
+	pub fn dev_lock(&self) {
+		self.bus.dev.lock();
+	}
+
+	#[inline(always)]
+	pub fn dev_unlock(&self) {
+		self.bus.dev.unlock();
+	}
+
+	/// A byte of a multi-byte access that is not all RAM (it may straddle DRAM_BASE); device lock held.
+	fn load_dev_or_ram(&mut self, a: u64) -> u8 {
+		match a >= DRAM_BASE {
+			true => self.bus.memory.read_byte(a),
+			false => self.load_dev(a)
+		}
+	}
+
+	fn store_dev_or_ram(&mut self, a: u64, value: u8) {
+		match a >= DRAM_BASE {
+			true => self.bus.memory.write_byte(a, value),
+			false => self.store_dev(a, value)
+		}
+	}
+
+	/// risc-box patch (SMP): a device (non-RAM) byte; the caller holds the device lock.
+	fn load_dev(&mut self, effective_address: u64) -> u8 {
+		{
+			match effective_address {
 				// I don't know why but dtb data seems to be stored from 0x1020 on Linux.
 				// It might be from self.x[0xb] initialization?
 				// And DTB size is arbitray.
-				0x00001020..=0x00001fff => self.dtb[effective_address as usize - 0x1020],
-				0x02000000..=0x0200ffff => self.clint.load(effective_address),
-				0x0C000000..=0x0fffffff => self.plic.load(effective_address),
-				0x10000000..=0x100000ff => self.uart.load(effective_address),
-				0x10001000..=0x10001FFF => self.disk.load(effective_address),
-				0x10002000..=0x10002FFF => self.net.load(effective_address), // risc-box patch
-				0x10003000..=0x10003FFF => self.input.load(effective_address), // risc-box patch
-				0x10004000..=0x10004FFF => self.snd.load(effective_address), // risc-box patch
-				0x10005000..=0x10005FFF => self.gpu.load(effective_address), // risc-box patch
-				0x10006000..=0x10006FFF => self.opl.load(effective_address), // risc-box patch
-				0x10007000..=0x10007FFF => self.overlay.load(effective_address),
+				0x00001020..=0x00001fff => self.bus.dtb[effective_address as usize - 0x1020],
+				0x02000000..=0x0200ffff => self.bus.clint.load(effective_address),
+				0x0C000000..=0x0fffffff => self.bus.plic.load(effective_address),
+				0x10000000..=0x100000ff => self.bus.uart.load(effective_address),
+				0x10001000..=0x10001FFF => self.bus.disk.load(effective_address),
+				0x10002000..=0x10002FFF => self.bus.net.load(effective_address), // risc-box patch
+				0x10003000..=0x10003FFF => self.bus.input.load(effective_address), // risc-box patch
+				0x10004000..=0x10004FFF => self.bus.snd.load(effective_address), // risc-box patch
+				0x10005000..=0x10005FFF => self.bus.gpu.load(effective_address), // risc-box patch
+				0x10006000..=0x10006FFF => self.bus.opl.load(effective_address), // risc-box patch
+				0x10007000..=0x10007FFF => self.bus.overlay.load(effective_address),
 				// risc-box patch: an access to an address no device backs must
 				// never panic the HOST process — a tenant guest could otherwise
 				// crash the whole enclave app. Read as zero, like an open bus.
@@ -872,12 +1138,14 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(1) > effective_address {
 			// Fast path. Directly load main memory at a time.
-			true => self.memory.read_halfword(effective_address),
+			true => self.bus.memory.read_halfword(effective_address),
 			false => {
 				let mut data = 0 as u16;
+				self.dev_lock();
 				for i in 0..2 {
-					data |= (self.load_raw(effective_address.wrapping_add(i)) as u16) << (i * 8)
+					data |= (self.load_dev_or_ram(effective_address.wrapping_add(i)) as u16) << (i * 8)
 				}
+				self.dev_unlock();
 				data
 			}
 		}
@@ -893,12 +1161,14 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(3) > effective_address {
 			// Fast path. Directly load main memory at a time.
-			true => self.memory.read_word(effective_address),
+			true => self.bus.memory.read_word(effective_address),
 			false => {
 				let mut data = 0 as u32;
+				self.dev_lock();
 				for i in 0..4 {
-					data |= (self.load_raw(effective_address.wrapping_add(i)) as u32) << (i * 8)
+					data |= (self.load_dev_or_ram(effective_address.wrapping_add(i)) as u32) << (i * 8)
 				}
+				self.dev_unlock();
 				data
 			}
 		}
@@ -914,12 +1184,14 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(7) > effective_address {
 			// Fast path. Directly load main memory at a time.
-			true => self.memory.read_doubleword(effective_address),
+			true => self.bus.memory.read_doubleword(effective_address),
 			false => {
 				let mut data = 0 as u64;
+				self.dev_lock();
 				for i in 0..8 {
-					data |= (self.load_raw(effective_address.wrapping_add(i)) as u64) << (i * 8)
+					data |= (self.load_dev_or_ram(effective_address.wrapping_add(i)) as u64) << (i * 8)
 				}
+				self.dev_unlock();
 				data
 			}
 		}
@@ -936,17 +1208,28 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		// @TODO: Mapping should be configurable with dtb
 		match effective_address >= DRAM_BASE {
-			true => self.memory.write_byte(effective_address, value),
-			false => match effective_address {
-				0x02000000..=0x0200ffff => self.clint.store(effective_address, value),
-				0x0c000000..=0x0fffffff => self.plic.store(effective_address, value),
-				0x10000000..=0x100000ff => self.uart.store(effective_address, value),
-				0x10001000..=0x10001FFF => self.disk.store(effective_address, value),
-				0x10002000..=0x10002FFF => self.net.store(effective_address, value), // risc-box patch
-				0x10003000..=0x10003FFF => self.input.store(effective_address, value), // risc-box patch
-				0x10004000..=0x10004FFF => self.snd.store(effective_address, value), // risc-box patch
-				0x10005000..=0x10005FFF => self.gpu.store(effective_address, value), // risc-box patch
-				0x10006000..=0x10006FFF => self.opl.store(effective_address, value), // risc-box patch
+			true => self.bus.memory.write_byte(effective_address, value),
+			false => {
+				self.dev_lock();
+				self.store_dev(effective_address, value);
+				self.dev_unlock();
+			}
+		}
+	}
+
+	/// risc-box patch (SMP): a device (non-RAM) byte store; the caller holds the device lock.
+	fn store_dev(&mut self, effective_address: u64, value: u8) {
+		{
+			match effective_address {
+				0x02000000..=0x0200ffff => self.bus.clint.store(effective_address, value),
+				0x0c000000..=0x0fffffff => self.bus.plic.store(effective_address, value),
+				0x10000000..=0x100000ff => self.bus.uart.store(effective_address, value),
+				0x10001000..=0x10001FFF => self.bus.disk.store(effective_address, value),
+				0x10002000..=0x10002FFF => self.bus.net.store(effective_address, value), // risc-box patch
+				0x10003000..=0x10003FFF => self.bus.input.store(effective_address, value), // risc-box patch
+				0x10004000..=0x10004FFF => self.bus.snd.store(effective_address, value), // risc-box patch
+				0x10005000..=0x10005FFF => self.bus.gpu.store(effective_address, value), // risc-box patch
+				0x10006000..=0x10006FFF => self.bus.opl.store(effective_address, value), // risc-box patch
 				0x10007000..=0x10007FFF => self.overlay_store(effective_address, value),
 				// risc-box patch: drop writes to unbacked addresses (open bus)
 				// rather than panic the host — see load_raw.
@@ -966,11 +1249,13 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(1) > effective_address {
 			// Fast path. Directly store to main memory at a time.
-			true => self.memory.write_halfword(effective_address, value),
+			true => self.bus.memory.write_halfword(effective_address, value),
 			false => {
+				self.dev_lock();
 				for i in 0..2 {
-					self.store_raw(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
+					self.store_dev_or_ram(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
 				}
+				self.dev_unlock();
 			}
 		}
 	}
@@ -986,11 +1271,13 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(3) > effective_address {
 			// Fast path. Directly store to main memory at a time.
-			true => self.memory.write_word(effective_address, value),
+			true => self.bus.memory.write_word(effective_address, value),
 			false => {
+				self.dev_lock();
 				for i in 0..4 {
-					self.store_raw(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
+					self.store_dev_or_ram(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
 				}
+				self.dev_unlock();
 			}
 		}
 	}
@@ -1006,11 +1293,13 @@ impl Mmu {
 		let effective_address = self.get_effective_address(p_address);
 		match effective_address >= DRAM_BASE && effective_address.wrapping_add(7) > effective_address {
 			// Fast path. Directly store to main memory at a time.
-			true => self.memory.write_doubleword(effective_address, value),
+			true => self.bus.memory.write_doubleword(effective_address, value),
 			false => {
+				self.dev_lock();
 				for i in 0..8 {
-					self.store_raw(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
+					self.store_dev_or_ram(effective_address.wrapping_add(i), ((value >> (i * 8)) & 0xff) as u8);
 				}
+				self.dev_unlock();
 			}
 		}
 	}
@@ -1028,7 +1317,7 @@ impl Mmu {
 		};
 		let effective_address = self.get_effective_address(p_address);
 		let valid = match effective_address >= DRAM_BASE {
-			true => self.memory.validate_address(effective_address),
+			true => self.bus.memory.validate_address(effective_address),
 			false => match effective_address {
 				0x00001020..=0x00001fff => true,
 				0x02000000..=0x0200ffff => true,
@@ -1287,17 +1576,17 @@ impl Mmu {
 
 	/// Returns immutable reference to `Clint`.
 	pub fn get_clint(&self) -> &Clint {
-		&self.clint
+		&self.bus.clint
 	}
 
 	/// Returns mutable reference to `Clint`.
 	pub fn get_mut_clint(&mut self) -> &mut Clint {
-		&mut self.clint
+		&mut self.bus.clint
 	}
 
 	/// Returns mutable reference to `Uart`.
 	pub fn get_mut_uart(&mut self) -> &mut Uart {
-		&mut self.uart
+		&mut self.bus.uart
 	}
 
 	/// risc-box patch: immutable access to the virtio disk, so the app can
@@ -1305,13 +1594,18 @@ impl Mmu {
 	/// risc-box patch: mutable access to the virtio-net device so the
 	/// embedding application can attach a backend and exchange frames.
 	pub fn get_mut_net(&mut self) -> &mut VirtioNet {
-		&mut self.net
+		&mut self.bus.net
+	}
+
+	/// risc-box patch: read-only view of the input device (its queue depth)
+	pub fn get_input(&self) -> &VirtioInput {
+		&self.bus.input
 	}
 
 	/// risc-box patch: mutable access to the virtio-input device so the
 	/// embedding application can inject pointer/keyboard events.
 	pub fn get_mut_input(&mut self) -> &mut VirtioInput {
-		&mut self.input
+		&mut self.bus.input
 	}
 
 	/// risc-box patch: mutable access to the virtio-snd device so the host can
@@ -1319,27 +1613,32 @@ impl Mmu {
 	/// risc-box patch: the OPL register mailbox (music; synthesis is the
 	/// host's job, see device/opl.rs).
 	pub fn get_mut_opl(&mut self) -> &mut Opl {
-		&mut self.opl
+		&mut self.bus.opl
 	}
 
 	pub fn get_mut_gpu(&mut self) -> &mut VirtioGpu {
-		&mut self.gpu
+		&mut self.bus.gpu
 	}
 
 	/// risc-box patch: read-only view of the display controller, for the
 	/// scanout path.
 	pub fn get_gpu(&self) -> &VirtioGpu {
-		&self.gpu
+		&self.bus.gpu
 	}
 
 	pub fn get_mut_snd(&mut self) -> &mut VirtioSnd {
-		&mut self.snd
+		&mut self.bus.snd
 	}
 
 	pub fn get_disk(&self) -> &VirtioBlockDisk {
-		&self.disk
+		&self.bus.disk
 	}
 }
+
+/// risc-box patch: the physical window whose stores feed the framebuffer
+/// counters and overlay rectangle (snoop_exec). The codegen JIT bails on
+/// stores here so the interpreter keeps that bookkeeping.
+pub const FB_STORE_WINDOW: (u64, u64) = (0x87e0_0000, 0x8860_0000);
 
 /// [`Memory`](../memory/struct.Memory.html) wrapper. Converts physical address to the one in memory
 /// using [`DRAM_BASE`](constant.DRAM_BASE.html) and accesses [`Memory`](../memory/struct.Memory.html).
@@ -1352,6 +1651,15 @@ pub struct MemoryWrapper {
 	// cached entry's meta embeds, killing them all at once.
 	exec_page_marks: Vec<u8>,
 	code_gen: u32,
+	// risc-box patch (per-page code generations, 2026-10-09): a store into a marked page bumps THAT page's
+	// generation and the epoch (`code_gen`) only. Caches keep `code_gen` as the cheap "nothing changed" test and,
+	// when the epoch moved, revalidate against their own pages' generations instead of dropping everything. A
+	// guest JIT (SpiderMonkey) patches code all the time; the old whole-memory bump threw away every decoded
+	// block and compiled region, and cleared ~458k page marks, on each of those stores.
+	page_gens: Vec<u32>,
+	// bumped by whole-memory invalidations (snapshot restore, TLB-generation wrap, fork): no page generation
+	// recorded before one of those may ever validate after it
+	glob_gen: u32,
 	fb_writes: u64,
 	fb_bytes: u64,
 	// risc-box patch (host-side game overlay): byte-offset extent of stores
@@ -1372,6 +1680,8 @@ impl MemoryWrapper {
 			memory: Memory::new(),
 			exec_page_marks: vec![],
 			code_gen: 1,
+			page_gens: vec![],
+			glob_gen: 1,
 			fb_writes: 0,
 			fb_bytes: 0,
 			fb_off_min: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -1383,6 +1693,7 @@ impl MemoryWrapper {
 	fn init(&mut self, capacity: u64) {
 		self.memory.init(capacity);
 		self.exec_page_marks = vec![0; ((capacity + 0xfff) >> 12) as usize]; // risc-box patch
+		self.page_gens = vec![1; ((capacity + 0xfff) >> 12) as usize]; // risc-box patch
 	}
 
 	// risc-box patch (debug aid): count stores landing in the framebuffer's
@@ -1431,7 +1742,7 @@ impl MemoryWrapper {
 	// risc-box patch: bump code_gen if this write can touch a marked page.
 	#[inline(always)]
 	fn snoop_exec(&mut self, p_address: u64, width: u64) {
-		if p_address >= 0x87e0_0000 && p_address < 0x8860_0000 {
+		if p_address >= FB_STORE_WINDOW.0 && p_address < FB_STORE_WINDOW.1 {
 			self.fb_writes = self.fb_writes.wrapping_add(1);
 			self.fb_bytes = self.fb_bytes.wrapping_add(width);
 			use std::sync::atomic::Ordering;
@@ -1446,16 +1757,53 @@ impl MemoryWrapper {
 		}
 		let first = (p_address.wrapping_sub(DRAM_BASE) >> 12) as usize;
 		let last = (p_address.wrapping_add(width - 1).wrapping_sub(DRAM_BASE) >> 12) as usize;
-		let hit = match self.exec_page_marks.get(first) {
+		let hit_first = match self.exec_page_marks.get(first) {
 			Some(&m) => m != 0,
 			None => false
-		} || (last != first && match self.exec_page_marks.get(last) {
+		};
+		let hit_last = last != first && match self.exec_page_marks.get(last) {
 			Some(&m) => m != 0,
 			None => false
-		});
-		if hit {
-			self.bump_code_gen();
+		};
+		if hit_first || hit_last {
+			if hit_first {
+				self.code_write_page(first);
+			}
+			if hit_last {
+				self.code_write_page(last);
+			}
+			self.code_gen = self.code_gen.wrapping_add(1);
 		}
+	}
+
+	// risc-box patch: a store reached marked page `page`: retire what was decoded from it (its generation moves)
+	// and unmark it; re-decoding re-marks it.
+	#[inline(always)]
+	fn code_write_page(&mut self, page: usize) {
+		if let Some(g) = self.page_gens.get_mut(page) {
+			*g = g.wrapping_add(1);
+		}
+		if let Some(m) = self.exec_page_marks.get_mut(page) {
+			*m = 0;
+		}
+	}
+
+	// risc-box patch: the code generation of the page holding p_address (0 when it is not DRAM)
+	#[inline(always)]
+	pub fn page_gen(&self, p_address: u64) -> u32 {
+		if p_address < DRAM_BASE {
+			return 0;
+		}
+		match self.page_gens.get(((p_address - DRAM_BASE) >> 12) as usize) {
+			Some(&g) => g,
+			None => 0
+		}
+	}
+
+	// risc-box patch
+	#[inline(always)]
+	pub fn glob_gen(&self) -> u32 {
+		self.glob_gen
 	}
 
 	// risc-box patch: remember that the page holding p_address backs cached
@@ -1484,6 +1832,7 @@ impl MemoryWrapper {
 	// re-mark what is still live.
 	pub fn bump_code_gen(&mut self) {
 		self.code_gen = self.code_gen.wrapping_add(1);
+		self.glob_gen = self.glob_gen.wrapping_add(1);
 		for m in self.exec_page_marks.iter_mut() {
 			*m = 0;
 		}
@@ -1558,6 +1907,16 @@ impl MemoryWrapper {
 		self.memory.validate_address(address - DRAM_BASE)
 	}
 
+	/// risc-box patch (SMP): host address for an atomic read-modify-write of `width` bytes at `p_address`, after
+	/// the same SMC snoop a store gets. None when the range is not all RAM.
+	pub fn rmw_ptr(&mut self, p_address: u64, width: u64) -> Option<*mut u8> {
+		if p_address < DRAM_BASE || !self.validate_address(p_address) || !self.validate_address(p_address + width - 1) {
+			return None;
+		}
+		self.snoop_exec(p_address, width);
+		Some(self.memory.rmw_ptr((p_address - DRAM_BASE) as usize))
+	}
+
 	// risc-box patch (snapshot/fork): the pages themselves. Writes made
 	// through these bypass the SMC snoop, so the caller bumps code_gen.
 	pub fn ram(&self) -> &Memory {
@@ -1619,52 +1978,52 @@ impl Mmu {
 		s.u8(addressing_mode_code(&self.addressing_mode));
 		s.u8(privilege_code(&self.privilege_mode));
 		s.u64(self.mstatus);
-		s.u64(self.ram_capacity);
+		s.u64(self.bus.ram_capacity);
 		s.end_section(at);
 
-		s.section(b"DTB_", &self.dtb);
+		s.section(b"DTB_", &self.bus.dtb);
 
 		let at = s.begin_section(b"CLNT");
-		self.clint.snapshot(s);
+		self.bus.clint.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"PLIC");
-		self.plic.snapshot(s);
+		self.bus.plic.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"UART");
-		self.uart.snapshot(s);
+		self.bus.uart.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"VBLK");
-		self.disk.snapshot(s);
+		self.bus.disk.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"VNET");
-		self.net.snapshot(s);
+		self.bus.net.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"VINP");
-		self.input.snapshot(s);
+		self.bus.input.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"VSND");
-		self.snd.snapshot(s);
+		self.bus.snd.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"VGPU");
-		self.gpu.snapshot(s);
+		self.bus.gpu.snapshot(s);
 		s.end_section(at);
 		let at = s.begin_section(b"OPL_");
-		self.opl.snapshot(s);
+		self.bus.opl.snapshot(s);
 		s.end_section(at);
 
 		let ram = match with_ram {
 			true => {
 				let at = s.begin_section(b"RAM_");
-				let ram = snapshot::encode_ram(self.memory.ram(), level, s);
+				let ram = snapshot::encode_ram(self.bus.memory.ram(), level, s);
 				s.end_section(at);
 				ram
 			},
-			false => snapshot::RamStats { bytes: self.memory.ram().len() as u64, pages_kept: 0, pages_total: 0 }
+			false => snapshot::RamStats { bytes: self.bus.memory.ram().len() as u64, pages_kept: 0, pages_total: 0 }
 		};
 
 		let at = s.begin_section(b"DDLT");
-		let blocks = self.disk.dirty_blocks();
-		let disk = &self.disk;
+		let blocks = self.bus.disk.dirty_blocks();
+		let disk = &self.bus.disk;
 		snapshot::encode_delta(&blocks, level, |b, out| disk.read_block(b, out), s);
 		s.end_section(at);
 
@@ -1672,11 +2031,37 @@ impl Mmu {
 	}
 
 	/// Apply one section. Ok(false) = not a section this layer knows.
+	/// risc-box patch (SMP): a secondary hart's translation state (the per-hart part of MMU_).
+	pub fn snapshot_translation(&self, s: &mut Ser) {
+		s.u64(self.clock);
+		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
+		s.u64(self.ppn);
+		s.u8(addressing_mode_code(&self.addressing_mode));
+		s.u8(privilege_code(&self.privilege_mode));
+		s.u64(self.mstatus);
+	}
+
+	pub fn restore_translation(&mut self, r: &mut De) -> Result<(), String> {
+		self.clock = r.u64()?;
+		self.xlen = match r.u8()? {
+			32 => Xlen::Bit32,
+			64 => Xlen::Bit64,
+			v => return Err(format!("snapshot: bad xlen {}", v))
+		};
+		self.ppn = r.u64()?;
+		self.addressing_mode = addressing_mode_from(r.u8()?)?;
+		self.privilege_mode = privilege_from(r.u8()?)?;
+		self.mstatus = r.u64()?;
+		self.clear_page_cache();
+		self.tlb_flush();
+		Ok(())
+	}
+
 	pub fn restore_section(&mut self, tag: &[u8; 4], payload: &[u8], stats: &mut snapshot::RestoreStats) -> Result<bool, String> {
 		let mut r = De::new(payload);
 		match tag {
 			b"MMU_" => {
-				self.overlay = Overlay::new();
+				self.bus.overlay = Overlay::new();
 				self.clock = r.u64()?;
 				self.xlen = match r.u8()? {
 					32 => Xlen::Bit32,
@@ -1687,46 +2072,46 @@ impl Mmu {
 				self.addressing_mode = addressing_mode_from(r.u8()?)?;
 				self.privilege_mode = privilege_from(r.u8()?)?;
 				self.mstatus = r.u64()?;
-				self.ram_capacity = r.u64()?;
-				if self.ram_capacity > self.memory.ram().len() as u64 {
+				self.bus.ram_capacity = r.u64()?;
+				if self.bus.ram_capacity > self.bus.memory.ram().len() as u64 {
 					return Err(format!(
 						"snapshot: MMU says {} bytes of RAM, {} allocated",
-						self.ram_capacity, self.memory.ram().len()
+						self.bus.ram_capacity, self.bus.memory.ram().len()
 					));
 				}
 				// every translation cache is derived state: start empty
 				self.clear_page_cache();
 				self.tlb_flush();
-				self.memory.bump_code_gen();
+				self.bus.memory.bump_code_gen();
 			},
 			b"DTB_" => {
-				if payload.len() > self.dtb.len() {
-					return Err(format!("snapshot: DTB is {} bytes, window is {}", payload.len(), self.dtb.len()));
+				if payload.len() > self.bus.dtb.len() {
+					return Err(format!("snapshot: DTB is {} bytes, window is {}", payload.len(), self.bus.dtb.len()));
 				}
-				self.dtb[..payload.len()].copy_from_slice(payload);
-				for b in self.dtb[payload.len()..].iter_mut() {
+				self.bus.dtb[..payload.len()].copy_from_slice(payload);
+				for b in self.bus.dtb[payload.len()..].iter_mut() {
 					*b = 0;
 				}
 				return Ok(true);
 			},
-			b"CLNT" => self.clint.restore(&mut r)?,
-			b"PLIC" => self.plic.restore(&mut r)?,
-			b"UART" => self.uart.restore(&mut r)?,
-			b"VBLK" => self.disk.restore(&mut r)?,
-			b"VNET" => self.net.restore(&mut r)?,
-			b"VINP" => self.input.restore(&mut r)?,
-			b"VSND" => self.snd.restore(&mut r)?,
-			b"VGPU" => self.gpu.restore(&mut r)?,
-			b"OPL_" => self.opl.restore(&mut r)?,
+			b"CLNT" => self.bus.clint.restore(&mut r)?,
+			b"PLIC" => self.bus.plic.restore(&mut r)?,
+			b"UART" => self.bus.uart.restore(&mut r)?,
+			b"VBLK" => self.bus.disk.restore(&mut r)?,
+			b"VNET" => self.bus.net.restore(&mut r)?,
+			b"VINP" => self.bus.input.restore(&mut r)?,
+			b"VSND" => self.bus.snd.restore(&mut r)?,
+			b"VGPU" => self.bus.gpu.restore(&mut r)?,
+			b"OPL_" => self.bus.opl.restore(&mut r)?,
 			b"RAM_" => {
-				let st = snapshot::decode_ram_into(payload, self.memory.ram_mut())?;
-				self.memory.bump_code_gen();
+				let st = snapshot::decode_ram_into(payload, self.bus.memory.ram_mut())?;
+				self.bus.memory.bump_code_gen();
 				stats.ram_pages_kept = st.pages_kept;
 				stats.ram_pages_total = st.pages_total;
 				return Ok(true);
 			},
 			b"DDLT" => {
-				let disk = &mut self.disk;
+				let disk = &mut self.bus.disk;
 				let n = snapshot::decode_delta(payload, |b, data| disk.write_block(b, data))?;
 				stats.delta_blocks = n as usize;
 				return Ok(true);
