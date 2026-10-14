@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""risc-xwin: hide or show the top-level X windows of one WM_CLASS (the RISC Box's warm Firefox).
+  risc-xwin hide [class]   iconify them (the window manager keeps them off screen and out of the way)
+  risc-xwin show [class]   map, raise and activate them
+  risc-xwin list [class]   print their ids and names
+Plain Xlib through ctypes: the image has libX11 and python3 but no xdotool/wmctrl."""
+import ctypes, ctypes.util, sys
+
+X = ctypes.cdll.LoadLibrary(ctypes.util.find_library('X11') or 'libX11.so.6')
+X.XOpenDisplay.restype = ctypes.c_void_p
+X.XOpenDisplay.argtypes = [ctypes.c_char_p]
+X.XDefaultRootWindow.restype = ctypes.c_ulong
+X.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+X.XDefaultScreen.argtypes = [ctypes.c_void_p]
+X.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                         ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint)]
+X.XFree.argtypes = [ctypes.c_void_p]
+X.XInternAtom.restype = ctypes.c_ulong
+X.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+X.XGetWindowProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long, ctypes.c_int,
+                                 ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+                                 ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                                 ctypes.POINTER(ctypes.c_void_p)]
+X.XIconifyWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
+X.XMapRaised.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+X.XFlush.argtypes = [ctypes.c_void_p]
+X.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+X.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
+
+
+class ClientMessage(ctypes.Structure):
+    _fields_ = [('type', ctypes.c_int), ('serial', ctypes.c_ulong), ('send_event', ctypes.c_int),
+                ('display', ctypes.c_void_p), ('window', ctypes.c_ulong), ('message_type', ctypes.c_ulong),
+                ('format', ctypes.c_int), ('l', ctypes.c_long * 5)]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [('xclient', ClientMessage), ('pad', ctypes.c_long * 24)]
+
+
+def prop(dpy, w, name):
+    atom = X.XInternAtom(dpy, name, 0)
+    t, f, n, after, data = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+    if X.XGetWindowProperty(dpy, w, atom, 0, 1024, 0, 0, ctypes.byref(t), ctypes.byref(f), ctypes.byref(n),
+                            ctypes.byref(after), ctypes.byref(data)) != 0 or not data.value:
+        return b''
+    raw = ctypes.string_at(data.value, n.value * (f.value // 8 if f.value != 32 else ctypes.sizeof(ctypes.c_long)))
+    X.XFree(data)
+    return raw
+
+
+def windows(dpy, root, cls):
+    out = []
+    stack = [root]
+    while stack:
+        w = stack.pop()
+        r, p, ch, n = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+        if X.XQueryTree(dpy, w, ctypes.byref(r), ctypes.byref(p), ctypes.byref(ch), ctypes.byref(n)) == 0:
+            continue
+        kids = [ch[i] for i in range(n.value)]
+        if n.value:
+            X.XFree(ch)
+        for k in kids:
+            wc = prop(dpy, k, b'WM_CLASS')
+            if wc and cls in wc.lower() and prop(dpy, k, b'WM_STATE'):
+                out.append((k, prop(dpy, k, b'_NET_WM_NAME') or prop(dpy, k, b'WM_NAME')))
+            else:
+                stack.append(k)
+    return out
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'list'
+    cls = (sys.argv[2] if len(sys.argv) > 2 else 'firefox').lower().encode()
+    dpy = X.XOpenDisplay(None)
+    if not dpy:
+        sys.exit('no display')
+    root = X.XDefaultRootWindow(dpy)
+    ws = windows(dpy, root, cls)
+    for w, name in ws:
+        if cmd == 'hide':
+            X.XIconifyWindow(dpy, w, X.XDefaultScreen(dpy))
+        elif cmd == 'show':
+            X.XMapRaised(dpy, w)
+            ev = XEvent()
+            ev.xclient.type = 33  # ClientMessage
+            ev.xclient.window = w
+            ev.xclient.message_type = X.XInternAtom(dpy, b'_NET_ACTIVE_WINDOW', 0)
+            ev.xclient.format = 32
+            ev.xclient.l[0] = 2  # source: pager / user action
+            X.XSendEvent(dpy, root, 0, (1 << 20) | (1 << 19), ctypes.byref(ev))  # SubstructureRedirect|Notify
+        print(f'{w:#x} {name.decode(errors="replace")}')
+    X.XSync(dpy, 0)
+    sys.exit(0 if ws else 1)
+
+
+main()

@@ -1,0 +1,53 @@
+#!/bin/sh
+# Firefox ESR, set up to be light: the profile's user.js (/root/.mozilla/firefox/*.default-release) holds the settings.
+#
+# Opening Firefox cold costs ~6G instructions on this emulated core (~100 s), so the desktop keeps one Firefox
+# running in the background with its window minimized (risc-browser --keep, started by xdesktop.sh). A menu click
+# then only shows that window - seconds, not minutes. Closing Firefox ends it; the desktop starts a fresh
+# background one a little later.
+export DISPLAY="${DISPLAY:-:0}"
+export HOME="${HOME:-/root}"
+export GDK_BACKEND=x11
+export GDK_CORE_DEVICE_EVENTS=1
+export MOZ_USE_XINPUT2=0
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+export LP_NUM_THREADS=1
+# Cold-start costs on a ~50 MIPS core (profiled 2026-10-13): GTK's Adwaita CSS (every number through musl's
+# software long-double strtod) -> a tiny theme (~/.themes/RiscBox); the accessibility bus -> off.
+export GTK_THEME=RiscBox
+export NO_AT_BRIDGE=1 GTK_A11Y=none
+# jemalloc instead of scudo: ~12% fewer instructions to start, and far fewer page faults
+[ -f /usr/lib/libjemalloc.so.2 ] && export LD_PRELOAD=/usr/lib/libjemalloc.so.2
+# One session bus shared by every launch: a second menu click finds the running Firefox over D-Bus and
+# opens a window in it, instead of failing on the locked profile.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    bus=/tmp/.risc-browser-bus
+    [ -S "$bus" ] || dbus-daemon --session --address="unix:path=$bus" --fork >/dev/null 2>&1
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus"
+fi
+
+running() { pidof firefox-esr >/dev/null 2>&1; }
+
+if [ "${1:-}" = "--keep" ]; then
+    # the background instance: start it, then minimize its window as soon as it is mapped
+    running && exit 0
+    nice -n 5 firefox-esr about:blank &
+    n=0
+    until python3 /usr/local/bin/risc-xwin hide >/dev/null 2>&1; do
+        sleep 2; n=$((n+1)); [ $n -ge 300 ] && break
+        running || exit 1
+    done
+    wait
+    exit 0
+fi
+
+if running; then
+    # a URL opens as a tab in the running Firefox (risc-open sends the remote call over D-Bus itself: a whole
+    # firefox-esr process just to deliver it costs ~20 s here); either way its window comes to the front
+    [ $# -gt 0 ] && { python3 /usr/local/bin/risc-open "$@" || firefox-esr --new-tab "$@"; } >/dev/null 2>&1 &
+    python3 /usr/local/bin/risc-xwin show >/dev/null 2>&1
+    wait
+    exit 0
+fi
+exec firefox-esr "$@"

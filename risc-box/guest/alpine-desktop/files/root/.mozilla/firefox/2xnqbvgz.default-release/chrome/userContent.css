@@ -1,0 +1,17 @@
+/* RISC Box (2026-10-13): every animation frame is painted in software on an emulated ~50 MIPS core. Google's
+   homepage alone kept ~30% of the CPU busy forever repainting an animated gradient. Animations and transitions
+   still run and fire their events, they just finish at once. */
+*, *::before, *::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+  scroll-behavior: auto !important;
+}
+
+/* Google's homepage: the AI Mode button's glow is a conic-gradient mask whose angle script animates every frame;
+   painted in software it kept ~30% of the CPU busy for as long as the tab was open. */
+@-moz-document domain("google.com") {
+  .fZhNMe, .Tdahud { display: none !important; }
+}

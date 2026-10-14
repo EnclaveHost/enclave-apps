@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""risc-open URL...: hand URLs to the running Firefox over its D-Bus remote interface.
+
+`firefox-esr URL` does the same, but it is a whole Firefox process (libxul's 120 MB, GTK, fontconfig) started only
+to send one message - ~20 s on this emulated core. This sends the identical OpenURL call
+(toolkit/components/remote: argc, little-endian offsets, then the working directory and each argument, NUL-ended)
+with dbus-send. Exit status 1 when no Firefox answers, so the caller can fall back."""
+import os, struct, subprocess, sys
+
+FIREFOX = '/usr/lib/firefox-esr/firefox-esr'
+
+
+def bus_names():
+    r = subprocess.run(['dbus-send', '--session', '--dest=org.freedesktop.DBus', '--type=method_call', '--print-reply',
+                        '/org/freedesktop/DBus', 'org.freedesktop.DBus.ListNames'], capture_output=True, text=True, timeout=20)
+    return [l.split('"')[1] for l in r.stdout.splitlines() if l.strip().startswith('string "')]
+
+
+def command_line(argv, cwd):
+    head = struct.pack('<i', len(argv))
+    strings = cwd.encode() + b'\0'
+    offsets = []
+    base = 4 * (len(argv) + 1)
+    for a in argv:
+        offsets.append(base + len(strings))
+        strings += a.encode() + b'\0'
+    return head + b''.join(struct.pack('<i', o) for o in offsets) + strings
+
+
+def main():
+    urls = sys.argv[1:]
+    names = [n for n in bus_names() if n.startswith('org.mozilla.')]
+    if not names:
+        return 1
+    name = names[0]
+    app = name.split('.')[2]
+    argv = [FIREFOX] + [x for u in urls for x in ('--new-tab', u)]
+    payload = command_line(argv, os.getcwd())
+    r = subprocess.run(['dbus-send', '--session', f'--dest={name}', '--type=method_call', '--print-reply', '--reply-timeout=60000',
+                        f'/org/mozilla/{app}/Remote', f'org.mozilla.{app}.OpenURL',
+                        'array:byte:' + ','.join(str(b) for b in payload)], capture_output=True, text=True, timeout=90)
+    return 0 if r.returncode == 0 else 1
+
+
+sys.exit(main())
