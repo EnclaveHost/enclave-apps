@@ -275,7 +275,8 @@ EOF
 wasmtime run -Scli -Stcp -Sinherit-network -Sallow-ip-name-lookup \
   --env "ENCLAVE_PORTS=http:8000=$APP2_PORT" --env "ENCLAVE_CONFIG=$CONFIG2" \
   target/wasm32-wasip2/release/s3-ipfs-adapter.wasm >"$WORK/app2.log" 2>&1 &
-PIDS+=($!)
+APP2_PID=$!
+PIDS+=($APP2_PID)
 for i in $(seq 1 60); do
   curl -sf "$BASE2/healthz" | grep -q '"ok":true' && break
   sleep 0.5
@@ -431,6 +432,30 @@ code=$(printf 'POST /add-json HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConten
   | { exec 3<>/dev/tcp/127.0.0.1/$APP2_PORT; cat >&3; head -c 20 <&3; } | grep -o '40[0-9]' | head -1)
 [ "$code" = 400 ] || fail "duplicate Content-Length -> '$code' (want 400)"
 pass "duplicate Content-Length refused (400)"
+
+echo "== restart reuses the leaves cache =="
+# The pin app's index (everything above, the pins included) persisted to
+# .enclave-index/leaves.bin; a restart must re-hash NOTHING: one LIST, one
+# GET of the cache, every object recognized by (size, etag).
+kill "$APP2_PID"; wait "$APP2_PID" 2>/dev/null || true
+wasmtime run -Scli -Stcp -Sinherit-network -Sallow-ip-name-lookup \
+  --env "ENCLAVE_PORTS=http:8000=$APP2_PORT" --env "ENCLAVE_CONFIG=$CONFIG2" \
+  target/wasm32-wasip2/release/s3-ipfs-adapter.wasm >"$WORK/app3.log" 2>&1 &
+PIDS+=($!)
+for i in $(seq 1 60); do
+  curl -sf "$BASE2/healthz" >/dev/null && break
+  sleep 0.5
+  [ "$i" = 60 ] && { cat "$WORK/app3.log"; fail "restarted pin app did not come up"; }
+done
+for i in $(seq 1 600); do
+  [ "$(curl -sf "$BASE2/api/status" | jget state)" = ready ] && break
+  sleep 0.5
+  [ "$i" = 600 ] && { cat "$WORK/app3.log"; fail "restarted pin app never became ready"; }
+done
+LISTED=$(grep -m1 'listed:' "$WORK/app3.log" || true)
+echo "$LISTED" | grep -Eq 'listed: ([1-9][0-9]*) unchanged \(\1 via the leaves cache\), 0 to hash' \
+  || { cat "$WORK/app3.log"; fail "restart re-hashed: $LISTED"; }
+pass "restart re-hashed nothing (${LISTED#*listed: })"
 
 echo
 OK=1
