@@ -1,0 +1,442 @@
+## 0.13.1 (2026-10-10)
+
+### Fixes
+
+- Remove API response type configuration functions and default to CBOR with JSON fallback.
+
+## 0.13.0 (2026-10-09)
+
+### Breaking Changes
+
+- Take a cutoff on `prune_slabs`
+
+#### Remove `Sdk::slab`
+
+A slab id is `Slab::digest()`, derived from the sector roots rather than stored,
+and no binding exposed a way to obtain one. `sdk.slab(id)` therefore took an
+argument its callers could not produce. The lookup is gone from the native SDK
+and from the uniffi, napi and wasm bindings, along with the `PinnedSlab` each of
+them mirrored for it. `sia_storage::PinnedSlab` goes too, since nothing public
+returned it once the lookup was gone.
+
+#### Replace fixed RPC deadlines with a per-RPC idle timeout
+
+Sector reads and writes no longer run under a fixed 90 second deadline. Each RPC now fails once its stream has gone 6 seconds without making progress, so a stalled host is dropped quickly while a slow transfer that is still moving data is allowed to finish. `RPCError::Elapsed` is removed, along with the never-constructed `UploadError::Timeout` and `DownloadError::Timeout`; a stalled RPC surfaces as a timed-out I/O error.
+
+### Features
+
+- Add `SharedSdk::object_summaries`, `objectSummaries` in the WASM and NAPI bindings, which lists shared objects without their slabs and returns each one's id, size, decrypted metadata and timestamps.
+
+#### Negotiate CBOR responses from the indexer
+
+The SDK prefers CBOR responses from the indexer and decodes them according to their content type, with JSON fallback for older indexers. Set `Builder::with_cbor(false)` or connect with `SharedSdk::connect_with_cbor(url, seed, false)` to request JSON for easier inspection; the FFI, N-API, and WASM bindings expose the same `withCbor` builder method and `connectWithCbor` constructor. Request bodies remain JSON. Malformed CBOR responses return the new `AppApiError::Cbor` variant.
+
+`EncryptionKey` and the encrypted keys and metadata of a `SealedObject` now serialize as byte strings in non-human-readable formats instead of strings or fixed-size tuples.
+
+Null timestamps from the indexer decode as Go's zero time and null lists as empty lists.
+
+### Fixes
+
+- All SDK instances now share the same underlying connection pool.
+- Apply the object keystream in bulk rather than per 64-byte segment.
+- Back off the download inflight limit when sector reads time out, instead of waiting for a goodput window that reads flat on a saturated link.
+- Back off the inflight limit on a window with no successes.
+- Decay the per host failure rate over time
+- Keep a SiaMux dial running when the RPC that started it is cancelled, for as long as another RPC is waiting on it.
+- Fail a download immediately when too few hosts are reachable
+- Improved WebTransport connection pooling due to Chrome connection limits.
+- Increased parallelism during WebTransport downloads and uploads.
+- Try every sector of the chunk the reader is waiting on at once instead of racing slow hosts in.
+- Refresh the host list when an upload finds too few hosts, rather than leaving uploads failing until the next scheduled refresh.
+- Request gzip or zstd compressed responses from the indexer.
+- Request the host list 500 hosts at a time, the indexer's maximum, so the current network loads in one request instead of three.
+- Fixed cancelled upload attempts losing their host for the rest of the slab
+- Serialize concurrent price table fetches to the same host behind a single RPC.
+
+#### Record a host failure when a sector read times out
+
+`read_sector` recorded a failure only when the RPC itself returned an error. A
+timeout dropped that future without the hook running, so a host that stopped
+answering reads kept no samples and a 0% failure rate, which host selection
+ranks above every measured host as a discovery preference. The host that just
+timed out was picked first again. `write_sector` already had this arm.
+
+#### Reupload slabs rejected by the indexer as too old
+
+Fresh slab pin requests now include each sector's upload time. If the indexer
+rejects a slab as too old, the SDK reuploads its retained shards and retries
+pinning with fresh timestamps, up to three upload attempts. This replaces the
+age estimate based on host-reported block heights and requires indexd#1068.
+
+#### Sample the download inflight controller per chunk rather than per sector read, and let it climb further before settling.
+
+The controller also backs off when reads time out, since a saturated link reads as flat goodput rather than as a decline. Timeouts count once per host and decay as windows complete, so neither one unreachable peer nor strays spread over a long download narrows the pipeline.
+
+## 0.12.0 (2026-09-14)
+
+### Breaking Changes
+
+- Added the HTTP status code to `AppApiError::Api` and removed the `Unauthorized` and `NotFound` variants
+- Remove contextual fields from several error variants to reduce `Error` enum size.
+
+#### Let a reconnecting user register a new app key
+
+When `reconnecting()` is true, `register` / `connect_pre_authorized` no longer fail just because the recovery phrase derives a different app key; a new application key will be registered instead.
+
+To let applications detect whether a recovery phrase matches an already-registered app key, this adds `matches_existing_app_key` (JS: `matchesExistingAppKey`).
+
+This removes the `BuilderError::WrongRecoveryPhrase` variant.
+
+#### Renamed the share URL methods on `Sdk`.
+
+`Sdk::share_object` and `Sdk::shared_object` are now `Sdk::object_share_url` and `Sdk::object_from_share_url`. The bindings change to match, so `shareObject` and `sharedObject` become `objectShareUrl` and `objectFromShareUrl`.
+
+### Features
+
+- Added `Download::write_to_path` for writing a download directly to a file.
+- Reupload slabs whose sectors expired from temporary storage
+
+#### Added `connect_pre_authorized` for connecting with a pre-authorized key.
+
+Applications can now bypass the interactive approval flow by connecting with a pre-authorized key that the indexer operator provisions out of band. `Builder::connect_pre_authorized(pre_authorized_key, mnemonic)` performs the connect, approval, and registration steps in one call and returns a ready SDK. The method is also exposed through the ffi, napi, and wasm bindings.
+
+#### Added `reconnecting` to the connection approval flow.
+
+After approval, `reconnecting()` reports whether the connect key already has an account for the application. When reconnecting, `register` and `connect_pre_authorized` fail with `WrongRecoveryPhrase` if the recovery phrase does not match the existing account.
+
+#### Added sharing keys for scoped, read-only access to objects.
+
+A sharing key grants read-only access to a chosen set of objects without the recipient needing an account, an app registration, or an approval flow. Owners create a key with `Sdk::create_sharing_key`, attach objects with `Sdk::share_object`, and hand out the key's seed; recipients connect with `SharedSdk::connect`, which pays for reads from the owner's account rather than their own.
+
+### Fixes
+
+- Increased default API timeout for slow indexers.
+- Pin slabs immediately
+- Removed the `blake2` module and the `blake2`/`hkdf` dependencies.
+- Retry failed shards up to three times before failing the download.
+- Added a method for truncating objects.
+
+#### Fix clippy lints introduced by Rust 1.98.
+
+Rust 1.98 extended `clippy::result_large_err` to `impl Future` return positions, added `clippy::chunks_exact_to_as_chunks`, and tightened unused import detection. These are lint fixes only, with no behavior changes.
+
+## 0.11.0 (2026-08-07)
+
+### Breaking Changes
+
+- Add a version field to slabs.
+- Added `PackedUploadoptions` for packed uploads.
+
+#### `Object` timestamps are now public fields.
+
+The `created_at()` and `updated_at()` accessors were removed; `created_at` and `updated_at` are now public fields on `Object`.
+
+#### The `mock` feature is now additive.
+
+Enabling `mock` previously replaced the siamux backend. Both the Sia transport and indexer backend are now selected at construction time through an enum, so the mock ones are added alongside the real ones and a single build can drive either.
+
+`MockUploader`, `MockDownloader`, and `MockHosts` are removed. They existed only because the mock transport could not be combined with an indexer client, and each was a duplicate of the equivalent `Sdk` method. Use `MockNetwork::sdk` and call `Sdk::upload`, `Sdk::upload_packed`, and `Sdk::download` instead.
+
+### Features
+
+- Encrypt object data per slab so each slab can be re-encrypted independently without reusing the object's data key.
+- Switch sector root and range proof verifier to optimized SIMD backends.
+
+#### Added path-based uploads behind the `fs` feature.
+
+`Sdk::upload_path` and `PackedUpload::add_path` open a file and read it to EOF, so callers uploading from disk no longer stream every chunk across the language boundary. The feature is unavailable on wasm32; the FFI and Node bindings enable it and expose `uploadPath`/`addPath`.
+
+#### Added `start_offset` to `UploadOptions`.
+
+This allows objects to be rewritten without reuploading the entire object. The original object is not replaced, so both versions can be pinned simultaneously.
+
+#### Added the `less-safe-crypto` feature.
+
+The feature exposes `Object::less_safe_new` and `Object::data_key` for exporting an object's data key and reconstructing the object from externally persisted components. The caller is responsible for the invariants the upload path normally enforces.
+
+#### Uploads will no longer block indefinitely until completion.
+
+Removed the progressive upload timeout and hosts are now retried a maximum of 3 times before giving up. The default 
+timeout is now 1.5m per shard per attempt. This should give enough time on slow connections. Racing and prioritization
+will still prioritize faster hosts after warming up.
+
+Users can still manually timeout
+
+### Fixes
+
+#### Reject malformed share-link encryption keys.
+
+The error for a bad share-link key now states it must be base64url-encoded rather than hex (the fragment was already decoded as base64url), and a fragment that does not decode to exactly 32 bytes is rejected instead of being silently zero-padded into a bogus key.
+
+## 0.10.0 (2026-06-23)
+
+### Breaking Changes
+
+#### Added adaptive transfer concurrency
+
+Uploads and downloads no longer take a fixed `max_inflight` concurrency limit — concurrency now adapts to network conditions automatically. Memory use is bounded directly instead, by two new options: `UploadOptions::max_buffered_slabs` and `DownloadOptions::max_buffered_chunks`, each defaulting to roughly 10% of system memory when unset. The `max_inflight` field is removed from the upload, download, and language-binding option types.
+
+### Features
+
+- Changed download chunking to ramp up to reduce round trips on large downloads.
+- Overprovision shard downloads to reduce tail latency from slow hosts
+- Take into account inflight uploads and downloads when ranking hosts.
+
+### Fixes
+
+- Pin slabs in batches within pin_object.
+- Removed rayon dependency due to panics at high concurrency
+
+#### Made racing adaptive so that racers will not steal slots from higher priority work
+
+For uploads, racing will only start when every shard has an attempt in flight. For downloads, racing will only start when the chunk is near the read head. The race timeout is derived from the p95 of recently completed RPCs instead of a fixed interval so only hosts well outside the normal latency spread get raced.
+
+## 0.9.1 (2026-05-18)
+
+### Fixes
+
+- Bump sia_core_derive.
+
+## 0.9.0 (2026-05-18)
+
+### Breaking Changes
+
+#### Switch to sia_reed_solomon for erasure-coding
+
+Replaced `reed-solomon-erasure` with `sia_reed_solomon`. Encoded parity bytes
+are compatible with existing `indexd` slabs.
+
+120 MiB upload against the mock cluster
+(`cargo bench -p sia_storage --all-features`):
+
+| | Before | After | Δ |
+|---|---|---|---|
+| `upload/90 inflight` | ~285 MiB/s | **611 MiB/s** | **+114%** |
+| `upload/10 inflight` | ~175 MiB/s | **595 MiB/s** | **+240%** |
+| `upload/default`     | ~184 MiB/s | **609 MiB/s** | **+231%** |
+
+### Fixes
+
+- Measure RPCAverage in throughput instead of latency to take into account transmitted bytes.
+
+## 0.8.0 (2026-04-27)
+
+### Breaking Changes
+
+#### Rename `slab_size` to `optimal_data_size` where it refers to the data-only portion
+
+Methods and fields that previously returned or stored `data_shards * SECTOR_SIZE` (the packing period for `PackedUpload`) are now named `optimal_data_size` to distinguish them from the true encoded slab size (`total_shards * SECTOR_SIZE`, which remains `slab_size`). Affects `PackedUpload::slab_size()` (Rust, FFI, NAPI) and the `slabSize` JS getter (now `optimalDataSize`).
+
+`UploadOptions::slab_size()`, `UploadOptions::optimal_data_size()`, `PackedUpload::optimal_data_size()`, and `PackedUpload::slabs()` now return `usize` instead of `u64`.
+
+### Features
+
+- `upload_packed` now returns a `Result` and will error if invalid options are passed to it.
+
+#### `PackedUpload` stays usable after a reader error
+
+If the reader passed to `add` errored mid-stream, bytes it had already buffered were silently attributed to the next object, corrupting it. Partial reads now become dead padding in the slab and subsequent objects stay aligned.
+
+## 0.7.0 (2026-04-18)
+
+### Breaking Changes
+
+- Replaced upload/download progress channels with more detailed callbacks.
+
+#### Download returns an AsyncRead
+
+`SDK::download` now returns a `Download` handle implementing `AsyncRead`
+instead of taking a writer. Callers pull data with `tokio::io::copy` or any
+other `AsyncRead` consumer.
+
+The `sia_storage_ffi` `SDK::download` now returns a `Download` object with
+`read()` and `close()` methods instead of taking a foreign `Writer`. The
+`Writer` foreign trait has been removed.
+
+### Features
+
+- Add encoded_size helper to sia_storage;
+
+### Fixes
+
+- Deduplicate concurrent dials for RHP4 clients.
+- Enforce Chrome's 64 concurrent pending connections limit in WebTransport client.
+- Refresh hosts periodically
+- Removed hardcoded 1s timeout for RPC settings when writing and reading sectors
+
+## 0.6.0 (2026-04-06)
+
+### Breaking Changes
+
+#### Resumable uploads
+
+`SDK::upload` now takes an `Object` parameter and appends uploaded slabs to it. This enables resumable uploads by passing the same object back to `upload` with a new reader.
+
+For new uploads, pass `Object::default()` (Rust) or `PinnedObject::new()` (FFI). This is a breaking change to the upload API signature.
+
+## 0.5.1 (2026-04-05)
+
+### Features
+
+- Add WebTransport client for WASM target
+- Allow wasm32-unknown-unknown compilation
+- Download objects in chunks to improve streaming.
+- Fixes wasm32 compat framework compilation
+
+#### Replace PrivateKey with AppKey in public API
+
+Replaced all uses of `PrivateKey` in the public API with `AppKey`. `PrivateKey` is no longer re-exported.
+
+Added `UploadOptions::validate` to check erasure coding parameters for sufficient durability.
+
+Made internal `app_client::Client` methods `pub(crate)` and moved data types (`App`, `Account`, `GeoLocation`, `HostQuery`, `ObjectsCursor`) to `lib.rs`.
+
+Added doc strings to all public items.
+
+### Fixes
+
+- Remove dyn dispatch of RHP client type
+- Update account types
+
+## 0.5.0 (2026-03-23)
+
+### Breaking Changes
+
+- Renamed crate to `sia_storage`
+
+## 0.4.0 (2026-03-18)
+
+### Breaking Changes
+
+- Added ephemeral key to authorization flow
+- Reduced the size of the pin object request. Up to 4TB of data can now be pinned in a single object.
+
+### Features
+
+- Added `ready` field to account.
+
+## 0.3.0 (2026-03-16)
+
+### Breaking Changes
+
+- Re-export 3rd-party types to improve ergonomics.
+- Use rustls-platform-verifier by default to simplify SDK initialization.
+
+### Features
+
+- Added mnemonic helpers.
+- Introduce mux crate and frame module
+- Return `sia://` links from the indexd SDK.
+
+### Fixes
+
+- use AsyncRead/AsyncWrite traits instead of Ext variants in trait bounds
+- Added cancel function to cancel inflight packed uploads.
+
+#### Check if we have enough hosts prior to encoding in upload_slabs
+
+##261 by @Alrighttt
+
+Fixes https://github.com/SiaFoundation/sia-sdk-rs/issues/251
+
+- Added an `available_for_upload` method that returns the amount of known hosts marked `good_for_upload`.
+- Added a check in `upload_slabs` that verifies we have enough good hosts prior to encoding any data. 
+- Adds a variant to `QueueError` for `upload_slabs`'s new failure case. This enables testing for this new case specifically.
+
+#### Fix upload racing race conditon
+
+##258 by @Alrighttt
+
+This fixes a race condition in the upload logic that could happen when the amount of healthy hosts is nearly the same as the amount of shards. This could happen when the racing mechanism was triggered prior to all of the initial shards being assigned a host. The slow hosts would be consumed from the HostQueue without completing the upload. This would cause a latter shard to hit a QueueError::NoMoreHosts error.
+
+This changes the upload behavior so that each shard has a host assigned before any upload begins.
+
+A `set_slow_hosts` method was added to the `MockRHP4Client` to allow easily testing these conditions. This mimics a similar mechanism from the Go SDK.
+
+#### Go SDK test parity
+
+##266 by @Alrighttt
+
+This pull requests adds some missing test cases that exist within the Go SDK. Closes https://github.com/SiaFoundation/sia-sdk-rs/issues/220
+
+The remaining tests that have not been ported require changes to the `SDK` struct to allow mocking the `api_client`. I will work on a solution for this.
+
+## 0.2.0 (2026-01-28)
+
+### Breaking Changes
+
+- Added missing SDK functionality.
+- Changed download function to borrow the writer.
+- Implemented new `indexd` authentication.
+- Merge SlabSlice and Slab types.
+- Reduced size of signed urls by shortening query parameter names and using base64 URL encoding instead of hex.
+- Renamed `key` to `id` in object event and cursor.
+
+### Features
+
+- Add optional host filters (offset/limit/service-account/protocol/country) plus distance sort
+- Exposed `Hosts` struct to deduplicate host selection and performance tracking for scenarios that can not use the QUIC client.
+- Implement upload packing
+- Track RPC failure rate when selecting hosts rather than raw RPCs.
+- Update the insufficient shard check in download_slab_shards.
+
+### Fixes
+
+- Fix decoding failing when encrypted metadata is null or missing
+- Fixed an issue with uploads stalling after resuming on some platforms.
+- Fixed progress callback not being called immediately leading to incorrect reporting.
+- Fixed signing when URLs have port number.
+- Improved upload performance by 75%.
+- Make use of goodForUpload field
+- Refactor the uploader and downloader to be transport agnostic to make it easier to add regression testing and benchmarks.
+- Remove service account fields
+- Remove SlabFetcher now that we have the full slab info in the object.
+- Update object listing endpoints to use events
+
+## 0.1.2 (2025-10-04)
+
+### Features
+
+- Add JSON serialization to ChainState
+
+## 0.1.1 (2025-10-04)
+
+### Features
+
+- Add JSON serialization to ChainState
+
+### Fixes
+
+- Fix path dependency versions.
+
+## 0.1.0 (2025-10-04)
+
+### Breaking Changes
+
+- Publish to cargo
+
+### Features
+
+- Add JSON serialization to ChainState
+
+## 0.0.2 (2025-10-04)
+
+### Features
+
+- Add JSON serialization to ChainState
+- Add account API endpoint to app_client and FFI implementation.
+- Add objects API to SDK and app client.
+- Add pin_slab and unpin_slab to FFI.
+- Add progress callback.
+- Add slab pruning
+- Encrypt object metadata.
+- Remove separate range methods.
+- Use randomly generated encryption keys.
+- Validate object key when fetching objects from indexd.
+- Add method for pinning multiple slabs
+
+### Fixes
+
+- Make upload progress more responsive.
+- Swap out 'time' dependency for 'chrono'.
+- Use PublicKey for account key type.

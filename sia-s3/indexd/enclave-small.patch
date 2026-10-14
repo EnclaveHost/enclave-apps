@@ -1,0 +1,26 @@
+diff --git a/contracts/form.go b/contracts/form.go
+index 385a284..45e48bc 100644
+--- a/contracts/form.go
++++ b/contracts/form.go
+@@ -21,7 +21,7 @@ const (
+ 	// this value will mean contracts will need to be refreshed
+ 	// more frequently. 256 GiB is a good trade off between initial
+ 	// cost to both parties and the frequency of refreshes.
+-	minContractGrowthRate = 256 << 30
++	minContractGrowthRate = 8 << 30 // enclave.host: sized for a small indexer (was 256 GiB)
+ 
+ 	// maxContractGrowthRate is the maximum additional data
+ 	// allowed when adding funds for refresh or renews. This
+diff --git a/contracts/funding.go b/contracts/funding.go
+index ade9da7..c4c033a 100644
+--- a/contracts/funding.go
++++ b/contracts/funding.go
+@@ -23,7 +23,7 @@ const (
+ 	// and downloading to and from a host at ~1Gbps for a period of 2 minutes.
+ 	// With 30 good hosts, this results in about 30Gbps of maximum theoretical
+ 	// throughput.
+-	serviceAccountFundTargetBytes = uint64(16 << 30) // 16 GiB
++	serviceAccountFundTargetBytes = uint64(1 << 30) // enclave.host: 1 GiB (was 16 GiB)
+ )
+ 
+ // AttachPools attaches all pending pool attachments for the given host.

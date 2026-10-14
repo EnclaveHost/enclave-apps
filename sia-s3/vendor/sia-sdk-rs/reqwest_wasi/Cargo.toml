@@ -1,0 +1,21 @@
+[package]
+name = "reqwest_wasi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The subset of the reqwest API sia_storage uses, over tokio + rustls on wasm32-wasip2, dialing through an enclave SOCKS5 egress front when ENCLAVE_EGRESS is set"
+publish = false
+
+[dependencies]
+http = "1"
+url = "2.5.8"
+bytes = "1"
+serde = "1"
+serde_json = "1"
+serde_urlencoded = "0.7"
+httparse = "1"
+tokio = { version = "1", features = ["io-util", "net", "time", "rt"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+log = "0.4"

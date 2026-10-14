@@ -1,0 +1,1014 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sia_core::rhp4::SECTOR_SIZE;
+
+use crate::AppKey;
+use crate::encryption::EncryptionKey;
+use blake2b_simd::Params;
+use serde_with::base64::Base64;
+use serde_with::{Bytes, DefaultOnNull, IfIsHumanReadable, serde_as};
+use sia_core::encoding::{self, SiaDecodable, SiaDecode, SiaEncodable, SiaEncode};
+use sia_core::signing::{PrivateKey, PublicKey, Signature};
+use sia_core::types::Hash256;
+use thiserror::Error;
+
+use crate::object_encryption::{
+    DecryptError, open_data_key, open_metadata, open_metadata_key, seal_data_key, seal_metadata,
+    seal_metadata_key,
+};
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, SiaEncode, SiaDecode)]
+#[serde(rename_all = "camelCase")]
+/// A Sector is a unit of data stored on the Sia network. It can be referenced by its Merkle root.
+pub struct Sector {
+    /// The Merkle root of the sector data.
+    pub root: Hash256,
+    /// The public key of the host storing this sector.
+    pub host_key: PublicKey,
+}
+
+/// The version of the slab
+#[repr(u8)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum SlabVersion {
+    #[default]
+    V0 = 0,
+    /// V1 changes how the object data key works. When encrypting, the slab key is used as a nonce on the data key so that
+    /// we can overwrite slab data without re-encrypting the whole object and without
+    /// reusing the encryption key.
+    V1 = 1,
+}
+
+impl From<SlabVersion> for u8 {
+    fn from(value: SlabVersion) -> Self {
+        value as u8
+    }
+}
+
+impl SiaEncodable for SlabVersion {
+    fn encode<W: std::io::prelude::Write>(&self, w: &mut W) -> encoding::Result<()> {
+        w.write_all(&[*self as u8])?;
+        Ok(())
+    }
+
+    fn encoded_length(&self) -> usize {
+        1
+    }
+}
+
+impl SiaDecodable for SlabVersion {
+    fn decode<R: std::io::prelude::Read>(r: &mut R) -> encoding::Result<Self> {
+        Self::try_from(u8::decode(r)?).map_err(encoding::Error::InvalidValue)
+    }
+}
+
+impl TryFrom<u8> for SlabVersion {
+    type Error = String;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::V0),
+            1 => Ok(Self::V1),
+            _ => Err(format!("unsupported version {value}")),
+        }
+    }
+}
+
+/// A Slab is an erasure-coded collection of sectors. The sectors can be downloaded and
+/// used to recover the original data.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Slab {
+    /// The encoding version of this slab.
+    #[serde(default)]
+    pub version: SlabVersion,
+    /// The encryption key used to encrypt and decrypt this slab's data.
+    pub encryption_key: EncryptionKey,
+    /// The minimum number of sectors required to recover the slab's data.
+    pub min_shards: u8,
+    /// The sectors that make up this slab, spread across different hosts.
+    #[serde_as(as = "DefaultOnNull")]
+    pub sectors: Vec<Sector>,
+    /// The byte offset of this slab's data within the parent object.
+    pub offset: u32,
+    /// The byte length of this slab's data.
+    pub length: u32,
+}
+
+impl Slab {
+    /// creates a unique identifier for the resulting slab to be referenced by hashing
+    /// its contents, excluding the host key, length, and offset.
+    pub fn digest(&self) -> Hash256 {
+        let mut state = Params::new().hash_length(32).to_state();
+        if self.version != SlabVersion::V0 {
+            // V0 doesn't have a version field and the existing IDs can't change for backwards compatibility
+            self.version.encode(&mut state).unwrap();
+        }
+        (self.min_shards as u64).encode(&mut state).unwrap();
+        self.encryption_key.encode(&mut state).unwrap();
+        self.sectors.iter().for_each(|sector| {
+            sector.root.encode(&mut state).unwrap();
+        });
+        state.finalize().into()
+    }
+}
+
+impl SiaEncodable for Slab {
+    fn encoded_length(&self) -> usize {
+        self.version.encoded_length()
+            + self.encryption_key.encoded_length()
+            + self.min_shards.encoded_length()
+            + self.sectors.encoded_length()
+            + 8 // combined offset|length u64
+    }
+
+    fn encode<W: std::io::Write>(&self, w: &mut W) -> encoding::Result<()> {
+        self.version.encode(w)?;
+        self.encryption_key.encode(w)?;
+        self.min_shards.encode(w)?;
+        self.sectors.encode(w)?;
+        let combined: u64 = (self.offset as u64) << 32 | (self.length as u64);
+        combined.encode(w)?;
+        Ok(())
+    }
+}
+
+impl SiaDecodable for Slab {
+    fn decode<R: std::io::Read>(r: &mut R) -> encoding::Result<Self> {
+        let version = SlabVersion::decode(r)?;
+        let encryption_key = EncryptionKey::decode(r)?;
+        let min_shards = u8::decode(r)?;
+        let sectors = Vec::<Sector>::decode(r)?;
+        let combined = u64::decode(r)?;
+
+        Ok(Self {
+            version,
+            encryption_key,
+            min_shards,
+            sectors,
+            offset: (combined >> 32) as u32,
+            length: combined as u32,
+        })
+    }
+}
+
+/// Errors that can occur when opening or verifying a sealed object.
+#[derive(Debug, Error)]
+pub enum SealedObjectError {
+    /// The encrypted data could not be decrypted.
+    #[error("decryption error: {0}")]
+    Decryption(#[from] DecryptError),
+    /// The sealed object's ID does not match its contents.
+    #[error("sealed object ID does not match contents")]
+    ContentsMismatch,
+    /// An error occurred during encoding or decoding.
+    #[error("encoding error: {0}")]
+    Encoding(#[from] encoding::Error),
+    /// The signature on the sealed object is invalid.
+    #[error("invalid signature")]
+    InvalidSignature,
+}
+
+/// (De)serializes bytes as a base64 string in human-readable formats and as a
+/// byte string otherwise.
+pub(crate) type Base64OrBytes = IfIsHumanReadable<Base64, Bytes>;
+
+#[serde_as]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+/// An encrypted, signed representation of an [Object] that can be stored on the indexer.
+///
+/// A sealed object can be opened with [SealedObject::open] using the same [AppKey] that sealed it.
+pub struct SealedObject {
+    /// The encrypted data encryption key.
+    #[serde_as(as = "Base64OrBytes")]
+    pub encrypted_data_key: Vec<u8>,
+    /// The erasure-coded slabs that make up the object's data.
+    #[serde_as(as = "DefaultOnNull")]
+    pub slabs: Vec<Slab>,
+    /// A signature over the data key and slabs.
+    pub data_signature: Signature,
+
+    /// The encrypted metadata encryption key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde_as(as = "DefaultOnNull<Base64OrBytes>")]
+    pub encrypted_metadata_key: Vec<u8>,
+    /// The encrypted metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde_as(as = "DefaultOnNull<Base64OrBytes>")]
+    pub encrypted_metadata: Vec<u8>,
+    /// A signature over the metadata key and metadata.
+    pub metadata_signature: Signature,
+
+    /// The time the object was created.
+    #[serde(with = "sia_core::types::null_as_zero_time")]
+    pub created_at: DateTime<Utc>,
+    /// The time the object was last updated.
+    #[serde(with = "sia_core::types::null_as_zero_time")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SiaDecodable for SealedObject {
+    fn decode<R: std::io::Read>(r: &mut R) -> encoding::Result<Self> {
+        let encrypted_data_key = Vec::<u8>::decode(r)?;
+        let slabs = Vec::<Slab>::decode(r)?;
+        let data_signature = Signature::decode(r)?;
+        let encrypted_metadata_key = Vec::<u8>::decode(r)?;
+        let encrypted_metadata = Vec::<u8>::decode(r)?;
+        let metadata_signature = Signature::decode(r)?;
+        let created_at = DateTime::<Utc>::decode(r)?;
+        let updated_at = DateTime::<Utc>::decode(r)?;
+
+        Ok(Self {
+            encrypted_data_key,
+            slabs,
+            data_signature,
+            encrypted_metadata_key,
+            encrypted_metadata,
+            metadata_signature,
+            created_at,
+            updated_at,
+        })
+    }
+}
+
+impl SealedObject {
+    fn data_sig_hash(object_id: &Hash256, encrypted_data_key: &[u8]) -> Hash256 {
+        let mut state = Params::new().hash_length(32).to_state();
+        object_id.encode(&mut state).unwrap();
+        state.update(encrypted_data_key);
+        state.finalize().into()
+    }
+
+    fn meta_sig_hash(
+        object_id: &Hash256,
+        encrypted_meta_key: &[u8],
+        encrypted_metadata: &[u8],
+    ) -> Hash256 {
+        let mut state = Params::new().hash_length(32).to_state();
+        object_id.encode(&mut state).unwrap();
+        state.update(encrypted_meta_key);
+        state.update(encrypted_metadata);
+        state.finalize().into()
+    }
+
+    fn verify_signatures(
+        &self,
+        app_key: &PublicKey,
+        object_id: &Hash256,
+    ) -> Result<(), SealedObjectError> {
+        let data_sig_hash = Self::data_sig_hash(object_id, &self.encrypted_data_key);
+        let meta_sig_hash = Self::meta_sig_hash(
+            object_id,
+            &self.encrypted_metadata_key,
+            &self.encrypted_metadata,
+        );
+
+        if !app_key.verify(data_sig_hash.as_ref(), &self.data_signature) {
+            return Err(SealedObjectError::InvalidSignature);
+        }
+
+        if !app_key.verify(meta_sig_hash.as_ref(), &self.metadata_signature) {
+            return Err(SealedObjectError::InvalidSignature);
+        }
+
+        Ok(())
+    }
+
+    /// Returns the unique identifier of the sealed object.
+    pub fn id(&self) -> Hash256 {
+        object_id(&self.slabs)
+    }
+
+    /// Decrypts and verifies the sealed object, returning the underlying [Object].
+    pub fn open(self, app_key: &AppKey) -> Result<Object, SealedObjectError> {
+        self.open_with(&app_key.0)
+    }
+
+    /// Decrypts and verifies the sealed object with the private key it was sealed
+    /// under, returning the underlying [Object].
+    pub(crate) fn open_with(self, key: &PrivateKey) -> Result<Object, SealedObjectError> {
+        let object_id = self.id();
+        self.verify_signatures(&key.public_key(), &object_id)?;
+
+        let data_key = open_data_key(key, &object_id, &self.encrypted_data_key)?;
+        let metadata = if !self.encrypted_metadata.is_empty() {
+            let metadata_key = open_metadata_key(key, &object_id, &self.encrypted_metadata_key)?;
+            open_metadata(&metadata_key, &self.encrypted_metadata)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Object {
+            data_key,
+            slabs: self.slabs,
+            metadata,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// An object listed without its slabs: its id, size, metadata and timestamps.
+/// Enough to show the object, not to download it. Fetch the full [Object] by
+/// id to download it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectSummary {
+    /// The object's unique identifier.
+    pub id: Hash256,
+    /// The object's size in bytes.
+    pub size: u64,
+    /// Application-defined metadata, decrypted.
+    pub metadata: Vec<u8>,
+    /// The time the object was created.
+    pub created_at: DateTime<Utc>,
+    /// The time the object was last updated.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An [ObjectSummary] as the indexer returns it, with the metadata still
+/// sealed. Its data key and data signature are also in the response but go
+/// unused, since a summary cannot be downloaded.
+#[serde_as]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SealedObjectSummary {
+    /// Sent alongside the object because it is a hash of the slabs, which
+    /// the listing leaves out.
+    #[serde(rename = "objectID")]
+    pub object_id: Hash256,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde_as(as = "DefaultOnNull<Base64OrBytes>")]
+    pub encrypted_metadata_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde_as(as = "DefaultOnNull<Base64OrBytes>")]
+    pub encrypted_metadata: Vec<u8>,
+    pub metadata_signature: Signature,
+    #[serde(with = "sia_core::types::null_as_zero_time")]
+    pub created_at: DateTime<Utc>,
+    #[serde(with = "sia_core::types::null_as_zero_time")]
+    pub updated_at: DateTime<Utc>,
+    pub size: u64,
+}
+
+impl SealedObjectSummary {
+    /// Verifies the metadata signature against the object id the indexer
+    /// sent and decrypts the metadata with the key the object was sealed
+    /// under. A forged id fails here, since the signature covers it.
+    pub(crate) fn open_with(self, key: &PrivateKey) -> Result<ObjectSummary, SealedObjectError> {
+        let sig_hash = SealedObject::meta_sig_hash(
+            &self.object_id,
+            &self.encrypted_metadata_key,
+            &self.encrypted_metadata,
+        );
+        if !key
+            .public_key()
+            .verify(sig_hash.as_ref(), &self.metadata_signature)
+        {
+            return Err(SealedObjectError::InvalidSignature);
+        }
+        let metadata = if !self.encrypted_metadata.is_empty() {
+            let metadata_key =
+                open_metadata_key(key, &self.object_id, &self.encrypted_metadata_key)?;
+            open_metadata(&metadata_key, &self.encrypted_metadata)?
+        } else {
+            Vec::new()
+        };
+        Ok(ObjectSummary {
+            id: self.object_id,
+            size: self.size,
+            metadata,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// An ObjectEvent represents an object and whether it was deleted or not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectEvent {
+    /// The unique identifier of the object.
+    pub id: Hash256,
+    /// Whether the object was deleted.
+    pub deleted: bool,
+    /// The time the event occurred.
+    pub updated_at: DateTime<Utc>,
+    /// The object, if it was not deleted.
+    pub object: Option<Object>,
+}
+
+/// A file stored on the Sia network, consisting of erasure-coded slabs and
+/// optional metadata.
+///
+/// Objects can be sealed with [Object::seal] for storage on the indexer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Object {
+    pub(crate) data_key: EncryptionKey,
+    pub(crate) slabs: Vec<Slab>,
+    /// Application-defined metadata stored alongside the object. Encrypted when sealed.
+    pub metadata: Vec<u8>,
+    /// The creation timestamp of the object. Overwritten by the indexer.
+    pub created_at: DateTime<Utc>,
+    /// The last updated timestamp of the object. Overwritten by the indexer.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Object {
+    /// Creates a new empty object with a unique data key and optional
+    /// application-defined metadata.
+    ///
+    /// Objects can be passed to [Sdk::upload](crate::Sdk::upload) to add data
+    /// to them and [Sdk::download](crate::Sdk::download) to retrieve the data
+    /// from the network.
+    ///
+    /// After uploading, objects should be pinned with
+    /// [Sdk::pin_object](crate::Sdk::pin_object) so the object is tracked and
+    /// remains available.
+    pub fn new(metadata: Option<Vec<u8>>) -> Self {
+        Object {
+            data_key: EncryptionKey::from(rand::random::<[u8; 32]>()),
+            slabs: Vec::new(),
+            metadata: metadata.unwrap_or_default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Creates an [Object] directly from an existing data key and slabs,
+    /// bypassing the SDK's upload pipeline. Prefer [Object::new] or [Object::default].
+    ///
+    /// This is useful for interoperability with systems such as IPFS or LBRY,
+    /// where an object's components are persisted separately and the object
+    /// must be reconstructed from them.
+    ///
+    /// Objects produced by
+    /// [Sdk::upload](crate::Sdk::upload) are guaranteed to be safe to
+    /// reconstruct. Others, not so much. Here be dragons.
+    ///
+    /// **Invariants:**
+    /// - The data key must be the one that encrypted the slabs. A mismatched
+    ///   key fails silently: downloads succeed but return garbage.
+    /// - Slab keys must never be reused. Reuse compromises encryption.
+    /// - Each slab's `version` must match the version it was encrypted with.
+    ///   A mislabeled slab decrypts to garbage without error.
+    /// - Each slab's `offset` and `length` must match how the data was
+    ///   encrypted: `offset` seeks the keystream, and slab order defines the
+    ///   object's byte stream. Wrong values silently corrupt or reorder the
+    ///   data.
+    #[cfg(feature = "less-safe-crypto")]
+    pub fn less_safe_new(
+        data_key: EncryptionKey,
+        slabs: Vec<Slab>,
+        metadata: Option<Vec<u8>>,
+    ) -> Self {
+        Object {
+            data_key,
+            slabs,
+            metadata: metadata.unwrap_or_default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Returns the unique identifier of the object.
+    pub fn id(&self) -> Hash256 {
+        object_id(&self.slabs)
+    }
+
+    /// Returns the data key so it can be exported and later re-imported
+    /// with [Object::less_safe_new].
+    ///
+    /// The data key alone decrypts the object's data. Never store it in
+    /// plaintext and do not reuse it for new objects.
+    ///
+    /// Prefer sealing the object with [Object::seal] instead.
+    #[cfg(feature = "less-safe-crypto")]
+    pub fn data_key(&self) -> &EncryptionKey {
+        &self.data_key
+    }
+
+    /// Returns the slabs that make up the object.
+    pub fn slabs(&self) -> &[Slab] {
+        &self.slabs
+    }
+
+    /// Returns the total size of the object by summing the lengths of its slabs.
+    pub fn size(&self) -> u64 {
+        self.slabs.iter().fold(0_u64, |v, s| v + s.length as u64)
+    }
+
+    /// Returns a new object truncated to `length` bytes.
+    ///
+    /// The final retained slab is shortened to end at `length`, and any slabs
+    /// beyond it are removed. If `length` is greater than the object's size,
+    /// the returned object is unchanged.
+    ///
+    /// The object should be repinned afterwards
+    #[must_use]
+    pub fn truncate(&self, length: u64) -> Self {
+        let mut size = 0_u64;
+        let mut slabs = self
+            .slabs
+            .iter()
+            .take_while(|slab| {
+                if size >= length {
+                    return false;
+                }
+                size += slab.length as u64;
+                true
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if let Some(last) = slabs.last_mut() {
+            last.length -= size.saturating_sub(length) as u32;
+        }
+
+        Self {
+            data_key: self.data_key.clone(),
+            slabs,
+            metadata: self.metadata.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    /// Returns the total encoded size of the object after erasure coding
+    /// by summing the sizes of its slabs.
+    pub fn encoded_size(&self) -> u64 {
+        self.slabs.iter().fold(0_u64, |v, s| {
+            v + (s.sectors.len() as u64 * SECTOR_SIZE as u64)
+        })
+    }
+
+    /// Encrypts and signs the object, producing a [SealedObject] that can be pinned to the indexer.
+    pub fn seal(&self, app_key: &AppKey) -> SealedObject {
+        self.seal_with(&app_key.0)
+    }
+
+    /// Encrypts and signs the object with `key`, producing a [SealedObject] only
+    /// the holder of `key` can open.
+    pub(crate) fn seal_with(&self, key: &PrivateKey) -> SealedObject {
+        let object_id = self.id();
+
+        let encrypted_data_key = seal_data_key(key, &object_id, &self.data_key);
+        let data_signature = {
+            let sig_hash = SealedObject::data_sig_hash(&object_id, &encrypted_data_key);
+            key.sign(sig_hash.as_ref())
+        };
+
+        let (encrypted_metadata_key, encrypted_metadata) = if !self.metadata.is_empty() {
+            let metadata_key = EncryptionKey::from(rand::random::<[u8; 32]>());
+            let encrypted_metadata_key = seal_metadata_key(key, &object_id, &metadata_key);
+            let encrypted_metadata = seal_metadata(&metadata_key, &self.metadata);
+            (encrypted_metadata_key, encrypted_metadata)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let metadata_signature = {
+            let sig_hash = SealedObject::meta_sig_hash(
+                &object_id,
+                &encrypted_metadata_key,
+                &encrypted_metadata,
+            );
+            key.sign(sig_hash.as_ref())
+        };
+
+        SealedObject {
+            encrypted_data_key,
+            encrypted_metadata_key,
+            slabs: self.slabs.clone(),
+            encrypted_metadata,
+            data_signature,
+            metadata_signature,
+
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+impl Default for Object {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+pub(crate) fn object_id(slabs: &[Slab]) -> Hash256 {
+    let mut state = Params::new().hash_length(32).to_state();
+    for slab in slabs.iter() {
+        let slab_id = slab.digest();
+        slab_id
+            .encode(&mut state)
+            .expect("hashing slab_id shouldn't fail");
+        ((slab.offset as u64) << 32 | slab.length as u64)
+            .encode(&mut state)
+            .expect("hashing slab offset/length shouldn't fail");
+    }
+    state.finalize().into()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use sia_core::hash_256;
+
+    fn random_bytes_32() -> [u8; 32] {
+        let mut buf = [0u8; 32];
+        getrandom::fill(&mut buf).unwrap();
+        buf
+    }
+
+    fn sealed_summary(object: &Object, key: &PrivateKey) -> SealedObjectSummary {
+        let sealed = object.seal_with(key);
+        SealedObjectSummary {
+            object_id: object.id(),
+            encrypted_metadata_key: sealed.encrypted_metadata_key,
+            encrypted_metadata: sealed.encrypted_metadata,
+            metadata_signature: sealed.metadata_signature,
+            created_at: sealed.created_at,
+            updated_at: sealed.updated_at,
+            size: object.size(),
+        }
+    }
+
+    fn summary_object(metadata: &[u8]) -> Object {
+        Object {
+            data_key: random_bytes_32().into(),
+            slabs: vec![Slab {
+                version: SlabVersion::V1,
+                encryption_key: random_bytes_32().into(),
+                min_shards: 1,
+                sectors: vec![Sector {
+                    root: Hash256::new(random_bytes_32()),
+                    host_key: PrivateKey::from_seed(&random_bytes_32()).public_key(),
+                }],
+                offset: 0,
+                length: 4096,
+            }],
+            metadata: metadata.to_vec(),
+            ..Object::default()
+        }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_summary_opens_metadata() {
+        let key = PrivateKey::from_seed(&random_bytes_32());
+        let object = summary_object(b"{\"name\":\"movie.mp4\"}");
+        let summary = sealed_summary(&object, &key).open_with(&key).unwrap();
+        assert_eq!(summary.id, object.id());
+        assert_eq!(summary.metadata, object.metadata);
+        assert_eq!(summary.size, 4096);
+        assert_eq!(summary.created_at, object.created_at);
+        assert_eq!(summary.updated_at, object.updated_at);
+
+        let empty = summary_object(b"");
+        let summary = sealed_summary(&empty, &key).open_with(&key).unwrap();
+        assert!(summary.metadata.is_empty());
+    }
+
+    /// The metadata signature covers the object id, so neither a swapped id
+    /// nor altered metadata gets through, and another key cannot open it.
+    #[sia_core_derive::cross_target_test]
+    fn test_summary_rejects_tampering() {
+        let key = PrivateKey::from_seed(&random_bytes_32());
+        let object = summary_object(b"metadata");
+
+        let mut wrong_id = sealed_summary(&object, &key);
+        wrong_id.object_id = Hash256::new(random_bytes_32());
+        assert!(matches!(
+            wrong_id.open_with(&key),
+            Err(SealedObjectError::InvalidSignature)
+        ));
+
+        let mut altered = sealed_summary(&object, &key);
+        altered.encrypted_metadata[0] ^= 1;
+        assert!(matches!(
+            altered.open_with(&key),
+            Err(SealedObjectError::InvalidSignature)
+        ));
+
+        let other = PrivateKey::from_seed(&random_bytes_32());
+        assert!(matches!(
+            sealed_summary(&object, &key).open_with(&other),
+            Err(SealedObjectError::InvalidSignature)
+        ));
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_slab_version_serde_numeric() {
+        let slab = Slab {
+            version: SlabVersion::V1,
+            encryption_key: [1u8; 32].into(),
+            min_shards: 1,
+            sectors: vec![],
+            offset: 0,
+            length: 0,
+        };
+
+        let mut value = serde_json::to_value(&slab).unwrap();
+        assert_eq!(value["version"], serde_json::json!(1));
+        assert_eq!(
+            serde_json::from_value::<Slab>(value.clone())
+                .unwrap()
+                .version,
+            SlabVersion::V1
+        );
+
+        // legacy data without a version field decodes as V0
+        value.as_object_mut().unwrap().remove("version");
+        assert_eq!(
+            serde_json::from_value::<Slab>(value).unwrap().version,
+            SlabVersion::V0
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_object_id() {
+        let slabs = vec![Slab {
+            version: SlabVersion::V0,
+            encryption_key: [0u8; 32].into(),
+            min_shards: 1,
+            sectors: vec![Sector {
+                root: Hash256::new([1u8; 32]),
+                host_key: PublicKey::new([2u8; 32]),
+            }],
+            offset: 10,
+            length: 100,
+        }];
+
+        let id = object_id(&slabs);
+        assert_eq!(
+            id.to_string(),
+            "1b13d5dd22605af0573cae7fe9242c1ee83727c29798308b2b170864677b46d0"
+        );
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_object_truncate() {
+        let slabs = [100, 200, 300]
+            .into_iter()
+            .map(|length| Slab {
+                version: SlabVersion::V1,
+                encryption_key: random_bytes_32().into(),
+                min_shards: 1,
+                sectors: vec![],
+                offset: 10,
+                length,
+            })
+            .collect::<Vec<_>>();
+        let object = Object {
+            slabs: slabs.clone(),
+            metadata: b"metadata".to_vec(),
+            ..Default::default()
+        };
+
+        let empty = object.truncate(0);
+        assert_eq!(empty.size(), 0);
+        assert!(empty.slabs().is_empty());
+
+        let partial_first = object.truncate(40);
+        assert_eq!(partial_first.size(), 40);
+        assert_eq!(partial_first.slabs().len(), 1);
+        assert_eq!(partial_first.slabs()[0].offset, slabs[0].offset);
+        assert_eq!(partial_first.slabs()[0].length, 40);
+
+        let exact_boundary = object.truncate(100);
+        assert_eq!(exact_boundary.size(), 100);
+        assert_eq!(exact_boundary.slabs(), &slabs[..1]);
+
+        let partial_second = object.truncate(250);
+        assert_eq!(partial_second.size(), 250);
+        assert_eq!(partial_second.slabs().len(), 2);
+        assert_eq!(partial_second.slabs()[0], slabs[0]);
+        assert_eq!(partial_second.slabs()[1].offset, slabs[1].offset);
+        assert_eq!(partial_second.slabs()[1].length, 150);
+
+        let oversized = object.truncate(object.size() + 1);
+        assert_eq!(oversized, object);
+        assert_eq!(object.slabs(), slabs);
+    }
+
+    /// Tests ObjectID of a SealedObject
+    /// Port of objects_test.go:TestObjectID
+    #[sia_core_derive::cross_target_test]
+    fn test_sealed_object_id_golden() {
+        let mut encryption_key = [0u8; 32];
+        encryption_key[..3].copy_from_slice(&[4, 5, 6]);
+        let mut sector_root = [0u8; 32];
+        sector_root[..3].copy_from_slice(&[7, 8, 9]);
+        let mut public_key = [0u8; 32];
+        public_key[..3].copy_from_slice(&[10, 11, 12]);
+        let mut data_signature = [0u8; 64];
+        data_signature[..3].copy_from_slice(&[22, 23, 24]);
+        let mut metadata_signature = [0u8; 64];
+        metadata_signature[..3].copy_from_slice(&[24, 23, 22]);
+
+        let sealed = SealedObject {
+            encrypted_data_key: vec![1, 2, 3],
+            encrypted_metadata_key: vec![3, 2, 1],
+            slabs: vec![Slab {
+                version: SlabVersion::V0,
+                encryption_key: encryption_key.into(),
+                min_shards: 1,
+                sectors: vec![Sector {
+                    root: sector_root.into(),
+                    host_key: PublicKey::new(public_key),
+                }],
+                offset: 131415,
+                length: 161718,
+            }],
+            encrypted_metadata: vec![19, 20, 21],
+            data_signature: Signature::new(data_signature),
+            metadata_signature: Signature::new(metadata_signature),
+            created_at: DateTime::from_timestamp(25, 26).unwrap(),
+            updated_at: DateTime::from_timestamp(27, 28).unwrap(),
+        };
+
+        assert_eq!(
+            hash_256!("92b456fd0320c6595cf40280fafde2e3c549e09f6e7168ebdd963500830f50b5"),
+            sealed.id()
+        )
+    }
+
+    /// tests Slab.digest against a reference digest
+    #[sia_core_derive::cross_target_test]
+    fn test_slab_digest() {
+        let s = Slab {
+            version: SlabVersion::V0,
+            min_shards: 1,
+            encryption_key: [
+                152, 138, 169, 77, 22, 195, 154, 192, 91, 139, 241, 61, 75, 225, 38, 124, 225, 31,
+                187, 165, 80, 215, 75, 121, 115, 204, 235, 9, 90, 248, 68, 92,
+            ]
+            .into(),
+            sectors: vec![
+                Sector {
+                    root: hash_256!(
+                        "fb0a42cce246d6bb9716eb0e97579a1d0d5c2bb34d7234e9ae271d4fd8201b24"
+                    ),
+                    host_key: PublicKey::new(random_bytes_32()), // host key is not included in the digest
+                },
+                Sector {
+                    root: hash_256!(
+                        "8125994daee38e1fbaf7a26c7935420ce055202f7175eae98d291ebe80f2b00e"
+                    ),
+                    host_key: PublicKey::new(random_bytes_32()), // host key is not included in the digest
+                },
+                Sector {
+                    root: hash_256!(
+                        "54ee41b57b9439868b119b8fe1c6c602bd6b35e27d31400c5bb85912b60c9f0a"
+                    ),
+                    host_key: PublicKey::new(random_bytes_32()), // host key is not included in the digest
+                },
+            ],
+            // length and offset are not included in the digest
+            length: 100,
+            offset: 100,
+        };
+
+        assert_eq!(
+            s.digest().to_string(),
+            "d1aea84f8682d7ae17b6c1f14dc344eb70b9328ee913a76fc241559657b06284"
+        )
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_object_roundtrip() {
+        let slabs = vec![
+            Slab {
+                version: SlabVersion::V0,
+                encryption_key: random_bytes_32().into(),
+                min_shards: 2,
+                sectors: vec![],
+                offset: 0,
+                length: 100,
+            },
+            Slab {
+                version: SlabVersion::V0,
+                encryption_key: random_bytes_32().into(),
+                min_shards: 2,
+                sectors: vec![],
+                offset: 0,
+                length: 100,
+            },
+        ];
+        let meta = b"hello, world!".to_vec();
+        let obj = Object {
+            slabs: slabs.clone(),
+            metadata: meta.clone(),
+            ..Default::default()
+        };
+
+        let seed: [u8; 32] = random_bytes_32();
+        let private_key = AppKey::import(seed);
+
+        let sealed = obj.seal(&private_key);
+        let opened = sealed.open(&private_key).expect("should open");
+
+        assert_eq!(opened.slabs, slabs);
+        assert_eq!(opened.metadata, meta);
+    }
+
+    #[sia_core_derive::cross_target_test]
+    fn test_open_with_wrong_key_rejected() {
+        let obj = Object {
+            slabs: vec![Slab {
+                version: SlabVersion::V0,
+                encryption_key: random_bytes_32().into(),
+                min_shards: 2,
+                sectors: vec![],
+                offset: 0,
+                length: 100,
+            }],
+            metadata: b"secret".to_vec(),
+            ..Default::default()
+        };
+
+        let key = PrivateKey::from_seed(&[1u8; 32]);
+        let wrong_key = PrivateKey::from_seed(&[2u8; 32]);
+
+        // open_with verifies the signatures against the opener's key first, so a
+        // wrong key is rejected before any attempt to decrypt.
+        let sealed = obj.seal_with(&key);
+        let err = sealed
+            .open_with(&wrong_key)
+            .expect_err("a wrong key must be rejected");
+        assert!(matches!(err, SealedObjectError::InvalidSignature), "{err}");
+    }
+
+    #[cfg(feature = "less-safe-crypto")]
+    #[sia_core_derive::cross_target_test]
+    fn test_less_safe_new_roundtrip() {
+        let data_key = EncryptionKey::from(random_bytes_32());
+        let slabs = vec![Slab {
+            version: SlabVersion::V1,
+            encryption_key: random_bytes_32().into(),
+            min_shards: 10,
+            sectors: (0..30)
+                .map(|_| Sector {
+                    root: random_bytes_32().into(),
+                    host_key: PublicKey::new(random_bytes_32()),
+                })
+                .collect(),
+            offset: 0,
+            length: 100,
+        }];
+        let meta = b"hello, world!".to_vec();
+
+        let reconstructed =
+            Object::less_safe_new(data_key.clone(), slabs.clone(), Some(meta.clone()));
+        let original = Object {
+            data_key,
+            slabs,
+            metadata: meta,
+            created_at: reconstructed.created_at,
+            updated_at: reconstructed.updated_at,
+        };
+        assert_eq!(original, reconstructed);
+        assert_eq!(original.id(), reconstructed.id());
+
+        let app_key = AppKey::import(random_bytes_32());
+        let opened_original = original.seal(&app_key).open(&app_key).expect("should open");
+        let opened_reconstructed = reconstructed
+            .seal(&app_key)
+            .open(&app_key)
+            .expect("should open");
+        assert_eq!(opened_original, original);
+        assert_eq!(opened_original, opened_reconstructed);
+    }
+
+    /// tests that the SealedObject struct is compatible with the Go implementation
+    /// by deserializing a reference object
+    #[sia_core_derive::cross_target_test]
+    fn test_sealed_object_golden() {
+        let mut seed = [0u8; 32];
+        hex::decode_to_slice(
+            "9593edfd90ef2da9973af3bca88afdf54b6e7ff66ff6c749505734b9cf6b8aec",
+            &mut seed,
+        )
+        .expect("hex");
+        let app_key = AppKey::import(seed);
+
+        let mut expected_object_key = [0u8; 32];
+        hex::decode_to_slice(
+            "cd280dd064e3c2d4259579bf0deda2492962c130ee8d7d2e11f1daca3e5cc579",
+            &mut expected_object_key,
+        )
+        .expect("hex");
+        let expected_object_key = EncryptionKey::from(expected_object_key);
+
+        let expected_metadata = hex::decode("b9d615255cc17596e3870c3adf5e11c1da0dd78e30f29c6b6d223949c7d91492db55cdc6e04ce65b5b1fea4ccc953e883d5bf23e9c893ecb5221e7315f16e7f95dfc70f0ed1ee1306e8733a22a5faf1b139f01f0f77ae00d71fe3bbefa4b65aca80f749e4788ace89beaa79ac651aedc54cba7066264df9db54c22c1e17cea1a").expect("hex");
+
+        let sealed_data = hex::decode("480000000000000063f49bd7cf21d25565ebb26a900efabec342418989958f09b735073af7dd5076231c32524ff6208f3a85f8cc8dd4a6ac913e0df51a34ab9ee325b41fc3de93a1107becc3b527f487020000000000000000739b1966a1d8ab194c0f0ebe012b00259491c13b73e1ad67128957590714dd33000000000000000000881300000a00000000a4e3e3f002e05ff9d05a3193cc1513a66c10d82979a0a2fc9aa0aa4c7de2c64600000000000000000000100000200000005cc53fb91b99eb0d4aa422a820d2e64109a344e5234d7fb31ec62460f5dc52b6ae0b67c71093cebdb7a6cb79a65dfb6f2cb28eb3704a302a4517269fce75680c48000000000000008465df0369c7a4144257ce38bb566b47350e21ae0049b97d56348c1269c4fa5a1ea32f88c20e0ba000446f66e955c191d816bd4f3576caacbd309149343c629c0c7a7fc99201644da800000000000000f58f39972c8b1db49fef8606f20e690fb68fc9d29b5ab0da3a871ddb0cd5e66968ea0cf852a521697f422baac24c9418ca42fbc766d08fe0b55417e4d0f42831040e1c4e3dba1557ef7285649ab1c810ee1771a4c04d2bea4b2bbf592d3e3a1cee7a9217191242a6526db0c0ac09398f2090179063b0bdc2278a88540531f6ad3b5d44ecac36b1fef09205a2011ea4539a9abb914f23461a443efe47e581698416e452fa37af929a8bf8668d999920b5ec04005f2b947194b19271846b3c375e75257eebaad288bcb1eb36f6748562d97fcd0904eb491090ea8f61c0ddbc741f187af2b22151180400096e88f1ffffff00096e88f1ffffff").expect("hex");
+        let sealed = SealedObject::decode(&mut &sealed_data[..]).expect("decode");
+        let opened = sealed.open(&app_key).expect("open");
+
+        assert_eq!(opened.data_key, expected_object_key);
+        assert_eq!(opened.slabs.len(), 2);
+        assert_eq!(opened.metadata, expected_metadata);
+    }
+}

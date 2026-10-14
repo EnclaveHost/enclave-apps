@@ -1,0 +1,197 @@
+## 0.6.0 (2026-10-09)
+
+### Breaking Changes
+
+#### Serialize keys and IDs as byte strings in non-human-readable formats
+
+`PublicKey`, `Signature`, and the types defined with `impl_hash_id!` (`Hash256`, `BlockID`, `TransactionID`, and the other IDs) now serialize as byte strings in non-human-readable formats such as CBOR instead of strings or fixed-size tuples, and deserialize from either form. JSON output is unchanged. `sia_core::types::deserialize_str_or_bytes` is available for types that follow the same convention.
+
+`AccountToken::valid_until` decodes a null timestamp as Go's zero time, since indexd's CBOR encoder writes the zero `time.Time` as null. `sia_core::types::null_as_zero_time` provides the same decoding for other timestamps.
+
+### Features
+
+- Implement Clone for the RHP4 protocol, encoding and proof validation errors.
+
+## 0.5.0 (2026-09-14)
+
+### Breaking Changes
+
+- Remove contextual fields from several error variants to reduce `Error` enum size.
+- Removed the `blake2` module and the `blake2`/`hkdf` dependencies.
+
+### Fixes
+
+- Fixed an issue with RPCRead where the returned bytes could be longer than the requested length.
+- Reupload slabs whose sectors expired from temporary storage
+- use --locked for cargo install wasm-pack
+
+## 0.4.2 (2026-08-07)
+
+### Features
+
+- Switch sector root and range proof verifier to optimized SIMD backends.
+
+## 0.4.1 (2026-05-18)
+
+### Fixes
+
+- Bump sia_core_derive.
+
+## 0.4.0 (2026-05-18)
+
+### Breaking Changes
+
+#### Use u64 for output and contract ID derive indices
+
+Changed the index parameter on `TransactionID`, `BlockID`, and `FileContractID`
+ID-derive methods from `usize` to `u64`: `siacoin_output_id`, `siafund_output_id`,
+`file_contract_id`, `miner_output_id`, `v2_siacoin_output_id`, `v2_siafund_output_id`,
+`v2_file_contract_id`, `v2_attestation_id`, `valid_output_id`, and `missed_output_id`.
+
+The hash input was already serialized as a little-endian `u64`, so on-chain IDs
+are unchanged. The previous signature silently truncated indices to 32 bits on
+`wasm32` (where `usize == u32`).
+
+### Fixes
+
+- Remove rayon crate from dependencies on WASM.
+
+## 0.3.1 (2026-04-05)
+
+### Fixes
+
+- Misc consensus fixes
+
+## 0.3.0 (2026-03-23)
+
+### Breaking Changes
+
+- Renamed crate to `sia_core`
+
+## 0.2.2 (2026-03-18)
+
+### Features
+
+- Implements the Siamux multiplexer
+
+## 0.2.1 (2026-03-16)
+
+### Features
+
+- Introduce mux crate and frame module
+- use ring instead of chacha20poly1305; optimize frame module to reduce copies
+
+### Fixes
+
+- use AsyncRead/AsyncWrite traits instead of Ext variants in trait bounds
+- Fixes a bug where object decryption silently fails
+
+#### Check if we have enough hosts prior to encoding in upload_slabs
+
+##261 by @Alrighttt
+
+Fixes https://github.com/SiaFoundation/sia-sdk-rs/issues/251
+
+- Added an `available_for_upload` method that returns the amount of known hosts marked `good_for_upload`.
+- Added a check in `upload_slabs` that verifies we have enough good hosts prior to encoding any data. 
+- Adds a variant to `QueueError` for `upload_slabs`'s new failure case. This enables testing for this new case specifically.
+
+#### Go SDK test parity
+
+##266 by @Alrighttt
+
+This pull requests adds some missing test cases that exist within the Go SDK. Closes https://github.com/SiaFoundation/sia-sdk-rs/issues/220
+
+The remaining tests that have not been ported require changes to the `SDK` struct to allow mocking the `api_client`. I will work on a solution for this.
+
+## 0.2.0 (2026-01-28)
+
+### Breaking Changes
+
+- Changes the Seed constructor to accept a mnemonic instead of raw entropy and adds `Seed::from_seed` to replace the old constructor.
+- Merge SlabSlice and Slab types.
+
+### Features
+
+- Added signature macro for testing.
+
+### Fixes
+
+- Fix release registry
+- Make use of goodForUpload field
+
+## 0.1.3 (2025-10-04)
+
+### Features
+
+- Add JSON serialization to ChainState
+
+### Fixes
+
+- Fixed release workflow.
+
+## 0.1.2 (2025-10-04)
+
+### Features
+
+- Add JSON serialization to ChainState
+
+### Fixes
+
+- Fix path dependency versions.
+
+## 0.1.1 (2025-10-04)
+
+### Features
+
+- Add JSON serialization to ChainState
+
+## 0.1.0 (2025-10-04)
+
+### Breaking Changes
+
+- Change signing code to borrow.
+
+### Features
+
+- Add JSON serialization to ChainState
+- Add account API endpoint to app_client and FFI implementation.
+- Add generic support for reading and writing erasure-coded slabs.
+- Add method to generate object URLs.
+- Add object methods to FFI crate.
+- Add pin_slab and unpin_slab to FFI.
+- Add an SDK client that exposes an upload and download method.
+- Add slab downloader.
+- Add support for encrypting and decrypting shards.
+- Add support for ReedSolomon erasure coding.
+- Added AsyncSiaEncodable and AsyncSiaDecodable traits.
+- Added object uploading.
+- Added RHP4 request and response types.
+- Added RHP4 RPC usage and helpers.
+- Implement client-side encryption for quic uploads and downloads.
+- Support download range requests.
+- Use randomly generated encryption keys.
+- Verify proofs in RPCWriteSector and RPCReadSector.
+
+### Fixes
+
+- Add V2 host announcement support.
+- Fixed RPC write sector encoding.
+- Swap out 'time' dependency for 'chrono'.
+- Use PublicKey for account key type.
+
+## 0.0.2 (2025-07-21)
+
+### Features
+
+- Add JSON serialization to ChainState
+- Add ID derivation helpers to transactions, blocks, and siafund claims
+- v2 signing implemented
+
+#### Refactor V1 transaction signing
+
+Replaced `v1::Transaction::sign` with `v1::Transaction::whole_sig_hash` and `v1::Transaction::partial_sig_hash`. This change is primarily to provide a more consistent experience with `core` and the V2::Transaction API.
+
+### Fixes
+
+- Fix element accumulator encoding

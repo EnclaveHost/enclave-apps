@@ -1,0 +1,6 @@
+[build]
+target = "wasm32-wasip2"
+
+# tokio gates `net` on wasm behind tokio_unstable
+[target.wasm32-wasip2]
+rustflags = ["--cfg", "tokio_unstable"]
