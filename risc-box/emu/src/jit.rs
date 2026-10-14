@@ -77,6 +77,11 @@ pub struct Layout {
 	/// it holds (u64) - Cpu::is_reservation_set / Cpu::reservation.
 	pub res_flag_addr: u64,
 	pub res_addr_addr: u64,
+	/// risc-box patch (SMP): the value LR read (Cpu::reservation_val); SC is a compare-and-swap from it
+	pub res_val_addr: u64,
+	/// risc-box patch (SMP): the machine has other harts: AMO*, LR/SC and FENCE are emitted as wasm atomics
+	/// on the shared memory, the operations Cpu::exec_atomic performs in the interpreter
+	pub smp: bool,
 	/// Some(_) when the guest runs under paging: memory ops probe the
 	/// emulator's software TLB (hit -> translated physical; miss/meta-stale
 	/// -> bail). None for bare/physical addressing.
@@ -819,6 +824,23 @@ impl<'a> Emit<'a> {
 		self.lget(addr);
 	}
 
+	/// dram_addr for a store, plus natural alignment of the LINEAR address (a wasm atomic traps on a
+	/// misaligned one; the interpreter handles it instead).
+	fn dram_addr_aligned(&mut self, width: u64, op_addr: u64, retired: u64) {
+		self.dram_addr(width, op_addr, retired, true);
+		self.op(DROP);
+		self.lget(self.l.addr);
+		if !self.m64() {
+			self.op(I64_EXTEND_I32_U);
+		}
+		self.i64c(width as i64 - 1);
+		self.op(I64_AND);
+		self.op(0x50); // i64.eqz
+		self.op(0x45); // i32.eqz: misaligned
+		self.bail_if(op_addr, retired);
+		self.lget(self.l.addr);
+	}
+
 	fn br_if(&mut self, depth: u32) {
 		self.op(0x0d);
 		self.idx(depth as u64);
@@ -999,15 +1021,8 @@ enum CsrOp {
 	C,
 }
 
-/// risc-box patch (SMP): set when the machine has more than one hart. AMO*, LR/SC and FENCE then stay with the
-/// interpreter, which runs them as host atomics and fences (Cpu::exec_atomic); compiled code would run them
-/// as plain loads and stores.
-pub static SMP_ATOMICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn table_op(op: &BlockOp) -> Option<TableOp> {
-	if SMP_ATOMICS.load(std::sync::atomic::Ordering::Relaxed) && matches!(op.word & 0x7f, 0x2f | 0x0f) {
-		return None;
-	}
 	use self::AmoOp as A;
 	use self::FOp as F;
 	let csr = ((op.word >> 20) & 0xfff) as u16;
@@ -1251,7 +1266,179 @@ fn mulh(e: &mut Emit, rd: u8, rs1: u8, rs2: u8, s1: bool, s2: bool) {
 /// too (RISC-V has no write-only pages), and an owned chunk's read and
 /// write pointers are one buffer.
 #[allow(clippy::too_many_arguments)]
+/// wasm threads opcodes (0xfe prefix) with their natural-alignment memarg
+fn atomic(e: &mut Emit, code: u64, align: u8) {
+	e.op(0xfe);
+	e.idx(code);
+	e.memarg(align, 0);
+}
+
+const I64_EXTEND32_S: u8 = 0xc4;
+
+/// SMP: an AMO as one wasm atomic read-modify-write (min/max: a compare-exchange loop). The address must be
+/// naturally aligned in linear memory too (wasm traps otherwise); anything else bails to the interpreter,
+/// which has its own fallback.
+#[allow(clippy::too_many_arguments)]
+fn amo_smp(e: &mut Emit, a: AmoOp, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	let (old, src, lin) = (e.l.t0, e.l.t1, e.l.addr);
+	let width = if w { 4 } else { 8 };
+	e.get_x(rs1);
+	e.dram_addr_aligned(width, addr, ret_before);
+	e.op(DROP); // also in `addr`
+	e.get_x(rs2);
+	e.lset(src);
+	// rmw opcode bases (i32 .rmw); +1 = i64.rmw, +6 = i64.rmw32 (zero-extending)
+	let rmw = |a: &AmoOp| match a {
+		AmoOp::Add => Some(0x1e),
+		AmoOp::And => Some(0x2c),
+		AmoOp::Or => Some(0x33),
+		AmoOp::Xor => Some(0x3a),
+		AmoOp::Swap => Some(0x41),
+		_ => None,
+	};
+	match rmw(&a) {
+		Some(base) => {
+			e.lget(lin);
+			e.lget(src);
+			atomic(e, if w { base + 6 } else { base + 1 }, if w { 2 } else { 3 });
+			e.lset(old);
+		}
+		None => {
+			// loop { old = load; new = pick(src, old); if cmpxchg(lin, old, new) == old: break }
+			e.op(LOOP);
+			e.op(VOID);
+			e.lget(lin);
+			atomic(e, if w { 0x16 } else { 0x11 }, if w { 2 } else { 3 }); // i64.atomic.load32_u / load
+			e.lset(old);
+			e.lget(lin);
+			e.lget(old);
+			// the replacement: pick(src, old) compared as the instruction's width and signedness
+			e.lget(src);
+			e.lget(old);
+			e.lget(src);
+			if w {
+				e.op(I32_WRAP_I64);
+			}
+			e.lget(old);
+			if w {
+				e.op(I32_WRAP_I64);
+			}
+			let (c32, c64) = match a {
+				AmoOp::Min => (0x48, 0x53),
+				AmoOp::Max => (0x4a, 0x55),
+				AmoOp::MinU => (0x49, 0x54),
+				_ => (0x4b, 0x56),
+			};
+			e.op(if w { c32 } else { c64 });
+			e.op(SELECT);
+			atomic(e, if w { 0x4e } else { 0x49 }, if w { 2 } else { 3 }); // i64.atomic.rmw32.cmpxchg_u / rmw.cmpxchg
+			e.lget(old);
+			e.op(I64_NE);
+			e.br_if(0);
+			e.op(END);
+		}
+	}
+	if w {
+		e.lget(old);
+		e.op(I64_EXTEND32_S);
+		e.lset(old);
+	}
+	e.set_x_pre(rd);
+	e.lget(old);
+	e.set_x_post(rd);
+	e.gen_check(next, ret_after);
+}
+
+/// SMP LR: an atomic load that also records the value it saw (SC compares against it).
+fn lr_smp(e: &mut Emit, w: bool, rd: u8, rs1: u8, addr: u64, ret_before: u64) {
+	let (va, base, v) = (e.l.t0, e.l.base, e.l.t1);
+	let (flag, held, seen) = (e.lay.res_flag_addr, e.lay.res_addr_addr, e.lay.res_val_addr);
+	e.get_x(rs1);
+	e.lset(va);
+	e.lget(va);
+	e.dram_addr_aligned(if w { 4 } else { 8 }, addr, ret_before);
+	atomic(e, if w { 0x16 } else { 0x11 }, if w { 2 } else { 3 });
+	e.lset(v);
+	e.lget(base);
+	e.lget(v);
+	e.op(I64_STORE);
+	e.memarg(3, seen);
+	e.set_x_pre(rd);
+	e.lget(v);
+	if w {
+		e.op(I64_EXTEND32_S);
+	}
+	e.set_x_post(rd);
+	e.lget(base);
+	e.i32c(1);
+	e.op(0x3a); // i32.store8
+	e.memarg(0, flag);
+	e.lget(base);
+	e.lget(va);
+	e.op(I64_STORE);
+	e.memarg(3, held);
+}
+
+/// SMP SC: when the reservation is held for exactly x[rs1], compare-and-swap x[rs2] in for the value LR saw:
+/// x[rd] = 0 when memory still held it, else 1. The reservation is dropped either way.
+#[allow(clippy::too_many_arguments)]
+fn sc_smp(e: &mut Emit, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	const I32_AND: u8 = 0x71;
+	let (va, base, seen_v) = (e.l.t0, e.l.base, e.l.t1);
+	let (flag, held, seen) = (e.lay.res_flag_addr, e.lay.res_addr_addr, e.lay.res_val_addr);
+	let clear = |e: &mut Emit| {
+		e.lget(base);
+		e.i32c(0);
+		e.op(0x3a); // i32.store8
+		e.memarg(0, flag);
+	};
+	e.get_x(rs1);
+	e.lset(va);
+	e.lget(base);
+	e.op(I32_LOAD8_U);
+	e.memarg(0, flag);
+	e.lget(base);
+	e.op(I64_LOAD);
+	e.memarg(3, held);
+	e.lget(va);
+	e.op(I64_EQ);
+	e.op(I32_AND);
+	e.op(IF);
+	e.op(VOID);
+	e.if_depth += 1;
+	e.lget(va);
+	e.dram_addr_aligned(if w { 4 } else { 8 }, addr, ret_before);
+	e.lget(base);
+	e.op(I64_LOAD);
+	e.memarg(3, seen);
+	e.ltee(seen_v);
+	e.get_x(rs2);
+	atomic(e, if w { 0x4e } else { 0x49 }, if w { 2 } else { 3 }); // cmpxchg: returns what was there
+	e.lget(seen_v);
+	if w {
+		// rmw32.cmpxchg returns the old word zero-extended; LR recorded it the same way
+	}
+	e.op(I64_NE); // 1 = failed
+	e.op(0xad); // i64.extend_i32_u
+	e.lset(seen_v);
+	clear(e);
+	e.set_x_pre(rd);
+	e.lget(seen_v);
+	e.set_x_post(rd);
+	e.gen_check(next, ret_after);
+	e.op(ELSE);
+	clear(e);
+	e.set_x_pre(rd);
+	e.i64c(1);
+	e.set_x_post(rd);
+	e.if_depth -= 1;
+	e.op(END);
+}
+
 fn amo(e: &mut Emit, a: AmoOp, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	if e.lay.smp {
+		return amo_smp(e, a, w, rd, rs1, rs2, addr, next, ret_before, ret_after);
+	}
 	let (old, src, lin) = (e.l.t0, e.l.t1, e.l.addr);
 	let width = if w { 4 } else { 8 };
 	e.get_x(rs1);
@@ -1335,6 +1522,9 @@ fn amo(e: &mut Emit, a: AmoOp, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, nex
 /// LR.W/.D: x[rd] = load(x[rs1]) (.W sign-extended), and the reservation is
 /// set to that (old) x[rs1].
 fn lr(e: &mut Emit, w: bool, rd: u8, rs1: u8, addr: u64, ret_before: u64) {
+	if e.lay.smp {
+		return lr_smp(e, w, rd, rs1, addr, ret_before);
+	}
 	let (va, base) = (e.l.t0, e.l.base);
 	let (flag, held) = (e.lay.res_flag_addr, e.lay.res_addr_addr);
 	e.get_x(rs1);
@@ -1369,6 +1559,9 @@ fn lr(e: &mut Emit, w: bool, rd: u8, rs1: u8, addr: u64, ret_before: u64) {
 /// touched, so the interpreter's retry still sees it held.
 #[allow(clippy::too_many_arguments)]
 fn sc(e: &mut Emit, w: bool, rd: u8, rs1: u8, rs2: u8, addr: u64, next: u64, ret_before: u64, ret_after: u64) {
+	if e.lay.smp {
+		return sc_smp(e, w, rd, rs1, rs2, addr, next, ret_before, ret_after);
+	}
 	const I32_AND: u8 = 0x71;
 	let (va, base) = (e.l.t0, e.l.base);
 	let (flag, held) = (e.lay.res_flag_addr, e.lay.res_addr_addr);
@@ -1820,6 +2013,11 @@ fn emit_int_table_op(e: &mut Emit, t: TableOp, rd: u8, rs1: u8, rs2: u8) {
 	const I32_AND: u8 = 0x71;
 	const IF_I64: u8 = 0x7e;
 	if t == TableOp::Fence {
+		if e.lay.smp {
+			e.op(0xfe); // atomic.fence
+			e.op(0x03);
+			e.op(0x00);
+		}
 		return;
 	}
 	e.set_x_pre(rd);
@@ -3213,7 +3411,7 @@ mod test_tier2 {
 			memory64: false, shared: false, max_pages: None, ctx: 2048,
 			x_base: 0, f_base: 512, tlb: None, pc_addr: 256, gen_addr: 264,
 			baked_gen: 1, guest_dram_base: 0x8000_0000, dram_len: 65536,
-			fcsr_addr: 272, res_flag_addr: 280, res_addr_addr: 288,
+			fcsr_addr: 272, res_flag_addr: 280, res_addr_addr: 288, res_val_addr: 0, smp: false,
 			ram: Ram::Flat { dram_base: 4096 },
 		}
 	}

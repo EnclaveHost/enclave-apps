@@ -1028,10 +1028,6 @@ impl Cpu {
 	/// risc-box patch (SMP): this machine has other harts (AMO/LR/SC become host atomics).
 	pub fn set_smp(&mut self, on: bool) {
 		self.smp = on;
-		#[cfg(feature = "jit")]
-		if on {
-			::jit::SMP_ATOMICS.store(true, std::sync::atomic::Ordering::Relaxed);
-		}
 	}
 
 	/// risc-box patch (SMP): AMO*, LR and SC (major opcode 0x2f) as host atomics on the guest's RAM, so they
@@ -1859,6 +1855,8 @@ impl Cpu {
 			fcsr_addr: 272,
 			res_flag_addr: 280,
 			res_addr_addr: 288,
+			res_val_addr: 0,
+			smp: false,
 			tlb: None,
 			guest_dram_base: 0x8000_0000,
 			dram_len: 1 << 31,
@@ -1944,6 +1942,8 @@ impl Cpu {
 			fcsr_addr: off(&self.csr[CSR_FCSR_ADDRESS as usize] as *const u64 as usize as u64),
 			res_flag_addr: off(&self.is_reservation_set as *const bool as usize as u64),
 			res_addr_addr: off(&self.reservation as *const u64 as usize as u64),
+			res_val_addr: off(&self.reservation_val as *const u64 as usize as u64),
+			smp: self.smp,
 			tlb: Some(::jit::TlbLayout {
 				sets,
 				read_tags: off(tlb[0]),
@@ -8890,6 +8890,7 @@ mod test_jit_equivalence {
 	const FCSRA: u64 = 272; // fcsr (u64)
 	const RESF: u64 = 280; // reservation flag (u8)
 	const RESA: u64 = 288; // reservation address (u64)
+	const RESV: u64 = 296; // the value LR read (u64; SMP layouts)
 	const FB: u64 = 512; // f[32] as raw 8-byte cells
 	const CTXA: u64 = 2048; // context block (base 0, bias 0)
 	const DB: u64 = 4096; // linear offset of guest DRAM window
@@ -9102,6 +9103,8 @@ mod test_jit_equivalence {
 			fcsr_addr: FCSRA,
 			res_flag_addr: RESF,
 			res_addr_addr: RESA,
+			res_val_addr: RESV,
+			smp: cpu.smp,
 			tlb: None,
 			guest_dram_base: DRAM_BASE,
 			dram_len: WIN,
@@ -9121,6 +9124,7 @@ mod test_jit_equivalence {
 		m.put64(FCSRA, cpu_pre.csr[CSR_FCSR_ADDRESS as usize]);
 		m.put(RESF, &[cpu_pre.is_reservation_set as u8]);
 		m.put64(RESA, cpu_pre.reservation);
+		m.put64(RESV, cpu_pre.reservation_val);
 		m.put64(CTXA + jit::CTX_BASE, 0);
 		m.put64(CTXA + jit::CTX_BIAS, 0);
 		let mut win = vec![0u8; WIN as usize];
@@ -9571,6 +9575,100 @@ mod test_jit_equivalence {
 		assert_eq!(checked, 240);
 	}
 
+	/// risc-box patch (SMP): the same cases with the machine SMP - the interpreter's host atomics
+	/// (exec_atomic) against the emitted wasm atomics.
+	#[test]
+	fn amos_match_the_interpreter_smp() {
+		let engine = engine();
+		let edge: [i64; 12] = [0, 1, -1, 2, -7, i64::MIN, i64::MAX, i32::MIN as i64, i32::MAX as i64,
+			0x1_0000_0000, -0x1_0000_0001, 0x7fff_ffff_ffff_fff0];
+		let mut r = Rng(1234);
+		let names = ["MULH", "MULHSU", "MULHU", "AMOADD.W", "AMOADD.D", "AMOSWAP.W", "AMOSWAP.D",
+			"AMOXOR.W", "AMOXOR.D", "AMOOR.W", "AMOOR.D", "AMOAND.W", "AMOAND.D", "AMOMIN.W", "AMOMIN.D",
+			"AMOMAX.W", "AMOMAX.D", "AMOMINU.W", "AMOMINU.D", "AMOMAXU.W", "AMOMAXU.D"];
+		let mut checked = 0;
+		for name in names.iter() {
+			let amo = name.starts_with("AMO");
+			for k in 0..80u64 {
+				let mut cpu = fresh_cpu(&mut Rng(k * 7 + 3));
+				cpu.smp = true;
+				let pick = |r: &mut Rng| match r.next() % 3 {
+					0 => edge[(r.next() % edge.len() as u64) as usize],
+					_ => r.next() as i64,
+				};
+				// rd: a fresh register, or one of the sources
+				let (rd, rs1, rs2) = match k % 4 {
+					0 => (6, 6, 7),
+					1 => (7, 6, 7),
+					_ => (5, 6, 7),
+				};
+				cpu.x[7] = pick(&mut r);
+				match amo {
+					true => {
+						let at = DRAM_BASE + 8192 + (r.next() % 4096 & !7);
+						cpu.x[6] = at as i64;
+						let v = pick(&mut r) as u64;
+						let _ = cpu.mmu.store_doubleword(at, v);
+					}
+					false => cpu.x[6] = pick(&mut r),
+				}
+				let w = word_of(name, rd, rs1, rs2, 0);
+				let ops = vec![decode_op_for_test(&cpu, w), op(HOT_ADDI, 28, rd as u8, 0, 1)];
+				assert!(ops[0].kind == 0 && jit::translatable(&ops[0]), "{}", name);
+				same_as_interpreter(&engine, &mut cpu, &ops, &format!("{} case {}", name, k));
+				checked += 1;
+			}
+		}
+		assert_eq!(checked, 21 * 80);
+	}
+
+	#[test]
+	fn lr_sc_match_the_interpreter_smp() {
+		let engine = engine();
+		let mut r = Rng(99);
+		let mut checked = 0;
+		for &wide in &[true, false] {
+			let (lr, sc) = if wide { ("LR.D", "SC.D") } else { ("LR.W", "SC.W") };
+			for k in 0..120u64 {
+				let mut cpu = fresh_cpu(&mut Rng(k + 11));
+				cpu.smp = true;
+				let at = DRAM_BASE + 8192 + (r.next() % 2048 & !7);
+				let other = at + 64;
+				cpu.x[6] = at as i64;
+				cpu.x[9] = other as i64;
+				cpu.reservation_val = match r.next() % 2 {
+					0 => cpu.mmu.load_doubleword(at).unwrap_or(0) & if wide { u64::MAX } else { 0xffff_ffff },
+					_ => r.next(),
+				};
+				cpu.is_reservation_set = r.next() % 2 == 0;
+				cpu.reservation = match r.next() % 3 {
+					0 => at,
+					1 => other,
+					_ => r.next(),
+				};
+				let addi = |rd: u8, rs: u8, imm: i32| op(HOT_ADDI, rd, rs, 0, imm);
+				let ops = match k % 5 {
+					// lr; add; sc - the CAS loop body
+					0 => vec![decode_op_for_test(&cpu, word_of(lr, 5, 6, 0, 0)), addi(5, 5, 3),
+						decode_op_for_test(&cpu, word_of(sc, 8, 6, 5, 0)), addi(28, 8, 1)],
+					// sc alone: whatever reservation the state holds
+					1 => vec![decode_op_for_test(&cpu, word_of(sc, 8, 6, 7, 0)), addi(28, 8, 1)],
+					// sc to the other address
+					2 => vec![decode_op_for_test(&cpu, word_of(sc, 8, 9, 7, 0)), addi(28, 8, 1)],
+					// lr, then sc elsewhere (fails, drops it), then sc here (fails)
+					3 => vec![decode_op_for_test(&cpu, word_of(lr, 5, 6, 0, 0)),
+						decode_op_for_test(&cpu, word_of(sc, 8, 9, 7, 0)),
+						decode_op_for_test(&cpu, word_of(sc, 10, 6, 7, 0)), addi(28, 10, 1)],
+					// lr with rd == rs1: the reservation keeps the OLD address
+					_ => vec![decode_op_for_test(&cpu, word_of(lr, 6, 6, 0, 0)), addi(28, 6, 1)],
+				};
+				same_as_interpreter(&engine, &mut cpu, &ops, &format!("{} case {}", lr, k));
+				checked += 1;
+			}
+		}
+		assert_eq!(checked, 240);
+	}
+
 	/// Every float op the translator takes from the table, single and
 	/// double, plus FDIV.D (hot) and the float CSRs: operand values from
 	/// f64_pick / f32_bits_pick (NaNs and improperly boxed singles
@@ -9881,6 +9979,8 @@ mod test_jit_equivalence {
 			fcsr_addr: 0x108,
 			res_flag_addr: 0x110,
 			res_addr_addr: 0x118,
+			res_val_addr: 0,
+			smp: false,
 			tlb: Some(jit::TlbLayout {
 				sets: 512,
 				read_tags: 0x1000,
