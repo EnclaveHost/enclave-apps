@@ -1,6 +1,6 @@
 [package]
 name = "sia-s3"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "An S3 endpoint backed by Sia, served from an attested enclave: objects are encrypted client-side and erasure-coded across Sia hosts through an indexer (sia.enclave.host); the key index lives in the objects' own encrypted metadata, so a restart rebuilds it with nothing stored locally."
 license-file = "../LICENSE"

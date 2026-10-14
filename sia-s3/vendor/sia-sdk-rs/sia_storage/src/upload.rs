@@ -8,7 +8,7 @@ use crate::app_client::{self, SectorPinParams, SlabPinParams};
 use crate::congestion::{InflightController, SamplePermit};
 use crate::encryption::{EncryptionKey, encrypt_shard};
 use crate::erasure_coding::{self, ErasureCoder, ReadSlab, SlabReader};
-use crate::hosts::{HostQueue, InflightGuard, QueueError, RPC_IDLE_TIMEOUT, RPCError};
+use crate::hosts::{HostQueue, InflightGuard, QueueError, rpc_idle_timeout, RPCError};
 use crate::slabs::SlabVersion;
 use crate::task::AbortOnDropHandle;
 use crate::time::{Duration, Instant, sleep};
@@ -404,7 +404,7 @@ impl ShardUpload {
         // Host of the lone attempt in flight, the only one a racer can beat.
         // Cleared once it completes: a failure is penalized by the RPC itself.
         let mut initial = Some(host.host_key());
-        self.spawn_write(&mut tasks, host, RPC_IDLE_TIMEOUT, permit);
+        self.spawn_write(&mut tasks, host, rpc_idle_timeout(), permit);
         let mut eligible = *waiting_rx.borrow_and_update() == 0;
         let mut last_event = Instant::now();
         let race_timeout = self
@@ -431,7 +431,7 @@ impl ShardUpload {
                             if tasks.is_empty() {
                                 let (host, permit) = self.acquire_host(Some(host)).await?;
                                 initial = Some(host.host_key());
-                                self.spawn_write(&mut tasks, host, RPC_IDLE_TIMEOUT, permit);
+                                self.spawn_write(&mut tasks, host, rpc_idle_timeout(), permit);
                             } else {
                                 let failed = host.into_host_key();
                                 initial = initial.filter(|h| *h != failed);
@@ -452,7 +452,7 @@ impl ShardUpload {
                                 "slab {} shard {} racing slow host with {} after {:?}",
                                 self.slab_index, self.shard_index, host.host_key(), elapsed
                             );
-                            self.spawn_write(&mut tasks, host, RPC_IDLE_TIMEOUT, racer);
+                            self.spawn_write(&mut tasks, host, rpc_idle_timeout(), racer);
                         }
                 },
                 _ = async { let _ = waiting_rx.wait_for(|waiting| *waiting == 0).await; }, if !eligible => {
@@ -1417,7 +1417,7 @@ mod tests {
             upload.spawn_write(
                 &mut tasks,
                 host,
-                RPC_IDLE_TIMEOUT,
+                rpc_idle_timeout(),
                 upload.limiter.acquire().await,
             );
             tasks.shutdown().await;
@@ -1433,7 +1433,7 @@ mod tests {
         upload.spawn_write(
             &mut tasks,
             fast_host,
-            RPC_IDLE_TIMEOUT,
+            rpc_idle_timeout(),
             upload.limiter.acquire().await,
         );
         let attempt = tasks.join_next().await.unwrap().unwrap();

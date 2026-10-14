@@ -24,7 +24,22 @@ mod metrics;
 
 /// How long a sector RPC may go without stream progress before the
 /// transport gives up on the host.
-pub(crate) const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long a sector RPC may make no progress before the host counts as failed. 6 s natively. Behind a deep, slow
+/// egress pipeline (an Enclave Shield partition: SOCKS front, hv_sock, bridge, shield-egress, a WireGuard circuit),
+/// 30 sector writes share one uplink and a host's reply only comes once its 4 MiB has drained through every buffer,
+/// so 6 s failed every host ("stream idle") and a PUT ended in "no more hosts available" (sia-s3, 2026-10-14).
+/// `SIA_RPC_IDLE_TIMEOUT_SECS` overrides; wasi defaults to 45 s.
+pub(crate) fn rpc_idle_timeout() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let secs = std::env::var("SIA_RPC_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s: &u64| s > 0)
+            .unwrap_or(if cfg!(target_os = "wasi") { 45 } else { 6 });
+        Duration::from_secs(secs)
+    })
+}
 
 /// Represents a host in the Sia network. The
 /// addresses can be used to connect to the host.

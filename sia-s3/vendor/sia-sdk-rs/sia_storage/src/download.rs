@@ -8,7 +8,7 @@ use std::task::{Poll, ready};
 use crate::congestion::{InflightController, SamplePermit};
 use crate::encryption::{Chacha20Cipher, EncryptionKey, encrypt_recovered_shards};
 use crate::erasure_coding::{self, ErasureCoder};
-use crate::hosts::{Hosts, InflightGuard, RPC_IDLE_TIMEOUT, RPCError};
+use crate::hosts::{Hosts, InflightGuard, rpc_idle_timeout, RPCError};
 use crate::slabs::SlabVersion::{V0, V1};
 use crate::time::{Duration, Instant, sleep};
 use crate::tokens::AccountTokenSource;
@@ -267,7 +267,7 @@ impl SlabRecovery<AwaitingRecovery> {
                     task.sector.root,
                     sector_offset,
                     sector_length,
-                    RPC_IDLE_TIMEOUT,
+                    rpc_idle_timeout(),
                 )
                 .await;
             let elapsed = start.elapsed();
