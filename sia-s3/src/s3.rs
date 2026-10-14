@@ -272,6 +272,15 @@ async fn get(store: &Store, req: &Request, bucket: &str, key: &str, w: &mut TcpS
             return send(w, r, ka).await;
         };
         let size = k.entry.s;
+        // conditional reads: a resumed range must not stitch two versions together
+        let tag_matches = |h: &str| h.split(',').map(|t| t.trim().trim_start_matches("W/").trim_matches('"')).any(|t| t == "*" || t == k.entry.t);
+        if req.header("if-match").is_some_and(|h| !tag_matches(h)) {
+            return send(w, err(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", &resource), ka).await;
+        }
+        if req.header("if-none-match").is_some_and(tag_matches) {
+            let r = Resp { status: 304, headers: vec![("ETag".into(), format!("\"{}\"", k.entry.t))], body: vec![] };
+            return send(w, r, ka).await;
+        }
         let range = match parse_range(req.header("range"), size) {
             Ok(r) => r,
             Err(()) => {

@@ -78,6 +78,7 @@ pub async fn run(sdk: Sdk, bucket: String, manifest: String) -> Result<(), Strin
     let total: u64 = todo.iter().map(|i| i.size).sum();
     eprintln!("[import] {} objects ({:.2} GiB) to import into {bucket}", todo.len(), total as f64 / (1u64 << 30) as f64);
     let client = reqwest_wasi::Client::new();
+    let verbose = std::env::var("IMPORT_VERBOSE").is_ok();
     let started = Instant::now();
     let mut done_bytes = 0u64;
     let mut done = 0usize;
@@ -101,13 +102,20 @@ pub async fn run(sdk: Sdk, bucket: String, manifest: String) -> Result<(), Strin
             let (tx, rx) = tokio::io::duplex(4 << 20);
             let fetcher = fetch(&client, item, tx);
             let adder = pu.add(rx);
+            let t0 = Instant::now();
             let (etag, added) = tokio::join!(fetcher, adder);
             let etag = etag?;
+            if verbose {
+                eprintln!("[import]   {} ({} B) fetched+packed in {:?}", item.key, item.size, t0.elapsed());
+            }
             let n = added.map_err(|e| format!("{}: {e}", item.key))?;
             if n != item.size {
                 return Err(format!("{}: packed {n} bytes, expected {}", item.key, item.size));
             }
             etags.push(etag);
+        }
+        if verbose {
+            eprintln!("[import]   finalizing batch of {} objects ({} B)", batch.len(), bytes);
         }
         let objs = pu.finalize().await.map_err(|e| e.to_string())?;
         if objs.len() != batch.len() {
