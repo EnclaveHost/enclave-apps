@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" font-family="monospace">
+  <rect width="1600" height="400" fill="#0b0e14"/>
+  <radialGradient id="g" cx="20%" cy="0%" r="90%">
+    <stop offset="0%" stop-color="#3fc7a6" stop-opacity=".10"/>
+    <stop offset="60%" stop-color="#3fc7a6" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1600" height="400" fill="url(#g)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#1e2430" stroke-width="4"/>
+
+  <!-- wordmark -->
+  <text x="90" y="170" font-size="84" fill="#3fc7a6">[ s3 <tspan fill="#5a6375">&#8594;</tspan> <tspan fill="#d7dde8" font-weight="bold">sia</tspan> ]</text>
+  <text x="96" y="252" font-size="30" fill="#8a94a6">S3 storage no host can read: sealed in the enclave</text>
+  <text x="96" y="310" font-size="24" fill="#5a6375">spread across independent hosts &#183; any 10 of 30 shards rebuild</text>
+  <text x="96" y="348" font-size="24" fill="#5a6375">S3 (SigV4) &#183; ranges &#183; copy &#183; multipart &#8594; sealed slabs &#8594; Sia</text>
+
+  <!-- the motif: an object leaves the bucket as a slab of shards, each shard
+       on its own host. Top: hosts. Middle: the slab (row 1 data, rows 2-3
+       parity). Bottom: the S3 bucket it came from. -->
+  <!-- shard -> host edges first, so the shapes sit on them -->
+  <g stroke="#5a6375" stroke-width="2" stroke-linecap="round">
+    <line x1="1174" y1="136" x2="1150" y2="70"/>
+    <line x1="1202" y1="136" x2="1183" y2="70"/>
+    <line x1="1230" y1="136" x2="1217" y2="70"/>
+    <line x1="1258" y1="136" x2="1250" y2="70"/>
+    <line x1="1286" y1="136" x2="1283" y2="70"/>
+    <line x1="1314" y1="136" x2="1317" y2="70"/>
+    <line x1="1342" y1="136" x2="1350" y2="70"/>
+    <line x1="1370" y1="136" x2="1383" y2="70"/>
+    <line x1="1398" y1="136" x2="1417" y2="70"/>
+    <line x1="1426" y1="136" x2="1450" y2="70"/>
+  </g>
+  <!-- independent hosts -->
+  <g fill="#10141d" stroke="#8a94a6" stroke-width="3">
+    <circle cx="1150" cy="60" r="10"/><circle cx="1183" cy="60" r="10"/><circle cx="1217" cy="60" r="10"/>
+    <circle cx="1250" cy="60" r="10"/><circle cx="1283" cy="60" r="10"/><circle cx="1317" cy="60" r="10"/>
+    <circle cx="1350" cy="60" r="10"/><circle cx="1383" cy="60" r="10"/><circle cx="1417" cy="60" r="10"/>
+    <circle cx="1450" cy="60" r="10"/>
+  </g>
+  <!-- the slab: 10 x 3 shards -->
+  <g stroke="#3fc7a6" stroke-width="3" stroke-linejoin="round">
+    <g fill="#3fc7a6">
+      <rect x="1163" y="136" width="22" height="22" rx="4"/><rect x="1191" y="136" width="22" height="22" rx="4"/><rect x="1219" y="136" width="22" height="22" rx="4"/><rect x="1247" y="136" width="22" height="22" rx="4"/><rect x="1275" y="136" width="22" height="22" rx="4"/><rect x="1303" y="136" width="22" height="22" rx="4"/><rect x="1331" y="136" width="22" height="22" rx="4"/><rect x="1359" y="136" width="22" height="22" rx="4"/><rect x="1387" y="136" width="22" height="22" rx="4"/><rect x="1415" y="136" width="22" height="22" rx="4"/>
+    </g>
+    <g fill="#10141d">
+      <rect x="1163" y="164" width="22" height="22" rx="4"/><rect x="1191" y="164" width="22" height="22" rx="4"/><rect x="1219" y="164" width="22" height="22" rx="4"/><rect x="1247" y="164" width="22" height="22" rx="4"/><rect x="1275" y="164" width="22" height="22" rx="4"/><rect x="1303" y="164" width="22" height="22" rx="4"/><rect x="1331" y="164" width="22" height="22" rx="4"/><rect x="1359" y="164" width="22" height="22" rx="4"/><rect x="1387" y="164" width="22" height="22" rx="4"/><rect x="1415" y="164" width="22" height="22" rx="4"/>
+      <rect x="1163" y="192" width="22" height="22" rx="4"/><rect x="1191" y="192" width="22" height="22" rx="4"/><rect x="1219" y="192" width="22" height="22" rx="4"/><rect x="1247" y="192" width="22" height="22" rx="4"/><rect x="1275" y="192" width="22" height="22" rx="4"/><rect x="1303" y="192" width="22" height="22" rx="4"/><rect x="1331" y="192" width="22" height="22" rx="4"/><rect x="1359" y="192" width="22" height="22" rx="4"/><rect x="1387" y="192" width="22" height="22" rx="4"/><rect x="1415" y="192" width="22" height="22" rx="4"/>
+    </g>
+  </g>
+  <!-- the object rising out of the bucket -->
+  <line x1="1300" y1="222" x2="1300" y2="250" stroke="#3fc7a6" stroke-width="4" stroke-dasharray="7 6" stroke-linecap="round"/>
+  <!-- the S3 bucket -->
+  <path d="M1130 265 v70 a170 26 0 0 0 340 0 v-70" fill="#10141d" stroke="#2a3242" stroke-width="4"/>
+  <ellipse cx="1300" cy="265" rx="170" ry="26" fill="#151b28" stroke="#2a3242" stroke-width="4"/>
+  <text x="1300" y="322" font-size="22" fill="#6b7488" text-anchor="middle">s3</text>
+</svg>
