@@ -48,6 +48,8 @@ pub struct Mmu {
 	privilege_mode: PrivilegeMode,
 	// risc-box patch (SMP): RAM and every device live on the bus, which all harts' MMUs share
 	bus: BusRef,
+	// which hart this MMU translates for (its index into the CLINT/PLIC/raised arrays)
+	hart: usize,
 
 	/// Address translation can be affected `mstatus` (MPRV, MPP in machine mode)
 	/// then `Mmu` has copy of it.
@@ -109,7 +111,10 @@ pub struct Bus {
 	overlay: Overlay,
 	plic: Plic,
 	clint: Clint,
-	uart: Uart
+	uart: Uart,
+	// interrupt-pending bits devices raised for harts other than 0 (hart 0's go straight into its mip, as they
+	// always have); each hart folds its own word into mip at its next device-service boundary
+	raised: Vec<std::sync::atomic::AtomicU64>
 }
 
 /// A hart's handle on the shared `Bus`. Harts run one at a time on a thread (interleaved SMP), so handing out
@@ -204,8 +209,10 @@ impl Mmu {
 				overlay: Overlay::new(),
 				plic: Plic::new(),
 				clint: Clint::new(),
-				uart: Uart::new(terminal)
+				uart: Uart::new(terminal),
+				raised: vec![std::sync::atomic::AtomicU64::new(0)]
 			}),
+			hart: 0,
 			mstatus: 0,
 			page_cache_enabled: false,
 			fetch_page_cache: FnvHashMap::default(),
@@ -220,6 +227,71 @@ impl Mmu {
 		};
 		mmu.refresh_tlb_meta();
 		mmu
+	}
+
+	/// risc-box patch (SMP): size the per-hart device state for `n` harts. Call before boot.
+	pub fn set_harts(&mut self, n: usize) {
+		let n = n.max(1);
+		let bus = &mut *self.bus;
+		bus.clint.set_harts(n);
+		bus.plic.set_harts(n);
+		bus.raised = (0..n).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+	}
+
+	pub fn harts(&self) -> usize {
+		self.bus.raised.len()
+	}
+
+	/// risc-box patch (SMP): replace the embedded one-hart DTB with the embedded `n`-hart one
+	/// (device/mkdtb-smp.py). False when there is none for `n`.
+	pub fn use_smp_dtb(&mut self, n: usize) -> bool {
+		let content: &[u8] = match n {
+			2 => include_bytes!("./device/dtb-smp2.dtb"),
+			4 => include_bytes!("./device/dtb-smp4.dtb"),
+			_ => return false
+		};
+		self.init_dtb(content.to_vec());
+		true
+	}
+
+	pub fn hart(&self) -> usize {
+		self.hart
+	}
+
+	/// risc-box patch (SMP): an MMU for hart `hart` on the same bus - its own translation state, starting the
+	/// way a fresh one does (bare addressing, machine mode).
+	pub fn new_hart(&self, hart: usize) -> Self {
+		let mut mmu = Mmu {
+			clock: 0,
+			xlen: self.xlen.clone(),
+			ppn: 0,
+			addressing_mode: AddressingMode::None,
+			privilege_mode: PrivilegeMode::Machine,
+			bus: self.bus.clone(),
+			hart: hart,
+			mstatus: 0,
+			page_cache_enabled: false,
+			fetch_page_cache: FnvHashMap::default(),
+			load_page_cache: FnvHashMap::default(),
+			store_page_cache: FnvHashMap::default(),
+			tlb_gen: 1,
+			tlb_tags: [[0; TLB_SETS]; 3],
+			tlb_metas: [[0; TLB_SETS]; 3],
+			tlb_ppns: [[0; TLB_SETS]; 3],
+			tlb_meta_cache: 0
+		};
+		mmu.refresh_tlb_meta();
+		mmu
+	}
+
+	/// risc-box patch (SMP): the pending bits devices raised for this hart since the last call.
+	#[inline(always)]
+	pub fn take_raised(&self) -> u64 {
+		match self.bus.raised.get(self.hart) {
+			Some(w) if w.load(std::sync::atomic::Ordering::Relaxed) != 0 =>
+				w.swap(0, std::sync::atomic::Ordering::AcqRel),
+			_ => 0
+		}
 	}
 
 	/// Updates XLEN, 32-bit or 64-bit
@@ -615,7 +687,7 @@ impl Mmu {
 	// did; devices that only poll queues simply get polled less often.
 	pub fn tick(&mut self, n: u64, mip: &mut u64) {
 		let bus = &mut *self.bus;
-		bus.clint.tick(n, mip);
+		bus.clint.tick(n, mip, &bus.raised);
 		bus.disk.tick(n, &mut bus.memory);
 		bus.net.tick(&mut bus.memory); // risc-box patch
 		bus.input.tick(&mut bus.memory); // risc-box patch
@@ -625,7 +697,7 @@ impl Mmu {
 		bus.uart.tick(n);
 		bus.plic.tick(n, bus.disk.is_interrupting(), bus.net.is_interrupting(),
 			bus.input.is_interrupting(), bus.snd.is_interrupting(),
-			bus.gpu.is_interrupting(), bus.uart.is_interrupting(), mip);
+			bus.gpu.is_interrupting(), bus.uart.is_interrupting(), mip, &bus.raised);
 		self.clock = self.clock.wrapping_add(n);
 	}
 
@@ -1836,6 +1908,32 @@ impl Mmu {
 	}
 
 	/// Apply one section. Ok(false) = not a section this layer knows.
+	/// risc-box patch (SMP): a secondary hart's translation state (the per-hart part of MMU_).
+	pub fn snapshot_translation(&self, s: &mut Ser) {
+		s.u64(self.clock);
+		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
+		s.u64(self.ppn);
+		s.u8(addressing_mode_code(&self.addressing_mode));
+		s.u8(privilege_code(&self.privilege_mode));
+		s.u64(self.mstatus);
+	}
+
+	pub fn restore_translation(&mut self, r: &mut De) -> Result<(), String> {
+		self.clock = r.u64()?;
+		self.xlen = match r.u8()? {
+			32 => Xlen::Bit32,
+			64 => Xlen::Bit64,
+			v => return Err(format!("snapshot: bad xlen {}", v))
+		};
+		self.ppn = r.u64()?;
+		self.addressing_mode = addressing_mode_from(r.u8()?)?;
+		self.privilege_mode = privilege_from(r.u8()?)?;
+		self.mstatus = r.u64()?;
+		self.clear_page_cache();
+		self.tlb_flush();
+		Ok(())
+	}
+
 	pub fn restore_section(&mut self, tag: &[u8; 4], payload: &[u8], stats: &mut snapshot::RestoreStats) -> Result<bool, String> {
 		let mut r = De::new(payload);
 		match tag {

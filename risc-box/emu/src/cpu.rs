@@ -58,7 +58,7 @@ const _CSR_MCYCLE_ADDRESS: u16 = 0xb00;
 const CSR_CYCLE_ADDRESS: u16 = 0xc00;
 const CSR_TIME_ADDRESS: u16 = 0xc01;
 const _CSR_INSERT_ADDRESS: u16 = 0xc02;
-const _CSR_MHARTID_ADDRESS: u16 = 0xf14;
+const CSR_MHARTID_ADDRESS: u16 = 0xf14;
 
 // risc-box patch: retired instructions between device services (see Cpu::tick).
 // The devices this machine has are a timer, a UART and three virtio queues;
@@ -999,6 +999,36 @@ impl Cpu {
 	/// # Arguments
 	/// * `Terminal`
 	pub fn new(terminal: Box<dyn Terminal>) -> Self {
+		Self::with_mmu(Mmu::new(Xlen::Bit64, terminal))
+	}
+
+	/// risc-box patch (SMP): hart `hart` of this machine - the same bus, its own registers, CSRs, caches and
+	/// translation state, reset the way hart 0 is (the caller sets its pc to the same entry point). OpenSBI tells
+	/// harts apart by mhartid and a0.
+	pub fn new_hart(&self, hart: usize) -> Self {
+		let mut cpu = Self::with_mmu(self.mmu.new_hart(hart));
+		cpu.update_xlen(self.xlen.clone());
+		cpu.tick_interval = self.tick_interval;
+		cpu.x[0xa] = hart as i64;
+		cpu.csr[CSR_MHARTID_ADDRESS as usize] = hart as u64;
+		cpu
+	}
+
+	pub fn hart(&self) -> usize {
+		self.mmu.hart()
+	}
+
+	/// risc-box patch (SMP): forget the LR reservation (another hart is about to run, or just ran).
+	pub fn drop_reservation(&mut self) {
+		self.is_reservation_set = false;
+	}
+
+	/// risc-box patch (SMP): (pc, privilege code, parked in WFI, instructions retired).
+	pub fn hart_state(&self) -> (u64, u8, bool, u64) {
+		(self.pc, ::mmu::privilege_code(&self.privilege_mode), self.wfi, self.retired)
+	}
+
+	fn with_mmu(mmu: Mmu) -> Self {
 		let mut cpu = Cpu {
 			clock: 0,
 			retired: 0,
@@ -1009,7 +1039,7 @@ impl Cpu {
 			f: [0.0; 32],
 			pc: 0,
 			csr: [0; CSR_CAPACITY],
-			mmu: Mmu::new(Xlen::Bit64, terminal),
+			mmu: mmu,
 			reservation: 0,
 			is_reservation_set: false,
 			_dump_flag: false,
@@ -1448,7 +1478,12 @@ impl Cpu {
 			if self.since_service >= self.tick_interval {
 				let served = self.since_service;
 				self.since_service = 0;
-				self.mmu.tick(served, &mut self.csr[CSR_MIP_ADDRESS as usize]);
+				// hart 0 services the devices (they raise the other harts' bits); every other hart folds in
+				// what was raised for it
+				match self.mmu.hart() {
+					0 => self.mmu.tick(served, &mut self.csr[CSR_MIP_ADDRESS as usize]),
+					_ => self.csr[CSR_MIP_ADDRESS as usize] |= self.mmu.take_raised()
+				}
 				self.check_interrupt = false;
 				self.handle_interrupt(self.pc);
 				#[cfg(feature = "tier2")]
@@ -4057,6 +4092,33 @@ impl Cpu {
 
 	fn snapshot_cpu(&self, s: &mut ::snapshot::Ser) {
 		let at = s.begin_section(b"CPU_");
+		self.write_cpu_fields(s);
+		s.end_section(at);
+	}
+
+	/// risc-box patch (SMP): hart h > 0 as one section "HRT<h>": its CPU_ fields, then its MMU's translation
+	/// state. The bus (RAM, devices) is hart 0's to write.
+	pub fn snapshot_hart(&self, s: &mut ::snapshot::Ser) {
+		let at = s.begin_section(&Self::hart_tag(self.hart()));
+		self.write_cpu_fields(s);
+		self.mmu.snapshot_translation(s);
+		s.end_section(at);
+	}
+
+	pub fn hart_tag(hart: usize) -> [u8; 4] {
+		[b'H', b'R', b'T', b'0' + (hart as u8 % 10)]
+	}
+
+	pub fn restore_hart(&mut self, payload: &[u8]) -> Result<(), String> {
+		let mut r = ::snapshot::De::new(payload);
+		let xlen = self.read_cpu_fields(&mut r)?;
+		self.mmu.restore_translation(&mut r)?;
+		r.finish("HRT")?;
+		self.after_restore(xlen);
+		Ok(())
+	}
+
+	fn write_cpu_fields(&self, s: &mut ::snapshot::Ser) {
 		s.u64(self.clock);
 		s.u8(match self.xlen { Xlen::Bit32 => 32, Xlen::Bit64 => 64 });
 		s.u8(::mmu::privilege_code(&self.privilege_mode));
@@ -4076,7 +4138,6 @@ impl Cpu {
 		s.bool(self.is_reservation_set);
 		s.u64(self.since_service);
 		s.bool(self.check_interrupt);
-		s.end_section(at);
 	}
 
 	/// risc-box patch (snapshot): Ok(false) = not a section this layer knows.
@@ -4085,6 +4146,13 @@ impl Cpu {
 			return self.mmu.restore_section(tag, payload, stats);
 		}
 		let mut r = ::snapshot::De::new(payload);
+		let xlen = self.read_cpu_fields(&mut r)?;
+		r.finish("CPU_")?;
+		self.after_restore(xlen);
+		Ok(true)
+	}
+
+	fn read_cpu_fields(&mut self, r: &mut ::snapshot::De) -> Result<Xlen, String> {
 		self.clock = r.u64()?;
 		let xlen = match r.u8()? {
 			32 => Xlen::Bit32,
@@ -4111,7 +4179,10 @@ impl Cpu {
 		self.is_reservation_set = r.bool()?;
 		self.since_service = r.u64()?;
 		self.check_interrupt = r.bool()?;
-		r.finish("CPU_")?;
+		Ok(xlen)
+	}
+
+	fn after_restore(&mut self, xlen: Xlen) {
 		// derived state: mask + the MMU's copies of what translation depends on
 		self.update_xlen(xlen);
 		self.mmu.update_privilege_mode(self.privilege_mode.clone());
@@ -4120,7 +4191,6 @@ impl Cpu {
 		for h in self.block_heads.iter_mut() {
 			*h = BlockHead::EMPTY;
 		}
-		Ok(true)
 	}
 
 	/// Returns mutable `Mmu`

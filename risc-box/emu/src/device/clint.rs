@@ -4,8 +4,10 @@ use cpu::{MIP_MSIP, MIP_MTIP};
 /// for the detail.
 pub struct Clint {
 	clock: u64,
-	msip: u32,
-	mtimecmp: u64,
+	// risc-box patch (SMP): one msip/mtimecmp per hart (the SiFive CLINT layout: msip[h] at +4h, mtimecmp[h]
+	// at 0x4000 + 8h); mtime is shared
+	msip: Vec<u32>,
+	mtimecmp: Vec<u64>,
 	mtime: u64,
 	// risc-box patch: see `set_wall_clock`.
 	wall: Option<Wall>
@@ -34,8 +36,8 @@ impl Clint {
 	pub fn new() -> Self {
 		Clint {
 			clock: 0,
-			msip: 0,
-			mtimecmp: 0,
+			msip: vec![0],
+			mtimecmp: vec![0],
 			mtime: 0, // @TODO: Should be bound to csr time register
 			wall: None
 		}
@@ -61,6 +63,12 @@ impl Clint {
 		self.mtime
 	}
 
+	/// risc-box patch (SMP): how many harts this CLINT serves.
+	pub fn set_harts(&mut self, n: usize) {
+		self.msip.resize(n.max(1), 0);
+		self.mtimecmp.resize(n.max(1), 0);
+	}
+
 	pub fn set_wall_clock(&mut self, on: bool) {
 		self.wall = match on {
 			true => Some(Wall {
@@ -81,7 +89,7 @@ impl Clint {
 	// risc-box patch: `n` instructions have retired since the last call. mtime
 	// advances by exactly that, so the guest's clock keeps the same rate it
 	// had when this ran every instruction — only its granularity changes.
-	pub fn tick(&mut self, n: u64, mip: &mut u64) {
+	pub fn tick(&mut self, n: u64, mip: &mut u64, raised: &[std::sync::atomic::AtomicU64]) {
 		self.clock = self.clock.wrapping_add(n);
 		match self.wall {
 			// risc-box patch: wall-clock mode. mtime is the host's monotonic
@@ -98,12 +106,22 @@ impl Clint {
 			None => self.mtime = self.mtime.wrapping_add(n)
 		}
 
-		if (self.msip & 1) != 0 {
-			*mip |= MIP_MSIP;
-		}
-
-		if self.mtimecmp > 0 && self.mtime >= self.mtimecmp {
-			*mip |= MIP_MTIP;
+		// hart 0's bits go straight into the calling hart's mip, as they always have; the other harts' are
+		// raised for them to fold in at their own next service (see Cpu::run)
+		for h in 0..self.msip.len() {
+			let mut bits = 0;
+			if (self.msip[h] & 1) != 0 {
+				bits |= MIP_MSIP;
+			}
+			if self.mtimecmp[h] > 0 && self.mtime >= self.mtimecmp[h] {
+				bits |= MIP_MTIP;
+			}
+			if bits != 0 {
+				match h {
+					0 => *mip |= bits,
+					_ => { raised[h].fetch_or(bits, std::sync::atomic::Ordering::AcqRel); }
+				}
+			}
 		}
 	}
 
@@ -114,43 +132,21 @@ impl Clint {
 	pub fn load(&self, address: u64) -> u8 {
 		//println!("CLINT Load AD:{:X}", address);
 		match address {
-			// MSIP register 4 bytes
-			0x02000000 => {
-				(self.msip & 0xff) as u8
+			// MSIP registers, 4 bytes per hart
+			0x02000000..=0x02003fff => {
+				let h = ((address - 0x02000000) >> 2) as usize;
+				match self.msip.get(h) {
+					Some(v) => (v >> ((address & 3) * 8)) as u8,
+					None => 0
+				}
 			},
-			0x02000001 => {
-				((self.msip >> 8) & 0xff) as u8
-			},
-			0x02000002 => {
-				((self.msip >> 16) & 0xff) as u8
-			},
-			0x02000003 => {
-				((self.msip >> 24) & 0xff) as u8
-			},
-			// MTIMECMP Registers 8 bytes
-			0x02004000 => {
-				self.mtimecmp as u8
-			},
-			0x02004001 => {
-				(self.mtimecmp >> 8) as u8
-			},
-			0x02004002 => {
-				(self.mtimecmp >> 16) as u8
-			},
-			0x02004003 => {
-				(self.mtimecmp >> 24) as u8
-			},
-			0x02004004 => {
-				(self.mtimecmp >> 32) as u8
-			},
-			0x02004005 => {
-				(self.mtimecmp >> 40) as u8
-			},
-			0x02004006 => {
-				(self.mtimecmp >> 48) as u8
-			},
-			0x02004007 => {
-				(self.mtimecmp >> 56) as u8
+			// MTIMECMP registers, 8 bytes per hart
+			0x02004000..=0x0200bff7 => {
+				let h = ((address - 0x02004000) >> 3) as usize;
+				match self.mtimecmp.get(h) {
+					Some(v) => (v >> ((address & 7) * 8)) as u8,
+					None => 0
+				}
 			},
 			0x0200bff8 => {
 				self.mtime as u8
@@ -188,34 +184,20 @@ impl Clint {
 	pub fn store(&mut self, address: u64, value: u8) {
 		//println!("CLINT Store AD:{:X} VAL:{:X}", address, value);
 		match address {
-			// MSIP register 4 bytes. Upper 31 bits are hardwired to zero.
-			0x02000000 => {
-				self.msip = (self.msip & !0x1) | ((value & 1) as u32);
+			// MSIP registers, 4 bytes per hart. Upper 31 bits are hardwired to zero.
+			0x02000000..=0x02003fff => {
+				let h = ((address - 0x02000000) >> 2) as usize;
+				if (address & 3) == 0 && h < self.msip.len() {
+					self.msip[h] = (self.msip[h] & !0x1) | ((value & 1) as u32);
+				}
 			},
-			// MTIMECMP Registers 8 bytes
-			0x02004000 => {
-				self.mtimecmp = (self.mtimecmp & !0xff) | (value as u64);
-			},
-			0x02004001 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 8)) | ((value as u64) << 8);
-			},
-			0x02004002 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 16)) | ((value as u64) << 16);
-			},
-			0x02004003 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 24)) | ((value as u64) << 24);
-			},
-			0x02004004 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 32)) | ((value as u64) << 32);
-			},
-			0x02004005 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 40)) | ((value as u64) << 40);
-			},
-			0x02004006 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 48)) | ((value as u64) << 48);
-			},
-			0x02004007 => {
-				self.mtimecmp = (self.mtimecmp & !(0xff << 56)) | ((value as u64) << 56);
+			// MTIMECMP registers, 8 bytes per hart
+			0x02004000..=0x0200bff7 => {
+				let h = ((address - 0x02004000) >> 3) as usize;
+				if h < self.mtimecmp.len() {
+					let pos = (address & 7) * 8;
+					self.mtimecmp[h] = (self.mtimecmp[h] & !(0xff << pos)) | ((value as u64) << pos);
+				}
 			},
 			// MTIME registers 8 bytes
 			0x0200bff8 => {
@@ -261,7 +243,7 @@ impl Clint {
 	/// wakes on `mtime >= mtimecmp` and on nothing else, so these two numbers are
 	/// the difference between "idle" and "never coming back".
 	pub fn read_mtimecmp(&self) -> u64 {
-		self.mtimecmp
+		self.mtimecmp[0]
 	}
 	pub fn is_wall(&self) -> bool {
 		self.wall.is_some()
@@ -274,10 +256,15 @@ use snapshot::{De, Ser};
 impl Clint {
 	pub fn snapshot(&self, w: &mut Ser) {
 		w.u64(self.clock);
-		w.u32(self.msip);
-		w.u64(self.mtimecmp);
+		w.u32(self.msip[0]);
+		w.u64(self.mtimecmp[0]);
 		w.u64(self.mtime);
 		w.bool(self.wall.is_some());
+		// risc-box patch (SMP): the other harts' registers follow; a one-hart machine writes exactly the old format
+		for h in 1..self.msip.len() {
+			w.u32(self.msip[h]);
+			w.u64(self.mtimecmp[h]);
+		}
 	}
 
 	/// The clock source (instruction-driven or wall) stays whatever THIS
@@ -286,10 +273,14 @@ impl Clint {
 	/// snapshot's value on the next sample.
 	pub fn restore(&mut self, r: &mut De) -> Result<(), String> {
 		self.clock = r.u64()?;
-		self.msip = r.u32()?;
-		self.mtimecmp = r.u64()?;
+		self.msip[0] = r.u32()?;
+		self.mtimecmp[0] = r.u64()?;
 		self.mtime = r.u64()?;
 		let _was_wall = r.bool()?;
+		for h in 1..self.msip.len() {
+			self.msip[h] = r.u32()?;
+			self.mtimecmp[h] = r.u64()?;
+		}
 		if self.wall.is_some() {
 			self.wall = Some(Wall {
 				start: std::time::Instant::now(),

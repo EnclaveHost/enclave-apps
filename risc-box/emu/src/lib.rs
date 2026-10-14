@@ -112,6 +112,13 @@ const REQUIRED_SECTIONS: [&[u8; 4]; 14] = [
 pub struct Emulator {
 	cpu: Cpu,
 
+	// risc-box patch (SMP): harts 1.. (hart 0 is `cpu`), sharing its bus; empty on a one-hart machine
+	harts: Vec<Cpu>,
+	// instructions each hart runs before the next takes the thread (interleaved SMP)
+	slice: u64,
+	// setup_dtb was called: set_harts leaves the DTB alone (the caller's describes the cpus)
+	dtb_given: bool,
+
 	// risc-box patch: per-machine RAM override (bytes); None = PROGRAM_MEMORY_CAPACITY.
 	ram_bytes: Option<u64>,
 
@@ -137,6 +144,9 @@ impl Emulator {
 	pub fn new(terminal: Box<dyn Terminal>) -> Self {
 		Emulator {
 			cpu: Cpu::new(terminal),
+			harts: Vec::new(),
+			slice: 4096,
+			dtb_given: false,
 
 			ram_bytes: None,
 
@@ -221,7 +231,50 @@ impl Emulator {
 	/// WFI-parked guest consumes the batch without spinning. Embedders'
 	/// tick-batches should call this instead of tick() in a loop.
 	pub fn run_n(&mut self, n: u64) {
-		self.cpu.run(n);
+		if self.harts.is_empty() {
+			self.cpu.run(n);
+			return;
+		}
+		// Interleaved SMP: each hart runs a slice in turn; `n` is hart 0's share, the device clock's driver.
+		// A hart's LR reservation does not survive another hart running (that hart may have stored to the
+		// reserved address), so it is dropped at the start of each slice: an SC across a switch fails, which
+		// the ISA allows and every LR/SC loop retries.
+		let mut left = n;
+		while left > 0 {
+			let s = left.min(self.slice);
+			self.cpu.drop_reservation();
+			self.cpu.run(s);
+			for h in self.harts.iter_mut() {
+				h.drop_reservation();
+				h.run(s);
+			}
+			left -= s;
+		}
+	}
+
+	/// risc-box patch (SMP): make this a machine of `n` harts. Call before `setup_program` (or `restore`): the
+	/// DTB must describe the same number of cpus.
+	pub fn set_harts(&mut self, n: usize) {
+		let n = n.max(1);
+		if n > 1 && !self.dtb_given && !self.cpu.get_mut_mmu().use_smp_dtb(n) {
+			eprintln!("[emu] no built-in DTB for {} harts; the guest will see one cpu", n);
+		}
+		self.cpu.get_mut_mmu().set_harts(n);
+		self.harts = (1..n).map(|h| self.cpu.new_hart(h)).collect();
+	}
+
+	pub fn harts(&self) -> usize {
+		1 + self.harts.len()
+	}
+
+	/// risc-box patch (SMP): instructions per hart per turn on the shared thread.
+	pub fn set_hart_slice(&mut self, n: u64) {
+		self.slice = n.max(64);
+	}
+
+	/// risc-box patch (SMP): (pc, privilege, wfi, retired) of each hart, for diagnosis.
+	pub fn hart_states(&self) -> Vec<(u64, u8, bool, u64)> {
+		std::iter::once(&self.cpu).chain(self.harts.iter()).map(|c| c.hart_state()).collect()
 	}
 
 	/// risc-box patch (blockstats feature): coverage histogram dump.
@@ -311,6 +364,13 @@ impl Emulator {
 		}
 
 		self.cpu.update_pc(header.e_entry);
+		for h in self.harts.iter_mut() {
+			h.update_xlen(match header.e_width {
+				32 => Xlen::Bit32,
+				_ => Xlen::Bit64
+			});
+			h.update_pc(header.e_entry);
+		}
 	}
 
 	/// Loads symbols of program and adds them to `symbol_map`.
@@ -413,6 +473,7 @@ impl Emulator {
 	}
 
 	pub fn setup_dtb(&mut self, content: Vec<u8>) {
+		self.dtb_given = true;
 		self.cpu.get_mut_mmu().init_dtb(content);
 	}
 
@@ -592,6 +653,9 @@ impl Emulator {
 	#[cfg(feature = "aot")]
 	pub fn aot_enable(&mut self) {
 		self.cpu.aot_enable();
+		for h in self.harts.iter_mut() {
+			h.aot_enable();
+		}
 	}
 
 	#[cfg(feature = "aot")]
@@ -666,6 +730,9 @@ impl Emulator {
 		s.str(env!("CARGO_PKG_VERSION"));
 		s.end_section(at);
 		let stats = self.cpu.snapshot_into(&mut s, level);
+		for h in self.harts.iter() {
+			h.snapshot_hart(&mut s);
+		}
 		let bytes = s.buf.len();
 		(s.buf, SnapshotInfo {
 			bytes,
@@ -766,7 +833,18 @@ impl Emulator {
 		self.cpu.get_mut_mmu().adopt_ram(&image.ram);
 		let mut seen: Vec<[u8; 4]> = vec![*b"RAM_"];
 		let mut stats = snapshot::RestoreStats::default();
+		let mut harts_seen = 0;
 		for (tag, payload) in image.sections.iter() {
+			if tag[..3] == *b"HRT" {
+				let h = (tag[3].wrapping_sub(b'0')) as usize;
+				match self.harts.get_mut(h.wrapping_sub(1)) {
+					Some(c) => c.restore_hart(payload)?,
+					None => return Err(format!("snapshot has hart {} but this machine has {} hart(s)", h, 1 + self.harts.len()))
+				}
+				harts_seen += 1;
+				seen.push(*tag);
+				continue;
+			}
 			if !self.cpu.restore_section(tag, payload, &mut stats)? {
 				return Err(format!(
 					"snapshot: unknown section {:?} (written by a newer emulator?)",
@@ -774,6 +852,9 @@ impl Emulator {
 				));
 			}
 			seen.push(*tag);
+		}
+		if harts_seen != self.harts.len() {
+			return Err(format!("snapshot has {} hart(s) but this machine has {}", 1 + harts_seen, 1 + self.harts.len()));
 		}
 		for req in REQUIRED_SECTIONS.iter() {
 			if !seen.contains(req) {
@@ -807,6 +888,9 @@ impl Emulator {
 		// delta is small
 		let mut s = Ser::new();
 		self.cpu.snapshot_into_no_ram(&mut s, 1);
+		for h in self.harts.iter() {
+			h.snapshot_hart(&mut s);
+		}
 		let secs = snapshot::sections_unframed(&s.buf);
 		let ram = self.cpu.get_mut_mmu().share_ram();
 		let pages_total = (ram.len() + snapshot::PAGE - 1) / snapshot::PAGE;
