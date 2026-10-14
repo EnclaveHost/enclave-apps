@@ -10,6 +10,7 @@
 
 mod config;
 mod http;
+mod import;
 mod s3;
 mod sigv4;
 mod store;
@@ -129,6 +130,30 @@ fn main() {
     };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     let local = tokio::task::LocalSet::new();
+
+    // `sia-s3 import <bucket> <manifest.json>`: bulk-load objects, then exit
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("import") {
+        let (Some(bucket), Some(manifest)) = (args.get(2).cloned(), args.get(3).cloned()) else {
+            eprintln!("usage: sia-s3 import <bucket> <manifest.json>");
+            std::process::exit(2);
+        };
+        let res = local.block_on(&rt, async move {
+            let sdk = Builder::new(cfg.indexer.as_str(), META)
+                .map_err(|e| e.to_string())?
+                .connected(&AppKey::import(cfg.app_key))
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the app key is not authorized on the indexer")?;
+            import::run(sdk, bucket, manifest).await
+        });
+        if let Err(e) = res {
+            eprintln!("[import] FAILED: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     local.block_on(&rt, async move {
         let app = Rc::new(App {
             store: Default::default(),

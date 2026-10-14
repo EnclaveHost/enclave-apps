@@ -1,51 +1,91 @@
-# sia-s3 (spike)
+# sia-s3
 
-Goal: an enclave app that serves an S3 endpoint backed by Sia (via the Sia
-Storage indexer), so s3-ipfs-adapter and other apps can move off R2 by changing
-only their endpoint.
+An S3 endpoint backed by [Sia](https://sia.tech), served from an attested enclave. Objects are encrypted and
+erasure-coded **inside the enclave** by the Sia SDK (10 data + 20 parity shards, any 10 of 30 hosts recover an
+object) and stored on independent Sia hosts through an indexer, by default the platform's own
+[`https://sia.enclave.host`](indexd/README.md). Existing S3 clients work unchanged: point them at this app.
 
-Step 1, the feasibility spike, lives in `spike/`. Its question: does the Sia
-Rust SDK (`sia_storage`) run as a wasm32-wasip2 component?
+The key index lives in the objects' own sealed metadata, so the app keeps **no local state**. A restart rebuilds
+the index from the indexer's object feed.
 
-## SDK patch
+## Config
 
-`sia-sdk-rs-wasip2.patch` applies to SiaFoundation/sia-sdk-rs at fbee7d9. The
-SDK treats every wasm32 target as a browser (WebTransport, fetch); the patch
-changes that as follows:
+`ENCLAVE_CONFIG` (or `SIAS3_CONFIG` locally), JSON. `$NAME` string values resolve from the environment, which
+is how deployment secrets arrive:
 
-- **Browser-only code** is gated to `wasm32-unknown-unknown`. wasip2 takes the
-  native SiaMux-over-TCP path instead, on tokio + wasi:sockets.
-- **reqwest_wasi** is a new crate that provides the subset of the reqwest API
-  the SDK uses. It speaks HTTP/1.1 over tokio + rustls(ring) and is aliased in
-  as `reqwest` on `target_os = "wasi"`.
-- **Egress:** `reqwest_wasi::net::connect` is the single dialer. When
-  `ENCLAVE_EGRESS` is set it goes through that SOCKS5 front, passing host
-  names unresolved; otherwise it connects directly, resolving names inline.
-- **No threads on wasip2:** `maybe_spawn_blocking` runs inline on all wasm.
-  The memory budget is fixed at 256 MiB, overridable with
-  `SIA_MEMORY_BUDGET`.
-
-Build with `RUSTFLAGS="--cfg tokio_unstable"`, because tokio gates `net` on
-wasm.
-
-```
-git clone https://github.com/SiaFoundation/sia-sdk-rs ../../sia-sdk-rs   # sibling of this worktree's parent
-(cd ../../sia-sdk-rs && git checkout fbee7d9 && git am <this dir>/sia-sdk-rs-wasip2.patch)
-cd spike && RUSTFLAGS="--cfg tokio_unstable" cargo build --release --target wasm32-wasip2
+```json
+{
+  "indexer": "https://sia.enclave.host",
+  "appKey": "$SIA_APP_KEY",
+  "region": "auto",
+  "buckets": ["ipfs"],
+  "credentials": [{ "accessKeyId": "$S3_ACCESS_KEY_ID", "secretAccessKey": "$S3_SECRET_ACCESS_KEY" }]
+}
 ```
 
-## Results (2026-10-13, wasmtime 49.0.1)
+- `appKey`: the 32-byte (hex) seed of an app key registered on the indexer (`POST /api/apps/register` on
+  indexd's admin API, with a connect key whose quota covers the data). It encrypts everything; losing it loses
+  the data, and leaking it exposes it.
+- `buckets`: fixed by config (CreateBucket on an existing one is a no-op).
+- `credentials`: every request must be SigV4-signed with one of these.
+- Optional: `maxBodyBytes` (64 MiB; single PUT / part cap), `compactMaxObjectBytes` (8 MiB),
+  `compactEverySecs` (1800).
 
-| check | result |
-|---|---|
-| SDK builds for wasm32-wasip2 | PASS (355 KB component, wasi 0.2 imports only) |
-| HTTPS to the hosted indexer (sia.storage) via reqwest_wasi | PASS, 427 ms, approval URL issued |
-| SiaMux handshake + host key check + RHP4 settings, 20 real hosts | PASS 20/20, 0.2-2 s each |
-| Same through a SOCKS5 user/pass front (ENCLAVE_EGRESS shape) | PASS 6/6; names passed unresolved; wrong token fails closed |
-| upload / pin / ranged download / object_events / delete | BLOCKED: waiting for the indexer approval (sign-in to a sia.storage account) |
-| Through the real platform egress (a deployed test app) | NOT RUN; egress code blocks only port 25, Sia hosts use 9984 |
+## S3 surface
 
+PUT/GET/HEAD/DELETE object, ranges (`bytes=a-b`, `a-`, `-n`), CopyObject (`x-amz-copy-source`),
+ListObjectsV2 and v1 (prefix, delimiter, max-keys, continuation-token, start-after), DeleteObjects,
+multipart (create, upload part, complete, abort, list uploads), ListBuckets, HeadBucket, GetBucketLocation.
+Auth is SigV4 header auth with a hex `x-amz-content-sha256` (verified against the body) or `UNSIGNED-PAYLOAD`.
+Not supported: presigned URLs, aws-chunked streaming uploads, ACLs, versioning, tagging. `GET /healthz` is
+unauthenticated and reports counts only.
+
+## How keys map to Sia objects
+
+- PUT uploads the body as one Sia object whose metadata names the key, size, ETag (MD5) and mtime.
+- CopyObject adds an entry to the source object's metadata, so no data moves. DELETE removes an entry, and an
+  object left serving nothing is deleted.
+- Multipart parts are objects tagged with their upload. Complete writes the key on part 1 and lists the
+  other parts in order.
+- The indexer refuses objects without data, so there are no standalone manifest objects.
+
+**Small objects** cost a full slab when uploaded alone (4 MiB sectors on 30 hosts, about 120 MiB of upload
+traffic and paid storage), and a lone small PUT takes on the order of 45 s. The **compactor** repacks
+single-object keys under `compactMaxObjectBytes` into shared slabs after five minutes, then prunes the old
+slabs. Reads are fast (a 1 MB range in about 0.6 s from 30 hosts).
+
+## Bulk import
+
+```bash
+sia-s3 import <bucket> manifest.json   # manifest: [{"key","size","url"}]
 ```
-wasmtime run -S inherit-network -S allow-ip-name-lookup --dir KEYS::/keys \
-  target/wasm32-wasip2/release/sia-spike.wasm connect|test|settings /keys/<file>
+
+The import fetches each URL in 32 MiB ranges, streams it into packed uploads (512 MiB batches), and pins with
+the same metadata the server writes. Re-running skips keys already present with the same size. A running
+server sees imported keys after its next index load (restart it).
+
+## Build and run
+
+```bash
+cargo build --release       # .cargo/config.toml targets wasm32-wasip2 with --cfg tokio_unstable
+wasmtime run -S inherit-network -S allow-ip-name-lookup \
+  --env 'ENCLAVE_PORTS=http:8000=18490' --env SIA_APP_KEY --env 'ENCLAVE_CONFIG={...}' \
+  target/wasm32-wasip2/release/sia-s3.wasm
+S3CHECK_ENDPOINT=http://127.0.0.1:18490 S3CHECK_AK=... S3CHECK_SK=... python3 -I scripts/s3check.py test
 ```
+
+Deploy on enclave.host CPU-only with port `http:8000`, egress enabled (the SDK dials the indexer and Sia hosts
+on their announced ports, through the deployment's SOCKS front), and the secrets above.
+
+## Vendored SDK
+
+`vendor/sia-sdk-rs` is SiaFoundation/sia-sdk-rs at the commit in `UPSTREAM`, plus the wasip2 patch: browser-only
+code is gated to `wasm32-unknown-unknown`, wasip2 uses the native SiaMux transport over wasi:sockets,
+`reqwest_wasi` replaces reqwest's browser backend, every dial goes through `ENCLAVE_EGRESS` when set, and
+blocking work runs inline (no threads on wasip2). MIT licensed, as upstream.
+
+## History
+
+`spike/` is the 2026-10-13 wasip2 feasibility test (SDK on wasip2, indexer over TLS, SiaMux to 20/20 hosts, the
+SOCKS egress path). Its results are in this file's history (commit 13dce6b). `sia-sdk-rs-wasip2.patch` is that
+patch as one file. `vendor/` carries it applied.
