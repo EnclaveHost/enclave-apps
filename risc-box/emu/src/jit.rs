@@ -3451,6 +3451,21 @@ pub mod verb {
 	pub const HOST_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 	pub const HOST_MAX_ATTEMPTS: u32 = 1024;
 	pub const HOST_MAX_MODULES: u32 = 256;
+
+	/// The host limits this policy assumes: the production runtime's, unless RISC_JIT_HOST_MODULES / _MB / _ATTEMPTS
+	/// say the runtime underneath allows more (experiments on a runtime built with larger codegen limits).
+	fn host_limit(key: &str, default: u64) -> u64 {
+		std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+	}
+	fn host_max_modules() -> u32 {
+		host_limit("RISC_JIT_HOST_MODULES", HOST_MAX_MODULES as u64).min(u32::MAX as u64) as u32
+	}
+	fn host_max_attempts() -> u32 {
+		host_limit("RISC_JIT_HOST_ATTEMPTS", HOST_MAX_ATTEMPTS as u64).min(u32::MAX as u64) as u32
+	}
+	fn host_max_input_bytes() -> u64 {
+		host_limit("RISC_JIT_HOST_MB", HOST_MAX_INPUT_BYTES >> 20).saturating_mul(1 << 20)
+	}
 	/// set/codegen.c's unwired stub: no host verb behind the import.
 	pub const UNAVAILABLE: i64 = -64;
 
@@ -3631,8 +3646,8 @@ pub mod verb {
 			return Got::Refused;
 		}
 		let modules = s.stats.compiled + s.stats.failed;
-		if modules >= p.module_budget.min(HOST_MAX_MODULES)
-			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
+		if modules >= p.module_budget.min(host_max_modules())
+			|| s.stats.attempts >= p.attempt_budget.min(host_max_attempts())
 		{
 			s.stats.refused_budget += 1;
 			return Got::Refused;
@@ -3647,9 +3662,9 @@ pub mod verb {
 			s.cache.insert(k, None);
 			return Got::TooLarge;
 		}
-		if modules >= p.module_budget.min(HOST_MAX_MODULES)
-			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
-			|| s.stats.bytes + module.len() as u64 > p.byte_budget.min(HOST_MAX_INPUT_BYTES)
+		if modules >= p.module_budget.min(host_max_modules())
+			|| s.stats.attempts >= p.attempt_budget.min(host_max_attempts())
+			|| s.stats.bytes + module.len() as u64 > p.byte_budget.min(host_max_input_bytes())
 		{
 			s.stats.refused_budget += 1;
 			return Got::Refused;
@@ -3713,14 +3728,14 @@ pub mod verb {
 		let p = &s.policy;
 		let modules = s.stats.compiled + s.stats.failed;
 		if s.stats.disabled.is_some()
-			|| modules >= p.module_budget.min(HOST_MAX_MODULES)
-			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
+			|| modules >= p.module_budget.min(host_max_modules())
+			|| s.stats.attempts >= p.attempt_budget.min(host_max_attempts())
 		{
 			return None;
 		}
 		Some(Bar {
 			heat_mult: s.heat_mult(),
-			bytes_left: p.byte_budget.min(HOST_MAX_INPUT_BYTES).saturating_sub(s.stats.bytes),
+			bytes_left: p.byte_budget.min(host_max_input_bytes()).saturating_sub(s.stats.bytes),
 			max_module_bytes: p.max_module_bytes.min(HOST_MAX_MODULE_BYTES),
 		})
 	}

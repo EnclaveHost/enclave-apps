@@ -1513,6 +1513,13 @@ fn jit_enable(emu: &mut Emulator) {
         p.max_pass_bytes = (v as usize).max(4096);
     }
     // the verb's lifetime budget (modules, MiB submitted); defaults fit the production host's limits
+    // formation throughput: compiles per formation pass, and the heat sampling duty cycle (1 window in 2^n recorded)
+    if let Some(v) = num("RISC_JIT_PER_PASS") {
+        p.max_compiles_per_pass = v.clamp(1, 4096) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_SAMPLE_PERIOD") {
+        p.sample_period = v.min(16) as u32;
+    }
     if let Some(v) = num("RISC_JIT_BUDGET_MODULES") {
         p.budget_modules = v.min(u32::MAX as u64) as u32;
     }
