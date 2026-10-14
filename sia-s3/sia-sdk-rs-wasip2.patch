@@ -1,0 +1,1096 @@
+From e1d1ebe097835b728108dd809b7bc2e4cbcf801c Mon Sep 17 00:00:00 2001
+From: Steven Batchelor <srbatchelor@ovgl.org>
+Date: Tue, 13 Oct 2026 18:21:19 -0700
+Subject: [PATCH] sia_storage on wasm32-wasip2: native SiaMux path over
+ wasi:sockets, reqwest_wasi shim, inline blocking work
+
+---
+ reqwest_wasi/Cargo.toml            |  21 ++
+ reqwest_wasi/src/lib.rs            | 528 +++++++++++++++++++++++++++++
+ sia_core/Cargo.toml                |   8 +-
+ sia_core/src/lib.rs                |   4 +-
+ sia_storage/Cargo.toml             |  16 +-
+ sia_storage/src/app_client/http.rs |   2 +-
+ sia_storage/src/builder.rs         |   2 +-
+ sia_storage/src/compat/mod.rs      |  18 +-
+ sia_storage/src/download.rs        |   4 +-
+ sia_storage/src/lib.rs             |  27 +-
+ sia_storage/src/rhp4.rs            |  32 +-
+ sia_storage/src/rhp4/pool.rs       |   4 +-
+ sia_storage/src/rhp4/siamux.rs     |  19 ++
+ sia_storage/src/sdk.rs             |   2 +-
+ sia_storage/src/shared_sdk.rs      |   2 +-
+ sia_storage/src/upload.rs          |   6 +-
+ 16 files changed, 642 insertions(+), 53 deletions(-)
+ create mode 100644 reqwest_wasi/Cargo.toml
+ create mode 100644 reqwest_wasi/src/lib.rs
+
+diff --git a/reqwest_wasi/Cargo.toml b/reqwest_wasi/Cargo.toml
+new file mode 100644
+index 0000000..9d5424e
+--- /dev/null
++++ b/reqwest_wasi/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "reqwest_wasi"
++version = "0.1.0"
++edition = "2024"
++license = "MIT"
++description = "The subset of the reqwest API sia_storage uses, over tokio + rustls on wasm32-wasip2, dialing through an enclave SOCKS5 egress front when ENCLAVE_EGRESS is set"
++publish = false
++
++[dependencies]
++http = "1"
++url = "2.5.8"
++bytes = "1"
++serde = "1"
++serde_json = "1"
++serde_urlencoded = "0.7"
++httparse = "1"
++tokio = { version = "1", features = ["io-util", "net", "time", "rt"] }
++tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
++rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
++webpki-roots = "1"
++log = "0.4"
+diff --git a/reqwest_wasi/src/lib.rs b/reqwest_wasi/src/lib.rs
+new file mode 100644
+index 0000000..3d961b1
+--- /dev/null
++++ b/reqwest_wasi/src/lib.rs
+@@ -0,0 +1,528 @@
++//! The slice of the reqwest API that `sia_storage` uses, for wasm32-wasip2.
++//!
++//! reqwest picks its browser (fetch/wasm-bindgen) backend on every wasm32
++//! target, which cannot run outside a browser. This crate is aliased in as
++//! `reqwest` on `target_os = "wasi"` and speaks plain HTTP/1.1 over tokio +
++//! rustls instead. Every request is `Connection: close` — the indexer API is
++//! a handful of small signed calls, not a hot path.
++//!
++//! [`net::connect`] is the one dialer: when `ENCLAVE_EGRESS`
++//! (`socks5://<id>:<token>@host:port`) is set, as it is for an enclave
++//! deployment with egress, every connection goes through that SOCKS5 front;
++//! otherwise it is a direct connect (local `wasmtime -S inherit-network`).
++
++use std::fmt;
++use std::sync::{Arc, OnceLock};
++use std::time::Duration;
++
++use serde::Serialize;
++use serde::de::DeserializeOwned;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++pub use http::{Method, StatusCode};
++pub use url::Url;
++
++pub mod header {
++    pub use http::header::{
++        ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
++        InvalidHeaderValue,
++    };
++}
++
++use header::{HeaderMap, HeaderName, HeaderValue};
++
++#[derive(Debug)]
++pub struct Error(String);
++
++impl fmt::Display for Error {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "http: {}", self.0)
++    }
++}
++
++impl std::error::Error for Error {}
++
++impl Error {
++    fn new(msg: impl Into<String>) -> Self {
++        Self(msg.into())
++    }
++    pub fn is_timeout(&self) -> bool {
++        self.0.starts_with("timeout")
++    }
++}
++
++impl From<std::io::Error> for Error {
++    fn from(e: std::io::Error) -> Self {
++        Self(format!("i/o: {e}"))
++    }
++}
++
++impl From<url::ParseError> for Error {
++    fn from(e: url::ParseError) -> Self {
++        Self(format!("url: {e}"))
++    }
++}
++
++pub trait IntoUrl {
++    fn into_url(self) -> Result<Url, Error>;
++}
++
++impl IntoUrl for Url {
++    fn into_url(self) -> Result<Url, Error> {
++        Ok(self)
++    }
++}
++
++impl IntoUrl for &Url {
++    fn into_url(self) -> Result<Url, Error> {
++        Ok(self.clone())
++    }
++}
++
++impl IntoUrl for &str {
++    fn into_url(self) -> Result<Url, Error> {
++        Ok(Url::parse(self)?)
++    }
++}
++
++impl IntoUrl for String {
++    fn into_url(self) -> Result<Url, Error> {
++        Ok(Url::parse(&self)?)
++    }
++}
++
++impl IntoUrl for &String {
++    fn into_url(self) -> Result<Url, Error> {
++        Ok(Url::parse(self)?)
++    }
++}
++
++#[derive(Clone, Default)]
++pub struct Client {
++    default_headers: HeaderMap,
++}
++
++#[derive(Default)]
++pub struct ClientBuilder {
++    default_headers: HeaderMap,
++}
++
++impl ClientBuilder {
++    pub fn default_headers(mut self, headers: HeaderMap) -> Self {
++        self.default_headers = headers;
++        self
++    }
++
++    pub fn build(self) -> Result<Client, Error> {
++        Ok(Client { default_headers: self.default_headers })
++    }
++}
++
++impl Client {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    pub fn builder() -> ClientBuilder {
++        ClientBuilder::default()
++    }
++
++    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
++        RequestBuilder {
++            method,
++            url: url.into_url(),
++            headers: self.default_headers.clone(),
++            body: None,
++            timeout: None,
++        }
++    }
++
++    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder {
++        self.request(Method::GET, url)
++    }
++
++    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder {
++        self.request(Method::POST, url)
++    }
++
++    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder {
++        self.request(Method::PUT, url)
++    }
++
++    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
++        self.request(Method::DELETE, url)
++    }
++}
++
++pub struct RequestBuilder {
++    method: Method,
++    url: Result<Url, Error>,
++    headers: HeaderMap,
++    body: Option<Vec<u8>>,
++    timeout: Option<Duration>,
++}
++
++impl RequestBuilder {
++    pub fn timeout(mut self, d: Duration) -> Self {
++        self.timeout = Some(d);
++        self
++    }
++
++    /// Appends the serialized pairs to the URL's query, as reqwest does.
++    pub fn query<T: Serialize + ?Sized>(mut self, q: &T) -> Self {
++        if let Ok(url) = &mut self.url {
++            match serde_urlencoded::to_string(q) {
++                Ok(s) if s.is_empty() => {}
++                Ok(s) => {
++                    let joined = match url.query() {
++                        Some(old) if !old.is_empty() => format!("{old}&{s}"),
++                        _ => s,
++                    };
++                    url.set_query(Some(&joined));
++                }
++                Err(e) => self.url = Err(Error::new(format!("query: {e}"))),
++            }
++        }
++        self
++    }
++
++    pub fn header<K, V>(mut self, k: K, v: V) -> Self
++    where
++        HeaderName: TryFrom<K>,
++        HeaderValue: TryFrom<V>,
++    {
++        if let (Ok(k), Ok(v)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
++            self.headers.insert(k, v);
++        }
++        self
++    }
++
++    pub fn body<B: Into<Vec<u8>>>(mut self, body: B) -> Self {
++        self.body = Some(body.into());
++        self
++    }
++
++    pub fn json<T: Serialize + ?Sized>(mut self, v: &T) -> Self {
++        match serde_json::to_vec(v) {
++            Ok(b) => {
++                self.headers.insert(
++                    header::CONTENT_TYPE,
++                    HeaderValue::from_static("application/json"),
++                );
++                self.body = Some(b);
++            }
++            Err(e) => self.url = Err(Error::new(format!("json: {e}"))),
++        }
++        self
++    }
++
++    pub async fn send(self) -> Result<Response, Error> {
++        let url = self.url?;
++        let fut = exchange(self.method, url, self.headers, self.body);
++        match self.timeout {
++            Some(t) => tokio::time::timeout(t, fut)
++                .await
++                .map_err(|_| Error::new(format!("timeout after {t:?}")))?,
++            None => fut.await,
++        }
++    }
++}
++
++pub struct Response {
++    status: StatusCode,
++    headers: HeaderMap,
++    url: Url,
++    body: bytes::Bytes,
++}
++
++impl Response {
++    pub fn status(&self) -> StatusCode {
++        self.status
++    }
++
++    pub fn headers(&self) -> &HeaderMap {
++        &self.headers
++    }
++
++    pub fn url(&self) -> &Url {
++        &self.url
++    }
++
++    pub async fn bytes(self) -> Result<bytes::Bytes, Error> {
++        Ok(self.body)
++    }
++
++    pub async fn text(self) -> Result<String, Error> {
++        Ok(String::from_utf8_lossy(&self.body).into_owned())
++    }
++
++    pub async fn json<T: DeserializeOwned>(self) -> Result<T, Error> {
++        serde_json::from_slice(&self.body).map_err(|e| Error::new(format!("json: {e}")))
++    }
++}
++
++fn tls_config() -> Arc<rustls::ClientConfig> {
++    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
++    CFG.get_or_init(|| {
++        let roots = rustls::RootCertStore {
++            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
++        };
++        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
++            rustls::crypto::ring::default_provider(),
++        ))
++        .with_safe_default_protocol_versions()
++        .expect("ring supports the default protocol versions")
++        .with_root_certificates(roots)
++        .with_no_client_auth();
++        Arc::new(cfg)
++    })
++    .clone()
++}
++
++async fn exchange(
++    method: Method,
++    url: Url,
++    headers: HeaderMap,
++    body: Option<Vec<u8>>,
++) -> Result<Response, Error> {
++    let https = match url.scheme() {
++        "https" => true,
++        "http" => false,
++        s => return Err(Error::new(format!("unsupported scheme {s}"))),
++    };
++    let host = url.host_str().ok_or_else(|| Error::new("url has no host"))?.to_string();
++    let port = url.port_or_known_default().ok_or_else(|| Error::new("url has no port"))?;
++
++    let mut target = url.path().to_string();
++    if let Some(q) = url.query() {
++        target.push('?');
++        target.push_str(q);
++    }
++    let host_header = match url.port() {
++        Some(p) => format!("{host}:{p}"),
++        None => host.clone(),
++    };
++    let body = body.unwrap_or_default();
++    let mut head = format!(
++        "{method} {target} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nUser-Agent: sia-storage-wasi\r\n"
++    );
++    if !body.is_empty() || matches!(method, Method::POST | Method::PUT) {
++        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
++    }
++    for (k, v) in headers.iter() {
++        if let Ok(v) = v.to_str() {
++            head.push_str(&format!("{k}: {v}\r\n"));
++        }
++    }
++    head.push_str("\r\n");
++
++    let tcp = net::connect(&host, port).await?;
++    let raw = if https {
++        let name = rustls::pki_types::ServerName::try_from(host.clone())
++            .map_err(|e| Error::new(format!("server name {host}: {e}")))?;
++        let mut tls = tokio_rustls::TlsConnector::from(tls_config())
++            .connect(name, tcp)
++            .await?;
++        roundtrip(&mut tls, head.as_bytes(), &body).await?
++    } else {
++        let mut tcp = tcp;
++        roundtrip(&mut tcp, head.as_bytes(), &body).await?
++    };
++    parse_response(url, &raw)
++}
++
++async fn roundtrip<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
++    s: &mut S,
++    head: &[u8],
++    body: &[u8],
++) -> Result<Vec<u8>, Error> {
++    s.write_all(head).await?;
++    if !body.is_empty() {
++        s.write_all(body).await?;
++    }
++    s.flush().await?;
++    let mut raw = Vec::new();
++    // Connection: close — the body ends at EOF. A TLS peer that closes
++    // without close_notify surfaces as UnexpectedEof once the bytes are in.
++    match s.read_to_end(&mut raw).await {
++        Ok(_) => {}
++        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !raw.is_empty() => {}
++        Err(e) => return Err(e.into()),
++    }
++    Ok(raw)
++}
++
++fn parse_response(url: Url, raw: &[u8]) -> Result<Response, Error> {
++    let mut hdrs = [httparse::EMPTY_HEADER; 96];
++    let mut resp = httparse::Response::new(&mut hdrs);
++    let n = match resp.parse(raw).map_err(|e| Error::new(format!("response: {e}")))? {
++        httparse::Status::Complete(n) => n,
++        httparse::Status::Partial => return Err(Error::new("truncated response head")),
++    };
++    let status = StatusCode::from_u16(resp.code.unwrap_or(0))
++        .map_err(|e| Error::new(format!("status: {e}")))?;
++    let mut headers = HeaderMap::new();
++    let mut chunked = false;
++    let mut length = None;
++    for h in resp.headers.iter() {
++        let (Ok(k), Ok(v)) = (HeaderName::try_from(h.name), HeaderValue::from_bytes(h.value)) else {
++            continue;
++        };
++        if k == http::header::TRANSFER_ENCODING
++            && v.to_str().is_ok_and(|v| v.to_ascii_lowercase().contains("chunked"))
++        {
++            chunked = true;
++        }
++        if k == http::header::CONTENT_LENGTH {
++            length = v.to_str().ok().and_then(|v| v.trim().parse::<usize>().ok());
++        }
++        headers.append(k, v);
++    }
++    let rest = &raw[n..];
++    let body = if chunked {
++        dechunk(rest)?
++    } else if let Some(len) = length {
++        if rest.len() < len {
++            return Err(Error::new(format!("body truncated: {} of {len} bytes", rest.len())));
++        }
++        rest[..len].to_vec()
++    } else {
++        rest.to_vec()
++    };
++    Ok(Response { status, headers, url, body: body.into() })
++}
++
++fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, Error> {
++    let mut out = Vec::new();
++    loop {
++        let eol = raw
++            .windows(2)
++            .position(|w| w == b"\r\n")
++            .ok_or_else(|| Error::new("bad chunk header"))?;
++        let size_txt = std::str::from_utf8(&raw[..eol]).map_err(|_| Error::new("bad chunk size"))?;
++        let size = usize::from_str_radix(size_txt.split(';').next().unwrap_or("").trim(), 16)
++            .map_err(|_| Error::new("bad chunk size"))?;
++        raw = &raw[eol + 2..];
++        if size == 0 {
++            return Ok(out);
++        }
++        if raw.len() < size + 2 {
++            return Err(Error::new("truncated chunk"));
++        }
++        out.extend_from_slice(&raw[..size]);
++        raw = &raw[size + 2..];
++    }
++}
++
++pub mod net {
++    //! Outbound TCP for wasip2: through the enclave's SOCKS5 egress front when
++    //! `ENCLAVE_EGRESS` is set, direct otherwise. Names are handed to the
++    //! front unresolved (ATYP DOMAIN) so resolution happens where its SSRF
++    //! checks live; IP literals go as ATYP v4/v6.
++
++    use std::io;
++    use std::net::IpAddr;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use tokio::net::TcpStream;
++
++    pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
++        match std::env::var("ENCLAVE_EGRESS") {
++            Ok(url) if !url.is_empty() => socks_connect(&url, host, port).await,
++            _ => direct(host.trim_start_matches('[').trim_end_matches(']'), port).await,
++        }
++    }
++
++    /// tokio resolves names on a blocking-pool thread, and wasip2 has no
++    /// threads: resolve with std's (wasi:sockets/ip-name-lookup) inline,
++    /// then try each address in turn.
++    async fn direct(host: &str, port: u16) -> io::Result<TcpStream> {
++        use std::net::ToSocketAddrs;
++        let addrs: Vec<_> = (host, port).to_socket_addrs()?.collect();
++        let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{host}: no addresses"));
++        for a in addrs {
++            match TcpStream::connect(a).await {
++                Ok(s) => return Ok(s),
++                Err(e) => last = e,
++            }
++        }
++        Err(last)
++    }
++
++    /// `addr` in `host:port` form (IPv6 hosts bracketed), as Sia host
++    /// announcements carry it.
++    pub async fn connect_addr(addr: &str) -> io::Result<TcpStream> {
++        let (host, port) = addr
++            .rsplit_once(':')
++            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("no port in {addr}")))?;
++        let port: u16 = port
++            .parse()
++            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad port in {addr}")))?;
++        connect(host.trim_start_matches('[').trim_end_matches(']'), port).await
++    }
++
++    fn bad(msg: String) -> io::Error {
++        io::Error::other(msg)
++    }
++
++    async fn socks_connect(url: &str, host: &str, port: u16) -> io::Result<TcpStream> {
++        let rest = url.split_once("://").map(|(_, r)| r).ok_or_else(|| bad("bad ENCLAVE_EGRESS url".into()))?;
++        let (creds, front) = rest.rsplit_once('@').ok_or_else(|| bad("no credential in ENCLAVE_EGRESS".into()))?;
++        let (id, token) = creds.split_once(':').ok_or_else(|| bad("bad ENCLAVE_EGRESS credential".into()))?;
++
++        let (fh, fp) = front.rsplit_once(':').ok_or_else(|| bad("egress front has no port".into()))?;
++        let mut s = direct(fh, fp.parse().map_err(|_| bad("bad egress front port".into()))?).await?;
++        s.write_all(&[0x05, 0x01, 0x02]).await?;
++        let mut m = [0u8; 2];
++        s.read_exact(&mut m).await?;
++        if m != [0x05, 0x02] {
++            return Err(bad("egress front rejected user/pass auth".into()));
++        }
++        let mut auth = vec![0x01, id.len() as u8];
++        auth.extend_from_slice(id.as_bytes());
++        auth.push(token.len() as u8);
++        auth.extend_from_slice(token.as_bytes());
++        s.write_all(&auth).await?;
++        let mut a = [0u8; 2];
++        s.read_exact(&mut a).await?;
++        if a[1] != 0x00 {
++            return Err(bad("egress credential rejected".into()));
++        }
++
++        let mut req = vec![0x05, 0x01, 0x00];
++        match host.parse::<IpAddr>() {
++            Ok(IpAddr::V4(v4)) => {
++                req.push(0x01);
++                req.extend_from_slice(&v4.octets());
++            }
++            Ok(IpAddr::V6(v6)) => {
++                req.push(0x04);
++                req.extend_from_slice(&v6.octets());
++            }
++            Err(_) => {
++                req.push(0x03);
++                req.push(host.len() as u8);
++                req.extend_from_slice(host.as_bytes());
++            }
++        }
++        req.extend_from_slice(&port.to_be_bytes());
++        s.write_all(&req).await?;
++        let mut head = [0u8; 4];
++        s.read_exact(&mut head).await?;
++        if head[1] != 0x00 {
++            return Err(bad(format!("egress CONNECT {host}:{port} refused (rep={})", head[1])));
++        }
++        let bnd_len = match head[3] {
++            0x01 => 4,
++            0x04 => 16,
++            0x03 => {
++                let mut l = [0u8; 1];
++                s.read_exact(&mut l).await?;
++                l[0] as usize
++            }
++            t => return Err(bad(format!("egress: unexpected BND.ADDR type {t}"))),
++        };
++        let mut skip = vec![0u8; bnd_len + 2];
++        s.read_exact(&mut skip).await?;
++        Ok(s)
++    }
++}
+diff --git a/sia_core/Cargo.toml b/sia_core/Cargo.toml
+index 02333c4..7e6bf0b 100644
+--- a/sia_core/Cargo.toml
++++ b/sia_core/Cargo.toml
+@@ -31,19 +31,19 @@ thiserror = "2.0.19"
+ uint = "0.10.0"
+ zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
+ 
+-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+ tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "io-util", "time"] }
+ 
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "io-util"] }
+ 
+ [dev-dependencies]
+ rand = "0.10.2"
+ 
+-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
++[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+ criterion = { version = "0.8", features = ["async_tokio"] }
+ 
+-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+ getrandom = { version = "0.4", features = ["wasm_js"] }
+ wasm-bindgen-test = "0.3"
+ 
+diff --git a/sia_core/src/lib.rs b/sia_core/src/lib.rs
+index 02793ce..68549e9 100644
+--- a/sia_core/src/lib.rs
++++ b/sia_core/src/lib.rs
+@@ -12,11 +12,11 @@
+ /// ```
+ macro_rules! maybe_spawn_blocking {
+     ($body:expr) => {{
+-        #[cfg(not(target_arch = "wasm32"))]
++        #[cfg(not(target_family = "wasm"))]
+         {
+             tokio::task::spawn_blocking(move || $body).await.unwrap()
+         }
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(target_family = "wasm")]
+         {
+             $body
+         }
+diff --git a/sia_storage/Cargo.toml b/sia_storage/Cargo.toml
+index d1101cf..3382864 100644
+--- a/sia_storage/Cargo.toml
++++ b/sia_storage/Cargo.toml
+@@ -39,15 +39,23 @@ tokio-util = { version = "0.7.19", features = ["rt"] }
+ sia_reed_solomon = "0.3.0"
+ 
+ # --- Native-only dependencies ---
+-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
++[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ # do not update to reqwest v0.13 until https://github.com/seanmonstar/reqwest/issues/2968 is resolved
+ reqwest = { version = "0.12.28", default-features = false, features = ["charset", "gzip", "http2", "json", "rustls-tls", "zstd"] }
+ tokio = { version = "1.53.1", features = ["sync", "io-util", "macros", "rt", "time"] }
+ sia_mux = { version = "0.1.1", path = "../sia_mux" }
+ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+ 
++# --- WASI (wasm32-wasip2) dependencies: the native SiaMux path over
++# tokio + wasi:sockets, with reqwest_wasi aliased in as `reqwest`. Building
++# needs RUSTFLAGS="--cfg tokio_unstable" (tokio gates `net` on wasm). ---
++[target.'cfg(target_os = "wasi")'.dependencies]
++reqwest_wasi = { path = "../reqwest_wasi" }
++tokio = { version = "1.53.1", features = ["sync", "io-util", "macros", "rt", "time", "net"] }
++sia_mux = { version = "0.1.1", path = "../sia_mux" }
++
+ # --- WASM-only dependencies ---
+-[target.'cfg(target_arch = "wasm32")'.dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+ reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
+ tokio = { version = "1.53.1", features = ["sync", "io-util", "macros", "rt"] }
+ wasm-bindgen = "0.2"
+@@ -72,7 +80,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
+ [dev-dependencies]
+ sia_core_derive = { path = "../sia_core_derive", version = "0.1.2" }
+ 
+-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
++[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+ criterion = { version = "0.8.2", features = ["async_tokio"] }
+ httptest = "0.16.4"
+ tokio = { version = "1.53.1", features = ["fs", "macros", "rt-multi-thread", "test-util"] }
+@@ -83,7 +91,7 @@ directories = "6.0.0"
+ toml = "1.1.3"
+ tempfile = "3.27.0"
+ 
+-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
++[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+ wasm-bindgen-test = "0.3"
+ 
+ [features]
+diff --git a/sia_storage/src/app_client/http.rs b/sia_storage/src/app_client/http.rs
+index 398a354..4af4e9b 100644
+--- a/sia_storage/src/app_client/http.rs
++++ b/sia_storage/src/app_client/http.rs
+@@ -744,7 +744,7 @@ mod test {
+ }
+ 
+ /// Integration tests requiring httptest, a native TCP mock server. Native only.
+-#[cfg(all(test, not(target_arch = "wasm32")))]
++#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+ mod native_tests {
+     use base64::engine::general_purpose::URL_SAFE;
+     use chrono::FixedOffset;
+diff --git a/sia_storage/src/builder.rs b/sia_storage/src/builder.rs
+index 6d908e5..14010c2 100644
+--- a/sia_storage/src/builder.rs
++++ b/sia_storage/src/builder.rs
+@@ -344,7 +344,7 @@ mod test {
+ }
+ 
+ /// Integration tests requiring httptest, a native TCP mock server. Native only.
+-#[cfg(all(test, not(target_arch = "wasm32")))]
++#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+ mod native_tests {
+     use super::*;
+     use crate::app_client::QUERY_PARAM_CREDENTIAL;
+diff --git a/sia_storage/src/compat/mod.rs b/sia_storage/src/compat/mod.rs
+index 7039826..5ed0c01 100644
+--- a/sia_storage/src/compat/mod.rs
++++ b/sia_storage/src/compat/mod.rs
+@@ -4,17 +4,17 @@
+ //! Do not import from `std::time`, `tokio::time`, `web_time`, or
+ //! `tokio_util::task` directly in other modules.
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ mod wasm_time;
+ 
+ /// Unified time types for native and WASM targets.
+ pub mod time {
+     pub use web_time::{Duration, Instant};
+ 
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     pub use tokio::time::{error::Elapsed, sleep, timeout};
+ 
+-    #[cfg(target_arch = "wasm32")]
++    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+     pub use super::wasm_time::{sleep, timeout};
+ }
+ 
+@@ -69,11 +69,11 @@ pub mod task {
+ /// ```
+ macro_rules! maybe_spawn_blocking {
+     ($body:expr) => {{
+-        #[cfg(not(target_arch = "wasm32"))]
++        #[cfg(not(target_family = "wasm"))]
+         {
+             tokio::task::spawn_blocking(move || $body).await?
+         }
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(target_family = "wasm")]
+         {
+             $body
+         }
+@@ -89,9 +89,9 @@ macro_rules! maybe_spawn_blocking {
+ /// ```
+ macro_rules! join_set_spawn {
+     ($set:expr, $fut:expr) => {{
+-        #[cfg(not(target_arch = "wasm32"))]
++        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+         $set.spawn($fut);
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+         $set.spawn_local($fut);
+     }};
+ }
+@@ -104,11 +104,11 @@ macro_rules! join_set_spawn {
+ /// ```
+ macro_rules! maybe_spawn {
+     ($fut:expr) => {{
+-        #[cfg(not(target_arch = "wasm32"))]
++        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+         {
+             tokio::spawn($fut)
+         }
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+         {
+             tokio::task::spawn_local($fut)
+         }
+diff --git a/sia_storage/src/download.rs b/sia_storage/src/download.rs
+index f530308..63f30c3 100644
+--- a/sia_storage/src/download.rs
++++ b/sia_storage/src/download.rs
+@@ -81,12 +81,12 @@ const MIN_INFLIGHT: usize = 1;
+ 
+ /// Memory-derived ceiling on buffered chunks; the controller adapts at or below
+ /// it.
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ fn default_chunks_in_memory() -> usize {
+     (crate::default_memory_budget() / MAX_CHUNK_SIZE as u64).max(1) as usize
+ }
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ fn default_chunks_in_memory() -> usize {
+     128
+ }
+diff --git a/sia_storage/src/lib.rs b/sia_storage/src/lib.rs
+index dd9d814..f70bf7b 100644
+--- a/sia_storage/src/lib.rs
++++ b/sia_storage/src/lib.rs
+@@ -47,6 +47,9 @@
+ mod compat;
+ 
+ pub(crate) use compat::{task, time};
++#[cfg(target_os = "wasi")]
++extern crate reqwest_wasi as reqwest;
++
+ use sia_core::rhp4::SECTOR_SIZE;
+ use sia_core::signing::PrivateKey;
+ 
+@@ -303,10 +306,10 @@ pub struct SharingKeyOptions {
+     pub expires_at: Option<DateTime<Utc>>,
+ }
+ 
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ pub type ShardProgressCallback = Arc<dyn Fn(ShardProgress) + Send + Sync + 'static>;
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ pub type ShardProgressCallback = Arc<dyn Fn(ShardProgress) + 'static>;
+ 
+ /// Information about a successfully uploaded or downloaded shard, used for progress reporting.
+@@ -339,7 +342,7 @@ pub struct DownloadOptions {
+ 
+ impl DownloadOptions {
+     /// Configures a callback to receive progress updates for each downloaded shard.
+-    #[cfg(target_arch = "wasm32")]
++    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+     pub fn on_shard_downloaded<F>(mut self, callback: F) -> Self
+     where
+         F: Fn(ShardProgress) + 'static,
+@@ -348,7 +351,7 @@ impl DownloadOptions {
+         self
+     }
+ 
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     pub fn on_shard_downloaded<F>(mut self, callback: F) -> Self
+     where
+         F: Fn(ShardProgress) + Send + Sync + 'static,
+@@ -385,7 +388,7 @@ pub struct UploadOptions {
+ }
+ 
+ impl UploadOptions {
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     pub fn on_shard_uploaded<F>(mut self, callback: F) -> Self
+     where
+         F: Fn(ShardProgress) + Send + Sync + 'static,
+@@ -394,7 +397,7 @@ impl UploadOptions {
+         self
+     }
+ 
+-    #[cfg(target_arch = "wasm32")]
++    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+     pub fn on_shard_uploaded<F>(mut self, callback: F) -> Self
+     where
+         F: Fn(ShardProgress) + 'static,
+@@ -557,7 +560,17 @@ impl From<PackedUploadOptions> for UploadOptions {
+ /// Calculates the default budget for memory usage of uploads
+ /// and downloads based on the system's memory or 1GB, whichever
+ /// is lower.
+-#[cfg(not(target_arch = "wasm32"))]
++/// On WASI there is no system-memory probe; the budget is fixed (256 MiB)
++/// unless `SIA_MEMORY_BUDGET` (bytes) says otherwise.
++#[cfg(target_os = "wasi")]
++fn default_memory_budget() -> u64 {
++    std::env::var("SIA_MEMORY_BUDGET")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(256 << 20)
++}
++
++#[cfg(not(target_family = "wasm"))]
+ fn default_memory_budget() -> u64 {
+     let mut sys = sysinfo::System::new();
+     sys.refresh_memory();
+diff --git a/sia_storage/src/rhp4.rs b/sia_storage/src/rhp4.rs
+index ee83c68..251370e 100644
+--- a/sia_storage/src/rhp4.rs
++++ b/sia_storage/src/rhp4.rs
+@@ -11,10 +11,10 @@ use thiserror::Error;
+ 
+ use crate::time::Duration;
+ 
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ mod siamux;
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ mod web_transport;
+ 
+ #[cfg(any(test, feature = "mock"))]
+@@ -26,9 +26,9 @@ pub(crate) use pool::default_client;
+ /// target. The `mock` feature adds an in-memory backend alongside it.
+ #[derive(Clone)]
+ pub(crate) enum Client {
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     SiaMux(siamux::Client),
+-    #[cfg(target_arch = "wasm32")]
++    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+     WebTransport(web_transport::Client),
+     #[cfg(any(test, feature = "mock"))]
+     Mock(mock::Client),
+@@ -43,11 +43,11 @@ impl Default for Client {
+ impl Client {
+     /// Creates a client using the real transport for this target.
+     pub(crate) fn new() -> Self {
+-        #[cfg(not(target_arch = "wasm32"))]
++        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+         {
+             Self::SiaMux(siamux::Client::new())
+         }
+-        #[cfg(target_arch = "wasm32")]
++        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+         {
+             Self::WebTransport(web_transport::Client::new())
+         }
+@@ -69,9 +69,9 @@ impl Transport for Client {
+         idle_timeout: Duration,
+     ) -> Result<(HostPrices, Duration), Error> {
+         match self {
+-            #[cfg(not(target_arch = "wasm32"))]
++            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+             Self::SiaMux(c) => c.host_prices(host, idle_timeout).await,
+-            #[cfg(target_arch = "wasm32")]
++            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+             Self::WebTransport(c) => c.host_prices(host, idle_timeout).await,
+             #[cfg(any(test, feature = "mock"))]
+             Self::Mock(c) => c.host_prices(host, idle_timeout).await,
+@@ -87,12 +87,12 @@ impl Transport for Client {
+         idle_timeout: Duration,
+     ) -> Result<(Hash256, Duration), Error> {
+         match self {
+-            #[cfg(not(target_arch = "wasm32"))]
++            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+             Self::SiaMux(c) => {
+                 c.write_sector(host, prices, account_key, sector, idle_timeout)
+                     .await
+             }
+-            #[cfg(target_arch = "wasm32")]
++            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+             Self::WebTransport(c) => {
+                 c.write_sector(host, prices, account_key, sector, idle_timeout)
+                     .await
+@@ -115,12 +115,12 @@ impl Transport for Client {
+         idle_timeout: Duration,
+     ) -> Result<(Bytes, Duration), Error> {
+         match self {
+-            #[cfg(not(target_arch = "wasm32"))]
++            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+             Self::SiaMux(c) => {
+                 c.read_sector(host, prices, token, root, range, idle_timeout)
+                     .await
+             }
+-            #[cfg(target_arch = "wasm32")]
++            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+             Self::WebTransport(c) => {
+                 c.read_sector(host, prices, token, root, range, idle_timeout)
+                     .await
+@@ -227,12 +227,12 @@ pub(crate) trait Transport: Clone + Unpin + MaybeSendSync + 'static {
+         idle_timeout: Duration,
+     ) -> impl Future<Output = Result<(Bytes, Duration), Error>> + MaybeSendSync;
+ }
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ pub(crate) trait MaybeSendSync: Send + Sync {}
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ impl<T: Send + Sync> MaybeSendSync for T {}
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ pub(crate) trait MaybeSendSync {}
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ impl<T> MaybeSendSync for T {}
+diff --git a/sia_storage/src/rhp4/pool.rs b/sia_storage/src/rhp4/pool.rs
+index ce692ae..4c07279 100644
+--- a/sia_storage/src/rhp4/pool.rs
++++ b/sia_storage/src/rhp4/pool.rs
+@@ -1,4 +1,4 @@
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ mod imp {
+     use std::collections::HashMap;
+     use std::future::pending;
+@@ -209,7 +209,7 @@ mod imp {
+     }
+ }
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ mod imp {
+     use crate::rhp4::Client;
+ 
+diff --git a/sia_storage/src/rhp4/siamux.rs b/sia_storage/src/rhp4/siamux.rs
+index d8ef326..3c93507 100644
+--- a/sia_storage/src/rhp4/siamux.rs
++++ b/sia_storage/src/rhp4/siamux.rs
+@@ -8,6 +8,7 @@ use std::collections::HashMap;
+ use std::ops::Range;
+ use std::sync::{Arc, Mutex, Weak};
+ use thiserror::{self, Error};
++#[cfg(not(target_os = "wasi"))]
+ use tokio::net::{TcpStream, lookup_host};
+ use tokio::sync::watch;
+ 
+@@ -82,6 +83,23 @@ impl Client {
+             if addr.protocol != Protocol::SiaMux {
+                 continue;
+             }
++            // WASI: one dial per announced address, by name - through the
++            // enclave egress front when there is one (it resolves).
++            #[cfg(target_os = "wasi")]
++            {
++                match reqwest_wasi::net::connect_addr(addr.address.as_str()).await {
++                    Ok(tcp) => match sia_mux::dial(tcp, &verifying_key).await {
++                        Ok(mux_conn) => {
++                            debug!("established siamux connection to {} via {}", host.public_key, addr.address);
++                            return Ok(mux_conn);
++                        }
++                        Err(e) => debug!("mux handshake failed to {} via {}: {e}", host.public_key, addr.address),
++                    },
++                    Err(e) => debug!("TCP connect failed to {}: {e}", addr.address),
++                }
++            }
++            #[cfg(not(target_os = "wasi"))]
++            {
+             let resolved_addrs = lookup_host(addr.address.as_str())
+                 .await
+                 .inspect_err(|e| debug!("failed to resolve {}: {e}", addr.address))?;
+@@ -108,6 +126,7 @@ impl Client {
+                     }
+                 }
+             }
++            }
+         }
+         Err(ConnectError::NoEndpoint)
+     }
+diff --git a/sia_storage/src/sdk.rs b/sia_storage/src/sdk.rs
+index 87ff98d..f22606b 100644
+--- a/sia_storage/src/sdk.rs
++++ b/sia_storage/src/sdk.rs
+@@ -921,7 +921,7 @@ mod test {
+ }
+ 
+ /// Integration tests requiring httptest, a TCP mock server. Native only.
+-#[cfg(all(test, not(target_arch = "wasm32")))]
++#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+ mod native_tests {
+     use super::test::random_seed;
+     use super::*;
+diff --git a/sia_storage/src/shared_sdk.rs b/sia_storage/src/shared_sdk.rs
+index 44f9383..849039d 100644
+--- a/sia_storage/src/shared_sdk.rs
++++ b/sia_storage/src/shared_sdk.rs
+@@ -247,7 +247,7 @@ impl SharedSdk {
+ }
+ 
+ /// Integration tests requiring httptest, a TCP mock server. Native only.
+-#[cfg(all(test, not(target_arch = "wasm32")))]
++#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+ mod native_tests {
+     use super::*;
+     use crate::app_client::SharedHost;
+diff --git a/sia_storage/src/upload.rs b/sia_storage/src/upload.rs
+index 0fc5e65..3c5c187 100644
+--- a/sia_storage/src/upload.rs
++++ b/sia_storage/src/upload.rs
+@@ -148,12 +148,12 @@ const RACE_FACTOR: f64 = 1.5;
+ const INITIAL_INFLIGHT: usize = 8;
+ const MIN_INFLIGHT: usize = 2;
+ 
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+ fn default_slabs_in_memory(slab_size: usize) -> usize {
+     (crate::default_memory_budget() / slab_size as u64).max(1) as usize
+ }
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+ fn default_slabs_in_memory(_slab_size: usize) -> usize {
+     3
+ }
+@@ -1189,7 +1189,7 @@ mod tests {
+     // Not a `cross_target_test`: the shard has to sit out a full
+     // `RPC_IDLE_TIMEOUT`, which only paused time makes cheap, and wasm has
+     // no equivalent.
+-    #[cfg(not(target_arch = "wasm32"))]
++    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+     #[tokio::test(start_paused = true)]
+     async fn test_upload_timeout_penalizes_host_once_after_retry() {
+         let (hosts_manager, app_key, slow) = racing_setup(Duration::from_secs(180));
+-- 
+2.56.0
+
