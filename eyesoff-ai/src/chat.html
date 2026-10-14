@@ -7018,6 +7018,11 @@ async function warmLadder() {
         const label = warmupStatus(s);
         bootMsg.textContent = label;
         li.querySelector(".b-sub").textContent = "preparing chat…";
+        // a prefill status means the model answered its probe: all that is
+        // left is the shared prompt prefix, and it is no reason to hold the
+        // page. It carries on behind the pill, and a message sent meanwhile
+        // waits for this same prefill (mm36) rather than reading its own.
+        if (/^prefilling /.test(s)) dismissBoot();
         if (bootGone) pill("", '<span class="spin"></span>', label);
       });
       ok = res.ok && !!d.ok;
