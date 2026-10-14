@@ -492,10 +492,15 @@ pub fn get_range(
                     break;
                 }
                 let from = start + body.len() as u64;
-                let (st, more, _, done) = request_opt("GET", ep, bucket, key, &[], Some((from, end)), creds, &[],
+                let (st, more, more_headers, done) = request_opt("GET", ep, bucket, key, &[], Some((from, end)), creds, &[],
                     &[("if-match".to_string(), etag.clone())], true)?;
                 if st != 206 {
                     return Err(format!("resuming at byte {from}: {}", s3_error(st, &more)));
+                }
+                // A store that ignores If-Match (sia-s3 does) answers the new version: its ETag says so.
+                let more_etag = more_headers.iter().find(|(k, _)| k == "etag").map(|(_, v)| v.as_str());
+                if more_etag.is_some_and(|e| e.trim_matches('"') != etag.trim_matches('"')) {
+                    return Err(format!("resuming at byte {from}: the object changed (ETag {} became {})", etag, more_etag.unwrap_or("")));
                 }
                 if more.is_empty() {
                     break;   // no progress: stop rather than spin
@@ -848,6 +853,12 @@ mod tests {
     /// A local "bucket" that answers range GETs from `data`: the first answer ends early (a clean close after `cut`
     /// bytes, as R2's sometimes did), every later one is whole unless `changed` (then 412, as for a new object version).
     fn range_server(data: Vec<u8>, cut: usize, changed: bool) -> (Endpoint, std::sync::mpsc::Receiver<(String, Option<String>)>) {
+        range_server_with(data, cut, changed, false)
+    }
+
+    /// `ignores_if_match`: a changed object is answered (206, ETag "v2") instead of 412, as a store without
+    /// conditional GETs does.
+    fn range_server_with(data: Vec<u8>, cut: usize, changed: bool, ignores_if_match: bool) -> (Endpoint, std::sync::mpsc::Receiver<(String, Option<String>)>) {
         use std::io::{BufRead, BufReader, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
@@ -865,7 +876,7 @@ mod tests {
                     if lower.starts_with("if-match:") { ifm = Some(line[9..].trim().to_string()); }
                 }
                 tx.send((range.clone(), ifm.clone())).unwrap();
-                if n > 0 && changed {
+                if n > 0 && changed && !ignores_if_match {
                     let _ = c.write_all(b"HTTP/1.1 412 Precondition Failed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
                     continue;
                 }
@@ -873,7 +884,8 @@ mod tests {
                 let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse::<usize>().unwrap().min(data.len() - 1));   // clamped at EOF
                 let part = &data[a..=b];
                 let send = if n == 0 { &part[..cut] } else { part };
-                let _ = c.write_all(format!("HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\netag: \"v1\"\r\nconnection: close\r\n\r\n", part.len()).as_bytes());
+                let version = if n > 0 && changed { "v2" } else { "v1" };
+                let _ = c.write_all(format!("HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\netag: \"{version}\"\r\nconnection: close\r\n\r\n", part.len()).as_bytes());
                 let _ = c.write_all(send);
             }
         });
@@ -914,6 +926,14 @@ mod tests {
         let (ep, _seen) = range_server(data, 300_000, true);
         let e = get_range(&ep, "ipfs", "pins/x", None, 0, 1024 * 1024).unwrap_err();
         assert!(e.contains("resuming at byte 300000"), "{e}");
+    }
+
+    #[test]
+    fn a_changed_object_fails_the_window_even_where_if_match_is_ignored() {
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (ep, _seen) = range_server_with(data, 300_000, true, true);
+        let e = get_range(&ep, "ipfs", "pins/x", None, 0, 1024 * 1024).unwrap_err();
+        assert!(e.contains("the object changed"), "{e}");
     }
 
     #[test]
