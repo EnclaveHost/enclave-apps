@@ -181,6 +181,7 @@ fn main() {
             buckets: cfg.buckets.clone(),
             credentials: cfg.credentials.clone(),
             region: cfg.region.clone(),
+            indexer: cfg.indexer.clone(),
             boot_error: Default::default(),
         });
         let p = port();

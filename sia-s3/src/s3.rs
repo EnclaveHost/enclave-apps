@@ -15,6 +15,7 @@ pub struct App {
     pub buckets: Vec<String>,
     pub credentials: Vec<(String, String)>,
     pub region: String,
+    pub indexer: String,
     pub boot_error: std::cell::RefCell<Option<String>>,
 }
 
@@ -122,6 +123,14 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
         let body = health(app).await;
         let r = Resp { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: body.into_bytes() };
         return send(w, r, ka).await;
+    }
+    // A browser opening the endpoint gets the app's page instead of an S3 AccessDenied. Only UNSIGNED GETs of these
+    // three paths: anything signed (or any other path) is S3 as before, so no client ever sees HTML for an S3 call.
+    let signed = req.header("authorization").is_some() || req.query.contains("X-Amz-Signature");
+    if !signed && req.method == "GET" {
+        if let Some(r) = page(app, &req.path).await {
+            return send(w, r, ka).await;
+        }
     }
     let resource = req.path.clone();
     match sigv4::verify(req, &app.credentials) {
@@ -445,6 +454,69 @@ async fn delete_many(store: &Store, bucket: &str, body: &[u8]) -> Resp {
         }
     }
     xml(200, format!("<DeleteResult>{out}</DeleteResult>"))
+}
+
+const UI: &str = include_str!("ui.html");
+const LOGO: &str = include_str!("../assets/logo.svg");
+
+/// The public page and what it reads. The status is the in-memory index only (no Sia or indexer traffic, so loading
+/// the page costs nothing and cannot starve the egress front); it never includes keys, object names or credentials.
+async fn page(app: &App, path: &str) -> Option<Resp> {
+    let typed = |ct: &str, body: Vec<u8>, extra: &[(&str, &str)]| {
+        let mut headers: Vec<(String, String)> = vec![("Content-Type".into(), ct.into()), ("Cache-Control".into(), "no-store".into())];
+        headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        Resp { status: 200, headers, body }
+    };
+    match path {
+        "/" => Some(typed(
+            "text/html; charset=utf-8",
+            UI.as_bytes().to_vec(),
+            &[
+                (
+                    "Content-Security-Policy",
+                    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob: data:; \
+                     connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+                ),
+                ("Referrer-Policy", "no-referrer"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        )),
+        "/logo.svg" | "/favicon.ico" => Some(typed("image/svg+xml", LOGO.as_bytes().to_vec(), &[])),
+        "/api/status" => {
+            let store = app.store.borrow().clone();
+            let mut v = serde_json::json!({
+                "app": "sia-s3",
+                "version": env!("CARGO_PKG_VERSION"),
+                "indexer": app.indexer,
+                "region": app.region,
+                "ready": store.is_some(),
+                "bootError": *app.boot_error.borrow(),
+            });
+            if let Some(s) = store {
+                let idx = s.idx.lock().await;
+                let buckets: Vec<_> = app
+                    .buckets
+                    .iter()
+                    .map(|b| {
+                        let (n, bytes) = idx
+                            .keys
+                            .range((b.clone(), String::new())..)
+                            .take_while(|((kb, _), _)| kb == b)
+                            .fold((0u64, 0u64), |(n, t), (_, k)| (n + 1, t + k.entry.s));
+                        serde_json::json!({ "name": b, "keys": n, "bytes": bytes })
+                    })
+                    .collect();
+                v["buckets"] = serde_json::json!(buckets);
+                v["objects"] = serde_json::json!(idx.objs.len());
+                v["openUploads"] = serde_json::json!(idx.uploads.len());
+                v["compactor"] = serde_json::json!(*s.stats.borrow());
+            } else {
+                v["buckets"] = serde_json::json!(app.buckets.iter().map(|b| serde_json::json!({ "name": b })).collect::<Vec<_>>());
+            }
+            Some(typed("application/json", v.to_string().into_bytes(), &[]))
+        }
+        _ => None,
+    }
 }
 
 async fn health(app: &App) -> String {

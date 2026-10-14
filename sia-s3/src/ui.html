@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Sia S3</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0e14; --panel: #10141d; --edge: #1e2430; --edge2: #2a3242;
+    --ink: #d7dde8; --dim: #8a94a6; --faint: #5a6375;
+    --amber: #e8a34c; --amber-hi: #ffc46b; --red: #e05e5e; --green: #6fcf8f;
+    --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 var(--mono);
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    background-image: radial-gradient(ellipse 80% 50% at 50% -10%, #151b28 0%, transparent 60%);
+  }
+  main { width: 100%; max-width: 980px; padding: 0 16px 40px; }
+  header { text-align: center; padding: 36px 0 6px; }
+  header img { width: 56px; height: 56px; }
+  .mark { font-size: 24px; letter-spacing: .1em; color: var(--amber); margin-top: 6px; }
+  .mark b { color: var(--ink); font-weight: 600; }
+  .tag { color: var(--dim); font-size: 13px; margin-top: 6px; }
+  .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 18px 22px; margin-top: 20px; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--dim); letter-spacing: .08em; font-weight: 600; }
+  .kv { display: flex; gap: 10px 26px; flex-wrap: wrap; font-size: 13px; color: var(--dim); }
+  .kv b { color: var(--ink); font-weight: 600; word-break: break-all; }
+  .state-ready { color: var(--green) !important; }
+  .state-busy { color: var(--amber-hi) !important; }
+  .state-bad { color: var(--red) !important; }
+  button {
+    background: var(--amber); color: #14100a; border: 0; border-radius: 8px;
+    padding: 8px 18px; font: 600 13px var(--mono); cursor: pointer; letter-spacing: .04em;
+  }
+  button:hover { background: var(--amber-hi); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--edge2); font-weight: 400; }
+  button.ghost:hover { color: var(--ink); border-color: var(--amber); }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 13px; }
+  th { text-align: left; color: var(--faint); font-weight: 400; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--edge2); }
+  td { padding: 5px 10px 5px 0; border-bottom: 1px solid var(--edge); vertical-align: top; }
+  td.name { word-break: break-all; }
+  td.sz, td.when { color: var(--dim); white-space: nowrap; }
+  td.act { white-space: nowrap; text-align: right; }
+  a { color: var(--amber); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .mini { font-size: 11.5px; color: var(--faint); }
+  .copy, .small {
+    cursor: pointer; color: var(--dim); border: 1px solid var(--edge2); border-radius: 5px;
+    padding: 0 7px; font: 11px var(--mono); background: transparent; margin-left: 6px; letter-spacing: 0;
+  }
+  .copy:hover, .small:hover { color: var(--ink); border-color: var(--amber); background: transparent; }
+  .small.danger:hover, .small.armed { color: #fff; background: var(--red); border-color: var(--red); }
+  input[type=text], input[type=password], select {
+    background: #0d1119; color: var(--ink); border: 1px solid var(--edge2);
+    border-radius: 7px; padding: 8px 12px; font: 13px var(--mono); min-width: 0;
+  }
+  input:focus, select:focus { border-color: var(--amber); outline: none; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .row input[type=text], .row input[type=password] { flex: 1 1 220px; }
+  pre {
+    background: #0d1119; border: 1px solid var(--edge2); border-radius: 7px; padding: 10px 12px;
+    font: 12.5px/1.55 var(--mono); color: var(--amber-hi); overflow-x: auto; margin: 8px 0 0; white-space: pre;
+  }
+  .pathbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .crumbs { flex: 1; min-width: 0; color: var(--dim); font-size: 13px; word-break: break-all; }
+  .crumbs a { color: var(--amber); cursor: pointer; }
+  .crumbs b { color: var(--ink); font-weight: 600; }
+  td.dir a { color: var(--ink); font-weight: 600; cursor: pointer; }
+  td.dir a::before { content: "▸ "; color: var(--amber); }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; white-space: pre-wrap; word-break: break-word; }
+  .note { color: var(--dim); font-size: 13px; margin-top: 8px; }
+  label.chk { color: var(--dim); font-size: 12px; display: flex; gap: 6px; align-items: center; }
+  footer { color: var(--faint); font-size: 11.5px; text-align: center; padding: 26px 16px 34px; max-width: 720px; }
+  .hidden { display: none !important; }
+  @media (max-width: 600px) {
+    .card { padding: 14px 14px; }
+    td.when, th.when { display: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="/logo.svg" alt="">
+    <div class="mark">sia <b>s3</b></div>
+    <div class="tag">an S3 endpoint backed by Sia, served from an attested enclave</div>
+  </header>
+
+  <section class="card">
+    <h2>STATUS</h2>
+    <div class="kv">
+      <span>state <b id="state">…</b></span>
+      <span>version <b id="version">…</b></span>
+      <span>keys <b id="keys">…</b></span>
+      <span>stored <b id="bytes">…</b></span>
+      <span>sia objects <b id="objects">…</b></span>
+      <span>open uploads <b id="uploads">…</b></span>
+    </div>
+    <div class="kv" style="margin-top:6px">
+      <span>indexer <b><a id="indexer" target="_blank" rel="noopener noreferrer">…</a></b></span>
+      <span>region <b id="region">…</b></span>
+    </div>
+    <table id="buckets">
+      <thead><tr><th>bucket</th><th>keys</th><th>size</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="err hidden" id="booterr"></div>
+  </section>
+
+  <section class="card">
+    <h2>CONNECT</h2>
+    <div class="kv">
+      <span>endpoint <b id="endpoint">…</b><button class="copy" data-copy="endpoint">copy</button></span>
+      <span>region <b id="region2">…</b></span>
+      <span>addressing <b>path-style</b></span>
+    </div>
+    <div class="note">
+      Any S3 client works: SigV4, ranges, copy, multipart, ListObjectsV2. The access keys are this
+      deployment's <b>S3_ACCESS_KEY_ID</b> and <b>S3_SECRET_ACCESS_KEY</b> secrets.
+    </div>
+    <pre id="snip-aws"></pre>
+    <pre id="snip-rclone"></pre>
+  </section>
+
+  <section class="card">
+    <h2>BROWSE</h2>
+    <div id="login">
+      <div class="note">
+        Requests are signed in this page with your keys (SigV4, WebCrypto). The keys never leave the page:
+        only signatures are sent.
+      </div>
+      <div class="row">
+        <input type="text" id="ak" placeholder="access key id" autocomplete="off" spellcheck="false">
+        <input type="password" id="sk" placeholder="secret access key" autocomplete="off">
+        <button id="unlock">open</button>
+      </div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="remember"> keep the keys for this tab</label>
+      </div>
+    </div>
+    <div id="browser" class="hidden">
+      <div class="pathbar">
+        <select id="bucket"></select>
+        <span class="crumbs" id="crumbs"></span>
+        <button id="upbtn">upload here</button>
+        <button class="ghost" id="lock">forget keys</button>
+        <input type="file" id="upfile" multiple class="hidden">
+      </div>
+      <div class="mini" id="upnote"></div>
+      <table>
+        <thead><tr><th>name</th><th>size</th><th class="when">modified</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="row"><button class="ghost hidden" id="more">load more</button><span class="mini" id="count"></span></div>
+    </div>
+    <div class="err hidden" id="err"></div>
+  </section>
+
+  <footer>
+    Objects are encrypted and erasure-coded inside the enclave and spread across independent Sia hosts:
+    any 10 of 30 shards rebuild an object, so no host can read the data and losing hosts loses nothing.
+    The key index lives in the objects' own sealed metadata, so the app keeps no local state.
+  </footer>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const ORIGIN = location.origin, HOST = location.host;
+let REGION = "auto";
+
+function fmtBytes(n) {
+  if (n == null) return "–";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(n < 10 ? 2 : 1) : n) + " " + u[i];
+}
+function show(el, on) { el.classList.toggle("hidden", !on); }
+function setErr(msg) { $("err").textContent = msg || ""; show($("err"), !!msg); }
+
+// ---------------- status ----------------
+async function status() {
+  let s;
+  try { s = await (await fetch("/api/status", { cache: "no-store" })).json(); }
+  catch (e) { $("state").textContent = "unreachable"; $("state").className = "state-bad"; return; }
+  REGION = s.region || "auto";
+  $("version").textContent = s.version;
+  $("region").textContent = REGION; $("region2").textContent = REGION;
+  $("indexer").textContent = (s.indexer || "").replace(/^https?:\/\//, "");
+  $("indexer").href = s.indexer || "#";
+  $("state").textContent = s.ready ? "ready" : "starting";
+  $("state").className = s.ready ? "state-ready" : "state-busy";
+  $("booterr").textContent = !s.ready && s.bootError ? "last start attempt: " + s.bootError : "";
+  show($("booterr"), !s.ready && !!s.bootError);
+  const bs = s.buckets || [];
+  $("keys").textContent = s.ready ? bs.reduce((a, b) => a + (b.keys || 0), 0).toLocaleString() : "–";
+  $("bytes").textContent = s.ready ? fmtBytes(bs.reduce((a, b) => a + (b.bytes || 0), 0)) : "–";
+  $("objects").textContent = s.ready ? (s.objects || 0).toLocaleString() : "–";
+  $("uploads").textContent = s.ready ? (s.openUploads || 0) : "–";
+  const tb = $("buckets").querySelector("tbody"); tb.textContent = "";
+  for (const b of bs) {
+    const tr = document.createElement("tr");
+    for (const v of [b.name, s.ready ? (b.keys || 0).toLocaleString() : "–", s.ready ? fmtBytes(b.bytes || 0) : "–"]) {
+      const td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+  const first = bs[0] ? bs[0].name : "my-bucket";
+  $("endpoint").textContent = ORIGIN;
+  $("snip-aws").textContent =
+    "export AWS_ACCESS_KEY_ID=<S3_ACCESS_KEY_ID>\n" +
+    "export AWS_SECRET_ACCESS_KEY=<S3_SECRET_ACCESS_KEY>\n" +
+    "aws s3 ls s3://" + first + "/ --endpoint-url " + ORIGIN + " --region " + REGION;
+  $("snip-rclone").textContent =
+    "[sia]\ntype = s3\nprovider = Other\nendpoint = " + ORIGIN + "\nregion = " + REGION +
+    "\nforce_path_style = true\naccess_key_id = <S3_ACCESS_KEY_ID>\nsecret_access_key = <S3_SECRET_ACCESS_KEY>";
+}
+document.addEventListener("click", (e) => {
+  const id = e.target && e.target.dataset && e.target.dataset.copy;
+  if (!id) return;
+  navigator.clipboard.writeText($(id).textContent).then(() => {
+    e.target.textContent = "copied"; setTimeout(() => (e.target.textContent = "copy"), 1200);
+  });
+});
+
+// ---------------- SigV4 (same canonical form the server verifies) ----------------
+const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+async function sha256hex(data) { return hex(await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : data)); }
+async function hmac(key, msg) {
+  const k = await crypto.subtle.importKey("raw", typeof key === "string" ? enc.encode(key) : key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return crypto.subtle.sign("HMAC", k, enc.encode(msg));
+}
+// AWS URI encoding: everything but A-Z a-z 0-9 - _ . ~ (and "/" in paths)
+function awsEnc(s, keepSlash) {
+  let out = "";
+  for (const b of enc.encode(s)) {
+    const c = String.fromCharCode(b);
+    if (/[A-Za-z0-9\-_.~]/.test(c) || (keepSlash && c === "/")) out += c;
+    else out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+let creds = null;
+async function s3(method, bucket, key, query, body, extraHeaders) {
+  if (!creds) throw new Error("no keys");
+  const path = "/" + awsEnc(bucket, false) + (key ? "/" + awsEnc(key, true) : "");
+  const qs = Object.keys(query || {}).sort().map((k) => awsEnc(k) + "=" + awsEnc(String(query[k]))).join("&");
+  const now = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const day = now.slice(0, 8);
+  const payload = body ? "UNSIGNED-PAYLOAD" : await sha256hex("");
+  const h = Object.assign({ "host": HOST, "x-amz-date": now, "x-amz-content-sha256": payload }, extraHeaders || {});
+  const names = Object.keys(h).map((n) => n.toLowerCase()).sort();
+  const lower = {}; for (const n of Object.keys(h)) lower[n.toLowerCase()] = String(h[n]).trim().split(/\s+/).join(" ");
+  const canonical = [method, path || "/", qs, names.map((n) => n + ":" + lower[n] + "\n").join(""), names.join(";"), payload].join("\n");
+  const scope = day + "/" + REGION + "/s3/aws4_request";
+  const sts = "AWS4-HMAC-SHA256\n" + now + "\n" + scope + "\n" + (await sha256hex(canonical));
+  let k = await hmac("AWS4" + creds.sk, day);
+  for (const p of [REGION, "s3", "aws4_request"]) k = await hmac(k, p);
+  const sig = hex(await hmac(k, sts));
+  const headers = {};
+  for (const n of Object.keys(h)) if (n.toLowerCase() !== "host") headers[n] = h[n];
+  headers["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + creds.ak + "/" + scope + ", SignedHeaders=" + names.join(";") + ", Signature=" + sig;
+  return fetch((path || "/") + (qs ? "?" + qs : ""), { method, headers, body: body || undefined, cache: "no-store" });
+}
+async function s3err(r) {
+  const t = await r.text();
+  const m = t.match(/<Code>([^<]*)<\/Code>[\s\S]*?<Message>([^<]*)<\/Message>/);
+  return "HTTP " + r.status + (m ? " " + m[1] + ": " + m[2] : t ? ": " + t.slice(0, 200) : "");
+}
+const xmlDoc = (t) => new DOMParser().parseFromString(t, "application/xml");
+const tagText = (el, name) => { const x = el.getElementsByTagName(name)[0]; return x ? x.textContent : ""; };
+
+// ---------------- browse ----------------
+let bucket = "", prefix = "", token = null;
+const STORE_KEY = "sia-s3-keys";
+function loadKeys() { try { const v = sessionStorage.getItem(STORE_KEY); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
+function saveKeys(c) { try { if (c) sessionStorage.setItem(STORE_KEY, JSON.stringify(c)); else sessionStorage.removeItem(STORE_KEY); } catch (e) {} }
+
+async function unlock(c, remember) {
+  creds = c; setErr("");
+  $("unlock").disabled = true;
+  try {
+    const r = await s3("GET", "", "", {});
+    if (!r.ok) throw new Error(await s3err(r));
+    const names = Array.from(xmlDoc(await r.text()).getElementsByTagName("Bucket"), (b) => tagText(b, "Name"));
+    const sel = $("bucket"); sel.textContent = "";
+    for (const n of names) { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); }
+    if (remember) saveKeys(c);
+    show($("login"), false); show($("browser"), true);
+    bucket = names[0] || ""; prefix = ""; await list(true);
+  } catch (e) {
+    creds = null; saveKeys(null);
+    setErr("Could not open the bucket list: " + e.message);
+  } finally { $("unlock").disabled = false; }
+}
+function crumbs() {
+  const c = $("crumbs"); c.textContent = "";
+  const parts = prefix.split("/").filter(Boolean);
+  const root = document.createElement("a"); root.textContent = bucket + "/"; root.onclick = () => go(""); c.appendChild(root);
+  let acc = "";
+  parts.forEach((p, i) => {
+    acc += p + "/";
+    if (i === parts.length - 1) { const b = document.createElement("b"); b.textContent = p + "/"; c.appendChild(b); }
+    else { const a = document.createElement("a"); const to = acc; a.textContent = p + "/"; a.onclick = () => go(to); c.appendChild(a); }
+  });
+}
+function go(p) { prefix = p; list(true); }
+async function list(reset) {
+  setErr("");
+  if (reset) { token = null; $("rows").textContent = ""; }
+  crumbs();
+  const q = { "list-type": "2", "delimiter": "/", "max-keys": "500" };
+  if (prefix) q.prefix = prefix;
+  if (token) q["continuation-token"] = token;
+  let r;
+  try { r = await s3("GET", bucket, "", q); } catch (e) { setErr(e.message); return; }
+  if (!r.ok) { setErr(await s3err(r)); return; }
+  const d = xmlDoc(await r.text());
+  const rows = $("rows");
+  for (const cp of d.getElementsByTagName("CommonPrefixes")) {
+    const p = tagText(cp, "Prefix");
+    const tr = document.createElement("tr");
+    const td = document.createElement("td"); td.className = "name dir"; td.colSpan = 4;
+    const a = document.createElement("a"); a.textContent = p.slice(prefix.length); a.onclick = () => go(p);
+    td.appendChild(a); tr.appendChild(td); rows.appendChild(tr);
+  }
+  for (const c of d.getElementsByTagName("Contents")) {
+    const key = tagText(c, "Key"), size = +tagText(c, "Size"), when = tagText(c, "LastModified");
+    const tr = document.createElement("tr");
+    const n = document.createElement("td"); n.className = "name"; n.textContent = key.slice(prefix.length) || key;
+    const s = document.createElement("td"); s.className = "sz"; s.textContent = fmtBytes(size);
+    const w = document.createElement("td"); w.className = "when"; w.textContent = when.replace("T", " ").replace(/\.\d+Z$/, "Z");
+    const act = document.createElement("td"); act.className = "act";
+    const dl = document.createElement("button"); dl.className = "small"; dl.textContent = "download"; dl.onclick = () => download(key, dl);
+    const del = document.createElement("button"); del.className = "small danger"; del.textContent = "delete"; del.onclick = () => remove(key, del, tr);
+    act.append(dl, del);
+    tr.append(n, s, w, act); rows.appendChild(tr);
+  }
+  token = tagText(d, "IsTruncated") === "true" ? tagText(d, "NextContinuationToken") : null;
+  show($("more"), !!token);
+  const shown = rows.children.length;
+  $("count").textContent = shown ? shown + " entr" + (shown === 1 ? "y" : "ies") + (token ? " so far" : "") : "empty";
+}
+async function download(key, btn) {
+  btn.disabled = true; const label = btn.textContent; btn.textContent = "fetching…";
+  try {
+    const r = await s3("GET", bucket, key, {});
+    if (!r.ok) throw new Error(await s3err(r));
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a"); a.href = url; a.download = key.split("/").pop() || "object";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) { setErr("Download of " + key + " failed: " + e.message); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+async function remove(key, btn, tr) {
+  if (!btn.classList.contains("armed")) {
+    btn.classList.add("armed"); btn.textContent = "confirm";
+    setTimeout(() => { btn.classList.remove("armed"); btn.textContent = "delete"; }, 4000);
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const r = await s3("DELETE", bucket, key, {});
+    if (!r.ok && r.status !== 204) throw new Error(await s3err(r));
+    tr.remove(); status();
+  } catch (e) { setErr("Delete of " + key + " failed: " + e.message); btn.disabled = false; }
+}
+async function upload(files) {
+  for (const f of files) {
+    $("upnote").textContent = "uploading " + f.name + " (" + fmtBytes(f.size) + "): every object is erasure-coded across 30 Sia hosts, so this can take a few minutes…";
+    try {
+      const r = await s3("PUT", bucket, prefix + f.name, {}, f, f.type ? { "content-type": f.type } : null);
+      if (!r.ok) throw new Error(await s3err(r));
+    } catch (e) { setErr("Upload of " + f.name + " failed: " + e.message); }
+  }
+  $("upnote").textContent = "";
+  list(true); status();
+}
+
+$("unlock").onclick = () => {
+  const ak = $("ak").value.trim(), sk = $("sk").value.trim();
+  if (!ak || !sk) { setErr("Both keys are needed."); return; }
+  $("sk").value = "";
+  unlock({ ak, sk }, $("remember").checked);
+};
+$("sk").addEventListener("keydown", (e) => { if (e.key === "Enter") $("unlock").click(); });
+$("lock").onclick = () => { creds = null; saveKeys(null); $("rows").textContent = ""; show($("browser"), false); show($("login"), true); };
+$("bucket").onchange = (e) => { bucket = e.target.value; go(""); };
+$("more").onclick = () => list(false);
+$("upbtn").onclick = () => $("upfile").click();
+$("upfile").onchange = (e) => { const fs = Array.from(e.target.files || []); e.target.value = ""; if (fs.length) upload(fs); };
+
+status();
+setInterval(status, 15000);
+const kept = loadKeys();
+if (kept) status().then(() => unlock(kept, true));
+</script>
+</body>
+</html>
