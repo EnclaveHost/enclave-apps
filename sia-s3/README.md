@@ -40,6 +40,23 @@ Auth is SigV4 header auth with a hex `x-amz-content-sha256` (verified against th
 Not supported: presigned URLs, aws-chunked streaming uploads, ACLs, versioning, tagging. `GET /healthz` is
 unauthenticated and reports counts only.
 
+## File explorer
+
+An unsigned `GET /` serves a page with the status, client setup, and a file explorer that opens with the S3
+keys. The page signs every request itself (SigV4 in WebCrypto) and sends only signatures; nothing else in the
+app changes. It has a folder tree, list and grid views, sorting and filtering, multi-select, a right-click menu,
+keyboard control, drag and drop (files and folders in from the desktop, items onto folders to move them),
+cut/copy/paste, rename, move or copy across folders and buckets, recursive delete, downloads, and previews
+(images, video, audio, PDF, text; keys without an extension are sniffed). Notes:
+
+- Rename, move and copy are CopyObject (plus DELETE for a move), so they rewrite metadata and never move data.
+- Uploads above 48 MiB go multipart in 40 MiB parts. When the gateway in front of the app gives up on a slow
+  upload (502/504) the page keeps checking until the key appears with the file's MD5 ETag (multipart: until
+  Complete succeeds), for up to 20 minutes.
+- A new folder exists only in the tab until a file is put in it: an empty marker object would cost a slab.
+- Previews download whole objects (text: the first 256 KiB) and are capped by type; downloads are saved as
+  `application/octet-stream`, and HTML is never rendered.
+
 ## How keys map to Sia objects
 
 - PUT uploads the body as one Sia object whose metadata names the key, size, ETag (MD5) and mtime.

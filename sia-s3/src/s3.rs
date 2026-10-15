@@ -475,7 +475,7 @@ async fn page(app: &App, path: &str) -> Option<Resp> {
                 (
                     "Content-Security-Policy",
                     "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob: data:; \
-                     connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+                     media-src blob:; frame-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
                 ),
                 ("Referrer-Policy", "no-referrer"),
                 ("X-Content-Type-Options", "nosniff"),
