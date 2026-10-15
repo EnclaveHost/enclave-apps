@@ -36,7 +36,8 @@ is how deployment secrets arrive:
 PUT/GET/HEAD/DELETE object, ranges (`bytes=a-b`, `a-`, `-n`), CopyObject (`x-amz-copy-source`),
 ListObjectsV2 and v1 (prefix, delimiter, max-keys, continuation-token, start-after), DeleteObjects,
 multipart (create, upload part, complete, abort, list uploads), ListBuckets, HeadBucket, GetBucketLocation.
-Auth is SigV4 header auth with a hex `x-amz-content-sha256` (verified against the body) or `UNSIGNED-PAYLOAD`.
+Request bodies: Content-Length or `Transfer-Encoding: chunked` (wasi:http clients send even an empty DELETE body
+chunked). Auth is SigV4 header auth with a hex `x-amz-content-sha256` (verified against the body) or `UNSIGNED-PAYLOAD`.
 Conditional PUT: `If-None-Match: *` (create only) and `If-Match: <etag>` answer 412 when they do not hold, checked again
 when the new object is committed. A single PUT above `maxBodyBytes` (up to 16 GiB) is not buffered: it streams to Sia
 as it arrives, hashed on the way (a short body or a payload-hash mismatch stores nothing).

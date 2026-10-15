@@ -69,8 +69,30 @@ pub async fn read_request(s: &mut TcpStream, carry: &mut Vec<u8>, max_body: usiz
         .collect();
     let get = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
 
-    if get("transfer-encoding").is_some_and(|v| !v.eq_ignore_ascii_case("identity")) {
-        return Err(ReadError::Bad("chunked request bodies are not supported; send Content-Length".into()));
+    let chunked = match get("transfer-encoding") {
+        None => false,
+        Some(v) if v.eq_ignore_ascii_case("identity") => false,
+        // wasi:http clients (jot, depot) send even an empty DELETE body chunked, and R2 accepts it
+        Some(v) if v.eq_ignore_ascii_case("chunked") => true,
+        Some(_) => return Err(ReadError::Bad("unsupported transfer-encoding".into())),
+    };
+    if chunked {
+        let keep_alive = match get("connection") {
+            Some(v) if v.eq_ignore_ascii_case("close") => false,
+            Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
+            _ => !http10,
+        };
+        if get("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) && buf.len() == head_end {
+            s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.map_err(|e| ReadError::Bad(e.to_string()))?;
+        }
+        let mut rest = buf.split_off(head_end);
+        let body = read_chunked(s, &mut rest, max_body).await?;
+        *carry = rest;
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target, String::new()),
+        };
+        return Ok(Request { method, path, query, headers, body, keep_alive, stream: None });
     }
     let len: usize = match get("content-length") {
         Some(v) => v.parse().map_err(|_| ReadError::Bad("bad content-length".into()))?,
@@ -121,6 +143,54 @@ pub async fn read_request(s: &mut TcpStream, carry: &mut Vec<u8>, max_body: usiz
         None => (target, String::new()),
     };
     Ok(Request { method, path, query, headers, body, keep_alive, stream: None })
+}
+
+/// A chunked body, at most `max_body` bytes; `buf` holds bytes already read and keeps any read past the body's end.
+async fn read_chunked(s: &mut TcpStream, buf: &mut Vec<u8>, max_body: usize) -> Result<Vec<u8>, ReadError> {
+    async fn more(s: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(), ReadError> {
+        let mut chunk = [0u8; 16 << 10];
+        let n = s.read(&mut chunk).await.map_err(|e| ReadError::Bad(e.to_string()))?;
+        if n == 0 {
+            return Err(ReadError::Closed);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        Ok(())
+    }
+    async fn line(s: &mut TcpStream, buf: &mut Vec<u8>) -> Result<String, ReadError> {
+        loop {
+            if let Some(i) = buf.windows(2).position(|w| w == b"\r\n") {
+                let l = String::from_utf8_lossy(&buf[..i]).to_string();
+                buf.drain(..i + 2);
+                return Ok(l);
+            }
+            if buf.len() > 8 << 10 {
+                return Err(ReadError::Bad("chunk size line too long".into()));
+            }
+            more(s, buf).await?;
+        }
+    }
+    let mut body = Vec::new();
+    loop {
+        let size_line = line(s, buf).await?;
+        let hex = size_line.split(';').next().unwrap_or("").trim();
+        let n = usize::from_str_radix(hex, 16).map_err(|_| ReadError::Bad("bad chunk size".into()))?;
+        if n == 0 {
+            // trailers, then the blank line that ends the body
+            while !line(s, buf).await?.is_empty() {}
+            return Ok(body);
+        }
+        if body.len() + n > max_body {
+            return Err(ReadError::TooLarge);
+        }
+        while buf.len() < n + 2 {
+            more(s, buf).await?;
+        }
+        if &buf[n..n + 2] != b"\r\n" {
+            return Err(ReadError::Bad("chunk not followed by CRLF".into()));
+        }
+        body.extend_from_slice(&buf[..n]);
+        buf.drain(..n + 2);
+    }
 }
 
 pub fn reason(status: u16) -> &'static str {
