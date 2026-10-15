@@ -26,6 +26,15 @@ use tokio::sync::Mutex;
 
 pub type Res<T> = Result<T, String>;
 
+/// A conditional PUT (If-Match / If-None-Match: *): checked before the upload, and again under the index lock when the
+/// new object is committed, so a writer that lost a race in between gets PreconditionFailed instead of overwriting.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cond {
+    None,
+    IfMatch(String),
+    IfNoneMatch,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Entry {
     pub b: String,
@@ -103,6 +112,15 @@ pub struct Store {
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn cond_holds(idx: &Index, kk: &(String, String), cond: &Cond) -> Res<()> {
+    let ok = match cond {
+        Cond::None => true,
+        Cond::IfNoneMatch => !idx.keys.contains_key(kk),
+        Cond::IfMatch(t) => idx.keys.get(kk).is_some_and(|k| t == "*" || k.entry.t == *t),
+    };
+    if ok { Ok(()) } else { Err("PreconditionFailed".into()) }
 }
 
 fn e2s<E: std::fmt::Display>(e: E) -> String {
@@ -270,16 +288,46 @@ impl Store {
         Ok(())
     }
 
-    pub async fn put(&self, b: &str, k: &str, body: Vec<u8>, ct: Option<String>) -> Res<String> {
+    /// Is `cond` true for the key now? Err("PreconditionFailed") when not.
+    pub async fn check(&self, b: &str, k: &str, cond: &Cond) -> Res<()> {
+        let idx = self.idx.lock().await;
+        cond_holds(&idx, &(b.to_string(), k.to_string()), cond)
+    }
+
+    pub async fn put(&self, b: &str, k: &str, body: Vec<u8>, ct: Option<String>, cond: &Cond) -> Res<String> {
+        self.check(b, k, cond).await?;
         let etag = md5_hex(&body);
         let size = body.len() as u64;
-        let mut obj = self.upload(body).await?;
-        let entry = Entry { b: b.into(), k: k.into(), s: size, t: etag.clone(), m: now(), c: ct, x: vec![] };
+        let obj = self.upload(body).await?;
+        self.commit(b, k, obj, etag.clone(), size, ct, cond).await?;
+        Ok(etag)
+    }
+
+    /// Upload a body streamed from `reader` (a single PUT too large to buffer); the caller commits it once the body's
+    /// hashes are known.
+    pub async fn upload_reader<R: tokio::io::AsyncRead + Unpin + 'static>(&self, reader: R) -> Res<Object> {
+        self.sdk.upload(Object::default(), reader, upload_opts()).await.map_err(e2s)
+    }
+
+    /// Drop an uploaded object that will not be committed (a failed hash check or condition).
+    pub async fn discard(&self, obj: &Object) {
+        let _ = self.sdk.delete_object(&obj.id()).await;
+    }
+
+    /// Make an uploaded object the key's content: pin its entry, then (under the lock, the condition checked again)
+    /// replace the key's old entry.
+    pub async fn commit(&self, b: &str, k: &str, mut obj: Object, etag: String, size: u64, ct: Option<String>, cond: &Cond) -> Res<()> {
+        let entry = Entry { b: b.into(), k: k.into(), s: size, t: etag, m: now(), c: ct, x: vec![] };
         let meta = Meta { v: 1, p: false, e: vec![entry.clone()], mp: None };
         self.pin_with(&mut obj, &meta).await?;
         let id = obj.id().to_string();
         let mut idx = self.idx.lock().await;
         let kk = (b.to_string(), k.to_string());
+        if let Err(e) = cond_holds(&idx, &kk, cond) {
+            drop(idx);
+            self.discard(&obj).await;
+            return Err(e);
+        }
         // the new object is pinned and authoritative (newest mtime) even if the
         // old entry cannot be removed now; a stale entry loses at the next boot
         if let Err(e) = self.detach(&mut idx, &kk).await {
@@ -287,7 +335,7 @@ impl Store {
         }
         idx.objs.insert(id.clone(), (obj, meta));
         idx.keys.insert(kk, Key { host: id, entry });
-        Ok(etag)
+        Ok(())
     }
 
     pub async fn copy(&self, src: (&str, &str), dst: (&str, &str)) -> Res<(String, i64)> {

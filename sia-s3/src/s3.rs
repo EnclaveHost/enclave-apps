@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 
 use crate::http::{Request, write_head};
 use crate::sigv4::{self, Verdict, percent_decode};
-use crate::store::Store;
+use crate::store::{Cond, Store};
 
 pub struct App {
     pub store: std::cell::RefCell<Option<Rc<Store>>>,
@@ -66,6 +66,7 @@ fn store_err(e: String, resource: &str) -> Resp {
     match code {
         "NoSuchKey" => err(404, "NoSuchKey", "The specified key does not exist.", resource),
         "NoSuchUpload" => err(404, "NoSuchUpload", "The specified upload does not exist.", resource),
+        "PreconditionFailed" => err(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", resource),
         "InvalidPart" | "InvalidPartOrder" => err(400, code, &e, resource),
         _ => {
             eprintln!("[sia-s3] {resource}: {e}");
@@ -219,7 +220,18 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
         }
         "PUT" => {
             let ct = req.header("content-type").map(String::from);
-            let r = match store.put(&bucket, &key, req.body.clone(), ct).await {
+            // conditional writes (jot's and depot's compare-and-swap): If-None-Match: * creates only, If-Match an ETag
+            let cond = match (req.header("if-none-match"), req.header("if-match")) {
+                (Some(v), _) if v.trim() == "*" => Cond::IfNoneMatch,
+                (Some(_), _) => return send(w, err(501, "NotImplemented", "If-None-Match on PUT supports only *", &resource), ka).await,
+                (None, Some(t)) => Cond::IfMatch(t.trim().trim_start_matches("W/").trim_matches('"').to_string()),
+                (None, None) => Cond::None,
+            };
+            if let Some(rest) = req.stream {
+                let r = put_streamed(&store, req, &bucket, &key, ct, &cond, rest, w).await;
+                return send(w, r, false).await;
+            }
+            let r = match store.put(&bucket, &key, req.body.clone(), ct, &cond).await {
                 Ok(etag) => Resp { status: 200, headers: vec![("ETag".into(), format!("\"{etag}\""))], body: vec![] },
                 Err(e) => store_err(e, &resource),
             };
@@ -269,6 +281,63 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
             send(w, r, ka).await
         }
         _ => send(w, err(501, "NotImplemented", "operation not supported", &resource), ka).await,
+    }
+}
+
+/// A single PUT too large to buffer: the body goes from the socket through a pipe into the Sia upload as it arrives,
+/// hashed on the way (MD5 = the ETag, SHA-256 = the signed payload hash, checked before anything is committed).
+#[allow(clippy::too_many_arguments)]
+async fn put_streamed(store: &Store, req: &Request, b: &str, k: &str, ct: Option<String>, cond: &Cond, rest: u64, w: &mut TcpStream) -> Resp {
+    use md5::{Digest as _, Md5};
+    use sha2::Sha256;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let resource = req.path.clone();
+    if let Err(e) = store.check(b, k, cond).await {
+        return store_err(e, &resource);
+    }
+    let size = req.body.len() as u64 + rest;
+    let want_sha = req.header("x-amz-content-sha256").filter(|p| p.len() == 64).map(|p| p.to_ascii_lowercase());
+    let (mut tx, rx) = tokio::io::duplex(4 << 20);
+    let pump = async {
+        let (mut md5, mut sha) = (Md5::new(), Sha256::new());
+        md5.update(&req.body);
+        sha2::Digest::update(&mut sha, &req.body);
+        tx.write_all(&req.body).await?;
+        let mut n = req.body.len() as u64;
+        let mut buf = vec![0u8; 256 << 10];
+        while n < size {
+            let want = (size - n).min(buf.len() as u64) as usize;
+            let m = w.read(&mut buf[..want]).await?;
+            if m == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("the body ended after {n} of {size} bytes")));
+            }
+            md5.update(&buf[..m]);
+            sha2::Digest::update(&mut sha, &buf[..m]);
+            tx.write_all(&buf[..m]).await?;
+            n += m as u64;
+        }
+        tx.shutdown().await?;
+        Ok::<_, std::io::Error>((hex::encode(md5.finalize()), hex::encode(sha2::Digest::finalize(sha))))
+    };
+    let (hashes, obj) = tokio::join!(pump, store.upload_reader(rx));
+    let obj = match obj {
+        Ok(o) => o,
+        Err(e) => return store_err(e, &resource),
+    };
+    let (etag, sha) = match hashes {
+        Ok(h) => h,
+        Err(e) => {
+            store.discard(&obj).await;
+            return err(400, "IncompleteBody", &e.to_string(), &resource);
+        }
+    };
+    if want_sha.is_some_and(|w| w != sha) {
+        store.discard(&obj).await;
+        return err(400, "XAmzContentSHA256Mismatch", "body does not match x-amz-content-sha256", &resource);
+    }
+    match store.commit(b, k, obj, etag.clone(), size, ct, cond).await {
+        Ok(()) => Resp { status: 200, headers: vec![("ETag".into(), format!("\"{etag}\""))], body: vec![] },
+        Err(e) => store_err(e, &resource),
     }
 }
 

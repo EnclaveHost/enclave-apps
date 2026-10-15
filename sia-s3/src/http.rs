@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const MAX_HEAD: usize = 64 << 10;
+/// A single PUT larger than the buffered body limit streams to Sia (risc-box saves a ~1 GB disk in one PUT); up to this.
+pub const MAX_STREAM: u64 = 16 << 30;
 
 pub struct Request {
     pub method: String,
@@ -17,6 +19,8 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub keep_alive: bool,
+    /// a streamed PUT: `body` holds the bytes already read, and this many more are still on the socket
+    pub stream: Option<u64>,
 }
 
 impl Request {
@@ -72,19 +76,34 @@ pub async fn read_request(s: &mut TcpStream, carry: &mut Vec<u8>, max_body: usiz
         Some(v) => v.parse().map_err(|_| ReadError::Bad("bad content-length".into()))?,
         None => 0,
     };
-    if len > max_body {
+    // only a plain object PUT may stream (not a part, not a copy); everything else stays bounded
+    let streams = len > max_body
+        && method == "PUT"
+        && !target.contains("uploadId=")
+        && get("x-amz-copy-source").is_none()
+        && len as u64 <= MAX_STREAM;
+    if len > max_body && !streams {
         return Err(ReadError::TooLarge);
     }
-    let keep_alive = match get("connection") {
+    let keep_alive = streams.then_some(false).unwrap_or(match get("connection") {
         Some(v) if v.eq_ignore_ascii_case("close") => false,
         Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
         _ => !http10,
-    };
+    });
     if len > 0 && get("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) && buf.len() == head_end {
         s.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.map_err(|e| ReadError::Bad(e.to_string()))?;
     }
 
     let mut body = buf.split_off(head_end);
+    if streams {
+        body.truncate(len);
+        let rest = (len - body.len()) as u64;
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target, String::new()),
+        };
+        return Ok(Request { method, path, query, headers, body, keep_alive, stream: Some(rest) });
+    }
     while body.len() < len {
         let mut chunk = vec![0u8; (len - body.len()).min(256 << 10)];
         let n = s.read(&mut chunk).await.map_err(|e| ReadError::Bad(e.to_string()))?;
@@ -101,7 +120,7 @@ pub async fn read_request(s: &mut TcpStream, carry: &mut Vec<u8>, max_body: usiz
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
     };
-    Ok(Request { method, path, query, headers, body, keep_alive })
+    Ok(Request { method, path, query, headers, body, keep_alive, stream: None })
 }
 
 pub fn reason(status: u16) -> &'static str {

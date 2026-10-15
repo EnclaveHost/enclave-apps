@@ -126,8 +126,9 @@ pub fn verify(req: &Request, credentials: &[(String, String)]) -> Verdict {
     let payload = req.header("x-amz-content-sha256").unwrap_or("");
     match payload {
         "UNSIGNED-PAYLOAD" => {}
+        // a streamed body is hashed as it arrives and compared at its end (s3.rs), before anything is committed
         p if p.len() == 64 && p.bytes().all(|c| c.is_ascii_hexdigit()) => {
-            if hex::encode(Sha256::digest(&req.body)) != p.to_ascii_lowercase() {
+            if req.stream.is_none() && hex::encode(Sha256::digest(&req.body)) != p.to_ascii_lowercase() {
                 return Verdict::Denied("XAmzContentSHA256Mismatch", "body does not match x-amz-content-sha256".into());
             }
         }
