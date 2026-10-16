@@ -99,7 +99,8 @@ fn run_owned(
     let mut last_tick = 0;
     let mut last_renew = now();
     loop {
-        if now() >= state.lease_until {
+        // Runs in flight need the lease the whole time; an idle scheduler lets it lapse.
+        if !active.is_empty() && now() >= state.lease_until {
             return Err("Lease expired; fencing without replay".into());
         }
         let mut finished = Vec::new();
@@ -128,7 +129,18 @@ fn run_owned(
             commit(store, &mut state)?;
             last_renew = now();
         }
-        let mut requests = server.poll(32768).into_iter();
+        let polled = server.poll(32768);
+        if !polled.is_empty() && now() >= state.lease_until {
+            // lapsed while idle: answer only if the stored state is still ours
+            if let Err(e) = store.still_ours() {
+                for (conn, req) in polled {
+                    server.respond(conn, api::unavailable(&req));
+                }
+                server.flush();
+                return Err(e);
+            }
+        }
+        let mut requests = polled.into_iter();
         while let Some((conn, req)) = requests.next() {
             let mut candidate = state.clone();
             let out = api::route(
@@ -176,7 +188,7 @@ fn run_owned(
                 }
             }
         }
-        if now().saturating_sub(last_renew) >= store::RENEW_AFTER {
+        if !active.is_empty() && now().saturating_sub(last_renew) >= store::RENEW_AFTER {
             commit(store, &mut state)?;
             last_renew = now();
         }

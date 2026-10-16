@@ -12,7 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 KEY='test-service-key-'+('a'*40);MASTER='test-encryption-key-'+('b'*40)
 USER='acct_'+('a'*32);OTHER='acct_'+('b'*32)
 ACCESS='synthetic-access';SECRET='synthetic-storage-secret'
-blob=None;etag=None;calls=[];lock=threading.Lock();fail_put=False;lose_put_reply=False
+blob=None;etag=None;calls=[];lock=threading.Lock();fail_put=False;lose_put_reply=False;puts=0
 
 def seal_state(state):
     k=hmac.new(hashlib.sha256(MASTER.encode()).digest(),b'enclave-cron-v1:state',hashlib.sha256).digest()
@@ -51,8 +51,9 @@ class Mock(BaseHTTPRequestHandler):
             with lock:self.send(200,blob,{'ETag':etag}) if blob is not None else self.send(404)
         else:self.send(404)
     def do_PUT(self):
-        global blob,etag,lose_put_reply
+        global blob,etag,lose_put_reply,puts
         b=self.rfile.read(int(self.headers.get('Content-Length','0')))
+        with lock:puts+=1
         if not self.signature_ok(b):self.send(403);return
         with lock:
             if fail_put:self.send(503);return
@@ -160,13 +161,14 @@ def main():
             assert pr.poll() is None and len(calls)==4 and req('/ping')[0]==503
             fail_put=False;expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
             assert pr.poll() is None and len(calls)==4
-            # Idle lease renewal takes the same safe recovery path, without any
-            # API mutation being necessary to trigger a storage failure.
-            fail_put=True
-            wait_for(lambda:req('/ping')[0]==503,40)
+            # An idle scheduler writes nothing (on sia-s3 every write is a full slab
+            # upload): it attempts no storage write, so a failing store does not
+            # disturb it, and it keeps serving.
+            fail_put=True;before=puts
+            time.sleep(5)
+            assert puts==before and req('/ping')[0]==200
             assert pr.poll() is None and len(calls)==4
-            fail_put=False;expire_lease();wait_for(lambda:req('/ping')[0]==200,40)
-            assert pr.poll() is None and len(calls)==4
+            fail_put=False
             # The storage accepted a run claim but the reply was lost. The scheduler
             # repeats the same conditional write, meets the conflict its own write
             # caused, reads the object back, finds exactly its claim, and carries on:

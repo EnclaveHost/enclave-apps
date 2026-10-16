@@ -7,8 +7,11 @@ pub const STORAGE_TIMEOUT: u64 = 120;
 /// A save is at most three storage requests (PUT, its repeat, the read-back),
 /// so the lease outlasts the slowest save that can still succeed.
 pub const LEASE: u64 = 600;
-/// An idle scheduler renews its lease this often, leaving LEASE - RENEW_AFTER
-/// (> 3 x STORAGE_TIMEOUT) for the renewal itself to land.
+/// While runs are in flight the scheduler renews its lease this often, leaving
+/// LEASE - RENEW_AFTER (> 3 x STORAGE_TIMEOUT) for the renewal itself to land.
+/// An idle scheduler writes nothing (on sia-s3 every write is a full slab
+/// upload): it lets the lease lapse and checks the object is still its own
+/// before it answers or writes again.
 pub const RENEW_AFTER: u64 = 240;
 pub struct Store {
     cfg: Storage,
@@ -101,6 +104,21 @@ impl Store {
         s.recover(now);
         self.save(&mut s, now)?;
         Ok(s)
+    }
+    /// After an idle lapse of the lease: is the stored object still the one this
+    /// scheduler last wrote? Anything else (another scheduler took over, or the
+    /// object is gone) fences. A read only, never a write.
+    pub fn still_ours(&mut self) -> Result<(), String> {
+        let r = self.request("GET", &[], false)?;
+        let tag = r.header("etag").filter(|s| !s.is_empty()).map(str::to_string);
+        if r.status == 200 && tag.is_some() && tag == self.etag {
+            Ok(())
+        } else {
+            Err(format!(
+                "Stored state changed while the lease was lapsed (HTTP {}); execution fenced",
+                r.status
+            ))
+        }
     }
     /// After an ambiguous write whose repeat met a conflict: did the first one
     /// land? Only an object that opens to exactly what we wrote is ours.
@@ -300,6 +318,23 @@ mod tests {
         let mut s = st.load(1000).unwrap();
         st.save(&mut s, 1001).expect("the repeat lands");
         st.save(&mut s, 1002).unwrap();
+    }
+
+    #[test]
+    fn an_idle_lapse_is_checked_by_reading_only() {
+        let (url, b) = bucket(vec![]);
+        let mut st = store(&url);
+        let _s = st.load(1000).unwrap();
+        let writes = b.lock().unwrap().n;
+        st.still_ours().expect("nobody else wrote");
+        assert_eq!(b.lock().unwrap().n, writes, "the check wrote nothing");
+        {
+            let mut g = b.lock().unwrap();
+            g.n += 1;
+            let other = Cipher::for_scope("m", "state").seal("cron/state", b"{\"other\":true}").unwrap();
+            g.obj = Some((other, format!("\"v{}\"", g.n)));
+        }
+        assert!(st.still_ours().unwrap_err().contains("fenced"));
     }
 
     #[test]
