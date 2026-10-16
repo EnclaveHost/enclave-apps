@@ -176,7 +176,7 @@ fn run_owned(
                 }
             }
         }
-        if now().saturating_sub(last_renew) >= 30 {
+        if now().saturating_sub(last_renew) >= store::RENEW_AFTER {
             commit(store, &mut state)?;
             last_renew = now();
         }

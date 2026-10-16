@@ -1,7 +1,15 @@
 use crate::{config::Storage, crypt::Cipher, engine::State, net::Pending, sigv4};
 use sha2::{Digest, Sha256};
 pub const MAX_STATE: usize = 4 * 1024 * 1024;
-pub const LEASE: u64 = 120;
+/// Storage requests get this long (sia-s3 takes 20-60 s per small PUT: every
+/// object uploads a full slab to its hosts).
+pub const STORAGE_TIMEOUT: u64 = 120;
+/// A save is at most three storage requests (PUT, its repeat, the read-back),
+/// so the lease outlasts the slowest save that can still succeed.
+pub const LEASE: u64 = 600;
+/// An idle scheduler renews its lease this often, leaving LEASE - RENEW_AFTER
+/// (> 3 x STORAGE_TIMEOUT) for the renewal itself to land.
+pub const RENEW_AFTER: u64 = 240;
 pub struct Store {
     cfg: Storage,
     etag: Option<String>,
@@ -60,7 +68,7 @@ impl Store {
             &format!("{}{path}", self.cfg.endpoint.trim_end_matches('/')),
             &headers,
             body,
-            20,
+            STORAGE_TIMEOUT,
             MAX_STATE + 64,
         )?
         .wait()

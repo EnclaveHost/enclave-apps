@@ -13,8 +13,8 @@ offset; intervals use seconds and an anchor; five-field numeric cron uses
 
 **Missed jobs are skipped.** After recovery, an expired one-time job is marked
 skipped. A recurring job resumes at its next future occurrence, without
-replaying the backlog. While running, the scheduler allows 30 seconds of
-ordinary dispatch jitter; an occurrence that cannot get a slot in that time
+replaying the backlog. While running, the scheduler allows 150 seconds of
+ordinary dispatch jitter (one slow storage write can hold the loop); an occurrence that cannot get a slot in that time
 is skipped too. One job never overlaps itself.
 
 ## Eyesoff integration
@@ -144,7 +144,8 @@ prompts and results from the bucket. The service key and callback credentials
 are never serialized into this state. Whoever controls the deployment master
 secret can decrypt it; this is not protection from that secret's holder.
 
-A 120-second lease, renewed every 30 seconds, and ETag compare-and-swap writes
+A 600-second lease, renewed every 240 seconds, and ETag compare-and-swap writes
+(storage requests may take up to 120 seconds: sia-s3 needs 20-60 s per small PUT)
 fence concurrent scheduler instances. Mutations and a run's `running` record
 are committed **before** acknowledgement or outbound effects. Missing ETags,
 CAS conflicts, invalid ciphertext, and failed/ambiguous writes stop dispatch and

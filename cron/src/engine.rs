@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-pub const GRACE: u64 = 30;
+/// How late a due occurrence may still start. Covers one slow storage save
+/// (crate::store::STORAGE_TIMEOUT) holding the single-threaded loop.
+pub const GRACE: u64 = 150;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
@@ -247,7 +249,7 @@ impl State {
                 continue;
             }
             if now.saturating_sub(due) > GRACE {
-                self.skip(&id, now, "Occurrence missed its 30-second dispatch grace");
+                self.skip(&id, now, "Occurrence missed its 150-second dispatch grace");
                 continue;
             }
             if out.len() >= slots {
@@ -408,9 +410,10 @@ mod tests {
         let mut s = State::default();
         let j = s.create("a", spec(), 60).unwrap();
         assert!(s.update("a", &j.id, None, Some(false), 2, 80).is_err());
-        assert!(s.claim_due(160, 1).is_empty());
+        // due at 120: still dispatched within GRACE, skipped once later than that
+        assert!(s.claim_due(120 + GRACE + 10, 1).is_empty());
         assert_eq!(s.runs[0].status, "skipped");
-        assert_eq!(s.jobs[&j.id].next_due, Some(180));
+        assert_eq!(s.jobs[&j.id].next_due, Some(300));
     }
     #[test]
     fn manual_idempotence() {
