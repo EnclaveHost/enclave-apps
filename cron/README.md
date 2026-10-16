@@ -148,8 +148,7 @@ A 600-second lease and ETag compare-and-swap writes (storage requests may take u
 to 120 seconds: sia-s3 needs 20-60 s per small PUT, each a full slab upload).
 The lease is held while runs are in flight, renewed every 240 seconds; an idle
 scheduler writes nothing, lets the lease lapse, and before it answers again
-re-reads the stored object (a read, never a write) to confirm it is still its own.
-fence concurrent scheduler instances. Mutations and a run's `running` record
+re-reads the stored object (a read, never a write) to confirm it is still its own. Together these fence concurrent scheduler instances. Mutations and a run's `running` record
 are committed **before** acknowledgement or outbound effects. Missing ETags,
 CAS conflicts, invalid ciphertext, and failed/ambiguous writes stop dispatch and
 return HTTP 503 with `Retry-After`. The process and listener stay alive, preserving
