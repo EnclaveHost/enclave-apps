@@ -27,6 +27,12 @@ use sha2::{Digest, Sha256};
 /// wedged connection, not a slow one; erroring lets the caller retry fresh.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(90);
 
+/// A PUT waits for the store to commit, and sia-s3 commits a small object only once its slab is on 30 Sia hosts:
+/// 20-60 s, set by the hosts' 4 MiB sector writes (2026-10-15). At 30 s every pin answered 502 while the object
+/// landed anyway. The loop is single-threaded, so the gateway waits with it; pins are rare.
+const PUT_READ_TIMEOUT: Duration = Duration::from_secs(180);
+const PUT_DEADLINE: Duration = Duration::from_secs(240);
+
 #[derive(Clone)]
 pub struct Creds {
     pub access_key_id: String,
@@ -216,7 +222,7 @@ impl Write for Wire {
     }
 }
 
-fn connect(ep: &Endpoint) -> Result<Wire, String> {
+fn connect(ep: &Endpoint, read_timeout: Duration) -> Result<Wire, String> {
     // No connect timeout, deliberately: dial(None) is plain TcpStream::connect,
     // which resolves names and tries each address itself. connect_timeout is
     // not trustworthy on wasm32-wasip2 (it can hand back a socket whose
@@ -226,7 +232,7 @@ fn connect(ep: &Endpoint) -> Result<Wire, String> {
     let sock = crate::egress::dial(ep.host.as_str(), ep.port, None)?;
     // A read timeout so a wedged peer surfaces as an error instead of
     // stalling the (single-threaded) event loop forever.
-    let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = sock.set_read_timeout(Some(read_timeout));
     if !ep.https {
         return Ok(Wire::Plain(sock));
     }
@@ -327,8 +333,9 @@ fn request_opt(
     }
     head.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", body.len()));
 
-    let deadline = Instant::now() + REQUEST_DEADLINE;
-    let mut wire = connect(ep)?;
+    let put = method == "PUT";
+    let deadline = Instant::now() + if put { PUT_DEADLINE } else { REQUEST_DEADLINE };
+    let mut wire = connect(ep, if put { PUT_READ_TIMEOUT } else { Duration::from_secs(30) })?;
     wire.write_all(head.as_bytes()).map_err(|e| format!("send: {e}"))?;
     // 64 KiB body chunks keep the TLS record path and wasi write sizes sane
     for chunk in body.chunks(64 * 1024) {
