@@ -1,3 +1,26 @@
+diff --git a/cmd/indexd/run.go b/cmd/indexd/run.go
+index 2388cb7..814ce21 100644
+--- a/cmd/indexd/run.go
++++ b/cmd/indexd/run.go
+@@ -343,10 +343,15 @@ func runRootCmd(ctx context.Context, cfg config.Config, walletKey types.PrivateK
+ 		return fmt.Errorf("failed to create application API: %w", err)
+ 	}
+ 
++	// enclave.host: an app's pin can outlast 30 s while the indexer is busy, and Go's WriteTimeout then cut the answer
++	// mid-response ("http: i/o: early eof" at sia-s3, 2026-10-16); with no IdleTimeout, ReadTimeout also closed a
++	// keep-alive connection that sat idle through a 30-60 s slab upload.
+ 	appAPI := http.Server{
+-		Handler:      appHandler,
+-		ReadTimeout:  30 * time.Second,
+-		WriteTimeout: 30 * time.Second,
++		Handler:           appHandler,
++		ReadHeaderTimeout: 30 * time.Second,
++		ReadTimeout:       5 * time.Minute,
++		WriteTimeout:      5 * time.Minute,
++		IdleTimeout:       5 * time.Minute,
+ 	}
+ 	defer appAPI.Close()
+ 
 diff --git a/contracts/form.go b/contracts/form.go
 index 385a284..45e48bc 100644
 --- a/contracts/form.go
