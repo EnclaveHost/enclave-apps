@@ -20,7 +20,7 @@
     <text x="96" y="176" fill="#e3eaf2" font-size="76" font-weight="700" letter-spacing="-1.5">EnclaveDNS</text>
     <text x="98" y="236" fill="#8fb4ff" font-size="30">every answer, verified.</text>
     <text x="98" y="298" fill="#93a4b6" font-size="20">DNSSEC from the root · .eth from ENS · .onion, never leaked</text>
-    <text x="98" y="330" fill="#5f7184" font-size="18">UDP · TCP · DNS-over-TLS · DNS-over-HTTPS — in an attested enclave</text>
+    <text x="98" y="330" fill="#5f7184" font-size="18">DNS-over-HTTPS · JSON API — in an attested enclave</text>
   </g>
   <g fill="none" stroke="url(#sig)" stroke-width="3" stroke-linecap="round">
     <path d="M1240 70 L1060 180"/>
