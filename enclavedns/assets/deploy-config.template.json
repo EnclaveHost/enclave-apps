@@ -1,0 +1,28 @@
+{
+  "recursion": true,
+  "zone_key_seed": "$ENCLAVEDNS_ZONE_SEED",
+  "admin_token": "$ENCLAVEDNS_ADMIN_TOKEN",
+  "resolver": {
+    "validate": true,
+    "qname_minimisation": true,
+    "transport": "auto"
+  },
+  "zones": [],
+  "ens": {
+    "rpc": [
+      "https://ethereum-rpc.publicnode.com",
+      "https://eth.drpc.org",
+      "https://rpc.flashbots.net"
+    ],
+    "quorum": 2,
+    "ttl": 300
+  },
+  "onion": {
+    "a": [],
+    "aaaa": []
+  },
+  "rate_limit": {
+    "udp_per_second": 40,
+    "udp_burst": 80
+  }
+}

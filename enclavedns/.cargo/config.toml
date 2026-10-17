@@ -1,0 +1,4 @@
+# Tests run as the real thing: a wasip2 component under wasmtime, with the
+# network the platform grants a run-mode app (tests/live.sh needs it).
+[target.wasm32-wasip2]
+runner = "wasmtime run -Scli -Stcp -Sudp -Sinherit-network -Sallow-ip-name-lookup"

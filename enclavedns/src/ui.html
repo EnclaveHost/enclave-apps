@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EnclaveDNS</title>
+<meta name="description" content="A validating DNSSEC resolver in an attested enclave, with native .eth and .onion resolution.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f1722'/%3E%3Cpath d='M9 10h14M9 16h10M9 22h14' stroke='%235fd4a0' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+:root{color-scheme:dark;--bg:#080d14;--panel:#0f1722;--panel2:#131d2a;--line:#22303f;--line2:#2f4053;--text:#e3eaf2;--dim:#93a4b6;--faint:#6b7d90;--acc:#8fb4ff;--jade:#5fd4a0;--warn:#ffc36e;--bad:#ff8a8a;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--ease:cubic-bezier(.2,.7,.2,1)}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--acc)}
+main{max-width:980px;margin:0 auto;padding:28px 16px 64px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font:600 22px/1.2 var(--mono);margin:0;letter-spacing:-.01em}
+.ver{font:12px var(--mono);color:var(--faint)}
+.live{margin-left:auto;font:12px var(--mono);color:var(--dim);display:flex;align-items:center;gap:8px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);transition:background .3s var(--ease)}
+.dot.on{background:var(--jade);box-shadow:0 0 10px rgba(95,212,160,.5)}
+.lede{color:var(--dim);max-width:70ch;margin:10px 0 26px}
+.lede b{color:var(--text);font-weight:600}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 18px 16px;margin:0 0 18px}
+h2{font:600 13px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:0 0 12px}
+.ep{display:grid;grid-template-columns:150px 1fr auto;gap:8px 12px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+.ep:first-of-type{border-top:0}
+.ep .k{color:var(--dim);font-size:13px}
+.ep code{font:13px var(--mono);color:var(--text);word-break:break-all}
+.ep small{display:block;color:var(--faint);font-size:12px;margin-top:2px}
+button{font:13px var(--mono);color:var(--text);background:var(--panel2);border:1px solid var(--line2);border-radius:8px;padding:6px 11px;cursor:pointer;transition:border-color .2s var(--ease),background .2s var(--ease)}
+button:hover{border-color:var(--acc)}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input[type=text],select{font:14px var(--mono);color:var(--text);background:var(--bg);border:1px solid var(--line2);border-radius:8px;padding:8px 10px}
+input[type=text]{flex:1 1 280px;min-width:0}
+label.chk{font-size:13px;color:var(--dim);display:flex;gap:6px;align-items:center}
+.examples{margin:10px 0 0;font-size:13px;color:var(--faint);display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.examples button{padding:3px 8px;font-size:12px}
+#out{margin-top:14px}
+.verdict{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font:13px var(--mono);margin-bottom:10px}
+.badge{border-radius:999px;padding:2px 10px;font:600 12px var(--mono);border:1px solid var(--line2);color:var(--dim)}
+.badge.secure{color:var(--jade);border-color:rgba(95,212,160,.5);background:rgba(95,212,160,.08)}
+.badge.bogus{color:var(--bad);border-color:rgba(255,138,138,.5);background:rgba(255,138,138,.08)}
+.badge.rc{color:var(--text)}
+.ede{font:13px var(--mono);color:var(--warn);margin:0 0 10px}
+table{width:100%;border-collapse:collapse;font:13px var(--mono)}
+th{text-align:left;color:var(--faint);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top;word-break:break-all}
+td.t{color:var(--acc);white-space:nowrap}
+td.ttl{color:var(--faint);white-space:nowrap}
+tr.sig td{color:var(--faint)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.stat .v{font:600 20px var(--mono)}
+.stat .l{font-size:12px;color:var(--faint)}
+.kv{font:13px var(--mono);color:var(--dim);margin:12px 0 0;display:grid;grid-template-columns:170px 1fr;gap:4px 12px}
+.kv span:nth-child(odd){color:var(--faint)}
+.zone{border-top:1px solid var(--line);padding:12px 0}
+.zone:first-of-type{border-top:0}
+.ds{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.ds code{font:12px var(--mono);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;word-break:break-all;flex:1 1 400px}
+.note{border-left:3px solid var(--warn);padding:4px 10px;color:var(--warn);font-size:13px;margin-top:8px}
+.muted{color:var(--faint);font-size:13px}
+footer{color:var(--faint);font-size:12px;text-align:center;margin-top:24px}
+@media (max-width:640px){.ep{grid-template-columns:1fr auto}.ep .k{grid-column:1/-1}.kv{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0f1722" stroke="#2f4053"/><path d="M9 10h14M9 16h10M9 22h14" stroke="#5fd4a0" stroke-width="2.5" stroke-linecap="round"/></svg>
+  <h1>EnclaveDNS</h1><span class="ver" id="ver"></span>
+  <span class="live"><span class="dot" id="dot"></span><span id="up">connecting</span></span>
+</header>
+<p class="lede">A <b>validating DNSSEC resolver</b> running in an attested enclave: every answer is checked from the root keys down, and the operator of the machine cannot see or change what you ask. It also resolves <b>.eth</b> names from ENS and <b>.onion</b> addresses itself, never asking the public DNS about either. No query is ever logged.</p>
+
+<section aria-labelledby="h-use">
+  <h2 id="h-use">Use it</h2>
+  <div id="eps"></div>
+</section>
+
+<section aria-labelledby="h-look">
+  <h2 id="h-look">Look up</h2>
+  <form id="f">
+    <label for="qn" class="muted" style="position:absolute;left:-9999px">Name</label>
+    <input type="text" id="qn" placeholder="example.com, vitalik.eth, ….onion" autocomplete="off" spellcheck="false" required>
+    <label for="qt" class="muted" style="position:absolute;left:-9999px">Type</label>
+    <select id="qt"></select>
+    <label class="chk"><input type="checkbox" id="qdo"> DNSSEC records</label>
+    <label class="chk"><input type="checkbox" id="qcd"> skip validation</label>
+    <button type="submit">Resolve</button>
+  </form>
+  <div class="examples">try:
+    <button type="button" data-q="isc.org">isc.org</button>
+    <button type="button" data-q="dnssec-failed.org">dnssec-failed.org</button>
+    <button type="button" data-q="vitalik.eth" data-t="TXT">vitalik.eth</button>
+    <button type="button" data-q="nick.ens" data-t="TXT">nick.ens</button>
+    <button type="button" data-q="2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion" data-t="TXT">torproject .onion</button>
+  </div>
+  <div id="out" aria-live="polite"></div>
+</section>
+
+<section aria-labelledby="h-stat">
+  <h2 id="h-stat">Server</h2>
+  <div class="grid" id="stats"></div>
+  <div class="kv" id="kv"></div>
+</section>
+
+<section aria-labelledby="h-zones" id="zsec" hidden>
+  <h2 id="h-zones">Hosted zones</h2>
+  <div id="zones"></div>
+</section>
+
+<footer>EnclaveDNS keeps counters only: no query names, no client addresses. <a href="/api/status">/api/status</a></footer>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const TYPES = ["A","AAAA","TXT","MX","NS","CNAME","SOA","SRV","CAA","HTTPS","DS","DNSKEY","PTR","TLSA"];
+$("qt").innerHTML = TYPES.map((t) => `<option>${t}</option>`).join("");
+
+async function copy(text, btn) {
+  try { await navigator.clipboard.writeText(text); btn.textContent = "copied"; setTimeout(() => btn.textContent = "copy", 1200); } catch (_) {}
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-copy]");
+  if (b) copy(b.dataset.copy, b);
+  const x = e.target.closest("button[data-q]");
+  if (x) { $("qn").value = x.dataset.q; $("qt").value = x.dataset.t || "A"; run(); }
+});
+
+function endpoints() {
+  const host = location.host, hn = location.hostname;
+  const m = /^([0-9a-f]{8})\.app\.enclave\.host$/i.exec(hn);
+  const rows = [
+    ["DNS-over-HTTPS", `https://${host}/dns-query`, "Firefox, Chrome, Android, iOS, curl --doh-url"],
+    ["DNS-over-TLS", `${hn}:853`, "Android Private DNS takes the host name; kdig +tls, stubby, systemd-resolved"],
+  ];
+  if (m) rows.push(["DNS (UDP/TCP 53)", `${m[1]}.ip.enclave.host`, "this deployment's own IPv6 address; resolving…", "ipv6"]);
+  rows.push(["JSON API", `https://${host}/resolve?name=example.com&type=A`, "Google/Cloudflare DNS-JSON shape, with Security and EDE fields"]);
+  $("eps").innerHTML = rows.map(([k, v, s, id]) =>
+    `<div class="ep"><span class="k">${esc(k)}</span><span><code>${esc(v)}</code><small${id ? ` id="${id}"` : ""}>${esc(s)}</small></span><button type="button" data-copy="${esc(v)}">copy</button></div>`).join("");
+  if (m) fetch(`/resolve?name=${m[1]}.ip.enclave.host&type=AAAA`).then((r) => r.json()).then((j) => {
+    const a = (j.Answer || []).find((x) => x.type === 28);
+    if (a) $("ipv6").innerHTML = `IPv6 <code>${esc(a.data)}</code>, port 53 over UDP and TCP`;
+  }).catch(() => {});
+}
+
+function verdict(j) {
+  const sec = j.Security || "";
+  const label = sec === "secure" ? "verified" : sec === "bogus" ? "bogus" : sec === "insecure" ? "unsigned" : sec;
+  return `<div class="verdict"><span class="badge rc">${esc(j.StatusName || j.Status)}</span>`
+    + `<span class="badge ${esc(sec)}">${esc(label)}</span>`
+    + `<span class="muted">from ${esc((j.Sources || []).join(", "))} · ${esc(j.ElapsedMs)} ms</span></div>`
+    + (j.EDE ? `<p class="ede">EDE ${esc(j.EDE.code)}: ${esc(j.EDE.text)}</p>` : "");
+}
+
+function table(recs) {
+  if (!recs || !recs.length) return "";
+  return `<table><thead><tr><th>name</th><th>ttl</th><th>type</th><th>data</th></tr></thead><tbody>`
+    + recs.map((r) => `<tr class="${r.typeName === "RRSIG" ? "sig" : ""}"><td>${esc(r.name)}</td><td class="ttl">${esc(r.TTL)}</td><td class="t">${esc(r.typeName)}</td><td>${esc(r.data)}</td></tr>`).join("")
+    + `</tbody></table>`;
+}
+
+async function run(ev) {
+  if (ev) ev.preventDefault();
+  const n = $("qn").value.trim();
+  if (!n) return;
+  const q = new URLSearchParams({name: n, type: $("qt").value});
+  if ($("qdo").checked) q.set("do", "1");
+  if ($("qcd").checked) q.set("cd", "1");
+  $("out").innerHTML = `<p class="muted">resolving ${esc(n)}…</p>`;
+  history.replaceState(null, "", `#${encodeURIComponent(n)}/${$("qt").value}`);
+  try {
+    const j = await (await fetch(`/resolve?${q}`)).json();
+    if (j.error) { $("out").innerHTML = `<p class="ede">${esc(j.error)}</p>`; return; }
+    let h = verdict(j) + table(j.Answer);
+    if ((!j.Answer || !j.Answer.length) && j.Authority && j.Authority.length) h += `<p class="muted">no records of that type; authority:</p>` + table(j.Authority);
+    else if (!j.Answer || !j.Answer.length) h += `<p class="muted">no records</p>`;
+    $("out").innerHTML = h;
+  } catch (e) { $("out").innerHTML = `<p class="ede">request failed: ${esc(e.message)}</p>`; }
+}
+$("f").addEventListener("submit", run);
+
+const fmtUp = (s) => s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : `${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h`;
+const n0 = (x) => Number(x || 0).toLocaleString();
+
+async function status() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    $("dot").classList.add("on");
+    $("up").textContent = `up ${fmtUp(s.uptime_s)}`;
+    $("ver").textContent = `v${s.version}`;
+    const q = s.queries, v = s.resolver.validated;
+    const total = q.udp + q.tcp + q.tls + q.https;
+    const checked = v.secure + v.insecure + v.bogus;
+    const stats = [
+      [n0(total), "queries"],
+      [`${n0(q.udp)} / ${n0(q.tcp)}`, "UDP / TCP"],
+      [`${n0(q.tls)} / ${n0(q.https)}`, "DoT / DoH"],
+      [checked ? `${Math.round(100 * v.secure / checked)}%` : "–", "lookups DNSSEC-verified"],
+      [n0(v.bogus), "bogus answers refused"],
+      [n0(s.resolver.cache_entries), "cached answers"],
+      [`${q.mean_ms} ms`, "mean response"],
+      [n0(q.ens + q.onion), ".eth + .onion lookups"],
+    ];
+    $("stats").innerHTML = stats.map(([a, b]) => `<div class="stat"><div class="v">${esc(a)}</div><div class="l">${esc(b)}</div></div>`).join("");
+    const kv = [
+      ["resolver", s.resolver.mode],
+      ["validation", s.resolver.validating ? "DNSSEC, root trust anchors KSK-2017 + KSK-2024" : "off"],
+      ["QNAME minimisation", s.resolver.qname_minimisation ? "on (RFC 9156)" : "off"],
+      ["ENS", s.ens ? `${s.ens.quorum} of ${s.ens.rpc.length} RPCs must agree: ${s.ens.rpc.join(", ")}` : "off"],
+      [".onion", s.onion ? (s.onion.cname_suffix ? `CNAME to *.${s.onion.cname_suffix}` : (s.onion.gateway_a.length + s.onion.gateway_aaaa.length) ? `gateway ${[...s.onion.gateway_a, ...s.onion.gateway_aaaa].join(", ")}` : "validated locally; key in TXT, no gateway") : "NXDOMAIN (RFC 7686)"],
+      ["rate-limited (UDP)", n0(q.rate_limited)],
+      ["UDP replies", s.udp_replies],
+      ["logging", s.logging],
+    ];
+    $("kv").innerHTML = kv.map(([a, b]) => `<span>${esc(a)}</span><span>${esc(b)}</span>`).join("");
+    if (s.zones.length) {
+      $("zsec").hidden = false;
+      $("zones").innerHTML = s.zones.map((z) => `<div class="zone"><b class="mono">${esc(z.name)}</b> <span class="muted">${z.records} records · ${z.signed ? "signed, ECDSA P-256" : "unsigned"}</span>`
+        + (z.ds ? `<div class="ds"><code>${esc(z.ds)}</code><button type="button" data-copy="${esc(z.ds)}">copy</button></div><p class="muted">Publish this DS at your registrar to make the zone secure (registries that read CDS pick it up themselves).</p>` : "")
+        + (z.ephemeral_key ? `<p class="note">No zone_key_seed secret is set, so this key changes on every restart and a published DS would break the zone. Set the secret before publishing the DS.</p>` : "")
+        + `</div>`).join("");
+    }
+  } catch (_) {
+    $("dot").classList.remove("on");
+    $("up").textContent = "unreachable";
+  }
+}
+endpoints();
+status();
+// a lookup can be linked: #name/TYPE
+if (location.hash.length > 1) {
+  const [n, t] = decodeURIComponent(location.hash.slice(1)).split("/");
+  $("qn").value = n;
+  if (t && TYPES.includes(t.toUpperCase())) $("qt").value = t.toUpperCase();
+  run();
+}
+setInterval(status, 10000);
+</script>
+</body>
+</html>

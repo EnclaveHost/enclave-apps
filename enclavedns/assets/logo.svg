@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">EnclaveDNS</title>
+  <desc id="desc">A chain of trust: the root node signs two names below it, and the verified leaf glows jade inside a rounded enclave frame.</desc>
+  <rect x="6" y="6" width="84" height="84" rx="20" fill="#0f1a2b" stroke="#2c4166" stroke-width="3"/>
+  <path d="M48 26 L30 50 M48 26 L66 50 M66 50 L56 72 M66 50 L76 72" fill="none" stroke="#8fb4ff" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="48" cy="24" r="7" fill="#dbe6ff"/>
+  <circle cx="30" cy="51" r="6" fill="#8fb4ff"/>
+  <circle cx="66" cy="51" r="6" fill="#8fb4ff"/>
+  <circle cx="76" cy="73" r="5" fill="#8fb4ff" fill-opacity=".55"/>
+  <circle cx="56" cy="73" r="8" fill="#5fd4a0"/>
+  <path d="M52.2 73.2 L55 76 L60 70.4" fill="none" stroke="#0f1a2b" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

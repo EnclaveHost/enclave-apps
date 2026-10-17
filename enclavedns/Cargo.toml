@@ -1,0 +1,49 @@
+[package]
+name = "enclavedns"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license-file = "../LICENSE"
+description = "EnclaveDNS: a validating DNSSEC resolver and signing authoritative server in an attested enclave, with native .eth (ENS) and .onion resolution. UDP/TCP 53, DNS-over-TLS, DNS-over-HTTPS."
+
+# A run-mode service app (one wasm32-wasip2 command component). Unlike depot's
+# blocking loop, a DNS server must keep answering while a lookup waits on a
+# slow authoritative server, so it runs on wstd's wasi:io/poll reactor: every
+# client query is its own task. UDP sockets are wasip2 bindings driven by the
+# same reactor (wstd has TCP and timers but no UDP).
+#
+# The DNS wire format, the iterative resolver, the DNSSEC validator, the
+# authoritative signer, the ENS client and the HTTP server are hand-written.
+# Dependencies are the primitives: signature algorithms DNSSEC uses (RSA,
+# ECDSA P-256/P-384, Ed25519), hashes (SHA-1 for NSEC3 and DS type 1, SHA-2,
+# Keccak for ENS), and the pure-Rust TLS stack for outbound HTTPS.
+[dependencies]
+wstd = "=0.6.6"
+wasip2 = "1.0"
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "0.26"
+sha1 = { version = "0.10", default-features = false, features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+sha3 = { version = "0.10", default-features = false }
+hmac = "0.12"
+rsa = { version = "0.9", default-features = false, features = ["std"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+getrandom = "0.2"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2

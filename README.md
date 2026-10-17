@@ -45,6 +45,7 @@ app's README (and `wasm/apps/README.md` in the
 | [golem](golem/) | QEMU machines booted in your browser from a wallet-sealed S3 volume: the enclave is the attested image vault and cross-origin-isolated server; disk snapshots stream back in. |
 | [risc-box](risc-box/) | The opposite split: a real machine emulated **on the enclave's CPU** (a pure-Rust RISC-V system emulator compiled to wasip2), booted from OS images in an S3 bucket, its serial console bridged to the browser; guest disk saved back with SigV4. |
 | [depot](depot/) | A private git server in an attested enclave: smart HTTP (protocol v2 and v0, push, shallow, thin packs, atomic pushes), every pack, index, ref and repository name encrypted before it reaches your R2/S3 bucket. Access tokens, protected refs, signed push webhooks, a web view of code and history, and an export script that turns the bucket back into plain git without the app. |
+| [enclavedns](enclavedns/) | A DNS server in an attested enclave: a validating DNSSEC resolver (root anchors down, NSEC/NSEC3, Extended DNS Errors), online-signed hosted zones whose keys survive restarts, `.eth` resolved from ENS (quorum of RPCs, wildcard and CCIP-Read resolvers, DNSLink) and `.onion` checked and answered locally, never leaked. UDP/TCP 53, DNS-over-TLS, DNS-over-HTTPS and a JSON API; counters only, no query log. |
 
 ## Building
 

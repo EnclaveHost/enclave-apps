@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 400" role="img" aria-labelledby="title desc">
+  <title id="title">EnclaveDNS — every answer, verified.</title>
+  <desc id="desc">A dark navy banner. On the right a DNS tree descends from the root through com, eth and onion; signatures run down its branches and the answer at the bottom glows jade.</desc>
+  <defs>
+    <radialGradient id="ambient" cx="76%" cy="50%" r="65%">
+      <stop offset="0" stop-color="#14283a"/>
+      <stop offset="1" stop-color="#080d14"/>
+    </radialGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0 H0 V48" fill="none" stroke="#8fb4ff" stroke-opacity=".035"/>
+    </pattern>
+    <linearGradient id="sig" x1="0" y1="40" x2="0" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#dbe6ff" stop-opacity=".9"/>
+      <stop offset="1" stop-color="#5fd4a0" stop-opacity=".9"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="400" fill="url(#ambient)"/>
+  <rect width="1600" height="400" fill="url(#grid)"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="96" y="176" fill="#e3eaf2" font-size="76" font-weight="700" letter-spacing="-1.5">EnclaveDNS</text>
+    <text x="98" y="236" fill="#8fb4ff" font-size="30">every answer, verified.</text>
+    <text x="98" y="298" fill="#93a4b6" font-size="20">DNSSEC from the root · .eth from ENS · .onion, never leaked</text>
+    <text x="98" y="330" fill="#5f7184" font-size="18">UDP · TCP · DNS-over-TLS · DNS-over-HTTPS — in an attested enclave</text>
+  </g>
+  <g fill="none" stroke="url(#sig)" stroke-width="3" stroke-linecap="round">
+    <path d="M1240 70 L1060 180"/>
+    <path d="M1240 70 L1240 180"/>
+    <path d="M1240 70 L1420 180"/>
+    <path d="M1060 180 L990 300"/>
+    <path d="M1060 180 L1130 300"/>
+    <path d="M1240 180 L1240 300"/>
+    <path d="M1420 180 L1420 300"/>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="20" text-anchor="middle">
+    <circle cx="1240" cy="66" r="24" fill="#16243a" stroke="#dbe6ff" stroke-width="2.5"/>
+    <text x="1240" y="73" fill="#dbe6ff" font-size="26">.</text>
+    <circle cx="1060" cy="182" r="22" fill="#16243a" stroke="#8fb4ff" stroke-width="2.5"/>
+    <text x="1094" y="189" fill="#93a4b6" text-anchor="start">com</text>
+    <circle cx="1240" cy="182" r="22" fill="#16243a" stroke="#8fb4ff" stroke-width="2.5"/>
+    <text x="1274" y="189" fill="#93a4b6" text-anchor="start">eth</text>
+    <circle cx="1420" cy="182" r="22" fill="#16243a" stroke="#8fb4ff" stroke-width="2.5"/>
+    <text x="1454" y="189" fill="#93a4b6" text-anchor="start">onion</text>
+    <circle cx="990" cy="302" r="16" fill="#16243a" stroke="#8fb4ff" stroke-opacity=".5" stroke-width="2"/>
+    <circle cx="1130" cy="302" r="26" fill="#5fd4a0"/>
+    <path d="M1118 302 L1127 311 L1143 293" fill="none" stroke="#0b1320" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="1240" cy="302" r="18" fill="#16243a" stroke="#8fb4ff" stroke-width="2"/>
+    <circle cx="1420" cy="302" r="18" fill="#16243a" stroke="#8fb4ff" stroke-width="2"/>
+    <text x="1130" y="356" fill="#5fd4a0">AD</text>
+    <text x="1240" y="356" fill="#93a4b6">vitalik</text>
+    <text x="1420" y="356" fill="#93a4b6">2gzy…3wid</text>
+  </g>
+</svg>
