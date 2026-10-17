@@ -841,14 +841,51 @@ impl Resolver {
         Err(last)
     }
 
-    async fn doh_exchange(&self, url: &str, wire: &[u8], wait: Duration) -> io::Result<Vec<u8>> {
+    /// Where an outbound host can be dialled: an IP literal; by name through
+    /// the egress front; the host's own lookup (inside an isolated partition
+    /// the only one that names its egress forwarders); else, when allowed,
+    /// this resolver.
+    pub async fn dests_for(self: &Rc<Self>, host: &str, port: u16, own_resolver: bool) -> Vec<Dest> {
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            return vec![Dest::Addr(SocketAddr::new(ip, port))];
+        }
+        if net::egress_proxy() {
+            return vec![Dest::Host(host.to_string(), port)];
+        }
+        let mut ips = net::system_lookup(host).await;
+        // v6 first: the platform's egress carries IPv6
+        ips.sort_by_key(|ip| ip.is_ipv4());
+        if !ips.is_empty() || !own_resolver {
+            return ips.into_iter().map(|ip| Dest::Addr(SocketAddr::new(ip, port))).collect();
+        }
+        let Ok(n) = Name::parse(host) else { return Vec::new() };
+        let mut out = Vec::new();
+        for t in [ty::AAAA, ty::A] {
+            let ctx = Ctx::new(Duration::from_secs(8));
+            let mut name = n.clone();
+            for _ in 0..8 {
+                let a = self.lookup(&name, t, &ctx, 0).await;
+                if a.sec == Sec::Bogus {
+                    break;
+                }
+                if let Some(c) = a.cname_target(&name) {
+                    name = c;
+                    continue;
+                }
+                out.extend(a.answer.iter().filter_map(rr_ip).map(|ip| Dest::Addr(SocketAddr::new(ip, port))));
+                break;
+            }
+        }
+        out
+    }
+
+    async fn doh_exchange(self: &Rc<Self>, url: &str, wire: &[u8], wait: Duration) -> io::Result<Vec<u8>> {
         let u = tls::parse_url(url).map_err(io::Error::other)?;
-        // DoH upstreams must be named by IP or resolvable without recursion into ourselves
-        let dests = match u.host.parse::<IpAddr>() {
-            Ok(ip) => vec![Dest::Addr(SocketAddr::new(ip, u.port))],
-            Err(_) if net::egress_proxy() => vec![Dest::Host(u.host.clone(), u.port)],
-            Err(_) => return Err(io::Error::other("a DoH upstream needs an IP address in its URL (or the egress front)")),
-        };
+        // never recurse into ourselves to find the upstream that is supposed to answer for us
+        let dests = self.dests_for(&u.host, u.port, false).await;
+        if dests.is_empty() {
+            return Err(io::Error::other(format!("cannot resolve the DoH upstream {} (use an IP literal, or a name the host resolves)", u.host)));
+        }
         let r = self
             .http
             .request(&u, &dests, "POST", &[("content-type", "application/dns-message"), ("accept", "application/dns-message")], wire, wait)

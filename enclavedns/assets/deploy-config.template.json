@@ -1,11 +1,11 @@
 {
   "recursion": true,
-  "zone_key_seed": "$ENCLAVEDNS_ZONE_SEED",
-  "admin_token": "$ENCLAVEDNS_ADMIN_TOKEN",
   "resolver": {
-    "validate": true,
-    "qname_minimisation": true,
-    "transport": "auto"
+    "forward": [
+      "https://cloudflare-dns.com/dns-query",
+      "https://dns.quad9.net/dns-query"
+    ],
+    "validate": true
   },
   "zones": [],
   "ens": {

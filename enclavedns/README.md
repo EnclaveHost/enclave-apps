@@ -159,7 +159,7 @@ a starting point.
 | Key | Default | |
 | --- | --- | --- |
 | `recursion` | `true` | `false` makes it authoritative-only: names outside the hosted zones, `.eth` and `.onion` get REFUSED |
-| `resolver.forward` | `[]` | upstreams instead of iterating: `udp://9.9.9.9`, `tcp://…`, `tls://1.1.1.1#cloudflare-dns.com`, `https://<ip>/dns-query`. Answers are still validated here |
+| `resolver.forward` | `[]` (the published config: Cloudflare and Quad9 DoH) | upstreams instead of iterating: `udp://9.9.9.9`, `tcp://…`, `tls://1.1.1.1#cloudflare-dns.com`, `https://<ip>/dns-query`. Answers are still validated here |
 | `resolver.validate` | `true` | DNSSEC validation |
 | `resolver.qname_minimisation` | `true` | RFC 9156 |
 | `resolver.transport` | `auto` | `auto`: UDP until the host refuses it, then TCP; `udp`; `tcp` |
@@ -197,17 +197,46 @@ a starting point.
 
 ## Platform notes
 
-- **Deploy where UDP replies are allowed.** Under the platform's transparent
-  egress (`-S egress`), wasmtime refuses every UDP send from the guest,
-  including replies to the UDP relay. On such a host UDP/53 cannot answer; the
-  app says so in its log and on the status page (`UDP replies: blocked`), while
-  TCP/53, DNS-over-TLS and DNS-over-HTTPS keep working. Its own upstream
-  queries switch to TCP by themselves.
-- **The per-app isolation tier does not offer raw ports**, so UDP/TCP 53 and
-  853 need a tier that does.
-- The UDP relay gives every client address its own flow, which the app sees as
-  its own loopback port. That is what makes per-client rate limiting possible
-  without seeing client addresses.
+Today's hosts run every app in its own isolated domain (an SNP guest, an
+Android pVM, or a Hyper-V partition on Enclave Shield). That shapes what
+EnclaveDNS can offer there:
+
+- **DNS-over-HTTPS only, on isolated hosts.** An isolated app's declared
+  TCP/UDP ports are never exposed as public plaintext ports: by design they
+  are reachable only through an attested TLS tunnel and a local connector
+  (`isolation/m4/PROTECTED-PORTS.md` in the platform repo), which ordinary DNS
+  clients cannot use. So the catalog's 0.1.1 declares `http:8000` alone:
+  DoH, the JSON API and the status page. Plain DNS on UDP/TCP 53 and
+  DNS-over-TLS need a host that offers public raw ports (0.1.0 declares them).
+- **No raw outbound network.** An isolated domain reaches only the HTTPS
+  origins named in its config, through forwarders the platform sets up before
+  the app starts. So the default config forwards to DoH upstreams
+  (`resolver.forward`) instead of iterating from the root. DNSSEC is still
+  validated inside the app: it asks with CD set and checks every chain from
+  the root anchors itself, so a dishonest upstream can withhold answers but
+  not forge them. Outbound hosts are found through the platform's own name
+  lookup, which inside a domain is the only one that names those forwarders.
+- **ENS offchain resolvers (CCIP-Read) fail on isolated hosts.** Their gateway
+  URLs come from the contracts at lookup time, so they are not among the
+  config's allowed origins. On-chain ENS names resolve normally.
+- **Ports below 443.** A Hyper-V partition that holds secrets lowers the
+  unprivileged port floor to 443, so a command app cannot bind 53 there
+  (0.1.0's first deployment on Enclave Shield died exactly so). Every
+  listener's bind result is on `GET /api/status` (`startup`), because an
+  isolated host withholds the app's stderr; a listener that cannot bind no
+  longer stops the others.
+- **Where raw ports exist** (a shared, non-isolated runtime), deploy without
+  transparent egress: under `-S egress`, wasmtime refuses every UDP send from
+  the guest, replies included. The app says so on its status page
+  (`UDP replies: blocked`); TCP/53, DNS-over-TLS and DNS-over-HTTPS keep
+  working, and its own upstream queries switch to TCP by themselves. The UDP
+  relay gives every client address its own flow, which is what makes
+  per-client rate limiting possible without seeing client addresses.
+- **Hosted zones need two secrets** (`ENCLAVEDNS_ZONE_SEED`, and
+  `ENCLAVEDNS_ADMIN_TOKEN` for `/api/flush`). The default config names
+  neither, so a deployment needs no secrets; to host zones, deploy with a
+  config override that adds `zones`, `"zone_key_seed": "$ENCLAVEDNS_ZONE_SEED"`
+  and `"admin_token": "$ENCLAVEDNS_ADMIN_TOKEN"`, and stage the secrets.
 
 ## Build and test
 
@@ -244,23 +273,26 @@ result and exits; it is useful for debugging a config.
 
 ## Publish and deploy
 
-1. **Secrets.** `scripts/new-secrets.sh enclavedns-secrets.env` writes
+1. **Secrets** (only to host zones). `scripts/new-secrets.sh enclavedns-secrets.env` writes
    `ENCLAVEDNS_ZONE_SEED` and `ENCLAVEDNS_ADMIN_TOKEN` (mode 0600). Back up
    the seed before you publish any DS record.
-2. **Publish** the build as a CPU service app with all four ports:
+2. **Publish** the build as a CPU service app. For isolated hosts (today's
+   fleet) declare only the HTTP port; on a host with public raw ports, add
+   `udp:53,tcp:53,tcp:853`:
    ```sh
-   enclave publish target/wasm32-wasip2/release/enclavedns.wasm --slug enclavedns --version 0.1.0 \
+   enclave publish target/wasm32-wasip2/release/enclavedns.wasm --slug enclavedns --version 0.1.1 \
      --name EnclaveDNS --desc "Validating DNSSEC resolver with native .eth and .onion" \
-     --mem 256 --cpu-gflops 20 --ports "http:8000,udp:53,tcp:53,tcp:853" \
-     --config "$(cat my-enclavedns-config.json)"
+     --mem 256 --cpu-gflops 20 --ports "http:8000" \
+     --config "$(cat assets/deploy-config.template.json)"
    ```
    The ports are fixed on-chain at publish time. A run-mode app published
    without them never starts, because the platform launches it as an HTTP
    component.
-3. **Deploy** it public (the relays route only public deployments), with the
-   secrets staged:
+3. **Deploy** it public (the relays route only public deployments). Add
+   `--secrets-file enclavedns-secrets.env` only when hosting zones (see
+   *Platform notes*):
    ```sh
-   enclave deploy enclavedns --public --fund 5 --secrets-file enclavedns-secrets.env
+   enclave deploy enclavedns --public --fund 5
    ```
 4. **Check** `https://<label>.app.enclave.host/`, then point a client at it.
 

@@ -119,7 +119,18 @@ fn die(msg: String) -> ! {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let mut cfg = config::Config::load().unwrap_or_else(|e| die(format!("config: {e}")));
+    // A config that does not load is reported, not fatal: on an isolated host the app's stderr is withheld, so the
+    // status page is the only place the reason can be read. The server then answers with nothing but its own status.
+    let mut startup: Vec<(String, Result<String, String>)> = Vec::new();
+    let mut cfg = match config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[enclavedns] config: {e}");
+            startup.push(("config".into(), Err(e)));
+            let safe = serde_json::json!({"recursion": false, "ens": {"enabled": false}, "onion": {"enabled": false}});
+            config::Config::from_json(&safe, std::env::var("ENCLAVE_PORTS").ok().as_deref()).unwrap_or_else(|e| die(e))
+        }
+    };
     // a smaller guest gets a smaller cache unless one is configured
     if let Some(mb) = std::env::var("ENCLAVE_MEM_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         cfg.resolver.cache_entries = cfg.resolver.cache_entries.min(mb * 150).max(1000);
@@ -143,9 +154,13 @@ fn main() {
                     } else {
                         println!("[enclavedns] zone {} (unsigned)", zone.apex);
                     }
+                    startup.push((format!("zone {}", zone.apex), Ok(format!("{} records", zone.record_count()))));
                     zones.push(zone);
                 }
-                Err(e) => die(format!("zone {}: {e}", z.name)),
+                Err(e) => {
+                    eprintln!("[enclavedns] zone {}: {e}", z.name);
+                    startup.push((format!("zone {}", z.name), Err(e)));
+                }
             }
         }
         let server = Server::new(resolver, zones, ens, cfg.ens_alias, cfg.onion.clone(), cfg.recursion, cfg.udp_rate, cfg.udp_burst);
@@ -176,29 +191,37 @@ fn main() {
         let bind = cfg.bind;
         let p = cfg.ports.clone();
         let mut up = Vec::new();
+        // each listener on its own: one that cannot bind is reported and the rest still serve
+        let mut note = |what: String, r: Result<(), std::io::Error>| match r {
+            Ok(()) => {
+                up.push(what.clone());
+                startup.push((what, Ok("listening".into())));
+            }
+            Err(e) => {
+                eprintln!("[enclavedns] {what}: {e}");
+                startup.push((what, Err(format!("{e} ({:?})", e.kind()))));
+            }
+        };
         if let Some(port) = p.dns_udp {
-            let s = net::Udp::bind(SocketAddr::new(bind, port)).await.unwrap_or_else(|e| die(format!("udp {port}: {e}")));
-            spawn(udp_loop(server.clone(), Rc::new(s)));
-            up.push(format!("dns udp {bind}:{port}"));
+            let r = net::Udp::bind(SocketAddr::new(bind, port)).await.map(|s| spawn(udp_loop(server.clone(), Rc::new(s))));
+            note(format!("dns udp {bind}:{port}"), r);
         }
         if let Some(port) = p.dns_tcp {
-            let l = net::Listener::bind(SocketAddr::new(bind, port)).await.unwrap_or_else(|e| die(format!("tcp {port}: {e}")));
-            spawn(tcp_listener(server.clone(), l, Via::Tcp));
-            up.push(format!("dns tcp {bind}:{port}"));
+            let r = net::Listener::bind(SocketAddr::new(bind, port)).await.map(|l| spawn(tcp_listener(server.clone(), l, Via::Tcp)));
+            note(format!("dns tcp {bind}:{port}"), r);
         }
         if let Some(port) = p.dot {
-            let l = net::Listener::bind(SocketAddr::new(bind, port)).await.unwrap_or_else(|e| die(format!("dot {port}: {e}")));
-            spawn(tcp_listener(server.clone(), l, Via::Tls));
-            up.push(format!("dot (tls ended by the platform) {bind}:{port}"));
+            let r = net::Listener::bind(SocketAddr::new(bind, port)).await.map(|l| spawn(tcp_listener(server.clone(), l, Via::Tls)));
+            note(format!("dot {bind}:{port} (tls ended by the platform)"), r);
         }
         let app = Rc::new(http::App { server: server.clone(), admin_token: cfg.admin_token.clone() });
         if let Some(port) = p.http {
-            let l = net::Listener::bind(SocketAddr::new(bind, port)).await.unwrap_or_else(|e| die(format!("http {port}: {e}")));
-            spawn(http_listener(app, l));
-            up.push(format!("http {bind}:{port}"));
+            let r = net::Listener::bind(SocketAddr::new(bind, port)).await.map(|l| spawn(http_listener(app, l)));
+            note(format!("http {bind}:{port}"), r);
         }
+        *server.startup.borrow_mut() = startup;
         if up.is_empty() {
-            die("no listeners: declare udp:53, tcp:53, tcp:853 and/or http:8000".into());
+            die("no listener could bind (see above); declare udp:53, tcp:53, tcp:853 and/or http:8000".into());
         }
         println!("[enclavedns] {} up: {}; {}", env!("CARGO_PKG_VERSION"), up.join(", "), server.resolver.transport_text());
         // prime: the root keys (and with them the transport), then ENS's hosts

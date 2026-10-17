@@ -402,3 +402,27 @@ pub async fn join_all<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
     let n = futs.len();
     JoinAll { futs: futs.into_iter().map(|f| Some(Box::pin(f))).collect(), out: (0..n).map(|_| None).collect() }.await
 }
+
+/// The host's own name lookup (wasi:sockets/ip-name-lookup). Inside an
+/// isolated partition this is the only resolver that names the egress
+/// forwarders: /etc/hosts maps each allowed origin to its loopback listener.
+/// Elsewhere it is the host's ordinary resolver. Empty on any failure.
+pub async fn system_lookup(name: &str) -> Vec<IpAddr> {
+    use wasip2::sockets::ip_name_lookup::resolve_addresses;
+    use wasip2::sockets::network::IpAddress;
+    let Ok(stream) = resolve_addresses(&instance_network(), name) else { return Vec::new() };
+    let mut out = Vec::new();
+    let work = async {
+        loop {
+            match stream.resolve_next_address() {
+                Ok(Some(IpAddress::Ipv4((a, b, c, d)))) => out.push(IpAddr::V4(Ipv4Addr::new(a, b, c, d))),
+                Ok(Some(IpAddress::Ipv6((a, b, c, d, e, f, g, h)))) => out.push(IpAddr::V6(Ipv6Addr::new(a, b, c, d, e, f, g, h))),
+                Ok(None) => return Ok(()),
+                Err(ErrorCode::WouldBlock) => wait(stream.subscribe()).await,
+                Err(e) => return Err(err(e)),
+            }
+        }
+    };
+    let _ = timeout(Duration::from_secs(5), work).await;
+    out
+}

@@ -217,7 +217,8 @@ async function status() {
       ["UDP replies", s.udp_replies],
       ["logging", s.logging],
     ];
-    $("kv").innerHTML = kv.map(([a, b]) => `<span>${esc(a)}</span><span>${esc(b)}</span>`).join("");
+    for (const s0 of (s.startup || []).filter((x) => !x.ok)) kv.unshift([`! ${s0.what}`, s0.error]);
+    $("kv").innerHTML = kv.map(([a, b]) => `<span>${esc(a)}</span><span${a.startsWith("! ") ? ' style="color:var(--bad)"' : ""}>${esc(b)}</span>`).join("");
     if (s.zones.length) {
       $("zsec").hidden = false;
       $("zones").innerHTML = s.zones.map((z) => `<div class="zone"><b class="mono">${esc(z.name)}</b> <span class="muted">${z.records} records · ${z.signed ? "signed, ECDSA P-256" : "unsigned"}</span>`

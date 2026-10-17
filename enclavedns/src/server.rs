@@ -89,6 +89,9 @@ pub struct Server {
     /// The host refuses this guest's UDP sends (the platform's transparent
     /// egress denies every UDP send, replies included): UDP/53 cannot answer.
     pub udp_replies_blocked: Cell<bool>,
+    /// What came up and what did not, for /api/status: an isolated host
+    /// withholds the app's stderr, so this is the only place a failure shows.
+    pub startup: RefCell<Vec<(String, Result<String, String>)>>,
     udp_rate: f64,
     udp_burst: f64,
     buckets: RefCell<HashMap<String, (f64, u64)>>,
@@ -129,6 +132,7 @@ impl Server {
             counters: RefCell::default(),
             started_ms: crate::net::now_ms(),
             udp_replies_blocked: Cell::new(false),
+            startup: RefCell::default(),
             udp_rate,
             udp_burst,
             buckets: RefCell::default(),

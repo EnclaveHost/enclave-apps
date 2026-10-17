@@ -313,6 +313,10 @@ fn status(app: &Rc<App>) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_s": (net::now_ms() - s.started_ms) / 1000,
         "recursion": s.recursion,
+        "startup": s.startup.borrow().iter().map(|(what, r)| match r {
+            Ok(v) => json!({"what": what, "ok": true, "detail": v}),
+            Err(e) => json!({"what": what, "ok": false, "error": e}),
+        }).collect::<Vec<_>>(),
         "udp_replies": if s.udp_replies_blocked.get() { "blocked by the host's egress policy: use TCP/53, DoT or DoH" } else { "ok" },
         "resolver": {
             "mode": s.resolver.transport_text(),

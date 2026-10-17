@@ -20,13 +20,12 @@
 
 use crate::name::Name;
 use crate::net::{self, Dest};
-use crate::resolver::{Answer, Ctx, Resolver, Sec};
+use crate::resolver::{Answer, Resolver};
 use crate::tls;
 use crate::wire::{ede, rcode, ty, Record};
 use sha3::{Digest, Keccak256};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -293,34 +292,9 @@ impl Ens {
         Rc::new(Ens { cfg, resolver, block: RefCell::default(), cache: RefCell::default(), calls: Default::default() })
     }
 
-    /// Where an HTTPS host can be dialled: by name through the egress
-    /// front, else at the addresses our own resolver finds.
+    /// Where an HTTPS host (an RPC, a CCIP gateway) can be dialled.
     pub async fn dests(&self, host: &str, port: u16) -> Vec<Dest> {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return vec![Dest::Addr(SocketAddr::new(ip, port))];
-        }
-        if net::egress_proxy() {
-            return vec![Dest::Host(host.to_string(), port)];
-        }
-        let Ok(n) = Name::parse(host) else { return Vec::new() };
-        let mut out = Vec::new();
-        for t in [ty::AAAA, ty::A] {
-            let ctx = Ctx::new(Duration::from_secs(8));
-            let mut name = n.clone();
-            for _ in 0..8 {
-                let a = self.resolver.lookup(&name, t, &ctx, 0).await;
-                if a.sec == Sec::Bogus {
-                    break;
-                }
-                if let Some(c) = a.cname_target(&name) {
-                    name = c;
-                    continue;
-                }
-                out.extend(a.answer.iter().filter_map(crate::resolver::rr_ip).map(|ip| Dest::Addr(SocketAddr::new(ip, port))));
-                break;
-            }
-        }
-        out
+        self.resolver.dests_for(host, port, true).await
     }
 
     async fn post_json(&self, url: &str, body: &str, limit: Duration) -> Result<serde_json::Value, String> {
