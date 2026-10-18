@@ -61,6 +61,9 @@ the exact endpoints:
 | `A`/`AAAA` with no stored records | a CNAME to `<address>.onion` if the contenthash is an onion service; else to `<name>.eth.<gateway>` if `ens.gateway` is set (for example `eth.limo`); else no data |
 | a name with no ENS resolver | NXDOMAIN |
 
+To open `.eth` sites in an ordinary browser, through your own IPFS, Swarm,
+Arweave and Tor software and over HTTPS, see [EnclaveDNS Local](local/README.md).
+
 `GET /api/ens/<name>` shows the whole picture: the resolver, whether it was
 reached by wildcard, the address, the contenthash, and the common text records.
 
