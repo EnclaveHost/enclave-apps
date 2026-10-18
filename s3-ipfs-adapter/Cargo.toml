@@ -20,6 +20,8 @@ rustls-rustcrypto = "0.0.2-alpha"
 webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
+sha3 = { version = "0.10", default-features = false }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 [profile.release]
 opt-level = "s"

@@ -73,10 +73,9 @@ client keeps working unchanged:
 | `POST /add-image` | an app thumbnail/banner: raster by magic bytes, or SVG through the strict fail-closed validator (reject, never sanitize). Answers `{cid, svg}` |
 | `GET /healthz` | `{"ok":true}` — the gateway liveness contract deploy tooling waits on |
 
-All three pin routes require the platform's wallet-signed upload token
-(`x-upload-address` / `x-upload-expiry` / `x-upload-token`, minted by the
-api-relay as `HMAC-SHA256(uploadKey, "<address>:<sha256(bytes)>:<expiry>")`),
-enforce per-wallet and global daily byte budgets, and echo CORS for the
+All three pin routes accept direct EOA wallet signatures when `walletAudience`
+is configured, or legacy relay HMAC tokens when `uploadKey` is configured.
+Both paths enforce per-wallet and global daily byte budgets, and echo CORS for the
 configured origins. Pins land in the bucket at `pins/<cid>` — the CID is
 computed by the same code that serves it, and a freshly pinned CID resolves
 immediately (the snapshot is patched without waiting for a LIST). Gateway
@@ -124,8 +123,10 @@ resolve from the environment, which is how deployment secrets arrive:
 ```
 
 The `upload` block is optional; without it the pin routes answer 503.
-`uploadKey` is the HMAC secret shared with the api-relay (reference a
-deployment secret, never inline it). All other keys default to the values
+`walletAudience` is this adapter’s full 32-byte deployment ID on Base. Set it
+to enable uploads without a relay or shared authorization secret.
+`uploadKey` is an optional compatibility secret shared with the api-relay
+(reference a deployment secret, never inline it). All other keys default to the values
 shown. `allowUnsigned: true` opens the routes with no token — dev/e2e only,
 never on a public deployment.
 
@@ -138,6 +139,39 @@ content-addressed data). Present it as `X-Api-Key: <key>` or `?key=<key>`;
 on the fleet the TLS proxy strips `Authorization`, so Bearer only works
 locally. A public deployment without an `api_key` leaves the bucket
 writable by anyone: set one.
+
+## Direct wallet upload protocol
+
+Set `upload.walletAudience` to the full adapter deployment ID, for example
+`0x7ae476a3a1e4b0b144248075ff6656a0a10c3ae4cea8b6e4ad2b59dd8989ce33`.
+The client personal-signs this exact UTF-8 message (LF separators, no trailing
+newline); address, service and SHA-256 are lowercase. `bytes` and `expiry`
+are unsigned decimal integers. The hash is 64 hex digits without `0x`.
+
+```text
+enclave-storage-upload:v1
+chainId:8453
+service:<full deployment ID>
+method:POST
+path:</add-json, /add-image or /add-wasm>
+address:<wallet address>
+sha256:<SHA-256 of the upload body>
+bytes:<Content-Length>
+expiry:<Unix seconds, at most 900 seconds ahead>
+```
+
+Send `x-upload-address`, `x-upload-expiry`, `x-upload-sha256`, and
+`x-upload-signature` (65-byte Ethereum signature as `0x` hex). The guest
+verifies the signature before accepting a streaming body, then checks the
+actual hash and length before committing it. Bad direct signatures never
+fall back to HMAC or unsigned mode. The configured service ID prevents a
+signature being reused at another adapter; route binding prevents using
+JSON authorization for a WASM or image upload. Repeating the same request
+within its validity window is possible and still consumes upload quotas.
+
+This path supports EOA signatures. Contract wallets and platform sessions
+still use the legacy path until independent contract/session verification
+is implemented. Enabling this feature alone does not retire the relay.
 
 ## Limits, by design
 

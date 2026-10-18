@@ -41,6 +41,7 @@ mod leavescache;
 mod redirects;
 mod s3;
 mod upload;
+mod wallet_upload;
 mod wasmscan;
 
 use std::cell::RefCell;
@@ -182,6 +183,7 @@ fn load_config() -> Config {
         let un = |k: &str, d: u64| u.get(k).and_then(|x| x.as_u64()).unwrap_or(d);
         Some(upload::UploadCfg {
             upload_key: us("uploadKey").unwrap_or_default().to_string(),
+            wallet_audience: us("walletAudience").unwrap_or_default().to_lowercase(),
             allow_unsigned: u.get("allowUnsigned").and_then(|x| x.as_bool()).unwrap_or(false),
             allow_origins: match u.get("allowOrigins").and_then(|x| x.as_array()) {
                 Some(a) => a
@@ -854,10 +856,10 @@ fn main() {
     match &cfg.upload {
         Some(u) if u.enabled() => eprintln!(
             "[s3-ipfs-adapter] pin routes ON (/add-wasm /add-json /add-image), {}",
-            if u.upload_key.is_empty() { "UNSIGNED (dev)" } else { "wallet-signed" }
+            if u.allow_unsigned && u.upload_key.is_empty() { "UNSIGNED (dev)" } else { "authenticated" }
         ),
         Some(_) => eprintln!(
-            "[s3-ipfs-adapter] pin routes configured but uploadKey unresolved - they answer 503 until the secret is set"
+            "[s3-ipfs-adapter] pin routes configured without valid walletAudience or uploadKey - they answer 503"
         ),
         None => {}
     }

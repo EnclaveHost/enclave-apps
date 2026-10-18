@@ -3,7 +3,7 @@
 //! inside the enclave so ipfs.enclave.host can be served entirely by this
 //! app. Wire compatibility is the contract: same routes, same
 //! x-upload-address / x-upload-expiry / x-upload-token wallet-HMAC auth
-//! (minted by the api-relay, which is unchanged), same response shapes
+//! for legacy clients, plus deployment-bound EIP-191 signatures, same response shapes
 //! ({"cid", ...}), same refusal codes (401/403/413/415/429), same CORS echo.
 //!
 //! What replaces Kubo: bytes are PUT into the configured S3 bucket under
@@ -48,6 +48,7 @@ const UPLOAD_SLOTS: u32 = 4;
 
 pub struct UploadCfg {
     pub upload_key: String, // shared HMAC secret with the api-relay
+    pub wallet_audience: String, // full deployment ID, signed by direct wallet clients
     pub allow_unsigned: bool, // dev/e2e only: no key, uploads open
     pub allow_origins: Vec<String>,
     pub max_wasm: u64,
@@ -60,7 +61,7 @@ pub struct UploadCfg {
 
 impl UploadCfg {
     pub fn enabled(&self) -> bool {
-        !self.upload_key.is_empty() || self.allow_unsigned
+        !self.upload_key.is_empty() || crate::wallet_upload::canonical_hex(&self.wallet_audience, 32, true) || self.allow_unsigned
     }
 }
 
@@ -192,15 +193,23 @@ pub struct AuthHdrs {
     address: String,
     expiry: u64,
     token: String,
+    wallet_body: Option<(String, u64)>,
 }
 
 /// Header-shape gate, decidable before any body byte: presence, address and
 /// expiry formats, freshness. Returns Ok(None) when auth is disabled
 /// (allow_unsigned dev mode). The HMAC itself binds to sha256(body), so it
-/// is checked in `verify_hmac` once the body is complete.
+/// is checked in `verify_body` once the body is complete. Direct signatures
+/// are checked here, and their declared body hash is checked at completion.
 fn precheck(cfg: &UploadCfg, req: &Request) -> Result<Option<AuthHdrs>, (u16, String)> {
-    if cfg.upload_key.is_empty() {
-        return Ok(None); // allow_unsigned checked by enabled()
+    for name in ["x-upload-address", "x-upload-expiry", "x-upload-token", "x-upload-signature", "x-upload-sha256"] {
+        if req.headers.iter().filter(|(k,_)| k == name).count() > 1 {
+            return Err((401, "duplicate upload authorization header".into()));
+        }
+    }
+    let wallet_attempt = req.header("x-upload-signature").is_some() || req.header("x-upload-sha256").is_some();
+    if !wallet_attempt && cfg.upload_key.is_empty() && cfg.allow_unsigned {
+        return Ok(None);
     }
     let address = req
         .header("x-upload-address")
@@ -213,7 +222,7 @@ fn precheck(cfg: &UploadCfg, req: &Request) -> Result<Option<AuthHdrs>, (u16, St
         .unwrap_or("")
         .trim()
         .to_lowercase();
-    if address.is_empty() || expiry.is_empty() || token.is_empty() {
+    if address.is_empty() || expiry.is_empty() || (!wallet_attempt && token.is_empty()) {
         return Err((401, "signed upload required: connect your wallet and retry (the console/CLI signs the upload)".into()));
     }
     if !(address.len() == 42
@@ -232,11 +241,36 @@ fn precheck(cfg: &UploadCfg, req: &Request) -> Result<Option<AuthHdrs>, (u16, St
     if exp > now + 900 {
         return Err((401, "upload authorization expiry too far in the future".into()));
     }
-    Ok(Some(AuthHdrs { address, expiry: exp, token }))
+    let wallet_body = if wallet_attempt {
+        use crate::wallet_upload::{canonical_hex, message, verify};
+        if !canonical_hex(&cfg.wallet_audience, 32, true) {
+            return Err((401, "direct wallet uploads are not configured".into()));
+        }
+        let hash = req.header("x-upload-sha256").unwrap_or("");
+        let size = req.header("content-length").and_then(|s| s.parse::<u64>().ok());
+        if !canonical_hex(hash, 32, false) || size.is_none() || req.method != "POST"
+            || !matches!(req.path.as_str(), "/add-json" | "/add-image" | "/add-wasm") {
+            return Err((401, "bad wallet upload scope".into()));
+        }
+        let size = size.unwrap();
+        let msg = message(&cfg.wallet_audience, &req.path, &address, hash, size, exp);
+        if !verify(&address, &msg, req.header("x-upload-signature").unwrap_or("")) {
+            return Err((403, "invalid wallet upload signature".into()));
+        }
+        Some((hash.to_string(), size))
+    } else {
+        if cfg.upload_key.is_empty() { return Err((401, "direct wallet signature required".into())); }
+        None
+    };
+    Ok(Some(AuthHdrs { address, expiry: exp, token, wallet_body }))
 }
 
 /// The api-relay's exact mint: HMAC-SHA256(UPLOAD_KEY, "addr:sha256hex:exp").
-fn verify_hmac(auth: &AuthHdrs, upload_key: &str, body_sha256_hex: &str) -> Result<(), (u16, String)> {
+fn verify_body(auth: &AuthHdrs, upload_key: &str, body_sha256_hex: &str, size: u64) -> Result<(), (u16, String)> {
+    if let Some((hash, expected_size)) = &auth.wallet_body {
+        return if hash == body_sha256_hex && *expected_size == size { Ok(()) }
+            else { Err((403, "upload signature does not cover these bytes".into())) };
+    }
     let msg = format!("{}:{}:{}", auth.address, body_sha256_hex, auth.expiry);
     let mut mac = Hmac::<Sha256>::new_from_slice(upload_key.as_bytes()).expect("hmac key");
     mac.update(msg.as_bytes());
@@ -279,7 +313,7 @@ pub fn cors(resp: Response, req: &Request, cfg: &UploadCfg) -> Response {
         .with("access-control-allow-methods", "POST, OPTIONS")
         .with(
             "access-control-allow-headers",
-            "content-type, x-upload-address, x-upload-expiry, x-upload-token",
+            "content-type, x-upload-address, x-upload-expiry, x-upload-token, x-upload-signature, x-upload-sha256",
         )
 }
 
@@ -352,7 +386,7 @@ fn gate_buffered<'a>(
     let auth = precheck(cfg, req)?;
     if let Some(a) = &auth {
         let hash = hex_of(&Sha256::digest(&req.body));
-        verify_hmac(a, &cfg.upload_key, &hash)?;
+        verify_body(a, &cfg.upload_key, &hash, req.body.len() as u64)?;
         reserve_bytes(
             &mut app.upload_shared.borrow_mut(),
             cfg.per_addr_daily,
@@ -657,7 +691,7 @@ impl Sink for WasmSink {
         // The HMAC binds the minted token to these exact bytes.
         let hash = hex_of(&std::mem::take(&mut self.body_hash).finalize());
         if let Some(a) = self.auth.take() {
-            if let Err((code, msg)) = verify_hmac(&a, &self.upload_key, &hash) {
+            if let Err((code, msg)) = verify_body(&a, &self.upload_key, &hash, self.fed) {
                 let reason = if code == 401 { "Unauthorized" } else { "Forbidden" };
                 return self.fail(code, reason, &msg);
             }
@@ -754,5 +788,62 @@ impl Drop for WasmSink {
         if held > 0 {
             release_global(&mut sh, held);
         }
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use k256::ecdsa::SigningKey;
+    use sha3::Keccak256;
+    fn cfg() -> UploadCfg {
+        UploadCfg { upload_key: String::new(), wallet_audience: format!("0x{}", "ab".repeat(32)), allow_unsigned: false, allow_origins: vec![], max_wasm: 1024, max_image: 1024, max_json: 1024, per_addr_daily: 1024, global_daily: 4096, json_per_ip_hourly: 60.0 }
+    }
+    fn request(c: &UploadCfg, expiry: u64) -> Request {
+        let v: serde_json::Value = serde_json::from_str(include_str!("wallet-upload-vector.json")).unwrap();
+        let address = v["address"].as_str().unwrap();
+        let hash = hex_of(&Sha256::digest(b"{}"));
+        let m = crate::wallet_upload::message(&c.wallet_audience,"/add-json",address,&hash,2,expiry);
+        let mut h = Keccak256::new(); h.update(format!("\x19Ethereum Signed Message:\n{}",m.len())); h.update(m.as_bytes());
+        let key = SigningKey::from_bytes(&[0x42u8;32].into()).unwrap();
+        let (sig, rec) = key.sign_prehash_recoverable(&h.finalize()).unwrap();
+        let signature = format!("0x{}{:02x}",hex_of(&sig.to_bytes()),rec.to_byte()+27);
+        Request { method:"POST".into(),path:"/add-json".into(),query:String::new(),body:b"{}".to_vec(),stream_len:None,headers:vec![("content-length".into(),"2".into()),("x-upload-address".into(),address.into()),("x-upload-expiry".into(),expiry.to_string()),("x-upload-sha256".into(),hash),("x-upload-signature".into(),signature)] }
+    }
+    #[test]
+    fn direct_upload_needs_no_relay_secret_and_binds_final_bytes() {
+        let c=cfg(); assert!(c.enabled());
+        let req=request(&c,now_secs()+300); let a=precheck(&c,&req).unwrap().unwrap();
+        assert!(verify_body(&a,"",&hex_of(&Sha256::digest(b"{}")),2).is_ok());
+        assert!(verify_body(&a,"",&hex_of(&Sha256::digest(b"[]")),2).is_err());
+        assert!(verify_body(&a,"",&hex_of(&Sha256::digest(b"{}")),3).is_err());
+        let mut unsigned=req; unsigned.headers.clear(); assert!(precheck(&c,&unsigned).is_err());
+    }
+    #[test]
+    fn invalid_wallet_auth_cannot_fall_through_to_legacy_or_dev() {
+        let mut c=cfg(); c.allow_unsigned=true; c.upload_key="legacy".into();
+        let mut req=request(&c,now_secs()+300);
+        req.headers.retain(|(k,_)|k!="x-upload-signature");
+        req.headers.push(("x-upload-token".into(),"0".repeat(64)));
+        assert!(precheck(&c,&req).is_err());
+        c.upload_key.clear(); assert!(precheck(&c,&req).is_err());
+        req.headers.clear(); assert!(precheck(&c,&req).unwrap().is_none());
+    }
+    #[test]
+    fn rejects_expiry_scope_and_header_ambiguity() {
+        let c=cfg();
+        assert!(precheck(&c,&request(&c,now_secs()-1)).is_err());
+        assert!(precheck(&c,&request(&c,now_secs()+1000)).is_err());
+        let mut req=request(&c,now_secs()+300); req.path="/add-wasm".into(); assert!(precheck(&c,&req).is_err());
+        let mut req=request(&c,now_secs()+300);req.headers.push(("x-upload-address".into(),"0x00".into()));assert!(precheck(&c,&req).is_err());
+        let req=request(&c,now_secs()+300);let mut other=cfg();other.wallet_audience=format!("0x{}","cd".repeat(32));assert!(precheck(&other,&req).is_err());
+    }
+    #[test]
+    fn legacy_hmac_stays_compatible() {
+        let mut c=cfg();c.upload_key="legacy".into();let mut req=request(&c,now_secs()+300);
+        let addr=req.header("x-upload-address").unwrap();let expiry=req.header("x-upload-expiry").unwrap();let hash=hex_of(&Sha256::digest(b"{}"));
+        let mut mac=Hmac::<Sha256>::new_from_slice(c.upload_key.as_bytes()).unwrap();mac.update(format!("{addr}:{hash}:{expiry}").as_bytes());let token=hex_of(&mac.finalize().into_bytes());
+        req.headers.retain(|(k,_)|k!="x-upload-signature"&&k!="x-upload-sha256");req.headers.push(("x-upload-token".into(),token));
+        let a=precheck(&c,&req).unwrap().unwrap();assert!(verify_body(&a,&c.upload_key,&hash,2).is_ok());assert!(verify_body(&a,"wrong",&hash,2).is_err());
     }
 }

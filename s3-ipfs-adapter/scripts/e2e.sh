@@ -432,6 +432,42 @@ code=$(printf 'POST /add-json HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConten
 [ "$code" = 400 ] || fail "duplicate Content-Length -> '$code' (want 400)"
 pass "duplicate Content-Length refused (400)"
 
+# A separate instance has NO shared relay secret. Authorize directly using
+# the public test wallet; exercise buffered and multipart WASM paths.
+APP3_PORT=18402
+BASE3="http://127.0.0.1:$APP3_PORT"
+AUDIENCE=0xabababababababababababababababababababababababababababababababab
+CONFIG3=$(python3 - "$CONFIG2" "$AUDIENCE" <<'PYCONFIG'
+import json,sys
+c=json.loads(sys.argv[1]);del c['upload']['uploadKey'];c['upload']['walletAudience']=sys.argv[2];print(json.dumps(c))
+PYCONFIG
+)
+wasmtime run -Scli -Stcp -Sinherit-network -Sallow-ip-name-lookup \
+  --env "ENCLAVE_PORTS=http:8000=$APP3_PORT" --env "ENCLAVE_CONFIG=$CONFIG3" \
+  target/wasm32-wasip2/release/s3-ipfs-adapter.wasm >"$WORK/app3.log" 2>&1 &
+PIDS+=($!)
+for i in $(seq 1 600); do
+  [ "$(curl -sf "$BASE3/api/status" | jget state 2>/dev/null)" = ready ] && break
+  sleep 0.5
+  [ "$i" = 600 ] && fail "direct-wallet app index never became ready"
+done
+cargo build --example test-upload-signature >/dev/null 2>&1
+SIGN=target/debug/examples/test-upload-signature
+printf '{"direct":true}' > "$WORK/direct.json"
+"$SIGN" "$WORK/direct.json" /add-json "$AUDIENCE" > "$WORK/wallet-headers"
+CID=$(curl -sf -H @"$WORK/wallet-headers" --data-binary @"$WORK/direct.json" "$BASE3/add-json" | jget cid)
+[ "$CID" = "$(ipfs add --cid-version 1 -Q --only-hash "$WORK/direct.json" 2>/dev/null)" ] || fail "direct wallet JSON CID mismatch"
+curl -sf "$BASE3/ipfs/$CID" | cmp - "$WORK/direct.json" || fail "direct wallet JSON bytes differ"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H @"$WORK/wallet-headers" --data-binary '{"direct":null}' "$BASE3/add-json")
+[ "$code" = 403 ] || fail "direct wrong bytes accepted ($code)"
+code=$(curl -s -o /dev/null -w '%{http_code}' --data-binary @"$WORK/direct.json" "$BASE3/add-json")
+[ "$code" = 401 ] || fail "unsigned direct upload accepted ($code)"
+"$SIGN" "$WORK/big.wasm" /add-wasm "$AUDIENCE" > "$WORK/wallet-headers"
+CID=$(curl -sf -H @"$WORK/wallet-headers" --data-binary @"$WORK/big.wasm" "$BASE3/add-wasm" | jget cid)
+[ "$CID" = "$BIG_EXPECT" ] || fail "direct wallet WASM CID mismatch"
+curl -sf "$BASE3/ipfs/$CID" | cmp - "$WORK/big.wasm" || fail "direct wallet WASM bytes differ"
+pass "relay-free wallet uploads pin and serve JSON/WASM, refuse unsigned or changed bytes"
+
 echo
 OK=1
 echo "ALL PASS"
