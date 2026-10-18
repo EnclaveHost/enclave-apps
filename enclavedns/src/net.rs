@@ -368,6 +368,29 @@ pub fn now_ms() -> u64 {
     wasip2::clocks::monotonic_clock::now() / 1_000_000
 }
 
+pub enum Either<A, B> {
+    Left(A),
+    Right(B),
+}
+
+/// Whichever of two futures finishes first; the other is dropped, so both
+/// must be safe to cancel.
+pub async fn select2<A: std::future::Future, B: std::future::Future>(a: A, b: B) -> Either<A::Output, B::Output> {
+    use std::task::Poll;
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(v) = a.as_mut().poll(cx) {
+            return Poll::Ready(Either::Left(v));
+        }
+        if let Poll::Ready(v) = b.as_mut().poll(cx) {
+            return Poll::Ready(Either::Right(v));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 /// Drive several futures on this task until all finish (results in order).
 pub async fn join_all<F: std::future::Future>(futs: Vec<F>) -> Vec<F::Output> {
     use std::pin::Pin;

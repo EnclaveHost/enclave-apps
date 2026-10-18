@@ -13,7 +13,7 @@ use crate::net::{self, Dest, Udp};
 use crate::tls::{self, Conn};
 use crate::wire::{ede, rcode, rrsets, ty, Message, Record};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -171,6 +171,16 @@ pub struct Stats {
     pub upstream_timeouts: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    /// answers served past their TTL while a refresh runs (RFC 8767)
+    pub stale_served: u64,
+    /// background re-resolutions: names near expiry, or served stale
+    pub refreshes: u64,
+    /// speculative DS/DNSKEY fetches for the zones above a new name
+    pub prefetches: u64,
+    /// identical upstream questions answered by one in-flight query
+    pub joined: u64,
+    /// second upstream asked because the first was slow
+    pub hedged: u64,
     pub secure: u64,
     pub insecure: u64,
     pub bogus: u64,
@@ -199,6 +209,12 @@ impl Ctx {
 }
 
 const MAX_QUERIES_PER_REQUEST: u32 = 150;
+/// An upstream answer is shared with identical questions for this long.
+const FWD_MEMO_MS: u64 = 5_000;
+/// How long past its TTL an answer may still be served while it refreshes.
+const STALE_MS: u64 = 3_600_000;
+/// The TTL a stale answer is handed out with (RFC 8767 §4).
+const STALE_TTL: u32 = 30;
 const MAX_DEPTH: u32 = 12;
 
 #[derive(Clone)]
@@ -213,6 +229,20 @@ struct Delegation {
     ns: Vec<Name>,
     addrs: RefCell<Vec<SocketAddr>>,
     resolved: Cell<bool>,
+}
+
+/// One upstream question, shared by everyone asking it while it runs and
+/// for FWD_MEMO_MS after.
+struct FwdSlot {
+    cell: tokio::sync::OnceCell<Result<Message, Answer>>,
+    done_ms: Cell<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct UpstreamStat {
+    pub srtt_ms: u32,
+    pub answered: u64,
+    pub failed: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -264,6 +294,10 @@ pub struct Resolver {
     v6_streak: Cell<u32>,
     udp_silent: Cell<u32>,
     tcp_idle: RefCell<HashMap<String, Vec<(Conn, u64)>>>,
+    fwd: RefCell<HashMap<(Name, u16), Rc<FwdSlot>>>,
+    pub upstream_stats: RefCell<Vec<UpstreamStat>>,
+    refreshing: RefCell<HashSet<(Name, u16)>>,
+    host_lookups: RefCell<HashMap<String, (Vec<IpAddr>, u64)>>,
     pub http: Rc<tls::Pool>,
     pub stats: RefCell<Stats>,
     local_nx: Vec<Name>,
@@ -290,6 +324,7 @@ impl Resolver {
             Transport::Auto if net::egress_proxy() => Some(false),
             Transport::Auto => None,
         };
+        let ups = vec![UpstreamStat::default(); cfg.forward.len()];
         Rc::new(Resolver {
             cfg,
             cache: RefCell::default(),
@@ -303,6 +338,10 @@ impl Resolver {
             v6_streak: Cell::new(0),
             udp_silent: Cell::new(0),
             tcp_idle: RefCell::default(),
+            fwd: RefCell::default(),
+            upstream_stats: RefCell::new(ups),
+            refreshing: RefCell::default(),
+            host_lookups: RefCell::default(),
             http,
             stats: RefCell::default(),
             local_nx: LOCAL_NXDOMAIN.iter().map(|s| Name::parse(s).unwrap()).collect(),
@@ -344,20 +383,26 @@ impl Resolver {
     // ------------------------------------------------------------ cache --
 
     fn cache_get(&self, name: &Name, qtype: u16) -> Option<Answer> {
+        self.cache_entry(name, qtype).filter(|(_, left_ms, _)| *left_ms > 0).map(|(a, _, _)| a)
+    }
+
+    /// (answer with aged TTLs, ms until expiry (negative once stale), TTL it was stored with in ms)
+    fn cache_entry(&self, name: &Name, qtype: u16) -> Option<(Answer, i64, u64)> {
         let now = net::now_ms();
         let c = self.cache.borrow();
         let (a, exp, at) = c.get(&(name.to_lowercase(), qtype))?;
-        if now >= *exp {
+        if now >= exp + STALE_MS {
             return None;
         }
-        let age = ((now - at) / 1000) as u32;
+        let (exp, at) = (*exp, *at);
+        let age = ((now.min(exp) - at) / 1000) as u32;
         let mut a = (**a).clone();
         for r in a.answer.iter_mut().chain(a.authority.iter_mut()) {
             r.ttl = r.ttl.saturating_sub(age);
         }
         a.ttl = a.ttl.saturating_sub(age);
         a.source = "cache";
-        Some(a)
+        Some((a, exp as i64 - now as i64, exp - at))
     }
 
     fn cache_put(&self, name: &Name, qtype: u16, a: &Answer) {
@@ -371,7 +416,10 @@ impl Resolver {
         let now = net::now_ms();
         let mut c = self.cache.borrow_mut();
         if c.len() >= self.cfg.cache_entries {
-            c.retain(|_, (_, exp, _)| *exp > now);
+            c.retain(|_, (_, exp, _)| *exp + STALE_MS > now);
+            if c.len() >= self.cfg.cache_entries {
+                c.retain(|_, (_, exp, _)| *exp > now);
+            }
             if c.len() >= self.cfg.cache_entries {
                 let drop: Vec<_> = c.keys().take(self.cfg.cache_entries / 10 + 1).cloned().collect();
                 for k in drop {
@@ -396,53 +444,130 @@ impl Resolver {
                 a.ede = Some((ede::BLOCKED, "special-use name, never sent to the internet (RFC 6761/7686)".into()));
                 return a;
             }
-            if let Some(a) = self.cache_get(name, qtype) {
-                self.stats.borrow_mut().cache_hits += 1;
-                return a;
-            }
-            self.stats.borrow_mut().cache_misses += 1;
-            if depth > MAX_DEPTH {
-                return Answer::fail(ede::OTHER, "resolution nested too deeply");
-            }
-            let (msg, zone) = match self.fetch(name, qtype, ctx, depth).await {
-                Ok(x) => x,
-                Err(a) => {
-                    self.cache_put(name, qtype, &a);
+            match self.cache_entry(name, qtype) {
+                Some((a, left_ms, stored_ms)) if left_ms > 0 => {
+                    self.stats.borrow_mut().cache_hits += 1;
+                    // a client name in its last tenth: refresh ahead of expiry
+                    if depth == 0 && stored_ms >= 10_000 && (left_ms as u64) < stored_ms / 10 {
+                        self.refresh(name, qtype);
+                    }
                     return a;
                 }
-            };
-            let mut a = extract(&msg, name, qtype, &zone);
-            a.ttl = a.ttl.min(if a.answer.is_empty() { self.cfg.max_negative_ttl } else { self.cfg.max_ttl });
-            if self.cfg.validate {
-                self.validate(name, qtype, &mut a, &zone, ctx, depth).await;
-            } else {
-                a.sec = Sec::Insecure;
-            }
-            {
-                let mut s = self.stats.borrow_mut();
-                match a.sec {
-                    Sec::Secure => s.secure += 1,
-                    Sec::Bogus => s.bogus += 1,
-                    _ => s.insecure += 1,
+                Some((mut a, _, _)) if depth == 0 && matches!(a.rcode, rcode::NOERROR | rcode::NXDOMAIN) && a.sec != Sec::Bogus => {
+                    // RFC 8767: answer from the expired entry now, refresh behind it
+                    self.stats.borrow_mut().stale_served += 1;
+                    for r in a.answer.iter_mut().chain(a.authority.iter_mut()) {
+                        r.ttl = STALE_TTL;
+                    }
+                    a.ttl = STALE_TTL;
+                    a.source = "stale cache";
+                    self.refresh(name, qtype);
+                    return a;
                 }
+                _ => {}
             }
-            if a.sec == Sec::Bogus {
-                a.ttl = a.ttl.min(60);
-            }
-            // RFC 9824: a validated compact denial (NSEC at the name with
-            // NXNAME) is a nonexistent name; say so plainly
-            if a.sec == Sec::Secure
-                && a.rcode == rcode::NOERROR
-                && a.answer.is_empty()
-                && a.authority.iter().any(|r| {
-                    r.rtype == ty::NSEC && r.name == *name && Nsec::parse(&r.name, &r.data).is_some_and(|n| dnssec::bitmap_has(&n.bitmap, ty::NXNAME))
-                })
-            {
-                a.rcode = rcode::NXDOMAIN;
-            }
+            self.stats.borrow_mut().cache_misses += 1;
+            let a = self.resolve(name, qtype, ctx, depth).await;
             self.cache_put(name, qtype, &a);
             a
         })
+    }
+
+    /// Re-resolve (name, qtype) in the background; a failure keeps the old
+    /// entry (RFC 8767: stale beats an outage).
+    fn refresh(self: &Rc<Self>, name: &Name, qtype: u16) {
+        let key = (name.to_lowercase(), qtype);
+        if !self.refreshing.borrow_mut().insert(key.clone()) {
+            return;
+        }
+        self.stats.borrow_mut().refreshes += 1;
+        let me = self.clone();
+        wstd::runtime::spawn(async move {
+            let ctx = Ctx::new(Duration::from_secs(9));
+            let a = me.resolve(&key.0, key.1, &ctx, 0).await;
+            if matches!(a.rcode, rcode::NOERROR | rcode::NXDOMAIN) && a.sec != Sec::Bogus {
+                me.cache_put(&key.0, key.1, &a);
+            }
+            me.refreshing.borrow_mut().remove(&key);
+        })
+        .detach();
+    }
+
+    /// Resolve and validate from the network, without the answer cache.
+    async fn resolve(self: &Rc<Self>, name: &Name, qtype: u16, ctx: &Rc<Ctx>, depth: u32) -> Answer {
+        if depth > MAX_DEPTH {
+            return Answer::fail(ede::OTHER, "resolution nested too deeply");
+        }
+        if depth == 0 {
+            self.prefetch_chain(name);
+        }
+        let (msg, zone) = match self.fetch(name, qtype, ctx, depth).await {
+            Ok(x) => x,
+            Err(a) => return a,
+        };
+        let mut a = extract(&msg, name, qtype, &zone);
+        a.ttl = a.ttl.min(if a.answer.is_empty() { self.cfg.max_negative_ttl } else { self.cfg.max_ttl });
+        if self.cfg.validate {
+            self.validate(name, qtype, &mut a, &zone, ctx, depth).await;
+        } else {
+            a.sec = Sec::Insecure;
+        }
+        {
+            let mut s = self.stats.borrow_mut();
+            match a.sec {
+                Sec::Secure => s.secure += 1,
+                Sec::Bogus => s.bogus += 1,
+                _ => s.insecure += 1,
+            }
+        }
+        if a.sec == Sec::Bogus {
+            a.ttl = a.ttl.min(60);
+        }
+        // RFC 9824: a validated compact denial (NSEC at the name with
+        // NXNAME) is a nonexistent name; say so plainly
+        if a.sec == Sec::Secure
+            && a.rcode == rcode::NOERROR
+            && a.answer.is_empty()
+            && a.authority.iter().any(|r| {
+                r.rtype == ty::NSEC && r.name == *name && Nsec::parse(&r.name, &r.data).is_some_and(|n| dnssec::bitmap_has(&n.bitmap, ty::NXNAME))
+            })
+        {
+            a.rcode = rcode::NXDOMAIN;
+        }
+        a
+    }
+
+    /// Forwarding with validation proves a new name from the root down, one
+    /// zone at a time: DS, then DNSKEY, then the zone below. Ask for every
+    /// zone the name may sit under at once instead; the chain walk then
+    /// finds them answered (or in flight) rather than asking in turn. Only
+    /// the top three levels: deeper names rarely start zones of their own.
+    fn prefetch_chain(self: &Rc<Self>, name: &Name) {
+        if self.cfg.forward.is_empty() || !self.cfg.validate {
+            return;
+        }
+        let now = net::now_ms();
+        let mut zones = Vec::new();
+        let mut cur = name.clone();
+        while !cur.is_root() {
+            let known = self.keys.borrow().get(&cur.to_lowercase()).is_some_and(|(_, exp)| *exp > now)
+                || self.cache_get(&cur, ty::DS).is_some();
+            if cur.label_count() <= 3 && !known {
+                zones.push(cur.clone());
+            }
+            cur = cur.parent().unwrap_or_else(Name::root);
+        }
+        if zones.is_empty() {
+            return;
+        }
+        self.stats.borrow_mut().prefetches += zones.len() as u64 * 2;
+        let me = self.clone();
+        wstd::runtime::spawn(async move {
+            let ctx = Ctx::new(Duration::from_secs(8));
+            let asks: Vec<_> = zones.iter().flat_map(|z| [(z, ty::DS), (z, ty::DNSKEY)]).map(|(z, t)| me.forward(z, t, &ctx)).collect();
+            net::join_all(asks).await;
+        })
+        .detach();
     }
 
     /// Get a response for (name, qtype) from the network, with the zone it
@@ -809,36 +934,154 @@ impl Resolver {
 
     // --------------------------------------------------------- forwarding --
 
+    /// Ask the upstreams; an identical question already in flight (or
+    /// answered in the last few seconds) is shared rather than asked again.
     async fn forward(self: &Rc<Self>, name: &Name, qtype: u16, ctx: &Rc<Ctx>) -> Result<Message, Answer> {
-        let mut last = Answer::fail(ede::NO_REACHABLE_AUTHORITY, "no upstream answered");
-        for up in &self.cfg.forward {
-            if !ctx.spend() {
-                break;
-            }
-            let id = net::random_u16();
-            // CD: we validate ourselves, and need the data a validating upstream would withhold
-            let q = Message::query(id, name, qtype, true, true, true);
-            let wire = q.to_bytes(65535);
-            let wait = Duration::from_millis(3000).min(ctx.left());
-            self.stats.borrow_mut().upstream_queries += 1;
-            let r: io::Result<Vec<u8>> = match up {
-                Upstream::Udp(a) => match self.udp_exchange(*a, &wire, id, wait).await {
-                    Ok(b) if Message::parse(&b).is_ok_and(|m| m.tc) => {
-                        self.stream_exchange(&format!("tcp {a}"), &Dest::Addr(*a), None, &wire, wait).await
-                    }
-                    r => r,
-                },
-                Upstream::Tcp(a) => self.stream_exchange(&format!("tcp {a}"), &Dest::Addr(*a), None, &wire, wait).await,
-                Upstream::Tls(a, n) => self.stream_exchange(&format!("tls {a} {n}"), &Dest::Addr(*a), Some(n), &wire, wait).await,
-                Upstream::Https(u) => self.doh_exchange(u, &wire, wait).await,
+        let key = (name.to_lowercase(), qtype);
+        let now = net::now_ms();
+        let slot = {
+            let mut m = self.fwd.borrow_mut();
+            let fresh = |f: &FwdSlot| match f.cell.get() {
+                None => true,
+                Some(r) => r.is_ok() && now.saturating_sub(f.done_ms.get()) < FWD_MEMO_MS,
             };
-            match r.and_then(|b| check_response(&b, id, name, qtype)) {
-                Ok(m) if m.rcode == rcode::NOERROR || m.rcode == rcode::NXDOMAIN => return Ok(m),
-                Ok(m) => last = Answer::fail(ede::NETWORK_ERROR, format!("{} answered {}", up.text(), rcode::name(m.rcode))),
-                Err(e) => last = Answer::fail(ede::NETWORK_ERROR, format!("{}: {e}", up.text())),
+            if m.len() > 2048 {
+                m.retain(|_, f| fresh(f));
+            }
+            match m.get(&key) {
+                Some(f) if fresh(f) => {
+                    self.stats.borrow_mut().joined += 1;
+                    f.clone()
+                }
+                _ => {
+                    let f = Rc::new(FwdSlot { cell: tokio::sync::OnceCell::new(), done_ms: Cell::new(0) });
+                    m.insert(key, f.clone());
+                    f
+                }
+            }
+        };
+        slot.cell
+            .get_or_init(|| async {
+                let r = self.forward_now(name, qtype, ctx).await;
+                slot.done_ms.set(net::now_ms());
+                r
+            })
+            .await
+            .clone()
+    }
+
+    /// How long to wait on upstream `i` before asking the next one too.
+    fn hedge_after(&self, i: usize) -> Duration {
+        let srtt = self.upstream_stats.borrow().get(i).map_or(0, |u| u.srtt_ms);
+        Duration::from_millis(if srtt == 0 { 1000 } else { (srtt as u64 * 2 + 100).clamp(250, 2000) })
+    }
+
+    fn note_upstream(&self, i: usize, ok: bool, rtt_ms: u64) {
+        if let Some(u) = self.upstream_stats.borrow_mut().get_mut(i) {
+            if ok {
+                u.answered += 1;
+                let r = rtt_ms.min(10_000) as u32;
+                u.srtt_ms = if u.srtt_ms == 0 { r } else { (u.srtt_ms * 7 + r) / 8 };
+            } else {
+                u.failed += 1;
             }
         }
-        Err(last)
+    }
+
+    /// The upstreams in order, the next one started early when the current
+    /// one is slower than its usual round trip; the first good answer wins.
+    async fn forward_now(self: &Rc<Self>, name: &Name, qtype: u16, ctx: &Rc<Ctx>) -> Result<Message, Answer> {
+        use std::task::Poll;
+        let n = self.cfg.forward.len();
+        let id = net::random_u16();
+        // CD: we validate ourselves, and need the data a validating upstream would withhold
+        let wire = Message::query(id, name, qtype, true, true, true).to_bytes(65535);
+        let mut last = Answer::fail(ede::NO_REACHABLE_AUTHORITY, "no upstream answered");
+        let mut running: Vec<(usize, u64, Fut<'_, io::Result<Vec<u8>>>)> = Vec::new();
+        let mut hedge: Option<Fut<'_, ()>> = None;
+        let mut next = 0usize;
+        loop {
+            // nothing running: start the next upstream (a hedge starts below)
+            if running.is_empty() {
+                if next >= n || !ctx.spend() {
+                    return Err(last);
+                }
+                let wait = Duration::from_millis(3000).min(ctx.left());
+                self.stats.borrow_mut().upstream_queries += 1;
+                running.push((next, net::now_ms(), Box::pin(self.ask_upstream(next, &wire, id, wait))));
+                hedge = (next + 1 < n).then(|| -> Fut<'_, ()> { Box::pin(net::sleep(self.hedge_after(next))) });
+                next += 1;
+            }
+            enum Ev {
+                Done(usize, io::Result<Vec<u8>>),
+                Hedge,
+            }
+            let ev = std::future::poll_fn(|cx| {
+                for (k, (_, _, f)) in running.iter_mut().enumerate() {
+                    if let Poll::Ready(r) = f.as_mut().poll(cx) {
+                        return Poll::Ready(Ev::Done(k, r));
+                    }
+                }
+                if let Some(h) = hedge.as_mut() {
+                    if h.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Ev::Hedge);
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+            match ev {
+                Ev::Hedge => {
+                    hedge = None;
+                    if next < n && ctx.spend() {
+                        let wait = Duration::from_millis(3000).min(ctx.left());
+                        let mut s = self.stats.borrow_mut();
+                        s.upstream_queries += 1;
+                        s.hedged += 1;
+                        drop(s);
+                        running.push((next, net::now_ms(), Box::pin(self.ask_upstream(next, &wire, id, wait))));
+                        hedge = (next + 1 < n).then(|| -> Fut<'_, ()> { Box::pin(net::sleep(self.hedge_after(next))) });
+                        next += 1;
+                    }
+                }
+                Ev::Done(k, r) => {
+                    let (i, t0, _) = running.remove(k);
+                    let up = &self.cfg.forward[i];
+                    match r.and_then(|b| check_response(&b, id, name, qtype)) {
+                        Ok(m) if m.rcode == rcode::NOERROR || m.rcode == rcode::NXDOMAIN => {
+                            self.note_upstream(i, true, net::now_ms().saturating_sub(t0));
+                            return Ok(m);
+                        }
+                        Ok(m) => {
+                            self.note_upstream(i, false, 0);
+                            last = Answer::fail(ede::NETWORK_ERROR, format!("{} answered {}", up.text(), rcode::name(m.rcode)));
+                        }
+                        Err(e) => {
+                            self.note_upstream(i, false, 0);
+                            last = Answer::fail(ede::NETWORK_ERROR, format!("{}: {e}", up.text()));
+                        }
+                    }
+                    // a failure moves straight on to the next upstream
+                    if running.is_empty() {
+                        hedge = None;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn ask_upstream(self: &Rc<Self>, i: usize, wire: &[u8], id: u16, wait: Duration) -> io::Result<Vec<u8>> {
+        match &self.cfg.forward[i] {
+            Upstream::Udp(a) => match self.udp_exchange(*a, wire, id, wait).await {
+                Ok(b) if Message::parse(&b).is_ok_and(|m| m.tc) => {
+                    self.stream_exchange(&format!("tcp {a}"), &Dest::Addr(*a), None, wire, wait).await
+                }
+                r => r,
+            },
+            Upstream::Tcp(a) => self.stream_exchange(&format!("tcp {a}"), &Dest::Addr(*a), None, wire, wait).await,
+            Upstream::Tls(a, n) => self.stream_exchange(&format!("tls {a} {n}"), &Dest::Addr(*a), Some(n), wire, wait).await,
+            Upstream::Https(u) => self.doh_exchange(u, wire, wait).await,
+        }
     }
 
     /// Where an outbound host can be dialled: an IP literal; by name through
@@ -852,7 +1095,7 @@ impl Resolver {
         if net::egress_proxy() {
             return vec![Dest::Host(host.to_string(), port)];
         }
-        let mut ips = net::system_lookup(host).await;
+        let mut ips = self.host_lookup(host).await;
         // v6 first: the platform's egress carries IPv6
         ips.sort_by_key(|ip| ip.is_ipv4());
         if !ips.is_empty() || !own_resolver {
@@ -877,6 +1120,22 @@ impl Resolver {
             }
         }
         out
+    }
+
+    /// The host's lookup, remembered for a minute: inside a partition it
+    /// answers from /etc/hosts, but every call still crosses into the host.
+    async fn host_lookup(&self, host: &str) -> Vec<IpAddr> {
+        let now = net::now_ms();
+        if let Some((ips, exp)) = self.host_lookups.borrow().get(host) {
+            if *exp > now {
+                return ips.clone();
+            }
+        }
+        let ips = net::system_lookup(host).await;
+        if !ips.is_empty() {
+            self.host_lookups.borrow_mut().insert(host.to_string(), (ips.clone(), now + 60_000));
+        }
+        ips
     }
 
     async fn doh_exchange(self: &Rc<Self>, url: &str, wire: &[u8], wait: Duration) -> io::Result<Vec<u8>> {

@@ -216,6 +216,24 @@ EnclaveDNS can offer there:
   the root anchors itself, so a dishonest upstream can withhold answers but
   not forge them. Outbound hosts are found through the platform's own name
   lookup, which inside a domain is the only one that names those forwarders.
+- **Every upstream round trip is slow there**, because egress leaves through
+  the host and a network exit: on the first Enclave Shield host one DoH
+  exchange took about as long as a whole cold lookup on a workstation, and a
+  new TLS connection several times that. So since 0.1.3:
+  - upstreams speak HTTP/2 when they offer it, with one multiplexed
+    connection per origin, pinged while in use. A burst of new names shares
+    it instead of dialling a connection each;
+  - the DS and DNSKEY sets of the top three zones above a new name are asked
+    for at once, rather than one zone after another as the chain walk reaches
+    them, and identical upstream questions in flight are asked only once;
+  - a slow upstream is hedged: the next one is asked too after twice its
+    smoothed round trip;
+  - a name asked in the last tenth of its TTL is refreshed in the background,
+    and for an hour past its TTL an expired answer is served at once (TTL 30,
+    RFC 8767) while it refreshes. A failed refresh keeps the old answer.
+
+  `GET /api/status` shows each upstream's smoothed round trip, the HTTP/2 and
+  HTTP/1.1 connection counts and the time of the last new connection.
 - **ENS offchain resolvers (CCIP-Read) fail on isolated hosts.** Their gateway
   URLs come from the contracts at lookup time, so they are not among the
   config's allowed origins. On-chain ENS names resolve normally.
@@ -243,7 +261,7 @@ EnclaveDNS can offer there:
 ```sh
 rustup target add wasm32-wasip2
 cargo build --release --target wasm32-wasip2
-# -> target/wasm32-wasip2/release/enclavedns.wasm (~2.2 MB)
+# -> target/wasm32-wasip2/release/enclavedns.wasm (~2.5 MB)
 
 cargo test --target wasm32-wasip2      # 35 unit tests, run under wasmtime
 ```

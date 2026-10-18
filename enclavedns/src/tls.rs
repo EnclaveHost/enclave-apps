@@ -3,23 +3,29 @@
 //! ENS JSON-RPC calls, CCIP-Read gateways and DNS-over-HTTPS upstreams.
 
 use crate::net::{self, Dest, Tcp};
-use std::cell::RefCell;
+use bytes::Bytes;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 thread_local! {
-    static TLS_CFG: Arc<rustls::ClientConfig> = {
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
-                .with_safe_default_protocol_versions()
-                .expect("tls versions")
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    };
+    static TLS_CFG: Arc<rustls::ClientConfig> = tls_config(&[]);
+    /// Offers h2 first: an origin that takes it gets one multiplexed connection.
+    static TLS_CFG_H2: Arc<rustls::ClientConfig> = tls_config(&[b"h2", b"http/1.1"]);
+}
+
+fn tls_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
+    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let mut c = rustls::ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
+        .with_safe_default_protocol_versions()
+        .expect("tls versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Arc::new(c)
 }
 
 pub struct TlsConn {
@@ -33,9 +39,12 @@ fn tls_err(e: rustls::Error) -> io::Error {
 
 impl TlsConn {
     pub async fn handshake(tcp: Tcp, server_name: &str) -> io::Result<TlsConn> {
+        Self::handshake_with(tcp, server_name, TLS_CFG.with(|c| c.clone())).await
+    }
+
+    async fn handshake_with(tcp: Tcp, server_name: &str, cfg: Arc<rustls::ClientConfig>) -> io::Result<TlsConn> {
         let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
             .map_err(|_| io::Error::other(format!("bad TLS server name {server_name}")))?;
-        let cfg = TLS_CFG.with(|c| c.clone());
         let conn = rustls::ClientConnection::new(cfg, name).map_err(tls_err)?;
         let mut t = TlsConn { tcp, conn };
         while t.conn.is_handshaking() {
@@ -63,12 +72,16 @@ impl TlsConn {
         if d.is_empty() {
             return Ok(false);
         }
-        let mut rd = &d[..];
+        self.feed(&d)?;
+        Ok(true)
+    }
+
+    fn feed(&mut self, mut rd: &[u8]) -> io::Result<()> {
         while !rd.is_empty() {
             self.conn.read_tls(&mut rd)?;
             self.conn.process_new_packets().map_err(tls_err)?;
         }
-        Ok(true)
+        Ok(())
     }
 
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
@@ -180,14 +193,49 @@ pub fn parse_url(u: &str) -> Result<Url, String> {
     Ok(Url { https, host: host.to_ascii_lowercase(), port, path: path.to_string() })
 }
 
-/// Idle keep-alive connections by origin.
+/// Outbound HTTP by origin: one multiplexed HTTP/2 connection for each
+/// origin that negotiates h2, else idle HTTP/1.1 keep-alive connections.
+/// Under the platform's egress a new connection costs several slow round
+/// trips, so concurrent requests must share one rather than each dial.
 #[derive(Default)]
 pub struct Pool {
     idle: RefCell<HashMap<String, Vec<(Conn, u64)>>>,
+    h2: RefCell<HashMap<String, H2Conn>>,
+    /// one dial per origin at a time; the others wait and share it
+    h2_dialing: RefCell<HashMap<String, Rc<tokio::sync::Mutex<()>>>>,
+    /// origins whose ALPN chose HTTP/1.1, until (ms)
+    h1_only: RefCell<HashMap<String, u64>>,
+    pub stats: RefCell<PoolStats>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct PoolStats {
+    pub h2_connects: u64,
+    pub h2_requests: u64,
+    pub h2_retries: u64,
+    pub h1_connects: u64,
+    pub h1_requests: u64,
+    /// TCP + TLS time of the last new connection
+    pub connect_ms_last: u64,
+    pub connect_ms_max: u64,
+}
+
+#[derive(Clone)]
+struct H2Conn {
+    send: h2::client::SendRequest<Bytes>,
+    life: Rc<H2Life>,
+}
+
+struct H2Life {
+    dead: Cell<bool>,
+    used_ms: Cell<u64>,
 }
 
 const IDLE_MS: u64 = 25_000;
 const MAX_BODY: usize = 4 << 20;
+/// An HTTP/2 connection is pinged while in use and let go after this idle.
+const H2_IDLE_MS: u64 = 300_000;
+const H2_PING_EVERY: Duration = Duration::from_secs(15);
 
 impl Pool {
     fn take(&self, key: &str) -> Option<Conn> {
@@ -238,8 +286,14 @@ impl Pool {
             head.push_str(&format!("content-length: {}\r\n", body.len()));
         }
         head.push_str("\r\n");
+        if url.https && !self.is_h1_only(&key) {
+            if let Some(r) = self.h2_request(&key, url, &host_hdr, dests, method, headers, body, limit).await? {
+                return Ok(r);
+            }
+        }
         let mut req = head.into_bytes();
         req.extend_from_slice(body);
+        self.stats.borrow_mut().h1_requests += 1;
 
         // a pooled connection the peer closed fails before any byte: retry fresh once
         if let Some(mut c) = self.take(&key) {
@@ -253,6 +307,7 @@ impl Pool {
         let mut last = io::Error::other("no address to dial");
         for d in dests {
             let tls = if url.https { Some(url.host.as_str()) } else { None };
+            let t0 = net::now_ms();
             let mut c = match Conn::open(d, tls, limit).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -260,6 +315,7 @@ impl Pool {
                     continue;
                 }
             };
+            self.note_connect(t0, false);
             let r = net::timeout(limit, async { exchange(&mut c, &req, method).await }).await;
             match r {
                 Ok((resp, keep)) => {
@@ -273,6 +329,266 @@ impl Pool {
         }
         Err(last)
     }
+}
+
+impl Pool {
+    fn note_connect(&self, t0: u64, h2: bool) {
+        let ms = net::now_ms().saturating_sub(t0);
+        let mut s = self.stats.borrow_mut();
+        if h2 {
+            s.h2_connects += 1;
+        } else {
+            s.h1_connects += 1;
+        }
+        s.connect_ms_last = ms;
+        s.connect_ms_max = s.connect_ms_max.max(ms);
+    }
+
+    fn is_h1_only(&self, key: &str) -> bool {
+        self.h1_only.borrow().get(key).is_some_and(|until| *until > net::now_ms())
+    }
+
+    fn live_h2(&self, key: &str) -> Option<H2Conn> {
+        let mut m = self.h2.borrow_mut();
+        match m.get(key) {
+            Some(c) if !c.life.dead.get() => Some(c.clone()),
+            Some(_) => {
+                m.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// One request over the origin's HTTP/2 connection; None when the
+    /// origin does not speak h2 (the caller uses HTTP/1.1).
+    #[allow(clippy::too_many_arguments)]
+    async fn h2_request(
+        &self,
+        key: &str,
+        url: &Url,
+        authority: &str,
+        dests: &[Dest],
+        method: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        limit: Duration,
+    ) -> io::Result<Option<Response>> {
+        let deadline = net::now_ms() + limit.as_millis() as u64;
+        let left = || Duration::from_millis(deadline.saturating_sub(net::now_ms()));
+        let mut retried = false;
+        loop {
+            let Some((c, fresh)) = self.h2_conn(key, url, dests, left()).await? else { return Ok(None) };
+            self.stats.borrow_mut().h2_requests += 1;
+            let r = net::timeout(left(), h2_exchange(c.send.clone(), url, authority, method, headers, body)).await;
+            match r {
+                Ok(resp) => {
+                    c.life.used_ms.set(net::now_ms());
+                    return Ok(Some(resp));
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err(e),
+                Err(e) => {
+                    // the connection failed (GOAWAY, reset, closed by the
+                    // path while idle): retire it and try once on a new one
+                    c.life.dead.set(true);
+                    if fresh || retried {
+                        return Err(e);
+                    }
+                    retried = true;
+                    self.stats.borrow_mut().h2_retries += 1;
+                }
+            }
+        }
+    }
+
+    /// The origin's live HTTP/2 connection, dialling it if there is none:
+    /// (connection, newly dialled), or None for an HTTP/1.1-only origin.
+    async fn h2_conn(&self, key: &str, url: &Url, dests: &[Dest], limit: Duration) -> io::Result<Option<(H2Conn, bool)>> {
+        if let Some(c) = self.live_h2(key) {
+            return Ok(Some((c, false)));
+        }
+        let lock = self.h2_dialing.borrow_mut().entry(key.to_string()).or_default().clone();
+        let _dialing = net::timeout(limit, async { Ok(lock.lock().await) }).await?;
+        if let Some(c) = self.live_h2(key) {
+            return Ok(Some((c, false)));
+        }
+        if self.is_h1_only(key) {
+            return Ok(None);
+        }
+        let deadline = net::now_ms() + limit.as_millis() as u64;
+        let left = || Duration::from_millis(deadline.saturating_sub(net::now_ms()));
+        let mut last = io::Error::other("no address to dial");
+        for d in dests {
+            let t0 = net::now_ms();
+            let tcp = match net::dial(d, left()).await {
+                Ok(t) => t,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            let cfg = TLS_CFG_H2.with(|c| c.clone());
+            let tls = match net::timeout(left(), TlsConn::handshake_with(tcp, &url.host, cfg)).await {
+                Ok(t) => t,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            if tls.conn.alpn_protocol() != Some(b"h2") {
+                // not wasted: it is a good HTTP/1.1 connection
+                self.note_connect(t0, false);
+                self.h1_only.borrow_mut().insert(key.to_string(), net::now_ms() + 600_000);
+                self.put(key, Conn::Tls(Box::new(tls)));
+                return Ok(None);
+            }
+            let c = net::timeout(left(), h2_start(tls)).await?;
+            self.note_connect(t0, true);
+            self.h2.borrow_mut().insert(key.to_string(), c.clone());
+            return Ok(Some((c, true)));
+        }
+        Err(last)
+    }
+}
+
+fn h2_err(e: h2::Error) -> io::Error {
+    if e.is_io() {
+        e.into_io().unwrap_or_else(|| io::Error::other("h2 i/o"))
+    } else {
+        io::Error::other(format!("h2: {e}"))
+    }
+}
+
+/// Run h2 over a TLS connection: h2 speaks to one end of an in-memory
+/// duplex, a pump task moves its bytes through rustls and the socket.
+async fn h2_start(tls: TlsConn) -> io::Result<H2Conn> {
+    let (ours, theirs) = tokio::io::duplex(64 * 1024);
+    let life = Rc::new(H2Life { dead: Cell::new(false), used_ms: Cell::new(net::now_ms()) });
+    wstd::runtime::spawn(pump(tls, theirs, life.clone())).detach();
+    let (send, mut conn) = h2::client::Builder::new()
+        .initial_window_size(1 << 20)
+        .initial_connection_window_size(4 << 20)
+        .handshake::<_, Bytes>(ours)
+        .await
+        .map_err(h2_err)?;
+    let ping = conn.ping_pong();
+    let l = life.clone();
+    wstd::runtime::spawn(async move {
+        let _ = conn.await;
+        l.dead.set(true);
+    })
+    .detach();
+    if let Some(p) = ping {
+        wstd::runtime::spawn(keepalive(p, life.clone())).detach();
+    }
+    Ok(H2Conn { send, life })
+}
+
+/// Ping while in use: a path that silently dropped the connection shows
+/// up here, not as a request that hangs until its deadline.
+async fn keepalive(mut p: h2::PingPong, life: Rc<H2Life>) {
+    loop {
+        net::sleep(H2_PING_EVERY).await;
+        if life.dead.get() {
+            return;
+        }
+        if net::now_ms().saturating_sub(life.used_ms.get()) > H2_IDLE_MS {
+            life.dead.set(true);
+            return;
+        }
+        let pong = net::timeout(Duration::from_secs(5), async { p.ping(h2::Ping::opaque()).await.map_err(h2_err) }).await;
+        if pong.is_err() {
+            life.dead.set(true);
+            return;
+        }
+    }
+}
+
+async fn pump(mut tls: TlsConn, mut side: tokio::io::DuplexStream, life: Rc<H2Life>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut plain = vec![0u8; 16 * 1024];
+    let mut out = vec![0u8; 16 * 1024];
+    'run: loop {
+        loop {
+            match tls.conn.reader().read(&mut plain) {
+                Ok(0) => break 'run,
+                Ok(n) => {
+                    if side.write_all(&plain[..n]).await.is_err() {
+                        break 'run;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => break 'run,
+            }
+        }
+        if tls.flush_tls().await.is_err() || life.dead.get() {
+            break;
+        }
+        let tcp = &tls.tcp;
+        match net::select2(side.read(&mut out), tcp.read(16 * 1024)).await {
+            net::Either::Left(Ok(0)) | net::Either::Left(Err(_)) => {
+                tls.conn.send_close_notify();
+                let _ = tls.flush_tls().await;
+                break;
+            }
+            net::Either::Left(Ok(n)) => {
+                if tls.conn.writer().write_all(&out[..n]).is_err() {
+                    break;
+                }
+            }
+            net::Either::Right(Ok(d)) if !d.is_empty() => {
+                if tls.feed(&d).is_err() {
+                    break;
+                }
+            }
+            net::Either::Right(_) => break,
+        }
+    }
+    life.dead.set(true);
+    tls.tcp.shutdown();
+}
+
+async fn h2_exchange(
+    send: h2::client::SendRequest<Bytes>,
+    url: &Url,
+    authority: &str,
+    method: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> io::Result<Response> {
+    let mut b = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{authority}{}", url.path))
+        .header("user-agent", "EnclaveDNS/0.1");
+    for (k, v) in headers {
+        // connection-specific fields are forbidden in HTTP/2
+        if ["connection", "host", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection"].contains(&k.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        b = b.header(*k, *v);
+    }
+    if !body.is_empty() || method != "GET" {
+        b = b.header("content-length", body.len());
+    }
+    let req = b.body(()).map_err(io::Error::other)?;
+    let mut send = send.ready().await.map_err(h2_err)?;
+    let (resp, mut stream) = send.send_request(req, body.is_empty()).map_err(h2_err)?;
+    if !body.is_empty() {
+        stream.send_data(Bytes::copy_from_slice(body), true).map_err(h2_err)?;
+    }
+    let resp = resp.await.map_err(h2_err)?;
+    let status = resp.status().as_u16();
+    let mut rb = resp.into_body();
+    let mut out = Vec::new();
+    while let Some(chunk) = rb.data().await {
+        let chunk = chunk.map_err(h2_err)?;
+        let _ = rb.flow_control().release_capacity(chunk.len());
+        if out.len() + chunk.len() > MAX_BODY {
+            return Err(io::Error::other("response body too large"));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Response { status, body: out })
 }
 
 async fn exchange(c: &mut Conn, req: &[u8], method: &str) -> io::Result<(Response, bool)> {

@@ -1,6 +1,6 @@
 [package]
 name = "enclavedns"
-version = "0.1.1"
+version = "0.1.3"
 edition = "2021"
 publish = false
 license-file = "../LICENSE"
@@ -16,7 +16,9 @@ description = "EnclaveDNS: a validating DNSSEC resolver and signing authoritativ
 # authoritative signer, the ENS client and the HTTP server are hand-written.
 # Dependencies are the primitives: signature algorithms DNSSEC uses (RSA,
 # ECDSA P-256/P-384, Ed25519), hashes (SHA-1 for NSEC3 and DS type 1, SHA-2,
-# Keccak for ENS), and the pure-Rust TLS stack for outbound HTTPS.
+# Keccak for ENS), the pure-Rust TLS stack for outbound HTTPS, and h2 for
+# HTTP/2 upstreams (driven over an in-memory duplex: tokio's I/O traits and
+# sync primitives only, no tokio runtime).
 [dependencies]
 wstd = "=0.6.6"
 wasip2 = "1.0"
@@ -34,6 +36,10 @@ p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 getrandom = "0.2"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", default-features = false, features = ["io-util", "sync"] }
 
 [profile.release]
 opt-level = 3

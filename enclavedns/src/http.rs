@@ -308,6 +308,15 @@ fn status(app: &Rc<App>) -> Value {
     let s = &app.server;
     let c = s.counters.borrow().clone();
     let st = s.resolver.stats.borrow().clone();
+    let upstreams: Vec<Value> = s.resolver.cfg.forward.iter().zip(s.resolver.upstream_stats.borrow().iter()).map(|(u, x)| json!({
+        "upstream": u.text(), "srtt_ms": x.srtt_ms, "answered": x.answered, "failed": x.failed,
+    })).collect();
+    let p = s.resolver.http.stats.borrow().clone();
+    let outbound = json!({
+        "h2_connects": p.h2_connects, "h2_requests": p.h2_requests, "h2_retries": p.h2_retries,
+        "h1_connects": p.h1_connects, "h1_requests": p.h1_requests,
+        "connect_ms_last": p.connect_ms_last, "connect_ms_max": p.connect_ms_max,
+    });
     json!({
         "name": "EnclaveDNS",
         "version": env!("CARGO_PKG_VERSION"),
@@ -330,6 +339,13 @@ fn status(app: &Rc<App>) -> Value {
             "upstream_timeouts": st.upstream_timeouts,
             "cache_hits": st.cache_hits,
             "cache_misses": st.cache_misses,
+            "stale_served": st.stale_served,
+            "refreshes": st.refreshes,
+            "prefetches": st.prefetches,
+            "joined_in_flight": st.joined,
+            "hedged": st.hedged,
+            "upstreams": upstreams,
+            "outbound": outbound,
             "validated": {"secure": st.secure, "insecure": st.insecure, "bogus": st.bogus},
             "trust_anchors": crate::dnssec::ROOT_ANCHORS.iter().map(|a| format!(". DS {} {} {} {}", a.0, a.1, a.2, a.3)).collect::<Vec<_>>(),
         },
