@@ -9,3 +9,7 @@ android/app/src/main/assets/appsnapshot/
 
 # generated per-deployment app dirs (gen-dep-app.mjs, built by CI)
 apps/dep-*/
+
+# Enclave's own verifier, fetched and sha256-checked by vendor-verifier.mjs (Enclave's license, not this repo's MIT)
+vendor/
+www/verifier-notices.md

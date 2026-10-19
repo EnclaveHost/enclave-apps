@@ -77,7 +77,9 @@ jobs:
 
       - run: npm run build
 
-      # Network-dependent by nature (live deployment + Sigstore + GitHub), so
+      - run: npm test
+
+      # Network-dependent by nature (live deployment + its host + the relay), so
       # informative, never a merge gate; only meaningful for published apps
       # whose url is live.
       - name: verify live deployment (non-blocking)

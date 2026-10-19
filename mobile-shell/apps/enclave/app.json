@@ -6,8 +6,6 @@
   "generic": true,
   "url": "https://enclave.host",
   "allowNavigation": ["*.app.enclave.host"],
-  "attestationPath": "/attestation",
-  "repo": "EnclaveHost/enclave",
   "icon": "icon.svg",
   "backgroundColor": "#0b1119",
   "themeColor": "#0b1119",

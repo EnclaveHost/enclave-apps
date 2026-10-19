@@ -3,19 +3,28 @@
 A verify-first mobile shell that wraps an Enclave app as an Android/iOS app -
 the pilot wraps [eyesoff.ai](https://eyesoff.ai). Think Salesforce Mobile
 Publisher, with one difference that is the whole point: **before the app
-loads, the shell verifies on-device that the deployment behind it runs the
-signed EnclaveHost/enclave release inside real enclave hardware** (quote
-against the vendor root, Sigstore provenance for the pinned repo, measurement
-match, TLS binding into the enclave origin - the same checks as
-`enclave attest`).
+loads, the shell verifies on-device that the deployment behind it runs in an
+isolated enclave** - over a nonce the phone draws, the app guest's
+hardware-signed report checked against the vendor root, its measurement
+against the expected one, and the key its public TLS certificate carries bound
+into the report. It is the same check enclave.host's dashboard badge runs,
+with Enclave's own verifier (`verifier/web` in EnclaveHost/enclave).
 
 ## How it works
 
 1. The webview opens a local, bundled splash (`www/index.html`). Nothing it
    executes comes from the network.
-2. The splash fetches `<app>/attestation` to learn which enclave origin backs
-   the app, then runs `@tinfoilsh/verifier` against that origin. The GitHub
-   repo is **pinned at build time** and never read from the response.
+2. The splash asks the platform which deployment serves the app (a
+   `<label>.app.enclave.host` origin names it; a custom domain resolves
+   through the relay's public `GET /v1/domains/map`), which host it runs on,
+   and that host's tier, then runs the matching per-app check from the
+   vendored verifier (`verifySnpAppWeb`, `verifyShieldAppWeb` or
+   `verifyPvmAppWeb`). Every request rides the native HTTP bridge
+   (`src/native-fetch.mjs`): the relay grants CORS to enclave.host only.
+   The verifier bundle is fetched at build time from the EnclaveHost/enclave
+   commit `verifier.pin.json` names and refused unless its sha256 matches
+   (`vendor-verifier.mjs`); it is Enclave's software under Enclave's license,
+   so it is never committed here.
 3. On PASS the webview navigates to the app origin (`server.allowNavigation`
    keeps it, and only it, inside the webview). On FAIL the app does not load:
    the user sees the failed step and may retry, or explicitly continue
@@ -23,10 +32,12 @@ match, TLS binding into the enclave origin - the same checks as
 4. Offline, the splash steps aside and the app's own service worker serves
    the cached shell.
 
-Honest scope: a PASS proves the *deployment* is genuine. The app-domain TLS
-leg still terminates at the platform relay until in-enclave app TLS ships;
-after that, the shell is where certificate pinning against the attested key
-belongs.
+Honest scope: a PASS is the verifier's "verified" or "limited". Unpinned it
+is "limited": the expected measurements are the relay's own prediction, not a
+build the phone reproduced, and which deployment serves a custom domain is the
+relay's routing map. The bound TLS key is the one on the app's
+`<label>.app.enclave.host` certificate; pinning the webview's own connection
+to it is still open.
 
 ## Prepackaged builds: the APK ships the app inside it
 
@@ -57,9 +68,7 @@ equivalent.
 build time. The dashboard's "Get the app" section offers it on every running
 public app with two steps: install the APK, then tap the pairing deep link
 (`enclave://open?u=<origin>&d=<deployment id>&n=<name>`). The splash stores
-the target, verifies it on the phone (falling back to the platform's public
-per-deployment attestation API for apps that don't serve `/attestation`
-themselves), and loads it; thereafter the app opens directly. A pairing
+the target, verifies it on the phone, and loads it; thereafter the app opens directly. A pairing
 target must clear the same `allowNavigation` allowlist the webview enforces,
 so a hostile link can never point the shell at a foreign site. Launcher
 name/icon stay "Enclave" - a branded launcher identity, or a custom-domain
@@ -68,7 +77,7 @@ app, is what the per-app matrix below is for.
 ## White-label: one shell, many apps
 
 Every directory under `apps/` is a branded app: an `app.json` (name,
-displayName, appId, url, pinned repo, colors, `icon`) plus its icon file
+displayName, appId, url, colors, `icon`) plus its icon file
 (SVG or PNG). `APP=<name> npm run build` stamps that identity into
 everything - the capacitor config, the bundled splash (name, mark, colors),
 the Android applicationId/strings and iOS bundle id/display name
@@ -116,8 +125,9 @@ Two platform details, both easy to get wrong in opposite directions:
 
 ```sh
 npm ci
-npm run build          # configure + bundle the splash
-npm run test:live      # node, no CORS: full verify against the live app
+npm run build          # configure + vendor the verifier + bundle the splash
+npm test               # unit tests (stub relay, stub bridge)
+npm run test:live      # node, no CORS: full verify against the live app (one fresh challenge)
 npx cap sync           # copy web assets into android/ and ios/
 ```
 

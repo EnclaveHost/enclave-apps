@@ -4,9 +4,11 @@
   "description": "Verify-first mobile shell that wraps an Enclave app for Android/iOS",
   "scripts": {
     "configure": "node configure.mjs",
-    "bundle": "esbuild src/splash.js --bundle --minify --format=iife --platform=browser --external:zlib --outfile=www/splash.bundle.js",
+    "vendor": "node vendor-verifier.mjs",
+    "bundle": "esbuild src/splash.js --bundle --minify --format=iife --platform=browser --outfile=www/splash.bundle.js",
     "brand": "node brand.mjs",
-    "build": "npm run configure && npm run bundle && npm run brand && npm run snap",
+    "build": "npm run configure && npm run vendor && npm run bundle && npm run brand && npm run snap",
+    "test": "node --test test/*.test.mjs",
     "test:live": "node test/verify.live.mjs",
     "sync": "npm run build && cap sync android",
     "snap": "node snapshot.mjs"
@@ -17,8 +19,7 @@
   "type": "commonjs",
   "dependencies": {
     "@capacitor/app": "^8.1.1",
-    "@capacitor/core": "^8.4.2",
-    "@tinfoilsh/verifier": "^1.1.10"
+    "@capacitor/core": "^8.4.2"
   },
   "devDependencies": {
     "@capacitor/android": "^8.4.2",

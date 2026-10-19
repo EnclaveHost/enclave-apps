@@ -12,6 +12,7 @@
 import { Capacitor, CapacitorHttp } from "@capacitor/core";
 import { App } from "@capacitor/app";
 import { verifyApp } from "./verify.mjs";
+import { makeNativeFetch } from "./native-fetch.mjs";
 import { referralFrom, referralCode, saveReferral, reportReferral } from "./referral.mjs";
 import cfg from "./config.gen.js";
 
@@ -21,20 +22,10 @@ const PASS_KEY = "enclave-shell-pass";
 const TARGET_KEY = "enclave-shell-target";
 const PASS_TTL_MS = 24 * 60 * 60 * 1000;
 
-// The app origin may send no CORS headers, so in the webview cross-origin
-// fetches ride the native HTTP bridge. The verifier's own fetches (GitHub,
-// Sigstore, the enclave endpoint) are CORS-open. Plain fetch stays as the
-// fallback so the splash also works in a desktop browser.
-async function getJson(url) {
-  if (Capacitor.isNativePlatform()) {
-    const r = await CapacitorHttp.get({ url, headers: { accept: "application/json" }, responseType: "json" });
-    if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
-    return typeof r.data === "string" ? JSON.parse(r.data) : r.data;
-  }
-  const r = await fetch(url, { headers: { accept: "application/json" } });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
+// The relay grants CORS to enclave.host only, so in the webview every request the check makes (the verifier's own
+// included) rides the native HTTP bridge (src/native-fetch.mjs); plain fetch stays as the fallback so the splash also
+// loads in a desktop browser (where the relay's CORS refuses it).
+const nativeFetch = Capacitor.isNativePlatform() ? makeNativeFetch(CapacitorHttp) : (url, opts) => fetch(url, opts);
 
 // ---- which app -------------------------------------------------------------
 function hostAllowed(host) {
@@ -145,6 +136,7 @@ function showFail(result) {
   show("failed");
   $("fail-reason").textContent = result.error || result.reason || "verification failed";
   const lines = Object.entries(result.steps || {}).map(([k, v]) => `${k}: ${v}`);
+  if (result.deployment?.box) lines.unshift(`host: ${result.deployment.box}${result.deployment.mode ? ` (${result.deployment.mode})` : ""}`);
   $("fail-steps").textContent = lines.join("\n");
 }
 
@@ -153,14 +145,14 @@ function recordPass(target, result) {
   try {
     localStorage.setItem(
       PASS_KEY,
-      JSON.stringify({ url: target.url, repo: cfg.repo, release: result.release, at: Date.now() })
+      JSON.stringify({ url: target.url, verifier: cfg.verifierSha256, deployment: result.deployment.id, at: Date.now() })
     );
   } catch (_) {}
 }
 function freshPass(target) {
   try {
     const p = JSON.parse(localStorage.getItem(PASS_KEY));
-    if (p && p.url === target.url && p.repo === cfg.repo && Date.now() - p.at < PASS_TTL_MS) return p;
+    if (p && p.url === target.url && p.verifier === cfg.verifierSha256 && Date.now() - p.at < PASS_TTL_MS) return p;
   } catch (_) {}
   return null;
 }
@@ -190,18 +182,16 @@ async function run(target) {
 
   const result = await verifyApp({
     url: target.url,
-    attestationPath: cfg.attestationPath,
-    repo: cfg.repo,
     deploymentId: target.id,
     apiBase: cfg.apiBase,
-    getJson,
+    fetchImpl: nativeFetch,
     onStage: stage,
   });
 
   if (result.pass) {
     recordPass(target, result);
-    const rel = result.release ? result.release.replace("sha256:", "").slice(0, 12) : "?";
-    stage(`verified: release ${rel} on ${result.deployment.enclave || result.origin}`);
+    // "limited" is the most an unpinned check can say (the expected measurements are the relay's prediction)
+    stage(`${result.status === "verified" ? "verified" : "verified (limited)"}: ${Object.values(result.steps).filter((x) => x === "pass").length} checks passed on ${result.deployment.box}`);
     setTimeout(() => enter(target), 900);
     return;
   }

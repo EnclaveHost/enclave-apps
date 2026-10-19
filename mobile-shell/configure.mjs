@@ -13,7 +13,7 @@ const APP = process.argv[2] || process.env.APP || "eyesoff";
 const dir = new URL(`./apps/${APP}/`, import.meta.url);
 const app = JSON.parse(readFileSync(new URL("app.json", dir), "utf8"));
 
-for (const key of ["name", "displayName", "appId", "url", "repo", "icon"]) {
+for (const key of ["name", "displayName", "appId", "url", "icon"]) {
   if (!app[key]) throw new Error(`apps/${APP}/app.json is missing "${key}"`);
 }
 if (!/^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/i.test(app.appId)) {
@@ -37,7 +37,7 @@ const capacitor = {
   backgroundColor: bg,
   server: {
     // The wrapped app stays INSIDE the webview; every other origin falls out
-    // to the system browser. The repo pin and the verify flow assume this
+    // to the system browser. The verify flow assumes this
     // list holds only origins the platform serves.
     allowNavigation: allowNav,
   },
@@ -59,11 +59,12 @@ const cfg = {
   url: origin,
   generic: !!app.generic,
   allowNavigation: allowNav,
-  attestationPath: app.attestationPath || "/attestation",
-  repo: app.repo,
-  // where the verify flow falls back for apps that do not serve their own
-  // /attestation: the platform's public per-deployment attestation endpoint
+  // the platform the verify flow asks which deployment serves this origin,
+  // and whose relay forwards the fresh challenges to its host
   apiBase: "https://api.enclave.host",
+  // the verifier bundle this build ships (vendor-verifier.mjs): a cached
+  // pass only counts for the verifier that made it
+  verifierSha256: JSON.parse(readFileSync(new URL("./verifier.pin.json", import.meta.url), "utf8")).sha256,
   backgroundColor: bg,
   iconDataUri: `data:${iconMime};base64,${iconBytes.toString("base64")}`,
 };
@@ -102,4 +103,4 @@ stamp("./ios/App/App/Info.plist", (s) =>
 stamp("./ios/App/App.xcodeproj/project.pbxproj", (s) =>
   s.replace(/PRODUCT_BUNDLE_IDENTIFIER = [^;]+;/g, `PRODUCT_BUNDLE_IDENTIFIER = ${app.appId};`));
 
-console.log(`configured shell for ${app.displayName} (${app.appId} -> ${cfg.url}, repo pin ${cfg.repo})`);
+console.log(`configured shell for ${app.displayName} (${app.appId} -> ${cfg.url}, verifier ${cfg.verifierSha256.slice(0, 12)})`);

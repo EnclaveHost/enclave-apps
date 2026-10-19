@@ -1,0 +1,7 @@
+{
+  "repo": "EnclaveHost/enclave",
+  "commit": "c8e467cdeca7bc53b1a95bb99bc3ab7d7bdce8b5",
+  "file": "verifier/web/dist/enclave-verifier-web.js",
+  "sha256": "77a10569e96d31e844f66580a2e1341e3bf7f2cf731e9e65daa489146fced892",
+  "notices": "verifier/web/dist/THIRD-PARTY-NOTICES.md"
+}

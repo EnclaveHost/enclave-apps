@@ -89,9 +89,11 @@
   </div>
 
   <div class="fineprint">
-    A pass means the deployment behind this app runs its signed release
-    inside real enclave hardware, checked on this device against vendor and
-    Sigstore roots.
+    A pass means this device checked, over a challenge it drew itself, that
+    the deployment behind this app runs in an isolated enclave: the
+    hardware-signed report, the expected launch measurement, and the key on
+    the app's TLS certificate. The expected measurement is the platform's own
+    prediction, not one this device rebuilt.
   </div>
 </main>
 <script src="splash.bundle.js"></script>

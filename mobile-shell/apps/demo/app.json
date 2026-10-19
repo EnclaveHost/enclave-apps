@@ -3,8 +3,6 @@
   "displayName": "Enclave Demo",
   "appId": "host.enclave.demo",
   "url": "https://demo.app.enclave.host",
-  "attestationPath": "/attestation",
-  "repo": "EnclaveHost/enclave",
   "icon": "icon.svg",
   "backgroundColor": "#0b1119",
   "themeColor": "#0b1119",

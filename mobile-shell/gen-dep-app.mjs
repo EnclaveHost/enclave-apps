@@ -58,8 +58,6 @@ const app = {
   // deployment so different apps install side by side
   appId: "host.enclave.a" + label,
   url: origin,
-  attestationPath: "/attestation",
-  repo: "EnclaveHost/enclave",
   icon: iconFile,
   backgroundColor: bg,
   themeColor: theme,
