@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "s3-ipfs-adapter"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "hmac",
  "k256",

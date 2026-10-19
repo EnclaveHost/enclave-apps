@@ -70,8 +70,13 @@ const INDEX_WINDOW: u64 = 4 * 1024 * 1024;
 const CACHE_DIR_REL: &str = ".enclave-index/";
 const CACHE_REL: &str = ".enclave-index/leaves.bin";
 /// Read ceiling for the cache object (~600 KB at today's 1000-file bucket;
-/// a cache past this parses as truncated and degrades to a full re-hash).
+/// a cache past this is not read, and the boot degrades to a full re-hash).
 const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Reads of the cache before a boot gives up on it. It is read only after a
+/// listing succeeded (the store is reachable), so a failure here is a store
+/// hiccup; the fail() backoff spreads these over ~2 minutes, and giving up
+/// costs a full re-hash (~80 minutes at 4.7 GB).
+const CACHE_TRIES: u32 = 8;
 /// Bytes fetched per streaming pull (whole chunks; 8 chunks).
 const STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 /// Soft target for one CAR pull's output.
@@ -401,10 +406,15 @@ const MAX_ATTEMPTS: u32 = 5;
 
 enum Phase {
     Idle, // unconfigured
-    // One GET of the persisted leaves cache before the first LIST, so a
-    // restart re-hashes only what changed instead of the whole bucket.
-    LoadCache { attempts: u32 },
-    List { cont: Option<String>, acc: Vec<s3::ObjMeta> },
+    // `cache`: the leaves cache's own listing row, when the listing had one.
+    List { cont: Option<String>, acc: Vec<s3::ObjMeta>, cache: Option<s3::ObjMeta> },
+    // Once per process, between the first successful listing and its hash:
+    // one GET of the persisted leaves cache, so a restart re-hashes only what
+    // changed instead of the whole bucket. It used to run BEFORE the listing,
+    // as the boot's first request -- which goes out before the partition's
+    // egress is admitted, so its three quick tries failed and the boot
+    // re-hashed everything (2026-10-13: ~80 minutes, every CID 404).
+    LoadCache { acc: Vec<s3::ObjMeta>, cache: Option<s3::ObjMeta>, attempts: u32 },
     Hash {
         queue: VecDeque<(s3::ObjMeta, u32)>, // (object, failed attempts so far)
         staged: Vec<FileEntry>,
@@ -423,6 +433,12 @@ struct Indexer {
     last_error: Option<String>,
     retry_at: Option<Instant>,
     skipped: u32, // objects given up on during the current/last hash cycle
+}
+
+impl Phase {
+    fn list() -> Phase {
+        Phase::List { cont: None, acc: Vec::new(), cache: None }
+    }
 }
 
 impl Indexer {
@@ -459,9 +475,43 @@ struct App {
     /// sha256 of the cache bytes last written (or None): saves are skipped
     /// while the committed rows would serialize to the same bytes.
     cache_fp: Option<[u8; 32]>,
+    /// The persisted cache was read (or found absent, or given up on) this
+    /// process: it is consulted once, after the first listing.
+    cache_consulted: bool,
+    /// A full index has been committed this process. Until then the served
+    /// snapshot holds only part of the bucket (pins merged during the boot
+    /// hash, or the interim commit of cached rows), and saving it would
+    /// overwrite the persisted cache with that part.
+    indexed: bool,
 }
 
 impl App {
+    /// The app as main() boots it: configured apps start in the boot phase.
+    fn new(cfg: Config, s3: Option<Rc<S3Ctx>>) -> App {
+        let phase = if s3.is_some() { Phase::list() } else { Phase::Idle };
+        App {
+            cfg,
+            s3,
+            snap: Rc::new(Snapshot::empty()),
+            indexer: Indexer {
+                phase,
+                last_list: None,
+                truncated: false,
+                errors: 0,
+                last_error: None,
+                retry_at: None,
+                skipped: 0,
+            },
+            upload_shared: upload::Shared::new(),
+            recent_uploads: Vec::new(),
+            redirects_cache: HashMap::new(),
+            recovered: HashMap::new(),
+            cache_fp: None,
+            cache_consulted: false,
+            indexed: false,
+        }
+    }
+
     fn fail(&mut self, err: String) {
         self.indexer.errors += 1;
         let backoff = (5 * u64::from(self.indexer.errors)).min(60);
@@ -491,15 +541,29 @@ impl App {
             Commit(Vec<FileEntry>),
             CacheLoaded(Vec<leavescache::Row>, [u8; 32]),
             CacheAbsent,
-            CacheRetry(u32, String),
         }
         let prefix_len = self.cfg.prefix.len();
         let after = match &mut self.indexer.phase {
             Phase::Idle => After::Nothing,
-            Phase::LoadCache { attempts } => {
-                let tries = *attempts;
+            Phase::LoadCache { cache, attempts, .. } => {
                 let key = format!("{}{}", self.cfg.prefix, CACHE_REL);
-                match s3::get_range(&s3ctx.ep, &s3ctx.bucket, &key, s3ctx.creds.as_ref(), 0, CACHE_MAX_BYTES) {
+                // The listing named the cache's size: ask for exactly that (a
+                // range past EOF is clamped by R2 and sia-s3, but nothing
+                // needs to rely on it). Only a truncated listing that never
+                // reached the cache's key asks blind, up to the ceiling.
+                let want = cache.as_ref().map_or(CACHE_MAX_BYTES, |m| m.size);
+                let got = if want > CACHE_MAX_BYTES {
+                    Err(format!("{want} bytes is past the {CACHE_MAX_BYTES}-byte ceiling"))
+                } else {
+                    s3::get_range(&s3ctx.ep, &s3ctx.bucket, &key, s3ctx.creds.as_ref(), 0, want).and_then(|data| {
+                        if cache.is_some() && data.len() as u64 != want {
+                            Err(format!("short read ({} of {want} bytes)", data.len()))
+                        } else {
+                            Ok(data)
+                        }
+                    })
+                };
+                match got {
                     Ok(data) => match leavescache::deserialize(&data) {
                         // The loaded bytes' digest seeds the save fingerprint,
                         // so a boot that changes nothing re-writes nothing.
@@ -509,19 +573,23 @@ impl App {
                             After::CacheAbsent
                         }
                     },
+                    // Gone since the listing (or a blind read of none): nothing to reuse.
+                    Err(e) if e.starts_with("S3 answered 404") => After::CacheAbsent,
+                    Err(e) if want > CACHE_MAX_BYTES => {
+                        eprintln!("[s3-ipfs-adapter] leaves cache not read ({e}); full re-hash");
+                        After::CacheAbsent
+                    }
                     Err(e) => {
-                        // A first run has no cache object: nothing to reuse,
-                        // not an error. Transient errors retry a few times —
-                        // giving up too eagerly costs an 80-minute re-hash —
-                        // but boot must never wedge on this: it is an
-                        // optimization, the LIST+hash path is the truth.
-                        if e.contains("404") || e.contains("NoSuchKey") {
-                            After::CacheAbsent
-                        } else if tries + 1 >= 3 {
-                            eprintln!("[s3-ipfs-adapter] leaves cache unreadable after {} tries ({e}); full re-hash", tries + 1);
+                        // The store answered the listing, so this is a hiccup:
+                        // retry, paced by fail(). Boot must still never wedge
+                        // on it -- the cache is an optimization, LIST+hash is
+                        // the truth.
+                        *attempts += 1;
+                        if *attempts >= CACHE_TRIES {
+                            eprintln!("[s3-ipfs-adapter] leaves cache unreadable after {attempts} tries ({e}); full re-hash");
                             After::CacheAbsent
                         } else {
-                            After::CacheRetry(tries + 1, format!("leaves cache: {e}"))
+                            After::Fail(format!("leaves cache: {e}"))
                         }
                     }
                 }
@@ -533,13 +601,13 @@ impl App {
                         .last_list
                         .is_none_or(|t| t.elapsed().as_secs() >= self.cfg.refresh_secs)
                 {
-                    self.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
+                    self.indexer.phase = Phase::list();
                     After::Worked
                 } else {
                     After::Nothing
                 }
             }
-            Phase::List { cont, acc } => {
+            Phase::List { cont, acc, cache } => {
                 let page = s3::list_page(
                     &s3ctx.ep,
                     &s3ctx.bucket,
@@ -562,13 +630,25 @@ impl App {
                             }
                             // Derived state, not content: indexing the leaves
                             // cache would hash an object that changes on every
-                            // save of the index it feeds.
-                            if o.key[prefix_len.min(o.key.len())..].starts_with(CACHE_DIR_REL) {
+                            // save of the index it feeds. Its row is kept aside:
+                            // it says whether there is a cache to read, and its size.
+                            let rel = &o.key[prefix_len.min(o.key.len())..];
+                            if rel.starts_with(CACHE_DIR_REL) {
+                                if rel == CACHE_REL {
+                                    *cache = Some(o);
+                                }
                                 continue;
                             }
                             acc.push(o);
                         }
                         self.indexer.errors = 0;
+                        // A listing that failed before this one succeeded is
+                        // over: at boot the first page often goes out before
+                        // the egress is admitted, and its error used to stay
+                        // in /api/status until the whole re-hash finished.
+                        if self.indexer.last_error.as_deref().is_some_and(|e| e.starts_with("list: ")) {
+                            self.indexer.last_error = None;
+                        }
                         if acc.len() >= self.cfg.max_keys {
                             acc.truncate(self.cfg.max_keys);
                             self.indexer.truncated = true;
@@ -678,20 +758,24 @@ impl App {
                 eprintln!("[s3-ipfs-adapter] leaves cache: {} rows", rows.len());
                 self.recovered = rows.into_iter().map(|r| (r.key.clone(), r)).collect();
                 self.cache_fp = Some(fp);
-                self.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
+                self.cache_done();
                 true
             }
             After::CacheAbsent => {
-                self.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
-                true
-            }
-            After::CacheRetry(attempts, e) => {
-                self.indexer.phase = Phase::LoadCache { attempts };
-                self.fail(e);
+                self.cache_done();
                 true
             }
             After::StartHash => {
-                self.start_hash();
+                let Phase::List { acc, cache, .. } = std::mem::replace(&mut self.indexer.phase, Phase::Ready) else {
+                    return true;
+                };
+                if !self.cache_consulted && (cache.is_some() || self.indexer.truncated) {
+                    self.indexer.phase = Phase::LoadCache { acc, cache, attempts: 0 };
+                } else {
+                    // A complete listing without the cache's key: a first run.
+                    self.cache_consulted = true;
+                    self.start_hash(acc);
+                }
                 true
             }
             After::Commit(mut staged) => {
@@ -719,6 +803,7 @@ impl App {
                     )
                 });
                 self.indexer.phase = Phase::Ready;
+                self.indexed = true;
                 // From here reuse comes from the committed snapshot; holding
                 // recovered rows past it would let a stale cache shadow later
                 // listings if the two ever disagreed on an unchanged key.
@@ -729,11 +814,19 @@ impl App {
         }
     }
 
-    fn start_hash(&mut self) {
-        let Phase::List { acc, .. } = std::mem::replace(&mut self.indexer.phase, Phase::Ready)
-        else {
-            return;
-        };
+    /// The cache read is over (loaded, absent, or given up on): hash what
+    /// the listing it followed holds.
+    fn cache_done(&mut self) {
+        self.cache_consulted = true;
+        if self.indexer.last_error.as_deref().is_some_and(|e| e.starts_with("leaves cache: ")) {
+            self.indexer.last_error = None;
+        }
+        if let Phase::LoadCache { acc, .. } = std::mem::replace(&mut self.indexer.phase, Phase::Ready) {
+            self.start_hash(acc);
+        }
+    }
+
+    fn start_hash(&mut self, acc: Vec<s3::ObjMeta>) {
         // A listing that names a recent upload has confirmed it: the normal
         // (size, etag) reuse below carries it from here on.
         self.recent_uploads
@@ -785,6 +878,19 @@ impl App {
             queue.len(),
             to_hash
         );
+        // A boot serves nothing until its first commit. What the listing and
+        // the cache already vouch for (the same (size, etag) binding) goes
+        // live now, rather than 404ing every CID until the last changed
+        // object has hashed; the full commit replaces it when the hash ends.
+        if !self.indexed && !queue.is_empty() && !staged.is_empty() {
+            let mut interim = staged.clone();
+            for f in &self.recent_uploads {
+                if !interim.iter().any(|s| s.key == f.key) {
+                    interim.push(f.clone());
+                }
+            }
+            self.snap = Rc::new(commit(interim));
+        }
         self.indexer.skipped = 0;
         self.indexer.phase = Phase::Hash { queue, staged, cur: None, hashed: 0, to_hash };
     }
@@ -848,11 +954,6 @@ fn main() {
             "[s3-ipfs-adapter] S3 requests will be UNSIGNED (no credentials resolved; public bucket assumed)"
         ),
     }
-    let phase = if s3ctx.is_some() {
-        Phase::LoadCache { attempts: 0 }
-    } else {
-        Phase::Idle
-    };
     match &cfg.upload {
         Some(u) if u.enabled() => eprintln!(
             "[s3-ipfs-adapter] pin routes ON (/add-wasm /add-json /add-image), {}",
@@ -863,25 +964,7 @@ fn main() {
         ),
         None => {}
     }
-    let mut app = App {
-        cfg,
-        s3: s3ctx,
-        snap: Rc::new(Snapshot::empty()),
-        indexer: Indexer {
-            phase,
-            last_list: None,
-            truncated: false,
-            errors: 0,
-            last_error: None,
-            retry_at: None,
-            skipped: 0,
-        },
-        upload_shared: upload::Shared::new(),
-        recent_uploads: Vec::new(),
-        redirects_cache: HashMap::new(),
-        recovered: HashMap::new(),
-        cache_fp: None,
-    };
+    let mut app = App::new(cfg, s3ctx);
     let mut srv = Server::bind(APP, 8000);
     // Per-route buffered-body caps, enforced in the parser against
     // Content-Length before anything is buffered. The pin routes use their
@@ -946,8 +1029,14 @@ fn merge_commits(app: &mut App) {
     if changed {
         app.snap = Rc::new(commit(entries));
         // A pin followed by a restart must survive it: persist right away
-        // rather than waiting for the next scheduled LIST to confirm it.
-        app.save_leaves_cache();
+        // rather than waiting for the next scheduled LIST to confirm it --
+        // but only over a full index. During the boot's hash the snapshot is
+        // just the pins (and cached rows) so far, and saving it replaced the
+        // whole persisted cache with them: the next restart re-hashed
+        // everything. Such a pin is persisted by the boot's commit instead.
+        if app.indexed {
+            app.save_leaves_cache();
+        }
     }
 }
 
@@ -1084,7 +1173,7 @@ fn api_refresh(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
 /// job. Dropping in-flight staging is safe (serving runs from the
 /// committed snapshot), and it is also the way out of a wedged hash job.
 fn restart_listing(app: &mut App) {
-    app.indexer.phase = Phase::List { cont: None, acc: Vec::new() };
+    app.indexer.phase = Phase::list();
     app.indexer.retry_at = None;
     app.indexer.errors = 0;
 }
@@ -1995,5 +2084,362 @@ impl Body for CarBody {
             return Ok(Some(out));
         }
         Ok(Some(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bucket whose first connection is dropped unanswered (the boot-time
+    /// "list: send" failure) and whose later ones list zero objects.
+    fn flaky_list_server() -> s3::Endpoint {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (n, conn) in l.incoming().enumerate() {
+                let mut c = conn.unwrap();
+                if n == 0 {
+                    drop(c);
+                    continue;
+                }
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                }
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>b</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>";
+                let _ = c.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        s3::Endpoint { https: false, host: "127.0.0.1".into(), port, region: "auto".into() }
+    }
+
+    #[test]
+    fn a_listing_that_succeeds_clears_the_listing_error_before_it() {
+        let ep = flaky_list_server();
+        let mut app = App::new(test_cfg(), Some(Rc::new(S3Ctx { ep, bucket: "b".into(), creds: None })));
+        app.indexer.phase = Phase::list();
+        app.tick();
+        assert!(app.indexer.last_error.as_deref().is_some_and(|e| e.starts_with("list: ")), "{:?}", app.indexer.last_error);
+        app.indexer.retry_at = None;   // skip the backoff
+        app.tick();
+        assert_eq!(app.indexer.last_error, None, "the failure before a listing that worked no longer shows");
+        assert_eq!(app.indexer.errors, 0);
+    }
+
+    fn test_cfg() -> Config {
+        Config { title: String::new(), endpoint: String::new(), region: "auto".into(), bucket: "b".into(),
+                 prefix: String::new(), creds: None, refresh_secs: 300, max_keys: 1000, api_key: None, upload: None }
+    }
+
+    // ---- a local bucket with sia-s3's semantics -----------------------------------------------------------------
+
+    /// What the local bucket holds and saw. ETags follow sia-s3 (the bucket's next home): a plain PUT is md5-shaped
+    /// hex, a CopyObject KEEPS the source's ETag, LIST answers `&quot;`-escaped and GET/HEAD/PUT answer quoted.
+    #[derive(Default)]
+    struct Bucket {
+        objects: std::collections::BTreeMap<String, (Vec<u8>, String)>,
+        /// GETs per key, and the Range header each one asked for.
+        gets: Vec<(String, String)>,
+        /// Connections still to drop unanswered: the partition's egress before it is admitted.
+        refuse: usize,
+        /// GETs of the leaves cache still to answer 500 (a store hiccup).
+        cache_500s: usize,
+    }
+
+    impl Bucket {
+        fn put(&mut self, key: &str, data: Vec<u8>, etag: &str) {
+            self.objects.insert(key.to_string(), (data, etag.to_string()));
+        }
+        fn hashed(&self) -> Vec<String> {
+            let mut v: Vec<String> = self.gets.iter().map(|(k, _)| k.clone())
+                .filter(|k| !k.starts_with(CACHE_DIR_REL)).collect();
+            v.dedup();
+            v
+        }
+    }
+
+    fn md5ish(data: &[u8]) -> String {
+        Sha256::digest(data)[..16].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn pct_decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn bucket_server(bucket: std::sync::Arc<std::sync::Mutex<Bucket>>) -> s3::Endpoint {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in l.incoming() {
+                let mut c = conn.unwrap();
+                {
+                    let mut b = bucket.lock().unwrap();
+                    if b.refuse > 0 {
+                        b.refuse -= 1;
+                        drop(c);
+                        continue;
+                    }
+                }
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut first = String::new();
+                r.read_line(&mut first).unwrap();
+                let mut hdrs: Vec<(String, String)> = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                    if let Some((k, v)) = line.split_once(':') {
+                        hdrs.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                    }
+                }
+                let h = |n: &str| hdrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+                let mut body = vec![0u8; h("content-length").and_then(|v| v.parse().ok()).unwrap_or(0)];
+                r.read_exact(&mut body).unwrap();
+                let mut parts = first.split_whitespace();
+                let (method, target) = (parts.next().unwrap().to_string(), parts.next().unwrap().to_string());
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                let key = pct_decode(path.trim_start_matches("/b").trim_start_matches('/'));
+                let mut b = bucket.lock().unwrap();
+                let (status, extra, out): (&str, String, Vec<u8>) = match method.as_str() {
+                    "GET" if key.is_empty() => {
+                        let prefix = query.split('&').find_map(|kv| kv.strip_prefix("prefix=")).map(pct_decode).unwrap_or_default();
+                        let mut xml = String::from("<?xml version=\"1.0\"?><ListBucketResult><Name>b</Name><IsTruncated>false</IsTruncated>");
+                        for (k, (d, e)) in b.objects.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)) {
+                            xml.push_str(&format!("<Contents><Key>{k}</Key><ETag>&quot;{e}&quot;</ETag><Size>{}</Size></Contents>", d.len()));
+                        }
+                        xml.push_str("</ListBucketResult>");
+                        ("200 OK", String::new(), xml.into_bytes())
+                    }
+                    "GET" => {
+                        let range = h("range").unwrap_or_default();
+                        b.gets.push((key.clone(), range.clone()));
+                        if key == CACHE_REL && b.cache_500s > 0 {
+                            b.cache_500s -= 1;
+                            drop(b);
+                            let _ = c.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                            continue;
+                        }
+                        match b.objects.get(&key) {
+                            None => ("404 Not Found", String::new(), b"<Error><Code>NoSuchKey</Code></Error>".to_vec()),
+                            Some((d, e)) => {
+                                let (a, z) = range.trim_start_matches("bytes=").split_once('-').unwrap();
+                                let (a, z): (usize, usize) = (a.parse().unwrap(), z.parse().unwrap());
+                                if a >= d.len() {
+                                    ("416 Range Not Satisfiable", String::new(), Vec::new())   // sia-s3 and S3: start past EOF
+                                } else {
+                                    let z = z.min(d.len() - 1);   // the end clamps at EOF
+                                    ("206 Partial Content", format!("etag: \"{e}\"\r\ncontent-range: bytes {a}-{z}/{}\r\n", d.len()), d[a..=z].to_vec())
+                                }
+                            }
+                        }
+                    }
+                    "PUT" => match h("x-amz-copy-source") {
+                        Some(src) => {
+                            let src = pct_decode(src.trim_start_matches("/b/"));
+                            let (d, e) = b.objects.get(&src).cloned().unwrap();
+                            b.objects.insert(key, (d, e.clone()));
+                            ("200 OK", String::new(), format!("<CopyObjectResult><ETag>\"{e}\"</ETag></CopyObjectResult>").into_bytes())
+                        }
+                        None => {
+                            let e = md5ish(&body);
+                            b.objects.insert(key, (body, e.clone()));
+                            ("200 OK", format!("etag: \"{e}\"\r\n"), Vec::new())
+                        }
+                    },
+                    _ => ("400 Bad Request", String::new(), Vec::new()),
+                };
+                drop(b);
+                let _ = c.write_all(format!("HTTP/1.1 {status}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", out.len()).as_bytes());
+                let _ = c.write_all(&out);
+            }
+        });
+        s3::Endpoint { https: false, host: "127.0.0.1".into(), port, region: "auto".into() }
+    }
+
+    fn boot(ep: &s3::Endpoint) -> App {
+        App::new(test_cfg(), Some(Rc::new(S3Ctx { ep: ep.clone(), bucket: "b".into(), creds: None })))
+    }
+
+    /// Tick (backoffs skipped, pins merged as main() does) until the index is ready.
+    fn run_until_ready(app: &mut App) {
+        for _ in 0..10_000 {
+            app.indexer.retry_at = None;
+            merge_commits(app);
+            app.tick();
+            if matches!(app.indexer.phase, Phase::Ready) {
+                return;
+            }
+        }
+        panic!("never ready: {} ({:?})", app.indexer.state_name(), app.indexer.last_error);
+    }
+
+    fn cids(app: &App) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = app.snap.files.iter().map(|f| (f.key.clone(), f.root.to_string())).collect();
+        v.sort();
+        v
+    }
+
+    /// A bucket shaped like production: pins/ and site/, a multi-chunk object, an empty one, and a multipart ETag.
+    fn sample_bucket() -> (std::sync::Arc<std::sync::Mutex<Bucket>>, s3::Endpoint) {
+        let bucket = std::sync::Arc::new(std::sync::Mutex::new(Bucket::default()));
+        {
+            let mut b = bucket.lock().unwrap();
+            let big: Vec<u8> = (0..ipfs::CHUNK as usize * 3 + 5).map(|i| (i % 253) as u8).collect();
+            let e = md5ish(&big);
+            b.put("pins/bafkbig", big, &e);
+            b.put("pins/bafksmall", b"{\"a\":1}".to_vec(), &md5ish(b"{\"a\":1}"));
+            b.put("site/app/index.html", b"<p>hi</p>".to_vec(), &md5ish(b"<p>hi</p>"));
+            b.put("site/empty", Vec::new(), &md5ish(b""));
+            b.put("site/mp.bin", vec![7; 1000], "0123456789abcdef0123456789abcdef-3");
+        }
+        let ep = bucket_server(bucket.clone());
+        (bucket, ep)
+    }
+
+    #[test]
+    fn a_restart_inside_the_egress_admission_window_reuses_the_cache() {
+        let (bucket, ep) = sample_bucket();
+        let mut first = boot(&ep);
+        run_until_ready(&mut first);
+        assert_eq!(first.snap.files.len(), 5);
+        let cache_len = bucket.lock().unwrap().objects.get(CACHE_REL).expect("the cache was saved").0.len();
+        // The restart: the partition's egress refuses the first several connections (production 2026-10-13: the
+        // boot's first requests fail with "send: I/O error" for longer than three quick tries).
+        {
+            let mut b = bucket.lock().unwrap();
+            b.gets.clear();
+            b.refuse = 8;
+        }
+        let mut second = boot(&ep);
+        run_until_ready(&mut second);
+        let b = bucket.lock().unwrap();
+        assert_eq!(b.hashed(), Vec::<String>::new(), "a restart re-hashed objects the cache describes");
+        assert_eq!(cids(&second), cids(&first));
+        let cache_gets: Vec<&String> = b.gets.iter().filter(|(k, _)| k == CACHE_REL).map(|(_, r)| r).collect();
+        assert_eq!(cache_gets, vec![&format!("bytes=0-{}", cache_len - 1)], "one GET of exactly the listed size");
+    }
+
+    #[test]
+    fn a_pin_during_the_boot_hash_does_not_shrink_the_cache() {
+        let (bucket, ep) = sample_bucket();
+        let mut first = boot(&ep);
+        run_until_ready(&mut first);
+        // One object changed while the app was down, so the next boot has hashing to do.
+        bucket.lock().unwrap().put("site/app/index.html", b"<p>new</p>".to_vec(), &md5ish(b"<p>new</p>"));
+        let mut second = boot(&ep);
+        while !matches!(second.indexer.phase, Phase::Hash { .. }) {
+            second.indexer.retry_at = None;
+            second.tick();
+        }
+        // A pin lands mid-hash (a deploy publishing its config), as pin_buffered() records it.
+        let data = b"{\"pinned\":true}".to_vec();
+        let etag = s3::put_object_etag(&second.s3.as_ref().unwrap().ep, "b", "pins/bafknew", None, &data).unwrap();
+        second.upload_shared.borrow_mut().commits.push(upload::PendingCommit {
+            key: "pins/bafknew".into(), size: data.len() as u64, etag, leaves: vec![Sha256::digest(&data).into()],
+        });
+        merge_commits(&mut second);
+        // ...and the partition restarts before the hash finishes.
+        drop(second);
+        bucket.lock().unwrap().gets.clear();
+        let mut third = boot(&ep);
+        run_until_ready(&mut third);
+        let mut hashed = bucket.lock().unwrap().hashed();
+        hashed.sort();
+        assert_eq!(hashed, vec!["pins/bafknew".to_string(), "site/app/index.html".to_string()],
+                   "only the changed object and the never-indexed pin hash");
+        assert_eq!(third.snap.files.len(), 6);
+    }
+
+    #[test]
+    fn a_pin_renamed_by_copy_survives_a_restart_without_a_re_hash() {
+        // /add-wasm's shape: a staging object, a server-side copy to pins/<cid> (sia-s3 keeps the source ETag; the
+        // multipart "-N" form), and the copy's ETag recorded for the merge.
+        let (bucket, ep) = sample_bucket();
+        let mut first = boot(&ep);
+        run_until_ready(&mut first);
+        let data = vec![9u8; 5000];
+        bucket.lock().unwrap().put("staging/x", data.clone(), "fedcba9876543210fedcba9876543210-2");
+        let etag = s3::copy_object(&ep, "b", "pins/bafkwasm", "staging/x", None).unwrap();
+        bucket.lock().unwrap().objects.remove("staging/x");
+        first.upload_shared.borrow_mut().commits.push(upload::PendingCommit {
+            key: "pins/bafkwasm".into(), size: data.len() as u64, etag, leaves: vec![Sha256::digest(&data).into()],
+        });
+        merge_commits(&mut first);
+        bucket.lock().unwrap().gets.clear();
+        let mut second = boot(&ep);
+        run_until_ready(&mut second);
+        assert_eq!(bucket.lock().unwrap().hashed(), Vec::<String>::new());
+        assert_eq!(cids(&second), cids(&first));
+    }
+
+    #[test]
+    fn a_boot_serves_what_the_cache_vouches_for_before_the_hash_ends() {
+        let (bucket, ep) = sample_bucket();
+        let mut first = boot(&ep);
+        run_until_ready(&mut first);
+        bucket.lock().unwrap().put("site/app/index.html", b"<p>new</p>".to_vec(), &md5ish(b"<p>new</p>"));
+        let mut second = boot(&ep);
+        while !matches!(second.indexer.phase, Phase::Hash { .. }) {
+            second.indexer.retry_at = None;
+            second.tick();
+        }
+        let serving: Vec<String> = second.snap.files.iter().map(|f| f.key.clone()).collect();
+        assert_eq!(serving.len(), 4, "the four unchanged objects serve while the changed one hashes: {serving:?}");
+        assert!(!serving.contains(&"site/app/index.html".to_string()));
+    }
+
+    #[test]
+    fn a_cache_read_hiccup_retries_and_a_dead_one_never_wedges_the_boot() {
+        let (bucket, ep) = sample_bucket();
+        let mut first = boot(&ep);
+        run_until_ready(&mut first);
+        // A few failed reads: still reused.
+        {
+            let mut b = bucket.lock().unwrap();
+            b.gets.clear();
+            b.cache_500s = CACHE_TRIES as usize - 1;
+        }
+        let mut second = boot(&ep);
+        run_until_ready(&mut second);
+        assert_eq!(bucket.lock().unwrap().hashed(), Vec::<String>::new());
+        assert_eq!(second.indexer.last_error, None, "the retried cache error does not linger");
+        // An unreadable cache: the boot gives up on it and indexes the bucket anyway.
+        {
+            let mut b = bucket.lock().unwrap();
+            b.gets.clear();
+            b.cache_500s = usize::MAX;
+        }
+        let mut third = boot(&ep);
+        run_until_ready(&mut third);
+        let b = bucket.lock().unwrap();
+        assert_eq!(b.gets.iter().filter(|(k, _)| k == CACHE_REL).count(), CACHE_TRIES as usize);
+        assert_eq!(b.hashed().len(), 4, "every non-empty object hashed");
+        assert_eq!(cids(&third), cids(&first));
+        assert_eq!(third.indexer.last_error, None);
+    }
+
+    #[test]
+    fn a_first_boot_with_no_cache_does_not_ask_for_it() {
+        let (bucket, ep) = sample_bucket();
+        let mut app = boot(&ep);
+        run_until_ready(&mut app);
+        let b = bucket.lock().unwrap();
+        assert!(b.gets.iter().all(|(k, _)| k != CACHE_REL), "the listing already said there is no cache");
+        assert!(b.objects.contains_key(CACHE_REL));
     }
 }
