@@ -28,6 +28,9 @@ chrono = "0.4"
 httparse = "1"
 getrandom = "0.3"
 
+[dev-dependencies]
+sia_storage = { path = "vendor/sia-sdk-rs/sia_storage", features = ["mock"] }
+
 [workspace]
 exclude = ["vendor"]
 

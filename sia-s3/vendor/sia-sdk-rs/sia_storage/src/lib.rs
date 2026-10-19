@@ -63,6 +63,7 @@ mod hosts;
 mod object_encryption;
 mod rhp4;
 mod sdk;
+mod recovery;
 mod shared_sdk;
 mod sharing;
 mod slabs;
@@ -73,6 +74,7 @@ mod upload;
 pub mod mock;
 
 pub use sdk::{Error, Sdk};
+pub use recovery::RecoveryReader;
 pub use shared_sdk::SharedSdk;
 pub use sharing::{KeyRecord, SharingError, SharingKey};
 

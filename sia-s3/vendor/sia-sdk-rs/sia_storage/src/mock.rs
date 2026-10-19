@@ -92,6 +92,11 @@ impl MockNetwork {
         .await
     }
 
+    /// Builds an indexer-free reader against only the mock host transport.
+    pub fn recovery_reader(&self, key: AppKey, hosts: Vec<Host>) -> crate::RecoveryReader {
+        crate::RecoveryReader::with_transport(key, hosts, Client::Mock(self.transport.clone()))
+    }
+
     /// Builds a [`SharedSdk`] backed by this network, as a recipient holding
     /// `seed`. The key must already exist on the mock indexer.
     pub async fn shared_sdk(&self, seed: [u8; 32]) -> Result<SharedSdk, BuilderError> {

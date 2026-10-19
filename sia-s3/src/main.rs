@@ -9,6 +9,7 @@
 //! The one platform rule: read `ENCLAVE_PORTS` and bind the actual port.
 
 mod config;
+mod recovery;
 mod diag;
 mod http;
 mod import;
@@ -141,6 +142,16 @@ fn main() {
     let debug = std::env::var("SIAS3_LOG").is_ok_and(|v| v == "debug");
     if log::set_boxed_logger(Box::new(Logger { debug })).is_ok() {
         log::set_max_level(if debug { log::LevelFilter::Debug } else { log::LevelFilter::Warn });
+    }
+    let recovery_args: Vec<String> = std::env::args().collect();
+    if recovery_args.get(1).map(String::as_str) == Some("recovery") {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        if let Err(e) = local.block_on(&rt, recovery::command(&recovery_args[2..])) {
+            eprintln!("[recovery] {e}");
+            std::process::exit(1);
+        }
+        return;
     }
     let cfg = match config::load() {
         Ok(c) => c,

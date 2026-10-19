@@ -110,3 +110,61 @@ blocking work runs inline (no threads on wasip2). MIT licensed, as upstream.
 `spike/` is the 2026-10-13 wasip2 feasibility test (SDK on wasip2, indexer over TLS, SiaMux to 20/20 hosts, the
 SOCKS egress path). Its results are in this file's history (commit 13dce6b). `sia-sdk-rs-wasip2.patch` is that
 patch as one file. `vendor/` carries it applied.
+
+## Indexer-free recovery reads
+
+An operator can export the resolved S3 key index while indexd is available, then
+recover existing files directly from Sia hosts without connecting to indexd. This
+is an explicit archive-recovery tool, not an automatic stale-index fallback for
+the live mutable S3 service.
+
+```bash
+# The file contains the existing 32-byte app seed as 64 hex digits.
+export SIA_RECOVERY_KEY_FILE=/protected/sia-s3.seed
+sia-s3 recovery export https://your-indexer.example snapshot.json
+# Save snapshotSha256 from the result in a separately trusted recovery record.
+
+sia-s3 recovery read snapshot.json SNAPSHOT_SHA256 ipfs pins/EXPECTED_CID \
+  recovered.wasm EXPECTED_FILE_SHA256 EXPECTED_FILE_BYTES
+```
+
+`recovery read` does not load `ENCLAVE_CONFIG`, create an indexer client, list
+remote objects, sweep, compact, upload or update metadata. Its reader contains
+only the app key and the snapshot's host list. It authorizes RHP4 reads directly
+with that key, verifies Sia's sector proofs, decrypts and reconstructs shards,
+and checks the complete file against the separately supplied size and SHA-256.
+The destination appears only after verification and cannot replace an existing
+file. Failure removes the temporary partial file. Reads have a ten-minute
+whole-file deadline and bounded chunk buffering.
+
+The snapshot contains sealed objects and references to their selected key
+entries; key names and object encryption keys stay inside sealed metadata. It
+contains no app seed. The exact external snapshot hash binds host addresses,
+object selection and metadata together. Reads reject a wrong hash/key, modified
+sealed metadata, duplicate key references and incomplete multipart objects.
+Snapshot inputs are capped at 64 MiB, 100,000 objects/keys and 10,000 hosts. Keep
+snapshots and app seeds protected and back them up separately from any public
+artifact directory. A snapshot records the resolved keys observed during export; capture is not a
+transaction across all mutable keys. Concurrent writes can race it, and an
+incomplete multipart capture is rejected. Quiesce writers if a consistent mutable
+bucket image is required. A saved snapshot does not prove that a key is still live
+or that a deletion/overwrite after capture did not happen.
+
+This command **cannot upload, renew contracts, refill host accounts or discover
+changed host addresses**. Reads consume existing prepaid app-account balances.
+If those balances run out, contracts expire, or too many sectors disappear, a
+snapshot alone cannot recover the data. Independent backend copies and
+owner-controlled funding/renewal are still required for sustained censorship
+resistance. Never start a cloned live indexd wallet/database alongside its
+original writer.
+
+Validation includes a real encrypted/erasure-coded mock-host download after the
+mock indexer and SDK are discarded, snapshot tampering and missing-part refusal,
+and output collision handling. A native production-data test used Linux cgroup
+IP filtering to allow only snapshot Sia-host IPs. It first proved the active
+local indexer reachable outside the test cgroup, then proved that the local
+indexer, all four public indexer fronts and Nan were unreachable inside it.
+The tool recovered a 1,501,902-byte adapter WASM and a 23,677,756-byte retained
+artifact with exact hashes. The test used a trusted recovery VM, not an attested
+guest, and left production writers running. The recovery utility also builds for
+WASI P2; a WASI recovery execution has not yet been demonstrated.
