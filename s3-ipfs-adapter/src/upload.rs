@@ -6,6 +6,10 @@
 //! for legacy clients, plus deployment-bound EIP-191 signatures, same response shapes
 //! ({"cid", ...}), same refusal codes (401/403/413/415/429), same CORS echo.
 //!
+//! The opt-in /add-file route stores generic runtime artifacts with the same
+//! bounded multipart path, but requires direct wallet authorization. It does
+//! not classify bytes as WASM or change runtime admission.
+//!
 //! What replaces Kubo: bytes are PUT into the configured S3 bucket under
 //! `pins/<cid>`, where the indexer's snapshot serves them right back over
 //! /ipfs/<cid> with a CID computed by the same code that computed it at
@@ -52,6 +56,7 @@ pub struct UploadCfg {
     pub allow_unsigned: bool, // dev/e2e only: no key, uploads open
     pub allow_origins: Vec<String>,
     pub max_wasm: u64,
+    pub max_file: u64, // explicit opt-in; zero disables generic runtime/artifact uploads
     pub max_image: usize,
     pub max_json: usize,
     pub per_addr_daily: u64,
@@ -208,6 +213,11 @@ fn precheck(cfg: &UploadCfg, req: &Request) -> Result<Option<AuthHdrs>, (u16, St
         }
     }
     let wallet_attempt = req.header("x-upload-signature").is_some() || req.header("x-upload-sha256").is_some();
+    // The generic route accepts only deployment- and path-bound signatures.
+    // Legacy HMAC tokens have no path binding and cannot authorize this route.
+    if req.path == "/add-file" && !wallet_attempt {
+        return Err((401, "file uploads require a direct wallet signature".into()));
+    }
     if !wallet_attempt && cfg.upload_key.is_empty() && cfg.allow_unsigned {
         return Ok(None);
     }
@@ -249,7 +259,7 @@ fn precheck(cfg: &UploadCfg, req: &Request) -> Result<Option<AuthHdrs>, (u16, St
         let hash = req.header("x-upload-sha256").unwrap_or("");
         let size = req.header("content-length").and_then(|s| s.parse::<u64>().ok());
         if !canonical_hex(hash, 32, false) || size.is_none() || req.method != "POST"
-            || !matches!(req.path.as_str(), "/add-json" | "/add-image" | "/add-wasm") {
+            || !matches!(req.path.as_str(), "/add-json" | "/add-image" | "/add-wasm" | "/add-file") {
             return Err((401, "bad wallet upload scope".into()));
         }
         let size = size.unwrap();
@@ -482,11 +492,21 @@ pub fn add_image(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
     }
 }
 
-// ---- the streaming route: /add-wasm -----------------------------------------
+// ---- the streaming routes: /add-wasm and /add-file -----------------------------------------
 
 /// Route entry: refuse everything refusable from the headers alone, then
 /// register the sink that consumes the body.
 pub fn add_wasm(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
+    add_stream(app, srv, conn, req, true);
+}
+
+/// Runtime/kernel bytes are stored by CID, not accepted as an executable app.
+/// Compute admission continues to validate the measured runtime independently.
+pub fn add_file(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
+    add_stream(app, srv, conn, req, false);
+}
+
+fn add_stream(app: &mut App, srv: &mut Server, conn: usize, req: &Request, wasm: bool) {
     let Some(cfg) = app.cfg.upload.as_ref().filter(|c| c.enabled()) else {
         return srv.respond(conn, json(503, "Service Unavailable", "{\"error\":\"uploads not configured\"}".into()));
     };
@@ -496,8 +516,12 @@ pub fn add_wasm(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
     let Some(declared) = req.stream_len.filter(|&n| n > 0) else {
         return refuse(srv, conn, req, cfg, 411, "Content-Length required");
     };
-    if declared > cfg.max_wasm {
-        return refuse(srv, conn, req, cfg, 413, &format!("too large (max {} bytes)", cfg.max_wasm));
+    let max_bytes = if wasm { cfg.max_wasm } else { cfg.max_file };
+    if !wasm && max_bytes == 0 {
+        return refuse(srv, conn, req, cfg, 503, "file uploads are disabled by this operator");
+    }
+    if declared > max_bytes {
+        return refuse(srv, conn, req, cfg, 413, &format!("too large (max {max_bytes} bytes)"));
     }
     let auth = match precheck(cfg, req) {
         Err((code, msg)) => return refuse(srv, conn, req, cfg, code, &msg),
@@ -537,7 +561,7 @@ pub fn add_wasm(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
         let probe = cors(Response::new(200, "OK"), req, cfg);
         probe.headers
     };
-    let sink = WasmSink {
+    let sink = ArtifactSink {
         s3: s3ctx,
         shared: app.upload_shared.clone(),
         upload_key: cfg.upload_key.clone(),
@@ -557,12 +581,12 @@ pub fn add_wasm(app: &mut App, srv: &mut Server, conn: usize, req: &Request) {
         leaf_hash: Sha256::new(),
         leaf_fill: 0,
         leaves: Vec::new(),
-        scan: WasmScan::new(),
+        scan: if wasm { Some(WasmScan::new()) } else { None },
     };
     srv.begin_body(conn, Box::new(sink));
 }
 
-struct WasmSink {
+struct ArtifactSink {
     s3: Rc<S3Ctx>,
     shared: Rc<RefCell<Shared>>,
     upload_key: String,
@@ -582,10 +606,10 @@ struct WasmSink {
     leaf_hash: Sha256,
     leaf_fill: usize,
     leaves: Vec<[u8; 32]>,
-    scan: WasmScan,
+    scan: Option<WasmScan>,
 }
 
-impl WasmSink {
+impl ArtifactSink {
     fn resp(&self, code: u16, reason: &'static str, body: String) -> Response {
         let mut r = json(code, reason, body);
         for (k, v) in &self.cors {
@@ -646,14 +670,15 @@ impl WasmSink {
     }
 }
 
-impl Sink for WasmSink {
+impl Sink for ArtifactSink {
     fn feed(&mut self, mut data: &[u8]) -> Result<(), Response> {
         self.fed += data.len() as u64;
         self.body_hash.update(data);
-        if let Err(msg) = self.scan.feed(data) {
-            // Tier-1 preamble refusal, decidable at byte 8: stop the upload
-            // now instead of accepting gigabytes that can only be refused.
-            return Err(self.fail(415, "Unsupported Media Type", &msg));
+        if let Some(scan) = self.scan.as_mut() {
+            if let Err(msg) = scan.feed(data) {
+                // The WASM route retains its preamble validation at byte 8.
+                return Err(self.fail(415, "Unsupported Media Type", &msg));
+            }
         }
         // Leaf hashing on kubo's chunk grid.
         let mut rest = data;
@@ -709,7 +734,7 @@ impl Sink for WasmSink {
             }
             self.global_held = 0; // consumed: the successful upload keeps its fleet bytes
         }
-        if let Some(msg) = self.scan.accept_error() {
+        if let Some(msg) = self.scan.as_ref().and_then(WasmScan::accept_error) {
             return self.fail(415, "Unsupported Media Type", &msg);
         }
         let (cid, _, _) = ipfs::build_file_dag(&self.leaves, self.fed);
@@ -751,7 +776,11 @@ impl Sink for WasmSink {
             etag,
             leaves: std::mem::take(&mut self.leaves),
         });
-        let v = self.scan.verdict();
+        let Some(scan) = self.scan.as_ref() else {
+            eprintln!("[s3-ipfs-adapter] pinned file {cid} ({} bytes)", self.fed);
+            return self.resp(200, "OK", format!("{{\"cid\":\"{cid}\",\"bytes\":{}}}", self.fed));
+        };
+        let v = scan.verdict();
         eprintln!(
             "[s3-ipfs-adapter] pinned wasm {cid} ({} bytes, wasi {})",
             self.fed,
@@ -777,7 +806,7 @@ impl Sink for WasmSink {
     }
 }
 
-impl Drop for WasmSink {
+impl Drop for ArtifactSink {
     fn drop(&mut self) {
         // Backstop: any reservation not settled by finish()/fail()/abort() is
         // refunded here (e.g. the sink dropped on a reap the loop did not route
@@ -797,18 +826,19 @@ mod auth_tests {
     use k256::ecdsa::SigningKey;
     use sha3::Keccak256;
     fn cfg() -> UploadCfg {
-        UploadCfg { upload_key: String::new(), wallet_audience: format!("0x{}", "ab".repeat(32)), allow_unsigned: false, allow_origins: vec![], max_wasm: 1024, max_image: 1024, max_json: 1024, per_addr_daily: 1024, global_daily: 4096, json_per_ip_hourly: 60.0 }
+        UploadCfg { upload_key: String::new(), wallet_audience: format!("0x{}", "ab".repeat(32)), allow_unsigned: false, allow_origins: vec![], max_wasm: 1024, max_file: 1024, max_image: 1024, max_json: 1024, per_addr_daily: 1024, global_daily: 4096, json_per_ip_hourly: 60.0 }
     }
-    fn request(c: &UploadCfg, expiry: u64) -> Request {
+    fn request(c: &UploadCfg, expiry: u64) -> Request { request_for(c, expiry, "/add-json") }
+    fn request_for(c: &UploadCfg, expiry: u64, path: &str) -> Request {
         let v: serde_json::Value = serde_json::from_str(include_str!("wallet-upload-vector.json")).unwrap();
         let address = v["address"].as_str().unwrap();
         let hash = hex_of(&Sha256::digest(b"{}"));
-        let m = crate::wallet_upload::message(&c.wallet_audience,"/add-json",address,&hash,2,expiry);
+        let m = crate::wallet_upload::message(&c.wallet_audience,path,address,&hash,2,expiry);
         let mut h = Keccak256::new(); h.update(format!("\x19Ethereum Signed Message:\n{}",m.len())); h.update(m.as_bytes());
         let key = SigningKey::from_bytes(&[0x42u8;32].into()).unwrap();
         let (sig, rec) = key.sign_prehash_recoverable(&h.finalize()).unwrap();
         let signature = format!("0x{}{:02x}",hex_of(&sig.to_bytes()),rec.to_byte()+27);
-        Request { method:"POST".into(),path:"/add-json".into(),query:String::new(),body:b"{}".to_vec(),stream_len:None,headers:vec![("content-length".into(),"2".into()),("x-upload-address".into(),address.into()),("x-upload-expiry".into(),expiry.to_string()),("x-upload-sha256".into(),hash),("x-upload-signature".into(),signature)] }
+        Request { method:"POST".into(),path:path.into(),query:String::new(),body:b"{}".to_vec(),stream_len:None,headers:vec![("content-length".into(),"2".into()),("x-upload-address".into(),address.into()),("x-upload-expiry".into(),expiry.to_string()),("x-upload-sha256".into(),hash),("x-upload-signature".into(),signature)] }
     }
     #[test]
     fn direct_upload_needs_no_relay_secret_and_binds_final_bytes() {
@@ -839,11 +869,26 @@ mod auth_tests {
         let req=request(&c,now_secs()+300);let mut other=cfg();other.wallet_audience=format!("0x{}","cd".repeat(32));assert!(precheck(&other,&req).is_err());
     }
     #[test]
+    fn generic_file_requires_its_own_wallet_scope_even_in_legacy_or_dev_mode() {
+        let mut c=cfg();
+        let req=request_for(&c,now_secs()+300,"/add-file");
+        let auth=precheck(&c,&req).unwrap().unwrap();
+        assert!(verify_body(&auth,"",&hex_of(&Sha256::digest(b"{}")),2).is_ok());
+        let mut wrong=request(&c,now_secs()+300);wrong.path="/add-file".into();
+        assert!(precheck(&c,&wrong).is_err());
+        let mut unsigned=req;unsigned.headers.clear();c.allow_unsigned=true;
+        assert!(precheck(&c,&unsigned).is_err());
+        c.upload_key="legacy".into();unsigned.headers.push(("x-upload-token".into(),"00".repeat(32)));
+        assert!(precheck(&c,&unsigned).is_err());
+    }
+
+    #[test]
     fn legacy_hmac_stays_compatible() {
         let mut c=cfg();c.upload_key="legacy".into();let mut req=request(&c,now_secs()+300);
         let addr=req.header("x-upload-address").unwrap();let expiry=req.header("x-upload-expiry").unwrap();let hash=hex_of(&Sha256::digest(b"{}"));
         let mut mac=Hmac::<Sha256>::new_from_slice(c.upload_key.as_bytes()).unwrap();mac.update(format!("{addr}:{hash}:{expiry}").as_bytes());let token=hex_of(&mac.finalize().into_bytes());
         req.headers.retain(|(k,_)|k!="x-upload-signature"&&k!="x-upload-sha256");req.headers.push(("x-upload-token".into(),token));
         let a=precheck(&c,&req).unwrap().unwrap();assert!(verify_body(&a,&c.upload_key,&hash,2).is_ok());assert!(verify_body(&a,"wrong",&hash,2).is_err());
+        req.path="/add-file".into();assert!(precheck(&c,&req).is_err());
     }
 }

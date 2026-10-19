@@ -69,12 +69,14 @@ client keeps working unchanged:
 | route | what |
 |---|---|
 | `POST /add-wasm` | a wasm component (Tier-1 validated: preamble + layer; wasm64 core-module carve-out), streamed through an S3 multipart upload — a 2 GiB body never lives in guest memory. Answers `{cid, wasi, world, threads, set, mem64}` (the wasi-world classifier rides back for claim routing) |
+| `POST /add-file` | generic runtime/kernel bytes, streamed with the same 8 MiB multipart parts and CID calculation; disabled by default. Answers `{cid, bytes}`. Requires direct wallet authorization and positive `maxFileBytes`; storing bytes does not admit a runtime. |
 | `POST /add-json` | an app-config JSON OBJECT (catalog rev-7 large configs), 1 MiB cap in lockstep with the runner's `CONFIG_MAX_BYTES` |
 | `POST /add-image` | an app thumbnail/banner: raster by magic bytes, or SVG through the strict fail-closed validator (reject, never sanitize). Answers `{cid, svg}` |
 | `GET /healthz` | `{"ok":true}` — the gateway liveness contract deploy tooling waits on |
 
-All three pin routes accept direct EOA wallet signatures when `walletAudience`
-is configured, or legacy relay HMAC tokens when `uploadKey` is configured.
+The WASM, JSON and image routes accept direct EOA wallet signatures when
+`walletAudience` is configured, or legacy relay HMAC tokens when `uploadKey` is
+configured. The opt-in file route requires a direct wallet signature.
 Both paths enforce per-wallet and global daily byte budgets, and echo CORS for the
 configured origins. Pins land in the bucket at `pins/<cid>` — the CID is
 computed by the same code that serves it, and a freshly pinned CID resolves
@@ -113,6 +115,7 @@ resolve from the environment, which is how deployment secrets arrive:
     "uploadKey": "$UPLOAD_KEY",
     "allowOrigins": ["https://enclave.host"],
     "maxWasmBytes": 2147483648,
+    "maxFileBytes": 0,
     "maxImageBytes": 4194304,
     "maxJsonBytes": 1048576,
     "perAddrDailyBytes": 4294967296,
@@ -127,8 +130,12 @@ The `upload` block is optional; without it the pin routes answer 503.
 to enable uploads without a relay or shared authorization secret.
 `uploadKey` is an optional compatibility secret shared with the api-relay
 (reference a deployment secret, never inline it). All other keys default to the values
-shown. `allowUnsigned: true` opens the routes with no token — dev/e2e only,
-never on a public deployment.
+shown. `allowUnsigned: true` opens the WASM, JSON and image routes with no token —
+dev/e2e only, never on a public deployment. Generic files remain wallet-only.
+Set `maxFileBytes` to an explicit positive limit (at most 2147483648) to enable
+`/add-file`; the default zero returns 503. It shares the four upload slots and
+per-wallet/global budgets. It does not bypass WASM validation on `/add-wasm`,
+change runtime admission or promise indefinite retention.
 
 `endpoint` and `bucket` are required; the app still starts without them and
 says so in the UI. Omit `credentials` for a public bucket (requests go
@@ -153,7 +160,7 @@ enclave-storage-upload:v1
 chainId:8453
 service:<full deployment ID>
 method:POST
-path:</add-json, /add-image or /add-wasm>
+path:</add-json, /add-image, /add-wasm or /add-file>
 address:<wallet address>
 sha256:<SHA-256 of the upload body>
 bytes:<Content-Length>
@@ -166,11 +173,11 @@ verifies the signature before accepting a streaming body, then checks the
 actual hash and length before committing it. Bad direct signatures never
 fall back to HMAC or unsigned mode. The configured service ID prevents a
 signature being reused at another adapter; route binding prevents using
-JSON authorization for a WASM or image upload. Repeating the same request
+JSON authorization for a WASM, image or generic file upload. Repeating the same request
 within its validity window is possible and still consumes upload quotas.
 
 This path supports EOA signatures. Contract wallets and platform sessions
-still use the legacy path until independent contract/session verification
+still use the legacy validating routes until independent contract/session verification
 is implemented. Enabling this feature alone does not retire the relay.
 
 ## Limits, by design

@@ -199,6 +199,7 @@ fn load_config() -> Config {
                 None => vec!["https://enclave.host".to_string()],
             },
             max_wasm: un("maxWasmBytes", 2 * 1024 * 1024 * 1024),
+            max_file: un("maxFileBytes", 0).min(2 * 1024 * 1024 * 1024),
             max_image: un("maxImageBytes", 4 * 1024 * 1024) as usize,
             max_json: un("maxJsonBytes", 1024 * 1024) as usize,
             per_addr_daily: un("perAddrDailyBytes", 4 * 1024 * 1024 * 1024),
@@ -956,8 +957,8 @@ fn main() {
     }
     match &cfg.upload {
         Some(u) if u.enabled() => eprintln!(
-            "[s3-ipfs-adapter] pin routes ON (/add-wasm /add-json /add-image), {}",
-            if u.allow_unsigned && u.upload_key.is_empty() { "UNSIGNED (dev)" } else { "authenticated" }
+            "[s3-ipfs-adapter] pin routes ON (/add-wasm /add-json /add-image), {}; /add-file limit={} bytes (wallet-only, zero disables)",
+            if u.allow_unsigned && u.upload_key.is_empty() { "UNSIGNED (dev)" } else { "authenticated" }, u.max_file
         ),
         Some(_) => eprintln!(
             "[s3-ipfs-adapter] pin routes configured without valid walletAudience or uploadKey - they answer 503"
@@ -970,7 +971,7 @@ fn main() {
     // Content-Length before anything is buffered. The pin routes use their
     // CONFIGURED ceilings (defaults 1 MiB / 4 MiB) so an unauthenticated
     // request can never make the parser buffer more than that route allows;
-    // /add-wasm is streamed, capped by the app in add_wasm().
+    // /add-wasm and /add-file are streamed, with separate app-configured caps.
     let json_cap = app.cfg.upload.as_ref().map_or(MAX_BODY, |u| u.max_json);
     let image_cap = app.cfg.upload.as_ref().map_or(MAX_BODY, |u| u.max_image);
     let big_routes: [(&str, usize); 3] = [
@@ -980,7 +981,7 @@ fn main() {
     ];
     let mut tick: u64 = 0;
     loop {
-        for (key, req) in srv.poll(MAX_BODY, &big_routes, "/add-wasm") {
+        for (key, req) in srv.poll(MAX_BODY, &big_routes, &["/add-wasm", "/add-file"]) {
             route(&mut app, &mut srv, key, &req);
         }
         merge_commits(&mut app);
@@ -1061,9 +1062,10 @@ fn route(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
         // and the gateway test suites wait on it.
         ("GET", "/healthz") => srv.respond(key, json(200, "OK", "{\"ok\":true}".into())),
         ("POST", "/add-wasm") => upload::add_wasm(app, srv, key, req),
+        ("POST", "/add-file") => upload::add_file(app, srv, key, req),
         ("POST", "/add-json") => upload::add_json(app, srv, key, req),
         ("POST", "/add-image") => upload::add_image(app, srv, key, req),
-        ("OPTIONS", "/add-wasm") | ("OPTIONS", "/add-json") | ("OPTIONS", "/add-image") => {
+        ("OPTIONS", "/add-file") | ("OPTIONS", "/add-wasm") | ("OPTIONS", "/add-json") | ("OPTIONS", "/add-image") => {
             let resp = Response::new(204, "No Content");
             let resp = match &app.cfg.upload {
                 Some(cfg) => upload::cors(resp, req, cfg),
