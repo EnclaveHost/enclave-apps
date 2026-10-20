@@ -33,6 +33,8 @@
 //! computed the index, so the published root CID is a faithful commitment
 //! to the bucket's contents at index time.
 
+mod account_upload;
+mod contract_wallet;
 mod egress;
 mod httpd;
 mod imgcheck;
@@ -190,14 +192,7 @@ fn load_config() -> Config {
             upload_key: us("uploadKey").unwrap_or_default().to_string(),
             wallet_audience: us("walletAudience").unwrap_or_default().to_lowercase(),
             allow_unsigned: u.get("allowUnsigned").and_then(|x| x.as_bool()).unwrap_or(false),
-            allow_origins: match u.get("allowOrigins").and_then(|x| x.as_array()) {
-                Some(a) => a
-                    .iter()
-                    .filter_map(|x| x.as_str())
-                    .map(|s| s.trim_end_matches('/').to_string())
-                    .collect(),
-                None => vec!["https://enclave.host".to_string()],
-            },
+            allow_origins: allow_origins(u.get("allowOrigins")),
             max_wasm: un("maxWasmBytes", 2 * 1024 * 1024 * 1024),
             max_file: un("maxFileBytes", 0).min(2 * 1024 * 1024 * 1024),
             max_image: un("maxImageBytes", 4 * 1024 * 1024) as usize,
@@ -205,6 +200,18 @@ fn load_config() -> Config {
             per_addr_daily: un("perAddrDailyBytes", 4 * 1024 * 1024 * 1024),
             global_daily: un("globalDailyBytes", 16 * 1024 * 1024 * 1024),
             json_per_ip_hourly: un("jsonPerIpHourly", 60) as f64,
+            // smart-account (ERC-1271) uploads: only with the operator's own pinned chain readers; a bad block disables
+            // them (fails closed) and says why
+            contract_wallets: match u.get("contractWallets") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => match account_upload::AccountCfg::parse(v) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("[s3-ipfs-adapter] config: {e}; smart-account uploads disabled");
+                        None
+                    }
+                },
+            },
         })
     });
     Config {
@@ -223,6 +230,88 @@ fn load_config() -> Config {
         api_key: s("api_key"),
         upload,
     }
+}
+
+/// The browser origins the upload routes answer CORS for: every dashboard
+/// that may upload from a visitor's browser, the platform's and any
+/// independent mirror alike, each listed EXPLICITLY by the operator. A list
+/// (`["https://enclave.host", "https://dash.example.org"]`) or one string of
+/// origins separated by commas or spaces, so a `$ALLOW_ORIGINS` secret can
+/// carry it. An absent key keeps the historical default, the platform's
+/// dashboard alone; `[]` is no browser origin at all (CLI and server-side
+/// uploads only).
+///
+/// Every entry is one exact origin, normalized the way a browser spells the
+/// Origin header (lowercase, no default port, no trailing slash), so the exact
+/// match in upload::cors meets it. Anything else is dropped and logged: a
+/// wildcard, `null`, a path, credentials, plain http off loopback. Nothing
+/// here ever yields `*`, and the upload routes send no allow-credentials -
+/// their authorization is the per-request wallet signature or token, never
+/// an ambient cookie - so listing a mirror lets it ASK, it does not let it
+/// act as anyone.
+fn allow_origins(v: Option<&serde_json::Value>) -> Vec<String> {
+    let raw: Vec<String> = match v {
+        None | Some(serde_json::Value::Null) => return vec!["https://enclave.host".to_string()],
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).map(str::to_string).collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|x| !x.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(other) => {
+            eprintln!("[s3-ipfs-adapter] config: upload.allowOrigins must be a list of origins, not {other}; allowing none");
+            return Vec::new();
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    for r in raw {
+        match norm_origin(&r) {
+            Some(o) if !out.contains(&o) => out.push(o),
+            Some(_) => {}
+            None => eprintln!("[s3-ipfs-adapter] config: upload.allowOrigins entry {r:?} is not one exact https origin; ignored"),
+        }
+    }
+    out
+}
+
+/// One origin as a browser sends it, or None. `https://host[:port]`, or
+/// `http://` for loopback only (a local dashboard under development).
+fn norm_origin(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches('/');
+    let (scheme, rest) = s.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let rest = rest.to_ascii_lowercase();
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@', '*', ' ', '\\']) {
+        return None;
+    }
+    let (host, port) = match rest.strip_prefix('[') {
+        Some(v6) => {
+            let (h, after) = v6.split_once(']')?;
+            (format!("[{h}]"), after.strip_prefix(':').map(str::to_string))
+        }
+        None => match rest.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p.to_string())),
+            None => (rest.clone(), None),
+        },
+    };
+    if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '[' | ']' | ':')) {
+        return None;
+    }
+    if let Some(p) = &port {
+        if p.is_empty() || p.parse::<u16>().ok().filter(|n| *n > 0).is_none() {
+            return None;
+        }
+    }
+    let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
+    let default = match scheme.as_str() {
+        "https" => "443",
+        "http" if loopback => "80",
+        _ => return None,
+    };
+    Some(match port.filter(|p| p != default) {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 impl Config {
@@ -1079,8 +1168,13 @@ fn route(app: &mut App, srv: &mut Server, key: usize, req: &Request) {
         ("POST", "/api/upload") => api_upload(app, srv, key, req),
         ("POST", "/api/delete") => api_delete(app, srv, key, req),
         ("GET", p) | ("HEAD", p) if p == "/ipfs" || p.starts_with("/ipfs/") => {
-            gateway(app, srv, key, req)
+            // configured browser origins may read (the dashboard's readback); every gateway answer is written
+            // synchronously, and the slot is cleared afterwards so it can never reach another response
+            srv.next_extra = app.cfg.upload.as_ref().map(|c| upload::gateway_cors(req, c)).unwrap_or_default();
+            gateway(app, srv, key, req);
+            srv.next_extra.clear();
         }
+        ("OPTIONS", p) if p == "/ipfs" || p.starts_with("/ipfs/") => srv.respond(key, upload::gateway_preflight(req, app.cfg.upload.as_ref())),
         _ => srv.respond(key, json(404, "Not Found", "{\"error\":\"no such route\"}".into())),
     }
 }
@@ -2092,6 +2186,60 @@ impl Body for CarBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_origins_are_exact_and_explicit() {
+        let j = |v: serde_json::Value| allow_origins(Some(&v));
+        // the historical default is kept for configs that never said
+        assert_eq!(allow_origins(None), vec!["https://enclave.host"]);
+        // an independent mirror is just another listed origin, normalized as browsers send it
+        assert_eq!(
+            j(serde_json::json!(["https://enclave.host", "HTTPS://Dash.Example.ORG:443/", "https://mirror.example.net:8443", "http://localhost:5173"])),
+            vec!["https://enclave.host", "https://dash.example.org", "https://mirror.example.net:8443", "http://localhost:5173"]
+        );
+        // a secret can carry the list as one string
+        assert_eq!(j(serde_json::json!("https://a.example, https://b.example https://a.example")), vec!["https://a.example", "https://b.example"]);
+        // explicit none
+        assert!(j(serde_json::json!([])).is_empty());
+        // never a wildcard or anything that is not one exact origin
+        for bad in ["*", "null", "https://*.ipfs.dweb.link", "https://a.example/path", "https://user@a.example", "http://a.example",
+                    "a.example", "https://", "https://a.example:0", "https://a.example:99999", "ftp://a.example", "$ALLOW_ORIGINS"] {
+            assert!(j(serde_json::json!([bad])).is_empty(), "{bad}");
+        }
+        assert!(j(serde_json::json!({"origin": "https://a.example"})).is_empty());
+    }
+
+    /// Through the CORS response the upload routes send: a listed mirror is
+    /// echoed exactly, an unlisted page is never granted its own origin, no
+    /// response says `*`, and none allows credentials.
+    #[test]
+    fn a_mirrored_dashboard_may_upload_and_nobody_else_is_granted() {
+        let up = upload::UploadCfg {
+            upload_key: String::new(), wallet_audience: format!("0x{}", "ab".repeat(32)), allow_unsigned: false,
+            allow_origins: allow_origins(Some(&serde_json::json!(["https://enclave.host", "https://dash.example.org"]))),
+            max_wasm: 1024, max_file: 0, max_image: 1024, max_json: 1024, per_addr_daily: 1024, global_daily: 4096,
+            json_per_ip_hourly: 60.0, contract_wallets: None,
+        };
+        let req = |origin: &str| httpd::Request {
+            method: "OPTIONS".into(), path: "/add-wasm".into(), query: String::new(),
+            headers: vec![("origin".into(), origin.into())], body: Vec::new(), stream_len: None,
+        };
+        let allow = |r: &httpd::Response| r.headers.iter().find(|(k, _)| k == "access-control-allow-origin").map(|(_, v)| v.clone());
+        for o in ["https://dash.example.org", "https://enclave.host"] {
+            let r = upload::cors(httpd::Response::new(204, "No Content"), &req(o), &up);
+            assert_eq!(allow(&r).as_deref(), Some(o));
+            assert!(r.headers.iter().all(|(k, _)| k != "access-control-allow-credentials"));
+            let h = r.headers.iter().find(|(k, _)| k == "access-control-allow-headers").unwrap().1.clone();
+            for needed in ["x-upload-address", "x-upload-expiry", "x-upload-signature", "x-upload-sha256"] {
+                assert!(h.contains(needed), "the wallet signature headers must be allowed: {needed}");
+            }
+        }
+        for o in ["https://evil.example", "null", ""] {
+            let r = upload::cors(httpd::Response::new(204, "No Content"), &req(o), &up);
+            assert_ne!(allow(&r).as_deref(), Some(o));
+            assert_ne!(allow(&r).as_deref(), Some("*"));
+        }
+    }
 
     /// A bucket whose first connection is dropped unanswered (the boot-time
     /// "list: send" failure) and whose later ones list zero objects.

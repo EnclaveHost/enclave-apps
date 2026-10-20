@@ -62,6 +62,8 @@ pub struct UploadCfg {
     pub per_addr_daily: u64,
     pub global_daily: u64,
     pub json_per_ip_hourly: f64,
+    /// `contractWallets`: the chain and pinned readers for smart-account (ERC-1271) uploads; None = v2 refused
+    pub contract_wallets: Option<crate::account_upload::AccountCfg>,
 }
 
 impl UploadCfg {
@@ -84,6 +86,8 @@ pub struct Shared {
     /// Uploads that completed in S3 and await the snapshot merge the main
     /// loop performs (it owns &mut App; sinks do not).
     pub commits: Vec<PendingCommit>,
+    /// smart-account uploads: used (account, nonce) pairs and the chain-check budget
+    pub account_guard: crate::account_upload::Guard,
 }
 
 pub struct PendingCommit {
@@ -103,6 +107,7 @@ impl Shared {
             slots: 0,
             seq: 0,
             commits: Vec::new(),
+            account_guard: Default::default(),
         }))
     }
 }
@@ -207,10 +212,26 @@ pub struct AuthHdrs {
 /// is checked in `verify_body` once the body is complete. Direct signatures
 /// are checked here, and their declared body hash is checked at completion.
 fn precheck(cfg: &UploadCfg, req: &Request) -> Result<Option<AuthHdrs>, (u16, String)> {
+    precheck_with(cfg, req, None)
+}
+
+/// precheck, plus smart-account (ERC-1271) uploads when the route passes the shared state: their replay memory and
+/// chain-check budget live there, and the account's contract is asked through the operator's pinned readers
+/// (account_upload.rs) before a single body byte is accepted.
+fn precheck_with(cfg: &UploadCfg, req: &Request, shared: Option<&RefCell<Shared>>) -> Result<Option<AuthHdrs>, (u16, String)> {
     for name in ["x-upload-address", "x-upload-expiry", "x-upload-token", "x-upload-signature", "x-upload-sha256"] {
         if req.headers.iter().filter(|(k,_)| k == name).count() > 1 {
             return Err((401, "duplicate upload authorization header".into()));
         }
+    }
+    // an explicitly declared smart-account upload is decided ONLY by the account (never falls back to another scheme)
+    if req.header("x-upload-scheme").is_some() {
+        let claim = crate::account_upload::parse(cfg.contract_wallets.as_ref(), &cfg.wallet_audience, req, now_secs())?;
+        let (Some(acfg), Some(sh)) = (cfg.contract_wallets.as_ref(), shared) else {
+            return Err((401, "smart-account uploads are not available on this route".into()));
+        };
+        crate::account_upload::verify(acfg, &claim, &mut sh.borrow_mut().account_guard, &mut crate::account_upload::NetReaders)?;
+        return Ok(Some(AuthHdrs { address: claim.account, expiry: claim.expiry, token: String::new(), wallet_body: Some((claim.hash, claim.size)) }));
     }
     let wallet_attempt = req.header("x-upload-signature").is_some() || req.header("x-upload-sha256").is_some();
     // The generic route accepts only deployment- and path-bound signatures.
@@ -323,8 +344,34 @@ pub fn cors(resp: Response, req: &Request, cfg: &UploadCfg) -> Response {
         .with("access-control-allow-methods", "POST, OPTIONS")
         .with(
             "access-control-allow-headers",
-            "content-type, x-upload-address, x-upload-expiry, x-upload-token, x-upload-signature, x-upload-sha256",
+            "content-type, x-upload-address, x-upload-expiry, x-upload-token, x-upload-signature, x-upload-sha256, x-upload-scheme, x-upload-nonce",
         )
+}
+
+/// The gateway's CORS: a configured browser origin (exactly; no fallback, no `*`, no credentials) may READ the public,
+/// content-addressed bytes - the dashboard's exact-byte readback after an upload, and its read of committed startup
+/// settings, both send `range` and `cache-control` and read `content-range`. Nothing here authorizes anything.
+pub fn gateway_cors(req: &Request, cfg: &UploadCfg) -> Vec<(String, String)> {
+    let origin = req.header("origin").unwrap_or("").trim_end_matches('/');
+    if origin.is_empty() || !cfg.allow_origins.iter().any(|o| o.as_str() == origin) {
+        return Vec::new();
+    }
+    vec![
+        ("access-control-allow-origin".into(), origin.to_string()),
+        ("vary".into(), "Origin".into()),
+        ("access-control-expose-headers".into(), "content-range, content-length, etag".into()),
+    ]
+}
+
+/// The preflight for a gateway read (OPTIONS /ipfs/...).
+pub fn gateway_preflight(req: &Request, cfg: Option<&UploadCfg>) -> Response {
+    let mut resp = Response::new(204, "No Content");
+    let cors = cfg.map(|c| gateway_cors(req, c)).unwrap_or_default();
+    if !cors.is_empty() {
+        resp.headers.extend(cors);
+        resp = resp.with("access-control-allow-methods", "GET, HEAD, OPTIONS").with("access-control-allow-headers", "range, cache-control");
+    }
+    resp
 }
 
 // ---- pinning ----------------------------------------------------------------
@@ -393,7 +440,7 @@ fn gate_buffered<'a>(
     if req.body.len() > cap {
         return Err((413, format!("too large (max {cap} bytes)")));
     }
-    let auth = precheck(cfg, req)?;
+    let auth = precheck_with(cfg, req, Some(&app.upload_shared))?;
     if let Some(a) = &auth {
         let hash = hex_of(&Sha256::digest(&req.body));
         verify_body(a, &cfg.upload_key, &hash, req.body.len() as u64)?;
@@ -523,7 +570,7 @@ fn add_stream(app: &mut App, srv: &mut Server, conn: usize, req: &Request, wasm:
     if declared > max_bytes {
         return refuse(srv, conn, req, cfg, 413, &format!("too large (max {max_bytes} bytes)"));
     }
-    let auth = match precheck(cfg, req) {
+    let auth = match precheck_with(cfg, req, Some(&app.upload_shared)) {
         Err((code, msg)) => return refuse(srv, conn, req, cfg, code, &msg),
         Ok(a) => a,
     };
@@ -826,7 +873,7 @@ mod auth_tests {
     use k256::ecdsa::SigningKey;
     use sha3::Keccak256;
     fn cfg() -> UploadCfg {
-        UploadCfg { upload_key: String::new(), wallet_audience: format!("0x{}", "ab".repeat(32)), allow_unsigned: false, allow_origins: vec![], max_wasm: 1024, max_file: 1024, max_image: 1024, max_json: 1024, per_addr_daily: 1024, global_daily: 4096, json_per_ip_hourly: 60.0 }
+        UploadCfg { upload_key: String::new(), wallet_audience: format!("0x{}", "ab".repeat(32)), allow_unsigned: false, allow_origins: vec![], max_wasm: 1024, max_file: 1024, max_image: 1024, max_json: 1024, per_addr_daily: 1024, global_daily: 4096, json_per_ip_hourly: 60.0, contract_wallets: None }
     }
     fn request(c: &UploadCfg, expiry: u64) -> Request { request_for(c, expiry, "/add-json") }
     fn request_for(c: &UploadCfg, expiry: u64, path: &str) -> Request {
@@ -839,6 +886,27 @@ mod auth_tests {
         let (sig, rec) = key.sign_prehash_recoverable(&h.finalize()).unwrap();
         let signature = format!("0x{}{:02x}",hex_of(&sig.to_bytes()),rec.to_byte()+27);
         Request { method:"POST".into(),path:path.into(),query:String::new(),body:b"{}".to_vec(),stream_len:None,headers:vec![("content-length".into(),"2".into()),("x-upload-address".into(),address.into()),("x-upload-expiry".into(),expiry.to_string()),("x-upload-sha256".into(),hash),("x-upload-signature".into(),signature)] }
+    }
+    #[test]
+    fn gateway_reads_are_open_only_to_configured_origins() {
+        let mut c = cfg();
+        c.allow_origins = vec!["https://dash.example".into(), "http://localhost:5173".into()];
+        let get = |origin: Option<&str>, method: &str| Request { method: method.into(), path: "/ipfs/bafkreia".into(), query: String::new(), body: Vec::new(), stream_len: None,
+            headers: origin.map(|o| vec![("origin".to_string(), o.to_string())]).unwrap_or_default() };
+        let h = gateway_cors(&get(Some("https://dash.example/"), "GET"), &c);
+        let find = |h: &Vec<(String, String)>, k: &str| h.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(find(&h, "access-control-allow-origin").as_deref(), Some("https://dash.example"));
+        assert!(find(&h, "access-control-expose-headers").unwrap().contains("content-range"));
+        assert!(h.iter().all(|(k, _)| k != "access-control-allow-credentials"));
+        // no fallback to the first origin (unlike the upload preflight), and nothing without an Origin
+        assert!(gateway_cors(&get(Some("https://evil.example"), "GET"), &c).is_empty());
+        assert!(gateway_cors(&get(None, "GET"), &c).is_empty());
+        let p = gateway_preflight(&get(Some("http://localhost:5173"), "OPTIONS"), Some(&c));
+        assert_eq!(p.status, 204);
+        assert_eq!(find(&p.headers, "access-control-allow-headers").as_deref(), Some("range, cache-control"));
+        assert_eq!(find(&p.headers, "access-control-allow-methods").as_deref(), Some("GET, HEAD, OPTIONS"));
+        assert!(gateway_preflight(&get(Some("https://evil.example"), "OPTIONS"), Some(&c)).headers.iter().all(|(k, _)| !k.starts_with("access-control")));
+        assert!(gateway_preflight(&get(Some("https://dash.example"), "OPTIONS"), None).headers.iter().all(|(k, _)| !k.starts_with("access-control")));
     }
     #[test]
     fn direct_upload_needs_no_relay_secret_and_binds_final_bytes() {

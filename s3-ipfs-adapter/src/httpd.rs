@@ -168,6 +168,9 @@ pub struct Server {
     app: &'static str,
     started: Instant,
     pump_cursor: usize,
+    /// Headers added to the next response this server writes (set by a route around a synchronous handler, cleared
+    /// by it afterwards): the gateway's CORS for configured browser origins.
+    pub next_extra: Vec<(String, String)>,
 }
 
 /// `ENCLAVE_PORTS=http:8000=18321,tcp:7777=18322` → the actual port to bind.
@@ -201,7 +204,7 @@ impl Server {
             .set_nonblocking(true)
             .expect("non-blocking listener");
         println!("[{app}] listening on 127.0.0.1:{port}");
-        Server { listener, conns: Vec::new(), app, started: Instant::now(), pump_cursor: 0 }
+        Server { listener, conns: Vec::new(), app, started: Instant::now(), pump_cursor: 0, next_extra: Vec::new() }
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -421,7 +424,8 @@ impl Server {
         };
     }
 
-    pub fn respond(&mut self, key: usize, resp: Response) {
+    pub fn respond(&mut self, key: usize, mut resp: Response) {
+        resp.headers.extend(std::mem::take(&mut self.next_extra));
         let Some(conn) = self.conns.get_mut(key) else { return };
         // Answering a streaming-route request WITHOUT consuming its body:
         // the engine will not resynchronize past an unread body, so the
@@ -449,6 +453,7 @@ impl Server {
         head_only: bool,
         src: Box<dyn Body>,
     ) {
+        resp.headers.extend(std::mem::take(&mut self.next_extra));
         let Some(conn) = self.conns.get_mut(key) else { return };
         let chunked = len.is_none();
         let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
