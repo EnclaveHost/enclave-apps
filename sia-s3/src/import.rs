@@ -6,15 +6,21 @@
 //! paying for a full one. Objects are pinned per batch with the same metadata
 //! the server writes, so a running sia-s3 sees them after its next index load.
 //! Keys already present with the same size are skipped: re-running resumes.
+//!
+//! With several indexers configured, run it once per replica (`sia-s3 import
+//! <bucket> <manifest> <replica>`) with the same `SIAS3_IMPORT_VERSION_MS`: each
+//! key's version is then identical on every replica (clock from that variable,
+//! write id from the key and its content), so repair has nothing to copy.
 
 use std::time::Instant;
 
 use md5::{Digest, Md5};
 use serde::Deserialize;
+use sha2::Sha256;
 use sia_storage::{PackedUploadOptions, Sdk};
 use tokio::io::AsyncWriteExt;
 
-use crate::store::{Entry, Meta, Store};
+use crate::store::{Entry, Store};
 
 #[derive(Deserialize, Clone)]
 struct Item {
@@ -63,7 +69,22 @@ async fn fetch(client: &reqwest_wasi::Client, item: &Item, mut w: tokio::io::Dup
     Ok(hex::encode(md5.finalize()))
 }
 
+/// The write id of an imported key: the same key with the same content gets the same id on every replica.
+fn import_wid(bucket: &str, key: &str, etag: &str, size: u64) -> String {
+    let mut h = Sha256::new();
+    for part in [bucket.as_bytes(), key.as_bytes(), etag.as_bytes(), &size.to_be_bytes()] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    hex::encode(&h.finalize()[..8])
+}
+
 pub async fn run(sdk: Sdk, bucket: String, manifest: String) -> Result<(), String> {
+    let version_ms: u64 = match std::env::var("SIAS3_IMPORT_VERSION_MS") {
+        Ok(v) => v.parse().map_err(|_| "SIAS3_IMPORT_VERSION_MS must be milliseconds since 1970")?,
+        Err(_) => chrono::Utc::now().timestamp_millis() as u64,
+    };
+    eprintln!("[import] version clock {version_ms} (set SIAS3_IMPORT_VERSION_MS to this for the other replicas)");
     let items: Vec<Item> = serde_json::from_slice(&std::fs::read(&manifest).map_err(|e| format!("{manifest}: {e}"))?)
         .map_err(|e| format!("manifest: {e}"))?;
     let store = Store::load(sdk, 0).await?;
@@ -121,16 +142,13 @@ pub async fn run(sdk: Sdk, bucket: String, manifest: String) -> Result<(), Strin
         if objs.len() != batch.len() {
             return Err(format!("packed upload returned {} objects for {}", objs.len(), batch.len()));
         }
-        let now = chrono::Utc::now().timestamp();
-        for ((item, etag), mut obj) in batch.iter().zip(etags).zip(objs) {
-            let meta = Meta {
-                v: 1,
-                p: true,
-                e: vec![Entry { b: bucket.clone(), k: item.key.clone(), s: item.size, t: etag, m: now, c: None, x: vec![] }],
-                mp: None,
-            };
-            obj.metadata = serde_json::to_vec(&meta).map_err(|e| e.to_string())?;
-            store.sdk.pin_object(&obj).await.map_err(|e| format!("{}: pin: {e}", item.key))?;
+        let m = (version_ms / 1000) as i64;
+        for ((item, etag), obj) in batch.iter().zip(etags).zip(objs) {
+            let i = import_wid(&bucket, &item.key, &etag, item.size);
+            let entry = Entry { b: bucket.clone(), k: item.key.clone(), s: item.size, t: etag, m, c: None, x: vec![], h: version_ms, i };
+            // the same placement rules as the server: inline, or a manifest for a key too long for metadata
+            let placement = store.stage_put(&obj, &entry).await.map_err(|e| format!("{}: {e}", item.key))?;
+            store.commit_put(obj, placement, entry, true).await.map_err(|e| format!("{}: pin: {e}", item.key))?;
             done += 1;
             done_bytes += item.size;
         }
@@ -145,4 +163,19 @@ pub async fn run(sdk: Sdk, bucket: String, manifest: String) -> Result<(), Strin
     }
     eprintln!("[import] done: {done} objects in {:.0}s", started.elapsed().as_secs_f64());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::import_wid;
+
+    #[test]
+    fn import_write_ids_depend_only_on_the_key_and_its_content() {
+        let a = import_wid("ipfs", "pins/x", "abc", 3);
+        assert_eq!(a, import_wid("ipfs", "pins/x", "abc", 3));
+        assert_eq!(a.len(), 16);
+        for other in [import_wid("ipfs", "pins/y", "abc", 3), import_wid("ipfs", "pins/x", "abd", 3), import_wid("ipfs", "pins/x", "abc", 4), import_wid("ipfspins/", "x", "abc", 3)] {
+            assert_ne!(a, other);
+        }
+    }
 }

@@ -7,15 +7,16 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::http::{Request, write_head};
+use crate::replica::Cluster;
 use crate::sigv4::{self, Verdict, percent_decode};
-use crate::store::{Cond, Store};
+use crate::store::Cond;
 
 pub struct App {
-    pub store: std::cell::RefCell<Option<Rc<Store>>>,
+    /// the indexers this app's data is replicated across (one for a 0.1.x config)
+    pub cluster: Rc<Cluster>,
     pub buckets: Vec<String>,
     pub credentials: Vec<(String, String)>,
     pub region: String,
-    pub indexer: String,
     pub boot_error: std::cell::RefCell<Option<String>>,
 }
 
@@ -67,7 +68,12 @@ fn store_err(e: String, resource: &str) -> Resp {
         "NoSuchKey" => err(404, "NoSuchKey", "The specified key does not exist.", resource),
         "NoSuchUpload" => err(404, "NoSuchUpload", "The specified upload does not exist.", resource),
         "PreconditionFailed" => err(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", resource),
-        "InvalidPart" | "InvalidPartOrder" => err(400, code, &e, resource),
+        "InvalidPart" | "InvalidPartOrder" | "EntityTooLarge" => err(400, code, &e, resource),
+        // a write quorum of indexers did not take the request (replica.rs)
+        "ServiceUnavailable" => {
+            eprintln!("[sia-s3] {resource}: {e}");
+            err(503, "ServiceUnavailable", &e, resource)
+        }
         _ => {
             eprintln!("[sia-s3] {resource}: {e}");
             err(500, "InternalError", &e, resource)
@@ -138,10 +144,11 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
         Verdict::Ok => {}
         Verdict::Denied(code, msg) => return send(w, err(403, code, &msg, &resource), ka).await,
     }
-    let Some(store) = app.store.borrow().clone() else {
+    let store = app.cluster.clone();
+    if !store.ready() {
         let msg = app.boot_error.borrow().clone().unwrap_or_else(|| "index is loading".into());
         return send(w, err(503, "SlowDown", &msg, &resource), ka).await;
-    };
+    }
 
     let q = sigv4::parse_query(&req.query);
     let qv = |k: &str| q.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
@@ -151,7 +158,13 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
     if req.path == "/" && has("sia-diag") && req.method == "GET" {
         let limit = qv("limit").and_then(|v| v.parse().ok()).unwrap_or(60);
         let secs = qv("timeout").and_then(|v| v.parse().ok()).unwrap_or(30);
-        let body = crate::diag::run(&store, limit, secs).await;
+        // ?replica=<name> picks the indexer whose hosts are probed (default: the first loaded one)
+        let loaded = store.loaded();
+        let pick = loaded.iter().find(|(i, _)| qv("replica").is_none_or(|n| store.replicas[*i].name == n));
+        let body = match pick {
+            Some((_, s)) => crate::diag::run(s, limit, secs).await,
+            None => serde_json::json!({ "error": "no such loaded replica" }).to_string(),
+        };
         let r = Resp { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: body.into_bytes() };
         return send(w, r, ka).await;
     }
@@ -238,11 +251,13 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
             send(w, r, ka).await
         }
         "POST" if has("uploads") => {
-            let uid = store.create_upload(&bucket, &key).await;
-            let r = xml(200, format!(
-                "<InitiateMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><UploadId>{uid}</UploadId></InitiateMultipartUploadResult>",
-                xml_escape(&bucket), xml_escape(&key)
-            ));
+            let r = match store.create_upload(&bucket, &key).await {
+                Ok(uid) => xml(200, format!(
+                    "<InitiateMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><UploadId>{uid}</UploadId></InitiateMultipartUploadResult>",
+                    xml_escape(&bucket), xml_escape(&key)
+                )),
+                Err(e) => store_err(e, &resource),
+            };
             send(w, r, ka).await
         }
         "POST" if has("uploadId") => {
@@ -287,12 +302,12 @@ pub async fn handle(app: &App, req: &Request, w: &mut TcpStream) -> std::io::Res
 /// A single PUT too large to buffer: the body goes from the socket through a pipe into the Sia upload as it arrives,
 /// hashed on the way (MD5 = the ETag, SHA-256 = the signed payload hash, checked before anything is committed).
 #[allow(clippy::too_many_arguments)]
-async fn put_streamed(store: &Store, req: &Request, b: &str, k: &str, ct: Option<String>, cond: &Cond, rest: u64, w: &mut TcpStream) -> Resp {
+async fn put_streamed(store: &Cluster, req: &Request, b: &str, k: &str, ct: Option<String>, cond: &Cond, rest: u64, w: &mut TcpStream) -> Resp {
     use md5::{Digest as _, Md5};
     use sha2::Sha256;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let resource = req.path.clone();
-    if let Err(e) = store.check(b, k, cond).await {
+    if let Err(e) = store.check(b, k, cond) {
         return store_err(e, &resource);
     }
     let size = req.body.len() as u64 + rest;
@@ -319,23 +334,23 @@ async fn put_streamed(store: &Store, req: &Request, b: &str, k: &str, ct: Option
         tx.shutdown().await?;
         Ok::<_, std::io::Error>((hex::encode(md5.finalize()), hex::encode(sha2::Digest::finalize(sha))))
     };
-    let (hashes, obj) = tokio::join!(pump, store.upload_reader(rx));
-    let obj = match obj {
+    let (hashes, staged) = tokio::join!(pump, store.upload_reader(rx));
+    let staged = match staged {
         Ok(o) => o,
         Err(e) => return store_err(e, &resource),
     };
     let (etag, sha) = match hashes {
         Ok(h) => h,
         Err(e) => {
-            store.discard(&obj).await;
+            store.discard(staged).await;
             return err(400, "IncompleteBody", &e.to_string(), &resource);
         }
     };
     if want_sha.is_some_and(|w| w != sha) {
-        store.discard(&obj).await;
+        store.discard(staged).await;
         return err(400, "XAmzContentSHA256Mismatch", "body does not match x-amz-content-sha256", &resource);
     }
-    match store.commit(b, k, obj, etag.clone(), size, ct, cond).await {
+    match store.commit(b, k, staged, etag.clone(), size, ct, cond).await {
         Ok(()) => Resp { status: 200, headers: vec![("ETag".into(), format!("\"{etag}\""))], body: vec![] },
         Err(e) => store_err(e, &resource),
     }
@@ -349,79 +364,69 @@ async fn send(w: &mut TcpStream, r: Resp, ka: bool) -> std::io::Result<()> {
     w.flush().await
 }
 
-async fn get(store: &Store, req: &Request, bucket: &str, key: &str, w: &mut TcpStream) -> std::io::Result<()> {
+async fn get(store: &Cluster, req: &Request, bucket: &str, key: &str, w: &mut TcpStream) -> std::io::Result<()> {
     let ka = req.keep_alive;
     let resource = req.path.clone();
-    let (entry, segs, range) = {
-        let idx = store.idx.lock().await;
-        let Some(k) = idx.keys.get(&(bucket.to_string(), key.to_string())) else {
-            let r = if req.method == "HEAD" { empty(404) } else { err(404, "NoSuchKey", "The specified key does not exist.", &resource) };
-            return send(w, r, ka).await;
-        };
-        let size = k.entry.s;
-        // conditional reads: a resumed range must not stitch two versions together
-        let tag_matches = |h: &str| h.split(',').map(|t| t.trim().trim_start_matches("W/").trim_matches('"')).any(|t| t == "*" || t == k.entry.t);
-        if req.header("if-match").is_some_and(|h| !tag_matches(h)) {
-            return send(w, err(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", &resource), ka).await;
-        }
-        if req.header("if-none-match").is_some_and(tag_matches) {
-            let r = Resp { status: 304, headers: vec![("ETag".into(), format!("\"{}\"", k.entry.t))], body: vec![] };
-            return send(w, r, ka).await;
-        }
-        let range = match parse_range(req.header("range"), size) {
-            Ok(r) => r,
-            Err(()) => {
-                let mut r = err(416, "InvalidRange", "The requested range is not satisfiable", &resource);
-                r.headers.push(("Content-Range".into(), format!("bytes */{size}")));
-                return send(w, r, ka).await;
-            }
-        };
-        let (start, len) = match range {
-            Some((a, b)) => (a, b - a + 1),
-            None => (0, size),
-        };
-        let segs = if req.method == "HEAD" { Ok(vec![]) } else { idx.segments(k, start, len) };
-        (k.entry.clone(), segs, range)
+    let Some(entry) = store.lookup(bucket, key) else {
+        let r = if req.method == "HEAD" { empty(404) } else { err(404, "NoSuchKey", "The specified key does not exist.", &resource) };
+        return send(w, r, ka).await;
     };
-    let segs = match segs {
-        Ok(s) => s,
-        Err(e) => return send(w, store_err(e, &resource), ka).await,
+    let size = entry.s;
+    // conditional reads: a resumed range must not stitch two versions together
+    let tag_matches = |h: &str| h.split(',').map(|t| t.trim().trim_start_matches("W/").trim_matches('"')).any(|t| t == "*" || t == entry.t);
+    if req.header("if-match").is_some_and(|h| !tag_matches(h)) {
+        return send(w, err(412, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold", &resource), ka).await;
+    }
+    if req.header("if-none-match").is_some_and(tag_matches) {
+        let r = Resp { status: 304, headers: vec![("ETag".into(), format!("\"{}\"", entry.t))], body: vec![] };
+        return send(w, r, ka).await;
+    }
+    let range = match parse_range(req.header("range"), size) {
+        Ok(r) => r,
+        Err(()) => {
+            let mut r = err(416, "InvalidRange", "The requested range is not satisfiable", &resource);
+            r.headers.push(("Content-Range".into(), format!("bytes */{size}")));
+            return send(w, r, ka).await;
+        }
     };
+    let (start, len) = match range {
+        Some((a, b)) => (a, b - a + 1),
+        None => (0, size),
+    };
+    if req.method != "HEAD" {
+        if let Err(e) = store.servable(&entry, start, len).await {
+            return send(w, store_err(e, &resource), ka).await;
+        }
+    }
     let mut headers = vec![
         ("ETag".to_string(), format!("\"{}\"", entry.t)),
         ("Last-Modified".to_string(), http_date(entry.m)),
         ("Accept-Ranges".to_string(), "bytes".to_string()),
         ("Content-Type".to_string(), entry.c.clone().unwrap_or_else(|| "application/octet-stream".into())),
     ];
-    let (status, len) = match range {
+    let status = match range {
         Some((a, b)) => {
             headers.push(("Content-Range".into(), format!("bytes {a}-{b}/{}", entry.s)));
-            (206, b - a + 1)
+            206
         }
-        None => (200, entry.s),
+        None => 200,
     };
     write_head(w, status, &headers, len, ka).await?;
     if req.method == "HEAD" {
         return w.flush().await;
     }
-    let mut sent = 0u64;
-    for (obj, off, n) in segs {
-        match store.read_into(&obj, off, n, w).await {
-            Ok(c) => sent += c,
-            Err(e) => {
-                // the head is already out: the only honest signal left is a short body
-                eprintln!("[sia-s3] GET {resource}: download failed after {sent} bytes: {e}");
-                return Err(std::io::Error::other(e));
-            }
+    // every replica holding this exact version is tried in turn, resuming where the last one stopped
+    match store.read(&entry, start, len, w).await {
+        Ok(_) => w.flush().await,
+        Err(e) => {
+            // the head is already out: the only honest signal left is a short body
+            eprintln!("[sia-s3] GET {resource}: download failed: {e}");
+            Err(std::io::Error::other(e))
         }
     }
-    if sent != len {
-        return Err(std::io::Error::other(format!("short body {sent}/{len}")));
-    }
-    w.flush().await
 }
 
-async fn list(store: &Store, bucket: &str, q: &[(String, String)]) -> Resp {
+async fn list(store: &Cluster, bucket: &str, q: &[(String, String)]) -> Resp {
     let qv = |k: &str| q.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
     let v2 = qv("list-type").as_deref() == Some("2");
     let prefix = qv("prefix").unwrap_or_default();
@@ -434,14 +439,14 @@ async fn list(store: &Store, bucket: &str, q: &[(String, String)]) -> Resp {
     }
     .unwrap_or_default();
 
-    let idx = store.idx.lock().await;
+    let view = store.view.borrow();
     let lo = (bucket.to_string(), if after > prefix { after.clone() } else { prefix.clone() });
     let mut contents = String::new();
     let mut prefixes: Vec<String> = Vec::new();
     let mut count = 0;
     let mut last = String::new();
     let mut truncated = false;
-    for ((b, k), key) in idx.keys.range(lo..) {
+    for ((b, k), entry) in view.keys.range(lo..) {
         if b != bucket || !k.starts_with(&prefix) {
             break;
         }
@@ -466,9 +471,9 @@ async fn list(store: &Store, bucket: &str, q: &[(String, String)]) -> Resp {
         contents.push_str(&format!(
             "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
             xml_escape(k),
-            iso_date(key.entry.m),
-            key.entry.t,
-            key.entry.s
+            iso_date(entry.m),
+            entry.t,
+            entry.s
         ));
         count += 1;
         last = k.clone();
@@ -499,18 +504,18 @@ async fn list(store: &Store, bucket: &str, q: &[(String, String)]) -> Resp {
     xml(200, body)
 }
 
-async fn list_uploads(store: &Store, bucket: &str) -> Resp {
-    let idx = store.idx.lock().await;
-    let ups: String = idx
-        .uploads
-        .iter()
-        .filter(|(_, u)| u.b == bucket)
-        .map(|(id, u)| format!("<Upload><Key>{}</Key><UploadId>{id}</UploadId><Initiated>{}</Initiated></Upload>", xml_escape(&u.k), iso_date(u.started)))
+async fn list_uploads(store: &Cluster, bucket: &str) -> Resp {
+    let ups: String = store
+        .uploads()
+        .await
+        .into_iter()
+        .filter(|(_, b, _, _)| b == bucket)
+        .map(|(id, _, k, started)| format!("<Upload><Key>{}</Key><UploadId>{id}</UploadId><Initiated>{}</Initiated></Upload>", xml_escape(&k), iso_date(started)))
         .collect();
     xml(200, format!("<ListMultipartUploadsResult><Bucket>{}</Bucket><IsTruncated>false</IsTruncated>{ups}</ListMultipartUploadsResult>", xml_escape(bucket)))
 }
 
-async fn delete_many(store: &Store, bucket: &str, body: &[u8]) -> Resp {
+async fn delete_many(store: &Cluster, bucket: &str, body: &[u8]) -> Resp {
     let body = String::from_utf8_lossy(body).to_string();
     let quiet = tag_values(&body, "Quiet").first().is_some_and(|q| q == "true");
     let mut out = String::new();
@@ -519,7 +524,10 @@ async fn delete_many(store: &Store, bucket: &str, body: &[u8]) -> Resp {
         match store.delete(bucket, &k).await {
             Ok(()) if !quiet => out.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(&k))),
             Ok(()) => {}
-            Err(e) => out.push_str(&format!("<Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>", xml_escape(&k), xml_escape(&e))),
+            Err(e) => {
+                let code = if e.starts_with("ServiceUnavailable") { "ServiceUnavailable" } else { "InternalError" };
+                out.push_str(&format!("<Error><Key>{}</Key><Code>{code}</Code><Message>{}</Message></Error>", xml_escape(&k), xml_escape(&e)))
+            }
         }
     }
     xml(200, format!("<DeleteResult>{out}</DeleteResult>"))
@@ -552,33 +560,42 @@ async fn page(app: &App, path: &str) -> Option<Resp> {
         )),
         "/logo.svg" | "/favicon.ico" => Some(typed("image/svg+xml", LOGO.as_bytes().to_vec(), &[])),
         "/api/status" => {
-            let store = app.store.borrow().clone();
+            let c = app.cluster.clone();
+            let ready = c.ready();
             let mut v = serde_json::json!({
                 "app": "sia-s3",
                 "version": env!("CARGO_PKG_VERSION"),
-                "indexer": app.indexer,
+                "indexer": c.replicas.iter().map(|r| r.indexer.as_str()).collect::<Vec<_>>().join(", "),
                 "region": app.region,
-                "ready": store.is_some(),
+                "ready": ready,
                 "bootError": *app.boot_error.borrow(),
+                "writeQuorum": c.write_quorum,
+                "readQuorum": c.read_quorum(),
+                "replicas": c.replica_status().await,
             });
-            if let Some(s) = store {
-                let idx = s.idx.lock().await;
-                let buckets: Vec<_> = app
-                    .buckets
-                    .iter()
-                    .map(|b| {
-                        let (n, bytes) = idx
-                            .keys
-                            .range((b.clone(), String::new())..)
-                            .take_while(|((kb, _), _)| kb == b)
-                            .fold((0u64, 0u64), |(n, t), (_, k)| (n + 1, t + k.entry.s));
-                        serde_json::json!({ "name": b, "keys": n, "bytes": bytes })
-                    })
-                    .collect();
+            if ready {
+                let buckets: Vec<_> = {
+                    let view = c.view.borrow();
+                    app.buckets
+                        .iter()
+                        .map(|b| {
+                            let (n, bytes) = view
+                                .keys
+                                .range((b.clone(), String::new())..)
+                                .take_while(|((kb, _), _)| kb == b)
+                                .fold((0u64, 0u64), |(n, t), (_, e)| (n + 1, t + e.s));
+                            serde_json::json!({ "name": b, "keys": n, "bytes": bytes })
+                        })
+                        .collect()
+                };
                 v["buckets"] = serde_json::json!(buckets);
-                v["objects"] = serde_json::json!(idx.objs.len());
-                v["openUploads"] = serde_json::json!(idx.uploads.len());
-                v["compactor"] = serde_json::json!(*s.stats.borrow());
+                let mut objects = 0;
+                for (_, s) in c.loaded() {
+                    objects += s.idx.lock().await.objs.len();
+                }
+                v["objects"] = serde_json::json!(objects);
+                v["openUploads"] = serde_json::json!(c.uploads().await.len());
+                v["replication"] = serde_json::json!(*c.stats.borrow());
             } else {
                 v["buckets"] = serde_json::json!(app.buckets.iter().map(|b| serde_json::json!({ "name": b })).collect::<Vec<_>>());
             }
@@ -589,25 +606,42 @@ async fn page(app: &App, path: &str) -> Option<Resp> {
 }
 
 async fn health(app: &App) -> String {
-    let store = app.store.borrow().clone();
-    match store {
-        None => serde_json::json!({ "app": concat!("sia-s3/", env!("CARGO_PKG_VERSION")), "ready": false, "error": *app.boot_error.borrow() }).to_string(),
-        Some(s) => {
-            let idx = s.idx.lock().await;
-            let unpacked = idx.objs.values().filter(|(o, m)| !m.p && o.size() <= s.compact_max_object).count();
-            serde_json::json!({
-                "app": concat!("sia-s3/", env!("CARGO_PKG_VERSION")),
-                "ready": true,
-                "keys": idx.keys.len(),
-                "objects": idx.objs.len(),
-                "openUploads": idx.uploads.len(),
-                "smallUnpacked": unpacked,
-                "bytes": idx.keys.values().map(|k| k.entry.s).sum::<u64>(),
-                "compactor": *s.stats.borrow(),
-            })
-            .to_string()
-        }
+    let c = app.cluster.clone();
+    if !c.ready() {
+        return serde_json::json!({
+            "app": concat!("sia-s3/", env!("CARGO_PKG_VERSION")),
+            "ready": false,
+            "error": *app.boot_error.borrow(),
+            "replicas": c.replica_status().await,
+        })
+        .to_string();
     }
+    let (mut objects, mut unpacked) = (0, 0);
+    for (_, s) in c.loaded() {
+        let idx = s.idx.lock().await;
+        objects += idx.objs.len();
+        unpacked += idx.objs.values().filter(|(o, m)| !m.p && o.size() <= s.compact_max_object).count();
+    }
+    let (keys, bytes) = {
+        let view = c.view.borrow();
+        (view.keys.len(), view.keys.values().map(|e| e.s).sum::<u64>())
+    };
+    let compactor = c.loaded().first().map(|(_, s)| serde_json::json!(*s.stats.borrow()));
+    serde_json::json!({
+        "app": concat!("sia-s3/", env!("CARGO_PKG_VERSION")),
+        "ready": true,
+        "keys": keys,
+        "objects": objects,
+        "openUploads": c.uploads().await.len(),
+        "smallUnpacked": unpacked,
+        "bytes": bytes,
+        "compactor": compactor,
+        "writeQuorum": c.write_quorum,
+        "readQuorum": c.read_quorum(),
+        "replication": *c.stats.borrow(),
+        "replicas": c.replica_status().await,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
