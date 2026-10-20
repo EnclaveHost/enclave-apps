@@ -7,7 +7,24 @@ use crate::rhp4::{Client, mock};
 use crate::time::Duration;
 use crate::{AppKey, BuilderError, Host, Sdk, SharedSdk, SharingKey, app_client};
 
-/// An in-memory Sia network: a mock indexer paired with a mock host transport.
+/// A fault injected into one indexer call (see [`MockNetwork::push_fault`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Fault {
+    /// The indexer applies the call, but the response is lost: the caller sees an error.
+    ApplyThenFail,
+    /// The call never answers and never takes effect.
+    Hang,
+    /// The call never answers, but the indexer applies it after this delay, as a
+    /// request a client gave up on can still be carried out.
+    ApplyLate(std::time::Duration),
+    /// The call never answers; the indexer applies it whenever the test calls
+    /// [`MockNetwork::apply_deferred`] (after any number of listings, restarts
+    /// or deadlines: no timing assumption).
+    Defer,
+}
+
+/// A mock Sia network: a mock indexer paired with a mock host transport, whose
+/// sectors live in memory (the default) or, with [`MockNetwork::with_disk_sectors`], on disk.
 ///
 /// [`MockNetwork::sdk`] builds a real [`Sdk`] against them, so tests drive the
 /// same public API an application uses rather than a parallel mock surface.
@@ -22,6 +39,34 @@ impl MockNetwork {
             api: app_client::mock::Client::new(),
             transport: mock::Client::new(),
         }
+    }
+
+    /// As [`MockNetwork::new`], but the mock hosts keep their sectors in files
+    /// under a fresh, uniquely named directory created inside `base`, instead
+    /// of in RAM, and hold at most `limit` bytes. Everything else - the real
+    /// encryption, erasure coding and sector roots, faults, slow hosts,
+    /// `clear_sectors` - is unchanged. For tests that write more sectors than
+    /// memory should hold; `base` should be on disk (not tmpfs). The directory
+    /// and its files are removed when the network and every SDK built from it
+    /// are dropped. Native only: there is no filesystem mock on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_disk_sectors(base: &std::path::Path, limit: u64) -> std::io::Result<Self> {
+        Ok(Self {
+            api: app_client::mock::Client::new(),
+            transport: mock::Client::with_disk_sectors(base, limit)?,
+        })
+    }
+
+    /// The directory a disk-backed network keeps its sectors in, if it is one.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sector_dir(&self) -> Option<std::path::PathBuf> {
+        self.transport.sector_dir()
+    }
+
+    /// Bytes of sectors a disk-backed network holds right now, if it is one.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sector_bytes(&self) -> Option<u64> {
+        self.transport.sector_bytes()
     }
 
     /// Adds `n` hosts that are usable for uploads and returns their keys.
@@ -63,6 +108,24 @@ impl MockNetwork {
     /// undownloadable.
     pub fn clear_sectors(&self) {
         self.transport.clear();
+    }
+
+    /// Takes the mock indexer offline (or back online). Hosts keep their
+    /// sectors and the indexer keeps its objects, as across a real outage.
+    pub fn set_indexer_offline(&self, offline: bool) {
+        self.api.set_offline(offline);
+    }
+
+    /// Queues `fault` for the next call of `op` on the mock indexer:
+    /// `"pin_object"` (also object metadata updates), `"delete_object"`, or
+    /// `"pin_slabs"` (the upload path; only [`Fault::Hang`] applies there).
+    pub fn push_fault(&self, op: &'static str, fault: Fault) {
+        self.api.push_fault(op, fault);
+    }
+
+    /// Applies every call held by [`Fault::Defer`], in order; returns how many.
+    pub fn apply_deferred(&self) -> usize {
+        self.api.apply_deferred()
     }
 
     /// The number of slabs currently pinned to the mock indexer.

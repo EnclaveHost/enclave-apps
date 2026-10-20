@@ -8,6 +8,12 @@ object) and stored on independent Sia hosts through an indexer, by default the p
 The key index lives in the objects' own sealed metadata, so the app keeps **no local state**. A restart rebuilds
 the index from the indexer's object feed.
 
+The buckets can also be **replicated across several indexers** (`replicas`, `writeQuorum`), each with its own
+contracts, funding and hosts. Writes then need only a quorum of indexers, a hung indexer delays a write by a grace
+period at most, reads fail over between them, and repair keeps them converged. Whether the indexers are run by
+independent operators is for the deployer to establish. See [REPLICATION.md](REPLICATION.md) for the fault model,
+the guarantees, what remains centralized, and the operator procedures.
+
 ## Config
 
 `ENCLAVE_CONFIG` (or `SIAS3_CONFIG` locally), JSON. `$NAME` string values resolve from the environment, which
@@ -30,6 +36,10 @@ is how deployment secrets arrive:
 - `credentials`: every request must be SigV4-signed with one of these.
 - Optional: `maxBodyBytes` (64 MiB; single PUT / part cap), `compactMaxObjectBytes` (8 MiB),
   `compactEverySecs` (1800).
+- Replication (optional): `replicas` (`[{name, indexer, appKey}]`, or one `$NAME` secret holding that array) in
+  place of `indexer`, plus `writeQuorum` (default: a majority), `repairEverySecs` (300) and `repairMaxBytesPerPass`
+  (1 GiB). Deadlines: `metadataTimeoutSecs` (120), `uploadTimeoutSecs` (1800), `uploadGraceSecs` (30),
+  `metadataGraceSecs` (5), `stallTimeoutSecs` (120). See [REPLICATION.md](REPLICATION.md).
 
 ## S3 surface
 
@@ -42,7 +52,7 @@ Conditional PUT: `If-None-Match: *` (create only) and `If-Match: <etag>` answer 
 when the new object is committed. A single PUT above `maxBodyBytes` (up to 16 GiB) is not buffered: it streams to Sia
 as it arrives, hashed on the way (a short body or a payload-hash mismatch stores nothing).
 Not supported: presigned URLs, aws-chunked streaming uploads, ACLs, versioning, tagging. `GET /healthz` is
-unauthenticated and reports counts only.
+unauthenticated and reports counts and per-indexer state only (never keys or object names).
 
 ## File explorer
 
@@ -63,12 +73,19 @@ cut/copy/paste, rename, move or copy across folders and buckets, recursive delet
 
 ## How keys map to Sia objects
 
-- PUT uploads the body as one Sia object whose metadata names the key, size, ETag (MD5) and mtime.
-- CopyObject adds an entry to the source object's metadata, so no data moves. DELETE removes an entry, and an
-  object left serving nothing is deleted.
+- PUT uploads the body as one Sia object whose metadata names the key, size, ETag (MD5), mtime and a version
+  stamp.
+- CopyObject adds an entry to the source object's metadata, so no data moves.
 - Multipart parts are objects tagged with their upload. Complete writes the key on part 1 and lists the
   other parts in order.
-- The indexer refuses objects without data, so there are no standalone manifest objects.
+- indexd keeps at most 1 KiB of sealed metadata per object. A key whose entry does not fit (more than about a
+  dozen parts, a key near S3's 1 KiB limit, a copy onto a crowded object) gets a **manifest**: a small object
+  whose encrypted body is the entry and part list, and whose signed metadata holds the body's length and SHA-256.
+  Up to 10,000 parts. A manifest costs one more small upload at Complete (or PUT/copy).
+- DELETE turns the entry into a **tombstone** in the same object. Maintenance later records it as a **deletion
+  floor** in a ledger object (also an encrypted body checked against signed metadata), then reclaims the payload.
+  Floors are kept for good (about 80 bytes per deleted key): any older version of the key that shows up later is
+  dead, so a delayed write or replayed data cannot bring a deleted key back.
 
 **Small objects** cost a full slab when uploaded alone (4 MiB sectors on 30 hosts, about 120 MiB of upload
 traffic and paid storage), and a lone small PUT takes on the order of 45 s. The **compactor** repacks
@@ -78,8 +95,11 @@ slabs. Reads are fast (a 1 MB range in about 0.6 s from 30 hosts).
 ## Bulk import
 
 ```bash
-sia-s3 import <bucket> manifest.json   # manifest: [{"key","size","url"}]
+sia-s3 import <bucket> manifest.json [replica]   # manifest: [{"key","size","url"}]
 ```
+
+With several replicas configured, name the replica and run once per replica with the same `SIAS3_IMPORT_VERSION_MS`
+(printed by the first run), so the keys get identical versions everywhere.
 
 The import fetches each URL in 32 MiB ranges, streams it into packed uploads (512 MiB batches), and pins with
 the same metadata the server writes. Re-running skips keys already present with the same size. A running
@@ -127,6 +147,8 @@ sia-s3 recovery export https://your-indexer.example snapshot.json
 sia-s3 recovery read snapshot.json SNAPSHOT_SHA256 ipfs pins/EXPECTED_CID \
   recovered.wasm EXPECTED_FILE_SHA256 EXPECTED_FILE_BYTES
 ```
+
+With replication, export one snapshot per indexer. Each snapshot carries its own replica's host list.
 
 `recovery read` does not load `ENCLAVE_CONFIG`, create an indexer client, list
 remote objects, sweep, compact, upload or update metadata. Its reader contains

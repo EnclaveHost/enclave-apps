@@ -2,9 +2,10 @@
 //!
 //! Data is encrypted and erasure-coded client-side (inside this enclave) by the
 //! Sia SDK and stored on Sia hosts through an indexer (default
-//! https://sia.enclave.host). The S3 key index lives in the objects' own sealed
-//! metadata (see store.rs), so the app keeps no local state: a restart reloads
-//! the index from the indexer's object feed.
+//! https://sia.enclave.host), or replicated across several independent indexers
+//! (replica.rs). The S3 key index lives in the objects' own sealed metadata (see
+//! store.rs), so the app keeps no local state: a restart reloads the index from
+//! the indexers' object feeds.
 //!
 //! The one platform rule: read `ENCLAVE_PORTS` and bind the actual port.
 
@@ -13,6 +14,7 @@ mod recovery;
 mod diag;
 mod http;
 mod import;
+mod replica;
 mod s3;
 mod sigv4;
 mod store;
@@ -20,10 +22,12 @@ mod store;
 use std::rc::Rc;
 use std::time::Duration;
 
-use sia_storage::{AppKey, AppMetadata, Builder, app_id};
+use sia_storage::{AppKey, AppMetadata, Builder, Sdk, app_id};
 use tokio::net::TcpListener;
 
+use crate::config::{Config, ReplicaCfg};
 use crate::http::{ReadError, read_request, write_head};
+use crate::replica::Cluster;
 use crate::s3::App;
 use crate::store::Store;
 
@@ -68,49 +72,89 @@ fn port() -> u16 {
     default
 }
 
-async fn boot(app: Rc<App>, cfg_indexer: String, key: [u8; 32], compact_max: u64, compact_every: u64) {
+async fn connect(r: &ReplicaCfg) -> Result<Sdk, String> {
+    Builder::new(r.indexer.as_str(), META)
+        .map_err(|e| e.to_string())?
+        .connected(&AppKey::import(r.app_key))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("the app key is not authorized on {}", r.indexer))
+}
+
+/// Connect to one indexer and load its index, retrying 5 s → 300 s, then join the cluster. Replicas load
+/// independently: one that is down never holds up the others.
+async fn load_replica(app: Rc<App>, cfg: Rc<Config>, i: usize) {
+    let r = &cfg.replicas[i];
     let mut wait = 5u64;
     let store = loop {
-        let attempt = async {
-            let sdk = Builder::new(cfg_indexer.as_str(), META)
-                .map_err(|e| e.to_string())?
-                .connected(&AppKey::import(key))
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "the app key is not authorized on the indexer".to_string())?;
-            Store::load(sdk, compact_max).await
-        };
-        match attempt.await {
+        match async { Store::load_with(connect(r).await?, cfg.compact_max_object, cfg.opts.clone()).await }.await {
             Ok(s) => break Rc::new(s),
             Err(e) => {
-                eprintln!("[sia-s3] boot: {e}; retrying in {wait}s");
-                *app.boot_error.borrow_mut() = Some(e);
+                eprintln!("[sia-s3] replica {}: boot: {e}; retrying in {wait}s", r.name);
+                *app.cluster.replicas[i].error.borrow_mut() = Some(format!("boot: {e}"));
+                *app.boot_error.borrow_mut() = Some(format!(
+                    "{} of {} replicas needed are loaded ({}: {e})",
+                    app.cluster.loaded().len(),
+                    app.cluster.read_quorum(),
+                    r.name
+                ));
                 tokio::time::sleep(Duration::from_secs(wait)).await;
                 wait = (wait * 2).min(300);
             }
         }
     };
-    *app.boot_error.borrow_mut() = None;
-    *app.store.borrow_mut() = Some(store.clone());
-    eprintln!("[sia-s3] ready");
+    app.cluster.attach(i, store.clone()).await;
+    eprintln!("[sia-s3] replica {} loaded ({}/{} loaded, {} needed)", r.name, app.cluster.loaded().len(), app.cluster.n(), app.cluster.read_quorum());
+    if app.cluster.ready() {
+        *app.boot_error.borrow_mut() = None;
+    }
     store.sweep().await;
+}
+
+async fn boot(app: Rc<App>, cfg: Rc<Config>) {
+    for i in 0..cfg.replicas.len() {
+        tokio::task::spawn_local(load_replica(app.clone(), cfg.clone(), i));
+    }
+    while !app.cluster.ready() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    eprintln!("[sia-s3] ready");
+    // with one indexer too: unknown outcomes are re-read, dead versions purged and tombstones collected
+    tokio::task::spawn_local(repair_loop(app.cluster.clone(), cfg.repair_every_secs, cfg.repair_max_bytes));
 
     loop {
-        tokio::time::sleep(Duration::from_secs(compact_every)).await;
-        match store.compact().await {
-            Ok(n) => {
-                let mut st = store.stats.borrow_mut();
-                st.compactions += 1;
-                st.compacted_objects += n as u64;
-                st.last_compaction = Some(chrono::Utc::now().to_rfc3339());
-                if n > 0 {
-                    eprintln!("[sia-s3] compactor: repacked {n} objects");
+        tokio::time::sleep(Duration::from_secs(cfg.compact_every_secs)).await;
+        for (i, store) in app.cluster.loaded() {
+            match store.compact().await {
+                Ok(n) => {
+                    let mut st = store.stats.borrow_mut();
+                    st.compactions += 1;
+                    st.compacted_objects += n as u64;
+                    st.last_compaction = Some(chrono::Utc::now().to_rfc3339());
+                    if n > 0 {
+                        eprintln!("[sia-s3] compactor ({}): repacked {n} objects", cfg.replicas[i].name);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[sia-s3] compactor ({}): {e}", cfg.replicas[i].name);
+                    store.stats.borrow_mut().last_error = Some(e);
                 }
             }
-            Err(e) => {
-                eprintln!("[sia-s3] compactor: {e}");
-                store.stats.borrow_mut().last_error = Some(e);
-            }
+        }
+    }
+}
+
+/// Re-read ambiguous replicas, bring lagging ones up to the merged view, record deletions as floors everywhere and
+/// reclaim the payload they cover.
+async fn repair_loop(cluster: Rc<Cluster>, every: u64, max_bytes: u64) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(every)).await;
+        let r = cluster.repair(max_bytes).await;
+        if r.reconciled + r.purged + r.copies + r.deletes + r.floors + r.reclaimed + r.merged + r.pending > 0 {
+            eprintln!(
+                "[sia-s3] repair: {} re-read, {} dead versions purged, {} copies, {} deletes, {} floors written, {} tombstones reclaimed, {} ledgers merged, {} pending",
+                r.reconciled, r.purged, r.copies, r.deletes, r.floors, r.reclaimed, r.merged, r.pending
+            );
         }
     }
 }
@@ -163,22 +207,22 @@ fn main() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     let local = tokio::task::LocalSet::new();
 
-    // `sia-s3 import <bucket> <manifest.json>`: bulk-load objects, then exit
+    // `sia-s3 import <bucket> <manifest.json> [replica]`: bulk-load objects into one indexer, then exit
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("import") {
         let (Some(bucket), Some(manifest)) = (args.get(2).cloned(), args.get(3).cloned()) else {
-            eprintln!("usage: sia-s3 import <bucket> <manifest.json>");
+            eprintln!("usage: sia-s3 import <bucket> <manifest.json> [replica name]");
             std::process::exit(2);
         };
-        let res = local.block_on(&rt, async move {
-            let sdk = Builder::new(cfg.indexer.as_str(), META)
-                .map_err(|e| e.to_string())?
-                .connected(&AppKey::import(cfg.app_key))
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("the app key is not authorized on the indexer")?;
-            import::run(sdk, bucket, manifest).await
-        });
+        let Some(r) = cfg.replicas.iter().find(|r| args.get(4).is_none_or(|n| r.name == *n)).cloned() else {
+            eprintln!("[import] no replica named {:?}", args[4]);
+            std::process::exit(2);
+        };
+        if cfg.replicas.len() > 1 && args.get(4).is_none() {
+            eprintln!("[import] {} replicas are configured: name the one to import into (run once per replica)", cfg.replicas.len());
+            std::process::exit(2);
+        }
+        let res = local.block_on(&rt, async move { import::run(connect(&r).await?, bucket, manifest).await });
         if let Err(e) = res {
             eprintln!("[import] FAILED: {e}");
             std::process::exit(1);
@@ -187,12 +231,17 @@ fn main() {
     }
 
     local.block_on(&rt, async move {
+        let cluster = Cluster::new(
+            cfg.replicas.iter().map(|r| (r.name.clone(), r.indexer.clone())).collect(),
+            cfg.write_quorum,
+            cfg.opts.clone(),
+            cfg.timing.clone(),
+        );
         let app = Rc::new(App {
-            store: Default::default(),
+            cluster: Rc::new(cluster),
             buckets: cfg.buckets.clone(),
             credentials: cfg.credentials.clone(),
             region: cfg.region.clone(),
-            indexer: cfg.indexer.clone(),
             boot_error: Default::default(),
         });
         let p = port();
@@ -203,12 +252,18 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        eprintln!("[sia-s3] listening on 127.0.0.1:{p}; indexer {}; buckets {:?}", cfg.indexer, cfg.buckets);
-        tokio::task::spawn_local(boot(app.clone(), cfg.indexer.clone(), cfg.app_key, cfg.compact_max_object, cfg.compact_every_secs));
+        let indexers: Vec<&str> = cfg.replicas.iter().map(|r| r.indexer.as_str()).collect();
+        eprintln!(
+            "[sia-s3] listening on 127.0.0.1:{p}; indexers {indexers:?} (write quorum {}); buckets {:?}",
+            cfg.write_quorum, cfg.buckets
+        );
+        let max_body = cfg.max_body;
+        let cfg = Rc::new(cfg);
+        tokio::task::spawn_local(boot(app.clone(), cfg.clone()));
         loop {
             match listener.accept().await {
                 Ok((s, _)) => {
-                    tokio::task::spawn_local(conn(app.clone(), s, cfg.max_body));
+                    tokio::task::spawn_local(conn(app.clone(), s, max_body));
                 }
                 Err(e) => {
                     eprintln!("[sia-s3] accept: {e}");
