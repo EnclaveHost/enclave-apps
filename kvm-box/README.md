@@ -8,13 +8,25 @@ source checkpoint contains two deployment paths:
 - The native desktop profile in `guest/native/` and `src/bin/shield-desktop.rs`,
   paired with the Enclave platform's dedicated Windows VBS launcher. Its image,
   authenticated volumes, monitor startup and cleanup have been qualified on
-  NucBox. Manager admission, owner release and final masked-GPU acceptance are
-  still being integrated. This path retains the stated operator/hypervisor
+  NucBox. The real manager has launched the signed v9 image with the installed
+  CPU/RAM pool sizes and enforced guest CPU quota; fresh app/host attestation
+  and scoped cleanup passed. Owner release and final desktop acceptance remain.
+  This path retains the stated operator/hypervisor
   trust boundary; it has no verified host-OS-exclusion claim.
 
 The complete app has not yet been published or deployed through the user's
-wallet. The native compute menus remain until compute acceptance is complete.
+wallet. The v9 candidate removes the Shield Compute and Native Shield Compute
+menu entries. Its standard OpenGL/Vulkan interface uses guest CPU Mesa for
+general rendering and supports bounded masked GPU operations; it is not a
+universal GPU renderer. Selected CTS results do not establish conformance or
+Steam game compatibility. The final owner's Moonlight pairing/stream must still
+be verified after provisioning this image.
 Build outputs and owner credentials are kept outside this source checkpoint.
+
+## Original Linux KVM/SNP path
+
+The following broker, build, credential and connector instructions describe the
+original Linux path, not activation of the native Windows profile above.
 
 A separate Wasm app that controls a native x86 Linux desktop through a host-side VM broker. Both the controller and desktop run in separate SEV-SNP guests. The desktop boots directly on KVM virtual CPUs; no RISC-V interpreter or nested KVM is involved.
 
