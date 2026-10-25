@@ -295,3 +295,45 @@ EGL must map the pinned EGL loader; GLX must map the corrected GLX loader. Vulka
 has no GL-loader requirement. Both selected-loader smoke cases pass, and the
 old GLX library is refused by its hash before test execution. Historical
 fixtures retain their exact older lock and runner; do not rewrite their evidence.
+
+
+## Embedded driver in signed v5, 2026-10-25
+
+The GLX fix is now embedded in the immutable v5 root rather than supplied by
+an overlay. The signed IGVM SHA-256 is
+`48d3eb8c97983fc4affebf7e8606c24916fb338c9f2bef86753ee735704843cc`;
+the profile is
+`e000a9577f0686a104494931ec66e41af22d2a0c552232d5fa965721d33a380e`.
+An independent Python cryptography verifier checked its P384/SHA384 signature
+against the reproducible IGVM builder's launch digest and refused an altered
+measurement and wrong hash algorithm.
+
+Separate disposable local KVM runs used the exact v5 root/profile/model media
+and production platform archive. Only test programs and an explicit initializer
+were appended; no driver library was overlaid. GLX and EGL each completed all
+551 selected cases (550 Pass, one unchanged CompatibilityWarning). Vulkan
+completed all 9,300 cases (4,371 Pass, 4,929 reviewed NotSupported). The required
+loader/core-library hashes and process mappings were checked, and Shield
+telemetry stayed unchanged. `allSelectedPassed` remains false for all suites.
+
+The GLX run additionally limited model storage reads to 32 MiB/s. The desktop
+reported running after 78,794 ms, within the 115-second inner startup budget.
+This is one controlled slow-storage check, not general startup reliability.
+The separate masked test verified 4,096 shader outputs and 131,072 MACs in 16
+GPU exchanges. A deliberately corrupted seventeenth reply retired the service;
+subsequent GL/Vulkan attempts failed without another GPU connection, CPU retry,
+readback or later draw. Both graphics windows produced changing pixels, and
+the GLX robustness discovery/context checks passed from the embedded library.
+
+All runs retained desktop UID 1000, zero capabilities, seccomp, no physical GPU
+nodes and sealed controller secrets. Native domains/cgroups and temporary VMs
+were removed. General rendering remains trusted CPU Mesa. These fixtures do
+not qualify owner release, fresh v5 hardware attestation, final CLI/browser/
+Moonlight workloads or production publication. The earlier v4 hardware evidence
+cannot establish the changed v5 measurement.
+
+`native-v5-checkpoint.json` records exact scope, counts and identities. The
+exported `native-graphics-final-v5` evidence directory contains full CTS case
+logs, fixture source, lifecycle results, masked failure evidence and a verified
+hash manifest. Its separate `native-platform-v5-signed-graphics` package retains
+historical export-time pending flags; later qualification is recorded separately.

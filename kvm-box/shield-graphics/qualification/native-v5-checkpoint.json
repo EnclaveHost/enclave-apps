@@ -1,0 +1,70 @@
+{
+  "passed": true,
+  "scope": "Selected native v5 graphics compatibility, embedded GLX discovery, bounded masked GPU integrity and controlled slow-storage startup; no owner release or fresh hardware admission",
+  "candidateImageSha256": "48d3eb8c97983fc4affebf7e8606c24916fb338c9f2bef86753ee735704843cc",
+  "rootPayloadSha256": "b10da6fc8c40f7f065e5ffa2f0840ae9cf62f346d2bcbed0225ec60362888801",
+  "profileSha256": "e000a9577f0686a104494931ec66e41af22d2a0c552232d5fa965721d33a380e",
+  "runtimeId": "f548e338e4e41bb1326693688c7b0067c9f330a24f4a21a61037bd334449c74f",
+  "driverOverlay": false,
+  "suites": {
+    "glx": {
+      "counts": {
+        "Pass": 550,
+        "CompatibilityWarning": 1
+      },
+      "allSelectedPassed": false,
+      "loaderIdentity": {
+        "libGLX_mesa.so.0.0.0": "f4d9469ce85f265504679176fd7000cb4d479513dda5f17ff60d889e0fd6bf94"
+      },
+      "workerTelemetryUnchanged": true,
+      "fixturePassed": true,
+      "seconds": 117.71640120493248
+    },
+    "egl": {
+      "counts": {
+        "Pass": 550,
+        "CompatibilityWarning": 1
+      },
+      "allSelectedPassed": false,
+      "loaderIdentity": {
+        "libEGL_mesa.so.0.0.0": "de08cc8df3680df55e9c1825fc7542fc2158d18e1fd06ec8b9c13f2b8411e1c9"
+      },
+      "workerTelemetryUnchanged": true,
+      "fixturePassed": true,
+      "seconds": 61.93488940107636
+    },
+    "vk": {
+      "counts": {
+        "Pass": 4371,
+        "NotSupported": 4929
+      },
+      "allSelectedPassed": false,
+      "loaderIdentity": {},
+      "workerTelemetryUnchanged": true,
+      "fixturePassed": true,
+      "seconds": 79.9441992091015
+    }
+  },
+  "masked": {
+    "verifiedExchanges": 16,
+    "verifiedMacs": 131072,
+    "shaderComponentsChecked": 4096,
+    "gpuConnections": 17,
+    "corruptReplies": 1,
+    "serviceRetired": true,
+    "postFailureCpuRetry": false
+  },
+  "controlledSlowStorageStartup": {
+    "passed": true,
+    "modelBytesPerSecond": 33554432,
+    "readyMilliseconds": [
+      78794
+    ],
+    "generalStartupReliabilityEstablished": false
+  },
+  "ownerRelease": false,
+  "freshHardwareAttestation": false,
+  "productionAdmission": false,
+  "published": false,
+  "generalGpuRendering": false
+}
