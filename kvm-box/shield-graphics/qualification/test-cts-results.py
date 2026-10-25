@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Negative evidence cases: incomplete CTS logs must not become green checks."""
+import importlib.util
+from pathlib import Path
+import unittest
+
+spec = importlib.util.spec_from_file_location('cts_results', Path(__file__).with_name('cts-results.py'))
+results = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(results)
+
+
+class EvidenceTests(unittest.TestCase):
+    def verdict(self, records=None, **kw):
+        values = dict(expected=['a', 'b'], results=records if records is not None else [
+            {'name': 'a', 'status': 'Pass'}, {'name': 'b', 'status': 'Pass'}],
+            returncode=0, timed_out=False, incomplete=False, mapped=['pinned'], required=['pinned'])
+        values.update(kw)
+        return results.evaluate(**values)
+
+    def test_complete(self):
+        self.assertTrue(self.verdict()['allSelectedPassed'])
+
+    def test_empty_selection(self):
+        self.assertFalse(self.verdict([], expected=[])['allSelectedPassed'])
+
+    def test_lost_last_case(self):
+        v = self.verdict([{'name': 'a', 'status': 'Pass'}])
+        self.assertFalse(v['complete'])
+        self.assertEqual(v['missing'], ['b'])
+
+    def test_duplicate_cannot_replace_missing(self):
+        v = self.verdict([{'name': 'a', 'status': 'Pass'}]*2)
+        self.assertFalse(v['complete'])
+        self.assertEqual(v['duplicates'], ['a'])
+
+    def test_extra_case(self):
+        self.assertFalse(self.verdict(expected=['a'])['complete'])
+
+    def test_unsupported_is_not_pass(self):
+        v = self.verdict([{'name': 'a', 'status': 'Pass'}, {'name': 'b', 'status': 'NotSupported'}])
+        self.assertTrue(v['complete'])
+        self.assertTrue(v['noFailuresWithUnsupported'])
+        self.assertFalse(v['allSelectedPassed'])
+
+    def test_warning_and_failure_not_pass(self):
+        for status in ['Fail', 'QualityWarning', 'CompatibilityWarning', 'Crash', 'InternalError', 'Pending']:
+            with self.subTest(status=status):
+                v = self.verdict([{'name': 'a', 'status': 'Pass'}, {'name': 'b', 'status': status}])
+                self.assertFalse(v['allSelectedPassed'])
+                self.assertFalse(v['noFailuresWithUnsupported'])
+
+    def test_nonzero_timeout_truncation(self):
+        for change in [dict(returncode=1), dict(timed_out=True), dict(incomplete=True)]:
+            with self.subTest(change=change):
+                self.assertFalse(self.verdict(**change)['complete'])
+
+    def test_wrong_driver(self):
+        v = self.verdict(mapped=['host-mesa'])
+        self.assertFalse(v['allSelectedPassed'])
+        self.assertEqual(v['missingLibraries'], ['pinned'])
+
+
+if __name__ == '__main__':
+    unittest.main()

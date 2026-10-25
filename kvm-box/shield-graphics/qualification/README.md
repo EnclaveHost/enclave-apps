@@ -1,5 +1,10 @@
 # Vulkan compute-to-draw qualification
 
+For broader API compatibility checks using the pinned public Khronos suite, see
+[CTS.md](CTS.md). Those selected tests exercise the ordinary CPU fallback and
+are separate from the protected-worker tests below. Passing a subset does not
+establish graphics conformance or GPU acceleration.
+
 This standard Vulkan application submits an integer compute shader, a memory
 barrier, and a draw using the computed buffer as integer vertex attributes.
 It reads back the rendered frame. It has no Shield service calls and never

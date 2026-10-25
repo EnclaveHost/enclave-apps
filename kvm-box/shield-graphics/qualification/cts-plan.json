@@ -1,0 +1,18 @@
+{
+  "gl": {
+    "buffer-storage": "KHR-GL45.buffer_storage.*",
+    "shader-storage": "KHR-GL45.shader_storage_buffer_object.*",
+    "compute": "KHR-GL45.compute_shader.*",
+    "sync": "KHR-GL45.sync.*",
+    "texture-barrier": "KHR-GL45.texture_barrier.*",
+    "direct-state-access": "KHR-GL45.direct_state_access.*"
+  },
+  "vk": {
+    "synchronization": "dEQP-VK.synchronization.basic.*",
+    "synchronization2": "dEQP-VK.synchronization2.basic.*",
+    "depth": "dEQP-VK.pipeline.monolithic.depth.*",
+    "input-assembly": "dEQP-VK.pipeline.monolithic.input_assembly.*",
+    "dynamic-offset": "dEQP-VK.pipeline.monolithic.dynamic_offset.*",
+    "pipeline-cache": "dEQP-VK.pipeline.monolithic.cache.*"
+  }
+}
