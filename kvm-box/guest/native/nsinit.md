@@ -94,3 +94,16 @@ not synthesize X events. A separate actual-kernel negative run refuses startup
 with hidepid=0 before root preparation or any worker probe. Thirteen parser
 cases cover mount-ID selection, aliases, weak options and bypass groups.
 Latest evidence: evidence/native-proc-input.
+
+
+## Separate graphics image
+
+Compile nsinit with `-DKVMBOX_SHIELD_GRAPHICS` only when packaging the new
+measured Mesa prefix at `/opt/shield/mesa`, its runtime dependencies and the
+Lavapipe ICD. This build fixes desktop-launch environment settings to that ICD
+and Zink, with two llvmpipe threads. Ordinary menu/terminal applications inherit
+them; no per-application service API is required. The baseline build remains
+unchanged. These settings choose the implementation, while the role's device
+and worker policies enforce physical GPU isolation. Unsetting them can select
+software rendering but cannot grant a physical GPU device or worker route.
+The graphics build has a different measured nsinit binary and root image.

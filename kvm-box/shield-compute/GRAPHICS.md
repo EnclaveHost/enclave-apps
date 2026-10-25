@@ -1,22 +1,27 @@
 # Protected graphics follow-up
 
-Status: feasibility/design note, 2026-10-24. No masked hardware graphics driver
-is implemented. The current logical GPU serves compute; the desktop renders
-inside the isolated VM using its software graphics path.
+Status: staged implementation, 2026-10-24. A narrow integer Vulkan prepass
+now executes through the existing masked channel in a patched Mesa ICD under
+host-container and native KVM tests; see the [driver contract](../shield-graphics/driver/README.md).
+The actual VM qualifies both the software reference and the narrow protected
+compute-to-draw path. General protected rendering remains open.
 
 The user has now explicitly requested work through a usable OpenGL/Vulkan
 driver. The separate [graphics reference](../shield-graphics/README.md) adds a
 Vulkan software ICD to the desktop-derived development image and demonstrates
-OpenGL through Zink plus real Vulkan/OpenGL frames in an isolated container.
-This supplies an API/reference baseline; VM qualification and protected
-hardware lowering remain outstanding. It does not complete the graphics goal.
+OpenGL through Zink plus real Vulkan/OpenGL frames in an isolated container
+and on the actual desktop inside KVM under the native application policy.
+A compute-to-draw fixture also passes with identical reference frames.
+Broader protected lowering and production/streaming qualification remain
+outstanding. It does not complete the graphics goal.
 
 A hybrid renderer is a possible research direction under the existing
 untrusted-GPU threat model. Selected linear work with explicitly public
 coefficients could be transformed into a vetted masked operation. Private
 visibility decisions, texture access, unsupported shaders, the framebuffer and
 encoding would remain inside the VM. This is an architectural inference from
-the existing compute boundary, not a demonstrated graphics acceleration result.
+the existing compute boundary. The initial integer prepass demonstrates only
+a narrow subset, with no measured performance gain.
 
 Encrypting a command stream or video connection does not hide plaintext from a
 GPU that must decrypt and render it. Masking a matrix product also does not

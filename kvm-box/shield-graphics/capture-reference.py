@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture the controlled 640x480, depth-24 Xvfb test display, refusing a blank frame."""
+"""Capture a controlled depth-24 test display, refusing a blank or oversized frame."""
 import ctypes as c
 import json
 from pathlib import Path
@@ -14,6 +14,10 @@ def bind(name, result, *args):
     return f
 
 open_display = bind('XOpenDisplay', c.c_void_p, c.c_char_p)
+default_screen = bind('XDefaultScreen', c.c_int, c.c_void_p)
+display_width = bind('XDisplayWidth', c.c_int, c.c_void_p, c.c_int)
+display_height = bind('XDisplayHeight', c.c_int, c.c_void_p, c.c_int)
+default_depth = bind('XDefaultDepth', c.c_int, c.c_void_p, c.c_int)
 root_window = bind('XDefaultRootWindow', c.c_ulong, c.c_void_p)
 get_image = bind('XGetImage', c.c_void_p, c.c_void_p, c.c_ulong, c.c_int, c.c_int,
                  c.c_uint, c.c_uint, c.c_ulong, c.c_int)
@@ -29,7 +33,10 @@ if not display:
     raise RuntimeError('cannot open the isolated test display')
 image = None
 try:
-    width, height = 640, 480
+    screen = default_screen(display)
+    width, height = display_width(display, screen), display_height(display, screen)
+    if default_depth(display, screen) != 24 or not (1 <= width <= 2048 and 1 <= height <= 2048):
+        raise RuntimeError('test capture requires a bounded depth-24 display')
     image = get_image(display, root_window(display), 0, 0, width, height, c.c_ulong(-1).value, 2)
     if not image:
         raise RuntimeError('XGetImage failed')

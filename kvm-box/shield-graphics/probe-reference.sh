@@ -31,5 +31,5 @@ exec xvfb-run -a -s '-screen 0 640x480x24 +extension GLX +render -noreset' /bin/
     code=0
     wait "$gears" || code=$?
     test "$code" = 124
-    cp /opt/shield/graphics-reference/packages.txt /evidence/packages.txt
+    dpkg-query -W > /evidence/packages.txt
 '

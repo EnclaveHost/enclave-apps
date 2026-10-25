@@ -3,7 +3,9 @@
 The requested endpoint is usable OpenGL/Vulkan in the native desktop, with
 physical GPU work restricted to the masked channel and unsupported work kept
 inside the VM. This directory starts the graphics reference and acceptance
-path. It does **not** implement masked hardware rendering yet.
+path. A [narrow protected Vulkan prepass](driver/README.md) now passes real
+worker tests through a patched Mesa ICD in a host container and the actual
+native KVM desktop. General masked rendering remains incomplete.
 
 The desktop base contains Mesa's software OpenGL implementation and a Vulkan
 loader, but lacks a Vulkan ICD. The separate development reference adds Mesa
@@ -29,6 +31,53 @@ results**, not native VM qualification, hardware acceleration, graphics API
 conformance testing, or Steam game compatibility results. The driver's
 reported memory total is not a measurement of the container's memory budget.
 
+## Native VM checkpoint
+
+The separate graphics root image now boots under the real native supervisor
+and nsinit in KVM with the existing desktop role policy. As UID 1000, with all
+capabilities dropped, no-new-privileges enabled and seccomp active, it renders
+Vulkan cubes and Zink OpenGL gears on both an isolated test display and the
+actual 1280×800 Xorg desktop. No physical GPU node is present.
+
+The [compute-to-draw fixture](qualification/README.md) also passes inside that
+VM: eight Vulkan dispatches check 2,048 integer values, preserve buffer guards,
+and feed a rendered triangle. Its final frame is byte-identical to both the
+Debian reference and an upstream source-built Mesa 25.0.7 driver. Existing CLI,
+CPU llama, desktop lifecycle, VNC RFB and Sunshine server-info tunnel checks pass.
+These checks use a synthetic worker and a test runtime adapter. They do not
+qualify production admission, GPU execution or Moonlight video streaming.
+
+The root squashfs SHA-256 is
+`6ca695df864f610993ef0454055daee81200a68ae81830510cca0d68c29a5ba5`,
+with dm-verity root
+`bea25bcec2365087b1e3e5ca02933776fe4a50e584118a13b5d72e2fad24a95c`.
+This is a separate development image; no running user VM was replaced.
+
+
+## Native masked-driver checkpoint
+
+A second separate image includes the patched ICD and a measured nsinit build
+with `KVMBOX_SHIELD_GRAPHICS`. Desktop applications inherit the Vulkan/Zink
+selection. The native role (UID 1000, no capabilities, NNP, seccomp, no physical
+GPU nodes) renders Vulkan and OpenGL on the 1280×800 desktop. Its standard
+Vulkan fixture makes eight verified GPU exchanges / 65,536 MACs through the
+existing Shield service, fixed guest-vsock proxy and dedicated loopback worker.
+All 2,048 checked values and the complete triangle frame match the reference.
+Thirteen graph checks also cover CLI/CPU inference, VNC, Sunshine server-info,
+clean stop, restart and supervisor-death teardown. A further KVM run corrupts
+an actual GPU reply: the driver reports device loss, publishes no output,
+skips the later draw and refuses retry without another worker connection.
+Both OpenGL and Vulkan clients map the pinned patched Vulkan library.
+
+Root squashfs SHA-256:
+`2b3f3969cf5927895c2d33bdd5548ded9b5cf631be2f2d2d0db9f8c9b86b8c6c`.
+Verity root:
+`b60655da14252a5c18e79d55657fd8ec23f9f4c9e252479ae7b68c5a1c3449c1`.
+The guest's `json-c` runtime is a normal measured Debian package. Matching
+virtio-vsock modules are in the test initrd. The original images and running
+VMs were preserved. Production runtime admission, hardware attestation,
+Moonlight video and general shader acceleration remain unqualified.
+
 ## Reproduce
 
 Build from an immutable local desktop image ID. The output directory must be
@@ -52,14 +101,47 @@ APT sources. The installed versions are recorded; this is not yet a fully
 reproducible release recipe. A release must pin the package artifacts or
 build sources and include the driver in a new authenticated root image.
 
+## Preserve the native desktop when packaging
+
+The VM base contains custom files added after its container image was built.
+Using a plain container export as the native base loses assets such as
+`/xorg.conf`; the first graphics packaging attempt failed Xorg startup for
+that reason. The native packager now refuses missing required base assets.
+
+Export the original immutable container image and its graphics-derived image
+to separate directories. Compose their package difference onto the customized
+VM filesystem before passing it to the native root-image builder:
+
+```sh
+python3 merge-native-root.py --base /work/original-image-export \
+  --graphics /work/graphics-image-export --customized /work/native-desktop-root \
+  --output /work/combined-root --receipt /work/composition.json
+```
+
+The composer rejects conflicting customizations, symlink-parent traversal and
+directory removals that discard custom assets. It verifies the resulting tree
+and that all input trees stayed unchanged. The executed merge contained 141
+changed paths and no conflicts. Inputs must be immutable development exports.
+
+## Building the driver from source
+
+`mesa-source.json` pins the upstream 25.0.7 archive and its official checksum.
+`mesa-tools.Dockerfile` supplies a separate Debian build environment;
+`build-mesa.sh` builds Lavapipe, LLVMpipe and Zink with four compiler jobs.
+Run it in that tools container with the verified extracted source mounted
+read-only at `/source` and a new writable directory at `/build`. Installed
+files are written under `/build/install/opt/shield/mesa`. No host driver is
+replaced. The development tools image still resolves APT dependencies at build
+time; record its immutable image ID and package versions for each qualification.
+
 ## Remaining work
 
-1. Qualify the standard APIs inside the native VM, including its actual
-   desktop display, application sandbox and Moonlight stream. Keep the
-   reference renderer available as the trusted fallback.
-2. Integrate an explicitly approved masked lowering into the graphics shader
-   execution path. The compute channel's existing public Q8 model policies
-   do not authorize arbitrary scene coefficients, textures or shaders.
+1. Qualify Moonlight video streaming with the graphics image and broader
+   application workloads. Native desktop API/rendering checks now pass; keep
+   the reference renderer available as the trusted fallback.
+2. Expand the VM-qualified protected Vulkan prepass from exact-module
+   admission into reviewed structural lowering. Existing public
+   model policies do not authorize arbitrary scene coefficients or textures.
 3. Validate numeric semantics and leakage for each accelerated operation;
    preserve trusted handling of private visibility, texture addressing,
    framebuffer composition and encoding where no protected lowering exists.

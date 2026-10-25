@@ -61,6 +61,17 @@ def tree(root):
    result[rel]=entry
  return dict(sorted(result.items()))
 
+def require_native_desktop_base(root):
+ # A container export is not the customized VM base. Missing this fixed
+ # configuration causes Xorg to seek a physical device and fail at boot.
+ # Resolve from a manifest, without following source-tree symlinks to the host.
+ manifest = tree(root)
+ for name in ('xorg.conf', 'shield/model-volume.json'):
+  entry = manifest.get(name)
+  if not entry or entry['type'] != 'file' or not entry['bytes']:
+   raise ValueError('missing native desktop base asset: ' + name)
+ return manifest
+
 def main():
  os.umask(0o022)
  if len(sys.argv)!=2: raise SystemExit('usage: build_root_image.py BUILD_SPEC.json')
@@ -109,7 +120,7 @@ def main():
   subprocess.run(['mount','-o','remount,bind,ro',str(lower)],check=True)
   if not os.statvfs(lower).f_flag & os.ST_RDONLY:raise ValueError('base is not read-only')
   # Record a complete content/metadata identity of the base and compare after.
-  base_manifest=tree(lower);base_identity=hashlib.sha256(canonical(base_manifest)).hexdigest()
+  base_manifest=require_native_desktop_base(lower);base_identity=hashlib.sha256(canonical(base_manifest)).hexdigest()
   (output/'base-files.json').write_bytes(canonical(base_manifest))
   subprocess.run(['mount','-t','overlay','overlay','-o',f'lowerdir={lower},upperdir={output}/upper,workdir={output}/work,userxattr',str(merged)],check=True);mounted.append(merged)
   rootfd=os.open(merged,os.O_PATH|os.O_DIRECTORY|os.O_CLOEXEC)

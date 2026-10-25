@@ -100,7 +100,18 @@ static char *const desktop_env[] = {
     "PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/home/desktop", "LANG=C.UTF-8", "DISPLAY=:0",
     "XDG_RUNTIME_DIR=" RUNTIME, "XAUTHORITY=" RUNTIME "/Xauthority",
     "DBUS_SESSION_BUS_ADDRESS=unix:path=" RUNTIME "/bus",
-    "PULSE_SERVER=unix:" RUNTIME "/pulse/native", NULL
+    "PULSE_SERVER=unix:" RUNTIME "/pulse/native",
+#ifdef KVMBOX_SHIELD_GRAPHICS
+    /* Separate measured graphics image only. The device policy still denies
+     * physical GPU nodes; these select the standard API implementation. */
+    "VK_DRIVER_FILES=/opt/shield/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json",
+    "VK_ICD_FILENAMES=/opt/shield/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json",
+    "LIBGL_DRIVERS_PATH=/opt/shield/mesa/lib/dri",
+    "LIBGL_ALWAYS_SOFTWARE=1", "GALLIUM_DRIVER=zink",
+    "MESA_LOADER_DRIVER_OVERRIDE=zink", "LIBGL_KOPPER_DRI2=true",
+    "LP_NUM_THREADS=2",
+#endif
+    NULL
 };
 static char *const role_env[] = { "PATH=/usr/bin:/bin", "LANG=C.UTF-8", "HOME=/nonexistent", NULL };
 static char *const no_env[] = { NULL };

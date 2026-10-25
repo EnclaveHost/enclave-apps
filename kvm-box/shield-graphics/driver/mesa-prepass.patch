@@ -1,0 +1,353 @@
+--- a/src/gallium/frontends/lavapipe/lvp_private.h
++++ b/src/gallium/frontends/lavapipe/lvp_private.h
+@@ -519,6 +519,8 @@
+ 
+ struct lvp_pipeline {
+    struct vk_object_base base;
++   /* Set only from exact source module validation; never serialized shader state. */
++   bool shield_prepass;
+    struct lvp_device *                          device;
+    struct lvp_pipeline_layout *                 layout;
+ 
+--- a/src/gallium/frontends/lavapipe/lvp_pipeline.c
++++ b/src/gallium/frontends/lavapipe/lvp_pipeline.c
+@@ -24,6 +24,8 @@
+ #include "lvp_private.h"
+ #include "vk_nir_convert_ycbcr.h"
+ #include "vk_pipeline.h"
++#include "vk_shader_module.h"
++#include "shield_prepass_spirv.h"
+ #include "vk_render_pass.h"
+ #include "vk_util.h"
+ #include "glsl_types.h"
+@@ -1050,6 +1052,17 @@
+    pipeline->force_min_sample = false;
+ 
+    pipeline->type = LVP_PIPELINE_COMPUTE;
++
++   /* Initial, deliberately exact admission. General NIR lowering is separate.
++    * Shader-object binaries, specializations, module identifiers, pNext state,
++    * non-default pipeline flags and all other shaders stay on llvmpipe. */
++   const VkPipelineShaderStageCreateInfo *stage = &pCreateInfo->stage;
++   struct vk_shader_module *module = vk_shader_module_from_handle(stage->module);
++   pipeline->shield_prepass = flags == 0 && pCreateInfo->pNext == NULL &&
++      stage->flags == 0 && stage->pNext == NULL && stage->pSpecializationInfo == NULL &&
++      stage->pName && !strcmp(stage->pName, "main") && module && !module->nir &&
++      module->size == sizeof(shield_prepass_spirv) &&
++      !memcmp(module->data, shield_prepass_spirv, sizeof(shield_prepass_spirv));
+ 
+    VkResult result = lvp_shader_compile_to_ir(pipeline, &pCreateInfo->stage);
+    if (result != VK_SUCCESS)
+--- a/src/gallium/frontends/lavapipe/lvp_execute.c
++++ b/src/gallium/frontends/lavapipe/lvp_execute.c
+@@ -24,6 +24,7 @@
+ /* use a gallium context to execute a command buffer */
+ 
+ #include "lvp_private.h"
++#include "shield_prepass_client.h"
+ #include "lvp_acceleration_structure.h"
+ 
+ #include "pipe/p_context.h"
+@@ -81,6 +82,10 @@
+ };
+ 
+ struct rendering_state {
++   bool shield_prepass;
++   bool shield_failed;
++   unsigned shield_generated_depth;
++   unsigned shield_active_queries;
+    struct pipe_context *pctx;
+    struct lvp_device *device; //for uniform inlining only
+    struct u_upload_mgr *uploader;
+@@ -600,6 +605,7 @@
+ static void
+ handle_compute_shader(struct rendering_state *state, struct lvp_shader *shader)
+ {
++   state->shield_prepass = false; /* shader objects and internal compute stay local */
+    state->shaders[MESA_SHADER_COMPUTE] = shader;
+ 
+    state->has_pcbuf[MESA_SHADER_COMPUTE] = shader->push_constant_size > 0;
+@@ -621,6 +627,7 @@
+    LVP_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
+ 
+    handle_compute_shader(state, &pipeline->shaders[MESA_SHADER_COMPUTE]);
++   state->shield_prepass = pipeline->shield_prepass;
+ }
+ 
+ static void handle_ray_tracing_pipeline(struct vk_cmd_queue_entry *cmd,
+@@ -2839,6 +2846,58 @@
+    state->ib_dirty = true;
+ }
+ 
++/* Fixed 64x4 prepass only. Routing uses shader/grid/descriptor metadata, never
++ * private values. Prior writes complete before input snapshot. Unsupported
++ * layouts retain the original CPU shader. A started request never retries. */
++static bool
++handle_shield_prepass(struct rendering_state *state)
++{
++   if (!state->shield_prepass || state->shield_generated_depth ||
++       state->shield_active_queries || state->dispatch_info.grid[0] != 1 ||
++       state->dispatch_info.grid[1] != 1 || state->dispatch_info.grid[2] != 1 ||
++       state->dispatch_info.block[0] != 64 || state->dispatch_info.block[1] != 1 ||
++       state->dispatch_info.block[2] != 1)
++      return false;
++   for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); ++i)
++      if (state->desc_buffers[i])
++         return false;
++   struct lvp_descriptor_set *set = state->desc_sets[LVP_PIPELINE_COMPUTE][0];
++   if (!set || !set->layout || set->layout->binding_count != 2 || !set->map ||
++       set->layout->dynamic_offset_count != 0)
++      return false;
++   struct lp_jit_buffer buffers[2];
++   for (unsigned i = 0; i < 2; ++i) {
++      const struct lvp_descriptor_set_binding_layout *binding = &set->layout->binding[i];
++      if (!binding->valid || binding->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
++          binding->array_size != 1 ||
++          binding->descriptor_index >= set->layout->size)
++         return false;
++      buffers[i] = ((const struct lp_descriptor *)set->map)[binding->descriptor_index].buffer;
++      /* num_elements in this BDA descriptor is a BYTE count (lp_jit.c). */
++      if (!buffers[i].u || buffers[i].num_elements != 1024 ||
++          ((uintptr_t)buffers[i].u & 3) || (uintptr_t)buffers[i].u > UINTPTR_MAX - 1024)
++         return false;
++   }
++   uintptr_t a = (uintptr_t)buffers[0].u, b = (uintptr_t)buffers[1].u;
++   if (a < b + 1024 && b < a + 1024)
++      return false;
++   finish_fence(state);
++   uint32_t snapshot[256];
++   int32_t result[256];
++   memcpy(snapshot, buffers[0].u, sizeof(snapshot));
++   enum shield_prepass_result status = shield_prepass_execute(snapshot, result);
++   explicit_bzero(snapshot, sizeof(snapshot));
++   if (status == SHIELD_PREPASS_UNAVAILABLE)
++      return false;
++   if (status == SHIELD_PREPASS_FAILED) {
++      state->shield_failed = true;
++      return true;
++   }
++   memcpy((void *)buffers[1].u, result, sizeof(result));
++   explicit_bzero(result, sizeof(result));
++   return true;
++}
++
+ static void handle_dispatch(struct vk_cmd_queue_entry *cmd,
+                             struct rendering_state *state)
+ {
+@@ -2849,7 +2908,8 @@
+    state->dispatch_info.grid_base[1] = 0;
+    state->dispatch_info.grid_base[2] = 0;
+    state->dispatch_info.indirect = NULL;
+-   state->pctx->launch_grid(state->pctx, &state->dispatch_info);
++   if (!handle_shield_prepass(state))
++      state->pctx->launch_grid(state->pctx, &state->dispatch_info);
+ }
+ 
+ static void handle_dispatch_base(struct vk_cmd_queue_entry *cmd,
+@@ -2967,6 +3027,8 @@
+        pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
+       emit_compute_state(state);
+ 
++   /* Query accounting belongs to llvmpipe, including inherited queries. */
++   state->shield_active_queries++;
+    emit_state(state);
+ 
+    uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
+@@ -2991,6 +3053,8 @@
+    assert(pool->queries[qcmd->query]);
+ 
+    state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
++   assert(state->shield_active_queries);
++   state->shield_active_queries--;
+ }
+ 
+ 
+@@ -3004,6 +3068,8 @@
+        pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
+       emit_compute_state(state);
+ 
++   /* Query accounting belongs to llvmpipe, including inherited queries. */
++   state->shield_active_queries++;
+    emit_state(state);
+ 
+    uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
+@@ -3028,6 +3094,8 @@
+    assert(pool->queries[qcmd->query]);
+ 
+    state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
++   assert(state->shield_active_queries);
++   state->shield_active_queries--;
+ }
+ 
+ static void handle_reset_query_pool(struct vk_cmd_queue_entry *cmd,
+@@ -4285,8 +4353,12 @@
+    struct list_head *list = (void*)p;
+ 
+    struct vk_cmd_queue_entry *exec_cmd = list_first_entry(list, struct vk_cmd_queue_entry, cmd_link);
++   /* Device-generated counts may depend on private shader output. Never
++    * make external routing depend on those counts, even with a bound pipeline. */
++   state->shield_generated_depth++;
+    if (exec_cmd)
+       lvp_execute_cmd_buffer(list, state, print_cmds);
++   state->shield_generated_depth--;
+ }
+ 
+ static void
+@@ -4957,6 +5029,8 @@
+    bool did_flush = false;
+ 
+    LIST_FOR_EACH_ENTRY(cmd, cmds, cmd_link) {
++      if (state->shield_failed)
++         break;
+       if (print_cmds)
+          fprintf(stderr, "%s\n", vk_cmd_queue_type_names[cmd->type]);
+       switch ((unsigned)cmd->type) {
+@@ -5418,7 +5492,7 @@
+    for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); i++)
+       pipe_resource_reference(&state->desc_buffers[i], NULL);
+ 
+-   return VK_SUCCESS;
++   return state->shield_failed ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+ }
+ 
+ size_t
+--- a/src/gallium/frontends/lavapipe/lvp_device.c
++++ b/src/gallium/frontends/lavapipe/lvp_device.c
+@@ -1646,10 +1646,17 @@
+       struct lvp_cmd_buffer *cmd_buffer =
+          container_of(submit->command_buffers[i], struct lvp_cmd_buffer, vk);
+ 
+-      lvp_execute_cmds(queue->device, queue, cmd_buffer);
++      result = lvp_execute_cmds(queue->device, queue, cmd_buffer);
++      if (result != VK_SUCCESS)
++         break;
+    }
+ 
+    simple_mtx_unlock(&queue->lock);
++
++   if (result != VK_SUCCESS) {
++      destroy_pipelines(queue);
++      return vk_queue_set_lost(&queue->vk, "protected prepass failed");
++   }
+ 
+    if (submit->command_buffer_count > 0)
+       queue->ctx->flush(queue->ctx, &queue->last_fence, 0);
+--- a/src/gallium/frontends/lavapipe/lvp_pipe_sync.c
++++ b/src/gallium/frontends/lavapipe/lvp_pipe_sync.c
+@@ -153,30 +153,20 @@
+ 
+    uint64_t now_ns = os_time_get_nano();
+    while (!sync->signaled && !sync->fence) {
++      if (vk_device_is_lost(&device->vk))
++         return VK_ERROR_DEVICE_LOST;
+       if (now_ns >= abs_timeout_ns)
+          return VK_TIMEOUT;
+ 
+-      int ret;
+-      if (abs_timeout_ns >= INT64_MAX) {
+-         /* Common infinite wait case */
+-         ret = cnd_wait(&sync->changed, &sync->lock);
+-      } else {
+-         /* This is really annoying.  The C11 threads API uses CLOCK_REALTIME
+-          * while all our absolute timeouts are in CLOCK_MONOTONIC.  Best
+-          * thing we can do is to convert and hope the system admin doesn't
+-          * change the time out from under us.
+-          */
+-         uint64_t rel_timeout_ns = abs_timeout_ns - now_ns;
+-
+-         struct timespec now_ts, abs_timeout_ts;
+-         timespec_get(&now_ts, TIME_UTC);
+-         if (timespec_add_nsec(&abs_timeout_ts, &now_ts, rel_timeout_ns)) {
+-            /* Overflowed; may as well be infinite */
+-            ret = cnd_wait(&sync->changed, &sync->lock);
+-         } else {
+-            ret = cnd_timedwait(&sync->changed, &sync->lock, &abs_timeout_ts);
+-         }
+-      }
++      /* Protected dispatch can fail before a fence is attached. A caller
++       * already waiting forever must observe device loss without relying on
++       * that fence ever being signaled. Normal attachment still broadcasts. */
++      uint64_t rel_timeout_ns = MIN2(abs_timeout_ns - now_ns, 100000000ull);
++      struct timespec now_ts, abs_timeout_ts;
++      timespec_get(&now_ts, TIME_UTC);
++      if (timespec_add_nsec(&abs_timeout_ts, &now_ts, rel_timeout_ns))
++         return vk_errorf(device, VK_ERROR_UNKNOWN, "sync clock overflow");
++      int ret = cnd_timedwait(&sync->changed, &sync->lock, &abs_timeout_ts);
+       if (ret == thrd_error)
+          return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+ 
+@@ -188,6 +178,9 @@
+        */
+       now_ns = os_time_get_nano();
+    }
++
++   if (vk_device_is_lost(&device->vk))
++      return VK_ERROR_DEVICE_LOST;
+ 
+    if (sync->signaled || (wait_flags & VK_SYNC_WAIT_PENDING))
+       return VK_SUCCESS;
+--- a/src/gallium/frontends/lavapipe/meson.build
++++ b/src/gallium/frontends/lavapipe/meson.build
+@@ -18,6 +18,7 @@
+     'lvp_cmd_buffer.c',
+     'lvp_descriptor_set.c',
+     'lvp_execute.c',
++    'shield_prepass_client.c',
+     'lvp_util.c',
+     'lvp_image.c',
+     'lvp_formats.c',
+@@ -59,5 +60,5 @@
+   gnu_symbol_visibility : 'hidden',
+   include_directories : [ inc_include, inc_src, inc_util, inc_gallium, inc_gallium_aux, inc_llvmpipe ],
+   dependencies : [ dep_llvm, idep_nir, idep_mesautil, idep_vulkan_util, idep_vulkan_wsi,
+-                   idep_vulkan_runtime, lvp_deps ]
++                   idep_vulkan_runtime, lvp_deps, dependency('json-c') ]
+ )
+--- a/src/gallium/targets/lavapipe/meson.build
++++ b/src/gallium/targets/lavapipe/meson.build
+@@ -13,7 +13,7 @@
+   # The linker still expects a definition for weak symbols at build time, just not at runtime.
+   # We have to forcibly ignore undefined symbols, which unfortunately applies to all symbols.
+   override_options : ['b_lundef=@0@'.format(host_machine.system() == 'darwin' ? 'false' : get_option('b_lundef').to_string())],
+-  dependencies : [driver_llvmpipe, idep_mesautil],
++  dependencies : [driver_llvmpipe, idep_mesautil, dependency('json-c')],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],
+   install : true,
+ )
+--- a/src/vulkan/runtime/vk_sync_timeline.c
++++ b/src/vulkan/runtime/vk_sync_timeline.c
+@@ -428,21 +428,23 @@
+                              enum vk_sync_wait_flags wait_flags,
+                              uint64_t abs_timeout_ns)
+ {
+-   struct timespec abs_timeout_ts;
+-   timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
+-
+-   /* Wait on the queue_submit condition variable until the timeline has a
+-    * time point pending that's at least as high as wait_value.
+-    */
++   /* Device loss can occur before the threaded driver attaches a signal.
++    * Bound each condition wait so an already waiting application observes it. */
+    while (timeline->highest_pending < wait_value) {
+-      int ret = u_cnd_monotonic_timedwait(&timeline->cond, &timeline->mutex,
+-                                          &abs_timeout_ts);
+-      if (ret == thrd_timedout)
++      if (vk_device_is_lost(device))
++         return VK_ERROR_DEVICE_LOST;
++      uint64_t now = os_time_get_nano();
++      if (now >= abs_timeout_ns)
+          return VK_TIMEOUT;
+-
+-      if (ret != thrd_success)
++      uint64_t wake = now + MIN2(abs_timeout_ns - now, 100000000ull);
++      struct timespec timeout;
++      timespec_from_nsec(&timeout, wake);
++      int ret = u_cnd_monotonic_timedwait(&timeline->cond, &timeline->mutex, &timeout);
++      if (ret != thrd_success && ret != thrd_timedout)
+          return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+    }
++   if (vk_device_is_lost(device))
++      return VK_ERROR_DEVICE_LOST;
+ 
+    if (wait_flags & VK_SYNC_WAIT_PENDING)
+       return VK_SUCCESS;
