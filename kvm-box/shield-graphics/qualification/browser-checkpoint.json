@@ -1,0 +1,118 @@
+{
+  "schema": "shield-browser-graphics-qualification/1",
+  "passed": true,
+  "rootImageSha256": "7bba94ee5d058358b0986dc183e89e24d39a0429fadc9e4471f168a0eba0ba2b",
+  "verityRoot": "dfe4ae0585b12e8928d91f4374b3d40b00aa4f6e1e7e676183ad88b338e2d5a8",
+  "firefox": {
+    "Name": "Firefox",
+    "Version": "153.5.1",
+    "BuildID": "20261019143936",
+    "SourceStamp": "46f5f658a8fe6751cb4ef704999da57fb1bf1ea2"
+  },
+  "profileUnchanged": true,
+  "profileSha256": "61137066674a618197ae8aec5822be4c76e13e810aff17cabd230faf95515379",
+  "graphics": {
+    "passed": true,
+    "results": [
+      {
+        "api": "webgl",
+        "passed": true,
+        "pixelsChecked": 16384,
+        "channelsChecked": 65536,
+        "maxChannelError": 0.5,
+        "renderer": "Generic Renderer",
+        "frames": 80,
+        "trianglesPerFrame": 512,
+        "frameIntervalP50Ms": 33.159999999999854,
+        "frameIntervalP95Ms": 34.09999999999991,
+        "renderP50Ms": 2,
+        "renderP95Ms": 7,
+        "averageFps": 30.003900507065918
+      },
+      {
+        "api": "webgl2",
+        "passed": true,
+        "pixelsChecked": 16384,
+        "channelsChecked": 65536,
+        "maxChannelError": 0.5,
+        "renderer": "Generic Renderer",
+        "frames": 80,
+        "trianglesPerFrame": 512,
+        "frameIntervalP50Ms": 33.14000000000033,
+        "frameIntervalP95Ms": 34.07999999999993,
+        "renderP50Ms": 2,
+        "renderP95Ms": 3,
+        "averageFps": 30.001650090754985
+      }
+    ],
+    "gpuOffloadClaim": false,
+    "browserProfileSha256": "61137066674a618197ae8aec5822be4c76e13e810aff17cabd230faf95515379",
+    "unreadableProcesses": [],
+    "loadedLibraries": {
+      "libvulkan_lvp.so": "a000f1ac8098618b1e497f29ed05f6b2bf4bdca2154e7d197feff4dd31b4465d",
+      "libgallium-25.0.7.so": "590f9bf762f857492ffdfff75acadb849cd47e307634e8efebde13bdd7fb0b80"
+    },
+    "graphicsEnvironments": [
+      {
+        "GALLIUM_DRIVER": "zink",
+        "LP_NUM_THREADS": "1",
+        "LIBGL_DRIVERS_PATH": "/opt/shield/mesa/lib/dri",
+        "LD_LIBRARY_PATH": "/opt/shield/mesa/lib"
+      }
+    ],
+    "workerExchanges": 0
+  },
+  "graphChecks": 13,
+  "masked": {
+    "verifiedExchanges": 16,
+    "verifiedMacs": 131072
+  },
+  "integrity": {
+    "passed": true,
+    "attempts": [
+      {
+        "case": "corrupted-worker-opengl",
+        "elapsedSeconds": 0.1368720800000034,
+        "passed": true,
+        "api": "OpenGL",
+        "contextLost": true,
+        "readbackSkipped": true
+      },
+      {
+        "case": "retired-service-opengl-retry",
+        "elapsedSeconds": 0.13626465999999482,
+        "passed": true,
+        "api": "OpenGL",
+        "contextLost": true,
+        "readbackSkipped": true
+      },
+      {
+        "case": "retired-service-vulkan-retry",
+        "elapsedSeconds": 0.12140019900000709,
+        "passed": true,
+        "deviceLost": true,
+        "outputUnchanged": true,
+        "laterDrawSkipped": true
+      }
+    ],
+    "serviceRetired": true,
+    "retryDidNotReachWorker": true
+  },
+  "productionAdmission": false,
+  "attestation": false,
+  "moonlightStreaming": false,
+  "scope": "native KVM desktop browser workload; CPU rendering through private Vulkan/Zink, no general GPU speedup or conformance claim",
+  "earlierFailures": [
+    "Development-image launcher mode644 corrected to555; normal Dockerfile already installs executable",
+    "Long title transport was truncated by Firefox; bounded numbered chunks now collect results"
+  ],
+  "workload": {
+    "canvasWidth": 640,
+    "canvasHeight": 360,
+    "referenceWidth": 128,
+    "referenceHeight": 128,
+    "trianglesPerFrame": 512,
+    "warmupFramesPerApi": 20,
+    "measuredFramesPerApi": 80
+  }
+}

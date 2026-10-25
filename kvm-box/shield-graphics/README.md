@@ -106,6 +106,23 @@ and with the exported evidence.
 This remains a test-adapter image with synthetic public-matrix approval;
 production attestation/admission and full-frame acceleration are not established.
 
+## Firefox/WebGL acceptance
+
+The browser launcher now honors the graphics image's inherited Zink selection
+instead of overriding it with direct llvmpipe. It keeps its one-thread limit
+and the existing lightweight Firefox profile. In the actual 2-vCPU/8-GiB KVM
+desktop, the installed browser passes complete-frame texture/depth/blending
+checks in both WebGL 1 and WebGL 2 and runs the controlled 512-triangle animation on a 640×360 canvas
+at approximately 30 FPS. Both private Mesa library hashes are confirmed in the
+browser process. Worker counters remain unchanged: this workload uses CPU
+rendering, with no hardware-acceleration claim.
+
+The same image passes the protected OpenGL/Vulkan prepass and corruption/retry
+checks. Exact image hashes, browser version, profile identity and measured
+frame times are in [the browser checkpoint](qualification/browser-checkpoint.json).
+This is application acceptance for a bounded workload, not API conformance,
+Steam compatibility or a long-duration performance result.
+
 ## Reproduce
 
 Build from an immutable local desktop image ID. The output directory must be

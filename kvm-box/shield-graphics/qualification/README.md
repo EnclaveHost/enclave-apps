@@ -85,3 +85,37 @@ the descriptor-buffer test overrides that selection and must stay local.
 as described in the driver README. It compiles and validates every SPIR-V input,
 then checks acceptance, named contract and rejection reason. These tests are
 independent of the real-ICD/GPU execution checks and do not replace them.
+
+## Desktop browser workload
+
+`browser-webgl.html` exercises WebGL 1 and 2 in the installed Firefox browser.
+Each API checks every RGBA channel of a 128×128 reference framebuffer with
+nearest-neighbor textures, overlapping depth-tested geometry and alpha blending
+(tolerance one 8-bit channel value). It then renders a 512-triangle animation on a 640×360 canvas,
+records 80 frames after warmup, and reports frame intervals and render-call times.
+The latter include JavaScript geometry updates, draw submission and `gl.finish()`;
+they are not hardware GPU timer measurements. The lightweight profile targets
+30 FPS. These results characterize this workload, not game compatibility.
+
+`probe-browser.py` runs as the actual native desktop user on Xorg, retains the
+installed profile, and obtains the result from the controlled page's X window
+title. No HTTP or automation listener or new firewall exception is needed.
+Place the HTML/probe and `capture-reference.py` under `/tmp`, with the existing
+`/tmp/graphics-evidence` directory, then invoke the probe with the measured
+desktop graphics environment. It records the profile hash, loaded private Mesa
+libraries and a screenshot, and terminates only the browser process group it
+started. The native harness separately checks that worker counters do not
+change during this CPU-rendered workload.
+
+The native browser checkpoint uses the existing x86 Firefox 153.5.1 and the
+unchanged lightweight profile (`61137066…5379`). Both APIs passed 65,536 channel
+comparisons each, at about 30.00 FPS. Median render-call time was 2 ms; p95 was
+7 ms for WebGL 1 and 3 ms for WebGL 2. Both p95 frame intervals were about 34.1 ms.
+This is a short controlled workload in a 2-vCPU/8-GiB KVM guest, not a game soak.
+The process mapped both pinned private Mesa libraries, retained one llvmpipe
+worker thread, and made no compute-worker exchanges. The native driver prepass,
+corruption/retry and lifecycle checks passed in the same run.
+
+Firefox truncates long native window titles. The probe therefore collects
+bounded numbered chunks with a per-report ID, rejects inconsistent chunks,
+and decodes only a complete report. The page itself displays the full result.
