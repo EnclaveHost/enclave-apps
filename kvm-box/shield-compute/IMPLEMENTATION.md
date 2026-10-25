@@ -1856,3 +1856,39 @@ full GPU rendering, universal CUDA, game qualification, or Khronos conformance.
 
 Evidence exports: `native-menu-build-v8`, `native-menu-cli-v8`, and
 `native-app-attestation-v8` under the task's `outputs/kvm-box/evidence/`.
+
+## Signed desktop v9: enforced launcher CPU allocation (2026-10-25)
+
+`native-v9-cpu-checkpoint.json` pins the new image and its separate runtime and
+hardware evidence. Only the monitor binary changed in the platform archive;
+the v8 root, profile, media, default home files and graphics/compute libraries
+remain byte-identical. The monitor now accepts a bounded launcher CPU quota
+without changing the immutable catalog bundle or its application identity.
+
+An eight-vCPU NucBox fixture loaded the four-CPU catalog bundle with an explicit
+six-CPU allocation. The effective requirement was six processors and the actual
+desktop cgroup read back `cpu.max=600000 100000`. Eight CPU consumers inside the
+desktop raised `nr_throttled` from 0 to 59. The packaged sd-cli and llama-cli
+then passed their standard masked-workload checks: 392 and 511 verified
+exchanges, the reference PNG and the expected Paris answer. All 14 home defaults
+passed again, and the removed diagnostic menu entries remained absent. This
+proves guest enforcement, not purchase authorization or host pool accounting.
+
+The exact signed production image separately passed two fresh app challenges
+and 26 guest negatives, bound to a fresh host TPM challenge with two negatives.
+The fixed Wasm controller remained sealed. The diagnostic TPM helper exited
+normally within the longer cleanup grace and left no new helper process.
+Both disposable test VMs were removed and their guest state archived.
+
+The runtime test's production VM inventory was **not** unchanged: one app was
+automatically replaced after RPC renewal failures and lease expiry. The first
+failure preceded the test VM launch. The node reason and Hyper-V events are
+included in the evidence; the RPC root cause remains unknown. The other three
+production VMs, physical GPU worker and host boot/security stayed unchanged.
+The separate attestation test had an unchanged production inventory.
+
+The node compatibility package is prepared but unactivated. Manager integration,
+real owner release, final GUI/FreeDoom/Firefox/Moonlight acceptance and wallet
+publication remain required. General rendering still uses CPU Mesa with the
+supported masked prepass. No universal CUDA, full GPU rendering, game support,
+Khronos conformance or host-OS exclusion is established by these tests.
