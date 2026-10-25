@@ -59,6 +59,21 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(v['allSelectedPassed'])
         self.assertEqual(v['missingLibraries'], ['pinned'])
 
+    def test_native_reference_cannot_bless_failure(self):
+        self.assertFalse(results.matches_reference({'a': 'Fail'}, [{'name': 'a', 'status': 'Fail'}], {'a'}))
+        self.assertFalse(results.matches_reference({'a': 'Pass'}, [{'name': 'a', 'status': 'Fail'}], set()))
+
+    def test_only_reviewed_warning_or_improvement(self):
+        baseline = {'a': 'CompatibilityWarning'}
+        self.assertTrue(results.matches_reference(baseline, [{'name': 'a', 'status': 'CompatibilityWarning'}], {'a'}))
+        self.assertTrue(results.matches_reference(baseline, [{'name': 'a', 'status': 'Pass'}], {'a'}))
+        self.assertFalse(results.matches_reference(baseline, [{'name': 'a', 'status': 'CompatibilityWarning'}], set()))
+        self.assertFalse(results.matches_reference({'a': 'Pass'}, [{'name': 'a', 'status': 'CompatibilityWarning'}], {'a'}))
+
+    def test_native_reference_rejects_duplicate_or_missing(self):
+        self.assertFalse(results.matches_reference({'a': 'Pass', 'b': 'Pass'}, [{'name': 'a', 'status': 'Pass'}]*2, set()))
+        self.assertFalse(results.matches_reference({'a': 'Pass'}, [], set()))
+
 
 if __name__ == '__main__':
     unittest.main()

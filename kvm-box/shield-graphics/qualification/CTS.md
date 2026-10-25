@@ -69,8 +69,9 @@ running the full plan.
 The OpenGL runner starts and terminates its own container-local Xvfb server.
 It selects EGL by default; `--gl-context glx` tests GLX context creation
 explicitly. Preserve context creation failures as failed qualification evidence.
-Zink uses lazy descriptors and one llvmpipe worker, matching the desktop's
-lightweight configuration. Vulkan loads the pinned Lavapipe ICD. No physical
+The container uses Zink's lazy descriptors and one llvmpipe worker. The final
+native image sets two llvmpipe workers; native qualification must retain that
+shipped setting and report the difference. Vulkan loads the pinned Lavapipe ICD. No physical
 GPU device or Shield service may be present. The driver cannot obtain a raw
 hardware path from this test environment.
 
@@ -124,3 +125,49 @@ Evidence is saved separately as `graphics-cts-opengl-v1`, including all per-case
 results, logs, exact selections, binary/library identities, baseline comparison,
 source audit and runner code. General rendering remains CPU-based. This
 checkpoint is neither native VM qualification nor complete API conformance.
+
+## Native OpenGL checkpoint, 2026-10-25
+
+The same 551 selected cases subsequently ran inside the actual native desktop
+on its existing Xorg `:0` display: 550 passes and the same one compatibility
+warning. `allSelectedPassed` remains false. Every group mapped both pinned
+Mesa libraries. The desktop kept its shipped `LP_NUM_THREADS=2` and lazy Zink
+descriptors. The UID-checked Shield service's counters were unchanged across
+the complete run, so this is CPU fallback evidence, not masked GPU execution.
+
+The test used the unchanged signed v4 candidate platform archive, profile,
+root filesystem and model media in a disposable local KVM VM. Explicit fixture
+entry points were appended to a separate initrd. The actual monitor/domain
+implementation loaded the expected controller/profile/runtime, kept the
+controller's secret pipe sealed, started the desktop, and cleaned up the domain
+and cgroup. Its one-use admission checks also passed. The fixture's privileged
+controller client is not owner-release or hardware-attestation evidence.
+
+`cts-native-role.c` opens a detached copy of the read-only test-assets mount
+before joining the desktop namespaces, transfers it with `move_mount`, closes
+inherited descriptors, and applies the real desktop role policy. It never ships
+in the production image. `cts-native.py` requires UID 1000, zero capability sets,
+no-new-privileges, seccomp, the expected guest kernel, and no physical GPU nodes.
+It runs the unchanged CTS binary, records full case logs and library mappings,
+and compares results against the container reference. Only the explicitly
+reviewed framebuffer compatibility warning may remain; a failed reference
+cannot authorize a later failure. The warning still never becomes a `Pass`.
+
+The runtime image has versioned GL/EGL/GLES loader libraries, whereas this CTS
+build calls `dlopen` with unversioned development names. The fixture creates
+three aliases in its own temporary directory pointing to the existing,
+hash-checked runtime libraries. It records the aliases and prepends only that
+directory to the test command's library search path. No driver or production
+filesystem bytes are replaced. API assertions and case selection are unchanged.
+
+Evidence `graphics-cts-native-opengl-v1` contains 79 files plus a hash manifest:
+full native QPA logs, lifecycle result, profile/media hashes, fixture source,
+build/run recipes and the three unsuccessful setup attempts. A captured host
+scope sample confirms the 4.5 GiB/no-swap/two-CPU limit; a host memory guard
+protects a 16 GiB available-memory floor. The test VM exited, its native domain
+and cgroup were removed, and the separate Vulkan compiler resumed.
+
+This qualifies the selected EGL/OpenGL workload in the native fixture. GLX CTS
+context creation, broader Vulkan coverage, real application workloads, owner
+provisioning and deployment remain separate work. It does not claim full API
+conformance, general protected GPU acceleration, or gaming performance.

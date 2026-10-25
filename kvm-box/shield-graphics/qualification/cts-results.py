@@ -2,6 +2,24 @@
 from collections import Counter
 
 
+def matches_reference(expected, results, known_compatibility_warnings):
+    """A reference may contain only passes and explicitly reviewed warnings.
+
+    Never let a failed baseline bless the same failure in a later native run.
+    The caller supplies reviewed case names, not arbitrary acceptable statuses.
+    """
+    if not expected or any(status != 'Pass' and not (
+            status == 'CompatibilityWarning' and name in known_compatibility_warnings)
+            for name, status in expected.items()):
+        return False
+    names = [r['name'] for r in results]
+    if len(names) != len(expected) or set(names) != set(expected):
+        return False
+    return all(r['status'] == 'Pass' or (
+        r['name'] in known_compatibility_warnings and
+        r['status'] == expected[r['name']] == 'CompatibilityWarning') for r in results)
+
+
 def evaluate(expected, results, returncode, timed_out, incomplete, mapped, required):
     names = [r['name'] for r in results]
     counts = Counter(r['status'] for r in results)
