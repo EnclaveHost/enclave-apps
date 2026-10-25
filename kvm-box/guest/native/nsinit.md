@@ -19,7 +19,7 @@ were checked for hidepid=2/invisible before any credentials were generated. The 
 the value for pairing. Parent buffers are wiped. Owner/wallet credentials are
 never inputs. Xorg uses the separately generated private Xauthority file.
 
-Startup is bounded by one 55-second monotonic deadline, including exec/probe
+Startup is bounded by one 115-second monotonic deadline, including exec/probe
 retries. `readiness.py` validates the root local worker peer without sending
 protocol bytes, the actual compute status through its peer-checked Unix socket,
 and the inner JSON/HTML routes. Desktop socket and fixed TCP readiness checks
@@ -27,6 +27,20 @@ also run. Only success emits exactly R and EOF. Process exit, parent death or a
 failed deadline tears down the namespace; clean external SIGTERM stops it.
 Shutdown sends TERM/CONT, then KILL within a total three-second grace. Liveness
 is monitored after readiness; hung-but-live daemons are not yet health-checked.
+
+The supervisor's outer deadline is 120 seconds. The service verifies about
+2.44 GB of model data before listening; a controlled 32 MiB/s model-device
+limit reproduced failure under the former 55-second budget. The longer budget
+allows that verification to finish without skipping it or reporting early
+readiness. It is a fixed limit, not an indefinitely renewable progress timer;
+slower or stalled storage can still fail startup. This reproduction does not
+establish the cause of the earlier uninstrumented timeout.
+
+The composed native-platform test with the new budget reaches readiness in
+80 seconds at the same 32 MiB/s limit, then draws changing Vulkan and OpenGL
+frames and cleans up the domain and cgroup. The root filesystem differs only
+in nsinit/supervisor; its other 26,029 paths remain identical. This is a
+controlled storage-delay regression, not general reliability qualification.
 
 ## Packaging and platform requirements
 

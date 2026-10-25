@@ -37,7 +37,9 @@
 #define GATEWAY_UID 1002
 #define CLIENTS 8
 #define STACK_BYTES (128 * 1024)
-#define START_MS 60000
+/* Full model verification can exceed a minute on cold/slower storage. Keep a
+ * fixed outer bound and leave nsinit five seconds for failure teardown. */
+#define START_MS 120000
 #define STOP_MS 5000
 #define CLIENT_MS 5000
 

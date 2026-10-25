@@ -54,7 +54,7 @@
 #define NI_KERNEL "6.6.87.2-enclave-kvm-box"
 #define READY_FD 3
 #define PARENT_FD 4
-#define STARTUP_MS 55000      /* the supervisor allows 60000 from before our exec */
+#define STARTUP_MS 115000     /* supervisor allows 120000 from before our exec */
 #define EXEC_MS 5000          /* fork to confirmed execve */
 #define TICK_MS 100
 #define RETRY_MS 250

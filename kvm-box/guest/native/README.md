@@ -71,7 +71,8 @@ the verified executable outside those descriptor numbers. fd 3 is a readiness
 pipe: nsinit sends exactly R then closes it. fd 4 is the supervisor pidfd and
 must remain monitored. Other inherited descriptors are closed; environment is
 cleared. PR_SET_PDEATHSIG and pidfd checks close the parent-death race.
-Readiness times out after 60 seconds. Stop uses pidfd SIGTERM, then SIGKILL
+Readiness times out after 120 seconds, allowing full model verification on
+slower storage. Stop uses pidfd SIGTERM, then SIGKILL
 after five seconds. Killing namespace PID 1 also removes descendants that
 escaped their process group. Unexpected termination becomes failed.
 
@@ -132,9 +133,10 @@ verification and the remaining authenticated-resource/admission requirements.
 
 ## Verification
 
-- Seven supervisor checks use real namespaces, pidfds and Unix credentials,
+- Nine supervisor checks use real namespaces, pidfds and Unix credentials,
   including escaped descendants, abnormal readiness, supervisor death, inherited
-  signals/closed stdio, and child mounts under a shared parent.
+  signals/closed stdio, child mounts under a shared parent, the actual two-minute
+  startup deadline, and explicit stop during startup.
 - Nine network checks use actual nftables and packets, including wrong-UID
   server impersonation and raw-worker TCP denial.
 - Gateway tests use real Unix sockets and TCP, protocol rejection, credentials,

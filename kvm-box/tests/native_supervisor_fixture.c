@@ -41,7 +41,10 @@ int main(void) {
         signal(SIGTERM, SIG_IGN);
         for (;;) pause();
     }
-    if (!strcmp(mode, "split-invalid")) {
+    if (!strcmp(mode, "never-ready")) {
+        /* Keep the readiness pipe open without writing. The production
+         * supervisor deadline must kill this namespace and its descendant. */
+    } else if (!strcmp(mode, "split-invalid")) {
         if (write(3, "R", 1) != 1) return 69;
         usleep(50000);
         if (write(3, "X", 1) != 1) return 69;

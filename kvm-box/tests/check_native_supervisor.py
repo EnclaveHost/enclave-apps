@@ -246,6 +246,28 @@ class SupervisorChecks(unittest.TestCase):
         finally:
             subprocess.run(['mount', '--make-private', str(self.root)], check=True)
 
+    def test_08_startup_deadline_kills_unready_namespace(self):
+        self.launch('never-ready')
+        started = time.monotonic()
+        self.assertEqual(self.control(b'B')['status'], 'starting')
+        self.wait_state('failed', seconds=125)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 119)
+        self.assertLess(elapsed, 125)
+        self.assert_no_descendants()
+        self.launch()
+        self.control(b'B'); self.wait_state('running')
+
+    def test_09_stop_during_startup_kills_unready_namespace(self):
+        self.launch('never-ready')
+        self.control(b'B')
+        until = time.monotonic() + 2
+        while not self.escaped_processes() and time.monotonic() < until:
+            time.sleep(.01)
+        self.assertTrue(self.escaped_processes())
+        self.control(b'H'); self.wait_state('stopped')
+        self.assert_no_descendants()
+
 if __name__ == '__main__':
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(SupervisorChecks))
     receipt = {'schema': 'kvm-box-native-supervisor-check/1', 'testsRun': result.testsRun,
