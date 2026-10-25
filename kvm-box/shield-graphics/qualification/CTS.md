@@ -407,3 +407,38 @@ run and cleanup evidence. Stream admission counts are not verified compute
 results. A follow-up disposable fixture extends only that front wait budget and
 test command deadlines; it must disclose this difference and cannot qualify
 production owner provisioning. Production front behavior remains unchanged.
+
+
+### Standard native CLI acceptance and v7 loopback policy (2026-10-25)
+
+The corrected extended-front fixture completed sd-cli with 392 verified masked
+exchanges and the expected PNG. llama-cli loaded its model but remained waiting
+for its own HTTP helper until the 900-second test deadline. The native nft policy
+blocked UID 1000 loopback TCP; this was not a GPU transport stall. Exported
+`native-cli-v6-sd-pass-llama-loopback` preserves the failed suite and sd success.
+
+The policy now marks desktop-initiated 127.0.0.1 TCP and requires UID 1000 on
+replies before established-flow acceptance. All fixed control and private-service
+guards remain. A real nftables regression reproduces the old failure and passes
+19 expectations with the change, including denial of cross-role helpers. The
+monitor embeds exactly the generator's policy. Native Go suites pass.
+
+A fresh NucBox fixture with that policy passed both packaged commands: sd-cli
+392 verified exchanges / 51,921,289,216 MACs and the exact reference PNG;
+llama-cli 511 exchanges / 14,478,327,808 MACs and the expected Paris answer.
+The CLI processes retain UID 1000, zero capabilities, seccomp, VSOCK denial and
+no physical GPU nodes. The test VM was removed, its VMGS archived and transport
+closed; production VMs and host security remained unchanged during this run.
+`native-v7-cli-checkpoint.json` and exported `native-cli-loopback-pass` preserve
+this scope. These small deterministic cases do not prove general numerical
+quality, speed, arbitrary CUDA compatibility or complete graphics conformance.
+
+The associated separate signed v7 candidate is
+`abbbecfeef734933cd50624dfe5f591823c592da7e3bef21239a27688d04110d`;
+launch measurement
+`d82dcdbb9f37abedbe408d89509e02dabe7c255734d92345fd7997a5bdb99d4e`.
+Only its monitor changed from v6. Independent signature and archive checks pass.
+The CLI fixture used a test monitor/front over the immutable production root;
+it is not fresh hardware attestation of the signed candidate or owner release.
+Final GUI/Moonlight acceptance, requested menu cleanup, wallet publication and
+production deployment remain outstanding. General rendering remains CPU Mesa.

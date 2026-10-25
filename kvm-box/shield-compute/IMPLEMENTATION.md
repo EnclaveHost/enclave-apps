@@ -1806,3 +1806,17 @@ The Windows bridge itself, manager GPU allocation, separate image selection,
 production monitor/native launch, release binding and actual GPU workloads are
 not yet integrated by this phase. Desktop admission remains disabled. No owner
 secret, running user service, NucBox deployment or publication was changed.
+
+
+## Native NucBox standard CLI acceptance (2026-10-25)
+
+Packaged sd-cli and llama-cli now pass inside the native desktop role through
+the standard OpenCL frontend, with 392 and 511 verified masked exchanges. The
+fixed sd PNG and llama answer match their deterministic references. A native
+loopback policy bug blocked llama-cli's own helper; the fix preserves cross-role
+and control-port denial in real nftables tests. See
+`../shield-graphics/qualification/native-v7-cli-checkpoint.json` and `CTS.md` for
+scope and evidence. This is a privileged lifecycle fixture, not real owner
+provisioning or final production publication. The earlier statement that no
+standard API exists describes the October 23 prototype only. Final menu cleanup,
+GUI/Moonlight acceptance, branding and wallet deployment are still outstanding.
