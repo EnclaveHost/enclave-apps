@@ -34,6 +34,16 @@ FILES = {
  'sunshineApps': ('sunshine-apps.json', 0o444),
 }
 
+AUTOMATION_FILES = {
+ 'automation': ('usr/local/libexec/kvm-box/automation', 0o555),
+ 'capture': ('usr/local/libexec/kvm-box/capture', 0o555),
+}
+
+def files_for_schema(schema):
+ if schema == 'kvm-box-native-root-build/1': return dict(FILES)
+ if schema == 'kvm-box-native-root-build/2': return {**FILES, **AUTOMATION_FILES}
+ raise ValueError('unsupported build specification')
+
 def digest(path):
  with open(path, 'rb') as f: return hashlib.file_digest(f, 'sha256').hexdigest()
 
@@ -76,7 +86,8 @@ def main():
  os.umask(0o022)
  if len(sys.argv)!=2: raise SystemExit('usage: build_root_image.py BUILD_SPEC.json')
  specpath=Path(sys.argv[1]).resolve(); spec=read_json(specpath)
- if set(spec)!=FIELDS or spec['schema']!='kvm-box-native-root-build/1' or set(spec['files'])!=set(FILES):
+ image_files=files_for_schema(spec.get('schema'))
+ if set(spec)!=FIELDS or set(spec['files'])!=set(image_files):
   raise ValueError('unsupported build specification')
  if os.getuid()!=0:
   env={**os.environ,'KVMBOX_BUILD_PARENT_USERNS':os.readlink('/proc/self/ns/user'),'KVMBOX_BUILD_PARENT_MNTNS':os.readlink('/proc/self/ns/mnt')}
@@ -172,7 +183,7 @@ def main():
    shutil.copytree(src,merged/rel,symlinks=True)
   if tree(merged/'opt/shield')!=sdk_tree:raise ValueError('copied SDK differs from verified source tree')
   if tree(merged/'usr/share/kvm-box/native-ui')!=asset_manifest:raise ValueError('copied UI differs from verified source tree')
-  for key,(rel,mode) in FILES.items():write(rel,sources[key].read_bytes(),mode)
+  for key,(rel,mode) in image_files.items():write(rel,sources[key].read_bytes(),mode)
   write('etc/pulse/client.conf',b'autospawn = no\n')
   write('etc/resolv.conf',b'nameserver 127.0.0.2\noptions timeout:2 attempts:2\n')
   write('desktop.profile',b'KVM-BOX-MASKED/1\n')

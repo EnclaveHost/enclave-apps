@@ -61,7 +61,7 @@
 #define CREDS_MS 20000
 #define PACTL_MS 5000
 #define XPROBE_MS 3000
-#define PROBE_MS 8000         /* readiness.py: interpreter start plus its own 2-3 s bound */
+#define PROBE_MS 8000         /* readiness.py: interpreter start plus its own <=6 s bound */
 #define CONNECT_MS 1000
 #define TERM_GRACE_MS 2000    /* both graces together stay under the supervisor's 5 s kill */
 #define KILL_GRACE_MS 1000
@@ -146,6 +146,8 @@ static char *const websockify_argv[] = { "/usr/bin/websockify", "127.0.0.1:6080"
 static char *const service_argv[] = {
     "/usr/bin/python3", "-I", "/shield/service.py", "--config", "/shield/native-service.json", NULL
 };
+static char *const automation_argv[] = { "/usr/local/libexec/kvm-box/automation", NULL };
+static char *const automation_probe_argv[] = { "/usr/bin/python3", "-I", READINESS, "automation", NULL };
 static char *const inner_argv[] = { "/usr/local/libexec/kvm-box/inner", NULL };
 static char *const worker_probe_argv[] = { "/usr/bin/python3", "-I", READINESS, "worker", NULL };
 static char *const compute_probe_argv[] = { "/usr/bin/python3", "-I", READINESS, "compute", NULL };
@@ -166,6 +168,8 @@ static const struct launch L_SUNSHINE = DESKTOP("sunshine", sunshine_argv, 1);
 static const struct launch L_X11VNC = DESKTOP("x11vnc", x11vnc_argv, 1);
 static const struct launch L_WEBSOCKIFY = ROLE("websockify", UI_UID, websockify_argv, 1);
 static const struct launch L_SERVICE = ROLE("shield-service", SERVICE_UID, service_argv, 1);
+static const struct launch L_AUTOMATION = DESKTOP("automation", automation_argv, 1);
+static const struct launch L_AUTOMATION_PROBE = ROLE("automation-probe", UI_UID, automation_probe_argv, 0);
 static const struct launch L_INNER = ROLE("inner", UI_UID, inner_argv, 1);
 static const struct launch L_WORKER_PROBE = ROLE("worker-probe", SERVICE_UID, worker_probe_argv, 0);
 static const struct launch L_COMPUTE_PROBE = ROLE("compute-probe", UI_UID, compute_probe_argv, 0);
@@ -654,12 +658,15 @@ static int start_session(void) {
     RUN("sunshine", start(&L_SUNSHINE));
     RUN("x11vnc", start(&L_X11VNC));
     RUN("websockify", start(&L_WEBSOCKIFY));
+    RUN("automation", start(&L_AUTOMATION));
+    RUN("automation-socket", wait_socket("/run/native-automation/desktop.sock", DESKTOP_UID));
     RUN("inner", start(&L_INNER));
 
     for (size_t i = 0; i < sizeof tcp_ports / sizeof tcp_ports[0]; ++i)
         RUN(tcp_ports[i].name, wait_tcp(tcp_ports[i].port));
     RUN("compute-probe", probe(&L_COMPUTE_PROBE, PROBE_MS));
     RUN("inner-probe", probe(&L_INNER_PROBE, PROBE_MS));
+    RUN("automation-probe", probe(&L_AUTOMATION_PROBE, PROBE_MS));
     RUN("ready", signal_ready());
     return 0;
 }

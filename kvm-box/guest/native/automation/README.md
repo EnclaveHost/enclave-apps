@@ -1,9 +1,9 @@
 # Native desktop automation service
 
 This is the desktop-side implementation for migrating RISC Box's `/exec` and
-`/computer` clients. The controller and both gateways are wired in source, but these
-changes are **not yet in the measured/released image**. Image integration and
-a real confined-VM acceptance run remain required before changing EyesOff AI
+`/computer` clients. The controller, both gateways, launcher, and image builder are wired in source.
+A schema-2 root image includes the service and capture helper; a real confined-VM
+acceptance run and signed release remain required before changing EyesOff AI
 or the API MCP Adapter configuration.
 
 The service must run as desktop UID/EUID 1000 inside the existing confined
@@ -79,6 +79,15 @@ sets known pixels, checks exact screenshot bytes and pointer coordinates, tests
 option-like typed text, and terminates only that test server. It never connects
 to the user's display or a production VM. Its JSON report pins tested binaries.
 
+The startup protocol and image-schema checks run from the repository root:
+
+```sh
+python3 kvm-box/tests/check_native_automation_readiness.py
+```
+
+The real socket case requires local UID/GID1000 and otherwise reports a skip.
+These checks do not replace startup and endpoint validation in the confined VM.
+
 ## Required release work
 
 1. Source complete: optional `KVMBOX_AUTOMATION_KEY` is loaded only by the
@@ -93,9 +102,12 @@ to the user's display or a production VM. Its JSON report pins tested binaries.
    It rejects redirects, chunked replies, oversized replies and malformed JSON.
    Rejected bodies are closed without draining. Source tests cover these
    boundaries, but confined-VM qualification is still required.
-3. Add the two binaries and service launch/readiness to a new measured image;
-   preserve the UID separation and the masked-only GPU path. Rebuild, sign and
-   qualify that image before enabling its profile.
+3. Image integration complete: schema `kvm-box-native-root-build/2` requires
+   pinned automation and capture binaries. The launcher starts automation as a
+   critical desktop service and probes it as UID1003 before declaring readiness.
+   The probe executes a fixed command and checks a bounded JPEG header; it is a
+   startup smoke test, not a full decoder or graphics correctness test. Sign and
+   qualify the resulting platform before enabling its profile.
 4. Verify authenticated endpoints, wrong keys/roles, timeout cleanup, real
    screenshot/input, native compute and graphics from the actual VM. Then
    publish the new version and migrate the two running tool configurations.

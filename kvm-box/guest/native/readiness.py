@@ -12,7 +12,9 @@ worker  (UID 1001): reserved local broker route reachability only. This is not
                     remote attestation or a GPU work check; no bytes are sent.
 compute (UID 1003): framed {"op":"status"} to the masking service.
 inner   (UID 1002): GET /compute/api/native and /vnc.html on 127.0.0.1:18080.
+automation (UID 1003): fixed desktop-user command and screenshot over Unix socket.
 """
+import base64
 import json
 import os
 import socket
@@ -161,6 +163,10 @@ def http_get(path, deadline, max_body):
                 break
             data.extend(chunk)
             require(len(data) <= limit)
+    return parse_http(data, max_body)
+
+
+def parse_http(data, max_body):
     end = data.find(b'\r\n\r\n')
     require(0 < end <= MAX_HEADERS)
     lines = bytes(data[:end]).split(b'\r\n')
@@ -192,7 +198,73 @@ def inner():
     require(media == b'text/html')
 
 
-PROBES = {'worker': (1001, worker), 'compute': (1003, compute), 'inner': (1002, inner)}
+def automation_exchange(directory, path, body, deadline):
+    limit = 6 * 1024 * 1024
+    with unix_connect(directory, 'desktop.sock', 1000, 1000, 0o660, deadline) as s:
+        require(peer_uid(s) == 1000)
+        request = (b'POST ' + path + b' HTTP/1.1\r\nHost: desktop\r\n'
+                   b'Content-Type: application/json\r\nContent-Length: ' + str(len(body)).encode() +
+                   b'\r\nConnection: close\r\n\r\n' + body)
+        s.settimeout(remaining(deadline)); s.sendall(request)
+        data = bytearray()
+        while True:
+            s.settimeout(remaining(deadline)); chunk = s.recv(65536)
+            if not chunk: break
+            data.extend(chunk); require(len(data) <= MAX_HEADERS + limit)
+        media, response = parse_http(data, limit)
+        require(media == b'application/json')
+        return strict_json(response)
+
+
+def automation():
+    deadline = time.monotonic() + 6
+    directory = pinned_directory('/run/native-automation', 1000, 1000, 0o750)
+    try:
+        command = automation_exchange(directory, b'/exec',
+            b'{"cmd":"printf native-automation-ready","timeout_s":1,"max_bytes":1024}', deadline)
+        require(isinstance(command, dict) and command.get('ok') is True and
+                type(command.get('exitCode')) is int and command['exitCode'] == 0 and
+                command.get('output') == 'native-automation-ready' and command.get('truncated') is False)
+        picture = automation_exchange(directory, b'/computer',
+            b'{"action":"screenshot","quality":30}', deadline)
+        require(isinstance(picture, dict) and picture.get('ok') is True and picture.get('mime') == 'image/jpeg')
+        screen = picture.get('screen')
+        require(isinstance(screen, dict) and type(screen.get('width')) is int and
+                type(screen.get('height')) is int and 0 < screen['width'] <= 3840 and 0 < screen['height'] <= 2160)
+        image = base64.b64decode(picture.get('image', ''), validate=True)
+        jpeg_dimensions(image, screen['width'], screen['height'])
+    finally:
+        os.close(directory)
+
+
+def jpeg_dimensions(image, width, height):
+    """Check the bounded baseline JPEG header emitted by Go's encoder.
+
+    This is a startup smoke check, not a complete JPEG decoder or a graphics
+    correctness test. Runtime qualification decodes and inspects actual pixels.
+    """
+    require(4 <= len(image) <= 4*1024*1024 and image.startswith(b'\xff\xd8') and image.endswith(b'\xff\xd9'))
+    at, found = 2, False
+    while at + 4 <= len(image):
+        require(image[at] == 255)
+        marker = image[at+1]
+        length = int.from_bytes(image[at+2:at+4], 'big')
+        require(length >= 2 and at + 2 + length <= len(image))
+        segment = image[at+4:at+2+length]
+        if marker == 0xc0:
+            require(not found and len(segment) == 15 and segment[0] == 8 and segment[5] == 3)
+            require(int.from_bytes(segment[1:3], 'big') == height and int.from_bytes(segment[3:5], 'big') == width)
+            found = True
+        elif marker == 0xda:
+            require(found and len(segment) >= 6 and at + 2 + length < len(image) - 2)
+            return
+        else:
+            require(marker in (0xc4, 0xdb, 0xdd, 0xfe) or 0xe0 <= marker <= 0xef)
+        at += 2 + length
+    raise NotReady()
+
+
+PROBES = {'worker': (1001, worker), 'compute': (1003, compute), 'inner': (1002, inner), 'automation': (1003, automation)}
 
 
 def main(argv):

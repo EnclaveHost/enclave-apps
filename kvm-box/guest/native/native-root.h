@@ -322,6 +322,8 @@ static int native_prepare_root(void) {
     nr_close(&f[NR_T1]); nr_close(&f[NR_T2]);
     NR_FD(NR_T1, nr_mkdir(f[NR_T0], "udev", 0755, 0, 0));
     nr_close(&f[NR_T1]);
+    NR_FD(NR_T1, nr_mkdir(f[NR_T0], "native-automation", 0750, NR_DESKTOP, NR_DESKTOP));
+    nr_close(&f[NR_T1]);
     NR_FD(NR_T1, nr_mkdir(f[NR_T0], "shield", 0750, NR_SHIELD, NR_DESKTOP));
     NR_FD(NR_T2, nr_mkdir(f[NR_T1], "jobs", 0700, NR_SHIELD, NR_SHIELD));
     nr_close(&f[NR_T1]); nr_close(&f[NR_T2]);

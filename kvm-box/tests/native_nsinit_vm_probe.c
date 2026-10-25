@@ -38,7 +38,7 @@ static pid_t check_roles(pid_t init) {
  }
  fclose(f);
  dprintf(1,"NSINIT_ROLE_CHECK children=%u rootHelpers=%u valid=%d\n",count,root,valid);
- return valid && count==10 && root==1 && flux>0 ? flux : -1;
+ return valid && count==11 && root==1 && flux>0 ? flux : -1;
 }
 static int critical_case(void){char b[2048];int f=open("/proc/cmdline",O_RDONLY|O_CLOEXEC);if(f<0)return -1;ssize_t n=read(f,b,sizeof b-1);close(f);if(n<0)return -1;b[n]=0;return strstr(b,"nsinit_case=critical")!=NULL;}
 static int run(void) {
