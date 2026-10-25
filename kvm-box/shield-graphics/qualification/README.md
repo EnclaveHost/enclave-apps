@@ -56,3 +56,20 @@ same-length `OpName` debug string in the compute module, and validate it with
 `spirv-val --target-env vulkan1.1`. This case intentionally remains local.
 The service and GPU policy are synthetic fixtures; successful tests do not
 establish production admission or attestation.
+
+
+## OpenGL compute reference
+
+`prepass-gl.cpp` and `prepass-gl.comp` exercise ordinary OpenGL compute through
+Zink on the pinned Vulkan ICD. Build with `OUTPUT=/output/gl sh /source/build-gl.sh`
+in the tools image, then run `prepass-gl prepass-gl.comp` on the desktop display.
+It checks 2,048 outputs across eight dispatches, SSBO alignment, untouched guards
+and unchanged input using independent integer arithmetic. It requires a Zink
+llvmpipe renderer and claims no GPU offload.
+
+This fixture passes both in the isolated container and under the actual KVM
+desktop role, together with the Vulkan protected prepass and worker-corruption
+checks. The current exact-module driver keeps Zink's generated compute shader
+local. Its generated SPIR-V uses a set-3 descriptor array and four scalar stores;
+structural proof and runtime descriptor admission must support that representation
+before OpenGL compute can use the masked route.

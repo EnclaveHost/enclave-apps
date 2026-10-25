@@ -68,6 +68,8 @@ clean stop, restart and supervisor-death teardown. A further KVM run corrupts
 an actual GPU reply: the driver reports device loss, publishes no output,
 skips the later draw and refuses retry without another worker connection.
 Both OpenGL and Vulkan clients map the pinned patched Vulkan library.
+A standard OpenGL compute fixture also checks 2,048 exact outputs and SSBO
+guards inside that VM; its Zink-generated shader currently remains local.
 
 Root squashfs SHA-256:
 `2b3f3969cf5927895c2d33bdd5548ded9b5cf631be2f2d2d0db9f8c9b86b8c6c`.
