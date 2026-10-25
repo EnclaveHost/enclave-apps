@@ -2,7 +2,14 @@
 
 Status: feasibility/design note, 2026-10-24. No masked hardware graphics driver
 is implemented. The current logical GPU serves compute; the desktop renders
-inside the confidential VM using its software graphics path.
+inside the isolated VM using its software graphics path.
+
+The user has now explicitly requested work through a usable OpenGL/Vulkan
+driver. The separate [graphics reference](../shield-graphics/README.md) adds a
+Vulkan software ICD to the desktop-derived development image and demonstrates
+OpenGL through Zink plus real Vulkan/OpenGL frames in an isolated container.
+This supplies an API/reference baseline; VM qualification and protected
+hardware lowering remain outstanding. It does not complete the graphics goal.
 
 A hybrid renderer is a possible research direction under the existing
 untrusted-GPU threat model. Selected linear work with explicitly public
