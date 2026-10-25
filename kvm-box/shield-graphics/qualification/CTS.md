@@ -337,3 +337,27 @@ exported `native-graphics-final-v5` evidence directory contains full CTS case
 logs, fixture source, lifecycle results, masked failure evidence and a verified
 hash manifest. Its separate `native-platform-v5-signed-graphics` package retains
 historical export-time pending flags; later qualification is recorded separately.
+
+
+A separate NucBox run then booted the exact signed v5 IGVM and loaded the fixed
+Wasm controller. Two fresh verifier challenges passed the hardware-bound app
+verifier for v5's new launch measurement, public signing identity, SVN 13,
+profile-derived app bundle, runtime and independently observed TLS key. All
+26 guest negative checks and two host negative checks were rejected. The
+prepared additive relay policy accepts these captured reports at SVN floor 13
+and rejects floor 14 without changing legacy image selections. That policy
+remains unactivated. See `native-v5-hardware-checkpoint.json` and exported
+`native-app-attestation-v5` evidence, including a standalone replay verifier.
+
+The controller remained sealed; this does not establish owner release or a
+running desktop on NucBox. The test VM was removed and its guest state archived.
+Original VMs, host boot, Secure Boot and VBS state were unchanged.
+
+The subsequent standard CLI check in a local native v5 fixture remains
+incomplete: the 4.5 GiB host test scope was OOM-killed before either application
+returned a completed result. A prepared 6 GiB retry has not launched because
+its preflight preserves 16 GiB of available memory for concurrent work.
+`native-cli-v5-incomplete` retains the failure evidence; it is neither a CLI
+pass nor evidence of an application defect. No production resource policy was
+changed in response. Complete this acceptance with sufficient test capacity
+before publication or removing the diagnostic menu entries.
