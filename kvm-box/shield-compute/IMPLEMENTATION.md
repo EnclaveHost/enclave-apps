@@ -1892,3 +1892,16 @@ real owner release, final GUI/FreeDoom/Firefox/Moonlight acceptance and wallet
 publication remain required. General rendering still uses CPU Mesa with the
 supported masked prepass. No universal CUDA, full GPU rendering, game support,
 Khronos conformance or host-OS exclusion is established by these tests.
+
+### Native v9 manager hardware checkpoint
+
+The installed-host compatibility overlay now has a disposable NucBox launch
+through its real Manager/router/WMI path. A purchased 600-percent allowance
+reached the signed monitor with six online processors and the expected 12/18-GiB
+application/partition memory split. Readiness correctly stayed closed before
+owner release; fresh hardware evidence passed. The real masked worker channel
+was authenticated, but this pre-owner run opened no GPU data streams. Cleanup
+removed all test resources without changing the four production VMs. See
+`../shield-graphics/qualification/native-v9-manager-checkpoint.json` and the
+corresponding CTS section. Production activation and final provisioned compute,
+graphics and Moonlight acceptance remain incomplete.

@@ -514,3 +514,30 @@ real owner release, final GUI/FreeDoom/Firefox/Moonlight acceptance and wallet
 publication remain required. General rendering still uses CPU Mesa with the
 supported masked prepass. No universal CUDA, full GPU rendering, game support,
 Khronos conformance or host-OS exclusion is established by these tests.
+
+## Signed desktop v9: manager hardware path (2026-10-25)
+
+`native-v9-manager-checkpoint.json` records a launch through the installed-host
+compatibility Manager, router and WMI launcher. The unchanged four-CPU catalog
+bundle received a purchased 600-percent CPU allowance, six online processors,
+12 GiB application RAM and an 18 GiB partition. Both host processor settings and
+the monitor quota read back exactly. The 109-module runtime was assembled from
+pinned installed sources and the committed compatibility overlay; its preceding
+manager suite passed 281 tests, plus eight packaging checks.
+
+The actual readiness judge verified the document on the app's TLS connection,
+but correctly refused readiness while owner secrets were missing (HTTP 503).
+Two separate fresh app challenges and 26 negatives passed the hardware verifier,
+with a fresh host TPM challenge and two negatives. The real masked-worker and
+egress transports started. No GPU data stream or owner release occurred. The
+component came from a local hash-pinned fixture fetcher, so this does not qualify
+live IPFS retrieval, catalog registration or purchase authorization.
+
+The test VM was removed, its guest state archived, every test process closed,
+and CPU/GPU/physical RAM reservations returned to zero. All four production VMs,
+the GPU worker and host boot/security state remained unchanged during this run.
+The evidence is `outputs/kvm-box/evidence/native-manager-hardware-v9/`; its bundled
+verifier replays the captured evidence independently. Production activation, owner
+provisioning, final desktop/Moonlight acceptance and wallet publication remain.
+This is launch and attestation evidence, not a new graphics or compute benchmark;
+the CPU Mesa and bounded masked-prepass limits above still apply.
