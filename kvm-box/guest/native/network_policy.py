@@ -33,6 +33,12 @@ def policy(runtime_uid):
         tcp dport 19080 reject
         ip daddr 127.0.0.1 tcp dport 18080 meta skuid 1002 accept
         tcp dport 18080 reject
+        # Desktop CLI tools may start private HTTP helpers on ephemeral ports.
+        # Tag only desktop-initiated loopback TCP, then require the same UID on
+        # replies BEFORE established handling; another role cannot impersonate
+        # that helper. Fixed control ports and private service IPs stay guarded.
+        ct mark 0x4b564d01 meta skuid != 1000 reject
+        meta skuid 1000 ip saddr 127.0.0.1 ip daddr 127.0.0.1 meta l4proto tcp ct direction original ct state new ct mark set 0x4b564d01 accept
         ct state established,related accept
         # Trusted native masking service's private llama HTTP helper only.
         meta skuid 1001 ip daddr 127.0.0.3 meta l4proto tcp accept

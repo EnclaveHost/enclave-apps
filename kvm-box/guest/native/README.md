@@ -461,3 +461,11 @@ The Windows bridge itself, manager GPU allocation, separate image selection,
 production monitor/native launch, release binding and actual GPU workloads are
 not yet integrated by this phase. Desktop admission remains disabled. No owner
 secret, running user service, NucBox deployment or publication was changed.
+
+Desktop CLI helpers may use IPv4 TCP on their own 127.0.0.1 loopback address.
+Desktop-initiated connections carry a reserved conntrack mark; replies must also
+originate from UID 1000 before the established-flow rule can accept them. This
+allows llama-cli's internal HTTP helper while refusing helper impersonation by
+other roles. Existing fixed-port guards and the UID 1001-only 127.0.0.3 service
+address take precedence. `test_loopback_policy.py` checks the real nft policy in
+an isolated network-none container, including cross-role and control-port denial.
