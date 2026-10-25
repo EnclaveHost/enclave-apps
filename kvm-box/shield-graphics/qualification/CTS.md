@@ -361,3 +361,29 @@ its preflight preserves 16 GiB of available memory for concurrent work.
 pass nor evidence of an application defect. No production resource policy was
 changed in response. Complete this acceptance with sufficient test capacity
 before publication or removing the diagnostic menu entries.
+
+
+## Worker startup failure and v6 candidate, 2026-10-25
+
+A NucBox CLI fixture exposed a panic when a failed vsock dial returned a typed
+nil connection through a non-nil interface. The monitor cleanup then called
+Close on that nil pointer. The production adapter now returns a nil interface
+with the error. A canceled-context regression against the real adapter reproduces
+the old panic and passes after the fix; the worker race suite and native monitor,
+desktop and worker tests pass. Platform source commit: `3655ccf8d`.
+
+The signed v6 image SHA-256 is
+`8a9b640bb468c6109f9a2bf9ca741da29df8be2b778d1694ed6af6768ca8e750`.
+Independent archive inspection shows only the monitor changed from v5. The
+immutable root, graphics libraries, runtime, controller, profile and media are
+identical. Repeated IGVM builds match, all five measurement mutations move the
+launch digest, and independent public-key verification accepts the signature
+and rejects an altered measurement and the wrong hash algorithm.
+
+`native-v6-build-checkpoint.json` and exported `native-worker-dial-fix-v6`
+evidence cover the regression and build. They do not establish v6 hardware
+attestation, CLI acceptance or owner release. The signed image is separate and
+unadmitted; historical v5 hardware reports cannot attest it. The failed CLI
+fixtures are retained, and the next test explicitly waits for the host bridge
+before loading the controller. That fixture-only delay is not a production
+startup-policy change or performance result.

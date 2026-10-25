@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "scope": "Worker vsock nil-interface regression and candidate build/signature verification only",
+  "sourceCommit": "3655ccf8d138ab87316ac671d1051dc8077aeedf",
+  "signedImageSha256": "8a9b640bb468c6109f9a2bf9ca741da29df8be2b778d1694ed6af6768ca8e750",
+  "launchMeasurement": "5c10c944afa0c5aa2118ce40e500c8d611bdbfc142251b03e9d4977fedfeb89e",
+  "onlyMonitorChanged": true,
+  "oldRegressionPanicked": true,
+  "fixedRaceSuitePassed": true,
+  "nativeUnitTestsPassed": true,
+  "freshHardwareAttestation": false,
+  "standardCliQualified": false,
+  "ownerRelease": false,
+  "published": false
+}
