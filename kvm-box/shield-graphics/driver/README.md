@@ -1,127 +1,112 @@
-# Experimental protected Vulkan prepass
+# Protected OpenGL/Vulkan prepass driver
 
-The patched Mesa 25.0.7 Lavapipe ICD now replaces one exact integer compute
-shader with a call to the guest-local Shield graph service. A standard Vulkan
-application uses the computed buffer for a subsequent draw. The application
-contains no Shield RPC calls. This is a narrow driver integration, **not a
-generic shader compiler or complete masked graphics renderer**.
+The separate Mesa 25.0.7 image exposes ordinary Vulkan through Lavapipe and
+OpenGL through Zink. A conditional NIR proof recognizes an integer compute
+prepass and routes it through the existing guest-local Shield service. Apps
+use standard graphics API calls; they contain no Shield RPCs. Unsupported
+shaders and graphics operations retain Mesa's CPU implementation inside the VM.
+This is functional API integration with a narrow protected operation, not a
+complete accelerated renderer or a performance/conformance claim.
 
-## Admission and execution
+## Compiler and runtime contract
 
-The initial matcher compares the complete SPIR-V module to the qualified bytes
-in `shield_prepass_spirv.h`. It also requires the ordinary compute pipeline
-path, the `main` entrypoint, and no specialization, extra creation structures or
-pipeline flags. The eligibility flag belongs to the pipeline and is never
-trusted from a serialized shader-object binary. Changed/unknown modules,
-shader objects, indirect dispatch (including device-generated commands), base
-dispatch and dispatches during active queries use the original CPU path.
-Generated-command routing never depends on device-memory dispatch counts.
-Queries retain llvmpipe accounting; tested invocation counts are 64 per dispatch.
+The compiler proves the transform `(x+y, y-x, z, w)` for 64 rows, where each
+component is `(word & 255) - 128`. It works on a bounded normalized NIR clone;
+the original CPU shader remains unchanged. It accepts equivalent arithmetic
+and renamed source modules rather than matching shader bytes. The proof uses
+32-bit modular affine equations, tracks raw inputs until low-byte extraction,
+and rejects unsupported instructions, control flow, memory effects and layouts.
+Unsigned shifts are distributed only over proven bounded, non-wrapping public
+row addresses with divisible coefficients. It never examines private values
+when deciding eligibility.
 
-The exact shader maps 64 rows of four uint32 words to
-`(x+y, y-x, z, w)`, where each component is `(word & 255) - 128`.
-The driver accepts one 64-thread workgroup, two non-dynamic storage-buffer
-bindings with exactly 1,024 bytes each, and disjoint aligned address ranges.
-Descriptor-buffer mode is excluded. Earlier writes finish before an owned
-input snapshot is made. Eligibility does not depend on private input values.
+Two named contracts share the same input/output byte layout:
 
-The client zero-pads the input and public 4×4 matrix to the existing FIELD_GEMM
-K=32 contract. No float is quantized. All intermediate integers are within
-int32 and the existing field bound. Masking and verification remain in the
-existing service/core; the driver has no worker address or raw GPU handle.
-The service separately approves the exact public matrix digest:
+- Vulkan: set 0, two individual storage-buffer bindings, one vector store per row.
+- Zink: set 3, binding 0, exactly two descriptors (input index 0, output index 1),
+  four scalar stores covering each output component exactly once.
+
+The proof is conditional, not authorization. Every dispatch independently
+requires an ordinary compute pipeline with `main`, no specialization, extra
+creation structures or flags; grid 1×1×1, block 64×1×1; exact non-dynamic,
+non-mutable storage-buffer layouts; two aligned, non-overlapping 1,024-byte
+ranges; no descriptor buffers, active queries or generated commands. Shader
+objects, binary state, indirect/base dispatch and other layouts stay on CPU.
+The result is never trusted from serialized shader objects. The proof has
+instruction, recursion, evaluation and normalization limits; exceeding them
+retains CPU execution. Upstream normalization preserves valid shader semantics;
+it does not promise to reproduce undefined behavior or nontermination.
+
+Earlier writes complete before an owned input snapshot. The client pads the
+public 4×4 transform to Shield's existing FIELD_GEMM K=32 contract; no float is
+quantized. The service separately approves the public matrix digest
 `cba40c98e8ffaf089742d01a6cf0caabc86caeaa7d3c52cd3047906670a3e517`.
-Tests approve it only in their isolated synthetic policy. No production policy
-has been changed. Unknown constants remain local under the service's policy.
+Tests authorize it only in isolated synthetic policies. No production policy
+changes, private constants, camera matrices or arbitrary shader approval follow
+from that test authorization.
 
-The only socket is `/run/shield/compute.sock`. The client checks the connected
-server UID is 1001 before sending bytes, bounds framing and total I/O time,
-validates compact JSON without duplicate keys, checks output types/ranges and
-exact per-request counters (one exchange, 8,192 MACs, no failures), and copies outputs only after the full response
-passes. An absent/refused socket before any request permits original CPU
-execution. A wrong peer, malformed reply or started-request failure causes
-Vulkan device loss and skips later commands; it never retries on CPU. Busy,
-permission and allocation errors are also fatal in this first version. Commands
-completed before the failed dispatch are not rolled back. Aliasing checks use
-virtual ranges; duplicate imports of the same underlying external memory are
-not identified. Explicit temporary-buffer wipes do not promise to erase every
-copy in json-c or application memory.
+## Protected channel and failure behavior
 
-Lavapipe's submission path previously ignored the execution function's return
-value. The patch propagates failure to the Vulkan queue. Pending fence and emulated timeline waits
-also check device loss on bounded condition-variable waits, including when an
-application requests an infinite wait. This prevents a failure before fence
-attachment from leaving that application blocked indefinitely. Pending waits
-poll at most every 100 ms; normal completion still wakes them immediately.
-Already-signaled waits may return device loss after the device has failed.
+The driver connects only to `/run/shield/compute.sock`, checks server UID 1001
+before sending bytes, bounds framing and total I/O time, validates canonical
+response types/ranges and exact counters, and publishes results only after full
+validation. Masking and verification remain in the existing service/core. The
+driver has neither a worker address nor a physical GPU handle.
 
-## Executed checks
+An absent/refused socket before sending permits original CPU execution. A wrong
+peer, malformed response or failure after a request begins causes device loss,
+skips later commands and never retries on CPU. Permission, busy and allocation
+errors are fatal in this version. Commands completed earlier are not rolled
+back. Aliasing checks use virtual ranges and do not identify duplicate imports
+of the same external memory. Explicit wipes cannot erase every library/app copy.
 
-- The ordinary Vulkan compute-to-draw fixture issued eight actual protected
-  dispatches: 65,536 verified GPU multiply-accumulates, with its 2,048 checked
-  scalar outputs and final frame matching the CPU reference exactly.
-- With no matrix approval, eight service requests executed locally with zero
-  worker connections. An unavailable service used the original CPU shader.
-- A changed debug name in otherwise valid SPIR-V kept the original CPU route
-  without contacting the service; this deliberately conservative matcher does
-  not claim structural or semantic shader recognition.
-- A malformed late output value and a wrong service UID caused device loss,
-  preserved the entire destination/sentinels, and skipped later draw/readback.
-- Modifying one value in an actual worker GEMM reply triggered Shield's
-  verification failure, retired the service, refused retry, and reached Vulkan
-  device loss with no output publication. Infinite fence waits returned in
-  about 0.17 seconds in this run.
-- Base dispatch, specialization, dynamic descriptors, oversized ranges,
-  device-generated dispatch and active statistics queries produce the same
-  reference frame without a service connection. These valid API cases run
-  with Khronos validation enabled; both output streams are checked for errors.
-- Infinite timeline waits, including wait-before-submit, and queue/device idle
-  waits observe a malformed protected response in under one second.
-- The client parser/serializer tests pass under AddressSanitizer and
-  UndefinedBehaviorSanitizer, including every truncation of a valid response,
-  duplicate keys, wrong types, bounds, routes and late failures.
-- The reference Vulkan fixture runs with Khronos validation enabled without
-  reported validation errors.
+Queue submission propagates execution failure. Pending fences and emulated
+timeline waits check loss at most every 100 ms, including infinite waits and
+wait-before-submit. Zink's reset query also checks the shared Vulkan loss state;
+loss flags are accessed atomically. A robust OpenGL context reports reset and
+subsequent commands report `GL_CONTEXT_LOST`. Applications must honor context
+loss; no post-reset buffer contents are promised by the API.
 
-The same patched ICD now passes in a separate dm-verity-backed KVM desktop
-image under UID 1000 with no capabilities, NoNewPrivs and seccomp. Its ordinary
-desktop environment selects the patched Vulkan ICD and Zink. The fixture makes
-eight verified GPU exchanges through a UID-checked guest socket, fixed vsock
-bridge and dedicated loopback worker; 2,048 scalar results and the complete
-triangle frame match the software reference exactly. Vulkan cubes and OpenGL
-gears render on the actual 1280×800 desktop, with no physical GPU nodes.
-Process mappings for both clients confirm the pinned patched Vulkan library.
+## Validation
 
-A second KVM run corrupts the ninth actual worker exchange, after the eight
-successful dispatches. Vulkan reports device loss, leaves the entire output
-unchanged, skips the later draw, and returns from its infinite wait in about
-0.12 seconds. The service retires; a new Vulkan process's retry fails locally
-with no tenth worker connection. Desktop restart and teardown still pass.
+The compiler fixtures cover equivalent modules, both descriptor forms, wrong
+arithmetic/centering/masks, memory layouts, missing stores, private-dependent
+addresses, overflow, volatile accesses, atomics and control flow. Each test
+requires exactly one explicit proof result and the expected contract/reason;
+compile failure never counts as successful rejection.
 
-This proves the narrow native driver path, not production admission,
-attestation, OpenGL protected lowering, conformance, streaming or a performance
-gain. The KVM launcher is a test adapter and the public-matrix policy is
-synthetic. The device continues reporting CPU honestly; most work stays local.
+The standard-API driver fixtures check 2,048 scalar outputs across eight
+dispatches, untouched inputs/guards and (Vulkan) an exact reference frame.
+Both Vulkan and ordinary OpenGL compute use eight real masked exchanges and
+65,536 verified MACs. No-approval and unavailable-service cases execute locally.
+Queries, generated/base dispatch, specialization, dynamic/wide descriptors and
+Zink descriptor-buffer mode remain CPU. Corrupting an actual worker GEMM reply
+retires the service and produces Vulkan device loss or OpenGL context loss;
+unverified output is not published. Fence/timeline/idle failure tests are bounded.
+The client parser also has ASan/UBSan coverage from the earlier qualified driver.
 
-## Reproduce the driver build
+The separate native KVM qualification includes actual Xorg rendering, both APIs,
+fixed UID-checked guest/vsock/loopback transport, lifecycle and corrupted-worker
+checks. Consult the saved evidence for the exact image and library hashes; a
+host-container run alone is not native qualification. Production admission,
+attestation, complete graphics conformance, Moonlight streaming and useful
+hardware acceleration for general applications remain separate acceptance work.
+The device honestly reports CPU. Rasterization, textures, visibility and frame
+encoding remain inside the VM; ordinary floating-point game shaders are local.
 
-Start from the upstream source archive pinned in `../mesa-source.json`.
-Apply `mesa-prepass.patch` with `git apply --check` and `git apply`. Copy
-`shield_prepass_client.c`, `shield_prepass_client.h`, and
-`shield_prepass_spirv.h` into `src/gallium/frontends/lavapipe/`. Build using the
-separate Mesa tools environment and `../build-mesa.sh`. The patch additionally
-requires the `json-c` development package. Its installed runtime library is a
-normal guest dependency. Use a separate install prefix; do not replace host
-Mesa. The source fixture, SPIR-V hash and its exact byte size are recorded in
-`prepass-module.json`.
+## Reproduce
 
-A focused independent Claude review identified generated-command admission,
-query accounting and untested timeline waits. Those cases now have explicit
-local routing or failure propagation and executed regression coverage. The
-review covered the ICD/client, not the underlying masking implementation.
+Start from the archive pinned in `../mesa-source.json`. Apply
+`mesa-prepass.patch` with `git apply --check` and `git apply`. Copy
+`shield_prepass_client.{c,h}` and `shield_prepass_nir.{c,h}` into
+`src/gallium/frontends/lavapipe/`, then use `../build-mesa.sh` in the pinned tools
+image with json-c development headers. Install into a separate prefix; do not
+replace host Mesa. The guest needs the normal json-c runtime dependency.
 
-Before broader use: structural NIR recognition
-and approved-operation coverage; Zink/OpenGL compute routing; complete-frame
-and performance testing. Private textures, visibility and framebuffer/encoding
-remain inside the VM. Ordinary floating-point game shaders are not accelerated
-by this initial integer prepass.
+For compiler fixtures, additionally apply `../qualification/nir-proof-tool.patch`
+and copy `shield_prepass_nir.{c,h}` into `src/compiler/spirv/`. Run
+`../qualification/test-nir.py --image sha256:TOOLS_HASH --source /work/mesa-source
+--build /work/build-parent --output /work/new-proof-results`.
+See `../qualification/README.md` for standard-API tests. Independent Claude
+reviews covered the original ICD/client and structural compiler integration;
+they are scoped reviews, not a cryptographic or platform security audit.

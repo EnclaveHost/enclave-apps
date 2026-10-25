@@ -107,6 +107,7 @@ static char *const desktop_env[] = {
     "VK_DRIVER_FILES=/opt/shield/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json",
     "VK_ICD_FILENAMES=/opt/shield/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json",
     "LIBGL_DRIVERS_PATH=/opt/shield/mesa/lib/dri",
+    "LD_LIBRARY_PATH=/opt/shield/mesa/lib", "ZINK_DESCRIPTORS=lazy",
     "LIBGL_ALWAYS_SOFTWARE=1", "GALLIUM_DRIVER=zink",
     "MESA_LOADER_DRIVER_OVERRIDE=zink", "LIBGL_KOPPER_DRI2=true",
     "LP_NUM_THREADS=2",

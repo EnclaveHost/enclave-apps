@@ -1,0 +1,93 @@
+--- a/src/compiler/spirv/spirv2nir.c
++++ b/src/compiler/spirv/spirv2nir.c
+@@ -28,6 +28,7 @@
+  */
+
+ #include "nir.h"
++#include "shield_prepass_nir.h"
+ #include "nir_spirv.h"
+ #include "spirv.h"
+ #include "util/u_dynarray.h"
+@@ -132,7 +133,10 @@
+    while (w < end) {
+       SpvOp opcode = w[0] & SpvOpCodeMask;
+       unsigned count = w[0] >> SpvWordCountShift;
+-      assert(count >= 1 && w + count <= end);
++      if (count < 1 || count > (size_t)(end - w)) {
++         fprintf(stderr, "Invalid SPIR-V instruction length\n");
++         return (struct entry_point){0};
++      }
+
+       if (opcode == SpvOpEntryPoint) {
+          seen_entry_point = true;
+@@ -239,6 +243,7 @@
+       }
+    }
+
++   if (optind >= argc) { print_usage(argv[0], stderr); return 1; }
+    const char *filename = argv[optind];
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+@@ -247,7 +252,7 @@
+    }
+
+    off_t len = lseek(fd, 0, SEEK_END);
+-   if (len % WORD_SIZE != 0) {
++   if (len < 5 * WORD_SIZE || len > 1024 * 1024 || len % WORD_SIZE != 0) {
+       fprintf(stderr, "File length isn't a multiple of the word size\n");
+       fprintf(stderr, "Are you sure this is a valid SPIR-V shader?\n");
+       close(fd);
+@@ -283,6 +288,12 @@
+
+    struct spirv_to_nir_options spirv_opts = {
+       .environment = env,
++      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
++      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
++      .phys_ssbo_addr_format = nir_address_format_64bit_global,
++      .push_const_addr_format = nir_address_format_logical,
++      .shared_addr_format = nir_address_format_32bit_offset,
++      .constant_addr_format = nir_address_format_64bit_global,
+    };
+
+    if (entry_point.stage == MESA_SHADER_KERNEL)
+@@ -295,7 +306,9 @@
+    if (nir) {
+       if (optimize) {
+          bool progress;
++         unsigned iterations = 0;
+          do {
++            if (++iterations > 64) { fprintf(stderr,"Normalization iteration limit\n"); return 1; }
+             progress = false;
+
+             #define OPT(pass, ...) ({                                  \
+@@ -324,14 +337,17 @@
+             #undef OPT
+          } while (progress);
+       }
++      struct shield_nir_proof proof = shield_prepass_prove_nir(nir);
++      fprintf(stderr,"SHIELD_STRUCTURAL_PROOF=%s reason=%s contract=%u\n",proof.contract!=SHIELD_NIR_NONE?"accepted":"rejected",shield_nir_reason_name(proof.reason),proof.contract);
+       nir_print_shader(nir, stdout);
+    } else {
+       fprintf(stderr, "SPIRV to NIR compilation failed\n");
+    }
+
++   bool compiled = nir != NULL;
+    glsl_type_singleton_decref();
+
+    ralloc_free(mem_ctx);
+
+-   return 0;
+-}
++   return compiled ? 0 : 1;
++}
+--- a/src/compiler/spirv/meson.build
++++ b/src/compiler/spirv/meson.build
+@@ -66,7 +66,7 @@
+
+ spirv2nir = executable(
+   'spirv2nir',
+-  files('spirv2nir.c') + [
++  files('spirv2nir.c', 'shield_prepass_nir.c') + [
+    vtn_generator_ids_h,
+   ],
+   dependencies : [dep_m, idep_vtn, idep_mesautil],

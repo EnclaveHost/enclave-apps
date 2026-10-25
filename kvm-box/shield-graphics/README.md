@@ -3,7 +3,7 @@
 The requested endpoint is usable OpenGL/Vulkan in the native desktop, with
 physical GPU work restricted to the masked channel and unsupported work kept
 inside the VM. This directory starts the graphics reference and acceptance
-path. A [narrow protected Vulkan prepass](driver/README.md) now passes real
+path. A [protected OpenGL/Vulkan prepass](driver/README.md) now passes real
 worker tests through a patched Mesa ICD in a host container and the actual
 native KVM desktop. General masked rendering remains incomplete.
 
@@ -31,7 +31,7 @@ results**, not native VM qualification, hardware acceleration, graphics API
 conformance testing, or Steam game compatibility results. The driver's
 reported memory total is not a measurement of the container's memory budget.
 
-## Native VM checkpoint
+## Earlier software-only native checkpoint
 
 The separate graphics root image now boots under the real native supervisor
 and nsinit in KVM with the existing desktop role policy. As UID 1000, with all
@@ -54,7 +54,7 @@ with dm-verity root
 This is a separate development image; no running user VM was replaced.
 
 
-## Native masked-driver checkpoint
+## Earlier exact-module native checkpoint
 
 A second separate image includes the patched ICD and a measured nsinit build
 with `KVMBOX_SHIELD_GRAPHICS`. Desktop applications inherit the Vulkan/Zink
@@ -79,6 +79,32 @@ The guest's `json-c` runtime is a normal measured Debian package. Matching
 virtio-vsock modules are in the test initrd. The original images and running
 VMs were preserved. Production runtime admission, hardware attestation,
 Moonlight video and general shader acceleration remain unqualified.
+
+## Structural OpenGL/Vulkan checkpoint
+
+The current source replaces byte matching with a bounded conditional NIR proof
+for equivalent shaders and Zink's descriptor-array/scalar-store representation.
+The standard OpenGL and Vulkan fixtures both use the masked route. CPU fallback
+remains available for unsupported semantics, layouts and API features. The
+separate desktop selects the measured Mesa libraries and lazy Zink descriptors;
+physical GPU nodes remain absent.
+
+Compiler admission has 32 positive/negative cases. The real-ICD regression suite
+has 25 cases, including OpenGL query accounting, descriptor-buffer fallback and
+actual worker corruption. Zink now propagates asynchronous Vulkan device loss
+to robust GL reset notification; subsequent commands report context loss.
+Shared loss flags use atomic accesses. Temporary proof/layout diagnostics have
+been removed. Independent compiler and driver reviews found no confirmed
+unsound admission; their scope excludes the underlying cryptographic proof.
+
+The native qualification checks 16 successful protected exchanges / 131,072
+MACs across both APIs, then corrupts the seventeenth response. OpenGL loses its
+context, and OpenGL/Vulkan retries fail without an eighteenth GPU exchange.
+Process maps verify both private Vulkan and Gallium libraries. Exact candidate
+hashes are recorded in [the qualification checkpoint](qualification/checkpoint.json)
+and with the exported evidence.
+This remains a test-adapter image with synthetic public-matrix approval;
+production attestation/admission and full-frame acceleration are not established.
 
 ## Reproduce
 
@@ -141,8 +167,8 @@ time; record its immutable image ID and package versions for each qualification.
 1. Qualify Moonlight video streaming with the graphics image and broader
    application workloads. Native desktop API/rendering checks now pass; keep
    the reference renderer available as the trusted fallback.
-2. Expand the VM-qualified protected Vulkan prepass from exact-module
-   admission into reviewed structural lowering. Existing public
+2. Expand the protected operation coverage beyond the structurally proven
+   fixed integer prepass. Existing public
    model policies do not authorize arbitrary scene coefficients or textures.
 3. Validate numeric semantics and leakage for each accelerated operation;
    preserve trusted handling of private visibility, texture addressing,
