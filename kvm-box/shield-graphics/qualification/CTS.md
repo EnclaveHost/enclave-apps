@@ -541,3 +541,26 @@ verifier replays the captured evidence independently. Production activation, own
 provisioning, final desktop/Moonlight acceptance and wallet publication remain.
 This is launch and attestation evidence, not a new graphics or compute benchmark;
 the CPU Mesa and bounded masked-prepass limits above still apply.
+
+## Signed desktop v9: live host pools and permanent assets (2026-10-25)
+
+`native-v9-livepool-checkpoint.json` closes the launch-sizing difference between
+the previous fixture and the live host. The separate test manager read the actual
+16-CPU / 96-GiB application pools and applied a 25% purchase: four processors,
+400% guest CPU quota, 24-GiB application allowance and a 36-GiB partition. Host
+and monitor readbacks matched. Fresh app/host verification passed again with
+26 guest and two host negative checks. The real readiness judge still refused
+service before owner provisioning; no desktop workload or GPU data stream ran.
+Cleanup removed the exact VM and all reservations. The four production VMs,
+physical worker and host boot/security matched the before/after inventories.
+
+The signed image, media, bridge, component and public release/configuration now
+have a separate permanent, protected NucBox directory. All nine files were
+independently rehashed there, and configuration identity and worker compatibility
+checks passed. Existing service configuration and processes were unchanged.
+The public controller gateway still returned 404, so normal wallet-authorized
+upload and actual catalog/component retrieval remain open. Evidence is in
+`native-manager-livepool-v9` and `native-durable-release-v9` under the exported
+`outputs/kvm-box/evidence/` directory. These checkpoints do not establish owner
+provisioning, production activation, final graphics/compute/Moonlight acceptance
+or publication; the rendering and threat-model limits above remain unchanged.
