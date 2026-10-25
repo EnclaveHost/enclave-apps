@@ -1,0 +1,23 @@
+--- a/tools/cli/cli-context.cpp
++++ b/tools/cli/cli-context.cpp
+@@ -477,6 +477,7 @@
+     };
+ 
+     while (true) {
++        const bool prompt_from_args = !params.prompt.empty();
+         std::string buffer;
+         {
+             ui::user_turn user_turn;
+@@ -515,8 +516,10 @@
+ 
+         bool add_user_msg = true;
+ 
+-        // process commands
+-        if (string_starts_with(buffer, "/exit")) {
++        // Arguments and prompt files are model input, not interactive commands.
++        if (prompt_from_args) {
++            cur_msg += buffer;
++        } else if (string_starts_with(buffer, "/exit")) {
+             break;
+         } else if (string_starts_with(buffer, "/regen")) {
+             if (impl->messages.size() >= 2) {

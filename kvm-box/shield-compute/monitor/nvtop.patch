@@ -1,0 +1,112 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 20258e6..553c4f7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -152,6 +152,8 @@ option(ENFLAME_SUPPORT "Build support for Enflame GCUs through libefml" ${ENFLAM
+ option(TENSTORRENT_SUPPORT "Build support for Tenstorrent accelerators through tt-kmd" ${TENSTORRENT_SUPPORT_DEFAULT})
+ option(IXML_SUPPORT "Build support for Iluvatar CoreX GPUs through libixml" ${IXML_SUPPORT_DEFAULT})
+ 
++option(SHIELD_SUPPORT "Build Enclave Shield logical GPU monitor" OFF)
++
+ add_subdirectory(src)
+ 
+ #///////////////////////////////////////////////////////////////////#
+diff --git a/include/nvtop/extract_gpuinfo_common.h b/include/nvtop/extract_gpuinfo_common.h
+index d088a7a..0d185ca 100644
+--- a/include/nvtop/extract_gpuinfo_common.h
++++ b/include/nvtop/extract_gpuinfo_common.h
+@@ -132,6 +132,11 @@ struct gpuinfo_extra_clock {
+ };
+ 
+ struct gpuinfo_dynamic_info {
++  // Trusted logical service counters; never physical GPU utilization.
++  bool shield_device;
++  bool shield_valid;
++  char shield_state[12];
++  uint64_t shield_jobs, shield_exchanges, shield_macs;
+   unsigned int gpu_clock_speed;       // Device clock speed in MHz
+   unsigned int gpu_clock_speed_max;   // Maximum clock speed in MHz
+   unsigned int mem_clock_speed;       // Device clock speed in MHz
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 83c2661..7ee319f 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -234,3 +234,10 @@ include(${PROJECT_SOURCE_DIR}/cmake/optimization_flags.cmake)
+ 
+ add_compiler_option_to_target_type(nvtop Debug PRIVATE ${ADDITIONAL_DEBUG_COMPILE_OPTIONS})
+ add_linker_option_to_all_but_target_type(nvtop dummy PRIVATE ${ADDITIONAL_RELEASE_LINK_OPTIONS})
++
++if(SHIELD_SUPPORT)
++  find_library(JSON_C_STATIC NAMES libjson-c.a REQUIRED)
++  target_sources(nvtop PRIVATE extract_gpuinfo_shield.c)
++  target_compile_definitions(nvtop PRIVATE SHIELD_SUPPORT)
++  target_link_libraries(nvtop PRIVATE ${JSON_C_STATIC})
++endif()
+diff --git a/src/interface.c b/src/interface.c
+index 9833f03..fc2c8ab 100644
+--- a/src/interface.c
++++ b/src/interface.c
+@@ -877,6 +877,30 @@ static unsigned collect_extra_info(const struct gpu_info *device, const nvtop_in
+   const struct gpuinfo_dynamic_info *dynamic_info = &device->dynamic_info;
+   const struct gpuinfo_static_info *static_info = &device->static_info;
+ 
++  if (options->has_gpu_info_bar && dynamic_info->shield_device && max_items >= 4) {
++    snprintf(items[count].name, sizeof(items[count].name), "State");
++    snprintf(items[count++].value, sizeof(items[0].value), "%s",
++             dynamic_info->shield_valid ? dynamic_info->shield_state : "offline");
++    const char *names[] = {"Jobs", "Exch", "MACs"};
++    uint64_t values[] = {dynamic_info->shield_jobs, dynamic_info->shield_exchanges, dynamic_info->shield_macs};
++    for (unsigned i = 0; i < 3; ++i) {
++      snprintf(items[count].name, sizeof(items[count].name), "%s", names[i]);
++      if (!dynamic_info->shield_valid) {
++        snprintf(items[count].value, sizeof(items[count].value), "N/A");
++      } else if (values[i] < 1000) {
++        snprintf(items[count].value, sizeof(items[count].value), "%" PRIu64, values[i]);
++      } else {
++        double compact = (double)values[i];
++        const char *units = "kMGTPE";
++        unsigned unit = 0;
++        compact /= 1000.;
++        while (compact >= 1000. && unit < 5) { compact /= 1000.; ++unit; }
++        snprintf(items[count].value, sizeof(items[count].value), "%.3g%c", compact, units[unit]);
++      }
++      ++count;
++    }
++  }
++
+   if (options->has_gpu_info_bar && IS_VALID(gpuinfo_extra_clocks_valid, dynamic_info->valid)) {
+     for (unsigned i = 0; i < dynamic_info->extra_clock_count; ++i) {
+       if (dynamic_info->extra_clocks[i].secondary)
+@@ -2638,6 +2662,16 @@ void print_snapshot(struct list_head *devices, bool use_fahrenheit_option, bool
+ 
+     printf("%s{\n", indent_level_two);
+ 
++    if (device->dynamic_info.shield_device) {
++      const struct gpuinfo_dynamic_info *d = &device->dynamic_info;
++      if (d->shield_valid)
++        printf("%s\"shield\": {\"state\": \"%s\", \"completed_jobs\": %" PRIu64
++               ", \"verified_exchanges\": %" PRIu64 ", \"verified_field_macs\": %" PRIu64 "},\n",
++               indent_level_four, d->shield_state, d->shield_jobs, d->shield_exchanges, d->shield_macs);
++      else
++        printf("%s\"shield\": null,\n", indent_level_four);
++    }
++
+     // Device Name
+     if (GPUINFO_STATIC_FIELD_VALID(&device->static_info, device_name))
+       printf("%s\"%s\": \"%s\",\n", indent_level_four, device_name_field, device->static_info.device_name);
+diff --git a/src/nvtop.c b/src/nvtop.c
+index d36efb1..8783111 100644
+--- a/src/nvtop.c
++++ b/src/nvtop.c
+@@ -131,7 +131,11 @@ int main(int argc, char **argv) {
+   bool hide_processes_option = false;
+   bool reverse_plot_direction_option = false;
+   bool encode_decode_timer_option_set = false;
++#ifdef SHIELD_SUPPORT
++  bool show_gpu_info_bar = true;
++#else
+   bool show_gpu_info_bar = false;
++#endif
+   bool show_all_info_bar = false;
+   bool dynamic_memory_units_option = false;
+   bool show_snapshot = false;

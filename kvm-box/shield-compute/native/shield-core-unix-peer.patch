@@ -1,0 +1,50 @@
+--- a/shielded-wire.c
++++ b/shielded-wire.c
+@@ -14,6 +14,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/socket.h>
++#include <sys/un.h>
+ #include <linux/vm_sockets.h>   /* after sys/socket.h: needs sa_family_t (aarch64 glibc) */
+ #include <sys/uio.h>
+ #include <limits.h>
+@@ -145,6 +146,39 @@
+ 
+ sh_pipe *sh_pipe_open(const char *host, int port, int *err) {
+     if (err) *err = SH_OK;
++    /* Private guest-local broker. The application process keeps its AF_VSOCK
++     * seccomp prohibition; a measured broker owns only a fixed worker route.
++     * The protocol and all masking/verification are unchanged. */
++    if (!strncmp(host, "unix:", 5)) {
++        const char *path = host + 5;
++        struct sockaddr_un un; memset(&un, 0, sizeof un);
++        if (*path != '/' || strlen(path) >= sizeof un.sun_path) {
++            if (err) *err = SH_ERR_IO;
++            return NULL;
++        }
++        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++        if (fd < 0) { if (err) *err = SH_ERR_IO; return NULL; }
++        un.sun_family = AF_UNIX;
++        memcpy(un.sun_path, path, strlen(path) + 1);
++        if (connect(fd, (struct sockaddr *)&un, sizeof un) != 0) {
++            close(fd); if (err) *err = SH_ERR_IO; return NULL;
++        }
++        /* A pathname or socket file owner is not server authentication. The
++         * measured local broker runs as root in the guest's user namespace;
++         * check the connected peer before any protocol bytes can be sent.
++         * This identifies only that broker, not its remote worker or the VM.
++         * There is deliberately no environment override or TCP fallback. */
++        struct ucred peer;
++        socklen_t peer_len = sizeof peer;
++        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0 ||
++            peer_len != sizeof peer || peer.uid != 0) {
++            close(fd); if (err) *err = SH_ERR_IO; return NULL;
++        }
++        sh_pipe *p = (sh_pipe *)calloc(1, sizeof *p);
++        if (!p) { close(fd); if (err) *err = SH_ERR_NOMEM; return NULL; }
++        p->fd = fd;
++        return p;
++    }
+     /* "vsock" or "vsock:<cid>": AF_VSOCK to the host (CID 2 unless told
+      * otherwise). A vsock round trip is a small fraction of slirp's, and at
+      * ~50 exchanges per token that fraction is most of the decode budget. */

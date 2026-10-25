@@ -1,0 +1,44 @@
+--- a/src/core/ggml_extend.hpp
++++ b/src/core/ggml_extend.hpp
+@@ -2164,8 +2164,15 @@
+         return !is_multi_device() && sd_backend_is_cpu(runtime_backend) && sd_get_accel_backend() != nullptr;
+     }
+ 
++    // OpenCL has a deliberately partial operator set (for example Q8 GET_ROWS
++    // is unsupported). A single OpenCL device still needs scheduler placement
++    // and a trailing CPU backend; direct graph submission bypasses supports_op.
++    bool uses_opencl_fallback() const {
++        return !is_multi_device() && sd_backend_is(runtime_backend, "opencl");
++    }
++
+     bool uses_sched() const {
+-        return is_multi_device() || uses_accel();
++        return is_multi_device() || uses_accel() || uses_opencl_fallback();
+     }
+ 
+     bool alloc_compute_buffer(ggml_cgraph* gf) {
+@@ -2400,13 +2407,13 @@
+                max_graph_vram_bytes > 0 &&
+                plan.segments.size() > 1 &&
+                !sd_backend_is_cpu(runtime_backend) &&
+-               !is_multi_device();
++               !uses_sched();
+     }
+ 
+     bool can_attempt_graph_cut_segmented_compute() const {
+         return max_graph_vram_bytes > 0 &&
+                !sd_backend_is_cpu(runtime_backend) &&
+-               !is_multi_device();
++               !uses_sched();
+     }
+ 
+     bool resolve_graph_cut_plan(ggml_cgraph* gf,
+@@ -2802,7 +2809,7 @@
+         }
+ 
+         ggml_status status;
+-        if (uses_accel()) {
++        if (uses_accel() || uses_opencl_fallback()) {
+             ggml_backend_sched_set_eval_callback(sched,
+                                                  sd_get_backend_eval_callback(),
+                                                  sd_get_backend_eval_callback_data());

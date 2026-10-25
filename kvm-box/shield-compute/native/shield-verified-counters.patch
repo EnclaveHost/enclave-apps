@@ -1,0 +1,93 @@
+--- a/wasm/ggml-shielded/shielded-tee.c
++++ b/wasm/ggml-shielded/shielded-tee.c
+@@ -489,6 +489,7 @@
+     uint64_t   spill_g_ready, spill_g_cap, spill_g_row_bytes, spill_g_bytes;
+ 
+     uint64_t   exchanges, macs, verify_fail, pads_used, pads_missed;
++    uint64_t   verified_exchanges, verified_macs;
+     sh_link_profile profile; /* caller-owned, independent of every other link */
+     /* Background importers publish this monotonic latch atomically. Keep it
+      * separate from the caller-owned remote-product counter. Never reset it
+@@ -531,6 +532,12 @@
+     if (e) *e = l->exchanges;
+     if (m) *m = l->macs;
+     if (v) *v = l->verify_fail + (uint64_t)__atomic_load_n(&l->pad_integrity_failed, __ATOMIC_ACQUIRE);
++}
++/* Separate from legacy diagnostics: local work and rejected replies never
++ * contribute. Call under the same serialization as sh_link_stats. */
++void sh_link_verified_stats(const sh_link *l, uint64_t *exchanges, uint64_t *macs) {
++    if (exchanges) *exchanges = l ? l->verified_exchanges : 0;
++    if (macs) *macs = l ? l->verified_macs : 0;
+ }
+ void sh_link_set_idle_work(sh_link *l, void (*fn)(void *), void *ctx) {
+     if (!l) return;
+@@ -2967,6 +2974,16 @@
+                             (unsigned long long)l->exchanges, (int)overlap, pm);
+                 }
+                 rc = SH_ERR_VERIFY; goto fail;
++            }
++        }
++        /* Commit only after EVERY member and row of this reply verified.
++         * A later failed chunk does not erase earlier verified work, but the
++         * application must still discard the failed graph/job's output. */
++        if (l->verify) {
++            l->verified_exchanges++;
++            for (size_t i = 0; i < n_nodes; i++) {
++                const sh_node *nd = &l->nodes[nodes[i]];
++                l->verified_macs += (uint64_t)m * (uint64_t)nd->K * (uint64_t)nd->N;
+             }
+         }
+         l->profile.completed_calls++;
+--- a/wasm/ggml-shielded/shielded-tee.h
++++ b/wasm/ggml-shielded/shielded-tee.h
+@@ -246,6 +246,10 @@
+ 
+ /* Counters, for the probe and for tests. */
+ void sh_link_stats(const sh_link *l, uint64_t *exchanges, uint64_t *macs, uint64_t *verify_fail);
++/* Completed, verified wire exchanges only; excludes local products, pad
++ * preparation, unverified mode and rejected replies. Earlier verified chunks
++ * still count if a later chunk fails. Serialized like sh_link_stats. */
++void sh_link_verified_stats(const sh_link *l, uint64_t *exchanges, uint64_t *macs);
+ 
+ /* Cumulative for this link only. Like sh_link_stats, the caller must serialize
+  * snapshots with operations on the SAME link. Different links own independent
+--- a/wasm/ggml-shielded/ggml-shielded.cpp
++++ b/wasm/ggml-shielded/ggml-shielded.cpp
+@@ -573,6 +573,22 @@
+     }
+     std::copy(v,v+24,out);
+     return 1;
++}
++
++void ggml_backend_shielded_verified_stats(uint64_t *exchanges, uint64_t *macs) {
++    sh_pool &p = sh_pool_get();
++    std::lock_guard<std::mutex> lock(p.mu);
++    sh_pool_init(p);
++    uint64_t total_exchanges = 0, total_macs = 0;
++    for (auto *s : p.cards) {
++        std::lock_guard<std::mutex> card_lock(s->mu);
++        uint64_t count = 0, work = 0;
++        sh_link_verified_stats(s->link, &count, &work);
++        total_exchanges += count;
++        total_macs += work;
++    }
++    if (exchanges) *exchanges = total_exchanges;
++    if (macs) *macs = total_macs;
+ }
+ 
+ void ggml_backend_shielded_stats(uint64_t *off, uint64_t *loc, uint64_t *macs, uint64_t *vf) {
+--- a/wasm/ggml-shielded/ggml-shielded.h
++++ b/wasm/ggml-shielded/ggml-shielded.h
+@@ -174,6 +174,12 @@
+  * over the cards: the quantity a dealt-pads usage receipt reports. */
+ GGML_BACKEND_API void ggml_backend_shielded_pads_used(uint64_t *used, uint64_t *missed);
+ /* Counters for the boot probe and the supervisor's verdict. */
++/* Wire-level verified work, distinct from the legacy graph-product counters.
++ * Chunking and grouped/split products follow actual exchanges, not graph nodes.
++ * Cached/local products and failed replies add nothing. A failed job can have
++ * earlier verified chunks: supervisors must publish only successful-job totals. */
++GGML_BACKEND_API void ggml_backend_shielded_verified_stats(uint64_t *exchanges,
++                                                           uint64_t *macs);
+ GGML_BACKEND_API void ggml_backend_shielded_stats(uint64_t *offloaded_nodes,
+                                                   uint64_t *local_nodes,
+                                                   uint64_t *macs,

@@ -1,0 +1,65 @@
+Adapted from PoCL commit 19dc70bbe927a6f6210ccd45b6a4c2a49fe6da96.
+Preserves the LLVM legacy pass-manager branch of the pinned 6.0 source.
+
+--- a/lib/CL/pocl_llvm_api.h
++++ b/lib/CL/pocl_llvm_api.h
+@@ -30,6 +30,7 @@
+ #include <llvm/IR/DiagnosticPrinter.h>
+ #include <llvm/IR/Module.h>
+ #include <llvm/Support/raw_os_ostream.h>
++#include <llvm/Target/TargetMachine.h>
+ 
+ #include <map>
+ #include <string>
+@@ -102,7 +103,8 @@
+  * Vectorize - whether to invoke the vectorizer (only used for legacy PM)
+  */
+ POCL_EXPORT void populateModulePM (void *Passes, void *Module, unsigned OptL,
+-                                   unsigned SizeL, bool Vectorize = true);
++                                   unsigned SizeL, bool Vectorize = true,
++                                   llvm::TargetMachine *TM = nullptr);
+ 
+ extern std::string CurrentWgMethod;
+ 
+--- a/lib/CL/pocl_llvm_wg.cc
++++ b/lib/CL/pocl_llvm_wg.cc
+@@ -313,7 +313,7 @@
+   PM.run(Bitcode, MAM);
+ #ifdef SEPARATE_OPTIMIZATION_FROM_POCL_PASSES
+   populateModulePM(nullptr, (void *)&Bitcode, OptimizeLevel, SizeLevel,
+-                   Vectorize);
++                   Vectorize, Machine.get());
+ #endif
+ }
+ 
+@@ -1528,7 +1528,7 @@
+ }
+ 
+ void populateModulePM(void *Passes, void *Module, unsigned OptL, unsigned SizeL,
+-                      bool Vectorize) {
++                      bool Vectorize, TargetMachine *TM) {
+ #if LLVM_MAJOR < MIN_LLVM_NEW_PASSMANAGER
+   PassManagerBuilder Builder;
+   Builder.OptLevel = OptL;
+@@ -1561,11 +1561,16 @@
+   CGSCCAnalysisManager CGAM;
+   ModuleAnalysisManager MAM;
+ 
+-  // Create the new pass manager builder.
+-  // Take a look at the PassBuilder constructor parameters for more
+-  // customization, e.g. specifying a TargetMachine or various debugging
+-  // options.
+-  PassBuilder PB;
++  // Match the work-group pipeline's vectorization policy and target.
++  // Backported from upstream 19dc70bbe927a6f6210ccd45b6a4c2a49fe6da96.
++  PipelineTuningOptions PTO;
++  PTO.LoopUnrolling = false;
++#if LLVM_MAJOR > 16
++  PTO.UnifiedLTO = false;
++#endif
++  PTO.SLPVectorization = Vectorize;
++  PTO.LoopVectorization = Vectorize;
++  PassBuilder PB(TM, PTO);
+ 
+   // Register all the basic analyses with the managers.
+   PB.registerModuleAnalyses(MAM);

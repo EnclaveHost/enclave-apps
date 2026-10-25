@@ -1,0 +1,992 @@
+--- a/src/core/ggml_extend.hpp
++++ b/src/core/ggml_extend.hpp
+@@ -25,6 +25,7 @@
+ #include <vector>
+ 
+ #include "core/ggml_extend_backend.h"
++#include "core/ggml_graph_operations.h"
+ #include "core/ggml_graph_cut.h"
+ #include "core/layer_split_partition.h"
+ #include "ggml-alloc.h"
+@@ -679,7 +680,7 @@
+         gate = x_vec[1];
+     }
+     gate = ggml_cont(ctx, gate);
+-    gate = ggml_silu_inplace(ctx, gate);
++    gate = sd_graph_silu_inplace(ctx, gate);
+ 
+     x = ggml_mul(ctx, x, gate);  // [ne3, ne2, ne1, ne0/2]
+ 
+@@ -970,7 +971,7 @@
+         x = ggml_cont(ctx, x);
+     }
+     if (inplace) {
+-        x = ggml_scale_inplace(ctx, x, factor);
++        x = sd_graph_scale_inplace(ctx, x, factor);
+     } else {
+         x = ggml_scale(ctx, x, factor);
+     }
+@@ -984,7 +985,7 @@
+         x = ggml_cont(ctx, x);
+     }
+     if (inplace) {
+-        x = ggml_gelu_inplace(ctx, x);
++        x = sd_graph_gelu_inplace(ctx, x);
+     } else {
+         x = ggml_gelu(ctx, x);
+     }
+@@ -998,7 +999,7 @@
+         x = ggml_cont(ctx, x);
+     }
+     if (inplace) {
+-        x = ggml_gelu_quick_inplace(ctx, x);
++        x = sd_graph_gelu_quick_inplace(ctx, x);
+     } else {
+         x = ggml_gelu_quick(ctx, x);
+     }
+@@ -1034,7 +1035,7 @@
+         x = ggml_ext_scale(ctx, x, 1.f / scale);
+     }
+     if (b != nullptr) {
+-        x = ggml_add_inplace(ctx, x, b);
++        x = sd_graph_add_inplace(ctx, x, b);
+     }
+     return x;
+ }
+@@ -1133,7 +1134,7 @@
+     }
+     if (b != nullptr) {
+         b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
+-        x = ggml_add_inplace(ctx, x, b);
++        x = sd_graph_add_inplace(ctx, x, b);
+     }
+     return x;
+ }
+@@ -1192,7 +1193,7 @@
+ 
+     if (b != nullptr) {
+         b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);  // [OC, 1, 1, 1]
+-        x = ggml_add_inplace(ctx, x, b);
++        x = sd_graph_add_inplace(ctx, x, b);
+     }
+     return x;
+ }
+@@ -1434,11 +1435,11 @@
+ 
+         auto kq = ggml_mul_mat(ctx, k, q);  // [N * n_head, L_q, L_k]
+         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+-        kq = ggml_scale_inplace(ctx, kq, scale);
++        kq = sd_graph_scale_inplace(ctx, kq, scale);
+         if (mask) {
+-            kq = ggml_add_inplace(ctx, kq, mask);
+-        }
+-        kq = ggml_soft_max_inplace(ctx, kq);
++            kq = sd_graph_add_inplace(ctx, kq, mask);
++        }
++        kq = sd_graph_soft_max_inplace(ctx, kq);
+ 
+         kqv = ggml_mul_mat(ctx, v, kq);  // [N * n_head, L_q, d_head]
+ 
+@@ -1459,9 +1460,9 @@
+                                                    float eps = EPS) {
+     x = ggml_norm(ctx, x, eps);
+     if (w != nullptr) {
+-        x = ggml_mul_inplace(ctx, x, w);
++        x = sd_graph_mul_inplace(ctx, x, w);
+         if (b != nullptr) {
+-            x = ggml_add_inplace(ctx, x, b);
++            x = sd_graph_add_inplace(ctx, x, b);
+         }
+     }
+     return x;
+@@ -1480,9 +1481,9 @@
+     const float eps = 1e-6f;  // default eps parameter
+     x               = ggml_group_norm(ctx, x, num_groups, eps);
+     if (w != nullptr && b != nullptr) {
+-        x = ggml_mul_inplace(ctx, x, w);
++        x = sd_graph_mul_inplace(ctx, x, w);
+         // b = ggml_repeat(ctx, b, x);
+-        x = ggml_add_inplace(ctx, x, b);
++        x = sd_graph_add_inplace(ctx, x, b);
+     }
+     return x;
+ }
+@@ -2001,6 +2002,7 @@
+     }
+ 
+     ggml_cgraph* get_compute_graph(get_graph_cb_t get_graph) {
++        SDGraphOutOfPlaceScope inplace_scope(compute_ctx, sd_backend_is(runtime_backend, "opencl"));
+         prepare_build_in_tensor_before();
+         ggml_cgraph* gf = get_graph();
+         if (ggml_graph_n_nodes(gf) > 0) {
+@@ -3502,7 +3504,7 @@
+         if (has_weight_scale) {
+             out = ggml_mul(ctx->ggml_ctx, out, params["weight_scale"]);
+             if (b != nullptr) {
+-                out = ggml_add_inplace(ctx->ggml_ctx, out, b);
++                out = sd_graph_add_inplace(ctx->ggml_ctx, out, b);
+             }
+         }
+         return out;
+@@ -3990,7 +3992,7 @@
+             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
+         }
+         x = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+-        x = ggml_mul_inplace(ctx->ggml_ctx, x, w);
++        x = sd_graph_mul_inplace(ctx->ggml_ctx, x, w);
+         return x;
+     }
+ };
+--- /dev/null
++++ b/src/core/ggml_graph_operations.h
+@@ -0,0 +1,56 @@
++#ifndef __SD_CORE_GGML_GRAPH_OPERATIONS_H__
++#define __SD_CORE_GGML_GRAPH_OPERATIONS_H__
++
++#include "ggml.h"
++
++// A CPU operation cannot write in place into an OpenCL allocation. During
++// mixed-backend graph construction, leave temporary output allocation to the
++// scheduler. Persistent inputs and weights retain their mutation semantics.
++inline thread_local ggml_context* sd_out_of_place_graph_context = nullptr;
++
++struct SDGraphOutOfPlaceScope {
++    ggml_context* previous;
++    SDGraphOutOfPlaceScope(ggml_context* ctx, bool enabled)
++        : previous(sd_out_of_place_graph_context) {
++        if (enabled) {
++            sd_out_of_place_graph_context = ctx;
++        }
++    }
++    ~SDGraphOutOfPlaceScope() { sd_out_of_place_graph_context = previous; }
++    SDGraphOutOfPlaceScope(const SDGraphOutOfPlaceScope&) = delete;
++    SDGraphOutOfPlaceScope& operator=(const SDGraphOutOfPlaceScope&) = delete;
++};
++
++static inline bool sd_graph_use_inplace(ggml_context* ctx, ggml_tensor* input) {
++    if (ctx != sd_out_of_place_graph_context) {
++        return true;
++    }
++    const ggml_tensor* root = input->view_src ? input->view_src : input;
++    return root->op == GGML_OP_NONE || root->buffer != nullptr || root->data != nullptr;
++}
++
++#define SD_GRAPH_UNARY_OP(name) \
++    static inline ggml_tensor* sd_graph_##name##_inplace(ggml_context* ctx, ggml_tensor* a) { \
++        return sd_graph_use_inplace(ctx, a) ? ggml_##name##_inplace(ctx, a) : ggml_##name(ctx, a); \
++    }
++SD_GRAPH_UNARY_OP(relu)
++SD_GRAPH_UNARY_OP(silu)
++SD_GRAPH_UNARY_OP(tanh)
++SD_GRAPH_UNARY_OP(gelu)
++SD_GRAPH_UNARY_OP(gelu_quick)
++SD_GRAPH_UNARY_OP(soft_max)
++#undef SD_GRAPH_UNARY_OP
++
++#define SD_GRAPH_BINARY_OP(name) \
++    static inline ggml_tensor* sd_graph_##name##_inplace(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) { \
++        return sd_graph_use_inplace(ctx, a) ? ggml_##name##_inplace(ctx, a, b) : ggml_##name(ctx, a, b); \
++    }
++SD_GRAPH_BINARY_OP(add)
++SD_GRAPH_BINARY_OP(mul)
++#undef SD_GRAPH_BINARY_OP
++
++static inline ggml_tensor* sd_graph_scale_inplace(ggml_context* ctx, ggml_tensor* a, float scale) {
++    return sd_graph_use_inplace(ctx, a) ? ggml_scale_inplace(ctx, a, scale) : ggml_scale(ctx, a, scale);
++}
++
++#endif
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -390,7 +390,7 @@
+ 
+             ggml_tensor* updown_1 = ggml_ext_merge_lora(ctx, hada_1_down, hada_1_up, hada_1_mid);
+             ggml_tensor* updown_2 = ggml_ext_merge_lora(ctx, hada_2_down, hada_2_up, hada_2_mid);
+-            auto curr_updown      = ggml_mul_inplace(ctx, updown_1, updown_2);
++            auto curr_updown      = sd_graph_mul_inplace(ctx, updown_1, updown_2);
+             curr_updown           = ggml_ext_scale(ctx, curr_updown, scale_value, true);
+             if (updown == nullptr) {
+                 updown = curr_updown;
+@@ -829,10 +829,10 @@
+             ggml_tensor* final_tensor;
+             if (model_tensor->type != GGML_TYPE_F32 && model_tensor->type != GGML_TYPE_F16) {
+                 final_tensor = ggml_ext_cast_f32(compute_ctx, runtime_backend, model_tensor);
+-                final_tensor = ggml_add_inplace(compute_ctx, final_tensor, diff);
++                final_tensor = sd_graph_add_inplace(compute_ctx, final_tensor, diff);
+                 final_tensor = ggml_cpy(compute_ctx, final_tensor, model_tensor);
+             } else {
+-                final_tensor = ggml_add_inplace(compute_ctx, model_tensor, diff);
++                final_tensor = sd_graph_add_inplace(compute_ctx, model_tensor, diff);
+             }
+             ggml_build_forward_expand(gf, final_tensor);
+             if (!sd_backend_is_cpu(runtime_backend) && ggml_backend_buffer_is_host(original_tensor->buffer)) {
+@@ -957,7 +957,7 @@
+             if (out_diff == nullptr) {
+                 continue;
+             }
+-            out = ggml_add_inplace(ctx, out, out_diff);
++            out = sd_graph_add_inplace(ctx, out, out_diff);
+         }
+         return out;
+     }
+--- a/src/model/adapter/pmid.hpp
++++ b/src/model/adapter/pmid.hpp
+@@ -141,7 +141,7 @@
+         // in torch and the first dim in GGML, consistent with the convention that pytorch's
+         // last dimension (varying most rapidly) corresponds to GGML's first (varying most rapidly).
+         // weight = ggml_soft_max(ctx, weight);
+-        weight = ggml_soft_max_inplace(ctx->ggml_ctx, weight);
++        weight = sd_graph_soft_max_inplace(ctx->ggml_ctx, weight);
+         v      = ggml_cont(ctx->ggml_ctx, ggml_transpose(ctx->ggml_ctx, v));
+         // auto out = ggml_mul_mat(ctx, weight, v);
+         auto out    = ggml_mul_mat(ctx->ggml_ctx, v, weight);  // NOTE order of mul is opposite to pytorch
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -139,7 +139,7 @@
+ 
+         // in_layers
+         auto h = in_layers_0->forward(ctx, x);
+-        h      = ggml_silu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+         h      = in_layers_2->forward(ctx, h);  // [N, out_channels, h, w] if dims == 2 else [N, out_channels, t, h, w]
+ 
+         // emb_layers
+@@ -164,7 +164,7 @@
+ 
+         // out_layers
+         h = out_layers_0->forward(ctx, h);
+-        h = ggml_silu_inplace(ctx->ggml_ctx, h);
++        h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+         // dropout, skip for inference
+         h = out_layers_3->forward(ctx, h);
+ 
+--- a/src/model/common/rope.hpp
++++ b/src/model/common/rope.hpp
+@@ -976,7 +976,7 @@
+         auto pe_0 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 0);  // [L, d_head/2, 2]
+         auto pe_1 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 1);  // [L, d_head/2, 2]
+ 
+-        auto x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));  // [N * n_head, L, d_head/2, 2]
++        auto x_out = sd_graph_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));  // [N * n_head, L, d_head/2, 2]
+         if (!rope_interleaved) {
+             x_out = ggml_cont(ctx, ggml_permute(ctx, x_out, 1, 0, 2, 3));  // [N * n_head, L, x, d_head/2]
+         }
+--- a/src/model/diffusion/anima.hpp
++++ b/src/model/diffusion/anima.hpp
+@@ -87,7 +87,7 @@
+             auto linear_2 = std::dynamic_pointer_cast<Linear>(blocks["1.linear_2"]);
+ 
+             x = linear_1->forward(ctx, x);
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = linear_2->forward(ctx, x);
+             return x;
+         }
+--- a/src/model/diffusion/control.hpp
++++ b/src/model/diffusion/control.hpp
+@@ -194,7 +194,7 @@
+ 
+                 h = block->forward(ctx, h);
+             } else {
+-                h = ggml_silu_inplace(ctx->ggml_ctx, h);
++                h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             }
+         }
+         return h;
+@@ -233,7 +233,7 @@
+         auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, model_channels);  // [N, model_channels]
+ 
+         auto emb = time_embed_0->forward(ctx, t_emb);
+-        emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
++        emb      = sd_graph_silu_inplace(ctx->ggml_ctx, emb);
+         emb      = time_embed_2->forward(ctx, emb);  // [N, time_embed_dim]
+ 
+         // SDXL/SVD
+@@ -242,7 +242,7 @@
+             auto label_embed_2 = std::dynamic_pointer_cast<Linear>(blocks["label_emb.0.2"]);
+ 
+             auto label_emb = label_embed_0->forward(ctx, y);
+-            label_emb      = ggml_silu_inplace(ctx->ggml_ctx, label_emb);
++            label_emb      = sd_graph_silu_inplace(ctx->ggml_ctx, label_emb);
+             label_emb      = label_embed_2->forward(ctx, label_emb);  // [N, time_embed_dim]
+ 
+             emb = ggml_add(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
+--- a/src/model/diffusion/flux.hpp
++++ b/src/model/diffusion/flux.hpp
+@@ -204,7 +204,7 @@
+             auto out_layer = std::dynamic_pointer_cast<Linear>(blocks["out_layer"]);
+ 
+             x = in_layer->forward(ctx, x);
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = out_layer->forward(ctx, x);
+             return x;
+         }
+@@ -354,7 +354,7 @@
+             auto down_proj = std::dynamic_pointer_cast<Linear>(blocks["down_proj"]);
+ 
+             auto gate = gate_proj->forward(ctx, x);
+-            gate      = ggml_silu_inplace(ctx->ggml_ctx, gate);
++            gate      = sd_graph_silu_inplace(ctx->ggml_ctx, gate);
+             x         = up_proj->forward(ctx, x);
+             x         = ggml_mul(ctx->ggml_ctx, x, gate);
+             x         = down_proj->forward(ctx, x);
+@@ -774,7 +774,7 @@
+             for (int i = 0; i < n_layers; i++) {
+                 auto norm  = std::dynamic_pointer_cast<RMSNorm>(blocks["norms." + std::to_string(i)]);
+                 auto embed = std::dynamic_pointer_cast<MLPEmbedder>(blocks["layers." + std::to_string(i)]);
+-                x          = ggml_add_inplace(ctx->ggml_ctx, x, embed->forward(ctx, norm->forward(ctx, x)));
++                x          = sd_graph_add_inplace(ctx->ggml_ctx, x, embed->forward(ctx, norm->forward(ctx, x)));
+             }
+             x = out_proj->forward(ctx, x);
+ 
+@@ -845,15 +845,15 @@
+             x          = norm->forward(ctx, x);  // [batch_size, n_token, hidden_size_x]
+ 
+             auto x1 = ggml_mul_mat(ctx->ggml_ctx, fc1_gate, x);  // [batch_size, n_token, hidden_size_x*mlp_ratio]
+-            x1      = ggml_silu_inplace(ctx->ggml_ctx, x1);
++            x1      = sd_graph_silu_inplace(ctx->ggml_ctx, x1);
+ 
+             auto x2 = ggml_mul_mat(ctx->ggml_ctx, fc1_value, x);  // [batch_size, n_token, hidden_size_x*mlp_ratio]
+ 
+-            x = ggml_mul_inplace(ctx->ggml_ctx, x1, x2);  // [batch_size, n_token, hidden_size_x*mlp_ratio]
++            x = sd_graph_mul_inplace(ctx->ggml_ctx, x1, x2);  // [batch_size, n_token, hidden_size_x*mlp_ratio]
+ 
+             x = ggml_mul_mat(ctx->ggml_ctx, fc2, x);  // [batch_size, n_token, hidden_size_x]
+ 
+-            x = ggml_add_inplace(ctx->ggml_ctx, x, res_x);
++            x = sd_graph_add_inplace(ctx->ggml_ctx, x, res_x);
+ 
+             return x;
+         }
+--- a/src/model/diffusion/hidream_o1.hpp
++++ b/src/model/diffusion/hidream_o1.hpp
+@@ -208,7 +208,7 @@
+             auto mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["mlp.2"]);
+             auto emb   = ggml_ext_timestep_embedding(ctx->ggml_ctx, t, frequency_embedding_size, 10000, 1000.0f);
+             emb        = mlp_0->forward(ctx, emb);
+-            emb        = ggml_silu_inplace(ctx->ggml_ctx, emb);
++            emb        = sd_graph_silu_inplace(ctx->ggml_ctx, emb);
+             emb        = mlp_2->forward(ctx, emb);
+             return emb;
+         }
+--- a/src/model/diffusion/krea2.hpp
++++ b/src/model/diffusion/krea2.hpp
+@@ -182,7 +182,7 @@
+             ggml_tensor* scale = params["scale"];
+             scale              = ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], 1, 1, 1));
+             x                  = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+-            x                  = ggml_mul_inplace(ctx->ggml_ctx, x, scale);
++            x                  = sd_graph_mul_inplace(ctx->ggml_ctx, x, scale);
+             return x;
+         }
+     };
+--- a/src/model/diffusion/lingbot_video.hpp
++++ b/src/model/diffusion/lingbot_video.hpp
+@@ -158,7 +158,7 @@
+ 
+             x = norm->forward(ctx, x);
+             x = linear_1->forward(ctx, x);
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = linear_2->forward(ctx, x);
+             return x;
+         }
+@@ -230,7 +230,7 @@
+             auto down_proj = std::dynamic_pointer_cast<Linear>(blocks["down_proj"]);
+ 
+             auto gate = gate_proj->forward(ctx, x);
+-            gate      = ggml_silu_inplace(ctx->ggml_ctx, gate);
++            gate      = sd_graph_silu_inplace(ctx->ggml_ctx, gate);
+             auto up   = up_proj->forward(ctx, x);
+             x         = ggml_mul(ctx->ggml_ctx, gate, up);
+             x         = down_proj->forward(ctx, x);
+@@ -405,7 +405,7 @@
+ 
+             x         = ggml_reshape_3d(ctx->ggml_ctx, x, hidden_size, 1, n_token_total);
+             auto gate = expert_linear(ctx, "experts.w1", x, selected_experts);
+-            gate      = ggml_silu_inplace(ctx->ggml_ctx, gate);
++            gate      = sd_graph_silu_inplace(ctx->ggml_ctx, gate);
+             auto up   = expert_linear(ctx, "experts.w3", x, selected_experts);
+             auto act  = ggml_mul(ctx->ggml_ctx, gate, up);
+             auto out  = expert_linear(ctx, "experts.w2", act, selected_experts);
+--- a/src/model/diffusion/ltxv.hpp
++++ b/src/model/diffusion/ltxv.hpp
+@@ -561,7 +561,7 @@
+ 
+             auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, frequency_embedding_size);
+             t_emb      = linear_1->forward(ctx, t_emb);
+-            t_emb      = ggml_silu_inplace(ctx->ggml_ctx, t_emb);
++            t_emb      = sd_graph_silu_inplace(ctx->ggml_ctx, t_emb);
+             t_emb      = linear_2->forward(ctx, t_emb);
+             return t_emb;
+         }
+--- a/src/model/diffusion/minit2i.hpp
++++ b/src/model/diffusion/minit2i.hpp
+@@ -245,7 +245,7 @@
+             auto mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["mlp.2"]);
+             auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, t, frequency_embedding_size, 10000, 1.0f);
+             t_emb      = mlp_0->forward(ctx, t_emb);
+-            t_emb      = ggml_silu_inplace(ctx->ggml_ctx, t_emb);
++            t_emb      = sd_graph_silu_inplace(ctx->ggml_ctx, t_emb);
+             return mlp_2->forward(ctx, t_emb);
+         }
+     };
+--- a/src/model/diffusion/mmdit.hpp
++++ b/src/model/diffusion/mmdit.hpp
+@@ -216,7 +216,7 @@
+         auto t_freq = ggml_ext_timestep_embedding(ctx->ggml_ctx, t, frequency_embedding_size);  // [N, frequency_embedding_size]
+ 
+         auto t_emb = mlp_0->forward(ctx, t_freq);
+-        t_emb      = ggml_silu_inplace(ctx->ggml_ctx, t_emb);
++        t_emb      = sd_graph_silu_inplace(ctx->ggml_ctx, t_emb);
+         t_emb      = mlp_2->forward(ctx, t_emb);
+         return t_emb;
+     }
+@@ -238,7 +238,7 @@
+         auto mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["mlp.2"]);
+ 
+         x = mlp_0->forward(ctx, x);
+-        x = ggml_silu_inplace(ctx->ggml_ctx, x);
++        x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+         x = mlp_2->forward(ctx, x);
+         return x;
+     }
+--- a/src/model/diffusion/pid.hpp
++++ b/src/model/diffusion/pid.hpp
+@@ -175,7 +175,7 @@
+             auto mlp_2 = std::dynamic_pointer_cast<Linear>(blocks["mlp.2"]);
+             auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, t, frequency_embedding_size, 10);
+             t_emb      = mlp_0->forward(ctx, t_emb);
+-            t_emb      = ggml_silu_inplace(ctx->ggml_ctx, t_emb);
++            t_emb      = sd_graph_silu_inplace(ctx->ggml_ctx, t_emb);
+             return mlp_2->forward(ctx, t_emb);
+         }
+     };
+@@ -191,8 +191,8 @@
+             auto w1 = std::dynamic_pointer_cast<Linear>(blocks["w1"]);
+             auto w2 = std::dynamic_pointer_cast<Linear>(blocks["w2"]);
+             auto w3 = std::dynamic_pointer_cast<Linear>(blocks["w3"]);
+-            auto h  = ggml_silu_inplace(ctx->ggml_ctx, w1->forward(ctx, x));
+-            h       = ggml_mul_inplace(ctx->ggml_ctx, h, w3->forward(ctx, x));
++            auto h  = sd_graph_silu_inplace(ctx->ggml_ctx, w1->forward(ctx, x));
++            h       = sd_graph_mul_inplace(ctx->ggml_ctx, h, w3->forward(ctx, x));
+             return w2->forward(ctx, h);
+         }
+     };
+@@ -496,9 +496,9 @@
+             auto conv1 = std::dynamic_pointer_cast<Conv2d>(blocks["block.2"]);
+             auto norm2 = std::dynamic_pointer_cast<GroupNorm>(blocks["block.3"]);
+             auto conv2 = std::dynamic_pointer_cast<Conv2d>(blocks["block.5"]);
+-            auto h     = ggml_silu_inplace(ctx->ggml_ctx, norm1->forward(ctx, x));
++            auto h     = sd_graph_silu_inplace(ctx->ggml_ctx, norm1->forward(ctx, x));
+             h          = conv1->forward(ctx, h);
+-            h          = ggml_silu_inplace(ctx->ggml_ctx, norm2->forward(ctx, h));
++            h          = sd_graph_silu_inplace(ctx->ggml_ctx, norm2->forward(ctx, h));
+             h          = conv2->forward(ctx, h);
+             return ggml_add(ctx->ggml_ctx, x, h);
+         }
+@@ -559,7 +559,7 @@
+             }
+ 
+             auto feat = conv0->forward(ctx, lq_latent);
+-            feat      = ggml_silu_inplace(ctx->ggml_ctx, feat);
++            feat      = sd_graph_silu_inplace(ctx->ggml_ctx, feat);
+             feat      = conv2->forward(ctx, feat);
+             for (int i = 0; i < config.lq_num_res_blocks; ++i) {
+                 auto block = std::dynamic_pointer_cast<PiDResBlock>(blocks["latent_proj." + std::to_string(3 + i)]);
+--- a/src/model/diffusion/qwen_image.hpp
++++ b/src/model/diffusion/qwen_image.hpp
+@@ -84,7 +84,7 @@
+             auto linear_2 = std::dynamic_pointer_cast<Linear>(blocks["linear_2"]);
+ 
+             sample = linear_1->forward(ctx, sample);
+-            sample = ggml_silu_inplace(ctx->ggml_ctx, sample);
++            sample = sd_graph_silu_inplace(ctx->ggml_ctx, sample);
+             sample = linear_2->forward(ctx, sample);
+             return sample;
+         }
+--- a/src/model/diffusion/sefi_image.hpp
++++ b/src/model/diffusion/sefi_image.hpp
+@@ -54,7 +54,7 @@
+             auto linear_2 = std::dynamic_pointer_cast<Linear>(blocks["linear_2"]);
+ 
+             sample = linear_1->forward(ctx, sample);
+-            sample = ggml_silu_inplace(ctx->ggml_ctx, sample);
++            sample = sd_graph_silu_inplace(ctx->ggml_ctx, sample);
+             sample = linear_2->forward(ctx, sample);
+             return sample;
+         }
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -239,7 +239,7 @@
+         auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, num_frames, static_cast<int>(in_channels), max_time_embed_period);  // [N, in_channels]
+ 
+         auto emb = time_pos_embed_0->forward(ctx, t_emb);
+-        emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
++        emb      = sd_graph_silu_inplace(ctx->ggml_ctx, emb);
+         emb      = time_pos_embed_2->forward(ctx, emb);                             // [N, in_channels]
+         emb      = ggml_reshape_3d(ctx->ggml_ctx, emb, emb->ne[0], 1, emb->ne[1]);  // [N, 1, in_channels]
+ 
+@@ -558,7 +558,7 @@
+         auto t_emb = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, model_channels);  // [N, model_channels]
+ 
+         auto emb = time_embed_0->forward(ctx, t_emb);
+-        emb      = ggml_silu_inplace(ctx->ggml_ctx, emb);
++        emb      = sd_graph_silu_inplace(ctx->ggml_ctx, emb);
+         emb      = time_embed_2->forward(ctx, emb);  // [N, time_embed_dim]
+ 
+         // SDXL/SVD
+@@ -567,7 +567,7 @@
+             auto label_embed_2 = std::dynamic_pointer_cast<Linear>(blocks["label_emb.0.2"]);
+ 
+             auto label_emb = label_embed_0->forward(ctx, y);
+-            label_emb      = ggml_silu_inplace(ctx->ggml_ctx, label_emb);
++            label_emb      = sd_graph_silu_inplace(ctx->ggml_ctx, label_emb);
+             label_emb      = label_embed_2->forward(ctx, label_emb);  // [N, time_embed_dim]
+ 
+             emb = ggml_add(ctx->ggml_ctx, emb, label_emb);  // [N, time_embed_dim]
+@@ -682,7 +682,7 @@
+ 
+         // out
+         h = out_0->forward(ctx, h);
+-        h = ggml_silu_inplace(ctx->ggml_ctx, h);
++        h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+         h = out_2->forward(ctx, h);
+         ggml_set_name(h, "bench-end");
+         return h;  // [N, out_channels, h, w]
+--- a/src/model/diffusion/wan.hpp
++++ b/src/model/diffusion/wan.hpp
+@@ -670,7 +670,7 @@
+             // time_embedding
+             auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
+             e      = time_embedding_0->forward(ctx, e);
+-            e      = ggml_silu_inplace(ctx->ggml_ctx, e);
++            e      = sd_graph_silu_inplace(ctx->ggml_ctx, e);
+             e      = time_embedding_2->forward(ctx, e);  // [N, dim] or [N, T, dim]
+ 
+             // time_projection
+--- a/src/model/te/llm.hpp
++++ b/src/model/te/llm.hpp
+@@ -293,7 +293,7 @@
+             x           = ggml_rms_norm(ctx->ggml_ctx, x, eps);
+             auto scaled = ggml_mul(ctx->ggml_ctx, x, w);
+             if (add_unit_offset) {
+-                scaled = ggml_add_inplace(ctx->ggml_ctx, scaled, x);
++                scaled = sd_graph_add_inplace(ctx->ggml_ctx, scaled, x);
+             }
+             return scaled;
+         }
+@@ -324,9 +324,9 @@
+             if (activation == MLPActivation::GELU_TANH) {
+                 h = ggml_ext_gelu(ctx->ggml_ctx, h, true);
+             } else {
+-                h = ggml_silu_inplace(ctx->ggml_ctx, h);
+-            }
+-            h = ggml_mul_inplace(ctx->ggml_ctx, h, up_proj->forward(ctx, x));
++                h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
++            }
++            h = sd_graph_mul_inplace(ctx->ggml_ctx, h, up_proj->forward(ctx, x));
+             h = down_proj->forward(ctx, h);
+             return h;
+         }
+@@ -566,8 +566,8 @@
+                 auto up_proj   = std::dynamic_pointer_cast<Linear>(blocks["up_proj"]);
+                 auto down_proj = std::dynamic_pointer_cast<Linear>(blocks["down_proj"]);
+                 auto h         = gate_proj->forward(ctx, x);
+-                h              = ggml_silu_inplace(ctx->ggml_ctx, h);
+-                h              = ggml_mul_inplace(ctx->ggml_ctx, h, up_proj->forward(ctx, x));
++                h              = sd_graph_silu_inplace(ctx->ggml_ctx, h);
++                h              = sd_graph_mul_inplace(ctx->ggml_ctx, h, up_proj->forward(ctx, x));
+                 x              = down_proj->forward(ctx, h);
+             }
+             return x;
+@@ -656,7 +656,7 @@
+                 x = ggml_add(ctx->ggml_ctx, x0, x1);
+                 if (bias) {
+                     auto b = ggml_reshape_4d(ctx->ggml_ctx, params["bias"], 1, 1, embed_dim, 1);
+-                    x      = ggml_add_inplace(ctx->ggml_ctx, x, b);
++                    x      = sd_graph_add_inplace(ctx->ggml_ctx, x, b);
+                 }
+             } else {
+                 auto proj = std::dynamic_pointer_cast<Conv3d>(blocks["proj"]);
+@@ -822,12 +822,12 @@
+             auto residual = x;
+             x             = forward_norm(ctx, "norm1", x);
+             x             = attn->forward(ctx, x, pe, mask);
+-            x             = ggml_add_inplace(ctx->ggml_ctx, x, residual);
++            x             = sd_graph_add_inplace(ctx->ggml_ctx, x, residual);
+ 
+             residual = x;
+             x        = forward_norm(ctx, "norm2", x);
+             x        = mlp->forward(ctx, x);
+-            x        = ggml_add_inplace(ctx->ggml_ctx, x, residual);
++            x        = sd_graph_add_inplace(ctx->ggml_ctx, x, residual);
+ 
+             return x;
+         }
+@@ -1128,11 +1128,11 @@
+ 
+                 auto kq = ggml_mul_mat(ctx->ggml_ctx, k, q);
+                 ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+-                kq = ggml_scale_inplace(ctx->ggml_ctx, kq, 1.0f / std::sqrt(static_cast<float>(head_dim)));
++                kq = sd_graph_scale_inplace(ctx->ggml_ctx, kq, 1.0f / std::sqrt(static_cast<float>(head_dim)));
+                 if (attention_mask != nullptr) {
+-                    kq = ggml_add_inplace(ctx->ggml_ctx, kq, attention_mask);
+-                }
+-                kq = ggml_soft_max_inplace(ctx->ggml_ctx, kq);
++                    kq = sd_graph_add_inplace(ctx->ggml_ctx, kq, attention_mask);
++                }
++                kq = sd_graph_soft_max_inplace(ctx->ggml_ctx, kq);
+                 ggml_soft_max_add_sinks(kq, params["sinks"]);
+ 
+                 auto kqv = ggml_mul_mat(ctx->ggml_ctx, v_attn, kq);
+@@ -1227,7 +1227,7 @@
+             if (post_attention_norm != nullptr) {
+                 x = post_attention_norm->forward(ctx, x);
+             }
+-            x = ggml_add_inplace(ctx->ggml_ctx, x, residual);
++            x = sd_graph_add_inplace(ctx->ggml_ctx, x, residual);
+ 
+             residual = x;
+             x        = pre_ffw_norm->forward(ctx, x);
+@@ -1241,7 +1241,7 @@
+             if (post_ffw_norm != nullptr) {
+                 x = post_ffw_norm->forward(ctx, x);
+             }
+-            x = ggml_add_inplace(ctx->ggml_ctx, x, residual);
++            x = sd_graph_add_inplace(ctx->ggml_ctx, x, residual);
+ 
+             return x;
+         }
+--- a/src/model/te/t5.hpp
++++ b/src/model/te/t5.hpp
+@@ -127,7 +127,7 @@
+         auto wo = std::dynamic_pointer_cast<Linear>(blocks["wo"]);
+ 
+         x = wi->forward(ctx, x);
+-        x = ggml_relu_inplace(ctx->ggml_ctx, x);
++        x = sd_graph_relu_inplace(ctx->ggml_ctx, x);
+         x = wo->forward(ctx, x);
+         return x;
+     }
+@@ -151,7 +151,7 @@
+ 
+         auto hidden_gelu   = ggml_ext_gelu(ctx->ggml_ctx, wi_0->forward(ctx, x), true);
+         auto hidden_linear = wi_1->forward(ctx, x);
+-        x                  = ggml_mul_inplace(ctx->ggml_ctx, hidden_gelu, hidden_linear);
++        x                  = sd_graph_mul_inplace(ctx->ggml_ctx, hidden_gelu, hidden_linear);
+         x                  = wo->forward(ctx, x);
+         return x;
+     }
+@@ -171,7 +171,7 @@
+ 
+         auto forwarded_states = layer_norm->forward(ctx, x);
+         forwarded_states      = DenseReluDense->forward(ctx, forwarded_states);
+-        x                     = ggml_add_inplace(ctx->ggml_ctx, forwarded_states, x);
++        x                     = sd_graph_add_inplace(ctx->ggml_ctx, forwarded_states, x);
+         return x;
+     }
+ };
+@@ -276,7 +276,7 @@
+         auto output              = ret.first;
+         past_bias                = ret.second;
+ 
+-        x = ggml_add_inplace(ctx->ggml_ctx, output, x);
++        x = sd_graph_add_inplace(ctx->ggml_ctx, output, x);
+         return {x, past_bias};
+     }
+ };
+--- a/src/model/upscaler/ltx_latent_upscaler.hpp
++++ b/src/model/upscaler/ltx_latent_upscaler.hpp
+@@ -168,8 +168,8 @@
+             }
+             weight = ggml_reshape_4d(ctx->ggml_ctx, weight, 1, 1, num_channels, 1);
+             bias   = ggml_reshape_4d(ctx->ggml_ctx, bias, 1, 1, num_channels, 1);
+-            x      = ggml_mul_inplace(ctx->ggml_ctx, x, weight);
+-            x      = ggml_add_inplace(ctx->ggml_ctx, x, bias);
++            x      = sd_graph_mul_inplace(ctx->ggml_ctx, x, weight);
++            x      = sd_graph_add_inplace(ctx->ggml_ctx, x, bias);
+             return ggml_reshape_4d(ctx->ggml_ctx, x, W, H, T, num_channels);
+         }
+     };
+@@ -194,7 +194,7 @@
+ 
+             x = conv1->forward(ctx, x);
+             x = norm1->forward(ctx, x);
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = conv2->forward(ctx, x);
+             x = norm2->forward(ctx, x);
+             x = ggml_add(ctx->ggml_ctx, x, residual);
+--- a/src/model/vae/auto_encoder_kl.hpp
++++ b/src/model/vae/auto_encoder_kl.hpp
+@@ -39,12 +39,12 @@
+ 
+         auto h = x;
+         h      = norm1->forward(ctx, h);
+-        h      = ggml_silu_inplace(ctx->ggml_ctx, h);  // swish
++        h      = sd_graph_silu_inplace(ctx->ggml_ctx, h);  // swish
+         h      = conv1->forward(ctx, h);
+         // return h;
+ 
+         h = norm2->forward(ctx, h);
+-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // swish
++        h = sd_graph_silu_inplace(ctx->ggml_ctx, h);  // swish
+         // dropout, skip for inference
+         h = conv2->forward(ctx, h);
+ 
+@@ -359,7 +359,7 @@
+ 
+         // end
+         h = norm_out->forward(ctx, h);
+-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
++        h = sd_graph_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
+         h = conv_out->forward(ctx, h);            // [N, z_channels*2, h, w]
+         return h;
+     }
+@@ -486,7 +486,7 @@
+         }
+ 
+         h = norm_out->forward(ctx, h);
+-        h = ggml_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
++        h = sd_graph_silu_inplace(ctx->ggml_ctx, h);  // nonlinearity/swish
+         h = conv_out->forward(ctx, h);            // [N, out_ch, h*8, w*8]
+         return h;
+     }
+--- a/src/model/vae/ltx_audio_vae.hpp
++++ b/src/model/vae/ltx_audio_vae.hpp
+@@ -501,10 +501,10 @@
+             auto conv2 = std::dynamic_pointer_cast<HeightCausalConv2D>(blocks["conv2"]);
+ 
+             auto h = norm1->forward(ctx, x);
+-            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
++            h      = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             h      = conv1->forward(ctx, h);
+             h      = norm2->forward(ctx, h);
+-            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
++            h      = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             h      = conv2->forward(ctx, h);
+ 
+             if (in_channels != out_channels) {
+@@ -555,7 +555,7 @@
+             x = ggml_conv_1d(ctx->ggml_ctx, params["weight"], x, stride, padding, dilation);
+             if (bias) {
+                 auto b = ggml_reshape_4d(ctx->ggml_ctx, params["bias"], 1, params["bias"]->ne[0], 1, 1);
+-                x      = ggml_add_inplace(ctx->ggml_ctx, x, b);
++                x      = sd_graph_add_inplace(ctx->ggml_ctx, x, b);
+             }
+             return x;
+         }
+@@ -604,7 +604,7 @@
+             }
+             if (bias) {
+                 auto b = ggml_reshape_4d(ctx->ggml_ctx, params["bias"], 1, params["bias"]->ne[0], 1, 1);
+-                x      = ggml_add_inplace(ctx->ggml_ctx, x, b);
++                x      = sd_graph_add_inplace(ctx->ggml_ctx, x, b);
+             }
+             return x;
+         }
+@@ -904,7 +904,7 @@
+             }
+ 
+             x = norm_out->forward(ctx, x);
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = conv_out->forward(ctx, x);
+             return adjust_output_shape(ctx, x, target_time, target_freq);
+         }
+--- a/src/model/vae/ltx_vae.hpp
++++ b/src/model/vae/ltx_vae.hpp
+@@ -276,14 +276,14 @@
+             if (timestep_conditioning) {
+                 h = apply_scale_shift(ctx->ggml_ctx, h, scale1, shift1);
+             }
+-            h = ggml_silu_inplace(ctx->ggml_ctx, h);
++            h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             h = conv1->forward(ctx, h, causal);
+ 
+             h = norm2->forward(ctx, h);
+             if (timestep_conditioning) {
+                 h = apply_scale_shift(ctx->ggml_ctx, h, scale2, shift2);
+             }
+-            h = ggml_silu_inplace(ctx->ggml_ctx, h);
++            h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             h = conv2->forward(ctx, h, causal);
+ 
+             return ggml_add(ctx->ggml_ctx, h, x);
+@@ -322,14 +322,14 @@
+             if (timestep_conditioning) {
+                 h = apply_scale_shift(ctx->ggml_ctx, h, scale1, shift1);
+             }
+-            h = ggml_silu_inplace(ctx->ggml_ctx, h);
++            h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             h = conv1->forward(ctx, h, feat_map, feat_idx, chunk_idx, causal, temporal_pad);
+ 
+             h = norm2->forward(ctx, h);
+             if (timestep_conditioning) {
+                 h = apply_scale_shift(ctx->ggml_ctx, h, scale2, shift2);
+             }
+-            h = ggml_silu_inplace(ctx->ggml_ctx, h);
++            h = sd_graph_silu_inplace(ctx->ggml_ctx, h);
+             h = conv2->forward(ctx, h, feat_map, feat_idx, chunk_idx, causal, temporal_pad);
+ 
+             return ggml_add(ctx->ggml_ctx, h, x);
+@@ -855,7 +855,7 @@
+             }
+ 
+             x = conv_norm_out->forward(ctx, x);
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = conv_out->forward(ctx, x, true);
+ 
+             auto last_channel = ggml_ext_slice(ctx->ggml_ctx, x, 3, x->ne[3] - 1, x->ne[3]);
+@@ -986,7 +986,7 @@
+                                                           2);
+                 x                       = apply_scale_shift(ctx->ggml_ctx, x, scale, shift);
+             }
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = conv_out->forward(ctx, x, causal_decoder);
+             return x;
+         }
+@@ -1043,7 +1043,7 @@
+                                                           2);
+                 x                       = apply_scale_shift(ctx->ggml_ctx, x, scale, shift);
+             }
+-            x = ggml_silu_inplace(ctx->ggml_ctx, x);
++            x = sd_graph_silu_inplace(ctx->ggml_ctx, x);
+             x = conv_out->forward(ctx, x, feat_map, feat_idx, chunk_idx, causal_decoder, temporal_pad);
+             return x;
+         }
+--- a/src/model/vae/tae.hpp
++++ b/src/model/vae/tae.hpp
+@@ -47,7 +47,7 @@
+ 
+             auto p = pool_0->forward(ctx, x);
+             p      = pool_1->forward(ctx, p);
+-            p      = ggml_relu_inplace(ctx->ggml_ctx, p);
++            p      = sd_graph_relu_inplace(ctx->ggml_ctx, p);
+             p      = pool_3->forward(ctx, p);
+ 
+             x = ggml_add(ctx->ggml_ctx, x, p);
+@@ -58,9 +58,9 @@
+         auto conv_4 = std::dynamic_pointer_cast<Conv2d>(blocks["conv.4"]);
+ 
+         auto h = conv_0->forward(ctx, x);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv_2->forward(ctx, h);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv_4->forward(ctx, h);
+ 
+         if (n_in != n_out) {
+@@ -70,7 +70,7 @@
+         }
+ 
+         h = ggml_add(ctx->ggml_ctx, h, x);
+-        h = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         return h;
+     }
+ };
+@@ -161,13 +161,13 @@
+         // return: [n, out_channels, h*8, w*8]
+ 
+         auto h = ggml_ext_scale(ctx->ggml_ctx, z, 1.0f / 3.0f);
+-        h      = ggml_tanh_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_tanh_inplace(ctx->ggml_ctx, h);
+         h      = ggml_ext_scale(ctx->ggml_ctx, h, 3.0f);
+ 
+         for (int i = 0; i < num_blocks * 3 + 10; i++) {
+             if (blocks.find(std::to_string(i)) == blocks.end()) {
+                 if (i == 1) {
+-                    h = ggml_relu_inplace(ctx->ggml_ctx, h);
++                    h = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+                 } else {
+                     h = ggml_upscale(ctx->ggml_ctx, h, 2, GGML_SCALE_MODE_NEAREST);
+                 }
+@@ -243,9 +243,9 @@
+ 
+         auto h = ggml_concat(ctx->ggml_ctx, x, past, 2);
+         h      = conv0->forward(ctx, h);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv1->forward(ctx, h);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv2->forward(ctx, h);
+ 
+         auto skip = x;
+@@ -253,8 +253,8 @@
+             auto skip_conv = std::dynamic_pointer_cast<Conv2d>(blocks["skip"]);
+             skip           = skip_conv->forward(ctx, x);
+         }
+-        h = ggml_add_inplace(ctx->ggml_ctx, h, skip);
+-        h = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h = sd_graph_add_inplace(ctx->ggml_ctx, h, skip);
++        h = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         return h;
+     }
+ };
+@@ -284,11 +284,11 @@
+ 
+         auto h = ggml_concat(ctx->ggml_ctx, x, past, 2);
+         h      = conv0->forward(ctx, h);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv1->forward(ctx, h);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv2->forward(ctx, h);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         h      = conv3->forward(ctx, h);
+ 
+         auto skip = x;
+@@ -296,8 +296,8 @@
+             auto skip_conv = std::dynamic_pointer_cast<Conv2d>(blocks["skip"]);
+             skip           = skip_conv->forward(ctx, x);
+         }
+-        h = ggml_add_inplace(ctx->ggml_ctx, h, skip);
+-        h = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h = sd_graph_add_inplace(ctx->ggml_ctx, h, skip);
++        h = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         return h;
+     }
+ };
+@@ -397,7 +397,7 @@
+         }
+ 
+         auto h = first_conv->forward(ctx, z);
+-        h      = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h      = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+ 
+         int index = 2;
+         for (int i = 0; i < num_layers; i++) {
+@@ -469,13 +469,13 @@
+ 
+         // Clamp()
+         auto h = ggml_ext_scale(ctx->ggml_ctx,
+-                                ggml_tanh_inplace(ctx->ggml_ctx,
++                                sd_graph_tanh_inplace(ctx->ggml_ctx,
+                                                   ggml_ext_scale(ctx->ggml_ctx, z, 1.0f / 3.0f)),
+                                 3.0f,
+                                 true);
+ 
+         h         = first_conv->forward(ctx, h);
+-        h         = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h         = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+         int index = 3;
+         for (int i = 0; i < num_layers; i++) {
+             for (int j = 0; j < num_blocks; j++) {
+@@ -497,7 +497,7 @@
+             block      = std::dynamic_pointer_cast<UnaryBlock>(blocks[std::to_string(index++)]);
+             h          = block->forward(ctx, h);
+         }
+-        h = ggml_relu_inplace(ctx->ggml_ctx, h);
++        h = sd_graph_relu_inplace(ctx->ggml_ctx, h);
+ 
+         auto last_conv = std::dynamic_pointer_cast<Conv2d>(blocks[std::to_string(++index)]);
+         h              = last_conv->forward(ctx, h);

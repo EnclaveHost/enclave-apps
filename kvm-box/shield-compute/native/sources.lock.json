@@ -1,0 +1,14 @@
+{
+  "schema": "shield-native-sources/1",
+  "llama": "ddd4ec1428a6201e18975ea52b07c71e0f9aef26",
+  "sd": "0407905fe85be75ef7b962dfae63ae0f766e6066",
+  "enclave": "04a27e8da4e7d8a5f4b1270e6d02231a2b96d29a",
+  "shield": "aa3b780ae37b69fb9d15aa16dfe44c6ceaab94bf",
+  "llamaPatches": [
+    "graph-slot", "cuda-graph-ptr-update", "sync-instr", "rs-pin-cells",
+    "topk-rows", "parallel-copy", "parallel-rows", "rs-inplace"
+  ],
+  "ggmlMaxName": 128,
+  "nativeGpuBackends": false,
+  "dealerMode": false
+}

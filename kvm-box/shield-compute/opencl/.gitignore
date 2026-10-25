@@ -1,0 +1,5 @@
+__pycache__/
+runtime/
+*.so
+test-opencl
+test-event-errors

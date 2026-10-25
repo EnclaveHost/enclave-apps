@@ -1,0 +1,21 @@
+# Only the measured service uid can reach the one fixed GPU worker socket.
+# Ordinary desktop Internet access remains available. This is device/service
+# mediation, not an information-flow sandbox for malicious desktop software.
+table inet shield {
+    chain output {
+        type filter hook output priority 0; policy accept;
+        # llama-cli's internal HTTP client/server remains private to this uid.
+        meta skuid 1001 ip daddr 127.0.0.3 meta l4proto tcp accept
+        meta skuid 1001 ip saddr 127.0.0.3 meta l4proto tcp accept
+        ip daddr 127.0.0.3 reject
+        # Another uid may bind this address, but must never impersonate the
+        # service's internal server by replying to its local HTTP client.
+        ip saddr 127.0.0.3 reject
+        meta skuid 1001 ip daddr 10.0.2.2 tcp dport 9741 accept
+        meta skuid 1001 reject
+        # Existing trusted attestation proxy may reach its pinned enclave services.
+        meta skuid 0 ip daddr 10.0.2.2 tcp dport { __ATTESTED_SERVICE_PORTS__ } accept
+        ip daddr 10.0.2.2 reject
+        ip6 daddr fec0::2 reject
+    }
+}

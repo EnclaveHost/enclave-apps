@@ -1,0 +1,90 @@
+--- a/wasm/ggml-shielded/shielded-tee.c
++++ b/wasm/ggml-shielded/shielded-tee.c
+@@ -392,6 +392,7 @@
+ } sh_group;
+ 
+ struct sh_link {
++    bool start_retryable; /* only connection/HELLO, before public upload or masked work */
+     sh_pipe   *pipe;
+     char       host[128];
+     int        port, vsock_port;
+@@ -2187,7 +2188,10 @@
+     return NULL;
+ }
+ 
++bool sh_link_start_retryable(const sh_link *l) { return l && l->start_retryable; }
++
+ int sh_link_start(sh_link *l) {
++    l->start_retryable = false;
+     /* Binding mutates the reader table; stop old importers before checking
+      * it, including on reconnect. Joining also observes their final latch. */
+     if (l->dealt) stop_threads(l);
+@@ -2221,7 +2225,7 @@
+         snprintf(l->transport, sizeof l->transport, "tcp %s:%d", l->host, l->port);
+     }
+     if (!l->pipe) l->pipe = sh_pipe_open(l->host, l->port, &err);
+-    if (!l->pipe) { snprintf(l->err, sizeof l->err, "connect %s:%d failed", l->host, l->port); return err; }
++    if (!l->pipe) { l->start_retryable = err == SH_ERR_IO; snprintf(l->err, sizeof l->err, "connect %s:%d failed", l->host, l->port); return err; }
+ 
+     uint8_t pay[256]; sh_reply rep;
+     /* The tenant's slice of the card, reserved at HELLO (protocol 1.3). The
+@@ -2237,7 +2241,7 @@
+     const uint64_t reserve = l->reserve_bytes;
+     size_t n = sh_pack_hello(pay, 1, reserve);
+     int rc = sh_pipe_call(l->pipe, SH_CMD_HELLO, pay, n, &rep);
+-    if (rc != SH_OK) { snprintf(l->err, sizeof l->err, "HELLO%s: %s", reserve ? " (with reservation)" : "", sh_pipe_last_error(l->pipe)); return rc; }
++    if (rc != SH_OK) { l->start_retryable = rc == SH_ERR_IO || rc == SH_ERR_VIOLATION; snprintf(l->err, sizeof l->err, "HELLO%s: %s", reserve ? " (with reservation)" : "", sh_pipe_last_error(l->pipe)); return rc; }
+     /* The one-frame exchange is protocol 1.1; an older worker would refuse it
+      * as an unknown command, so say what is wrong here rather than there. */
+     int hello_minor = -1;
+--- a/wasm/ggml-shielded/shielded-tee.h
++++ b/wasm/ggml-shielded/shielded-tee.h
+@@ -170,6 +170,8 @@
+  * Restartable: a weight added after start means a fresh connection carrying
+  * the whole set. */
+ int sh_link_start(sh_link *l);
++/* Last start failed before uploads or masked work. No execution retry is implied. */
++bool     sh_link_start_retryable(const sh_link *l);
+ 
+ /* One masked exchange: every node in `nodes` must belong to one group (share
+  * the activation). `x_field` is the PLAINTEXT field-encoded activation, (m,K)
+--- a/wasm/ggml-shielded/ggml-shielded.cpp
++++ b/wasm/ggml-shielded/ggml-shielded.cpp
+@@ -100,6 +100,19 @@
+     g_offload_failed.store(true);
+     fprintf(stderr, "[shielded] protected offload failed (%d); backend retired\n", rc);
+     return true;
++}
++// A deliberate graph re-registration can race the old worker reservation's
++// cleanup. Retry only pre-work connection/HELLO negotiation, at most twice.
++// Public uploads, pad preparation and every matrix exchange remain fail-closed.
++static int sh_start_with_policy(sh_link *link) {
++    int rc = sh_link_start(link);
++    for (unsigned retry = 0; rc != SH_OK && retry < 2 &&
++            g_require_offload.load() && sh_link_start_retryable(link); ++retry) {
++        fprintf(stderr, "[shielded] retrying pre-work negotiation (%u/2)\n", retry + 1);
++        usleep(100000u << retry);
++        rc = sh_link_start(link);
++    }
++    return rc;
+ }
+ static ggml_shielded_source_release g_source_release;
+ static void *g_source_release_ctx;
+@@ -2395,7 +2408,7 @@
+     if (s.link && !s.link_failed && !sh_link_is_live(s.link)) s.dirty = true;
+     if (s.dirty && s.link && !s.link_failed) {
+         const double t0 = sh_now_ms();
+-        const int rc = sh_link_start(s.link);
++        const int rc = sh_start_with_policy(s.link);
+         if (rc == SH_ERR_VERIFY) {
+             /* A pad importer or authenticated upload can reject while start
+              * is warming the link. Never downgrade this to a retryable bank
+@@ -2440,7 +2453,7 @@
+             if (!o->link_failed && !sh_link_is_live(o->link)) o->dirty = true;
+             if (!o->dirty || o->link_failed) continue;
+             const double t0 = sh_now_ms();
+-            const int rc = sh_link_start(o->link);
++            const int rc = sh_start_with_policy(o->link);
+             if (rc == SH_ERR_VERIFY) {
+                 o->verify_fail++;
+                 fprintf(stderr, "[shielded] integrity failure during start of %s:%d: %s\n", o->host.c_str(), o->port, sh_link_last_error(o->link));

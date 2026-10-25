@@ -1,0 +1,10 @@
+{
+  "repository": "enclave",
+  "revision": "d09f377d03cc4032df43800adb1046551b667691",
+  "sourceDirectory": "isolation/m2",
+  "files": {
+    "app-seccomp.h": "1bcc87cc8c202caa1d1c3572a535da7f291b4e68f199ceb34419f5341666b325",
+    "sha256-min.h": "9b857776a74ded12ca64f56e45fc4a37a4d73d2e5c6785493f2f625d6448c9c7"
+  },
+  "purpose": "Reuse exact platform app-runtime seccomp for native desktop roles; this does not enable runtime admission"
+}

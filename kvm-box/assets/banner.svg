@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="400" viewBox="0 0 1600 400" font-family="monospace" role="img" aria-labelledby="title desc">
+  <title id="title">KVM Box — native desktop, masked compute</title>
+  <desc id="desc">A confidential Linux desktop with a Wasm controller, hardware KVM, masked GPU compute, Moonlight and FreeDoom.</desc>
+  <defs><radialGradient id="glow" cx="18%" cy="0%" r="90%"><stop offset="0%" stop-color="#6bd0c4" stop-opacity=".10"/><stop offset="60%" stop-color="#6bd0c4" stop-opacity="0"/></radialGradient></defs>
+  <rect width="1600" height="400" fill="#0b0d12"/><rect width="1600" height="400" fill="url(#glow)"/>
+  <rect x="6" y="6" width="1588" height="388" rx="18" fill="none" stroke="#252b38" stroke-width="4"/>
+  <text x="90" y="150" font-size="64" font-weight="700" fill="#6bd0c4">[ KVM <tspan fill="#9be7dd">Box</tspan> ]</text>
+  <text x="90" y="205" font-size="26" fill="#a5afc1">Native Linux desktop in a confidential VM</text>
+  <text x="90" y="245" font-size="26" fill="#868ea0">Masked compute · Moonlight · FreeDoom</text>
+  <text x="90" y="310" font-size="20" fill="#73819a">Wasm controller → hardware KVM → verified compute</text>
+  <g transform="translate(1080,70)">
+    <rect width="430" height="250" rx="12" fill="#101620" stroke="#2a3242" stroke-width="2"/>
+    <path d="M0 42h430" stroke="#2a3242" stroke-width="2"/>
+    <circle cx="22" cy="21" r="4" fill="#6bd0c4"/><text x="39" y="27" font-size="16" fill="#a5afc1">Linux · x86_64</text>
+    <text x="26" y="82" font-size="19" fill="#6bd0c4">&gt;_ Enclave Shield</text>
+    <text x="26" y="120" font-size="18" fill="#a5afc1">masked + verified GPU work</text>
+    <text x="26" y="151" font-size="18" fill="#868ea0">local CPU fallback</text>
+    <polyline points="26,204 106,204 133,180 163,229 194,193 221,204 402,204" fill="none" stroke="#9be7dd" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

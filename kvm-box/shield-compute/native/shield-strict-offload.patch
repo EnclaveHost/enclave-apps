@@ -1,0 +1,105 @@
+--- a/wasm/ggml-shielded/ggml-shielded.cpp
++++ b/wasm/ggml-shielded/ggml-shielded.cpp
+@@ -92,6 +92,15 @@
+ static sh_window_fn g_win_fn; static void *g_win_ctx;   /* dealt pads: see ggml_backend_shielded_set_window_provider */
+ static ggml_shielded_weight_verifier g_weight_verifier;
+ static void *g_weight_verifier_ctx;
++// Opt-in is one-way and installed before registration. The process-wide latch
++// prevents another graph/card/backend handle from retrying a failed job.
++static std::atomic<bool> g_require_offload{false}, g_offload_failed{false};
++static bool sh_strict_offload_error(int rc) {
++    if (rc == SH_OK || !g_require_offload.load()) return false;
++    g_offload_failed.store(true);
++    fprintf(stderr, "[shielded] protected offload failed (%d); backend retired\n", rc);
++    return true;
++}
+ static ggml_shielded_source_release g_source_release;
+ static void *g_source_release_ctx;
+ static ggml_shielded_encoded_source g_encoded_source;   /* optional catalog hit path (shielded-encoded-source.h) */
+@@ -348,6 +357,18 @@
+         if (!s->weights.empty() || !s->refused.empty() || s->source_verification_failed || s->weight_cache_failed)
+             return SH_ERR_RANGE;
+     g_weight_verifier = verifier; g_weight_verifier_ctx = ctx;
++    return SH_OK;
++}
++
++int ggml_backend_shielded_require_offload(void) {
++    sh_pool &p = sh_pool_get();
++    std::lock_guard<std::mutex> lk(p.mu);
++    sh_pool_init(p);
++    if (!g_weight_verifier || p.invalid || !p.pending.empty()) return SH_ERR_RANGE;
++    for (const auto *s : p.cards)
++        if (!s->weights.empty() || !s->refused.empty() || s->source_verification_failed || s->weight_cache_failed)
++            return SH_ERR_RANGE;
++    g_require_offload.store(true);
+     return SH_OK;
+ }
+ 
+@@ -2361,7 +2382,7 @@
+         sh_place_main_self();
+         if ((s.graph_calls & 255) == 0) sh_place_sweep();
+     }
+-    if (sh_card_integrity_failed(s) || s.weight_cache_failed || s.source_verification_failed) return GGML_STATUS_FAILED;
++    if (g_offload_failed.load() || sh_card_integrity_failed(s) || s.weight_cache_failed || s.source_verification_failed) return GGML_STATUS_FAILED;
+     const double tg0 = sh_now_ms();
+     s.graph_calls++;
+     int trace_m = 0;   /* rows of the last offloaded node in this graph, for the phase trace */
+@@ -2383,6 +2404,7 @@
+             fprintf(stderr, "[shielded] integrity failure during start: %s\n", sh_link_last_error(s.link));
+             return GGML_STATUS_FAILED;
+         }
++        if (sh_strict_offload_error(rc)) return GGML_STATUS_FAILED;
+         if (rc != SH_OK && sh_link_is_dealt(s.link)) {
+             /* Dealt pads configured and no way to run them (no window, no
+              * shipment, no worker): the same refusal as exhaustion. Computing
+@@ -2424,6 +2446,7 @@
+                 fprintf(stderr, "[shielded] integrity failure during start of %s:%d: %s\n", o->host.c_str(), o->port, sh_link_last_error(o->link));
+                 return GGML_STATUS_FAILED;
+             }
++            if (sh_strict_offload_error(rc)) return GGML_STATUS_FAILED;
+             if (rc != SH_OK) {
+                 SH_LOG("split: card %s:%d unavailable (%s); retrying in %.0f s\n", o->host.c_str(), o->port,
+                        sh_link_last_error(o->link), o->link_backoff_ms / 1000);
+@@ -2779,6 +2802,12 @@
+                 }
+             }
+             rc = all_live ? sh_split_exchange(pool, xents, yp, x_gpu.data(), m, post_ok ? &post : nullptr) : SH_ERR_IO;
++            // A shape refusal may use the trusted local implementation. An
++            // attempted exchange that fails must not retry or downgrade.
++            if (rc != SH_ERR_VERIFY && rc != SH_ERR_PROTO && sh_strict_offload_error(rc)) {
++                sh_link_set_idle_work(s.link, nullptr, nullptr);
++                return GGML_STATUS_FAILED;
++            }
+             /* Unlike a shape refusal, a broken transport must re-enter the
+              * start path. Otherwise column splitting silently stays on the
+              * whole-model CPU fallback forever after the broker goes idle.
+@@ -2919,6 +2948,7 @@
+                 fprintf(stderr, "[shielded] %s\n", sh_link_last_error(s.link));
+                 return GGML_STATUS_FAILED;
+             }
++            if (rc != SH_ERR_PROTO && sh_strict_offload_error(rc)) return GGML_STATUS_FAILED;
+             if (rc == SH_ERR_EXHAUST && sh_link_is_dealt(s.link)) {
+                 /* Dealt pads and the bank is behind: the trusted half has
+                  * nothing to mask with and must not silently fall back to
+@@ -2972,6 +3002,7 @@
+                 }
+             }
+         } else {
++            if (sh_strict_offload_error(SH_ERR_IO)) return GGML_STATUS_FAILED;
+             rc = sh_local_products(s, nodes, xents, x_gpu.data(), m, yp.data());
+             s.local_nodes += members.size();
+         }
+--- a/wasm/ggml-shielded/ggml-shielded.h
++++ b/wasm/ggml-shielded/ggml-shielded.h
+@@ -178,6 +178,11 @@
+  * Chunking and grouped/split products follow actual exchanges, not graph nodes.
+  * Cached/local products and failed replies add nothing. A failed job can have
+  * earlier verified chunks: supervisors must publish only successful-job totals. */
++/* One-way policy, after installing the public-weight verifier and before
++ * registration. Runtime transport, resource and pad failures retire the whole
++ * backend instead of silently retrying or falling back. Unsupported shapes
++ * and operations may still use the trusted local implementation. */
++GGML_BACKEND_API int ggml_backend_shielded_require_offload(void);
+ GGML_BACKEND_API void ggml_backend_shielded_verified_stats(uint64_t *exchanges,
+                                                            uint64_t *macs);
+ GGML_BACKEND_API void ggml_backend_shielded_stats(uint64_t *offloaded_nodes,

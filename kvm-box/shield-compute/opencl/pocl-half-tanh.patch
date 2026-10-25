@@ -1,0 +1,25 @@
+--- a/lib/kernel/sleef/libm/sleef_glue.cl
++++ b/lib/kernel/sleef/libm/sleef_glue.cl
+@@ -84,3 +84,22 @@
+ 
+ #endif
+ #endif
++
++#ifdef cl_khr_fp16
++/* SLEEF exports float/double tanh; evaluate half through float and round once. */
++half _CL_OVERLOADABLE _CL_READNONE tanh (half x)
++{
++  half result;
++  vstore_half_rte (tanh ((float)x), 0, (private half *)&result);
++  return result;
++}
++#define HALF_TANH_VECTOR(N) \
++  half##N _CL_OVERLOADABLE _CL_READNONE tanh (half##N x) \
++  { half##N result; for (int i = 0; i < N; ++i) result[i] = tanh (x[i]); return result; }
++HALF_TANH_VECTOR(2)
++HALF_TANH_VECTOR(3)
++HALF_TANH_VECTOR(4)
++HALF_TANH_VECTOR(8)
++HALF_TANH_VECTOR(16)
++#undef HALF_TANH_VECTOR
++#endif

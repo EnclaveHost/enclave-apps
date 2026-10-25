@@ -1,0 +1,62 @@
+--- a/wasm/ggml-shielded/sd-calib.cpp
++++ b/wasm/ggml-shielded/sd-calib.cpp
+@@ -255,7 +255,7 @@
+ 
+ static void usage() {
+     fprintf(stderr,
+-        "usage: sd-calib --diffusion D.gguf --llm L.gguf --vae V.safetensors [--sizes 512,1024] [--prompts N]\n"
++        "usage: sd-calib [--model MODEL.gguf | --diffusion D.gguf --llm L.gguf --vae V.safetensors] [--sizes 512,1024] [--prompts N]\n"
+         "                [--steps 8] [--cfg 1.0] [--threads N] [--top-rows 128] [--sample-rows 128]\n"
+         "                [--max-k-div 64] [--keep-tight] [--verbose] <out.calib>\n");
+     exit(2);
+@@ -263,14 +263,15 @@
+ 
+ int main(int argc, char **argv) {
+     int threads = (int)std::max(1u, std::thread::hardware_concurrency());
+-    std::string diffusion, llm, vae, out_path, sizes_arg = "512";
++    std::string model, diffusion, llm, vae, out_path, sizes_arg = "512";
+     int n_prompts = (int)(sizeof(PROMPTS) / sizeof(PROMPTS[0]));
+     int steps = 8, max_k_div = 64;
+     float cfg = 1.0f;
+     bool omit_tight = true;
+     for (int i = 1; i < argc; i++) {
+         const std::string a = argv[i];
+-        if (a == "--diffusion" && i + 1 < argc) diffusion = argv[++i];
++        if (a == "--model" && i + 1 < argc) model = argv[++i];
++        else if (a == "--diffusion" && i + 1 < argc) diffusion = argv[++i];
+         else if (a == "--llm" && i + 1 < argc) llm = argv[++i];
+         else if (a == "--vae" && i + 1 < argc) vae = argv[++i];
+         else if (a == "--sizes" && i + 1 < argc) sizes_arg = argv[++i];
+@@ -287,7 +288,8 @@
+         else if (out_path.empty()) out_path = a;
+         else usage();
+     }
+-    if (diffusion.empty() || llm.empty() || vae.empty() || out_path.empty()) usage();
++    if (out_path.empty() || (model.empty() && (diffusion.empty() || llm.empty() || vae.empty()))) usage();
++    if (!model.empty() && (!diffusion.empty() || !llm.empty() || !vae.empty())) usage();
+     if (getenv("SD_ACCEL_BACKEND")) { fprintf(stderr, "[sd-calib] unset SD_ACCEL_BACKEND: calibration observes the plain CPU graph\n"); return 2; }
+     std::vector<int> sizes;
+     for (size_t p = 0; p < sizes_arg.size();) {
+@@ -300,9 +302,10 @@
+     sd_set_log_callback(log_cb, nullptr);
+     sd_ctx_params_t cp;
+     sd_ctx_params_init(&cp);
+-    cp.diffusion_model_path = diffusion.c_str();
+-    cp.llm_path = llm.c_str();
+-    cp.vae_path = vae.c_str();
++    cp.model_path = model.empty() ? nullptr : model.c_str();
++    cp.diffusion_model_path = diffusion.empty() ? nullptr : diffusion.c_str();
++    cp.llm_path = llm.empty() ? nullptr : llm.c_str();
++    cp.vae_path = vae.empty() ? nullptr : vae.c_str();
+     cp.n_threads = threads;
+     cp.diffusion_flash_attn = true;
+     cp.enable_mmap = true;
+@@ -427,7 +430,7 @@
+     if (!f) { fprintf(stderr, "[sd-calib] cannot write %s\n", out_path.c_str()); return 2; }
+     fprintf(f, "# shielded-calib 2\n");
+     fprintf(f, "# sd-calib: %s + %s, %zu sites, reference exponent %d\n",
+-            diffusion.substr(diffusion.find_last_of('/') + 1).c_str(), llm.substr(llm.find_last_of('/') + 1).c_str(),
++            (model.empty() ? diffusion : model).substr((model.empty() ? diffusion : model).find_last_of('/') + 1).c_str(), llm.substr(llm.find_last_of('/') + 1).c_str(),
+             chosen.size(), REF_AF);
+     fprintf(f, "# %d public images (sizes %s, %d steps, cfg %.1f); pass B rows per site <= %zu (top L2, top Linf, reservoir)\n",
+             images, sizes_arg.c_str(), steps, cfg, 2 * g_cap.top_rows + g_cap.sample_rows);

@@ -1,0 +1,37 @@
+--- a/wasm/ggml-shielded/ggml-shielded.cpp
++++ b/wasm/ggml-shielded/ggml-shielded.cpp
+@@ -927,6 +927,24 @@
+     return -1;
+ }
+ 
++// GGML names can exceed the wire protocol's 63-byte limit. Authenticate
++// their full names above this layer; use a lossless-length SHA-256 identity
++// (base32, 52 characters) for the public wire label, without truncating names.
++#include "shielded-sha256.h"
++static std::string sh_wire_name(const std::string &name) {
++    uint8_t hash[32]; sha256_ctx ctx;
++    sha_init(&ctx); sha_update(&ctx, (const uint8_t *)name.data(), name.size()); sha_final(&ctx, hash);
++    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
++    std::string out = "w_";
++    uint32_t bits = 0; unsigned count = 0;
++    for (uint8_t byte : hash) {
++        bits = (bits << 8) | byte; count += 8;
++        while (count >= 5) { count -= 5; out += alphabet[(bits >> count) & 31]; }
++    }
++    if (count) out += alphabet[(bits << (5-count)) & 31];
++    return out;
++}
++
+ static bool sh_register(sh_state &s, const ggml_tensor *w, sh_source_prefetch *prefetch = nullptr,
+                         const ggml_tensor *next_source = nullptr,
+                         int64_t split_col0 = 0, int64_t split_ncols = 0) {
+@@ -1217,7 +1235,8 @@
+     if (sh_env_int("SHIELDED_COMPACT_WEIGHTS", 0) && !sh_link_is_dealt(s.link))
+         sh_link_quiesce(s.link);
+ #endif
+-    const int node = sh_link_add_weight(s.link, name.c_str(), stored.w.data(), K, link_N, sh_max_m(), share);
++    const auto wire_name = sh_wire_name(name);
++    const int node = sh_link_add_weight(s.link, wire_name.c_str(), stored.w.data(), K, link_N, sh_max_m(), share);
+     if (node < 0) {
+         SH_LOG("%s: %s\n", name.c_str(), sh_link_last_error(s.link));
+         s.weights.erase(name); s.refused.insert(name);

@@ -1,0 +1,43 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -7113,6 +7113,40 @@
+ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
+     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
++
++    // Prefer the native CPU backend for work that this experimental Shield
++    // route cannot mask, avoiding PoCL's emulated half arithmetic. The OpenCL
++    // frontend still authenticates actual Q8 bytes before protected dispatch.
++    const char * native_cpu = getenv("GGML_SHIELD_NATIVE_CPU_FALLBACK");
++    if (dev_ctx->device_name == "Enclave Shield Virtual GPU (guest CPU + verified offload)" &&
++        native_cpu != nullptr && strcmp(native_cpu, "1") == 0) {
++        switch (op->op) {
++            case GGML_OP_NONE:
++            case GGML_OP_VIEW:
++            case GGML_OP_RESHAPE:
++            case GGML_OP_PERMUTE:
++            case GGML_OP_TRANSPOSE:
++                break;
++            case GGML_OP_MUL_MAT:
++                if (op->src[0]->type != GGML_TYPE_Q8_0 || op->src[1]->type != GGML_TYPE_F32) {
++                    return false;
++                }
++                // The measured executor uses Shield's fixed 2M-weight MAC
++                // threshold. Unsupported small or batched products belong on
++                // native CPU, not the slower OpenCL CPU implementation.
++                if (op->src[0]->ne[0] <= 0 || op->src[0]->ne[1] <= 0 ||
++                    op->src[0]->ne[0] < (2000000 / op->src[0]->ne[1] + (2000000 % op->src[0]->ne[1] != 0)) ||
++                    op->src[0]->ne[2] != 1 || op->src[0]->ne[3] != 1 ||
++                    op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1 ||
++                    (op->src[1]->ne[1] == 1 && op->src[0]->ne[1] % 8 != 0) ||
++                    !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1])) {
++                    return false;
++                }
++                break;
++            default:
++                return false;
++        }
++    }
+ 
+     // reject ops that match the opfilter regex
+     if (dev_ctx->opfilter && std::regex_match(std::string(ggml_op_desc(op)), *dev_ctx->opfilter)) {

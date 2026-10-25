@@ -1,0 +1,14 @@
+--- a/src/core/ggml_extend.hpp
++++ b/src/core/ggml_extend.hpp
+@@ -2002,7 +2002,10 @@
+     }
+ 
+     ggml_cgraph* get_compute_graph(get_graph_cb_t get_graph) {
+-        SDGraphOutOfPlaceScope inplace_scope(compute_ctx, sd_backend_is(runtime_backend, "opencl"));
++        const char* out_of_place = std::getenv("SD_GRAPH_OUT_OF_PLACE");
++        SDGraphOutOfPlaceScope inplace_scope(compute_ctx,
++            sd_backend_is(runtime_backend, "opencl") ||
++            (out_of_place != nullptr && std::strcmp(out_of_place, "1") == 0));
+         prepare_build_in_tensor_before();
+         ggml_cgraph* gf = get_graph();
+         if (ggml_graph_n_nodes(gf) > 0) {
