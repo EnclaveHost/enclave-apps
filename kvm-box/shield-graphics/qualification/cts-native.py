@@ -44,6 +44,13 @@ expected_status = json.loads((assets/'expected-results.json').read_text())
 required = ['/opt/shield/mesa/lib/'+name for name in lock['mesa']] if api == 'gl' else ['/opt/shield/mesa/lib/libvulkan_lvp.so']
 for name, digest in lock['mesa'].items():
     assert probe.sha('/opt/shield/mesa/lib/'+name) == digest
+loader_identity = {}
+if api == 'gl':
+    name = 'libEGL_mesa.so.0.0.0' if gl_context == 'egl' else 'libGLX_mesa.so.0.0.0'
+    loader = '/opt/shield/mesa/lib/'+name
+    assert probe.sha(loader) == lock['loaders'][name]
+    required.append(loader)
+    loader_identity[name] = lock['loaders'][name]
 parser_path = assets/'source/scripts/log/log_parser.py'
 assert probe.sha(parser_path) == lock['qpaParserSha256']
 parser = module('qpa_parser', parser_path)
@@ -154,7 +161,7 @@ summary = {'passed': True, 'scope': 'Native desktop role, actual Xorg, immutable
            'counts': counts, 'allSelectedPassed': all(r['status'] == 'Pass' for r in records),
            'matchesContainerBaselineOrImproves': True, 'groups': groups,
            'workerTelemetryUnchanged': True, 'environment': environment, 'testLinkerAliases': aliases,
-           'ctsCommit': lock['source']['commit'], 'binarySha256': probe.sha(binary), 'mesa': lock['mesa']}
+           'ctsCommit': lock['source']['commit'], 'binarySha256': probe.sha(binary), 'mesa': lock['mesa'], 'loaderIdentity': loader_identity}
 (output/'result.json').write_text(json.dumps(summary, indent=2)+'\n')
 buffer = io.BytesIO()
 with tarfile.open(fileobj=buffer, mode='w') as archive:

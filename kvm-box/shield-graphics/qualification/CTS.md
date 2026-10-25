@@ -273,3 +273,25 @@ This fix is not yet in the signed v4 image. Masked failure regression checks
 and a newly built/qualified image remain required before release. Both the
 failed original native run and successful overlay run are retained alongside
 the container evidence in `graphics-glx-robustness-v1`.
+
+## Masked GLX regression, 2026-10-25
+
+The corrected GLX library also passed the actual native masked-work fixture:
+16 verified affine exchanges, 131,072 MACs and 4,096 checked shader components.
+Corrupting GPU reply 17 caused OpenGL context loss; subsequent OpenGL and Vulkan
+attempts failed against the retired service without an eighteenth GPU stream,
+CPU retry, readback or later draw. The host fixture verified the pinned dedicated
+RTX 3070 worker and left it running. Domain/cgroup cleanup and one-use admission
+passed. Evidence is `native-glx-masked-v1`.
+
+The first attempt stopped before GPU work because two Vulkan frames were
+identical. It is retained. The fixture now samples for up to eight seconds while
+requiring the same more-than-1,000 changed pixels; the successful run needed only
+one sample for each program. The original sample's cause is unestablished. This
+is an explicit single-library overlay test, not final-image owner provisioning.
+
+The CTS lock now pins the selected GL loader in addition to the core libraries:
+EGL must map the pinned EGL loader; GLX must map the corrected GLX loader. Vulkan
+has no GL-loader requirement. Both selected-loader smoke cases pass, and the
+old GLX library is refused by its hash before test execution. Historical
+fixtures retain their exact older lock and runner; do not rewrite their evidence.

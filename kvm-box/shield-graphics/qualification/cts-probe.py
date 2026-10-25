@@ -75,6 +75,13 @@ def main():
     for path, digest in libs.items():
         if sha(path) != digest:
             raise RuntimeError('Mesa hash mismatch: '+path)
+    loader = None
+    if a.api == 'gl':
+        name = 'libEGL_mesa.so.0.0.0' if a.gl_context == 'egl' else 'libGLX_mesa.so.0.0.0'
+        loader = '/opt/shield/mesa/lib/'+name
+        libs[loader] = lock['loaders'][name]
+        if sha(loader) != libs[loader]:
+            raise RuntimeError('Mesa loader hash mismatch: '+loader)
     icd = Path('/opt/shield/mesa/share/vulkan/icd.d/lvp_icd.x86_64.json')
     if json.loads(icd.read_text())['ICD']['library_path'] != '/opt/shield/mesa/lib/libvulkan_lvp.so':
         raise RuntimeError('Unexpected ICD path')

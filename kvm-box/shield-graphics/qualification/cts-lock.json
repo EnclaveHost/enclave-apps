@@ -69,5 +69,9 @@
     "libvulkan_lvp.so": "aa600783f4e5d7e8763a5b0159fb90309d8deb19d9ece27ed9d5d6f266fc95a8",
     "libgallium-25.0.7.so": "590f9bf762f857492ffdfff75acadb849cd47e307634e8efebde13bdd7fb0b80"
   },
-  "qpaParserSha256": "21f4480270ce1b0893cd1a7ffd18d4e709275a76ac5910cf3e90a4c915884a0d"
+  "qpaParserSha256": "21f4480270ce1b0893cd1a7ffd18d4e709275a76ac5910cf3e90a4c915884a0d",
+  "loaders": {
+    "libEGL_mesa.so.0.0.0": "de08cc8df3680df55e9c1825fc7542fc2158d18e1fd06ec8b9c13f2b8411e1c9",
+    "libGLX_mesa.so.0.0.0": "f4d9469ce85f265504679176fd7000cb4d479513dda5f17ff60d889e0fd6bf94"
+  }
 }
