@@ -189,7 +189,10 @@ func planComputer(m map[string]any, s screen) (computerPlan, error) {
 		}
 		x := int(math.Round(math.Max(0, math.Min(float64(s.width-1), v[0]))))
 		y := int(math.Round(math.Max(0, math.Min(float64(s.height-1), v[1]))))
-		return []string{"mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y)}
+		// Debian xdotool 3.20160805 waits indefinitely with --sync if the
+		// pointer is already at the target. XCloseDisplay flushes this request;
+		// the subsequent capture/settle loop observes the resulting X11 state.
+		return []string{"mousemove", strconv.Itoa(x), strconv.Itoa(y)}
 	}
 	button := "1"
 	if b, exists := m["button"]; exists {

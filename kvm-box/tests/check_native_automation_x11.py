@@ -37,7 +37,7 @@ with (w/'xvfb.log').open('w') as log:
   d=lib.XOpenDisplay(env['DISPLAY'].encode());assert d
   root=lib.XDefaultRootWindow(d)
   lib.XSetWindowBackground(d,root,0xde1e0a);lib.XClearWindow(d,root);lib.XSync(d,0)
-  subprocess.run(['xdotool','mousemove','--sync','480','300'],env=env,check=True,timeout=3)
+  subprocess.run(['xdotool','mousemove','480','300'],env=env,check=True,timeout=3)
   cap=opts.capture.resolve()
   b=subprocess.check_output([str(cap)],env=env,timeout=3)
   assert b[:4]==b'RGB1'
@@ -47,8 +47,8 @@ with (w/'xvfb.log').open('w') as log:
   # Confirm an option-like string remains literal typed input, not a filename.
   typed=subprocess.run(['xdotool','type','--clearmodifiers','--delay','0','--','--file /nonexistent-test-file; $(echo harmless)'],env=env,capture_output=True,timeout=3)
   assert typed.returncode==0,typed.stderr
-  # Same-coordinate synchronized move must not hang.
-  subprocess.run(['xdotool','mousemove','--sync','480','300'],env=env,check=True,timeout=3)
+  # Same-coordinate move must not wait for a coordinate change.
+  subprocess.run(['xdotool','mousemove','480','300'],env=env,check=True,timeout=3)
   report={'status':'passed','display':display,'width':dims[0],'height':dims[1],'pointer':[dims[2],dims[3]],'firstPixel':list(b[20:23]),'bytes':len(b),'typedOptionLikeText':True,'sameCoordinateMove':True,'productionVMChanged':False,'captureSha256':hashlib.sha256(cap.read_bytes()).hexdigest(),'xvfbSha256':hashlib.sha256(opts.xvfb.read_bytes()).hexdigest()}
   (w/'live-x11-result.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report))
  finally:

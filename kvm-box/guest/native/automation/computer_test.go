@@ -43,7 +43,7 @@ func TestCaptureFraming(t *testing.T) {
 func TestGridAndInputPlan(t *testing.T) {
 	s := testScreen()
 	p, e := planComputer(map[string]any{"action": "click", "x": "500", "y": float64(500), "grid": float64(1000)}, s)
-	if e != nil || !reflect.DeepEqual(p.commands[0], []string{"mousemove", "--sync", "480", "300"}) {
+	if e != nil || !reflect.DeepEqual(p.commands[0], []string{"mousemove", "480", "300"}) {
 		t.Fatal(p, e)
 	}
 	p, e = planComputer(map[string]any{"action": "type", "text": "--file /etc/passwd; $(echo bad)\n"}, s)

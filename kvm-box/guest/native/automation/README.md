@@ -88,6 +88,31 @@ python3 kvm-box/tests/check_native_automation_readiness.py
 The real socket case requires local UID/GID1000 and otherwise reports a skip.
 These checks do not replace startup and endpoint validation in the confined VM.
 
+## Confined VM acceptance fixture
+
+`tests/native_automation_netns.c` and `tests/native_automation_http.go` are
+fixture-only clients. The C launcher requires the explicit VM test boot marker,
+joins the disposable domain's network namespace, and drops to a fixed identity
+before executing the HTTP client. They must never be placed in a production
+root or platform archive.
+
+The client exercises the actual outer gateway, inner gateway and automation
+service. It checks desktop identity, credential exclusion, absence of physical
+GPU device nodes, nonzero exit results, output bounds, timeout cleanup, full
+JPEG decoding, X11 pointer position, invalid input, and a command lasting more
+than the inner gateway's default 60-second response deadline. Other service
+identities must fail to reach the outer gateway. The controller identity is
+supplied by the fixture: this is not proof of owner authentication or release.
+The scoped-key tests in `shield-desktop.rs` cover authentication separately;
+production acceptance must also prove the complete attested release path.
+
+The first v10 VM run passed startup, execution and screenshot checks but failed
+pointer movement. The packaged Debian xdotool waits indefinitely for a coordinate
+change when `mousemove --sync` targets the current position. The service now
+sends an ordinary flushed move and observes the result through its capture and
+settling loop. The VM fixture checks both changed coordinates and repeated
+same-coordinate moves. The rebuilt image must pass that fixture before release.
+
 ## Required release work
 
 1. Source complete: optional `KVMBOX_AUTOMATION_KEY` is loaded only by the
