@@ -15,9 +15,9 @@ variants={
  'renamed':(s.replace('positions','transformed').replace('row','item').replace('source','input_data'),True),
  'reassociated':(s.replace('v.x + v.y, v.y - v.x','v.y + v.x, -v.x + v.y'),True),
  'explicit-scalar':(s.replace('ivec4(v.x + v.y, v.y - v.x, v.z, v.w)','ivec4((v.y+v.x)+0, v.y+(-v.x), v.z*1, v.w-0)'),True),
- 'wrong-matrix':(s.replace('v.x + v.y','v.x - v.y'),False),
+ 'wrong-matrix':(s.replace('v.x + v.y','v.x - v.y'),True),
  'wrong-mask':(s.replace('255u','254u'),False),
- 'wrong-centering':(s.replace('ivec4(128)','ivec4(127)'),False),
+ 'wrong-centering':(s.replace('ivec4(128)','ivec4(127)'),True),
  'wrong-row':(s.replace('gl_GlobalInvocationID.x','gl_GlobalInvocationID.y'),False),
  'wrong-binding':(s.replace('binding = 0','binding = 3'),False),
  'wrong-workgroup':(s.replace('local_size_x = 64','local_size_x = 32'),False),
@@ -51,7 +51,7 @@ variants.update({
  'zink-wrong-input':(zink.replace('buffers[0].words','buffers[1].words'),False),
  'zink-wrong-output':(zink.replace('buffers[1].words','buffers[0].words'),False),
  'zink-missing-store':(zink.replace(' buffers[1].words[offset+3]=uint(v.w);',''),False),
- 'zink-wrong-component':(zink.replace('uint(v.z)','uint(v.w)'),False),
+ 'zink-wrong-component':(zink.replace('uint(v.z)','uint(v.w)'),True),
  'zink-wrong-store-index':(zink.replace('words[offset+3]=','words[offset+4]='),False),
  'zink-modular-equivalent':(zink.replace('(row<<4)>>2','((row+0x10000000u)<<4)>>2'),True),
  'zink-shift-overflow':(zink.replace('(row<<4)>>2','(row*0x40000010u)>>2'),False),
@@ -73,9 +73,9 @@ done
 cmd=['docker','run','--rm','--init','--network','none','--cpus','2','--memory','2g','--user',f'{os.getuid()}:{os.getgid()}','-v',str(mesa_source)+':/source:ro','-v',str(exp)+':/build:rw','-v',str(out)+':/fixtures:rw',image,'sh','-c',script]
 with (h/'structural-tests.log').open('w') as log:p=subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT,timeout=60)
 assert p.returncode==0
-reasons={'wrong-matrix': 'output-equation', 'wrong-mask': 'expression', 'wrong-centering': 'output-equation', 'wrong-row': 'input-access', 'wrong-binding': 'input-access', 'wrong-workgroup': 'metadata', 'wrong-output-offset': 'output-layout', 'extra-write': 'output-layout', 'private-branch': 'control-flow', 'unclamped': 'expression', 'fixed-short-input': 'input-access', 'fixed-short-output': 'output-layout', 'volatile': 'volatile-access', 'zink-wrong-set': 'input-access', 'zink-wrong-binding': 'input-access', 'zink-wrong-input': 'input-access', 'zink-wrong-output': 'output-layout', 'zink-missing-store': 'store-shape', 'zink-wrong-component': 'output-equation', 'zink-wrong-store-index': 'output-layout', 'zink-shift-overflow': 'expression', 'zink-shift-private': 'input-access', 'zink-shift-nondivisible': 'expression', 'zink-atomic': 'intrinsic'}
+reasons={'wrong-mask': 'expression', 'wrong-row': 'input-access', 'wrong-binding': 'input-access', 'wrong-workgroup': 'metadata', 'wrong-output-offset': 'output-layout', 'extra-write': 'output-layout', 'private-branch': 'control-flow', 'unclamped': 'expression', 'fixed-short-input': 'input-access', 'fixed-short-output': 'output-layout', 'volatile': 'volatile-access', 'zink-wrong-set': 'input-access', 'zink-wrong-binding': 'input-access', 'zink-wrong-input': 'input-access', 'zink-wrong-output': 'output-layout', 'zink-missing-store': 'store-shape', 'zink-wrong-store-index': 'output-layout', 'zink-shift-overflow': 'expression', 'zink-shift-private': 'input-access', 'zink-shift-nondivisible': 'expression', 'zink-atomic': 'intrinsic'}
 results=[]
 for name,(_,expected) in variants.items():
- report=(out/(name+'.comp.proof')).read_text();tokens=re.findall(r'^SHIELD_STRUCTURAL_PROOF=(accepted|rejected) reason=([a-z-]+) contract=([012])$',report,re.M);assert len(tokens)==1,(name,'missing/ambiguous proof result');actual=tokens[0][0]=='accepted';assert (int(tokens[0][2]) in [1,2])==actual;reason=tokens[0][1]
- result={'name':name,'expected':expected,'accepted':actual,'reason':reason,'contract':int(tokens[0][2]),'expectedReason':reasons.get(name,'ok'),'passed':actual==expected and reason==reasons.get(name,'ok') and (not actual or int(tokens[0][2])==(2 if name.startswith('zink-') else 1)),'spirvSha256':hashlib.sha256((out/(name+'.comp.spv')).read_bytes()).hexdigest()};results.append(result)
+ report=(out/(name+'.comp.proof')).read_text();tokens=re.findall(r'^SHIELD_STRUCTURAL_PROOF=(accepted|rejected) reason=([a-z-]+) contract=([01234])$',report,re.M);assert len(tokens)==1,(name,'missing/ambiguous proof result');actual=tokens[0][0]=='accepted';assert (int(tokens[0][2]) in [1,2,3,4])==actual;reason=tokens[0][1]
+ result={'name':name,'expected':expected,'accepted':actual,'reason':reason,'contract':int(tokens[0][2]),'expectedReason':reasons.get(name,'ok'),'passed':actual==expected and reason==reasons.get(name,'ok') and (not actual or int(tokens[0][2])==(4 if name=='zink-wrong-component' else 3 if name in ['wrong-matrix','wrong-centering'] else 2 if name.startswith('zink-') else 1)),'spirvSha256':hashlib.sha256((out/(name+'.comp.spv')).read_bytes()).hexdigest()};results.append(result)
 record={'passed':all(r['passed'] for r in results),'cases':results,'scope':'Compiler admission tests; GPU routing is measured separately by driver tests'};(h/'structural-results.json').write_text(json.dumps(record,indent=2)+'\n');print(json.dumps(record));assert record['passed']

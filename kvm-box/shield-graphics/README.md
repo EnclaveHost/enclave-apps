@@ -3,7 +3,7 @@
 The requested endpoint is usable OpenGL/Vulkan in the native desktop, with
 physical GPU work restricted to the masked channel and unsupported work kept
 inside the VM. This directory contains the graphics reference and acceptance
-path. A [protected OpenGL/Vulkan prepass](driver/README.md) now passes real
+path. A [protected OpenGL/Vulkan affine compiler](driver/README.md) now passes real
 worker tests through a patched Mesa ICD in a host container and the actual
 native KVM desktop. General masked rendering remains incomplete.
 
@@ -12,6 +12,48 @@ loader, but lacks a Vulkan ICD. The separate development reference adds Mesa
 Lavapipe and tests OpenGL over Vulkan using Zink. Keeping both APIs on one
 renderer gives future protected compiler work a common reference path.
 [Mesa documents Zink's Vulkan requirements](https://docs.mesa3d.org/drivers/zink.html).
+
+## Current generalized compiler checkpoint
+
+The compiler now extracts a bounded 4×4 integer matrix plus modular bias and row
+terms from ordinary Vulkan and Zink-generated OpenGL shaders. It keeps bias and
+row terms inside the VM, sends only the bounded dot product to the existing
+Shield service, and requires separate approval of the exact matrix digest.
+Unapproved constants stay local. This broadens the former single transform;
+it does not introduce float quantization or arbitrary shader approval.
+
+The [affine checkpoint](qualification/affine-checkpoint.json) records a separate
+native image with 32 verified exchanges / 262,144 MACs across the old and new
+Vulkan/OpenGL fixtures. Each of four programs checks 2,048 outputs. Both Vulkan
+frames match independent CPU references. Corrupting actual worker reply 33
+causes OpenGL context loss and service retirement; OpenGL/Vulkan retries make
+no additional worker exchange. All 14 native lifecycle checks pass.
+
+The same boot passes Firefox WebGL 1/2 and encrypted Moonlight streaming:
+1280×800 H.264, 29.93 FPS received/decoded, 29.83 displayed in the short test.
+The image SHA-256 is
+`f473f553d0a4a5b29e205fd5d8af449bd4e5bc9e2d1dfe5c818736792ecb4b71`;
+dm-verity root is
+`ffaae3cfbb40e61a4bdd39fe5898634288cabe57fdf58dd9b62e952fa04e6b54`.
+Vulkan library SHA-256 is
+`aa600783f4e5d7e8763a5b0159fb90309d8deb19d9ece27ed9d5d6f266fc95a8`.
+Gallium remains the previously qualified build. This is a separate test image,
+using synthetic owner admission and public fixture policies; it has not replaced
+the user's VM or established production attestation.
+
+Validation includes 32 baseline and 41 generalized compiler cases, the 25-case
+original driver regression suite, eight affine driver cases, and 1,028 new
+ASan/UBSan client cases plus the original parser suite. Exact matrix identity is
+checked in the service-side test receipts. All 15 patched upstream Mesa files
+reproduce the tested source. Offline proof normalization differs from runtime;
+actual driver tests separately establish runtime eligibility for their fixtures.
+The scoped independent Claude review found no confirmed defect in the reviewed
+compiler/client/runtime delta; it did not review cryptography or the platform.
+
+These are correctness and isolation results. The device still reports CPU;
+ordinary floating-point rendering and video encoding remain local. There is no
+measured speedup or general protected game-rendering claim. Earlier checkpoints
+below retain their original hashes and narrower acceptance scope.
 
 ## What has been demonstrated
 
@@ -212,7 +254,7 @@ time; record its immutable image ID and package versions for each qualification.
    video checks now pass; keep
    the reference renderer available as the trusted fallback.
 2. Expand the protected operation coverage beyond the structurally proven
-   fixed integer prepass. Existing public
+   bounded integer affine family. Existing public
    model policies do not authorize arbitrary scene coefficients or textures.
 3. Validate numeric semantics and leakage for each accelerated operation;
    preserve trusted handling of private visibility, texture addressing,

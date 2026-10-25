@@ -1,6 +1,7 @@
 /* Parser/serialization tests use synthetic replies, never claim GPU work. */
 #include "shield_prepass_client.c"
 #include <assert.h>
+static const struct shield_affine64 fixed={.matrix={{1,-1,0,0},{1,1,0,0},{0,0,1,0},{0,0,0,1}}};
 static struct json_object *fixture(const char *route) {
     struct json_object *root = json_object_new_object(), *outputs = json_object_new_object(), *rows = json_object_new_array(), *routes = json_object_new_object(), *stats = json_object_new_object();
     json_object_object_add(root, "ok", json_object_new_boolean(true));
@@ -22,7 +23,7 @@ static struct json_object *fixture(const char *route) {
 static void run(struct json_object *root, enum shield_prepass_result expected) {
     const char *text = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
     int32_t output[256]; memset(output, 0xa5, sizeof output);
-    assert(response(text, strlen(text), output) == expected);
+    assert(response(&fixed, text, strlen(text), output) == expected);
     if (expected == SHIELD_PREPASS_FAILED) {
         for (size_t i = 0; i < sizeof output; ++i) assert(((unsigned char *)output)[i] == 0xa5);
     } else {
@@ -33,7 +34,7 @@ static void run(struct json_object *root, enum shield_prepass_result expected) {
 int main(void) {
     char body[REQUEST_LIMIT]; uint32_t input[256];
     for (unsigned i = 0; i < 256; ++i) input[i] = 0xffffff00u | i;
-    size_t length = request(input, body); assert(length && length < REQUEST_LIMIT);
+    size_t length = request(&fixed, input, body); assert(length && length < REQUEST_LIMIT);
     struct json_object *req = json_tokener_parse(body); assert(req);
     struct json_object *inputs, *rows;
     assert(field(req, "inputs", json_type_object, &inputs) && field(inputs, "x", json_type_array, &rows));
@@ -63,8 +64,8 @@ int main(void) {
     root = fixture("local"); const char *valid = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN); length = strlen(valid);
     char duplicate[RESPONSE_LIMIT]; int n = snprintf(duplicate, sizeof duplicate, "{\"ok\":false,%s", valid + 1); assert(n > 0);
     int32_t output[256]; memset(output, 0xa5, sizeof output);
-    assert(response(duplicate, (size_t)n, output) == SHIELD_PREPASS_FAILED);
-    for (size_t cut = 0; cut < length; ++cut) assert(response(valid, cut, output) == SHIELD_PREPASS_FAILED);
+    assert(response(&fixed, duplicate, (size_t)n, output) == SHIELD_PREPASS_FAILED);
+    for (size_t cut = 0; cut < length; ++cut) assert(response(&fixed, valid, cut, output) == SHIELD_PREPASS_FAILED);
     for (size_t i = 0; i < sizeof output; ++i) assert(((unsigned char *)output)[i] == 0xa5);
     json_object_put(root);
     puts("prepass client: request, route, bounds, types, late failure, duplicate keys and every truncation passed; synthetic replies only");

@@ -53,15 +53,14 @@ static bool number(char *data, size_t *used, int value) {
     char text[24]; int n = snprintf(text, sizeof text, "%d", value);
     return n > 0 && (size_t)n < sizeof text && append(data, used, text);
 }
-static size_t request(const uint32_t input[256], char data[REQUEST_LIMIT]) {
+static size_t request(const struct shield_affine64 *transform, const uint32_t input[256], char data[REQUEST_LIMIT]) {
     size_t used = 0;
     if (!append(data, &used, "{\"op\":\"graph\",\"mode\":\"masked\",\"graph\":{\"schema\":\"shield-graph/1\",\"nodes\":[{\"name\":\"x\",\"op\":\"input\",\"shape\":[64,32],\"bound\":128},{\"name\":\"w\",\"op\":\"constant\",\"shape\":[32,4],\"value\":[")) return 0;
-    const int weights[4][4] = {{1,-1,0,0}, {1,1,0,0}, {0,0,1,0}, {0,0,0,1}};
     for (unsigned row = 0; row < 32; ++row) {
         if (!append(data, &used, row ? ",[" : "[")) return 0;
         for (unsigned col = 0; col < 4; ++col) {
             if (col && !append(data, &used, ",")) return 0;
-            if (!number(data, &used, row < 4 ? weights[row][col] : 0)) return 0;
+            if (!number(data, &used, row < 4 ? transform->matrix[row][col] : 0)) return 0;
         }
         if (!append(data, &used, "]")) return 0;
     }
@@ -86,7 +85,7 @@ static bool counter(struct json_object *object, const char *name, int64_t min, i
     int64_t count = json_object_get_int64(value);
     return count >= min && count <= max;
 }
-static enum shield_prepass_result response(const char *data, size_t length, int32_t output[256]) {
+static enum shield_prepass_result response(const struct shield_affine64 *transform, const char *data, size_t length, int32_t output[256]) {
     enum shield_prepass_result result = SHIELD_PREPASS_FAILED;
     struct json_tokener *parser = json_tokener_new_ex(16);
     if (!parser) return result;
@@ -126,11 +125,23 @@ static enum shield_prepass_result response(const char *data, size_t length, int3
             struct json_object *value = json_object_array_get_idx(values, col);
             if (!json_object_is_type(value, json_type_int)) { result = SHIELD_PREPASS_FAILED; goto done; }
             int64_t number = json_object_get_int64(value);
-            // This exact shader has tighter bounds than generic FIELD_GEMM.
-            int64_t low = col == 0 ? -256 : col == 1 ? -255 : -128;
-            int64_t high = col == 0 ? 254 : col == 1 ? 255 : 127;
+            // Exact interval of four independent centered low-byte inputs.
+            // This bounds only the dot product; modular row/bias terms never leave the VM.
+            int64_t low = 0, high = 0;
+            for (unsigned k = 0; k < 4; k++) {
+                int64_t coefficient = transform->matrix[k][col];
+                low += coefficient >= 0 ? -128 * coefficient : 127 * coefficient;
+                high += coefficient >= 0 ? 127 * coefficient : -128 * coefficient;
+            }
             if (number < low || number > high) { result = SHIELD_PREPASS_FAILED; goto done; }
             scratch[row * 4 + col] = (int32_t)number;
+        }
+    }
+    for (unsigned row = 0; row < 64; row++) {
+        for (unsigned col = 0; col < 4; col++) {
+            uint32_t bits = (uint32_t)scratch[row * 4 + col] + transform->bias[col] +
+                            row * transform->row[col];
+            memcpy(&scratch[row * 4 + col], &bits, sizeof bits);
         }
     }
     memcpy(output, scratch, sizeof scratch);
@@ -139,11 +150,14 @@ done:
     if (root) json_object_put(root);
     return result;
 }
-enum shield_prepass_result shield_prepass_execute(const uint32_t input[256], int32_t output[256]) {
+enum shield_prepass_result shield_prepass_execute_transform(const struct shield_affine64 *candidate, const uint32_t input[256], int32_t output[256]) {
     enum shield_prepass_result result = SHIELD_PREPASS_FAILED;
+    if (!candidate || !input || !output) return result;
+    const struct shield_affine64 transform = *candidate;
+    if (!shield_affine64_valid(&transform)) return result;
     char *body = malloc(REQUEST_LIMIT);
     if (!body) return result;
-    size_t length = request(input, body);
+    size_t length = request(&transform, input, body);
     int fd = -1; char *reply = NULL;
     if (!length) goto done;
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -166,10 +180,15 @@ enum shield_prepass_result shield_prepass_execute(const uint32_t input[256], int
     reply = malloc(length + 1); if (!reply) goto done;
     if (!transfer(fd, reply, length, false, deadline)) goto done;
     reply[length] = 0;
-    result = response(reply, length, output);
+    result = response(&transform, reply, length, output);
 done:
     if (fd >= 0) close(fd);
     if (reply) { explicit_bzero(reply, length); free(reply); }
     explicit_bzero(body, REQUEST_LIMIT); free(body);
     return result;
+}
+
+enum shield_prepass_result shield_prepass_execute(const uint32_t input[256], int32_t output[256]) {
+    const struct shield_affine64 transform = shield_affine64_fixed();
+    return shield_prepass_execute_transform(&transform, input, output);
 }

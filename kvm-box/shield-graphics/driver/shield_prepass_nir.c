@@ -1,4 +1,4 @@
-/* Experimental proof of the existing fixed integer prepass, after NIR SSA
+/* Experimental proof of bounded integer affine prepasses, after NIR SSA
  * normalization. A successful proof is not policy approval or driver admission.
  * All arithmetic is in Z/(2^32); the final bounded result is separately known.
  * No runtime input values, shader names or debug information are consulted. */
@@ -129,7 +129,7 @@ static struct value evaluate(nir_def *def, unsigned component, unsigned depth, u
    }
    return bad();
 }
-static enum shield_nir_reason prove(nir_shader *nir, enum shield_nir_contract contract) {
+static enum shield_nir_reason prove(nir_shader *nir, enum shield_nir_contract contract, struct shield_affine64 *transform) {
    if (!nir || nir->info.stage!=MESA_SHADER_COMPUTE || nir->info.workgroup_size[0]!=64 ||
        nir->info.workgroup_size[1]!=1 || nir->info.workgroup_size[2]!=1 ||
        nir->info.workgroup_size_variable || nir->info.shared_size || (nir->info.num_ssbos!=2 && nir->info.num_ssbos!=1))
@@ -182,12 +182,21 @@ static enum shield_nir_reason prove(nir_shader *nir, enum shield_nir_contract co
                if(first>3) return SHIELD_NIR_OUTPUT_LAYOUT;
                row.coefficient[0]=first;
                if(!equals(index,row)) return SHIELD_NIR_OUTPUT_LAYOUT;
-               const uint32_t expected[4][6]={{0,0,1,1,0,0},{0,0,UINT32_MAX,1,0,0},{0,0,0,0,1,0},{0,0,0,0,0,1}};
                for(unsigned c=0;c<width;c++) {
                   unsigned component=first+c;
                   if(written&(1u<<component)) return SHIELD_NIR_STORE_SHAPE;
-                  struct value want={.form=AFFINE}; memcpy(want.coefficient,expected[component],sizeof want.coefficient);
-                  if(!equals(evaluate(i->src[1].ssa,c,0,&budget,contract),want)) return budget?SHIELD_NIR_OUTPUT_EQUATION:SHIELD_NIR_LIMIT;
+                  struct value equation=evaluate(i->src[1].ssa,c,0,&budget,contract);
+                  if(equation.form!=AFFINE) return budget?SHIELD_NIR_OUTPUT_EQUATION:SHIELD_NIR_LIMIT;
+                  for(unsigned k=0;k<4;k++) {
+                     uint32_t coefficient=equation.coefficient[2+k];
+                     /* Interpret the modular representative without a narrowing signed cast.
+                      * The existing FIELD_GEMM public-weight contract permits +/-119. */
+                     if(coefficient<=119) transform->matrix[k][component]=(int32_t)coefficient;
+                     else if(coefficient>=UINT32_MAX-118) transform->matrix[k][component]=-(int32_t)(0u-coefficient);
+                     else return SHIELD_NIR_OUTPUT_EQUATION;
+                  }
+                  transform->bias[component]=equation.coefficient[0];
+                  transform->row[component]=equation.coefficient[1];
                   written|=1u<<component;
                }
                break;
@@ -207,8 +216,12 @@ static enum shield_nir_reason prove(nir_shader *nir, enum shield_nir_contract co
 }
 struct shield_nir_proof shield_prepass_prove_nir(nir_shader *nir) {
    enum shield_nir_contract contract=nir && nir->info.num_ssbos==1?SHIELD_NIR_ZINK64_V1:SHIELD_NIR_FIXED64_V1;
-   enum shield_nir_reason reason=prove(nir,contract);
-   return (struct shield_nir_proof){.contract=reason==SHIELD_NIR_OK?contract:SHIELD_NIR_NONE,.reason=reason};
+   struct shield_affine64 transform={0};
+   enum shield_nir_reason reason=prove(nir,contract,&transform);
+   if(reason!=SHIELD_NIR_OK) return (struct shield_nir_proof){.contract=SHIELD_NIR_NONE,.reason=reason};
+   if(!shield_affine64_is_fixed(&transform))
+      contract=contract==SHIELD_NIR_ZINK64_V1?SHIELD_NIR_ZINK_AFFINE64_V2:SHIELD_NIR_AFFINE64_V2;
+   return (struct shield_nir_proof){.contract=contract,.reason=reason,.transform=transform};
 }
 const char *shield_nir_reason_name(enum shield_nir_reason reason) {
    const char *names[]={"ok","metadata","limit","control-flow","deref-mode","expression","input-access","volatile-access","store-shape","output-layout","output-equation","intrinsic","instruction"};

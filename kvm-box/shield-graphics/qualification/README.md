@@ -165,3 +165,41 @@ native restart/teardown plus the existing browser and protected-compute checks.
 It is a short LAN-style fixture, not a WAN/game/latency guarantee. Logs exported
 as evidence omit Moonlight request URLs containing synthetic pairing/session
 secrets. Client keys, owner credentials and paired settings are not exported.
+
+## Generalized affine contracts
+
+`test-affine-nir.py` uses the same `--image`, `--source`, `--build`, and fresh
+`--output` arguments as `test-nir.py`. It compiles 41 public fixtures and compares
+all extracted coefficients, including modular bias/row values. It is an offline
+proof test; only actual driver runs establish runtime routing.
+
+The `affine/` directory contains independent standard-API Vulkan/OpenGL programs
+and GLSL with a different 4×4 matrix, nonzero bias, signed boundary values and row
+terms that wrap modulo 2^32. Each API checks 2,048 outputs against an integer
+oracle. Build with its `build.sh` and `build-gl.sh` in the pinned tools image.
+Use a separate output directory with `build/` for Vulkan binaries and `gl/` for
+OpenGL binaries (copy the executable and `.comp` into the output root), and render `triangle.rgba` with the original fixed-only ICD as
+the CPU reference before running the candidate. `affine/prepare.py --image sha256:TOOLS_HASH --reference /work/reference-mesa
+--output /work/new-affine-results` automates this build and CPU reference run,
+with no service socket, network or physical GPU. It records all fixture and
+reference-library hashes. The source/fixture manifest is `affine/fixture.json`. `affine/run-driver.py` takes the same arguments as the
+original runner; modes `local`, `gl-local`, `masked`, `gl-masked`, `unavailable`,
+`gl-unavailable`, `worker-corrupt`, and `gl-worker-corrupt` are qualified for this
+fixture. The container service checks the exact matrix in every request and
+records its digest. Bias/row terms do not appear in that request.
+
+The normal 25-case driver suite remains required. Its layout/query/loss fixtures
+continue using the original transform. Build the client unit tests separately:
+
+```sh
+cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+  ../driver/test_prepass_client.c $(pkg-config --cflags --libs json-c) -o test-client
+cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+  ../driver/test_affine_client.c $(pkg-config --cflags --libs json-c) -o test-affine-client
+./test-client
+./test-affine-client
+```
+
+No production approval policy is changed by these fixtures. There is no measured
+speedup claim: small synchronous masked requests have overhead, and general
+floating-point rendering stays on the CPU.

@@ -1,10 +1,10 @@
 # Protected graphics follow-up
 
-Status: staged implementation, 2026-10-25. A narrow integer Vulkan prepass
+Status: staged implementation, 2026-10-25. A bounded integer affine compiler for OpenGL/Vulkan
 now executes through the existing masked channel in a patched Mesa ICD under
 host-container and native KVM tests; see the [driver contract](../shield-graphics/driver/README.md).
-The actual VM qualifies both the software reference and the narrow protected
-compute-to-draw path. General protected rendering remains open.
+The actual VM qualifies the software reference and both the original and generalized
+protected compute-to-draw paths. General protected rendering remains open.
 
 The user has now explicitly requested work through a usable OpenGL/Vulkan
 driver. The separate [graphics reference](../shield-graphics/README.md) adds a
@@ -22,8 +22,9 @@ untrusted-GPU threat model. Selected linear work with explicitly public
 coefficients could be transformed into a vetted masked operation. Private
 visibility decisions, texture access, unsupported shaders, the framebuffer and
 encoding would remain inside the VM. This is an architectural inference from
-the existing compute boundary. The initial integer prepass demonstrates only
-a narrow subset, with no measured performance gain.
+the existing compute boundary. The generalized compiler extracts approved bounded matrix products and keeps
+modular bias/row terms local. It demonstrates a limited integer subset, with no
+measured performance gain.
 
 Encrypting a command stream or video connection does not hide plaintext from a
 GPU that must decrypt and render it. Masking a matrix product also does not

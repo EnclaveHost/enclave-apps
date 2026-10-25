@@ -1,15 +1,20 @@
-/* Experimental exact-integer prepass adapter; not general shader lowering. */
+/* Exact bounded-integer affine adapter; not arbitrary shader lowering. */
 #ifndef SHIELD_PREPASS_CLIENT_H
 #define SHIELD_PREPASS_CLIENT_H
 #include <stdint.h>
+#include "shield_affine64.h"
 enum shield_prepass_result {
     SHIELD_PREPASS_FAILED = -1,
     SHIELD_PREPASS_UNAVAILABLE = 0, /* No connection/request; use original CPU shader. */
     SHIELD_PREPASS_LOCAL = 1,       /* Trusted service explicitly reports CPU execution. */
     SHIELD_PREPASS_MASKED = 2       /* Service reports verified masked exchanges. */
 };
-/* Input is an owned 64x4 snapshot for the exact qualification shader. Output
+/* Input is an owned 64x4 snapshot. The legacy entry uses the fixed qualification transform. Output
  * is unchanged unless the entire response is validated. The caller must prove
  * shader equivalence, descriptor extent, synchronization and non-aliasing. */
 enum shield_prepass_result shield_prepass_execute(const uint32_t input[256], int32_t output[256]);
+/* Caller must supply an immutable transform from an accepted conditional proof
+ * and revalidate the full dispatch/layout contract. Bounds validation here is
+ * defense in depth, not semantic proof or public-matrix authorization. */
+enum shield_prepass_result shield_prepass_execute_transform(const struct shield_affine64 *transform, const uint32_t input[256], int32_t output[256]);
 #endif

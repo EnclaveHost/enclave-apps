@@ -60,12 +60,25 @@
              progress = false;
 
              #define OPT(pass, ...) ({                                  \
-@@ -324,14 +337,17 @@
+@@ -324,14 +337,30 @@
              #undef OPT
           } while (progress);
        }
 +      struct shield_nir_proof proof = shield_prepass_prove_nir(nir);
 +      fprintf(stderr,"SHIELD_STRUCTURAL_PROOF=%s reason=%s contract=%u\n",proof.contract!=SHIELD_NIR_NONE?"accepted":"rejected",shield_nir_reason_name(proof.reason),proof.contract);
++      if (proof.contract != SHIELD_NIR_NONE) {
++         fprintf(stderr,"SHIELD_AFFINE64={\"matrix\":[");
++         for(unsigned k=0;k<4;k++) {
++            fprintf(stderr,"%s[",k?",":"");
++            for(unsigned c=0;c<4;c++) fprintf(stderr,"%s%d",c?",":"",proof.transform.matrix[k][c]);
++            fprintf(stderr,"]");
++         }
++         fprintf(stderr,"],\"bias\":[");
++         for(unsigned c=0;c<4;c++) fprintf(stderr,"%s%u",c?",":"",proof.transform.bias[c]);
++         fprintf(stderr,"],\"row\":[");
++         for(unsigned c=0;c<4;c++) fprintf(stderr,"%s%u",c?",":"",proof.transform.row[c]);
++         fprintf(stderr,"]}\n");
++      }
        nir_print_shader(nir, stdout);
     } else {
        fprintf(stderr, "SPIRV to NIR compilation failed\n");

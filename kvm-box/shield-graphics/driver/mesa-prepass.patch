@@ -14,7 +14,7 @@
     struct vk_object_base base;
 +   /* Set only from exact source module validation; never serialized shader state. */
 +   bool shield_prepass_candidate;
-+   enum shield_nir_contract shield_prepass;
++   struct shield_nir_proof shield_prepass;
     struct lvp_device *                          device;
     struct lvp_pipeline_layout *                 layout;
 
@@ -35,15 +35,15 @@
 
 +/* Experimental structural admission. The original CPU NIR stays untouched.
 + * This contract is conditional on the complete handle_shield_prepass guards. */
-+static enum shield_nir_contract
++static struct shield_nir_proof
 +lvp_prove_prepass(nir_shader *original)
 +{
 +   nir_function_impl *entry = nir_shader_get_entrypoint(original);
 +   if (!entry || entry->ssa_alloc > 4096)
-+      return SHIELD_NIR_NONE;
++      return (struct shield_nir_proof){.contract=SHIELD_NIR_NONE,.reason=SHIELD_NIR_LIMIT};
 +   nir_shader *nir = nir_shader_clone(NULL, original);
 +   if (!nir)
-+      return SHIELD_NIR_NONE;
++      return (struct shield_nir_proof){.contract=SHIELD_NIR_NONE,.reason=SHIELD_NIR_LIMIT};
 +   bool settled = false;
 +   for (unsigned iteration = 0; iteration < 16; ++iteration) {
 +      bool progress = false;
@@ -61,13 +61,13 @@
 +      NIR_PASS(progress, nir, nir_opt_dead_cf);
 +      if (!progress) { settled = true; break; }
 +   }
-+   struct shield_nir_proof proof = {SHIELD_NIR_NONE, SHIELD_NIR_LIMIT};
++   struct shield_nir_proof proof = {.contract=SHIELD_NIR_NONE,.reason=SHIELD_NIR_LIMIT};
 +   if (settled) {
 +      nir_validate_shader(nir, "experimental Shield proof input");
 +      proof = shield_prepass_prove_nir(nir);
 +   }
 +   ralloc_free(nir);
-+   return proof.contract;
++   return proof;
 +}
 +
  VkResult
@@ -112,7 +112,7 @@
  };
 
  struct rendering_state {
-+   enum shield_nir_contract shield_prepass;
++   struct shield_nir_proof shield_prepass;
 +   bool shield_failed;
 +   unsigned shield_generated_depth;
 +   unsigned shield_active_queries;
@@ -123,7 +123,7 @@
  static void
  handle_compute_shader(struct rendering_state *state, struct lvp_shader *shader)
  {
-+   state->shield_prepass = SHIELD_NIR_NONE; /* shader objects and internal compute stay local */
++   state->shield_prepass = (struct shield_nir_proof){.contract=SHIELD_NIR_NONE}; /* shader objects and internal compute stay local */
     state->shaders[MESA_SHADER_COMPUTE] = shader;
 
     state->has_pcbuf[MESA_SHADER_COMPUTE] = shader->push_constant_size > 0;
@@ -135,18 +135,19 @@
  }
 
  static void handle_ray_tracing_pipeline(struct vk_cmd_queue_entry *cmd,
-@@ -2839,6 +2846,62 @@
+@@ -2839,6 +2846,63 @@
     state->ib_dirty = true;
  }
 
-+/* Fixed 64x4 prepass only. Routing uses shader/grid/descriptor metadata, never
++/* Bounded 64x4 affine prepass (contracts 1-4). Routing uses shader/grid/descriptor metadata, never
 + * private values. Prior writes complete before input snapshot. Unsupported
 + * layouts retain the original CPU shader. A started request never retries. */
 +static bool
 +handle_shield_prepass(struct rendering_state *state)
 +{
-+   if ((state->shield_prepass != SHIELD_NIR_FIXED64_V1 &&
-+        state->shield_prepass != SHIELD_NIR_ZINK64_V1) || state->shield_generated_depth ||
++   const enum shield_nir_contract contract=state->shield_prepass.contract;
++   if ((contract != SHIELD_NIR_FIXED64_V1 && contract != SHIELD_NIR_ZINK64_V1 &&
++        contract != SHIELD_NIR_AFFINE64_V2 && contract != SHIELD_NIR_ZINK_AFFINE64_V2) || state->shield_generated_depth ||
 +       state->shield_active_queries || state->dispatch_info.grid[0] != 1 ||
 +       state->dispatch_info.grid[1] != 1 || state->dispatch_info.grid[2] != 1 ||
 +       state->dispatch_info.block[0] != 64 || state->dispatch_info.block[1] != 1 ||
@@ -155,7 +156,7 @@
 +   for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); ++i)
 +      if (state->desc_buffers[i])
 +         return false;
-+   bool array_layout = state->shield_prepass == SHIELD_NIR_ZINK64_V1;
++   bool array_layout = contract == SHIELD_NIR_ZINK64_V1 || contract == SHIELD_NIR_ZINK_AFFINE64_V2;
 +   struct lvp_descriptor_set *set = state->desc_sets[LVP_PIPELINE_COMPUTE][array_layout ? 3 : 0];
 +   if (!set || !set->layout || set->layout->binding_count != (array_layout ? 1 : 2) || !set->map ||
 +       set->layout->dynamic_offset_count != 0)
@@ -182,7 +183,7 @@
 +   uint32_t snapshot[256];
 +   int32_t result[256];
 +   memcpy(snapshot, buffers[0].u, sizeof(snapshot));
-+   enum shield_prepass_result status = shield_prepass_execute(snapshot, result);
++   enum shield_prepass_result status = shield_prepass_execute_transform(&state->shield_prepass.transform, snapshot, result);
 +   explicit_bzero(snapshot, sizeof(snapshot));
 +   if (status == SHIELD_PREPASS_UNAVAILABLE)
 +      return false;
@@ -198,7 +199,7 @@
  static void handle_dispatch(struct vk_cmd_queue_entry *cmd,
                              struct rendering_state *state)
  {
-@@ -2849,7 +2912,8 @@
+@@ -2849,7 +2913,8 @@
     state->dispatch_info.grid_base[1] = 0;
     state->dispatch_info.grid_base[2] = 0;
     state->dispatch_info.indirect = NULL;
@@ -208,7 +209,7 @@
  }
 
  static void handle_dispatch_base(struct vk_cmd_queue_entry *cmd,
-@@ -2967,6 +3031,8 @@
+@@ -2967,6 +3032,8 @@
         pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
        emit_compute_state(state);
 
@@ -217,7 +218,7 @@
     emit_state(state);
 
     uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
-@@ -2991,6 +3057,8 @@
+@@ -2991,6 +3058,8 @@
     assert(pool->queries[qcmd->query]);
 
     state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -226,7 +227,7 @@
  }
 
 
-@@ -3004,6 +3072,8 @@
+@@ -3004,6 +3073,8 @@
         pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
        emit_compute_state(state);
 
@@ -235,7 +236,7 @@
     emit_state(state);
 
     uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
-@@ -3028,6 +3098,8 @@
+@@ -3028,6 +3099,8 @@
     assert(pool->queries[qcmd->query]);
 
     state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -244,7 +245,7 @@
  }
 
  static void handle_reset_query_pool(struct vk_cmd_queue_entry *cmd,
-@@ -4285,8 +4357,12 @@
+@@ -4285,8 +4358,12 @@
     struct list_head *list = (void*)p;
 
     struct vk_cmd_queue_entry *exec_cmd = list_first_entry(list, struct vk_cmd_queue_entry, cmd_link);
@@ -257,7 +258,7 @@
  }
 
  static void
-@@ -4957,6 +5033,8 @@
+@@ -4957,6 +5034,8 @@
     bool did_flush = false;
 
     LIST_FOR_EACH_ENTRY(cmd, cmds, cmd_link) {
@@ -266,7 +267,7 @@
        if (print_cmds)
           fprintf(stderr, "%s\n", vk_cmd_queue_type_names[cmd->type]);
        switch ((unsigned)cmd->type) {
-@@ -5418,7 +5496,7 @@
+@@ -5418,7 +5497,7 @@
     for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); i++)
        pipe_resource_reference(&state->desc_buffers[i], NULL);
 
