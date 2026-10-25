@@ -3,5 +3,4 @@
   [exec] (Terminal) {xterm -fn fixed -bg "#101020" -fg "#c8d0ff"}
   [exec] (DOOM) {/usr/bin/doom-fs}
   [restart] (Restart WM)
-  [exec] (Shield Compute) {/usr/local/bin/risc-browser http://127.0.0.1:8765/}
 [end]

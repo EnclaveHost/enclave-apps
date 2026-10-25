@@ -136,7 +136,7 @@ Additional validation: `CGO_ENABLED=0 go test ./...` in `guest/` checks fixed tu
 
 ## RISC Box desktop parity (0.3)
 
-The native image carries the recovered RISC Box Fluxbox `bloe` style, purple background, terminal colors, keyboard bindings, tiny RiscBox GTK theme and animation CSS. Right-click the desktop for **Web Browser - Firefox**, **Terminal**, **DOOM**, or **Shield Compute**. Firefox and Doom start on demand, leaving no browser process idle after boot.
+The native image carries the recovered RISC Box Fluxbox `bloe` style, purple background, terminal colors, keyboard bindings, tiny RiscBox GTK theme and animation CSS. Right-click the desktop for **Web Browser - Firefox**, **Terminal**, or **DOOM**. Firefox and Doom start on demand, leaving no browser process idle after boot.
 
 FreeDoom Phase 1 uses the exact WAD recovered from the tuned RISC base. Its custom xdoom engine is rebuilt for x86 with uncapped interpolation, fused palette scaling, MIT-SHM double buffering, palette invalidation and the wide timer fix. The fullscreen launcher hides and restores the toolbar/cursor, retains sound and music, and caps rendering near 60 FPS. The previous RISC MMIO OPL synthesis is replaced by the same native OPL implementation inside this guest; PCM goes through PulseAudio to Sunshine. No host audio or framebuffer device is exposed.
 

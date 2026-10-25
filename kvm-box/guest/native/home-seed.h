@@ -66,17 +66,17 @@
 #define HS_NFILES (sizeof native_home_files / sizeof native_home_files[0])
 #define HS_NDIRS (sizeof native_home_dirs / sizeof native_home_dirs[0])
 
-/* Measured old desktop (manifest.json): path and byte count of every file. */
+/* Measured desktop defaults (home-defaults-manifest.json): path and byte count of every file. */
 static const struct hs_expect { const char *path; size_t size; } hs_expected[] = {
     { ".bash_logout", 220 }, { ".bashrc", 3526 }, { ".blank.xbm", 160 },
     { ".config/gtk-3.0/settings.ini", 62 }, { ".fluxbox/apps", 74 },
-    { ".fluxbox/init", 581 }, { ".fluxbox/keys", 4872 }, { ".fluxbox/menu", 385 },
+    { ".fluxbox/init", 581 }, { ".fluxbox/keys", 4872 }, { ".fluxbox/menu", 213 },
     { ".fluxbox/overlay", 89 }, { ".mozilla/firefox/kvm-box/chrome/userContent.css", 829 },
     { ".mozilla/firefox/kvm-box/user.js", 3083 }, { ".mozilla/firefox/profiles.ini", 93 },
     { ".profile", 807 }, { ".themes/RiscBox/gtk-3.0/gtk.css", 964 },
 };
 #define HS_EXPECT_FILES 14
-#define HS_EXPECT_BYTES ((size_t)15745)
+#define HS_EXPECT_BYTES ((size_t)15573)
 _Static_assert(sizeof hs_expected / sizeof hs_expected[0] == HS_EXPECT_FILES, "expected table");
 _Static_assert(HS_NFILES >= 1 && HS_NFILES <= HS_MAX_FILES, "home file table size");
 _Static_assert(HS_NDIRS >= 1 && HS_NDIRS <= HS_MAX_DIRS, "home directory table size");

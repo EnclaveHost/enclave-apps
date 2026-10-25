@@ -30,7 +30,7 @@ is recorded in evidence/native-home.
    `6.6.87.2-enclave-kvm-box`. Otherwise `EPERM`.
 2. Validates the whole table before any mutation (`EINVAL`):
    - 1..64 dirs and 1..128 files, with exactly 14 files.
-   - Total size at most 1 MiB with overflow-safe summation, and exactly 15745 bytes.
+   - Total size at most 1 MiB with overflow-safe summation, and exactly 15573 bytes.
    - Each path is at most 255 bytes, with 1..8 components of at most 64 bytes
      drawn from `[A-Za-z0-9._-]`. No empty, `.` or `..` components, and no
      leading, trailing or doubled `/`.

@@ -53,7 +53,7 @@ static int home_checks(void) {
         int fd = atoi(entry->d_name); CHECK(fd <= 4 || fd == dirfd(ds));
     }
     closedir(ds);
-    dprintf(1,"NATIVE_HOME_SEED_PASS files=14 bytes=15745 noMerge=true authPrivate=true\n");
+    dprintf(1,"NATIVE_HOME_SEED_PASS files=%zu bytes=%zu noMerge=true authPrivate=true\n", (size_t)HS_EXPECT_FILES, HS_EXPECT_BYTES);
     return 0;
 }
 static int role_check(uid_t uid) {

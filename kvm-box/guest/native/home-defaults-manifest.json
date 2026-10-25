@@ -1,7 +1,6 @@
 {
   "schema": "kvm-box-native-home-defaults/1",
-  "source": "release-v6.11-declines-candidate desktop.cpio.xz /home/desktop",
-  "sourceArchiveSha256": "16b49634b5c9a1327a03dfacc5a6706821396adf6dd1fb79a1a184ee51bfe74d",
+  "source": "Repository guest/native/home-defaults; two diagnostic menu entries removed after native CLI acceptance",
   "files": [
     {
       "path": ".bash_logout",
@@ -47,8 +46,8 @@
     },
     {
       "path": ".fluxbox/menu",
-      "bytes": 385,
-      "sha256": "ecf297f0508cb8e1a51822d36821c32b61841ff056ae7431967601eb2b420e72",
+      "bytes": 213,
+      "sha256": "8568d2db0ffa1315b3154c563fc110778e94cf354b97f4ec71ddc1c7f808473c",
       "mode": 420
     },
     {
@@ -87,5 +86,7 @@
       "sha256": "438f0c9c110da82653613d0e67088c16962b63a99076172be9ac045fd33a38cb",
       "mode": 420
     }
-  ]
+  ],
+  "sourceBaselineArchiveSha256": "16b49634b5c9a1327a03dfacc5a6706821396adf6dd1fb79a1a184ee51bfe74d",
+  "sourceBaselineManifestSha256": "a49b25a36fde6f4e2cd446db0875564ae8fce330a6be3af3e9f4b9cf1f05406e"
 }

@@ -5,8 +5,11 @@ The native nsinit now passes composed KVM startup, clean-stop and critical
 daemon-failure tests with the actual desktop/service graph. The real Wasm
 controller, outer gateway and supervisor also pass a combined nine-check KVM
 run through the actual desktop and inner gateway. The measured
-profile launcher, authenticated worker reservation and complete controller-to-GPU
-integration remain unfinished. See nsinit.md for the component boundary.
+profile launcher and authenticated worker transport now pass native fixture
+checks; standard sd-cli and llama-cli complete masked operations on NucBox.
+Real owner release and production deployment remain unfinished. See nsinit.md
+for the component boundary and ../../shield-graphics/qualification/CTS.md for
+the exact evidence scope.
 Never install the test nsinit
 or the kernel-check bypass binary in a release image.
 
@@ -469,3 +472,9 @@ allows llama-cli's internal HTTP helper while refusing helper impersonation by
 other roles. Existing fixed-port guards and the UID 1001-only 127.0.0.3 service
 address take precedence. `test_loopback_policy.py` checks the real nft policy in
 an isolated network-none container, including cross-role and control-port denial.
+
+The pinned public home inputs now live in `home-defaults/`. Rebuild the header
+with `python3 build_home_defaults.py --root home-defaults --output home-defaults.h`
+from this directory. The manifest authenticates every input. The two diagnostic
+compute menu entries have been removed after native standard CLI acceptance;
+Firefox, Terminal and DOOM remain. The protected backend is unchanged.

@@ -16,4 +16,5 @@ COPY policy /shield/policy
 RUN chmod 755 /shield/guest-start.sh /shield/mount-models.sh \
     && printf '#!/bin/sh\nexec /usr/bin/python3 -I /shield/client.py "$@"\n' > /usr/local/bin/shield-compute \
     && chmod 755 /usr/local/bin/shield-compute
-RUN sed -i '/\[end\]/i\  [exec] (Native Shield Compute) {/usr/local/bin/risc-browser http://127.0.0.1:8765/native/}' /home/desktop/.fluxbox/menu
+# Standard CLI access replaces the two diagnostic desktop menu entries.
+RUN sed -i '/\[exec\] (Shield Compute)/d; /\[exec\] (Native Shield Compute)/d' /home/desktop/.fluxbox/menu
