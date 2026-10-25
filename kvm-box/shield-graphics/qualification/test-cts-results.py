@@ -74,6 +74,32 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(results.matches_reference({'a': 'Pass', 'b': 'Pass'}, [{'name': 'a', 'status': 'Pass'}]*2, set()))
         self.assertFalse(results.matches_reference({'a': 'Pass'}, [], set()))
 
+    def test_optional_reference_requires_case_and_reason(self):
+        ref = {'a': {'status': 'NotSupported', 'details': 'optional feature absent'}}
+        records = [dict(name='a', **ref['a'])]
+        approved = {'a': 'optional feature absent'}
+        self.assertTrue(results.matches_optional_reference(ref, records, approved))
+        self.assertFalse(results.matches_optional_reference(ref, records, {}))
+        self.assertFalse(results.matches_optional_reference(ref, records, {'a': 'different reason'}))
+        self.assertFalse(results.matches_optional_reference(ref, records, dict(approved, extra='unknown case')))
+        changed = [dict(name='a', status='NotSupported', details='new unsupported reason')]
+        self.assertFalse(results.matches_optional_reference(ref, changed, approved))
+        self.assertTrue(results.matches_optional_reference(ref, [dict(name='a', status='Pass')], approved))
+
+    def test_optional_reference_rejects_failures_and_regressions(self):
+        for status in ['Fail', 'Crash', 'InternalError', 'CompatibilityWarning', 'QualityWarning', 'Pending']:
+            ref = {'a': {'status': status, 'details': 'reason'}}
+            self.assertFalse(results.matches_optional_reference(ref, [dict(name='a', **ref['a'])], {'a': 'reason'}))
+            self.assertFalse(results.matches_optional_reference({'a': {'status': 'Pass'}}, [dict(name='a', **ref['a'])], {}))
+        self.assertFalse(results.matches_optional_reference({'a': {'status': 'Pass'}},
+                         [dict(name='a', status='NotSupported', details='reason')], {'a': 'reason'}))
+
+    def test_optional_reference_rejects_incomplete_inventory(self):
+        ref = {'a': {'status': 'Pass'}, 'b': {'status': 'Pass'}}
+        self.assertFalse(results.matches_optional_reference(ref, [dict(name='a', status='Pass')]*2, {}))
+        self.assertFalse(results.matches_optional_reference(ref, [dict(name='a', status='Pass')], {}))
+        self.assertFalse(results.matches_optional_reference({}, [], {}))
+
 
 if __name__ == '__main__':
     unittest.main()

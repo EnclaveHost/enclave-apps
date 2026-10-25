@@ -35,16 +35,23 @@ probe = module('cts_probe', assets/'qualification/cts-probe.py')
 result_rules = module('cts_results', assets/'qualification/cts-results.py')
 evaluate = result_rules.evaluate
 lock = json.loads((assets/'qualification/cts-lock.json').read_text())
-plan = json.loads((assets/'qualification/cts-plan.json').read_text())['gl']
+api = (assets/'native-api').read_text().strip() if (assets/'native-api').exists() else 'gl'
+assert api in ('gl', 'vk')
+gl_context = (assets/'native-gl-context').read_text().strip() if (assets/'native-gl-context').exists() else 'egl'
+assert gl_context in ('egl', 'glx')
+plan = json.loads((assets/'qualification/cts-plan.json').read_text())[api]
 expected_status = json.loads((assets/'expected-results.json').read_text())
-required = ['/opt/shield/mesa/lib/'+name for name in lock['mesa']]
+required = ['/opt/shield/mesa/lib/'+name for name in lock['mesa']] if api == 'gl' else ['/opt/shield/mesa/lib/libvulkan_lvp.so']
 for name, digest in lock['mesa'].items():
     assert probe.sha('/opt/shield/mesa/lib/'+name) == digest
 parser_path = assets/'source/scripts/log/log_parser.py'
 assert probe.sha(parser_path) == lock['qpaParserSha256']
 parser = module('qpa_parser', parser_path)
-binary = assets/'build/external/openglcts/modules/glcts'
-assert probe.sha(binary) == '33979163a00d6eb79d20950ae14a9ab89bf5c3bc84bd53b66aece9bca3ae2079'
+binary = assets/('build/external/openglcts/modules/glcts' if api == 'gl' else 'build/external/vulkancts/modules/vulkan/deqp-vk')
+assert probe.sha(binary) == {
+    'gl': '33979163a00d6eb79d20950ae14a9ab89bf5c3bc84bd53b66aece9bca3ae2079',
+    'vk': '2bb9cb3260fa3cb35c9c67845f098115a89a9522391b4a3c4063ef261805fb82',
+}[api]
 output.mkdir(mode=0o700)
 finished = False
 
@@ -93,10 +100,10 @@ assert environment['LP_NUM_THREADS'] == '2'
 linker = Path('/tmp/native-cts-linker')
 linker.mkdir(mode=0o700)
 aliases = {}
-for name, soname, digest in [
+for name, soname, digest in ([
     ('libEGL.so', 'libEGL.so.1', 'f4b60a4618fbf760f395f64dfd53320446ba1011151a80e411742b3232b194e6'),
     ('libGL.so', 'libGL.so.1', 'b01915dfedf03be4710d3184bc62a3364880fc950043742fd5e07659b409ef1e'),
-    ('libGLESv2.so', 'libGLESv2.so.2', 'a705c66de30ca4e883120c70acae0f1011d7c3f97605eef331e03493beae3812')]:
+    ('libGLESv2.so', 'libGLESv2.so.2', 'a705c66de30ca4e883120c70acae0f1011d7c3f97605eef331e03493beae3812')] if api == 'gl' else []):
     target = Path('/usr/lib/x86_64-linux-gnu')/soname
     assert probe.sha(target) == digest
     (linker/name).symlink_to(target)
@@ -107,15 +114,17 @@ records = []
 for name, pattern in plan.items():
     folder = output/name
     folder.mkdir()
-    options = [str(binary), '--deqp-case='+pattern, '--deqp-gl-context-type=egl',
+    options = [str(binary), '--deqp-case='+pattern,
                '--deqp-shadercache=disable', '--deqp-surface-width=256', '--deqp-surface-height=256']
+    if api == 'gl':
+        options += ['--deqp-gl-context-type='+gl_context]
     listing = probe.run(options+['--deqp-runmode=stdout-caselist',
                         '--deqp-log-filename='+str(folder/'listing.qpa')],
                         binary.parent, environment, folder/'listing.log', 30)
     expected = [line[6:].strip() for line in (folder/'listing.log').read_text().splitlines() if line.startswith('TEST: ')]
     assert listing['returncode'] == 0 and not listing['timedOut'] and expected, (name, listing, (folder/'listing.log').read_text()[-2000:])
     execution = probe.run(options+['--deqp-log-filename='+str(folder/'results.qpa'), '--deqp-watchdog=enable'],
-                          binary.parent, environment, folder/'stdout.log', 120)
+                          binary.parent, environment, folder/'stdout.log', 900 if api == 'vk' else 120)
     qpa = parser.BatchResultParser()
     items = [{'name': r.name, 'status': r.statusCode, 'details': r.statusDetails}
              for r in qpa.parseFile(str(folder/'results.qpa'))]
@@ -128,15 +137,20 @@ for name, pattern in plan.items():
 after = compute_status()
 assert before['telemetry'] == after['telemetry'], 'Unexpected compute telemetry change during CPU CTS'
 assert all(g['complete'] and not g['missingLibraries'] for g in groups.values()), groups
-assert len(records) == len(expected_status) == 551
+assert len(records) == len(expected_status) == (551 if api == 'gl' else 9300)
 assert {r['name'] for r in records} == set(expected_status)
-assert result_rules.matches_reference(expected_status, records, {
-    'KHR-GL45.direct_state_access.framebuffers_check_status'
-}), [r for r in records if r['status'] != 'Pass']
+if api == 'gl':
+    reference_matches = result_rules.matches_reference(expected_status, records, {
+        'KHR-GL45.direct_state_access.framebuffers_check_status'
+    })
+else:
+    reviewed = json.loads((assets/'reviewed-unsupported.json').read_text())
+    reference_matches = result_rules.matches_optional_reference(expected_status, records, reviewed)
+assert reference_matches, 'Native case statuses differ from the reviewed reference; inspect retained per-case logs'
 counts = dict(Counter(r['status'] for r in records))
 summary = {'passed': True, 'scope': 'Native desktop role, actual Xorg, immutable candidate root; selected CTS CPU compatibility and unchanged masked-worker counters; not conformance certification or owner release',
            'uid': os.getuid(), 'capabilitiesZero': True, 'noNewPrivs': True, 'seccomp': 2,
-           'noPhysicalGpu': True, 'display': ':0', 'context': 'EGL', 'gpuExecuted': False,
+           'noPhysicalGpu': True, 'display': ':0', 'api': api, 'context': gl_context.upper() if api == 'gl' else 'Vulkan', 'gpuExecuted': False,
            'counts': counts, 'allSelectedPassed': all(r['status'] == 'Pass' for r in records),
            'matchesContainerBaselineOrImproves': True, 'groups': groups,
            'workerTelemetryUnchanged': True, 'environment': environment, 'testLinkerAliases': aliases,

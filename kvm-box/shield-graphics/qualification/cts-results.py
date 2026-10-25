@@ -2,6 +2,31 @@
 from collections import Counter
 
 
+def matches_optional_reference(expected, results, reviewed_unsupported):
+    """Compare a complete Vulkan run without turning optional features into passes.
+
+    Each reviewed exception binds a case name AND its exact unsupported reason.
+    A previously passing case may not regress; unknown failures or changed
+    unsupported reasons cannot be authorized by a reference result.
+    """
+    if not expected or set(reviewed_unsupported) - set(expected):
+        return False
+    for name, record in expected.items():
+        if record['status'] != 'Pass' and not (
+                record['status'] == 'NotSupported' and
+                name in reviewed_unsupported and
+                record['details'] == reviewed_unsupported[name]):
+            return False
+    names = [r['name'] for r in results]
+    if len(names) != len(expected) or set(names) != set(expected):
+        return False
+    return all(r['status'] == 'Pass' or (
+        r['status'] == expected[r['name']]['status'] == 'NotSupported' and
+        r['name'] in reviewed_unsupported and
+        r['details'] == expected[r['name']]['details'] == reviewed_unsupported[r['name']]
+    ) for r in results)
+
+
 def matches_reference(expected, results, known_compatibility_warnings):
     """A reference may contain only passes and explicitly reviewed warnings.
 

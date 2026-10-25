@@ -534,3 +534,17 @@
        mesa_loge("zink: DEVICE LOST!\n");
        /* if nothing can save us, abort */
        if (screen->abort_on_hang && !screen->robust_ctx_count)
+--- a/src/glx/glxextensions.c
++++ b/src/glx/glxextensions.c
+@@ -85,7 +85,10 @@
+    { GLX(ARB_create_context),             N, N },
+    { GLX(ARB_create_context_no_error),    N, N },
+    { GLX(ARB_create_context_profile),     N, N },
+-   { GLX(ARB_create_context_robustness),  N, N },
++   /* Direct contexts implement robustness in the client and driver. A software
++    * X server may omit it from its indirect-rendering extension list. Driver
++    * reset-query capability still gates direct_support in glxext.c. */
++   { GLX(ARB_create_context_robustness),  N, Y },
+    { GLX(ARB_fbconfig_float),             Y, N },
+    { GLX(ARB_framebuffer_sRGB),           Y, N },
+    { GLX(ARB_get_proc_address),           N, N },

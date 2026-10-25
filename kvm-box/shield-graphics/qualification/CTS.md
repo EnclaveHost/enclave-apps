@@ -105,7 +105,7 @@ candidate libraries: 550 `Pass`, one `CompatibilityWarning`, no unsupported
 cases, missing results or duplicate results. Counts were buffer storage 9,
 shader storage 124, compute 42, sync 1, texture barrier 4, and direct state
 access 371. The sync group contains only `flush_commands`; it is not exhaustive
-synchronization coverage. Vulkan's separate synchronization groups remain pending.
+synchronization coverage. Vulkan's separate synchronization results are recorded below.
 
 `KHR-GL45.direct_state_access.framebuffers_check_status` reports
 `GL_FRAMEBUFFER_COMPLETE` where two optional subcases expect incomplete
@@ -171,3 +171,105 @@ This qualifies the selected EGL/OpenGL workload in the native fixture. GLX CTS
 context creation, broader Vulkan coverage, real application workloads, owner
 provisioning and deployment remain separate work. It does not claim full API
 conformance, general protected GPU acceleration, or gaming performance.
+
+## Vulkan container checkpoint, 2026-10-25
+
+The six selected groups completed all 9,300 cases with 4,371 `Pass` and 4,929
+`NotSupported`, no failures, missing or duplicate records, and the pinned
+Lavapipe library observed in every test process. `allSelectedPassed` is false.
+The exact case names, statuses and diagnostic details match an independent run
+against the separately pinned unmodified Mesa 25.0.7 libraries.
+
+| Group | Pass | NotSupported |
+| --- | ---: | ---: |
+| Synchronization | 21 | 3 |
+| Synchronization2 | 14 | 3 |
+| Depth | 3,199 | 4,923 |
+| Input assembly | 148 | 0 |
+| Dynamic descriptor offsets | 216 | 0 |
+| Pipeline cache | 773 | 0 |
+
+The unsupported cases comprise 4,015 depth-bounds tests, 908 tests of
+`VK_FORMAT_D16_UNORM_S8_UINT`, and six semaphore tests requiring multiple queues.
+The pinned upstream synchronization test explicitly requires a second queue;
+Lavapipe exposes one queue. The depth tests check the advertised feature and
+format support before running. Unsupported results remain visible; this evidence
+does not establish support for those features or full Vulkan conformance.
+
+The unmodified `deqp-vk` binary SHA-256 is
+`2bb9cb3260fa3cb35c9c67845f098115a89a9522391b4a3c4063ef261805fb82`.
+Native fixtures select `vk` via a read-only `native-api` asset, use that exact
+binary and its upstream runtime data, and retain the shipped desktop settings.
+`matches_optional_reference` requires a complete case inventory and explicit
+case-name/reason pairs for reviewed unsupported results. New unsupported cases,
+changed reasons, failures, warnings, missing cases and duplicates are rejected.
+An optional feature improving to `Pass` is allowed. This comparison never changes
+the raw statuses or the all-pass verdict. These CPU compatibility tests require
+unchanged Shield worker telemetry; masked execution is qualified separately.
+
+## Native Vulkan checkpoint, 2026-10-25
+
+All 9,300 selected cases also completed in the actual native desktop role with
+the same 4,371 passes and 4,929 unsupported results. Each case's status and
+unsupported diagnostic matched the reviewed reference. Every group mapped the
+pinned Lavapipe library. The fixture retained desktop UID 1000, zero
+capabilities, no-new-privileges, seccomp, no physical GPU devices and two
+llvmpipe workers. The UID-checked Shield service's telemetry was unchanged.
+No GL development-library aliases were needed for the Vulkan binary.
+
+The exact signed v4 candidate root/profile/model media and production platform
+archive remained unchanged. A separate test initrd
+`a89470f68d5d60190986634e555ce5542f9fbc6cc67d7033629a11203f408fd6`
+appended 1,596 test files. The real monitor/domain lifecycle passed, including
+sealed controller secret, one-use claim, and domain/cgroup removal. The test VM
+and host scope exited. Its privileged fixture client is not owner provisioning,
+NucBox deployment or hardware attestation.
+
+The fixture permits 900 seconds per Vulkan group; a test-only Go overlay raises
+the graphics-command deadline to 1,500 seconds, with explicit guest/host
+lifecycle deadlines of 1,560/1,620 seconds. Production timeouts are unchanged.
+The actual complete host run took about 76 seconds under a 4.5 GiB/no-swap,
+two-CPU scope and 16 GiB available-memory guard. Timings across container and
+native runs are not a controlled performance comparison: desktop worker/cache
+settings differ. No gaming or GPU speedup is inferred.
+
+Evidence `graphics-cts-vulkan-v1` retains both container runs and their exact
+comparison. `graphics-cts-native-vulkan-v1` retains full native logs, pinned
+inputs, fixture source and lifecycle evidence. `allSelectedPassed` remains
+false in all three runs. This is selected Vulkan compatibility evidence, not
+conformance certification or general protected hardware rendering.
+
+## GLX robustness discovery fix under qualification
+
+The native v4 GLX attempt also stopped before enumeration because neither the
+server nor combined GLX extension string advertised robustness. A separate
+probe established that the client supports it and can create a direct context
+whose queried robust-access flag and lose-context-on-reset strategy are set.
+The issue is discovery, not evidence that reset behavior can be ignored.
+
+The private Mesa patch marks robustness as available through a capable direct
+renderer independently of the server's indirect extension list. Mesa still
+requires the actual driver reset-query capability before enabling direct
+support; no extension override or CTS option suppresses the check. When no direct renderer is available, the existing server-dependent
+negotiation path is unchanged. See the
+[Khronos extension specification](https://registry.khronos.org/OpenGL/extensions/ARB/GLX_ARB_create_context_robustness.txt)
+for context flags, reset strategies and sharing requirements.
+
+With the rebuilt GLX library, all 551 original GLX CTS cases ran in the isolated
+container: 550 passes and the same framebuffer compatibility warning as EGL.
+The exact GLX library hash and process mapping were checked. The regression
+probe `glx-robustness.cpp` checks normal extension discovery, the direct context,
+actual robust flag and reset strategy, and rejection of incompatible sharing
+and invalid reset attributes. Its discovery assertion rejects the old library.
+
+The changed library subsequently completed the same 551 cases in the native
+VM: 550 passes and one unchanged warning. All groups mapped its exact hash;
+Shield telemetry was unchanged, and the domain/cgroup/one-use lifecycle passed.
+The test helper mounted only this library read-only over its original path in
+the disposable desktop namespace before dropping privileges. This explicit
+overlay is a qualification fixture, not a new signed production image.
+
+This fix is not yet in the signed v4 image. Masked failure regression checks
+and a newly built/qualified image remain required before release. Both the
+failed original native run and successful overlay run are retained alongside
+the container evidence in `graphics-glx-robustness-v1`.
