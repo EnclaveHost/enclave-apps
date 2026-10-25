@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -165,12 +166,18 @@ type service struct {
 }
 
 func jsonReply(w http.ResponseWriter, code int, value any) {
+	body, err := json.Marshal(value)
+	if err != nil {
+		code = 500
+		body = []byte(`{"ok":false,"error":"response encoding failed"}`)
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(value)
+	_, _ = w.Write(body)
 }
 
 func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {

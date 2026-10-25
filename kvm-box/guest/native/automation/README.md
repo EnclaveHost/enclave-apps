@@ -1,9 +1,10 @@
 # Native desktop automation service
 
 This is the desktop-side implementation for migrating RISC Box's `/exec` and
-`/computer` clients. It is **not yet wired into the controller, gateways or
-released image**. Those steps and a real confined-VM acceptance run remain
-required before changing EyesOff AI or the API MCP Adapter configuration.
+`/computer` clients. The controller and both gateways are wired in source, but these
+changes are **not yet in the measured/released image**. Image integration and
+a real confined-VM acceptance run remain required before changing EyesOff AI
+or the API MCP Adapter configuration.
 
 The service must run as desktop UID/EUID 1000 inside the existing confined
 desktop namespace. It accepts HTTP over `/run/native-automation/desktop.sock`
@@ -80,13 +81,18 @@ to the user's display or a production VM. Its JSON report pins tested binaries.
 
 ## Required release work
 
-1. Add a separately released automation key to the Wasm controller, scoped to
-   the two POST endpoints. Retain owner Basic authentication and reject
-   ambiguous/duplicate credentials. Never forward credentials downstream.
-2. Add exact route allowlists to both gateways. The inner gateway must verify
-   socket metadata and server peer UID 1000, bound deadlines and reply length,
-   parse the JSON response, and emit its own safe response headers. Desktop
-   output must never become executable content on the owner's UI origin.
+1. Source complete: optional `KVMBOX_AUTOMATION_KEY` is loaded only by the
+   Wasm controller, retained as a digest, and permits only the exact two POST
+   routes. Bearer or `X-Api-Key` is accepted; both are accepted only when each
+   independently matches the same key. Duplicate or conflicting credentials
+   fail. Owner Basic authentication remains available. The measured release
+   policy still needs to deliver the separate automation secret.
+2. Source complete: both gateways allow the exact routes. The inner gateway
+   verifies socket metadata and server UID1000 before writing; bounds the
+   deadline, headers and body; validates strict JSON; and emits safe headers.
+   It rejects redirects, chunked replies, oversized replies and malformed JSON.
+   Rejected bodies are closed without draining. Source tests cover these
+   boundaries, but confined-VM qualification is still required.
 3. Add the two binaries and service launch/readiness to a new measured image;
    preserve the UID separation and the masked-only GPU path. Rebuild, sign and
    qualify that image before enabling its profile.

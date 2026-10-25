@@ -133,7 +133,7 @@ func startupCheck(uid, euid int, lookup func(string) (string, bool), args []stri
 	if uid != gatewayUID || euid != gatewayUID {
 		return errors.New("must run as uid 1002")
 	}
-	for _, k := range []string{"KVMBOX_OWNER_PASSWORD", "KVMBOX_ACCESS_SHA256"} {
+	for _, k := range []string{"KVMBOX_OWNER_PASSWORD", "KVMBOX_ACCESS_SHA256", "KVMBOX_AUTOMATION_KEY"} {
 		if _, ok := lookup(k); ok {
 			return errors.New("inherited owner credential variable refused")
 		}
@@ -173,7 +173,7 @@ func newGateway(cfg config) *gateway {
 			MaxConnsPerHost:        cfg.maxActive,
 			MaxIdleConnsPerHost:    8,
 			IdleConnTimeout:        60 * time.Second,
-			ResponseHeaderTimeout:  120 * time.Second,
+			ResponseHeaderTimeout:  130 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10,
 			DisableCompression:     true,
 		},
@@ -275,6 +275,8 @@ var (
 )
 
 var routes = []route{
+	{path: "/exec", methods: []string{http.MethodPost}},
+	{path: "/computer", methods: []string{http.MethodPost}},
 	{path: "/vnc.html", methods: getHead, query: true},
 	{path: "/app/", prefix: true, methods: getHead, query: true},
 	{path: "/core/", prefix: true, methods: getHead, query: true},

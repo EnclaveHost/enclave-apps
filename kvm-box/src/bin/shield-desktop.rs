@@ -1,9 +1,10 @@
 //! Shield desktop controller: the portable Wasm (wasm32-wasip2) front for the
 //! measured native desktop companion at the fixed loopback gateway.
 //!
-//! Single-threaded, nonblocking and bounded. Every request must carry HTTP Basic
-//! `owner:<password>`; the password arrives only as KVMBOX_OWNER_PASSWORD from
-//! secretrun's verified release and is kept solely as a SHA-256 digest.
+//! Single-threaded, nonblocking and bounded. Owner requests carry HTTP Basic
+//! `owner:<password>`. An optional separately released automation key admits
+//! only POST /exec and /computer. Released credentials are kept as SHA-256
+//! digests and never forwarded to the companion.
 #![forbid(unsafe_code)]
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -52,7 +53,7 @@ const FORWARDED_HEADERS: &[&str] = &[
 ];
 const SINGLETON_HEADERS: &[&str] = &[
     "host", "authorization", "content-length", "upgrade", "connection", "origin", "expect",
-    "content-type", "range", "x-kvm-box-request", "x-compute-authorization",
+    "content-type", "range", "x-kvm-box-request", "x-compute-authorization", "x-api-key",
     "sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol",
 ];
 const _: () = assert!(HTML.len() < BUF_CAP / 2);
@@ -60,6 +61,7 @@ const _: () = assert!(HTML.len() < BUF_CAP / 2);
 struct Config {
     upstream: SocketAddr,
     owner_digest: [u8; 32],
+    automation_digest: Option<[u8; 32]>,
     header_timeout: Duration,
     idle_timeout: Duration,
 }
@@ -73,6 +75,7 @@ enum CredentialError {
     NotUtf8,
     Empty,
     TooLong,
+    InvalidAutomation,
 }
 
 impl CredentialError {
@@ -83,6 +86,7 @@ impl CredentialError {
             Self::NotUtf8 => "KVMBOX_OWNER_PASSWORD is not UTF-8",
             Self::Empty => "KVMBOX_OWNER_PASSWORD is empty",
             Self::TooLong => "KVMBOX_OWNER_PASSWORD exceeds 1024 bytes",
+            Self::InvalidAutomation => "KVMBOX_AUTOMATION_KEY must contain 32..1024 printable non-space ASCII bytes",
         }
     }
 }
@@ -111,6 +115,37 @@ fn load_owner_digest(password: Option<OsString>, legacy_hash_present: bool) -> R
     };
     wipe(&mut bytes);
     result
+}
+
+/// The automation key is optional and independently released. It grants only
+/// the exact /exec and /computer POST routes, never desktop lifecycle or UI.
+fn load_automation_digest(key: Option<OsString>) -> Result<Option<[u8; 32]>, CredentialError> {
+    let Some(key) = key else { return Ok(None) };
+    let mut bytes = key.into_encoded_bytes();
+    let result = if (32..=MAX_PASSWORD).contains(&bytes.len()) && bytes.iter().all(|b| (0x21..=0x7e).contains(b)) {
+        Ok(Some(sha256(&bytes)))
+    } else { Err(CredentialError::InvalidAutomation) };
+    wipe(&mut bytes);
+    result
+}
+
+fn request_authorized(method: &str, target: &str, headers: &[httparse::Header<'_>], owner_digest: &[u8; 32], automation_digest: Option<&[u8; 32]>) -> bool {
+    let auth = values(headers, "authorization");
+    let keys = values(headers, "x-api-key");
+    if auth.len() > 1 || keys.len() > 1 { return false; }
+    if keys.is_empty() && auth.len() == 1 && owner_authorized(auth[0], owner_digest) { return true; }
+    if method != "POST" || !matches!(target, "/exec" | "/computer") { return false; }
+    let Some(digest) = automation_digest else { return false };
+    let valid = |key: &[u8]| (32..=MAX_PASSWORD).contains(&key.len()) && ct_eq(&sha256(key), digest);
+    // Existing tool configs sometimes send the same key in BOTH headers.
+    // Accept that only when each independently matches; never choose one of
+    // two conflicting credentials or combine an owner login with an API key.
+    if let Some(value) = auth.first() {
+        let Some(token) = value.strip_prefix(b"Bearer ").or_else(|| value.strip_prefix(b"bearer ")) else { return false };
+        if !valid(token) { return false; }
+    }
+    if let Some(key) = keys.first() { if !valid(key) { return false; } }
+    !auth.is_empty() || !keys.is_empty()
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -398,7 +433,12 @@ fn push_forwarded(head: &mut Vec<u8>, headers: &[httparse::Header]) {
 /// Pure policy for one complete request head. `extra` holds bytes the client sent
 /// after the head that were already read. Nothing here can dial upstream, so every
 /// refusal (including authentication) happens before any companion connection.
+#[cfg(test)]
 fn decide(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32]) -> Decision {
+    decide_with_automation(raw, extra, owner_digest, None)
+}
+
+fn decide_with_automation(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32], automation_digest: Option<&[u8; 32]>) -> Decision {
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut slots);
     match req.parse(raw) {
@@ -409,8 +449,7 @@ fn decide(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32]) -> Decision {
     let (method, target, version) = (req.method.unwrap_or(""), req.path.unwrap_or(""), req.version);
     let headers = &*req.headers;
 
-    let auth = values(headers, "authorization");
-    if auth.len() != 1 || !owner_authorized(auth[0], owner_digest) {
+    if !request_authorized(method, target, headers, owner_digest, automation_digest) {
         return Decision::Local(unauthorized());
     }
     if version != Some(1) {
@@ -460,6 +499,12 @@ fn decide(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32]) -> Decision {
     };
 
     let route = match path {
+        "/exec" | "/computer" => {
+            if method != "POST" { return refuse(405, "POST only"); }
+            if query.is_some() { return refuse(400, "Query not supported"); }
+            if body_len > 64 * 1024 { return refuse(413, "Automation request too large"); }
+            Route::Desktop(path)
+        }
         "/" => Route::Dashboard,
         "/api/status" => Route::Api("GET", "status"),
         "/api/start" => Route::Api("POST", "start"),
@@ -932,7 +977,7 @@ impl Conn {
             }
         };
         let extra = self.head.split_off(end);
-        let decision = decide(&self.head, &extra, &cfg.owner_digest);
+        let decision = decide_with_automation(&self.head, &extra, &cfg.owner_digest, cfg.automation_digest.as_ref());
         wipe(&mut self.head);
         self.head = Vec::new();
         match decision {
@@ -1238,9 +1283,21 @@ fn serve(listener: &TcpListener, cfg: &Config, stop: &AtomicBool) {
 fn main() {
     let legacy = std::env::var_os("KVMBOX_ACCESS_SHA256").is_some();
     let password = std::env::var_os("KVMBOX_OWNER_PASSWORD");
+    let automation_key = std::env::var_os("KVMBOX_AUTOMATION_KEY");
     // Single-threaded startup: nothing else can observe the environment while it is cleared.
     std::env::remove_var("KVMBOX_OWNER_PASSWORD");
-    let owner_digest = match load_owner_digest(password, legacy) {
+    std::env::remove_var("KVMBOX_AUTOMATION_KEY");
+    // Consume and scrub both secret buffers before either failure can exit.
+    let owner_result = load_owner_digest(password, legacy);
+    let automation_result = load_automation_digest(automation_key);
+    let owner_digest = match owner_result {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Shield desktop controller refused to start: {}", e.message());
+            std::process::exit(1);
+        }
+    };
+    let automation_digest = match automation_result {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Shield desktop controller refused to start: {}", e.message());
@@ -1250,6 +1307,7 @@ fn main() {
     let cfg = Config {
         upstream: COMPANION.parse().expect("companion address"),
         owner_digest,
+        automation_digest,
         header_timeout: HEADER_TIMEOUT,
         idle_timeout: IDLE_TIMEOUT,
     };
@@ -1328,6 +1386,64 @@ mod tests {
     }
 
     // ---------------------------------------------------------- unit: secrets
+
+    const AUTOMATION_KEY: &str = "automation-test-key-0123456789abcdef";
+
+    #[test]
+    fn automation_key_is_optional_but_never_accepts_empty_or_ambiguous_values() {
+        assert_eq!(load_automation_digest(None), Ok(None));
+        assert_eq!(load_automation_digest(Some(AUTOMATION_KEY.into())), Ok(Some(sha256(AUTOMATION_KEY.as_bytes()))));
+        for bad in ["".to_string(), "a".repeat(31), "a".repeat(1025), " ".repeat(32), "é".repeat(32), "a\nb".repeat(32)] {
+            assert_eq!(load_automation_digest(Some(bad.into())), Err(CredentialError::InvalidAutomation));
+        }
+    }
+
+    fn automation_request(method: &str, target: &str, headers: &str, enabled: bool) -> Decision {
+        let raw = format!("{method} {target} HTTP/1.1\r\nHost: {HOST}\r\n{headers}Content-Length: 2\r\n\r\n");
+        let key = sha256(AUTOMATION_KEY.as_bytes());
+        decide_with_automation(raw.as_bytes(), b"{}", &digest(), enabled.then_some(&key))
+    }
+
+    #[test]
+    fn automation_auth_is_scoped_and_removed_before_forwarding() {
+        for target in ["/exec", "/computer"] {
+            for headers in [
+                format!("Authorization: Bearer {AUTOMATION_KEY}\r\n"),
+                format!("X-Api-Key: {AUTOMATION_KEY}\r\n"),
+                format!("Authorization: Bearer {AUTOMATION_KEY}\r\nX-Api-Key: {AUTOMATION_KEY}\r\n"),
+            ] {
+                let plan = proxied(automation_request("POST", target, &headers, true));
+                let head = String::from_utf8(plan.head).unwrap();
+                assert!(head.starts_with(&format!("POST {target} HTTP/1.1\r\n")));
+                assert!(!head.to_ascii_lowercase().contains("authorization"));
+                assert!(!head.to_ascii_lowercase().contains("x-api-key"));
+                assert!(!head.contains(AUTOMATION_KEY));
+                assert_eq!(plan.prefix, b"{}");
+                assert_eq!(local_status(&automation_request("POST", target, &headers, false)), 401);
+            }
+        }
+        let headers = format!("Authorization: Bearer {AUTOMATION_KEY}\r\n");
+        for (method, target) in [("GET", "/exec"), ("POST", "/api/start"), ("POST", "/api/stop"), ("GET", "/"), ("POST", "/desktop/exec"), ("POST", "/computer?x=1"), ("POST", "/computer/")] {
+            assert_eq!(local_status(&automation_request(method, target, &headers, true)), 401, "{method} {target}");
+        }
+    }
+
+    #[test]
+    fn automation_refuses_conflicting_duplicate_and_wrong_credentials() {
+        for headers in [
+            format!("Authorization: Bearer {AUTOMATION_KEY}\r\nX-Api-Key: wrong\r\n"),
+            format!("Authorization: Bearer wrong\r\nX-Api-Key: {AUTOMATION_KEY}\r\n"),
+            format!("{}X-Api-Key: {AUTOMATION_KEY}\r\n", auth()),
+            format!("X-Api-Key: {AUTOMATION_KEY}\r\nX-Api-Key: {AUTOMATION_KEY}\r\n"),
+            format!("Authorization: Bearer {AUTOMATION_KEY}\r\nAuthorization: Bearer {AUTOMATION_KEY}\r\n"),
+            "Authorization: Bearer wrong\r\n".into(),
+            "".into(),
+        ] {
+            assert_eq!(local_status(&automation_request("POST", "/exec", &headers, true)), 401);
+        }
+        let plan = proxied(automation_request("POST", "/exec", &auth(), false));
+        assert_eq!(plan.prefix, b"{}");
+    }
 
     #[test]
     fn credential_loader_requires_released_password() {
@@ -1654,10 +1770,13 @@ mod tests {
         server_with(upstream, Duration::from_secs(2), Duration::from_secs(5))
     }
     fn server_with(upstream: SocketAddr, header_timeout: Duration, idle_timeout: Duration) -> TestServer {
+        server_with_automation(upstream, header_timeout, idle_timeout, None)
+    }
+    fn server_with_automation(upstream: SocketAddr, header_timeout: Duration, idle_timeout: Duration, automation_digest: Option<[u8; 32]>) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
-        let cfg = Config { upstream, owner_digest: digest(), header_timeout, idle_timeout };
+        let cfg = Config { upstream, owner_digest: digest(), automation_digest, header_timeout, idle_timeout };
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = thread::spawn(move || serve(&listener, &cfg, &flag));
@@ -1730,6 +1849,31 @@ mod tests {
         let mut s = connect(addr);
         s.write_all(raw).unwrap();
         read_all(&mut s)
+    }
+
+    #[test]
+    fn automation_auth_streams_only_after_validation_over_real_sockets() {
+        let up = mock(|mut s| {
+            let head = read_head(&mut s);
+            assert!(head.starts_with(b"POST /exec HTTP/1.1\r\n"));
+            assert!(header_value(&head, "authorization").is_none());
+            assert!(header_value(&head, "x-api-key").is_none());
+            let mut body = [0u8; 2];
+            s.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"{}");
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").unwrap();
+        });
+        let srv = server_with_automation(up.addr, Duration::from_secs(2), Duration::from_secs(5), Some(sha256(AUTOMATION_KEY.as_bytes())));
+        for (target, key) in [("/api/start", AUTOMATION_KEY), ("/exec", "wrong-key")] {
+            let raw = format!("POST {target} HTTP/1.1\r\nHost: {HOST}\r\nX-Api-Key: {key}\r\nContent-Length: 2\r\n\r\n{{}}");
+            assert_eq!(status_line(&exchange(srv.addr, raw.as_bytes())), 401);
+            assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
+        }
+        let raw = format!("POST /exec HTTP/1.1\r\nHost: {HOST}\r\nX-Api-Key: {AUTOMATION_KEY}\r\nContent-Length: 2\r\n\r\n{{}}");
+        let reply = exchange(srv.addr, raw.as_bytes());
+        assert_eq!(status_line(&reply), 200);
+        assert!(reply.ends_with(b"{\"ok\":true}"));
+        assert_eq!(up.accepts.load(Ordering::SeqCst), 1);
     }
     fn split_response(resp: &[u8]) -> (String, Vec<u8>) {
         let p = find_head_end(resp).expect("response head");

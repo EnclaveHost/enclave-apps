@@ -273,6 +273,49 @@ func testClient() *http.Client {
 	}
 }
 
+func TestAutomationRoutesUseFixedInnerAndStripCredentials(t *testing.T) {
+	inner := startInner(t)
+	_, addr := startGateway(t, testConfig(inner.addr(), nil))
+	c := testClient()
+	defer c.CloseIdleConnections()
+	for _, path := range []string{"/exec", "/computer"} {
+		req, e := http.NewRequest("POST", "http://"+addr+path, strings.NewReader(`{}`))
+		if e != nil {
+			t.Fatal(e)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Api-Key", "must-not-forward")
+		r, e := c.Do(req)
+		if e != nil {
+			t.Fatal(e)
+		}
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+		if r.StatusCode != 200 {
+			t.Fatal("automation route refused", r.StatusCode)
+		}
+		h, host, uri, n := inner.seen()
+		if h.Get("X-Api-Key") != "" || host != inner.addr() || uri != path || n != 2 {
+			t.Fatal("incorrect forwarding", h, host, uri, n)
+		}
+	}
+	before := inner.hits.Load()
+	for _, path := range []string{"/exec?cmd=true", "/computer/", "/execution"} {
+		r, e := c.Post("http://"+addr+path, "application/json", strings.NewReader(`{}`))
+		if e != nil {
+			t.Fatal(e)
+		}
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+		if r.StatusCode == 200 {
+			t.Fatal("route alias admitted", path)
+		}
+	}
+	if inner.hits.Load() != before {
+		t.Fatal("invalid route reached inner service")
+	}
+}
+
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

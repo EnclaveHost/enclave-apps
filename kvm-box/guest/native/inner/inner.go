@@ -116,6 +116,11 @@ var (
 // config exists so tests can substitute temporary trees, sockets, listeners
 // and their own UID. Production always uses productionConfig.
 type config struct {
+	automationSocket  string
+	automationUID     uint32
+	automationGID     uint32
+	automationPeerUID uint32
+	automationTimeout time.Duration
 	// Static trees. Every directory from staticAnchor down to the tree root,
 	// and every component inside it, must satisfy the ownership checks.
 	staticAnchor    string
@@ -153,11 +158,16 @@ type config struct {
 
 func productionConfig() config {
 	return config{
-		staticAnchor:    "/",
-		novncRoot:       novncRoot,
-		nativeDir:       nativeUIDir,
-		staticUID:       staticOwner,
-		requireReadOnly: true,
+		automationSocket:  "/run/native-automation/desktop.sock",
+		automationUID:     1000,
+		automationGID:     1000,
+		automationPeerUID: 1000,
+		automationTimeout: 125 * time.Second,
+		staticAnchor:      "/",
+		novncRoot:         novncRoot,
+		nativeDir:         nativeUIDir,
+		staticUID:         staticOwner,
+		requireReadOnly:   true,
 
 		computeSocket:  computeSocket,
 		computeDirUID:  computeUID,
@@ -224,7 +234,7 @@ func startupCheck(uid, euid int, lookup func(string) (string, bool), args []stri
 	if uid != innerUID || euid != innerUID {
 		return errors.New("must run as uid 1003")
 	}
-	for _, k := range []string{"KVMBOX_OWNER_PASSWORD", "KVMBOX_ACCESS_SHA256"} {
+	for _, k := range []string{"KVMBOX_OWNER_PASSWORD", "KVMBOX_ACCESS_SHA256", "KVMBOX_AUTOMATION_KEY"} {
 		if _, ok := lookup(k); ok {
 			return errors.New("inherited owner credential variable refused")
 		}
@@ -361,6 +371,7 @@ type routeKind int
 
 const (
 	routeNone routeKind = iota
+	routeAutomation
 	routeNoVNC
 	routeNativePage
 	routeComputeStatus
@@ -372,6 +383,8 @@ const (
 
 func classify(path string) routeKind {
 	switch path {
+	case "/exec", "/computer":
+		return routeAutomation
 	case "/vnc.html":
 		return routeNoVNC
 	case "/compute/", "/compute/native/":
@@ -401,7 +414,7 @@ func (k routeKind) allows(method string) bool {
 		return method == http.MethodGet || method == http.MethodHead
 	case routeComputeStatus, routeWebSocket, routeTunnel:
 		return method == http.MethodGet
-	case routeComputeWork, routePair:
+	case routeComputeWork, routePair, routeAutomation:
 		return method == http.MethodPost
 	}
 	return false
@@ -449,6 +462,8 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch kind {
+	case routeAutomation:
+		g.serveAutomation(w, r)
 	case routeNoVNC:
 		g.serveStatic(w, r, g.cfg.novncRoot, path[1:])
 	case routeNativePage:
@@ -470,7 +485,7 @@ var singletonHeaders = []string{
 // The outer gateway strips these; their presence here means unexpected
 // direct input, so they are refused rather than ignored or reused.
 var refusedHeaders = []string{
-	"Authorization", "Proxy-Authorization", "Cookie", "Content-Encoding", "Transfer-Encoding",
+	"Authorization", "Proxy-Authorization", "Cookie", "Content-Encoding", "Transfer-Encoding", "X-Api-Key",
 }
 
 // admit applies the checks common to every route. It returns the raw path
