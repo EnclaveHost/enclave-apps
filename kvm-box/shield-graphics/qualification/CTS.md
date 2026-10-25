@@ -387,3 +387,23 @@ unadmitted; historical v5 hardware reports cannot attest it. The failed CLI
 fixtures are retained, and the next test explicitly waits for the host bridge
 before loading the controller. That fixture-only delay is not a production
 startup-policy change or performance result.
+
+
+The exact signed v6 image subsequently passed fresh NucBox hardware-bound app
+verification: two independent challenges, 26 refused guest negative cases and
+two refused host negative cases. The actual controller remained sealed. The
+prepared additive relay policy accepts the captured reports at SVN floor 13 and
+rejects floor 14 with the hardware signature still valid; it is not activated.
+`native-v6-hardware-checkpoint.json` and exported `native-app-attestation-v6`
+record this separate scope. Its bundled verifier replays independently. The
+attestation VM and transports were removed; the original four VMs, host boot,
+Secure Boot and VBS status were unchanged.
+
+The next v6 standard CLI fixture reached native desktop startup and opened 115
+authenticated worker streams, but did not return an application result. The
+front's five-minute upstream-listener deadline ended the deliberately sealed
+controller's domain. Exported `native-cli-v6-front-timeout` retains this failed
+run and cleanup evidence. Stream admission counts are not verified compute
+results. A follow-up disposable fixture extends only that front wait budget and
+test command deadlines; it must disclose this difference and cannot qualify
+production owner provisioning. Production front behavior remains unchanged.
