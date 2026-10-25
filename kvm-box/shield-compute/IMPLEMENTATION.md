@@ -1820,3 +1820,39 @@ scope and evidence. This is a privileged lifecycle fixture, not real owner
 provisioning or final production publication. The earlier statement that no
 standard API exists describes the October 23 prototype only. Final menu cleanup,
 GUI/Moonlight acceptance, branding and wallet deployment are still outstanding.
+
+## Signed desktop v8: menu and CLI acceptance (2026-10-25)
+
+`native-v8-desktop-checkpoint.json` records the new signed image, launch
+measurement, root profile and fresh hardware checks. The two diagnostic compute
+menu entries are removed. A real native desktop run verified all 14 seeded home
+files, their ownership, modes and contents. The other 13 defaults preserve the
+lightweight Firefox profile and desktop styling. Firefox, Terminal and DOOM menu
+entries remain. The rebuilt root changes only the startup binary that embeds
+these defaults; 26,031 other paths, including graphics and compute libraries,
+are byte-identical to the preceding root.
+
+On that unmodified root, packaged sd-cli generated the reference PNG with 392
+verified masked exchanges (51,921,289,216 MACs); llama-cli completed the fixed
+prompt with 511 exchanges (14,478,327,808 MACs). Both exited zero. The desktop
+role had UID 1000, zero capabilities and seccomp, without physical GPU device
+nodes or VSOCK access. This lifecycle fixture adds a test initializer/monitor
+and longer front wait; it does not establish real owner provisioning.
+
+Separately, the exact signed v8 production image loaded its genuine Wasm
+controller and passed two fresh app-attestation challenges, 26 guest negative
+checks, and a fresh host TPM challenge with two negative checks. The controller
+remained sealed. The diagnostic host SSH process needed forced closure after
+its short cleanup grace; subsequent process inspection showed no new TPM helper
+left behind. Both disposable VMs were removed and their VMGS files archived.
+Production VMs and host boot/security state were unchanged during both tests.
+
+NucBox is the documented host-trusted Hyper-V deployment; this does not exclude
+the host OS. The catalog/deployment identity remains a fixture. Real owner
+release, final GUI/FreeDoom/Firefox/Moonlight acceptance, production integration
+and wallet publication remain required. General OpenGL/Vulkan rendering remains
+CPU Mesa with only the supported masked integer-affine prepass; this is not
+full GPU rendering, universal CUDA, game qualification, or Khronos conformance.
+
+Evidence exports: `native-menu-build-v8`, `native-menu-cli-v8`, and
+`native-app-attestation-v8` under the task's `outputs/kvm-box/evidence/`.
