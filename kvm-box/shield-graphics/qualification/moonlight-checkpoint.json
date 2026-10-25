@@ -1,0 +1,151 @@
+{
+  "schema": "shield-native-graphics-stream/1",
+  "passed": true,
+  "rootImageSha256": "7bba94ee5d058358b0986dc183e89e24d39a0429fadc9e4471f168a0eba0ba2b",
+  "verityRoot": "dfe4ae0585b12e8928d91f4374b3d40b00aa4f6e1e7e676183ad88b338e2d5a8",
+  "vcpus": 2,
+  "memoryMiB": 8192,
+  "stream": {
+    "passed": true,
+    "productionAdmission": false,
+    "attestation": false,
+    "scope": "Synthetic owner, fixture TLS CA, actual native gateway tunnels and Sunshine/Moonlight; CPU rendering/encoding",
+    "streamExitCode": 0,
+    "transport": {
+      "connections": 29,
+      "bytesFromGuest": 10117209,
+      "bytesToGuest": 42956
+    },
+    "frameSha256": [
+      "536a0aceb396afcd9a4980d3dc49ee5633c08a73e6c3dbc18e96b3f286088ced",
+      "4e8a4164ade1c1812c8ef01c4ea4474871825e8e5938a9884bfd98a188c583bd",
+      "9f5316ffcd9d31dbfb48b82ebdf74b158be0fd603a6253e77329ef5d779501ad"
+    ],
+    "frameRates": {
+      "Incoming frame rate from network": 29.93,
+      "Decoding frame rate": 29.93,
+      "Rendering frame rate": 29.83
+    },
+    "clientRenderer": [
+      "SDL Info (0): Renderer 'SDL' with 'DRM' backend chosen"
+    ],
+    "gracefulClientStop": true,
+    "nativeLifecyclePassed": true
+  },
+  "scene": {
+    "loadedLibraries": {
+      "128": {
+        "libvulkan_lvp.so": "a000f1ac8098618b1e497f29ed05f6b2bf4bdca2154e7d197feff4dd31b4465d"
+      },
+      "129": {
+        "libvulkan_lvp.so": "a000f1ac8098618b1e497f29ed05f6b2bf4bdca2154e7d197feff4dd31b4465d",
+        "libgallium-25.0.7.so": "590f9bf762f857492ffdfff75acadb849cd47e307634e8efebde13bdd7fb0b80"
+      }
+    }
+  },
+  "motion": {
+    "region": [
+      650,
+      230,
+      1000,
+      480
+    ],
+    "regionPixels": 87500,
+    "changedPixelsOver40PerChannel": [
+      12353,
+      15066
+    ],
+    "passed": true,
+    "scope": "Gears region excludes performance text; motion only, not source-frame equality"
+  },
+  "resolution": [
+    1280,
+    800
+  ],
+  "requestedFps": 30,
+  "requestedBitrateKbps": 5000,
+  "codec": "H.264",
+  "sample": "Three client captures eight seconds apart; short controlled workload",
+  "videoStatistics": [
+    "Incoming frame rate from network: 29.93 FPS",
+    "Decoding frame rate: 29.93 FPS",
+    "Rendering frame rate: 29.83 FPS",
+    "Host processing latency min/max/average: 6.2/212.9/13.5 ms",
+    "Frames dropped by your network connection: 0.00%",
+    "Frames dropped due to network jitter: 0.33%",
+    "Average network latency: 2 ms (variance: 1 ms)",
+    "Average decoding time: 0.52 ms",
+    "Average frame queue delay: 0.11 ms",
+    "Average rendering time (including monitor V-sync latency): 1.39 ms"
+  ],
+  "nativeGraphChecks": 14,
+  "masked": {
+    "verifiedExchanges": 16,
+    "verifiedMacs": 131072
+  },
+  "integrity": {
+    "passed": true,
+    "attempts": [
+      {
+        "case": "corrupted-worker-opengl",
+        "elapsedSeconds": 0.13699708000000044,
+        "passed": true,
+        "api": "OpenGL",
+        "contextLost": true,
+        "readbackSkipped": true
+      },
+      {
+        "case": "retired-service-opengl-retry",
+        "elapsedSeconds": 0.1366592100000048,
+        "passed": true,
+        "api": "OpenGL",
+        "contextLost": true,
+        "readbackSkipped": true
+      },
+      {
+        "case": "retired-service-vulkan-retry",
+        "elapsedSeconds": 0.12176183999999068,
+        "passed": true,
+        "deviceLost": true,
+        "outputUnchanged": true,
+        "laterDrawSkipped": true
+      }
+    ],
+    "serviceRetired": true,
+    "retryDidNotReachWorker": true
+  },
+  "browserPassed": true,
+  "sunshine": {
+    "packageVersion": "2026.914.233613-1+debiantrixie",
+    "sha256": "f4bd86105e114d921ae900be93686d9afcb2b7c77c6a021fd30e230cc03d8c1e",
+    "capture": "x11",
+    "encoder": "software",
+    "lanEncryptionMode": 2,
+    "wanEncryptionMode": 2
+  },
+  "moonlight": {
+    "version": "6.2.0",
+    "sha256": "6fa013389798a6c6acbdd26bdfe8cec1f11f2b9adfa2677ebbb92f232d72b45f",
+    "decode": "software",
+    "display": "SDL software frontend with DRM buffer backend",
+    "physicalDevicesAbsentOnClient": false
+  },
+  "ownerAdapterSha256": "88bec19129c82687ec3cea2b27791371c4e31a0c296cf4d3db336a58087fd519",
+  "physicalGpuNodesInGuest": false,
+  "generalGpuRendering": false,
+  "productionAdmission": false,
+  "attestation": false,
+  "productionOwnerPairingChanged": false,
+  "audio": "Packets received by dummy sink; tone fidelity and user playback not qualified",
+  "earlierFailures": [
+    "Fixture certificate omitted kvm-box SAN; verification correctly refused it",
+    "Pair/quit CLI commands left GUI dialogs open; success checked by authenticated list and graceful local SIGTERM",
+    "Initial client auto-selected hardware display; final client uses SDL software frontend",
+    "Terminating nsenter before its scene finished left namespace cleanup waiting; stop file and normal child reaping fixed the harness"
+  ],
+  "limitations": [
+    "Synthetic owner and fixture TLS CA/test runtime adapter; no production trust-chain claim",
+    "CPU rendering/encoding; only fixed proven integer compute prepass reaches masked worker",
+    "No game compatibility, graphics API conformance, long soak, WAN or latency guarantee"
+  ]
+}

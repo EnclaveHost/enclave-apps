@@ -119,3 +119,49 @@ corruption/retry and lifecycle checks passed in the same run.
 Firefox truncates long native window titles. The probe therefore collects
 bounded numbered chunks with a per-report ID, rejects inconsistent chunks,
 and decodes only a complete report. The page itself displays the full result.
+
+## Native Moonlight workload
+
+`stream-scene.py` runs as the native desktop UID under its real role policy.
+It starts `vkcube` and `glxgears` on Xorg using the measured graphics environment
+from `/tmp/probe-graphics-environment.json`, refuses physical GPU nodes, and
+records loaded-library hashes in `/tmp/stream-scene-ready.json`. Copy it as
+`/tmp/probe-stream-scene.py` and invoke it with the native role launcher used by
+the exported qualification harness. Request cleanup by creating
+`/tmp/stream-scene-stop`, then wait for the namespace launcher to reap its child.
+Killing the outer `nsenter` process prematurely can leave a child unreaped and
+stall namespace destruction; that earlier harness failure is preserved.
+
+The host harness creates a new Moonlight home/config/cache, an authenticated
+isolated Xvfb display, a fixture TLS certificate naming both `kvm-box` and
+`127.0.0.1`, and a fixed test vsock relay into the existing owner-authenticated
+gateway. It runs the unmodified `host/moonlight.mjs` adapter on a separate
+loopback address. The relay has no direct access to desktop service ports.
+This is a test runtime path; it does not simulate or claim hardware attestation.
+
+Pair through the existing owner PIN endpoint, verify pairing using the
+authenticated `moonlight list`, then run:
+
+```sh
+moonlight stream 127.0.0.9 'KVM Box Desktop' --resolution 1280x800 \
+  --fps 30 --bitrate 5000 --video-codec H.264 --video-decoder software \
+  --display-mode borderless --no-vsync --no-frame-pacing --no-keep-awake \
+  --capture-system-keys never --performance-overlay
+```
+
+Use only the disposable client environment; the full exported harness supplies
+the software renderer selection, display and fixture trust store. Moonlight's
+pair command leaves a success dialog open, so process exit is not a pairing
+oracle. After three captures eight seconds apart, SIGTERM requests Moonlight's
+graceful local session stop and emits its global decoder statistics. The final
+client uses an SDL software frontend with a DRM buffer backend; host device
+access is not excluded. The guest has no physical GPU node and uses CPU capture,
+rendering and encoding. Its only hardware compute is the separately checked
+masked prepass.
+
+The final [checkpoint](moonlight-checkpoint.json) records 29.93 FPS received and
+decoded, 29.83 FPS displayed, zero network loss, 0.33% jitter drops, and successful
+native restart/teardown plus the existing browser and protected-compute checks.
+It is a short LAN-style fixture, not a WAN/game/latency guarantee. Logs exported
+as evidence omit Moonlight request URLs containing synthetic pairing/session
+secrets. Client keys, owner credentials and paired settings are not exported.

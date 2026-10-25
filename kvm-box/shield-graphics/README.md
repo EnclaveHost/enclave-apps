@@ -2,7 +2,7 @@
 
 The requested endpoint is usable OpenGL/Vulkan in the native desktop, with
 physical GPU work restricted to the masked channel and unsupported work kept
-inside the VM. This directory starts the graphics reference and acceptance
+inside the VM. This directory contains the graphics reference and acceptance
 path. A [protected OpenGL/Vulkan prepass](driver/README.md) now passes real
 worker tests through a patched Mesa ICD in a host container and the actual
 native KVM desktop. General masked rendering remains incomplete.
@@ -123,6 +123,32 @@ frame times are in [the browser checkpoint](qualification/browser-checkpoint.jso
 This is application acceptance for a bounded workload, not API conformance,
 Steam compatibility or a long-duration performance result.
 
+## Native Moonlight video acceptance
+
+The same separate browser-qualified image now streams the actual Vulkan cube
+and Zink OpenGL gears through Sunshine and the unmodified owner-side Moonlight
+adapter. An isolated Moonlight 6.2.0 client receives H.264 at 1280×800, requested
+30 FPS and 5 Mbps. The final short run measured 29.93 FPS received/decoded and
+29.83 FPS displayed, with 0% network loss and 0.33% jitter drops. Captured frames
+were visually inspected; a gears-region comparison independently confirms
+animation outside the statistics overlay. Sunshine captures X11 and encodes on
+the VM CPU. The client uses software decoding and the SDL software frontend
+with a DRM buffer backend; it is not a device-isolated client test.
+
+Both scene processes map the pinned Vulkan library, and gears also maps the
+pinned Gallium library. The same boot passes Firefox/WebGL, 16 verified masked
+compute exchanges, corruption/retry checks, and all 14 native graph checks,
+including clean stop, restart and supervisor-death teardown. See the
+[streaming checkpoint](qualification/moonlight-checkpoint.json).
+
+This qualification uses synthetic owner credentials, a fixture TLS CA, and a
+test vsock relay into the existing authenticated gateway. Certificate checks
+remain enabled; fixed application ports and guest role policies are unchanged.
+It establishes application/video functionality, not production attestation or
+owner admission. The user's existing Moonlight pairing and VM remain unchanged.
+Audio packets reached a dummy sink; audio fidelity, game/controller input,
+WAN performance and long-duration behavior remain unqualified.
+
 ## Reproduce
 
 Build from an immutable local desktop image ID. The output directory must be
@@ -181,8 +207,9 @@ time; record its immutable image ID and package versions for each qualification.
 
 ## Remaining work
 
-1. Qualify Moonlight video streaming with the graphics image and broader
-   application workloads. Native desktop API/rendering checks now pass; keep
+1. Qualify broader application workloads, game/input/audio behavior and
+   production Moonlight integration. Native desktop API/rendering and isolated
+   video checks now pass; keep
    the reference renderer available as the trusted fallback.
 2. Expand the protected operation coverage beyond the structurally proven
    fixed integer prepass. Existing public

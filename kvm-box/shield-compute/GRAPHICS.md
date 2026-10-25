@@ -1,6 +1,6 @@
 # Protected graphics follow-up
 
-Status: staged implementation, 2026-10-24. A narrow integer Vulkan prepass
+Status: staged implementation, 2026-10-25. A narrow integer Vulkan prepass
 now executes through the existing masked channel in a patched Mesa ICD under
 host-container and native KVM tests; see the [driver contract](../shield-graphics/driver/README.md).
 The actual VM qualifies both the software reference and the narrow protected
@@ -12,8 +12,10 @@ Vulkan software ICD to the desktop-derived development image and demonstrates
 OpenGL through Zink plus real Vulkan/OpenGL frames in an isolated container
 and on the actual desktop inside KVM under the native application policy.
 A compute-to-draw fixture also passes with identical reference frames.
-Broader protected lowering and production/streaming qualification remain
-outstanding. It does not complete the graphics goal.
+Firefox/WebGL and isolated Moonlight video acceptance also pass on the separate
+native image, including restart and teardown. Broader protected lowering and
+production admission/transport qualification remain outstanding. It does not
+complete the full masked hardware graphics goal.
 
 A hybrid renderer is a possible research direction under the existing
 untrusted-GPU threat model. Selected linear work with explicitly public
