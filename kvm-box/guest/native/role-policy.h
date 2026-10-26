@@ -14,10 +14,10 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#include "platform-policy/app-seccomp.h"
+#include "wx-policy.h"
 
 static inline int native_role_statement(char *out, size_t length) {
-    return app_seccomp_statement(out, length);
+    return native_seccomp_statement(out, length);
 }
 
 static int native_enter_role(uid_t uid) {
@@ -52,7 +52,7 @@ static int native_enter_role(uid_t uid) {
     if (getresuid(&real, &effective, &saved) || getresgid(&greal, &geffective, &gsaved) ||
         real != uid || effective != uid || saved != uid ||
         greal != gid || geffective != gid || gsaved != gid || setuid(0) == 0) { errno = EPERM; return -1; }
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || app_seccomp_install()) return -1;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || native_seccomp_install()) return -1;
     return 0;
 }
 #endif

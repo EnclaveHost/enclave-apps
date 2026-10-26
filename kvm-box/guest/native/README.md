@@ -216,12 +216,37 @@ enforce CPU or memory limits.
 ## Native role and root preparation integration
 
 `role-policy.h` clears every capability set, drops real/effective/saved IDs,
-sets NoNewPrivs and installs the pinned M3 71-rule app-seccomp filter
-(d4d17c9f53832439c92a3232fd09feed8b28f0e3c7dd357d26468a9566f62b66).
+sets NoNewPrivs and installs the native 101-rule seccomp filter
+(a496482d694447a8c9f1869fe4455d1e18e75052ca47132f8fe5652a716ad410).
+`wx-policy.h` refines the unchanged pinned M3 71-rule app-seccomp program
+(d4d17c9f53832439c92a3232fd09feed8b28f0e3c7dd357d26468a9566f62b66)
+by replacing its final fall-through ALLOW. The pinned baseline has no early
+ALLOW for the memory syscalls below; recheck this when updating that baseline.
+All existing architecture checks and syscall denials remain in place.
 UID 1001 keeps primary group 1000 for its desktop-facing compute socket and
 supplementary group 1001 for the worker socket. UID 1003 has supplementary
 group 1000; compute service peer-UID authorization must explicitly include it
 in the measured native profile. Group access alone does not authorize requests.
+
+The native refinement returns EPERM before `mmap`, `mprotect`, or
+`pkey_mprotect` can create a simultaneously writable and executable mapping.
+It also denies writable `shmat` with SHM_EXEC and setting READ_IMPLIES_EXEC;
+role startup refuses an inherited READ_IMPLIES_EXEC personality. Ordinary RW
+memory and RW-to-RX JIT transitions remain available. Each role installs the
+filter before exec, so descendants inherit it. The Firefox preference
+`javascript.options.content_process_write_protect_code=true` is still needed:
+it makes Firefox use compatible transitions while leaving JIT and WebAssembly
+enabled. A denied syscall does not guarantee an application will recover;
+an application may exit if it cannot handle the error.
+
+This is preventive enforcement for explicit syscall requests, not a replacement
+for the attestation W^X scan. Seccomp cannot inspect ELF program headers or
+detect writable/executable aliases to the same backing storage. Keep admission
+fail-closed if the scan detects an actual violation. The change requires a new
+measured image and qualification before deployment; editing these sources does
+not change running instances. `tests/check_native_wx.c` tests the real filter
+in a disposable child, including denied transitions preserving old permissions,
+working JIT code, thread/fork/exec inheritance, and existing isolation denials.
 
 Four real namespace tests cover irreversible IDs, setuid exec, capability
 bounds, syscall denials, working threads and CPU JIT. The actual Go gateway
