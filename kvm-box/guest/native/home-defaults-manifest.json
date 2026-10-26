@@ -1,0 +1,92 @@
+{
+  "schema": "kvm-box-native-home-defaults/1",
+  "source": "Repository guest/native/home-defaults; two diagnostic menu entries removed after native CLI acceptance",
+  "files": [
+    {
+      "path": ".bash_logout",
+      "bytes": 220,
+      "sha256": "26882b79471c25f945c970f8233d8ce29d54e9d5eedcd2884f88affa84a18f56",
+      "mode": 420
+    },
+    {
+      "path": ".bashrc",
+      "bytes": 3526,
+      "sha256": "afae8986f549c6403410e029f9cce7983311512d04b1f02af02e4ce0af0dd2bf",
+      "mode": 420
+    },
+    {
+      "path": ".blank.xbm",
+      "bytes": 160,
+      "sha256": "ea0da9e044c2ef0df324c3d7810f7faac238e7582fde91fa31b4cbfaf95e7b09",
+      "mode": 420
+    },
+    {
+      "path": ".config/gtk-3.0/settings.ini",
+      "bytes": 62,
+      "sha256": "d7d14f26f6c97b54b378562d5976320823b360f3ea9f9c6c17efc5043b9fd23b",
+      "mode": 420
+    },
+    {
+      "path": ".fluxbox/apps",
+      "bytes": 74,
+      "sha256": "e42f76862da44318efd957bfa9c6b8cbcdf589f78fa2e5173831fadb4787feb7",
+      "mode": 420
+    },
+    {
+      "path": ".fluxbox/init",
+      "bytes": 581,
+      "sha256": "31ef10744acd51004de49e9c47d30ceda048466baa4e5d196329f8dd571b4712",
+      "mode": 420
+    },
+    {
+      "path": ".fluxbox/keys",
+      "bytes": 4872,
+      "sha256": "a85874130770dc3e0eabcc57be89492f33c8222d9149e0a01f44f8e920e9de0f",
+      "mode": 420
+    },
+    {
+      "path": ".fluxbox/menu",
+      "bytes": 213,
+      "sha256": "8568d2db0ffa1315b3154c563fc110778e94cf354b97f4ec71ddc1c7f808473c",
+      "mode": 420
+    },
+    {
+      "path": ".fluxbox/overlay",
+      "bytes": 89,
+      "sha256": "a1e632f87079c771ede68fe7c39d73e8eaf199cd4aaf86af89b8b5e697387633",
+      "mode": 420
+    },
+    {
+      "path": ".mozilla/firefox/kvm-box/chrome/userContent.css",
+      "bytes": 829,
+      "sha256": "889b2c24be607227b9737381df8b01932a130cd2bc02730a65c81c06ecbf595a",
+      "mode": 420
+    },
+    {
+      "path": ".mozilla/firefox/kvm-box/user.js",
+      "bytes": 3083,
+      "sha256": "61137066674a618197ae8aec5822be4c76e13e810aff17cabd230faf95515379",
+      "mode": 420
+    },
+    {
+      "path": ".mozilla/firefox/profiles.ini",
+      "bytes": 93,
+      "sha256": "182d37855ad5433cbe94c965936f83741c993395dabf14d0627e59895ebb47bb",
+      "mode": 420
+    },
+    {
+      "path": ".profile",
+      "bytes": 807,
+      "sha256": "28b4a453b68dde64f814e94bab14ee651f4f162e15dd9920490aa1d49f05d2a4",
+      "mode": 420
+    },
+    {
+      "path": ".themes/RiscBox/gtk-3.0/gtk.css",
+      "bytes": 964,
+      "sha256": "438f0c9c110da82653613d0e67088c16962b63a99076172be9ac045fd33a38cb",
+      "mode": 420
+    }
+  ],
+  "sourceBaselineArchiveSha256": "16b49634b5c9a1327a03dfacc5a6706821396adf6dd1fb79a1a184ee51bfe74d",
+  "sourceBaselineManifestSha256": "a49b25a36fde6f4e2cd446db0875564ae8fce330a6be3af3e9f4b9cf1f05406e"
+}

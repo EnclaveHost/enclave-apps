@@ -1,0 +1,11 @@
+target/
+__pycache__/
+*.pyc
+
+# Rebuilt by the OpenCL Makefile and HIP frontend build stage.
+/shield-compute/opencl/runtime/
+/shield-compute/opencl/ir-compiler
+/shield-compute/opencl/test-opencl
+/shield-compute/opencl/test-svm
+/shield-compute/opencl/test-event-errors
+/shield-compute/opencl/gemm-reference.bc

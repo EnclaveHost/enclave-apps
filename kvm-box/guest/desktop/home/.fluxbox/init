@@ -1,0 +1,14 @@
+session.screen0.toolbar.visible: true
+session.screen0.toolbar.autoHide:	false
+session.screen0.iconbar.mode:	{static groups} (workspace)
+session.screen0.tabs.usePixmap:	false
+session.screen0.slit.placement:	RightBottom
+session.screen0.slit.direction:	Vertical
+session.screen0.allowRemoteActions:	true
+session.screen0.workspaces:	1
+session.screen0.rootCommand:	xsetroot -solid "#1a1a2e"
+session.menuFile:	/home/desktop/.fluxbox/menu
+session.configVersion:	13
+session.styleFile: /usr/share/fluxbox/styles/bloe
+session.screen0.opaqueMove: false
+session.screen0.workspacewarping: false

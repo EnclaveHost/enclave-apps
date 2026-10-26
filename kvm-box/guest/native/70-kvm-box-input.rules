@@ -1,0 +1,9 @@
+# Sole input rule set for the admitted exclusive desktop guest.
+# Never install against the physical host's input tree.
+ACTION=="remove", GOTO="kvm_box_input_end"
+SUBSYSTEM!="input", GOTO="kvm_box_input_end"
+IMPORT{builtin}="input_id"
+ENV{ID_INPUT}=="1", TAG+="seat"
+KERNEL=="event*", OWNER:="1000", GROUP:="1000", MODE:="0600"
+KERNEL=="js*", OWNER:="1000", GROUP:="1000", MODE:="0600"
+LABEL="kvm_box_input_end"

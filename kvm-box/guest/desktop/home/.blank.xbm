@@ -1,0 +1,6 @@
+#define b_width 8
+#define b_height 8
+#define b_x_hot 0
+#define b_y_hot 0
+static unsigned char b_bits[] = {
+   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };

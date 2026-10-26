@@ -1,0 +1,49 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -32,6 +32,7 @@
+ );
+ 
+ #include <CL/cl.h>
++#include <CL/cl_ext.h>
+ 
+ #include <inttypes.h>
+ #include <string.h>
+@@ -5755,7 +5756,10 @@
+         if (dev_ctx->adreno_gen == ADRENO_GPU_GEN::ADRENO_UNKNOWN) {
+             dev_ctx->adreno_gen = get_adreno_gpu_gen(dev_ctx->device_name.c_str());
+         }
+-    } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
++    } else if (strstr(dev_ctx->device_name.c_str(), "Intel") ||
++               dev_ctx->device_name == "Enclave Shield Virtual GPU (guest CPU + verified offload)") {
++        // This selects the subgroup kernel implementation, not a hardware identity.
++        // Shield's required subgroup capabilities are checked below.
+         dev_ctx->gpu_family = GPU_FAMILY::INTEL;
+     } else {
+         GGML_LOG_WARN("ggml_opencl: unsupported GPU '%s'.\n", dev_ctx->device_name.c_str());
+@@ -5786,6 +5790,26 @@
+     char *ext_buffer = (char *)alloca(ext_str_size + 1);
+     clGetDeviceInfo(dev_ctx->device, CL_DEVICE_EXTENSIONS, ext_str_size, ext_buffer, NULL);
+     ext_buffer[ext_str_size] = '\0';
++
++    if (dev_ctx->device_name == "Enclave Shield Virtual GPU (guest CPU + verified offload)") {
++        const std::string extensions = std::string(" ") + ext_buffer + " ";
++        size_t bytes = 0;
++        if (extensions.find(" cl_intel_subgroups ") == std::string::npos ||
++            extensions.find(" cl_intel_required_subgroup_size ") == std::string::npos ||
++            clGetDeviceInfo(dev_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_INTEL, 0, nullptr, &bytes) != CL_SUCCESS ||
++            bytes == 0 || bytes > 1024 || bytes % sizeof(size_t) != 0) {
++            GGML_LOG_WARN("ggml_opencl: Shield device lacks required subgroup capabilities\n");
++            return false;
++        }
++        std::vector<size_t> sizes(bytes / sizeof(size_t));
++        if (clGetDeviceInfo(dev_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_INTEL, bytes, sizes.data(), nullptr) != CL_SUCCESS ||
++            std::find(sizes.begin(), sizes.end(), 16) == sizes.end() ||
++            std::find(sizes.begin(), sizes.end(), 32) == sizes.end()) {
++            GGML_LOG_WARN("ggml_opencl: Shield device requires subgroup sizes 16 and 32\n");
++            return false;
++        }
++        GGML_LOG_INFO("ggml_opencl: Shield logical device uses capability-checked subgroup kernels\n");
++    }
+ 
+     // Check if ext_buffer contains cl_khr_fp16
+     bool fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;

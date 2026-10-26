@@ -1,0 +1,74 @@
+--- a/lib/kernel/read_image.cl
++++ b/lib/kernel/read_image.cl
+@@ -1930,3 +1930,39 @@
+ IMPLEMENT_READ_INT4_IMAGE_INT_COORD (IMG_RW_AQ image3d_t, int4, i, int4)
+ 
+ #endif
++
++#ifdef cl_khr_fp16
++/* Reuse float image addressing/filtering, then round once to half. */
++#define READ_HALF_NOSAMPLER(QUAL, IMG, COORD) \
++  half4 _CL_OVERLOADABLE _CL_READONLY read_imageh (QUAL IMG image, COORD coord) \
++  { half4 value; vstore_half4_rte (read_imagef (image, coord), 0, (private half *)&value); return value; }
++#define READ_HALF_SAMPLER(IMG, COORD) \
++  half4 _CL_OVERLOADABLE _CL_READONLY read_imageh (IMG_RO_AQ IMG image, sampler_t sampler, COORD coord) \
++  { half4 value; vstore_half4_rte (read_imagef (image, sampler, coord), 0, (private half *)&value); return value; }
++READ_HALF_NOSAMPLER (IMG_RO_AQ, image1d_t, int)
++READ_HALF_SAMPLER (image1d_t, int)
++READ_HALF_SAMPLER (image1d_t, float)
++READ_HALF_NOSAMPLER (IMG_RO_AQ, image1d_buffer_t, int)
++READ_HALF_NOSAMPLER (IMG_RO_AQ, image1d_array_t, int2)
++READ_HALF_SAMPLER (image1d_array_t, int2)
++READ_HALF_SAMPLER (image1d_array_t, float2)
++READ_HALF_NOSAMPLER (IMG_RO_AQ, image2d_t, int2)
++READ_HALF_SAMPLER (image2d_t, int2)
++READ_HALF_SAMPLER (image2d_t, float2)
++READ_HALF_NOSAMPLER (IMG_RO_AQ, image2d_array_t, int4)
++READ_HALF_SAMPLER (image2d_array_t, int4)
++READ_HALF_SAMPLER (image2d_array_t, float4)
++READ_HALF_NOSAMPLER (IMG_RO_AQ, image3d_t, int4)
++READ_HALF_SAMPLER (image3d_t, int4)
++READ_HALF_SAMPLER (image3d_t, float4)
++#ifdef CLANG_HAS_RW_IMAGES
++READ_HALF_NOSAMPLER (IMG_RW_AQ, image1d_t, int)
++READ_HALF_NOSAMPLER (IMG_RW_AQ, image1d_buffer_t, int)
++READ_HALF_NOSAMPLER (IMG_RW_AQ, image1d_array_t, int2)
++READ_HALF_NOSAMPLER (IMG_RW_AQ, image2d_t, int2)
++READ_HALF_NOSAMPLER (IMG_RW_AQ, image2d_array_t, int4)
++READ_HALF_NOSAMPLER (IMG_RW_AQ, image3d_t, int4)
++#endif
++#undef READ_HALF_NOSAMPLER
++#undef READ_HALF_SAMPLER
++#endif
+--- a/lib/kernel/write_image.cl
++++ b/lib/kernel/write_image.cl
+@@ -508,3 +508,29 @@
+ #endif
+ 
+ #endif
++
++#ifdef cl_khr_fp16
++/* Every finite half value is exactly representable as float. */
++#define WRITE_HALF(QUAL, IMG, COORD) \
++  void _CL_OVERLOADABLE write_imageh (QUAL IMG image, COORD coord, half4 color) \
++  { write_imagef (image, coord, convert_float4 (color)); }
++WRITE_HALF (IMG_WO_AQ, image1d_t, int)
++WRITE_HALF (IMG_WO_AQ, image1d_buffer_t, int)
++WRITE_HALF (IMG_WO_AQ, image1d_array_t, int2)
++WRITE_HALF (IMG_WO_AQ, image2d_t, int2)
++WRITE_HALF (IMG_WO_AQ, image2d_array_t, int4)
++#ifdef cl_khr_3d_image_writes
++WRITE_HALF (IMG_WO_AQ, image3d_t, int4)
++#endif
++#ifdef CLANG_HAS_RW_IMAGES
++WRITE_HALF (IMG_RW_AQ, image1d_t, int)
++WRITE_HALF (IMG_RW_AQ, image1d_buffer_t, int)
++WRITE_HALF (IMG_RW_AQ, image1d_array_t, int2)
++WRITE_HALF (IMG_RW_AQ, image2d_t, int2)
++WRITE_HALF (IMG_RW_AQ, image2d_array_t, int4)
++#ifdef cl_khr_3d_image_writes
++WRITE_HALF (IMG_RW_AQ, image3d_t, int4)
++#endif
++#endif
++#undef WRITE_HALF
++#endif

@@ -1,0 +1,7 @@
+{
+  "schema": "shield-prepass-module/1",
+  "spirvSha256": "600bdec45b28f06b00fa4b75dc41bc565c88ee57b77847d3ef3c0b806118c1a1",
+  "spirvBytes": 2096,
+  "admission": "conditional structural NIR proof plus per-dispatch layout checks; this hash identifies the reference fixture only",
+  "source": "../qualification/linear-prepass.comp"
+}

@@ -1,0 +1,41 @@
+--- a/tools/cli/cli-server.h
++++ b/tools/cli/cli-server.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <thread>
++#include <unistd.h>
+ 
+ #include "http.h"
+ 
+@@ -9,6 +10,12 @@
+ void llama_server_terminate();
+ 
+ struct cli_server {
++    // UID 1001 is the measured compute service, isolated by guest nftables.
++    // Ordinary desktop CLI processes use their normal local loopback address.
++    static const char * loopback() {
++        return geteuid() == 1001 ? "127.0.0.3" : "127.0.0.1";
++    }
++
+     std::thread th;
+     int port = -1;
+     std::atomic<bool> is_alive = false;
+@@ -42,7 +49,7 @@
+ 
+         common_params server_params = params; // copy
+         server_params.port = port;
+-        server_params.hostname = "127.0.0.3"; // private guest service address, filtered by uid
++        server_params.hostname = loopback(); // both server and client must use the same address
+ 
+         th = std::thread([this, server_params]() mutable {
+             // argc / argv are only used in router mode, we can skip them for now
+@@ -57,7 +64,7 @@
+     }
+ 
+     std::string address() const {
+-        return "http://127.0.0.3:" + std::to_string(port);
++        return std::string("http://") + loopback() + ":" + std::to_string(port);
+     }
+ 
+     bool wait_ready(std::function<bool()> should_stop) {

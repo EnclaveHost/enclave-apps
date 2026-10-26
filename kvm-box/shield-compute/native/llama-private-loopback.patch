@@ -1,0 +1,19 @@
+--- a/tools/cli/cli-server.h
++++ b/tools/cli/cli-server.h
+@@ -42,6 +42,7 @@
+ 
+         common_params server_params = params; // copy
+         server_params.port = port;
++        server_params.hostname = "127.0.0.3"; // private guest service address, filtered by uid
+ 
+         th = std::thread([this, server_params]() mutable {
+             // argc / argv are only used in router mode, we can skip them for now
+@@ -56,7 +57,7 @@
+     }
+ 
+     std::string address() const {
+-        return "http://127.0.0.1:" + std::to_string(port);
++        return "http://127.0.0.3:" + std::to_string(port);
+     }
+ 
+     bool wait_ready(std::function<bool()> should_stop) {

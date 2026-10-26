@@ -1,0 +1,20 @@
+{
+  "schema": "kvm-box-native-xauth-adaptation/1",
+  "before": {
+    "xdoom/i_video_x11raw.c": "036254b16d62ec99fa1170695cdbbd2ff8b0232172f2594d8c50872864c34d0f",
+    "xdoom/x11-auth.h": null,
+    "xdoom/Makefile": "ea9457958288f19c9d4a5e1b009c40efe20ca3d81afc104fb963eeb530324eda",
+    "PORTING.txt": "af00d5cc753086bd7d52e2f30037c08b633fc90412c265144a20db485d307296"
+  },
+  "after": {
+    "xdoom/i_video_x11raw.c": "ca07af4d6475c5d6dfbe66c4a7ac5522c3b20fa830a46783166bfd392b97d127",
+    "xdoom/x11-auth.h": "62c9364b012584bad2f3cc6d4175286855e15466c4691cdf1a85bb044aa2fd5f",
+    "xdoom/Makefile": "c69e0365b560b2b01a7f95ee7e582feed8af5a4a7e40298bf9fec0c6740045f0",
+    "PORTING.txt": "0b24562b08a5f6c9d966d226bd9f179e4b7051c1c857541457e0640b31e22d45"
+  },
+  "sourceBaseline": "reference/provenance-before-native-auth.json",
+  "renderingLoopChanged": false,
+  "xlibAdded": false,
+  "testBinarySha256": "234c01d34818a8b77dfcd334be8953b3c59ced9e105a468c6158ef2fa7e26825",
+  "testBinaryBuild": "Static x86_64, GCC16, -std=gnu17 -O2, NOSDL=1; future production Docker build remains separate"
+}

@@ -1,0 +1,237 @@
+// Native KVM port: synthesize OPL3 inside the guest, alongside the existing
+// sample-accurate MIDI scheduler. No host MMIO or external audio device.
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "opl.h"
+#include "opl_queue.h"
+
+#include "opl3.h"
+static opl3_chip native_chip;
+
+// THE CARD'S rate, which is the only one that matters here.
+//
+// MIDI time is advanced by the frames the sound card is about to play
+// (OPL_RBX_Tick), so this must be the rate those frames are counted at:
+// i_sound_rbx.c's OUT_RATE, 11025. It is NOT snd_samplerate, which fbDOOM
+// leaves at 44100 and i_oplmusic dutifully passes to OPL_SetSampleRate —
+// believing that made the clock advance a quarter as fast as real time and
+// the music played at literally a quarter speed.
+#define CARD_RATE 11025
+static unsigned int mix_rate = CARD_RATE;
+
+static int chip_ready = 0;
+static int paused = 0;
+
+static opl_callback_queue_t *queue = NULL;
+
+/// Microseconds of chip time consumed so far. Callback deadlines are absolute
+/// against this, so it must advance by exactly what is rendered — drift here
+/// is drift in the music's tempo.
+static uint64_t current_time = 0;
+/// Sample fraction carried between calls. A render of N samples is
+/// N*1e6/rate microseconds, which is not an integer at 11025 Hz; dropping the
+/// remainder every call would run the music progressively sharp. (The sound
+/// card learned this same lesson the hard way — see virtio_snd::accrue.)
+static uint64_t time_frac = 0;
+
+opl_init_result_t OPL_Init(unsigned int port_base)
+{
+    (void) port_base;
+    if (queue == NULL)
+    {
+        queue = OPL_Queue_Create();
+    }
+    OPL3_Reset(&native_chip, CARD_RATE);
+    printf("I_OPL: native guest OPL3 at %d Hz\n", CARD_RATE);
+    chip_ready = 1;
+    current_time = 0;
+    time_frac = 0;
+    paused = 0;
+    // OPL3: i_oplmusic uses the extra voices when the chip reports one.
+    return OPL_INIT_OPL3;
+}
+
+void OPL_Shutdown(void)
+{
+    if (queue != NULL)
+    {
+        OPL_Queue_Destroy(queue);
+        queue = NULL;
+    }
+    chip_ready = 0;
+}
+
+void OPL_SetSampleRate(unsigned int rate)
+{
+    // DELIBERATELY IGNORED. i_oplmusic passes snd_samplerate (44100 in
+    // fbDOOM), but the clock here counts frames the CARD plays, and the card
+    // runs at CARD_RATE. Honouring this argument ran the music at a quarter
+    // speed. The host synthesises at the card's rate too, so there is one
+    // rate in the system and this is not it.
+    (void) rate;
+    mix_rate = CARD_RATE;
+}
+
+void OPL_WriteRegister(int reg, int value)
+{
+    if (chip_ready) OPL3_WriteRegBuffered(&native_chip, (uint16_t) reg, (uint8_t) value);
+}
+
+void OPL_WritePort(opl_port_t port, unsigned int value)
+{
+    // Register/data port pairs are what a DOS driver would use; i_oplmusic
+    // goes through OPL_WriteRegister, so this only has to exist.
+    static int selected = 0;
+    if (port == OPL_REGISTER_PORT || port == OPL_REGISTER_PORT_OPL3)
+    {
+        selected = (int) value;
+    }
+    else
+    {
+        OPL_WriteRegister(selected, (int) value);
+    }
+}
+
+opl_init_result_t OPL_Detect(void)
+{
+    return OPL_INIT_OPL3;
+}
+
+void OPL_InitRegisters(int opl3)
+{
+    int r;
+    // Silence every operator, then enable OPL3 mode if asked. Chocolate Doom
+    // does this through the port interface; the effect is what matters.
+    for (r = 0x40; r <= 0x55; ++r)  { OPL_WriteRegister(r, 0x3f); }
+    for (r = 0x60; r <= 0xf5; ++r)  { OPL_WriteRegister(r, 0x00); }
+    for (r = 0x01; r <= 0x0f; ++r)  { OPL_WriteRegister(r, 0x00); }
+    if (opl3)
+    {
+        OPL_WriteRegister(0x105, 0x01);   // OPL3 enable
+        for (r = 0x140; r <= 0x155; ++r) { OPL_WriteRegister(r, 0x3f); }
+        for (r = 0x160; r <= 0x1f5; ++r) { OPL_WriteRegister(r, 0x00); }
+    }
+}
+
+void OPL_SetCallback(uint64_t us, opl_callback_t callback, void *data)
+{
+    if (queue != NULL)
+    {
+        OPL_Queue_Push(queue, callback, data, current_time + us);
+    }
+}
+
+void OPL_ClearCallbacks(void)
+{
+    if (queue != NULL)
+    {
+        OPL_Queue_Clear(queue);
+    }
+}
+
+void OPL_AdjustCallbacks(float factor)
+{
+    if (queue != NULL)
+    {
+        OPL_Queue_AdjustCallbacks(queue, current_time, factor);
+    }
+}
+
+// Single-threaded: the mixer and the music run on DOOM's own thread, so
+// there is nothing to lock against.
+void OPL_Lock(void) {}
+void OPL_Unlock(void) {}
+
+void OPL_SetPaused(int pause_music)
+{
+    paused = pause_music;
+}
+
+void OPL_Delay(uint64_t us)
+{
+    // Only used by hardware detection paths, which this driver does not take.
+    (void) us;
+}
+
+/// Advance MIDI time by `frames` samples' worth and fire every event that
+/// falls due, posting its register writes to the host.
+///
+/// This does NOT generate audio: the host owns the chip and sums the music
+/// into the card's PCM (src/opl.rs). What stays here is the part that must
+/// keep DOOM's own timing — i_oplmusic schedules events in microseconds from
+/// now, and those deadlines are only meaningful against the same clock the
+/// sound stream runs on.
+///
+/// Time still advances in the chunks the events fall into rather than one
+/// jump per call, because a note scheduled a third of the way through a
+/// buffer must have its registers written before the ones after it: the host
+/// applies writes in the order it receives them.
+void OPL_RBX_Render(short *samples, unsigned int frames)
+{
+    unsigned int done = 0;
+
+    if (!chip_ready || paused)
+    {
+        // A paused song holds its place: time must not advance, or every
+        // pending event fires at once on resume.
+        return;
+    }
+
+    while (done < frames)
+    {
+        unsigned int chunk = frames - done;
+
+        if (queue != NULL && !OPL_Queue_IsEmpty(queue))
+        {
+            uint64_t next = OPL_Queue_Peek(queue);
+            if (next <= current_time)
+            {
+                opl_callback_t cb;
+                void *data;
+                if (OPL_Queue_Pop(queue, &cb, &data))
+                {
+                    cb(data);
+                }
+                continue;
+            }
+            {
+                uint64_t until = ((next - current_time) * mix_rate) / 1000000ULL;
+                if (until < chunk)
+                {
+                    chunk = (unsigned int) until;
+                }
+                if (chunk == 0)
+                {
+                    chunk = 1; // always make progress
+                }
+            }
+        }
+
+        OPL3_GenerateStream(&native_chip, samples + done * 2, chunk);
+        done += chunk;
+
+        // Advance by exactly what the card played, carrying the remainder so
+        // the tempo does not drift. (The sound card learned this the hard
+        // way — see virtio_snd::accrue.)
+        {
+            uint64_t num = (uint64_t) chunk * 1000000ULL + time_frac;
+            current_time += num / mix_rate;
+            time_frac = num % mix_rate;
+        }
+    }
+}
+
+/// Whether a song is actually playing, so the mixer can skip the MIDI work
+/// when there is nothing to schedule.
+int OPL_RBX_Active(void)
+{
+    return chip_ready && !paused && queue != NULL && !OPL_Queue_IsEmpty(queue);
+}

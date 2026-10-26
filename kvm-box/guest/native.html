@@ -1,0 +1,48 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Native Shield Compute</title>
+<style>body{font:17px system-ui;background:#1a1a2e;color:#e0e0ff;max-width:850px;margin:40px auto;padding:24px}p{line-height:1.5}textarea{box-sizing:border-box;width:100%;min-height:110px;font:inherit;padding:12px;background:#101020;color:inherit;border:1px solid #65709a}select,button{font:inherit;padding:10px;margin:12px 8px 12px 0}pre{white-space:pre-wrap;font-size:15px;overflow-wrap:anywhere}img{max-width:100%;image-rendering:auto}label{display:inline-block}</style>
+<h1>Native Shield Compute</h1><p>Run llama.cpp and stable-diffusion.cpp inside this desktop. GPU operations use the masked, verified channel; remaining operations run locally.</p>
+<p id="status" role="status">Checking local compute…</p>
+<label>Application <select id="engine"><option value="llama">llama.cpp · Qwen 0.5B</option><option value="sd">sd.cpp · SD 1.5</option></select></label>
+<label>Compute <select id="mode"><option value="cpu" selected>Native arithmetic · CPU</option><option value="masked">Masked GPU · approximate</option></select></label>
+<p>Native arithmetic is the default. Select Masked GPU to opt into calibrated quantized arithmetic; results can differ from the CPU reference. Image generation currently uses 256 × 256 pixels and eight steps.</p>
+<textarea id="prompt" aria-label="Prompt" placeholder="Write a prompt"></textarea><br><button id="run" disabled>Run</button>
+<p id="progress" role="status"></p><pre id="text"></pre><img id="image" alt="Generated image" hidden><pre id="stats"></pre>
+<script>
+const $=id=>document.getElementById(id),base=location.pathname.replace(/native\/?$/,'');
+let running=false,statusTimer,statusRequest,statusVersion=0;
+function stopStatus(){
+ clearTimeout(statusTimer);statusVersion++;statusRequest?.abort();statusRequest=null;
+}
+async function refreshStatus(){
+ stopStatus();const version=statusVersion,controller=new AbortController();statusRequest=controller;
+ const timeout=setTimeout(()=>controller.abort(),5000);
+ try{
+  const r=await fetch(base+'api/native',{cache:'no-store',signal:controller.signal});
+  if(!r.ok)throw Error('Status request failed ('+r.status+')');
+  const s=await r.json();if(version!==statusVersion)return;
+  if(!s.ok)throw Error(s.error||'Local compute unavailable');
+  $('status').textContent=s.state==='retired'?'Local compute stopped after a failure; restart the compute service.':
+   s.state==='busy'?'Local compute: busy — waiting for the current job to finish…':'Local compute: '+s.state;
+  $('run').disabled=running||s.state!=='ready';
+ }catch(e){
+  if(version!==statusVersion)return;
+  $('status').textContent='Local compute unavailable — retrying…';$('run').disabled=true;
+ }finally{
+  clearTimeout(timeout);
+  if(version===statusVersion){statusRequest=null;statusTimer=setTimeout(refreshStatus,2000)}
+ }
+}
+$('run').onclick=async()=>{
+ if(running||$('run').disabled)return;
+ running=true;stopStatus();$('run').disabled=true;$('status').textContent='Local compute: busy';
+ $('progress').textContent='Computing…';$('text').textContent='';$('image').hidden=true;$('stats').textContent='';
+ try{
+  const mode=$('mode').value;
+  const r=await fetch(base+'native/compute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:$('engine').value,prompt:$('prompt').value,mode,arithmetic:mode==='masked'?'shield-fixed-point-v1':'native-model-v1',seed:42})});
+  if(!r.ok)throw Error(await r.text());const value=await r.json();if(!value.ok)throw Error(value.error);
+  $('text').textContent=value.text||'';if(value.png){$('image').src='data:image/png;base64,'+value.png;$('image').hidden=false}
+  $('progress').textContent=value.arithmetic?.approximate?'Complete · approximate fixed-point arithmetic':'Complete · native model arithmetic';$('stats').textContent=JSON.stringify({arithmetic:value.arithmetic,...value.stats},null,2);
+ }catch(e){$('progress').textContent=e.message}finally{running=false;await refreshStatus()}
+};
+refreshStatus();
+</script></html>

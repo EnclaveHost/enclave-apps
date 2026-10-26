@@ -1,0 +1,14 @@
+#!/bin/sh
+# Native x86 port of the RISC Box lightweight browser launcher.
+export DISPLAY="${DISPLAY:-:0}" HOME="${HOME:-/home/desktop}"
+export GDK_BACKEND=x11 GDK_CORE_DEVICE_EVENTS=1 MOZ_USE_XINPUT2=0
+# Honor the separate graphics image while retaining the lightweight CPU default.
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}" LP_NUM_THREADS=1
+export GTK_THEME=RiscBox NO_AT_BRIDGE=1 GTK_A11Y=none
+if /usr/local/bin/risc-xwin-native list >/dev/null 2>&1; then
+    /usr/local/bin/risc-xwin-native show >/dev/null 2>&1
+    [ "$#" -eq 0 ] && exit 0
+    exec firefox-esr --profile "$HOME/.mozilla/firefox/kvm-box" --new-tab "$@"
+fi
+[ "$#" -gt 0 ] || set -- about:blank
+exec firefox-esr --profile "$HOME/.mozilla/firefox/kvm-box" "$@"

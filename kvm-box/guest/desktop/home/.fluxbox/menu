@@ -1,0 +1,6 @@
+[begin] (KVM Box)
+  [exec] (Web Browser - Firefox) {/usr/local/bin/risc-browser}
+  [exec] (Terminal) {xterm -fn fixed -bg "#101020" -fg "#c8d0ff"}
+  [exec] (DOOM) {/usr/bin/doom-fs}
+  [restart] (Restart WM)
+[end]

@@ -1,0 +1,75 @@
+--- a/src/core/ggml_graph_operations.h
++++ b/src/core/ggml_graph_operations.h
+@@ -2,24 +2,37 @@
+ #define __SD_CORE_GGML_GRAPH_OPERATIONS_H__
+ 
+ #include "ggml.h"
++#include "ggml-backend.h"
+ 
+ // A CPU operation cannot write in place into an OpenCL allocation. During
+ // mixed-backend graph construction, leave temporary output allocation to the
+ // scheduler. Persistent inputs and weights retain their mutation semantics.
+ inline thread_local ggml_context* sd_out_of_place_graph_context = nullptr;
++inline thread_local ggml_backend_t sd_graph_cpu_fallback = nullptr;
+ 
+ struct SDGraphOutOfPlaceScope {
+     ggml_context* previous;
+-    SDGraphOutOfPlaceScope(ggml_context* ctx, bool enabled)
+-        : previous(sd_out_of_place_graph_context) {
++    ggml_backend_t previous_fallback;
++    SDGraphOutOfPlaceScope(ggml_context* ctx, bool enabled, ggml_backend_t fallback = nullptr)
++        : previous(sd_out_of_place_graph_context), previous_fallback(sd_graph_cpu_fallback) {
+         if (enabled) {
+             sd_out_of_place_graph_context = ctx;
++            sd_graph_cpu_fallback = fallback;
+         }
+     }
+-    ~SDGraphOutOfPlaceScope() { sd_out_of_place_graph_context = previous; }
++    ~SDGraphOutOfPlaceScope() {
++        sd_out_of_place_graph_context = previous;
++        sd_graph_cpu_fallback = previous_fallback;
++    }
+     SDGraphOutOfPlaceScope(const SDGraphOutOfPlaceScope&) = delete;
+     SDGraphOutOfPlaceScope& operator=(const SDGraphOutOfPlaceScope&) = delete;
+ };
++
++static inline bool sd_graph_supports_op(ggml_context* ctx, ggml_backend_t backend, const ggml_tensor* op) {
++    return ggml_backend_supports_op(backend, op) ||
++        (ctx == sd_out_of_place_graph_context && sd_graph_cpu_fallback != nullptr &&
++         ggml_backend_supports_op(sd_graph_cpu_fallback, op));
++}
+ 
+ static inline bool sd_graph_use_inplace(ggml_context* ctx, ggml_tensor* input) {
+     if (ctx != sd_out_of_place_graph_context) {
+--- a/src/core/ggml_extend.hpp
++++ b/src/core/ggml_extend.hpp
+@@ -1391,7 +1391,7 @@
+         }
+ 
+         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+-        if (!ggml_backend_supports_op(backend, out)) {
++        if (!sd_graph_supports_op(ctx, backend, out)) {
+             return nullptr;
+         }
+         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+@@ -2002,10 +2002,18 @@
+     }
+ 
+     ggml_cgraph* get_compute_graph(get_graph_cb_t get_graph) {
++        const bool opencl_graph = sd_backend_is(runtime_backend, "opencl");
++        if (opencl_graph && cpu_fallback_backend == nullptr) {
++            cpu_fallback_backend = sd_backend_cpu_init();
++            if (cpu_fallback_backend == nullptr) {
++                LOG_ERROR("%s: CPU fallback initialization failed", get_desc().c_str());
++                return nullptr;
++            }
++        }
+         const char* out_of_place = std::getenv("SD_GRAPH_OUT_OF_PLACE");
+         SDGraphOutOfPlaceScope inplace_scope(compute_ctx,
+-            sd_backend_is(runtime_backend, "opencl") ||
+-            (out_of_place != nullptr && std::strcmp(out_of_place, "1") == 0));
++            opencl_graph || (out_of_place != nullptr && std::strcmp(out_of_place, "1") == 0),
++            cpu_fallback_backend);
+         prepare_build_in_tensor_before();
+         ggml_cgraph* gf = get_graph();
+         if (ggml_graph_n_nodes(gf) > 0) {

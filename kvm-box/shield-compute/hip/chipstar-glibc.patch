@@ -1,0 +1,279 @@
+diff --git a/host_math_funcs/common.h b/host_math_funcs/common.h
+index ecc6287..dc9d52d 100644
+--- a/host_math_funcs/common.h
++++ b/host_math_funcs/common.h
+@@ -214,10 +214,10 @@ static inline double BUILTIN_FREXP_MANT_F64(double x) {
+ 
+ #define BUILTIN_ISFINITE_F32(x) __builtin_isfinite(x)
+ 
+-// __builtin_modff and __builtin_modf return the fractional part of x, and store the integer part in the address of the second argument
+-// so we need to subtract the integer part from the fractional part to get the fractional part
+-static inline float BUILTIN_FRACTION_F32(float x) { float rem; return x - __builtin_modff(x, &rem); }
+-static inline double BUILTIN_FRACTION_F64(double x) { double rem; return x - __builtin_modf(x, &rem); }
++// Fraction used by OCML's pi-scaled trigonometric argument reduction.
++// Subtracting modf's return value yields the integer part, not the fraction.
++static inline float BUILTIN_FRACTION_F32(float x) { return x - __builtin_floorf(x); }
++static inline double BUILTIN_FRACTION_F64(double x) { return x - __builtin_floor(x); }
+ #define BUILTIN_RINT_F32(x) __builtin_rintf(x)
+ #define BUILTIN_RINT_F64(x) __builtin_rint(x)
+ #define BUILTIN_ISFINITE_F64(x) __builtin_isfinite(x)
+@@ -257,4 +257,3 @@ static inline bool CORRECTLY_ROUNDED_SQRT32() { return false; }
+ 
+ #define BUILTIN_FLDEXP_F32(x, exp) ldexpf(x, exp)
+ 
+-
+diff --git a/include/hip/devicelib/double_precision/dp_math.hh b/include/hip/devicelib/double_precision/dp_math.hh
+index 58a4b97..8b6f1ff 100644
+--- a/include/hip/devicelib/double_precision/dp_math.hh
++++ b/include/hip/devicelib/double_precision/dp_math.hh
+@@ -105,7 +105,7 @@ static inline __device__ double cosh(double x) { return __builtin_cosh(x); }
+ extern "C++" __device__ double cosh(double x); // OpenCL
+ #endif
+ 
+-extern "C++" __device__ double cospi(double x); // OpenCL
++extern "C++" __device__ double cospi(double x) noexcept; // OpenCL
+ 
+ extern "C" __device__  double __ocml_i0_f64(double x);
+ extern "C++" inline __device__ double cyl_bessel_i0 ( double  x ) {
+@@ -462,7 +462,7 @@ static inline __device__ double sinh(double x) { return __builtin_sinh(x); }
+ extern "C++" __device__ double sinh(double x); // OpenCL
+ #endif
+ 
+-extern "C++" __device__ double sinpi(double x); // OpenCL
++extern "C++" __device__ double sinpi(double x) noexcept; // OpenCL
+ 
+ #if defined __has_builtin && __has_builtin(__builtin_sqrt)
+ static inline __device__ double sqrt(double x) { return __builtin_sqrt(x); }
+diff --git a/include/hip/devicelib/host_math_funcs.hh b/include/hip/devicelib/host_math_funcs.hh
+index 53e1cc5..9c71b5a 100644
+--- a/include/hip/devicelib/host_math_funcs.hh
++++ b/include/hip/devicelib/host_math_funcs.hh
+@@ -28,11 +28,11 @@ extern "C" {
+ }
+ 
+ // Trigonometric functions
+-inline float cospi(float x) { return __ocml_cospi_f32(x); }
+-inline float cospif(float x) { return __ocml_cospi_f32(x); }
++inline float cospi(float x) noexcept { return __ocml_cospi_f32(x); }
++extern "C" inline float cospif(float x) noexcept { return __ocml_cospi_f32(x); }
+ 
+-inline float sinpi(float x) { return __ocml_sinpi_f32(x); }
+-inline float sinpif(float x) { return __ocml_sinpi_f32(x); }
++inline float sinpi(float x) noexcept { return __ocml_sinpi_f32(x); }
++extern "C" inline float sinpif(float x) noexcept { return __ocml_sinpi_f32(x); }
+ 
+ // Error functions
+ inline double erfcinv(double x) { return __ocml_erfcinv_f64(x); }
+@@ -85,4 +85,4 @@ inline double rsqrt(double x) { return __ocml_rsqrt_f64(x); }
+ inline float rsqrtf(float x) { return __ocml_rsqrt_f32(x); }
+ 
+ 
+-#endif // HIP_INCLUDE_DEVICELIB_HOST_MATH_FUNCS_H
+\ No newline at end of file
++#endif // HIP_INCLUDE_DEVICELIB_HOST_MATH_FUNCS_H
+diff --git a/include/hip/devicelib/single_precision/sp_math.hh b/include/hip/devicelib/single_precision/sp_math.hh
+index 86b3918..2da03ca 100644
+--- a/include/hip/devicelib/single_precision/sp_math.hh
++++ b/include/hip/devicelib/single_precision/sp_math.hh
+@@ -112,8 +112,8 @@ extern "C++" __device__ float cosh(float x); // OpenCL
+ extern "C++" inline __device__ float coshf(float x) { return ::cosh(x); }
+ #endif
+ 
+-extern "C++" __device__ float cospi(float x); // OpenCL
+-extern "C++" inline __device__ float cospif(float x) { return ::cospi(x); }
++extern "C++" __device__ float cospi(float x) noexcept; // OpenCL
++extern "C++" inline __device__ float cospif(float x) noexcept { return ::cospi(x); }
+ 
+ extern "C" __device__  float __ocml_i0_f32(float x); // OCML
+ extern "C++" inline __device__ float cyl_bessel_i0f(float x) { return ::__ocml_i0_f32(x); }
+@@ -564,8 +564,8 @@ extern "C++" __device__ float sinh(float x); // OpenCL
+ extern "C++" inline __device__ float sinhf(float x) { return ::sinh(x); }
+ #endif
+ 
+-extern "C++" __device__ float sinpi(float x); // OpenCL
+-extern "C++" inline __device__ float sinpif(float x) { return ::sinpi(x); }
++extern "C++" __device__ float sinpi(float x) noexcept; // OpenCL
++extern "C++" inline __device__ float sinpif(float x) noexcept { return ::sinpi(x); }
+ 
+ #if defined __has_builtin && __has_builtin(__builtin_sqrtf)
+ static inline __device__ float sqrtf(float x) { return __builtin_sqrtf(x); }
+diff --git a/include/hip/spirv_fixups.h b/include/hip/spirv_fixups.h
+index ccf94ef..24aaa08 100644
+--- a/include/hip/spirv_fixups.h
++++ b/include/hip/spirv_fixups.h
+@@ -47,6 +47,24 @@
+ // This define is known to include code with unsupported __bf16 type.
+ #undef __SSE2__
+ 
++// glibc 2.41 also enables binary128 from the compiler version, independent
++// of __FLOAT128__. SPIR-V has no binary128 type. Suppress only that header's
++// compiler-version detection during the device pass, restoring it afterward.
++#if defined(__linux__) && defined(__x86_64__)
++#include <features.h>
++#if defined(__GLIBC__)
++#pragma push_macro("__GNUC_PREREQ")
++#pragma push_macro("__glibc_clang_prereq")
++#undef __GNUC_PREREQ
++#undef __glibc_clang_prereq
++#define __GNUC_PREREQ(major, minor) 0
++#define __glibc_clang_prereq(major, minor) 0
++#include <bits/floatn.h>
++#pragma pop_macro("__glibc_clang_prereq")
++#pragma pop_macro("__GNUC_PREREQ")
++#endif
++#endif
++
+ #endif // __HIP_DEVICE_COMPILE__
+ 
+ 
+diff --git a/src/CHIPBackend.cc b/src/CHIPBackend.cc
+index d2cd327..bd6c50d 100755
+--- a/src/CHIPBackend.cc
++++ b/src/CHIPBackend.cc
+@@ -511,8 +511,14 @@ chipstar::Device::~Device() {
+ 
+   // Call finish() for PerThreadDefaultQueue to ensure that all
+   // outstanding work items are completed.
+-  if (PerThreadDefaultQueue)
+-    PerThreadDefaultQueue->finish();
++  if (PerThreadDefaultQueue) {
++    try {
++      PerThreadDefaultQueue->finish();
++    } catch (const CHIPError &) {
++      // The application can observe a failed command through synchronization.
++      // Destruction must still release a retired stream without throwing.
++    }
++  }
+ 
+   for (auto *Queue : UserQueues_)
+     delete Queue;
+@@ -1254,9 +1260,14 @@ void chipstar::Backend::waitForThreadExit() {
+                 "been created via hipStreamCreate()");
+         logWarn("Removing user-created streams without calling a destructor");
+       }
+-      for (auto &Queue : Dev->getQueuesNoLock()) {
++      auto QueuesToRemove = Dev->getQueuesNoLock();
++      for (auto Queue : QueuesToRemove) {
+         logDebug("Destroying queue {}", (void *)Queue);
+-        Queue->finish();
++        try {
++          Queue->finish();
++        } catch (const CHIPError &) {
++          // No result is accepted here; this is teardown after command failure.
++        }
+         Queue->updateLastEvent(nullptr);
+         Dev->removeQueue(Queue);
+       }
+diff --git a/src/CHIPBackend.hh b/src/CHIPBackend.hh
+index efcb0b9..f7bbd16 100644
+--- a/src/CHIPBackend.hh
++++ b/src/CHIPBackend.hh
+@@ -2332,14 +2332,13 @@ public:
+    */
+ 
+   bool query() {
+-    if (!LastEvent_)
++    auto Last = getLastEvent();
++    if (!Last)
+       return true;
+-
+-    if (LastEvent_->updateFinishStatus(false))
+-      if (LastEvent_->isFinished())
+-        return true;
+-
+-    return false;
++    // API queries must distinguish completion, pending work, and failure.
++    // The false mode is for background event retirement and suppresses errors.
++    Last->updateFinishStatus(true);
++    return Last->isFinished();
+   };
+ 
+   /**
+diff --git a/src/CHIPBindings.cc b/src/CHIPBindings.cc
+index 1aeaca8..031ca8c 100755
+--- a/src/CHIPBindings.cc
++++ b/src/CHIPBindings.cc
+@@ -3400,14 +3400,22 @@ hipError_t hipStreamDestroy(hipStream_t Stream) {
+   if (ChipQueue->getCaptureStatus() == hipStreamCaptureStatusInvalidated)
+     RETURN(hipErrorStreamCaptureInvalidated);
+ 
+-  chipstar::Device *Dev = Backend->getActiveDevice();
+-
+-  // finish all streams. Need to make sure that no Dev->synchronizeQueues();
+-  hipDeviceSynchronizeInternal();
++  chipstar::Device *Dev = ChipQueue->getDevice();
++
++  // HIP permits waiting for this stream's outstanding work on destruction.
++  // Synchronizing the whole device couples unrelated streams and prevents
++  // disposal after one command fails. Retire this queue even when finish()
++  // reports its already-observable asynchronous error, then return that error.
++  hipError_t FinishStatus = hipSuccess;
++  try {
++    ChipQueue->finish();
++  } catch (CHIPError &Error) {
++    FinishStatus = Error.toHIPError();
++  }
+ 
+   LOCK(Dev->QueueAddRemoveMtx);
+   if (Dev->removeQueue(ChipQueue))
+-    RETURN(hipSuccess);
++    RETURN(FinishStatus);
+   else
+     RETURN(hipErrorInvalidValue);
+ 
+diff --git a/src/backend/OpenCL/CHIPBackendOpenCL.cc b/src/backend/OpenCL/CHIPBackendOpenCL.cc
+index 57e78fc..125a35d 100644
+--- a/src/backend/OpenCL/CHIPBackendOpenCL.cc
++++ b/src/backend/OpenCL/CHIPBackendOpenCL.cc
+@@ -760,6 +760,8 @@ bool CHIPEventOpenCL::updateFinishStatus(bool ThrowErrorIfNotReady) {
+   clStatus = clGetEventInfo(ClEvent, CL_EVENT_COMMAND_EXECUTION_STATUS,
+                             sizeof(int), &UpdatedStatus, NULL);
+   CHIPERR_CHECK_LOG_AND_THROW_TABLE(clGetEventInfo);
++  if (ThrowErrorIfNotReady && UpdatedStatus < CL_COMPLETE)
++    CHIPERR_LOG_AND_THROW("OpenCL command failed", hipErrorLaunchFailure);
+   if (ThrowErrorIfNotReady && UpdatedStatus != CL_COMPLETE) {
+     CHIPERR_LOG_AND_THROW("chipstar::Event not yet ready", hipErrorNotReady);
+   }
+@@ -1142,7 +1144,12 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
+   std::string cacheName =
+       generateCacheName(binAsStr + buildOptions, deviceName);
+ 
+-  bool cached =
++  // Shield derives lowering plans from the actual IL and every linked input.
++  // An opaque program binary cannot carry that provenance. Re-submit IL on
++  // this logical device; PoCL can still use its own compilation cache.
++  const bool NeedsILProvenance =
++      deviceName.rfind("Enclave Shield Virtual GPU", 0) == 0;
++  bool cached = !NeedsILProvenance &&
+       load(*ChipCtxOcl->get(), {*ChipDevOcl->get()}, cacheName, Program_);
+ 
+   if (!cached) {
+@@ -1184,7 +1191,8 @@ void CHIPModuleOpenCL::compile(chipstar::Device *ChipDev) {
+                             hipErrorInitializationError);
+     }
+ 
+-    save(Program_, cacheName);
++    if (!NeedsILProvenance)
++      save(Program_, cacheName);
+   }
+ 
+   std::vector<cl::Kernel> Kernels;
+@@ -1787,6 +1795,18 @@ CHIPQueueOpenCL::memCopyAsyncImpl(void *Dst, const void *Src, size_t Size,
+ void CHIPQueueOpenCL::finish() {
+   clStatus = get()->finish();
+   CHIPERR_CHECK_LOG_AND_THROW_TABLE(clFinish);
++  // clFinish waits for completion but does not report a command's negative
++  // execution status. Preserve failed dependency/offload events as HIP errors.
++  auto Last = getLastEvent();
++  if (Last) {
++    auto Native = std::static_pointer_cast<CHIPEventOpenCL>(Last)->getNativeRef();
++    cl_int Status = CL_QUEUED;
++    clStatus = clGetEventInfo(Native, CL_EVENT_COMMAND_EXECUTION_STATUS,
++                              sizeof(Status), &Status, nullptr);
++    CHIPERR_CHECK_LOG_AND_THROW_TABLE(clGetEventInfo);
++    if (Status < CL_COMPLETE)
++      CHIPERR_LOG_AND_THROW("OpenCL stream command failed", hipErrorLaunchFailure);
++  }
+   this->LastEvent_ = nullptr;
+ }
+ 

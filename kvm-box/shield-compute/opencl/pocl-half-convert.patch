@@ -1,0 +1,47 @@
+--- a/lib/kernel/CMakeLists.txt
++++ b/lib/kernel/CMakeLists.txt
+@@ -52,6 +52,7 @@
+ clz.cl
+ ctz.cl
+ convert_type.cl
++convert_half.cl
+ copysign.cl
+ cos.cl
+ cosh.cl
+--- /dev/null
++++ b/lib/kernel/convert_half.cl
+@@ -0,0 +1,24 @@
++/* Explicit float-to-half conversions using the runtime's rounding stores.
++ * Kept separate from the generated convert_type.cl file. */
++#ifdef cl_khr_fp16
++#define HALF_CONVERT_SCALAR(R) \
++  half _CL_OVERLOADABLE _CL_READNONE convert_half_##R (float x) \
++  { half result; vstore_half_##R (x, 0, (private half *)&result); return result; }
++#define HALF_CONVERT_VECTOR(N, R) \
++  half##N _CL_OVERLOADABLE _CL_READNONE convert_half##N##_##R (float##N x) \
++  { half##N result; for (int i = 0; i < N; ++i) result[i] = convert_half_##R (x[i]); return result; }
++#define HALF_CONVERT(R) \
++  HALF_CONVERT_SCALAR(R) \
++  HALF_CONVERT_VECTOR(2, R) \
++  HALF_CONVERT_VECTOR(3, R) \
++  HALF_CONVERT_VECTOR(4, R) \
++  HALF_CONVERT_VECTOR(8, R) \
++  HALF_CONVERT_VECTOR(16, R)
++HALF_CONVERT(rte)
++HALF_CONVERT(rtz)
++HALF_CONVERT(rtp)
++HALF_CONVERT(rtn)
++#undef HALF_CONVERT
++#undef HALF_CONVERT_VECTOR
++#undef HALF_CONVERT_SCALAR
++#endif
+--- a/lib/kernel/host/CMakeLists.txt
++++ b/lib/kernel/host/CMakeLists.txt
+@@ -40,6 +40,7 @@
+ clz.cl
+ ctz.cl
+ convert_type.cl
++convert_half.cl
+ cross.cl
+ distance.cl
+ dot.cl

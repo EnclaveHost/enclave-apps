@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Shield graphics browser qualification</title>
+<style>body{margin:24px;background:#141827;color:#e8edfa;font:16px sans-serif}canvas{width:640px;height:360px;display:block}pre{white-space:pre-wrap;max-width:1100px}</style>
+<h1>Browser graphics qualification</h1>
+<p>WebGL textures, depth, blending and animation through the desktop's standard driver.</p>
+<canvas id="scene" width="640" height="360"></canvas><pre id="status">Starting…</pre>
+<script>
+'use strict';
+const status=document.querySelector('#status');
+function progress(text){document.title='SHIELD_WEBGL_PROGRESS '+text+' '+document.visibilityState;status.textContent=text}
+function require(ok,why){if(!ok)throw Error(why)}
+function report(value){
+ status.textContent=JSON.stringify(value,null,2);
+ // Firefox bounds the native window title. Keep each message below that bound.
+ const bytes=new TextEncoder().encode(JSON.stringify(value)),payload=btoa(String.fromCharCode(...bytes));
+ const chunks=payload.match(/.{1,160}/g),nonce=crypto.getRandomValues(new Uint32Array(1))[0].toString(16).padStart(8,'0');let index=0;
+ const emit=()=>{document.title='SHIELD_WGL:'+nonce+':'+index+':'+chunks.length+':'+chunks[index]+':END';index=(index+1)%chunks.length};
+ emit();setInterval(emit,500);
+}
+function percentile(values,p){return [...values].sort((a,b)=>a-b)[Math.min(values.length-1,Math.floor(values.length*p))]}
+async function exercise(api){
+ const canvas=document.querySelector('#scene');
+ const gl=canvas.getContext(api,{alpha:false,antialias:false,preserveDrawingBuffer:true});
+ require(gl,api+' unavailable');progress(api+' context');const v2=api==='webgl2';
+ const shader=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);require(gl.getShaderParameter(s,gl.COMPILE_STATUS),gl.getShaderInfoLog(s));return s};
+ const vertex=(v2?'#version 300 es\n':'')+(v2?'in':'attribute')+' vec2 p; uniform float z; '+(v2?'out':'varying')+' vec2 uv; void main(){uv=(p+1.0)*0.5;gl_Position=vec4(p,z,1.0);}';
+ const fragment=(v2?'#version 300 es\n':'')+'precision highp float; '+(v2?'in':'varying')+' vec2 uv; uniform sampler2D tex;uniform int mode;uniform vec4 color;'+(v2?'out vec4 result;':'')+'void main(){'+(v2?'result':'gl_FragColor')+'=mode==0?'+(v2?'texture':'texture2D')+'(tex,uv):color;}';
+ const program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,vertex));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fragment));gl.linkProgram(program);require(gl.getProgramParameter(program,gl.LINK_STATUS),gl.getProgramInfoLog(program));gl.useProgram(program);
+ const loc={p:gl.getAttribLocation(program,'p'),z:gl.getUniformLocation(program,'z'),mode:gl.getUniformLocation(program,'mode'),color:gl.getUniformLocation(program,'color')};
+ const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.enableVertexAttribArray(loc.p);gl.vertexAttribPointer(loc.p,2,gl.FLOAT,false,0,0);
+ function geometry(data){gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.STREAM_DRAW);gl.drawArrays(gl.TRIANGLES,0,data.length/2)}
+ const quad=(s=1)=>[-s,-s,s,-s,-s,s,-s,s,s,-s,s,s];
+ function texture(w,h,data){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,data);return t}
+ const colors=[[255,0,0,255],[0,255,0,255],[0,0,255,255],[255,255,255,255]];
+ const input=texture(2,2,new Uint8Array(colors.flat())), output=texture(128,128,null), fbo=gl.createFramebuffer(),depth=gl.createRenderbuffer();
+ gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,output,0);gl.bindRenderbuffer(gl.RENDERBUFFER,depth);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,128,128);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth);require(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE,'incomplete framebuffer');
+ gl.disable(gl.DITHER);gl.viewport(0,0,128,128);gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LESS);gl.clearColor(0,0,0,1);gl.clearDepth(1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.bindTexture(gl.TEXTURE_2D,input);gl.uniform1i(loc.mode,0);gl.uniform1f(loc.z,.5);geometry(quad());
+ gl.enable(gl.BLEND);gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);gl.uniform1i(loc.mode,1);gl.uniform4f(loc.color,1,1,0,.5);gl.uniform1f(loc.z,0);geometry(quad(.5));
+ gl.disable(gl.BLEND);gl.uniform4f(loc.color,1,0,1,1);gl.uniform1f(loc.z,.75);geometry(quad());
+ progress(api+' readback');const pixels=new Uint8Array(128*128*4);gl.readPixels(0,0,128,128,gl.RGBA,gl.UNSIGNED_BYTE,pixels);let maxError=0;
+ for(let y=0;y<128;y++)for(let x=0;x<128;x++)for(let c=0;c<4;c++){
+  let expected=colors[(y>=64?2:0)+(x>=64?1:0)][c];
+  if(x>=32&&x<96&&y>=32&&y<96&&c<3)expected=(expected+(c<2?255:0))*.5;
+  const error=Math.abs(pixels[(y*128+x)*4+c]-expected);maxError=Math.max(maxError,error);require(error<=1,'pixel mismatch '+[x,y,c,pixels[(y*128+x)*4+c],expected]);
+ }
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.disable(gl.DEPTH_TEST);gl.viewport(0,0,canvas.width,canvas.height);gl.bindTexture(gl.TEXTURE_2D,output);gl.uniform1i(loc.mode,0);gl.uniform1f(loc.z,0);geometry(quad());
+ require(gl.getError()===gl.NO_ERROR,'WebGL error');
+ progress(api+' animation');
+ const render=[],intervals=[];let last=0;
+ for(let frame=0;frame<100;frame++){
+  if(frame%20===0)progress(api+' frame '+frame);
+  const timestamp=await Promise.race([new Promise(requestAnimationFrame),new Promise((_,reject)=>setTimeout(()=>reject(Error('animation frame deadline')),3000))]);if(frame>=20&&last)intervals.push(timestamp-last);last=timestamp;
+  const started=performance.now();gl.clear(gl.COLOR_BUFFER_BIT);const vertices=[];
+  for(let i=0;i<256;i++){
+   const cx=((i%16)+.5)/8-1,cy=(Math.floor(i/16)+.5)/8-1,a=frame*.035+i*.01,co=Math.cos(a),si=Math.sin(a);
+   for(let k=0;k<6;k++){const q=quad(.055),x=q[k*2],y=q[k*2+1];vertices.push(cx+x*co-y*si,cy+x*si+y*co)}
+  }
+  geometry(vertices);gl.finish();if(frame>=20)render.push(performance.now()-started);
+ }
+ require(!gl.isContextLost()&&gl.getError()===gl.NO_ERROR,'lost context or render error');const debug=gl.getExtension('WEBGL_debug_renderer_info');
+ return {api,passed:true,pixelsChecked:16384,channelsChecked:65536,maxChannelError:maxError,renderer:debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),frames:80,trianglesPerFrame:512,frameIntervalP50Ms:percentile(intervals,.5),frameIntervalP95Ms:percentile(intervals,.95),renderP50Ms:percentile(render,.5),renderP95Ms:percentile(render,.95),averageFps:1000/(intervals.reduce((a,b)=>a+b,0)/intervals.length)};
+}
+(async()=>{try{
+ const results=[];
+ for(const api of ['webgl','webgl2']){
+  if(results.length){const old=document.querySelector('#scene'),fresh=old.cloneNode();old.replaceWith(fresh)}
+  status.textContent='Testing '+api+'…';results.push(await exercise(api));
+ }
+ report({passed:true,results,gpuOffloadClaim:false});
+}catch(error){report({passed:false,error:String(error)})}})();
+</script>

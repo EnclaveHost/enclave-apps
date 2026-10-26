@@ -1,0 +1,32 @@
+{
+  "passed": true,
+  "triangleSha256": "116743614a5162a4c02d292766b6db3ad6a85df4b49633f1aa750547707fe842",
+  "byteIdenticalToUnmodifiedMesaReference": true,
+  "libraries": {
+    "libvulkan_lvp.so": "a000f1ac8098618b1e497f29ed05f6b2bf4bdca2154e7d197feff4dd31b4465d",
+    "libgallium-25.0.7.so": "590f9bf762f857492ffdfff75acadb849cd47e307634e8efebde13bdd7fb0b80"
+  },
+  "graphChecks": 13,
+  "verifiedExchanges": 16,
+  "verifiedMacs": 131072,
+  "corruptedExchange": 17,
+  "retryWorkerExchanges": 0,
+  "compilerCases": 32,
+  "driverCases": 25,
+  "productionAdmission": false,
+  "attestation": false,
+  "moonlightVideo": false,
+  "generalGraphicsGpuAcceleration": false,
+  "reviews": {
+    "structuralProof": "scoped independent review; no confirmed unsound acceptance",
+    "zinkResetDelta": "self-reviewed and tested; outside independent review coverage"
+  },
+  "earlierTestFailures": [
+    "Controller connection timeout in initial pre-atomic-image run; unchanged repeat passed",
+    "Final image initial boot refused a too-small root device; test harness now selects fixed SCSI target IDs instead of sdX order"
+  ],
+  "schema": "shield-graphics-qualification-checkpoint/1",
+  "rootImageSha256": "e1aed3187491f6e74ec5e1a10cd329e6b253d3a5f614d596933c31d5ad9b2fc9",
+  "verityRoot": "f7cb0ccc01fcf63bc6af16e823415daa404c616711483cd7b76412e110c30904",
+  "scope": "separate native KVM image; synthetic policy and test admission adapter"
+}

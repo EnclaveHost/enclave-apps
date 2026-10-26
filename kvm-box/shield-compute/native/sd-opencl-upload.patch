@@ -1,0 +1,33 @@
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -1046,7 +1046,7 @@
+         std::atomic<size_t> tensor_idx(0);
+         std::atomic<bool> failed(false);
+         std::vector<std::thread> workers;
+-        std::mutex rpc_backend_mutex;
++        std::mutex serialized_backend_mutex;
+ 
+         for (int i = 0; i < n_threads; ++i) {
+             workers.emplace_back([&, file_path, is_zip]() {
+@@ -1207,13 +1207,15 @@
+                     if (dst_tensor->buffer != nullptr && !ggml_backend_buffer_is_host(dst_tensor->buffer)) {
+                         t0 = ggml_time_ms();
+ 
+-                        // RPC backends require serialized access to prevent concurrency issues
++                        // OpenCL uploads reuse conversion kernel arguments, and RPC
++                        // connections also require serialized backend access.
+                         const char* buffer_type_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(dst_tensor->buffer));
+-                        bool is_rpc_buffer           = buffer_type_name != nullptr &&
+-                                             std::string(buffer_type_name).find("RPC") != std::string::npos;
+-
+-                        if (is_rpc_buffer) {
+-                            std::lock_guard<std::mutex> lock(rpc_backend_mutex);
++                        bool needs_serial_upload = buffer_type_name != nullptr &&
++                            (std::string(buffer_type_name).find("RPC") != std::string::npos ||
++                             std::string(buffer_type_name) == "OpenCL");
++
++                        if (needs_serial_upload) {
++                            std::lock_guard<std::mutex> lock(serialized_backend_mutex);
+                             ggml_backend_tensor_set(dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
+                         } else {
+                             ggml_backend_tensor_set(dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));

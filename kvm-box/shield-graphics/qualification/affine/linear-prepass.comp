@@ -1,0 +1,14 @@
+#version 450
+// Exact integer compute prepass; source data remains private. This fixture's
+// published constant matrix is NOT authorization to offload arbitrary shaders.
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint words[]; } source;
+layout(set = 0, binding = 1, std430) writeonly buffer Output { ivec4 positions[]; } destination;
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    ivec4 v = ivec4(source.words[4 * row] & 255u,
+                   source.words[4 * row + 1] & 255u,
+                   source.words[4 * row + 2] & 255u,
+                   source.words[4 * row + 3] & 255u) - ivec4(128);
+    destination.positions[row] = ivec4(int(uint(v.x)*1u+uint(v.y)*4294967295u+uint(v.z)*0u+uint(v.w)*0u+7u+row*1u),int(uint(v.x)*1u+uint(v.y)*1u+uint(v.z)*0u+uint(v.w)*0u+4294967293u+row*4294967295u),int(uint(v.x)*1u+uint(v.y)*0u+uint(v.z)*2u+uint(v.w)*1u+2147483647u+row*4294967295u),int(uint(v.x)*4294967295u+uint(v.y)*2u+uint(v.z)*4294967295u+uint(v.w)*1u+2147483648u+row*2147483648u));
+}

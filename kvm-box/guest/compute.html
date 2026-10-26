@@ -1,0 +1,17 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>KVM Box Compute</title><style>body{font:18px system-ui;background:#10151c;color:#e5edf5;max-width:850px;margin:50px auto;padding:25px}p{line-height:1.5}textarea{box-sizing:border-box;width:100%;height:90px;font:inherit;padding:12px}button{font:inherit;padding:12px;margin:15px 0}img{max-width:100%}pre{white-space:pre-wrap;font-size:14px}</style><h1>Shield compute</h1><p>Image generation runs in a separately verified enclave using its Shield backend. This desktop verifies that service before sending your prompt.</p><pre id="status">Checking service…</pre><textarea id="prompt" placeholder="Describe an image"></textarea><br><button id="generate" disabled>Generate image</button><p id="progress"></p><img id="result"><p>Native applications can use <code>http://127.0.0.1:8765/services/images/v1/images/generations</code> inside this desktop. Chat applications can use <code>http://127.0.0.1:8765/services/chat/v1</code> with their EyesOff API key. Desktop graphics and video encoding still use the CPU.</p><script>
+const base=location.pathname.replace(/\/$/,'');fetch(base+'/api/services').then(r=>r.json()).then(s=>{document.querySelector('#status').textContent=s.services.map(x=>x.label+': '+(x.verified?'Identity verified':x.error)).join('\n');document.querySelector('#generate').disabled=!s.services.some(x=>x.name==='images'&&x.verified)}).catch(e=>document.querySelector('#status').textContent=e.message);
+document.querySelector('#generate').onclick=async()=>{
+ const b=document.querySelector('#generate'),progress=document.querySelector('#progress');b.disabled=true;progress.textContent='Generating…';
+ try {
+  const r=await fetch(base+'/services/images/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value,width:512,height:512,steps:4})});
+  if(!r.ok)throw Error(await r.text());
+  const reader=r.body.getReader(),decoder=new TextDecoder();let pending='',done=false;
+  for(;;){const chunk=await reader.read();if(chunk.done)break;pending+=decoder.decode(chunk.value,{stream:true});let boundary;
+   while((boundary=pending.indexOf('\n\n'))>=0){const event=pending.slice(0,boundary);pending=pending.slice(boundary+2);
+    for(const line of event.split('\n'))if(line.startsWith('data:')){const v=JSON.parse(line.slice(5));if(v.error)throw Error(typeof v.error==='string'?v.error:JSON.stringify(v.error));if(v.status)progress.textContent=v.status;if(v.done){document.querySelector('#result').src='data:image/png;base64,'+v.image;progress.textContent='Complete';done=true}}
+   }
+  }
+  if(!done)throw Error('Service ended before returning an image');
+ }catch(e){progress.textContent=e.message}finally{b.disabled=false}
+};
+</script></html>

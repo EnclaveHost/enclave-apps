@@ -1,0 +1,19 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -10732,7 +10732,15 @@
+     ggml_backend_opencl_context *backend_ctx = ggml_cl_init(buffer_type->device);
+ 
+     if (!backend_ctx->program_cache_initialized) {
+-        backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
++        // Opaque program binaries cannot carry authenticated source lowering
++        // plans. Always submit source to the Shield frontend, even on a warm
++        // application cache. PoCL may still use its own source-keyed CPU cache.
++        if (backend_ctx->device_name == "Enclave Shield Virtual GPU (guest CPU + verified offload)") {
++            backend_ctx->program_cache = {};
++            GGML_LOG_INFO("ggml_opencl: Shield requires source validation; application binary cache disabled\n");
++        } else {
++            backend_ctx->program_cache = cl_program_cache_init(backend_ctx->device);
++        }
+         backend_ctx->program_cache_initialized = true;
+     }
+     load_cl_kernels(backend_ctx);

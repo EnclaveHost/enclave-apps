@@ -1,0 +1,77 @@
+{
+  "source": {
+    "url": "https://codeload.github.com/KhronosGroup/VK-GL-CTS/tar.gz/c2dcff23a48c7cb17efc51ee634b027aa6770889",
+    "commit": "c2dcff23a48c7cb17efc51ee634b027aa6770889",
+    "tag": "vulkan-cts-1.4.1.0",
+    "sha256": "8930a9323bc61abedbb6a0dc795dcac929cd9b781132bd8f92a8a8e1f863c756",
+    "bytes": 76697073
+  },
+  "dependencies": [
+    {
+      "name": "spirv-tools",
+      "revision": "3fb52548bc8a68d349d31e21bd4e80e3d953e87c",
+      "url": "https://codeload.github.com/KhronosGroup/SPIRV-Tools/tar.gz/3fb52548bc8a68d349d31e21bd4e80e3d953e87c",
+      "sha256": "c47241413abe4792f91e55e1bf65acd2dd1c90266b4ea3dfc8383bcc4b14d184",
+      "bytes": 3206470
+    },
+    {
+      "name": "glslang",
+      "revision": "a0995c49ebcaca2c6d3b03efbabf74f3843decdb",
+      "url": "https://codeload.github.com/KhronosGroup/glslang/tar.gz/a0995c49ebcaca2c6d3b03efbabf74f3843decdb",
+      "sha256": "84160d535e6889796bb8f106378d16b5667984e642b461b9c2a912da18bacda1",
+      "bytes": 3921303
+    },
+    {
+      "name": "spirv-headers",
+      "revision": "36d5e2ddaa54c70d2f29081510c66f4fc98e5e53",
+      "url": "https://codeload.github.com/KhronosGroup/SPIRV-Headers/tar.gz/36d5e2ddaa54c70d2f29081510c66f4fc98e5e53",
+      "sha256": "e9632c0e0719889e904f980b824928b15d41e3e6ccdfb0d6dec7f04dc8a86572",
+      "bytes": 532333
+    },
+    {
+      "name": "vulkan-docs",
+      "revision": "c7a3955e47d223c6a37fb29e2061c973eec98d0a",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-Docs/tar.gz/c7a3955e47d223c6a37fb29e2061c973eec98d0a",
+      "sha256": "eb10bd0e0ff4c5b3ed9c2f937b8688aae6af53ce06ed5a7cea81d12eda36c7e3",
+      "bytes": 5682544
+    },
+    {
+      "name": "vulkan-validationlayers",
+      "revision": "902f3cf8d51e76be0c0deb4be39c6223abebbae2",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-ValidationLayers/tar.gz/902f3cf8d51e76be0c0deb4be39c6223abebbae2",
+      "sha256": "033ab935339b8a64d8c64b5e09a28bdfef3b7704510bf3726aa97ae94c9dfb02",
+      "bytes": 5647659
+    },
+    {
+      "name": "amber",
+      "revision": "1ec5e96db7e0343d045a52c590e30eba154f74a8",
+      "url": "https://codeload.github.com/google/amber/tar.gz/1ec5e96db7e0343d045a52c590e30eba154f74a8",
+      "sha256": "247bc068a8a4f52523920da0eff2fc671302cdbaa4806dd0aa52374a23433534",
+      "bytes": 486132
+    },
+    {
+      "name": "jsoncpp",
+      "revision": "9059f5cad030ba11d37818847443a53918c327b1",
+      "url": "https://codeload.github.com/open-source-parsers/jsoncpp/tar.gz/9059f5cad030ba11d37818847443a53918c327b1",
+      "sha256": "e7a12f50c2125abc9e4b2a38f399393503b6eebd5b4ab75ebb7df1664e768ce7",
+      "bytes": 214278
+    },
+    {
+      "name": "nvidia-video-samples",
+      "revision": "4b5c49d2c3ea7e9af6b7cce243780c62270eae77",
+      "url": "https://codeload.github.com/Igalia/vk_video_samples/tar.gz/4b5c49d2c3ea7e9af6b7cce243780c62270eae77",
+      "sha256": "4b94592c6d1b8a6e0a2702dcc3b821ff3e07bb7da1fc6d66f1d9f5c84f162568",
+      "bytes": 1645592
+    }
+  ],
+  "toolsImage": "sha256:55d0b6b993bb704b5e470ee0fe0e9ea446d219eb1506314e4c20ec0c2be36bbd",
+  "mesa": {
+    "libvulkan_lvp.so": "aa600783f4e5d7e8763a5b0159fb90309d8deb19d9ece27ed9d5d6f266fc95a8",
+    "libgallium-25.0.7.so": "590f9bf762f857492ffdfff75acadb849cd47e307634e8efebde13bdd7fb0b80"
+  },
+  "qpaParserSha256": "21f4480270ce1b0893cd1a7ffd18d4e709275a76ac5910cf3e90a4c915884a0d",
+  "loaders": {
+    "libEGL_mesa.so.0.0.0": "de08cc8df3680df55e9c1825fc7542fc2158d18e1fd06ec8b9c13f2b8411e1c9",
+    "libGLX_mesa.so.0.0.0": "f4d9469ce85f265504679176fd7000cb4d479513dda5f17ff60d889e0fd6bf94"
+  }
+}
