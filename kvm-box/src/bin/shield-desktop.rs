@@ -1986,7 +1986,7 @@ mod tests {
         for h in ["Cache-Control: no-store", "X-Content-Type-Options: nosniff", "frame-ancestors 'none'"] {
             assert!(head.contains(h), "{h}");
         }
-        assert!(String::from_utf8_lossy(&body).contains("path=desktop/websockify"));
+        assert!(String::from_utf8_lossy(&body).contains("path=/desktop/websockify"));
         assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
     }
 
