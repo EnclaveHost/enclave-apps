@@ -56,3 +56,6 @@ user_pref("browser.urlbar.autoFill", false);
 user_pref("fission.autostart", true);
 user_pref("browser.startup.firstrunSkipsHomepage", true);
 user_pref("datareporting.policy.firstRunURL", "");
+
+// Enclave Shield: JIT pages may be writable OR executable, never both.
+user_pref("javascript.options.content_process_write_protect_code", true);

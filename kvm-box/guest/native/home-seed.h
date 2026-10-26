@@ -72,11 +72,11 @@ static const struct hs_expect { const char *path; size_t size; } hs_expected[] =
     { ".config/gtk-3.0/settings.ini", 62 }, { ".fluxbox/apps", 74 },
     { ".fluxbox/init", 581 }, { ".fluxbox/keys", 4872 }, { ".fluxbox/menu", 213 },
     { ".fluxbox/overlay", 89 }, { ".mozilla/firefox/kvm-box/chrome/userContent.css", 829 },
-    { ".mozilla/firefox/kvm-box/user.js", 3083 }, { ".mozilla/firefox/profiles.ini", 93 },
+    { ".mozilla/firefox/kvm-box/user.js", 3230 }, { ".mozilla/firefox/profiles.ini", 93 },
     { ".profile", 807 }, { ".themes/RiscBox/gtk-3.0/gtk.css", 964 },
 };
 #define HS_EXPECT_FILES 14
-#define HS_EXPECT_BYTES ((size_t)15573)
+#define HS_EXPECT_BYTES ((size_t)15720)
 _Static_assert(sizeof hs_expected / sizeof hs_expected[0] == HS_EXPECT_FILES, "expected table");
 _Static_assert(HS_NFILES >= 1 && HS_NFILES <= HS_MAX_FILES, "home file table size");
 _Static_assert(HS_NDIRS >= 1 && HS_NDIRS <= HS_MAX_DIRS, "home directory table size");

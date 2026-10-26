@@ -64,8 +64,8 @@
     },
     {
       "path": ".mozilla/firefox/kvm-box/user.js",
-      "bytes": 3083,
-      "sha256": "61137066674a618197ae8aec5822be4c76e13e810aff17cabd230faf95515379",
+      "bytes": 3230,
+      "sha256": "c654abecbb3c2b97e9dbe8fc4ce9bb994e385e73b71554d36157830a4dabcb30",
       "mode": 420
     },
     {
