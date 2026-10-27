@@ -1,15 +1,16 @@
 # Native desktop companion — development components
 
-These sources are not admitted by the platform runtime and are not deployed.
-The native nsinit now passes composed KVM startup, clean-stop and critical
-daemon-failure tests with the actual desktop/service graph. The real Wasm
-controller, outer gateway and supervisor also pass a combined nine-check KVM
-run through the actual desktop and inner gateway. The measured
-profile launcher and authenticated worker transport now pass native fixture
-checks; standard sd-cli and llama-cli complete masked operations on NucBox.
-Real owner release and production deployment remain unfinished. See nsinit.md
-for the component boundary and ../../shield-graphics/qualification/CTS.md for
-the exact evidence scope.
+The signed native desktop profile has been deployed on NucBox as
+`kvm-box-native:0.9.0`; the earlier startup-only checkpoint below is no longer
+its deployment status. See [DEPLOYMENT_STATUS.md](DEPLOYMENT_STATUS.md) for the
+current release pins and the distinction between deployed code and candidates.
+Native nsinit, the Wasm controller, gateways and supervisor have composed KVM
+startup/stop and failure tests. The measured profile launcher and authenticated
+worker transport also have native fixture coverage; standard sd-cli and
+llama-cli have completed masked operations on NucBox. Owner testing verified
+usable Moonlight streaming. This does not certify all graphics APIs, games or
+untrusted-host confidentiality. See nsinit.md for the component boundary and
+../../shield-graphics/qualification/CTS.md for the exact test scope.
 Never install the test nsinit
 or the kernel-check bypass binary in a release image.
 

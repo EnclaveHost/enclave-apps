@@ -1,6 +1,6 @@
 {
   "schema": "shield-graphics-grid-checkpoint/1",
-  "scope": "isolated host-container qualification; native image acceptance pending; production image unchanged",
+  "scope": "isolated host-container and native KVM qualification; production VBS admission/deployment pending",
   "librarySha256": "038d5c4bf64fafdc8eb45b5c4634262c450f49dc0e4a48995f8486c714e70020",
   "toolImage": "sha256:9c97d769ffa3e605b415ad7165f687994d6178aabcce836943b45ecaa17fd825",
   "proofCases": 48,
@@ -20,5 +20,19 @@
     "reportWritten": true,
     "cliExit": "max-turn cap after report was written",
     "followup": "corrected row contract comment; removed unused production request macro; added mixed-ID, modular-identity, boundary-shift and worst-payload tests"
+  },
+  "native": {
+    "passed": true,
+    "rootImageSha256": "4a5dc041155e33c923d5224f3be3103291405a62f5426fb97b604f62cad98db5",
+    "verityRoot": "27bafabba66ad4d4ed102cb2e6cfae53c7ab54443c0b6de92df725d24c01d383",
+    "graphicsCases": 11,
+    "desktopChecks": 9,
+    "protectedOutputsChecked": 524288,
+    "verifiedOffloads": 2048,
+    "maskedMacs": 16777216,
+    "lastTileCorruptionRejected": true,
+    "desktopSurvivesRetirement": true,
+    "productionAdmission": false,
+    "moonlightStreaming": false
   }
 }

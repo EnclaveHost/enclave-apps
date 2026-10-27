@@ -96,14 +96,21 @@ loss; no post-reset buffer contents are promised by the API.
 
 ## Validation
 
-The multi-workgroup extension has separate host-container qualification; it has
-not replaced the running native image. It adds 48 proof cases for both layouts,
+The multi-workgroup extension has host-container and separate native KVM qualification;
+it has not replaced the running production image. It adds 48 proof cases for both layouts,
 46 sanitized client cases, and real OpenGL/Vulkan tests at 1, 2 and 64 workgroups.
 At 64 groups each API checks 131,072 scalar outputs over eight dispatches, with
 512 verified GPU exchanges / 4,194,304 MACs. The 65-group and local-only row-term
 controls execute on CPU without a service request. Corrupting the final tile
 causes device/context loss; Vulkan checks the entire output and subsequent draw
 remain untouched. The original 73 proof cases retain their prior proof results.
+
+The new native candidate passes 11 graphics cases and nine desktop/lifecycle
+checks. Four protected API fixtures check 524,288 values with 2,048 verified
+exchanges / 16,777,216 MACs. Final-tile corruption causes Vulkan device loss
+without publication; retired Vulkan/OpenGL retries make no worker connection.
+The desktop survives retirement and stops cleanly. The test uses synthetic
+admission and a fixed vsock relay, not production VBS attestation.
 
 The following describes the earlier single-workgroup/native checkpoint.
 

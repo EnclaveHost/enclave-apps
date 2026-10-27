@@ -51,8 +51,9 @@ All input bounds are checked before registration. Tile geometry depends only
 on the declared shape; each tile uses the existing fresh-mask and verification
 path. The full graph result is withheld until all tiles succeed, and staged
 matrix rows are cleared on a later-tile failure. Service memory, work and
-output limits still apply. This expands the graph backend, not the set of
-OpenGL/Vulkan shaders recognized by the driver.
+output limits still apply. The [graphics driver](../shield-graphics/driver/README.md) separately extends
+its proven affine dispatch geometry to the same bound; this does not authorize
+arbitrary shaders or floating-point quantization.
 
 `channel.py` binds the existing `sh_link_*` API with verification always enabled.
 It independently checks public-weight digests against its trusted caller policy

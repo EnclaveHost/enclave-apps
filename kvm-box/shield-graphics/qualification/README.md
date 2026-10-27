@@ -235,6 +235,6 @@ A positive 64-group variant uses `-DSHIELD_TEST_GLOBAL_BIAS=7` and
 local to the client. The independently computed C++ oracle checks every row.
 
 Offline `test-grid-nir.py` compares conditional workgroup bounds and extracted
-transforms; these results alone do not establish runtime eligibility. A new
-native image, native lifecycle tests and production admission remain necessary
-before deploying this extension.
+transforms; these results alone do not establish runtime eligibility. The separate native image and lifecycle tests now pass, as recorded in
+`grid-checkpoint.json`. Production VBS admission and owner acceptance remain
+necessary before deploying this extension.
