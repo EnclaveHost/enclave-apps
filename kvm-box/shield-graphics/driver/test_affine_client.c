@@ -1,3 +1,4 @@
+#define LEGACY_TEST_CAPACITY 16384
 /* Independent integer oracle for the generalized transport; synthetic replies only. */
 #include "shield_prepass_client.c"
 #include <assert.h>
@@ -15,10 +16,10 @@ int main(void) {
         for(unsigned c=0;c<4;c++) { t.bias[c]=next();t.row[c]=next(); }
         for(unsigned i=0;i<256;i++) input[i]=next();
         assert(shield_affine64_valid(&t));
-        char body[REQUEST_LIMIT],same[REQUEST_LIMIT];assert(request(&t,input,64,body,REQUEST_LIMIT));
+        char body[LEGACY_TEST_CAPACITY],same[LEGACY_TEST_CAPACITY];assert(request(&t,input,64,body,LEGACY_TEST_CAPACITY));
         struct shield_affine64 changed=t;
         for(unsigned c=0;c<4;c++){changed.bias[c]^=0xffffffffu;changed.row[c]^=0xaaaaaaaa;}
-        assert(request(&changed,input,64,same,REQUEST_LIMIT));assert(!strcmp(body,same));
+        assert(request(&changed,input,64,same,LEGACY_TEST_CAPACITY));assert(!strcmp(body,same));
         struct json_object *req=json_tokener_parse(body), *graph,*nodes,*weights,*values;
         assert(field(req,"graph",json_type_object,&graph));assert(field(graph,"nodes",json_type_array,&nodes));
         assert(json_object_array_length(nodes)==3);

@@ -48,6 +48,11 @@ instruction, recursion, evaluation and normalization limits; exceeding them
 retains CPU execution. Upstream normalization preserves valid shader semantics;
 it does not promise to reproduce undefined behavior or nontermination.
 
+Worst-case 4,096-row request and response widths are covered by client tests;
+the measured service accepts at most 8 MiB per request, above the client bound
+of `2048 + 4096*96` bytes. The fixed I/O deadline remains an availability bound,
+not a latency guarantee for a remote worker.
+
 Earlier writes complete before an owned input snapshot. The client pads the
 4×4 transform to Shield's existing FIELD_GEMM K=32 contract; no float is
 quantized. The service must separately approve the exact padded matrix digest. A successful
@@ -69,7 +74,8 @@ from that test authorization.
 ## Protected channel and failure behavior
 
 The driver connects only to `/run/shield/compute.sock`, checks server UID 1001
-before sending bytes, bounds framing and total I/O time, validates canonical
+before sending bytes, bounds framing and total I/O time (15 seconds for the
+complete request, including all tiles), validates canonical
 response types/ranges and exact counters, and publishes results only after full
 validation. Masking and verification remain in the existing service/core. The
 driver has neither a worker address nor a physical GPU handle.
@@ -91,8 +97,8 @@ loss; no post-reset buffer contents are promised by the API.
 ## Validation
 
 The multi-workgroup extension has separate host-container qualification; it has
-not replaced the running native image. It adds 34 proof cases for both layouts,
-42 sanitized client cases, and real OpenGL/Vulkan tests at 1, 2 and 64 workgroups.
+not replaced the running native image. It adds 48 proof cases for both layouts,
+46 sanitized client cases, and real OpenGL/Vulkan tests at 1, 2 and 64 workgroups.
 At 64 groups each API checks 131,072 scalar outputs over eight dispatches, with
 512 verified GPU exchanges / 4,194,304 MACs. The 65-group and local-only row-term
 controls execute on CPU without a service request. Corrupting the final tile

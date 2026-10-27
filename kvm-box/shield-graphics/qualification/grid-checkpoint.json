@@ -3,15 +3,22 @@
   "scope": "isolated host-container qualification; native image acceptance pending; production image unchanged",
   "librarySha256": "038d5c4bf64fafdc8eb45b5c4634262c450f49dc0e4a48995f8486c714e70020",
   "toolImage": "sha256:9c97d769ffa3e605b415ad7165f687994d6178aabcce836943b45ecaa17fd825",
-  "proofCases": 34,
+  "proofCases": 48,
   "legacyProofCases": 73,
-  "driverCases": 42,
-  "gridSanitizerCases": 42,
+  "driverCases": 44,
+  "gridSanitizerCases": 46,
   "affineSanitizerCases": 1028,
   "maxWorkgroups": 64,
   "rowsPerWorkgroup": 64,
   "matrixApproval": "separate exact padded public constant digest; unchanged",
   "failure": "last real GPU tile corruption rejects the dispatch and retires service; no CPU retry",
   "rendering": "general rasterization and unsupported shaders remain CPU",
-  "deployment": "not activated"
+  "deployment": "not activated",
+  "review": {
+    "scope": "static multi-workgroup delta review, no cryptography/platform audit",
+    "confirmedCorrectnessDefects": 0,
+    "reportWritten": true,
+    "cliExit": "max-turn cap after report was written",
+    "followup": "corrected row contract comment; removed unused production request macro; added mixed-ID, modular-identity, boundary-shift and worst-payload tests"
+  }
 }

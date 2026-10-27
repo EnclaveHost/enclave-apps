@@ -16,7 +16,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define REQUEST_LIMIT 16384
 #define MAX_ROWS 4096
 #define TIMEOUT_MS 15000
 #define SERVICE_UID 1001

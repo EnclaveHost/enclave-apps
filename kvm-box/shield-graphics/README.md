@@ -19,7 +19,7 @@ The [larger-dispatch checkpoint](qualification/grid-checkpoint.json) extends
 the proved integer path to 1–64 workgroups (64–4,096 rows). It distinguishes
 local and global invocation IDs, tiles approved products through the existing
 masked channel, and publishes results only when every tile has verified.
-All 42 host driver cases pass, including final-tile corruption and CPU-only
+All 44 host driver cases pass, including final-tile corruption and CPU-only
 negative controls. Native image acceptance and deployment remain pending.
 This extends compute coverage; general graphics rendering remains local.
 

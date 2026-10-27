@@ -70,6 +70,43 @@ int main(void) {
         assert(response(&t,text,strlen(text),n,output)==SHIELD_PREPASS_FAILED);sentinel(guarded,words+8);checks++;
         json_object_put(root);free(body);free(other);free(input);free(expected);free(guarded);
     }
+    /* Maximal decimal width at the public row/weight bounds. These exercise
+     * the complete body, not only the capacity formula. Service framing is
+     * independently capped at 8MiB, above this <400KiB client request. */
+    {
+        const unsigned n=4096;size_t words=n*4,bytes=words*sizeof(uint32_t);
+        struct shield_affine64 t=shield_affine64_fixed();
+        uint32_t *input=calloc(words,sizeof *input);int32_t *output=malloc(bytes);
+        size_t capacity=2048+n*96;char *body=malloc(capacity);
+        assert(input&&output&&body);
+        for(unsigned k=0;k<4;k++)for(unsigned c=0;c<4;c++)t.matrix[k][c]=-119;
+        size_t length=request(&t,input,n,body,capacity);
+        assert(length>300000 && length<capacity && length<(8u<<20));checks++;
+        for(unsigned sign=0;sign<2;sign++) {
+            int dot=sign?60928:-60928;
+            for(unsigned k=0;k<4;k++)for(unsigned c=0;c<4;c++)t.matrix[k][c]=sign?-119:119;
+            struct json_object *root=json_object_new_object(),*outputs=json_object_new_object(),*rows=json_object_new_array(),*routes=json_object_new_object(),*stats=json_object_new_object();
+            json_object_object_add(root,"ok",json_object_new_boolean(true));
+            json_object_object_add(root,"outputs",outputs);json_object_object_add(outputs,"y",rows);
+            json_object_object_add(root,"routes",routes);json_object_object_add(routes,"y",json_object_new_string("masked-field-gemm"));
+            json_object_object_add(root,"stats",stats);
+            json_object_object_add(stats,"exchanges",json_object_new_int(64));
+            json_object_object_add(stats,"macs",json_object_new_int(524288));
+            json_object_object_add(stats,"verification_failures",json_object_new_int(0));
+            for(unsigned r=0;r<n;r++) {
+                struct json_object *row=json_object_new_array();json_object_array_add(rows,row);
+                for(unsigned c=0;c<4;c++)json_object_array_add(row,json_object_new_int(dot));
+            }
+            const char *text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
+            assert(strlen(text)<2048+n*32);
+            assert(response(&t,text,strlen(text),n,output)==SHIELD_PREPASS_MASKED);
+            for(unsigned i=0;i<words;i++)assert(output[i]==dot);
+            checks++;json_object_put(root);
+        }
+        memset(output,0xa5,bytes);memset(body,' ',2048+n*32+1);
+        assert(response(&t,body,2048+n*32+1,n,output)==SHIELD_PREPASS_FAILED);
+        sentinel(output,words);checks++;free(body);free(output);free(input);
+    }
     struct shield_affine64 t=shield_affine64_fixed();uint32_t input[256]={0};int32_t output[256];memset(output,0xa5,sizeof output);
     for(unsigned n=0;n<=1;n++) { assert(shield_prepass_execute_rows(&t,input,n?4097:0,output)==SHIELD_PREPASS_FAILED);sentinel(output,256);checks++; }
     printf("grid client: %u request/counter/bounds/atomic-publication checks passed\n",checks);

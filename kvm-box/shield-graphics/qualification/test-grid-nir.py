@@ -18,6 +18,9 @@ for name,row,groups in [
  ('explicit-global','64u*gl_WorkGroupID.x+gl_LocalInvocationID.x',64),
  ('shift-global','(gl_WorkGroupID.x<<6)+gl_LocalInvocationID.x',64),
  ('local-only','gl_LocalInvocationID.x',1),
+ ('workgroup-only','64u*gl_WorkGroupID.x',0),
+ ('shift-boundary-valid','(gl_GlobalInvocationID.x<<20)>>20',64),
+ ('shift-boundary-wrap','(gl_GlobalInvocationID.x<<21)>>21',1),
  ('wrong-group-stride32','32u*gl_WorkGroupID.x+gl_LocalInvocationID.x',1),
  ('wrong-group-stride128','128u*gl_WorkGroupID.x+gl_LocalInvocationID.x',1),
  ('wrapped-local','(gl_GlobalInvocationID.x<<26)>>26',1),
@@ -35,9 +38,13 @@ for name,term,groups,coefficient in [
  ('local-row-bias','gl_LocalInvocationID.x*7u',1,7),
  ('group-row-bias','gl_WorkGroupID.x*7u',1,0),
  ('wrapped-row-bias','gl_GlobalInvocationID.x*0xffffffffu',64,0xffffffff),
+ ('modular-local-row-bias','gl_LocalInvocationID.x*0x04000000u',64,0x04000000),
+ ('modular-global-row-bias','gl_GlobalInvocationID.x*0x04000000u',64,0x04000000),
 ]:
  expected=json.loads(json.dumps(fixed));expected['row'][0]=coefficient
  cases[name]=(base.replace('v.x + v.y','int(uint(v.x+v.y)+'+term+')'),groups,expected)
+cases['mixed-local-input']=(base.replace('source.words[4 * row','source.words[4 * gl_LocalInvocationID.x'),1,fixed)
+cases['mixed-global-input']=(base.replace('uint row = gl_GlobalInvocationID.x','uint row = gl_LocalInvocationID.x').replace('source.words[4 * row','source.words[4 * gl_GlobalInvocationID.x'),1,fixed)
 # Generate a scalar-store descriptor array form independently for every case.
 for name,(shader,groups,expected) in list(cases.items()):
  z=shader.replace('layout(set = 0, binding = 0, std430) readonly buffer Input { uint words[]; } source;','layout(set=3,binding=0,std430) buffer Data { uint words[]; } buffers[2];')
