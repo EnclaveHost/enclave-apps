@@ -1438,6 +1438,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smoltcp",
+ "snapshot-crypto",
  "webpki-roots 0.26.11",
  "wit-bindgen",
  "x509-parser",
@@ -1707,6 +1708,18 @@ dependencies = [
  "defmt 0.3.100",
  "heapless",
  "managed",
+]
+
+[[package]]
+name = "snapshot-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "hmac",
+ "rand_core",
+ "serde_json",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

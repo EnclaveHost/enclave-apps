@@ -267,14 +267,15 @@ pub struct Config {
     // Instant boot. `snapshot` names the S3 key a snapshot of the booted
     // machine lives under: when the object exists, /start resumes from it —
     // seconds — instead of running the guest's own boot, which on an emulated
-    // core is minutes. When it does not exist yet the boot is a cold one and
-    // POST /snapshot writes the object (to `snapshotSaveKey`, defaulting to
+    // core is minutes. A new private session explicitly uses snapshot:false;
+    // POST /snapshot writes the encrypted object (to `snapshotSaveKey`, defaulting to
     // `snapshot`) so every start after that is instant. `snapshotLevel` is
     // the deflate level the RAM image is written at (1 fast .. 9 small).
     // The same object is the default ROOT that instances fork from.
     snapshot: Option<String>,
     snapshot_save_key: Option<String>,
     snapshot_level: u8,
+    snapshot_policy: Result<snapshot_crypto::policy::Policy, String>,
     // A shell command run on the guest console right after a restore or a
     // fork, via the /exec machinery. A resumed guest still believes it is the
     // moment the snapshot was taken: its wall clock is stale and its random
@@ -452,6 +453,7 @@ fn load_config() -> Config {
             .and_then(|x| x.as_u64())
             .unwrap_or(2)
             .clamp(1, 9) as u8,
+        snapshot_policy: snapshot_crypto::policy::Policy::from_config(&v, "risc-box", s("api_key").is_some()),
         restore_exec: s("restoreExec"),
         restore_exec_timeout_s: v
             .get("restoreExecTimeoutS")
@@ -1184,7 +1186,7 @@ impl App {
                 .unwrap_or_else(|| "null".into())
         };
         format!(
-            "{{\"key\":{},\"cachedBytes\":{},\"restored\":{},\"restoreMs\":{:.0},\"takenUnix\":{},\"lastSnapshot\":{}}}",
+            "{{\"key\":{},\"cachedBytes\":{},\"restored\":{},\"restoreMs\":{:.0},\"takenUnix\":{},\"lastSnapshot\":{},\"privateSaveReady\":{},\"encryptionError\":{}}}",
             js(&self.cfg.snapshot),
             self.cache
                 .as_ref()
@@ -1195,6 +1197,9 @@ impl App {
             m.restore_ms,
             m.restore_taken_unix,
             js(&m.last_snapshot),
+            self.cfg.snapshot_policy.as_ref().is_ok_and(|p| p.check_save(
+                self.cfg.snapshot_save_key.as_deref().unwrap_or("")).is_ok()),
+            js(&self.cfg.snapshot_policy.as_ref().err().cloned()),
         )
     }
 
@@ -1262,6 +1267,7 @@ fn progress_logger(what: &str) -> impl FnMut(usize, usize) + '_ {
 fn fetch_images(
     cfg: &Config,
     creds: Option<&Creds>,
+    want_snapshot: bool,
     pump: &mut dyn FnMut(&str, usize, usize),
 ) -> Result<Images, String> {
     let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
@@ -1336,9 +1342,9 @@ fn fetch_images(
     };
     // The snapshot rides the same fetch (and the same retry budget): a
     // transient egress blip at enclave cold boot must not silently turn an
-    // instant start into a two-minute one. A missing object is not an error,
-    // it is the state before the first /snapshot.
-    let snap_stored = match &cfg.snapshot {
+    // instant start into a two-minute one. Missing private state is an error;
+    // only an explicitly public template may fall back to a cold boot.
+    let snap_stored = match cfg.snapshot.as_ref().filter(|_| want_snapshot) {
         Some(k) => {
             eprintln!("[risc-box] fetching snapshot s3://{}/{k}", cfg.bucket);
             let mut snap_log = progress_logger("snapshot");
@@ -1348,14 +1354,21 @@ fn fetch_images(
             })
                 .map_err(|e| format!("fetch snapshot {k}: {e}"))?
             {
-                Some(mut b) => {
+                Some(b) => {
+                    // Authenticate the entire envelope before parsing any VM
+                    // state. Missing keys/corruption never fall back to plaintext.
+                    let mut b = cfg.snapshot_policy.as_ref().map_err(Clone::clone)?
+                        .open(&cfg.bucket, k, b)?;
                     b.shrink_to_fit();
                     eprintln!("[risc-box]   snapshot {} bytes", b.len());
                     Some(b)
                 }
                 None => {
+                    if !cfg.snapshot_policy.as_ref().map_err(Clone::clone)?.is_public(k) {
+                        return Err("private snapshot is missing; explicitly start with snapshot:false for a new session".into());
+                    }
                     eprintln!(
-                        "[risc-box]   no snapshot at {k} yet: this boot is a cold one (POST /snapshot once the machine is ready)"
+                        "[risc-box]   public template {k} is absent: booting the base images"
                     );
                     None
                 }
@@ -1590,11 +1603,19 @@ fn boot(app: &mut App, want_snapshot: bool) -> Result<Booted, String> {
                         Some(img)
                     }
                     Err(e) => {
+                        if !cfg.snapshot_policy.as_ref().map_err(Clone::clone)?.is_public(&key) {
+                            return Err(format!("private snapshot cannot be parsed: {e}"));
+                        }
                         eprintln!("[risc-box] ignoring the snapshot: {e}; booting cold");
                         None
                     }
                 },
-                (None, None) => None,
+                (None, None) => {
+                    if !cfg.snapshot_policy.as_ref().map_err(Clone::clone)?.is_public(&key) {
+                        return Err("private snapshot is not loaded; explicitly choose a new session".into());
+                    }
+                    None
+                },
             };
             if let Some(img) = image {
                 let ram_mib = img.meta.ram_bytes >> 20;
@@ -1639,7 +1660,12 @@ fn boot(app: &mut App, want_snapshot: bool) -> Result<Booted, String> {
                         finish_machine(&mut emu, cfg);
                         return Ok(Booted { emu, restored: Some(info) });
                     }
-                    Err(why) => eprintln!("[risc-box] ignoring the snapshot: {why}; booting cold"),
+                    Err(why) => {
+                        if !cfg.snapshot_policy.as_ref().map_err(Clone::clone)?.is_public(&key) {
+                            return Err(format!("private snapshot is incompatible: {why}"));
+                        }
+                        eprintln!("[risc-box] ignoring the snapshot: {why}; booting cold");
+                    }
                 }
             }
         }
@@ -1696,8 +1722,9 @@ fn root_image(app: &mut App, from: &str) -> Result<(String, Arc<SnapshotImage>),
         _ => {
             let ep = Endpoint::parse(&cfg.endpoint, &cfg.region)?;
             eprintln!("[risc-box] fetching root snapshot s3://{}/{from}", cfg.bucket);
-            s3::get_object(&ep, &cfg.bucket, from, app.live_creds.as_ref(), &mut progress_logger("root"))
-                .map_err(|e| format!("fetch root snapshot {from}: {e}"))?
+            let downloaded = s3::get_object(&ep, &cfg.bucket, from, app.live_creds.as_ref(), &mut progress_logger("root"))
+                .map_err(|e| format!("fetch root snapshot {from}: {e}"))?;
+            cfg.snapshot_policy.as_ref().map_err(Clone::clone)?.open(&cfg.bucket, from, downloaded)?
         }
     };
     let img = Emulator::load_image(&bytes).map_err(|e| format!("root snapshot {from}: {e}"))?;
@@ -2933,6 +2960,14 @@ fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usi
             "no snapshot key: pass {\"key\": \"<s3 key>\"} (the main machine defaults to the config's `snapshot`)",
         )));
     };
+    // Enforce the policy before snapshotting RAM or making any S3 request.
+    let policy = match app.cfg.snapshot_policy.as_ref() {
+        Ok(p) => p,
+        Err(e) => return server.respond(key, json(409, "Conflict", err(e))),
+    };
+    if let Err(e) = policy.check_save(&save_key) {
+        return server.respond(key, json(409, "Conflict", err(&e)));
+    }
     let level = v
         .get("level")
         .and_then(|l| l.as_u64())
@@ -2948,16 +2983,20 @@ fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usi
     let emu = app.machines[mi].emu.as_ref().expect("emu present (checked above)");
     let t0 = Instant::now();
     let (data, info) = emu.snapshot(&identity, level);
+    let sealed = match policy.seal(&app.cfg.bucket, &save_key, &data) {
+        Ok(bytes) => bytes,
+        Err(e) => return server.respond(key, json(500, "Error", err(&e))),
+    };
     let snap_ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "[risc-box] snapshot of {}: {} bytes in {:.0}ms ({}/{} RAM pages kept, {} disk blocks changed); uploading to s3://{}/{save_key}",
         app.machines[mi].id, data.len(), snap_ms, info.ram_pages_kept, info.ram_pages_total, info.delta_blocks, app.cfg.bucket
     );
     let t1 = Instant::now();
-    match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &data) {
+    match s3::put_object(&ep, &app.cfg.bucket, &save_key, app.live_creds.as_ref(), &sealed) {
         Ok(()) => {
             let upload_ms = t1.elapsed().as_secs_f64() * 1000.0;
-            let bytes = data.len();
+            let bytes = sealed.len();
             eprintln!("[risc-box] snapshot uploaded in {upload_ms:.0}ms");
             // A snapshot written to the config's root key IS the new root:
             // cache it for the next start, and retire the stale inflated
@@ -2974,7 +3013,7 @@ fn snapshot(app: &mut App, server: &mut Server, key: usize, body: &[u8], mi: usi
             server.respond(
                 key,
                 json(200, "OK", format!(
-                    "{{\"ok\":true,\"key\":\"{}\",\"bytes\":{},\"ramPagesKept\":{},\"ramPagesTotal\":{},\"deltaBlocks\":{},\"snapshotMs\":{:.0},\"uploadMs\":{:.0}}}",
+                    "{{\"ok\":true,\"encrypted\":true,\"key\":\"{}\",\"bytes\":{},\"ramPagesKept\":{},\"ramPagesTotal\":{},\"deltaBlocks\":{},\"snapshotMs\":{:.0},\"uploadMs\":{:.0}}}",
                     httpd::json_escape(&save_key), bytes, info.ram_pages_kept, info.ram_pages_total,
                     info.delta_blocks, snap_ms, upload_ms
                 )),
@@ -3035,7 +3074,9 @@ fn save(app: &mut App, server: &mut Server, key: usize) {
 /// Perform a queued /start of the MAIN machine: fetch (or reuse cached)
 /// images and boot — or, when a matching snapshot is cached, resume.
 fn do_start(app: &mut App, server: &mut Server, start: Start) {
-    let need_fetch = start.reset || app.cache.is_none();
+    let need_fetch = start.reset || app.cache.is_none()
+        || (start.snapshot.unwrap_or(true) && app.cfg.snapshot.is_some()
+            && app.cache.as_ref().is_some_and(|c| c.snap_stored.is_none()));
     if need_fetch {
         // creds precedence: request body > config; borrow-safe clone of config creds
         let body = start.creds;
@@ -3067,7 +3108,7 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
             last_pump = Instant::now();
         };
         // stash which creds we used so /save can reuse them
-        match fetch_images(&app.cfg, chosen, &mut pump) {
+        match fetch_images(&app.cfg, chosen, start.snapshot.unwrap_or(true), &mut pump) {
             Ok(imgs) => {
                 app.live_creds = match &body {
                     Some(c) => Some(clone_creds(c)),
@@ -3126,7 +3167,8 @@ fn do_start(app: &mut App, server: &mut Server, start: Start) {
     let want_snapshot = start.snapshot.unwrap_or(true);
     let booted = match boot(app, want_snapshot) {
         Ok(b) => b,
-        Err(e) if want_snapshot => {
+        Err(e) if want_snapshot && app.cfg.snapshot.as_ref().is_some_and(|key|
+            app.cfg.snapshot_policy.as_ref().is_ok_and(|p| p.is_public(key))) => {
             // A snapshot that failed mid-restore is retired so the machine
             // still comes up, cold, from the base images.
             eprintln!("[risc-box] {e}; dropping the snapshot and booting cold");
@@ -3947,6 +3989,52 @@ fn loop_sleep(app: &App, ms: u64) {
         if let Some(e) = m.emu.as_ref() {
             e.acquire_devices();
         }
+    }
+}
+
+#[cfg(test)]
+mod private_snapshot_tests {
+    use super::*;
+    use riscv_emu_rust::terminal::DummyTerminal;
+
+    #[test]
+    fn encrypted_snapshot_resumes_cpu_ram_and_disk_delta() {
+        let make = || {
+            let mut e = Emulator::new(Box::new(DummyTerminal::new()));
+            e.setup_ram_bytes(16 << 20);
+            e.get_mut_cpu().get_mut_mmu().init_memory(16 << 20);
+            e.setup_filesystem(vec![0; 8192]);
+            e
+        };
+        let mut original = make();
+        // addi x5,x0,7; addi x5,x5,1. Save between instructions.
+        for (i, byte) in [0x00700293u32, 0x00128293].iter().flat_map(|n| n.to_le_bytes()).enumerate() {
+            original.get_mut_cpu().get_mut_mmu().store_raw(0x80000000 + i as u64, byte);
+        }
+        original.get_mut_cpu().update_pc(0x80000000);
+        original.tick();
+        assert_eq!(original.get_cpu().read_register(5), 7);
+        original.get_mut_cpu().get_mut_mmu().store_raw(0x80002000, 0x5a);
+        let mut delta = riscv_emu_rust::snapshot::Ser::new();
+        riscv_emu_rust::snapshot::encode_delta(&[0], 1, |_, block| block.fill(0x3c), &mut delta);
+        original.get_mut_cpu().get_mut_mmu().restore_section(
+            b"DDLT", &delta.buf, &mut riscv_emu_rust::snapshot::RestoreStats::default(),
+        ).unwrap();
+        let (plain, _) = original.snapshot("pinned-kernel-and-base-image", 1);
+        let c = snapshot_crypto::Cipher::new([42; 32], "risc-box", "alice", "deployment");
+        let sealed = c.seal_bytes("bucket", "private/session", &plain).unwrap();
+        assert!(!sealed.starts_with(b"RBXSNAP"));
+        let opened = c.open_bytes("bucket", "private/session", &sealed).unwrap();
+        let mut resumed = make();
+        resumed.restore(&opened, "pinned-kernel-and-base-image").unwrap();
+        assert_eq!(resumed.get_cpu().read_pc(), original.get_cpu().read_pc());
+        assert_eq!(resumed.get_mut_cpu().get_mut_mmu().load_word_raw(0x80002000), 0x5a);
+        let mut block = [0; 4096];
+        resumed.get_cpu().get_mmu().get_disk().read_block(0, &mut block);
+        assert_eq!(block, [0x3c; 4096]);
+        resumed.tick();
+        assert_eq!(resumed.get_cpu().read_register(5), 8, "continues execution, not cold boot");
+        assert!(make().restore(&opened, "wrong-image").is_err());
     }
 }
 
