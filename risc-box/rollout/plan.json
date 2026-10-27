@@ -1,0 +1,308 @@
+{
+  "schema": "sia-app-owned-rollout/v1",
+  "title": "Private VM snapshots",
+  "createdAt": "2026-10-27T16:48:49.151Z",
+  "sourceCommit": "6bdd93d794c077b0d8ea6aaea2b799de57057f29",
+  "chainId": 8453,
+  "wallet": "0x0b2d009c0c9af05b12100d77f3c815fea822ee61",
+  "status": "ready",
+  "contracts": {
+    "deployments": "0xB1783B61E1FDee6a6163DC3CdaC27bF32E7d117B",
+    "appCatalog": "0x18419CA2b502D423A8de6269AEeE171a378626e3"
+  },
+  "gates": [
+    {
+      "id": "risc-validation",
+      "title": "Private snapshot tests passed",
+      "status": "verified",
+      "detail": "11 crypto/migration tests and all 79 RISC Box tests passed. The continuation test resumes the saved instruction, RAM and disk overlay after authenticated encryption. Wrong-owner, corruption and truncation controls passed. Production artifact qualification remains separate."
+    },
+    {
+      "id": "native-runtime",
+      "title": "Qualify native guest-managed checkpoints",
+      "status": "blocked",
+      "detail": "Host-managed hibernation is blocked, but Linux guest-managed checkpointing remains a candidate on the existing isolation platform. Capture/restore, TPM mapping, fresh attestation and lifecycle recovery still need implementation and testing."
+    },
+    {
+      "id": "release",
+      "title": "Prepare verified artifacts and private configuration",
+      "status": "blocked",
+      "detail": "Private key provisioning and legacy snapshot migration are required before changing the existing deployment. Its version 0.6.69 selection and inactive state remain unchanged. Publication alone does not migrate or activate it."
+    },
+    {
+      "id": "risc-artifact",
+      "title": "RISC production artifact qualified",
+      "status": "verified",
+      "detail": "90 Rust tests; seven HTTP/S3 checks on both WASI and the retained SET runtime; main-thread and SET-worker codegen selftests. Memory64, 149 AOT regions and JIT remain enabled. Current fleet equivalence and live migration are separate gates."
+    }
+  ],
+  "apps": [
+    {
+      "slug": "risc-box",
+      "intent": "Publish \u2192 encrypt snapshots \u2192 update",
+      "detail": "Production artifact and ordinary WASI both passed HTTP/S3 checks. Main-thread and SET-worker generated-code tests passed. Existing version 0.6.69 deployment is inactive and will not be changed by the two prepared actions.",
+      "gates": [
+        "risc-validation",
+        "release"
+      ],
+      "status": "ready",
+      "catalogAppIds": [
+        "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094"
+      ],
+      "deploymentIds": [
+        "0xe64f7cba307e2d97485bde356d75564ccb74c5e31c272b5ab3349abfe122569b"
+      ],
+      "candidateVersion": "0.6.70",
+      "artifact": {
+        "file": "artifacts/risc-box-0.6.70.wasm",
+        "sha256": "43adfb522f3de592d04129457ea7f729c5a592cf295824bf817be55458b840d6",
+        "bytes": 22648456,
+        "cid": "bafybeiabohu27xff6az2u54w2t6zcmsudoqfrm6tbwo6d6njnepl57tt34"
+      }
+    },
+    {
+      "slug": "kvm-box-native",
+      "intent": "Implement and qualify native resume",
+      "detail": "No native snapshot endpoint is enabled yet. A guest-managed Linux checkpoint may preserve the current isolation platform; TPM mapping and lifecycle recovery require changes.",
+      "gates": [
+        "native-runtime",
+        "release"
+      ],
+      "status": "blocked",
+      "catalogAppIds": [
+        "0xcdc1fa941d248411e49f922e0bc7adfe8cc343712ca4fe4dfb24fab3ef6c70ce"
+      ],
+      "deploymentIds": [
+        "0x9a28642bed115105c07bea1131c56c83ae2843ce4daf07958ab36437c0528a6b"
+      ],
+      "candidateVersion": null,
+      "artifact": null
+    }
+  ],
+  "actions": [
+    {
+      "id": "risc-upload-070",
+      "kind": "upload",
+      "slug": "risc-box",
+      "title": "Upload the verified RISC Box artifact",
+      "description": "Authorize the upload of exactly the tested 22,648,456-byte component. The local page verifies its CID and downloaded CAR before enabling publication. This does not change a deployment.",
+      "status": "ready",
+      "gates": [
+        "risc-artifact"
+      ],
+      "artifact": {
+        "file": "artifacts/risc-box-0.6.70.wasm",
+        "sha256": "43adfb522f3de592d04129457ea7f729c5a592cf295824bf817be55458b840d6",
+        "bytes": 22648456,
+        "cid": "bafybeiabohu27xff6az2u54w2t6zcmsudoqfrm6tbwo6d6njnepl57tt34"
+      }
+    },
+    {
+      "id": "risc-publish-070",
+      "kind": "publish",
+      "slug": "risc-box",
+      "title": "Publish RISC Box 0.6.70",
+      "description": "Publish private snapshot support with the existing resource limits and zero publisher fee. Fresh deployments cold-boot from their OS images until a public template is explicitly pinned or private snapshot configuration is provided. Existing deployments stay on their selected version. This does not migrate, restart or activate the current deployment.",
+      "status": "ready",
+      "gates": [
+        "risc-artifact"
+      ],
+      "dependsOn": [
+        "risc-upload-070"
+      ],
+      "release": {
+        "name": "RISC Box",
+        "description": "RISC-V Linux with resumable CPU, RAM and disk snapshots. Private snapshots are encrypted in the app before standard S3 storage and authenticated before restore. Configure a separate snapshot key and trusted owner/deployment identity. Memory64, shared threads, AOT and JIT are preserved. Public boot templates require explicit SHA-256 pins; the default starts from the OS images.",
+        "version": "0.6.70",
+        "cid": "bafybeiabohu27xff6az2u54w2t6zcmsudoqfrm6tbwo6d6njnepl57tt34",
+        "resources": [
+          0,
+          0,
+          12288,
+          250
+        ],
+        "ports": "http:8000,tcp:2222,tcp:47984,tcp:47989,tcp:48010,udp:47998,udp:47999,udp:48000",
+        "config": "{\"api_key\":\"$RISCBOX_API_KEY\",\"autostart\":true,\"bucket\":\"machines\",\"credentials\":{\"accessKeyId\":\"$S3_ACCESS_KEY_ID\",\"secretAccessKey\":\"$S3_SECRET_ACCESS_KEY\"},\"display\":{\"height\":600,\"width\":960},\"endpoint\":\"$S3_ENDPOINT\",\"fs\":\"alpine/rootfs-badwolf-20261002.ext2.gz\",\"kernel\":\"alpine/fw_payload-gpu.elf\",\"mem64\":true,\"net\":{\"forwards\":[{\"listen\":2222,\"to\":22}]},\"ramMiB\":1792,\"realtime\":true,\"region\":\"auto\",\"restoreExec\":\"date -s @{epoch} >/dev/null; printf '%s' '{entropy}' > /dev/urandom\",\"saveKey\":\"alpine/rootfs-badwolf-20261002.saved.ext2.gz\",\"set\":true,\"snapshotSaveKey\":\"private/session.snap\",\"title\":\"Alpine desktop\",\"wasi\":\"0.2\",\"egress\":\"public-web\",\"_media\":{\"thumbnail\":\"bafkreidcn43juu5xeizjsrbexb3zwnkmgyfcv4g5ooncvenwzk2khbpkjy\",\"thumbnailSvg\":true,\"banner\":\"bafkreib2ciaxlw7ale33jgqutzwylvny3qisdbdhqoowwyhwgiciilzhja\",\"bannerSvg\":true},\"snapshotEncryption\":{\"masterKey\":\"$RISCBOX_SNAPSHOT_KEY\",\"owner\":\"$RISCBOX_SNAPSHOT_OWNER\",\"deployment\":\"$RISCBOX_SNAPSHOT_DEPLOYMENT\"}}",
+        "feePerSec6": "0"
+      },
+      "gasCap": "1437418",
+      "maxFeePerGas": "11000000",
+      "maxPriorityFeePerGas": "1000000",
+      "preconditions": [
+        {
+          "contract": "appCatalog",
+          "fn": "getApp",
+          "args": [
+            "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094"
+          ],
+          "fields": {
+            "publisher": "0x0b2d009c0c9Af05b12100D77F3c815fea822eE61",
+            "slug": "risc-box",
+            "versionCount": 70,
+            "active": true
+          }
+        },
+        {
+          "contract": "appCatalog",
+          "fn": "getVersion",
+          "args": [
+            "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094",
+            69
+          ],
+          "fields": {
+            "cid": "bafybeigd2hqji26ibfyal2uqwam5vkati4g57jj7mwdk5nbxdizuj6ci6q",
+            "version": "0.6.69",
+            "config": "{\"api_key\":\"$RISCBOX_API_KEY\",\"autostart\":true,\"bucket\":\"machines\",\"credentials\":{\"accessKeyId\":\"$S3_ACCESS_KEY_ID\",\"secretAccessKey\":\"$S3_SECRET_ACCESS_KEY\"},\"display\":{\"height\":600,\"width\":960},\"endpoint\":\"$S3_ENDPOINT\",\"fs\":\"alpine/rootfs-badwolf-20261002.ext2.gz\",\"kernel\":\"alpine/fw_payload-gpu.elf\",\"mem64\":true,\"net\":{\"forwards\":[{\"listen\":2222,\"to\":22}]},\"ramMiB\":1792,\"realtime\":true,\"region\":\"auto\",\"restoreExec\":\"date -s @{epoch} >/dev/null; printf '%s' '{entropy}' > /dev/urandom\",\"saveKey\":\"alpine/rootfs-badwolf-20261002.saved.ext2.gz\",\"set\":true,\"snapshot\":\"alpine/desktop-badwolf-1792-20261002.snap\",\"snapshotSaveKey\":\"alpine/risc-box-badwolf-user-saved.snap\",\"title\":\"Alpine desktop\",\"wasi\":\"0.2\",\"egress\":\"public-web\",\"_media\":{\"thumbnail\":\"bafkreidcn43juu5xeizjsrbexb3zwnkmgyfcv4g5ooncvenwzk2khbpkjy\",\"thumbnailSvg\":true,\"banner\":\"bafkreib2ciaxlw7ale33jgqutzwylvny3qisdbdhqoowwyhwgiciilzhja\",\"bannerSvg\":true}}"
+          }
+        },
+        {
+          "contract": "appCatalog",
+          "fn": "versionFee",
+          "args": [
+            "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094",
+            69
+          ],
+          "expected": "0"
+        }
+      ],
+      "postconditions": [
+        {
+          "contract": "appCatalog",
+          "fn": "getApp",
+          "args": [
+            "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094"
+          ],
+          "fields": {
+            "publisher": "0x0b2d009c0c9Af05b12100D77F3c815fea822eE61",
+            "versionCount": 71,
+            "active": true,
+            "name": "RISC Box",
+            "description": "RISC-V Linux with resumable CPU, RAM and disk snapshots. Private snapshots are encrypted in the app before standard S3 storage and authenticated before restore. Configure a separate snapshot key and trusted owner/deployment identity. Memory64, shared threads, AOT and JIT are preserved. Public boot templates require explicit SHA-256 pins; the default starts from the OS images."
+          }
+        },
+        {
+          "contract": "appCatalog",
+          "fn": "getVersion",
+          "args": [
+            "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094",
+            70
+          ],
+          "fields": {
+            "cid": "bafybeiabohu27xff6az2u54w2t6zcmsudoqfrm6tbwo6d6njnepl57tt34",
+            "version": "0.6.70",
+            "config": "{\"api_key\":\"$RISCBOX_API_KEY\",\"autostart\":true,\"bucket\":\"machines\",\"credentials\":{\"accessKeyId\":\"$S3_ACCESS_KEY_ID\",\"secretAccessKey\":\"$S3_SECRET_ACCESS_KEY\"},\"display\":{\"height\":600,\"width\":960},\"endpoint\":\"$S3_ENDPOINT\",\"fs\":\"alpine/rootfs-badwolf-20261002.ext2.gz\",\"kernel\":\"alpine/fw_payload-gpu.elf\",\"mem64\":true,\"net\":{\"forwards\":[{\"listen\":2222,\"to\":22}]},\"ramMiB\":1792,\"realtime\":true,\"region\":\"auto\",\"restoreExec\":\"date -s @{epoch} >/dev/null; printf '%s' '{entropy}' > /dev/urandom\",\"saveKey\":\"alpine/rootfs-badwolf-20261002.saved.ext2.gz\",\"set\":true,\"snapshotSaveKey\":\"private/session.snap\",\"title\":\"Alpine desktop\",\"wasi\":\"0.2\",\"egress\":\"public-web\",\"_media\":{\"thumbnail\":\"bafkreidcn43juu5xeizjsrbexb3zwnkmgyfcv4g5ooncvenwzk2khbpkjy\",\"thumbnailSvg\":true,\"banner\":\"bafkreib2ciaxlw7ale33jgqutzwylvny3qisdbdhqoowwyhwgiciilzhja\",\"bannerSvg\":true},\"snapshotEncryption\":{\"masterKey\":\"$RISCBOX_SNAPSHOT_KEY\",\"owner\":\"$RISCBOX_SNAPSHOT_OWNER\",\"deployment\":\"$RISCBOX_SNAPSHOT_DEPLOYMENT\"}}",
+            "ports": "http:8000,tcp:2222,tcp:47984,tcp:47989,tcp:48010,udp:47998,udp:47999,udp:48000",
+            "vramMb": 0,
+            "gpuGflops": 0,
+            "memMb": 12288,
+            "cpuGflops": 250,
+            "yanked": false
+          }
+        },
+        {
+          "contract": "appCatalog",
+          "fn": "versionFee",
+          "args": [
+            "0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094",
+            70
+          ],
+          "expected": "0"
+        }
+      ]
+    },
+    {
+      "id": "risc-private-update-070",
+      "kind": "snapshot-update",
+      "slug": "risc-box",
+      "title": "Update RISC Box with verified private snapshots",
+      "description": "After publication, key read-back and migration verification, review an atomic version/config update. The encrypted boot and saved snapshots replace their old references. The existing inactive deployment stays inactive; originals are retained. Exact object paths and calldata are shown after migration.",
+      "status": "ready",
+      "gates": [
+        "risc-artifact"
+      ],
+      "dependsOn": [
+        "risc-publish-070"
+      ]
+    }
+  ],
+  "evidence": [
+    {
+      "file": "evidence/private-snapshot-tests.json",
+      "sha256": "45d9c73d3e62393bb78af4b011b181922c17d1ca57979dea72952f3506f629e5",
+      "label": "90 passing tests and resource receipts"
+    },
+    {
+      "file": "evidence/native-snapshot-platform.json",
+      "sha256": "046f5d491b188a4b74ea67904f65c89e57fe4bac409ef4504034c7b6e8a66e4b",
+      "label": "Confirmed native platform limitation"
+    },
+    {
+      "file": "evidence/private-snapshot-http.json",
+      "sha256": "84ffdc2ed92dbe0ab9aa7ea7a2dc744170b8439dda210053258a20ac79209959",
+      "label": "Seven passing HTTP/S3 integration checks"
+    },
+    {
+      "file": "evidence/risc-set64-http.json",
+      "sha256": "4c2e96801f6a63d6f4d59da0cccb8af5d9cbf6d1e2d6811fdba8976fc57d1627",
+      "label": "risc-set64-http.json"
+    },
+    {
+      "file": "evidence/risc-set64-package.json",
+      "sha256": "922674825df5b53be9c89cbb08f0c88ceab2acf654b621d7dac871cf39322b97",
+      "label": "risc-set64-package.json"
+    },
+    {
+      "file": "evidence/risc-qualified-build.json",
+      "sha256": "02e049e4115023d4068a0b5ed6eafe66e176fc814c3268b1d0497b75bdf58798",
+      "label": "risc-qualified-build.json"
+    }
+  ],
+  "phases": [
+    {
+      "title": "Scope",
+      "detail": "Private snapshots only; standard S3 retained."
+    },
+    {
+      "title": "RISC implementation",
+      "detail": "Implemented and tested."
+    },
+    {
+      "title": "Verification",
+      "detail": "90 tests and app integration passed on both runtime profiles; SET codegen passed."
+    },
+    {
+      "title": "Native runtime",
+      "detail": "Guest-managed checkpoint path under qualification."
+    },
+    {
+      "title": "Publish / update",
+      "detail": "RISC upload/publication prepared; deployment update still gated."
+    }
+  ],
+  "notes": [
+    "Catalog references are on-chain deployment selections, not proof of what a runner currently executes.",
+    "The selected RISC production deployment belongs to the expected wallet and was inactive at block 53168233. The older compromised test-wallet deployment is excluded.",
+    "The published default cold-boots from OS images; it does not classify any legacy snapshot as public. Private saves require the snapshot key plus trusted owner/deployment identity.",
+    "The publication fee cap is 1437418 gas at 11000000 wei/gas, plus the separately checked L1 fee. The wallet currently has 12439002046534 wei; this is below the reviewed maximum. Publication remains refused until its live balance covers the cap.",
+    "The current RISC deployment is not CPU-TEE isolated. Snapshot object encryption protects storage contents; it does not establish protection from the app host or a relay-readable secret store.",
+    "The deployment-update request is derived only from verified migration receipts and preserves the inactive state. Activation and live runner health remain separate."
+  ],
+  "scopeNote": "Upload/publication and owner-signed key provisioning are prepared. Encrypted migration must verify before the deployment update can be signed. Native capture/restore remains under qualification.",
+  "updatedAt": "2026-10-27T19:04:16.230453+00:00",
+  "codeHashes": {
+    "0xab214342d5a490150a4a977063a2f88e21f80907": "0xe4f570e99f2ac708b35539fe5906889d8cb99189e6c9075f5e46d3b6921ac152",
+    "0x18419ca2b502d423a8de6269aeee171a378626e3": "0x3f3c4cc028abd3e117465362e196243cafaaffa7508dc6297d78a6b709dcc79f",
+    "0xb1783b61e1fdee6a6163dc3cdac27bf32e7d117b": "0x71d50076336283e774ba2ef8d5cbf7602e9cdc5dd918a7e7390c743367766682"
+  },
+  "queueTitle": "RISC rollout prepared; wallet steps pending",
+  "privateSnapshot": {
+    "deploymentId": "0xe64f7cba307e2d97485bde356d75564ccb74c5e31c272b5ab3349abfe122569b",
+    "baseline": {
+      "owner": "0x0b2d009c0c9Af05b12100D77F3c815fea822eE61",
+      "appRef": "catalog://0xa856a26bd6ab39807baa0b6d9a54eaa7b29eeda18be71cd6b75e4d1b65922094/69",
+      "configCid": "{\"network\":{\"relay\":\"us-west\"},\"isolation\":{\"cpuTee\":false,\"gpuTee\":false},\"placement\":{\"hostId\":\"0x2fcef48d6ad6919a6264074592b13855968b9f7be52c463764609a68af41447a\"},\"config\":{\"api_key\":\"$RISCBOX_API_KEY\",\"autostart\":true,\"bucket\":\"machines\",\"credentials\":{\"accessKeyId\":\"$S3_ACCESS_KEY_ID\",\"secretAccessKey\":\"$S3_SECRET_ACCESS_KEY\"},\"display\":{\"height\":600,\"width\":960},\"endpoint\":\"$S3_ENDPOINT\",\"fs\":\"alpine/rootfs-firefox-tuned-20261023.ext2.gz\",\"kernel\":\"alpine/fw_payload-gpu.elf\",\"mem64\":true,\"net\":{\"forwards\":[{\"listen\":2222,\"to\":22}]},\"ramMiB\":1792,\"realtime\":true,\"region\":\"auto\",\"restoreExec\":\"date -s @{epoch} >/dev/null; printf '%s' '{entropy}' > /dev/urandom\",\"saveKey\":\"alpine/rootfs-firefox-tuned-20261023.saved.ext2.gz\",\"set\":true,\"snapshot\":\"alpine/desktop-firefox-tuned-20261023.snap\",\"snapshotSaveKey\":\"alpine/risc-box-badwolf-user-saved.snap\",\"title\":\"Alpine desktop\",\"wasi\":\"0.2\",\"egress\":\"public-web\"}}",
+      "active": false
+    },
+    "scope": "Existing owner-signed relay secret channel; storage privacy only. No app-host isolation guarantee."
+  }
+}

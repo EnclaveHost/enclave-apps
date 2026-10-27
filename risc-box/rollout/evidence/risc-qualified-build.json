@@ -1,0 +1,43 @@
+{
+  "schema": "risc-private-snapshot-build/1",
+  "implementationCommit": "158e91d139f8b0159fd6200abf6c6d1700f6eac2",
+  "reviewBranch": "feat/private-snapshots-review",
+  "image": "sha256:66fd96a50d715536cab2e7e091c53d0e35638257bc8f4093acd579a1c4f4eedc",
+  "rustc": "1.99.0-nightly (84b36a78a 2026-08-06)",
+  "toolchainAlias": "nightly-2026-08-07",
+  "features": [
+    "set",
+    "aot",
+    "codegen"
+  ],
+  "artifact": {
+    "sha256": "43adfb522f3de592d04129457ea7f729c5a592cf295824bf817be55458b840d6",
+    "bytes": 22648456
+  },
+  "qualification": {
+    "cryptoTests": 11,
+    "riscTests": 79,
+    "wasiHttpChecks": 7,
+    "setHttpChecks": 7,
+    "setCodegenSelftest": [
+      "main",
+      "SET worker"
+    ],
+    "setRuntimeSha256": "9caac5e682396f9dd275b1599843d80568bd7067e4abd3136cfa798800b905b9",
+    "setRuntimeVersion": "49.0.0 (0701eed1a 2026-10-02)",
+    "currentFleetEquivalent": false,
+    "nativeCheckpointQualified": false
+  },
+  "tools": {
+    "build-runtime.sh": "1207cf09457b1dacbd1005633d9ef853afc15c83dc5a3a0c5e581737790a8d86",
+    "build.sh": "33f441aed566f8fb1debca9a7ad63d57835f73bb089283d032acdfcfa5cfdfaa",
+    "link-app.sh": "22166d18e62102243529bba2cc02be987cd6d0fb8cd4a7226c960ceeb98c1003",
+    "proxy-app.sh": "53494f1df0c4e0fc290124989a706aed303b421fed9c7accbb835f43c47a123b",
+    "libclang_rt.builtins-wasm64.a": "8653b474b970206f4838ae1b2859752a4444d7e869db9478e0d951805aab2396",
+    "wasm-tools-set": "82488ce2dd84f1d2c331ace2608d155ed00402d977e4fe54bcb303eb95bcaf23",
+    "wac-set": "cb607dab1d998aba120a55e9f566c248d8f6df980daff11dd26aa230fd46152a",
+    "set-componentize": "af3922a0e9efe9fc380a49ead9e45551637074eb1aae66decd4629d6d60070f3",
+    "codegen-componentize": "a071bb32d9fd5dd89154366fb21ebce9ca94dfbbedddf82e7debe5ddaa739ce6",
+    "wasip2_component_type.o": "86f9012410e26b18c2685d7e396608cf575a47bec9870bdfcecdc6fcd5e672be"
+  }
+}

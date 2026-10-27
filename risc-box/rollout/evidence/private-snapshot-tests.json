@@ -1,0 +1,36 @@
+{
+  "schema": "private-snapshot-validation/1",
+  "sourceCommit": "158e91d139f8b0159fd6200abf6c6d1700f6eac2",
+  "crypto": {
+    "passed": 11,
+    "failed": 0,
+    "ignored": 0,
+    "receipt": {
+      "unit": "enclave-snapshot-crypto-once-20261027",
+      "exit": 0,
+      "seconds": 7.038900852203369,
+      "guardStop": null,
+      "targetBytes": 54601987,
+      "peakTargetBytes": 54601987,
+      "minRootFreeBytes": 60843020288
+    },
+    "guard": "[memory-guard] exit=0 peakTreeRssMiB=278 minHostAvailableMiB=92711"
+  },
+  "risc": {
+    "passed": 79,
+    "failed": 0,
+    "ignored": 0,
+    "filtered": 0,
+    "receipt": {
+      "unit": "enclave-snapshot-risc-full-20261027",
+      "exit": 0,
+      "seconds": 8.754695415496826,
+      "guardStop": null,
+      "targetBytes": 381663892,
+      "peakTargetBytes": 381663892,
+      "minRootFreeBytes": 60504150016
+    },
+    "guard": "[memory-guard] exit=0 peakTreeRssMiB=153 minHostAvailableMiB=92234"
+  },
+  "scope": "Host tests of snapshot envelope and RISC emulator continuation; not native VM restore or production deployment."
+}
