@@ -58,8 +58,8 @@
     },
     {
       "path": ".mozilla/firefox/kvm-box/chrome/userContent.css",
-      "bytes": 829,
-      "sha256": "889b2c24be607227b9737381df8b01932a130cd2bc02730a65c81c06ecbf595a",
+      "bytes": 521,
+      "sha256": "266b3596dedb2d7456cc3f657b776317fcfb8c13db83809adb7f9fa9c2f69429",
       "mode": 420
     },
     {
