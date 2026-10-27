@@ -89,3 +89,19 @@ Required implementation and acceptance work:
 Until these pass, native full snapshot capability remains unsupported. The
 live native desktop and its cursor/game/home customizations must be preserved.
 Do not reboot it to test a speculative checkpoint path.
+
+## Disposable availability result (2026-10-27)
+
+The non-debug IGVM `0a8fe8682750fd8827cb03164852944a4c23b94764579a6d02292817811f9c71`
+booted a synthetic, diskless 2 GiB/one-vCPU guest. `/dev/snapshot` opened and
+closed successfully without freeze/restore ioctls. `/sys/power/state` included
+`disk`; the VMBus hibernation attribute remained `0`. The missing lockdown
+sysfs file is not proof of a security property. Exact diagnostic VM and task
+absence, unchanged preexisting VM states and unchanged master VMGS hash were
+verified after cleanup.
+
+The subsequent capture/read/discard candidate built deterministically as
+`abe26d3cd1740d4b47f1445beb6f81ddf61505d13841e32d9debb5a8d81eab38`.
+It has not been launched. Further native operations are held while the
+coordinating storage recovery work takes priority. This is a scheduling hold,
+not evidence that guest-managed capture is unsupported.

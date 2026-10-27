@@ -1,5 +1,6 @@
 import {createPublicClient,http,decodeFunctionData,encodeFunctionData,stringToHex,parseAbi,keccak256,serializeTransaction,decodeFunctionResult} from './vendor/viem.mjs';
 import fs from 'node:fs';
+import {Refusal} from './core.mjs';
 export const CHAIN=8453;
 export const OWNER='0x0b2d009c0c9af05b12100d77f3c815fea822ee61';
 export const BOOK='0xab214342d5A490150A4A977063A2f88E21F80907';
@@ -102,7 +103,8 @@ export async function prepareTransaction(plan,a){
   a.postconditions.forEach((q,i)=>{const p=conditionCall(plan,q);checkCondition(decodeFunctionResult({abi:p.abi,functionName:p.functionName,data:results[i+1].returnData}),q);});
   const raw=serializeTransaction({type:'eip1559',chainId:CHAIN,nonce,to:tx.to,data:tx.data,value:0n,gas,maxFeePerGas:maxFee,maxPriorityFeePerGas:tip});
   const l1=await c.readContract({address:'0x420000000000000000000000000000000000000F',abi:parseAbi(['function getL1Fee(bytes) view returns (uint256)']),functionName:'getL1Fee',args:[raw],blockNumber:block.number});
-  if(await c.getBalance({address:plan.wallet,blockNumber:block.number})<gas*maxFee+l1)throw Error('Insufficient ETH for the maximum fee');
+  const balance=await c.getBalance({address:plan.wallet,blockNumber:block.number}),required=gas*maxFee+l1;
+  if(balance<required)throw new Refusal(`Insufficient Base ETH: wallet balance ${balance} wei; this request requires up to ${required} wei including its L1 fee (${required-balance} wei short). No transaction was requested.`);
   eq((await c.getBlock({blockNumber:block.number})).hash,block.hash,'Anchor changed');return nonce;
  }));
  same(views[0],views[1],'RPCs disagree on nonce');if(Date.now()-started>60000)throw Error('Preparation expired');
