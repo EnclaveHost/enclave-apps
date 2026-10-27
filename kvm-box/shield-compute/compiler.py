@@ -14,6 +14,10 @@ import numpy as np
 HALF_FIELD = (251 * 241 * 239) // 2
 I64_MAX = (1 << 63) - 1
 MAX_ELEMENTS = 16 * 1024 * 1024
+# One FIELD_GEMM request remains limited to 64 rows. A graph may use a bounded
+# sequence of these requests, determined solely by its public declared shape.
+MASKED_TILE_ROWS = 64
+MAX_MASKED_ROWS = 4096
 
 
 class CompileError(ValueError):
@@ -134,7 +138,7 @@ def compile_graph(graph, approved_public_constants=()):
                 shape = (a.shape[0], b.shape[1])
                 bound = a.bound * b.bound * a.shape[1]
                 if (b.constant is not None and b.approved_public and b.bound <= 119 and
-                        a.shape[1] % 32 == 0 and a.shape[0] <= 64 and
+                        a.shape[1] % 32 == 0 and a.shape[0] <= MAX_MASKED_ROWS and
                         a.bound <= HALF_FIELD and bound <= HALF_FIELD):
                     place, reason = 'masked-field-gemm', 'approved public int8 weights; static no-wrap bound'
                 else:
@@ -180,7 +184,7 @@ def _execute(plan, inputs, channel=None):
     if channel is not None:
         for n in plan.instructions:
             if n.placement == 'masked-field-gemm':
-                remote[n.name] = channel.register(values[n.args[1]], n.shape[0])
+                remote[n.name] = channel.register(values[n.args[1]], min(n.shape[0], MASKED_TILE_ROWS))
         if remote:
             channel.start()
     for n in plan.instructions:
@@ -188,7 +192,21 @@ def _execute(plan, inputs, channel=None):
             continue
         args = [values[a] for a in n.args]
         if n.name in remote:
-            values[n.name] = channel.matmul(remote[n.name], args[0])
+            # Keep the entire result private until every tile has passed the
+            # existing channel verification. Never fall back after an offload
+            # begins, and wipe staged rows on a later-tile failure.
+            staged = np.empty(n.shape, dtype=np.int64)
+            try:
+                for first in range(0, n.shape[0], MASKED_TILE_ROWS):
+                    last = min(first + MASKED_TILE_ROWS, n.shape[0])
+                    tile = channel.matmul(remote[n.name], args[0][first:last])
+                    if tile.shape != (last-first, n.shape[1]) or tile.dtype != np.dtype('int64'):
+                        raise RuntimeError('invalid verified tile result')
+                    staged[first:last] = tile
+                values[n.name] = staged
+            except BaseException:
+                staged.fill(0)
+                raise
             routes[n.name] = 'masked-field-gemm'
         else:
             if n.op == 'matmul': result = args[0] @ args[1]

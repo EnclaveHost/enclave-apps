@@ -13,6 +13,46 @@ from service import Compute, receive, send, FIXED_ARITHMETIC, NATIVE_ARITHMETIC
 
 
 class ServiceTests(unittest.TestCase):
+    def test_graph_failure_exposes_only_bounded_code_and_remains_retired(self):
+        import numpy as np
+        from channel import ChannelError
+        from compiler import constant_digest
+        w = np.ones((32, 4), dtype=np.int64)
+        self.config['publicConstants'] = [constant_digest(w)]
+        self.config['core'] = '/unused/test-core.so'
+        request = {'op': 'graph', 'mode': 'masked', 'inputs': {'x': [[1]*32]*65},
+                   'graph': {'schema': 'shield-graph/1', 'nodes': [
+                       {'name': 'x', 'op': 'input', 'shape': [65,32], 'bound': 1},
+                       {'name': 'w', 'op': 'constant', 'shape': [32,4], 'value': w.tolist()},
+                       {'name': 'y', 'op': 'matmul', 'args': ['x','w']},
+                   ], 'outputs': ['y']}}
+        before = dict(self.compute.telemetry)
+        with patch('channel.MaskedChannel') as factory:
+            channel = factory.return_value
+            channel.matmul.side_effect = [np.full((64,4),32,dtype=np.int64),
+                ChannelError('private tensor or arbitrary worker text', stage='compute', code=-10)]
+            with self.assertRaisesRegex(ValueError, '^masked computation failed; no result released$'):
+                self.compute.run(request)
+            channel.close.assert_called_once()
+            self.assertEqual(channel.matmul.call_count, 2)
+            with self.assertRaisesRegex(ValueError, 'retired'):
+                self.compute.run(request)
+            factory.assert_called_once()
+        status = self.compute.status()
+        self.assertEqual(status['state'], 'retired')
+        self.assertEqual(status['graphFailure'], {'stage': 'compute', 'code': -10})
+        self.assertEqual(status['telemetry'], before)
+        self.assertEqual(status['completed'], 0)
+        self.assertNotIn('private tensor', json.dumps(status))
+        status['graphFailure']['stage'] = 'changed by caller'
+        self.assertEqual(self.compute.status()['graphFailure']['stage'], 'compute')
+
+    def test_channel_diagnostic_drops_unbounded_or_arbitrary_metadata(self):
+        from channel import ChannelError
+        for code in ('secret', True, 0, -129, 1 << 60, None):
+            error = ChannelError('private', stage='private worker string', code=code)
+            self.assertEqual(error.public_failure(), {'stage': 'unknown', 'code': None})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

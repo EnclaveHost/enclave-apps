@@ -45,6 +45,15 @@ chosen from public contracts, not from the values of private inputs. Inputs
 outside their declared ranges are rejected before any weight upload. Private
 weights, attention products and nonlinear operations never enter the channel.
 
+The graph backend accepts up to 4,096 rows for an eligible matrix product,
+split into at most 64 requests of at most 64 rows on one registered channel.
+All input bounds are checked before registration. Tile geometry depends only
+on the declared shape; each tile uses the existing fresh-mask and verification
+path. The full graph result is withheld until all tiles succeed, and staged
+matrix rows are cleared on a later-tile failure. Service memory, work and
+output limits still apply. This expands the graph backend, not the set of
+OpenGL/Vulkan shaders recognized by the driver.
+
 `channel.py` binds the existing `sh_link_*` API with verification always enabled.
 It independently checks public-weight digests against its trusted caller policy
 before registration, even when invoked without the graph compiler.
@@ -53,6 +62,21 @@ private result scratch, serializes operations, and retires the channel on any
 transport or verification failure. No graph outputs are returned on failure.
 There is no retry using an unprotected GPU. An offline CPU run is explicitly
 selected before execution by omitting the channel.
+
+After a graph channel failure, service status includes `graphFailure` with a
+fixed stage (`initialize`, `register`, `start`, `compute`, or `unknown`) and a
+bounded numeric C error code when available. It never contains arbitrary
+exception messages, worker strings or tensors. This is diagnostic only:
+retirement, output withholding and rejection of subsequent work are unchanged.
+
+The October 27 candidate passed dedicated GPU transport tests for 65, 129 and
+4,096 rows, exact reference outputs, distinct masks for repeated input tiles,
+and corruption in the second and final tile. The production desktop's older
+compiler has not been replaced with this candidate. A live adapter test that
+opened a separate graph connection for each tile retired that older service;
+the matching 63-connection cutoff was reproduced in the Windows bridge, whose
+completed-stream cleanup fix is maintained in the host repository. See the
+deployment evidence before treating candidate tests as live acceptance.
 
 The new Python code is experimental and has not had an independent security
 review. The model's declared ranges and exact integer arithmetic are intentional
