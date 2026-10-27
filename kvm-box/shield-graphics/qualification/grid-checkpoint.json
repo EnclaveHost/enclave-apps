@@ -52,6 +52,22 @@
     "isoPayloadsChecked": 3,
     "metadataMutationControlsRejected": 9,
     "hardwareAdmission": false,
-    "activated": false
+    "activated": false,
+    "staging": {
+      "host": "NucBox",
+      "passed": true,
+      "directory": "C:\\ProgramData\\Enclave\\native-desktop\\releases\\a2272bcd8f7d5db883ae212ee1cb499a8bf100f9cc6f23073e61b68343f185f9",
+      "configSha256": "bf6bdc2a2d0d11d2ce4dd06b80491f7c3c9974ce167e1acd796101d0d0e933e0",
+      "payloadAndConfigFilesVerified": 6,
+      "aclPathsChecked": 9,
+      "productionParserPassed": true,
+      "configMutationControlsRejected": 4,
+      "modelMediaReused": true,
+      "vmStatesAndUptimesPreserved": true,
+      "liveConfigurationUnchanged": true,
+      "finished": "2026-10-27T03:47:15.4274387Z",
+      "hardwareAdmission": false,
+      "activated": false
+    }
   }
 }

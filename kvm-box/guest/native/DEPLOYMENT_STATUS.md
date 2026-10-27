@@ -48,6 +48,17 @@ The host bridge's completed-stream cleanup fix is separately staged and tested
 on Windows; it has not been activated. Deploying the candidate still requires
 hardware admission and coordinated release pins, followed by a fresh app process
 and positive owner acceptance. Preserve the existing retirement until that fresh process.
+
+The SVN18 image, root/hash media, profile, bridge fix and prospective desktop
+configuration are now staged together on NucBox under the new image hash's
+release directory. The unchanged model media was hash-checked and reused.
+Readback verified all six staged payload/config files. The production config
+parser accepted the new configuration and rejected four pin/identity mutations;
+ACL checks found only SYSTEM/Administrators access on the nine staged paths.
+Manager epochs, all app states, VM uptimes and the live runner/config/bridge
+hashes remained unchanged. Staging does not enable hardware admission or select
+the image for the running app.
+
 The current desktop home is ephemeral: restarting loses its Firefox/session
 state. Restart timing is pending the owner's preference.
 
