@@ -33,6 +33,7 @@ path = "src/main.rs"
 # and the S3 client are hand-rolled std (src/httpd.rs, src/s3.rs).
 [dependencies]
 enclave-shield-video = { path = "shield-video", optional = true }
+snapshot-crypto = { path = "../snapshot-crypto" }
 riscv_emu_rust = { path = "emu" }
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["std"] }

@@ -129,6 +129,11 @@ JSON object:
   "net": { "forwards": [ { "listen": 2222, "to": 22 } ] },
   "api_key": "$RISCBOX_API_KEY",
   "snapshot": "images/desktop.snap",
+  "snapshotEncryption": {
+    "masterKey": "$RISCBOX_SNAPSHOT_KEY",
+    "owner": "<stable owner identity>",
+    "deployment": "<deployment id>"
+  },
   "restoreExec": "date -s @{epoch} >/dev/null; echo {entropy} > /dev/urandom"
 }
 ```
@@ -155,7 +160,8 @@ JSON object:
   see *Many machines, one process*.
 - `snapshot` names the object a **snapshot of the booted machine** lives under.
   When it exists, `/start` resumes the machine from it in seconds instead of
-  booting the OS; when it does not exist yet, the boot is a cold one and
+  booting the OS. For the first private session explicitly start with
+  `{"snapshot":false}`; a missing private object is an error, not a cold boot.
   `POST /snapshot` writes it (to `snapshotSaveKey`, default `snapshot`) so every
   start after that is instant. `snapshotLevel` (1-9, default 2) is the deflate
   level. `restoreExec` is a shell command run on the guest console right after a
@@ -451,17 +457,19 @@ the kernel, init, Xorg, the session. None of that work depends on anything but
 the images, so it only has to be done once. `POST /snapshot` serializes the
 **running machine** — CPU registers and CSRs, every device's registers and
 rings, the device tree as the guest saw it, guest RAM, and the disk blocks the
-guest has changed — and PUTs it to the configured `snapshot` key. From then on
+guest has changed — encrypts it in the app, and PUTs it to the configured
+`snapshot` key using ordinary S3. From then on
 every `/start`, including the one after a restart or a redeploy, **resumes** the
 machine from that moment: fetch, inflate, continue. Locally the sample image
 restores in well under a second; on the fleet the cost is the download.
 
 ```sh
-# 1. deploy with "snapshot": "images/desktop.snap" in the config — the object
-#    does not exist yet, so the first start boots cold
+# 1. configure snapshotEncryption (see below) and "snapshot": "images/desktop.snap" — the object
+#    does not exist yet, so explicitly request the initial cold boot:
+curl -s -XPOST -H "x-api-key: $KEY" https://<id8>.app.enclave.host/start -d '{"snapshot":false}'
 # 2. once the machine is where you want it (desktop up, logged in, quiet):
 curl -s -XPOST -H "x-api-key: $KEY" https://<id8>.app.enclave.host/snapshot
-# {"ok":true,"key":"images/desktop.snap","bytes":13924085,"ramPagesKept":7751,
+# {"ok":true,"encrypted":true,"key":"images/desktop.snap","bytes":13924085,"ramPagesKept":7751,
 #  "ramPagesTotal":131072,"deltaBlocks":1,"snapshotMs":320,"uploadMs":1400}
 # 3. every start from now on resumes:
 curl -s -XPOST -H "x-api-key: $KEY" .../stop; curl -s -XPOST -H "x-api-key: $KEY" .../start -d '{}'
@@ -477,11 +485,68 @@ exactly as a cold boot does and lays the delta over it. That is what keeps a
 snapshot small, and it is also why a snapshot is **bound to its images**: it
 records a sha256 of the kernel and fs objects as fetched (plus the RAM size,
 display geometry and clock mode), and a start whose images or settings differ
-ignores the snapshot with a log line and boots cold rather than mount a
-filesystem half from another image. Overwrite the base image, or change
+refuses to resume a private snapshot rather than silently booting a fresh
+session. Explicitly pinned public templates retain the cold-boot fallback
+for incompatible images. Overwrite the base image, or change
 `ramMiB`, and you take a new snapshot. A snapshot is also bound to the
 emulator's own format (`emu/src/snapshot.rs`, `FORMAT`): a newer app that
 changed a device's layout refuses old snapshots the same way.
+
+### Private snapshots and public boot templates
+
+All `POST /snapshot` writes, including instance snapshots, are private and
+encrypted. Set `api_key` and `snapshotEncryption` as shown above. Provision a
+random 32-byte master secret, represented as 64 hexadecimal characters, via
+the existing private deployment-secret channel. Public config references the
+secret by environment name; never put its value in a catalog, URL or browser.
+Keep a recoverable copy: losing it loses access to saved sessions.
+
+The key is scoped to this app, the configured owner and deployment. The current
+API has one authenticated owner per deployment; instance IDs are not separate
+wallet identities. Do not share one deployment/API key between mutually
+untrusted wallet owners. A wallet address is an identity, not a secret. Like
+Jot, anyone holding the deployment master secret can derive the storage keys.
+
+The versioned AES-256-GCM envelope uses independently authenticated 1 MiB
+records and an authenticated end marker. It binds owner/deployment/app,
+bucket/object key, record order and length. The image identity and emulator
+format remain inside the authenticated payload. Changing an object name,
+owner, deployment or key requires decrypting and resealing; changing only the
+S3 endpoint does not. Ordinary S3 tools see opaque bytes. Sia's own encryption
+and the generic S3 adapter are unchanged. This does not provide rollback or
+clone prevention; those require a trusted revision/lease service.
+
+Without a valid key or owner authentication, private snapshot save/load fails.
+Bad authentication, plaintext private objects and incompatible private state
+never silently become a cold boot. An explicit `/start` with
+`{"snapshot":false,"reset":true}` can boot the base images without fetching
+the snapshot; it does not delete or overwrite the saved object.
+
+An intentionally public, sanitized boot template can be read without a secret
+by pinning its exact plaintext SHA-256 in deployment config:
+
+```json
+{"snapshot":"templates/clean.snap",
+ "snapshotSaveKey":"private/session.snap",
+ "publicSnapshots":{"templates/clean.snap":"<64 hex SHA-256>"}}
+```
+
+Public template keys are read-only through `/snapshot`, even when encryption
+is configured. Public template selection does not select the private save as
+the next boot source: set `snapshot` to `private/session.snap` when switching
+to that saved session. Do not classify an old private snapshot as public to
+bypass the new check. Preserve legacy objects and use the offline
+`snapshot-crypto` migration tool to encrypt a trusted downloaded copy under a
+new key before switching the deployment. Verify resume before retiring the old
+copy. Public templates should be built without user credentials or sessions.
+
+Only private snapshot objects change here. Kernel/base filesystem downloads,
+disk-only `/save`, Jot, Depot and the S3 adapter retain their existing behavior.
+Disk-only `/save` is still a plaintext export at the app boundary; use encrypted
+snapshots for private resumable sessions. Encryption adds work only during
+snapshot save/load, not during VM execution. The current RISC upload interface
+buffers ciphertext alongside the serialized snapshot, so allow extra memory
+approximately equal to the compressed snapshot size plus 1 MiB.
 
 What a resumed guest does not know. It believes it is the moment the snapshot
 was taken: its wall clock is stale, and its kernel random pool is the same one
