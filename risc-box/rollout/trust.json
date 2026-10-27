@@ -1,0 +1,5 @@
+{
+  "schema": "sia-rollout-trust/v1",
+  "planSha256": "ba7240e2fa3d31b9d7d3beab149fa6917c51823d63b3d77d1f8783a1f30c9107",
+  "port": 8769
+}

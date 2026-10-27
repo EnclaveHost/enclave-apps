@@ -1,0 +1,16 @@
+{
+  "schema": "native-snapshot-platform-gate/1",
+  "status": "guest-checkpoint-path-unqualified",
+  "sourceCommit": "db3c09ed5752703ff7ee6493c7e6761f719f82f9",
+  "paravisorSha256": "71a91101f8f9b870199946076db2b220c68167e029539d4619a6b7600432124e",
+  "findings": [
+    "openhcl/underhill_core/src/worker.rs:2220-2233 calls isolated-configuration validation on cold initialization.",
+    "worker.rs:4084-4085 explicitly rejects hibernation_enabled for isolated configurations.",
+    "Host-side Save-VM is refused for this VM isolation type.",
+    "Native app lifecycle supports start/stop; it owns no guest CPU/RAM checkpoint primitive.",
+    "No isolation gate was bypassed, no diagnostic VM was started, and the running native desktop was not modified.",
+    "The Linux userspace snapshot path with platform_support=false does not use ACPI S4 callbacks; OpenHCL host-hibernation rejection alone does not prove it impossible.",
+    "Native owner source audit found no blanket gate in that path, but the custom TPM control-page mapping lacks restore callbacks and requires re-registration plus fresh attestation."
+  ],
+  "decision": "Continue qualifying a guest-managed checkpoint on the existing isolation platform. Earlier platform-replacement question was premature."
+}

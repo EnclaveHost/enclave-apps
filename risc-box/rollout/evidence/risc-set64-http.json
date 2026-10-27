@@ -1,0 +1,15 @@
+{
+  "passed": [
+    "codegen main and SET worker execute and revoke generated code",
+    "snapshot endpoint requires owner authentication",
+    "actual S3 PUT contains authenticated envelope",
+    "app fetches and accepts its saved snapshot through the restore path",
+    "tampered S3 object fails closed instead of cold boot",
+    "explicit cold boot remains available after a damaged private snapshot",
+    "missing snapshot key prevents storage upload",
+    "wrong owner cannot restore through the app"
+  ],
+  "count": 8,
+  "artifactSha256": "43adfb522f3de592d04129457ea7f729c5a592cf295824bf817be55458b840d6",
+  "scope": "Synthetic RISC guest with loopback S3 fixture. No production traffic or real credentials. Pinned historical SET runtime network capability is broad (CLI has no address allowlist); fixture URLs are pinned to loopback, DNS/UDP disabled, and child environment has no host credentials."
+}
