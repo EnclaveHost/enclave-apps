@@ -39,10 +39,26 @@ Kernel CONFIG_HIBERNATION / CONFIG_SNAPSHOT_DEV being enabled does not
 establish support at the isolated platform boundary. Do not bypass that
 validation or replay an old attestation/transport lease to claim resume.
 
-A platform redesign is therefore required before the acceptance work below.
-The owner has been asked whether to retain the current platform with native
-snapshots explicitly unsupported or authorize that separate redesign. The
-private RISC snapshot implementation can be completed independently.
+This restriction applies to host-advertised/managed hibernation. It does not
+prove guest-driven Linux checkpointing is impossible. In the pinned kernel,
+`kernel/power/user.c` initializes userspace snapshot `platform_support=false`;
+CREATE_IMAGE / ATOMIC_RESTORE call the Linux snapshot paths without ACPI
+platform callbacks. `hibernation_available()` checks nohibernate, lockdown,
+secretmem and CXL state, not ACPI S4. Hyper-V syscore and VMBus freeze/restore
+callbacks remain active without that S4 condition. This is an **unqualified
+candidate**, not a supported native resume implementation, and may preserve
+the current isolation platform.
+
+The custom `drivers/char/tpm/enclave_openhcl_tpm.c` driver currently registers
+its two DMA32 control pages with OpenHCL only at module initialization. It has
+no PM freeze/restore callbacks. A restored kernel may contain different page
+addresses from a fresh boot, so safe quiescence and mapping re-registration
+must be implemented and tested before fresh attestation can be trusted.
+OpenHCL TPM/custody state outside the Linux guest is not in its checkpoint.
+The ordinary native desktop has neither /dev/snapshot nor CAP_SYS_ADMIN;
+checkpoint access must remain in a narrowly authenticated platform helper.
+Opening /dev/snapshot itself invokes PM prepare notifiers and acquires global
+hibernation state; even an open-only probe belongs in a disposable guest.
 
 Required implementation and acceptance work:
 
