@@ -8,7 +8,7 @@ export async function startMoonlight({verified,authorization,address='127.0.0.2'
  async function tunnel(transport,port) {
   const target=await verified('desktop');
   return new Promise((resolve,reject)=>{
-   const req=https.request({hostname:'127.0.0.1',port:target.port,path:`/api/moonlight/tunnel?transport=${transport}&port=${port}`,headers:{host:'kvm-box',authorization,connection:'Upgrade',upgrade:'kvm-box-tunnel'},agent:target.agent});
+   const req=https.request({hostname:'127.0.0.1',port:target.port,path:`${target.pathPrefix||''}/api/moonlight/tunnel?transport=${transport}&port=${port}`,headers:{host:target.hostname||'kvm-box',authorization,connection:'Upgrade',upgrade:'kvm-box-tunnel'},agent:target.agent});
    const timer=setTimeout(()=>req.destroy(Error('Tunnel timeout')),10000);
    req.once('upgrade',(res,sock,head)=>{clearTimeout(timer);if(head.length)sock.unshift(head);resolve(sock)});
    req.once('response',res=>{clearTimeout(timer);res.resume();reject(Error('Tunnel refused: '+res.statusCode))});
