@@ -209,7 +209,7 @@ No production approval policy is changed by these fixtures. There is no measured
 speedup claim: small synchronous masked requests have overhead, and general
 floating-point rendering stays on the CPU.
 
-## Multi-workgroup extension (host qualification)
+## Multi-workgroup extension
 
 Compile the ordinary `prepass.cpp` and `prepass-gl.cpp` fixtures with
 `-DSHIELD_TEST_GROUPS=N` for N=1,2,64,65. Use separate output directories
@@ -236,5 +236,7 @@ local to the client. The independently computed C++ oracle checks every row.
 
 Offline `test-grid-nir.py` compares conditional workgroup bounds and extracted
 transforms; these results alone do not establish runtime eligibility. The separate native image and lifecycle tests now pass, as recorded in
-`grid-checkpoint.json`. Production VBS admission and owner acceptance remain
-necessary before deploying this extension.
+`grid-checkpoint.json`. A separate SVN18 platform package also passed independent
+signature and export-integrity checks. Production VBS admission and owner
+acceptance remain necessary before deploying this extension; the signed release
+pins are recorded in `../../guest/native/DEPLOYMENT_STATUS.md`.

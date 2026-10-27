@@ -34,5 +34,24 @@
     "desktopSurvivesRetirement": true,
     "productionAdmission": false,
     "moonlightStreaming": false
+  },
+  "release": {
+    "signed": true,
+    "guestSvn": 18,
+    "signedImageSha256": "a2272bcd8f7d5db883ae212ee1cb499a8bf100f9cc6f23073e61b68343f185f9",
+    "profileSha256": "dffd7d80cd0dd1ff929dd3b4f79d4dc58ff81570b52eec2aab740d04e8ee3dd6",
+    "launchMeasurement": "99291ba3048a00505505b418220e9006f389ac228ca7ffc623058a0bb4d894d0",
+    "independentSignatureVerified": true,
+    "platformSourceInventoryEntries": 233,
+    "platformSourceInventoryUnchanged": true,
+    "platformArchiveChanged": [
+      "plat/native-boot",
+      "plat/native-desktop/profile.json"
+    ],
+    "exportFilesChecked": 16,
+    "isoPayloadsChecked": 3,
+    "metadataMutationControlsRejected": 9,
+    "hardwareAdmission": false,
+    "activated": false
   }
 }

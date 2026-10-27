@@ -32,11 +32,22 @@ corruption, retired retries and desktop survival. These tests used a dedicated
 worker, fixed vsock relay and synthetic owner admission. They do not establish
 production VBS attestation or Moonlight acceptance for the new image.
 
+The separate signed SVN18 package is built and independently verified:
+
+- IGVM SHA-256: `a2272bcd8f7d5db883ae212ee1cb499a8bf100f9cc6f23073e61b68343f185f9`.
+- Profile SHA-256: `dffd7d80cd0dd1ff929dd3b4f79d4dc58ff81570b52eec2aab740d04e8ee3dd6`.
+- Launch measurement: `99291ba3048a00505505b418220e9006f389ac228ca7ffc623058a0bb4d894d0`.
+
+All 233 platform source inventory entries match v13. The platform archive differs
+only in the authenticated desktop profile and its matching boot parameters.
+The exported bundle passed file-hash and three ISO payload binding checks;
+nine metadata mutation controls rejected mismatched pins and stale approval flags.
+Local signing and these integrity checks do not establish hardware admission.
+
 The host bridge's completed-stream cleanup fix is separately staged and tested
 on Windows; it has not been activated. Deploying the candidate still requires
-measured platform packaging, signature/identity verification, hardware admission
-and coordinated release pins, followed by a fresh app process and positive
-owner acceptance. Preserve the existing retirement until that fresh process.
+hardware admission and coordinated release pins, followed by a fresh app process
+and positive owner acceptance. Preserve the existing retirement until that fresh process.
 The current desktop home is ephemeral: restarting loses its Firefox/session
 state. Restart timing is pending the owner's preference.
 
