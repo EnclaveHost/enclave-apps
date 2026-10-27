@@ -62,6 +62,14 @@ the image for the running app.
 The current desktop home is ephemeral: restarting loses its Firefox/session
 state. Restart timing is pending the owner's preference.
 
+The hardware fixture is prepared for the exact staged SVN18 image, profile and
+bridge. Offline preparation checks validate the app mapping and bundle, reject
+changed root payloads and the old profile, and confirm that both saved SVN17
+reports fail the SVN18 policy floor. These are saved-transcript regressions, not
+new hardware evidence. The established 12-GiB test VM retains its 28-GiB free-RAM
+gate, including the 16-GiB reserve. A fresh NucBox read found 18,163,195,904 bytes
+free with the current 32-GiB desktop still running, so this gate is not met.
+
 General rasterization, texture handling, visibility and encoding remain local.
 Physical GPU access is restricted to the masked service channel; public-matrix
 approval is independent of compiler eligibility. No general game acceleration,
