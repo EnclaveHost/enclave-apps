@@ -105,6 +105,29 @@ def collect(novnc, native_page):
     if len(data) > 512 << 10 or total + len(data) > MAX_TOTAL or len(output) >= MAX_FILES:
         raise ValueError('native UI page limit')
     output['native.html'] = data
+    # Package the bounded x11vnc polling adapter with the measured UI. Never
+    # load code from mutable home files or a separate, unverified web origin.
+    pacing = read_regular(Path(__file__).with_name('desktop-pacing.mjs'))
+    bootstrap = b'''import UI from './ui.js';
+import RFB from '../core/rfb.js';
+import {installPacing} from './native-pacing.mjs';
+let current=null, pacing=null;
+setInterval(()=>{
+  if(UI.rfb!==current){pacing?.stop();current=UI.rfb;pacing=null;}
+  if(current?._rfbConnectionState==='connected' && !pacing && !current._enabledContinuousUpdates){
+    pacing=installPacing(current,RFB.messages.fbUpdateRequest);
+  }
+},500);
+'''
+    html = output['novnc/vnc.html']
+    if html.count(b'</body>') != 1:
+        raise ValueError('noVNC page must have one closing body')
+    tag = b'<script type="module" src="app/native-pacing-bootstrap.mjs"></script>\n'
+    if len(html)+len(tag)>MAX_FILE or len(pacing)>MAX_FILE or total+len(data)+len(pacing)+len(bootstrap)+len(tag)>MAX_TOTAL or len(output)+2>MAX_FILES:
+        raise ValueError('desktop pacing asset limit')
+    output['novnc/vnc.html'] = html.replace(b'</body>',tag+b'</body>')
+    output['novnc/app/native-pacing.mjs'] = pacing
+    output['novnc/app/native-pacing-bootstrap.mjs'] = bootstrap
     return output
 
 

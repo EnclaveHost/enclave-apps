@@ -14,7 +14,7 @@ class Assets(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
         self.root=self.base/'novnc';self.root.mkdir()
-        (self.root/'vnc.html').write_text('<html>static fixture</html>')
+        (self.root/'vnc.html').write_text('<html><body>static fixture</body></html>')
         for d in ['app','core','vendor']:(self.root/d).mkdir()
         (self.root/'app/a.js').write_text('export const a=1;')
         self.page=self.base/'native.html';self.page.write_text('<html>native fixture</html>')
@@ -27,7 +27,9 @@ class Assets(unittest.TestCase):
     def test_flatten_internal_alias_and_permissions(self):
         (self.root/'core/alias.js').symlink_to('../app/a.js')
         m=self.build()
-        self.assertEqual(len(m['files']),4)
+        self.assertEqual(len(m['files']),6)
+        self.assertIn(b'app/native-pacing-bootstrap.mjs', (self.output/'novnc/vnc.html').read_bytes())
+        self.assertIn(b'installPacing', (self.output/'novnc/app/native-pacing.mjs').read_bytes())
         self.assertEqual((self.output/'novnc/core/alias.js').read_bytes(),(self.root/'app/a.js').read_bytes())
         for p in self.output.rglob('*'):
             self.assertFalse(p.is_symlink())
