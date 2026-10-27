@@ -1,6 +1,6 @@
 {
   "schema": "shield-graphics-grid-checkpoint/1",
-  "scope": "isolated host-container and native KVM qualification; production VBS admission/deployment pending",
+  "scope": "host, native KVM and fresh VBS hardware verification; production configuration selected, app acceptance pending funding",
   "librarySha256": "038d5c4bf64fafdc8eb45b5c4634262c450f49dc0e4a48995f8486c714e70020",
   "toolImage": "sha256:9c97d769ffa3e605b415ad7165f687994d6178aabcce836943b45ecaa17fd825",
   "proofCases": 48,
@@ -13,7 +13,7 @@
   "matrixApproval": "separate exact padded public constant digest; unchanged",
   "failure": "last real GPU tile corruption rejects the dispatch and retires service; no CPU retry",
   "rendering": "general rasterization and unsupported shaders remain CPU",
-  "deployment": "not activated",
+  "deployment": "SVN18 configuration activated; no fresh production instance yet",
   "review": {
     "scope": "static multi-workgroup delta review, no cryptography/platform audit",
     "confirmedCorrectnessDefects": 0,
@@ -51,8 +51,8 @@
     "exportFilesChecked": 16,
     "isoPayloadsChecked": 3,
     "metadataMutationControlsRejected": 9,
-    "hardwareAdmission": false,
-    "activated": false,
+    "hardwareAdmission": true,
+    "activated": true,
     "staging": {
       "host": "NucBox",
       "passed": true,
@@ -67,7 +67,12 @@
       "liveConfigurationUnchanged": true,
       "finished": "2026-10-27T03:47:15.4274387Z",
       "hardwareAdmission": false,
-      "activated": false
+      "activated": false,
+      "aclCorrection": {
+        "emptyFileRulesDetectedBeforeBoot": true,
+        "candidateFilesRepaired": 8,
+        "contentHashesReverified": true
+      }
     },
     "hardwarePreparation": {
       "prepared": true,
@@ -79,9 +84,25 @@
       "minimumAvailableGiB": 28,
       "latestAvailableBytes": 18163195904,
       "latestResourceReadUtc": "2026-10-27T04:00:01.5684903Z",
-      "nativeDesktopStillRunning": true,
-      "restartTimingAnswered": false,
-      "freshHardwareTestRun": false
+      "nativeDesktopStillRunning": false,
+      "restartTimingAnswered": true,
+      "freshHardwareTestRun": true
+    },
+    "hardware": {
+      "passed": true,
+      "freshChallenges": 2,
+      "negativeControlsPerChallenge": 13,
+      "testVmRemoved": true,
+      "runStateArchived": true,
+      "ownerAcceptance": false
+    },
+    "activation": {
+      "finished": "2026-10-27T08:02:33.9786642Z",
+      "legacyVmsPreserved": 9,
+      "appId": "f7a74f8e343c817343121db860fda71b7c05a57868a520bc9508218c5ea1d86b",
+      "serving": false,
+      "reason": "hosting balance 14 micro-USDC; no live spending session",
+      "newBridgeSelected": true
     }
   }
 }
