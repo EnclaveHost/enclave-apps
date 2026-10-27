@@ -135,11 +135,11 @@
  }
 
  static void handle_ray_tracing_pipeline(struct vk_cmd_queue_entry *cmd,
-@@ -2839,6 +2846,63 @@
+@@ -2839,6 +2846,75 @@
     state->ib_dirty = true;
  }
 
-+/* Bounded 64x4 affine prepass (contracts 1-4). Routing uses shader/grid/descriptor metadata, never
++/* Bounded affine prepass (contracts 1-4, up to 4096 rows). Routing uses shader/grid/descriptor metadata, never
 + * private values. Prior writes complete before input snapshot. Unsupported
 + * layouts retain the original CPU shader. A started request never retries. */
 +static bool
@@ -148,7 +148,9 @@
 +   const enum shield_nir_contract contract=state->shield_prepass.contract;
 +   if ((contract != SHIELD_NIR_FIXED64_V1 && contract != SHIELD_NIR_ZINK64_V1 &&
 +        contract != SHIELD_NIR_AFFINE64_V2 && contract != SHIELD_NIR_ZINK_AFFINE64_V2) || state->shield_generated_depth ||
-+       state->shield_active_queries || state->dispatch_info.grid[0] != 1 ||
++       state->shield_active_queries || !state->dispatch_info.grid[0] ||
++       (state->shield_prepass.max_workgroups != 1 && state->shield_prepass.max_workgroups != 64) ||
++       state->dispatch_info.grid[0] > state->shield_prepass.max_workgroups ||
 +       state->dispatch_info.grid[1] != 1 || state->dispatch_info.grid[2] != 1 ||
 +       state->dispatch_info.block[0] != 64 || state->dispatch_info.block[1] != 1 ||
 +       state->dispatch_info.block[2] != 1)
@@ -156,6 +158,8 @@
 +   for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); ++i)
 +      if (state->desc_buffers[i])
 +         return false;
++   const unsigned rows = state->dispatch_info.grid[0] * 64;
++   const size_t bytes = (size_t)rows * 16;
 +   bool array_layout = contract == SHIELD_NIR_ZINK64_V1 || contract == SHIELD_NIR_ZINK_AFFINE64_V2;
 +   struct lvp_descriptor_set *set = state->desc_sets[LVP_PIPELINE_COMPUTE][array_layout ? 3 : 0];
 +   if (!set || !set->layout || set->layout->binding_count != (array_layout ? 1 : 2) || !set->map ||
@@ -172,34 +176,42 @@
 +         return false;
 +      buffers[i] = ((const struct lp_descriptor *)set->map)[binding->descriptor_index + element].buffer;
 +      /* num_elements in this BDA descriptor is a BYTE count (lp_jit.c). */
-+      if (!buffers[i].u || buffers[i].num_elements != 1024 ||
-+          ((uintptr_t)buffers[i].u & 3) || (uintptr_t)buffers[i].u > UINTPTR_MAX - 1024)
++      if (!buffers[i].u || buffers[i].num_elements != bytes ||
++          ((uintptr_t)buffers[i].u & 3) || (uintptr_t)buffers[i].u > UINTPTR_MAX - bytes)
 +         return false;
 +   }
 +   uintptr_t a = (uintptr_t)buffers[0].u, b = (uintptr_t)buffers[1].u;
-+   if (a < b + 1024 && b < a + 1024)
++   if (a < b + bytes && b < a + bytes)
 +      return false;
-+   finish_fence(state);
-+   uint32_t snapshot[256];
-+   int32_t result[256];
-+   memcpy(snapshot, buffers[0].u, sizeof(snapshot));
-+   enum shield_prepass_result status = shield_prepass_execute_transform(&state->shield_prepass.transform, snapshot, result);
-+   explicit_bzero(snapshot, sizeof(snapshot));
-+   if (status == SHIELD_PREPASS_UNAVAILABLE)
-+      return false;
-+   if (status == SHIELD_PREPASS_FAILED) {
++   uint32_t *snapshot = malloc(bytes);
++   int32_t *result = malloc(bytes);
++   if (!snapshot || !result) {
++      free(snapshot); free(result);
 +      state->shield_failed = true;
 +      return true;
 +   }
-+   memcpy((void *)buffers[1].u, result, sizeof(result));
-+   explicit_bzero(result, sizeof(result));
++   finish_fence(state);
++   memcpy(snapshot, buffers[0].u, bytes);
++   enum shield_prepass_result status = shield_prepass_execute_rows(&state->shield_prepass.transform, snapshot, rows, result);
++   explicit_bzero(snapshot, bytes); free(snapshot);
++   if (status == SHIELD_PREPASS_UNAVAILABLE) {
++      explicit_bzero(result, bytes); free(result);
++      return false;
++   }
++   if (status != SHIELD_PREPASS_LOCAL && status != SHIELD_PREPASS_MASKED) {
++      explicit_bzero(result, bytes); free(result);
++      state->shield_failed = true;
++      return true;
++   }
++   memcpy((void *)buffers[1].u, result, bytes);
++   explicit_bzero(result, bytes); free(result);
 +   return true;
 +}
 +
  static void handle_dispatch(struct vk_cmd_queue_entry *cmd,
                              struct rendering_state *state)
  {
-@@ -2849,7 +2913,8 @@
+@@ -2849,7 +2925,8 @@
     state->dispatch_info.grid_base[1] = 0;
     state->dispatch_info.grid_base[2] = 0;
     state->dispatch_info.indirect = NULL;
@@ -209,7 +221,7 @@
  }
 
  static void handle_dispatch_base(struct vk_cmd_queue_entry *cmd,
-@@ -2967,6 +3032,8 @@
+@@ -2967,6 +3044,8 @@
         pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
        emit_compute_state(state);
 
@@ -218,7 +230,7 @@
     emit_state(state);
 
     uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
-@@ -2991,6 +3058,8 @@
+@@ -2991,6 +3070,8 @@
     assert(pool->queries[qcmd->query]);
 
     state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -227,7 +239,7 @@
  }
 
 
-@@ -3004,6 +3073,8 @@
+@@ -3004,6 +3085,8 @@
         pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
        emit_compute_state(state);
 
@@ -236,7 +248,7 @@
     emit_state(state);
 
     uint32_t count = util_bitcount(state->framebuffer.viewmask ? state->framebuffer.viewmask : BITFIELD_BIT(0));
-@@ -3028,6 +3099,8 @@
+@@ -3028,6 +3111,8 @@
     assert(pool->queries[qcmd->query]);
 
     state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -245,7 +257,7 @@
  }
 
  static void handle_reset_query_pool(struct vk_cmd_queue_entry *cmd,
-@@ -4285,8 +4358,12 @@
+@@ -4285,8 +4370,12 @@
     struct list_head *list = (void*)p;
 
     struct vk_cmd_queue_entry *exec_cmd = list_first_entry(list, struct vk_cmd_queue_entry, cmd_link);
@@ -258,7 +270,7 @@
  }
 
  static void
-@@ -4957,6 +5034,8 @@
+@@ -4957,6 +5046,8 @@
     bool did_flush = false;
 
     LIST_FOR_EACH_ENTRY(cmd, cmds, cmd_link) {
@@ -267,7 +279,7 @@
        if (print_cmds)
           fprintf(stderr, "%s\n", vk_cmd_queue_type_names[cmd->type]);
        switch ((unsigned)cmd->type) {
-@@ -5418,7 +5497,7 @@
+@@ -5418,7 +5509,7 @@
     for (unsigned i = 0; i < ARRAY_SIZE(state->desc_buffers); i++)
        pipe_resource_reference(&state->desc_buffers[i], NULL);
 

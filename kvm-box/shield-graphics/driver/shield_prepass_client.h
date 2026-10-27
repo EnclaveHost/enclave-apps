@@ -17,4 +17,8 @@ enum shield_prepass_result shield_prepass_execute(const uint32_t input[256], int
  * and revalidate the full dispatch/layout contract. Bounds validation here is
  * defense in depth, not semantic proof or public-matrix authorization. */
 enum shield_prepass_result shield_prepass_execute_transform(const struct shield_affine64 *transform, const uint32_t input[256], int32_t output[256]);
+/* Contiguous count x 4 owned input snapshot, 1..4096 rows. The caller must
+ * possess the matching multi-workgroup proof before using count > 64.
+ * One graph request uses independently verified tiles on a single channel. */
+enum shield_prepass_result shield_prepass_execute_rows(const struct shield_affine64 *transform, const uint32_t *input, unsigned count, int32_t *output);
 #endif

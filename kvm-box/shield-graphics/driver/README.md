@@ -10,7 +10,7 @@ complete accelerated renderer or a performance/conformance claim.
 
 ## Compiler and runtime contract
 
-The compiler extracts exact bounded affine transforms for 64 rows. Each input
+The compiler extracts exact bounded affine transforms for 64–4,096 rows. Each input
 component is `x[k] = (word[k] & 255) - 128`; output component `c` is
 `sum(x[k] * matrix[k][c]) + bias[c] + row * rowCoefficient[c]` modulo 2^32.
 Matrix coefficients must be integers in [-119,119]. Bias and row coefficients
@@ -22,7 +22,10 @@ and renamed source modules rather than matching shader bytes. The proof uses
 and rejects unsupported instructions, control flow, memory effects and layouts.
 Unsigned shifts are distributed only over proven bounded, non-wrapping public
 row addresses with divisible coefficients. It never examines private values
-when deciding eligibility.
+when deciding eligibility. Public low-bit masks are identities only when the
+complete public address interval fits the mask. Local and workgroup IDs remain
+independent proof variables: global row is `64*workgroup.x + local.x`. A shader
+proved only for one workgroup retains that tighter bound.
 
 Two descriptor layouts share the same input/output byte layout:
 
@@ -36,9 +39,9 @@ same runtime restrictions and separate service authorization.
 
 The proof is conditional, not authorization. Every dispatch independently
 requires an ordinary compute pipeline with `main`, no specialization, extra
-creation structures or flags; grid 1×1×1, block 64×1×1; exact non-dynamic,
-non-mutable storage-buffer layouts; two aligned, non-overlapping 1,024-byte
-ranges; no descriptor buffers, active queries or generated commands. Shader
+creation structures or flags; grid X from 1 through its proof bound (1 or 64), grid Y/Z=1, block 64×1×1; exact non-dynamic,
+non-mutable storage-buffer layouts; two aligned, non-overlapping ranges of
+exactly `gridX*1,024` bytes; no descriptor buffers, active queries or generated commands. Shader
 objects, binary state, indirect/base dispatch and other layouts stay on CPU.
 The result is never trusted from serialized shader objects. The proof has
 instruction, recursion, evaluation and normalization limits; exceeding them
@@ -57,7 +60,9 @@ the affine fixture digest is
 `3743f9f172613ba7e24c17237aba24e330c043ac4c8bc7e6e150bb6f5635a6a5`.
 Bias and row terms never enter the service request. The client validates all
 bounded dot products before applying those terms with modular arithmetic and
-publishing the complete output. No production policy
+publishing the complete output. The service splits an approved product into
+64-row tiles on one registered channel with independent masking/verification.
+A failed tile rejects the whole dispatch, including earlier verified tiles. No production policy
 changes, private constants, camera matrices or arbitrary shader approval follow
 from that test authorization.
 
@@ -84,6 +89,17 @@ subsequent commands report `GL_CONTEXT_LOST`. Applications must honor context
 loss; no post-reset buffer contents are promised by the API.
 
 ## Validation
+
+The multi-workgroup extension has separate host-container qualification; it has
+not replaced the running native image. It adds 34 proof cases for both layouts,
+42 sanitized client cases, and real OpenGL/Vulkan tests at 1, 2 and 64 workgroups.
+At 64 groups each API checks 131,072 scalar outputs over eight dispatches, with
+512 verified GPU exchanges / 4,194,304 MACs. The 65-group and local-only row-term
+controls execute on CPU without a service request. Corrupting the final tile
+causes device/context loss; Vulkan checks the entire output and subsequent draw
+remain untouched. The original 73 proof cases retain their prior proof results.
+
+The following describes the earlier single-workgroup/native checkpoint.
 
 The compiler fixtures cover equivalent modules, both descriptor forms, varied
 arithmetic/centering, rejected masks, memory layouts, missing stores, private-dependent
@@ -134,6 +150,9 @@ and copy `shield_prepass_nir.{c,h}` and `shield_affine64.h` into `src/compiler/s
 --build /work/build-parent --output /work/new-proof-results`.
 Run `../qualification/test-affine-nir.py` with the same arguments in a fresh
 output directory for the generalized extraction suite.
+Run `../qualification/test-grid-nir.py --tool /work/build/mesa/src/compiler/spirv/spirv2nir
+--output /work/new-grid-results` with glslangValidator and spirv-val installed.
+Build `test_grid_client.c` alongside the existing client sanitizer suites.
 See `../qualification/README.md` for standard-API tests. Independent Claude
 reviews covered the original ICD/client and structural compiler integration;
 they are scoped reviews, not a cryptographic or platform security audit.

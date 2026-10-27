@@ -60,12 +60,13 @@
              progress = false;
 
              #define OPT(pass, ...) ({                                  \
-@@ -324,14 +337,30 @@
+@@ -324,14 +337,31 @@
              #undef OPT
           } while (progress);
        }
 +      struct shield_nir_proof proof = shield_prepass_prove_nir(nir);
 +      fprintf(stderr,"SHIELD_STRUCTURAL_PROOF=%s reason=%s contract=%u\n",proof.contract!=SHIELD_NIR_NONE?"accepted":"rejected",shield_nir_reason_name(proof.reason),proof.contract);
++      fprintf(stderr,"SHIELD_MAX_WORKGROUPS=%u\n",proof.max_workgroups);
 +      if (proof.contract != SHIELD_NIR_NONE) {
 +         fprintf(stderr,"SHIELD_AFFINE64={\"matrix\":[");
 +         for(unsigned k=0;k<4;k++) {

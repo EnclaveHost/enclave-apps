@@ -1,3 +1,13 @@
+#ifndef SHIELD_TEST_GLOBAL_BIAS
+#define SHIELD_TEST_GLOBAL_BIAS 0
+#endif
+#ifndef SHIELD_TEST_LOCAL_BIAS
+#define SHIELD_TEST_LOCAL_BIAS 0
+#endif
+#ifndef SHIELD_TEST_GROUPS
+#define SHIELD_TEST_GROUPS 1
+#endif
+static_assert(SHIELD_TEST_GROUPS >= 1 && SHIELD_TEST_GROUPS <= 65, "bounded test dispatch");
 // Standard Vulkan qualification: SSBO compute -> vertex buffer -> raster -> readback.
 // No Shield socket or physical-GPU API is called by this application.
 #include <vulkan/vulkan.h>
@@ -48,7 +58,7 @@ static VkShaderModule shader(const std::string &path) {
 int main(int argc, char **argv) {
     require(argc == 3 || (argc == 4 && !std::strcmp(argv[3], "--expect-device-lost")), "usage: prepass SHADER_DIRECTORY NEW_RGBA_OUTPUT [--expect-device-lost]");
     const bool expect_lost = argc == 4;
-    constexpr uint32_t rows = 64, dimensions = 4, size = rows * dimensions * 4, guard = 16, width = 128, height = 128;
+    constexpr uint32_t rows = 64 * SHIELD_TEST_GROUPS, dimensions = 4, size = rows * dimensions * 4, guard = 16, width = 128, height = 128;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.pApplicationName = "Shield graphics API qualification"; app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; instance_info.pApplicationInfo = &app;
     VkInstance instance; VK(vkCreateInstance(&instance_info, nullptr, &instance));
@@ -127,7 +137,7 @@ int main(int argc, char **argv) {
         VK(vkResetCommandBuffer(command, 0)); VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; VK(vkBeginCommandBuffer(command, &begin));
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; host.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT; host.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &host, 0, nullptr, 0, nullptr);
-        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, compute); vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, compute_layout, 0, 1, &set, 0, nullptr); vkCmdDispatch(command, 1, 1, 1);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, compute); vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, compute_layout, 0, 1, &set, 0, nullptr); vkCmdDispatch(command, SHIELD_TEST_GROUPS, 1, 1);
         VkMemoryBarrier computed{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; computed.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; computed.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &computed, 0, nullptr, 0, nullptr);
         VkClearValue clear{}; clear.color.float32[3] = 1;
@@ -150,7 +160,7 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < guard; ++i) require(destination.mapped[i] == 0xa5 && destination.mapped[guard + size + i] == 0xa5, "compute overwrote a guard");
         for (uint32_t row = 0; row < rows; ++row) {
             int32_t x[4], actual[4]; for (int j = 0; j < 4; ++j) x[j] = int32_t(input[4 * row + j] & 255u) - 128;
-            const int32_t expected[4]{x[0] + x[1], x[1] - x[0], x[2], x[3]}; std::memcpy(actual, destination.mapped + guard + 16 * row, 16);
+            const int32_t expected[4]{x[0] + x[1] + int32_t(SHIELD_TEST_LOCAL_BIAS*(row%64)+SHIELD_TEST_GLOBAL_BIAS*row), x[1] - x[0], x[2], x[3]}; std::memcpy(actual, destination.mapped + guard + 16 * row, 16);
             require(std::memcmp(expected, actual, 16) == 0, "shader differs from independent integer reference");
         }
         require(std::memcmp(source.mapped, input.data(), size) == 0, "compute modified readonly input");
@@ -160,7 +170,7 @@ int main(int argc, char **argv) {
     // Exclusive creation avoids overwriting any existing evidence file.
     FILE *output = std::fopen(argv[2], "wbx"); require(output, "output already exists or cannot be created");
     require(std::fwrite(pixels.mapped, 1, width * height * 4, output) == width * height * 4, "frame write failed"); require(std::fclose(output) == 0, "frame close failed");
-    std::printf("{\"passed\":true,\"deviceType\":\"CPU\",\"shaderOutputsChecked\":2048,\"dispatches\":8,\"guardsIntact\":true,\"width\":128,\"height\":128,\"coloredPixels\":%u,\"hardwareAccelerationClaim\":false}\n", colored);
+    std::printf("{\"passed\":true,\"deviceType\":\"CPU\",\"shaderOutputsChecked\":%u,\"dispatches\":8,\"guardsIntact\":true,\"width\":128,\"height\":128,\"coloredPixels\":%u,\"hardwareAccelerationClaim\":false}\n", rows*4*8, colored);
     vkDestroyFence(device, fence, nullptr); vkDestroyCommandPool(device, commands, nullptr); vkDestroyPipeline(device, graphics, nullptr); vkDestroyFramebuffer(device, framebuffer, nullptr); vkDestroyRenderPass(device, pass, nullptr); vkDestroyImageView(device, view, nullptr); vkDestroyImage(device, image, nullptr); vkFreeMemory(device, image_memory, nullptr); vkDestroyPipeline(device, compute, nullptr);
     for (auto module : {cs, vs, fs}) vkDestroyShaderModule(device, module, nullptr);
     vkDestroyDescriptorPool(device, pool, nullptr); vkDestroyPipelineLayout(device, compute_layout, nullptr); vkDestroyPipelineLayout(device, graphics_layout, nullptr); vkDestroyDescriptorSetLayout(device, set_layout, nullptr); destroy(source); destroy(destination); destroy(pixels); vkDestroyDevice(device, nullptr); vkDestroyInstance(instance, nullptr);
