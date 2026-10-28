@@ -102,6 +102,40 @@ verified after cleanup.
 
 The subsequent capture/read/discard candidate built deterministically as
 `abe26d3cd1740d4b47f1445beb6f81ddf61505d13841e32d9debb5a8d81eab38`.
-It has not been launched. Further native operations are held while the
-coordinating storage recovery work takes priority. This is a scheduling hold,
-not evidence that guest-managed capture is unsupported.
+It subsequently ran successfully on 2026-10-28 at 02:23 UTC: the guest read
+92,291,072 bytes, then freed the image, thawed and closed the device. The
+independent watchdog and a final separate query confirmed the owned VM and
+both scheduled tasks absent. All four preexisting VM IDs/states and pinned
+host modules/master VMGS remained unchanged. Receipts are under
+`snapshot-probes/evidence/`. This qualifies capture/read/discard only.
+
+## Native encrypted checkpoint transport
+
+`snapshot-crypto::native` now packs the memory image and a consistent writable
+storage stream into an authenticated private envelope. The trusted expected
+binding covers kernel, platform, root filesystem, configuration, RAM, vCPUs
+and admission epoch. App scope is fixed to `kvm-box-native`; owner/deployment,
+bucket and object are also authenticated. It rejects short/extra components,
+wrong bindings and truncated or damaged objects. Opening authenticates the
+complete object into an unlinked mode-0600 private guest staging file before
+exposing either component. The caller must retain exclusive ownership of that
+file and provide private backing storage. Error and drop paths truncate it.
+Epoch equality is NOT an anti-clone service: fresh external exclusive admission
+and secret release remain prerequisites to production restore.
+
+Six new transport tests pass alongside nine existing crypto/policy tests.
+The capture acceptance parser has eight passing tests. No native app endpoint
+is connected to this preparatory transport yet.
+
+A two-boot synthetic encrypted roundtrip probe is under `snapshot-probes/roundtrip`.
+It is not an app helper and must never ship in a user image. Its fixed key and
+binding markers are public test material, not real secret custody/measurement.
+It requires one newly created blank 1 GiB virtual disk and an independent host
+watchdog. The capture branch saves authenticated state and powers off without
+closing `/dev/snapshot`, following the pinned kernel's userland-swsusp contract.
+The separate restore boot authenticates all bytes before loading the kernel
+restore device. Success requires returning to the original CREATE_IMAGE call
+with original=0, restored RAM sentinel and functioning TPM transport. This
+probe has not been booted; no restore or desktop continuation claim is made.
+The small synthetic disk marker tests the transport's second component, not
+filesystem consistency or full writable-disk restoration.
