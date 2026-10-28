@@ -59,6 +59,12 @@ def accept(report, before, after):
 
 
 if __name__ == '__main__':
-    root = Path(__file__).resolve().parent
-    print(json.dumps(accept(*[json.loads((root / f).read_text()) for f in
-        ['remote-result.json', 'preflight-live.stdout', 'postflight-live.stdout']]), indent=2))
+    import argparse
+    root = Path(__file__).resolve().parent / 'evidence'
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--report', type=Path, default=root / 'capture-result.json')
+    parser.add_argument('--before', type=Path, default=root / 'capture-before.json')
+    parser.add_argument('--after', type=Path, default=root / 'capture-after.json')
+    args = parser.parse_args()
+    print(json.dumps(accept(*[json.loads(p.read_text()) for p in
+        [args.report, args.before, args.after]]), indent=2))

@@ -4,6 +4,8 @@
 //! Capture writes only encrypted state to that disk and powers off without
 //! closing the snapshot device. A separate boot authenticates before restore.
 //! This does not qualify secret custody, anti-clone admission, GPU or desktop.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+compile_error!("this diagnostic requires x86_64 Linux");
 use snapshot_crypto::native::{self, Binding, NativeCipher};
 use std::{
     ffi::CStr,
@@ -14,11 +16,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FREEZE: libc::c_ulong = 0x3301;
-const CREATE: libc::c_ulong = 0x40043311;
-const IMAGE_SIZE: libc::c_ulong = 0x8008330e;
-const PREF_SIZE: libc::c_ulong = 0x3312;
-const RESTORE: libc::c_ulong = 0x3304;
+const FREEZE: libc::Ioctl = libc::_IO(b'3' as u32, 1);
+const CREATE: libc::Ioctl = libc::_IOW::<libc::c_int>(b'3' as u32, 17);
+const IMAGE_SIZE: libc::Ioctl = libc::_IOR::<libc::loff_t>(b'3' as u32, 14);
+const PREF_SIZE: libc::Ioctl = libc::_IO(b'3' as u32, 18);
+const RESTORE: libc::Ioctl = libc::_IO(b'3' as u32, 4);
 const DISK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PLAIN: u64 = 512 * 1024 * 1024;
 const MAX_ENCRYPTED: u64 = MAX_PLAIN + 1024 * 1024;
@@ -117,7 +119,7 @@ fn disk() -> io::Result<File> {
     unsafe {
         check(libc::ioctl(
             file.as_raw_fd(),
-            0x80081272 as libc::c_ulong,
+            libc::_IOR::<usize>(0x12, 114),
             &mut size,
         ))?;
     }
