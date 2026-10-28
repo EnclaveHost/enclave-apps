@@ -63,10 +63,18 @@ fn setup() -> io::Result<()> {
             std::ptr::null(),
         ))?;
     }
-    let console = OpenOptions::new().write(true).open("/dev/console")?;
+    let console = OpenOptions::new()
+        .write(true)
+        .open("/dev/console")?
+        .into_raw_fd();
     unsafe {
-        check(libc::dup2(console.as_raw_fd(), 1))?;
-        check(libc::dup2(console.as_raw_fd(), 2))?;
+        check(libc::dup2(console, 1))?;
+        check(libc::dup2(console, 2))?;
+        // Kernel init can begin with closed standard fds. Do not close stdout
+        // through File::drop when opening the console returned fd 1 or 2.
+        if console > 2 {
+            check(libc::close(console))?;
+        }
     }
     mount(c"proc", c"/proc", None)?;
     mount(c"sysfs", c"/sys", None)?;

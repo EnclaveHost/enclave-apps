@@ -16,7 +16,7 @@ size, independent cleanup, unchanged inventory and pins. COMPLETE alone never
 passes. test_accept_capture.py covers missing/duplicate/out-of-order steps,
 failed cleanup, corruption of inventory/pins and mismatched read lengths.
 
-roundtrip/ is a new two-boot encrypted synthetic diagnostic, NOT qualified.
+roundtrip/ is a built two-boot encrypted synthetic diagnostic, NOT booted or qualified.
 It needs a separately reviewed lifecycle and freshly created blank 1 GiB VHD.
 It must not run against existing disks or with real credentials/user state.
 Its PUBLIC test key and placeholder binding digests establish no privacy or
@@ -25,3 +25,5 @@ exclusive admission, GPU recovery, full desktop or writable-filesystem restore.
 The kernel explicitly forbids cancelling capture then restoring it in place.
 
 Native application snapshot endpoints remain disabled. See ../SNAPSHOTS.md.
+
+The host harness is unexecuted and needs validation/review after the Metal0 hold.

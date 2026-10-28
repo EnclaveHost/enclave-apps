@@ -135,7 +135,15 @@ watchdog. The capture branch saves authenticated state and powers off without
 closing `/dev/snapshot`, following the pinned kernel's userland-swsusp contract.
 The separate restore boot authenticates all bytes before loading the kernel
 restore device. Success requires returning to the original CREATE_IMAGE call
-with original=0, restored RAM sentinel and functioning TPM transport. This
+with original=0, restored RAM sentinel and functioning TPM transport. The static musl helper and deterministic non-debug image have built successfully
+(image SHA-256 cd5b06ded55dec460547531e47ca4de22775b9fc11e1d52d58c9e34e92df41e7). This
 probe has not been booted; no restore or desktop continuation claim is made.
 The small synthetic disk marker tests the transport's second component, not
 filesystem consistency or full writable-disk restoration.
+
+The two-cold-boot host harness is prepared but unexecuted. Its acceptance tests
+have not run; a read-only host syntax/cmdlet check timed out. Native operations
+are now held for priority Metal0 recovery. The successful build receipt is in
+`snapshot-probes/evidence/roundtrip-build.json`; the earlier failed build was
+caused by an incorrectly applied global file-size cap and is preserved locally.
+The corrected build kept the original 2 GiB memory / 512 MiB total scratch caps.
