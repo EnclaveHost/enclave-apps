@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod native;
 pub mod policy;
 
 const MAGIC: &[u8; 8] = b"EVMSNAP1";
