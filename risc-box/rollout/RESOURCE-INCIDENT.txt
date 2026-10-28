@@ -1,0 +1,28 @@
+2026-10-27 approximately 19:22 UTC — migration fixture resource incident
+
+The initial Node fixture was incorrectly launched without the shared queue,
+cgroup limit or host-memory guard. A receipt field named source overwrote the
+source object path with metadata. The test then compared undefined against a
+100 KB Buffer using assert.deepEqual, causing Node's diagnostic formatting to
+consume approximately 70,625,220 KiB RSS. The observed test processes were
+3591752 (child) and 3591746 (parent); both were terminated with SIGTERM and
+subsequently confirmed absent. The original test output contains only its TAP
+header; no huge diagnostic was rendered again.
+
+The coordinating RPC scan 1928 stopped with exit 5 after roughly 4h39m. Its
+soft guard observed 16,758 MiB available, below its 16,896 MiB threshold;
+the outer guard's minimum was 16,567 MiB (about 16.18 GiB). An earlier local
+sample of 18.8 GiB was not the minimum. Scan 1928 produced no structural
+validation result. The coordinator started replacement scan 1930 at 19:24 UTC.
+
+Fix: retain source path and store hash/length metadata as original. Replace
+large Buffer deepEqual diagnostics with bounded boolean equality assertions.
+The corrected four-test fixture passed under a 256 MiB, no-swap, one-CPU,
+60-second cgroup plus 200 MiB tree-RSS and 16 GiB host-floor guard. Receipt:
+migration-test-bounded.tap; memory-guard peak 131 MiB, minimum host 95,177 MiB;
+systemd cgroup peak 52.1 MiB, runtime 397 ms. This rerun preceded the coordinator's
+hold message. No further unguarded tests were run.
+
+All subsequent page fixtures use outputs/sia-rollout-page/verify.sh: shared
+256 MiB queue, named constrained service, memory guard, sequential test files,
+and a 48 GiB root-space precheck. New native work remains separately coordinated.

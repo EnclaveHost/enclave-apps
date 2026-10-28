@@ -1,0 +1,4 @@
+{
+  "status": "unverified",
+  "reason": "Read-only host parser/cmdlet-metadata query timed out after25s; no VM/VHD/task mutations were executed. Not retried under Metal0 resource hold."
+}

@@ -1,0 +1,30 @@
+{
+  "run": "snap-161ca971",
+  "name": "enclave-snap-161ca971",
+  "marker": "private-snapshot-availability/snap-161ca971",
+  "directory": "C:\\Users\\claude\\enclave-snap-161ca971",
+  "guestMemoryBytes": 2147483648,
+  "totalReservationBytes": 4294967296,
+  "vcpus": 1,
+  "activeSeconds": 90,
+  "independentWatchdogSeconds": 150,
+  "watchdogExecutionSeconds": 45,
+  "serialCap": 262144,
+  "hostFloorBytes": 17179869184,
+  "rootFloorBytes": 51539607552,
+  "operation": "One owned synthetic VM with one new blank1GiBVHD; encrypted capture and actual power-off; fresh admission and second cold boot for authenticated restore; cleanup after either failure or completion",
+  "files": {
+    "create.ps1": "c4edfad75fbda21014566633781a222a9e6e32a7c4f609c5cc73497eebd87920",
+    "run.ps1": "9ec361380da7d20824c2b5871ebcd43c4d7498366d86b4ce3c3a26bbc972810a",
+    "launch.ps1": "84416784f72870a3b926e445d7c402509b37f3a4314838f323fe3b71881b6716",
+    "stage.ps1": "64254dd85effeef9da56fc1a440cf5a76e4b97b7083e6482542661db6d08a849",
+    "watchdog.ps1": "fc6488d8bacb9ad4c481e78d0f7a10936821219f0b61a226ccefbeb839188f0f",
+    "common.ps1": "41ac1b25327e663bf0a4ead31a3b2c7ed637401048f9ca7bae7382dbe9e32689"
+  },
+  "watchdogRetryCount": "indefinite only on unresolved creation; requires reconciliation",
+  "runnerHostTaskLimitSeconds": 120,
+  "unknownCreation": "Watchdog stays registered and retries every minute until reconciled; never silently concludes absent while definition may be in flight.",
+  "activeSecondsPerBoot": 45,
+  "diskBytes": 1073741824,
+  "publicTestKey": true
+}

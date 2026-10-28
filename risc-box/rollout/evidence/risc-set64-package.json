@@ -1,0 +1,38 @@
+{
+  "exit": 0,
+  "seconds": 30.69431710243225,
+  "guardStop": null,
+  "containerId": "1a397b0ee0e467789146a526a09f276b6027833c1b6855010be2301477db8536",
+  "peakContainerBytes": 737828864,
+  "cgroupPeakBytes": 750911488,
+  "memoryEvents": {
+    "low": 0,
+    "high": 0,
+    "max": 0,
+    "oom": 0,
+    "oom_kill": 0,
+    "oom_group_kill": 0,
+    "sock_throttled": 0
+  },
+  "minHostAvailableBytes": 96347332608,
+  "minRootFreeBytes": 58613108736,
+  "maxBuildBytes": 376054308,
+  "maxLayerBytes": 61440,
+  "sourceCommit": "158e91d139f8b0159fd6200abf6c6d1700f6eac2",
+  "sourceArchiveSha256": "2b26ba9f019c62ac5515b4a213a454df349aaa0af197a631140ec0e1c2bafc26",
+  "recipePins": {
+    "input-pins.json": "d20ab16090a459b209556e4114f1e6a675ee768655cbfa4aedaca3632dfacea7",
+    "run-guard.py": "313117d767e5bc60cd03d9df1b2348a2d986116d624fed4d27cca0a1f22e6924",
+    "run.sh": "c7fabc7399d0ef953dc59bb2cdf0c52800bd2525abb58f18df601b448fa25994",
+    "rustc-host.txt": "b0d948fdc4d7a997725d27a649bb02ebf8ae44ece6d6a522c2f4d895d7b36da4",
+    "source-pin.json": "f003383ed32180385e968cfd0b01648296d3f051863c4a7a003c0873daeaaf3b"
+  },
+  "cleanup": [
+    {
+      "removeExit": 0
+    },
+    {
+      "containerAbsent": true
+    }
+  ]
+}
