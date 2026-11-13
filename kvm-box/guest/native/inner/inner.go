@@ -383,7 +383,7 @@ const (
 
 func classify(path string) routeKind {
 	switch path {
-	case "/exec", "/computer":
+	case "/exec", "/computer", "/terminal":
 		return routeAutomation
 	case "/vnc.html":
 		return routeNoVNC

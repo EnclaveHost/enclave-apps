@@ -81,6 +81,7 @@ class Compute:
         self.config = config
         self.lock = threading.Lock()
         self.retired = False
+        self.graph_failure = None
         self.completed = 0
         self.active = None
         self.telemetry = {'verifiedOffloads': 0, 'maskedMacs': 0, 'lastCompleted': None}
@@ -106,7 +107,8 @@ class Compute:
                 'gpuRoute': 'masked-verified-only', 'fallback': 'trusted guest CPU',
                 'nativeArithmetic': {'cpu': NATIVE_ARITHMETIC, 'masked': FIXED_ARITHMETIC,
                                      'maskedRequiresExplicitOptIn': True},
-                'cudaBinaryCompatibility': False, 'telemetry': self.telemetry}
+                'cudaBinaryCompatibility': False, 'telemetry': self.telemetry,
+                'graphFailure': dict(self.graph_failure) if self.graph_failure else None}
 
     def record_completed(self, engine, mode, stats):
         # Only trusted execution results contribute counters. Never include
@@ -216,7 +218,8 @@ class Compute:
                 raise ValueError('graph output limit')
             self.record_completed('graph', request['mode'], result['stats'])
             return result
-        except ChannelError:
+        except ChannelError as error:
+            self.graph_failure = error.public_failure()
             self.retired = True
             raise ValueError('masked computation failed; no result released') from None
 

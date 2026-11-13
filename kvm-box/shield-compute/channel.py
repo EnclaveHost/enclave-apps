@@ -12,7 +12,15 @@ from compiler import constant_digest
 
 
 class ChannelError(RuntimeError):
-    pass
+    def __init__(self, message, *, stage='unknown', code=None):
+        super().__init__(message)
+        # Only fixed local labels and bounded C return codes may cross the
+        # service status boundary. Never forward exception/worker text there.
+        self.stage = stage if stage in ('initialize', 'register', 'start', 'compute') else 'unknown'
+        self.code = code if type(code) is int and -128 <= code < 0 else None
+
+    def public_failure(self):
+        return {'stage': self.stage, 'code': self.code}
 
 
 class MaskedChannel:
@@ -50,7 +58,7 @@ class MaskedChannel:
         err = C.c_int()
         self._link = self._lib.sh_link_open(host.encode(), port, True, C.byref(err))
         if not self._link:
-            raise ChannelError(f'Shield initialization failed ({err.value})')
+            raise ChannelError(f'Shield initialization failed ({err.value})', stage='initialize', code=err.value)
         self._lib.sh_link_configure(self._link, 0, reserve_bytes, 1)
         self._lib.sh_link_configure_shm(self._link, b'', 0)
 
@@ -61,7 +69,7 @@ class MaskedChannel:
     def _error(self, stage, code):
         self.close()
         # Do not relay arbitrary worker strings or tensor data to host logs.
-        raise ChannelError(f'{stage} failed ({code}); channel retired, no result released')
+        raise ChannelError(f'{stage} failed ({code}); channel retired, no result released', stage=stage, code=code)
 
     def register(self, approved_public_weight, max_rows):
         with self._lock:
@@ -80,7 +88,7 @@ class MaskedChannel:
             node = self._lib.sh_link_add_weight(self._link, f'w{len(self._weights)}'.encode(),
                 owned.ctypes.data_as(C.POINTER(C.c_int8)), w.shape[0], w.shape[1], max_rows, -1)
             if node < 0:
-                self._error('registration', node)
+                self._error('register', node)
             self._weights.append(owned)
             self._nodes[node] = (w.shape[0], w.shape[1], max_rows,
                                  max(abs(int(w.min())), abs(int(w.max()))))
@@ -117,7 +125,7 @@ class MaskedChannel:
             rc = self._lib.sh_link_gemm(self._link, nodes, 1, x.ctypes.data_as(p64), x.shape[0], outputs)
             if rc:
                 scratch.fill(0)
-                self._error('verified masked computation', rc)
+                self._error('compute', rc)
             return scratch
 
     @property

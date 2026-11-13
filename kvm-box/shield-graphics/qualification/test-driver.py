@@ -7,8 +7,13 @@ from service import Compute,receive,send
 from compiler import constant_digest
 assert os.getuid()==0 and Path('/output/build/prepass').is_file()
 assert not Path('/dev/dri').exists() and not Path('/dev/nvidia0').exists()
+groups=int(os.environ.get('SHIELD_TEST_GROUPS','1'));assert 1<=groups<=65
+rows=groups*64
+force_cpu=os.environ.get('SHIELD_TEST_CPU_ONLY','0')=='1'
+corrupt_at=int(os.environ.get('SHIELD_TEST_CORRUPT_AT','1'));assert 1<=corrupt_at<=groups
 mode=sys.argv[1];gl_mode=mode.startswith('gl-');failure=mode.startswith('bad-reply') or mode in ['wrong-peer','worker-corrupt','gl-worker-corrupt'];variant=mode in ['queries','generated','bad-reply-timeline','bad-reply-timeline-before','bad-reply-queue-idle','bad-reply-device-idle'];assert gl_mode or variant or mode in ['equivalent','masked','local','bad-reply','wrong-peer','unavailable','worker-corrupt','unmatched','dispatch-base','specialization','dynamic-bindings','wide-range']
-no_route=mode in ['gl-queries','gl-wide-range','gl-descriptor-buffer','queries','generated','unmatched','dispatch-base','specialization','dynamic-bindings','wide-range']
+no_route=force_cpu or groups>64 or mode in ['gl-queries','gl-wide-range','gl-descriptor-buffer','queries','generated','unmatched','dispatch-base','specialization','dynamic-bindings','wide-range']
+assert not ((force_cpu or groups>64) and failure),'CPU-only dispatch cannot test protected failure'
 root=Path('/run/shield');root.mkdir(mode=0o755);os.chown(root,1000 if mode=='wrong-peer' else 1001,1000)
 worker_dir=Path('/run/shield-worker');worker_dir.mkdir(mode=0o755)
 broker=socket.socket(socket.AF_UNIX);broker.bind('/run/shield-worker/gpu0');os.chown('/run/shield-worker/gpu0',0,1001);os.chmod('/run/shield-worker/gpu0',0o660);broker.listen(8);broker.settimeout(2)
@@ -25,15 +30,17 @@ if pid==0:
   os.write(ready_w,b'R');os.close(ready_w)
   weights=np.zeros((32,4),dtype=np.int64);weights[:4]=[[1,-1,0,0],[1,1,0,0],[0,0,1,0],[0,0,0,1]];digest=constant_digest(weights)
   compute=Compute({'schema':'shield-guest-service/1','models':{},'publicConstants':[digest] if mode in ['masked','worker-corrupt','equivalent','gl-masked','gl-worker-corrupt'] else [],'core':'/opt/shield/lib/libshield-core.so','worker':{'host':'unix:/run/shield-worker/gpu0','port':19595}})
-  expected=8 if mode in ['local','masked','equivalent','gl-masked','gl-local'] else 0 if mode in ['unavailable','gl-unavailable'] or no_route else 1
+  expected=0 if no_route else 8 if mode in ['local','masked','equivalent','gl-masked','gl-local'] else 0 if mode in ['unavailable','gl-unavailable'] or no_route else 1
   for index in range(expected):
    conn,_=server.accept();conn.settimeout(20)
    with conn:
     if mode=='wrong-peer':assert conn.recv(1)==b'';continue
-    request=receive(conn,16384);record['requests']+=1
+    request=receive(conn,2048+rows*96);record['requests']+=1
+    assert request['graph']['nodes'][0]['shape']==[rows,32]
+    assert request['graph']['nodes'][1]['value']==weights.tolist()
     if mode.startswith('bad-reply'):
      time.sleep(.2)
-     send(conn,{'ok':True,'outputs':{'y':[[0]*4]*63+[[0,0,0,1.5]]},'routes':{'y':'local'},'stats':{}})
+     send(conn,{'ok':True,'outputs':{'y':[[0]*4]*(rows-1)+[[0,0,0,1.5]]},'routes':{'y':'local'},'stats':{}})
     else:
      try:result=compute.run(request)
      except ValueError:
@@ -45,7 +52,7 @@ if pid==0:
       else:raise AssertionError('retired service accepted retry')
      send(conn,result)
      if mode not in ['worker-corrupt','gl-worker-corrupt']:assert result['routes']=={'y':'masked-field-gemm' if mode in ['masked','equivalent','gl-masked','gl-worker-corrupt'] else 'local'}
-  if no_route:
+  if no_route and mode not in ['unavailable','gl-unavailable']:
    server.settimeout(2)
    try:unexpected,_=server.accept()
    except socket.timeout:pass
@@ -54,7 +61,7 @@ if pid==0:
  except Exception as error:record.update(error=type(error).__name__,detail=str(error)[:200])
  os.write(report_w,json.dumps(record).encode());os.close(report_w);os._exit(0 if record['passed'] else 1)
 os.close(ready_w);os.close(report_w);assert os.read(ready_r,1)==b'R';os.close(ready_r)
-proxy_report={'connections':0,'bytesToWorker':0,'bytesFromWorker':0};done=threading.Event()
+proxy_report={'connections':0,'bytesToWorker':0,'bytesFromWorker':0,'matrixReplies':0};done=threading.Event()
 def proxy():
  try:
   while not done.is_set():
@@ -79,6 +86,8 @@ def proxy():
        reply_header=exact(target,9);status,size=struct.unpack('<BQ',reply_header);assert size<=16*1024*1024
        reply=bytearray(exact(target,size))
        if command in (12,13) and status==0 and reply:
+        proxy_report['matrixReplies']+=1
+       if command in (12,13) and status==0 and reply and proxy_report['matrixReplies']==corrupt_at:
         reply[0]^=1;proxy_report['modifiedRealGemmReply']=True
        peer.sendall(reply_header+reply);proxy_report['bytesFromWorker']+=9+size
      except EOFError:pass
@@ -95,7 +104,7 @@ def proxy():
  except Exception as error:proxy_report.update(error=type(error).__name__)
  finally:broker.close()
 thread=threading.Thread(target=proxy);thread.start()
-command=['/output/variants/prepass-'+mode if variant or no_route and mode!='unmatched' else '/output/build/prepass','/output/build-equivalent' if mode=='equivalent' else '/output/build-unmatched' if mode=='unmatched' else '/output/build','/output/driver-'+mode+'.rgba']
+command=['/output/variants/prepass-'+mode if variant or mode in ['dispatch-base','specialization','dynamic-bindings','wide-range'] else '/output/build/prepass','/output/build-equivalent' if mode=='equivalent' else '/output/build-unmatched' if mode=='unmatched' else '/output/build','/output/driver-'+mode+'.rgba']
 if gl_mode:command=['xvfb-run','-a','/output/prepass-gl','/output/prepass-gl.comp']
 if failure:command+=['--expect-device-lost']
 if mode in ['gl-queries','gl-wide-range']:command+=['--'+mode[3:]]
@@ -107,12 +116,14 @@ if no_route or variant:env['VK_INSTANCE_LAYERS']='VK_LAYER_KHRONOS_validation'
 p=subprocess.run(command,env=env,preexec_fn=drop(1000),capture_output=True,text=True,timeout=40)
 client_elapsed=time.monotonic()-started
 report=json.loads(os.read(report_r,8192));os.close(report_r);_,status=os.waitpid(pid,0);done.set();thread.join(22)
-expected_connections=8 if mode in ['masked','equivalent','gl-masked'] else 1 if mode in ['worker-corrupt','gl-worker-corrupt'] else 0
-result={'passed':p.returncode==0 and os.waitstatus_to_exitcode(status)==0 and report.get('passed') and proxy_report['connections']==expected_connections and 'error' not in proxy_report,'mode':mode,'service':report,'proxy':proxy_report,'clientElapsedSeconds':client_elapsed,'clientExitCode':p.returncode,'client':p.stdout.strip(),'clientError':p.stderr.strip(),'scope':'patched standard Vulkan ICD in host container; no native VM/attestation claim'}
+expected_connections=0 if no_route else 8 if mode in ['masked','equivalent','gl-masked'] else 1 if mode in ['worker-corrupt','gl-worker-corrupt'] else 0
+result={'passed':p.returncode==0 and os.waitstatus_to_exitcode(status)==0 and report.get('passed') and proxy_report['connections']==expected_connections and 'error' not in proxy_report,'mode':mode,'groups':groups,'cpuOnlyExpected':no_route,'corruptAt':corrupt_at if failure else None,'service':report,'proxy':proxy_report,'clientElapsedSeconds':client_elapsed,'clientExitCode':p.returncode,'client':p.stdout.strip(),'clientError':p.stderr.strip(),'scope':'patched standard Vulkan ICD in host container; no native VM/attestation claim'}
 if not failure and not gl_mode and p.returncode==0:
  result['frameMatchesReference']=(Path(command[2]).read_bytes()==Path('/output/triangle.rgba').read_bytes());result['passed'] &= result['frameMatchesReference']
-if mode in ['masked','equivalent','gl-masked']:result['passed'] &= report.get('telemetry',{}).get('verifiedOffloads')==8
-if failure:result['passed'] &= client_elapsed < 5
+if mode in ['masked','equivalent','gl-masked']:
+ result['passed'] &= report.get('telemetry',{}).get('verifiedOffloads')==(0 if no_route else 8*groups)
+ result['passed'] &= report.get('telemetry',{}).get('maskedMacs')==(0 if no_route else 8*rows*128)
+if failure:result['passed'] &= client_elapsed < 10
 if mode in ['worker-corrupt','gl-worker-corrupt']:result['passed'] &= proxy_report.get('modifiedRealGemmReply') is True and report.get('serviceRetired') is True
 if no_route or variant:result['passed'] &= 'Validation Error' not in p.stdout+p.stderr and 'VUID-' not in p.stdout+p.stderr
 print(json.dumps(result));assert result['passed']

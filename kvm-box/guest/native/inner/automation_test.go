@@ -91,6 +91,49 @@ func TestAutomationForwardingAndUntrustedHeaders(t *testing.T) {
 	}
 }
 
+func TestTerminalUsesTheAutomationBoundary(t *testing.T) {
+	cfg := testConfig(t)
+	seen := make(chan *http.Request, 1)
+	startAutomation(t, &cfg, func(c net.Conn) {
+		r, e := http.ReadRequest(bufio.NewReader(c))
+		if e != nil {
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+		seen <- r
+		io.WriteString(c, automationReply(`{"ok":true,"cursor":7,"data":"cmVhZHk+IA==","reset":true,"running":true,"cols":100,"rows":26}`, "Set-Cookie: desktop=untrusted\r\n"))
+	})
+	addr := startGateway(t, cfg)
+	body := `{"op":"read","wait_ms":0}`
+	resp, got := exchange(t, addr, fmt.Sprintf("POST /terminal HTTP/1.1\r\n%sContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", hostLine, len(body), body))
+	if resp.StatusCode != 200 || !strings.Contains(got, `"cursor":7`) || resp.Header.Get("Set-Cookie") != "" {
+		t.Fatalf("terminal forward failed: %d %s", resp.StatusCode, got)
+	}
+	select {
+	case req := <-seen:
+		if req.URL.Path != "/terminal" || req.Host != "desktop" || req.Header.Get("Authorization") != "" {
+			t.Fatal("incorrect upstream request")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no upstream request")
+	}
+	for _, request := range []string{
+		fmt.Sprintf("GET /terminal HTTP/1.1\r\n%sConnection: close\r\n\r\n", hostLine),
+		fmt.Sprintf("POST /terminal/ HTTP/1.1\r\n%sContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", hostLine),
+		fmt.Sprintf("POST /terminal?op=read HTTP/1.1\r\n%sContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", hostLine),
+	} {
+		if resp, _ := exchange(t, addr, request); resp.StatusCode == 200 {
+			t.Fatal("terminal alias admitted")
+		}
+	}
+	select {
+	case <-seen:
+		t.Fatal("an alias reached the automation service")
+	default:
+	}
+}
+
 func TestAutomationRefusesSocketMetadataAndPeerBeforeSending(t *testing.T) {
 	for _, kind := range []string{"peer", "directory", "socket", "symlink"} {
 		t.Run(kind, func(t *testing.T) {

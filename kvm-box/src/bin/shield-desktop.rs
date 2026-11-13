@@ -18,6 +18,9 @@ use std::{
 };
 
 const HTML: &str = include_str!("shield-desktop.html");
+/// The page's terminal: vendored xterm.js (MIT), the files RISC Box serves.
+const XTERM_JS: &[u8] = include_bytes!("../vendor/xterm.js");
+const XTERM_CSS: &[u8] = include_bytes!("../vendor/xterm.css");
 const LISTEN: &str = "127.0.0.1:8000";
 const COMPANION: &str = "127.0.0.1:19080";
 /// Host sent upstream; never derived from the caller.
@@ -35,13 +38,15 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// One absolute bound for sending a static asset, however slowly it is read.
+const ASSET_TIMEOUT: Duration = Duration::from_secs(30);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const DRAIN_LIMIT: usize = 256 * 1024;
 const PUMP_ROUNDS: usize = 4;
 const ACCEPT_BURST: usize = 16;
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
-const DASHBOARD_CSP: &str = "Content-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\n";
+const DASHBOARD_CSP: &str = "Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'\r\n";
 const PLAIN_CSP: &str = "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n";
 /// Only these caller headers reach the companion. Everything else (Authorization,
 /// Proxy-Authorization, Forwarded, X-Forwarded-*, Cookie, Origin, hop-by-hop and
@@ -353,13 +358,16 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn local(status: u16, mime: &str, body: &[u8], extra_headers: &str) -> Vec<u8> {
-    let mut out = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n{extra_headers}\r\n",
-        reason(status),
-        body.len()
+fn local_head(status: u16, mime: &str, length: usize, extra_headers: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {mime}\r\nContent-Length: {length}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n{extra_headers}\r\n",
+        reason(status)
     )
-    .into_bytes();
+    .into_bytes()
+}
+
+fn local(status: u16, mime: &str, body: &[u8], extra_headers: &str) -> Vec<u8> {
+    let mut out = local_head(status, mime, body.len(), extra_headers);
     out.extend_from_slice(body);
     out
 }
@@ -394,15 +402,22 @@ struct Plan {
 
 enum Decision {
     Local(Vec<u8>),
+    /// A response head and a static body too large to buffer whole.
+    Asset(Vec<u8>, &'static [u8]),
     Proxy(Plan),
 }
 
 enum Route<'a> {
     Dashboard,
+    Asset(&'static str, &'static [u8]),
     Api(&'static str, &'static str),
     Desktop(&'a str),
     WebSocket(&'a str),
     Moonlight(&'a str),
+}
+
+fn explicit_action(headers: &[httparse::Header<'_>]) -> bool {
+    matches!(values(headers, "x-kvm-box-request").as_slice(), [v] if *v == &b"1"[..])
 }
 
 fn refuse(status: u16, msg: &str) -> Decision {
@@ -499,13 +514,19 @@ fn decide_with_automation(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32], aut
     };
 
     let route = match path {
-        "/exec" | "/computer" => {
+        "/exec" | "/computer" | "/terminal" => {
             if method != "POST" { return refuse(405, "POST only"); }
             if query.is_some() { return refuse(400, "Query not supported"); }
             if body_len > 64 * 1024 { return refuse(413, "Automation request too large"); }
+            // The terminal belongs to the owner's page: the automation key never
+            // reaches it (request_authorized), and like the page's other actions
+            // it needs the explicit header.
+            if path == "/terminal" && !explicit_action(headers) { return refuse(403, "Explicit action header required"); }
             Route::Desktop(path)
         }
         "/" => Route::Dashboard,
+        "/a/xterm.js" => Route::Asset("text/javascript; charset=utf-8", XTERM_JS),
+        "/a/xterm.css" => Route::Asset("text/css; charset=utf-8", XTERM_CSS),
         "/api/status" => Route::Api("GET", "status"),
         "/api/start" => Route::Api("POST", "start"),
         "/api/stop" => Route::Api("POST", "stop"),
@@ -534,6 +555,15 @@ fn decide_with_automation(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32], aut
             }
             Decision::Local(local(200, "text/html; charset=utf-8", HTML.as_bytes(), DASHBOARD_CSP))
         }
+        Route::Asset(mime, body) => {
+            if method != "GET" {
+                return refuse(405, "GET only");
+            }
+            if query.is_some() {
+                return refuse(400, "Query not supported");
+            }
+            Decision::Asset(local_head(200, mime, body.len(), PLAIN_CSP), body)
+        }
         Route::Api(want, action) => {
             if method != want {
                 return refuse(405, "Method not allowed");
@@ -544,7 +574,7 @@ fn decide_with_automation(raw: &[u8], extra: &[u8], owner_digest: &[u8; 32], aut
             if body_len != 0 {
                 return refuse(400, "Request bodies are not supported");
             }
-            if want == "POST" && !matches!(values(headers, "x-kvm-box-request").as_slice(), [v] if *v == &b"1"[..]) {
+            if want == "POST" && !explicit_action(headers) {
                 return refuse(403, "Explicit action header required");
             }
             let length = if want == "POST" { "X-KVM-Box-Request: 1\r\nContent-Length: 0\r\n" } else { "" };
@@ -847,6 +877,8 @@ struct Conn {
     desktop: bool,
     c2u: Buf,
     u2c: Buf,
+    /// What is left of a static asset after the part already in `u2c`.
+    tail: &'static [u8],
     resp_head: Vec<u8>,
     resp_started: bool,
     interim: u8,
@@ -872,6 +904,7 @@ impl Conn {
             desktop: true,
             c2u: Buf::new(),
             u2c: Buf::new(),
+            tail: &[],
             resp_head: Vec::new(),
             resp_started: false,
             interim: 0,
@@ -945,6 +978,14 @@ impl Conn {
         }
     }
 
+    fn respond_asset(&mut self, head: Vec<u8>, body: &'static [u8], now: Instant) {
+        self.respond_raw(head, now);
+        if self.phase == Phase::Local {
+            self.tail = body;
+            self.deadline = now + ASSET_TIMEOUT;
+        }
+    }
+
     /// Response complete: close our write side, then discard (never forward) any
     /// further client bytes briefly so the close does not reset the response.
     fn finish_response(&mut self, now: Instant) {
@@ -982,6 +1023,7 @@ impl Conn {
         self.head = Vec::new();
         match decision {
             Decision::Local(resp) => self.respond_raw(resp, now),
+            Decision::Asset(head, body) => self.respond_asset(head, body, now),
             Decision::Proxy(plan) => self.start_proxy(plan, now, cfg),
         }
         true
@@ -1011,13 +1053,17 @@ impl Conn {
     }
 
     fn pump_local(&mut self, now: Instant) -> bool {
+        let more = self.tail.len().min(self.u2c.space());
+        if more > 0 && self.u2c.push(&self.tail[..more]) {
+            self.tail = &self.tail[more..];
+        }
         if self.u2c.is_empty() {
             self.finish_response(now);
             return true;
         }
         match self.u2c.drain_to(&mut self.client) {
             Io::Moved(_) => {
-                if self.u2c.is_empty() {
+                if self.u2c.is_empty() && self.tail.is_empty() {
                     self.finish_response(now);
                 }
                 true
@@ -1365,7 +1411,7 @@ mod tests {
     }
     fn local_status(d: &Decision) -> u16 {
         match d {
-            Decision::Local(r) => status_line(r),
+            Decision::Local(r) | Decision::Asset(r, _) => status_line(r),
             Decision::Proxy(_) => 0,
         }
     }
@@ -1375,7 +1421,7 @@ mod tests {
     fn proxied(d: Decision) -> Plan {
         match d {
             Decision::Proxy(p) => p,
-            Decision::Local(r) => panic!("refused: {}", String::from_utf8_lossy(&r)),
+            Decision::Local(r) | Decision::Asset(r, _) => panic!("refused: {}", String::from_utf8_lossy(&r)),
         }
     }
     fn wait_until(f: impl Fn() -> bool) -> bool {
@@ -1423,9 +1469,39 @@ mod tests {
             }
         }
         let headers = format!("Authorization: Bearer {AUTOMATION_KEY}\r\n");
-        for (method, target) in [("GET", "/exec"), ("POST", "/api/start"), ("POST", "/api/stop"), ("GET", "/"), ("POST", "/desktop/exec"), ("POST", "/computer?x=1"), ("POST", "/computer/")] {
+        for (method, target) in [("GET", "/exec"), ("POST", "/api/start"), ("POST", "/api/stop"), ("GET", "/"), ("POST", "/terminal"), ("GET", "/a/xterm.js"), ("POST", "/desktop/exec"), ("POST", "/computer?x=1"), ("POST", "/computer/")] {
             assert_eq!(local_status(&automation_request(method, target, &headers, true)), 401, "{method} {target}");
         }
+    }
+
+    #[test]
+    fn terminal_is_the_owners_page_action_only() {
+        let explicit = "X-KVM-Box-Request: 1\r\nContent-Type: application/json\r\n";
+        let plan = proxied(automation_request("POST", "/terminal", &format!("{}{explicit}", auth()), true));
+        let head = String::from_utf8(plan.head).unwrap();
+        assert!(head.starts_with("POST /terminal HTTP/1.1\r\n"));
+        assert!(!head.to_ascii_lowercase().contains("authorization"));
+        assert!(head.contains("Content-Length: 2\r\n"));
+        assert_eq!(plan.prefix, b"{}");
+        assert!(plan.desktop);
+        // Not without the explicit header, not by another method or alias, and
+        // never with the automation key, alone or beside the owner's sign-in.
+        assert_eq!(local_status(&automation_request("POST", "/terminal", &auth(), true)), 403);
+        assert_eq!(local_status(&automation_request("POST", "/terminal", &format!("{}X-KVM-Box-Request: 2\r\n", auth()), true)), 403);
+        assert_eq!(local_status(&automation_request("GET", "/terminal", &format!("{}{explicit}", auth()), true)), 400);
+        assert_eq!(local_status(&decide_str(&request("GET", "/terminal", explicit))), 405);
+        assert_eq!(local_status(&automation_request("POST", "/terminal?op=read", &format!("{}{explicit}", auth()), true)), 400);
+        assert_eq!(local_status(&automation_request("POST", "/terminal/", &format!("{}{explicit}", auth()), true)), 404);
+        assert_eq!(local_status(&automation_request("POST", "/terminal", &format!("{}{explicit}Origin: https://evil.example\r\n", auth()), true)), 403);
+        for headers in [
+            format!("Authorization: Bearer {AUTOMATION_KEY}\r\n{explicit}"),
+            format!("X-Api-Key: {AUTOMATION_KEY}\r\n{explicit}"),
+            format!("{}X-Api-Key: {AUTOMATION_KEY}\r\n{explicit}", auth()),
+        ] {
+            assert_eq!(local_status(&automation_request("POST", "/terminal", &headers, true)), 401);
+        }
+        let big = format!("POST /terminal HTTP/1.1\r\nHost: {HOST}\r\n{}{explicit}Content-Length: 65537\r\n\r\n", auth());
+        assert_eq!(local_status(&decide_str(&big)), 413);
     }
 
     #[test]
@@ -1505,7 +1581,7 @@ mod tests {
     #[test]
     fn every_route_requires_exactly_one_owner_authorization() {
         let wrong = format!("Authorization: Basic {}\r\n", STANDARD.encode("owner:synthetic-wrong"));
-        for target in ["/", "/api/status", "/desktop/vnc.html", "/desktop/websockify", "/nope"] {
+        for target in ["/", "/a/xterm.js", "/a/xterm.css", "/terminal", "/api/status", "/desktop/vnc.html", "/desktop/websockify", "/nope"] {
             for raw in [
                 format!("GET {target} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
                 format!("GET {target} HTTP/1.1\r\nHost: {HOST}\r\n{}{}\r\n", auth(), auth()),
@@ -1517,6 +1593,7 @@ mod tests {
                         assert_eq!(status_line(&r), 401, "{raw}");
                         assert!(String::from_utf8_lossy(&r).contains("WWW-Authenticate: Basic realm=\"KVM Box\""));
                     }
+                    Decision::Asset(..) => panic!("unauthenticated asset served: {raw}"),
                     Decision::Proxy(_) => panic!("unauthenticated request proxied: {raw}"),
                 }
             }
@@ -1983,10 +2060,52 @@ mod tests {
         let srv = server(up.addr);
         let (head, body) = split_response(&exchange(srv.addr, request("GET", "/", "").as_bytes()));
         assert!(head.starts_with("HTTP/1.1 200 "));
-        for h in ["Cache-Control: no-store", "X-Content-Type-Options: nosniff", "frame-ancestors 'none'"] {
+        for h in ["Cache-Control: no-store", "X-Content-Type-Options: nosniff", "frame-ancestors 'none'", "script-src 'self' 'unsafe-inline';", "style-src 'self' 'unsafe-inline';"] {
             assert!(head.contains(h), "{h}");
         }
-        assert!(String::from_utf8_lossy(&body).contains("path=desktop/websockify"));
+        let page = String::from_utf8_lossy(&body);
+        // The noVNC page resolves `path` against the origin: without the leading
+        // slash the socket opens at /desktop/desktop/websockify and is refused.
+        assert!(page.contains("&path=/desktop/websockify\""));
+        // One power button, and the terminal with the assets this controller serves.
+        for part in ["id=\"power\"", "id=\"term\"", "href=\"/a/xterm.css\"", "src=\"/a/xterm.js\"", "fetch('/terminal'"] {
+            assert!(page.contains(part), "{part}");
+        }
+        for gone in ["id=\"start\"", "id=\"stop\""] {
+            assert!(!page.contains(gone), "{gone}");
+        }
+        assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn terminal_assets_larger_than_the_buffer_are_served_whole() {
+        assert!(XTERM_JS.len() > 2 * BUF_CAP && !XTERM_CSS.is_empty());
+        let up = mock(|_s| {});
+        let srv = server(up.addr);
+        for (target, mime, asset) in [("/a/xterm.js", "text/javascript; charset=utf-8", XTERM_JS), ("/a/xterm.css", "text/css; charset=utf-8", XTERM_CSS)] {
+            let (head, body) = split_response(&exchange(srv.addr, request("GET", target, "").as_bytes()));
+            assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+            for h in [format!("Content-Type: {mime}\r\n"), format!("Content-Length: {}\r\n", asset.len()), "X-Content-Type-Options: nosniff\r\n".into(), "default-src 'none'".into()] {
+                assert!(head.contains(&h), "{h}");
+            }
+            assert!(body == asset, "{target}: {} of {} bytes", body.len(), asset.len());
+            // A reader that takes the body a few bytes at a time still gets all of it.
+            let mut s = connect(srv.addr);
+            s.write_all(request("GET", target, "").as_bytes()).unwrap();
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 1500];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    Err(e) => panic!("{target}: {e}"),
+                }
+            }
+            assert!(split_response(&got).1 == asset, "{target}: slow reader");
+        }
+        for raw in [request("POST", "/a/xterm.js", "Content-Length: 0\r\n"), request("GET", "/a/xterm.js?v=1", ""), request("GET", "/a/", ""), request("GET", "/a/xterm.js.map", ""), request("HEAD", "/a/xterm.css", "")] {
+            assert!(status_line(&exchange(srv.addr, raw.as_bytes())) >= 400, "{raw}");
+        }
         assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
     }
 

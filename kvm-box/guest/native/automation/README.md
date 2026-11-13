@@ -49,6 +49,29 @@ come from `desktop-capture.c`, installed at the fixed path
 `/usr/local/libexec/kvm-box/capture`, using the desktop's authenticated X11
 connection. The helper accepts no arguments and requires UID/EUID 1000.
 
+`POST /terminal` is the owner's terminal on the controller's page: one
+interactive shell (`/bin/bash`, else `/bin/sh`) on a pseudo-terminal, as the
+desktop user, in `/home/desktop`, with the same constructed environment as
+`/exec` plus `TERM`. It is the same authority as `/exec`, kept as one long-lived
+session; it is not a second boundary. The controller admits it only with the
+owner's Basic credential and the page's `X-KVM-Box-Request: 1` header; the
+automation key does not reach it. The body is one JSON object:
+
+- `{"op":"read","cursor":N,"wait_ms":M}` returns output after absolute cursor
+  `N`, waiting up to `M` (0–20000 ms) for more. Without a cursor, or with one
+  outside the 256 KiB scrollback, it returns the scrollback with `reset: true`.
+  One reply carries at most 128 KiB.
+- `{"op":"write","data":"<base64>"}` types 1–16384 decoded bytes.
+- `{"op":"resize","cols":C,"rows":R}` (20–400 by 5–200).
+- `{"op":"restart"}` hangs the shell up and starts a new one.
+
+Every reply is `ok`, `cursor`, base64 `data`, `reset`, `running`, `cols`,
+`rows`, and `error` when refused. There is one shell for all pages: a second
+page sees and types into the same session. The shell is started on first use,
+again a second after it exits, and ends with the service (the desktop's stop).
+Two reads may wait at once; a third is answered 429 `terminal busy`. Programs
+started from it are ordinary desktop workload, as with `/exec`.
+
 ## Verification
 
 From `kvm-box/guest/native/automation`:
@@ -62,7 +85,10 @@ The tests execute real shell commands and Unix socket connections. They cover
 nonzero exits, bounded output, timeout/cancellation, inherited credential
 exclusion, invalid requests without side effects, peer rejection, role refusal,
 RGB framing, grid mapping, invalid input without injection, JPEG decoding,
-failed-drag cleanup, pixel settling and concurrent action refusal.
+failed-drag cleanup, pixel settling and concurrent action refusal. The terminal
+tests run a real shell on a real pseudo-terminal: output by cursor, long-poll
+wake-up, scrollback overrun, interrupt, resize, restart, respawn after exit,
+input bounds and the busy refusal.
 
 From the repository root, with an available Xvfb binary, a writable scratch
 directory and the desktop UID (1000):

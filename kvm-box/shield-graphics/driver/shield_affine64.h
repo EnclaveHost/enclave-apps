@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* x[r,k] = (input[r*4+k] & 255) - 128, r in [0,63].
+/* x[r,k] = (input[r*4+k] & 255) - 128, global row r in [0,64*gridX-1], with gridX within the proved bound.
  * y[r,c] = sum_k(x[r,k]*matrix[k][c]) + bias[c] + r*row[c] in Z/(2^32).
  * Only the bounded dot product is sent to the existing Shield service.
  * Bias/row coefficients stay in the trusted caller and are applied afterward.

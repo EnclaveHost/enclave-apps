@@ -1,3 +1,13 @@
+#ifndef SHIELD_TEST_GLOBAL_BIAS
+#define SHIELD_TEST_GLOBAL_BIAS 0
+#endif
+#ifndef SHIELD_TEST_LOCAL_BIAS
+#define SHIELD_TEST_LOCAL_BIAS 0
+#endif
+#ifndef SHIELD_TEST_GROUPS
+#define SHIELD_TEST_GROUPS 1
+#endif
+static_assert(SHIELD_TEST_GROUPS >= 1 && SHIELD_TEST_GROUPS <= 65, "bounded test dispatch");
 #define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <GL/glext.h>
@@ -32,15 +42,15 @@ int main(int argc,char **argv){
  GLuint shader=glCreateShader(GL_COMPUTE_SHADER);glShaderSource(shader,1,&ptr,nullptr);glCompileShader(shader);GLint ok=0;glGetShaderiv(shader,GL_COMPILE_STATUS,&ok);
  if(!ok){char log[8192];glGetShaderInfoLog(shader,sizeof log,nullptr,log);std::fprintf(stderr,"%s\n",log);}require(ok,"compile failed");
  GLuint program=glCreateProgram();glAttachShader(program,shader);glLinkProgram(program);glGetProgramiv(program,GL_LINK_STATUS,&ok);require(ok,"link failed");glUseProgram(program);
- GLint alignment=0;glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,&alignment);require(alignment>0&&alignment<=4096,"invalid buffer alignment");const size_t guard=alignment,size=1024;
+ GLint alignment=0;glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT,&alignment);require(alignment>0&&alignment<=4096,"invalid buffer alignment");constexpr unsigned rows=64*SHIELD_TEST_GROUPS;const size_t guard=alignment,size=rows*16;
  GLuint buffers[2];glGenBuffers(2,buffers);glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[0]);glBufferData(GL_SHADER_STORAGE_BUFFER,size,nullptr,GL_DYNAMIC_DRAW);glBindBufferRange(GL_SHADER_STORAGE_BUFFER,0,buffers[0],0,size);
  glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[1]);glBufferData(GL_SHADER_STORAGE_BUFFER,size+2*guard,nullptr,GL_DYNAMIC_DRAW);glBindBufferRange(GL_SHADER_STORAGE_BUFFER,1,buffers[1],guard,wide_mode?size+guard:size);
  GLuint query=0; if(query_mode)glGenQueries(1,&query);
  for(unsigned test=0;test<8;test++){
-  std::array<uint32_t,256> input{};uint32_t rng=0x9e3779b9u+test;for(auto &word:input){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;word=rng;}input[0]=0;input[1]=255;input[2]=0xffffff00u;input[3]=0xffffffffu;
+  std::array<uint32_t,64*SHIELD_TEST_GROUPS*4> input{};uint32_t rng=0x9e3779b9u+test;for(auto &word:input){rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;word=rng;}input[0]=0;input[1]=255;input[2]=0xffffff00u;input[3]=0xffffffffu;
   std::vector<unsigned char> output(size+2*guard,0xa5);glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[0]);glBufferSubData(GL_SHADER_STORAGE_BUFFER,0,size,input.data());glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[1]);glBufferSubData(GL_SHADER_STORAGE_BUFFER,0,output.size(),output.data());check();
   if(query_mode)glBeginQuery(GL_COMPUTE_SHADER_INVOCATIONS_ARB,query);
-  glDispatchCompute(1,1,1);
+  glDispatchCompute(SHIELD_TEST_GROUPS,1,1);
   if(query_mode)glEndQuery(GL_COMPUTE_SHADER_INVOCATIONS_ARB);
   glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
   if(expect_lost){
@@ -55,11 +65,11 @@ int main(int argc,char **argv){
    return 0;
   }
   glGetBufferSubData(GL_SHADER_STORAGE_BUFFER,0,output.size(),output.data());check();
-  if(query_mode){GLuint64 invocations=0;glGetQueryObjectui64v(query,GL_QUERY_RESULT,&invocations);require(invocations==64,"wrong compute invocation count");}
+  if(query_mode){GLuint64 invocations=0;glGetQueryObjectui64v(query,GL_QUERY_RESULT,&invocations);require(invocations==rows,"wrong compute invocation count");}
   for(size_t i=0;i<guard;i++)require(output[i]==0xa5&&output[guard+size+i]==0xa5,"guard overwritten");
-  for(unsigned row=0;row<64;row++){int32_t v[4],actual[4];for(unsigned c=0;c<4;c++)v[c]=int32_t(input[row*4+c]&255u)-128;const int32_t want[]{v[0]+v[1],v[1]-v[0],v[2],v[3]};std::memcpy(actual,output.data()+guard+16*row,16);require(!std::memcmp(actual,want,16),"GL compute output differs from reference");}
-  std::array<uint32_t,256> readback{};glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[0]);glGetBufferSubData(GL_SHADER_STORAGE_BUFFER,0,size,readback.data());require(readback==input,"input changed");glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[1]);check();
+  for(unsigned row=0;row<rows;row++){int32_t v[4],actual[4];for(unsigned c=0;c<4;c++)v[c]=int32_t(input[row*4+c]&255u)-128;const int32_t want[]{v[0]+v[1]+int32_t(SHIELD_TEST_LOCAL_BIAS*(row%64)+SHIELD_TEST_GLOBAL_BIAS*row),v[1]-v[0],v[2],v[3]};std::memcpy(actual,output.data()+guard+16*row,16);require(!std::memcmp(actual,want,16),"GL compute output differs from reference");}
+  std::array<uint32_t,64*SHIELD_TEST_GROUPS*4> readback{};glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[0]);glGetBufferSubData(GL_SHADER_STORAGE_BUFFER,0,size,readback.data());require(readback==input,"input changed");glBindBuffer(GL_SHADER_STORAGE_BUFFER,buffers[1]);check();
  }
- std::printf("{\"passed\":true,\"api\":\"OpenGL\",\"dispatches\":8,\"outputsChecked\":2048,\"guardsIntact\":true,\"gpuOffloadClaim\":false,\"renderer\":\"%s\"}\n",renderer);
+ std::printf("{\"passed\":true,\"api\":\"OpenGL\",\"dispatches\":8,\"outputsChecked\":%u,\"guardsIntact\":true,\"gpuOffloadClaim\":false,\"renderer\":\"%s\"}\n",rows*4*8,renderer);
  glDeleteBuffers(2,buffers);glDeleteProgram(program);glDeleteShader(shader);glXMakeContextCurrent(display,None,None,nullptr);glXDestroyPbuffer(display,surface);glXDestroyContext(display,ctx);XCloseDisplay(display);
 }

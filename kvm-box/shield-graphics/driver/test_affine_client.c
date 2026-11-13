@@ -1,3 +1,4 @@
+#define LEGACY_TEST_CAPACITY 16384
 /* Independent integer oracle for the generalized transport; synthetic replies only. */
 #include "shield_prepass_client.c"
 #include <assert.h>
@@ -15,10 +16,10 @@ int main(void) {
         for(unsigned c=0;c<4;c++) { t.bias[c]=next();t.row[c]=next(); }
         for(unsigned i=0;i<256;i++) input[i]=next();
         assert(shield_affine64_valid(&t));
-        char body[REQUEST_LIMIT],same[REQUEST_LIMIT];assert(request(&t,input,body));
+        char body[LEGACY_TEST_CAPACITY],same[LEGACY_TEST_CAPACITY];assert(request(&t,input,64,body,LEGACY_TEST_CAPACITY));
         struct shield_affine64 changed=t;
         for(unsigned c=0;c<4;c++){changed.bias[c]^=0xffffffffu;changed.row[c]^=0xaaaaaaaa;}
-        assert(request(&changed,input,same));assert(!strcmp(body,same));
+        assert(request(&changed,input,64,same,LEGACY_TEST_CAPACITY));assert(!strcmp(body,same));
         struct json_object *req=json_tokener_parse(body), *graph,*nodes,*weights,*values;
         assert(field(req,"graph",json_type_object,&graph));assert(field(graph,"nodes",json_type_array,&nodes));
         assert(json_object_array_length(nodes)==3);
@@ -52,20 +53,20 @@ int main(void) {
             }
         }
         const char *text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
-        assert(response(&t,text,strlen(text),output)==SHIELD_PREPASS_MASKED);
+        assert(response(&t,text,strlen(text),64,output)==SHIELD_PREPASS_MASKED);
         assert(!memcmp(output,expected,sizeof expected));cases++;
         json_object_object_add(routes,"y",json_object_new_string("local"));
         json_object_object_del(stats,"exchanges");json_object_object_del(stats,"macs");json_object_object_del(stats,"verification_failures");
         text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
-        assert(response(&t,text,strlen(text),output)==SHIELD_PREPASS_LOCAL);
+        assert(response(&t,text,strlen(text),64,output)==SHIELD_PREPASS_LOCAL);
         assert(!memcmp(output,expected,sizeof expected));cases++;
         /* Fail at the final element, after 255 valid values; publish nothing. */
         json_object_array_put_idx(json_object_array_get_idx(rows,63),3,json_object_new_int(60929));
         text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);memset(output,0xa5,sizeof output);
-        assert(response(&t,text,strlen(text),output)==SHIELD_PREPASS_FAILED);unchanged(output);cases++;
+        assert(response(&t,text,strlen(text),64,output)==SHIELD_PREPASS_FAILED);unchanged(output);cases++;
         json_object_array_put_idx(json_object_array_get_idx(rows,63),3,json_object_new_int(-60929));
         text=json_object_to_json_string_ext(root,JSON_C_TO_STRING_PLAIN);
-        assert(response(&t,text,strlen(text),output)==SHIELD_PREPASS_FAILED);unchanged(output);cases++;
+        assert(response(&t,text,strlen(text),64,output)==SHIELD_PREPASS_FAILED);unchanged(output);cases++;
         json_object_put(root);
     }
     struct shield_affine64 t=shield_affine64_fixed();uint32_t input[256]={0};int32_t output[256];

@@ -1,0 +1,108 @@
+{
+  "schema": "shield-graphics-grid-checkpoint/1",
+  "scope": "host, native KVM and fresh VBS hardware verification; production configuration selected, app acceptance pending funding",
+  "librarySha256": "038d5c4bf64fafdc8eb45b5c4634262c450f49dc0e4a48995f8486c714e70020",
+  "toolImage": "sha256:9c97d769ffa3e605b415ad7165f687994d6178aabcce836943b45ecaa17fd825",
+  "proofCases": 48,
+  "legacyProofCases": 73,
+  "driverCases": 44,
+  "gridSanitizerCases": 46,
+  "affineSanitizerCases": 1028,
+  "maxWorkgroups": 64,
+  "rowsPerWorkgroup": 64,
+  "matrixApproval": "separate exact padded public constant digest; unchanged",
+  "failure": "last real GPU tile corruption rejects the dispatch and retires service; no CPU retry",
+  "rendering": "general rasterization and unsupported shaders remain CPU",
+  "deployment": "SVN18 configuration activated; no fresh production instance yet",
+  "review": {
+    "scope": "static multi-workgroup delta review, no cryptography/platform audit",
+    "confirmedCorrectnessDefects": 0,
+    "reportWritten": true,
+    "cliExit": "max-turn cap after report was written",
+    "followup": "corrected row contract comment; removed unused production request macro; added mixed-ID, modular-identity, boundary-shift and worst-payload tests"
+  },
+  "native": {
+    "passed": true,
+    "rootImageSha256": "4a5dc041155e33c923d5224f3be3103291405a62f5426fb97b604f62cad98db5",
+    "verityRoot": "27bafabba66ad4d4ed102cb2e6cfae53c7ab54443c0b6de92df725d24c01d383",
+    "graphicsCases": 11,
+    "desktopChecks": 9,
+    "protectedOutputsChecked": 524288,
+    "verifiedOffloads": 2048,
+    "maskedMacs": 16777216,
+    "lastTileCorruptionRejected": true,
+    "desktopSurvivesRetirement": true,
+    "productionAdmission": false,
+    "moonlightStreaming": false
+  },
+  "release": {
+    "signed": true,
+    "guestSvn": 18,
+    "signedImageSha256": "a2272bcd8f7d5db883ae212ee1cb499a8bf100f9cc6f23073e61b68343f185f9",
+    "profileSha256": "dffd7d80cd0dd1ff929dd3b4f79d4dc58ff81570b52eec2aab740d04e8ee3dd6",
+    "launchMeasurement": "99291ba3048a00505505b418220e9006f389ac228ca7ffc623058a0bb4d894d0",
+    "independentSignatureVerified": true,
+    "platformSourceInventoryEntries": 233,
+    "platformSourceInventoryUnchanged": true,
+    "platformArchiveChanged": [
+      "plat/native-boot",
+      "plat/native-desktop/profile.json"
+    ],
+    "exportFilesChecked": 16,
+    "isoPayloadsChecked": 3,
+    "metadataMutationControlsRejected": 9,
+    "hardwareAdmission": true,
+    "activated": true,
+    "staging": {
+      "host": "NucBox",
+      "passed": true,
+      "directory": "C:\\ProgramData\\Enclave\\native-desktop\\releases\\a2272bcd8f7d5db883ae212ee1cb499a8bf100f9cc6f23073e61b68343f185f9",
+      "configSha256": "bf6bdc2a2d0d11d2ce4dd06b80491f7c3c9974ce167e1acd796101d0d0e933e0",
+      "payloadAndConfigFilesVerified": 6,
+      "aclPathsChecked": 9,
+      "productionParserPassed": true,
+      "configMutationControlsRejected": 4,
+      "modelMediaReused": true,
+      "vmStatesAndUptimesPreserved": true,
+      "liveConfigurationUnchanged": true,
+      "finished": "2026-10-27T03:47:15.4274387Z",
+      "hardwareAdmission": false,
+      "activated": false,
+      "aclCorrection": {
+        "emptyFileRulesDetectedBeforeBoot": true,
+        "candidateFilesRepaired": 8,
+        "contentHashesReverified": true
+      }
+    },
+    "hardwarePreparation": {
+      "prepared": true,
+      "offlineTestsPassed": true,
+      "oldSvn17ReportsRefused": 2,
+      "mappingNegativeControls": 2,
+      "javascriptFilesSyntaxChecked": 9,
+      "testVmMemoryGiB": 12,
+      "minimumAvailableGiB": 28,
+      "latestAvailableBytes": 18163195904,
+      "latestResourceReadUtc": "2026-10-27T04:00:01.5684903Z",
+      "nativeDesktopStillRunning": false,
+      "restartTimingAnswered": true,
+      "freshHardwareTestRun": true
+    },
+    "hardware": {
+      "passed": true,
+      "freshChallenges": 2,
+      "negativeControlsPerChallenge": 13,
+      "testVmRemoved": true,
+      "runStateArchived": true,
+      "ownerAcceptance": false
+    },
+    "activation": {
+      "finished": "2026-10-27T08:02:33.9786642Z",
+      "legacyVmsPreserved": 9,
+      "appId": "f7a74f8e343c817343121db860fda71b7c05a57868a520bc9508218c5ea1d86b",
+      "serving": false,
+      "reason": "hosting balance 14 micro-USDC; no live spending session",
+      "newBridgeSelected": true
+    }
+  }
+}

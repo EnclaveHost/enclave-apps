@@ -13,6 +13,17 @@ Lavapipe and tests OpenGL over Vulkan using Zink. Keeping both APIs on one
 renderer gives future protected compiler work a common reference path.
 [Mesa documents Zink's Vulkan requirements](https://docs.mesa3d.org/drivers/zink.html).
 
+## Multi-workgroup candidate
+
+The [larger-dispatch checkpoint](qualification/grid-checkpoint.json) extends
+the proved integer path to 1–64 workgroups (64–4,096 rows). It distinguishes
+local and global invocation IDs, tiles approved products through the existing
+masked channel, and publishes results only when every tile has verified.
+All 44 host driver cases pass, including final-tile corruption and CPU-only
+negative controls. Separate native KVM qualification also passes; production platform packaging,
+hardware admission and deployment remain pending.
+This extends compute coverage; general graphics rendering remains local.
+
 ## Current generalized compiler checkpoint
 
 The compiler now extracts a bounded 4×4 integer matrix plus modular bias and row
@@ -250,9 +261,9 @@ time; record its immutable image ID and package versions for each qualification.
 ## Remaining work
 
 1. Qualify broader application workloads, game/input/audio behavior and
-   production Moonlight integration. Native desktop API/rendering and isolated
-   video checks now pass; keep
-   the reference renderer available as the trusted fallback.
+   owner Moonlight acceptance after each image update. The deployed v13
+   desktop has owner-verified usable streaming; isolated native API/rendering
+   checks also pass. Keep the reference renderer as the trusted fallback.
 2. Expand the protected operation coverage beyond the structurally proven
    bounded integer affine family. Existing public
    model policies do not authorize arbitrary scene coefficients or textures.
@@ -263,7 +274,8 @@ time; record its immutable image ID and package versions for each qualification.
    replies, and measure frame times and masking costs on the target VM.
 5. Exercise real applications and compatible games, run relevant API
    conformance tests, package a separate measured image, and complete the
-   original desktop acceptance and publication work.
+   per-release production admission and owner acceptance. The native app
+   is already published; a new candidate must not inherit old acceptance claims.
 
 CPU rendering is a functional reference and fallback. It does not satisfy the
 requested masked hardware acceleration by itself. The threat model and

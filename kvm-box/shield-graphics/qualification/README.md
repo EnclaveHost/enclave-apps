@@ -208,3 +208,35 @@ cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
 No production approval policy is changed by these fixtures. There is no measured
 speedup claim: small synchronous masked requests have overhead, and general
 floating-point rendering stays on the CPU.
+
+## Multi-workgroup extension
+
+Compile the ordinary `prepass.cpp` and `prepass-gl.cpp` fixtures with
+`-DSHIELD_TEST_GROUPS=N` for N=1,2,64,65. Use separate output directories
+for each geometry and preserve the single-workgroup CPU reference frame.
+Pass the same `--groups N` to `run-driver.py`; it checks service requests,
+verified exchange/MAC counters and all output values. `--memory-mib` bounds
+Docker memory and swap (default 2048); account for the Docker daemon separately
+when using a process-tree memory guard. Tests use an isolated worker, never a
+production reservation, and expose no physical GPU device to the container.
+
+For N=65 the correct result is CPU execution without contacting the service.
+For N=64, `worker-corrupt` / `gl-worker-corrupt --corrupt-at 64` modify the final
+real GPU matrix reply. The service must retire; Vulkan must leave the entire
+output and later draw untouched, while OpenGL must report context loss.
+`local` / `gl-local` omit matrix approval and require trusted local execution.
+
+Compile a separate two-workgroup negative fixture with
+`-DSHIELD_TEST_LOCAL_BIAS=7` and add `7*gl_LocalInvocationID.x` to the first shader
+output component. Use `--cpu-only`: this valid shader cannot use the wide proof.
+Generate its reference frame by running the fixture with no service present.
+A positive 64-group variant uses `-DSHIELD_TEST_GLOBAL_BIAS=7` and
+`7*gl_GlobalInvocationID.x` instead, proving that row terms remain global and
+local to the client. The independently computed C++ oracle checks every row.
+
+Offline `test-grid-nir.py` compares conditional workgroup bounds and extracted
+transforms; these results alone do not establish runtime eligibility. The separate native image and lifecycle tests now pass, as recorded in
+`grid-checkpoint.json`. A separate SVN18 platform package also passed independent
+signature and export-integrity checks. Production VBS admission and owner
+acceptance remain necessary before deploying this extension; the signed release
+pins are recorded in `../../guest/native/DEPLOYMENT_STATUS.md`.

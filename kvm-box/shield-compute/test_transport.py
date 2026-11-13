@@ -12,7 +12,7 @@ import unittest
 import numpy as np
 
 from channel import ChannelError, MaskedChannel
-from compiler import constant_digest
+from compiler import compile_graph, constant_digest, execute
 
 LIBRARY = os.environ.get('SHIELD_COMPUTE_TEST_LIBRARY')
 PORT = int(os.environ.get('SHIELD_COMPUTE_TEST_PORT', '0'))
@@ -29,13 +29,14 @@ def receive(sock, length):
 
 
 class Proxy:
-    def __init__(self, corrupt=False):
+    def __init__(self, corrupt=False, corrupt_at=1):
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.port = self.listener.getsockname()[1]
         self.listener.listen(1)
         self.listener.settimeout(15)
         self.corrupt = corrupt
+        self.corrupt_at = corrupt_at
         self.masked_hashes = []
         self.commands = []
         self.failure = None
@@ -63,7 +64,8 @@ class Proxy:
                     if size > 16 * 1024 * 1024:
                         raise RuntimeError('oversized test reply')
                     reply = bytearray(receive(worker, size))
-                    if self.corrupt and command in (12, 13) and status == 0 and reply:
+                    if (self.corrupt and command in (12, 13) and status == 0 and reply
+                            and len(self.masked_hashes) == self.corrupt_at):
                         reply[0] ^= 1
                     guest.sendall(reply_header + reply)
         except EOFError:
@@ -124,6 +126,47 @@ class TransportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ChannelError, 'not approved'):
                     channel.register(self.w, 2)
                 self.assertEqual(channel.stats['exchanges'], 0)
+
+    def tiled_graph(self, rows):
+        return {'schema': 'shield-graph/1', 'nodes': [
+            {'name': 'x', 'op': 'input', 'shape': [rows, 32], 'bound': 10},
+            {'name': 'w', 'op': 'constant', 'shape': list(self.w.shape), 'value': self.w.tolist()},
+            {'name': 'y', 'op': 'matmul', 'args': ['x', 'w']},
+            {'name': 'relu', 'op': 'relu', 'args': ['y']},
+        ], 'outputs': ['relu']}
+
+    def test_tiled_graph_uses_one_link_and_fresh_masks(self):
+        self.w = np.random.default_rng(18).integers(-2, 3, (32,8), dtype=np.int64)
+        for rows in (65, 129, 4096):
+            with self.subTest(rows=rows):
+                proxy = Proxy()
+                approved = [constant_digest(self.w)]
+                channel = MaskedChannel(LIBRARY, '127.0.0.1', proxy.port, approved)
+                x = np.full((rows, 32), 3, dtype=np.int64)
+                outputs, routes = execute(compile_graph(self.tiled_graph(rows), approved), {'x': x}, channel)
+                np.testing.assert_array_equal(outputs['relu'], np.maximum(x @ self.w, 0))
+                self.assertEqual(routes['y'], 'masked-field-gemm')
+                self.assertEqual(channel.stats['exchanges'], (rows+63)//64)
+                self.assertEqual(channel.stats['macs'], rows*32*self.w.shape[1])
+                self.assertEqual(channel.stats['verification_failures'], 0)
+                proxy.join()
+                self.assertEqual(len(set(proxy.masked_hashes)), (rows+63)//64)
+
+    def test_later_tiled_reply_corruption_releases_no_graph_output(self):
+        self.w = np.random.default_rng(18).integers(-2, 3, (32,8), dtype=np.int64)
+        for corrupt_at in (2, 3):
+            with self.subTest(corrupt_at=corrupt_at):
+                proxy = Proxy(corrupt=True, corrupt_at=corrupt_at)
+                approved = [constant_digest(self.w)]
+                channel = MaskedChannel(LIBRARY, '127.0.0.1', proxy.port, approved)
+                with self.assertRaisesRegex(ChannelError, 'no result released'):
+                    execute(compile_graph(self.tiled_graph(129), approved),
+                            {'x': np.full((129,32), 3, dtype=np.int64)}, channel)
+                self.assertEqual(channel.stats['verification_failures'], 1)
+                with self.assertRaisesRegex(ChannelError, 'retired'):
+                    channel.start()
+                proxy.join()
+                self.assertEqual(len(proxy.masked_hashes), corrupt_at)
 
 
 if __name__ == '__main__':

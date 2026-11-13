@@ -8,19 +8,19 @@ source checkpoint contains two deployment paths:
 - The native desktop profile in `guest/native/` and `src/bin/shield-desktop.rs`,
   paired with the Enclave platform's dedicated Windows VBS launcher. Its image,
   authenticated volumes, monitor startup and cleanup have been qualified on
-  NucBox. The real manager has launched the signed v9 image with the installed
-  CPU/RAM pool sizes and enforced guest CPU quota; fresh app/host attestation
-  and scoped cleanup passed. Owner release and final desktop acceptance remain.
-  This path retains the stated operator/hypervisor
-  trust boundary; it has no verified host-OS-exclusion claim.
+  NucBox. The signed v13 release is deployed as `kvm-box-native:0.9.0`,
+  and owner testing verified usable Moonlight streaming. This path retains
+  the stated operator/hypervisor trust boundary; it has no verified
+  host-OS-exclusion claim.
 
-The complete app has not yet been published or deployed through the user's
-wallet. The v9 candidate removes the Shield Compute and Native Shield Compute
-menu entries. Its standard OpenGL/Vulkan interface uses guest CPU Mesa for
-general rendering and supports bounded masked GPU operations; it is not a
-universal GPU renderer. Selected CTS results do not establish conformance or
-Steam game compatibility. The final owner's Moonlight pairing/stream must still
-be verified after provisioning this image.
+The native release removes the Shield Compute and Native Shield Compute menu
+entries. Standard OpenGL/Vulkan uses guest CPU Mesa for general rendering and
+supports bounded masked GPU operations. It is not a universal accelerated
+renderer; selected CTS results do not establish conformance or Steam game
+compatibility. The multi-workgroup candidate has passed separate native KVM
+qualification but has not replaced the deployed image. See the dated
+[native deployment status](guest/native/DEPLOYMENT_STATUS.md) for release pins,
+current limitations and outstanding deployment gates.
 Build outputs and owner credentials are kept outside this source checkpoint.
 
 ## Original Linux KVM/SNP path

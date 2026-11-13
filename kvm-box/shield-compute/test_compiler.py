@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from compiler import CompileError, HALF_FIELD, compile_graph, constant_digest, execute
+from compiler import CompileError, HALF_FIELD, MAX_MASKED_ROWS, compile_graph, constant_digest, execute
 
 
 def example():
@@ -24,8 +24,11 @@ class RecordingChannel:
         self.started = False
         self.closed = False
         self.corrupt = corrupt
+        self.rows = []
+        self.calls = []
 
     def register(self, weight, rows):
+        self.rows.append(rows)
         self.weights.append(weight.copy())
         return len(self.weights) - 1
 
@@ -33,6 +36,7 @@ class RecordingChannel:
         self.started = True
 
     def matmul(self, node, x):
+        self.calls.append((node, x.shape[0]))
         if self.corrupt:
             raise RuntimeError('verified transport rejected forged result')
         return x @ self.weights[node]
@@ -126,6 +130,56 @@ class CompilerTests(unittest.TestCase):
         graph = copy.deepcopy(self.graph)
         graph['nodes'][2]['args'][0] = 'square'
         with self.assertRaises(CompileError): compile_graph(graph)
+
+    def test_tiled_dispatch_preserves_exact_results_and_local_graph_tail(self):
+        rng = np.random.default_rng(2901)
+        for rows in (1, 63, 64, 65, 127, 128, 129, MAX_MASKED_ROWS):
+            with self.subTest(rows=rows):
+                graph = copy.deepcopy(self.graph)
+                graph['nodes'][0]['shape'][0] = rows
+                x = rng.integers(-10, 11, (rows, 32), dtype=np.int64)
+                channel = RecordingChannel()
+                result, routes = execute(compile_graph(graph, self.approved), {'input': x}, channel)
+                np.testing.assert_array_equal(result['square'], np.maximum(x @ self.w, 0)**2)
+                self.assertEqual(channel.rows, [min(rows, 64)])
+                self.assertEqual([n for _, n in channel.calls], [min(64, rows-i) for i in range(0, rows, 64)])
+                self.assertEqual(routes['activation'], 'local')
+                self.assertEqual(routes['linear'], 'masked-field-gemm')
+                self.assertTrue(channel.closed)
+
+    def test_larger_graph_does_not_expand_constant_approval_or_worker_limits(self):
+        for approved, rows in (([], 129), (self.approved, MAX_MASKED_ROWS+1)):
+            graph = copy.deepcopy(self.graph)
+            graph['nodes'][0]['shape'][0] = rows
+            channel = RecordingChannel()
+            execute(compile_graph(graph, approved), {'input': np.zeros((rows,32), dtype=np.int64)}, channel)
+            self.assertFalse(channel.started)
+            self.assertEqual(channel.calls, [])
+
+    def test_invalid_last_row_refused_before_first_tile(self):
+        graph = copy.deepcopy(self.graph)
+        graph['nodes'][0]['shape'][0] = 129
+        x = np.zeros((129,32), dtype=np.int64); x[-1,-1] = 11
+        channel = RecordingChannel()
+        with self.assertRaises(ValueError): execute(compile_graph(graph,self.approved), {'input':x},channel)
+        self.assertEqual(channel.weights, [])
+        self.assertEqual(channel.calls, [])
+        self.assertTrue(channel.closed)
+
+    def test_late_tile_failure_releases_no_graph_outputs_and_does_not_retry(self):
+        class FailSecond(RecordingChannel):
+            def matmul(self,node,x):
+                if self.calls:
+                    self.calls.append((node,x.shape[0]))
+                    raise RuntimeError('late verified transport failure')
+                return super().matmul(node,x)
+        graph = copy.deepcopy(self.graph)
+        graph['nodes'][0]['shape'][0] = 129
+        channel=FailSecond()
+        with self.assertRaisesRegex(RuntimeError,'late verified'):
+            execute(compile_graph(graph,self.approved),{'input':np.ones((129,32),dtype=np.int64)},channel)
+        self.assertEqual(channel.calls,[(0,64),(0,64)])
+        self.assertTrue(channel.closed)
 
 
 if __name__ == '__main__':

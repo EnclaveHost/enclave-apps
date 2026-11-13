@@ -235,6 +235,51 @@ class Wasip2Checks(unittest.TestCase):
         with LOCK:
             self.assertEqual(len(RECORDS), before)
 
+    def test_06a_terminal_is_the_owners_page_action(self):
+        body = json.dumps({"op": "read", "wait_ms": 0}).encode()
+        page = "Content-Type: application/json\r\nX-KVM-Box-Request: 1\r\n"
+        with LOCK:
+            before = len(RECORDS)
+        self.assertTrue(request("/terminal", "POST", body, page, authorized=False).startswith(b"HTTP/1.1 401"))
+        self.assertTrue(request("/terminal", "POST", body, "Content-Type: application/json\r\n").startswith(b"HTTP/1.1 403"))
+        self.assertNotIn(request("/terminal?op=read", "POST", body, page).split(b" ")[1], [b"200", b"101"])
+        self.assertNotIn(request("/terminal", extra="X-KVM-Box-Request: 1\r\n").split(b" ")[1], [b"200", b"101"])
+        with LOCK:
+            self.assertEqual(len(RECORDS), before)
+        r = request("/terminal", "POST", body, page)
+        self.assertTrue(r.startswith(b"HTTP/1.1 200"), r[:200])
+        result = json.loads(r.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(result["target"], "/terminal")
+        self.assertEqual(result["sha256"], hashlib.sha256(body).hexdigest())
+        with LOCK:
+            record = RECORDS[-1]
+        self.assertNotIn("authorization", record["headers"])
+
+    def test_06b_terminal_assets_are_served_whole(self):
+        vendor = Path(__file__).resolve().parent.parent / "src" / "vendor"
+        for name in ["xterm.js", "xterm.css"]:
+            want = (vendor / name).read_bytes()
+            self.assertTrue(request("/a/" + name, authorized=False).startswith(b"HTTP/1.1 401"))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                for r in pool.map(lambda _: request("/a/" + name), range(4)):
+                    head, got = r.split(b"\r\n\r\n", 1)
+                    self.assertTrue(head.startswith(b"HTTP/1.1 200"), head)
+                    self.assertIn(b"Content-Length: " + str(len(want)).encode() + b"\r\n", head + b"\r\n")
+                    self.assertEqual(hashlib.sha256(got).hexdigest(), hashlib.sha256(want).hexdigest())
+        # A reader slower than the controller's buffer still gets every byte.
+        want = (vendor / "xterm.js").read_bytes()
+        with socket.create_connection(("127.0.0.1", 8000), 4) as s:
+            s.settimeout(8)
+            s.sendall(f"GET /a/xterm.js HTTP/1.1\r\nHost: fixture.test\r\nConnection: close\r\nAuthorization: {AUTH}\r\n\r\n".encode())
+            head, got = receive_head(s)
+            while True:
+                time.sleep(.002)
+                b = s.recv(4096)
+                if not b:
+                    break
+                got += b
+        self.assertEqual(hashlib.sha256(got).hexdigest(), hashlib.sha256(want).hexdigest())
+
     def test_07_header_timeout(self):
         with socket.create_connection(("127.0.0.1", 8000), 4) as s:
             s.settimeout(7)

@@ -1,0 +1,4 @@
+# kvm-box/src/vendor/xterm.js is the published xterm.js bundle (MIT), byte-identical to risc-box/src/vendor/xterm.js
+# (sha256 f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7). The scanner reads the minified export
+# assignment `t.FourKeyMap=t.TwoKeyMap` on its single line as a key. Nothing else is excused.
+kvm-box/src/vendor/xterm.js:generic-api-key:1

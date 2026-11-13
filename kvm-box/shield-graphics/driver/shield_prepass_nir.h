@@ -3,11 +3,16 @@
 #define SHIELD_PREPASS_NIR_H
 #include "nir.h"
 #include "shield_affine64.h"
+/* max_workgroups is an in-memory conditional bound: 1 or 64. The latter
+ * proves global row = 64*workgroup.x + local.x, including input/output addresses
+ * and row terms. Runtime must still enforce block64x1x1, gridY/Z=1, base0,
+ * gridX<=max_workgroups, and exact gridX*1024-byte non-overlapping ranges.
+ * A zero bound is never eligible. It cannot be recovered from serialized data. */
 /* Conditional proof, not authorization. FIXED64_V1 requires EVERY dispatch to
- * revalidate: ordinary direct dispatch, grid 1x1x1/base0, block64x1x1; no active
+ * revalidate: ordinary direct dispatch, gridX 1..max_workgroups, gridY/Z=1, base0, block64x1x1; no active
  * queries/generated commands; descriptor-buffer mode absent; exactly two
  * non-dynamic non-mutable STORAGE_BUFFER bindings at set0 bindings0/1, arrays
- * of length1, each range1024 bytes, aligned/non-null/non-overlapping/non-wrapping.
+ * of length1, each range gridX*1024 bytes, aligned/non-null/non-overlapping/non-wrapping.
  * Pipeline metadata/entrypoint/specialization must bind this exact NIR.
  * Service approval and verified output publication remain independent.
  * Never serialize this result or accept it from shader-object/cache binaries.
@@ -29,7 +34,7 @@ enum shield_nir_reason {
  SHIELD_NIR_VOLATILE_ACCESS, SHIELD_NIR_STORE_SHAPE, SHIELD_NIR_OUTPUT_LAYOUT,
  SHIELD_NIR_OUTPUT_EQUATION, SHIELD_NIR_INTRINSIC, SHIELD_NIR_INSTRUCTION
 };
-struct shield_nir_proof { enum shield_nir_contract contract; enum shield_nir_reason reason; struct shield_affine64 transform; };
+struct shield_nir_proof { enum shield_nir_contract contract; enum shield_nir_reason reason; struct shield_affine64 transform; unsigned max_workgroups; };
 struct shield_nir_proof shield_prepass_prove_nir(nir_shader *nir);
 const char *shield_nir_reason_name(enum shield_nir_reason reason);
 #endif
