@@ -278,7 +278,7 @@ func TestAutomationRoutesUseFixedInnerAndStripCredentials(t *testing.T) {
 	_, addr := startGateway(t, testConfig(inner.addr(), nil))
 	c := testClient()
 	defer c.CloseIdleConnections()
-	for _, path := range []string{"/exec", "/computer"} {
+	for _, path := range []string{"/exec", "/computer", "/terminal"} {
 		req, e := http.NewRequest("POST", "http://"+addr+path, strings.NewReader(`{}`))
 		if e != nil {
 			t.Fatal(e)
@@ -300,7 +300,7 @@ func TestAutomationRoutesUseFixedInnerAndStripCredentials(t *testing.T) {
 		}
 	}
 	before := inner.hits.Load()
-	for _, path := range []string{"/exec?cmd=true", "/computer/", "/execution"} {
+	for _, path := range []string{"/exec?cmd=true", "/computer/", "/execution", "/terminal/", "/terminal?op=read", "/terminals"} {
 		r, e := c.Post("http://"+addr+path, "application/json", strings.NewReader(`{}`))
 		if e != nil {
 			t.Fatal(e)

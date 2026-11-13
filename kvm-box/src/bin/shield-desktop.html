@@ -1,1 +1,84 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>KVM Box</title><style>body{font:16px system-ui;background:#10151c;color:#e5edf5;max-width:760px;margin:70px auto;padding:24px}h1{font-size:44px;margin-bottom:8px}.sub{color:#a7b8cb}button,a{font:inherit;border:1px solid #54718e;border-radius:8px;padding:11px 18px;color:#e5edf5;background:#253b50;text-decoration:none;cursor:pointer;display:inline-block;margin:12px 8px 12px 0}pre{white-space:pre-wrap;background:#19232f;padding:22px;border-radius:10px;min-height:100px}small{color:#9dafc3}</style><h1>KVM Box</h1><p class="sub">A measured native x86 Linux desktop, controlled by a portable WebAssembly app.</p><button id="start">Start desktop</button><button id="stop">Stop desktop</button><a href="/desktop/vnc.html?autoconnect=true&resize=remote&path=/desktop/websockify" target="_blank" rel="noopener">Open desktop</a><a href="/desktop/compute/" target="_blank" rel="noopener">Shield compute</a><pre id="status">Loading…</pre><h2>Moonlight</h2><p>Add PC <strong>127.0.0.2</strong> in Moonlight, then enter its pairing PIN here. Select “KVM Box Desktop” to stream.</p><form id="pair"><input id="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required placeholder="4-digit PIN" aria-label="Moonlight pairing PIN"><button>Pair Moonlight</button></form><p id="pair-status"></p><p class="sub">Video is encoded inside the desktop domain. Audio, input and Moonlight traffic travel through this owner-authenticated controller. After a desktop restart, remove its old PC entry in Moonlight and pair again.</p><small>Desktop changes are temporary in this version.</small><script>const out=document.querySelector('#status');async function call(action){try{const r=await fetch('/api/'+action,{method:action==='status'?'GET':'POST',headers:{'X-KVM-Box-Request':'1'}});const s=await r.json();out.textContent=s.error?'Desktop error: '+s.error:'Desktop '+s.status+(s.vcpus?'\n'+s.vcpus+' virtual CPUs':'')+(s.memoryMiB?' · '+(s.memoryMiB/1024)+' GiB memory':'')+'\nMeasured native desktop · temporary desktop storage';document.querySelector('#start').disabled=['starting','running','stopping'].includes(s.status);document.querySelector('#stop').disabled=['stopped','stopping'].includes(s.status)}catch(e){out.textContent=e.message}}document.querySelector('#start').onclick=()=>call('start');document.querySelector('#stop').onclick=()=>{if(confirm('Stop the desktop? Unsaved changes will be lost.'))call('stop')};document.querySelector('#pair').onsubmit=async e=>{e.preventDefault();const out=document.querySelector('#pair-status');try{const r=await fetch('/desktop/api/moonlight/pair',{method:'POST',headers:{'Content-Type':'application/json','X-KVM-Box-Request':'1'},body:JSON.stringify({pin:document.querySelector('#pin').value,name:'KVM Box owner'})});const s=await r.json();out.textContent=r.ok&&s.status?'Paired. Open KVM Box Desktop in Moonlight.':'Pairing failed: '+(s.error||JSON.stringify(s))}catch(e){out.textContent=e.message}};call('status');setInterval(()=>call('status'),4000);</script></html>
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>KVM Box</title><link rel="stylesheet" href="/a/xterm.css"><style>body{font:16px system-ui;background:#10151c;color:#e5edf5;max-width:860px;margin:70px auto;padding:24px}h1{font-size:44px;margin-bottom:8px}.sub{color:#a7b8cb}button,a{font:inherit;border:1px solid #54718e;border-radius:8px;padding:11px 18px;color:#e5edf5;background:#253b50;text-decoration:none;cursor:pointer;display:inline-block;margin:12px 8px 12px 0}button:disabled,a.off{opacity:.45;cursor:not-allowed}pre{white-space:pre-wrap;background:#19232f;padding:22px;border-radius:10px;min-height:100px}small{color:#9dafc3}#term{background:#000;border-radius:10px;padding:8px;min-height:360px;overflow-x:auto}#term-note{min-height:1.3em}</style>
+<h1>KVM Box</h1><p class="sub">A measured native x86 Linux desktop, controlled by a portable WebAssembly app.</p>
+<button id="power" disabled>Start desktop</button><a class="off" aria-disabled="true" href="/desktop/vnc.html?autoconnect=true&resize=remote&path=/desktop/websockify" target="_blank" rel="noopener">Open desktop</a><a class="off" aria-disabled="true" href="/desktop/compute/" target="_blank" rel="noopener">Shield compute</a><pre id="status">Loading…</pre>
+<h2>Terminal</h2><p class="sub">A shell inside the desktop, as the desktop user. It keeps running while this page is closed and ends when the desktop stops.</p><div id="term"></div><p id="term-note" class="sub">Start the desktop to use the terminal.</p><button id="term-restart" disabled>Restart shell</button>
+<h2>Moonlight</h2><p>With the KVM Box connector running on your computer, add PC <strong>127.0.0.2</strong> in Moonlight, then enter its pairing PIN here. Select “KVM Box Desktop” to stream.</p><form id="pair"><input id="pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required placeholder="4-digit PIN" aria-label="Moonlight pairing PIN"><button>Pair Moonlight</button></form><p id="pair-status"></p><p class="sub">Video is encoded inside the desktop domain. Audio, input and Moonlight traffic travel through this owner-authenticated controller. After a desktop restart, remove its old PC entry in Moonlight and pair again.</p><small>Desktop changes are temporary in this version.</small>
+<script src="/a/xterm.js"></script><script>
+const $=s=>document.querySelector(s),out=$('#status'),power=$('#power'),links=document.querySelectorAll('a[aria-disabled]');
+// One button: it starts a stopped desktop and stops a running one. The links
+// lead into the desktop, so they are live only while it runs.
+const LABEL={stopped:'Start desktop',failed:'Start desktop',starting:'Starting…',running:'Stop desktop',stopping:'Stopping…'};
+let state='';
+function show(s){
+ state=s.error?'':s.status||'';
+ out.textContent=s.error?'Desktop error: '+s.error:'Desktop '+s.status+(s.vcpus?'\n'+s.vcpus+' virtual CPUs':'')+(s.memoryMiB?' · '+(s.memoryMiB/1024)+' GiB memory':'')+'\nMeasured native desktop · temporary desktop storage';
+ if(LABEL[state])power.textContent=LABEL[state];
+ power.disabled=!['stopped','failed','running'].includes(state);
+ const on=state==='running';
+ for(const a of links){a.classList.toggle('off',!on);a.setAttribute('aria-disabled',String(!on))}
+ terminal(on);
+}
+async function call(action){
+ try{const r=await fetch('/api/'+action,{method:action==='status'?'GET':'POST',headers:{'X-KVM-Box-Request':'1'}});show(await r.json())}
+ catch(e){out.textContent=e.message;power.disabled=true}
+}
+power.onclick=()=>{
+ if(state==='running'){if(confirm('Stop the desktop? Unsaved changes will be lost.'))call('stop')}
+ else call('start');
+};
+for(const a of links)a.onclick=e=>{if(a.classList.contains('off'))e.preventDefault()};
+$('#pair').onsubmit=async e=>{e.preventDefault();const out=$('#pair-status');try{const r=await fetch('/desktop/api/moonlight/pair',{method:'POST',headers:{'Content-Type':'application/json','X-KVM-Box-Request':'1'},body:JSON.stringify({pin:$('#pin').value,name:'KVM Box owner'})});const s=await r.json();out.textContent=r.ok&&s.status?'Paired. Open KVM Box Desktop in Moonlight.':'Pairing failed: '+(s.error||JSON.stringify(s))}catch(e){out.textContent=e.message}};
+
+// Terminal: the shell's output is read from the desktop by cursor, so a reload
+// or a second page starts from the scrollback; keys go out one request at a
+// time, in order, and whatever is typed meanwhile rides in the next.
+const note=$('#term-note'),restart=$('#term-restart');
+const term=typeof Terminal==='function'?new Terminal({fontSize:13,scrollback:8000,cols:100,rows:26,theme:{background:'#000000'},cursorBlink:true}):null;
+let live=false,reading=false,cursor=null,decoder=new TextDecoder(),queue='',sending=false;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const b64=u=>{let s='';for(const b of u)s+=String.fromCharCode(b);return btoa(s)};
+async function tcall(body){
+ const r=await fetch('/terminal',{method:'POST',headers:{'Content-Type':'application/json','X-KVM-Box-Request':'1'},body:JSON.stringify(body)});
+ let s=null;try{s=await r.json()}catch(_){}
+ if(!s||!s.ok)throw Error(s&&s.error?s.error:'HTTP '+r.status);
+ return s;
+}
+function terminal(on){
+ if(!term){note.textContent='The terminal could not be loaded.';return}
+ restart.disabled=!on;
+ if(on===live)return;
+ live=on;
+ if(on){note.textContent='';read()}else{cursor=null;queue='';note.textContent='Start the desktop to use the terminal.'}
+}
+async function read(){
+ if(reading)return;
+ reading=true;
+ while(live){
+  try{
+   const s=await tcall(cursor===null?{op:'read',wait_ms:0}:{op:'read',cursor,wait_ms:20000});
+   if(!live)break;
+   if(s.reset){term.reset();decoder=new TextDecoder()}
+   if(s.data)term.write(decoder.decode(unb64(s.data),{stream:true}));
+   cursor=s.cursor;note.textContent='';
+   if(s.cols!==term.cols||s.rows!==term.rows)await tcall({op:'resize',cols:term.cols,rows:term.rows});
+  }catch(e){if(live)note.textContent='Terminal: '+e.message+'. Retrying…';await sleep(2000)}
+ }
+ reading=false;
+}
+async function type(){
+ if(sending||!queue)return;
+ sending=true;
+ const bytes=new TextEncoder().encode(queue);queue='';
+ try{for(let i=0;i<bytes.length;i+=8192)await tcall({op:'write',data:b64(bytes.subarray(i,i+8192))})}
+ catch(e){note.textContent='Terminal: '+e.message}
+ sending=false;
+ if(queue)type();
+}
+if(term){
+ term.open($('#term'));
+ term.onData(d=>{if(live){queue+=d;type()}});
+ restart.onclick=async()=>{try{await tcall({op:'restart'});term.focus()}catch(e){note.textContent='Terminal: '+e.message}};
+}
+call('status');setInterval(()=>call('status'),4000);
+</script></html>

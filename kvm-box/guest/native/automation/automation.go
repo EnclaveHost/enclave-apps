@@ -31,7 +31,7 @@ const (
 	clientUID      = 1003
 	maxRequest     = 64 << 10
 	maxOutput      = 1 << 20
-	maxConnections = 4
+	maxConnections = 8
 )
 
 // Deliberately constructed, not copied from the daemon's environment. In
@@ -161,8 +161,13 @@ type service struct {
 	env           []string
 	slots         chan struct{}
 	computerSlots chan struct{}
-	grab          func(context.Context) (screen, error)
-	send          func(context.Context, []string) error
+	// The terminal has its own bounds: a page's waiting read never takes a
+	// command or computer slot, and waiting reads never take each other's ops.
+	term      *terminal
+	termReads chan struct{}
+	termOps   chan struct{}
+	grab      func(context.Context) (screen, error)
+	send      func(context.Context, []string) error
 }
 
 func jsonReply(w http.ResponseWriter, code int, value any) {
@@ -184,8 +189,12 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_ = rc.SetWriteDeadline(time.Now().Add(125 * time.Second))
-	if r.Method != "POST" || (r.URL.Path != "/exec" && r.URL.Path != "/computer") || r.URL.RawQuery != "" || r.URL.RawPath != "" {
+	if r.Method != "POST" || (r.URL.Path != "/exec" && r.URL.Path != "/computer" && r.URL.Path != "/terminal") || r.URL.RawQuery != "" || r.URL.RawPath != "" {
 		jsonReply(w, 404, map[string]any{"ok": false, "error": "endpoint refused"})
+		return
+	}
+	if r.URL.Path == "/terminal" {
+		s.serveTerminal(w, r)
 		return
 	}
 	select {
@@ -238,6 +247,40 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonReply(w, 200, execute(r.Context(), body, s.dir, s.env))
+}
+
+func (s *service) serveTerminal(w http.ResponseWriter, r *http.Request) {
+	if s.term == nil {
+		jsonReply(w, 503, map[string]any{"ok": false, "error": "terminal unavailable"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequest)
+	defer r.Body.Close()
+	body, err := decodeTerminal(r.Body)
+	if err != nil {
+		jsonReply(w, 400, map[string]any{"ok": false, "error": "invalid terminal request"})
+		return
+	}
+	slots := s.termOps
+	if body.Op == "read" {
+		slots = s.termReads
+	}
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	default:
+		jsonReply(w, 429, map[string]any{"ok": false, "error": "terminal busy"})
+		return
+	}
+	value, err := s.term.serve(r.Context(), body)
+	switch {
+	case err == nil:
+		jsonReply(w, 200, value)
+	case errors.Is(err, errInvalidTerminal):
+		jsonReply(w, 400, map[string]any{"ok": false, "error": err.Error()})
+	default:
+		jsonReply(w, 503, map[string]any{"ok": false, "error": err.Error()})
+	}
 }
 
 type peerListener struct {
@@ -334,7 +377,9 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	s := &service{dir: "/home/desktop", env: desktopEnvironment, slots: make(chan struct{}, 2), computerSlots: make(chan struct{}, 1)}
+	s := &service{dir: "/home/desktop", env: desktopEnvironment, slots: make(chan struct{}, 2), computerSlots: make(chan struct{}, 1),
+		term: newTerminal("/home/desktop", desktopEnvironment), termReads: make(chan struct{}, 2), termOps: make(chan struct{}, 2)}
+	defer s.term.close()
 	srv := &http.Server{Handler: s, ReadHeaderTimeout: 3 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 8192, BaseContext: func(net.Listener) context.Context { return ctx }}
 	srv.SetKeepAlivesEnabled(false)
 	go func() { <-ctx.Done(); _ = srv.Close() }()

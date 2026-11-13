@@ -277,6 +277,7 @@ var (
 var routes = []route{
 	{path: "/exec", methods: []string{http.MethodPost}},
 	{path: "/computer", methods: []string{http.MethodPost}},
+	{path: "/terminal", methods: []string{http.MethodPost}},
 	{path: "/vnc.html", methods: getHead, query: true},
 	{path: "/app/", prefix: true, methods: getHead, query: true},
 	{path: "/core/", prefix: true, methods: getHead, query: true},

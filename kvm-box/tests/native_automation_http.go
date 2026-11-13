@@ -123,6 +123,25 @@ func main() {
 	v = call("/computer", map[string]any{"action": "unsupported-action"}, 400)
 	require(v["ok"] == false, "invalid action refusal")
 	checks = append(checks, "invalid action refused")
+	v = call("/terminal", map[string]any{"op": "read", "wait_ms": 0}, 200)
+	require(v["ok"] == true && v["running"] == true, "terminal started")
+	cursor := v["cursor"]
+	v = call("/terminal", map[string]any{"op": "resize", "cols": 132, "rows": 43}, 200)
+	require(v["cols"] == float64(132) && v["rows"] == float64(43), "terminal resize")
+	typed := base64.StdEncoding.EncodeToString([]byte("printf 'term-%s-%s-%s\\n' \"$(id -u)\" \"$(tput cols)\" \"$((6*7))\"\n"))
+	require(call("/terminal", map[string]any{"op": "write", "data": typed}, 200)["ok"] == true, "terminal input")
+	shown := ""
+	for deadline := time.Now().Add(15 * time.Second); !strings.Contains(shown, "term-1000-132-42") && time.Now().Before(deadline); {
+		v = call("/terminal", map[string]any{"op": "read", "cursor": cursor, "wait_ms": 2000}, 200)
+		b, e := base64.StdEncoding.Strict().DecodeString(v["data"].(string))
+		require(e == nil, "terminal output encoding")
+		shown += string(b)
+		cursor = v["cursor"]
+	}
+	require(strings.Contains(shown, "term-1000-132-42"), "terminal output as the desktop user")
+	v = call("/terminal", map[string]any{"op": "run"}, 400)
+	require(v["ok"] == false, "invalid terminal request refusal")
+	checks = append(checks, "terminal shell as the desktop user through both gateways")
 	success(command("sleep 65; printf long-command-ok", 70, 1024), "long-command-ok")
 	checks = append(checks, "response survives 60-second gateway default")
 	b, _ := json.Marshal(map[string]any{"passed": true, "checks": checks, "screen": map[string]int{"width": w, "height": h}, "ownerAuthentication": false, "productionRelease": false})
