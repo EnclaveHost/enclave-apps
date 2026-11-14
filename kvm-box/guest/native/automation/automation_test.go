@@ -20,7 +20,7 @@ import (
 
 func testService(t *testing.T) *service {
 	t.Helper()
-	return &service{dir: t.TempDir(), env: []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}, slots: make(chan struct{}, 2)}
+	return &service{dir: t.TempDir(), env: []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}, slots: make(chan struct{}, 2), pairedSlots: make(chan struct{}, 1)}
 }
 func intp(v int) *int { return &v }
 

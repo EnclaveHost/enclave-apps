@@ -168,6 +168,11 @@ type service struct {
 	termOps   chan struct{}
 	grab      func(context.Context) (screen, error)
 	send      func(context.Context, []string) error
+
+	// Sunshine's paired records, by certificate digest, for the inner gateway
+	// alone: no route of the web gateway maps to it. See paired.go.
+	statePath   string
+	pairedSlots chan struct{}
 }
 
 func jsonReply(w http.ResponseWriter, code int, value any) {
@@ -189,12 +194,16 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_ = rc.SetWriteDeadline(time.Now().Add(125 * time.Second))
-	if r.Method != "POST" || (r.URL.Path != "/exec" && r.URL.Path != "/computer" && r.URL.Path != "/terminal") || r.URL.RawQuery != "" || r.URL.RawPath != "" {
+	if r.Method != "POST" || (r.URL.Path != "/exec" && r.URL.Path != "/computer" && r.URL.Path != "/terminal" && r.URL.Path != "/paired") || r.URL.RawQuery != "" || r.URL.RawPath != "" {
 		jsonReply(w, 404, map[string]any{"ok": false, "error": "endpoint refused"})
 		return
 	}
 	if r.URL.Path == "/terminal" {
 		s.serveTerminal(w, r)
+		return
+	}
+	if r.URL.Path == "/paired" {
+		s.servePaired(w, r)
 		return
 	}
 	select {
@@ -378,7 +387,8 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	s := &service{dir: "/home/desktop", env: desktopEnvironment, slots: make(chan struct{}, 2), computerSlots: make(chan struct{}, 1),
-		term: newTerminal("/home/desktop", desktopEnvironment), termReads: make(chan struct{}, 2), termOps: make(chan struct{}, 2)}
+		term: newTerminal("/home/desktop", desktopEnvironment), termReads: make(chan struct{}, 2), termOps: make(chan struct{}, 2),
+		statePath: sunshineState, pairedSlots: make(chan struct{}, 1)}
 	defer s.term.close()
 	srv := &http.Server{Handler: s, ReadHeaderTimeout: 3 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 8192, BaseContext: func(net.Listener) context.Context { return ctx }}
 	srv.SetKeepAlivesEnabled(false)

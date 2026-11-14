@@ -72,6 +72,21 @@ again a second after it exits, and ends with the service (the desktop's stop).
 Two reads may wait at once; a third is answered 429 `terminal busy`. Programs
 started from it are ordinary desktop workload, as with `/exec`.
 
+`POST /paired` is the inner gateway's own question; no web route and no
+controller route maps to it. The body is exactly `{}`. The reply names every
+paired record in Sunshine's state file
+(`/home/desktop/.config/sunshine/sunshine_state.json`), in stored order, with
+the SHA-256 of the record's certificate (its DER, or its trimmed text when it
+is not one PEM certificate):
+`{"clients":[{"uuid":"…","cert_sha256":"…"}],"ok":true}`. Nothing else of the
+file leaves the service: no certificate, no name, no admin credential hash or
+salt. The file must be a regular file of at most 4 MiB with at most 512
+records, each with a distinct well-formed identifier and a certificate;
+otherwise the answer is 503 `paired clients unavailable`. One request at a
+time (a second is 429), apart from the command slots. The gateway uses the
+digests to find the records that repeat a certificate
+(`../inner/notes.md`, "Pairing the same client again").
+
 ## Verification
 
 From `kvm-box/guest/native/automation`:
@@ -88,7 +103,10 @@ RGB framing, grid mapping, invalid input without injection, JPEG decoding,
 failed-drag cleanup, pixel settling and concurrent action refusal. The terminal
 tests run a real shell on a real pseudo-terminal: output by cursor, long-poll
 wake-up, scrollback overrun, interrupt, resize, restart, respawn after exit,
-input bounds and the busy refusal.
+input bounds and the busy refusal. The paired-records tests cover digests of
+one certificate spelled two ways, empty and refused state files, the reply
+carrying digests only, and the file checks (absent, symbolic link, directory,
+oversized).
 
 From the repository root, with an available Xvfb binary, a writable scratch
 directory and the desktop UID (1000):
