@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -75,6 +76,7 @@ func testConfig(t *testing.T) config {
 	cfg.sunshineAddr = refused
 	cfg.credPath = filepath.Join(base, "absent", "sunshine-password")
 	cfg.handshake = 2 * time.Second
+	cfg.digestRetry = 5 * time.Millisecond
 	return cfg
 }
 
@@ -173,6 +175,11 @@ func TestProductionEndpointsAreFixed(t *testing.T) {
 	if cfg.wsAddr != "127.0.0.1:6080" || cfg.sunshineAddr != "127.0.0.1:47990" ||
 		cfg.credPath != "/run/native-ui/sunshine-password" || cfg.credUID != 1003 || cfg.credGID != 1003 {
 		t.Error("upstream configuration changed")
+	}
+	if sunshinePinURL != "https://127.0.0.1:47990/api/pin" || sunshineClientsURL != "https://127.0.0.1:47990/api/clients/list" ||
+		sunshineUnpairURL != "https://127.0.0.1:47990/api/clients/unpair" || gatedTunnelPort != "47984" ||
+		cfg.tidyTimeout != 10*time.Second || cfg.digestRetry != 200*time.Millisecond {
+		t.Error("pairing configuration changed")
 	}
 	if got := cfg.tunnelTarget("udp", "47998"); got != "127.0.0.1:47998" {
 		t.Errorf("tunnel target %q", got)
@@ -1164,13 +1171,30 @@ type sunshineFixture struct {
 	posts      atomic.Int32
 	other      atomic.Int32
 	posted     chan []byte
+
+	// Paired records, oldest first, as Sunshine keeps them: a PIN it accepts
+	// adds one, carrying the certificate named by pairAs. See clients_test.go.
+	mu           sync.Mutex
+	records      []fixtureRecord
+	serial       int
+	pairAs       string
+	noRecord     bool          // accept the PIN without storing a record
+	clientsBody  string        // answer for the list in place of the records
+	keepOnUnpair bool          // answer a removal without removing
+	unpairBody   string        // answer for a removal in place of its status
+	pinGate      chan struct{} // the PIN answer waits for this
+	listGate     chan struct{} // the list answer waits for this
+	lists        atomic.Int32
+	unpaired     []string
 }
 
 func startSunshine(t *testing.T, cfg *config, s *sunshineFixture) {
 	t.Helper()
-	s.posted = make(chan []byte, 4)
+	s.posted = make(chan []byte, 16)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/pin" {
+		switch r.URL.Path {
+		case "/api/pin", "/api/clients/list", "/api/clients/unpair":
+		default:
 			s.other.Add(1)
 			http.NotFound(w, r)
 			return
@@ -1179,6 +1203,10 @@ func startSunshine(t *testing.T, cfg *config, s *sunshineFixture) {
 		if !ok || user != "owner" || pass != testCredential {
 			w.WriteHeader(http.StatusUnauthorized)
 			io.WriteString(w, "<html>login "+pass+"</html>")
+			return
+		}
+		if r.URL.Path != "/api/pin" {
+			s.serveClients(w, r)
 			return
 		}
 		switch r.Method {
@@ -1197,6 +1225,12 @@ func startSunshine(t *testing.T, cfg *config, s *sunshineFixture) {
 			s.posts.Add(1)
 			b, _ := io.ReadAll(r.Body)
 			s.posted <- b
+			if s.pinGate != nil {
+				<-s.pinGate
+			}
+			if s.reply == `{"status":true}` && !s.noRecord {
+				s.addRecord()
+			}
 			io.WriteString(w, s.reply)
 		}
 	}))

@@ -56,7 +56,9 @@ func (g *gateway) serveAutomation(w http.ResponseWriter, r *http.Request) {
 // are sent, and one absolute deadline bounds the complete exchange.
 func (g *gateway) automationExchange(parent context.Context, path string, body []byte, deadline time.Time) (int, []byte, error) {
 	bad := errors.New("desktop automation unavailable")
-	if (path != "/exec" && path != "/computer" && path != "/terminal") || len(body) == 0 || len(body) > maxAutomationRequest {
+	// "/paired" is this gateway's own question (clients.go); no web route
+	// maps to it.
+	if (path != "/exec" && path != "/computer" && path != "/terminal" && path != "/paired") || len(body) == 0 || len(body) > maxAutomationRequest {
 		return 0, nil, bad
 	}
 	ctx, cancel := context.WithDeadline(parent, deadline)

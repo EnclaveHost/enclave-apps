@@ -145,6 +145,8 @@ type config struct {
 	credUID      uint32
 	credGID      uint32
 	pairTimeout  time.Duration
+	tidyTimeout  time.Duration
+	digestRetry  time.Duration
 
 	dial        time.Duration
 	handshake   time.Duration
@@ -185,6 +187,8 @@ func productionConfig() config {
 		credUID:      innerUID,
 		credGID:      innerUID,
 		pairTimeout:  pairTimeout,
+		tidyTimeout:  tidyTimeout,
+		digestRetry:  digestRetryWait,
 
 		dial:        dialTimeout,
 		handshake:   handshakeTimeout,
@@ -250,6 +254,7 @@ type gateway struct {
 	wsSlots     chan struct{}
 	tunnelSlots chan struct{}
 	pairSem     chan struct{}
+	pairGate    pairGate
 	sunshine    *http.Client
 	srv         *http.Server
 }
@@ -1374,6 +1379,14 @@ func (g *gateway) serveTunnel(w http.ResponseWriter, r *http.Request, query stri
 		return
 	}
 	defer release()
+	// A client's certificate is first shown on this port. While a PIN is being
+	// settled the connection waits, so it meets Sunshine's list only after the
+	// certificate's older records are gone. See clients.go.
+	if transport == "tcp" && port == gatedTunnelPort &&
+		!g.pairGate.wait(r.Context(), g.cfg.pairTimeout+g.cfg.tidyTimeout) {
+		writeError(w, http.StatusServiceUnavailable)
+		return
+	}
 	d := net.Dialer{Timeout: g.cfg.dial}
 	up, err := d.DialContext(r.Context(), transport, g.cfg.tunnelTarget(transport, port))
 	if err != nil {
@@ -1605,7 +1618,17 @@ func (g *gateway) servePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer wipe(cred)
+	open := g.pairGate.hold()
+	defer open()
 	status, code := g.pairSunshine(ctx, cred, pin, name)
+	if code == 0 && status {
+		// Sunshine has stored the record. Removing the certificate's older
+		// records is not the page's to cancel: it runs on the gateway's own
+		// context, and the page hears "paired" only when the list is settled.
+		tidy, done := context.WithTimeout(g.ctx, g.cfg.tidyTimeout)
+		code = g.tidyClients(tidy, cred)
+		done()
+	}
 	switch {
 	case code == http.StatusConflict:
 		writeJSON(w, code, []byte(pairCountBody))
@@ -1686,7 +1709,7 @@ type pinRequest struct {
 // Sunshine's boolean result, or a nonzero status for the client. Sunshine
 // bodies, headers and redirects are never passed through.
 func (g *gateway) pairSunshine(ctx context.Context, cred []byte, pin, name string) (bool, int) {
-	b, code := g.sunshineCall(ctx, http.MethodGet, nil, cred, maxPairList)
+	b, code := g.sunshineCall(ctx, http.MethodGet, sunshinePinURL, nil, cred, maxPairList)
 	if code != 0 {
 		return false, code
 	}
@@ -1701,7 +1724,7 @@ func (g *gateway) pairSunshine(ctx context.Context, cred []byte, pin, name strin
 	if err != nil {
 		return false, http.StatusBadGateway
 	}
-	b, code = g.sunshineCall(ctx, http.MethodPost, payload, cred, maxPairReply)
+	b, code = g.sunshineCall(ctx, http.MethodPost, sunshinePinURL, payload, cred, maxPairReply)
 	if code != 0 {
 		return false, code
 	}
@@ -1712,12 +1735,19 @@ func (g *gateway) pairSunshine(ctx context.Context, cred []byte, pin, name strin
 	return status, 0
 }
 
-func (g *gateway) sunshineCall(ctx context.Context, method string, body, cred []byte, limit int64) ([]byte, int) {
+// sunshineCall reaches one of the fixed admin endpoints: the PIN, the list of
+// paired records, or the removal of one record. No Origin or Referer header
+// is sent, which is what Sunshine's request-forgery check expects of a
+// client that is not a browser.
+func (g *gateway) sunshineCall(ctx context.Context, method, target string, body, cred []byte, limit int64) ([]byte, int) {
+	if target != sunshinePinURL && target != sunshineClientsURL && target != sunshineUnpairURL {
+		return nil, http.StatusServiceUnavailable
+	}
 	var rd io.Reader = http.NoBody
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, sunshinePinURL, rd)
+	req, err := http.NewRequestWithContext(ctx, method, target, rd)
 	if err != nil {
 		return nil, http.StatusServiceUnavailable
 	}

@@ -78,6 +78,73 @@ cgroups, and signal readiness only after the required services are ready.
 The existing control-chain test still uses a fixture inner server; this new
 boundary test does not by itself replace that whole-chain acceptance.
 
+## Pairing the same client again (source, not released image)
+
+Sunshine 2026.914 appends a record for every completed pairing and accepts a
+client certificate only while exactly one record carries it. Moonlight keeps
+its certificate, so a Moonlight that paired a second time was refused on every
+HTTPS request ("The client is not authorized. Certificate verification
+failed. (Error 401)"), and every further try added a record. Only a desktop
+restart cleared it.
+
+After Sunshine accepts a PIN the gateway now leaves one record per
+certificate (`clients.go`): it lists the records through Sunshine's admin API,
+asks the desktop automation service which certificate each record carries
+(`/paired`, digests only), removes every record that a later record repeats,
+and lists again. The page hears `{"status":true}` only when that list holds
+none of the removed records; otherwise 502. Rules:
+
+- The newest record of a certificate always stays, so the list never becomes
+  empty here (Sunshine ends the running application when it does).
+- Without digests for every listed record (three tries, 200 ms apart) only the
+  newest record stays: the client that just paired works, other devices pair
+  again.
+- The cleanup runs on the gateway's own context (10 s), not the page's
+  request, once Sunshine has accepted the PIN.
+- New tunnel connections to port 47984 wait from before the PIN is sent until
+  the list is settled (at most the pairing time plus the cleanup time, then
+  503). Sunshine stores the record before it answers the PIN, and the client's
+  next request is its first with the certificate; held back, it never meets a
+  list in which its certificate appears twice. Connections already open are
+  not touched.
+- `/paired` is not a web route: the page and the controller get 404.
+
+Limit: when the page's request ends while the PIN is still with Sunshine (30 s
+pairing time), a pairing that completes afterwards is not cleaned up. The next
+pairing through the page cleans it up.
+
+Unit tests (`clients_test.go`) use a Sunshine fixture that keeps records the
+way Sunshine does. A separate run uses Sunshine itself: the image's base root
+read-only in a sandbox with its own loopback, a virtual display, Sunshine
+started as nsinit starts it, automation's `TestLiveServePaired` answering
+`/paired` from the real state file, and `TestLiveSunshinePairAgain` pairing as
+Moonlight does (one certificate kept, the PIN through this gateway's route,
+the first certificate request sent at once through the tunnel). Both tests
+are behind the `sunshine_live` build tag and skip without their environment:
+
+```sh
+go test -c -tags sunshine_live -o "$BIN/inner.test" .          # in inner/
+go test -c -tags sunshine_live -o "$BIN/automation.test" .     # in automation/
+bwrap --ro-bind "$BASE_ROOT" / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run \
+  --bind "$HOME_DIR" /home/desktop --ro-bind "$BIN" /mnt --bind "$OUT" /media \
+  --unshare-net --unshare-pid --unshare-ipc --die-with-parent /bin/sh /mnt/inside.sh
+```
+
+`inside.sh` is `sunshine-live-inside.sh` copied into `$BIN`. It sets a random credential with `sunshine /sunshine.conf --creds`,
+starts `Xvfb :0` and `sunshine /sunshine.conf`, then runs
+`automation.test -test.run 'TestLiveServePaired$'` (with
+`KVMBOX_LIVE_SOCKET_DIR`, `KVMBOX_LIVE_STATE`, `KVMBOX_LIVE_STOP`) beside
+`inner.test -test.run 'TestLiveSunshinePairAgain$'` (with
+`KVMBOX_LIVE_CREDENTIAL`, `KVMBOX_LIVE_SOCKET_DIR`).
+
+Result on 2026-11-14 with Sunshine 2026.914.233613: one client paired three
+times and a second client beside it all stay authorized, from the first
+certificate request on, with one record each. The same binary shows the
+defect when the PIN is entered at Sunshine alone (two records, status 401 for
+that certificate, the other client unaffected) and clears it with one more
+pairing through the route. This run has no nsinit, no confined identities, no
+nft rules and no video stream; it is not a test of the image.
+
 ## Desktop automation integration (source, not released image)
 
 The exact POST routes `/exec` and `/computer` now forward the controller's
