@@ -97,6 +97,10 @@ struct AwaitingRecovery {
     /// duration of the RPC in `SlabRecovery::recover_shard` to ensure the
     /// reservation is released on completion or error.
     sectors: Vec<(SectorTask, Option<InflightGuard>)>,
+    /// The slab's shard count: its sectors before `prioritize` dropped those
+    /// without a known host. A shard keeps its original slab index, so the
+    /// recovered shards are laid out over all of them, never over the subset.
+    total_shards: usize,
     /// This chunk's position in download order. Compared against `popped`
     /// to decide whether the chunk is close enough to the read head to race.
     seq: usize,
@@ -171,6 +175,7 @@ impl SlabRecovery<AwaitingRecovery> {
             )));
         }
 
+        let total_shards = slab.slab.sectors.len();
         let mut sectors = slab
             .slab
             .sectors
@@ -224,6 +229,7 @@ impl SlabRecovery<AwaitingRecovery> {
             length: slab.slab.length as usize,
             state: AwaitingRecovery {
                 sectors,
+                total_shards,
                 seq,
                 head,
                 popped,
@@ -287,7 +293,7 @@ impl SlabRecovery<AwaitingRecovery> {
         shard_downloaded: Option<ShardProgressCallback>,
     ) -> Result<SlabRecovery<ShardsRecovered>, DownloadError> {
         let mut shard_tasks = JoinSet::new();
-        let mut shards = vec![None; self.state.sectors.len()];
+        let mut shards = vec![None; self.state.total_shards];
         let mut sectors = VecDeque::from(std::mem::take(&mut self.state.sectors));
         let seq = self.state.seq;
         let mut popped_rx = self.state.popped.subscribe();
@@ -330,10 +336,25 @@ impl SlabRecovery<AwaitingRecovery> {
                     let DownloadResult{ result, task, elapsed } = res?;
                     match result {
                         Ok(data) => {
+                            // a shard goes to its original slab index; one outside the slab, or one
+                            // recovered twice, is refused rather than counted or overwritten
+                            let total_shards = shards.len();
+                            let Some(slot) = shards.get_mut(task.shard_index) else {
+                                return Err(DownloadError::InvalidSlab(format!(
+                                    "shard index {} is outside the slab's {total_shards} shards",
+                                    task.shard_index
+                                )));
+                            };
+                            if slot.is_some() {
+                                return Err(DownloadError::InvalidSlab(format!(
+                                    "shard {} was recovered twice",
+                                    task.shard_index
+                                )));
+                            }
                             recovered_shards += 1;
                             slowest_winner = Some(slowest_winner.unwrap_or_default().max(elapsed));
                             let shard_size = data.len();
-                            shards[task.shard_index] = Some(Vec::from(data));
+                            *slot = Some(Vec::from(data));
                             if recovered_shards <= min_shards && let Some(callback) = &shard_downloaded {
                                 callback(ShardProgress {
                                     host_key: task.sector.host_key,
@@ -1789,5 +1810,218 @@ mod test {
             slab.sectors.len(),
             "the head transition reads every remaining sector"
         );
+    }
+
+    /// Shard topology after `prioritize` drops sectors whose host the SDK no
+    /// longer knows (the indexer's usable list omits them, e.g. after it
+    /// blocked unusable hosts). Recovered shards must sit at their ORIGINAL
+    /// slab index in a vector of the slab's full shard count; the subset's
+    /// length is neither the index space nor the erasure-code shape.
+    mod shard_topology {
+        use super::*;
+        use sia_core::signing::PublicKey;
+
+        struct Fixture {
+            hosts: Hosts,
+            transport: mock::Client,
+            app_key: Arc<AppKey>,
+            all_hosts: Vec<Host>,
+            obj: Object,
+            data: Bytes,
+        }
+
+        impl Fixture {
+            /// One full slab in the production 10+20 layout on 30 of 60 mock hosts.
+            async fn new() -> Self {
+                let upload_options = UploadOptions::default();
+                assert_eq!((upload_options.data_shards, upload_options.parity_shards), (10, 20));
+                let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+                let transport = mock::Client::new();
+                let hosts = Hosts::new(Client::Mock(transport.clone()));
+                let all_hosts: Vec<Host> = (0..60)
+                    .map(|_| Host {
+                        public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                        addresses: vec![NetAddress {
+                            protocol: sia_core::types::v2::Protocol::QUIC,
+                            address: "localhost:1234".to_string(),
+                        }],
+                        country_code: "US".to_string(),
+                        latitude: 0.0,
+                        longitude: 0.0,
+                        good_for_upload: true,
+                    })
+                    .collect();
+                hosts.update(all_hosts.clone(), true);
+                let mut data = BytesMut::zeroed(optimal_data_size);
+                rand::rng().fill_bytes(&mut data);
+                let data = data.freeze();
+                let app_key = Arc::new(AppKey::import(rand::random()));
+                let obj = upload_object(
+                    hosts.clone(),
+                    crate::app_client::Client::mock(),
+                    app_key.clone(),
+                    Object::default(),
+                    Cursor::new(data.clone()),
+                    upload_options,
+                )
+                .await
+                .unwrap();
+                assert_eq!(obj.slabs().len(), 1);
+                assert_eq!(obj.slabs()[0].sectors.len(), 30);
+                Fixture { hosts, transport, app_key, all_hosts, obj, data }
+            }
+
+            fn slab(&self) -> Slab {
+                self.obj.slabs()[0].clone()
+            }
+
+            fn host_of(&self, shard: usize) -> PublicKey {
+                self.slab().sectors[shard].host_key
+            }
+
+            /// The SDK's host list becomes the full list minus the hosts of
+            /// `shards`, as `Hosts::refresh` replaces it with the indexer's.
+            fn forget(&self, shards: impl IntoIterator<Item = usize>) {
+                let gone: Vec<PublicKey> = shards.into_iter().map(|i| self.host_of(i)).collect();
+                self.hosts.update(
+                    self.all_hosts.iter().filter(|h| !gone.contains(&h.public_key)).cloned().collect(),
+                    true,
+                );
+            }
+
+            /// Every read of the hosts of `shards` fails (more often than a
+            /// sector is retried).
+            fn fail_reads(&self, shards: impl IntoIterator<Item = usize>) {
+                let keys: Vec<PublicKey> = shards.into_iter().map(|i| self.host_of(i)).collect();
+                self.transport.set_read_failures(keys, 100);
+            }
+
+            fn recovery(&self) -> Result<SlabRecovery<AwaitingRecovery>, DownloadError> {
+                let mut slab = self.slab();
+                slab.offset = 0;
+                slab.length = self.data.len() as u32;
+                let controller = Arc::new(InflightController::new(INITIAL_INFLIGHT, MIN_INFLIGHT, 100, 10));
+                let permit = controller.sample();
+                SlabRecovery::new(
+                    self.hosts.clone(),
+                    controller,
+                    self.app_key.clone(),
+                    permit,
+                    ChunkSlab { slab, index: 0, object_offset: 0 },
+                    0,
+                    watch::channel(0).0,
+                )
+            }
+
+            /// Recovers, decodes and decrypts the whole slab through `SlabRecovery`.
+            async fn recover(&self, recovery: SlabRecovery<AwaitingRecovery>) -> Result<Vec<u8>, DownloadError> {
+                let mut out = Vec::with_capacity(self.data.len());
+                recovery.recover_shards(None).await?.decode()?.write(&mut out).await?;
+                Chacha20Cipher::new_v1(self.obj.data_key.clone(), 0, &self.slab().encryption_key)
+                    .apply_keystream(&mut out);
+                Ok(out)
+            }
+
+            /// The whole object through the public `Download` reader (sia-s3's GET path).
+            async fn download(&self) -> Result<Vec<u8>, String> {
+                let mut out = Vec::with_capacity(self.data.len());
+                let mut download = Download::new(&self.obj, self.hosts.clone(), self.app_key.clone(), DownloadOptions::default())
+                    .map_err(|e| format!("{e:?}"))?;
+                tokio::io::copy(&mut download, &mut out).await.map_err(|e| format!("{e:?}"))?;
+                Ok(out)
+            }
+
+            async fn assert_exact(&self, case: &str) {
+                let recovered = self.recover(self.recovery().expect(case)).await.unwrap_or_else(|e| panic!("{case}: recovery: {e:?}"));
+                assert!(recovered == self.data[..], "{case}: SlabRecovery bytes differ");
+                let downloaded = self.download().await.unwrap_or_else(|e| panic!("{case}: download: {e}"));
+                assert!(downloaded == self.data[..], "{case}: Download bytes differ");
+            }
+        }
+
+        /// Hosts of shards 0-2 unknown, shards 3-19 unreadable: only the parity
+        /// shards 20-29 survive (indices beyond the 27 remaining sectors).
+        #[sia_core_derive::cross_target_test]
+        async fn parity_only_noncontiguous_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            f.forget(0..3);
+            f.fail_reads(3..20);
+            f.assert_exact("parity-only 20..29").await;
+        }
+
+        /// Hosts of the LAST shards unknown and data shards 0-4 unreadable: the
+        /// erasure code must still be 10+20, not 10+(remaining - 10).
+        #[sia_core_derive::cross_target_test]
+        async fn trailing_hosts_unknown_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            f.forget(27..30);
+            f.fail_reads(0..5);
+            f.assert_exact("trailing 27..29 unknown, data 0..4 unreadable").await;
+        }
+
+        /// One storage endpoint gone (shard 0's host) and real out-of-order
+        /// completion: shards 1-19 are slow, so 20-29 (index 29 = the
+        /// remaining count) complete first.
+        #[sia_core_derive::cross_target_test]
+        async fn one_unknown_host_out_of_order_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            f.forget([0]);
+            f.transport.set_slow_hosts((1..20).map(|i| f.host_of(i)), Duration::from_secs(3));
+            let recovered = f.recover(f.recovery().unwrap()).await.expect("recovery");
+            assert!(recovered == f.data[..], "SlabRecovery bytes differ");
+            f.transport.reset_slow_hosts();
+        }
+
+        /// Losing any single endpoint returns the exact bytes.
+        #[sia_core_derive::cross_target_test]
+        async fn single_host_loss_at_each_position_recovers_exact_bytes() {
+            let f = Fixture::new().await;
+            for k in [0, 5, 9, 10, 19, 20, 28, 29] {
+                f.forget([k]);
+                f.assert_exact(&format!("host of shard {k} unknown")).await;
+            }
+        }
+
+        /// Fewer than min_shards survivors fail with NotEnoughShards, never a
+        /// panic and never bytes.
+        #[sia_core_derive::cross_target_test]
+        async fn insufficient_shards_fail_cleanly() {
+            let f = Fixture::new().await;
+            f.forget(0..15);
+            f.fail_reads(15..21);
+            match f.recover(f.recovery().unwrap()).await {
+                Err(DownloadError::NotEnoughShards(have, 10)) => assert!(have < 10),
+                other => panic!("expected NotEnoughShards, got {:?}", other.map(|b| b.len())),
+            }
+            assert!(f.download().await.is_err(), "the reader must return an error");
+            f.forget(0..21);
+            match f.recovery() {
+                Err(DownloadError::NotEnoughShards(9, 10)) => {}
+                other => panic!("expected NotEnoughShards(9, 10), got {:?}", other.err()),
+            }
+        }
+
+        /// A task whose shard index lies outside the slab, or two tasks for one
+        /// index, are refused as InvalidSlab (only 10 sectors are known, so every
+        /// task's result is needed and the check is reached deterministically).
+        #[sia_core_derive::cross_target_test]
+        async fn malformed_shard_indices_are_refused() {
+            let f = Fixture::new().await;
+            f.forget(10..30);
+            let mut recovery = f.recovery().unwrap();
+            assert_eq!(recovery.state.sectors.len(), 10);
+            recovery.state.sectors[3].0.shard_index = 30;
+            match f.recover(recovery).await {
+                Err(DownloadError::InvalidSlab(msg)) => assert!(msg.contains("outside"), "{msg}"),
+                other => panic!("expected InvalidSlab, got {:?}", other.map(|b| b.len())),
+            }
+            let mut recovery = f.recovery().unwrap();
+            let first = recovery.state.sectors[0].0.shard_index;
+            recovery.state.sectors[1].0.shard_index = first;
+            match f.recover(recovery).await {
+                Err(DownloadError::InvalidSlab(msg)) => assert!(msg.contains("twice"), "{msg}"),
+                other => panic!("expected InvalidSlab, got {:?}", other.map(|b| b.len())),
+            }
+        }
     }
 }
