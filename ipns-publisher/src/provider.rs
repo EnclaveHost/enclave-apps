@@ -296,6 +296,8 @@ pub struct Provider {
     /// Whether the current head advertises every block of `current_root`.
     built_all: bool,
     walk: Option<Walk>,
+    /// The root whose walk failed and has not been started again.
+    failed_root: Option<Vec<u8>>,
 
     tasks: VecDeque<PTask>,
     durable: bool,
@@ -336,6 +338,7 @@ impl Provider {
             block_count: 0,
             built_all: false,
             walk: None,
+            failed_root: None,
             tasks: VecDeque::new(),
             durable: false,
             last_note: "idle".into(),
@@ -359,6 +362,7 @@ impl Provider {
             return;
         }
         self.walk = None;
+        self.failed_root = None;
         self.tasks.retain(|t| !matches!(t, PTask::Build(_) | PTask::Walk));
         self.tasks.push_front(PTask::Build(root_cid_bytes));
     }
@@ -397,8 +401,19 @@ impl Provider {
         }
     }
 
+    /// Whether a walk failed and nothing has started it again.
+    pub fn wants_retry(&self) -> bool {
+        self.failed_root.is_some()
+    }
+
+    /// Whether the head advertises the current root the way the configuration asks.
+    pub fn is_current(&self) -> bool {
+        self.head.is_some() && self.built_all == self.announce_all_blocks && self.walk.is_none() && self.failed_root.is_none()
+    }
+
     fn walk_failed(&mut self, root: &[u8], e: String) {
         self.walk = None;
+        self.failed_root = Some(root.to_vec());
         self.last_error = Some(format!("walk {}: {e}", ipni::cid_string(root)));
         eprintln!("[ipns-publisher] IPNI {}", self.last_error.as_ref().unwrap());
     }
@@ -445,6 +460,7 @@ impl Provider {
         self.current_root = Some(root);
         self.block_count = mhs.len();
         self.built_all = all;
+        self.failed_root = None;
         self.prune();
         self.save_state();
 
@@ -791,6 +807,7 @@ mod tests {
             block_count: 0,
             built_all: false,
             walk: None,
+            failed_root: None,
             tasks: VecDeque::new(),
             durable: false,
             last_note: "idle".into(),
@@ -887,7 +904,7 @@ mod tests {
             p.walk_step(&|cid| store.get(cid).cloned().ok_or_else(|| "404".to_string()));
         }
         assert!(p.last_error.as_ref().unwrap().contains("does not hash"), "{:?}", p.last_error);
-        assert!(p.head.is_none() && !p.built_all);
+        assert!(p.head.is_none() && !p.built_all && p.wants_retry() && !p.is_current());
         store.insert(dir_key, good);
         p.announce_root(root);
         p.drive();
@@ -895,5 +912,6 @@ mod tests {
             p.walk_step(&|cid| store.get(cid).cloned().ok_or_else(|| "404".to_string()));
         }
         assert_eq!((p.last_error.clone(), p.block_count, p.built_all), (None, total, true));
+        assert!(!p.wants_retry() && p.is_current());
     }
 }

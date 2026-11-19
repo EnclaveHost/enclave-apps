@@ -36,6 +36,13 @@ const APP: &str = "ipns-publisher/0.1.0";
 const MAX_BODY: usize = 64 * 1024;
 const STATE_FILE: &str = "/data/ipns-publisher-state.json";
 
+/// How long after the n-th failure in a row to try again: 30 s, doubling, at
+/// most 15 minutes and never longer than the regular interval.
+fn retry_delay(failures: u32, republish_secs: u64) -> Duration {
+    let secs = 30u64.saturating_mul(1 << failures.saturating_sub(1).min(5));
+    Duration::from_secs(secs.min(900).min(republish_secs.max(1)))
+}
+
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64
 }
@@ -190,6 +197,11 @@ struct App {
     delegate_results: Vec<DelegateResult>,
     last_error: Option<String>,
     next_publish: Instant,
+    /// Publish rounds that failed in a row (no value, no record).
+    failed_rounds: u32,
+    /// IPNI walks that failed in a row, and when the next one starts.
+    ipni_failures: u32,
+    ipni_retry_at: Option<Instant>,
     durable_state: bool,
     dht: Option<p2p::Dht>,
     provider: Option<provider::Provider>,
@@ -230,6 +242,9 @@ impl App {
             delegate_results: Vec::new(),
             last_error: None,
             next_publish: Instant::now(),
+            failed_rounds: 0,
+            ipni_failures: 0,
+            ipni_retry_at: None,
             durable_state: false,
             dht: None,
             provider,
@@ -313,12 +328,47 @@ impl App {
         self.tasks.push_back(Task::Sign);
     }
 
+    /// A round that signed nothing is tried again soon, not after
+    /// `republishSecs`: a partition that starts before its network is up
+    /// otherwise publishes nothing for hours (2026-11-19: four).
+    fn publish_failed(&mut self, e: String) {
+        self.last_error = Some(e);
+        self.failed_rounds = self.failed_rounds.saturating_add(1);
+        let wait = retry_delay(self.failed_rounds, self.cfg.republish_secs);
+        self.next_publish = self.next_publish.min(Instant::now() + wait);
+    }
+
+    /// A failed IPNI walk starts again after a backoff instead of waiting for
+    /// the next signed value.
+    fn retry_provider(&mut self) {
+        let failed = self.provider.as_ref().is_some_and(|p| p.wants_retry());
+        if !failed {
+            if self.provider.as_ref().is_some_and(|p| p.is_current()) {
+                self.ipni_failures = 0;
+            }
+            self.ipni_retry_at = None;
+            return;
+        }
+        match self.ipni_retry_at {
+            None => {
+                self.ipni_failures = self.ipni_failures.saturating_add(1);
+                self.ipni_retry_at = Some(Instant::now() + retry_delay(self.ipni_failures, self.cfg.republish_secs));
+            }
+            Some(at) if Instant::now() >= at => {
+                self.ipni_retry_at = None;
+                self.announce_provider();
+            }
+            Some(_) => {}
+        }
+    }
+
     /// Advance one bounded task. Returns whether work happened.
     fn tick(&mut self) -> bool {
         if self.cfg.identity.is_some() && Instant::now() >= self.next_publish {
             self.next_publish = Instant::now() + Duration::from_secs(self.cfg.republish_secs);
             self.enqueue_publish();
         }
+        self.retry_provider();
         let Some(task) = self.tasks.pop_front() else { return false };
         match task {
             Task::Recover(delegate) => self.do_recover(&delegate),
@@ -423,7 +473,7 @@ impl App {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[ipns-publisher] publish aborted: {e}");
-                self.last_error = Some(e);
+                self.publish_failed(e);
                 return;
             }
         };
@@ -458,6 +508,7 @@ impl App {
                 self.validity_unix = validity_unix;
                 self.published_at = Some(now_unix());
                 self.last_error = None;
+                self.failed_rounds = 0;
                 self.note_recovered(seq, self.value.clone(), "self");
                 self.save_state();
                 for d in self.cfg.delegates.clone() {
@@ -471,7 +522,7 @@ impl App {
             }
             Err(e) => {
                 eprintln!("[ipns-publisher] record build failed: {e}");
-                self.last_error = Some(e);
+                self.publish_failed(e);
             }
         }
     }
@@ -841,5 +892,61 @@ fn serve() {
         if !(worked || p2p_busy || ipni_busy || flushed) {
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(value: &str) -> Config {
+        Config {
+            identity: Some(Identity::from_seed([9u8; 32])),
+            key_error: None,
+            value_src: value.into(),
+            lifetime_secs: 172800,
+            republish_secs: 14400,
+            ttl_secs: 300,
+            delegates: Vec::new(),
+            bootstrap: Vec::new(),
+            dht: false,
+            api_key: String::new(),
+            ipni_gateway_url: None,
+            ipni_publisher_url: None,
+            ipni_indexers: Vec::new(),
+            ipni_all_blocks: true,
+        }
+    }
+
+    #[test]
+    fn retry_delay_backs_off_and_never_exceeds_the_interval() {
+        let secs = |n| retry_delay(n, 14400).as_secs();
+        assert_eq!([secs(1), secs(2), secs(3), secs(4), secs(5), secs(6), secs(40)], [30, 60, 120, 240, 480, 900, 900]);
+        assert_eq!(retry_delay(3, 45).as_secs(), 45);
+    }
+
+    #[test]
+    fn a_round_that_signs_nothing_is_tried_again_soon() {
+        let mut app = App::new(config("")); // no value: every round fails
+        while app.tick() {}
+        assert!(app.record.is_none() && app.last_error.is_some());
+        assert_eq!(app.failed_rounds, 1);
+        let wait = app.next_publish.saturating_duration_since(Instant::now());
+        assert!(wait <= Duration::from_secs(30), "next round in {wait:?}, not in republishSecs");
+        // the next round fails too and waits longer
+        app.next_publish = Instant::now();
+        while app.tick() {}
+        assert_eq!(app.failed_rounds, 2);
+        let wait = app.next_publish.saturating_duration_since(Instant::now());
+        assert!(wait > Duration::from_secs(30) && wait <= Duration::from_secs(60), "{wait:?}");
+    }
+
+    #[test]
+    fn a_signed_round_waits_the_regular_interval() {
+        let mut app = App::new(config("/ipfs/bafybeihvox7sjpnt5uuaqa6we4zuigwl5ohdx4jjvnxyiccx76a2nx7pbe"));
+        while app.tick() {}
+        assert!(app.record.is_some() && app.last_error.is_none());
+        assert_eq!(app.failed_rounds, 0);
+        assert!(app.next_publish.saturating_duration_since(Instant::now()) > Duration::from_secs(14000));
     }
 }
