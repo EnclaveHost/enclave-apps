@@ -5,8 +5,8 @@
 //! bitswap. See IPNI.md for the Step-0 findings and wire formats.
 //!
 //! Flow, on a new site root:
-//!   1. enumerate the DAG's block multihashes from the adapter's
-//!      `?format=car&dag-scope=all` (the content lives in the bucket, not here);
+//!   1. take the root's multihash, or with `announceAllBlocks` every block's
+//!      (the walk below; the content lives behind the gateway, not here);
 //!   2. build an EntryChunk of those multihashes and an Advertisement (chained
 //!      to the previous head) whose Addresses = the adapter gateway and whose
 //!      Metadata = transport-ipfs-gateway-http;
@@ -14,23 +14,156 @@
 //!      `/ipni/v1/ad/head` and `/ipni/v1/ad/<cid>`;
 //!   4. announce the new head to the indexers via `PUT /announce`.
 //!
-//! Single-threaded, bounded per tick (the suite discipline): the CAR fetch
+//! With `announceAllBlocks` the DAG is walked instead (one dag-pb block per
+//! drive() step, each checked against its CID; raw leaves are taken from their
+//! parent's links and never fetched), and every block's multihash is
+//! advertised. A node that already has the root block asks the network for the
+//! root's children by their own CIDs: with only the root advertised it finds
+//! no provider and the site does not load (enclavehost.eth, 2026-11-19).
+//!
+//! Single-threaded, bounded per tick (the suite discipline): each block fetch
 //! and each announce PUT are one blocking HTTP request per drive() step.
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ed25519_dalek::SigningKey;
 
 use crate::ipni::{self, Advertisement};
 use crate::multiformats::{hex, hex_decode, multiaddr_encode, varint_read};
 use crate::webreq;
+use sha2::{Digest, Sha256};
 
 const CHAIN_FILE: &str = "/data/ipni-chain.json";
 /// Keep at most this many advertisement generations crawlable; older ads are
 /// pruned (an indexer that far behind re-syncs from the current head).
 const MAX_CHAIN: usize = 32;
+
+/// One IPNI entry chunk carries every multihash of the site; a tree larger than
+/// this is refused rather than advertised in part.
+const MAX_WALK_BLOCKS: usize = 16384;
+const CODEC_DAG_PB: u64 = 0x70;
+
+// ---- DAG walk --------------------------------------------------------------
+
+/// The codec of a binary CID (a CIDv0 is dag-pb).
+fn cid_codec(cid: &[u8]) -> Option<u64> {
+    if cid.len() == 34 && cid[0] == 0x12 && cid[1] == 0x20 {
+        return Some(CODEC_DAG_PB);
+    }
+    let (version, n) = varint_read(cid)?;
+    if version != 1 {
+        return None;
+    }
+    varint_read(&cid[n..]).map(|(codec, _)| codec)
+}
+
+/// The link CIDs of a dag-pb node, in order (PBNode.Links is field 2, PBLink.Hash
+/// is field 1). Anything that is not a well-formed dag-pb node is an error.
+pub fn dag_pb_links(block: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    fn field(b: &[u8], p: &mut usize) -> Result<(u64, Option<(usize, usize)>), String> {
+        let (key, n) = varint_read(&b[*p..]).ok_or("dag-pb: bad field key")?;
+        *p += n;
+        match key & 7 {
+            0 => {
+                let (_, n) = varint_read(&b[*p..]).ok_or("dag-pb: bad varint")?;
+                *p += n;
+                Ok((key >> 3, None))
+            }
+            2 => {
+                let (len, n) = varint_read(&b[*p..]).ok_or("dag-pb: bad length")?;
+                *p += n;
+                let end = p.checked_add(len as usize).filter(|e| *e <= b.len()).ok_or("dag-pb: truncated field")?;
+                let span = (*p, end);
+                *p = end;
+                Ok((key >> 3, Some(span)))
+            }
+            _ => Err("dag-pb: unsupported wire type".into()),
+        }
+    }
+    let mut links = Vec::new();
+    let mut p = 0usize;
+    while p < block.len() {
+        let (num, span) = field(block, &mut p)?;
+        let (2, Some((start, end))) = (num, span) else { continue };
+        let link = &block[start..end];
+        let mut q = 0usize;
+        let mut hash = None;
+        while q < link.len() {
+            if let (1, Some((s, e))) = field(link, &mut q)? {
+                hash = Some(link[s..e].to_vec());
+            }
+        }
+        links.push(hash.ok_or("dag-pb: link without a hash")?);
+    }
+    Ok(links)
+}
+
+/// A walk of the site DAG in progress.
+struct Walk {
+    root: Vec<u8>,
+    /// dag-pb blocks still to fetch (CID bytes).
+    queue: VecDeque<Vec<u8>>,
+    seen: HashSet<Vec<u8>>,
+    /// Multihashes in the order found, each once.
+    mhs: Vec<Vec<u8>>,
+}
+
+impl Walk {
+    fn new(root: Vec<u8>) -> Result<Walk, String> {
+        let mut w = Walk { root: root.clone(), queue: VecDeque::new(), seen: HashSet::new(), mhs: Vec::new() };
+        w.visit(root)?;
+        Ok(w)
+    }
+
+    fn visit(&mut self, cid: Vec<u8>) -> Result<(), String> {
+        let (mh, _) = cid_multihash(&cid).ok_or("walk: bad CID")?;
+        // identity multihashes carry their bytes inline; nobody fetches them
+        if varint_read(&mh).map(|(code, _)| code == 0).unwrap_or(false) || !self.seen.insert(mh.clone()) {
+            return Ok(());
+        }
+        if self.mhs.len() >= MAX_WALK_BLOCKS {
+            return Err(format!("the tree has more than {MAX_WALK_BLOCKS} blocks"));
+        }
+        self.mhs.push(mh);
+        if cid_codec(&cid) == Some(CODEC_DAG_PB) {
+            self.queue.push_back(cid);
+        }
+        Ok(())
+    }
+
+    /// Fetch and check one dag-pb block and queue its links. Ok(true) when the
+    /// walk is complete.
+    fn step(&mut self, fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Result<bool, String> {
+        let Some(cid) = self.queue.pop_front() else { return Ok(true) };
+        let (mh, _) = cid_multihash(&cid).ok_or("walk: bad CID")?;
+        if mh.len() != 34 || mh[0] != 0x12 || mh[1] != 0x20 {
+            return Err("walk: only sha2-256 blocks can be checked".into());
+        }
+        // a CIDv0 is asked for as its CIDv1 (same multihash, dag-pb)
+        let v1 = if cid.len() == 34 && cid[0] == 0x12 { [&[0x01u8, 0x70][..], &cid[..]].concat() } else { cid };
+        let name = ipni::cid_string(&v1);
+        let block = fetch(&name)?;
+        if Sha256::digest(&block).as_slice() != &mh[2..] {
+            return Err(format!("block {name} does not hash to its CID"));
+        }
+        for link in dag_pb_links(&block).map_err(|e| format!("{name}: {e}"))? {
+            self.visit(link)?;
+        }
+        Ok(self.queue.is_empty())
+    }
+}
+
+/// One block from the gateway, as raw bytes (the caller checks it against its CID).
+fn fetch_raw_block(gateway: &str, cid: &str) -> Result<Vec<u8>, String> {
+    let url = webreq::Url::parse(&format!("{gateway}/ipfs/{cid}?format=raw"))?;
+    let (status, body, _) = webreq::request("GET", &url, &[("accept", "application/vnd.ipld.raw")], &[])?;
+    if status != 200 {
+        return Err(format!("the gateway answered {status} for block {cid}"));
+    }
+    Ok(body)
+}
 
 // ---- CAR parsing -----------------------------------------------------------
 
@@ -138,6 +271,8 @@ fn cid_multihash(b: &[u8]) -> Option<(Vec<u8>, usize)> {
 enum PTask {
     /// Fetch the CAR for this root, enumerate multihashes, build + chain the ad.
     Build(Vec<u8>), // root cid bytes
+    /// Fetch the next block of the DAG walk in progress.
+    Walk,
     /// Announce the current head to one indexer.
     Announce(String),
 }
@@ -158,6 +293,9 @@ pub struct Provider {
     head: Option<Vec<u8>>,
     current_root: Option<Vec<u8>>,
     block_count: usize,
+    /// Whether the current head advertises every block of `current_root`.
+    built_all: bool,
+    walk: Option<Walk>,
 
     tasks: VecDeque<PTask>,
     durable: bool,
@@ -196,6 +334,8 @@ impl Provider {
             head: None,
             current_root: None,
             block_count: 0,
+            built_all: false,
+            walk: None,
             tasks: VecDeque::new(),
             durable: false,
             last_note: "idle".into(),
@@ -206,13 +346,20 @@ impl Provider {
         Ok(p)
     }
 
-    /// Advertise a new site root (called when the IPNS value changes to an
-    /// `/ipfs/<cid>`). No-op if it is already the current root.
+    /// Advertise a site root (called on every signed `/ipfs/<cid>` value).
+    /// No-op if the head already advertises this root the way the
+    /// configuration asks (root only, or every block), or while its walk runs:
+    /// a root advertised alone before `announceAllBlocks` was set, or whose
+    /// walk failed, is advertised again.
     pub fn announce_root(&mut self, root_cid_bytes: Vec<u8>) {
-        if self.current_root.as_ref() == Some(&root_cid_bytes) && self.head.is_some() {
+        if self.current_root.as_ref() == Some(&root_cid_bytes) && self.head.is_some() && self.built_all == self.announce_all_blocks {
             return;
         }
-        self.tasks.retain(|t| !matches!(t, PTask::Build(_)));
+        if self.walk.as_ref().map(|w| &w.root) == Some(&root_cid_bytes) {
+            return;
+        }
+        self.walk = None;
+        self.tasks.retain(|t| !matches!(t, PTask::Build(_) | PTask::Walk));
         self.tasks.push_front(PTask::Build(root_cid_bytes));
     }
 
@@ -221,33 +368,56 @@ impl Provider {
         let Some(task) = self.tasks.pop_front() else { return false };
         match task {
             PTask::Build(root) => self.do_build(root),
+            PTask::Walk => {
+                let gateway = self.gateway_url.trim_end_matches('/').to_string();
+                self.walk_step(&|cid| fetch_raw_block(&gateway, cid));
+            }
             PTask::Announce(indexer) => self.do_announce(&indexer),
         }
         true
     }
 
     fn do_build(&mut self, root: Vec<u8>) {
+        if self.announce_all_blocks {
+            // every block: walk the DAG one block per step, then advertise
+            match Walk::new(root.clone()) {
+                Ok(w) => {
+                    self.last_note = format!("walking {}", ipni::cid_string(&root));
+                    self.walk = Some(w);
+                    self.tasks.push_front(PTask::Walk);
+                }
+                Err(e) => self.walk_failed(&root, e),
+            }
+            return;
+        }
+        // root-only: announce just the root's multihash
+        match cid_multihash(&root) {
+            Some((mh, _)) => self.finish_build(root, vec![mh], false),
+            None => self.last_error = Some("root-only: bad root cid".into()),
+        }
+    }
+
+    fn walk_failed(&mut self, root: &[u8], e: String) {
+        self.walk = None;
+        self.last_error = Some(format!("walk {}: {e}", ipni::cid_string(root)));
+        eprintln!("[ipns-publisher] IPNI {}", self.last_error.as_ref().unwrap());
+    }
+
+    /// One block of the walk. The next signed value starts it again if it failed.
+    fn walk_step(&mut self, fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>) {
+        let Some(mut w) = self.walk.take() else { return };
+        match w.step(fetch) {
+            Ok(true) => self.finish_build(w.root, w.mhs, true),
+            Ok(false) => {
+                self.walk = Some(w);
+                self.tasks.push_front(PTask::Walk);
+            }
+            Err(e) => self.walk_failed(&w.root, e),
+        }
+    }
+
+    fn finish_build(&mut self, root: Vec<u8>, mhs: Vec<Vec<u8>>, all: bool) {
         let root_str = ipni::cid_string(&root);
-        // 1. enumerate the DAG's block multihashes from the adapter
-        let mhs = if self.announce_all_blocks {
-            match self.enumerate(&root_str) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.last_error = Some(format!("enumerate {root_str}: {e}"));
-                    eprintln!("[ipns-publisher] IPNI {}", self.last_error.as_ref().unwrap());
-                    return;
-                }
-            }
-        } else {
-            // root-only: announce just the root's multihash
-            match cid_multihash(&root) {
-                Some((mh, _)) => vec![mh],
-                None => {
-                    self.last_error = Some("root-only: bad root cid".into());
-                    return;
-                }
-            }
-        };
         eprintln!("[ipns-publisher] IPNI: advertising {root_str} ({} blocks)", mhs.len());
 
         // 2. build the entry chunk + advertisement (chained to the head)
@@ -274,6 +444,7 @@ impl Provider {
         self.head = Some(ad_cid);
         self.current_root = Some(root);
         self.block_count = mhs.len();
+        self.built_all = all;
         self.prune();
         self.save_state();
 
@@ -284,34 +455,6 @@ impl Provider {
         }
         self.last_note = format!("advertised {root_str}, {} blocks, chain {}", mhs.len(), self.chain.len());
         self.last_error = None;
-    }
-
-    /// Fetch the whole-DAG CAR from the adapter and enumerate block multihashes.
-    fn enumerate(&self, root_str: &str) -> Result<Vec<Vec<u8>>, String> {
-        let url = webreq::Url::parse(&format!(
-            "{}/ipfs/{root_str}?format=car&dag-scope=all",
-            self.gateway_url.trim_end_matches('/')
-        ))?;
-        let (status, body, _) = webreq::request(
-            "GET",
-            &url,
-            &[("accept", "application/vnd.ipld.car")],
-            &[],
-        )?;
-        if status != 200 {
-            return Err(format!("adapter answered {status}"));
-        }
-        let (car_root, mhs) = car_multihashes(&body)?;
-        if ipni::cid_string(&car_root) != root_str {
-            return Err(format!(
-                "CAR root {} != requested {root_str}",
-                ipni::cid_string(&car_root)
-            ));
-        }
-        if mhs.is_empty() {
-            return Err("CAR held no blocks".into());
-        }
-        Ok(mhs)
     }
 
     fn do_announce(&mut self, indexer: &str) {
@@ -421,9 +564,11 @@ impl Provider {
         blocks.push('}');
         let chain: Vec<String> = self.chain.iter().map(|c| format!("\"{}\"", ipni::cid_string(c))).collect();
         let json = format!(
-            "{{\"head\":{},\"root\":{},\"chain\":[{}],\"blocks\":{}}}\n",
+            "{{\"head\":{},\"root\":{},\"allBlocks\":{},\"blockCount\":{},\"chain\":[{}],\"blocks\":{}}}\n",
             self.head.as_ref().map(|h| format!("\"{}\"", ipni::cid_string(h))).unwrap_or_else(|| "null".into()),
             self.current_root.as_ref().map(|r| format!("\"{}\"", ipni::cid_string(r))).unwrap_or_else(|| "null".into()),
+            self.built_all,
+            self.block_count,
             chain.join(","),
             blocks,
         );
@@ -453,6 +598,9 @@ impl Provider {
         }
         self.head = v.get("head").and_then(|h| h.as_str()).and_then(cid_of);
         self.current_root = v.get("root").and_then(|r| r.as_str()).and_then(cid_of);
+        // a state written before the walk existed advertised the root alone
+        self.built_all = v.get("allBlocks").and_then(|b| b.as_bool()).unwrap_or(false);
+        self.block_count = v.get("blockCount").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
         if self.head.is_some() {
             self.durable = true;
             eprintln!(
@@ -610,5 +758,142 @@ mod tests {
         assert_ne!(p.publisher_addrs[0], bare);
         // The ad's retrieval address stays a bare HTTP multiaddr (no /p2p).
         assert!(!p.retrieval_addr.contains("/p2p/"));
+    }
+
+    /// A dag-pb node with these links (and a little data), as kubo encodes it.
+    fn pb_node(links: &[&Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for l in links {
+            let mut link = vec![0x0a, l.len() as u8];
+            link.extend_from_slice(l);
+            link.extend_from_slice(&[0x12, 0x01, b'n', 0x18, 0x07]); // Name, Tsize
+            out.push(0x12);
+            out.push(link.len() as u8);
+            out.extend_from_slice(&link);
+        }
+        out.extend_from_slice(&[0x0a, 0x02, 0x08, 0x01]); // Data: unixfs directory
+        out
+    }
+
+    fn test_provider(all: bool) -> Provider {
+        Provider {
+            identity: SigningKey::from_bytes(&[7u8; 32]),
+            peer_id: "12D3KooWTest".into(),
+            gateway_url: "https://gateway.invalid".into(),
+            retrieval_addr: "/dns4/gateway.invalid/tcp/443/https".into(),
+            publisher_addrs: Vec::new(),
+            indexers: Vec::new(),
+            announce_all_blocks: all,
+            blocks: HashMap::new(),
+            chain: VecDeque::new(),
+            head: None,
+            current_root: None,
+            block_count: 0,
+            built_all: false,
+            walk: None,
+            tasks: VecDeque::new(),
+            durable: false,
+            last_note: "idle".into(),
+            last_error: None,
+            announced: Vec::new(),
+        }
+    }
+
+    /// root -> {leaf a, dir -> {leaf a (again), file node -> {chunk 1, chunk 2}}}
+    fn tree() -> (Vec<u8>, HashMap<String, Vec<u8>>, usize) {
+        const DAG_PB: u64 = 0x70;
+        let a = cid_v1(CODEC_RAW, b"leaf a");
+        let c1 = cid_v1(CODEC_RAW, b"chunk 1");
+        let c2 = cid_v1(CODEC_RAW, b"chunk 2");
+        let file_block = pb_node(&[&c1, &c2]);
+        let file = cid_v1(DAG_PB, &file_block);
+        let dir_block = pb_node(&[&a, &file]);
+        let dir = cid_v1(DAG_PB, &dir_block);
+        let root_block = pb_node(&[&a, &dir]);
+        let root = cid_v1(DAG_PB, &root_block);
+        let mut store = HashMap::new();
+        for (c, b) in [(&root, root_block), (&dir, dir_block), (&file, file_block)] {
+            store.insert(ipni::cid_string(c), b);
+        }
+        (root, store, 6)
+    }
+
+    #[test]
+    fn dag_pb_links_in_order_and_malformed_refused() {
+        let a = cid_v1(CODEC_RAW, b"x");
+        let b = cid_v1(CODEC_RAW, b"y");
+        assert_eq!(dag_pb_links(&pb_node(&[&a, &b])).unwrap(), vec![a.clone(), b]);
+        assert!(dag_pb_links(&pb_node(&[])).unwrap().is_empty());
+        let mut cut = pb_node(&[&a]);
+        cut.truncate(10);
+        assert!(dag_pb_links(&cut).is_err());
+        assert!(dag_pb_links(&[0x12, 0x02, 0x12, 0x00]).is_err()); // a link without a hash
+    }
+
+    #[test]
+    fn walk_advertises_every_block_once_and_fetches_only_dag_pb() {
+        let (root, store, total) = tree();
+        let fetched = std::cell::RefCell::new(Vec::new());
+        let fetch = |cid: &str| {
+            fetched.borrow_mut().push(cid.to_string());
+            store.get(cid).cloned().ok_or_else(|| format!("404 {cid}"))
+        };
+        let mut p = test_provider(true);
+        p.announce_root(root.clone());
+        assert!(p.drive()); // Build starts the walk
+        assert!(p.walk.is_some() && p.head.is_none());
+        while p.walk.is_some() {
+            p.walk_step(&fetch);
+        }
+        assert_eq!(p.last_error, None);
+        assert_eq!(fetched.borrow().len(), 3, "the three dag-pb nodes, never a raw leaf");
+        assert_eq!(p.block_count, total);
+        assert!(p.built_all && p.head.is_some() && p.current_root.as_ref() == Some(&root));
+        // the same root again is a no-op
+        let head = p.head.clone();
+        p.announce_root(root);
+        assert!(p.tasks.iter().all(|t| !matches!(t, PTask::Build(_))));
+        assert_eq!(p.head, head);
+    }
+
+    #[test]
+    fn a_root_advertised_alone_is_advertised_again_with_every_block() {
+        let (root, store, total) = tree();
+        let mut p = test_provider(false);
+        p.announce_root(root.clone());
+        assert!(p.drive());
+        assert_eq!((p.block_count, p.built_all, p.chain.len()), (1, false, 1));
+        p.announce_root(root.clone());
+        assert!(p.tasks.is_empty(), "root-only configuration: nothing more to do");
+        // the configuration now asks for every block
+        p.announce_all_blocks = true;
+        p.announce_root(root.clone());
+        assert!(p.drive());
+        while p.walk.is_some() {
+            p.walk_step(&|cid| store.get(cid).cloned().ok_or_else(|| "404".to_string()));
+        }
+        assert_eq!((p.block_count, p.built_all, p.chain.len()), (total, true, 2));
+    }
+
+    #[test]
+    fn a_missing_or_wrong_block_fails_the_walk_and_the_next_value_retries() {
+        let (root, mut store, total) = tree();
+        let dir_key = store.keys().find(|k| **k != ipni::cid_string(&root)).unwrap().clone();
+        let good = store.insert(dir_key.clone(), b"not the block".to_vec()).unwrap();
+        let mut p = test_provider(true);
+        p.announce_root(root.clone());
+        p.drive();
+        while p.walk.is_some() {
+            p.walk_step(&|cid| store.get(cid).cloned().ok_or_else(|| "404".to_string()));
+        }
+        assert!(p.last_error.as_ref().unwrap().contains("does not hash"), "{:?}", p.last_error);
+        assert!(p.head.is_none() && !p.built_all);
+        store.insert(dir_key, good);
+        p.announce_root(root);
+        p.drive();
+        while p.walk.is_some() {
+            p.walk_step(&|cid| store.get(cid).cloned().ok_or_else(|| "404".to_string()));
+        }
+        assert_eq!((p.last_error.clone(), p.block_count, p.built_all), (None, total, true));
     }
 }
