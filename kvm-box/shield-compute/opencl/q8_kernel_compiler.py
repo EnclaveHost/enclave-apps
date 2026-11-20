@@ -13,7 +13,15 @@ import subprocess
 from kernel_compiler import ast, canonical_type, MAX_SOURCE
 
 ROOT = Path(__file__).resolve().parent / 'q8-reference'
-REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl'}
+REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl',
+              'mm_q4_k': 'mul_mm_q4_k_f32_l4_lm.cl', 'mv_q4_k': 'mul_mv_q4_k_f32_flat.cl'}
+# The K-quant kernels take the same arguments after four weight buffers
+# (quants, 6-bit scales, d, dmin) where the Q8_0 kernels take two.
+ARGUMENTS = {
+    'q8_0': {'quants': 0, 'scales': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
+    'q4_k': {'quants': 0, 'scales': 1, 'd': 2, 'dmin': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
+             'outputOffset': 7},
+}
 STRICT = ('-cl-std=CL3.0',)
 FAST = STRICT + ('-cl-mad-enable', '-cl-unsafe-math-optimizations',
                  '-cl-finite-math-only', '-cl-fast-relaxed-math')
@@ -26,7 +34,8 @@ KINDS = {'FunctionDecl', 'ParmVarDecl', 'VarDecl', 'CompoundStmt', 'DeclStmt',
          'CStyleCastExpr', 'CallExpr', 'ForStmt', 'IfStmt', 'ArraySubscriptExpr',
          'IntegerLiteral', 'FloatingLiteral', 'CompoundAssignOperator',
          'ExtVectorElementExpr', 'CompoundLiteralExpr', 'InitListExpr',
-         'UnaryExprOrTypeTraitExpr', 'ParenExpr', 'OpenCLKernelAttr',
+         'UnaryExprOrTypeTraitExpr', 'ParenExpr', 'ConditionalOperator', 'ImplicitValueInitExpr',
+         'OpenCLKernelAttr',
          'OpenCLIntelReqdSubGroupSizeAttr'}
 def without_comments(source):
     # Preserve newlines and strings while replacing comments by whitespace,
@@ -123,7 +132,10 @@ def normalize(function, source):
             return {'kind': kind, 'size': int(size[1])}
         if kind in ('ParmVarDecl', 'VarDecl'):
             symbols[node['id']] = len(symbols)
-        ignored = {'id', 'loc', 'range', 'inner', 'referencedDecl'}
+        # A partly initialised array carries its filler as child nodes under
+        # their own key; they are visited like any other child, so that their
+        # node identities do not enter the comparison.
+        ignored = {'id', 'loc', 'range', 'inner', 'referencedDecl', 'array_filler'}
         if kind in ('FunctionDecl', 'ParmVarDecl', 'VarDecl'):
             ignored |= {'name', 'mangledName'}
         result = {k: typed(v) for k, v in node.items() if k not in ignored}
@@ -146,6 +158,8 @@ def normalize(function, source):
                 result['reference'] = [decl['kind'], symbols[decl['id']], canonical_type(decl)]
         if 'inner' in node:
             result['inner'] = [visit(child) for child in node['inner']]
+        if 'array_filler' in node:
+            result['array_filler'] = [visit(child) for child in node['array_filler']]
         return result
 
     return visit(function)
@@ -179,12 +193,12 @@ def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
             for variant in REFERENCES:
                 pattern, digest = reference(variant, flags, clang)
                 if normalized == pattern:
+                    weights = 'q4_k' if variant.endswith('_q4_k') else 'q8_0'
                     plans[function['name']] = {
                         'schema': 'shield-opencl-q8-analysis/1', 'dispatchable': False,
-                        'operation': 'q8_0-f32-matmul', 'variant': variant,
+                        'operation': weights + '-f32-matmul', 'variant': variant,
                         'referenceSha256': digest, 'buildOptions': list(flags),
-                        'arguments': {'quants': 0, 'scales': 1, 'input': 2, 'inputOffset': 3,
-                                      'output': 4, 'outputOffset': 5},
+                        'arguments': ARGUMENTS[weights],
                         'requires': ['validated-launch-and-storage', 'authenticated-public-q8-tensor',
                                      'explicit-numerical-contract', 'verified-masked-executor'],
                     }

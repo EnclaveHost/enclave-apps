@@ -226,11 +226,16 @@ struct StartupTiming {
   std::atomic<uint64_t> compiler_ns{0}, compiler_calls{0}, build_ns{0}, build_calls{0};
   std::atomic<uint64_t> api_ns[4] = {}, api_calls[4] = {};  // write, read, set-arg, other kernels
   const bool enabled = std::getenv("SHIELD_OPENCL_TIMING") != nullptr;
+  std::mutex names_mutex;
+  std::map<std::string, uint64_t> names;
   static uint64_t now() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
   }
   ~StartupTiming() {
+    for (const auto &[name, count] : names)
+      std::fprintf(stderr, "[shield-opencl-timing] cpu-runtime kernel %s launches=%llu\n", name.c_str(),
+                   (unsigned long long)count);
     if (enabled)
       std::fprintf(stderr, "[shield-opencl-timing] analysis calls=%llu ms=%.1f; program builds=%llu ms=%.1f\n",
                    (unsigned long long)compiler_calls.load(), compiler_ns.load() / 1e6,
@@ -1289,6 +1294,14 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
   }
   (void)q8_mv;
   auto fallback = [&] {
+    if (startup_timing.enabled) {
+      // Which kernels the CPU runtime ran, by name, for the timing report.
+      char name[128] = {};
+      if (!REAL(clGetKernelInfo)(kernel, CL_KERNEL_FUNCTION_NAME, sizeof(name), name, nullptr)) {
+        std::lock_guard lock(startup_timing.names_mutex);
+        ++startup_timing.names[name];
+      }
+    }
 #ifdef SHIELD_Q8_MASKED
     // The original kernel runs: whatever it may write is no longer known. The
     // Q8 kernels write only their output argument.

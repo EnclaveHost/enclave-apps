@@ -10,7 +10,25 @@ MM_NAME = 'kernel_mul_mm_q8_0_f32_l4_lm'
 MV_NAME = 'kernel_mul_mv_q8_0_f32_flat'
 
 
+MM_K = (ROOT / 'mul_mm_q4_k_f32_l4_lm.cl').read_text()
+MV_K = (ROOT / 'mul_mv_q4_k_f32_flat.cl').read_text()
+
+
 class Q8CompilerTests(unittest.TestCase):
+    def test_q4_k_sources_are_recognised_as_their_own_operation(self):
+        for source, name, variant in [(MM_K, 'kernel_mul_mm_q4_k_f32_l4_lm', 'mm_q4_k'),
+                                      (MV_K, 'kernel_mul_mv_q4_K_f32_flat', 'mv_q4_k')]:
+            for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+                with self.subTest(variant=variant, options=options):
+                    plan = analyze(source, options)[name]
+                    self.assertEqual((plan['variant'], plan['operation']), (variant, 'q4_k-f32-matmul'))
+                    self.assertFalse(plan['dispatchable'])
+                    self.assertEqual(plan['arguments']['input'], 4)
+        # Constants and partly initialised arrays are part of the comparison.
+        self.assertEqual(analyze(MV_K.replace('kmask2 = 0x0f0f', 'kmask2 = 0x0f0e')), {})
+        self.assertEqual(analyze(MV_K.replace('{0.f}', '{1.f}')), {})
+        self.assertEqual(analyze(MM_K.replace('0x0F', '0x0E', 1)), {})
+
     def test_real_sources_and_both_arithmetic_profiles(self):
         for source, name, variant in [(MM, MM_NAME, 'mm'), (MV, MV_NAME, 'mv')]:
             for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
