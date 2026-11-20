@@ -289,12 +289,12 @@ vector kernel has its own, shorter list.
 - The frontend remembers a tensor's four buffers as one, tracks writes to any
   of them, and authenticates the tensor by its GGUF digest recomputed from
   them. Direct route only.
-- A Q6_K tensor the executor declines is computed in the client like a Q8_0
-  one, from its quants as signed codes with a scale for every sixteen. A
-  declined Q4_K tensor has no such product and runs its own kernel on the CPU
-  runtime, which is slow; the test model has none.
-- Executor sessions accept approved Q4_K and Q6_K tensors whose rows are whole
-  256-weight blocks.
+- A K-quant tensor the executor declines is computed in the client like a
+  Q8_0 one, from codes, scales and (Q4_K, Q5_K) minimums decoded from the flat
+  buffers. `test_q8_kquant.py` checks the decoding against gguf-py's.
+- Executor sessions accept approved Q4_K, Q5_K and Q6_K tensors whose rows are
+  whole 256-weight blocks. Q5_K, added after the measurements below, is Q4_K
+  with a fifth weight buffer for the high bit of each quant.
 - `llama-shield-cpu-fallback.patch` lets those products reach the OpenCL
   device. The plugin has to be rebuilt with it, and the packaged table of
   sources with nothing to lower has to be regenerated without the four
@@ -322,6 +322,38 @@ four: fewer offloaded products need fewer pads, which helps when pads are
 scarce and hurts when the CPU is the limit. Those numbers describe a different
 split of the work, not a faster route.
 
+## EyesOff's model
+
+`Qwen3.8-27B-UD-Q4_K_XL.gguf` with the calibration EyesOff uses (262 sites),
+service settings (two llama threads, one refill thread), eight processors, two
+test workers on the two V100s through a worker pool (one card cannot hold the
+model). Of its 410 tensors large enough to offload, 191 are Q5_K, 70 IQ4_XS,
+69 Q4_K, 56 Q6_K, 14 Q8_0 and 10 other types.
+
+| 62 prompt tokens, 32 generated | Native Shield | OpenCL route |
+| --- | ---: | ---: |
+| Generation | 1.70 t/s | 1.33 t/s (78%) |
+| Prompt | 3.9 t/s | 2.9 t/s |
+| Whole run | 122 s | 146 s |
+| Verified work, 16 tokens | 5,137 exchanges, 1.94e12 MACs | 4,421 exchanges, 1.43e12 MACs |
+
+The first 16 generated tokens are identical; by 32 the texts differ.
+
+The route offloads Q4_K, Q5_K, Q6_K and Q8_0 here. The OpenCL backend has no
+kernel for IQ4_XS, so the 46 IQ4_XS tensors that have calibration sites (and a
+few of other types) stay on the CPU, where the native engine offloads them.
+That is a quarter of the offloaded work and about 180 ms of CPU a token, most
+of the difference. A trace shows 514 ms of each 731 ms token waiting for the
+executor (both paths wait for pads at these settings) and 217 ms in the
+client.
+
+Both figures are far below what EyesOff reaches in production (about 19 tokens
+per second): this harness uses the KVM Box service's settings, not EyesOff's.
+
+Seen in this run and not yet dealt with: the paired-product prediction misses
+on this model (112 of 2,318 pairs, relearned each time), each miss costing an
+exchange; and the eight kernel analyses at start-up take 4.6 s.
+
 ## What is not established
 
 - Nothing here ran in a measured image or a confidential VM, on NucBox, or
@@ -334,15 +366,10 @@ split of the work, not a faster route.
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
-- EyesOff's production model itself has not been run on this route. Its file
-  (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, with the calibration EyesOff uses) is not a
-  plain Q4_K_M: of its 410 tensors large enough to offload, 191 are Q5_K, 70
-  IQ4_XS, 69 Q4_K, 56 Q6_K, 14 Q8_0 and 10 other types. The route lowers Q4_K,
-  Q6_K and Q8_0, about a third of them. The OpenCL backend has Q5_K kernels
-  (five weight buffers) that could be lowered the same way. It has no IQ4_XS
-  kernel at all, so those products could only stay on the CPU, where the
-  native engine offloads them.
-- The K-quant path was measured on one 3B model. There is no kernel fixture,
+- Parity on EyesOff's own model is not reached and cannot be with the kernels
+  llama's OpenCL backend has: IQ4_XS products have nowhere to be lowered from.
+  It would take new kernels in that backend.
+- There is no kernel fixture,
   identity test or failure-injection test for K-quant launches; the Q8 ones
   pass unchanged, and the evidence for K-quants is the recogniser and
   admission tests plus the end-to-end run whose text and exchange counts equal
@@ -358,6 +385,6 @@ split of the work, not a faster route.
   programs built instead of 119) and once with `sd-cli` (same image). They are
   on only for `llama-cli`. There is no unit test for the handle bookkeeping.
 - The executor now needs `-pthread` when it is linked.
-- Six kernels are lowered (Q8_0, Q4_K, Q6_K; matrix and vector each). Other
+- Eight kernels are lowered (Q8_0, Q4_K, Q5_K, Q6_K; matrix and vector each). Other
   kernels, other weight types and CUDA binaries are unchanged.
 - The new code has had no independent security review.

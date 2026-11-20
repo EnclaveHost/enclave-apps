@@ -37,6 +37,7 @@
 #include <sys/time.h>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <atomic>
 #include <condition_variable>
@@ -879,7 +880,20 @@ public:
                    (uint64_t)entry.ne[0] <= kMaxPayload / 4 && (uint64_t)entry.ne[1] <= kMaxPayload / 4;
         };
         const char * reserve = std::getenv("SHIELDED_RESERVE_BYTES");
-        const uint64_t cap = reserve ? std::strtoull(reserve, nullptr, 10) : 0;
+        uint64_t cap = reserve ? std::strtoull(reserve, nullptr, 10) : 0;
+        // With a pool of workers (host|port|vsock|bytes, one a line) the
+        // backend spreads the weights over all of them: their shares add up.
+        if (const char * pool = std::getenv("SHIELDED_WORKERS")) {
+            uint64_t total = 0;
+            std::istringstream lines(pool);
+            for (std::string line; std::getline(lines, line);) {
+                std::istringstream fields(line);
+                std::string field;
+                for (int i = 0; i < 4 && std::getline(fields, field, '|'); ++i)
+                    if (i == 3) total += std::strtoull(field.c_str(), nullptr, 10);
+            }
+            if (total) cap = total;
+        }
         if (cap) {
             // The backend charges a weight its int8 matrix plus activation
             // buffers for the widest batch; keep a fifth of the share spare.
