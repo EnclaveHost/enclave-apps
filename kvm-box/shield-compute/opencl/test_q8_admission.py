@@ -4,7 +4,7 @@ import struct
 import unittest
 from dataclasses import replace
 
-from q8_admission import BufferView, PublicQ8Catalog, q8_digest, validate_launch
+from q8_admission import BufferView, PublicQ8Catalog, q4_k_digest, q8_digest, validate_launch
 
 
 def fixture(variant, k=96, n=72, m=3):
@@ -21,6 +21,105 @@ def fixture(variant, k=96, n=72, m=3):
     sizes = {0: n*k, 1: n*k//16, 2: m*k*4+32, 4: m*n*4+16}
     buffers = {index: BufferView(index+1, size+64, 64, size) for index, size in sizes.items()}
     return scalars, buffers, grid, local
+
+
+def k_fixture(variant, k=512, n=72, m=3):
+    """The Q4_K kernels: the Q8 arguments two places later, four weight buffers."""
+    scalars = {5: 32, 7: 16, 8: k, 9: n, 19: 1, 20: 1}
+    if variant == 'mm_q4_k':
+        scalars.update({10: 1, 11: m, 12: 1, 13: k, 14: k, 15: n,
+                        16: k*n, 17: k*m, 18: n*m})
+        grid, local = ((n+63)//64*128, (m+63)//64, 1), (128, 1, 1)
+    else:
+        row = k//256*144
+        scalars.update({10: row, 11: row*n, 12: row*n, 13: 1, 14: 4*k,
+                        15: 4*k*m, 16: 4*k*m, 17: n, 18: m})
+        grid, local = ((n+3)//4*16, m, 1), (16, 1, 1)
+    blocks = n*k//256
+    sizes = {0: blocks*128, 1: blocks*12, 2: blocks*2, 3: blocks*2, 4: m*k*4+32, 6: m*n*4+16}
+    buffers = {index: BufferView(index+1, size+64, 64, size) for index, size in sizes.items()}
+    return scalars, buffers, grid, local
+
+
+class Q4KLaunchTests(unittest.TestCase):
+    def test_real_layouts(self):
+        for variant, k, n, m in [('mm_q4_k', 2048, 11008, 32), ('mv_q4_k', 2048, 11008, 1),
+                                  ('mm_q4_k', 256, 73, 67), ('mv_q4_k', 256, 4, 3)]:
+            with self.subTest(variant=variant, shape=(k, n, m)):
+                launch = validate_launch(variant, *k_fixture(variant, k, n, m))
+                self.assertEqual((launch.k, launch.n, launch.m), (k, n, m))
+                self.assertEqual(len(launch.reads), 5)
+                self.assertEqual(launch.reads[0][2]-launch.reads[0][1], k*n//2)
+                self.assertEqual(launch.reads[1][2]-launch.reads[1][1], k*n//256*12)
+                self.assertEqual(launch.write[2]-launch.write[1], m*n*4)
+
+    def test_every_argument_is_checked_and_q8_arguments_are_not_accepted(self):
+        for variant in ('mm_q4_k', 'mv_q4_k'):
+            scalars, buffers, grid, local = k_fixture(variant)
+            for index in range(8, 21):
+                with self.subTest(variant=variant, index=index):
+                    with self.assertRaises(ValueError):
+                        validate_launch(variant, {**scalars, index: scalars[index]+1}, buffers, grid, local)
+            for missing in (*scalars, *buffers):
+                with self.subTest(variant=variant, missing=missing):
+                    with self.assertRaises(ValueError):
+                        validate_launch(variant, {i: v for i, v in scalars.items() if i != missing},
+                                        {i: v for i, v in buffers.items() if i != missing}, grid, local)
+            with self.assertRaises(ValueError):
+                validate_launch(variant, *fixture(variant[:2]))
+            with self.assertRaises(ValueError):
+                validate_launch(variant[:2], scalars, buffers, grid, local)
+            with self.assertRaises(ValueError):
+                validate_launch(variant, scalars, buffers, (grid[0]+16, grid[1], 1), local)
+
+    def test_block_size_tail_rows_alignment_and_overflow(self):
+        with self.assertRaises(ValueError):  # 32-wide blocks are not K-quant super-blocks
+            validate_launch('mv_q4_k', *k_fixture('mv_q4_k', 288, 8, 1))
+        with self.assertRaises(ValueError):  # four rows are loaded unguarded
+            validate_launch('mv_q4_k', *k_fixture('mv_q4_k', 256, 6, 1))
+        with self.assertRaises(ValueError):  # signed byte offset into the quants
+            validate_launch('mv_q4_k', *k_fixture('mv_q4_k', 65536, 65536, 1))
+        with self.assertRaises(ValueError):
+            validate_launch('mm_q4_k', *k_fixture('mm_q4_k', 1 << 20, 2048, 1))
+        for variant, index, alignment in [('mm_q4_k', 0, 4), ('mv_q4_k', 0, 4), ('mv_q4_k', 1, 2),
+                                          ('mm_q4_k', 2, 2), ('mv_q4_k', 3, 2), ('mm_q4_k', 4, 16),
+                                          ('mv_q4_k', 4, 4), ('mm_q4_k', 6, 4)]:
+            scalars, buffers, grid, local = k_fixture(variant)
+            moved = replace(buffers[index], offset=buffers[index].offset+alignment//2,
+                            root_bytes=buffers[index].root_bytes+alignment)
+            with self.subTest(variant=variant, index=index):
+                with self.assertRaises(ValueError):
+                    validate_launch(variant, scalars, {**buffers, index: moved}, grid, local)
+        # The matrix kernel reads scale bytes singly: an odd offset is fine there.
+        scalars, buffers, grid, local = k_fixture('mm_q4_k')
+        odd = replace(buffers[1], offset=buffers[1].offset+1, root_bytes=buffers[1].root_bytes+1)
+        validate_launch('mm_q4_k', scalars, {**buffers, 1: odd}, grid, local)
+
+    def test_output_may_not_alias_any_of_the_five_inputs(self):
+        for variant in ('mm_q4_k', 'mv_q4_k'):
+            scalars, buffers, grid, local = k_fixture(variant)
+            for index in (0, 1, 2, 3, 4):
+                with self.subTest(variant=variant, index=index):
+                    shared = replace(buffers[6], root=buffers[index].root, root_bytes=1 << 20, offset=0,
+                                     size=1 << 20)
+                    source = replace(buffers[index], root_bytes=1 << 20)
+                    with self.assertRaises(ValueError):
+                        validate_launch(variant, scalars, {**buffers, index: source, 6: shared}, grid, local)
+
+    def test_digest_is_the_gguf_block_order(self):
+        k, n = 256, 2500  # more than one chunk
+        blocks = k*n//256
+        raw = bytes((7*i+3) % 251 for i in range(blocks*144))
+        d = b''.join(raw[i*144:i*144+2] for i in range(blocks))
+        dmin = b''.join(raw[i*144+2:i*144+4] for i in range(blocks))
+        scales = b''.join(raw[i*144+4:i*144+16] for i in range(blocks))
+        quants = b''.join(raw[i*144+16:i*144+144] for i in range(blocks))
+        self.assertEqual(q4_k_digest(quants, scales, d, dmin, k, n), hashlib.sha256(raw).hexdigest())
+        self.assertNotEqual(q4_k_digest(quants, scales, dmin, d, k, n), hashlib.sha256(raw).hexdigest())
+        with self.assertRaises(ValueError):
+            q4_k_digest(quants[:-1], scales, d, dmin, k, n)
+        with self.assertRaises(ValueError):
+            q4_k_digest(bytearray(quants), scales, d, dmin, k, n)
 
 
 class LaunchTests(unittest.TestCase):

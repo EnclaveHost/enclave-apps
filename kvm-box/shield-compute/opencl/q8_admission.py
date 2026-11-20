@@ -50,15 +50,24 @@ class Launch:
 
 
 def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
-    """Validate the initial contiguous, non-batched 19-argument ABI subset.
+    """Validate the initial contiguous, non-batched ABI subset.
 
     scalars maps argument index to a decoded int with original ABI size checked
-    by the caller. buffers maps 0/1/2/4 to allocation-registry BufferViews.
+    by the caller. buffers maps the weight, input and output argument indices
+    to allocation-registry BufferViews: 0/1/2/4 for the Q8_0 kernels, and
+    0/1/2/3/4/6 for the Q4_K kernels, whose arguments are the Q8_0 kernels'
+    after four weight buffers (quants, 6-bit scales, d, dmin) instead of two.
     Explicit local sizes and a complete zero-offset 3-D grid are required.
     """
-    if variant not in ('mm', 'mv'):
+    if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k'):
         raise ValueError('unknown kernel variant')
-    if set(scalars) != {3, 5, *range(6, 19)} or set(buffers) != {0, 1, 2, 4}:
+    k_quant = variant.endswith('_q4_k')
+    matrix = variant.startswith('mm')
+    shift = 2 if k_quant else 0  # every argument after the weights moves by this
+    at = lambda index: index + shift
+    weights = (0, 1, 2, 3) if k_quant else (0, 1)
+    if (set(scalars) != {at(3), at(5), *range(at(6), at(19))}
+            or set(buffers) != {*weights, at(2), at(4)}):
         raise ValueError('incomplete kernel arguments')
     if any(type(key) is not int for key in (*scalars, *buffers)):
         raise ValueError('invalid argument index')
@@ -69,14 +78,17 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
             integer(value)
     if tuple(offset) != (0, 0, 0):
         raise ValueError('global offsets need separate lowering')
-    wide = {3, 5} | ({8, 9, 10, 12, 13, 14} if variant == 'mv' else set())
+    strides = set() if matrix else {at(8), at(9), at(10), at(12), at(13), at(14)}
+    # The Q4_K vector kernel takes its two pointer offsets as int.
+    wide = strides | (set() if variant == 'mv_q4_k' else {at(3), at(5)})
     for index, value in scalars.items():
         integer(value, U64 if index in wide else I32)
-    k, n = scalars[6], scalars[7]
-    m = scalars[9 if variant == 'mm' else 16]
-    if min(k, n, m) == 0 or k % 32 or k > I32 - 128:
-        raise ValueError('invalid Q8 dimensions')
-    if variant == 'mm':
+    k, n = scalars[at(6)], scalars[at(7)]
+    m = scalars[at(9 if matrix else 16)]
+    block = 256 if k_quant else 32
+    if min(k, n, m) == 0 or k % block or k > I32 - 128:
+        raise ValueError('invalid tensor dimensions')
+    if matrix:
         expected = {8: 1, 10: 1, 11: k, 12: k, 13: n, 14: k*n,
                     15: k*m, 16: n*m, 17: 1, 18: 1}
         grid, local = ((n+63)//64*128, (m+63)//64, 1), (128, 1, 1)
@@ -86,20 +98,28 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
             raise ValueError('signed kernel index overflow')
         input_alignment = 16
     else:
-        row = k//32*34
+        row = k//256*144 if k_quant else k//32*34
         expected = {8: row, 9: row*n, 10: row*n, 11: 1, 12: k*4,
                     13: m*k*4, 14: m*k*4, 15: n, 17: 1, 18: 1}
-        grid, local = ((n+7)//8*16, m*2, 1), (16, 2, 1)
-        # All four rows are loaded before the output guards. The source also
-        # narrows packed row offsets to uint before dividing by 34.
-        if n % 8 or n > I32-8 or row*n > U32:
-            raise ValueError('unguarded tail rows or narrowed row offset')
+        if k_quant:
+            grid, local = ((n+3)//4*16, m, 1), (16, 1, 1)
+            # Four rows are loaded before the output guards. The block index
+            # of a row, its byte offset into the quants (128 bytes a block),
+            # the input offset and the output index are all signed int.
+            if n % 4 or n > I32-4 or n*k//2 > I32 or m*k*4 > I32 or m*n > I32:
+                raise ValueError('unguarded tail rows or signed kernel index overflow')
+        else:
+            grid, local = ((n+7)//8*16, m*2, 1), (16, 2, 1)
+            # All four rows are loaded before the output guards. The source also
+            # narrows packed row offsets to uint before dividing by 34.
+            if n % 8 or n > I32-8 or row*n > U32:
+                raise ValueError('unguarded tail rows or narrowed row offset')
         input_alignment = 4
-    if any(scalars[index] != value for index, value in expected.items()):
+    if any(scalars[at(index)] != value for index, value in expected.items()):
         raise ValueError('unsupported strides, broadcasting or batching')
     if tuple(global_size) != grid or tuple(local_size) != local:
         raise ValueError('incomplete or incompatible workgroup grid')
-    if scalars[3] % input_alignment or scalars[5] % 4:
+    if scalars[at(3)] % input_alignment or scalars[at(5)] % 4:
         raise ValueError('unaligned kernel pointer offset')
     roots = {}
     for buffer in buffers.values():
@@ -109,18 +129,55 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
         if buffer.root in roots and roots[buffer.root] != buffer.root_bytes:
             raise ValueError('inconsistent root allocation size')
         roots[buffer.root] = buffer.root_bytes
-    for index, alignment, extra in ((0, 4 if variant == 'mm' else 1, 0),
-                                     (1, 2, 0), (2, input_alignment, scalars[3]),
-                                     (4, 4, scalars[5])):
+    if k_quant:
+        # The quants are read through uchar4 (matrix) or uint (vector)
+        # pointers; the vector kernel reads the scales as ushort.
+        aligned = ((0, 4, 0), (1, 1 if matrix else 2, 0), (2, 2, 0), (3, 2, 0))
+    else:
+        aligned = ((0, 4 if matrix else 1, 0), (1, 2, 0))
+    for index, alignment, extra in (*aligned, (at(2), input_alignment, scalars[at(3)]),
+                                    (at(4), 4, scalars[at(5)])):
         if (buffers[index].offset + extra) % alignment:
             raise ValueError('unaligned sub-buffer address')
-    reads = (buffers[0].interval(0, n*k), buffers[1].interval(0, n*k//16),
-             buffers[2].interval(scalars[3], m*k*4))
-    write = buffers[4].interval(scalars[5], m*n*4)
+    if k_quant:
+        blocks = n*k//256
+        reads = (buffers[0].interval(0, blocks*128), buffers[1].interval(0, blocks*12),
+                 buffers[2].interval(0, blocks*2), buffers[3].interval(0, blocks*2))
+    else:
+        reads = (buffers[0].interval(0, n*k), buffers[1].interval(0, n*k//16))
+    reads += (buffers[at(2)].interval(scalars[at(3)], m*k*4),)
+    write = buffers[at(4)].interval(scalars[at(5)], m*n*4)
     if any(write[0] == read[0] and max(write[1], read[1]) < min(write[2], read[2])
            for read in reads):
         raise ValueError('output aliases an input allocation range')
     return Launch(variant, m, n, k, reads, write)
+
+
+def q4_k_digest(quants, scales, d, dmin, k, n):
+    """Hash original GGUF block_q4_K order: half d, half dmin, 12 scale bytes,
+    128 quant bytes for each 256 weights. Exact bytes, as for Q8."""
+    integer(k, I32)
+    integer(n, I32)
+    if not k or not n or k % 256 or k*n > 2*MAX_BYTES:
+        raise ValueError('invalid Q4_K tensor shape')
+    if any(type(part) is not bytes for part in (quants, scales, d, dmin)):
+        raise ValueError('immutable snapshots required')
+    blocks = k*n//256
+    if (len(quants), len(scales), len(d), len(dmin)) != (blocks*128, blocks*12, blocks*2, blocks*2):
+        raise ValueError('Q4_K tensor lengths differ from shape')
+    digest = hashlib.sha256()
+    for first in range(0, blocks, 1024):
+        count = min(1024, blocks-first)
+        interleaved = bytearray(count*144)
+        for lane in range(2):
+            interleaved[lane::144] = d[first*2+lane:(first+count)*2:2]
+            interleaved[2+lane::144] = dmin[first*2+lane:(first+count)*2:2]
+        for lane in range(12):
+            interleaved[4+lane::144] = scales[first*12+lane:(first+count)*12:12]
+        for lane in range(128):
+            interleaved[16+lane::144] = quants[first*128+lane:(first+count)*128:128]
+        digest.update(interleaved)
+    return digest.hexdigest()
 
 
 def q8_digest(quants, scales, k, n):
