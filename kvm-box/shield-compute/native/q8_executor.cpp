@@ -915,7 +915,7 @@ private:
     ggml_backend_t cpu_ = nullptr;
     bool cpu_tried_ = false;
     size_t retained_ = 0;
-    uint64_t completed_ = 0;
+    std::atomic<uint64_t> completed_{0};  // read by the serving loop while a job may run
     bool prepared_ = false;
 };
 
@@ -1492,16 +1492,22 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
         for (size_t i = 0; i < sessions.size();) {
             if (!fds[2 + i].revents) { ++i; continue; }
             try {
+                // Another session's request in this same pass may have started one.
+                ahead.wait();
                 session_request(sessions[i], engine, ahead);
                 ++i;
             } catch (const Drop & drop) {
                 if (std::strcmp(drop.why, "client closed"))
                     std::fprintf(stderr, "[q8-executor] session dropped: %s\n", drop.why);
+                // A reply that could not be written may follow a job that
+                // still uses this session.
+                ahead.wait();
                 close(sessions[i].fd);
                 sessions.erase(sessions.begin() + (ptrdiff_t)i);
                 fds.erase(fds.begin() + 2 + (ptrdiff_t)i);
             }
             if (engine.completed() >= kMaxSessionRequests) {
+                ahead.wait();  // the totals below read the engine
                 close_sessions(sessions, true);
                 const Totals t = totals(base, engine);
                 control_send(control, 'F', &t);
