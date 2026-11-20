@@ -60,8 +60,8 @@ namespace {
 
 constexpr const char * kArithmetic = "shield-fixed-point-v1";
 constexpr size_t kMaxPolicy = 16u << 20;
-constexpr uint64_t kMaxModel = 16ull << 30;
-constexpr size_t kMaxTensor = 512u << 20;
+constexpr uint64_t kMaxModel = 64ull << 30;
+constexpr size_t kMaxTensor = size_t(2) << 30;
 constexpr size_t kMaxHeader = 8192;          // including the terminating '\n'
 constexpr size_t kMaxPayload = 2u << 20;     // input and output, each
 constexpr uint64_t kMaxRows = 32;
@@ -115,12 +115,13 @@ struct PolicyEntry {
 };
 using Policy = std::map<std::string, PolicyEntry>;
 
-// The weight types a product may be asked for: Q8_0, and Q4_K or Q6_K whose
-// rows are whole 256-weight super-blocks. Sessions only; the request protocol on stdin
+// The weight types a product may be asked for: Q8_0, and Q4_K, Q5_K or Q6_K
+// whose rows are whole 256-weight super-blocks. Sessions only; the request protocol on stdin
 // stays Q8_0, which the service checks before it forwards anything.
 bool lowered_weight(uint32_t type, int64_t k) {
     return k > 0 && ((type == GGML_TYPE_Q8_0 && k % 32 == 0) ||
-                     ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) && k % 256 == 0));
+                     ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) &&
+                      k % 256 == 0));
 }
 
 std::string read_policy_file(const char * path) {

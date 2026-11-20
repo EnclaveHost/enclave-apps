@@ -46,8 +46,8 @@ struct Q8Region {
 struct Q8Known {
   // The tensor's weight buffers: codes and scales for Q8_0; four for the
   // K-quants (quants, scales, d, dmin for Q4_K; low bits, high bits, scales, d
-  // for Q6_K).
-  std::array<Q8Region, 4> weights;
+  // for Q6_K) and five for Q5_K (quants, high bits, scales, d, dmin).
+  std::array<Q8Region, 5> weights;
   unsigned count;
   size_t k, n;
   std::shared_ptr<const Q8Identity> identity;  // q8_authenticate's answer for these bytes
@@ -163,6 +163,7 @@ bool q8_all_finite(const unsigned char *bytes, size_t count) {
 // kernel's sub-group reduction, so results can differ in the last bits, as
 // they do between any two float implementations. SHIELD_OPENCL_Q8_LOCAL=0
 // keeps the original kernel.
+#include "q8_kquant.inc"
 std::atomic<size_t> q8_local_bytes{0};
 struct Q8Local {
   size_t k = 0, n = 0, charged = 0;
@@ -172,32 +173,25 @@ struct Q8Local {
   size_t block = 32;
   std::vector<int8_t> codes;   // n rows of k
   std::vector<float> scales;   // n rows of k/block
+  // Q4_K and Q5_K weights are scale * quant - minimum for each 32: the quants
+  // are the codes, and the minimum of each 32 is taken off the sum of that
+  // part of the activation. Empty for the other types.
+  std::vector<float> minimums; // n rows of k/32
   ~Q8Local() { q8_local_bytes -= charged; }
 };
-constexpr size_t Q8_LOCAL_LIMIT = 1024u << 20;
+// Private weight copies for local products, in total: 1 GiB unless
+// SHIELD_OPENCL_Q8_LOCAL_MB says otherwise. A model with many tensors the
+// executor declines needs more, or the rest run their own kernels.
+const size_t Q8_LOCAL_LIMIT = [] {
+  const char *value = std::getenv("SHIELD_OPENCL_Q8_LOCAL_MB");
+  return size_t(std::min<unsigned long long>(value ? std::strtoull(value, nullptr, 10) : 1024, 1u << 20)) << 20;
+}();
 bool q8_local_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("SHIELD_OPENCL_Q8_LOCAL");
     return !value || std::strcmp(value, "0");
   }();
   return enabled;
-}
-float q8_half_to_float(uint16_t h) {
-  const uint32_t sign = uint32_t(h & 0x8000) << 16, exponent = (h >> 10) & 31, fraction = h & 1023;
-  uint32_t bits;
-  if (exponent == 0) {
-    if (!fraction) bits = sign;
-    else {
-      int shift = 0;
-      uint32_t f = fraction;
-      while (!(f & 1024)) { f <<= 1; ++shift; }
-      bits = sign | ((113 - shift) << 23) | ((f & 1023) << 13);
-    }
-  } else if (exponent == 31) bits = sign | 0x7f800000u | (fraction << 13);
-  else bits = sign | ((exponent + 112) << 23) | (fraction << 13);
-  float value;
-  std::memcpy(&value, &bits, 4);
-  return value;
 }
 void q8_local_rows_scalar(const Q8Local &w, const float *x, float *y, size_t first, size_t last) {
   const size_t blocks = w.k / 32;
@@ -385,9 +379,21 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
   static auto *pool = new Q8LocalPool;
   // Small products are not worth waking threads for.
   const size_t use = w.k * w.n * m < (4u << 20) ? 1 : std::min(threads, w.n);
+  std::vector<float> sums;
   for (size_t r = 0; r < m; ++r) {
     if (use == 1) rows(w, x + r * w.k, y + r * w.n, 0, w.n);
     else pool->run(rows, w, x + r * w.k, y + r * w.n, use);
+    if (w.minimums.empty()) continue;
+    const size_t parts = w.k / 32;
+    sums.assign(parts, 0.0f);
+    for (size_t b = 0; b < parts; ++b)
+      for (size_t i = 0; i < 32; ++i) sums[b] += x[r * w.k + b * 32 + i];
+    for (size_t j = 0; j < w.n; ++j) {
+      const float *minimum = w.minimums.data() + j * parts;
+      float total = 0;
+      for (size_t b = 0; b < parts; ++b) total += minimum[b] * sums[b];
+      y[r * w.n + j] -= total;
+    }
   }
 }
 
@@ -733,9 +739,9 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
 struct Q8DirectLaunch {
   cl_command_queue queue;
   int kind;                            // Q8Kind
-  std::array<cl_mem, 6> buffers;       // the weight buffers, then activation and output
-  std::array<Storage, 6> storage;
-  std::array<size_t, 5> read_bytes;    // the weight buffers, then the activation
+  std::array<cl_mem, 7> buffers;       // the weight buffers, then activation and output
+  std::array<Storage, 7> storage;
+  std::array<size_t, 6> read_bytes;    // the weight buffers, then the activation
   unsigned weights() const { return q8_kind_weights(kind); }
   size_t input_offset, output_offset, output_bytes, k, n, m;
   cl_event *event;
@@ -769,60 +775,50 @@ cl_int q8_direct_result(const Q8DirectLaunch &launch, cl_int status) {
 // The product computed in this process. False: not available (disabled, the
 // weights could not be remembered, or the copy would exceed the limit); the
 // caller then runs the original kernel.
-// A Q6_K tensor's four flat buffers as codes and scales (see Q8Local): within
-// each 256 weights, the low nibbles of the first 64 low bytes are weights
-// 0..63 and their high nibbles weights 128..191 of the first half, and so on
-// as in ggml's dequantize_row_q6_K; the two high bits come from the matching
-// 2-bit field of the high byte.
-bool q6k_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
-  std::array<std::vector<unsigned char>, 4> raw;
-  for (unsigned i = 0; i < 4; ++i) {
+// A K-quant tensor's flat buffers, read back and decoded for a local product
+// (q8_kquant.inc has the decoding).
+bool q8_kquant_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
+  const unsigned count = launch.weights();
+  const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
+  std::array<std::vector<unsigned char>, 5> raw;
+  for (unsigned i = 0; i < count; ++i) {
     raw[i].resize(launch.read_bytes[i]);
     if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i], raw[i].data(),
                                   0, nullptr, nullptr))
       return false;
   }
   const size_t blocks = launch.k * launch.n / 256;
-  local.block = 16;
   local.codes.resize(blocks * 256);
-  local.scales.resize(blocks * 16);
-  for (size_t ib = 0; ib < blocks; ++ib) {
-    const unsigned char *ql = raw[0].data() + ib * 128, *qh = raw[1].data() + ib * 64;
-    const auto *sc = reinterpret_cast<const int8_t *>(raw[2].data() + ib * 16);
-    uint16_t half;
-    std::memcpy(&half, raw[3].data() + ib * 2, 2);
-    const float d = q8_half_to_float(half);
-    int8_t *out = local.codes.data() + ib * 256;
-    for (size_t part = 0; part < 2; ++part)
-      for (size_t l = 0; l < 32; ++l) {
-        const unsigned low0 = ql[part * 64 + l], low1 = ql[part * 64 + l + 32], high = qh[part * 32 + l];
-        out[part * 128 + l] = int8_t(int((low0 & 0xF) | ((high & 3) << 4)) - 32);
-        out[part * 128 + l + 32] = int8_t(int((low1 & 0xF) | (((high >> 2) & 3) << 4)) - 32);
-        out[part * 128 + l + 64] = int8_t(int((low0 >> 4) | (((high >> 4) & 3) << 4)) - 32);
-        out[part * 128 + l + 96] = int8_t(int((low1 >> 4) | (((high >> 6) & 3) << 4)) - 32);
-      }
-    for (size_t i = 0; i < 16; ++i) local.scales[ib * 16 + i] = d * float(sc[i]);
+  if (q6) {
+    local.block = 16;
+    local.scales.resize(blocks * 16);
+    q8_decode_q6_k(raw[0].data(), raw[1].data(), raw[2].data(), raw[3].data(), blocks, local.codes.data(),
+                   local.scales.data());
+  } else {
+    const bool q5 = count == 5;
+    local.block = 32;
+    local.scales.resize(blocks * 8);
+    local.minimums.resize(blocks * 8);
+    q8_decode_q45_k(raw[0].data(), q5 ? raw[1].data() : nullptr, raw[q5 ? 2 : 1].data(), raw[q5 ? 3 : 2].data(),
+                    raw[q5 ? 4 : 3].data(), blocks, local.codes.data(), local.scales.data(), local.minimums.data());
   }
   return true;
 }
 
 bool q8_local(const Q8DirectLaunch &launch, const Q8Identity &identity, bool remembered,
               const std::vector<unsigned char> &input, std::vector<unsigned char> &output) {
-  // Q8_0 and Q6_K weights have a local product; a Q4_K tensor that is not
-  // offloaded runs its own kernel.
-  const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
-  if ((launch.weights() != 2 && !q6) || !q8_local_enabled() || !remembered || identity.local_unavailable)
-    return false;
+  const bool k_quant = launch.weights() != 2;
+  if (!q8_local_enabled() || !remembered || identity.local_unavailable) return false;
   if (!identity.local) {
-    const size_t bytes = q6 ? launch.k * launch.n + launch.k * launch.n / 4
-                            : launch.read_bytes[0] + launch.read_bytes[1] * 2;
+    const size_t bytes = k_quant ? launch.k * launch.n + launch.k * launch.n / 4
+                                 : launch.read_bytes[0] + launch.read_bytes[1] * 2;
     if (q8_local_bytes.load() + bytes > Q8_LOCAL_LIMIT) return false;
     try {
       auto local = std::make_shared<Q8Local>();
       local->k = launch.k;
       local->n = launch.n;
-      if (q6) {
-        if (!q6k_local_weights(launch, *local)) {
+      if (k_quant) {
+        if (!q8_kquant_local_weights(launch, *local)) {
           identity.local_unavailable = true;
           return false;
         }
@@ -864,7 +860,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   q8_timing.add(Q8Timing::Wait, stage);
 
   const unsigned count = launch.weights();
-  std::array<Q8Region, 4> regions{};
+  std::array<Q8Region, 5> regions{};
   for (unsigned w = 0; w < count; ++w)
     regions[w] = {launch.storage[w].root, launch.storage[w].offset, launch.read_bytes[w]};
   std::shared_ptr<const Q8Identity> identity;
@@ -885,7 +881,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   }
   if (!known) {
     stage = Q8Timing::now();
-    std::array<std::vector<unsigned char>, 4> bytes;
+    std::array<std::vector<unsigned char>, 5> bytes;
     for (size_t i = 0; i < count; ++i) {
       bytes[i].resize(launch.read_bytes[i]);
       if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i],
@@ -896,7 +892,9 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     stage = Q8Timing::now();
     try {
       const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
-      const json answer = q6 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
+      const json answer = count == 5 ? q5k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], launch.k,
+                                                        launch.n)
+                          : q6 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
                           : count == 4 ? q4k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
                                        : q8_authenticate(bytes[0], bytes[1], launch.k, launch.n);
       auto fresh = std::make_shared<Q8Identity>();
@@ -948,7 +946,13 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   // Not offloaded: weights that are not an approved tensor, a shape the
   // protocol cannot carry, or a width the executor has already declined.
   const uint64_t width = launch.m < 64 ? uint64_t(1) << launch.m : 0;
-  bool local = !weights.approved || !rows || (weights.declined & width);
+  // SHIELD_OPENCL_Q8_LOCAL_ONLY=1 offloads nothing: every product is computed
+  // here or by its own kernel. For comparing the two; never set by a package.
+  static const bool local_only = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_LOCAL_ONLY");
+    return value && !std::strcmp(value, "1");
+  }();
+  bool local = local_only || !weights.approved || !rows || (weights.declined & width);
   try {
     if (!local && launch.m <= rows) {
       const auto shared = q8_exchange_shared(weights, launch.k, launch.n, launch.m, input);

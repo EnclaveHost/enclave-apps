@@ -4,7 +4,7 @@ import struct
 import unittest
 from dataclasses import replace
 
-from q8_admission import (BufferView, PublicQ8Catalog, q4_k_digest, q6_k_digest, q8_digest,
+from q8_admission import (BufferView, PublicQ8Catalog, q4_k_digest, q5_k_digest, q6_k_digest, q8_digest,
                           validate_launch)
 
 
@@ -134,6 +134,81 @@ def q6_fixture(variant, k=512, n=72, m=3):
     for index, size in enumerate((128, 64, 16, 2)):
         buffers[index] = BufferView(index+1, blocks*size+64, 64, blocks*size)
     return scalars, buffers, grid, local
+
+
+def q5_fixture(variant, k=512, n=72, m=3):
+    """Q5_K: the Q4_K arguments one place later, after a fifth weight buffer."""
+    base, buffers4, grid, local = k_fixture(variant.replace('q5', 'q4'), k, n, m)
+    scalars = {index+1: value for index, value in base.items()}
+    if variant == 'mv_q5_k':
+        row = k//256*176
+        scalars.update({11: row, 12: row*n, 13: row*n})
+    blocks = n*k//256
+    buffers = {5: replace(buffers4[4], root=6), 7: replace(buffers4[6], root=8)}
+    for index, size in enumerate((128, 32, 12, 2, 2)):
+        buffers[index] = BufferView(index+1, blocks*size+64, 64, blocks*size)
+    return scalars, buffers, grid, local
+
+
+class Q5KLaunchTests(unittest.TestCase):
+    def test_real_layouts(self):
+        for variant, k, n, m in [('mm_q5_k', 5120, 17408, 32), ('mv_q5_k', 5120, 17408, 1),
+                                  ('mv_q5_k', 17408, 5120, 1), ('mm_q5_k', 256, 73, 67), ('mv_q5_k', 256, 4, 3)]:
+            with self.subTest(variant=variant, shape=(k, n, m)):
+                launch = validate_launch(variant, *q5_fixture(variant, k, n, m))
+                self.assertEqual((launch.k, launch.n, launch.m), (k, n, m))
+                self.assertEqual([end-start for _, start, end in launch.reads],
+                                 [k*n//2, k*n//8, k*n//256*12, k*n//128, k*n//128, m*k*4])
+
+    def test_every_argument_and_every_other_kernels_layout(self):
+        for variant in ('mm_q5_k', 'mv_q5_k'):
+            scalars, buffers, grid, local = q5_fixture(variant)
+            for index in range(9, 22):
+                with self.subTest(variant=variant, index=index):
+                    with self.assertRaises(ValueError):
+                        validate_launch(variant, {**scalars, index: scalars[index]+1}, buffers, grid, local)
+            for missing in (*scalars, *buffers):
+                with self.subTest(variant=variant, missing=missing):
+                    with self.assertRaises(ValueError):
+                        validate_launch(variant, {i: v for i, v in scalars.items() if i != missing},
+                                        {i: v for i, v in buffers.items() if i != missing}, grid, local)
+            for other in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k'):
+                with self.assertRaises(ValueError):
+                    validate_launch(other, scalars, buffers, grid, local)
+            with self.assertRaises(ValueError):
+                validate_launch(variant, *k_fixture(variant.replace('q5', 'q4')))
+        with self.assertRaises(ValueError):  # the Q4_K row stride is not the Q5_K one
+            scalars, buffers, grid, local = q5_fixture('mv_q5_k')
+            validate_launch('mv_q5_k', {**scalars, 11: 512//256*144}, buffers, grid, local)
+        with self.assertRaises(ValueError):
+            validate_launch('mv_q5_k', *q5_fixture('mv_q5_k', 256, 6, 1))
+
+    def test_alignment_and_aliasing(self):
+        for variant in ('mm_q5_k', 'mv_q5_k'):
+            scalars, buffers, grid, local = q5_fixture(variant)
+            odd = replace(buffers[1], offset=buffers[1].offset+1, root_bytes=buffers[1].root_bytes+1)
+            validate_launch(variant, scalars, {**buffers, 1: odd}, grid, local)
+            for index in (0, 3, 4):
+                moved = replace(buffers[index], offset=buffers[index].offset+1,
+                                root_bytes=buffers[index].root_bytes+1)
+                with self.assertRaises(ValueError):
+                    validate_launch(variant, scalars, {**buffers, index: moved}, grid, local)
+            for index in (0, 1, 2, 3, 4, 5):
+                shared = replace(buffers[7], root=buffers[index].root, root_bytes=1 << 20, offset=0, size=1 << 20)
+                source = replace(buffers[index], root_bytes=1 << 20)
+                with self.assertRaises(ValueError):
+                    validate_launch(variant, scalars, {**buffers, index: source, 7: shared}, grid, local)
+
+    def test_digest_is_the_gguf_block_order(self):
+        k, n = 256, 300
+        blocks = k*n//256
+        raw = bytes((13*i+7) % 249 for i in range(blocks*176))
+        part = lambda start, size: b''.join(raw[i*176+start:i*176+start+size] for i in range(blocks))
+        d, dmin, scales, high, quants = part(0, 2), part(2, 2), part(4, 12), part(16, 32), part(48, 128)
+        self.assertEqual(q5_k_digest(quants, high, scales, d, dmin, k, n), hashlib.sha256(raw).hexdigest())
+        self.assertNotEqual(q5_k_digest(quants, high, scales, dmin, d, k, n), hashlib.sha256(raw).hexdigest())
+        with self.assertRaises(ValueError):
+            q5_k_digest(quants, high[:-1], scales, d, dmin, k, n)
 
 
 class Q6KLaunchTests(unittest.TestCase):

@@ -15,13 +15,16 @@ from kernel_compiler import ast, canonical_type, MAX_SOURCE
 ROOT = Path(__file__).resolve().parent / 'q8-reference'
 REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl',
               'mm_q4_k': 'mul_mm_q4_k_f32_l4_lm.cl', 'mv_q4_k': 'mul_mv_q4_k_f32_flat.cl',
+              'mm_q5_k': 'mul_mm_q5_k_f32_l4_lm.cl', 'mv_q5_k': 'mul_mv_q5_k_f32_flat.cl',
               'mm_q6_k': 'mul_mm_q6_k_f32_l4_lm.cl', 'mv_q6_k': 'mul_mv_q6_k_f32_flat.cl'}
-# The K-quant kernels take the same arguments after four weight buffers
-# (quants, 6-bit scales, d, dmin) where the Q8_0 kernels take two.
+# The K-quant kernels take four weight buffers (five for Q5_K) where the
+# Q8_0 kernels take two; their other arguments follow.
 ARGUMENTS = {
     'q8_0': {'quants': 0, 'scales': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     'q4_k': {'quants': 0, 'scales': 1, 'd': 2, 'dmin': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
              'outputOffset': 7},
+    'q5_k': {'quants': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'dmin': 4, 'input': 5, 'inputOffset': 6,
+             'output': 7, 'outputOffset': 8},
     'q6_k': {'quantsLow': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
              'outputOffset': 7},
 }

@@ -20,7 +20,7 @@
 +                break;
 +            case GGML_OP_MUL_MAT:
 +                if ((op->src[0]->type != GGML_TYPE_Q8_0 && op->src[0]->type != GGML_TYPE_Q4_K &&
-+                     op->src[0]->type != GGML_TYPE_Q6_K) ||
++                     op->src[0]->type != GGML_TYPE_Q5_K && op->src[0]->type != GGML_TYPE_Q6_K) ||
 +                    op->src[1]->type != GGML_TYPE_F32) {
 +                    return false;
 +                }

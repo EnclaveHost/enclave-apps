@@ -19,6 +19,19 @@ MV_6 = (ROOT / 'mul_mv_q6_k_f32_flat.cl').read_text()
 
 
 class Q8CompilerTests(unittest.TestCase):
+    def test_q5_k_sources(self):
+        for file, name, variant in [('mul_mm_q5_k_f32_l4_lm.cl', 'kernel_mul_mm_q5_k_f32_l4_lm', 'mm_q5_k'),
+                                    ('mul_mv_q5_k_f32_flat.cl', 'kernel_mul_mv_q5_K_f32_flat', 'mv_q5_k')]:
+            source = (ROOT / file).read_text()
+            for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+                with self.subTest(variant=variant, options=options):
+                    plan = analyze(source, options)[name]
+                    self.assertEqual((plan['variant'], plan['operation']), (variant, 'q5_k-f32-matmul'))
+                    self.assertEqual(plan['arguments']['input'], 5)
+        source = (ROOT / 'mul_mv_q5_k_f32_flat.cl').read_text()
+        self.assertEqual(analyze(source.replace('qh[2]&u1_lo?16.f:0.f', 'qh[3]&u1_lo?16.f:0.f', 1)), {})
+        self.assertEqual(analyze(source.replace('qh += blk*32;', 'qh += blk*31;')), {})
+
     def test_q6_k_sources_and_the_function_the_vector_kernel_calls(self):
         for source, name, variant in [(MM_6, 'kernel_mul_mm_q6_k_f32_l4_lm', 'mm_q6_k'),
                                       (MV_6, 'kernel_mul_mv_q6_K_f32_flat', 'mv_q6_k')]:

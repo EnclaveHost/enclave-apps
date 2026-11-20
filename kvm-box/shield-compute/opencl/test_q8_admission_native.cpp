@@ -1,7 +1,7 @@
 // Test driver for q8_admission.inc. One launch per input line:
 //   kind (1 mm, 2 mv, 3 mm_q4_k, 4 mv_q4_k, 5 mm_q6_k, 6 mv_q6_k), scalars 3 and
 //   5..18 two places before a K-quant kernel has them (zero where unused), six buffers (root root_bytes offset size; unused ones zero),
-//   global[3], local[3], offset[3]  -- 49 unsigned decimal numbers.
+//   global[3], local[3], offset[3]  -- 53 unsigned decimal numbers.
 // Prints "0", or "1 m n k reads... output".
 #include <algorithm>
 #include <array>
