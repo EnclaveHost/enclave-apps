@@ -1,0 +1,179 @@
+diff -ruN a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+--- a/ggml/src/ggml-opencl/CMakeLists.txt	2026-07-31 22:13:07.000000000 -0700
++++ b/ggml/src/ggml-opencl/CMakeLists.txt	2026-11-20 05:23:21.585379790 -0700
+@@ -159,6 +159,7 @@
+     mul_mm_q5_0_f32_l4_lm
+     mul_mm_q5_1_f32_l4_lm
+     mul_mm_q8_0_f32_l4_lm
++    mul_mat_iq4_xs_f32_raw
+     mul_mm_iq4_nl_f32_l4_lm
+     mul_mm_q4_k_f32_l4_lm
+     mul_mm_q5_k_f32_l4_lm
+diff -ruN a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp	2026-11-20 04:04:24.855303938 -0700
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp	2026-11-20 05:23:21.589813925 -0700
+@@ -715,6 +715,7 @@
+     cl_program program_mul_mm_f32_f32_l4_lm;
+     cl_program program_mul_mm_f16_f32_l4_lm;
+     cl_program program_mul_mm_q8_0_f32_l4_lm;
++    cl_program program_mul_mat_iq4_xs_f32_raw;
+ 
+     cl_kernel kernel_add, kernel_add_row, kernel_add_f16, kernel_add_row_f16;
+     cl_kernel kernel_mul, kernel_mul_row, kernel_mul_f16, kernel_mul_row_f16;
+@@ -905,6 +906,7 @@
+     cl_kernel kernel_mul_mm_q5_0_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q5_1_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q8_0_f32_l4_lm;
++    cl_kernel kernel_mul_mat_iq4_xs_f32_raw;
+     cl_kernel kernel_mul_mm_q4_k_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q5_k_f32_l4_lm;
+     cl_kernel kernel_mul_mm_q6_k_f32_l4_lm;
+@@ -2351,6 +2353,22 @@
+         GGML_LOG_CONT(".");
+     }
+ 
++    // mul_mat_iq4_xs_f32_raw (Enclave Shield: IQ4_XS weights as GGUF bytes)
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "mul_mat_iq4_xs_f32_raw.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("mul_mat_iq4_xs_f32_raw.cl");
++#endif
++        backend_ctx->program_mul_mat_iq4_xs_f32_raw =
++            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++
++        CL_CHECK((backend_ctx->kernel_mul_mat_iq4_xs_f32_raw = clCreateKernel(backend_ctx->program_mul_mat_iq4_xs_f32_raw, "kernel_mul_mat_iq4_xs_f32_raw", &err), err));
++        GGML_LOG_CONT(".");
++    }
++
+     // mul_mm_q1_0_f32_l4_lm
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -7129,7 +7147,8 @@
+                 break;
+             case GGML_OP_MUL_MAT:
+                 if ((op->src[0]->type != GGML_TYPE_Q8_0 && op->src[0]->type != GGML_TYPE_Q4_K &&
+-                     op->src[0]->type != GGML_TYPE_Q5_K && op->src[0]->type != GGML_TYPE_Q6_K) ||
++                     op->src[0]->type != GGML_TYPE_Q5_K && op->src[0]->type != GGML_TYPE_Q6_K &&
++                     op->src[0]->type != GGML_TYPE_IQ4_XS) ||
+                     op->src[1]->type != GGML_TYPE_F32) {
+                     return false;
+                 }
+@@ -7358,6 +7377,15 @@
+                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
+                 return op->src[1]->type == GGML_TYPE_F32;
++            } else if (op->src[0]->type == GGML_TYPE_IQ4_XS) {
++                // Only the Enclave Shield device has a use for the plain
++                // IQ4_XS kernel: it offloads the product. Two-dimensional,
++                // contiguous, whole 256-weight rows.
++                return dev_ctx->device_name == "Enclave Shield Virtual GPU (guest CPU + verified offload)" &&
++                       op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 256 == 0 &&
++                       op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
++                       op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
++                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+             }
+             return false;
+         case GGML_OP_MUL_MAT_ID:
+@@ -18598,6 +18626,38 @@
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
++    // IQ4_XS weights stay as GGUF bytes and have one plain kernel (see
++    // mul_mat_iq4_xs_f32_raw.cl); supports_op admits only the 2-D contiguous case.
++    if (src0t == GGML_TYPE_IQ4_XS) {
++        ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++        ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++        ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++        cl_ulong offset0 = extra0->offset + src0->view_offs;
++        cl_ulong offset1 = extra1->offset + src1->view_offs;
++        cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++        int ne00 = src0->ne[0];
++        int ne01 = src0->ne[1];
++        int ne11 = src1->ne[1];
++
++        cl_kernel kernel = backend_ctx->kernel_mul_mat_iq4_xs_f32_raw;
++        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(int),      &ne01));
++        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(int),      &ne11));
++
++        size_t global_work_size[] = {(size_t)ne01, (size_t)ne11, 1};
++        size_t local_work_size[] = {1, 1, 1};
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++        return;
++    }
++
+     // quant kv without FA
+     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
+     // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
+diff -ruN a/ggml/src/ggml-opencl/kernels/mul_mat_iq4_xs_f32_raw.cl b/ggml/src/ggml-opencl/kernels/mul_mat_iq4_xs_f32_raw.cl
+--- a/ggml/src/ggml-opencl/kernels/mul_mat_iq4_xs_f32_raw.cl	1969-12-31 17:00:00.000000000 -0700
++++ b/ggml/src/ggml-opencl/kernels/mul_mat_iq4_xs_f32_raw.cl	2026-11-20 05:23:21.576184755 -0700
+@@ -0,0 +1,57 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++//------------------------------------------------------------------------------
++// kernel_mul_mat_iq4_xs_f32_raw
++//
++// A plain product for IQ4_XS weights kept exactly as the GGUF holds them:
++// 136 bytes for each 256 weights (half d, 16 bits of high scale bits, four
++// bytes of low scale bits, 128 bytes of 4-bit indices into a fixed table).
++// One work item computes one output, dst[r][j] = row j of src0 . row r of src1.
++// Written to be read, not to be fast: the Enclave Shield device offloads this
++// product when it can and only runs the kernel when it cannot.
++//------------------------------------------------------------------------------
++kernel void kernel_mul_mat_iq4_xs_f32_raw(
++    global uchar * src0,
++    ulong offset0,
++    global float * src1,
++    ulong offset1,
++    global float * dst,
++    ulong offsetd,
++    int ne00,
++    int ne01,
++    int ne11
++) {
++    src0 = src0 + offset0;
++    src1 = (global float *)((global char *)src1 + offset1);
++    dst  = (global float *)((global char *)dst + offsetd);
++
++    const char values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
++
++    const int j = get_global_id(0);
++    const int r = get_global_id(1);
++    if (j < ne01 && r < ne11) {
++        const int nb = ne00 / 256;
++        global uchar * row = src0 + (ulong)j * (ulong)nb * 136;
++        global float * x = src1 + (ulong)r * (ulong)ne00;
++
++        float total = 0.0f;
++        for (int ib = 0; ib < nb; ib++) {
++            global uchar * block = row + (ulong)ib * 136;
++            const float d = vload_half(0, (global half *)block);
++            const uint high = (uint)block[2] | ((uint)block[3] << 8);
++            for (int part = 0; part < 8; part++) {
++                const int low = (block[4 + part / 2] >> (4 * (part % 2))) & 0xF;
++                const int scale = (low | (((high >> (2 * part)) & 3) << 4)) - 32;
++                global uchar * q = block + 8 + part * 16;
++                global float * y = x + ib * 256 + part * 32;
++                float sum = 0.0f;
++                for (int i = 0; i < 16; i++) {
++                    sum += y[i] * (float)values[q[i] & 0xF];
++                    sum += y[i + 16] * (float)values[q[i] >> 4];
++                }
++                total += d * (float)scale * sum;
++            }
++        }
++        dst[(ulong)r * (ulong)ne01 + j] = total;
++    }
++}

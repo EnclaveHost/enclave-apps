@@ -116,12 +116,13 @@ struct PolicyEntry {
 };
 using Policy = std::map<std::string, PolicyEntry>;
 
-// The weight types a product may be asked for: Q8_0, and Q4_K, Q5_K or Q6_K
-// whose rows are whole 256-weight super-blocks. Sessions only; the request protocol on stdin
+// The weight types a product may be asked for: Q8_0, and Q4_K, Q5_K, Q6_K or
+// IQ4_XS whose rows are whole 256-weight super-blocks. Sessions only; the request protocol on stdin
 // stays Q8_0, which the service checks before it forwards anything.
 bool lowered_weight(uint32_t type, int64_t k) {
     return k > 0 && ((type == GGML_TYPE_Q8_0 && k % 32 == 0) ||
-                     ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K) &&
+                     ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
+                       type == GGML_TYPE_IQ4_XS) &&
                       k % 256 == 0));
 }
 

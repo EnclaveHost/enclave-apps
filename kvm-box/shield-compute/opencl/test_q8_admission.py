@@ -211,6 +211,47 @@ class Q5KLaunchTests(unittest.TestCase):
             q5_k_digest(quants, high[:-1], scales, d, dmin, k, n)
 
 
+def iq4_fixture(k=512, n=72, m=3, offsets=(64, 32, 16)):
+    scalars = {1: offsets[0], 3: offsets[1], 5: offsets[2], 6: k, 7: n, 8: m}
+    sizes = {0: n*k//256*136+offsets[0], 2: m*k*4+offsets[1], 4: m*n*4+offsets[2]}
+    buffers = {index: BufferView(index+1, size+64, 64, size) for index, size in sizes.items()}
+    return scalars, buffers, (n, m, 1), (1, 1, 1)
+
+
+class IQ4XSLaunchTests(unittest.TestCase):
+    def test_real_layouts(self):
+        for k, n, m in [(5120, 17408, 1), (17408, 5120, 32), (256, 1, 1), (2048, 11008, 7)]:
+            launch = validate_launch('raw_iq4_xs', *iq4_fixture(k, n, m))
+            self.assertEqual((launch.k, launch.n, launch.m), (k, n, m))
+            self.assertEqual([end-start for _, start, end in launch.reads], [k*n//256*136, m*k*4])
+            self.assertEqual(launch.write[2]-launch.write[1], m*n*4)
+
+    def test_arguments_grid_alignment_and_aliasing(self):
+        scalars, buffers, grid, local = iq4_fixture()
+        for missing in (*scalars, *buffers):
+            with self.assertRaises(ValueError):
+                validate_launch('raw_iq4_xs', {i: v for i, v in scalars.items() if i != missing},
+                                {i: v for i, v in buffers.items() if i != missing}, grid, local)
+        for change in ({6: 288}, {6: 768}, {7: 73}, {8: 4}, {1: 65}, {3: 34}, {5: 18}, {7: 0}):
+            with self.subTest(change=change):
+                with self.assertRaises(ValueError):
+                    validate_launch('raw_iq4_xs', {**scalars, **change}, buffers, grid, local)
+        with self.assertRaises(ValueError):
+            validate_launch('raw_iq4_xs', scalars, buffers, grid, (2, 1, 1))
+        with self.assertRaises(ValueError):
+            validate_launch('raw_iq4_xs', scalars, buffers, (73, 3, 1), local)
+        with self.assertRaises(ValueError):
+            validate_launch('mv', scalars, buffers, grid, local)
+        for index in (0, 2):
+            shared = replace(buffers[4], root=buffers[index].root, root_bytes=1 << 20, offset=0, size=1 << 20)
+            source = replace(buffers[index], root_bytes=1 << 20)
+            with self.assertRaises(ValueError):
+                validate_launch('raw_iq4_xs', scalars, {**buffers, index: source, 4: shared}, grid, local)
+        short = replace(buffers[0], size=buffers[0].size-1)
+        with self.assertRaises(ValueError):
+            validate_launch('raw_iq4_xs', scalars, {**buffers, 0: short}, grid, local)
+
+
 class Q6KLaunchTests(unittest.TestCase):
     def test_real_layouts_including_an_output_layer(self):
         for variant, k, n, m in [('mm_q6_k', 2048, 11008, 32), ('mv_q6_k', 11008, 2048, 1),

@@ -24,6 +24,7 @@ LAYOUT = {
     12: ([('d', 2), ('dmin', 2), ('scales', 12), ('qs', 128)], ['qs', 'scales', 'd', 'dmin']),
     13: ([('d', 2), ('dmin', 2), ('scales', 12), ('qh', 32), ('qs', 128)], ['qs', 'qh', 'scales', 'd', 'dmin']),
     14: ([('ql', 128), ('qh', 64), ('scales', 16), ('d', 2)], ['ql', 'qh', 'scales', 'd']),
+    23: ([('d', 2), ('scales_h', 2), ('scales_l', 4), ('qs', 128)], None),  # kept whole
 }
 
 
@@ -41,7 +42,7 @@ class KQuantDecode(unittest.TestCase):
 
     def test_decoded_weights_equal_the_reference(self):
         rng = np.random.default_rng(20261120)
-        for kind, name in ((12, 'Q4_K'), (13, 'Q5_K'), (14, 'Q6_K')):
+        for kind, name in ((12, 'Q4_K'), (13, 'Q5_K'), (14, 'Q6_K'), (23, 'IQ4_XS')):
             fields, flat = LAYOUT[kind]
             size = sum(width for _, width in fields)
             blocks = 257
@@ -56,7 +57,8 @@ class KQuantDecode(unittest.TestCase):
                 parts[field] = raw[:, offset:offset+width].tobytes()
                 offset += width
             expected = quants.dequantize(raw.reshape(-1), GGMLQuantizationType[name]).reshape(-1)
-            payload = f'{kind} {blocks}\n'.encode() + b''.join(parts[field] for field in flat)
+            payload = f'{kind} {blocks}\n'.encode() + (raw.tobytes() if flat is None else
+                                                        b''.join(parts[field] for field in flat))
             output = subprocess.run([self.driver], input=payload, capture_output=True, check=True).stdout
             actual = np.frombuffer(output, dtype='<f4')
             with self.subTest(type=name):

@@ -19,6 +19,20 @@ MV_6 = (ROOT / 'mul_mv_q6_k_f32_flat.cl').read_text()
 
 
 class Q8CompilerTests(unittest.TestCase):
+    def test_the_iq4_xs_kernel_added_to_the_backend(self):
+        source = (ROOT / 'mul_mat_iq4_xs_f32_raw.cl').read_text()
+        for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+            plan = analyze(source, options)['kernel_mul_mat_iq4_xs_f32_raw']
+            self.assertEqual((plan['variant'], plan['operation']), ('raw_iq4_xs', 'iq4_xs-f32-matmul'))
+            self.assertEqual(plan['arguments'], {'weights': 0, 'weightsOffset': 1, 'input': 2, 'inputOffset': 3,
+                                                 'output': 4, 'outputOffset': 5})
+        # The table of values, the scale bits and the block size are semantics.
+        for old, new in [('-22, -10, 1, 13', '-22, -10, 2, 13'), ('(2 * part)) & 3) << 4)) - 32', '(2 * part)) & 3) << 4)) - 31'),
+                         ('(ulong)nb * 136', '(ulong)nb * 144'), ('y[i + 16]', 'y[i + 15]')]:
+            with self.subTest(change=old):
+                self.assertIn(old, source)
+                self.assertEqual(analyze(source.replace(old, new, 1)), {})
+
     def test_q5_k_sources(self):
         for file, name, variant in [('mul_mm_q5_k_f32_l4_lm.cl', 'kernel_mul_mm_q5_k_f32_l4_lm', 'mm_q5_k'),
                                     ('mul_mv_q5_k_f32_flat.cl', 'kernel_mul_mv_q5_K_f32_flat', 'mv_q5_k')]:

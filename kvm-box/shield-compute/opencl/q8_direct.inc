@@ -742,6 +742,7 @@ struct Q8DirectLaunch {
   std::array<cl_mem, 7> buffers;       // the weight buffers, then activation and output
   std::array<Storage, 7> storage;
   std::array<size_t, 6> read_bytes;    // the weight buffers, then the activation
+  size_t weight_offset;                // where the weights start in their buffer (the plain IQ4_XS kernel)
   unsigned weights() const { return q8_kind_weights(kind); }
   size_t input_offset, output_offset, output_bytes, k, n, m;
   cl_event *event;
@@ -783,13 +784,17 @@ bool q8_kquant_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
   std::array<std::vector<unsigned char>, 5> raw;
   for (unsigned i = 0; i < count; ++i) {
     raw[i].resize(launch.read_bytes[i]);
-    if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i], raw[i].data(),
-                                  0, nullptr, nullptr))
+    if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, launch.weight_offset,
+                                  launch.read_bytes[i], raw[i].data(), 0, nullptr, nullptr))
       return false;
   }
   const size_t blocks = launch.k * launch.n / 256;
   local.codes.resize(blocks * 256);
-  if (q6) {
+  if (count == 1) {
+    local.block = 32;
+    local.scales.resize(blocks * 8);
+    q8_decode_iq4_xs(raw[0].data(), blocks, local.codes.data(), local.scales.data());
+  } else if (q6) {
     local.block = 16;
     local.scales.resize(blocks * 16);
     q8_decode_q6_k(raw[0].data(), raw[1].data(), raw[2].data(), raw[3].data(), blocks, local.codes.data(),
@@ -862,7 +867,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   const unsigned count = launch.weights();
   std::array<Q8Region, 5> regions{};
   for (unsigned w = 0; w < count; ++w)
-    regions[w] = {launch.storage[w].root, launch.storage[w].offset, launch.read_bytes[w]};
+    regions[w] = {launch.storage[w].root, launch.storage[w].offset + launch.weight_offset, launch.read_bytes[w]};
   std::shared_ptr<const Q8Identity> identity;
   bool known = false;
   {
@@ -884,15 +889,16 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     std::array<std::vector<unsigned char>, 5> bytes;
     for (size_t i = 0; i < count; ++i) {
       bytes[i].resize(launch.read_bytes[i]);
-      if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i],
-                                    bytes[i].data(), 0, nullptr, nullptr))
+      if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, launch.weight_offset,
+                                    launch.read_bytes[i], bytes[i].data(), 0, nullptr, nullptr))
         return std::nullopt;
     }
     q8_timing.add(Q8Timing::Snapshot, stage);
     stage = Q8Timing::now();
     try {
       const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
-      const json answer = count == 5 ? q5k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], launch.k,
+      const json answer = count == 1 ? iq4xs_authenticate(bytes[0], launch.k, launch.n)
+                          : count == 5 ? q5k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], launch.k,
                                                         launch.n)
                           : q6 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
                           : count == 4 ? q4k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)

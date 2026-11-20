@@ -18,3 +18,7 @@ Copied byte-for-byte from llama.cpp commit
 
 These are structural compiler references and execution-test inputs, not an
 authorization list based on function names. See `../Q8_LOWERING.md`.
+
+`mul_mat_iq4_xs_f32_raw.cl` (`c0dc97543954401020f12bb3d53a9ad839238dfa57d025bfa07042628809c6a4`) is not from llama.cpp. It is the plain
+IQ4_XS product that `native/llama-shield-iq4-xs.patch` adds to llama's OpenCL
+backend, under the same license as that patch's target.

@@ -78,7 +78,7 @@ std::string q8_sha(const std::string &value) {
   Q8Hash hash; hash.update(value.data(), value.size()); return hash.finish();
 }
 struct Q8PublicTensor {
-  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K
+  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 23 IQ4_XS
   size_t k, n;
   std::string sha, name, engine, policy_sha;
 };
@@ -101,7 +101,7 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
       if (!tensors.is_array() || tensors.size()>100000) throw std::runtime_error("policy tensor limit");
       for (const auto &tensor : tensors) {
         if (tensor.at("type") != 8 && tensor.at("type") != 12 && tensor.at("type") != 13 &&
-            tensor.at("type") != 14) continue;
+            tensor.at("type") != 14 && tensor.at("type") != 23) continue;
         const int type = tensor.at("type").get<int>();
         const auto &shape = tensor.at("ne");
         if (!shape.is_array() || shape.size()!=4) throw std::runtime_error("policy shape");
@@ -111,7 +111,7 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
         if (type != 8 && k%256) continue;
         if (!k || k%32 || !n || k>(size_t(2)<<30)/n ||
             tensor.at("nbytes")!=(type == 12 ? k*n/256*144 : type == 13 ? k*n/256*176 :
-                                  type == 14 ? k*n/256*210 : k*n/32*34))
+                                  type == 14 ? k*n/256*210 : type == 23 ? k*n/256*136 : k*n/32*34))
           throw std::runtime_error("policy tensor dimensions");
         result.push_back({type,k,n,tensor.at("sha256").get<std::string>(),tensor.at("name").get<std::string>(),engine,digest});
       }
@@ -139,6 +139,18 @@ json q8_authenticate(const std::vector<unsigned char> &quants,
       return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
               {"sha256",digest},{"policySha256",tensor.policy_sha}};
   // Unknown weights may be private. Do not expose their digest or contents.
+  return {{"approved",false}};
+}
+// An IQ4_XS tensor is kept as its GGUF bytes: the digest is of the buffer.
+json iq4xs_authenticate(const std::vector<unsigned char> &bytes, size_t k, size_t n) {
+  if (k%256 || bytes.size()!=k*n/256*136) throw std::runtime_error("snapshot shape");
+  Q8Hash hash;
+  hash.update(bytes.data(), bytes.size());
+  const auto digest=hash.finish();
+  for (const auto &tensor:q8_catalog())
+    if (tensor.type==23 && tensor.k==k && tensor.n==n && tensor.sha==digest)
+      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
+              {"sha256",digest},{"policySha256",tensor.policy_sha}};
   return {{"approved",false}};
 }
 // For a Q5_K tensor: half d, half dmin, 12 scale bytes, 32 high-bit bytes and
@@ -410,8 +422,8 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
   }
   // Scalars as many places before a K-quant kernel has them as it has extra
   // weight buffers (see q8_admission.inc).
-  const bool mv=q8_kind_vector(kind);
-  const unsigned weights=q8_kind_weights(kind), shift=weights-2;
+  const bool mv=q8_kind_vector(kind), raw=kind==IQ4XS_RAW;
+  const unsigned weights=q8_kind_weights(kind), shift=raw?0:weights-2;
   std::array<cl_mem,7> buffers{};
   std::array<Storage,7> stored{};
   std::array<unsigned,7> indices{};
@@ -423,7 +435,20 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
   for(unsigned i=0;i<3;++i) { view.global[i]=global[i]; view.local[i]=local[i]; view.offset[i]=offset?offset[i]:0; }
   try {
     const bool strided=kind==Q8_MV || kind==Q4K_MV || kind==Q5K_MV;  // byte strides passed as ulong
-    for(unsigned i=3;i<q8_kind_scalars(kind);++i) if(i!=4) {
+    if(raw) {
+      // The plain IQ4_XS kernel: weights offset, input offset, output offset
+      // as ulong at 1, 3, 5; ne00, ne01, ne11 at 6, 7, 8. Held with the
+      // weights offset at 4.
+      for(unsigned i=1;i<9;++i) if(i!=2 && i!=4) {
+        const bool wide=i<6;
+        const auto &argument=state.args[i];
+        if(argument.size()!=(wide?sizeof(cl_ulong):sizeof(cl_int))) return {false,0};
+        uint64_t &held=scalars[i==1?4:i];
+        if(wide) { cl_ulong value; std::memcpy(&value,argument.data(),sizeof(value)); held=value; }
+        else { cl_int value; std::memcpy(&value,argument.data(),sizeof(value)); if(value<0) return {false,0}; held=value; }
+      }
+    }
+    else for(unsigned i=3;i<q8_kind_scalars(kind);++i) if(i!=4) {
       // The Q4_K and Q5_K vector kernels take their two pointer offsets as int.
       bool wide=((i==3 || i==5) && kind!=Q4K_MV && kind!=Q5K_MV) || (strided && (i==8 || i==9 || i==10 || i==12 || i==13 || i==14));
       const auto &argument=state.args[i+shift];
@@ -451,7 +476,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     // These equalities bind the snapshot and write extents to the same checked
     // ABI, in addition to the stride/grid/alias/range validation above.
     if(!checked_k || checked_k!=scalars[6] || !checked_n || checked_n!=scalars[7] ||
-       !checked_m || checked_m!=scalars[kind==Q6K_MV?12:mv?16:9] || checked_k>(512u<<20)/4/checked_m ||
+       !checked_m || checked_m!=scalars[raw?8:kind==Q6K_MV?12:mv?16:9] || checked_k>(512u<<20)/4/checked_m ||
        checked_n>(512u<<20)/4/checked_m || bytes[weights]!=checked_m*checked_k*4 ||
        checked_output!=checked_m*checked_n*4) return {false,0};
     size_t total=0;
@@ -467,7 +492,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
 #ifdef SHIELD_Q8_MASKED
     if(masked && !count && q8_direct_enabled() &&
        !(properties&(CL_QUEUE_PROFILING_ENABLE|CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE))) {
-      const Q8DirectLaunch launch{q,kind,buffers,stored,bytes,size_t(scalars[3]),size_t(scalars[5]),checked_output,
+      const Q8DirectLaunch launch{q,kind,buffers,stored,bytes,raw?size_t(scalars[4]):0,size_t(scalars[3]),size_t(scalars[5]),checked_output,
                                   checked_k,checked_n,checked_m,event};
       auto result=q8_direct(launch);
       q8_timing.add(Q8Timing::Enqueue,enqueue_ns);

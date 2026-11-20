@@ -62,6 +62,8 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
     """
     if variant == 'mv_q6_k':
         return validate_q6_k_vector(scalars, buffers, global_size, local_size, offset)
+    if variant == 'raw_iq4_xs':
+        return validate_iq4_xs(scalars, buffers, global_size, local_size, offset)
     if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k', 'mm_q5_k', 'mv_q5_k', 'mm_q6_k'):
         raise ValueError('unknown kernel variant')
     k_quant = variant.endswith('_k')
@@ -216,6 +218,48 @@ def validate_q6_k_vector(scalars, buffers, global_size, local_size, offset=(0, 0
            for read in reads):
         raise ValueError('output aliases an input allocation range')
     return Launch('mv_q6_k', m, n, k, reads, write)
+
+
+def validate_iq4_xs(scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
+    """The plain IQ4_XS kernel: weights as GGUF bytes and their offset, input
+    and offset, output and offset, then ne00, ne01, ne11. One work item an
+    output, every read guarded by the two dimensions."""
+    if set(scalars) != {1, 3, 5, 6, 7, 8} or set(buffers) != {0, 2, 4}:
+        raise ValueError('incomplete kernel arguments')
+    if any(type(key) is not int for key in (*scalars, *buffers)):
+        raise ValueError('invalid argument index')
+    for values in (global_size, local_size, offset):
+        if not isinstance(values, (tuple, list)) or len(values) != 3:
+            raise ValueError('expected three dimensions')
+        for value in values:
+            integer(value)
+    if tuple(offset) != (0, 0, 0):
+        raise ValueError('global offsets need separate lowering')
+    for index, value in scalars.items():
+        integer(value, U64 if index in (1, 3, 5) else I32)
+    k, n, m = scalars[6], scalars[7], scalars[8]
+    if min(k, n, m) == 0 or k % 256 or k > I32 - 256:
+        raise ValueError('invalid tensor dimensions')
+    if tuple(global_size) != (n, m, 1) or tuple(local_size) != (1, 1, 1):
+        raise ValueError('incomplete or incompatible workgroup grid')
+    roots = {}
+    for buffer in buffers.values():
+        if not isinstance(buffer, BufferView):
+            raise ValueError('allocation registry view required')
+        buffer.interval(0, 0)
+        if buffer.root in roots and roots[buffer.root] != buffer.root_bytes:
+            raise ValueError('inconsistent root allocation size')
+        roots[buffer.root] = buffer.root_bytes
+    # d is loaded as a half; input and output are float.
+    for index, alignment, extra in ((0, 2, scalars[1]), (2, 4, scalars[3]), (4, 4, scalars[5])):
+        if (buffers[index].offset + extra) % alignment:
+            raise ValueError('unaligned kernel pointer')
+    reads = (buffers[0].interval(scalars[1], n*k//256*136), buffers[2].interval(scalars[3], m*k*4))
+    write = buffers[4].interval(scalars[5], m*n*4)
+    if any(write[0] == read[0] and max(write[1], read[1]) < min(write[2], read[2])
+           for read in reads):
+        raise ValueError('output aliases an input allocation range')
+    return Launch('raw_iq4_xs', m, n, k, reads, write)
 
 
 def q6_k_digest(low, high, scales, d, k, n):

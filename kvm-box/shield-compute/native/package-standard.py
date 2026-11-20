@@ -130,7 +130,7 @@ def main():
             raise ValueError('build-only runtime path: ' + str(path))
     patches = ['llama-desktop-loopback.patch', 'llama-shield-opencl.patch',
                'llama-shield-cpu-fallback.patch', 'llama-opencl-q8-views.patch',
-               'llama-shield-source-cache.patch',
+               'llama-shield-source-cache.patch', 'llama-shield-iq4-xs.patch',
                'sd-opencl-fallback.patch', 'sd-opencl-graph-operations.patch',
                'sd-opencl-upload.patch', 'sd-graph-diagnostic.patch', 'sd-opencl-capabilities.patch']
     provenance = {'schema': 'shield-standard-package/1', 'baseImage': args.base_image,

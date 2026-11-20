@@ -32,6 +32,11 @@ int main() {
     q8_decode_q45_k(quants.data(), type == 13 ? high.data() : nullptr, packed.data(), d.data(), dmin.data(), blocks,
                     codes.data(), scales.data(), minimums.data());
     for (size_t i = 0; i < weights.size(); ++i) weights[i] = scales[i / 32] * float(codes[i]) - minimums[i / 32];
+  } else if (type == 23) {
+    const auto bytes = read(136);
+    std::vector<float> scales(blocks * 8);
+    q8_decode_iq4_xs(bytes.data(), blocks, codes.data(), scales.data());
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = scales[i / 32] * float(codes[i]);
   } else {
     return 2;
   }

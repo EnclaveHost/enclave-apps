@@ -77,3 +77,30 @@ inline void q8_decode_q6_k(const unsigned char *low, const unsigned char *high, 
     for (size_t i = 0; i < 16; ++i) scales[ib * 16 + i] = scale_d * float(sc[i]);
   }
 }
+
+// IQ4_XS: 136 bytes a block, kept as the GGUF has them: half d, 16 bits of
+// high scale bits, four bytes of low scale bits, then eight parts of 32
+// weights as 4-bit indices into a fixed table, low nibbles first. A weight is
+// scales[part] * codes[i], the code being the table's value and the scale
+// d * (6-bit scale - 32).
+inline void q8_decode_iq4_xs(const unsigned char *bytes, size_t blocks, int8_t *codes, float *scales) {
+  static const int8_t values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+  for (size_t ib = 0; ib < blocks; ++ib) {
+    const unsigned char *block = bytes + ib * 136;
+    uint16_t half;
+    std::memcpy(&half, block, 2);
+    const float scale_d = q8_half_to_float(half);
+    const unsigned high = unsigned(block[2]) | (unsigned(block[3]) << 8);
+    for (size_t part = 0; part < 8; ++part) {
+      const int low = (block[4 + part / 2] >> (4 * (part % 2))) & 0xF;
+      const int scale = (low | int(((high >> (2 * part)) & 3) << 4)) - 32;
+      scales[ib * 8 + part] = scale_d * float(scale);
+      const unsigned char *q = block + 8 + part * 16;
+      int8_t *out = codes + ib * 256 + part * 32;
+      for (size_t i = 0; i < 16; ++i) {
+        out[i] = values[q[i] & 0xF];
+        out[i + 16] = values[q[i] >> 4];
+      }
+    }
+  }
+}

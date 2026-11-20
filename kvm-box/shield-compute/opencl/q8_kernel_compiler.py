@@ -16,7 +16,9 @@ ROOT = Path(__file__).resolve().parent / 'q8-reference'
 REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl',
               'mm_q4_k': 'mul_mm_q4_k_f32_l4_lm.cl', 'mv_q4_k': 'mul_mv_q4_k_f32_flat.cl',
               'mm_q5_k': 'mul_mm_q5_k_f32_l4_lm.cl', 'mv_q5_k': 'mul_mv_q5_k_f32_flat.cl',
-              'mm_q6_k': 'mul_mm_q6_k_f32_l4_lm.cl', 'mv_q6_k': 'mul_mv_q6_k_f32_flat.cl'}
+              'mm_q6_k': 'mul_mm_q6_k_f32_l4_lm.cl', 'mv_q6_k': 'mul_mv_q6_k_f32_flat.cl',
+              # Not llama's: added to its OpenCL backend by llama-shield-iq4-xs.patch.
+              'raw_iq4_xs': 'mul_mat_iq4_xs_f32_raw.cl'}
 # The K-quant kernels take four weight buffers (five for Q5_K) where the
 # Q8_0 kernels take two; their other arguments follow.
 ARGUMENTS = {
@@ -25,6 +27,8 @@ ARGUMENTS = {
              'outputOffset': 7},
     'q5_k': {'quants': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'dmin': 4, 'input': 5, 'inputOffset': 6,
              'output': 7, 'outputOffset': 8},
+    # One buffer of GGUF bytes, then its offset.
+    'iq4_xs': {'weights': 0, 'weightsOffset': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     'q6_k': {'quantsLow': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
              'outputOffset': 7},
 }
@@ -35,7 +39,7 @@ CAPABILITIES = ('-Dcl_intel_subgroups=1', '-Dcl_intel_required_subgroup_size=1')
 BUILTINS = {'get_global_id', 'get_group_id', 'get_local_id', 'get_local_size',
             'get_sub_group_id', 'get_sub_group_local_id', 'sub_group_reduce_add',
             'convert_float4', 'convert_float8', 'vload8', 'barrier', 'mad',
-            'vload4', 'convert_int4', 'convert_float', 'convert_char', 'dot'}
+            'vload4', 'convert_int4', 'convert_float', 'convert_char', 'dot', 'vload_half', 'get_global_id'}
 KINDS = {'FunctionDecl', 'ParmVarDecl', 'VarDecl', 'CompoundStmt', 'DeclStmt',
          'BinaryOperator', 'UnaryOperator', 'DeclRefExpr', 'ImplicitCastExpr',
          'CStyleCastExpr', 'CallExpr', 'ForStmt', 'IfStmt', 'ArraySubscriptExpr',
@@ -220,7 +224,7 @@ def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
             for variant in REFERENCES:
                 pattern, digest = reference(variant, flags, clang)
                 if normalized == pattern:
-                    weights = variant[3:] if '_' in variant else 'q8_0'
+                    weights = variant.split('_', 1)[1] if '_' in variant else 'q8_0'
                     plans[function['name']] = {
                         'schema': 'shield-opencl-q8-analysis/1', 'dispatchable': False,
                         'operation': weights + '-f32-matmul', 'variant': variant,
