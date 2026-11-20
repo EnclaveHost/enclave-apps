@@ -325,34 +325,78 @@ split of the work, not a faster route.
 ## EyesOff's model
 
 `Qwen3.8-27B-UD-Q4_K_XL.gguf` with the calibration EyesOff uses (262 sites),
-service settings (two llama threads, one refill thread), eight processors, two
-test workers on the two V100s through a worker pool (one card cannot hold the
-model). Of its 410 tensors large enough to offload, 191 are Q5_K, 70 IQ4_XS,
-69 Q4_K, 56 Q6_K, 14 Q8_0 and 10 other types.
+two llama threads, eight processors, two test workers on the two V100s
+through a worker pool (one card cannot hold the model). Of its 410 tensors
+large enough to offload, 191 are Q5_K, 70 IQ4_XS, 69 Q4_K, 56 Q6_K, 14 Q8_0,
+6 IQ4_NL, 3 Q3_K and 1 IQ3_S. All eight types are lowered now:
 
-| 62 prompt tokens, 32 generated | Native Shield | OpenCL route |
-| --- | ---: | ---: |
-| Generation | 1.70 t/s | 1.33 t/s (78%) |
-| Prompt | 3.9 t/s | 2.9 t/s |
-| Whole run | 122 s | 146 s |
-| Verified work, 16 tokens | 5,137 exchanges, 1.94e12 MACs | 4,421 exchanges, 1.43e12 MACs |
+- Q8_0, Q4_K, Q5_K, Q6_K and IQ4_NL through the kernels llama's OpenCL backend
+  has for them.
+- IQ4_XS, Q3_K and IQ3_S have no kernel there. `llama-shield-iq4-xs.patch`
+  adds one plain kernel for each to the backend, used only on the Shield
+  device: the weights stay as the GGUF has them, one work item computes one
+  output. The three sources are pinned in `q8-reference/` and recognised,
+  admitted and authenticated like the others (the digest is of the buffer).
 
-The first 16 generated tokens are identical; by 32 the texts differ.
+Tokens per second, 62 prompt tokens, medians of alternating runs:
 
-The route offloads Q4_K, Q5_K, Q6_K and Q8_0 here. The OpenCL backend has no
-kernel for IQ4_XS, so the 46 IQ4_XS tensors that have calibration sites (and a
-few of other types) stay on the CPU, where the native engine offloads them.
-That is a quarter of the offloaded work and about 180 ms of CPU a token, most
-of the difference. A trace shows 514 ms of each 731 ms token waiting for the
-executor (both paths wait for pads at these settings) and 217 ms in the
-client.
+| Refill threads | Generated | Native Shield | OpenCL route | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 100 | 7.9 | 7.8 | 99% |
+| 2 (one a card) | 64 | 4.9 | 4.8 | 98% |
+| 1, eight processors | 48 | 1.8 | 1.4 | 76% |
+| 1, two processors | 48 | 1.6 | 1.3 | 84% |
 
-Both figures are far below what EyesOff reaches in production (about 19 tokens
-per second): this harness uses the KVM Box service's settings, not EyesOff's.
+The generated text is identical to the native engine's in every row, and the
+offloaded work is the same (4.09e12 MACs for the 100-token run).
 
-Seen in this run and not yet dealt with: the paired-product prediction misses
-on this model (112 of 2,318 pairs, relearned each time), each miss costing an
-exchange; and the eight kernel analyses at start-up take 4.6 s.
+Three things got it there from 58% with four refill threads:
+
+- **The fused Gated Delta Net.** llama turns the fused op off when it lands
+  on another device than its layer, and on this route it lands on the CPU by
+  design. Its unfused form was about 80 ms of `mul`, `sum_rows` and `repeat`
+  a token, more than everything else the client did.
+  `llama-shield-fused-cpu.patch` (in libllama, not the plugin) keeps the fused
+  op when the layer's device is the Shield device with the native CPU
+  fallback. Found with a wall-clock profile taken only after generation had
+  begun; a profile that includes the prompt shows start-up work instead.
+- **A third tensor on one activation.** Attention's q, k and v read the same
+  bytes. The third was learned as the first one's pair and replaced the pair
+  just served, so one product in three tokens was computed and thrown away,
+  with its pads. It is now learned as the second one's follower.
+- **The last four tensors.** Three Q3_K and one IQ3_S feed-forward tensors
+  were 10 ms of CPU a token.
+
+**One refill thread and two cards.** The backend divides the refill threads
+over the cards, so with one thread the second card has none and every pad for
+a tensor placed there is made while the engine waits (both paths: 31 to 34 s
+of a 35 to 41 s run). Which tensors land on that card then decides the speed.
+The backend places layers in name order on the emptier card. The native engine
+offers the tensors llama's graph uses; the executor offers every approved
+tensor, which here adds the five groups of the model's unused MTP block
+(`blk.64`). That moves `output.weight` (a 58 ms pad a token) and one block to
+the card without a refill thread. With a refill thread on each card the
+difference is gone. The KVM Box service gives the engine one worker, not a
+pool, so this is a property of this rig; it would matter for a pool.
+
+**Cold start.** A tensor's first launch used to wait for its weights to be
+read back and hashed: 13 s for this model, spent after the executor was
+ready. The bytes are in place as soon as the application has loaded them,
+while the executor is still starting, so they are now authenticated then:
+when a kernel that is not a product has written sub-buffers whose sizes, in
+argument order, are the flat buffers of a catalogued tensor, or the
+application writes exactly a catalogued tensor's GGUF bytes, the frontend
+authenticates them as a launch would and remembers the identity under the
+same write tracking (`q8_preauthenticate_*` in `q8_direct.inc`). A wrong guess
+costs the time and remembers nothing; after 64 of them it stops looking.
+`SHIELD_OPENCL_Q8_PREAUTH=0` turns it off. With it all 401 tensors are
+authenticated ahead and no launch authenticates; a 16-token run from a cold
+start takes 99 s instead of 113 s, against the native engine's 91 s. The rest
+is the upload to the OpenCL device, which the native engine does not do.
+
+Both paths are far below what EyesOff reaches in production (about 19 tokens
+per second): this harness uses the KVM Box service's settings and two V100s,
+not EyesOff's.
 
 ## What is not established
 
@@ -366,9 +410,15 @@ exchange; and the eight kernel analyses at start-up take 4.6 s.
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
-- Parity on EyesOff's own model is not reached and cannot be with the kernels
-  llama's OpenCL backend has: IQ4_XS products have nowhere to be lowered from.
-  It would take new kernels in that backend.
+- On EyesOff's own model the route is level with the native engine when each
+  card has a refill thread, and behind it (76 to 84%) with one refill thread
+  for two cards, for the placement reason given above. The executor still
+  registers approved tensors the application never uses.
+- The rebuilt plugin, libllama and declines table exist only outside this
+  repository; no image contains them. `test_q8_raw_kernels.cpp` executes the
+  three plain kernels on the CPU runtime against the decoded weights (942
+  outputs, both option sets); it was built and run by hand, not by a script
+  in this repository.
 - There is no kernel fixture,
   identity test or failure-injection test for K-quant launches; the Q8 ones
   pass unchanged, and the evidence for K-quants is the recogniser and
@@ -385,6 +435,7 @@ exchange; and the eight kernel analyses at start-up take 4.6 s.
   programs built instead of 119) and once with `sd-cli` (same image). They are
   on only for `llama-cli`. There is no unit test for the handle bookkeeping.
 - The executor now needs `-pthread` when it is linked.
-- Eight kernels are lowered (Q8_0, Q4_K, Q5_K, Q6_K; matrix and vector each). Other
+- Thirteen kernels are lowered (Q8_0, Q4_K, Q5_K, Q6_K and IQ4_NL, matrix and
+  vector each; one plain kernel each for IQ4_XS, Q3_K and IQ3_S). Other
   kernels, other weight types and CUDA binaries are unchanged.
 - The new code has had no independent security review.

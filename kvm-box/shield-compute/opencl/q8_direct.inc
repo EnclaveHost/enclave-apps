@@ -872,6 +872,200 @@ bool q8_local(const Q8DirectLaunch &launch, const Q8Identity &identity, bool rem
   return true;
 }
 
+// Keeps an authenticated tensor's identity for later launches. False when the
+// buffers can change without a call this library sees (host-pointer buffers,
+// buffers mapped for writing): those are authenticated on every launch.
+bool q8_remember(const std::array<Q8Region, 5> &regions, const std::array<cl_mem_flags, 5> &root_flags,
+                 unsigned count, size_t k, size_t n, const std::shared_ptr<const Q8Identity> &identity) {
+  std::lock_guard lock(q8_cache_mutex);
+  bool stable = !q8_untracked_writers.load();
+  for (unsigned w = 0; w < count; ++w) {
+    if (root_flags[w] & CL_MEM_USE_HOST_PTR) stable = false;
+    for (const auto &[pointer, root] : q8_write_maps)
+      if (root == regions[w].root) stable = false;
+  }
+  if (!stable || q8_known.size() >= 8192) return false;
+  unsigned retained = 0;
+  while (retained < count && !REAL(clRetainMemObject)(regions[retained].root)) ++retained;
+  if (retained != count) {
+    while (retained) REAL(clReleaseMemObject)(regions[--retained].root);
+    return false;
+  }
+  q8_known.push_back({regions, count, k, n, identity});
+  q8_known_count.store(q8_known.size(), std::memory_order_release);
+  return true;
+}
+
+// Authentication ahead of the first product.
+//
+// A tensor's first launch waits for its weights to be read back and hashed:
+// seconds for a small model and a quarter of a minute for a 27B one, spent
+// after the executor is ready. The same bytes are in place as soon as the
+// application has loaded them, while the executor is still starting. So when
+// the application writes or converts what could be a catalogued tensor, it is
+// authenticated then, exactly as a launch would do it, and remembered under
+// the same write tracking. A guess that is wrong costs the time only: nothing
+// is remembered and the first launch authenticates as before.
+struct Q8Expected {
+  bool usable = false;
+  std::set<std::pair<int, size_t>> flat;  // (type, weights) of tensors kept as several flat buffers
+  std::map<size_t, std::vector<int>> raw; // bytes -> types of tensors kept as GGUF bytes
+};
+const Q8Expected &q8_expected() {
+  static const Q8Expected expected = [] {
+    Q8Expected result;
+    const char *contract = std::getenv("SHIELD_OPENCL_ARITHMETIC");
+    const char *enabled = std::getenv("SHIELD_OPENCL_Q8_PREAUTH");
+    if (!contract || std::strcmp(contract, "shield-fixed-point-v1") || !q8_direct_enabled() ||
+        (enabled && !std::strcmp(enabled, "0")))
+      return result;
+    try {
+      for (const auto &tensor : q8_catalog()) {
+        const size_t weights = tensor.k * tensor.n;
+        if (tensor.type == 23) result.raw[weights / 256 * 136].push_back(23);
+        else if (tensor.type == 11 || tensor.type == 21) result.raw[weights / 256 * 110].push_back(tensor.type);
+        else result.flat.insert({tensor.type, weights});
+      }
+      result.usable = !result.flat.empty() || !result.raw.empty();
+    } catch (...) {
+      result = {};
+    }
+    return result;
+  }();
+  return expected;
+}
+std::atomic<uint64_t> q8_preauth_tensors{0}, q8_preauth_misses{0}, q8_preauth_ns{0};
+// An application whose buffers only look like tensors stops being read for it.
+constexpr uint64_t kPreauthMisses = 64;
+struct Q8PreauthReport {
+  ~Q8PreauthReport() {
+    if (q8_timing.enabled)
+      std::fprintf(stderr, "[shield-opencl-timing] authenticated ahead: tensors=%llu not catalogued=%llu ms=%.1f\n",
+                   (unsigned long long)q8_preauth_tensors.load(), (unsigned long long)q8_preauth_misses.load(),
+                   q8_preauth_ns.load() / 1e6);
+  }
+} q8_preauth_report;
+void q8_preauth_answer(const json &answer, const std::array<Q8Region, 5> &regions,
+                       const std::array<cl_mem_flags, 5> &root_flags, unsigned count) {
+  if (!answer.at("approved").get<bool>()) {
+    ++q8_preauth_misses;
+    return;
+  }
+  auto identity = std::make_shared<Q8Identity>();
+  identity->approved = true;
+  identity->engine = answer.at("engine").get<std::string>();
+  identity->tensor = answer.at("tensor").get<std::string>();
+  identity->sha256 = answer.at("sha256").get<std::string>();
+  if (q8_remember(regions, root_flags, count, answer.at("k").get<size_t>(), answer.at("n").get<size_t>(), identity))
+    ++q8_preauth_tensors;
+}
+// After a kernel that is not a product has run: were some of its buffers,
+// taken in argument order, the flat buffers of a catalogued tensor?
+void q8_preauthenticate_kernel(cl_command_queue queue, cl_kernel kernel) {
+  const Q8Expected &expected = q8_expected();
+  if (!expected.usable || expected.flat.empty() || q8_preauth_misses.load() > kPreauthMisses) return;
+  // Every pointer-sized argument, in argument order. Only those that are
+  // sub-buffers this library saw created are looked at: any other may be a
+  // number.
+  static thread_local std::vector<std::pair<cl_uint, cl_mem>> arguments;
+  {
+    std::lock_guard lock(mutex);
+    const auto it = kernels.find(kernel);
+    if (it == kernels.end() || it->second.mems.size() < 2) return;
+    arguments = it->second.mems;
+  }
+  std::sort(arguments.begin(), arguments.end());
+  std::array<cl_mem, 22> mems{};
+  std::array<size_t, 22> sizes{};
+  unsigned found = 0;
+  {
+    std::lock_guard lock(q8_cache_mutex);
+    if (q8_children.empty()) return;
+    for (const auto &[index, handle] : arguments) {
+      const auto it = q8_children.find(handle);
+      if (it == q8_children.end() || found == mems.size()) continue;
+      mems[found] = handle;
+      sizes[found++] = it->second.size;
+    }
+  }
+  if (found < 2) return;
+  // Type, weights to a unit, then the bytes of each flat buffer for a unit.
+  struct Layout { int type; unsigned unit, count; unsigned bytes[5]; };
+  static const Layout layouts[] = {{13, 256, 5, {128, 32, 12, 2, 2}}, {12, 256, 4, {128, 12, 2, 2, 0}},
+                                   {14, 256, 4, {128, 64, 16, 2, 0}}, {8, 32, 2, {32, 2, 0, 0, 0}},
+                                   {20, 32, 2, {16, 2, 0, 0, 0}}};
+  for (unsigned first = 0; first + 2 <= found; ++first) for (const Layout &layout : layouts) {
+    if (first + layout.count > found || !sizes[first] || sizes[first] % layout.bytes[0]) continue;
+    const size_t units = sizes[first] / layout.bytes[0];
+    bool fits = expected.flat.count({layout.type, units * layout.unit}) != 0;
+    for (unsigned w = 1; fits && w < layout.count; ++w) fits = sizes[first + w] == units * layout.bytes[w];
+    if (!fits) continue;
+    const uint64_t start = Q8Timing::now();
+    std::array<Q8Region, 5> regions{};
+    std::array<cl_mem_flags, 5> root_flags{};
+    std::array<std::vector<unsigned char>, 5> bytes;
+    if (REAL(clFinish)(queue)) return;
+    for (unsigned w = 0; w < layout.count; ++w) {
+      Storage stored;
+      if (!storage(mems[first + w], stored) || stored.size != sizes[first + w]) return;
+      regions[w] = {stored.root, stored.offset, stored.size};
+      root_flags[w] = stored.root_flags;
+      bytes[w].resize(stored.size);
+      if (REAL(clEnqueueReadBuffer)(queue, mems[first + w], CL_TRUE, 0, stored.size, bytes[w].data(), 0, nullptr,
+                                    nullptr))
+        return;
+    }
+    try {
+      const size_t k = layout.unit, n = units;
+      q8_any_shape = true;
+      const json answer = layout.type == 13 ? q5k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], k, n)
+                          : layout.type == 12 ? q4k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], k, n)
+                          : layout.type == 14 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], k, n)
+                          : layout.type == 20 ? iq4nl_authenticate(bytes[0], bytes[1], k, n)
+                                              : q8_authenticate(bytes[0], bytes[1], k, n);
+      q8_any_shape = false;
+      q8_preauth_answer(answer, regions, root_flags, layout.count);
+    } catch (...) {
+      q8_any_shape = false;
+    }
+    q8_preauth_ns += Q8Timing::now() - start;
+    return;
+  }
+}
+// After the application has written `size` bytes from `pointer`: were they a
+// catalogued tensor that is kept as its GGUF bytes?
+void q8_preauthenticate_write(cl_command_queue queue, cl_mem buffer, size_t offset, size_t size,
+                              const void *pointer) {
+  const Q8Expected &expected = q8_expected();
+  if (!expected.usable || !pointer || q8_preauth_misses.load() > kPreauthMisses) return;
+  const auto types = expected.raw.find(size);
+  if (types == expected.raw.end()) return;
+  const uint64_t start = Q8Timing::now();
+  Storage stored;
+  // The write may still be queued; the bytes hashed are the ones written.
+  if (REAL(clFinish)(queue) || !storage(buffer, stored) || offset > stored.size || size > stored.size - offset) return;
+  try {
+    Q8Hash hash;
+    hash.update(static_cast<const unsigned char *>(pointer), size);
+    const std::string digest = hash.finish();
+    json answer = {{"approved", false}};
+    q8_any_shape = true;
+    for (size_t i = 0; i < types->second.size() && !answer.at("approved").get<bool>(); ++i) {
+      const int type = types->second[i];
+      answer = q8_catalog_answer(type, 256, size / (type == 23 ? 136 : 110), digest);
+    }
+    q8_any_shape = false;
+    std::array<Q8Region, 5> regions{};
+    std::array<cl_mem_flags, 5> root_flags{};
+    regions[0] = {stored.root, stored.offset + offset, size};
+    root_flags[0] = stored.root_flags;
+    q8_preauth_answer(answer, regions, root_flags, 1);
+  } catch (...) {
+    q8_any_shape = false;
+  }
+  q8_preauth_ns += Q8Timing::now() - start;
+}
+
 // nullopt: not taken, the caller continues with CPU execution of the original
 // kernel. Any other value is the launch's result; after a chunk has been sent,
 // failures are reported and never retried on another route.
@@ -937,26 +1131,9 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       return std::nullopt;
     }
     q8_timing.add(Q8Timing::Authenticate, stage);
-    // Host-pointer buffers and buffers mapped for writing can change without
-    // any call this library sees; those are authenticated on every launch.
-    std::lock_guard lock(q8_cache_mutex);
-    bool stable = !q8_untracked_writers.load();
-    for (unsigned w = 0; w < count; ++w) {
-      if (launch.storage[w].root_flags & CL_MEM_USE_HOST_PTR) stable = false;
-      for (const auto &[pointer, root] : q8_write_maps)
-        if (root == regions[w].root) stable = false;
-    }
-    if (stable && q8_known.size() < 8192) {
-      unsigned retained = 0;
-      while (retained < count && !REAL(clRetainMemObject)(regions[retained].root)) ++retained;
-      if (retained == count) {
-        q8_known.push_back({regions, count, launch.k, launch.n, identity});
-        q8_known_count.store(q8_known.size(), std::memory_order_release);
-        known = true;
-      } else {
-        while (retained) REAL(clReleaseMemObject)(regions[--retained].root);
-      }
-    }
+    std::array<cl_mem_flags, 5> root_flags{};
+    for (unsigned w = 0; w < count; ++w) root_flags[w] = launch.storage[w].root_flags;
+    known = q8_remember(regions, root_flags, count, launch.k, launch.n, identity);
   }
   const Q8Identity &weights = *identity;
   constexpr size_t maximum = 2u << 20;

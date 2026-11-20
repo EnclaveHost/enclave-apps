@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 #include <spawn.h>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <sstream>
 #include <sys/socket.h>
@@ -1333,8 +1334,13 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
                                 q8_kernel == 7 || q8_kernel == 8 ? 7 : q8_kernel >= 3 && q8_kernel <= 6 ? 6 : 4);
 #endif
     StartupTiming::Scope scope(startup_timing, 3);
-    return REAL(clEnqueueNDRangeKernel)(q, kernel, dimensions, offset, global,
-                                        local, count, wait, event);
+    const cl_int code = REAL(clEnqueueNDRangeKernel)(q, kernel, dimensions, offset, global,
+                                                     local, count, wait, event);
+#ifdef SHIELD_Q8_MASKED
+    // What it wrote may be a tensor's weights (see q8_direct.inc).
+    if (!code && !q8_kernel) q8_preauthenticate_kernel(q, kernel);
+#endif
+    return code;
   };
 #ifdef SHIELD_Q8_CAPTURE
   if (q8_kernel) {
@@ -1652,7 +1658,11 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteBuffer(
     const void *pointer, cl_uint count, const cl_event *wait, cl_event *event) {
   StartupTiming::Scope scope(startup_timing, 0);
   q8_written(buffer, offset, size, false);
-  return REAL(clEnqueueWriteBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
+  const cl_int code = REAL(clEnqueueWriteBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
+#ifdef SHIELD_Q8_MASKED
+  if (!code) q8_preauthenticate_write(q, buffer, offset, size, pointer);
+#endif
+  return code;
 }
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueReadBuffer(
     cl_command_queue q, cl_mem buffer, cl_bool blocking, size_t offset, size_t size,

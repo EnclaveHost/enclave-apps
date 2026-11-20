@@ -123,6 +123,22 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
   }();
   return entries;
 }
+// Set (by q8_preauthenticate in q8_direct.inc) while weights are authenticated
+// before any launch has given their shape: a catalogued tensor of the type
+// with as many weights and the digest answers, and the answer has its shape.
+thread_local bool q8_any_shape = false;
+json q8_catalog_answer(int type, size_t k, size_t n, const std::string &digest) {
+  for (const auto &tensor:q8_catalog()) {
+    if (tensor.type!=type || tensor.sha!=digest) continue;
+    if (q8_any_shape ? tensor.k*tensor.n!=k*n : tensor.k!=k || tensor.n!=n) continue;
+    json answer={{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
+                 {"sha256",digest},{"policySha256",tensor.policy_sha}};
+    if (q8_any_shape) { answer["k"]=tensor.k; answer["n"]=tensor.n; }
+    return answer;
+  }
+  // Unknown weights may be private. Do not expose their digest or contents.
+  return {{"approved",false}};
+}
 json q8_authenticate(const std::vector<unsigned char> &quants,
                      const std::vector<unsigned char> &scales, size_t k, size_t n) {
   if (quants.size()!=k*n || scales.size()!=k*n/16) throw std::runtime_error("snapshot shape");
@@ -137,12 +153,7 @@ json q8_authenticate(const std::vector<unsigned char> &quants,
     hash.update(packed.data(), count*34);
   }
   const auto digest=hash.finish();
-  for (const auto &tensor:q8_catalog())
-    if (tensor.type==8 && tensor.k==k && tensor.n==n && tensor.sha==digest)
-      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
-              {"sha256",digest},{"policySha256",tensor.policy_sha}};
-  // Unknown weights may be private. Do not expose their digest or contents.
-  return {{"approved",false}};
+  return q8_catalog_answer(8, k, n, digest);
 }
 // An IQ4_NL tensor: half d, then 16 quant bytes, for each 32 weights.
 json iq4nl_authenticate(const std::vector<unsigned char> &quants, const std::vector<unsigned char> &d,
@@ -160,11 +171,7 @@ json iq4nl_authenticate(const std::vector<unsigned char> &quants, const std::vec
     hash.update(packed.data(), count*18);
   }
   const auto digest=hash.finish();
-  for (const auto &tensor:q8_catalog())
-    if (tensor.type==20 && tensor.k==k && tensor.n==n && tensor.sha==digest)
-      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
-              {"sha256",digest},{"policySha256",tensor.policy_sha}};
-  return {{"approved",false}};
+  return q8_catalog_answer(20, k, n, digest);
 }
 // An IQ4_XS, Q3_K or IQ3_S tensor is kept as its GGUF bytes: the digest is of
 // the buffer. `type` is the GGML type and `block` its bytes for 256 weights.
@@ -173,11 +180,7 @@ json raw_authenticate(const std::vector<unsigned char> &bytes, size_t k, size_t 
   Q8Hash hash;
   hash.update(bytes.data(), bytes.size());
   const auto digest=hash.finish();
-  for (const auto &tensor:q8_catalog())
-    if (tensor.type==type && tensor.k==k && tensor.n==n && tensor.sha==digest)
-      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
-              {"sha256",digest},{"policySha256",tensor.policy_sha}};
-  return {{"approved",false}};
+  return q8_catalog_answer(type, k, n, digest);
 }
 // For a Q5_K tensor: half d, half dmin, 12 scale bytes, 32 high-bit bytes and
 // 128 quant bytes for each 256 weights.
@@ -202,11 +205,7 @@ json q5k_authenticate(const std::vector<unsigned char> &quants, const std::vecto
     hash.update(packed.data(), count*176);
   }
   const auto digest=hash.finish();
-  for (const auto &tensor:q8_catalog())
-    if (tensor.type==13 && tensor.k==k && tensor.n==n && tensor.sha==digest)
-      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
-              {"sha256",digest},{"policySha256",tensor.policy_sha}};
-  return {{"approved",false}};
+  return q8_catalog_answer(13, k, n, digest);
 }
 // And for a Q6_K tensor: 128 low-bit bytes, 64 high-bit bytes, 16 scale bytes
 // and half d for each 256 weights.
@@ -230,11 +229,7 @@ json q6k_authenticate(const std::vector<unsigned char> &low, const std::vector<u
     hash.update(packed.data(), count*210);
   }
   const auto digest=hash.finish();
-  for (const auto &tensor:q8_catalog())
-    if (tensor.type==14 && tensor.k==k && tensor.n==n && tensor.sha==digest)
-      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
-              {"sha256",digest},{"policySha256",tensor.policy_sha}};
-  return {{"approved",false}};
+  return q8_catalog_answer(14, k, n, digest);
 }
 // The same question for a Q4_K tensor held as the four flat buffers of the
 // OpenCL backend: the digest is of the GGUF block order (half d, half dmin,
@@ -259,11 +254,7 @@ json q4k_authenticate(const std::vector<unsigned char> &quants, const std::vecto
     hash.update(packed.data(), count*144);
   }
   const auto digest=hash.finish();
-  for (const auto &tensor:q8_catalog())
-    if (tensor.type==12 && tensor.k==k && tensor.n==n && tensor.sha==digest)
-      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
-              {"sha256",digest},{"policySha256",tensor.policy_sha}};
-  return {{"approved",false}};
+  return q8_catalog_answer(12, k, n, digest);
 }
 void q8_log(const json &record) {
   // Test builds require their configured audit file. Packaged applications can
