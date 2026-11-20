@@ -101,6 +101,10 @@ def main():
         # does those without a hand-off to a worker thread per command. sd.cpp
         # still runs real kernels there and keeps the threaded driver.
         driver = 'export POCL_DEVICES="${POCL_DEVICES:-basic}"\n' if name == 'llama-cli' else ''
+        # llama's idle OpenMP thread spins while a launch waits for the Shield
+        # service. With fewer than four processors that starves the service.
+        if name == 'llama-cli':
+            driver += ('if [ "$(nproc)" -lt 4 ]; then export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-passive}"; fi\n')
         path.write_text('#!/bin/sh\nset -eu\n'
                         'export GGML_SHIELD_NATIVE_CPU_FALLBACK=1\n'
                         'export POCL_MAX_PTHREAD_COUNT="${POCL_MAX_PTHREAD_COUNT:-2}"\n'

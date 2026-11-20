@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <iterator>
 #include <poll.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <map>
@@ -1083,8 +1084,9 @@ public:
 
     // Returns once no job is running; rethrows what the last one threw.
     void wait() {
-        // A job is one exchange with the worker; its end is usually close.
-        for (int spins = 0; busy_.load(std::memory_order_acquire) && spins < 20000; ++spins) __builtin_ia32_pause();
+        // Asleep, not spinning: a job is mostly waiting for the worker, and on
+        // a guest with two processors a spinning thread here takes one of them
+        // from the thread that makes the pads.
         std::unique_lock lock(mutex_);
         idle_.wait(lock, [this] { return !busy_.load(std::memory_order_acquire); });
         if (error_) std::rethrow_exception(std::exchange(error_, nullptr));
@@ -1313,8 +1315,13 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
             s.last.first = f.id;
             s.last.second = extra.pair;
             s.last.valid = true;
-            // SHIELD_Q8_AHEAD=0 turns the continuation off.
-            static const bool ahead = !std::getenv("SHIELD_Q8_AHEAD") || std::strcmp(std::getenv("SHIELD_Q8_AHEAD"), "0");
+            // The continuation needs a processor of its own to be a gain: on by
+            // default with four or more, SHIELD_Q8_AHEAD=0 or 1 decides otherwise.
+            static const bool ahead = [] {
+                if (const char * value = std::getenv("SHIELD_Q8_AHEAD")) return std::strcmp(value, "0") != 0;
+                cpu_set_t set;
+                return sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) >= 4;
+            }();
             // Started before the reply so it overlaps the client's own work.
             // The products are complete and are only read from here on.
             if (ahead && f.id < s.chains.size() && s.chains[f.id].next != kNoPair) {

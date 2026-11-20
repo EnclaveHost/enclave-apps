@@ -154,6 +154,12 @@ class Compute:
         env = {'PATH': '/usr/bin:/bin', 'HOME': directory, 'TMPDIR': directory,
                'LANG': 'C.UTF-8', 'OMP_NUM_THREADS': str(self.config['threads']),
                'GGML_BACKEND_PATH': root + '/lib/backends/libggml-cpu.so'}
+        # An engine's idle OpenMP thread spins while the engine waits for the
+        # worker. On a guest with two processors that takes one of them from
+        # the thread that makes the pads, and generation runs at about half
+        # speed. With processors to spare, spinning is slightly faster.
+        if len(os.sched_getaffinity(0)) < 4:
+            env['OMP_WAIT_POLICY'] = 'passive'
         if masked:
             env.update({
                 'ENCLAVE_SHIELD_POLICY': spec['policy'],
