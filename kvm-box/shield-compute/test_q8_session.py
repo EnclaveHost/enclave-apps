@@ -191,6 +191,50 @@ class Sessions(unittest.TestCase):
             self.assertEqual(first.tobytes(), gate.tobytes())
         self.assert_healthy()
 
+    def test_a_continuation_computed_ahead_answers_only_the_bytes_it_was_computed_from(self):
+        # After a few rounds the executor expects the gated pair to be followed
+        # by the down projection and computes it before it is asked. A zero
+        # activation makes the gated product exactly zero on any CPU, so the
+        # expectation is certain to be learned here.
+        session = Session()
+        self.addCleanup(session.close)
+        self.assertIsNotNone(session.share())
+        for slot, tensor in enumerate((self.gate, self.up, self.down)):
+            self.assertEqual(session.open(slot, tensor), 0)
+        width, hidden_width, out = self.gate['ne'][0], self.down['ne'][0], self.down['ne'][1]
+        zeros = np.zeros((1, width), dtype='<f4')
+        hidden = np.zeros((1, hidden_width), dtype='<f4')
+        want = self.legacy(self.down, hidden)
+
+        def pair():
+            status, gate, up = session.matmul_shared(0, zeros, hidden_width, pair=1, pair_n=hidden_width)
+            self.assertEqual(status, 0)
+            self.assertFalse(gate.any() or up.any())
+
+        for _ in range(4):
+            pair()
+            status, y, _ = session.matmul_shared(2, hidden, out)
+            self.assertEqual(status, 0)
+            np.testing.assert_array_equal(y, want)
+        # A different activation after the pair gets its own product.
+        pair()
+        other = self.activation(self.down)
+        status, y, _ = session.matmul_shared(2, other, out)
+        self.assertEqual(status, 0)
+        np.testing.assert_array_equal(y, self.legacy(self.down, other))
+        # So does a different tensor in the expected slot, and the same bytes
+        # for a tensor that is not the expected one.
+        pair()
+        status, y, _ = session.matmul_shared(0, zeros, hidden_width)
+        self.assertEqual(status, 0)
+        self.assertFalse(y.any())
+        for _ in range(2):
+            pair()
+            status, y, _ = session.matmul_shared(2, hidden, out)
+            self.assertEqual(status, 0)
+            np.testing.assert_array_equal(y, want)
+        self.assert_healthy()
+
     def test_unapproved_references_are_refused_without_harm(self):
         session = Session()
         self.addCleanup(session.close)

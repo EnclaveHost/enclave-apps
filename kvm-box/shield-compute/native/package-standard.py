@@ -91,7 +91,11 @@ def main():
     for name in ('llama-cli', 'sd-cli'):
         path = out / 'overlay/usr/local/bin' / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        extra = ' --no-kv-offload' if name == 'llama-cli' else ''
+        # llama leaves attention off the fused path when the layers sit on the
+        # OpenCL device and nothing asks for it. Attention runs on the CPU here
+        # either way, and fused it is about a tenth of a token faster. An
+        # option on the command line still wins.
+        extra = ' --no-kv-offload --flash-attn on' if name == 'llama-cli' else ''
         # With the native CPU fallback, llama leaves only buffer transfers and
         # the Q8 launches on the OpenCL device. The CPU runtime's inline driver
         # does those without a hand-off to a worker thread per command. sd.cpp

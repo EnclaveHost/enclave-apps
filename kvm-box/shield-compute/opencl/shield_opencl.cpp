@@ -219,6 +219,9 @@ void read_all(int fd, void *ptr, size_t n) {
 }
 // Optional aggregate startup timing (SHIELD_OPENCL_TIMING): durations and
 // counts of analysis-helper runs and CPU-runtime program builds.
+// Set once the launches SHIELD_OPENCL_TIMING=N leaves out have passed, so the
+// per-call counters below describe steady state.
+std::atomic<bool> timing_steady{false};
 struct StartupTiming {
   std::atomic<uint64_t> compiler_ns{0}, compiler_calls{0}, build_ns{0}, build_calls{0};
   std::atomic<uint64_t> api_ns[4] = {}, api_calls[4] = {};  // write, read, set-arg, other kernels
@@ -234,13 +237,19 @@ struct StartupTiming {
                    (unsigned long long)build_calls.load(), build_ns.load() / 1e6);
     static const char *names[4] = {"write-buffer", "read-buffer", "set-kernel-arg", "other-kernel"};
     for (int i = 0; enabled && i < 4; ++i)
-      std::fprintf(stderr, "[shield-opencl-timing] %s calls=%llu ms=%.1f\n", names[i],
-                   (unsigned long long)api_calls[i].load(), api_ns[i].load() / 1e6);
+      std::fprintf(stderr, "[shield-opencl-timing] %s calls=%llu ms=%.1f us/call=%.2f\n", names[i],
+                   (unsigned long long)api_calls[i].load(), api_ns[i].load() / 1e6,
+                   api_calls[i].load() ? api_ns[i].load() / 1e3 / api_calls[i].load() : 0.0);
   }
   struct Scope {
     StartupTiming &timing; int index; uint64_t start;
     Scope(StartupTiming &t, int i) : timing(t), index(i), start(t.enabled ? now() : 0) {}
-    ~Scope() { if (timing.enabled) { timing.api_ns[index] += now() - start; timing.api_calls[index]++; } }
+    ~Scope() {
+      if (timing.enabled && timing_steady.load(std::memory_order_relaxed)) {
+        timing.api_ns[index] += now() - start;
+        timing.api_calls[index]++;
+      }
+    }
   };
 };
 StartupTiming startup_timing;

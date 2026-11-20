@@ -231,31 +231,111 @@ void q8_local_rows_avx2(const Q8Local &w, const float *x, float *y, size_t first
   }
 }
 #endif
+#if defined(__x86_64__)
+// Sixteen codes at a time. Each row is one pass over its codes; a row of a
+// feed-forward projection is tens of kilobytes, so the pass is bound by how
+// fast the weights arrive from memory and the conversion must not add to it.
+__attribute__((target("avx512f,avx512bw,avx512vl,fma")))
+void q8_local_rows_avx512(const Q8Local &w, const float *x, float *y, size_t first, size_t last) {
+  const size_t blocks = w.k / 32;
+  for (size_t j = first; j < last; ++j) {
+    const int8_t *codes = w.codes.data() + j * w.k;
+    const float *scales = w.scales.data() + j * blocks;
+    __m512 total = _mm512_setzero_ps();
+    for (size_t b = 0; b < blocks; ++b) {
+      const int8_t *c = codes + b * 32;
+      const float *v = x + b * 32;
+      __m512 sum = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)c))),
+                                 _mm512_loadu_ps(v));
+      sum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(c + 16)))),
+                            _mm512_loadu_ps(v + 16), sum);
+      total = _mm512_fmadd_ps(sum, _mm512_set1_ps(scales[b]), total);
+    }
+    y[j] = _mm512_reduce_add_ps(total);
+  }
+}
+#endif
+
+// Threads that split the rows of a large local product. They are started once
+// and wait between products; starting threads for every product cost more than
+// the product. A forked child starts its own.
+class Q8LocalPool {
+public:
+  using Rows = void (*)(const Q8Local &, const float *, float *, size_t, size_t);
+  void run(Rows rows, const Q8Local &w, const float *x, float *y, size_t parts) {
+    std::unique_lock lock(mutex_);
+    if (owner_ != getpid()) {
+      for (auto &thread : threads_) thread.detach();  // they did not survive the fork
+      threads_.clear();
+      owner_ = getpid();
+      generation_ = pending_ = 0;
+    }
+    while (threads_.size() + 1 < parts) threads_.emplace_back([this, index = threads_.size() + 1] { work(index); });
+    rows_ = rows; w_ = &w; x_ = x; y_ = y; parts_ = parts;
+    pending_ = parts - 1;
+    ++generation_;
+    lock.unlock();
+    start_.notify_all();
+    const size_t step = (w.n + parts - 1) / parts;
+    rows(w, x, y, 0, std::min(w.n, step));
+    lock.lock();
+    done_.wait(lock, [this] { return pending_ == 0; });
+  }
+
+private:
+  void work(size_t index) {
+    uint64_t seen = 0;
+    std::unique_lock lock(mutex_);
+    for (;;) {
+      start_.wait(lock, [&] { return generation_ != seen; });
+      seen = generation_;
+      if (index >= parts_) continue;
+      const Rows rows = rows_;
+      const Q8Local &w = *w_;
+      const float *x = x_;
+      float *y = y_;
+      const size_t step = (w.n + parts_ - 1) / parts_;
+      lock.unlock();
+      if (index * step < w.n) rows(w, x, y, index * step, std::min(w.n, (index + 1) * step));
+      lock.lock();
+      if (--pending_ == 0) done_.notify_one();
+    }
+  }
+  std::mutex mutex_;
+  std::condition_variable start_, done_;
+  std::vector<std::thread> threads_;
+  pid_t owner_ = 0;
+  uint64_t generation_ = 0;
+  size_t pending_ = 0, parts_ = 0;
+  Rows rows_ = nullptr;
+  const Q8Local *w_ = nullptr;
+  const float *x_ = nullptr;
+  float *y_ = nullptr;
+};
+
 void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
   static const size_t threads = [] {
     const char *value = std::getenv("SHIELD_OPENCL_Q8_LOCAL_THREADS");
     const size_t wanted = value ? std::strtoull(value, nullptr, 10) : 4;
     return std::min<size_t>(std::max<size_t>(wanted, 1), 16);
   }();
+  static const Q8LocalPool::Rows rows = [] {
+    Q8LocalPool::Rows chosen = q8_local_rows_scalar;
 #if defined(__x86_64__)
-  static const bool avx2 = __builtin_cpu_supports("avx2");
+    if (__builtin_cpu_supports("avx2")) chosen = q8_local_rows_avx2;
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("fma"))
+      chosen = q8_local_rows_avx512;
 #endif
-  const auto rows = [&](size_t r, size_t first, size_t last) {
-#if defined(__x86_64__)
-    if (avx2) return q8_local_rows_avx2(w, x + r * w.k, y + r * w.n, first, last);
-#endif
-    q8_local_rows_scalar(w, x + r * w.k, y + r * w.n, first, last);
-  };
-  // Small products are not worth starting threads for.
-  const size_t use = w.k * w.n * m < (4u << 20) ? 1 : threads;
+    return chosen;
+  }();
+  // The pool lives for the process: no teardown can race a late launch.
+  static auto *pool = new Q8LocalPool;
+  // Small products are not worth waking threads for.
+  const size_t use = w.k * w.n * m < (4u << 20) ? 1 : std::min(threads, w.n);
   for (size_t r = 0; r < m; ++r) {
-    if (use == 1) { rows(r, 0, w.n); continue; }
-    std::vector<std::thread> pool;
-    const size_t step = (w.n + use - 1) / use;
-    for (size_t t = 1; t < use; ++t)
-      if (t * step < w.n) pool.emplace_back(rows, r, t * step, std::min(w.n, (t + 1) * step));
-    rows(r, 0, std::min(w.n, step));
-    for (auto &thread : pool) thread.join();
+    if (use == 1) rows(w, x + r * w.k, y + r * w.n, 0, w.n);
+    else pool->run(rows, w, x + r * w.k, y + r * w.n, use);
   }
 }
 
@@ -788,7 +868,9 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       q8_timing.add(Q8Timing::Cpu, stage);
       stage = Q8Timing::now();
     }
-    if (!q8_all_finite(product, launch.output_bytes / 4)) throw std::runtime_error("Q8 nonfinite result");
+    // The executor checks every product for non-finite values before it
+    // releases it; a product computed here is checked now.
+    if (local && !q8_all_finite(product, launch.output_bytes / 4)) throw std::runtime_error("Q8 nonfinite result");
   } catch (const std::exception &error) {
     // A fixed local reason only; never tensor names, shapes or values.
     if (q8_timing.enabled) std::fprintf(stderr, "[shield-opencl] direct route failed: %s\n", error.what());

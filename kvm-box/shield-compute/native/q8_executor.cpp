@@ -37,8 +37,15 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <tuple>
+#include <utility>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -197,6 +204,51 @@ struct Model {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> meta{nullptr, ggml_free};
     std::unique_ptr<gguf_context, decltype(&gguf_free)> gguf{nullptr, gguf_free};
     std::map<std::string, ggml_tensor *> verified;
+    // Tensors whose mapped bytes verify_all found to match the policy digest,
+    // with the exact range it hashed.
+    std::map<std::string, std::pair<const unsigned char *, size_t>> prehashed;
+
+    // Check the policy digest of each named tensor's mapped bytes on several
+    // threads. A tensor that is missing, malformed or does not match is simply
+    // left out; weight() then performs every check itself and retires.
+    void verify_all(const Policy & policy, const std::vector<std::string> & names) {
+        struct Job { std::string name; const unsigned char * bytes; size_t size; std::string want; bool ok = false; };
+        std::vector<Job> jobs;
+        const size_t data_off = gguf_get_data_offset(gguf.get());
+        const size_t align = gguf_get_alignment(gguf.get());
+        for (const std::string & name : names) {
+            const auto pit = policy.find(name);
+            const int64_t id = gguf_find_tensor(gguf.get(), name.c_str());
+            if (pit == policy.end() || id < 0 || verified.count(name) || prehashed.count(name)) continue;
+            const size_t bytes = gguf_get_tensor_size(gguf.get(), id);
+            const size_t tensor_off = gguf_get_tensor_offset(gguf.get(), id);
+            if (bytes == 0 || bytes > kMaxTensor || bytes != pit->second.nbytes || data_off > map.size ||
+                    tensor_off > map.size - data_off || bytes > map.size - data_off - tensor_off ||
+                    align == 0 || (data_off + tensor_off) % align != 0)
+                continue;
+            jobs.push_back({name, static_cast<const unsigned char *>(map.base) + data_off + tensor_off, bytes,
+                            pit->second.sha256});
+        }
+        const unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+        std::atomic<size_t> next{0};
+        const auto work = [&] {
+            for (size_t i; (i = next.fetch_add(1)) < jobs.size();) {
+                unsigned char out[EVP_MAX_MD_SIZE];
+                unsigned count = 0;
+                static const char hex[] = "0123456789abcdef";
+                std::string digest(64, '0');
+                if (!EVP_Digest(jobs[i].bytes, jobs[i].size, out, &count, EVP_sha256(), nullptr) || count != 32) continue;
+                for (unsigned b = 0; b < 32; ++b) { digest[2 * b] = hex[out[b] >> 4]; digest[2 * b + 1] = hex[out[b] & 15]; }
+                jobs[i].ok = digest == jobs[i].want;
+            }
+        };
+        std::vector<std::thread> pool;
+        for (unsigned t = 1; t < threads; ++t) pool.emplace_back(work);
+        work();
+        for (auto & thread : pool) thread.join();
+        for (const Job & job : jobs)
+            if (job.ok) prehashed.emplace(job.name, std::make_pair(job.bytes, job.size));
+    }
 
     explicit Model(const char * path) {
         const int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -277,7 +329,12 @@ struct Model {
         if (t->data || t->buffer || t->view_src) retire("unexpected metadata tensor state");
 
         const auto * bytes_ptr = static_cast<const unsigned char *>(map.base) + data_off + tensor_off;
-        if (sha256_hex(bytes_ptr, bytes) != entry.sha256) retire("model tensor digest mismatch");
+        if (const auto it = prehashed.find(name); it != prehashed.end()) {
+            // verify_all hashed exactly these bytes: same mapping, offset and length.
+            if (it->second.first != bytes_ptr || it->second.second != bytes) retire("model tensor digest mismatch");
+        } else if (sha256_hex(bytes_ptr, bytes) != entry.sha256) {
+            retire("model tensor digest mismatch");
+        }
 
         // Read-only public mapping; the backend copies it privately and the
         // bootstrap verifier re-authenticates that copy at registration.
@@ -319,12 +376,7 @@ struct Backend {
 
 struct Counters {
     uint64_t offloaded = 0, local = 0, graph_macs = 0, failures = 0, exchanges = 0, macs = 0;
-    static Counters read() {
-        Counters c;
-        ggml_backend_shielded_stats(&c.offloaded, &c.local, &c.graph_macs, &c.failures);
-        ggml_backend_shielded_verified_stats(&c.exchanges, &c.macs);
-        return c;
-    }
+    static Counters read();
 };
 
 // ---------------------------------------------------------------- I/O
@@ -461,6 +513,9 @@ Request parse_header(const std::string & line) {
 // fixed blocks, so the compiler vectorises it; a vocabulary-sized product is
 // otherwise a visible share of a token.
 __attribute__((optimize("O3"), target_clones("avx2", "default")))
+// Fixed blocks so the compiler vectorises the reduction; the products of a
+// feed-forward pair are large enough for a scalar scan to show in a token.
+__attribute__((optimize("O3"), target_clones("avx2", "default")))
 bool all_finite(const float * v, size_t n) {
     uint32_t largest = 0;
     size_t i = 0;
@@ -477,6 +532,27 @@ bool all_finite(const float * v, size_t n) {
     return largest < 0x7f800000u;
 }
 
+// all_finite(from, n) and a copy to `to` in one pass. `from` is private
+// memory; the answer describes exactly the values that were there.
+__attribute__((optimize("O3"), target_clones("avx2", "default")))
+bool copy_finite(unsigned char * to, const float * from, size_t n) {
+    uint32_t largest = 0;
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint32_t block[64];
+        std::memcpy(block, from + i, sizeof block);
+        std::memcpy(to + i * 4, block, sizeof block);
+        for (unsigned j = 0; j < 64; ++j) largest = std::max(largest, block[j] & 0x7fffffffu);
+    }
+    for (; i < n; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, from + i, 4);
+        std::memcpy(to + i * 4, &bits, 4);
+        largest = std::max(largest, bits & 0x7fffffffu);
+    }
+    return largest < 0x7f800000u;
+}
+
 using GraphContext = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 
 // One weight x batch-width product, built once and reused. The engine does
@@ -487,6 +563,7 @@ struct Product {
     ggml_cgraph * graph = nullptr;
     size_t input_bytes = 0, output_bytes = 0;
     bool supported = false;
+    uint64_t stamp = 0;  // changes whenever x or y may have changed
 };
 
 // Optional aggregate timing (SHIELD_Q8_EXECUTOR_TIMING=1): counts and
@@ -496,19 +573,34 @@ struct Timing {
     // SHIELD_Q8_EXECUTOR_TIMING=N leaves the first N products (load) out.
     const uint64_t skip = enabled ? std::strtoull(std::getenv("SHIELD_Q8_EXECUTOR_TIMING"), nullptr, 10) : 0;
     uint64_t seen = 0;
-    uint64_t compute_ns = 0, backend_ns = 0, request_ns = 0, calls = 0, exchanged = 0;
+    uint64_t compute_ns = 0, backend_ns = 0, request_ns = 0, counters_ns = 0, calls = 0, exchanged = 0;
+    uint64_t gap_ns[2] = {0, 0}, gaps[2] = {0, 0}, replied = 0, ahead = 0; bool was_pair = false;
     static uint64_t now() {
         return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     ~Timing() {
         if (enabled && calls)
-            std::fprintf(stderr, "[q8-executor-timing] calls=%llu exchanged=%llu request_us=%.1f compute_us=%.1f backend_us=%.1f\n",
+            std::fprintf(stderr, "[q8-executor-timing] client time after a single product: n=%llu us=%.1f; after a pair: n=%llu us=%.1f; served ahead=%llu\n",
+                         (unsigned long long)gaps[0], gaps[0] ? gap_ns[0] / 1e3 / gaps[0] : 0.0,
+                         (unsigned long long)gaps[1], gaps[1] ? gap_ns[1] / 1e3 / gaps[1] : 0.0,
+                         (unsigned long long)ahead);
+        if (enabled && calls)
+            std::fprintf(stderr, "[q8-executor-timing] calls=%llu exchanged=%llu request_us=%.1f compute_us=%.1f backend_us=%.1f counters_us=%.1f\n",
                          (unsigned long long)calls, (unsigned long long)exchanged, request_ns / 1e3 / calls,
-                         compute_ns / 1e3 / calls, backend_ns / 1e3 / calls);
+                         compute_ns / 1e3 / calls, backend_ns / 1e3 / calls, counters_ns / 1e3 / calls);
     }
 };
 Timing timing;
+
+Counters Counters::read() {
+    const uint64_t t0 = timing.enabled ? Timing::now() : 0;
+    Counters c;
+    ggml_backend_shielded_stats(&c.offloaded, &c.local, &c.graph_macs, &c.failures);
+    ggml_backend_shielded_verified_stats(&c.exchanges, &c.macs);
+    if (timing.enabled && timing.seen >= timing.skip) timing.counters_ns += Timing::now() - t0;
+    return c;
+}
 
 struct Outcome {
     bool supported = false;
@@ -536,6 +628,7 @@ public:
             products_.clear();
             pairs_.clear();
             retained_ = 0;
+            ++generation_;
         }
         const size_t mem = 4 * ggml_tensor_overhead() + ggml_graph_overhead_custom(kGraphNodes, false) +
                            p.input_bytes + p.output_bytes + (64u << 10);
@@ -558,10 +651,14 @@ public:
         return products_.emplace(key, std::move(p)).first->second;
     }
 
-    // The input is already in p.x->data and has been checked finite.
-    Outcome compute(Product & p, uint64_t k, uint64_t n, uint64_t m) {
+    // The input is already in p.x->data and has been checked finite. With
+    // `to`, the product is also copied there, after the accounting holds and
+    // in the same pass that checks it; a product that then turns out not to be
+    // finite retires the executor with part of it copied and no reply sent.
+    Outcome compute(Product & p, uint64_t k, uint64_t n, uint64_t m, unsigned char * to = nullptr) {
         Outcome out;
         if (!p.supported) return out;
+        ++p.stamp;
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
         // NaN sentinel: an output the backend never wrote fails the finite check.
         std::fill_n(static_cast<float *>(p.y->data), m * n, std::nanf(""));
@@ -577,7 +674,6 @@ public:
                 after.graph_macs < before.graph_macs || after.exchanges < before.exchanges ||
                 after.macs < before.macs || after.failures != 0)
             retire("backend counters inconsistent");
-        if (!all_finite(static_cast<const float *>(p.y->data), m * n)) retire("non-finite output");
         Counters & d = out.delta;
         d.offloaded = after.offloaded - before.offloaded;
         d.local = after.local - before.local;
@@ -589,6 +685,8 @@ public:
         if (d.graph_macs != m * k * n || d.offloaded + d.local != 1 ||
                 (d.exchanges != 0) != (d.macs != 0) || (d.local == 1 && d.exchanges != 0))
             retire("invalid verified accounting");
+        const auto * y = static_cast<const float *>(p.y->data);
+        if (!(to ? copy_finite(to, y, m * n) : all_finite(y, m * n))) retire("non-finite output");
         out.supported = true;
         out.exchanges = d.exchanges;
         out.macs = d.macs;
@@ -609,6 +707,12 @@ public:
         ggml_tensor * x = nullptr, * y[2] = {nullptr, nullptr};
         ggml_cgraph * graph = nullptr;
         size_t input_bytes = 0, output_bytes[2] = {0, 0};
+        // The two products gated together the way a feed-forward block does
+        // it, swiglu(y[i], y[1 - i]), for products of equal width. Computed
+        // only when gated() is asked for one.
+        ggml_tensor * gated[2] = {nullptr, nullptr};
+        ggml_cgraph * glue[2] = {nullptr, nullptr};
+        uint64_t stamp = 0;  // changes with every compute
     };
 
     Pair * pair(ggml_tensor * w1, ggml_tensor * w2, uint64_t k, uint64_t n1, uint64_t n2, uint64_t m) {
@@ -624,8 +728,11 @@ public:
             products_.clear();
             pairs_.clear();
             retained_ = 0;
+            ++generation_;
         }
-        const size_t mem = 6 * ggml_tensor_overhead() + ggml_graph_overhead_custom(kGraphNodes, false) + bytes + (64u << 10);
+        const bool glue = n1 == n2;
+        const size_t mem = 10 * ggml_tensor_overhead() + 3 * ggml_graph_overhead_custom(kGraphNodes, false) + bytes +
+                           (glue ? 4 * p.output_bytes[0] : 0) + (64u << 10);
         p.ctx.reset(ggml_init(ggml_init_params{mem, nullptr, false}));
         if (!p.ctx) retire("graph context allocation failed");
         p.x = ggml_new_tensor_2d(p.ctx.get(), GGML_TYPE_F32, (int64_t)k, (int64_t)m);
@@ -650,29 +757,49 @@ public:
             ggml_build_forward_expand(p.graph, p.y[0]);
             ggml_build_forward_expand(p.graph, p.y[1]);
         }
-        retained_ += bytes;
+        // The gating graphs read the products through plain input tensors
+        // that point at the same bytes. Built on the products themselves, a
+        // graph would contain the two multiplications and the CPU backend
+        // would compute them again, unprotected and over the verified values.
+        ggml_tensor * read[2] = {nullptr, nullptr};
+        for (int i = 0; supported && glue && i < 2; ++i) {
+            read[i] = ggml_new_tensor_2d(p.ctx.get(), GGML_TYPE_F32, (int64_t)n1, (int64_t)m);
+            if (!read[i]) retire("graph context allocation failed");
+            read[i]->data = p.y[i]->data;
+            ggml_set_input(read[i]);
+        }
+        for (int i = 0; supported && glue && i < 2; ++i) {
+            ggml_tensor * g = ggml_swiglu_split(p.ctx.get(), read[i], read[1 - i]);
+            ggml_cgraph * graph = g ? ggml_new_graph_custom(p.ctx.get(), kGraphNodes, false) : nullptr;
+            if (!graph || !g->data || g->type != GGML_TYPE_F32 || ggml_nbytes(g) != p.output_bytes[0]) break;
+            ggml_build_forward_expand(graph, g);
+            p.gated[i] = g;
+            p.glue[i] = graph;
+        }
+        retained_ += bytes + (glue ? 4 * p.output_bytes[0] : 0);
         Pair & stored = pairs_.emplace(key, std::move(p)).first->second;
         return stored.graph ? &stored : nullptr;
     }
 
     // Both products, or a retirement. The input is in p.x->data, checked finite.
-    Outcome compute(Pair & p, uint64_t k, uint64_t n1, uint64_t n2, uint64_t m) {
+    // `to` receives them as in the single-product compute.
+    Outcome compute(Pair & p, uint64_t k, uint64_t n1, uint64_t n2, uint64_t m, unsigned char * const to[2]) {
         Outcome out;
+        ++p.stamp;
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
         std::fill_n(static_cast<float *>(p.y[0]->data), m * n1, std::nanf(""));
         std::fill_n(static_cast<float *>(p.y[1]->data), m * n2, std::nanf(""));
         const Counters before = Counters::read();
         if (before.failures != 0) retire("backend has verification failures");
+        const uint64_t t1 = timing.enabled ? Timing::now() : 0;
         if (ggml_backend_graph_compute(backend_.backend, p.graph) != GGML_STATUS_SUCCESS)
             retire("backend compute failed");
+        if (timing.enabled && timing.seen >= timing.skip) timing.backend_ns += Timing::now() - t1;
         const Counters after = Counters::read();
         if (after.offloaded < before.offloaded || after.local < before.local ||
                 after.graph_macs < before.graph_macs || after.exchanges < before.exchanges ||
                 after.macs < before.macs || after.failures != 0)
             retire("backend counters inconsistent");
-        if (!all_finite(static_cast<const float *>(p.y[0]->data), m * n1) ||
-                !all_finite(static_cast<const float *>(p.y[1]->data), m * n2))
-            retire("non-finite output");
         Counters & d = out.delta;
         d.offloaded = after.offloaded - before.offloaded;
         d.local = after.local - before.local;
@@ -684,6 +811,9 @@ public:
         if (d.graph_macs != m * k * (n1 + n2) || d.offloaded + d.local != 2 ||
                 (d.exchanges != 0) != (d.macs != 0) || (d.local == 2 && d.exchanges != 0))
             retire("invalid verified accounting");
+        if (!copy_finite(to[0], static_cast<const float *>(p.y[0]->data), m * n1) ||
+                !copy_finite(to[1], static_cast<const float *>(p.y[1]->data), m * n2))
+            retire("non-finite output");
         out.supported = true;
         out.exchanges = d.exchanges;
         out.macs = d.macs;
@@ -697,6 +827,30 @@ public:
     }
 
     uint64_t completed() const { return completed_; }
+
+    // Changes when cached graphs were dropped: Product and Pair references
+    // taken before the change are gone.
+    uint64_t generation() const { return generation_; }
+
+    // swiglu(y[order], y[1 - order]) of the pair's current products, computed
+    // on the CPU backend in this process, or null when that is not available.
+    // Ordinary arithmetic on values this process already holds; nothing is
+    // sent anywhere.
+    const float * gated(Pair & p, int order) {
+        if (!p.glue[order]) return nullptr;
+        if (!cpu_tried_) {
+            cpu_tried_ = true;
+            cpu_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (cpu_) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu_));
+                const auto set = reg ? (ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(
+                                           reg, "ggml_backend_set_n_threads") : nullptr;
+                if (set) set(cpu_, 1);
+            }
+        }
+        if (!cpu_ || ggml_backend_graph_compute(cpu_, p.glue[order]) != GGML_STATUS_SUCCESS) return nullptr;
+        return static_cast<const float *>(p.gated[order]->data);
+    }
 
     // Offer every approved tensor to the backend before the first product, so
     // it registers them with the worker in one start. Offered one at a time,
@@ -728,8 +882,15 @@ public:
             }
             if (bytes > cap / 5 * 4) return;
         }
-        for (const auto & [name, entry] : policy_) {
-            if (!eligible(entry)) continue;
+        // Hashing a multi-gigabyte model on one thread is most of the wait.
+        // The digests are independent, so check them on a few threads first;
+        // weight() then finds each tensor already verified or retires.
+        std::vector<std::string> names;
+        for (const auto & [name, entry] : policy_)
+            if (eligible(entry)) names.push_back(name);
+        model_.verify_all(policy_, names);
+        for (const std::string & name : names) {
+            const PolicyEntry & entry = policy_.at(name);
             ggml_tensor * w = model_.weight(policy_, name, entry.sha256, entry.ne[0], entry.ne[1]);
             product(w, (uint64_t)entry.ne[0], (uint64_t)entry.ne[1], 1);
         }
@@ -749,6 +910,9 @@ private:
     Backend & backend_;
     std::map<std::pair<ggml_tensor *, uint64_t>, Product> products_;
     std::map<std::tuple<ggml_tensor *, ggml_tensor *, uint64_t>, Pair> pairs_;
+    uint64_t generation_ = 0;
+    ggml_backend_t cpu_ = nullptr;
+    bool cpu_tried_ = false;
     size_t retained_ = 0;
     uint64_t completed_ = 0;
     bool prepared_ = false;
@@ -829,10 +993,38 @@ struct Shared {
     }
 };
 
+// What a client was seen to do with a pair of products: gate them together
+// and ask for a third tensor's product of the result (a feed-forward block's
+// down projection). Indexed by the pair's first slot.
+struct Chain {
+    uint32_t second = kNoPair, next = kNoPair;
+    uint8_t order = 0, strikes = 0;
+};
+constexpr uint8_t kChainStrikes = 3;
+
 struct Session {
     int fd = -1;
     std::vector<Slot> slots;
     Shared shared;
+    std::vector<Chain> chains;
+    // The pair served last, while its products are still the pair's current ones.
+    struct {
+        Engine::Pair * pair = nullptr;
+        uint64_t stamp = 0, generation = 0, m = 0;
+        uint32_t first = kNoPair, second = kNoPair;
+        bool valid = false;
+    } last;
+    // A product computed ahead of the request expected next. It is released
+    // only to a request for the same tensor whose activation is byte for byte
+    // the one it was computed from; otherwise it is dropped.
+    struct {
+        Product * product = nullptr;
+        ggml_tensor * w = nullptr;
+        uint64_t stamp = 0, generation = 0, m = 0;
+        uint32_t first = kNoPair;
+        Outcome out;
+        bool valid = false;
+    } held;
 };
 
 // This session only. Static reason, as for Retire: no client values.
@@ -860,7 +1052,129 @@ void session_write(int fd, const void * src, size_t n) {
     }
 }
 
-void session_request(Session & s, Engine & engine) {
+// One job at a time on a second thread. The thread that answers a client goes
+// straight back to waiting for it: a reply on the session socket wakes the
+// client onto the replying thread's processor, and a thread that kept
+// computing there would hold the client up for as long as it computed.
+// Nothing else uses the engine or the sessions while a job runs; the serving
+// loop calls wait() before it handles anything.
+class Ahead {
+public:
+    Ahead() : thread_([this] { run(); }) {}
+    ~Ahead() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_one();
+        thread_.join();
+    }
+    Ahead(const Ahead &) = delete;
+    Ahead & operator=(const Ahead &) = delete;
+
+    void post(std::function<void()> job) {
+        {
+            std::lock_guard lock(mutex_);
+            job_ = std::move(job);
+            busy_.store(true, std::memory_order_release);
+        }
+        wake_.notify_one();
+    }
+
+    // Returns once no job is running; rethrows what the last one threw.
+    void wait() {
+        // A job is one exchange with the worker; its end is usually close.
+        for (int spins = 0; busy_.load(std::memory_order_acquire) && spins < 20000; ++spins) __builtin_ia32_pause();
+        std::unique_lock lock(mutex_);
+        idle_.wait(lock, [this] { return !busy_.load(std::memory_order_acquire); });
+        if (error_) std::rethrow_exception(std::exchange(error_, nullptr));
+    }
+
+private:
+    void run() {
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            wake_.wait(lock, [this] { return stop_ || job_; });
+            if (!job_) return;
+            const std::function<void()> job = std::exchange(job_, nullptr);
+            lock.unlock();
+            std::exception_ptr error;
+            try {
+                job();
+            } catch (...) {
+                error = std::current_exception();
+            }
+            lock.lock();
+            error_ = error;
+            busy_.store(false, std::memory_order_release);
+            idle_.notify_all();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_, idle_;
+    std::function<void()> job_;
+    std::exception_ptr error_;
+    std::atomic<bool> busy_{false};
+    bool stop_ = false;
+    std::thread thread_;
+};
+
+// After a pair, see whether the request that followed asked for a product of
+// the pair gated together. The activation is already in x, private and finite.
+void chain_learn(Session & s, Engine & engine, uint32_t id, uint64_t m, const void * x, size_t bytes) {
+    auto & last = s.last;
+    if (!last.valid) return;
+    last.valid = false;
+    if (last.generation != engine.generation() || last.pair->stamp != last.stamp || last.m != m ||
+            last.pair->output_bytes[0] != bytes || id == last.first || id == last.second)
+        return;
+    if (s.chains.size() <= last.first) s.chains.resize(last.first + 1);
+    Chain & chain = s.chains[last.first];
+    if (chain.next != kNoPair || chain.strikes >= kChainStrikes) return;
+    for (int order = 0; order < 2; ++order) {
+        const float * gated = engine.gated(*last.pair, order);
+        if (gated && !std::memcmp(gated, x, bytes)) {
+            chain.second = last.second;
+            chain.next = id;
+            chain.order = (uint8_t)order;
+            return;
+        }
+    }
+    ++chain.strikes;
+}
+
+// After a pair whose continuation is known, compute it before it is asked for.
+void chain_ahead(Session & s, Engine & engine, uint32_t first, uint32_t second, uint64_t m, Engine::Pair & pair) {
+    if (first >= s.chains.size()) return;
+    Chain & chain = s.chains[first];
+    if (chain.next == kNoPair || chain.second != second || chain.next >= s.slots.size()) return;
+    const Slot & next = s.slots[chain.next];
+    const size_t bytes = pair.output_bytes[0];
+    if (!next.w || m * next.k * 4 != bytes || m * next.n * 4 > kMaxPayload) return;
+    const uint64_t generation = engine.generation();
+    Product & p = engine.product(next.w, next.k, next.n, m);
+    if (engine.generation() != generation) return;  // the pair went with the old graphs
+    const float * gated = engine.gated(pair, chain.order);
+    if (!gated || !all_finite(gated, bytes / 4)) return;
+    std::memcpy(p.x->data, gated, bytes);
+    const Outcome out = engine.compute(p, next.k, next.n, m);
+    if (!out.supported) {
+        chain.next = kNoPair;
+        chain.strikes = kChainStrikes;
+        return;
+    }
+    s.held.product = &p;
+    s.held.w = next.w;
+    s.held.stamp = p.stamp;
+    s.held.generation = engine.generation();
+    s.held.m = m;
+    s.held.first = first;
+    s.held.out = out;
+    s.held.valid = true;
+}
+
+void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
     Frame f{};
     session_read(s.fd, &f, sizeof f);
     const uint64_t t0 = timing.enabled ? Timing::now() : 0;
@@ -927,6 +1241,10 @@ void session_request(Session & s, Engine & engine) {
         return;
     }
     if (f.type == kMatmulShared) {
+        if (timing.enabled && timing.seen > timing.skip && timing.replied) {
+            timing.gap_ns[timing.was_pair] += t0 - timing.replied;
+            ++timing.gaps[timing.was_pair];
+        }
         struct { uint32_t pair, reserved; } extra{};
         session_read(s.fd, &extra, sizeof extra);
         if (!s.shared.base || f.id >= s.slots.size() || !s.slots[f.id].w || f.b != 0 || extra.reserved != 0)
@@ -936,6 +1254,28 @@ void session_request(Session & s, Engine & engine) {
         if (m == 0 || m > kMaxRows || m * slot.k * 4 > kMaxPayload || m * slot.n * 4 > kMaxPayload)
             throw Drop{"unsupported geometry"};
         struct { Frame f; uint64_t exchanges, macs; } r{{kMatmulShared, f.id, kUnsupported, 0}, 0, 0};
+        if (s.held.valid) {
+            s.held.valid = false;
+            Product * ahead = s.held.product;
+            if (s.held.generation == engine.generation() && ahead->stamp == s.held.stamp && s.held.w == slot.w &&
+                    s.held.m == m && extra.pair == kNoPair && ahead->input_bytes == m * slot.k * 4 &&
+                    !std::memcmp(s.shared.base, ahead->x->data, ahead->input_bytes)) {
+                std::memcpy(s.shared.base + kMaxPayload, ahead->y->data, ahead->output_bytes);
+                r.f.a = kOk;
+                r.exchanges = s.held.out.exchanges;
+                r.macs = s.held.out.macs;
+                s.last.valid = false;
+                session_write(s.fd, &r, sizeof r);
+                if (timing.enabled) { timing.replied = Timing::now(); timing.was_pair = false; ++timing.ahead; }
+                return;
+            }
+            // Not what followed this time: stop expecting it.
+            if (s.held.first < s.chains.size()) {
+                Chain & chain = s.chains[s.held.first];
+                chain.next = kNoPair;
+                if (chain.strikes < kChainStrikes) ++chain.strikes;
+            }
+        }
         // A second approved tensor applied to the same activation, when the
         // client expects to ask for it next. Declined silently otherwise.
         Engine::Pair * both = nullptr;
@@ -946,9 +1286,9 @@ void session_request(Session & s, Engine & engine) {
             const Slot & second = s.slots[extra.pair];
             std::memcpy(both->x->data, s.shared.base, both->input_bytes);
             if (!all_finite(static_cast<const float *>(both->x->data), m * slot.k)) throw Drop{"non-finite input"};
-            const Outcome out = engine.compute(*both, slot.k, slot.n, second.n, m);
-            std::memcpy(s.shared.base + kMaxPayload, both->y[0]->data, both->output_bytes[0]);
-            std::memcpy(s.shared.base + 2 * kMaxPayload, both->y[1]->data, both->output_bytes[1]);
+            unsigned char * const to[2] = {s.shared.base + kMaxPayload, s.shared.base + 2 * kMaxPayload};
+            s.last.valid = false;
+            const Outcome out = engine.compute(*both, slot.k, slot.n, second.n, m, to);
             r.f.a = kOk;
             r.f.b = 1;
             r.exchanges = out.exchanges;
@@ -957,15 +1297,33 @@ void session_request(Session & s, Engine & engine) {
             Product & p = engine.product(slot.w, slot.k, slot.n, m);
             std::memcpy(p.x->data, s.shared.base, p.input_bytes);
             if (!all_finite(static_cast<const float *>(p.x->data), m * slot.k)) throw Drop{"non-finite input"};
-            const Outcome out = engine.compute(p, slot.k, slot.n, m);
+            chain_learn(s, engine, f.id, m, p.x->data, p.input_bytes);
+            const Outcome out = engine.compute(p, slot.k, slot.n, m, s.shared.base + kMaxPayload);
             if (out.supported) {
-                std::memcpy(s.shared.base + kMaxPayload, p.y->data, p.output_bytes);
                 r.f.a = kOk;
                 r.exchanges = out.exchanges;
                 r.macs = out.macs;
             }
         }
+        if (both) {
+            s.last.pair = both;
+            s.last.stamp = both->stamp;
+            s.last.generation = engine.generation();
+            s.last.m = m;
+            s.last.first = f.id;
+            s.last.second = extra.pair;
+            s.last.valid = true;
+            // SHIELD_Q8_AHEAD=0 turns the continuation off.
+            static const bool ahead = !std::getenv("SHIELD_Q8_AHEAD") || std::strcmp(std::getenv("SHIELD_Q8_AHEAD"), "0");
+            // Started before the reply so it overlaps the client's own work.
+            // The products are complete and are only read from here on.
+            if (ahead && f.id < s.chains.size() && s.chains[f.id].next != kNoPair) {
+                const uint32_t first = f.id, second = extra.pair;
+                ahead_thread.post([&s, &engine, first, second, m, both] { chain_ahead(s, engine, first, second, m, *both); });
+            }
+        }
         session_write(s.fd, &r, sizeof r);
+        if (timing.enabled) { timing.replied = Timing::now(); timing.was_pair = both != nullptr; }
         if (timing.enabled && timing.seen > timing.skip) timing.request_ns += Timing::now() - t0;
         return;
     }
@@ -1036,6 +1394,7 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
     Input in;
     std::string line;
     std::vector<Session> sessions;
+    Ahead ahead;  // after the engine and the sessions its jobs use
     bool stdin_open = true;
     uint64_t served = 0;
     // SHIELD_Q8_SPIN_US bounds the wait described below; 0 always sleeps.
@@ -1063,6 +1422,8 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
             do ready = poll(fds.data(), fds.size(), -1); while (ready < 0 && errno == EINTR);
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) retire("poll failed");
+        // Whatever follows may use the engine or change the sessions.
+        ahead.wait();
 
         if (fds[1].revents) {
             char command = 0;
@@ -1084,7 +1445,8 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
                     const timeval timeout{10, 0};
                     setsockopt(passed, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
                     setsockopt(passed, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
-                    sessions.push_back(Session{passed, {}, {}});
+                    sessions.emplace_back();
+                    sessions.back().fd = passed;
                 } else if (passed >= 0) {
                     close(passed);
                 }
@@ -1123,7 +1485,7 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
         for (size_t i = 0; i < sessions.size();) {
             if (!fds[2 + i].revents) { ++i; continue; }
             try {
-                session_request(sessions[i], engine);
+                session_request(sessions[i], engine, ahead);
                 ++i;
             } catch (const Drop & drop) {
                 if (std::strcmp(drop.why, "client closed"))

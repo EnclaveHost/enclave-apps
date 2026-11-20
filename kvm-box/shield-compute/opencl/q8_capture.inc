@@ -23,7 +23,10 @@ struct Q8Timing {
   }
   void launch() {
     if (!enabled) return;
-    if (launches.fetch_add(1) == skip) first = now();
+    if (launches.fetch_add(1) == skip) {
+      first = now();
+      timing_steady = true;
+    }
   }
   void add(Stage stage, uint64_t start) {
     if (!enabled || launches.load() <= skip) return;
