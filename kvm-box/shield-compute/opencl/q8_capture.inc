@@ -78,6 +78,7 @@ std::string q8_sha(const std::string &value) {
   Q8Hash hash; hash.update(value.data(), value.size()); return hash.finish();
 }
 struct Q8PublicTensor {
+  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K
   size_t k, n;
   std::string sha, name, engine, policy_sha;
 };
@@ -99,14 +100,18 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
       const auto &tensors = policy.at("tensors");
       if (!tensors.is_array() || tensors.size()>100000) throw std::runtime_error("policy tensor limit");
       for (const auto &tensor : tensors) {
-        if (tensor.at("type") != 8) continue;
+        if (tensor.at("type") != 8 && tensor.at("type") != 12) continue;
+        const int type = tensor.at("type").get<int>();
         const auto &shape = tensor.at("ne");
         if (!shape.is_array() || shape.size()!=4) throw std::runtime_error("policy shape");
         if (shape[2] != 1 || shape[3] != 1) continue;
         size_t k=shape[0].get<size_t>(), n=shape[1].get<size_t>();
-        if (!k || k%32 || !n || k>(512u<<20)/n || tensor.at("nbytes")!=k*n/32*34)
+        // A K-quant tensor whose rows are not whole super-blocks is never lowered.
+        if (type == 12 && k%256) continue;
+        if (!k || k%32 || !n || k>(512u<<20)/n ||
+            tensor.at("nbytes")!=(type == 12 ? k*n/256*144 : k*n/32*34))
           throw std::runtime_error("policy tensor dimensions");
-        result.push_back({k,n,tensor.at("sha256").get<std::string>(),tensor.at("name").get<std::string>(),engine,digest});
+        result.push_back({type,k,n,tensor.at("sha256").get<std::string>(),tensor.at("name").get<std::string>(),engine,digest});
       }
     }
     return result;
@@ -128,10 +133,39 @@ json q8_authenticate(const std::vector<unsigned char> &quants,
   }
   const auto digest=hash.finish();
   for (const auto &tensor:q8_catalog())
-    if (tensor.k==k && tensor.n==n && tensor.sha==digest)
+    if (tensor.type==8 && tensor.k==k && tensor.n==n && tensor.sha==digest)
       return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
               {"sha256",digest},{"policySha256",tensor.policy_sha}};
   // Unknown weights may be private. Do not expose their digest or contents.
+  return {{"approved",false}};
+}
+// The same question for a Q4_K tensor held as the four flat buffers of the
+// OpenCL backend: the digest is of the GGUF block order (half d, half dmin,
+// 12 scale bytes, 128 quant bytes for each 256 weights), exact bytes.
+json q4k_authenticate(const std::vector<unsigned char> &quants, const std::vector<unsigned char> &scales,
+                      const std::vector<unsigned char> &d, const std::vector<unsigned char> &dmin,
+                      size_t k, size_t n) {
+  const size_t blocks=k*n/256;
+  if (k%256 || quants.size()!=blocks*128 || scales.size()!=blocks*12 || d.size()!=blocks*2 ||
+      dmin.size()!=blocks*2) throw std::runtime_error("snapshot shape");
+  Q8Hash hash;
+  std::vector<unsigned char> packed(1024*144);
+  for (size_t first=0;first<blocks;first+=1024) {
+    const size_t count=std::min(size_t(1024), blocks-first);
+    for (size_t block=0;block<count;++block) {
+      unsigned char *out=packed.data()+block*144;
+      std::memcpy(out, d.data()+(first+block)*2, 2);
+      std::memcpy(out+2, dmin.data()+(first+block)*2, 2);
+      std::memcpy(out+4, scales.data()+(first+block)*12, 12);
+      std::memcpy(out+16, quants.data()+(first+block)*128, 128);
+    }
+    hash.update(packed.data(), count*144);
+  }
+  const auto digest=hash.finish();
+  for (const auto &tensor:q8_catalog())
+    if (tensor.type==12 && tensor.k==k && tensor.n==n && tensor.sha==digest)
+      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
+              {"sha256",digest},{"policySha256",tensor.policy_sha}};
   return {{"approved",false}};
 }
 void q8_log(const json &record) {
@@ -284,7 +318,7 @@ void CL_CALLBACK q8_ready(cl_event, cl_int, void *opaque) {
     q8_pending_jobs.fetch_sub(1);
   }
 }
-std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Kernel &state, bool mv,
+std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Kernel &state, int kind,
     cl_uint dimensions,const size_t *offset,const size_t *global,const size_t *local,
     cl_uint count,const cl_event *wait,cl_event *event) {
   bool masked=false;
@@ -315,29 +349,37 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     cl_context c=nullptr;
     if(REAL(clGetEventInfo)(wait[i],CL_EVENT_CONTEXT,sizeof(c),&c,nullptr) || c!=context) return {false,0};
   }
-  std::array<cl_mem,4> buffers{};
-  std::array<Storage,4> stored{};
-  std::array<unsigned,4> indices={0,1,2,4};
+  // Arguments in the Q8_0 numbering: a Q4_K kernel has four weight buffers
+  // where a Q8_0 kernel has two, and everything after them two places later.
+  const bool mv=q8_kind_vector(kind);
+  const unsigned weights=q8_kind_weights(kind), shift=weights-2;
+  std::array<cl_mem,6> buffers{};
+  std::array<Storage,6> stored{};
+  std::array<unsigned,6> indices{};
+  for(unsigned i=0;i<weights;++i) indices[i]=i;
+  indices[weights]=2+shift; indices[weights+1]=4+shift;
   std::array<uint64_t,19> scalars{};
   Q8LaunchView view{};
-  view.mv=mv;
+  view.kind=kind;
   for(unsigned i=0;i<3;++i) { view.global[i]=global[i]; view.local[i]=local[i]; view.offset[i]=offset?offset[i]:0; }
   try {
     for(unsigned i=3;i<19;++i) if(i!=4) {
-      bool wide=i==3 || i==5 || (mv && (i==8 || i==9 || i==10 || i==12 || i==13 || i==14));
-      if(state.args[i].size()!=(wide?sizeof(cl_ulong):sizeof(cl_int))) return {false,0};
-      if(wide) { cl_ulong value; std::memcpy(&value,state.args[i].data(),sizeof(value)); scalars[i]=value; }
-      else { cl_int value; std::memcpy(&value,state.args[i].data(),sizeof(value)); if(value<0) return {false,0}; scalars[i]=value; }
+      // The Q4_K vector kernel takes its two pointer offsets as int.
+      bool wide=((i==3 || i==5) && kind!=Q4K_MV) || (mv && (i==8 || i==9 || i==10 || i==12 || i==13 || i==14));
+      const auto &argument=state.args[i+shift];
+      if(argument.size()!=(wide?sizeof(cl_ulong):sizeof(cl_int))) return {false,0};
+      if(wide) { cl_ulong value; std::memcpy(&value,argument.data(),sizeof(value)); scalars[i]=value; }
+      else { cl_int value; std::memcpy(&value,argument.data(),sizeof(value)); if(value<0) return {false,0}; scalars[i]=value; }
     }
     view.scalars=scalars;
-    for(size_t i=0;i<4;++i) {
+    for(size_t i=0;i<weights+2;++i) {
       unsigned index=indices[i];
       if(state.args[index].size()!=sizeof(cl_mem)) return {false,0};
       std::memcpy(&buffers[i],state.args[index].data(),sizeof(cl_mem));
       Storage &memory=stored[i];
       if(!storage(buffers[i],memory) || memory.context!=context ||
-         (memory.flags&CL_MEM_HOST_NO_ACCESS) || (i<3 && (memory.flags&CL_MEM_HOST_WRITE_ONLY)) ||
-         (masked && i==3 && (memory.flags&CL_MEM_HOST_READ_ONLY))) return {false,0};
+         (memory.flags&CL_MEM_HOST_NO_ACCESS) || (i<=weights && (memory.flags&CL_MEM_HOST_WRITE_ONLY)) ||
+         (masked && i==weights+1 && (memory.flags&CL_MEM_HOST_READ_ONLY))) return {false,0};
       size_t root_bytes=0;
       if(REAL(clGetMemObjectInfo)(memory.root,CL_MEM_SIZE,sizeof(root_bytes),&root_bytes,nullptr)) return {false,0};
       view.buffers[i]={reinterpret_cast<uintptr_t>(memory.root),root_bytes,memory.offset,memory.size};
@@ -350,10 +392,13 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     // ABI, in addition to the stride/grid/alias/range validation above.
     if(!checked_k || checked_k!=scalars[6] || !checked_n || checked_n!=scalars[7] ||
        !checked_m || checked_m!=scalars[mv?16:9] || checked_k>(512u<<20)/4/checked_m ||
-       checked_n>(512u<<20)/4/checked_m || bytes[2]!=checked_m*checked_k*4 ||
+       checked_n>(512u<<20)/4/checked_m || bytes[weights]!=checked_m*checked_k*4 ||
        checked_output!=checked_m*checked_n*4) return {false,0};
-    if(bytes[0]>512u<<20 || bytes[1]>512u<<20 || bytes[2]>512u<<20) return {false,0};
-    size_t total=bytes[0]+bytes[1]+bytes[2];
+    size_t total=0;
+    for(unsigned i=0;i<=weights;++i) {
+      if(bytes[i]>512u<<20) return {false,0};
+      total+=bytes[i];
+    }
     if(masked) {
       if(checked_output>512u<<20) return {false,0};
       total+=checked_output;
@@ -362,7 +407,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
 #ifdef SHIELD_Q8_MASKED
     if(masked && !count && q8_direct_enabled() &&
        !(properties&(CL_QUEUE_PROFILING_ENABLE|CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE))) {
-      const Q8DirectLaunch launch{q,buffers,stored,bytes,size_t(scalars[3]),size_t(scalars[5]),checked_output,
+      const Q8DirectLaunch launch{q,kind,buffers,stored,bytes,size_t(scalars[3]),size_t(scalars[5]),checked_output,
                                   checked_k,checked_n,checked_m,event};
       auto result=q8_direct(launch);
       q8_timing.add(Q8Timing::Enqueue,enqueue_ns);
@@ -370,6 +415,8 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
       return {true,*result};
     }
 #endif
+    // The queued route knows the Q8_0 kernels only.
+    if(kind!=Q8_MM && kind!=Q8_MV) return {false,0};
     if(!queued_offload_reliable()) return {false,0};
     // The queued route keeps a public description of the launch for its log.
     json metadata={{"variant",mv?"mv":"mm"},{"scalars",json::object()},
@@ -382,7 +429,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
           {"root_bytes",view.buffers[i].root_bytes},{"offset",view.buffers[i].offset},{"size",view.buffers[i].size}};
     auto job=std::make_shared<Q8CaptureJob>();
     job->masked=masked; job->output_offset=scalars[5]; job->output_bytes=checked_output;
-    job->read_bytes=bytes; job->input_offset=scalars[3]; job->k=scalars[6]; job->n=scalars[7];
+    job->read_bytes={bytes[0],bytes[1],bytes[2]}; job->input_offset=scalars[3]; job->k=scalars[6]; job->n=scalars[7];
     std::copy(global,global+3,job->global.begin()); std::copy(local,local+3,job->local.begin());
     // Allocation addresses stay private: logs contain stable per-record root
     // labels preserving alias relationships, not host/process pointers.

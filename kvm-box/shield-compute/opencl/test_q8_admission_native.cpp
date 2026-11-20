@@ -1,7 +1,8 @@
 // Test driver for q8_admission.inc. One launch per input line:
-//   mv, scalars 3 and 5..18, four buffers (root root_bytes offset size),
-//   global[3], local[3], offset[3]  -- 41 unsigned decimal numbers.
-// Prints "0", or "1 m n k read0 read1 read2 output".
+//   kind (1 mm, 2 mv, 3 mm_q4_k, 4 mv_q4_k), scalars 3 and 5..18 in the Q8
+//   numbering, six buffers (root root_bytes offset size; unused ones zero),
+//   global[3], local[3], offset[3]  -- 49 unsigned decimal numbers.
+// Prints "0", or "1 m n k reads... output".
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -19,9 +20,9 @@ int main() {
   while (std::getline(std::cin, line)) {
     std::istringstream in(line);
     Q8LaunchView view{};
-    uint64_t mv = 0;
-    in >> mv;
-    view.mv = mv != 0;
+    uint64_t kind = 0;
+    in >> kind;
+    view.kind = int(kind);
     in >> view.scalars[3];
     for (unsigned i = 5; i < 19; ++i) in >> view.scalars[i];
     for (auto &b : view.buffers) in >> b.root >> b.root_bytes >> b.offset >> b.size;
@@ -37,8 +38,9 @@ int main() {
       std::puts("0");
       continue;
     }
-    std::printf("1 %zu %zu %zu %zu %zu %zu %zu\n", layout->m, layout->n, layout->k, layout->read_bytes[0],
-                layout->read_bytes[1], layout->read_bytes[2], layout->output_bytes);
+    std::printf("1 %zu %zu %zu", layout->m, layout->n, layout->k);
+    for (unsigned i = 0; i <= q8_kind_weights(view.kind); ++i) std::printf(" %zu", layout->read_bytes[i]);
+    std::printf(" %zu\n", layout->output_bytes);
   }
   return 0;
 }

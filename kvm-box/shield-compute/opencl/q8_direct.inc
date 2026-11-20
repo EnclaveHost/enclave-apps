@@ -44,7 +44,10 @@ struct Q8Region {
   }
 };
 struct Q8Known {
-  Q8Region codes, scales;
+  // The tensor's weight buffers: codes and scales for Q8_0; quants, scales, d
+  // and dmin for Q4_K.
+  std::array<Q8Region, 4> weights;
+  unsigned count;
   size_t k, n;
   std::shared_ptr<const Q8Identity> identity;  // q8_authenticate's answer for these bytes
 };
@@ -78,9 +81,10 @@ Q8Region q8_resolve(cl_mem handle, size_t offset, size_t size, bool whole) {
 }
 void q8_forget_locked(const Q8Region &written) {
   for (size_t i = 0; i < q8_known.size();) {
-    if (q8_known[i].codes.overlaps(written) || q8_known[i].scales.overlaps(written)) {
-      REAL(clReleaseMemObject)(q8_known[i].codes.root);
-      REAL(clReleaseMemObject)(q8_known[i].scales.root);
+    bool overlap = false;
+    for (unsigned w = 0; w < q8_known[i].count; ++w) overlap = overlap || q8_known[i].weights[w].overlaps(written);
+    if (overlap) {
+      for (unsigned w = 0; w < q8_known[i].count; ++w) REAL(clReleaseMemObject)(q8_known[i].weights[w].root);
       q8_known[i] = std::move(q8_known.back());
       q8_known.pop_back();
     } else {
@@ -99,8 +103,7 @@ void q8_written_everything() {
   if (!q8_known_count.load(std::memory_order_acquire)) return;
   std::lock_guard lock(q8_cache_mutex);
   for (auto &known : q8_known) {
-    REAL(clReleaseMemObject)(known.codes.root);
-    REAL(clReleaseMemObject)(known.scales.root);
+    for (unsigned w = 0; w < known.count; ++w) REAL(clReleaseMemObject)(known.weights[w].root);
   }
   q8_known.clear();
   q8_known_count.store(0, std::memory_order_release);
@@ -680,9 +683,11 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
 
 struct Q8DirectLaunch {
   cl_command_queue queue;
-  std::array<cl_mem, 4> buffers;       // codes, scales, activation, output
-  std::array<Storage, 4> storage;
-  std::array<size_t, 3> read_bytes;
+  int kind;                            // Q8Kind
+  std::array<cl_mem, 6> buffers;       // the weight buffers, then activation and output
+  std::array<Storage, 6> storage;
+  std::array<size_t, 5> read_bytes;    // the weight buffers, then the activation
+  unsigned weights() const { return q8_kind_weights(kind); }
   size_t input_offset, output_offset, output_bytes, k, n, m;
   cl_event *event;
 };
@@ -717,7 +722,8 @@ cl_int q8_direct_result(const Q8DirectLaunch &launch, cl_int status) {
 // caller then runs the original kernel.
 bool q8_local(const Q8DirectLaunch &launch, const Q8Identity &identity, bool remembered,
               const std::vector<unsigned char> &input, std::vector<unsigned char> &output) {
-  if (!q8_local_enabled() || !remembered || identity.local_unavailable) return false;
+  // Only Q8_0 weights have a local product; anything else runs its own kernel.
+  if (launch.weights() != 2 || !q8_local_enabled() || !remembered || identity.local_unavailable) return false;
   if (!identity.local) {
     const size_t bytes = launch.read_bytes[0] + launch.read_bytes[1] * 2;
     if (q8_local_bytes.load() + bytes > Q8_LOCAL_LIMIT) return false;
@@ -760,26 +766,30 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   if (REAL(clFinish)(launch.queue)) return std::nullopt;
   q8_timing.add(Q8Timing::Wait, stage);
 
-  const Q8Region codes{launch.storage[0].root, launch.storage[0].offset, launch.read_bytes[0]};
-  const Q8Region scales{launch.storage[1].root, launch.storage[1].offset, launch.read_bytes[1]};
+  const unsigned count = launch.weights();
+  std::array<Q8Region, 4> regions{};
+  for (unsigned w = 0; w < count; ++w)
+    regions[w] = {launch.storage[w].root, launch.storage[w].offset, launch.read_bytes[w]};
   std::shared_ptr<const Q8Identity> identity;
   bool known = false;
   {
     std::lock_guard lock(q8_cache_mutex);
-    for (const auto &entry : q8_known)
-      if (entry.codes.root == codes.root && entry.codes.offset == codes.offset &&
-          entry.codes.size == codes.size && entry.scales.root == scales.root &&
-          entry.scales.offset == scales.offset && entry.scales.size == scales.size &&
-          entry.k == launch.k && entry.n == launch.n) {
+    for (const auto &entry : q8_known) {
+      bool same = entry.count == count && entry.k == launch.k && entry.n == launch.n;
+      for (unsigned w = 0; same && w < count; ++w)
+        same = entry.weights[w].root == regions[w].root && entry.weights[w].offset == regions[w].offset &&
+               entry.weights[w].size == regions[w].size;
+      if (same) {
         identity = entry.identity;
         known = true;
         break;
       }
+    }
   }
   if (!known) {
     stage = Q8Timing::now();
-    std::array<std::vector<unsigned char>, 2> bytes;
-    for (size_t i = 0; i < 2; ++i) {
+    std::array<std::vector<unsigned char>, 4> bytes;
+    for (size_t i = 0; i < count; ++i) {
       bytes[i].resize(launch.read_bytes[i]);
       if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i],
                                     bytes[i].data(), 0, nullptr, nullptr))
@@ -788,7 +798,8 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     q8_timing.add(Q8Timing::Snapshot, stage);
     stage = Q8Timing::now();
     try {
-      const json answer = q8_authenticate(bytes[0], bytes[1], launch.k, launch.n);
+      const json answer = count == 4 ? q4k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
+                                     : q8_authenticate(bytes[0], bytes[1], launch.k, launch.n);
       auto fresh = std::make_shared<Q8Identity>();
       fresh->approved = answer.at("approved").get<bool>();
       if (fresh->approved) {
@@ -804,17 +815,21 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     // Host-pointer buffers and buffers mapped for writing can change without
     // any call this library sees; those are authenticated on every launch.
     std::lock_guard lock(q8_cache_mutex);
-    bool stable = !q8_untracked_writers.load() &&
-                  !((launch.storage[0].root_flags | launch.storage[1].root_flags) & CL_MEM_USE_HOST_PTR);
-    for (const auto &[pointer, root] : q8_write_maps)
-      if (root == codes.root || root == scales.root) stable = false;
-    if (stable && q8_known.size() < 8192 && !REAL(clRetainMemObject)(codes.root)) {
-      if (!REAL(clRetainMemObject)(scales.root)) {
-        q8_known.push_back({codes, scales, launch.k, launch.n, identity});
+    bool stable = !q8_untracked_writers.load();
+    for (unsigned w = 0; w < count; ++w) {
+      if (launch.storage[w].root_flags & CL_MEM_USE_HOST_PTR) stable = false;
+      for (const auto &[pointer, root] : q8_write_maps)
+        if (root == regions[w].root) stable = false;
+    }
+    if (stable && q8_known.size() < 8192) {
+      unsigned retained = 0;
+      while (retained < count && !REAL(clRetainMemObject)(regions[retained].root)) ++retained;
+      if (retained == count) {
+        q8_known.push_back({regions, count, launch.k, launch.n, identity});
         q8_known_count.store(q8_known.size(), std::memory_order_release);
         known = true;
       } else {
-        REAL(clReleaseMemObject)(codes.root);
+        while (retained) REAL(clReleaseMemObject)(regions[--retained].root);
       }
     }
   }
@@ -824,9 +839,9 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
 
   static thread_local std::vector<unsigned char> input, output;
   stage = Q8Timing::now();
-  input.resize(launch.read_bytes[2]);
-  if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[2], CL_TRUE, launch.input_offset,
-                                launch.read_bytes[2], input.data(), 0, nullptr, nullptr))
+  input.resize(launch.read_bytes[count]);
+  if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[count], CL_TRUE, launch.input_offset,
+                                launch.read_bytes[count], input.data(), 0, nullptr, nullptr))
     return std::nullopt;
   q8_timing.add(Q8Timing::Snapshot, stage);
   stage = Q8Timing::now();
@@ -881,8 +896,8 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   q8_timing.add(Q8Timing::Service, stage);
   stage = Q8Timing::now();
   // Every chunk has verified before any result reaches application memory.
-  q8_written(launch.buffers[3], launch.output_offset, launch.output_bytes, false);
-  if (REAL(clEnqueueWriteBuffer)(launch.queue, launch.buffers[3], CL_TRUE, launch.output_offset,
+  q8_written(launch.buffers[count + 1], launch.output_offset, launch.output_bytes, false);
+  if (REAL(clEnqueueWriteBuffer)(launch.queue, launch.buffers[count + 1], CL_TRUE, launch.output_offset,
                                  launch.output_bytes, product, 0, nullptr, nullptr))
     return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
   const cl_int result = q8_direct_result(launch, CL_SUCCESS);
