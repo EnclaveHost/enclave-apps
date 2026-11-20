@@ -87,6 +87,17 @@ each launch layout was validated by starting Python (about 10 s over a run).
    the row kernel has an AVX-512 form. The product is bound by how fast the
    weights arrive from memory, as it is in the native engine.
 
+10. **Programs are built when a kernel is used** (`SHIELD_OPENCL_LAZY_BUILD=1`,
+    set by the packaged `llama-cli`). llama builds 119 programs and creates
+    their kernels, then launches kernels from five. A build from the CPU
+    runtime's cache costs about 25 ms. A program whose source is in the
+    packaged table of sources with nothing to lower is not built when asked;
+    its kernels are handles of this library until one is used for anything
+    but retain and release, and then the program is built and the handle
+    stands for the real kernel. A build or kernel error is reported at that
+    later call, which is why an application has to opt in. The warm-up hint
+    now goes out at the first device query.
+
 `SHIELD_OPENCL_Q8_DIRECT=0` selects the queued route; `SHIELD_OPENCL_Q8_SHARED=0`
 keeps payloads on the socket and disables pairing.
 
@@ -168,7 +179,7 @@ Generation, tokens per second, with the settings above applied to both paths:
 
 | Model, processors, refill threads | Native Shield | Standard OpenCL | Ratio |
 | --- | ---: | ---: | ---: |
-| Qwen2.5-0.5B Q8_0, 2, 1 (the desktop guest's shape) | 100–102 | 92–94 | 91–94% |
+| Qwen2.5-0.5B Q8_0, 2, 1 (the desktop guest's shape) | 100–103 | 92–96 | 91–94% |
 | Qwen2.5-3B Q8_0, 2, 1 | 20.4 | 19.1 | 93.5% |
 | 0.5B, 8, 1 | 115 | 107 | 93% |
 | 3B, 8, 1 | 21.5 | 20.1 | 94% |
@@ -179,11 +190,23 @@ For scale: before this work the queued route gave 2.1 tokens per second on the
 0.5B model, and the native engine as shipped (spinning OpenMP thread) gives 59
 on two processors.
 
-Prompt processing is faster on the OpenCL route (0.5B: 218 against 136 tokens
-per second on two processors; 3B: 58 against 22). Start-up is slower: a whole
-148-token run takes 6.7 s against 4.1 s on the 0.5B model and 26 s against
-22 s on the 3B model, nearly all of it building OpenCL programs and reading
-the weights into device buffers.
+Prompt processing is faster on the OpenCL route (0.5B: 250 against 138 tokens
+per second on two processors; 3B: 58 against 22), because the executor has
+been making pads since the hint.
+
+A whole run of 39 prompt tokens and 148 generated ones, two processors, in
+seconds. The native engine registers the model with the worker in every run.
+The executor does it once and stays; a native job in between displaces it.
+
+| | Native Shield | OpenCL, executor not running | OpenCL, executor running |
+| --- | ---: | ---: | ---: |
+| 0.5B | 4.1–4.5 | 4.4–4.6 | 3.3 |
+| 3B | 21.3–21.5 | 25.5–25.7 | 14.0 |
+
+Before the programs were built on demand the 0.5B run took 6.7 s. On the 3B
+model a first run is slower than native because the client hashes every weight
+it uses (1.8 s) and the executor checks every digest, on the same two
+processors, before the registration that both paths wait for.
 
 Where the remaining time goes, 3B model with pads plentiful (22.1 ms a token
 against 18.1 ms native), from a trace of the executor's session loop:
@@ -258,6 +281,9 @@ priority of the executor's pad thread (within noise).
   never learns it and runs as before.
 - The passive OpenMP policy changes the native engine's timing too. It was
   measured on these two models only.
+- Deferred builds were exercised with the packaged llama (identical text, five
+  programs built instead of 119) and once with `sd-cli` (same image). They are
+  on only for `llama-cli`. There is no unit test for the handle bookkeeping.
 - The executor now needs `-pthread` when it is linked.
 - Only the two Q8 kernels are lowered. Other kernels, other weight types and
   CUDA binaries are unchanged.

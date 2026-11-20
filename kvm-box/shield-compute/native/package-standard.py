@@ -105,6 +105,9 @@ def main():
         # service. With fewer than four processors that starves the service.
         if name == 'llama-cli':
             driver += ('if [ "$(nproc)" -lt 4 ]; then export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-passive}"; fi\n')
+            # llama builds 119 programs and launches kernels from a handful.
+            # The frontend builds a program when one of its kernels is used.
+            driver += 'export SHIELD_OPENCL_LAZY_BUILD="${SHIELD_OPENCL_LAZY_BUILD:-1}"\n'
         path.write_text('#!/bin/sh\nset -eu\n'
                         'export GGML_SHIELD_NATIVE_CPU_FALLBACK=1\n'
                         'export POCL_MAX_PTHREAD_COUNT="${POCL_MAX_PTHREAD_COUNT:-2}"\n'

@@ -10,11 +10,12 @@ OPENCL_1.0 {
   clEnqueueMapBuffer; clEnqueueMapImage; clEnqueueUnmapMemObject;
   clEnqueueNativeKernel; clReleaseMemObject; clEnqueueTask;
   clGetExtensionFunctionAddress;
+  clGetKernelInfo; clGetKernelWorkGroupInfo; clGetProgramBuildInfo; clGetProgramInfo;
  local: *;
 };
 OPENCL_1.1 { global: clSetEventCallback; clCreateSubBuffer; clEnqueueWriteBufferRect; clEnqueueCopyBufferRect; } OPENCL_1.0;
-OPENCL_1.2 { global: clCompileProgram; clLinkProgram; clEnqueueFillBuffer; clEnqueueFillImage; clCreateImage; clEnqueueMigrateMemObjects; clGetExtensionFunctionAddressForPlatform; } OPENCL_1.1;
-OPENCL_2.0 { global: clSVMAlloc; clSVMFree; clEnqueueSVMFree; clSetKernelArgSVMPointer; } OPENCL_1.2;
-OPENCL_2.1 { global: clCloneKernel; clCreateProgramWithIL; } OPENCL_2.0;
+OPENCL_1.2 { global: clCompileProgram; clLinkProgram; clEnqueueFillBuffer; clEnqueueFillImage; clCreateImage; clEnqueueMigrateMemObjects; clGetExtensionFunctionAddressForPlatform; clGetKernelArgInfo; } OPENCL_1.1;
+OPENCL_2.0 { global: clSVMAlloc; clSVMFree; clEnqueueSVMFree; clSetKernelArgSVMPointer; clSetKernelExecInfo; } OPENCL_1.2;
+OPENCL_2.1 { global: clCloneKernel; clCreateProgramWithIL; clGetKernelSubGroupInfo; } OPENCL_2.0;
 OPENCL_2.2 {} OPENCL_2.1;
 OPENCL_3.0 { global: clCreateImageWithProperties; } OPENCL_2.2;

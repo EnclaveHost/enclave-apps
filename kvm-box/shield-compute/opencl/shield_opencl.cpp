@@ -635,6 +635,11 @@ CL_API_ENTRY cl_int CL_API_CALL clGetDeviceIDs(cl_platform_id p,
   // maps to the hybrid Shield device, whose non-offloaded work stays in-guest.
   if (!valid_device_type(type))
     return CL_INVALID_DEVICE_TYPE;
+#ifdef SHIELD_Q8_MASKED
+  // The earliest sign that this process will compute: the executor's start is
+  // the longest part of a cold start, so the hint goes out here.
+  q8_warm_once();
+#endif
   return REAL(clGetDeviceIDs)(p, backing_device_type(type), n, out, count);
 }
 CL_API_ENTRY cl_int CL_API_CALL clGetDeviceInfo(cl_device_id d,
@@ -690,6 +695,114 @@ CL_API_ENTRY cl_context CL_API_CALL clCreateContextFromType(
     *error = status;
   return context;
 }
+#ifdef SHIELD_SOURCE_DECLINES
+// Deferred builds (SHIELD_OPENCL_LAZY_BUILD=1, set by the packaged llama-cli).
+//
+// An engine that keeps most of its work on the CPU still builds every program
+// it has and creates every kernel, and never launches most of them. A build
+// from the CPU runtime's cache costs about 25 ms; llama has 119 programs. A
+// program whose source is in the packaged table of sources with nothing to
+// lower is therefore not built when the application asks. Its kernels are
+// handles of this library until one is used for anything but retain and
+// release; then the program is built, the kernel created, and the handle
+// stands for it from there on.
+//
+// A build or kernel error that the application would have seen at once is
+// reported at that later call instead, which is why this is opt-in.
+struct LazyProgram {
+  std::string options;
+  std::vector<cl_device_id> devices;
+  cl_int result = CL_SUCCESS;
+  bool pending = true;
+};
+struct VirtualKernel {
+  std::atomic<cl_kernel> real{nullptr};
+  cl_program program = nullptr;
+  std::string name;
+  unsigned references = 0;  // 0: free slot
+  bool failed = false;
+};
+std::mutex lazy_mutex;
+std::map<cl_program, LazyProgram> lazy_programs;
+std::atomic<size_t> lazy_pending{0};
+constexpr size_t VIRTUAL_KERNELS = 4096;
+VirtualKernel *virtual_kernels() {
+  static auto *slots = new VirtualKernel[VIRTUAL_KERNELS];
+  return slots;
+}
+std::atomic<bool> virtual_kernels_used{false};
+bool lazy_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_LAZY_BUILD");
+    return value && !std::strcmp(value, "1");
+  }();
+  return enabled;
+}
+bool is_virtual(cl_kernel kernel) {
+  if (!virtual_kernels_used.load(std::memory_order_acquire)) return false;
+  const auto address = reinterpret_cast<uintptr_t>(kernel), first = reinterpret_cast<uintptr_t>(virtual_kernels());
+  return address >= first && address < first + VIRTUAL_KERNELS * sizeof(VirtualKernel) &&
+         (address - first) % sizeof(VirtualKernel) == 0;
+}
+// The deferred build, if this program has one. Its result either way.
+cl_int lazy_build(cl_program program) {
+  if (!lazy_pending.load(std::memory_order_acquire)) return CL_SUCCESS;
+  std::lock_guard lock(lazy_mutex);
+  auto it = lazy_programs.find(program);
+  if (it == lazy_programs.end()) return CL_SUCCESS;
+  if (!it->second.pending) return it->second.result;
+  const auto start = StartupTiming::now();
+  it->second.result = REAL(clBuildProgram)(program, cl_uint(it->second.devices.size()),
+                                           it->second.devices.empty() ? nullptr : it->second.devices.data(),
+                                           it->second.options.c_str(), nullptr, nullptr);
+  startup_timing.build_ns += StartupTiming::now() - start;
+  startup_timing.build_calls++;
+  it->second.pending = false;
+  lazy_pending.fetch_sub(1);
+  return it->second.result;
+}
+// The kernel a handle stands for: itself, or the kernel behind one of this
+// library's handles, created now if it has not been. Null if that fails.
+cl_kernel real_kernel(cl_kernel kernel, cl_int *error = nullptr) {
+  if (!is_virtual(kernel)) return kernel;
+  auto *slot = reinterpret_cast<VirtualKernel *>(kernel);
+  if (cl_kernel made = slot->real.load(std::memory_order_acquire)) return made;
+  cl_program program;
+  std::string name;
+  {
+    std::lock_guard lock(lazy_mutex);
+    if (!slot->references || slot->failed) {
+      if (error) *error = CL_INVALID_KERNEL;
+      return nullptr;
+    }
+    program = slot->program;
+    name = slot->name;
+  }
+  cl_int status = lazy_build(program);
+  cl_kernel made = status ? nullptr : REAL(clCreateKernel)(program, name.c_str(), &status);
+  std::lock_guard lock(lazy_mutex);
+  if (cl_kernel raced = slot->real.load(std::memory_order_acquire)) {
+    if (made) REAL(clReleaseKernel)(made);
+    return raced;
+  }
+  if (!made) {
+    slot->failed = true;
+    if (error) *error = status ? status : CL_INVALID_KERNEL;
+    return nullptr;
+  }
+  {
+    std::lock_guard kernels_lock(mutex);
+    kernels[made] = Kernel{};
+  }
+  slot->real.store(made, std::memory_order_release);
+  return made;
+}
+#else
+inline bool lazy_enabled() { return false; }
+inline bool is_virtual(cl_kernel) { return false; }
+inline cl_int lazy_build(cl_program) { return CL_SUCCESS; }
+inline cl_kernel real_kernel(cl_kernel kernel, cl_int * = nullptr) { return kernel; }
+#endif
 CL_API_ENTRY cl_program CL_API_CALL clCreateProgramWithIL(
     cl_context context, const void *il, size_t bytes, cl_int *error) {
   auto program = REAL(clCreateProgramWithIL)(context, il, bytes, error);
@@ -731,6 +844,20 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseProgram(cl_program program) {
     if (it != programs.end() && !--it->second.references)
       programs.erase(it);
   }
+#ifdef SHIELD_SOURCE_DECLINES
+  if (lazy_enabled()) {
+    cl_uint references = 0;
+    if (program && !REAL(clGetProgramInfo)(program, CL_PROGRAM_REFERENCE_COUNT, sizeof(references), &references,
+                                           nullptr) && references <= 1) {
+      std::lock_guard lock(lazy_mutex);
+      auto it = lazy_programs.find(program);
+      if (it != lazy_programs.end()) {
+        if (it->second.pending) lazy_pending.fetch_sub(1);
+        lazy_programs.erase(it);
+      }
+    }
+  }
+#endif
   return REAL(clReleaseProgram)(program);
 }
 CL_API_ENTRY cl_int CL_API_CALL clCompileProgram(
@@ -747,6 +874,7 @@ CL_API_ENTRY cl_int CL_API_CALL clCompileProgram(
       it->second.plans = json::object();
     }
   }
+  lazy_build(program);
   auto result = REAL(clCompileProgram)(program, count, devices, options,
                                        header_count, headers, names, callback, data);
   if (!result && !callback && !header_count && il_options(options) && one_cpu_program(program)) {
@@ -772,6 +900,38 @@ CL_API_ENTRY cl_int CL_API_CALL clBuildProgram(
   }
 #ifdef SHIELD_Q8_MASKED
   q8_warm_once();
+#endif
+#ifdef SHIELD_SOURCE_DECLINES
+  if (lazy_enabled() && program) {
+    {
+      // A second build request replaces whatever was deferred.
+      std::lock_guard lock(lazy_mutex);
+      auto it = lazy_programs.find(program);
+      if (it != lazy_programs.end()) {
+        if (it->second.pending) lazy_pending.fetch_sub(1);
+        lazy_programs.erase(it);
+      }
+    }
+    size_t length = 0;
+    if (!callback && (count == 0 || devices) && count <= 8 && one_cpu_program(program) &&
+        !REAL(clGetProgramInfo)(program, CL_PROGRAM_SOURCE, 0, nullptr, &length) && length >= 2 &&
+        length <= (1 << 20)) {
+      std::string source(length, '\0');
+      const std::string text = options ? options : "";
+      if (!REAL(clGetProgramInfo)(program, CL_PROGRAM_SOURCE, length, source.data(), nullptr)) {
+        source.pop_back();
+        if (text.size() <= 4096 && shield_source_declines::contains(source, text)) {
+          LazyProgram lazy;
+          lazy.options = text;
+          if (count) lazy.devices.assign(devices, devices + count);
+          std::lock_guard lock(lazy_mutex);
+          lazy_programs[program] = std::move(lazy);
+          lazy_pending.fetch_add(1);
+          return CL_SUCCESS;
+        }
+      }
+    }
+  }
 #endif
   const auto build_start = StartupTiming::now();
   auto result = REAL(clBuildProgram)(program, count, devices, options, callback, data);
@@ -825,6 +985,7 @@ CL_API_ENTRY cl_program CL_API_CALL clLinkProgram(
         modules.clear();
     }
   } catch (...) { modules.clear(); }
+  for (cl_uint i = 0; inputs && i < input_count; ++i) lazy_build(inputs[i]);
   auto linked = REAL(clLinkProgram)(context, count, devices, options, input_count,
                                     inputs, callback, data, error);
   {
@@ -854,6 +1015,31 @@ CL_API_ENTRY cl_program CL_API_CALL clLinkProgram(
 CL_API_ENTRY cl_kernel CL_API_CALL clCreateKernel(cl_program p,
                                                   const char *name,
                                                   cl_int *error) {
+#ifdef SHIELD_SOURCE_DECLINES
+  if (lazy_enabled() && name && lazy_pending.load(std::memory_order_acquire)) {
+    std::lock_guard lock(lazy_mutex);
+    auto it = lazy_programs.find(p);
+    if (it != lazy_programs.end() && it->second.pending && !REAL(clRetainProgram)(p)) {
+      VirtualKernel *slots = virtual_kernels();
+      for (size_t i = 0; i < VIRTUAL_KERNELS; ++i)
+        if (!slots[i].references) {
+          slots[i].real.store(nullptr, std::memory_order_release);
+          slots[i].program = p;
+          slots[i].name = name;
+          slots[i].failed = false;
+          slots[i].references = 1;
+          virtual_kernels_used.store(true, std::memory_order_release);
+          if (error) *error = CL_SUCCESS;
+          return reinterpret_cast<cl_kernel>(&slots[i]);
+        }
+      REAL(clReleaseProgram)(p);  // no free handle: build after all
+    }
+  }
+  if (const cl_int built = lazy_build(p)) {
+    if (error) *error = built;
+    return nullptr;
+  }
+#endif
   auto kernel = REAL(clCreateKernel)(p, name, error);
   if (kernel) {
     Kernel state;
@@ -874,6 +1060,7 @@ CL_API_ENTRY cl_int CL_API_CALL clCreateKernelsInProgram(cl_program p,
                                                          cl_uint n,
                                                          cl_kernel *out,
                                                          cl_uint *count) {
+  if (const cl_int built = lazy_build(p)) return built;
   auto result = REAL(clCreateKernelsInProgram)(p, n, out, count);
   if (result || !out)
     return result;
@@ -902,6 +1089,7 @@ CL_API_ENTRY cl_int CL_API_CALL clCreateKernelsInProgram(cl_program p,
 CL_API_ENTRY cl_int CL_API_CALL clSetKernelArg(cl_kernel k, cl_uint index,
                                                size_t n, const void *value) {
   StartupTiming::Scope scope(startup_timing, 2);
+  if (is_virtual(k) && !(k = real_kernel(k))) return CL_INVALID_KERNEL;
   auto result = REAL(clSetKernelArg)(k, index, n, value);
   if (!result) {
     std::lock_guard lock(mutex);
@@ -996,6 +1184,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueSVMFree(
 CL_API_ENTRY cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
                                                         cl_uint index,
                                                         const void *pointer) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
   auto result = REAL(clSetKernelArgSVMPointer)(kernel, index, pointer);
   if (!result) {
     std::lock_guard lock(mutex);
@@ -1015,6 +1204,15 @@ CL_API_ENTRY cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
   return result;
 }
 CL_API_ENTRY cl_int CL_API_CALL clRetainKernel(cl_kernel k) {
+#ifdef SHIELD_SOURCE_DECLINES
+  if (is_virtual(k)) {
+    std::lock_guard lock(lazy_mutex);
+    auto *slot = reinterpret_cast<VirtualKernel *>(k);
+    if (!slot->references) return CL_INVALID_KERNEL;
+    ++slot->references;
+    return CL_SUCCESS;
+  }
+#endif
   auto r = REAL(clRetainKernel)(k);
   if (!r) {
     std::lock_guard lock(mutex);
@@ -1025,6 +1223,26 @@ CL_API_ENTRY cl_int CL_API_CALL clRetainKernel(cl_kernel k) {
   return r;
 }
 CL_API_ENTRY cl_int CL_API_CALL clReleaseKernel(cl_kernel k) {
+#ifdef SHIELD_SOURCE_DECLINES
+  if (is_virtual(k)) {
+    cl_kernel made = nullptr;
+    cl_program program = nullptr;
+    {
+      std::lock_guard lock(lazy_mutex);
+      auto *slot = reinterpret_cast<VirtualKernel *>(k);
+      if (!slot->references) return CL_INVALID_KERNEL;
+      if (--slot->references) return CL_SUCCESS;
+      made = slot->real.exchange(nullptr);
+      program = slot->program;
+      slot->program = nullptr;
+      slot->name.clear();
+    }
+    // The handle's own reference to the kernel it stood for, and to the program.
+    if (made) clReleaseKernel(made);
+    if (program) clReleaseProgram(program);
+    return CL_SUCCESS;
+  }
+#endif
   {
     std::lock_guard lock(mutex);
     auto it = kernels.find(k);
@@ -1035,6 +1253,7 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseKernel(cl_kernel k) {
   return REAL(clReleaseKernel)(k);
 }
 CL_API_ENTRY cl_kernel CL_API_CALL clCloneKernel(cl_kernel k, cl_int *error) {
+  if (is_virtual(k) && !(k = real_kernel(k, error))) return nullptr;
   auto clone = REAL(clCloneKernel)(k, error);
   if (clone) {
     std::lock_guard lock(mutex);
@@ -1054,6 +1273,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
   // storage, so the per-launch copy allocates nothing.
   static thread_local Kernel state;
   bool q8_kernel = false, q8_mv = false;
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
   {
     std::lock_guard lock(mutex);
     auto it = kernels.find(kernel);
@@ -1567,9 +1787,56 @@ CL_API_ENTRY void *CL_API_CALL clGetExtensionFunctionAddress(const char *name) {
 }
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueTask(cl_command_queue q, cl_kernel kernel, cl_uint count,
                                               const cl_event *wait, cl_event *event) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
   q8_kernel_may_write(kernel);
   return REAL(clEnqueueTask)(q, kernel, count, wait, event);
 }
+#ifdef SHIELD_SOURCE_DECLINES
+// Every other call that takes a kernel or asks about a build: a handle of this
+// library is exchanged for its kernel first, and a deferred build happens.
+CL_API_ENTRY cl_int CL_API_CALL clGetKernelInfo(cl_kernel kernel, cl_kernel_info name, size_t size, void *value,
+                                                size_t *returned) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
+  return REAL(clGetKernelInfo)(kernel, name, size, value, returned);
+}
+CL_API_ENTRY cl_int CL_API_CALL clGetKernelArgInfo(cl_kernel kernel, cl_uint index, cl_kernel_arg_info name,
+                                                   size_t size, void *value, size_t *returned) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
+  return REAL(clGetKernelArgInfo)(kernel, index, name, size, value, returned);
+}
+CL_API_ENTRY cl_int CL_API_CALL clGetKernelWorkGroupInfo(cl_kernel kernel, cl_device_id device,
+                                                         cl_kernel_work_group_info name, size_t size, void *value,
+                                                         size_t *returned) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
+  return REAL(clGetKernelWorkGroupInfo)(kernel, device, name, size, value, returned);
+}
+CL_API_ENTRY cl_int CL_API_CALL clGetKernelSubGroupInfo(cl_kernel kernel, cl_device_id device,
+                                                        cl_kernel_sub_group_info name, size_t input_size,
+                                                        const void *input, size_t size, void *value,
+                                                        size_t *returned) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
+  return REAL(clGetKernelSubGroupInfo)(kernel, device, name, input_size, input, size, value, returned);
+}
+CL_API_ENTRY cl_int CL_API_CALL clSetKernelExecInfo(cl_kernel kernel, cl_kernel_exec_info name, size_t size,
+                                                    const void *value) {
+  if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
+  return REAL(clSetKernelExecInfo)(kernel, name, size, value);
+}
+CL_API_ENTRY cl_int CL_API_CALL clGetProgramBuildInfo(cl_program program, cl_device_id device,
+                                                      cl_program_build_info name, size_t size, void *value,
+                                                      size_t *returned) {
+  lazy_build(program);
+  return REAL(clGetProgramBuildInfo)(program, device, name, size, value, returned);
+}
+CL_API_ENTRY cl_int CL_API_CALL clGetProgramInfo(cl_program program, cl_program_info name, size_t size, void *value,
+                                                 size_t *returned) {
+  // What a program is built from can be read without building it.
+  if (name != CL_PROGRAM_SOURCE && name != CL_PROGRAM_CONTEXT && name != CL_PROGRAM_NUM_DEVICES &&
+      name != CL_PROGRAM_DEVICES && name != CL_PROGRAM_REFERENCE_COUNT && name != CL_PROGRAM_IL)
+    lazy_build(program);
+  return REAL(clGetProgramInfo)(program, name, size, value, returned);
+}
+#endif
 CL_API_ENTRY void *CL_API_CALL clGetExtensionFunctionAddressForPlatform(
     cl_platform_id platform, const char *name) {
   // Extension entry points (command buffers, for one) enqueue work this
