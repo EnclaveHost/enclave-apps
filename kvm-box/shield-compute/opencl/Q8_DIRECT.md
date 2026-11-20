@@ -334,11 +334,19 @@ split of the work, not a faster route.
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
-- EyesOff's production model itself (27B Q4_K_M) has not been run. The K-quant
-  path was measured on one 3B model. There is no kernel fixture, identity test
-  or failure-injection test for K-quant launches; the Q8 ones pass unchanged,
-  and the evidence for K-quants is the recogniser and admission tests plus the
-  end-to-end run whose text and exchange counts equal the native engine's.
+- EyesOff's production model itself has not been run on this route. Its file
+  (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, with the calibration EyesOff uses) is not a
+  plain Q4_K_M: of its 410 tensors large enough to offload, 191 are Q5_K, 70
+  IQ4_XS, 69 Q4_K, 56 Q6_K, 14 Q8_0 and 10 other types. The route lowers Q4_K,
+  Q6_K and Q8_0, about a third of them. The OpenCL backend has Q5_K kernels
+  (five weight buffers) that could be lowered the same way. It has no IQ4_XS
+  kernel at all, so those products could only stay on the CPU, where the
+  native engine offloads them.
+- The K-quant path was measured on one 3B model. There is no kernel fixture,
+  identity test or failure-injection test for K-quant launches; the Q8 ones
+  pass unchanged, and the evidence for K-quants is the recogniser and
+  admission tests plus the end-to-end run whose text and exchange counts equal
+  the native engine's.
 - The Q6_K local product has only been exercised by that run (one tensor).
 - The continuation is learned only for a pair gated with `swiglu` and only if
   the executor's ggml produces the same bytes as the application's. It did for
