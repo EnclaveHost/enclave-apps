@@ -41,6 +41,9 @@
 #ifdef SHIELD_Q8_MASKED
 #include <bit>
 #include <cmath>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <sys/mman.h>
 #include <sys/uio.h>
 #endif

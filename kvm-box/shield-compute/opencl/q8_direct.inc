@@ -28,6 +28,13 @@ struct Q8Identity {
   // Slot opened for this tensor in the session with this serial number.
   mutable uint64_t session_serial = 0;
   mutable uint32_t slot = 0;
+  // A private copy of the weights for local computation, made the first time
+  // a launch with them cannot be offloaded. Used only under q8_direct_mutex.
+  mutable std::shared_ptr<const struct Q8Local> local;
+  mutable bool local_unavailable = false;
+  // Batch widths (bit m) the executor declined for this tensor. Its answer
+  // depends only on the tensor and the width, so it is not asked again.
+  mutable uint64_t declined = 0;
 };
 struct Q8Region {
   cl_mem root;
@@ -140,6 +147,116 @@ bool q8_all_finite(const unsigned char *bytes, size_t count) {
     largest = std::max(largest, bits & 0x7fffffffu);
   }
   return largest < 0x7f800000u;
+}
+
+// Local computation of a Q8 product that cannot be offloaded: weights this
+// process has not shown to be an approved public tensor, or an approved tensor
+// the backend has no calibrated site for. The original kernel computes
+//   y[r][j] = sum over 32-wide blocks b of scale[j][b] * sum_i code[j][b][i] * x[r][b][i]
+// on the CPU runtime's device, where it is slow (one thread under the inline
+// driver, emulated half arithmetic). This computes the same sums in float32
+// from a private copy of the weights. The order of additions differs from the
+// kernel's sub-group reduction, so results can differ in the last bits, as
+// they do between any two float implementations. SHIELD_OPENCL_Q8_LOCAL=0
+// keeps the original kernel.
+std::atomic<size_t> q8_local_bytes{0};
+struct Q8Local {
+  size_t k = 0, n = 0, charged = 0;
+  std::vector<int8_t> codes;   // n rows of k
+  std::vector<float> scales;   // n rows of k/32
+  ~Q8Local() { q8_local_bytes -= charged; }
+};
+constexpr size_t Q8_LOCAL_LIMIT = 1024u << 20;
+bool q8_local_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_LOCAL");
+    return !value || std::strcmp(value, "0");
+  }();
+  return enabled;
+}
+float q8_half_to_float(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000) << 16, exponent = (h >> 10) & 31, fraction = h & 1023;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (!fraction) bits = sign;
+    else {
+      int shift = 0;
+      uint32_t f = fraction;
+      while (!(f & 1024)) { f <<= 1; ++shift; }
+      bits = sign | ((113 - shift) << 23) | ((f & 1023) << 13);
+    }
+  } else if (exponent == 31) bits = sign | 0x7f800000u | (fraction << 13);
+  else bits = sign | ((exponent + 112) << 23) | (fraction << 13);
+  float value;
+  std::memcpy(&value, &bits, 4);
+  return value;
+}
+void q8_local_rows_scalar(const Q8Local &w, const float *x, float *y, size_t first, size_t last) {
+  const size_t blocks = w.k / 32;
+  for (size_t j = first; j < last; ++j) {
+    const int8_t *codes = w.codes.data() + j * w.k;
+    const float *scales = w.scales.data() + j * blocks;
+    float total = 0;
+    for (size_t b = 0; b < blocks; ++b) {
+      float sum = 0;
+      for (size_t i = 0; i < 32; ++i) sum += float(codes[b * 32 + i]) * x[b * 32 + i];
+      total += sum * scales[b];
+    }
+    y[j] = total;
+  }
+}
+#if defined(__x86_64__)
+__attribute__((target("avx2")))
+void q8_local_rows_avx2(const Q8Local &w, const float *x, float *y, size_t first, size_t last) {
+  const size_t blocks = w.k / 32;
+  for (size_t j = first; j < last; ++j) {
+    const int8_t *codes = w.codes.data() + j * w.k;
+    const float *scales = w.scales.data() + j * blocks;
+    __m256 total = _mm256_setzero_ps();
+    for (size_t b = 0; b < blocks; ++b) {
+      const int8_t *c = codes + b * 32;
+      const float *v = x + b * 32;
+      __m256 sum = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)c))),
+                                 _mm256_loadu_ps(v));
+      for (int part = 1; part < 4; ++part)
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(c + 8 * part)))),
+            _mm256_loadu_ps(v + 8 * part)));
+      total = _mm256_add_ps(total, _mm256_mul_ps(sum, _mm256_set1_ps(scales[b])));
+    }
+    __m128 half = _mm_add_ps(_mm256_castps256_ps128(total), _mm256_extractf128_ps(total, 1));
+    half = _mm_add_ps(half, _mm_movehl_ps(half, half));
+    half = _mm_add_ss(half, _mm_shuffle_ps(half, half, 1));
+    y[j] = _mm_cvtss_f32(half);
+  }
+}
+#endif
+void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
+  static const size_t threads = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_LOCAL_THREADS");
+    const size_t wanted = value ? std::strtoull(value, nullptr, 10) : 4;
+    return std::min<size_t>(std::max<size_t>(wanted, 1), 16);
+  }();
+#if defined(__x86_64__)
+  static const bool avx2 = __builtin_cpu_supports("avx2");
+#endif
+  const auto rows = [&](size_t r, size_t first, size_t last) {
+#if defined(__x86_64__)
+    if (avx2) return q8_local_rows_avx2(w, x + r * w.k, y + r * w.n, first, last);
+#endif
+    q8_local_rows_scalar(w, x + r * w.k, y + r * w.n, first, last);
+  };
+  // Small products are not worth starting threads for.
+  const size_t use = w.k * w.n * m < (4u << 20) ? 1 : threads;
+  for (size_t r = 0; r < m; ++r) {
+    if (use == 1) { rows(r, 0, w.n); continue; }
+    std::vector<std::thread> pool;
+    const size_t step = (w.n + use - 1) / use;
+    for (size_t t = 1; t < use; ++t)
+      if (t * step < w.n) pool.emplace_back(rows, r, t * step, std::min(w.n, (t + 1) * step));
+    rows(r, 0, std::min(w.n, step));
+    for (auto &thread : pool) thread.join();
+  }
 }
 
 // One session with the executor, shared by this process's launches.
@@ -515,6 +632,44 @@ cl_int q8_direct_result(const Q8DirectLaunch &launch, cl_int status) {
   return CL_SUCCESS;
 }
 
+// The product computed in this process. False: not available (disabled, the
+// weights could not be remembered, or the copy would exceed the limit); the
+// caller then runs the original kernel.
+bool q8_local(const Q8DirectLaunch &launch, const Q8Identity &identity, bool remembered,
+              const std::vector<unsigned char> &input, std::vector<unsigned char> &output) {
+  if (!q8_local_enabled() || !remembered || identity.local_unavailable) return false;
+  if (!identity.local) {
+    const size_t bytes = launch.read_bytes[0] + launch.read_bytes[1] * 2;
+    if (q8_local_bytes.load() + bytes > Q8_LOCAL_LIMIT) return false;
+    try {
+      auto local = std::make_shared<Q8Local>();
+      local->k = launch.k;
+      local->n = launch.n;
+      local->codes.resize(launch.read_bytes[0]);
+      std::vector<uint16_t> halves(launch.read_bytes[1] / 2);
+      if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[0], CL_TRUE, 0, launch.read_bytes[0],
+                                    local->codes.data(), 0, nullptr, nullptr) ||
+          REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[1], CL_TRUE, 0, launch.read_bytes[1],
+                                    halves.data(), 0, nullptr, nullptr)) {
+        identity.local_unavailable = true;
+        return false;
+      }
+      local->scales.resize(halves.size());
+      for (size_t i = 0; i < halves.size(); ++i) local->scales[i] = q8_half_to_float(halves[i]);
+      q8_local_bytes += bytes;
+      local->charged = bytes;
+      identity.local = std::move(local);
+    } catch (...) {
+      identity.local_unavailable = true;
+      return false;
+    }
+  }
+  output.resize(launch.output_bytes);
+  q8_local_product(*identity.local, reinterpret_cast<const float *>(input.data()),
+                   reinterpret_cast<float *>(output.data()), launch.m);
+  return true;
+}
+
 // nullopt: not taken, the caller continues with CPU execution of the original
 // kernel. Any other value is the launch's result; after a chunk has been sent,
 // failures are reported and never retried on another route.
@@ -577,16 +732,15 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       if (!REAL(clRetainMemObject)(scales.root)) {
         q8_known.push_back({codes, scales, launch.k, launch.n, identity});
         q8_known_count.store(q8_known.size(), std::memory_order_release);
+        known = true;
       } else {
         REAL(clReleaseMemObject)(codes.root);
       }
     }
   }
-  if (!identity->approved) return std::nullopt;
   const Q8Identity &weights = *identity;
   constexpr size_t maximum = 2u << 20;
   const size_t rows = std::min({size_t(32), maximum / (launch.k * 4), maximum / (launch.n * 4)});
-  if (!rows) return std::nullopt;
 
   static thread_local std::vector<unsigned char> input, output;
   stage = Q8Timing::now();
@@ -597,17 +751,21 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   q8_timing.add(Q8Timing::Snapshot, stage);
   stage = Q8Timing::now();
   const unsigned char *product = nullptr;
+  // Not offloaded: weights that are not an approved tensor, a shape the
+  // protocol cannot carry, or a width the executor has already declined.
+  const uint64_t width = launch.m < 64 ? uint64_t(1) << launch.m : 0;
+  bool local = !weights.approved || !rows || (weights.declined & width);
   try {
-    if (launch.m <= rows) {
+    if (!local && launch.m <= rows) {
       const auto shared = q8_exchange_shared(weights, launch.k, launch.n, launch.m, input);
       if (shared) {
-        if (!*shared) return std::nullopt;
-        product = *shared;
+        if (*shared) product = *shared;
+        else local = true;
       }
-    } else {
+    } else if (!local) {
       q8_session.last_valid = q8_session.ready_valid = false;
     }
-    if (!product) {
+    if (!product && !local) {
       output.resize(launch.output_bytes);
       for (size_t first = 0; first < launch.m; first += rows) {
         const size_t count = std::min(rows, launch.m - first);
@@ -615,10 +773,20 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
                          output.data() + first * launch.n * 4)) {
           // Only a decline of the first chunk can select CPU.
           if (first) return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
-          return std::nullopt;
+          local = true;
+          break;
         }
       }
+      if (!local) product = output.data();
+    }
+    if (local) {
+      // Computed here if possible, otherwise by the original kernel.
+      if (weights.approved && rows) weights.declined |= width;
+      q8_session.last_valid = q8_session.ready_valid = false;
+      if (!q8_local(launch, weights, known, input, output)) return std::nullopt;
       product = output.data();
+      q8_timing.add(Q8Timing::Cpu, stage);
+      stage = Q8Timing::now();
     }
     if (!q8_all_finite(product, launch.output_bytes / 4)) throw std::runtime_error("Q8 nonfinite result");
   } catch (const std::exception &error) {
