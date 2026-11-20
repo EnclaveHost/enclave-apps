@@ -268,6 +268,51 @@ priority of the executor's pad thread (within noise).
 - The earlier Python suites (`test_q8_service`, `test_q8_finite`,
   `test_service`, `test_service_admission`, `test_compiler`) pass.
 
+## Q4_K (first pass)
+
+EyesOff's model is a Q4_K_M file, so the route was extended to the two Q4_K
+kernels (`kernel_mul_mm_q4_k_f32_l4_lm`, `kernel_mul_mv_q4_K_f32_flat`). They
+take the Q8_0 kernels' arguments after four weight buffers (quants, 6-bit
+scales, `d`, `dmin`) instead of two, which is the GGUF block split apart.
+
+- The two sources are pinned in `q8-reference/` and recognised by the same
+  structural comparison as their own operation.
+- Launch admission covers both layouts in the Python reference and in C++; the
+  parity test compares them on more than six thousand changed launches.
+- The frontend remembers the four buffers as one tensor, tracks writes to any
+  of them, and authenticates the tensor by its GGUF digest recomputed from
+  them. Direct route only; a Q4_K launch that is not offloaded runs its own
+  kernel on the CPU runtime (there is no local product for it).
+- Executor sessions accept approved Q4_K tensors whose rows are whole
+  256-weight blocks.
+- `llama-shield-cpu-fallback.patch` now lets Q4_K products reach the OpenCL
+  device. The plugin has to be rebuilt with it, and the packaged table of
+  sources with nothing to lower has to be regenerated without the two Q4_K
+  sources. Both were done by hand outside this repository for the
+  measurements below; no image contains them.
+
+Qwen2.5-3B Q4_K_M (217 Q4_K tensors, 37 Q6_K, calibrated with
+`shielded-calib`), same harness and worker as above, tokens per second:
+
+| Processors, refill threads, tokens | Native Shield | OpenCL route | Ratio |
+| --- | ---: | ---: | ---: |
+| 2, 1, 148 | 20.6 | 21.4 | 104% |
+| 2, 1, 440 | 18.3 | 19.5 | 107% |
+| 8, 1, 148 | 21.1 | 23.7 | 112% |
+| 8, 4, 148 | 58.0 | 29.8 | 51% |
+
+A whole 148-token run takes 23.1 s against 26.3 s on two processors.
+
+These numbers do not show parity, in either direction. The OpenCL route leaves
+the model's Q6_K tensors (half of the feed-forward down projections, the value
+projections and the output layer) on the CPU, where the native engine offloads
+them. With one refill thread both paths wait for pads, and needing fewer pads
+puts the OpenCL route ahead; with pads plentiful the CPU products are the
+bottleneck and it is half as fast. The generated text is the native engine's
+for the first 24 tokens and differs later, because those tensors are computed
+with different arithmetic. Lowering the Q6_K kernels is the next step; the
+Q6_K matrix kernel has the Q4_K argument layout, the vector kernel has its own.
+
 ## What is not established
 
 - Nothing here ran in a measured image or a confidential VM, on NucBox, or
@@ -280,16 +325,10 @@ priority of the executor's pad thread (within noise).
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
-- EyesOff's production model is a 27B Q4_K GGUF. This route cannot run it yet:
-  only the two Q8_0 kernels are lowered. An earlier version of this file said
-  llama's OpenCL backend has no K-quant kernels; that was wrong. The packaged
-  backend has `kernel_mul_mm_q4_k_f32_l4_lm`, `kernel_mul_mv_q4_K_f32_flat`
-  and the Q6_K pair. The flat Q4_K layout is the GGUF block split into four
-  buffers (quants, scales, `d`, `dmin`), so a tensor's policy digest can be
-  recomputed from them. Lowering those kernels needs new source recognition,
-  launch admission, a four-buffer identity, K-quant tensors in the executor
-  and the policy tool, and a local product for declined tensors. None of
-  that exists.
+- EyesOff's production model itself (27B Q4_K_M) has not been run. The Q4_K
+  path above was measured on a 3B model only, with Q6_K tensors left on the CPU.
+  There is no fixture, identity test or failure-injection test for Q4_K
+  launches; the Q8 ones pass unchanged.
 - The continuation is learned only for a pair gated with `swiglu` and only if
   the executor's ggml produces the same bytes as the application's. It did for
   the packaged llama; another build, or another activation function, simply
