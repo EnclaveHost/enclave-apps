@@ -280,10 +280,16 @@ priority of the executor's pad thread (within noise).
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
-- EyesOff's production model is a 27B Q4_K GGUF. This route cannot run it: only
-  the Q8_0 kernels are lowered, and llama's OpenCL backend has no K-quant
-  kernels to lower. A comparison with EyesOff itself needs a Q4_0 or Q8_0 file
-  of a larger model and, for Q4_0, new kernel recognition and admission.
+- EyesOff's production model is a 27B Q4_K GGUF. This route cannot run it yet:
+  only the two Q8_0 kernels are lowered. An earlier version of this file said
+  llama's OpenCL backend has no K-quant kernels; that was wrong. The packaged
+  backend has `kernel_mul_mm_q4_k_f32_l4_lm`, `kernel_mul_mv_q4_K_f32_flat`
+  and the Q6_K pair. The flat Q4_K layout is the GGUF block split into four
+  buffers (quants, scales, `d`, `dmin`), so a tensor's policy digest can be
+  recomputed from them. Lowering those kernels needs new source recognition,
+  launch admission, a four-buffer identity, K-quant tensors in the executor
+  and the policy tool, and a local product for declined tensors. None of
+  that exists.
 - The continuation is learned only for a pair gated with `swiglu` and only if
   the executor's ggml produces the same bytes as the application's. It did for
   the packaged llama; another build, or another activation function, simply
