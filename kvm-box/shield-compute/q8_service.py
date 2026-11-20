@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import select
 import signal
+import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -23,6 +25,10 @@ MAX_BYTES = 2 << 20
 MAX_EXECUTOR_REQUESTS = 100000
 MAX_WEIGHT_BYTES = 512 << 20
 STATS = ('offloaded', 'local', 'graph_macs', 'exchanges', 'macs', 'verification_failures')
+# Executor totals on the control socket: offloaded, local, graph_macs,
+# verification failures, verified exchanges, their MACs, completed products.
+TOTALS = struct.Struct('<7Q')
+CONTROL_TIMEOUT = 120
 
 
 class Q8ExecutionError(RuntimeError):
@@ -80,14 +86,63 @@ class Q8Broker:
                 raise ValueError('Q8 policy tensor limit')
             self.policies[engine] = {x['name']: x for x in entries}
         self.process = None
+        self.control = None
         self.directory = None
         self.engine = None
         self.retired = False
         self.requests = 0
+        # (verified exchanges, MACs, completed products) already reported for
+        # this executor process, and those not yet collected from earlier ones.
+        self.accounted = [0, 0, 0]
+        self.pending = [0, 0, 0]
+        self.attached = False  # this executor process has been given a session
+        self.warmed = False    # this executor process was asked to prepare
+        self.last_engine = next(iter(config['models']))
+
+    def _note(self, totals):
+        current = [totals[4], totals[5], totals[6]]
+        if totals[3] or any(a < b for a, b in zip(current, self.accounted)):
+            raise Q8ExecutionError('executor accounting')
+        for i in range(3):
+            self.pending[i] += current[i]-self.accounted[i]
+        self.accounted = current
+
+    def _control(self, command, fds=()):
+        # One datagram each way. 'F' is the executor's final totals: it sends
+        # them when asked to drain and when it reaches its own request cap.
+        self.control.settimeout(CONTROL_TIMEOUT)
+        try:
+            if fds:
+                socket.send_fds(self.control, [command], fds)
+            else:
+                self.control.send(command)
+            reply = self.control.recv(1+TOTALS.size)
+        except OSError:
+            reply = b''
+        if reply[:1] in (b's', b'F') and len(reply) == 1+TOTALS.size:
+            self._note(TOTALS.unpack(reply[1:]))
+        return reply[:1]
 
     def close(self):
+        # Ask a live executor to finish what it is doing and say goodbye to its
+        # sessions, so a client between requests can tell a planned stop from a
+        # failure. Only an executor that does not answer is killed.
         process, self.process = self.process, None
+        control, self.control = self.control, None
         if process:
+            if process.poll() is None and control is not None and not self.retired and (self.attached or self.warmed):
+                self.control = control
+                try:
+                    drained = self._control(b'D') == b'F'
+                except Q8ExecutionError:
+                    drained = False
+                    self.retired = True
+                self.control = None
+                if drained:
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
             if process.poll() is None:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -96,6 +151,10 @@ class Q8Broker:
             process.wait()
             process.stdin.close()
             process.stdout.close()
+        if control is not None:
+            control.close()
+        self.attached = self.warmed = False
+        self.accounted = [0, 0, 0]
         if self.directory:
             self.directory.cleanup()
             self.directory = None
@@ -106,16 +165,40 @@ class Q8Broker:
         if self.process and self.requests >= MAX_EXECUTOR_REQUESTS:
             self.close()
         if self.process and self.engine == engine:
-            if self.process.poll() is not None:
+            code = self.process.poll()
+            if code is None:
+                return
+            if code != 0:
                 raise Q8ExecutionError('executor exited')
-            return
+            # A clean exit is the executor's own planned stop; its final
+            # totals are waiting on the control socket.
+            try:
+                self.control.settimeout(0)
+                reply = self.control.recv(1+TOTALS.size)
+                if reply[:1] == b'F' and len(reply) == 1+TOTALS.size:
+                    self._note(TOTALS.unpack(reply[1:]))
+            except OSError:
+                pass
         self.close()
         self.directory = tempfile.TemporaryDirectory(dir=self.config['jobs'])
         spec = self.config['models'][engine]
         env = self.environment(spec, True, self.directory.name, engine)
-        self.process = subprocess.Popen([self.config['sdk']+'/bin/shield-q8-executor', spec['model']],
-            env=env, cwd=self.directory.name, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0)
+        self.control, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        # The executor's diagnostics are fixed reasons, counters and public
+        # tensor names. They are discarded unless the service itself was
+        # started with a log path; a client cannot set this.
+        log_path = os.environ.get('SHIELD_Q8_EXECUTOR_LOG')
+        log = open(log_path, 'ab') if log_path else None
+        try:
+            self.process = subprocess.Popen([self.config['sdk']+'/bin/shield-q8-executor', spec['model'],
+                '--control-fd', str(theirs.fileno())],
+                env=env, cwd=self.directory.name, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=log or subprocess.DEVNULL, start_new_session=True, bufsize=0,
+                pass_fds=(theirs.fileno(),))
+        finally:
+            theirs.close()
+            if log:
+                log.close()
         os.set_blocking(self.process.stdin.fileno(), False)
         os.set_blocking(self.process.stdout.fileno(), False)
         self.engine = engine
@@ -145,6 +228,55 @@ class Q8Broker:
             else:
                 offset += chunk
         return bytes(output) if reading else None
+
+    def attach(self, engine, client):
+        """Hand a credential-checked client socket to the engine's executor.
+
+        False means the executor has no free session; nothing has started.
+        """
+        if self.retired:
+            raise Q8ExecutionError('Q8 executor retired')
+        try:
+            self._start(engine)
+            reply = self._control(b'A', [client.fileno()])
+        except Q8ExecutionError:
+            self.retired = True
+            raise
+        if reply == b'a':
+            self.attached = True
+            self.last_engine = engine
+            return True
+        if reply == b'n':
+            return False
+        self.retired = True
+        raise Q8ExecutionError('executor refused a session')
+
+    def warm(self, engine):
+        """Start the engine's executor and let it register its tensors now.
+
+        Nothing is computed. The executor answers its next control message
+        when it is done, so a session attached meanwhile simply waits.
+        """
+        if self.retired:
+            return
+        try:
+            self._start(engine)
+            if not self.warmed:
+                self.control.send(b'P')
+                self.warmed = True
+        except (Q8ExecutionError, OSError):
+            self.retired = True
+
+    def collect(self):
+        """Verified work completed since the last call, as (exchanges, MACs, products)."""
+        if self.process and not self.retired:
+            if self.process.poll() is None:
+                if self._control(b'S') not in (b's', b'F') and self.process.poll() not in (None, 0):
+                    self.retired = True
+            elif self.process.returncode != 0:
+                self.retired = True
+        pending, self.pending = self.pending, [0, 0, 0]
+        return pending
 
     def execute(self, request):
         if self.retired:
@@ -194,6 +326,10 @@ class Q8Broker:
             if not finite_f32(output):
                 raise Q8ExecutionError('non-finite executor output')
             self.requests += 1
+            # Already reported to the caller; keep it out of collect().
+            self.accounted[0] += stats['exchanges']
+            self.accounted[1] += stats['macs']
+            self.accounted[2] += 1
             spec = self.config['models'][engine]
             return {'ok': True, 'supported': True, 'output': base64.b64encode(output).decode('ascii'),
                     'stats': stats, 'arithmetic': ARITHMETIC, 'modelSha256': spec['modelSha256'],

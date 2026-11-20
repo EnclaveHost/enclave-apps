@@ -92,10 +92,16 @@ def main():
         path = out / 'overlay/usr/local/bin' / name
         path.parent.mkdir(parents=True, exist_ok=True)
         extra = ' --no-kv-offload' if name == 'llama-cli' else ''
+        # With the native CPU fallback, llama leaves only buffer transfers and
+        # the Q8 launches on the OpenCL device. The CPU runtime's inline driver
+        # does those without a hand-off to a worker thread per command. sd.cpp
+        # still runs real kernels there and keeps the threaded driver.
+        driver = 'export POCL_DEVICES="${POCL_DEVICES:-basic}"\n' if name == 'llama-cli' else ''
         path.write_text('#!/bin/sh\nset -eu\n'
                         'export GGML_SHIELD_NATIVE_CPU_FALLBACK=1\n'
                         'export POCL_MAX_PTHREAD_COUNT="${POCL_MAX_PTHREAD_COUNT:-2}"\n'
                         'export POCL_CPU_MAX_CU_COUNT="${POCL_CPU_MAX_CU_COUNT:-2}"\n'
+                        + driver +
                         f'exec /opt/shield/apps/bin/{name}{extra} "$@"\n')
         path.chmod(0o755)
     # The measured service is the only process that can authorize actual GPU work.

@@ -1905,3 +1905,36 @@ removed all test resources without changing the four production VMs. See
 `../shield-graphics/qualification/native-v9-manager-checkpoint.json` and the
 corresponding CTS section. Production activation and final provisioned compute,
 graphics and Moonlight acceptance remain incomplete.
+
+## Direct Q8 route for the standard OpenCL path (2026-11-19, host tests)
+
+Development branch `kvm-box/shield-opencl-perf`; not built into a measured
+image and not deployed. The standard OpenCL path was correct but about fifty
+times slower than the native engine on the same worker (2.1 against 102 tokens
+per second for the Qwen fixture). Per launch it re-read and re-hashed the
+weight tensor, crossed the service's JSON and base64 framing, and started a
+helper process for each new launch layout; per run it registered tensors with
+the worker one at a time.
+
+The direct route remembers a weight region's identity until something could
+have written to it, gives the client a session with the executor (binary
+frames, sealed shared memory for payloads), validates launches in C++, registers
+all approved tensors in one start, runs the launch inside the enqueue call and
+asks for a gate/up pair in one request. Design, boundary reasoning and limits
+are in [opencl/Q8_DIRECT.md](opencl/Q8_DIRECT.md).
+
+Host-container medians against the dedicated RTX worker, default service
+settings: generation 104 against 114 tokens per second native with four CPUs
+(92%) and 76 against 84 under a two-CPU quota (91%); prompt processing 346
+against 129; the acceptance prompt in 5.3 s. Stable Diffusion's PNG, exchange
+and MAC counts are unchanged, and generated text is byte-identical to the
+queued route. Fault, identity-invalidation, session-protocol and admission-parity
+tests pass; the earlier Python suites pass.
+
+This does not check any acceptance item. It is one small model in a host
+container: no measured image, no confidential VM, no NucBox run, no larger
+model, no independent review. With two refill threads the native path is still
+ahead (about 180 against 133 tokens per second). The llama acceptance count is
+now 487 for a cold service as well as a warm one, because tensors are registered
+together; the fixed 511 in the acceptance harness needs to follow.
+

@@ -1,0 +1,646 @@
+// Direct Q8 route. Included inside the frontend namespace with SHIELD_Q8_MASKED.
+//
+// The queued route in q8_capture.inc snapshots and re-hashes a weight tensor for
+// every launch and sends each activation through the service's JSON framing.
+// This route keeps the same decisions and moves the cost off the per-launch path:
+//
+//  * A weight region is authenticated once and remembered until something could
+//    have written to it. Every API that can write a buffer drops the overlapping
+//    entries (q8_written and its callers in shield_opencl.cpp); a later launch
+//    then hashes the bytes again. The remembered answer only says which public
+//    tensor the application means. The service computes with its own
+//    authenticated copy of that tensor, so a missed write could give the
+//    application a product for the original weights, never disclose anything.
+//  * Activations go to the measured executor over one long-lived session socket
+//    (see native/q8_executor.cpp), which the service hands over after checking
+//    this process's credentials.
+//  * The launch runs inside clEnqueueNDRangeKernel: prior commands on the queue
+//    are finished first, and the output is in place when the call returns.
+//
+// It applies to in-order, non-profiling queues and launches without a wait list.
+// Everything else keeps the queued route. SHIELD_OPENCL_Q8_DIRECT=0 disables it.
+
+std::mutex q8_cache_mutex;
+// Which approved public tensor a weight region holds, if any.
+struct Q8Identity {
+  bool approved = false;
+  std::string engine, tensor, sha256;
+  // Slot opened for this tensor in the session with this serial number.
+  mutable uint64_t session_serial = 0;
+  mutable uint32_t slot = 0;
+};
+struct Q8Region {
+  cl_mem root;
+  size_t offset, size;
+  bool overlaps(const Q8Region &other) const {
+    return root == other.root && offset < other.offset + other.size && other.offset < offset + size;
+  }
+};
+struct Q8Known {
+  Q8Region codes, scales;
+  size_t k, n;
+  std::shared_ptr<const Q8Identity> identity;  // q8_authenticate's answer for these bytes
+};
+std::vector<Q8Known> q8_known;                 // each entry holds a reference on its roots
+std::map<cl_mem, Q8Region> q8_children;        // sub-buffers and buffer-backed images
+std::map<void *, cl_mem> q8_write_maps;        // host pointers mapped for writing
+std::atomic<bool> q8_untracked_writers{false}; // an API this file cannot follow is in use
+std::atomic<size_t> q8_known_count{0};
+
+bool q8_direct_shared_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_SHARED");
+    return !value || std::strcmp(value, "0");
+  }();
+  return enabled;
+}
+bool q8_direct_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_DIRECT");
+    return !value || std::strcmp(value, "0");
+  }();
+  return enabled;
+}
+
+// Caller holds q8_cache_mutex.
+Q8Region q8_resolve(cl_mem handle, size_t offset, size_t size, bool whole) {
+  auto it = q8_children.find(handle);
+  if (it == q8_children.end()) return {handle, whole ? 0 : offset, whole ? SIZE_MAX / 2 : size};
+  if (whole) return it->second;
+  return {it->second.root, it->second.offset + offset, std::min(size, it->second.size)};
+}
+void q8_forget_locked(const Q8Region &written) {
+  for (size_t i = 0; i < q8_known.size();) {
+    if (q8_known[i].codes.overlaps(written) || q8_known[i].scales.overlaps(written)) {
+      REAL(clReleaseMemObject)(q8_known[i].codes.root);
+      REAL(clReleaseMemObject)(q8_known[i].scales.root);
+      q8_known[i] = std::move(q8_known.back());
+      q8_known.pop_back();
+    } else {
+      ++i;
+    }
+  }
+  q8_known_count.store(q8_known.size(), std::memory_order_release);
+}
+// Something may write [offset, offset+size) of this buffer, sub-buffer or image.
+void q8_written(cl_mem handle, size_t offset, size_t size, bool whole) {
+  if (!handle || !q8_known_count.load(std::memory_order_acquire)) return;
+  std::lock_guard lock(q8_cache_mutex);
+  q8_forget_locked(q8_resolve(handle, offset, size, whole));
+}
+void q8_written_everything() {
+  if (!q8_known_count.load(std::memory_order_acquire)) return;
+  std::lock_guard lock(q8_cache_mutex);
+  for (auto &known : q8_known) {
+    REAL(clReleaseMemObject)(known.codes.root);
+    REAL(clReleaseMemObject)(known.scales.root);
+  }
+  q8_known.clear();
+  q8_known_count.store(0, std::memory_order_release);
+}
+// An ordinary kernel may write any buffer it was given. `only` restricts that
+// to one argument for the Q8 kernels, whose other buffers are read-only inputs.
+void q8_kernel_may_write(cl_kernel kernel, int only = -1) {
+  if (!q8_known_count.load(std::memory_order_acquire)) return;
+  std::vector<std::pair<cl_uint, cl_mem>> mems;
+  {
+    std::lock_guard lock(mutex);
+    auto it = kernels.find(kernel);
+    if (it == kernels.end()) return;
+    mems = it->second.mems;
+  }
+  std::lock_guard lock(q8_cache_mutex);
+  for (const auto &[index, handle] : mems)
+    if (handle && (only < 0 || index == cl_uint(only)))
+      q8_forget_locked(q8_resolve(handle, 0, 0, true));
+}
+void q8_child(cl_mem child, cl_mem parent, size_t offset, size_t size) {
+  if (!child || !parent) return;
+  std::lock_guard lock(q8_cache_mutex);
+  auto it = q8_children.find(parent);
+  if (it == q8_children.end()) q8_children[child] = {parent, offset, size};
+  else q8_children[child] = {it->second.root, it->second.offset + offset, std::min(size, it->second.size)};
+}
+
+// Every float32 is finite: no exponent field is all ones. Written as a
+// reduction over fixed blocks so the compiler vectorises it; a large product
+// (a vocabulary projection) is otherwise a visible share of a token.
+__attribute__((optimize("O3"), target_clones("avx2", "default")))
+bool q8_all_finite(const unsigned char *bytes, size_t count) {
+  uint32_t largest = 0;
+  size_t i = 0;
+  for (; i + 64 <= count; i += 64) {
+    uint32_t block[64];
+    std::memcpy(block, bytes + i * 4, sizeof(block));
+    for (unsigned j = 0; j < 64; ++j) largest = std::max(largest, block[j] & 0x7fffffffu);
+  }
+  for (; i < count; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, bytes + i * 4, 4);
+    largest = std::max(largest, bits & 0x7fffffffu);
+  }
+  return largest < 0x7f800000u;
+}
+
+// One session with the executor, shared by this process's launches.
+constexpr size_t Q8_SHARED_REGION = 2u << 20, Q8_SHARED_REGIONS = 3;
+constexpr uint32_t Q8_NO_PAIR = 0xffffffff;
+struct Q8Session {
+  int fd = -1;
+  uint64_t serial = 0;  // changes with every connection; slots belong to one
+  std::string engine;
+  std::map<std::string, uint32_t> slots;  // tensor name -> slot opened in this session
+  // Payload memory the executor created for this session: activation, product,
+  // and the product of a paired tensor. Null when it could not provide one.
+  unsigned char *shared = nullptr;
+  // Two tensors applied to the same activation one after the other (a
+  // feed-forward gate and up projection) can share a round trip: the second
+  // product is requested with the first and used only if the next launch asks
+  // for exactly that tensor with exactly the same activation bytes.
+  std::vector<uint32_t> pair_of;           // slot -> slot seen next with the same activation
+  std::vector<unsigned char> last_input;   // activation of the previous single-request launch
+  uint32_t last_slot = Q8_NO_PAIR;
+  size_t last_m = 0;
+  bool last_valid = false, ready_valid = false;
+  uint64_t requests = 0, paired = 0, served = 0, learned = 0, missed = 0;  // counts for the timing report
+  uint32_t ready_slot = Q8_NO_PAIR;        // paired product waiting in the third region
+  void reset() {
+    if (fd >= 0) close(fd);
+    fd = -1;
+    serial = 0;
+    if (shared) munmap(shared, Q8_SHARED_REGIONS * Q8_SHARED_REGION);
+    shared = nullptr;
+    slots.clear();
+    pair_of.clear();
+    last_valid = ready_valid = false;
+  }
+};
+std::mutex q8_direct_mutex;
+Q8Session q8_session;
+// A forked child must not write frames into its parent's session. It drops its
+// copies of the socket and mapping and opens a session of its own if it needs one.
+const int q8_fork_guard = pthread_atfork(nullptr, nullptr, [] {
+  if (q8_session.fd >= 0) close(q8_session.fd);
+  q8_session.fd = -1;
+  q8_session.reset();
+});
+struct Q8Frame {
+  uint32_t type, id, a, b;
+};
+constexpr uint32_t Q8_OPEN = 1, Q8_MATMUL = 2, Q8_SHARE = 3, Q8_MATMUL_SHARED = 4, Q8_BYE = 0xff;
+struct Q8Bye {};  // the executor stopped between requests; nothing was computed
+struct Q8SendFailed {};
+// After a failed send: whether the executor had already said goodbye. It
+// closes right after that frame, so a request written into the closing socket
+// was never read and may go to a new session.
+bool q8_said_goodbye(int fd) {
+  struct { uint32_t type, id, a, b; } frame{};
+  ssize_t received;
+  do received = recv(fd, &frame, sizeof(frame), MSG_DONTWAIT);
+  while (received < 0 && errno == EINTR);
+  return received == ssize_t(sizeof(frame)) && frame.type == 0xff;
+}
+
+void q8_send(int fd, const void *a, size_t an, const void *b = nullptr, size_t bn = 0) {
+  iovec parts[2] = {{const_cast<void *>(a), an}, {const_cast<void *>(b), bn}};
+  size_t first = 0;
+  while (first < 2) {
+    msghdr message{};
+    message.msg_iov = parts + first;
+    message.msg_iovlen = 2 - first;
+    ssize_t sent = sendmsg(fd, &message, MSG_NOSIGNAL);
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent <= 0) throw Q8SendFailed{};
+    while (first < 2 && size_t(sent) >= parts[first].iov_len) sent -= parts[first++].iov_len;
+    if (first < 2) {
+      parts[first].iov_base = static_cast<char *>(parts[first].iov_base) + sent;
+      parts[first].iov_len -= sent;
+    }
+  }
+}
+// A reply usually arrives within the time a blocked thread takes to wake, so
+// look for it briefly first. SHIELD_OPENCL_Q8_SPIN_US bounds that; 0 sleeps.
+uint64_t q8_spin_ns() {
+  static const uint64_t value = [] {
+    const char *text = std::getenv("SHIELD_OPENCL_Q8_SPIN_US");
+    return std::min<uint64_t>(text ? std::strtoull(text, nullptr, 10) : 0, 10000) * 1000;
+  }();
+  return value;
+}
+void q8_receive(int fd, void *out, size_t n, bool spin = false) {
+  auto *p = static_cast<char *>(out);
+  if (spin && q8_spin_ns()) {
+    const uint64_t until = Q8Timing::now() + q8_spin_ns();
+    do {
+      ssize_t r = recv(fd, p, n, MSG_DONTWAIT);
+      if (r > 0) { p += r; n -= r; break; }
+      if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        throw std::runtime_error("Shield session closed");
+      __builtin_ia32_pause();
+    } while (Q8Timing::now() < until);
+  }
+  while (n) {
+    ssize_t r = recv(fd, p, n, 0);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) throw std::runtime_error("Shield session closed");
+    p += r;
+    n -= r;
+  }
+}
+Q8Frame q8_reply(int fd, uint32_t expected, uint32_t id) {
+  Q8Frame frame{};
+  q8_receive(fd, &frame, sizeof(frame), true);
+  if (frame.type == Q8_BYE) throw Q8Bye{};
+  if (frame.type != expected || frame.id != id) throw std::runtime_error("Shield session reply");
+  return frame;
+}
+void q8_connect(const std::string &engine) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(20);
+  const auto request = json{{"op", "q8_session"}, {"engine", engine},
+                            {"arithmetic", "shield-fixed-point-v1"}}.dump();
+  for (;;) {
+    Fd socket_fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    if (socket_fd.value < 0) throw std::runtime_error("socket failed");
+    timeval timeout{1200, 0};
+    setsockopt(socket_fd.value, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socket_fd.value, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::strcpy(address.sun_path, "/run/shield/compute.sock");
+    bool busy = false;
+    if (connect(socket_fd.value, reinterpret_cast<sockaddr *>(&address), sizeof(address))) {
+      if (errno != EAGAIN) throw std::runtime_error("Shield service unavailable");
+      busy = true;
+    } else {
+      uint32_t size = htonl(request.size());
+      try {
+        q8_send(socket_fd.value, &size, sizeof(size), request.data(), request.size());
+      } catch (const Q8SendFailed &) {
+        throw std::runtime_error("Shield send failed");
+      }
+      q8_receive(socket_fd.value, &size, sizeof(size));
+      size = ntohl(size);
+      if (!size || size > 4096) throw std::runtime_error("response limit");
+      std::string response(size, '\0');
+      q8_receive(socket_fd.value, response.data(), size);
+      auto result = json::parse(response);
+      if (result.value("ok", false)) {
+        q8_session.reset();
+        static uint64_t next_serial = 0;
+        q8_session.serial = ++next_serial;
+        q8_session.fd = socket_fd.value;
+        socket_fd.value = -1;
+        q8_session.engine = engine;
+        // Ask for shared payload memory. Any refusal leaves payloads on the socket.
+        if (q8_direct_shared_enabled()) {
+          const Q8Frame share{Q8_SHARE, 0, 0, 0};
+          try {
+            q8_send(q8_session.fd, &share, sizeof(share));
+          } catch (const Q8SendFailed &) {
+            throw std::runtime_error("Shield session send failed");
+          }
+          Q8Frame reply{};
+          char control[CMSG_SPACE(sizeof(int))];
+          iovec part{&reply, sizeof(reply)};
+          msghdr message{};
+          message.msg_iov = &part;
+          message.msg_iovlen = 1;
+          message.msg_control = control;
+          message.msg_controllen = sizeof(control);
+          ssize_t received;
+          do received = recvmsg(q8_session.fd, &message, MSG_CMSG_CLOEXEC | MSG_WAITALL);
+          while (received < 0 && errno == EINTR);
+          int shared_fd = -1;
+          for (cmsghdr *c = CMSG_FIRSTHDR(&message); received > 0 && c; c = CMSG_NXTHDR(&message, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
+              std::memcpy(&shared_fd, CMSG_DATA(c), sizeof(int));
+          Fd holder(shared_fd);
+          if (received != ssize_t(sizeof(reply)) || reply.type != Q8_SHARE)
+            throw std::runtime_error("Shield session reply");
+          if (reply.a == 0 && reply.b == Q8_SHARED_REGION && shared_fd >= 0) {
+            void *base = mmap(nullptr, Q8_SHARED_REGIONS * Q8_SHARED_REGION, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0);
+            if (base != MAP_FAILED) q8_session.shared = static_cast<unsigned char *>(base);
+          }
+        }
+        return;
+      }
+      // Only admission contention is retryable, as for the queued route.
+      if (result.value("error", "") != "compute busy") throw std::runtime_error("Shield computation refused");
+      busy = true;
+    }
+    if (busy && std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("Shield computation refused");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+// Tell the service, once, that this process has opted into masked Q8 and is
+// still building its programs. The service can start its executor meanwhile.
+// A hint only: failures are ignored and nothing waits for it.
+void q8_warm_once() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const char *contract = std::getenv("SHIELD_OPENCL_ARITHMETIC");
+    if (!contract || std::strcmp(contract, "shield-fixed-point-v1") || !q8_direct_enabled()) return;
+    try {
+      std::thread([] {
+        try {
+          Fd socket_fd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+          if (socket_fd.value < 0) return;
+          timeval timeout{30, 0};
+          setsockopt(socket_fd.value, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+          setsockopt(socket_fd.value, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+          sockaddr_un address{};
+          address.sun_family = AF_UNIX;
+          std::strcpy(address.sun_path, "/run/shield/compute.sock");
+          if (connect(socket_fd.value, reinterpret_cast<sockaddr *>(&address), sizeof(address))) return;
+          const std::string request = R"({"op":"q8_warm","arithmetic":"shield-fixed-point-v1"})";
+          uint32_t size = htonl(request.size());
+          q8_send(socket_fd.value, &size, sizeof(size), request.data(), request.size());
+          char reply[256];
+          (void)!recv(socket_fd.value, reply, sizeof(reply), 0);
+        } catch (...) {
+        }
+      }).detach();
+    } catch (...) {
+    }
+  });
+}
+uint32_t q8_slot(const Q8Identity &weights, size_t k, size_t n) {
+  // Only launches holding q8_direct_mutex read or write the cached slot.
+  if (weights.session_serial == q8_session.serial) return weights.slot;
+  const auto remember = [&](uint32_t id) {
+    weights.session_serial = q8_session.serial;
+    weights.slot = id;
+    return id;
+  };
+  const auto &name = weights.tensor;
+  auto it = q8_session.slots.find(name);
+  if (it != q8_session.slots.end()) return remember(it->second);
+  const auto &digest = weights.sha256;
+  if (digest.size() != 64 || name.empty() || name.size() > 127 || q8_session.slots.size() >= 4096)
+    throw std::runtime_error("Q8 tensor reference");
+  const uint32_t id = q8_session.slots.size();
+  struct { Q8Frame frame; uint64_t k, n; char sha[64]; } open{{Q8_OPEN, id, uint32_t(name.size()), 0}, k, n, {}};
+  std::memcpy(open.sha, digest.data(), 64);
+  q8_send(q8_session.fd, &open, sizeof(open), name.data(), name.size());
+  if (q8_reply(q8_session.fd, Q8_OPEN, id).a != 0) throw std::runtime_error("Q8 tensor refused");
+  q8_session.slots.emplace(name, id);
+  return remember(id);
+}
+// One chunk. False means the executor declined it before computing anything.
+bool q8_exchange(const Q8Identity &weights, size_t k, size_t n, size_t m, const unsigned char *input,
+                 unsigned char *output) {
+  for (int attempt = 0;; ++attempt) {
+    try {
+      const auto &engine = weights.engine;
+      if (q8_session.fd < 0 || q8_session.engine != engine) q8_connect(engine);
+      const uint32_t id = q8_slot(weights, k, n);
+      const Q8Frame frame{Q8_MATMUL, id, uint32_t(m), 0};
+      q8_send(q8_session.fd, &frame, sizeof(frame), input, m * k * 4);
+      const Q8Frame reply = q8_reply(q8_session.fd, Q8_MATMUL, id);
+      uint64_t counters[2];
+      q8_receive(q8_session.fd, counters, sizeof(counters));
+      if (reply.a == 1) return false;
+      if (reply.a != 0) throw std::runtime_error("Q8 session status");
+      q8_receive(q8_session.fd, output, m * n * 4);
+      return true;
+    } catch (const Q8Bye &) {
+      // A planned stop (another job took the worker, or executor turnover).
+      // This request was not read, so it may be sent to a new session.
+      q8_session.reset();
+      if (attempt >= 8) throw std::runtime_error("Shield session unavailable");
+    } catch (const Q8SendFailed &) {
+      const bool goodbye = q8_said_goodbye(q8_session.fd);
+      q8_session.reset();
+      if (!goodbye || attempt >= 8) throw std::runtime_error("Shield session send failed");
+    } catch (...) {
+      q8_session.reset();
+      throw;
+    }
+  }
+}
+
+// A whole launch in one request through shared memory. Returns the product's
+// bytes (valid until the next request), or null if the executor declined it
+// before computing anything. nullopt: no shared memory, use q8_exchange.
+std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weights, size_t k, size_t n, size_t m,
+                                                        std::vector<unsigned char> &input) {
+  Q8Session &session = q8_session;
+  for (int attempt = 0;; ++attempt) {
+    try {
+      const auto &engine = weights.engine;
+      if (session.fd < 0 || session.engine != engine) q8_connect(engine);
+      if (!session.shared) return std::nullopt;
+      const uint32_t id = q8_slot(weights, k, n);
+      const bool same_input = session.last_valid && session.last_m == m &&
+                              session.last_input.size() == input.size() &&
+                              !std::memcmp(session.last_input.data(), input.data(), input.size());
+      if (session.ready_valid) {
+        session.ready_valid = false;
+        if (session.ready_slot == id && same_input) {
+          ++session.served;
+          return session.shared + 2 * Q8_SHARED_REGION;
+        }
+        ++session.missed;
+        // The expected launch did not follow; stop asking for that pair.
+        if (session.last_slot < session.pair_of.size()) session.pair_of[session.last_slot] = Q8_NO_PAIR;
+      } else if (same_input && session.last_slot != id) {
+        if (session.pair_of.size() <= session.last_slot) session.pair_of.resize(session.last_slot + 1, Q8_NO_PAIR);
+        session.pair_of[session.last_slot] = id;
+        ++session.learned;
+      }
+      const uint32_t pair = id < session.pair_of.size() ? session.pair_of[id] : Q8_NO_PAIR;
+      std::memcpy(session.shared, input.data(), input.size());
+      struct { Q8Frame frame; uint32_t pair, reserved; } request{{Q8_MATMUL_SHARED, id, uint32_t(m), 0}, pair, 0};
+      q8_send(session.fd, &request, sizeof(request));
+      const Q8Frame reply = q8_reply(session.fd, Q8_MATMUL_SHARED, id);
+      uint64_t counters[2];
+      q8_receive(session.fd, counters, sizeof(counters));
+      session.last_valid = false;
+      if (reply.a == 1) return nullptr;
+      if (reply.a != 0) throw std::runtime_error("Q8 session status");
+      session.last_slot = id;
+      session.last_m = m;
+      session.last_input.swap(input);
+      session.last_valid = true;
+      ++session.requests;
+      session.ready_valid = (reply.b & 1) && pair != Q8_NO_PAIR;
+      session.paired += session.ready_valid;
+      session.ready_slot = pair;
+      return session.shared + Q8_SHARED_REGION;
+    } catch (const Q8Bye &) {
+      session.reset();
+      if (attempt >= 8) throw std::runtime_error("Shield session unavailable");
+    } catch (const Q8SendFailed &) {
+      const bool goodbye = q8_said_goodbye(session.fd);
+      session.reset();
+      if (!goodbye || attempt >= 8) throw std::runtime_error("Shield session send failed");
+    } catch (...) {
+      session.reset();
+      throw;
+    }
+  }
+}
+
+struct Q8DirectLaunch {
+  cl_command_queue queue;
+  std::array<cl_mem, 4> buffers;       // codes, scales, activation, output
+  std::array<Storage, 4> storage;
+  std::array<size_t, 3> read_bytes;
+  size_t input_offset, output_offset, output_bytes, k, n, m;
+  cl_event *event;
+};
+
+// The launch's event, when the application asked for one. A failed launch is
+// reported the way the queued route reports it: the enqueue succeeds and its
+// event completes with an error. Without an event the error is returned.
+cl_int q8_direct_result(const Q8DirectLaunch &launch, cl_int status) {
+  if (!launch.event) return status;
+  cl_event done = nullptr;
+  if (status == CL_SUCCESS) {
+    if (REAL(clEnqueueMarkerWithWaitList)(launch.queue, 0, nullptr, &done)) return CL_OUT_OF_RESOURCES;
+  } else {
+    cl_context context = nullptr;
+    cl_int error = 0;
+    if (REAL(clGetCommandQueueInfo)(launch.queue, CL_QUEUE_CONTEXT, sizeof(context), &context, nullptr))
+      return status;
+    done = REAL(clCreateUserEvent)(context, &error);
+    if (!done) return status;
+    REAL(clSetUserEventStatus)(done, status);
+  }
+  {
+    std::lock_guard lock(mutex);
+    offload_events[done] = {1, nullptr};
+  }
+  *launch.event = done;
+  return CL_SUCCESS;
+}
+
+// nullopt: not taken, the caller continues with CPU execution of the original
+// kernel. Any other value is the launch's result; after a chunk has been sent,
+// failures are reported and never retried on another route.
+std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
+  std::lock_guard direct(q8_direct_mutex);
+  auto stage = Q8Timing::now();
+  // Results of earlier commands must be in the buffers before they are read.
+  if (REAL(clFinish)(launch.queue)) return std::nullopt;
+  q8_timing.add(Q8Timing::Wait, stage);
+
+  const Q8Region codes{launch.storage[0].root, launch.storage[0].offset, launch.read_bytes[0]};
+  const Q8Region scales{launch.storage[1].root, launch.storage[1].offset, launch.read_bytes[1]};
+  std::shared_ptr<const Q8Identity> identity;
+  bool known = false;
+  {
+    std::lock_guard lock(q8_cache_mutex);
+    for (const auto &entry : q8_known)
+      if (entry.codes.root == codes.root && entry.codes.offset == codes.offset &&
+          entry.codes.size == codes.size && entry.scales.root == scales.root &&
+          entry.scales.offset == scales.offset && entry.scales.size == scales.size &&
+          entry.k == launch.k && entry.n == launch.n) {
+        identity = entry.identity;
+        known = true;
+        break;
+      }
+  }
+  if (!known) {
+    stage = Q8Timing::now();
+    std::array<std::vector<unsigned char>, 2> bytes;
+    for (size_t i = 0; i < 2; ++i) {
+      bytes[i].resize(launch.read_bytes[i]);
+      if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i],
+                                    bytes[i].data(), 0, nullptr, nullptr))
+        return std::nullopt;
+    }
+    q8_timing.add(Q8Timing::Snapshot, stage);
+    stage = Q8Timing::now();
+    try {
+      const json answer = q8_authenticate(bytes[0], bytes[1], launch.k, launch.n);
+      auto fresh = std::make_shared<Q8Identity>();
+      fresh->approved = answer.at("approved").get<bool>();
+      if (fresh->approved) {
+        fresh->engine = answer.at("engine").get<std::string>();
+        fresh->tensor = answer.at("tensor").get<std::string>();
+        fresh->sha256 = answer.at("sha256").get<std::string>();
+      }
+      identity = std::move(fresh);
+    } catch (...) {
+      return std::nullopt;
+    }
+    q8_timing.add(Q8Timing::Authenticate, stage);
+    // Host-pointer buffers and buffers mapped for writing can change without
+    // any call this library sees; those are authenticated on every launch.
+    std::lock_guard lock(q8_cache_mutex);
+    bool stable = !q8_untracked_writers.load() &&
+                  !((launch.storage[0].root_flags | launch.storage[1].root_flags) & CL_MEM_USE_HOST_PTR);
+    for (const auto &[pointer, root] : q8_write_maps)
+      if (root == codes.root || root == scales.root) stable = false;
+    if (stable && q8_known.size() < 8192 && !REAL(clRetainMemObject)(codes.root)) {
+      if (!REAL(clRetainMemObject)(scales.root)) {
+        q8_known.push_back({codes, scales, launch.k, launch.n, identity});
+        q8_known_count.store(q8_known.size(), std::memory_order_release);
+      } else {
+        REAL(clReleaseMemObject)(codes.root);
+      }
+    }
+  }
+  if (!identity->approved) return std::nullopt;
+  const Q8Identity &weights = *identity;
+  constexpr size_t maximum = 2u << 20;
+  const size_t rows = std::min({size_t(32), maximum / (launch.k * 4), maximum / (launch.n * 4)});
+  if (!rows) return std::nullopt;
+
+  static thread_local std::vector<unsigned char> input, output;
+  stage = Q8Timing::now();
+  input.resize(launch.read_bytes[2]);
+  if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[2], CL_TRUE, launch.input_offset,
+                                launch.read_bytes[2], input.data(), 0, nullptr, nullptr))
+    return std::nullopt;
+  q8_timing.add(Q8Timing::Snapshot, stage);
+  stage = Q8Timing::now();
+  const unsigned char *product = nullptr;
+  try {
+    if (launch.m <= rows) {
+      const auto shared = q8_exchange_shared(weights, launch.k, launch.n, launch.m, input);
+      if (shared) {
+        if (!*shared) return std::nullopt;
+        product = *shared;
+      }
+    } else {
+      q8_session.last_valid = q8_session.ready_valid = false;
+    }
+    if (!product) {
+      output.resize(launch.output_bytes);
+      for (size_t first = 0; first < launch.m; first += rows) {
+        const size_t count = std::min(rows, launch.m - first);
+        if (!q8_exchange(weights, launch.k, launch.n, count, input.data() + first * launch.k * 4,
+                         output.data() + first * launch.n * 4)) {
+          // Only a decline of the first chunk can select CPU.
+          if (first) return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
+          return std::nullopt;
+        }
+      }
+      product = output.data();
+    }
+    if (!q8_all_finite(product, launch.output_bytes / 4)) throw std::runtime_error("Q8 nonfinite result");
+  } catch (const std::exception &error) {
+    // A fixed local reason only; never tensor names, shapes or values.
+    if (q8_timing.enabled) std::fprintf(stderr, "[shield-opencl] direct route failed: %s\n", error.what());
+    return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
+  } catch (...) {
+    return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
+  }
+  q8_timing.add(Q8Timing::Service, stage);
+  stage = Q8Timing::now();
+  // Every chunk has verified before any result reaches application memory.
+  q8_written(launch.buffers[3], launch.output_offset, launch.output_bytes, false);
+  if (REAL(clEnqueueWriteBuffer)(launch.queue, launch.buffers[3], CL_TRUE, launch.output_offset,
+                                 launch.output_bytes, product, 0, nullptr, nullptr))
+    return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
+  const cl_int result = q8_direct_result(launch, CL_SUCCESS);
+  q8_timing.add(Q8Timing::Write, stage);
+  if (q8_timing.enabled && !((q8_session.requests + q8_session.served) % 4096) && q8_session.requests)
+    std::fprintf(stderr, "[shield-opencl-timing] shared requests=%llu paired=%llu served=%llu learned=%llu missed=%llu\n",
+                 (unsigned long long)q8_session.requests, (unsigned long long)q8_session.paired,
+                 (unsigned long long)q8_session.served, (unsigned long long)q8_session.learned,
+                 (unsigned long long)q8_session.missed);
+  return result;
+}

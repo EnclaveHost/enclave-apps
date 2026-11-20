@@ -1,13 +1,17 @@
 // OpenCL compatibility frontend. Only the measured Unix service can access GPU.
 // All ordinary, unrecognized kernels execute through the guest's PoCL CPU ICD.
 #define CL_TARGET_OPENCL_VERSION 300
+#define CL_USE_DEPRECATED_OPENCL_1_1_APIS
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+#define CL_USE_DEPRECATED_OPENCL_2_0_APIS
 #include <CL/cl.h>
 #include <algorithm>
 #include <arpa/inet.h>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -33,10 +37,12 @@
 #include <condition_variable>
 #include <deque>
 #include <openssl/evp.h>
+#include <optional>
 #ifdef SHIELD_Q8_MASKED
 #include <bit>
 #include <cmath>
-#include <optional>
+#include <sys/mman.h>
+#include <sys/uio.h>
 #endif
 #ifdef SHIELD_Q8_SNAPSHOT_TEST
 extern "C" void shield_q8_snapshot_test(size_t,size_t,size_t,const unsigned char *,const unsigned char *,const unsigned char *);
@@ -64,7 +70,12 @@ template <class T> T real(const char *name) {
     throw std::runtime_error("missing OpenCL entry point");
   return reinterpret_cast<T>(p);
 }
-#define REAL(name) real<decltype(&name)>(#name)
+// Resolved once per call site: dlsym on every call is measurable on hot paths.
+#define REAL(name)                                                             \
+  ([] {                                                                        \
+    static const auto pointer = real<decltype(&name)>(#name);                  \
+    return pointer;                                                            \
+  }())
 cl_int copy_info(const void *value, size_t bytes, size_t size, void *out,
                  size_t *actual) {
   if (actual)
@@ -78,6 +89,20 @@ cl_int copy_info(const void *value, size_t bytes, size_t size, void *out,
 }
 cl_int text_info(const char *value, size_t size, void *out, size_t *actual) {
   return copy_info(value, std::strlen(value) + 1, size, out, actual);
+}
+// The queued routes hand a launch to another thread and complete it through a
+// user event. That relies on the CPU runtime's threaded driver. Its inline
+// driver (POCL_DEVICES=basic or cpu-minimal) runs commands in the calling
+// thread and returns from a wait before such a launch has written its output
+// (seen with the Q8 fixture), so under it those launches keep the CPU kernel.
+bool queued_offload_reliable() {
+  static const bool reliable = [] {
+    const char *devices = std::getenv("POCL_DEVICES");
+    if (!devices || !*devices) return true;  // the runtime's default is the threaded driver
+    const std::string list(devices);
+    return list.find("basic") == std::string::npos && list.find("minimal") == std::string::npos;
+  }();
+  return reliable;
 }
 bool cpu_device(cl_device_id device) {
   cl_device_type type = 0;
@@ -108,8 +133,14 @@ struct Kernel {
   unsigned references = 1;
   std::array<std::vector<unsigned char>, 19> args;
   std::array<bool, 19> svm{};
+  // Every pointer-sized argument, by index: any of them may be a buffer the
+  // kernel writes (see q8_direct.inc).
+  std::vector<std::pair<cl_uint, cl_mem>> mems;
 #ifdef SHIELD_Q8_CAPTURE
-  json q8_analysis = json::object();
+  // Which recognized Q8 kernel this is: 0 none, 1 the matrix variant, 2 the
+  // vector variant. Decided once from the analysis when the kernel is created;
+  // launches and argument updates then need no lookups in the plan.
+  int q8 = 0;
 #endif
 };
 struct SvmAllocation {
@@ -183,7 +214,42 @@ void read_all(int fd, void *ptr, size_t n) {
     n -= r;
   }
 }
+// Optional aggregate startup timing (SHIELD_OPENCL_TIMING): durations and
+// counts of analysis-helper runs and CPU-runtime program builds.
+struct StartupTiming {
+  std::atomic<uint64_t> compiler_ns{0}, compiler_calls{0}, build_ns{0}, build_calls{0};
+  std::atomic<uint64_t> api_ns[4] = {}, api_calls[4] = {};  // write, read, set-arg, other kernels
+  const bool enabled = std::getenv("SHIELD_OPENCL_TIMING") != nullptr;
+  static uint64_t now() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  ~StartupTiming() {
+    if (enabled)
+      std::fprintf(stderr, "[shield-opencl-timing] analysis calls=%llu ms=%.1f; program builds=%llu ms=%.1f\n",
+                   (unsigned long long)compiler_calls.load(), compiler_ns.load() / 1e6,
+                   (unsigned long long)build_calls.load(), build_ns.load() / 1e6);
+    static const char *names[4] = {"write-buffer", "read-buffer", "set-kernel-arg", "other-kernel"};
+    for (int i = 0; enabled && i < 4; ++i)
+      std::fprintf(stderr, "[shield-opencl-timing] %s calls=%llu ms=%.1f\n", names[i],
+                   (unsigned long long)api_calls[i].load(), api_ns[i].load() / 1e6);
+  }
+  struct Scope {
+    StartupTiming &timing; int index; uint64_t start;
+    Scope(StartupTiming &t, int i) : timing(t), index(i), start(t.enabled ? now() : 0) {}
+    ~Scope() { if (timing.enabled) { timing.api_ns[index] += now() - start; timing.api_calls[index]++; } }
+  };
+};
+StartupTiming startup_timing;
+json invoke_compiler_process(const json &description);
 json invoke_compiler(const json &description) {
+  const auto start = StartupTiming::now();
+  auto result = invoke_compiler_process(description);
+  startup_timing.compiler_ns += StartupTiming::now() - start;
+  startup_timing.compiler_calls++;
+  return result;
+}
+json invoke_compiler_process(const json &description) {
   // Files are unlinked immediately; source never leaves this VM process
   // boundary.
   char in_name[] = "/tmp/shield-cl-in-XXXXXX",
@@ -389,6 +455,11 @@ json service(const json &request) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 }
+#ifdef SHIELD_Q8_MASKED
+// Defined in q8_direct.inc: something may write this range of a buffer, so any
+// weight identity remembered for it is dropped.
+void q8_written(cl_mem handle, size_t offset = 0, size_t size = 0, bool whole = true);
+#endif
 struct Job {
   std::shared_ptr<Profile> profile;
   cl_command_queue private_queue = nullptr;
@@ -477,6 +548,9 @@ struct Job {
       // No output buffer is modified before the trusted service returns
       // success.
       const size_t output_bytes = output.size() * sizeof(cl_long);
+#ifdef SHIELD_Q8_MASKED
+      if (!svm_storage[2]) q8_written(buffers[2], 0, output_bytes, false);
+#endif
       cl_int written = svm_storage[2]
           ? REAL(clEnqueueSVMMemcpy)(private_queue, CL_TRUE, svm_pointers[2],
                                       output.data(), output_bytes, 0, nullptr, nullptr)
@@ -502,9 +576,10 @@ struct Storage {
   size_t offset, size;
   cl_context context;
   cl_mem_flags flags;
+  cl_mem_flags root_flags;
 };
 bool storage(cl_mem b, Storage &out) {
-  out = {b, 0, 0, nullptr, 0};
+  out = {b, 0, 0, nullptr, 0, 0};
   if (!b)
     return false;
   cl_mem_object_type type;
@@ -526,8 +601,12 @@ bool storage(cl_mem b, Storage &out) {
   if (parent) {
     out.root = parent;
     if (REAL(clGetMemObjectInfo)(b, CL_MEM_OFFSET, sizeof(out.offset),
-                                 &out.offset, nullptr))
+                                 &out.offset, nullptr) ||
+        REAL(clGetMemObjectInfo)(parent, CL_MEM_FLAGS, sizeof(out.root_flags),
+                                 &out.root_flags, nullptr))
       return false;
+  } else {
+    out.root_flags = out.flags;
   }
   return true;
 }
@@ -679,7 +758,13 @@ CL_API_ENTRY cl_int CL_API_CALL clBuildProgram(
       it->second.plans = json::object();
     }
   }
+#ifdef SHIELD_Q8_MASKED
+  q8_warm_once();
+#endif
+  const auto build_start = StartupTiming::now();
   auto result = REAL(clBuildProgram)(program, count, devices, options, callback, data);
+  startup_timing.build_ns += StartupTiming::now() - build_start;
+  startup_timing.build_calls++;
   if (!result && !callback && il_options(options) && one_cpu_program(program)) {
     try {
       std::vector<std::string> modules;
@@ -764,7 +849,7 @@ CL_API_ENTRY cl_kernel CL_API_CALL clCreateKernel(cl_program p,
       auto plan = kernel_plan(p, name);
       state.recognized = integer_dispatch_plan(plan);
 #ifdef SHIELD_Q8_CAPTURE
-      if (q8_capture_plan(plan)) state.q8_analysis = std::move(plan);
+      if (q8_capture_plan(plan)) state.q8 = plan.at("variant") == "mv" ? 2 : 1;
 #endif
     } catch (...) {
     }
@@ -792,7 +877,7 @@ CL_API_ENTRY cl_int CL_API_CALL clCreateKernelsInProgram(cl_program p,
         auto plan = kernel_plan(p, name);
         state.recognized = integer_dispatch_plan(plan);
 #ifdef SHIELD_Q8_CAPTURE
-        if (q8_capture_plan(plan)) state.q8_analysis = std::move(plan);
+        if (q8_capture_plan(plan)) state.q8 = plan.at("variant") == "mv" ? 2 : 1;
 #endif
       } catch (...) {
       }
@@ -804,13 +889,22 @@ CL_API_ENTRY cl_int CL_API_CALL clCreateKernelsInProgram(cl_program p,
 }
 CL_API_ENTRY cl_int CL_API_CALL clSetKernelArg(cl_kernel k, cl_uint index,
                                                size_t n, const void *value) {
+  StartupTiming::Scope scope(startup_timing, 2);
   auto result = REAL(clSetKernelArg)(k, index, n, value);
   if (!result) {
     std::lock_guard lock(mutex);
     auto it = kernels.find(k);
+    if (it != kernels.end()) {
+      cl_mem handle = nullptr;
+      if (value && n == sizeof(cl_mem)) std::memcpy(&handle, value, sizeof(handle));
+      auto &mems = it->second.mems;
+      auto slot = std::find_if(mems.begin(), mems.end(), [&](const auto &m) { return m.first == index; });
+      if (slot != mems.end()) slot->second = handle;
+      else if (handle) mems.emplace_back(index, handle);
+    }
     const bool capture = it != kernels.end() &&
 #ifdef SHIELD_Q8_CAPTURE
-                         q8_capture_plan(it->second.q8_analysis);
+                         it->second.q8 != 0;
 #else
                          false;
 #endif
@@ -818,7 +912,7 @@ CL_API_ENTRY cl_int CL_API_CALL clSetKernelArg(cl_kernel k, cl_uint index,
       if (index >= (capture ? 19u : 6u) || !value || n > sizeof(cl_mem)) {
         it->second.recognized = false;
 #ifdef SHIELD_Q8_CAPTURE
-        it->second.q8_analysis = json::object();
+        it->second.q8 = 0;
 #endif
       } else {
         auto *p = static_cast<const unsigned char *>(value);
@@ -896,7 +990,7 @@ CL_API_ENTRY cl_int CL_API_CALL clSetKernelArgSVMPointer(cl_kernel kernel,
     auto it = kernels.find(kernel);
     const bool capture = it != kernels.end() &&
 #ifdef SHIELD_Q8_CAPTURE
-                         q8_capture_plan(it->second.q8_analysis);
+                         it->second.q8 != 0;
 #else
                          false;
 #endif
@@ -922,8 +1016,9 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseKernel(cl_kernel k) {
   {
     std::lock_guard lock(mutex);
     auto it = kernels.find(k);
-    if (it != kernels.end() && !--it->second.references)
+    if (it != kernels.end() && !--it->second.references) {
       kernels.erase(it);
+    }
   }
   return REAL(clReleaseKernel)(k);
 }
@@ -943,24 +1038,41 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
     cl_command_queue q, cl_kernel kernel, cl_uint dimensions,
     const size_t *offset, const size_t *global, const size_t *local,
     cl_uint count, const cl_event *wait, cl_event *event) {
-  auto fallback = [&] {
-    return REAL(clEnqueueNDRangeKernel)(q, kernel, dimensions, offset, global,
-                                        local, count, wait, event);
-  };
-  Kernel state;
+  // A per-thread copy of what a launch needs. Assigning into it reuses its
+  // storage, so the per-launch copy allocates nothing.
+  static thread_local Kernel state;
+  bool q8_kernel = false, q8_mv = false;
   {
     std::lock_guard lock(mutex);
     auto it = kernels.find(kernel);
-    if (it != kernels.end())
-      state = it->second;
-  }
+    state.recognized = it != kernels.end() && it->second.recognized;
+    if (it != kernels.end()) {
+      state.args = it->second.args;
+      state.svm = it->second.svm;
 #ifdef SHIELD_Q8_CAPTURE
-  if (q8_capture_plan(state.q8_analysis)) {
-    auto captured = capture_q8(q, kernel, state, dimensions, offset, global, local, count, wait, event);
+      q8_kernel = it->second.q8 != 0;
+      q8_mv = it->second.q8 == 2;
+#endif
+    }
+  }
+  (void)q8_mv;
+  auto fallback = [&] {
+#ifdef SHIELD_Q8_MASKED
+    // The original kernel runs: whatever it may write is no longer known. The
+    // Q8 kernels write only their output argument.
+    q8_kernel_may_write(kernel, q8_kernel ? 4 : -1);
+#endif
+    StartupTiming::Scope scope(startup_timing, 3);
+    return REAL(clEnqueueNDRangeKernel)(q, kernel, dimensions, offset, global,
+                                        local, count, wait, event);
+  };
+#ifdef SHIELD_Q8_CAPTURE
+  if (q8_kernel) {
+    auto captured = capture_q8(q, kernel, state, q8_mv, dimensions, offset, global, local, count, wait, event);
     if (captured.first) return captured.second;
   }
 #endif
-  if (!state.recognized)
+  if (!state.recognized || !queued_offload_reliable())
     return fallback();
   if ((dimensions != 2 && dimensions != 3) || !global ||
       (dimensions == 3 && (global[2] != 1 || (local && local[2] != 1) ||
@@ -1262,4 +1374,197 @@ CL_API_ENTRY cl_int CL_API_CALL clGetEventProfilingInfo(
   }
   return copy_info(&value, sizeof(value), n, out, size);
 }
+#ifdef SHIELD_Q8_MASKED
+// Write tracking for the direct Q8 route's weight identities (q8_direct.inc).
+// Each wrapper forgets what it may overwrite, then calls the CPU runtime.
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteBuffer(
+    cl_command_queue q, cl_mem buffer, cl_bool blocking, size_t offset, size_t size,
+    const void *pointer, cl_uint count, const cl_event *wait, cl_event *event) {
+  StartupTiming::Scope scope(startup_timing, 0);
+  q8_written(buffer, offset, size, false);
+  return REAL(clEnqueueWriteBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueReadBuffer(
+    cl_command_queue q, cl_mem buffer, cl_bool blocking, size_t offset, size_t size,
+    void *pointer, cl_uint count, const cl_event *wait, cl_event *event) {
+  StartupTiming::Scope scope(startup_timing, 1);
+  return REAL(clEnqueueReadBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteBufferRect(
+    cl_command_queue q, cl_mem buffer, cl_bool blocking, const size_t *buffer_origin,
+    const size_t *host_origin, const size_t *region, size_t buffer_row_pitch,
+    size_t buffer_slice_pitch, size_t host_row_pitch, size_t host_slice_pitch,
+    const void *pointer, cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(buffer);
+  return REAL(clEnqueueWriteBufferRect)(q, buffer, blocking, buffer_origin, host_origin, region,
+                                        buffer_row_pitch, buffer_slice_pitch, host_row_pitch,
+                                        host_slice_pitch, pointer, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueFillBuffer(
+    cl_command_queue q, cl_mem buffer, const void *pattern, size_t pattern_size, size_t offset,
+    size_t size, cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(buffer, offset, size, false);
+  return REAL(clEnqueueFillBuffer)(q, buffer, pattern, pattern_size, offset, size, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueCopyBuffer(
+    cl_command_queue q, cl_mem source, cl_mem destination, size_t source_offset,
+    size_t destination_offset, size_t size, cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(destination, destination_offset, size, false);
+  return REAL(clEnqueueCopyBuffer)(q, source, destination, source_offset, destination_offset, size,
+                                   count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueCopyBufferRect(
+    cl_command_queue q, cl_mem source, cl_mem destination, const size_t *source_origin,
+    const size_t *destination_origin, const size_t *region, size_t source_row_pitch,
+    size_t source_slice_pitch, size_t destination_row_pitch, size_t destination_slice_pitch,
+    cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(destination);
+  return REAL(clEnqueueCopyBufferRect)(q, source, destination, source_origin, destination_origin,
+                                       region, source_row_pitch, source_slice_pitch,
+                                       destination_row_pitch, destination_slice_pitch, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueCopyImageToBuffer(
+    cl_command_queue q, cl_mem image, cl_mem buffer, const size_t *origin, const size_t *region,
+    size_t offset, cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(buffer);
+  return REAL(clEnqueueCopyImageToBuffer)(q, image, buffer, origin, region, offset, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteImage(
+    cl_command_queue q, cl_mem image, cl_bool blocking, const size_t *origin, const size_t *region,
+    size_t row_pitch, size_t slice_pitch, const void *pointer, cl_uint count, const cl_event *wait,
+    cl_event *event) {
+  q8_written(image);
+  return REAL(clEnqueueWriteImage)(q, image, blocking, origin, region, row_pitch, slice_pitch, pointer,
+                                   count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueFillImage(
+    cl_command_queue q, cl_mem image, const void *color, const size_t *origin, const size_t *region,
+    cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(image);
+  return REAL(clEnqueueFillImage)(q, image, color, origin, region, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueCopyImage(
+    cl_command_queue q, cl_mem source, cl_mem destination, const size_t *source_origin,
+    const size_t *destination_origin, const size_t *region, cl_uint count, const cl_event *wait,
+    cl_event *event) {
+  q8_written(destination);
+  return REAL(clEnqueueCopyImage)(q, source, destination, source_origin, destination_origin, region,
+                                  count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueCopyBufferToImage(
+    cl_command_queue q, cl_mem buffer, cl_mem image, size_t offset, const size_t *origin,
+    const size_t *region, cl_uint count, const cl_event *wait, cl_event *event) {
+  q8_written(image);
+  return REAL(clEnqueueCopyBufferToImage)(q, buffer, image, offset, origin, region, count, wait, event);
+}
+CL_API_ENTRY void *CL_API_CALL clEnqueueMapBuffer(
+    cl_command_queue q, cl_mem buffer, cl_bool blocking, cl_map_flags flags, size_t offset,
+    size_t size, cl_uint count, const cl_event *wait, cl_event *event, cl_int *error) {
+  const bool writes = flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION);
+  if (writes) q8_written(buffer);
+  void *pointer = REAL(clEnqueueMapBuffer)(q, buffer, blocking, flags, offset, size, count, wait, event, error);
+  if (pointer && writes) {
+    // Until it is unmapped the application can write through this pointer
+    // at any time, so the buffer's contents cannot be remembered.
+    std::lock_guard lock(q8_cache_mutex);
+    q8_write_maps[pointer] = q8_resolve(buffer, 0, 0, true).root;
+  }
+  return pointer;
+}
+CL_API_ENTRY void *CL_API_CALL clEnqueueMapImage(
+    cl_command_queue q, cl_mem image, cl_bool blocking, cl_map_flags flags, const size_t *origin,
+    const size_t *region, size_t *row_pitch, size_t *slice_pitch, cl_uint count, const cl_event *wait,
+    cl_event *event, cl_int *error) {
+  const bool writes = flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION);
+  if (writes) q8_written(image);
+  void *pointer = REAL(clEnqueueMapImage)(q, image, blocking, flags, origin, region, row_pitch,
+                                          slice_pitch, count, wait, event, error);
+  if (pointer && writes) {
+    std::lock_guard lock(q8_cache_mutex);
+    q8_write_maps[pointer] = q8_resolve(image, 0, 0, true).root;
+  }
+  return pointer;
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueUnmapMemObject(
+    cl_command_queue q, cl_mem object, void *pointer, cl_uint count, const cl_event *wait,
+    cl_event *event) {
+  q8_written(object);
+  {
+    std::lock_guard lock(q8_cache_mutex);
+    q8_write_maps.erase(pointer);
+  }
+  return REAL(clEnqueueUnmapMemObject)(q, object, pointer, count, wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueNativeKernel(
+    cl_command_queue q, void(CL_CALLBACK *function)(void *), void *arguments, size_t size,
+    cl_uint mem_count, const cl_mem *mems, const void **locations, cl_uint count,
+    const cl_event *wait, cl_event *event) {
+  q8_written_everything();
+  q8_untracked_writers.store(true);
+  return REAL(clEnqueueNativeKernel)(q, function, arguments, size, mem_count, mems, locations, count,
+                                     wait, event);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueMigrateMemObjects(
+    cl_command_queue q, cl_uint mem_count, const cl_mem *mems, cl_mem_migration_flags flags,
+    cl_uint count, const cl_event *wait, cl_event *event) {
+  for (cl_uint i = 0; mems && i < mem_count; ++i) q8_written(mems[i]);
+  return REAL(clEnqueueMigrateMemObjects)(q, mem_count, mems, flags, count, wait, event);
+}
+CL_API_ENTRY cl_mem CL_API_CALL clCreateSubBuffer(
+    cl_mem buffer, cl_mem_flags flags, cl_buffer_create_type type, const void *info, cl_int *error) {
+  cl_mem child = REAL(clCreateSubBuffer)(buffer, flags, type, info, error);
+  if (child && type == CL_BUFFER_CREATE_TYPE_REGION && info) {
+    const auto *region = static_cast<const cl_buffer_region *>(info);
+    q8_child(child, buffer, region->origin, region->size);
+  }
+  return child;
+}
+CL_API_ENTRY cl_mem CL_API_CALL clCreateImage(
+    cl_context context, cl_mem_flags flags, const cl_image_format *format,
+    const cl_image_desc *description, void *host, cl_int *error) {
+  cl_mem image = REAL(clCreateImage)(context, flags, format, description, host, error);
+  // An image over a buffer writes that buffer; treat it as the whole of it.
+  if (image && description && description->buffer)
+    q8_child(image, description->buffer, 0, SIZE_MAX / 2);
+  return image;
+}
+CL_API_ENTRY cl_mem CL_API_CALL clCreateImageWithProperties(
+    cl_context context, const cl_mem_properties *properties, cl_mem_flags flags,
+    const cl_image_format *format, const cl_image_desc *description, void *host, cl_int *error) {
+  cl_mem image = REAL(clCreateImageWithProperties)(context, properties, flags, format, description, host, error);
+  if (image && description && description->buffer)
+    q8_child(image, description->buffer, 0, SIZE_MAX / 2);
+  return image;
+}
+CL_API_ENTRY cl_int CL_API_CALL clReleaseMemObject(cl_mem object) {
+  // Remembered identities hold their own reference, so a handle cannot be
+  // recycled under them; an application release simply ends the memory.
+  q8_written(object);
+  cl_uint references = 0;
+  if (object && !REAL(clGetMemObjectInfo)(object, CL_MEM_REFERENCE_COUNT, sizeof(references),
+                                         &references, nullptr) && references <= 1) {
+    std::lock_guard lock(q8_cache_mutex);
+    q8_children.erase(object);
+  }
+  return REAL(clReleaseMemObject)(object);
+}
+CL_API_ENTRY void *CL_API_CALL clGetExtensionFunctionAddress(const char *name) {
+  q8_written_everything();
+  q8_untracked_writers.store(true);
+  return REAL(clGetExtensionFunctionAddress)(name);
+}
+CL_API_ENTRY cl_int CL_API_CALL clEnqueueTask(cl_command_queue q, cl_kernel kernel, cl_uint count,
+                                              const cl_event *wait, cl_event *event) {
+  q8_kernel_may_write(kernel);
+  return REAL(clEnqueueTask)(q, kernel, count, wait, event);
+}
+CL_API_ENTRY void *CL_API_CALL clGetExtensionFunctionAddressForPlatform(
+    cl_platform_id platform, const char *name) {
+  // Extension entry points (command buffers, for one) enqueue work this
+  // library does not see. Once one is requested nothing is remembered.
+  q8_written_everything();
+  q8_untracked_writers.store(true);
+  return REAL(clGetExtensionFunctionAddressForPlatform)(platform, name);
+}
+#endif
 }

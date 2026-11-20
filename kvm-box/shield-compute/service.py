@@ -87,6 +87,7 @@ class Compute:
         self.telemetry = {'verifiedOffloads': 0, 'maskedMacs': 0, 'lastCompleted': None}
         self.calibration_digests = {}
         self.q8_broker = None
+        self.q8_lock = threading.Lock()
         for engine, spec in config['models'].items():
             # Deployment mounts this filesystem read-only with dm-verity.
             verify_file(spec['model'], spec['modelSha256'])
@@ -97,7 +98,32 @@ class Compute:
             verify_file(spec['calibration'], policy['calibrationSha256'])
             self.calibration_digests[engine] = policy['calibrationSha256']
 
+    def collect_q8(self):
+        # Session clients talk to the executor directly, so their verified
+        # work is read back from it here rather than recorded per request.
+        broker = self.q8_broker
+        if broker is None:
+            return
+        from q8_service import Q8ExecutionError
+        with self.q8_lock:
+            try:
+                exchanges, macs, products = broker.collect()
+            except Q8ExecutionError:
+                self.retired = True
+                return
+            if broker.retired:
+                self.retired = True
+            if products:
+                previous = self.telemetry
+                self.telemetry = {
+                    'verifiedOffloads': previous['verifiedOffloads'] + exchanges,
+                    'maskedMacs': previous['maskedMacs'] + macs,
+                    'lastCompleted': {'engine': 'q8', 'mode': 'masked',
+                                      'verifiedOffloads': exchanges, 'maskedMacs': macs}}
+                self.completed += products
+
     def status(self):
+        self.collect_q8()
         active = self.active
         return {'ok': True, 'schema': 'shield-guest-status/1',
                 'state': 'retired' if self.retired else 'busy' if self.lock.locked() else 'ready',
@@ -164,7 +190,9 @@ class Compute:
                 return self.q8(request)
             # A native/graph job owns the worker reservation while it runs.
             if self.q8_broker is not None:
-                self.q8_broker.close()
+                with self.q8_lock:
+                    self.q8_broker.close()
+                self.collect_q8()
             if request.get('op') == 'graph':
                 return self.graph(request)
             return self.native(request)
@@ -180,13 +208,71 @@ class Compute:
             self.q8_broker = Q8Broker(self.config, self.environment)
         self.active = {'engine': 'q8', 'mode': 'masked', 'started': time.monotonic()}
         try:
-            result = self.q8_broker.execute(request)
+            with self.q8_lock:
+                result = self.q8_broker.execute(request)
             if result.get('supported'):
                 self.record_completed('q8', 'masked', result['stats'])
             return result
         except Q8ExecutionError:
             self.retired = True
             raise ValueError('Q8 computation failed; compute retired; no result released') from None
+
+    def q8_session(self, request, client):
+        """Attach a client's socket to the Q8 executor for direct binary requests.
+
+        The caller has checked the peer's credentials. Returns the reply to
+        send; after an 'ok' the socket belongs to the executor's session.
+        """
+        from q8_service import ARITHMETIC, Q8Broker, Q8ExecutionError
+        if (not isinstance(request, dict) or set(request) != {'op', 'engine', 'arithmetic'} or
+                request['arithmetic'] != ARITHMETIC or not isinstance(request['engine'], str) or
+                request['engine'] not in self.config['models']):
+            raise ValueError('invalid Q8 session or explicit arithmetic contract')
+        if self.config.get('enableQ8Experimental') is not True:
+            raise ValueError('experimental Q8 execution is disabled')
+        if not self.lock.acquire(blocking=False):
+            raise ValueError('compute busy')
+        try:
+            if self.retired:
+                raise ValueError('compute retired; administrator restart required')
+            if self.q8_broker is None:
+                self.q8_broker = Q8Broker(self.config, self.environment)
+            try:
+                with self.q8_lock:
+                    attached = self.q8_broker.attach(request['engine'], client)
+            except Q8ExecutionError:
+                self.retired = True
+                raise ValueError('Q8 computation failed; compute retired; no result released') from None
+            if not attached:
+                raise ValueError('compute busy')
+            return {'ok': True, 'session': 'shield-q8-session/1'}
+        finally:
+            self.lock.release()
+
+    def q8_warm(self, request):
+        """A client expects to use Q8 soon: start the executor it used last.
+
+        A hint only. It starts no computation, and a wrong guess costs the
+        later session one executor restart.
+        """
+        from q8_service import ARITHMETIC, Q8Broker
+        if (not isinstance(request, dict) or set(request) != {'op', 'arithmetic'} or
+                request['arithmetic'] != ARITHMETIC):
+            raise ValueError('invalid Q8 hint or explicit arithmetic contract')
+        if self.config.get('enableQ8Experimental') is not True:
+            raise ValueError('experimental Q8 execution is disabled')
+        if not self.lock.acquire(blocking=False):
+            return {'ok': True, 'warm': False}
+        try:
+            if self.retired:
+                raise ValueError('compute retired; administrator restart required')
+            if self.q8_broker is None:
+                self.q8_broker = Q8Broker(self.config, self.environment)
+            with self.q8_lock:
+                self.q8_broker.warm(self.q8_broker.last_engine)
+            return {'ok': True, 'warm': True}
+        finally:
+            self.lock.release()
 
     def graph(self, request):
         if set(request) != {'op', 'graph', 'inputs', 'mode'} or request['mode'] not in ('masked', 'cpu'):
@@ -315,7 +401,20 @@ class Handler(socketserver.BaseRequestHandler):
             return
         self.request.settimeout(self.server.frame_timeout)
         try:
-            result = self.server.compute.run(request)
+            if isinstance(request, dict) and request.get('op') == 'q8_session':
+                result = self.server.compute.q8_session(request, self.request)
+                # The executor now owns this connection. Answer, then let go of
+                # this copy without shutting the shared socket down.
+                try:
+                    send(self.request, result)
+                except (OSError, ValueError):
+                    pass
+                os.close(self.request.detach())
+                return
+            if isinstance(request, dict) and request.get('op') == 'q8_warm':
+                result = self.server.compute.q8_warm(request)
+            else:
+                result = self.server.compute.run(request)
         except (ValueError, KeyError, TypeError, OverflowError) as error:
             result = {'ok': False, 'error': str(error)[:200]}
         except Exception:

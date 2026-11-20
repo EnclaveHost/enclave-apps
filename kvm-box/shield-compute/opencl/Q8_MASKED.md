@@ -1,5 +1,12 @@
 # Standard OpenCL Q8 execution through Enclave Shield
 
+Update, 2026-11-19: this document describes the queued route. In-order,
+non-profiling launches without a wait list now take the direct route described
+in [Q8_DIRECT.md](Q8_DIRECT.md), which keeps this route's decisions and
+arithmetic. Two statements below changed with it: launch layouts are validated
+in C++ (`q8_admission.inc`) without a helper process or a layout cache, and the
+queued route is not used under the CPU runtime's inline driver.
+
 Status, 2026-10-24: the experimental frontend now executes the two pinned Q8
 matrix kernels through the guest-local service and the existing native Shield
 backend. Real Qwen, Stable Diffusion and worker-failure probes pass in host containers.
