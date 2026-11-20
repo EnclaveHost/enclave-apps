@@ -186,6 +186,13 @@ Generation, tokens per second, with the settings above applied to both paths:
 | 0.5B, 8, 4 | 158 | 141 | 89% |
 | 3B, 8, 4 | 53–55 | 45 | 81–85% |
 
+Over 440 generated tokens, where the pads made before the first token no
+longer matter, the two-processor rows are 85 against 90 (95%) and 18.2
+against 19.0 (96%). On two processors both paths keep both busy: the pad
+thread has one to itself, and the rest of the OpenCL route (client and
+executor together) uses about 1.3 ms more processor time a token than the
+native engine on the 0.5B model.
+
 For scale: before this work the queued route gave 2.1 tokens per second on the
 0.5B model, and the native engine as shipped (spinning OpenMP thread) gives 59
 on two processors.
@@ -266,8 +273,10 @@ priority of the executor's pad thread (within noise).
 - Nothing here ran in a measured image or a confidential VM, on NucBox, or
   through the native profile's launcher and broker. The two-processor numbers
   come from a container pinned to two cores, not from the guest.
-- Parity is not reached. At the service's settings the route is 6–9% behind
-  the native path; with pads plentiful it is 11–19% behind.
+- Parity in tokens per second is not reached. At the service's settings the
+  route is 4–9% behind the native path; with pads plentiful it is 11–19%
+  behind. A whole run is shorter than the native engine's only when the
+  executor is already running.
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
