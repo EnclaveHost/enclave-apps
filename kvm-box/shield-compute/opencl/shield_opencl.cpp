@@ -326,14 +326,15 @@ bool integer_dispatch_plan(const json &plan) {
 #ifdef SHIELD_Q8_CAPTURE
 // Which recognized kernel an analysis describes: 0 none, 1 and 2 the Q8_0
 // matrix and vector kernels, 3 and 4 the Q4_K ones, 5 and 6 the Q6_K ones, 7
-// and 8 the Q5_K ones, 9 the plain IQ4_XS kernel (Q8Kind in q8_admission.inc).
+// and 8 the Q5_K ones, 9, 12 and 13 the plain IQ4_XS, Q3_K and IQ3_S kernels
+// (Q8Kind in q8_admission.inc).
 // How many arguments a recognized kernel of that kind has.
 unsigned q8_kind_arguments(int kind) {
   switch (kind) {
     case 3: case 4: case 5: return 21;
     case 6: return 17;
     case 7: case 8: return 22;
-    case 9: return 9;
+    case 9: case 12: case 13: return 9;
     case 11: return 15;
     default: return 19;
   }
@@ -348,6 +349,8 @@ int q8_plan_kind(const json &plan) {
   if (operation == "q6_k-f32-matmul") return variant == "mm_q6_k" ? 5 : variant == "mv_q6_k" ? 6 : 0;
   if (operation == "q5_k-f32-matmul") return variant == "mm_q5_k" ? 7 : variant == "mv_q5_k" ? 8 : 0;
   if (operation == "iq4_xs-f32-matmul") return variant == "raw_iq4_xs" ? 9 : 0;
+  if (operation == "q3_k-f32-matmul") return variant == "raw_q3_k" ? 12 : 0;
+  if (operation == "iq3_s-f32-matmul") return variant == "raw_iq3_s" ? 13 : 0;
   if (operation == "iq4_nl-f32-matmul") return variant == "mm_iq4_nl" ? 10 : variant == "mv_iq4_nl" ? 11 : 0;
   return 0;
 }
@@ -1326,7 +1329,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
     // The original kernel runs: whatever it may write is no longer known. The
     // Q8 kernels write only their output argument.
     // The output is the second buffer after the weights.
-    q8_kernel_may_write(kernel, !q8_kernel ? -1 : q8_kernel == 9 ? 4 :
+    q8_kernel_may_write(kernel, !q8_kernel ? -1 : q8_kind_raw(q8_kernel) ? 4 :
                                 q8_kernel == 7 || q8_kernel == 8 ? 7 : q8_kernel >= 3 && q8_kernel <= 6 ? 6 : 4);
 #endif
     StartupTiming::Scope scope(startup_timing, 3);

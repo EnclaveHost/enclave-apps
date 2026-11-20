@@ -26,6 +26,8 @@ LAYOUT = {
     14: ([('ql', 128), ('qh', 64), ('scales', 16), ('d', 2)], ['ql', 'qh', 'scales', 'd']),
     20: ([('d', 2), ('qs', 16)], ['qs', 'd']),
     23: ([('d', 2), ('scales_h', 2), ('scales_l', 4), ('qs', 128)], None),  # kept whole
+    11: ([('hmask', 32), ('qs', 64), ('scales', 12), ('d', 2)], None),
+    21: ([('d', 2), ('qs', 64), ('qh', 8), ('signs', 32), ('scales', 4)], None),
 }
 
 
@@ -43,7 +45,8 @@ class KQuantDecode(unittest.TestCase):
 
     def test_decoded_weights_equal_the_reference(self):
         rng = np.random.default_rng(20261120)
-        for kind, name in ((12, 'Q4_K'), (13, 'Q5_K'), (14, 'Q6_K'), (20, 'IQ4_NL'), (23, 'IQ4_XS')):
+        for kind, name in ((12, 'Q4_K'), (13, 'Q5_K'), (14, 'Q6_K'), (20, 'IQ4_NL'), (23, 'IQ4_XS'),
+                           (11, 'Q3_K'), (21, 'IQ3_S')):
             fields, flat = LAYOUT[kind]
             size = sum(width for _, width in fields)
             blocks = 257

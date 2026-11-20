@@ -24,3 +24,8 @@ authorization list based on function names. See `../Q8_LOWERING.md`.
 `mul_mat_iq4_xs_f32_raw.cl` (`c0dc97543954401020f12bb3d53a9ad839238dfa57d025bfa07042628809c6a4`) is not from llama.cpp. It is the plain
 IQ4_XS product that `native/llama-shield-iq4-xs.patch` adds to llama's OpenCL
 backend, under the same license as that patch's target.
+
+`mul_mat_q3_k_f32_raw.cl` (`4d7535b3c46f3e33221af7ac5e2695573efcc12ce127d82ebcb6b8cae39911db`) and
+`mul_mat_iq3_s_f32_raw.cl` (`ce58aca25ebf985562a4028fc9f5e106a8973d6dda5b0689970c3845e8f168d3`) are the
+same kind of kernel for Q3_K and IQ3_S, added by the same patch. The IQ3_S
+kernel carries ggml's `iq3s_grid` table.

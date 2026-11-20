@@ -212,9 +212,9 @@ class Q5KLaunchTests(unittest.TestCase):
             q5_k_digest(quants, high[:-1], scales, d, dmin, k, n)
 
 
-def iq4_fixture(k=512, n=72, m=3, offsets=(64, 32, 16)):
+def iq4_fixture(k=512, n=72, m=3, offsets=(64, 32, 16), block=136):
     scalars = {1: offsets[0], 3: offsets[1], 5: offsets[2], 6: k, 7: n, 8: m}
-    sizes = {0: n*k//256*136+offsets[0], 2: m*k*4+offsets[1], 4: m*n*4+offsets[2]}
+    sizes = {0: n*k//256*block+offsets[0], 2: m*k*4+offsets[1], 4: m*n*4+offsets[2]}
     buffers = {index: BufferView(index+1, size+64, 64, size) for index, size in sizes.items()}
     return scalars, buffers, (n, m, 1), (1, 1, 1)
 
@@ -226,6 +226,20 @@ class IQ4XSLaunchTests(unittest.TestCase):
             self.assertEqual((launch.k, launch.n, launch.m), (k, n, m))
             self.assertEqual([end-start for _, start, end in launch.reads], [k*n//256*136, m*k*4])
             self.assertEqual(launch.write[2]-launch.write[1], m*n*4)
+
+    def test_q3_k_and_iq3_s_have_110_byte_blocks(self):
+        for variant in ('raw_q3_k', 'raw_iq3_s'):
+            for k, n, m in [(5120, 17408, 1), (17408, 5120, 32), (256, 1, 1)]:
+                scalars, buffers, grid, local = iq4_fixture(k, n, m, block=110)
+                launch = validate_launch(variant, scalars, buffers, grid, local)
+                self.assertEqual((launch.variant, launch.k, launch.n, launch.m), (variant, k, n, m))
+                self.assertEqual([end-start for _, start, end in launch.reads], [k*n//256*110, m*k*4])
+                # The same buffers are a byte short of nothing, and too short for IQ4_XS.
+                with self.assertRaises(ValueError):
+                    validate_launch(variant, scalars, {**buffers, 0: replace(buffers[0], size=buffers[0].size-1)},
+                                    grid, local)
+                with self.assertRaises(ValueError):
+                    validate_launch('raw_iq4_xs', scalars, buffers, grid, local)
 
     def test_arguments_grid_alignment_and_aliasing(self):
         scalars, buffers, grid, local = iq4_fixture()

@@ -48,6 +48,16 @@ int main() {
     std::vector<float> scales(blocks * 8);
     q8_decode_iq4_xs(bytes.data(), blocks, codes.data(), scales.data());
     for (size_t i = 0; i < weights.size(); ++i) weights[i] = scales[i / 32] * float(codes[i]);
+  } else if (type == 11) {
+    const auto bytes = read(110);
+    std::vector<float> scales(blocks * 16);
+    q8_decode_q3_k(bytes.data(), blocks, codes.data(), scales.data());
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = scales[i / 16] * float(codes[i]);
+  } else if (type == 21) {
+    const auto bytes = read(110);
+    std::vector<float> scales(blocks * 8);
+    q8_decode_iq3_s(bytes.data(), blocks, codes.data(), scales.data());
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = scales[i / 32] * float(codes[i]);
   } else {
     return 2;
   }

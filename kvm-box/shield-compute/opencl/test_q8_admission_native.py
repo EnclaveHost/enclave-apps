@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 
-from q8_admission import BufferView, validate_launch
+from q8_admission import BufferView, RAW_BLOCK, validate_launch
 
 HERE = Path(__file__).resolve().parent
 I32 = (1 << 31) - 1
@@ -20,15 +20,15 @@ INTERESTING = (0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 34, 63, 64, 65, 127,
 
 
 KINDS = {'mm': 1, 'mv': 2, 'mm_q4_k': 3, 'mv_q4_k': 4, 'mm_q6_k': 5, 'mv_q6_k': 6, 'mm_q5_k': 7, 'mv_q5_k': 8,
-         'raw_iq4_xs': 9, 'mm_iq4_nl': 10, 'mv_iq4_nl': 11}
+         'raw_iq4_xs': 9, 'mm_iq4_nl': 10, 'mv_iq4_nl': 11, 'raw_q3_k': 12, 'raw_iq3_s': 13}
 
 
 def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=False):
     """Scalars in the Q8 numbering; a Q4_K kernel's argument is two places later."""
-    if variant == 'raw_iq4_xs':
+    if variant in RAW_BLOCK:
         # Held as: 3 input offset, 4 weights offset, 5 output offset, 6 k, 7 n, 8 m.
         weights_offset = 2 * (input_offset // 4)
-        sizes = [weights_offset + n*k//256*136, input_offset + m*k*4, output_offset + m*n*4]
+        sizes = [weights_offset + n*k//256*RAW_BLOCK[variant], input_offset + m*k*4, output_offset + m*n*4]
         scalars = {3: input_offset, 4: weights_offset, 5: output_offset, 6: k, 7: n, 8: m}
         if shared_root:
             total, buffers, offset = sum((size + 63)//64*64 for size in sizes), [], 0
@@ -70,12 +70,12 @@ def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=Fal
 
 
 def reference(case):
-    if case['variant'] == 'raw_iq4_xs':
+    if case['variant'] in RAW_BLOCK:
         try:
             held = case['scalars']
             scalars = {1: held[4], 3: held[3], 5: held[5], 6: held[6], 7: held[7], 8: held[8]}
             buffers = {index: BufferView(*case['buffers'][i]) for i, index in enumerate((0, 2, 4))}
-            result = validate_launch('raw_iq4_xs', scalars, buffers, case['global'], case['local'], case['offset'])
+            result = validate_launch(case['variant'], scalars, buffers, case['global'], case['local'], case['offset'])
         except (ValueError, TypeError, KeyError, IndexError):
             return None
         return (result.m, result.n, result.k, *(end - start for _, start, end in result.reads),
@@ -162,7 +162,7 @@ class NativeAdmission(unittest.TestCase):
                  for shared in (False, True)]
         self.assertGreater(self.compare(cases), len(cases) // 2)
         cases = [launch(variant, k, n, m, input_offset=io, output_offset=oo, shared_root=shared)
-                 for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k', 'mm_q5_k', 'mv_q5_k', 'raw_iq4_xs')
+                 for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k', 'mm_q5_k', 'mv_q5_k', 'raw_iq4_xs', 'raw_q3_k', 'raw_iq3_s')
                  for k, n in ((2048, 11008), (11008, 2048), (256, 4), (2048, 151936), (288, 8), (256, 6))
                  for m in (1, 2, 3, 7, 32) for io, oo in ((0, 0), (32, 32), (64, 16))
                  for shared in (False, True)]
@@ -184,13 +184,14 @@ class NativeAdmission(unittest.TestCase):
         self.assertEqual(self.compare(cases), len(accepted))
         # The same holds for the two matrix kernels with two weight buffers:
         # Q8_0 buffers are large enough for an IQ4_NL tensor of the same shape.
+        # Q3_K and IQ3_S both have 110-byte blocks and one buffer.
         self.assertEqual(sorted((c['variant'], len(c['buffers'])) for c in accepted),
-                         [('mm_iq4_nl', 4), ('mm_q4_k', 6)])
+                         [('mm_iq4_nl', 4), ('mm_q4_k', 6), ('raw_iq3_s', 3)])
 
     def test_every_field_and_random_changes(self):
         rng = random.Random(20261119)
         cases = []
-        for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k', 'mm_q5_k', 'mv_q5_k', 'raw_iq4_xs'):
+        for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k', 'mm_q5_k', 'mv_q5_k', 'raw_iq4_xs', 'raw_q3_k', 'raw_iq3_s'):
             for shared in (False, True):
                 cases += mutations(launch(variant, 2048, 4864, 3, input_offset=32, output_offset=32,
                                           shared_root=shared), rng)

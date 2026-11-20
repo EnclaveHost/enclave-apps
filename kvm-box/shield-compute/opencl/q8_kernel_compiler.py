@@ -19,7 +19,8 @@ REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl',
               'mm_q6_k': 'mul_mm_q6_k_f32_l4_lm.cl', 'mv_q6_k': 'mul_mv_q6_k_f32_flat.cl',
               'mm_iq4_nl': 'mul_mm_iq4_nl_f32_l4_lm.cl', 'mv_iq4_nl': 'mul_mv_iq4_nl_f32_flat.cl',
               # Not llama's: added to its OpenCL backend by llama-shield-iq4-xs.patch.
-              'raw_iq4_xs': 'mul_mat_iq4_xs_f32_raw.cl'}
+              'raw_iq4_xs': 'mul_mat_iq4_xs_f32_raw.cl', 'raw_q3_k': 'mul_mat_q3_k_f32_raw.cl',
+              'raw_iq3_s': 'mul_mat_iq3_s_f32_raw.cl'}
 # The K-quant kernels take four weight buffers (five for Q5_K) where the
 # Q8_0 kernels take two; their other arguments follow.
 ARGUMENTS = {
@@ -31,6 +32,8 @@ ARGUMENTS = {
     'iq4_nl': {'quants': 0, 'scales': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     # One buffer of GGUF bytes, then its offset.
     'iq4_xs': {'weights': 0, 'weightsOffset': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
+    'q3_k': {'weights': 0, 'weightsOffset': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
+    'iq3_s': {'weights': 0, 'weightsOffset': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     'q6_k': {'quantsLow': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
              'outputOffset': 7},
 }
@@ -228,7 +231,8 @@ KERNELS = {
     'mm_q5_k': 'kernel_mul_mm_q5_k_f32_l4_lm', 'mv_q5_k': 'kernel_mul_mv_q5_K_f32_flat',
     'mm_q6_k': 'kernel_mul_mm_q6_k_f32_l4_lm', 'mv_q6_k': 'kernel_mul_mv_q6_K_f32_flat',
     'mm_iq4_nl': 'kernel_mul_mm_iq4_nl_f32_l4_lm', 'mv_iq4_nl': 'kernel_mul_mv_iq4_nl_f32_flat',
-    'raw_iq4_xs': 'kernel_mul_mat_iq4_xs_f32_raw',
+    'raw_iq4_xs': 'kernel_mul_mat_iq4_xs_f32_raw', 'raw_q3_k': 'kernel_mul_mat_q3_k_f32_raw',
+    'raw_iq3_s': 'kernel_mul_mat_iq3_s_f32_raw',
 }
 
 

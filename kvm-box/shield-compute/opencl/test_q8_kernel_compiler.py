@@ -33,6 +33,26 @@ class Q8CompilerTests(unittest.TestCase):
                 self.assertIn(old, source)
                 self.assertEqual(analyze(source.replace(old, new, 1)), {})
 
+    def test_the_q3_k_and_iq3_s_kernels_added_to_the_backend(self):
+        cases = {
+            'q3_k': [('(scale - 32)', None), ('(ulong)nb * 110', '(ulong)nb * 136'), ('? 0 : 4)', '? 0 : 3)'),
+                     ('block + 108', 'block + 106'), ('<< (half_block * 4 + pair)', '<< (half_block * 4)')],
+            'iq3_s': [('0x01010101, 0x01010103', '0x01010101, 0x01010105'), ('block[66 + part]', 'block[67 + part]'),
+                      ('1 + 2 * ((block[106', '2 * ((block[106'), ('? -magnitude : magnitude', '? magnitude : -magnitude'),
+                      ('0x0f0d0703, 0x0f0f0101,\n};', '0x0f0d0703, 0x0f0f0103,\n};')],
+        }
+        for weights, changes in cases.items():
+            source = (ROOT / f'mul_mat_{weights}_f32_raw.cl').read_text()
+            for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+                plan = analyze(source, options, compare=True)[f'kernel_mul_mat_{weights}_f32_raw']
+                self.assertEqual((plan['variant'], plan['operation']), ('raw_' + weights, weights + '-f32-matmul'))
+            for old, new in changes:
+                if new is None:
+                    continue
+                with self.subTest(weights=weights, change=old):
+                    self.assertIn(old, source)
+                    self.assertEqual(analyze(source.replace(old, new, 1)), {})
+
     def test_a_reference_itself_gets_the_plan_the_comparison_gives(self):
         from q8_kernel_compiler import KERNELS, REFERENCES
         self.assertEqual(set(KERNELS), set(REFERENCES))

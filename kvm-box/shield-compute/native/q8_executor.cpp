@@ -122,7 +122,7 @@ using Policy = std::map<std::string, PolicyEntry>;
 bool lowered_weight(uint32_t type, int64_t k) {
     return k > 0 && (((type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) && k % 32 == 0) ||
                      ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
-                       type == GGML_TYPE_IQ4_XS) &&
+                       type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ3_S) &&
                       k % 256 == 0));
 }
 

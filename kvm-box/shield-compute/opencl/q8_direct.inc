@@ -693,6 +693,10 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
         session.ready_valid = false;
         if (session.ready_slot == id && same_input) {
           ++session.served;
+          // A third tensor on the same activation (attention's q, k and v)
+          // follows this one, not the tensor the pair was requested with:
+          // learning it there would replace the pair just served.
+          session.last_slot = id;
           return session.shared + 2 * Q8_SHARED_REGION;
         }
         ++session.missed;
@@ -795,6 +799,14 @@ bool q8_kquant_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
     local.scales.resize(launch.k * launch.n / 32);
     q8_decode_iq4_nl(raw[0].data(), raw[1].data(), launch.k * launch.n / 32, local.codes.data(),
                      local.scales.data());
+  } else if (launch.kind == Q3K_RAW) {
+    local.block = 16;
+    local.scales.resize(blocks * 16);
+    q8_decode_q3_k(raw[0].data(), blocks, local.codes.data(), local.scales.data());
+  } else if (launch.kind == IQ3S_RAW) {
+    local.block = 32;
+    local.scales.resize(blocks * 8);
+    q8_decode_iq3_s(raw[0].data(), blocks, local.codes.data(), local.scales.data());
   } else if (count == 1) {
     local.block = 32;
     local.scales.resize(blocks * 8);
@@ -905,7 +917,9 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
       const bool nl = launch.kind == IQ4NL_MM || launch.kind == IQ4NL_MV;
       const json answer = nl ? iq4nl_authenticate(bytes[0], bytes[1], launch.k, launch.n)
-                          : count == 1 ? iq4xs_authenticate(bytes[0], launch.k, launch.n)
+                          : count == 1 ? raw_authenticate(bytes[0], launch.k, launch.n,
+                                                          launch.kind == Q3K_RAW ? 11 : launch.kind == IQ3S_RAW ? 21 : 23,
+                                                          q8_raw_block(launch.kind))
                           : count == 5 ? q5k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], launch.k,
                                                         launch.n)
                           : q6 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)

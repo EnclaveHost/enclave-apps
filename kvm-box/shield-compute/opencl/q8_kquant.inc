@@ -122,3 +122,57 @@ inline void q8_decode_iq4_nl(const unsigned char *quants, const unsigned char *d
     }
   }
 }
+
+// Q3_K: 110 bytes a block, kept as the GGUF has them: 32 bytes with the high
+// bit of each quant, 64 with the low two bits, 12 bytes of 6-bit scales and
+// half d. Sixteen parts of 16 weights; a weight is scales[part] * codes[i],
+// the code being the 3-bit quant less 4 and the scale d * (6-bit scale - 32).
+inline void q8_decode_q3_k(const unsigned char *bytes, size_t blocks, int8_t *codes, float *scales) {
+  for (size_t ib = 0; ib < blocks; ++ib) {
+    const unsigned char *block = bytes + ib * 110, *high = block, *quants = block + 32, *packed = block + 96;
+    uint16_t half;
+    std::memcpy(&half, block + 108, 2);
+    const float scale_d = q8_half_to_float(half);
+    for (size_t part = 0; part < 16; ++part) {
+      const int low = part < 8 ? packed[part] & 0xF : packed[part - 8] >> 4;
+      const int scale = (low | (((packed[8 + part % 4] >> (2 * (part / 4))) & 3) << 4)) - 32;
+      scales[ib * 16 + part] = scale_d * float(scale);
+      // A quant byte holds one weight of each of four pairs of parts of its
+      // half block; a high-bit byte one bit for each of the block's eight.
+      const size_t half_block = part / 8, pair = (part % 8) / 2;
+      const unsigned char *q = quants + half_block * 32 + (part % 2) * 16, *h = high + (part % 2) * 16;
+      const unsigned bit = 1u << (half_block * 4 + pair);
+      int8_t *out = codes + ib * 256 + part * 16;
+      for (size_t i = 0; i < 16; ++i) out[i] = int8_t(int((q[i] >> (2 * pair)) & 3) - ((h[i] & bit) ? 0 : 4));
+    }
+  }
+}
+
+#include "q8_iq3s_grid.inc"
+// IQ3_S: 110 bytes a block, kept as the GGUF has them: half d, 64 bytes of
+// grid indices, 8 bytes with their ninth bits, 32 bytes of signs and 4 bytes
+// of 4-bit scales. Eight parts of 32 weights, four weights to a grid entry; a
+// weight is scales[part] * codes[i], the code being the entry's odd magnitude
+// with its sign and the scale d * (1 + 2 * 4-bit scale).
+inline void q8_decode_iq3_s(const unsigned char *bytes, size_t blocks, int8_t *codes, float *scales) {
+  for (size_t ib = 0; ib < blocks; ++ib) {
+    const unsigned char *block = bytes + ib * 110;
+    uint16_t half;
+    std::memcpy(&half, block, 2);
+    const float scale_d = q8_half_to_float(half);
+    for (size_t part = 0; part < 8; ++part) {
+      const unsigned char *q = block + 2 + part * 8, *signs = block + 74 + part * 4;
+      const unsigned ninth = block[66 + part];
+      scales[ib * 8 + part] = scale_d * float(1 + 2 * ((block[106 + part / 2] >> (4 * (part % 2))) & 0xF));
+      int8_t *out = codes + ib * 256 + part * 32;
+      for (size_t i = 0; i < 8; ++i) {
+        const uint32_t entry = q8_iq3s_grid[q[i] | (((ninth >> i) & 1) << 8)];
+        const unsigned sign = signs[i / 2] >> (4 * (i % 2));
+        for (size_t w = 0; w < 4; ++w) {
+          const int magnitude = int((entry >> (8 * w)) & 0xFF);
+          out[i * 4 + w] = int8_t(((sign >> w) & 1) ? -magnitude : magnitude);
+        }
+      }
+    }
+  }
+}

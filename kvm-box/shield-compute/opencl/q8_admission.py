@@ -62,8 +62,8 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
     """
     if variant in ('mv_q6_k', 'mv_iq4_nl'):
         return validate_short_vector(variant, scalars, buffers, global_size, local_size, offset)
-    if variant == 'raw_iq4_xs':
-        return validate_iq4_xs(scalars, buffers, global_size, local_size, offset)
+    if variant in RAW_BLOCK:
+        return validate_raw(variant, scalars, buffers, global_size, local_size, offset)
     if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k', 'mm_q5_k', 'mv_q5_k', 'mm_q6_k', 'mm_iq4_nl'):
         raise ValueError('unknown kernel variant')
     k_quant = variant.endswith('_k')
@@ -252,10 +252,14 @@ def iq4_nl_digest(quants, scales, k, n):
     return digest.hexdigest()
 
 
-def validate_iq4_xs(scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
-    """The plain IQ4_XS kernel: weights as GGUF bytes and their offset, input
-    and offset, output and offset, then ne00, ne01, ne11. One work item an
-    output, every read guarded by the two dimensions."""
+# Bytes of GGUF for each 256 weights, for the types kept as the file has them.
+RAW_BLOCK = {'raw_iq4_xs': 136, 'raw_q3_k': 110, 'raw_iq3_s': 110}
+
+
+def validate_raw(variant, scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
+    """A plain kernel (IQ4_XS, Q3_K, IQ3_S): weights as GGUF bytes and their
+    offset, input and offset, output and offset, then ne00, ne01, ne11. One
+    work item an output, every read guarded by the two dimensions."""
     if set(scalars) != {1, 3, 5, 6, 7, 8} or set(buffers) != {0, 2, 4}:
         raise ValueError('incomplete kernel arguments')
     if any(type(key) is not int for key in (*scalars, *buffers)):
@@ -286,12 +290,12 @@ def validate_iq4_xs(scalars, buffers, global_size, local_size, offset=(0, 0, 0))
     for index, alignment, extra in ((0, 2, scalars[1]), (2, 4, scalars[3]), (4, 4, scalars[5])):
         if (buffers[index].offset + extra) % alignment:
             raise ValueError('unaligned kernel pointer')
-    reads = (buffers[0].interval(scalars[1], n*k//256*136), buffers[2].interval(scalars[3], m*k*4))
+    reads = (buffers[0].interval(scalars[1], n*k//256*RAW_BLOCK[variant]), buffers[2].interval(scalars[3], m*k*4))
     write = buffers[4].interval(scalars[5], m*n*4)
     if any(write[0] == read[0] and max(write[1], read[1]) < min(write[2], read[2])
            for read in reads):
         raise ValueError('output aliases an input allocation range')
-    return Launch('raw_iq4_xs', m, n, k, reads, write)
+    return Launch(variant, m, n, k, reads, write)
 
 
 def q6_k_digest(low, high, scales, d, k, n):

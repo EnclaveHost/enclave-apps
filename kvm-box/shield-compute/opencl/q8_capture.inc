@@ -78,7 +78,7 @@ std::string q8_sha(const std::string &value) {
   Q8Hash hash; hash.update(value.data(), value.size()); return hash.finish();
 }
 struct Q8PublicTensor {
-  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 20 IQ4_NL, 23 IQ4_XS
+  int type;  // GGML tensor type: 8 Q8_0, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 20 IQ4_NL, 21 IQ3_S, 23 IQ4_XS
   size_t k, n;
   std::string sha, name, engine, policy_sha;
 };
@@ -101,7 +101,8 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
       if (!tensors.is_array() || tensors.size()>100000) throw std::runtime_error("policy tensor limit");
       for (const auto &tensor : tensors) {
         if (tensor.at("type") != 8 && tensor.at("type") != 12 && tensor.at("type") != 13 &&
-            tensor.at("type") != 14 && tensor.at("type") != 20 && tensor.at("type") != 23) continue;
+            tensor.at("type") != 14 && tensor.at("type") != 20 && tensor.at("type") != 23 &&
+            tensor.at("type") != 11 && tensor.at("type") != 21) continue;
         const int type = tensor.at("type").get<int>();
         const auto &shape = tensor.at("ne");
         if (!shape.is_array() || shape.size()!=4) throw std::runtime_error("policy shape");
@@ -112,6 +113,7 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
         if (!k || k%32 || !n || k>(size_t(2)<<30)/n ||
             tensor.at("nbytes")!=(type == 12 ? k*n/256*144 : type == 13 ? k*n/256*176 :
                                   type == 14 ? k*n/256*210 : type == 23 ? k*n/256*136 :
+                                  type == 11 || type == 21 ? k*n/256*110 :
                                   type == 20 ? k*n/32*18 : k*n/32*34))
           throw std::runtime_error("policy tensor dimensions");
         result.push_back({type,k,n,tensor.at("sha256").get<std::string>(),tensor.at("name").get<std::string>(),engine,digest});
@@ -164,14 +166,15 @@ json iq4nl_authenticate(const std::vector<unsigned char> &quants, const std::vec
               {"sha256",digest},{"policySha256",tensor.policy_sha}};
   return {{"approved",false}};
 }
-// An IQ4_XS tensor is kept as its GGUF bytes: the digest is of the buffer.
-json iq4xs_authenticate(const std::vector<unsigned char> &bytes, size_t k, size_t n) {
-  if (k%256 || bytes.size()!=k*n/256*136) throw std::runtime_error("snapshot shape");
+// An IQ4_XS, Q3_K or IQ3_S tensor is kept as its GGUF bytes: the digest is of
+// the buffer. `type` is the GGML type and `block` its bytes for 256 weights.
+json raw_authenticate(const std::vector<unsigned char> &bytes, size_t k, size_t n, int type, size_t block) {
+  if (k%256 || bytes.size()!=k*n/256*block) throw std::runtime_error("snapshot shape");
   Q8Hash hash;
   hash.update(bytes.data(), bytes.size());
   const auto digest=hash.finish();
   for (const auto &tensor:q8_catalog())
-    if (tensor.type==23 && tensor.k==k && tensor.n==n && tensor.sha==digest)
+    if (tensor.type==type && tensor.k==k && tensor.n==n && tensor.sha==digest)
       return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
               {"sha256",digest},{"policySha256",tensor.policy_sha}};
   return {{"approved",false}};
@@ -445,7 +448,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
   }
   // Scalars as many places before a K-quant kernel has them as it has extra
   // weight buffers (see q8_admission.inc).
-  const bool mv=q8_kind_vector(kind), raw=kind==IQ4XS_RAW;
+  const bool mv=q8_kind_vector(kind), raw=q8_kind_raw(kind);
   const unsigned weights=q8_kind_weights(kind), shift=raw?0:weights-2;
   std::array<cl_mem,7> buffers{};
   std::array<Storage,7> stored{};
@@ -459,7 +462,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
   try {
     const bool strided=kind==Q8_MV || kind==Q4K_MV || kind==Q5K_MV;  // byte strides passed as ulong
     if(raw) {
-      // The plain IQ4_XS kernel: weights offset, input offset, output offset
+      // A plain kernel: weights offset, input offset, output offset
       // as ulong at 1, 3, 5; ne00, ne01, ne11 at 6, 7, 8. Held with the
       // weights offset at 4.
       for(unsigned i=1;i<9;++i) if(i!=2 && i!=4) {

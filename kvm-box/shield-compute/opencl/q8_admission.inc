@@ -15,18 +15,23 @@ enum Q8Kind {
   IQ4XS_RAW = 9,
   // IQ4_NL: two weight buffers. The matrix kernel has the Q8_0 arguments; the
   // vector kernel has the Q6_K vector kernel's shorter list.
-  IQ4NL_MM = 10, IQ4NL_MV = 11
+  IQ4NL_MM = 10, IQ4NL_MV = 11,
+  // Plain kernels like the IQ4_XS one, for Q3_K and IQ3_S.
+  Q3K_RAW = 12, IQ3S_RAW = 13
 };
+inline bool q8_kind_raw(int kind) { return kind == IQ4XS_RAW || kind == Q3K_RAW || kind == IQ3S_RAW; }
+// Bytes of GGUF for each 256 weights of a type kept as the file has it.
+inline unsigned q8_raw_block(int kind) { return kind == IQ4XS_RAW ? 136 : 110; }
 inline bool q8_kind_vector(int kind) {
   return kind == Q8_MV || kind == Q4K_MV || kind == Q6K_MV || kind == Q5K_MV || kind == IQ4NL_MV;
 }
 // Q5_K has a fifth weight buffer, the high bit of each quant.
 inline unsigned q8_kind_weights(int kind) {
-  return kind == IQ4XS_RAW ? 1 : kind == Q5K_MM || kind == Q5K_MV ? 5 : kind >= Q4K_MM && kind <= Q6K_MV ? 4 : 2;
+  return q8_kind_raw(kind) ? 1 : kind == Q5K_MM || kind == Q5K_MV ? 5 : kind >= Q4K_MM && kind <= Q6K_MV ? 4 : 2;
 }
 // One past the last meaningful scalar.
 inline unsigned q8_kind_scalars(int kind) {
-  return kind == Q6K_MV || kind == IQ4NL_MV ? 15 : kind == IQ4XS_RAW ? 9 : 19;
+  return kind == Q6K_MV || kind == IQ4NL_MV ? 15 : q8_kind_raw(kind) ? 9 : 19;
 }
 struct Q8BufferView {
   uint64_t root, root_bytes, offset, size;
@@ -45,7 +50,7 @@ struct Q8Layout {
 std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
   using wide = unsigned __int128;
   constexpr uint64_t I32 = (1ull << 31) - 1, U32 = (1ull << 32) - 1, MAX_BYTES = 2ull << 30;
-  if (v.kind < Q8_MM || v.kind > IQ4NL_MV) return std::nullopt;
+  if (v.kind < Q8_MM || v.kind > IQ3S_RAW) return std::nullopt;
   const bool vector = q8_kind_vector(v.kind), k_quant = q8_kind_weights(v.kind) >= 4;
   const bool q6 = v.kind == Q6K_MM || v.kind == Q6K_MV, q5 = v.kind == Q5K_MM || v.kind == Q5K_MV;
   const unsigned weights = q8_kind_weights(v.kind);
@@ -57,7 +62,7 @@ std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
   };
   if (v.offset[0] || v.offset[1] || v.offset[2]) return std::nullopt;
   const auto &s = v.scalars;
-  if (v.kind == IQ4XS_RAW) {
+  if (q8_kind_raw(v.kind)) {
     // offset1, weights offset, offsetd, ne00, ne01, ne11 at 3, 4, 5, 6, 7, 8.
     // One work item an output; every read is guarded by the two dimensions.
     for (unsigned i = 6; i < 9; ++i)
@@ -77,7 +82,7 @@ std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
     if ((wide(v.buffers[0].offset) + s[4]) % 2 || (wide(v.buffers[1].offset) + s[3]) % 4 ||
         (wide(v.buffers[2].offset) + s[5]) % 4)
       return std::nullopt;
-    const auto weights_read = interval(v.buffers[0], s[4], n * k / 256 * 136);
+    const auto weights_read = interval(v.buffers[0], s[4], n * k / 256 * q8_raw_block(v.kind));
     const auto input_read = interval(v.buffers[1], s[3], m * k * 4);
     const auto write = interval(v.buffers[2], s[5], m * n * 4);
     if (!weights_read || !input_read || !write) return std::nullopt;
