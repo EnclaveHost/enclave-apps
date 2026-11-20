@@ -78,7 +78,7 @@ std::string q8_sha(const std::string &value) {
   Q8Hash hash; hash.update(value.data(), value.size()); return hash.finish();
 }
 struct Q8PublicTensor {
-  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 23 IQ4_XS
+  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 20 IQ4_NL, 23 IQ4_XS
   size_t k, n;
   std::string sha, name, engine, policy_sha;
 };
@@ -101,17 +101,18 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
       if (!tensors.is_array() || tensors.size()>100000) throw std::runtime_error("policy tensor limit");
       for (const auto &tensor : tensors) {
         if (tensor.at("type") != 8 && tensor.at("type") != 12 && tensor.at("type") != 13 &&
-            tensor.at("type") != 14 && tensor.at("type") != 23) continue;
+            tensor.at("type") != 14 && tensor.at("type") != 20 && tensor.at("type") != 23) continue;
         const int type = tensor.at("type").get<int>();
         const auto &shape = tensor.at("ne");
         if (!shape.is_array() || shape.size()!=4) throw std::runtime_error("policy shape");
         if (shape[2] != 1 || shape[3] != 1) continue;
         size_t k=shape[0].get<size_t>(), n=shape[1].get<size_t>();
         // A K-quant tensor whose rows are not whole super-blocks is never lowered.
-        if (type != 8 && k%256) continue;
+        if (type != 8 && type != 20 && k%256) continue;
         if (!k || k%32 || !n || k>(size_t(2)<<30)/n ||
             tensor.at("nbytes")!=(type == 12 ? k*n/256*144 : type == 13 ? k*n/256*176 :
-                                  type == 14 ? k*n/256*210 : type == 23 ? k*n/256*136 : k*n/32*34))
+                                  type == 14 ? k*n/256*210 : type == 23 ? k*n/256*136 :
+                                  type == 20 ? k*n/32*18 : k*n/32*34))
           throw std::runtime_error("policy tensor dimensions");
         result.push_back({type,k,n,tensor.at("sha256").get<std::string>(),tensor.at("name").get<std::string>(),engine,digest});
       }
@@ -139,6 +140,28 @@ json q8_authenticate(const std::vector<unsigned char> &quants,
       return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
               {"sha256",digest},{"policySha256",tensor.policy_sha}};
   // Unknown weights may be private. Do not expose their digest or contents.
+  return {{"approved",false}};
+}
+// An IQ4_NL tensor: half d, then 16 quant bytes, for each 32 weights.
+json iq4nl_authenticate(const std::vector<unsigned char> &quants, const std::vector<unsigned char> &d,
+                        size_t k, size_t n) {
+  const size_t blocks=k*n/32;
+  if (k%32 || quants.size()!=blocks*16 || d.size()!=blocks*2) throw std::runtime_error("snapshot shape");
+  Q8Hash hash;
+  std::vector<unsigned char> packed(4096*18);
+  for (size_t first=0;first<blocks;first+=4096) {
+    const size_t count=std::min(size_t(4096), blocks-first);
+    for (size_t block=0;block<count;++block) {
+      std::memcpy(packed.data()+block*18, d.data()+(first+block)*2, 2);
+      std::memcpy(packed.data()+block*18+2, quants.data()+(first+block)*16, 16);
+    }
+    hash.update(packed.data(), count*18);
+  }
+  const auto digest=hash.finish();
+  for (const auto &tensor:q8_catalog())
+    if (tensor.type==20 && tensor.k==k && tensor.n==n && tensor.sha==digest)
+      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
+              {"sha256",digest},{"policySha256",tensor.policy_sha}};
   return {{"approved",false}};
 }
 // An IQ4_XS tensor is kept as its GGUF bytes: the digest is of the buffer.
@@ -476,7 +499,8 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     // These equalities bind the snapshot and write extents to the same checked
     // ABI, in addition to the stride/grid/alias/range validation above.
     if(!checked_k || checked_k!=scalars[6] || !checked_n || checked_n!=scalars[7] ||
-       !checked_m || checked_m!=scalars[raw?8:kind==Q6K_MV?12:mv?16:9] || checked_k>(512u<<20)/4/checked_m ||
+       !checked_m || checked_m!=scalars[raw?8:(kind==Q6K_MV || kind==IQ4NL_MV)?12:mv?16:9] ||
+       checked_k>(512u<<20)/4/checked_m ||
        checked_n>(512u<<20)/4/checked_m || bytes[weights]!=checked_m*checked_k*4 ||
        checked_output!=checked_m*checked_n*4) return {false,0};
     size_t total=0;

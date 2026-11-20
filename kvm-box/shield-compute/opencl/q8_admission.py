@@ -60,13 +60,15 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
     (five for Q5_K) instead of two, so 0/1/2/3/4/6 or 0/1/2/3/4/5/7.
     Explicit local sizes and a complete zero-offset 3-D grid are required.
     """
-    if variant == 'mv_q6_k':
-        return validate_q6_k_vector(scalars, buffers, global_size, local_size, offset)
+    if variant in ('mv_q6_k', 'mv_iq4_nl'):
+        return validate_short_vector(variant, scalars, buffers, global_size, local_size, offset)
     if variant == 'raw_iq4_xs':
         return validate_iq4_xs(scalars, buffers, global_size, local_size, offset)
-    if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k', 'mm_q5_k', 'mv_q5_k', 'mm_q6_k'):
+    if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k', 'mm_q5_k', 'mv_q5_k', 'mm_q6_k', 'mm_iq4_nl'):
         raise ValueError('unknown kernel variant')
     k_quant = variant.endswith('_k')
+    # IQ4_NL has the Q8_0 matrix kernel's arguments; its quants are nibbles.
+    nibbles = variant == 'mm_iq4_nl'
     q5, q6 = variant.endswith('_q5_k'), variant.endswith('_q6_k')
     matrix = variant.startswith('mm')
     # Every argument after the weights moves by this: Q5_K has a fifth weight
@@ -148,7 +150,7 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
         # pointers; the vector kernel reads the scales as ushort.
         aligned = ((0, 4, 0), (1, 1 if matrix else 2, 0), (2, 2, 0), (3, 2, 0))
     else:
-        aligned = ((0, 4 if matrix else 1, 0), (1, 2, 0))
+        aligned = ((0, 4 if matrix else 1, 0), (1, 2, 0))  # IQ4_NL reads its quants as uchar4 too
     for index, alignment, extra in (*aligned, (at(2), input_alignment, scalars[at(3)]),
                                     (at(4), 4, scalars[at(5)])):
         if (buffers[index].offset + extra) % alignment:
@@ -158,7 +160,7 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
         sizes = (128, 32, 12, 2, 2) if q5 else (128, 64, 16, 2) if q6 else (128, 12, 2, 2)
         reads = tuple(buffers[index].interval(0, blocks*size) for index, size in enumerate(sizes))
     else:
-        reads = (buffers[0].interval(0, n*k), buffers[1].interval(0, n*k//16))
+        reads = (buffers[0].interval(0, n*k//2 if nibbles else n*k), buffers[1].interval(0, n*k//16))
     reads += (buffers[at(2)].interval(scalars[at(3)], m*k*4),)
     write = buffers[at(4)].interval(scalars[at(5)], m*n*4)
     if any(write[0] == read[0] and max(write[1], read[1]) < min(write[2], read[2])
@@ -167,11 +169,16 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
     return Launch(variant, m, n, k, reads, write)
 
 
-def validate_q6_k_vector(scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
-    """The Q6_K vector kernel, which has its own seventeen arguments: four
-    weight buffers (low and high quant bits, scales, d), input, its offset,
-    output, its offset, then ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3."""
-    if set(scalars) != {5, 7, *range(8, 17)} or set(buffers) != {0, 1, 2, 3, 4, 6}:
+def validate_short_vector(variant, scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
+    """The Q6_K and IQ4_NL vector kernels, which share a list of arguments after
+    their weight buffers (four: low and high quant bits, scales, d; or two:
+    quants, d): input, its offset, output, its offset, then ne00, ne01, ne02,
+    ne10, ne12, ne0, ne1, r2, r3."""
+    q6 = variant == 'mv_q6_k'
+    weights = 4 if q6 else 2
+    at = lambda index: index + weights
+    if (set(scalars) != {at(1), at(3), *range(at(4), at(13))}
+            or set(buffers) != {*range(weights), at(0), at(2)}):
         raise ValueError('incomplete kernel arguments')
     if any(type(key) is not int for key in (*scalars, *buffers)):
         raise ValueError('invalid argument index')
@@ -183,20 +190,22 @@ def validate_q6_k_vector(scalars, buffers, global_size, local_size, offset=(0, 0
     if tuple(offset) != (0, 0, 0):
         raise ValueError('global offsets need separate lowering')
     for index, value in scalars.items():
-        integer(value, U64 if index in (5, 7) else I32)
-    k, n, m = scalars[8], scalars[9], scalars[14]
-    if min(k, n, m) == 0 or k % 256 or k > I32 - 128:
+        integer(value, U64 if index in (at(1), at(3)) else I32)
+    k, n, m = scalars[at(4)], scalars[at(5)], scalars[at(10)]
+    if min(k, n, m) == 0 or k % (256 if q6 else 32) or k > I32 - 128:
         raise ValueError('invalid tensor dimensions')
-    # Every row is guarded before it is read. Block counts, the input index
-    # and the output index are signed int products.
-    if n > I32 - 8 or n*k//256 > I32 or m*k > I32 or m*n > I32:
-        raise ValueError('signed kernel index overflow')
-    if any(scalars[index] != value for index, value in
-           {10: 1, 11: k, 12: 1, 13: n, 15: 1, 16: 1}.items()):
+    # Block counts, the input index and the output index are signed int
+    # products. The Q6_K kernel guards every row before it reads it; the
+    # IQ4_NL kernel reads eight rows and guards only the writes.
+    if n > I32 - 8 or n*k//32 > I32 or m*k > I32 or m*n > I32 or (not q6 and n % 8):
+        raise ValueError('signed kernel index overflow or unguarded tail rows')
+    if any(scalars[at(index)] != value for index, value in
+           {6: 1, 7: k, 8: 1, 9: n, 11: 1, 12: 1}.items()):
         raise ValueError('unsupported strides, broadcasting or batching')
-    if tuple(global_size) != ((n+7)//8*16, m*2, 1) or tuple(local_size) != (16, 2, 1):
+    grid, local = (((n+7)//8*16, m*2, 1), (16, 2, 1)) if q6 else (((n+7)//8*16, m, 1), (16, 1, 1))
+    if tuple(global_size) != grid or tuple(local_size) != local:
         raise ValueError('incomplete or incompatible workgroup grid')
-    if scalars[5] % 4 or scalars[7] % 4:
+    if scalars[at(1)] % 4 or scalars[at(3)] % 4:
         raise ValueError('unaligned kernel pointer offset')
     roots = {}
     for buffer in buffers.values():
@@ -206,18 +215,41 @@ def validate_q6_k_vector(scalars, buffers, global_size, local_size, offset=(0, 0
         if buffer.root in roots and roots[buffer.root] != buffer.root_bytes:
             raise ValueError('inconsistent root allocation size')
         roots[buffer.root] = buffer.root_bytes
-    for index, alignment, extra in ((0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 2, 0),
-                                    (4, 4, scalars[5]), (6, 4, scalars[7])):
+    aligned = ((0, 1), (1, 1), (2, 1), (3, 2)) if q6 else ((0, 1), (1, 2))
+    for index, alignment, extra in (*((i, a, 0) for i, a in aligned), (at(0), 4, scalars[at(1)]),
+                                    (at(2), 4, scalars[at(3)])):
         if (buffers[index].offset + extra) % alignment:
             raise ValueError('unaligned sub-buffer address')
-    blocks = n*k//256
-    reads = tuple(buffers[index].interval(0, blocks*size) for index, size in enumerate((128, 64, 16, 2)))
-    reads += (buffers[4].interval(scalars[5], m*k*4),)
-    write = buffers[6].interval(scalars[7], m*n*4)
+    if q6:
+        blocks = n*k//256
+        reads = tuple(buffers[index].interval(0, blocks*size) for index, size in enumerate((128, 64, 16, 2)))
+    else:
+        reads = (buffers[0].interval(0, n*k//2), buffers[1].interval(0, n*k//16))
+    reads += (buffers[at(0)].interval(scalars[at(1)], m*k*4),)
+    write = buffers[at(2)].interval(scalars[at(3)], m*n*4)
     if any(write[0] == read[0] and max(write[1], read[1]) < min(write[2], read[2])
            for read in reads):
         raise ValueError('output aliases an input allocation range')
-    return Launch('mv_q6_k', m, n, k, reads, write)
+    return Launch(variant, m, n, k, reads, write)
+
+
+def iq4_nl_digest(quants, scales, k, n):
+    """Hash original GGUF block_iq4_nl order: half d, then 16 quant bytes, for
+    each 32 weights. Exact bytes."""
+    integer(k, I32)
+    integer(n, I32)
+    if not k or not n or k % 32 or k*n > 2*MAX_BYTES:
+        raise ValueError('invalid IQ4_NL tensor shape')
+    if type(quants) is not bytes or type(scales) is not bytes:
+        raise ValueError('immutable snapshots required')
+    blocks = k*n//32
+    if len(quants) != blocks*16 or len(scales) != blocks*2:
+        raise ValueError('IQ4_NL tensor lengths differ from shape')
+    digest = hashlib.sha256()
+    for block in range(blocks):
+        digest.update(scales[block*2:block*2+2])
+        digest.update(quants[block*16:block*16+16])
+    return digest.hexdigest()
 
 
 def validate_iq4_xs(scalars, buffers, global_size, local_size, offset=(0, 0, 0)):

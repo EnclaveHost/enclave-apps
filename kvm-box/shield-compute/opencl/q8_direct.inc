@@ -789,8 +789,13 @@ bool q8_kquant_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
       return false;
   }
   const size_t blocks = launch.k * launch.n / 256;
-  local.codes.resize(blocks * 256);
-  if (count == 1) {
+  local.codes.resize(launch.k * launch.n);
+  if (launch.kind == IQ4NL_MM || launch.kind == IQ4NL_MV) {
+    local.block = 32;
+    local.scales.resize(launch.k * launch.n / 32);
+    q8_decode_iq4_nl(raw[0].data(), raw[1].data(), launch.k * launch.n / 32, local.codes.data(),
+                     local.scales.data());
+  } else if (count == 1) {
     local.block = 32;
     local.scales.resize(blocks * 8);
     q8_decode_iq4_xs(raw[0].data(), blocks, local.codes.data(), local.scales.data());
@@ -812,7 +817,8 @@ bool q8_kquant_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
 
 bool q8_local(const Q8DirectLaunch &launch, const Q8Identity &identity, bool remembered,
               const std::vector<unsigned char> &input, std::vector<unsigned char> &output) {
-  const bool k_quant = launch.weights() != 2;
+  // Everything but Q8_0 is decoded from its flat buffers.
+  const bool k_quant = launch.kind != Q8_MM && launch.kind != Q8_MV;
   if (!q8_local_enabled() || !remembered || identity.local_unavailable) return false;
   if (!identity.local) {
     const size_t bytes = k_quant ? launch.k * launch.n + launch.k * launch.n / 4
@@ -897,7 +903,9 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     stage = Q8Timing::now();
     try {
       const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
-      const json answer = count == 1 ? iq4xs_authenticate(bytes[0], launch.k, launch.n)
+      const bool nl = launch.kind == IQ4NL_MM || launch.kind == IQ4NL_MV;
+      const json answer = nl ? iq4nl_authenticate(bytes[0], bytes[1], launch.k, launch.n)
+                          : count == 1 ? iq4xs_authenticate(bytes[0], launch.k, launch.n)
                           : count == 5 ? q5k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], launch.k,
                                                         launch.n)
                           : q6 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)

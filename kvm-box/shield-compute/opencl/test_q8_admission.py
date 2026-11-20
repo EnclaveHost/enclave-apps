@@ -4,7 +4,8 @@ import struct
 import unittest
 from dataclasses import replace
 
-from q8_admission import (BufferView, PublicQ8Catalog, q4_k_digest, q5_k_digest, q6_k_digest, q8_digest,
+from q8_admission import (BufferView, PublicQ8Catalog, iq4_nl_digest, q4_k_digest, q5_k_digest, q6_k_digest,
+                          q8_digest,
                           validate_launch)
 
 
@@ -250,6 +251,62 @@ class IQ4XSLaunchTests(unittest.TestCase):
         short = replace(buffers[0], size=buffers[0].size-1)
         with self.assertRaises(ValueError):
             validate_launch('raw_iq4_xs', scalars, {**buffers, 0: short}, grid, local)
+
+
+def nl_fixture(variant, k=96, n=72, m=3):
+    """IQ4_NL: the Q8_0 matrix arguments, or the short vector list after two buffers."""
+    if variant == 'mm_iq4_nl':
+        scalars, buffers, grid, local = fixture('mm', k, n, m)
+    else:
+        scalars = {3: 32, 5: 16, 6: k, 7: n, 8: 1, 9: k, 10: 1, 11: n, 12: m, 13: 1, 14: 1}
+        grid, local = ((n+7)//8*16, m, 1), (16, 1, 1)
+        buffers = {2: BufferView(3, m*k*4+96, 64, m*k*4+32), 4: BufferView(5, m*n*4+80, 64, m*n*4+16)}
+    buffers = {**buffers, 0: BufferView(1, n*k//2+64, 64, n*k//2), 1: BufferView(2, n*k//16+64, 64, n*k//16)}
+    return scalars, buffers, grid, local
+
+
+class IQ4NLLaunchTests(unittest.TestCase):
+    def test_real_layouts(self):
+        for variant, k, n, m in [('mm_iq4_nl', 5120, 17408, 32), ('mv_iq4_nl', 17408, 5120, 1),
+                                  ('mv_iq4_nl', 5120, 10240, 1), ('mm_iq4_nl', 96, 73, 67), ('mv_iq4_nl', 32, 8, 3)]:
+            with self.subTest(variant=variant, shape=(k, n, m)):
+                launch = validate_launch(variant, *nl_fixture(variant, k, n, m))
+                self.assertEqual([end-start for _, start, end in launch.reads], [k*n//2, k*n//16, m*k*4])
+                self.assertEqual(launch.write[2]-launch.write[1], m*n*4)
+
+    def test_arguments_tail_rows_and_other_kernels(self):
+        scalars, buffers, grid, local = nl_fixture('mv_iq4_nl')
+        for index in range(6, 15):
+            with self.subTest(index=index):
+                with self.assertRaises(ValueError):
+                    validate_launch('mv_iq4_nl', {**scalars, index: scalars[index]+1}, buffers, grid, local)
+        with self.assertRaises(ValueError):  # eight rows are read before any guard
+            validate_launch('mv_iq4_nl', *nl_fixture('mv_iq4_nl', 96, 12, 1))
+        with self.assertRaises(ValueError):
+            validate_launch('mv_iq4_nl', scalars, buffers, grid, (16, 2, 1))
+        for other in ('mv', 'mv_q6_k', 'mm_iq4_nl'):
+            with self.assertRaises(ValueError):
+                validate_launch(other, scalars, buffers, grid, local)
+        with self.assertRaises(ValueError):  # Q8 buffers hold twice the quants; the Q8 kernel needs them
+            validate_launch('mm', *nl_fixture('mm_iq4_nl'))
+        odd = replace(buffers[1], offset=buffers[1].offset+1, root_bytes=buffers[1].root_bytes+1)
+        with self.assertRaises(ValueError):
+            validate_launch('mv_iq4_nl', scalars, {**buffers, 1: odd}, grid, local)
+        for index in (0, 1, 2):
+            shared = replace(buffers[4], root=buffers[index].root, root_bytes=1 << 20, offset=0, size=1 << 20)
+            source = replace(buffers[index], root_bytes=1 << 20)
+            with self.assertRaises(ValueError):
+                validate_launch('mv_iq4_nl', scalars, {**buffers, index: source, 4: shared}, grid, local)
+
+    def test_digest_is_the_gguf_block_order(self):
+        k, n = 64, 500
+        blocks = k*n//32
+        raw = bytes((17*i+9) % 247 for i in range(blocks*18))
+        d = b''.join(raw[i*18:i*18+2] for i in range(blocks))
+        quants = b''.join(raw[i*18+2:i*18+18] for i in range(blocks))
+        self.assertEqual(iq4_nl_digest(quants, d, k, n), hashlib.sha256(raw).hexdigest())
+        with self.assertRaises(ValueError):
+            iq4_nl_digest(quants, d[:-2], k, n)
 
 
 class Q6KLaunchTests(unittest.TestCase):

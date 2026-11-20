@@ -17,6 +17,7 @@ REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl',
               'mm_q4_k': 'mul_mm_q4_k_f32_l4_lm.cl', 'mv_q4_k': 'mul_mv_q4_k_f32_flat.cl',
               'mm_q5_k': 'mul_mm_q5_k_f32_l4_lm.cl', 'mv_q5_k': 'mul_mv_q5_k_f32_flat.cl',
               'mm_q6_k': 'mul_mm_q6_k_f32_l4_lm.cl', 'mv_q6_k': 'mul_mv_q6_k_f32_flat.cl',
+              'mm_iq4_nl': 'mul_mm_iq4_nl_f32_l4_lm.cl', 'mv_iq4_nl': 'mul_mv_iq4_nl_f32_flat.cl',
               # Not llama's: added to its OpenCL backend by llama-shield-iq4-xs.patch.
               'raw_iq4_xs': 'mul_mat_iq4_xs_f32_raw.cl'}
 # The K-quant kernels take four weight buffers (five for Q5_K) where the
@@ -27,6 +28,7 @@ ARGUMENTS = {
              'outputOffset': 7},
     'q5_k': {'quants': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'dmin': 4, 'input': 5, 'inputOffset': 6,
              'output': 7, 'outputOffset': 8},
+    'iq4_nl': {'quants': 0, 'scales': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     # One buffer of GGUF bytes, then its offset.
     'iq4_xs': {'weights': 0, 'weightsOffset': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     'q6_k': {'quantsLow': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
@@ -91,7 +93,15 @@ def source_functions(tree):
     kernels, helpers = [], {}
     for node in tree.get('inner', []):
         if node.get('kind') == 'VarDecl':
-            raise ValueError('global storage is not supported')
+            # A table of constants is compared, like a function, through the
+            # kernel that reads it. Anything else at file scope is refused.
+            qualified = node.get('type', {}).get('qualType', '')
+            # __constant storage cannot be written, by a kernel or anything else.
+            if ('includedFrom' in node.get('loc', {}) or not qualified.startswith('__constant ')
+                    or not node.get('inner')):
+                raise ValueError('global storage is not supported')
+            helpers[node['id']] = node
+            continue
         if node.get('kind') != 'FunctionDecl':
             continue
         if 'includedFrom' in node.get('loc', {}):
@@ -182,6 +192,11 @@ def normalize(function, source, helpers=None, calling=(), used=None):
                 if decl['name'] not in BUILTINS:
                     raise ValueError('unsupported imported call')
                 result['reference'] = [decl['kind'], decl['name'], canonical_type(decl)]
+            elif decl['kind'] == 'VarDecl' and decl['id'] in helpers:
+                # A constant table of this source: its values are part of the comparison.
+                used.add(decl['id'])
+                result['reference'] = ['SourceConstant', canonical_type(decl),
+                                       normalize(helpers[decl['id']], source, {}, calling + (decl['id'],), used)]
             else:
                 if decl['id'] not in symbols:
                     raise ValueError('reference outside kernel')
@@ -195,7 +210,7 @@ def normalize(function, source, helpers=None, calling=(), used=None):
     return visit(function)
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=64)
 def reference(variant, flags, clang):
     source = (ROOT / REFERENCES[variant]).read_text()
     tree = ast(source, clang, flags + CAPABILITIES)
@@ -204,7 +219,38 @@ def reference(variant, flags, clang):
     return normalize(functions[0], source, helpers), hashlib.sha256(source.encode()).hexdigest()
 
 
-def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
+# The one kernel each reference defines. A source that is byte for byte a
+# reference needs no comparison (test_q8_kernel_compiler.py checks that the
+# comparison gives the same plans for every reference).
+KERNELS = {
+    'mm': 'kernel_mul_mm_q8_0_f32_l4_lm', 'mv': 'kernel_mul_mv_q8_0_f32_flat',
+    'mm_q4_k': 'kernel_mul_mm_q4_k_f32_l4_lm', 'mv_q4_k': 'kernel_mul_mv_q4_K_f32_flat',
+    'mm_q5_k': 'kernel_mul_mm_q5_k_f32_l4_lm', 'mv_q5_k': 'kernel_mul_mv_q5_K_f32_flat',
+    'mm_q6_k': 'kernel_mul_mm_q6_k_f32_l4_lm', 'mv_q6_k': 'kernel_mul_mv_q6_K_f32_flat',
+    'mm_iq4_nl': 'kernel_mul_mm_iq4_nl_f32_l4_lm', 'mv_iq4_nl': 'kernel_mul_mv_iq4_nl_f32_flat',
+    'raw_iq4_xs': 'kernel_mul_mat_iq4_xs_f32_raw',
+}
+
+
+def plan(variant, digest, flags):
+    weights = variant.split('_', 1)[1] if '_' in variant else 'q8_0'
+    return {
+        'schema': 'shield-opencl-q8-analysis/1', 'dispatchable': False,
+        'operation': weights + '-f32-matmul', 'variant': variant,
+        'referenceSha256': digest, 'buildOptions': list(flags),
+        'arguments': ARGUMENTS[weights],
+        'requires': ['validated-launch-and-storage', 'authenticated-public-q8-tensor',
+                     'explicit-numerical-contract', 'verified-masked-executor'],
+    }
+
+
+@lru_cache(maxsize=1)
+def reference_digests():
+    return {hashlib.sha256((ROOT / filename).read_bytes()).hexdigest(): variant
+            for variant, filename in REFERENCES.items()}
+
+
+def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18', compare=False):
     if not isinstance(source, str) or not isinstance(options, str):
         return {}
     if len(source.encode()) > MAX_SOURCE or '\0' in source or len(options) > 4096:
@@ -215,6 +261,10 @@ def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
     flags = next((profile for profile in (STRICT, FAST) if set(options) == set(profile)), None)
     if flags is None:
         return {}
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    if not compare and digest in reference_digests():
+        variant = reference_digests()[digest]
+        return {KERNELS[variant]: plan(variant, digest, flags)}
     try:
         functions, helpers = source_functions(ast(source, clang, flags + CAPABILITIES))
         plans = {}
@@ -224,15 +274,7 @@ def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
             for variant in REFERENCES:
                 pattern, digest = reference(variant, flags, clang)
                 if normalized == pattern:
-                    weights = variant.split('_', 1)[1] if '_' in variant else 'q8_0'
-                    plans[function['name']] = {
-                        'schema': 'shield-opencl-q8-analysis/1', 'dispatchable': False,
-                        'operation': weights + '-f32-matmul', 'variant': variant,
-                        'referenceSha256': digest, 'buildOptions': list(flags),
-                        'arguments': ARGUMENTS[weights],
-                        'requires': ['validated-launch-and-storage', 'authenticated-public-q8-tensor',
-                                     'explicit-numerical-contract', 'verified-masked-executor'],
-                    }
+                    plans[function['name']] = plan(variant, digest, flags)
         # A function no kernel calls has no audited counterpart to be compared with.
         if used != set(helpers):
             return {}

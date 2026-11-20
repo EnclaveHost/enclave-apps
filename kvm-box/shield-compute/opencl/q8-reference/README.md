@@ -13,6 +13,8 @@ Copied byte-for-byte from llama.cpp commit
 
 | `mul_mm_q5_k_f32_l4_lm.cl` | `86ff5d043dbdadaf9ae20b3ca705ab470ae40104e1798c556339cfa2d0b29722` |
 | `mul_mv_q5_k_f32_flat.cl` | `29f18899004892ccc213435a93e20945258d0e222f6434b44ee81a8403e64cc7` |
+| `mul_mm_iq4_nl_f32_l4_lm.cl` | `60476776abf2c3c039868b10cfeab9de2155ebdd3e0c9119879574230d8bd973` |
+| `mul_mv_iq4_nl_f32_flat.cl` | `320423827aebd8fa18490575215750e644e894b532618ab99b6665eaeaec9cf6` |
 | `mul_mm_q6_k_f32_l4_lm.cl` | `77e47f8f5a7353205cfa29a566b5b4065933aba8f96a4d734283bde763eeb522` |
 | `mul_mv_q6_k_f32_flat.cl` | `1ffac95ccbc2ad514fd53a1d3ecb8d0ae04a429d080ecacd64166067b6095d3d` |
 

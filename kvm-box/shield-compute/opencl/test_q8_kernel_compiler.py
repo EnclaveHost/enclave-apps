@@ -33,6 +33,35 @@ class Q8CompilerTests(unittest.TestCase):
                 self.assertIn(old, source)
                 self.assertEqual(analyze(source.replace(old, new, 1)), {})
 
+    def test_a_reference_itself_gets_the_plan_the_comparison_gives(self):
+        from q8_kernel_compiler import KERNELS, REFERENCES
+        self.assertEqual(set(KERNELS), set(REFERENCES))
+        for variant, filename in REFERENCES.items():
+            source = (ROOT / filename).read_text()
+            for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+                with self.subTest(variant=variant, options=options):
+                    direct = analyze(source, options)
+                    self.assertEqual(direct, analyze(source, options, compare=True))
+                    self.assertEqual(list(direct), [KERNELS[variant]])
+            # One more byte and the source is compared, not looked up.
+            self.assertEqual(analyze(source + '\n'), analyze(source + '\n', compare=True))
+
+    def test_iq4_nl_sources_with_their_table_and_nested_functions(self):
+        for file, name, variant in [('mul_mm_iq4_nl_f32_l4_lm.cl', 'kernel_mul_mm_iq4_nl_f32_l4_lm', 'mm_iq4_nl'),
+                                    ('mul_mv_iq4_nl_f32_flat.cl', 'kernel_mul_mv_iq4_nl_f32_flat', 'mv_iq4_nl')]:
+            source = (ROOT / file).read_text()
+            for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+                plan = analyze(source, options)[name]
+                self.assertEqual((plan['variant'], plan['operation']), (variant, 'iq4_nl-f32-matmul'))
+            # One value of the table every kernel reads.
+            self.assertIn('25.f', source)
+            self.assertEqual(analyze(source.replace('25.f', '26.f', 1)), {})
+            # File-scope storage a kernel could write is still refused.
+            self.assertEqual(analyze(source.replace('constant float kvalues_iq4nl', 'float kvalues_iq4nl', 1)), {})
+        source = (ROOT / 'mul_mv_iq4_nl_f32_flat.cl').read_text()
+        self.assertEqual(analyze(source.replace('kvalues_iq4nl[qs[i] >> 4]', 'kvalues_iq4nl[qs[i] >> 3]', 1)), {})
+        self.assertEqual(analyze(source.replace('d + ib + 5*nb', 'd + ib + 4*nb', 1)), {})
+
     def test_q5_k_sources(self):
         for file, name, variant in [('mul_mm_q5_k_f32_l4_lm.cl', 'kernel_mul_mm_q5_k_f32_l4_lm', 'mm_q5_k'),
                                     ('mul_mv_q5_k_f32_flat.cl', 'kernel_mul_mv_q5_K_f32_flat', 'mv_q5_k')]:

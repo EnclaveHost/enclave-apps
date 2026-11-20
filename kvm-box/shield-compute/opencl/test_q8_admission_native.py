@@ -20,7 +20,7 @@ INTERESTING = (0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 34, 63, 64, 65, 127,
 
 
 KINDS = {'mm': 1, 'mv': 2, 'mm_q4_k': 3, 'mv_q4_k': 4, 'mm_q6_k': 5, 'mv_q6_k': 6, 'mm_q5_k': 7, 'mv_q5_k': 8,
-         'raw_iq4_xs': 9}
+         'raw_iq4_xs': 9, 'mm_iq4_nl': 10, 'mv_iq4_nl': 11}
 
 
 def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=False):
@@ -41,9 +41,10 @@ def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=Fal
                 'local': [1, 1, 1], 'offset': [0, 0, 0]}
     k_quant, q6, q5 = variant.endswith('_k'), variant.endswith('_q6_k'), variant.endswith('_q5_k')
     scalars = {3: input_offset, 5: output_offset, 6: k, 7: n, 17: 1, 18: 1}
-    if variant == 'mv_q6_k':
+    nibbles = variant.endswith('_iq4_nl')
+    if variant in ('mv_q6_k', 'mv_iq4_nl'):
         scalars = {3: input_offset, 5: output_offset, 6: k, 7: n, 8: 1, 9: k, 10: 1, 11: n, 12: m, 13: 1, 14: 1}
-        grid, local = [(n+7)//8*16, m*2, 1], [16, 2, 1]
+        grid, local = ([(n+7)//8*16, m*2, 1], [16, 2, 1]) if q6 else ([(n+7)//8*16, m, 1], [16, 1, 1])
     elif variant.startswith('mm'):
         scalars.update({8: 1, 9: m, 10: 1, 11: k, 12: k, 13: n, 14: k*n, 15: k*m, 16: n*m})
         grid, local = [(n+63)//64*128, (m+63)//64, 1], [128, 1, 1]
@@ -54,7 +55,8 @@ def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=Fal
         grid, local = ([(n+3)//4*16, m, 1], [16, 1, 1]) if k_quant else ([(n+7)//8*16, m*2, 1], [16, 2, 1])
     weights = ([n*k//2, n*k//8, n*k//256*12, n*k//256*2, n*k//256*2] if q5 else
                [n*k//2, n*k//4, n*k//16, n*k//256*2] if q6 else
-               [n*k//2, n*k//256*12, n*k//256*2, n*k//256*2] if k_quant else [n*k, n*k//16])
+               [n*k//2, n*k//256*12, n*k//256*2, n*k//256*2] if k_quant else
+               [n*k//2, n*k//16] if nibbles else [n*k, n*k//16])
     sizes = weights + [input_offset + m*k*4, output_offset + m*n*4]
     if shared_root:
         total, buffers, offset = sum((size + 63)//64*64 for size in sizes), [], 0
@@ -154,7 +156,8 @@ class NativeAdmission(unittest.TestCase):
 
     def test_valid_launches(self):
         cases = [launch(variant, k, n, m, input_offset=io, output_offset=oo, shared_root=shared)
-                 for variant in ('mm', 'mv') for k, n in ((896, 4864), (4864, 896), (32, 8), (896, 151936))
+                 for variant in ('mm', 'mv', 'mm_iq4_nl', 'mv_iq4_nl')
+                 for k, n in ((896, 4864), (4864, 896), (32, 8), (896, 151936), (96, 12))
                  for m in (1, 2, 3, 7, 32) for io, oo in ((0, 0), (32, 32), (64, 16))
                  for shared in (False, True)]
         self.assertGreater(self.compare(cases), len(cases) // 2)
@@ -171,7 +174,7 @@ class NativeAdmission(unittest.TestCase):
             base = launch(variant, 2048 if variant.endswith('_k') else 896, 4864, 3)
             for other in KINDS:
                 if other != variant and len(launch(other, 2048, 8, 1)['buffers']) == len(base['buffers']) \
-                        and 'mv_q6_k' not in (other, variant):
+                        and 'mv_q6_k' not in (other, variant) and 'mv_iq4_nl' not in (other, variant):
                     cases.append({**base, 'variant': other})
         # Geometry cannot tell the two matrix kernels with four weight buffers
         # apart when the buffers are large enough for both: Q6_K buffers hold
@@ -179,7 +182,10 @@ class NativeAdmission(unittest.TestCase):
         # recognised source, never from the launch.
         accepted = [c for c in cases if reference(c) is not None]
         self.assertEqual(self.compare(cases), len(accepted))
-        self.assertEqual([(c['variant'], len(c['buffers'])) for c in accepted], [('mm_q4_k', 6)])
+        # The same holds for the two matrix kernels with two weight buffers:
+        # Q8_0 buffers are large enough for an IQ4_NL tensor of the same shape.
+        self.assertEqual(sorted((c['variant'], len(c['buffers'])) for c in accepted),
+                         [('mm_iq4_nl', 4), ('mm_q4_k', 6)])
 
     def test_every_field_and_random_changes(self):
         rng = random.Random(20261119)
@@ -188,12 +194,12 @@ class NativeAdmission(unittest.TestCase):
             for shared in (False, True):
                 cases += mutations(launch(variant, 2048, 4864, 3, input_offset=32, output_offset=32,
                                           shared_root=shared), rng)
-        for variant in ('mm', 'mv'):
+        for variant in ('mm', 'mv', 'mm_iq4_nl', 'mv_iq4_nl'):
             for shared in (False, True):
                 cases += mutations(launch(variant, 896, 4864, 3, input_offset=32, output_offset=32,
                                           shared_root=shared), rng)
         accepted = self.compare(cases)
-        self.assertGreater(len(cases), 14000)
+        self.assertGreater(len(cases), 17000)
         # Most changes must be refused, and some harmless ones (larger buffers) accepted.
         self.assertGreater(accepted, 20)
         self.assertLess(accepted, len(cases) // 4)

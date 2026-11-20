@@ -12,6 +12,17 @@ int main() {
   unsigned type = 0;
   unsigned long long blocks = 0;
   if (std::scanf("%u %llu\n", &type, &blocks) != 2 || blocks == 0 || blocks > 100000) return 2;
+  if (type == 20) {  // 32 weights to a block
+    std::vector<unsigned char> quants(16 * blocks), d(2 * blocks);
+    if (std::fread(quants.data(), 1, quants.size(), stdin) != quants.size() ||
+        std::fread(d.data(), 1, d.size(), stdin) != d.size())
+      return 2;
+    std::vector<int8_t> codes(blocks * 32);
+    std::vector<float> scales(blocks), weights(blocks * 32);
+    q8_decode_iq4_nl(quants.data(), d.data(), blocks, codes.data(), scales.data());
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = scales[i / 32] * float(codes[i]);
+    return std::fwrite(weights.data(), 4, weights.size(), stdout) == weights.size() ? 0 : 2;
+  }
   auto read = [&](size_t bytes) {
     std::vector<unsigned char> data(bytes * blocks);
     if (std::fread(data.data(), 1, data.size(), stdin) != data.size()) std::exit(2);

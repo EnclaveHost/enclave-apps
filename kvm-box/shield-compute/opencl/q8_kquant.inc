@@ -104,3 +104,21 @@ inline void q8_decode_iq4_xs(const unsigned char *bytes, size_t blocks, int8_t *
     }
   }
 }
+
+// IQ4_NL: 32 weights to a block, 16 quant bytes and half d, with IQ4_XS's
+// table. A weight is scales[block] * codes[i].
+inline void q8_decode_iq4_nl(const unsigned char *quants, const unsigned char *d, size_t blocks, int8_t *codes,
+                             float *scales) {
+  static const int8_t values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+  for (size_t ib = 0; ib < blocks; ++ib) {
+    uint16_t half;
+    std::memcpy(&half, d + ib * 2, 2);
+    scales[ib] = q8_half_to_float(half);
+    const unsigned char *q = quants + ib * 16;
+    int8_t *out = codes + ib * 32;
+    for (size_t i = 0; i < 16; ++i) {
+      out[i] = values[q[i] & 0xF];
+      out[i + 16] = values[q[i] >> 4];
+    }
+  }
+}
