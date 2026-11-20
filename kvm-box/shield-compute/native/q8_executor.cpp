@@ -115,6 +115,13 @@ struct PolicyEntry {
 };
 using Policy = std::map<std::string, PolicyEntry>;
 
+// The weight types a product may be asked for: Q8_0, and Q4_K whose rows are
+// whole 256-weight super-blocks. Sessions only; the request protocol on stdin
+// stays Q8_0, which the service checks before it forwards anything.
+bool lowered_weight(uint32_t type, int64_t k) {
+    return k > 0 && ((type == GGML_TYPE_Q8_0 && k % 32 == 0) || (type == GGML_TYPE_Q4_K && k % 256 == 0));
+}
+
 std::string read_policy_file(const char * path) {
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) retire("policy open failed");
@@ -291,7 +298,7 @@ struct Model {
                          const std::string & digest, int64_t k, int64_t n) {
         const auto pit = policy.find(name);
         return pit != policy.end() && pit->second.sha256 == digest &&
-               pit->second.type == GGML_TYPE_Q8_0 &&
+               lowered_weight(pit->second.type, k) &&
                pit->second.ne == std::array<int64_t, 4>{k, n, 1, 1};
     }
 
@@ -301,8 +308,9 @@ struct Model {
         if (pit == policy.end()) retire("tensor not in public policy");
         const PolicyEntry & entry = pit->second;
         if (entry.sha256 != digest) retire("request digest does not match policy");
-        if (entry.type != GGML_TYPE_Q8_0 || entry.ne != std::array<int64_t, 4>{k, n, 1, 1})
+        if (!lowered_weight(entry.type, k) || entry.ne != std::array<int64_t, 4>{k, n, 1, 1})
             retire("request geometry does not match policy");
+        const ggml_type type = (ggml_type)entry.type;
 
         if (const auto it = verified.find(name); it != verified.end()) return it->second;
 
@@ -311,14 +319,14 @@ struct Model {
         if (id < 0 || !t || std::strcmp(ggml_get_name(t), name.c_str()))
             retire("tensor not in model");
         const int64_t * gne = gguf_get_tensor_ne(gguf.get(), id);
-        if (gguf_get_tensor_type(gguf.get(), id) != GGML_TYPE_Q8_0 || t->type != GGML_TYPE_Q8_0)
-            retire("tensor is not Q8_0");
+        if (gguf_get_tensor_type(gguf.get(), id) != type || t->type != type)
+            retire("tensor type does not match policy");
         for (int i = 0; i < 4; ++i)
             if (gne[i] != entry.ne[i] || t->ne[i] != entry.ne[i])
                 retire("tensor geometry mismatch");
         const size_t bytes = gguf_get_tensor_size(gguf.get(), id);
         if (bytes == 0 || bytes > kMaxTensor || bytes != entry.nbytes || bytes != ggml_nbytes(t) ||
-                bytes != ggml_row_size(GGML_TYPE_Q8_0, k) * (size_t)n || !ggml_is_contiguous(t))
+                bytes != ggml_row_size(type, k) * (size_t)n || !ggml_is_contiguous(t))
             retire("tensor size mismatch");
         const size_t size = map.size;
         const size_t data_off = gguf_get_data_offset(gguf.get());
@@ -865,7 +873,7 @@ public:
         if (prepared_) return;
         prepared_ = true;
         const auto eligible = [](const PolicyEntry & entry) {
-            return entry.type == GGML_TYPE_Q8_0 && entry.ne[2] == 1 && entry.ne[3] == 1 && entry.ne[0] % 32 == 0 &&
+            return lowered_weight(entry.type, entry.ne[0]) && entry.ne[2] == 1 && entry.ne[3] == 1 &&
                    (uint64_t)entry.ne[0] <= kMaxPayload / 4 && (uint64_t)entry.ne[1] <= kMaxPayload / 4;
         };
         const char * reserve = std::getenv("SHIELDED_RESERVE_BYTES");
