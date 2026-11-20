@@ -19,21 +19,25 @@ INTERESTING = (0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 34, 63, 64, 65, 127,
                I32 - 128, I32 - 8, I32, I32 + 1, (1 << 32) - 1, 1 << 32, (1 << 63) - 1, (1 << 64) - 1)
 
 
-KINDS = {'mm': 1, 'mv': 2, 'mm_q4_k': 3, 'mv_q4_k': 4}
+KINDS = {'mm': 1, 'mv': 2, 'mm_q4_k': 3, 'mv_q4_k': 4, 'mm_q6_k': 5, 'mv_q6_k': 6}
 
 
 def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=False):
     """Scalars in the Q8 numbering; a Q4_K kernel's argument is two places later."""
-    k_quant = variant.endswith('_q4_k')
+    k_quant, q6 = variant.endswith('_k'), variant.endswith('_q6_k')
     scalars = {3: input_offset, 5: output_offset, 6: k, 7: n, 17: 1, 18: 1}
-    if variant.startswith('mm'):
+    if variant == 'mv_q6_k':
+        scalars = {3: input_offset, 5: output_offset, 6: k, 7: n, 8: 1, 9: k, 10: 1, 11: n, 12: m, 13: 1, 14: 1}
+        grid, local = [(n+7)//8*16, m*2, 1], [16, 2, 1]
+    elif variant.startswith('mm'):
         scalars.update({8: 1, 9: m, 10: 1, 11: k, 12: k, 13: n, 14: k*n, 15: k*m, 16: n*m})
         grid, local = [(n+63)//64*128, (m+63)//64, 1], [128, 1, 1]
     else:
-        row = k//256*144 if k_quant else k//32*34
+        row = k//256*144 if k_quant else k//32*34  # the Q6_K vector kernel is handled above
         scalars.update({8: row, 9: row*n, 10: row*n, 11: 1, 12: k*4, 13: m*k*4, 14: m*k*4, 15: n, 16: m})
         grid, local = ([(n+3)//4*16, m, 1], [16, 1, 1]) if k_quant else ([(n+7)//8*16, m*2, 1], [16, 2, 1])
-    weights = [n*k//2, n*k//256*12, n*k//256*2, n*k//256*2] if k_quant else [n*k, n*k//16]
+    weights = ([n*k//2, n*k//4, n*k//16, n*k//256*2] if q6 else
+               [n*k//2, n*k//256*12, n*k//256*2, n*k//256*2] if k_quant else [n*k, n*k//16])
     sizes = weights + [input_offset + m*k*4, output_offset + m*n*4]
     if shared_root:
         total, buffers, offset = sum((size + 63)//64*64 for size in sizes), [], 0
@@ -47,7 +51,7 @@ def launch(variant, k, n, m, *, input_offset=0, output_offset=0, shared_root=Fal
 
 
 def reference(case):
-    k_quant = case['variant'].endswith('_q4_k')
+    k_quant = case['variant'].endswith('_k')
     shift = 2 if k_quant else 0
     indices = (0, 1, 2, 3, 4, 6) if k_quant else (0, 1, 2, 4)
     try:
@@ -63,7 +67,7 @@ def reference(case):
 
 def encode(case):
     scalars = case['scalars']
-    values = [KINDS[case['variant']], scalars[3]] + [scalars[i] for i in range(5, 19)]
+    values = [KINDS[case['variant']], scalars[3]] + [scalars.get(i, 0) for i in range(5, 19)]
     for buffer in case['buffers'] + [[0, 0, 0, 0]]*(6 - len(case['buffers'])):
         values += buffer
     return ' '.join(str(v) for v in values + case['global'] + case['local'] + case['offset'])
@@ -128,7 +132,7 @@ class NativeAdmission(unittest.TestCase):
                  for shared in (False, True)]
         self.assertGreater(self.compare(cases), len(cases) // 2)
         cases = [launch(variant, k, n, m, input_offset=io, output_offset=oo, shared_root=shared)
-                 for variant in ('mm_q4_k', 'mv_q4_k')
+                 for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k')
                  for k, n in ((2048, 11008), (11008, 2048), (256, 4), (2048, 151936), (288, 8), (256, 6))
                  for m in (1, 2, 3, 7, 32) for io, oo in ((0, 0), (32, 32), (64, 16))
                  for shared in (False, True)]
@@ -139,14 +143,15 @@ class NativeAdmission(unittest.TestCase):
         for variant in KINDS:
             base = launch(variant, 2048 if 'q4_k' in variant else 896, 4864, 3)
             for other in KINDS:
-                if other != variant and other.endswith('_q4_k') == variant.endswith('_q4_k'):
+                if other != variant and other.endswith('_k') == variant.endswith('_k') and \
+                        'mv_q6_k' not in (other, variant):
                     cases.append({**base, 'variant': other})
         self.assertEqual(self.compare(cases), 0)
 
     def test_every_field_and_random_changes(self):
         rng = random.Random(20261119)
         cases = []
-        for variant in ('mm_q4_k', 'mv_q4_k'):
+        for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k'):
             for shared in (False, True):
                 cases += mutations(launch(variant, 2048, 4864, 3, input_offset=32, output_offset=32,
                                           shared_root=shared), rng)
@@ -155,7 +160,7 @@ class NativeAdmission(unittest.TestCase):
                 cases += mutations(launch(variant, 896, 4864, 3, input_offset=32, output_offset=32,
                                           shared_root=shared), rng)
         accepted = self.compare(cases)
-        self.assertGreater(len(cases), 6000)
+        self.assertGreater(len(cases), 9000)
         # Most changes must be refused, and some harmless ones (larger buffers) accepted.
         self.assertGreater(accepted, 20)
         self.assertLess(accepted, len(cases) // 4)
@@ -167,7 +172,7 @@ class NativeAdmission(unittest.TestCase):
         overlapping['buffers'][3][3] = max(base['buffers'][2][3], base['buffers'][3][3])
         overlapping['buffers'][2][3] = overlapping['buffers'][3][3]
         self.assertEqual(self.compare([overlapping, base]), 1)
-        for variant in ('mm_q4_k', 'mv_q4_k'):
+        for variant in ('mm_q4_k', 'mv_q4_k', 'mm_q6_k', 'mv_q6_k'):
             base = launch(variant, 2048, 4864, 3, shared_root=True)
             for weight in range(5):
                 case = {**base, 'buffers': [list(b) for b in base['buffers']]}

@@ -11,8 +11,8 @@ Copied byte-for-byte from llama.cpp commit
 | `mul_mm_q4_k_f32_l4_lm.cl` | `12f6e45a94a64a9f085b0ac99dfd000a2351aa9861ae5ccbd5acf7dda47201d5` |
 | `mul_mv_q4_k_f32_flat.cl` | `15a59243fabf94d4dc33a98fa70e61d0adee8338bfb60a827b2e63c95034351e` |
 
-The two Q4_K files are recognised by the structural analysis only. Nothing
-admits, captures or executes their launches yet.
+| `mul_mm_q6_k_f32_l4_lm.cl` | `77e47f8f5a7353205cfa29a566b5b4065933aba8f96a4d734283bde763eeb522` |
+| `mul_mv_q6_k_f32_flat.cl` | `1ffac95ccbc2ad514fd53a1d3ecb8d0ae04a429d080ecacd64166067b6095d3d` |
 
 These are structural compiler references and execution-test inputs, not an
 authorization list based on function names. See `../Q8_LOWERING.md`.

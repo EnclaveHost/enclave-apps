@@ -14,7 +14,31 @@ MM_K = (ROOT / 'mul_mm_q4_k_f32_l4_lm.cl').read_text()
 MV_K = (ROOT / 'mul_mv_q4_k_f32_flat.cl').read_text()
 
 
+MM_6 = (ROOT / 'mul_mm_q6_k_f32_l4_lm.cl').read_text()
+MV_6 = (ROOT / 'mul_mv_q6_k_f32_flat.cl').read_text()
+
+
 class Q8CompilerTests(unittest.TestCase):
+    def test_q6_k_sources_and_the_function_the_vector_kernel_calls(self):
+        for source, name, variant in [(MM_6, 'kernel_mul_mm_q6_k_f32_l4_lm', 'mm_q6_k'),
+                                      (MV_6, 'kernel_mul_mv_q6_K_f32_flat', 'mv_q6_k')]:
+            for options in ['-cl-std=CL3.0', ' '.join(FAST)]:
+                with self.subTest(variant=variant, options=options):
+                    plan = analyze(source, options)[name]
+                    self.assertEqual((plan['variant'], plan['operation']), (variant, 'q6_k-f32-matmul'))
+                    self.assertEqual(plan['arguments']['quantsHigh'], 1)
+        # The vector kernel's arithmetic is in a function it calls: that body
+        # is part of the comparison, whatever the function is called.
+        self.assertIn('kernel_mul_mv_q6_K_f32_flat', analyze(MV_6.replace('block_q_6_K_dot_y_flat', 'helper')))
+        for old, new in [('dot(y1, w1) * sc[2]', 'dot(y1, w1) * sc[3]'), ('- 32.f;', '- 31.f;'),
+                         ('ib*64 + q_offset_h', 'ib*64 + q_offset_l')]:
+            with self.subTest(change=old):
+                self.assertIn(old, MV_6)
+                self.assertEqual(analyze(MV_6.replace(old, new, 1)), {})
+        # A second, different function of the same name cannot stand in.
+        self.assertEqual(analyze(MV_6.replace('return dall * (', 'return 2 * dall * (')), {})
+        self.assertEqual(analyze(MM_6.replace('& 3) << 4', '& 3) << 5', 1)), {})
+
     def test_q4_k_sources_are_recognised_as_their_own_operation(self):
         for source, name, variant in [(MM_K, 'kernel_mul_mm_q4_k_f32_l4_lm', 'mm_q4_k'),
                                       (MV_K, 'kernel_mul_mv_q4_K_f32_flat', 'mv_q4_k')]:

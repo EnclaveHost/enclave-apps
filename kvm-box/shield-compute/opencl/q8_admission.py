@@ -59,9 +59,12 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
     after four weight buffers (quants, 6-bit scales, d, dmin) instead of two.
     Explicit local sizes and a complete zero-offset 3-D grid are required.
     """
-    if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k'):
+    if variant == 'mv_q6_k':
+        return validate_q6_k_vector(scalars, buffers, global_size, local_size, offset)
+    if variant not in ('mm', 'mv', 'mm_q4_k', 'mv_q4_k', 'mm_q6_k'):
         raise ValueError('unknown kernel variant')
-    k_quant = variant.endswith('_q4_k')
+    k_quant = variant.endswith('_k')
+    q6 = variant.endswith('_q6_k')
     matrix = variant.startswith('mm')
     shift = 2 if k_quant else 0  # every argument after the weights moves by this
     at = lambda index: index + shift
@@ -129,7 +132,10 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
         if buffer.root in roots and roots[buffer.root] != buffer.root_bytes:
             raise ValueError('inconsistent root allocation size')
         roots[buffer.root] = buffer.root_bytes
-    if k_quant:
+    if q6:
+        # Quants and scales are read a byte at a time; d is half.
+        aligned = ((0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 2, 0))
+    elif k_quant:
         # The quants are read through uchar4 (matrix) or uint (vector)
         # pointers; the vector kernel reads the scales as ushort.
         aligned = ((0, 4, 0), (1, 1 if matrix else 2, 0), (2, 2, 0), (3, 2, 0))
@@ -141,8 +147,8 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
             raise ValueError('unaligned sub-buffer address')
     if k_quant:
         blocks = n*k//256
-        reads = (buffers[0].interval(0, blocks*128), buffers[1].interval(0, blocks*12),
-                 buffers[2].interval(0, blocks*2), buffers[3].interval(0, blocks*2))
+        sizes = (128, 64, 16, 2) if q6 else (128, 12, 2, 2)
+        reads = tuple(buffers[index].interval(0, blocks*size) for index, size in enumerate(sizes))
     else:
         reads = (buffers[0].interval(0, n*k), buffers[1].interval(0, n*k//16))
     reads += (buffers[at(2)].interval(scalars[at(3)], m*k*4),)
@@ -151,6 +157,80 @@ def validate_launch(variant, scalars, buffers, global_size, local_size, offset=(
            for read in reads):
         raise ValueError('output aliases an input allocation range')
     return Launch(variant, m, n, k, reads, write)
+
+
+def validate_q6_k_vector(scalars, buffers, global_size, local_size, offset=(0, 0, 0)):
+    """The Q6_K vector kernel, which has its own seventeen arguments: four
+    weight buffers (low and high quant bits, scales, d), input, its offset,
+    output, its offset, then ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3."""
+    if set(scalars) != {5, 7, *range(8, 17)} or set(buffers) != {0, 1, 2, 3, 4, 6}:
+        raise ValueError('incomplete kernel arguments')
+    if any(type(key) is not int for key in (*scalars, *buffers)):
+        raise ValueError('invalid argument index')
+    for values in (global_size, local_size, offset):
+        if not isinstance(values, (tuple, list)) or len(values) != 3:
+            raise ValueError('expected three dimensions')
+        for value in values:
+            integer(value)
+    if tuple(offset) != (0, 0, 0):
+        raise ValueError('global offsets need separate lowering')
+    for index, value in scalars.items():
+        integer(value, U64 if index in (5, 7) else I32)
+    k, n, m = scalars[8], scalars[9], scalars[14]
+    if min(k, n, m) == 0 or k % 256 or k > I32 - 128:
+        raise ValueError('invalid tensor dimensions')
+    # Every row is guarded before it is read. Block counts, the input index
+    # and the output index are signed int products.
+    if n > I32 - 8 or n*k//256 > I32 or m*k > I32 or m*n > I32:
+        raise ValueError('signed kernel index overflow')
+    if any(scalars[index] != value for index, value in
+           {10: 1, 11: k, 12: 1, 13: n, 15: 1, 16: 1}.items()):
+        raise ValueError('unsupported strides, broadcasting or batching')
+    if tuple(global_size) != ((n+7)//8*16, m*2, 1) or tuple(local_size) != (16, 2, 1):
+        raise ValueError('incomplete or incompatible workgroup grid')
+    if scalars[5] % 4 or scalars[7] % 4:
+        raise ValueError('unaligned kernel pointer offset')
+    roots = {}
+    for buffer in buffers.values():
+        if not isinstance(buffer, BufferView):
+            raise ValueError('allocation registry view required')
+        buffer.interval(0, 0)
+        if buffer.root in roots and roots[buffer.root] != buffer.root_bytes:
+            raise ValueError('inconsistent root allocation size')
+        roots[buffer.root] = buffer.root_bytes
+    for index, alignment, extra in ((0, 1, 0), (1, 1, 0), (2, 1, 0), (3, 2, 0),
+                                    (4, 4, scalars[5]), (6, 4, scalars[7])):
+        if (buffers[index].offset + extra) % alignment:
+            raise ValueError('unaligned sub-buffer address')
+    blocks = n*k//256
+    reads = tuple(buffers[index].interval(0, blocks*size) for index, size in enumerate((128, 64, 16, 2)))
+    reads += (buffers[4].interval(scalars[5], m*k*4),)
+    write = buffers[6].interval(scalars[7], m*n*4)
+    if any(write[0] == read[0] and max(write[1], read[1]) < min(write[2], read[2])
+           for read in reads):
+        raise ValueError('output aliases an input allocation range')
+    return Launch('mv_q6_k', m, n, k, reads, write)
+
+
+def q6_k_digest(low, high, scales, d, k, n):
+    """Hash original GGUF block_q6_K order: 128 low-bit bytes, 64 high-bit
+    bytes, 16 scale bytes, half d for each 256 weights. Exact bytes."""
+    integer(k, I32)
+    integer(n, I32)
+    if not k or not n or k % 256 or k*n > 2*MAX_BYTES:
+        raise ValueError('invalid Q6_K tensor shape')
+    if any(type(part) is not bytes for part in (low, high, scales, d)):
+        raise ValueError('immutable snapshots required')
+    blocks = k*n//256
+    if (len(low), len(high), len(scales), len(d)) != (blocks*128, blocks*64, blocks*16, blocks*2):
+        raise ValueError('Q6_K tensor lengths differ from shape')
+    digest = hashlib.sha256()
+    for block in range(blocks):
+        digest.update(low[block*128:block*128+128])
+        digest.update(high[block*64:block*64+64])
+        digest.update(scales[block*16:block*16+16])
+        digest.update(d[block*2:block*2+2])
+    return digest.hexdigest()
 
 
 def q4_k_digest(quants, scales, d, dmin, k, n):

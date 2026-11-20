@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -7113,6 +7113,45 @@
+@@ -7113,6 +7113,46 @@
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -19,12 +19,13 @@
 +            case GGML_OP_TRANSPOSE:
 +                break;
 +            case GGML_OP_MUL_MAT:
-+                if ((op->src[0]->type != GGML_TYPE_Q8_0 && op->src[0]->type != GGML_TYPE_Q4_K) ||
++                if ((op->src[0]->type != GGML_TYPE_Q8_0 && op->src[0]->type != GGML_TYPE_Q4_K &&
++                     op->src[0]->type != GGML_TYPE_Q6_K) ||
 +                    op->src[1]->type != GGML_TYPE_F32) {
 +                    return false;
 +                }
 +                // K-quant super-blocks hold 256 weights.
-+                if (op->src[0]->type == GGML_TYPE_Q4_K && op->src[0]->ne[0] % 256 != 0) {
++                if (op->src[0]->type != GGML_TYPE_Q8_0 && op->src[0]->ne[0] % 256 != 0) {
 +                    return false;
 +                }
 +                // The measured executor uses Shield's fixed 2M-weight MAC

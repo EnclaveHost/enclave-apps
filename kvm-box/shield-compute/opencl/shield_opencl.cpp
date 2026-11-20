@@ -325,7 +325,8 @@ bool integer_dispatch_plan(const json &plan) {
 }
 #ifdef SHIELD_Q8_CAPTURE
 // Which recognized kernel an analysis describes: 0 none, 1 and 2 the Q8_0
-// matrix and vector kernels, 3 and 4 the Q4_K ones (Q8Kind in q8_admission.inc).
+// matrix and vector kernels, 3 and 4 the Q4_K ones, 5 and 6 the Q6_K ones
+// (Q8Kind in q8_admission.inc).
 int q8_plan_kind(const json &plan) {
   if (!plan.is_object() || plan.value("schema", "") != "shield-opencl-q8-analysis/1" ||
       !plan.contains("dispatchable") || plan["dispatchable"] != false)
@@ -333,6 +334,7 @@ int q8_plan_kind(const json &plan) {
   const std::string operation = plan.value("operation", ""), variant = plan.value("variant", "");
   if (operation == "q8_0-f32-matmul") return variant == "mm" ? 1 : variant == "mv" ? 2 : 0;
   if (operation == "q4_k-f32-matmul") return variant == "mm_q4_k" ? 3 : variant == "mv_q4_k" ? 4 : 0;
+  if (operation == "q6_k-f32-matmul") return variant == "mm_q6_k" ? 5 : variant == "mv_q6_k" ? 6 : 0;
   return 0;
 }
 #endif

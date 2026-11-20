@@ -44,8 +44,9 @@ struct Q8Region {
   }
 };
 struct Q8Known {
-  // The tensor's weight buffers: codes and scales for Q8_0; quants, scales, d
-  // and dmin for Q4_K.
+  // The tensor's weight buffers: codes and scales for Q8_0; four for the
+  // K-quants (quants, scales, d, dmin for Q4_K; low bits, high bits, scales, d
+  // for Q6_K).
   std::array<Q8Region, 4> weights;
   unsigned count;
   size_t k, n;
@@ -165,8 +166,12 @@ bool q8_all_finite(const unsigned char *bytes, size_t count) {
 std::atomic<size_t> q8_local_bytes{0};
 struct Q8Local {
   size_t k = 0, n = 0, charged = 0;
+  // Weights that share a scale: 32 for Q8_0. A Q6_K tensor is held the same
+  // way with 16: its 6-bit quants less 32 as codes, and d times the 8-bit
+  // scale of each sixteen as the scale.
+  size_t block = 32;
   std::vector<int8_t> codes;   // n rows of k
-  std::vector<float> scales;   // n rows of k/32
+  std::vector<float> scales;   // n rows of k/block
   ~Q8Local() { q8_local_bytes -= charged; }
 };
 constexpr size_t Q8_LOCAL_LIMIT = 1024u << 20;
@@ -259,6 +264,40 @@ void q8_local_rows_avx512(const Q8Local &w, const float *x, float *y, size_t fir
 }
 #endif
 
+// The same sums with a scale for every sixteen codes.
+void q8_local_rows16_scalar(const Q8Local &w, const float *x, float *y, size_t first, size_t last) {
+  const size_t blocks = w.k / 16;
+  for (size_t j = first; j < last; ++j) {
+    const int8_t *codes = w.codes.data() + j * w.k;
+    const float *scales = w.scales.data() + j * blocks;
+    float total = 0;
+    for (size_t b = 0; b < blocks; ++b) {
+      float sum = 0;
+      for (size_t i = 0; i < 16; ++i) sum += float(codes[b * 16 + i]) * x[b * 16 + i];
+      total += sum * scales[b];
+    }
+    y[j] = total;
+  }
+}
+#if defined(__x86_64__)
+__attribute__((target("avx512f,avx512bw,avx512vl,fma")))
+void q8_local_rows16_avx512(const Q8Local &w, const float *x, float *y, size_t first, size_t last) {
+  const size_t blocks = w.k / 16;
+  for (size_t j = first; j < last; ++j) {
+    const int8_t *codes = w.codes.data() + j * w.k;
+    const float *scales = w.scales.data() + j * blocks;
+    __m512 total = _mm512_setzero_ps();
+    for (size_t b = 0; b < blocks; ++b) {
+      const __m512 sum = _mm512_mul_ps(
+          _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(codes + b * 16)))),
+          _mm512_loadu_ps(x + b * 16));
+      total = _mm512_fmadd_ps(sum, _mm512_set1_ps(scales[b]), total);
+    }
+    y[j] = _mm512_reduce_add_ps(total);
+  }
+}
+#endif
+
 // Threads that split the rows of a large local product. They are started once
 // and wait between products; starting threads for every product cost more than
 // the product. A forked child starts its own.
@@ -322,7 +361,16 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
     const size_t wanted = value ? std::strtoull(value, nullptr, 10) : 4;
     return std::min<size_t>(std::max<size_t>(wanted, 1), 16);
   }();
-  static const Q8LocalPool::Rows rows = [] {
+  static const Q8LocalPool::Rows rows16 = [] {
+    Q8LocalPool::Rows chosen = q8_local_rows16_scalar;
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("fma"))
+      chosen = q8_local_rows16_avx512;
+#endif
+    return chosen;
+  }();
+  static const Q8LocalPool::Rows rows32 = [] {
     Q8LocalPool::Rows chosen = q8_local_rows_scalar;
 #if defined(__x86_64__)
     if (__builtin_cpu_supports("avx2")) chosen = q8_local_rows_avx2;
@@ -332,6 +380,7 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
 #endif
     return chosen;
   }();
+  const Q8LocalPool::Rows rows = w.block == 16 ? rows16 : rows32;
   // The pool lives for the process: no teardown can race a late launch.
   static auto *pool = new Q8LocalPool;
   // Small products are not worth waking threads for.
@@ -720,28 +769,76 @@ cl_int q8_direct_result(const Q8DirectLaunch &launch, cl_int status) {
 // The product computed in this process. False: not available (disabled, the
 // weights could not be remembered, or the copy would exceed the limit); the
 // caller then runs the original kernel.
+// A Q6_K tensor's four flat buffers as codes and scales (see Q8Local): within
+// each 256 weights, the low nibbles of the first 64 low bytes are weights
+// 0..63 and their high nibbles weights 128..191 of the first half, and so on
+// as in ggml's dequantize_row_q6_K; the two high bits come from the matching
+// 2-bit field of the high byte.
+bool q6k_local_weights(const Q8DirectLaunch &launch, Q8Local &local) {
+  std::array<std::vector<unsigned char>, 4> raw;
+  for (unsigned i = 0; i < 4; ++i) {
+    raw[i].resize(launch.read_bytes[i]);
+    if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[i], CL_TRUE, 0, launch.read_bytes[i], raw[i].data(),
+                                  0, nullptr, nullptr))
+      return false;
+  }
+  const size_t blocks = launch.k * launch.n / 256;
+  local.block = 16;
+  local.codes.resize(blocks * 256);
+  local.scales.resize(blocks * 16);
+  for (size_t ib = 0; ib < blocks; ++ib) {
+    const unsigned char *ql = raw[0].data() + ib * 128, *qh = raw[1].data() + ib * 64;
+    const auto *sc = reinterpret_cast<const int8_t *>(raw[2].data() + ib * 16);
+    uint16_t half;
+    std::memcpy(&half, raw[3].data() + ib * 2, 2);
+    const float d = q8_half_to_float(half);
+    int8_t *out = local.codes.data() + ib * 256;
+    for (size_t part = 0; part < 2; ++part)
+      for (size_t l = 0; l < 32; ++l) {
+        const unsigned low0 = ql[part * 64 + l], low1 = ql[part * 64 + l + 32], high = qh[part * 32 + l];
+        out[part * 128 + l] = int8_t(int((low0 & 0xF) | ((high & 3) << 4)) - 32);
+        out[part * 128 + l + 32] = int8_t(int((low1 & 0xF) | (((high >> 2) & 3) << 4)) - 32);
+        out[part * 128 + l + 64] = int8_t(int((low0 >> 4) | (((high >> 4) & 3) << 4)) - 32);
+        out[part * 128 + l + 96] = int8_t(int((low1 >> 4) | (((high >> 6) & 3) << 4)) - 32);
+      }
+    for (size_t i = 0; i < 16; ++i) local.scales[ib * 16 + i] = d * float(sc[i]);
+  }
+  return true;
+}
+
 bool q8_local(const Q8DirectLaunch &launch, const Q8Identity &identity, bool remembered,
               const std::vector<unsigned char> &input, std::vector<unsigned char> &output) {
-  // Only Q8_0 weights have a local product; anything else runs its own kernel.
-  if (launch.weights() != 2 || !q8_local_enabled() || !remembered || identity.local_unavailable) return false;
+  // Q8_0 and Q6_K weights have a local product; a Q4_K tensor that is not
+  // offloaded runs its own kernel.
+  const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
+  if ((launch.weights() != 2 && !q6) || !q8_local_enabled() || !remembered || identity.local_unavailable)
+    return false;
   if (!identity.local) {
-    const size_t bytes = launch.read_bytes[0] + launch.read_bytes[1] * 2;
+    const size_t bytes = q6 ? launch.k * launch.n + launch.k * launch.n / 4
+                            : launch.read_bytes[0] + launch.read_bytes[1] * 2;
     if (q8_local_bytes.load() + bytes > Q8_LOCAL_LIMIT) return false;
     try {
       auto local = std::make_shared<Q8Local>();
       local->k = launch.k;
       local->n = launch.n;
-      local->codes.resize(launch.read_bytes[0]);
-      std::vector<uint16_t> halves(launch.read_bytes[1] / 2);
-      if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[0], CL_TRUE, 0, launch.read_bytes[0],
-                                    local->codes.data(), 0, nullptr, nullptr) ||
-          REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[1], CL_TRUE, 0, launch.read_bytes[1],
-                                    halves.data(), 0, nullptr, nullptr)) {
-        identity.local_unavailable = true;
-        return false;
+      if (q6) {
+        if (!q6k_local_weights(launch, *local)) {
+          identity.local_unavailable = true;
+          return false;
+        }
+      } else {
+        local->codes.resize(launch.read_bytes[0]);
+        std::vector<uint16_t> halves(launch.read_bytes[1] / 2);
+        if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[0], CL_TRUE, 0, launch.read_bytes[0],
+                                      local->codes.data(), 0, nullptr, nullptr) ||
+            REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[1], CL_TRUE, 0, launch.read_bytes[1],
+                                      halves.data(), 0, nullptr, nullptr)) {
+          identity.local_unavailable = true;
+          return false;
+        }
+        local->scales.resize(halves.size());
+        for (size_t i = 0; i < halves.size(); ++i) local->scales[i] = q8_half_to_float(halves[i]);
       }
-      local->scales.resize(halves.size());
-      for (size_t i = 0; i < halves.size(); ++i) local->scales[i] = q8_half_to_float(halves[i]);
       q8_local_bytes += bytes;
       local->charged = bytes;
       identity.local = std::move(local);
@@ -798,8 +895,10 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     q8_timing.add(Q8Timing::Snapshot, stage);
     stage = Q8Timing::now();
     try {
-      const json answer = count == 4 ? q4k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
-                                     : q8_authenticate(bytes[0], bytes[1], launch.k, launch.n);
+      const bool q6 = launch.kind == Q6K_MM || launch.kind == Q6K_MV;
+      const json answer = q6 ? q6k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
+                          : count == 4 ? q4k_authenticate(bytes[0], bytes[1], bytes[2], bytes[3], launch.k, launch.n)
+                                       : q8_authenticate(bytes[0], bytes[1], launch.k, launch.n);
       auto fresh = std::make_shared<Q8Identity>();
       fresh->approved = answer.at("approved").get<bool>();
       if (fresh->approved) {

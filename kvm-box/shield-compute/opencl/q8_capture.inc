@@ -78,7 +78,7 @@ std::string q8_sha(const std::string &value) {
   Q8Hash hash; hash.update(value.data(), value.size()); return hash.finish();
 }
 struct Q8PublicTensor {
-  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K
+  int type;  // GGML tensor type: 8 Q8_0, 12 Q4_K, 14 Q6_K
   size_t k, n;
   std::string sha, name, engine, policy_sha;
 };
@@ -100,16 +100,16 @@ const std::vector<Q8PublicTensor> &q8_catalog() {
       const auto &tensors = policy.at("tensors");
       if (!tensors.is_array() || tensors.size()>100000) throw std::runtime_error("policy tensor limit");
       for (const auto &tensor : tensors) {
-        if (tensor.at("type") != 8 && tensor.at("type") != 12) continue;
+        if (tensor.at("type") != 8 && tensor.at("type") != 12 && tensor.at("type") != 14) continue;
         const int type = tensor.at("type").get<int>();
         const auto &shape = tensor.at("ne");
         if (!shape.is_array() || shape.size()!=4) throw std::runtime_error("policy shape");
         if (shape[2] != 1 || shape[3] != 1) continue;
         size_t k=shape[0].get<size_t>(), n=shape[1].get<size_t>();
         // A K-quant tensor whose rows are not whole super-blocks is never lowered.
-        if (type == 12 && k%256) continue;
+        if (type != 8 && k%256) continue;
         if (!k || k%32 || !n || k>(512u<<20)/n ||
-            tensor.at("nbytes")!=(type == 12 ? k*n/256*144 : k*n/32*34))
+            tensor.at("nbytes")!=(type == 12 ? k*n/256*144 : type == 14 ? k*n/256*210 : k*n/32*34))
           throw std::runtime_error("policy tensor dimensions");
         result.push_back({type,k,n,tensor.at("sha256").get<std::string>(),tensor.at("name").get<std::string>(),engine,digest});
       }
@@ -137,6 +137,34 @@ json q8_authenticate(const std::vector<unsigned char> &quants,
       return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
               {"sha256",digest},{"policySha256",tensor.policy_sha}};
   // Unknown weights may be private. Do not expose their digest or contents.
+  return {{"approved",false}};
+}
+// And for a Q6_K tensor: 128 low-bit bytes, 64 high-bit bytes, 16 scale bytes
+// and half d for each 256 weights.
+json q6k_authenticate(const std::vector<unsigned char> &low, const std::vector<unsigned char> &high,
+                      const std::vector<unsigned char> &scales, const std::vector<unsigned char> &d,
+                      size_t k, size_t n) {
+  const size_t blocks=k*n/256;
+  if (k%256 || low.size()!=blocks*128 || high.size()!=blocks*64 || scales.size()!=blocks*16 ||
+      d.size()!=blocks*2) throw std::runtime_error("snapshot shape");
+  Q8Hash hash;
+  std::vector<unsigned char> packed(1024*210);
+  for (size_t first=0;first<blocks;first+=1024) {
+    const size_t count=std::min(size_t(1024), blocks-first);
+    for (size_t block=0;block<count;++block) {
+      unsigned char *out=packed.data()+block*210;
+      std::memcpy(out, low.data()+(first+block)*128, 128);
+      std::memcpy(out+128, high.data()+(first+block)*64, 64);
+      std::memcpy(out+192, scales.data()+(first+block)*16, 16);
+      std::memcpy(out+208, d.data()+(first+block)*2, 2);
+    }
+    hash.update(packed.data(), count*210);
+  }
+  const auto digest=hash.finish();
+  for (const auto &tensor:q8_catalog())
+    if (tensor.type==14 && tensor.k==k && tensor.n==n && tensor.sha==digest)
+      return {{"approved",true},{"engine",tensor.engine},{"tensor",tensor.name},
+              {"sha256",digest},{"policySha256",tensor.policy_sha}};
   return {{"approved",false}};
 }
 // The same question for a Q4_K tensor held as the four flat buffers of the
@@ -349,8 +377,8 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     cl_context c=nullptr;
     if(REAL(clGetEventInfo)(wait[i],CL_EVENT_CONTEXT,sizeof(c),&c,nullptr) || c!=context) return {false,0};
   }
-  // Arguments in the Q8_0 numbering: a Q4_K kernel has four weight buffers
-  // where a Q8_0 kernel has two, and everything after them two places later.
+  // Scalars two places before a K-quant kernel has them (see q8_admission.inc):
+  // those kernels have four weight buffers where a Q8_0 kernel has two.
   const bool mv=q8_kind_vector(kind);
   const unsigned weights=q8_kind_weights(kind), shift=weights-2;
   std::array<cl_mem,6> buffers{};
@@ -363,9 +391,10 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
   view.kind=kind;
   for(unsigned i=0;i<3;++i) { view.global[i]=global[i]; view.local[i]=local[i]; view.offset[i]=offset?offset[i]:0; }
   try {
-    for(unsigned i=3;i<19;++i) if(i!=4) {
+    const bool strided=kind==Q8_MV || kind==Q4K_MV;  // byte strides passed as ulong
+    for(unsigned i=3;i<q8_kind_scalars(kind);++i) if(i!=4) {
       // The Q4_K vector kernel takes its two pointer offsets as int.
-      bool wide=((i==3 || i==5) && kind!=Q4K_MV) || (mv && (i==8 || i==9 || i==10 || i==12 || i==13 || i==14));
+      bool wide=((i==3 || i==5) && kind!=Q4K_MV) || (strided && (i==8 || i==9 || i==10 || i==12 || i==13 || i==14));
       const auto &argument=state.args[i+shift];
       if(argument.size()!=(wide?sizeof(cl_ulong):sizeof(cl_int))) return {false,0};
       if(wide) { cl_ulong value; std::memcpy(&value,argument.data(),sizeof(value)); scalars[i]=value; }
@@ -391,7 +420,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     // These equalities bind the snapshot and write extents to the same checked
     // ABI, in addition to the stride/grid/alias/range validation above.
     if(!checked_k || checked_k!=scalars[6] || !checked_n || checked_n!=scalars[7] ||
-       !checked_m || checked_m!=scalars[mv?16:9] || checked_k>(512u<<20)/4/checked_m ||
+       !checked_m || checked_m!=scalars[kind==Q6K_MV?12:mv?16:9] || checked_k>(512u<<20)/4/checked_m ||
        checked_n>(512u<<20)/4/checked_m || bytes[weights]!=checked_m*checked_k*4 ||
        checked_output!=checked_m*checked_n*4) return {false,0};
     size_t total=0;

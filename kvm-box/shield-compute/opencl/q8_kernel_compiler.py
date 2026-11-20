@@ -14,12 +14,15 @@ from kernel_compiler import ast, canonical_type, MAX_SOURCE
 
 ROOT = Path(__file__).resolve().parent / 'q8-reference'
 REFERENCES = {'mm': 'mul_mm_q8_0_f32_l4_lm.cl', 'mv': 'mul_mv_q8_0_f32_flat.cl',
-              'mm_q4_k': 'mul_mm_q4_k_f32_l4_lm.cl', 'mv_q4_k': 'mul_mv_q4_k_f32_flat.cl'}
+              'mm_q4_k': 'mul_mm_q4_k_f32_l4_lm.cl', 'mv_q4_k': 'mul_mv_q4_k_f32_flat.cl',
+              'mm_q6_k': 'mul_mm_q6_k_f32_l4_lm.cl', 'mv_q6_k': 'mul_mv_q6_k_f32_flat.cl'}
 # The K-quant kernels take the same arguments after four weight buffers
 # (quants, 6-bit scales, d, dmin) where the Q8_0 kernels take two.
 ARGUMENTS = {
     'q8_0': {'quants': 0, 'scales': 1, 'input': 2, 'inputOffset': 3, 'output': 4, 'outputOffset': 5},
     'q4_k': {'quants': 0, 'scales': 1, 'd': 2, 'dmin': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
+             'outputOffset': 7},
+    'q6_k': {'quantsLow': 0, 'quantsHigh': 1, 'scales': 2, 'd': 3, 'input': 4, 'inputOffset': 5, 'output': 6,
              'outputOffset': 7},
 }
 STRICT = ('-cl-std=CL3.0',)
@@ -28,14 +31,15 @@ FAST = STRICT + ('-cl-mad-enable', '-cl-unsafe-math-optimizations',
 CAPABILITIES = ('-Dcl_intel_subgroups=1', '-Dcl_intel_required_subgroup_size=1')
 BUILTINS = {'get_global_id', 'get_group_id', 'get_local_id', 'get_local_size',
             'get_sub_group_id', 'get_sub_group_local_id', 'sub_group_reduce_add',
-            'convert_float4', 'convert_float8', 'vload8', 'barrier', 'mad'}
+            'convert_float4', 'convert_float8', 'vload8', 'barrier', 'mad',
+            'vload4', 'convert_int4', 'convert_float', 'convert_char', 'dot'}
 KINDS = {'FunctionDecl', 'ParmVarDecl', 'VarDecl', 'CompoundStmt', 'DeclStmt',
          'BinaryOperator', 'UnaryOperator', 'DeclRefExpr', 'ImplicitCastExpr',
          'CStyleCastExpr', 'CallExpr', 'ForStmt', 'IfStmt', 'ArraySubscriptExpr',
          'IntegerLiteral', 'FloatingLiteral', 'CompoundAssignOperator',
          'ExtVectorElementExpr', 'CompoundLiteralExpr', 'InitListExpr',
          'UnaryExprOrTypeTraitExpr', 'ParenExpr', 'ConditionalOperator', 'ImplicitValueInitExpr',
-         'OpenCLKernelAttr',
+         'ReturnStmt', 'OpenCLKernelAttr',
          'OpenCLIntelReqdSubGroupSizeAttr'}
 def without_comments(source):
     # Preserve newlines and strings while replacing comments by whitespace,
@@ -72,7 +76,12 @@ def source_allowed(source):
 
 
 def source_functions(tree):
-    result = []
+    """The kernels of a source, and its other functions by node identity.
+
+    A function that is not a kernel can only matter through a kernel that
+    calls it; normalize() then compares its whole body as part of the caller.
+    """
+    kernels, helpers = [], {}
     for node in tree.get('inner', []):
         if node.get('kind') == 'VarDecl':
             raise ValueError('global storage is not supported')
@@ -82,15 +91,20 @@ def source_functions(tree):
             # Only the compiler's default header is available: includes and
             # source-location directives are refused before invoking Clang.
             continue
-        if not any(n.get('kind') == 'OpenCLKernelAttr' for n in node.get('inner', [])):
-            raise ValueError('source function declarations/definitions are not imported builtins')
-        result.append(node)
-    return result
+        if any(n.get('kind') == 'OpenCLKernelAttr' for n in node.get('inner', [])):
+            kernels.append(node)
+        elif any(n.get('kind') == 'CompoundStmt' for n in node.get('inner', [])):
+            helpers[node['id']] = node
+        else:
+            raise ValueError('source function declarations are not imported builtins')
+    return kernels, helpers
 
 
-def normalize(function, source):
+def normalize(function, source, helpers=None, calling=(), used=None):
     symbols = {}
     encoded = source.encode()
+    helpers = helpers or {}
+    used = set() if used is None else used
 
     def source_range(node, last_only=False):
         span = node['range']
@@ -148,7 +162,16 @@ def normalize(function, source):
             result['selector'] = selector
         if kind == 'DeclRefExpr':
             decl = node['referencedDecl']
-            if decl['kind'] == 'FunctionDecl':
+            if decl['kind'] == 'FunctionDecl' and decl['id'] in helpers:
+                # A function of this source: its whole normalized body stands
+                # in for the reference, so equal callers have equal callees.
+                if decl['id'] in calling or len(calling) >= 4:
+                    raise ValueError('recursive or deeply nested source function')
+                used.add(decl['id'])
+                result['reference'] = ['SourceFunction', canonical_type(decl),
+                                       normalize(helpers[decl['id']], source, helpers, calling + (decl['id'],),
+                                                 used)]
+            elif decl['kind'] == 'FunctionDecl':
                 if decl['name'] not in BUILTINS:
                     raise ValueError('unsupported imported call')
                 result['reference'] = [decl['kind'], decl['name'], canonical_type(decl)]
@@ -169,9 +192,9 @@ def normalize(function, source):
 def reference(variant, flags, clang):
     source = (ROOT / REFERENCES[variant]).read_text()
     tree = ast(source, clang, flags + CAPABILITIES)
-    functions = source_functions(tree)
+    functions, helpers = source_functions(tree)
     assert len(functions) == 1
-    return normalize(functions[0], source), hashlib.sha256(source.encode()).hexdigest()
+    return normalize(functions[0], source, helpers), hashlib.sha256(source.encode()).hexdigest()
 
 
 def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
@@ -186,14 +209,15 @@ def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
     if flags is None:
         return {}
     try:
-        functions = source_functions(ast(source, clang, flags + CAPABILITIES))
+        functions, helpers = source_functions(ast(source, clang, flags + CAPABILITIES))
         plans = {}
+        used = set()
         for function in functions:
-            normalized = normalize(function, source)
+            normalized = normalize(function, source, helpers, used=used)
             for variant in REFERENCES:
                 pattern, digest = reference(variant, flags, clang)
                 if normalized == pattern:
-                    weights = 'q4_k' if variant.endswith('_q4_k') else 'q8_0'
+                    weights = variant[3:] if '_' in variant else 'q8_0'
                     plans[function['name']] = {
                         'schema': 'shield-opencl-q8-analysis/1', 'dispatchable': False,
                         'operation': weights + '-f32-matmul', 'variant': variant,
@@ -202,6 +226,9 @@ def analyze(source, options='-cl-std=CL3.0', clang='/usr/bin/clang-18'):
                         'requires': ['validated-launch-and-storage', 'authenticated-public-q8-tensor',
                                      'explicit-numerical-contract', 'verified-masked-executor'],
                     }
+        # A function no kernel calls has no audited counterpart to be compared with.
+        if used != set(helpers):
+            return {}
         return plans
     except (ValueError, KeyError, TypeError, IndexError, OSError, subprocess.SubprocessError):
         return {}

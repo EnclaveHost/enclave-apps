@@ -268,50 +268,59 @@ priority of the executor's pad thread (within noise).
 - The earlier Python suites (`test_q8_service`, `test_q8_finite`,
   `test_service`, `test_service_admission`, `test_compiler`) pass.
 
-## Q4_K (first pass)
+## Q4_K and Q6_K
 
-EyesOff's model is a Q4_K_M file, so the route was extended to the two Q4_K
-kernels (`kernel_mul_mm_q4_k_f32_l4_lm`, `kernel_mul_mv_q4_K_f32_flat`). They
-take the Q8_0 kernels' arguments after four weight buffers (quants, 6-bit
-scales, `d`, `dmin`) instead of two, which is the GGUF block split apart.
+EyesOff's model is a Q4_K_M file, which holds Q4_K and Q6_K tensors, so the
+route was extended to the four kernels the OpenCL backend uses for them
+(`kernel_mul_mm_q4_k_f32_l4_lm`, `kernel_mul_mv_q4_K_f32_flat`,
+`kernel_mul_mm_q6_k_f32_l4_lm`, `kernel_mul_mv_q6_K_f32_flat`). Each takes four
+weight buffers, which are the GGUF block split apart (quants, 6-bit scales,
+`d`, `dmin` for Q4_K; low bits, high bits, scales, `d` for Q6_K). Three of the
+four have the Q8_0 kernels' remaining arguments two places later; the Q6_K
+vector kernel has its own, shorter list.
 
-- The two sources are pinned in `q8-reference/` and recognised by the same
-  structural comparison as their own operation.
-- Launch admission covers both layouts in the Python reference and in C++; the
-  parity test compares them on more than six thousand changed launches.
-- The frontend remembers the four buffers as one tensor, tracks writes to any
+- The four sources are pinned in `q8-reference/` and recognised by the same
+  structural comparison, each as its own operation. The Q6_K vector kernel
+  does its arithmetic in a function it calls. The comparison now takes such a
+  function's whole body as part of its caller, and still refuses a source
+  with a function no kernel calls.
+- Launch admission covers all six layouts in the Python reference and in C++;
+  the parity test compares them on more than nine thousand changed launches.
+- The frontend remembers a tensor's four buffers as one, tracks writes to any
   of them, and authenticates the tensor by its GGUF digest recomputed from
-  them. Direct route only; a Q4_K launch that is not offloaded runs its own
-  kernel on the CPU runtime (there is no local product for it).
-- Executor sessions accept approved Q4_K tensors whose rows are whole
+  them. Direct route only.
+- A Q6_K tensor the executor declines is computed in the client like a Q8_0
+  one, from its quants as signed codes with a scale for every sixteen. A
+  declined Q4_K tensor has no such product and runs its own kernel on the CPU
+  runtime, which is slow; the test model has none.
+- Executor sessions accept approved Q4_K and Q6_K tensors whose rows are whole
   256-weight blocks.
-- `llama-shield-cpu-fallback.patch` now lets Q4_K products reach the OpenCL
+- `llama-shield-cpu-fallback.patch` lets those products reach the OpenCL
   device. The plugin has to be rebuilt with it, and the packaged table of
-  sources with nothing to lower has to be regenerated without the two Q4_K
+  sources with nothing to lower has to be regenerated without the four
   sources. Both were done by hand outside this repository for the
   measurements below; no image contains them.
 
 Qwen2.5-3B Q4_K_M (217 Q4_K tensors, 37 Q6_K, calibrated with
-`shielded-calib`), same harness and worker as above, tokens per second:
+`shielded-calib`; the calibration refuses one Q6_K tensor), same harness and
+worker as above, 148 generated tokens, tokens per second:
 
-| Processors, refill threads, tokens | Native Shield | OpenCL route | Ratio |
+| Processors, refill threads | Native Shield | OpenCL route | Ratio |
 | --- | ---: | ---: | ---: |
-| 2, 1, 148 | 20.6 | 21.4 | 104% |
-| 2, 1, 440 | 18.3 | 19.5 | 107% |
-| 8, 1, 148 | 21.1 | 23.7 | 112% |
-| 8, 4, 148 | 58.0 | 29.8 | 51% |
+| 2, 1 | 20.9 | 19.1 | 92% |
+| 8, 1 | 21.3 | 19.9 | 93.5% |
+| 8, 4 | 57.2 | 44.4 | 78% |
 
-A whole 148-token run takes 23.1 s against 26.3 s on two processors.
+Both paths make the same 3,741 verified exchanges for the first 24 tokens with
+the same work, and the generated text is identical over all 148 tokens.
+Prompt processing is 34 against 22 tokens per second on two processors. A
+whole run with the executor not yet running takes 28.5 s against 25.7 s there.
 
-These numbers do not show parity, in either direction. The OpenCL route leaves
-the model's Q6_K tensors (half of the feed-forward down projections, the value
-projections and the output layer) on the CPU, where the native engine offloads
-them. With one refill thread both paths wait for pads, and needing fewer pads
-puts the OpenCL route ahead; with pads plentiful the CPU products are the
-bottleneck and it is half as fast. The generated text is the native engine's
-for the first 24 tokens and differs later, because those tensors are computed
-with different arithmetic. Lowering the Q6_K kernels is the next step; the
-Q6_K matrix kernel has the Q4_K argument layout, the vector kernel has its own.
+With only Q4_K lowered, and the Q6_K tensors left on the CPU, the same model
+ran at 104–112% of the native engine with one refill thread and at 51% with
+four: fewer offloaded products need fewer pads, which helps when pads are
+scarce and hurts when the CPU is the limit. Those numbers describe a different
+split of the work, not a faster route.
 
 ## What is not established
 
@@ -319,16 +328,18 @@ Q6_K matrix kernel has the Q4_K argument layout, the vector kernel has its own.
   through the native profile's launcher and broker. The two-processor numbers
   come from a container pinned to two cores, not from the guest.
 - Parity in tokens per second is not reached. At the service's settings the
-  route is 4–9% behind the native path; with pads plentiful it is 11–19%
+  route is 4–9% behind the native path; with pads plentiful it is 11–22%
   behind. A whole run is shorter than the native engine's only when the
   executor is already running.
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
-- EyesOff's production model itself (27B Q4_K_M) has not been run. The Q4_K
-  path above was measured on a 3B model only, with Q6_K tensors left on the CPU.
-  There is no fixture, identity test or failure-injection test for Q4_K
-  launches; the Q8 ones pass unchanged.
+- EyesOff's production model itself (27B Q4_K_M) has not been run. The K-quant
+  path was measured on one 3B model. There is no kernel fixture, identity test
+  or failure-injection test for K-quant launches; the Q8 ones pass unchanged,
+  and the evidence for K-quants is the recogniser and admission tests plus the
+  end-to-end run whose text and exchange counts equal the native engine's.
+- The Q6_K local product has only been exercised by that run (one tensor).
 - The continuation is learned only for a pair gated with `swiglu` and only if
   the executor's ggml produces the same bytes as the application's. It did for
   the packaged llama; another build, or another activation function, simply
@@ -339,6 +350,6 @@ Q6_K matrix kernel has the Q4_K argument layout, the vector kernel has its own.
   programs built instead of 119) and once with `sd-cli` (same image). They are
   on only for `llama-cli`. There is no unit test for the handle bookkeeping.
 - The executor now needs `-pthread` when it is linked.
-- Only the two Q8 kernels are lowered. Other kernels, other weight types and
-  CUDA binaries are unchanged.
+- Six kernels are lowered (Q8_0, Q4_K, Q6_K; matrix and vector each). Other
+  kernels, other weight types and CUDA binaries are unchanged.
 - The new code has had no independent security review.

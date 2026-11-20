@@ -3,12 +3,15 @@
 // test_q8_admission_native.py). Running them here keeps a launch from waiting
 // on a helper process. Public launch geometry only; never tensor contents.
 //
-// The Q4_K kernels take the Q8_0 kernels' arguments two places later, after
-// four weight buffers instead of two. Scalars are held in the Q8_0 numbering
-// for all four kinds.
-enum Q8Kind { Q8_NONE = 0, Q8_MM = 1, Q8_MV = 2, Q4K_MM = 3, Q4K_MV = 4 };
-inline bool q8_kind_vector(int kind) { return kind == Q8_MV || kind == Q4K_MV; }
-inline unsigned q8_kind_weights(int kind) { return kind == Q4K_MM || kind == Q4K_MV ? 4 : 2; }
+// The K-quant kernels have four weight buffers where the Q8_0 kernels have
+// two, so their other arguments come two places later. Scalars are held two
+// places earlier than a K-quant kernel has them, which for all but the Q6_K
+// vector kernel is the Q8_0 numbering; that kernel has its own, shorter list.
+enum Q8Kind { Q8_NONE = 0, Q8_MM = 1, Q8_MV = 2, Q4K_MM = 3, Q4K_MV = 4, Q6K_MM = 5, Q6K_MV = 6 };
+inline bool q8_kind_vector(int kind) { return kind == Q8_MV || kind == Q4K_MV || kind == Q6K_MV; }
+inline unsigned q8_kind_weights(int kind) { return kind >= Q4K_MM && kind <= Q6K_MV ? 4 : 2; }
+// One past the last meaningful scalar.
+inline unsigned q8_kind_scalars(int kind) { return kind == Q6K_MV ? 15 : 19; }
 struct Q8BufferView {
   uint64_t root, root_bytes, offset, size;
 };
@@ -26,8 +29,9 @@ struct Q8Layout {
 std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
   using wide = unsigned __int128;
   constexpr uint64_t I32 = (1ull << 31) - 1, U32 = (1ull << 32) - 1, MAX_BYTES = 512ull << 20;
-  if (v.kind < Q8_MM || v.kind > Q4K_MV) return std::nullopt;
+  if (v.kind < Q8_MM || v.kind > Q6K_MV) return std::nullopt;
   const bool vector = q8_kind_vector(v.kind), k_quant = q8_kind_weights(v.kind) == 4;
+  const bool q6 = v.kind == Q6K_MM || v.kind == Q6K_MV;
   const unsigned weights = q8_kind_weights(v.kind);
   struct Interval { uint64_t root; wide start, end; };
   auto interval = [&](const Q8BufferView &b, wide offset, wide length) -> std::optional<Interval> {
@@ -37,6 +41,47 @@ std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
   };
   if (v.offset[0] || v.offset[1] || v.offset[2]) return std::nullopt;
   const auto &s = v.scalars;
+  if (v.kind == Q6K_MV) {
+    // offset1, offsetd, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3 at
+    // 3, 5 and 6..14. Every row is guarded before it is read. Block counts,
+    // the input index and the output index are signed int products.
+    for (unsigned i = 6; i < 15; ++i)
+      if (s[i] > I32) return std::nullopt;
+    const wide k = s[6], n = s[7], m = s[12];
+    if (!k || !n || !m || k % 256 || k > I32 - 128) return std::nullopt;
+    if (n > I32 - 8 || n * k / 256 > I32 || m * k > I32 || m * n > I32) return std::nullopt;
+    if (s[8] != 1 || wide(s[9]) != k || s[10] != 1 || wide(s[11]) != n || s[13] != 1 || s[14] != 1)
+      return std::nullopt;
+    if (wide(v.global[0]) != (n + 7) / 8 * 16 || wide(v.global[1]) != m * 2 || v.global[2] != 1 ||
+        v.local[0] != 16 || v.local[1] != 2 || v.local[2] != 1)
+      return std::nullopt;
+    if (s[3] % 4 || s[5] % 4) return std::nullopt;
+    for (unsigned i = 0; i < 6; ++i) {
+      if (!interval(v.buffers[i], 0, 0)) return std::nullopt;
+      for (unsigned j = 0; j < 6; ++j)
+        if (v.buffers[i].root == v.buffers[j].root && v.buffers[i].root_bytes != v.buffers[j].root_bytes)
+          return std::nullopt;
+    }
+    const std::array<std::pair<uint64_t, uint64_t>, 6> aligned = {{{1, 0}, {1, 0}, {1, 0}, {2, 0}, {4, s[3]}, {4, s[5]}}};
+    for (unsigned i = 0; i < 6; ++i)
+      if ((wide(v.buffers[i].offset) + aligned[i].second) % aligned[i].first) return std::nullopt;
+    const wide blocks = n * k / 256;
+    const std::array<std::optional<Interval>, 5> reads = {
+        interval(v.buffers[0], 0, blocks * 128), interval(v.buffers[1], 0, blocks * 64),
+        interval(v.buffers[2], 0, blocks * 16), interval(v.buffers[3], 0, blocks * 2),
+        interval(v.buffers[4], s[3], m * k * 4)};
+    const auto write = interval(v.buffers[5], s[5], m * n * 4);
+    if (!write) return std::nullopt;
+    Q8Layout layout{size_t(m), size_t(n), size_t(k), {}, size_t(write->end - write->start)};
+    for (unsigned i = 0; i < 5; ++i) {
+      if (!reads[i]) return std::nullopt;
+      if (write->root == reads[i]->root &&
+          std::max(write->start, reads[i]->start) < std::min(write->end, reads[i]->end))
+        return std::nullopt;
+      layout.read_bytes[i] = size_t(reads[i]->end - reads[i]->start);
+    }
+    return layout;
+  }
   for (unsigned i = 3; i < 19; ++i) {
     if (i == 4) continue;
     // The Q4_K vector kernel takes its two pointer offsets as int.
@@ -92,7 +137,9 @@ std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
   // The Q4_K quants are read through uchar4 (matrix) or uint (vector)
   // pointers; the vector kernel reads the scales as ushort.
   std::array<std::pair<uint64_t, uint64_t>, 6> alignment{};
-  if (k_quant) alignment = {{{4, 0}, {vector ? 2u : 1u, 0}, {2, 0}, {2, 0}}};
+  // The Q6_K matrix kernel reads quants and scales a byte at a time.
+  if (q6) alignment = {{{1, 0}, {1, 0}, {1, 0}, {2, 0}}};
+  else if (k_quant) alignment = {{{4, 0}, {vector ? 2u : 1u, 0}, {2, 0}, {2, 0}}};
   else alignment = {{{vector ? 1u : 4u, 0}, {2, 0}}};
   alignment[weights] = {input_alignment, s[3]};
   alignment[weights + 1] = {4, s[5]};
@@ -102,8 +149,8 @@ std::optional<Q8Layout> q8_validate_launch(const Q8LaunchView &v) {
   if (k_quant) {
     const wide blocks = n * k / 256;
     reads[0] = interval(v.buffers[0], 0, blocks * 128);
-    reads[1] = interval(v.buffers[1], 0, blocks * 12);
-    reads[2] = interval(v.buffers[2], 0, blocks * 2);
+    reads[1] = interval(v.buffers[1], 0, blocks * (q6 ? 64 : 12));
+    reads[2] = interval(v.buffers[2], 0, blocks * (q6 ? 16 : 2));
     reads[3] = interval(v.buffers[3], 0, blocks * 2);
   } else {
     reads[0] = interval(v.buffers[0], 0, n * k);
