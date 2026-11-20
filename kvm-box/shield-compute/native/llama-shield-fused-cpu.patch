@@ -1,0 +1,20 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -525,7 +525,16 @@
+             // but is still wrong for cases like --no-kv-offload.
+             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+ 
+-            if (device_fused != device_layer) {
++            // The Enclave Shield device hands everything it cannot mask to
++            // the native CPU backend on purpose. A fused op placed there is
++            // the intended placement, and far cheaper than its unfused form.
++            const char * shield_native_cpu = getenv("GGML_SHIELD_NATIVE_CPU_FALLBACK");
++            const char * shield_layer = device_layer ? ggml_backend_dev_description(device_layer) : nullptr;
++            const bool shield_cpu = shield_native_cpu != nullptr && strcmp(shield_native_cpu, "1") == 0 &&
++                    shield_layer != nullptr && strstr(shield_layer, "Enclave Shield Virtual GPU") != nullptr &&
++                    device_fused != nullptr && ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_CPU;
++
++            if (device_fused != device_layer && !shield_cpu) {
+                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+                         "is assigned to device %s (usually due to missing support)\n",
+                         func, node.il,
