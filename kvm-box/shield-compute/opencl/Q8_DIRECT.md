@@ -346,6 +346,12 @@ Tokens per second, 62 prompt tokens, medians of alternating runs:
 | 2 (one a card) | 64 | 4.9 | 4.8 | 98% |
 | 1, eight processors | 48 | 1.8 | 1.4 | 76% |
 | 1, two processors | 48 | 1.6 | 1.3 | 84% |
+| 4, EyesOff's link settings | 100 | 6.3 | 6.2 | 99.6% |
+
+The last row adds the settings EyesOff's deployment gives the link
+(`SHIELDED_SPLIT_COLS=1`, which sends every product to both cards,
+`SHIELDED_OVERLAP_VERIFY=1`, pool depth and refill batch 64, weight budget
+0.95) to both paths.
 
 The generated text is identical to the native engine's in every row, and the
 offloaded work is the same (4.09e12 MACs for the 100-token run).
@@ -394,6 +400,20 @@ authenticated ahead and no launch authenticates; a 16-token run from a cold
 start takes 99 s instead of 113 s, against the native engine's 91 s. The rest
 is the upload to the OpenCL device, which the native engine does not do.
 
+**When pads are in stock.** These rows are all limited by how fast pads are
+made, ten refill threads included (7.7 against 6.8 with sixteen logical
+processors on the same eight cores). The first tokens of a run, which use the
+pads made while the model loaded, show what is left when they are not: 14.2
+tokens a second against 12.3 (87%) over 16 tokens. The difference is a fixed
+cost of about 35 us for each of some 255 round trips a token. Measured on the
+3B model with timestamps in the shared memory: 7 us for the two crossings
+between the processes (3 us when both sides spin, which costs more than it
+saves on eight busy processors), about 10 us in the executor around the
+backend call and 4 us in the frontend. The backend call itself takes what the
+native engine's exchange takes. Pinning the two threads to one core's two
+hardware threads was worth 7% in one arrangement and broke another; it is not
+used.
+
 Both paths are far below what EyesOff reaches in production (about 19 tokens
 per second): this harness uses the KVM Box service's settings and two V100s,
 not EyesOff's.
@@ -403,10 +423,12 @@ not EyesOff's.
 - Nothing here ran in a measured image or a confidential VM, on NucBox, or
   through the native profile's launcher and broker. The two-processor numbers
   come from a container pinned to two cores, not from the guest.
-- Parity in tokens per second is not reached. At the service's settings the
-  route is 4–9% behind the native path; with pads plentiful it is 11–22%
-  behind. A whole run is shorter than the native engine's only when the
-  executor is already running.
+- On the two small models the route is 6 to 8% behind the native path at the
+  service's settings and 16 to 21% behind with four refill threads (re-measured
+  after the changes above: 0.5B 92%, 3B Q8_0 94% and 84%, 3B Q4_K_M 94% and
+  79%). There a token is a hundred and more small products, and the fixed
+  cost of a round trip is a larger share of each. A whole run is shorter than
+  the native engine's only when the executor is already running.
 - Two models, both Qwen2.5 Q8_0. The 3B model has one feed-forward tensor the
   calibration refuses (`blk.2.ffn_down.weight`); both paths compute it on the
   CPU.
