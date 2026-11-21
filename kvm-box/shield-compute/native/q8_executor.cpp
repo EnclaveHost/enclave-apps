@@ -106,6 +106,27 @@ const char * required_env(const char * key) {
     return value;
 }
 
+// Processors this process can count on: those it may run on, and no more than
+// its control group's quota allows (a container given two processors' worth of
+// time on an eight-processor host has two).
+int usable_cpus() {
+    static const int count = [] {
+        cpu_set_t set;
+        int cpus = sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 1;
+        if (FILE * f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
+            char quota[32] = {};
+            unsigned long long period = 0;
+            if (std::fscanf(f, "%31s %llu", quota, &period) == 2 && period && std::strcmp(quota, "max")) {
+                const unsigned long long allowed = (std::strtoull(quota, nullptr, 10) + period - 1) / period;
+                cpus = (int)std::min<unsigned long long>((unsigned long long)cpus, std::max(allowed, 1ull));
+            }
+            std::fclose(f);
+        }
+        return std::max(cpus, 1);
+    }();
+    return count;
+}
+
 // ---------------------------------------------------------------- policy
 
 struct PolicyEntry {
@@ -568,11 +589,84 @@ bool copy_finite(unsigned char * to, const float * from, size_t n) {
 
 using GraphContext = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
 
+// Whether a pad is likely to be in stock for a group of products.
+//
+// The backend keeps a pool of pads per group, made ahead by its refill
+// threads. With the pool empty it makes the pad inside the request, which costs
+// several times the product it protects. This process holds the same
+// authenticated weights and may compute the product itself instead, on its
+// own processors: ordinary arithmetic on values it already holds, as the
+// backend does for a tensor it has no site for. So a product is exchanged when
+// a pad is expected to be ready and computed here when it is not.
+//
+// Nothing asks the pool. Until an exchange has had to make its own pad, every
+// product is exchanged, exactly as before. After that the group's refill rate
+// is estimated: it starts from how often the group was asked for when the pool
+// first ran dry, falls when an exchange finds the pool empty and creeps up
+// while exchanges find pads. SHIELD_Q8_DRY_LOCAL=0 exchanges everything.
+struct PadStock {
+    bool learned = false;
+    double stock = 0, per_ns = 0;
+    uint64_t at = 0, asked_at = 0, asked_before = 0, declined = 0;
+    // What each way of getting this group's products has taken, smoothed; 0 until seen.
+    double found_ns = 0, made_ns = 0, here_ns = 0;
+    bool expected = false;  // the estimate said a pad was ready for the exchange in progress
+    static uint64_t now() {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    static void smooth(double & mean, double sample) { mean = mean ? mean + (sample - mean) / 8 : sample; }
+    static constexpr double kDepth = 4, kFall = 0.5, kRise = 1.01, kSurprise = 1.15;
+    // True: exchange this product. Called once for every request of the group.
+    // `margin` is how much cheaper the product must be here than the exchange
+    // is expected to be: computing here takes processors the refill threads
+    // would otherwise use.
+    bool take(double margin) {
+        const uint64_t t = now();
+        asked_before = asked_at;
+        asked_at = t;
+        expected = true;
+        if (!learned) return true;
+        stock = std::min(kDepth, stock + per_ns * (double)(t - at));
+        at = t;
+        // A product that is cheaper here than an exchange that finds its pad
+        // is computed here whatever the pool holds.
+        const bool cheaper = here_ns && found_ns && here_ns * margin < found_ns;
+        if (stock >= 1 && !cheaper) { stock -= 1; return true; }
+        if (cheaper && ++declined % 64) return false;
+        // Not known yet what it costs here, or not looked at for a while.
+        const bool look = here_ns == 0 || ++declined % 64 == 0;
+        const double exchange = stock * (found_ns ? found_ns : made_ns) + (1 - stock) * made_ns;
+        if (look || here_ns * margin < exchange) return false;
+        expected = false;
+        stock = 0;
+        return true;
+    }
+    // After an exchange: whether it had to make its own pad, and how long it took.
+    void exchanged(bool missed, uint64_t ns) {
+        smooth(missed ? made_ns : found_ns, (double)ns);
+        if (!learned) {
+            if (!missed || !asked_before) return;
+            learned = true;
+            // The pool did not keep up with this group's own requests; half
+            // their rate is where the estimate starts.
+            per_ns = 0.5 / (double)std::max<uint64_t>(asked_at - asked_before, 1000);
+            stock = 0;
+            at = now();
+            return;
+        }
+        if (missed) { if (expected) per_ns *= kFall; stock = 0; }
+        else per_ns *= expected ? kRise : kSurprise;
+    }
+    void computed_here(uint64_t ns) { smooth(here_ns, (double)ns); }
+};
+
 // One weight x batch-width product, built once and reused. The engine does
 // the same with its own graphs, so the backend sees stable nodes across tokens.
 struct Product {
     GraphContext ctx{nullptr, ggml_free};
     ggml_tensor * x = nullptr, * y = nullptr;
+    PadStock pads;
     ggml_cgraph * graph = nullptr;
     size_t input_bytes = 0, output_bytes = 0;
     bool supported = false;
@@ -626,6 +720,30 @@ public:
     Engine(Model & model, const Policy & policy, Backend & backend)
         : model_(model), policy_(policy), backend_(backend) {}
 
+    ~Engine() {
+        if (here_ || dry_)
+            std::fprintf(stderr, "[q8-executor] pads: %llu exchanges found one (%.0f us each), %llu made their own (%.0f us each), "
+                                 "%llu products computed here instead (%.0f us a request)\n",
+                         (unsigned long long)stocked_, stocked_ ? stocked_ns_ / 1e3 / stocked_ : 0.,
+                         (unsigned long long)dry_, dry_ ? dry_ns_ / 1e3 / dry_ : 0.,
+                         (unsigned long long)here_, here_ ? here_ns_ / 1e3 / here_ : 0.);
+        if (std::getenv("SHIELD_Q8_DRY_LOCAL_REPORT")) {
+            std::map<std::tuple<int64_t, int64_t, int64_t>, std::array<double, 5>> by;
+            const auto add = [&by](int64_t k, int64_t n, int64_t two, const PadStock & pads) {
+                auto & row = by[{k, n, two}];
+                row[0] += 1; row[1] += pads.found_ns; row[2] += pads.made_ns; row[3] += pads.here_ns; row[4] += pads.per_ns * 1e9;
+            };
+            for (const auto & [key, product] : products_)
+                if (key.second == 1) add(product.x->ne[0], product.y->ne[0], 0, product.pads);
+            for (const auto & [key, pair] : pairs_)
+                if (std::get<2>(key) == 1) add(pair.x->ne[0], pair.y[0]->ne[0] + pair.y[1]->ne[0], 1, pair.pads);
+            for (const auto & [key, row] : by)
+                std::fprintf(stderr, "[q8-executor] pads k=%lld n=%lld pair=%lld groups=%.0f found=%.0f us made=%.0f us here=%.0f us refill=%.1f/s\n",
+                             (long long)std::get<0>(key), (long long)std::get<1>(key), (long long)std::get<2>(key), row[0],
+                             row[1] / row[0] / 1e3, row[2] / row[0] / 1e3, row[3] / row[0] / 1e3, row[4] / row[0]);
+        }
+        if (products_cpu_) ggml_backend_free(products_cpu_);
+    }
     const Policy & policy() const { return policy_; }
     Model & model() { return model_; }
 
@@ -668,11 +786,26 @@ public:
     // `to`, the product is also copied there, after the accounting holds and
     // in the same pass that checks it; a product that then turns out not to be
     // finite retires the executor with part of it copied and no reply sent.
-    Outcome compute(Product & p, uint64_t k, uint64_t n, uint64_t m, unsigned char * to = nullptr) {
+    Outcome compute(Product & p, uint64_t k, uint64_t n, uint64_t m, unsigned char * to = nullptr, bool session = false) {
         Outcome out;
         if (!p.supported) return out;
         ++p.stamp;
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
+        // Session products only: the line protocol reports the backend's own
+        // accounting for every product.
+        const bool watch = session && m == 1;
+        const uint64_t w0 = watch ? PadStock::now() : 0;
+        if (watch && dry_local_ && !p.pads.take(margin_) && here(p.graph)) {
+            const auto * y = static_cast<const float *>(p.y->data);
+            if (!(to ? copy_finite(to, y, m * n) : all_finite(y, m * n))) retire("non-finite output");
+            out.supported = true;
+            ++here_;
+            p.pads.computed_here(PadStock::now() - w0);
+            here_ns_ += PadStock::now() - w0;
+            ++completed_;
+            return out;
+        }
+        const uint64_t missed = watch ? pads_missed() : 0;
         // NaN sentinel: an output the backend never wrote fails the finite check.
         std::fill_n(static_cast<float *>(p.y->data), m * n, std::nanf(""));
         const Counters before = Counters::read();
@@ -698,6 +831,14 @@ public:
         if (d.graph_macs != m * k * n || d.offloaded + d.local != 1 ||
                 (d.exchanges != 0) != (d.macs != 0) || (d.local == 1 && d.exchanges != 0))
             retire("invalid verified accounting");
+        if (watch && d.exchanges) {
+            const bool dry = pads_missed() != missed;
+            const uint64_t took = PadStock::now() - w0;
+            if (dry_local_) p.pads.exchanged(dry, took);
+            dry_ += dry;
+            (dry ? dry_ns_ : stocked_ns_) += took;
+            stocked_ += !dry;
+        }
         const auto * y = static_cast<const float *>(p.y->data);
         if (!(to ? copy_finite(to, y, m * n) : all_finite(y, m * n))) retire("non-finite output");
         out.supported = true;
@@ -726,6 +867,7 @@ public:
         ggml_tensor * gated[2] = {nullptr, nullptr};
         ggml_cgraph * glue[2] = {nullptr, nullptr};
         uint64_t stamp = 0;  // changes with every compute
+        PadStock pads;
     };
 
     Pair * pair(ggml_tensor * w1, ggml_tensor * w2, uint64_t k, uint64_t n1, uint64_t n2, uint64_t m) {
@@ -800,6 +942,20 @@ public:
         Outcome out;
         ++p.stamp;
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
+        const bool watch = m == 1;
+        const uint64_t w0 = watch ? PadStock::now() : 0;
+        if (watch && dry_local_ && !p.pads.take(margin_) && here(p.graph)) {
+            p.pads.computed_here(PadStock::now() - w0);
+            here_ns_ += PadStock::now() - w0;
+            if (!copy_finite(to[0], static_cast<const float *>(p.y[0]->data), m * n1) ||
+                    !copy_finite(to[1], static_cast<const float *>(p.y[1]->data), m * n2))
+                retire("non-finite output");
+            out.supported = true;
+            here_ += 2;
+            completed_ += 2;
+            return out;
+        }
+        const uint64_t missed = watch ? pads_missed() : 0;
         std::fill_n(static_cast<float *>(p.y[0]->data), m * n1, std::nanf(""));
         std::fill_n(static_cast<float *>(p.y[1]->data), m * n2, std::nanf(""));
         const Counters before = Counters::read();
@@ -824,6 +980,14 @@ public:
         if (d.graph_macs != m * k * (n1 + n2) || d.offloaded + d.local != 2 ||
                 (d.exchanges != 0) != (d.macs != 0) || (d.local == 2 && d.exchanges != 0))
             retire("invalid verified accounting");
+        if (watch && d.exchanges) {
+            const bool dry = pads_missed() != missed;
+            const uint64_t took = PadStock::now() - w0;
+            if (dry_local_) p.pads.exchanged(dry, took);
+            dry_ += dry;
+            (dry ? dry_ns_ : stocked_ns_) += took;
+            stocked_ += !dry;
+        }
         if (!copy_finite(to[0], static_cast<const float *>(p.y[0]->data), m * n1) ||
                 !copy_finite(to[1], static_cast<const float *>(p.y[1]->data), m * n2))
             retire("non-finite output");
@@ -930,6 +1094,45 @@ public:
     }
 
 private:
+    static uint64_t pads_missed() {
+        uint64_t missed = 0;
+        ggml_backend_shielded_pads_used(nullptr, &missed);
+        return missed;
+    }
+    // One of this engine's product graphs on the CPU backend, in this process.
+    // False when that backend is not available; the product is then exchanged.
+    bool here(ggml_cgraph * graph) {
+        if (!products_cpu_tried_) {
+            products_cpu_tried_ = true;
+            products_cpu_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            if (products_cpu_) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(products_cpu_));
+                const auto set = reg ? (ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(
+                                           reg, "ggml_backend_set_n_threads") : nullptr;
+                // The client waits for this product. With processors to spare
+                // one or two are left to the refill thread and to the client's
+                // OpenMP threads, which do not all sleep while it waits; with
+                // two there is nothing to leave (measured at 2, 4 and 8).
+                const int cpus = usable_cpus();
+                int threads = cpus <= 2 ? cpus : cpus <= 4 ? cpus - 1 : std::min(cpus - 2, 16);
+                if (const char * value = std::getenv("SHIELD_Q8_DRY_LOCAL_THREADS")) threads = std::atoi(value);
+                if (set) set(products_cpu_, std::clamp(threads, 1, 64));
+            }
+        }
+        return products_cpu_ && ggml_backend_graph_compute(products_cpu_, graph) == GGML_STATUS_SUCCESS;
+    }
+    const bool dry_local_ = [] {
+        const char * value = std::getenv("SHIELD_Q8_DRY_LOCAL");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    const double margin_ = [] {
+        const char * value = std::getenv("SHIELD_Q8_DRY_LOCAL_MARGIN");
+        const double margin = value ? std::atof(value) : 0.35;
+        return margin > 0 ? margin : 1.0;
+    }();
+    ggml_backend_t products_cpu_ = nullptr;
+    bool products_cpu_tried_ = false;
+    uint64_t here_ = 0, dry_ = 0, stocked_ = 0, here_ns_ = 0, dry_ns_ = 0, stocked_ns_ = 0;
     static constexpr size_t kMaxRetained = 256u << 20;
     Model & model_;
     const Policy & policy_;
@@ -1185,7 +1388,7 @@ void chain_ahead(Session & s, Engine & engine, uint32_t first, uint32_t second, 
     const float * gated = engine.gated(pair, chain.order);
     if (!gated || !all_finite(gated, bytes / 4)) return;
     std::memcpy(p.x->data, gated, bytes);
-    const Outcome out = engine.compute(p, next.k, next.n, m);
+    const Outcome out = engine.compute(p, next.k, next.n, m, nullptr, true);
     if (!out.supported) {
         chain.next = kNoPair;
         chain.strikes = kChainStrikes;
@@ -1325,7 +1528,7 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
             std::memcpy(p.x->data, s.shared.base, p.input_bytes);
             if (!all_finite(static_cast<const float *>(p.x->data), m * slot.k)) throw Drop{"non-finite input"};
             chain_learn(s, engine, f.id, m, p.x->data, p.input_bytes);
-            const Outcome out = engine.compute(p, slot.k, slot.n, m, s.shared.base + kMaxPayload);
+            const Outcome out = engine.compute(p, slot.k, slot.n, m, s.shared.base + kMaxPayload, true);
             if (out.supported) {
                 r.f.a = kOk;
                 r.exchanges = out.exchanges;
@@ -1344,8 +1547,7 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
             // default with four or more, SHIELD_Q8_AHEAD=0 or 1 decides otherwise.
             static const bool ahead = [] {
                 if (const char * value = std::getenv("SHIELD_Q8_AHEAD")) return std::strcmp(value, "0") != 0;
-                cpu_set_t set;
-                return sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) >= 4;
+                return usable_cpus() >= 4;
             }();
             // Started before the reply so it overlaps the client's own work.
             // The products are complete and are only read from here on.
@@ -1368,7 +1570,7 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
     // Complete, validated private payload before any backend query.
     session_read(s.fd, p.x->data, p.input_bytes);
     if (!all_finite(static_cast<const float *>(p.x->data), m * slot.k)) throw Drop{"non-finite input"};
-    const Outcome out = engine.compute(p, slot.k, slot.n, m);
+    const Outcome out = engine.compute(p, slot.k, slot.n, m, nullptr, true);
     struct { Frame f; uint64_t exchanges, macs; } r{{kMatmul, f.id, out.supported ? kOk : kUnsupported, 0},
                                                     out.exchanges, out.macs};
     session_write(s.fd, &r, sizeof r);

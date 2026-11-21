@@ -101,11 +101,14 @@ class Session:
 
 
 class Sessions(unittest.TestCase):
+    # These tests count exchanges and compare bytes between requests.
+    exchange_every_product = True
+
     @classmethod
     def setUpClass(cls):
         config = json.loads(Path('/shield/service.json').read_text())
         config.update(jobs='/tmp', enableQ8Experimental=True, timeoutSeconds=120, clientUids=[os.getuid()],
-                      socket=SOCKET)
+                      socket=SOCKET, q8ExchangeEveryProduct=cls.exchange_every_product)
         config['worker'] = {'host': '127.0.0.1', 'port': 9741}
         cls.config = config
         cls.compute = Compute(config)
@@ -394,6 +397,40 @@ class Sessions(unittest.TestCase):
         self.assertEqual(again.open(0, self.down), 0)
         self.assertEqual(again.matmul(0, x, self.down['ne'][1])[0], 0)
         self.assert_healthy()
+
+
+class PadsRunOut(unittest.TestCase):
+    """The default: a product whose pad pool is empty may be computed by the executor itself."""
+    exchange_every_product = False
+    setUpClass = classmethod(Sessions.setUpClass.__func__)
+    tearDownClass = classmethod(Sessions.tearDownClass.__func__)
+    activation, legacy, assert_healthy = Sessions.activation, Sessions.legacy, Sessions.assert_healthy
+
+    def test_products_stay_correct_and_counted_when_the_pool_is_empty(self):
+        session = Session()
+        self.addCleanup(session.close)
+        self.assertEqual(session.open(0, self.down), 0)
+        before = self.compute.status()
+        requests = 48   # faster than one refill thread fills a pool that starts empty
+        for _ in range(requests):
+            x = self.activation(self.down)
+            status, y = session.matmul(0, x, self.down['ne'][1])
+            self.assertEqual(status, 0)
+            self.assertTrue(np.isfinite(y).all())
+            # The line protocol always exchanges. The exchange and the CPU
+            # backend each quantise the activation their own way, so on these
+            # random activations the products agree to several percent and not
+            # bit for bit (6% seen).
+            reference = self.legacy(self.down, x)
+            self.assertLess(np.linalg.norm(y - reference), 0.12 * np.linalg.norm(reference))
+        after = self.compute.status()
+        self.assertEqual(after['completed'] - before['completed'], 2 * requests)
+        verified = after['telemetry']['verifiedOffloads'] - before['telemetry']['verifiedOffloads']
+        # Every line-protocol product is an exchange; a session product is one or none.
+        self.assertGreaterEqual(verified, requests)
+        self.assertLessEqual(verified, 2 * requests)
+        self.assert_healthy()
+
 
 
 if __name__ == '__main__':

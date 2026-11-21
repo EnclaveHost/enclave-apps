@@ -175,6 +175,12 @@ class Compute:
                 'SHIELDED_REFILL_THREADS': '1', 'SHIELDED_MAX_M': '32',
                 'SHIELDED_POOL_DEPTH': '32',
             })
+            # The executor computes a session product itself when the pad pool
+            # has run dry and that is cheaper than an exchange that makes its
+            # own pad (native/q8_executor.cpp, PadStock). With this set every
+            # product is exchanged, and equal requests give equal bytes.
+            if self.config.get('q8ExchangeEveryProduct') is True:
+                env['SHIELD_Q8_DRY_LOCAL'] = '0'
             if engine == 'sd':
                 env['SD_ACCEL_BACKEND'] = root + '/lib/backends/libggml-shielded.so'
                 # Image-token batches exceed MAX_M. Split them into bounded,

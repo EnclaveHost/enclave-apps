@@ -418,6 +418,72 @@ Both paths are far below what EyesOff reaches in production (about 19 tokens
 per second): this harness uses the KVM Box service's settings and two V100s,
 not EyesOff's.
 
+## When the pad pool is empty
+
+At the service's settings one refill thread makes the pads, and it does not
+keep up: on the 3B Q4_K_M model about one exchange in eight finds its pool
+empty and makes its own pad inside the request. Those are the large groups
+(the gate and up projections together take 2.1 ms, a down projection 1.2 ms,
+the vocabulary projection 13 to 17 ms) and they are two thirds of a token's
+time on either path. An exchange that finds its pad takes 0.05 to 0.15 ms.
+
+The executor holds the same authenticated weights and has the CPU backend, so
+it can compute such a product itself: ordinary arithmetic on values it
+already holds, as the backend does for a tensor it has no site for. Nothing
+leaves the process. `PadStock` in `native/q8_executor.cpp` decides for each
+group of products. Until an exchange has had to make its own pad everything is
+exchanged as before. From then on the group's refill rate is estimated (the
+backend's count of pads made on the request path says after each exchange
+whether the pool was empty), and when no pad is expected the product is
+computed here if that is cheaper than the exchange is expected to be, by the
+times measured for that group. A group that is cheaper here than an exchange
+that finds its pad is computed here regardless. Session products of one row
+only; the line protocol still exchanges everything and reports the backend's
+accounting.
+
+Measured on the 3B Q4_K_M model, three alternating runs each, service
+settings, tokens per second in generation:
+
+| processors | native engine | this route | |
+|---|---|---|---|
+| 2 (pinned) | 21.1 | 23.0 | 109% |
+| 4 (pinned) | 21.4 | 25.7 | 120% |
+| 8 (pinned) | 22.2 | 29.1 | 131% |
+| 8, two refill threads | 36.9 | 36.6 | 99% |
+| 8, four refill threads | 61.7 | 49.0 | 79% |
+
+With pads plentiful nothing is computed here and the route is where it was.
+The gain comes from processors the native engine leaves idle at these settings
+(the client's while it waits, and any beyond the engine's two threads): the
+product is computed on all of them, less one or two when there are more than
+two. Before this the route was at 91 to 96% in the first three rows.
+
+What it changes, and why a deployment may not want it:
+
+- Fewer products are exchanged, so `verifiedOffloads` and `maskedMacs` count
+  less than the work done: about half the products of a token at the
+  service's settings. They still count exactly what was exchanged.
+- Whether a product is exchanged depends on timing, and the two computations
+  round differently. Equal requests no longer give equal bytes, and a run's
+  text differs from the native engine's and from one run to the next (the
+  text of every run read as sound). With every product exchanged the route's
+  text equals the native engine's.
+- The card does less. That is the point at these settings, where making the
+  pad costs more than the product, but a deployment that wants the work on
+  the card should turn it off or give the engine refill threads.
+
+`q8ExchangeEveryProduct: true` in the service configuration (or
+`SHIELD_Q8_DRY_LOCAL=0` for the executor) exchanges everything.
+`SHIELD_Q8_DRY_LOCAL_THREADS` and `SHIELD_Q8_DRY_LOCAL_MARGIN` (0.35: how
+much cheaper the product must be here) are for measuring;
+`SHIELD_Q8_DRY_LOCAL_REPORT=1` prints the times per group when the executor
+stops. `test_q8_session.py` runs its accounting tests with every product
+exchanged and has one test of the default.
+
+Not measured: EyesOff's 27B model with this (the host had 39 GB free of the
+48 a run takes), and any guest. An earlier attempt that used the CPU
+backend's default of four threads was no faster than making the pad.
+
 ## What is not established
 
 - Nothing here ran in a measured image or a confidential VM, on NucBox, or
