@@ -719,6 +719,31 @@ plain and 14.48, 15.55, 16.27 drafting with it, 14.55, 14.90, 14.19 and 14.95,
 14.07, 14.59 without; the native engine 15.26, 15.71, 15.19 and 17.61, 16.78,
 17.42. A little, and more with two rows.
 
+**Where a token's time is on the OpenCL route**, from timers in the frontend
+(llama-cli, one run each, milliseconds a token): over the socket 77.8 = 51.0
+waiting on the executor + 3.7 in the frontend's launches + 23.0 outside them;
+mailbox with the threads free 76.3 = 45.8 + 3.9 + 26.6; mailbox with the two
+on one core 71.2 = 44.7 + 2.8 + 23.8; on two cores 67.7 = 41.0 + 3.0 + 23.8.
+A mailed request reaches the executor in 0.3 to 0.9 us and its answer comes
+back in 0.1 to 0.3. So the hand-off is no longer a cost, and the 23 ms
+outside the launches does not depend on it: that is the application's own
+path (its processor work, its copies in and out of device buffers, 18 kernel
+arguments a launch, and with llama-cli its sampling over the vocabulary).
+Under EyesOff's loop, which samples by a plain maximum, one core was better
+than two in alternating rounds (15.02, 16.53, 14.92 against 14.71, 14.12,
+14.35 plain).
+
+Tried on that path and not kept: waiting with MONITORX/MWAITX in place of a
+spinning loop, so that the waiting hardware thread leaves the core to the
+other (14.59, 14.48, 14.55 against 14.75, 14.38, 14.58; a wait does sleep, 54
+us for a 50 us limit); using the activation where it lies in the runtime's
+storage with one copy into the shared memory (14.96 against 15.40, medians of
+three); the residual chain run on the serving thread itself, a step the
+client is waiting for computed straight into the shared memory (branch
+`kvm-box/shield-residual-inline`: every prediction right, 14.64 against 14.90,
+the chain's products 178 us each beside a busy sibling where one alone takes
+150 to 160).
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have
