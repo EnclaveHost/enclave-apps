@@ -729,6 +729,12 @@ set.
 Measured: the application's private memory falls from 1.94 GiB to 0.17 GiB on
 the 3B model with the same text, exchanges and speed (45 to 47 tokens a second
 both ways); the 27B runs above kept 18 GB or more available on a host with 57.
+A buffer that is rewritten all the time is the wrong thing to put there:
+llama's compute buffer (495 MiB on the 27B) qualifies by size, and with it in
+memory instead (`SHIELD_OPENCL_BUFFER_FILE_MIN_MB=1000`; which of the weight
+buffers that still leaves on the file was not checked) the route measured 14.40,
+14.89, 14.82 tokens a second against 14.48, 14.56, 14.35. Size does not tell
+weights from work space; that needs a better rule before this is a default.
 The directory must be on a disk with room for the model. Not tried: a guest,
 and a directory in memory, where it would save nothing.
 
