@@ -398,7 +398,7 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
 }
 
 // One session with the executor, shared by this process's launches.
-constexpr size_t Q8_SHARED_REGION = 2u << 20, Q8_SHARED_REGIONS = 3;
+constexpr size_t Q8_SHARED_REGION = 64u << 20, Q8_SHARED_REGIONS = 3;
 constexpr uint32_t Q8_NO_PAIR = 0xffffffff;
 struct Q8Session {
   int fd = -1;

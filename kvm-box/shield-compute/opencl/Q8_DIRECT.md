@@ -528,6 +528,58 @@ is behind by about 9 ms a token, 35 us for each of its 256 exchanges. Eight
 is worse for both on eight processors. The route does not exceed the native
 engine on this model in any of these.
 
+## EyesOff's own settings and engine
+
+The rows above compare the route with the same backend under this harness's
+settings. EyesOff itself runs at about 20 tokens a second on these two cards
+(`shielded/REPORT.md` in the platform repository, sections 16 to 18), so that
+comparison was against a slow baseline. What its deployment and that report
+use, and this harness did not: a shared-memory ring to each worker instead of
+TCP, eight engine threads, a refill thread for every pool (16 in all), batch
+width 64, no processor limit, and drafting with the model's MTP head through
+`libenclave_llama`.
+
+Measured 2026-11-22 on a loaded host (another tenant's VM at three to eight
+processors), 64 tokens, the report's prompt, tokens a second:
+
+| Path | Plain | Drafting k=1 |
+| --- | ---: | ---: |
+| EyesOff's engine and harness on the host (`bench-spec2`, official build) | 16.45, 15.92 | 19.51, 16.60 |
+| The same loop in the KVM Box image over its Shield backend | 14.78 | 14.23, 15.21 |
+| The same loop over the OpenCL route | 11.96 | 11.53, 11.67 |
+| llama-cli, native Shield, ring, 8 threads, 16 refill threads | 15.73 | |
+| llama-cli, OpenCL route, same | 11.8 to 12.6 | |
+| llama-cli, OpenCL route, TCP, same threads | 10.61 | |
+| llama-cli, OpenCL route, as measured before (TCP, 2 threads, 4 refill threads, 8 processors) | 6.3 | |
+
+So the settings are worth a factor of two to the route, and with them it is
+at 75 to 80% of the native engine and about 74% of EyesOff's plain decode on
+the same day. The drafting loop runs over the route unchanged (same accepted
+drafts, identical text); it gains nothing in the image on either path today.
+
+To run EyesOff's loop over the route: the engine shim and `bench-spec2` built
+against this tree's llama, the OpenCL backend loaded as the device, the
+recurrent state and KV kept off the device and fused attention on (what
+`--no-kv-offload` and `--flash-attn on` do for llama-cli), and the executor's
+shared regions large enough for a batch of full-vocabulary rows. The regions
+are now 64 MiB and a request may have 64 rows (they were 2 MiB and 32; a
+17-row prompt asked for 16.9 MB of logits).
+
+The service takes the settings from its configuration (`link`: `workers`
+with an optional `ring` each, `refillThreads`, `maxRows`, `poolDepth`,
+`refillBatch`, `splitColumns`, `overlapVerify`), checked value by value.
+Without it the defaults are unchanged.
+
+Where the route's remaining 17 ms a token goes, from timestamps in the shared
+region and the two timing reports (generation only, 261 requests a token):
+about 7 ms in the two crossings between the processes (12 to 20 us back, the
+same order forward; spinning brings the way back to 5 us and makes the whole
+slower on a busy host), 4 ms in the frontend around its 401 launches, 2 ms in
+the executor around the backend call, 2 ms in the scheduler's buffer reads
+and writes, the rest in the client. A request for a product the executor
+already started (the down projection) waits for it, about 190 us: that is the
+product, not a cost of asking. Not established: any of this in a guest.
+
 ## Application buffers backed by a file
 
 On the 27B the route held the model three times: the executor's backend copy

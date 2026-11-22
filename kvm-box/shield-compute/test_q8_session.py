@@ -26,7 +26,7 @@ from service import Compute, Server, Handler, receive, send
 
 ARITHMETIC = 'shield-fixed-point-v1'
 OPEN, MATMUL, SHARE, MATMUL_SHARED, BYE = 1, 2, 3, 4, 0xff
-REGION = 2 << 20
+REGION = 64 << 20
 NO_PAIR = 0xffffffff
 F_GET_SEALS, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_GROW = 1034, 1, 2, 4
 SOCKET = '/tmp/shield-q8-session-test.sock'

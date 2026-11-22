@@ -64,8 +64,8 @@ constexpr size_t kMaxPolicy = 16u << 20;
 constexpr uint64_t kMaxModel = 64ull << 30;
 constexpr size_t kMaxTensor = size_t(2) << 30;
 constexpr size_t kMaxHeader = 8192;          // including the terminating '\n'
-constexpr size_t kMaxPayload = 2u << 20;     // input and output, each
-constexpr uint64_t kMaxRows = 32;
+constexpr size_t kMaxPayload = 64u << 20;    // input and output, each
+constexpr uint64_t kMaxRows = 64;
 constexpr uint64_t kMaxRequests = 100000;
 
 // Thrown for every refusal; never carries private values.

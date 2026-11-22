@@ -274,5 +274,35 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(receive(b, 100), {'text': 'private guest data'})
 
 
+class LinkSettings(unittest.TestCase):
+    def test_settings_become_the_backend_environment(self):
+        from service import link_environment
+        self.assertEqual(link_environment(None), {})
+        env = link_environment({
+            'refillThreads': 16, 'maxRows': 64, 'poolDepth': 64, 'refillBatch': 64, 'splitColumns': True,
+            'overlapVerify': False,
+            'workers': [{'host': '127.0.0.1', 'port': 9601, 'reserveBytes': 26000000000,
+                         'ring': '/dev/enclave-shielded-shm/card-0', 'ringBytes': 64 << 20},
+                        {'host': '10.0.2.2', 'port': 9602, 'reserveBytes': 26000000000}]})
+        self.assertEqual(env, {
+            'SHIELDED_REFILL_THREADS': '16', 'SHIELDED_MAX_M': '64', 'SHIELDED_POOL_DEPTH': '64',
+            'SHIELDED_REFILL_BATCH': '64', 'SHIELDED_SPLIT_COLS': '1',
+            'SHIELDED_WORKERS': '127.0.0.1|9601|0|26000000000|/dev/enclave-shielded-shm/card-0|67108864\n'
+                                '10.0.2.2|9602|0|26000000000'})
+
+    def test_anything_else_is_refused(self):
+        from service import link_environment
+        worker = {'host': '127.0.0.1', 'port': 9601, 'reserveBytes': 1 << 30}
+        for link in ('x', {'env': {}}, {'refillThreads': 0}, {'refillThreads': '4'}, {'maxRows': 65},
+                     {'splitColumns': 1}, {'workers': []}, {'workers': [dict(worker, host='a|b')]},
+                     {'workers': [dict(worker, port=0)]}, {'workers': [dict(worker, reserveBytes=True)]},
+                     {'workers': [dict(worker, ring='/dev/shm/x')]},
+                     {'workers': [dict(worker, ring='/dev/enclave-shielded-shm/../x')]},
+                     {'workers': [dict(worker, ring='/dev/enclave-shielded-shm/card-0', ringBytes=1 << 20)]},
+                     {'workers': [dict(worker, extra=1)]}):
+            with self.assertRaises(ValueError):
+                link_environment(link)
+
+
 if __name__ == '__main__':
     unittest.main()

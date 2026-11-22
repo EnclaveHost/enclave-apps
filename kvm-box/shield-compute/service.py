@@ -74,6 +74,61 @@ def verify_file(path, expected):
         raise ValueError('measured artifact digest mismatch')
 
 
+
+# Administrator's settings for the link to the workers (config "link"). The defaults above are for a small
+# guest and one worker over TCP; on a host with processors to spare the same route measured twice as fast
+# with a ring to each worker and a refill thread per pool (opencl/Q8_DIRECT.md, "EyesOff's settings").
+# Every value is checked here: nothing in it is passed through as text.
+LINK_NUMBERS = {'refillThreads': ('SHIELDED_REFILL_THREADS', 1, 64), 'maxRows': ('SHIELDED_MAX_M', 1, 64),
+                'poolDepth': ('SHIELDED_POOL_DEPTH', 1, 256), 'refillBatch': ('SHIELDED_REFILL_BATCH', 1, 256)}
+LINK_SWITCHES = {'splitColumns': 'SHIELDED_SPLIT_COLS', 'overlapVerify': 'SHIELDED_OVERLAP_VERIFY'}
+RING_DIRECTORY = '/dev/enclave-shielded-shm/'
+
+
+def link_environment(link):
+    if link is None:
+        return {}
+    if not isinstance(link, dict) or set(link) - set(LINK_NUMBERS) - set(LINK_SWITCHES) - {'workers'}:
+        raise ValueError('invalid link settings')
+    env = {}
+    for key, (name, least, most) in LINK_NUMBERS.items():
+        if key in link:
+            value = link[key]
+            if type(value) is not int or not least <= value <= most:
+                raise ValueError('invalid link setting ' + key)
+            env[name] = str(value)
+    for key, name in LINK_SWITCHES.items():
+        if key in link:
+            if type(link[key]) is not bool:
+                raise ValueError('invalid link setting ' + key)
+            if link[key]:
+                env[name] = '1'
+    if 'workers' in link:
+        workers = link['workers']
+        if not isinstance(workers, list) or not 1 <= len(workers) <= 8:
+            raise ValueError('invalid link workers')
+        lines = []
+        for worker in workers:
+            if not isinstance(worker, dict) or set(worker) - {'host', 'port', 'reserveBytes', 'ring', 'ringBytes'}:
+                raise ValueError('invalid link worker')
+            host, port, reserve = worker.get('host'), worker.get('port'), worker.get('reserveBytes')
+            if (not isinstance(host, str) or not re.fullmatch(r'[0-9A-Za-z.:-]{1,64}', host) or
+                    type(port) is not int or not 1 <= port <= 65535 or
+                    type(reserve) is not int or not 1 <= reserve <= 1 << 40):
+                raise ValueError('invalid link worker')
+            line = '%s|%d|0|%d' % (host, port, reserve)
+            if 'ring' in worker or 'ringBytes' in worker:
+                ring, size = worker.get('ring'), worker.get('ringBytes', 64 << 20)
+                if (not isinstance(ring, str) or not ring.startswith(RING_DIRECTORY) or
+                        not re.fullmatch(r'[0-9A-Za-z._-]{1,64}', ring[len(RING_DIRECTORY):]) or
+                        type(size) is not int or size not in (8 << 20, 16 << 20, 32 << 20, 64 << 20)):
+                    raise ValueError('invalid link worker ring')
+                line += '|%s|%d' % (ring, size)
+            lines.append(line)
+        env['SHIELDED_WORKERS'] = '\n'.join(lines)
+    return env
+
+
 class Compute:
     def __init__(self, config):
         if config['schema'] != 'shield-guest-service/1':
@@ -175,6 +230,7 @@ class Compute:
                 'SHIELDED_REFILL_THREADS': '1', 'SHIELDED_MAX_M': '32',
                 'SHIELDED_POOL_DEPTH': '32',
             })
+            env.update(link_environment(self.config.get('link')))
             # The executor computes a session product itself when the pad pool
             # has run dry and that is cheaper than an exchange that makes its
             # own pad (native/q8_executor.cpp, PadStock). With this set every
