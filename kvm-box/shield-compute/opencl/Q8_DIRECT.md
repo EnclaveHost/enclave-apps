@@ -648,6 +648,14 @@ and 16.2 drafting against the native engine's 15.5 and 16.6.
   executor pins itself after its first mailed product, when the backend's
   threads exist, because a thread made later inherits the one processor.
 
+The mailbox and the one core are in the OpenCL frontend too
+(`SHIELD_OPENCL_Q8_MAILBOX=1`, `SHIELD_OPENCL_Q8_CPU`), so the emulated device
+has them for any application. The same loop over the OpenCL route, three
+alternating rounds: 14.45, 14.79, 13.44 plain and 15.43, 15.33, 15.50 drafting
+with them, against 12.54, 12.87, 12.89 and 12.77, 12.26, 12.67 over the socket.
+That is 93% of the native engine; what is left is the OpenCL layer itself,
+which the session backend does not have.
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have

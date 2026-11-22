@@ -400,6 +400,16 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
 // One session with the executor, shared by this process's launches.
 constexpr size_t Q8_SHARED_REGION = 64u << 20, Q8_SHARED_REGIONS = 3;
 constexpr uint32_t Q8_NO_PAIR = 0xffffffff;
+// EXPERIMENT (SHIELD_OPENCL_Q8_MAILBOX=1, and SHIELD_Q8_MAILBOX=1 for the executor): the executor's request
+// slot in the last bytes of the shared memory (its Mail). A request and its answer pass through it without a
+// system call while the executor is awake. SHIELD_OPENCL_Q8_CPU pins the thread that makes the requests, to
+// the other hardware thread of the core the executor's serving thread is on.
+struct Q8Mail {
+  std::atomic<uint32_t> request, reply, sleeping;
+  uint32_t id, m, pair;
+  uint32_t status, paired;
+  uint64_t exchanges, macs;
+};
 struct Q8Session {
   int fd = -1;
   uint64_t serial = 0;  // changes with every connection; slots belong to one
@@ -408,6 +418,8 @@ struct Q8Session {
   // Payload memory the executor created for this session: activation, product,
   // and the product of a paired tensor. Null when it could not provide one.
   unsigned char *shared = nullptr;
+  Q8Mail *mail = nullptr;
+  bool pinned = false;
   // Two tensors applied to the same activation one after the other (a
   // feed-forward gate and up projection) can share a round trip: the second
   // product is requested with the first and used only if the next launch asks
@@ -425,6 +437,7 @@ struct Q8Session {
     serial = 0;
     if (shared) munmap(shared, Q8_SHARED_REGIONS * Q8_SHARED_REGION);
     shared = nullptr;
+    mail = nullptr;
     slots.clear();
     pair_of.clear();
     last_valid = ready_valid = false;
@@ -442,7 +455,7 @@ const int q8_fork_guard = pthread_atfork(nullptr, nullptr, [] {
 struct Q8Frame {
   uint32_t type, id, a, b;
 };
-constexpr uint32_t Q8_OPEN = 1, Q8_MATMUL = 2, Q8_SHARE = 3, Q8_MATMUL_SHARED = 4, Q8_BYE = 0xff;
+constexpr uint32_t Q8_OPEN = 1, Q8_MATMUL = 2, Q8_SHARE = 3, Q8_MATMUL_SHARED = 4, Q8_MAIL = 5, Q8_WAKE = 6, Q8_BYE = 0xff;
 struct Q8Bye {};  // the executor stopped between requests; nothing was computed
 struct Q8SendFailed {};
 // After a failed send: whether the executor had already said goodbye. It
@@ -575,6 +588,18 @@ void q8_connect(const std::string &engine) {
           if (reply.a == 0 && reply.b == Q8_SHARED_REGION && shared_fd >= 0) {
             void *base = mmap(nullptr, Q8_SHARED_REGIONS * Q8_SHARED_REGION, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0);
             if (base != MAP_FAILED) q8_session.shared = static_cast<unsigned char *>(base);
+          }
+          if (q8_session.shared && std::getenv("SHIELD_OPENCL_Q8_MAILBOX")) {
+            const Q8Frame ask{Q8_MAIL, 0, 0, 0};
+            try {
+              q8_send(q8_session.fd, &ask, sizeof(ask));
+            } catch (const Q8SendFailed &) {
+              throw std::runtime_error("Shield session send failed");
+            }
+            Q8Frame answer{};
+            q8_receive(q8_session.fd, &answer, sizeof(answer));
+            if (answer.type == Q8_MAIL && answer.a == 0)
+              q8_session.mail = reinterpret_cast<Q8Mail *>(q8_session.shared + Q8_SHARED_REGIONS * Q8_SHARED_REGION - sizeof(Q8Mail));
           }
         }
         return;
@@ -709,11 +734,44 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       }
       const uint32_t pair = id < session.pair_of.size() ? session.pair_of[id] : Q8_NO_PAIR;
       std::memcpy(session.shared, input.data(), input.size());
-      struct { Q8Frame frame; uint32_t pair, reserved; } request{{Q8_MATMUL_SHARED, id, uint32_t(m), 0}, pair, 0};
-      q8_send(session.fd, &request, sizeof(request));
-      const Q8Frame reply = q8_reply(session.fd, Q8_MATMUL_SHARED, id);
-      uint64_t counters[2];
-      q8_receive(session.fd, counters, sizeof(counters));
+      Q8Frame reply{};
+      if (session.mail) {
+        Q8Mail *mail = session.mail;
+        if (!session.pinned) {
+          session.pinned = true;
+          if (const char *cpu = std::getenv("SHIELD_OPENCL_Q8_CPU")) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(std::atoi(cpu), &set);
+            sched_setaffinity(0, sizeof(set), &set);  // the calling thread
+          }
+        }
+        mail->id = id;
+        mail->m = uint32_t(m);
+        mail->pair = pair;
+        const uint32_t mine = mail->request.load(std::memory_order_relaxed) + 1;
+        mail->request.store(mine, std::memory_order_seq_cst);
+        if (mail->sleeping.load(std::memory_order_seq_cst)) {
+          const Q8Frame wake{Q8_WAKE, 0, 0, 0};
+          q8_send(session.fd, &wake, sizeof(wake));
+        }
+        // The executor closes the socket when it stops; look now and then so that this does not wait for ever.
+        for (uint64_t turn = 1; mail->reply.load(std::memory_order_acquire) != mine; ++turn) {
+          _mm_pause();
+          if ((turn & 0xfffff) == 0) {
+            Q8Frame gone{};
+            const ssize_t got = recv(session.fd, &gone, sizeof(gone), MSG_PEEK | MSG_DONTWAIT);
+            if (got == 0 || (got == ssize_t(sizeof(gone)) && gone.type == Q8_BYE)) throw std::runtime_error("Shield session closed");
+          }
+        }
+        reply = {Q8_MATMUL_SHARED, id, mail->status, mail->paired};
+      } else {
+        struct { Q8Frame frame; uint32_t pair, reserved; } request{{Q8_MATMUL_SHARED, id, uint32_t(m), 0}, pair, 0};
+        q8_send(session.fd, &request, sizeof(request));
+        reply = q8_reply(session.fd, Q8_MATMUL_SHARED, id);
+        uint64_t counters[2];
+        q8_receive(session.fd, counters, sizeof(counters));
+      }
       session.last_valid = false;
       if (reply.a == 1) return nullptr;
       if (reply.a != 0) throw std::runtime_error("Q8 session status");
