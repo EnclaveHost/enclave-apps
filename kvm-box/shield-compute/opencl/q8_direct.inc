@@ -398,7 +398,7 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
 }
 
 // One session with the executor, shared by this process's launches.
-constexpr size_t Q8_SHARED_REGION = 64u << 20, Q8_SHARED_REGIONS = 3;
+constexpr size_t Q8_SHARED_REGION = 64u << 20, Q8_SHARED_REGIONS = 4;
 constexpr uint32_t Q8_NO_PAIR = 0xffffffff;
 // EXPERIMENT (SHIELD_OPENCL_Q8_MAILBOX=1, and SHIELD_Q8_MAILBOX=1 for the executor): the executor's request
 // slot in the last bytes of the shared memory (its Mail). A request and its answer pass through it without a
@@ -409,6 +409,7 @@ struct Q8Mail {
   uint32_t id, m, pair;
   uint32_t status, paired;
   uint64_t exchanges, macs;
+  uint32_t third, reserved;  // third: a second partner's slot plus one, 0 for none
 };
 struct Q8Session {
   int fd = -1;
@@ -431,6 +432,11 @@ struct Q8Session {
   bool last_valid = false, ready_valid = false;
   uint64_t requests = 0, paired = 0, served = 0, learned = 0, missed = 0;  // counts for the timing report
   uint32_t ready_slot = Q8_NO_PAIR;        // paired product waiting in the third region
+  // A third tensor on the same activation (attention's q, k and v) can ride with the pair: it is learned
+  // when it follows a paired product that was just served, and its product waits in the fourth region.
+  std::vector<uint32_t> third_of;          // a pair's first slot -> the slot seen after its partner
+  uint32_t first_slot = Q8_NO_PAIR, ready2_slot = Q8_NO_PAIR;
+  bool ready2_valid = false, partner_served = false;
   void reset() {
     if (fd >= 0) close(fd);
     fd = -1;
@@ -440,7 +446,8 @@ struct Q8Session {
     mail = nullptr;
     slots.clear();
     pair_of.clear();
-    last_valid = ready_valid = false;
+    third_of.clear();
+    last_valid = ready_valid = ready2_valid = partner_served = false;
   }
 };
 std::mutex q8_direct_mutex;
@@ -714,6 +721,8 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       const bool same_input = session.last_valid && session.last_m == m &&
                               session.last_input.size() == input.size() &&
                               !std::memcmp(session.last_input.data(), input.data(), input.size());
+      const bool after_partner = session.partner_served;
+      session.partner_served = false;
       if (session.ready_valid) {
         session.ready_valid = false;
         if (session.ready_slot == id && same_input) {
@@ -722,17 +731,36 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
           // follows this one, not the tensor the pair was requested with:
           // learning it there would replace the pair just served.
           session.last_slot = id;
+          session.partner_served = true;
           return session.shared + 2 * Q8_SHARED_REGION;
         }
         ++session.missed;
+        session.ready2_valid = false;
         // The expected launch did not follow; stop asking for that pair.
         if (session.last_slot < session.pair_of.size()) session.pair_of[session.last_slot] = Q8_NO_PAIR;
+      } else if (session.ready2_valid) {
+        session.ready2_valid = false;
+        if (session.ready2_slot == id && same_input) {
+          ++session.served;
+          session.last_slot = id;
+          return session.shared + 3 * Q8_SHARED_REGION;
+        }
+        ++session.missed;
+        if (session.first_slot < session.third_of.size()) session.third_of[session.first_slot] = Q8_NO_PAIR;
       } else if (same_input && session.last_slot != id) {
-        if (session.pair_of.size() <= session.last_slot) session.pair_of.resize(session.last_slot + 1, Q8_NO_PAIR);
-        session.pair_of[session.last_slot] = id;
+        if (after_partner && session.first_slot != Q8_NO_PAIR && session.first_slot != id &&
+            std::getenv("SHIELD_OPENCL_Q8_TRIPLE")) {
+          if (session.third_of.size() <= session.first_slot) session.third_of.resize(session.first_slot + 1, Q8_NO_PAIR);
+          session.third_of[session.first_slot] = id;
+        } else {
+          if (session.pair_of.size() <= session.last_slot) session.pair_of.resize(session.last_slot + 1, Q8_NO_PAIR);
+          session.pair_of[session.last_slot] = id;
+        }
         ++session.learned;
       }
       const uint32_t pair = id < session.pair_of.size() ? session.pair_of[id] : Q8_NO_PAIR;
+      const uint32_t third = pair != Q8_NO_PAIR && id < session.third_of.size() ? session.third_of[id] : Q8_NO_PAIR;
+      session.first_slot = id;
       std::memcpy(session.shared, input.data(), input.size());
       Q8Frame reply{};
       if (session.mail) {
@@ -749,6 +777,7 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
         mail->id = id;
         mail->m = uint32_t(m);
         mail->pair = pair;
+        mail->third = third == Q8_NO_PAIR ? 0 : third + 1;
         const uint32_t mine = mail->request.load(std::memory_order_relaxed) + 1;
         mail->request.store(mine, std::memory_order_seq_cst);
         if (mail->sleeping.load(std::memory_order_seq_cst)) {
@@ -766,7 +795,8 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
         }
         reply = {Q8_MATMUL_SHARED, id, mail->status, mail->paired};
       } else {
-        struct { Q8Frame frame; uint32_t pair, reserved; } request{{Q8_MATMUL_SHARED, id, uint32_t(m), 0}, pair, 0};
+        struct { Q8Frame frame; uint32_t pair, reserved; } request{{Q8_MATMUL_SHARED, id, uint32_t(m), 0}, pair,
+                                                                    third == Q8_NO_PAIR ? 0 : third + 1};
         q8_send(session.fd, &request, sizeof(request));
         reply = q8_reply(session.fd, Q8_MATMUL_SHARED, id);
         uint64_t counters[2];
@@ -783,6 +813,8 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       session.ready_valid = (reply.b & 1) && pair != Q8_NO_PAIR;
       session.paired += session.ready_valid;
       session.ready_slot = pair;
+      session.ready2_valid = session.ready_valid && (reply.b & 2) && third != Q8_NO_PAIR;
+      session.ready2_slot = third;
       return session.shared + Q8_SHARED_REGION;
     } catch (const Q8Bye &) {
       session.reset();

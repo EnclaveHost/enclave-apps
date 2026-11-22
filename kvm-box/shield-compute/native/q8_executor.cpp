@@ -892,6 +892,79 @@ public:
         PadStock pads;
     };
 
+    // EXPERIMENT. Three weights applied to one activation (attention's q, k and v) in one graph, so that
+    // the group is one exchange, as it is for an engine whose graph the backend sees whole. No gating
+    // and no pad estimate: nothing is known to follow it.
+    struct Triple {
+        GraphContext ctx{nullptr, ggml_free};
+        ggml_tensor * x = nullptr, * y[3] = {nullptr, nullptr, nullptr};
+        ggml_cgraph * graph = nullptr;
+        size_t input_bytes = 0, output_bytes[3] = {0, 0, 0};
+    };
+
+    Triple * triple(ggml_tensor * const w[3], uint64_t k, const uint64_t n[3], uint64_t m) {
+        const auto key = std::make_tuple(w[0], w[1], w[2], m);
+        if (const auto it = triples_.find(key); it != triples_.end()) return it->second.graph ? &it->second : nullptr;
+        constexpr size_t kGraphNodes = 12;
+        Triple p;
+        p.input_bytes = m * k * 4;
+        size_t bytes = p.input_bytes;
+        for (int i = 0; i < 3; ++i) bytes += p.output_bytes[i] = m * n[i] * 4;
+        if (triples_.size() >= 256) triples_.clear();
+        const size_t mem = 12 * ggml_tensor_overhead() + ggml_graph_overhead_custom(kGraphNodes, false) + bytes + (64u << 10);
+        p.ctx.reset(ggml_init(ggml_init_params{mem, nullptr, false}));
+        if (!p.ctx) retire("graph context allocation failed");
+        p.x = ggml_new_tensor_2d(p.ctx.get(), GGML_TYPE_F32, (int64_t)k, (int64_t)m);
+        if (!p.x || !p.x->data || ggml_nbytes(p.x) != p.input_bytes) retire("input tensor allocation failed");
+        ggml_set_input(p.x);
+        bool supported = true;
+        for (int i = 0; i < 3; ++i) {
+            ggml_tensor * y = ggml_mul_mat(p.ctx.get(), w[i], p.x);
+            if (!y || !y->data || y->type != GGML_TYPE_F32 || y->ne[0] != (int64_t)n[i] || y->ne[1] != (int64_t)m ||
+                    y->ne[2] != 1 || y->ne[3] != 1 || ggml_nbytes(y) != p.output_bytes[i] || !ggml_is_contiguous(y))
+                retire("output tensor allocation failed");
+            ggml_set_output(y);
+            supported = supported && ggml_backend_supports_op(backend_.backend, y);
+            p.y[i] = y;
+        }
+        if (supported) {
+            p.graph = ggml_new_graph_custom(p.ctx.get(), kGraphNodes, false);
+            if (!p.graph) retire("graph allocation failed");
+            for (int i = 0; i < 3; ++i) ggml_build_forward_expand(p.graph, p.y[i]);
+        }
+        Triple & stored = triples_.emplace(key, std::move(p)).first->second;
+        return stored.graph ? &stored : nullptr;
+    }
+
+    // All three products, or a retirement. The input is in p.x->data, checked finite.
+    Outcome compute(Triple & p, uint64_t k, const uint64_t n[3], uint64_t m, unsigned char * const to[3]) {
+        Outcome out;
+        for (int i = 0; i < 3; ++i) std::fill_n(static_cast<float *>(p.y[i]->data), m * n[i], std::nanf(""));
+        const Counters before = Counters::read();
+        if (before.failures != 0) retire("backend has verification failures");
+        if (ggml_backend_graph_compute(backend_.backend, p.graph) != GGML_STATUS_SUCCESS) retire("backend compute failed");
+        const Counters after = Counters::read();
+        if (after.offloaded < before.offloaded || after.local < before.local || after.graph_macs < before.graph_macs ||
+                after.exchanges < before.exchanges || after.macs < before.macs || after.failures != 0)
+            retire("backend counters inconsistent");
+        Counters & d = out.delta;
+        d.offloaded = after.offloaded - before.offloaded;
+        d.local = after.local - before.local;
+        d.graph_macs = after.graph_macs - before.graph_macs;
+        d.exchanges = after.exchanges - before.exchanges;
+        d.macs = after.macs - before.macs;
+        if (d.graph_macs != m * k * (n[0] + n[1] + n[2]) || d.offloaded + d.local != 3 ||
+                (d.exchanges != 0) != (d.macs != 0) || (d.local == 3 && d.exchanges != 0))
+            retire("invalid verified accounting");
+        for (int i = 0; i < 3; ++i)
+            if (!copy_finite(to[i], static_cast<const float *>(p.y[i]->data), m * n[i])) retire("non-finite output");
+        out.supported = true;
+        out.exchanges = d.exchanges;
+        out.macs = d.macs;
+        ++completed_;
+        return out;
+    }
+
     Pair * pair(ggml_tensor * w1, ggml_tensor * w2, uint64_t k, uint64_t n1, uint64_t n2, uint64_t m) {
         const auto key = std::make_tuple(w1, w2, m);
         if (const auto it = pairs_.find(key); it != pairs_.end()) return it->second.graph ? &it->second : nullptr;
@@ -1161,6 +1234,7 @@ private:
     Backend & backend_;
     std::map<std::pair<ggml_tensor *, uint64_t>, Product> products_;
     std::map<std::tuple<ggml_tensor *, ggml_tensor *, uint64_t>, Pair> pairs_;
+    std::map<std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *, uint64_t>, Triple> triples_;
     uint64_t generation_ = 0;
     ggml_backend_t cpu_ = nullptr;
     bool cpu_tried_ = false;
@@ -1219,9 +1293,10 @@ struct Mail {
     uint32_t id, m, pair;
     uint32_t status, paired;
     uint64_t exchanges, macs;
+    uint32_t third, reserved;  // third: a second partner's slot plus one, 0 for none
 };
 // Shared regions, kMaxPayload bytes each: activation, product, paired product.
-constexpr size_t kRegions = 3;
+constexpr size_t kRegions = 4;  // activation, product, a paired product, a third
 constexpr uint32_t kNoPair = 0xffffffff;
 constexpr uint32_t kOk = 0, kUnsupported = 1, kRefused = 2;
 constexpr size_t kMaxSessions = 16, kMaxSlots = 4096;
@@ -1271,7 +1346,7 @@ struct Session {
     bool mail = false;        // the client asked to use the mailbox
     bool from_mail = false;   // the request being served came from it
     uint32_t mail_seen = 0;
-    Mail * mailbox() const { return reinterpret_cast<Mail *>(shared.base + 3 * kMaxPayload - sizeof(Mail)); }
+    Mail * mailbox() const { return reinterpret_cast<Mail *>(shared.base + kRegions * kMaxPayload - sizeof(Mail)); }
     bool mail_pending() const {
         return mail && shared.base && mailbox()->request.load(std::memory_order_acquire) != mail_seen;
     }
@@ -1542,8 +1617,16 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             ++timing.gaps[timing.was_pair];
         }
         struct { uint32_t pair, reserved; } extra{};
-        if (s.from_mail) extra.pair = s.mailbox()->pair;
-        else session_read(s.fd, &extra, sizeof extra);
+        if (s.from_mail) {
+            extra.pair = s.mailbox()->pair;
+            extra.reserved = s.mailbox()->third;
+        } else {
+            session_read(s.fd, &extra, sizeof extra);
+        }
+        // `reserved` names a second partner, its slot plus one (0: none), only with a pair.
+        const uint32_t third = extra.reserved ? extra.reserved - 1 : kNoPair;
+        if (third != kNoPair && extra.pair == kNoPair) throw Drop{"invalid frame"};
+        extra.reserved = 0;
         // The answer to a mailed request is written in place and published by `reply`.
         const auto answer = [&s](const void * reply, size_t size) {
             if (!s.from_mail) return session_write(s.fd, reply, size);
@@ -1563,6 +1646,28 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
         if (m == 0 || m > kMaxRows || m * slot.k * 4 > kMaxPayload || m * slot.n * 4 > kMaxPayload)
             throw Drop{"unsupported geometry"};
         struct { Frame f; uint64_t exchanges, macs; } r{{kMatmulShared, f.id, kUnsupported, 0}, 0, 0};
+        if (third != kNoPair && third < s.slots.size() && extra.pair < s.slots.size() && s.slots[third].w &&
+                s.slots[extra.pair].w && third != f.id && third != extra.pair && extra.pair != f.id &&
+                s.slots[third].k == slot.k && s.slots[extra.pair].k == slot.k &&
+                m * s.slots[third].n * 4 <= kMaxPayload && m * s.slots[extra.pair].n * 4 <= kMaxPayload) {
+            ggml_tensor * const w[3] = {slot.w, s.slots[extra.pair].w, s.slots[third].w};
+            const uint64_t n[3] = {slot.n, s.slots[extra.pair].n, s.slots[third].n};
+            if (Engine::Triple * all = engine.triple(w, slot.k, n, m)) {
+                std::memcpy(all->x->data, s.shared.base, all->input_bytes);
+                if (!all_finite(static_cast<const float *>(all->x->data), m * slot.k)) throw Drop{"non-finite input"};
+                unsigned char * const to[3] = {s.shared.base + kMaxPayload, s.shared.base + 2 * kMaxPayload,
+                                               s.shared.base + 3 * kMaxPayload};
+                s.held.valid = false;
+                s.last.valid = false;
+                const Outcome out = engine.compute(*all, slot.k, n, m, to);
+                r.f.a = kOk;
+                r.f.b = 3;
+                r.exchanges = out.exchanges;
+                r.macs = out.macs;
+                answer(&r, sizeof r);
+                return;
+            }
+        }
         if (s.held.valid) {
             s.held.valid = false;
             Product * ahead = s.held.product;

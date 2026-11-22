@@ -82,7 +82,7 @@ class Session:
             return None
         assert region == REGION and len(fds) == 1
         self.fd = fds[0]
-        self.shared = mmap.mmap(self.fd, 3 * REGION)
+        self.shared = mmap.mmap(self.fd, 4 * REGION)
         return self.fd
 
     def matmul_shared(self, slot, x, n, pair=NO_PAIR, pair_n=0):
@@ -167,8 +167,8 @@ class Sessions(unittest.TestCase):
         self.assertIsNotNone(fd)
         seals = fcntl.fcntl(fd, F_GET_SEALS)
         self.assertEqual(seals & (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW), F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW)
-        self.assertEqual(os.fstat(fd).st_size, 3 * REGION)
-        for size in (0, REGION, 4 * REGION):
+        self.assertEqual(os.fstat(fd).st_size, 4 * REGION)
+        for size in (0, REGION, 5 * REGION):
             with self.assertRaises(OSError):
                 os.ftruncate(fd, size)
         self.assertEqual(session.open(0, self.gate), 0)

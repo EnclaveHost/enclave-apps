@@ -682,6 +682,24 @@ the device model itself: about 7 us of launch handling for each of 401 kernel
 launches a token, 18 kernel arguments each, and the copies in and out of
 device buffers. The session backend has none of them.
 
+**Three products in one exchange** (`SHIELD_OPENCL_Q8_TRIPLE=1` for the
+frontend; the session backend always). Attention's q, k and v take one
+activation; as a pair and a single they were two exchanges. The executor
+builds one graph for the three (`Engine::Triple`, a fourth shared region, the
+request's reserved word names the third slot plus one) and the frontend
+learns the third as the tensor that follows a paired product just served. On
+the OpenCL route, alternating rounds: 13.92, 14.67, 15.19 plain against 14.41,
+14.03, 14.22, and 13.85, 14.21, 13.85 drafting against 14.59, 14.72, 14.58. A
+few percent for one row, a loss for two; left opt-in. A spinning hand-off for
+the executor's second thread on a core of its own was also tried and removed
+(14.56, 14.22, 14.38 against 15.09, 14.17, 15.08 without the second thread).
+
+**Drafting on the OpenCL route** stays near its plain speed (about 14.6)
+while the native engine gains (17.2 to 19.5 that day) and the session backend
+with it (17.0): a two-row round doubles every copy in and out of device
+buffers, and the round costs the route 1.69 of its token against 1.5 for the
+native engine.
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have

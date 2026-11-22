@@ -49,6 +49,7 @@ struct Mail {
     uint32_t id, m, pair;
     uint32_t status, paired;
     uint64_t exchanges, macs;
+    uint32_t third, reserved;
 };
 constexpr int64_t kMaxRows = 64;
 
@@ -139,7 +140,7 @@ struct Session {
                 std::memcpy(&shared_fd, CMSG_DATA(c), sizeof(int));
         if (received != (ssize_t)sizeof reply || reply.type != kShare || reply.a != 0 || reply.b != kRegion || shared_fd < 0)
             fail("the service gave no shared memory");
-        void * base = mmap(nullptr, 3 * kRegion, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0);
+        void * base = mmap(nullptr, 4 * kRegion, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, 0);
         close(shared_fd);
         if (base == MAP_FAILED) fail("shared memory could not be mapped");
         shared = static_cast<unsigned char *>(base);
@@ -149,7 +150,7 @@ struct Session {
             Frame answer{};
             receive_all(fd, &answer, sizeof answer);
             if (answer.type == kMailFrame && answer.a == 0)
-                mail = reinterpret_cast<Mail *>(shared + 3 * kRegion - sizeof(Mail));
+                mail = reinterpret_cast<Mail *>(shared + 4 * kRegion - sizeof(Mail));
         }
     }
     Mail * mail = nullptr;
@@ -187,7 +188,7 @@ struct Session {
 
     // rows x k activations in, rows x n products out; with `second`, its products of the same rows too.
     void products(uint32_t first, uint32_t second, int64_t rows, int64_t k, const float * x, int64_t n1, float * y1,
-                  int64_t n2, float * y2) {
+                  int64_t n2, float * y2, uint32_t third = kNoPair, int64_t n3 = 0, float * y3 = nullptr) {
         std::memcpy(shared, x, (size_t)(rows * k) * 4);
         struct { Frame frame; uint64_t counters[2]; } reply{};
         if (mail) {
@@ -203,6 +204,7 @@ struct Session {
             mail->id = first;
             mail->m = (uint32_t)rows;
             mail->pair = second;
+            mail->third = third == kNoPair ? 0 : third + 1;
             const uint32_t mine = mail->request.load(std::memory_order_relaxed) + 1;
             mail->request.store(mine, std::memory_order_seq_cst);
             if (mail->sleeping.load(std::memory_order_seq_cst)) {
@@ -212,7 +214,8 @@ struct Session {
             while (mail->reply.load(std::memory_order_acquire) != mine) _mm_pause();
             reply.frame = {kMatmulShared, first, mail->status, mail->paired};
         } else {
-            const struct { Frame frame; uint32_t pair, reserved; } request{{kMatmulShared, first, (uint32_t)rows, 0}, second, 0};
+            const struct { Frame frame; uint32_t pair, reserved; } request{{kMatmulShared, first, (uint32_t)rows, 0}, second,
+                                                                              third == kNoPair ? 0 : third + 1};
             send_all(fd, &request, sizeof request);
             receive_all(fd, &reply, sizeof reply);
         }
@@ -223,6 +226,10 @@ struct Session {
             if (!(reply.frame.b & 1)) fail("paired product missing");
             std::memcpy(y2, shared + 2 * kRegion, (size_t)(rows * n2) * 4);
             ++pairs;
+        }
+        if (third != kNoPair) {
+            if (!(reply.frame.b & 2)) fail("third product missing");
+            std::memcpy(y3, shared + 3 * kRegion, (size_t)(rows * n3) * 4);
         }
     }
 };
@@ -269,18 +276,36 @@ ggml_status graph_compute(ggml_backend_t, ggml_cgraph * graph) {
                 break;
             }
         }
+        // And a third, as attention's q, k and v are.
+        int also = -1;
+        uint32_t third = kNoPair;
+        for (int j = with + 1; with >= 0 && j < graph->n_nodes && j < i + 12; ++j) {
+            const ggml_tensor * other = graph->nodes[j];
+            if (!done[(size_t)j] && other->op == GGML_OP_MUL_MAT && other->src[1] == x && other->src[0] != w &&
+                    other->src[0] != graph->nodes[with]->src[0]) {
+                const uint32_t id = s.slot(other->src[0]);
+                if (id != kNoPair) {
+                    also = j;
+                    third = id;
+                }
+                break;
+            }
+        }
         const int64_t k = w->ne[0], n1 = w->ne[1], rows = x->ne[1];
         const int64_t n2 = with >= 0 ? graph->nodes[with]->src[0]->ne[1] : 0;
-        const int64_t widest = std::max(n1, n2);
+        const int64_t n3 = also >= 0 ? graph->nodes[also]->src[0]->ne[1] : 0;
+        const int64_t widest = std::max(std::max(n1, n2), n3);
         const int64_t step = std::max<int64_t>(1, std::min<int64_t>(kMaxRows, (int64_t)(kRegion / 4) / std::max(widest, k)));
         for (int64_t at = 0; at < rows; at += step) {
             const int64_t take = std::min(step, rows - at);
             s.products(first, second, take, k, static_cast<const float *>(x->data) + at * k, n1,
                        static_cast<float *>(node->data) + at * n1, n2,
-                       with >= 0 ? static_cast<float *>(graph->nodes[with]->data) + at * n2 : nullptr);
+                       with >= 0 ? static_cast<float *>(graph->nodes[with]->data) + at * n2 : nullptr, third, n3,
+                       also >= 0 ? static_cast<float *>(graph->nodes[also]->data) + at * n3 : nullptr);
         }
         done[(size_t)i] = 1;
         if (with >= 0) done[(size_t)with] = 1;
+        if (also >= 0) done[(size_t)also] = 1;
     }
     return GGML_STATUS_SUCCESS;
 }
