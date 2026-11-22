@@ -1630,7 +1630,10 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             }();
             // Started before the reply so it overlaps the client's own work.
             // The products are complete and are only read from here on.
-            if (ahead && f.id < s.chains.size() && s.chains[f.id].next != kNoPair) {
+            // Not for a mailed request: its client is waiting on this thread's processor, and a product
+            // made on another thread comes back through a sleep and a cold cache. Measured on the 27B with
+            // the two threads on one core: 13.2 tokens a second drafting with it, 15.4 without.
+            if (ahead && !s.from_mail && f.id < s.chains.size() && s.chains[f.id].next != kNoPair) {
                 const uint32_t first = f.id, second = extra.pair;
                 ahead_thread.post([&s, &engine, first, second, m, both] { chain_ahead(s, engine, first, second, m, *both); });
             }
@@ -1765,6 +1768,7 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
                     if (!pinned) {
                         pinned = true;
                         if (const char * cpu = std::getenv("SHIELD_Q8_SERVE_CPU")) {
+                            usable_cpus();  // counted before this thread is confined: the others are not
                             cpu_set_t set;
                             CPU_ZERO(&set);
                             CPU_SET(std::atoi(cpu), &set);

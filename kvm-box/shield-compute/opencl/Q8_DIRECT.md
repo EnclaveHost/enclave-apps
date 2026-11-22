@@ -656,6 +656,15 @@ with them, against 12.54, 12.87, 12.89 and 12.77, 12.26, 12.67 over the socket.
 That is 93% of the native engine; what is left is the OpenCL layer itself,
 which the session backend does not have.
 
+**No product ahead for a mailed request.** The executor's second thread, which
+computes the down projection while the client gates the pair, loses here: the
+client is waiting on the serving thread's own core, and a product made on
+another thread comes back through a sleep and a cold cache. With it on, the
+OpenCL route did 13.2 drafting and the session backend 13.6 to 16.4; without,
+three more alternating rounds gave the OpenCL route 15.46, 14.30, 14.45 plain
+and 13.53, 15.75, 15.20 drafting, and the session backend 15.20, 16.40, 16.49
+and 16.86, 17.16, 17.02. Requests over the socket keep the second thread.
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have
