@@ -580,6 +580,30 @@ and writes, the rest in the client. A request for a product the executor
 already started (the down projection) waits for it, about 190 us: that is the
 product, not a cost of asking. Not established: any of this in a guest.
 
+**What bounds a token, and a chain that did not shorten it.** A layer of this
+model makes four exchanges, and each needs the one before: the opening
+products are of norm(h); the next is of something only the client computes
+(the recurrence or the attention); the feed-forward pair is of norm(h + that
+product); the down projection is of their gating; and the next layer opens on
+h + product + down projection. With 64 layers and about 175 us an exchange
+that is 45 ms a token before any arithmetic, for the native engine as for the
+route (the native engine: 1,000 us a layer, 280 of them on the processor).
+
+An experiment (branch `kvm-box/shield-residual-chain`, `SHIELD_Q8_RESIDUAL=1`)
+had the executor follow h itself: it finds the token's embedding row from the
+first layer's request (by the signs of its first 64 values, then the whole
+row), adds each product as the client does, applies the same norm, and so
+computes the pair, the down projection and the next layer's opening products
+before they are asked for, releasing each only to a request with the same
+bytes. Every one of the 41,184 predicted requests in a 200-token run was
+answered from the chain, none was computed in vain, and the text is the same.
+The speed did not change (12.1 to 12.3 against 12.35): the three products are
+540 us of the chain's 670, and they cannot overlap one another. What the route
+adds to the native engine's layer is about 300 us in small pieces on that
+path: the crossings, the frontend's launches, the scheduler's buffer copies,
+and the client's part between the opening products and its next request,
+which takes about 450 us here.
+
 ## Application buffers backed by a file
 
 On the 27B the route held the model three times: the executor's backend copy
