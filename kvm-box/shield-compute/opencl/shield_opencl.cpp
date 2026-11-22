@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 #ifdef SHIELD_SOURCE_DECLINES
 #include "source_declines.hpp"
@@ -96,6 +97,71 @@ bool on_file_backing(cl_mem buffer) {
   cl_mem parent = nullptr;
   return !REAL(clGetMemObjectInfo)(buffer, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof parent, &parent, nullptr) &&
          parent && is_file_backed(parent);
+}
+// EXPERIMENT (SHIELD_OPENCL_DIRECT_BUFFERS=1). A blocking read or write of a buffer is a copy from or to the
+// CPU runtime's own storage, and the runtime takes several microseconds to arrange each one: a command, an
+// event, a queue. An application built on a scheduler makes hundreds a token, and every product launch here
+// makes two more. With this set the storage is mapped once for each buffer and such a copy is made directly,
+// after the queue has been finished as before. Only for a runtime whose map is the storage itself (the CPU
+// runtime's is) and for calls this library sees.
+struct HostView {
+  cl_mem root = nullptr;
+  size_t origin = 0, size = 0;
+  unsigned char *base = nullptr;
+};
+std::mutex host_views_mutex;
+std::unordered_map<cl_mem, HostView> host_views;
+void CL_CALLBACK host_view_ended(cl_mem buffer, void *) {
+  std::lock_guard lock(host_views_mutex);
+  host_views.erase(buffer);
+}
+bool direct_buffers() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_DIRECT_BUFFERS");
+    return value && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+// The bytes of buffer[offset, offset + size) in the runtime's storage, or null to use the runtime's own call.
+unsigned char *host_bytes(cl_command_queue q, cl_mem buffer, size_t offset, size_t size) {
+  if (!direct_buffers() || !buffer) return nullptr;
+  std::lock_guard lock(host_views_mutex);
+  auto found = host_views.find(buffer);
+  if (found == host_views.end()) {
+    HostView view;
+    cl_mem_object_type type = 0;
+    cl_mem parent = nullptr;
+    if (REAL(clGetMemObjectInfo)(buffer, CL_MEM_TYPE, sizeof(type), &type, nullptr) || type != CL_MEM_OBJECT_BUFFER ||
+        REAL(clGetMemObjectInfo)(buffer, CL_MEM_SIZE, sizeof(view.size), &view.size, nullptr) ||
+        REAL(clGetMemObjectInfo)(buffer, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(parent), &parent, nullptr))
+      return nullptr;
+    view.root = parent ? parent : buffer;
+    if (parent && REAL(clGetMemObjectInfo)(buffer, CL_MEM_OFFSET, sizeof(view.origin), &view.origin, nullptr)) return nullptr;
+    size_t whole = 0;
+    if (REAL(clGetMemObjectInfo)(view.root, CL_MEM_SIZE, sizeof(whole), &whole, nullptr) || view.origin > whole ||
+        view.size > whole - view.origin)
+      return nullptr;
+    unsigned char *base = nullptr;
+    if (parent) {
+      auto root = host_views.find(parent);
+      if (root != host_views.end()) base = root->second.base;
+    }
+    if (!base) {
+      cl_int error = CL_SUCCESS;
+      base = static_cast<unsigned char *>(REAL(clEnqueueMapBuffer)(q, view.root, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0,
+                                                                  whole, 0, nullptr, nullptr, &error));
+      if (!base || error) return nullptr;
+      if (parent && !host_views.count(parent) &&
+          !REAL(clSetMemObjectDestructorCallback)(parent, host_view_ended, nullptr))
+        host_views.emplace(parent, HostView{parent, 0, whole, base});
+    }
+    view.base = base;
+    if (REAL(clSetMemObjectDestructorCallback)(buffer, host_view_ended, nullptr)) return nullptr;
+    found = host_views.emplace(buffer, view).first;
+  }
+  const HostView &view = found->second;
+  if (offset > view.size || size > view.size - offset) return nullptr;
+  return view.base + view.origin + offset;
 }
 cl_int copy_info(const void *value, size_t bytes, size_t size, void *out,
                  size_t *actual) {
@@ -1677,7 +1743,14 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteBuffer(
     const void *pointer, cl_uint count, const cl_event *wait, cl_event *event) {
   StartupTiming::Scope scope(startup_timing, 0);
   q8_written(buffer, offset, size, false);
-  const cl_int code = REAL(clEnqueueWriteBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
+  cl_int code;
+  unsigned char *host = blocking && !count && !event && pointer ? host_bytes(q, buffer, offset, size) : nullptr;
+  if (host && !REAL(clFinish)(q)) {
+    std::memcpy(host, pointer, size);
+    code = CL_SUCCESS;
+  } else {
+    code = REAL(clEnqueueWriteBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
+  }
 #ifdef SHIELD_Q8_MASKED
   if (!code) q8_preauthenticate_write(q, buffer, offset, size, pointer);
 #endif
@@ -1687,6 +1760,11 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueReadBuffer(
     cl_command_queue q, cl_mem buffer, cl_bool blocking, size_t offset, size_t size,
     void *pointer, cl_uint count, const cl_event *wait, cl_event *event) {
   StartupTiming::Scope scope(startup_timing, 1);
+  if (blocking && !count && !event && pointer)
+    if (const unsigned char *host = host_bytes(q, buffer, offset, size); host && !REAL(clFinish)(q)) {
+      std::memcpy(pointer, host, size);
+      return CL_SUCCESS;
+    }
   return REAL(clEnqueueReadBuffer)(q, buffer, blocking, offset, size, pointer, count, wait, event);
 }
 CL_API_ENTRY cl_int CL_API_CALL clEnqueueWriteBufferRect(

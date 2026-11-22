@@ -665,6 +665,23 @@ three more alternating rounds gave the OpenCL route 15.46, 14.30, 14.45 plain
 and 13.53, 15.75, 15.20 drafting, and the session backend 15.20, 16.40, 16.49
 and 16.86, 17.16, 17.02. Requests over the socket keep the second thread.
 
+**Buffer reads and writes made directly** (`SHIELD_OPENCL_DIRECT_BUFFERS=1`).
+A blocking read or write of a buffer, and the frontend's own two around each
+product, copy from or to the CPU runtime's storage, mapped once for each
+buffer, after the queue has been finished as before. Worth about 2% on the
+OpenCL route (14.44, 14.65, 14.88 plain against 14.62, 14.04, 14.33 in
+alternating rounds; drafting within the noise): the runtime's bookkeeping was
+the smaller part of those calls, and the copy itself, 40 to 70 KB each way,
+is how an OpenCL application gets a device's results. Only for a runtime
+whose map is its storage, and it does not see reads and writes made through
+entry points this library does not wrap.
+
+Where that leaves the emulated device on this model: about 14.5 tokens a
+second plain against the native engine's 15.9 that day, 92%. What remains is
+the device model itself: about 7 us of launch handling for each of 401 kernel
+launches a token, 18 kernel arguments each, and the copies in and out of
+device buffers. The session backend has none of them.
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have

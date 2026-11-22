@@ -1200,8 +1200,10 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   static thread_local std::vector<unsigned char> input, output;
   stage = Q8Timing::now();
   input.resize(launch.read_bytes[count]);
-  if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[count], CL_TRUE, launch.input_offset,
-                                launch.read_bytes[count], input.data(), 0, nullptr, nullptr))
+  if (const unsigned char *host = host_bytes(launch.queue, launch.buffers[count], launch.input_offset, launch.read_bytes[count]))
+    std::memcpy(input.data(), host, launch.read_bytes[count]);
+  else if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[count], CL_TRUE, launch.input_offset,
+                                     launch.read_bytes[count], input.data(), 0, nullptr, nullptr))
     return std::nullopt;
   q8_timing.add(Q8Timing::Snapshot, stage);
   stage = Q8Timing::now();
@@ -1263,8 +1265,10 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   stage = Q8Timing::now();
   // Every chunk has verified before any result reaches application memory.
   q8_written(launch.buffers[count + 1], launch.output_offset, launch.output_bytes, false);
-  if (REAL(clEnqueueWriteBuffer)(launch.queue, launch.buffers[count + 1], CL_TRUE, launch.output_offset,
-                                 launch.output_bytes, product, 0, nullptr, nullptr))
+  if (unsigned char *host = host_bytes(launch.queue, launch.buffers[count + 1], launch.output_offset, launch.output_bytes))
+    std::memcpy(host, product, launch.output_bytes);
+  else if (REAL(clEnqueueWriteBuffer)(launch.queue, launch.buffers[count + 1], CL_TRUE, launch.output_offset,
+                                      launch.output_bytes, product, 0, nullptr, nullptr))
     return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
   const cl_int result = q8_direct_result(launch, CL_SUCCESS);
   q8_timing.add(Q8Timing::Write, stage);
