@@ -604,6 +604,58 @@ path: the crossings, the frontend's launches, the scheduler's buffer copies,
 and the client's part between the opening products and its next request,
 which takes about 450 us here.
 
+## A session without OpenCL, and without the kernel in between
+
+Experiment, opt-in, not released. Three pieces, measured together on EyesOff's
+27B under EyesOff's own loop (`bench-spec2`, 64 tokens, ring workers, four
+engine threads, 16 refill threads), tokens a second:
+
+| Path | Plain | Drafting k=1 |
+| --- | ---: | ---: |
+| OpenCL route | 12.33, 12.73 | 12.51, 12.74 |
+| Session backend, socket | 13.08, 12.73, 12.84 | 13.68, 13.28, 13.56 |
+| Session backend, mailbox | 13.75 | 13.04 |
+| Session backend, mailbox, the two threads on one core | 14.78, 16.09, 15.40, 14.79, 15.51, 15.37 | 17.04, 16.48, 15.01, 16.00, 15.26, 16.41 |
+| Native Shield engine in the image | 15.46, 15.94, 15.27 | 17.27, 16.63, 15.51 |
+| EyesOff's engine on the host, same day | 16.45, 15.92 | 19.51, 16.60 |
+
+The text is identical in every run. With all three the medians are 15.4 plain
+and 16.2 drafting against the native engine's 15.5 and 16.6.
+
+- **The session backend** (`native/ggml_shield_session.cpp`) is a ggml
+  accelerator on host memory, as the native Shield backend is: it takes the
+  weight x activation products and leaves everything else to the CPU backend.
+  It sends them over the same session the OpenCL frontend uses, so the
+  application still holds no worker route and no pads. It names a tensor by its
+  GGUF name and the SHA-256 of the mapped bytes, computed once when the
+  scheduler first asks about it; two products of one activation go in one
+  request. Nothing is recognised, lowered or copied into device buffers: the
+  weights stay mapped from the file. Only for applications built on ggml.
+- **The mailbox** (`SHIELD_Q8_MAILBOX=1` for the executor,
+  `SHIELD_SESSION_MAILBOX=1` for the backend) is a request slot in the last
+  bytes of the session's shared memory. The client writes the request and adds
+  one to a counter, the executor answers in place and sets its counter equal,
+  and neither enters the kernel. The executor watches the slot for 2 ms after a
+  request (`SHIELD_Q8_MAILBOX_SPIN_US`) and then sleeps in poll with a flag
+  raised; a client that sees the flag sends a frame to wake it. What is asked
+  and answered is a shared-memory product, checked as one.
+- **One core for the two threads** (`SHIELD_SESSION_CPU`, `SHIELD_Q8_SERVE_CPU`,
+  set to the two hardware threads of a core). The client's thread and the
+  executor's serving thread never compute at the same time, so they can wait
+  for each other on one core without taking a processor from anything else,
+  and the activation stays in that core's cache. Spinning without this lost
+  on a busy host (above); with it the crossing costs almost nothing. The
+  executor pins itself after its first mailed product, when the backend's
+  threads exist, because a thread made later inherits the one processor.
+
+Not done: the backend aborts if the service refuses a product in the middle of
+a run or says goodbye (the frontend reconnects and falls back); the executor
+takes the processor number from its environment, which the service would have
+to choose; the drafting loop needed fused attention on for the native engine
+too (`ENCLAVE_GGML_FLASH_ATTN_ON` in the harness's copy of the shim), without
+which both paths gained nothing from drafting; nothing ran in a guest. On the
+OpenCL route the mailbox and the pinning are not wired in.
+
 ## Application buffers backed by a file
 
 On the 27B the route held the model three times: the executor's backend copy

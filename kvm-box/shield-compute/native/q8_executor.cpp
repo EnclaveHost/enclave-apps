@@ -1208,7 +1208,18 @@ void serve_stdin(Input & in, const std::string & line, int out_fd, Engine & engi
 // refuses that session only: nothing protected has started. Backend, model and
 // accounting failures still retire the whole process.
 
-constexpr uint32_t kOpen = 1, kMatmul = 2, kShare = 3, kMatmulShared = 4, kBye = 0xff;
+constexpr uint32_t kOpen = 1, kMatmul = 2, kShare = 3, kMatmulShared = 4, kMail = 5, kWake = 6, kBye = 0xff;
+// EXPERIMENT (SHIELD_Q8_MAILBOX=1). A shared-memory request posted in the last bytes of a session's shared
+// memory, for a client and executor that are both awake: the client writes the request and adds one to
+// `request`, the executor answers in place and makes `reply` equal to it, and neither enters the kernel.
+// What is asked and answered is a kMatmulShared exchange, checked as one. When the executor has gone to
+// sleep (`sleeping`), the client sends a kWake frame after posting.
+struct Mail {
+    std::atomic<uint32_t> request, reply, sleeping;
+    uint32_t id, m, pair;
+    uint32_t status, paired;
+    uint64_t exchanges, macs;
+};
 // Shared regions, kMaxPayload bytes each: activation, product, paired product.
 constexpr size_t kRegions = 3;
 constexpr uint32_t kNoPair = 0xffffffff;
@@ -1257,6 +1268,13 @@ struct Session {
     int fd = -1;
     std::vector<Slot> slots;
     Shared shared;
+    bool mail = false;        // the client asked to use the mailbox
+    bool from_mail = false;   // the request being served came from it
+    uint32_t mail_seen = 0;
+    Mail * mailbox() const { return reinterpret_cast<Mail *>(shared.base + 3 * kMaxPayload - sizeof(Mail)); }
+    bool mail_pending() const {
+        return mail && shared.base && mailbox()->request.load(std::memory_order_acquire) != mail_seen;
+    }
     std::vector<Chain> chains;
     // The pair served last, while its products are still the pair's current ones.
     struct {
@@ -1426,10 +1444,36 @@ void chain_ahead(Session & s, Engine & engine, uint32_t first, uint32_t second, 
     s.held.valid = true;
 }
 
-void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
+void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool mailed = false) {
     Frame f{};
-    session_read(s.fd, &f, sizeof f);
+    s.from_mail = mailed;
+    if (mailed) {
+        const Mail * mail = s.mailbox();
+        s.mail_seen = mail->request.load(std::memory_order_acquire);
+        f = {kMatmulShared, mail->id, mail->m, 0};
+    } else {
+        session_read(s.fd, &f, sizeof f);
+    }
     const uint64_t t0 = timing.enabled ? Timing::now() : 0;
+    if (f.type == kWake) return;  // only to end a sleep: the request is in the mailbox
+    if (f.type == kMail) {
+        static const bool allowed = [] {
+            const char * value = std::getenv("SHIELD_Q8_MAILBOX");
+            return value && std::strcmp(value, "0") != 0;
+        }();
+        Frame r{kMail, 0, kRefused, 0};
+        if (allowed && s.shared.base && f.id == 0 && f.a == 0 && f.b == 0) {
+            Mail * mail = s.mailbox();
+            mail->request.store(0);
+            mail->reply.store(0);
+            mail->sleeping.store(0);
+            s.mail_seen = 0;
+            s.mail = true;
+            r.a = kOk;
+        }
+        session_write(s.fd, &r, sizeof r);
+        return;
+    }
     if (f.type == kOpen) {
         struct { uint64_t k, n; char sha[64]; } body{};
         char name[GGML_MAX_NAME] = {};
@@ -1498,7 +1542,20 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
             ++timing.gaps[timing.was_pair];
         }
         struct { uint32_t pair, reserved; } extra{};
-        session_read(s.fd, &extra, sizeof extra);
+        if (s.from_mail) extra.pair = s.mailbox()->pair;
+        else session_read(s.fd, &extra, sizeof extra);
+        // The answer to a mailed request is written in place and published by `reply`.
+        const auto answer = [&s](const void * reply, size_t size) {
+            if (!s.from_mail) return session_write(s.fd, reply, size);
+            struct { Frame f; uint64_t exchanges, macs; } r{};
+            std::memcpy(&r, reply, std::min(size, sizeof r));
+            Mail * mail = s.mailbox();
+            mail->status = r.f.a;
+            mail->paired = r.f.b;
+            mail->exchanges = r.exchanges;
+            mail->macs = r.macs;
+            mail->reply.store(s.mail_seen, std::memory_order_release);
+        };
         if (!s.shared.base || f.id >= s.slots.size() || !s.slots[f.id].w || f.b != 0 || extra.reserved != 0)
             throw Drop{"invalid frame"};
         const Slot & slot = s.slots[f.id];
@@ -1517,7 +1574,7 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
                 r.exchanges = s.held.out.exchanges;
                 r.macs = s.held.out.macs;
                 s.last.valid = false;
-                session_write(s.fd, &r, sizeof r);
+                answer(&r, sizeof r);
                 if (timing.enabled) { timing.replied = Timing::now(); timing.was_pair = false; ++timing.ahead; }
                 return;
             }
@@ -1578,7 +1635,7 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread) {
                 ahead_thread.post([&s, &engine, first, second, m, both] { chain_ahead(s, engine, first, second, m, *both); });
             }
         }
-        session_write(s.fd, &r, sizeof r);
+        answer(&r, sizeof r);
         if (timing.enabled) { timing.replied = Timing::now(); timing.was_pair = both != nullptr; }
         if (timing.enabled && timing.seen > timing.skip) timing.request_ns += Timing::now() - t0;
         return;
@@ -1666,7 +1723,64 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
         // tens of microseconds. Waking from a blocking poll costs about as
         // much as the product itself, so look again briefly before sleeping.
         int ready = 0;
-        if (!sessions.empty() && spin_ns) {
+        // Sessions with a mailbox are watched in memory for a while after each request, then by poll with
+        // `sleeping` raised so that the client knows to send a frame.
+        const auto mailed = [&sessions]() -> Session * {
+            for (Session & one : sessions)
+                if (one.mail_pending()) return &one;
+            return nullptr;
+        };
+        bool mailboxes = false;
+        for (const Session & one : sessions) mailboxes = mailboxes || one.mail;
+        if (mailboxes) {
+            static const uint64_t watch_ns = [] {
+                const char * value = std::getenv("SHIELD_Q8_MAILBOX_SPIN_US");
+                return std::min<uint64_t>(value ? std::strtoull(value, nullptr, 10) : 2000, 1000000) * 1000;
+            }();
+            const uint64_t until = Timing::now() + watch_ns;
+            Session * posted = nullptr;
+            unsigned turn = 0;
+            while (!(posted = mailed())) {
+                __builtin_ia32_pause();
+                if ((++turn & 63) == 0) {
+                    ready = poll(fds.data(), fds.size(), 0);
+                    if (ready != 0 || Timing::now() >= until) break;
+                }
+            }
+            if (!posted && ready == 0) {
+                for (Session & one : sessions)
+                    if (one.mail) one.mailbox()->sleeping.store(1, std::memory_order_seq_cst);
+                if (!(posted = mailed()))
+                    do ready = poll(fds.data(), fds.size(), -1); while (ready < 0 && errno == EINTR);
+                for (Session & one : sessions)
+                    if (one.mail) one.mailbox()->sleeping.store(0, std::memory_order_seq_cst);
+            }
+            if (posted) {
+                ahead.wait();
+                try {
+                    session_request(*posted, engine, ahead, true);
+                    // After the first mailed product, when the backend's threads all exist: a thread
+                    // made later would inherit this one processor.
+                    static bool pinned = false;
+                    if (!pinned) {
+                        pinned = true;
+                        if (const char * cpu = std::getenv("SHIELD_Q8_SERVE_CPU")) {
+                            cpu_set_t set;
+                            CPU_ZERO(&set);
+                            CPU_SET(std::atoi(cpu), &set);
+                            sched_setaffinity(0, sizeof set, &set);
+                        }
+                    }
+                } catch (const Drop & drop) {
+                    std::fprintf(stderr, "[q8-executor] session dropped: %s\n", drop.why);
+                    ahead.wait();
+                    const size_t at = (size_t)(posted - sessions.data());
+                    close(sessions[at].fd);
+                    sessions.erase(sessions.begin() + (ptrdiff_t)at);
+                }
+                continue;
+            }
+        } else if (!sessions.empty() && spin_ns) {
             const uint64_t until = Timing::now() + spin_ns;
             do {
                 ready = poll(fds.data(), fds.size(), 0);
@@ -1674,7 +1788,7 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
                 __builtin_ia32_pause();
             } while (Timing::now() < until);
         }
-        if (ready == 0)
+        if (ready == 0 && !mailboxes)
             do ready = poll(fds.data(), fds.size(), -1); while (ready < 0 && errno == EINTR);
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) retire("poll failed");
