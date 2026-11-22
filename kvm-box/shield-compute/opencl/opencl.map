@@ -8,7 +8,7 @@ OPENCL_1.0 {
   clEnqueueWriteBuffer; clEnqueueReadBuffer; clEnqueueCopyBuffer; clEnqueueCopyImageToBuffer;
   clEnqueueWriteImage; clEnqueueCopyImage; clEnqueueCopyBufferToImage;
   clEnqueueMapBuffer; clEnqueueMapImage; clEnqueueUnmapMemObject;
-  clEnqueueNativeKernel; clReleaseMemObject; clEnqueueTask;
+  clEnqueueNativeKernel; clReleaseMemObject; clEnqueueTask; clCreateBuffer; clGetMemObjectInfo;
   clGetExtensionFunctionAddress;
   clGetKernelInfo; clGetKernelWorkGroupInfo; clGetProgramBuildInfo; clGetProgramInfo;
  local: *;

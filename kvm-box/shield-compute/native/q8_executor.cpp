@@ -617,16 +617,33 @@ struct PadStock {
     }
     static void smooth(double & mean, double sample) { mean = mean ? mean + (sample - mean) / 8 : sample; }
     static constexpr double kDepth = 4, kFall = 0.5, kRise = 1.01, kSurprise = 1.15;
+    // The estimate is often wrong about a pool that fills a batch at a time (EyesOff's 27B at depth and
+    // batch 64: of the products it sent here, a third to a half would have found a pad). A product that
+    // found a pad cost almost nothing, so computing here pays only when the product costs less here than
+    // that share of a pad made on the path. A group whose product is dearer is always exchanged. What a
+    // product costs here before the group has been tried is taken from the others, by its size.
+    static double worth() {
+        static const double share = [] {
+            const char * value = std::getenv("SHIELD_Q8_DRY_LOCAL_WORTH");
+            const double given = value ? std::atof(value) : 1.0;
+            return given > 0 ? given : 1.0;
+        }();
+        return share;
+    }
+    static inline std::atomic<double> here_ns_per_mac{0};
+    uint64_t dear = 0;
     // True: exchange this product. Called once for every request of the group.
     // `margin` is how much cheaper the product must be here than the exchange
     // is expected to be: computing here takes processors the refill threads
     // would otherwise use.
-    bool take(double margin) {
+    bool take(double margin, double macs) {
         const uint64_t t = now();
         asked_before = asked_at;
         asked_at = t;
         expected = true;
         if (!learned) return true;
+        const double here = here_ns ? here_ns : here_ns_per_mac.load(std::memory_order_relaxed) * macs;
+        if (here && made_ns && here >= made_ns * worth() && ++dear % 1024) return true;
         stock = std::min(kDepth, stock + per_ns * (double)(t - at));
         at = t;
         // A product that is cheaper here than an exchange that finds its pad
@@ -658,7 +675,12 @@ struct PadStock {
         if (missed) { if (expected) per_ns *= kFall; stock = 0; }
         else per_ns *= expected ? kRise : kSurprise;
     }
-    void computed_here(uint64_t ns) { smooth(here_ns, (double)ns); }
+    void computed_here(uint64_t ns, double macs) {
+        smooth(here_ns, (double)ns);
+        double rate = here_ns_per_mac.load(std::memory_order_relaxed);
+        smooth(rate, (double)ns / std::max(macs, 1.0));
+        here_ns_per_mac.store(rate, std::memory_order_relaxed);
+    }
 };
 
 // One weight x batch-width product, built once and reused. The engine does
@@ -795,12 +817,12 @@ public:
         // accounting for every product.
         const bool watch = session && m == 1;
         const uint64_t w0 = watch ? PadStock::now() : 0;
-        if (watch && dry_local_ && !p.pads.take(margin_) && here(p.graph)) {
+        if (watch && dry_local_ && !p.pads.take(margin_, (double)k * (double)n) && here(p.graph)) {
             const auto * y = static_cast<const float *>(p.y->data);
             if (!(to ? copy_finite(to, y, m * n) : all_finite(y, m * n))) retire("non-finite output");
             out.supported = true;
             ++here_;
-            p.pads.computed_here(PadStock::now() - w0);
+            p.pads.computed_here(PadStock::now() - w0, (double)k * (double)n);
             here_ns_ += PadStock::now() - w0;
             ++completed_;
             return out;
@@ -944,8 +966,8 @@ public:
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
         const bool watch = m == 1;
         const uint64_t w0 = watch ? PadStock::now() : 0;
-        if (watch && dry_local_ && !p.pads.take(margin_) && here(p.graph)) {
-            p.pads.computed_here(PadStock::now() - w0);
+        if (watch && dry_local_ && !p.pads.take(margin_, (double)k * (double)(n1 + n2)) && here(p.graph)) {
+            p.pads.computed_here(PadStock::now() - w0, (double)k * (double)(n1 + n2));
             here_ns_ += PadStock::now() - w0;
             if (!copy_finite(to[0], static_cast<const float *>(p.y[0]->data), m * n1) ||
                     !copy_finite(to[1], static_cast<const float *>(p.y[1]->data), m * n2))

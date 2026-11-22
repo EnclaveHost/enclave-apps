@@ -80,6 +80,23 @@ template <class T> T real(const char *name) {
     static const auto pointer = real<decltype(&name)>(#name);                  \
     return pointer;                                                            \
   }())
+// Buffers this library backed with a file of its own (clCreateBuffer below). The application never
+// receives their host pointer, so they change only through calls this library sees.
+std::mutex file_backed_mutex;
+std::set<cl_mem> file_backed;
+bool is_file_backed(cl_mem buffer) {
+  std::lock_guard lock(file_backed_mutex);
+  return file_backed.count(buffer) != 0;
+}
+// ...or a sub-buffer of one.
+bool on_file_backing(cl_mem buffer) {
+  if (!buffer) return false;
+  { std::lock_guard lock(file_backed_mutex); if (file_backed.empty()) return false; }
+  if (is_file_backed(buffer)) return true;
+  cl_mem parent = nullptr;
+  return !REAL(clGetMemObjectInfo)(buffer, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof parent, &parent, nullptr) &&
+         parent && is_file_backed(parent);
+}
 cl_int copy_info(const void *value, size_t bytes, size_t size, void *out,
                  size_t *actual) {
   if (actual)
@@ -635,6 +652,7 @@ bool storage(cl_mem b, Storage &out) {
       REAL(clGetMemObjectInfo)(b, CL_MEM_FLAGS, sizeof(out.flags), &out.flags,
                                nullptr))
     return false;
+  if (on_file_backing(b)) out.flags &= ~(cl_mem_flags)CL_MEM_USE_HOST_PTR;
   // OpenCL sub-buffers have only one parent level. Check every backing range.
   cl_mem parent = nullptr;
   if (REAL(clGetMemObjectInfo)(b, CL_MEM_ASSOCIATED_MEMOBJECT, sizeof(parent),
@@ -647,6 +665,7 @@ bool storage(cl_mem b, Storage &out) {
         REAL(clGetMemObjectInfo)(parent, CL_MEM_FLAGS, sizeof(out.root_flags),
                                  &out.root_flags, nullptr))
       return false;
+    if (is_file_backed(parent)) out.root_flags &= ~(cl_mem_flags)CL_MEM_USE_HOST_PTR;
   } else {
     out.root_flags = out.flags;
   }
@@ -1815,6 +1834,66 @@ CL_API_ENTRY cl_mem CL_API_CALL clCreateImageWithProperties(
   if (image && description && description->buffer)
     q8_child(image, description->buffer, 0, SIZE_MAX / 2);
   return image;
+}
+// A large buffer the application creates without host memory may be backed by an unlinked file in
+// SHIELD_OPENCL_BUFFER_DIR instead of private memory. Model weights are such buffers: once the executor
+// has them they are read again only for a product computed here, and private memory would hold a second
+// copy of the model for the life of the process (17 GB for a 27B model). File pages can be written back
+// and dropped under memory pressure and read again when wanted. Off unless the directory is set.
+namespace {
+struct FileBacking { void *base; size_t size; };
+void CL_CALLBACK file_backing_ended(cl_mem buffer, void *data) {
+  auto *backing = static_cast<FileBacking *>(data);
+  { std::lock_guard lock(file_backed_mutex); file_backed.erase(buffer); }
+  munmap(backing->base, backing->size);
+  delete backing;
+}
+}
+CL_API_ENTRY cl_mem CL_API_CALL clCreateBuffer(cl_context context, cl_mem_flags flags, size_t size,
+                                              void *host, cl_int *error) {
+  static const char *const dir = std::getenv("SHIELD_OPENCL_BUFFER_DIR");
+  static const size_t least = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_BUFFER_FILE_MIN_MB");
+    const long megabytes = value ? std::atol(value) : 64;
+    return (size_t)(megabytes > 0 ? megabytes : 64) << 20;
+  }();
+  if (!dir || !*dir || host || size < least ||
+      (flags & (CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR | CL_MEM_COPY_HOST_PTR)))
+    return REAL(clCreateBuffer)(context, flags, size, host, error);
+  const size_t mapped = (size + 4095) & ~(size_t)4095;
+  const int fd = open(dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  void *base = MAP_FAILED;
+  if (fd >= 0 && ftruncate(fd, (off_t)mapped) == 0)
+    base = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (fd >= 0) close(fd);
+  if (base == MAP_FAILED) return REAL(clCreateBuffer)(context, flags, size, host, error);
+  cl_int status = CL_SUCCESS;
+  cl_mem buffer = REAL(clCreateBuffer)(context, flags | CL_MEM_USE_HOST_PTR, size, base, &status);
+  auto *backing = buffer ? new FileBacking{base, mapped} : nullptr;
+  if (!buffer || REAL(clSetMemObjectDestructorCallback)(buffer, file_backing_ended, backing) != CL_SUCCESS) {
+    if (buffer) REAL(clReleaseMemObject)(buffer);
+    delete backing;
+    munmap(base, mapped);
+    return REAL(clCreateBuffer)(context, flags, size, host, error);
+  }
+  { std::lock_guard lock(file_backed_mutex); file_backed.insert(buffer); }
+  if (error) *error = status;
+  return buffer;
+}
+// The backing of such a buffer is not the application's: it sees a buffer without host memory.
+CL_API_ENTRY cl_int CL_API_CALL clGetMemObjectInfo(cl_mem object, cl_mem_info name, size_t size, void *value,
+                                                   size_t *actual) {
+  if ((name != CL_MEM_FLAGS && name != CL_MEM_HOST_PTR) || !on_file_backing(object))
+    return REAL(clGetMemObjectInfo)(object, name, size, value, actual);
+  if (name == CL_MEM_HOST_PTR) {
+    void *none = nullptr;
+    return copy_info(&none, sizeof none, size, value, actual);
+  }
+  cl_mem_flags flags = 0;
+  if (const cl_int status = REAL(clGetMemObjectInfo)(object, CL_MEM_FLAGS, sizeof flags, &flags, nullptr))
+    return status;
+  flags &= ~(cl_mem_flags)CL_MEM_USE_HOST_PTR;
+  return copy_info(&flags, sizeof flags, size, value, actual);
 }
 CL_API_ENTRY cl_int CL_API_CALL clReleaseMemObject(cl_mem object) {
   // Remembered identities hold their own reference, so a handle cannot be

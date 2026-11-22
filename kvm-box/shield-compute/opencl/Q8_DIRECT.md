@@ -480,9 +480,77 @@ much cheaper the product must be here) are for measuring;
 stops. `test_q8_session.py` runs its accounting tests with every product
 exchanged and has one test of the default.
 
-Not measured: EyesOff's 27B model with this (the host had 39 GB free of the
-48 a run takes), and any guest. An earlier attempt that used the CPU
-backend's default of four threads was no faster than making the pad.
+### EyesOff's 27B with this
+
+Measured 2026-11-22 at EyesOff's link settings (pool depth and refill batch
+64, four refill threads, two cards), 100 tokens, alternating runs, with the
+buffers of the next section so that it fits beside the other tenants.
+
+| Executor | OpenCL route | Native Shield |
+| --- | ---: | ---: |
+| every product exchanged | 6.31, 6.35, 6.32, 6.33 | 6.46, 6.26, 6.41, 6.46 |
+| the estimate above alone | 6.28, 4.62, 4.95 | |
+| with the cost rule below | 6.19, 6.20, 6.30 | 6.39, 6.37, 6.33 |
+
+The estimate alone loses here. A pool this deep is refilled a batch at a
+time, and a group's exchanges go 64 found, then 1 to 13 not, then 64 found
+again; 3,335 of 25,444 exchanges find nothing. The estimate models a rate, so
+it sent 3,900 to 11,100 products here, most of which would have found a pad
+in 0.15 ms. And a product costs more here than the pad does: 6 to 8 ms on
+eight processors for most groups, against 3 ms for the card to make the pad.
+
+So a group is exchanged whatever the estimate says when its product costs as
+much here as a pad made on the path (`SHIELD_Q8_DRY_LOCAL_WORTH`, the share
+of that cost, default 1). Before a group has been tried, its cost here is
+taken from the groups that have, by size, so a large tensor is not computed
+once just to find out. With the rule one or two products a run are computed
+here on this model and the route is where exchanging everything puts it, 98
+to 100% of the native engine. On the 3B model at the service's settings the
+rule changes nothing at a share of 1 (103 and 104% on two processors, 130% on
+eight); a share of 0.5 costs it the gain on two processors (95 and 97%).
+
+Counting the batches instead of estimating a rate was tried and not kept: it
+was right about when the pool is empty and still lost, because the product is
+dearer here than the pad.
+
+What limits both paths on this model is the supply of pads. 400-token runs:
+
+| Refill threads | Pool depth | Native Shield | OpenCL route | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 4 | 64 | 7.14, 7.18 | 7.08, 7.01 | 98% |
+| 4 | 128 | 7.38, 7.55 | 7.09, 7.40 | 97% |
+| 6 | 64 | 7.98 | 7.47 | 94% |
+| 8 | 64 | 7.63 | 6.97 | 91% |
+
+A deeper pool leaves the misses where they were (8,300 to 9,100 of 102,544),
+so the threads do not keep up; six of them do (one miss), and then the route
+is behind by about 9 ms a token, 35 us for each of its 256 exchanges. Eight
+is worse for both on eight processors. The route does not exceed the native
+engine on this model in any of these.
+
+## Application buffers backed by a file
+
+On the 27B the route held the model three times: the executor's backend copy
+(as the native engine has), and every weight again in the private memory of
+the buffers llama's OpenCL backend creates, 16 GB that is read only for a
+product computed in the application. With two test workers a run needed more
+than 50 GB where the native engine needs 31.
+
+With `SHIELD_OPENCL_BUFFER_DIR` set, `clCreateBuffer` backs a buffer of 64 MB
+or more (`SHIELD_OPENCL_BUFFER_FILE_MIN_MB`) that the application creates
+without host memory by an unlinked file in that directory, handed to the
+runtime as its host pointer. The pages are file pages: written back and
+dropped under pressure, read again when wanted. The application is not told:
+`clGetMemObjectInfo` reports such a buffer, and its sub-buffers, without a
+host pointer, so it still changes only through calls this library sees and an
+authenticated identity is remembered as before. Off unless the directory is
+set.
+
+Measured: the application's private memory falls from 1.94 GiB to 0.17 GiB on
+the 3B model with the same text, exchanges and speed (45 to 47 tokens a second
+both ways); the 27B runs above kept 18 GB or more available on a host with 57.
+The directory must be on a disk with room for the model. Not tried: a guest,
+and a directory in memory, where it would save nothing.
 
 ## What is not established
 
