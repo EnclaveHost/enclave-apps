@@ -42,6 +42,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <deque>
+#include <mutex>
+#include <unordered_map>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -240,6 +243,46 @@ struct Model {
     // Tensors whose mapped bytes verify_all found to match the policy digest,
     // with the exact range it hashed.
     std::map<std::string, std::pair<const unsigned char *, size_t>> prehashed;
+
+    // A model tensor's mapped bytes with no policy check. Only for arithmetic whose result is compared,
+    // byte for byte, with what a client sends before anything is done with it (Residual): a wrong byte
+    // here makes the comparison fail and nothing else.
+    struct Raw {
+        const unsigned char * data = nullptr;
+        size_t bytes = 0;
+        ggml_type type = GGML_TYPE_F32;
+        int64_t ne[2] = {0, 0};
+    };
+    Raw raw(const std::string & name) const {
+        Raw r;
+        const int64_t id = gguf_find_tensor(gguf.get(), name.c_str());
+        const ggml_tensor * t = ggml_get_tensor(meta.get(), name.c_str());
+        if (id < 0 || !t) return r;
+        const size_t bytes = gguf_get_tensor_size(gguf.get(), id);
+        const size_t data_off = gguf_get_data_offset(gguf.get());
+        const size_t tensor_off = gguf_get_tensor_offset(gguf.get(), id);
+        if (bytes == 0 || bytes != ggml_nbytes(t) || data_off > map.size || tensor_off > map.size - data_off ||
+                bytes > map.size - data_off - tensor_off)
+            return r;
+        r.data = static_cast<const unsigned char *>(map.base) + data_off + tensor_off;
+        r.bytes = bytes;
+        r.type = t->type;
+        r.ne[0] = t->ne[0];
+        r.ne[1] = t->ne[1];
+        return r;
+    }
+    // The model's RMS norm epsilon, 0 when it does not say.
+    float rms_eps() const {
+        const int64_t n = gguf_get_n_kv(gguf.get());
+        for (int64_t i = 0; i < n; ++i) {
+            const std::string key = gguf_get_key(gguf.get(), i);
+            const std::string tail = ".attention.layer_norm_rms_epsilon";
+            if (key.size() > tail.size() && !key.compare(key.size() - tail.size(), tail.size(), tail) &&
+                    gguf_get_kv_type(gguf.get(), i) == GGUF_TYPE_FLOAT32)
+                return gguf_get_val_f32(gguf.get(), i);
+        }
+        return 0;
+    }
 
     // Check the policy digest of each named tensor's mapped bytes on several
     // threads. A tensor that is missing, malformed or does not match is simply
@@ -1104,12 +1147,125 @@ public:
     // taken before the change are gone.
     uint64_t generation() const { return generation_; }
 
+    Model::Raw raw(const std::string & name) const { return model_.raw(name); }
+
+    // rms_norm(h) * w for one row, on the CPU backend the client uses and so with its bytes (the same
+    // fused operation). Null when it cannot be built.
+    const float * normed(const Model::Raw & w, const float * h, size_t k) {
+        if (!w.data || w.type != GGML_TYPE_F32 || w.bytes != k * 4 || !cpu_ready()) return nullptr;
+        NormGlue & g = norms_[w.data];
+        if (!g.tried) {
+            g.tried = true;
+            const float eps = model_.rms_eps();
+            if (!(eps > 0)) return nullptr;
+            const ggml_init_params params{4 * k * 4 + (1u << 20), nullptr, false};
+            g.ctx.reset(ggml_init(params));
+            if (!g.ctx) return nullptr;
+            ggml_tensor * in = ggml_new_tensor_2d(g.ctx.get(), GGML_TYPE_F32, (int64_t)k, 1);
+            ggml_tensor * weight = ggml_new_tensor_1d(g.ctx.get(), GGML_TYPE_F32, (int64_t)k);
+            if (!in || !weight) return nullptr;
+            std::memcpy(weight->data, w.data, k * 4);
+            ggml_set_input(in);
+            ggml_set_input(weight);
+            ggml_tensor * out = ggml_mul(g.ctx.get(), ggml_rms_norm(g.ctx.get(), in, eps), weight);
+            ggml_cgraph * graph = out ? ggml_new_graph_custom(g.ctx.get(), 16, false) : nullptr;
+            if (!graph || !out->data) return nullptr;
+            ggml_build_forward_expand(graph, out);
+            g.in = in;
+            g.out = out;
+            g.graph = graph;
+        }
+        if (!g.graph) return nullptr;
+        std::memcpy(g.in->data, h, k * 4);
+        if (ggml_backend_graph_compute(cpu_, g.graph) != GGML_STATUS_SUCCESS) return nullptr;
+        return static_cast<const float *>(g.out->data);
+    }
+
+    // The same norm written out, which is what the CPU backend's loop does without the cost of running a
+    // graph for 5,000 values. It is used for a weight only after it has given that backend's bytes eight
+    // times running; one difference and the graph is used for that weight from then on.
+    const float * normed_direct(const Model::Raw & w, const float * h, size_t k, std::vector<float> & out) {
+        if (!w.data || w.type != GGML_TYPE_F32 || w.bytes != k * 4) return nullptr;
+        NormGlue & g = norms_[w.data];
+        if (g.trust < 0) return normed(w, h, k);
+        const float eps = eps_ ? eps_ : (eps_ = model_.rms_eps());
+        if (!(eps > 0)) return nullptr;
+        const auto * weight = reinterpret_cast<const float *>(w.data);
+        out.resize(k);
+        double sum = 0.0;
+        for (size_t i = 0; i < k; ++i) sum += (double)(h[i] * h[i]);
+        const float mean = sum / (double)(int64_t)k;
+        const float scale = 1.0f / sqrtf(mean + eps);
+        for (size_t i = 0; i < k; ++i) out[i] = h[i] * scale * weight[i];
+        if (g.trust < 8) {
+            const float * graph = normed(w, h, k);
+            if (!graph) return nullptr;
+            if (std::memcmp(graph, out.data(), k * 4)) {
+                g.trust = -1;
+                return graph;
+            }
+            ++g.trust;
+        }
+        return out.data();
+    }
+
+    // The token embedding whose normalized row is exactly x, as the first layer's input is. Tokens are
+    // found by the signs of their first values and then checked whole.
+    bool embedding_for(const Model::Raw & w0, const float * x, size_t k, std::vector<float> & h) {
+        if (!w0.data || w0.type != GGML_TYPE_F32 || w0.bytes != k * 4 || k < 64) return false;
+        const auto * w = reinterpret_cast<const float *>(w0.data);
+        if (!vocab_.tried) {
+            vocab_.tried = true;
+            const Model::Raw e = model_.raw("token_embd.weight");
+            const ggml_type_traits * traits = e.data ? ggml_get_type_traits(e.type) : nullptr;
+            if (!traits || !traits->to_float || e.ne[0] != (int64_t)k || e.ne[1] <= 0) return false;
+            const size_t row = ggml_row_size(e.type, (int64_t)k);
+            const size_t block = (size_t)ggml_blck_size(e.type);
+            if (!row || !block || k % block || row * (size_t)e.ne[1] != e.bytes) return false;
+            const size_t head = (64 + block - 1) / block * block;
+            std::vector<float> first(head);
+            vocab_.by.reserve((size_t)e.ne[1]);
+            for (int64_t t = 0; t < e.ne[1]; ++t) {
+                traits->to_float(e.data + (size_t)t * row, first.data(), (int64_t)head);
+                uint64_t key = 0;
+                for (int i = 0; i < 64; ++i) key |= (uint64_t)(std::signbit(first[i]) != std::signbit(w[i])) << i;
+                vocab_.by.emplace(key, (uint32_t)t);
+            }
+            vocab_.embd = e;
+            vocab_.row = row;
+        }
+        if (!vocab_.embd.data) return false;
+        uint64_t key = 0;
+        for (int i = 0; i < 64; ++i) key |= (uint64_t)std::signbit(x[i]) << i;
+        const auto range = vocab_.by.equal_range(key);
+        h.resize(k);
+        for (auto it = range.first; it != range.second; ++it) {
+            ggml_get_type_traits(vocab_.embd.type)->to_float(vocab_.embd.data + (size_t)it->second * vocab_.row, h.data(), (int64_t)k);
+            const float * again = normed(w0, h.data(), k);
+            if (again && !std::memcmp(again, x, k * 4)) return true;
+        }
+        return false;
+    }
+
+    // The last layer of the model proper: the highest block with a feed-forward norm that is not the
+    // next-token (MTP) block. -1 when the names are not these.
+    int last_layer() {
+        if (last_layer_ == -2) {
+            last_layer_ = -1;
+            for (int l = 0; l < 4096; ++l) {
+                const std::string at = "blk." + std::to_string(l);
+                if (!model_.raw(at + ".post_attention_norm.weight").data) break;
+                if (!model_.raw(at + ".nextn.eh_proj.weight").data) last_layer_ = l;
+            }
+        }
+        return last_layer_;
+    }
+
     // swiglu(y[order], y[1 - order]) of the pair's current products, computed
     // on the CPU backend in this process, or null when that is not available.
     // Ordinary arithmetic on values this process already holds; nothing is
     // sent anywhere.
-    const float * gated(Pair & p, int order) {
-        if (!p.glue[order]) return nullptr;
+    bool cpu_ready() {
         if (!cpu_tried_) {
             cpu_tried_ = true;
             cpu_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -1120,6 +1276,12 @@ public:
                 if (set) set(cpu_, 1);
             }
         }
+        return cpu_ != nullptr;
+    }
+
+    const float * gated(Pair & p, int order) {
+        if (!p.glue[order]) return nullptr;
+        cpu_ready();
         if (!cpu_ || ggml_backend_graph_compute(cpu_, p.glue[order]) != GGML_STATUS_SUCCESS) return nullptr;
         return static_cast<const float *>(p.gated[order]->data);
     }
@@ -1238,6 +1400,22 @@ private:
     uint64_t generation_ = 0;
     ggml_backend_t cpu_ = nullptr;
     bool cpu_tried_ = false;
+    struct NormGlue {
+        GraphContext ctx{nullptr, ggml_free};
+        ggml_tensor * in = nullptr, * out = nullptr;
+        ggml_cgraph * graph = nullptr;
+        bool tried = false;
+        int trust = 0;
+    };
+    std::map<const unsigned char *, NormGlue> norms_;
+    float eps_ = 0;
+    struct {
+        bool tried = false;
+        Model::Raw embd;
+        size_t row = 0;
+        std::unordered_multimap<uint64_t, uint32_t> by;
+    } vocab_;
+    int last_layer_ = -2;
     size_t retained_ = 0;
     std::atomic<uint64_t> completed_{0};  // read by the serving loop while a job may run
     bool prepared_ = false;
@@ -1339,6 +1517,98 @@ struct Chain {
 };
 constexpr uint8_t kChainStrikes = 3;
 
+// The residual stream of one sequence, followed so that the requests a client is about to make can be
+// computed before it makes them (SHIELD_Q8_RESIDUAL=1, one row at a time).
+//
+// In these models a layer makes four exchanges. The first products are of norm(h), h the layer's input;
+// the next is of something only the client can compute (the recurrence or the attention); then the two
+// feed-forward products are of norm(h + that product), the down projection is of their gating, and the
+// next layer starts from h + that product + the down projection. So from the second exchange on, the
+// inputs of the next three are arithmetic on values this process already holds, the same additions and
+// the same norm the client's CPU backend performs. They are computed here while the client is still
+// doing its own, and each result is released only to a request for that tensor whose activation is byte
+// for byte the one it was computed from, as a continuation is. A layer costs the client one wait instead
+// of four. Which tensors play which part is read from their names and proved by the comparison: a model
+// built otherwise never matches and is served as before.
+//
+// h itself is never sent. It starts as the token's embedding row, found from the first layer's request
+// (Engine::embedding_for), and is carried forward by the additions.
+enum class Part : uint8_t { None, First, Mixed, Gate, Down, Head };
+struct Where {
+    Part part = Part::None;
+    int layer = -1;
+};
+inline Where where_is(const char * name) {
+    if (!std::strcmp(name, "output.weight")) return {Part::Head, -1};
+    int layer = -1;
+    char rest[48] = {};
+    if (std::sscanf(name, "blk.%d.%47s", &layer, rest) != 2 || layer < 0) return {};
+    for (const char * first : {"attn_qkv.weight", "attn_gate.weight", "attn_q.weight", "attn_k.weight", "attn_v.weight"})
+        if (!std::strcmp(rest, first)) return {Part::First, layer};
+    for (const char * mixed : {"ssm_out.weight", "attn_output.weight"})
+        if (!std::strcmp(rest, mixed)) return {Part::Mixed, layer};
+    for (const char * gate : {"ffn_gate.weight", "ffn_up.weight"})
+        if (!std::strcmp(rest, gate)) return {Part::Gate, layer};
+    if (!std::strcmp(rest, "ffn_down.weight")) return {Part::Down, layer};
+    return {};
+}
+struct Residual {
+    struct Step {
+        uint32_t id = kNoPair, pair = kNoPair;
+        std::vector<unsigned char> x, y0, y1;
+        uint64_t exchanges = 0, macs = 0;
+    };
+    struct Layer {
+        std::vector<std::pair<uint32_t, uint32_t>> first;  // the requests that open the layer, as first seen
+        bool first_known = false;
+        uint32_t gate[2] = {kNoPair, kNoPair}, down = kNoPair;
+    };
+    // Between the serving thread and the one that computes ahead.
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<Step> ready;  // in the order the client will ask
+    bool running = false, cancel = false;
+    std::vector<Step> spare;  // by slot: a step's buffers are as large every time, and zeroing new ones costs
+    Step take(uint32_t id) {
+        std::lock_guard lock(mutex);
+        if (id < spare.size() && spare[id].id == id) {
+            Step step = std::move(spare[id]);
+            spare[id].id = kNoPair;
+            return step;
+        }
+        return {};
+    }
+    void give(Step && step) {
+        std::lock_guard lock(mutex);
+        const uint32_t id = step.id;
+        if (id == kNoPair || id >= kMaxSlots) return;
+        if (spare.size() <= id) spare.resize(id + 1);
+        spare[id] = std::move(step);
+    }
+    // Used only by whichever thread has the engine.
+    bool valid = false;
+    int layer = -1;
+    int pending = -1;  // a chain to run on the serving thread itself once the request is answered (mailbox)
+    std::vector<float> h, mid;
+    std::vector<Layer> layers;
+    std::vector<Model::Raw> post_norm, attn_norm;  // by layer, looked up once
+    Model::Raw output_norm;
+    std::vector<float> scratch, next;
+    uint32_t head = kNoPair;
+    unsigned strikes = 0;
+    uint64_t served = 0, dropped = 0;
+    uint64_t chains = 0, chain_ns = 0, waits = 0, wait_ns = 0, norm_ns = 0, gated_ns = 0, compute_ns = 0, look_ns = 0;
+    ~Residual() {
+        if (served || dropped)
+            std::fprintf(stderr, "[q8-executor] residual chain: %llu requests answered from it, %llu computed and not asked for; "
+                                 "%llu chains of %.0f us (norms %.0f, gating %.0f, products %.0f, graphs %.0f); a request waited %.0f us for its step\n",
+                         (unsigned long long)served, (unsigned long long)dropped, (unsigned long long)chains,
+                         chains ? chain_ns / 1e3 / chains : 0., chains ? norm_ns / 1e3 / chains : 0., chains ? gated_ns / 1e3 / chains : 0.,
+                         chains ? compute_ns / 1e3 / chains : 0., chains ? look_ns / 1e3 / chains : 0., waits ? wait_ns / 1e3 / waits : 0.);
+    }
+};
+constexpr unsigned kResidualStrikes = 16;
+
 struct Session {
     int fd = -1;
     std::vector<Slot> slots;
@@ -1351,6 +1621,7 @@ struct Session {
         return mail && shared.base && mailbox()->request.load(std::memory_order_acquire) != mail_seen;
     }
     std::vector<Chain> chains;
+    std::unique_ptr<Residual> residual;
     // The pair served last, while its products are still the pair's current ones.
     struct {
         Engine::Pair * pair = nullptr;
@@ -1519,6 +1790,403 @@ void chain_ahead(Session & s, Engine & engine, uint32_t first, uint32_t second, 
     s.held.valid = true;
 }
 
+// ---- the residual chain (see Residual)
+
+void residual_reply(Session & s, const Residual::Step & step) {
+    std::memcpy(s.shared.base + kMaxPayload, step.y0.data(), step.y0.size());
+    if (step.pair != kNoPair) std::memcpy(s.shared.base + 2 * kMaxPayload, step.y1.data(), step.y1.size());
+    struct { Frame f; uint64_t exchanges, macs; } r{{kMatmulShared, step.id, kOk, step.pair != kNoPair ? 1u : 0u},
+                                                    step.exchanges, step.macs};
+    if (!s.from_mail) return session_write(s.fd, &r, sizeof r);
+    Mail * mail = s.mailbox();
+    mail->status = r.f.a;
+    mail->paired = r.f.b;
+    mail->exchanges = r.exchanges;
+    mail->macs = r.macs;
+    mail->reply.store(s.mail_seen, std::memory_order_release);
+}
+
+// A request for what the chain has computed or is computing, answered without the engine. False leaves
+// the request unread, for the ordinary path.
+bool residual_serve(Session & s) {
+    if (!s.residual || !s.shared.base) return false;
+    Residual & r = *s.residual;
+    {
+        std::lock_guard lock(r.mutex);
+        if (r.ready.empty() && !r.running) return false;
+    }
+    struct { Frame f; uint32_t pair, reserved; } q{};
+    const ssize_t got = recv(s.fd, &q, sizeof q, MSG_PEEK | MSG_DONTWAIT);
+    if (got != (ssize_t)sizeof q) return false;
+    Residual::Step step;
+    {
+        std::unique_lock lock(r.mutex);
+        if (q.f.type != kMatmulShared || q.f.a != 1 || q.f.b != 0 || q.reserved != 0) {
+            r.cancel = true;
+            return false;
+        }
+        const uint64_t waited = Timing::now();
+        r.changed.wait(lock, [&r] { return !r.ready.empty() || !r.running; });
+        ++r.waits;
+        r.wait_ns += Timing::now() - waited;
+        if (r.ready.empty()) return false;
+        const Residual::Step & front = r.ready.front();
+        if (front.id != q.f.id || front.pair != q.pair || std::memcmp(s.shared.base, front.x.data(), front.x.size())) {
+            r.cancel = true;
+            return false;
+        }
+        step = std::move(r.ready.front());
+        r.ready.pop_front();
+        ++r.served;
+    }
+    session_read(s.fd, &q, sizeof q);
+    residual_reply(s, step);
+    r.give(std::move(step));
+    return true;
+}
+
+// The same from the ordinary path, which has read the request and has the engine: nothing is being
+// computed ahead any more. What the chain holds is this request's or is nobody's.
+bool residual_offer(Session & s, uint32_t id, uint32_t pair, uint64_t m) {
+    if (!s.residual) return false;
+    Residual & r = *s.residual;
+    Residual::Step step;
+    {
+        std::lock_guard lock(r.mutex);
+        r.cancel = false;
+        if (r.ready.empty()) return false;
+        const Residual::Step & front = r.ready.front();
+        if (m != 1 || front.id != id || front.pair != pair ||
+                std::memcmp(s.shared.base, front.x.data(), front.x.size())) {
+            if (std::getenv("SHIELD_Q8_RESIDUAL_DEBUG") && r.strikes < 12)
+                std::fprintf(stderr, "[residual] asked %u/%u m=%llu, held %u/%u, bytes %s\n", id, pair, (unsigned long long)m, front.id, front.pair,
+                             std::memcmp(s.shared.base, front.x.data(), front.x.size()) ? "differ" : "equal");
+            r.dropped += r.ready.size();
+            r.ready.clear();
+            r.valid = false;
+            ++r.strikes;
+            return false;
+        }
+        step = std::move(r.ready.front());
+        r.ready.pop_front();
+        ++r.served;
+    }
+    residual_reply(s, step);
+    r.give(std::move(step));
+    return true;
+}
+
+// On the thread that computes ahead: the feed-forward pair, its down projection and what opens the next
+// layer (or the vocabulary projection after the last), each from this process's own arithmetic.
+void residual_chain(Session & s, Engine & engine, int layer) {
+    Residual & r = *s.residual;
+    struct Finish {
+        Residual & r;
+        uint64_t began = Timing::now();
+        ~Finish() {
+            std::lock_guard lock(r.mutex);
+            r.running = false;
+            ++r.chains;
+            r.chain_ns += Timing::now() - began;
+            r.changed.notify_all();
+        }
+    } finish{r};
+    // On the serving thread (mailbox): after each step, answer what the client has asked for meanwhile if
+    // it is what the chain holds next; anything else ends the chain and is left for the ordinary path.
+    const auto pump = [&r, &s] {
+        while (s.mail && s.mail_pending() && !r.ready.empty()) {
+            const Mail * mail = s.mailbox();
+            Residual::Step & front = r.ready.front();
+            if (mail->m != 1 || mail->third != 0 || front.id != mail->id || front.pair != mail->pair ||
+                    std::memcmp(s.shared.base, front.x.data(), front.x.size())) {
+                r.cancel = true;
+                return;
+            }
+            s.mail_seen = mail->request.load(std::memory_order_acquire);
+            s.from_mail = true;
+            Residual::Step step = std::move(front);
+            r.ready.pop_front();
+            ++r.served;
+            residual_reply(s, step);
+            r.give(std::move(step));
+        }
+    };
+    const bool inline_chain = s.from_mail;
+    // A step the client is already waiting for is computed straight into the shared memory and answered
+    // there, with no copy kept.
+    const auto wanted = [&r, &s, inline_chain](uint32_t id, uint32_t with, const void * x, size_t bytes) {
+        if (!inline_chain || !r.ready.empty() || !s.mail_pending()) return false;
+        const Mail * mail = s.mailbox();
+        return mail->m == 1 && mail->third == 0 && mail->id == id && mail->pair == with &&
+               !std::memcmp(s.shared.base, x, bytes);
+    };
+    const auto answer_now = [&r, &s](uint32_t id, uint32_t with, const Outcome & out) {
+        Mail * mail = s.mailbox();
+        s.mail_seen = mail->request.load(std::memory_order_acquire);
+        s.from_mail = true;
+        (void)id;
+        mail->status = kOk;
+        mail->paired = with != kNoPair ? 1u : 0u;
+        mail->exchanges = out.exchanges;
+        mail->macs = out.macs;
+        mail->reply.store(s.mail_seen, std::memory_order_release);
+        ++r.served;
+    };
+    const auto push = [&r, &pump, inline_chain](Residual::Step && step) {
+        {
+            std::lock_guard lock(r.mutex);
+            r.ready.push_back(std::move(step));
+            r.changed.notify_all();
+        }
+        if (inline_chain) pump();
+        return !r.cancel;
+    };
+    static int told = 0;
+    const auto lost = [&r, layer](int line = __builtin_LINE()) {
+        if (std::getenv("SHIELD_Q8_RESIDUAL_DEBUG") && told < 30) { ++told; std::fprintf(stderr, "[residual] chain layer %d stopped at line %d\n", layer, line); }
+        r.valid = false;
+    };
+    const Residual::Layer at = r.layers[(size_t)layer];
+    uint32_t first = kNoPair, second = kNoPair;
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t f = at.gate[i], o = at.gate[1 - i];
+        if (f < s.chains.size() && o != kNoPair && s.chains[f].second == o && s.chains[f].next != kNoPair) {
+            first = f;
+            second = o;
+        }
+    }
+    if (first == kNoPair || first >= s.slots.size() || second >= s.slots.size()) return lost();
+    const Chain chain = s.chains[first];
+    const uint32_t down_id = chain.next;
+    if (down_id >= s.slots.size() || where_is(ggml_get_name(s.slots[down_id].w)).part != Part::Down) return lost();
+    const Slot one = s.slots[first], two = s.slots[second], down = s.slots[down_id];
+    const size_t k = one.k;
+    if (!one.w || !two.w || !down.w || two.k != k || down.k != one.n || one.n != two.n || down.n != k || r.mid.size() != k)
+        return lost();
+    const std::string block = "blk." + std::to_string(layer);
+    uint64_t tt = Timing::now();
+    if (r.post_norm.size() <= (size_t)layer + 1) {
+        r.post_norm.resize((size_t)layer + 2);
+        r.attn_norm.resize((size_t)layer + 2);
+    }
+    if (!r.post_norm[(size_t)layer].data) r.post_norm[(size_t)layer] = engine.raw(block + ".post_attention_norm.weight");
+    const float * x = engine.normed_direct(r.post_norm[(size_t)layer], r.mid.data(), k, r.scratch);
+    r.norm_ns += Timing::now() - tt;
+    if (!x || !all_finite(x, k)) return lost();
+    const uint64_t generation = engine.generation();
+    tt = Timing::now();
+    Engine::Pair * pair = engine.pair(one.w, two.w, k, one.n, two.n, 1);
+    r.look_ns += Timing::now() - tt;
+    if (!pair) return lost();
+    std::memcpy(pair->x->data, x, k * 4);
+    if (wanted(first, second, x, k * 4)) {
+        unsigned char * const to[2] = {s.shared.base + kMaxPayload, s.shared.base + 2 * kMaxPayload};
+        tt = Timing::now();
+        const Outcome out = engine.compute(*pair, k, one.n, two.n, 1, to);
+        r.compute_ns += Timing::now() - tt;
+        answer_now(first, second, out);
+    } else {
+        Residual::Step gate = r.take(first);
+        gate.id = first;
+        gate.pair = second;
+        gate.x.assign(reinterpret_cast<const unsigned char *>(x), reinterpret_cast<const unsigned char *>(x) + k * 4);
+        gate.y0.resize(one.n * 4);
+        gate.y1.resize(two.n * 4);
+        unsigned char * const to[2] = {gate.y0.data(), gate.y1.data()};
+        tt = Timing::now();
+        const Outcome out = engine.compute(*pair, k, one.n, two.n, 1, to);
+        r.compute_ns += Timing::now() - tt;
+        gate.exchanges = out.exchanges;
+        gate.macs = out.macs;
+        if (!push(std::move(gate))) return lost();
+    }
+
+    tt = Timing::now();
+    Product & p = engine.product(down.w, down.k, down.n, 1);
+    r.look_ns += Timing::now() - tt;
+    if (engine.generation() != generation) return lost();  // the pair went with the old graphs
+    tt = Timing::now();
+    const float * gated = engine.gated(*pair, chain.order);
+    r.gated_ns += Timing::now() - tt;
+    if (!gated || !all_finite(gated, down.k)) return lost();
+    std::memcpy(p.x->data, gated, down.k * 4);
+    std::vector<float> & next = r.next;
+    next.resize(k);
+    if (wanted(down_id, kNoPair, gated, down.k * 4)) {
+        tt = Timing::now();
+        const Outcome out = engine.compute(p, down.k, down.n, 1, s.shared.base + kMaxPayload, true);
+        r.compute_ns += Timing::now() - tt;
+        if (!out.supported) return lost();
+        const auto * y = static_cast<const float *>(p.y->data);
+        for (size_t i = 0; i < k; ++i) next[i] = y[i] + r.mid[i];
+        answer_now(down_id, kNoPair, out);
+    } else {
+        Residual::Step fall = r.take(down_id);
+        fall.id = down_id;
+        fall.x.assign(reinterpret_cast<const unsigned char *>(gated), reinterpret_cast<const unsigned char *>(gated) + down.k * 4);
+        fall.y0.resize(down.n * 4);
+        tt = Timing::now();
+        const Outcome out = engine.compute(p, down.k, down.n, 1, fall.y0.data(), true);
+        r.compute_ns += Timing::now() - tt;
+        if (!out.supported) return lost();
+        fall.exchanges = out.exchanges;
+        fall.macs = out.macs;
+        const auto * y = reinterpret_cast<const float *>(fall.y0.data());
+        for (size_t i = 0; i < k; ++i) next[i] = y[i] + r.mid[i];
+        if (!push(std::move(fall))) return lost();
+    }
+
+    // One product, or two of the same activation, asked for as the client asks.
+    const auto ahead = [&](uint32_t id, uint32_t with, const float * in) {
+        if (id >= s.slots.size() || !s.slots[id].w || s.slots[id].k != k) return false;
+        const Slot a = s.slots[id];
+        if (wanted(id, with, in, k * 4)) {
+            if (with != kNoPair) {
+                if (with >= s.slots.size() || !s.slots[with].w || s.slots[with].k != k) return false;
+                const Slot b = s.slots[with];
+                Engine::Pair * both = engine.pair(a.w, b.w, k, a.n, b.n, 1);
+                if (!both) return false;
+                std::memcpy(both->x->data, in, k * 4);
+                unsigned char * const to[2] = {s.shared.base + kMaxPayload, s.shared.base + 2 * kMaxPayload};
+                const uint64_t t2 = Timing::now();
+                const Outcome out = engine.compute(*both, k, a.n, b.n, 1, to);
+                r.compute_ns += Timing::now() - t2;
+                answer_now(id, with, out);
+            } else {
+                Product & one_more = engine.product(a.w, a.k, a.n, 1);
+                std::memcpy(one_more.x->data, in, k * 4);
+                const Outcome out = engine.compute(one_more, a.k, a.n, 1, s.shared.base + kMaxPayload, true);
+                if (!out.supported) return false;
+                answer_now(id, with, out);
+            }
+            return !r.cancel;
+        }
+        Residual::Step step = r.take(id);
+        step.id = id;
+        step.pair = with;
+        step.x.assign(reinterpret_cast<const unsigned char *>(in), reinterpret_cast<const unsigned char *>(in) + k * 4);
+        step.y0.resize(a.n * 4);
+        if (with != kNoPair) {
+            if (with >= s.slots.size() || !s.slots[with].w || s.slots[with].k != k) return false;
+            const Slot b = s.slots[with];
+            Engine::Pair * both = engine.pair(a.w, b.w, k, a.n, b.n, 1);
+            if (!both) return false;
+            step.y1.resize(b.n * 4);
+            std::memcpy(both->x->data, in, k * 4);
+            unsigned char * const to[2] = {step.y0.data(), step.y1.data()};
+            const uint64_t t2 = Timing::now();
+            const Outcome out = engine.compute(*both, k, a.n, b.n, 1, to);
+            r.compute_ns += Timing::now() - t2;
+            step.exchanges = out.exchanges;
+            step.macs = out.macs;
+        } else {
+            Product & one_more = engine.product(a.w, a.k, a.n, 1);
+            std::memcpy(one_more.x->data, in, k * 4);
+            const Outcome out = engine.compute(one_more, a.k, a.n, 1, step.y0.data(), true);
+            if (!out.supported) return false;
+            step.exchanges = out.exchanges;
+            step.macs = out.macs;
+        }
+        return push(std::move(step));
+    };
+
+    if (layer == engine.last_layer()) {
+        r.valid = false;  // the sequence's next token starts again from its embedding
+        if (r.head == kNoPair) return;
+        if (!r.output_norm.data) r.output_norm = engine.raw("output_norm.weight");
+        const float * last = engine.normed_direct(r.output_norm, next.data(), k, r.scratch);
+        if (last && all_finite(last, k)) {
+            const std::vector<float> in(last, last + k);
+            ahead(r.head, kNoPair, in.data());
+        }
+        return;
+    }
+    if ((size_t)layer + 1 >= r.layers.size() || !r.layers[(size_t)layer + 1].first_known) return lost();
+    const std::vector<std::pair<uint32_t, uint32_t>> opening = r.layers[(size_t)layer + 1].first;
+    tt = Timing::now();
+    if (!r.attn_norm[(size_t)layer + 1].data)
+        r.attn_norm[(size_t)layer + 1] = engine.raw("blk." + std::to_string(layer + 1) + ".attn_norm.weight");
+    const float * normal = engine.normed_direct(r.attn_norm[(size_t)layer + 1], next.data(), k, r.scratch);
+    r.norm_ns += Timing::now() - tt;
+    if (!normal || !all_finite(normal, k)) return lost();
+    const std::vector<float> in(normal, normal + k);
+    for (const auto & [id, with] : opening)
+        if (!ahead(id, with, in.data())) return lost();
+    r.h.swap(next);
+    r.layer = layer + 1;
+}
+
+// After a request the ordinary path computed (one row): learn the layer's shape from it, find the
+// stream at the first layer, and at the product only the client could ask for, start the chain.
+void residual_after(Session & s, Engine & engine, Ahead & ahead_thread, uint32_t id, uint32_t pair, uint64_t m,
+                    const float * x, const float * y) {
+    if (!s.residual) return;
+    Residual & r = *s.residual;
+    if (r.strikes >= kResidualStrikes) return;
+    const Where at = where_is(ggml_get_name(s.slots[id].w));
+    static int said = 0;
+    static const bool loud = std::getenv("SHIELD_Q8_RESIDUAL_DEBUG") != nullptr;
+    if (loud && said < 40) {
+        ++said;
+        std::fprintf(stderr, "[residual] %s m=%llu part=%d layer=%d last=%d valid=%d at=%d\n", ggml_get_name(s.slots[id].w),
+                     (unsigned long long)m, (int)at.part, at.layer, engine.last_layer(), (int)r.valid, r.layer);
+    }
+    if (m != 1 || at.part == Part::None || at.layer > engine.last_layer()) {
+        r.valid = false;
+        return;
+    }
+    const size_t k = s.slots[id].k;
+    if (at.part == Part::Head) {
+        r.head = id;
+        r.valid = false;
+        return;
+    }
+    if (r.layers.size() <= (size_t)at.layer) r.layers.resize((size_t)at.layer + 1);
+    Residual::Layer & layer = r.layers[(size_t)at.layer];
+    switch (at.part) {
+    case Part::First:
+        if (!layer.first_known) layer.first.emplace_back(id, pair);
+        if (at.layer == 0) {
+            r.valid = engine.embedding_for(engine.raw("blk.0.attn_norm.weight"), x, k, r.h);
+            r.layer = 0;
+            if (loud && said < 60) { ++said; std::fprintf(stderr, "[residual] embedding found=%d\n", (int)r.valid); }
+        } else {
+            r.valid = false;
+        }
+        break;
+    case Part::Mixed:
+        layer.first_known = !layer.first.empty();
+        if (r.valid && r.layer == at.layer && !r.h.empty() && s.slots[id].n == r.h.size() && pair == kNoPair) {
+            const size_t width = r.h.size();
+            r.mid.resize(width);
+            for (size_t i = 0; i < width; ++i) r.mid[i] = y[i] + r.h[i];
+            {
+                std::lock_guard lock(r.mutex);
+                r.running = true;
+                r.cancel = false;
+            }
+            const int now = at.layer;
+            if (s.from_mail) r.pending = now;
+            else ahead_thread.post([&s, &engine, now] { residual_chain(s, engine, now); });
+        } else {
+            r.valid = false;
+        }
+        break;
+    case Part::Gate:
+        for (const uint32_t one : {id, pair})
+            if (one != kNoPair && layer.gate[0] != one && layer.gate[1] != one)
+                layer.gate[layer.gate[0] == kNoPair ? 0 : 1] = one;
+        r.valid = false;
+        break;
+    case Part::Down:
+        layer.down = id;
+        r.valid = false;
+        break;
+    default:
+        r.valid = false;
+    }
+}
+
 void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool mailed = false) {
     Frame f{};
     s.from_mail = mailed;
@@ -1645,6 +2313,16 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
         const uint64_t m = f.a;
         if (m == 0 || m > kMaxRows || m * slot.k * 4 > kMaxPayload || m * slot.n * 4 > kMaxPayload)
             throw Drop{"unsupported geometry"};
+        static const bool residual = [] {
+            const char * value = std::getenv("SHIELD_Q8_RESIDUAL");
+            return value && std::strcmp(value, "0") != 0;
+        }();
+        if (residual && !s.residual) s.residual = std::make_unique<Residual>();
+        if (residual_offer(s, f.id, extra.pair, m)) {
+            s.held.valid = false;
+            s.last.valid = false;
+            return;
+        }
         struct { Frame f; uint64_t exchanges, macs; } r{{kMatmulShared, f.id, kUnsupported, 0}, 0, 0};
         if (third != kNoPair && third < s.slots.size() && extra.pair < s.slots.size() && s.slots[third].w &&
                 s.slots[extra.pair].w && third != f.id && third != extra.pair && extra.pair != f.id &&
@@ -1707,6 +2385,8 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             r.f.b = 1;
             r.exchanges = out.exchanges;
             r.macs = out.macs;
+            residual_after(s, engine, ahead_thread, f.id, extra.pair, m, static_cast<const float *>(both->x->data),
+                           static_cast<const float *>(both->y[0]->data));
         } else {
             Product & p = engine.product(slot.w, slot.k, slot.n, m);
             std::memcpy(p.x->data, s.shared.base, p.input_bytes);
@@ -1717,6 +2397,8 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
                 r.f.a = kOk;
                 r.exchanges = out.exchanges;
                 r.macs = out.macs;
+                residual_after(s, engine, ahead_thread, f.id, kNoPair, m, static_cast<const float *>(p.x->data),
+                               static_cast<const float *>(p.y->data));
             }
         }
         if (both) {
@@ -1755,6 +2437,10 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
         }();
         if (inline_ahead && both && s.from_mail && f.id < s.chains.size() && s.chains[f.id].next != kNoPair)
             chain_ahead(s, engine, f.id, extra.pair, m, *both);
+        if (s.residual && s.residual->pending >= 0) {
+            const int layer = std::exchange(s.residual->pending, -1);
+            residual_chain(s, engine, layer);
+        }
         return;
     }
     if (f.type != kMatmul || f.id >= s.slots.size() || !s.slots[f.id].w || f.b != 0) throw Drop{"invalid frame"};
@@ -1910,6 +2596,26 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
             do ready = poll(fds.data(), fds.size(), -1); while (ready < 0 && errno == EINTR);
         if (ready < 0 && errno == EINTR) continue;
         if (ready < 0) retire("poll failed");
+        // A request the residual chain has the answer to, or is computing it, does not need the engine:
+        // it is answered while the chain goes on. Only when nothing else is waiting.
+        if (!fds[0].revents && !fds[1].revents) {
+            bool rest = false, dropped = false;
+            for (size_t i = 0; i < sessions.size() && !dropped; ++i) {
+                if (!fds[2 + i].revents) continue;
+                try {
+                    if (residual_serve(sessions[i])) fds[2 + i].revents = 0;
+                    else rest = true;
+                } catch (const Drop & drop) {
+                    if (std::strcmp(drop.why, "client closed"))
+                        std::fprintf(stderr, "[q8-executor] session dropped: %s\n", drop.why);
+                    ahead.wait();
+                    close(sessions[i].fd);
+                    sessions.erase(sessions.begin() + (ptrdiff_t)i);
+                    dropped = true;
+                }
+            }
+            if (dropped || !rest) continue;
+        }
         // Whatever follows may use the engine or change the sessions.
         ahead.wait();
 
