@@ -1746,6 +1746,15 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
         answer(&r, sizeof r);
         if (timing.enabled) { timing.replied = Timing::now(); timing.was_pair = both != nullptr; }
         if (timing.enabled && timing.seen > timing.skip) timing.request_ns += Timing::now() - t0;
+        // EXPERIMENT (SHIELD_Q8_AHEAD_INLINE=1). For a mailed pair whose continuation is known, this thread
+        // computes it itself as soon as the pair is answered, while the client gates the pair on the
+        // other hardware thread of the core. No hand-off and nothing leaves the core's cache.
+        static const bool inline_ahead = [] {
+            const char * value = std::getenv("SHIELD_Q8_AHEAD_INLINE");
+            return value && std::strcmp(value, "0") != 0;
+        }();
+        if (inline_ahead && both && s.from_mail && f.id < s.chains.size() && s.chains[f.id].next != kNoPair)
+            chain_ahead(s, engine, f.id, extra.pair, m, *both);
         return;
     }
     if (f.type != kMatmul || f.id >= s.slots.size() || !s.slots[f.id].w || f.b != 0) throw Drop{"invalid frame"};

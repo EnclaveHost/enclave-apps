@@ -710,6 +710,15 @@ alternating rounds. The native engine in those rounds: 16.14, 15.51, 16.00 and
 17.16, 19.16, 16.18. Binding the client's other engine threads to cores of
 their own made it slower (14.32, 13.90, 14.19 plain); they are left free.
 
+**The continuation on the serving thread** (`SHIELD_Q8_AHEAD_INLINE=1`). For a
+mailed pair whose continuation is known, the serving thread computes the down
+projection itself as soon as it has answered the pair, while the client gates
+the pair on the core's other hardware thread: no hand-off, nothing leaves the
+cache. OpenCL route on the quiet core, alternating rounds: 14.81, 14.62, 14.75
+plain and 14.48, 15.55, 16.27 drafting with it, 14.55, 14.90, 14.19 and 14.95,
+14.07, 14.59 without; the native engine 15.26, 15.71, 15.19 and 17.61, 16.78,
+17.42. A little, and more with two rows.
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have
