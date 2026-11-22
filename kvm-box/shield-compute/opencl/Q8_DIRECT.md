@@ -700,6 +700,16 @@ with it (17.0): a two-row round doubles every copy in and out of device
 buffers, and the round costs the route 1.69 of its token against 1.5 for the
 native engine.
 
+**Which core.** The two threads cannot leave their core when something else is
+scheduled on it, so the choice matters on a shared host. On a core whose
+hardware threads were 2 to 4% busy before the run, the OpenCL route (mailbox,
+direct buffers, work buffers in memory, triples) measured 14.95, 15.19, 14.66
+plain and 15.69, 15.84, 14.79 drafting; on the one used for the tables above,
+9 and 20% busy, 14.88, 14.27, 14.42 and 14.16, 14.43, 13.49 in the same
+alternating rounds. The native engine in those rounds: 16.14, 15.51, 16.00 and
+17.16, 19.16, 16.18. Binding the client's other engine threads to cores of
+their own made it slower (14.32, 13.90, 14.19 plain); they are left free.
+
 Not done: the backend aborts if the service refuses a product in the middle of
 a run or says goodbye (the frontend reconnects and falls back); the executor
 takes the processor number from its environment, which the service would have
