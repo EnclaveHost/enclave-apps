@@ -893,6 +893,34 @@ run's phases and differed by 5 to 12 us with nothing switched. Arenas: 3.3,
   holds: the time in `clSetKernelArg` did not move (0.14 to 0.16 us a call),
   the runtime's part of it is small.
 
+### The sentinel, written while the serving thread waits
+
+Before the backend computes an output the executor makes every value of it a
+NaN, so that an output the backend did not write fails the finite check. Timed
+inside the pair path at one row: 10.3 us for the sentinel of a feed-forward
+pair of the 27B (139 KB whose lines are in another core's cache or the third
+level), 4.6 for the checked copy out, 0.6 and 0.7 for the two counter reads.
+The sentinel is the same check as before, written at another time: a mailed
+session's serving thread has nothing to do between its answer and the next
+request, so it puts the sentinel back then, one product at a time, into
+outputs no session can still read (not a pair a session may yet gate, nor a
+product held for one). A compute that finds it there does not write it again;
+one that does not, writes it as before. `SHIELD_Q8_IDLE_SENTINEL=0` turns it
+off. The executor's time around the backend, a compute: 8.6, 8.3, 8.7 us with
+it against 16.3, 16.1, 16.1 without, in alternating runs, and the backend's
+own time no different (195, 186, 202 against 188, 205, 189).
+
+With it, 300 tokens alternating with the native engine in the image: drafting
+15.82, 16.08, 15.78 against 16.26, 16.01, 16.37 (98%); plain 15.38, 15.24,
+15.35 against 15.85, 15.70, 15.65 (97%). What is left is in the two-row
+verify step, 108.2 ms a round against 103.9; the draft step is shorter on the
+route (8.2 against 10.1).
+
+Waiting for the reply with MONITORX/MWAITX in place of the pause loop, so that
+the waiting thread leaves the core to the executor, switched in-run: 0.5 and
+0.2 us a launch worse of 211, with 1.3 between the two states when nothing is
+switched. The pause loop is not what the executor loses time to.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route

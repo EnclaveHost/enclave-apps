@@ -52,6 +52,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <deque>
 
 static_assert(GGML_MAX_NAME == 128, "build with the SDK's GGML_MAX_NAME=128");
 static_assert(std::endian::native == std::endian::little, "wire format is little-endian f32");
@@ -693,6 +694,7 @@ struct Product {
     size_t input_bytes = 0, output_bytes = 0;
     bool supported = false;
     uint64_t stamp = 0;  // changes whenever x or y may have changed
+    bool poisoned = false;  // y holds the sentinel (see Engine::poison_idle)
 };
 
 // Optional aggregate timing (SHIELD_Q8_EXECUTOR_TIMING=1): counts and
@@ -778,6 +780,7 @@ public:
         p.output_bytes = m * n * 4;
         // Keep the retained scratch bounded; a full cache is simply rebuilt.
         if (retained_ + p.input_bytes + p.output_bytes > kMaxRetained) {
+            dirty_.clear();
             products_.clear();
             pairs_.clear();
             retained_ = 0;
@@ -812,6 +815,7 @@ public:
         Outcome out;
         if (!p.supported) return out;
         ++p.stamp;
+        const bool sentinel = std::exchange(p.poisoned, false);
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
         // Session products only: the line protocol reports the backend's own
         // accounting for every product.
@@ -829,7 +833,7 @@ public:
         }
         const uint64_t missed = watch ? pads_missed() : 0;
         // NaN sentinel: an output the backend never wrote fails the finite check.
-        std::fill_n(static_cast<float *>(p.y->data), m * n, std::nanf(""));
+        if (!sentinel) std::fill_n(static_cast<float *>(p.y->data), m * n, std::nanf(""));
         const Counters before = Counters::read();
         if (before.failures != 0) retire("backend has verification failures");
         const uint64_t t1 = timing.enabled ? Timing::now() : 0;
@@ -872,6 +876,7 @@ public:
             timing.exchanged += d.exchanges != 0;
         }
         ++completed_;
+        dirty_.push_back({&p, {static_cast<float *>(p.y->data), nullptr, nullptr}, {m * n, 0, 0}, &p.poisoned, &p.stamp, p.stamp});
         return out;
     }
 
@@ -890,6 +895,7 @@ public:
         ggml_cgraph * glue[2] = {nullptr, nullptr};
         uint64_t stamp = 0;  // changes with every compute
         PadStock pads;
+        bool poisoned = false;
     };
 
     // EXPERIMENT. Three weights applied to one activation (attention's q, k and v) in one graph, so that
@@ -900,7 +906,40 @@ public:
         ggml_tensor * x = nullptr, * y[3] = {nullptr, nullptr, nullptr};
         ggml_cgraph * graph = nullptr;
         size_t input_bytes = 0, output_bytes[3] = {0, 0, 0};
+        uint64_t stamp = 0;
+        bool poisoned = false;
     };
+
+    // The sentinel. Before the backend computes an output every value of it is made a NaN, so that an
+    // output the backend did not write fails the finite check. That is a pass over memory the request then
+    // waits for (10 us for a feed-forward pair of the 27B). A mailed session's serving thread has nothing
+    // to do between its answer and the next request, so the outputs of products that were computed are
+    // made NaNs again then, one at a time, and a compute finds its sentinel already there. An output a
+    // session may still read (a pair it may gate, a product held for it) is left until it is not.
+    struct Dirty {
+        const void * owner;
+        float * y[3];
+        size_t n[3];
+        bool * poisoned;
+        const uint64_t * stamp;
+        uint64_t at;
+    };
+    template <class Referenced> bool poison_idle(Referenced && referenced) {
+        while (!dirty_.empty()) {
+            const Dirty d = dirty_.front();
+            if (*d.stamp != d.at || *d.poisoned) {  // computed again since
+                dirty_.pop_front();
+                continue;
+            }
+            if (referenced(d.owner)) return false;
+            dirty_.pop_front();
+            for (int i = 0; i < 3; ++i)
+                if (d.y[i]) std::fill_n(d.y[i], d.n[i], std::nanf(""));
+            *d.poisoned = true;
+            return true;
+        }
+        return false;
+    }
 
     Triple * triple(ggml_tensor * const w[3], uint64_t k, const uint64_t n[3], uint64_t m) {
         const auto key = std::make_tuple(w[0], w[1], w[2], m);
@@ -910,7 +949,10 @@ public:
         p.input_bytes = m * k * 4;
         size_t bytes = p.input_bytes;
         for (int i = 0; i < 3; ++i) bytes += p.output_bytes[i] = m * n[i] * 4;
-        if (triples_.size() >= 256) triples_.clear();
+        if (triples_.size() >= 256) {
+            dirty_.clear();
+            triples_.clear();
+        }
         const size_t mem = 12 * ggml_tensor_overhead() + ggml_graph_overhead_custom(kGraphNodes, false) + bytes + (64u << 10);
         p.ctx.reset(ggml_init(ggml_init_params{mem, nullptr, false}));
         if (!p.ctx) retire("graph context allocation failed");
@@ -939,7 +981,9 @@ public:
     // All three products, or a retirement. The input is in p.x->data, checked finite.
     Outcome compute(Triple & p, uint64_t k, const uint64_t n[3], uint64_t m, unsigned char * const to[3]) {
         Outcome out;
-        for (int i = 0; i < 3; ++i) std::fill_n(static_cast<float *>(p.y[i]->data), m * n[i], std::nanf(""));
+        ++p.stamp;
+        if (!std::exchange(p.poisoned, false))
+            for (int i = 0; i < 3; ++i) std::fill_n(static_cast<float *>(p.y[i]->data), m * n[i], std::nanf(""));
         const Counters before = Counters::read();
         if (before.failures != 0) retire("backend has verification failures");
         if (ggml_backend_graph_compute(backend_.backend, p.graph) != GGML_STATUS_SUCCESS) retire("backend compute failed");
@@ -958,6 +1002,8 @@ public:
             retire("invalid verified accounting");
         for (int i = 0; i < 3; ++i)
             if (!copy_finite(to[i], static_cast<const float *>(p.y[i]->data), m * n[i])) retire("non-finite output");
+        dirty_.push_back({&p, {static_cast<float *>(p.y[0]->data), static_cast<float *>(p.y[1]->data),
+                               static_cast<float *>(p.y[2]->data)}, {m * n[0], m * n[1], m * n[2]}, &p.poisoned, &p.stamp, p.stamp});
         out.supported = true;
         out.exchanges = d.exchanges;
         out.macs = d.macs;
@@ -975,6 +1021,7 @@ public:
         p.output_bytes[1] = m * n2 * 4;
         const size_t bytes = p.input_bytes + p.output_bytes[0] + p.output_bytes[1];
         if (retained_ + bytes > kMaxRetained) {
+            dirty_.clear();
             products_.clear();
             pairs_.clear();
             retained_ = 0;
@@ -1036,6 +1083,7 @@ public:
     Outcome compute(Pair & p, uint64_t k, uint64_t n1, uint64_t n2, uint64_t m, unsigned char * const to[2]) {
         Outcome out;
         ++p.stamp;
+        const bool sentinel = std::exchange(p.poisoned, false);
         const uint64_t t0 = timing.enabled ? Timing::now() : 0;
         const bool watch = m == 1;
         const uint64_t w0 = watch ? PadStock::now() : 0;
@@ -1051,8 +1099,10 @@ public:
             return out;
         }
         const uint64_t missed = watch ? pads_missed() : 0;
-        std::fill_n(static_cast<float *>(p.y[0]->data), m * n1, std::nanf(""));
-        std::fill_n(static_cast<float *>(p.y[1]->data), m * n2, std::nanf(""));
+        if (!sentinel) {
+            std::fill_n(static_cast<float *>(p.y[0]->data), m * n1, std::nanf(""));
+            std::fill_n(static_cast<float *>(p.y[1]->data), m * n2, std::nanf(""));
+        }
         const Counters before = Counters::read();
         if (before.failures != 0) retire("backend has verification failures");
         const uint64_t t1 = timing.enabled ? Timing::now() : 0;
@@ -1095,6 +1145,8 @@ public:
             timing.exchanged += d.exchanges != 0;
         }
         completed_ += 2;
+        dirty_.push_back({&p, {static_cast<float *>(p.y[0]->data), static_cast<float *>(p.y[1]->data), nullptr},
+                          {m * n1, m * n2, 0}, &p.poisoned, &p.stamp, p.stamp});
         return out;
     }
 
@@ -1236,6 +1288,7 @@ private:
     std::map<std::tuple<ggml_tensor *, ggml_tensor *, uint64_t>, Pair> pairs_;
     std::map<std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *, uint64_t>, Triple> triples_;
     uint64_t generation_ = 0;
+    std::deque<Dirty> dirty_;
     ggml_backend_t cpu_ = nullptr;
     bool cpu_tried_ = false;
     size_t retained_ = 0;
@@ -1451,6 +1504,8 @@ public:
         }
         wake_.notify_one();
     }
+
+    bool idle() const { return !busy_.load(std::memory_order_acquire); }
 
     // Returns once no job is running; rethrows what the last one threw.
     void wait() {
@@ -1947,7 +2002,21 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
             const uint64_t until = Timing::now() + watch_ns;
             Session * posted = nullptr;
             unsigned turn = 0;
+            // Nothing to serve: put the sentinel back in outputs no session reads any more, one product
+            // at a time so that a request waits for at most one. SHIELD_Q8_IDLE_SENTINEL=0 leaves it to
+            // the compute that needs it.
+            static const bool idle_sentinel = [] {
+                const char * value = std::getenv("SHIELD_Q8_IDLE_SENTINEL");
+                return !value || std::strcmp(value, "0") != 0;
+            }();
+            const auto read_by_a_session = [&sessions](const void * owner) {
+                for (const Session & one : sessions)
+                    if ((one.last.valid && one.last.pair == owner) || (one.held.valid && one.held.product == owner))
+                        return true;
+                return false;
+            };
             while (!(posted = mailed())) {
+                if (idle_sentinel && ahead.idle() && engine.poison_idle(read_by_a_session)) continue;
                 __builtin_ia32_pause();
                 if ((++turn & 63) == 0) {
                     ready = poll(fds.data(), fds.size(), 0);
