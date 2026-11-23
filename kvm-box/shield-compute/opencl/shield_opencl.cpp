@@ -1923,6 +1923,7 @@ struct FileBacking { void *base; size_t size; };
 void CL_CALLBACK file_backing_ended(cl_mem buffer, void *data) {
   auto *backing = static_cast<FileBacking *>(data);
   { std::lock_guard lock(file_backed_mutex); file_backed.erase(buffer); }
+  { std::lock_guard lock(q8_arena_mutex); q8_arena_buffers.erase(buffer); }
   munmap(backing->base, backing->size);
   delete backing;
 }
@@ -1935,15 +1936,22 @@ CL_API_ENTRY cl_mem CL_API_CALL clCreateBuffer(cl_context context, cl_mem_flags 
     const long megabytes = value ? std::atol(value) : 64;
     return (size_t)(megabytes > 0 ? megabytes : 64) << 20;
   }();
-  if (!dir || !*dir || host || size < least ||
-      (flags & (CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR | CL_MEM_COPY_HOST_PTR)))
-    return REAL(clCreateBuffer)(context, flags, size, host, error);
+  const bool plain = !host && !(flags & (CL_MEM_USE_HOST_PTR | CL_MEM_ALLOC_HOST_PTR | CL_MEM_COPY_HOST_PTR));
+  const bool to_file = plain && dir && *dir && size >= least;
+  // A smaller buffer gets page-aligned memory of this library's, which an arena of the executor's can
+  // later take the place of (see q8_arena_share in q8_direct.inc).
+  const bool to_arena = plain && !to_file && q8_arena_enabled() && size >= (size_t(1) << 20) && size <= (size_t(1) << 30);
+  if (!to_file && !to_arena) return REAL(clCreateBuffer)(context, flags, size, host, error);
   const size_t mapped = (size + 4095) & ~(size_t)4095;
-  const int fd = open(dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
   void *base = MAP_FAILED;
-  if (fd >= 0 && ftruncate(fd, (off_t)mapped) == 0)
-    base = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (fd >= 0) close(fd);
+  if (to_file) {
+    const int fd = open(dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    if (fd >= 0 && ftruncate(fd, (off_t)mapped) == 0)
+      base = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (fd >= 0) close(fd);
+  } else {
+    base = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  }
   if (base == MAP_FAILED) return REAL(clCreateBuffer)(context, flags, size, host, error);
   cl_int status = CL_SUCCESS;
   cl_mem buffer = REAL(clCreateBuffer)(context, flags | CL_MEM_USE_HOST_PTR, size, base, &status);
@@ -1955,6 +1963,10 @@ CL_API_ENTRY cl_mem CL_API_CALL clCreateBuffer(cl_context context, cl_mem_flags 
     return REAL(clCreateBuffer)(context, flags, size, host, error);
   }
   { std::lock_guard lock(file_backed_mutex); file_backed.insert(buffer); }
+  if (to_arena) {
+    std::lock_guard lock(q8_arena_mutex);
+    q8_arena_buffers[buffer] = {static_cast<unsigned char *>(base), mapped, 0, 0};
+  }
   if (error) *error = status;
   return buffer;
 }
@@ -1977,7 +1989,7 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseMemObject(cl_mem object) {
   // Remembered identities hold their own reference, so a handle cannot be
   // recycled under them; an application release simply ends the memory.
   q8_written(object);
-  q8_epoch.fetch_add(1, std::memory_order_release);
+  if (object) q8_release_count(object).fetch_add(1, std::memory_order_release);
   cl_uint references = 0;
   if (object && !REAL(clGetMemObjectInfo)(object, CL_MEM_REFERENCE_COUNT, sizeof(references),
                                          &references, nullptr) && references <= 1) {

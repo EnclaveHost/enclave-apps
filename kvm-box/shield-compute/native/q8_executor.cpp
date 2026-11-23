@@ -1282,7 +1282,7 @@ void serve_stdin(Input & in, const std::string & line, int out_fd, Engine & engi
 // refuses that session only: nothing protected has started. Backend, model and
 // accounting failures still retire the whole process.
 
-constexpr uint32_t kOpen = 1, kMatmul = 2, kShare = 3, kMatmulShared = 4, kMail = 5, kWake = 6, kBye = 0xff;
+constexpr uint32_t kOpen = 1, kMatmul = 2, kShare = 3, kMatmulShared = 4, kMail = 5, kWake = 6, kArena = 7, kBye = 0xff;
 // EXPERIMENT (SHIELD_Q8_MAILBOX=1). A shared-memory request posted in the last bytes of a session's shared
 // memory, for a client and executor that are both awake: the client writes the request and adds one to
 // `request`, the executor answers in place and makes `reply` equal to it, and neither enters the kernel.
@@ -1294,7 +1294,17 @@ struct Mail {
     uint32_t status, paired;
     uint64_t exchanges, macs;
     uint32_t third, reserved;  // third: a second partner's slot plus one, 0 for none
+    // EXPERIMENT (kArena). Where the activation is read and the first product written when not in the
+    // first two regions: an arena's index plus one (0: the region) and a byte offset in it.
+    uint32_t in_arena, out_arena;
+    uint64_t in_offset, out_offset;
 };
+// EXPERIMENT (kArena). More shared memory for a session, made and sealed here like the regions and handed
+// to the client, which may put the buffers of its application in it. A mailed request can then name a
+// place in an arena for its activation or its first product, and those bytes are not copied between the
+// application's buffer and the regions. The rules for the regions hold: an activation is copied out of
+// the arena before it is checked, and a product is copied in only after it has been checked.
+constexpr size_t kMaxArenas = 4, kMaxArena = size_t(1) << 30;
 // Shared regions, kMaxPayload bytes each: activation, product, paired product.
 constexpr size_t kRegions = 4;  // activation, product, a paired product, a third
 constexpr uint32_t kNoPair = 0xffffffff;
@@ -1339,10 +1349,27 @@ struct Chain {
 };
 constexpr uint8_t kChainStrikes = 3;
 
+struct Arena {
+    unsigned char * base = nullptr;
+    size_t size = 0;
+    Arena() = default;
+    Arena(unsigned char * b, size_t n) : base(b), size(n) {}
+    Arena(Arena && other) noexcept : base(other.base), size(other.size) { other.base = nullptr; }
+    Arena & operator=(Arena && other) noexcept {
+        std::swap(base, other.base);
+        std::swap(size, other.size);
+        return *this;
+    }
+    ~Arena() {
+        if (base) munmap(base, size);
+    }
+};
+
 struct Session {
     int fd = -1;
     std::vector<Slot> slots;
     Shared shared;
+    std::vector<Arena> arenas;
     bool mail = false;        // the client asked to use the mailbox
     bool from_mail = false;   // the request being served came from it
     uint32_t mail_seen = 0;
@@ -1542,6 +1569,7 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             mail->request.store(0);
             mail->reply.store(0);
             mail->sleeping.store(0);
+            mail->in_arena = mail->out_arena = 0;
             s.mail_seen = 0;
             s.mail = true;
             r.a = kOk;
@@ -1570,6 +1598,47 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             r.a = kOk;
         }
         session_write(s.fd, &r, sizeof r);
+        return;
+    }
+    if (f.type == kArena) {
+        // a and b: the size, low and high half. Refused (a = 1) without the regions, out of order, or
+        // beyond the limits; the client then keeps using the regions.
+        Frame r{kArena, f.id, 1, 0};
+        const size_t size = ((size_t)f.b << 32) | f.a;
+        int fd = -1;
+        if (s.shared.base && f.id == s.arenas.size() && f.id < kMaxArenas && size >= 4096 && size <= kMaxArena &&
+                size % 4096 == 0) {
+#ifdef MFD_NOEXEC_SEAL
+            fd = memfd_create("shield-q8-arena", MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL);
+            if (fd < 0)  // a kernel without the flag
+#endif
+            fd = memfd_create("shield-q8-arena", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+            void * base = MAP_FAILED;
+            if (fd >= 0 && ftruncate(fd, (off_t)size) == 0 &&
+                    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) == 0)
+                base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (base != MAP_FAILED) {
+                s.arenas.emplace_back(static_cast<unsigned char *>(base), size);
+                r.a = kOk;
+            } else if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
+        }
+        char cbuf[CMSG_SPACE(sizeof(int))] = {};
+        iovec iov{&r, sizeof r};
+        msghdr msg{};
+        msg.msg_iov = &iov; msg.msg_iovlen = 1;
+        if (fd >= 0) {
+            msg.msg_control = cbuf; msg.msg_controllen = sizeof cbuf;
+            cmsghdr * c = CMSG_FIRSTHDR(&msg);
+            c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(c), &fd, sizeof(int));
+        }
+        ssize_t sent;
+        do sent = sendmsg(s.fd, &msg, MSG_NOSIGNAL); while (sent < 0 && errno == EINTR);
+        if (fd >= 0) close(fd);
+        if (sent != (ssize_t)sizeof r) throw Drop{"write stalled"};
         return;
     }
     if (f.type == kShare) {
@@ -1645,6 +1714,27 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
         const uint64_t m = f.a;
         if (m == 0 || m > kMaxRows || m * slot.k * 4 > kMaxPayload || m * slot.n * 4 > kMaxPayload)
             throw Drop{"unsupported geometry"};
+        // Where the activation is and where the first product goes: the regions, or for a mailed request
+        // a place in an arena. Each field is read once; the client can write the mailbox at any time.
+        const unsigned char * in = s.shared.base;
+        unsigned char * out0 = s.shared.base + kMaxPayload;
+        if (s.from_mail) {
+            const Mail * mail = s.mailbox();
+            const uint32_t in_arena = mail->in_arena, out_arena = mail->out_arena;
+            const uint64_t in_offset = mail->in_offset, out_offset = mail->out_offset;
+            if (in_arena) {
+                if (in_arena > s.arenas.size()) throw Drop{"invalid arena"};
+                const Arena & arena = s.arenas[in_arena - 1];
+                if (in_offset > arena.size || m * slot.k * 4 > arena.size - in_offset) throw Drop{"invalid arena range"};
+                in = arena.base + in_offset;
+            }
+            if (out_arena) {
+                if (out_arena > s.arenas.size()) throw Drop{"invalid arena"};
+                const Arena & arena = s.arenas[out_arena - 1];
+                if (out_offset > arena.size || m * slot.n * 4 > arena.size - out_offset) throw Drop{"invalid arena range"};
+                out0 = arena.base + out_offset;
+            }
+        }
         struct { Frame f; uint64_t exchanges, macs; } r{{kMatmulShared, f.id, kUnsupported, 0}, 0, 0};
         if (third != kNoPair && third < s.slots.size() && extra.pair < s.slots.size() && s.slots[third].w &&
                 s.slots[extra.pair].w && third != f.id && third != extra.pair && extra.pair != f.id &&
@@ -1653,9 +1743,9 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             ggml_tensor * const w[3] = {slot.w, s.slots[extra.pair].w, s.slots[third].w};
             const uint64_t n[3] = {slot.n, s.slots[extra.pair].n, s.slots[third].n};
             if (Engine::Triple * all = engine.triple(w, slot.k, n, m)) {
-                std::memcpy(all->x->data, s.shared.base, all->input_bytes);
+                std::memcpy(all->x->data, in, all->input_bytes);
                 if (!all_finite(static_cast<const float *>(all->x->data), m * slot.k)) throw Drop{"non-finite input"};
-                unsigned char * const to[3] = {s.shared.base + kMaxPayload, s.shared.base + 2 * kMaxPayload,
+                unsigned char * const to[3] = {out0, s.shared.base + 2 * kMaxPayload,
                                                s.shared.base + 3 * kMaxPayload};
                 s.held.valid = false;
                 s.last.valid = false;
@@ -1673,8 +1763,8 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             Product * ahead = s.held.product;
             if (s.held.generation == engine.generation() && ahead->stamp == s.held.stamp && s.held.w == slot.w &&
                     s.held.m == m && extra.pair == kNoPair && ahead->input_bytes == m * slot.k * 4 &&
-                    !std::memcmp(s.shared.base, ahead->x->data, ahead->input_bytes)) {
-                std::memcpy(s.shared.base + kMaxPayload, ahead->y->data, ahead->output_bytes);
+                    !std::memcmp(in, ahead->x->data, ahead->input_bytes)) {
+                std::memcpy(out0, ahead->y->data, ahead->output_bytes);
                 r.f.a = kOk;
                 r.exchanges = s.held.out.exchanges;
                 r.macs = s.held.out.macs;
@@ -1698,9 +1788,9 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             both = engine.pair(slot.w, s.slots[extra.pair].w, slot.k, slot.n, s.slots[extra.pair].n, m);
         if (both) {
             const Slot & second = s.slots[extra.pair];
-            std::memcpy(both->x->data, s.shared.base, both->input_bytes);
+            std::memcpy(both->x->data, in, both->input_bytes);
             if (!all_finite(static_cast<const float *>(both->x->data), m * slot.k)) throw Drop{"non-finite input"};
-            unsigned char * const to[2] = {s.shared.base + kMaxPayload, s.shared.base + 2 * kMaxPayload};
+            unsigned char * const to[2] = {out0, s.shared.base + 2 * kMaxPayload};
             s.last.valid = false;
             const Outcome out = engine.compute(*both, slot.k, slot.n, second.n, m, to);
             r.f.a = kOk;
@@ -1709,10 +1799,10 @@ void session_request(Session & s, Engine & engine, Ahead & ahead_thread, bool ma
             r.macs = out.macs;
         } else {
             Product & p = engine.product(slot.w, slot.k, slot.n, m);
-            std::memcpy(p.x->data, s.shared.base, p.input_bytes);
+            std::memcpy(p.x->data, in, p.input_bytes);
             if (!all_finite(static_cast<const float *>(p.x->data), m * slot.k)) throw Drop{"non-finite input"};
             chain_learn(s, engine, f.id, m, p.x->data, p.input_bytes);
-            const Outcome out = engine.compute(p, slot.k, slot.n, m, s.shared.base + kMaxPayload, true);
+            const Outcome out = engine.compute(p, slot.k, slot.n, m, out0, true);
             if (out.supported) {
                 r.f.a = kOk;
                 r.exchanges = out.exchanges;

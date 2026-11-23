@@ -61,9 +61,17 @@ std::atomic<size_t> q8_known_count{0};
 // tensors only when it is to one of these roots: an application writes its activations hundreds of times
 // a token, to buffers that hold no weights, and every such write used to walk the whole list.
 std::unordered_map<cl_mem, unsigned> q8_known_roots;
-// Moves whenever a remembered launch may no longer describe what the application would launch: a memory
-// object was released (its handle may come back as another object) or a remembered tensor was forgotten.
+// Moves whenever a remembered tensor is forgotten: what a launch was found to be may then not hold.
 std::atomic<uint64_t> q8_epoch{1};
+// Releases of memory objects, counted in a table by handle. A handle may come back as another object once
+// it has been released, so whatever was learned about a handle holds only while its count stands still.
+// (An application releases objects all the time, a temporary sub-buffer for a launch for one; a single
+// count for all of them would make everything learned stale at every release.)
+std::array<std::atomic<uint32_t>, 4096> q8_released{};
+inline std::atomic<uint32_t> &q8_release_count(cl_mem handle) {
+  const auto value = reinterpret_cast<uintptr_t>(handle);
+  return q8_released[((value >> 4) ^ (value >> 16)) & 4095];
+}
 size_t q8_known_hint = 0;  // where the last launch's tensor was found: launches come round in the same order
 
 bool q8_direct_shared_enabled() {
@@ -108,13 +116,22 @@ void q8_forget_locked(const Q8Region &written) {
   }
   q8_known_count.store(q8_known.size(), std::memory_order_release);
 }
+// The activation of the last request that was read where it lies in an arena (see q8_arena_share), until
+// something may have written it: a later launch on the same place then has the same activation without
+// its bytes being compared. Guarded by q8_cache_mutex.
+Q8Region q8_placed_input{};
+std::atomic<bool> q8_placed_input_clean{false};
 // Something may write [offset, offset+size) of this buffer, sub-buffer or image.
 void q8_written(cl_mem handle, size_t offset, size_t size, bool whole) {
-  if (!handle || !q8_known_count.load(std::memory_order_acquire)) return;
+  const bool placed = q8_placed_input_clean.load(std::memory_order_acquire);
+  if (!handle || (!placed && !q8_known_count.load(std::memory_order_acquire))) return;
   std::lock_guard lock(q8_cache_mutex);
-  q8_forget_locked(q8_resolve(handle, offset, size, whole));
+  const Q8Region written = q8_resolve(handle, offset, size, whole);
+  if (placed && written.overlaps(q8_placed_input)) q8_placed_input_clean.store(false, std::memory_order_release);
+  q8_forget_locked(written);
 }
 void q8_written_everything() {
+  q8_placed_input_clean.store(false, std::memory_order_release);
   if (!q8_known_count.load(std::memory_order_acquire)) return;
   std::lock_guard lock(q8_cache_mutex);
   for (auto &known : q8_known) {
@@ -128,6 +145,7 @@ void q8_written_everything() {
 // An ordinary kernel may write any buffer it was given. `only` restricts that
 // to one argument for the Q8 kernels, whose other buffers are read-only inputs.
 void q8_kernel_may_write(cl_kernel kernel, int only = -1) {
+  q8_placed_input_clean.store(false, std::memory_order_release);
   if (!q8_known_count.load(std::memory_order_acquire)) return;
   std::vector<std::pair<cl_uint, cl_mem>> mems;
   {
@@ -413,6 +431,34 @@ void q8_local_product(const Q8Local &w, const float *x, float *y, size_t m) {
   }
 }
 
+// For measuring one experiment against its absence inside one run (SHIELD_OPENCL_Q8_AB=<name>): the named
+// experiment is switched on and off every so many launches and the time a launch
+// takes from one to the next is summed for each state and printed at exit. Runs differ by more than
+// most of these experiments gain; neighbouring stretches of one run do not.
+struct Q8AB {
+  const char *const name = std::getenv("SHIELD_OPENCL_Q8_AB");
+  // Launches in a stretch (SHIELD_OPENCL_Q8_AB_WINDOW). The default is one token of the 27B, so that the
+  // two states see the same mix of whatever the run goes through.
+  const uint64_t window = std::getenv("SHIELD_OPENCL_Q8_AB_WINDOW") ? std::strtoull(std::getenv("SHIELD_OPENCL_Q8_AB_WINDOW"), nullptr, 10) : 407;
+  bool on = false;
+  uint64_t launches = 0, last = 0, ns[2] = {}, counted[2] = {}, windows = 0;
+  bool is(const char *what) const { return name && !std::strcmp(name, what); }
+  void tick() {
+    if (!name || !window || ++launches % window) return;
+    const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    // The first windows are the load and the warm-up.
+    if (last && ++windows > 40) { ns[on] += now - last; counted[on] += window; }
+    on = !on;
+    last = now;
+  }
+  ~Q8AB() {
+    if (name)
+      std::fprintf(stderr, "[shield-opencl-timing] AB %s: off %.2f us a launch over %llu, on %.2f over %llu\n", name,
+                   counted[0] ? ns[0] / 1e3 / counted[0] : 0.0, (unsigned long long)counted[0],
+                   counted[1] ? ns[1] / 1e3 / counted[1] : 0.0, (unsigned long long)counted[1]);
+  }
+} q8_ab;
 // One session with the executor, shared by this process's launches.
 constexpr size_t Q8_SHARED_REGION = 64u << 20, Q8_SHARED_REGIONS = 4;
 constexpr uint32_t Q8_NO_PAIR = 0xffffffff;
@@ -426,6 +472,13 @@ struct Q8Mail {
   uint32_t status, paired;
   uint64_t exchanges, macs;
   uint32_t third, reserved;  // third: a second partner's slot plus one, 0 for none
+  uint32_t in_arena, out_arena;  // an arena's index plus one, 0 for the regions (see q8_arena_share)
+  uint64_t in_offset, out_offset;
+};
+// A place in a buffer of the application: its root and a byte offset in it.
+struct Q8Spot {
+  cl_mem root = nullptr;
+  size_t offset = 0;
 };
 struct Q8Session {
   int fd = -1;
@@ -442,7 +495,9 @@ struct Q8Session {
   // product is requested with the first and used only if the next launch asks
   // for exactly that tensor with exactly the same activation bytes.
   std::vector<uint32_t> pair_of;           // slot -> slot seen next with the same activation
-  std::vector<unsigned char> last_input;   // activation of the previous single-request launch
+  size_t last_bytes = 0;                   // size of the previous request's activation
+  bool last_placed = false;                // it was read in an arena (q8_placed_input), not copied to the first region
+  unsigned arenas = 0;                     // arenas the executor has made for this session
   uint32_t last_slot = Q8_NO_PAIR;
   size_t last_m = 0;
   bool last_valid = false, ready_valid = false;
@@ -464,6 +519,7 @@ struct Q8Session {
     pair_of.clear();
     third_of.clear();
     last_valid = ready_valid = ready2_valid = partner_served = false;
+    arenas = 0;
   }
 };
 std::mutex q8_direct_mutex;
@@ -478,7 +534,7 @@ const int q8_fork_guard = pthread_atfork(nullptr, nullptr, [] {
 struct Q8Frame {
   uint32_t type, id, a, b;
 };
-constexpr uint32_t Q8_OPEN = 1, Q8_MATMUL = 2, Q8_SHARE = 3, Q8_MATMUL_SHARED = 4, Q8_MAIL = 5, Q8_WAKE = 6, Q8_BYE = 0xff;
+constexpr uint32_t Q8_OPEN = 1, Q8_MATMUL = 2, Q8_SHARE = 3, Q8_MATMUL_SHARED = 4, Q8_MAIL = 5, Q8_WAKE = 6, Q8_ARENA = 7, Q8_BYE = 0xff;
 struct Q8Bye {};  // the executor stopped between requests; nothing was computed
 struct Q8SendFailed {};
 // After a failed send: whether the executor had already said goodbye. It
@@ -667,6 +723,89 @@ void q8_warm_once() {
     }
   });
 }
+// EXPERIMENT (SHIELD_OPENCL_Q8_ARENA=1, with the mailbox). A buffer the application created without host
+// memory, of a megabyte to a gigabyte, is given page-aligned memory of this library's instead of the
+// runtime's own (see clCreateBuffer). When a launch reads its activation from such a buffer or writes its
+// product to one, the executor is asked for an arena of the buffer's size: shared memory it makes and
+// seals as it does the regions. The buffer's bytes are copied into it and it is mapped where the buffer's
+// memory was, so the application and the runtime see the same bytes at the same address and the executor
+// sees them too. A request then names the place of its activation and of its first product in the
+// arena, and neither is copied between the buffer and the regions.
+struct Q8ArenaBuffer {
+  unsigned char *base = nullptr;
+  size_t size = 0;        // whole pages
+  uint64_t serial = 0;    // the session it was last offered to
+  uint32_t index = 0;     // its arena in that session plus one, 0: not shared
+};
+std::mutex q8_arena_mutex;
+std::unordered_map<cl_mem, Q8ArenaBuffer> q8_arena_buffers;
+bool q8_arena_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_ARENA");
+    return value && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+// The arena of this root in the current session, plus one; 0 when it has none. Called with a session
+// that has a mailbox, under q8_direct_mutex.
+uint32_t q8_arena_share(cl_mem root, unsigned char **base = nullptr) {
+  if (!root) return 0;
+  std::lock_guard lock(q8_arena_mutex);
+  auto found = q8_arena_buffers.find(root);
+  if (found == q8_arena_buffers.end()) return 0;
+  Q8ArenaBuffer &buffer = found->second;
+  if (base) *base = buffer.base;
+  if (buffer.serial == q8_session.serial) return buffer.index;
+  buffer.serial = q8_session.serial;
+  buffer.index = 0;
+  if (q8_session.arenas >= 4 || buffer.size > (size_t(1) << 30)) return 0;
+  const Q8Frame ask{Q8_ARENA, q8_session.arenas, uint32_t(buffer.size), uint32_t(uint64_t(buffer.size) >> 32)};
+  q8_send(q8_session.fd, &ask, sizeof(ask));
+  Q8Frame reply{};
+  char control[CMSG_SPACE(sizeof(int))];
+  iovec part{&reply, sizeof(reply)};
+  msghdr message{};
+  message.msg_iov = &part;
+  message.msg_iovlen = 1;
+  message.msg_control = control;
+  message.msg_controllen = sizeof(control);
+  ssize_t received;
+  do received = recvmsg(q8_session.fd, &message, MSG_CMSG_CLOEXEC | MSG_WAITALL);
+  while (received < 0 && errno == EINTR);
+  int arena_fd = -1;
+  for (cmsghdr *c = CMSG_FIRSTHDR(&message); received > 0 && c; c = CMSG_NXTHDR(&message, c))
+    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
+      std::memcpy(&arena_fd, CMSG_DATA(c), sizeof(int));
+  Fd holder(arena_fd);
+  if (received != ssize_t(sizeof(reply)) || reply.type != Q8_ARENA) throw std::runtime_error("Shield session reply");
+  if (reply.a != 0 || arena_fd < 0) return 0;
+  const uint32_t index = q8_session.arenas++;
+  // The bytes first, through a mapping of its own; then the arena in the buffer's place. If the second
+  // mapping fails the buffer is as it was and the executor's arena is simply never named.
+  // Only the pages the buffer has: the rest of a compute buffer was never touched and reads as zeros in
+  // the arena as it did in the buffer. (A page that was swapped out would be missed; the buffer is
+  // private memory of this process and nothing here runs with swap.)
+  void *copy = mmap(nullptr, buffer.size, PROT_READ | PROT_WRITE, MAP_SHARED, arena_fd, 0);
+  if (copy == MAP_FAILED) return 0;
+  {
+    std::vector<unsigned char> resident(buffer.size / 4096);
+    if (mincore(buffer.base, buffer.size, resident.data())) {
+      std::memcpy(copy, buffer.base, buffer.size);
+    } else {
+      for (size_t page = 0; page < resident.size();) {
+        if (!(resident[page] & 1)) { ++page; continue; }
+        size_t end = page;
+        while (end < resident.size() && (resident[end] & 1)) ++end;
+        std::memcpy(static_cast<unsigned char *>(copy) + page * 4096, buffer.base + page * 4096, (end - page) * 4096);
+        page = end;
+      }
+    }
+  }
+  munmap(copy, buffer.size);
+  if (mmap(buffer.base, buffer.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, arena_fd, 0) == MAP_FAILED) return 0;
+  buffer.index = index + 1;
+  return buffer.index;
+}
 uint32_t q8_slot(const Q8Identity &weights, size_t k, size_t n) {
   // Only launches holding q8_direct_mutex read or write the cached slot.
   if (weights.session_serial == q8_session.serial) return weights.slot;
@@ -725,8 +864,12 @@ bool q8_exchange(const Q8Identity &weights, size_t k, size_t n, size_t m, const 
 // A whole launch in one request through shared memory. Returns the product's
 // bytes (valid until the next request), or null if the executor declined it
 // before computing anything. nullopt: no shared memory, use q8_exchange.
+// `input` is the activation where the caller has it. `in` and `out`, when given, are where the activation
+// and the product lie in buffers of the application that may be arenas; a product written in place is
+// returned as its address there.
 std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weights, size_t k, size_t n, size_t m,
-                                                        std::vector<unsigned char> &input) {
+                                                        const unsigned char *input, size_t input_bytes,
+                                                        const Q8Spot *in = nullptr, const Q8Spot *out = nullptr) {
   Q8Session &session = q8_session;
   for (int attempt = 0;; ++attempt) {
     try {
@@ -734,9 +877,23 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       if (session.fd < 0 || session.engine != engine) q8_connect(engine);
       if (!session.shared) return std::nullopt;
       const uint32_t id = q8_slot(weights, k, n);
-      const bool same_input = session.last_valid && session.last_m == m &&
-                              session.last_input.size() == input.size() &&
-                              !std::memcmp(session.last_input.data(), input.data(), input.size());
+      // Arenas for this launch's two places, if the session can have them.
+      uint32_t in_arena = 0, out_arena = 0;
+      unsigned char *out_base = nullptr;
+      if (session.mail && in) in_arena = q8_arena_share(in->root);
+      if (session.mail && out) out_arena = q8_arena_share(out->root, &out_base);
+      if (in_arena && out_arena == in_arena && in->offset < out->offset + m * n * 4 && out->offset < in->offset + input_bytes)
+        out_arena = 0;
+      // The same activation as the last request's: the same untouched place in an arena, or the same
+      // bytes as the first region still holds (only a request writes it).
+      bool same_input = session.last_valid && session.last_m == m && session.last_bytes == input_bytes;
+      if (same_input && in_arena) {
+        std::lock_guard lock(q8_cache_mutex);
+        same_input = session.last_placed && q8_placed_input_clean.load(std::memory_order_acquire) &&
+                     q8_placed_input.root == in->root && q8_placed_input.offset == in->offset;
+      } else if (same_input) {
+        same_input = !session.last_placed && !std::memcmp(session.shared, input, input_bytes);
+      }
       const bool after_partner = session.partner_served;
       session.partner_served = false;
       if (session.ready_valid) {
@@ -777,7 +934,14 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       const uint32_t pair = id < session.pair_of.size() ? session.pair_of[id] : Q8_NO_PAIR;
       const uint32_t third = pair != Q8_NO_PAIR && id < session.third_of.size() ? session.third_of[id] : Q8_NO_PAIR;
       session.first_slot = id;
-      std::memcpy(session.shared, input.data(), input.size());
+      session.last_valid = false;
+      if (in_arena) {
+        std::lock_guard lock(q8_cache_mutex);
+        q8_placed_input = {in->root, in->offset, input_bytes};
+        q8_placed_input_clean.store(true, std::memory_order_release);
+      } else {
+        std::memcpy(session.shared, input, input_bytes);
+      }
       Q8Frame reply{};
       if (session.mail) {
         Q8Mail *mail = session.mail;
@@ -794,6 +958,10 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
         mail->m = uint32_t(m);
         mail->pair = pair;
         mail->third = third == Q8_NO_PAIR ? 0 : third + 1;
+        mail->in_arena = in_arena;
+        mail->in_offset = in_arena ? in->offset : 0;
+        mail->out_arena = out_arena;
+        mail->out_offset = out_arena ? out->offset : 0;
         const uint32_t mine = mail->request.load(std::memory_order_relaxed) + 1;
         mail->request.store(mine, std::memory_order_seq_cst);
         if (mail->sleeping.load(std::memory_order_seq_cst)) {
@@ -823,7 +991,8 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       if (reply.a != 0) throw std::runtime_error("Q8 session status");
       session.last_slot = id;
       session.last_m = m;
-      session.last_input.swap(input);
+      session.last_bytes = input_bytes;
+      session.last_placed = in_arena != 0;
       session.last_valid = true;
       ++session.requests;
       session.ready_valid = (reply.b & 1) && pair != Q8_NO_PAIR;
@@ -831,6 +1000,7 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
       session.ready_slot = pair;
       session.ready2_valid = session.ready_valid && (reply.b & 2) && third != Q8_NO_PAIR;
       session.ready2_slot = third;
+      if (out_arena) return out_base + out->offset;
       return session.shared + Q8_SHARED_REGION;
     } catch (const Q8Bye &) {
       session.reset();
@@ -865,15 +1035,23 @@ struct Q8DirectLaunch {
 // SHIELD_OPENCL_Q8_MEMO=0 checks every launch afresh.
 struct Q8LaunchMemo {
   uint64_t epoch = 0;
+  uint32_t releases = 0;  // of the launch's buffers and their roots, summed, when it was checked
   Q8DirectLaunch launch{};
   std::shared_ptr<const Q8Identity> identity;
 };
+uint32_t q8_launch_releases(const Q8DirectLaunch &launch) {
+  uint32_t sum = 0;
+  for (unsigned i = 0; i < launch.weights() + 2; ++i)
+    sum += q8_release_count(launch.buffers[i]).load(std::memory_order_acquire) +
+           q8_release_count(launch.storage[i].root).load(std::memory_order_acquire);
+  return sum;
+}
 bool q8_memo_enabled() {
   static const bool enabled = [] {
     const char *value = std::getenv("SHIELD_OPENCL_Q8_MEMO");
     return !value || std::strcmp(value, "0") != 0;
   }();
-  return enabled;
+  return q8_ab.is("memo") ? q8_ab.on : enabled;
 }
 
 // The launch's event, when the application asked for one. A failed launch is
@@ -1196,6 +1374,7 @@ void q8_preauthenticate_write(cl_command_queue queue, cl_mem buffer, size_t offs
 // failures are reported and never retried on another route.
 std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   std::lock_guard direct(q8_direct_mutex);
+  q8_ab.tick();
   auto stage = Q8Timing::now();
   // Results of earlier commands must be in the buffers before they are read.
   if (REAL(clFinish)(launch.queue)) return std::nullopt;
@@ -1274,12 +1453,30 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
 
   static thread_local std::vector<unsigned char> input, output;
   stage = Q8Timing::now();
-  input.resize(launch.read_bytes[count]);
-  if (const unsigned char *host = host_bytes(launch.queue, launch.buffers[count], launch.input_offset, launch.read_bytes[count]))
-    std::memcpy(input.data(), host, launch.read_bytes[count]);
-  else if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[count], CL_TRUE, launch.input_offset,
-                                     launch.read_bytes[count], input.data(), 0, nullptr, nullptr))
-    return std::nullopt;
+  // The activation where the runtime keeps it when that can be had, and a copy here otherwise and for
+  // the paths that keep one.
+  const size_t input_bytes = launch.read_bytes[count];
+  const unsigned char *activation = host_bytes(launch.queue, launch.buffers[count], launch.input_offset, input_bytes);
+  const auto snapshot = [&] {
+    if (activation == input.data() && input.size() == input_bytes) return true;
+    input.resize(input_bytes);
+    if (activation) std::memcpy(input.data(), activation, input_bytes);
+    else if (REAL(clEnqueueReadBuffer)(launch.queue, launch.buffers[count], CL_TRUE, launch.input_offset, input_bytes,
+                                       input.data(), 0, nullptr, nullptr))
+      return false;
+    activation = input.data();
+    return true;
+  };
+  if (!activation && !snapshot()) return std::nullopt;
+  // Places an arena could hold (see q8_arena_share), and the product's address in the runtime's storage.
+  const bool placed = activation != input.data() && q8_arena_enabled() && (!q8_ab.is("arena") || q8_ab.on);
+  const Q8Spot in_spot{launch.storage[count].root, launch.storage[count].offset + launch.input_offset};
+  const Q8Spot out_spot{launch.storage[count + 1].root, launch.storage[count + 1].offset + launch.output_offset};
+  unsigned char *const destination =
+      host_bytes(launch.queue, launch.buffers[count + 1], launch.output_offset, launch.output_bytes);
+  // An arena's product is written by the executor during the exchange: what the write may touch is
+  // forgotten before it, not after.
+  if (placed && destination) q8_written(launch.buffers[count + 1], launch.output_offset, launch.output_bytes, false);
   q8_timing.add(Q8Timing::Snapshot, stage);
   stage = Q8Timing::now();
   const unsigned char *product = nullptr;
@@ -1295,7 +1492,8 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   bool local = local_only || !weights.approved || !rows || (weights.declined & width);
   try {
     if (!local && launch.m <= rows) {
-      const auto shared = q8_exchange_shared(weights, launch.k, launch.n, launch.m, input);
+      const auto shared = q8_exchange_shared(weights, launch.k, launch.n, launch.m, activation, input_bytes,
+                                             placed ? &in_spot : nullptr, placed && destination ? &out_spot : nullptr);
       if (shared) {
         if (*shared) product = *shared;
         else local = true;
@@ -1304,6 +1502,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       q8_session.last_valid = q8_session.ready_valid = false;
     }
     if (!product && !local) {
+      if (!snapshot()) return q8_direct_result(launch, CL_OUT_OF_RESOURCES);
       output.resize(launch.output_bytes);
       for (size_t first = 0; first < launch.m; first += rows) {
         const size_t count = std::min(rows, launch.m - first);
@@ -1321,7 +1520,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       // Computed here if possible, otherwise by the original kernel.
       if (weights.approved && rows) weights.declined |= width;
       q8_session.last_valid = q8_session.ready_valid = false;
-      if (!q8_local(launch, weights, known, input, output)) return std::nullopt;
+      if (!snapshot() || !q8_local(launch, weights, known, input, output)) return std::nullopt;
       product = output.data();
       q8_timing.add(Q8Timing::Cpu, stage);
       stage = Q8Timing::now();
@@ -1340,8 +1539,10 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
   stage = Q8Timing::now();
   // Every chunk has verified before any result reaches application memory.
   q8_written(launch.buffers[count + 1], launch.output_offset, launch.output_bytes, false);
-  if (unsigned char *host = host_bytes(launch.queue, launch.buffers[count + 1], launch.output_offset, launch.output_bytes))
-    std::memcpy(host, product, launch.output_bytes);
+  if (destination && product == destination)
+    ;  // written in place, through an arena
+  else if (destination)
+    std::memcpy(destination, product, launch.output_bytes);
   else if (REAL(clEnqueueWriteBuffer)(launch.queue, launch.buffers[count + 1], CL_TRUE, launch.output_offset,
                                       launch.output_bytes, product, 0, nullptr, nullptr))
     return q8_direct_result(launch, CL_OUT_OF_RESOURCES);

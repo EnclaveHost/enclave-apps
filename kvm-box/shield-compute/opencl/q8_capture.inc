@@ -457,7 +457,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     memo_epoch=q8_epoch.load(std::memory_order_acquire);
     if(memos.size()>4096) memos.clear();
     memo=&memos[key];
-    if(memo->epoch==memo_epoch) {
+    if(memo->epoch==memo_epoch && memo->releases==q8_launch_releases(memo->launch)) {
       Q8DirectLaunch launch=memo->launch;
       launch.event=event; launch.memo=memo;
       auto result=q8_direct(launch);
@@ -547,7 +547,10 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
       auto result=q8_direct(launch);
       q8_timing.add(Q8Timing::Enqueue,enqueue_ns);
       if(!result) return {false,0};
-      if(memo) { memo->launch=launch; memo->launch.event=nullptr; memo->launch.memo=nullptr; memo->epoch=memo_epoch; }
+      if(memo) {
+        memo->launch=launch; memo->launch.event=nullptr; memo->launch.memo=nullptr;
+        memo->releases=q8_launch_releases(launch); memo->epoch=memo_epoch;
+      }
       return {true,*result};
     }
 #endif

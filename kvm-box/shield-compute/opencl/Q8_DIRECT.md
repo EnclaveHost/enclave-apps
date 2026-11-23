@@ -814,6 +814,99 @@ workers that fall asleep (`OMP_WAIT_POLICY=active`: 106.4, 111.0 against
 110.5, 110.0; two: 117.6, 115.8; eight: 138, 143; four: 110.5, 109.5), and not
 the client's pin (without it: 116.3, 118.8).
 
+## Arenas: the executor reads and writes the application's buffer
+
+Experiment, opt-in (`SHIELD_OPENCL_Q8_ARENA=1`, with the mailbox and direct
+buffers), not released.
+
+A buffer the application creates without host memory, of a megabyte to a
+gigabyte, gets page-aligned memory of the frontend's instead of the runtime's
+own. When a launch reads its activation from such a buffer or writes its
+product to one, the frontend asks the executor for an arena of the buffer's
+size (frame 7): shared memory the executor makes and seals exactly as it does
+the regions, at most four a session and a gigabyte each. The frontend copies
+the buffer's resident pages into it and maps it where the buffer's memory
+was, so the application, the runtime and the executor see the same bytes. A
+mailed request then names where its activation lies and where its first
+product goes (an arena and an offset, each checked against the arena's size),
+and neither is copied between the buffer and the regions. The rules of the
+regions hold: the executor copies an activation out before it checks it and
+copies a product in only after it has checked it. A partner's product still
+comes through its region, since the launch that will ask for it has not said
+where it goes.
+
+Whether a launch has the same activation as the request before it was decided
+by comparing bytes with a kept copy. For an activation read in place it is the
+same place with nothing written to it since (every write the frontend sees
+already passes through `q8_written`); the copy is no longer made.
+
+What moved, a launch: the copy of the activation out of the buffer 1.7 to 0.3
+us, the copy of the product into it 2.3 to 1.2 us (what is left is the
+partners'), the frontend's time around an exchange 6.3 to 3.8 us with the
+change below. The first version copied a whole 519 MB compute buffer into its
+arena inside the timed draft phase; it copies only resident pages now.
+
+Releases are counted by handle (a table of 4,096 counts) instead of in one
+number: an application releases memory objects all the time, and one count for
+all of them made every remembered launch stale at every release.
+
+Session tests: an arena is sealed and of the size asked; sizes of zero, not a
+whole page, over a gigabyte and an index out of order are refused; a mailed
+request with its activation and product in an arena gives the bytes the
+regions give, at one and two rows; a place outside an arena ends that session
+and no other. 13 tests pass. The llama-cli text is unchanged
+(`fc9381771ffb68b1`), 15.47 tokens a second in that run against 14.65 before
+the changes of this section and the last.
+
+Under EyesOff's loop, 300 tokens, alternating with the native engine in the
+image: drafting 16.12, 16.07, 16.05 against 16.23, 16.70, 16.59 (97%); plain
+15.56, 14.88, 15.04 against 16.23, 16.09, 16.16 (94%). Plain over six runs
+each: 66.1 ms a token with arenas, 67.5 without.
+
+### Measuring inside one run
+
+Runs on this host differ by one to two milliseconds a token, more than most of
+these changes gain. `SHIELD_OPENCL_Q8_AB=<name>` switches one experiment
+(`arena`, `memo`) on and off every 407 launches (one token of the 27B;
+`SHIELD_OPENCL_Q8_AB_WINDOW`) and prints the time a launch takes, from one to
+the next, in each state. With nothing switched (`none`) the two states differed
+by 0.5, 0.8 and 3.4 us a launch in three runs of 212, so it resolves about
+3 us (1.5%). With ten-token stretches the states saw different mixes of the
+run's phases and differed by 5 to 12 us with nothing switched. Arenas: 3.3,
+2.8 and 2.8 us a launch better in three runs.
+
+### Tried and not kept
+
+- Using the wait. While a request is with the executor the client thread only
+  waits, on the core's other hardware thread, with the cache the two share. It
+  asked for the lines the product would be written to and the lines the
+  application copied to after the same request one token before. In-run: 0.2
+  better and 2.5 worse; whole runs 65.8 against 66.0 ms a token.
+- A sparse sentinel in the executor (the first and last value of an output and
+  one in every 1024 instead of every value): 65.9, 66.1 ms a token against
+  63.9, 62.8 with the full one in alternating runs, which is within what runs
+  differ by; no gain shown, and the full one checks more.
+- The residual chain with the executor on a core of its own (the one case not
+  measured before): 68.5, 67.6 ms a token plain against 64.5, 66.9 without it
+  on one core; on one core with it 66.5, 66.3.
+- Not passing the runtime a kernel argument that repeats the bytes it already
+  holds: the time in `clSetKernelArg` did not move (0.14 to 0.16 us a call),
+  the runtime's part of it is small.
+
+### Where the time is now
+
+Stack samples of the main thread in the plain phase, 600 tokens: the route
+64.6 ms a token, of which 77% in the frontend (nearly all of it the wait for
+the executor) and 20% in the application's processor work; the native engine
+60.9 ms, 68% in its backend and 29% in the processor work. By the timers the
+route's client waits 39.7 ms a token for the executor and the executor is
+busy 39.9; the native backend's share is 41 ms. So the exchanges cost the two
+paths the same, and what the route still adds is what an OpenCL device has to
+do that an engine with the tensors in its own memory does not: the
+application's copy of every activation into a device buffer and of every
+product out of one (about 5 us a launch), 18 kernel arguments (2 to 3), and
+the frontend's work around the exchange (under 4), 4 to 5 ms of a token.
+
 ## Application buffers backed by a file
 
 On the 27B the route held the model three times: the executor's backend copy
