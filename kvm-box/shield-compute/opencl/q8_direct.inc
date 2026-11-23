@@ -57,6 +57,14 @@ std::map<cl_mem, Q8Region> q8_children;        // sub-buffers and buffer-backed 
 std::map<void *, cl_mem> q8_write_maps;        // host pointers mapped for writing
 std::atomic<bool> q8_untracked_writers{false}; // an API this file cannot follow is in use
 std::atomic<size_t> q8_known_count{0};
+// How many remembered weight regions each root buffer holds. A write is checked against the remembered
+// tensors only when it is to one of these roots: an application writes its activations hundreds of times
+// a token, to buffers that hold no weights, and every such write used to walk the whole list.
+std::unordered_map<cl_mem, unsigned> q8_known_roots;
+// Moves whenever a remembered launch may no longer describe what the application would launch: a memory
+// object was released (its handle may come back as another object) or a remembered tensor was forgotten.
+std::atomic<uint64_t> q8_epoch{1};
+size_t q8_known_hint = 0;  // where the last launch's tensor was found: launches come round in the same order
 
 bool q8_direct_shared_enabled() {
   static const bool enabled = [] {
@@ -81,10 +89,16 @@ Q8Region q8_resolve(cl_mem handle, size_t offset, size_t size, bool whole) {
   return {it->second.root, it->second.offset + offset, std::min(size, it->second.size)};
 }
 void q8_forget_locked(const Q8Region &written) {
+  if (!q8_known_roots.count(written.root)) return;
   for (size_t i = 0; i < q8_known.size();) {
     bool overlap = false;
     for (unsigned w = 0; w < q8_known[i].count; ++w) overlap = overlap || q8_known[i].weights[w].overlaps(written);
     if (overlap) {
+      for (unsigned w = 0; w < q8_known[i].count; ++w) {
+        const auto held = q8_known_roots.find(q8_known[i].weights[w].root);
+        if (held != q8_known_roots.end() && !--held->second) q8_known_roots.erase(held);
+      }
+      q8_epoch.fetch_add(1, std::memory_order_release);
       for (unsigned w = 0; w < q8_known[i].count; ++w) REAL(clReleaseMemObject)(q8_known[i].weights[w].root);
       q8_known[i] = std::move(q8_known.back());
       q8_known.pop_back();
@@ -107,6 +121,8 @@ void q8_written_everything() {
     for (unsigned w = 0; w < known.count; ++w) REAL(clReleaseMemObject)(known.weights[w].root);
   }
   q8_known.clear();
+  q8_known_roots.clear();
+  q8_epoch.fetch_add(1, std::memory_order_release);
   q8_known_count.store(0, std::memory_order_release);
 }
 // An ordinary kernel may write any buffer it was given. `only` restricts that
@@ -840,7 +856,25 @@ struct Q8DirectLaunch {
   unsigned weights() const { return q8_kind_weights(kind); }
   size_t input_offset, output_offset, output_bytes, k, n, m;
   cl_event *event;
+  struct Q8LaunchMemo *memo = nullptr;
 };
+// A launch the application repeats: the same kernel, queue, arguments and grid. An application decodes token
+// after token with the same graph, so every product launch of a token repeats one of the token before. What
+// the checks of such a launch found is kept and used again while q8_epoch stands still: the properties of a
+// live memory object never change, and the epoch moves when one is released or a tensor is forgotten.
+// SHIELD_OPENCL_Q8_MEMO=0 checks every launch afresh.
+struct Q8LaunchMemo {
+  uint64_t epoch = 0;
+  Q8DirectLaunch launch{};
+  std::shared_ptr<const Q8Identity> identity;
+};
+bool q8_memo_enabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_Q8_MEMO");
+    return !value || std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
 
 // The launch's event, when the application asked for one. A failed launch is
 // reported the way the queued route reports it: the enqueue succeeds and its
@@ -982,6 +1016,7 @@ bool q8_remember(const std::array<Q8Region, 5> &regions, const std::array<cl_mem
     return false;
   }
   q8_known.push_back({regions, count, k, n, identity});
+  for (unsigned w = 0; w < count; ++w) ++q8_known_roots[regions[w].root];
   q8_known_count.store(q8_known.size(), std::memory_order_release);
   return true;
 }
@@ -1172,9 +1207,15 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     regions[w] = {launch.storage[w].root, launch.storage[w].offset + launch.weight_offset, launch.read_bytes[w]};
   std::shared_ptr<const Q8Identity> identity;
   bool known = false;
-  {
+  if (launch.memo && launch.memo->identity && launch.memo->epoch == q8_epoch.load(std::memory_order_acquire)) {
+    identity = launch.memo->identity;
+    known = true;
+  } else {
     std::lock_guard lock(q8_cache_mutex);
-    for (const auto &entry : q8_known) {
+    const size_t total = q8_known.size();
+    for (size_t step = 0; step < total; ++step) {
+      const size_t at = (q8_known_hint + step) % total;
+      const Q8Known &entry = q8_known[at];
       bool same = entry.count == count && entry.k == launch.k && entry.n == launch.n;
       for (unsigned w = 0; same && w < count; ++w)
         same = entry.weights[w].root == regions[w].root && entry.weights[w].offset == regions[w].offset &&
@@ -1182,6 +1223,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
       if (same) {
         identity = entry.identity;
         known = true;
+        q8_known_hint = at + 1;
         break;
       }
     }
@@ -1225,6 +1267,7 @@ std::optional<cl_int> q8_direct(const Q8DirectLaunch &launch) {
     for (unsigned w = 0; w < count; ++w) root_flags[w] = launch.storage[w].root_flags;
     known = q8_remember(regions, root_flags, count, launch.k, launch.n, identity);
   }
+  if (launch.memo) launch.memo->identity = known ? identity : nullptr;
   const Q8Identity &weights = *identity;
   constexpr size_t maximum = 2u << 20;
   const size_t rows = std::min({size_t(32), maximum / (launch.k * 4), maximum / (launch.n * 4)});

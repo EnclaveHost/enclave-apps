@@ -437,6 +437,37 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
     cl_context c=nullptr;
     if(REAL(clGetEventInfo)(wait[i],CL_EVENT_CONTEXT,sizeof(c),&c,nullptr) || c!=context) return {false,0};
   }
+#ifdef SHIELD_Q8_MASKED
+  Q8LaunchMemo *memo=nullptr;
+  uint64_t memo_epoch=0;
+  if(masked && !count && q8_direct_enabled() && q8_memo_enabled() &&
+     !(properties&(CL_QUEUE_PROFILING_ENABLE|CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE))) {
+    static thread_local std::unordered_map<std::string,Q8LaunchMemo> memos;
+    static thread_local std::string key;
+    key.clear();
+    const auto add=[&](const void *bytes,size_t size) { key.append(static_cast<const char *>(bytes),size); };
+    add(&kernel,sizeof kernel); add(&q,sizeof q); add(&context,sizeof context); add(&kind,sizeof kind);
+    add(global,3*sizeof *global); add(local,3*sizeof *local);
+    const size_t none[3]={0,0,0};
+    add(offset?offset:none,sizeof none);
+    for(unsigned i=0;i<q8_kind_arguments(kind);++i) {
+      const unsigned char size=(unsigned char)state.args[i].size();
+      add(&size,1); add(state.args[i].data(),state.args[i].size());
+    }
+    memo_epoch=q8_epoch.load(std::memory_order_acquire);
+    if(memos.size()>4096) memos.clear();
+    memo=&memos[key];
+    if(memo->epoch==memo_epoch) {
+      Q8DirectLaunch launch=memo->launch;
+      launch.event=event; launch.memo=memo;
+      auto result=q8_direct(launch);
+      q8_timing.add(Q8Timing::Enqueue,enqueue_ns);
+      if(!result) return {false,0};
+      return {true,*result};
+    }
+    memo->epoch=0; memo->identity=nullptr;
+  }
+#endif
   // Scalars as many places before a K-quant kernel has them as it has extra
   // weight buffers (see q8_admission.inc).
   const bool mv=q8_kind_vector(kind), raw=q8_kind_raw(kind);
@@ -510,11 +541,13 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
 #ifdef SHIELD_Q8_MASKED
     if(masked && !count && q8_direct_enabled() &&
        !(properties&(CL_QUEUE_PROFILING_ENABLE|CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE))) {
-      const Q8DirectLaunch launch{q,kind,buffers,stored,bytes,raw?size_t(scalars[4]):0,size_t(scalars[3]),size_t(scalars[5]),checked_output,
-                                  checked_k,checked_n,checked_m,event};
+      Q8DirectLaunch launch{q,kind,buffers,stored,bytes,raw?size_t(scalars[4]):0,size_t(scalars[3]),size_t(scalars[5]),checked_output,
+                            checked_k,checked_n,checked_m,event};
+      launch.memo=memo;
       auto result=q8_direct(launch);
       q8_timing.add(Q8Timing::Enqueue,enqueue_ns);
       if(!result) return {false,0};
+      if(memo) { memo->launch=launch; memo->launch.event=nullptr; memo->launch.memo=nullptr; memo->epoch=memo_epoch; }
       return {true,*result};
     }
 #endif

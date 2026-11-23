@@ -752,6 +752,68 @@ too (`ENCLAVE_GGML_FLASH_ATTN_ON` in the harness's copy of the shim), without
 which both paths gained nothing from drafting; nothing ran in a guest. On the
 OpenCL route the mailbox and the pinning are not wired in.
 
+## What a repeated launch costs in the frontend
+
+Measured 2026-11-22 on EyesOff's 27B under EyesOff's loop (`bench-spec2`,
+ring workers, four engine threads, 16 refill threads, mailbox, the two threads
+on one core, direct buffers, triples, inline continuation).
+
+Two walks over the list of remembered tensors (about 400 on this model) were
+on every token's path: every write to any buffer compared its range with every
+remembered tensor (an application writes its activations several hundred
+times a token, to buffers that hold no weights), and every launch searched the
+list from the start for its tensor. A write is now compared only when its root
+buffer holds remembered weights (a count of them per root), and a launch looks
+first where the launch before it was found. Three alternating rounds of 100
+tokens: plain 15.50, 14.78, 15.44 with the change against 14.62, 15.33, 14.91
+without, and the native engine 15.89, 15.57, 15.12.
+
+A launch an application repeats (the same kernel, queue, arguments and grid:
+every product launch of a token repeats one of the token before) no longer has
+its buffers looked up and its layout checked again. What the checks found is
+kept under those bytes and used while no memory object has been released and
+no remembered tensor forgotten since (`q8_epoch`). The time a launch spends in
+the frontend outside the exchange fell from 8.7 to 6.3 us.
+`SHIELD_OPENCL_Q8_MEMO=0` checks every launch afresh. Four alternating rounds
+of 300 tokens, drafting: 15.73, 15.81, 15.93, 15.80 against 15.54, 15.71,
+15.81; plain 15.15, 15.00, 15.25, 14.70 against 14.87, 15.24, 15.09. The text
+is the same (`fc9381771ffb68b1` for the 100-token llama-cli run).
+
+Where the route then stands against the native engine in the image, four
+alternating rounds of 300 tokens before the second change: drafting 15.91,
+15.79, 15.96, 15.25 against 17.02, 16.20, 16.51, 16.44 (95%); plain 14.89,
+15.65, 14.58, 14.59 against 17.03, 16.09, 15.74, 16.21 (92%). A pair of
+600-token runs came out level (16.16 against 16.11 drafting). The host carried
+other load all day (load average 14 to 16), and single runs differ by one
+token a second.
+
+What the timers say is left, a launch (407 a token, 409 a two-row round):
+
+- 6.3 us in the frontend around the exchange, of which 1.7 is the copy of the
+  activation out of the buffer and 2.3 the copy of the product into it;
+- 4.0 us for the application's read of the product and 2.2 for 0.64 writes of
+  an activation, each one copy of 20 to 70 KB at the speed a copy between two
+  places in the second-level cache has (10 to 15 GB a second);
+- 2.6 us for 18.6 kernel arguments.
+
+That is about 6 ms of a 66 ms token, and the native engine has none of it: it
+encodes the activation where the tensor lies and writes the product where the
+next operation reads it. An activation is copied four times on its way to the
+executor's graph and a product three times on its way back.
+
+At two rows the executor's own time and the frontend's are below the native
+engine's backend time in a stack sample of the main thread (61% of a 111 ms
+round against 68% of 106), and the application's processor work is above it
+(35% against 29%): the main thread waits longer for its three workers at the
+end of each parallel step (10% against 5%) and the recurrent blocks take
+longer (11.5% against 8%). Not explained. It is not the executor's core
+(executor on another core: 111.5, 101.3 against 101.1, 100.5 ms a round), not
+workers that fall asleep (`OMP_WAIT_POLICY=active`: 106.4, 111.0 against
+109.3, 108.5; `passive` is 150), not their placement (bound to three cores:
+107.6, 110.2, 109.3 against 113.0, 107.9, 108.1), not the thread count (three:
+110.5, 110.0; two: 117.6, 115.8; eight: 138, 143; four: 110.5, 109.5), and not
+the client's pin (without it: 116.3, 118.8).
+
 ## Application buffers backed by a file
 
 On the 27B the route held the model three times: the executor's backend copy

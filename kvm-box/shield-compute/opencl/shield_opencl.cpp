@@ -1977,6 +1977,7 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseMemObject(cl_mem object) {
   // Remembered identities hold their own reference, so a handle cannot be
   // recycled under them; an application release simply ends the memory.
   q8_written(object);
+  q8_epoch.fetch_add(1, std::memory_order_release);
   cl_uint references = 0;
   if (object && !REAL(clGetMemObjectInfo)(object, CL_MEM_REFERENCE_COUNT, sizeof(references),
                                          &references, nullptr) && references <= 1) {
