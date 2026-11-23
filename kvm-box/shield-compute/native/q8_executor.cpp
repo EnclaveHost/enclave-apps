@@ -52,6 +52,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+#include <dirent.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <deque>
 
 static_assert(GGML_MAX_NAME == 128, "build with the SDK's GGML_MAX_NAME=128");
@@ -2040,6 +2043,37 @@ int serve(int out_fd, int control, Model & model, const Policy & policy, Backend
                     static bool pinned = false;
                     if (!pinned) {
                         pinned = true;
+                        // EXPERIMENT (SHIELD_Q8_NICE_REFILL=n). The pad refill threads at a lower priority, so
+                        // that one of them waking does not take the processor from a thread of the client's
+                        // that is computing. Not the thread made last, which is the second card's helper and
+                        // is waited for in every exchange.
+                        if (const char * nice_refill = std::getenv("SHIELD_Q8_NICE_REFILL")) {
+                            const pid_t self = (pid_t)syscall(SYS_gettid);
+                            std::vector<std::pair<unsigned long long, pid_t>> others;
+                            if (DIR * tasks = opendir("/proc/self/task")) {
+                                while (const dirent * entry = readdir(tasks)) {
+                                    const pid_t tid = (pid_t)std::atoi(entry->d_name);
+                                    if (tid <= 0 || tid == self) continue;
+                                    char path[64], line[512] = {};
+                                    std::snprintf(path, sizeof path, "/proc/self/task/%d/stat", (int)tid);
+                                    unsigned long long started = 0;
+                                    if (FILE * f = std::fopen(path, "r")) {
+                                        if (std::fgets(line, sizeof line, f))
+                                            if (const char * after = std::strrchr(line, ')')) {
+                                                int field = 2;
+                                                for (const char * c = after + 1; *c && field < 22; ++c)
+                                                    if (*c == ' ' && ++field == 22) started = std::strtoull(c + 1, nullptr, 10);
+                                            }
+                                        std::fclose(f);
+                                    }
+                                    others.emplace_back(started, tid);
+                                }
+                                closedir(tasks);
+                            }
+                            std::sort(others.begin(), others.end());
+                            if (!others.empty()) others.pop_back();  // the helper
+                            for (const auto & [started, tid] : others) setpriority(PRIO_PROCESS, (id_t)tid, std::atoi(nice_refill));
+                        }
                         if (const char * cpu = std::getenv("SHIELD_Q8_SERVE_CPU")) {
                             usable_cpus();  // counted before this thread is confined: the others are not
                             cpu_set_t set;

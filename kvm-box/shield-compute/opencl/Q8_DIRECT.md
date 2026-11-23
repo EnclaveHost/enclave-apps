@@ -966,6 +966,15 @@ What was tried on that, none kept:
   serving thread and the requesting thread are pinned to: three rounds looked
   like a gain for drafting (16.55 against 15.89); five rounds did not (15.86
   against 16.30 drafting, 16.09 against 15.74 plain).
+- The refill threads alone at nice 10 (`SHIELD_Q8_NICE_REFILL=10`, an
+  experiment that is in the executor, off unless set; it takes the thread made
+  last to be the helper and leaves it): five alternating rounds, drafting
+  16.53 against 16.37 and plain 15.73 against 15.40, the draft step 6.6 ms
+  against 8.1 and the verify step no different (105.3 against 104.9).
+- The executor waiting with MONITORX/MWAITX while the client computes, asked
+  for by a bit in the request and switched in-run: 1.0 us a launch worse and
+  1.1 better of 205. Neither thread of the shared core loses time to the
+  other's wait.
 - The application's workers bound to three cores of their own
   (`GOMP_CPU_AFFINITY`): still preempted 120 to 340 times a second, no faster.
 
