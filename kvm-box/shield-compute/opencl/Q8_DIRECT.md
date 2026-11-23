@@ -921,6 +921,54 @@ the waiting thread leaves the core to the executor, switched in-run: 0.5 and
 0.2 us a launch worse of 211, with 1.3 between the two states when nothing is
 switched. The pause loop is not what the executor loses time to.
 
+### The machine is full, and what that does to the route
+
+Measured 2026-11-23 on the same host, which carried other guests throughout
+(load average 14 to 19 on 32 hardware threads).
+
+EyesOff's own engine on the host, 300 tokens, two runs: 16.03 and 16.84 tokens
+a second plain, 17.45 and 17.01 drafting. Against it and the native engine in
+the image, alternating rounds of 300 tokens over the night and the morning:
+
+| Set | Route plain | Native plain | Route drafting | Native drafting |
+| --- | ---: | ---: | ---: | ---: |
+| 3 rounds | 15.32 | 15.73 | 15.89 | 16.21 |
+| 5 rounds | 15.36 | 16.45 | 15.81 | 16.74 |
+| 4 rounds | 16.47 | 16.35 | 15.48 | 17.07 |
+| 5 rounds | 15.74 | 16.63 | 16.30 | 17.39 |
+
+Plain is between 93 and 101% of the native engine and drafting between 91 and
+98%, set by set. The two-row verify step is the constant difference: 104 to
+110 ms a round on the route against 98 to 104.
+
+During drafting all 16 pad refill threads of the executor run without pause
+(104% of a processor each, no voluntary switch in five seconds), its second
+card's helper spins, and with the serving thread, the client's four threads,
+the two workers and the other guests about 30 threads want 32 hardware
+threads. The client's three OpenMP workers are preempted 60 to 300 times a
+second each on the route and 3 to 17 with the native engine, and move to
+another processor every few seconds; the executor's serving thread, which
+cannot move, is preempted 26 to 70 times a second.
+
+What was tried on that, none kept:
+
+- Fewer or more refill threads. 16 is the number: 12 gave a verify step of 120
+  ms and 8 of 146 (the pool runs dry at two rows); 24 gave 120 to 138 and 32
+  gave 125 to 131 (they take the processors the requests need).
+- The executor's threads other than the serving one confined to other
+  processors (`taskset`): the workers were then preempted 3 to 43 times a
+  second, and a token took 84 to 89 ms plain, the helper and the pads being
+  far from the thread they serve.
+- Those threads at a lower priority (nice 10): preemptions of the workers down
+  to under 10 a second; four rounds, drafting 16.41 against 15.48 and plain
+  15.94 against 16.47. One gains what the other loses.
+- Those threads, and the application's other threads, kept off the core the
+  serving thread and the requesting thread are pinned to: three rounds looked
+  like a gain for drafting (16.55 against 15.89); five rounds did not (15.86
+  against 16.30 drafting, 16.09 against 15.74 plain).
+- The application's workers bound to three cores of their own
+  (`GOMP_CPU_AFFINITY`): still preempted 120 to 340 times a second, no faster.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
