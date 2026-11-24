@@ -36,6 +36,13 @@ const APP: &str = "ipns-publisher/0.1.0";
 const MAX_BODY: usize = 64 * 1024;
 const STATE_FILE: &str = "/data/ipns-publisher-state.json";
 
+/// How long after the n-th failure in a row to try again: 30 s, doubling, at
+/// most 15 minutes and never longer than the regular interval.
+fn retry_delay(failures: u32, republish_secs: u64) -> Duration {
+    let secs = 30u64.saturating_mul(1 << failures.saturating_sub(1).min(5));
+    Duration::from_secs(secs.min(900).min(republish_secs.max(1)))
+}
+
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64
 }
@@ -190,6 +197,11 @@ struct App {
     delegate_results: Vec<DelegateResult>,
     last_error: Option<String>,
     next_publish: Instant,
+    /// Publish rounds that failed in a row (no value, no record).
+    failed_rounds: u32,
+    /// IPNI walks that failed in a row, and when the next one starts.
+    ipni_failures: u32,
+    ipni_retry_at: Option<Instant>,
     durable_state: bool,
     dht: Option<p2p::Dht>,
     provider: Option<provider::Provider>,
@@ -230,6 +242,9 @@ impl App {
             delegate_results: Vec::new(),
             last_error: None,
             next_publish: Instant::now(),
+            failed_rounds: 0,
+            ipni_failures: 0,
+            ipni_retry_at: None,
             durable_state: false,
             dht: None,
             provider,
@@ -313,12 +328,47 @@ impl App {
         self.tasks.push_back(Task::Sign);
     }
 
+    /// A round that signed nothing is tried again soon, not after
+    /// `republishSecs`: a partition that starts before its network is up
+    /// otherwise publishes nothing for hours (2026-11-19: four).
+    fn publish_failed(&mut self, e: String) {
+        self.last_error = Some(e);
+        self.failed_rounds = self.failed_rounds.saturating_add(1);
+        let wait = retry_delay(self.failed_rounds, self.cfg.republish_secs);
+        self.next_publish = self.next_publish.min(Instant::now() + wait);
+    }
+
+    /// A failed IPNI walk starts again after a backoff instead of waiting for
+    /// the next signed value.
+    fn retry_provider(&mut self) {
+        let failed = self.provider.as_ref().is_some_and(|p| p.wants_retry());
+        if !failed {
+            if self.provider.as_ref().is_some_and(|p| p.is_current()) {
+                self.ipni_failures = 0;
+            }
+            self.ipni_retry_at = None;
+            return;
+        }
+        match self.ipni_retry_at {
+            None => {
+                self.ipni_failures = self.ipni_failures.saturating_add(1);
+                self.ipni_retry_at = Some(Instant::now() + retry_delay(self.ipni_failures, self.cfg.republish_secs));
+            }
+            Some(at) if Instant::now() >= at => {
+                self.ipni_retry_at = None;
+                self.announce_provider();
+            }
+            Some(_) => {}
+        }
+    }
+
     /// Advance one bounded task. Returns whether work happened.
     fn tick(&mut self) -> bool {
         if self.cfg.identity.is_some() && Instant::now() >= self.next_publish {
             self.next_publish = Instant::now() + Duration::from_secs(self.cfg.republish_secs);
             self.enqueue_publish();
         }
+        self.retry_provider();
         let Some(task) = self.tasks.pop_front() else { return false };
         match task {
             Task::Recover(delegate) => self.do_recover(&delegate),
@@ -423,7 +473,7 @@ impl App {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[ipns-publisher] publish aborted: {e}");
-                self.last_error = Some(e);
+                self.publish_failed(e);
                 return;
             }
         };
@@ -458,6 +508,7 @@ impl App {
                 self.validity_unix = validity_unix;
                 self.published_at = Some(now_unix());
                 self.last_error = None;
+                self.failed_rounds = 0;
                 self.note_recovered(seq, self.value.clone(), "self");
                 self.save_state();
                 for d in self.cfg.delegates.clone() {
@@ -471,7 +522,7 @@ impl App {
             }
             Err(e) => {
                 eprintln!("[ipns-publisher] record build failed: {e}");
-                self.last_error = Some(e);
+                self.publish_failed(e);
             }
         }
     }
@@ -718,6 +769,7 @@ fn status_page(app: &App, uptime: u64) -> Response {
     let body = format!(
         r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>ipns-publisher</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2096%2096%22%3E%3C%21--%20ipns-publisher:%20an%20ed25519%20key%20whose%20bow%20is%20a%20hexagon%20(the%20enclave%20/%20CID%20motif%20shared%20with%20its%20siblings),%20broadcasting%20the%20signed%20name%20outward%20to%20DHT%20peers.%20The%20key%20never%20leaves%20the%20enclave;%20the%20name%20does.%20--%3E%3C%21--%20broadcast%20waves:%20the%20signed%20record%20published%20out%20to%20the%20DHT%20--%3E%3Cg%20fill=%22none%22%20stroke=%22%23a78bfa%22%20stroke-width=%222.5%22%20stroke-linecap=%22round%22%3E%3Cpath%20d=%22M71.1%2041.9%20A8%208%200%200%201%2071.1%2054.1%22%20opacity=%220.9%22/%3E%3Cpath%20d=%22M75.6%2036.5%20A15%2015%200%200%201%2075.6%2059.5%22%20opacity=%220.55%22/%3E%3Cpath%20d=%22M80.1%2031.2%20A22%2022%200%200%201%2080.1%2064.9%22%20opacity=%220.32%22/%3E%3C/g%3E%3C%21--%20peer%20nodes%20receiving%20the%20record%20--%3E%3Cg%20fill=%22%23a78bfa%22%3E%3Ccircle%20cx=%2280.1%22%20cy=%2231.2%22%20r=%222.1%22%20opacity=%220.7%22/%3E%3Ccircle%20cx=%2286%22%20cy=%2248%22%20r=%222.4%22/%3E%3Ccircle%20cx=%2280.1%22%20cy=%2264.9%22%20r=%222.1%22%20opacity=%220.7%22/%3E%3C/g%3E%3C%21--%20the%20key:%20hexagonal%20bow%20%2B%20shaft%20%2B%20bit,%20one%20solid%20violet%20--%3E%3Cg%20fill=%22%23a78bfa%22%3E%3C%21--%20shaft%20--%3E%3Crect%20x=%2248.7%22%20y=%2245%22%20width=%2217.2%22%20height=%226%22/%3E%3C%21--%20bit%20(teeth),%20hanging%20off%20the%20shaft%20near%20the%20tip%20--%3E%3Crect%20x=%2255%22%20y=%2251%22%20width=%223.5%22%20height=%226%22/%3E%3Crect%20x=%2261.5%22%20y=%2251%22%20width=%224%22%20height=%229%22/%3E%3C%21--%20bow:%20a%20pointy-top%20hexagon%20(cx%2034,%20cy%2048,%20r%2017)%20--%3E%3Cpolygon%20points=%2234,31%2048.72,39.5%2048.72,56.5%2034,65%2019.28,56.5%2019.28,39.5%22/%3E%3C/g%3E%3C%21--%20keyhole%20cut%20into%20the%20bow:%20this%20is%20the%20custody,%20held%20in%20the%20enclave%20--%3E%3Cg%20fill=%22%230e1220%22%3E%3Ccircle%20cx=%2234%22%20cy=%2244%22%20r=%224.5%22/%3E%3Cpolygon%20points=%2231.4,47%2036.6,47%2037.6,55%2030.4,55%22/%3E%3C/g%3E%3C%21--%20the%20name%20it%20publishes%20(the%20multibase%20%27k%27%20prefix%20of%20every%20IPNS%20name)%20--%3E%3Ctext%20x=%2234%22%20y=%2282.5%22%20font-family=%22monospace%22%20font-size=%229%22%20font-weight=%22bold%22%20fill=%22%238a94a6%22%20text-anchor=%22middle%22%3Ek51%3C/text%3E%3C/svg%3E">
 <style>
  body{{font:14px/1.5 system-ui,sans-serif;background:#101418;color:#d6dde4;max-width:780px;margin:2rem auto;padding:0 1rem}}
  h1{{font-size:1.2rem}} code{{word-break:break-all}}
@@ -840,5 +892,61 @@ fn serve() {
         if !(worked || p2p_busy || ipni_busy || flushed) {
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(value: &str) -> Config {
+        Config {
+            identity: Some(Identity::from_seed([9u8; 32])),
+            key_error: None,
+            value_src: value.into(),
+            lifetime_secs: 172800,
+            republish_secs: 14400,
+            ttl_secs: 300,
+            delegates: Vec::new(),
+            bootstrap: Vec::new(),
+            dht: false,
+            api_key: String::new(),
+            ipni_gateway_url: None,
+            ipni_publisher_url: None,
+            ipni_indexers: Vec::new(),
+            ipni_all_blocks: true,
+        }
+    }
+
+    #[test]
+    fn retry_delay_backs_off_and_never_exceeds_the_interval() {
+        let secs = |n| retry_delay(n, 14400).as_secs();
+        assert_eq!([secs(1), secs(2), secs(3), secs(4), secs(5), secs(6), secs(40)], [30, 60, 120, 240, 480, 900, 900]);
+        assert_eq!(retry_delay(3, 45).as_secs(), 45);
+    }
+
+    #[test]
+    fn a_round_that_signs_nothing_is_tried_again_soon() {
+        let mut app = App::new(config("")); // no value: every round fails
+        while app.tick() {}
+        assert!(app.record.is_none() && app.last_error.is_some());
+        assert_eq!(app.failed_rounds, 1);
+        let wait = app.next_publish.saturating_duration_since(Instant::now());
+        assert!(wait <= Duration::from_secs(30), "next round in {wait:?}, not in republishSecs");
+        // the next round fails too and waits longer
+        app.next_publish = Instant::now();
+        while app.tick() {}
+        assert_eq!(app.failed_rounds, 2);
+        let wait = app.next_publish.saturating_duration_since(Instant::now());
+        assert!(wait > Duration::from_secs(30) && wait <= Duration::from_secs(60), "{wait:?}");
+    }
+
+    #[test]
+    fn a_signed_round_waits_the_regular_interval() {
+        let mut app = App::new(config("/ipfs/bafybeihvox7sjpnt5uuaqa6we4zuigwl5ohdx4jjvnxyiccx76a2nx7pbe"));
+        while app.tick() {}
+        assert!(app.record.is_some() && app.last_error.is_none());
+        assert_eq!(app.failed_rounds, 0);
+        assert!(app.next_publish.saturating_duration_since(Instant::now()) > Duration::from_secs(14000));
     }
 }

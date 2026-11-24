@@ -27,6 +27,12 @@ use sha2::{Digest, Sha256};
 /// wedged connection, not a slow one; erroring lets the caller retry fresh.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(90);
 
+/// A PUT waits for the store to commit, and sia-s3 commits a small object only once its slab is on 30 Sia hosts:
+/// 20-60 s, set by the hosts' 4 MiB sector writes (2026-10-15). At 30 s every pin answered 502 while the object
+/// landed anyway. The loop is single-threaded, so the gateway waits with it; pins are rare.
+const PUT_READ_TIMEOUT: Duration = Duration::from_secs(180);
+const PUT_DEADLINE: Duration = Duration::from_secs(240);
+
 #[derive(Clone)]
 pub struct Creds {
     pub access_key_id: String,
@@ -216,7 +222,7 @@ impl Write for Wire {
     }
 }
 
-fn connect(ep: &Endpoint) -> Result<Wire, String> {
+fn connect(ep: &Endpoint, read_timeout: Duration) -> Result<Wire, String> {
     // No connect timeout, deliberately: dial(None) is plain TcpStream::connect,
     // which resolves names and tries each address itself. connect_timeout is
     // not trustworthy on wasm32-wasip2 (it can hand back a socket whose
@@ -226,7 +232,7 @@ fn connect(ep: &Endpoint) -> Result<Wire, String> {
     let sock = crate::egress::dial(ep.host.as_str(), ep.port, None)?;
     // A read timeout so a wedged peer surfaces as an error instead of
     // stalling the (single-threaded) event loop forever.
-    let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = sock.set_read_timeout(Some(read_timeout));
     if !ep.https {
         return Ok(Wire::Plain(sock));
     }
@@ -260,6 +266,28 @@ fn request(
     body: &[u8],
     extra: &[(String, String)],
 ) -> Result<(u16, Vec<u8>, Vec<(String, String)>), String> {
+    let (status, body, headers, _) = request_opt(method, ep, bucket, key, query, range, creds, body, extra, false)?;
+    Ok((status, body, headers))
+}
+
+/// `request`, but with `allow_short` a body that ends before its content-length is RETURNED (with `complete` false)
+/// instead of failing: the caller resumes it. Only get_range opts in; every other request still treats a short body as
+/// an error. (2026-10-13: the bucket's range answers sometimes end cleanly after ~3.2 MB of 4 MiB -- a clean close by the
+/// upstream after whole TLS records, measured byte-exact on the host -- and restarting the whole object on each one made
+/// a large object take several attempts.)
+#[allow(clippy::too_many_arguments)]
+fn request_opt(
+    method: &str,
+    ep: &Endpoint,
+    bucket: &str,
+    key: &str,
+    query: &[(String, String)],
+    range: Option<(u64, u64)>, // inclusive byte range
+    creds: Option<&Creds>,
+    body: &[u8],
+    extra: &[(String, String)],
+    allow_short: bool,
+) -> Result<(u16, Vec<u8>, Vec<(String, String)>, bool), String> {
     let canonical_uri = if key.is_empty() {
         format!("/{}", uri_encode(bucket, true))
     } else {
@@ -305,8 +333,9 @@ fn request(
     }
     head.push_str(&format!("content-length: {}\r\nconnection: close\r\n\r\n", body.len()));
 
-    let deadline = Instant::now() + REQUEST_DEADLINE;
-    let mut wire = connect(ep)?;
+    let put = method == "PUT";
+    let deadline = Instant::now() + if put { PUT_DEADLINE } else { REQUEST_DEADLINE };
+    let mut wire = connect(ep, if put { PUT_READ_TIMEOUT } else { Duration::from_secs(30) })?;
     wire.write_all(head.as_bytes()).map_err(|e| format!("send: {e}"))?;
     // 64 KiB body chunks keep the TLS record path and wasi write sizes sane
     for chunk in body.chunks(64 * 1024) {
@@ -392,16 +421,19 @@ fn request(
     }
     let he = head_end.ok_or("response ended before headers completed")?;
     if method == "HEAD" {
-        return Ok((status, Vec::new(), resp_headers));
+        return Ok((status, Vec::new(), resp_headers, true));
     }
     let raw = &rbuf[he..];
     let body = if chunked { dechunk(raw)? } else { raw.to_vec() };
     if let Some(cl) = content_length {
         if body.len() < cl {
+            if allow_short && !chunked {
+                return Ok((status, body, resp_headers, false));
+            }
             return Err(format!("short body: {} of {cl} bytes", body.len()));
         }
     }
-    Ok((status, body, resp_headers))
+    Ok((status, body, resp_headers, true))
 }
 
 /// Minimal HTTP/1.1 chunked-body decoder.
@@ -432,6 +464,9 @@ fn s3_error(status: u16, body: &[u8]) -> String {
     format!("S3 answered {status}: {text}")
 }
 
+/// How many times get_range asks again for the rest of a range answer that ended early.
+const RESUME_TRIES: usize = 4;
+
 /// GET `len` bytes of an object starting at `start`. The store may clamp the
 /// range at EOF, so the result can be shorter than asked; never longer.
 pub fn get_range(
@@ -445,10 +480,49 @@ pub fn get_range(
     if len == 0 {
         return Ok(Vec::new());
     }
-    let (status, mut body, _) =
-        request("GET", ep, bucket, key, &[], Some((start, start + len - 1)), creds, &[], &[])?;
+    let end = start + len - 1;
+    let (status, mut body, headers, complete) =
+        request_opt("GET", ep, bucket, key, &[], Some((start, end)), creds, &[], &[], true)?;
     match status {
-        206 => Ok(body),
+        206 if complete => Ok(body),
+        // A range answer that ended early: ask for exactly the missing bytes, from the SAME object version (If-Match on
+        // the first answer's ETag: a changed object answers 412 and the window fails as before, never a spliced body).
+        206 => {
+            let etag = headers.iter().find(|(k, _)| k == "etag").map(|(_, v)| v.clone());
+            let Some(etag) = etag else { return Err(format!("short body: {} of {len} bytes (no ETag to resume against)", body.len())) };
+            // the bytes this answer promised: its own content-length (the store clamps a range at EOF, so in an object's
+            // last window it can be less than `len`; resuming toward `len` would ask past EOF and fail with 416)
+            let want = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.trim().parse::<u64>().ok())
+                .map_or(len, |cl| cl.min(len));
+            for _ in 0..RESUME_TRIES {
+                if body.len() as u64 >= want {
+                    break;
+                }
+                let from = start + body.len() as u64;
+                let (st, more, more_headers, done) = request_opt("GET", ep, bucket, key, &[], Some((from, end)), creds, &[],
+                    &[("if-match".to_string(), etag.clone())], true)?;
+                if st != 206 {
+                    return Err(format!("resuming at byte {from}: {}", s3_error(st, &more)));
+                }
+                // A store that ignores If-Match (sia-s3 does) answers the new version: its ETag says so.
+                let more_etag = more_headers.iter().find(|(k, _)| k == "etag").map(|(_, v)| v.as_str());
+                if more_etag.is_some_and(|e| e.trim_matches('"') != etag.trim_matches('"')) {
+                    return Err(format!("resuming at byte {from}: the object changed (ETag {} became {})", etag, more_etag.unwrap_or("")));
+                }
+                if more.is_empty() {
+                    break;   // no progress: stop rather than spin
+                }
+                body.extend_from_slice(&more);
+                if done && body.len() as u64 >= want {
+                    break;
+                }
+            }
+            if (body.len() as u64) < want {
+                return Err(format!("short body: {} of {want} bytes after {RESUME_TRIES} resumes", body.len()));
+            }
+            body.truncate(want as usize);
+            Ok(body)
+        }
         // A store that ignores Range answers 200 with the whole object.
         200 if start == 0 => {
             body.truncate(len as usize);
@@ -781,6 +855,92 @@ mod tests {
         );
         assert_eq!(xml_field(&xml, "NextContinuationToken").as_deref(), Some("tok+1="));
         assert_eq!(xml_unescape("x&#x41;&#66;&bogus;y"), "xAB&bogus;y");
+    }
+
+    /// A local "bucket" that answers range GETs from `data`: the first answer ends early (a clean close after `cut`
+    /// bytes, as R2's sometimes did), every later one is whole unless `changed` (then 412, as for a new object version).
+    fn range_server(data: Vec<u8>, cut: usize, changed: bool) -> (Endpoint, std::sync::mpsc::Receiver<(String, Option<String>)>) {
+        range_server_with(data, cut, changed, false)
+    }
+
+    /// `ignores_if_match`: a changed object is answered (206, ETag "v2") instead of 412, as a store without
+    /// conditional GETs does.
+    fn range_server_with(data: Vec<u8>, cut: usize, changed: bool, ignores_if_match: bool) -> (Endpoint, std::sync::mpsc::Receiver<(String, Option<String>)>) {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (n, conn) in l.incoming().enumerate() {
+                let mut c = conn.unwrap();
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let (mut range, mut ifm) = (String::new(), None);
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("range: bytes=") { range = v.trim().to_string(); }
+                    if lower.starts_with("if-match:") { ifm = Some(line[9..].trim().to_string()); }
+                }
+                tx.send((range.clone(), ifm.clone())).unwrap();
+                if n > 0 && changed && !ignores_if_match {
+                    let _ = c.write_all(b"HTTP/1.1 412 Precondition Failed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                    continue;
+                }
+                let (a, b) = range.split_once('-').unwrap();
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse::<usize>().unwrap().min(data.len() - 1));   // clamped at EOF
+                let part = &data[a..=b];
+                let send = if n == 0 { &part[..cut] } else { part };
+                let version = if n > 0 && changed { "v2" } else { "v1" };
+                let _ = c.write_all(format!("HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\netag: \"{version}\"\r\nconnection: close\r\n\r\n", part.len()).as_bytes());
+                let _ = c.write_all(send);
+            }
+        });
+        (Endpoint { https: false, host: "127.0.0.1".into(), port, region: "auto".into() }, rx)
+    }
+
+    #[test]
+    fn a_range_answer_that_ends_early_is_resumed_from_the_same_version() {
+        let data: Vec<u8> = (0..4 * 1024 * 1024 + 100).map(|i| (i % 251) as u8).collect();
+        let (ep, seen) = range_server(data.clone(), 3_276_800, false);
+        let got = get_range(&ep, "ipfs", "pins/x", None, 100, 4 * 1024 * 1024).unwrap();
+        assert_eq!(got.len(), 4 * 1024 * 1024);
+        assert!(got == data[100..100 + 4 * 1024 * 1024], "the resumed bytes are exactly the object's");
+        let (r0, m0) = seen.recv().unwrap();
+        let (r1, m1) = seen.recv().unwrap();
+        assert_eq!(r0, format!("100-{}", 100 + 4 * 1024 * 1024 - 1));
+        assert_eq!(m0, None);
+        assert_eq!(r1, format!("{}-{}", 100 + 3_276_800, 100 + 4 * 1024 * 1024 - 1), "only the missing bytes");
+        assert_eq!(m1.as_deref(), Some("\"v1\""), "from the same object version");
+    }
+
+    #[test]
+    fn a_cut_in_the_last_window_resumes_to_eof_not_past_it() {
+        // the object ends 1 MiB into the asked window: the store clamps the range, and the cut lands inside it
+        let data: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (ep, seen) = range_server(data.clone(), 300_000, false);
+        let got = get_range(&ep, "ipfs", "pins/x", None, 4 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
+        assert!(got == data[4 * 1024 * 1024..], "exactly the object's tail");
+        let _ = seen.recv().unwrap();
+        let (r1, _) = seen.recv().unwrap();
+        assert_eq!(r1, format!("{}-{}", 4 * 1024 * 1024 + 300_000, 8 * 1024 * 1024 - 1));
+        assert!(seen.try_recv().is_err(), "no third request past EOF");
+    }
+
+    #[test]
+    fn a_changed_object_fails_the_window_instead_of_splicing() {
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (ep, _seen) = range_server(data, 300_000, true);
+        let e = get_range(&ep, "ipfs", "pins/x", None, 0, 1024 * 1024).unwrap_err();
+        assert!(e.contains("resuming at byte 300000"), "{e}");
+    }
+
+    #[test]
+    fn a_changed_object_fails_the_window_even_where_if_match_is_ignored() {
+        let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let (ep, _seen) = range_server_with(data, 300_000, true, true);
+        let e = get_range(&ep, "ipfs", "pins/x", None, 0, 1024 * 1024).unwrap_err();
+        assert!(e.contains("the object changed"), "{e}");
     }
 
     #[test]
