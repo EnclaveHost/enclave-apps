@@ -154,7 +154,9 @@
 //!                               token. Tool calls arrive as `{"tool":{...}}`
 //!                               (before the round trip, carrying `n`/`of`
 //!                               and the clock, `elapsed_s`/`max_seconds`) and
-//!                               `{"tool_result":{...}}` (after it); the reply
+//!                               `{"tool_result":{...}}` (after it, with the
+//!                               text the model read back as `result`, error
+//!                               or not); the reply
 //!                               regenerates from the result, so a `tool` event
 //!                               resets the client's buffer the way a `notice`
 //!                               does. `loop: true` on the request asks the
@@ -237,6 +239,7 @@ mod http;
 mod image;
 mod sampling;
 mod search;
+mod session;
 mod sso;
 mod tools;
 mod vision;
@@ -263,6 +266,10 @@ use sampling::{pick_row, Rng, Row, SampleParams};
 static CHAT_HTML: &str = include_str!("chat.html");
 static LEGAL_HTML: &str = include_str!("legal.html");
 static SSO_RETURN_HTML: &str = include_str!("sso-return.html");
+/// The mobile shell's sign-in return (/sso-app, /sso-app/return): a path the
+/// shell claims as a verified Android app link, shown in the browser only when
+/// the hand-off to the app needs a tap (src/sso-app.html).
+static SSO_APP_HTML: &str = include_str!("sso-app.html");
 static EMOJI_WOFF2: &[u8] = include_bytes!("../assets/emoji.woff2");
 /// The brand mark, for the consumers that ask the SERVER for an icon rather
 /// than reading the page's <link>: browsers hitting a non-HTML route, crawlers,
@@ -1022,6 +1029,153 @@ fn feed_waiting(
     }
 }
 
+/// Is this host error a refusal for ROOM - the shared pool or the MTP
+/// head's context - that generate() steps aside for and resumes after?
+fn pool_refused(e: &str) -> bool {
+    e.contains(POOL_FULL_MARKER) || e.contains(MTP_HEAD_FULL)
+}
+
+/// What generate() narrates while it waits for pool room. Opens with
+/// BUSY_STATUS, so internal_status holds an internal pass (router verdict,
+/// title, vision question) to its own busy allowance here exactly as in the
+/// session queue.
+fn pool_status(waited_ms: u128) -> String {
+    format!(
+        "{BUSY_STATUS} ({}s) - the model's memory is full, waiting for room to continue",
+        waited_ms / 1000
+    )
+}
+
+/// How an answer ends when the pool never drained.
+fn pool_full_gave_up(waited_ms: u128) -> String {
+    format!(
+        "the model's memory stayed full for {}s: this deployment is holding more (or longer) \
+         conversations than its context pool fits right now. Try again in a little while, \
+         or continue in a new chat",
+        waited_ms / 1000
+    )
+}
+
+/// The pause before generate()'s `n`th reopen (0-based) since the answer
+/// last made progress: POOL_REOPEN_MIN_MS doubling up to POOL_REOPEN_MAX_MS.
+/// generate() adds up to half again (pool_jitter).
+fn pool_reopen_delay(n: u32) -> u128 {
+    POOL_REOPEN_MIN_MS
+        .saturating_mul(1u128 << n.min(16))
+        .min(POOL_REOPEN_MAX_MS)
+}
+
+/// 0..span ms, drawn from the wall clock's sub-second part: enough to pull
+/// apart chats that were refused in the same instant, so they do not reopen
+/// into each other again. Nothing here needs to be unpredictable.
+fn pool_jitter(span: u128) -> u128 {
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    ((ns.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u128) % span.max(1)
+}
+
+/// A refused GENERATION step (POOL_FULL_MARKER) waits a moment drawn per
+/// call and tries once more before generate() steps the answer aside. An MTP
+/// round takes the decode turn alone, so a pool that runs out refuses every
+/// generating chat within milliseconds of each other; drawn apart, the first
+/// to retry finds no room and steps aside, and the cells it hands back let
+/// the others' retries through - one chat pauses instead of all of them.
+/// `step(retry)`: the refused call changed nothing (llama.cpp leaves the
+/// pool as it was, the engine advances no position), except that a fused
+/// round's folded observe ran before its verify - so it has landed, and the
+/// retry must not send it again. Never for a prompt chunk: the engine books
+/// a chunk before decoding it, and the same chunk sent twice is refused or
+/// desyncs its token shadow.
+fn pool_retry<T>(step: impl FnMut(bool) -> Result<T, String>) -> Result<T, String> {
+    pool_retry_with(step, &|ms| sleep_ms(ms))
+}
+
+fn pool_retry_with<T>(
+    mut step: impl FnMut(bool) -> Result<T, String>,
+    sleep: &dyn Fn(u64),
+) -> Result<T, String> {
+    match step(false) {
+        Err(e) if e.contains(POOL_FULL_MARKER) => {
+            sleep((POOL_RETRY_MIN_MS + pool_jitter(POOL_RETRY_SPAN_MS)) as u64);
+            step(true)
+        }
+        r => r,
+    }
+}
+
+/// A resumed answer's tokens so far (see Answer), fed behind its prompt;
+/// returns the row the last of them leaves, which the next token is sampled
+/// from. Fed as GENERATION - "all"-shaped passes in prefill-sized chunks -
+/// and never as more prompt: the engine parks a prompt when its first
+/// generation step arrives, and prompt-plus-half-an-answer is a park no later
+/// turn branches off (the next prompt renders the answer through the
+/// template) that would hold its cells for the park's whole TTL - the very
+/// room the resume waited for. Measured 2026-10-05 on a 1024-token pool: two
+/// resumed answers parked that way kept a third chat out for five minutes.
+fn feed_answer(
+    sess: &mut Session,
+    cfg: &AppConfig,
+    ids: &[u32],
+    status: &dyn Fn(&str) -> bool,
+) -> Result<Row, String> {
+    if let Session::Onnx { .. } = sess {
+        return sess.feed(cfg, ids, true); // no shared pool, no parks
+    }
+    feed_answer_chunks(sess, cfg, ids, status, |s, c, _| {
+        s.feed_all(cfg, c).map(|mut rows| rows.pop().unwrap_or_else(|| Row::dense(Vec::new())))
+    })
+}
+
+/// feed_answer for the MTP loop: each chunk's hidden rows are harvested for
+/// the real sequence `t_seq` and its tokens observed into the head from
+/// position `t_fed` on - exactly how a round's accepted tokens reach it - so
+/// the head drafts from the answer as it stands.
+fn feed_answer_mtp(
+    sess: &mut Session,
+    cfg: &AppConfig,
+    ids: &[u32],
+    t_seq: i32,
+    t_fed: usize,
+    status: &dyn Fn(&str) -> bool,
+) -> Result<Row, String> {
+    feed_answer_chunks(sess, cfg, ids, status, |s, c, done| {
+        let mut rows = s.feed_all_mtp(cfg, c, t_seq)?;
+        s.mtp_accept(t_fed + done, c)?;
+        Ok(rows.pop().unwrap_or_else(|| Row::dense(Vec::new())))
+    })
+}
+
+fn feed_answer_chunks(
+    sess: &mut Session,
+    cfg: &AppConfig,
+    ids: &[u32],
+    status: &dyn Fn(&str) -> bool,
+    mut feed: impl FnMut(&mut Session, &[u32], usize) -> Result<Row, String>,
+) -> Result<Row, String> {
+    let chunk = prefill_chunk(sess, cfg);
+    let (mut done, mut last_tick) = (0usize, now_ms());
+    let mut row = Row::dense(Vec::new());
+    for c in ids.chunks(chunk) {
+        row = feed(sess, c, done)?;
+        done += c.len();
+        if done < ids.len() && now_ms() - last_tick >= PREFILL_TICK_MS {
+            last_tick = now_ms();
+            if !status(&format!(
+                "{PREFILL_STATUS}the answer so far again: {done} of {} tokens",
+                ids.len()
+            )) {
+                return Err("client disconnected".into());
+            }
+        }
+    }
+    if row.vals.is_empty() {
+        return Err("the engine returned no row for the answer so far".into());
+    }
+    Ok(row)
+}
+
 /// The "(N of M tokens)" a PREFIX_WARMING_MARKER refusal carries: the
 /// leader's progress toward the mark this request is waiting on.
 fn prefix_wait_progress(e: &str) -> Option<(usize, usize)> {
@@ -1050,6 +1204,106 @@ mod prefix_wait_tests {
         assert_eq!(prefix_wait_progress("compute: something else (1 of 2 tokens)"), None);
         assert_eq!(prefix_wait_progress("[prefix_warming] no numbers"), None);
         assert_eq!(prefix_wait_progress("[prefix_warming] (x of y tokens)"), None);
+    }
+}
+
+#[cfg(test)]
+mod pool_wait_tests {
+    use super::*;
+
+    #[test]
+    fn an_internal_pass_waits_only_its_own_busy_allowance() {
+        // the wait narrates as a busy tick, so internal_status's budget
+        // applies: spent at once here, and generate() is told to stop
+        let relay = internal_status("naming the chat", &|_: &str| {}, 0);
+        assert!(!relay(&pool_status(0)));
+        let relay = internal_status("naming the chat", &|_: &str| {}, 60_000);
+        assert!(relay(&pool_status(0)));
+    }
+
+    // the exact text wasm/wasmtime-nn-ggml.patch's decode_err(1) builds,
+    // wrapped the way nn_err() wraps it (the 2026-10-04 eyesoff.ai report)
+    const REFUSED: &str = "mtp_round: ErrorCode::RuntimeError: Failed while accessing backend: \
+        [kv_pool_full] the shared KV pool cannot hold this step right now — too many (or too \
+        long) concurrent chats; retry shortly, or redeploy with a larger share";
+
+    #[test]
+    fn a_refused_step_is_retried_once_after_a_drawn_pause_without_its_observe() {
+        let slept = std::cell::RefCell::new(Vec::new());
+        let sleep = |ms: u64| slept.borrow_mut().push(ms);
+        // what mtp_round sends: the folded observe on the first try only
+        let mut sent_obs = Vec::new();
+        let r = pool_retry_with(|retry| {
+            sent_obs.push(!retry);
+            if retry { Ok(7) } else { Err(REFUSED.to_string()) }
+        }, &sleep);
+        assert_eq!(r, Ok(7));
+        assert_eq!(sent_obs, vec![true, false]);
+        let slept = slept.borrow();
+        assert_eq!(slept.len(), 1);
+        let lo = POOL_RETRY_MIN_MS as u64;
+        assert!((lo..lo + POOL_RETRY_SPAN_MS as u64).contains(&slept[0]), "{slept:?}");
+    }
+
+    #[test]
+    fn a_step_refused_twice_goes_up_to_generate_and_other_errors_pass_straight_through() {
+        let calls = std::cell::Cell::new(0);
+        let r: Result<(), String> = pool_retry_with(|_| {
+            calls.set(calls.get() + 1);
+            Err(REFUSED.to_string())
+        }, &|_| {});
+        assert!(r.unwrap_err().contains(POOL_FULL_MARKER), "generate() must see the refusal");
+        assert_eq!(calls.get(), 2);
+        let slept = std::cell::Cell::new(false);
+        let r: Result<(), String> =
+            pool_retry_with(|_| Err("mtp observe failed (rc 1)".into()), &|_| slept.set(true));
+        assert_eq!(r.unwrap_err(), "mtp observe failed (rc 1)");
+        assert!(!slept.get(), "no pause for an error that is not pool room");
+    }
+
+    #[test]
+    fn a_full_mtp_head_is_room_too_but_a_stale_observe_is_a_fault() {
+        assert!(pool_refused(REFUSED));
+        // the 2026-10-05 run's exact error, and the fused round's own
+        assert!(pool_refused("mtp_accept: ErrorCode::RuntimeError: Failed while accessing backend: \
+            mtp observe failed (rc 1; harvested rows stale?)"));
+        assert!(pool_refused("[mtp_obs_failed] fused observe failed (rc 1; harvested rows stale?)"));
+        assert!(!pool_refused("mtp observe failed (rc -1; harvested rows stale?)"));
+        assert!(!pool_refused("mtp observe failed (rc 12; harvested rows stale?)"));
+        // the in-place retry stays pool-only: a failed observe did not land,
+        // and retrying without it would desync the head
+        let calls = std::cell::Cell::new(0);
+        let _ = pool_retry_with(|_| -> Result<(), String> {
+            calls.set(calls.get() + 1);
+            Err("[mtp_obs_failed] fused observe failed (rc 1; harvested rows stale?)".into())
+        }, &|_| {});
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn the_sentence_an_answer_ends_with_is_not_a_refusal() {
+        let e = pool_full_gave_up(301_000);
+        assert!(!e.contains(POOL_FULL_MARKER), "{e}");
+        assert!(e.contains("301s"), "{e}");
+    }
+
+    #[test]
+    fn reopens_back_off_and_are_drawn_apart() {
+        let d: Vec<u128> = (0..6).map(pool_reopen_delay).collect();
+        assert_eq!(d, vec![4_000, 8_000, 16_000, 30_000, 30_000, 30_000]);
+        assert_eq!(pool_reopen_delay(u32::MAX), POOL_REOPEN_MAX_MS);
+        for _ in 0..1000 {
+            assert!(pool_jitter(2_000) < 2_000);
+        }
+        assert_eq!(pool_jitter(0), 0);
+        // the clock's sub-second part spreads the draws, not one value
+        let draws: std::collections::HashSet<u128> = (0..64)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_micros(37));
+                pool_jitter(15_000)
+            })
+            .collect();
+        assert!(draws.len() > 8, "{draws:?}");
     }
 }
 /// Request-body ceiling. Generous because attachments arrive base64'd INSIDE
@@ -1097,6 +1351,50 @@ const PREFIX_WAIT_BUDGET_MS: u128 = 900_000;
 /// pass that cannot start is dropped, so the queue allowance stays with the
 /// answer the user is actually waiting for.
 const INTERNAL_BUSY_BUDGET_MS: u128 = 30_000;
+/// The host's shared KV pool (one per model: ENCLAVE_GGML_N_CTX tokens that
+/// every concurrent chat, internal pass and parked prompt prefix draws from)
+/// refuses a decode it cannot place with this marker. Until 2026-10-04 it
+/// ended the answer - "gpu: mtp_round: ... [kv_pool_full] ..." mid-reply on
+/// eyesoff.ai, behind a Retry button that read the whole prompt again into
+/// the same full pool. generate() now steps aside and resumes instead.
+///
+/// Stepping aside, not waiting in place, because a pool with no room
+/// refuses EVERY generating chat at once (each step needs a cell): chats
+/// that each held their cells and waited would only wait on each other.
+const POOL_FULL_MARKER: &str = "[kv_pool_full]";
+
+thread_local! {
+    /// how many times a generation stepped aside for pool room since the
+    /// answer loop last looked (take_pool_step_asides): the one reading of
+    /// the pool's REAL state the guest gets - its own prompt is only part of
+    /// what fills it (other chats, parked prefixes)
+    static POOL_STEP_ASIDES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn take_pool_step_asides() -> u32 {
+    POOL_STEP_ASIDES.with(|c| c.replace(0))
+}
+/// The MTP head runs its own llama context, sized like the pool (n_ctx,
+/// unified) and holding every sequence's mirrored positions, so it runs out
+/// of room alongside it - and says so only as llama's no-slot code from an
+/// observe: "[mtp_obs_failed] fused observe failed (rc 1; ...)" or
+/// "mtp observe failed (rc 1; ...)". Seen 2026-10-05 on a 640-token pool, in
+/// the answer that got through once its neighbour stepped aside. Other rc
+/// values are real faults (stale rows), not room.
+const MTP_HEAD_FULL: &str = "observe failed (rc 1;";
+const POOL_POLL_MS: u64 = 2000;
+/// The session queue's allowance, counted from the answer's last progress.
+/// A pool that has not drained by then is not going to (one long chat, or
+/// parked prefixes, fill it), and the answer ends with a sentence instead.
+const POOL_WAIT_BUDGET_MS: u128 = 300_000;
+/// Each reopen reads the prompt again from the longest park it still
+/// matches, so reopens back off instead of polling: 4 s, 8 s, 16 s, then
+/// every 30 s, each plus up to half again.
+const POOL_REOPEN_MIN_MS: u128 = 4_000;
+const POOL_REOPEN_MAX_MS: u128 = 30_000;
+/// pool_retry's pause before its one retry in place: 0.5 s plus up to 2 s.
+const POOL_RETRY_MIN_MS: u128 = 500;
+const POOL_RETRY_SPAN_MS: u128 = 2_000;
 
 /// Status relay for an internal generation (router verdict, vision question,
 /// chat title). generate() narrates its busy queue through the status
@@ -1323,8 +1621,10 @@ impl Session {
     }
 
     /// Feed `ids`; with `want_logits`, return the LAST token's logits row.
+    /// Generation steps only - a refused feed gets pool_retry's one retry,
+    /// which a prompt chunk must not (prefill goes through feed_declared).
     fn feed(&mut self, cfg: &AppConfig, ids: &[u32], want_logits: bool) -> Result<Row, String> {
-        self.feed_declared(cfg, ids, want_logits, None)
+        pool_retry(|_| self.feed_declared(cfg, ids, want_logits, None))
     }
 
     /// feed(), plus the mm34 prefix-cache declaration on a prompt's FIRST
@@ -1889,14 +2189,15 @@ impl Session {
             return Err("speculative decoding needs the ggml backend".into());
         };
         let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let outs = ctx
-            .compute(vec![
+        let outs = pool_retry(|_| {
+            ctx.compute(vec![
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 topk_input(),
                 timing_input(),
             ])
-            .map_err(|e| nn_err("compute", e))?;
+            .map_err(|e| nn_err("compute", e))
+        })?;
         note_timing("feed_all", &outs);
         rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
@@ -2002,6 +2303,9 @@ impl Session {
             prefix_wait: data.len() >= 60 && v(14) > 0,
             warming: if data.len() >= 64 { v(15).max(0) } else { 0 },
             parks: if data.len() >= 68 { v(16).max(0) } else { 0 },
+            // the engine's array (ggml.rs "caps"): 16 protocol, 17 claims,
+            // 18 parks, 19 end parks
+            park_end: data.len() >= 80 && v(19) != 0,
         })
     }
 
@@ -2067,15 +2371,16 @@ impl Session {
             return Err("speculative decoding needs the ggml backend".into());
         };
         let bytes: Vec<u8> = ids.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let outs = ctx
-            .compute(vec![
+        let outs = pool_retry(|_| {
+            ctx.compute(vec![
                 ("tokens".to_string(), Tensor::new(&[1, ids.len() as u32], TensorType::I32, &bytes)),
                 ("all".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
                 ("mtp_for".to_string(), Tensor::new(&[1], TensorType::I32, &real_seq.to_le_bytes())),
                 topk_input(),
                 timing_input(),
             ])
-            .map_err(|e| nn_err("compute", e))?;
+            .map_err(|e| nn_err("compute", e))
+        })?;
         note_timing("feed_all_mtp", &outs);
         rows_from_outs(&outs, ids.len(), cfg.vocab)
     }
@@ -2148,25 +2453,29 @@ impl Session {
         bytes.extend_from_slice(&p_min_milli.to_le_bytes());
         let pbytes: Vec<u8> =
             pending.iter().flat_map(|&t| (t as i32).to_le_bytes()).collect();
-        let mut inputs = vec![
-            ("mtp_round".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
-            ("tokens".to_string(),
-             Tensor::new(&[1, pending.len() as u32], TensorType::I32, &pbytes)),
-            topk_input(),
-            timing_input(),
-        ];
-        if let Some((pos0, toks)) = obs {
-            let mut ob = Vec::with_capacity((toks.len() + 1) * 4);
-            ob.extend_from_slice(&(pos0 as i32).to_le_bytes());
-            for t in toks {
-                ob.extend_from_slice(&(*t as i32).to_le_bytes());
+        let outs = pool_retry(|retry| {
+            let mut inputs = vec![
+                ("mtp_round".to_string(), Tensor::new(&[3], TensorType::I32, &bytes)),
+                ("tokens".to_string(),
+                 Tensor::new(&[1, pending.len() as u32], TensorType::I32, &pbytes)),
+                topk_input(),
+                timing_input(),
+            ];
+            // a round refused for pool room ran its observe before the
+            // verify: it has landed, and must not be sent twice (pool_retry)
+            if let (Some((pos0, toks)), false) = (obs, retry) {
+                let mut ob = Vec::with_capacity((toks.len() + 1) * 4);
+                ob.extend_from_slice(&(pos0 as i32).to_le_bytes());
+                for t in toks {
+                    ob.extend_from_slice(&(*t as i32).to_le_bytes());
+                }
+                inputs.push((
+                    "mtp_obs".to_string(),
+                    Tensor::new(&[(toks.len() + 1) as u32], TensorType::I32, &ob),
+                ));
             }
-            inputs.push((
-                "mtp_obs".to_string(),
-                Tensor::new(&[(toks.len() + 1) as u32], TensorType::I32, &ob),
-            ));
-        }
-        let outs = ctx.compute(inputs).map_err(|e| nn_err("mtp_round", e))?;
+            ctx.compute(inputs).map_err(|e| nn_err("mtp_round", e))
+        })?;
         note_timing("mtp_round", &outs);
         let drafts: Vec<u32> = outs
             .iter()
@@ -2268,6 +2577,21 @@ impl Session {
     /// until this branch decodes. The speculative primitive that replaces
     /// rewind: verify draft tokens on a branch, adopt the branch on full
     /// accept, re-feed only the accepted tokens on partial accept.
+    /// ggml only (mm37): ask the engine to park this sequence whole when the
+    /// session ends - prompt plus answer - so the conversation's next turn,
+    /// which replays the answer as its ids, branches off its end. Best
+    /// effort: an engine without it (caps[17] = 0) is simply not asked.
+    fn request_end_park(&mut self) {
+        if !self.caps().map(|c| c.park_end).unwrap_or(false) {
+            return;
+        }
+        let Session::Ggml { ctx } = self else { return };
+        let _ = ctx.compute(vec![
+            ("park_end".to_string(), Tensor::new(&[1], TensorType::I32, &1i32.to_le_bytes())),
+            timing_input(),
+        ]);
+    }
+
     fn copy_from(&mut self, src_seq: i32, src_fed: usize) -> Result<(), String> {
         let Session::Ggml { ctx } = self else {
             return Err("copy_from needs the ggml backend".into());
@@ -2315,6 +2639,25 @@ impl Session {
 /// every one of these is a mistake someone can only fix if they know which of
 /// four different reasons stopped them: this model cannot see, this backend
 /// cannot see, too many pictures, or one picture too large.
+/// The newest message, when the request ends with one from the user, may
+/// take at most max_message_tokens of text. Older ones got in under whatever
+/// limit stood then, and refusing them now would end the chat for good.
+fn check_message_tokens(cfg: &AppConfig, tok: &Tok, messages: &[ChatMsg]) -> Result<(), String> {
+    let max = cfg.max_message_tokens;
+    let Some(m) = messages.last().filter(|m| max > 0 && m.role == "user") else {
+        return Ok(());
+    };
+    let n = tok.encode_ids(&m.content, false)?.len();
+    if n > max {
+        return Err(format!(
+            "[message_too_long] this message is {n} tokens, and one message may be at most {max} \
+             (about {} words). Shorten it, or send it in parts.",
+            max * 3 / 4
+        ));
+    }
+    Ok(())
+}
+
 fn check_images(
     raw: &serde_json::Value,
     cfg: &AppConfig,
@@ -2511,6 +2854,9 @@ struct Caps {
     /// warm_one's probe feed exists to obtain
     warming: i32,
     parks: i32,
+    /// mm37: the engine parks a finished sequence whole when asked
+    /// ({"park_end": [1]}), so the next turn branches off the answer's end
+    park_end: bool,
 }
 
 /// Everything speculative decoding needs beyond the target session: the
@@ -2622,12 +2968,17 @@ struct GenParams {
     /// identical consecutive token blocks that end a degenerate reply
     /// (0 = off). Unlike think_budget this applies to the whole reply.
     loop_reps: usize,
+    /// mm37: this generation is a chat turn whose answer the client keeps as
+    /// ids - ask the engine to park the finished sequence (request_end_park)
+    park_end: bool,
 }
 
 struct GenStats {
     target: String,
     prompt_tokens: usize,
     tokens: usize,
+    /// mm37: the generated token ids themselves (`tokens` of them)
+    ids: Vec<u32>,
     load_ms: u128,
     prefill_ms: u128,
     decode_ms: u128,
@@ -3007,6 +3358,15 @@ impl ThinkGuard {
 /// proposes draft_tokens ahead, the target verifies them in one pass, and
 /// every accepted token skips a full target step; any draft-side failure
 /// falls back to plain decode with a status note.
+///
+/// A full KV pool (pool_refused) does not end the answer. A refused
+/// step first gets one short retry in place (pool_retry); still refused, the
+/// attempt steps aside - its session goes with it, handing every cell it
+/// held back to the pool - and once there may be room again a fresh attempt
+/// picks the answer up where it stopped: the prompt is prefilled (branched
+/// off the turn's own park when it still stands), the tokens already
+/// generated are fed behind it (feed_answer), and decoding continues through
+/// the same Answer, so the reader sees one unbroken reply.
 fn generate(
     cfg: &AppConfig,
     tok: &Tok,
@@ -3016,6 +3376,86 @@ fn generate(
     p: &GenParams,
     draft: &DraftPlan,
     emit: &dyn Fn(&str) -> bool,
+    status: &dyn Fn(&str) -> bool,
+) -> Result<GenStats, String> {
+    let mut ans = Answer {
+        out: TextOut::new(tok, emit, &p.stop_strings),
+        think: ThinkGuard::new(p.think_budget, p.think_open, tok),
+        guard_from: 0,
+        drafted: 0,
+        accepted: 0,
+    };
+    // the wait is counted from the first refusal since the answer last grew:
+    // a long answer that steps aside more than once is not cut off for the
+    // time it spent making progress in between
+    let (mut since, mut reopens, mut grown) = (None::<u128>, 0u32, 0usize);
+    loop {
+        match generate_attempt(cfg, prompt, target, tname, p, draft, &mut ans, status) {
+            Ok(s) => return Ok(s),
+            Err(e) if pool_refused(&e) => {
+                POOL_STEP_ASIDES.with(|c| c.set(c.get() + 1));
+                if ans.out.generated.len() > grown {
+                    grown = ans.out.generated.len();
+                    (since, reopens) = (None, 0);
+                }
+                let t0 = *since.get_or_insert_with(now_ms);
+                let pause = pool_reopen_delay(reopens);
+                let reopen_at = now_ms() + pause + pool_jitter(pause / 2);
+                reopens += 1;
+                loop {
+                    let waited = now_ms().saturating_sub(t0);
+                    if waited >= POOL_WAIT_BUDGET_MS {
+                        return Err(pool_full_gave_up(waited));
+                    }
+                    if !status(&pool_status(waited)) {
+                        return Err("client disconnected".into());
+                    }
+                    let left = reopen_at.saturating_sub(now_ms());
+                    if left == 0 {
+                        break;
+                    }
+                    sleep_ms((left as u64).min(POOL_POLL_MS));
+                }
+                if !ans.out.generated.is_empty() && !status(&format!(
+                    "picking the answer up again where it stopped ({} tokens in)",
+                    ans.out.generated.len()
+                )) {
+                    return Err("client disconnected".into());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// What an answer has produced so far. generate() owns it and lends it to
+/// each attempt, so an attempt that steps aside for pool room leaves it
+/// exactly where the reader's view of the answer is, and the next attempt
+/// decodes on through it: nothing sent twice, nothing in the stop-string
+/// holdback lost, the think budget and the repetition check where they were.
+struct Answer<'a> {
+    out: TextOut<'a>,
+    think: ThinkGuard,
+    /// where the repetition check starts: moved past a force-closed
+    /// reasoning block so the answer is not condemned for the loop that
+    /// preceded it
+    guard_from: usize,
+    drafted: usize,
+    accepted: usize,
+}
+
+/// One generate() attempt on a fresh session: prefill `prompt`, feed the
+/// answer so far behind it when resuming (feed_answer), and decode on
+/// through `ans`.
+#[allow(clippy::too_many_arguments)]
+fn generate_attempt(
+    cfg: &AppConfig,
+    prompt: &Prompt,
+    target: ExecutionTarget,
+    tname: &str,
+    p: &GenParams,
+    draft: &DraftPlan,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     // The repetition window and the RNG seed read the text side of the
@@ -3054,6 +3494,9 @@ fn generate(
         }
     };
     let load_ms = now_ms() - t0;
+    if p.park_end {
+        sess.request_end_park();
+    }
 
     // speculative path: the rig opening non-retrying - busy slots, an unfit
     // share, a headless volume, or a host predating the speculative verbs
@@ -3089,7 +3532,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via {} - prefilling {} prompt tokens", dc.name, ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_spec(cfg, dc, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
+                return generate_spec(cfg, dc, ids, &prompt.marks, tname, p, sess, rig, load_ms, ans, status);
             }
             Err(e) => {
                 let _ = status(&format!("draft model unavailable ({}); plain decode", strip_code(&e)));
@@ -3100,7 +3543,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via the model's MTP head - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_mtp(cfg, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
+                return generate_mtp(cfg, ids, &prompt.marks, tname, p, sess, rig, load_ms, ans, status);
             }
             Err(e) => {
                 let _ = status(&format!("MTP drafting unavailable ({}); plain decode", strip_code(&e)));
@@ -3111,7 +3554,7 @@ fn generate(
                 if !status(&format!("session ready ({load_ms} ms); speculative decode via prompt lookup - prefilling {} prompt tokens", ids.len())) {
                     return Err("client disconnected".into());
                 }
-                return generate_lookup(cfg, tok, ids, &prompt.marks, tname, p, sess, rig, load_ms, emit, status);
+                return generate_lookup(cfg, ids, &prompt.marks, tname, p, sess, rig, load_ms, ans, status);
             }
             Err(e) => {
                 let _ = status(&format!("prompt-lookup drafting unavailable ({}); plain decode", strip_code(&e)));
@@ -3179,7 +3622,7 @@ fn generate(
                     // waiting out a warm-up of its prefix already under way (mm36)
                     let (l, took) = feed_waiting(|wait| {
                         let declare = if fed == 0 && done == 0 {
-                            prompt.text_only().map(|t| Declare { prompt: t, marks: prompt.marks.as_slice(), wait })
+                            prompt.declared().map(|(t, marks)| Declare { prompt: t, marks, wait })
                         } else { None };
                         sess.feed_declared(cfg, &ids[done..end], last, declare)
                     }, status, t1, prompt_ids.len())?;
@@ -3229,17 +3672,17 @@ fn generate(
         // means the render went wrong rather than the model.
         return Err("prompt ended without a text turn to answer from".into());
     }
+    // a resumed answer: its tokens so far go in behind the prompt
+    if !ans.out.generated.is_empty() {
+        logits = feed_answer(&mut sess, cfg, &ans.out.generated, status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     // -- decode
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    // where the repetition check starts: moved past a force-closed reasoning
-    // block so the answer is not condemned for the loop that preceded it
-    let mut guard_from = 0usize;
     let mut finish: &'static str = "stop";
     loop {
         let recent = out.recent(prompt_ids, p.sample.rep_window);
@@ -3257,8 +3700,8 @@ fn generate(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted: 0, accepted: 0,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: prompt.images, image_pos,
                 });
             }
@@ -3269,7 +3712,7 @@ fn generate(
         // the think budget below never sees. Inside the reasoning block it is
         // the BLOCK that ends instead of the reply (take_loop), because a reply
         // that stops there has nothing in it the user asked for.
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break;
         }
@@ -3283,7 +3726,7 @@ fn generate(
             // the answer is judged for repetition on ITS OWN tokens: the loop
             // that just ended is still in `generated` and would trip the guard
             // again on the next token
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             let mut ids = vec![next];
             ids.extend_from_slice(&think.close);
             logits = sess.feed(cfg, &ids, true)?;
@@ -3297,8 +3740,8 @@ fn generate(
     gperf_note(&mut sess, gperf0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted: 0, accepted: 0,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: prompt.images, image_pos,
     })
 }
@@ -3328,7 +3771,6 @@ fn generate(
 fn generate_spec(
     cfg: &AppConfig,
     dcfg: &AppConfig,
-    tok: &Tok,
     prompt_ids: &[u32],
     marks: &[usize],
     tname: &str,
@@ -3336,7 +3778,7 @@ fn generate_spec(
     mut sess: Session,
     rig: SpecRig,
     load_ms: u128,
-    emit: &dyn Fn(&str) -> bool,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let SpecRig { mut dsess, mut tscr, mut dscr, t_seq, d_seq, tscr_seq, dscr_seq } = rig;
@@ -3351,19 +3793,22 @@ fn generate_spec(
     prefill_text(&mut dsess, dcfg, prompt_ids, marks, &draft_status, |s, ids, _last, declare| {
         s.feed_declared(dcfg, ids, false, declare)
     })?;
+    // a resumed answer: its tokens so far go in behind the prompt, on both
+    if !ans.out.generated.is_empty() {
+        t_logits = feed_answer(&mut sess, cfg, &ans.out.generated, status)?;
+        feed_answer(&mut dsess, dcfg, &ans.out.generated, &draft_status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
-    let (mut drafted, mut accepted) = (0usize, 0usize);
-    // fed-token cursors, so rewinds land on absolute positions
-    let mut t_fed = prompt_ids.len();
-    let mut d_fed = prompt_ids.len();
+    // fed-token cursors, so rewinds land on absolute positions (a resumed
+    // answer's tokens so far are fed already)
+    let mut t_fed = prompt_ids.len() + out.generated.len();
+    let mut d_fed = t_fed;
     let mut d_behind: Vec<u32> = Vec::new(); // target-fed tokens the draft hasn't seen yet
 
     // the first token comes straight off the target's prefill row
@@ -3378,8 +3823,8 @@ fn generate_spec(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
@@ -3390,7 +3835,7 @@ fn generate_spec(
         //    the plain loop). Speculative decode makes this MORE likely to run
         //    long, not less - a looping target accepts its own drafts almost
         //    perfectly, so the repetition arrives faster.
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -3403,7 +3848,7 @@ fn generate_spec(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             let mut row = sess.feed(cfg, &ids, true)?;
@@ -3434,7 +3879,7 @@ fn generate_spec(
                 dscr_fed += 1;
             }
         }
-        drafted += drafts.len();
+        *drafted += drafts.len();
         // -- ONE verify pass over [pending, d1..dk] on the target BRANCH:
         //    k+1 rows, the real sequence untouched
         tscr.copy_from(t_seq, t_fed)?;
@@ -3458,12 +3903,12 @@ fn generate_spec(
             // the draft predicted the target's sample exactly - it is the
             // target's token in every sense; run it through the same gates
             if cfg.eos.contains(&d) {
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             match out.push(d) {
@@ -3472,16 +3917,16 @@ fn generate_spec(
                     let decode_ms = now_ms() - t2;
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                        finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; break 'outer; }
             }
             acc += 1;
         }
-        accepted += acc;
+        *accepted += acc;
         if let Some(r) = replacement {
             // partial round: commit ONLY the accepted tokens to the real
             // target (one batched pass, logits unread) and abandon both
@@ -3510,8 +3955,8 @@ fn generate_spec(
     let decode_ms = now_ms() - t2;
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted, accepted,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
@@ -3527,7 +3972,6 @@ fn generate_spec(
 #[allow(clippy::too_many_arguments)]
 fn generate_mtp(
     cfg: &AppConfig,
-    tok: &Tok,
     prompt_ids: &[u32],
     marks: &[usize],
     tname: &str,
@@ -3535,7 +3979,7 @@ fn generate_mtp(
     mut sess: Session,
     rig: MtpRig,
     load_ms: u128,
-    emit: &dyn Fn(&str) -> bool,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
@@ -3567,17 +4011,19 @@ fn generate_mtp(
     let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, _last, declare| {
         s.feed_mtp_declared(cfg, ids, declare)
     })?;
+    // a resumed answer: its tokens so far go in behind the prompt, mirrored
+    // into the head like any accepted round
+    if !ans.out.generated.is_empty() {
+        t_logits = feed_answer_mtp(&mut sess, cfg, &ans.out.generated, t_seq, prompt_ids.len(), status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
-    let (mut drafted, mut accepted) = (0usize, 0usize);
-    let mut t_fed = prompt_ids.len();
+    let mut t_fed = prompt_ids.len() + out.generated.len(); // resumed: fed already
 
     let recent = out.recent(prompt_ids, p.sample.rep_window);
     let mut pending = pick_row(&mut t_logits, &recent, &p.sample, &mut rng);
@@ -3590,8 +4036,8 @@ fn generate_mtp(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
@@ -3601,7 +4047,7 @@ fn generate_mtp(
         //    what is stuck (see the plain loop; the MTP head predicts a
         //    repeating tail near-perfectly, so this path reaches the cap
         //    fastest of the three)
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -3615,7 +4061,7 @@ fn generate_mtp(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             // a deferred observe must land BEFORE the forced pass below
             // overwrites the harvest rows it pairs with
             if let Some((op, ot)) = pending_obs.take() {
@@ -3711,7 +4157,17 @@ fn generate_mtp(
                 tscr_fed = t_fed + feed.len();
             }
         }
-        drafted += drafts.len();
+        *drafted += drafts.len();
+        // mm37: every exit from the verify below ends the generation
+        // mid-round. In rewind mode the real sequence still holds this
+        // round's unchecked drafts: drop them exactly as a partial accept
+        // does (within the snapshot depth), so the engine's end park is the
+        // answer's own prefix and the next turn can branch off it.
+        let settle = |sess: &mut Session, acc: usize| {
+            if depth > 0 {
+                let _ = sess.rewind_to(t_fed0 + acc + 1);
+            }
+        };
         // -- verify: accept while the target's own sample agrees
         let mut acc = 0usize;
         let mut replacement: Option<u32> = None;
@@ -3723,30 +4179,33 @@ fn generate_mtp(
                 break;
             }
             if cfg.eos.contains(&d) {
-                accepted += acc;
+                *accepted += acc;
+                settle(&mut sess, acc);
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
-                accepted += acc;
+                *accepted += acc;
+                settle(&mut sess, acc);
                 break 'outer;
             }
             match out.push(d) {
                 Pushed::More => {}
                 Pushed::Stopped => {
+                    settle(&mut sess, acc);
                     let decode_ms = now_ms() - t2;
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                        finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; settle(&mut sess, acc); break 'outer; }
             }
             acc += 1;
         }
-        accepted += acc;
+        *accepted += acc;
         // -- the head learns ONLY the accepted tokens (its KV never holds a
         //    rejected proposal), then the target commits them. On fold-aware
         //    hosts the observe rides the NEXT round's draft call instead of
@@ -3784,8 +4243,8 @@ fn generate_mtp(
     let decode_ms = now_ms() - t2;
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted, accepted,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
@@ -3932,7 +4391,6 @@ impl LookupGate {
 #[allow(clippy::too_many_arguments)]
 fn generate_lookup(
     cfg: &AppConfig,
-    tok: &Tok,
     prompt_ids: &[u32],
     marks: &[usize],
     tname: &str,
@@ -3940,7 +4398,7 @@ fn generate_lookup(
     mut sess: Session,
     rig: MtpRig,
     load_ms: u128,
-    emit: &dyn Fn(&str) -> bool,
+    ans: &mut Answer<'_>,
     status: &dyn Fn(&str) -> bool,
 ) -> Result<GenStats, String> {
     let MtpRig { mut tscr, t_seq, tscr_seq } = rig;
@@ -3954,17 +4412,18 @@ fn generate_lookup(
     let mut t_logits = prefill_text(&mut sess, cfg, prompt_ids, marks, status, |s, ids, last, declare| {
         s.feed_declared(cfg, ids, last, declare)
     })?;
+    // a resumed answer: its tokens so far go in behind the prompt
+    if !ans.out.generated.is_empty() {
+        t_logits = feed_answer(&mut sess, cfg, &ans.out.generated, status)?;
+    }
     let prefill_ms = now_ms() - t1;
 
     let t2 = now_ms();
     let mut rng = Rng::new(now_ms() as u64 ^ (prompt_ids.len() as u64) << 17);
-    let mut out = TextOut::new(tok, emit, &p.stop_strings);
-    let mut think = ThinkGuard::new(p.think_budget, p.think_open, tok);
+    let Answer { out, think, guard_from, drafted, accepted } = ans;
     let loop_guard = LoopGuard::new(p.loop_reps);
-    let mut guard_from = 0usize; // see the plain loop
     let mut finish: &'static str = "stop";
-    let (mut drafted, mut accepted) = (0usize, 0usize);
-    let mut t_fed = prompt_ids.len();
+    let mut t_fed = prompt_ids.len() + out.generated.len(); // resumed: fed already
     let mut gate = LookupGate::with(
         cfg.draft_min_ngram.unwrap_or(LOOKUP_NGRAM),
         cfg.draft_gate.unwrap_or(true),
@@ -3981,8 +4440,8 @@ fn generate_lookup(
                 let decode_ms = now_ms() - t2;
                 return Ok(GenStats {
                     target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                    tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                    finish_reason: "stop", text: out.text, drafted, accepted,
+                    tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                    finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
                     think_forced: think.forced, images: 0, image_pos: 0,
                 });
             }
@@ -3991,7 +4450,7 @@ fn generate_lookup(
         // -- degenerate loop: same policy as the other loops; lookup makes a
         //    stuck repetition ACCELERATE (its own tail matches perfectly), so
         //    this guard earns its keep here
-        if loop_guard.tripped(&out.generated[guard_from..]) && !think.take_loop() {
+        if loop_guard.tripped(&out.generated[*guard_from..]) && !think.take_loop() {
             finish = "repetition";
             break 'outer;
         }
@@ -4002,7 +4461,7 @@ fn generate_lookup(
             if !out.push_forced(&think.close) {
                 break 'outer;
             }
-            guard_from = out.generated.len();
+            *guard_from = out.generated.len();
             let mut ids = vec![pending];
             ids.extend_from_slice(&think.close);
             let mut row = sess.feed(cfg, &ids, true)?;
@@ -4032,7 +4491,7 @@ fn generate_lookup(
             pending = pick_row(&mut row, &recent, &p.sample, &mut rng);
             continue 'outer;
         }
-        drafted += drafts.len();
+        *drafted += drafts.len();
         let m = drafts.len();
         let mut feed: Vec<u32> = Vec::with_capacity(m + 1);
         feed.push(pending);
@@ -4062,12 +4521,12 @@ fn generate_lookup(
                 break;
             }
             if cfg.eos.contains(&d) {
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             if out.generated.len() >= p.max_new {
                 finish = "length";
-                accepted += acc;
+                *accepted += acc;
                 break 'outer;
             }
             match out.push(d) {
@@ -4076,16 +4535,16 @@ fn generate_lookup(
                     let decode_ms = now_ms() - t2;
                     return Ok(GenStats {
                         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-                        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-                        finish_reason: "stop", text: out.text, drafted, accepted: accepted + acc + 1,
+                        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+                        finish_reason: "stop", text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted + acc + 1,
                         think_forced: think.forced, images: 0, image_pos: 0,
                     });
                 }
-                Pushed::Gone => { accepted += acc + 1; break 'outer; }
+                Pushed::Gone => { *accepted += acc + 1; break 'outer; }
             }
             acc += 1;
         }
-        accepted += acc;
+        *accepted += acc;
         gate.observe(acc, m);
         if let Some(r) = replacement {
             if depth > 0 {
@@ -4122,8 +4581,8 @@ fn generate_lookup(
     gperf_note(&mut sess, gperf0);
     Ok(GenStats {
         target: tname.to_string(), prompt_tokens: prompt_ids.len(),
-        tokens: out.generated.len(), load_ms, prefill_ms, decode_ms,
-        finish_reason: finish, text: out.text, drafted, accepted,
+        tokens: out.generated.len(), ids: out.generated.clone(), load_ms, prefill_ms, decode_ms,
+        finish_reason: finish, text: std::mem::take(&mut out.text), drafted: *drafted, accepted: *accepted,
         think_forced: think.forced, images: 0, image_pos: 0,
     })
 }
@@ -4155,6 +4614,12 @@ struct ChatMsg {
     /// OpenAI's schema but still widely sent) the function's own name
     tool_call_id: Option<String>,
     tool_name: Option<String>,
+    /// mm37: an assistant turn's exact token ids, as this server returned
+    /// them ("tok" on the finished reply): the opener it was generated
+    /// behind and every token it generated. build_prompt replays the turn AS
+    /// these ids when they pass valid_turn_ids, so the prompt extends the
+    /// engine's end park of that turn token for token; otherwise the text.
+    tok: Option<Vec<u32>>,
 }
 
 impl ChatMsg {
@@ -4226,6 +4691,9 @@ impl<'de> Deserialize<'de> for ChatMsg {
             tool_call_id: Option<String>,
             #[serde(default)]
             name: Option<String>,
+            // mm37: base64 of the turn's u32 LE token ids
+            #[serde(default)]
+            tok: Option<String>,
         }
         #[derive(Deserialize)]
         struct WireToolCall {
@@ -4245,6 +4713,9 @@ impl<'de> Deserialize<'de> for ChatMsg {
         let mut msg = ChatMsg { role: w.role, ..Default::default() };
         msg.tool_call_id = w.tool_call_id;
         msg.tool_name = w.name;
+        // an unreadable "tok" is ignored, never an error: the turn's text is
+        // always there to replay instead
+        msg.tok = w.tok.as_deref().filter(|_| msg.role == "assistant").and_then(turn_ids_from_b64);
         for c in w.tool_calls {
             let args = match c.function.arguments {
                 Some(serde_json::Value::String(s)) => {
@@ -4420,6 +4891,76 @@ fn image_kind(b: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// mm37: a turn's token ids for the client to keep (u32 LE, standard base64).
+fn turn_ids_b64(ids: &[u32]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = ids.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// mm37: the ids a client sent back for a turn - well-formed only; what they
+/// may contain is valid_turn_ids' call (it needs the config).
+fn turn_ids_from_b64(s: &str) -> Option<Vec<u32>> {
+    let b = b64_decode(s).ok()?;
+    if b.len() % 4 != 0 || b.len() / 4 > MAX_TURN_IDS {
+        return None;
+    }
+    Some(b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// The longest turn replayed as ids (a whole 64K window of one turn).
+const MAX_TURN_IDS: usize = 65536;
+
+/// mm37: client-kept ids for a replayed answer may say no more than its text
+/// could: ordinary vocabulary plus the think block's own two markers - no
+/// turn boundary, tool response or image pad rides in on them. Qwen-family
+/// vocabularies hold every added token at and above the lowest end-of-turn
+/// id (248044.. on the 0.8B and the 27B alike), so that id is the floor.
+fn valid_turn_ids(cfg: &AppConfig, tok: &Tok, ids: &[u32]) -> bool {
+    let Some(&floor) = cfg.eos.iter().min() else { return false };
+    if ids.is_empty() || ids.len() > MAX_TURN_IDS {
+        return false;
+    }
+    let one = |t: &str| match tok.encode_ids(t, false) {
+        Ok(v) if v.len() == 1 => Some(v[0]),
+        _ => None,
+    };
+    let (open, close) = (one("<think>"), one("</think>"));
+    ids.iter().all(|&t| t < floor || Some(t) == open || Some(t) == close)
+}
+
+/// mm37: a finished turn's ids as the engine holds them: the opener its prompt
+/// ended in (everything after the last "<|im_start|>assistant\n") and every
+/// token generated, without the stop token the template writes back itself.
+fn turn_ids_for(tok: &Tok, prompt: &[u32], generated: &[u32], eos: &[u32]) -> Option<Vec<u32>> {
+    let open = tok.encode_ids("<|im_start|>assistant\n", false).ok()?;
+    if open.is_empty() || prompt.len() < open.len() {
+        return None;
+    }
+    let at = (0..=prompt.len() - open.len()).rev().find(|&i| prompt[i..i + open.len()] == open[..])?;
+    let mut gen = generated;
+    while let Some((last, rest)) = gen.split_last() {
+        if !eos.contains(last) {
+            break;
+        }
+        gen = rest;
+    }
+    if gen.is_empty() {
+        return None;
+    }
+    let mut ids = prompt[at + open.len()..].to_vec();
+    ids.extend_from_slice(gen);
+    Some(ids)
+}
+
 /// Standard base64, tolerating whitespace and missing padding (both are
 /// common in hand-assembled requests). No dependency for this: the crate
 /// carries a tokenizer and serde and nothing else, and a decoder is 20 lines.
@@ -4462,6 +5003,11 @@ struct ChatReq {
     /// of the body, so no client can claim an identity by writing one.
     #[serde(skip)]
     caller: Option<String>,
+    /// this chat's Enclave session (session.rs), from the x-enclave-session
+    /// HEADER of a signed-in request - never the body. Handed to the tool
+    /// registry only (Builtins::session), never to the prompt.
+    #[serde(skip)]
+    session: Option<session::ChatSession>,
     #[serde(default)]
     model: Option<String>, // OpenAI field: a model name or volume from /models; absent (or unknown) = the largest
     #[serde(default)]
@@ -4971,6 +5517,7 @@ decide what is needed to handle the last user message.
         think_open: false,
         // the router emits one short line; a loop there is still a loop
         loop_reps: 4,
+        park_end: false,
     };
     let Some(&(target, tname)) = targets_for(cfg, mode).first() else {
         return RouterOut::default();
@@ -5300,6 +5847,7 @@ fn run_agent(env: &AgentEnv, s: AgentSpawn) -> AgentReport {
                     break 'answer None;
                 }
             };
+        tl.note_prompt(prompt_cost(&prompt_ids, env.cfg), kv_pool(), env.cfg.max_prompt_tokens);
         let effort =
             resolve_effort(env.cfg, env.tok, &messages, env.mode, think_open, None, &on_status);
         let params = gen_params(env.cfg, env.creq, stops, think_open, effort);
@@ -5498,6 +6046,11 @@ struct ToolLoop<'a> {
     /// response turn, tool name, full text, condensed already) - so older
     /// ones can be condensed once the model has acted on them (compact)
     results: Vec<(usize, String, String, bool)>,
+    /// the response turns carrying a picture this loop attached for the model
+    /// (a `result.see` screenshot), oldest first: past ToolsConfig::
+    /// keep_images, or past the model's image ceiling, the oldest are taken
+    /// back out (trim_pictures)
+    pictures: Vec<usize>,
     /// the subagent tree this loop belongs to, shared by every loop in the
     /// answer, and this loop's place in it: id 0 at depth 0 for the answer
     /// itself, else the child's
@@ -5537,13 +6090,67 @@ struct ToolLoop<'a> {
     /// the model's own state block, as it last wrote it under `### LEDGER`;
     /// shown back under every result in ledger mode
     ledger: String,
-    /// the newest call and a hash of its result, with how many times in a
-    /// row that exact pair has come back. Two identical outcomes get a
-    /// warning in the result; a third identical CALL is refused unrun. A
-    /// different call in between resets it, so polling a log between waits
-    /// is never mistaken for being stuck.
-    last_pair: Option<(String, u64)>,
-    same_runs: usize,
+    /// COMPACTION (ToolsConfig::compact_at): how many tokens the newest
+    /// prompt took, as the leg built it (note_prompt)...
+    prompt_tokens: usize,
+    /// ...what it is measured against (the KV pool, else the prompt cap),
+    /// and where the model is told to compact and where nothing else runs
+    /// until it has, in tokens (compact_marks; zeros = off)
+    compact_window: usize,
+    compact_tell: usize,
+    compact_force: usize,
+    /// the model was refused a call for not compacting; a second one is
+    /// compacted for it (compact_auto)
+    compact_told: bool,
+    /// the first prompt after a compaction, once measured: a prompt still
+    /// over the marks then (a huge system prompt or request, which nothing
+    /// can drop) is not nagged again until the loop has added a quarter of
+    /// the tell mark on top of it
+    compact_floor: Option<usize>,
+    compact_pending: bool,
+    /// a generation in this loop stepped aside because the shared pool was
+    /// full: the model is told to compact even below the tell mark, while
+    /// its conversation holds a real share of the pool
+    pool_pressed: bool,
+    /// the call the force mark held back, which the compaction drops along
+    /// with everything else: its result names it, so the model can make it
+    held: Option<String>,
+    /// how many times this loop compacted, and the newest summary - the
+    /// page keeps it, so the next request does not resend what it replaced
+    compactions: usize,
+    summary: Option<String>,
+    /// the ledger is in force: from the start under Ledger::Always, from
+    /// the result that re-ran a check under Ledger::Checks, never under Off
+    ledger_on: bool,
+    /// Ledger::Checks' evidence, until it switches on: every call that ran
+    /// that was not a wait or a load_tools, counted, and per call (canonical
+    /// form) its latest good run (see reruns_a_check)
+    acts: usize,
+    checks: std::collections::HashMap<String, CheckRuns>,
+    /// ToolsConfig::max_repeat_calls: the newest call (canonical form) and
+    /// how many times in a row it has run (1 for a call new here). Any
+    /// different call resets it - a wait or a subagent too, so polling a log
+    /// between waits is never a repeat. `repeat_told` is the call whose
+    /// over-the-limit repeat was already answered "not run": asking for it
+    /// once more ends the answer.
+    last_call: Option<String>,
+    repeats: usize,
+    repeat_told: Option<String>,
+    /// ToolsConfig::max_failed_calls: calls in a row that failed. Any call
+    /// that succeeds resets it; waits neither count nor reset it. At the
+    /// limit the model is told once to answer, then refused, exactly as the
+    /// call count does.
+    failed_run: usize,
+    failed_told: bool,
+    /// when each count last went up (now_ms), for the cooldown
+    /// (ToolsConfig::limit_cooldown_s, see cool_down)
+    failed_at: u128,
+    repeat_at: u128,
+    /// ToolsConfig::max_calls under a cooldown: the calls since the last
+    /// break of limit_cooldown_s between two calls, and when the last call
+    /// ended. Without a cooldown it is every call of the answer, as `calls`.
+    counted: usize,
+    call_at: u128,
     /// the verify gate (Budget::verify): whether the check has run in this
     /// answer, whether its latest result passed, and whether an unverified
     /// answer was already bounced once - told once, then accepted, exactly
@@ -5569,19 +6176,46 @@ const REFUSED_TIME: &str =
 /// the call was and how it ended (a test run's summary line is at the tail),
 /// too little to be worth re-reading - the point of condensing.
 const CONDENSE_EDGE: usize = 240;
+/// What a result carrying a picture for the model says about it: attached,
+/// not shown because this model cannot see, or taken back out of the prompt
+/// since (ToolLoop::trim_pictures swaps the first for the third).
+const PICTURE_ATTACHED: &str =
+    "\n[The picture this call returned is attached to this result; you can see it.]";
+const PICTURE_BLIND: &str =
+    "\n[This call returned a picture, but the model answering cannot see images, so it was left out.]";
+const PICTURE_NO_ROOM: &str =
+    "\n[This call returned a picture, but this request already carries as many pictures as the model \
+     takes, so it was left out.]";
+const PICTURE_GONE: &str =
+    "\n[The picture was shown to you at the time; it has been removed since. Take a new one to look again.]";
 const REFUSED_STUB: &str =
     "the model kept writing tool calls with arguments it had not filled in, so none were run";
 const REFUSED_GONE: &str =
     "the client disconnected before the model's tool call could run, so it was not run";
-const REFUSED_STUCK: &str =
-    "the model kept repeating one identical tool call that kept returning the identical \
-     result, so it was not run again";
-/// How many identical (call, result) pairs in a row before the model is
-/// told, in the result itself, that repeating the call is pointless. The
-/// next identical call after that is refused. Two, because one repeat is
-/// how a model re-reads a file it is about to edit; two with nothing
-/// changed in between is a model that has stopped deciding.
-const STUCK_TELL: usize = 2;
+const REFUSED_REPEAT: &str =
+    "the model kept asking for the same tool call after it had been repeated too many times \
+     in a row, so it was not run again";
+const REFUSED_FAILING: &str =
+    "the model wrote another tool call after too many calls in a row had failed, so it was \
+     not run";
+/// Ledger::Checks switches on at the call's THIRD good run with other calls
+/// before it and a different answer from the run before - two passes of
+/// run, change, run again. Two runs would be one re-read of a file after
+/// editing it, which is not a test loop and would cost the model what it
+/// read before; three is a loop, and in one of thirty passes, one more
+/// step with the whole history is nothing.
+const CHECK_RUNS: usize = 3;
+
+/// One call's record for Ledger::Checks (ToolLoop::reruns_a_check): the hash
+/// of its latest good result, `acts` when it ran, and how many of its runs
+/// so far count (the first, then each one that came back changed after
+/// something else ran).
+struct CheckRuns {
+    hash: u64,
+    at: usize,
+    runs: usize,
+}
+
 /// The heading a ledger-mode reply writes its state under (see
 /// tools::ToolsConfig::ledger). Matched case-insensitively, at any heading
 /// depth, so `## Ledger` counts too.
@@ -5593,6 +6227,11 @@ const LEDGER_HEAD: &str = "ledger";
 /// reason: one bad draft is a slip, three is a model that is not going to
 /// author the value.
 const STUB_RETRIES: usize = 3;
+/// The most of a call's result text its live event carries, so the person
+/// can open the call and read it. A result is already cut to its tool's
+/// max_chars (load_tools' 24k is the largest built in), but an error is not,
+/// and neither is a tool that raised its own max_chars.
+const RESULT_EVENT_CHARS: usize = 32_000;
 
 impl<'a> ToolLoop<'a> {
     /// Resolve the registry for this turn. MCP discovery happens HERE, before
@@ -5631,6 +6270,7 @@ impl<'a> ToolLoop<'a> {
         spawn: Option<Spawn<'a>>,
     ) -> ToolLoop<'a> {
         let t0 = now_ms();
+        let ledger_on = budget.ledger == tools::Ledger::Always;
         let mut builtins = builtins;
         {
             let t = tree.borrow();
@@ -5650,6 +6290,7 @@ impl<'a> ToolLoop<'a> {
             calls: 0,
             time_told: false,
             results: Vec::new(),
+            pictures: Vec::new(),
             tree,
             id,
             depth,
@@ -5661,8 +6302,29 @@ impl<'a> ToolLoop<'a> {
             log: Vec::new(),
             base_len: None,
             ledger: String::new(),
-            last_pair: None,
-            same_runs: 0,
+            prompt_tokens: 0,
+            compact_window: 0,
+            compact_tell: 0,
+            compact_force: 0,
+            compact_told: false,
+            compact_floor: None,
+            compact_pending: false,
+            pool_pressed: false,
+            held: None,
+            compactions: 0,
+            summary: None,
+            ledger_on,
+            acts: 0,
+            checks: std::collections::HashMap::new(),
+            last_call: None,
+            repeats: 0,
+            repeat_told: None,
+            failed_run: 0,
+            failed_told: false,
+            failed_at: 0,
+            repeat_at: 0,
+            counted: 0,
+            call_at: 0,
             verify_seen: false,
             verify_ok: false,
             verify_told: false,
@@ -5688,7 +6350,289 @@ impl<'a> ToolLoop<'a> {
             "max_seconds": self.budget.max_seconds,
             "agents": self.tree.borrow().spawned,
             "max_agents": self.tree.borrow().limit,
+            "compactions": self.compactions,
         })
+    }
+
+    /// The leg reports every prompt it built: its size in tokens (pictures
+    /// at their budgeted cost), the KV pool (ENCLAVE_GGML_N_CTX, 0 when the
+    /// host does not say) and the prompt cap. The next result reads it.
+    fn note_prompt(&mut self, tokens: usize, pool: usize, cap: usize) {
+        self.prompt_tokens = tokens;
+        let (window, tell, force) = compact_marks(self.cfg, pool, cap);
+        self.compact_window = window;
+        self.compact_tell = tell;
+        self.compact_force = force;
+        if std::mem::take(&mut self.compact_pending) {
+            self.compact_floor = Some(tokens);
+        }
+    }
+
+    /// The prompt is past `mark` and compacting could still bring it down:
+    /// right after a compaction the prompt is what it cannot drop, so it
+    /// has to grow a quarter of the tell mark past that first.
+    fn over(&self, mark: usize) -> bool {
+        self.reg.find(tools::COMPACT_TOOL).is_some_and(|t| t.is_builtin(tools::Builtin::Compact))
+            && mark > 0
+            && self.prompt_tokens >= mark
+            && self.compact_floor.is_none_or(|f| self.prompt_tokens >= f + self.compact_tell / 4)
+    }
+
+    /// Where the context stands, under a result once it is past the tell
+    /// mark: a fact the model reads, with what to do about it.
+    fn compact_note(&self) -> String {
+        if !self.over(self.compact_tell) {
+            // the pool ran out under it: the window's arithmetic says there
+            // is room, the engine says there is not, and the engine is right
+            if self.pool_pressed && self.compact_window > 0
+                && self.over(self.compact_window / 8)
+            {
+                return format!(
+                    "\n\n[context: the memory this model shares with other chats ran out during \
+                     your last step, and this conversation holds {} of its {} tokens. Call {} \
+                     now, before anything else, with a summary that lets you carry on without \
+                     the rest.]",
+                    self.prompt_tokens,
+                    self.compact_window,
+                    tools::COMPACT_TOOL,
+                );
+            }
+            return String::new();
+        }
+        format!(
+            "\n\n[context: {}% full - this conversation takes {} of the {} tokens the model's \
+             memory holds. Call {} now, before anything else, with a summary that lets you carry \
+             on without the rest; at {} tokens nothing else runs until you have.]",
+            self.prompt_tokens * 100 / self.compact_window.max(1),
+            self.prompt_tokens,
+            self.compact_window,
+            tools::COMPACT_TOOL,
+            self.compact_force,
+        )
+    }
+
+    /// Replace everything but the system prompt and the user's latest
+    /// message with the compact call and its result. Returns how many
+    /// messages went. Every index the loop holds into the conversation
+    /// points past the new end, so they go too, and the ledger's base moves
+    /// to just after the request.
+    fn replace_history(&mut self, messages: &mut Vec<ChatMsg>, call: String, result: &str) -> usize {
+        let base = (*self.base_len.get_or_insert(messages.len())).min(messages.len());
+        let req = messages[..base].iter().rposition(|m| m.role == "user");
+        let before = messages.len();
+        let mut i = 0;
+        messages.retain(|m| {
+            let keep = m.role == "system" || Some(i) == req;
+            i += 1;
+            keep
+        });
+        let gone = before - messages.len();
+        self.base_len = Some(messages.len());
+        self.results.clear();
+        self.pictures.clear();
+        messages.push(ChatMsg::text("assistant", call));
+        messages.push(ChatMsg::text("user", tools::response_turn(tools::COMPACT_TOOL, result)));
+        self.compactions += 1;
+        self.compact_told = false;
+        self.compact_pending = true;
+        self.pool_pressed = false;
+        gone
+    }
+
+    /// A `compact` call: the model's summary replaces the conversation. An
+    /// empty or overlong summary changes nothing and says why.
+    fn compact_with(
+        &mut self,
+        c: &tools::ToolCall,
+        messages: &mut Vec<ChatMsg>,
+        on_call: &dyn Fn(&serde_json::Value),
+        on_result: &dyn Fn(&serde_json::Value),
+        on_note: &dyn Fn(&str),
+    ) -> bool {
+        self.calls += 1;
+        on_call(&serde_json::json!({
+            "name": c.name, "arguments": c.args, "n": self.calls,
+            "of": self.budget.max_calls,
+            "elapsed_s": self.elapsed_s(), "max_seconds": self.budget.max_seconds,
+        }));
+        let summary = c.args.get("summary").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let max = self.cfg.compact_max_chars.max(1000);
+        let chars = summary.chars().count();
+        let refused = if summary.is_empty() {
+            Some("Not compacted: `summary` was empty. Call compact again with the summary written \
+                  out in full.".to_string())
+        } else if chars > max {
+            Some(format!(
+                "Not compacted: the summary is {chars} characters and compact takes at most {max}. \
+                 Shorten it - keep the goal, the exact current state and the next steps - and call \
+                 compact again."
+            ))
+        } else {
+            None
+        };
+        let (ok, text) = match refused {
+            Some(t) => {
+                messages.push(ChatMsg::text("assistant", canonical_call(c)));
+                messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &t)));
+                (false, t)
+            }
+            None => {
+                let was = self.prompt_tokens;
+                // the summary is the result, so it reads as text rather than
+                // as one escaped JSON string inside the call
+                let call = canonical_call(&tools::ToolCall {
+                    name: c.name.clone(),
+                    args: serde_json::json!({ "summary": "(in the result below)" }),
+                });
+                let held = self.held.take();
+                // the count is only known once the messages are gone
+                let gone = self.replace_history(messages, call, "");
+                let t = format!(
+                    "Compacted. The conversation was {was} tokens; {gone} earlier messages are gone, \
+                     and this summary, which you wrote, is now the only record of them:\n\n{summary}\n\n\
+                     [Carry on from the summary. What it lists as done IS done - do not repeat any of \
+                     it; go on with its next step.{}]",
+                    held.map_or(String::new(), |h| format!(
+                        " The call you were stopped from making until you compacted was {h} - make it \
+                         now if it is still the next step."
+                    )),
+                );
+                if let Some(m) = messages.last_mut() {
+                    m.content = tools::response_turn(&c.name, &t);
+                }
+                on_note(&format!(
+                    "the model compacted its context: {gone} earlier messages replaced by its summary"
+                ));
+                self.summary = Some(summary);
+                (true, t)
+            }
+        };
+        let entry = serde_json::json!({
+            "name": c.name, "arguments": c.args, "n": self.calls,
+            "ok": ok, "ms": 0, "chars": text.chars().count(),
+        });
+        let mut live = entry.clone();
+        live["result"] = serde_json::json!(tools::truncate(&text, RESULT_EVENT_CHARS));
+        on_result(&live);
+        self.log.push(entry);
+        self.call_at = now_ms();
+        true
+    }
+
+    /// Past the force mark, the model's next call is not run until it has
+    /// compacted - asked once; asked and still calling something else, it
+    /// is compacted for it (compact_auto) and the call goes ahead. Returns
+    /// Some(regenerate) when the call was answered here.
+    fn hold_for_compaction(
+        &mut self,
+        c: &tools::ToolCall,
+        messages: &mut Vec<ChatMsg>,
+        on_note: &dyn Fn(&str),
+    ) -> Option<bool> {
+        if !self.over(self.compact_force) {
+            return None;
+        }
+        if self.compact_told {
+            self.compact_auto(messages, on_note);
+            return None;
+        }
+        self.compact_told = true;
+        self.held = Some(serde_json::json!({ "name": c.name, "arguments": c.args }).to_string());
+        on_note("the context is nearly full; the model was asked to compact it before calling anything else");
+        messages.push(ChatMsg::text("assistant", canonical_call(c)));
+        messages.push(ChatMsg::text(
+            "user",
+            tools::response_turn(
+                &c.name,
+                &format!(
+                    "This call was NOT run: the conversation takes {} of the {} tokens the model's \
+                     memory holds, so the context must be compacted first. Call {} now with your \
+                     summary, then make this call again. Calling anything else compacts the \
+                     context without your summary.",
+                    self.prompt_tokens,
+                    self.compact_window,
+                    tools::COMPACT_TOOL,
+                ),
+            ),
+        ));
+        Some(true)
+    }
+
+    /// The model would not summarize, so the loop does it from what it
+    /// has: the conversation's turns, each cut short, the calls with their
+    /// results condensed. Worse than the model's own summary - it cannot
+    /// say what mattered - but it keeps the request and the trail, where
+    /// the prompt cap would drop the oldest turns, the request first.
+    fn compact_auto(&mut self, messages: &mut Vec<ChatMsg>, on_note: &dyn Fn(&str)) {
+        let base = (*self.base_len.get_or_insert(messages.len())).min(messages.len());
+        let req = messages[..base].iter().rposition(|m| m.role == "user");
+        let max = self.cfg.compact_max_chars.max(1000);
+        let mut lines: Vec<String> = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == "system" || Some(i) == req {
+                continue;
+            }
+            let text = strip_think(&m.content);
+            // the app's own nudges to compact are not part of the record
+            // (inside a result it is JSON-escaped: its newlines are "\\n")
+            let text = match text.find("[context: ") {
+                Some(at) => format!(
+                    "{}{}",
+                    text[..at].trim_end_matches("\\n").trim_end_matches('\n'),
+                    text[at..].find(".]").map_or("", |e| &text[at + e + 2..])
+                ),
+                None => text,
+            };
+            let text = text.trim();
+            if text.contains("so the context must be compacted first") {
+                lines.push("  -> not run: the context had to be compacted first".into());
+                continue;
+            }
+            let line = if i >= base && m.role == "assistant" {
+                format!("- {}", tools::truncate(text, 400))
+            } else if i >= base {
+                format!("  -> {}", condense(text).unwrap_or_else(|| text.to_string()))
+            } else {
+                format!("{}: {}", m.role, tools::truncate(text, 600))
+            };
+            lines.push(line);
+        }
+        // the newest lines matter most: keep the tail that fits
+        let mut kept: Vec<String> = Vec::new();
+        let mut used = 0;
+        for l in lines.into_iter().rev() {
+            used += l.chars().count() + 1;
+            if used > max {
+                break;
+            }
+            kept.push(l);
+        }
+        kept.reverse();
+        let summary = format!(
+            "[Compacted automatically: you did not summarize when asked, so this is the \
+             conversation so far, each part cut short, oldest first.]\n{}",
+            kept.join("\n")
+        );
+        let was = self.prompt_tokens;
+        let gone = self.replace_history(
+            messages,
+            canonical_call(&tools::ToolCall {
+                name: tools::COMPACT_TOOL.to_string(),
+                args: serde_json::json!({ "summary": "(written by the app, in the result below)" }),
+            }),
+            "",
+        );
+        if let Some(m) = messages.last_mut() {
+            m.content = tools::response_turn(
+                tools::COMPACT_TOOL,
+                &format!("The conversation was {was} tokens; {gone} earlier messages are gone.\n\n{summary}"),
+            );
+        }
+        on_note(&format!(
+            "the model did not compact a nearly full context, so the app did: {gone} earlier \
+             messages replaced by a cut-down record of them"
+        ));
+        self.summary = Some(summary);
     }
 
     /// Run a subagent for a `spawn_agent` call and hand its report back as
@@ -5705,6 +6649,7 @@ impl<'a> ToolLoop<'a> {
             ms: (now_ms() as u64).saturating_sub(t0),
             sources: Vec::new(),
             image: None,
+            seen: None,
         };
         let Some(spawn) = self.spawn else {
             return done("subagents are not available here".into(), true);
@@ -5727,7 +6672,7 @@ impl<'a> ToolLoop<'a> {
             Err(why) => return done(why, true),
         };
         let budget = tools::Budget {
-            max_calls: self.cfg.agent_max_calls.unwrap_or(self.cfg.max_calls).max(1),
+            max_calls: self.cfg.agent_max_calls.unwrap_or(self.cfg.max_calls),
             max_seconds: self.left_s().max(1),
             ..self.budget.clone()
         };
@@ -5784,7 +6729,9 @@ impl<'a> ToolLoop<'a> {
         }
         let cut = self.results.len() - keep;
         for (idx, name, text, done) in &mut self.results[..cut] {
-            if *done {
+            // loaded signatures are what later calls are written from: a
+            // schema cut to its head and tail is one the model cannot follow
+            if *done || name.as_str() == tools::LOAD_TOOLS {
                 continue;
             }
             *done = true;
@@ -5807,20 +6754,22 @@ impl<'a> ToolLoop<'a> {
         self.reg.makes_image(self.cfg)
     }
 
-    /// The model owns the looking this turn (some armed tool takes $images):
-    /// the delegated-vision pre-pass stands down, and the leg stashes the
-    /// pictures here (stash_images).
-    fn owns_vision(&self) -> bool {
-        self.reg.image_reader(self.cfg).is_some()
-    }
-
-    /// Take the attached pictures out of the conversation and hold them for
-    /// the image-taking tools. Called by the legs exactly when owns_vision().
-    fn stash_images(&mut self, messages: &mut [ChatMsg]) {
+    /// Keep image-tool inputs available without taking pictures away from a
+    /// local VLM or a configured vision service. Return whether a tool owns
+    /// image reading and the delegated pre-pass should stand down.
+    fn prepare_images(
+        &mut self,
+        cfg: &AppConfig,
+        requested: Option<&str>,
+        messages: &mut [ChatMsg],
+    ) -> bool {
         let (reader, transformer) = self.reg.image_tool_names(self.cfg);
-        let (reader, transformer) =
-            (reader.map(str::to_string), transformer.map(str::to_string));
-        self.images = stash_images_for_tool(messages, reader.as_deref(), transformer.as_deref());
+        let (images, tool_vision) = prepare_tool_images(
+            messages, reader, transformer,
+            images_read_locally(cfg, requested), cfg.vision_service.is_some(),
+        );
+        self.images = images;
+        tool_vision
     }
 
     fn armed(&self) -> bool {
@@ -5847,20 +6796,29 @@ impl<'a> ToolLoop<'a> {
         if !self.armed() {
             return false;
         }
+        if take_pool_step_asides() > 0 {
+            self.pool_pressed = true;
+        }
         // LEDGER MODE: the reply's state block replaces the last one, and
         // the conversation goes back to where this loop found it before
         // the step appends its one call and one result. A reply with no
         // block keeps the previous ledger: losing state is the one thing
-        // this mode must never do by accident.
-        if self.budget.ledger {
+        // this mode must never do by accident - which is also why a ledger
+        // that switched on mid-answer drops nothing until the model has
+        // written one.
+        let base = *self.base_len.get_or_insert(messages.len());
+        if self.ledger_on {
             if let Some(l) = ledger_of(text) {
                 self.ledger = tools::truncate(&l, self.cfg.ledger_chars.max(200));
             }
-            let base = *self.base_len.get_or_insert(messages.len());
-            messages.truncate(base);
+            if self.dropping() {
+                messages.truncate(base);
+                self.pictures.retain(|&i| i < base);
+                self.results.retain(|r| r.0 < base);
+            }
         }
         let again = self.step_inner(text, messages, on_call, on_result, on_note);
-        if again && self.budget.ledger {
+        if again && self.ledger_on {
             if let Some(m) = messages.last_mut() {
                 m.content.push_str(&self.ledger_turn());
             }
@@ -5868,9 +6826,65 @@ impl<'a> ToolLoop<'a> {
         again
     }
 
+    /// Whether a step drops the history: from the first under
+    /// Ledger::Always, and under Checks once the model has a ledger for the
+    /// history to be dropped INTO.
+    fn dropping(&self) -> bool {
+        self.ledger_on && (self.budget.ledger == tools::Ledger::Always || !self.ledger.is_empty())
+    }
+
+    /// Ledger::Checks: does this result come from RE-RUNNING A CHECK? That
+    /// is the shape of a test loop - run it, change something, run it
+    /// again - and the call's CHECK_RUNS-th run of that shape is the one
+    /// that says so. A run only counts when something other than a wait
+    /// ran since the last one and it answered differently: re-reading what
+    /// has not changed answers the same, and polling has only waits in
+    /// between. A call that failed outright (the machine down, a 409) is
+    /// not a check that ran, so it never counts, though it is still
+    /// something that ran in between. Every call is recorded until the
+    /// ledger switches on; nothing is after.
+    fn reruns_a_check(&mut self, name: &str, key: &str, r: &tools::ToolResult) -> bool {
+        if name == "wait" || name == tools::LOAD_TOOLS {
+            return false;
+        }
+        self.acts += 1;
+        // a child's report is never the same twice, and spawning one is
+        // handing work off, not checking it
+        if r.is_error || name == tools::AGENT_TOOL {
+            return false;
+        }
+        let h = fnv1a(&r.text);
+        let acts = self.acts;
+        let c = self.checks.entry(key.to_string()).or_insert(CheckRuns { hash: h, at: acts, runs: 0 });
+        if c.runs == 0 || (c.at + 1 < acts && c.hash != h) {
+            c.runs += 1;
+        }
+        c.hash = h;
+        c.at = acts;
+        c.runs >= CHECK_RUNS
+    }
+
     /// The ledger as the model reads it back: under every result, exactly
-    /// as it last wrote it, with the instruction to rewrite it whole.
+    /// as it last wrote it, with the instruction to rewrite it whole. A
+    /// ledger that switched on mid-answer has no rules in the system
+    /// prompt, so until the model has written one, this is where it learns
+    /// what the ledger is and that the history goes once it exists.
     fn ledger_turn(&self) -> String {
+        if self.budget.ledger == tools::Ledger::Checks && self.ledger.is_empty() {
+            return format!(
+                "\n\n### LEDGER (none yet - write it now)\nThis loop is re-running a check after \
+                 each change, so from here on it keeps NO history: once you have written a \
+                 ledger, everything before the newest result is gone except that block. Start \
+                 your next reply with a `### LEDGER` heading line, before any call, and put \
+                 under it: the goal in one line, what you have established (copy out any fact \
+                 from earlier results you will still need - those results will be gone), what \
+                 failed and why, the exact state of files and commands (paths, what was run, \
+                 what it said), and the next step. Keep it under {} characters. It is shown \
+                 back to you under every result; rewrite it WHOLE each time, since whatever \
+                 you leave out is lost.",
+                self.cfg.ledger_chars.max(200),
+            );
+        }
         format!(
             "\n\n### LEDGER (your state, exactly as you last wrote it. Rewrite it WHOLE under a \
              `### LEDGER` heading at the top of your next reply, before any call; under {} \
@@ -5911,7 +6925,7 @@ impl<'a> ToolLoop<'a> {
         let Some(name) = self.verify_name() else {
             return false;
         };
-        if self.calls >= self.budget.max_calls || self.elapsed_s() >= self.budget.max_seconds {
+        if self.budget.calls_spent(self.counted) || self.elapsed_s() >= self.budget.max_seconds {
             return false;
         }
         self.verify_told = true;
@@ -5940,35 +6954,83 @@ impl<'a> ToolLoop<'a> {
         true
     }
 
-    /// Track one (call, result) pair for the stuck detector; returns the
-    /// warning to append to the result, or nothing. Waits and subagents are
-    /// never tracked: a wait repeats by design, and a child's report is
-    /// never byte-identical twice for the same reason a test log is not.
-    fn note_repeat(&mut self, key: &str, tracked: bool, result: &str, on_note: &dyn Fn(&str)) -> String {
+    /// Count one call that ran against the two limits on calls that do no
+    /// work, and return what the result should say about them: the failure
+    /// streak from its second failure on, and a repeat from the first. The
+    /// model reads where it stands while it can still change course; the
+    /// limits themselves are enforced in step_inner, before a call runs.
+    fn note_waste(&mut self, name: &str, key: &str, tracked: bool, failed: bool) -> String {
+        self.cool_down();
+        let now = now_ms();
+        let mut out = String::new();
+        if name != "wait" {
+            self.failed_run = if failed { self.failed_run + 1 } else { 0 };
+            if failed {
+                self.failed_at = now;
+            }
+            let max = self.budget.max_failed;
+            if failed && max != 0 && self.failed_run >= 2 {
+                out.push_str(&if self.failed_run >= max {
+                    format!(
+                        "\n\n[That is {max} failed calls in a row, the limit for one answer: do not \
+                         call anything else. Answer now - say what you tried, what failed and why, \
+                         and what would unblock it.]"
+                    )
+                } else {
+                    format!(
+                        "\n\n[{} calls in a row have failed; after {max} this answer stops calling \
+                         tools. Change the approach, not just the command.]",
+                        self.failed_run
+                    )
+                });
+            }
+        }
         if !tracked {
-            self.last_pair = None;
-            self.same_runs = 0;
-            return String::new();
+            self.last_call = None;
+            self.repeats = 0;
+            return out;
         }
-        let h = fnv1a(result);
-        self.same_runs = match &self.last_pair {
-            Some((k, ph)) if k == key && *ph == h => self.same_runs + 1,
-            _ => 1,
-        };
-        self.last_pair = Some((key.to_string(), h));
-        if self.same_runs < STUCK_TELL {
-            return String::new();
+        if self.last_call.as_deref() == Some(key) {
+            self.repeats += 1;
+        } else {
+            self.last_call = Some(key.to_string());
+            self.repeats = 1;
         }
-        on_note(
-            "the model repeated an identical tool call and got the identical result; telling it \
-             to change course",
-        );
-        format!(
-            "\n\n[This exact call has now returned the identical result {} times in a row. \
-             Calling it again unchanged will be refused: change the input, take a different \
-             approach, or answer with what you have.]",
-            self.same_runs
-        )
+        self.repeat_at = now;
+        let max = self.budget.max_repeats;
+        if self.repeats > 1 && max != 0 {
+            out.push_str(&format!(
+                "\n\n[This is the same call as the one before it, {} times in a row now; one call \
+                 runs at most {max} times in a row. Do something different, or use the result you \
+                 have.]",
+                self.repeats,
+            ));
+        }
+        out
+    }
+
+    /// THE COOLDOWN (ToolsConfig::limit_cooldown_s): a count that has not
+    /// gone up for that long starts again from zero, and the "answer now"
+    /// or "not run" it earned goes with it - a burst of failures ends the
+    /// burst, not the answer, once things have been quiet that long.
+    fn cool_down(&mut self) {
+        let cd = u128::from(self.budget.cooldown_s) * 1000;
+        if cd == 0 {
+            return;
+        }
+        let now = now_ms();
+        if self.counted > 0 && now.saturating_sub(self.call_at) >= cd {
+            self.counted = 0;
+            self.limit_told = false;
+        }
+        if self.failed_run > 0 && now.saturating_sub(self.failed_at) >= cd {
+            self.failed_run = 0;
+            self.failed_told = false;
+        }
+        if self.repeats > 0 && now.saturating_sub(self.repeat_at) >= cd {
+            self.repeats = 0;
+            self.repeat_told = None;
+        }
     }
 
     fn step_inner(
@@ -6031,8 +7093,11 @@ impl<'a> ToolLoop<'a> {
         };
         // Out of calls: say so once and let it write the answer. Saying it
         // twice is a loop, so the second offence ends the turn - refused, so
-        // the legs deliver the reason rather than a visible fake call.
-        if self.calls >= self.cfg.max_calls {
+        // the legs deliver the reason rather than a visible fake call. Under
+        // a cooldown the count is of calls with no break that long between
+        // them, so a break first starts it - and the three others - again.
+        self.cool_down();
+        if self.budget.calls_spent(self.counted) {
             if self.limit_told {
                 self.refused = Some(REFUSED_LIMIT);
                 return false;
@@ -6118,26 +7183,87 @@ impl<'a> ToolLoop<'a> {
             self.refused = Some(REFUSED_GONE);
             return false;
         }
-        // Stuck: the same call, after the same call twice returned the same
-        // thing and the model was told so. It was warned in the result it
-        // read; running it a third time would only teach it that warnings
-        // are noise.
+        // COMPACTION: the model's own call to compact is bookkeeping, never
+        // a failure or a repeat; past the force mark, any other call waits
+        // for it
+        if c.name == tools::COMPACT_TOOL
+            && self.reg.find(&c.name).is_some_and(|t| t.is_builtin(tools::Builtin::Compact))
+        {
+            return self.compact_with(&c, messages, on_call, on_result, on_note);
+        }
+        if let Some(again) = self.hold_for_compaction(&c, messages, on_note) {
+            return again;
+        }
+        // Failing: the last max_failed calls all failed, and the result of
+        // the last one said this was the limit. Out of budget the way the
+        // count and the clock are: told once, then refused - unless the
+        // cooldown has passed since, which starts both counts again.
+        self.cool_down();
+        let max = self.budget.max_failed;
+        if max != 0 && self.failed_run >= max {
+            if self.failed_told {
+                self.refused = Some(REFUSED_FAILING);
+                return false;
+            }
+            self.failed_told = true;
+            on_note(&format!(
+                "{max} tool calls in a row failed; the model will finish with what it has"
+            ));
+            messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+            messages.push(ChatMsg::text(
+                "user",
+                tools::response_turn(
+                    &c.name,
+                    &format!(
+                        "This call was NOT run: the last {max} calls all failed, which is the limit \
+                         for one answer. Do not call anything else. Answer now: say what you tried, \
+                         what failed and why, and what would unblock it."
+                    ),
+                ),
+            ));
+            return true;
+        }
+        // Repeating: the same call as the one before it, already run as
+        // many times in a row as it may be. Not run, and told so; a
+        // different call is the way on, and resets the count. Asking for
+        // this one yet again ends the answer.
         let key = canonical_call(&c);
         let tracked = c.name != "wait" && c.name != tools::AGENT_TOOL;
-        if tracked
-            && self.same_runs >= STUCK_TELL
-            && self.last_pair.as_ref().is_some_and(|(k, _)| *k == key)
-        {
-            self.refused = Some(REFUSED_STUCK);
-            return false;
+        let max = self.budget.max_repeats;
+        if tracked && max != 0 && self.repeats >= max && self.last_call.as_deref() == Some(key.as_str()) {
+            if self.repeat_told.as_deref() == Some(key.as_str()) {
+                self.refused = Some(REFUSED_REPEAT);
+                return false;
+            }
+            self.repeat_told = Some(key.clone());
+            on_note(&format!(
+                "the model asked for the same tool call a {} time in a row; it was not run",
+                ordinal(max + 1)
+            ));
+            messages.push(ChatMsg::text("assistant", canonical_call(&c)));
+            messages.push(ChatMsg::text(
+                "user",
+                tools::response_turn(
+                    &c.name,
+                    &format!(
+                        "This call was NOT run: it is the same call (same function, same \
+                         arguments) as the last {max} calls, and one call runs at most {max} times \
+                         in a row. Running it again would only return what you already have. Do \
+                         something different, or answer with what you have; asking for this same \
+                         call again ends this answer."
+                    ),
+                ),
+            ));
+            return true;
         }
         self.calls += 1;
+        self.counted += 1;
         on_call(&serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
             "of": self.budget.max_calls,
             "elapsed_s": self.elapsed_s(), "max_seconds": self.budget.max_seconds,
         }));
-        let mut r = if c.name == tools::AGENT_TOOL && self.reg.find(&c.name).is_some() {
+        let r = if c.name == tools::AGENT_TOOL && self.reg.find(&c.name).is_some() {
             // a child runs through the leg, not through tools::call: it is
             // a whole answer loop of its own, and only the leg can generate
             self.spawn_child(&c.args)
@@ -6159,6 +7285,28 @@ impl<'a> ToolLoop<'a> {
                 self.status,
             )
         };
+        self.take_result(&c, &key, tracked, r, messages, on_result, on_note)
+    }
+
+    /// Everything a call's RESULT does to the loop, once the call has run:
+    /// the format pass, the picture, the events, the verify gate, the stuck
+    /// detector, and the two turns appended to the conversation. Split from
+    /// step_inner so a test can hand it a result without a network.
+    #[allow(clippy::too_many_arguments)]
+    fn take_result(
+        &mut self,
+        c: &tools::ToolCall,
+        key: &str,
+        tracked: bool,
+        mut r: tools::ToolResult,
+        messages: &mut Vec<ChatMsg>,
+        on_result: &dyn Fn(&serde_json::Value),
+        on_note: &dyn Fn(&str),
+    ) -> bool {
+        // the break before the next call runs from here, the call's end
+        self.call_at = now_ms();
+        // judged on what the tool said, before a format pass rewrites it
+        let failed = r.is_error || tools::reports_failure(&r.text);
         // the tool's own format prompt, applied before anything downstream
         // sees the result. It rides the tool's facts rather than the http
         // array, so an entry moved into an api-mcp-adapter (which reports
@@ -6172,6 +7320,19 @@ impl<'a> ToolLoop<'a> {
         }
         if let Some(img) = r.image.take() {
             self.image_out = Some(img);
+        }
+        // A picture for the MODEL (result.see): it rides this result's turn
+        // into the next prompt when the serving model reads pictures itself,
+        // and a blind one is told what it missed rather than left to guess
+        // why the result talks about a screenshot it cannot find.
+        let picture = r.seen.take();
+        let shown = picture.is_some() && self.picture_room(messages) > 0;
+        if picture.is_some() {
+            r.text.push_str(match (shown, self.builtins.image_slots > 0) {
+                (true, _) => PICTURE_ATTACHED,
+                (false, true) => PICTURE_NO_ROOM,
+                (false, false) => PICTURE_BLIND,
+            });
         }
         let mut entry = serde_json::json!({
             "name": c.name, "arguments": c.args, "n": self.calls,
@@ -6189,7 +7350,18 @@ impl<'a> ToolLoop<'a> {
                 .map(|(t, u)| serde_json::json!({ "title": t, "url": u }))
                 .collect::<Vec<_>>());
         }
-        on_result(&entry);
+        // the live event carries what the model was shown, so the person
+        // watching sees the same screen; the answer's stats do not, since
+        // they persist with the chat and a run of screenshots is megabytes.
+        // The same goes for the result's TEXT, error or not: the person can
+        // open the call and read what came back, which is the only way to
+        // see why a call failed.
+        let mut live = entry.clone();
+        live["result"] = serde_json::json!(tools::truncate(&r.text, RESULT_EVENT_CHARS));
+        if let Some(b) = picture.as_ref().filter(|_| shown) {
+            live["picture"] = serde_json::json!(vision::to_data_uri(b));
+        }
+        on_result(&live);
         self.log.push(entry);
         // the verify gate reads the check's latest result - and only the
         // latest thing run: a call after a passing check (a wait aside) is
@@ -6200,35 +7372,103 @@ impl<'a> ToolLoop<'a> {
         } else if c.name != "wait" {
             self.verify_ok = false;
         }
-        let stuck = self.note_repeat(&key, tracked, &r.text, on_note);
+        let stuck = self.note_waste(&c.name, key, tracked, failed);
+        if self.budget.ledger == tools::Ledger::Checks && !self.ledger_on {
+            self.ledger_on = self.reruns_a_check(&c.name, key, &r);
+            if self.ledger_on {
+                on_note(&format!(
+                    "the loop is re-running a check ({}) after each change; from here on it keeps \
+                     the model's ledger instead of the whole history",
+                    c.name
+                ));
+            }
+        }
         // A persisting loop is told where it stands with every result, so
         // "the budget is nearly spent" is a fact it can read rather than a
         // count it has to keep. Outside the loop the rules already said the
         // limit once, and a running tally would only invite calls.
         let text = if self.budget.persist {
             format!(
-                "{}{}\n\n[loop: call {} of {}; {} elapsed of {}]",
+                "{}{}\n\n[loop: call {}{}; {} elapsed of {}]",
                 r.text,
                 stuck,
                 self.calls,
-                self.budget.max_calls,
+                match (self.budget.max_calls, self.budget.cooldown_s) {
+                    (0, _) => String::new(),
+                    (n, 0) => format!(" of {n}"),
+                    (n, cd) => format!(
+                        "; {} of {n} with no break of {} between them",
+                        self.counted,
+                        tools::human_secs(cd)
+                    ),
+                },
                 tools::human_secs(self.elapsed_s()),
                 self.budget.time(),
             )
         } else {
             format!("{}{stuck}", r.text)
         };
+        let text = format!("{text}{}", self.compact_note());
         // The model's own call goes back in as the assistant turn it was, so
         // the next pass sees what it asked for beside what came back.
         messages.push(ChatMsg::text("assistant", canonical_call(&c)));
-        messages.push(ChatMsg::text("user", tools::response_turn(&c.name, &text)));
+        let mut turn = ChatMsg::text("user", tools::response_turn(&c.name, &text));
+        if let Some(b) = picture.filter(|_| shown) {
+            turn.images.push(b);
+        }
+        let pictured = !turn.images.is_empty();
+        messages.push(turn);
         // in ledger mode there is never an older result to condense: the
         // step wrapper drops it whole
-        if !self.budget.ledger {
+        if !self.dropping() {
             self.results.push((messages.len() - 1, c.name.clone(), text, false));
             self.compact(messages);
         }
+        if pictured {
+            self.pictures.push(messages.len() - 1);
+            self.trim_pictures(messages);
+        }
         true
+    }
+
+    /// How many of this loop's pictures the prompt can hold: keep_images,
+    /// within what the model takes once the request's own media are counted.
+    fn picture_room(&self, messages: &[ChatMsg]) -> usize {
+        let theirs: usize = messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.pictures.contains(i))
+            .map(|(_, m)| m.images.len() + m.videos.len())
+            .sum();
+        self.builtins.image_slots.saturating_sub(theirs).min(self.cfg.keep_images)
+    }
+
+    /// Keep the prompt's pictures within bounds: the newest keep_images of
+    /// this loop's own, and never more in all than the model takes (the
+    /// request's attachments are counted first - they are the user's, and
+    /// a screenshot is the one that can be taken again). An older picture
+    /// leaves the prompt with a line saying it was there, so the result
+    /// still reads as what it was.
+    fn trim_pictures(&mut self, messages: &mut [ChatMsg]) {
+        let room = self.picture_room(messages);
+        while self.pictures.len() > room {
+            let idx = self.pictures.remove(0);
+            let Some(m) = messages.get_mut(idx) else { continue };
+            m.images.clear();
+            match self.results.iter_mut().find(|r| r.0 == idx) {
+                Some(r) => {
+                    r.2 = r.2.replace(PICTURE_ATTACHED, PICTURE_GONE);
+                    let shown = if r.3 { condense(&r.2).unwrap_or_else(|| r.2.clone()) } else { r.2.clone() };
+                    m.content = tools::response_turn(&r.1, &shown);
+                }
+                // ledger mode keeps no results list; the turn's text is its
+                // own record, the note in it JSON-escaped like the rest
+                None => {
+                    let esc = |t: &str| t.replace('\n', "\\n");
+                    m.content = m.content.replace(&esc(PICTURE_ATTACHED), &esc(PICTURE_GONE));
+                }
+            }
+        }
     }
 }
 
@@ -6264,6 +7504,18 @@ fn ledger_of(text: &str) -> Option<String> {
 }
 
 /// FNV-1a over the text, for telling identical results apart cheaply.
+/// "3rd", "4th": how a note counts.
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -6301,6 +7553,38 @@ fn cut_report(text: &str, max_chars: usize) -> String {
 
 /// A result the model has already acted on, cut to its head and tail. None
 /// when it is short enough that cutting would save nothing.
+/// The KV pool every chat on this model shares, in tokens: the node's
+/// context window, forwarded as ENCLAVE_GGML_N_CTX. 0 when the host does
+/// not say.
+fn kv_pool() -> usize {
+    std::env::var("ENCLAVE_GGML_N_CTX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// What a built prompt costs the KV pool: its text, and each picture at the
+/// cost it was budgeted at when the prompt was fitted.
+fn prompt_cost(p: &Prompt, cfg: &AppConfig) -> usize {
+    p.text_ids.len() + p.images * cfg.image_tokens
+}
+
+/// Compaction's marks, in tokens: (window, tell, force). The shares are of
+/// the KV POOL - what runs out - falling back to the prompt cap where the
+/// host does not say; neither mark may sit past the cap's own edge, since
+/// beyond max_prompt_tokens build_prompt drops the oldest turns unread and
+/// compacting after that is too late. Zeros when compaction is off.
+fn compact_marks(tc: &tools::ToolsConfig, pool: usize, cap: usize) -> (usize, usize, usize) {
+    if !(tc.compact_at > 0.0) {
+        return (0, 0, 0);
+    }
+    let window = if pool > 0 { pool } else { cap };
+    let share = |f: f64| (window as f64 * f.clamp(0.05, 1.0)) as usize;
+    let tell = share(tc.compact_at).min(cap / 100 * 85);
+    let force = share(tc.compact_force_at.max(tc.compact_at)).min(cap / 100 * 95).max(tell);
+    (window, tell, force)
+}
+
 fn condense(text: &str) -> Option<String> {
     let n = text.chars().count();
     if n <= CONDENSE_EDGE * 3 {
@@ -6583,6 +7867,27 @@ fn call_excerpt(text: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// A transformer needs the same bytes as vision, but cannot replace it.
+/// Copy the latest attachment for tools when another path reads the image;
+/// only remove image parts when the tool loop is responsible for them.
+fn prepare_tool_images(
+    messages: &mut [ChatMsg],
+    reader: Option<&str>,
+    transformer: Option<&str>,
+    local_vision: bool,
+    delegated_vision: bool,
+) -> (Vec<Vec<u8>>, bool) {
+    if reader.is_none() && transformer.is_none() {
+        return (Vec::new(), false);
+    }
+    if local_vision || (reader.is_none() && delegated_vision) {
+        let images = messages.iter().rev().find(|m| !m.images.is_empty())
+            .map(|m| m.images.clone()).unwrap_or_default();
+        return (images, false);
+    }
+    (stash_images_for_tool(messages, reader, transformer), true)
+}
+
 /// When the model holds an image-reading tool, the pictures must leave the
 /// prompt - this model cannot see, and build_prompt refuses image turns on
 /// blind models - but the bytes stay reachable for the tool. The turn the
@@ -6672,6 +7977,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         // a picture is a per-turn fact, not a capability
         images_present: true,
         images_local: false,
+        image_slots: 0,
         // a probe wait sleeps the config's cap at most; the loop narrows it
         // per call from what is left of the answer
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
@@ -6682,6 +7988,7 @@ fn builtins_of(cfg: &AppConfig) -> tools::Builtins<'_> {
         agent_limit: tc.map_or(0, |t| t.max_agents),
         // the probe answers for no one in particular
         user: None,
+        session: None,
     }
 }
 
@@ -6704,11 +8011,13 @@ fn builtins_for<'a>(cfg: &'a AppConfig, creq: &'a ChatReq, off: &'a [String]) ->
         off,
         images_present: creq.messages.iter().any(|m| !m.images.is_empty()),
         images_local: images_read_locally(cfg, creq.model.as_deref()),
+        image_slots: if images_read_locally(cfg, creq.model.as_deref()) { cfg.max_images } else { 0 },
         wait_cap_s: tc.map_or(0, |t| t.wait_max_s),
         turn_left_s: tc.map_or(0, |t| t.max_seconds),
         agent_slots: 0,
         agent_limit: tc.map_or(0, |t| t.max_agents),
         user: creq.caller.as_deref(),
+        session: creq.session.as_ref(),
     }
 }
 
@@ -6850,6 +8159,7 @@ Reply with EXACTLY ONE line: the title and nothing else.";
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
@@ -7230,6 +8540,7 @@ ASK: <the question>";
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let (target, tname) = *targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
@@ -7582,6 +8893,7 @@ fn format_tool_result(
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let &(target, tname) = targets_for(cfg, mode).first()?;
     let status = internal_status("formatting the result…", on_status, INTERNAL_BUSY_BUDGET_MS);
@@ -7720,6 +9032,7 @@ fn apply_tool_routes(
         think_budget: 0,
         think_open: false,
         loop_reps: 4,
+        park_end: false,
     };
     let &(target, tname) = targets_for(cfg, mode).first()?;
     let noop_emit = |_: &str| true;
@@ -7962,6 +9275,26 @@ impl Prompt {
         (self.images == 0).then_some(self.text_ids.as_slice())
     }
 
+    /// What the engine is told this prompt is (mm34), and the marks inside
+    /// it: the whole token stream when it is all text; with a picture in it,
+    /// the text BEFORE the first picture. That run is plain text - the system
+    /// message and tool block, the turns before - so the engine can branch
+    /// it off a standing park and park the system marks as prefill crosses
+    /// them, and its plan simply ends where the declaration does: the engine
+    /// treats a guest that feeds past it as served, and the picture and what
+    /// follows go in as they always did. Without this, every step of a loop
+    /// that is looking at a screenshot re-prefilled the whole system prompt
+    /// (~1.6k tokens, about a minute on a CPU node) before the picture.
+    fn declared(&self) -> Option<(&[u32], &[usize])> {
+        if self.images == 0 {
+            return Some((self.text_ids.as_slice(), self.marks.as_slice()));
+        }
+        let Some(PromptPart::Text(head)) = self.parts.first() else { return None };
+        // marks are ascending (marks_from); keep those inside the head
+        let n = self.marks.iter().take_while(|&&m| m <= head.len()).count();
+        (head.len() >= 2).then_some((head.as_slice(), &self.marks[..n]))
+    }
+
 }
 
 /// Render + tokenize the conversation; drops oldest turns until it fits.
@@ -8057,6 +9390,8 @@ fn build_prompt(
     let mut msgs: Vec<(String, String)> = Vec::new();
     let mut turn_images: Vec<&[Vec<u8>]> = Vec::new();
     let mut turn_videos: Vec<&[Vec<u8>]> = Vec::new();
+    // mm37: per turn, the ids it is replayed as (Some) or None for its text
+    let mut turn_toks: Vec<Option<&[u32]>> = Vec::new();
     for m in messages.iter().filter(|m| m.role == "user" || m.role == "assistant") {
         // mm33: video is opt-in per model (it is priced per frame)
         if !m.videos.is_empty() && !cfg.video {
@@ -8069,6 +9404,20 @@ fn build_prompt(
                     v.len() >> 20, cfg.max_video_bytes >> 20
                 ));
             }
+        }
+        // mm37: an answer whose exact ids the client kept is replayed AS them
+        // (think block and all): the engine parked that whole turn, so the
+        // prompt then extends the park instead of re-reading the answer
+        let ids = m.tok.as_deref().filter(|ids| {
+            m.role == "assistant" && cfg.template == "chatml" && m.images.is_empty()
+                && m.videos.is_empty() && valid_turn_ids(cfg, tok, ids)
+        });
+        if ids.is_some() {
+            msgs.push((m.role.clone(), config::TOK_MARK.to_string()));
+            turn_images.push(&m.images);
+            turn_videos.push(&m.videos);
+            turn_toks.push(ids);
+            continue;
         }
         let content = if cfg.thinking && m.role == "assistant" {
             strip_think(&m.content)
@@ -8093,6 +9442,7 @@ fn build_prompt(
         msgs.push((m.role.clone(), content));
         turn_images.push(&m.images);
         turn_videos.push(&m.videos);
+        turn_toks.push(None);
     }
     if msgs.is_empty() {
         return Err("no user/assistant messages".into());
@@ -8111,7 +9461,9 @@ fn build_prompt(
         // copying several megabytes to find that out.
         let images: usize = turn_images.iter().map(|im| im.len()).sum();
         let videos: usize = turn_videos.iter().map(|v| v.len()).sum();
+        let spliced: Vec<&[u32]> = turn_toks.iter().flatten().copied().collect();
         let total = tokens_of(tok, &rendered.prompt)?
+            + spliced.iter().map(|ids| ids.len()).sum::<usize>()
             + images * cfg.image_tokens
             + videos * cfg.video_frames * cfg.image_tokens;
         if total <= cfg.max_prompt_tokens || msgs.len() <= 1 {
@@ -8132,13 +9484,15 @@ fn build_prompt(
                 .flat_map(|(vs, ims)| vs.iter().cloned().map(Media::Video)
                     .chain(ims.iter().cloned().map(Media::Image)))
                 .collect();
-            let mut prompt = split_rendered(tok, &rendered.prompt, media)?;
+            let mut prompt = split_rendered(tok, &rendered.prompt, media, &spliced)?;
             // the shared prefixes worth parking (mm35): the system text on
             // its own when a tool block follows it (every settings
             // combination shares that much), and the whole system message.
-            // chatml only - the boundaries below are its markers - and only
-            // for a prompt the engine can be told about whole (no media).
-            if cfg.template == "chatml" && prompt.images == 0 {
+            // chatml only - the boundaries below are its markers. A prompt
+            // with media gets them too: what the engine is told about it is
+            // the text before its first picture (Prompt::declared), and the
+            // system message is always in that text.
+            if cfg.template == "chatml" {
                 let mut cands = Vec::new();
                 if block_added {
                     cands.push(tok.encode_ids(
@@ -8164,13 +9518,14 @@ fn build_prompt(
         msgs.remove(0); // drop the oldest turn and retry
         turn_images.remove(0); // ...and the pictures that were part of it
         turn_videos.remove(0);
+        turn_toks.remove(0);
     }
 }
 
 /// How many tokens a rendered prompt costs, media marks excluded (they are
 /// punctuation for the splitter, not text for the model).
 fn tokens_of(tok: &Tok, rendered: &str) -> Result<usize, String> {
-    let text = rendered.replace(config::MEDIA_MARK, "");
+    let text = rendered.replace(config::MEDIA_MARK, "").replace(config::TOK_MARK, "");
     Ok(tok.encode_ids(text.as_str(), true)?.len())
 }
 
@@ -8178,36 +9533,71 @@ fn tokens_of(tok: &Tok, rendered: &str) -> Result<usize, String> {
 /// them. Only the FIRST run gets the tokenizer's special-token treatment, the
 /// same as a whole prompt would: later runs continue a sequence that already
 /// began, so re-adding a BOS at each image would corrupt it.
+/// mm37: a TOK_MARK is a replayed turn's ids, spliced in verbatim. The text
+/// either side is cut at "<|im_start|>assistant\n" / "<|im_end|>", where the
+/// tokenizer splits anyway, so the runs tokenize exactly as the whole prompt
+/// of the turn that generated those ids did.
 fn split_rendered(
     tok: &Tok,
     rendered: &str,
     media: Vec<Media>,
+    spliced: &[&[u32]],
 ) -> Result<Prompt, String> {
-    let chunks: Vec<&str> = rendered.split(config::MEDIA_MARK).collect();
-    if chunks.len() - 1 != media.len() {
-        return Err(format!(
-            "prompt has {} media slots but {} attachments",
-            chunks.len() - 1,
-            media.len()
-        ));
+    let marks = rendered.matches(config::MEDIA_MARK).count();
+    if marks != media.len() {
+        return Err(format!("prompt has {marks} media slots but {} attachments", media.len()));
     }
-    let mut parts = Vec::with_capacity(chunks.len() + media.len());
+    if rendered.matches(config::TOK_MARK).count() != spliced.len() {
+        return Err("prompt has a replayed-turn slot without its ids".into());
+    }
+    let mut parts: Vec<PromptPart> = Vec::with_capacity(2 * (marks + spliced.len()) + 1);
     let mut text_ids = Vec::new();
     let mut imgs = media.into_iter();
-    for (i, chunk) in chunks.iter().enumerate() {
+    let mut turns = spliced.iter();
+    let text = |parts: &mut Vec<PromptPart>, text_ids: &mut Vec<u32>, ids: &[u32]| {
+        if ids.is_empty() {
+            return;
+        }
+        text_ids.extend_from_slice(ids);
+        // adjacent text runs (a spliced turn between two) feed as one
+        if let Some(PromptPart::Text(prev)) = parts.last_mut() {
+            prev.extend_from_slice(ids);
+        } else {
+            parts.push(PromptPart::Text(ids.to_vec()));
+        }
+    };
+    let mut rest = rendered;
+    let mut run = 0usize;
+    loop {
+        let next = [config::MEDIA_MARK, config::TOK_MARK]
+            .iter()
+            .filter_map(|m| rest.find(m).map(|i| (i, *m)))
+            .min_by_key(|(i, _)| *i);
+        let (cut, mark) = match next {
+            Some((i, m)) => (i, Some(m)),
+            None => (rest.len(), None),
+        };
+        let chunk = &rest[..cut];
         if !chunk.is_empty() {
-            let ids = tok.encode_ids(*chunk, i == 0)?;
-            if !ids.is_empty() {
-                text_ids.extend_from_slice(&ids);
-                parts.push(PromptPart::Text(ids));
+            let ids = tok.encode_ids(chunk, run == 0)?;
+            text(&mut parts, &mut text_ids, &ids);
+        }
+        run += 1;
+        match mark {
+            None => break,
+            Some(m) if m == config::MEDIA_MARK => {
+                parts.push(match imgs.next() {
+                    Some(Media::Image(b)) => PromptPart::Image(b),
+                    Some(Media::Video(b)) => PromptPart::Video(b),
+                    None => return Err("media slot without an attachment".into()),
+                });
+            }
+            Some(_) => {
+                let ids = turns.next().ok_or("replayed-turn slot without its ids")?;
+                text(&mut parts, &mut text_ids, ids);
             }
         }
-        if let Some(m) = imgs.next() {
-            parts.push(match m {
-                Media::Image(b) => PromptPart::Image(b),
-                Media::Video(b) => PromptPart::Video(b),
-            });
-        }
+        rest = &rest[cut + mark.map_or(0, |m| m.len())..];
     }
     // `images` is the MEDIA count: every path that asks text_only() cares
     // whether anything non-text sits in the prompt, not which kind
@@ -8235,8 +9625,8 @@ fn marks_from(text_ids: &[u32], candidates: &[Vec<u32>]) -> Vec<usize> {
 
 /// Remove media marks from text that came from outside.
 fn strip_marks(s: &str) -> String {
-    if s.contains(config::MEDIA_MARK) {
-        return s.replace(config::MEDIA_MARK, "");
+    if s.contains(config::MEDIA_MARK) || s.contains(config::TOK_MARK) {
+        return s.replace(config::MEDIA_MARK, "").replace(config::TOK_MARK, "");
     }
     s.to_string()
 }
@@ -8318,6 +9708,7 @@ fn gen_params(
         },
         think_open,
         loop_reps: cfg.repeat_guard,
+        park_end: false,
     }
 }
 
@@ -8396,6 +9787,26 @@ fn warmup_frame(progress: bool, status: &str, result: Option<&serde_json::Value>
         (false, Some(v)) => v.to_string(),
         (true, None) => format!("{}\n", serde_json::json!({ "status": status })),
         (true, Some(v)) => format!("{}\n", serde_json::json!({ "result": v })),
+    }
+}
+
+#[cfg(test)]
+mod warm_caller_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_warmup_lists_as_signed_in_only_where_sign_in_is_required() {
+        let required = serde_json::json!({ "sso": { "signer": "0x3394b4d24250F1657cB547975e77117454b3Cc6D",
+            "audience": "0x9eb4e60063aa079cebed355f96b2d049457ae77bdbcd49086040282e1e4b871c", "required": true } });
+        let optional = serde_json::json!({ "sso": { "signer": "0x3394b4d24250F1657cB547975e77117454b3Cc6D",
+            "audience": "0x9eb4e60063aa079cebed355f96b2d049457ae77bdbcd49086040282e1e4b871c", "required": false } });
+        assert_eq!(warm_caller(&required, None).as_deref(), Some(WARM_LISTING_CALLER));
+        assert_eq!(warm_caller(&optional, None), None, "an open deployment's boot warm-up stays anonymous");
+        assert_eq!(warm_caller(&serde_json::json!({}), None), None, "no sso at all: anonymous");
+        assert_eq!(warm_caller(&required, Some("acct_real".into())).as_deref(), Some("acct_real"),
+            "a verified caller is never replaced");
+        // the stand-in passes the adapters' identity check (api-mcp-adapter / enclave-cron canonical_sub)
+        assert!(WARM_LISTING_CALLER.len() == 42 && WARM_LISTING_CALLER[2..].chars().all(|c| c == '0'));
     }
 }
 
@@ -8489,6 +9900,8 @@ const ERR_CODES: &[&str] = &[
     "vision_unavailable", "image_undecodable", "image_too_wide",
     // sign-in gate: the playground opens its sign-in dialog on this one
     "sso_required",
+    // one message over max_message_tokens: the user's to shorten
+    "message_too_long",
 ];
 
 /// Drop the "[code] " marker from a message bound for a payload without a
@@ -8587,6 +10000,24 @@ fn caller_identity(cfg: &AppConfig, req: &IncomingRequest) -> Option<String> {
         }
     }
     None
+}
+
+/// The chat's Enclave session, from the x-enclave-session header (see
+/// session.rs). Read from the headers like the caller, so before the body.
+/// Only a SIGNED-IN request may bring one: the session acts for a wallet,
+/// and an anonymous turn is nobody's to act for. A header that is refused
+/// or malformed is treated as no session at all, and the log line says why
+/// in words - never the value, which carries the private key.
+fn chat_session(req: &IncomingRequest, caller: Option<&str>) -> Option<session::ChatSession> {
+    let raw = req
+        .headers()
+        .get(&session::HEADER.to_string())
+        .into_iter()
+        .find_map(|v| String::from_utf8(v).ok().filter(|s| !s.trim().is_empty()));
+    session::accept(raw.as_deref(), caller.is_some()).unwrap_or_else(|e| {
+        eprintln!("[eyesoff-ai] {} ignored: {e}", session::HEADER);
+        None
+    })
 }
 
 /// POST /v1/keys - hand a signed-in user their derived API key. The identity
@@ -8718,6 +10149,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let t0 = now_ms();
     // who is asking, from the headers, before the body is taken
     let caller = config::from_value(raw.clone()).ok().and_then(|base| caller_identity(&base, &req));
+    let session = chat_session(&req, caller.as_deref());
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let mut creq = match parsed {
@@ -8725,6 +10157,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
         Err(e) => return json_err(out, 400, &e),
     };
     creq.caller = caller;
+    creq.session = session;
     let t1 = init_note("body", t0);
     let cfg = &match resolve_model(raw, creq.model.as_deref()) {
         Ok(c) => c,
@@ -8786,6 +10219,12 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
             return;
         }
     };
+    if let Err(e) = check_message_tokens(cfg, &tok, &creq.messages) {
+        let _ = send(serde_json::json!({ "error": strip_code(&e) }));
+        drop(stream);
+        let _ = OutgoingBody::finish(body, None);
+        return;
+    }
 
     let mode = creq.target.as_deref().unwrap_or("auto");
 
@@ -8873,10 +10312,9 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // it; the report is prepended to whatever that leg left behind. When the
     // MODEL holds view_image the pre-pass stands down: the pictures leave the
     // prompt and wait for the tool instead.
-    let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
-        if let Some(t) = &mut tl {
-            t.stash_images(&mut messages);
-        }
+    let vision_meta = if tl.as_mut().is_some_and(|t| {
+            t.prepare_images(cfg, creq.model.as_deref(), &mut messages)
+        }) {
         None
     } else {
         match apply_vision(cfg, &creq, &mut messages, &tok, mode, &status_cb) {
@@ -8934,7 +10372,11 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     let last_user = messages.iter().rposition(|m| m.role == "user");
     let mut last_err = String::new();
     let mut ok = false;
+    // mm37: generation legs this turn took (a tool step or a search rerun
+    // adds one); only a one-leg answer is handed back as its ids
+    let mut legs = 0usize;
     'answer: loop {
+        legs += 1;
         let caps = match &tl {
             Some(t) => Capabilities::Tools(t.tools(), &t.budget),
             None => Capabilities::Note,
@@ -8948,8 +10390,13 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                 return;
             }
         };
+        if let Some(t) = tl.as_mut() {
+            t.note_prompt(prompt_cost(&prompt_ids, cfg), kv_pool(), cfg.max_prompt_tokens);
+        }
         let effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &status_cb);
-        let params = gen_params(cfg, &creq, stops, think_open, effort);
+        let mut params = gen_params(cfg, &creq, stops, think_open, effort);
+        // the page keeps this turn's answer as ids (mm37): park its end
+        params.park_end = true;
         // free the encode slot ONLY when nothing can re-enter this loop: a
         // tool call (or the tools-less search remedy) appends messages and
         // rebuilds the prompt, which must re-encode - a dropped host-tokenizer
@@ -9131,10 +10578,24 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
                     if s.think_forced {
                         done["think_forced"] = serde_json::json!(true);
                     }
+                    // mm37: the answer as the exact ids the engine parked, for
+                    // the page to replay next turn - only a one-leg answer:
+                    // a tool step or a search rerun rebuilt this turn from
+                    // messages the page never sends back
+                    if legs == 1 && tl.as_ref().map_or(true, |t| t.calls == 0) && !tool_searched && !tool_nudged {
+                        if let Some(ids) = turn_ids_for(&tok, &prompt_ids.text_ids, &s.ids, &cfg.eos) {
+                            done["tok"] = serde_json::json!(turn_ids_b64(&ids));
+                        }
+                    }
                     // what the loop spent, when it ran at all: the client
                     // shows it on the finished reply's meta line
                     if let Some(t) = tl.as_ref().filter(|t| t.calls > 0) {
                         done["loop"] = t.progress();
+                    }
+                    // a compacted answer: the page sends this summary in
+                    // place of the turns before its question from now on
+                    if let Some(sm) = tl.as_ref().and_then(|t| t.summary.as_ref()) {
+                        done["compact"] = serde_json::json!({ "summary": sm });
                     }
                     let im = INIT_MS.with(|v| v.borrow().clone());
                     if !im.is_empty() {
@@ -9216,6 +10677,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
     }
     // who is asking, from the headers, before the body is taken
     let caller = caller_identity(&base, &req);
+    let session = chat_session(&req, caller.as_deref());
     let parsed: Result<ChatReq, String> = read_body(&req)
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("bad JSON: {e}")));
     let mut creq = match parsed {
@@ -9223,6 +10685,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         Err(e) => return json_err(out, 400, &e),
     };
     creq.caller = caller;
+    creq.session = session;
     // A client-declared `tools` array is the PASSTHROUGH (see client_tools):
     // the model is offered the client's functions and its call goes back on
     // the reply as `tool_calls`, for the CLIENT to execute. The deployment's
@@ -9325,6 +10788,12 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 return;
             }
         };
+        if let Err(e) = check_message_tokens(cfg, &tok, &creq.messages) {
+            send_err(&e);
+            drop(stream);
+            let _ = OutgoingBody::finish(body, None);
+            return;
+        }
         // Effort scaling, when the deployment configured it: the rating comes out
         // of the router pass below if that runs, and from its own short pass later
         // if it does not. `want_effort` gates BOTH, so a deployment without the
@@ -9408,10 +10877,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         // vision_service, or a serving model reading the picture itself,
         // no-ops here. When the MODEL holds view_image the pre-pass stands
         // down and the pictures wait for the tool.
-        let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
-            if let Some(t) = &mut tl {
-                t.stash_images(&mut messages);
-            }
+        let vision_meta = if tl.as_mut().is_some_and(|t| {
+            t.prepare_images(cfg, creq.model.as_deref(), &mut messages)
+        }) {
             None
         } else {
             match apply_vision(cfg, &creq, &mut messages, &tok, mode, &leg_status) {
@@ -9479,6 +10947,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
                 return;
             }
         };
+        if let Some(t) = tl.as_mut() {
+            t.note_prompt(prompt_cost(&prompt_ids, cfg), kv_pool(), cfg.max_prompt_tokens);
+        }
         let effort =
             resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &leg_status);
         let params = gen_params(cfg, &creq, stops, think_open, effort);
@@ -9647,6 +11118,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(t) => t,
             Err(e) => return json_err(out, 500, &e),
         };
+        if let Err(e) = check_message_tokens(cfg, &tok, &creq.messages) {
+            return json_err(out, 400, &e);
+        }
         let no_status = |_: &str| {};
         // Effort scaling, when the deployment configured it: the rating comes out
         // of the router pass below if that runs, and from its own short pass later
@@ -9715,10 +11189,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(m) => m,
             Err(e) => return json_err(out, 502, &e),
         };
-        let vision_meta = if tl.as_ref().is_some_and(|t| t.owns_vision()) {
-            if let Some(t) = &mut tl {
-                t.stash_images(&mut messages);
-            }
+        let vision_meta = if tl.as_mut().is_some_and(|t| {
+            t.prepare_images(cfg, creq.model.as_deref(), &mut messages)
+        }) {
             None
         } else {
             match apply_vision(cfg, &creq, &mut messages, &tok, mode, &no_status) {
@@ -9748,6 +11221,9 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
             Ok(v) => v,
             Err(e) => return json_err(out, 400, &e),
         };
+        if let Some(t) = tl.as_mut() {
+            t.note_prompt(prompt_cost(&prompt_ids, cfg), kv_pool(), cfg.max_prompt_tokens);
+        }
         think_open = opened;
         effort = resolve_effort(cfg, &tok, &messages, mode, think_open, router_effort, &no_status);
         params = gen_params(cfg, &creq, stops, think_open, effort);
@@ -10138,10 +11614,29 @@ fn handle_d2h(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     }
 }
 
+/// Whom an UNSIGNED warm-up (the guest's boot probe) renders the prompt as, on
+/// a deployment that requires sign-in: no chat there is anonymous, and every
+/// signed-in chat renders the same prompt - per-user MCP servers list their
+/// per-user tools for ANY named caller, with definitions that do not depend
+/// on who (api-mcp-adapter, enclave-cron) - so the boot parks exactly the
+/// prefix the first real chat uses, instead of an anonymous one nobody can
+/// reach (which left every signed-in page re-reading ~6k tokens after a boot).
+/// The zero address is no one's account and only ever reaches a tools/list:
+/// a warm-up generates nothing and calls no tool.
+const WARM_LISTING_CALLER: &str = "0x0000000000000000000000000000000000000000";
+
+fn warm_caller(raw: &serde_json::Value, verified: Option<String>) -> Option<String> {
+    verified.or_else(|| {
+        sso::SsoConfig::from_raw(raw).filter(|s| s.required).map(|_| WARM_LISTING_CALLER.to_string())
+    })
+}
+
 fn handle_warmup(raw: &serde_json::Value, query: &str, req: &IncomingRequest, out: ResponseOutparam) {
-    // Boot probes remain anonymous. A signed-in browser warms the same tool
-    // set its chat will see, including identity-dependent MCP capabilities.
-    let caller = config::from_value(raw.clone()).ok().and_then(|cfg| caller_identity(&cfg, req));
+    // A signed-in browser warms the same tool set its chat will see,
+    // including identity-dependent MCP capabilities; an unsigned boot probe on
+    // a sign-in-required deployment warms that same signed-in set (warm_caller).
+    let verified = config::from_value(raw.clone()).ok().and_then(|cfg| caller_identity(&cfg, req));
+    let caller = warm_caller(raw, verified);
     // GPU by default - but on a deployment the platform gave NO GPU share,
     // "gpu" is a guaranteed failure for the onnx path, and reporting every
     // model broken hides the real story (the fleet had no GPU enclave free).
@@ -10397,10 +11892,18 @@ fn handle_model_list(raw: &serde_json::Value, out: ResponseOutparam) {
                 "enabled": true,
                 "default_on": t.default_on,
                 "max_calls": t.max_calls,
+                "max_failed_calls": t.max_failed_calls,
+                "max_repeat_calls": t.max_repeat_calls,
+                "limit_cooldown_s": t.limit_cooldown_s,
+                // compaction: shares of the KV pool, which is named so the
+                // marks can be read as tokens
+                "compact_at": t.compact_at,
+                "compact_force_at": t.compact_force_at,
+                "kv_pool": kv_pool(),
                 "max_seconds": t.max_seconds,
                 "max_agents": t.max_agents,
                 "max_agent_depth": t.max_agent_depth,
-                "ledger": t.ledger,
+                "ledger": t.ledger.json(),
                 "verify": t.verify,
                 // what a turn would really be offered, not what was typed: a
                 // duplicate or an unusable name is dropped at resolution, and
@@ -10645,12 +12148,17 @@ fn handle_tools_probe(
     let body = serde_json::json!({
         "discover_ms": discover_ms,
         "max_calls": tcfg.max_calls,
+        "max_failed_calls": tcfg.max_failed_calls,
+        "max_repeat_calls": tcfg.max_repeat_calls,
+        "limit_cooldown_s": tcfg.limit_cooldown_s,
+        "compact_at": tcfg.compact_at,
+        "compact_force_at": tcfg.compact_force_at,
         "max_seconds": tcfg.max_seconds,
         "wait_max_s": tcfg.wait_max_s,
         "keep_results": tcfg.keep_results,
         "max_agents": tcfg.max_agents,
         "max_agent_depth": tcfg.max_agent_depth,
-        "ledger": tcfg.ledger,
+        "ledger": tcfg.ledger.json(),
         "ledger_chars": tcfg.ledger_chars,
         "verify": tcfg.verify,
         "verify_pass": tcfg.verify_pass,
@@ -10681,6 +12189,7 @@ fn handle_tools_probe(
             "user": t.meta.user,
             "route": t.meta.route,
             "route_arg": t.meta.route_arg,
+            "defer": t.meta.defer,
         })).collect::<Vec<_>>(),
     });
     respond_bytes(out, 200, "application/json", body.to_string().as_bytes());
@@ -10852,6 +12361,9 @@ impl Guest for Component {
             // again, so it may hand the return fragment over and close (see
             // src/sso-return.html). Open like the page that carries the
             // sign-in button, for the same reason.
+            (Method::Get, "/sso-app") | (Method::Get, "/sso-app/return") => {
+                respond_bytes(out, 200, "text/html; charset=utf-8", SSO_APP_HTML.as_bytes())
+            }
             (Method::Get, "/sso-return") => {
                 respond_bytes(out, 200, "text/html; charset=utf-8", SSO_RETURN_HTML.as_bytes())
             }
@@ -10871,7 +12383,7 @@ impl Guest for Component {
             _ => json_err(
                 out,
                 404,
-                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /v1/keys, POST /chat, POST /title",
+                "not found; routes: GET /, GET /c/<chat>, GET /favicon.svg, GET /favicon.ico, GET /apple-touch-icon.png, GET /icon-192.png, GET /icon-512.png, GET /icon-maskable-512.png, GET /manifest.webmanifest, GET /sw.js, GET /.well-known/<file>, GET /emoji.woff2, GET /ping, GET /models, GET /sso-return, GET /sso-app, GET /attestation, GET /search, GET /warmup, GET /v1/models, POST /v1/chat/completions, POST /v1/keys, POST /chat, POST /title",
             ),
         }
     }
@@ -11057,6 +12569,55 @@ mod tests {
         let _ = stash_images_for_tool(&mut msgs, Some("view_image"), None);
         assert!(msgs[0].content.contains("generated earlier"), "{}", msgs[0].content);
         assert!(msgs[0].images.is_empty());
+    }
+
+    #[test]
+    fn image_transformer_preserves_local_and_delegated_vision() {
+        for (local, delegated) in [(true, false), (true, true), (false, true)] {
+            let mut older = ChatMsg::text("user", "first image");
+            older.images = vec![vec![1, 2]];
+            let mut latest = ChatMsg::text("user", "describe this image");
+            latest.images = vec![vec![3, 4], vec![5, 6]];
+            let mut messages = vec![older, latest];
+            let (tool_images, tool_vision) = prepare_tool_images(
+                &mut messages, None, Some("upscale_image"), local, delegated,
+            );
+            assert!(!tool_vision, "the upscaler must not bypass vision");
+            assert_eq!(tool_images, vec![vec![3, 4], vec![5, 6]]);
+            assert_eq!(messages[0].images, vec![vec![1, 2]]);
+            assert_eq!(messages[1].images, tool_images);
+            assert_eq!(messages[1].content, "describe this image");
+        }
+    }
+
+    #[test]
+    fn image_reader_owns_only_nonlocal_vision() {
+        for (local, delegated) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut message = ChatMsg::text("user", "describe this image");
+            message.images = vec![vec![1, 2, 3]];
+            let mut messages = vec![message];
+            let (images, tool_vision) = prepare_tool_images(
+                &mut messages, Some("view_image"), Some("upscale_image"), local, delegated,
+            );
+            assert_eq!(images, vec![vec![1, 2, 3]]);
+            assert_eq!(tool_vision, !local);
+            assert_eq!(messages[0].images.is_empty(), !local);
+            assert_eq!(messages[0].content.contains("call view_image"), !local);
+        }
+    }
+
+    #[test]
+    fn transformer_only_blind_model_keeps_honest_tool_note() {
+        let mut message = ChatMsg::text("user", "upscale this");
+        message.images = vec![vec![1, 2, 3]];
+        let mut messages = vec![message];
+        let (images, tool_vision) = prepare_tool_images(
+            &mut messages, None, Some("upscale_image"), false, false,
+        );
+        assert!(tool_vision);
+        assert_eq!(images, vec![vec![1, 2, 3]]);
+        assert!(messages[0].images.is_empty());
+        assert!(messages[0].content.contains("no tool to view"));
     }
 
     /// Routes the router serves statics from, spelled scope-relative the way
@@ -11705,13 +13266,15 @@ mod tests {
         let mut msgs = vec![ChatMsg::text("user", "make the tests pass")];
         // the "no such tool" result is short; pad it through the log so the
         // condenser has something to cut
-        // distinct calls: an identical call with an identical result twice
-        // over is what the stuck detector refuses, and that is not this test
+        // distinct calls: the same call in a row counts toward
+        // max_repeat_calls, and that is not this test
         let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
         for i in 0..4 {
             assert!(tl.step(&call(i), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
             // the progress line rides under a persisting loop's results
-            assert!(tl.results[i].2.contains(&format!("[loop: call {} of 32;", i + 1)), "{}", tl.results[i].2);
+            // (the default cooldown makes the count one of calls with no
+            // break of a minute between them)
+            assert!(tl.results[i].2.contains(&format!("[loop: call {}; {} of 32 with no break of 60 seconds", i + 1, i + 1)), "{}", tl.results[i].2);
             // stand in for a long test log: the loop condenses what IT
             // recorded, so lengthen the recorded copy and the turn together
             let long = format!("run {i} BEGIN {} END run {i}", "log line\n".repeat(200));
@@ -11739,13 +13302,164 @@ mod tests {
         assert_eq!(condense("short"), None);
     }
 
+    /// What a call returned reaches the person on its live event - a failure's
+    /// error text above all, since nothing else says why it failed - cut at
+    /// RESULT_EVENT_CHARS, and stays out of the answer's stats.
+    #[test]
+    fn a_results_text_rides_its_live_event_and_not_the_stats() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 8, "http": [{ "name": "run_vm_command", "url": "https://h/run" }]
+        }))
+        .unwrap();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let result = |text: String, is_error: bool| tools::ToolResult {
+            text, is_error, ms: 7, sources: Vec::new(), image: None, seen: None,
+        };
+        let call = |n: u8| tools::ToolCall {
+            name: "run_vm_command".into(),
+            args: serde_json::json!({ "cmd": "uname -a", "n": n }),
+        };
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "is the vm up?")];
+        let live = std::cell::RefCell::new(Vec::new());
+        let on_result = |e: &serde_json::Value| live.borrow_mut().push(e.clone());
+        let err = "tool 'run_vm_command' answered HTTP 502: no VM is attached to this session".to_string();
+        assert!(tl.take_result(&call(1), "k1", true, result(err.clone(), true), &mut msgs, &on_result, &|_| {}));
+        let long = "x".repeat(RESULT_EVENT_CHARS + 50);
+        assert!(tl.take_result(&call(2), "k2", true, result(long, false), &mut msgs, &on_result, &|_| {}));
+        let live = live.borrow();
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0]["ok"], false);
+        assert_eq!(live[0]["result"], err.as_str());
+        assert!(msgs[2].content.contains(&err), "the model read the same text: {}", msgs[2].content);
+        let cut = live[1]["result"].as_str().unwrap();
+        assert!(cut.starts_with(&"x".repeat(RESULT_EVENT_CHARS)));
+        assert!(cut.ends_with(&format!("[truncated at {RESULT_EVENT_CHARS} characters]")), "{}", &cut[cut.len() - 60..]);
+        assert!(tl.log.iter().all(|e| e.get("result").is_none()), "{:?}", tl.log);
+    }
+
     /// LEDGER MODE keeps the conversation flat: after every step the prompt
     /// is the original turns, one call and one result, and the only state
     /// that crosses is what the model wrote under `### LEDGER`.
+    /// A tool result's picture for the MODEL (result.see): attached to the
+    /// result's turn, the newest keep_images kept, older ones taken back out
+    /// with a line saying so, the request's own attachments counted first,
+    /// and a blind model told what it missed.
+    #[test]
+    fn a_result_picture_reaches_the_model_and_only_the_newest_stays() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "http": [{ "name": "computer", "url": "https://h/computer" }]
+        }))
+        .unwrap();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1];
+        let result = |n: u8| tools::ToolResult {
+            text: format!("{{\"ok\":true,\"step\":{n}}}"),
+            is_error: false, ms: 5, sources: Vec::new(), image: None,
+            seen: Some([png.clone(), vec![n]].concat()),
+        };
+        let call = |n: u8| tools::ToolCall {
+            name: "computer".into(),
+            args: serde_json::json!({ "action": "click", "n": n }),
+        };
+        let sees = tools::Builtins { images_local: true, image_slots: 4, ..Default::default() };
+        let mut tl = ToolLoop::open(&tc, sees, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "open the browser")];
+        let seen_live = std::cell::RefCell::new(Vec::new());
+        let on_result = |e: &serde_json::Value| {
+            seen_live.borrow_mut().push(e.get("picture").and_then(|p| p.as_str()).map(str::to_string));
+        };
+        for n in 1..=3u8 {
+            assert!(tl.take_result(&call(n), &format!("k{n}"), true, result(n), &mut msgs, &on_result, &|_| {}));
+        }
+        let with: Vec<usize> = (0..msgs.len()).filter(|&i| !msgs[i].images.is_empty()).collect();
+        assert_eq!(with, vec![6], "only the newest result keeps its picture (keep_images = 1)");
+        assert_eq!(msgs[6].images[0].last(), Some(&3));
+        assert!(msgs[6].content.contains("attached to this result; you can see it"), "{}", msgs[6].content);
+        for i in [2, 4] {
+            assert!(msgs[i].content.contains("removed since. Take a new one"), "{}", msgs[i].content);
+            assert!(!msgs[i].content.contains("you can see it"), "{}", msgs[i].content);
+        }
+        // the person watching got each picture on the live event, as a data URI
+        let live = seen_live.borrow();
+        assert_eq!(live.len(), 3);
+        assert!(live.iter().all(|p| p.as_deref().is_some_and(|p| p.starts_with("data:image/png;base64,"))));
+        // ...and the answer's stats did not
+        assert!(tl.log.iter().all(|e| e.get("picture").is_none()));
+
+        // the request's own attachments are counted first: 4 slots, 4 taken
+        let mut tl = ToolLoop::open(&tc, sees, tc.budget(None), &nop, &nofmt, None);
+        let mut full = ChatMsg::text("user", "compare these");
+        full.images = vec![png.clone(); 4];
+        let mut msgs = vec![full];
+        assert!(tl.take_result(&call(1), "k", true, result(1), &mut msgs, &|_| {}, &|_| {}));
+        assert!(msgs[2].images.is_empty());
+        assert!(msgs[2].content.contains("already carries as many pictures"), "{}", msgs[2].content);
+        assert_eq!(msgs[0].images.len(), 4, "the user's pictures are never the ones dropped");
+
+        // a model that cannot see is told so, and gets no bytes
+        let blind = tools::Builtins::default();
+        let mut tl = ToolLoop::open(&tc, blind, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "look")];
+        assert!(tl.take_result(&call(1), "k", true, result(1), &mut msgs, &|_| {}, &|_| {}));
+        assert!(msgs[2].images.is_empty());
+        assert!(msgs[2].content.contains("cannot see images"), "{}", msgs[2].content);
+
+        // ledger mode: the step wrapper drops old turns whole, and the newest
+        // picture survives the truncation and the ledger tail
+        let lc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 32, "ledger": "always", "keep_images": 2,
+            "http": [{ "name": "computer", "url": "https://h/computer" }]
+        }))
+        .unwrap();
+        let mut tl = ToolLoop::open(&lc, sees, lc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        tl.base_len = Some(1);
+        for n in 1..=2u8 {
+            msgs.truncate(1);
+            tl.pictures.retain(|&i| i < 1);
+            assert!(tl.take_result(&call(n), "k", true, result(n), &mut msgs, &|_| {}, &|_| {}));
+        }
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].images.len(), 1);
+        assert_eq!(tl.pictures, vec![2]);
+    }
+
+    /// A prompt with a picture in it is declared to the engine up to its
+    /// first picture, with the marks inside that text; an all-text prompt is
+    /// declared whole, as before.
+    #[test]
+    fn a_prompt_with_a_picture_declares_the_text_before_it() {
+        let text = Prompt {
+            parts: vec![PromptPart::Text((0..300).collect())],
+            text_ids: (0..300).collect(),
+            images: 0,
+            marks: vec![100, 200],
+        };
+        let (ids, marks) = text.declared().unwrap();
+        assert_eq!((ids.len(), marks), (300, &[100usize, 200][..]));
+        let pic = Prompt {
+            parts: vec![
+                PromptPart::Text((0..150).collect()),
+                PromptPart::Image(vec![1, 2, 3]),
+                PromptPart::Text((150..300).collect()),
+            ],
+            text_ids: (0..300).collect(),
+            images: 1,
+            marks: vec![100, 150, 200],
+        };
+        let (ids, marks) = pic.declared().unwrap();
+        assert_eq!(ids, &(0..150).collect::<Vec<u32>>()[..]);
+        assert_eq!(marks, &[100usize, 150][..], "a mark at the head's end is inside it; past it is not");
+        assert!(pic.text_only().is_none(), "speculative paths still see a picture prompt as one");
+    }
+
     #[test]
     fn ledger_mode_rebuilds_the_conversation_from_the_ledger() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
-            "max_calls": 32, "ledger": true, "ledger_chars": 300,
+            "max_calls": 32, "ledger": "always", "ledger_chars": 300,
             "http": [{ "name": "t", "url": "https://h/x" }]
         }))
         .unwrap();
@@ -11753,7 +13467,7 @@ mod tests {
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
         let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
-        assert!(tl.budget.ledger);
+        assert_eq!(tl.budget.ledger, tools::Ledger::Always);
         let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "make it pass")];
         let call = |i: usize| {
             format!(
@@ -11800,44 +13514,677 @@ mod tests {
         assert_eq!(ledger_of("### Ledgers\nno"), None);
     }
 
-    /// The same call after the same call twice returned the same thing is
-    /// refused unrun; the second identical outcome is what warns the model.
-    /// A different call in between (a wait, a read of something else)
-    /// resets the count, because polling is not being stuck.
+    /// COMPACTION's marks are shares of the KV pool, never past the prompt
+    /// cap's edge, and the prompt cap stands in where the host gives no pool.
     #[test]
-    fn an_identical_call_with_an_identical_result_is_refused_the_third_time() {
+    fn compaction_marks_follow_the_kv_pool_inside_the_prompt_cap() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((tc.compact_at, tc.compact_force_at), (0.6, 0.7));
+        // eyesoff's 27b: nnCtx 180224, max_prompt_tokens 131072
+        assert_eq!(compact_marks(&tc, 180_224, 131_072), (180_224, 108_134, 124_450));
+        // a pool far bigger than the cap: the cap's edge wins
+        assert_eq!(compact_marks(&tc, 1 << 20, 131_072), (1 << 20, 111_350, 124_450));
+        // no pool reported: the cap is the window
+        assert_eq!(compact_marks(&tc, 0, 100_000), (100_000, 60_000, 70_000));
+        let off: tools::ToolsConfig = serde_json::from_value(serde_json::json!({ "compact_at": 0 })).unwrap();
+        assert_eq!(compact_marks(&off, 180_224, 131_072), (0, 0, 0));
+        // a force share below the tell share is the tell share
+        let odd: tools::ToolsConfig =
+            serde_json::from_value(serde_json::json!({ "compact_at": 0.5, "compact_force_at": 0.2 })).unwrap();
+        let (_, tell, force) = compact_marks(&odd, 100_000, 100_000);
+        assert_eq!((tell, force), (50_000, 50_000));
+    }
+
+    fn compacting_loop() -> tools::ToolsConfig {
+        serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_failed_calls": 0, "max_repeat_calls": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_is_offered_beside_other_tools_only() {
+        let on = compacting_loop();
+        let reg = tools::build(&on, tools::Builtins::default(), &|_| {});
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.last(), Some(&tools::COMPACT_TOOL), "{names:?}");
+        assert!(reg.find(tools::COMPACT_TOOL).unwrap().is_builtin(tools::Builtin::Compact));
+        let mut off = compacting_loop();
+        off.compact_at = 0.0;
+        assert!(tools::build(&off, tools::Builtins::default(), &|_| {}).find(tools::COMPACT_TOOL).is_none());
+        let mut bare = compacting_loop();
+        bare.http.clear();
+        assert!(tools::build(&bare, tools::Builtins::default(), &|_| {}).tools.is_empty(),
+            "a loop with nothing else to call has nothing to compact");
+        // a configured tool that took the name is left alone, with a note
+        let mut taken = compacting_loop();
+        taken.http[0].name = "compact".into();
+        let reg = tools::build(&taken, tools::Builtins::default(), &|_| {});
+        assert!(!reg.find(tools::COMPACT_TOOL).unwrap().is_builtin(tools::Builtin::Compact));
+        assert!(reg.notes.iter().any(|n| n.contains("cannot compact")), "{:?}", reg.notes);
+    }
+
+    /// The model's summary replaces everything but the system prompt and
+    /// the request, and the loop's own bookkeeping moves with it.
+    #[test]
+    fn compact_replaces_the_conversation_with_the_models_summary() {
+        let tc = compacting_loop();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![
+            ChatMsg::text("system", "you are eyesoff"),
+            ChatMsg::text("user", "earlier question"),
+            ChatMsg::text("assistant", "earlier answer"),
+            ChatMsg::text("user", "build the app"),
+        ];
+        let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        for i in 0..4 {
+            assert!(tl.step(&call(i), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert_eq!(msgs.len(), 12);
+        let (calls, results, notes) = (std::cell::RefCell::new(0), std::cell::RefCell::new(Vec::new()), std::cell::RefCell::new(Vec::new()));
+        let summary = "Goal: build the app. Done: scaffold in /work/app. Next: run the tests.";
+        let c = format!("<tool_call>{{\"name\":\"compact\",\"arguments\":{{\"summary\":\"{summary}\"}}}}</tool_call>");
+        tl.prompt_tokens = 50_000;
+        assert!(tl.step(&c, &mut msgs, &|_| *calls.borrow_mut() += 1,
+            &|r| results.borrow_mut().push(r.clone()), &|n| notes.borrow_mut().push(n.to_string())));
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        assert_eq!(msgs[1].content, "build the app", "the request stays, word for word");
+        assert!(!msgs[2].content.contains("scaffold"), "the summary is not repeated in the call: {}", msgs[2].content);
+        let res = &msgs[3].content;
+        assert!(res.contains(summary) && res.contains("50000 tokens") && res.contains("10 earlier messages"), "{res}");
+        assert_eq!(tl.base_len, Some(2));
+        assert!(tl.results.is_empty() && tl.pictures.is_empty());
+        assert_eq!((tl.compactions, tl.summary.as_deref()), (1, Some(summary)));
+        assert_eq!(tl.counted, 4, "compacting is not a call the burst limit counts");
+        assert_eq!(*calls.borrow(), 1, "the page shows the call");
+        assert_eq!(results.borrow()[0]["ok"], true);
+        assert!(notes.borrow()[0].contains("compacted"), "{:?}", notes.borrow());
+        // the loop carries on from the new base
+        assert!(tl.step(&call(9), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(tl.progress()["compactions"], 1);
+        // an empty summary or an overlong one changes nothing
+        for bad in ["", &"x".repeat(16_001)] {
+            let before = msgs.len();
+            let c = format!("<tool_call>{{\"name\":\"compact\",\"arguments\":{{\"summary\":\"{bad}\"}}}}</tool_call>");
+            assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            assert_eq!(msgs.len(), before + 2);
+            assert!(msgs.last().unwrap().content.contains("Not compacted"), "{}", msgs.last().unwrap().content);
+            assert_eq!(tl.compactions, 1);
+        }
+    }
+
+    /// Past the tell mark each result says how full the context is; past the
+    /// force mark the next other call waits for a compaction, and a model
+    /// that calls something else again is compacted for it.
+    #[test]
+    fn a_filling_context_is_told_then_held_then_compacted_for_the_model() {
+        let tc = compacting_loop();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "go")];
+        let call = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        // pool 100k, cap 100k: tell at 60k, force at 70k
+        tl.note_prompt(59_999, 100_000, 100_000);
+        assert!(tl.step(&call(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!msgs.last().unwrap().content.contains("[context:"));
+        tl.note_prompt(65_000, 100_000, 100_000);
+        assert!(tl.step(&call(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        let told = &msgs.last().unwrap().content;
+        assert!(told.contains("[context: 65% full") && told.contains("Call compact now") && told.contains("at 70000 tokens"), "{told}");
+        // past the force mark: not run, asked to compact
+        tl.note_prompt(71_000, 100_000, 100_000);
+        let ran = std::cell::RefCell::new(0);
+        assert!(tl.step(&call(3), &mut msgs, &|_| *ran.borrow_mut() += 1, &|_| {}, &|_| {}));
+        assert_eq!(*ran.borrow(), 0);
+        assert!(msgs.last().unwrap().content.contains("This call was NOT run") && msgs.last().unwrap().content.contains("Call compact now"));
+        // a model that compacts when held is told which call it was held from
+        {
+            let mut t2 = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+            let mut m = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "go")];
+            t2.note_prompt(71_000, 100_000, 100_000);
+            assert!(t2.step(&call(5), &mut m, &|_| {}, &|_| {}, &|_| {}));
+            let c = "<tool_call>{\"name\":\"compact\",\"arguments\":{\"summary\":\"pages 1-4 read\"}}</tool_call>";
+            assert!(t2.step(c, &mut m, &|_| {}, &|_| {}, &|_| {}));
+            let r = &m.last().unwrap().content;
+            assert!(r.contains("pages 1-4 read") && r.contains("do not repeat") && r.contains("i\\\":5"), "{r}");
+            assert!(t2.held.is_none());
+        }
+        // asked again for something else: the app compacts, then the call runs
+        let notes = std::cell::RefCell::new(Vec::new());
+        assert!(tl.step(&call(4), &mut msgs, &|_| *ran.borrow_mut() += 1, &|_| {}, &|n| notes.borrow_mut().push(n.to_string())));
+        assert_eq!(*ran.borrow(), 1);
+        let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user", "assistant", "user"]);
+        let rec = &msgs[3].content;
+        assert!(rec.contains("Compacted automatically") && rec.matches("- <tool_call>").count() == 3, "{rec}");
+        assert!(!rec.contains("[context:") && rec.contains("not run: the context had to be compacted first"), "{rec}");
+        assert!(msgs[4].content.contains("\"i\":4"));
+        assert!(notes.borrow().iter().any(|n| n.contains("did not compact")), "{:?}", notes.borrow());
+        assert!(tl.summary.as_deref().is_some_and(|s| s.contains("Compacted automatically")));
+        // right after: a prompt still over the marks (what nothing can drop)
+        // is not nagged until the loop has added a quarter of the tell mark
+        tl.note_prompt(72_000, 100_000, 100_000);
+        assert!(tl.step(&call(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!msgs.last().unwrap().content.contains("[context:"), "{}", msgs.last().unwrap().content);
+        tl.note_prompt(87_000, 100_000, 100_000);
+        assert!(tl.step(&call(6), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(msgs.last().unwrap().content.contains("This call was NOT run"), "{}", msgs.last().unwrap().content);
+        // the pool itself ran out (a generation stepped aside): told to
+        // compact below the tell mark, once the chat holds an eighth of it
+        let mut pressed = ToolLoop::open(&tc, tools::Builtins::default(), tc.budget(None), &nop, &nofmt, None);
+        let mut m3 = vec![ChatMsg::text("user", "go")];
+        pressed.note_prompt(20_000, 100_000, 100_000);
+        POOL_STEP_ASIDES.with(|c| c.set(2));
+        assert!(pressed.step(&call(1), &mut m3, &|_| {}, &|_| {}, &|_| {}));
+        assert!(m3.last().unwrap().content.contains("shares with other chats ran out"), "{}", m3.last().unwrap().content);
+        assert_eq!(take_pool_step_asides(), 0, "read once");
+        pressed.note_prompt(10_000, 100_000, 100_000);
+        assert!(pressed.step(&call(2), &mut m3, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!m3.last().unwrap().content.contains("[context:"), "a small chat is not what filled it");
+        // compaction off: none of it
+        let mut off = compacting_loop();
+        off.compact_at = 0.0;
+        let mut quiet = ToolLoop::open(&off, tools::Builtins::default(), off.budget(None), &nop, &nofmt, None);
+        let mut m2 = vec![ChatMsg::text("user", "go")];
+        quiet.note_prompt(99_000, 100_000, 100_000);
+        assert!(quiet.step(&call(1), &mut m2, &|_| {}, &|_| {}, &|_| {}));
+        assert!(!m2.last().unwrap().content.contains("[context:"));
+    }
+
+    /// One message may take at most max_message_tokens; only the newest is
+    /// judged, and only when it is the user's.
+    #[test]
+    fn one_message_is_capped_and_only_the_newest() {
+        let tok = test_tokenizer();
+        let mut cfg = test_config();
+        cfg.max_message_tokens = 3;
+        let long = ChatMsg::text("user", "this no pictures here");
+        let e = check_message_tokens(&cfg, &tok, &[long.clone()]).unwrap_err();
+        assert!(e.starts_with("[message_too_long] this message is 4 tokens") && e.contains("at most 3"), "{e}");
+        assert!(check_message_tokens(&cfg, &tok, &[ChatMsg::text("user", "no pictures here")]).is_ok());
+        assert!(check_message_tokens(&cfg, &tok, &[long.clone(), ChatMsg::text("assistant", "ok"), ChatMsg::text("user", "here")]).is_ok(),
+            "an older long message is not judged again");
+        assert!(check_message_tokens(&cfg, &tok, &[long.clone(), ChatMsg::text("tool", "x")]).is_ok());
+        cfg.max_message_tokens = 0;
+        assert!(check_message_tokens(&cfg, &tok, &[long]).is_ok(), "0 = no cap");
+        assert!(ERR_CODES.contains(&"message_too_long"));
+    }
+
+    /// `ledger: true` is Ledger::Checks: a loop keeps its whole history
+    /// until it re-runs a check - the same call, its third good run with
+    /// something else run before it and a different answer each time. A
+    /// guide read again, a check re-run back to back, a check polled
+    /// between waits and a machine that keeps answering 409 never switch it
+    /// on; nothing does under Off, and Always is on from the start.
+    #[test]
+    fn a_checks_ledger_switches_on_when_a_check_is_rerun() {
+        fn run(
+            tl: &mut ToolLoop,
+            msgs: &mut Vec<ChatMsg>,
+            name: &str,
+            n: u32,
+            text: &str,
+            is_error: bool,
+            on_note: &dyn Fn(&str),
+        ) {
+            let c = tools::ToolCall { name: name.into(), args: serde_json::json!({ "n": n }) };
+            let key = canonical_call(&c);
+            let r = tools::ToolResult {
+                text: text.into(), is_error, ms: 1, sources: Vec::new(), image: None, seen: None,
+            };
+            assert!(tl.take_result(&c, &key, name != "wait", r, msgs, &|_| {}, on_note));
+        }
+        let cfg = |ledger: serde_json::Value| -> tools::ToolsConfig {
+            serde_json::from_value(serde_json::json!({
+                "max_calls": 32, "ledger": ledger, "builtin": ["wait"],
+                "http": [{ "name": "t", "url": "https://h/x" }]
+            }))
+            .unwrap()
+        };
+        let tc = cfg(serde_json::json!(true));
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let persist = serde_json::json!(true);
+        let notes = std::cell::RefCell::new(Vec::<String>::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        let open = |tc| ToolLoop::open(tc, b, tc.budget(Some(&persist)), &nop, &nofmt, None);
+
+        // reading first: a guide read three times between other calls
+        // answers the same each time, so the loop stays whole
+        let mut tl = open(&tc);
+        assert_eq!(tl.budget.ledger, tools::Ledger::Checks);
+        assert!(!tl.ledger_on);
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        for i in 0..3 {
+            run(&mut tl, &mut msgs, "guide", 0, "Publishing: build a component...", false, &on_note);
+            run(&mut tl, &mut msgs, "edit", i, "written", false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        assert_eq!(tl.results.len(), 6, "every result is kept, the older ones condensed");
+        // then a test loop: run, fix, run, fix, run - the third run is the switch
+        run(&mut tl, &mut msgs, "check", 0, "3 failed", false, &on_note);
+        run(&mut tl, &mut msgs, "edit", 10, "written", false, &on_note);
+        run(&mut tl, &mut msgs, "check", 0, "2 failed", false, &on_note);
+        assert!(!tl.ledger_on, "one re-run is a re-read, not a loop");
+        run(&mut tl, &mut msgs, "edit", 11, "written", false, &on_note);
+        assert!(notes.borrow().is_empty(), "{:?}", notes.borrow());
+        run(&mut tl, &mut msgs, "check", 0, "1 failed", false, &on_note);
+        assert!(tl.ledger_on);
+        assert_eq!(notes.borrow().len(), 1);
+        assert!(notes.borrow()[0].contains("re-running a check (check)"), "{:?}", notes.borrow());
+        // nothing is dropped until the model has written a ledger
+        assert!(!tl.dropping());
+        assert_eq!(tl.results.len(), 11);
+
+        // the same check back to back: nothing changed in between
+        let mut tl = open(&tc);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        for t in ["a", "b", "c", "d"] {
+            run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        // polling: only waits in between
+        let mut tl = open(&tc);
+        for (i, t) in ["starting", "pulling", "booting", "running"].iter().enumerate() {
+            run(&mut tl, &mut msgs, "get_deployment", 0, t, false, &on_note);
+            run(&mut tl, &mut msgs, "wait", i as u32, "waited 30 seconds", false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        // a machine that is down: the failures differ, but none is a run
+        let mut tl = open(&tc);
+        run(&mut tl, &mut msgs, "run_vm_command", 0, "Linux riscv64", false, &on_note);
+        for i in 0..4 {
+            run(&mut tl, &mut msgs, "computer", i, "HTTP 409", true, &on_note);
+            let err = format!("HTTP 409: machine is not running; next retry in {}s", 60 - i);
+            run(&mut tl, &mut msgs, "run_vm_command", 0, &err, true, &on_note);
+        }
+        assert!(!tl.ledger_on);
+        // an identical answer after a change leaves the count where it was;
+        // the next changed one still counts
+        let mut tl = open(&tc);
+        for (i, t) in ["3 failed", "3 failed", "2 failed", "1 failed"].iter().enumerate() {
+            assert!(!tl.ledger_on, "switched on before run {i}");
+            run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+            run(&mut tl, &mut msgs, "edit", i as u32, "written", false, &on_note);
+        }
+        assert!(tl.ledger_on);
+
+        // Off never switches on; Always is on before anything ran
+        for (ledger, on) in [(serde_json::json!(false), false), (serde_json::json!("always"), true)] {
+            let tc = cfg(ledger);
+            let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&persist)), &nop, &nofmt, None);
+            assert_eq!(tl.ledger_on, on);
+            for (i, t) in ["3 failed", "2 failed", "1 failed", "0 failed"].iter().enumerate() {
+                run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+                run(&mut tl, &mut msgs, "edit", i as u32, "written", false, &on_note);
+            }
+            assert_eq!(tl.ledger_on, on);
+        }
+        // and a loop that does not persist has no ledger to switch on
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        assert_eq!(tl.budget.ledger, tools::Ledger::Off);
+        for (i, t) in ["3 failed", "2 failed", "1 failed", "0 failed"].iter().enumerate() {
+            run(&mut tl, &mut msgs, "check", 0, t, false, &on_note);
+            run(&mut tl, &mut msgs, "edit", i as u32, "written", false, &on_note);
+        }
+        assert!(!tl.ledger_on);
+    }
+
+    /// Once a Checks ledger is on, the history stays until the model has
+    /// written a ledger - the result says what the ledger is, since the
+    /// system prompt never did - and from the first ledger on, every step
+    /// is the original turns, one call, one result and the ledger.
+    #[test]
+    fn a_checks_ledger_drops_the_history_only_once_it_is_written() {
         let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
-            "max_calls": 32, "http": [{ "name": "t", "url": "https://h/x" }]
+            "max_calls": 32, "ledger": true, "ledger_chars": 900,
+            "http": [{ "name": "t", "url": "https://h/x" }]
         }))
         .unwrap();
         let b = tools::Builtins::default();
         let nop = |_: &str| {};
         let nofmt = |_: &str, _: &str| None;
-        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
-        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(Some(&serde_json::json!(true))), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("system", "s"), ChatMsg::text("user", "make it pass")];
+        let bare = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        // off: a plain loop, accumulating, no ledger in sight
+        assert!(tl.step(&bare(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bare(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 6);
+        assert!(!msgs[5].content.contains("LEDGER"), "{}", msgs[5].content);
+        assert_eq!(tl.results.len(), 2);
+        // switched on (take_result does this when a check is re-run)
+        tl.ledger_on = true;
+        // a reply without a ledger loses nothing, and is told what to write
+        assert!(tl.step(&bare(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 8, "no ledger yet, so nothing is dropped");
+        let last = &msgs[7].content;
+        assert!(last.contains("### LEDGER (none yet - write it now)"), "{last}");
+        assert!(last.contains("keeps NO history"), "{last}");
+        assert!(last.contains("under 900 characters"), "{last}");
+        assert_eq!(tl.results.len(), 3);
+        // the first ledger: the history goes, the ledger rides the result
+        let with = "### LEDGER\ngoal: tests pass\n- x fails in parse()\n- next: fix parse\n\
+                    <tool_call>{\"name\":\"nope\",\"arguments\":{\"i\":4}}</tool_call>";
+        assert!(tl.step(with, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 4, "the base plus one call and one result");
+        assert!(msgs[2].content.contains("\"i\":4"), "{}", msgs[2].content);
+        let last = &msgs[3].content;
+        assert!(last.contains("### LEDGER (your state"), "{last}");
+        assert!(last.contains("- x fails in parse()\n- next: fix parse"), "{last}");
+        assert!(!last.contains("none yet"), "{last}");
+        assert!(tl.results.is_empty(), "nothing to condense once the history is dropped");
+        // and a reply without a block keeps it, still dropping
+        assert!(tl.step(&bare(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs[3].content.contains("- next: fix parse"), "{}", msgs[3].content);
+        assert_eq!(tl.calls, 5);
+    }
+
+    /// max_repeat_calls: one call runs at most that many times in a row,
+    /// whatever it returns. The run past it is not run and the model is told
+    /// to do something different; asking for it once more ends the answer.
+    /// Any different call resets the count - a wait too, so polling between
+    /// waits is never a repeat - and waits are never counted themselves.
+    #[test]
+    fn the_same_call_runs_at_most_max_repeat_calls_times_in_a_row() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_repeat_calls": 3, "max_failed_calls": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
         let a = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"q\":1}}</tool_call>";
         let other = "<tool_call>{\"name\":\"nope\",\"arguments\":{\"q\":2}}</tool_call>";
-        let notes = std::cell::RefCell::new(Vec::new());
+        let notes = std::cell::RefCell::new(Vec::<String>::new());
         let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
-        assert!(!msgs.last().unwrap().content.contains("identical result"), "{}", msgs.last().unwrap().content);
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
-        assert!(msgs.last().unwrap().content.contains("identical result 2 times in a row"), "{}", msgs.last().unwrap().content);
-        assert_eq!(notes.borrow().len(), 1, "{:?}", notes.borrow());
-        assert!(!tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
-        assert_eq!(tl.refused, Some(REFUSED_STUCK));
-        assert_eq!(tl.calls, 2, "the third identical call must not run");
-        // a different call between two identical ones resets the count
         let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
         let mut msgs = vec![ChatMsg::text("user", "hi")];
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert!(tl.step(other, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
-        assert_eq!(tl.calls, 4);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(!msgs.last().unwrap().content.contains("same call"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("2 times in a row now"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("3 times in a row now"), "{}", msgs.last().unwrap().content);
+        assert_eq!(tl.calls, 3);
+        assert!(notes.borrow().is_empty(), "{:?}", notes.borrow());
+        // the 4th is not run, and the model is told why
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.calls, 3, "the 4th identical call in a row must not run");
+        assert!(msgs.last().unwrap().content.contains("NOT run"), "{}", msgs.last().unwrap().content);
+        assert!(msgs.last().unwrap().content.contains("at most 3 times"), "{}", msgs.last().unwrap().content);
+        assert!(notes.borrow()[0].contains("a 4th time in a row"), "{:?}", notes.borrow());
         assert_eq!(tl.refused, None);
+        // asking for it yet again ends the answer
+        assert!(!tl.step(a, &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.refused, Some(REFUSED_REPEAT));
+        assert_eq!(tl.calls, 3);
+
+        // ...but a different call is the way on, and resets the count
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        for _ in 0..3 {
+            assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}), "told, not ended");
+        assert!(tl.step(other, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        for _ in 0..3 {
+            assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert_eq!(tl.calls, 7);
+        assert_eq!(tl.refused, None);
+        // a wait in between resets it too, and waits are never counted
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        for name in ["t", "t", "wait", "t", "t", "wait", "wait", "wait", "wait"] {
+            tl.note_waste(name, &format!("{name}{{}}"), name != "wait", false);
+        }
+        assert_eq!(tl.repeats, 0);
+        tl.note_waste("t", "t{}", true, false);
+        tl.note_waste("t", "t{}", true, false);
+        assert_eq!(tl.repeats, 2);
+        // no limit at all: nothing is ever refused
+        let off: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_repeat_calls": 0, "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let mut tl = ToolLoop::open(&off, b, off.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "hi")];
+        for _ in 0..4 {
+            tl.failed_run = 0; // the unknown tool fails; this is about repeats
+            assert!(tl.step(a, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+            assert!(!msgs.last().unwrap().content.contains("same call"), "{}", msgs.last().unwrap().content);
+        }
+        assert_eq!(tl.calls, 4);
         assert_eq!(fnv1a("a"), fnv1a("a"));
         assert_ne!(fnv1a("a"), fnv1a("b"));
+        assert_eq!((ordinal(1), ordinal(2), ordinal(3), ordinal(4), ordinal(11), ordinal(22)),
+                   ("1st".into(), "2nd".into(), "3rd".into(), "4th".into(), "11th".into(), "22nd".into()));
+    }
+
+    /// max_failed_calls: at that many failed calls in a row the result says
+    /// it is the limit, the next call is not run and the model is told to
+    /// answer, and a call after that is refused. A command that exited
+    /// non-zero is a failure though the tool answered fine; any call that
+    /// succeeds resets the run, and a wait neither counts nor resets it.
+    #[test]
+    fn calls_that_keep_failing_end_the_answer() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_failed_calls": 3, "max_repeat_calls": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let bad = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        let notes = std::cell::RefCell::new(Vec::<String>::new());
+        let on_note = |n: &str| notes.borrow_mut().push(n.to_string());
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(!msgs.last().unwrap().content.contains("in a row"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("2 calls in a row have failed; after 3"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert!(msgs.last().unwrap().content.contains("That is 3 failed calls in a row"), "{}", msgs.last().unwrap().content);
+        assert_eq!((tl.calls, tl.failed_run), (3, 3));
+        assert!(notes.borrow().is_empty(), "{:?}", notes.borrow());
+        assert!(tl.step(&bad(4), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.calls, 3, "the call after the limit must not run");
+        assert!(msgs.last().unwrap().content.contains("last 3 calls all failed"), "{}", msgs.last().unwrap().content);
+        assert!(notes.borrow()[0].contains("3 tool calls in a row failed"), "{:?}", notes.borrow());
+        assert!(!tl.step(&bad(5), &mut msgs, &|_| {}, &|_| {}, &on_note));
+        assert_eq!(tl.refused, Some(REFUSED_FAILING));
+
+        // what counts: the tool's error, and a command that exited non-zero;
+        // a success resets the run, a wait leaves it where it was
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "build it")];
+        let run = |tl: &mut ToolLoop, msgs: &mut Vec<ChatMsg>, name: &str, i: u32, text: &str, is_error: bool| {
+            let c = tools::ToolCall { name: name.into(), args: serde_json::json!({ "i": i }) };
+            let key = canonical_call(&c);
+            let r = tools::ToolResult { text: text.into(), is_error, ms: 1, sources: Vec::new(), image: None, seen: None };
+            assert!(tl.take_result(&c, &key, name != "wait", r, msgs, &|_| {}, &|_| {}));
+        };
+        run(&mut tl, &mut msgs, "run_vm_command", 1, r#"{"ok":true,"exitCode":132,"output":"Illegal instruction"}"#, false);
+        run(&mut tl, &mut msgs, "computer", 2, "HTTP 409: machine is not running", true);
+        assert_eq!(tl.failed_run, 2);
+        run(&mut tl, &mut msgs, "wait", 3, "waited 30 seconds", false);
+        assert_eq!(tl.failed_run, 2, "a wait is not a success");
+        run(&mut tl, &mut msgs, "run_vm_command", 4, r#"{"ok":false,"error":"timed out","output":""}"#, false);
+        assert_eq!(tl.failed_run, 3);
+        run(&mut tl, &mut msgs, "run_vm_command", 5, r#"{"ok":true,"exitCode":0,"output":"ok"}"#, false);
+        assert_eq!(tl.failed_run, 0, "a success resets the run");
+        // a test loop: the check fails every pass, the edit between succeeds
+        for i in 0..10 {
+            run(&mut tl, &mut msgs, "run_vm_command", 100, &format!(r#"{{"ok":true,"exitCode":1,"output":"{i} failed"}}"#), false);
+            run(&mut tl, &mut msgs, "run_vm_command", 200 + i, r#"{"ok":true,"exitCode":0,"output":""}"#, false);
+        }
+        assert_eq!(tl.failed_run, 0);
+        assert!(!tl.failed_told);
+    }
+
+    /// THE COOLDOWN: a count that has not gone up for limit_cooldown_s
+    /// starts again - after the limit was hit too, so the call it stopped
+    /// runs once things have been quiet that long. Measured from the last
+    /// failure, and from the last run of the repeated call; 0 = never.
+    #[test]
+    fn the_limits_cool_down_after_a_quiet_spell() {
+        let cfg = |cd: u64| -> tools::ToolsConfig {
+            serde_json::from_value(serde_json::json!({
+                "max_calls": 0, "max_failed_calls": 2, "max_repeat_calls": 2, "limit_cooldown_s": cd,
+                "http": [{ "name": "t", "url": "https://h/x" }]
+            }))
+            .unwrap()
+        };
+        let tc = cfg(60);
+        assert_eq!(cfg(0).limit_cooldown_s, 0);
+        let dflt: tools::ToolsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((dflt.max_failed_calls, dflt.max_repeat_calls, dflt.limit_cooldown_s), (5, 3, 60));
+        let b = tools::Builtins::default();
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let bad = |i: usize| format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+        let ago = |s: u128| now_ms() - s * 1000;
+        // failures: at the limit, then a minute of quiet, then it runs
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.failed_told), (2, true), "the limit stopped the 3rd");
+        tl.failed_at = ago(59);
+        assert!(!tl.step(&bad(4), &mut msgs, &|_| {}, &|_| {}, &|_| {}), "59 s is not quiet enough");
+        tl.refused = None;
+        tl.failed_at = ago(61);
+        assert!(tl.step(&bad(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.failed_run, tl.failed_told), (3, 1, false));
+        // a failure after a quiet spell starts the run at one
+        tl.failed_at = ago(61);
+        assert!(tl.step(&bad(6), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.failed_run, 1);
+        assert!(!msgs.last().unwrap().content.contains("in a row have failed"), "{}", msgs.last().unwrap().content);
+
+        // repeats: the over-the-limit run waits out the cooldown
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        let same = bad(9);
+        for _ in 0..3 {
+            tl.failed_run = 0;
+            assert!(tl.step(&same, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert_eq!(tl.calls, 2, "the 3rd in a row was not run");
+        tl.failed_run = 0;
+        tl.repeat_at = ago(61);
+        assert!(tl.step(&same, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.repeats, tl.repeat_told.is_none()), (3, 1, true));
+
+        // max_calls: a count of calls with no cooldown-long break between
+        // them, so a break starts it again
+        let mc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 2, "max_failed_calls": 0, "max_repeat_calls": 0, "limit_cooldown_s": 60,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let persist = serde_json::json!(true);
+        let bm = mc.budget(Some(&persist));
+        assert!(bm.rule().contains("at most 2 calls with no break of 60 seconds between them"), "{}", bm.rule());
+        let mut tl = ToolLoop::open(&mc, b, bm, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(msgs.last().unwrap().content.contains("[loop: call 2; 2 of 2 with no break of 60 seconds"), "{}", msgs.last().unwrap().content);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.limit_told), (2, true), "the 3rd within the minute is not run");
+        assert!(msgs.last().unwrap().content.contains("limit on tool calls"), "{}", msgs.last().unwrap().content);
+        tl.call_at = ago(59);
+        assert!(!tl.step(&bad(4), &mut msgs, &|_| {}, &|_| {}, &|_| {}), "59 s is no break");
+        tl.refused = None;
+        tl.call_at = ago(61);
+        assert!(tl.step(&bad(5), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!((tl.calls, tl.counted, tl.limit_told), (3, 1, false));
+        assert!(msgs.last().unwrap().content.contains("[loop: call 3; 1 of 2 with no break"), "{}", msgs.last().unwrap().content);
+        // without a cooldown the count is the answer's, as it always was
+        let m0: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 2, "max_failed_calls": 0, "limit_cooldown_s": 0,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b0 = m0.budget(Some(&persist));
+        assert!(b0.rule().contains("at most 2 calls in one answer"), "{}", b0.rule());
+        let mut tl = ToolLoop::open(&m0, b, b0, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(msgs.last().unwrap().content.contains("[loop: call 2 of 2;"), "{}", msgs.last().unwrap().content);
+        tl.call_at = ago(3600);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 2);
+
+        // cooldown 0: never
+        let tc = cfg(0);
+        let mut tl = ToolLoop::open(&tc, b, tc.budget(None), &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        assert!(tl.step(&bad(1), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert!(tl.step(&bad(2), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        tl.failed_at = ago(3600);
+        assert!(tl.step(&bad(3), &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 2);
+    }
+
+    /// max_calls 0 is no fixed count: the rules say so, a call far past any
+    /// old count runs, the loop line drops its "of", and a request may
+    /// still lower it (and the two other limits) but never ask for none.
+    #[test]
+    fn max_calls_zero_is_no_fixed_count() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({
+            "max_calls": 0, "max_failed_calls": 8, "max_repeat_calls": 8,
+            "http": [{ "name": "t", "url": "https://h/x" }]
+        }))
+        .unwrap();
+        let b = tc.budget(Some(&serde_json::json!(true)));
+        assert_eq!((b.max_calls, b.max_failed, b.max_repeats), (0, 8, 8));
+        assert!(!b.calls_spent(10_000));
+        let rule = b.rule();
+        assert!(rule.contains("no fixed number of calls"), "{rule}");
+        assert!(rule.contains("After 8 failed calls in a row"), "{rule}");
+        assert!(rule.contains("at most 8 times in a row"), "{rule}");
+        let low = tc.budget(Some(&serde_json::json!({ "max_calls": 5, "max_failed_calls": 2, "max_repeat_calls": 99 })));
+        assert_eq!((low.max_calls, low.max_failed, low.max_repeats), (5, 2, 8));
+        assert!(low.calls_spent(5) && !low.calls_spent(4));
+        let nop = |_: &str| {};
+        let nofmt = |_: &str, _: &str| None;
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), b, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        tl.calls = 500;
+        let c = format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":1}}}}</tool_call>");
+        assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 501);
+        let last = &msgs.last().unwrap().content;
+        assert!(last.contains("[loop: call 501;"), "{last}");
+        // a counted budget still counts, and the request's lowered figure
+        // is the one enforced
+        let mut tl = ToolLoop::open(&tc, tools::Builtins::default(), low, &nop, &nofmt, None);
+        let mut msgs = vec![ChatMsg::text("user", "go")];
+        for i in 0..5 {
+            tl.failed_run = 0;
+            let c = format!("<tool_call>{{\"name\":\"nope\",\"arguments\":{{\"i\":{i}}}}}</tool_call>");
+            assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        }
+        assert!(msgs.last().unwrap().content.contains("[loop: call 5; 5 of 5 with no break of 60 seconds"), "{}", msgs.last().unwrap().content);
+        tl.failed_run = 0;
+        assert!(tl.step(&c, &mut msgs, &|_| {}, &|_| {}, &|_| {}));
+        assert_eq!(tl.calls, 5);
+        assert!(msgs.last().unwrap().content.contains("limit on tool calls"), "{}", msgs.last().unwrap().content);
     }
 
     /// A persisting answer whose check has not passed is sent back once
@@ -11904,7 +14251,7 @@ mod tests {
         assert!(!none.step("Done.", &mut m3, &|_| {}, &|_| {}, &|_| {}));
         // what passing means
         let res = |text: &str, err: bool| tools::ToolResult {
-            text: text.into(), is_error: err, ms: 1, sources: Vec::new(), image: None,
+            text: text.into(), is_error: err, ms: 1, sources: Vec::new(), image: None, seen: None,
         };
         assert!(verify_passed(&res("3 passed, 0 failed", false), Some("0 failed")));
         assert!(!verify_passed(&res("2 passed, 1 failed", false), Some("0 failed")));
@@ -12999,7 +15346,7 @@ mod tests {
     fn rendered_prompt_splits_around_its_images() {
         let tok = test_tokenizer();
         let rendered = format!("before {} after", config::MEDIA_MARK);
-        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect()).unwrap();
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect(), &[]).unwrap();
         assert_eq!(p.images, 1);
         assert_eq!(p.parts.len(), 3);
         assert!(matches!(p.parts[0], PromptPart::Text(_)));
@@ -13012,12 +15359,12 @@ mod tests {
         }).flatten().collect();
         assert_eq!(joined, p.text_ids);
         // text-only prompts stay exactly what they were
-        let plain = split_rendered(&tok, "no pictures here", vec![]).unwrap();
+        let plain = split_rendered(&tok, "no pictures here", vec![], &[]).unwrap();
         assert!(plain.text_only().is_some());
         assert!(p.text_only().is_none());
         // slot/image count mismatches are caught rather than silently misaligned
-        assert!(split_rendered(&tok, &rendered, vec![].into_iter().map(Media::Image).collect()).is_err());
-        assert!(split_rendered(&tok, "no slot", vec![Media::Image(png_bytes())]).is_err());
+        assert!(split_rendered(&tok, &rendered, vec![].into_iter().map(Media::Image).collect(), &[]).is_err());
+        assert!(split_rendered(&tok, "no slot", vec![Media::Image(png_bytes())], &[]).is_err());
     }
 
     #[test]
@@ -13080,7 +15427,7 @@ mod tests {
     fn an_image_at_the_end_leaves_no_dangling_slot() {
         let tok = test_tokenizer();
         let rendered = format!("caption this {}", config::MEDIA_MARK);
-        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect()).unwrap();
+        let p = split_rendered(&tok, &rendered, vec![png_bytes()].into_iter().map(Media::Image).collect(), &[]).unwrap();
         // trailing empty chunk contributes no part
         assert_eq!(p.parts.len(), 2);
         assert!(matches!(p.parts[1], PromptPart::Image(_)));
@@ -13227,6 +15574,142 @@ mod tests {
         assert!(folded.contains("VISION REPORT"));
         assert!(folded.trim_end().ends_with("Question: what is this"));
         assert!(folded.contains("A red barn beside a fence."));
+    }
+}
+
+#[cfg(test)]
+mod tests_end_parks {
+    //! mm37: a turn replayed as its ids makes the next prompt extend the
+    //! engine's end park of that turn token for token. The real Qwen
+    //! tokenizer decides whether the chunked tokenization agrees with the
+    //! whole-prompt one, so these run against it when
+    //! EYESOFF_TEST_QWEN_TOKENIZER names a tokenizer.json (skipped otherwise).
+    use super::*;
+
+    fn qwen() -> Option<Tok> {
+        let path = std::env::var("EYESOFF_TEST_QWEN_TOKENIZER").ok()?;
+        Some(Tok::Local(Tokenizer::from_file(path).expect("qwen tokenizer")))
+    }
+
+    fn cfg() -> AppConfig {
+        let v: serde_json::Value =
+            serde_json::from_slice(config::APP_CONFIG_JSON).expect("embedded config is JSON");
+        let mut c = config::from_value(v).expect("embedded config parses");
+        c.template = "chatml".into();
+        c.thinking = true;
+        c.eos = vec![248046, 248044];
+        c.max_prompt_tokens = 1 << 20;
+        c
+    }
+
+    fn user(t: &str) -> ChatMsg {
+        ChatMsg::text("user", t)
+    }
+
+    #[test]
+    fn ids_round_trip_through_base64() {
+        for ids in [vec![1u32], vec![0, 248068, 7, 248069], (0..1000).collect::<Vec<u32>>()] {
+            assert_eq!(turn_ids_from_b64(&turn_ids_b64(&ids)), Some(ids));
+        }
+        assert_eq!(turn_ids_from_b64("AAA"), None, "not a whole number of ids");
+    }
+
+    #[test]
+    fn the_next_prompt_extends_the_end_park_token_for_token() {
+        let Some(tok) = qwen() else {
+            eprintln!("EYESOFF_TEST_QWEN_TOKENIZER unset: skipped");
+            return;
+        };
+        let cfg = cfg();
+        // turn 1: thinking on, so the prompt opens the think block
+        let m1 = vec![user("Write a haiku about the sea.")];
+        let (p1, _, think_open) = build_prompt(&cfg, &tok, &m1, true, Capabilities::Note).unwrap();
+        assert!(think_open);
+        // what the model generated, including a NON-canonical split ("sea" as
+        // "se"+"a"): re-tokenizing the text could never reproduce it
+        let enc = |t: &str| tok.encode_ids(t, false).unwrap();
+        let mut gen = enc("Waves and salt.\n");
+        gen.extend(enc("</think>\n\nWaves fold on the "));
+        gen.extend(enc("se"));
+        gen.extend(enc("a"));
+        gen.extend(enc(" shore,\nthe tide keeps its time."));
+        assert_ne!(enc("se").iter().chain(enc("a").iter()).copied().collect::<Vec<_>>(), enc("sea"),
+                   "the split must really be non-canonical for this test to mean anything");
+        let mut with_stop = gen.clone();
+        with_stop.push(248046); // <|im_end|>, the stop token
+        let ids = turn_ids_for(&tok, &p1.text_ids, &with_stop, &cfg.eos).unwrap();
+        assert!(valid_turn_ids(&cfg, &tok, &ids));
+        // the engine's end park: turn 1's prompt and everything generated
+        let park: Vec<u32> = p1.text_ids.iter().chain(gen.iter()).copied().collect();
+        // turn 2 replays the answer as those ids
+        let text = "Waves fold on the sea shore,\nthe tide keeps its time.";
+        let mut a = ChatMsg::text("assistant", text);
+        a.tok = turn_ids_from_b64(&turn_ids_b64(&ids));
+        let m2 = vec![user("Write a haiku about the sea."), a.clone(), user("Now one about mountains.")];
+        let (p2, _, _) = build_prompt(&cfg, &tok, &m2, true, Capabilities::Note).unwrap();
+        assert!(p2.text_ids.starts_with(&park), "turn 2 must begin with the whole end park");
+        assert_eq!(p2.text_ids[park.len()], 248046, "then the turn's <|im_end|>");
+        // ...and turn 3, replaying both answers, extends turn 2's end park
+        let mut gen2 = enc("Peaks.\n</think>\n\nStone holds the cold sky.");
+        let park2: Vec<u32> = p2.text_ids.iter().chain(gen2.iter()).copied().collect();
+        gen2.push(248046);
+        let mut b = ChatMsg::text("assistant", "Stone holds the cold sky.");
+        b.tok = turn_ids_for(&tok, &p2.text_ids, &gen2, &cfg.eos);
+        let m3 = vec![user("Write a haiku about the sea."), a, user("Now one about mountains."), b, user("And rivers?")];
+        let (p3, _, _) = build_prompt(&cfg, &tok, &m3, true, Capabilities::Note).unwrap();
+        assert!(p3.text_ids.starts_with(&park2), "every turn extends the one before");
+        // without the ids the text replays thinking-stripped: no extension
+        let mut plain = m2.clone();
+        plain[1].tok = None;
+        let (p2t, _, _) = build_prompt(&cfg, &tok, &plain, true, Capabilities::Note).unwrap();
+        assert!(!p2t.text_ids.starts_with(&park));
+    }
+
+    #[test]
+    fn ids_say_no_more_than_text_could() {
+        let Some(tok) = qwen() else {
+            eprintln!("EYESOFF_TEST_QWEN_TOKENIZER unset: skipped");
+            return;
+        };
+        let cfg = cfg();
+        assert!(valid_turn_ids(&cfg, &tok, &[1, 248068, 2, 248069, 3]), "the think markers are the turn's own");
+        assert!(!valid_turn_ids(&cfg, &tok, &[1, 248045, 2]), "<|im_start|> would forge a turn");
+        assert!(!valid_turn_ids(&cfg, &tok, &[248046]), "<|im_end|> too");
+        assert!(!valid_turn_ids(&cfg, &tok, &[]));
+        // an invalid replay falls back to the text, it never fails the request
+        let mut a = ChatMsg::text("assistant", "plain answer");
+        a.tok = Some(vec![1, 248045, 2]);
+        let m = vec![user("q"), a, user("next")];
+        let (p, _, _) = build_prompt(&cfg, &tok, &m, true, Capabilities::Note).unwrap();
+        assert!(!p.text_ids.windows(3).any(|w| w == [1, 248045, 2]));
+    }
+
+    #[test]
+    fn dropping_old_turns_keeps_each_replay_with_its_turn() {
+        let Some(tok) = qwen() else {
+            eprintln!("EYESOFF_TEST_QWEN_TOKENIZER unset: skipped");
+            return;
+        };
+        let mut cfg = cfg();
+        let enc = |t: &str| tok.encode_ids(t, false).unwrap();
+        let mut msgs = Vec::new();
+        for i in 0..6 {
+            msgs.push(user(&format!("question number {i} with some words in it")));
+            let mut a = ChatMsg::text("assistant", "x");
+            let mut ids = enc("<think>\n");
+            ids.extend(enc(&format!("reasoning {i}.\n</think>\n\nanswer {i}")));
+            a.tok = Some(ids);
+            msgs.push(a);
+        }
+        msgs.push(user("last"));
+        let (full, _, _) = build_prompt(&cfg, &tok, &msgs, true, Capabilities::Note).unwrap();
+        cfg.max_prompt_tokens = full.text_ids.len() / 2;
+        let (cut, _, _) = build_prompt(&cfg, &tok, &msgs, true, Capabilities::Note).unwrap();
+        assert!(cut.text_ids.len() <= cfg.max_prompt_tokens);
+        // the newest replayed answer is still there, intact, before the last turn
+        let last = enc("reasoning 5.\n</think>\n\nanswer 5");
+        assert!(cut.text_ids.windows(last.len()).any(|w| w == &last[..]));
+        assert!(!cut.text_ids.windows(enc("reasoning 0.").len()).any(|w| w == &enc("reasoning 0.")[..]));
     }
 }
 

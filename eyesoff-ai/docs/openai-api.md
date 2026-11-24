@@ -474,7 +474,7 @@ report progress; keep state in files rather than in the conversation; stop
 early only when the check passes, cannot pass, or the budget is nearly spent,
 and then report exactly what passes and what does not. Every tool result in a
 persisting loop carries a trailer, `[loop: call 7 of 32; 6 minutes elapsed of
-1 hour]`, so the budget is a fact the model reads rather than a count it
+1 hour]` (`[loop: call 7; ...]` with no fixed count), so the budget is a fact the model reads rather than a count it
 keeps. The object form **lowers** the deployment's budgets for one answer and
 never raises them: `"loop": {"max_calls": 8, "max_seconds": 600}` (add
 `"persist": false` to lower the budget without asking for persistence).
@@ -486,6 +486,65 @@ finish from what it has; a second call is refused and the answer ends (the
 `: enclave-tool-note` comment, or the playground's notice, says which). `GET
 /models` reports both under `tools`, and each `: enclave-tool` comment
 carries `n`, `of`, `elapsed_s` and `max_seconds`.
+
+**Calls that do no work.** `max_calls: 0` means no fixed count: a count
+stops thirty good steps exactly as it stops thirty wasted ones, so the
+answer is bounded instead by the clock and by two limits on waste.
+`max_failed_calls` (default 5) is how many calls **in a row** may fail; any
+call that succeeds resets it, so a test loop that fails its check on every
+pass and edits a file in between is never stopped by it. A call fails when
+the tool says so or when its result says so in its body - a top-level
+non-zero `exitCode` / `exit_code` / `exit`, or `"ok": false` - because a
+command runner answers HTTP 200 for a command that exited 1. At the limit
+the result says so, the next call is not run and the model is told to answer
+with what failed and what would unblock it; a call after that is refused and
+the answer ends. `max_repeat_calls` (default 3) is how many times **in a
+row** one call (same function, same arguments, whatever it returned) may
+run; any different call resets it, a wait included, so a log polled between
+waits never counts, and waits are never counted themselves. The run past the
+limit is answered "not run: do something different"; asking for that same
+call once more ends the answer. All three counts come with a **cooldown**,
+`limit_cooldown_s` (default 60, 0 = never): a count that has not gone up for
+that long - since the last failure, since the last run of the repeated call,
+since the last call ended - starts again from zero, the "answer now" it
+earned included. So with a cooldown, `max_calls: 32` stops 32 calls with no
+break of 60 seconds between them, not 32 calls per answer; the rules and the
+`[loop: call 40; 12 of 32 with no break of 60 seconds between them; ...]`
+trailer say so. It runs on
+wall-clock time and the model's generation counts, so on a model whose steps
+take a minute a 60-second cooldown leaves the limits catching only quick
+retries. A request's `loop` object may lower `max_failed_calls` and
+`max_repeat_calls` like the other figures; `/models` and `/tools` report all
+three. These replace 0.58's stuck-call rule (an identical call with an
+identical result, refused the third time), which the repeat limit covers.
+
+**Compaction.** Every armed loop is also offered `compact` (never named in
+config; `compact_at: 0` removes it). Its one argument is `summary`, and the
+summary replaces the whole conversation except the system prompt and the
+user's latest message, which stays word for word; the call's result is the
+summary, so the next step reads it as text. The trigger is the **KV pool**,
+the node's context window (`ENCLAVE_GGML_N_CTX`, which every chat on the
+model shares - `/models` reports it as `tools.kv_pool`), not the prompt cap:
+once a loop's prompt fills `compact_at` of it (default 0.6) each result ends
+with a `[context: N% full ...]` line telling the model to compact, and past
+`compact_force_at` (default 0.7) the next other call is not run until it has.
+The pool is shared - other chats and parked prefixes fill it too - so the
+one reading of its real state, a generation stepping aside because the pool
+refused it (`kv_pool_full`), also tells the model to compact below the mark,
+while its conversation holds at least an eighth of the pool. A model that
+calls something else again is compacted for it, from the
+conversation's turns cut short and the calls with their results condensed,
+and that call then runs. Neither mark is ever placed past 85% / 95% of
+`max_prompt_tokens`, because beyond that cap the oldest turns are dropped
+unread - the user's request first - which is the loss compaction exists to
+prevent. A summary over `compact_max_chars` (default 16000) is handed back to
+be shortened, not cut. On eyesoff (pool 180,224, cap 131,072) the model is
+told at 108,134 tokens and held at 124,450. The finished answer's `done`
+event carries `compact: {summary}`, and the playground then sends that
+summary in front of the compacted answer's question instead of the turns it
+replaced. A per-model `max_message_tokens` (default 0 = none) caps ONE
+message from the user; only the newest is checked, and an over-long one is
+refused with `message_too_long` before anything runs.
 
 **`wait`** (builtin; name it in the config's `tools.builtin`) sleeps
 `seconds` inside the enclave and returns. Nothing leaves, nothing is
@@ -508,6 +567,30 @@ stay in the prompt whole; older ones are condensed to their first and last
 line survives condensing; one that buries it in the middle should be told to
 print a summary.
 
+**Pictures the model is shown: `result.see`.** A tool can answer with a
+picture for the MODEL rather than the client - a screenshot of a machine the
+model is driving (the RISC Box's `POST /computer`) is what this exists for:
+the model has to see what its click did before it decides the next one. An
+http entry names the field with `"result": {"see": "<dot path>"}` (base64 or a
+data URI; `"$body"` when the endpoint answers with image bytes), and an MCP
+tool returns an `image` content part with `_meta` `result: "see"` - or with no
+`result` at all, which is read as "see" when the serving model can look and as
+a picture for the client otherwise. The picture is cut out of the text the
+model reads, checked to be a real image, and attached to that result's turn,
+so the next generation sees it through the model's own vision projector; a
+model that cannot see is told the picture was left out. Only the newest
+`keep_images` (default 1) stay in the prompt - an older one is replaced by a
+line saying it was there - and never more than the model's `max_images` with
+the request's own attachments counted first. Each picture is a vision-encoder
+pass and ~1-2k tokens of prefill on every step it stays, and a model working a
+screen acts on what it shows now. The live `tool_result` event carries the
+picture as `picture` (a data URI) so the person watching sees the same
+screen; the playground shows it under the call, and keeps only an answer's
+last one in its history. A step whose prompt carries a picture still branches
+off the engine's parked system prompt (it declares the text before its first
+picture), so a long run pays for its new turns and its picture, not a fresh
+system prompt each step.
+
 **Ledger mode (0.58).** `"loop": {"ledger": true}` (or `ledger: true` in the
 config's `tools` block) changes what a step re-prefills. The conversation is
 NOT accumulated: the model writes its state under a `### LEDGER` heading at
@@ -522,6 +605,25 @@ model what belongs in it (the goal, what is established, what failed and
 why, the state of files and commands, the next step) and to rewrite it whole
 each time. Only a persisting loop has a ledger; `keep_results` does nothing
 in this mode, since there is never an older result to condense.
+
+**When the ledger switches on.** It suits a test loop - run the check, fix,
+run it again - where the newest result is all the next step needs, and it is
+wrong for work that reads first: a guide read at step two is gone at step
+three unless the model copied it out. So `true` means **checks**: the loop
+keeps its whole history (older results condensed, as usual) until it re-runs
+a check, and only then switches to the ledger. A check is re-run at the third
+good run of the same call (same tool, same arguments) where something other
+than a wait ran since the previous run and the answer changed - run, change,
+run, change, run. A guide read again answers the same, polling has only waits
+in between, and a call that failed outright (the machine down, an HTTP 409)
+is not a run, so none of those switch it on. The result that switches it on
+tells the model what the ledger is and asks for the first one; nothing is
+dropped until the model has written it. The playground shows a note when it
+happens. Until then the rules and the parked system prompt are exactly the
+plain loop's. `"ledger": "always"` is the ledger from the first step, as 0.58
+shipped it (rules in the system prompt); `false` or `"off"` never. The config
+and a request's `loop` object take the same spellings; `/models` and `/tools`
+report `false`, `"checks"` or `"always"`.
 
 **The verify gate (0.58).** A config that names the tool that checks the
 goal - `"verify": "run_tests"`, optionally with `"verify_pass": "0 failed"`

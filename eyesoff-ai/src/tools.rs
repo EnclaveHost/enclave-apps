@@ -52,6 +52,18 @@
 //! schema - the switch it sits under, pictures in and out, a call's own
 //! timeout, the prompt-side settings - so an http entry moved out of this
 //! config into an adapter keeps behaving exactly as it did here.
+//!
+//! DEFERRED SCHEMAS: every signature in the `<tools>` block is prompt the
+//! engine prefills before the first token of an answer, on every new chat.
+//! A big server is most of that bill - mcp.enclave.host's 36 tools are 28k
+//! characters, ~8k tokens, two thirds of the whole prompt - for tools most
+//! answers never touch. A server marked `defer` (or a tool whose `_meta`
+//! says so) is shown as ONE line per tool instead, and the `load_tools`
+//! builtin hands the model the full signatures of the ones it picks, as a
+//! tool result. The result lands in the conversation, never in the system
+//! text, so the parked system prefix stays the same whatever was loaded.
+//! A deferred tool stays in the registry and callable all along: loading is
+//! how the model learns the arguments, not a permission.
 
 use std::collections::BTreeMap;
 
@@ -69,9 +81,48 @@ pub struct ToolsConfig {
     /// how many tool calls ONE answer may make before the model is told to
     /// answer from what it has. Each call is a round trip AND a full re-prefill
     /// of the conversation, so this is the main cost knob: a 5-hop turn is five
-    /// prefills of a share other tenants are waiting for.
+    /// prefills of a share other tenants are waiting for. 0 means NO fixed
+    /// count: the answer is bounded by max_seconds and by the two limits on
+    /// calls that do no work (max_failed_calls, max_repeat_calls), which is
+    /// what a long job wants - a count stops thirty good steps exactly as it
+    /// stops thirty wasted ones. With limit_cooldown_s set, the count is of
+    /// calls with no break of that long between them: a pause that long (a
+    /// wait, a slow step) starts it again, so it stops a burst, not a job.
     #[serde(default = "default_max_calls")]
     pub max_calls: usize,
+    /// how many calls IN A ROW may fail before the model is told to stop
+    /// calling and answer (0 = no limit; default 5). A call fails when the
+    /// tool says so, or when its result reports a failure in its body - a
+    /// command that exited non-zero, `"ok": false` (see reports_failure),
+    /// because a command runner answers HTTP 200 for a command that exited
+    /// 1. In a row, because any call that succeeds resets it: a test loop
+    /// fails its check on every pass and changes a file in between, and
+    /// that is work; five failures with nothing working in between is not.
+    /// Waits neither fail nor reset it.
+    #[serde(default = "default_max_failed_calls")]
+    pub max_failed_calls: usize,
+    /// how many times IN A ROW one call may run - the same tool with the
+    /// same arguments as the call just before it, whatever it returned -
+    /// before a further run is refused (0 = no limit; default 3). Any
+    /// different call resets it, a wait or a subagent included, so a test
+    /// re-run after an edit, or a log polled between waits, never counts;
+    /// waits themselves are never counted. The run past the limit is
+    /// answered "not run: do something different"; asking for that same
+    /// call once more ends the answer.
+    #[serde(default = "default_max_repeat_calls")]
+    pub max_repeat_calls: usize,
+    /// COOLDOWN for the three limits above, seconds (default 60; 0 = never):
+    /// a count that has not gone up for this long starts again from zero,
+    /// the "answer now" it may have earned included - for max_calls, this
+    /// long since the last call ended. A burst of failures
+    /// ends the burst; calls spread over minutes (a slow build that failed,
+    /// retried after a wait) are judged afresh. It runs from the call that
+    /// last raised the count, so a step slower than the cooldown - the
+    /// model's generation counts - resets it too: on a model whose steps
+    /// take a minute, a 60-second cooldown leaves the limits catching only
+    /// quick retries.
+    #[serde(default = "default_limit_cooldown_s")]
+    pub limit_cooldown_s: u64,
     /// per-call timeout, seconds (connect and first byte). Overridable per tool.
     #[serde(default = "default_timeout_s")]
     pub timeout_s: u64,
@@ -112,6 +163,36 @@ pub struct ToolsConfig {
     /// failures it already fixed.
     #[serde(default = "default_keep_results")]
     pub keep_results: usize,
+    /// how many PICTURES tool results may keep in the prompt at once (a
+    /// `result.see` entry's screenshots). The newest stay; an older one is
+    /// replaced by a line saying it was there. A picture is a vision-encoder
+    /// pass and ~1-2k tokens of prefill every step it stays, and a model
+    /// driving a screen acts on what it shows NOW, so the default is 1. The
+    /// request's own attachments count against the model's max_images first.
+    #[serde(default = "default_keep_images")]
+    pub keep_images: usize,
+    /// COMPACTION: once a loop's prompt fills this share of the KV POOL -
+    /// the node's context window (ENCLAVE_GGML_N_CTX), which every chat on
+    /// the model shares, so it is what actually runs out - each tool result
+    /// tells the model to call `compact`: it writes a summary of everything
+    /// so far, and the summary replaces it all except the system prompt and
+    /// the user's latest message. 0 = no `compact` tool. Default 0.6. Never
+    /// later than the prompt cap allows (see ToolLoop::compact_marks):
+    /// past max_prompt_tokens the oldest turns are dropped unread, which is
+    /// the loss this exists to prevent.
+    #[serde(default = "default_compact_at")]
+    pub compact_at: f64,
+    /// past this share of the pool (default 0.7), a call other than
+    /// `compact` is not run until the model has compacted - told once; a
+    /// model that still calls something else is compacted for it, from its
+    /// calls and their condensed results.
+    #[serde(default = "default_compact_force_at")]
+    pub compact_force_at: f64,
+    /// the longest summary `compact` takes, characters (default 16000). A
+    /// longer one is handed back to be shortened rather than cut: the end of
+    /// a summary is where the next steps are.
+    #[serde(default = "default_compact_max_chars")]
+    pub compact_max_chars: usize,
     /// SUBAGENTS: how many ONE answer may spawn in total, however they nest.
     /// Zero (the default) means the `spawn_agent` tool does not exist. A
     /// positive number is the deployer's consent and the only switch: the
@@ -141,10 +222,20 @@ pub struct ToolsConfig {
     /// fixed-size tail behind a prefix the engine keeps warm, which on a CPU
     /// node is the difference between a two-second step and a two-minute one
     /// thirty calls in. It is the pattern the ledger-orchestration papers
-    /// use: fresh context every call, state on the page. A request's `loop`
-    /// object may set `ledger` either way; it only applies when persisting.
+    /// use: fresh context every call, state on the page.
+    ///
+    /// It suits a TEST LOOP - run the check, fix, run it again - where the
+    /// newest result is all the next step needs. It is wrong for work that
+    /// reads first: a guide read at step two is gone at step three unless
+    /// the model copied it out, and a model that did not reads it again,
+    /// and again (seen live 2026-10-07: seventeen guide calls in one answer,
+    /// four topics). So `true` means Ledger::Checks - full history until the
+    /// loop starts re-running a check, the ledger from then on - and the old
+    /// from-the-first-step behaviour is `"always"`. A request's `loop`
+    /// object may set `ledger` any of those ways; it only applies when
+    /// persisting.
     #[serde(default)]
-    pub ledger: bool,
+    pub ledger: Ledger,
     /// the most characters of a ledger block kept (default 2400). What the
     /// model writes past it is cut, and the rules tell it the cap.
     #[serde(default = "default_ledger_chars")]
@@ -237,6 +328,10 @@ pub struct Builtins<'a> {
     /// prefer_local or named outright), so image-reading tools are silently
     /// stood down: there is nothing to delegate.
     pub images_local: bool,
+    /// how many pictures this turn's prompt may carry in all (the serving
+    /// model's max_images when it reads pictures itself, else 0): the
+    /// ceiling a tool result's picture (`result.see`) is attached under
+    pub image_slots: usize,
     /// the most ONE wait call may sleep right now, seconds: the config's
     /// wait_max_s, clamped by what is left of the answer's time budget. Zero
     /// means no wait is possible (the budget is spent), and the call says so
@@ -256,6 +351,14 @@ pub struct Builtins<'a> {
     /// call is about without the model ever choosing. Filled from the request
     /// headers before the body is read, never from the body or the model.
     pub user: Option<&'a str>,
+    /// this chat's Enclave session (session.rs): read from the request's
+    /// x-enclave-session header on a signed-in turn, never from the body or
+    /// the model. A session-capable builder on a server with sessions on
+    /// gets `session: {vault, sid}` added to its arguments, and the calls it
+    /// answers with are signed with this key and executed (call_mcp_session).
+    /// Never rendered into the prompt: the parked prefix is shared by every
+    /// chat, so nothing per chat may enter it.
+    pub session: Option<&'a crate::session::ChatSession>,
     /// the deployment's max_agents, so a loop with no slots left is told
     /// apart from a deployment that never had the feature (the first is
     /// silent, the second is a note if someone named the tool anyway)
@@ -265,6 +368,10 @@ pub struct Builtins<'a> {
 /// The name of the subagent tool, which the answer loop runs itself: a
 /// child is a whole loop of generations, and only a leg can generate.
 pub const AGENT_TOOL: &str = "spawn_agent";
+
+/// The name of the compaction tool, which the answer loop runs itself: it
+/// rewrites the loop's own conversation, which no request can reach.
+pub const COMPACT_TOOL: &str = "compact";
 
 /// TOOL GROUPS: what a person switches on and off. A group is one tool as the
 /// settings panel shows it, made of any number of endpoints (see
@@ -304,7 +411,29 @@ pub enum Builtin {
     /// request. Children may spawn children; the per-answer count and the
     /// depth limit (AgentTree) are what stop that being unbounded.
     Agent,
+    /// Hand the model the full signatures of deferred tools (see DEFERRED
+    /// SCHEMAS above). Never named in config: the registry adds it whenever
+    /// something is deferred, and tools::call answers it from the registry,
+    /// because the signatures are already there - nothing leaves.
+    LoadTools,
+    /// Replace the conversation so far with the model's own summary of it
+    /// (ToolsConfig::compact_at). Never named in config: build() adds it to
+    /// every armed registry while compaction is on, and the answer loop runs
+    /// it (ToolLoop::compact_with), since it rewrites the loop's messages.
+    Compact,
 }
+
+/// The name of the builtin that loads deferred signatures.
+pub const LOAD_TOOLS: &str = "load_tools";
+
+/// The longest one-line summary a deferred tool gets in the prompt: its
+/// description's first sentence, cut here. Enough to choose by.
+const DEFER_SUMMARY_CHARS: usize = 90;
+
+/// What one load_tools result may carry. Larger than a tool's max_chars on
+/// purpose: a signature cut in half is worse than none, so the result stops
+/// at the last WHOLE signature that fits and names the ones left over.
+const LOAD_MAX_CHARS: usize = 24_000;
 
 impl Builtin {
     fn parse(name: &str) -> Option<Builtin> {
@@ -326,6 +455,8 @@ impl Builtin {
             Builtin::Request => "request",
             Builtin::Wait => "wait",
             Builtin::Agent => AGENT_TOOL,
+            Builtin::LoadTools => LOAD_TOOLS,
+            Builtin::Compact => COMPACT_TOOL,
         }
     }
 
@@ -371,6 +502,21 @@ impl Builtin {
                  at a time, each with its own call budget inside this answer's remaining time; \
                  an answer may spawn only so many in total, and each may spawn its own. Prefer \
                  doing a few calls yourself over spawning an agent for them.",
+            Builtin::LoadTools =>
+                "Get the full signatures of functions listed by name only (under \"More \
+                 functions\"). Call it with the names you are about to use, before the first \
+                 call to any of them; the result shows each one exactly as <tools> does. Load \
+                 only what you need - every signature is text you then read past.",
+            Builtin::Compact =>
+                "Free up context: replace this whole conversation with your own summary of \
+                 it. Afterwards you see only the system prompt, the user's latest message and \
+                 your summary - every earlier message, call and result is gone. Call it when a \
+                 result tells you the context is filling up. Write the summary as notes to \
+                 yourself that are enough to carry on without anything else: the user's goal \
+                 and every requirement or preference they stated, in their words; what is \
+                 done and how you know; the exact current state (file paths, commands and \
+                 what they printed, ids, URLs, versions, errors); what failed and why; and \
+                 the next steps. Copy out any fact from a result you will still need.",
         }
     }
 
@@ -443,6 +589,27 @@ impl Builtin {
                 },
                 "required": ["task"],
             }),
+            Builtin::LoadTools => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "the function names to load, as listed",
+                    }
+                },
+                "required": ["names"],
+            }),
+            Builtin::Compact => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "everything needed to carry on, as notes to yourself",
+                    }
+                },
+                "required": ["summary"],
+            }),
         }
     }
 
@@ -452,6 +619,10 @@ impl Builtin {
             Builtin::WebSearch | Builtin::Request => b.search.is_some(),
             Builtin::Wait => true,
             Builtin::Agent => b.agent_slots > 0,
+            // added by build() when something is deferred, never from config
+            Builtin::LoadTools => false,
+            // added by build() while compaction is on, never from config
+            Builtin::Compact => false,
         }
     }
 
@@ -464,6 +635,8 @@ impl Builtin {
             // configured, but this loop may not spawn (count spent, or at
             // the depth limit): a per-loop fact, not a misconfiguration
             Builtin::Agent => b.agent_limit > 0,
+            Builtin::LoadTools => false,
+            Builtin::Compact => false,
         }
     }
 
@@ -473,7 +646,62 @@ impl Builtin {
             Builtin::WebSearch | Builtin::Request => "`search`",
             Builtin::Wait => "nothing",
             Builtin::Agent => "`max_agents` (a positive count in the `tools` block)",
+            Builtin::LoadTools => "a deferred tool (`defer` on an mcp entry)",
+            Builtin::Compact => "a positive `compact_at` in the `tools` block",
         }
+    }
+}
+
+/// When a persisting loop drops its history for the ledger (see
+/// ToolsConfig::ledger). Written `true` / `false` / `"checks"` /
+/// `"always"` / `"off"` in a config or a request's `loop` object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ledger {
+    /// never: results accumulate, the older ones condensed (keep_results)
+    #[default]
+    Off,
+    /// once the loop RE-RUNS A CHECK (see ToolLoop::reruns_a_check): the
+    /// steps before that keep everything they read, and the history is only
+    /// dropped once the model has written a ledger to carry it
+    Checks,
+    /// from the first step, as 0.58 shipped it
+    Always,
+}
+
+impl Ledger {
+    /// The written forms; None for anything else.
+    pub fn parse(v: &serde_json::Value) -> Option<Ledger> {
+        match v {
+            serde_json::Value::Bool(true) => Some(Ledger::Checks),
+            serde_json::Value::Bool(false) => Some(Ledger::Off),
+            serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "checks" => Some(Ledger::Checks),
+                "always" => Some(Ledger::Always),
+                "off" => Some(Ledger::Off),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// How /models and /tools report it.
+    pub fn json(self) -> serde_json::Value {
+        match self {
+            Ledger::Off => serde_json::json!(false),
+            Ledger::Checks => serde_json::json!("checks"),
+            Ledger::Always => serde_json::json!("always"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Ledger {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ledger::parse(&v).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "ledger must be true, false, \"checks\", \"always\" or \"off\", not {v}"
+            ))
+        })
     }
 }
 
@@ -484,14 +712,22 @@ impl Builtin {
 /// until the check passes, rather than answering at the first opportunity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Budget {
+    /// 0 = no fixed count (see ToolsConfig::max_calls)
     pub max_calls: usize,
     pub max_seconds: u64,
+    /// failed calls in a row before the answer stops calling, and runs of
+    /// one call in a row before a further one is refused
+    /// (ToolsConfig::max_failed_calls / max_repeat_calls); 0 = no limit
+    pub max_failed: usize,
+    pub max_repeats: usize,
+    /// ToolsConfig::limit_cooldown_s; 0 = the counts never start again
+    pub cooldown_s: u64,
     pub persist: bool,
     /// subagents the whole answer may spawn (see ToolsConfig::max_agents)
     pub max_agents: u32,
     pub max_agent_depth: u32,
-    /// ledger mode (see ToolsConfig::ledger); never true unless persisting
-    pub ledger: bool,
+    /// ledger mode (see ToolsConfig::ledger); always Off unless persisting
+    pub ledger: Ledger,
     /// the tool whose passing result a persisting answer needs (see
     /// ToolsConfig::verify)
     pub verify: Option<String>,
@@ -505,10 +741,13 @@ impl Budget {
         Budget {
             max_calls: n,
             max_seconds: default_max_seconds(),
+            max_failed: default_max_failed_calls(),
+            max_repeats: default_max_repeat_calls(),
+            cooldown_s: 0,
             persist: false,
             max_agents: 0,
             max_agent_depth: default_max_agent_depth(),
-            ledger: false,
+            ledger: Ledger::Off,
             verify: None,
         }
     }
@@ -516,6 +755,55 @@ impl Budget {
     /// The wall-clock figure as the model should read it.
     pub fn time(&self) -> String {
         human_secs(self.max_seconds)
+    }
+
+    /// Whether the call count is spent (never, when there is none). The
+    /// count is of calls since the last cooldown-long break, when there is
+    /// a cooldown (ToolLoop::counted).
+    pub fn calls_spent(&self, calls: usize) -> bool {
+        self.max_calls != 0 && calls >= self.max_calls
+    }
+
+    /// The budget sentence of the rules: the count when there is one, the
+    /// clock always, and the two limits on calls that do no work - stated,
+    /// because a model that knows a second identical failure counts against
+    /// it changes something before retrying.
+    pub fn rule(&self) -> String {
+        let mut s = if self.max_calls == 0 {
+            format!("There is no fixed number of calls, but the whole answer has {} of wall-clock time", self.time())
+        } else if self.cooldown_s != 0 {
+            format!(
+                "You may make at most {} call{} with no break of {} between them (a break that \
+                 long starts the count again), and the whole answer has {} of wall-clock time",
+                self.max_calls,
+                if self.max_calls == 1 { "" } else { "s" },
+                human_secs(self.cooldown_s),
+                self.time(),
+            )
+        } else {
+            format!(
+                "You may make at most {} call{} in one answer, and the whole answer has {} of wall-clock time",
+                self.max_calls,
+                if self.max_calls == 1 { "" } else { "s" },
+                self.time(),
+            )
+        };
+        if self.max_failed != 0 {
+            s.push_str(&format!(
+                ". After {} failed calls in a row the answer stops calling tools, so when a call \
+                 fails, change the approach before trying again",
+                self.max_failed
+            ));
+        }
+        if self.max_repeats != 0 {
+            s.push_str(&format!(
+                ". The same call (same function, same arguments) is run at most {} times in a \
+                 row; do something different in between, or use the result you already have",
+                self.max_repeats
+            ));
+        }
+        s.push_str(". Make each call count.");
+        s
     }
 }
 
@@ -594,6 +882,15 @@ pub fn wait_plan(args: &serde_json::Value, cap_s: u64) -> Result<(u64, String, S
 fn default_max_calls() -> usize {
     3
 }
+fn default_max_failed_calls() -> usize {
+    5
+}
+fn default_max_repeat_calls() -> usize {
+    3
+}
+fn default_limit_cooldown_s() -> u64 {
+    60
+}
 fn default_max_seconds() -> u64 {
     3600
 }
@@ -602,6 +899,18 @@ fn default_wait_max_s() -> u64 {
 }
 fn default_keep_results() -> usize {
     3
+}
+fn default_keep_images() -> usize {
+    1
+}
+fn default_compact_at() -> f64 {
+    0.6
+}
+fn default_compact_force_at() -> f64 {
+    0.7
+}
+fn default_compact_max_chars() -> usize {
+    16_000
 }
 fn default_ledger_chars() -> usize {
     2400
@@ -636,8 +945,11 @@ impl ToolsConfig {
     /// answer dressed as a budget.
     pub fn budget(&self, req: Option<&serde_json::Value>) -> Budget {
         let mut b = Budget {
-            max_calls: self.max_calls.max(1),
+            max_calls: self.max_calls,
             max_seconds: self.max_seconds.max(1),
+            max_failed: self.max_failed_calls,
+            max_repeats: self.max_repeat_calls,
+            cooldown_s: self.limit_cooldown_s,
             persist: false,
             max_agents: self.max_agents,
             max_agent_depth: self.max_agent_depth.max(1),
@@ -649,8 +961,8 @@ impl ToolsConfig {
             Some(serde_json::Value::Object(o)) => {
                 b.persist = o.get("persist").and_then(|v| v.as_bool()).unwrap_or(true);
                 // the ledger is a prompt shape, not a cost: a request may
-                // choose it either way
-                if let Some(l) = o.get("ledger").and_then(|v| v.as_bool()) {
+                // choose it any way
+                if let Some(l) = o.get("ledger").and_then(Ledger::parse) {
                     b.ledger = l;
                 }
                 // the check may be named (a client knows its own harness)
@@ -662,8 +974,20 @@ impl ToolsConfig {
                     Some(serde_json::Value::Bool(false)) => b.verify = None,
                     _ => {}
                 }
+                // a request lowers a figure, never raises one, and no fixed
+                // count is the highest of all; it cannot ask for "none"
+                let lower = |cur: usize, n: u64| match cur {
+                    0 => (n as usize).max(1),
+                    c => c.min(n as usize).max(1),
+                };
                 if let Some(n) = o.get("max_calls").and_then(|v| v.as_u64()) {
-                    b.max_calls = b.max_calls.min(n as usize).max(1);
+                    b.max_calls = lower(b.max_calls, n);
+                }
+                if let Some(n) = o.get("max_failed_calls").and_then(|v| v.as_u64()) {
+                    b.max_failed = lower(b.max_failed, n);
+                }
+                if let Some(n) = o.get("max_repeat_calls").and_then(|v| v.as_u64()) {
+                    b.max_repeats = lower(b.max_repeats, n);
                 }
                 if let Some(s) = o.get("max_seconds").and_then(|v| v.as_u64()) {
                     b.max_seconds = b.max_seconds.min(s).max(1);
@@ -681,7 +1005,7 @@ impl ToolsConfig {
         }
         // both only mean anything in a loop that persists
         if !b.persist {
-            b.ledger = false;
+            b.ledger = Ledger::Off;
             b.verify = None;
         }
         b
@@ -815,6 +1139,13 @@ impl ToolsConfig {
                 out.push(t.name.clone());
             }
         }
+        // compact joins any registry that offers something else (an MCP
+        // server's tools included), last
+        if self.compact_at > 0.0 && (!out.is_empty() || !self.mcp.is_empty())
+            && !out.iter().any(|n| n == COMPACT_TOOL)
+        {
+            out.push(COMPACT_TOOL.to_string());
+        }
         out
     }
 }
@@ -923,6 +1254,18 @@ pub struct ResultMap {
     /// to the full body: a readable result beats an error.
     #[serde(default)]
     pub text: Option<String>,
+    /// the field holding a picture for the MODEL to look at - the opposite
+    /// destination from `image`. A screenshot from a machine the model is
+    /// driving is the case this exists for: the model has to see the result
+    /// of its click before it can decide the next one. The bytes ride the
+    /// result's turn into the prompt (only when the serving model reads
+    /// pictures itself; a blind one is told what it missed), the field is
+    /// cut out of the text it reads (megabytes of base64 are not something a
+    /// model can read), and `text` still picks a field if one is named.
+    /// `"$body"` takes the whole response as the picture, for an endpoint
+    /// that answers with image bytes rather than JSON.
+    #[serde(default)]
+    pub see: Option<String>,
 }
 
 impl HttpTool {
@@ -947,6 +1290,11 @@ impl HttpTool {
     /// The response carries a picture for the client (see ResultMap).
     pub fn makes_image(&self) -> bool {
         self.result.as_ref().is_some_and(|r| r.image.is_some())
+    }
+
+    /// The response carries a picture for the MODEL (ResultMap::see).
+    pub fn sees(&self) -> bool {
+        self.result.as_ref().is_some_and(|r| r.see.is_some())
     }
 
     /// The switch this endpoint sits under when it says so, or when it is
@@ -1019,6 +1367,18 @@ pub struct McpServer {
     /// the person's switches show.
     #[serde(default)]
     pub groups: BTreeMap<String, Vec<String>>,
+    /// show this server's tools by name and one line only, and let the
+    /// model load the signatures it needs (see DEFERRED SCHEMAS). For a big
+    /// server most answers never call: its schemas stop being prefill.
+    #[serde(default)]
+    pub defer: bool,
+    /// this server's session-capable builders (session::SESSION_TOOLS) act
+    /// through the chat's Enclave session when the turn has one: the
+    /// session is added to their arguments and the calls they answer with
+    /// are signed and sent with the server's session_execute. Absent: on for
+    /// https://mcp.enclave.host, off for every other server.
+    #[serde(default)]
+    pub sessions: Option<bool>,
 }
 
 /// A tool as an MCP server lists it, or as an inline declaration writes it:
@@ -1062,6 +1422,12 @@ impl McpToolDecl {
 }
 
 impl McpServer {
+    /// Whether this server's builders act through a chat's session (see
+    /// `sessions`).
+    pub fn sessions_on(&self) -> bool {
+        self.sessions.unwrap_or_else(|| crate::session::default_on(&self.url))
+    }
+
     /// The switch this server's tools sit under (see `group`).
     pub fn group_name(&self) -> String {
         if let Some(g) = self.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
@@ -1139,7 +1505,12 @@ pub struct ToolMeta {
     /// reserved arguments `images` (data URIs) and `image` (the first)
     #[serde(default)]
     pub images: bool,
-    /// "image": answers with a picture for the client
+    /// "image": answers with a picture for the client; "see": answers with
+    /// a picture for the model to look at (ResultMap::see). An MCP tool that
+    /// says neither and returns an image part is read as "see" when the
+    /// serving model can look, which is what the MCP spec means by a tool
+    /// result, and as "image" otherwise, so a blind model's user still gets
+    /// the picture.
     #[serde(default)]
     pub result: Option<String>,
     /// how long ONE call may take, when the tool knows better than the
@@ -1158,6 +1529,11 @@ pub struct ToolMeta {
     /// acts for the signed-in user (the server said so)
     #[serde(default)]
     pub user: bool,
+    /// shown by name and one line until load_tools fetches its signature
+    /// (see DEFERRED SCHEMAS): the server's own say for one tool, or the
+    /// whole server's (McpServer::defer)
+    #[serde(default)]
+    pub defer: bool,
 }
 
 impl ToolMeta {
@@ -1165,18 +1541,31 @@ impl ToolMeta {
         self.result.as_deref() == Some("image")
     }
 
+    pub fn sees(&self) -> bool {
+        self.result.as_deref() == Some("see")
+    }
+
     /// An http entry's facts, as the registry carries them for every source.
     pub fn of_http(t: &HttpTool, group: &str) -> ToolMeta {
         ToolMeta {
             group: Some(group.to_string()),
             images: t.wants_images(),
-            result: t.makes_image().then(|| "image".to_string()),
+            result: if t.makes_image() {
+                Some("image".to_string())
+            } else if t.sees() {
+                Some("see".to_string())
+            } else {
+                None
+            },
             timeout_s: t.timeout_s,
             max_chars: t.max_chars,
             format: t.format.clone(),
             route: t.route.clone(),
             route_arg: t.route_arg.clone(),
             user: t.headers.values().any(|v| matches!(v.trim(), "$user" | "${user}")),
+            // an http entry is written out in this config, a few at a time;
+            // deferring is for servers whose lists arrive by the dozen
+            defer: false,
         }
     }
 }
@@ -1189,6 +1578,13 @@ pub struct Tool {
     pub parameters: serde_json::Value,
     pub src: ToolSrc,
     pub meta: ToolMeta,
+}
+
+impl Tool {
+    /// This app's own builtin `k`, not a configured tool that took its name.
+    pub fn is_builtin(&self, k: Builtin) -> bool {
+        matches!(self.src, ToolSrc::Builtin(b) if b == k)
+    }
 }
 
 /// One MCP connection for the life of ONE request. The component keeps nothing
@@ -1208,6 +1604,19 @@ pub struct McpSession {
     /// which is BEFORE the initialized notification, the first request the
     /// revision requires the header on.
     opened: bool,
+    /// the server's builders act through the chat's session
+    /// (McpServer::sessions_on)
+    sessions: bool,
+}
+
+impl McpSession {
+    /// Does a call to the server tool `remote` go through the chat's session
+    /// path (call_mcp_session)? A session-capable builder on a server with
+    /// sessions on - on that path a turn WITHOUT a session still gets the
+    /// note saying why nothing was sent.
+    fn acts_through_sessions(&self, remote: &str) -> bool {
+        self.sessions && crate::session::is_session_tool(remote)
+    }
 }
 
 /// Everything callable this turn, plus whatever went wrong assembling it.
@@ -1235,13 +1644,6 @@ impl Registry {
     /// verdict stands down when this is true: the model owns the decision.
     pub fn makes_image(&self, _cfg: &ToolsConfig) -> bool {
         self.tools.iter().any(|t| t.meta.makes_image())
-    }
-
-    /// The name of the first armed tool that reads the turn's pictures, if
-    /// any. The legs use it to stand the vision pre-pass down, stash the
-    /// pictures for the tool, and tell the model what to call.
-    pub fn image_reader<'a>(&'a self, cfg: &ToolsConfig) -> Option<&'a str> {
-        self.image_tool_names(cfg).0.or(self.image_tool_names(cfg).1)
     }
 
     /// The armed image-taking tools by NATURE: (reader, transformer). A
@@ -1382,6 +1784,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             handshake: s.handshake,
             // nothing to negotiate with a server we do not handshake with
             opened: !s.handshake,
+            sessions: s.sessions_on(),
         };
         let declared: Vec<McpToolDecl> = if s.discover && s.tools.is_empty() {
             on_status(&format!("listing tools on {}…", host_of(&s.url)));
@@ -1429,6 +1832,7 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             }
             let mut meta = d.meta.clone();
             meta.group = Some(group);
+            meta.defer |= s.defer;
             reg.tools.push(Tool {
                 name: exposed,
                 description: d.description.clone(),
@@ -1438,6 +1842,50 @@ pub fn build(cfg: &ToolsConfig, b: Builtins, on_status: &dyn Fn(&str)) -> Regist
             });
         }
         reg.mcp.push(sess);
+    }
+    // Deferred tools need load_tools to be usable. Added last because only
+    // now is it known whether anything was deferred; if a configured tool
+    // already took the name, nothing can be loaded, so everything is shown
+    // in full instead - costly, never broken.
+    if reg.tools.iter().any(|t| t.meta.defer) {
+        if reg.find(LOAD_TOOLS).is_none() {
+            let k = Builtin::LoadTools;
+            reg.tools.push(Tool {
+                name: k.name().to_string(),
+                description: k.description().to_string(),
+                parameters: k.schema(),
+                src: ToolSrc::Builtin(k),
+                meta: ToolMeta::default(),
+            });
+        } else {
+            reg.notes.push(format!(
+                "a tool named '{LOAD_TOOLS}' is configured, so deferred tools cannot be loaded \
+                 and are shown in full"
+            ));
+            for t in &mut reg.tools {
+                t.meta.defer = false;
+            }
+        }
+    }
+    // compact goes to any registry that offers something else - a loop of
+    // calls is what fills a window - and is last, so it never reorders the
+    // tools a parked prefix already holds
+    if cfg.compact_at > 0.0 && !reg.tools.is_empty() {
+        if reg.find(COMPACT_TOOL).is_none() {
+            let k = Builtin::Compact;
+            reg.tools.push(Tool {
+                name: k.name().to_string(),
+                description: k.description().to_string(),
+                parameters: k.schema(),
+                src: ToolSrc::Builtin(k),
+                meta: ToolMeta::default(),
+            });
+        } else {
+            reg.notes.push(format!(
+                "a tool named '{COMPACT_TOOL}' is configured, so the model cannot compact its \
+                 context; set compact_at to 0 to silence this"
+            ));
+        }
     }
     reg
 }
@@ -1597,12 +2045,9 @@ pub fn system_block_prefix(tools: &[Tool], b: &Budget) -> String {
         "Rules for this app: the call is executed by the server and its result comes back in a \
          <tool_response> block; wait for it rather than inventing one. Call ONLY the functions \
          listed above, by their exact names - nothing else exists, and a call to anything else \
-         is shown to the user as a failure. You may make at most {} call{} in one answer, and \
-         the whole answer has {} of wall-clock time, so make each one count. When a call fails, \
-         say so plainly and answer from what you have.",
-        b.max_calls,
-        if b.max_calls == 1 { "" } else { "s" },
-        b.time(),
+         is shown to the user as a failure. {} When a call fails, say so plainly and answer \
+         from what you have.",
+        b.rule(),
     ));
     s
 }
@@ -1656,7 +2101,10 @@ fn finish_rule(tools: &[Tool], b: &Budget) -> String {
             None => String::new(),
         },
     );
-    if b.ledger {
+    // Checks says nothing here: the ledger is introduced by the result that
+    // switches it on (ToolLoop::ledger_turn), and until then the rules - and
+    // the parked prefix - are the plain loop's
+    if b.ledger == Ledger::Always {
         s.push_str(
             " THE LEDGER: this loop keeps NO history. When a result comes back, everything you \
              wrote before it is gone except one block: the ledger you write at the START of \
@@ -1744,11 +2192,9 @@ pub fn merged_system_block(tools: &[Tool], b: &Budget, require: Option<&str>) ->
         "Rules for this app: after you write a call, STOP - it is executed for you and its \
          result comes back in a <tool_response> block; never invent one. Call ONLY the \
          functions listed above, by their exact names - nothing else exists, and a call to \
-         anything else is shown to the user as a failure. One call at a time, and at most \
-         {} of them are run by this server in a single answer, within {} of wall-clock time. \
-         When a call fails, say so plainly and answer from what you have.",
-        b.max_calls,
-        b.time(),
+         anything else is shown to the user as a failure. One call at a time. For the calls \
+         this server runs: {} When a call fails, say so plainly and answer from what you have.",
+        b.rule(),
     ));
     s.push_str(&finish_rule(tools, b));
     push_forced(&mut s, require);
@@ -1756,22 +2202,14 @@ pub fn merged_system_block(tools: &[Tool], b: &Budget, require: Option<&str>) ->
 }
 
 /// The part both modes share: the signature list, in the format the model was
-/// trained on.
+/// trained on, and after it the one-line index of any deferred tools.
 fn signatures(tools: &[Tool]) -> String {
     let mut s = String::from(
         "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
          You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
     );
-    for t in tools {
-        let sig = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.parameters,
-            }
-        });
-        s.push_str(&sig.to_string());
+    for t in tools.iter().filter(|t| !t.meta.defer) {
+        s.push_str(&signature(t));
         s.push('\n');
     }
     s.push_str(
@@ -1779,7 +2217,117 @@ fn signatures(tools: &[Tool]) -> String {
          arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\
          {\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n",
     );
+    let deferred: Vec<&Tool> = tools.iter().filter(|t| t.meta.defer).collect();
+    if !deferred.is_empty() {
+        s.push_str(&format!(
+            "More functions, listed by name only. They are called the same way, but their \
+             arguments are not shown: call {LOAD_TOOLS} with the names you need first and \
+             their signatures come back in its result. Never guess their arguments.\n",
+        ));
+        for t in deferred {
+            s.push_str(&format!("- {}: {}\n", t.name, summary(&t.description)));
+        }
+        s.push('\n');
+    }
     s
+}
+
+/// One tool as a `<tools>` line: the JSON function signature.
+fn signature(t: &Tool) -> String {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.parameters,
+        }
+    })
+    .to_string()
+}
+
+/// A deferred tool's line in the index: its description's first sentence,
+/// on one line, cut at DEFER_SUMMARY_CHARS.
+fn summary(description: &str) -> String {
+    let flat = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    // a sentence ends at a stop followed by a space, so "v1.2" and "e.g."
+    // mid-word do not end it early
+    let first = flat
+        .char_indices()
+        .find(|&(i, c)| matches!(c, '.' | '!' | '?') && flat[i + 1..].starts_with(' '))
+        .map(|(i, _)| &flat[..=i])
+        .unwrap_or(&flat);
+    if first.chars().count() <= DEFER_SUMMARY_CHARS {
+        return first.to_string();
+    }
+    let cut: String = first.chars().take(DEFER_SUMMARY_CHARS - 3).collect();
+    format!("{}...", cut.trim_end())
+}
+
+/// The load_tools call: the full signatures of the named deferred tools, in
+/// the `<tools>` form. Whole signatures only - one that would cross
+/// LOAD_MAX_CHARS is left out and named, for a second call.
+fn load_tools(reg: &Registry, args: &serde_json::Value) -> Result<String, String> {
+    let names: Vec<String> = match args.get("names") {
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|n| n.as_str()).map(|n| n.trim().to_string()).collect()
+        }
+        // a model that writes one name as a string meant that one
+        Some(serde_json::Value::String(n)) => vec![n.trim().to_string()],
+        _ => Vec::new(),
+    };
+    if names.is_empty() {
+        return Err(format!("{LOAD_TOOLS} needs `names`, a list of function names"));
+    }
+    let mut sigs = String::new();
+    let (mut shown, mut missing, mut over) = (Vec::new(), Vec::new(), Vec::new());
+    for n in &names {
+        match reg.find(n) {
+            // a tool already in <tools> has nothing more to load: say so
+            // rather than repeat it
+            Some(t) if !t.meta.defer => shown.push(n.as_str()),
+            Some(t) => {
+                let sig = signature(t);
+                if sigs.len() + sig.len() + 1 > LOAD_MAX_CHARS {
+                    over.push(n.as_str());
+                } else {
+                    sigs.push_str(&sig);
+                    sigs.push('\n');
+                }
+            }
+            None => missing.push(n.as_str()),
+        }
+    }
+    if sigs.is_empty() && over.is_empty() && shown.is_empty() {
+        let known: Vec<&str> =
+            reg.tools.iter().filter(|t| t.meta.defer).map(|t| t.name.as_str()).collect();
+        return Err(format!(
+            "no function named {} is listed. The ones that can be loaded: {}",
+            missing.join(", "),
+            known.join(", ")
+        ));
+    }
+    let mut out = String::new();
+    if !sigs.is_empty() {
+        out.push_str(&format!(
+            "<tools>\n{sigs}</tools>\nCall these exactly like the functions in <tools> above."
+        ));
+    }
+    let mut note = |s: String| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&s);
+    };
+    if !shown.is_empty() {
+        note(format!("Already in <tools> above: {}.", shown.join(", ")));
+    }
+    if !over.is_empty() {
+        note(format!("Not loaded, this result is full: {} - load them in a second call.", over.join(", ")));
+    }
+    if !missing.is_empty() {
+        note(format!("No function by these names: {}.", missing.join(", ")));
+    }
+    Ok(out)
 }
 
 /// Tool calling is a trained format, not a prompt trick: only the templates
@@ -2306,7 +2854,16 @@ pub struct ToolResult {
     /// text beside it; the bytes ride out to the client through the leg's
     /// existing image delivery.
     pub image: Option<crate::image::GeneratedImage>,
+    /// a picture for the MODEL (ResultMap::see, or an MCP image part read
+    /// as one): the loop attaches it to this result's turn when the serving
+    /// model reads pictures, and says so in the text when it cannot
+    pub seen: Option<Vec<u8>>,
 }
+
+/// The longest a picture the model is shown may be, decoded. A screenshot is
+/// tens of kilobytes; this only stops a runaway endpoint from putting a
+/// poster-sized file through the vision encoder on every step of a loop.
+pub const MAX_SEEN_BYTES: usize = 6 * 1024 * 1024;
 
 /// Run one call. Never returns Err: a failure IS a result, handed back to the
 /// model so it can try something else or tell the user plainly. A tool that is
@@ -2355,23 +2912,32 @@ pub fn call(
                 ms: now_ms().saturating_sub(t0),
                 sources: Vec::new(),
                 image: None,
+                seen: None,
             };
         }
     };
     // the tool's own figure wins over the deployment's, whichever source
-    // it came from: an http entry's field, or what an MCP server declared
-    let max_chars = meta.max_chars.unwrap_or(cfg.max_chars);
+    // it came from: an http entry's field, or what an MCP server declared.
+    // load_tools sizes its own result in whole signatures (LOAD_MAX_CHARS),
+    // plus room for the notes after them.
+    let max_chars = match src {
+        ToolSrc::Builtin(Builtin::LoadTools) => LOAD_MAX_CHARS + 2_000,
+        _ => meta.max_chars.unwrap_or(cfg.max_chars),
+    };
     let mut sources = Vec::new();
     let mut image = None;
+    let mut seen = None;
     let r = match src {
+        // answered from the registry: the signatures are already here
+        ToolSrc::Builtin(Builtin::LoadTools) => load_tools(reg, args),
         ToolSrc::Builtin(k) => call_builtin(k, &b, args, &mut sources, on_status),
-        ToolSrc::Http(i) => {
-            call_http(&cfg.http[i], cfg, args, images, &mut sources, &mut image, on_status, b.user)
-        }
+        ToolSrc::Http(i) => call_http(
+            &cfg.http[i], cfg, args, images, &mut sources, &mut image, &mut seen, on_status, b.user,
+        ),
         ToolSrc::Mcp { server, remote } => {
             let sess = &mut reg.mcp[server];
             // a picture arrives as megabytes of base64 inside the envelope
-            let max_bytes = if meta.makes_image() {
+            let max_bytes = if meta.makes_image() || meta.sees() {
                 (12 * 1024 * 1024).max(cfg.max_bytes)
             } else {
                 cfg.max_bytes.max(http::DEFAULT_MAX_BYTES)
@@ -2383,6 +2949,9 @@ pub fn call(
                 images,
                 timeout_s: meta.timeout_s.unwrap_or(sess.timeout_s),
                 max_bytes,
+                // an image part is for the model when the tool says so, or
+                // when it says nothing and the model can look (ToolMeta::result)
+                see: meta.sees() || (!meta.makes_image() && b.images_local),
             };
             // ticked like an http entry: a tool is allowed to be slow, and
             // the client stream must see something inside every idle window
@@ -2392,14 +2961,38 @@ pub fn call(
                     !crate::client_gone()
                 })
             };
-            call_mcp(sess, &c, args, &mut sources, &mut image, &mut transport)
+            if sess.acts_through_sessions(&remote) {
+                call_mcp_session(sess, &c, args, b.session, &mut sources, &mut image, &mut seen, &mut transport)
+            } else {
+                call_mcp(sess, &c, args, &mut sources, &mut image, &mut seen, &mut transport)
+            }
         }
         // never built into a Registry - the passthrough renders client tools
         // into the prompt and hands the call back, so reaching this arm is a
         // wiring bug, and the failure must say which side executes
         ToolSrc::Client => Err("client-declared tools are executed by the client, not here".into()),
     };
-    finish_call(r, max_chars, sources, image, t0, now_ms)
+    let out = finish_call(r, max_chars, sources, image, seen, t0, now_ms);
+    match reg.find(name) {
+        Some(t) if meta.defer => with_signature(out, t),
+        _ => out,
+    }
+}
+
+/// A deferred tool's refusal carries its signature. Models call a listed
+/// name straight away rather than load it first (seen with qwen3.5-9b: a
+/// guessed `slug` where the server wants `app`), and the server's complaint
+/// names one argument at best; with the signature in hand the next call is
+/// right, one step instead of a load and a retry.
+fn with_signature(mut r: ToolResult, t: &Tool) -> ToolResult {
+    if r.is_error {
+        r.text.push_str(&format!(
+            "\n\nThe signature of {}, to call it correctly:\n<tools>\n{}\n</tools>",
+            t.name,
+            signature(t)
+        ));
+    }
+    r
 }
 
 /// Run ONE http entry outside a registry: the routed pre-pass path, which
@@ -2417,11 +3010,12 @@ pub fn call_http_entry(
     let t = &cfg.http[i];
     let mut sources = Vec::new();
     let mut image = None;
+    let mut seen = None;
     // the routed pre-pass carries no caller: an entry that asks for $user
     // fails closed there, which is the right answer for a route with no one
     // behind it
-    let r = call_http(t, cfg, args, images, &mut sources, &mut image, on_status, None);
-    finish_call(r, t.max_chars.unwrap_or(cfg.max_chars), sources, image, t0, now_ms)
+    let r = call_http(t, cfg, args, images, &mut sources, &mut image, &mut seen, on_status, None);
+    finish_call(r, t.max_chars.unwrap_or(cfg.max_chars), sources, image, seen, t0, now_ms)
 }
 
 /// The shared tail of a call: truncation, error hygiene, the clock.
@@ -2430,6 +3024,7 @@ fn finish_call(
     max_chars: usize,
     mut sources: Vec<(String, String)>,
     mut image: Option<crate::image::GeneratedImage>,
+    mut seen: Option<Vec<u8>>,
     t0: u64,
     now_ms: impl Fn() -> u64,
 ) -> ToolResult {
@@ -2440,11 +3035,12 @@ fn finish_call(
     if is_error {
         sources.clear();
         image = None;
+        seen = None;
     }
     if let Some(img) = &mut image {
         img.ms = now_ms().saturating_sub(t0);
     }
-    ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources, image }
+    ToolResult { text, is_error, ms: now_ms().saturating_sub(t0), sources, image, seen }
 }
 
 /// The app's own capabilities, called the way any other tool is.
@@ -2468,6 +3064,14 @@ fn call_builtin(
              subagent loop, which only a chat turn can host"
                 .into(),
         ),
+        // tools::call answers it from the registry before reaching here
+        Builtin::LoadTools => Err(format!("{LOAD_TOOLS} is answered from the tool registry")),
+        // like spawn_agent: intercepted by the answer loop, whose messages it
+        // rewrites; only the /tools probe gets this far
+        Builtin::Compact => Err(format!(
+            "{COMPACT_TOOL} is run by the answer loop: it replaces that loop's conversation, \
+             which a probe does not have"
+        )),
         Builtin::Wait => {
             let (secs, reason, note) = wait_plan(args, b.wait_cap_s)?;
             // Sleep in ticks, each one a status line: the guest cannot say
@@ -2599,6 +3203,53 @@ fn request_payload(
     Ok((body, ctype))
 }
 
+/// Does a result report a FAILURE in its body? A command runner answers
+/// HTTP 200 for a command that exited 1 - risc-box's /exec says
+/// `{"ok":true,"exitCode":1,"output":...}`, and `{"ok":false,"error":...}`
+/// when the command timed out - so is_error alone misses every failing
+/// command. Read: a top-level `"ok": false`, or a non-zero `exitCode` /
+/// `exit_code` / `exit`. Top-level only, so a command that printed JSON
+/// with those keys in its OUTPUT does not count. A result cut at max_chars
+/// no longer parses; the fields this reads come first in such a body, so it
+/// falls back to the text before the first string-valued field.
+pub fn reports_failure(text: &str) -> bool {
+    let t = text.trim_start();
+    if !t.starts_with('{') {
+        return false;
+    }
+    let failed = |o: &serde_json::Map<String, serde_json::Value>| {
+        o.get("ok").and_then(|v| v.as_bool()) == Some(false)
+            || ["exitCode", "exit_code", "exit"]
+                .iter()
+                .any(|k| o.get(*k).and_then(|v| v.as_i64()).is_some_and(|c| c != 0))
+    };
+    if let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(t) {
+        return failed(&o);
+    }
+    // cut short: the head up to the first string value, closed off - only
+    // numbers, booleans and nulls before it, which is all this reads
+    let mut head = String::new();
+    for (i, ch) in t.char_indices() {
+        if ch == '"' {
+            // a key is followed by ':'; a string VALUE follows one
+            let before = t[..i].trim_end();
+            if before.ends_with(':') {
+                break;
+            }
+        }
+        head.push(ch);
+        if i > 512 {
+            return false;
+        }
+    }
+    let head = head.trim_end().trim_end_matches(',').trim_end_matches(|c: char| c != ',' && c != '{');
+    let head = head.trim_end().trim_end_matches(',');
+    match serde_json::from_str::<serde_json::Value>(&format!("{head}}}")) {
+        Ok(serde_json::Value::Object(o)) => failed(&o),
+        _ => false,
+    }
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -2614,6 +3265,7 @@ fn call_http(
     images: &[Vec<u8>],
     sources: &mut Vec<(String, String)>,
     image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
     on_status: &dyn Fn(&str),
     user: Option<&str>,
 ) -> Result<String, String> {
@@ -2692,16 +3344,59 @@ fn call_http(
         // the stop button, mid-request: the wait ends and nothing is read
         !crate::client_gone()
     })?;
+    let see_body = t.result.as_ref().and_then(|m| m.see.as_deref()).map(str::trim) == Some("$body");
+    if r.status < 400 && see_body {
+        // the whole response IS the picture: never through a UTF-8 lossy
+        // pass, which would mangle every byte that matters
+        if r.truncated {
+            return Err(cut_picture(t, cfg));
+        }
+        let n = r.body.len();
+        *seen = Some(seen_bytes(r.body)?);
+        return Ok(format!("{} returned a picture ({} KB).", t.name, n.div_ceil(1024)));
+    }
     let text = String::from_utf8_lossy(&r.body).trim().to_string();
     if r.status >= 400 {
         let hint: String = text.chars().take(400).collect();
         return Err(format!("tool '{}' returned HTTP {}: {hint}", t.name, r.status));
     }
     if r.truncated {
+        // half a picture is no picture, and its base64 is no use as text
+        if t.sees() {
+            return Err(cut_picture(t, cfg));
+        }
         return Ok(format!("{text}\n[response was cut off at {} bytes]", req_max(t, cfg)));
     }
     extract_sources(t, &text, sources);
-    map_result(t, text, args, image_out)
+    map_result(t, text, args, image_out, seen)
+}
+
+fn cut_picture(t: &HttpTool, cfg: &ToolsConfig) -> String {
+    format!(
+        "tool '{}' answered with more than {} bytes, so its picture was cut off and dropped \
+         - raise the entry's max_bytes",
+        t.name,
+        req_max(t, cfg)
+    )
+}
+
+/// Bytes a model will be shown: a real image (png, jpeg, gif, bmp; a webp is
+/// transcoded, since the vision encoder has no VP8) of a sane size. Anything
+/// else fails the call with the reason, rather than reaching the encoder and
+/// failing the whole answer there.
+fn seen_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.len() > MAX_SEEN_BYTES {
+        return Err(format!(
+            "the picture is {} KB; a picture for the model may be at most {} KB",
+            bytes.len() / 1024,
+            MAX_SEEN_BYTES / 1024
+        ));
+    }
+    match crate::image_kind(&bytes) {
+        Some("webp") => crate::webp::to_jpeg(&bytes),
+        Some(_) => Ok(bytes),
+        None => Err("the tool's picture is not a recognisable image (png, jpeg, webp, gif or bmp)".into()),
+    }
 }
 
 /// The hits a sources map names, as (title, url) rows for the citation list.
@@ -2735,7 +3430,7 @@ fn extract_sources(t: &HttpTool, text: &str, sources: &mut Vec<(String, String)>
 fn req_max(t: &HttpTool, cfg: &ToolsConfig) -> usize {
     match t.max_bytes {
         Some(n) => n,
-        None if t.makes_image() => (12 * 1024 * 1024).max(cfg.max_bytes),
+        None if t.makes_image() || t.sees() => (12 * 1024 * 1024).max(cfg.max_bytes),
         None => cfg.max_bytes,
     }
 }
@@ -2770,9 +3465,29 @@ fn map_result(
     text: String,
     args: &serde_json::Value,
     image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
 ) -> Result<String, String> {
     let Some(rm) = &t.result else { return Ok(text) };
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+    let mut parsed: Option<serde_json::Value> = serde_json::from_str(&text).ok();
+    if let Some(path) = rm.see.as_deref().map(str::trim).filter(|p| *p != "$body") {
+        let missing = || {
+            let hint: String = text.chars().take(200).collect();
+            format!("tool '{}' answered without a picture at result.see path '{path}': {hint}", t.name)
+        };
+        let j = parsed.as_mut().ok_or_else(missing)?;
+        let raw = json_path(j, path).and_then(|v| v.as_str()).ok_or_else(missing)?;
+        let bytes = crate::decode_image_src(raw)
+            .map_err(|e| format!("tool '{}' answered with a picture this app cannot read: {e}", t.name))?;
+        *seen = Some(seen_bytes(bytes)?);
+        // the model reads everything BUT the picture: its base64 is
+        // thousands of tokens of nothing, and the picture itself is attached
+        json_remove(j, path);
+    }
+    if rm.see.is_some() && rm.text.is_none() {
+        if let Some(j) = &parsed {
+            return Ok(j.to_string());
+        }
+    }
     if let Some(path) = &rm.image {
         let raw = parsed
             .as_ref()
@@ -2850,6 +3565,41 @@ fn json_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json:
         };
     }
     Some(cur)
+}
+
+/// Remove what a dot path names (an object key; an array slot becomes null,
+/// so later indexes keep their meaning). A path that misses removes nothing.
+fn json_remove(v: &mut serde_json::Value, path: &str) {
+    let (parent, last) = match path.rsplit_once('.') {
+        Some((p, l)) => {
+            let mut cur = &mut *v;
+            for seg in p.split('.') {
+                cur = match seg.parse::<usize>() {
+                    Ok(i) => match cur.get_mut(i) {
+                        Some(c) => c,
+                        None => return,
+                    },
+                    Err(_) => match cur.get_mut(seg) {
+                        Some(c) => c,
+                        None => return,
+                    },
+                };
+            }
+            (cur, l)
+        }
+        None => (v, path),
+    };
+    match parent {
+        serde_json::Value::Object(o) => {
+            o.remove(last);
+        }
+        serde_json::Value::Array(a) => {
+            if let Some(slot) = last.parse::<usize>().ok().and_then(|i| a.get_mut(i)) {
+                *slot = serde_json::Value::Null;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// (mime, base64) from a field that may be raw base64 or a full data URI.
@@ -3053,6 +3803,8 @@ struct McpCall<'a> {
     images: &'a [Vec<u8>],
     timeout_s: u64,
     max_bytes: usize,
+    /// an image part in the result is for the model, not the client
+    see: bool,
 }
 
 fn call_mcp(
@@ -3061,8 +3813,20 @@ fn call_mcp(
     args: &serde_json::Value,
     sources: &mut Vec<(String, String)>,
     image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
     transport: &mut Transport<'_>,
 ) -> Result<String, String> {
+    let (r, args) = mcp_tools_call(sess, c, args, transport)?;
+    mcp_read(&r, &args, c, sources, image_out, seen)
+}
+
+/// The tools/call round trip: the raw result, and the arguments as sent.
+fn mcp_tools_call(
+    sess: &mut McpSession,
+    c: &McpCall,
+    args: &serde_json::Value,
+    transport: &mut Transport<'_>,
+) -> Result<(serde_json::Value, serde_json::Value), String> {
     // a turn that skipped discovery (inline tools) never handshook
     handshake(sess, transport)?;
     // the turn's pictures ride the call as the reserved arguments the
@@ -3082,7 +3846,20 @@ fn call_mcp(
         c.max_bytes,
         transport,
     )?;
-    let out = mcp_outcome(&r, &args);
+    Ok((r, args))
+}
+
+/// A tools/call result, read for the model: the text (or the server's error
+/// as an Err), with citations and pictures put where they go.
+fn mcp_read(
+    r: &serde_json::Value,
+    args: &serde_json::Value,
+    c: &McpCall,
+    sources: &mut Vec<(String, String)>,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
+) -> Result<String, String> {
+    let out = mcp_outcome(r, args, c.see);
     if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
         return Err(if out.text.is_empty() {
             format!("mcp tool '{}' reported an error", c.remote)
@@ -3091,17 +3868,97 @@ fn call_mcp(
         });
     }
     *sources = out.sources;
+    if let Some(b) = out.seen {
+        *seen = Some(seen_bytes(b)?);
+    }
     if let Some((mime, b64)) = out.image {
         *image_out = Some(crate::image::GeneratedImage {
             b64,
             mime,
-            prompt: image_request_label(&args),
+            prompt: image_request_label(args),
             model: None,
             seed: None,
             ms: 0, // stamped by call(), which owns the clock
         });
     }
     Ok(out.text)
+}
+
+/// The least session_execute is given to answer, whatever the server's own
+/// timeout: it sends every call on chain and waits for each receipt, which
+/// is several blocks for a deploy. The client stream ticks meanwhile.
+const SESSION_EXECUTE_TIMEOUT_S: u64 = 120;
+
+/// A session-capable builder on a server with sessions on (see
+/// crate::session). With this chat's session, the builder is asked for
+/// session calls, every call is signed with the chat's key, and the same
+/// server's session_execute sends them: the model gets ONE result, the
+/// builder's facts plus what was executed. Without one, the builder's own
+/// answer (wallet transactions) comes back with a note saying why nothing
+/// was sent. An error - the builder's, a call that cannot be signed, or
+/// session_execute's (which names the call that failed) - is the result.
+#[allow(clippy::too_many_arguments)]
+fn call_mcp_session(
+    sess: &mut McpSession,
+    c: &McpCall,
+    args: &serde_json::Value,
+    session: Option<&crate::session::ChatSession>,
+    sources: &mut Vec<(String, String)>,
+    image_out: &mut Option<crate::image::GeneratedImage>,
+    seen: &mut Option<Vec<u8>>,
+    transport: &mut Transport<'_>,
+) -> Result<String, String> {
+    use crate::session::{self, Plan};
+    let Some(s) = session else {
+        let (r, sent) = mcp_tools_call(sess, c, args, transport)?;
+        let text = mcp_read(&r, &sent, c, sources, image_out, seen)?;
+        // "nothing to do" (no transactions) needs no session to say so
+        if session::answer_object(&r).is_some_and(|a| !session::has_work(&a)) {
+            return Ok(text);
+        }
+        return Ok(format!("{}\n\n{}", text.trim_end(), session::NO_SESSION_NOTE));
+    };
+    let sent = session::with_session_arg(args, s);
+    let (r, sent) = mcp_tools_call(sess, c, sent.as_ref().unwrap_or(args), transport)?;
+    let text = mcp_read(&r, &sent, c, sources, image_out, seen)?;
+    let Some(answer) = session::answer_object(&r) else { return Ok(text) };
+    let exec_args = match session::plan(&answer, s)? {
+        Plan::Keep => return Ok(text),
+        Plan::Foreign(note) => return Ok(format!("{}\n\n{note}", text.trim_end())),
+        Plan::Execute(a) => a,
+    };
+    let n = exec_args["calls"].as_array().map_or(0, |c| c.len());
+    let r = rpc_with(
+        sess,
+        "tools/call",
+        Some(serde_json::json!({ "name": session::EXECUTE_TOOL, "arguments": exec_args })),
+        c.timeout_s.max(SESSION_EXECUTE_TIMEOUT_S),
+        http::DEFAULT_MAX_BYTES,
+        transport,
+    )
+    .map_err(|e| {
+        // the calls may be on chain already: a retry of the builder quotes
+        // FRESH nonces, so it could do the same thing twice
+        format!(
+            "{} signed {n} session call(s) with this chat's Enclave session, but {} did not \
+             answer ({e}). They may still have been sent: check the result (get_deployment, \
+             session_status) before calling {} again.",
+            c.remote,
+            session::EXECUTE_TOOL,
+            c.remote
+        )
+    })?;
+    let out = mcp_outcome(&r, &serde_json::Value::Null, false);
+    if r.get("isError").and_then(|e| e.as_bool()).unwrap_or(false) {
+        return Err(format!(
+            "{} prepared {n} session call(s) and this chat's Enclave session signed them, but {} \
+             refused them: {}",
+            c.remote,
+            session::EXECUTE_TOOL,
+            if out.text.trim().is_empty() { "(no reason given)" } else { out.text.trim() }
+        ));
+    }
+    Ok(session::executed_result(&answer, session::answer_object(&r), &out.text))
 }
 
 /// What a tools/call result carries for this app.
@@ -3111,6 +3968,8 @@ struct McpOutcome {
     sources: Vec<(String, String)>,
     /// (mime, base64) of the first image part
     image: Option<(String, String)>,
+    /// the first image part's bytes, when it is for the model (`see`)
+    seen: Option<Vec<u8>>,
 }
 
 /// An MCP result, read: text parts join; the first image part is a picture
@@ -3119,7 +3978,7 @@ struct McpOutcome {
 /// citations; any other binary part is named rather than dumped, because a
 /// base64 blob in the prompt is thousands of tokens of nothing the model
 /// can read; structured output alone falls back to its JSON.
-fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value) -> McpOutcome {
+fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value, see: bool) -> McpOutcome {
     let mut out = McpOutcome::default();
     let mut parts = Vec::new();
     if let Some(a) = r.get("content").and_then(|c| c.as_array()) {
@@ -3128,6 +3987,18 @@ fn mcp_outcome(r: &serde_json::Value, args: &serde_json::Value) -> McpOutcome {
                 Some("text") => {
                     if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
                         parts.push(t.to_string());
+                    }
+                }
+                // a picture for the MODEL: decoded here, attached to the
+                // result's turn by the loop; the text says only that it came
+                Some("image") if see => {
+                    let data = c.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    if out.seen.is_some() || data.is_empty() {
+                        continue;
+                    }
+                    match crate::decode_image_src(data) {
+                        Ok(b) => out.seen = Some(b),
+                        Err(e) => parts.push(format!("[an image part could not be read: {e}]")),
                     }
                 }
                 Some("image") if out.image.is_none() => {
@@ -3395,7 +4266,7 @@ mod tests {
         let b = Builtins { search: None, web_withheld: true, off: &off, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let offered: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(offered, ["run_vm_command", "generate_image"]);
+        assert_eq!(offered, ["run_vm_command", "generate_image", COMPACT_TOOL]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
     }
 
@@ -3644,7 +4515,7 @@ mod tests {
         }))
         .unwrap();
         let reg = build(&cfg, Builtins::default(), &|_| {});
-        assert_eq!(reg.tools.len(), 1);
+        assert_eq!(reg.tools.len(), 2, "a, then compact");
         assert_eq!(reg.notes.len(), 2);
     }
 
@@ -3664,7 +4535,7 @@ mod tests {
         let reg = build(&cfg, Builtins::default(), &|_| {});
         let resolved: Vec<String> = reg.tools.iter().map(|t| t.name.clone()).collect();
         assert_eq!(cfg.http_names(), resolved);
-        assert_eq!(resolved, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(resolved, vec!["a".to_string(), "b".to_string(), COMPACT_TOOL.to_string()]);
     }
 
     /// Built-ins only appear when the capability behind them is configured.
@@ -3691,10 +4562,10 @@ mod tests {
         let b = Builtins { search: Some(&scfg), ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["web_search", "request"]);
+        assert_eq!(names, vec!["web_search", "request", COMPACT_TOOL]);
         assert_eq!(reg.notes.len(), 1);
         // and /models advertises exactly those
-        assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "request".to_string()]);
+        assert_eq!(cfg.http_names(), vec!["web_search".to_string(), "request".to_string(), COMPACT_TOOL.to_string()]);
     }
 
     /// The generic powers that let ANY API be an image or vision tool: a
@@ -3727,20 +4598,20 @@ mod tests {
         let b = Builtins { images_present: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["draw", "look"]);
+        assert_eq!(names, vec!["draw", "look", COMPACT_TOOL]);
         assert!(reg.makes_image(&cfg));
-        assert_eq!(reg.image_reader(&cfg), Some("look"));
+        assert_eq!(reg.image_tool_names(&cfg).0, Some("look"));
         // no picture this turn: the reader vanishes silently
         let reg = build(&cfg, Builtins::default(), &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["draw"]);
+        assert_eq!(names, vec!["draw", COMPACT_TOOL]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        assert_eq!(reg.image_reader(&cfg), None);
+        assert_eq!(reg.image_tool_names(&cfg).0, None);
         // the serving model reads pictures itself: same silent stand-down
         let b = Builtins { images_present: true, images_local: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
         let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["draw"]);
+        assert_eq!(names, vec!["draw", COMPACT_TOOL]);
     }
 
     /// The response side of the generic entries: extraction by dot path, an
@@ -3759,6 +4630,7 @@ mod tests {
             serde_json::json!({"data": [{"b64_json": "QUJD"}]}).to_string(),
             &serde_json::json!({"prompt": "a fox"}),
             &mut img,
+            &mut None,
         )
         .unwrap();
         assert!(out.contains("a fox"), "{out}");
@@ -3772,13 +4644,14 @@ mod tests {
             serde_json::json!({"data": [{"b64_json": "data:image/webp;base64,QUJD"}]}).to_string(),
             &serde_json::json!({}),
             &mut img,
+            &mut None,
         )
         .unwrap();
         let g = img.expect("image extracted");
         assert_eq!((g.mime.as_str(), g.b64.as_str()), ("image/webp", "QUJD"));
         // a response with no image at the path is an error naming the path
         let mut img = None;
-        let e = map_result(&draw, "{\"error\": \"busy\"}".into(), &serde_json::json!({}), &mut img)
+        let e = map_result(&draw, "{\"error\": \"busy\"}".into(), &serde_json::json!({}), &mut img, &mut None)
             .unwrap_err();
         assert!(e.contains("data.0.b64_json"), "{e}");
         assert!(img.is_none());
@@ -3794,11 +4667,12 @@ mod tests {
             serde_json::json!({"answer": "a receipt", "tokens": 512}).to_string(),
             &serde_json::json!({}),
             &mut img,
+            &mut None,
         )
         .unwrap();
         assert_eq!(out, "a receipt");
         let whole = serde_json::json!({"other": 1}).to_string();
-        let out = map_result(&look, whole.clone(), &serde_json::json!({}), &mut img).unwrap();
+        let out = map_result(&look, whole.clone(), &serde_json::json!({}), &mut img, &mut None).unwrap();
         assert_eq!(out, whole);
     }
 
@@ -4079,6 +4953,170 @@ mod tests {
         assert!(matches!(all[0].src, ToolSrc::Client));
     }
 
+    /// A deferred server's schema text, measured. Big enough that the
+    /// test fails if it leaks into the prompt.
+    fn deferred_cfg(extra: serde_json::Value) -> ToolsConfig {
+        let big = |n: &str| serde_json::json!({
+            "name": n,
+            "description": format!("{n} does the {n} thing. It has a long story after that."),
+            "parameters": { "type": "object", "properties": {
+                "wallet": { "type": "string", "description": "x".repeat(2000) } },
+                "required": ["wallet"] },
+        });
+        let mut v = serde_json::json!({
+            "builtin": ["wait"],
+            "mcp": [{ "url": "https://mcp.example", "discover": false, "handshake": false,
+                      "group": "enclave", "defer": true,
+                      "tools": [big("plan_deploy"), big("build_fund")] }]
+        });
+        if let Some(o) = extra.as_object() {
+            for (k, x) in o {
+                v[k] = x.clone();
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The point of `defer`: a big server costs one line per tool in the
+    /// prompt, and its signatures arrive only when the model asks.
+    #[test]
+    fn a_deferred_server_is_one_line_per_tool_until_loaded() {
+        let cfg = deferred_cfg(serde_json::json!({}));
+        let mut reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.notes.is_empty(), "{:?}", reg.notes);
+        let names: Vec<&str> = reg.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["wait", "plan_deploy", "build_fund", LOAD_TOOLS, COMPACT_TOOL]);
+        let block = system_block(&reg.tools, &Budget::calls(8));
+        // listed by name and first sentence, never by schema
+        assert!(block.contains("- plan_deploy: plan_deploy does the plan_deploy thing.\n"), "{block}");
+        assert!(!block.contains("xxxxxxxx"), "a deferred schema leaked into the prompt");
+        assert!(!block.contains("\"name\":\"plan_deploy\""), "{block}");
+        // the loader and the undeferred tools are in <tools> as ever
+        assert!(block.contains(&format!("\"name\":\"{LOAD_TOOLS}\"")), "{block}");
+        assert!(block.contains("\"name\":\"wait\""), "{block}");
+        assert!(block.len() < 4000, "the block is {} chars", block.len());
+
+        let call = |reg: &mut Registry, args: serde_json::Value| {
+            super::call(reg, &cfg, Builtins::default(), LOAD_TOOLS, &args, &[], || 0, &|_| {})
+        };
+        let r = call(&mut reg, serde_json::json!({"names": ["plan_deploy", "wait", "nope"]}));
+        assert!(!r.is_error, "{}", r.text);
+        // whole, in the <tools> form, not cut to the deployment's max_chars
+        assert!(r.text.starts_with("<tools>\n{"), "{}", r.text);
+        assert!(r.text.contains(&"x".repeat(2000)), "the schema arrived whole");
+        assert!(!r.text.contains("\"name\":\"build_fund\""), "only what was asked for");
+        assert!(r.text.contains("Already in <tools> above: wait."), "{}", r.text);
+        assert!(r.text.contains("No function by these names: nope."), "{}", r.text);
+        // one name as a bare string is the model meaning that one
+        let r = call(&mut reg, serde_json::json!({"names": "build_fund"}));
+        assert!(r.text.contains("\"name\":\"build_fund\""), "{}", r.text);
+        // nothing loadable: an error that says what can be loaded
+        let r = call(&mut reg, serde_json::json!({"names": ["nope"]}));
+        assert!(r.is_error);
+        assert!(r.text.contains("plan_deploy, build_fund"), "{}", r.text);
+        let r = call(&mut reg, serde_json::json!({}));
+        assert!(r.is_error && r.text.contains("needs `names`"), "{}", r.text);
+        // and a deferred tool was callable all along: loading is not a gate
+        assert!(matches!(reg.find("plan_deploy").unwrap().src, ToolSrc::Mcp { .. }));
+    }
+
+    /// A result stops at the last WHOLE signature that fits; the rest are
+    /// named for a second call rather than cut mid-schema.
+    #[test]
+    fn a_full_load_names_what_it_left_out() {
+        let many: Vec<serde_json::Value> = (0..20).map(|i| serde_json::json!({
+            "name": format!("t{i}"), "description": "d",
+            "parameters": { "type": "object", "properties": {
+                "a": { "type": "string", "description": "y".repeat(3000) } } },
+        })).collect();
+        let cfg = deferred_cfg(serde_json::json!({
+            "mcp": [{ "url": "https://mcp.example", "discover": false, "defer": true, "tools": many }]
+        }));
+        let mut reg = build(&cfg, Builtins::default(), &|_| {});
+        let names: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
+        let r = super::call(&mut reg, &cfg, Builtins::default(), LOAD_TOOLS,
+                            &serde_json::json!({ "names": names }), &[], || 0, &|_| {});
+        assert!(!r.is_error, "{}", r.text);
+        assert!(r.text.contains("\"name\":\"t0\""), "{}", r.text);
+        assert!(r.text.contains("Not loaded, this result is full: "), "{}", r.text);
+        assert!(r.text.contains("t19"), "the last is named for a second call");
+        // every loaded signature is valid JSON on its own line
+        let body = r.text.split("</tools>").next().unwrap().trim_start_matches("<tools>\n");
+        for line in body.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("a whole signature");
+        }
+    }
+
+    /// One tool can defer itself through its declaration (or a server's
+    /// `_meta`) without the whole server deferring; with nothing deferred
+    /// there is no loader to read past.
+    #[test]
+    fn defer_is_per_tool_and_the_loader_only_exists_when_needed() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://mcp.example", "discover": false, "tools": [
+                { "name": "small", "description": "s" },
+                { "name": "huge", "description": "h", "defer": true },
+            ] }]
+        }))
+        .unwrap();
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(!reg.find("small").unwrap().meta.defer);
+        assert!(reg.find("huge").unwrap().meta.defer);
+        assert!(reg.find(LOAD_TOOLS).is_some());
+        let plain: ToolsConfig = serde_json::from_value(serde_json::json!({
+            "mcp": [{ "url": "https://mcp.example", "discover": false,
+                      "tools": [{ "name": "small", "description": "s" }] }]
+        }))
+        .unwrap();
+        let reg = build(&plain, Builtins::default(), &|_| {});
+        assert!(reg.find(LOAD_TOOLS).is_none());
+        assert!(!system_block(&reg.tools, &Budget::calls(3)).contains("More functions"));
+    }
+
+    /// A configured tool that already owns the name leaves nothing to load
+    /// with, so the deferred tools are shown in full: costly, never broken.
+    #[test]
+    fn a_taken_loader_name_shows_everything_in_full() {
+        let cfg = deferred_cfg(serde_json::json!({
+            "http": [{ "name": LOAD_TOOLS, "description": "mine", "url": "https://x.example/" }]
+        }));
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        assert!(reg.tools.iter().all(|t| !t.meta.defer));
+        assert!(reg.notes.iter().any(|n| n.contains("shown in full")), "{:?}", reg.notes);
+        assert!(system_block(&reg.tools, &Budget::calls(3)).contains("\"name\":\"plan_deploy\""));
+    }
+
+    /// A deferred tool called unloaded and refused gets its signature in
+    /// the refusal; a success is left alone.
+    #[test]
+    fn a_refused_deferred_call_carries_its_signature() {
+        let cfg = deferred_cfg(serde_json::json!({}));
+        let reg = build(&cfg, Builtins::default(), &|_| {});
+        let t = reg.find("plan_deploy").unwrap();
+        let res = |is_error: bool| ToolResult {
+            text: "missing required argument: app".into(),
+            is_error,
+            ms: 0,
+            sources: Vec::new(),
+            image: None,
+            seen: None,
+        };
+        let r = with_signature(res(true), t);
+        assert!(r.text.starts_with("missing required argument: app\n\nThe signature of plan_deploy"));
+        assert!(r.text.contains("\"required\":[\"wallet\"]"), "{}", r.text);
+        assert_eq!(with_signature(res(false), t).text, "missing required argument: app");
+    }
+
+    #[test]
+    fn a_summary_is_the_first_sentence_on_one_line() {
+        assert_eq!(summary("Lists apps.\nThen more."), "Lists apps.");
+        // a stop with no space after it is not a sentence end
+        assert_eq!(summary("Uses ledger v1.2 today. More."), "Uses ledger v1.2 today.");
+        assert_eq!(summary("no stop at all"), "no stop at all");
+        let long = summary(&"word ".repeat(40));
+        assert!(long.ends_with("...") && long.chars().count() <= DEFER_SUMMARY_CHARS, "{long}");
+    }
+
     /// The detector's whole job is to be narrow: an unfilled slot is caught,
     /// and a real value that merely READS like one is not, because the cost of
     /// a false positive is a wasted generation on every turn that asks about
@@ -4209,8 +5247,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "provider": "exa" })).unwrap();
         let b = Builtins { search: Some(&scfg), ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
-        assert_eq!(reg.tools.len(), 1);
-        assert!(matches!(reg.tools[0].src, ToolSrc::Builtin(_)));
+        assert_eq!(reg.tools.len(), 2, "web_search, then compact");
+        assert!(matches!(reg.tools[0].src, ToolSrc::Builtin(Builtin::WebSearch)));
         assert_eq!(reg.notes.len(), 1);
     }
 
@@ -4308,6 +5346,7 @@ mod tests {
             next_id: 1,
             handshake,
             opened: !handshake,
+            sessions: false,
         }
     }
 
@@ -4375,6 +5414,80 @@ mod tests {
     /// An MCP image result is a picture for the CLIENT, not thousands of
     /// tokens of base64 in the prompt; the model gets the same note an http
     /// image entry earns, and citation rows come off structuredContent.
+    /// result.see: the picture is decoded for the MODEL, cut out of the text
+    /// it reads, and validated; result.image stays the client's.
+    #[test]
+    fn a_see_result_is_a_picture_for_the_model_not_text() {
+        let png_b64 = "iVBORw0KGgoAAAABAgM="; // \x89PNG\r\n\x1a\n + 3 bytes
+        let pc: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "computer", "url": "https://rb/computer", "method": "POST",
+            "result": { "see": "image" }
+        }))
+        .unwrap();
+        assert!(pc.sees() && !pc.makes_image());
+        assert_eq!(ToolMeta::of_http(&pc, "virtual_machine").result.as_deref(), Some("see"));
+        let body = serde_json::json!({ "ok": true, "did": "clicked", "image": png_b64, "screen": {"width": 960} });
+        let (mut img, mut seen) = (None, None);
+        let text = map_result(&pc, body.to_string(), &serde_json::json!({}), &mut img, &mut seen).unwrap();
+        assert!(img.is_none(), "nothing goes to the client");
+        assert_eq!(&seen.as_ref().unwrap()[..4], &[0x89, b'P', b'N', b'G']);
+        let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(j.get("image").is_none(), "the base64 is cut out of what the model reads: {text}");
+        assert_eq!(j["did"], "clicked");
+        assert_eq!(j["screen"]["width"], 960);
+        // a data URI works too, and a nested path is cut where it was
+        let nested: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "n", "url": "https://rb/x", "result": { "see": "shot.data" }
+        }))
+        .unwrap();
+        let body = serde_json::json!({ "shot": { "data": format!("data:image/png;base64,{png_b64}"), "w": 3 } });
+        let mut seen = None;
+        let text = map_result(&nested, body.to_string(), &serde_json::json!({}), &mut None, &mut seen).unwrap();
+        assert!(seen.is_some());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), serde_json::json!({ "shot": { "w": 3 } }));
+        // a text path still picks the field
+        let picked: HttpTool = serde_json::from_value(serde_json::json!({
+            "name": "p", "url": "https://rb/x", "result": { "see": "image", "text": "did" }
+        }))
+        .unwrap();
+        let body = serde_json::json!({ "did": "typed 5 characters", "image": png_b64 });
+        let text = map_result(&picked, body.to_string(), &serde_json::json!({}), &mut None, &mut None).unwrap();
+        assert_eq!(text, "typed 5 characters");
+        // no picture where the map says, or one that is not an image: an
+        // error naming the problem, never base64 handed to the model
+        let e = map_result(&pc, "{\"ok\":true}".into(), &serde_json::json!({}), &mut None, &mut None).unwrap_err();
+        assert!(e.contains("result.see path 'image'"), "{e}");
+        let e = map_result(&pc, "{\"image\":\"aGVsbG8=\"}".into(), &serde_json::json!({}), &mut None, &mut None)
+            .unwrap_err();
+        assert!(e.contains("cannot read"), "{e}");
+        // raw image bytes are checked the same way
+        assert!(seen_bytes([&[0xff, 0xd8, 0xff, 0xe0][..], &[0u8; 12]].concat()).is_ok());
+        assert!(seen_bytes(b"<html>".to_vec()).is_err());
+        assert!(seen_bytes(vec![0u8; MAX_SEEN_BYTES + 1]).is_err());
+    }
+
+    /// An MCP image part: the model's when the tool says "see" (or says
+    /// nothing and the model can look), the client's otherwise.
+    #[test]
+    fn an_mcp_image_part_goes_where_the_tool_says() {
+        let r = serde_json::json!({ "content": [
+            { "type": "text", "text": "clicked" },
+            { "type": "image", "data": "iVBORw0KGgoAAAABAgM=", "mimeType": "image/png" },
+        ]});
+        let none = serde_json::json!({});
+        let to_model = mcp_outcome(&r, &none, true);
+        assert!(to_model.image.is_none());
+        assert_eq!(&to_model.seen.as_ref().unwrap()[..4], &[0x89, b'P', b'N', b'G']);
+        assert_eq!(to_model.text, "clicked");
+        let to_client = mcp_outcome(&r, &none, false);
+        assert!(to_client.seen.is_none() && to_client.image.is_some());
+        assert!(to_client.text.contains("an image has been generated"), "{}", to_client.text);
+        // a part that is not an image is named, not fed to the encoder
+        let bad = serde_json::json!({ "content": [{ "type": "image", "data": "aGVsbG8=" }]});
+        let o = mcp_outcome(&bad, &none, true);
+        assert!(o.seen.is_none() && o.text.contains("could not be read"), "{}", o.text);
+    }
+
     #[test]
     fn an_image_result_reaches_the_client() {
         let call = serde_json::json!({ "content": [
@@ -4391,6 +5504,7 @@ mod tests {
             images: &[],
             timeout_s: 20,
             max_bytes: 1024,
+            see: false,
         };
         let mut sources = Vec::new();
         let mut image = None;
@@ -4400,6 +5514,7 @@ mod tests {
             &serde_json::json!({ "prompt": "a cat" }),
             &mut sources,
             &mut image,
+            &mut None,
             &mut fake.transport(),
         )
         .unwrap();
@@ -4421,10 +5536,10 @@ mod tests {
             ]},
         })]);
         let meta = ToolMeta::default();
-        let c = McpCall { name: "search", remote: "search", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024 };
+        let c = McpCall { name: "search", remote: "search", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024, see: false };
         let mut sources = Vec::new();
         let mut image = None;
-        let text = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut sources, &mut image, &mut fake.transport()).unwrap();
+        let text = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut sources, &mut image, &mut None, &mut fake.transport()).unwrap();
         assert_eq!(text, "two hits");
         assert_eq!(
             sources,
@@ -4450,6 +5565,7 @@ mod tests {
             images: std::slice::from_ref(&png),
             timeout_s: 20,
             max_bytes: 1024,
+            see: false,
         };
         let mut sources = Vec::new();
         let mut image = None;
@@ -4459,6 +5575,7 @@ mod tests {
             &serde_json::json!({ "question": "what is this?", "image": "the model's guess" }),
             &mut sources,
             &mut image,
+            &mut None,
             &mut fake.transport(),
         )
         .unwrap();
@@ -4469,8 +5586,8 @@ mod tests {
         // a tool that does NOT take pictures is not handed them
         let mut fake = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
         let meta = ToolMeta::default();
-        let c = McpCall { name: "n", remote: "n", meta: &meta, images: std::slice::from_ref(&png), timeout_s: 20, max_bytes: 1024 };
-        call_mcp(&mut sess, &c, &serde_json::json!({ "q": 1 }), &mut Vec::new(), &mut None, &mut fake.transport()).unwrap();
+        let c = McpCall { name: "n", remote: "n", meta: &meta, images: std::slice::from_ref(&png), timeout_s: 20, max_bytes: 1024, see: false };
+        call_mcp(&mut sess, &c, &serde_json::json!({ "q": 1 }), &mut Vec::new(), &mut None, &mut None, &mut fake.transport()).unwrap();
         assert_eq!(fake.sent[0].1["params"]["arguments"], serde_json::json!({ "q": 1 }));
     }
 
@@ -4484,13 +5601,13 @@ mod tests {
         fake.session = Some("s-1".into());
         let mut sess = session(false);
         let meta = ToolMeta::default();
-        let c = McpCall { name: "a", remote: "a", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024 };
-        let e = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut fake.transport())
+        let c = McpCall { name: "a", remote: "a", meta: &meta, images: &[], timeout_s: 20, max_bytes: 1024, see: false };
+        let e = call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut None, &mut fake.transport())
             .unwrap_err();
         assert_eq!(e, "the endpoint said no");
         assert_eq!(sess.session_id.as_deref(), Some("s-1"));
         let mut fake2 = FakeServer::new(vec![serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })]);
-        call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut fake2.transport()).unwrap();
+        call_mcp(&mut sess, &c, &serde_json::json!({}), &mut Vec::new(), &mut None, &mut None, &mut fake2.transport()).unwrap();
         assert!(fake2.sent[0].2.iter().any(|(k, v)| k == "mcp-session-id" && v == "s-1"));
     }
 
@@ -4548,7 +5665,7 @@ mod tests {
         .unwrap();
         // no pictures this turn: neither picture tool is offered
         let reg = build(&cfg, Builtins { user: Some("0xabc"), ..Default::default() }, &|_| {});
-        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read"]);
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", COMPACT_TOOL]);
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
         assert_eq!(reg.mcp[0].headers, vec![("x-user".to_string(), "0xabc".to_string())]);
         // with pictures, both; the reader and the transformer are told apart
@@ -4559,7 +5676,7 @@ mod tests {
         // a model that reads pictures itself keeps the transformer only
         let b = Builtins { user: Some("0xabc"), images_present: true, images_local: true, ..Default::default() };
         let reg = build(&cfg, b, &|_| {});
-        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", "upscale_image"]);
+        assert_eq!(reg.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["notes_read", "upscale_image", COMPACT_TOOL]);
         // a switched-off group withholds its tools, and the whole server
         // is not dialled when every group is off
         let off = ["notes".to_string(), "images".to_string()];
@@ -4743,12 +5860,12 @@ mod tests {
         let r = serde_json::json!({ "content": [
             { "type": "resource", "resource": { "uri": "file:///x.md", "mimeType": "text/markdown", "text": "the answer" } }
         ]});
-        assert_eq!(mcp_outcome(&r, &none).text, "the answer");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "the answer");
         // a binary resource has no text to read, and says so
         let r = serde_json::json!({ "content": [
             { "type": "resource", "resource": { "uri": "file:///x.bin", "blob": "AAAA" } }
         ]});
-        assert_eq!(mcp_outcome(&r, &none).text, "[binary resource omitted]");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "[binary resource omitted]");
     }
 
     /// The per-tool group gate is load-bearing: a switched-off group must
@@ -4770,7 +5887,8 @@ mod tests {
         .unwrap();
         let armed = |off: &[String]| -> Vec<String> {
             let b = Builtins { off, ..Default::default() };
-            build(&cfg, b, &|_| {}).tools.iter().map(|t| t.name.clone()).collect()
+            build(&cfg, b, &|_| {}).tools.iter().map(|t| t.name.clone())
+                .filter(|n| n != COMPACT_TOOL).collect()
         };
         assert_eq!(armed(&[]), vec!["notes_read".to_string(), "run_vm_command".to_string()]);
         assert_eq!(armed(&["notes".to_string()]), vec!["run_vm_command".to_string()]);
@@ -4789,12 +5907,12 @@ mod tests {
     fn mcp_content_renders_text_and_names_the_rest() {
         let none = serde_json::json!({});
         let r = serde_json::json!({"content":[{"type":"text","text":"hello"},{"type":"audio","data":"…"}]});
-        assert_eq!(mcp_outcome(&r, &none).text, "hello\n[audio content omitted]");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "hello\n[audio content omitted]");
         let r = serde_json::json!({"content":[],"structuredContent":{"n":1}});
-        assert_eq!(mcp_outcome(&r, &none).text, "{\"n\":1}");
+        assert_eq!(mcp_outcome(&r, &none, false).text, "{\"n\":1}");
         // a server that hands a data URI where the spec says bare base64
         let r = serde_json::json!({"content":[{"type":"image","data":"data:image/gif;base64,ZZ"}]});
-        assert_eq!(mcp_outcome(&r, &none).image, Some(("image/gif".to_string(), "ZZ".to_string())));
+        assert_eq!(mcp_outcome(&r, &none, false).image, Some(("image/gif".to_string(), "ZZ".to_string())));
     }
 
 
@@ -4829,7 +5947,7 @@ mod tests {
         assert!(reg.find("wait").is_some(), "{:?}", reg.notes);
         assert!(reg.find("web_search").is_none());
         assert!(reg.notes.is_empty(), "{:?}", reg.notes);
-        assert_eq!(cfg.http_names(), vec!["wait".to_string(), "web_search".to_string()]);
+        assert_eq!(cfg.http_names(), vec!["wait".to_string(), "web_search".to_string(), COMPACT_TOOL.to_string()]);
         // the budget fields have their defaults without being written
         assert_eq!(cfg.max_seconds, 3600);
         assert_eq!(cfg.wait_max_s, 600);
@@ -4870,13 +5988,13 @@ mod tests {
         }))
         .unwrap();
         let b = cfg.budget(None);
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 60 });
         assert!(cfg.budget(Some(&serde_json::json!(true))).persist);
         assert!(!cfg.budget(Some(&serde_json::json!(false))).persist);
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 8, "max_seconds": 600 })));
-        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        assert_eq!(b, Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 60 });
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 999, "max_seconds": 99999, "persist": false })));
-        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        assert_eq!(b, Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 60 });
         // zero is not a budget: the loop would refuse its first call
         let b = cfg.budget(Some(&serde_json::json!({ "max_calls": 0, "max_seconds": 0 })));
         assert_eq!((b.max_calls, b.max_seconds), (1, 1));
@@ -4929,7 +6047,7 @@ mod tests {
         assert_eq!(b.max_agents, 0);
         // the persisting rules point at it when it is there
         let with = vec![tool("run_tests"), tool(AGENT_TOOL)];
-        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: false, verify: None });
+        let rules = system_block(&with, &Budget { max_calls: 8, max_seconds: 600, persist: true, max_agents: 4, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(rules.contains("spawn_agent"), "{rules}");
     }
 
@@ -4938,28 +6056,55 @@ mod tests {
     #[test]
     fn the_rules_follow_the_budget() {
         let list = vec![tool("run_tests")];
-        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        let quick = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: false, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(quick.contains("at most 32 calls"), "{quick}");
         assert!(quick.contains("30 minutes of wall-clock time"), "{quick}");
         assert!(quick.contains("stop calling and write the answer"), "{quick}");
         assert!(!quick.contains("WORKING TO A CHECK"), "{quick}");
-        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        let persist = system_block(&list, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(persist.contains("WORKING TO A CHECK"), "{persist}");
         assert!(persist.contains("keep going until the check passes"), "{persist}");
         assert!(!persist.contains("call wait"), "{persist}");
         let with_wait = vec![tool("run_tests"), tool("wait")];
-        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None });
+        let persist = system_block(&with_wait, &Budget { max_calls: 32, max_seconds: 1800, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 });
         assert!(persist.contains("call wait rather than polling"), "{persist}");
         // the merged block (client tools beside ours) carries the same rule
-        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: false, verify: None }, None);
-        assert!(merged.contains("at most 4 of them"), "{merged}");
-        assert!(merged.contains("within 2 minutes"), "{merged}");
+        let merged = merged_system_block(&with_wait, &Budget { max_calls: 4, max_seconds: 120, persist: true, max_agents: 0, max_agent_depth: 3, ledger: Ledger::Off, verify: None, max_failed: 5, max_repeats: 3, cooldown_s: 0 }, None);
+        assert!(merged.contains("this server runs: You may make at most 4 calls"), "{merged}");
+        assert!(merged.contains("has 2 minutes of wall-clock time"), "{merged}");
+        assert!(merged.contains("After 5 failed calls in a row"), "{merged}");
         assert!(merged.contains("WORKING TO A CHECK"), "{merged}");
     }
 
+    /// A command runner answers HTTP 200 for a command that failed, so the
+    /// body is what says it: a non-zero exit code or `"ok": false`, at the
+    /// top level only, and still read when the result was cut short.
+    #[test]
+    fn a_failing_command_is_read_from_its_body() {
+        assert!(!reports_failure(r#"{"ok":true,"exitCode":0,"output":"x"}"#));
+        assert!(reports_failure(r#"{"ok":true,"exitCode":132,"output":"Illegal instruction"}"#));
+        assert!(reports_failure(r#"{"ok":false,"error":"timed out after 30 s","output":""}"#));
+        assert!(reports_failure(r#"{"exit_code": 2, "stdout": ""}"#));
+        assert!(reports_failure(r#" {"exit": -1}"#));
+        // a command that printed such JSON did not itself fail
+        assert!(!reports_failure(r#"{"ok":true,"exitCode":0,"output":"{\"exitCode\":1,\"ok\":false}"}"#));
+        // cut at max_chars: still read from the head
+        let cut = |code: i32| format!("{{\"ok\":true,\"exitCode\":{code},\"output\":\"{}\n[truncated at 6000 characters]", "x".repeat(50));
+        assert!(reports_failure(&cut(1)));
+        assert!(!reports_failure(&cut(0)));
+        assert!(reports_failure("{\"ok\":false,\"error\":\"tim\n[truncated at 6000 characters]"));
+        // not JSON, or JSON without the fields: not a failure
+        assert!(!reports_failure("Linux riscv64 6.1"));
+        assert!(!reports_failure(r#"{"error":"something"#));
+        assert!(!reports_failure(r#"{"status":"running"}"#));
+        assert!(!reports_failure("[1, 2]"));
+        assert!(!reports_failure(""));
+    }
+
     /// Ledger mode and the verify gate ride the budget: the config sets
-    /// them, a request may set the ledger either way and name or waive the
-    /// check, and neither survives a loop that does not persist.
+    /// them, a request may set the ledger any way and name or waive the
+    /// check, and neither survives a loop that does not persist. `true` is
+    /// the check-triggered ledger; `"always"` is the 0.58 one.
     #[test]
     fn the_ledger_and_the_check_follow_the_budget() {
         let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({
@@ -4968,26 +6113,53 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.ledger_chars, 2400);
+        assert_eq!(cfg.ledger, Ledger::Checks);
         // not persisting: neither applies
         let b = cfg.budget(None);
-        assert!(!b.ledger);
+        assert_eq!(b.ledger, Ledger::Off);
         assert_eq!(b.verify, None);
         let b = cfg.budget(Some(&serde_json::json!(true)));
-        assert!(b.ledger);
+        assert_eq!(b.ledger, Ledger::Checks);
         assert_eq!(b.verify.as_deref(), Some("run_tests"));
         let b = cfg.budget(Some(&serde_json::json!({ "ledger": false, "verify": false })));
-        assert!(b.persist && !b.ledger && b.verify.is_none());
+        assert!(b.persist && b.ledger == Ledger::Off && b.verify.is_none());
+        let b = cfg.budget(Some(&serde_json::json!({ "ledger": "always" })));
+        assert_eq!(b.ledger, Ledger::Always);
+        // an unreadable request value leaves the deployment's choice alone
+        let b = cfg.budget(Some(&serde_json::json!({ "ledger": "sometimes" })));
+        assert_eq!(b.ledger, Ledger::Checks);
         let b = cfg.budget(Some(&serde_json::json!({ "verify": "make_check" })));
         assert_eq!(b.verify.as_deref(), Some("make_check"));
         // a deployment without either may still be asked for the ledger
         let plain: ToolsConfig = serde_json::from_value(serde_json::json!({ "max_calls": 4 })).unwrap();
-        assert!(plain.budget(Some(&serde_json::json!({ "ledger": true }))).ledger);
-        assert!(!plain.budget(Some(&serde_json::json!({ "ledger": true, "persist": false }))).ledger);
+        assert_eq!(plain.ledger, Ledger::Off);
+        assert_eq!(plain.budget(Some(&serde_json::json!({ "ledger": true }))).ledger, Ledger::Checks);
+        assert_eq!(plain.budget(Some(&serde_json::json!({ "ledger": true, "persist": false }))).ledger, Ledger::Off);
+        // every written form in a config, and a typo refused rather than guessed
+        for (v, want) in [
+            (serde_json::json!(false), Ledger::Off),
+            (serde_json::json!("off"), Ledger::Off),
+            (serde_json::json!("Checks"), Ledger::Checks),
+            (serde_json::json!(" always "), Ledger::Always),
+        ] {
+            let c: ToolsConfig = serde_json::from_value(serde_json::json!({ "ledger": v })).unwrap();
+            assert_eq!(c.ledger, want, "{v}");
+        }
+        assert!(serde_json::from_value::<ToolsConfig>(serde_json::json!({ "ledger": "alway" })).is_err());
+        assert!(serde_json::from_value::<ToolsConfig>(serde_json::json!({ "ledger": 1 })).is_err());
+        assert_eq!(Ledger::Off.json(), serde_json::json!(false));
+        assert_eq!(Ledger::Checks.json(), serde_json::json!("checks"));
+        assert_eq!(Ledger::Always.json(), serde_json::json!("always"));
         // the rules name the check only when the tool is really offered,
-        // and describe the ledger only in ledger mode
+        // and describe the ledger up front only when it runs from the first
+        // step: the check-triggered one is introduced when it switches on,
+        // so until then the rules are the plain loop's, byte for byte
         let list = vec![tool("run_tests")];
         let rules = system_block(&list, &cfg.budget(Some(&serde_json::json!(true))));
         assert!(rules.contains("CHECKED by `run_tests`"), "{rules}");
+        assert!(!rules.contains("THE LEDGER"), "{rules}");
+        assert_eq!(rules, system_block(&list, &cfg.budget(Some(&serde_json::json!({ "ledger": false })))));
+        let rules = system_block(&list, &cfg.budget(Some(&serde_json::json!({ "ledger": "always" }))));
         assert!(rules.contains("THE LEDGER"), "{rules}");
         assert!(rules.contains("### LEDGER"), "{rules}");
         assert!(rules.contains("genuinely different ways"), "{rules}");
@@ -5128,6 +6300,7 @@ mod tests {
             next_id: 1,
             handshake: s.handshake,
             opened: !s.handshake,
+            sessions: s.sessions_on(),
         };
 
         // ONE round trip, because the adapter needs no handshake
@@ -5169,10 +6342,11 @@ mod tests {
                 images,
                 timeout_s: 30,
                 max_bytes: 12 * 1024 * 1024,
+                see: false,
             };
             let mut sources = Vec::new();
             let mut image = None;
-            let r = call_mcp(sess, &c, &args, &mut sources, &mut image, &mut tcp_request);
+            let r = call_mcp(sess, &c, &args, &mut sources, &mut image, &mut None, &mut tcp_request);
             (r, sources, image)
         };
 
@@ -5257,5 +6431,264 @@ mod identity_tests {
         let mut plain = BTreeMap::new();
         plain.insert("x-note".to_string(), "for $user only".to_string());
         assert_eq!(identity_headers(&plain, None, "t").unwrap()["x-note"], "for $user only");
+    }
+}
+
+/// A chat's Enclave session on the MCP call path (see crate::session):
+/// which calls take it, what is sent, what the model gets back.
+#[cfg(test)]
+mod chat_session_tests {
+    use super::*;
+    use crate::session::tests::{test_session, unhex, D, DIGEST, SID, VAULT};
+    use crate::session::{EXECUTED_NOTE, NO_SESSION_NOTE};
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+
+    /// A scripted server: each request is recorded and answered from the
+    /// queue, `Err` standing for a transport failure.
+    struct Script {
+        sent: Vec<serde_json::Value>,
+        replies: Vec<Result<serde_json::Value, String>>,
+    }
+
+    impl Script {
+        fn new(replies: Vec<Result<serde_json::Value, String>>) -> Script {
+            Script { sent: Vec::new(), replies }
+        }
+
+        fn transport<'a>(&'a mut self) -> impl FnMut(HttpReq<'_>) -> Result<http::Response, String> + 'a {
+            move |req: HttpReq<'_>| {
+                let body: serde_json::Value = serde_json::from_slice(req.body.unwrap_or(b"{}")).unwrap();
+                self.sent.push(body.clone());
+                let result = self.replies.remove(0)?;
+                let msg = serde_json::json!({ "jsonrpc": "2.0", "id": body["id"], "result": result });
+                Ok(http::Response {
+                    status: 200,
+                    body: msg.to_string().into_bytes(),
+                    location: None,
+                    ctype: None,
+                    headers: Vec::new(),
+                    truncated: false,
+                })
+            }
+        }
+
+        /// (tool name, arguments) of the nth request
+        fn call(&self, n: usize) -> (&str, &serde_json::Value) {
+            let p = &self.sent[n]["params"];
+            (p["name"].as_str().unwrap(), &p["arguments"])
+        }
+    }
+
+    /// A tools/call result the way mcp.enclave.host writes one: the JSON as
+    /// text AND as structuredContent.
+    fn mcp_json(o: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "content": [{ "type": "text", "text": o.to_string() }], "structuredContent": o })
+    }
+
+    fn mcp_error(text: &str) -> serde_json::Value {
+        serde_json::json!({ "content": [{ "type": "text", "text": text }], "isError": true })
+    }
+
+    fn digest2() -> String {
+        format!("0x{}", "11".repeat(32))
+    }
+
+    fn session_answer(vault: &str) -> serde_json::Value {
+        mcp_json(serde_json::json!({
+            "via": "session", "vault": vault, "sid": SID, "owner": "0x0b2d009c0c9af05b12100d77f3c815fea822ee61",
+            "app": "hello-world", "environment": "prod",
+            "calls": [
+                { "action": 0, "actionName": "deploy.create", "describe": "create", "nonce": "7", "fee": "12500",
+                  "deadline": "1791000000", "args": "0xc0ffee", "digest": DIGEST, "digestSha256": "0xaa" },
+                { "action": 1, "actionName": "deploy.fund", "describe": "fund", "nonce": "8", "fee": "12500",
+                  "deadline": "1791000000", "args": "0xbeef", "digest": digest2(), "digestSha256": "0xbb" },
+            ],
+            "sign": "For each call: ECDSA P-256 ...", "next": "session_execute { ... }",
+        }))
+    }
+
+    fn plan_deploy() -> (ToolMeta, McpSession) {
+        let sess = McpSession {
+            url: "https://mcp.enclave.host".into(),
+            headers: Vec::new(),
+            session_id: None,
+            version: MCP_VERSION.into(),
+            timeout_s: 30,
+            next_id: 1,
+            handshake: false,
+            opened: true,
+            sessions: true,
+        };
+        (ToolMeta::default(), sess)
+    }
+
+    fn call<'a>(meta: &'a ToolMeta, remote: &'a str) -> McpCall<'a> {
+        McpCall { name: remote, remote, meta, images: &[], timeout_s: 30, max_bytes: 1 << 20, see: false }
+    }
+
+    fn run(
+        sess: &mut McpSession,
+        c: &McpCall,
+        args: serde_json::Value,
+        session: Option<&crate::session::ChatSession>,
+        script: &mut Script,
+    ) -> Result<String, String> {
+        call_mcp_session(sess, c, &args, session, &mut Vec::new(), &mut None, &mut None, &mut script.transport())
+    }
+
+    #[test]
+    fn a_builder_is_signed_and_executed_through_the_chats_session() {
+        let s = test_session();
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "plan_deploy");
+        let mut script = Script::new(vec![
+            Ok(session_answer("0xB794C4DD00000000000000000000000000000345")),
+            Ok(mcp_json(serde_json::json!({
+                "executed": [
+                    { "call": 0, "action": "deploy.create", "txHash": "0xt1", "block": "5", "result": "0x9eb4" },
+                    { "call": 1, "action": "deploy.fund", "txHash": "0xt2", "block": "6", "result": "0x" },
+                ],
+                "createdId": "0x9eb4", "next": "claim_hint { id: createdId }, then get_deployment until running",
+            }))),
+        ]);
+        let text = run(&mut sess, &c, serde_json::json!({ "app": "hello-world", "fundUsd": 2 }), Some(&s), &mut script)
+            .unwrap();
+
+        // 1: the builder, with the session added beside the model's arguments
+        let (name, args) = script.call(0);
+        assert_eq!(name, "plan_deploy");
+        assert_eq!(args["app"], "hello-world");
+        assert_eq!(args["fundUsd"], 2);
+        assert_eq!(args["session"], serde_json::json!({ "vault": VAULT.to_ascii_lowercase(), "sid": SID }));
+
+        // 2: session_execute on the same server, every call signed
+        let (name, x) = script.call(1);
+        assert_eq!(name, "session_execute");
+        assert_eq!(x["vault"], VAULT.to_ascii_lowercase());
+        assert_eq!(x["sid"], SID);
+        let pk = &x["publicKey"];
+        let point = [&[4u8][..], &unhex(pk["x"].as_str().unwrap()), &unhex(pk["y"].as_str().unwrap())].concat();
+        let vk = VerifyingKey::from_sec1_bytes(&point).unwrap();
+        let calls = x["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (c, digest, nonce, args) in [(&calls[0], DIGEST.to_string(), "7", "0xc0ffee"), (&calls[1], digest2(), "8", "0xbeef")] {
+            // each call goes back exactly as received, plus its signature
+            assert_eq!((c["nonce"].as_str(), c["args"].as_str(), c["fee"].as_str()), (Some(nonce), Some(args), Some("12500")));
+            let sig = unhex(c["signature"].as_str().unwrap());
+            assert_eq!(sig.len(), 64, "r || s");
+            vk.verify(&unhex(&digest), &Signature::from_slice(&sig).unwrap()).expect("the vault's P256VERIFY accepts it");
+        }
+        assert_eq!(script.sent.len(), 2);
+        // the private key went nowhere
+        for b in &script.sent {
+            assert!(!b.to_string().contains(D), "{b}");
+        }
+
+        // ONE result: the builder's facts and what was executed
+        let (first, rest) = text.split_once('\n').unwrap();
+        assert_eq!(first, EXECUTED_NOTE);
+        let j: serde_json::Value = serde_json::from_str(rest).unwrap();
+        assert_eq!(j["app"], "hello-world");
+        assert_eq!(j["createdId"], "0x9eb4");
+        assert_eq!(j["executed"][1]["txHash"], "0xt2");
+        assert!(j.get("calls").is_none() && j.get("sign").is_none(), "{j}");
+        assert!(!text.contains(DIGEST) && !text.contains(D), "{text}");
+    }
+
+    #[test]
+    fn the_models_own_session_is_never_replaced_or_signed_for() {
+        let s = test_session();
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "build_stop");
+        let theirs = serde_json::json!({ "vault": "0x0000000000000000000000000000000000000001", "sid": SID });
+        let mut script = Script::new(vec![Ok(session_answer("0x0000000000000000000000000000000000000001"))]);
+        let text = run(&mut sess, &c, serde_json::json!({ "id": "0x9e", "session": theirs }), Some(&s), &mut script).unwrap();
+        assert_eq!(script.call(0).1["session"], theirs);
+        assert_eq!(script.sent.len(), 1, "nothing signed, nothing executed");
+        assert!(text.contains("not this chat's Enclave session"), "{text}");
+    }
+
+    #[test]
+    fn without_a_session_the_result_says_why_nothing_was_sent() {
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "build_fund");
+        let wallet = mcp_json(serde_json::json!({ "id": "0x9e", "transactions": [{ "to": "0x1", "data": "0x" }] }));
+        let mut script = Script::new(vec![Ok(wallet)]);
+        let text = run(&mut sess, &c, serde_json::json!({ "id": "0x9e", "usd": 1 }), None, &mut script).unwrap();
+        assert!(script.call(0).1.get("session").is_none());
+        assert!(text.contains("\"transactions\"") && text.ends_with(NO_SESSION_NOTE), "{text}");
+        // a builder with nothing to do needs no session to say so
+        let idle = mcp_json(serde_json::json!({ "id": "0x9e", "note": "nothing to do", "transactions": [] }));
+        let mut script = Script::new(vec![Ok(idle)]);
+        let text = run(&mut sess, &c, serde_json::json!({ "id": "0x9e" }), None, &mut script).unwrap();
+        assert!(!text.contains(NO_SESSION_NOTE), "{text}");
+        // and the builder's own error is the result, unchanged
+        let mut script = Script::new(vec![Ok(mcp_error("Error: no such deployment"))]);
+        let e = run(&mut sess, &c, serde_json::json!({}), None, &mut script).unwrap_err();
+        assert_eq!(e, "Error: no such deployment");
+    }
+
+    #[test]
+    fn a_failed_execute_is_the_result_and_says_what_happened() {
+        let s = test_session();
+        let (meta, mut sess) = plan_deploy();
+        let c = call(&meta, "plan_deploy");
+        // the server refused one call: its words reach the model
+        let mut script = Script::new(vec![
+            Ok(session_answer(VAULT)),
+            Ok(mcp_error("Error: call 1 (deploy.fund) failed: over budget - 1 earlier call(s) went through: 0xt1")),
+        ]);
+        let e = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap_err();
+        assert!(e.contains("call 1 (deploy.fund) failed: over budget") && e.contains("0xt1"), "{e}");
+        // no answer at all: the calls may have gone through, so no blind retry
+        let mut script = Script::new(vec![Ok(session_answer(VAULT)), Err("timed out after 120s".into())]);
+        let e = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap_err();
+        assert!(e.contains("timed out after 120s") && e.contains("may still have been sent"), "{e}");
+        // the builder's own error: nothing signed, nothing sent after it
+        let mut script = Script::new(vec![Ok(mcp_error("Error: this session is not live"))]);
+        let e = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap_err();
+        assert_eq!(e, "Error: this session is not live");
+        assert_eq!(script.sent.len(), 1);
+        // "nothing to sign": the builder's answer as it is, no execute
+        let none = mcp_json(serde_json::json!({ "via": "session", "calls": [], "note": "nothing to sign" }));
+        let mut script = Script::new(vec![Ok(none)]);
+        let text = run(&mut sess, &c, serde_json::json!({ "app": "x" }), Some(&s), &mut script).unwrap();
+        assert!(text.contains("nothing to sign") && script.sent.len() == 1, "{text}");
+    }
+
+    /// Which servers and which tools take the path at all: mcp.enclave.host
+    /// by default, another server only when its entry says `sessions: true`,
+    /// and only the session-capable builders on either.
+    #[test]
+    fn only_the_builders_of_a_sessions_server_take_the_path() {
+        let cfg: ToolsConfig = serde_json::from_value(serde_json::json!({ "mcp": [
+            { "url": "https://mcp.enclave.host", "discover": false, "handshake": false,
+              "tools": [{ "name": "plan_deploy" }, { "name": "get_deployment" }] },
+            { "url": "https://tools.example/mcp", "discover": false, "prefix": "x_", "tools": [{ "name": "plan_deploy" }] },
+            { "url": "https://tools.example/mcp", "discover": false, "sessions": true, "prefix": "y_",
+              "tools": [{ "name": "build_stop" }] },
+            { "url": "https://mcp.enclave.host/", "discover": false, "sessions": false, "prefix": "z_",
+              "tools": [{ "name": "build_fund" }] },
+        ]}))
+        .unwrap();
+        let s = test_session();
+        let reg = build(&cfg, Builtins { user: Some("0xabc"), session: Some(&s), ..Default::default() }, &|_| {});
+        let on: Vec<bool> = reg.mcp.iter().map(|m| m.sessions).collect();
+        assert_eq!(on, [true, false, true, false]);
+        let route = |name: &str| match &reg.find(name).unwrap().src {
+            ToolSrc::Mcp { server, remote } => reg.mcp[*server].acts_through_sessions(remote),
+            _ => unreachable!(),
+        };
+        assert!(route("plan_deploy"));
+        assert!(!route("get_deployment"), "not a builder");
+        assert!(!route("x_plan_deploy"), "another server, not opted in");
+        assert!(route("y_build_stop"), "another server that opted in");
+        assert!(!route("z_build_fund"), "mcp.enclave.host opted out");
+        // and nothing about the session reaches the prompt: the same block
+        // with or without one, so every chat shares the parked prefix
+        let without = build(&cfg, Builtins { user: Some("0xabc"), ..Default::default() }, &|_| {});
+        let b = Budget::calls(8);
+        assert_eq!(system_block(&reg.tools, &b), system_block(&without.tools, &b));
     }
 }

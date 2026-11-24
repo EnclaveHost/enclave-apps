@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex" />
+<title>Back to the app</title>
+<style>
+  html { color-scheme: dark light; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; text-align: center;
+         background: #0b0d12; color: #9aa3b2; padding: 24px; box-sizing: border-box;
+         font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  @media (prefers-color-scheme: light) { body { background: #f6f7f9; color: #4a5262; } }
+  .card { max-width: 360px; }
+  h1 { font-size: 18px; margin: 0 0 8px; color: inherit; }
+  a.btn { display: inline-block; margin-top: 16px; padding: 12px 22px; border-radius: 999px;
+          background: #2fe6a8; color: #07120d; font-weight: 600; text-decoration: none; }
+  p.small { font-size: 13px; opacity: .8; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="title">Signed in</h1>
+  <p id="msg">Tap below to go back to the app.</p>
+  <a class="btn" id="back" href="#">Return to the app</a>
+  <p class="small" id="note"></p>
+</div>
+<script>
+/* The mobile shell's sign-in landing pad, shown only when the browser did NOT
+   hand this URL to the app by itself. The app claims /sso-app as a verified
+   Android app link; browsers follow that claim for navigations the user
+   started, but a server redirect straight back (an already signed-in
+   enclave.host passes through without a tap) can stay in the tab. One tap on
+   a link to /sso-app/return is a user navigation, so the app opens and the
+   shell loads the token into the chat page, whose state check decides.
+   The token is never accepted here: the state that guards it lives in the
+   app, and this page is in the browser. */
+(function () {
+  var frag = location.hash || "";
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  var back = document.getElementById("back");
+  if (!/[#&]sso=/.test(frag)) {
+    document.getElementById("title").textContent = "Nothing to return";
+    document.getElementById("msg").textContent = "This page carries a sign-in back to the app. Start the sign-in from the app.";
+    back.style.display = "none";
+    return;
+  }
+  back.href = new URL("sso-app/return", new URL(".", location.href)).href + frag;
+  if (/\/sso-app\/return$/.test(location.pathname)) {
+    // the link above already went here once: the app did not take it
+    document.getElementById("title").textContent = "The app did not open";
+    document.getElementById("msg").textContent = "Is the app installed and up to date? Open it and sign in again from there.";
+    back.style.display = "none";
+  } else {
+    document.getElementById("note").textContent = "If nothing happens, open the app and sign in again.";
+  }
+})();
+</script>
+</body>
+</html>
