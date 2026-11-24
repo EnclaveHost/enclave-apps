@@ -95,12 +95,14 @@ def run(service, outer_limit):
                 assert control['ok'] and 'synthetic positive control' in control['text'], control
                 before = call(config['socket'], {'op': 'status'})
                 expected = min(8 << 20, outer_limit) if outer_limit >= 0 else 8 << 20
-                assert resource.prlimit(process.pid, resource.RLIMIT_FSIZE) == (expected, expected)
-                assert json.loads(witness.read_text()) == {'limits': [expected, expected]}
+                # the hard limit is what the executor may raise its own to, for its shared memory
+                ceiling = max(expected, min(1 << 30, outer_limit) if outer_limit >= 0 else 1 << 30)
+                assert resource.prlimit(process.pid, resource.RLIMIT_FSIZE) == (expected, ceiling)
+                assert json.loads(witness.read_text()) == {'limits': [expected, ceiling]}
                 failed = call(config['socket'], {**request, 'prompt': 'overflow'})
                 assert failed == {'ok': False, 'error': 'compute failed; no result released'}, failed
                 observed = json.loads(witness.read_text())
-                assert observed == {'limits': [expected, expected], 'bytesWritten': expected, 'errno': 27}, observed
+                assert observed == {'limits': [expected, ceiling], 'bytesWritten': expected, 'errno': 27}, observed
                 after = call(config['socket'], {'op': 'status'})
                 assert after['state'] == 'retired' and after['completed'] == before['completed'] == 1
                 assert after['telemetry'] == before['telemetry']

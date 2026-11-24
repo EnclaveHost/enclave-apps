@@ -132,13 +132,29 @@ def main():
             # The two pieces of the direct route that do not depend on the
             # guest's processors: blocking buffer reads and writes copied
             # straight from the CPU runtime's storage, and kernel arguments
-            # kept in the frontend for launches it takes itself. The mailbox,
-            # the pinned processors, arenas (which need the mailbox), three
-            # products in an exchange, file-backed buffers and device-side glue
-            # stay off unless the environment asks: opencl/Q8_DIRECT.md,
-            # "What the 0.6.12 candidate sets".
+            # kept in the frontend for launches it takes itself.
             driver += 'export SHIELD_OPENCL_DIRECT_BUFFERS="${SHIELD_OPENCL_DIRECT_BUFFERS:-1}"\n'
             driver += 'export SHIELD_OPENCL_LAZY_ARGS="${SHIELD_OPENCL_LAZY_ARGS:-1}"\n'
+            # The arithmetic between two products stays on the device, where
+            # the frontend computes it (the plugin carries
+            # llama-device-glue.patch). The plugin's fused norm kernel is not
+            # one the frontend computes, so norm and multiplication are asked
+            # for separately.
+            driver += 'export SHIELD_OPENCL_GLUE="${SHIELD_OPENCL_GLUE:-1}"\n'
+            driver += 'export GGML_SHIELD_DEVICE_GLUE="${GGML_SHIELD_DEVICE_GLUE:-add,mul,rms,glu}"\n'
+            driver += 'export GGML_OPENCL_DISABLE_FUSION="${GGML_OPENCL_DISABLE_FUSION:-1}"\n'
+            # The shared-memory pieces, as measured in opencl/Q8_DIRECT.md: a
+            # request passed through the session's mailbox, up to three
+            # products in an exchange, and arenas. Both ends of a mailbox wait
+            # by spinning, so they are for a guest with processors to spare;
+            # the service applies the same rule to its side (service.py). The
+            # two pinned processors stay with whoever knows the guest's
+            # topology, and file-backed buffers with whoever has a disk.
+            driver += ('if [ "$(nproc)" -ge 4 ]; then\n'
+                       '  export SHIELD_OPENCL_Q8_MAILBOX="${SHIELD_OPENCL_Q8_MAILBOX:-1}"\n'
+                       '  export SHIELD_OPENCL_Q8_TRIPLE="${SHIELD_OPENCL_Q8_TRIPLE:-1}"\n'
+                       '  export SHIELD_OPENCL_Q8_ARENA="${SHIELD_OPENCL_Q8_ARENA:-1}"\n'
+                       'fi\n')
         path.write_text('#!/bin/sh\nset -eu\n'
                         'export GGML_SHIELD_NATIVE_CPU_FALLBACK=1\n'
                         'export POCL_MAX_PTHREAD_COUNT="${POCL_MAX_PTHREAD_COUNT:-2}"\n'

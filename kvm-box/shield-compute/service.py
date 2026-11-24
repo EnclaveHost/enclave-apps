@@ -29,6 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 MAX_REQUEST = 8 << 20
 MAX_RESPONSE = 16 << 20
 MAX_NATIVE_FILE = 8 << 20
+# The largest file a child may ask for by raising its own limit, which only the Q8 executor does: its
+# session memory is a memfd of four 64 MiB regions, and an arena is a memfd of up to a gigabyte
+# (native/q8_executor.cpp, kMaxArena). A file a child writes without asking is still bound at
+# MAX_NATIVE_FILE.
+MAX_SHARED_FILE = 1 << 30
 NATIVE_ARITHMETIC = 'native-model-v1'
 FIXED_ARITHMETIC = 'shield-fixed-point-v1'
 STATS = re.compile(r'\[enclave-shield\] offloaded=(\d+) local=(\d+) graph_macs=(\d+) exchanges=(\d+) macs=(\d+) verification_failures=(\d+)')
@@ -264,7 +269,13 @@ class Compute:
                 'SHIELDED_POOL_DEPTH': '32',
             })
             env.update(link_environment(self.config.get('link')))
-            env.update(route_environment(self.config.get('route')))
+            # The mailbox has the client and the serving thread wait by spinning. With fewer than four
+            # processors that takes them from the threads that make the pads, as an idle OpenMP thread
+            # does above, so the route settings are left out and sessions use the socket.
+            if len(os.sched_getaffinity(0)) >= 4:
+                env.update(route_environment(self.config.get('route')))
+            else:
+                route_environment(self.config.get('route'))  # still validated
             # The executor computes a session product itself when the pad pool
             # has run dry and that is cheaper than an exchange that makes its
             # own pad (native/q8_executor.cpp, PadStock). With this set every
@@ -568,9 +579,12 @@ def main():
     os.umask(0o077)
     # Set once before serving threads; children inherit the bound without an
     # unsafe preexec_fn in this multithreaded process. Never raise an outer cap.
+    # The soft limit is what a child's write meets. The hard limit is how far a child may raise its own,
+    # and is the size of the executor's largest shared memory.
     _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
     bound = MAX_NATIVE_FILE if hard == resource.RLIM_INFINITY else min(MAX_NATIVE_FILE, hard)
-    resource.setrlimit(resource.RLIMIT_FSIZE, (bound, bound))
+    ceiling = MAX_SHARED_FILE if hard == resource.RLIM_INFINITY else min(MAX_SHARED_FILE, hard)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (bound, max(bound, ceiling)))
     compute = Compute(json.loads(a.config.read_text()))
     path = Path(compute.config['socket'])
     path.unlink(missing_ok=True)

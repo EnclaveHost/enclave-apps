@@ -1,5 +1,76 @@
 # Packaged standard GPU applications
 
+## 0.6.12 direct candidate 2 (2026-11-24): running in measured guests
+
+`enclave-kvm-box-desktop:0.6.12-direct-candidate-2`
+(`sha256:55ebfefe78ee3dbe0f759567161fc92b6f8d4aa825fc8aaaebe2e8a05d3fd69c`)
+replaces the first candidate below. It is a local development image: unsigned,
+unpublished, in no catalog, started with `--development-unbound`. Both of its
+guests boot under SNP and are attested (controller and desktop, `gate=open`).
+
+What changed against the first candidate:
+
+- The file bound no longer removes the shared regions. `service.py` keeps the
+  8 MiB bound as the soft `RLIMIT_FSIZE` of everything it starts and leaves the
+  hard limit at 1 GiB (or the limit it was given, if lower). The executor
+  raises its own soft limit to the hard one, so it can size the four 64 MiB
+  session regions and the arenas; the application engines keep the 8 MiB bound.
+- The image turns the measured route on. The packaged `llama-cli` sets
+  `SHIELD_OPENCL_GLUE=1`, `GGML_SHIELD_DEVICE_GLUE=add,mul,rms,glu` and
+  `GGML_OPENCL_DISABLE_FUSION=1`, and on a guest with four or more processors
+  also `SHIELD_OPENCL_Q8_MAILBOX=1`, `SHIELD_OPENCL_Q8_TRIPLE=1` and
+  `SHIELD_OPENCL_Q8_ARENA=1`. `service.json` carries
+  `route: {mailbox: true, continueInline: true}`, which the service applies
+  under the same four-processor condition: the mailbox waits by spinning, and
+  with fewer processors that takes time from the threads that make the pads.
+  Each setting can still be overridden from the environment.
+- `host/build.py --desktop-vcpus` (2, 4 or 8, default 2) sizes the desktop
+  guest. This candidate was built with 8 and 8192 MiB.
+- The controller's runtime no longer runs as root. `guest/runapp.c` drops to
+  uid 1000 with no capabilities and `no_new_privs`, installs the platform's
+  application seccomp filter, hands the filter statement to its root parent
+  (written to `/run/enclave/seccomp`) and executes the runtime; the front is
+  given that statement. This is what the front's self-test asked for.
+- `host/start.sh` passes `--no-moonlight` to the connector when
+  `KVMBOX_NO_MOONLIGHT` is set, for a host whose GameStream ports are taken.
+
+Passed in the image (containers, test worker on a V100):
+`test_standard_package.py` with the file limits the service sets
+(`--ulimit fsize=8388608:1073741824`), SD and llama; `../test_q8_session.py`,
+13 tests; `test_file_limit.py`; `../test_service.py`, 26 tests.
+
+Passed in the running desktop guest (8 processors):
+
+- Through the guest's Shield service (`/api/shield/compute`): masked llama,
+  487 verified exchanges, 14,273,495,040 MACs, no verification failure; masked
+  SD, 1136 verified exchanges, 181,525,282,816 MACs, no verification failure.
+  The boundary report is unchanged (uid 1000, no raw GPU device, vsock,
+  io_uring and the worker denied, the local service available).
+- The packaged `llama-cli` with `--device GPUOpenCL`, typed into the desktop's
+  terminal as the desktop user: it answered Paris, the service counted a `q8`
+  session of 536 verified exchanges and 15,024,128,000 MACs, and while it ran
+  the client's `/proc/<pid>/maps` held one `memfd:shield-q8` mapping (the
+  session regions and the mailbox) and two `memfd:shield-q8-arena` mappings.
+  The service stayed `ready`.
+
+Not done: `sd-cli` through OpenCL in the guest, the fault runs (corrupted and
+dropped worker replies) in the guest, any speed measurement in the guest, and
+the 27B model, which is not in the image. The speed figures of
+`../opencl/Q8_DIRECT.md` are from containers on the host. The CLI run in the
+guest used other arguments than the fixture (more tokens, and the terminal's
+input closed), so its 536 exchanges are not to be compared with the fixture's
+487; the fixture check of the first candidate (`test-standard-vm.py`) was not
+run in the guest, which has no way to receive a file short of typing it.
+
+Two things to know when starting it on this host: the VCEK under
+`~/.cache/enclave-isolation` was stale and the verifier rejected the report
+signature until it was given the current one; and `host/stop.sh` fails without
+stopping the broker when the connector unit is not loaded.
+
+The commands and receipts are outside the repository, in
+`work/shield-compat/direct-0.6.12b` and `work/kvm-box-v6.12b-direct` of the
+2026-10-23 working directory.
+
 ## 0.6.12 direct candidate (2026-11-23): built, gated in the image, not booted
 
 `enclave-kvm-box-desktop:0.6.12-direct-candidate`

@@ -18,5 +18,5 @@ common=(--release "$release" --work "$work" --enclave "$enclave" --vcek "$vcek" 
 systemd-run --user --unit=kvm-box-broker-dev --collect -p Restart=no \
  python3 "$here/broker.py" "${common[@]}" --parent-unit kvm-box-broker-dev.service
 systemd-run --user --unit=kvm-box-connector-dev --collect -p BindsTo=kvm-box-broker-dev.service \
- node "$here/connect.mjs" "${common[@]}" --password-file "$work/owner-password" --listen-port "${KVMBOX_LOCAL_PORT:-0}"
+ node "$here/connect.mjs" "${common[@]}" --password-file "$work/owner-password" --listen-port "${KVMBOX_LOCAL_PORT:-0}" ${KVMBOX_NO_MOONLIGHT:+--no-moonlight}
 echo "The local console URL is recorded in $work/connector.json. Both guests require verified SNP attestation."

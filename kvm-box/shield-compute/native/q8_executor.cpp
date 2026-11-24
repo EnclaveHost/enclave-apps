@@ -2221,6 +2221,15 @@ int main(int argc, char ** argv) {
     // sharing and the client keeps to the socket; by default it is a signal
     // that ends this process and retires the service.
     std::signal(SIGXFSZ, SIG_IGN);
+    // The service leaves a hard limit above that bound for this process alone to use: the size of its
+    // largest shared memory. Raised here, and nowhere else.
+    {
+        rlimit files{};
+        if (getrlimit(RLIMIT_FSIZE, &files) == 0 && files.rlim_cur != files.rlim_max) {
+            files.rlim_cur = files.rlim_max;
+            setrlimit(RLIMIT_FSIZE, &files);
+        }
+    }
 
     try {
         int control = -1;

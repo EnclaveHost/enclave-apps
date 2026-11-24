@@ -1072,6 +1072,13 @@ SHIELD_OPENCL_GLUE=1  GGML_SHIELD_DEVICE_GLUE=add,mul,rms,glu  GGML_OPENCL_DISAB
 
 ### What the 0.6.12 candidate sets
 
+Superseded on 2026-11-24 by candidate 2, which turns on the mailbox, arenas,
+three products, `continueInline` and device-side glue on a guest with four or
+more processors, and whose executor gets its shared regions under the file
+bound. It runs in measured guests; the record is at the top of
+`../native/STANDARD_PACKAGE.md`. The rest of this section describes the first
+candidate.
+
 A candidate image was built on 2026-11-23
 (`enclave-kvm-box-desktop:0.6.12-direct-candidate`; what was and was not
 validated is at the top of `../native/STANDARD_PACKAGE.md`). The packager was

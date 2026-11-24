@@ -43,7 +43,7 @@ def pack(root,out,compression='gzip'):
   z=subprocess.Popen(compressor,stdin=a.stdout,stdout=f);a.stdout.close();a.communicate(('\n'.join(entries)+'\n').encode())
   if a.returncode or z.wait():raise RuntimeError('packing failed')
 def main():
- ap=argparse.ArgumentParser();ap.add_argument('--compute-config',type=Path,required=True);ap.add_argument('--enclave',type=Path,required=True);ap.add_argument('--work',type=Path,required=True);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--desktop-oci',default='enclave-kvm-box-desktop:0.3.0');ap.add_argument('--version');ap.add_argument('--shield-volume',type=Path);ap.add_argument('--link-model-volume',action='store_true',help='hard-link the immutable public model volume on the same filesystem');ap.add_argument('--desktop-memory-mib',type=int,choices=[4096,6144,8192],default=4096);ap.add_argument('--compression',choices=['gzip','xz'],default='gzip',help='xz needs CONFIG_RD_XZ in the guest kernel and reduces firmware initrd allocation');a=ap.parse_args()
+ ap=argparse.ArgumentParser();ap.add_argument('--compute-config',type=Path,required=True);ap.add_argument('--enclave',type=Path,required=True);ap.add_argument('--work',type=Path,required=True);ap.add_argument('--output',type=Path,required=True);ap.add_argument('--desktop-oci',default='enclave-kvm-box-desktop:0.3.0');ap.add_argument('--version');ap.add_argument('--shield-volume',type=Path);ap.add_argument('--link-model-volume',action='store_true',help='hard-link the immutable public model volume on the same filesystem');ap.add_argument('--desktop-memory-mib',type=int,choices=[4096,6144,8192],default=4096);ap.add_argument('--desktop-vcpus',type=int,choices=[2,4,8],default=2,help='the shared-memory compute route waits by spinning and is used with four or more');ap.add_argument('--compression',choices=['gzip','xz'],default='gzip',help='xz needs CONFIG_RD_XZ in the guest kernel and reduces firmware initrd allocation');a=ap.parse_args()
  app=Path(__file__).resolve().parents[1];enclave=a.enclave.resolve();w=a.work.resolve();out=a.output.resolve();w.mkdir(parents=True,exist_ok=True);out.mkdir(parents=True,exist_ok=True)
  suffix='.cpio.xz' if a.compression=='xz' else '.cpio.gz'
  # Never silently rotate the user's credential when rebuilding an image.
@@ -57,6 +57,8 @@ def main():
  goenv={**os.environ,'CGO_ENABLED':'0'}
  for cwd,target,bin in [(app/'guest','.',w/'helper'),(enclave/'isolation/m2','./front',w/'front'),(enclave/'isolation/m2','./fwd',w/'fwd'),(enclave/'isolation/contract','./cmd/bundle',w/'bundle')]:run(['go','build','-trimpath','-buildvcs=false','-ldflags=-s -w -buildid=','-o',bin,target],cwd=cwd,env=goenv)
  run(['gcc','-static','-O2','-Wall','-Wextra','-Werror',app/'guest/init.c','-o',w/'init'])
+ # The controller's runtime starter takes the platform's own seccomp filter from the revision the image is built against.
+ run(['gcc','-static','-O2','-Wall','-Wextra','-Werror','-I',enclave/'isolation/m2',app/'guest/runapp.c','-o',w/'runapp'])
  run([w/'bundle','build','-label','kvm-box','-world','wasi:cli','-http','8000','-mem','512','-vcpus','1',out/'kvm-box.wasm',out/'kvm-box.bundle'])
  roots={x:w/(x+'-root') for x in ['controller','desktop']}
  for root in roots.values():
@@ -85,6 +87,7 @@ def main():
  ctrl=roots['controller'];(ctrl/'bin').mkdir();copy(roots['desktop']/'bin/busybox',ctrl/'bin/busybox')
  for n in ['sh','cat','mkdir']:os.symlink('busybox',ctrl/'bin'/n)
  run([enclave/'isolation/m4/runtime-set.sh','compose',ctrl/'rt'])
+ copy(w/'runapp',ctrl/'runapp');(ctrl/'runapp').chmod(0o755)
  copy(out/'kvm-box.wasm',ctrl/'app.wasm');copy(out/'kvm-box.bundle',ctrl/'app.bundle')
  ctrl_id=sha(out/'kvm-box.bundle');(ctrl/'app.sha256').write_text(ctrl_id+'\n')
  # The service policy and verifier are part of the measured image.
@@ -117,7 +120,7 @@ def main():
    (root/'desktop-session.sh').chmod(0o755)
   pack(root,out/(name+suffix),a.compression)
  records={}
- for name,vcpus,mem,app_id in [('controller',1,768,ctrl_id),('desktop',2,a.desktop_memory_mib,desktop_id)]:
+ for name,vcpus,mem,app_id in [('controller',1,768,ctrl_id),('desktop',a.desktop_vcpus,a.desktop_memory_mib,desktop_id)]:
   img=out/(name+suffix)
   measurement=subprocess.check_output([str(Path.home()/'.local/bin/sev-snp-measure'),'--mode','snp','--vcpus',str(vcpus),'--vcpu-family','26','--vcpu-model','2','--vcpu-stepping','1','--vmm-type','QEMU','--ovmf',str(out/'OVMF.amdsev.fd'),'--kernel',str(out/'vmlinuz'),'--initrd',str(img),'--append',append],text=True).strip()
   records[name]={'image':img.name,'sha256':sha(img),'appId':app_id,'measurement':measurement,'vcpus':vcpus,'memoryMiB':mem,'network':name=='desktop'}

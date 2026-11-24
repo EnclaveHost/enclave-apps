@@ -43,6 +43,10 @@ config['enableQ8Experimental'] = True
 # Without it the executor computes a product itself when its pad pool runs dry.
 assert 'q8ExchangeEveryProduct' not in config and 'route' not in config and 'link' not in config
 config['q8ExchangeEveryProduct'] = True
+# The executor's side of the shared-memory route: a mailbox in the session's memory and a feed-forward
+# block's continuation computed on the serving thread. service.py leaves both out on a guest with fewer
+# than four processors. No processor is named: that is for whoever knows the guest's topology.
+config['route'] = {'mailbox': True, 'continueInline': True}
 config_path.write_text(json.dumps(config, indent=2) + '\n')
 firewall_path = Path('/shield/guest-firewall.nft')
 ports = re.findall(r'tcp dport \{ ([0-9, ]+) \}', firewall_path.read_text())
