@@ -150,6 +150,7 @@ sampled the one way the server samples. The fields that exist:
 | `top_k` | int | extension (common in OSS servers). Default = config; `0` = off. |
 | `stop` | string \| [string] | extra stop strings; the first **4** of an array are honoured, on top of the chat template's own stops. |
 | `enable_thinking` | bool | extension: `false` disables `<think>` reasoning on thinking models. See [Thinking](#thinking). |
+| `speculative` | bool | unreleased extension: `false` uses plain decode for this request's answer/tool loop; `true` or absent retains the deployment's configured draft path. Does not enable an unconfigured head or alter other requests. Also accepted by `/chat`. See [decode qualification](decode-tuning-20260930.md). |
 | `chat_template_kwargs` | object | vLLM/SGLang spelling: `{"enable_thinking": false}`. Top-level wins when both present. |
 | `target` | string | extension: `"cpu"` \| `"gpu"` \| `"auto"` (default auto: GPU then CPU fallback). ggml deployments ignore it (offload is the node's call). |
 | `web_search` | bool \| string | extension, needs the deployment's search config. See [Web search](#web-search-image-generation-and-the-router). |
@@ -253,6 +254,34 @@ built-in UI does. All three follow one contract: **explicit request value
 wins; an absent field takes the deployment's default** (`default_on` in the
 respective config block). A deployment without the block never searches,
 never draws, and never advertises either.
+
+On per-app isolated hosts, declare the search endpoint in the owner config,
+even when the provider has a built-in default. For example, merge this into
+`tools.search` (or the supported legacy top-level `search` block):
+
+```json
+{
+  "provider": "exa",
+  "endpoint": "https://api.exa.ai/search",
+  "api_key": "$EXA_API_KEY",
+  "max_results": 5,
+  "fetch_pages": 2
+}
+```
+
+Store the credential in sealed Secrets; the config contains only its name.
+The guest derives its HTTPS allowlist from URLs in the authenticated config.
+A provider name alone does not authorize its default hostname. If the config
+has a top-level `egress` list, include `https://api.exa.ai` there as well: that
+explicit list replaces URL derivation. Apply the owner-signed config and
+restart the app to rebuild its egress policy.
+
+Use authenticated `GET /search?q=confidential%20computing` to check the search
+provider without running inference. `DnsError` with `address not available`
+can mean a missing allowed origin, even when public DNS resolves correctly.
+Exa returns page text inline; fetching a result URL separately with
+`GET /search?url=...` still requires that URL's origin to be allowed. Neither
+search results nor redirects extend the owner's allowlist.
 
 - `web_search: true` — search **every** turn. `"auto"` — a cheap router
   generation decides per turn whether the question needs the web (and what
@@ -790,13 +819,40 @@ around API integrations — see the `lib.rs` header for each:
 |---|---|
 | `GET /ping` | liveness; touches no wasi-nn |
 | `GET /models` | open model list + `gpu` presence + vision capability (the playground's) |
-| `GET /warmup[?model=…]` | load + one forward pass; bare = smallest-first ladder over every servable model |
+| `GET /warmup[?model=…]` | load models and prepare shared prompt prefixes; bare = smallest-first model ladder and bounded startup feature plan |
 | `GET /attestation` | this deployment's SEV-SNP quote, measurement, GPU CC mode |
 | `GET /search?q=…` / `?url=…` | web-search probe: provider leg / fetch-extract leg, separately |
 | `GET /tools[?call=…&args=…]` | resolve the tool registry; run one entry |
 | `GET /legal`, `/privacy`, `/terms` | the deployment's legal document (one embedded page, linked from the playground) |
 | `POST /chat` | legacy SSE endpoint the playground uses (its own event schema) |
 | `POST /title` | name a chat from its opening exchange; failures answer `title: null` |
+
+### Startup prompt preparation
+
+The guest startup hook calls `/warmup` as soon as the app listens, without
+waiting for a browser. In addition to loading the model, this prepares the
+deployment default, Loop, search-off, search-off with Loop, and chat-only
+prompt variants. Identical token prefixes are deduplicated. The plan stops
+on a busy/failed branch, after eight unique prefix boundaries, or before
+starting another branch once nine minutes have elapsed. A single in-flight
+branch may take longer. Real requests can populate a missing branch later.
+
+`/warmup?switches=<URL-encoded JSON object>` prepares only the selected
+combination. Supported switches are `web_search`, `image_gen`, `tools`,
+`tool_choice`, `model`, and `loop`. Messages and caller identity are ignored;
+warmup uses a synthetic message and caches only marked system boundaries.
+The browser sends the same Loop setting as its chat request.
+
+The `prefix` result retains its existing fields and adds `complete`,
+`planned_variants`, `variants`, `unique_prefixes`, and `plan_ms`. Check
+`complete` and individual branch results: HTTP 200/model readiness alone
+does not mean every prefix was prepared. `prefix=0` skips prompt preparation.
+
+Reuse requires an exact preceding token sequence. The common system text,
+tool definitions/budget, and final feature instructions form branching
+prefixes; independently computed KV blocks cannot be concatenated after a
+different earlier feature selection. These caches are in memory and can be
+evicted under pressure; startup preparation is repeated after an app restart.
 
 ## Compatibility notes
 

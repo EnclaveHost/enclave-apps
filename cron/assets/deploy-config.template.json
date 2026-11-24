@@ -1,0 +1,24 @@
+{
+  "api_key": "$CRON_API_KEY",
+  "storage": {
+    "endpoint": "https://ACCOUNT.r2.cloudflarestorage.com",
+    "region": "auto",
+    "bucket": "agent-data",
+    "key": "cron/state",
+    "access_key": "$CRON_STORAGE_ACCESS_KEY",
+    "secret_key": "$CRON_STORAGE_SECRET_KEY",
+    "master_key": "$CRON_MASTER_KEY"
+  },
+  "concurrency": 1,
+  "targets": {
+    "eyesoff": {
+      "kind": "eyesoff",
+      "url": "https://eyesoff.ai/chat",
+      "model": "qwen3.8-27b-mtp",
+      "timeout_s": 900,
+      "api_keys": {
+        "acct_REPLACE_WITH_CANONICAL_ACCOUNT_ID": "$EYESOFF_PERSONAL_API_KEY"
+      }
+    }
+  }
+}

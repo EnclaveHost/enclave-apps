@@ -795,6 +795,22 @@ enum DraftPlan {
     Lookup,
 }
 
+/// A caller can opt out of the configured draft path for this request. It
+/// cannot enable an unconfigured head/model or change other requests. Keeping
+/// this decision outside resolve_draft also avoids opening a draft model just
+/// to run a plain-decode comparison.
+fn resolve_request_draft(
+    raw: &serde_json::Value,
+    cfg: &AppConfig,
+    req: &ChatReq,
+) -> (DraftPlan, Option<String>) {
+    if req.speculative == Some(false) {
+        (DraftPlan::Plain, Some("disabled for this request".into()))
+    } else {
+        resolve_draft(raw, cfg)
+    }
+}
+
 /// The draft plan for speculative decoding, when `cfg` names one and it is
 /// usable - else Plain plus the reason for a status line. "mtp" = the
 /// model's own head (existence verified against the host at session open).
@@ -4466,6 +4482,11 @@ struct ChatReq {
     stop: Option<serde_json::Value>, // string or [string]
     #[serde(default)]
     enable_thinking: Option<bool>, // extension: false turns off <think> reasoning (thinking models only)
+    /// Extension for controlled decode comparisons: false bypasses the
+    /// deployment's draft path for this request and its answer/tool loop.
+    /// True or absent retains the deployment's choice and capability checks.
+    #[serde(default)]
+    speculative: Option<bool>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>, // vLLM/SGLang spelling of the same switch
     /// extension (needs config.search): `true` searches every turn, `"auto"`
@@ -7824,7 +7845,7 @@ fn finish_search(
     let question = messages[last].content.trim().to_string();
     messages[last].content = format!(
         "{}\nQuestion: {question}",
-        search::render_context(&query, &hits)
+        search::render_context(scfg, &query, &hits)
     );
     Ok(Some(SearchMeta {
         provider: scfg.provider.clone(),
@@ -8122,6 +8143,10 @@ fn build_prompt(
                 if block_added {
                     cands.push(tok.encode_ids(
                         &format!("<|im_start|>system\n{}", base.trim_end()), true)?);
+                }
+                if let Capabilities::Tools(list, budget) = caps {
+                    cands.push(tok.encode_ids(&format!("<|im_start|>system\n{}{}",
+                        base.trim_end(), tools::system_block_prefix(list, budget)), true)?);
                 }
                 cands.push(tok.encode_ids(
                     &format!("<|im_start|>system\n{system}<|im_end|>\n"), true)?);
@@ -8781,7 +8806,7 @@ fn handle_chat(raw: &serde_json::Value, req: IncomingRequest, out: ResponseOutpa
     // must stop the router deciding about search, or the turn pays for a
     // provider round trip the model never asked for and then gets the tool too.
     let formatter = |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &status_cb);
-    let (ref draft_cfg, draft_note) = resolve_draft(raw, cfg);
+    let (ref draft_cfg, draft_note) = resolve_request_draft(raw, cfg, &creq);
     // Subagents run through this same leg: every event a child makes is one
     // of this stream's own events, carrying the agent's id, so the client
     // files it under the right card and the bytes keep the stream alive.
@@ -9308,7 +9333,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &leg_status);
-        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        let (ref draft_cfg, _) = resolve_request_draft(raw, cfg, &creq);
         // subagents narrate as SSE comments like everything else on this
         // leg: `: enclave-agent`, `: enclave-agent-delta`, `: enclave-agent-done`
         let event = |kind: &str, v: serde_json::Value| {
@@ -9631,7 +9656,7 @@ fn handle_completions(raw: &serde_json::Value, req: IncomingRequest, out: Respon
         let want_effort = cfg.effort.is_some() && cfg.thinking && creq.thinking();
         let formatter =
             |instr: &str, raw: &str| format_tool_result(cfg, &tok, mode, instr, raw, &no_status);
-        let (ref draft_cfg, _) = resolve_draft(raw, cfg);
+        let (ref draft_cfg, _) = resolve_request_draft(raw, cfg, &creq);
         // a buffered reply has nothing to narrate to; children still run,
         // and their calls reach the client on enclave.tools
         let event = |_: &str, _: serde_json::Value| true;
@@ -9901,26 +9926,82 @@ fn warm_one(cfg: &AppConfig, mode: &str) -> Result<(String, u64, u64), String> {
 /// An engine without
 /// boundary parks, or a prompt with no mark, is a no-op reported as such. A
 /// later call finds the parks standing and returns in milliseconds.
+// Only settings that change the chat prompt are accepted. In particular, a
+// caller cannot inject conversation messages into a shared startup prefix.
+fn warm_request(switches: &serde_json::Value, caller: Option<&str>) -> Result<ChatReq, String> {
+    let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "warm" }] });
+    if let (Some(dst), Some(src)) = (req.as_object_mut(), switches.as_object()) {
+        for k in ["web_search", "image_gen", "tools", "tool_choice", "model", "loop"] {
+            if let Some(v) = src.get(k) { dst.insert(k.to_string(), v.clone()); }
+        }
+    }
+    let mut req: ChatReq = serde_json::from_value(req).map_err(|e| e.to_string())?;
+    // The caller comes only from a verified request credential. Switches may
+    // choose capabilities but can never supply an identity or private text.
+    req.caller = caller.map(str::to_owned);
+    Ok(req)
+}
+
+// This is deliberately bounded, not the power set of configured tools. Each
+// branch keeps the exact preceding tokens, so the engine can reuse the common
+// base without pretending later KV blocks are independent of earlier features.
+fn startup_prefix_variants() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("default", serde_json::json!({})),
+        ("loop", serde_json::json!({"loop": true})),
+        ("search-off", serde_json::json!({"web_search": "off"})),
+        ("search-off-loop", serde_json::json!({"web_search": "off", "loop": true})),
+        ("chat-only", serde_json::json!({"web_search": "off", "image_gen": "off", "tools": false})),
+    ]
+}
+
+fn warm_prefix_plan(cfg: &AppConfig, mode: &str, switches: Option<&serde_json::Value>, caller: Option<&str>,
+                    tick: &dyn Fn(&str) -> bool) -> serde_json::Value {
+    let start = now_ms();
+    let plan = switches.map_or_else(startup_prefix_variants, |v| vec![("selected", v.clone())]);
+    let planned = plan.len();
+    let mut seen = std::collections::HashSet::new();
+    let mut variants = Vec::new();
+    let mut primary = serde_json::Value::Null;
+    for (name, settings) in plan {
+        // The guest's boot hook has a 15-minute deadline. Leave headroom for
+        // the last branch; a cold default always gets its first attempt.
+        if !variants.is_empty() && now_ms() - start >= 540_000 { break; }
+        let result = match warm_prefix(cfg, mode, &settings, caller, tick, &mut seen) {
+            Ok(v) => v,
+            Err(e) => serde_json::json!({"parked": false, "error": e}),
+        };
+        if primary.is_null() { primary = result.clone(); }
+        let failed = result.get("parked").and_then(|v| v.as_bool()) != Some(true);
+        variants.push(serde_json::json!({"name":name,"prefix":result}));
+        // Busy/failed startup preparation is retryable. Do not contend with
+        // real chats by opening four more sessions after a refusal.
+        if failed { break; }
+    }
+    if let Some(obj) = primary.as_object_mut() {
+        obj.insert("complete".into(), serde_json::json!(variants.len() == planned && variants.iter().all(|v| v["prefix"]["parked"] == true)));
+        obj.insert("planned_variants".into(), serde_json::json!(planned));
+        obj.insert("variants".into(), serde_json::json!(variants));
+        obj.insert("unique_prefixes".into(), serde_json::json!(seen.len()));
+        obj.insert("plan_ms".into(), serde_json::json!(now_ms()-start));
+    }
+    primary
+}
+
 fn warm_prefix(
     cfg: &AppConfig,
     mode: &str,
     switches: &serde_json::Value,
+    caller: Option<&str>,
     tick: &dyn Fn(&str) -> bool,
+    seen: &mut std::collections::HashSet<Vec<u32>>,
 ) -> Result<serde_json::Value, String> {
     let t0 = now_ms();
     let tok = make_tok(cfg, "auto", t0)?;
     // the turn this warm-up stands in for: the caller's switches (the same
     // fields a /chat body carries - web_search, image_gen, tools), so a page
     // parks the prefix ITS chats will match, not only the deployment default
-    let mut req = serde_json::json!({ "messages": [{ "role": "user", "content": "warm" }] });
-    if let (Some(dst), Some(src)) = (req.as_object_mut(), switches.as_object()) {
-        for k in ["web_search", "image_gen", "tools", "tool_choice", "model"] {
-            if let Some(v) = src.get(k) {
-                dst.insert(k.to_string(), v.clone());
-            }
-        }
-    }
-    let creq: ChatReq = serde_json::from_value(req).map_err(|e| e.to_string())?;
+    let creq = warm_request(switches, caller)?;
     let off = creq.off_groups(cfg);
     let mut b = builtins_for(cfg, &creq, &off);
     // what a fresh answer is offered at depth 0 (AgentTree::slots)
@@ -9928,7 +10009,7 @@ fn warm_prefix(
     // the routing classifier's prefix, parked after the main one (below)
     let router_sys = router_system(cfg, &creq, &b);
     let reg = tools_enabled(cfg, &creq).map(|tc| (tc, tools::build(tc, b, &|_| {})));
-    let park_budget = reg.as_ref().map(|(tc, _)| tc.budget(None));
+    let park_budget = reg.as_ref().map(|(tc, _)| tc.budget(creq.loop_.as_ref()));
     let caps = match (reg.as_ref(), park_budget.as_ref()) {
         (Some((_, r)), Some(b)) if !r.tools.is_empty() => Capabilities::Tools(&r.tools, b),
         _ => Capabilities::Note,
@@ -9938,6 +10019,16 @@ fn warm_prefix(
         return Ok(serde_json::json!({ "parked": false, "why": "no boundary to park" }));
     };
     let ids = &prompt.text_ids[..end];
+    if seen.contains(ids) {
+        return Ok(serde_json::json!({ "parked": true, "deduplicated": true, "tokens": end }));
+    }
+    // Include intermediate marks: base, tool definitions and final system
+    // branches all consume the same bounded prefix-cache budget.
+    let new_marks: Vec<_> = prompt.marks.iter().map(|&m| &prompt.text_ids[..m])
+        .filter(|ids| !seen.contains(*ids)).collect();
+    if seen.len() + new_marks.len() > 8 {
+        return Ok(serde_json::json!({ "parked": false, "why": "startup prefix slot budget" }));
+    }
     if !tick(&format!("{PREFILL_STATUS}0 of {end} prompt tokens")) {
         return Err("client disconnected".into());
     }
@@ -9955,6 +10046,7 @@ fn warm_prefix(
             s.feed_declared(cfg, ids, last, declare)
         })?;
         let main_ms = now_ms() - t1;
+        for &m in &prompt.marks { seen.insert(prompt.text_ids[..m].to_vec()); }
         drop(sess); // its sequence is spent; the router prompt needs a fresh one
         // the routing classifier's own prefix (router_system): a fresh
         // sequence, the same declared-marks feed, no generation
@@ -9966,12 +10058,17 @@ fn warm_prefix(
                     Err(e) => serde_json::json!({ "parked": false, "error": e }),
                     Ok((rp, _, _)) => match rp.marks.last() {
                         None => serde_json::json!({ "parked": false, "why": "no boundary to park" }),
+                        Some(&rend) if seen.contains(&rp.text_ids[..rend]) =>
+                            serde_json::json!({ "parked": true, "deduplicated": true, "tokens": rend }),
+                        Some(_) if seen.len() >= 8 =>
+                            serde_json::json!({ "parked": false, "why": "startup prefix slot budget" }),
                         Some(&rend) => {
                             let t2 = now_ms();
                             let mut rsess = Session::open(cfg, target)?;
                             prefill_text(&mut rsess, cfg, &rp.text_ids[..rend], &rp.marks, tick, |s, ids, last, declare| {
                                 s.feed_declared(cfg, ids, last, declare)
                             })?;
+                            seen.insert(rp.text_ids[..rend].to_vec());
                             serde_json::json!({ "parked": true, "tokens": rend, "marks": rp.marks, "ms": now_ms() - t2 })
                         }
                     },
@@ -10041,7 +10138,10 @@ fn handle_d2h(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     }
 }
 
-fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
+fn handle_warmup(raw: &serde_json::Value, query: &str, req: &IncomingRequest, out: ResponseOutparam) {
+    // Boot probes remain anonymous. A signed-in browser warms the same tool
+    // set its chat will see, including identity-dependent MCP capabilities.
+    let caller = config::from_value(raw.clone()).ok().and_then(|cfg| caller_identity(&cfg, req));
     // GPU by default - but on a deployment the platform gave NO GPU share,
     // "gpu" is a guaranteed failure for the onnx path, and reporting every
     // model broken hides the real story (the fleet had no GPU enclave free).
@@ -10059,17 +10159,17 @@ fn handle_warmup(raw: &serde_json::Value, query: &str, out: ResponseOutparam) {
     let progress = query.split('&').any(|kv| kv == "progress=1");
     // ?switches=<url-encoded JSON of the chat body's switch fields>: park the
     // prefix those settings render, so the page's warm-up serves the page
-    let switches: serde_json::Value = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("switches="))
-        .and_then(|v| serde_json::from_str(&percent_decode_query(v)).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let switches = query.split('&').find_map(|kv| kv.strip_prefix("switches="));
+    let switches: Option<serde_json::Value> = match switches {
+        Some(v) => match serde_json::from_str::<serde_json::Value>(&percent_decode_query(v)) {
+            Ok(v) if v.is_object() => Some(v),
+            _ => return json_err(out, 400, "switches must be a JSON object"),
+        },
+        None => None,
+    };
     let park = |cfg: &AppConfig, tick: &dyn Fn(&str) -> bool| -> serde_json::Value {
         if !prefix { return serde_json::Value::Null; }
-        match warm_prefix(cfg, mode, &switches, tick) {
-            Ok(v) => v,
-            Err(e) => serde_json::json!({ "parked": false, "error": e }),
-        }
+        warm_prefix_plan(cfg, mode, switches.as_ref(), caller.as_deref(), tick)
     };
 
     if model.is_some() {
@@ -10747,7 +10847,7 @@ impl Guest for Component {
             (Method::Get, "/attestation") => handle_attestation(req, out),
             (Method::Get, "/search") => handle_search_probe(&raw, req, query, out),
             (Method::Get, "/tools") => handle_tools_probe(&raw, req, query, out),
-            (Method::Get, "/warmup") => handle_warmup(&raw, query, out),
+            (Method::Get, "/warmup") => handle_warmup(&raw, query, &req, out),
             // the popup sign-in's landing pad: same-origin with the opener
             // again, so it may hand the return fragment over and close (see
             // src/sso-return.html). Open like the page that carries the
@@ -10888,6 +10988,45 @@ mod tests_2026_08_01 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_warmup_preserves_loop_budget_without_private_messages() {
+        let tc: tools::ToolsConfig = serde_json::from_value(serde_json::json!({"max_calls": 32, "max_agents": 8})).unwrap();
+        for setting in [serde_json::json!(true), serde_json::json!(false), serde_json::json!({"max_calls": 4, "persist": true})] {
+            let req = warm_request(&serde_json::json!({"loop": setting, "messages": [{"role":"user","content":"private"}], "caller":"spoof"}), None).unwrap();
+            assert_eq!(tc.budget(req.loop_.as_ref()), tc.budget(Some(&setting)));
+            assert_eq!(req.messages.len(), 1);
+            assert_eq!(req.messages[0].content, "warm");
+            assert!(req.caller.is_none());
+        }
+    }
+
+    #[test]
+    fn startup_warmup_keeps_defaults_and_bounds_feature_branches() {
+        let plan = startup_prefix_variants();
+        assert_eq!(plan.len(), 5);
+        assert_eq!(plan[0].1, serde_json::json!({}));
+        let requests: Vec<_> = plan.iter().map(|(_, v)| warm_request(v, None).unwrap()).collect();
+        assert!(requests[0].tools.is_none());
+        assert_eq!(requests[1].loop_, Some(serde_json::json!(true)));
+        assert_eq!(requests[2].web_search, Some(serde_json::json!("off")));
+        assert_eq!(requests[3].loop_, Some(serde_json::json!(true)));
+        assert_eq!(requests[4].tools, Some(serde_json::json!(false)));
+        assert_eq!(requests[4].image_gen, Some(serde_json::json!("off")));
+    }
+
+    #[test]
+    fn warmup_identity_comes_only_from_verified_credentials() {
+        let switches = serde_json::json!({"caller":"attacker", "user":"attacker",
+            "messages":[{"role":"user","content":"private text"}], "loop":true});
+        let anonymous = warm_request(&switches, None).unwrap();
+        assert!(anonymous.caller.is_none());
+        let signed_in = warm_request(&switches, Some("acct_verified")).unwrap();
+        assert_eq!(signed_in.caller.as_deref(), Some("acct_verified"));
+        assert_eq!(signed_in.messages[0].content, "warm");
+        assert_eq!(signed_in.loop_, Some(serde_json::json!(true)));
+    }
+
 
     #[test]
     fn stash_notes_name_tools_for_what_they_do() {
@@ -11046,6 +11185,42 @@ mod tests {
 
     fn chat_req(body: serde_json::Value) -> ChatReq {
         serde_json::from_value(body).expect("request parses")
+    }
+
+    #[test]
+    fn request_can_disable_drafts_without_changing_the_deployment() {
+        let raw = serde_json::json!({});
+        let mut cfg = test_config();
+        cfg.backend = "ggml".into();
+        let disabled = chat_req(serde_json::json!({"messages":[],"speculative":false}));
+        let ordinary = chat_req(serde_json::json!({"messages":[]}));
+        for name in ["mtp", "lookup", "unavailable-draft-model"] {
+            cfg.draft = Some(name.into());
+            let (plan, note) = resolve_request_draft(&raw, &cfg, &disabled);
+            assert!(matches!(plan, DraftPlan::Plain));
+            assert_eq!(note.as_deref(), Some("disabled for this request"));
+            assert_eq!(cfg.draft.as_deref(), Some(name));
+        }
+        // The next request still selects the configured MTP path.
+        cfg.draft = Some("mtp".into());
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &ordinary).0, DraftPlan::Mtp));
+    }
+
+    #[test]
+    fn request_cannot_enable_an_unconfigured_or_unsupported_draft() {
+        let raw = serde_json::json!({});
+        let mut cfg = test_config();
+        let enabled = chat_req(serde_json::json!({"messages":[],"speculative":true}));
+        cfg.backend = "ggml".into();
+        cfg.draft = None;
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &enabled).0, DraftPlan::Plain));
+        cfg.draft = Some("mtp".into());
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &enabled).0, DraftPlan::Mtp));
+        cfg.backend = "onnx".into();
+        assert!(matches!(resolve_request_draft(&raw, &cfg, &enabled).0, DraftPlan::Plain));
+        assert!(serde_json::from_value::<ChatReq>(serde_json::json!({
+            "messages":[],"speculative":"false"
+        })).is_err());
     }
 
     /// The gate's whole job: a call never reaches the client, an answer is not

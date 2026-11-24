@@ -31,6 +31,7 @@ app's README (and `wasm/apps/README.md` in the
 | [backchannel](backchannel/) | E2E-encrypted ephemeral chat rooms; the enclave relays ciphertext blind. |
 | [warpad](warpad/) | E2E-encrypted shared scratchpad: every save replaces the only ciphertext; no history, anywhere. |
 | [failsafe](failsafe/) | Time capsules and dead man's switches: ciphertext the enclave refuses to serve until the clock, or the silence, says so. |
+| [cron](cron/) | Durable, per-user scheduled Eyesoff agent runs and webhooks: encrypted S3 state, MCP tools, run history, and skipped missed occurrences. |
 | [pulse](pulse/) | Push-based uptime: cron jobs curl heartbeats into the enclave; status history nobody can edit. |
 | [quorum](quorum/) | M-of-N secret release: break-glass escrow the enclave enforces; who approved stays private. |
 | [fairdraw](fairdraw/) | Provably fair raffles: salt committed before entries, revealed at close, winners recomputable in your browser. |

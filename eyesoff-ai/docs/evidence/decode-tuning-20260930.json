@@ -1,0 +1,796 @@
+{
+  "baseline": {
+    "date": "2026-09-30T12:38:49.148251+00:00",
+    "status": "baseline_only_no_deployment",
+    "app_version": "1.0.69",
+    "runtime_release": "4bb9f020d0d3c0760c60f7e3a28e32e4429139c82023785d5415f83bcb054170",
+    "method": "Four serial synthetic same-origin authenticated /chat requests in a fresh browser tab; omit initial request; CPU experiments finished before inference. No app config changes. No user chats read. Browser authentication remained in browser.",
+    "prompt": "Write a vivid short story about a robot tending a garden on the Moon.",
+    "parameters": {
+      "model": "qwen3.8-27b-mtp",
+      "max_tokens": 128,
+      "temperature": 0,
+      "enable_thinking": false,
+      "web_search": "off",
+      "image_gen": "off",
+      "tools": false
+    },
+    "samples": [
+      {
+        "sample": 1,
+        "first_ms": 817.9,
+        "total_ms": 9147.9,
+        "decode_ms": 8708,
+        "tok_per_s": 14.7,
+        "tokens": 128,
+        "draft_tokens": 79,
+        "draft_accepted": 49,
+        "prefill_ms": 1,
+        "prompt_tokens": 1544,
+        "gate_us": 0,
+        "target_decode_us": 8264419,
+        "draft_us": 362010,
+        "answer_sha256": "f7079bf062ff4cb70850f4f90dd1c47381bcc0e6d086fccc308de87d9aad94b3"
+      },
+      {
+        "sample": 2,
+        "first_ms": 996.7,
+        "total_ms": 9289.2,
+        "decode_ms": 8784,
+        "tok_per_s": 14.6,
+        "tokens": 128,
+        "draft_tokens": 79,
+        "draft_accepted": 49,
+        "prefill_ms": 1,
+        "prompt_tokens": 1544,
+        "gate_us": 0,
+        "target_decode_us": 8339462,
+        "draft_us": 356117,
+        "answer_sha256": "f7079bf062ff4cb70850f4f90dd1c47381bcc0e6d086fccc308de87d9aad94b3"
+      },
+      {
+        "sample": 3,
+        "first_ms": 822.6,
+        "total_ms": 9047.8,
+        "decode_ms": 8607,
+        "tok_per_s": 14.9,
+        "tokens": 128,
+        "draft_tokens": 79,
+        "draft_accepted": 49,
+        "prefill_ms": 1,
+        "prompt_tokens": 1544,
+        "gate_us": 0,
+        "target_decode_us": 8160431,
+        "draft_us": 363344,
+        "answer_sha256": "f7079bf062ff4cb70850f4f90dd1c47381bcc0e6d086fccc308de87d9aad94b3"
+      }
+    ],
+    "aggregate_tok_s": 14.713207402582475,
+    "initial_excluded": {
+      "first_ms": 8073.2,
+      "decode_ms": 9331,
+      "prefill_ms": 7110,
+      "tokens": 128
+    },
+    "interpretation": "Existing production baseline, not an improvement attributable to a change. Verification decode dominates the measured time. It may include CPU pad waits, transport and GPU work; this profile does not distinguish them."
+  },
+  "kernel_trials": [
+    {
+      "log": "dense-down16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 18.921,
+          "samples": 13
+        },
+        "dense": {
+          "median_cpu_ms": 18.895,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "dense-down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.104,
+          "samples": 13
+        },
+        "dense": {
+          "median_cpu_ms": 45.709,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "dense-gate16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.905,
+          "samples": 13
+        },
+        "dense": {
+          "median_cpu_ms": 17.59,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "dense-gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.736,
+          "samples": 13
+        },
+        "dense": {
+          "median_cpu_ms": 46.059000000000005,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "dense-head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 670.387,
+          "samples": 13
+        },
+        "dense": {
+          "median_cpu_ms": 674.221,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "down16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.259,
+          "samples": 10
+        },
+        "loop": {
+          "median_cpu_ms": 18.0105,
+          "samples": 10
+        },
+        "unroll": {
+          "median_cpu_ms": 18.35,
+          "samples": 10
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 48.2055,
+          "samples": 10
+        },
+        "loop": {
+          "median_cpu_ms": 49.486,
+          "samples": 10
+        },
+        "unroll": {
+          "median_cpu_ms": 48.876000000000005,
+          "samples": 10
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "gate16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 18.414499999999997,
+          "samples": 10
+        },
+        "loop": {
+          "median_cpu_ms": 19.258000000000003,
+          "samples": 10
+        },
+        "unroll": {
+          "median_cpu_ms": 18.243000000000002,
+          "samples": 10
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 47.7555,
+          "samples": 10
+        },
+        "loop": {
+          "median_cpu_ms": 47.709999999999994,
+          "samples": 10
+        },
+        "unroll": {
+          "median_cpu_ms": 47.9825,
+          "samples": 10
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 698.481,
+          "samples": 10
+        },
+        "loop": {
+          "median_cpu_ms": 696.41,
+          "samples": 10
+        },
+        "unroll": {
+          "median_cpu_ms": 726.292,
+          "samples": 10
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "planes-down16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.080000000000002,
+          "samples": 13
+        },
+        "planes": {
+          "median_cpu_ms": 18.533,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain",
+      "qualification_note": "Initial samples overlapped the tail of a rejected transposed experiment on the same core. Do not use as decisive speed evidence."
+    },
+    {
+      "log": "planes-down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 48.605000000000004,
+          "samples": 13
+        },
+        "planes": {
+          "median_cpu_ms": 47.758,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain",
+      "qualification_note": "Initial samples overlapped the tail of a rejected transposed experiment on the same core. Do not use as decisive speed evidence."
+    },
+    {
+      "log": "planes-gate16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.894000000000002,
+          "samples": 13
+        },
+        "planes": {
+          "median_cpu_ms": 18.153,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain",
+      "qualification_note": "Initial samples overlapped the tail of a rejected transposed experiment on the same core. Do not use as decisive speed evidence."
+    },
+    {
+      "log": "planes-gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 47.032,
+          "samples": 13
+        },
+        "planes": {
+          "median_cpu_ms": 46.563,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain",
+      "qualification_note": "Initial samples overlapped the tail of a rejected transposed experiment on the same core. Do not use as decisive speed evidence."
+    },
+    {
+      "log": "planes-head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 666.31,
+          "samples": 13
+        },
+        "planes": {
+          "median_cpu_ms": 668.701,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain",
+      "qualification_note": "Initial samples overlapped the tail of a rejected transposed experiment on the same core. Do not use as decisive speed evidence."
+    },
+    {
+      "log": "reduce-down16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.86,
+          "samples": 13
+        },
+        "reduce": {
+          "median_cpu_ms": 18.612,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "reduce-down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.032999999999994,
+          "samples": 13
+        },
+        "reduce": {
+          "median_cpu_ms": 47.671,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "reduce-gate16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 18.205,
+          "samples": 13
+        },
+        "reduce": {
+          "median_cpu_ms": 18.743,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "reduce-gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.536,
+          "samples": 13
+        },
+        "reduce": {
+          "median_cpu_ms": 45.562,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "reduce-head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 675.434,
+          "samples": 13
+        },
+        "reduce": {
+          "median_cpu_ms": 663.227,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "tiles-down16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 18.237,
+          "samples": 7
+        },
+        "tile1024": {
+          "median_cpu_ms": 17.854,
+          "samples": 7
+        },
+        "tile128": {
+          "median_cpu_ms": 17.331,
+          "samples": 7
+        },
+        "tile256": {
+          "median_cpu_ms": 18.749,
+          "samples": 7
+        },
+        "tile512": {
+          "median_cpu_ms": 17.080000000000002,
+          "samples": 7
+        },
+        "tile768": {
+          "median_cpu_ms": 19.064,
+          "samples": 7
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "tiles-down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.451,
+          "samples": 7
+        },
+        "tile1024": {
+          "median_cpu_ms": 49.397999999999996,
+          "samples": 7
+        },
+        "tile128": {
+          "median_cpu_ms": 48.431000000000004,
+          "samples": 7
+        },
+        "tile256": {
+          "median_cpu_ms": 47.22,
+          "samples": 7
+        },
+        "tile512": {
+          "median_cpu_ms": 47.431,
+          "samples": 7
+        },
+        "tile768": {
+          "median_cpu_ms": 48.766,
+          "samples": 7
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "tiles-gate16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 19.807000000000002,
+          "samples": 7
+        },
+        "tile1024": {
+          "median_cpu_ms": 17.759,
+          "samples": 7
+        },
+        "tile128": {
+          "median_cpu_ms": 21.378,
+          "samples": 7
+        },
+        "tile256": {
+          "median_cpu_ms": 19.985,
+          "samples": 7
+        },
+        "tile512": {
+          "median_cpu_ms": 19.128,
+          "samples": 7
+        },
+        "tile768": {
+          "median_cpu_ms": 17.97,
+          "samples": 7
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "tiles-gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 47.272,
+          "samples": 7
+        },
+        "tile1024": {
+          "median_cpu_ms": 47.915,
+          "samples": 7
+        },
+        "tile128": {
+          "median_cpu_ms": 50.53,
+          "samples": 7
+        },
+        "tile256": {
+          "median_cpu_ms": 48.729,
+          "samples": 7
+        },
+        "tile512": {
+          "median_cpu_ms": 47.114999999999995,
+          "samples": 7
+        },
+        "tile768": {
+          "median_cpu_ms": 47.205,
+          "samples": 7
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "tiles-head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 696.0849999999999,
+          "samples": 7
+        },
+        "tile1024": {
+          "median_cpu_ms": 694.637,
+          "samples": 7
+        },
+        "tile128": {
+          "median_cpu_ms": 723.592,
+          "samples": 7
+        },
+        "tile256": {
+          "median_cpu_ms": 710.0070000000001,
+          "samples": 7
+        },
+        "tile512": {
+          "median_cpu_ms": 689.704,
+          "samples": 7
+        },
+        "tile768": {
+          "median_cpu_ms": 682.369,
+          "samples": 7
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "transpose-down64.jsonl",
+      "results": {},
+      "status": "failed_exact_oracle_on_first_candidate_sample"
+    },
+    {
+      "log": "transu8-down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 45.672,
+          "samples": 13
+        },
+        "transu8": {
+          "median_cpu_ms": 75.074,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "transu8-gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.864999999999995,
+          "samples": 13
+        },
+        "transu8": {
+          "median_cpu_ms": 76.41000000000001,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "transu8-head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 679.614,
+          "samples": 13
+        },
+        "transu8": {
+          "median_cpu_ms": 1113.71,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "transums-down64.jsonl",
+      "results": {},
+      "status": "failed_exact_oracle_on_first_candidate_sample"
+    },
+    {
+      "log": "vbmi-down16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.244,
+          "samples": 13
+        },
+        "vbmi": {
+          "median_cpu_ms": 17.4,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "vbmi-down64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 46.335,
+          "samples": 13
+        },
+        "vbmi": {
+          "median_cpu_ms": 45.446,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "vbmi-gate16.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 17.562,
+          "samples": 13
+        },
+        "vbmi": {
+          "median_cpu_ms": 17.09,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "vbmi-gate64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 47.61,
+          "samples": 13
+        },
+        "vbmi": {
+          "median_cpu_ms": 46.471,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    },
+    {
+      "log": "vbmi-head64.jsonl",
+      "results": {
+        "base": {
+          "median_cpu_ms": 671.5250000000001,
+          "samples": 13
+        },
+        "vbmi": {
+          "median_cpu_ms": 674.452,
+          "samples": 13
+        }
+      },
+      "all_recorded_exact": true,
+      "status": "not_selected_no_reliable_overall_gain"
+    }
+  ],
+  "runtime_candidates_selected": [],
+  "runtime_sources_modified": false,
+  "baseline_source_commit": "af8f2aed0",
+  "scratch_artifact_sha256": {
+    "base.cpp": "2f0244ae76220132cf8ffe5e12efdbf53c7400d62b40ec25e8c9d28bbeab01b9",
+    "bench-dense.cpp": "ad4d92003895119a46ca16281c45b97e5dec1791589c8d6231406030632edc54",
+    "bench-instructions.cpp": "5abb0a90cf45c8553e63fd2576a3bb898ec303daf31e936a70026137a5d5fb31",
+    "bench-planes.cpp": "416925446de3676398908d6aa3361d471fa4b905a77b28f909b432bd3852e2a8",
+    "bench-reduce.cpp": "3e3979425a1b155557ae3437689c90e5a76850b4552df58ce9f0290c0b79c8d8",
+    "bench-transpose.cpp": "de1defd4e2bb3b11f9536e419fbef09cd2d034176ab495c0b290b9a012c9e474",
+    "bench-transu8.cpp": "c95520385234a08235002d8481e58616f99c82231bc10af609affb2300772166",
+    "bench-transums.cpp": "c657fdccde22ed87d5e98fc36eeece3705bce8c87c7640abdd6ae16295708f4b",
+    "bench-vbmi.cpp": "1980879ea6bb669f5bf99a384e256f069e5e0b81ecd3bd72637f30a520d4e54e",
+    "bench.cpp": "dd095577dee96ce41baf5cccc66a384c0ae9ff08773ce01efd678a5183c72c56",
+    "build-dense-real.py": "6a0ac43c3cdef4460a29f21bb80003c36656d04bce0832bb30fa0e8f65f3ce3a",
+    "build-planes-real.py": "3353965878082a663152ffe4ae8de60c69df79f03ac8b7c6f07df96d3dc9da8b",
+    "build-planes.py": "98386b098daa79317cc31d0692979a75d309723e2a672607957aedac2f21febd",
+    "build-reduce.py": "373a143aa7a25456f27e23689c1758b757261f57be5e2c894fd80d1884839039",
+    "build-tiles.py": "26f3473465550785ea35b094493137552f6a0b45ec30eb7646e50eef88d947a5",
+    "build-transpose-real.py": "10c4c21d052b16faedf46e7eef66d317552a0514cd4e0d8b10b504c4d460d617",
+    "build-transpose-sums.py": "77cd3fa57ace000de19df663b72c992b53f5808c85ba801d174be298afb33671",
+    "build-transpose.py": "7f3c7feb43c11b2cce75593dc33ea8c9417dfaa23c2e087676f101fe4d2e4d3e",
+    "build-transu8-real.py": "1904b3c3f69edf0b98ee7062ba619802c3a8ed9aabe400781c5241e9f738249c",
+    "build-transu8.py": "8d318f9cda45a7aa855397c86922cd90d7d56c61089a5dd3eab7617e5f681283",
+    "build-transums-debug.py": "061a90957346331efb328eb055a68027a260de5082bb2300d9e7b35286ad0873",
+    "build-transums-real.py": "0bc4c81a39bd69a8b5afa1d17fe25e2a0880001f3d5834bf4dddfb9dd0b232b4",
+    "build-vbmi-all.py": "22ba8518377fa569837b234638935d82b3e2ca5d4d34b1c881fdbf16b7ff918a",
+    "build-vbmi-real.py": "4fbfe97ad516d81f677588a477c49c65ad8bab550b4610e677b56bfa678b530d",
+    "build-vbmi.py": "488e49bfa014439e46e267835af2a6ee18e8a02c308432f763d5664b4e955a1b",
+    "build.py": "7c8ce314bab7588480e98fe1e963a4afe2e0d5a1ef7b78c4ef69c730831e11f6",
+    "dense-candidate.cpp": "e34ad9334ef944d4045347d06dbcf8f97504d784542e020a141f9f63e24a81ad",
+    "dense-down16.jsonl": "74080cd4ffa0a7db945ee6424db4ad46e38f0f9acc087cf55b8c12ff1a199114",
+    "dense-down64.jsonl": "040253d1d1e8e09894fcceb44bfa6d1a58b8cca025f9075a4f9d277b94f4cc51",
+    "dense-gate16.jsonl": "c882f0287428b22f61b68bdefd85fa54b908c17d7f1317e02bba1c2e2ae8a70d",
+    "dense-gate64.jsonl": "72128904c510f822dfe9de05396eb9e38668d300ce26b3c8a4e595dcf16bbdbd",
+    "dense-head64.jsonl": "c40571072bda7e6c3dce5fbd411db48b014d2840e4746d5a7d6d75e1e4a445b9",
+    "dense.cpp": "e9ec000d37f3ef6b81eb0f45af6cb4375fb0a9652f28ca379b15a18f8d9f7b1b",
+    "down16.jsonl": "6c33508c419631b5f551370a0a38dc1914185f9b6dbcd0dd97baf57e32463460",
+    "down64.jsonl": "8f2b0e9f267d867876e9e92ab1179404ae23a8b897d2cdaee8680d47bb269324",
+    "gate16.jsonl": "e12ef5a521b4af43ddea35ebaa551ba8595191854fce6590b37f88861e6bd24f",
+    "gate64.jsonl": "821e43a20f4598eca006417ff8c1a7c661d12a7a549a39d481df9ed2b7837be7",
+    "head64.jsonl": "0ed2b6e08d0d6fbe41bb5e987eabfa4cb9e4a6762bbacccd76de8c4c3f4d24c4",
+    "loop.cpp": "583f3177752f136b883e630a914c69aa58b4053cfc495aa6e47b5d36d068fc23",
+    "planes-candidate.cpp": "266bd096e5a83c8ba0d4410c7f73414f6486cb7acfd54e979a5cf75e198ffedc",
+    "planes-down16.jsonl": "60bb61ebc49ddef80ca390809e882b16b9601ddd38edbccbf39cc74fdc2f6eca",
+    "planes-down64.jsonl": "cb65b8038fed6bd6817865ed2f327989e2f4463c2605243b9a2bb19ffc503c10",
+    "planes-gate16.jsonl": "c1ef821579544a4cccde10eaa0479753c8bdd608ae0c93a41d46517cc8d087e3",
+    "planes-gate64.jsonl": "1876051f28f24b8430709377303ba09d8c72339c3a33c8dc58b7ca25fd610b56",
+    "planes-head64.jsonl": "6e98ceaab78c51ced10b88869e9d53335ac157bd2a8d24e117ecd9124560bd5b",
+    "planes.cpp": "38b99405b5b9eda7c3f74d84fadb0cd14e6a4bef78d4082cd1bcd75bdbb9f128",
+    "reduce-candidate.cpp": "5ee3abcb6e6c044c8a2b144ec2b5b41af5bbd4874c100967b2b3342b4b42a18d",
+    "reduce-down16.jsonl": "d5da3b33838e7b4e0b0434d30ffc1a42dbfc86f788fdca130af62a26cb575702",
+    "reduce-down64.jsonl": "37b45227fb98dc813ac306b1d1a7527b47058f345c0790b0a6e43b42073a935e",
+    "reduce-gate16.jsonl": "c0cc040e9305977c60f93006b0370bc7b6b654a94936a8f5a9fc356577538939",
+    "reduce-gate64.jsonl": "6536bea6de0698e4579b50a3a633942b03c5b005878fd997b7e8e056cdce10cb",
+    "reduce-head64.jsonl": "294cc35ab26e4c79dbe4773449c990d7f81931af09a6e0bdcf1c043323cec777",
+    "reduce.cpp": "a62aeb393f793888057a69d3cecc959b3921e576a451450b35782097d0198c71",
+    "run-dense.py": "5f7180def473e659c3cd8bf14d9f26f9bb4d64892a9fe4e58f3059875d0e81ab",
+    "run-planes.py": "08084c37c8a6f037fc04bd75007f20327acb4a4b7318512cc227a1307486e57a",
+    "run-reduce.py": "3aec7c136053a1f6058e89de32e9e73af3b426e894377cb9d12394abafef958d",
+    "run-tiles.py": "21706c4e63ca18592c5afa097fbb7a4c407a4db4ef4b559004e0da71bda2f515",
+    "run-transpose.py": "c610543647960ef82fa4a63c0828104c8e8a7b844ed4f34b2cff5d7de981ffef",
+    "run-transu8.py": "9c1b38138c4fd4fa41e324df35ee2981ab97dd06aa6b3299a434261a0710c4c9",
+    "run-transums.py": "889de01daae31f3147b3708a4a16477037d3c99a6b3993d3668e22aa1b5d765b",
+    "run-vbmi.py": "55794674e8ff321df7fa0c07e4516eb37e58bbd58b01ac187370d5441d9b8392",
+    "run.py": "4ca95755490a11f205030bc912ee86767ed8e1c6b6db09de05bc184829bcd6ba",
+    "tile1024.cpp": "1bf64f260326268f70755513020135e43474862520b8513389c31b712c00cfd3",
+    "tile128.cpp": "c4cc31cfab13d95957491af6bfced14708a77650743a0f6d7967c1e3f35a1857",
+    "tile256.cpp": "2466a8c85ee0f95692c81c6dbfbb17f10cf5dff5e9bf5ec1ebf14963f02071cd",
+    "tile512.cpp": "20f6e477700c97b0c58e3b5197c0347a50480e9f77e39f663a1b02f97068ca13",
+    "tile768.cpp": "8e17e205b5079e5bdad0030c0aa396e84163173008024f5c9039b14d3532acc0",
+    "tiles-down16.jsonl": "c9d7ec944be7c59c677836f506c01d52f1e0cc0c16a21153f9c8348f7d973c3b",
+    "tiles-down64.jsonl": "6848cf10402640408265d1c271e6c5e2bb9b767053c5079a8c5b5ab94848c6db",
+    "tiles-gate16.jsonl": "0905b245fef9d8c4a605dc4a3803642302686f453722924e177453fb7e4f2855",
+    "tiles-gate64.jsonl": "10a8a4dd5fd1d3c45472172ab86974aeb9f0c049d83af0301315af96e970b8cb",
+    "tiles-head64.jsonl": "50057a397dda73f4fed64e857279b311716fa136061269593611b1b42e7d1565",
+    "transpose-candidate.cpp": "015bfdd6297c6b3cba047f9a150f2869939dad353ca8282158d4cda2ce4a3126",
+    "transpose-down64.jsonl": "a54bf91fed1df8f248bf58fb8f6555fa3eb5bc3392a54993ed6c31775768ad05",
+    "transpose-sums-candidate.cpp": "3aa07620b4d1afc1649144d8ead38de88c1f32b639f85f5c4bfd981274df063b",
+    "transpose.cpp": "bfe1352c700eaca1ed3d7cdcdc7c15c5cafdcc46206d75b380b7223171d3c56b",
+    "transu8-candidate.cpp": "0b699922e35b7543a59f72e8858ec4662fda0d6776009824fccb678dbe48495d",
+    "transu8-down16.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "transu8-down64.jsonl": "921fc10babb076546055d566a3f17da74d34382d5377082e5431596e90658770",
+    "transu8-gate64.jsonl": "8080bc892437c2f70472746418f071c14f3176ae50c3805b5e50c39df018b211",
+    "transu8-head64.jsonl": "08b9d2f34b0503a105959734a47b4ff7a47f394d202e528c6d009e6643b8344b",
+    "transu8.cpp": "6002c452b5daa0c97a229493719221eaa907e260a28c9810cf17ab7880ba33a2",
+    "transums-down64.jsonl": "a3bf23a0b334d7aea4a5716908bf69eea2607efd5911286b9947d033e83fb10d",
+    "transums.cpp": "21e38f4a078c88cc7ada87116c2eb58c6cb4ba07ae57bcdad34c899db20cb708",
+    "unroll.cpp": "a49c7d0e2706d96e2f923fcfb1d0260e6ced275b80b80fa7f66fd01e3086bf4e",
+    "vbmi-candidate.cpp": "d50f0c9698b15e218d4d5033863a12cd2b8ed8a4f92929d6dfa6de2e27bccf81",
+    "vbmi-down16.jsonl": "f81ad0ffa64c911a15fd07114bd138c2efbaef5dc982fe87581b98fad7a1513b",
+    "vbmi-down64.jsonl": "e92182ee46d1e4a94570a9f8b2932f9c4d48fc590b841aeb3b5bc167449fa1ec",
+    "vbmi-gate16.jsonl": "08d6ee4604284d7cd153cb10f1efd6e7782138e9ad36754e5f32fd1c0e39736c",
+    "vbmi-gate64.jsonl": "6d7b3afbb6f3832c43260ffbe2f1d793273ab287631353c56c5fd7e24112cb9e",
+    "vbmi-head64.jsonl": "39f906f2728a0a808f180b8a2550f01ca9cb0827917fbd7b7d9194fd809a6be4",
+    "vbmi.cpp": "e1f70664ab097344b9b290c165729f12de42f04c5358465415c88b05ff1126af"
+  },
+  "test_artifact": {
+    "status": "test_only_unpublished_undeployed",
+    "sha256": "28ec8ef303d1e24a4af5f92352acfe6a36c7278bfa014583275f49f2b8b38027",
+    "bytes": 6768183,
+    "path": "/home/steven/enclave-bench/shield-decode-tuning-20260930/eyesoff-speculative-control-test-only.wasm",
+    "native_tests_passed": 226,
+    "wasm_target": "wasm32-wasip2",
+    "performance_gain_claimed": false,
+    "needs_new_catalog_version_before_publication": true
+  }
+}

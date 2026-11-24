@@ -1,0 +1,38 @@
+{
+  "date": "2026-09-30",
+  "production_deployed": false,
+  "artifact": {
+    "path": "cron/target/wasm32-wasip2/release/enclave-cron.wasm",
+    "sha256": "e1df979f5f4c01ac5b7c82ba63e5e7618ca48f9ed5a9d4bac41a5bf8c6e050cf",
+    "target": "wasm32-wasip2"
+  },
+  "rust_tests": {"passed": 24, "failed": 0},
+  "wasm_integration": {
+    "command": "python3 cron/tests/e2e.py --https-check",
+    "passed": [
+      "SigV4 storage signing",
+      "encrypted durable writes",
+      "HTTP webhook dispatch",
+      "CAS lease exclusivity",
+      "per-user API/target isolation",
+      "autonomous one-time dispatch",
+      "authenticated Eyesoff callback",
+      "MCP tools",
+      "same-second idempotent manual run",
+      "restart preserves jobs/results",
+      "skip missed after crash",
+      "storage failure fences effects",
+      "interrupted delivery is not replayed",
+      "live CAS conflict fences effects",
+      "corrupt state fails closed",
+      "public HTTPS ping with certificate verification"
+    ],
+    "scope": "Local synthetic S3 and Eyesoff services, except an unauthenticated HTTPS GET to eyesoff.ai/ping. No production model requests."
+  },
+  "browser_smoke": {
+    "passed": ["connect with synthetic identity", "create one-time job", "observe autonomous successful execution and retained result"],
+    "scope": "Chrome against local Wasm demo, synthetic credentials and callback. Accessibility-state verification; screenshot capture timed out."
+  },
+  "missed_job_policy": "Skip expired one-time jobs and recurring backlog; resume recurring jobs at the next future occurrence.",
+  "deployment_remaining": ["durable conditional-write storage and secrets", "per-user Eyesoff callback credentials", "publish and deploy scheduler app", "merge MCP entry into Eyesoff configuration", "verify hosted end-to-end execution"]
+}
