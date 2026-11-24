@@ -1243,6 +1243,25 @@ plain 16.00 against 15.73 (0.27, standard error 0.29), the native engine 16.68
 and 15.91 in the same rounds. Rebuilding the graphs seven times is too little
 to see, so the bound stays a constant.
 
+Not the cause: pads. With every product exchanged, 1 to 20 of about 74,000
+exchanges in a run make their own pad (35 to 62 ms each), and the time lost
+that way does not follow a run's speed (correlation -0.2 over twelve runs).
+
+Threads, measured the same day (300 tokens, two to four rounds a setting, so
+read the direction and not the digits). The native engine gains from six
+application threads where the route does not: native plain 59.6 ms a token at
+six against 64.0 at four, drafting 16.77 against 16.46; the route at six, 62.3
+ms and 16.37. A profile says why the route stays flat as built: its requesting
+thread waits 21.5% of its time at the OpenMP barrier at six threads (7.1% at
+four), the native engine's 10.1% (8.6%). Spinning workers and an unpinned
+requesting thread change nothing. The draft step follows the OpenCL runtime's
+own threads (`POCL_MAX_PTHREAD_COUNT`), which the harness had tied to the
+application's: 5.1 to 6.4 ms with four, 7.5 to 9.2 with two (what the packaged
+wrapper sets), 11.4 to 12.4 with one, and no better with six or eight. Six
+application threads with four runtime threads gave the route plain 57.1 and
+60.8 ms, the native engine's figure at six. So the two counts are separate
+settings, and a guest with more than four processors wants the runtime at four.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
