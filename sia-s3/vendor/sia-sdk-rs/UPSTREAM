@@ -1,1 +1,6 @@
 e1d1ebe097835b728108dd809b7bc2e4cbcf801c
+
+Local test-only changes (not upstream): src/rhp4/mock.rs gains an optional, native-only, disk-backed mock
+sector store, and src/mock.rs gains MockNetwork::with_disk_sectors / sector_dir / sector_bytes. Both exist only
+under cfg(test) or the `mock` feature. The in-memory default is unchanged. See sia-s3/REPLICATION.md, "Test memory:
+the disk-backed mock".

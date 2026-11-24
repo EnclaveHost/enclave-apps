@@ -14,9 +14,229 @@ use sia_core::types::{Currency, Hash256};
 use super::{Error as RHP4Error, HostEndpoint, Transport};
 use crate::time::{Duration, Instant, sleep};
 
+/// Where the mock hosts keep the sectors written to them.
+///
+/// `Memory` (the default) holds every sector in RAM, as the mock always has.
+/// `Disk` keeps the same bytes in files under a directory this mock created
+/// itself, so tests that write thousands of 4 MiB sectors (every one really
+/// encrypted, erasure-coded and root-hashed by the SDK) can run in bounded
+/// memory. Both answer reads identically: the same bytes, the same ranges,
+/// the same "host not found" / "sector not found" errors, the same `clear`.
+/// Test/mock support only - never a production host backend.
+enum Sectors {
+    Memory(HashMap<PublicKey, HashMap<Hash256, Bytes>>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Disk(disk::DiskSectors),
+}
+
+impl Sectors {
+    fn put(&mut self, host: PublicKey, root: Hash256, sector: Bytes) -> Result<(), RHP4Error> {
+        match self {
+            Sectors::Memory(m) => {
+                m.entry(host).or_default().insert(root, sector);
+                Ok(())
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Sectors::Disk(d) => d.put(host, root, &sector),
+        }
+    }
+
+    fn get(&self, host: &PublicKey, root: &Hash256, range: Range<usize>) -> Result<Bytes, RHP4Error> {
+        match self {
+            Sectors::Memory(m) => {
+                let host_sectors = m
+                    .get(host)
+                    .ok_or_else(|| RHP4Error::Transport("host not found".to_string()))?;
+                let sector = host_sectors
+                    .get(root)
+                    .ok_or_else(|| RHP4Error::Transport("sector not found".to_string()))?;
+                Ok(Bytes::copy_from_slice(&sector[range]))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Sectors::Disk(d) => d.get(host, root, range),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Sectors::Memory(m) => m.clear(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Sectors::Disk(d) => d.clear(),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod disk {
+    //! Sectors in files, for the mock only.
+    //!
+    //! Layout: `<dir>/<hex host key>/<hex sector root>.sector`, where `dir` is
+    //! a directory THIS store created (fresh, unique) under a base the caller
+    //! names. Every path is derived from two validated 32-byte binary values -
+    //! the host's public key and the sector's root, which the transport itself
+    //! computed from the bytes - so no caller-supplied string ever reaches the
+    //! filesystem, and only files this store wrote are ever read or removed.
+    //! Cleanup removes exactly those files, then the (by then empty) host
+    //! directories and `dir`; it never removes anything recursively, so a
+    //! stray file someone else put there is left alone and reported.
+    use std::collections::{HashMap, HashSet};
+    use std::fs::{self, File};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+    use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use bytes::Bytes;
+    use sia_core::signing::PublicKey;
+    use sia_core::types::Hash256;
+
+    use super::RHP4Error;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) struct DiskSectors {
+        dir: PathBuf,
+        held: HashMap<PublicKey, HashMap<Hash256, u64>>,
+        host_dirs: HashSet<PublicKey>,
+        bytes: u64,
+        limit: u64,
+    }
+
+    fn io_err(what: &str, e: io::Error) -> RHP4Error {
+        RHP4Error::Transport(format!("mock sector store: {what}: {e}"))
+    }
+
+    impl DiskSectors {
+        /// A fresh, unique directory under `base` (which must already exist
+        /// and be a directory), holding at most `limit` bytes of sectors.
+        pub(crate) fn create(base: &Path, limit: u64) -> io::Result<DiskSectors> {
+            if !fs::metadata(base)?.is_dir() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "the sector base is not a directory"));
+            }
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            for _ in 0..16 {
+                let n = NEXT.fetch_add(1, Ordering::Relaxed);
+                let dir = base.join(format!("sia-mock-sectors-{}-{nanos}-{n}", std::process::id()));
+                match fs::create_dir(&dir) {
+                    Ok(()) => return Ok(DiskSectors { dir, held: HashMap::new(), host_dirs: HashSet::new(), bytes: 0, limit }),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, "no unique sector directory could be made"))
+        }
+
+        pub(crate) fn dir(&self) -> &Path {
+            &self.dir
+        }
+
+        pub(crate) fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        fn host_dir(&self, host: &PublicKey) -> PathBuf {
+            self.dir.join(hex::encode(<PublicKey as AsRef<[u8]>>::as_ref(host)))
+        }
+
+        fn path(&self, host: &PublicKey, root: &Hash256) -> PathBuf {
+            let r: [u8; 32] = (*root).into();
+            self.host_dir(host).join(format!("{}.sector", hex::encode(r)))
+        }
+
+        /// Store one sector. A sector is named by its own root, so a second
+        /// write of the same root on the same host is the same bytes and
+        /// changes nothing. Over the byte budget, or on any I/O failure, the
+        /// write fails - it is never silently dropped.
+        pub(crate) fn put(&mut self, host: PublicKey, root: Hash256, data: &[u8]) -> Result<(), RHP4Error> {
+            if self.held.get(&host).is_some_and(|h| h.contains_key(&root)) {
+                return Ok(());
+            }
+            let len = data.len() as u64;
+            if self.bytes.saturating_add(len) > self.limit {
+                return Err(RHP4Error::Transport(format!(
+                    "mock sector store: over its {} byte budget",
+                    self.limit
+                )));
+            }
+            if !self.host_dirs.contains(&host) {
+                fs::create_dir(self.host_dir(&host)).map_err(|e| io_err("host directory", e))?;
+                self.host_dirs.insert(host);
+            }
+            let path = self.path(&host, &root);
+            let part = path.with_extension("part");
+            let written = (|| -> io::Result<()> {
+                let mut f = File::create_new(&part)?;
+                f.write_all(data)?;
+                f.flush()?;
+                drop(f);
+                fs::rename(&part, &path)
+            })();
+            if let Err(e) = written {
+                let _ = fs::remove_file(&part);
+                return Err(io_err("write", e));
+            }
+            self.held.entry(host).or_default().insert(root, len);
+            self.bytes += len;
+            Ok(())
+        }
+
+        /// Read `range` of one sector, straight from its file. Errors match
+        /// the in-memory store's; a range outside the sector is an error here
+        /// rather than the in-memory store's slice panic.
+        pub(crate) fn get(&self, host: &PublicKey, root: &Hash256, range: Range<usize>) -> Result<Bytes, RHP4Error> {
+            let host_sectors = self
+                .held
+                .get(host)
+                .ok_or_else(|| RHP4Error::Transport("host not found".to_string()))?;
+            let len = *host_sectors
+                .get(root)
+                .ok_or_else(|| RHP4Error::Transport("sector not found".to_string()))?;
+            if range.start > range.end || range.end as u64 > len {
+                return Err(RHP4Error::Transport("range outside the sector".to_string()));
+            }
+            let mut f = File::open(self.path(host, root)).map_err(|e| io_err("open", e))?;
+            f.seek(SeekFrom::Start(range.start as u64)).map_err(|e| io_err("seek", e))?;
+            let mut buf = vec![0u8; range.end - range.start];
+            f.read_exact(&mut buf).map_err(|e| io_err("read", e))?;
+            Ok(Bytes::from(buf))
+        }
+
+        /// Forget and delete every sector, as hosts losing their data.
+        pub(crate) fn clear(&mut self) {
+            for (host, sectors) in std::mem::take(&mut self.held) {
+                for root in sectors.keys() {
+                    let p = self.path(&host, root);
+                    if let Err(e) = fs::remove_file(&p) {
+                        eprintln!("mock sector store: could not remove {}: {e}", p.display());
+                    }
+                }
+            }
+            self.bytes = 0;
+        }
+    }
+
+    impl Drop for DiskSectors {
+        fn drop(&mut self) {
+            self.clear();
+            for host in std::mem::take(&mut self.host_dirs) {
+                let d = self.host_dir(&host);
+                if let Err(e) = fs::remove_dir(&d) {
+                    eprintln!("mock sector store: could not remove {}: {e}", d.display());
+                }
+            }
+            if let Err(e) = fs::remove_dir(&self.dir) {
+                eprintln!("mock sector store: could not remove {}: {e}", self.dir.display());
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
-    sectors: Arc<RwLock<HashMap<PublicKey, HashMap<Hash256, Bytes>>>>,
+    sectors: Arc<RwLock<Sectors>>,
     slow_hosts: Arc<RwLock<HashSet<PublicKey>>>,
     slow_delay: Arc<RwLock<Duration>>,
     /// Per-sector read delay. After each read, the delay is halved. Used to
@@ -39,7 +259,7 @@ impl Default for Client {
 impl Client {
     pub fn new() -> Self {
         Self {
-            sectors: Arc::new(RwLock::new(HashMap::new())),
+            sectors: Arc::new(RwLock::new(Sectors::Memory(HashMap::new()))),
             slow_hosts: Arc::new(RwLock::new(HashSet::new())),
             slow_delay: Arc::new(RwLock::new(Duration::ZERO)),
             read_delays: Arc::new(RwLock::new(HashMap::new())),
@@ -49,6 +269,35 @@ impl Client {
             price_requests: Arc::new(AtomicUsize::new(0)),
             price_failures: Arc::new(AtomicUsize::new(0)),
             read_requests: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// As [`Client::new`], but the hosts keep their sectors in files under a
+    /// fresh directory created inside `base` (see [`Sectors`]), holding at most
+    /// `limit` bytes. The directory and every file in it are removed when the
+    /// last clone of this client is dropped.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_disk_sectors(base: &std::path::Path, limit: u64) -> std::io::Result<Self> {
+        let c = Self::new();
+        *c.sectors.write().unwrap() = Sectors::Disk(disk::DiskSectors::create(base, limit)?);
+        Ok(c)
+    }
+
+    /// The directory a disk-backed client keeps its sectors in.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sector_dir(&self) -> Option<std::path::PathBuf> {
+        match &*self.sectors.read().unwrap() {
+            Sectors::Disk(d) => Some(d.dir().to_path_buf()),
+            Sectors::Memory(_) => None,
+        }
+    }
+
+    /// Bytes of sectors a disk-backed client currently holds.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sector_bytes(&self) -> Option<u64> {
+        match &*self.sectors.read().unwrap() {
+            Sectors::Disk(d) => Some(d.bytes()),
+            Sectors::Memory(_) => None,
         }
     }
 
@@ -185,9 +434,7 @@ impl Transport for Client {
 
         sleep(Duration::from_millis(3)).await; // simulate network latency ~ 10Gbps
         let sector_root = sia_core::rhp4::sector_root(&sector);
-        let mut sectors = self.sectors.write().unwrap();
-        let host_sectors = sectors.entry(host.public_key).or_default();
-        host_sectors.insert(sector_root, sector);
+        self.sectors.write().unwrap().put(host.public_key, sector_root, sector)?;
         if let Some(delay) = *self.initial_read_delay.read().unwrap() {
             self.read_delays.write().unwrap().insert(sector_root, delay);
         }
@@ -235,16 +482,7 @@ impl Transport for Client {
             sleep(delay).await;
         }
 
-        let sector = {
-            let sectors = self.sectors.read().unwrap();
-            let host_sectors = sectors
-                .get(&host.public_key)
-                .ok_or_else(|| RHP4Error::Transport("host not found".to_string()))?;
-            let sector = host_sectors
-                .get(&root)
-                .ok_or_else(|| RHP4Error::Transport("sector not found".to_string()))?;
-            Bytes::copy_from_slice(&sector[range])
-        };
+        let sector = self.sectors.read().unwrap().get(&host.public_key, &root, range)?;
         sleep(Duration::from_nanos(sector.len() as u64 * 8 / 10)).await; // simulate network latency ~ 10Gbps
         Ok((sector, start.elapsed()))
     }

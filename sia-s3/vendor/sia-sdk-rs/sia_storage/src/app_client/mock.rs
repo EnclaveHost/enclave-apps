@@ -61,6 +61,10 @@ struct State {
     pin_slabs_requests: Vec<Vec<SlabPinParams>>,
     pin_slabs_errors: VecDeque<Error>,
     sharing_keys: HashMap<PublicKey, StoredSharingKey>,
+    /// While set, every account-facing call fails as an unreachable indexer would.
+    offline: bool,
+    /// Faults the next calls of an operation suffer, in order (see [`crate::mock::Fault`]).
+    faults: HashMap<&'static str, VecDeque<crate::mock::Fault>>,
 }
 
 /// An in-memory stand-in for the indexer API.
@@ -69,9 +73,13 @@ struct State {
 /// [`SealedObject`] they were pinned with, so `seal`/`open` still round-trips,
 /// and [`Client::hosts`] honours `offset`/`limit` so the SDK's paged host
 /// refresh terminates. Other [`HostQuery`] filters are ignored.
+/// A call the mock indexer will apply only when the test says so.
+type Deferred = Box<dyn FnOnce(&Client) + Send>;
+
 #[derive(Clone, Default)]
 pub(crate) struct Client {
     state: Arc<RwLock<State>>,
+    deferred: Arc<std::sync::Mutex<Vec<Deferred>>>,
 }
 
 #[cfg(test)]
@@ -120,7 +128,81 @@ impl Client {
         self.state.read().unwrap().pin_slabs_calls
     }
 
+    /// Makes the indexer unreachable (or reachable again). Stored objects and
+    /// slabs are kept, as they would be across a real outage.
+    pub(crate) fn set_offline(&self, offline: bool) {
+        self.state.write().unwrap().offline = offline;
+    }
+
+    /// Queues `fault` for the next call of `op` (`"pin_object"`, `"pin_slabs"` or `"delete_object"`).
+    pub(crate) fn push_fault(&self, op: &'static str, fault: crate::mock::Fault) {
+        self.state.write().unwrap().faults.entry(op).or_default().push_back(fault);
+    }
+
+    fn take_fault(&self, op: &'static str) -> Option<crate::mock::Fault> {
+        self.state.write().unwrap().faults.get_mut(op).and_then(|q| q.pop_front())
+    }
+
+    /// Runs `apply` as the fault for `op` dictates: normally; then reporting a
+    /// lost response; never answering; or applying it later, in the background,
+    /// while the caller waits forever (a request the client gave up on that the
+    /// indexer still carries out).
+    async fn with_fault<T, E: From<Error>>(
+        &self,
+        op: &'static str,
+        apply: impl FnOnce(&Client) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        use crate::mock::Fault;
+        match self.take_fault(op) {
+            None => apply(self),
+            Some(Fault::ApplyThenFail) => {
+                apply(self)?;
+                Err(Error::Api(StatusCode::BAD_GATEWAY, format!("{op}: response lost")).into())
+            }
+            Some(Fault::Hang) => std::future::pending().await,
+            Some(Fault::ApplyLate(delay)) => {
+                let me = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = apply(&me);
+                });
+                std::future::pending().await
+            }
+            Some(Fault::Defer) => {
+                self.deferred.lock().unwrap().push(Box::new(move |me: &Client| {
+                    let _ = apply(me);
+                }));
+                std::future::pending().await
+            }
+        }
+    }
+
+    /// Applies every deferred call now, in the order they were made; returns how many.
+    pub(crate) fn apply_deferred(&self) -> usize {
+        let calls: Vec<Deferred> = std::mem::take(&mut *self.deferred.lock().unwrap());
+        let n = calls.len();
+        for call in calls {
+            call(self);
+        }
+        n
+    }
+
+    fn reachable(&self) -> Result<(), Error> {
+        if self.state.read().unwrap().offline {
+            return Err(Error::Api(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mock indexer offline".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn check_app_authenticated(&self, _: &PrivateKey) -> Result<bool, Error> {
+        self.reachable()?;
         Ok(true)
     }
 
@@ -168,6 +250,7 @@ impl Client {
     }
 
     pub(crate) async fn hosts(&self, _: &PrivateKey, query: HostQuery) -> Result<Vec<Host>, Error> {
+        self.reachable()?;
         let state = self.state.read().unwrap();
         let offset = query.offset.unwrap_or(0) as usize;
         let limit = query.limit.map_or(usize::MAX, |l| l as usize);
@@ -192,6 +275,7 @@ impl Client {
         _: &PrivateKey,
         key: &Hash256,
     ) -> Result<SealedObject, Error> {
+        self.reachable()?;
         self.state
             .read()
             .unwrap()
@@ -207,6 +291,7 @@ impl Client {
         cursor: Option<ObjectsCursor>,
         limit: Option<usize>,
     ) -> Result<Vec<SealedObjectEvent>, Error> {
+        self.reachable()?;
         let state = self.state.read().unwrap();
         let mut events: Vec<SealedObjectEvent> = state
             .objects
@@ -235,25 +320,36 @@ impl Client {
         _: &PrivateKey,
         object: &SealedObject,
     ) -> Result<(), PinObjectError> {
-        let mut state = self.state.write().unwrap();
-        if object
-            .slabs
-            .iter()
-            .any(|slab| !state.slabs.contains_key(&slab.digest()))
-        {
-            return Err(PinObjectError::UnpinnedSlab);
-        }
-        state.objects.insert(
-            object.id(),
-            StoredObject {
-                sealed: Some(object.clone()),
-                updated_at: Utc::now(),
-            },
-        );
-        Ok(())
+        self.reachable()?;
+        let object = object.clone();
+        self.with_fault("pin_object", move |me| {
+            let mut state = me.state.write().unwrap();
+            if object
+                .slabs
+                .iter()
+                .any(|slab| !state.slabs.contains_key(&slab.digest()))
+            {
+                return Err(PinObjectError::UnpinnedSlab);
+            }
+            state.objects.insert(
+                object.id(),
+                StoredObject {
+                    sealed: Some(object.clone()),
+                    updated_at: Utc::now(),
+                },
+            );
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn delete_object(&self, _: &PrivateKey, key: &Hash256) -> Result<(), Error> {
+        self.reachable()?;
+        let key = *key;
+        self.with_fault("delete_object", move |me| me.apply_delete(&key)).await
+    }
+
+    fn apply_delete(&self, key: &Hash256) -> Result<(), Error> {
         let mut state = self.state.write().unwrap();
         match state.objects.get_mut(key) {
             Some(stored) => {
@@ -280,6 +376,10 @@ impl Client {
         _: &PrivateKey,
         slabs: &[SlabPinParams],
     ) -> Result<Vec<Hash256>, Error> {
+        self.reachable()?;
+        if let Some(crate::mock::Fault::Hang) = self.take_fault("pin_slabs") {
+            return std::future::pending().await;
+        }
         let mut state = self.state.write().unwrap();
         state.pin_slabs_calls += 1;
         #[cfg(test)]
@@ -311,6 +411,7 @@ impl Client {
         _: &PrivateKey,
         _before: Option<DateTime<Utc>>,
     ) -> Result<(), Error> {
+        self.reachable()?;
         let mut state = self.state.write().unwrap();
         let referenced: HashSet<Hash256> = state
             .objects
@@ -323,6 +424,7 @@ impl Client {
     }
 
     pub(crate) async fn account(&self, app_key: &PrivateKey) -> Result<Account, Error> {
+        self.reachable()?;
         let state = self.state.read().unwrap();
         let pinned_size: u64 = state
             .slabs
