@@ -1289,6 +1289,18 @@ backend is not the slower one (link total 17.6 s against 19.3 s, the products
 the backend: in that set the route's plain step was the faster (61.2 ms against
 62.7) and its verify step the slower (104.6 against 100.6).
 
+By rows, from the executor's side with the continuation off (one run): one-row
+requests 73,950 at 174 us of service, two-row requests 40,267 at 267 us (the
+two-row figure includes the prompt's wide batches). Taking the step times, a
+plain step is 42.9 ms of service and 21.7 ms in the client, a verify step 66.7
+and 39.3: the second row costs the client 1.8 times and the executor 1.5. A
+profile in three-second buckets (`~/shield-perf/prof/wallprof2.so`,
+`WALLPROF_BUCKET_MS`) puts 4 to 6% of the requesting thread in memory copies in
+one generation phase and 0.5% in the other; two thirds of those copies are the
+processor backend's own (the gated delta net's state) and a third the reads at
+the boundary between the two backends, which the native engine makes too.
+Nothing in it that is the route's alone.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
