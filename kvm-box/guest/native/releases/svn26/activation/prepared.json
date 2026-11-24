@@ -1,0 +1,81 @@
+{
+  "target": "C:\\ProgramData\\Enclave\\native-desktop\\releases\\07c4efd2fe3db9bc906e0d89d4db62284ed5747d534d204efbd4e758cbbc24a1",
+  "previousTarget": "C:\\ProgramData\\Enclave\\native-desktop\\releases\\8695919cb134018d3ce58e771ad9053a0586f543ac8ccea3bc2bbfbe41f0840e",
+  "guestSvn": 26,
+  "imageSha256": "07c4efd2fe3db9bc906e0d89d4db62284ed5747d534d204efbd4e758cbbc24a1",
+  "profileSha256": "c84c58bf0e5140d475f2f106a3ceddf5c7e090467b56b1b60d53cb66058a8b3a",
+  "launchMeasurement": "c4664608d87ab50ffcf5c2574079081d7203b6e58e129302a709fe2697ae8a09",
+  "controllerCid": "bafybeig564vcjghux3gnfgzpcdddtxl6mlvrzelmhe7qnapi7ejnsmpoxa",
+  "controllerSha256": "e05247f88eb521d48507ff49bb88d16b5bba2df75fb2794b2082382ae7506630",
+  "catalog": {
+    "app": "0x8e8a1340ca7e9ea1490ce15295d722c3f5186db9e0d0f1094661dbe919d8208c",
+    "version": 2,
+    "label": "0.9.2"
+  },
+  "deployment": "0xf9bb979ae685c7f16f6c49df3f35f76ff38aca86b5ce3e76e02b83115360dd58",
+  "purchased": {
+    "cpuMilli": 170,
+    "gpuMilli": 100
+  },
+  "appId": "7d4c0f91932378acc03eeb5b6aec71fab4891dbe493d203ac4d7bf920523729f",
+  "previousAppId": "970444895772c6bfe55c418614a7612464fd903329aad5356e3ba7186a515525",
+  "recordSha256": "c97cc2a67ea7c74cb899c0bea26969fcb062c328da0c75b3d96b61a148675152",
+  "ownerSignatureNeeded": false,
+  "releaseSchema": "enclave-desktop-release/2",
+  "hostBundle": {
+    "version": "2026.11.20",
+    "commit": "b602b569a8d6cdce522fee7ded74acd8b510b238",
+    "zipSha256": "01c7255d9a2c88624155320ee5b9050738de6bb7c6604e10e169f782fbf240f7"
+  },
+  "hostBundleChanges": false,
+  "oldPolicySha256": "ae6326749c2b30b6317f41487bff932c448d560b3ba4e3e694a235a3226e31dc",
+  "files": {
+    "desktop-config.json": "ac8aade4979e3d384c4acb7eda764a75d2e8cd82ae8d4c49be28f335d03f9e1c",
+    "desktop-release.json": "be76d7d744d607a2a90c6a013c5f1730fb38e1c6a7594ef4296a68f19c13048d",
+    "shield-policy.json": "866bc49effcf7fb588af0f2b98feb4b064b3c7a8bf2afb4a8893294242d6bfe1",
+    "derived.json": "944d68a39caf90d4d4e3c046b7696b0e52e2ab30ad7b103e96a7f4e084c2d3f4",
+    "native-desktop-env.cmd": "dd8a3cf4544e8f746a9e3a50dcebca5a385cdcfd7e9b38d2c3b999faf1b1b98c"
+  },
+  "stage": {
+    "native-igvm.bin": {
+      "bytes": 86637572,
+      "sha256": "07c4efd2fe3db9bc906e0d89d4db62284ed5747d534d204efbd4e758cbbc24a1"
+    },
+    "root.iso": {
+      "bytes": 596520960,
+      "sha256": "5446eebafd70cf8c285ac25a10f7ae357d7a041ea4eccd87cce67be4ea86b7c7"
+    },
+    "hashes.iso": {
+      "bytes": 4767744,
+      "sha256": "0631870caac2c8cb81d65a7af862dde70e4d69376cc5f2a8e6c997e4d509e541"
+    },
+    "models.iso": {
+      "bytes": 20794515456,
+      "sha256": "2887bde950db7bca139b5b4317cc2027ac391e601068d6d75197d157924db964"
+    },
+    "profile.json": {
+      "bytes": 1069,
+      "sha256": "c84c58bf0e5140d475f2f106a3ceddf5c7e090467b56b1b60d53cb66058a8b3a"
+    },
+    "desktop-config.json": {
+      "bytes": 3529,
+      "sha256": "ac8aade4979e3d384c4acb7eda764a75d2e8cd82ae8d4c49be28f335d03f9e1c"
+    },
+    "desktop-release.json": {
+      "bytes": 618,
+      "sha256": "be76d7d744d607a2a90c6a013c5f1730fb38e1c6a7594ef4296a68f19c13048d"
+    },
+    "native-desktop-env.cmd": {
+      "bytes": 833,
+      "sha256": "dd8a3cf4544e8f746a9e3a50dcebca5a385cdcfd7e9b38d2c3b999faf1b1b98c"
+    },
+    "shield-policy.json": {
+      "bytes": 9305,
+      "sha256": "866bc49effcf7fb588af0f2b98feb4b064b3c7a8bf2afb4a8893294242d6bfe1"
+    },
+    "shielded-bridge.exe": {
+      "copyFrom": "C:\\ProgramData\\Enclave\\native-desktop\\releases\\8695919cb134018d3ce58e771ad9053a0586f543ac8ccea3bc2bbfbe41f0840e\\shielded-bridge.exe",
+      "sha256": "cc751de67c7d303f989367e1ac5ed5eb316f2b13cd10be74ff44256551d18d73"
+    }
+  }
+}

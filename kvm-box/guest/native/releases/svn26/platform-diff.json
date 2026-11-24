@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "against": "native-shield-image-v22 (SVN25, the live release)",
+  "changes": [
+    "plat/native-boot",
+    "plat/native-desktop/profile.json"
+  ],
+  "allOtherEntriesIdentical": true
+}

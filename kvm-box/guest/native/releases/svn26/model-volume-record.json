@@ -1,0 +1,28 @@
+{
+  "name": "kvm-box-public-models-v5",
+  "source": "/home/steven/Documents/Codex/2026-10-23/it/work/native-models-image-v23/models-src",
+  "fs": "ext4",
+  "builtBy": "metal/volumes.mjs",
+  "bytes": 19998467136,
+  "files": [
+    "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+    "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "sd15-q8.gguf"
+  ],
+  "fileCount": 3,
+  "gguf": null,
+  "sd": false,
+  "image": "volume.img",
+  "imageBytes": 20794449920,
+  "verity": {
+    "alg": "sha256",
+    "root": "52703ab7ab78f0e44b0bcb740a3cf6d2afa7c6af4a7b49d1ba4647273f1b66cb",
+    "salt": "c238d2ec3fc5b4d1b9552b9c24ce4287185127d2aae10fdac232a433cf3577f2",
+    "dataBlockSize": 4096,
+    "hashBlockSize": 4096,
+    "dataBlocks": 5037104,
+    "hashOffset": 20631977984,
+    "hashStartBlock": 5037105
+  },
+  "note": "Rebuild with: node metal/volumes.mjs build kvm-box-public-models-v5 --src <same tree> --force  → the same root hash. The enclave attests to this root hash; nothing else about this file is trusted."
+}

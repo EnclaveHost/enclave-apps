@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "against": "native-shield-image-v22 (the root image of SVN25)",
+  "changes": [
+    "shield/model-volume.json",
+    "shield/mount-models.sh"
+  ],
+  "allOtherEntriesIdentical": true
+}
