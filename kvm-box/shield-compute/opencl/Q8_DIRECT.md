@@ -1271,6 +1271,24 @@ us a call. Having the backend write straight into the client's memory would
 need the sentinel written there at request time, which costs what the copy
 does, so the copy stays.
 
+Three more that came to nothing, the same day. (1) The continuation computed
+ahead (`SHIELD_Q8_AHEAD_INLINE`), five alternating rounds on and off: verify
+104.8 ms on against 104.0 off, plain 62.7 against 62.3. It is worth nothing
+measurable on this model, so the wider form of it was not built: after 60,198
+single products of a run the client asks for the next within 80 us (37,802 of
+them in 10 to 20 us; 1.17 s in all), which looks like room to start the next
+product early, and is the same head start the feed-forward continuation already
+has. (2) glibc's allocator kept from unmapping (`MALLOC_MMAP_THRESHOLD_`,
+`MALLOC_TRIM_THRESHOLD_`, `MALLOC_TOP_PAD_`) in the executor, in the client and
+in the native engine, whose requesting thread spends 5% of its time in munmap:
+no change in any of the three (route verify 104.6 ms, 105.6 with the executor's
+set, 106.6 with both; native 100.6 and 103.4). (3) The backend's own profile
+(`SHIELDED_PROFILE`) in the executor and in the native engine: the executor's
+backend is not the slower one (link total 17.6 s against 19.3 s, the products
+14.2 s against 15.0 s). What the route loses it loses at two rows and outside
+the backend: in that set the route's plain step was the faster (61.2 ms against
+62.7) and its verify step the slower (104.6 against 100.6).
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
