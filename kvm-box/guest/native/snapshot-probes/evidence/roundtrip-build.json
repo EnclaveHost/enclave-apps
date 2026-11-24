@@ -1,0 +1,54 @@
+{
+  "schema": "native-synthetic-roundtrip-build/1",
+  "scope": "PID1-only synthetic two-cold-boot diagnostic using public test key and placeholder binding fixtures; never a production app image",
+  "booted": false,
+  "restoreQualified": false,
+  "candidate": {
+    "binSha": "cd5b06ded55dec460547531e47ca4de22775b9fc11e1d52d58c9e34e92df41e7",
+    "bytes": 53926428,
+    "vbsSha": "0b95c0ba7e3d47e9e3071ced5c53a9ec1823c09f9dd8915e6c1a2a049fab5b3c",
+    "digest": "3576F7D04E6119147E818CFAC9CF69D17770048F7827E251BF03FBF41645FD41",
+    "deterministic": true,
+    "sameAsCurrent": false,
+    "strings": {
+      "mustContain": [
+        [
+          "OPENHCL_FORCE_LOAD_VTL0_IMAGE=linux",
+          true
+        ],
+        [
+          "console=ttyS0 rdinit=/init loglevel=3 report_host=9001",
+          true
+        ]
+      ],
+      "mustNotContain": [
+        [
+          "OPENHCL_CONFIDENTIAL_DEBUG=1",
+          false
+        ]
+      ]
+    }
+  },
+  "inputs": {
+    "linux_initrd": "3e6682c236d6b77d87489a597f609291021848424e02bc9fcf8e25f837eec02e",
+    "linux_kernel": "f401ccc30759c48c29a63bdb36e9cd7b09b840e863016080716b644939870da8",
+    "underhill_initrd": "71a91101f8f9b870199946076db2b220c68167e029539d4619a6b7600432124e",
+    "manifest": "0ce9d8a87582bb5d60200d7f98c67ee357dbd042aec7338649c981753753df61",
+    "igvmfilegen": "81647f66a88559d68c4d7565dfdcc355305c00cc842b49403a3c5188c36e1a1c",
+    "recipe": "23a41fbd3babf52b29793f1d39f30a06ec707f6ce3fed06800913a72661dedce",
+    "builder": "c00624cc63f32ce79f2cb4b86e80f8e4c400b48c5163cadfc3c3b62d805c9bb0"
+  },
+  "buildReceipt": {
+    "exit": 0,
+    "lastCommandExit": 0,
+    "seconds": 5.85633457894437,
+    "guardStop": null,
+    "minRootFreeBytes": 1013886001152,
+    "peakOutputBytes": 341572039,
+    "scope": "Build only; candidate performs two-boot synthetic encrypted snapshot capture and restore using a PUBLIC TEST KEY and a dedicated new blank virtual disk. No VM launched. Not a production snapshot helper."
+  },
+  "sourceSha256": "13a5e01e4cc3360badbeda754f4076969e7f4542672a91192406d8a089016a52",
+  "initSha256": "3dccdaa65188ff53116342b5f0723ff317364ecea55d45166054ede54d765597",
+  "memoryGuard": "[memory-guard] exit=0 peakTreeRssMiB=719 minHostAvailableMiB=94050\n",
+  "cgroupPeakDisplay": "966.9M (swap: 0B), systemd-run retained output"
+}

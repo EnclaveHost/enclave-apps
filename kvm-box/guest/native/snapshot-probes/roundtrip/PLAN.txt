@@ -1,0 +1,38 @@
+Encrypted fresh-boot continuation diagnostic (source candidate)
+
+Not an app endpoint, not a production secret store. Its fixed key and binding
+digests are public synthetic fixtures. No real data/credentials are admitted.
+
+Build: static x86_64 Linux musl binary, deterministic initrd/IGVM using the
+previously pinned kernel and OpenHCL. Native envelope validation uses the same
+snapshot-crypto module as the tested transport. Record all source/input/output
+hashes. Local build grant does not grant a remote VM or disk operation.
+
+Proposed host lifecycle, NOT AUTHORIZED OR IMPLEMENTED HERE:
+- New unique run directory, nonreparse parent, fresh admission and pinned inputs.
+- New dynamically allocated 1 GiB VHDX created by New-VHD under that directory;
+  no Mount-VHD, USB, physical disk passthrough, existing volumes or formatting.
+- Guest has 2 GiB/1 CPU, one exact VHD path, no NIC/DVD/other disks. Boot 1 and
+  boot 2 use the same verified firmware and hardware identity. Preserve owned
+  VM settings/ID across a full Off -> Start cold boot, with fresh OpenHCL boot.
+- Boot 1: verify blank diagnostic disk and capacity, TPM command, freeze/capture,
+  stream authenticated ciphertext to the raw disk, commit frame after fsync,
+  overwrite a RAM sentinel and power off WITHOUT cancelling the checkpoint.
+- Require actual VM Off plus capture markers; no auto-start on timeout or an
+  ambiguous capture. Hash detached/offline VHD file and record bounded size.
+- Boot 2 needs separate fresh admission and exact-operation review. Guest
+  authenticates full envelope into private tmpfs, validates all expected
+  bindings and synthetic storage marker, loads /dev/snapshot, freezes/restores.
+- Acceptance requires previous original=1, committed encrypted frame and actual
+  power-off, followed by authenticated load in a NEW boot, original=0 return
+  to the captured CREATE_IMAGE call, RAM sentinel and post-restore TPM command.
+- TPM success is transport evidence, not attestation or secret-custody recovery.
+  The synthetic storage marker is not a writable filesystem consistency test.
+- Independent scheduled watchdog must bound each boot and remove only the
+  validated owned VM on failure, preserving the synthetic VHD for diagnostics.
+  Unknown creation/cleanup retains watchdog and requires reconciliation.
+- Verify prior VM identities/states, host/module/master pins and owned VM/task
+  absence; do not declare success from a serial COMPLETE/PASS marker alone.
+
+The existing live native app must never be stopped or used for this diagnostic.
+No desktop/GPU/admission/custody/production-snapshot capability follows from it.

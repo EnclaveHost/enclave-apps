@@ -1,0 +1,48 @@
+{
+  "watchdog-receipt.json": {
+    "at": "2026-10-28T02:24:31.1535135Z",
+    "id": null,
+    "secondAbsenceCheck": {
+      "at": "2026-10-28T02:24:33.2540805Z",
+      "id": null,
+      "absent": true
+    },
+    "absent": true
+  },
+  "result.json": {
+    "masterSha": "e93237a717a7e0e9fa201db2b331d2ed480274bfa47145854ea3ba85852abb96",
+    "id": "4c70b8ab-376b-4991-bd67-bb09c935c096",
+    "startedAt": "2026-10-28T02:23:01.9476842Z",
+    "sawComplete": true,
+    "run": "snap-08d36938",
+    "capture": "SNAPPROBE BEGIN capture-discard-v1\r\nSNAPPROBE /proc/cmdline = console=ttyS0 rdinit=/init loglevel=3 report_host=9001  \r\nSNAPPROBE /sys/power/state = freeze mem disk \r\nSNAPPROBE /sys/power/disk = [shutdown] reboot suspend test_resume  \r\nSNAPPROBE /sys/power/resume = 0:0 \r\nSNAPPROBE /sys/bus/vmbus/hibernation = 0 \r\nSNAPPROBE /sys/kernel/security/lockdown ERROR 2 No such file or directory\r\nSNAPPROBE /proc/meminfo = MemTotal:        1877208 kB MemFree:         1840548 kB MemAvailable:    1807172 kB Buffers:               0 kB Cached:              836 kB SwapCached:            0 kB Active:               88 kB Inactive:            748 kB Active(anon):         88 kB Inactive(anon):      748 kB Active(file):          0 kB Inactive(file):        0 kB Unevictable:           0 kB Mlocked:               0 kB SwapTotal:             0 kB SwapFree:              0 kB Dirty:                 0 kB Writeback:             0 kB AnonPages:            44 kB Mapped:              704 kB Shmem:               836 kB KReclaimable:        828 kB Slab:              11564 kB SReclaimable:        828 kB SUnreclaim:        10736 kB KernelStack:         976 kB PageTables:           12 kB SecPageTables:         0 kB NFS_Unstable:          0 kB Bounce:                0 kB WritebackTmp:          0 kB CommitLimit:      938604 kB Committed_AS:       1164 kB VmallocTotal:   34359738367 kB VmallocUsed:        7360 kB VmallocChunk:          0 kB Percpu:              276 kB HardwareCorrupted:     0 kB AnonHugePages:         0 kB ShmemHugePages:        0 kB ShmemPmdMapped:        0 kB FileHugePages:         0 kB FilePmdMapped:         0 kB Unaccepted:            0 kB HugePages_Total:       0 HugePages_Free:        0 HugePages_Rsvd:        0 HugePages_Surp:        0 Hugepagesize:       2048 kB Hugetlb:               0 kB DirectMap4k:       22528 kB DirectMap2M:     1019904 kB DirectMap1G:     2097152 kB \r\nSNAPPROBE FREEZE begin\r\nSNAPPROBE CREATE_IMAGE begin\r\nSNAPPROBE CREATE_IMAGE OK original=1\r\nSNAPPROBE IMAGE_SIZE 92291072\r\nSNAPPROBE IMAGE_READ OK bytes=92291072 diagnostic_fnv64=a483a7abe8948750\r\nSNAPPROBE FREE OK\r\nSNAPPROBE UNFREEZE OK\r\nSNAPPROBE CLOSE OK\r\nSNAPPROBE RESULT PASS\r\nSNAPPROBE COMPLETE capture-discard-v1\r\n",
+    "after": [
+      {
+        "Name": "enclave-app-hv371cd2082dd408-10c44a8a",
+        "Id": "0b118645-4768-4f30-871d-b99eb8333676",
+        "State": "Running"
+      },
+      {
+        "Name": "enclave-app-hv4c2e5185d0e5b8-a79db30f",
+        "Id": "1ca457d6-17bf-47fa-ad26-72770d74e08b",
+        "State": "Running"
+      },
+      {
+        "Name": "enclave-control",
+        "Id": "dd8df95d-b771-4545-a861-0092e74a40f3",
+        "State": "Running"
+      },
+      {
+        "Name": "enclave-storage",
+        "Id": "4a4ddcac-d06f-4a5c-b96e-e692302db5c8",
+        "State": "Running"
+      }
+    ],
+    "finishedAt": "2026-10-28T02:23:08.4383485Z",
+    "cleanup": {
+      "at": "2026-10-28T02:23:08.4378105Z",
+      "id": "4c70b8ab-376b-4991-bd67-bb09c935c096",
+      "absent": true
+    }
+  }
+}
