@@ -681,12 +681,15 @@ pub struct JitState {
 	present: Vec<u64>,
 	regions: Vec<JitRegion>,
 	free: Vec<u32>,
-	/// (table index, pc bias) -> installed instance
-	instances: ::fnv::FnvHashMap<(u64, u64), u32>,
+	/// (table index, pc bias, entry base) -> installed instance: a packed
+	/// module holds several regions, which may share a bias
+	instances: ::fnv::FnvHashMap<(u64, u64, u32), u32>,
 	/// block pcs whose code changed under a proven region (self-modifying
 	/// or JIT-generated guest code): never formed into a region again, so
 	/// the compile budget is not spent chasing code that keeps changing
 	volatile: ::fnv::FnvHashSet<u64>,
+	/// risc-box patch (packed modules): regions waiting for a module, emitted against `lay` (see jit_packs)
+	queue: Vec<PackCand>,
 	/// the execution view whose table holds our indices
 	owner: usize,
 	/// this run() may dispatch: owner thread, RV64
@@ -742,6 +745,19 @@ pub struct JitParams {
 	/// risc-box patch: when a region returns at a pc that starts another proven region, call that one directly
 	/// (within the same fuel) instead of going back through the block cache probe
 	pub chain: bool,
+	/// risc-box patch (packed modules): a region that clears its own need waits in a queue, already emitted, and a
+	/// module is compiled from the queue once it holds this many bytes (at most max_module_bytes)...
+	pub pack_target_bytes: usize,
+	/// ...or once its oldest region has waited this many formation passes...
+	pub pack_max_wait: u64,
+	/// ...or at once when a queued region shows this many times its own need in heat.
+	pub pack_hot_factor: u64,
+	/// module bytes compiled per formation pass, at most (compiles stall the machine's own thread)
+	pub max_pass_bytes: usize,
+	/// the verb policy's lifetime budget: modules and submitted bytes (0 = the policy's default, sized for the
+	/// production host's 256 modules / 16 MiB per execution view). Heat escalation spreads over the byte budget.
+	pub budget_modules: u32,
+	pub budget_bytes: u64,
 }
 
 #[cfg(feature = "codegen")]
@@ -766,6 +782,12 @@ impl Default for JitParams {
 			trace: false,
 			compile_pct: 100,
 			chain: true,
+			pack_target_bytes: 48 * 1024,
+			pack_max_wait: 4,
+			pack_hot_factor: 8,
+			max_pass_bytes: 128 * 1024,
+			budget_modules: 0,
+			budget_bytes: 0,
 		}
 	}
 }
@@ -797,6 +819,23 @@ pub struct JitStats {
 	pub volatile: u64,
 	/// time spent forming (and emitting/compiling) regions, microseconds
 	pub form_us: u64,
+	/// risc-box patch (packed modules): modules compiled from packs, regions placed in them, and regions installed
+	/// from the process-wide placement cache (re-formed, or formed by another machine) without a compile
+	pub packs: u64,
+	pub packed_regions: u64,
+	pub pack_reused: u64,
+	/// regions waiting in the pack queue now, and their bytes (upper bound)
+	pub queued: u64,
+	pub queued_bytes: u64,
+	/// packs submitted because the queue reached pack_target_bytes / its oldest region waited pack_max_wait
+	/// passes / a region was pack_hot_factor times its need
+	pub packs_full: u64,
+	pub packs_aged: u64,
+	pub packs_hot: u64,
+	/// queued regions dropped because their code changed before their pack was built, and because they waited
+	/// twice their deadline without a module having room for them
+	pub queue_stale: u64,
+	pub queue_expired: u64,
 }
 
 #[cfg(feature = "codegen")]
@@ -812,11 +851,13 @@ impl JitSlot {
 	const EMPTY: JitSlot = JitSlot { tag: 0, region: 0, entry: 0 };
 }
 
-/// One compiled module placed at a page-aligned pc bias.
+/// One compiled region placed at a page-aligned pc bias: a module of its
+/// own, or one group of a packed module (entries entry_base..+members).
 #[cfg(feature = "codegen")]
 struct JitRegion {
 	index: u64,
 	bias: u64,
+	entry_base: u32,
 	/// runtime start pc of each member block, in module block order, with
 	/// the (uncompressed word, length) stream the module was built from
 	members: Vec<(u64, Vec<(u32, u8)>)>,
@@ -894,7 +935,7 @@ impl JitState {
 		let r = &mut self.regions[rid as usize];
 		r.refs -= 1;
 		if r.refs == 0 {
-			self.instances.remove(&(r.index, r.bias));
+			self.instances.remove(&(r.index, r.bias, r.entry_base));
 			r.members = Vec::new();
 			r.pages = Vec::new();
 			r.page_gens = Vec::new();
@@ -908,15 +949,15 @@ impl JitState {
 		}
 	}
 
-	/// An instance of compiled `index` at `bias` (shared with an identical
-	/// one already installed).
-	fn instance(&mut self, index: u64, bias: u64, members: Vec<(u64, Vec<(u32, u8)>)>) -> u32 {
-		if let Some(&rid) = self.instances.get(&(index, bias)) {
+	/// An instance of the region at entry `base` of compiled `index`, at
+	/// `bias` (shared with an identical one already installed).
+	fn instance(&mut self, index: u64, bias: u64, base: u32, members: Vec<(u64, Vec<(u32, u8)>)>) -> u32 {
+		if let Some(&rid) = self.instances.get(&(index, bias, base)) {
 			return rid;
 		}
 		let r = JitRegion {
-			index, bias, members, pages: Vec::new(), proof_gen: 0, page_gens: Vec::new(), proof_glob: 0, alt: None,
-			checked: (0, 0), ok: false, refs: 0, calls: 0, retired: 0, empty: 0,
+			index, bias, entry_base: base, members, pages: Vec::new(), proof_gen: 0, page_gens: Vec::new(),
+			proof_glob: 0, alt: None, checked: (0, 0), ok: false, refs: 0, calls: 0, retired: 0, empty: 0,
 		};
 		let rid = match self.free.pop() {
 			Some(rid) => {
@@ -928,9 +969,30 @@ impl JitState {
 				(self.regions.len() - 1) as u32
 			}
 		};
-		self.instances.insert((index, bias), rid);
+		self.instances.insert((index, bias, base), rid);
 		self.stats.live_regions += 1;
 		rid
+	}
+
+	/// risc-box patch (packed modules): install region `c`, compiled at entry `base` of module `index`: its own
+	/// instance (own bias, own members, own proof), every member slot pointing at base + i.
+	fn place(&mut self, c: &PackCand, index: u64, base: u32) {
+		// blocks are in pc order: the region's block order
+		let words: Vec<(u64, Vec<(u32, u8)>)> =
+			c.blocks.iter().map(|b| (b.pc, b.ops.iter().map(|o| (o.word, o.len)).collect())).collect();
+		let rid = self.instance(index, c.bias, base, words);
+		for (i, b) in c.blocks.iter().enumerate() {
+			let slot = ((b.pc >> 1) as usize) & (BLOCK_SLOTS - 1);
+			self.install(slot, b.pc, rid, base + i as u32);
+		}
+		self.stats.installs += 1;
+	}
+
+	/// Compile time is capped at a share of the wall time since the JIT was enabled (JitParams::compile_pct).
+	fn may_compile(&self) -> bool {
+		let spent_ms = ::jit::verb::stats().compile_us / 1000;
+		let wall_ms = self.since.elapsed().as_millis() as u64;
+		spent_ms <= 250 + wall_ms * self.params.compile_pct as u64 / 100
 	}
 
 	/// risc-box patch (diag): classify one sampled region exit (see JitDiag).
@@ -996,6 +1058,375 @@ impl JitState {
 		self.instances.clear();
 		self.stats.live_regions = 0;
 		self.stats.resets += 1;
+		// queued code was emitted against the layout that no longer holds
+		self.queue.clear();
+		self.stats.queued = 0;
+		self.stats.queued_bytes = 0;
+	}
+
+	/// risc-box patch (packed modules): give a candidate its group code, emitted once against the current layout.
+	/// A region too large for any module is cut to its hotter half once, as a region too large to compile always
+	/// was (a half placed before is installed right away). False: the candidate is settled (installed, or dropped
+	/// and never submitted again).
+	fn emit_cand(&mut self, c: &mut PackCand, max_module: usize) -> bool {
+		if c.code.is_some() {
+			return true;
+		}
+		loop {
+			let emitted = match ::jit::emit_group(&c.rel(), &self.lay) {
+				Some(g) if g.pack_cost() + ::jit::PACK_FIXED_BOUND <= max_module => {
+					c.code = Some(g);
+					return true;
+				}
+				Some(_) => true,
+				None => false,
+			};
+			if emitted {
+				self.stats.oversize += 1;
+			}
+			::jit::verb::place(c.key, None);
+			if !emitted || c.split || c.blocks.len() < 2 {
+				return false;
+			}
+			// keep the hotter half
+			let mut blocks = std::mem::take(&mut c.blocks);
+			blocks.sort_by(|a, b| b.heat.cmp(&a.heat));
+			blocks.truncate((blocks.len() + 1) / 2);
+			let formed = c.formed;
+			*c = PackCand::new(blocks, &self.params, self.lay_hash, formed);
+			c.split = true;
+			match ::jit::verb::placed(c.key) {
+				Some(Some((index, base, n))) if n as usize == c.blocks.len() => {
+					self.place(c, index, base);
+					self.stats.pack_reused += 1;
+					return false;
+				}
+				Some(_) => return false,
+				None => {}
+			}
+		}
+	}
+}
+
+/// risc-box patch (packed modules): why a pack was submitted.
+#[cfg(feature = "codegen")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackWhy {
+	/// the queue reached pack_target_bytes
+	Full,
+	/// a queued region showed pack_hot_factor times its need
+	Hot,
+	/// the oldest queued region waited pack_max_wait passes
+	Aged,
+}
+
+/// risc-box patch (packed modules): one member block of a formed region.
+#[cfg(feature = "codegen")]
+struct PackBlock {
+	pc: u64,
+	/// sampled heat in the pass that formed the region
+	heat: u64,
+	ops: Vec<BlockOp>,
+	/// the physical page the block was built from (formation checked that pc fetches from it)
+	page: u64,
+}
+
+/// risc-box patch (packed modules): a formed region on its way to a module.
+#[cfg(feature = "codegen")]
+struct PackCand {
+	/// in pc order: the region's block order
+	blocks: Vec<PackBlock>,
+	bias: u64,
+	/// source key of the region alone (position independent: module pcs)
+	key: (u64, u64, u64),
+	heat: u64,
+	/// max(compile_heat, compile_heat_per_op * ops): never escalated per region
+	need: u64,
+	/// the region's group code (emitted once, before it is queued)
+	code: Option<::jit::GroupCode>,
+	/// already cut to its hotter half (too large for any module)
+	split: bool,
+	/// the formation pass that formed it
+	formed: u64,
+}
+
+#[cfg(feature = "codegen")]
+impl PackCand {
+	fn new(mut blocks: Vec<PackBlock>, params: &JitParams, lay_hash: u64, formed: u64) -> PackCand {
+		blocks.sort_by_key(|b| b.pc);
+		let bias = blocks[0].pc & !0xfff;
+		let rel: Vec<(u64, Vec<BlockOp>)> = blocks.iter().map(|b| (b.pc - bias, b.ops.clone())).collect();
+		let key = ::jit::source_key(&rel, lay_hash);
+		let heat = blocks.iter().map(|b| b.heat).sum();
+		let ops: u64 = blocks.iter().map(|b| b.ops.len() as u64).sum();
+		let need = params.compile_heat.max(params.compile_heat_per_op * ops);
+		PackCand { blocks, bias, key, heat, need, code: None, split: false, formed }
+	}
+
+	/// The blocks at module pcs (runtime pc - bias): what the module is built from.
+	fn rel(&self) -> Vec<(u64, Vec<BlockOp>)> {
+		self.blocks.iter().map(|b| (b.pc - self.bias, b.ops.clone())).collect()
+	}
+
+	/// The most it adds to a pack (emitted: always, once queued).
+	fn cost(&self) -> usize {
+		self.code.as_ref().map_or(usize::MAX / 4, |g| g.pack_cost())
+	}
+}
+
+impl Cpu {
+	/// risc-box patch (packed modules): a queued region's code is still the code it was emitted from: every
+	/// member's (word, length) stream is still on the physical page its block was built from, that page is not
+	/// one a guest JIT keeps rewriting, and no member turned volatile. Read from PHYSICAL memory, so the answer
+	/// holds whichever address space runs at the flush and whether or not the block cache still holds the blocks
+	/// (both change between passes; neither makes the code stale).
+	#[cfg(feature = "codegen")]
+	fn jit_queued_current(&mut self, c: &PackCand, volatile: &::fnv::FnvHashSet<u64>) -> bool {
+		for b in c.blocks.iter() {
+			if volatile.contains(&b.pc) || self.mmu.page_gen(b.page) >= JIT_REWRITTEN_PAGE_GEN {
+				return false;
+			}
+			let mut off = b.pc & 0xfff;
+			for o in b.ops.iter() {
+				if off + o.len as u64 > 0x1000 {
+					return false;
+				}
+				let raw = self.mmu.load_word_raw(b.page | off);
+				let (w, l) = match (raw & 0x3) == 0x3 {
+					true => (raw, 4u8),
+					false => (self.uncompress(raw & 0xffff), 2u8),
+				};
+				if w != o.word || l != o.len {
+					return false;
+				}
+				off += o.len as u64;
+			}
+		}
+		true
+	}
+
+	/// risc-box patch (packed modules): queue this pass's new regions, then compile modules from the queue.
+	///
+	/// The host's module quota (256 per process, never refunded) used to run out with a third of its byte quota
+	/// spent, and packing only one pass's few regions still made small modules. So a region that clears its own
+	/// (unescalated) need is emitted once and WAITS, and a module is built from the queue when the queue holds
+	/// pack_target_bytes, when its oldest region has waited pack_max_wait passes, or at once when a region shows
+	/// pack_hot_factor times its need (with whatever else waits). A module takes, hot regions first and then
+	/// hottest first, every queued region that keeps its total heat at or above its total need times the verb's
+	/// current escalation and still fits the size cap, the bytes left this pass (max_pass_bytes) and in the
+	/// budget; it is submitted ONCE, so the budget and the escalation (by bytes) apply per module. Before the
+	/// first module of a pass, queued regions whose code changed are dropped: nothing is compiled from stale ops.
+	/// A due region that cannot clear the bar even with the hottest company is refused for heat, as its own
+	/// lookup would have refused it; one that waits twice its deadline (no room) is dropped. Each region placed
+	/// becomes its own instance with entries base + i and is remembered process-wide (verb::placed).
+	#[cfg(feature = "codegen")]
+	fn jit_packs(&mut self, j: &mut JitState, new: Vec<PackCand>) {
+		let pass = j.stats.passes;
+		let p = j.params.clone();
+		let off = ::jit::verb::stats().disabled.is_some();
+		let (mut refused_heat, mut refused_budget) = (0u64, 0u64);
+		let bar0 = ::jit::verb::bar();
+		let max0 = p.max_module_bytes.min(bar0.map_or(usize::MAX, |b| b.max_module_bytes));
+		for mut c in new {
+			if c.heat < c.need {
+				refused_heat += 1;
+				continue;
+			}
+			if bar0.is_none() {
+				// nothing can be compiled any more: never emit
+				refused_budget += !off as u64;
+				continue;
+			}
+			if !j.emit_cand(&mut c, max0) {
+				continue;
+			}
+			// a split region's heat and need moved, and so did its key
+			if c.heat < c.need {
+				refused_heat += 1;
+				continue;
+			}
+			if !j.queue.iter().any(|q| q.key == c.key) {
+				j.queue.push(c);
+			}
+		}
+		let mut q = std::mem::take(&mut j.queue);
+		let (mut compiles, mut pass_bytes, mut checked) = (0u32, 0usize, false);
+		while !q.is_empty() && compiles < p.max_compiles_per_pass && j.may_compile() {
+			let bar = match ::jit::verb::bar() {
+				Some(b) => b,
+				None => {
+					// the module or attempt budget is spent (or compiling is off for good)
+					refused_budget += if off { 0 } else { q.len() as u64 };
+					q.clear();
+					break;
+				}
+			};
+			let fits_bar = |h: u64, n: u64| h >= n.saturating_mul(bar.heat_mult);
+			let hot = |c: &PackCand| c.heat >= c.need.saturating_mul(p.pack_hot_factor) && fits_bar(c.heat, c.need);
+			let due = |c: &PackCand| pass.saturating_sub(c.formed) >= p.pack_max_wait;
+			let max_module = p.max_module_bytes.min(bar.max_module_bytes);
+			let target = p.pack_target_bytes.min(max_module);
+			let queued: usize = q.iter().map(|c| c.cost()).sum();
+			let why = if queued >= target {
+				PackWhy::Full
+			} else if q.iter().any(|c| hot(c)) {
+				PackWhy::Hot
+			} else if q.iter().any(|c| due(c)) {
+				PackWhy::Aged
+			} else {
+				break;
+			};
+			if !checked {
+				// never compile stale code: drop what changed since it was queued, then decide again
+				checked = true;
+				let before = q.len();
+				q.retain(|c| self.jit_queued_current(c, &j.volatile));
+				j.stats.queue_stale += (before - q.len()) as u64;
+				continue;
+			}
+			let pass_left = p.max_pass_bytes.saturating_sub(pass_bytes);
+			if pass_bytes > 0 && pass_left < target.min(queued + ::jit::PACK_FIXED_BOUND) {
+				break; // the rest waits for the next pass
+			}
+			let budget_binds = bar.bytes_left < max_module.min(pass_left) as u64;
+			let limit = (max_module.min(pass_left) as u64).min(bar.bytes_left) as usize;
+			// fill: the hot regions (they asked for this module), then hottest first
+			q.sort_by(|a, b| hot(b).cmp(&hot(a)).then(b.heat.cmp(&a.heat)).then(a.key.cmp(&b.key)));
+			let mut pick: Vec<usize> = Vec::new();
+			let mut below_bar = vec![false; q.len()];
+			let (mut heat, mut need, mut cost) = (0u64, 0u64, ::jit::PACK_FIXED_BOUND);
+			for (i, c) in q.iter().enumerate() {
+				if pick.len() >= ::jit::MAX_PACK_GROUPS {
+					break;
+				}
+				if !fits_bar(heat + c.heat, need + c.need) {
+					below_bar[i] = true;
+					continue;
+				}
+				if cost.saturating_add(c.cost()) > limit {
+					continue;
+				}
+				pick.push(i);
+				heat += c.heat;
+				need += c.need;
+				cost += c.cost();
+			}
+			let mut drop = vec![false; q.len()];
+			for i in 0..q.len() {
+				if below_bar[i] && due(&q[i]) {
+					drop[i] = true;
+					refused_heat += 1;
+				}
+			}
+			if pick.is_empty() {
+				if budget_binds {
+					// what is left does not fit the bytes left in the budget
+					for i in 0..q.len() {
+						if !drop[i] {
+							drop[i] = true;
+							refused_budget += 1;
+						}
+					}
+				}
+				let mut k = 0;
+				q.retain(|_| (!drop[k], k += 1).0);
+				break;
+			}
+			// exact size: the bound keeps the cap from binding here; should it ever, the coldest group goes
+			let mut built = None;
+			while let Some(&last) = pick.last() {
+				let groups: Vec<&::jit::GroupCode> = pick.iter().map(|&i| q[i].code.as_ref().unwrap()).collect();
+				match ::jit::pack(&groups, &j.lay) {
+					Some((m, b)) if m.len() <= limit => {
+						built = Some((m, b));
+						break;
+					}
+					_ => {
+						pick.pop();
+						if pick.is_empty() {
+							::jit::verb::place(q[last].key, None);
+							drop[last] = true;
+							j.stats.oversize += 1;
+						}
+					}
+				}
+			}
+			let (module, bases) = match built {
+				Some(b) => b,
+				None => {
+					let mut k = 0;
+					q.retain(|_| (!drop[k], k += 1).0);
+					continue;
+				}
+			};
+			let keys: Vec<(u64, u64, u64)> = pick.iter().map(|&i| q[i].key).collect();
+			let heat: u64 = pick.iter().map(|&i| q[i].heat).sum();
+			let need: u64 = pick.iter().map(|&i| q[i].need).sum();
+			let size = module.len();
+			let t0 = std::time::Instant::now();
+			let r = ::jit::verb::lookup(::jit::pack_key(&keys), heat, need, true, move || Some(module));
+			if p.trace {
+				let blocks: usize = pick.iter().map(|&i| q[i].blocks.len()).sum();
+				let ops: usize = pick.iter().map(|&i| q[i].blocks.iter().map(|b| b.ops.len()).sum::<usize>()).sum();
+				eprintln!(
+					"[jit] pack {:?} ({:?}): {} regions, {} blocks, {} ops, {} bytes, heat {} (need {} x{}), {} still queued, {:.1} ms",
+					r, why, pick.len(), blocks, ops, size, heat, need, bar.heat_mult, q.len() - pick.len(),
+					t0.elapsed().as_secs_f64() * 1000.0
+				);
+			}
+			match r {
+				::jit::verb::Got::Compiled(index) | ::jit::verb::Got::Cached(index) => {
+					for (k, &i) in pick.iter().enumerate() {
+						::jit::verb::place(q[i].key, Some((index, bases[k], q[i].blocks.len() as u32)));
+						j.place(&q[i], index, bases[k]);
+						drop[i] = true;
+					}
+					j.stats.packed_regions += pick.len() as u64;
+					if matches!(r, ::jit::verb::Got::Compiled(_)) {
+						j.stats.packs += 1;
+						match why {
+							PackWhy::Full => j.stats.packs_full += 1,
+							PackWhy::Hot => j.stats.packs_hot += 1,
+							PackWhy::Aged => j.stats.packs_aged += 1,
+						}
+						compiles += 1;
+						pass_bytes += size;
+					}
+				}
+				::jit::verb::Got::Failed => {
+					// a failed module is never resubmitted, nor are its regions
+					compiles += 1;
+					pass_bytes += size;
+					for &i in pick.iter() {
+						::jit::verb::place(q[i].key, None);
+						drop[i] = true;
+					}
+				}
+				// Neither happens while bar() describes the verb (the module was sized and filled against it); the
+				// regions keep waiting
+				::jit::verb::Got::TooLarge | ::jit::verb::Got::Refused => {
+					if r == ::jit::verb::Got::TooLarge {
+						j.stats.oversize += 1;
+					}
+					let mut k = 0;
+					q.retain(|_| (!drop[k], k += 1).0);
+					break;
+				}
+			}
+			let mut k = 0;
+			q.retain(|_| (!drop[k], k += 1).0);
+		}
+		// a region that waited twice its deadline found no room: let its blocks form again
+		let before = q.len();
+		q.retain(|c| pass.saturating_sub(c.formed) < 2 * p.pack_max_wait + 2);
+		let expired = (before - q.len()) as u64;
+		j.stats.queue_expired += expired;
+		refused_budget += expired;
+		j.stats.queued = q.len() as u64;
+		j.stats.queued_bytes = q.iter().map(|c| c.cost() as u64).sum();
+		j.queue = q;
+		j.stats.refused += refused_heat + refused_budget;
+		::jit::verb::note_refused(refused_heat, refused_budget);
 	}
 }
 
@@ -1240,6 +1671,18 @@ impl Cpu {
 	/// Reads Program counter content
 	pub fn read_pc(&self) -> u64 {
 		self.pc
+	}
+
+	/// risc-box patch (profiling): pc, privilege (0 user, 1 supervisor, 3 machine) and satp, for a host-side
+	/// sampler that attributes guest time to guest code.
+	pub fn sample_state(&self) -> (u64, u8, u64) {
+		let p = match self.privilege_mode {
+			PrivilegeMode::User => 0,
+			PrivilegeMode::Supervisor => 1,
+			PrivilegeMode::Reserved => 2,
+			PrivilegeMode::Machine => 3,
+		};
+		(self.pc, p, self.read_csr_raw(CSR_SATP_ADDRESS))
 	}
 
 	// risc-box patch: true while the hart is parked in WFI with no enabled
@@ -1869,10 +2312,18 @@ impl Cpu {
 	/// interprets exactly as before.
 	#[cfg(feature = "codegen")]
 	pub fn jit_enable(&mut self, params: JitParams) -> bool {
-		let policy = ::jit::verb::Policy {
+		let mut policy = ::jit::verb::Policy {
 			max_module_bytes: params.max_module_bytes,
 			..Default::default()
 		};
+		if params.budget_modules > 0 {
+			policy.module_budget = params.budget_modules;
+			policy.attempt_budget = params.budget_modules.saturating_mul(4);
+		}
+		if params.budget_bytes > 0 {
+			policy.byte_budget = params.budget_bytes;
+			policy.escalation_bytes = (params.budget_bytes / 8).max(1);
+		}
 		if !::jit::verb::enable(policy) {
 			return false;
 		}
@@ -1895,6 +2346,7 @@ impl Cpu {
 			free: Vec::new(),
 			instances: Default::default(),
 			volatile: Default::default(),
+			queue: Vec::new(),
 			owner: ::jit::verb::thread_id(),
 			live: false,
 			since: std::time::Instant::now(),
@@ -2057,6 +2509,9 @@ impl Cpu {
 		let ctx = unsafe { &*ctx };
 		ctx.set(::jit::CTX_BASE, self as *mut Cpu as usize as u64);
 		ctx.set(::jit::CTX_BIAS, bias);
+		// the pack tests' stand-in call reads the block of the hart that made the call (per hart since SMP)
+		#[cfg(test)]
+		selftest::CALL_CTX.store(ctx as *const ::jit::verb::Ctx as usize, std::sync::atomic::Ordering::Relaxed);
 		let ran = unsafe { ::jit::verb::call(index, fuel, entry) };
 		let pc = self.pc;
 		let j = self.jit.as_deref_mut().unwrap();
@@ -2284,17 +2739,20 @@ impl Cpu {
 		// covered: installed AND runnable at its last check. A region that
 		// cannot run here (another address space's code at the same pcs)
 		// must not hide this context's hot blocks from formation.
+		// risc-box patch (packed modules): blocks of a queued region are claimed too: they never form into a
+		// second, overlapping region while the first waits for its module
 		let regions = {
-			let JitState { ref mut t2, ref slots, ref regions, ref volatile, .. } = *j;
+			let JitState { ref mut t2, ref slots, ref regions, ref volatile, ref queue, .. } = *j;
+			let queued: ::fnv::FnvHashSet<u64> = queue.iter().flat_map(|c| c.blocks.iter().map(|b| b.pc)).collect();
 			t2.form_now(|pc| {
 				let s = slots[((pc >> 1) as usize) & (BLOCK_SLOTS - 1)];
-				(s.tag == pc && regions[s.region as usize].ok) || volatile.contains(&pc)
+				(s.tag == pc && regions[s.region as usize].ok) || volatile.contains(&pc) || queued.contains(&pc)
 			})
 		};
 		let cg = self.mmu.code_gen();
-		let mut compiles = 0u32;
 		let began = std::time::Instant::now();
 		let installs_before = j.stats.installs;
+		let mut waiting: Vec<PackCand> = Vec::new();
 		for (members, _) in regions {
 			j.stats.formed += 1;
 			// One address space, one privilege side: members must be cached
@@ -2303,7 +2761,7 @@ impl Cpu {
 			// member's side of the address space (sampled edges cross traps
 			// and context switches; a region mixing them could never verify).
 			let side = members.iter().max_by_key(|m| m.1).map_or(0, |m| m.0 >> 63);
-			let mut blocks: Vec<(u64, u64, Vec<BlockOp>)> = Vec::with_capacity(members.len());
+			let mut blocks: Vec<PackBlock> = Vec::with_capacity(members.len());
 			for &(pc, h) in members.iter() {
 				if pc >> 63 != side {
 					continue;
@@ -2322,93 +2780,43 @@ impl Cpu {
 					continue;
 				}
 				if let Some(ops) = self.jit_block_ops(pc, cg) {
-					blocks.push((pc, h, ops));
+					blocks.push(PackBlock { pc, heat: h, ops, page });
 				}
 			}
-			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].0, &blocks[0].2)) {
+			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].pc, &blocks[0].ops)) {
 				continue;
 			}
 			// a block whose first op the emitter cannot translate is never an
 			// entry worth having: every call there would return at once; a
 			// near-cold member costs compile time and buys nothing
 			let prune = j.params.prune_heat;
-			blocks.retain(|b| ::jit::translatable(&b.2[0]) && b.1 >= prune);
-			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].0, &blocks[0].2)) {
+			blocks.retain(|b| ::jit::translatable(&b.ops[0]) && b.heat >= prune);
+			if blocks.is_empty() || (blocks.len() == 1 && !Self::jit_self_loop(blocks[0].pc, &blocks[0].ops)) {
 				continue;
 			}
-			let mut got = None;
-			for attempt in 0..2 {
-				blocks.sort_by_key(|b| b.0);
-				let bias = blocks[0].0 & !0xfff;
-				let rel: Vec<(u64, Vec<BlockOp>)> =
-					blocks.iter().map(|b| (b.0 - bias, b.2.clone())).collect();
-				let key = ::jit::source_key(&rel, j.lay_hash);
-				let heat: u64 = blocks.iter().map(|b| b.1).sum();
-				let ops: u64 = blocks.iter().map(|b| b.2.len() as u64).sum();
-				let need = j.params.compile_heat.max(j.params.compile_heat_per_op * ops);
-				let may = compiles < j.params.max_compiles_per_pass && {
-					let spent_ms = ::jit::verb::stats().compile_us / 1000;
-					let wall_ms = j.since.elapsed().as_millis() as u64;
-					spent_ms <= 250 + wall_ms * j.params.compile_pct as u64 / 100
-				};
-				let lay = &j.lay;
-				let mut size = 0usize;
-				let t0 = std::time::Instant::now();
-				let r = ::jit::verb::lookup(key, heat, need, may, || {
-					let m = ::jit::emit_region(&rel, lay);
-					size = m.as_ref().map_or(0, |m| m.len());
-					m
-				});
-				if j.params.trace && size > 0 {
-					eprintln!(
-						"[jit] compile {:?}: {} blocks, {} ops, {} bytes, heat {}, {:.1} ms",
-						r, rel.len(), rel.iter().map(|b| b.1.len()).sum::<usize>(), size, heat,
-						t0.elapsed().as_secs_f64() * 1000.0
-					);
+			// risc-box patch (packed modules): a region compiled before (into whichever module, by whichever
+			// machine) is installed from its placement without a compile; one already queued is not queued twice;
+			// the rest go to the pack queue
+			let c = PackCand::new(blocks, &j.params, j.lay_hash, j.stats.passes);
+			match ::jit::verb::placed(c.key) {
+				Some(Some((index, base, n))) if n as usize == c.blocks.len() => {
+					j.place(&c, index, base);
+					j.stats.pack_reused += 1;
 				}
-				match r {
-					::jit::verb::Got::Compiled(_) | ::jit::verb::Got::Failed => compiles += 1,
-					::jit::verb::Got::TooLarge => {
-						j.stats.oversize += 1;
-						if attempt == 0 && blocks.len() > 1 {
-							// keep the hotter half
-							blocks.sort_by(|a, b| b.1.cmp(&a.1));
-							blocks.truncate((blocks.len() + 1) / 2);
-							continue;
-						}
-					}
-					_ => {}
-				}
-				got = r.index().map(|i| (i, bias));
-				break;
+				Some(_) => {}
+				None if j.queue.iter().any(|q| q.key == c.key) || waiting.iter().any(|q| q.key == c.key) => {}
+				None => waiting.push(c),
 			}
-			let (index, bias) = match got {
-				Some(g) => g,
-				None => {
-					j.stats.refused += 1;
-					continue;
-				}
-			};
-			// blocks are in pc order here: the module's block order
-			let words: Vec<(u64, Vec<(u32, u8)>)> = blocks
-				.iter()
-				.map(|b| (b.0, b.2.iter().map(|o| (o.word, o.len)).collect()))
-				.collect();
-			let rid = j.instance(index, bias, words);
-			for (i, b) in blocks.iter().enumerate() {
-				let slot = ((b.0 >> 1) as usize) & (BLOCK_SLOTS - 1);
-				j.install(slot, b.0, rid, i as u32);
-			}
-			j.stats.installs += 1;
 		}
+		self.jit_packs(&mut j, waiting);
 		let us = began.elapsed().as_micros() as u64;
 		j.stats.form_us += us;
 		if j.params.trace {
 			let v = ::jit::verb::stats();
 			eprintln!(
-				"[jit] pass {} retired {}M: +{} installs, {} compiled ({} failed, {:.0} ms total), {} live, coverage {:.1}%, pass {:.1} ms",
+				"[jit] pass {} retired {}M: +{} installs, {} compiled ({} failed, {:.0} ms total), {} queued ({} KiB), {} live, coverage {:.1}%, pass {:.1} ms",
 				j.stats.passes, self.retired / 1_000_000, j.stats.installs - installs_before, v.compiled, v.failed,
-				v.compile_us as f64 / 1000.0, j.stats.live_regions,
+				v.compile_us as f64 / 1000.0, j.stats.queued, j.stats.queued_bytes / 1024, j.stats.live_regions,
 				100.0 * j.stats.retired as f64 / (j.stats.retired + j.stats.interpreted).max(1) as f64,
 				us as f64 / 1000.0
 			);
@@ -8364,6 +8772,11 @@ mod selftest {
 	use mmu::DRAM_BASE;
 	use terminal::DummyTerminal;
 
+	/// The context block of the hart that made the last verb call (set in jit_run_one): the pack tests'
+	/// stand-in call reads and writes through it, as generated code does.
+	#[cfg(test)]
+	pub static CALL_CTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 	pub const RAM: u64 = 32 << 20;
 	const PT_POOL: u64 = DRAM_BASE + 0x1_0000; // page tables, bump-allocated
 	const CODE_PA: u64 = DRAM_BASE + 0x10_0000;
@@ -8855,6 +9268,564 @@ mod selftest {
 			assert_eq!(n, m);
 		}
 
+		/// risc-box patch (packed modules): stand-ins for the verb's compile
+		/// and call (natively there is neither) and the formation tests'
+		/// guest, heat and placement helpers.
+		mod packs {
+			use std::sync::atomic::{AtomicU64, Ordering};
+			use std::sync::Mutex;
+			use super::*;
+			pub static MODULES: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+			/// (table index, entry, bias in the context block) per call
+			pub static CALLS: Mutex<Vec<(u64, u32, u64)>> = Mutex::new(Vec::new());
+			/// pcs the stand-in call "exits" at, in order (none left: it runs nothing)
+			pub static EXITS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+			pub static PC_OFF: AtomicU64 = AtomicU64::new(0);
+			/// stand-in compiler: keeps every module, hands out table indices 7000, 7001, ...
+			pub fn compile(m: &[u8]) -> i64 {
+				let mut v = MODULES.lock().unwrap_or_else(|e| e.into_inner());
+				v.push(m.to_vec());
+				7000 + v.len() as i64 - 1
+			}
+			/// stand-in call: logs it, and "exits" at the next EXITS pc after 5 instructions (or runs nothing)
+			pub fn call(index: u64, _fuel: u64, entry: u32) -> u64 {
+				let ctx = unsafe { &*(super::super::CALL_CTX.load(Ordering::Relaxed) as *const ::jit::verb::Ctx) };
+				CALLS.lock().unwrap_or_else(|e| e.into_inner()).push((index, entry, ctx.get(::jit::CTX_BIAS)));
+				let mut exits = EXITS.lock().unwrap_or_else(|e| e.into_inner());
+				if exits.is_empty() {
+					return 0;
+				}
+				// what generated code does: pc written through the context block's state base
+				let pc = exits.remove(0);
+				unsafe { *((ctx.get(::jit::CTX_BASE) + PC_OFF.load(Ordering::Relaxed)) as usize as *mut u64) = pc };
+				5
+			}
+			/// Fresh verb state with the stand-ins (the caller holds TEST_SERIAL).
+			pub fn reset(policy: ::jit::verb::Policy) {
+				MODULES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+				CALLS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+				EXITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+				::jit::verb::reset_for_test(Some(compile), policy);
+				::jit::verb::set_test_caller(Some(call));
+			}
+			/// The self-test guest (seed 11), interpreted to its spin loop, and the cached blocks a region can be
+			/// formed from: valid now, fetched from the page they were built from, on a page that is not being
+			/// rewritten, first op translated. Several sit on each code page.
+			pub fn guest() -> (Cpu, Vec<u64>) {
+				let (mut cpu, spin) = machine(11, 6);
+				assert!(run_to_spin(&mut cpu, spin, 1 << 28).1);
+				let cg = cpu.mmu.code_gen();
+				let mut pcs = Vec::new();
+				for slot in 0..BLOCK_SLOTS {
+					let h = cpu.block_heads[slot];
+					if h.tag == 0 || h.count == 0 || !cpu.head_valid(&h) {
+						continue;
+					}
+					match cpu.mmu.translate_fetch_probe(h.tag) {
+						Ok(p) if (p & !0xfff) == h.phys_page => {}
+						_ => continue,
+					}
+					if cpu.mmu.page_gen(h.phys_page) >= JIT_REWRITTEN_PAGE_GEN {
+						continue;
+					}
+					match cpu.jit_block_ops(h.tag, cg) {
+						Some(ops) if ::jit::translatable(&ops[0]) => pcs.push(h.tag),
+						_ => {}
+					}
+				}
+				pcs.sort();
+				assert!(pcs.len() >= 24, "cached blocks: {}", pcs.len());
+				(cpu, pcs)
+			}
+			/// Sampled heat and successions for each (region, its total heat): 100 rounds of a cycle through its
+			/// blocks, nothing between regions.
+			pub fn heat(cpu: &mut Cpu, regions: &[(Vec<u64>, u64)]) {
+				let j = cpu.jit.as_deref_mut().unwrap();
+				for (r, h) in regions {
+					j.t2.note_break();
+					for _ in 0..100 {
+						for &pc in r {
+							j.t2.note_block(pc, h / 100 / r.len() as u64);
+						}
+					}
+				}
+				j.t2.note_break();
+			}
+			/// A region's unescalated need, and its group's pack cost, as the packer computes them.
+			pub fn need_and_cost(cpu: &Cpu, r: &[u64]) -> (u64, usize) {
+				let j = cpu.jit.as_deref().unwrap();
+				let cg = cpu.mmu.code_gen();
+				let bias = r[0] & !0xfff;
+				let rel: Vec<(u64, Vec<BlockOp>)> = r.iter().map(|&pc| (pc - bias, cpu.jit_block_ops(pc, cg).unwrap())).collect();
+				let ops: u64 = rel.iter().map(|b| b.1.len() as u64).sum();
+				let need = j.params.compile_heat.max(j.params.compile_heat_per_op * ops);
+				(need, ::jit::emit_group(&rel, &j.lay).unwrap().pack_cost())
+			}
+			/// Where each region was installed: (instance, entry base, bias, table index), checking that every
+			/// member slot points at that instance with entry base + i and that the instance holds exactly the
+			/// region's own members. None for a region not installed.
+			pub fn placed(cpu: &Cpu, regions: &[Vec<u64>]) -> Vec<Option<(u32, u32, u64, u64)>> {
+				let j = cpu.jit.as_deref().unwrap();
+				regions.iter().map(|r| {
+					let s0 = j.slots[((r[0] >> 1) as usize) & (BLOCK_SLOTS - 1)];
+					if s0.tag != r[0] {
+						return None;
+					}
+					let reg = &j.regions[s0.region as usize];
+					assert_eq!(reg.bias, r[0] & !0xfff);
+					assert_eq!(reg.members.iter().map(|m| m.0).collect::<Vec<u64>>(), *r, "the region's own members");
+					for (i, &pc) in r.iter().enumerate() {
+						let s = j.slots[((pc >> 1) as usize) & (BLOCK_SLOTS - 1)];
+						assert_eq!((s.tag, s.region, s.entry), (pc, s0.region, reg.entry_base + i as u32));
+					}
+					Some((s0.region, reg.entry_base, reg.bias, reg.index))
+				}).collect()
+			}
+		}
+
+		/// risc-box patch (packed modules), at formation level: eight hot
+		/// regions formed in one pass (three cached blocks of the self-test
+		/// guest each, several on one code page) are compiled as ONE module,
+		/// each installed as its own instance with its own entry range, and
+		/// none runs before its own proof: a call that exits at another
+		/// group's entry chains into it with THAT group's bias, and a group
+		/// whose code changed does not run while its module-mate does. The
+		/// same regions formed again — on this machine once its instances are
+		/// gone, or on another machine — install from the placement cache
+		/// without a compile.
+		#[test]
+		fn formation_packs_hot_regions_into_one_module() {
+			extern crate wasmtime;
+			use self::packs::*;
+			use std::sync::atomic::Ordering;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let params = JitParams::default();
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(8).map(|c| c.to_vec()).collect();
+			let hot: Vec<(Vec<u64>, u64)> = regions.iter().map(|r| (r.clone(), 150_000)).collect();
+			assert!(a.jit_enable(params.clone()));
+			a.jit_prepare();
+			heat(&mut a, &hot);
+			a.jit_form_pass();
+
+			// ONE module holds all eight
+			let v = ::jit::verb::stats();
+			assert_eq!((v.compiled, MODULES.lock().unwrap_or_else(|e| e.into_inner()).len()), (1, 1), "{:?}", v);
+			let bytes = MODULES.lock().unwrap_or_else(|e| e.into_inner())[0].clone();
+			let mut c = wasmtime::Config::new();
+			c.wasm_memory64(true);
+			c.wasm_threads(true);
+			wasmtime::Module::validate(&wasmtime::Engine::new(&c).unwrap(), &bytes).expect("the pack is valid wasm");
+			// (instance, entry base, bias) per region, all in module 7000
+			let placed = |cpu: &Cpu| -> Vec<(u32, u32, u64)> {
+				packs::placed(cpu, &regions).into_iter().map(|p| {
+					let p = p.expect("every region installed");
+					assert_eq!(p.3, 7000);
+					(p.0, p.1, p.2)
+				}).collect()
+			};
+			let p = placed(&a);
+			let mut bases: Vec<u32> = p.iter().map(|x| x.1).collect();
+			bases.sort();
+			assert_eq!(bases, (0..8).map(|k| 3 * k).collect::<Vec<u32>>(), "one entry range per region");
+			let mut rids: Vec<u32> = p.iter().map(|x| x.0).collect();
+			rids.sort();
+			rids.dedup();
+			assert_eq!(rids.len(), 8, "one instance per region");
+			let shared = p.iter().filter(|x| p.iter().filter(|y| y.2 == x.2).count() > 1).count();
+			assert!(shared >= 2, "regions sharing a bias (one code page) keep separate instances");
+			{
+				let j = a.jit.as_deref().unwrap();
+				assert_eq!((j.stats.packs, j.stats.packed_regions, j.stats.pack_reused), (1, 8, 0));
+				assert_eq!((j.stats.installs, j.stats.live_regions, j.stats.refused), (8, 8, 0));
+				// 25 times their need: hot, so packed in the pass that formed them
+				assert_eq!((j.stats.packs_hot, j.stats.queued, j.stats.queued_bytes), (1, 0, 0));
+				eprintln!("pack: {} regions, {} entries, {} bytes", j.stats.packed_regions, 24, bytes.len());
+				// installed, not run: nothing is proven yet
+				assert!(p.iter().all(|x| !j.regions[x.0 as usize].ok && j.regions[x.0 as usize].checked == (0, 0)));
+			}
+
+			// a call into region 0 that exits at region 1's first block chains into region 1 — same module,
+			// its own entry and ITS bias — after region 1's own proof; region 2..7 are still unproven
+			PC_OFF.store(a.jit.as_deref().unwrap().lay.pc_addr, Ordering::Relaxed);
+			*EXITS.lock().unwrap_or_else(|e| e.into_inner()) = vec![regions[1][0], 0x1234];
+			a.update_pc(regions[0][0]);
+			let ran = a.jit_run(((regions[0][0] >> 1) as usize) & (BLOCK_SLOTS - 1), regions[0][0]);
+			assert_eq!(ran, 10);
+			assert_eq!(*CALLS.lock().unwrap_or_else(|e| e.into_inner()), vec![(7000, p[0].1, p[0].2), (7000, p[1].1, p[1].2)]);
+			{
+				let j = a.jit.as_deref().unwrap();
+				assert!(j.regions[p[0].0 as usize].ok && j.regions[p[1].0 as usize].ok);
+				assert_eq!((j.stats.content_checks, j.stats.calls), (2, 2), "one proof per region that ran");
+				assert!(j.stats.chained >= 1);
+				assert!(p[2..].iter().all(|x| j.regions[x.0 as usize].checked == (0, 0)));
+			}
+
+			// the same regions formed again after this machine's instances are gone (a RAM resize drops them):
+			// installed from the placement cache, nothing compiled
+			a.jit.as_deref_mut().unwrap().clear();
+			heat(&mut a, &hot);
+			a.jit_form_pass();
+			assert_eq!(::jit::verb::stats().compiled, 1, "re-formed regions compile nothing");
+			let p = placed(&a);
+			{
+				let j = a.jit.as_deref().unwrap();
+				assert_eq!((j.stats.packs, j.stats.pack_reused, j.stats.live_regions), (1, 8, 8));
+			}
+
+			// ... and on another machine running the same code
+			let (mut b, pcs_b) = guest();
+			assert_eq!(pcs_b, pcs);
+			assert!(b.jit_enable(params.clone()));
+			b.jit_prepare();
+			heat(&mut b, &hot);
+			b.jit_form_pass();
+			assert_eq!(::jit::verb::stats().compiled, 1, "another machine compiles nothing either");
+			let pb = placed(&b);
+			assert_eq!(pb.iter().map(|x| (x.1, x.2)).collect::<Vec<_>>(), p.iter().map(|x| (x.1, x.2)).collect::<Vec<_>>());
+			assert_eq!(b.jit.as_deref().unwrap().stats.pack_reused, 8);
+
+			// region 2's code changes: it no longer runs, while region 3 — same module — still does
+			let pc2 = regions[2][0];
+			let phys = a.mmu.translate_fetch_probe(pc2).unwrap();
+			let old = a.mmu.load_word_raw(phys);
+			let new: u32 = if old == 0x0010_0013 { 0x0020_0013 } else { 0x0010_0013 }; // addi x0, x0, 1|2
+			for (k, byte) in new.to_le_bytes().iter().enumerate() {
+				a.mmu.store_raw(phys + k as u64, *byte);
+			}
+			CALLS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+			EXITS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+			assert_eq!(a.jit_run(((pc2 >> 1) as usize) & (BLOCK_SLOTS - 1), pc2), 0);
+			assert!(CALLS.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "a group whose proof fails is never called");
+			let pc3 = regions[3][0];
+			assert_eq!(a.jit_run(((pc3 >> 1) as usize) & (BLOCK_SLOTS - 1), pc3), 0);
+			assert_eq!(*CALLS.lock().unwrap_or_else(|e| e.into_inner()), vec![(7000, p[3].1, p[3].2)]);
+			{
+				let j = a.jit.as_deref().unwrap();
+				assert!(!j.regions[p[2].0 as usize].ok && j.regions[p[3].0 as usize].ok);
+			}
+			::jit::verb::set_test_caller(None);
+		}
+
+		/// The packer under the size cap and the per-pass compile limit:
+		/// regions go in hottest first, every module stays under
+		/// max_module_bytes (set so that any region fits alone and any two
+		/// fit together) and holds several regions, a pass compiles at most
+		/// max_compiles_per_pass modules, and the regions left over are packed
+		/// by later passes while the ones already placed re-install from the
+		/// placement cache.
+		#[test]
+		fn formation_fills_modules_to_the_cap_hottest_first() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(8).map(|c| c.to_vec()).collect();
+			// region k is hotter than region k + 1; the coldest still clears its need by itself
+			let hot: Vec<(Vec<u64>, u64)> =
+				regions.iter().enumerate().map(|(k, r)| (r.clone(), (9 - k as u64) * 10_000)).collect();
+			let mut params = JitParams::default();
+			params.max_compiles_per_pass = 1;
+			params.pack_max_wait = 0; // no deferral: every pass packs what waits
+			assert!(a.jit_enable(params.clone()));
+			// each region's group, emitted as the packer will
+			let cg = a.mmu.code_gen();
+			let costs: Vec<usize> = regions.iter().map(|r| {
+				let bias = r[0] & !0xfff;
+				let rel: Vec<(u64, Vec<BlockOp>)> = r.iter().map(|&pc| (pc - bias, a.jit_block_ops(pc, cg).unwrap())).collect();
+				::jit::emit_group(&rel, &a.jit.as_deref().unwrap().lay).unwrap().pack_cost()
+			}).collect();
+			let cap = ::jit::PACK_FIXED_BOUND + 2 * costs.iter().max().unwrap() + 16;
+			a.jit.as_deref_mut().unwrap().params.max_module_bytes = cap;
+			a.jit_prepare();
+			let mut passes = 0;
+			let mut first_pass = Vec::new();
+			while packs::placed(&a, &regions).iter().any(|p| p.is_none()) {
+				passes += 1;
+				assert!(passes <= 4, "every region placed within a few passes");
+				let before = ::jit::verb::stats().compiled;
+				heat(&mut a, &hot);
+				a.jit_form_pass();
+				let compiled = ::jit::verb::stats().compiled - before;
+				assert_eq!(compiled, 1, "one module per pass (max_compiles_per_pass)");
+				if passes == 1 {
+					first_pass = packs::placed(&a, &regions);
+				}
+			}
+			assert!(passes >= 2, "the first module could not hold every region");
+			let mods = MODULES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+			assert!(mods.iter().all(|m| m.len() <= cap), "cap {}: {:?}", cap, mods.iter().map(|m| m.len()).collect::<Vec<_>>());
+			// hottest first: the hottest region is in the first module
+			assert_eq!(first_pass[0].map(|p| p.3), Some(7000), "{:?}", first_pass);
+			let p: Vec<(u32, u32, u64, u64)> = packs::placed(&a, &regions).into_iter().map(|p| p.unwrap()).collect();
+			let mut per_module = std::collections::BTreeMap::new();
+			for x in p.iter() {
+				*per_module.entry(x.3).or_insert(0) += 1;
+			}
+			assert_eq!(per_module.len(), mods.len());
+			assert!(mods.len() <= 4, "two regions or more per module: {:?}", per_module);
+			let j = a.jit.as_deref().unwrap();
+			assert_eq!((j.stats.packs as usize, j.stats.packed_regions), (mods.len(), 8));
+			let early = first_pass.iter().filter(|p| p.is_some()).count() as u64;
+			assert!(j.stats.pack_reused >= early * (passes - 1),
+				"placed regions re-formed in later passes re-install without a compile");
+			eprintln!("cap {}: group costs {:?}; {} modules {:?} bytes, regions per module {:?}, {} passes",
+				cap, costs, mods.len(), mods.iter().map(|m| m.len()).collect::<Vec<_>>(),
+				per_module.values().collect::<Vec<_>>(), passes);
+		}
+
+		/// Once the module budget is spent the regions still waiting are
+		/// counted as refused for budget — one count per REGION, as when
+		/// every region had its own lookup — and nothing more is emitted.
+		#[test]
+		fn pack_budget_refusals_count_regions() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy { module_budget: 1, ..::jit::verb::Policy::default() });
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(8).map(|c| c.to_vec()).collect();
+			let hot: Vec<(Vec<u64>, u64)> =
+				regions.iter().enumerate().map(|(k, r)| (r.clone(), (9 - k as u64) * 10_000)).collect();
+			let mut params = JitParams::default();
+			params.max_module_bytes = 4096; // not all eight in one module
+			params.pack_max_wait = 0;
+			assert!(a.jit_enable(params));
+			a.jit_prepare();
+			heat(&mut a, &hot);
+			a.jit_form_pass();
+			let v = ::jit::verb::stats();
+			let j = a.jit.as_deref().unwrap();
+			let placed = packs::placed(&a, &regions).iter().filter(|p| p.is_some()).count() as u64;
+			assert_eq!((v.compiled, j.stats.packs, j.stats.packed_regions), (1, 1, placed));
+			assert!(placed >= 2 && placed < 8, "{}", placed);
+			// every region was formed and considered (each fits a module alone): the ones not placed were refused,
+			// for budget
+			assert_eq!((j.stats.formed, j.stats.oversize, j.stats.refused + placed), (8, 0, 8));
+			assert_eq!((v.refused_budget, v.refused_heat), (8 - placed, 0), "{:?} {:?}", v, j.stats);
+		}
+
+		/// Admission is per MODULE: a region below the escalated bar rides
+		/// along with a hotter one when the module's total heat clears its
+		/// total need times the escalation; alone it is refused (and counted
+		/// as refused for heat); a region below its OWN unescalated need never
+		/// rides along. (No deferral here: each pass packs what it formed.)
+		#[test]
+		fn pack_admission_is_per_module_with_a_per_region_floor() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			// the bar doubles per 10000 module bytes
+			reset(::jit::verb::Policy { escalation_bytes: 10_000, ..::jit::verb::Policy::default() });
+			let (mut a, pcs) = guest();
+			let r: Vec<Vec<u64>> = pcs.chunks(3).take(5).map(|c| c.to_vec()).collect();
+			let mut params = JitParams::default();
+			params.compile_heat_per_op = 0; // need = compile_heat = 6000 for every region
+			params.seed_heat = 100;
+			params.prune_heat = 1;
+			params.pack_max_wait = 0;
+			assert!(a.jit_enable(params));
+			a.jit_prepare();
+			let need = 6000u64;
+			// pass 1, bar x1: r0 alone
+			heat(&mut a, &[(r[0].clone(), 2 * need)]);
+			a.jit_form_pass();
+			assert_eq!(::jit::verb::stats().compiled, 1);
+			// 10000 more bytes spent elsewhere: the bar is x2
+			assert!(::jit::verb::get(&vec![0xab; 10_000], 1 << 40, 1).is_some());
+			assert_eq!(::jit::verb::bar().unwrap().heat_mult, 2);
+			// pass 2: r1 (1.5 x need) cannot clear it alone, but with r2 (5 x need) the module holds
+			// 6.5 x need >= 2 x 2 x need; r3 (0.5 x need) would still fit the module's bar, but is below its own need
+			let refused_heat = ::jit::verb::stats().refused_heat;
+			heat(&mut a, &[(r[1].clone(), 3 * need / 2), (r[2].clone(), 5 * need), (r[3].clone(), need / 2)]);
+			a.jit_form_pass();
+			assert_eq!(::jit::verb::stats().compiled, 3);
+			let p = packs::placed(&a, &r);
+			assert!(p[1].is_some() && p[2].is_some() && p[1].unwrap().3 == p[2].unwrap().3, "r1 rode along with r2: {:?}", p);
+			assert!(p[3].is_none(), "r3 is below its own need");
+			assert_eq!(::jit::verb::stats().refused_heat, refused_heat + 1);
+			// pass 3, bar x4: r4 (1.5 x need) alone is refused for heat, nothing compiles
+			assert!(::jit::verb::get(&vec![0xcd; 10_000], 1 << 40, 1).is_some());
+			assert_eq!(::jit::verb::bar().unwrap().heat_mult, 4);
+			heat(&mut a, &[(r[4].clone(), 3 * need / 2)]);
+			a.jit_form_pass();
+			assert_eq!(::jit::verb::stats().compiled, 4);
+			assert!(packs::placed(&a, &r)[4].is_none());
+			assert_eq!(::jit::verb::stats().refused_heat, refused_heat + 2);
+			assert_eq!(a.jit.as_deref().unwrap().stats.queued, 0, "refused, not left waiting");
+		}
+
+		/// max_pass_bytes bounds what one pass compiles (each compile stalls
+		/// the machine's thread): with room for four compiles per pass but
+		/// bytes for about one module, the queue drains one module per pass.
+		#[test]
+		fn pass_byte_cap_spreads_modules_over_passes() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(8).map(|c| c.to_vec()).collect();
+			let mut params = JitParams::default();
+			params.pack_max_wait = 0;
+			assert!(a.jit_enable(params));
+			let nc: Vec<(u64, usize)> = regions.iter().map(|r| need_and_cost(&a, r)).collect();
+			let cap = ::jit::PACK_FIXED_BOUND + 2 * nc.iter().map(|x| x.1).max().unwrap() + 16;
+			{
+				let p = &mut a.jit.as_deref_mut().unwrap().params;
+				p.max_module_bytes = cap;
+				p.max_pass_bytes = cap;
+				assert_eq!(p.max_compiles_per_pass, 4);
+			}
+			let hot: Vec<(Vec<u64>, u64)> = regions.iter().zip(nc.iter()).map(|(r, x)| (r.clone(), 2 * x.0)).collect();
+			a.jit_prepare();
+			let mut passes = 0;
+			while packs::placed(&a, &regions).iter().any(|p| p.is_none()) {
+				passes += 1;
+				assert!(passes <= 8);
+				let (n0, b0) = (MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), ::jit::verb::stats().bytes);
+				heat(&mut a, &hot);
+				a.jit_form_pass();
+				let (n1, b1) = (MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), ::jit::verb::stats().bytes);
+				assert_eq!(n1 - n0, 1, "pass {}: one module", passes);
+				assert!(b1 - b0 <= cap as u64, "pass {}: {} bytes > {}", passes, b1 - b0, cap);
+			}
+			assert!(passes >= 2, "the byte cap, not the compile limit, split the work");
+		}
+
+		/// (a) Deferred packing: regions formed in DIFFERENT passes wait in
+		/// the queue (emitted, not compiled) until the queue holds the target,
+		/// then go into ONE module together.
+		#[test]
+		fn queued_regions_from_several_passes_share_one_module() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(8).map(|c| c.to_vec()).collect();
+			let mut params = JitParams::default();
+			params.pack_max_wait = 100;
+			assert!(a.jit_enable(params));
+			let nc: Vec<(u64, usize)> = regions.iter().map(|r| need_and_cost(&a, r)).collect();
+			// 2 x need: not hot; the target: more than the first four regions hold, less than all eight
+			let target = nc[..4].iter().map(|x| x.1).sum::<usize>() + 1;
+			assert!(nc.iter().map(|x| x.1).sum::<usize>() >= target);
+			a.jit.as_deref_mut().unwrap().params.pack_target_bytes = target;
+			let warm = |k: std::ops::Range<usize>| -> Vec<(Vec<u64>, u64)> {
+				k.map(|i| (regions[i].clone(), 2 * nc[i].0)).collect()
+			};
+			a.jit_prepare();
+			heat(&mut a, &warm(0..4));
+			a.jit_form_pass();
+			{
+				let j = a.jit.as_deref().unwrap();
+				assert_eq!((MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), j.stats.queued), (0, 4), "below the target: they wait");
+				assert_eq!(j.stats.queued_bytes as usize, target - 1);
+				assert!(packs::placed(&a, &regions).iter().all(|p| p.is_none()));
+			}
+			// the queued regions stay hot; their blocks do not form a second, overlapping region meanwhile
+			heat(&mut a, &warm(0..8));
+			a.jit_form_pass();
+			let mods = MODULES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+			assert_eq!(mods.len(), 1, "one module for both passes' regions");
+			let p: Vec<_> = packs::placed(&a, &regions).into_iter().map(|p| p.expect("placed")).collect();
+			assert!(p.iter().all(|x| x.3 == 7000));
+			let j = a.jit.as_deref().unwrap();
+			assert_eq!((j.stats.packs, j.stats.packs_full, j.stats.packed_regions), (1, 1, 8));
+			assert_eq!((j.stats.queued, j.stats.queued_bytes, j.stats.refused), (0, 0, 0));
+			eprintln!("deferred: 8 regions from 2 passes in one {}-byte module (target {})", mods[0].len(), target);
+		}
+
+		/// (b) A queue that never reaches the target is flushed once its
+		/// oldest region has waited pack_max_wait passes — not before.
+		#[test]
+		fn aged_queue_is_flushed_after_max_wait_passes() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(3).map(|c| c.to_vec()).collect();
+			let mut params = JitParams::default();
+			params.pack_max_wait = 3;
+			assert!(a.jit_enable(params));
+			let nc: Vec<(u64, usize)> = regions.iter().map(|r| need_and_cost(&a, r)).collect();
+			a.jit_prepare();
+			// pass 1 queues r0 and r1, pass 2 queues r2: the oldest is due at pass 4
+			heat(&mut a, &[(regions[0].clone(), 2 * nc[0].0), (regions[1].clone(), 2 * nc[1].0)]);
+			a.jit_form_pass();
+			heat(&mut a, &[(regions[2].clone(), 2 * nc[2].0)]);
+			a.jit_form_pass();
+			a.jit_form_pass();
+			assert_eq!((MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), a.jit.as_deref().unwrap().stats.queued), (0, 3), "3 passes: waiting");
+			a.jit_form_pass();
+			assert_eq!(MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), 1, "4th pass: the oldest waited 3 passes");
+			assert!(packs::placed(&a, &regions).iter().all(|p| p.map_or(false, |p| p.3 == 7000)), "with everything queued");
+			let j = a.jit.as_deref().unwrap();
+			assert_eq!((j.stats.packs, j.stats.packs_aged, j.stats.queued), (1, 1, 0));
+		}
+
+		/// (c) A region at pack_hot_factor times its need is compiled in the
+		/// pass that formed it, with whatever else waits.
+		#[test]
+		fn hot_region_flushes_the_queue_at_once() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(3).map(|c| c.to_vec()).collect();
+			let mut params = JitParams::default();
+			params.pack_max_wait = 100;
+			assert!(a.jit_enable(params));
+			let nc: Vec<(u64, usize)> = regions.iter().map(|r| need_and_cost(&a, r)).collect();
+			a.jit_prepare();
+			heat(&mut a, &[(regions[0].clone(), 2 * nc[0].0), (regions[1].clone(), 7 * nc[1].0)]);
+			a.jit_form_pass();
+			assert_eq!(MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), 0, "7 x need is not hot");
+			heat(&mut a, &[(regions[2].clone(), 8 * nc[2].0)]);
+			a.jit_form_pass();
+			assert_eq!(MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), 1, "8 x need: at once");
+			assert!(packs::placed(&a, &regions).iter().all(|p| p.map_or(false, |p| p.3 == 7000)), "with everything queued");
+			let j = a.jit.as_deref().unwrap();
+			assert_eq!((j.stats.packs, j.stats.packs_hot, j.stats.queued), (1, 1, 0));
+		}
+
+		/// (d) A queued region whose code changes before its module is built
+		/// is dropped, not compiled from the ops it was queued with; the
+		/// region queued with it is compiled. Its blocks may form again (from
+		/// the new code).
+		#[test]
+		fn queued_region_whose_code_changed_is_not_compiled() {
+			use self::packs::*;
+			let _l = ::jit::verb::TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			reset(::jit::verb::Policy::default());
+			let (mut a, pcs) = guest();
+			let regions: Vec<Vec<u64>> = pcs.chunks(3).take(2).map(|c| c.to_vec()).collect();
+			let mut params = JitParams::default();
+			params.pack_max_wait = 1;
+			assert!(a.jit_enable(params));
+			let nc: Vec<(u64, usize)> = regions.iter().map(|r| need_and_cost(&a, r)).collect();
+			a.jit_prepare();
+			heat(&mut a, &[(regions[0].clone(), 2 * nc[0].0), (regions[1].clone(), 2 * nc[1].0)]);
+			a.jit_form_pass();
+			assert_eq!((MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), a.jit.as_deref().unwrap().stats.queued), (0, 2));
+			// r1's second block: one instruction rewritten in memory (as a guest's store would)
+			let pc = regions[1][1];
+			let phys = a.mmu.translate_fetch_probe(pc).unwrap();
+			let old = a.mmu.load_word_raw(phys);
+			let new: u32 = if old == 0x0010_0013 { 0x0020_0013 } else { 0x0010_0013 }; // addi x0, x0, 1|2
+			for (k, byte) in new.to_le_bytes().iter().enumerate() {
+				a.mmu.store_raw(phys + k as u64, *byte);
+			}
+			// the drop must come from the code, not from the page counting as rewritten
+			assert!(a.mmu.page_gen(phys) < JIT_REWRITTEN_PAGE_GEN);
+			// the next pass: both are due
+			a.jit_form_pass();
+			assert_eq!(MODULES.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+			let p = packs::placed(&a, &regions);
+			assert_eq!(p[0].map(|x| (x.1, x.3)), Some((0, 7000)), "r0 compiled, alone in its module");
+			assert!(p[1].is_none(), "r1 is not compiled from stale ops");
+			let j = a.jit.as_deref().unwrap();
+			assert_eq!((j.stats.queue_stale, j.stats.queued, j.stats.packed_regions, j.stats.packs_aged), (1, 0, 1, 1));
+		}
+
 		/// Natively there is no verb: the JIT reports itself unavailable and
 		/// the self-test fails closed rather than passing on zero coverage.
 		#[test]
@@ -8955,6 +9926,13 @@ mod test_jit_equivalence {
 		}
 		fn call_region(&mut self, engine: &wasmtime::Engine, bytes: &[u8], fuel: u64, entry: u32) -> u64 {
 			let inst = self.instance(engine, bytes);
+			let run = inst.get_typed_func::<(i64, i32), i64>(&mut self.store, "run").unwrap();
+			run.call(&mut self.store, (fuel as i64, entry as i32)).unwrap() as u64
+		}
+		/// call_region for a module compiled once and entered many times
+		fn call_module(&mut self, module: &wasmtime::Module, fuel: u64, entry: u32) -> u64 {
+			let mem = self.mem;
+			let inst = wasmtime::Instance::new(&mut self.store, module, &[mem.into()]).expect("instantiates");
 			let run = inst.get_typed_func::<(i64, i32), i64>(&mut self.store, "run").unwrap();
 			run.call(&mut self.store, (fuel as i64, entry as i32)).unwrap() as u64
 		}
@@ -10236,55 +11214,71 @@ mod test_jit_equivalence {
 		assert!(completed > 120 && bailed > 20, "coverage of both paths: {} / {}", completed, bailed);
 	}
 
-	/// Random regions of 2..6 member blocks at a nonzero bias, each ending
-	/// in a branch, JAL or JALR to another member (or out), with x5..x7
-	/// holding RUNTIME member pcs for the JALRs: in-region transfers,
-	/// indirect dispatch and fuel exits against the reference.
+	/// A random region: 2..6 member blocks (module pcs) at a nonzero bias,
+	/// each ending in a branch, JAL or JALR to another member (or out), the
+	/// RUNTIME targets x5..x7 hold for the JALRs (members, or not), a fuel
+	/// bound, and how many ops the blocks hold before their terminators.
+	struct RandRegion {
+		blocks: Vec<(u64, Vec<BlockOp>)>,
+		bias: u64,
+		targets: Vec<u64>,
+		fuel: u64,
+		body_len: usize,
+	}
+
+	fn rand_region(r: &mut Rng) -> RandRegion {
+		let n = 2 + (r.next() % 5) as usize;
+		let starts: Vec<u64> = (0..n as u64).map(|i| 0x1000 + i * 0x100 + (r.next() % 8) * 4).collect();
+		let bias = (1 + (r.next() & 0xffff)) << 12;
+		let mut blocks = Vec::new();
+		let mut body_len = 0;
+		for (i, &s) in starts.iter().enumerate() {
+			let len = 1 + (r.next() % 6) as usize;
+			let mut ops = rand_ops(r, len);
+			// keep control flow for the terminator
+			ops.retain(|o| !matches!(o.kind, HOT_BEQ..=HOT_BGEU | HOT_JAL | HOT_JALR));
+			if ops.is_empty() {
+				ops.push(op(HOT_ADDI, 28, 28, 0, 1));
+			}
+			body_len += ops.len();
+			let here = s + ops.len() as u64 * 4;
+			let to = starts[(r.next() as usize) % n];
+			let rel = (to.wrapping_sub(here)) as i32;
+			let term = match r.next() % 5 {
+				0 => op(HOT_BNE, 0, 28, 0, rel),
+				1 => op(HOT_BEQ, 0, 0, 0, rel), // always taken
+				2 => op(HOT_JAL, if r.next() % 2 == 0 { 1 } else { 0 }, 0, 0, rel),
+				3 => op(HOT_JALR, 1, 5 + (r.next() % 3) as u8, 0, 0),
+				_ => op(HOT_ADDI, 29, 29, 0, i as i32), // fall out
+			};
+			ops.push(term);
+			blocks.push((s, ops));
+		}
+		let targets: Vec<u64> = (0..3).map(|_| match r.next() % 4 {
+			0 => bias + 0x1000 + 0x8000, // not a member
+			_ => bias + starts[(r.next() as usize) % n],
+		}).collect();
+		let fuel = 20 + r.next() % 400;
+		RandRegion { blocks, bias, targets, fuel, body_len }
+	}
+
+	/// Random regions (rand_region): in-region transfers, indirect dispatch
+	/// and fuel exits against the reference.
 	#[test]
 	fn chunked_regions_with_bias_and_indirect_jumps_match() {
 		let engine = engine();
 		let (mut transfers, mut cases) = (0, 0);
 		for seed in 1..200u64 {
 			let mut r = Rng(seed * 104729 | 1);
-			let n = 2 + (r.next() % 5) as usize;
-			let starts: Vec<u64> = (0..n as u64).map(|i| 0x1000 + i * 0x100 + (r.next() % 8) * 4).collect();
-			let bias = (1 + (r.next() & 0xffff)) << 12;
-			let mut blocks = Vec::new();
-			let mut body_len = 0;
-			for (i, &s) in starts.iter().enumerate() {
-				let len = 1 + (r.next() % 6) as usize;
-				let mut ops = rand_ops(&mut r, len);
-				// keep control flow for the terminator
-				ops.retain(|o| !matches!(o.kind, HOT_BEQ..=HOT_BGEU | HOT_JAL | HOT_JALR));
-				if ops.is_empty() {
-					ops.push(op(HOT_ADDI, 28, 28, 0, 1));
-				}
-				body_len += ops.len();
-				let here = s + ops.len() as u64 * 4;
-				let to = starts[(r.next() as usize) % n];
-				let rel = (to.wrapping_sub(here)) as i32;
-				let term = match r.next() % 5 {
-					0 => op(HOT_BNE, 0, 28, 0, rel),
-					1 => op(HOT_BEQ, 0, 0, 0, rel), // always taken
-					2 => op(HOT_JAL, if r.next() % 2 == 0 { 1 } else { 0 }, 0, 0, rel),
-					3 => op(HOT_JALR, 1, 5 + (r.next() % 3) as u8, 0, 0),
-					_ => op(HOT_ADDI, 29, 29, 0, i as i32), // fall out
-				};
-				ops.push(term);
-				blocks.push((s, ops));
-			}
-			let targets: Vec<u64> = (0..3).map(|_| match r.next() % 4 {
-				0 => bias + 0x1000 + 0x8000, // not a member
-				_ => bias + starts[(r.next() as usize) % n],
-			}).collect();
-			let fuel = 20 + r.next() % 400;
+			let rr = rand_region(&mut r);
+			let targets = rr.targets.clone();
 			let setup = move |c: &mut Cpu| {
 				for k in 0..3 {
 					c.x[5 + k] = targets[k] as i64;
 				}
 			};
-			let (rw, _) = check_region(&engine, seed, &blocks, bias, fuel, &setup);
-			if rw > body_len as u64 {
+			let (rw, _) = check_region(&engine, seed, &rr.blocks, rr.bias, rr.fuel, &setup);
+			if rw > rr.body_len as u64 {
 				transfers += 1;
 			}
 			cases += 1;
@@ -10315,6 +11309,250 @@ mod test_jit_equivalence {
 		});
 		assert!(!bailed);
 		assert_eq!(rw, 50 * 5, "every iteration ran compiled");
+	}
+
+	// ---- packed modules: several regions behind one run(fuel, entry) -----
+
+	const S_FCSR: u64 = 0x108;
+
+	/// Everything a chunked module can change: x, f, pc, fcsr, every chunk.
+	fn chunked_state(m: &Mem) -> (Vec<u64>, Vec<u64>, u64, u64, Vec<u8>) {
+		let x = (0..32).map(|i| m.get64(s_x(i))).collect();
+		let f = (0..32).map(|i| m.get64(s_f(i))).collect();
+		(x, f, m.get64(STATE + S_PC), m.get64(STATE + S_FCSR), m.get(CHUNKS, (RAM) as usize))
+	}
+
+	/// Enter random region `rr` at its block `i`: through entry `entry` of
+	/// the PACKED module and through entry i of the module compiled ALONE,
+	/// both at rr.bias, then against the reference interpreter — fully when
+	/// the modules ran to a region exit, else at the exact op they bailed
+	/// before. The two modules must agree bit for bit (retired, x, f, pc,
+	/// fcsr, memory); the reference on all of it too. Returns (retired,
+	/// whether it bailed early).
+	fn check_entry(engine: &wasmtime::Engine, seed: u64, rr: &RandRegion, i: usize, packed: &wasmtime::Module,
+		entry: u32, alone: &wasmtime::Module) -> (u64, bool)
+	{
+		let rt: Vec<(u64, Vec<BlockOp>)> = rr.blocks.iter().map(|b| (b.0.wrapping_add(rr.bias), b.1.clone())).collect();
+		let fresh = || {
+			let mut c = paged_cpu(seed);
+			for k in 0..3 {
+				c.x[5 + k] = rr.targets[k] as i64;
+			}
+			c.update_pc(rt[i].0);
+			c
+		};
+		let what = format!("seed {} block {} (entry {})", seed, i, entry);
+		let cpu = fresh();
+		let mut mp = chunked_mem(engine, &cpu, rr.bias);
+		let rp = mp.call_module(packed, rr.fuel, entry);
+		let mut ma = chunked_mem(engine, &cpu, rr.bias);
+		let ra = ma.call_module(alone, rr.fuel, i as u32);
+		assert_eq!(rp, ra, "{}: retired, packed vs alone", what);
+		assert!(chunked_state(&mp) == chunked_state(&ma), "{}: state, packed vs alone", what);
+		let mut full = fresh();
+		let ri = region_ref(&mut full, &rt, rr.fuel, None);
+		let fcsr = mp.get64(STATE + S_FCSR);
+		if ri == rp && full.pc == mp.get64(STATE + S_PC) {
+			assert_same(&mp, &full, &format!("{} (completed, {} retired)", what, rp));
+			assert_eq!(fcsr, full.csr[CSR_FCSR_ADDRESS as usize], "{}: fcsr", what);
+			return (rp, false);
+		}
+		assert!(rp < ri, "{}: module retired {} past the reference's {}", what, rp, ri);
+		let mut part = fresh();
+		assert_eq!(region_ref(&mut part, &rt, rr.fuel, Some(rp)), rp, "{}", what);
+		assert_same(&mp, &part, &format!("{} (bailed after {} of {})", what, rp, ri));
+		assert_eq!(fcsr, part.csr[CSR_FCSR_ADDRESS as usize], "{}: fcsr", what);
+		(rp, true)
+	}
+
+	/// A pack of three random regions: entering EVERY entry of every group
+	/// (base_k + i, with that group's bias) gives what the same region
+	/// compiled alone gives, bit for bit, and what the interpreter gives.
+	/// Each region draws its own bias (different per group); one case in
+	/// three moves all three to the SAME bias, so the groups' runtime pcs
+	/// interleave and a fallthrough of one often lands on a block start of
+	/// another (which it must leave to, as its own module would). Entries
+	/// past the last group run nothing.
+	#[test]
+	fn packed_regions_match_alone_and_interpreter() {
+		let engine = engine();
+		let lay = chunked_layout(true);
+		let (mut entries, mut bailed, mut transfers, mut shared_bias) = (0u64, 0u64, 0u64, 0u64);
+		let (mut packed_bytes, mut alone_bytes) = (0usize, 0usize);
+		for seed in 1..80u64 {
+			let mut r = Rng(seed * 15485863 | 1);
+			let mut regions: Vec<RandRegion> = (0..3).map(|_| rand_region(&mut r)).collect();
+			if seed % 3 == 0 {
+				let b = regions[0].bias;
+				for rr in regions.iter_mut() {
+					for t in rr.targets.iter_mut() {
+						*t = *t - rr.bias + b;
+					}
+					rr.bias = b;
+				}
+				shared_bias += 1;
+			} else {
+				assert!(regions[0].bias != regions[1].bias || regions[1].bias != regions[2].bias);
+			}
+			let groups: Vec<Vec<(u64, Vec<BlockOp>)>> = regions.iter().map(|rr| rr.blocks.clone()).collect();
+			let (bytes, bases) = jit::emit_regions(&groups, &lay).expect("pack emits");
+			let n: Vec<u32> = regions.iter().map(|rr| rr.blocks.len() as u32).collect();
+			assert_eq!(bases, vec![0, n[0], n[0] + n[1]], "entry bases");
+			let packed = wasmtime::Module::new(&engine, &bytes).expect("valid pack");
+			packed_bytes += bytes.len();
+			if seed == 1 {
+				eprintln!("pack: {} groups, {} entries, {} bytes (alone: {} bytes)", groups.len(),
+					n.iter().sum::<u32>(), bytes.len(),
+					groups.iter().map(|g| jit::emit_region(g, &lay).unwrap().len()).sum::<usize>());
+			}
+			for (k, rr) in regions.iter().enumerate() {
+				let one = jit::emit_region(&rr.blocks, &lay).expect("region emits");
+				alone_bytes += one.len();
+				let alone = wasmtime::Module::new(&engine, &one).unwrap();
+				for i in 0..rr.blocks.len() {
+					let (rw, b) = check_entry(&engine, seed, rr, i, &packed, bases[k] + i as u32, &alone);
+					entries += 1;
+					bailed += b as u64;
+					if rw > rr.blocks[i].1.len() as u64 {
+						transfers += 1;
+					}
+				}
+			}
+			// past the last entry: nothing runs, nothing changes
+			let cpu = paged_cpu(seed);
+			let mut m = chunked_mem(&engine, &cpu, regions[0].bias);
+			let before = chunked_state(&m);
+			assert_eq!(m.call_module(&packed, 1000, n.iter().sum::<u32>()), 0);
+			assert!(chunked_state(&m) == before, "seed {}: out-of-range entry touched state", seed);
+		}
+		eprintln!("packed entries: {} checked ({} bailed early, {} ran past their first block), {} packs at one bias; \
+			{} packed bytes vs {} alone", entries, bailed, transfers, shared_bias, packed_bytes, alone_bytes);
+		assert!(entries > 600 && transfers > entries / 8 && entries - bailed > entries / 3,
+			"coverage: {} entries, {} bailed, {} transfers", entries, bailed, transfers);
+		// one module's header instead of three, a few bytes of group switch per entry
+		assert!(packed_bytes < alone_bytes, "{} vs {}", packed_bytes, alone_bytes);
+	}
+
+	/// The packer's size arithmetic: a pack never exceeds PACK_FIXED_BOUND
+	/// plus its groups' pack_cost (the packer fills against that bound), up
+	/// to MAX_PACK_GROUPS groups and with a production-shaped layout (a
+	/// context block at a high address, shared memory64 with a maximum);
+	/// one group packs to exactly emit_region's module; a pack is a valid
+	/// module; more than MAX_PACK_GROUPS groups is refused.
+	#[test]
+	fn pack_size_bound_and_single_group_identity() {
+		let engine = engine();
+		let mut prod = chunked_layout(true);
+		prod.shared = true;
+		prod.max_pages = Some(1 << 18);
+		prod.ctx = 0x7fff_f7a3_1d48;
+		let mut slack = usize::MAX;
+		for (li, lay) in [chunked_layout(true), chunked_layout(false), prod].iter().enumerate() {
+			for seed in 1..40u64 {
+				let mut r = Rng(seed * 7_368_787 | 1);
+				let k = match seed {
+					1 => jit::MAX_PACK_GROUPS,
+					_ => 1 + (r.next() % 12) as usize,
+				};
+				let regions: Vec<RandRegion> = (0..k).map(|_| rand_region(&mut r)).collect();
+				let groups: Vec<jit::GroupCode> = regions.iter().map(|rr| jit::emit_group(&rr.blocks, lay).unwrap()).collect();
+				let refs: Vec<&jit::GroupCode> = groups.iter().collect();
+				let (bytes, bases) = jit::pack(&refs, lay).expect("packs");
+				let bound = jit::PACK_FIXED_BOUND + groups.iter().map(|g| g.pack_cost()).sum::<usize>();
+				assert!(bytes.len() <= bound, "layout {} seed {}: {} > {}", li, seed, bytes.len(), bound);
+				slack = slack.min(bound - bytes.len());
+				let blocks: Vec<Vec<(u64, Vec<BlockOp>)>> = regions.iter().map(|rr| rr.blocks.clone()).collect();
+				assert_eq!(jit::emit_regions(&blocks, lay), Some((bytes.clone(), bases)), "emit_regions = pack(emit_group)");
+				if k == 1 {
+					assert_eq!(Some(bytes.clone()), jit::emit_region(&regions[0].blocks, lay), "one group = emit_region");
+				}
+				if seed == 1 || seed == 2 {
+					// shared memories need the threads proposal; validate, don't instantiate
+					wasmtime::Module::validate(&engine, &bytes).expect("valid pack");
+				}
+			}
+		}
+		let g = jit::emit_group(&loop_region(0), &chunked_layout(true)).unwrap();
+		let too_many: Vec<&jit::GroupCode> = (0..jit::MAX_PACK_GROUPS + 1).map(|_| &g).collect();
+		assert!(jit::pack(&too_many, &chunked_layout(true)).is_none());
+		eprintln!("pack size bound: at least {} bytes to spare", slack);
+	}
+
+	/// A group's control transfers reach ONLY its own blocks. Group A's
+	/// blocks leave by a JAL, a taken branch, a JALR and a fallthrough, each
+	/// to a pc where group B — same module, same bias, so the very same
+	/// runtime pcs — starts a block; and B's JAL goes to A's first block.
+	/// Every one of them must leave the module with pc at the target and
+	/// nothing of the other group run. The same blocks as ONE group do run
+	/// on (the transfers are real), so this fails if the scoping breaks.
+	#[test]
+	fn packed_group_never_enters_another_groups_block() {
+		let engine = engine();
+		let lay = chunked_layout(true);
+		let bias = 0x7f00_0000u64;
+		let a: Vec<(u64, Vec<BlockOp>)> = vec![
+			(0x1000, vec![op(HOT_ADDI, 28, 28, 0, 1), op(HOT_JAL, 0, 0, 0, 0x2000 - 0x1004)]),
+			(0x1100, vec![op(HOT_ADDI, 28, 28, 0, 2), op(HOT_BEQ, 0, 0, 0, 0x2000 - 0x1104)]),
+			(0x1200, vec![op(HOT_ADDI, 28, 28, 0, 3), op(HOT_JALR, 0, 5, 0, 0)]),
+			(0x1300, vec![op(HOT_ADDI, 28, 28, 0, 4), op(HOT_ADDI, 28, 28, 0, 5)]), // falls through to 0x1308
+		];
+		let b: Vec<(u64, Vec<BlockOp>)> = vec![
+			(0x1308, vec![op(HOT_ADDI, 29, 29, 0, 200), op(HOT_ADDI, 29, 29, 0, 1)]), // falls out at 0x1310
+			(0x2000, vec![op(HOT_ADDI, 29, 29, 0, 100), op(HOT_JAL, 0, 0, 0, 0x1000 - 0x2004)]),
+		];
+		// (group, block, retired, exit pc) for each entry of the pack
+		let expect: [(usize, usize, u64, u64); 6] = [
+			(0, 0, 2, 0x2000), (0, 1, 2, 0x2000), (0, 2, 2, 0x2000), (0, 3, 2, 0x1308),
+			(1, 0, 2, 0x1310), (1, 1, 2, 0x1000),
+		];
+		let setup = |c: &mut Cpu| {
+			c.x[5] = (bias + 0x2000) as i64;
+			c.x[28] = 0;
+			c.x[29] = 0;
+		};
+		for order in 0..2 {
+			// both orders: A's entries at base 0 then B's, and the reverse
+			let groups = match order {
+				0 => vec![a.clone(), b.clone()],
+				_ => vec![b.clone(), a.clone()],
+			};
+			let (bytes, bases) = jit::emit_regions(&groups, &lay).expect("pack emits");
+			for &(g, i, retired, exit) in expect.iter() {
+				let (blocks, base) = match (g, order) {
+					(0, 0) => (&a, bases[0]),
+					(0, _) => (&a, bases[1]),
+					(_, 0) => (&b, bases[1]),
+					_ => (&b, bases[0]),
+				};
+				let mut cpu = paged_cpu(5);
+				setup(&mut cpu);
+				cpu.update_pc(blocks[i].0 + bias);
+				let mut m = chunked_mem(&engine, &cpu, bias);
+				let what = format!("order {} group {} block {:#x}", order, g, blocks[i].0);
+				let rw = m.call_region(&engine, &bytes, 1000, base + i as u32);
+				assert_eq!((rw, m.get64(STATE + S_PC)), (retired, bias + exit), "{}", what);
+				// nothing of the other group ran
+				let other = if g == 0 { 29 } else { 28 };
+				assert_eq!(m.get64(s_x(other)), 0, "{}: x{} written", what, other);
+				// and that is exactly what the interpreter does with this group's blocks alone
+				let rt: Vec<(u64, Vec<BlockOp>)> = blocks.iter().map(|b| (b.0 + bias, b.1.clone())).collect();
+				let ri = region_ref(&mut cpu, &rt, 1000, None);
+				assert_eq!(ri, rw, "{}", what);
+				assert_same(&m, &cpu, &what);
+			}
+		}
+		// control: the same blocks as ONE region do run on into each other
+		let mut one = a.clone();
+		one.extend(b.iter().cloned());
+		one.sort_by_key(|b| b.0);
+		let bytes = jit::emit_region(&one, &lay).unwrap();
+		let mut cpu = paged_cpu(5);
+		setup(&mut cpu);
+		cpu.update_pc(0x1300 + bias);
+		let mut m = chunked_mem(&engine, &cpu, bias);
+		let at = one.iter().position(|b| b.0 == 0x1300).unwrap() as u32;
+		let rw = m.call_region(&engine, &bytes, 1000, at);
+		assert!(rw > 2 && m.get64(s_x(29)) != 0, "one region: the fallthrough continues in-region ({} retired)", rw);
 	}
 
 	/// The production import shape: shared memory64 with a declared

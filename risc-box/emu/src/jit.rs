@@ -364,8 +364,9 @@ impl<'a> Emit<'a> {
 		self.reg_locals = next - FIRST_REG_LOCAL;
 	}
 
-	/// Read the context block (and the cached registers) into locals.
-	fn prologue(&mut self) {
+	/// Read the context block into locals (once per call, whichever packed
+	/// region the call enters: every region reads the same cells).
+	fn ctx_prologue(&mut self) {
 		let ctx = self.lay.ctx;
 		let (base, bias) = (self.l.base, self.l.bias);
 		self.addr_const(ctx);
@@ -393,6 +394,11 @@ impl<'a> Emit<'a> {
 			self.memarg(2, t.meta_cache);
 			self.lset(self.l.meta);
 		}
+	}
+
+	/// Load the registers this region caches into their locals.
+	fn reg_prologue(&mut self) {
+		let base = self.l.base;
 		for r in 1..32 {
 			if self.xl[r] != NONE {
 				self.lget(base);
@@ -411,8 +417,8 @@ impl<'a> Emit<'a> {
 		}
 	}
 
-	/// The single exit (after the $exit block): write back the registers
-	/// the region wrote and pc, return retired.
+	/// The region's single exit (after its $exit block): write back the
+	/// registers the region wrote and pc, leave retired on the stack.
 	fn epilogue(&mut self) {
 		let base = self.l.base;
 		for r in 1..32 {
@@ -2146,6 +2152,30 @@ pub(crate) fn source_key(blocks: &[(u64, Vec<BlockOp>)], layout_hash: u64) -> (u
 }
 
 #[cfg(feature = "codegen")]
+/// The cache key of a PACK (see emit_regions): its groups' source keys, in
+/// order (pack() is a pure function of the groups and their order). One
+/// group's pack is that region's module, so it keeps the region's own key.
+pub(crate) fn pack_key(keys: &[(u64, u64, u64)]) -> (u64, u64, u64) {
+	use std::hash::Hasher;
+	if keys.len() == 1 {
+		return keys[0];
+	}
+	let mut sip = std::collections::hash_map::DefaultHasher::new();
+	let mut fnv: Vec<u8> = Vec::with_capacity(8 + keys.len() * 24);
+	sip.write(b"risc-box pack");
+	sip.write_usize(keys.len());
+	fnv.extend_from_slice(b"pack");
+	fnv.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+	for k in keys {
+		for v in [k.0, k.1, k.2] {
+			sip.write_u64(v);
+			fnv.extend_from_slice(&v.to_le_bytes());
+		}
+	}
+	(keys[0].0, fnv64(&fnv), sip.finish())
+}
+
+#[cfg(feature = "codegen")]
 /// A stable hash of everything in a Layout the emitted code depends on.
 pub fn layout_hash(lay: &Layout) -> u64 {
 	use std::hash::{Hash, Hasher};
@@ -2486,7 +2516,8 @@ fn emit_search(e: &mut Emit, pcs: &[(u64, u32)]) {
 /// before retrying. Block pcs are module pcs: the caller rebases them and
 /// supplies the difference as the context block's bias.
 pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u8>> {
-	emit_region_impl(blocks, lay, false)
+	let g = emit_group_impl(blocks, lay, false)?;
+	pack(&[&g], lay).map(|(m, _)| m)
 }
 
 /// One block as a region module (tests): None when its first op is not
@@ -2494,16 +2525,78 @@ pub fn emit_region(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<Vec<u
 /// exec_block does (a jump to its own start re-enters, meets the spent
 /// fuel and leaves with pc there).
 pub fn emit_block(ops: &[BlockOp], start: u64, lay: &Layout) -> Option<Vec<u8>> {
-	emit_region_impl(&[(start, ops.to_vec())], lay, true)
+	let g = emit_group_impl(&[(start, ops.to_vec())], lay, true)?;
+	pack(&[&g], lay).map(|(m, _)| m)
 }
 
-fn emit_region_impl(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout, strict: bool) -> Option<Vec<u8>> {
-	if blocks.is_empty() || blocks.len() > 512 || (lay.shared && lay.max_pages.is_none()) {
+/// risc-box patch (packed modules): SEVERAL regions in one module, so the
+/// host's per-process module quota covers several times more code (its byte
+/// quota is the one that should bind). Returns the module and each region's
+/// ENTRY BASE: the module still exports the one `run(fuel, entry)` the host
+/// accepts, and entry `base_k + i` starts block i of region k. Each region
+/// (a "group") is exactly what emit_region makes of it alone — its own
+/// register plan, dispatch loop, indirect-jump dispatcher and epilogue — and
+/// its control transfers reach ONLY its own blocks: a branch, jump or JALR to
+/// a pc that starts a block of another group leaves the function with pc
+/// exact, as it would leave a module of its own. Every group computes runtime
+/// pcs from the context block's bias, so each stays position independent
+/// relative to its OWN bias: the caller sets the bias of the group it enters.
+pub fn emit_regions(groups: &[Vec<(u64, Vec<BlockOp>)>], lay: &Layout) -> Option<(Vec<u8>, Vec<u32>)> {
+	let mut code = Vec::with_capacity(groups.len());
+	for g in groups {
+		code.push(emit_group_impl(g, lay, false)?);
+	}
+	let refs: Vec<&GroupCode> = code.iter().collect();
+	pack(&refs, lay)
+}
+
+/// Most groups one pack holds (keeps every br_table target a 1-byte index).
+pub const MAX_PACK_GROUPS: usize = 64;
+/// What a pack spends beyond its groups' own code, at most: the module's
+/// sections and locals, the entry guard, the context loads and the group
+/// switch's opcode and vector length (the switch's per-entry bytes are in
+/// GroupCode::pack_cost).
+pub const PACK_FIXED_BOUND: usize = 512;
+
+/// One region's code, emitted alone so that packs are assembled from it
+/// without emitting anything twice: the register loads, then (at `cur_at`)
+/// the point where the pack sets `cur` from the entry, then the dispatch
+/// loop and the epilogue, which leaves `retired` on the stack. Branch depths
+/// inside are relative to the group's own blocks, so the code is the same
+/// wherever in a pack it lands.
+pub struct GroupCode {
+	code: Vec<u8>,
+	cur_at: usize,
+	reg_locals: u32,
+	n: u32,
+}
+
+impl GroupCode {
+	/// Member blocks (= entries) of the group.
+	pub fn blocks(&self) -> u32 {
+		self.n
+	}
+	/// The most this group adds to a pack: its code, its label and br_table
+	/// entries, its `cur` setup and its return.
+	pub fn pack_cost(&self) -> usize {
+		self.code.len() + self.n as usize + 24
+	}
+}
+
+/// The code of one region (see GroupCode); None when it cannot be emitted.
+pub fn emit_group(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout) -> Option<GroupCode> {
+	emit_group_impl(blocks, lay, false)
+}
+
+fn emit_group_impl(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout, strict: bool) -> Option<GroupCode> {
+	if blocks.is_empty() || blocks.len() > 512 {
 		return None;
 	}
 	let n = blocks.len();
 	let mut e = Emit::new(lay);
 	e.strict = strict;
+	// the group's OWN block starts: exit(), branches and the indirect
+	// dispatcher resolve against these and nothing else
 	for (i, &(start, _)) in blocks.iter().enumerate() {
 		e.targets.entry(start).or_insert(i as u32);
 	}
@@ -2512,18 +2605,8 @@ fn emit_region_impl(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout, strict: bool) 
 	e.dispatch = if has_jalr { Some(n as u32) } else { None };
 	e.plan_registers(blocks);
 	let l = e.l;
-	// entry guard: an index the module does not have runs nothing
-	e.lget(l.entry);
-	e.i32c(n as i32);
-	e.op(I32_GE_U);
-	e.op(IF);
-	e.op(VOID);
-	e.i64c(0);
-	e.op(RETURN);
-	e.op(END);
-	e.prologue();
-	e.lget(l.entry);
-	e.lset(l.cur);
+	e.reg_prologue();
+	let cur_at = e.code.len();
 	e.op(BLOCK); // $exit
 	e.op(VOID);
 	// dispatch loop: br_table on cur into one label per block (+ the
@@ -2576,8 +2659,77 @@ fn emit_region_impl(blocks: &[(u64, Vec<BlockOp>)], lay: &Layout, strict: bool) 
 	e.op(UNREACHABLE); // the loop never falls through
 	e.op(END); // $exit
 	e.epilogue();
-	let regs = e.reg_locals;
-	Some(assemble(e.code, regs, lay))
+	Some(GroupCode { code: e.code, cur_at, reg_locals: e.reg_locals, n: n as u32 })
+}
+
+/// Assemble a module from emitted groups, in order; returns it with each
+/// group's entry base. The function: the entry guard (an entry past the
+/// last group's runs nothing), the context loads, then — with more than one
+/// group — a br_table over the ENTRY that selects the group (one label per
+/// group, group k's code following the end of label k); each group sets
+/// cur = entry - base_k and runs exactly its own code, which ends in its own
+/// epilogue and returns. One group assembles to exactly what emit_region
+/// has always produced.
+pub fn pack(groups: &[&GroupCode], lay: &Layout) -> Option<(Vec<u8>, Vec<u32>)> {
+	if groups.is_empty() || groups.len() > MAX_PACK_GROUPS || (lay.shared && lay.max_pages.is_none()) {
+		return None;
+	}
+	let mut bases = Vec::with_capacity(groups.len());
+	let mut total = 0u32;
+	for g in groups {
+		bases.push(total);
+		total += g.n;
+	}
+	let size: usize = groups.iter().map(|g| g.pack_cost()).sum();
+	let mut e = Emit::new(lay);
+	e.code.reserve(size + 256);
+	let l = e.l;
+	// entry guard: an index the module does not have runs nothing
+	e.lget(l.entry);
+	e.i32c(total as i32);
+	e.op(I32_GE_U);
+	e.op(IF);
+	e.op(VOID);
+	e.i64c(0);
+	e.op(RETURN);
+	e.op(END);
+	e.ctx_prologue();
+	let many = groups.len() > 1;
+	if many {
+		for _ in 0..groups.len() {
+			e.op(BLOCK);
+			e.op(VOID);
+		}
+		e.lget(l.entry);
+		e.op(BR_TABLE);
+		e.idx(total as u64);
+		for (k, g) in groups.iter().enumerate() {
+			for _ in 0..g.n {
+				e.idx(k as u64);
+			}
+		}
+		e.idx(0); // default: unreachable (entry is guarded)
+	}
+	let mut regs = 0;
+	for (k, g) in groups.iter().enumerate() {
+		if many {
+			e.op(END); // end of label k: group k's code follows
+		}
+		e.code.extend_from_slice(&g.code[..g.cur_at]);
+		e.lget(l.entry);
+		if bases[k] != 0 {
+			e.i32c(bases[k] as i32);
+			e.op(I32_SUB);
+		}
+		e.lset(l.cur);
+		e.code.extend_from_slice(&g.code[g.cur_at..]);
+		if k + 1 < groups.len() {
+			// the last group's epilogue falls into the function's end
+			e.op(RETURN);
+		}
+		regs = regs.max(g.reg_locals);
+	}
+	Some((assemble(e.code, regs, lay), bases))
 }
 
 /// ... as i32 as i64 (wrap then sign-extend)
@@ -3483,9 +3635,12 @@ mod test_tier2 {
 ///   address, in another process or another machine, is the same module)
 ///   reuse the cached table index; a module that failed is never retried;
 /// - our budget sits under the host's (modules, attempts, bytes), and the
-///   heat a region must show to be compiled doubles every `heat_doubling`
-///   compiles, so the budget goes to the hottest code first and is never
-///   spent all at once on whatever was warm early;
+///   heat a module must show to be compiled doubles every `escalation_bytes`
+///   of module bytes spent, so the budget goes to the hottest code first and
+///   is never spent all at once on whatever was warm early. It escalates by
+///   BYTES, not modules: a module may hold several regions (packs), and many
+///   small modules must not raise the bar faster than the same code in one;
+///   the module count is only a hard cap;
 /// - a missing verb, an exhausted host quota, a binding failure or a run of
 ///   failed compiles turns compilation off for the life of the process;
 ///   regions already compiled keep running, everything else interprets.
@@ -3502,6 +3657,21 @@ pub mod verb {
 	pub const HOST_MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 	pub const HOST_MAX_ATTEMPTS: u32 = 1024;
 	pub const HOST_MAX_MODULES: u32 = 256;
+
+	/// The host limits this policy assumes: the production runtime's, unless RISC_JIT_HOST_MODULES / _MB / _ATTEMPTS
+	/// say the runtime underneath allows more (experiments on a runtime built with larger codegen limits).
+	fn host_limit(key: &str, default: u64) -> u64 {
+		std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+	}
+	fn host_max_modules() -> u32 {
+		host_limit("RISC_JIT_HOST_MODULES", HOST_MAX_MODULES as u64).min(u32::MAX as u64) as u32
+	}
+	fn host_max_attempts() -> u32 {
+		host_limit("RISC_JIT_HOST_ATTEMPTS", HOST_MAX_ATTEMPTS as u64).min(u32::MAX as u64) as u32
+	}
+	fn host_max_input_bytes() -> u64 {
+		host_limit("RISC_JIT_HOST_MB", HOST_MAX_INPUT_BYTES >> 20).saturating_mul(1 << 20)
+	}
 	/// set/codegen.c's unwired stub: no host verb behind the import.
 	pub const UNAVAILABLE: i64 = -64;
 
@@ -3514,8 +3684,8 @@ pub mod verb {
 		pub module_budget: u32,
 		pub attempt_budget: u32,
 		pub byte_budget: u64,
-		/// Required heat doubles every this many compiles.
-		pub heat_doubling: u32,
+		/// Required heat doubles every this many module bytes submitted.
+		pub escalation_bytes: u64,
 		/// Consecutive failed compiles that turn compilation off.
 		pub max_consecutive_failures: u32,
 	}
@@ -3529,7 +3699,8 @@ pub mod verb {
 				module_budget: 240,
 				attempt_budget: 960,
 				byte_budget: 15 * 1024 * 1024,
-				heat_doubling: 48,
+				// eight doublings over the byte budget (~1.9 MB each)
+				escalation_bytes: 15 * 1024 * 1024 / 8,
 				max_consecutive_failures: 6,
 			}
 		}
@@ -3558,6 +3729,12 @@ pub mod verb {
 		// source key (see super::source_key) -> Some(table index) | None
 		// (failed, or too large: either way, never resubmitted)
 		cache: ::fnv::FnvHashMap<(u64, u64, u64), Option<u64>>,
+		// risc-box patch (packed modules): REGION source key -> where it was
+		// compiled, (table index, entry base, blocks) | None (its pack failed,
+		// or it is too large for any module: never resubmitted). Process-wide
+		// like `cache`, so a re-formed region — on this machine or any other
+		// running the same code — runs without spending budget.
+		placed: ::fnv::FnvHashMap<(u64, u64, u64), Option<(u64, u32, u32)>>,
 		consecutive_failures: u32,
 		owner: usize,
 	}
@@ -3576,6 +3753,14 @@ pub mod verb {
 	/// This thread's state, else the first enabled one (the embedder's thread reading hart 0's counters).
 	fn mine_or_first() -> Option<std::sync::Arc<Mutex<State>>> {
 		mine().or_else(|| STATES.lock().unwrap_or_else(|e| e.into_inner()).first().map(|(_, st)| st.clone()))
+	}
+
+	impl State {
+		/// What min_heat is multiplied by now: doubled per escalation_bytes
+		/// of module bytes submitted so far.
+		fn heat_mult(&self) -> u64 {
+			1u64 << (self.stats.bytes / self.policy.escalation_bytes.max(1)).min(30)
+		}
 	}
 
 	/// A key for callers that hold module bytes (tests, tools).
@@ -3598,6 +3783,7 @@ pub mod verb {
 					policy,
 					stats: Stats::default(),
 					cache: Default::default(),
+					placed: Default::default(),
 					consecutive_failures: 0,
 					owner: sys::thread(),
 				}));
@@ -3677,14 +3863,13 @@ pub mod verb {
 			return Got::Refused;
 		}
 		let p = &s.policy;
-		let shift = (s.stats.compiled / p.heat_doubling.max(1)).min(30);
-		if heat < min_heat.saturating_mul(1u64 << shift) {
+		if heat < min_heat.saturating_mul(s.heat_mult()) {
 			s.stats.refused_heat += 1;
 			return Got::Refused;
 		}
 		let modules = s.stats.compiled + s.stats.failed;
-		if modules >= p.module_budget.min(HOST_MAX_MODULES)
-			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
+		if modules >= p.module_budget.min(host_max_modules())
+			|| s.stats.attempts >= p.attempt_budget.min(host_max_attempts())
 		{
 			s.stats.refused_budget += 1;
 			return Got::Refused;
@@ -3699,9 +3884,9 @@ pub mod verb {
 			s.cache.insert(k, None);
 			return Got::TooLarge;
 		}
-		if modules >= p.module_budget.min(HOST_MAX_MODULES)
-			|| s.stats.attempts >= p.attempt_budget.min(HOST_MAX_ATTEMPTS)
-			|| s.stats.bytes + module.len() as u64 > p.byte_budget.min(HOST_MAX_INPUT_BYTES)
+		if modules >= p.module_budget.min(host_max_modules())
+			|| s.stats.attempts >= p.attempt_budget.min(host_max_attempts())
+			|| s.stats.bytes + module.len() as u64 > p.byte_budget.min(host_max_input_bytes())
 		{
 			s.stats.refused_budget += 1;
 			return Got::Refused;
@@ -3738,6 +3923,65 @@ pub mod verb {
 		Got::Failed
 	}
 
+	/// Where the region with source key `k` was placed: Some(Some((table
+	/// index, entry base, blocks))), Some(None) when it is never to be
+	/// submitted again, None when it was never seen.
+	pub fn placed(k: (u64, u64, u64)) -> Option<Option<(u64, u32, u32)>> {
+		let st = mine()?;
+		let s = st.lock().unwrap_or_else(|e| e.into_inner());
+		s.placed.get(&k).copied()
+	}
+
+	/// Record where region `k` was placed (None: never submit it again).
+	pub fn place(k: (u64, u64, u64), at: Option<(u64, u32, u32)>) {
+		if let Some(st) = mine() {
+			st.lock().unwrap_or_else(|e| e.into_inner()).placed.insert(k, at);
+		}
+	}
+
+	/// What a module submitted now must clear, read-only: None when nothing
+	/// can be compiled any more (off, or the module/attempt budget spent);
+	/// else the heat multiplier lookup() applies to `min_heat` right now,
+	/// the input bytes left in the budget and the module size cap. A packer
+	/// sizes and fills a module against this before emitting anything.
+	pub fn bar() -> Option<Bar> {
+		let st = mine()?;
+		let s = st.lock().unwrap_or_else(|e| e.into_inner());
+		let p = &s.policy;
+		let modules = s.stats.compiled + s.stats.failed;
+		if s.stats.disabled.is_some()
+			|| modules >= p.module_budget.min(host_max_modules())
+			|| s.stats.attempts >= p.attempt_budget.min(host_max_attempts())
+		{
+			return None;
+		}
+		Some(Bar {
+			heat_mult: s.heat_mult(),
+			bytes_left: p.byte_budget.min(host_max_input_bytes()).saturating_sub(s.stats.bytes),
+			max_module_bytes: p.max_module_bytes.min(HOST_MAX_MODULE_BYTES),
+		})
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	pub struct Bar {
+		pub heat_mult: u64,
+		pub bytes_left: u64,
+		pub max_module_bytes: usize,
+	}
+
+	/// Count regions a packer turned down without a lookup of their own —
+	/// for heat (no module they could join clears the bar with them) or for
+	/// budget (none is left, or they do not fit the bytes left) — so the
+	/// refused counters keep counting regions, as they did when every
+	/// region had its own lookup.
+	pub fn note_refused(heat: u64, budget: u64) {
+		if let Some(st) = mine() {
+			let mut s = st.lock().unwrap_or_else(|e| e.into_inner());
+			s.stats.refused_heat += heat;
+			s.stats.refused_budget += budget;
+		}
+	}
+
 	/// lookup() for callers holding module bytes that only want the index.
 	pub fn get(module: &[u8], heat: u64, min_heat: u64) -> Option<u64> {
 		let m = module.to_vec();
@@ -3772,6 +4016,10 @@ pub mod verb {
 				let p = (self.0.get() as *mut u64).add((cell / 8) as usize);
 				std::ptr::write_volatile(p, v);
 			}
+		}
+		/// cell = super::CTX_* (tests: what the generated code would read)
+		pub fn get(&self, cell: u64) -> u64 {
+			unsafe { std::ptr::read_volatile((self.0.get() as *const u64).add((cell / 8) as usize)) }
 		}
 	}
 
@@ -3818,17 +4066,32 @@ pub mod verb {
 		pub fn thread() -> usize {
 			1
 		}
-		pub unsafe fn call(_index: u64, _fuel: u64, _entry: u32) -> u64 {
-			0
+		/// Natively a table index is no function: a test may stand in for the
+		/// call (it sees the index, fuel and entry; the context block holds
+		/// the rest), else nothing runs.
+		pub static TEST_CALLER: Mutex<Option<fn(u64, u64, u32) -> u64>> = Mutex::new(None);
+		pub unsafe fn call(index: u64, fuel: u64, entry: u32) -> u64 {
+			match *TEST_CALLER.lock().unwrap() {
+				Some(f) => f(index, fuel, entry),
+				None => 0,
+			}
 		}
 	}
 
-	/// Tests: reset the process-wide state and install a stand-in compiler.
+	/// Tests: reset the process-wide state and install a stand-in compiler
+	/// (and no stand-in caller).
 	#[cfg(not(target_family = "wasm"))]
 	pub fn reset_for_test(compiler: Option<fn(&[u8]) -> i64>, policy: Policy) {
 		*sys::TEST_COMPILER.lock().unwrap() = compiler;
+		*sys::TEST_CALLER.lock().unwrap() = None;
 		STATES.lock().unwrap_or_else(|e| e.into_inner()).clear();
 		enable(policy);
+	}
+
+	/// Tests: stand in for calls into compiled code (natively there is none).
+	#[cfg(not(target_family = "wasm"))]
+	pub fn set_test_caller(caller: Option<fn(u64, u64, u32) -> u64>) {
+		*sys::TEST_CALLER.lock().unwrap() = caller;
 	}
 
 	/// Tests that touch the process-wide verb state take this first.
@@ -3855,21 +4118,47 @@ pub mod verb {
 		#[test]
 		fn caches_identical_modules_and_escalates_heat() {
 			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-			reset_for_test(Some(ok), Policy { heat_doubling: 2, ..Policy::default() });
+			reset_for_test(Some(ok), Policy { escalation_bytes: 16, ..Policy::default() });
 			let a = get(b"module-a", 10, 10).expect("compiles at threshold");
 			assert_eq!(get(b"module-a", 0, 10), Some(a), "same bytes reuse, heat irrelevant");
 			assert!(get(b"module-b", 10, 10).is_some());
-			// two compiles spent: the threshold doubled
+			// 16 bytes spent: the threshold doubled
 			assert!(get(b"module-c", 10, 10).is_none(), "below the doubled threshold");
 			assert!(get(b"module-c", 20, 10).is_some());
 			let s = stats();
 			assert_eq!((s.compiled, s.reused, s.refused_heat), (3, 1, 1));
 		}
 
+		/// The bar follows BYTES: eight 100-byte modules raise it exactly as
+		/// far as one 800-byte module, and the module count never raises it.
+		#[test]
+		fn escalation_follows_bytes_not_modules() {
+			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+			let policy = Policy { escalation_bytes: 300, ..Policy::default() };
+			let mult = |modules: &[Vec<u8>]| {
+				reset_for_test(Some(ok), policy.clone());
+				let mut seen = Vec::new();
+				for m in modules {
+					seen.push(bar().unwrap().heat_mult);
+					assert!(get(m, 1 << 20, 1).is_some());
+				}
+				seen.push(bar().unwrap().heat_mult);
+				seen
+			};
+			let small: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 100]).collect();
+			let one = vec![vec![9u8; 800]];
+			// before each module, and after the last: 0, 100, ..., 800 bytes spent
+			assert_eq!(mult(&small), vec![1, 1, 1, 2, 2, 2, 4, 4, 4]);
+			assert_eq!(mult(&one), vec![1, 4]);
+			// lookup applies the same bar: 800 bytes in, a module needs 4x its min_heat
+			assert!(get(b"next", 39, 10).is_none());
+			assert!(get(b"next", 40, 10).is_some());
+		}
+
 		#[test]
 		fn budget_is_cumulative_and_failures_are_not_retried() {
 			let _l = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-			reset_for_test(Some(ok), Policy { module_budget: 2, heat_doubling: 1000, ..Policy::default() });
+			reset_for_test(Some(ok), Policy { module_budget: 2, ..Policy::default() });
 			assert!(get(b"x1", 1, 1).is_some());
 			assert!(get(b"x2", 1, 1).is_some());
 			assert!(get(b"x3", 1, 1).is_none(), "module budget spent");

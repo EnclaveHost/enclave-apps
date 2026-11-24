@@ -1502,11 +1502,27 @@ fn finish_machine(emu: &mut Emulator, cfg: &Config) {
     }
 }
 
+/// Local profiling (RISC_PC_SAMPLE=1): the guest's (pc, privilege, satp) after each executed batch, drained by
+/// GET /debug/pcs. Off unless the runtime environment sets it, which no deployment does.
+static PC_SAMPLES: std::sync::Mutex<Vec<(u64, u8, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn pc_sampling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RISC_PC_SAMPLE").map_or(false, |v| v == "1"))
+}
+
+fn pc_sample(s: (u64, u8, u64)) {
+    let mut g = PC_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() < 4 << 20 {
+        g.push(s);
+    }
+}
+
 /// The live region JIT (PLATFORM-JIT.md): hot guest regions compile to wasm
 /// through the platform's enclave:codegen verb and run in place of the
 /// interpreter. On wherever the build has it; RISC_JIT=0 is the off switch
 /// (and the benchmark's A/B), RISC_JIT_FUEL / RISC_JIT_INTERVAL /
-/// RISC_JIT_HEAT tune it. Without the verb, or once its process-wide budget
+/// RISC_JIT_HEAT / RISC_JIT_PACK_* tune it. Without the verb, or once its process-wide budget
 /// is spent, the machine simply keeps interpreting.
 #[cfg(feature = "codegen")]
 fn jit_enable(emu: &mut Emulator) {
@@ -1537,6 +1553,33 @@ fn jit_enable(emu: &mut Emulator) {
     if let Some(v) = num("RISC_JIT_BLOCKS") {
         p.max_blocks = (v as usize).clamp(1, 512);
     }
+    // packed modules: queue target (bytes), deadline (formation passes), hot factor, bytes per pass
+    if let Some(v) = num("RISC_JIT_PACK_TARGET") {
+        p.pack_target_bytes = v as usize;
+    }
+    if let Some(v) = num("RISC_JIT_PACK_WAIT") {
+        p.pack_max_wait = v;
+    }
+    if let Some(v) = num("RISC_JIT_PACK_HOT") {
+        p.pack_hot_factor = v.max(1);
+    }
+    if let Some(v) = num("RISC_JIT_PASS_BYTES") {
+        p.max_pass_bytes = (v as usize).max(4096);
+    }
+    // the verb's lifetime budget (modules, MiB submitted); defaults fit the production host's limits
+    // formation throughput: compiles per formation pass, and the heat sampling duty cycle (1 window in 2^n recorded)
+    if let Some(v) = num("RISC_JIT_PER_PASS") {
+        p.max_compiles_per_pass = v.clamp(1, 4096) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_SAMPLE_PERIOD") {
+        p.sample_period = v.min(16) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_BUDGET_MODULES") {
+        p.budget_modules = v.min(u32::MAX as u64) as u32;
+    }
+    if let Some(v) = num("RISC_JIT_BUDGET_MB") {
+        p.budget_bytes = v.saturating_mul(1024 * 1024);
+    }
     p.trace = std::env::var("RISC_JIT_TRACE").map_or(false, |v| v == "1");
     p.chain = !std::env::var("RISC_JIT_CHAIN").map_or(false, |v| v == "0");
     let fuel = p.fuel;
@@ -1557,13 +1600,15 @@ fn jit_json(emu: Option<&Emulator>) -> String {
     format!(
         ",\"jit\":{{\"calls\":{},\"chained\":{},\"skippedRewritten\":{},\"retired\":{},\"emptyCalls\":{},\"interpreted\":{},\"regions\":{},\"installs\":{},\
          \"formed\":{},\"passes\":{},\"contentChecks\":{},\"mapChecks\":{},\"verifyFailures\":{},\"oversize\":{},\
-         \"volatile\":{},\"formMs\":{:.1},\
+         \"volatile\":{},\"formMs\":{:.1},\"packs\":{},\"packedRegions\":{},\"packReused\":{},\
+         \"queued\":{},\"queuedBytes\":{},\"packsFull\":{},\"packsAged\":{},\"packsHot\":{},\"queueStale\":{},\"queueExpired\":{},\
          \"compiled\":{},\"compileFailed\":{},\"compileBytes\":{},\"reused\":{},\"refusedHeat\":{},\"refusedBudget\":{},\
          \"compileMs\":{:.1},\"maxCompileMs\":{:.1},\"lastStatus\":{},\"disabled\":{},\
          \"codeGen\":{}}}",
         s.calls, s.chained, s.skipped_rewritten, s.retired, s.empty_calls, s.interpreted, s.live_regions, s.installs,
         s.formed, s.passes, s.content_checks, s.map_checks, s.verify_failures, s.oversize,
-        s.volatile, s.form_us as f64 / 1000.0,
+        s.volatile, s.form_us as f64 / 1000.0, s.packs, s.packed_regions, s.pack_reused,
+        s.queued, s.queued_bytes, s.packs_full, s.packs_aged, s.packs_hot, s.queue_stale, s.queue_expired,
         v.compiled, v.failed, v.bytes, v.reused, v.refused_heat, v.refused_budget,
         v.compile_us as f64 / 1000.0, v.max_compile_us as f64 / 1000.0, v.last_status,
         v.disabled.map_or("null".to_string(), |d| format!("\"{d}\"")),
@@ -1855,6 +1900,22 @@ fn route(app: &mut App, server: &mut Server, key: usize, req: Request) {
             };
             let topic = m.console_topic();
             server.upgrade_sse(key, &topic, &initial);
+        }
+        // Local profiling only: the guest pc samples (RISC_PC_SAMPLE=1), one "pc priv satp" hex line each; ?reset clears.
+        ("GET", "/debug/pcs") if !sub && pc_sampling() => {
+            let mut g = PC_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+            let mut body = String::with_capacity(g.len() * 36);
+            for (pc, p, satp) in g.iter() {
+                body.push_str(&format!("{pc:x} {p} {satp:x}\n"));
+            }
+            g.clear();
+            return server.respond(key, Response::new(200, "OK").with("cache-control", "no-store").body("text/plain", body));
+        }
+        // Local profiling only: ends the process so `wasmtime run --profile=guest` writes its profile. Absent unless
+        // the runtime environment sets RISC_DEBUG_EXIT=1, which no deployment does.
+        ("POST", "/debug/exit") if !sub && std::env::var("RISC_DEBUG_EXIT").map_or(false, |v| v == "1") => {
+            eprintln!("[risc-box] /debug/exit: exiting (RISC_DEBUG_EXIT=1)");
+            std::process::exit(0);
         }
         ("POST", "/start") if !sub => {
             if app.main().phase == Phase::Running {
@@ -3555,6 +3616,9 @@ pub fn run() {
             // loop almost nothing, leaving the budget to scan/encode).
             let ran_at = Instant::now();
             emu.run_n(batch);
+            if !parked && pc_sampling() {
+                pc_sample(emu.get_cpu().sample_state());
+            }
             // The rate only means something for a batch that EXECUTED: a parked guest consumes
             // its batch without running anything, which would read as an absurd rate.
             if !parked {
