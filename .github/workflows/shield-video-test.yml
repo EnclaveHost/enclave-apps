@@ -1,0 +1,24 @@
+name: Enclave Shield video tests
+on:
+  push:
+    branches: [main]
+    paths: ["risc-box/**", ".github/workflows/shield-video-test.yml"]
+  pull_request:
+    paths: ["risc-box/**", ".github/workflows/shield-video-test.yml"]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Adversarial transport and transform tests
+        run: cargo test --locked --release --manifest-path risc-box/shield-video/Cargo.toml
+      - name: Install WebAssembly target
+        run: rustup target add wasm32-wasip2
+      - name: Build masked RISC Box and codec probe
+        run: |
+          cargo build --locked --release --target wasm32-wasip2 --manifest-path risc-box/Cargo.toml --features masked-video
+          cargo build --locked --release --target wasm32-wasip2 --manifest-path risc-box/shield-video/Cargo.toml --features codec-tests --example codec_probe
+      # Real-GPU/FFmpeg tests are explicit local integration tests; see README.

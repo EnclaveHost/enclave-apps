@@ -31,6 +31,7 @@ fn main() {
 
     let mut cc = Command::new(env::var("RBX_CLANG").unwrap_or_else(|_| "clang".into()));
     cc.args(["-O2", "-DNDEBUG", "-c", "vendor/minih264/wrapper.c", "-o"]).arg(&obj);
+    if env::var_os("CARGO_FEATURE_MASKED_VIDEO").is_some() { cc.arg("-DRBX_SHIELD_VIDEO"); }
     if arch == "wasm32" || arch == "wasm64" {
         cc.arg(format!("--target={arch}-wasip2"));
         cc.args(["-nostdlibinc", "-Ivendor/minih264/shim"]);
