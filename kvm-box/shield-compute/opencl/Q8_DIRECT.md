@@ -1142,6 +1142,43 @@ What stands between this and a release, in the order it would be done:
 7. An independent review of the arena and mailbox code, which share memory
    between the client and the executor in new ways.
 
+### After the release: two more sets, and two things that did not help
+
+Measured 2026-11-24 on the same full host, 300 tokens, alternating rounds, the
+committed route (mailbox, arenas, triples, inline continuation, glue, lazy
+arguments) against the native engine in the image:
+
+| Set | Route plain | Native plain | Route drafting | Native drafting | Route verify | Native verify |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 rounds, morning | 15.73 | 16.10 | 16.37 | 17.07 | 105.9 ms | 101.6 ms |
+| 4 rounds, an hour later | 16.53 | 16.52 | 16.55 | 16.68 | 103.8 ms | 102.7 ms |
+
+Over the eight rounds plain is 98.9% of the native engine and drafting 97.5%.
+The second set is level in both; the first is not, and single rounds differ by
+a token a second, so neither set alone says where the route stands.
+
+Stage timers over one drafting run of 47.2 s (190,003 launches): the executor
+23.8 s; the launch around it 0.68 s (3.6 us a launch); the glue kernels 0.97 s
+(222,128 launches, 4.4 us each, work the native engine also does); 6.16 million
+kernel-argument calls 0.53 s with the timer's own cost in it; 100,806 buffer
+reads 0.39 s and 40,064 writes 0.09 s. What the route adds that an engine with
+the tensors in its own memory does not is the launch, the arguments and the
+copies: about 1.7 s, 3.6% of the run. An idle `clFinish` of the CPU runtime
+costs 0.2 us, so the finishes before each read are not where the reads' time
+goes; it is the copy.
+
+Not kept:
+
+- Three products in an exchange only at one row (the third as its own request
+  at two rows, a setting in the frontend, removed again). Four rounds: drafting
+  16.58 against 16.55 without the gate, the verify step 105.4 ms against 103.8,
+  plain 16.32 against 16.53. The old finding that triples lose at two rows does
+  not hold with arenas and the continuation in place.
+- The fused norm kernel (`kernel_rms_norm_mul` in the frontend, fusion left on
+  in the plugin). Its rounds ran while the host was at its busiest: 15.35 and
+  16.22 drafting against the native engine's 10.94 to 17.16 in the same set.
+  Nothing can be read from them, and it is not in the tree.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
