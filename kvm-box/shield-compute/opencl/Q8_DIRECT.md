@@ -978,6 +978,73 @@ What was tried on that, none kept:
 - The application's workers bound to three cores of their own
   (`GOMP_CPU_AFFINITY`): still preempted 120 to 340 times a second, no faster.
 
+### The arithmetic between products on the device, and arguments kept here
+
+Experiment, opt-in, 2026-11-23. Three pieces.
+
+**Glue on the device** (`SHIELD_OPENCL_GLUE=1`, `q8_glue.inc`). The packaged
+llama plugin sends everything but the products to the processor backend
+(`GGML_SHIELD_NATIVE_CPU_FALLBACK=1`), so the residual stream crossed the
+device boundary four times a layer. With `llama-device-glue.patch` applied to
+the plugin and `GGML_SHIELD_DEVICE_GLUE=add,mul,rms,glu` (and
+`GGML_OPENCL_DISABLE_FUSION=1`, since the fused norm kernel is not one of
+these), additions, multiplications by a row of weights, RMS norms and the
+feed-forward gate of the stream stay on the device, and the frontend computes
+them itself on the buffers' bytes when the plugin launches `kernel_add`,
+`kernel_add_row`, `kernel_mul`, `kernel_mul_row`, `kernel_rms_norm` or
+`kernel_swiglu`: 3 to 14 us each where the CPU runtime took 10, 33 and 229 for
+norm, addition and gate (and hung on the row multiplication). A launch with a
+geometry other than the plugin's, or that the buffers do not cover, is left to
+the runtime. Kernels are known by name only, which is not enough for a
+release. In a 100-token run the application's writes of activations fell from
+41,981 to 13,806 and its reads from 68,181 to 34,744.
+
+The gate uses the exponential of the application's processor backend, in the
+256-bit form the packaged backend is built with
+(`SHIELD_OPENCL_GLUE_EXP=avx512` for the other). The two do not round alike:
+with the 512-bit one the executor served no continuation ahead at all (0
+against 10,278 in 100 tokens), because it learns one only from a gate with the
+bits its own copy of that backend gives.
+
+**Arguments kept here** (`SHIELD_OPENCL_LAZY_ARGS=1`). A glue kernel takes 13
+to 30 arguments, and with glue on the device setting arguments became the
+largest cost in the frontend, 5.5 us a launch. For a kernel whose launches are
+taken here the arguments are now kept in the frontend and passed to the
+runtime only when a launch is left to it after all, or the kernel is cloned or
+run as a task.
+
+**A pin that spread.** The frontend pins the thread that makes requests at its
+first mailed product. A thread that thread makes afterwards starts with the
+same single processor. Nothing did until the norm moved to the device: then
+the application first needed its pool of workers after the pin, all of them
+landed on that one processor, and a token took 20 seconds. Every 256 requests
+the frontend now gives any other thread of the process that is confined to
+exactly that processor the processors the requesting thread had before.
+
+Alternating rounds of 300 tokens, with `SHIELD_Q8_NICE_REFILL=10`:
+
+| Route | Plain | Drafting | Verify ms | Draft ms |
+| --- | ---: | ---: | ---: | ---: |
+| before these (4 rounds) | 15.66 | 16.50 | 104.8 | 7.3 |
+| glue, arguments passed (4) | 16.00 | 16.40 | 105.3 | 7.5 |
+| arguments kept, no glue (4) | 15.77 | 16.44 | 104.7 | 7.9 |
+| glue and arguments kept (4) | 16.53 | 16.64 | 104.1 | 7.0 |
+| the same, second set (4) | 16.41 | 16.56 | 104.1 | 7.6 |
+| the same, six client threads (4) | 16.70 | 16.50 | 102.2 | 9.8 |
+| native engine, same sets | 16.34 to 16.95 | 17.00 to 17.16 | 99.5 to 101.2 | 7.3 to 8.3 |
+
+With both, plain is at 97 to 98.5% of the native engine in the image and
+drafting at 97 to 98%. Six client threads bring the verify step to within a
+millisecond of the native engine's and lengthen the draft step by two, as
+they did before.
+
+With glue on the device the norm is summed in another order than the
+processor backend's, so the logits differ in their last bits: the 100-token
+llama-cli text is `dcb6091e2630a532` with it and `fc9381771ffb68b1` without
+(with arguments kept and nothing else changed it is the same text as before).
+Under EyesOff's loop the 300-token text and its acceptance rate were the same
+with and without glue. 13 session tests pass.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route

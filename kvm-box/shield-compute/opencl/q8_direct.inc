@@ -489,7 +489,10 @@ struct Q8Session {
   // and the product of a paired tensor. Null when it could not provide one.
   unsigned char *shared = nullptr;
   Q8Mail *mail = nullptr;
-  bool pinned = false;
+  bool pinned = false, pin_valid = false;
+  int pin_cpu = -1;
+  uint64_t pin_checks = 0;
+  cpu_set_t pin_before;
   // Two tensors applied to the same activation one after the other (a
   // feed-forward gate and up projection) can share a round trip: the second
   // product is requested with the first and used only if the next launch asks
@@ -948,10 +951,28 @@ std::optional<const unsigned char *> q8_exchange_shared(const Q8Identity &weight
         if (!session.pinned) {
           session.pinned = true;
           if (const char *cpu = std::getenv("SHIELD_OPENCL_Q8_CPU")) {
+            session.pin_cpu = std::atoi(cpu);
+            session.pin_valid = sched_getaffinity(0, sizeof(session.pin_before), &session.pin_before) == 0;
             cpu_set_t set;
             CPU_ZERO(&set);
-            CPU_SET(std::atoi(cpu), &set);
+            CPU_SET(session.pin_cpu, &set);
             sched_setaffinity(0, sizeof(set), &set);  // the calling thread
+          }
+        }
+        // A thread this one makes after it was pinned starts on this one processor too (a pool of
+        // workers the application first needs later, for one). Now and then, any other thread of the
+        // process found confined to exactly this processor is given the processors this thread had.
+        if (session.pin_valid && (++session.pin_checks & 255) == 1) {
+          const pid_t self = pid_t(syscall(SYS_gettid));
+          if (DIR *tasks = opendir("/proc/self/task")) {
+            while (const dirent *entry = readdir(tasks)) {
+              const pid_t tid = pid_t(std::atoi(entry->d_name));
+              cpu_set_t has;
+              if (tid > 0 && tid != self && sched_getaffinity(tid, sizeof(has), &has) == 0 && CPU_COUNT(&has) == 1 &&
+                  CPU_ISSET(session.pin_cpu, &has))
+                sched_setaffinity(tid, sizeof(session.pin_before), &session.pin_before);
+            }
+            closedir(tasks);
           }
         }
         mail->id = id;

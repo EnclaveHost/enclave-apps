@@ -1,0 +1,25 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -7206,6 +7206,22 @@
+                     return false;
+                 }
+                 break;
++            case GGML_OP_ADD:
++            case GGML_OP_MUL:
++            case GGML_OP_RMS_NORM:
++            case GGML_OP_GLU: {
++                // EXPERIMENT (GGML_SHIELD_DEVICE_GLUE=1): the arithmetic between two products of the
++                // residual stream stays on the device, so that the stream does not cross to the
++                // processor backend and back between them.
++                static const char * glue = getenv("GGML_SHIELD_DEVICE_GLUE");  // names: add mul rms glu
++                const char * name = op->op == GGML_OP_ADD ? "add" : op->op == GGML_OP_MUL ? "mul" :
++                                    op->op == GGML_OP_RMS_NORM ? "rms" : "glu";
++                if (!glue || !strstr(glue, name) || op->type != GGML_TYPE_F32 || op->ne[2] != 1 || op->ne[3] != 1 ||
++                    op->ne[0] < 1024) {
++                    return false;
++                }
++                break;
++            }
+             default:
+                 return false;
+         }

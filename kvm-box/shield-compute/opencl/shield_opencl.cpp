@@ -24,6 +24,8 @@
 #include <set>
 #include <string>
 #include <sstream>
+#include <dirent.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -229,6 +231,12 @@ struct Kernel {
   // launches and argument updates then need no lookups in the plan.
   int q8 = 0;
 #endif
+  // Which glue kernel this is (q8_glue.inc): -1 not looked at yet, 0 none. Its arguments as they were set.
+  int glue = -1;
+  std::array<uint64_t, 32> glue_value{};
+  std::array<uint8_t, 32> glue_size{};
+  // Arguments held here and not yet passed to the runtime (see lazy_arguments).
+  uint32_t lazy_dirty = 0;
 };
 struct SvmAllocation {
   void *base = nullptr;
@@ -243,6 +251,41 @@ struct SvmAllocation {
 };
 std::map<uintptr_t, std::shared_ptr<SvmAllocation>> svm_allocations;
 std::map<cl_kernel, Kernel> kernels;
+// Moves whenever an entry of `kernels` is made, replaced or removed: a pointer to an entry that a thread
+// kept is good only while this stands still.
+std::atomic<uint64_t> kernels_generation{1};
+// EXPERIMENT (SHIELD_OPENCL_LAZY_ARGS=1). An application sets every argument of a kernel before every
+// launch, 18 for a product and 30 for an addition. For a kernel whose launches are taken here (a product
+// kernel, a glue kernel) the runtime never runs with them, so they are kept here and passed to the
+// runtime only if a launch is left to it after all, or the kernel is cloned.
+bool lazy_arguments() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SHIELD_OPENCL_LAZY_ARGS");
+    return value && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+// Passes what is held to the runtime. Called with `mutex` held.
+cl_int flush_arguments_locked(cl_kernel k, Kernel &held) {
+  for (unsigned index = 0; held.lazy_dirty && index < 32; ++index) {
+    if (!(held.lazy_dirty & (uint32_t(1) << index))) continue;
+    held.lazy_dirty &= ~(uint32_t(1) << index);
+    const size_t n = held.glue_size[index];
+    if (const cl_int code = REAL(clSetKernelArg)(k, index, n, &held.glue_value[index])) return code;
+    cl_mem handle = nullptr;
+    if (n == sizeof(cl_mem)) std::memcpy(&handle, &held.glue_value[index], sizeof(handle));
+    auto slot = std::find_if(held.mems.begin(), held.mems.end(), [&](const auto &m) { return m.first == index; });
+    if (slot != held.mems.end()) slot->second = handle;
+    else if (handle) held.mems.emplace_back(index, handle);
+  }
+  return CL_SUCCESS;
+}
+cl_int flush_arguments(cl_kernel k) {
+  if (!lazy_arguments()) return CL_SUCCESS;
+  std::lock_guard lock(mutex);
+  auto it = kernels.find(k);
+  return it == kernels.end() ? CL_SUCCESS : flush_arguments_locked(k, it->second);
+}
 std::atomic<uint64_t> next_program_revision{1};
 struct Program {
   uint64_t revision = next_program_revision.fetch_add(1);
@@ -739,6 +782,7 @@ bool storage(cl_mem b, Storage &out) {
 }
 #ifdef SHIELD_Q8_CAPTURE
 #include "q8_capture.inc"
+#include "q8_glue.inc"
 #endif
 } // namespace
 extern "C" {
@@ -908,6 +952,7 @@ cl_kernel real_kernel(cl_kernel kernel, cl_int *error = nullptr) {
   {
     std::lock_guard kernels_lock(mutex);
     kernels[made] = Kernel{};
+    kernels_generation.fetch_add(1, std::memory_order_release);
   }
   slot->real.store(made, std::memory_order_release);
   return made;
@@ -1168,6 +1213,7 @@ CL_API_ENTRY cl_kernel CL_API_CALL clCreateKernel(cl_program p,
     }
     std::lock_guard lock(mutex);
     kernels[kernel] = std::move(state);
+    kernels_generation.fetch_add(1, std::memory_order_release);
   }
   return kernel;
 }
@@ -1198,6 +1244,7 @@ CL_API_ENTRY cl_int CL_API_CALL clCreateKernelsInProgram(cl_program p,
     }
     std::lock_guard lock(mutex);
     kernels[out[i]] = std::move(state);
+    kernels_generation.fetch_add(1, std::memory_order_release);
   }
   return result;
 }
@@ -1205,6 +1252,35 @@ CL_API_ENTRY cl_int CL_API_CALL clSetKernelArg(cl_kernel k, cl_uint index,
                                                size_t n, const void *value) {
   StartupTiming::Scope scope(startup_timing, 2);
   if (is_virtual(k) && !(k = real_kernel(k))) return CL_INVALID_KERNEL;
+#ifdef SHIELD_Q8_CAPTURE
+  if (value && n && n <= sizeof(uint64_t) && index < 32 && lazy_arguments()) {
+    static thread_local cl_kernel last = nullptr;
+    static thread_local Kernel *kept = nullptr;
+    static thread_local uint64_t kept_in = 0;
+    const uint64_t generation = kernels_generation.load(std::memory_order_acquire);
+    if (last != k || kept_in != generation) {
+      std::lock_guard lock(mutex);
+      auto it = kernels.find(k);
+      kept = it == kernels.end() ? nullptr : &it->second;
+      if (kept && kept->glue < 0 && glue_enabled()) kept->glue = glue_kind_of(k);
+      last = k;
+      kept_in = generation;
+    }
+    if (kept && (kept->q8 != 0 ? index < q8_kind_arguments(kept->q8) : kept->glue > 0)) {
+      uint64_t bits = 0;
+      std::memcpy(&bits, value, n);
+      kept->glue_value[index] = bits;
+      kept->glue_size[index] = uint8_t(n);
+      kept->lazy_dirty |= uint32_t(1) << index;
+      if (kept->q8 != 0) {
+        auto *p = static_cast<const unsigned char *>(value);
+        kept->args[index].assign(p, p + n);
+        kept->svm[index] = false;
+      }
+      return CL_SUCCESS;
+    }
+  }
+#endif
   auto result = REAL(clSetKernelArg)(k, index, n, value);
   if (!result) {
     std::lock_guard lock(mutex);
@@ -1212,6 +1288,16 @@ CL_API_ENTRY cl_int CL_API_CALL clSetKernelArg(cl_kernel k, cl_uint index,
     if (it != kernels.end()) {
       cl_mem handle = nullptr;
       if (value && n == sizeof(cl_mem)) std::memcpy(&handle, value, sizeof(handle));
+      if (glue_enabled()) {
+        Kernel &held = it->second;
+        if (held.glue < 0) held.glue = glue_kind_of(k);
+        if (held.glue > 0 && index < held.glue_value.size()) {
+          uint64_t bits = 0;
+          if (value && n <= sizeof(bits)) std::memcpy(&bits, value, n);
+          held.glue_value[index] = bits;
+          held.glue_size[index] = value && n <= sizeof(bits) ? uint8_t(n) : 0;
+        }
+      }
       auto &mems = it->second.mems;
       auto slot = std::find_if(mems.begin(), mems.end(), [&](const auto &m) { return m.first == index; });
       if (slot != mems.end()) slot->second = handle;
@@ -1364,12 +1450,17 @@ CL_API_ENTRY cl_int CL_API_CALL clReleaseKernel(cl_kernel k) {
     auto it = kernels.find(k);
     if (it != kernels.end() && !--it->second.references) {
       kernels.erase(it);
+      kernels_generation.fetch_add(1, std::memory_order_release);
     }
   }
   return REAL(clReleaseKernel)(k);
 }
 CL_API_ENTRY cl_kernel CL_API_CALL clCloneKernel(cl_kernel k, cl_int *error) {
   if (is_virtual(k) && !(k = real_kernel(k, error))) return nullptr;
+  if (const cl_int unsent = flush_arguments(k)) {
+    if (error) *error = unsent;
+    return nullptr;
+  }
   auto clone = REAL(clCloneKernel)(k, error);
   if (clone) {
     std::lock_guard lock(mutex);
@@ -1377,6 +1468,7 @@ CL_API_ENTRY cl_kernel CL_API_CALL clCloneKernel(cl_kernel k, cl_int *error) {
     if (it != kernels.end()) {
       kernels[clone] = it->second;
       kernels[clone].references = 1;
+      kernels_generation.fetch_add(1, std::memory_order_release);
     }
   }
   return clone;
@@ -1388,12 +1480,19 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
   // A per-thread copy of what a launch needs. Assigning into it reuses its
   // storage, so the per-launch copy allocates nothing.
   static thread_local Kernel state;
+  static thread_local GlueArgs glue_args;
+  int glue_kernel = 0;
   int q8_kernel = 0;  // Q8Kind
   if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
   {
     std::lock_guard lock(mutex);
     auto it = kernels.find(kernel);
     state.recognized = it != kernels.end() && it->second.recognized;
+    if (it != kernels.end() && it->second.glue > 0) {
+      glue_kernel = it->second.glue;
+      glue_args.value = it->second.glue_value;
+      glue_args.size = it->second.glue_size;
+    }
     if (it != kernels.end()) {
       state.args = it->second.args;
       state.svm = it->second.svm;
@@ -1402,7 +1501,10 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueNDRangeKernel(
 #endif
     }
   }
+  if (glue_kernel && !count && !event && glue_run(q, glue_kernel, glue_args, dimensions, offset, global, local))
+    return CL_SUCCESS;
   auto fallback = [&] {
+    if (const cl_int unsent = flush_arguments(kernel)) return unsent;
     if (startup_timing.enabled) {
       // Which kernels the CPU runtime ran, by name, for the timing report.
       char name[128] = {};
@@ -2007,6 +2109,7 @@ CL_API_ENTRY cl_int CL_API_CALL clEnqueueTask(cl_command_queue q, cl_kernel kern
                                               const cl_event *wait, cl_event *event) {
   if (is_virtual(kernel) && !(kernel = real_kernel(kernel))) return CL_INVALID_KERNEL;
   q8_kernel_may_write(kernel);
+  if (const cl_int unsent = flush_arguments(kernel)) return unsent;
   return REAL(clEnqueueTask)(q, kernel, count, wait, event);
 }
 #ifdef SHIELD_SOURCE_DECLINES

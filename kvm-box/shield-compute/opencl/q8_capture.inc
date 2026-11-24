@@ -588,6 +588,7 @@ std::pair<bool,cl_int> capture_q8(cl_command_queue q, cl_kernel kernel, const Ke
       if(!job->profile->sample(job->profile->queued)) return {false,0};
     }
     cl_int error=0;
+    if(flush_arguments(kernel)) return {false,0};
     job->kernel=REAL(clCloneKernel)(kernel,&error); if(!job->kernel) return {false,0};
     job->queue=REAL(clCreateCommandQueue)(context,device,0,&error); if(!job->queue) return {false,0};
     job->completion=REAL(clCreateUserEvent)(context,&error); if(!job->completion) return {false,0};
