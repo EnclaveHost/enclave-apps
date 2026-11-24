@@ -1262,6 +1262,15 @@ application threads with four runtime threads gave the route plain 57.1 and
 60.8 ms, the native engine's figure at six. So the two counts are separate
 settings, and a guest with more than four processors wants the runtime at four.
 
+What the executor adds to a product beyond the backend's own time, for whoever
+looks next: 8 us a call (compute 203 against backend 195, 114,217 calls). Timed
+apart, the copy of each product to the client with its finite check is 512 ms
+of a run (159,927 copies, 10.6 GB, 3.2 us each) and the sentinel fills that the
+idle thread did not get to 84 ms; reading the backend's counters twice is 1.4
+us a call. Having the backend write straight into the client's memory would
+need the sentinel written there at request time, which costs what the copy
+does, so the copy stays.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
