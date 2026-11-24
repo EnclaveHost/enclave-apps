@@ -2,3 +2,9 @@
 # (sha256 f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7). The scanner reads the minified export
 # assignment `t.FourKeyMap=t.TwoKeyMap` on its single line as a key. Nothing else is excused.
 kvm-box/src/vendor/xterm.js:generic-api-key:1
+# sia-s3/vendor/sia-sdk-rs is the vendored upstream Sia SDK. Its unit test test_objects (sia_storage app_client/http.rs)
+# holds a JSON fixture of three objects whose "key" fields are 64-hex object ids; the scanner reads each as an API
+# key. Excused by commit and line, so the same file is scanned again when it changes. Nothing else is excused.
+eec6892b2f1046fa9f7ff811bdf365131768e90d:sia-s3/vendor/sia-sdk-rs/sia_storage/src/app_client/http.rs:generic-api-key:1802
+eec6892b2f1046fa9f7ff811bdf365131768e90d:sia-s3/vendor/sia-sdk-rs/sia_storage/src/app_client/http.rs:generic-api-key:1850
+eec6892b2f1046fa9f7ff811bdf365131768e90d:sia-s3/vendor/sia-sdk-rs/sia_storage/src/app_client/http.rs:generic-api-key:1898
