@@ -1070,7 +1070,30 @@ SHIELD_OPENCL_BUFFER_DIR=<a directory on disk>  SHIELD_OPENCL_BUFFER_FILE_MIN_MB
 SHIELD_OPENCL_GLUE=1  GGML_SHIELD_DEVICE_GLUE=add,mul,rms,glu  GGML_OPENCL_DISABLE_FUSION=1   (patched plugin only)
 ```
 
+Checked against the release tooling on 2026-11-24, when a 0.6.12 candidate
+was asked for. The last image the packager built is
+`0.6.11-declines-candidate-v2` (2026-10-24), and its recorded inputs show it
+holds none of the direct route: its frontend was built from
+`shield_opencl.cpp`, `q8_capture.inc` and `q8_masked.inc` only, and its plugin
+knows Q8_0 kernels only. `native/source_declines_package.py` still lists
+those sources (`FRONTEND_SOURCES`, `COMPILER_SOURCES`), so
+`build-declines-frontend.py` cannot build today's frontend, which also
+includes `q8_admission.inc`, `q8_direct.inc`, `q8_kquant.inc`,
+`q8_iq3s_grid.inc` and `q8_glue.inc`. The K-quant plugin, its libllama and
+its declines table were built by hand outside this repository
+(`~/shield-perf/kq`), and the plugin's K-quant changes are not among the
+patches `package-standard.py` binds. The 0.6.11 development deployment
+(controller and desktop guests, 8 GiB desktop) is stopped. So a candidate is
+not one build away: everything on this route since 2026-11-19 has to be
+brought through the packager first.
+
 What stands between this and a release, in the order it would be done:
+
+0. Bring the packager up to the code: the frontend and compiler source lists,
+   the K-quant reference kernels, the plugin's changes exported from the
+   scratch tree as patches the packager binds (with
+   `llama-device-glue.patch`), the request corpus captured again with the new
+   plugin, and the declines table generated from it in the runtime image.
 
 1. The two processor numbers are this host's (hardware threads 14 and 30 are
    one core here). A guest has its own topology; the service has to choose
