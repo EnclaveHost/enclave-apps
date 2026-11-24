@@ -1179,6 +1179,26 @@ Not kept:
   16.22 drafting against the native engine's 10.94 to 17.16 in the same set.
   Nothing can be read from them, and it is not in the tree.
 
+A third set the same day, on a quieter host (load 4 to 13), eight alternating
+rounds: drafting 16.70 against 16.72 (standard deviations 0.16 and 0.34; the
+paired difference is -0.02 with a standard error of 0.12), plain 15.83 against
+16.12 (paired difference -0.29, standard error 0.09). A fourth, six rounds:
+drafting 16.50 against 16.86, plain 16.16 against 16.32. Over the four sets the
+route is at 96 to 100% of the native engine drafting and 98 to 100% plain;
+about 98% and 99% is what they say together, and no single set settles it.
+
+Also not kept, from that fourth set:
+
+- The compute buffer given to the scheduler as a host buffer
+  (`GGML_SHIELD_HOST_COMPUTE=1`, a patch to the plugin that was not added to
+  the bound ones): the buffer mapped once for reading, a tensor's data pointer
+  its place in that mapping, so an operation of the processor backend reads a
+  product where it lies instead of after a copy. Buffer reads fell from
+  100,806 to 951 in a run and the text was the same. Six alternating rounds:
+  drafting 16.40 against 16.50 without it, plain 15.92 against 16.16. The time
+  of the copies is not saved, it moves: the operation that reads the product
+  pays for bringing it to its processor instead.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
