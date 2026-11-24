@@ -112,6 +112,44 @@ __attribute__((target("avx2,fma"))) inline __m256 glue_expf8(__m256 x) {
                        _mm256_or_ps(_mm256_and_ps(_mm256_castsi256_ps(c), _mm256_mul_ps(_mm256_fmadd_ps(s2, j, s2), s1)),
                                     _mm256_andnot_ps(_mm256_castsi256_ps(c), _mm256_fmadd_ps(k, j, k)))));
 }
+// glue_expf8 sixteen lanes at a time: the same operations in the same order on each lane, so every lane
+// has the bits glue_expf8 gives it. (Its early return is the last selection below with no lane chosen;
+// j * k + k and k * j + k are one value.)
+__attribute__((target("avx512f,avx512dq,fma"))) inline __m512 glue_expf16(__m512 x) {
+  const __m512 r = _mm512_set1_ps(0x1.8p23f);
+  const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+  const __m512 n = _mm512_sub_ps(z, r);
+  const __m512 b = _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f), _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+  const __m512i e = _mm512_slli_epi32(_mm512_castps_si512(z), 23);
+  const __m512 k = _mm512_castsi512_ps(_mm512_add_epi32(e, _mm512_castps_si512(_mm512_set1_ps(1))));
+  const __m512 magnitude = _mm512_andnot_ps(_mm512_set1_ps(-0.f), n);
+  const __mmask16 c = _mm512_cmp_ps_mask(magnitude, _mm512_set1_ps(126), _CMP_GT_OQ);
+  const __m512 u = _mm512_mul_ps(b, b);
+  const __m512 j = _mm512_fmadd_ps(
+      _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), b, _mm512_set1_ps(0x1.573e2ep-5f)), u,
+                      _mm512_fmadd_ps(_mm512_set1_ps(0x1.555e66p-3f), b, _mm512_set1_ps(0x1.fffdb6p-2f))),
+      u, _mm512_mul_ps(_mm512_set1_ps(0x1.ffffecp-1f), b));
+  const __m512 usual = _mm512_fmadd_ps(k, j, k);
+  if (!c) return usual;
+  const __m512i g = _mm512_maskz_set1_epi32(_mm512_cmp_ps_mask(n, _mm512_setzero_ps(), _CMP_LE_OQ), int(0x82000000u));
+  const __m512 s1 = _mm512_castsi512_ps(_mm512_add_epi32(g, _mm512_set1_epi32(0x7f000000)));
+  const __m512 s2 = _mm512_castsi512_ps(_mm512_sub_epi32(e, g));
+  const __mmask16 d = _mm512_cmp_ps_mask(magnitude, _mm512_set1_ps(192), _CMP_GT_OQ);
+  const __m512 large = _mm512_mul_ps(_mm512_fmadd_ps(s2, j, s2), s1);
+  return _mm512_mask_blend_ps(d, _mm512_mask_blend_ps(c, usual, large), _mm512_mul_ps(s1, s1));
+}
+__attribute__((target("avx2,fma"))) void glue_swiglu_row8(float *y, const float *x, const float *g, size_t n);
+// glue_swiglu_row8 with sixteen lanes while sixteen elements are left; the rest is glue_swiglu_row8's.
+__attribute__((target("avx512f,avx512dq,fma"))) void glue_swiglu_row16(float *y, const float *x, const float *g, size_t n) {
+  size_t i = 0;
+  const __m512 one = _mm512_set1_ps(1), zero = _mm512_setzero_ps();
+  for (; i + 15 < n; i += 16) {
+    const __m512 v = _mm512_loadu_ps(x + i);
+    const __m512 silu = _mm512_div_ps(v, _mm512_add_ps(one, glue_expf16(_mm512_sub_ps(zero, v))));
+    _mm512_storeu_ps(y + i, _mm512_mul_ps(silu, _mm512_loadu_ps(g + i)));
+  }
+  glue_swiglu_row8(y + i, x + i, g + i, n - i);
+}
 __attribute__((target("avx2,fma"))) void glue_swiglu_row8(float *y, const float *x, const float *g, size_t n) {
   size_t i = 0;
   const __m256 one = _mm256_set1_ps(1), zero = _mm256_setzero_ps();
@@ -248,8 +286,15 @@ bool glue_run(cl_command_queue q, int kind, const GlueArgs &a, cl_uint dimension
     unsigned char *pd = bytes(md, od, extd);
     if (!p0 || !p1 || !pd || REAL(clFinish)(q)) return false;
     q8_written(md, size_t(od), size_t(extd), false);
+    // Sixteen lanes of the 256-bit exponential where the processor has them (SHIELD_OPENCL_GLUE_LANES=8
+    // keeps eight): the same bits, in half the time.
+    static const bool sixteen = [] {
+      const char *value = std::getenv("SHIELD_OPENCL_GLUE_LANES");
+      return !(value && !std::strcmp(value, "8")) && __builtin_cpu_supports("avx512f") &&
+             __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("fma");
+    }();
     for (uint64_t r = 0; r < rows; ++r)
-      (wide_exp ? glue_swiglu_row : glue_swiglu_row8)(reinterpret_cast<float *>(pd + r * nb1),
+      (wide_exp ? glue_swiglu_row : sixteen ? glue_swiglu_row16 : glue_swiglu_row8)(reinterpret_cast<float *>(pd + r * nb1),
                                                       reinterpret_cast<const float *>(p0 + r * nb01) + off0,
                                                       reinterpret_cast<const float *>(p1 + r * nb11) + off1, ne0);
     return true;

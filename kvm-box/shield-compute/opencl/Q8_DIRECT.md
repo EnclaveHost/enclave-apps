@@ -1209,6 +1209,30 @@ Also not kept, from that fourth set:
   cache domain) and 16.52 on 15 and 31. A pair can be worse; none found is
   better, and how busy a processor looks beforehand does not say which.
 
+Kept, from the same day: SwiGLU in the frontend with sixteen lanes
+(`glue_swiglu_row16`, on by default where the processor has AVX-512;
+`SHIELD_OPENCL_GLUE_LANES=8` keeps eight). It is the 256-bit exponential the
+packaged processor backend uses, the same operations in the same order on each
+lane, so the bits are the same: 7.9 million values compared, the limits and
+non-finite values among them, none different; the 27B text and the small
+model's text unchanged. A row of 21,504 takes 3.1 us instead of 5.8, and the
+glue kernels of a drafting run 785 ms instead of 951 (0.35% of the run). This
+is after SVN25 and is not in it.
+
+What a profile of the requesting thread said, for whoever looks next. In the
+generation window (the first 140 s of a run are loading and one thread
+authenticating ahead, and a profile that starts earlier mixes the two) the
+route's thread is 64% in the frontend, of which 95.6% is the wait for the
+executor's reply, and 30% in the processor backend with 7.0% at an OpenMP
+barrier; the native engine's is 59% in its backend plus 8% in libllama, and
+30% in the processor backend with 6.4% at the barrier. The processor side is
+the same in both. Each of the application's four threads has its processor to
+itself during generation (980 to 993 of 1,000 ticks in ten seconds, 6 to 26
+involuntary switches a second). Passive OpenMP waiting is much worse (14.3
+tokens a second); spinning for ever, an active wait policy, no idle sentinel
+and no nice on the refill threads change nothing; one thread gives 13.6 and
+two 15.8.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
