@@ -168,6 +168,9 @@ pub struct Server {
     app: &'static str,
     started: Instant,
     pump_cursor: usize,
+    /// Headers added to the next response this server writes (set by a route around a synchronous handler, cleared
+    /// by it afterwards): the gateway's CORS for configured browser origins.
+    pub next_extra: Vec<(String, String)>,
 }
 
 /// `ENCLAVE_PORTS=http:8000=18321,tcp:7777=18322` → the actual port to bind.
@@ -201,7 +204,7 @@ impl Server {
             .set_nonblocking(true)
             .expect("non-blocking listener");
         println!("[{app}] listening on 127.0.0.1:{port}");
-        Server { listener, conns: Vec::new(), app, started: Instant::now(), pump_cursor: 0 }
+        Server { listener, conns: Vec::new(), app, started: Instant::now(), pump_cursor: 0, next_extra: Vec::new() }
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -222,14 +225,14 @@ impl Server {
     /// `max_body` caps ordinary request bodies; a target matching a prefix in
     /// `big_routes` gets THAT route's cap (each buffered upload route has its
     /// own ceiling — a blanket cap over-buffers the smaller routes). Targets
-    /// under `stream_prefix` are not buffered at all: the request is emitted
+    /// listed in `stream_routes` are not buffered at all: the request is emitted
     /// at end-of-headers with `stream_len` set, and the body is consumed by
     /// the Sink the app registers via `begin_body`.
     pub fn poll(
         &mut self,
         max_body: usize,
         big_routes: &[(&str, usize)],
-        stream_prefix: &str,
+        stream_routes: &[&str],
     ) -> Vec<(usize, Request)> {
         let biggest = big_routes.iter().map(|(_, c)| *c).max().unwrap_or(0);
         let read_cap = MAX_HEADER_BYTES + max_body.max(biggest);
@@ -364,7 +367,7 @@ impl Server {
                 continue; // emitted last poll; the app answers before this one
             }
             if let ConnState::Http { since, reading_body } = &mut conn.state {
-                match try_parse(&mut conn.rbuf, max_body, big_routes, stream_prefix) {
+                match try_parse(&mut conn.rbuf, max_body, big_routes, stream_routes) {
                     Parse::Complete(req) => {
                         if req
                             .header("connection")
@@ -421,7 +424,8 @@ impl Server {
         };
     }
 
-    pub fn respond(&mut self, key: usize, resp: Response) {
+    pub fn respond(&mut self, key: usize, mut resp: Response) {
+        resp.headers.extend(std::mem::take(&mut self.next_extra));
         let Some(conn) = self.conns.get_mut(key) else { return };
         // Answering a streaming-route request WITHOUT consuming its body:
         // the engine will not resynchronize past an unread body, so the
@@ -449,6 +453,7 @@ impl Server {
         head_only: bool,
         src: Box<dyn Body>,
     ) {
+        resp.headers.extend(std::mem::take(&mut self.next_extra));
         let Some(conn) = self.conns.get_mut(key) else { return };
         let chunked = len.is_none();
         let mut head = format!("HTTP/1.1 {} {}\r\n", resp.status, resp.reason);
@@ -663,7 +668,7 @@ fn try_parse(
     rbuf: &mut Vec<u8>,
     max_body: usize,
     big_routes: &[(&str, usize)],
-    stream_prefix: &str,
+    stream_routes: &[&str],
 ) -> Parse {
     let Some(head_end) = find_crlfcrlf(rbuf) else {
         if rbuf.len() > MAX_HEADER_BYTES {
@@ -723,8 +728,7 @@ fn try_parse(
     // A streaming route's body is not buffered: emit the request at
     // end-of-headers and let the app's Sink consume the body. Its size cap
     // is the app's business (it knows the route's ceiling), not the parser's.
-    let is_stream = !stream_prefix.is_empty()
-        && bare_target.starts_with(stream_prefix)
+    let is_stream = stream_routes.contains(&bare_target)
         && method == "POST"
         && content_length > 0;
     // Per-route cap, enforced against Content-Length BEFORE a byte is
@@ -845,7 +849,7 @@ mod tests {
 
     fn parse(head: &str) -> Parse {
         let mut rbuf = head.as_bytes().to_vec();
-        try_parse(&mut rbuf, 16 * 1024, &ROUTES, "/add-wasm")
+        try_parse(&mut rbuf, 16 * 1024, &ROUTES, &["/add-wasm", "/add-file"])
     }
 
     #[test]
@@ -889,6 +893,16 @@ mod tests {
             }
             other => panic!("expected Complete, got {}", parse_kind(&other)),
         }
+    }
+
+    #[test]
+    fn generic_file_streams_only_on_the_exact_route() {
+        match parse("POST /add-file HTTP/1.1\r\ncontent-length: 100000000\r\n\r\n") {
+            Parse::Complete(req) => { assert_eq!(req.stream_len,Some(100_000_000));assert!(req.body.is_empty()); },
+            other => panic!("expected streamed file, got {}",parse_kind(&other)),
+        }
+        assert!(matches!(parse("POST /add-file-extra HTTP/1.1\r\ncontent-length: 100000000\r\n\r\n"),Parse::Bad(413,_)));
+        assert!(matches!(parse("POST /add-file HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n"),Parse::Bad(501,_)));
     }
 
     #[test]

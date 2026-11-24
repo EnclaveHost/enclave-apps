@@ -1,0 +1,10 @@
+{
+  "address": "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+  "service": "0xabababababababababababababababababababababababababababababababab",
+  "path": "/add-json",
+  "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "bytes": 2,
+  "expiry": 1792346000,
+  "message": "enclave-storage-upload:v1\nchainId:8453\nservice:0xabababababababababababababababababababababababababababababababab\nmethod:POST\npath:/add-json\naddress:0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025\nsha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\nbytes:2\nexpiry:1792346000",
+  "signature": "0x2c06c7cfd2afc19845bd7ef048a8dc841a8d29bb907b0f17dbd4182069346ea15cd2a3939ae3962019981f19bd11c04b193775e12c6ae2e9f640663b691f8b971b"
+}
