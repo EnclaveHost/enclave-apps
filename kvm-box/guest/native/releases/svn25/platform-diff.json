@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "against": "native-audio-image-v21 (SVN24, the live release)",
+  "changes": [
+    "plat/native-boot",
+    "plat/native-desktop/profile.json"
+  ],
+  "allOtherEntriesIdentical": true
+}

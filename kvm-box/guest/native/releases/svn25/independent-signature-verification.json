@@ -1,0 +1,19 @@
+{
+  "passed": true,
+  "implementation": "Python cryptography independent of RustCrypto signer",
+  "signedImageSha256": "8695919cb134018d3ce58e771ad9053a0586f543ac8ccea3bc2bbfbe41f0840e",
+  "launchMeasurement": "6886b5428333a283edfce9b8c55bb8756782ed7aa38615f934df245fa41841d9",
+  "identity": {
+    "moduleId": 1802724708,
+    "productId": 1818455653,
+    "signer": "c47c23318e325d23a9c0110f6b6aa59d80cd8f24629b1a5fe77fbb6fb9c5e89d"
+  },
+  "guestSvn": 25,
+  "sha384Verified": true,
+  "wrongHashRejected": true,
+  "modifiedMeasurementRejected": true,
+  "publicKeyMatches": true,
+  "privateKeyRead": false,
+  "hardwareAttestation": false,
+  "productionAdmission": false
+}

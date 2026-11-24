@@ -1,0 +1,34 @@
+{
+  "appId": "970444895772c6bfe55c418614a7612464fd903329aad5356e3ba7186a515525",
+  "recordSha256": "ff032fee1dba453a817a50dbf8a928a6f83500b7a06d1912a15ada1e92d57314",
+  "record": {
+    "derivation": "enclave-catalog-bundle/8",
+    "catalog": {
+      "app": "0x8e8a1340ca7e9ea1490ce15295d722c3f5186db9e0d0f1094661dbe919d8208c",
+      "version": 2
+    },
+    "cid": "bafybeig564vcjghux3gnfgzpcdddtxl6mlvrzelmhe7qnapi7ejnsmpoxa",
+    "runtimeId": "f548e338e4e41bb1326693688c7b0067c9f330a24f4a21a61037bd334449c74f",
+    "policy": {
+      "cpuPercent": 400,
+      "memMiB": 8192,
+      "vcpus": 4
+    },
+    "http": 8000,
+    "ports": [
+      "tcp:47984",
+      "tcp:47989",
+      "tcp:48010",
+      "udp:47998",
+      "udp:47999",
+      "udp:48000"
+    ],
+    "configBase64": "eyJlZ3Jlc3MiOiJwdWJsaWMtd2ViIiwid2FzaSI6IjAuMiJ9",
+    "secretDeployment": "0xf9bb979ae685c7f16f6c49df3f35f76ff38aca86b5ce3e76e02b83115360dd58",
+    "desktop": {
+      "profile": "kvm-box-masked-v1",
+      "profileSha256": "0725c246b7610f52a92bcb7d7d6531b417a6d35bfcded1d99ca50ce2ebaf44c8",
+      "gpuMilli": 100
+    }
+  }
+}

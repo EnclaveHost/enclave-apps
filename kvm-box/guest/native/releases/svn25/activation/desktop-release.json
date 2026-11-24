@@ -1,0 +1,13 @@
+{
+  "schema": "enclave-desktop-release/2",
+  "controllerCid": "bafybeig564vcjghux3gnfgzpcdddtxl6mlvrzelmhe7qnapi7ejnsmpoxa",
+  "controllerSha256": "e05247f88eb521d48507ff49bb88d16b5bba2df75fb2794b2082382ae7506630",
+  "runtimeId": "f548e338e4e41bb1326693688c7b0067c9f330a24f4a21a61037bd334449c74f",
+  "igvmSha256": "8695919cb134018d3ce58e771ad9053a0586f543ac8ccea3bc2bbfbe41f0840e",
+  "profileSha256": "0725c246b7610f52a92bcb7d7d6531b417a6d35bfcded1d99ca50ce2ebaf44c8",
+  "launchMeasurement": "6886b5428333a283edfce9b8c55bb8756782ed7aa38615f934df245fa41841d9",
+  "policy": {
+    "cpuPercent": 400,
+    "vcpus": 4
+  }
+}

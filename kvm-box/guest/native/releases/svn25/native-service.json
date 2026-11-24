@@ -1,0 +1,46 @@
+{
+  "clientUids": [
+    1000,
+    1003
+  ],
+  "core": "/opt/shield/lib/libshield-core.so",
+  "enableQ8Experimental": true,
+  "jobs": "/run/shield/jobs",
+  "models": {
+    "llama": {
+      "calibration": "/shield/policy/qwen.calib",
+      "model": "/models/qwen2.5-0.5b-instruct-q8_0.gguf",
+      "modelSha256": "f81d63cf49568f78154f6ddc8b114f603579360c7c878831a7f95a51dc284d24",
+      "policy": "/shield/policy/qwen.json",
+      "policySha256": "e7e8a13e0b368e0bfd90655cbbc05e1a1adab55620cb0606773d6d9fa94aae69",
+      "reserveBytes": 1200000000
+    },
+    "sd": {
+      "calibration": "/shield/policy/sd15.calib",
+      "model": "/models/sd15-q8.gguf",
+      "modelSha256": "d0555243938c62faeefb4ac93f6c7a053ad373a4290c5256bce229aeb193bf94",
+      "policy": "/shield/policy/sd15.json",
+      "policySha256": "6e6768ce6a75de3ce9db8ca41e1dd1177169f1021a4c53428ca84516d0be821a",
+      "reserveBytes": 1800000000
+    }
+  },
+  "publicConstants": [
+    "28677b4278b1d52a88ca3798b95d97801ebd23371ada2a55b327589d458c3b81",
+    "c11714610e1e3211e9654dd93421e3b188a6440ebb3fb275c390a2754e96ab71",
+    "cba40c98e8ffaf089742d01a6cf0caabc86caeaa7d3c52cd3047906670a3e517",
+    "3743f9f172613ba7e24c17237aba24e330c043ac4c8bc7e6e150bb6f5635a6a5"
+  ],
+  "route": {
+    "continueInline": true,
+    "mailbox": true
+  },
+  "schema": "shield-guest-service/1",
+  "sdk": "/opt/shield",
+  "socket": "/run/shield/compute.sock",
+  "threads": 2,
+  "timeoutSeconds": 1200,
+  "worker": {
+    "host": "unix:/run/shield-worker/gpu0",
+    "port": 19595
+  }
+}

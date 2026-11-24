@@ -1,0 +1,135 @@
+{
+  "schema": "kvm-box-native-root-image-kvm/1",
+  "case": "valid",
+  "command": [
+    "qemu-system-x86_64",
+    "-machine",
+    "q35,accel=kvm",
+    "-cpu",
+    "host",
+    "-smp",
+    "2",
+    "-m",
+    "3072",
+    "-nodefaults",
+    "-no-reboot",
+    "-display",
+    "none",
+    "-monitor",
+    "none",
+    "-serial",
+    "file:/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/probe/valid.serial.log",
+    "-nic",
+    "none",
+    "-device",
+    "virtio-scsi-pci,id=scsi0",
+    "-kernel",
+    "/home/steven/Documents/Codex/2026-10-23/it/work/nucbox-desktop-v2/kernel-src/arch/x86/boot/bzImage",
+    "-initrd",
+    "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/probe/probe.initrd",
+    "-append",
+    "console=ttyS0 rdinit=/probe-init panic=-1 loglevel=4",
+    "-drive",
+    "file=/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/root-image/rootfs.squashfs,if=none,id=disk0,format=raw,readonly=on",
+    "-device",
+    "scsi-hd,drive=disk0,bus=scsi0.0,channel=0,scsi-id=0,lun=0",
+    "-drive",
+    "file=/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/root-image/rootfs.verity,if=none,id=disk1,format=raw,readonly=on",
+    "-device",
+    "scsi-hd,drive=disk1,bus=scsi0.0,channel=0,scsi-id=1,lun=0",
+    "-drive",
+    "file=/home/steven/Documents/Codex/2026-10-23/it/outputs/kvm-box/release-v6.11-declines-candidate/models.img,if=none,id=disk2,format=raw,readonly=on",
+    "-device",
+    "scsi-hd,drive=disk2,bus=scsi0.0,channel=0,scsi-id=2,lun=0"
+  ],
+  "initrdSha256": "8ebaba24d09ddec6b4e47318f67742e93811bc6ece0978247fe0614ceea32831",
+  "qemuExitCode": 0,
+  "rootImageSha256": "f3fcab92dfa9008556c8a1e374f33690c95348069825b7574183cfb10c40cde0",
+  "rootHash": "4e6a2124c0679e99bc8cb26a13c652bddfe1f811bfdde2c72eac5fc693aad038",
+  "serialSha256": "dc01ea5f9709de7d522eb6b1c4a99821f91c4708f0af996ea42db8a4a30fd66f",
+  "verity": {
+    "passed": true,
+    "fullImageRead": true,
+    "readOnly": true,
+    "bytesRead": 596455424
+  },
+  "modelVerity": {
+    "passed": true,
+    "fullImageRead": true,
+    "readOnly": true,
+    "bytesRead": 2546024448
+  },
+  "graph": {
+    "passed": true,
+    "checks": [
+      "ancestor-proc-hides-credential-argv",
+      "owner-auth-and-action-gates",
+      "real-supervisor-nsinit-start",
+      "real-desktop-vnc-assets",
+      "owner-page-one-power-button-terminal-assets",
+      "owner-page-names-the-public-moonlight-pc",
+      "open-desktop-link-websocket-reaches-vnc",
+      "automation-inherits-RWX-denial-and-Firefox-default",
+      "desktop-survives-denied-allocation",
+      "terminal-owner-and-page-action-gates",
+      "terminal-shell-is-the-desktop-user",
+      "terminal-resize-reaches-the-pty",
+      "terminal-interrupt-key",
+      "terminal-second-page-sees-the-session",
+      "terminal-restart-is-a-new-shell",
+      "paired-records-question-has-no-web-route",
+      "pairing-route-reaches-sunshine-with-nothing-to-pair",
+      "clean-desktop-stop",
+      "terminal-ends-with-the-desktop",
+      "terminal-starts-fresh-with-the-next-desktop",
+      "second-clean-desktop-stop"
+    ],
+    "facts": {
+      "pageSha256": "c75d2105e885c6c923899955e93b82531d3c3c851d5fd5d90f748bcb7d4a836c",
+      "xterm.js": {
+        "bytes": 283404,
+        "sha256": "f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7"
+      },
+      "xterm.css": {
+        "bytes": 5383,
+        "sha256": "832f3f2c603b43ad4351ff04970150cc7a873014276db126a6065c6dd81e4872"
+      },
+      "vncBanner": "RFB 003.008",
+      "pairedFromTheWeb": 404,
+      "pairedFromTheWeb/desktop": 404,
+      "unaskedPin": 409,
+      "terminalWhileStopped": 502
+    },
+    "workerProbes": 2,
+    "workerError": null,
+    "gpu": false,
+    "authenticatedResources": false,
+    "productionAdmission": false,
+    "moonlightStreaming": false
+  },
+  "assets": {
+    "xterm.js": {
+      "served": {
+        "bytes": 283404,
+        "sha256": "f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7"
+      },
+      "source": {
+        "bytes": 283404,
+        "sha256": "f0aea0f75f48559013ae6643c2479dd737d26da42d5524e6d2b70915ae6523c7"
+      }
+    },
+    "xterm.css": {
+      "served": {
+        "bytes": 5383,
+        "sha256": "832f3f2c603b43ad4351ff04970150cc7a873014276db126a6065c6dd81e4872"
+      },
+      "source": {
+        "bytes": 5383,
+        "sha256": "832f3f2c603b43ad4351ff04970150cc7a873014276db126a6065c6dd81e4872"
+      }
+    },
+    "passed": true
+  },
+  "passed": true,
+  "scope": "Kernel integrity and the actual image graph with the owner page, its terminal, the desktop link and the pairing route with nothing to pair; pinned release runtime; synthetic worker, test runtime and gateway role adapters, synthetic owner credential; no GPU, admission, attestation or Moonlight streaming"
+}

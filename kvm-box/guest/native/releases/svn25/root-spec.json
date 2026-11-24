@@ -1,0 +1,77 @@
+{
+  "assets": "/home/steven/Documents/Codex/2026-10-23/it/work/native-ui/assets-v3",
+  "baseRoot": "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/base",
+  "files": {
+    "automation": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-pair-image-v17/build/automation",
+      "sha256": "727b774bd612f1fa0385df3e57fecc70799835a9497c9a015d387ae2245007b5"
+    },
+    "capture": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-automation-image-v10/build/capture",
+      "sha256": "4802be3e0438a576d10686425274e3f3d388f756a6fed724332c1a8bba95075a"
+    },
+    "controller": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-pair-image-v17/build/shield-desktop.wasm",
+      "sha256": "e05247f88eb521d48507ff49bb88d16b5bba2df75fb2794b2082382ae7506630"
+    },
+    "gateway": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-pair-image-v17/build/gateway",
+      "sha256": "92ef1c39b275e1c5409bb8345bf11ba8cf55a41ce01b807b4acbd95ceb8c6faf"
+    },
+    "inner": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-pair-image-v17/build/inner",
+      "sha256": "6eeb7d4070dbedde0204fb112c42336d4f3368034ca2db4ebd4bee583efffde3"
+    },
+    "inputRules": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/enclave-apps-kvm-pair/kvm-box/guest/native/70-kvm-box-input.rules",
+      "sha256": "1484a506e3e12f11ed869af2bff3229970f649e87a6a3d9f740988895a0c93f4"
+    },
+    "nftModule": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-nft-module/nft_ct.ko",
+      "sha256": "eeb8873ce7b08831c20d960272c493bfaa74782d37d054741124521cceb71e65"
+    },
+    "nsinit": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-wx-image-v13/build/nsinit",
+      "sha256": "ca08754a8748362551ae94ee69a0850a839137bd768b9f68a44f42c73638b4bb"
+    },
+    "readiness": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/enclave-apps-kvm-pair/kvm-box/guest/native/readiness.py",
+      "sha256": "b41832c1a1c678014bbfd13973a5fbfee1b7858ea60ae2536ca93a8c55da0b87"
+    },
+    "service": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/inputs/service.py",
+      "sha256": "547b75ab35285371beed03bf68f0c4257d6f865c68ff0224671bd20d3a7d26c8"
+    },
+    "serviceConfig": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/inputs/native-service.json",
+      "sha256": "2767a273f87b9966deecd60222f4866b0df64066bd69025f63162f8cf6f8a69e"
+    },
+    "sunshineApps": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/enclave-apps-kvm-pair/kvm-box/guest/sunshine-apps.json",
+      "sha256": "4641adb5f1d835617953d72a46e3335188209d50ee9183ea180bcbd126002078"
+    },
+    "sunshineConfig": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/enclave-apps-kvm-pair/kvm-box/guest/sunshine.conf",
+      "sha256": "e5fa33039e874bdcc0ea0aa3e9565de16e58a6f861a9b9ceb3f91d5837055b4c"
+    },
+    "supervisor": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-startup-diagnostic/build/supervisor",
+      "sha256": "28f101d15dde3fa0b43bd70b017f9c4ba1b44b52a5a79a24298f95f155ad08f0"
+    },
+    "udev": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-companion/udev-launch",
+      "sha256": "9a39ba438e3556abf011af8d7db233939deb8ac622010ffdc6b529268cf8d5e1"
+    },
+    "xdoom": {
+      "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/inputs/xdoom",
+      "sha256": "8dc87135ff058e9d19f27465883a7e2861c21f667a782c89ba49902f2819a484"
+    }
+  },
+  "mksquashfs": {
+    "path": "/home/steven/Documents/Codex/2026-10-23/it/work/native-image-tools/mksquashfs",
+    "sha256": "ea9ac9b6697186082d68b88cb20a747bc981bfbb6cf383233eb22532bf53d0ec"
+  },
+  "output": "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/root-image",
+  "schema": "kvm-box-native-root-build/2",
+  "sdk": "/home/steven/Documents/Codex/2026-10-23/it/work/native-shield-image-v22/sdk"
+}
