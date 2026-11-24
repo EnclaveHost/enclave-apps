@@ -1199,6 +1199,16 @@ Also not kept, from that fourth set:
   of the copies is not saved, it moves: the operation that reads the product
   pays for bringing it to its processor instead.
 
+- Another core for the pinned pair. With nothing of the route running, the
+  serving thread's processor (30) was 21% busy with other tenants' work and
+  the pair 9 and 25 was at 11 and 2%. Five alternating rounds on 9 and 25:
+  drafting 16.38 against 16.63 on 14 and 30 (paired difference -0.25, standard
+  error 0.08), plain 15.35 against 15.93, the native engine 16.79 and 16.34 in
+  the same rounds. A sweep of three rounds each then gave 16.60 on 14 and 30,
+  16.66 with the two swapped, 16.55 on 12 and 28, 16.52 on 2 and 18 (the other
+  cache domain) and 16.52 on 15 and 31. A pair can be worse; none found is
+  better, and how busy a processor looks beforehand does not say which.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
