@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -46,6 +47,9 @@
 /// Never mix more than this in one go: after a long stall the clock reports a
 /// huge debt, and paying all of it would be a burst of stale audio.
 #define MAX_FRAMES    2048
+/// Most audio allowed to wait between the mixer and pacat (the pipe plus the
+/// carry): 100 ms, about three tics. pacat's own 60 ms comes on top.
+#define MAX_LAG_FRAMES (OUT_RATE / 10)
 
 typedef struct
 {
@@ -345,6 +349,27 @@ static void RBX_Update(void)
             mixbuf[i * 2] += (short)((sample * chan->leftvol) >> 7);
             mixbuf[i * 2 + 1] += (short)((sample * chan->rightvol) >> 7);
             chan->pos += chan->step;
+        }
+    }
+
+    // Keep the sound with the picture. pacat takes from the pipe only as fast
+    // as the sink plays, and this side writes as fast as the clock runs, so
+    // audio that piles up in the pipe never drains: every stall the 60 ms
+    // pulse buffer could not cover (this loop, pacat, the sink) adds its length
+    // to the delay for good, and the 256 KB pipe holds six seconds of it.
+    // Measured on the KVM Box after a long session: the gunshot came 1.5 s
+    // after the muzzle flash. So when the pipe and the carry already hold more
+    // than MAX_LAG_FRAMES, this mix and the carry go instead of queueing: one
+    // short gap, then sound is back in step.
+    {
+        int queued = 0;
+
+        if (ioctl(sink_fd, FIONREAD, &queued) == 0
+         && queued / (int)(sizeof(short) * OUT_CHANNELS) + carry_len / OUT_CHANNELS
+            > MAX_LAG_FRAMES)
+        {
+            carry_len = 0;
+            return;
         }
     }
 
