@@ -304,5 +304,24 @@ class LinkSettings(unittest.TestCase):
                 link_environment(link)
 
 
+class RouteSettings(unittest.TestCase):
+    def test_settings_become_the_executor_environment(self):
+        from service import route_environment
+        self.assertEqual(route_environment(None), {})
+        self.assertEqual(route_environment({'mailbox': False}), {})
+        self.assertEqual(route_environment({'mailbox': True, 'continueInline': True, 'serveProcessor': 30, 'refillNice': 10}),
+                         {'SHIELD_Q8_MAILBOX': '1', 'SHIELD_Q8_AHEAD_INLINE': '1', 'SHIELD_Q8_SERVE_CPU': '30',
+                          'SHIELD_Q8_NICE_REFILL': '10'})
+        self.assertEqual(route_environment({'refillNice': 5}), {'SHIELD_Q8_NICE_REFILL': '5'})
+
+    def test_anything_else_is_refused(self):
+        from service import route_environment
+        for route in ('x', {'env': {}}, {'mailbox': 1}, {'serveProcessor': 30}, {'continueInline': True},
+                      {'mailbox': True, 'serveProcessor': -1}, {'mailbox': True, 'serveProcessor': '30'},
+                      {'refillNice': 0}, {'refillNice': 20}, {'refillNice': True}):
+            with self.assertRaises(ValueError):
+                route_environment(route)
+
+
 if __name__ == '__main__':
     unittest.main()

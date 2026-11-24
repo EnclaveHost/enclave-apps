@@ -129,6 +129,39 @@ def link_environment(link):
     return env
 
 
+# How a session is served, as the executor's environment. Experimental and off unless the policy sets it;
+# measured in opencl/Q8_DIRECT.md. `mailbox` lets a client and the executor pass requests through the
+# session's shared memory without a system call; `serveProcessor` is the hardware thread the serving
+# thread stays on (the client's requesting thread belongs on the other one of the same core, which the
+# desktop's environment sets); `continueInline` has that thread compute a feed-forward block's
+# continuation itself; `refillNice` lowers the priority of the pad refill threads.
+ROUTE_SWITCHES = {'mailbox': 'SHIELD_Q8_MAILBOX', 'continueInline': 'SHIELD_Q8_AHEAD_INLINE'}
+ROUTE_NUMBERS = {'serveProcessor': ('SHIELD_Q8_SERVE_CPU', 0, 1023), 'refillNice': ('SHIELD_Q8_NICE_REFILL', 1, 19)}
+
+
+def route_environment(route):
+    if route is None:
+        return {}
+    if not isinstance(route, dict) or set(route) - set(ROUTE_SWITCHES) - set(ROUTE_NUMBERS):
+        raise ValueError('invalid route settings')
+    env = {}
+    for key, name in ROUTE_SWITCHES.items():
+        if key in route:
+            if type(route[key]) is not bool:
+                raise ValueError('invalid route setting ' + key)
+            if route[key]:
+                env[name] = '1'
+    for key, (name, least, most) in ROUTE_NUMBERS.items():
+        if key in route:
+            value = route[key]
+            if type(value) is not int or not least <= value <= most:
+                raise ValueError('invalid route setting ' + key)
+            env[name] = str(value)
+    if ('serveProcessor' in route or route.get('continueInline')) and not route.get('mailbox'):
+        raise ValueError('route settings need the mailbox')
+    return env
+
+
 class Compute:
     def __init__(self, config):
         if config['schema'] != 'shield-guest-service/1':
@@ -231,6 +264,7 @@ class Compute:
                 'SHIELDED_POOL_DEPTH': '32',
             })
             env.update(link_environment(self.config.get('link')))
+            env.update(route_environment(self.config.get('route')))
             # The executor computes a session product itself when the pad pool
             # has run dry and that is cheaper than an exchange that makes its
             # own pad (native/q8_executor.cpp, PadStock). With this set every

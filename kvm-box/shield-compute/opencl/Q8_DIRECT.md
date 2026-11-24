@@ -1045,6 +1045,49 @@ llama-cli text is `dcb6091e2630a532` with it and `fc9381771ffb68b1` without
 Under EyesOff's loop the 300-token text and its acceptance rate were the same
 with and without glue. 13 session tests pass.
 
+### What a deployment would set
+
+None of this is on in any image. Every piece is off unless it is asked for,
+and none has run in a guest. The measured configuration is:
+
+Service policy (`service.json`), which becomes the executor's environment:
+
+```json
+"link": {"refillThreads": 16, "maxRows": 64, "poolDepth": 64, "refillBatch": 64,
+         "splitColumns": true, "overlapVerify": true,
+         "workers": [{"host": "...", "port": 9601, "reserveBytes": 26000000000,
+                      "ring": "/dev/enclave-shielded-shm/card-0", "ringBytes": 67108864}, ...]},
+"route": {"mailbox": true, "continueInline": true, "serveProcessor": 30, "refillNice": 10},
+"q8ExchangeEveryProduct": true
+```
+
+The environment of the application in the desktop, which the frontend reads:
+
+```
+SHIELD_OPENCL_Q8_MAILBOX=1  SHIELD_OPENCL_Q8_CPU=14   (the other hardware thread of serveProcessor's core)
+SHIELD_OPENCL_DIRECT_BUFFERS=1  SHIELD_OPENCL_Q8_TRIPLE=1  SHIELD_OPENCL_Q8_ARENA=1  SHIELD_OPENCL_LAZY_ARGS=1
+SHIELD_OPENCL_BUFFER_DIR=<a directory on disk>  SHIELD_OPENCL_BUFFER_FILE_MIN_MB=1000
+SHIELD_OPENCL_GLUE=1  GGML_SHIELD_DEVICE_GLUE=add,mul,rms,glu  GGML_OPENCL_DISABLE_FUSION=1   (patched plugin only)
+```
+
+What stands between this and a release, in the order it would be done:
+
+1. The two processor numbers are this host's (hardware threads 14 and 30 are
+   one core here). A guest has its own topology; the service has to choose
+   the pair, or the image has to be built for a known one.
+2. The plugin in the image has to be rebuilt with `llama-device-glue.patch`,
+   and the glue kernels bound by source and not by name, before
+   `SHIELD_OPENCL_GLUE` can be on in a release.
+3. The declines table and the frontend's bound build metadata have to be
+   regenerated for the new frontend (`native/build-declines-frontend.py`).
+4. The rings need the workers' shared memory in the guest. Without them the
+   route runs at about half this speed.
+5. A guest run: identical text, the session tests, and the failure cases (a
+   refused arena, an executor that stops mid-run, a client that dies holding
+   the mailbox).
+6. An independent review of the arena and mailbox code, which share memory
+   between the client and the executor in new ways.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
