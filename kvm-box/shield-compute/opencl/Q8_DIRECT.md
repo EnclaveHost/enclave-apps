@@ -1233,6 +1233,16 @@ tokens a second); spinning for ever, an active wait policy, no idle sentinel
 and no nice on the refill threads change nothing; one thread gives 13.6 and
 two 15.8.
 
+Not kept: a larger bound on the executor's graph cache. The cache of
+per-product graphs holds 256 MiB of scratch; on the 27B model, asked for at one
+and at two rows, it fills and is cleared seven times in a 300-token drafting
+run (205 MiB held at exit: 168 products, 134 pairs, 50 triples). With the bound
+at 1 GiB nothing is cleared, and six alternating rounds gave drafting 16.54
+against 16.58 at 256 MiB (paired difference -0.04, standard error 0.12) and
+plain 16.00 against 15.73 (0.27, standard error 0.29), the native engine 16.68
+and 15.91 in the same rounds. Rebuilding the graphs seven times is too little
+to see, so the bound stays a constant.
+
 ### Where the time is now
 
 Stack samples of the main thread in the plain phase, 600 tokens: the route
