@@ -2215,6 +2215,12 @@ int main(int argc, char ** argv) {
     const int out_fd = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
     if (out_fd < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) return 1;
     std::signal(SIGPIPE, SIG_IGN);
+    // The service bounds the size of a file its children may write (8 MiB),
+    // and the bound covers a memfd. Sizing the shared regions or an arena past
+    // it must be an error the request handlers see, so that they refuse the
+    // sharing and the client keeps to the socket; by default it is a signal
+    // that ends this process and retires the service.
+    std::signal(SIGXFSZ, SIG_IGN);
 
     try {
         int control = -1;

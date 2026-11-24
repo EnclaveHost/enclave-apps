@@ -8,13 +8,14 @@ running VM or a mutable image tag.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
 
-from source_declines_package import FRONTEND_SOURCES, verify_build
+from source_declines_package import COMPILER_SOURCES, FRONTEND_SOURCES, verify_build
 
 
 def sha(path):
@@ -27,7 +28,9 @@ def main():
     parser.add_argument('--base-image', required=True)
     parser.add_argument('--source-declines-build', type=Path, required=True,
                         help='Checked frontend build directory with rejection-table provenance')
-    for name in ('base-sdk', 'sd-library', 'cli-library', 'opencl-plugin',
+    parser.add_argument('--llama-opencl-build', type=Path, required=True,
+                        help="build-llama-opencl.py's output: the plugin and libllama with their receipt")
+    for name in ('base-sdk', 'sd-library', 'cli-library',
                  'frontend-dir', 'pocl-library', 'pocl-bitcode', 'executor', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     args = parser.parse_args()
@@ -43,6 +46,11 @@ def main():
     inputs = {}
     _, decline_receipt = verify_build(args.source_declines_build,
                                      args.frontend_dir / 'libOpenCL.so.1', repo / 'opencl')
+    spec = importlib.util.spec_from_file_location('build_llama_opencl', repo / 'native/build-llama-opencl.py')
+    llama_build = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(llama_build)
+    llama_receipt = llama_build.verify(args.llama_opencl_build, repo / 'native')
+    llama_lib = args.llama_opencl_build / 'lib'
 
     def copy(src, dest):
         target = out / 'overlay' / dest.lstrip('/')
@@ -56,7 +64,14 @@ def main():
         (args.sd_library, '/opt/shield/lib/libstable-diffusion.so'),
         (args.cli_library, '/opt/shield/lib/libllama-cli-impl.so'),
         (args.executor, '/opt/shield/bin/shield-q8-executor'),
-        (args.opencl_plugin, '/opt/shield/apps/bin/libggml-opencl.so'),
+        (llama_lib / 'libggml-opencl.so', '/opt/shield/apps/bin/libggml-opencl.so'),
+        # llama-shield-fused-cpu.patch is in libllama. It acts only for an
+        # application that set GGML_SHIELD_NATIVE_CPU_FALLBACK=1 on the Shield
+        # device, which the service's own llama never does. The SDK lists the
+        # library under its three names.
+        (llama_lib / 'libllama.so.0.0.0', '/opt/shield/lib/libllama.so.0.0.0'),
+        (llama_lib / 'libllama.so.0.0.0', '/opt/shield/lib/libllama.so.0'),
+        (llama_lib / 'libllama.so.0.0.0', '/opt/shield/lib/libllama.so'),
         (args.base_sdk / 'lib/backends/libggml-cpu.so', '/opt/shield/apps/bin/libggml-cpu.so'),
         (args.base_sdk / 'bin/llama-cli', '/opt/shield/apps/bin/llama-cli'),
         (args.base_sdk / 'bin/sd-cli', '/opt/shield/apps/bin/sd-cli'),
@@ -75,6 +90,12 @@ def main():
     for path in sorted((repo / 'opencl/q8-reference').iterdir()):
         if path.is_file():
             copy(path, '/opt/shield/opencl/q8-reference/' + path.name)
+    # The rejection table binds every .py and .cl below the compiler's directory.
+    compiler_root = out / 'overlay/opt/shield/opencl'
+    staged = {str(p.relative_to(compiler_root)) for p in compiler_root.rglob('*')
+              if p.is_file() and p.suffix in ('.py', '.cl')}
+    if staged != set(COMPILER_SOURCES):
+        raise ValueError('staged compiler sources differ from the bound set')
     for name in ('service.py', 'q8_service.py'):
         copy(repo / name, '/shield/' + name)
     if decline_receipt is not None:
@@ -108,6 +129,16 @@ def main():
             # llama builds 119 programs and launches kernels from a handful.
             # The frontend builds a program when one of its kernels is used.
             driver += 'export SHIELD_OPENCL_LAZY_BUILD="${SHIELD_OPENCL_LAZY_BUILD:-1}"\n'
+            # The two pieces of the direct route that do not depend on the
+            # guest's processors: blocking buffer reads and writes copied
+            # straight from the CPU runtime's storage, and kernel arguments
+            # kept in the frontend for launches it takes itself. The mailbox,
+            # the pinned processors, arenas (which need the mailbox), three
+            # products in an exchange, file-backed buffers and device-side glue
+            # stay off unless the environment asks: opencl/Q8_DIRECT.md,
+            # "What the 0.6.12 candidate sets".
+            driver += 'export SHIELD_OPENCL_DIRECT_BUFFERS="${SHIELD_OPENCL_DIRECT_BUFFERS:-1}"\n'
+            driver += 'export SHIELD_OPENCL_LAZY_ARGS="${SHIELD_OPENCL_LAZY_ARGS:-1}"\n'
         path.write_text('#!/bin/sh\nset -eu\n'
                         'export GGML_SHIELD_NATIVE_CPU_FALLBACK=1\n'
                         'export POCL_MAX_PTHREAD_COUNT="${POCL_MAX_PTHREAD_COUNT:-2}"\n'
@@ -131,15 +162,18 @@ def main():
     patches = ['llama-desktop-loopback.patch', 'llama-shield-opencl.patch',
                'llama-shield-cpu-fallback.patch', 'llama-opencl-q8-views.patch',
                'llama-shield-source-cache.patch', 'llama-shield-iq4-xs.patch',
-               'llama-shield-fused-cpu.patch',
+               'llama-shield-fused-cpu.patch', 'llama-device-glue.patch',
                'sd-opencl-fallback.patch', 'sd-opencl-graph-operations.patch',
                'sd-opencl-upload.patch', 'sd-graph-diagnostic.patch', 'sd-opencl-capabilities.patch']
     provenance = {'schema': 'shield-standard-package/1', 'baseImage': args.base_image,
                   'baseSdkManifestSha256': sha(args.base_sdk / 'files.sha256.json'),
                   'inputs': inputs, 'patches': {n: sha(repo / 'native' / n) for n in patches},
                   'recipeSha256': {name: sha(repo / 'native' / name) for name in
-                                   ('package-standard.py', 'finalize-standard.py', 'build-standard-image.py')},
+                                   ('package-standard.py', 'finalize-standard.py', 'build-standard-image.py',
+                                    'build-llama-opencl.py')},
                   'frontendSources': {name: sha(repo / 'opencl' / name) for name in FRONTEND_SOURCES},
+                  'llamaOpenclBuild': llama_receipt,
+                  'executorSourceSha256': sha(repo / 'native/q8_executor.cpp'),
                   'arithmetic': 'explicit shield-fixed-point-v1; otherwise trusted CPU',
                   'deploymentStatus': 'candidate; requires packaged and confidential VM tests'}
     if decline_receipt is not None:

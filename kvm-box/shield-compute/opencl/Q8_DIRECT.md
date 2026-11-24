@@ -1047,8 +1047,8 @@ with and without glue. 13 session tests pass.
 
 ### What a deployment would set
 
-None of this is on in any image. Every piece is off unless it is asked for,
-and none has run in a guest. The measured configuration is:
+Every piece is off unless it is asked for, and none has run in a guest. What
+the 0.6.12 candidate image turns on is in the next section. The measured configuration is:
 
 Service policy (`service.json`), which becomes the executor's environment:
 
@@ -1070,45 +1070,69 @@ SHIELD_OPENCL_BUFFER_DIR=<a directory on disk>  SHIELD_OPENCL_BUFFER_FILE_MIN_MB
 SHIELD_OPENCL_GLUE=1  GGML_SHIELD_DEVICE_GLUE=add,mul,rms,glu  GGML_OPENCL_DISABLE_FUSION=1   (patched plugin only)
 ```
 
-Checked against the release tooling on 2026-11-24, when a 0.6.12 candidate
-was asked for. The last image the packager built is
-`0.6.11-declines-candidate-v2` (2026-10-24), and its recorded inputs show it
-holds none of the direct route: its frontend was built from
-`shield_opencl.cpp`, `q8_capture.inc` and `q8_masked.inc` only, and its plugin
-knows Q8_0 kernels only. `native/source_declines_package.py` still lists
-those sources (`FRONTEND_SOURCES`, `COMPILER_SOURCES`), so
-`build-declines-frontend.py` cannot build today's frontend, which also
-includes `q8_admission.inc`, `q8_direct.inc`, `q8_kquant.inc`,
-`q8_iq3s_grid.inc` and `q8_glue.inc`. The K-quant plugin, its libllama and
-its declines table were built by hand outside this repository
-(`~/shield-perf/kq`), and the plugin's K-quant changes are not among the
-patches `package-standard.py` binds. The 0.6.11 development deployment
-(controller and desktop guests, 8 GiB desktop) is stopped. So a candidate is
-not one build away: everything on this route since 2026-11-19 has to be
-brought through the packager first.
+### What the 0.6.12 candidate sets
+
+A candidate image was built on 2026-11-23
+(`enclave-kvm-box-desktop:0.6.12-direct-candidate`; what was and was not
+validated is at the top of `../native/STANDARD_PACKAGE.md`). The packager was
+three weeks behind this route and was brought up to it first: the frontend and
+compiler source lists, a build of the plugin and libllama from the pinned
+source and the bound patches (`native/build-llama-opencl.py`; the patches
+already reproduced the scratch tree exactly, and `llama-device-glue.patch`
+moved to `native/`), a request corpus captured again and a declines table
+generated from it.
+
+On by default in the packaged `llama-cli`, because neither depends on the
+guest's processors or changes a result: `SHIELD_OPENCL_DIRECT_BUFFERS=1` and
+`SHIELD_OPENCL_LAZY_ARGS=1`. In `service.json`: `q8ExchangeEveryProduct`.
+
+Left off:
+
+- The mailbox and the two processors (`route` in the policy,
+  `SHIELD_OPENCL_Q8_MAILBOX`, `SHIELD_OPENCL_Q8_CPU`). The desktop guest has
+  two processors. Both sides spin, and the numbers 14 and 30 are two threads
+  of one core on a 32-thread host.
+- Arenas, which need the mailbox, and `continueInline` with them.
+- Three products in an exchange: a gain for one row and a loss for two.
+- Device-side glue. The plugin in the image has the patch, inert until
+  `GGML_SHIELD_DEVICE_GLUE` names an operation, but the frontend still
+  recognises a glue kernel by its name (item 3 below), and glue changes the
+  text.
+- File-backed buffers, which need a directory on disk and a better rule than
+  size.
+- `link` settings: the service's defaults are for a small guest and one
+  worker.
+
+**The file bound.** Packaging found that none of the shared-memory pieces can
+exist in the real service. `service.py` bounds the files of its children at
+8 MiB, the bound covers a memfd, and since the regions became 64 MiB the
+executor was killed by SIGXFSZ when it sized them: every direct session
+failed and the service retired. The harness never applied the bound. The
+executor now ignores the signal and refuses the regions, so the route runs
+over the socket. The regions, the mailbox and arenas need a decision on that
+bound before any of the measurements above can be had in a deployment.
 
 What stands between this and a release, in the order it would be done:
 
-0. Bring the packager up to the code: the frontend and compiler source lists,
-   the K-quant reference kernels, the plugin's changes exported from the
-   scratch tree as patches the packager binds (with
-   `llama-device-glue.patch`), the request corpus captured again with the new
-   plugin, and the declines table generated from it in the runtime image.
-
-1. The two processor numbers are this host's (hardware threads 14 and 30 are
+0. Done on 2026-11-23, except that nothing has run in a guest: the controller
+   guest's attestation is rejected with today's enclave repository, for a
+   reason outside this route (`../native/STANDARD_PACKAGE.md`).
+1. Decide how the 8 MiB file bound and the 64 MiB regions live together.
+2. The two processor numbers are this host's (hardware threads 14 and 30 are
    one core here). A guest has its own topology; the service has to choose
    the pair, or the image has to be built for a known one.
-2. The plugin in the image has to be rebuilt with `llama-device-glue.patch`,
-   and the glue kernels bound by source and not by name, before
-   `SHIELD_OPENCL_GLUE` can be on in a release.
-3. The declines table and the frontend's bound build metadata have to be
-   regenerated for the new frontend (`native/build-declines-frontend.py`).
-4. The rings need the workers' shared memory in the guest. Without them the
+3. The glue kernels have to be bound by source and not by name before
+   `SHIELD_OPENCL_GLUE` can be on in a release (the plugin in the candidate
+   already has `llama-device-glue.patch`).
+4. The declines table and the frontend's bound build metadata have to be
+   regenerated whenever the frontend or the compiler changes again
+   (`native/build-declines-frontend.py`; done for the candidate).
+5. The rings need the workers' shared memory in the guest. Without them the
    route runs at about half this speed.
-5. A guest run: identical text, the session tests, and the failure cases (a
+6. A guest run: identical text, the session tests, and the failure cases (a
    refused arena, an executor that stops mid-run, a client that dies holding
    the mailbox).
-6. An independent review of the arena and mailbox code, which share memory
+7. An independent review of the arena and mailbox code, which share memory
    between the client and the executor in new ways.
 
 ### Where the time is now
@@ -1173,8 +1197,8 @@ and a directory in memory, where it would save nothing.
   card has a refill thread, and behind it (76 to 84%) with one refill thread
   for two cards, for the placement reason given above. The executor still
   registers approved tensors the application never uses.
-- The rebuilt plugin, libllama and declines table exist only outside this
-  repository; no image contains them. `test_q8_raw_kernels.cpp` executes the
+- The rebuilt plugin, libllama and declines table are in the 0.6.12 candidate
+  image, built by the packager's own recipes. No guest has run them. `test_q8_raw_kernels.cpp` executes the
   three plain kernels on the CPU runtime against the decoded weights (942
   outputs, both option sets); it was built and run by hand, not by a script
   in this repository.

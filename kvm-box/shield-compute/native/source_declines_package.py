@@ -18,10 +18,24 @@ from functools import partial
 
 COMPILER = '/opt/shield/opencl/q8_capture_compiler.py'
 FRONTEND_SOURCES = ('shield_opencl.cpp', 'source_declines.hpp', 'build_source_declines.py',
-                    'q8_capture.inc', 'q8_masked.inc', 'opencl.map', 'Makefile')
+                    'q8_capture.inc', 'q8_admission.inc', 'q8_masked.inc', 'q8_direct.inc',
+                    'q8_kquant.inc', 'q8_iq3s_grid.inc', 'q8_glue.inc', 'opencl.map', 'Makefile')
+# Every .py and .cl below the installed compiler's directory: build_source_declines.py records
+# exactly that set, and package-standard.py installs exactly these.
 COMPILER_SOURCES = ('gemm_i8.cl', 'kernel_compiler.py', 'q8_admission.py',
                     'q8_capture_compiler.py', 'q8_kernel_compiler.py',
+                    'q8-reference/mul_mat_iq3_s_f32_raw.cl',
+                    'q8-reference/mul_mat_iq4_xs_f32_raw.cl',
+                    'q8-reference/mul_mat_q3_k_f32_raw.cl',
+                    'q8-reference/mul_mm_iq4_nl_f32_l4_lm.cl',
+                    'q8-reference/mul_mm_q4_k_f32_l4_lm.cl',
+                    'q8-reference/mul_mm_q5_k_f32_l4_lm.cl',
+                    'q8-reference/mul_mm_q6_k_f32_l4_lm.cl',
                     'q8-reference/mul_mm_q8_0_f32_l4_lm.cl',
+                    'q8-reference/mul_mv_iq4_nl_f32_flat.cl',
+                    'q8-reference/mul_mv_q4_k_f32_flat.cl',
+                    'q8-reference/mul_mv_q5_k_f32_flat.cl',
+                    'q8-reference/mul_mv_q6_k_f32_flat.cl',
                     'q8-reference/mul_mv_q8_0_f32_flat.cl')
 FILE_LIMIT = 8 << 20
 

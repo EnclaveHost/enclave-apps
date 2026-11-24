@@ -38,6 +38,11 @@ config = json.loads(config_path.read_text())
 assert config['sdk'] == str(root)
 assert config['worker'] == {'host': '10.0.2.2', 'port': 9741}
 config['enableQ8Experimental'] = True
+# Every session product is exchanged: equal requests then give equal bytes and
+# the same verified-exchange count, which the release checks compare exactly.
+# Without it the executor computes a product itself when its pad pool runs dry.
+assert 'q8ExchangeEveryProduct' not in config and 'route' not in config and 'link' not in config
+config['q8ExchangeEveryProduct'] = True
 config_path.write_text(json.dumps(config, indent=2) + '\n')
 firewall_path = Path('/shield/guest-firewall.nft')
 ports = re.findall(r'tcp dport \{ ([0-9, ]+) \}', firewall_path.read_text())

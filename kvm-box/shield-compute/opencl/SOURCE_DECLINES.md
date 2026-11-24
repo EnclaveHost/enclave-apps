@@ -70,6 +70,23 @@ Installed validation receipts omit timing fields; timings belong in external
 build logs. Guest application and fault checks remain required after producing
 the separately measured confidential-VM image.
 
+For 0.6.12 the compiler itself changed (K-quant recognition and its reference
+kernels), so no image held the compiler the table had to be generated with.
+The table was generated in the immutable base image of the package with the
+five compiler files and `q8-reference` of the tree mounted read-only over
+`/opt/shield/opencl`, as user 1000 with the same limits. That is sound only
+because image finalization then checks the installed files against the
+manifest's digests and classifies every request again in the finished image.
+The request corpus was captured by running the installed-application test with
+an unbound frontend (a bound one never asks about a source it has a hint for),
+deferred builds off, and a compiler copy that records each source request.
+`native/source_declines_package.py` lists the frontend's sources and the
+compiler's; `python3 -m unittest test_source_declines_package` in `native/`
+checks both lists against the tree without any built artifact. The six
+positive canaries still cover integer GEMM and the two Q8 references only: a
+K-quant reference has no canary, and its classification is held by the corpus
+records, which are rechecked with their result digests.
+
 Portable key tests are in `opencl/test_source_declines.py`. Real-artifact
 mutation tests run with `native/test_source_declines_package.py --build BUILD
 --baseline-frontend BASELINE_LIB`. Additional installed-image checks exercise

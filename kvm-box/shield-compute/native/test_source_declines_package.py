@@ -6,11 +6,49 @@ import shutil
 import tempfile
 import unittest
 
-from source_declines_package import read_table, sha, verify_build
+import re
+
+from source_declines_package import COMPILER_SOURCES, FRONTEND_SOURCES, read_table, sha, verify_build
 
 BUILD = None
 BASELINE = None
 SOURCE = Path(__file__).resolve().parent.parent / 'opencl'
+
+
+class SourceLists(unittest.TestCase):
+    """The bound lists against the tree; needs no built artifacts."""
+
+    def test_frontend_list_covers_every_local_include(self):
+        seen, pending = set(), ['shield_opencl.cpp']
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for included in re.findall(r'^\s*#\s*include\s+"([^"]+)"', (SOURCE / name).read_text(), re.M):
+                if (SOURCE / included).is_file():
+                    pending.append(included)
+        self.assertGreater(len(seen), 1)
+        self.assertEqual(seen - set(FRONTEND_SOURCES), set())
+
+    def test_frontend_list_names_existing_files(self):
+        for name in FRONTEND_SOURCES:
+            self.assertTrue((SOURCE / name).is_file(), name)
+
+    def test_compiler_list_is_the_installed_set(self):
+        # package-standard.py installs these five and all of q8-reference; the
+        # table generator records every .py and .cl below the compiler.
+        installed = {'kernel_compiler.py', 'q8_capture_compiler.py', 'q8_kernel_compiler.py',
+                     'q8_admission.py', 'gemm_i8.cl'}
+        installed |= {'q8-reference/' + p.name for p in (SOURCE / 'q8-reference').iterdir()
+                      if p.suffix in ('.py', '.cl')}
+        self.assertEqual(set(COMPILER_SOURCES), installed)
+        self.assertEqual(len(COMPILER_SOURCES), len(set(COMPILER_SOURCES)))
+
+    def test_compiler_reads_only_listed_references(self):
+        text = (SOURCE / 'q8_kernel_compiler.py').read_text()
+        for name in set(re.findall(r"'([a-z0-9_]+\.cl)'", text)):
+            self.assertIn('q8-reference/' + name, COMPILER_SOURCES)
 
 
 class ReleaseGate(unittest.TestCase):

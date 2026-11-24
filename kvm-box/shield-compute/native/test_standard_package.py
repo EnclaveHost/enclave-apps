@@ -120,7 +120,10 @@ print(json.dumps({'uid':os.getuid(),'rawGpuDevices':devices,'vsockDenied':True,'
             assert result['verifiedExchanges']==392 and result['maskedMacs']==51921289216
         else:
             assert 'Paris' in (out/'llama.stdout').read_text()
-            assert result['verifiedExchanges']==511 and result['maskedMacs']==14478327808
+            # The direct route registers a tensor when it is first used, in one
+            # exchange with its product (opencl/Q8_DIRECT.md): 487 where the
+            # queued route of 0.6.11 counted 511 and 14478327808.
+            assert result['verifiedExchanges']==487 and result['maskedMacs']==14273495040,result
             assert 'listening on http://127.0.0.1:' in (out/'llama.stderr').read_text()
         print(name+' passed',flush=True)
     # The native service path must retain its private loopback identity even

@@ -1,5 +1,78 @@
 # Packaged standard GPU applications
 
+## 0.6.12 direct candidate (2026-11-23): built, gated in the image, not booted
+
+`enclave-kvm-box-desktop:0.6.12-direct-candidate`
+(`sha256:32cdbc6f1280fc27dbff8b2d1c28eab1408655dc8a762605392921ea5c8a7b56`)
+holds the direct OpenCL route of `../opencl/Q8_DIRECT.md` as it is on `main`,
+on the same base image as 0.6.11. It is a local development image: unsigned,
+unpublished, in no catalog.
+
+What is new in it against 0.6.11: the frontend (all of its `.inc` files, bound
+to a regenerated table of 122 requests with 109 declines), the K-quant
+compiler and its thirteen reference kernels, llama's OpenCL plugin and
+libllama built by `build-llama-opencl.py` from the pinned source and the seven
+bound patches, the executor, `service.py` and `q8_service.py`. Stable
+Diffusion's library, the CLI library, the CPU runtime and its bitcode are the
+0.6.11 binaries.
+
+What the image turns on. The packaged `llama-cli` sets
+`SHIELD_OPENCL_DIRECT_BUFFERS=1` and `SHIELD_OPENCL_LAZY_ARGS=1` beside the
+settings it had; `service.json` gets `q8ExchangeEveryProduct: true`, so equal
+requests give equal bytes and the exchange counts below are exact. Everything
+else measured in `Q8_DIRECT.md` stays off; the reasons are under "What the
+0.6.12 candidate sets" there. `sd-cli` is unchanged.
+
+Passed:
+
+- `python3 -m unittest test_source_declines_package` (the source lists
+  against the tree) and the sixteen mutation tests against the real build.
+- Image finalization: overlay and SDK digests, and every one of the 122
+  requests classified twice with canaries before and after, at the 8 MiB and
+  the 32 MiB file bound.
+- `test_standard_package.py` on the installed image, three runs: normal
+  (SD 392 verified exchanges, 51,921,289,216 MACs, the fixture PNG
+  `048b2445…7abf80`; llama 487 exchanges, 14,273,495,040 MACs, the Paris
+  answer; the native service and both loopback identities), a corrupted worker
+  reply and a dropped worker connection (each fails closed, retires the
+  service and refuses a retry).
+- `../test_q8_session.py` in the installed image: 13 tests.
+
+Not passed, and where it stopped: the measured images were built
+(`host/build.py`, version `0.6.12-direct-candidate`, 8 GiB desktop) and
+started with `host/start.sh --development-unbound`. The controller guest
+booted under SNP and its attestation was rejected: "the runtime self-test
+covered NO runtime process (runtime=0)". The front built from today's enclave
+repository counts a process as the runtime only when it does not run as root,
+and `guest/controller-start.sh` starts the runtime as root; 0.6.11 was
+accepted in October because its older front stated no count and the verifier
+took the legacy form. This is the controller, not Shield Compute, and the gate
+was left as it is. The desktop guest was therefore never started: **nothing
+of 0.6.12 has run in a guest**, no in-guest llama or SD check was made, and
+the 0.6.11 guest figures below are the last guest evidence there is.
+`test_q8_session.py` cannot run in the guest as written in any case: it
+starts its own executor against a worker on loopback, and in the guest only
+the service identity may reach the worker.
+
+Two things the gates found in the route itself:
+
+- Under the service's 8 MiB file bound the executor was killed (SIGXFSZ) when
+  it sized the 64 MiB session regions, so every direct session failed and
+  retired the service. The executor now ignores that signal, the regions are
+  refused and the client keeps to the socket. In the packaged service there
+  are therefore no shared regions, and so no mailbox and no arenas, whatever
+  is switched on: the 97 to 98% configuration of `Q8_DIRECT.md` does not exist
+  under this bound. The session tests do get regions, because they build the
+  service in process without the bound.
+- llama's check counts 487 exchanges on the direct route, as `Q8_DIRECT.md`
+  recorded; the test still held the queued route's 511 and was corrected.
+
+The commands and receipts of this build are outside the repository, in
+`work/shield-compat/direct-0.6.12` and `work/kvm-box-v6.12-direct` of the
+2026-10-23 working directory.
+
+## 0.6.11 and before
+
 The 0.6.11 compiler-rejection development image is running locally and has
 passed measured-image guest validation. Standard CLI SD/Qwen recorded 392/511
 verified exchanges, with the expected output and unchanged MAC counts; the
@@ -88,7 +161,17 @@ preserves the base's attested-service port policy, and updates manifests.
 
 The supplied libraries come from the pinned, patched native/GGML/PoCL builds
 listed in `STANDARD_SD_MASKED.md`, plus `llama-desktop-loopback.patch` and
-`llama-shield-source-cache.patch`. This is an incremental packaging recipe;
+`llama-shield-source-cache.patch`. Since 0.6.12 the plugin and libllama are not
+supplied as files: `build-llama-opencl.py --source LLAMA --builder-image
+sha256:... --output BUILD` copies the tree `prepare.py` exported, applies the
+patches in its `LLAMA_PATCHES` order, builds both in the builder image and
+writes a receipt, and `package-standard.py --llama-opencl-build BUILD` refuses
+a build whose patches, recipe or outputs differ from it. libllama is installed
+over the SDK's (its one patch acts only for an application that asked for the
+native CPU fallback on the Shield device). The executor is still supplied as a
+file; the package records the digest of `q8_executor.cpp` beside it, and it
+must be linked with `-pthread`. A frontend needs `LDLIBS=-lcrypto` with or
+without a table. This is an incremental packaging recipe;
 its input binary hashes and source build receipts remain required provenance.
 The frontend build must pass:
 
